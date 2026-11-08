@@ -126,6 +126,11 @@ pub trait Storage: Send {
     fn backfill_work_anchor(&mut self, _employee: EmployeeId) -> Result<bool> {
         Err(ErrorCode::WorkspaceBrokerUnavailable)
     }
+    /// F6l (F6 §3.4 S5a/S5b, §3.12 step 7): every employee storage still
+    /// holds any trace of — an image in the kernel-verified inventory or a
+    /// ledger entry that is not `Destroyed`. Unreadable ⇒ error, never an
+    /// empty list (an authoritative `NotFound` needs a positive "nothing").
+    fn traces(&mut self) -> Result<Vec<EmployeeId>> { Err(ErrorCode::IsolationUnavailable) }
 }
 
 pub struct UnavailableStorage;

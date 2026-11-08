@@ -99,7 +99,7 @@ fn lifecycle_error(e:LifecycleError)->Error {
 }
 fn exchange(item:&ConfirmationItem,action:Action)->Result<Receipt>{
     #[cfg(target_os="linux")]{
-        allocation::transport::request(&Request{schema:1,nonce:RequestId(*uuid::Uuid::new_v4().as_bytes()),action,item:item.clone()}).map_err(|_|Error::Apply)
+        allocation::transport::request(&Request{schema:1,nonce:RequestId(*uuid::Uuid::new_v4().as_bytes()),action,item:item.clone(),approver:None}).map_err(|_|Error::Apply)
     }
     #[cfg(not(target_os="linux"))]{let _=(item,action);Err(Error::Denied)}
 }

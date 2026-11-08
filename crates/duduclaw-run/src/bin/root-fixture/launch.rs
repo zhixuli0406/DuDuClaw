@@ -7,17 +7,17 @@ use duduclaw_run::{linux::{bootstrap, sealed_registry::{self, SealedRegistry}, r
     seccomp::RuntimeProfile, validation::Identity};
 use std::time::{Duration, Instant};
 
-const RUN: RunId = RunId([0x42;16]);
+pub(super) const RUN: RunId = RunId([0x42;16]);
 const SUPERVISOR: u32 = 997;
 const PROMPT: &[u8] = b"sealed-prompt-fixture";
 const ATTACHMENT: &[u8] = b"sealed-attachment-fixture";
 
-fn socketpair(kind: i32) -> (OwnedFd,OwnedFd) {
+pub(super) fn socketpair(kind: i32) -> (OwnedFd,OwnedFd) {
     let mut descriptors=[-1;2];
     assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX,kind|libc::SOCK_CLOEXEC,0,descriptors.as_mut_ptr()) },0);
     unsafe { (OwnedFd::from_raw_fd(descriptors[0]),OwnedFd::from_raw_fd(descriptors[1])) }
 }
-fn memfd(contents: &[u8]) -> OwnedFd {
+pub(super) fn memfd(contents: &[u8]) -> OwnedFd {
     let raw=unsafe { libc::memfd_create(c"launch-fixture".as_ptr(),libc::MFD_CLOEXEC|libc::MFD_ALLOW_SEALING) };
     assert!(raw>=0);
     let mut file=unsafe { File::from_raw_fd(raw) };
@@ -44,7 +44,7 @@ fn program(identity: Identity, mode: &str, script: Option<Identity>) -> Program 
         seccomp,seccomp_digest}
 }
 
-fn prepare(root: &Path, scenario: &str) -> (TrustedRun,Vec<OwnedFd>,OwnedFd,Option<OwnedFd>) {
+pub(super) fn prepare(root: &Path, scenario: &str) -> (TrustedRun,Vec<OwnedFd>,OwnedFd,Option<OwnedFd>) {
     // The test checkout may itself be beneath the /tmp now hidden by the private
     // tmpfs. Read the running image by fd, never reopen that masked pathname.
     let mut source=File::open("/proc/self/exe").unwrap();
@@ -93,7 +93,7 @@ fn prepare(root: &Path, scenario: &str) -> (TrustedRun,Vec<OwnedFd>,OwnedFd,Opti
     } else {(None,None)};
     let mode=match scenario {
         "launch-pty"=>"pty", "launch-teardown"=>"orphan", "launch-script"=>"script",
-        "launch-fast-exit"=>"fast", _=>"normal",
+        "launch-fast-exit"=>"fast", helper if helper.starts_with("helper-")=>"helpers", _=>"normal",
     };
     let plan=TrustedRun {pty_size:(scenario=="launch-pty").then_some(duduclaw_isolation::execution::PtySize { rows: 24, columns: 80 }),stdin:false,root:mounts::RootConfig {employee_uid:EMPLOYEE,employee_gid:EMPLOYEE,
         pty:scenario=="launch-pty",pty_limit:2,work_noexec:true,tmp_noexec:true,
@@ -120,14 +120,14 @@ fn fail_supervisor_transition() {
     assert_eq!(unsafe { libc::syscall(libc::SYS_seccomp,1,0,&filter) },0);
 }
 
-fn children(pid: i32) -> Vec<i32> {
+pub(super) fn children(pid: i32) -> Vec<i32> {
     match std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
         Ok(text)=>text.split_whitespace().map(|value|value.parse().unwrap()).collect(),
         Err(error) if error.raw_os_error()==Some(libc::ENOENT)=>Vec::new(),
         Err(error)=>panic!("read controlled child list: {error}"),
     }
 }
-fn pidfd(pid: i32) -> OwnedFd {
+pub(super) fn pidfd(pid: i32) -> OwnedFd {
     let descriptor=unsafe { libc::syscall(libc::SYS_pidfd_open,pid,0) };
     assert!(descriptor>=0,"open controlled child pidfd");
     unsafe {OwnedFd::from_raw_fd(descriptor as i32)}
@@ -136,13 +136,13 @@ fn signal(target: &OwnedFd, signal: i32) {
     assert_eq!(unsafe {libc::syscall(libc::SYS_pidfd_send_signal,target.as_raw_fd(),signal,
         std::ptr::null::<libc::siginfo_t>(),0)},0);
 }
-fn readable(fd: RawFd, milliseconds: i32) -> bool {
+pub(super) fn readable(fd: RawFd, milliseconds: i32) -> bool {
     let mut poll=libc::pollfd {fd,events:libc::POLLIN,revents:0};
     let result=unsafe {libc::poll(&mut poll,1,milliseconds)};
     assert!(result>=0,"fixture poll failed");
     result==1 && poll.revents&(libc::POLLIN|libc::POLLHUP)!=0
 }
-struct Cleanup;
+pub(super) struct Cleanup;
 impl Drop for Cleanup {
     fn drop(&mut self) {
         fn stop_tree(pid: i32) {
@@ -335,6 +335,93 @@ pub(super) fn run(root: &Path, scenario: &str) {
     assert!(children(unsafe {libc::getpid()}).is_empty(),"fixture descendants must be reaped");
 }
 
+/// HX runtime side (payload mode "helpers"): line commands on fd 3, "OK\n"
+/// replies; any failed assertion exits 101 instead of the expected 23.
+fn helper_commands() {
+    loop {
+        let mut line=Vec::new();
+        loop {
+            let mut byte=[0u8];
+            assert_eq!(unsafe {libc::read(3,byte.as_mut_ptr().cast(),1)},1,"coordinator command");
+            if byte[0]==b'\n' {break;}
+            line.push(byte[0]);
+        }
+        let line=String::from_utf8(line).unwrap();
+        match line.as_bytes().first().copied() {
+            Some(b'G')=>return,
+            Some(b'P')=>runtime_cannot_see(line[1..].parse().unwrap()),
+            Some(b'X')=>runtime_cannot_exec_helpers(),
+            Some(b'S')=>runtime_cannot_precreate_scratch(),
+            Some(b'D')=>spawn_daemon(),
+            _=>panic!("unknown coordinator command"),
+        }
+        assert_eq!(unsafe {libc::send(3,b"OK\n".as_ptr().cast(),3,libc::MSG_NOSIGNAL)},3);
+    }
+}
+fn pause_forever() -> ! { loop {unsafe {libc::pause();}} }
+/// Same uid, `hidepid=invisible`: visibility is decided by Landlock domain
+/// scoping. A child in the runtime's own domain is visible (positive control);
+/// the launcher (sibling domain, non-dumpable) and a helper (stacked under the
+/// launcher, dumpable after exec) are not.
+fn runtime_cannot_see(pid: i32) {
+    let child=unsafe {libc::fork()}; assert!(child>=0);
+    if child==0 {pause_forever();}
+    assert!(Path::new(&format!("/proc/{child}/status")).exists(),"same-domain child must be visible");
+    let environ=std::fs::read(format!("/proc/{child}/environ"));
+    unsafe {libc::kill(child,libc::SIGKILL); libc::waitpid(child,std::ptr::null_mut(),0);}
+    assert!(environ.is_ok(),"same-domain child environ readable");
+    assert!(!Path::new(&format!("/proc/{pid}")).exists(),"launcher/helper /proc entry visible to the runtime");
+    for leaf in ["status","environ","mem","cmdline","fd","cwd","root","maps"] {
+        let path=CString::new(format!("/proc/{pid}/{leaf}")).unwrap();
+        assert_eq!(unsafe {libc::open(path.as_ptr(),libc::O_RDONLY|libc::O_CLOEXEC)},-1,"{leaf}");
+        assert!(matches!(errno(),libc::ENOENT|libc::EACCES|libc::EPERM),"{leaf}: {}",errno());
+    }
+    assert_eq!(unsafe {libc::ptrace(libc::PTRACE_ATTACH,pid,std::ptr::null_mut::<u8>(),std::ptr::null_mut::<u8>())},-1);
+}
+fn exec_errno(path: &CStr) -> i32 {
+    let child=unsafe {libc::fork()}; assert!(child>=0);
+    if child==0 {
+        let argv=[path.as_ptr(),std::ptr::null()];
+        let envp=[std::ptr::null::<libc::c_char>()];
+        unsafe {libc::execve(path.as_ptr(),argv.as_ptr(),envp.as_ptr()); libc::_exit(errno());}
+    }
+    let mut status=0; assert_eq!(unsafe {libc::waitpid(child,&mut status,0)},child);
+    assert!(libc::WIFEXITED(status)); libc::WEXITSTATUS(status)
+}
+/// HX2 finding (a): helper runtimes sit in the runtime's registry. `/runtime/helper`
+/// is masked (root-owned, mode 0), `/helpers/*` is outside the runtime's Landlock,
+/// and the staged registry clone is gone.
+fn runtime_cannot_exec_helpers() {
+    assert_eq!(exec_errno(c"/runtime/helper"),libc::EACCES);
+    assert_eq!(exec_errno(c"/helpers/helper"),libc::EACCES);
+    for path in ["/runtime/helper","/helpers/helper"] {
+        assert_eq!(std::fs::read(path).unwrap_err().raw_os_error(),Some(libc::EACCES),"{path}");
+    }
+    assert_eq!(std::fs::metadata("/runtime/helper").unwrap().len(),0,"mask is an empty file");
+    assert_eq!(std::fs::read_dir("/helpers").unwrap_err().raw_os_error(),Some(libc::EACCES));
+    assert!(!Path::new("/.helper-registry").exists(),"staged registry must be detached");
+    // Its own registry entry stays executable and readable.
+    assert!(std::fs::read("/runtime/payload").is_ok());
+}
+fn runtime_cannot_precreate_scratch() {
+    for path in ["/helper-tmp/precreated","/helper-tmp/0101"] {
+        assert_eq!(std::fs::create_dir(path).unwrap_err().raw_os_error(),Some(libc::EACCES),"{path}");
+    }
+    assert_eq!(std::fs::read_dir("/helper-tmp").unwrap_err().raw_os_error(),Some(libc::EACCES));
+    assert_eq!(std::fs::write("/helper-tmp/driver.cjs",b"x").unwrap_err().raw_os_error(),Some(libc::EACCES));
+}
+/// A daemonized runtime descendant (setsid + double fork) that would outlive
+/// the runtime without the rt-runtime cgroup.kill [F4].
+fn spawn_daemon() {
+    let child=unsafe {libc::fork()}; assert!(child>=0);
+    if child==0 {
+        unsafe {libc::setsid();}
+        if unsafe {libc::fork()}==0 {pause_forever();}
+        unsafe {libc::_exit(0);}
+    }
+    let mut status=0; assert_eq!(unsafe {libc::waitpid(child,&mut status,0)},child);
+}
+
 fn exact_read(descriptor: RawFd, expected: &[u8]) {
     let mut actual=vec![0;expected.len()];
     let count=unsafe {libc::read(descriptor,actual.as_mut_ptr().cast(),actual.len())};
@@ -380,6 +467,11 @@ pub(super) fn runtime_mode() {
             assert_eq!(unsafe {libc::write(1,b"PTY-OK\n".as_ptr().cast(),7)},7);
         }
         if mode=="fast" { return; }
+        if mode=="helpers" {
+            assert_eq!(unsafe {libc::send(3,b"READY".as_ptr().cast(),5,libc::MSG_NOSIGNAL)},5);
+            helper_commands();
+            return;
+        }
         if mode=="orphan" {
             let child=unsafe {libc::fork()}; assert!(child>=0);
             if child==0 {

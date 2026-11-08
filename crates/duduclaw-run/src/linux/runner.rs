@@ -1,7 +1,7 @@
 //! Single-threaded, one-shot launch engine. No stage has an unsandboxed fallback.
 use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use duduclaw_isolation::{ids::Sha256Digest, ipc::InputFd};
 use crate::{Error, Result, fd_plan::{Destination, FdPlan, Source}, landlock::Policy,
     seccomp::{self, Architecture, Filter, RuntimeProfile}, state::{Machine, Stage}, validation::{self, Expected, Identity}};
@@ -51,10 +51,15 @@ pub struct TrustedRun {
     pub launcher: Option<LauncherPlan>,
 }
 
-/// Flip only together with HX3b's launcher fork in `child_init`. Until then
-/// spawnd never plans a launcher and `launch` refuses one that arrives anyway.
-pub const LAUNCHER_SUPPORTED: bool = false;
+/// HX3b: `child_init` forks the in-trampoline launcher (D8 revision §2.1, Q1 = A).
+pub const LAUNCHER_SUPPORTED: bool = true;
 pub const MAX_HELPER_MOUNTS: usize = 4;
+/// Upper bound of the signed launcher drain window F (§2.5 (b)).
+pub const MAX_LAUNCHER_DRAIN_MS: u64 = 600_000;
+/// Init's bound after SIGTERM to the launcher is F + this (§2.5 (c)).
+pub const LAUNCHER_DRAIN_SLACK_MS: u64 = 2_000;
+/// `FailurePage` isolation bits: runtime, forwarder, launcher.
+pub(super) const LAUNCHER_ISOLATED: u32 = 4;
 
 /// Root-signed helper table for one run. The index of a `HelperProgram` is the
 /// `helper` byte of a launcher `Start` frame; nothing here comes from IPC.
@@ -62,8 +67,12 @@ pub const MAX_HELPER_MOUNTS: usize = 4;
 #[serde(deny_unknown_fields)]
 pub struct LauncherPlan {
     pub helpers: Vec<HelperProgram>,
+    /// Exactly one helper registry clone (HX2 `prepare_helpers`); `/helpers` is
+    /// built from per-file binds of it (`mounts::HelperView`).
     pub mounts: Vec<MountIdentity>,
     pub tmpfs_bytes: u64,
+    /// Drain window F = parent `termination_grace_ms` − 2 s, at least 1 s (§2.5 (b)).
+    pub drain_ms: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,10 +94,35 @@ impl LauncherPlan {
         1 + self.mounts.len() + self.helpers.iter().map(|h| 1 + usize::from(h.program.script.is_some())).sum::<usize>()
             + crate::helper_policy::HELPER_CGROUP_FDS
     }
-    fn validate(&self) -> Result<()> {
+    /// `parent` is the run's runtime program: F_L and every F_H are derived from
+    /// its signed profile, so they are checked here, before any fd is touched.
+    fn validate(&self, parent: &Program) -> Result<()> {
         use crate::helper_policy::*;
-        if self.helpers.is_empty() || self.helpers.len() > MAX_HELPER_BINDINGS || self.mounts.is_empty()
-            || self.mounts.len() > MAX_HELPER_MOUNTS || self.tmpfs_bytes == 0 { return Err(Error::Executable); }
+        if self.helpers.is_empty() || self.helpers.len() > MAX_HELPER_BINDINGS || self.mounts.len() != 1
+            || self.tmpfs_bytes == 0 || self.tmpfs_bytes > 1024 * 1024 * 1024
+            || self.drain_ms == 0 || self.drain_ms > MAX_LAUNCHER_DRAIN_MS { return Err(Error::Executable); }
+        let arch = Architecture::native().map_err(|_| Error::Seccomp)?;
+        // HX3a: F_L adds no kill/dup3/file/socket calls; refuse a parent without them.
+        if !seccomp::parent_supports_launcher(arch, &parent.seccomp) { return Err(Error::Seccomp); }
+        seccomp::launcher(arch, &parent.seccomp, parent.seccomp_digest).map_err(|_| Error::Seccomp)?;
+        // One registry name maps to one signed file identity across the table.
+        let mut names: Vec<(String, Identity)> = Vec::new();
+        let mut name = |path: &[u8], identity: Identity| -> Result<()> {
+            let name = helper_file_name(path).ok_or(Error::Executable)?;
+            match names.iter().find(|(known, _)| known == name) {
+                Some((_, known)) if *known != identity => Err(Error::Executable),
+                Some(_) => Ok(()),
+                None => { names.push((name.to_owned(), identity)); Ok(()) }
+            }
+        };
+        for helper in &self.helpers {
+            name(helper.program.argv.first().ok_or(Error::Executable)?.as_bytes(), helper.program.identity)?;
+            if let Some((identity, path)) = &helper.program.script {
+                name(format!("/helpers/{}", path.to_str().map_err(|_| Error::Executable)?).as_bytes(), *identity)?;
+            }
+            seccomp::helper(arch, &parent.seccomp, parent.seccomp_digest, &helper.program.seccomp,
+                helper.program.seccomp_digest, &helper.self_only).map_err(|_| Error::Seccomp)?;
+        }
         for helper in &self.helpers {
             let mut grants = helper.filesystem.clone();
             grants.sort_unstable(); grants.dedup();
@@ -148,7 +182,7 @@ impl TrustedRun {
             if program.script.is_some() { return Err(Error::Executable); }
             validate_program(program)?;
         }
-        if let Some(launcher) = &self.launcher { launcher.validate()?; }
+        if let Some(launcher) = &self.launcher { launcher.validate(&self.program)?; }
         Ok(())
     }
 }
@@ -178,12 +212,14 @@ struct Inputs {
     attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, forwarder: Option<(OwnedFd, OwnedFd)>,
     launcher: Option<LauncherInputs>,
 }
-/// Consumed by HX3b's launcher. `cgroups` order is `helper_policy::HELPER_CGROUP_FDS`.
-#[allow(dead_code)]
+/// `cgroups` order is `helper_policy::HELPER_CGROUP_FDS`.
 struct LauncherInputs {
-    control: OwnedFd, mounts: Vec<OwnedFd>, helpers: Vec<(OwnedFd, Option<OwnedFd>)>,
+    control: OwnedFd, registry: mounts::DetachedMount, helpers: Vec<(OwnedFd, Option<OwnedFd>)>,
     cgroups: [OwnedFd; crate::helper_policy::HELPER_CGROUP_FDS],
 }
+/// Root-opened `rt-runtime` files: the runtime child moves itself with `procs`
+/// before exec; init writes `kill` the moment it reaps the runtime [F4].
+pub(super) struct RuntimeCgroup { procs: OwnedFd, kill: OwnedFd }
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 /// A root-opened, write-only cgroup v2 interface file. Moves through it rely on
 /// open-time credentials (CVE-2021-4197 fix); spawnd probes that before planning.
@@ -200,13 +236,15 @@ fn take_launcher(plan: &LauncherPlan, fds: &mut impl Iterator<Item = OwnedFd>, m
     if let Some(mcp) = mcp {
         if fd::observe(control.as_raw_fd())?.identity == fd::observe(mcp.as_raw_fd())?.identity { return Err(Error::Descriptors); }
     }
-    let mut mounts = Vec::new();
+    let mut registry = None;
     for expected in &plan.mounts {
         let fd = fds.next().ok_or(Error::Descriptors)?;
         validation::validate(fd::observe(fd.as_raw_fd())?, Expected::Mount {
             mount: expected.mount, fs_type: expected.fs_type, required_flags: 1 | 2 | 4 })?;
-        mounts.push(fd);
+        if registry.is_some() { return Err(Error::Descriptors); }
+        registry = Some(mounts::DetachedMount { fd, expected_mount_id: expected.mount, expected_fs_type: expected.fs_type });
     }
+    let registry = registry.ok_or(Error::Descriptors)?;
     let mut helpers = Vec::new();
     for helper in &plan.helpers {
         let registry = plan.mounts.get(usize::from(helper.mount)).ok_or(Error::Descriptors)?.mount;
@@ -225,7 +263,7 @@ fn take_launcher(plan: &LauncherPlan, fds: &mut impl Iterator<Item = OwnedFd>, m
     let cgroups = [cgroup()?, cgroup()?, cgroup()?, cgroup()?];
     let identities: Vec<_> = cgroups.iter().map(|fd| fd::observe(fd.as_raw_fd()).map(|o| o.identity)).collect::<Result<_>>()?;
     if identities.iter().enumerate().any(|(i, a)| identities[..i].contains(a)) { return Err(Error::Descriptors); }
-    Ok(LauncherInputs { control, mounts, helpers, cgroups })
+    Ok(LauncherInputs { control, registry, helpers, cgroups })
 }
 
 fn take_inputs(plan: &TrustedRun, descriptors: Vec<OwnedFd>) -> Result<Inputs> {
@@ -293,7 +331,7 @@ fn take_inputs(plan: &TrustedRun, descriptors: Vec<OwnedFd>) -> Result<Inputs> {
     Ok(Inputs { mounts, exec, script, prompt, attachments, stdin, mcp, forwarder, launcher })
 }
 
-fn verify_executable(fd: RawFd, identity: Identity, registry_mount: u64) -> Result<()> {
+pub(super) fn verify_executable(fd: RawFd, identity: Identity, registry_mount: u64) -> Result<()> {
     validation::validate(fd::observe(fd)?, Expected::Executable { identity, registry_mount })?;
     let mut magic = [0u8; 4];
     if unsafe { libc::pread(fd, magic.as_mut_ptr().cast(), magic.len(), 0) } != 4 || magic != *b"\x7fELF" {
@@ -334,15 +372,41 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
     let n = 3 + 1 + 1 + 1 + plan.attachments.len() + 1 + usize::from(plan.program.script.is_some());
     if fd::soft_limit()? < FdPlan::required_limit(n)? { return Err(Error::DescriptorLimit); }
     let input = take_inputs(&plan, fds)?;
-    // HX3b forks the launcher (D8 revision §2.1). Until it lands, a planned
-    // launcher fails closed instead of leaving root-opened cgroup fds unused.
-    // HX3b replaces this refusal and sets LAUNCHER_SUPPORTED in the same change.
-    if input.launcher.is_some() { return Err(Error::Bootstrap); }
     machine.advance(Stage::DescriptorsVerified)?;
     mounts::enter_namespaces().map_err(|_| Error::Namespace)?;
     machine.advance(Stage::Namespaces)?; machine.advance(Stage::PrivatePropagation)?;
-    let Inputs { mounts: mount_inputs, exec, script, prompt, attachments, stdin, mcp, forwarder, launcher: _ } = input;
+    // [F2] Only this process (the future supervisor, outside the run's PID
+    // namespace) is OOM-protected; host procfs is still visible before pivot.
+    // Init inherits the value and resets it to 0 before it forks anything.
+    privileges::protect_supervisor_from_oom()?;
+    let Inputs { mounts: mount_inputs, exec, script, prompt, attachments, stdin, mcp, forwarder, launcher } = input;
     let mut root = mounts::build_root(mount_inputs, &plan.root).map_err(|_| Error::Mount)?;
+    // HX: `/helpers`, `/helper-tmp` and the `/runtime` masks (mounts::HelperView).
+    let launcher = match (launcher, &plan.launcher) {
+        (Some(inputs), Some(launcher_plan)) => {
+            let LauncherInputs { control, registry, helpers, cgroups } = inputs;
+            let mut files = Vec::new();
+            for (helper, (helper_exec, helper_script)) in launcher_plan.helpers.iter().zip(&helpers) {
+                let name = crate::helper_policy::helper_file_name(helper.program.argv[0].as_bytes()).ok_or(Error::Executable)?;
+                files.push((CString::new(name).map_err(|_| Error::Executable)?, helper_exec.as_raw_fd()));
+                match (&helper.program.script, helper_script) {
+                    (Some((_, path)), Some(fd)) => files.push((path.clone(), fd.as_raw_fd())),
+                    (None, None) => {}
+                    _ => return Err(Error::Executable),
+                }
+            }
+            let mut keep = vec![exec.as_raw_fd()];
+            keep.extend(script.as_ref().map(AsRawFd::as_raw_fd));
+            keep.extend(forwarder.as_ref().map(|(_, forward_exec)| forward_exec.as_raw_fd()));
+            let readback = root.attach_helpers(mounts::HelperView { registry, files, keep,
+                tmpfs_bytes: launcher_plan.tmpfs_bytes }, &plan.root).map_err(|_| Error::Mount)?;
+            let [procs, kill, foreground, recording] = cgroups;
+            Some((super::launcher::Prepared { control, helpers, slots: [foreground, recording], binds: readback.binds },
+                RuntimeCgroup { procs, kill }))
+        }
+        (None, None) => None,
+        _ => return Err(Error::Descriptors),
+    };
     let pty = root.take_pty();
     let slave = if let Some(pty) = pty {
         let size = plan.pty_size.ok_or(Error::Descriptors)?;
@@ -377,7 +441,7 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
         let supervisor_identity = (plan.supervisor_uid, plan.supervisor_gid);
         // The parent never needs heap state again. Do not drop fd owners after
         // sweeping descriptors: a reused descriptor must never be closed twice.
-        std::mem::forget((plan, exec, script, prompt, attachments, stdin, mcp, forwarder, slave, write));
+        std::mem::forget((plan, exec, script, prompt, attachments, stdin, mcp, forwarder, slave, write, launcher));
         supervisor(status, pidfd, machine, supervisor_identity, failure)
     } else {
         drop(read);
@@ -387,7 +451,7 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
             failure.record(error); write_status(status, bootstrap::error_status(error)); exit_now(125);
         }
         let result = child_init(plan, exec, script, prompt, attachments, stdin, mcp, forwarder,
-            slave, ready.landlock_ruleset_abi, status, machine, failure);
+            slave, launcher, ready.landlock_ruleset_abi, status, machine, failure);
         if let Err(error) = result { failure.record(error); write_status(status, bootstrap::error_status(error)); }
         exit_now(125)
     }
@@ -404,8 +468,9 @@ struct CloneArgs {
 /// exec. It is not a capability and contains no text. Successful exec destroys
 /// the anonymous mapping, so runtime code cannot modify it. It intentionally
 /// lives until process exit; no munmap is needed under the supervisor filter.
+/// The HX launcher is never exec'd, so it unmaps its copy after marking [F12].
 #[derive(Clone, Copy)]
-struct FailurePage(*const SharedStatus);
+pub(super) struct FailurePage(*const SharedStatus);
 #[repr(C)]
 struct SharedStatus { error: AtomicU32, supervisor_ready: AtomicU32, isolated: AtomicU32 }
 impl FailurePage {
@@ -417,16 +482,25 @@ impl FailurePage {
         unsafe { word.write(SharedStatus { error: AtomicU32::new(0), supervisor_ready: AtomicU32::new(0), isolated: AtomicU32::new(0) }); }
         Ok(Self(word))
     }
-    fn record(self, error: Error) {
+    pub(super) fn record(self, error: Error) {
         let _ = unsafe { &*self.0 }.error.compare_exchange(0, u32::from(bootstrap::error_code(error)), Ordering::Release, Ordering::Relaxed);
     }
     fn read(self) -> u8 {
         let code = unsafe { &*self.0 }.error.load(Ordering::Acquire);
         if code <= 16 { code as u8 } else { bootstrap::error_code(Error::Status) }
     }
-    fn mark_isolated(self, bit: u32) { unsafe { &*self.0 }.isolated.fetch_or(bit, Ordering::Release); }
-    fn all_isolated(self, forwarder: bool) -> bool {
-        self.read() == 0 && unsafe { &*self.0 }.isolated.load(Ordering::Acquire) == if forwarder { 3 } else { 1 }
+    pub(super) fn mark_isolated(self, bit: u32) { unsafe { &*self.0 }.isolated.fetch_or(bit, Ordering::Release); }
+    /// Runtime bit 1 always; forwarder bit 2 and launcher bit 4 exactly when planned.
+    fn all_isolated(self, forwarder: bool, launcher: bool) -> bool {
+        let expected = 1 | if forwarder { 2 } else { 0 } | if launcher { LAUNCHER_ISOLATED } else { 0 };
+        self.read() == 0 && unsafe { &*self.0 }.isolated.load(Ordering::Acquire) == expected
+    }
+    /// Launcher only, after `mark_isolated`: drop this process's writable mapping.
+    ///
+    /// # Safety
+    /// No copy of this `FailurePage` may be used afterwards in this process.
+    pub(super) unsafe fn unmap(self) -> bool {
+        unsafe { libc::munmap(self.0.cast_mut().cast(), 4096) == 0 }
     }
     fn allow_child(self) { unsafe { &*self.0 }.supervisor_ready.store(1, Ordering::Release); }
     fn await_supervisor(self) -> Result<()> {
@@ -497,8 +571,12 @@ fn supervisor(status: RawFd, pidfd: RawFd, mut machine: Machine, identity: (u32,
 #[allow(clippy::too_many_arguments)]
 fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: OwnedFd,
     attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, forwarder: Option<(OwnedFd,OwnedFd)>,
-    slave: Option<OwnedFd>, abi: u32, status: RawFd, mut machine: Machine, failure: FailurePage) -> Result<()> {
+    slave: Option<OwnedFd>, launcher: Option<(super::launcher::Prepared, RuntimeCgroup)>, abi: u32, status: RawFd,
+    mut machine: Machine, failure: FailurePage) -> Result<()> {
     mounts::mount_proc(plan.proc_subset_pid).map_err(|_| Error::Mount)?; machine.advance(Stage::ProcMounted)?;
+    // [F2] Still root with CAP_SYS_RESOURCE: value and inherited minimum become
+    // 0 before the forwarder, launcher or runtime exists (only the supervisor keeps -1000).
+    privileges::reset_oom_score_adj()?;
     privileges::set_securebits()?; machine.advance(Stage::Securebits)?;
     privileges::drop_bounding()?; machine.advance(Stage::BoundingDropped)?;
     privileges::set_identity(plan.root.employee_uid, plan.root.employee_gid)?; machine.advance(Stage::IdentityDropped)?;
@@ -507,12 +585,44 @@ fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: 
     privileges::no_new_privileges()?; machine.advance(Stage::NoNewPrivileges)?;
     privileges::verify(plan.root.employee_uid, plan.root.employee_gid)?; machine.advance(Stage::PrivilegesVerified)?;
     write_status(status, bootstrap::status(1, 0, abi));
-    restrict_filesystem(abi)?; machine.advance(Stage::Landlocked)?;
     let arch = Architecture::native().map_err(|_| Error::Seccomp)?;
+    // HX launcher (D8 revision §2.1): forked HERE, after privilege readback and
+    // BEFORE init's runtime Landlock, so its Landlock domain is a sibling of the
+    // runtime's and not nested in it (the primary guard against the runtime
+    // reaching the launcher's or a helper's /proc and memory). Non-dumpable is
+    // inherited from `non_dumpable` above; no exec, no extra artifact (Q1 = A).
+    let mut launcher_pid = None;
+    let mut launcher_ready = None;
+    let mut runtime_cgroup = None;
+    if let Some((prepared, cgroup)) = launcher {
+        let filters = super::launcher::Filters::build(arch, &plan)?;
+        let mut ready = [-1; 2];
+        super::checked(unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) }, Error::Process)?;
+        let ready_read = unsafe { OwnedFd::from_raw_fd(ready[0]) };
+        let ready_write = unsafe { OwnedFd::from_raw_fd(ready[1]) };
+        let child = fork()?;
+        if child == 0 {
+            drop(ready_read);
+            super::launcher::serve(&plan, prepared, filters, ready_write, status, failure, abi);
+        }
+        machine.advance(Stage::LauncherForked)?;
+        // Launcher-only authority leaves init now: control socket, helper
+        // executables and the slot cgroup files.
+        drop((ready_write, prepared, filters));
+        launcher_pid = Some(child);
+        launcher_ready = Some(ready_read);
+        runtime_cgroup = Some(cgroup);
+    }
+    restrict_filesystem(abi)?; machine.advance(Stage::Landlocked)?;
     let common = seccomp::common(arch);
     common.install().map_err(|_| Error::Seccomp)?; machine.advance(Stage::CommonFiltered)?;
     let runtime_filter = seccomp::runtime(arch, &plan.program.seccomp, plan.program.seccomp_digest).map_err(|_| Error::Seccomp)?;
-    let init_filter = seccomp::init(arch, status).map_err(|_| Error::Seccomp)?;
+    let (runtime_procs, runtime_kill) = match runtime_cgroup {
+        Some(RuntimeCgroup { procs, kill }) => (Some(procs), Some(kill)),
+        None => (None, None),
+    };
+    let init_filter = seccomp::init_with_kill(arch, status, runtime_kill.as_ref().map(AsRawFd::as_raw_fd))
+        .map_err(|_| Error::Seccomp)?;
     install_signal_handlers()?;
     let mut exec_pipe = [-1; 2];
     super::checked(unsafe { libc::pipe2(exec_pipe.as_mut_ptr(), libc::O_CLOEXEC) }, Error::Process)?;
@@ -538,12 +648,13 @@ fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: 
     machine.advance(Stage::Forked)?;
     if runtime == 0 {
         drop(exec_check);
-        let result = execute_runtime(&plan.program, exec, script, prompt, attachments, stdin, mcp, slave, exec_done, &runtime_filter, machine, failure);
+        let result = execute_runtime(&plan.program, exec, script, prompt, attachments, stdin, mcp, slave, exec_done,
+            runtime_procs, &runtime_filter, machine, failure);
         if let Err(error) = result { failure.record(error); write_status(status, bootstrap::error_status(error)); }
         exit_now(126);
     }
     RUNTIME_PID.store(runtime, Ordering::Relaxed);
-    drop(exec_done);
+    drop((exec_done, runtime_procs));
     // EOF alone is not evidence: a child can die before exec. Shared flags are
     // written only after final fd readback, Landlock and seccomp installation.
     let mut byte = 0u8;
@@ -554,7 +665,11 @@ fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: 
         return Err(Error::Exec);
     }
     drop(exec_check);
-    if !failure.all_isolated(forwarder_pid.is_some()) { return Err(Error::Exec); }
+    // [F12] The launcher writes its ready byte only after marking bit 4,
+    // unmapping its page and closing its status fd; wait (bounded) before the
+    // isolation check so a slow launcher cannot race `all_isolated`.
+    if let Some(ready) = launcher_ready.take() { await_launcher(ready)?; }
+    if !failure.all_isolated(forwarder_pid.is_some(), launcher_pid.is_some()) { return Err(Error::Exec); }
     // A dead forwarder is a broken network boundary. A short successful runtime,
     // however, must preserve its actual outcome without issuing a ready receipt.
     for (pid, is_runtime) in forwarder_pid.into_iter().map(|pid| (pid, false)).chain([(runtime, true)]) {
@@ -571,25 +686,97 @@ fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: 
     // still revokes the capability if exec fails or the process exits later.
     write_status(status, bootstrap::status(7, 0, 0));
     drop((exec, script, prompt, attachments, stdin, mcp, slave));
-    fd::close_except(&[status])?; machine.advance(Stage::InitClosed)?;
+    let kill = runtime_kill.map(IntoRawFd::into_raw_fd);
+    let mut keep = vec![status];
+    keep.extend(kill);
+    fd::close_except(&keep)?; machine.advance(Stage::InitClosed)?;
     machine.advance(Stage::InitFiltered)?;
     init_filter.install().map_err(|_| Error::Seccomp)?;
     if unblock_signals().is_err() { failure.record(Error::Process); exit_now(125); }
     write_status(status, bootstrap::status(3, 0, 0));
     unsafe { libc::close(status); }
+    let drain_ms = plan.launcher.as_ref().map_or(0, |launcher| launcher.drain_ms);
+    reap(runtime, forwarder_pid, launcher_pid, kill, drain_ms, failure)
+}
+
+fn await_launcher(ready: OwnedFd) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(duduclaw_isolation::ipc::CONTROL_TIMEOUT_MS);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { return Err(Error::Process); }
+        let mut poll = libc::pollfd { fd: ready.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let timeout = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX).max(1);
+        let result = unsafe { libc::poll(&mut poll, 1, timeout) };
+        if result < 0 { if super::errno() == libc::EINTR { continue; } return Err(Error::Process); }
+        if result == 0 { continue; }
+        let mut byte = 0u8;
+        let count = unsafe { libc::read(ready.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+        if count < 0 && super::errno() == libc::EINTR { continue; }
+        // EOF means the launcher died (or failed) before it was isolated.
+        return if count == 1 && byte == super::launcher::READY { Ok(()) } else { Err(Error::Process) };
+    }
+}
+
+/// Init's terminal loop, under the init filter. A dead forwarder ends the run
+/// (broken network boundary); a dead launcher does not (§2.5: spawnd sees the
+/// control socket close). On runtime exit [F4]: (a) kill `rt-runtime` through
+/// the root-opened fd so its daemonized descendants (which may still hold MCP
+/// fd 3) die first; (b) SIGTERM the launcher, which refuses `Start` from then
+/// on and drains; (c) wait at most F + 2 s, re-armed every 200 ms so a missed
+/// SIGALRM cannot leave init blocked, then SIGKILL the launcher's process group
+/// and exit with the runtime's stored status. Init exit tears down the PID
+/// namespace, so every helper dies with it.
+fn reap(runtime: i32, forwarder: Option<i32>, mut launcher: Option<i32>, kill: Option<RawFd>, drain_ms: u64,
+    failure: FailurePage) -> ! {
+    let mut outcome: Option<i32> = None;
     loop {
         let mut exit = 0i32;
         let pid = unsafe { libc::waitpid(-1, &mut exit, 0) };
-        if forwarder_pid == Some(pid) {
+        if pid < 0 {
+            if super::errno() == libc::EINTR {
+                if outcome.is_some() && DRAIN_EXPIRED.load(Ordering::Relaxed) {
+                    if let Some(launcher) = launcher { unsafe { libc::kill(-launcher, libc::SIGKILL); libc::kill(launcher, libc::SIGKILL); } }
+                    break;
+                }
+                continue;
+            }
+            if outcome.is_some() { break; }
+            exit_now(125);
+        }
+        if outcome.is_none() && forwarder == Some(pid) {
             failure.record(Error::Process);
             exit_now(125);
         }
-        if pid == runtime {
-            if libc::WIFEXITED(exit) { exit_now(libc::WEXITSTATUS(exit)); }
-            if libc::WIFSIGNALED(exit) { exit_now(128 + libc::WTERMSIG(exit)); }
+        if launcher == Some(pid) {
+            launcher = None;
+            if outcome.is_some() { break; }
+            continue;
         }
-        if pid < 0 && super::errno() != libc::EINTR { exit_now(125); }
+        if pid == runtime && outcome.is_none() {
+            let code = if libc::WIFEXITED(exit) { libc::WEXITSTATUS(exit) }
+                else if libc::WIFSIGNALED(exit) { 128 + libc::WTERMSIG(exit) } else { continue };
+            // The namespace may reuse this pid; never forward signals to it again.
+            RUNTIME_PID.store(0, Ordering::Relaxed);
+            outcome = Some(code);
+            if let Some(kill) = kill { unsafe { libc::write(kill, b"1".as_ptr().cast(), 1); } }
+            match launcher {
+                None => break,
+                Some(launcher) => {
+                    unsafe { libc::kill(launcher, libc::SIGTERM); }
+                    arm_drain_alarm(drain_ms.saturating_add(LAUNCHER_DRAIN_SLACK_MS));
+                }
+            }
+        }
     }
+    exit_now(outcome.unwrap_or(125))
+}
+
+fn arm_drain_alarm(ms: u64) {
+    let value = libc::timeval { tv_sec: (ms / 1000) as libc::time_t, tv_usec: ((ms % 1000) * 1000) as libc::suseconds_t };
+    let interval = libc::timeval { tv_sec: 0, tv_usec: 200_000 };
+    let timer = libc::itimerval { it_interval: interval, it_value: value };
+    // Allowed by the init filter; on failure the run still ends at RuntimeMaxUSec.
+    unsafe { libc::setitimer(libc::ITIMER_REAL, &timer, std::ptr::null_mut()); }
 }
 
 fn restrict_filesystem(abi: u32) -> Result<()> {
@@ -610,8 +797,13 @@ fn restrict_filesystem(abi: u32) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_runtime(program: &Program, exec: OwnedFd, script: Option<OwnedFd>, prompt: OwnedFd,
-    attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, slave: Option<OwnedFd>, exec_done: OwnedFd, filter: &Filter,
-    mut machine: Machine, failure: FailurePage) -> Result<()> {
+    attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, slave: Option<OwnedFd>, exec_done: OwnedFd,
+    cgroup: Option<OwnedFd>, filter: &Filter, mut machine: Machine, failure: FailurePage) -> Result<()> {
+    // HX [F4]: move into `rt-runtime` through the root-opened `cgroup.procs`
+    // before anything else, so every runtime descendant is in that leaf.
+    if let Some(procs) = cgroup {
+        if unsafe { libc::write(procs.as_raw_fd(), b"0".as_ptr().cast(), 1) } != 1 { return Err(Error::Process); }
+    }
     super::checked(unsafe { libc::setsid() }, Error::Process)?;
     let native = std::fs::symlink_metadata("/run/native-project");
     let cwd = match native {
@@ -679,7 +871,7 @@ fn execute_raw(program: &Program, exec: OwnedFd, exec_done: OwnedFd, filter: &Fi
     exit_now(126)
 }
 
-fn dev_null(flags: i32) -> Result<OwnedFd> {
+pub(super) fn dev_null(flags: i32) -> Result<OwnedFd> {
     let fd = unsafe { libc::open(c"/dev/null".as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
     if fd < 0 { return Err(Error::Descriptors); }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -688,13 +880,15 @@ fn dev_null(flags: i32) -> Result<OwnedFd> {
     Ok(fd)
 }
 
-fn fork() -> Result<i32> {
+pub(super) fn fork() -> Result<i32> {
     // Raw clone avoids libc fork callbacks and cannot use clone3 (common returns ENOSYS).
     let pid = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0usize, 0usize, 0usize, 0usize) };
     if pid < 0 { Err(Error::Process) } else { Ok(pid as i32) }
 }
 
 static RUNTIME_PID: AtomicI32 = AtomicI32::new(0);
+static DRAIN_EXPIRED: AtomicBool = AtomicBool::new(false);
+extern "C" fn drain_expired(_signal: i32) { DRAIN_EXPIRED.store(true, Ordering::Relaxed); }
 extern "C" fn forward_signal(signal: i32) {
     let pid = RUNTIME_PID.load(Ordering::Relaxed);
     if pid > 1 {
@@ -711,6 +905,12 @@ fn install_signal_handlers() -> Result<()> {
     for signal in [libc::SIGTERM,libc::SIGINT,libc::SIGHUP] {
         super::checked(unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) }, Error::Process)?;
     }
+    // §2.5 (c): SIGALRM only sets a flag. No SA_RESTART, so init's waitpid
+    // returns EINTR; a PID-namespace init ignores SIG_DFL SIGALRM entirely.
+    let mut alarm: libc::sigaction = unsafe { std::mem::zeroed() };
+    alarm.sa_sigaction = drain_expired as *const () as usize;
+    unsafe { libc::sigemptyset(&mut alarm.sa_mask); }
+    super::checked(unsafe { libc::sigaction(libc::SIGALRM, &alarm, std::ptr::null_mut()) }, Error::Process)?;
     Ok(())
 }
 fn termination_mask() -> libc::sigset_t {
@@ -732,10 +932,10 @@ fn reset_signal_handlers() -> Result<()> {
     }
     unblock_signals()
 }
-fn write_status(fd: RawFd, bytes: [u8;12]) {
+pub(super) fn write_status(fd: RawFd, bytes: [u8;12]) {
     if unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) } != bytes.len() as isize { exit_now(125); }
 }
-fn exit_now(code: i32) -> ! { unsafe { libc::_exit(code) } }
+pub(super) fn exit_now(code: i32) -> ! { unsafe { libc::_exit(code) } }
 
 #[cfg(test)]
 mod tests {
@@ -743,15 +943,102 @@ mod tests {
     #[test]
     fn eof_without_both_final_isolation_receipts_never_admits() {
         let page = FailurePage::new().unwrap();
-        assert!(!page.all_isolated(false));
+        assert!(!page.all_isolated(false, false));
         page.mark_isolated(1);
-        assert!(page.all_isolated(false));
-        assert!(!page.all_isolated(true));
+        assert!(page.all_isolated(false, false));
+        assert!(!page.all_isolated(true, false));
         page.mark_isolated(2);
-        assert!(page.all_isolated(true));
+        assert!(page.all_isolated(true, false));
         page.record(Error::Exec);
-        assert!(!page.all_isolated(true));
+        assert!(!page.all_isolated(true, false));
         unsafe { libc::munmap(page.0.cast_mut().cast(), 4096); }
+    }
+    #[test]
+    fn launcher_ready_before_all_isolated() {
+        // A planned launcher must have marked bit 4; an unplanned bit 4 is as
+        // wrong as a missing one (exact equality, never "at least").
+        for forwarder in [false, true] {
+            let page = FailurePage::new().unwrap();
+            page.mark_isolated(1);
+            if forwarder { page.mark_isolated(2); }
+            assert!(!page.all_isolated(forwarder, true), "launcher bit missing");
+            assert!(page.all_isolated(forwarder, false));
+            page.mark_isolated(LAUNCHER_ISOLATED);
+            assert!(page.all_isolated(forwarder, true));
+            assert!(!page.all_isolated(forwarder, false), "unplanned launcher bit");
+            page.record(Error::Landlock);
+            assert!(!page.all_isolated(forwarder, true), "launcher setup error never admits");
+            unsafe { libc::munmap(page.0.cast_mut().cast(), 4096); }
+        }
+        // The launcher's unmap drops only its own mapping of a forked page.
+        let page = FailurePage::new().unwrap();
+        // The child only touches the atomic page, munmap and _exit (fork-safe).
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            page.mark_isolated(LAUNCHER_ISOLATED);
+            let unmapped = unsafe { page.unmap() };
+            unsafe { libc::_exit(if unmapped { 0 } else { 1 }); }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        page.mark_isolated(1);
+        assert!(page.all_isolated(false, true), "the parent still reads the child's mark");
+        unsafe { libc::munmap(page.0.cast_mut().cast(), 4096); }
+    }
+    fn profile(calls: &[u32]) -> (RuntimeProfile, Sha256Digest) {
+        let profile = RuntimeProfile { allowed_syscalls: calls.to_vec() };
+        let digest = profile.digest(Architecture::native().unwrap()).unwrap();
+        (profile, digest)
+    }
+    fn program(argv: &[&str], calls: &[u32], script: Option<&str>) -> Program {
+        let (seccomp, seccomp_digest) = profile(calls);
+        let identity = Identity { inode: 7, mount: 9, dev_major: 8, dev_minor: 1 };
+        Program { identity, script: script.map(|name| (Identity { inode: 8, ..identity }, CString::new(name).unwrap())),
+            argv: argv.iter().map(|arg| CString::new(*arg).unwrap()).collect(), environment: vec![], seccomp, seccomp_digest }
+    }
+    #[test]
+    fn launcher_plan_requires_parent_launcher_calls_and_flat_helper_files() {
+        let arch = Architecture::native().unwrap();
+        let parent_calls = arch.launcher_parent_calls().to_vec();
+        let parent = program(&["/runtime/claude"], &parent_calls, None);
+        let helper_calls = [arch.execveat(), arch.exit_group(), arch.launcher_parent_calls()[0]];
+        let helper = |argv: &[&str], script: Option<&str>| HelperProgram { program: program(argv, &helper_calls, script),
+            self_only: vec![], mount: 0, slot: crate::helper_policy::HelperSlot::Foreground,
+            filesystem: vec![crate::helper_policy::HelperFs::SystemRo, crate::helper_policy::HelperFs::Work],
+            open_files: 64, file_size_bytes: 1 << 20, timeout_ms: 30_000, egress: false };
+        let plan = |helpers: Vec<HelperProgram>| LauncherPlan { helpers, mounts: vec![MountIdentity { mount: 9, fs_type: 1 }],
+            tmpfs_bytes: 1 << 20, drain_ms: 10_000 };
+        assert!(plan(vec![helper(&["/helpers/program"], None)]).validate(&parent).is_ok());
+        assert!(plan(vec![helper(&["/helpers/node", "/helpers/driver.cjs"], Some("driver.cjs"))]).validate(&parent).is_ok());
+        // HX3a: F_L adds no kill/dup3/file/socket calls, so a parent without them is refused.
+        for missing in arch.launcher_parent_calls() {
+            let calls: Vec<_> = parent_calls.iter().copied().filter(|nr| *nr != missing).collect();
+            let narrow = program(&["/runtime/claude"], &calls, None);
+            assert_eq!(plan(vec![helper(&["/helpers/program"], None)]).validate(&narrow), Err(Error::Seccomp), "{missing}");
+        }
+        // Nested or non-/helpers names, and one name with two identities, are refused.
+        for argv in [&["/helpers/a/b"][..], &["/runtime/program"], &["/helpers/.."]] {
+            assert!(plan(vec![helper(argv, None)]).validate(&parent).is_err(), "{argv:?}");
+        }
+        assert!(plan(vec![helper(&["/helpers/node", "/helpers/sub/driver.cjs"], Some("sub/driver.cjs"))]).validate(&parent).is_err());
+        let mut other = helper(&["/helpers/program"], None);
+        other.program.identity.inode = 99;
+        assert!(plan(vec![helper(&["/helpers/program"], None), other]).validate(&parent).is_err());
+        // Exactly one registry mount; bounded drain window.
+        let mut two = plan(vec![helper(&["/helpers/program"], None)]);
+        two.mounts.push(MountIdentity { mount: 10, fs_type: 1 });
+        assert!(two.validate(&parent).is_err());
+        for drain_ms in [0, MAX_LAUNCHER_DRAIN_MS + 1] {
+            let mut bad = plan(vec![helper(&["/helpers/program"], None)]);
+            bad.drain_ms = drain_ms;
+            assert!(bad.validate(&parent).is_err());
+        }
+        // F_H must stay within the parent (a call the parent lacks).
+        let mut wide = helper(&["/helpers/program"], None);
+        (wide.program.seccomp, wide.program.seccomp_digest) = profile(&[arch.execveat(), arch.exit_group(), 0x3ff]);
+        assert_eq!(plan(vec![wide]).validate(&parent), Err(Error::Seccomp));
     }
     #[test]
     fn supervisor_barrier_never_releases_after_preparation_failure() {

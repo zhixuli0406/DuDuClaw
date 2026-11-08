@@ -104,3 +104,69 @@ fn iso_root_e2e_sealed_bootstrap_trampoline_double_fork_teardown() { fixture("la
 #[test]
 #[ignore = "requires root Linux full trampoline; --features root-test-fixture"]
 fn iso_root_e2e_sealed_bootstrap_fast_exit_preserves_status() { fixture("launch-fast-exit"); }
+
+// HX3b in-run helper launcher (D8 revision §7). Need root, cgroup v2 with
+// cgroup.kill, Landlock and the open-time-credentials fix (CVE-2021-4197);
+// they create and remove a fixture cgroup under /sys/fs/cgroup.
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_launcher_forked_before_runtime_landlock() { fixture("helper-proc"); }
+
+/// Same scenario: the decisive check is the dumpable helper, whose /proc stays
+/// invisible to the same-uid runtime only because its Landlock domain is not
+/// nested in the runtime's. Meaningful on any Yama setting (Yama only gates
+/// PTRACE_ATTACH); run it on Debian 12 (ptrace_scope=0) as §7 asks.
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_runtime_cannot_access_proc_of_helper() { fixture("helper-proc"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_launcher_fd_table_exact() { fixture("helper-launcher-fds"); }
+
+/// The isolation receipt (7) is issued only after init read the launcher's
+/// ready byte; at that receipt the launcher has already closed its status and
+/// ready pipes (checked in the same scenario).
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_launcher_ready_before_all_isolated() { fixture("helper-launcher-fds"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_helper_fd_table_exact() { fixture("helper-fds"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_only_supervisor_oom_protected() { fixture("helper-oom"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_helper_cannot_open_home_config_tmp_devshm() { fixture("helper-fs"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_offline_helper_socket_eperm() { fixture("helper-socket"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_runtime_cannot_exec_helpers() { fixture("helper-exec"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_runtime_cannot_precreate_helper_scratch() { fixture("helper-scratch"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_runtime_descendants_killed_on_runtime_exit() { fixture("helper-descendants"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_launcher_refuses_start_after_sigterm() { fixture("helper-sigterm"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_init_wait_bounded_with_stopped_launcher() { fixture("helper-stopped"); }
+
+#[test]
+#[ignore = "requires root Linux, cgroup v2 + Landlock, full trampoline with launcher; --features root-test-fixture"]
+fn iso_root_helper_helper_raise_rlimit_denied() { fixture("helper-rlimit"); }

@@ -5,8 +5,11 @@ use duduclaw_isolation::{execution::{ResourceLimits, RunTimeouts}, ids::{Employe
 pub const TRAMPOLINE: &str = "/usr/lib/duduclaw/duduclaw-run";
 pub const SPAWND: &str = "/usr/lib/duduclaw/duduclaw-spawnd";
 // CAP_CHOWN is required for per-run devpts (R7-M1). No CAP_FOWNER is granted.
+// CAP_SYS_RESOURCE (24): supervisor-only oom_score_adj = -1000 and init's reset
+// of value and inherited minimum to 0 (HX D8 revision §2.1 [F2]); dropped with
+// the whole bounding set before any employee-uid process exists.
 pub const TRAMPOLINE_CAPABILITIES: u64 = (1 << 0) | (1 << 6) | (1 << 7)
-    | (1 << 8) | (1 << 12) | (1 << 21);
+    | (1 << 8) | (1 << 12) | (1 << 21) | (1 << 24);
 pub const TRAMPOLINE_NAMESPACES: u64 = 0x0002_0000 | 0x0800_0000 | 0x0400_0000
     | 0x4000_0000 | 0x2000_0000;
 
@@ -813,6 +816,11 @@ mod tests {
         assert_eq!(policy.properties["CapabilityBoundingSet"], Property::U64(TRAMPOLINE_CAPABILITIES));
         assert_eq!(TRAMPOLINE_CAPABILITIES & 1, 1);
         assert_eq!(TRAMPOLINE_CAPABILITIES & (1 << 3), 0);
+        // HX [F2]: supervisor-only OOM protection needs CAP_SYS_RESOURCE before the drop.
+        assert_eq!(TRAMPOLINE_CAPABILITIES & (1 << 24), 1 << 24);
+        #[cfg(target_os = "linux")]
+        assert_eq!(duduclaw_run::linux::privileges::REQUIRED_BOUNDING_CAPABILITIES.iter().fold(0u64, |bits, cap| bits | 1 << cap),
+            TRAMPOLINE_CAPABILITIES);
         assert_eq!(TRAMPOLINE_NAMESPACES & 0x1000_0000, 0);
         assert_eq!(policy.properties["RuntimeMaxUSec"], Property::U64(60_000_000));
         assert_eq!(policy.properties["KillMode"], Property::Text("control-group".into()));

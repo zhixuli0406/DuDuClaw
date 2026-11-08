@@ -16,6 +16,17 @@ pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, O
     WorkAnchorBackfilled,
     /// H4: start-up anchor backfill could not create/verify an anchor.
     WorkAnchorBackfillFailed,
+    /// HX4: spawnd sent `Start` for a helper call (detail: `helper`).
+    HelperStarted,
+    /// HX4: a helper call ended root-side (detail: `helper` with the outcome).
+    HelperEnded,
+    /// HX4: a `HelperCall` was refused (detail: the wire code).
+    HelperRefused,
+    /// HX4: the run's launcher channel or slot cgroups were lost (detail: code).
+    HelperChannelClosed,
+    /// F6l (§3.12 step 8): an employee's root allocation was retired
+    /// (detail: `retired`).
+    Retired,
 }
 /// Bounded, content-free detail. Never a path, file name, file content or
 /// free-form text: identities and counts only.
@@ -27,6 +38,18 @@ pub enum Detail {
     WorkSource { device_major: u32, device_minor: u32, inode: u64, size: u64 },
     Code { code: duduclaw_isolation::ipc::ErrorCode },
     Stopped { runs: u16, confirmed: bool },
+    /// HX4 helper call: spawnd's call id, the signed helper index in the
+    /// parent's list, the slot, the input memfd size and, once ended, the
+    /// root-determined outcome. No argv, path, input or output content.
+    Helper { call: duduclaw_isolation::ipc::HelperCallId, helper: u8, slot: duduclaw_isolation::ipc::HelperSlot,
+        input_bytes: u64, effective_timeout_ms: Option<u64>, outcome: Option<duduclaw_isolation::ipc::HelperOutcome> },
+    /// F6l retire (S12): the burned UID, the label (validated agent id), the
+    /// last observed usage (`None` when it could not be read, e.g. a resumed
+    /// retire), the quota, the 16-hex quarantine digest prefix, the requester
+    /// and approver user ids (validated opaque ids) and the early-purge flag.
+    /// Every text value was validated by `allocation::retire_specification`.
+    Retired { uid: u32, label: String, used_bytes: Option<u64>, used_inodes: Option<u64>, quota_bytes: u64, quota_inodes: u64,
+        quarantine_digest_prefix: String, requested_by: String, approved_by: String, early: bool },
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -377,5 +400,28 @@ mod tests {
         let stopped = Record { at_unix_ms: 1, event: Event::EmployeeRunsStopped, employee: None, run: None, suppressed: 0,
             detail: Some(Detail::Stopped { runs: 3, confirmed: false }) };
         assert_eq!(serde_json::to_value(stopped).unwrap()["detail"]["confirmed"], false);
+    }
+    #[test]
+    fn hx4_helper_events_carry_ids_sizes_and_outcome_never_content() {
+        use duduclaw_isolation::ipc::{HelperCallId, HelperOutcome, HelperSlot};
+        let detail = Detail::Helper { call: HelperCallId::new([7; 16]).unwrap(), helper: 2, slot: HelperSlot::Recording,
+            input_bytes: 12, effective_timeout_ms: None, outcome: Some(HelperOutcome::OomKilled) };
+        let record = Record { at_unix_ms: 1, event: Event::HelperEnded, employee: Some(EmployeeId([1; 16])),
+            run: Some(RunId([2; 16])), suppressed: 0, detail: Some(detail.clone()) };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["event"], "helper_ended");
+        assert_eq!(value["detail"]["kind"], "helper");
+        assert_eq!(value["detail"]["outcome"]["kind"], "oom_killed");
+        let keys: Vec<_> = value["detail"].as_object().unwrap().keys().cloned().collect();
+        assert!(keys.iter().all(|key| !matches!(key.as_str(), "path" | "argv" | "env" | "name" | "content" | "output")), "{keys:?}");
+        let line = serde_json::to_vec(&record).unwrap();
+        assert!(line.len() < LINE_BYTES);
+        assert_eq!(serde_json::from_slice::<Record>(&line).unwrap().detail, Some(detail));
+        let mut forged = value;
+        forged["detail"]["argv"] = "rm -rf".into();
+        assert!(serde_json::from_value::<Record>(forged).is_err());
+        for event in [Event::HelperStarted, Event::HelperRefused, Event::HelperChannelClosed] {
+            assert!(serde_json::to_value(event).unwrap().as_str().unwrap().starts_with("helper_"));
+        }
     }
 }

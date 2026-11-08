@@ -2,7 +2,10 @@
 //! an alternate executor. All slow operations run off the control socket thread.
 use std::{collections::{BTreeMap, BTreeSet}, io, os::fd::{AsFd, OwnedFd}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize, NetworkPolicy}, ids::{EmployeeId, RunId, RequestId}, ipc::{CleanupReadback, ErrorCode, SpawnRequest}};
-use crate::{Result, admission::{BrokerJob, BrokerReply, BrokerStep, Host, HostProgress, LaunchPolicy, Ticket},
+use duduclaw_isolation::ipc::{HelperCallId, SpawndFeatures as Features};
+use crate::{Result, admission::{BrokerJob, BrokerReply, BrokerStep, Host, HostProgress, LaunchPolicy, Ticket,
+        HelperEvent, HelperSignal, HelperStart, HelperStarted},
+    helper_host::{CallPlan, HelperAudit, HelperEngine},
     accounts::{self, InstallationEvidence, LinuxAccounts},
     audit::{Detail, Event, Record, disk::AuditWorker}, bootstrap::{BootstrapPlan, Trampoline},
     channels::{OutputRelay, RevocablePair, ConnectionRevoker}, fds::SnapshotAuthority,
@@ -294,6 +297,24 @@ struct LiveRun {
     /// `select_workspace`) and the pins of in-flight snapshot copies; released
     /// (and drained) before any `Storage::detach` of this run.
     broker: crate::work_broker::BrokerRoot,
+    /// HX4: the parent runtime the helper table is derived from (per call,
+    /// from this run's employee) and the run's helper engine, linked from the
+    /// trampoline once Running; shut down before the trampoline is closed.
+    helper_parent: Option<crate::policy::PublishedRuntime>,
+    helper: Option<RunHelper>,
+}
+/// HX4 per-run helper state on the lifecycle thread.
+enum RunHelper { Engine(Box<HelperEngine<crate::helper_cgroup::linux::UnitTree>>), Unavailable(ErrorCode) }
+/// Content-free helper audit (helper index, slot, sizes, outcome).
+fn emit_helper(audit: &AuditWorker, employee: EmployeeId, run: RunId, fact: HelperAudit) {
+    let (event, detail) = match fact {
+        HelperAudit::Started { call, index, slot, input_bytes, effective_timeout_ms } => (Event::HelperStarted,
+            Detail::Helper { call, helper: index, slot, input_bytes, effective_timeout_ms: Some(effective_timeout_ms), outcome: None }),
+        HelperAudit::Ended { call, index, slot, input_bytes, outcome } => (Event::HelperEnded,
+            Detail::Helper { call, helper: index, slot, input_bytes, effective_timeout_ms: None, outcome: Some(outcome) }),
+        HelperAudit::Closed { code } => (Event::HelperChannelClosed, Detail::Code { code }),
+    };
+    emit_detail(audit, event, Some(employee), Some(run), Some(detail));
 }
 /// The core owns every privileged side effect. WorkerHost supplies bounded
 /// mailboxes and the independent UID monitor supplies live fail-closed fencing.
@@ -305,6 +326,8 @@ struct Core {
     policy: Option<RootPolicy>, report: EvidenceReport, gateway: (u32, u32), monitor: Monitor,
     runs: BTreeMap<RunId, LiveRun>, audit: AuditWorker, last_refresh: Instant, poisoned: bool,
     view: Arc<Mutex<PublishedView>>,
+    /// HX4 events of engines already shut down (run cleanup).
+    helper_events: Vec<HelperEvent>,
 }
 impl LinuxHost {
     pub fn open(gateway: (u32, u32), components: Components, audit: AuditWorker) -> io::Result<Self> {
@@ -318,9 +341,14 @@ impl LinuxHost {
             report: EvidenceReport::current(Readiness::default(), 0)?, policy: None,
             employees: registry.registry().employees.iter().filter(|a| a.state == crate::registry::AccountState::Ready).map(|a| a.employee).collect(),
         }));
-        let mut core = Core { allocator: crate::allocation::Allocator::open()?, registry, systemd: Systemd::connect()?, journal: RunJournal::open()?,
+        // F6l S5a: a missing allocation journal is refused while the registry
+        // or storage still shows an employee (no silent empty journal).
+        let mut components = components;
+        let allocator = crate::allocation::Allocator::open(registry.registry(), components.storage.as_mut())?;
+        let mut core = Core { allocator, registry, systemd: Systemd::connect()?, journal: RunJournal::open()?,
             components, policy: None, report: EvidenceReport::current(Readiness::default(), 0)?, gateway,
-            monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone() };
+            monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
+            helper_events: Vec::new() };
         core.report.publish(gateway.1)?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
@@ -407,6 +435,8 @@ impl Core {
             Ok(mut report) => {
                 report.checked_boottime_ms = probe_started;
                 report.landlock = landlock;
+                // [F17, H4] the same set every `Reserved` carries (LinuxHost::features).
+                report.features = self.features();
                 self.report = report;
                 if self.report.publish(self.gateway.1).is_err() { self.poisoned = true; self.report.checks.startup_reconciled = false; }
             },
@@ -513,6 +543,14 @@ impl Core {
             if let Some(run) = previous {
                 let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
                 if !entry.closed {
+                    // HX4: live helper calls end RunEnded and the launcher
+                    // channel closes before the trampoline and its fds go.
+                    if let Some(RunHelper::Engine(mut engine)) = entry.helper.take() {
+                        engine.shutdown();
+                        self.helper_events.extend(engine.take_events());
+                        for fact in engine.take_audit() { emit_helper(&self.audit, employee, run.0, fact); }
+                    }
+                    entry.helper = Some(RunHelper::Unavailable(ErrorCode::NotReady));
                     // H4: the broker clone pins the employee filesystem. Drop it
                     // first, and wait for in-flight snapshot copies (each holds a
                     // dup and a pin; bounded by the 10 s copy deadline) before
@@ -546,13 +584,28 @@ impl Core {
     }
 }
 impl Host for Core {
-    fn allocation(&mut self, request: &duduclaw_migration::allocation::Request) -> Result<duduclaw_migration::allocation::Receipt> {
-        if self.poisoned { return Err(unavailable()); }
-        // Allocation never races an active run or the lifecycle's H journal.
-        if request.action != duduclaw_migration::allocation::Action::ReadBack && !self.runs.is_empty() { return Err(ErrorCode::NotReady); }
+    fn allocation(&mut self, request: &duduclaw_migration::allocation::Request)
+        -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
+        use duduclaw_migration::allocation::ErrorCode as Wire;
+        if self.poisoned { return Err(Wire::IsolationUnavailable); }
+        // F6l: the idle readback (S14/S17) of a Ready subject, read in this
+        // worker turn; every source readable or an error (never zero).
+        let idle = self.allocator.subject(request).map(|employee| self.employee_idle(employee));
+        // The gate itself is applied by the allocator: a Retired replay is
+        // answered before it (S15), ReadBack never waits for it.
+        let host_busy = !self.runs.is_empty();
+        let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut accounts = LinuxAccounts { evidence: self.components.installation.as_ref() };
-        let result = self.allocator.handle(request, &mut self.registry, &mut accounts, self.components.storage.as_mut());
-        let mut entries = self.monitor.entries.lock().map_err(|_| unavailable())?;
+        let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
+            storage: self.components.storage.as_mut(), host_busy, idle, now_unix });
+        for event in self.allocator.take_events() {
+            match event {
+                crate::allocation::AllocationEvent::Retired { employee, detail } =>
+                    emit_detail(&self.audit, Event::Retired, Some(employee), None, Some(detail)),
+                crate::allocation::AllocationEvent::Intruder { employee } => emit(&self.audit, Event::Intruder, Some(employee), None),
+            }
+        }
+        let mut entries = self.monitor.entries.lock().map_err(|_| Wire::IsolationUnavailable)?;
         // Even a failed allocation may have created a durable UID reservation.
         // Monitor every such identity before returning its failure to the gateway.
         for account in &self.registry.registry().employees {
@@ -577,6 +630,65 @@ impl Host for Core {
             BrokerJob::WorkAnchor { employee } => self.broker_anchor(employee).map(|anchor| BrokerStep::Done(BrokerReply::WorkAnchor(anchor))),
             BrokerJob::EmployeeIdle { employee } => self.employee_idle(employee).map(|report| BrokerStep::Done(BrokerReply::Idle(report))),
         }
+    }
+    /// HX4 host-level availability, the source of the `helper_calls` bit:
+    /// the trampoline forks launchers, the publication has launcher plans, and
+    /// the slot cgroups are not known to lack open-time credentials (probed
+    /// on the first helper-enabled run; a failed probe clears the bit).
+    fn helpers_ready(&mut self) -> Result<()> {
+        if crate::helper_cgroup::linux::open_time_credentials_observed() == Some(false) { return Err(ErrorCode::HelperCgroupUnavailable); }
+        if self.poisoned || !duduclaw_run::linux::runner::LAUNCHER_SUPPORTED
+            || !self.policy.as_ref().is_some_and(RootPolicy::launchers_active) { return Err(ErrorCode::HelperUnavailable); }
+        Ok(())
+    }
+    fn features(&mut self) -> Features {
+        let features = crate::host_state::DECODED_FEATURES;
+        if self.helpers_ready().is_ok() { features.with(Features::HELPER_CALLS) } else { features }
+    }
+    fn helper_run(&mut self, job: HelperStart<Vec<OwnedFd>>) -> Result<HelperStarted<Vec<OwnedFd>>> {
+        if self.poisoned { return Err(ErrorCode::HelperUnavailable); }
+        let HelperStart { run, employee, call, helper, slot, timeout_ms, input_bytes, mut input, run_remaining_ms } = job;
+        let input = match (input.pop(), input.is_empty()) { (Some(fd), true) => fd, _ => return Err(ErrorCode::InvalidFds) };
+        let cancelled = self.monitor.cancellation(run).map_err(|_| ErrorCode::NotReady)?;
+        let entry = self.runs.get(&run.0).ok_or(ErrorCode::NotFound)?;
+        // [F7] root's own record of the run's employee must be the coordinator's.
+        if entry.employee != employee { return Err(ErrorCode::Unauthorized); }
+        if entry.closed || !entry.started_event || cancelled.load(Ordering::Acquire) { return Err(ErrorCode::NotReady); }
+        let parent = entry.helper_parent.as_ref().ok_or(ErrorCode::HelperUnavailable)?;
+        let policy = self.policy.as_ref().ok_or(ErrorCode::HelperUnavailable)?;
+        // §2.3: re-derived per call from the run's employee (entitlement may
+        // have been withdrawn since start), never from the request.
+        let derived = policy.derive_helper(entry.employee, parent, &helper).map_err(|_| ErrorCode::RuntimeDenied)?;
+        if derived.binding.slot != slot { return Err(ErrorCode::InvalidRequest); }
+        // Root's own deadline bounds the coordinator's view.
+        let own = u64::try_from(entry.runtime_deadline.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX);
+        let plan = CallPlan { call, index: derived.index, slot, requested_ms: timeout_ms, input_bytes,
+            run_remaining_ms: run_remaining_ms.min(own), termination_grace_ms: parent.timeouts.termination_grace_ms };
+        let now = os(crate::server::coordination_time_ms())?;
+        let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
+        let engine = match entry.helper.as_mut() {
+            Some(RunHelper::Engine(engine)) => engine,
+            Some(RunHelper::Unavailable(code)) => return Err(*code),
+            None => return Err(ErrorCode::NotReady),
+        };
+        let started = engine.start(now, plan, input);
+        for fact in engine.take_audit() { emit_helper(&self.audit, employee, run.0, fact); }
+        let started = started?;
+        Ok(HelperStarted { effective_timeout_ms: started.effective_timeout_ms, pipes: vec![started.stdout, started.stderr] })
+    }
+    fn helper_signal(&mut self, run: RunHandle, call: HelperCallId, signal: HelperSignal) -> Result<()> {
+        let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
+        let Some(RunHelper::Engine(engine)) = entry.helper.as_mut() else { return Ok(()) };
+        let result = engine.signal(call, signal);
+        for fact in engine.take_audit() { emit_helper(&self.audit, entry.employee, run.0, fact); }
+        result
+    }
+    fn helper_events(&mut self) -> Vec<HelperEvent> {
+        let mut events = std::mem::take(&mut self.helper_events);
+        for entry in self.runs.values_mut() {
+            if let Some(RunHelper::Engine(engine)) = entry.helper.as_mut() { events.extend(engine.take_events()); }
+        }
+        events
     }
     type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
     fn ready(&mut self, employee: EmployeeId) -> Result<()> {
@@ -608,7 +720,7 @@ impl Host for Core {
         self.runs.insert(run.0, LiveRun { employee, unit: None, attachment: None, revokers: vec![], gateway_io: Some(vec![]),
             relays: vec![], egress: false, pty: *pty, pty_taken: false, closed: false, started_event: false, truncated_event: false,
             runtime_deadline: Instant::now() + Duration::from_millis(runtime.timeouts.runtime_ms), bootstrap_attempted: false, projection: None,
-            broker: crate::work_broker::BrokerRoot::new(None) });
+            broker: crate::work_broker::BrokerRoot::new(None), helper_parent: Some(runtime.clone()), helper: None });
         let mut storage = self.components.storage.attach(employee, account.uid, run, &runtime.resources.disk)?;
         storage.receipt.check(employee, run)?;
         self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.attachment = Some(storage.receipt.clone());
@@ -677,7 +789,8 @@ impl Host for Core {
                     crate::native_trampoline::HelperRun { index: entry.index, binding: entry.binding.clone(),
                         runtime: entry.runtime.clone(), executable, script }).collect();
                 native_profile.launcher = Some(crate::native_trampoline::LauncherProfile { helpers, mount: prepared.mount,
-                    tmpfs_bytes: policy.helper_tmpfs_bytes(&runtime).ok_or_else(unavailable)? });
+                    tmpfs_bytes: policy.helper_tmpfs_bytes(&runtime).ok_or_else(unavailable)?,
+                    drain_ms: crate::native_trampoline::launcher_drain_ms(runtime.timeouts.termination_grace_ms) });
             }
         }
         let sealed_plan = plan.seal()?;
@@ -707,6 +820,16 @@ impl Host for Core {
             if !entry.started_event {
                 self.monitor.running(run, entry.runtime_deadline)?;
                 emit(&self.audit, Event::Started, Some(entry.employee), Some(run.0)); entry.started_event = true; }
+            // HX4: the launcher link moves out of the trampoline once, when Running.
+            if matches!(progress, HostProgress::Running { .. }) && entry.helper.is_none() {
+                entry.helper = Some(match self.components.trampoline.take_helper_link(run) {
+                    Ok(link) => match HelperEngine::new(run, link) {
+                        Ok(engine) => RunHelper::Engine(Box::new(engine)),
+                        Err(code) => RunHelper::Unavailable(code),
+                    },
+                    Err(code) => RunHelper::Unavailable(code),
+                });
+            }
         }
         Ok(progress)
     }
@@ -736,6 +859,16 @@ impl Host for Core {
         self.runs.remove(&run.0); Ok(())
     }
     fn maintenance(&mut self) -> Result<()> {
+        // HX4: launcher frames, spawnd's watchdog and the runtime cgroup, every turn.
+        if let Ok(now) = crate::server::coordination_time_ms() {
+            for (run, entry) in &mut self.runs {
+                if entry.closed { continue; }
+                if let Some(RunHelper::Engine(engine)) = entry.helper.as_mut() {
+                    engine.service(now);
+                    for fact in engine.take_audit() { emit_helper(&self.audit, entry.employee, *run, fact); }
+                }
+            }
+        }
         for (run, entry) in &mut self.runs {
             for relay in &mut entry.relays {
                 if relay.pump().is_err() {
@@ -783,6 +916,19 @@ impl Host for LinuxHost {
     fn broker_submit(&mut self, t: Ticket, j: BrokerJob) -> Result<()> { self.worker.broker_submit(t, j) }
     fn broker_poll(&mut self, t: Ticket) -> Result<Option<BrokerReply>> { self.worker.broker_poll(t) }
     fn broker_abandon(&mut self, t: Ticket) { self.worker.broker_abandon(t) }
+    /// [F17, H4] exactly the published readiness report's set (one source).
+    fn features(&mut self) -> Features {
+        self.view.try_lock().map(|view| view.report.features).unwrap_or(crate::host_state::DECODED_FEATURES)
+    }
+    fn helpers_ready(&mut self) -> Result<()> {
+        if self.features().contains(Features::HELPER_CALLS) { return Ok(()); }
+        Err(if crate::helper_cgroup::linux::open_time_credentials_observed() == Some(false) { ErrorCode::HelperCgroupUnavailable }
+            else { ErrorCode::HelperUnavailable })
+    }
+    fn helper_start(&mut self, t: Ticket, job: HelperStart<Vec<OwnedFd>>) -> Result<()> { self.worker.helper_start(t, job) }
+    fn helper_poll(&mut self, t: Ticket) -> Result<Option<HelperStarted<Vec<OwnedFd>>>> { self.worker.helper_poll(t) }
+    fn helper_signal(&mut self, r: RunHandle, c: HelperCallId, s: HelperSignal) -> Result<()> { self.worker.helper_signal(r, c, s) }
+    fn helper_events(&mut self) -> Vec<HelperEvent> { self.worker.helper_events() }
 }
 
 #[cfg(test)]

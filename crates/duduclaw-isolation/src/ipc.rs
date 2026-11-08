@@ -18,11 +18,13 @@ pub const PROTOCOL_VERSION: u16 = 1;
 ///   employee-scoped root reads/stops Package H4 added for F6 (tombstone S13,
 ///   restore/retire idle check): `stop_employee_runs` 0x0103, `employee_idle` 0x0104.
 /// - `OPCODES_HELPER` 0x0200–0x02FF: HX in-run helpers (D8 revision, option A).
-/// A gateway sends a Package H op only when spawnd's readiness report
-/// advertises `features.work_broker` (an older spawnd decodes an unknown `op`
-/// as a malformed frame and closes the control connection).
 ///   Numbers and names are reserved in `HX_RESERVED_OPS`; HX4 adds the
 ///   variants with exactly those values. Package H must not use this range.
+///
+/// A gateway sends a Package H op only when spawnd advertises
+/// `SpawndFeatures::WORK_BROKER`, and an HX op only with
+/// `SpawndFeatures::HELPER_CALLS` (`Opcode::feature`); an older spawnd decodes an
+/// unknown `op` as a malformed frame and closes the control connection.
 /// `SpawnRequest::opcode` is an exhaustive match, so a new variant without a
 /// registry entry does not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -31,16 +33,29 @@ pub enum Opcode {
     ReserveRun = 0x0001, StartRun = 0x0002, Resize = 0x0003, PtyActivity = 0x0004,
     Cancel = 0x0005, Wait = 0x0006, Status = 0x0007, TakeIo = 0x0008,
     OpenWorkFile = 0x0101, WorkAnchor = 0x0102, StopEmployeeRuns = 0x0103, EmployeeIdle = 0x0104,
+    /// HX (HX3a), numbers and names exactly as reserved in `HX_RESERVED_OPS`.
+    HelperCall = 0x0201, HelperWait = 0x0202, HelperStop = 0x0203, HelperCancel = 0x0204,
 }
 pub const OPCODES_CORE: RangeInclusive<u16> = 0x0001..=0x00ff;
 pub const OPCODES_WORK: RangeInclusive<u16> = 0x0100..=0x01ff;
 pub const OPCODES_HELPER: RangeInclusive<u16> = 0x0200..=0x02ff;
 impl Opcode {
-    pub const ALL: [Self; 12] = [Self::ReserveRun, Self::StartRun, Self::Resize, Self::PtyActivity,
+    pub const ALL: [Self; 16] = [Self::ReserveRun, Self::StartRun, Self::Resize, Self::PtyActivity,
         Self::Cancel, Self::Wait, Self::Status, Self::TakeIo, Self::OpenWorkFile, Self::WorkAnchor,
-        Self::StopEmployeeRuns, Self::EmployeeIdle];
-    /// Package H ops (`OPCODES_WORK`), gated by the `work_broker` feature bit.
+        Self::StopEmployeeRuns, Self::EmployeeIdle,
+        Self::HelperCall, Self::HelperWait, Self::HelperStop, Self::HelperCancel];
+    /// Package H ops (`OPCODES_WORK`), gated by `SpawndFeatures::WORK_BROKER`.
     pub const WORK: [Self; 4] = [Self::OpenWorkFile, Self::WorkAnchor, Self::StopEmployeeRuns, Self::EmployeeIdle];
+    /// HX ops (`OPCODES_HELPER`), gated by `SpawndFeatures::HELPER_CALLS`.
+    pub const HELPER: [Self; 4] = [Self::HelperCall, Self::HelperWait, Self::HelperStop, Self::HelperCancel];
+    /// The feature bit a gateway must see before it sends this op; core ops need none.
+    pub const fn feature(self) -> SpawndFeatures {
+        match self {
+            Self::OpenWorkFile | Self::WorkAnchor | Self::StopEmployeeRuns | Self::EmployeeIdle => SpawndFeatures::WORK_BROKER,
+            Self::HelperCall | Self::HelperWait | Self::HelperStop | Self::HelperCancel => SpawndFeatures::HELPER_CALLS,
+            _ => SpawndFeatures::NONE,
+        }
+    }
     pub const fn code(self) -> u16 { self as u16 }
     /// The serde `op` tag of the matching `SpawnRequest` variant.
     pub const fn wire_name(self) -> &'static str {
@@ -50,6 +65,8 @@ impl Opcode {
             Self::Status => "status", Self::TakeIo => "take_io",
             Self::OpenWorkFile => "open_work_file", Self::WorkAnchor => "work_anchor",
             Self::StopEmployeeRuns => "stop_employee_runs", Self::EmployeeIdle => "employee_idle",
+            Self::HelperCall => "helper_call", Self::HelperWait => "helper_wait",
+            Self::HelperStop => "helper_stop", Self::HelperCancel => "helper_cancel",
         }
     }
     pub fn from_code(code: u16) -> Option<Self> { Self::ALL.into_iter().find(|op| op.code() == code) }
@@ -70,6 +87,127 @@ pub const HX_RESERVED_RESULTS: [&str; 2] = ["helper_started", "helper_ended"];
 /// HX §5 `ErrorCode` names, owner HX4. Package H error codes must differ.
 pub const HX_RESERVED_ERROR_CODES: [&str; 4] =
     ["helper_busy", "helper_unavailable", "run_time_exhausted", "helper_cgroup_unavailable"];
+
+/// HX §2.2/§2.5 bounds. A helper never runs longer than this (check 3), and
+/// spawnd refuses a call whose remaining run time leaves less than
+/// `MIN_HELPER_RUN_REMAINDER_MS` with `RunTimeExhausted`.
+pub const MAX_HELPER_TIMEOUT_MS: u64 = 300_000;
+pub const MIN_HELPER_RUN_REMAINDER_MS: u64 = 5_000;
+/// The sealed helper input memfd has the prompt bound.
+pub const MAX_HELPER_INPUT_BYTES: u64 = MAX_PROMPT_BYTES;
+/// Readiness reason a gateway reports when spawnd does not advertise
+/// `SpawndFeatures::HELPER_CALLS` [F17]: `helper_launcher_unavailable{reason}`.
+pub const HELPER_FEATURE_MISSING_REASON: &str = "spawnd_feature_missing";
+
+/// [F17, H4] The one set of protocol feature bits spawnd advertises. The same
+/// value, computed in one place (`Host::features`), is sent the same way on
+/// both channels a gateway reads: the root readiness report
+/// (`EvidenceReport.features`, host-wide, read before any connection) and every
+/// `SpawnResponse::Reserved` (authoritative for that control connection, so a
+/// spawnd restarted with other bits between readiness and reservation is
+/// noticed). Omitted when empty, so an old spawnd reads as "no features"; a
+/// gateway that does not see a bit never sends that bit's ops (`Opcode::feature`;
+/// an old spawnd would close the connection on the unknown `op`). Unknown bits
+/// from a newer spawnd are carried but never tested, so they cannot fail a
+/// reservation or a readiness read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SpawndFeatures(pub u32);
+impl SpawndFeatures {
+    pub const NONE: Self = Self(0);
+    /// `helper_calls` (HX4): spawnd dispatches `HelperCall`/`HelperWait`/
+    /// `HelperStop`/`HelperCancel` AND can run helpers on this host (launcher
+    /// plans active, slot cgroups available). Without it every helper op is
+    /// refused (`helper_unavailable` / `helper_cgroup_unavailable`).
+    pub const HELPER_CALLS: Self = Self(1 << 0);
+    /// `work_broker` (H4): spawnd decodes and answers the four Package H ops
+    /// (`Opcode::WORK`). A decode bit, not availability: each op still fails
+    /// closed (`workspace_broker_unavailable`, …) on a host without the broker.
+    pub const WORK_BROKER: Self = Self(1 << 1);
+    /// Bit → wire name, for readiness and audit output.
+    pub const NAMES: [(Self, &'static str); 2] =
+        [(Self::HELPER_CALLS, "helper_calls"), (Self::WORK_BROKER, "work_broker")];
+    pub const fn contains(self, feature: Self) -> bool { feature.0 != 0 && self.0 & feature.0 == feature.0 }
+    pub const fn with(self, feature: Self) -> Self { Self(self.0 | feature.0) }
+    pub const fn without(self, feature: Self) -> Self { Self(self.0 & !feature.0) }
+    /// Whether a gateway may send `op` to a spawnd advertising `self`.
+    pub const fn allows(self, op: Opcode) -> bool {
+        let needed = op.feature();
+        needed.0 == 0 || self.contains(needed)
+    }
+    pub fn is_empty(&self) -> bool { self.0 == 0 }
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        Self::NAMES.into_iter().filter(move |(bit, _)| self.contains(*bit)).map(|(_, name)| name)
+    }
+}
+
+/// HX §2.2 [F7]: per-run call identity generated by spawnd (16 random bytes,
+/// deduplicated within the run) and returned in `HelperStarted`. The gateway
+/// never chooses it. All-zero is never generated, so it is refused everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct HelperCallId([u8; 16]);
+impl HelperCallId {
+    pub fn new(bytes: [u8; 16]) -> Result<Self, ContractError> {
+        if bytes == [0; 16] { Err(ContractError::InvalidValue("helper call id")) } else { Ok(Self(bytes)) }
+    }
+    pub const fn bytes(&self) -> [u8; 16] { self.0 }
+    /// 32 lowercase hex digits (the recording job id format, `recording_helper::valid_id`).
+    pub fn hex(&self) -> String { self.0.iter().map(|b| format!("{b:02x}")).collect() }
+}
+impl<'de> Deserialize<'de> for HelperCallId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::new(<[u8; 16]>::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `hx/fg` or `hx/rec` (Q4 = A: one of each per run). Shared with the signed
+/// helper policy (`duduclaw_run::helper_policy` re-exports this type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelperSlot { Foreground, Recording }
+
+/// Root-determined end of one helper call (HX §5). spawnd derives it from
+/// cgroup events, its watchdog and `memory.events`; launcher frames are hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HelperOutcome { Exited(i32), Signalled(u32), TimedOut, OomKilled, RunEnded, StartFailed }
+impl HelperOutcome {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        match self {
+            Self::Exited(code) if !(0..=255).contains(code) => Err(ContractError::InvalidValue("helper exit code")),
+            Self::Signalled(signal) if !(1..=64).contains(signal) => Err(ContractError::InvalidValue("helper signal")),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn validate_helper_timeout(timeout_ms: u64) -> Result<(), ContractError> {
+    if timeout_ms == 0 || timeout_ms > MAX_HELPER_TIMEOUT_MS { return Err(ContractError::LimitExceeded("helper timeout")); }
+    Ok(())
+}
+
+/// Pair an HX reply with its request and the number of received fds. The
+/// caller still checks each fd against `FdRole` (pipe read ends, CLOEXEC).
+pub fn check_helper_reply(request: &SpawnRequest, response: &SpawnResponse, received_fds: usize)
+    -> Result<(), ContractError> {
+    request.validate()?;
+    response.validate()?;
+    if received_fds != response.fd_plan().len() { return Err(ContractError::InvalidFrame); }
+    use SpawnRequest as Q;
+    use SpawnResponse as R;
+    let paired = match (request, response) {
+        (Q::HelperCall { .. } | Q::HelperWait { .. } | Q::HelperStop { .. } | Q::HelperCancel { .. }, R::Error { .. }) => true,
+        (Q::HelperCall { run, timeout_ms, .. }, R::HelperStarted { run: actual, effective_timeout_ms, .. }) =>
+            run == actual && effective_timeout_ms <= timeout_ms,
+        (Q::HelperWait { run, call }, R::HelperEnded { run: actual, call: actual_call, .. }) =>
+            run == actual && call == actual_call,
+        (Q::HelperStop { .. } | Q::HelperCancel { .. }, R::Ack) => true,
+        (Q::HelperCall { .. } | Q::HelperWait { .. } | Q::HelperStop { .. } | Q::HelperCancel { .. }, _) => false,
+        _ => return Err(ContractError::InvalidValue("not a helper request")),
+    };
+    if paired { Ok(()) } else { Err(ContractError::InvalidFrame) }
+}
 
 /// D-H1 relative path bounds. The sum of components is also bounded by
 /// `MAX_WORK_PATH_BYTES`, so an `OpenWorkFile` frame is always far below
@@ -412,6 +550,24 @@ pub enum SpawnRequest {
     /// `Error` (`NotFound` unknown employee, `IsolationUnavailable` when any
     /// source is unreadable — never a zero report on uncertainty).
     EmployeeIdle { employee_id: EmployeeId },
+    /// HX (opcode 0x0201). Run one root-signed helper inside the live run.
+    /// Carries exactly one `PromptSealed` fd: the sealed input memfd of
+    /// `input_bytes` (spawnd revalidates seals and size). `run` must be Running
+    /// and owned by this connection and `employee_id` must equal the run's
+    /// admitted employee [F7]; spawnd re-derives the helper from the run's
+    /// employee and maps it to an index in the signed table, never trusting
+    /// `helper` beyond a lookup key. `timeout_ms` is the tool's own bound; spawnd
+    /// replies with the effective value. Reply: `HelperStarted` with
+    /// `[StdoutRead, StderrRead]`, or `Error` (`HelperBusy`, `RunTimeExhausted`,
+    /// `HelperUnavailable`, `HelperCgroupUnavailable`, …).
+    HelperCall { run: RunHandle, employee_id: EmployeeId, helper: RuntimeKind, slot: HelperSlot,
+        timeout_ms: u64, input_bytes: u64 },
+    /// HX (0x0202). Wait for a started call. Reply: `HelperEnded`, or `Error`.
+    HelperWait { run: RunHandle, call: HelperCallId },
+    /// HX (0x0203). Recording: ask the helper to flush and exit (`stop\n`). Reply: `Ack`.
+    HelperStop { run: RunHandle, call: HelperCallId },
+    /// HX (0x0204). Kill the call's slot cgroup, queued or running. Reply: `Ack`.
+    HelperCancel { run: RunHandle, call: HelperCallId },
 }
 
 /// Ordered ancillary roles, never OS descriptor numbers (§4 fd matrix).
@@ -429,6 +585,8 @@ impl SpawnRequest {
             Self::Status { .. } => Opcode::Status, Self::TakeIo { .. } => Opcode::TakeIo,
             Self::OpenWorkFile { .. } => Opcode::OpenWorkFile, Self::WorkAnchor { .. } => Opcode::WorkAnchor,
             Self::StopEmployeeRuns { .. } => Opcode::StopEmployeeRuns, Self::EmployeeIdle { .. } => Opcode::EmployeeIdle,
+            Self::HelperCall { .. } => Opcode::HelperCall, Self::HelperWait { .. } => Opcode::HelperWait,
+            Self::HelperStop { .. } => Opcode::HelperStop, Self::HelperCancel { .. } => Opcode::HelperCancel,
         }
     }
     /// Exact fd order accompanying this message. There are no caller-supplied
@@ -444,6 +602,7 @@ impl SpawnRequest {
             }));
             if workspace.is_some() { roles.push(FdRole::WorkspaceDirectory); }
         }
+        if let Self::HelperCall { .. } = self { roles.push(FdRole::PromptSealed); }
         Ok(roles)
     }
     pub fn validate(&self) -> Result<(), ContractError> {
@@ -470,6 +629,12 @@ impl SpawnRequest {
             }
             Self::Resize { size, .. } => size.validate()?,
             Self::OpenWorkFile { path, mode: WorkOpenMode::ReadOnly, .. } => path.validate()?,
+            Self::HelperCall { helper, timeout_ms, input_bytes, .. } => {
+                // Helpers are registered runtime records only, never a built-in AI runtime.
+                if !matches!(helper, RuntimeKind::Registered(_)) { return Err(ContractError::InvalidValue("helper runtime")); }
+                validate_helper_timeout(*timeout_ms)?;
+                if *input_bytes > MAX_HELPER_INPUT_BYTES { return Err(ContractError::LimitExceeded("helper input")); }
+            }
             _ => {}
         }
         Ok(())
@@ -487,11 +652,18 @@ impl SpawnRequest {
 /// - `WorkspaceBrokerUnavailable`: broker or anchor not available on this
 ///   host (readiness reason `workspace_broker_unavailable`, H16).
 ///
-/// Names in `HX_RESERVED_ERROR_CODES` belong to HX4.
+/// HX additions (names exactly `HX_RESERVED_ERROR_CODES`; existing codes keep
+/// their meaning: `Unauthorized` connection/employee mismatch, `NotReady` run
+/// not Running, `NotFound` unknown run or call):
+/// - `HelperBusy`: slot occupied and the per-run FIFO (≤ 4) full or its deadline passed.
+/// - `HelperUnavailable`: no launcher, launcher dead, or control channel closed (F14).
+/// - `RunTimeExhausted`: less than `MIN_HELPER_RUN_REMAINDER_MS` of run time remains.
+/// - `HelperCgroupUnavailable`: slot cgroups or open-time credentials unavailable (Q2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode { UnsupportedVersion, InvalidRequest, Unauthorized, InvalidFds, QueueFull, QueueExpired, NotFound, NotReady, AlreadyTaken, WouldDeadlock, RuntimeDenied, ResourceLimit, IsolationUnavailable, Internal,
-    WorkFileNotFound, WorkFileRefused, WorkFileTooLarge, WorkspaceBrokerUnavailable }
+    WorkFileNotFound, WorkFileRefused, WorkFileTooLarge, WorkspaceBrokerUnavailable,
+    HelperBusy, HelperUnavailable, RunTimeExhausted, HelperCgroupUnavailable }
 
 /// Queue priority is host-derived from verified task context (§4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,12 +698,15 @@ impl IoDelivery {
     }
 }
 
-/// Versioned through Envelope; only Io and WorkFile carry fds, all other
-/// replies carry zero (§4). Result tags in `HX_RESERVED_RESULTS` belong to HX4.
+/// Versioned through Envelope; only Io, WorkFile and HelperStarted carry fds,
+/// all other replies carry zero (§4). HX result tags are `HX_RESERVED_RESULTS`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SpawnResponse {
-    Reserved { run: RunHandle, expires_at_unix_ms: u64 },
+    Reserved { run: RunHandle, expires_at_unix_ms: u64,
+        /// [F17] spawnd capability bits; omitted (and read as none) when empty.
+        #[serde(default, skip_serializing_if = "SpawndFeatures::is_empty")]
+        features: SpawndFeatures },
     Accepted { run: RunHandle, status: RunStatus },
     Status { run: RunHandle, status: RunStatus },
     Io { run: RunHandle, delivery: IoDelivery },
@@ -546,12 +721,19 @@ pub enum SpawnResponse {
     EmployeeRunsStopped { employee_id: EmployeeId, runs: List<RunHandle, MAX_STOPPED_RUNS>, confirmed: bool },
     /// Reply to `EmployeeIdle`: no fd.
     EmployeeIdle { employee_id: EmployeeId, report: EmployeeIdleReport },
+    /// Reply to `HelperCall`: exactly `[StdoutRead, StderrRead]` (the call's
+    /// pipe read ends). `call` is spawnd-generated; `effective_timeout_ms` ≤
+    /// the request's `timeout_ms` (min with the binding and the run deadline).
+    HelperStarted { run: RunHandle, call: HelperCallId, effective_timeout_ms: u64 },
+    /// Reply to `HelperWait`: no fd.
+    HelperEnded { run: RunHandle, call: HelperCallId, outcome: HelperOutcome },
 }
 impl SpawnResponse {
     pub fn fd_plan(&self) -> Vec<FdRole> {
         match self {
             Self::Io { delivery, .. } => delivery.fd_plan(),
             Self::WorkFile { .. } => vec![FdRole::WorkFileRead],
+            Self::HelperStarted { .. } => vec![FdRole::StdoutRead, FdRole::StderrRead],
             _ => vec![],
         }
     }
@@ -559,6 +741,8 @@ impl SpawnResponse {
         match self {
             Self::WorkFile { file, .. } => file.validate(),
             Self::WorkAnchor { anchor, .. } => anchor.validate(),
+            Self::HelperStarted { effective_timeout_ms, .. } => validate_helper_timeout(*effective_timeout_ms),
+            Self::HelperEnded { outcome, .. } => outcome.validate(),
             _ => Ok(()),
         }
     }
@@ -698,7 +882,182 @@ mod tests {
             SpawnRequest::TakeIo { run: run3() }, open("a.csv"),
             SpawnRequest::WorkAnchor { employee_id: EmployeeId([1; 16]) },
             SpawnRequest::StopEmployeeRuns { employee_id: EmployeeId([1; 16]) },
-            SpawnRequest::EmployeeIdle { employee_id: EmployeeId([1; 16]) }]
+            SpawnRequest::EmployeeIdle { employee_id: EmployeeId([1; 16]) },
+            helper_call(), SpawnRequest::HelperWait { run: run3(), call: call7() },
+            SpawnRequest::HelperStop { run: run3(), call: call7() },
+            SpawnRequest::HelperCancel { run: run3(), call: call7() }]
+    }
+    fn call7() -> HelperCallId { HelperCallId::new([7; 16]).unwrap() }
+    fn helper_call() -> SpawnRequest {
+        SpawnRequest::HelperCall { run: run3(), employee_id: EmployeeId([1; 16]),
+            helper: RuntimeKind::Registered(Text::new("duduclaw-program-v1".into()).unwrap()),
+            slot: HelperSlot::Foreground, timeout_ms: 60_000, input_bytes: 12 }
+    }
+    fn helper_started() -> SpawnResponse {
+        SpawnResponse::HelperStarted { run: run3(), call: call7(), effective_timeout_ms: 30_000 }
+    }
+    fn helper_ended(outcome: HelperOutcome) -> SpawnResponse {
+        SpawnResponse::HelperEnded { run: run3(), call: call7(), outcome }
+    }
+
+    #[test]
+    fn hx3a_helper_ops_use_reserved_numbers_names_and_codes() {
+        for reserved in HX_RESERVED_OPS {
+            let op = Opcode::from_code(reserved.code).expect("HX op assigned");
+            assert_eq!(op.wire_name(), reserved.op);
+        }
+        for request in every_request().into_iter().filter(|r| OPCODES_HELPER.contains(&r.opcode().code())) {
+            let value = serde_json::to_value(&request).unwrap();
+            assert!(HX_RESERVED_OPS.iter().any(|r| r.op == value["op"] && r.code == request.opcode().code()));
+        }
+        let tags: Vec<_> = [helper_started(), helper_ended(HelperOutcome::TimedOut)].iter()
+            .map(|r| serde_json::to_value(r).unwrap()["result"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(tags, HX_RESERVED_RESULTS);
+        let codes: Vec<_> = [ErrorCode::HelperBusy, ErrorCode::HelperUnavailable, ErrorCode::RunTimeExhausted,
+            ErrorCode::HelperCgroupUnavailable].iter()
+            .map(|c| serde_json::to_value(c).unwrap().as_str().unwrap().to_owned()).collect();
+        assert_eq!(codes, HX_RESERVED_ERROR_CODES);
+    }
+
+    #[test]
+    fn hx3a_helper_call_codec_and_strict_schema() {
+        for request in every_request().into_iter().filter(|r| OPCODES_HELPER.contains(&r.opcode().code())) {
+            let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: request };
+            assert_eq!(decode::<SpawnRequest>(&encode(&envelope).unwrap()).unwrap(), envelope);
+        }
+        for reply in [helper_started(), helper_ended(HelperOutcome::Exited(0)), helper_ended(HelperOutcome::OomKilled)] {
+            let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: reply };
+            assert_eq!(decode::<SpawnResponse>(&encode(&envelope).unwrap()).unwrap(), envelope);
+        }
+        let call = helper_call();
+        assert_eq!(call.fd_plan().unwrap(), vec![FdRole::PromptSealed], "exactly the sealed input memfd");
+        for other in [SpawnRequest::HelperWait { run: run3(), call: call7() },
+            SpawnRequest::HelperStop { run: run3(), call: call7() }, SpawnRequest::HelperCancel { run: run3(), call: call7() }] {
+            assert!(other.fd_plan().unwrap().is_empty());
+        }
+        // No names, paths, argv, env, index, uid or caller-chosen call id on the wire.
+        for forbidden in ["argv", "env", "path", "cwd", "index", "uid", "call", "profile", "seccomp", "deadline"] {
+            let mut value = serde_json::to_value(helper_call()).unwrap();
+            value[forbidden] = 1.into();
+            assert!(serde_json::from_value::<SpawnRequest>(value).is_err(), "{forbidden}");
+        }
+        for missing in ["run", "employee_id", "helper", "slot", "timeout_ms", "input_bytes"] {
+            let mut value = serde_json::to_value(helper_call()).unwrap();
+            value.as_object_mut().unwrap().remove(missing);
+            assert!(serde_json::from_value::<SpawnRequest>(value).is_err(), "{missing}");
+        }
+        let mut value = serde_json::to_value(helper_call()).unwrap();
+        value["slot"] = "background".into();
+        assert!(serde_json::from_value::<SpawnRequest>(value).is_err());
+        // Bounds: built-in runtimes are never helpers; timeout 1..=300 s; input ≤ 16 MiB.
+        let with = |helper: RuntimeKind, timeout_ms: u64, input_bytes: u64| SpawnRequest::HelperCall { run: run3(),
+            employee_id: EmployeeId([1; 16]), helper, slot: HelperSlot::Recording, timeout_ms, input_bytes };
+        let registered = || RuntimeKind::Registered(Text::new("duduclaw-browser-record-v1".into()).unwrap());
+        assert!(with(registered(), MAX_HELPER_TIMEOUT_MS, MAX_HELPER_INPUT_BYTES).validate().is_ok());
+        for bad in [with(RuntimeKind::Claude, 1, 0), with(RuntimeKind::Codex, 1, 0), with(registered(), 0, 0),
+            with(registered(), MAX_HELPER_TIMEOUT_MS + 1, 0), with(registered(), 1, MAX_HELPER_INPUT_BYTES + 1)] {
+            assert!(bad.validate().is_err() && bad.fd_plan().is_err(), "{bad:?}");
+            let frame = frame_payload(&serde_json::to_vec(&Envelope { version: 1, request_id: RequestId([2; 16]),
+                message: bad }).unwrap()).unwrap();
+            // Structural decode succeeds; the server's fd_plan/validate refuses it before any fd use.
+            assert!(decode::<SpawnRequest>(&frame).unwrap().message.validate().is_err());
+        }
+        // Call ids: the all-zero id is unrepresentable, also on the wire.
+        assert!(HelperCallId::new([0; 16]).is_err());
+        let mut value = serde_json::to_value(SpawnRequest::HelperWait { run: run3(), call: call7() }).unwrap();
+        value["call"] = serde_json::to_value([0u8; 16]).unwrap();
+        assert!(serde_json::from_value::<SpawnRequest>(value).is_err());
+        assert_eq!(call7().hex(), "07".repeat(16));
+        // Outcomes are bounded wait statuses.
+        for outcome in [HelperOutcome::Exited(256), HelperOutcome::Exited(-1), HelperOutcome::Signalled(0), HelperOutcome::Signalled(65)] {
+            assert!(helper_ended(outcome).validate().is_err(), "{outcome:?}");
+        }
+        for timeout in [0, MAX_HELPER_TIMEOUT_MS + 1] {
+            assert!(SpawnResponse::HelperStarted { run: run3(), call: call7(), effective_timeout_ms: timeout }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn hx3a_helper_reply_pairing_and_fd_counts() {
+        let call = helper_call();
+        assert_eq!(helper_started().fd_plan(), vec![FdRole::StdoutRead, FdRole::StderrRead]);
+        assert_eq!(check_helper_reply(&call, &helper_started(), 2), Ok(()));
+        for count in [0, 1, 3] { assert!(check_helper_reply(&call, &helper_started(), count).is_err(), "{count}"); }
+        for code in [ErrorCode::HelperBusy, ErrorCode::RunTimeExhausted, ErrorCode::HelperCgroupUnavailable] {
+            assert_eq!(check_helper_reply(&call, &SpawnResponse::Error { code }, 0), Ok(()));
+            assert!(check_helper_reply(&call, &SpawnResponse::Error { code }, 1).is_err());
+        }
+        // effective ≤ requested; reply run must match.
+        let longer = SpawnResponse::HelperStarted { run: run3(), call: call7(), effective_timeout_ms: 60_001 };
+        assert!(check_helper_reply(&call, &longer, 2).is_err());
+        let other_run = SpawnResponse::HelperStarted { run: RunHandle(crate::ids::RunId([4; 16])), call: call7(),
+            effective_timeout_ms: 1 };
+        assert!(check_helper_reply(&call, &other_run, 2).is_err());
+        let wait = SpawnRequest::HelperWait { run: run3(), call: call7() };
+        assert_eq!(check_helper_reply(&wait, &helper_ended(HelperOutcome::RunEnded), 0), Ok(()));
+        assert!(check_helper_reply(&wait, &helper_ended(HelperOutcome::RunEnded), 1).is_err());
+        let other_call = SpawnResponse::HelperEnded { run: run3(), call: HelperCallId::new([8; 16]).unwrap(),
+            outcome: HelperOutcome::Exited(0) };
+        assert!(check_helper_reply(&wait, &other_call, 0).is_err());
+        for request in [SpawnRequest::HelperStop { run: run3(), call: call7() }, SpawnRequest::HelperCancel { run: run3(), call: call7() }] {
+            assert_eq!(check_helper_reply(&request, &SpawnResponse::Ack, 0), Ok(()));
+            assert!(check_helper_reply(&request, &helper_started(), 2).is_err());
+        }
+        assert!(check_helper_reply(&call, &SpawnResponse::Ack, 0).is_err());
+        assert!(check_helper_reply(&wait, &helper_started(), 2).is_err());
+        assert!(check_helper_reply(&SpawnRequest::Status { run: run3() }, &helper_started(), 2).is_err());
+        // Work replies keep their own pairing; helper replies never pair with work requests.
+        assert!(check_work_reply(&open("a"), &helper_started(), 2).is_err());
+    }
+
+    #[test]
+    fn hx3a_helper_calls_feature_bit_is_additive() {
+        let run = run3();
+        let old = SpawnResponse::Reserved { run, expires_at_unix_ms: 9, features: SpawndFeatures::NONE };
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("features").is_none(), "an empty set is omitted, as an old spawnd sends it");
+        assert_eq!(serde_json::from_value::<SpawnResponse>(value).unwrap(), old);
+        let new = SpawnResponse::Reserved { run, expires_at_unix_ms: 9, features: SpawndFeatures::NONE.with(SpawndFeatures::HELPER_CALLS) };
+        let value = serde_json::to_value(&new).unwrap();
+        assert_eq!(value["features"], 1);
+        let SpawnResponse::Reserved { features, .. } = serde_json::from_value::<SpawnResponse>(value).unwrap() else { panic!() };
+        assert!(features.contains(SpawndFeatures::HELPER_CALLS));
+        assert_eq!(features.names().collect::<Vec<_>>(), ["helper_calls"]);
+        assert!(!SpawndFeatures::NONE.contains(SpawndFeatures::HELPER_CALLS));
+        assert!(!SpawndFeatures::HELPER_CALLS.contains(SpawndFeatures::NONE), "the empty set is never a feature");
+        // An unknown future bit neither fails the reservation nor reads as helper_calls.
+        let future: SpawnResponse = serde_json::from_value(serde_json::json!({
+            "result": "reserved", "run": run, "expires_at_unix_ms": 9, "features": 1 << 7 })).unwrap();
+        let SpawnResponse::Reserved { features, .. } = future else { panic!() };
+        assert!(!features.contains(SpawndFeatures::HELPER_CALLS));
+        assert_eq!(HELPER_FEATURE_MISSING_REASON, "spawnd_feature_missing");
+    }
+
+    #[test]
+    fn hx4_one_feature_set_gates_work_and_helper_ops() {
+        // One bitset carries both bits; names are stable and distinct.
+        let both = SpawndFeatures::NONE.with(SpawndFeatures::WORK_BROKER).with(SpawndFeatures::HELPER_CALLS);
+        assert_eq!(both.names().collect::<Vec<_>>(), ["helper_calls", "work_broker"]);
+        assert_eq!(serde_json::to_value(both).unwrap(), 3);
+        assert_eq!(both.without(SpawndFeatures::HELPER_CALLS), SpawndFeatures::WORK_BROKER);
+        // Every op maps to exactly the bit of its range; core ops need none.
+        for op in Opcode::ALL {
+            let expected = if OPCODES_WORK.contains(&op.code()) { SpawndFeatures::WORK_BROKER }
+                else if OPCODES_HELPER.contains(&op.code()) { SpawndFeatures::HELPER_CALLS }
+                else { SpawndFeatures::NONE };
+            assert_eq!(op.feature(), expected, "{op:?}");
+            assert!(both.allows(op));
+            assert_eq!(SpawndFeatures::NONE.allows(op), expected == SpawndFeatures::NONE, "{op:?}");
+        }
+        for op in Opcode::WORK {
+            assert!(SpawndFeatures::WORK_BROKER.allows(op) && !SpawndFeatures::HELPER_CALLS.allows(op));
+        }
+        for op in Opcode::HELPER {
+            assert!(SpawndFeatures::HELPER_CALLS.allows(op) && !SpawndFeatures::WORK_BROKER.allows(op));
+        }
+        // Reserved carries the same value the readiness report carries.
+        let reserved = SpawnResponse::Reserved { run: run3(), expires_at_unix_ms: 9, features: both };
+        assert_eq!(serde_json::to_value(&reserved).unwrap()["features"], 3);
     }
 
     #[test]

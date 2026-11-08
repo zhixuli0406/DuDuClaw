@@ -224,6 +224,14 @@ impl Storage for LoopStorage {
             quota: DiskQuota::LoopFilesystem { bytes: entry.quota.bytes, inodes: entry.quota.inodes } };
         self.provision(&request)
     }
+    fn traces(&mut self) -> Result<Vec<EmployeeId>> {
+        let images = self.inventory()?;
+        let mut employees: Vec<EmployeeId> = images.iter().map(|image| image.employee).collect();
+        employees.extend(self.journal.employees.iter().filter(|entry| entry.phase != Phase::Destroyed).map(|entry| entry.employee));
+        employees.sort_unstable_by_key(|employee| employee.0);
+        employees.dedup();
+        Ok(employees)
+    }
     fn attachments(&mut self) -> Result<Vec<Attachment>> {
         let images = self.inventory()?;
         self.journal.employees.iter().filter_map(|entry| entry.lease.as_ref().map(|lease| (entry, lease)))

@@ -116,6 +116,173 @@ impl PreparedRoot {
     }
 }
 
+/// HX helper view (D8 revision §2.1, §2.4; HX2 finding (a)). spawnd's helper
+/// registry mount is a clone of the SAME generation directory that backs
+/// `/runtime`. Landlock rules attach to inodes, so mounting that clone at
+/// `/helpers` would put every helper file beneath the runtime's `/runtime` rule
+/// (the directory inode is shared) and the runtime could read and exec them.
+/// Instead `/helpers` is a small read-only tmpfs holding one read-only bind per
+/// signed helper file: a file bind is its own mount root, so no path to it
+/// passes through a directory the runtime has a rule on. The registry clone is
+/// only staged to make its files cloneable from this namespace and is detached
+/// again before pivot. Helper-only names inside `/runtime` are covered by an
+/// empty root-owned mode-0 file.
+pub struct HelperView {
+    pub registry: DetachedMount,
+    /// `(flat name, descriptor)` of every helper executable and script; each fd
+    /// must already be verified on `registry`.
+    pub files: Vec<(CString, RawFd)>,
+    /// Runtime/forwarder executable and script descriptors: never masked.
+    pub keep: Vec<RawFd>,
+    pub tmpfs_bytes: u64,
+}
+/// Mount id of each `/helpers/<name>` bind, read back after attaching.
+pub struct HelperReadback { pub binds: Vec<(CString, u64)> }
+
+const HELPER_STAGE: &CStr = c".helper-registry";
+const HELPER_STAGE_PATH: &CStr = c"/tmp/duduclaw-root/.helper-registry";
+const HELPER_MASK: &CStr = c".helper-mask";
+const HELPERS_TMPFS_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileKey { inode: u64, major: u32, minor: u32 }
+fn file_stat(fd: RawFd) -> Result<libc::statx, MountError> {
+    let mask = libc::STATX_BASIC_STATS | libc::STATX_MNT_ID;
+    // SAFETY: initialized result, AT_EMPTY_PATH addresses the owned fd itself.
+    let mut result: libc::statx = unsafe { zeroed() };
+    unsafe { cvt(libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        mask, &mut result), MountError::Identity)?; }
+    if result.stx_mask & mask != mask { return Err(MountError::Identity); }
+    Ok(result)
+}
+fn key(stat: &libc::statx) -> FileKey { FileKey { inode: stat.stx_ino, major: stat.stx_dev_major, minor: stat.stx_dev_minor } }
+fn is_regular(stat: &libc::statx) -> bool { u32::from(stat.stx_mode) & libc::S_IFMT == libc::S_IFREG }
+fn flat_name(name: &CStr) -> bool {
+    let bytes = name.to_bytes();
+    !bytes.is_empty() && bytes != b"." && bytes != b".." && bytes.len() <= 255
+        && bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+/// O_PATH, no symlinks anywhere, beneath `parent`; `same_mount` adds NO_XDEV.
+fn open_entry(parent: RawFd, name: &CStr, same_mount: bool) -> Result<OwnedFd, std::io::Error> {
+    let how = OpenHow { flags: (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64, mode: 0,
+        resolve: 0x08 | 0x04 | 0x02 | if same_mount { 0x01 } else { 0 } };
+    // SAFETY: initialized open_how v0 and valid C string.
+    let raw = unsafe { libc::syscall(libc::SYS_openat2, parent, name.as_ptr(), &how, size_of::<OpenHow>()) };
+    if raw < 0 { return Err(std::io::Error::last_os_error()); }
+    Ok(unsafe { OwnedFd::from_raw_fd(raw as RawFd) })
+}
+fn clone_file(fd: RawFd, name: Option<&CStr>) -> Result<OwnedFd, MountError> {
+    // Non-recursive bind of exactly this file. The source mount must belong to
+    // this namespace (5.15/6.1/6.8 refuse foreign ones), hence the staging.
+    let (path, flags) = match name { Some(name) => (name, libc::AT_SYMLINK_NOFOLLOW as u32),
+        None => (c"", libc::AT_EMPTY_PATH as u32) };
+    owned(unsafe { libc::syscall(libc::SYS_open_tree, fd, path.as_ptr(),
+        OPEN_TREE_CLONE | libc::O_CLOEXEC as u32 | flags) }, MountError::Mount)
+}
+
+impl PreparedRoot {
+    /// Build `/helpers`, `/helper-tmp` and the `/runtime` masks. Before `pivot`, while root.
+    pub fn attach_helpers(&self, view: HelperView, config: &RootConfig) -> Result<HelperReadback, MountError> {
+        config.validate()?;
+        if view.files.is_empty() || view.files.len() > 32 || view.tmpfs_bytes == 0
+            || view.tmpfs_bytes > 1024 * 1024 * 1024 { return Err(MountError::InvalidPolicy); }
+        let root = self.root.as_raw_fd();
+        let mut names: Vec<(CString, RawFd, FileKey, u32)> = Vec::new();
+        for (name, fd) in &view.files {
+            if !flat_name(name) { return Err(MountError::InvalidPolicy); }
+            let stat = file_stat(*fd)?;
+            if !is_regular(&stat) || stat.stx_uid != 0 { return Err(MountError::Identity); }
+            match names.iter().find(|(known, ..)| known == name) {
+                Some((_, _, known, _)) if *known != key(&stat) => return Err(MountError::InvalidPolicy),
+                Some(_) => continue,
+                None => names.push((name.clone(), *fd, key(&stat), stat.stx_nlink)),
+            }
+        }
+        let keep = view.keep.iter().map(|fd| file_stat(*fd).map(|stat| key(&stat))).collect::<Result<Vec<_>, _>>()?;
+        // 1. Stage the registry clone so its files belong to this mount namespace.
+        mkdir(root, HELPER_STAGE, 0o700)?;
+        attach_input(view.registry, root, HELPER_STAGE, MOUNT_RDONLY | MOUNT_NOSUID | MOUNT_NODEV | MOUNT_NOSYMFOLLOW)?;
+        // 2. /helpers: private tmpfs of placeholders, one read-only file bind each.
+        mkdir(root, c"helpers", 0o755)?;
+        let helpers_mount = tmpfs(HELPERS_TMPFS_BYTES, 64, "0755", MOUNT_NOSUID | MOUNT_NODEV)?;
+        move_mount(helpers_mount, root, c"helpers")?;
+        let helpers = open_dir(root, c"helpers")?;
+        let helpers_mount_id = statx(helpers.as_raw_fd())?.stx_mnt_id;
+        let file_attrs = MOUNT_RDONLY | MOUNT_NOSUID | MOUNT_NODEV;
+        let mut binds = Vec::new();
+        for (name, fd, expected, _) in &names {
+            // SAFETY: new file under the owned tmpfs, exclusive and no symlink.
+            drop(owned(unsafe { libc::openat(helpers.as_raw_fd(), name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o444) } as i64,
+                MountError::Directory)?);
+            let bind = clone_file(*fd, None)?;
+            if key(&file_stat(bind.as_raw_fd())?) != *expected { return Err(MountError::Identity); }
+            set_private(bind.as_raw_fd(), false)?;
+            set_attributes(bind.as_raw_fd(), file_attrs, false)?;
+            move_mount(bind, helpers.as_raw_fd(), name)?;
+            let readback = open_entry(helpers.as_raw_fd(), name, false).map_err(|_| MountError::Identity)?;
+            let stat = file_stat(readback.as_raw_fd())?;
+            if key(&stat) != *expected || !is_regular(&stat) || stat.stx_mnt_id == 0 || stat.stx_mnt_id == helpers_mount_id {
+                return Err(MountError::Identity);
+            }
+            verify_flags(readback.as_raw_fd(), file_attrs)?;
+            binds.push((name.clone(), stat.stx_mnt_id));
+        }
+        set_attributes(helpers.as_raw_fd(), MOUNT_RDONLY, false)?;
+        verify_mount(helpers.as_raw_fd(), None, TMPFS_MAGIC, MOUNT_RDONLY | MOUNT_NOSUID | MOUNT_NODEV)?;
+        drop(helpers);
+        // 3. Mask helper-only names in /runtime (same registry directory).
+        let runtime = open_dir(root, c"runtime")?;
+        let mut mask_key = None;
+        for (name, _, helper, nlink) in &names {
+            if keep.contains(helper) { continue; }
+            let target = match open_entry(runtime.as_raw_fd(), name, true) {
+                Ok(target) => target,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(_) => return Err(MountError::Identity),
+            };
+            // A hard-link alias of a helper file would stay reachable unmasked.
+            if !is_regular(&file_stat(target.as_raw_fd())?) || *nlink != 1 { return Err(MountError::Identity); }
+            drop(target);
+            if mask_key.is_none() {
+                // SAFETY: new mode-0 root-owned file on the still-writable root tmpfs.
+                let mask = owned(unsafe { libc::openat(root, HELPER_MASK.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0) } as i64,
+                    MountError::Directory)?;
+                unsafe { cvt(libc::fchmod(mask.as_raw_fd(), 0), MountError::Directory)?; }
+                mask_key = Some(key(&file_stat(mask.as_raw_fd())?));
+            }
+            let mask = clone_file(root, Some(HELPER_MASK))?;
+            set_private(mask.as_raw_fd(), false)?;
+            set_attributes(mask.as_raw_fd(), MOUNT_RDONLY | MOUNT_NOSUID | MOUNT_NODEV | MOUNT_NOEXEC, false)?;
+            move_mount(mask, runtime.as_raw_fd(), name)?;
+            let readback = open_entry(runtime.as_raw_fd(), name, false).map_err(|_| MountError::Identity)?;
+            if Some(key(&file_stat(readback.as_raw_fd())?)) != mask_key { return Err(MountError::Identity); }
+        }
+        drop(runtime);
+        // 4. /helper-tmp: the launcher's scratch tmpfs, employee-owned, mode 0700.
+        mkdir(root, c"helper-tmp", 0o755)?;
+        let attrs = MOUNT_NOSUID | MOUNT_NODEV | if config.tmp_noexec { MOUNT_NOEXEC } else { 0 };
+        let scratch = tmpfs(view.tmpfs_bytes, config.tmpfs_inodes, "0700", attrs)?;
+        move_mount(scratch, root, c"helper-tmp")?;
+        let scratch = open_dir(root, c"helper-tmp")?;
+        // SAFETY: newly mounted root-owned directory, changed before privilege drop.
+        unsafe { cvt(libc::fchown(scratch.as_raw_fd(), config.employee_uid, config.employee_gid), MountError::Directory)?; }
+        verify_mount(scratch.as_raw_fd(), None, TMPFS_MAGIC, attrs)?;
+        let owner = statx(scratch.as_raw_fd())?;
+        if owner.stx_uid != config.employee_uid || owner.stx_mode & 0o7777 != 0o700 { return Err(MountError::Directory); }
+        drop(scratch);
+        // 5. Detach the staged registry (its directory inode is the runtime's) and the mask source.
+        unsafe {
+            cvt(libc::umount2(HELPER_STAGE_PATH.as_ptr(), libc::MNT_DETACH), MountError::Mount)?;
+            cvt(libc::unlinkat(root, HELPER_STAGE.as_ptr(), libc::AT_REMOVEDIR), MountError::Directory)?;
+            if mask_key.is_some() { cvt(libc::unlinkat(root, HELPER_MASK.as_ptr(), 0), MountError::Directory)?; }
+        }
+        if open_entry(root, HELPER_STAGE, true).is_ok() { return Err(MountError::Mount); }
+        Ok(HelperReadback { binds })
+    }
+}
+
 /// Must run before any cloning or mounting. No user namespace is created.
 pub fn enter_namespaces() -> Result<(), MountError> {
     // SAFETY: mutates only this single-threaded trampoline and its descendants.

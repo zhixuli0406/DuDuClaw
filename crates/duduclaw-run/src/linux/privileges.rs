@@ -3,7 +3,11 @@ use crate::{Error, Result};
 pub const SECUREBITS: u64 = 1 | 2 | 4 | 8 | 32 | 64 | 128;
 pub const CAP_SETPCAP: u32 = 8;
 /// R7-M1: CAP_CHOWN is needed before the drop for the fresh devpts slave.
-pub const REQUIRED_BOUNDING_CAPABILITIES: &[u32] = &[0, 6, 7, 8, 12, 21];
+/// HX [F2]: CAP_SYS_RESOURCE (24) lets the root supervisor take
+/// `oom_score_adj = -1000` and lets init reset both the value and the inherited
+/// `oom_score_adj_min` to 0 before any employee process exists.
+pub const REQUIRED_BOUNDING_CAPABILITIES: &[u32] = &[0, 6, 7, 8, 12, 21, 24];
+pub const SUPERVISOR_OOM_SCORE_ADJ: i32 = -1000;
 
 #[repr(C)]
 struct CapHeader { version: u32, pid: i32 }
@@ -110,6 +114,32 @@ pub fn verify(uid: u32, gid: u32) -> Result<()> {
         || prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0)? != 1 { return Err(Error::Privileges); }
     Ok(())
 }
+
+/// Write and read back this process's `oom_score_adj` through a fixed procfs path.
+/// Only for the root trampoline: with CAP_SYS_RESOURCE the kernel also sets
+/// `oom_score_adj_min` to the written value, which every later fork inherits.
+fn set_oom_score_adj(path: &std::ffi::CStr, value: i32) -> Result<()> {
+    let text = format!("{value}\n");
+    // SAFETY: fixed path; descriptor closed on every path below.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+    if fd < 0 { return Err(Error::Privileges); }
+    let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+    if unsafe { libc::write(raw, text.as_ptr().cast(), text.len()) } != text.len() as isize { return Err(Error::Privileges); }
+    let mut back = [0u8; 16];
+    let read = unsafe { libc::pread(raw, back.as_mut_ptr().cast(), back.len(), 0) };
+    if read <= 0 || back[..read as usize] != *text.as_bytes() { return Err(Error::Privileges); }
+    Ok(())
+}
+/// HX [F2]: only the supervisor (outside the run's PID namespace) is OOM-protected.
+/// Called by the root trampoline before pivot (host procfs) and before clone3.
+pub fn protect_supervisor_from_oom() -> Result<()> {
+    set_oom_score_adj(c"/proc/self/oom_score_adj", SUPERVISOR_OOM_SCORE_ADJ)
+}
+/// HX [F2]: namespace init resets the inherited protection to 0 while it still
+/// holds CAP_SYS_RESOURCE (so `oom_score_adj_min` becomes 0 too), before it forks
+/// the forwarder, launcher or runtime. Requires its own procfs (after `mount_proc`).
+pub fn reset_oom_score_adj() -> Result<()> { set_oom_score_adj(c"/proc/self/oom_score_adj", 0) }
 
 pub fn drop_all(uid: u32, gid: u32) -> Result<()> {
     set_securebits()?;

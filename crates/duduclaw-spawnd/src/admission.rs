@@ -3,8 +3,13 @@ use std::collections::BTreeMap;
 use duduclaw_isolation::{bounded::List, execution::{RunHandle, RunOutcome, RuntimeKind, PtySize}, ids::{EmployeeId, RunId},
     ipc::{AdmissionState, CleanupReadback, ControlConnectionId, EmployeeIdleReport, ErrorCode, IoDelivery, QueueClass,
         QueueStatus, RunReservation, RunStatus, SpawnRequest, SpawnResponse, WorkAnchorIdentity, WorkFileMetadata,
-        WorkPath, DEFAULT_QUEUE_LENGTH, MAX_STOPPED_RUNS}};
+        WorkPath, DEFAULT_QUEUE_LENGTH, MAX_STOPPED_RUNS, HelperCallId, SpawndFeatures}};
 use crate::Result;
+
+#[path = "admission_helpers.rs"]
+mod helpers;
+pub use helpers::{effective_timeout_ms, HelperEvent, HelperReply, HelperSignal, HelperStart, HelperStarted,
+    CALL_DESCRIPTORS, HELPER_QUEUE_MS, MAX_ENDED_RECORDS, MAX_QUEUED_CALLS, RESULT_GRACE_MS, WATCHDOG_GRACE_MS};
 
 /// H4 caps on outstanding work-file snapshots: submitted to the host and not
 /// yet delivered, refused or abandoned. The host copies one snapshot at a time
@@ -119,8 +124,11 @@ pub trait Host {
     fn forget(&mut self, run: RunHandle) -> Result<()>;
     /// Adapter background work; never called on the control socket thread.
     fn maintenance(&mut self) -> Result<()> { Ok(()) }
-    fn allocation(&mut self, _: &duduclaw_migration::allocation::Request) -> Result<duduclaw_migration::allocation::Receipt> {
-        Err(ErrorCode::IsolationUnavailable)
+    /// Confirmed allocation, compensation, read-back and retire (F6l). The
+    /// answer uses the allocation wire codes (schema 2).
+    fn allocation(&mut self, _: &duduclaw_migration::allocation::Request)
+        -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
+        Err(duduclaw_migration::allocation::ErrorCode::IsolationUnavailable)
     }
     /// H4 synchronous broker step. Called only on an adapter's own lifecycle
     /// thread, never on the control socket thread. Missing broker ⇒ refuse.
@@ -131,6 +139,29 @@ pub trait Host {
     fn broker_poll(&mut self, _: Ticket) -> Result<Option<BrokerReply>> { Err(ErrorCode::WorkspaceBrokerUnavailable) }
     /// Forget a ticket; a result that arrives later (and its fd) is dropped.
     fn broker_abandon(&mut self, _: Ticket) {}
+    /// HX4: whether this host can run helpers now (launcher plans active,
+    /// slot cgroups not known to be unavailable). `Err` is the per-call code
+    /// (`helper_unavailable` / `helper_cgroup_unavailable`).
+    fn helpers_ready(&mut self) -> Result<()> { Err(ErrorCode::HelperUnavailable) }
+    /// [F17, H4] The one feature set this spawnd advertises, identical in the
+    /// readiness report and in every `Reserved`. This binary always decodes the
+    /// Package H ops; `helper_calls` only when [`Self::helpers_ready`].
+    fn features(&mut self) -> SpawndFeatures {
+        let features = SpawndFeatures::WORK_BROKER;
+        if self.helpers_ready().is_ok() { features.with(SpawndFeatures::HELPER_CALLS) } else { features }
+    }
+    /// HX4 synchronous start, on an adapter's lifecycle thread only: re-derive
+    /// the helper from the run's own employee, revalidate the memfd, write the
+    /// slot limits, create the pipes and send `Start`.
+    fn helper_run(&mut self, _: HelperStart<Self::Inputs>) -> Result<HelperStarted<Self::Io>> { Err(ErrorCode::HelperUnavailable) }
+    /// HX4 non-blocking facade used by the coordinator (one ticket per call).
+    fn helper_start(&mut self, _: Ticket, _: HelperStart<Self::Inputs>) -> Result<()> { Err(ErrorCode::HelperUnavailable) }
+    /// `Ok(None)` while pending; the result (`Ok(Some)` or `Err`) exactly once.
+    fn helper_poll(&mut self, _: Ticket) -> Result<Option<HelperStarted<Self::Io>>> { Err(ErrorCode::HelperUnavailable) }
+    /// [F8] Per-call stop/kill. Must never revoke or kill the run.
+    fn helper_signal(&mut self, _: RunHandle, _: HelperCallId, _: HelperSignal) -> Result<()> { Err(ErrorCode::HelperUnavailable) }
+    /// Root-determined ends, runtime exits and channel losses since the last call.
+    fn helper_events(&mut self) -> Vec<HelperEvent> { Vec::new() }
 }
 
 /// One outstanding H4 job as the coordinator tracks it.
@@ -139,6 +170,8 @@ enum Pending {
     Anchor { employee: EmployeeId },
     Idle { employee: EmployeeId },
     Stop(StopProgress),
+    /// HX4: one outstanding `HelperCall` reply (`poll_helper_ticket`).
+    Helper(helpers::HelperTicket),
 }
 struct StopProgress { employee: EmployeeId, runs: Vec<RunHandle>, deadline: u64, probe: Option<Ticket> }
 
@@ -216,6 +249,8 @@ pub struct Coordinator<H: Host> {
     tickets: BTreeMap<Ticket, Pending>,
     next_ticket: u64,
     stopping: BTreeMap<EmployeeId, usize>,
+    /// HX4 per-run helper calls (FIFO, call ids, outcomes); never an admission entry.
+    helpers: BTreeMap<RunId, helpers::RunHelpers<H::Inputs>>,
 }
 impl<H: Host> Coordinator<H> {
     pub fn new(host: H, limits: Limits) -> Result<Self> {
@@ -227,7 +262,7 @@ impl<H: Host> Coordinator<H> {
         }
         Ok(Self { host, limits, entries: BTreeMap::new(), sequence: 0,
             last_now: 0, last_scan: None, scan_ok: false,
-            tickets: BTreeMap::new(), next_ticket: 0, stopping: BTreeMap::new() })
+            tickets: BTreeMap::new(), next_ticket: 0, stopping: BTreeMap::new(), helpers: BTreeMap::new() })
     }
     fn host_ticket(&mut self) -> Result<Ticket> {
         self.next_ticket = self.next_ticket.checked_add(1).ok_or(ErrorCode::ResourceLimit)?;
@@ -317,8 +352,12 @@ impl<H: Host> Coordinator<H> {
     /// ticket is `NotFound`. Never blocks.
     pub fn poll_ticket(&mut self, ticket: Ticket, now: u64) -> Result<Option<BrokerOutcome>> {
         self.time(now)?;
-        let stop = matches!(self.tickets.get(&ticket).ok_or(ErrorCode::NotFound)?, Pending::Stop(_));
-        if stop { return self.poll_stop(ticket, now); }
+        match self.tickets.get(&ticket).ok_or(ErrorCode::NotFound)? {
+            Pending::Stop(_) => return self.poll_stop(ticket, now),
+            // Answered with pipes by `poll_helper_ticket`, never by the broker.
+            Pending::Helper(_) => return Err(ErrorCode::InvalidRequest),
+            _ => {}
+        }
         let reply = match self.host.broker_poll(ticket) {
             Ok(None) => return Ok(None),
             Ok(Some(reply)) => Ok(reply),
@@ -396,6 +435,7 @@ impl<H: Host> Coordinator<H> {
                 if let Some(probe) = progress.probe { self.host.broker_abandon(probe); }
                 self.release_stop(progress.employee);
             }
+            Some(Pending::Helper(record)) => self.abandon_helper(record),
             Some(_) => self.host.broker_abandon(ticket),
             None => {}
         }
@@ -426,7 +466,8 @@ impl<H: Host> Coordinator<H> {
         self.entries.insert(random_run.0, Entry { employee, connection, reservation, state: AdmissionState::Reserved,
             request: None, policy: None, inputs: None, input_bytes: 0, input_descriptors: 0, sequence: self.sequence,
             deadline: expires, started: 0, terminal_at: 0, outcome: None, io_taken: false, pty_activity_ms: 0, initial_pty_size: None });
-        Ok(SpawnResponse::Reserved { run: random_run, expires_at_unix_ms: expires })
+        // [F17, H4] the same feature set the readiness report carries.
+        Ok(SpawnResponse::Reserved { run: random_run, expires_at_unix_ms: expires, features: self.host.features() })
     }
     pub fn start(&mut self, connection: ControlConnectionId, request: SpawnRequest, inputs: H::Inputs,
         now: u64) -> Result<SpawnResponse> {
@@ -448,10 +489,12 @@ impl<H: Host> Coordinator<H> {
             duduclaw_isolation::ipc::InputFd::SealedMemfd { bytes }
             | duduclaw_isolation::ipc::InputFd::ReadOnlySnapshot { bytes } => *bytes,
         });
-        let pending: u64 = self.entries.values().map(|entry| entry.input_bytes).sum();
+        // HX4: queued/starting helper memfds share these budgets.
+        let (helper_bytes, helper_fds) = self.helper_held();
+        let pending: u64 = self.entries.values().map(|entry| entry.input_bytes).sum::<u64>().saturating_add(helper_bytes);
         if input_bytes > self.limits.pending_input_bytes.saturating_sub(pending) { return Err(ErrorCode::ResourceLimit); }
         let descriptors = request.fd_plan().map_err(|_| ErrorCode::InvalidRequest)?.len();
-        let held: usize = self.entries.values().map(|entry| entry.input_descriptors).sum();
+        let held: usize = self.entries.values().map(|entry| entry.input_descriptors).sum::<usize>() + helper_fds;
         if descriptors > self.limits.input_descriptors.saturating_sub(held) { return Err(ErrorCode::ResourceLimit); }
         let deadline = now.checked_add(policy.queue_ms).ok_or(ErrorCode::InvalidRequest)?;
         let entry = self.entries.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
@@ -542,6 +585,8 @@ impl<H: Host> Coordinator<H> {
         Ok(())
     }
     fn drain(&mut self, run: RunHandle, reason: RunOutcome) -> Result<()> {
+        // HX4: leaving Running drops the helper queue; live calls end RunEnded.
+        self.end_helpers(run, true);
         let entry = self.entries.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
         if entry.state != AdmissionState::Draining { entry.transition(AdmissionState::Draining, None)?; }
         entry.outcome = Some(reason);
@@ -647,6 +692,8 @@ impl<H: Host> Coordinator<H> {
         for id in expired {
             if self.host.forget(RunHandle(id)).is_ok() { self.entries.remove(&id); }
         }
+        // HX4: host events, drops for runs that left Running, then the queues.
+        self.tick_helpers(now);
         if !self.scan_ok { return Err(ErrorCode::IsolationUnavailable); }
         let mut candidates: Vec<_> = self.entries.iter().filter(|(_, e)| e.state == AdmissionState::Queued)
             .map(|(id, e)| (Self::priority(e), *id)).collect();

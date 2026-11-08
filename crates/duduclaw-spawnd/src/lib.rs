@@ -8,6 +8,9 @@ pub mod systemd;
 pub mod policy;
 pub mod helper_policy;
 pub mod helper_cgroup;
+/// HX4 root side of in-run helper calls (per-run engine on the lifecycle thread).
+#[cfg(target_os = "linux")]
+pub mod helper_host;
 pub mod storage;
 #[cfg(unix)]
 pub mod work_anchor;

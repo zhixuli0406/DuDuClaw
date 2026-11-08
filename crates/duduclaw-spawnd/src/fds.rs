@@ -22,6 +22,11 @@ pub struct SnapshotAuthority { pub gateway_uid: u32, pub mount_id: u64 }
 pub fn validate_start(request: &SpawnRequest, descriptors: &[OwnedFd], authority: SnapshotAuthority) -> io::Result<()> {
     let plan = request.fd_plan().map_err(|_| invalid())?;
     if descriptors.len() != plan.len() { return Err(invalid()); }
+    // HX4: the helper input is the same sealed tmpfs memfd shape as a prompt;
+    // the host revalidates it again right before `Start`.
+    if let SpawnRequest::HelperCall { input_bytes, .. } = request {
+        return validate_sealed(descriptors.first().ok_or_else(invalid)?.as_fd(), *input_bytes);
+    }
     let SpawnRequest::StartRun { prompt_bytes, input_fds, workspace, .. } = request else { return Ok(()); };
     validate_sealed(descriptors[0].as_fd(), *prompt_bytes)?;
     for (input, fd) in input_fds.as_slice().iter().zip(descriptors.iter().skip(1)) {
@@ -116,6 +121,22 @@ mod tests {
         assert!(validate_sealed(sealed.as_fd(), 2).is_ok());
         assert!(validate_sealed(sealed.as_fd(), 1).is_err());
         assert!(nix::unistd::write(&sealed, b"x").is_err());
+    }
+    #[test]
+    fn helper_call_input_must_be_one_sealed_memfd_of_the_stated_size() {
+        use duduclaw_isolation::{bounded::Text, ipc::HelperSlot};
+        let authority = SnapshotAuthority { gateway_uid: 42, mount_id: 1 };
+        let call = |input_bytes| SpawnRequest::HelperCall { run: RunHandle(RunId([1; 16])), employee_id: EmployeeId([2; 16]),
+            helper: RuntimeKind::Registered(Text::new("duduclaw-program-v1".into()).unwrap()), slot: HelperSlot::Foreground,
+            timeout_ms: 1_000, input_bytes };
+        assert!(validate_start(&call(2), &[sealed_plan(b"{}").unwrap()], authority).is_ok());
+        assert!(validate_start(&call(3), &[sealed_plan(b"{}").unwrap()], authority).is_err(), "size");
+        assert!(validate_start(&call(2), &[], authority).is_err(), "count");
+        assert!(validate_start(&call(2), &[sealed_plan(b"{}").unwrap(), sealed_plan(b"{}").unwrap()], authority).is_err());
+        let unsealed = memfd_create(c"unsealed", MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING).unwrap();
+        assert!(validate_start(&call(0), &[unsealed], authority).is_err(), "seals");
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(validate_start(&call(0), &[file.into()], authority).is_err(), "not a memfd");
     }
     #[test]
     fn start_rejects_fd_count_mismatch_and_special_files() {

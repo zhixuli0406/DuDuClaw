@@ -70,24 +70,15 @@ pub struct LandlockEvidence { pub detected_abi: u32, pub selected_abi: u32 }
 impl LandlockEvidence {
     fn valid(&self) -> bool { self.detected_abi > 0 && self.selected_abi == self.detected_abi.min(7) }
 }
-/// Protocol feature bits the gateway reads before sending an op an older
-/// spawnd would not decode (an unknown `op` closes the control connection).
-/// Deliberately NOT `deny_unknown_fields`: an older reader ignores a newer
-/// bit, and a missing bit reads `false` (the gateway then reports the named
-/// readiness reason instead of sending). HX4 adds `helper_calls` here (F17).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpawndFeatures {
-    /// H4: this spawnd answers the Package H ops `open_work_file`,
-    /// `work_anchor`, `stop_employee_runs` and `employee_idle`
-    /// (`ipc::Opcode::WORK`). A bit for decoding, not for availability: each
-    /// op still fails closed (`workspace_broker_unavailable`, …) on this host.
-    #[serde(default)]
-    pub work_broker: bool,
-}
-impl SpawndFeatures {
-    /// What this binary implements.
-    pub const fn current() -> Self { Self { work_broker: true } }
-}
+/// The one protocol feature set (`ipc::SpawndFeatures`, a u32 bitset:
+/// `helper_calls` = bit 0, `work_broker` = bit 1). The readiness report and
+/// every `Reserved` carry the same value from `Host::features`; an older
+/// reader ignores newer bits, and a missing set reads as none (the gateway
+/// then reports the named readiness reason instead of sending).
+pub use duduclaw_isolation::ipc::SpawndFeatures;
+/// What this binary always decodes; `Core::refresh` adds `helper_calls` when
+/// helpers can run on this host (launcher plans active, slot cgroups usable).
+pub const DECODED_FEATURES: SpawndFeatures = SpawndFeatures::WORK_BROKER;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceReport {
@@ -98,7 +89,7 @@ pub struct EvidenceReport {
     pub host_pty_budget: u32,
     #[serde(default)]
     pub landlock: Option<LandlockEvidence>,
-    /// H4 feature bits; absent in reports of an older spawnd ⇒ all false.
+    /// [F17, H4] feature bits; absent in reports of an older spawnd ⇒ none.
     #[serde(default)]
     pub features: SpawndFeatures,
     pub checks: Readiness,
@@ -107,10 +98,13 @@ impl EvidenceReport {
     pub fn current(checks: Readiness, host_pty_budget: u32) -> io::Result<Self> {
         Ok(Self { version: 1, boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_owned(),
             checked_boottime_ms: boottime_ms()?, valid_for_ms: 1_000, host_pty_budget, landlock: None,
-            features: SpawndFeatures::current(), checks })
+            features: DECODED_FEATURES, checks })
     }
     /// Gateway gate for every `ipc::Opcode::WORK` op (H4/H5/H16).
-    pub fn work_broker(&self) -> bool { self.features.work_broker }
+    pub fn work_broker(&self) -> bool { self.features.contains(SpawndFeatures::WORK_BROKER) }
+    /// Gateway gate for every `ipc::Opcode::HELPER` op (HX5); without it the
+    /// gateway reports `helper_launcher_unavailable{spawnd_feature_missing}`.
+    pub fn helper_calls(&self) -> bool { self.features.contains(SpawndFeatures::HELPER_CALLS) }
     pub fn check_at(&self, boot_id: &str, now: u64) -> crate::Result<()> {
         if self.version != 1 || self.boot_id != boot_id || self.valid_for_ms == 0 || self.valid_for_ms > 1_000
             || now < self.checked_boottime_ms || now - self.checked_boottime_ms >= self.valid_for_ms
@@ -138,7 +132,7 @@ mod tests {
     fn evidence_rejects_stale_future_different_boot_and_missing_components() {
         let report = EvidenceReport { version: 1, boot_id: "boot".into(), checked_boottime_ms: 100,
             valid_for_ms: 1000, host_pty_budget: 100, landlock: Some(LandlockEvidence { detected_abi: 8, selected_abi: 7 }),
-            features: SpawndFeatures::current(), checks: Readiness {
+            features: DECODED_FEATURES, checks: Readiness {
                 protocol: 1, registry_verified: true, accounts_locked: true, ssh_live_negative_checks: true,
                 cron_at_acl_and_jobs_verified: true, external_iam_reservation_verified: true,
                 trampoline_verified: true, landlock_self_test: true, namespace_self_test: true,
@@ -158,24 +152,32 @@ mod tests {
     fn h4_feature_bits_advertised() {
         let report = EvidenceReport::current(Readiness::default(), 1).unwrap();
         assert!(report.work_broker(), "this spawnd decodes every Package H op");
+        assert!(!report.helper_calls(), "helper_calls only once Core::refresh proves helpers can run");
         let value = serde_json::to_value(&report).unwrap();
-        assert_eq!(value["features"]["work_broker"], true);
+        // The same bitset (and wire form) as `SpawnResponse::Reserved.features`.
+        assert_eq!(value["features"], SpawndFeatures::WORK_BROKER.0);
         // A report from an older spawnd has no bits: the gateway must not send.
         let mut old = value.clone();
         old.as_object_mut().unwrap().remove("features");
         assert!(!serde_json::from_value::<EvidenceReport>(old).unwrap().work_broker());
         let mut off = value.clone();
-        off["features"] = serde_json::json!({});
+        off["features"] = 0.into();
         assert!(!serde_json::from_value::<EvidenceReport>(off).unwrap().work_broker());
-        // A newer bit (HX4 `helper_calls`) is ignored by this reader...
+        // HX4 adds helper_calls to the same set; an unknown newer bit is ignored...
+        let mut both = value.clone();
+        both["features"] = SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_CALLS).0.into();
+        let both = serde_json::from_value::<EvidenceReport>(both).unwrap();
+        assert!(both.work_broker() && both.helper_calls());
         let mut newer = value.clone();
-        newer["features"]["helper_calls"] = true.into();
-        assert!(serde_json::from_value::<EvidenceReport>(newer).unwrap().work_broker());
+        newer["features"] = (SpawndFeatures::WORK_BROKER.0 | 1 << 9).into();
+        let newer = serde_json::from_value::<EvidenceReport>(newer).unwrap();
+        assert!(newer.work_broker() && !newer.helper_calls());
         // ...while the report itself stays strict.
         let mut extra = value;
         extra["work_broker"] = true.into();
         assert!(serde_json::from_value::<EvidenceReport>(extra).is_err());
         assert_eq!(duduclaw_isolation::ipc::Opcode::WORK.len(), 4);
+        assert_eq!(duduclaw_isolation::ipc::Opcode::HELPER.len(), 4);
     }
 }
 

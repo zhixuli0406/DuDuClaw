@@ -230,6 +230,12 @@ pub trait Trampoline: Send {
     /// Returns the validated per-run master exactly once after Running.
     fn take_pty(&mut self, run: RunHandle) -> Result<std::os::fd::OwnedFd>;
     fn close(&mut self, run: RunHandle) -> Result<()>;
+    /// HX4: once Running, move spawnd's end of the run's launcher control
+    /// socketpair, its root-held slot cgroups and its helper table out, once.
+    /// `helper_unavailable` without a launcher, `helper_cgroup_unavailable`
+    /// when the slot cgroups could not be prepared (HX2 fail-closed path).
+    fn take_helper_link(&mut self, _: RunHandle)
+        -> Result<crate::helper_host::HelperLink<crate::helper_cgroup::linux::UnitTree>> { Err(ErrorCode::HelperUnavailable) }
 }
 #[cfg(target_os = "linux")]
 pub struct UnavailableTrampoline;

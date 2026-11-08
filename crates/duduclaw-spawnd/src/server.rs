@@ -73,15 +73,20 @@ impl Subject {
             SpawnRequest::OpenWorkFile { run, employee_id, .. } => (Some(*employee_id), Some(run.0)),
             SpawnRequest::WorkAnchor { employee_id } | SpawnRequest::StopEmployeeRuns { employee_id }
                 | SpawnRequest::EmployeeIdle { employee_id } => (Some(*employee_id), None),
+            SpawnRequest::HelperCall { run, employee_id, .. } => (Some(*employee_id), Some(run.0)),
+            SpawnRequest::HelperWait { run, .. } | SpawnRequest::HelperStop { run, .. }
+                | SpawnRequest::HelperCancel { run, .. } => (None, Some(run.0)),
             _ => (None, None),
         };
         Self { op: message.opcode(), employee, run }
     }
     fn work(self) -> bool { Opcode::WORK.contains(&self.op) }
+    fn helper(self) -> bool { Opcode::HELPER.contains(&self.op) }
 }
-/// H4: a Package H request whose reply waits for root work (lease check,
-/// snapshot copy, stop confirmation). The client gets no other reply until
-/// this one is sent, and it is sent within `BROKER_REPLY_MS`.
+/// H4/HX4: a Package H request (lease check, snapshot copy, stop
+/// confirmation) or a `HelperCall` (slot wait, root start) whose reply waits
+/// for root work. The client gets no other reply until this one is sent, and
+/// it is sent within `BROKER_REPLY_MS`.
 struct Deferred { request_id: RequestId, ticket: Ticket, deadline: u64, subject: Subject }
 struct Client { socket: Seqpacket, id: ControlConnectionId, last_request: u64, deferred: Option<Deferred> }
 enum Dispatched { Now(SpawnResponse, Vec<OwnedFd>), Later(Ticket) }
@@ -207,6 +212,13 @@ fn audit_record(now: u64, message: &SpawnResponse, subject: Subject, detail: Opt
             record(Event::WorkFileRefused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
         SpawnResponse::Error { code } if subject.work() =>
             record(Event::Refused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
+        // HX4: a refused HelperCall is audited; a HelperWait poll that is
+        // simply not finished yet is not (the host audits every start and end).
+        SpawnResponse::Error { code } if subject.op == Opcode::HelperCall =>
+            record(Event::HelperRefused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
+        SpawnResponse::Error { code: ErrorCode::NotReady } if subject.op == Opcode::HelperWait => None,
+        SpawnResponse::Error { code } if subject.helper() =>
+            record(Event::Refused, None, subject.run, Some(Detail::Code { code: *code })),
         SpawnResponse::Error { .. } => record(Event::Refused, None, None, None),
         _ => None,
     }
@@ -217,6 +229,24 @@ fn audit_record(now: u64, message: &SpawnResponse, subject: Subject, detail: Opt
 /// the host) and the caller gets `workspace_broker_unavailable`.
 fn finish<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut Coordinator<H>, deferred: &Deferred,
     now: u64) -> Option<(Envelope<SpawnResponse>, Vec<OwnedFd>, Option<Detail>)> {
+    if deferred.subject.op == Opcode::HelperCall {
+        // HX4: `HelperStarted` carries exactly `[StdoutRead, StderrRead]`. The
+        // coordinator answers a queued call `helper_busy` at HELPER_QUEUE_MS,
+        // before this deadline; this fallback covers a stalled host start.
+        let (message, descriptors) = match coordinator.poll_helper_ticket(deferred.ticket, now) {
+            Ok(Some(reply)) => (reply.response, reply.pipes.unwrap_or_default()),
+            Ok(None) if now < deferred.deadline => return None,
+            Ok(None) => {
+                coordinator.abandon_ticket(deferred.ticket);
+                (SpawnResponse::Error { code: ErrorCode::HelperBusy }, vec![])
+            }
+            Err(code) => {
+                coordinator.abandon_ticket(deferred.ticket);
+                (SpawnResponse::Error { code }, vec![])
+            }
+        };
+        return Some((Envelope { version: ipc::PROTOCOL_VERSION, request_id: deferred.request_id, message }, descriptors, None));
+    }
     let (message, descriptors, detail) = match coordinator.poll_ticket(deferred.ticket, now) {
         Ok(Some(outcome)) => {
             let descriptors: Vec<OwnedFd> = outcome.file.map(OwnedFd::from).into_iter().collect();
@@ -272,6 +302,21 @@ fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut
                 return Ok(Dispatched::Later(coordinator.stop_employee_runs(employee_id, now)?)),
             SpawnRequest::EmployeeIdle { employee_id } =>
                 return Ok(Dispatched::Later(coordinator.employee_idle(employee_id, now)?)),
+            // HX4 helper calls. Same listener authentication; the coordinator
+            // checks run ownership, `entry.employee == employee_id` [F7],
+            // `Running` [F4], remaining run time and the per-run FIFO (Q4); the
+            // host re-derives the helper from the run's employee, revalidates the
+            // memfd (already checked by `validate_start`) and starts it. Only
+            // HelperCall is deferred (≤ BROKER_REPLY_MS; a queued call waits at
+            // most HELPER_QUEUE_MS); the call id is drawn here, never the gateway's.
+            request @ SpawnRequest::HelperCall { .. } => {
+                let call = random_id().map_err(|_| ErrorCode::Internal)?;
+                return Ok(Dispatched::Later(coordinator.helper_call(connection, request, packet.fds, call, now)?));
+            }
+            SpawnRequest::HelperWait { run, call } => coordinator.helper_wait(run, call, connection)?,
+            // [F8] per-call only: never Cancel/revoke/kill of the run.
+            SpawnRequest::HelperStop { run, call } => { coordinator.helper_stop(run, call, connection, now)?; SpawnResponse::Ack }
+            SpawnRequest::HelperCancel { run, call } => { coordinator.helper_cancel(run, call, connection, now)?; SpawnResponse::Ack }
         };
         Ok(Dispatched::Now(response, vec![]))
     })();

@@ -362,6 +362,10 @@ fn map_error(code: ErrorCode) -> BackendError {
         ErrorCode::WorkFileNotFound => BackendError::NotFound,
         ErrorCode::WorkFileRefused | ErrorCode::WorkFileTooLarge => BackendError::Denied,
         ErrorCode::WorkspaceBrokerUnavailable => BackendError::Unavailable,
+        // HX codes. HX5's `run_helper` maps them to typed per-call results
+        // (`helper_busy`, `run_time_exhausted`, …) before this generic mapping.
+        ErrorCode::HelperBusy | ErrorCode::HelperUnavailable | ErrorCode::HelperCgroupUnavailable => BackendError::Unavailable,
+        ErrorCode::RunTimeExhausted => BackendError::Timeout,
     }
 }
 
@@ -781,7 +785,7 @@ mod tests {
             let request: Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
             let run = duduclaw_isolation::execution::RunHandle(duduclaw_isolation::ids::RunId([9; 16]));
             let response = Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id,
-                message: SpawnResponse::Reserved { run, expires_at_unix_ms: 100 } };
+                message: SpawnResponse::Reserved { run, expires_at_unix_ms: 100, features: ipc::SpawndFeatures::NONE } };
             server_live.store(false, Ordering::SeqCst);
             send_checked(&right, &ipc::encode(&response).unwrap(), &[], &|| Ok(())).await.unwrap();
         });
