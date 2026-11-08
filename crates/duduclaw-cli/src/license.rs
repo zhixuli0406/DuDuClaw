@@ -9,6 +9,7 @@
 //!   import <path>       Import a license JSON file from disk
 //!   deactivate          Remove the active license (revert to OpenSource)
 //!   fingerprint         Print this machine's fingerprint
+//!   installation-key    Print the MFA relay installation key fingerprint (SAS)
 //!
 //! Design notes:
 //!
@@ -90,6 +91,12 @@ pub enum LicenseCommands {
         #[arg(long)]
         all: bool,
     },
+
+    /// Print this installation's MFA relay key fingerprint (16-character SAS)
+    /// for comparison when approving the installation in the license console.
+    /// Creates `state/installation.key` if it does not exist yet. Line 1 is
+    /// the SAS only; details go to stderr.
+    InstallationKey,
 }
 
 // ── Public entry point ────────────────────────────────────────
@@ -110,6 +117,7 @@ pub async fn run(cmd: LicenseCommands) -> Result<()> {
         LicenseCommands::Rebind => cmd_rebind().await,
         LicenseCommands::Subscriptions => cmd_subscriptions().await,
         LicenseCommands::Fingerprint { all } => cmd_fingerprint(all).await,
+        LicenseCommands::InstallationKey => cmd_installation_key().await,
     }
 }
 
@@ -125,6 +133,7 @@ fn command_writes_state(cmd: &LicenseCommands) -> bool {
             | LicenseCommands::Import { .. }
             | LicenseCommands::Deactivate
             | LicenseCommands::Rebind
+            | LicenseCommands::InstallationKey
     )
 }
 
@@ -145,7 +154,31 @@ pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] = &[duduclaw_core
 }, duduclaw_core::OperatorCommand {
     name: "duduclaw license state change",
     path: &["license", "rebind"],
+}, duduclaw_core::OperatorCommand {
+    name: "duduclaw license state change",
+    path: &["license", "installation-key"],
 }];
+
+/// The gateway home that holds `license.json` also holds `state/installation.key`.
+fn installation_home(license_path: &std::path::Path) -> Option<&std::path::Path> {
+    license_path.parent()
+}
+
+/// Local installation public key for refresh/rebind, generated only if absent.
+/// Any key-store failure omits the field: the license still refreshes, the
+/// MFA relay just stays unbound.
+fn installation_pubkey_for(license_path: &std::path::Path) -> Option<String> {
+    installation_home(license_path).and_then(duduclaw_gateway::installation_identity::ensure_public_key_hex)
+}
+
+/// Relay key state of a license versus the local key (public values only).
+fn relay_key_line(license: &License, local_pubkey: Option<&str>) -> &'static str {
+    match (license.installation_pubkey.as_deref(), local_pubkey) {
+        (None, _) => "not yet approved — approve this installation in the license console",
+        (Some(bound), Some(local)) if bound == local => "approved for this installation",
+        _ => "bound to a different key — approve this installation in the license console",
+    }
+}
 
 pub fn bash_license_decision(
     command: &str,
@@ -384,12 +417,16 @@ async fn cmd_rebind() -> Result<()> {
 
     let endpoint = format!("{}/v1/license/rebind", resolve_control_url(installed.control_url.as_deref()).trim_end_matches('/'));
     let nonce = uuid::Uuid::new_v4().to_string();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "subscription_id": installed.subscription_id,
         "old_fingerprint": installed.machine_fingerprint,
         "new_fingerprint": new_fp,
         "nonce": nonce,
     });
+    // The new machine's installation key; approval binds it with the move.
+    if let Some(pubkey) = installation_pubkey_for(&path) {
+        body["installation_pubkey"] = serde_json::json!(pubkey);
+    }
 
     let endpoint = validated_control_endpoint(&endpoint)?;
     let request = control_request(endpoint.as_str()).await?;
@@ -523,6 +560,8 @@ async fn cmd_activate(key_input: &str) -> Result<()> {
 
     let path = save_default(&license)
         .map_err(|e| DuDuClawError::License(format!("failed to save license: {e}")))?;
+    // Ensure the MFA relay installation key exists (local only, no network).
+    let local_pubkey = installation_pubkey_for(&path);
 
     println!("✓ License activated");
     println!("  Tier:           {}", license.tier);
@@ -533,6 +572,9 @@ async fn cmd_activate(key_input: &str) -> Result<()> {
         license.days_until_expiry()
     );
     println!("  Saved to:       {}", path.display());
+    if let Some(sas) = local_pubkey.as_deref().and_then(duduclaw_gateway::installation_identity::sas_for_hex) {
+        println!("  Relay key:      {sas} ({})", relay_key_line(&license, local_pubkey.as_deref()));
+    }
 
     Ok(())
 }
@@ -807,6 +849,12 @@ async fn cmd_refresh() -> Result<()> {
         // the rebind in the console. The installed binding is not a secret.
         request_body["new_fingerprint"] = serde_json::json!(proposed_fingerprint);
     }
+    // Capability signal: the issuer only signs `installation_pubkey` into the
+    // license for requests that carry it; an unknown key awaits owner approval.
+    let local_pubkey = installation_pubkey_for(&path);
+    if let Some(pubkey) = local_pubkey.as_deref() {
+        request_body["installation_pubkey"] = serde_json::json!(pubkey);
+    }
 
     let endpoint = validated_control_endpoint(&endpoint)?;
     let client = control_request(endpoint.as_str()).await?;
@@ -862,6 +910,11 @@ async fn cmd_refresh() -> Result<()> {
             println!("  Tier:           {}", new_license.tier);
             println!("  Days remaining: {}", new_license.days_until_expiry());
             println!("  Saved to:       {}", path.display());
+            // A differing or absent key never rejects the license; only the
+            // MFA email relay waits for console approval.
+            if let Some(sas) = local_pubkey.as_deref().and_then(duduclaw_gateway::installation_identity::sas_for_hex) {
+                println!("  Relay key:      {sas} ({})", relay_key_line(&new_license, local_pubkey.as_deref()));
+            }
 
             if let Some(warnings) = envelope.get("warnings").and_then(|v| v.as_array()) {
                 if !warnings.is_empty() {
@@ -1010,6 +1063,31 @@ async fn cmd_fingerprint(all: bool) -> Result<()> {
         eprintln!("(no legacy fingerprints — this machine accepts only the value above)");
     }
     warn_if_hostname_only(None);
+    Ok(())
+}
+
+// ── installation-key ──────────────────────────────────────────
+
+async fn cmd_installation_key() -> Result<()> {
+    let path = storage::default_license_path()
+        .map_err(|e| DuDuClawError::License(format!("license path: {e}")))?;
+    let home = installation_home(&path)
+        .ok_or_else(|| DuDuClawError::License("cannot locate the DuDuClaw home directory".into()))?;
+    // Generated only when absent; unsafe or unreadable key files are reported,
+    // never replaced. Only public values are printed.
+    let (key, created) = duduclaw_gateway::installation_identity::load_or_create(home)
+        .map_err(|e| DuDuClawError::License(format!(
+            "installation key unavailable ({:?}); it was not regenerated — check {}",
+            e.kind(), home.join("state").display())))?;
+    println!("{}", key.fingerprint());
+    eprintln!("Public key:       {}", key.public_key_hex());
+    if created { eprintln!("(new installation key created)"); }
+    match load_default() {
+        Ok(license) => eprintln!("MFA email relay:  {}", relay_key_line(&license, Some(&key.public_key_hex()))),
+        Err(LicenseError::FileNotFound(_)) => eprintln!("MFA email relay:  no license installed"),
+        Err(_) => eprintln!("MFA email relay:  installed license unreadable"),
+    }
+    eprintln!("Compare this fingerprint with the pending installation in the license console before approving.");
     Ok(())
 }
 
@@ -1235,6 +1313,7 @@ mod tests {
         assert!(command_writes_state(&LicenseCommands::Import { path: PathBuf::from("license.json") }));
         assert!(command_writes_state(&LicenseCommands::Deactivate));
         assert!(command_writes_state(&LicenseCommands::Rebind));
+        assert!(command_writes_state(&LicenseCommands::InstallationKey));
         assert!(!command_writes_state(&LicenseCommands::Status));
         assert!(!command_writes_state(&LicenseCommands::Export { base64: false }));
         assert!(!command_writes_state(&LicenseCommands::Subscriptions));
@@ -1271,6 +1350,7 @@ mod tests {
             "duduclaw license import ./license.json",
             "duduclaw license deactivate",
             "duduclaw license rebind",
+            "duduclaw license installation-key",
         ] {
             assert!(bash_license_decision(command, &caller).is_some(), "{command}");
         }

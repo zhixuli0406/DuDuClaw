@@ -62,10 +62,45 @@ OEM tar, Pro binaries and control-plane allowlist. Pro images default to
 `CLOUD_BUILD=1`; set `CLOUD_BUILD=0` to deliberately build locally. The pushed amd64
 image is pulled before tar creation and linux-x64 binary extraction.
 
+## Re-run archive signing only
+
+The `release.yml` build matrix uploads `unsigned-duduclaw-*` artifacts (archives
+and SHA-256 checksums) immediately after packaging. A separate `sign` matrix
+checks each checksum, signs the archive with keyless cosign and verifies the
+signature against the exact workflow ref (`https://github.com/${github.workflow_ref}`)
+and the GitHub OIDC issuer (`https://token.actions.githubusercontent.com`). Windows
+keeps its existing ZIP/cosign path. Each sign or verify command gets six attempts
+with delays of 30, 60, 120, 240 and 480 seconds; exhausted retries fail that sign
+job while preserving the unsigned build artifacts.
+
+After a transient Rekor/Fulcio outage, find the failed signing job's database ID:
+
+```bash
+gh run view RUN_ID --json jobs --jq '.jobs[] | select(.name | startswith("Sign ")) | {name, databaseId, conclusion}'
+gh run rerun RUN_ID --job SIGN_JOB_ID
+```
+
+Repeat for each failed signing matrix entry. This reruns the selected signing
+job and its downstream dependents; it does not rerun successful build jobs. Use
+the numeric `databaseId`, not a matrix label or job URL suffix. Unsigned artifacts
+must still be within their Actions retention period. An expired artifact requires
+a rebuild. Re-running an old run uses that run's workflow revision, so this recovery
+path applies only to runs containing the separate `sign` job.
+
+Verified bundles retain the original `duduclaw-*` artifact names and archive,
+`.sha256`, `.sig` and `.pem` paths. A signing rerun overwrites only its signed
+bundle. GitHub Release and npm download only these bundles, excluding `unsigned-*`;
+PyPI builds its own package and waits for the release job. Minisign remains in the
+release job, and PyPI retains its separate Trusted Publisher OIDC permission.
+
 ## Main platform CI preflight
 
 PR Rust CI runs only on Ubuntu. Main pushes, the daily 18:00 UTC schedule and
-manual CI runs cover Ubuntu, macOS and Windows; Windows failures are real failures.
+manual CI runs cover Ubuntu, macOS and Windows. Ubuntu runs without partitioning;
+macOS and Windows each run workspace and gateway nextest in three parallel hash
+partitions. Each OS runs doctests, OpenTelemetry, app-compat and edition-ceiling
+verification only in shard 1; required native Windows cases also run only there.
+JUnit artifacts are named `nextest-<os>-shard<k>` (Ubuntu uses shard 1).
 Before any mutation, release preflight reads the remote main tip with `git ls-remote`
 and requires pre-bump HEAD to contain it. It queries the latest 100 `ci.yml` runs
 on main across all statuses, selects the newest push/schedule ancestor of HEAD,
@@ -74,9 +109,10 @@ run can be ignored only if a later run exists on a strictly newer main commit;
 a manual cancellation with no such successor blocks. Failures never fall back
 to older green runs. The selected run must be on remote main's tip or at most
 3 commits behind it, and no more than 36 hours old (including runs at the tip).
-Both `Rust macos-latest` and `Rust windows-latest` must be present and successful;
+All six `Rust macos-latest (shard 1/3)` through `(shard 3/3)` and
+`Rust windows-latest (shard 1/3)` through `(shard 3/3)` jobs must be present and successful;
 failed, cancelled, skipped or missing jobs block minor/major. A non-success run
-conclusion blocks even when both platform jobs succeeded. The local `origin/main`
+conclusion blocks even when all six platform shards succeeded. The local `origin/main`
 tracking ref is not used as the remote-tip authority.
 Missing `gh`, authentication/query failures or absent coverage also block.
 Hotfix prints a warning and continues. `DUDUCLAW_RELEASE_IGNORE_PLATFORM_CI="reason"`
@@ -171,7 +207,39 @@ optional output cannot satisfy either mandatory full-manual item.
 
 `scripts/release.sh` checks the enterprise prerequisites before it changes anything: the private enterprise checkout, the Pro signing key, `minisign`, `gcloud` and `docker` on `PATH`, a running Docker daemon, an active gcloud account, the token that fetches the distributor notice (read from Secret Manager when `DUDUCLAW_CONTROL_ADMIN_TOKEN` is unset; `DUDUCLAW_DISTRIBUTOR_NOTICE=skip` builds without fetching) and the enterprise checkout on its own branch. A missing one stops the run. A deliberate CE-only release sets `DUDUCLAW_RELEASE_WITHOUT_PRO=1` and is announced as such.
 
-After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision) must all succeed. The script commits the re-resolved enterprise `Cargo.lock` and (minor/major only) the distributor brief on the enterprise checkout's branch and prints the push command; only a failed commit is a gap. The darwin binary is taken from cargo's actual target directory, so a shared `CARGO_TARGET_DIR` works. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks that the serving control-plane revision offers the version (`pro-offer`) and fails, instead of staying silent, when it runs without the enterprise checkout.
+After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision in every configured region) must all succeed. The script commits the re-resolved enterprise `Cargo.lock` and (minor/major only) the distributor brief on the enterprise checkout's branch and prints the push command; only a failed commit is a gap. The darwin binary is taken from cargo's actual target directory, so a shared `CARGO_TARGET_DIR` works. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks each region's serving control-plane revision for the offered version (`pro-offer`) and delivery manifest (`delivery-manifest`) and fails, instead of staying silent, when it runs without the enterprise checkout.
+
+
+### Control-plane regions (RM-161)
+
+The service name is `duduclaw-control-plane` in both `asia-east1` (API domain,
+called by gateways) and `us-east4` (console domain). Release env sync and
+`release.sh verify VERSION` default to both regions, independently of
+`DUDUCLAW_GCP_REGION`, which still selects the artifact registry region.
+`DUDUCLAW_CP_SERVICE` overrides the shared service name.
+
+Set `CP_REGIONS="asia-east1 us-east4"` to override the whitespace-separated list.
+An empty list fails. For backward compatibility, setting only `CP_REGION` selects
+that single region and prints a warning that the other region is skipped.
+`CP_REGIONS` takes precedence when both variables are set. Remove a single-region
+override before a normal release so both gateway and console offers are updated.
+
+The sync reads the existing manifest from the first configured region (normally
+`asia-east1`), computes the intended manifest once using the uploaded tar SHA,
+and writes identical `DUDUCLAW_PRO_VERSIONS` and
+`DUDUCLAW_GENERAL_DELIVERY_MANIFEST` values to every configured region. If the
+manifest cannot be read or computed, no region is updated and the release fails.
+After updating all regions and routing traffic to their latest revisions, it
+reads each service's live traffic and then that serving revision's env, printing
+the region and revision name. Any failed update, unreadable/split serving
+revision, or value that differs from the intended values fails the release gate.
+
+Verification reports both checks per region and a control-plane summary (normally
+four checks across two regions). The manifest must contain the requested version
+with a valid SHA-256, and both env values must agree between regions. All live
+readback uses `gcloud run services describe --format=json` and
+`gcloud run revisions describe --format=json`; it needs no `logging.read`
+permission and does not query Cloud Logging.
 
 Added after v1.76.2: the distributor-notice token and enterprise-branch preflight checks, the automatic enterprise commit, and reading the darwin binary from cargo's target directory.
 

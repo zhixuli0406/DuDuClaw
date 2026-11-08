@@ -82,7 +82,7 @@ impl Default for VoiceConfig {
 
 impl VoiceConfig {
     /// Allowed TTS provider values.
-    const VALID_TTS_PROVIDERS: &[&str] = &["auto", "kokoro", "azure", "minimax", "openai-tts", "openai", "piper", "command", "off", "none", "disabled", "edge-tts", "edge"];
+    const VALID_TTS_PROVIDERS: &[&str] = &["auto", "kokoro", "azure", "minimax", "openai-tts", "openai", "piper", "command", "off", "none", "disabled"];
 
     /// Validate and normalize config values, falling back to "auto" for unknown providers.
     pub fn validate(&mut self) {

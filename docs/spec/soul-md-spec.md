@@ -25,6 +25,8 @@ SOUL.md is **pure Markdown** with no YAML frontmatter. The Evolution Engine pars
 
 The agent's default reply language is **not** configured in SOUL.md. It comes from `config.toml [general] default_language` (set once for the whole gateway, editable from the dashboard's general settings) and is injected into every system prompt by `duduclaw-gateway::prompt_identity`. A fresh install defaults to `zh-TW`. Absent/empty config falls back to "respond in the same language as the user's input."
 
+A single employee can override it with `[prompt] reply_language` in its own `agent.toml` (`auto` | `zh-TW` | `zh-CN` | `en` | `ja-JP`; any other value is rejected on write). Resolution order: the employee's `reply_language` → `[general] default_language` → follow the user's input language. `auto` means "follow the user's language" and wins over a pinned global value. When a non-`auto` language is in effect, the shared base prompt states that language instead of "match the user's input", and each turn's user-side message ends with a one-line `<reply_language>` reminder.
+
 SOUL.md may still carry an optional `## Terminology & Tone` (or `## Tone`) section for content the global default doesn't cover — industry glossaries, persona/voice, or drafting-language exceptions (e.g. "internal reports always stay zh-TW even when the customer's draft is in English") — see `templates/*/SOUL.md` (and the premium templates in the private enterprise checkout) for examples.
 
 ## Required Sections

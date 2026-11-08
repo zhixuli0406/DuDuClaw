@@ -370,6 +370,31 @@ mod tests {
         );
     }
 
+    /// The resolved reply language (employee override or global, computed by
+    /// the caller) is what reaches the minimal prompt; `auto` adds no directive.
+    #[test]
+    fn minimal_prompt_language_directive_follows_resolved_setting() {
+        let build = |lang: Option<&'static str>| {
+            build_minimal_inner(MinimalInput {
+                agent_name: "test",
+                display_name: "Alice",
+                default_language: lang,
+                soul: Some("Be friendly."),
+                identity: None,
+                user: None,
+                instructions: None,
+                contract: "",
+                sender_block: "",
+                pinned_instructions: "",
+                minimal_core_kb: 5,
+            })
+        };
+        assert!(build(Some("ja-JP")).contains("Japanese"));
+        assert!(build(Some("zh-CN")).contains("Simplified Chinese"));
+        assert!(!build(Some("auto")).contains("always respond in"));
+        assert!(!build(None).contains("always respond in"));
+    }
+
     /// Agent-config import: INSTRUCTIONS.md reaches the minimal prompt, after
     /// SOUL/IDENTITY, cut to the same `minimal_core_kb` budget as SOUL.
     #[test]

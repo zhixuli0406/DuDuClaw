@@ -19,7 +19,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 ### 通道（11 個）
 - **Telegram**（long polling）— 檔案／照片／貼圖／語音、群組話題（forums/topics）、僅限提及（mention-only）、透過 OpenAI Whisper API 轉錄語音。
 - **LINE**（webhook）— HMAC-SHA256 簽章、貼圖目錄、逐聊天室設定。
-- **Discord**（Gateway WebSocket）— `tokio::select!` 心跳、斜線指令、自動建立討論串；語音頻道（Songbird）只存在於啟用非預設 `discord-voice` feature 的建置，正式發布的執行檔不含此 feature。v1.9.2 強化：真正的 op 6 RESUME（持久化 `session_id` + `resume_gateway_url` + sequence）、停滯監看（超過 2 倍心跳間隔無流量即中斷）、心跳 channel 容量 1→16 並改用 `try_send`、op 9 加上 1-5 秒抖動、處理 RESUMED dispatch、backoff 上限 60 秒。
+- **Discord**（Gateway WebSocket）— `tokio::select!` 心跳、斜線指令、自動建立討論串v1.9.2 強化：真正的 op 6 RESUME（持久化 `session_id` + `resume_gateway_url` + sequence）、停滯監看（超過 2 倍心跳間隔無流量即中斷）、心跳 channel 容量 1→16 並改用 `try_send`、op 9 加上 1-5 秒抖動、處理 RESUMED dispatch、backoff 上限 60 秒。
 - **Slack**（Socket Mode）、**WhatsApp**（Cloud API webhook，簽章驗證 fail-closed）、**Feishu**（Open Platform v2）、**Google Chat**（webhook，JWT 驗證）、**Microsoft Teams**（Azure Bot / Connector v3，JWT 驗證）、**WeCom**（HMAC-SHA1 + AES-256-CBC）、**DingTalk**（HMAC-SHA256 + 時間窗）、**WebChat**（`/ws/chat` + React 前端）。
 - 通用的 `POST /webhook/{agent_id}` endpoint 從未掛載，已於 v1.66 移除；入站 webhook 屬於各個通道與 Odoo（`POST /webhook/odoo`）。
 - **通道熱啟動／熱停止**：Dashboard 的 `channels.add` / `channels.remove` 可直接啟動／中止通道任務，不需重啟 gateway。
@@ -86,7 +86,6 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 - **HTTP endpoints**：`POST /api/stt`（OpenAI 相容的轉錄 API 或本機指令範本；未設定 STT provider 時回 501）、`POST /api/tts`，後端為 Piper（本機）／Kokoro / Azure／MiniMax T2A／OpenAI TTS。
 - **Telegram 語音**：轉錄使用設定的 STT 供應商（未設定時保留 Whisper 備援）；語音回覆使用共用 TTS router 與儀表板 TTS 設定，失敗時退回文字。
 - 本機 Kokoro-82M v1.1-zh（Apache-2.0；從「設定 → 語音」下載，約 134 MB）取代原本的選用 CLI。自動順序：已安裝 Piper → 已安裝 Kokoro → MiniMax → OpenAI → Azure。Kokoro 中文帶有中國大陸口音，多音字可能誤讀。官方 Azure AI Speech REST 提供台灣國語聲音，會將文字傳送至 Microsoft，需設定 `AZURE_SPEECH_KEY`／`AZURE_SPEECH_REGION`。Telegram 以 WAV 接收本機 Kokoro 音訊（`sendAudio`）。
-- **正式發布的執行檔不含**：行程內 Whisper（`whisper` feature）、ONNX embedding（`onnx` feature）與 Discord 語音（`discord-voice` feature）。
 - 此處過去列出的 SenseVoice、Deepgram、Silero VAD、`symphonia` 解碼與 LiveKit 語音房，都沒有對應的程式碼。詳見 [`docs/features/zh-TW/14-voice-pipeline.md`](../../features/zh-TW/14-voice-pipeline.md)。
 
 ### 安全性

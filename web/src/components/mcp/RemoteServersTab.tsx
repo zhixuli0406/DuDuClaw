@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type McpRegistryHeader, type McpRemoteAuth, type McpRemoteServerStatus } from '@/lib/api';
 import { openExternal } from '@/lib/external-link';
+import { dashboardBaseUrl } from '@/lib/dashboard-base';
 import { toast } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import {
@@ -26,9 +27,13 @@ import { ConfirmDialog } from '@/components/settings/controls';
 import { ToolEffectsPanel } from './ToolEffectsPanel';
 import { McpEventsPanel } from './McpEventsPanel';
 
-/** The dashboard origin the OAuth redirect comes back to (validated by the gateway). */
+/**
+ * The dashboard address the OAuth redirect comes back to: origin plus the
+ * dashboard base path (RM-129). The gateway validates the origin against its
+ * allowlist; `[dashboard] public_url` decides the path.
+ */
 export function dashboardOrigin(): string {
-  return typeof window === 'undefined' ? '' : window.location.origin;
+  return dashboardBaseUrl();
 }
 
 /**

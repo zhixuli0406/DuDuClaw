@@ -157,6 +157,8 @@ confidence = quality_spread       · 0.4
 - **`LlmJudge<C: LlmCaller>`**——複数候補・XML区切りのプロンプト（`build_judge_prompt`）を構築し、候補タグをエスケープして注入耐性を持たせ、応答を JSON 優先（fence 除去付き）で解析します。バックエンドは注入式なので、gateway は Confidence Router（local 優先、信頼度が低いとき Claude にエスカレート）を接続できます。解析不能な判定や範囲外のインデックスはエラーを返します（fail-closed）。
 - **`HeuristicJudge`**——決定論的・ゼロ LLM のフォールバックジャッジで、LLM が利用できないときに使われます。
 
+`LlmJudge` はブラインド評価を行います：候補はランダムな順序で匿名ラベル（`Candidate A`、`B`…）として提示され、ブランチ id・名前・モデルは含まれません。シャッフル順序は監査用に判定の rationale に記録されます。
+
 `test_pass_ratio` はジャッジ可能ブランチ全体の `test_exit_code` から算出され、どのブランチもテストされていないときは中立値（0.5）になります。
 
 ---

@@ -1,3 +1,4 @@
+pub mod module_lease;
 pub mod autonomy_gate;
 pub mod autonomy_handoff;
 pub mod agent_guard;
@@ -35,6 +36,8 @@ pub mod fs_lock;
 pub mod owner_lock;
 pub mod grounding;
 pub mod identity_token;
+#[cfg(windows)]
+pub mod windows_private_state;
 pub mod keychain;
 pub mod knowledge_agent;
 pub mod lenient;

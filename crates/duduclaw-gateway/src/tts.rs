@@ -654,11 +654,11 @@ impl TtsRouter {
     fn strategy_for_setting(setting: &str) -> Option<TtsStrategy> {
         Some(match setting {
             "none" | "off" | "disabled" => return None,
-            // Deprecated settings remain accepted until v1.81.0.
+            // Removed settings leave TTS disabled; point operators to Kokoro.
             "edge-tts" | "edge" => {
                 static WARN: std::sync::Once = std::sync::Once::new();
-                WARN.call_once(|| warn!("edge-tts is deprecated; using auto. Choose Kokoro or Azure; compatibility ends in v1.81.0"));
-                TtsStrategy::LocalFirst
+                WARN.call_once(|| warn!("edge-tts is no longer supported; TTS is disabled. Choose Kokoro instead."));
+                return None;
             }
             "kokoro" => TtsStrategy::KokoroOnly,
             "azure" => TtsStrategy::AzureOnly,
@@ -862,8 +862,6 @@ mod tests {
         for (setting, strategy) in [
             ("", TtsStrategy::LocalFirst),
             ("auto", TtsStrategy::LocalFirst),
-            ("edge", TtsStrategy::LocalFirst),
-            ("edge-tts", TtsStrategy::LocalFirst),
             ("kokoro", TtsStrategy::KokoroOnly),
             ("azure", TtsStrategy::AzureOnly),
             ("piper", TtsStrategy::PiperOnly),
@@ -873,6 +871,9 @@ mod tests {
             ("command", TtsStrategy::CommandOnly),
         ] {
             assert_eq!(TtsRouter::strategy_for_setting(setting), Some(strategy));
+        }
+        for setting in ["edge-tts", "edge"] {
+            assert_eq!(TtsRouter::strategy_for_setting(setting), None);
         }
         for setting in ["none", "off", "disabled"] {
             assert_eq!(TtsRouter::strategy_for_setting(setting), None);

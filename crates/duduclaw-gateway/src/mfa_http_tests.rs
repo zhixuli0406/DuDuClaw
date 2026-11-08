@@ -1088,6 +1088,8 @@ async fn mfa_email_http_login_uses_verified_address_and_consumes_challenge() {
     state.user_db.mfa_email_verify_and_issue(&token,&code,true,now,|_,_,_|Ok(())).unwrap();
     let token=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,false,now+60).unwrap();
     let (_,code)=state.user_db.mfa_email_send(&token,false,now+60).unwrap();
+    std::fs::write(dir.path().join("config.toml"),"[auth]\nmfa_enforced=false\n[mfa]\nemail_relay=false\n").unwrap();
+    assert!(!crate::mfa_email::available(dir.path()));
     let payload=||serde_json::from_value(json!({"challenge_id":token,"code":code})).unwrap();
     let (status,value)=body(super::super::server_mfa_email::verify(State(state.clone()),ConnectInfo(peer(231)),Json(payload())).await).await;
     assert_eq!(status,StatusCode::OK);
@@ -1147,7 +1149,7 @@ async fn mfa_email_http_invalid_capabilities_hide_send_availability() {
         json!({"enrollment_token":stepup}),json!({"enrollment_token":expired})];
     let mut expected=None;
     for smtp in [false,true] {
-        let config=if smtp {"[channels.email]\nsmtp_host='127.0.0.1'\nsmtp_port=9\nfrom_addr='sender@example.test'\n"} else {"[auth]\nmfa_enforced=false\n"};
+        let config=if smtp {"[channels.email]\nsmtp_host='127.0.0.1'\nsmtp_port=9\nfrom_addr='sender@example.test'\n"} else {"[auth]\nmfa_enforced=false\n[mfa]\nemail_relay=false\n"};
         std::fs::write(dir.path().join("config.toml"),config).unwrap();
         assert_eq!(crate::mfa_email::available(dir.path()),smtp);
         for (i,value) in invalid.iter().enumerate() {

@@ -237,7 +237,6 @@ pub mod delegation_gate;
 pub mod delegation_router;
 pub mod direct_api;
 pub mod discord;
-pub mod discord_voice;
 /// B0-1 exploration-tree ledger, replay simulator and policy protocol (offline only).
 pub mod discovery;
 pub mod dispatcher;
@@ -420,6 +419,8 @@ pub mod secret_redact;
 pub mod server;
 mod mfa;
 mod mfa_email;
+/// Installation Ed25519 key and the shared descriptor-pinned `state/` store.
+pub mod installation_identity;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;

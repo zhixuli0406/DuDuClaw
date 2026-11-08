@@ -444,7 +444,7 @@ pub async fn dispatch(
             agent_dir: agent.dir.clone(),
             runtime: RuntimeType::Claude,
             model: agent.config.model.preferred.clone(),
-            system_prompt: match sandbox_system_prompt(agent) {
+            system_prompt: match sandbox_system_prompt(home, agent).await {
                 Ok(prompt) => prompt,
                 Err(error) => {
                     let failure = SandboxFailure::failed("profile_unavailable", &error.to_string());
@@ -1217,8 +1217,17 @@ mod tests_docker;
 mod tests_runner;
 
 /// The sandboxed task uses the same ordered profile as every other runner.
-fn sandbox_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> std::io::Result<String> {
-    let profile = duduclaw_core::profile_sections::ProfileSections::load(&agent.dir)?;
+async fn sandbox_system_prompt(home: &Path, agent: &duduclaw_agent::LoadedAgent) -> std::io::Result<String> {
+    let language = crate::prompt_identity::resolve_reply_language(home, &agent.config).await;
+    let mut profile = duduclaw_core::profile_sections::ProfileSections::load(&agent.dir)?;
+    let display_name = if agent.config.agent.display_name.trim().is_empty() {
+        &agent.config.agent.name
+    } else {
+        &agent.config.agent.display_name
+    };
+    profile.set_identity_directive(crate::prompt_identity::identity_and_language_section(
+        display_name, language.as_deref(),
+    ));
     Ok(profile.rendered(duduclaw_core::profile_sections::ProfileRenderOptions {
         headings: true,
         ..Default::default()
@@ -1262,7 +1271,7 @@ mod instructions_slot_tests {
     }
 
     #[tokio::test]
-    async fn sandbox_prompt_carries_instructions_after_identity() {
+    async fn prompt_identity_sandbox_language_and_instructions() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("agents").join("advisor");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1277,7 +1286,18 @@ mod instructions_slot_tests {
         std::fs::write(dir.join("CONTRACT.toml"), "[boundaries]\nmust_not = ['CONTRACT-BODY']\n").unwrap();
         std::fs::write(dir.join("INSTRUCTIONS.md"), "INSTRUCTIONS-BODY").unwrap();
         let agent = duduclaw_agent::registry::AgentRegistry::load_agent(&dir).await.unwrap();
-        let p = super::sandbox_system_prompt(&agent).unwrap();
+        let p = super::sandbox_system_prompt(tmp.path(), &agent).await.unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[general]\ndefault_language = 'en'\n").unwrap();
+        let global = super::sandbox_system_prompt(tmp.path(), &agent).await.unwrap();
+        assert!(global.contains("always respond in English"));
+        let mut agent = agent;
+        agent.config.prompt.reply_language = Some("zh-CN".into());
+        let employee = super::sandbox_system_prompt(tmp.path(), &agent).await.unwrap();
+        assert!(employee.contains("always respond in Simplified Chinese"));
+        assert!(!employee.contains("always respond in English"));
+        agent.config.prompt.reply_language = Some("auto".into());
+        assert_eq!(super::sandbox_system_prompt(tmp.path(), &agent).await.unwrap(), p);
+
         let ident = p.find("IDENTITY-BODY").unwrap();
         let user = p.find("USER-BODY &lt;/user_profile&gt;").expect("user data is escaped");
         let rules = p.find("# Instructions").unwrap();
