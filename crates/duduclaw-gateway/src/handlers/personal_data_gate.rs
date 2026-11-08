@@ -18,10 +18,21 @@
 //!   write refuses. Every other caller is refused.
 //! - Cross-agent listings (`chat.sessions.list`, `search.query` without
 //!   `agent_id`) hide Personal employees the caller does not own.
+//! - **P1b (work record, [`DataCategory::Work`]).** `activity.list`,
+//!   `timeline.list`, `decisions.list`/`dismiss`, `canvas.get`,
+//!   `tasks.list`/`list_page`/`flow_metrics` and `tasks.assign` (its
+//!   destination) are gated on `agent_id`; the single-task RPCs in
+//!   [`task_scoped`] (gets refuse, writes refuse) are gated on the task's
+//!   employee, read from `tasks.db` before the handler (unreadable store ⇒
+//!   refused). Unscoped lists hide through `TaskReader` (`task_privacy.rs`).
+//!   Approval cards of another person's Personal employee are metadata only
+//!   ([`personal_metadata_card`]); `approvals.get` with a step-up returns the
+//!   full card, audited.
 use super::*;
 use super::isolation_connectors_rpc::authorize_step_up;
 use crate::personal_visibility::{self as visibility, DataCategory, Reader};
 use duduclaw_auth::mfa::MigrationConfirmationSession;
+use rusqlite::OptionalExtension;
 
 /// Request field carrying the step-up proof's CSRF token (32-byte array).
 /// Removed from the params before any handler runs.
@@ -51,7 +62,66 @@ pub(super) fn agent_scoped(method: &str) -> Option<DataCategory> {
         | "agent_files.history" | "agent_files.save" | "agent_files.rollback" | "agents.inspect"
         | "contract.get" | "contract.update" => DataCategory::AgentFiles,
         "chat.sessions.list" | "search.query" | "runs.list" => DataCategory::Sessions,
+        "activity.list" | "timeline.list" | "decisions.list" | "decisions.dismiss" | "canvas.get"
+        | "tasks.list" | "tasks.list_page" | "tasks.flow_metrics" | "tasks.assign" => DataCategory::Work,
         _ => return None,
+    })
+}
+
+/// Single-task dashboard RPCs (reads and writes) keyed by `task_id`: the
+/// gate runs on the task's employee (`assigned_to`), category
+/// [`DataCategory::Work`].
+pub(super) fn task_scoped(method: &str) -> bool {
+    matches!(
+        method,
+        "tasks.update" | "tasks.remove" | "tasks.assign" | "tasks.archive" | "tasks.unarchive"
+            | "tasks.pin" | "tasks.unpin" | "tasks.rename" | "tasks.comment" | "tasks.comments"
+            | "tasks.iterations" | "tasks.timeline" | "tasks.changes" | "tasks.artifacts"
+            | "tasks.role_turns" | "tasks.goal_decide" | "activity.list"
+    )
+}
+
+/// The employee a task is assigned to, read from `tasks.db` without
+/// opening a writable store. `Ok(None)` = no such task (the handler answers);
+/// `Err` = the store could not be read (the gate refuses).
+pub(super) fn task_employee(home: &Path, task_id: &str) -> Result<Option<String>, ()> {
+    let conn = crate::review_evidence::audience::readonly_db(&home.join("tasks.db")).map_err(|_| ())?;
+    conn.query_row("SELECT assigned_to FROM tasks WHERE id=?1", [task_id], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|_| ())
+}
+
+/// A non-blank string parameter.
+fn param_text(params: &Value, key: &str) -> Option<String> {
+    params.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned)
+}
+
+/// The approval card another person's Personal employee shows to a reader
+/// who is not its owner: label, status and timing only. No summary,
+/// payload, digest, binding, answer, simulation or conversation link.
+pub(super) fn personal_metadata_card(record: &crate::approval::ApprovalRecord) -> Value {
+    json!({
+        "id": record.id.as_str(),
+        "digest": Value::Null,
+        "agent_id": record.agent_id,
+        "kind": crate::governance::ApprovalKind::parse(&record.action_kind).as_str(),
+        "summary": "",
+        "payload": {"redacted": true, "personal_employee": true},
+        "request_kind": record.request_kind,
+        "status": record.status,
+        "binding": Value::Null,
+        "answer": Value::Null,
+        "may_decide": false,
+        "workflow_activation": Value::Null,
+        "invalidated_reason": Value::Null,
+        "created_at": record.created_at,
+        "ttl_seconds": record.ttl_seconds,
+        "expires_at": record.expires_at_epoch(),
+        "simulation": Value::Null,
+        "channel": Value::Null,
+        "channel_link": Value::Null,
+        "restricted": true,
+        "personal_employee": true,
     })
 }
 
@@ -143,27 +213,76 @@ impl MethodHandler {
         .map_err(|_| UNAVAILABLE)?
     }
 
-    /// Dispatch-level wrapper for [`agent_scoped`] methods. Calls without an
-    /// `agent_id` are left to the handler (cross-agent listings hide
+    /// Dispatch-level wrapper for [`agent_scoped`] methods (on `agent_id`)
+    /// and [`task_scoped`] methods (on the employee of `task_id`). Calls
+    /// without either are left to the handler (cross-agent listings hide
     /// Personal employees there; agent-required methods refuse).
-    pub(super) async fn personal_data_gate_for_params(
+    pub(super) async fn personal_gates_for_params(
         &self,
         method: &str,
-        category: DataCategory,
         params: &mut Value,
         ctx: &UserContext,
     ) -> Result<(), WsFrame> {
-        if !crate::runtime_readiness::is_protected_linux() {
+        let category = agent_scoped(method);
+        let by_task = task_scoped(method);
+        if (category.is_none() && !by_task) || !crate::runtime_readiness::is_protected_linux() {
             return Ok(());
         }
+        let refuse = |message: &str| WsFrame::error_response("", message);
         let csrf = take_step_up(params);
-        let Some(agent) = params.get("agent_id").and_then(Value::as_str).map(str::trim)
-            .filter(|agent| !agent.is_empty()).map(str::to_owned) else {
+        if let (Some(category), Some(agent)) = (category, param_text(params, "agent_id")) {
+            self.personal_data_gate(ctx, Target { method, category, agent: &agent }, csrf)
+                .await
+                .map_err(refuse)?;
+        }
+        let Some(task_id) = param_text(params, "task_id").filter(|_| by_task) else {
             return Ok(());
         };
-        self.personal_data_gate(ctx, Target { method, category, agent: &agent }, csrf)
+        let home = self.home_dir.clone();
+        let employee = tokio::task::spawn_blocking(move || task_employee(&home, &task_id))
             .await
-            .map_err(|message| WsFrame::error_response("", message))
+            .map_err(|_| refuse(UNAVAILABLE))?
+            .map_err(|()| refuse(UNAVAILABLE))?;
+        match employee {
+            Some(agent) => self
+                .personal_data_gate(ctx, Target { method, category: DataCategory::Work, agent: &agent }, csrf)
+                .await
+                .map_err(refuse),
+            None => Ok(()),
+        }
+    }
+
+    /// Approval cards (`approvals.list` / `approvals.get`) of these employees
+    /// are shown as [`personal_metadata_card`]: Personal employees `ctx` does
+    /// not own. `approvals.get` (`by_id`, one row) with a `step_up_csrf`
+    /// ([`take_step_up`], taken by the handler) runs the break-glass gate on
+    /// that card's employee and, once audited, returns it in full. Empty
+    /// outside protected mode.
+    pub(super) async fn personal_approval_hidden(
+        &self,
+        ctx: &UserContext,
+        csrf: Option<[u8; 32]>,
+        by_id: bool,
+        rows: &[crate::approval::ApprovalRecord],
+    ) -> Result<std::collections::BTreeSet<String>, WsFrame> {
+        if !crate::runtime_readiness::is_protected_linux() {
+            return Ok(Default::default());
+        }
+        let mut hidden = self
+            .personal_hidden_agents(ctx)
+            .await
+            .map_err(|message| WsFrame::error_response("", message))?;
+        if let (Some(csrf), true, [record]) = (csrf, by_id, rows)
+            && ctx.is_admin()
+            && hidden.contains(&record.agent_id)
+        {
+            let target = Target { method: "approvals.get", category: DataCategory::Work, agent: &record.agent_id };
+            self.personal_data_gate(ctx, target, Some(csrf))
+                .await
+                .map_err(|message| WsFrame::error_response("", message))?;
+            hidden.remove(&record.agent_id);
+        }
+        Ok(hidden)
     }
 
     /// Personal employees hidden from `ctx` in cross-agent listings. Empty

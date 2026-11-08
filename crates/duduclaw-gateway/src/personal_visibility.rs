@@ -21,6 +21,12 @@
 //! - **Cross-agent management MCP tools** call [`management_refusal`]: an AI
 //!   caller never manages another person's Personal employee; human owner
 //!   actions go through the dashboard.
+//! - **P1b:** the same refusal covers delegation and cross-agent reads
+//!   (`spawn_agent`, `send_to_agent`, `check_responses`, `task_status`, memory
+//!   namespaces); `list_agents` hides ([`hidden_from_employee`]); an
+//!   ephemeral sub-agent acts as its parent ([`acting_employee`]); task,
+//!   activity, timeline, decision, canvas and approval reads are category
+//!   [`DataCategory::Work`] on the dashboard.
 //!
 //! Every check here runs only in protected mode (`protected = true`, from
 //! `runtime_readiness::is_protected_linux()`); otherwise nothing is read and
@@ -45,6 +51,9 @@ pub enum DataCategory {
     AgentFiles,
     /// The employee's own wiki pages.
     Wiki,
+    /// Its work record (P1b): tasks and their detail, activity, timeline,
+    /// open decisions, canvas and approval payloads.
+    Work,
 }
 
 impl DataCategory {
@@ -54,6 +63,7 @@ impl DataCategory {
             Self::Memory => "memory",
             Self::AgentFiles => "agent_files",
             Self::Wiki => "wiki",
+            Self::Work => "work",
         }
     }
 }
@@ -77,9 +87,9 @@ pub enum Reader {
 pub struct Unavailable;
 
 /// Shown to an AI caller that targets another person's Personal employee.
-pub const PERSONAL_TARGET_REFUSED: &str = "這位 AI 員工是某位同仁的個人專屬員工，其他 AI 員工不能修改或移除它的設定與檔案。\
-    如需變更，請由擁有者在控制台操作。 / This is a person's Personal employee; another AI employee cannot change or \
-    remove it. The owner manages it from the dashboard.";
+pub const PERSONAL_TARGET_REFUSED: &str = "這位 AI 員工是某位同仁的個人專屬員工，其他 AI 員工不能讀取、委派工作給它，\
+    也不能修改或移除它的設定與檔案。如需變更，請由擁有者在控制台操作。 / This is a person's Personal employee; another \
+    AI employee cannot read, delegate to, change or remove it. The owner manages it from the dashboard.";
 /// Shown when the Personal mirror cannot be read (fail closed).
 pub const OWNERSHIP_UNAVAILABLE: &str = "無法確認這位 AI 員工的歸屬，已拒絕操作。 / Employee ownership could not be \
     verified; the operation was refused.";
@@ -134,18 +144,78 @@ pub fn classify_reader(
     })
 }
 
-/// Refusal for a cross-agent management MCP tool (`agent_update`,
-/// `agent_update_soul`, `agent_remove`, …) whose `target` is a Personal
-/// employee and whose acting employee is not that employee itself.
-/// `None` = allowed (the tool's own checks still apply).
+/// The regular employee an acting AI id works as (P1b). A regular id is
+/// itself (no I/O). An ephemeral sub-agent (`eph-…`) is the root of its
+/// host-recorded parent chain, `duduclaw_core::autonomy_gate::
+/// effective_identities`: at every hop the scaffold's `ephemeral.toml`
+/// `parent` must equal the host-owned org store's `reports_to`, so neither
+/// the sub-agent's own files nor a tool argument can choose its parent.
+/// `None` = blank id or an unresolvable chain (callers refuse).
+pub fn acting_employee(home: &Path, acting: &str) -> Option<String> {
+    if acting.is_empty() {
+        return None;
+    }
+    if !crate::ephemeral::is_ephemeral_id(acting) {
+        return Some(acting.to_owned());
+    }
+    duduclaw_core::autonomy_gate::effective_identities(
+        home,
+        acting,
+        duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    )
+    .ok()?
+    .pop()
+}
+
+/// `acting` is `target` itself, or an ephemeral sub-agent of `target`
+/// ([`acting_employee`]). Exact id equality; never reads `users.db`.
+pub fn same_employee(home: &Path, acting: &str, target: &str) -> bool {
+    if acting.is_empty() || target.is_empty() {
+        return false;
+    }
+    acting == target
+        || (crate::ephemeral::is_ephemeral_id(acting)
+            && acting_employee(home, acting).as_deref() == Some(target))
+}
+
+/// Personal employees an AI caller must not see in a cross-agent listing
+/// (MCP `list_agents`): every one except the acting employee itself (an
+/// ephemeral sub-agent counts as its parent). Other AI employees get no
+/// metadata at all — the row is hidden, not redacted. Empty outside
+/// protected mode; an unreadable store is [`Unavailable`].
+pub fn hidden_from_employee(home: &Path, protected: bool, acting: &str)
+    -> Result<BTreeSet<String>, Unavailable> {
+    if !protected {
+        return Ok(BTreeSet::new());
+    }
+    let me = acting_employee(home, acting);
+    let conn = open(home)?;
+    let mut statement = conn
+        .prepare("SELECT agent_name FROM isolation_personal_agents")
+        .map_err(|_| Unavailable)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| Unavailable)?;
+    let mut hidden = rows.collect::<Result<BTreeSet<_>, _>>().map_err(|_| Unavailable)?;
+    if let Some(me) = me {
+        hidden.remove(&me);
+    }
+    Ok(hidden)
+}
+
+/// Refusal for a cross-agent MCP tool (`agent_update`, `agent_remove`,
+/// `spawn_agent`, `check_responses`, …) whose `target` is a Personal
+/// employee and whose acting employee is not that employee itself (an
+/// ephemeral sub-agent of it counts as it, [`same_employee`]). A self-target
+/// is decided before any `users.db` read. `None` = allowed (the tool's own
+/// checks still apply).
 pub fn management_refusal(home: &Path, protected: bool, acting_agent: &str, target: &str)
     -> Option<&'static str> {
-    if !protected {
+    if !protected || same_employee(home, acting_agent, target) {
         return None;
     }
     match personal_owner(home, target) {
         Ok(None) => None,
-        Ok(Some(_)) if !acting_agent.is_empty() && acting_agent == target => None,
         Ok(Some(_)) => Some(PERSONAL_TARGET_REFUSED),
         Err(Unavailable) => Some(OWNERSHIP_UNAVAILABLE),
     }

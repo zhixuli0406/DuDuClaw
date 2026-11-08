@@ -561,10 +561,10 @@ impl MethodHandler {
         // Protected mode only: a Personal employee's conversations, memory,
         // agent files and wiki are readable by its owner; an Admin needs a
         // fresh step-up and is audited; team grants never reach them. Runs
-        // before any handler or extension sees the call.
-        if let Some(category) = personal_data_gate::agent_scoped(method)
-            && let Err(frame) = self.personal_data_gate_for_params(method, category, &mut params, ctx).await
-        {
+        // before any handler or extension sees the call. P1b adds the work
+        // record (tasks, activity, timeline, decisions, canvas), gated on
+        // `agent_id` or on the employee of `task_id`.
+        if let Err(frame) = self.personal_gates_for_params(method, &mut params, ctx).await {
             return frame;
         }
 

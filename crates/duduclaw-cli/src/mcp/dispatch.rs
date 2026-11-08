@@ -38,18 +38,16 @@ pub(crate) async fn handle_tools_call(
         }
     }
 
-    // ── v1.81 P1: never act on another person's Personal employee ──────────
-    // Protected mode only. Cross-agent management / file tools that name
-    // another employee refuse when it is a Personal employee; the owner
-    // manages it from the dashboard. Runs before any handler or isolation
-    // route, for every principal kind.
+    // ── v1.81 P1/P1b: never act on another person's Personal employee ──────
+    // Protected mode only. Cross-agent management / file / delegation / read
+    // tools naming another employee, `task_status` on a foreign process
+    // store and a memory `namespace` of another employee refuse when it is a
+    // Personal employee (self-targets never read users.db). Runs before any
+    // handler or isolation route, for every principal kind.
     let acting_for_target = acting_agent_id(caller_client_id, default_agent);
-    if let Some(refusal) = super::personal_target::personal_target_refusal(
-        home_dir,
-        duduclaw_gateway::runtime_readiness::is_protected_linux(),
-        tool_name,
-        &arguments,
-        acting_for_target,
+    if let Some(refusal) = super::personal_target::pre_dispatch_refusal(
+        home_dir, duduclaw_gateway::runtime_readiness::is_protected_linux(), tool_name, &arguments,
+        acting_for_target, default_agent, &ns_ctx.write_namespace,
     ) {
         duduclaw_security::audit::append_tool_call_denied(
             home_dir,
@@ -531,7 +529,8 @@ impl GatewayHandler<'_> {
             )
             .await
         }
-        "list_agents" => handle_list_agents(&arguments, home_dir, default_agent).await,
+        "list_agents" => super::personal_target::list_agents_hiding(&arguments, home_dir, default_agent,
+            acting_agent_id(caller_client_id, default_agent), duduclaw_gateway::runtime_readiness::is_protected_linux()).await,
         "create_task" => handle_create_task(&arguments, home_dir, record_actor.id()).await,
         "check_responses" => handle_check_responses(&arguments, home_dir).await,
         "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
