@@ -125,6 +125,10 @@ pub(super) fn load_one(home: &Path, provider: &str) -> Result<Option<McpOAuthCli
             Some(config)
         }
     };
+    // Same post-crypto boundary as `load`: the recheck below must compare the
+    // bytes captured before decryption against the bytes present *after* it.
+    #[cfg(test)]
+    home_store::test_probe::preparation_boundary(home);
     with_file(home, |g| {
         let actual = RawArray::read(&g.home().join(CLIENT_CONFIG_FILE))?;
         if !actual.same_bytes(&captured.original) {
