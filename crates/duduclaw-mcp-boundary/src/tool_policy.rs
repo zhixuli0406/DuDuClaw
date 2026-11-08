@@ -91,7 +91,9 @@ pub const POLICIES: &[ToolPolicy] = &[
     // agents
     ToolPolicy { name: "create_agent", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "list_agents", route: Route::Service, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "create_task", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    // H8: a TaskSpec plan is host-queue work under the run's own live task
+    // (`create_task_selector`), not a workspace operation.
+    ToolPolicy { name: "create_task", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Task] },
     ToolPolicy { name: "check_responses", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "task_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
     ToolPolicy { name: "agent_status", route: Route::Service, required: &[ResourceKind::Employee] },
@@ -382,6 +384,24 @@ fn own_employee(context: &RequestContext) -> ResourceGrant {
     ResourceGrant::Employee { id: context.record().employee }
 }
 
+/// Top-level task selector argument keys. `create_task` never accepts them.
+pub const TASK_SELECTOR_KEYS: [&str; 5] = ["task_id", "parent_task_id", "goal_id", "parent_goal_id", "depends_on"];
+
+/// H8 live task selector for `create_task`: the task is the run's own task
+/// from the verified capability record (`record.task`), never an argument, and
+/// the record must also carry the exact signed `Task` grant for it. Live
+/// ownership (the task store says the calling employee owns it now) is the
+/// resolver's job at use time; this is only the record-side half, shared by
+/// discovery (`eligible`) and `authorize`.
+pub fn create_task_selector(context: &RequestContext) -> Result<ResourceGrant, VerificationError> {
+    let record = context.record();
+    let task = record.task.as_ref().ok_or(VerificationError::Invalid)?;
+    let selector = ResourceGrant::Task { id: task.clone() };
+    validate_resource(&selector)?;
+    if !record.io_resources().any(|grant| grant == &selector) { return Err(VerificationError::Invalid); }
+    Ok(selector)
+}
+
 /// Discovery shares the exact tool and mandatory resource policy with calls.
 /// The transport additionally checks that the corresponding host service exists.
 /// Optional argument-dependent resources are checked by `authorize`, not guessed
@@ -394,6 +414,7 @@ pub fn eligible(context: &RequestContext, name: &str) -> bool {
         && ((record.employee_scope() && (employee_service_scope(policy) || policy.route == Route::Connector)) || policy.required.iter().all(|kind| record.io_resources()
             .any(|grant| ResourceKind::of(grant) == *kind && validate_resource(grant).is_ok()
                 && (*kind != ResourceKind::Employee || grant == &own_employee(context)))))
+        && (name != "create_task" || create_task_selector(context).is_ok())
 }
 
 fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<ResourceKind>, VerificationError> {
@@ -434,8 +455,12 @@ fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<Resou
     }
     if object.contains_key("drive_file_id") { add(ResourceKind::Connector); }
     if object.get("write_wiki").and_then(Value::as_bool) == Some(true) { add(ResourceKind::Wiki); }
-    if matches!(policy.name, "tasks_create" | "tasks_update" | "goals_create" | "activity_post" | "create_task") {
-        for key in ["task_id", "parent_task_id", "goal_id", "parent_goal_id", "depends_on"] {
+    if policy.name == "create_task" {
+        // H8: the task comes only from the verified record; an argument that
+        // names one (even null) is refused instead of being interpreted.
+        if TASK_SELECTOR_KEYS.iter().any(|key| object.contains_key(*key)) { return Err(VerificationError::Invalid); }
+    } else if matches!(policy.name, "tasks_create" | "tasks_update" | "goals_create" | "activity_post") {
+        for key in TASK_SELECTOR_KEYS {
             if object.get(key).is_some_and(|value| !value.is_null()) { add(ResourceKind::Task); }
         }
     }
@@ -646,6 +671,14 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
             }
         }
     } else { check_selected_resources(policy, arguments, &resources)?; }
+    if name == "create_task" {
+        // Exactly the record's own task, once; the resolver vouched for live
+        // ownership and cannot substitute or add another task.
+        let selector = create_task_selector(context)?;
+        if !resources.iter().filter(|resource| ResourceKind::of(resource) == ResourceKind::Task).eq([&selector]) {
+            return Err(VerificationError::Invalid);
+        }
+    }
     Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(), resources })
 }
 

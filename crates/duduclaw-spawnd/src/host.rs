@@ -90,7 +90,12 @@ impl Components {
     pub fn installed() -> Self {
         let mut components = Self::default();
         crate::installed::install(&mut components);
-        match crate::storage::LoopStorage::open(std::path::Path::new(STORAGE_IMAGES), std::path::Path::new(STORAGE_JOURNAL)) {
+        // H3: the allocation/retire hook wraps H's storage so every provisioned
+        // employee has its root-owned work anchor (`employee-work` identity).
+        let storage = crate::storage::LoopStorage::open(std::path::Path::new(STORAGE_IMAGES), std::path::Path::new(STORAGE_JOURNAL))
+            .and_then(|storage| Ok(crate::work_anchor::AnchoredStorage::new(Box::new(storage),
+                crate::work_anchor::WorkAnchors::open_installed()?)));
+        match storage {
             Ok(storage) => components.storage = Box::new(storage),
             Err(_) => eprintln!("duduclaw-spawnd: installed storage unavailable"),
         }

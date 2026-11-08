@@ -96,6 +96,37 @@ fn selected_task_and_dependency_ids_cannot_be_replaced_by_resolver() {
 }
 
 #[test]
+fn create_task_boundary_pins_the_record_task() {
+    let own = ResourceGrant::Task { id: text("run-task") };
+    let other = ResourceGrant::Task { id: text("other-task") };
+    let with_task = |task: Option<&str>, resources: Vec<ResourceGrant>| {
+        let mut record = context("create_task", resources).record().clone();
+        record.task = task.map(|task| text::<128>(task));
+        RequestContext::from_verified_record(record)
+    };
+    let args = json!({"goal":"g", "steps":[{"description":"s"}]});
+    let ctx = with_task(Some("run-task"), vec![employee(), own.clone(), other.clone()]);
+    assert!(eligible(&ctx, "create_task"));
+    assert_eq!(create_task_selector(&ctx).unwrap(), own);
+    assert!(authorize(&ctx, "create_task", &args, &Fixed(vec![employee(), own.clone()])).is_ok());
+    // A resolver may not substitute, add or omit the task.
+    for resources in [vec![employee(), other.clone()], vec![employee(), own.clone(), other.clone()], vec![employee()]] {
+        assert!(authorize(&ctx, "create_task", &args, &Fixed(resources)).is_err());
+    }
+    // Workspace is no longer the gate: a workspace-only record stays ineligible.
+    let workspace = ResourceGrant::Workspace { handle: text("employee-work") };
+    assert!(!eligible(&with_task(None, vec![employee(), workspace.clone()]), "create_task"));
+    assert!(!eligible(&with_task(Some("run-task"), vec![employee(), workspace, other.clone()]), "create_task"));
+    assert!(!eligible(&with_task(None, vec![employee(), own.clone()]), "create_task"));
+    // Selector-shaped arguments are refused before resolution.
+    for key in TASK_SELECTOR_KEYS {
+        let mut forged = args.clone();
+        forged[key] = json!("run-task");
+        assert!(authorize(&ctx, "create_task", &forged, &Fixed(vec![employee(), own.clone()])).is_err(), "{key}");
+    }
+}
+
+#[test]
 fn file_resources_preserve_workspace_only_and_reject_escape() {
     let resources = vec![ResourceGrant::Workspace { handle: text("work") }];
     let ctx = context("file_read", resources.clone());
