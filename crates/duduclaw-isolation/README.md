@@ -77,6 +77,19 @@ not authorize ambient Service/Connector access. Both full-record and resource-ta
 golden bytes are versioned.
 Old v1 capability MACs fail verification; IPC wire v1 is unchanged.
 
+**CONTRACT CHANGE (2026-11-08, D-H2): resource tag 11, `PublicOrigins { origins }`.**
+Additive to v2 (existing records encode identically, so the version stays 2).
+Encoding: tag `0x0b`, then the entries as a set (u32 count, u32-length texts in
+encoded-byte order). Each entry is `*` (any public HTTPS origin) or exactly
+`https://<hostname>`: https only, default port, no userinfo/path/query/fragment,
+canonical lowercase ASCII hostname with at least two labels, never an IP literal
+or a non-public name (`localhost`, `.local`, `.internal`, `.arpa`, …). The set
+has 1..=16 entries, no duplicates, and `*` only alone. The grant is valid only
+alongside `EmployeeScope` for the record's own employee, at most once, never
+inside `Confined`; decoding a `CapabilityRecord` refuses anything else, and
+signing re-checks it. It authorizes only `web_fetch_cached`/`web_extract`; the
+host fetch still pins DNS, refuses non-public addresses and follows no redirect.
+
 `RequestContext::verify_live` requires the original connection's host verifier;
 plain `from_verified_record` contexts are suitable for policy fixtures but
 cannot perform I/O. The verifier is in-memory only and is not serialized into

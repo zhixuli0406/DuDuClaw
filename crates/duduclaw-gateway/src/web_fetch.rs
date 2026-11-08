@@ -207,6 +207,10 @@ pub(crate) async fn resolve_public_addrs(
     host: &str,
     port: u16,
 ) -> Result<Vec<std::net::SocketAddr>, FetchError> {
+    #[cfg(test)]
+    if let Some((addrs, unvetted)) = test_dns::lookup(host) {
+        return if unvetted { Ok(addrs) } else { vet_resolved_addrs(host, addrs) };
+    }
     let target = format!("{host}:{port}");
     // `to_socket_addrs` blocks; keep it off the async executor exactly as the
     // original inline implementation here did.
@@ -224,6 +228,25 @@ pub(crate) async fn resolve_public_addrs(
         warn!(host = %host, error = %e, "DNS re-pin refused the resolved address set");
     }
     vetted
+}
+
+/// Test-only DNS answers for [`resolve_public_addrs`] (compiled out of
+/// production). Use a unique host per test: tests share the process.
+#[cfg(test)]
+pub(crate) mod test_dns {
+    use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
+    static ANSWERS: Mutex<Option<HashMap<String, (Vec<SocketAddr>, bool)>>> = Mutex::new(None);
+    fn set(host: &str, addrs: Vec<SocketAddr>, unvetted: bool) {
+        ANSWERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(host.to_owned(), (addrs, unvetted));
+    }
+    /// Answer `host` with `addrs`; the public-address screen still applies.
+    pub(crate) fn answer(host: &str, addrs: Vec<SocketAddr>) { set(host, addrs, false) }
+    /// Answer `host` with `addrs` and skip the screen, so a loopback fixture
+    /// server can stand in for a public origin in redirect tests.
+    pub(crate) fn answer_unvetted(host: &str, addrs: Vec<SocketAddr>) { set(host, addrs, true) }
+    pub(super) fn lookup(host: &str) -> Option<(Vec<SocketAddr>, bool)> {
+        ANSWERS.lock().unwrap().as_ref().and_then(|answers| answers.get(host).cloned())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,5 +1103,78 @@ mod i1c_protected_tests {
         bad.fetched_at = Utc::now() + chrono::Duration::hours(1);
         save_cache(&bad, dir.path()).unwrap();
         assert!(load_protected_cache(url, 60, dir.path()).is_none());
+    }
+}
+
+/// H7 (D-H2): the host fetch behind a `PublicOrigins` grant. The grant only
+/// selects the origin; these properties keep it from reaching anything else.
+#[cfg(test)]
+mod h7_protected_fetch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn addr(value: &str) -> std::net::SocketAddr { value.parse().unwrap() }
+
+    #[tokio::test]
+    async fn web_fetch_refuses_private_address_after_dns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("h7-dns-private.example.net", vec![addr("10.0.0.5:443")]),
+            ("h7-dns-metadata.example.net", vec![addr("169.254.169.254:443")]),
+            ("h7-dns-loopback.example.net", vec![addr("127.0.0.1:443")]),
+            ("h7-dns-mapped.example.net", vec![addr("[::ffff:127.0.0.1]:443")]),
+            ("h7-dns-linklocal.example.net", vec![addr("[fe80::1]:443")]),
+            ("h7-dns-cgnat.example.net", vec![addr("100.64.0.1:443")]),
+            // A half-rebound answer refuses the whole set.
+            ("h7-dns-mixed.example.net", vec![addr("93.184.216.34:443"), addr("192.168.1.10:443")]),
+        ];
+        for (host, answer) in cases {
+            test_dns::answer(host, answer);
+            let url = format!("https://{host}/page");
+            assert!(validate_workflow_public_url(&url).is_ok(), "the name alone passes the pattern gate");
+            let err = web_fetch_protected_cached(&url, 60, dir.path()).await.expect_err(host);
+            assert!(matches!(err, FetchError::SsrfBlocked(_)), "{host} → {err}");
+        }
+        // Nothing reached the cache.
+        let protected = dir.path().join("protected-no-redirect-v1");
+        assert!(!protected.exists() || std::fs::read_dir(&protected).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn web_fetch_refuses_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let host = "h7-redirect.example.net";
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        // Same pinned origin: if the client followed the Location, the second
+        // request would land here too and return 200.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return; };
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await { Ok(0) | Err(_) => break, Ok(n) => request.extend_from_slice(&buffer[..n]) }
+                }
+                let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+                let response = if first {
+                    format!("HTTP/1.1 302 Found\r\nLocation: http://{host}:{}/followed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", local.port())
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfollowed".to_owned()
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        test_dns::answer_unvetted(host, vec![local]);
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{host}:{}/start", local.port());
+        let err = web_fetch_protected_cached(&url, 60, dir.path()).await.expect_err("redirect must not be followed");
+        assert!(matches!(err, FetchError::HttpError(302, _)), "{err}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "exactly one request; the Location was not fetched");
+        assert!(load_protected_cache(&url, 60, &dir.path().join("protected-no-redirect-v1")).is_none());
+        server.abort();
     }
 }

@@ -50,13 +50,80 @@ pub enum ResourceGrant {
     Connector { account: Text<128>, binding: EmployeeBinding },
     Recipient { id: Text<256> },
     UrlOrigin { origin: Text<2048> },
+    /// CONTRACT CHANGE (D-H2, tag 11): URL authority for the web tools of an
+    /// employee-scope run. Valid only alongside `EmployeeScope` for the record's
+    /// own employee, at most once, never `Confined`. A set of 1..=16 entries
+    /// (see [`PublicOrigin`]). It never weakens the host fetch: DNS answers are
+    /// pinned, non-public addresses are refused and redirects are not followed.
+    PublicOrigins { origins: List<PublicOrigin, PUBLIC_ORIGINS_MAX> },
+}
+
+/// Most entries in one `PublicOrigins` grant.
+pub const PUBLIC_ORIGINS_MAX: usize = 16;
+
+/// Hostname suffixes that never name a public origin (RFC 6761/6762/7686/8375
+/// and common private-network names). The fetch layer still classifies every
+/// resolved address; this only keeps such names out of signed authority.
+const NON_PUBLIC_TLDS: &[&str] = &["localhost", "local", "localdomain", "internal", "intranet",
+    "lan", "home", "corp", "arpa", "onion", "test", "invalid", "example"];
+
+/// One `PublicOrigins` entry, validated on construction and on decode.
+///
+/// * `*` — any public HTTPS origin on the default port. The host fetch decides
+///   "public" per resolved address, never from the name.
+/// * `https://<hostname>` — exactly that origin: scheme `https` only, default
+///   port only (no `:port`), no userinfo, path, query or fragment; the hostname
+///   is the canonical ASCII form (lowercase LDH labels, IDNs as `xn--`), at
+///   least two labels, no trailing dot, top-level label starting with a letter
+///   (so no IPv4 literal or WHATWG numeric host), and never an IP literal.
+///   It matches only that exact host: there are no subdomain wildcards.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct PublicOrigin(String);
+
+impl PublicOrigin {
+    pub const ANY: &'static str = "*";
+
+    pub fn parse(value: &str) -> Result<Self, ContractError> {
+        if value == Self::ANY { return Ok(Self(value.to_owned())); }
+        let host = value.strip_prefix("https://")
+            .ok_or(ContractError::InvalidValue("public origin must be https://<host> or *"))?;
+        let labels: Vec<&str> = host.split('.').collect();
+        let label_ok = |label: &str| (1..=63).contains(&label.len())
+            && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !label.starts_with('-') && !label.ends_with('-');
+        let tld = labels.last().copied().unwrap_or("");
+        if host.is_empty() || host.len() > 253 || labels.len() < 2 || !labels.iter().copied().all(label_ok)
+            || !tld.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            || NON_PUBLIC_TLDS.contains(&tld) {
+            return Err(ContractError::InvalidValue("public origin host"));
+        }
+        Ok(Self(value.to_owned()))
+    }
+    pub fn any() -> Self { Self(Self::ANY.to_owned()) }
+    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn is_any(&self) -> bool { self.0 == Self::ANY }
+    /// The exact hostname, or `None` for `*`.
+    pub fn host(&self) -> Option<&str> { self.0.strip_prefix("https://") }
+    /// Whether this entry authorizes the exact origin `origin` (never `*`).
+    pub fn permits(&self, origin: &PublicOrigin) -> bool {
+        !origin.is_any() && (self.is_any() || self == origin)
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicOrigin {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::parse(&String::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Persistable capability claims (§6.1). Hashes/nonces are metadata, not bearers.
 /// Epoch changes invalidate all old records after gateway restart; policy and
 /// principal generations must be checked live on every call, not just at mint.
+/// Decoding refuses a `PublicOrigins` grant that is not valid for the record
+/// (see [`CapabilityRecord::check_public_origins`]); signing re-checks it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "CapabilityRecordWire")]
 pub struct CapabilityRecord {
     pub id: CapabilityId,
     pub employee: EmployeeId,
@@ -74,6 +141,40 @@ pub struct CapabilityRecord {
     pub expires_at: u64,
     pub nonce: [u8; 32],
     pub jti: [u8; 16],
+}
+
+/// Wire shape of [`CapabilityRecord`]; same fields, checked on conversion.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityRecordWire {
+    id: CapabilityId,
+    employee: EmployeeId,
+    run: RunId,
+    task: Option<Text<128>>,
+    principal: Principal,
+    employee_binding: EmployeeBinding,
+    lane: Lane,
+    tools: List<Text<128>, 256>,
+    resources: List<ResourceGrant, 128>,
+    policy_revision: u64,
+    gateway_epoch: [u8; 16],
+    issued_at: u64,
+    not_before: u64,
+    expires_at: u64,
+    nonce: [u8; 32],
+    jti: [u8; 16],
+}
+
+impl TryFrom<CapabilityRecordWire> for CapabilityRecord {
+    type Error = ContractError;
+    fn try_from(wire: CapabilityRecordWire) -> Result<Self, ContractError> {
+        let CapabilityRecordWire { id, employee, run, task, principal, employee_binding, lane, tools,
+            resources, policy_revision, gateway_epoch, issued_at, not_before, expires_at, nonce, jti } = wire;
+        let record = Self { id, employee, run, task, principal, employee_binding, lane, tools, resources,
+            policy_revision, gateway_epoch, issued_at, not_before, expires_at, nonce, jti };
+        record.check_public_origins()?;
+        Ok(record)
+    }
 }
 
 // Canonical encoding is independent of JSON and serde enum naming. Integers are
@@ -109,6 +210,16 @@ fn resource_bytes(resource: &ResourceGrant) -> Vec<u8> {
         }
         ResourceGrant::Recipient { id } => { out.push(7); text_bytes(&mut out, id.as_str()); }
         ResourceGrant::UrlOrigin { origin } => { out.push(8); text_bytes(&mut out, origin.as_str()); }
+        ResourceGrant::PublicOrigins { origins } => {
+            // A set: u32 count, then text entries in encoded-byte order (length
+            // prefix first), like every other set. Duplicates are refused by
+            // check_public_origins before encoding.
+            out.push(11);
+            let mut entries: Vec<&str> = origins.as_slice().iter().map(PublicOrigin::as_str).collect();
+            entries.sort_by(|a, b| (a.len(), a.as_bytes()).cmp(&(b.len(), b.as_bytes())));
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for entry in entries { text_bytes(&mut out, entry); }
+        }
     }
     out
 }
@@ -139,21 +250,53 @@ impl CapabilityRecord {
     /// Workspace and origin grants remain explicit for A/E confinement; they do
     /// not narrow the employee-scope authority of Service/Connector handlers.
     pub fn validate_resource_mode(&self) -> Result<(), ContractError> {
+        self.check_public_origins()?;
         let scopes: Vec<_> = self.resources.as_slice().iter().filter_map(|grant| match grant {
             ResourceGrant::EmployeeScope { id } => Some(*id), _ => None,
         }).collect();
         if !scopes.is_empty() && (scopes != [self.employee] || self.task.is_some()
             || self.resources.as_slice().iter().any(|grant| !matches!(grant,
-                ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::Workspace { .. } | ResourceGrant::UrlOrigin { .. } | ResourceGrant::Confined { .. }))) {
+                ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::Workspace { .. }
+                | ResourceGrant::UrlOrigin { .. } | ResourceGrant::Confined { .. } | ResourceGrant::PublicOrigins { .. }))) {
             return Err(ContractError::InvalidValue("ambiguous employee-scope resource policy"));
         }
         for grant in self.resources.as_slice() {
             if let ResourceGrant::Confined { resource } = grant {
                 if scopes.is_empty() || matches!(resource.as_ref(), ResourceGrant::Confined { .. }
-                    | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. }) {
+                    | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. }
+                    | ResourceGrant::PublicOrigins { .. }) {
                     return Err(ContractError::InvalidValue("invalid confined resource"));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The `PublicOrigins` rules, applied on decode and before signing: only in
+    /// an employee-scope record (EmployeeScope for this record's own employee,
+    /// no task), at most one such grant, never `Confined`, a non-empty set
+    /// without duplicates, and `*` only as the sole entry.
+    pub fn check_public_origins(&self) -> Result<(), ContractError> {
+        let mut found = 0;
+        for grant in self.resources.as_slice() {
+            match grant {
+                ResourceGrant::Confined { resource } if matches!(resource.as_ref(), ResourceGrant::PublicOrigins { .. }) =>
+                    return Err(ContractError::InvalidValue("confined public origins")),
+                ResourceGrant::PublicOrigins { origins } => {
+                    found += 1;
+                    let entries = origins.as_slice();
+                    if entries.is_empty() || (entries.len() > 1 && entries.iter().any(PublicOrigin::is_any))
+                        || entries.iter().enumerate().any(|(index, entry)| entries[..index].contains(entry)) {
+                        return Err(ContractError::InvalidValue("public origins set"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if found > 1 || (found == 1 && (!self.employee_scope() || self.task.is_some()
+            || self.resources.as_slice().iter().any(|grant|
+                matches!(grant, ResourceGrant::EmployeeScope { id } if *id != self.employee)))) {
+            return Err(ContractError::InvalidValue("public origins require own employee scope"));
         }
         Ok(())
     }
@@ -392,6 +535,102 @@ mod tests {
             let actual: String = resource_bytes(&resource).iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(actual, expected);
         }
+    }
+    fn origins(entries: &[&str]) -> ResourceGrant {
+        ResourceGrant::PublicOrigins { origins: List::new(entries.iter()
+            .map(|entry| PublicOrigin::parse(entry).unwrap()).collect()).unwrap() }
+    }
+    fn public_scoped(grant: ResourceGrant) -> CapabilityRecord {
+        let mut scoped = record();
+        scoped.task = None;
+        scoped.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scoped.employee }, grant]).unwrap();
+        scoped
+    }
+    #[test]
+    fn public_origins_requires_employee_scope() {
+        let scoped = public_scoped(origins(&["*"]));
+        scoped.canonical_bytes().unwrap();
+        let json = serde_json::to_value(&scoped).unwrap();
+        assert_eq!(serde_json::from_value::<CapabilityRecord>(json.clone()).unwrap(), scoped);
+        // Decode refuses the grant without the own employee's scope.
+        let mut unscoped = json.clone();
+        unscoped["resources"].as_array_mut().unwrap().retain(|grant| grant["kind"] != "employee_scope");
+        assert!(serde_json::from_value::<CapabilityRecord>(unscoped).is_err());
+        let mut tasked = json.clone();
+        tasked["task"] = serde_json::json!("t");
+        assert!(serde_json::from_value::<CapabilityRecord>(tasked).is_err());
+        let mut confined = json;
+        confined["resources"][1] = serde_json::json!({"kind":"confined","resource":{"kind":"public_origins","origins":["*"]}});
+        assert!(serde_json::from_value::<CapabilityRecord>(confined).is_err());
+        // Constructed records are refused before signing, with the same rules.
+        let mut bad = record();
+        bad.resources = List::new(vec![origins(&["*"])]).unwrap();
+        assert!(bad.canonical_bytes().is_err() && bad.validate_resource_mode().is_err());
+        bad.task = None;
+        bad.resources = List::new(vec![ResourceGrant::Employee { id: bad.employee }, origins(&["*"])]).unwrap();
+        assert!(bad.canonical_bytes().is_err());
+        bad.resources = List::new(vec![ResourceGrant::EmployeeScope { id: EmployeeId([9; 16]) }, origins(&["*"])]).unwrap();
+        assert!(bad.canonical_bytes().is_err());
+        bad.resources = List::new(vec![ResourceGrant::EmployeeScope { id: bad.employee },
+            ResourceGrant::Confined { resource: Box::new(origins(&["*"])) }]).unwrap();
+        assert!(bad.canonical_bytes().is_err());
+        bad.resources = List::new(vec![ResourceGrant::EmployeeScope { id: bad.employee },
+            origins(&["https://a.co"]), origins(&["https://b.co"])]).unwrap();
+        assert!(bad.canonical_bytes().is_err(), "at most one PublicOrigins grant");
+        for set in [&[][..], &["*", "https://a.co"][..], &["https://a.co", "https://a.co"][..]] {
+            assert!(public_scoped(origins(set)).canonical_bytes().is_err(), "{set:?}");
+        }
+    }
+    #[test]
+    fn public_origins_mac_covered() {
+        let cases = [
+            (origins(&["*"]), "0b00000001000000012a"),
+            (origins(&["https://b.co", "https://a.co"]), concat!("0b00000002",
+                "0000000c68747470733a2f2f612e636f", "0000000c68747470733a2f2f622e636f")),
+        ];
+        for (grant, expected) in &cases {
+            let actual: String = resource_bytes(grant).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(&actual, expected);
+            let bytes = public_scoped(grant.clone()).canonical_bytes().unwrap();
+            let encoded = resource_bytes(grant);
+            assert!(bytes.windows(encoded.len()).any(|window| window == encoded.as_slice()));
+        }
+        // Order inside the set is not authority; content is.
+        let a = public_scoped(origins(&["https://a.co", "https://b.co"])).canonical_bytes().unwrap();
+        assert_eq!(a, public_scoped(origins(&["https://b.co", "https://a.co"])).canonical_bytes().unwrap());
+        for other in [&["https://a.co"][..], &["https://a.co", "https://c.co"][..], &["*"][..]] {
+            assert_ne!(a, public_scoped(origins(other)).canonical_bytes().unwrap(), "{other:?}");
+        }
+        // Distinct from an exact UrlOrigin and from the scope alone.
+        let url = ResourceGrant::UrlOrigin { origin: Text::new("https://a.co".into()).unwrap() };
+        assert_ne!(resource_bytes(&url)[0], resource_bytes(&origins(&["https://a.co"]))[0]);
+        let mut scope_only = public_scoped(origins(&["*"]));
+        scope_only.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scope_only.employee }]).unwrap();
+        assert_ne!(scope_only.canonical_bytes().unwrap(), public_scoped(origins(&["*"])).canonical_bytes().unwrap());
+    }
+    #[test]
+    fn public_origins_rejects_ip_literal_and_userinfo() {
+        for valid in ["*", "https://example.com", "https://a.co", "https://xn--r8jz45g.jp", "https://api-1.example.org"] {
+            assert!(PublicOrigin::parse(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["", "**", "https://*.example.com", "*.example.com", "http://example.com", "example.com",
+            "https://127.0.0.1", "https://1.2.3.4", "https://0x7f.1", "https://8.8.8.8", "https://[::1]",
+            "https://[2001:db8::1]", "https://user@example.com", "https://user:pw@example.com",
+            "https://example.com:443", "https://example.com:8443", "https://example.com/", "https://example.com/p",
+            "https://example.com?q", "https://example.com#f", "https://EXAMPLE.com", "https://example.com.",
+            "https://com", "https://localhost", "https://a.localhost", "https://metadata.google.internal",
+            "https://printer.local", "https://router.home.arpa", "https://x.test", "https://-a.com",
+            "https://a-.com", "https://a..com", "https://例え.jp", "https://ex ample.com", "https://a.co\n"] {
+            assert!(PublicOrigin::parse(invalid).is_err(), "{invalid:?}");
+            let grant = serde_json::json!({"kind":"public_origins","origins":[invalid]});
+            assert!(serde_json::from_value::<ResourceGrant>(grant).is_err(), "{invalid:?}");
+        }
+        let any = PublicOrigin::any();
+        let exact = PublicOrigin::parse("https://a.co").unwrap();
+        assert!(any.permits(&exact) && exact.permits(&exact) && !any.permits(&any));
+        assert!(!exact.permits(&PublicOrigin::parse("https://b.a.co").unwrap()));
+        assert_eq!(exact.host(), Some("a.co"));
+        assert_eq!(any.host(), None);
     }
     #[test]
     fn background_capability_golden_bytes() {
