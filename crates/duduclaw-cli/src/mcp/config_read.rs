@@ -385,7 +385,7 @@ pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdic
         let signed = duduclaw_core::is_valid_agent_id(claimed)
             && duduclaw_core::load_identity_key(home_dir)
                 .map(zeroize::Zeroizing::new)
-                .is_some_and(|key| duduclaw_core::verify_identity_token(&key, claimed, &token));
+                .is_some_and(|key| duduclaw_core::verify_agent_token(home_dir, &key, claimed, &token));
         return if signed {
             duduclaw_core::IdentityVerdict::Verified
         } else {
