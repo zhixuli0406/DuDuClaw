@@ -76,8 +76,11 @@ impl MethodHandler {
                 let store = ConfirmationStore::open_read_only(&path).map_err(|_| "無法讀取遷移狀態。")?;
                 let items = store.list().map_err(|_| "無法讀取遷移狀態。")?;
                 // F6d: Employee and EmployeeRetire items behind one backend.
+                // F6fa: the listing's step-up freshness is the real one (an
+                // early-purged retire card without a fresh proof lists as not
+                // applicable until the Admin steps up).
                 let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
-                    Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user);
+                    Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user, proof.as_ref().map(|p| p.verified_at));
                 let items: Vec<Value> = items.into_iter().map(|item| {
                     let supported = employee_backend.validate(&item).is_ok() || GatewayAuthority::built_in_item_supported(&item)
                         || GatewayAccountReadback::available(&home, &item)
@@ -152,7 +155,7 @@ impl MethodHandler {
             let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
             // F6d: one slot, two backends (Employee + EmployeeRetire).
             let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
-                Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user);
+                Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user, Some(proof.verified_at));
             let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
             let adopt_home = home.clone();
             let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);

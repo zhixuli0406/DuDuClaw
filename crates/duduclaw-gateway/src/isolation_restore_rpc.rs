@@ -83,10 +83,15 @@ impl RpcError {
             Self::Factor(OwnerFactorError::RateLimited) => "寄送太頻繁，請稍後再試。",
             Self::Factor(OwnerFactorError::Denied) => "登入憑證已失效，請重新登入。",
             Self::Factor(OwnerFactorError::Unavailable) => "無法讀取帳號資料。",
+            Self::Factor(OwnerFactorError::BaselineMissing) =>
+                "這位員工註銷時沒有留下主人的驗證方式紀錄，無法確認主人身分，因此無法還原或接手。",
+            Self::Factor(OwnerFactorError::NotPreexisting) =>
+                "請使用註銷當時已設定、之後未曾變更的驗證方式；註銷後才新增或重新設定的驗證方式不能用來證明身分。",
             Self::Restore(refusal) => match refusal {
                 Refusal::NotFound | Refusal::NotOwner => "找不到這位員工，或這筆申請。",
                 Refusal::FactorRequired => "請先完成兩步驟驗證。",
                 Refusal::OwnerIneligible => "原主人目前無法使用帳號",
+                Refusal::SnapshotIncomplete => "這位員工註銷時的帳號紀錄不完整，無法確認主人的登入方式未被他人變更，因此無法還原。",
                 Refusal::CredentialChanged => "主人的登入方式在註銷後被他人變更",
                 Refusal::LabelTaken | Refusal::LabelPending => "已有同名員工或提案",
                 Refusal::Integrity | Refusal::OrgChanged | Refusal::StoresChanged => "隔離區資料與註銷時不一致",
@@ -139,18 +144,52 @@ fn purpose(employee: EmployeeId, incarnation: u32) -> Result<String, RpcError> {
     duduclaw_auth::mfa::owner_factor::restore_purpose(&hex::encode(employee.0), incarnation).ok_or(RpcError::Invalid)
 }
 
-/// Who gets a request-side notice: the log-eligible Admins (S16) and, for a
-/// Personal row, the tombstone-time address.
-fn notify(home: &Path, q: &engine::Quarantined, event: &str, details: Value, capped: bool, now: i64) -> bool {
-    let mut recipients = wiring::admin_notice_addresses(home, now);
-    if let Some(address) = q.principal_snapshot["notice_address"].as_str() { recipients.push(address.to_owned()); }
-    let scope = match &q.owner {
-        Some(owner) => NoticeScope::Owner(owner.clone()),
-        None => NoticeScope::Tenant(q.tenant.clone()),
+/// The tombstone-time factor baseline (F6fa) of the caller's own Personal
+/// row named by a server-built proof purpose (`restore:` or
+/// `adopt:<employee_id>:<incarnation>`). The production [`FactorCheck`] and
+/// challenge issuer pass it to `UserDb::restore_owner_factor` /
+/// `restore_challenge`, so the strongest factor and its credential are the
+/// tombstone's, never the live account's. A snapshot recorded before the
+/// baseline existed refuses `FACTOR_BASELINE_MISSING` (no weaker fallback).
+/// Read before the factor's users.db transaction, holding no lock (M6).
+pub(crate) fn factor_baseline(home: &Path, caller: &str, purpose: &str)
+    -> Result<duduclaw_auth::mfa::owner_factor::FactorBaseline, OwnerFactorError> {
+    let rest = purpose.strip_prefix("restore:").or_else(|| purpose.strip_prefix("adopt:")).ok_or(OwnerFactorError::Denied)?;
+    let (hex, incarnation) = rest.split_once(':').ok_or(OwnerFactorError::Denied)?;
+    let employee = hex16(hex).map_err(|_| OwnerFactorError::Denied)?;
+    let incarnation: u32 = incarnation.parse().map_err(|_| OwnerFactorError::Denied)?;
+    if !is_row_purpose(purpose, employee, incarnation) { return Err(OwnerFactorError::Denied); }
+    let q = match own_row(home, caller, employee, incarnation) {
+        Ok(q) => q,
+        Err(RpcError::Restore(Refusal::Unavailable)) => return Err(OwnerFactorError::Unavailable),
+        Err(_) => return Err(OwnerFactorError::Denied),
     };
+    duduclaw_auth::mfa::owner_factor::FactorBaseline::from_snapshot(&q.principal_snapshot).ok_or(OwnerFactorError::BaselineMissing)
+}
+
+/// `purpose` is exactly the canonical restore or adoption purpose of the row.
+fn is_row_purpose(purpose: &str, employee: EmployeeId, incarnation: u32) -> bool {
+    use duduclaw_auth::mfa::owner_factor::{adopt_purpose, restore_purpose};
+    let hex = hex::encode(employee.0);
+    restore_purpose(&hex, incarnation).as_deref() == Some(purpose) || adopt_purpose(&hex, incarnation).as_deref() == Some(purpose)
+}
+
+/// Who gets a request-side notice: the log-eligible Admins (S16) and, for a
+/// Personal row, the tombstone-time address. An uncapped (security) notice
+/// that cannot be queued is audited Critical (`wiring::queue_or_alert`).
+fn notify(home: &Path, q: &engine::Quarantined, event: &str, details: Value, capped: bool, now: i64) -> bool {
+    let mut recipients = wiring::admin_notice_addresses(home, &q.label, event, now);
+    if let Some(address) = q.principal_snapshot["notice_address"].as_str() { recipients.push(address.to_owned()); }
     let mut details = details;
     details["label"] = json!(q.label);
-    wiring::queue_notice(home, &scope, event, &recipients, &details, capped, now).unwrap_or(false)
+    wiring::queue_or_alert(home, &scope_of(q), event, &recipients, &details, capped, now)
+}
+
+fn scope_of(q: &engine::Quarantined) -> NoticeScope {
+    match &q.owner {
+        Some(owner) => NoticeScope::Owner(owner.clone()),
+        None => NoticeScope::Tenant(q.tenant.clone()),
+    }
 }
 
 fn row_of(home: &Path, employee: EmployeeId, incarnation: u32) -> Result<Option<engine::Quarantined>, Refusal> {
@@ -335,11 +374,13 @@ pub(crate) fn decide(home: &Path, env: &RestoreEnv<'_>, approver: &str, id: &str
         notify(home, &q, "isolation.employee_restored", json!({"request_id": id, "approver_user_id": approver,
             "self_approved": restored.self_approved, "incarnation": restored.incarnation}), false, env.now);
         if restored.self_approved {
-            // S16: the addresses the rule read from the log in the apply tx.
+            // S16: the addresses the rule read from the log in the apply tx,
+            // plus (Personal, §3.4) the tombstone-time notice address.
+            let mut recipients = notices();
             let mut details = json!({"request_id": id, "approver_user_id": approver, "label": q.label});
-            details["log_addresses"] = json!(notices().len());
-            let scope = q.owner.clone().map_or(NoticeScope::Tenant(q.tenant.clone()), NoticeScope::Owner);
-            let _ = wiring::queue_notice(home, &scope, "isolation.employee_restore_self_approved", &notices(), &details, false, env.now);
+            details["log_addresses"] = json!(recipients.len());
+            if let Some(address) = q.principal_snapshot["notice_address"].as_str() { recipients.push(address.to_owned()); }
+            wiring::queue_or_alert(home, &scope_of(&q), "isolation.employee_restore_self_approved", &recipients, &details, false, env.now);
         }
     }
     Ok(json!({"request_id": id, "state": "done", "label": request.label, "incarnation": restored.incarnation,

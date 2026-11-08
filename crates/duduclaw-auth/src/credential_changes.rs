@@ -139,6 +139,23 @@ pub fn changes_since(conn: &Connection, user: &str, since: i64, limit: usize) ->
     Ok(rows)
 }
 
+/// Changes of `user` with `seq > after` (the high-water mark recorded at the
+/// tombstone, F6fa), oldest first, at most `limit` (an over-long answer is an
+/// error). Ordered by the log's own sequence, never by wall clock, so a clock
+/// step cannot hide a change. A missing table is an error.
+pub fn changes_after(conn: &Connection, user: &str, after: i64, limit: usize) -> Result<Vec<CredentialChange>, String> {
+    let bound = i64::try_from(limit.saturating_add(1)).map_err(|e| e.to_string())?;
+    let mut statement = conn.prepare(
+        "SELECT seq,user_id,field,actor_user_id,owner_authenticated,at FROM credential_changes
+         WHERE user_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3").map_err(|e| e.to_string())?;
+    let rows = statement.query_map(params![user, after, bound], |r| Ok(CredentialChange {
+        seq: r.get(0)?, user_id: r.get(1)?, field: r.get(2)?, actor_user_id: r.get(3)?,
+        owner_authenticated: r.get::<_, i64>(4)? == 1, at: r.get(5)?,
+    })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    if rows.len() > limit { return Err("credential change log longer than the read limit".into()); }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{UserDb, UserRole};

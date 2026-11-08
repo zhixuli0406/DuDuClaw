@@ -71,12 +71,14 @@ impl MigrationAuthorityBackend for CompositeBackend {
 
 /// The production pair for the confirmation RPC: `EmployeeAuthority` and the
 /// retire backend over spawnd, F6c2's rule and the notice outbox; `actor` is
-/// the live dashboard Admin of the call.
-pub(crate) fn production_backend(home: PathBuf, employee: Arc<dyn MigrationAuthorityBackend>, actor: &str)
-    -> Arc<dyn MigrationAuthorityBackend> {
+/// the live dashboard Admin of the call; `step_up_verified_at` the
+/// `verified_at` of the migration step-up proof this call read (`None`
+/// without one), from which the rule computes `fresh_step_up` (F6fa).
+pub(crate) fn production_backend(home: PathBuf, employee: Arc<dyn MigrationAuthorityBackend>, actor: &str,
+    step_up_verified_at: Option<u64>) -> Arc<dyn MigrationAuthorityBackend> {
     use crate::isolation_restore_wiring::{unix_now, OutboxNotifier, RetireLogRule};
     let retire = EmployeeRetireAuthority::new(home, Arc::new(crate::isolation_retire::SpawndRetireRoot),
-        Arc::new(RetireLogRule { now: unix_now }), Arc::new(OutboxNotifier), Some(actor.to_owned()));
+        Arc::new(RetireLogRule { now: unix_now, step_up_verified_at }), Arc::new(OutboxNotifier), Some(actor.to_owned()));
     Arc::new(CompositeBackend::new(vec![employee, Arc::new(retire)]))
 }
 

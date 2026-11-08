@@ -7,13 +7,15 @@
 //!    row becomes `invalid`.
 //! 2. tx1 (short): every common check again incl. R1; request `applying`,
 //!    quarantine `restoring` bound to the request (`closed_by_request`).
-//! 3. tx2 (`BEGIN IMMEDIATE`, `synchronous=FULL`, held to the end): NOREPLACE
-//!    move back to `agents/<label>` with the root `(dev, ino)` checked;
-//!    stat re-walk against step 1 (mismatch: moved back, `needs_reseal`);
-//!    route digest and store marks again; users.db in one transaction
-//!    (eligibility, approval rule, mirror or bindings, ACL + policy epoch
-//!    bump); the confirmed row live with `incarnation + 1`; quarantine
-//!    `restored`; request `done`.
+//! 3. tx2 (`BEGIN IMMEDIATE`, `synchronous=FULL`, held to the end): the
+//!    agent cap recounted and open Employee proposals re-read under the
+//!    apply.db writer lock (F6fa); NOREPLACE move back to `agents/<label>`
+//!    with the root `(dev, ino)` checked; stat re-walk against step 1
+//!    (mismatch: moved back, `needs_reseal`); route digest and store marks
+//!    again; users.db in one transaction (tenant, eligibility, the Q3
+//!    credential check against the snapshot, approval rule, mirror or
+//!    bindings, ACL + policy epoch bump); the confirmed row live with
+//!    `incarnation + 1`; quarantine `restored`; request `done`.
 //! 4. After commit the lifecycle must read the new incarnation (else alert).
 //!
 //! The registry rescan, provider cache eviction (L3) and owner/approver
@@ -44,9 +46,10 @@ pub(crate) struct Recovered {
 /// Points where a test may act (touch the tree, change an account) or
 /// simulate a crash (the hook returns `true`: the call returns at once,
 /// without any cleanup, and an open transaction rolls back as on process
-/// death).
+/// death). `BeforeTx1`: after every outside check and the quarantine
+/// verification, before any lock (the window a concurrent writer races).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HookPoint { AfterMove, AfterUsers, AfterCommit }
+pub(crate) enum HookPoint { BeforeTx1, AfterMove, AfterUsers, AfterCommit }
 
 #[cfg(test)]
 thread_local! {
@@ -64,7 +67,7 @@ fn crash_at(point: HookPoint) -> bool {
 /// A refusal that ends the request (the requester must file again).
 fn terminal(refusal: Refusal) -> bool {
     matches!(refusal, Refusal::RoutesChanged | Refusal::StoresChanged | Refusal::OrgChanged | Refusal::Integrity
-        | Refusal::CredentialChanged | Refusal::Expired | Refusal::Inconsistent | Refusal::OwnerIneligible
+        | Refusal::CredentialChanged | Refusal::SnapshotIncomplete | Refusal::Expired | Refusal::Inconsistent | Refusal::OwnerIneligible
         | Refusal::NotSealed | Refusal::Root(RootClass::Gone | RootClass::Inconsistent | RootClass::Retired))
 }
 
@@ -137,6 +140,7 @@ pub(crate) fn approve(home: &Path, env: &RestoreEnv<'_>, request_id: &str, appro
             return Err(settle(home, &request, Refusal::Integrity, Some((&["sealed"][..], "invalid")), env.now)),
         Err(refusal) => return Err(settle(home, &request, refusal, None, env.now)),
     };
+    if crash_at(HookPoint::BeforeTx1) { return Err(Refusal::Unavailable); }
     // 2. tx1.
     {
         let mut db = open_apply(home)?;
@@ -246,6 +250,12 @@ fn apply_locked(home: &Path, env: &RestoreEnv<'_>, tx: &Connection, request: &Re
     dir: &crate::fs_safe::SafeDir, verified: &quarantine::Sealed) -> Result<Restored, Step> {
     let (receipt, encoded) = check_apply_db(tx, q, Stage::Apply(&request.request_id), env.now)
         .map_err(|r| Step::Refused(r, "sealed"))?;
+    // F6fa: what `check_outside` read before tx1, again under the apply.db
+    // writer lock this transaction holds — a proposal apply (which must take
+    // it to save a confirmed row) cannot add a live employee before the
+    // commit, and staging (which takes it too) cannot add an open proposal.
+    check_quota_in(tx, env.agent_cap).map_err(|r| Step::Refused(r, "sealed"))?;
+    check_no_open_proposal(home, &q.label).map_err(|r| Step::Refused(r, "sealed"))?;
     let root = q.root.ok_or(Step::Refused(Refusal::NotSealed, "sealed"))?;
     let dirs = open_dirs(home).map_err(|r| Step::Refused(r, "sealed"))?;
     // a. NOREPLACE move from held descriptors; the kernel refuses an
@@ -329,10 +339,13 @@ fn users_error(error: duduclaw_auth::db::PersonalAgentError) -> Refusal {
     }
 }
 
-/// §3.5 c: one users.db IMMEDIATE transaction — tenant, eligibility, the
-/// approval rule (inside the same transaction as the writes) and, for a
-/// self-approval, its users.db audit row, then the mirror or the selected
-/// bindings with the ACL and policy epoch bumps.
+/// §3.5 c: one users.db IMMEDIATE transaction — tenant, eligibility, the Q3
+/// credential check against the tombstone snapshot (F6fa: a change committed
+/// after the approval call's outside check is seen here, and none can land
+/// before this transaction commits), the approval rule (inside the same
+/// transaction as the writes) and, for a self-approval, its users.db audit
+/// row, then the mirror or the selected bindings with the ACL and policy
+/// epoch bumps.
 fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q: &Quarantined, approver: &str)
     -> Result<Approval, Refusal> {
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(from_lifecycle)?;
@@ -340,6 +353,7 @@ fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q:
     if duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)? != q.tenant { return Err(Refusal::TenantMismatch); }
     if let Some(owner) = &q.owner {
         if !lifecycle::owner_eligible(&tx, owner).map_err(from_lifecycle)? { return Err(Refusal::OwnerIneligible); }
+        check_credentials(home, &tx, q, owner)?;
     }
     let approval = decide(env.rule, &tx, &request.requester, approver, request.kind)?;
     // F6c2: the sole-Admin users.db audit row, written once, here — in the

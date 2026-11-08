@@ -167,9 +167,24 @@ impl ApprovalRule for LogRule {
 }
 
 /// F6l's retire-card rule for an early-purged row (S12), requester = proposer.
-/// The confirmation RPC refuses every approve/apply call without a verified
-/// step-up proof before any backend runs, so the step-up is fresh here.
-pub(crate) struct RetireLogRule { pub(crate) now: fn() -> i64 }
+/// `step_up_verified_at`: the `verified_at` of the migration step-up proof the
+/// confirmation RPC read for this call (`None`: none, e.g. a card listing).
+/// F6fa: the rule's `fresh_step_up` is computed from it at each decision
+/// (verified within [`duduclaw_auth::mfa::TTL`] seconds, not in the future),
+/// never assumed.
+pub(crate) struct RetireLogRule {
+    pub(crate) now: fn() -> i64,
+    pub(crate) step_up_verified_at: Option<u64>,
+}
+
+/// A migration step-up proof `verified_at` is fresh at `now`: the same
+/// five-minute window `ApprovalSession::authorize` and
+/// `UserDb::migration_confirmation_session` apply.
+pub(crate) fn step_up_fresh(verified_at: Option<u64>, now: i64) -> bool {
+    let Ok(now) = u64::try_from(now) else { return false };
+    let ttl = u64::try_from(duduclaw_auth::mfa::TTL).unwrap_or(0);
+    verified_at.is_some_and(|at| at <= now && now - at <= ttl)
+}
 
 fn retire_approval(decision: ApprovalDecision)
     -> Result<crate::isolation_retire::Approval, crate::isolation_retire::ApprovalRefusal> {
@@ -180,7 +195,16 @@ fn retire_approval(decision: ApprovalDecision)
         ApprovalDecision::Refused(rule::ApprovalRefusal::SecondAdminRequired) => Err(R::NeedsOtherAdmin),
         ApprovalDecision::Refused(rule::ApprovalRefusal::ApproverNotQualified(_)) => Err(R::NotQualified),
         ApprovalDecision::Refused(rule::ApprovalRefusal::CoolingWindow) => Err(R::Cooling),
+        ApprovalDecision::Refused(rule::ApprovalRefusal::StepUpRequired) => Err(R::StepUpRequired),
         ApprovalDecision::Refused(_) => Err(R::LogUnavailable),
+    }
+}
+
+impl RetireLogRule {
+    fn request<'a>(&self, requester: &'a str, approver: &'a str, owner: Option<&'a str>) -> ApprovalRequest<'a> {
+        let now = (self.now)();
+        ApprovalRequest { kind: ApprovalKind::EarlyPurgedRetire, requester_user_id: requester, owner_user_id: owner,
+            approver_user_id: approver, fresh_step_up: step_up_fresh(self.step_up_verified_at, now), now }
     }
 }
 
@@ -190,29 +214,31 @@ impl crate::isolation_retire::ApprovalRule for RetireLogRule {
         use crate::isolation_retire::ApprovalRefusal as R;
         let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadOnly).map_err(|_| R::LogUnavailable)?;
         let tx = users.transaction().map_err(|_| R::LogUnavailable)?;
-        let request = ApprovalRequest { kind: ApprovalKind::EarlyPurgedRetire, requester_user_id: requester,
-            owner_user_id: owner, approver_user_id: approver, fresh_step_up: true, now: (self.now)() };
-        let decision = EligibilityLogRule.decide(&tx, &request);
+        let decision = EligibilityLogRule.decide(&tx, &self.request(requester, approver, owner));
         tx.finish().map_err(|_| R::LogUnavailable)?;
         retire_approval(decision)
     }
 
-    /// S12: the retire card has no users.db write of its own, so this opens
-    /// one IMMEDIATE users.db transaction, decides again in it and writes
-    /// F6c2's self-approval row there — once per proposal (`subject`): a
-    /// retried stage finds the row and writes nothing.
-    fn record_self_approval(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>, subject: &str)
-        -> Result<(), crate::isolation_retire::ApprovalRefusal> {
+    /// S12 + F6fa: the binding decision of the stage step, for every
+    /// approval (self or another Admin). The retire card has no users.db
+    /// write of its own, so this opens one IMMEDIATE users.db transaction
+    /// (the caller holds its apply.db IMMEDIATE transaction, M6), decides in
+    /// it and, for a self-approval, writes F6c2's row there — once per
+    /// proposal (`subject`): a retried stage finds the row and writes nothing.
+    fn confirm_at_apply(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>, subject: &str)
+        -> Result<crate::isolation_retire::Approval, crate::isolation_retire::ApprovalRefusal> {
         use crate::isolation_retire::{Approval as A, ApprovalRefusal as R};
         let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(|_| R::LogUnavailable)?;
         let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| R::LogUnavailable)?;
-        let request = ApprovalRequest { kind: ApprovalKind::EarlyPurgedRetire, requester_user_id: requester,
-            owner_user_id: owner, approver_user_id: approver, fresh_step_up: true, now: (self.now)() };
-        if retire_approval(EligibilityLogRule.decide(&tx, &request))? != A::SelfApproved { return Err(R::LogUnavailable); }
-        let written: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM auth_audit_log WHERE action=?1 AND target=?2)",
-            params![rule::SELF_APPROVED_AUDIT_ACTION, subject], |r| r.get(0)).map_err(|_| R::LogUnavailable)?;
-        if !written { rule::record_self_approval(&tx, &request, subject).map_err(|_| R::LogUnavailable)?; }
-        tx.commit().map_err(|_| R::LogUnavailable)
+        let request = self.request(requester, approver, owner);
+        let approval = retire_approval(EligibilityLogRule.decide(&tx, &request))?;
+        if approval == A::SelfApproved {
+            let written: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM auth_audit_log WHERE action=?1 AND target=?2)",
+                params![rule::SELF_APPROVED_AUDIT_ACTION, subject], |r| r.get(0)).map_err(|_| R::LogUnavailable)?;
+            if !written { rule::record_self_approval(&tx, &request, subject).map_err(|_| R::LogUnavailable)?; }
+        }
+        tx.commit().map_err(|_| R::LogUnavailable)?;
+        Ok(approval)
     }
 }
 
@@ -259,15 +285,41 @@ pub(crate) fn queue_notice(home: &Path, scope: &NoticeScope, event: &str, recipi
     Ok(true)
 }
 
+/// Queue one notice; a failure is never silent (F6fa). An uncapped notice
+/// (a security event: approval, self-approval, restore, adoption, retire,
+/// root alert) that cannot be queued is audited Critical
+/// `isolation.employee_restore_notice_unqueued` (the Admins learn of the
+/// event from the audit even with no outbox); a capped one is logged.
+/// Returns whether the notice was queued.
+pub(crate) fn queue_or_alert(home: &Path, scope: &NoticeScope, event: &str, recipients: &[String], details: &Value,
+    capped: bool, now: i64) -> bool {
+    match queue_notice(home, scope, event, recipients, details, capped, now) {
+        Ok(queued) => queued,
+        Err(refusal) => {
+            let label = details["label"].as_str().unwrap_or("");
+            if capped {
+                tracing::warn!(event, label, code = refusal.code(), "restore notice could not be queued");
+            } else {
+                restore::audit(home, "isolation.employee_restore_notice_unqueued", label, Severity::Critical,
+                    json!({"event": event, "scope": scope.key(), "recipients": recipients.len(), "code": refusal.code()}));
+            }
+            false
+        }
+    }
+}
+
 /// S16: every address the eligibility log shows for an account eligible in
-/// the last 30 days (deleted accounts included). Unreadable ⇒ empty, logged.
-pub(crate) fn admin_notice_addresses(home: &Path, now: i64) -> Vec<String> {
+/// the last 30 days (deleted accounts included). Unreadable ⇒ empty and,
+/// since the Admins then get no notice of `event` at all, audited Critical
+/// `isolation.employee_restore_notice_recipients_unavailable` (F6fa).
+pub(crate) fn admin_notice_addresses(home: &Path, label: &str, event: &str, now: i64) -> Vec<String> {
     let read = || -> Result<Vec<String>, ()> {
         let users = lifecycle::open_store(home, USERS_DB, Access::ReadOnly).map_err(|_| ())?;
         rule::notice_addresses(&users, now).map_err(|_| ())
     };
     read().unwrap_or_else(|()| {
-        tracing::warn!("restore notices: admin eligibility log unreadable; admin addresses unavailable");
+        restore::audit(home, "isolation.employee_restore_notice_recipients_unavailable", label, Severity::Critical,
+            json!({"event": event, "reason": "admin_eligibility_log_unreadable"}));
         Vec::new()
     })
 }
@@ -283,15 +335,14 @@ pub(crate) struct OutboxNotifier;
 impl crate::isolation_retire::RetireNotifier for OutboxNotifier {
     fn notify(&self, home: &Path, event: &str, owner: Option<&str>, details: &Value) {
         let now = unix_now();
-        let mut recipients = admin_notice_addresses(home, now);
+        let label = details["label"].as_str().unwrap_or("");
+        let mut recipients = admin_notice_addresses(home, label, event, now);
         if let Some(address) = owner.and_then(|owner| account_address(home, owner)) { recipients.push(address); }
         let scope = match owner {
             Some(owner) => NoticeScope::Owner(owner.to_owned()),
             None => NoticeScope::Tenant(String::new()),
         };
-        if queue_notice(home, &scope, event, &recipients, details, false, now).is_err() {
-            tracing::warn!(event, "retire notice could not be queued");
-        }
+        queue_or_alert(home, &scope, event, &recipients, details, false, now);
     }
 }
 

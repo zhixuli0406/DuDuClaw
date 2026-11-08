@@ -23,7 +23,7 @@ use crate::isolation_restore::{CatalogRoutes, RestoreEnv, SpawndRootProbe};
 use crate::isolation_restore_rpc::{self as rpc, RpcError};
 use crate::isolation_restore_wiring::{LogRule, RegistryMarks};
 use duduclaw_auth::mfa::owner_factor::{RestoreChallenge, RestoreProof};
-use duduclaw_auth::mfa::OwnerFactorError;
+use duduclaw_auth::mfa::{OwnerFactor, OwnerFactorError};
 
 pub(super) const LIST_RESTORABLE: &str = "me.isolation.list_restorable";
 pub(super) const RESTORE_CHALLENGE: &str = "me.isolation.restore_challenge";
@@ -167,10 +167,12 @@ impl MethodHandler {
         let params = if params.is_null() { json!({}) } else { params };
         let (home, user, epoch) = (self.home_dir.clone(), ctx.user_id.clone(), ctx.credential_epoch);
         let invalid = |_| Failure::Rpc(RpcError::Invalid);
-        // Admin + fresh migration step-up with its session-bound CSRF token.
-        let step_up = move |db: &UserDb, user: &str, session: &str, csrf: &[u8; 32], now: i64| -> Result<(), Failure> {
+        // Admin + fresh migration step-up with its session-bound CSRF token;
+        // returns the proof's `verified_at` (the rule's freshness, F6fa).
+        let step_up = move |db: &UserDb, user: &str, session: &str, csrf: &[u8; 32], now: i64| -> Result<u64, Failure> {
             let proof = db.migration_confirmation_session(user, session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
-            authorize_step_up(proof.as_ref(), user, csrf, now).map_err(Failure::Gate)
+            authorize_step_up(proof.as_ref(), user, csrf, now).map_err(Failure::Gate)?;
+            proof.map(|proof| proof.verified_at).ok_or(Failure::Gate(SESSION_EXPIRED))
         };
         match method {
             LIST_RESTORABLE => {
@@ -184,7 +186,11 @@ impl MethodHandler {
                     let now = now()?;
                     let origin = passkey_origin(&home);
                     let mail = crate::mfa_email::available(&home);
-                    let issue = |purpose: &str| db.restore_challenge(&user, epoch, purpose, origin.as_deref(), mail, now);
+                    // F6fa: the tombstone's factor baseline of the row the purpose names.
+                    let issue = |purpose: &str| -> Result<RestoreChallenge, OwnerFactorError> {
+                        let baseline = rpc::factor_baseline(&home, &user, purpose)?;
+                        db.restore_challenge(&user, epoch, purpose, &baseline, origin.as_deref(), mail, now)
+                    };
                     if input.for_adoption {
                         return Ok(rpc::adoption_challenge(&home, &user, &input.employee_id, input.incarnation, &issue)?);
                     }
@@ -216,9 +222,13 @@ impl MethodHandler {
                     let now = now()?;
                     let cipher = crate::mfa::Cipher(&home);
                     let origin = passkey_origin(&home);
-                    let check = |factor, purpose: &str, code: &str| db.restore_owner_factor(&user, epoch, factor,
-                        &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
-                        &cipher, origin.as_deref(), now);
+                    // F6fa: the tombstone's factor baseline of the row the purpose names.
+                    let check = |factor: OwnerFactor, purpose: &str, code: &str| -> Result<OwnerFactor, OwnerFactorError> {
+                        let baseline = rpc::factor_baseline(&home, &user, purpose)?;
+                        db.restore_owner_factor(&user, epoch, factor, &baseline,
+                            &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
+                            &cipher, origin.as_deref(), now)
+                    };
                     // The request stage never approves: no step-up for the rule.
                     let rule = LogRule::new(false, now);
                     Ok(with_env(&home, &user, &rule, cap, now, |env| rpc::request_restore(&home, env, &user,
@@ -231,9 +241,13 @@ impl MethodHandler {
                     let now = now()?;
                     let cipher = crate::mfa::Cipher(&home);
                     let origin = passkey_origin(&home);
-                    let check = |factor, purpose: &str, code: &str| db.restore_owner_factor(&user, epoch, factor,
-                        &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
-                        &cipher, origin.as_deref(), now);
+                    // F6fa: the tombstone's factor baseline of the row the purpose names.
+                    let check = |factor: OwnerFactor, purpose: &str, code: &str| -> Result<OwnerFactor, OwnerFactorError> {
+                        let baseline = rpc::factor_baseline(&home, &user, purpose)?;
+                        db.restore_owner_factor(&user, epoch, factor, &baseline,
+                            &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
+                            &cipher, origin.as_deref(), now)
+                    };
                     Ok(rpc::cancel_own(&home, &user, &input.request_id, &input.factor, &input.code, &check, now)?)
                 }).await
             }
@@ -244,9 +258,10 @@ impl MethodHandler {
                 let scan_home = home.clone();
                 let done = run(move || {
                     let now = now()?;
-                    step_up(db.as_ref(), &user, &session, &input.csrf_token, now)?;
-                    // The verified step-up of this very call (S1: fresh).
-                    let rule = LogRule::new(true, now);
+                    let verified_at = step_up(db.as_ref(), &user, &session, &input.csrf_token, now)?;
+                    // The verified step-up of this very call (S1), its
+                    // freshness computed from the proof (F6fa), never assumed.
+                    let rule = LogRule::new(crate::isolation_restore_wiring::step_up_fresh(Some(verified_at), now), now);
                     let notices = || rule.notice_addresses();
                     Ok(with_env(&home, &user, &rule, cap, now, |env| rpc::decide(&home, env, &user, &input.request_id, approve, &notices))?)
                 }).await?;
@@ -292,9 +307,13 @@ impl MethodHandler {
                     let now = now()?;
                     let cipher = crate::mfa::Cipher(&home);
                     let origin = passkey_origin(&home);
-                    let check = |factor, purpose: &str, code: &str| db.restore_owner_factor(&user, epoch, factor,
-                        &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
-                        &cipher, origin.as_deref(), now);
+                    // F6fa: the tombstone's factor baseline of the row the purpose names.
+                    let check = |factor: OwnerFactor, purpose: &str, code: &str| -> Result<OwnerFactor, OwnerFactorError> {
+                        let baseline = rpc::factor_baseline(&home, &user, purpose)?;
+                        db.restore_owner_factor(&user, epoch, factor, &baseline,
+                            &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
+                            &cipher, origin.as_deref(), now)
+                    };
                     Ok(with_adopt_env(&home, &user, cap, now, |env| rpc::request_adoption(&home, env, &user, &input.employee_id,
                         input.incarnation, input.target_label.as_deref(), &input.factor, &input.code, &check))?)
                 }).await

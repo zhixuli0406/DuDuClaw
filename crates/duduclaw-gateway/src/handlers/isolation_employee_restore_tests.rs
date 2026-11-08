@@ -40,6 +40,40 @@ async fn restore_rpcs_not_listed_to_ai() {
     }
 }
 
+/// F6fa (review item 8, verified): the restore RPCs and the owner's own
+/// credential writers (`users.change_password`, `users.change_email`) are
+/// unreachable from an AI employee. AI employees act only through MCP tools,
+/// which the CLI implements itself (no tool forwards a dashboard RPC method);
+/// none of these names is an MCP tool (registry, external whitelist, tool
+/// guide); and the identity internal / legacy-token connections run as
+/// (`system`) is refused by every one of them. The on-behalf-of context
+/// (`on_behalf_of/`) only attributes MCP tool and bus dispatch to a human; it
+/// never opens a dashboard session.
+#[tokio::test]
+async fn f6fa_restore_and_credential_rpcs_unreachable_from_ai() {
+    let dir = crate::fs_safe::private_test_home().unwrap();
+    let handler = MethodHandler::new(dir.path().to_path_buf()).await;
+    let guide = include_str!("../../../../docs/guides/mcp-tools.md");
+    let tools: Vec<&str> = duduclaw_core::mcp_tool_defs::tools().map(|tool| tool.name).collect();
+    let credentials = ["users.change_password", "users.change_email"];
+    for method in METHODS.iter().chain(credentials.iter()) {
+        for name in [method.to_string(), method.replace('.', "_")] {
+            assert!(!tools.contains(&name.as_str()), "{name} must not be an MCP tool");
+            assert!(!duduclaw_core::mcp_tool_defs::EXTERNAL_TOOLS_WHITELIST.contains(&name.as_str()), "{name}");
+        }
+        assert!(!guide.contains(method), "{method} must not be documented as an MCP tool");
+    }
+    for method in METHODS {
+        let frame = handler.handle_isolation_employee(method, json!({}), &ctx("system", UserRole::Admin)).await;
+        assert_eq!(refusal(&frame), NOT_ALLOWED, "{method}");
+    }
+    let system = ctx("system", UserRole::Admin);
+    let frame = handler.handle_users_change_password(json!({"current_password": "x", "new_password": "long-enough-1"}), &system).await;
+    assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "users.change_password as system: {frame:?}");
+    let frame = handler.handle_users_change_email(json!({"email": "x@example.test", "current_password": "x"}), &system).await;
+    assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "users.change_email as system: {frame:?}");
+}
+
 /// Decide (and regrant / admin cancel / retire) need Admin + MFA + a fresh
 /// migration step-up with its CSRF token; the request schema has no field
 /// that could stand in for it, and the rule itself refuses without step-up.

@@ -73,15 +73,26 @@ impl RetireRoot for FakeRoot {
 /// F6c2's rule as a fake: a configured answer, every call recorded.
 struct Rule { answer: Mutex<std::result::Result<Approval, ApprovalRefusal>>, calls: Mutex<Vec<(String, String, Option<String>)>>,
     /// Subjects of every users.db self-approval row requested (S12).
-    recorded: Mutex<Vec<String>> }
+    recorded: Mutex<Vec<String>>,
+    /// `(subject, apply.db writer lock held)` of every stage-step decision (F6fa).
+    confirmed: Mutex<Vec<(String, bool)>> }
 impl ApprovalRule for Rule {
     fn decide(&self, _: &Path, requester: &str, approver: &str, owner: Option<&str>) -> std::result::Result<Approval, ApprovalRefusal> {
         self.calls.lock().unwrap().push((requester.into(), approver.into(), owner.map(str::to_owned)));
         *self.answer.lock().unwrap()
     }
-    fn record_self_approval(&self, _: &Path, _: &str, _: &str, _: Option<&str>, subject: &str) -> std::result::Result<(), ApprovalRefusal> {
-        self.recorded.lock().unwrap().push(subject.into());
-        Ok(())
+    /// The stage step's decision (F6fa: for every approval, inside the apply
+    /// tx); the users.db row is requested only for a self-approval.
+    fn confirm_at_apply(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>, subject: &str)
+        -> std::result::Result<Approval, ApprovalRefusal> {
+        // Is the caller's apply.db writer lock held right now?
+        let probe = Connection::open(home.join(APPLY)).unwrap();
+        probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let locked = probe.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_err();
+        self.confirmed.lock().unwrap().push((subject.into(), locked));
+        let approval = self.decide(home, requester, approver, owner)?;
+        if approval == Approval::SelfApproved { self.recorded.lock().unwrap().push(subject.into()); }
+        Ok(approval)
     }
 }
 #[derive(Default)]
@@ -189,7 +200,8 @@ fn fixture(early: bool) -> Fx {
     let receipt = Receipt { binding: item.binding, label: LABEL.into(), employee: EMPLOYEE, uid: 70_001, bytes: spec.bytes,
         inodes: spec.inodes, disabled: false, principal_binding: spec.binding };
     let fx = Fx { dir, root: Arc::new(FakeRoot { state: Mutex::new(Spawnd { phase: Some(Phase::Ready), ..Spawnd::default() }), receipt: receipt.clone() }),
-        rule: Arc::new(Rule { answer: Mutex::new(Ok(Approval::OtherAdmin)), calls: Mutex::new(Vec::new()), recorded: Mutex::new(Vec::new()) }),
+        rule: Arc::new(Rule { answer: Mutex::new(Ok(Approval::OtherAdmin)), calls: Mutex::new(Vec::new()), recorded: Mutex::new(Vec::new()),
+            confirmed: Mutex::new(Vec::new()) }),
         notices: Arc::new(Notices::default()), now: Arc::new(AtomicI64::new(1_000_000)) };
     let mut dead = receipt.clone(); dead.disabled = true;
     fx.sql("INSERT INTO confirmed_employees(label,operation,digest,receipt,tenant_id,incarnation) VALUES(?1,'op-1',X'01',?2,'tenant-a',0)",
@@ -318,6 +330,60 @@ fn retire_early_purged_row_needs_second_admin() {
     fx.apply_all(&binding).unwrap();
     assert!(fx.rule.calls.lock().unwrap().is_empty());
     assert!(fx.rule.recorded.lock().unwrap().is_empty(), "no self-approval row without the rule");
+}
+
+/// F6fa (review item 7): an early-purged row approved by another Admin is
+/// decided again at the stage step inside the apply.db transaction (the
+/// writer lock is held while the rule reads users.db), exactly once, before
+/// the root retire; a refusal there stops the retire. Rows purged after 90
+/// days never consult the rule.
+#[test]
+fn f6fa_retire_non_self_approval_decided_in_apply_tx() {
+    let fx = fixture(true);
+    let binding = fx.staged();
+    fx.approve(&binding, APPROVER).unwrap();
+    fx.apply_all(&binding).unwrap();
+    let key = hex::encode(binding.operation_id.proposal_id.0);
+    assert_eq!(*fx.rule.confirmed.lock().unwrap(), vec![(key.clone(), true)], "once, at stage, under the apply.db lock");
+    assert!(fx.rule.recorded.lock().unwrap().is_empty(), "no self-approval row for another Admin");
+    let approvers = spawnd(&fx).approvers.clone();
+    assert!(!approvers.is_empty() && approvers.iter().all(|a| a == APPROVER), "{approvers:?}");
+    // A refusal at the stage decision stops before the root.
+    let fx = fixture(true);
+    let binding = fx.staged();
+    fx.approve(&binding, APPROVER).unwrap();
+    *fx.rule.answer.lock().unwrap() = Err(ApprovalRefusal::StepUpRequired);
+    assert!(fx.apply_all(&binding).is_err());
+    assert_eq!(spawnd(&fx).retires, 0);
+    assert_eq!(ApprovalRefusal::StepUpRequired.code(), "STEP_UP_REQUIRED");
+    // Not early: no decision at all.
+    let fx = fixture(false);
+    let binding = fx.staged();
+    fx.approve(&binding, APPROVER).unwrap();
+    fx.apply_all(&binding).unwrap();
+    assert!(fx.rule.confirmed.lock().unwrap().is_empty());
+}
+
+/// F6fa: the production retire rule gets the real step-up freshness of the
+/// call (never a hard-coded `true`): no proof, a stale one or one from the
+/// future is not fresh, so the F6c2 rule refuses `STEP_UP_REQUIRED`.
+#[test]
+fn f6fa_retire_rule_uses_real_step_up() {
+    use crate::isolation_restore_wiring::{step_up_fresh, RetireLogRule};
+    let now = 1_000_000;
+    assert!(step_up_fresh(Some(now as u64), now));
+    assert!(step_up_fresh(Some(now as u64 - 300), now));
+    assert!(!step_up_fresh(Some(now as u64 - 301), now), "older than the 5-minute window");
+    assert!(!step_up_fresh(Some(now as u64 + 1), now), "from the future");
+    assert!(!step_up_fresh(None, now), "no proof in this call");
+    assert!(!step_up_fresh(Some(0), -1));
+    let dir = crate::fs_safe::private_test_home().unwrap();
+    duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+    for verified_at in [None, Some(1u64)] {
+        let rule = RetireLogRule { now: crate::isolation_restore_wiring::unix_now, step_up_verified_at: verified_at };
+        assert_eq!(rule.decide(dir.path(), "a", "b", None), Err(ApprovalRefusal::StepUpRequired), "{verified_at:?}");
+        assert_eq!(rule.confirm_at_apply(dir.path(), "a", "a", None, "p-1"), Err(ApprovalRefusal::StepUpRequired), "{verified_at:?}");
+    }
 }
 
 #[test]

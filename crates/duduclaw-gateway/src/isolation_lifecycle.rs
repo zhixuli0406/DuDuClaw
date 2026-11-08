@@ -556,12 +556,29 @@ pub(crate) fn record_fence_group(home: &Path, label: &str, employee: EmployeeId,
 /// The Personal (H3) or Shared (R4) principal snapshot of §3.2 step 3, from
 /// one users.db read transaction. Never holds a credential value: the
 /// MFA/passkey set is a digest, the Google link is the `sub` only.
+///
+/// F6fa (Personal): `owner_factors` = the owner's factor baseline
+/// (`duduclaw_auth::mfa::owner_factor::FactorBaseline`: strongest kind,
+/// passkey credential ids, TOTP-secret and email-factor-address digests; the
+/// restore proof must use a credential recorded here) and `credential_seq` =
+/// the `credential_changes` high-water `seq` of the same read (Q3 counts only
+/// rows after it, never by wall clock).
 pub(crate) fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinned: &str)
     -> Result<serde_json::Value, LifecycleError> {
     use LifecycleError::Unavailable;
-    use sha2::{Digest, Sha256};
     let mut users = open_store(home, USERS_DB, Access::ReadOnly)?;
     let tx = users.transaction().map_err(|_| Unavailable)?;
+    let value = principal_snapshot_in(&tx, home, label, binding, pinned)?;
+    tx.finish().map_err(|_| Unavailable)?;
+    Ok(value)
+}
+
+/// [`principal_snapshot`] on the caller's users.db connection (the restore
+/// apply reads it inside its users.db write transaction, F6fa item 2).
+pub(crate) fn principal_snapshot_in(tx: &Connection, home: &Path, label: &str, binding: &EmployeeBinding, pinned: &str)
+    -> Result<serde_json::Value, LifecycleError> {
+    use LifecycleError::Unavailable;
+    use sha2::{Digest, Sha256};
     let strings = |sql: &str, key: &str| -> Result<Vec<String>, LifecycleError> {
         let mut statement = tx.prepare(sql).map_err(|_| Unavailable)?;
         let rows = statement.query_map([key], |r| r.get::<_, String>(0)).map_err(|_| Unavailable)?
@@ -593,6 +610,8 @@ pub(crate) fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBin
                 Ok(None) => serde_json::Value::Null,
                 Err(_) => serde_json::json!("unreadable"),
             };
+            let baseline = duduclaw_auth::mfa::owner_factor::FactorBaseline::read(tx, owner).map_err(|_| Unavailable)?;
+            let seq = duduclaw_auth::credential_changes::high_water(tx).map_err(|_| Unavailable)?;
             serde_json::json!({
                 "kind": "personal", "owner_user_id": owner,
                 "credential_epoch": account.as_ref().map(|(epoch, _)| *epoch),
@@ -600,6 +619,8 @@ pub(crate) fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBin
                 "google_sub": google,
                 "factors_digest": hex::encode(factors.finalize()),
                 "notice_address": account.as_ref().map(|(_, email)| email.clone()),
+                "owner_factors": baseline.to_value(),
+                "credential_seq": seq,
             })
         }
         EmployeeBinding::Shared(_) => {
@@ -613,7 +634,6 @@ pub(crate) fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBin
             serde_json::json!({"kind": "shared", "tenant_id": pinned, "members": members})
         }
     };
-    tx.finish().map_err(|_| Unavailable)?;
     Ok(value)
 }
 

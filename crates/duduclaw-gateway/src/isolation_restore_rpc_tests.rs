@@ -238,6 +238,95 @@ fn regrant_requires_admin_step_up_and_audits() {
     assert!(log.contains("isolation.employee_restore_regranted") && log.contains(&f.bob), "{log}");
 }
 
+// ── F6fa ────────────────────────────────────────────────────────────────
+
+/// Review item 1: the tombstone records the owner's factor baseline, and the
+/// production factor check reads it from the caller's own row (by the
+/// server-built purpose). A row tombstoned before F6fa has none: refused
+/// `FACTOR_BASELINE_MISSING`, never the live account's factors.
+#[test]
+fn f6fa_legacy_snapshot_without_factor_ids_refused() {
+    use duduclaw_auth::mfa::owner_factor::FactorBaseline;
+    let f = fixture();
+    let home = f.home();
+    sql(home, USERS_DB, "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'TOTP-ENC',0)", &[&f.alice]);
+    let (_, _root) = tombstoned(&f);
+    let snapshot = super::restore::row(home, 0).principal_snapshot;
+    let recorded = FactorBaseline::from_snapshot(&snapshot).expect("recorded at the tombstone");
+    assert_eq!(recorded.strongest, Some(OwnerFactor::Totp));
+    assert!(recorded.totp.is_some() && recorded.passkeys.is_empty());
+    assert!(!snapshot.to_string().contains("TOTP-ENC"), "a digest, never the stored secret");
+    assert_eq!(rpc::factor_baseline(home, &f.alice, &purpose0()), Ok(recorded));
+    let adopt = format!("adopt:{}:0", employee());
+    assert!(rpc::factor_baseline(home, &f.alice, &adopt).is_ok(), "the adoption purpose names the same row");
+    // Only the caller's own row, only a canonical purpose of it.
+    assert_eq!(rpc::factor_baseline(home, &f.bob, &purpose0()), Err(OwnerFactorError::Denied));
+    for bad in [format!("restore:{}:01", employee()), format!("restore:{}:1", employee()), "restore:x:0".to_owned(),
+        format!("login:{}:0", employee())] {
+        assert_eq!(rpc::factor_baseline(home, &f.alice, &bad), Err(OwnerFactorError::Denied), "{bad}");
+    }
+    // The legacy shape (no `owner_factors`).
+    let mut legacy = snapshot.clone();
+    legacy.as_object_mut().unwrap().remove("owner_factors");
+    sql(home, APPLY_DB, "UPDATE employee_quarantine SET principal_snapshot=?1", &[&legacy.to_string()]);
+    assert_eq!(rpc::factor_baseline(home, &f.alice, &purpose0()), Err(OwnerFactorError::BaselineMissing));
+    let refused = RpcError::Factor(OwnerFactorError::BaselineMissing);
+    assert_eq!(refused.code(), "FACTOR_BASELINE_MISSING");
+    assert!(!refused.message().is_empty());
+}
+
+/// Review item 5: a sole-Admin self-approval notifies the log addresses the
+/// rule read **and** (Personal) the tombstone-time notice address.
+#[test]
+fn f6fa_self_approval_notice_reaches_tombstone_address() {
+    let f = fixture();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let address = super::restore::row(f.home(), 0).principal_snapshot["notice_address"].as_str().unwrap().to_owned();
+    let filed = file(&f, &fx).unwrap();
+    let id = filed["request_id"].as_str().unwrap().to_owned();
+    let log = || vec!["admin-log@example.test".to_owned()];
+    let done = rpc::decide(f.home(), &fx.env(), &f.alice, &id, true, &log).unwrap();
+    assert_eq!(done["self_approved"], true);
+    let recipients: String = Connection::open(f.home().join(APPLY_DB)).unwrap().query_row(
+        "SELECT recipients FROM employee_restore_notices WHERE event='isolation.employee_restore_self_approved'", [], |r| r.get(0)).unwrap();
+    let recipients: Vec<String> = serde_json::from_str(&recipients).unwrap();
+    assert!(recipients.contains(&address) && recipients.contains(&"admin-log@example.test".to_owned()), "{recipients:?}");
+}
+
+fn critical_events(home: &Path, event: &str) -> usize {
+    audit_log(home).lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["event_type"] == event && entry["severity"] == "critical").count()
+}
+
+/// Review item 5: an unreadable eligibility log (no Admin recipients) and an
+/// uncapped security notice that cannot be queued are audited Critical,
+/// never swallowed; a capped notice that cannot be queued is not.
+#[test]
+fn f6fa_notice_failures_audited_critical() {
+    use crate::isolation_restore_wiring::{admin_notice_addresses, queue_or_alert};
+    // No users.db at all: no addresses, one Critical audit naming the event.
+    let empty = crate::fs_safe::private_test_home().unwrap();
+    assert!(admin_notice_addresses(empty.path(), LABEL, "isolation.employee_restored", now()).is_empty());
+    assert_eq!(critical_events(empty.path(), "isolation.employee_restore_notice_recipients_unavailable"), 1);
+    assert!(audit_log(empty.path()).contains("isolation.employee_restored"));
+    // The outbox refuses inserts.
+    let f = fixture();
+    let home = f.home();
+    let (_, _root) = tombstoned(&f);
+    sql(home, APPLY_DB, "CREATE TABLE IF NOT EXISTS employee_restore_notices (seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL, event TEXT NOT NULL, recipients TEXT NOT NULL, details TEXT NOT NULL,
+        capped INTEGER NOT NULL CHECK (capped IN (0, 1)), at INTEGER NOT NULL, delivered_at INTEGER)", &[]);
+    sql(home, APPLY_DB, "CREATE TRIGGER outbox_broken BEFORE INSERT ON employee_restore_notices
+        BEGIN SELECT RAISE(ABORT, 'outbox broken'); END", &[]);
+    let scope = NoticeScope::Owner(f.alice.clone());
+    let to = vec!["admin@example.test".to_owned()];
+    assert!(!queue_or_alert(home, &scope, "isolation.employee_restore_requested", &to, &json!({"label": LABEL}), true, now()));
+    assert_eq!(critical_events(home, "isolation.employee_restore_notice_unqueued"), 0, "capped: logged, not Critical");
+    assert!(!queue_or_alert(home, &scope, "isolation.employee_restored", &to, &json!({"label": LABEL}), false, now()));
+    assert_eq!(critical_events(home, "isolation.employee_restore_notice_unqueued"), 1);
+}
+
 /// M6/S17: every path that takes both stores takes apply.db before
 /// users.db. While another connection holds apply.db's writer lock, the
 /// restore request and approval paths block on apply.db without holding a

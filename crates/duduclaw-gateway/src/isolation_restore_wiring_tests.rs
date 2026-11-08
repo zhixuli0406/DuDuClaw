@@ -37,7 +37,8 @@ fn log_rule_requires_step_up_and_transaction() {
 fn retire_rule_fails_closed() {
     use crate::isolation_retire::{ApprovalRefusal, ApprovalRule as _};
     let (dir, _db) = users();
-    let rule = RetireLogRule { now: unix_now };
+    // A fresh step-up of this call (F6fa: passed, never assumed).
+    let rule = RetireLogRule { now: unix_now, step_up_verified_at: Some(unix_now() as u64) };
     // A fresh, intact log with no accounts: the non-party approver "b" is not
     // an eligible Admin, so F6c2 refuses `APPROVER_NOT_QUALIFIED` (the log
     // itself is readable; coverage only gates the sole-Admin path).

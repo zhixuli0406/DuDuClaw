@@ -28,6 +28,20 @@
 //! account at the lockout threshold is refused even with a correct proof.
 //! Every attempt that reaches the proof check is committed (counter, consumed
 //! challenge, audit `isolation.restore_factor_verified` / `_failed`).
+//!
+//! **Tombstone baseline (F6fa).** "Strongest factor" is the strongest factor
+//! **at the tombstone**, never the live account: the tombstone records a
+//! [`FactorBaseline`] (strongest kind, passkey credential ids, a digest of the
+//! enrolled TOTP secret, a digest of the email-factor address) in
+//! `principal_snapshot.owner_factors`, and every challenge and proof needs a
+//! credential that existed then and is unchanged now (the passkey id is one
+//! of the recorded ids and the ceremony offers only those; the TOTP secret is
+//! the one enrolled then; the email factor is for the same address). A factor
+//! enrolled after the tombstone — even by someone holding the owner's session
+//! and password, whose writes are stamped owner-authenticated — never counts
+//! ([`OwnerFactorError::NotPreexisting`]). A row tombstoned before the
+//! baseline was recorded is refused ([`OwnerFactorError::BaselineMissing`]);
+//! there is no weaker fallback.
 use super::*;
 use serde_json::Value;
 
@@ -61,6 +75,13 @@ pub enum OwnerFactorError {
     /// The email-factor send budget is spent (≤ 5 per hour, ≥ 60 s apart).
     RateLimited,
     Unavailable,
+    /// The row's tombstone snapshot records no factor baseline (tombstoned
+    /// before F6fa, or malformed): the owner cannot be proven, so refused.
+    BaselineMissing,
+    /// The factor the proof needs did not exist at the tombstone, or was
+    /// re-enrolled / changed since (a passkey not recorded then, another TOTP
+    /// secret, another email-factor address), or no factor existed then.
+    NotPreexisting,
 }
 
 impl OwnerFactorError {
@@ -72,7 +93,130 @@ impl OwnerFactorError {
             Self::Failed => "FACTOR_FAILED",
             Self::RateLimited => "FACTOR_RATE_LIMITED",
             Self::Unavailable => "FACTOR_UNAVAILABLE",
+            Self::BaselineMissing => "FACTOR_BASELINE_MISSING",
+            Self::NotPreexisting => "FACTOR_NOT_PREEXISTING",
         }
+    }
+}
+
+/// passkey > TOTP > email.
+fn rank(factor: OwnerFactor) -> u8 {
+    match factor { OwnerFactor::Passkey => 3, OwnerFactor::Totp => 2, OwnerFactor::Email => 1 }
+}
+
+/// Version of [`FactorBaseline::to_value`].
+const BASELINE_VERSION: u64 = 1;
+/// More passkeys than registration allows (20) is malformed.
+const MAX_BASELINE_PASSKEYS: usize = 64;
+
+fn credential_digest(kind: &str, user: &str, value: &str) -> String {
+    token_hash(&format!("duduclaw-owner-factor-v1:{kind}:{}:{user}:{value}", user.len()))
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The identities of an account's second-factor credentials at one moment —
+/// recorded at the tombstone (§3.2 step 3) in
+/// `principal_snapshot.owner_factors`. Never a secret: passkey ids are public
+/// WebAuthn credential ids, the TOTP is a digest of its stored (encrypted)
+/// secret, the email factor a digest of its address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactorBaseline {
+    /// The strongest factor then (`None`: no second factor enrolled).
+    pub strongest: Option<OwnerFactor>,
+    /// `mfa_passkeys.id` of every passkey then, sorted.
+    pub passkeys: Vec<String>,
+    /// Digest of the enrolled TOTP secret (a re-enrolment changes it).
+    pub totp: Option<String>,
+    /// Digest of the email-factor address (only a factor for the account's
+    /// current address counts, as at login).
+    pub email: Option<String>,
+}
+
+impl FactorBaseline {
+    fn implied(&self) -> Option<OwnerFactor> {
+        if !self.passkeys.is_empty() { Some(OwnerFactor::Passkey) }
+        else if self.totp.is_some() { Some(OwnerFactor::Totp) }
+        else if self.email.is_some() { Some(OwnerFactor::Email) }
+        else { None }
+    }
+
+    /// The factor set of `user` now, read on the caller's connection (the
+    /// tombstone reads it inside its users.db snapshot transaction).
+    pub fn read(conn: &Connection, user: &str) -> Result<Self> {
+        let passkeys = {
+            let mut statement = conn.prepare("SELECT id FROM mfa_passkeys WHERE user_id=?1 ORDER BY id").map_err(|e| e.to_string())?;
+            let ids = statement.query_map([user], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
+                .collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+            ids
+        };
+        let totp: Option<String> = conn.query_row("SELECT secret_enc FROM mfa_credentials WHERE user_id=?1", [user], |r| r.get(0))
+            .optional().map_err(|e| e.to_string())?;
+        let email: Option<String> = conn.query_row("SELECT c.email FROM mfa_email_credentials c JOIN users u ON u.id=c.user_id
+            WHERE c.user_id=?1 AND c.email=u.email", [user], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        let mut baseline = Self {
+            strongest: None, passkeys,
+            totp: totp.map(|secret| credential_digest("totp", user, &secret)),
+            email: email.map(|address| credential_digest("email", user, &address)),
+        };
+        baseline.strongest = baseline.implied();
+        Ok(baseline)
+    }
+
+    /// The `principal_snapshot.owner_factors` value.
+    pub fn to_value(&self) -> Value {
+        serde_json::json!({"version": BASELINE_VERSION, "strongest": self.strongest.map(OwnerFactor::as_str),
+            "passkeys": self.passkeys, "totp": self.totp, "email": self.email})
+    }
+
+    /// Strict parse of `snapshot.owner_factors`. `None` for a snapshot
+    /// recorded before F6fa (no factor identities) or any malformed value:
+    /// unknown version or keys, a `strongest` the identities do not imply.
+    pub fn from_snapshot(snapshot: &Value) -> Option<Self> {
+        let value = snapshot.get("owner_factors")?.as_object()?;
+        if value.len() != 5 || value.get("version")?.as_u64()? != BASELINE_VERSION { return None; }
+        let digest = |key: &str| -> Option<Option<String>> {
+            match value.get(key)? {
+                Value::Null => Some(None),
+                Value::String(text) if is_digest(text) => Some(Some(text.clone())),
+                _ => None,
+            }
+        };
+        let ids = value.get("passkeys")?.as_array()?;
+        if ids.len() > MAX_BASELINE_PASSKEYS { return None; }
+        let passkeys = ids.iter().map(|id| id.as_str().filter(|id| !id.is_empty() && id.len() <= 1024).map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        let strongest = match value.get("strongest")? {
+            Value::Null => None,
+            Value::String(name) => Some(OwnerFactor::parse(name)?),
+            _ => return None,
+        };
+        let parsed = Self { strongest, passkeys, totp: digest("totp")?, email: digest("email")? };
+        (parsed.implied() == parsed.strongest).then_some(parsed)
+    }
+
+    /// The factor a proof must use now and, for a passkey, the ids it may
+    /// use: the strongest factor of the baseline, still enrolled exactly as
+    /// then. A passkey: the recorded ids that still exist (none ⇒ refused);
+    /// TOTP: the same secret; email: the same address. Anything else (no
+    /// factor then, removed, re-enrolled, changed) is
+    /// [`OwnerFactorError::NotPreexisting`] — never a newer or weaker one.
+    fn usable(&self, conn: &Connection, user: &str) -> Proof<(OwnerFactor, Vec<String>)> {
+        use OwnerFactorError::NotPreexisting;
+        let required = self.strongest.ok_or(NotPreexisting)?;
+        let live = Self::read(conn, user).map_err(unavailable)?;
+        let same = match required {
+            OwnerFactor::Passkey => {
+                let kept: Vec<String> = self.passkeys.iter().filter(|id| live.passkeys.contains(id)).cloned().collect();
+                if kept.is_empty() { return Err(NotPreexisting); }
+                return Ok((required, kept));
+            }
+            OwnerFactor::Totp => self.totp.is_some() && self.totp == live.totp,
+            OwnerFactor::Email => self.email.is_some() && self.email == live.email,
+        };
+        if same { Ok((required, Vec::new())) } else { Err(NotPreexisting) }
     }
 }
 
@@ -146,8 +290,10 @@ pub enum RestoreChallenge {
     Totp,
 }
 
-/// The strongest enrolled factor of `user` (`None`: none enrolled). The email
-/// factor counts only for the account's current address.
+/// The strongest **live** enrolled factor of `user` (`None`: none enrolled).
+/// The email factor counts only for the account's current address. A
+/// restore proof never uses this (F6fa): it needs the tombstone's
+/// [`FactorBaseline`].
 pub fn strongest_factor(conn: &Connection, user: &str) -> Result<Option<OwnerFactor>> {
     let exists = |sql: &str| -> Result<bool> { conn.query_row(sql, [user], |r| r.get(0)).map_err(|e| e.to_string()) };
     if exists("SELECT EXISTS(SELECT 1 FROM mfa_passkeys WHERE user_id=?1)")? { return Ok(Some(OwnerFactor::Passkey)); }
@@ -221,35 +367,39 @@ fn email_proof(tx: &Connection, user: &str, proof: &RestoreProof<'_>, now: i64) 
         && bool::from(hash.as_bytes().ct_eq(email_code_hash(id, proof.purpose, proof.code).as_bytes()))))
 }
 
-/// Consume the passkey ceremony and verify the assertion (passkey module).
-fn passkey_proof(tx: &Connection, user: &str, proof: &RestoreProof<'_>, origin: &str, now: i64) -> bool {
+/// Consume the passkey ceremony and verify the assertion (passkey module),
+/// accepting only a credential id in `allowed` (the tombstone's).
+fn passkey_proof(tx: &Connection, user: &str, proof: &RestoreProof<'_>, origin: &str, allowed: &[String], now: i64) -> bool {
     match (proof.challenge_id, proof.credential) {
         (Some(id), Some(credential)) =>
-            passkey::purpose_finish(tx, origin, user, proof.purpose, id, credential.clone(), now).is_ok(),
+            passkey::purpose_finish(tx, origin, user, proof.purpose, id, credential.clone(), allowed, now).is_ok(),
         _ => false,
     }
 }
 
 impl UserDb {
     /// `me.isolation.restore_challenge`: issue the proof challenge of the
-    /// owner's strongest factor for `purpose`. `origin` is the
-    /// operator-configured dashboard origin (passkey relying party; `None` ⇒
-    /// a passkey owner is refused unavailable); `email_available` is the
-    /// email-factor sender's availability (checked before any code or send
-    /// budget is spent).
-    pub fn restore_challenge(&self, user: &str, epoch: u64, purpose: &str, origin: Option<&str>, email_available: bool,
-        now: i64) -> Proof<RestoreChallenge> {
+    /// owner's strongest factor **at the tombstone** (`baseline`, from the
+    /// row's snapshot) for `purpose`, only while that credential is still the
+    /// one recorded then (a passkey ceremony offers only the recorded ids).
+    /// `origin` is the operator-configured dashboard origin (passkey relying
+    /// party; `None` ⇒ a passkey owner is refused unavailable);
+    /// `email_available` is the email-factor sender's availability (checked
+    /// before any code or send budget is spent).
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_challenge(&self, user: &str, epoch: u64, purpose: &str, baseline: &FactorBaseline, origin: Option<&str>,
+        email_available: bool, now: i64) -> Proof<RestoreChallenge> {
         use OwnerFactorError::*;
         if user.is_empty() || now <= 0 || !valid_purpose(purpose) { return Err(Denied); }
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
         let account = owner_account(&tx, user, epoch)?;
-        let strongest = strongest_factor(&tx, user).map_err(unavailable)?.ok_or(NoFactor)?;
+        let (strongest, allowed) = baseline.usable(&tx, user)?;
         if locked(lockout(&tx, user)?, now) { return Err(Failed); }
         let issued = match strongest {
             OwnerFactor::Totp => RestoreChallenge::Totp,
             OwnerFactor::Passkey => RestoreChallenge::Passkey(
-                passkey::purpose_begin(&tx, origin.ok_or(Unavailable)?, user, purpose, now).map_err(unavailable)?),
+                passkey::purpose_begin(&tx, origin.ok_or(Unavailable)?, user, purpose, &allowed, now).map_err(unavailable)?),
             OwnerFactor::Email => {
                 if !email_available { return Err(Unavailable); }
                 // The login email factor's send budget.
@@ -281,13 +431,19 @@ impl UserDb {
             params![token_hash(challenge_id), user]).map(|_| ()).map_err(|e| e.to_string())
     }
 
-    /// Verify the owner's strongest factor for one restore step. `epoch` is
-    /// the session's credential epoch, `origin` as for
-    /// [`Self::restore_challenge`]. Every attempt that reaches the proof check
-    /// is committed (counter, consumed challenge, audit), success or not.
+    /// Verify the owner's strongest factor **at the tombstone** (`baseline`,
+    /// from the row's snapshot) for one restore step: the presented factor
+    /// must be that one, and the credential must be the one recorded then
+    /// (F6fa). `epoch` is the session's credential epoch, `origin` as for
+    /// [`Self::restore_challenge`]. A stronger factor than the baseline's was
+    /// enrolled after the tombstone ([`OwnerFactorError::NotPreexisting`]); a
+    /// weaker one is [`OwnerFactorError::NotStrongest`]; both are refused
+    /// before any counter or challenge is touched. Every attempt that reaches
+    /// the proof check is committed (counter, consumed challenge, audit),
+    /// success or not.
     #[allow(clippy::too_many_arguments)]
-    pub fn restore_owner_factor(&self, user: &str, epoch: u64, presented: OwnerFactor, proof: &RestoreProof<'_>,
-        cipher: &dyn MfaCipher, origin: Option<&str>, now: i64) -> Proof<OwnerFactor> {
+    pub fn restore_owner_factor(&self, user: &str, epoch: u64, presented: OwnerFactor, baseline: &FactorBaseline,
+        proof: &RestoreProof<'_>, cipher: &dyn MfaCipher, origin: Option<&str>, now: i64) -> Proof<OwnerFactor> {
         use OwnerFactorError::*;
         if user.is_empty() || proof.code.len() > 64 || now <= 0 || !valid_purpose(proof.purpose)
             || proof.challenge_id.is_some_and(|id| id.is_empty() || id.len() > 128) {
@@ -296,7 +452,8 @@ impl UserDb {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
         owner_account(&tx, user, epoch)?;
-        let strongest = strongest_factor(&tx, user).map_err(unavailable)?.ok_or(NoFactor)?;
+        let (strongest, allowed) = baseline.usable(&tx, user)?;
+        if rank(presented) > rank(strongest) { return Err(NotPreexisting); }
         if presented != strongest { return Err(NotStrongest(strongest)); }
         let verified = match strongest {
             OwnerFactor::Totp => check_factor(&tx, user, proof.code, false, cipher, now).is_ok(),
@@ -304,7 +461,7 @@ impl UserDb {
                 let failures = lockout(&tx, user)?;
                 if locked(failures, now) { false } else {
                     let verified = match strongest {
-                        OwnerFactor::Passkey => passkey_proof(&tx, user, proof, origin.ok_or(Unavailable)?, now),
+                        OwnerFactor::Passkey => passkey_proof(&tx, user, proof, origin.ok_or(Unavailable)?, &allowed, now),
                         _ => email_proof(&tx, user, proof, now)?,
                     };
                     count_attempt(&tx, user, verified, failures, now)?;

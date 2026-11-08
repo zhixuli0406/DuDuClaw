@@ -662,6 +662,200 @@ fn self_approval_row_written_once_in_apply_tx() {
     assert_eq!(self_approval_rows(home, &request.request_id), 0);
 }
 
+// ── F6fa (security fix round, part a) ───────────────────────────────────
+
+/// Review item 2 (L2 race): another employee goes live after the approval
+/// call's outside checks (here: between them and tx1). The apply
+/// transaction recounts under the apply.db writer lock and refuses; the
+/// tree goes back to the quarantine.
+#[test]
+fn f6fa_quota_recounted_in_apply_tx() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let mut fx = fakes(&root);
+    fx.cap = 1;
+    let request = file(&f, &fx).unwrap();
+    let (path, tenant) = (home.to_path_buf(), f.tenant.clone());
+    hook(move |point| {
+        if point == HookPoint::BeforeTx1 {
+            let team = applied(&path, 2, "team", &[("binding_kind", "shared"), ("tenant_id", tenant.as_str())]);
+            save(&path, &team, &receipt(&team, 2, false)).unwrap();
+        }
+        false
+    });
+    let refused = approve(home, &fx.env(), &request.request_id, &f.bob);
+    unhook();
+    assert_eq!(refused.err(), Some(Refusal::QuotaExceeded));
+    assert!(in_quarantine(home), "moved back (never moved)");
+    assert_eq!(row(home, 0).seal, "sealed");
+    let failed = stored(home, &request.request_id);
+    assert_eq!((failed.state.as_str(), failed.failure.as_deref()), ("failed", Some("QUOTA_EXCEEDED")));
+    assert_eq!(read_lifecycle_with(home, LABEL, &Root(vec![root])), Err(Tombstoned));
+    assert_eq!(mirror(home, LABEL), None);
+}
+
+/// Review item 2 (label race): an Employee proposal for the label staged
+/// after the outside checks is seen inside the apply transaction.
+#[test]
+fn f6fa_open_proposal_rechecked_in_apply_tx() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let request = file(&f, &fx).unwrap();
+    let path = home.to_path_buf();
+    hook(move |point| {
+        if point == HookPoint::BeforeTx1 {
+            let mut store = ConfirmationStore::from_connection(Connection::open(path.join(CONFIRMATIONS_DB)).unwrap()).unwrap();
+            let fields = [("employee_id", LABEL), ("disk_bytes", "67108864")].iter()
+                .map(|(name, value)| ProposalField { name: (*name).into(), value: ProposalValue::Text { value: (*value).into() } }).collect();
+            store.stage_proposal(ProposalOperationId { proposal_id: RequestId([8; 16]), revision: 1 }, ConfirmationCategory::Employee,
+                fields, &Accept).unwrap();
+        }
+        false
+    });
+    let refused = approve(home, &fx.env(), &request.request_id, &f.bob);
+    unhook();
+    assert_eq!(refused.err(), Some(Refusal::LabelPending));
+    assert!(in_quarantine(home));
+    assert_eq!(row(home, 0).seal, "sealed");
+    assert_eq!(stored(home, &request.request_id).failure.as_deref(), Some("LABEL_PENDING"));
+}
+
+/// Review item 2 (Q3 race): an Admin resets the owner's password after the
+/// approval call's outside check, while the apply holds apply.db but not
+/// yet users.db. The users.db write transaction of the apply re-runs the
+/// credential check and refuses; nothing of the restore remains.
+#[test]
+fn f6fa_credential_change_rechecked_in_apply_tx() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let request = file(&f, &fx).unwrap();
+    let (path, alice) = (home.to_path_buf(), f.alice.clone());
+    hook(move |point| {
+        if point == HookPoint::AfterMove {
+            sql(&path, USERS_DB, "UPDATE users SET password_hash='reset-by-admin' WHERE id=?1", &[&alice]);
+        }
+        false
+    });
+    let refused = approve(home, &fx.env(), &request.request_id, &f.bob);
+    unhook();
+    assert_eq!(refused.err(), Some(Refusal::CredentialChanged));
+    assert!(in_quarantine(home), "moved back");
+    assert_eq!(row(home, 0).seal, "sealed");
+    assert_eq!(stored(home, &request.request_id).failure.as_deref(), Some("CREDENTIAL_CHANGED"));
+    assert_eq!(mirror(home, LABEL), None);
+    assert_eq!(read_lifecycle_with(home, LABEL, &Root(vec![root])), Err(Tombstoned));
+}
+
+/// Review item 3: each differing snapshot field needs an owner row of a
+/// field that can change it. An owner-stamped password change does not
+/// explain an email change that left no log row (the old check passed any
+/// difference as soon as some owner row existed).
+#[test]
+fn f6fa_q3_maps_each_snapshot_field_to_its_log_fields() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let conn = Connection::open(home.join(USERS_DB)).unwrap();
+    let since = duduclaw_auth::credential_changes::high_water(&conn).unwrap();
+    conn.execute("UPDATE users SET password_hash='owner-changed' WHERE id=?1", [&f.alice]).unwrap();
+    duduclaw_auth::credential_changes::stamp_owner(&conn, since, &f.alice).unwrap();
+    // The owner's own password change alone passes (it explains the epoch).
+    let first = file(&f, &fx).unwrap();
+    close_request(home, &first.request_id, &f.bob, Close::Cancelled, now()).unwrap();
+    // An email change with no log row (trigger removed): not explained.
+    conn.execute_batch("DROP TRIGGER credential_changes_email").unwrap();
+    conn.execute("UPDATE users SET email='other@example.test' WHERE id=?1", [&f.alice]).unwrap();
+    assert_eq!(file(&f, &fx).err(), Some(Refusal::CredentialChanged));
+    assert!(SNAPSHOT_LOG_FIELDS.contains(&("email", &["email"][..])));
+}
+
+/// Review item 3: the log is read after the `credential_seq` recorded at the
+/// tombstone, never by wall clock. A non-owner row written after the
+/// tombstone with a clock set back is still counted; a row from before the
+/// tombstone with a clock set ahead is not.
+#[test]
+fn f6fa_q3_counts_by_seq_not_clock() {
+    let f = fixture();
+    let home = f.home();
+    // Before the tombstone, stamped an hour in the future.
+    let users = Connection::open(home.join(USERS_DB)).unwrap();
+    users.execute("INSERT INTO credential_changes(user_id,field,actor_user_id,owner_authenticated,at) VALUES(?1,'password',NULL,0,?2)",
+        rusqlite::params![f.alice, now() + 3_600]).unwrap();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let q = row(home, 0);
+    let recorded = q.principal_snapshot["credential_seq"].as_i64().unwrap();
+    assert_eq!(recorded, duduclaw_auth::credential_changes::high_water(&users).unwrap(), "seq recorded at the tombstone");
+    let request = file(&f, &fx).unwrap();
+    close_request(home, &request.request_id, &f.bob, Close::Cancelled, now()).unwrap();
+    // After the tombstone, stamped a day before it.
+    users.execute("INSERT INTO credential_changes(user_id,field,actor_user_id,owner_authenticated,at) VALUES(?1,'password',NULL,0,?2)",
+        rusqlite::params![f.alice, q.quarantined_at - 86_400]).unwrap();
+    assert_eq!(file(&f, &fx).err(), Some(Refusal::CredentialChanged));
+}
+
+/// A row tombstoned before F6fa has no `credential_seq` (and no factor
+/// baseline): refused `SNAPSHOT_INCOMPLETE`, never a wall-clock fallback.
+#[test]
+fn f6fa_legacy_snapshot_without_credential_seq_refused() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let mut snapshot = row(home, 0).principal_snapshot;
+    assert!(snapshot["credential_seq"].is_i64());
+    snapshot.as_object_mut().unwrap().remove("credential_seq");
+    sql(home, APPLY_DB, "UPDATE employee_quarantine SET principal_snapshot=?1", &[&snapshot.to_string()]);
+    assert_eq!(file(&f, &fx).err(), Some(Refusal::SnapshotIncomplete));
+    assert_eq!(Refusal::SnapshotIncomplete.code(), "SNAPSHOT_INCOMPLETE");
+}
+
+/// Review item 4: the engine accepts only the three factor names the RPC can
+/// verify; `google_reauth` (no such verifier) is refused.
+#[test]
+fn f6fa_google_reauth_not_an_accepted_factor() {
+    let f = fixture();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    assert!(!PROOF_FACTORS.contains(&"google_reauth"));
+    let proof = OwnerProof { user_id: &f.alice, factor: "google_reauth" };
+    assert_eq!(file_personal_request(f.home(), &fx.env(), EMP, 0, Some(proof)).err(), Some(Refusal::FactorRequired));
+    let proof = OwnerProof { user_id: &f.alice, factor: "totp" };
+    assert!(file_personal_request(f.home(), &fx.env(), EMP, 0, Some(proof)).is_ok());
+}
+
+/// Review item 6 (§3.5 d "re-insert the marker row", verified): the
+/// creation marker only lets a Personal *proposal* adopt a directory it
+/// created while no live row holds the label. A restored employee's label
+/// is held by its live confirmed row (`check_marker` refuses LABEL_TAKEN
+/// before reading any marker) and by the R7 / restore checks, so the restore
+/// writes no marker: re-inserting one would protect nothing and would let a
+/// later proposal flow treat the restored tree as its own.
+#[test]
+fn f6fa_restored_label_protected_without_marker() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let request = file(&f, &fx).unwrap();
+    approve(home, &fx.env(), &request.request_id, &f.bob).unwrap();
+    let db = Connection::open(home.join(APPLY_DB)).unwrap();
+    let table: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='employee_dir_markers')",
+        [], |r| r.get(0)).unwrap();
+    if table {
+        let marked: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM employee_dir_markers WHERE label=?1)", [LABEL], |r| r.get(0)).unwrap();
+        assert!(!marked, "no marker after a restore");
+    }
+    let refused = crate::handlers::employee_dirs::check_marker(&db, home, &home.join("agents"), LABEL, &f.alice).err();
+    assert!(refused.is_some_and(|message| message.contains("已被使用")), "{refused:?}");
+}
+
 #[path = "isolation_restore_recovery_tests.rs"]
 mod recovery;
 /// F6g adoption under a new employee id (same fixture and fakes).

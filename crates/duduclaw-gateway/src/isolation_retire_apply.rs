@@ -6,8 +6,11 @@
 //!   Admin approving the card (S12);
 //! - `stage` / `publish` / `read_back` (item `Applying`): R11 and the rule
 //!   again with the approver from the item's approval record, then
-//!   `Action::Retire` (idempotent). A Retired receipt matching `root_item`
-//!   sets `root_state = retired`;
+//!   `Action::Retire` (idempotent). At `stage` (F6fa) an early-purged row's
+//!   rule is decided once more inside an apply.db IMMEDIATE transaction
+//!   (R11 re-run there; the rule's users.db write transaction inside it, M6)
+//!   for every approval, not only a self-approval, before any root effect.
+//!   A Retired receipt matching `root_item` sets `root_state = retired`;
 //! - `disable_and_read_back`: a ReadBack of the old allocation. Ready ⇒ no
 //!   root effect yet ⇒ `Ok` (and, when the card is being rejected,
 //!   `root_state` back to `allocated`); anything else ⇒ `Err` (forward only,
@@ -81,21 +84,40 @@ impl RetireBackend {
         Ok(Validated { spec, approver, approval, checked })
     }
 
+    /// The stage step's binding decision for an early-purged row (S12,
+    /// F6fa): one apply.db IMMEDIATE transaction re-runs R11, and inside it
+    /// the rule decides again in its own users.db write transaction (the
+    /// sole-Admin row written there), for a self-approval and for another
+    /// Admin's alike. The answer must equal the validation's; the root retire
+    /// runs only after this commits.
+    fn confirm_in_apply_tx(&self, v: &Validated, key: &str, validated: Approval) -> Result<Approval, RetireError> {
+        let mut db = writable_apply(&self.home)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| RetireError::Unavailable)?;
+        check(&tx, v.spec.employee, Expect::Proposal(key))?;
+        let confirmed = self.rule.confirm_at_apply(&self.home, &v.spec.requested_by, &v.approver, v.checked.owner.as_deref(), key)
+            .map_err(RetireError::Approval)?;
+        if confirmed != validated { return Err(RetireError::Stale); }
+        tx.commit().map_err(|_| RetireError::Unavailable)?;
+        Ok(confirmed)
+    }
+
     /// One apply step: `Action::Retire` with the recorded approver.
     pub(crate) fn apply(&self, item: &ConfirmationItem, step: Step) -> Result<(), RetireError> {
         let v = self.validate(item)?;
         let hex = hex::encode(v.spec.employee.0);
         let key = proposal_key(&item.binding);
-        let self_approved = v.approval == Some(Approval::SelfApproved);
+        let staging = step == Step::Stage && !v.checked.retired;
+        // S12: decided again inside the apply transaction before any root
+        // effect (the self-approval row idempotent per proposal); a refusal
+        // refuses the retire.
+        let approval = match (staging, v.approval) {
+            (true, Some(validated)) => Some(self.confirm_in_apply_tx(&v, &key, validated)?),
+            (_, approval) => approval,
+        };
+        let self_approved = approval == Some(Approval::SelfApproved);
         let details = json!({"employee": hex, "proposal_id": key, "requested_by": v.spec.requested_by, "approved_by": v.approver,
             "early": v.spec.early, "self_approved": self_approved, "digest_prefix": v.spec.quarantine_digest_prefix, "uid": v.spec.uid});
-        if step == Step::Stage && !v.checked.retired {
-            // S12: the users.db self-approval row before any root effect
-            // (idempotent per proposal; a failure refuses the retire).
-            if self_approved {
-                self.rule.record_self_approval(&self.home, &v.spec.requested_by, &v.approver, v.checked.owner.as_deref(), &key)
-                    .map_err(RetireError::Approval)?;
-            }
+        if staging {
             audit(&self.home, "isolation.employee_retire_approved", &v.spec.label, false, details.clone());
             if self_approved {
                 audit(&self.home, "isolation.employee_retire_self_approved", &v.spec.label, true, details.clone());

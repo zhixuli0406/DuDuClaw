@@ -98,6 +98,10 @@ pub(crate) enum Refusal {
     NotOwner,
     FactorRequired,
     OwnerIneligible,
+    /// The tombstone snapshot lacks what the owner checks need (F6fa: the
+    /// `credential_changes` high-water `seq`; tombstoned before it was
+    /// recorded). Never falls back to a wall-clock or weaker check.
+    SnapshotIncomplete,
     /// Quarantine not `sealed` (pending, oversize, invalid, absent, …), Q6.
     NotSealed,
     /// Past the 90-day window or the request's own expiry.
@@ -137,6 +141,7 @@ impl Refusal {
             Self::NotOwner => "NOT_OWNER",
             Self::FactorRequired => "FACTOR_REQUIRED",
             Self::OwnerIneligible => "OWNER_INELIGIBLE",
+            Self::SnapshotIncomplete => "SNAPSHOT_INCOMPLETE",
             Self::NotSealed => "NOT_SEALED",
             Self::Expired => "RESTORE_EXPIRED",
             Self::TombstoneIncomplete => "TOMBSTONE_INCOMPLETE",
@@ -413,9 +418,13 @@ pub(crate) fn request_digest(request: &RestoreRequest, quarantine_digest: &str) 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OwnerProof<'a> {
     pub(crate) user_id: &'a str,
-    /// `passkey`, `totp`, `email` or `google_reauth`.
+    /// `passkey`, `totp` or `email` (F6fa: no Google re-auth path exists,
+    /// so it is not accepted; SSO-only owners are refused at the factor step).
     pub(crate) factor: &'a str,
 }
+
+/// The factor names a filed proof may carry.
+pub(crate) const PROOF_FACTORS: [&str; 3] = ["passkey", "totp", "email"];
 
 /// A filed request.
 #[derive(Debug, Clone, PartialEq)]
@@ -431,7 +440,7 @@ pub(crate) fn file_personal_request(home: &Path, env: &RestoreEnv<'_>, employee:
     let proof = proof.ok_or(Refusal::FactorRequired)?;
     // Not-owned rows answer NOT_FOUND (no existence oracle).
     if peek.kind != EmployeeKind::Personal || peek.owner.as_deref() != Some(proof.user_id) { return Err(Refusal::NotFound); }
-    if !matches!(proof.factor, "passkey" | "totp" | "email" | "google_reauth") { return Err(Refusal::FactorRequired); }
+    if !PROOF_FACTORS.contains(&proof.factor) { return Err(Refusal::FactorRequired); }
     recover_label(home, env, &peek.label)?;
     let q = load_fenced(home, env, employee, incarnation)?;
     let routes = check_outside(home, env, &q)?;

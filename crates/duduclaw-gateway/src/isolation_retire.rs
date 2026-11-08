@@ -145,12 +145,15 @@ impl RetireError {
 pub(crate) trait ApprovalRule: Send + Sync {
     /// `owner`: the Personal owner of the purged row (`approver != owner` too).
     fn decide(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>) -> Result<Approval, ApprovalRefusal>;
-    /// S12 sole-Admin retire: F6c2's users.db self-approval audit row for
-    /// `subject` (the proposal id), written in the users.db transaction of a
-    /// decision that allowed the self-approval, at most once per proposal.
-    /// Called by the stage step before the root retire; `Err` refuses it.
-    fn record_self_approval(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>, subject: &str)
-        -> Result<(), ApprovalRefusal>;
+    /// The binding decision of the stage step (S12, F6fa), for **every**
+    /// approval of an early-purged row: decided in a users.db write
+    /// transaction the caller opens while holding its apply.db IMMEDIATE
+    /// transaction (M6), so the Admin count is read with the apply, and — for
+    /// a sole-Admin self-approval — F6c2's users.db audit row for `subject`
+    /// (the proposal id) written there, at most once per proposal. `Err`
+    /// refuses the root retire.
+    fn confirm_at_apply(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>, subject: &str)
+        -> Result<Approval, ApprovalRefusal>;
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Approval {
@@ -170,6 +173,9 @@ pub(crate) enum ApprovalRefusal {
     Cooling,
     /// `ADMIN_LOG_UNAVAILABLE`: unreadable log or under 7 days of coverage.
     LogUnavailable,
+    /// `STEP_UP_REQUIRED`: this call carries no fresh step-up proof (F6fa:
+    /// the rule receives the real freshness, never an assumed one).
+    StepUpRequired,
 }
 impl ApprovalRefusal {
     pub(crate) fn code(self) -> &'static str {
@@ -178,6 +184,7 @@ impl ApprovalRefusal {
             Self::NotQualified => "APPROVER_NOT_QUALIFIED",
             Self::Cooling => "SELF_APPROVAL_COOLING",
             Self::LogUnavailable => "ADMIN_LOG_UNAVAILABLE",
+            Self::StepUpRequired => "STEP_UP_REQUIRED",
         }
     }
     pub(crate) fn message(self) -> &'static str {
@@ -186,6 +193,7 @@ impl ApprovalRefusal {
             Self::NotQualified => "擔任管理員未滿 7 天，或由申請人設為管理員，無法核准",
             Self::Cooling => "7 天內有管理員失去權限，暫時不能自行核准",
             Self::LogUnavailable => "管理員權限紀錄無法讀取，暫時不能自行核准",
+            Self::StepUpRequired => "請先以密碼與雙因素驗證確認身分。",
         }
     }
 }

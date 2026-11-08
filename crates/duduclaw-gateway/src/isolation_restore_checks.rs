@@ -120,20 +120,38 @@ pub(crate) fn ensure_tombstone_finished(home: &Path, q: &Quarantined) -> Result<
     Ok(())
 }
 
-/// Q3: the owner's identity facts compared with the tombstone snapshot. Any
-/// logged change since the tombstone by someone other than the owner, a
-/// difference without a log entry, or a changed Google `sub` (not logged in
-/// users.db) refuses. Owner-authenticated changes by the owner pass.
-fn check_credentials(home: &Path, users: &Connection, q: &Quarantined, owner: &str) -> Result<(), Refusal> {
-    let changes = duduclaw_auth::credential_changes::changes_since(users, owner, q.quarantined_at, MAX_CREDENTIAL_CHANGES)
+/// Q3 (F6fa): each compared snapshot field and the `credential_changes`
+/// fields whose (owner-stamped) rows may explain a difference in it. The
+/// password has no snapshot field: any password row not by the owner refuses
+/// through the log; `credential_epoch` moves with every credential write.
+/// `google_sub` is not logged in users.db, so any change refuses.
+pub(crate) const SNAPSHOT_LOG_FIELDS: [(&str, &[&str]); 3] = [
+    ("email", &["email"]),
+    ("factors_digest", &["totp", "passkey", "email_factor"]),
+    ("credential_epoch", &["password", "email", "totp", "passkey", "email_factor"]),
+];
+
+/// Q3: the owner's identity facts compared with the tombstone snapshot, on
+/// the caller's users.db connection (`users`: the read transaction of a
+/// check, or the restore apply's write transaction). Only log rows after the
+/// `credential_seq` recorded at the tombstone count (by sequence, never wall
+/// clock). Any such row not by the owner (owner-authenticated) refuses; each
+/// differing snapshot field needs at least one owner row of a field that can
+/// change it ([`SNAPSHOT_LOG_FIELDS`]); a changed Google `sub` refuses. A
+/// snapshot without `credential_seq` (tombstoned before F6fa) refuses
+/// `SNAPSHOT_INCOMPLETE` (no wall-clock fallback).
+pub(crate) fn check_credentials(home: &Path, users: &Connection, q: &Quarantined, owner: &str) -> Result<(), Refusal> {
+    let since = q.principal_snapshot["credential_seq"].as_i64().filter(|seq| *seq >= 0).ok_or(Refusal::SnapshotIncomplete)?;
+    let changes = duduclaw_auth::credential_changes::changes_after(users, owner, since, MAX_CREDENTIAL_CHANGES)
         .map_err(unavailable)?;
     if changes.iter().any(|change| !change.by_owner()) { return Err(Refusal::CredentialChanged); }
-    let current = lifecycle::principal_snapshot(home, &q.label, &q.binding()?, &q.tenant).map_err(from_lifecycle)?;
+    let current = lifecycle::principal_snapshot_in(users, home, &q.label, &q.binding()?, &q.tenant).map_err(from_lifecycle)?;
     if current["google_sub"] == json!("unreadable") { return Err(Refusal::Unavailable); }
     if current["google_sub"] != q.principal_snapshot["google_sub"] { return Err(Refusal::CredentialChanged); }
-    let differs = ["credential_epoch", "email", "factors_digest"].iter()
-        .any(|field| current[*field] != q.principal_snapshot[*field]);
-    if differs && changes.is_empty() { return Err(Refusal::CredentialChanged); }
+    for (field, logged) in SNAPSHOT_LOG_FIELDS {
+        if current[field] == q.principal_snapshot[field] { continue; }
+        if !changes.iter().any(|change| logged.contains(&change.field.as_str())) { return Err(Refusal::CredentialChanged); }
+    }
     Ok(())
 }
 
@@ -187,6 +205,26 @@ pub(crate) fn check_target_absent(home: &Path, label: &str) -> Result<(), Refusa
 pub(crate) fn check_quota(home: &Path, cap: usize) -> Result<(), Refusal> {
     if cap == 0 { return Ok(()); }
     let live = lifecycle::confirmed_entries(home, MAX_CONFIRMED).map_err(from_lifecycle)?.iter().filter(|e| !e.disabled).count();
+    if live >= cap { Err(Refusal::QuotaExceeded) } else { Ok(()) }
+}
+
+/// L2 inside the apply transaction (F6fa item 2): the live confirmed
+/// employees counted on the caller's apply.db connection, which holds the
+/// writer lock, so no proposal apply can add one between this count and the
+/// restore's commit.
+pub(crate) fn check_quota_in(db: &Connection, cap: usize) -> Result<(), Refusal> {
+    if cap == 0 { return Ok(()); }
+    let bound = i64::try_from(MAX_CONFIRMED.saturating_add(1)).map_err(unavailable)?;
+    let mut statement = db.prepare("SELECT label,receipt FROM confirmed_employees ORDER BY label LIMIT ?1").map_err(unavailable)?;
+    let rows = statement.query_map([bound], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(unavailable)?
+        .collect::<Result<Vec<_>, _>>().map_err(unavailable)?;
+    if rows.len() > MAX_CONFIRMED { return Err(Refusal::Unavailable); }
+    let mut live = 0usize;
+    for (label, encoded) in rows {
+        let receipt: Receipt = serde_json::from_str(&encoded).map_err(unavailable)?;
+        if receipt.label != label { return Err(Refusal::Unavailable); }
+        if !receipt.disabled { live += 1; }
+    }
     if live >= cap { Err(Refusal::QuotaExceeded) } else { Ok(()) }
 }
 

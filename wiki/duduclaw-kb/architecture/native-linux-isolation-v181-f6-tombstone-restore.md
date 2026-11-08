@@ -142,7 +142,9 @@ every protected-mode employee (accepted only outside protected mode, unchanged t
    `org:<label>` entry (H4). Short tx writes the result. A failed seal never blocks the tombstone; the RPC
    returns the seal state (Q6).
 3. **Principal snapshot.** Personal (H3): `credential_epoch`, email, Google `sub`, MFA/passkey-set
-   digest, notice address. Shared (R4): the pinned `tenant_id` (legacy unpinned rows refuse tombstone,
+   digest, notice address; F6fa adds the owner factor baseline (strongest factor, passkey credential ids,
+   TOTP-secret and email-factor-address digests; Q2 proofs must use a credential recorded here) and the
+   `credential_changes` high-water `seq` (Q3 reads rows after it). Shared (R4): the pinned `tenant_id` (legacy unpinned rows refuse tombstone,
    as `resolve` already refuses them) and `members` = every binding `(user_id, access_level, is_primary)`.
 4. **Stop runs and fence** (H2, S13), after commit and before step 5: ask spawnd to cancel every live run
    of the employee and wait for the confirmed stop (no run record, no unit; bounded wait, then retry with
@@ -296,8 +298,11 @@ that takes both (`save_confirmed_receipt`, tombstone, restore, adoption, recover
       `restore_shared_bindings(home, label, tenant, member_selection)` (§3.9, S11). Both refuse if a mirror or
       binding exists, re-check eligibility, bump `acl_generation` and `policy_epoch` (H1a).
    d. `UPDATE confirmed_employees SET receipt = <disabled=false>, incarnation = incarnation + 1 WHERE
-      label = ? AND receipt = <old> AND incarnation = <old>` (one row); re-insert the marker row (inferred,
-      verify needed); quarantine `restored`, `closed_by_request`; request `done`. Commit.
+      label = ? AND receipt = <old> AND incarnation = <old>` (one row); **no marker row** (verified in
+      F6fa: `employee_dir_markers` only lets a Personal proposal adopt a directory it created while no live
+      row holds the label; the live confirmed row already refuses `LABEL_TAKEN`, and a re-inserted marker
+      would let a later proposal treat the restored tree as its own); quarantine `restored`,
+      `closed_by_request`; request `done`. Commit.
 4. After commit: `read_lifecycle` must return the new incarnation (else alert, fail closed); registry
    scan; cache eviction (L3); audit; notify the owner or members and the approver.
 

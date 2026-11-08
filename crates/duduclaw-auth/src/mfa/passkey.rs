@@ -95,13 +95,20 @@ fn save_ceremony(conn: &Connection, user: &str, purpose: &str, token: &str, sess
 /// The one assertion verifier (login and the F6d restore proof): webauthn-rs
 /// over the server-held ceremony state, user verification required, the
 /// signature counter compared with the LIVE row and persisted on `tx`.
-fn verify_assertion(tx: &Connection, rp: &Webauthn, user: &str, state: &str, credential: Value) -> Result<()> {
+/// `allowed` (restore proof, F6fa): the credential must be one of these
+/// `mfa_passkeys.id` values (the ids recorded at the tombstone), checked
+/// before the counter is touched.
+fn verify_assertion(tx: &Connection, rp: &Webauthn, user: &str, state: &str, credential: Value, allowed: Option<&[String]>)
+    -> Result<()> {
     let state: PasskeyAuthentication = serde_json::from_str(state).map_err(|_|DENIED)?;
     let response: PublicKeyCredential = serde_json::from_value(credential).map_err(|_|DENIED)?;
     let result = rp.finish_passkey_authentication(&response,&state).map_err(|_|DENIED)?;
     if !result.user_verified() { return Err(DENIED.to_string()); }
     // Compare with the live row, not the snapshot captured by begin.
     let mut key = keys(tx,user)?.into_iter().find(|k|k.cred_id()==result.cred_id()).ok_or(DENIED)?;
+    if let Some(allowed) = allowed {
+        if !allowed.contains(&credential_id(&key)?) { return Err(DENIED.into()); }
+    }
     if !counter_valid(counter(&key),result.counter()) { return Err(DENIED.into()); }
     key.update_credential(&result).ok_or(DENIED)?;
     tx.execute("UPDATE mfa_passkeys SET credential=?2 WHERE id=?1 AND user_id=?3",
@@ -114,10 +121,12 @@ fn verify_assertion(tx: &Connection, rp: &Webauthn, user: &str, state: &str, cre
 /// purpose and binding = hash(purpose), no session, the operator-configured
 /// origin and the credential epoch; [`TTL`] seconds; a new one for the same
 /// purpose replaces the old. Returns the WebAuthn request options with
-/// `challenge_id`.
-pub(super) fn purpose_begin(tx: &Connection, origin: &str, user: &str, purpose: &str, now: i64) -> Result<Value> {
+/// `challenge_id`. Only the credentials whose `mfa_passkeys.id` is in
+/// `allowed` (the tombstone's, F6fa) are offered and accepted; none ⇒ refused.
+pub(super) fn purpose_begin(tx: &Connection, origin: &str, user: &str, purpose: &str, allowed: &[String], now: i64) -> Result<Value> {
     let rp = relying_party(origin)?;
-    let keys = keys(tx,user)?;
+    let keys: Vec<Passkey> = keys(tx,user)?.into_iter()
+        .filter(|key| credential_id(key).is_ok_and(|id| allowed.contains(&id))).collect();
     if keys.is_empty() { return Err(DENIED.into()); }
     let (challenge,state) = rp.start_passkey_authentication(&keys).map_err(|_|DENIED)?;
     let id = save_ceremony(tx,user,purpose,purpose,None,origin,"",serde_json::to_string(&state).map_err(|_|DENIED)?,now)?;
@@ -129,9 +138,11 @@ pub(super) fn purpose_begin(tx: &Connection, origin: &str, user: &str, purpose: 
 /// Consume the `purpose` ceremony `id` of `user` (single use: deleted before
 /// the assertion is checked, so a failed proof cannot be retried) and verify
 /// the assertion with [`verify_assertion`]. A ceremony of another purpose,
-/// user, origin or epoch, or an expired one, is never found.
-pub(super) fn purpose_finish(tx: &Connection, origin: &str, user: &str, purpose: &str, id: &str, credential: Value, now: i64)
-    -> Result<()> {
+/// user, origin or epoch, or an expired one, is never found; a credential
+/// outside `allowed` is refused.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn purpose_finish(tx: &Connection, origin: &str, user: &str, purpose: &str, id: &str, credential: Value,
+    allowed: &[String], now: i64) -> Result<()> {
     let rp = relying_party(origin)?;
     // Another account's attempt must not consume the owner's ceremony.
     let owner: Option<String> = tx.query_row("SELECT user_id FROM mfa_passkey_ceremonies WHERE token_hash=?1 AND purpose=?2",
@@ -139,7 +150,7 @@ pub(super) fn purpose_finish(tx: &Connection, origin: &str, user: &str, purpose:
     if owner.as_deref() != Some(user) { return Err(DENIED.into()); }
     let ceremony = take_ceremony(tx,id,purpose,purpose,None,origin,now)?;
     if ceremony.user != user { return Err(DENIED.into()); }
-    verify_assertion(tx,&rp,user,&ceremony.state,credential)
+    verify_assertion(tx,&rp,user,&ceremony.state,credential,Some(allowed))
 }
 
 impl UserDb {
@@ -238,7 +249,7 @@ impl UserDb {
         let ceremony = take_ceremony(&tx,id,"login",token,None,origin,now)?;
         if ceremony.user != user { return Err(DENIED.into()); }
         tx.execute("UPDATE mfa_challenges SET attempts=attempts+1 WHERE token_hash=?1", [token_hash(token)]).map_err(|e|e.to_string())?;
-        if let Err(error) = verify_assertion(&tx,&rp,&user,&ceremony.state,credential) {
+        if let Err(error) = verify_assertion(&tx,&rp,&user,&ceremony.state,credential,None) {
             audit(&tx,&user,"mfa.verification_failed",None)?;
             tx.commit().map_err(|e|e.to_string())?;
             return Err(error);
@@ -351,6 +362,8 @@ pub(crate) mod ceremony_tests {
             let document=EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING,&rng).unwrap();
             Self {key:EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING,document.as_ref(),&rng).unwrap(),id:vec![42;32]}
         }
+        /// A second authenticator with its own credential id (`byte` ≠ 42).
+        pub(crate) fn with_id(byte: u8) -> Self { let mut key=Self::new(); key.id=vec![byte;32]; key }
         fn data(&self, counter:u32, flags:u8)->Vec<u8> {
             let mut value=ring::digest::digest(&ring::digest::SHA256,b"dashboard.example.com").as_ref().to_vec();
             value.push(flags);value.extend_from_slice(&counter.to_be_bytes());value
@@ -382,7 +395,10 @@ pub(crate) mod ceremony_tests {
     /// Register one passkey for `user` (password `password`) through the
     /// real API at `now`; returns the authenticator that holds its key.
     pub(crate) fn register(db: &UserDb, user: &str, password: &str, now: i64) -> Authenticator {
-        let key=Authenticator::new();
+        register_key(db, user, password, now, Authenticator::new())
+    }
+    /// [`register`] with a given authenticator (e.g. [`Authenticator::with_id`]).
+    pub(crate) fn register_key(db: &UserDb, user: &str, password: &str, now: i64, key: Authenticator) -> Authenticator {
         let token=db.mfa_factor_password_challenge(user,password,"session",now).unwrap();
         let start=db.mfa_passkey_register_begin(user,&token,Some("session"),ORIGIN,"Laptop",now,false).unwrap();
         db.mfa_passkey_register_finish(start["ceremony_id"].as_str().unwrap(),&token,Some("session"),ORIGIN,key.registration(&start),now,false,|_,_,_|Ok(())).unwrap();
