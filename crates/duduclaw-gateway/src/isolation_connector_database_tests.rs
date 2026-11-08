@@ -180,6 +180,25 @@ async fn finite_sql_lowers_to_a_single_exact_granted_table_and_keeps_literals_bo
     fixture.live.store(false,Ordering::SeqCst);assert!(fixture.provider.execute(selected,call).await.is_err());
 }
 
+#[test]
+fn pre_connect_fence_refuses_backslash_escape_string_and_dollar_quoting() {
+    for sql in [
+        "SELECT 'a\\'' INTO OUTFILE '/tmp/never-write'",          // MySQL backslash bypass
+        "SELECT 'x\\' FROM customers",
+        "SELECT `a\\` FROM customers",
+        "SELECT E'a\\'' FROM customers", "SELECT E'' FROM customers", // PostgreSQL E'…'
+        "SELECT U&'d\\0061t' FROM customers",
+        "SELECT $$ x $$ FROM customers", "SELECT $q$ x $q$ FROM customers", // dollar quoting
+    ] {
+        assert!(matches!(select_only_before_connect(sql), Err(VerificationError::Invalid)), "{sql}");
+    }
+    for sql in ["SELECT 'it''s' FROM customers", "SELECT 'INTO' FROM customers",
+        "SELECT name FROM customers WHERE name = 'o''brien'", "SELECT \"a\"\"b\" FROM customers",
+        "SELECT e FROM customers", "SELECT u & 1 FROM customers"] {
+        assert!(select_only_before_connect(sql).is_ok(), "{sql}");
+    }
+}
+
 #[tokio::test]
 async fn database_policy_select_only_and_redacted_errors() {
     for employee_scope in [false, true] {
@@ -207,7 +226,27 @@ async fn database_policy_select_only_and_redacted_errors() {
         }
     }
     let fixture = Fixture::new(true);
+    std::fs::remove_file(fixture.home.path().join("demo.sqlite")).unwrap();
+    for sql in [
+        // MySQL backslash escape hides INTO from a ''-only scanner.
+        "SELECT 'a\\'' INTO OUTFILE '/tmp/never-write'",
+        "SELECT \"a\\\"\" INTO OUTFILE '/tmp/never-write'",
+        "SELECT 'a\\\\' FROM customers",
+        // PostgreSQL escape strings and Unicode escapes.
+        "SELECT E'a\\'' FROM customers", "SELECT e'plain' FROM customers",
+        "SELECT U&'d\\0061t' FROM customers",
+        // PostgreSQL dollar quoting.
+        "SELECT $$ x $$ FROM customers", "SELECT $tag$ ' $tag$ INTO x FROM customers",
+        "SELECT $_t1$x$_t1$ FROM customers",
+    ] {
+        let (selected, call) = fixture.call("db_query", json!({"source":"demo","sql":sql}));
+        assert!(matches!(fixture.provider.execute(selected, call).await,
+            Err(VerificationError::Invalid)), "escape form must be refused: {sql}");
+    }
+    let fixture = Fixture::new(true);
     for sql in ["SELECT * FROM customers", "/* ordinary comment */ SELECT * FROM customers",
+        "SELECT 'it''s' FROM customers", "SELECT name FROM customers WHERE name = 'o''brien'",
+        "SELECT \"name\" FROM customers WHERE name <> 'a''b''c'",
         "WITH x AS (SELECT * FROM customers) SELECT * FROM x",
         "SELECT 'DELETE; UPDATE /* not a comment */' FROM customers"] {
         let (selected, call) = fixture.call("db_query", json!({"source":"demo","sql":sql}));

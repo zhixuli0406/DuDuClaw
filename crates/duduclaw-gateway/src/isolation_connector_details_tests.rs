@@ -40,6 +40,10 @@ fn fixture() -> tempfile::TempDir {
 }
 fn catalog(home: &Path) -> Arc<ConnectorCatalog> { Arc::new(ConnectorCatalog::open(home).unwrap()) }
 fn reader(home: &Path) -> CatalogAccountDetails { CatalogAccountDetails::new(home.to_path_buf(), catalog(home)).unwrap() }
+/// Resolve as EMPLOYEE/AGENT, the employee the fixtures provision for.
+fn resolve(details: &CatalogAccountDetails, route: &Route) -> Result<Option<ProvisionedDetail>, VerificationError> {
+    details.detail(route, EMPLOYEE, AGENT).map(DetailLookup::ready)
+}
 fn current(home: &Path, account: &AccountId) -> (Route, Option<AccountDetailRecord>) {
     catalog(home).route_details(account).unwrap().unwrap()
 }
@@ -74,7 +78,7 @@ fn c6_provision_records_details_pinned_to_generation() {
 
     // The production reader resolves it and pins generation, binding and employee.
     let details = reader(home.path());
-    let provisioned = details.detail(&route).unwrap().unwrap();
+    let provisioned = resolve(&details, &route).unwrap().unwrap();
     assert!(matches!(&provisioned.detail, ConnectorAccountDetail::Database { source } if source == "demo"));
     assert_eq!((provisioned.pin.generation(), provisioned.pin.employee(), provisioned.pin.agent()),
         (route.generation, EMPLOYEE, AGENT));
@@ -107,7 +111,7 @@ fn c6_provision_records_details_pinned_to_generation() {
     let (moved, stored) = current(home.path(), &account);
     assert!(moved.active && moved.generation == next && stored.is_none());
     assert_eq!(detail_rows(home.path(), &account), 0);
-    assert!(details.detail(&moved).unwrap().is_none(), "old-generation details never resolve");
+    assert!(resolve(&details, &moved).unwrap().is_none(), "old-generation details never resolve");
     assert_eq!(details.current_pin(&account).unwrap(), None);
 
     // The employee must be one that can use a route of this binding/kind.
@@ -131,7 +135,7 @@ fn c6_relink_invalidates_old_details() {
         Some((&owner, &database("demo"))), &actor()).unwrap();
     let details = reader(home.path());
     let (old_route, _) = current(home.path(), &old);
-    let old_pin = details.detail(&old_route).unwrap().unwrap().pin;
+    let old_pin = resolve(&details, &old_route).unwrap().unwrap().pin;
 
     // Relink: retire the old account, provision the same account again.
     revoke_with(home.path(), &old, &actor(), None).unwrap();
@@ -140,19 +144,19 @@ fn c6_relink_invalidates_old_details() {
     assert_ne!(old, new, "a relink always mints a new id");
 
     // The old account's details are gone for good; a fence pinned to them refuses.
-    assert!(details.detail(&old_route).unwrap().is_none());
+    assert!(resolve(&details, &old_route).unwrap().is_none());
     assert_eq!(details.current_pin(&old).unwrap(), None);
     assert_eq!(detail_rows(home.path(), &old), 0);
     // The new account resolves under its own, newer pin only.
     let (new_route, _) = current(home.path(), &new);
-    let new_pin = details.detail(&new_route).unwrap().unwrap().pin;
+    let new_pin = resolve(&details, &new_route).unwrap().unwrap().pin;
     assert!(new_route.generation > old_route.generation);
     assert_ne!(new_pin, old_pin);
     assert_eq!(details.current_pin(&new).unwrap(), Some(new_pin));
     // Asking with the stale route snapshot for the new id never mixes them.
     let mut stale = new_route.clone();
     stale.generation = old_route.generation;
-    assert_eq!(details.detail(&stale).err(), Some(VerificationError::Unavailable));
+    assert_eq!(resolve(&details, &stale).err(), Some(VerificationError::Unavailable));
 }
 
 #[cfg(unix)]
@@ -202,7 +206,7 @@ fn c6_foreign_website_credential_refused() {
 
     let account = computer(&own).unwrap();
     let (route, _) = current(home.path(), &account);
-    let provisioned = reader(home.path()).detail(&route).unwrap().unwrap();
+    let provisioned = resolve(&reader(home.path()), &route).unwrap().unwrap();
     assert!(matches!(&provisioned.detail, ConnectorAccountDetail::Computer { credential } if *credential == own));
     let audit = audit(home.path());
     assert!(!audit.contains("fixture-password") && !audit.contains("robot"));
@@ -257,13 +261,54 @@ fn c6_channel_token_is_reference_only() {
     // The reader resolves it in memory for the provider build only.
     let details = reader(home.path());
     let (route, _) = current(home.path(), &account);
-    let provisioned = details.detail(&route).unwrap().unwrap();
+    let provisioned = resolve(&details, &route).unwrap().unwrap();
     assert!(matches!(&provisioned.detail, ConnectorAccountDetail::Channel { token: Some(token), scope, .. }
         if token == TOKEN && scope == "123456789"));
     assert!(!format!("{:?}", provisioned.pin).contains(TOKEN), "the pin is secret-free");
 
     // Token removed from the agent: setup required (never another token).
     std::fs::write(home.path().join("agents").join(AGENT).join("agent.toml"), "[capabilities]\ndb_sources=['demo']\n").unwrap();
-    assert!(details.detail(&route).unwrap().is_none());
+    assert!(resolve(&details, &route).unwrap().is_none());
     assert_eq!(refused(attempt(&telegram(ChannelTokenRef::Agent))), DetailError::Unknown);
+}
+
+#[cfg(unix)]
+#[test]
+fn c6_shared_tenant_channel_refuses_home_token() {
+    // The home bot is a home-wide credential; a SharedTenant route may not
+    // borrow it until tenant token sources exist (task E4).
+    let home = fixture();
+    let owner = employee(company());
+    assert_eq!(refused(provision(home.path(), "channel", ConnectorKind::SharedTenant, &company(), "company bot",
+        Some((&owner, &telegram(ChannelTokenRef::Home))), &actor())), DetailError::Foreign);
+    assert_eq!(route_count(home.path()), 0, "nothing registered for a refused reference");
+}
+
+#[cfg(unix)]
+#[test]
+fn c6_foreign_pin_is_decided_before_token_resolution() {
+    let home = fixture();
+    let other_employee = EmployeeId([9; 16]);
+    let catalog = catalog(home.path());
+    // Provisioned for another employee whose agent has no Telegram token.
+    let account = catalog.register_with_details("other bot", "channel", ConnectorKind::Personal, &alice(),
+        &AccountDetailRecord { employee: other_employee, agent: OTHER_AGENT.into(), reference: telegram(ChannelTokenRef::Agent) })
+        .unwrap();
+    let details = CatalogAccountDetails::new(home.path().to_path_buf(), catalog.clone()).unwrap();
+    let (route, _) = current(home.path(), &account);
+    assert!(matches!(details.detail(&route, EMPLOYEE, AGENT), Ok(DetailLookup::Foreign)),
+        "another employee's details are foreign, not a missing token of this employee");
+    assert!(matches!(details.detail(&route, EMPLOYEE, OTHER_AGENT), Ok(DetailLookup::Foreign)));
+    assert!(matches!(details.detail(&route, other_employee, AGENT), Ok(DetailLookup::Foreign)),
+        "a recreated employee under another id is not the pinned one");
+    // Only the pinned employee resolves its (missing) token.
+    assert!(matches!(details.detail(&route, other_employee, OTHER_AGENT), Ok(DetailLookup::Missing)));
+
+    // Pinned to another employee whose agent HAS a token: still foreign, the
+    // token is never resolved into this employee's lookup.
+    let theirs = catalog.register_with_details("their bot", "channel", ConnectorKind::Personal, &alice(),
+        &AccountDetailRecord { employee: other_employee, agent: AGENT.into(), reference: telegram(ChannelTokenRef::Agent) })
+        .unwrap();
+    let (route, _) = current(home.path(), &theirs);
+    assert!(matches!(details.detail(&route, EMPLOYEE, AGENT), Ok(DetailLookup::Foreign)));
 }

@@ -97,10 +97,14 @@ impl GoogleAccountRoutes {
     fn from_lifecycle(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle)
         -> Result<Self, GoogleRoutesError> {
         let routes = catalog.active_routes_for(&lifecycle.binding).map_err(|_| GoogleRoutesError::Unavailable)?;
+        // Shared employees admit only the home route. SharedTenant routes have
+        // no tenant-scoped credential source yet (task E4); until one exists a
+        // tenant route would be served from the home credential, so it is
+        // ignored here and a tenant-only catalog is setup-required.
         let mut routes = routes.into_iter().filter(|route| route.provider == "google" && route.active
             && route.binding == lifecycle.binding && matches!((&lifecycle.binding, route.kind),
                 (EmployeeBinding::Personal(_), ConnectorKind::Personal)
-                | (EmployeeBinding::Shared(_), ConnectorKind::SharedHome | ConnectorKind::SharedTenant)));
+                | (EmployeeBinding::Shared(_), ConnectorKind::SharedHome)));
         let route = routes.next().ok_or(GoogleRoutesError::SetupRequired)?;
         // The sealed source has one account per owner/home. Multiple routes
         // have no trustworthy credential mapping: never choose the first one.

@@ -32,7 +32,7 @@ use std::{path::{Path, PathBuf}, sync::Arc};
 use duduclaw_isolation::{capability::EmployeeBinding, ids::EmployeeId};
 use duduclaw_mcp_boundary::VerificationError;
 use rusqlite::{Connection, OptionalExtension, params};
-use crate::isolation_connector_boot::{ConnectorAccountDetail, ConnectorAccountDetails, DetailPin, ProvisionedDetail};
+use crate::isolation_connector_boot::{ConnectorAccountDetail, ConnectorAccountDetails, DetailLookup, DetailPin, ProvisionedDetail};
 use crate::isolation_connectors::{AccountId, CatalogError, ConnectorCatalog, ConnectorKind, ProductConnectorAccount, Route};
 
 /// Providers whose routes cannot be served without provisioned details.
@@ -47,7 +47,8 @@ pub enum ChannelTokenRef {
     /// whose sender reads the installed home credential. SharedHome only.
     None,
     /// The installed home bot: `config.toml [channels] <channel token field>`.
-    /// Shared (tenant/home) routes only, never a Personal route.
+    /// SharedHome routes only: never a Personal route, and never a
+    /// SharedTenant route until tenant token sources exist (task E4).
     Home,
     /// The employee's own agent bot: `agents/<agent>/agent.toml
     /// [channels.<channel>] bot_token(_enc)` of exactly the pinned agent (no
@@ -336,7 +337,9 @@ fn validate_channel(home: &Path, kind: ConnectorKind, binding: &EmployeeBinding,
     let self_configures = crate::channel_sender::sender_self_configures(channel);
     match token {
         ChannelTokenRef::None if !self_configures || kind != ConnectorKind::SharedHome => return Err(DetailError::Foreign),
-        ChannelTokenRef::Home if kind == ConnectorKind::Personal || self_configures => return Err(DetailError::Foreign),
+        // The home bot is a home-wide credential. Until tenant-scoped token
+        // sources exist (task E4) a SharedTenant route may not borrow it.
+        ChannelTokenRef::Home if kind != ConnectorKind::SharedHome || self_configures => return Err(DetailError::Foreign),
         ChannelTokenRef::Agent if self_configures => return Err(DetailError::Foreign),
         _ => {}
     }
@@ -411,17 +414,22 @@ impl CatalogAccountDetails {
     }
 }
 impl ConnectorAccountDetails for CatalogAccountDetails {
-    fn detail(&self, route: &Route) -> Result<Option<ProvisionedDetail>, VerificationError> {
+    fn detail(&self, route: &Route, employee: EmployeeId, agent: &str) -> Result<DetailLookup, VerificationError> {
         if !needs_details(route.provider) { return Err(VerificationError::Invalid); }
-        let Some((current, record)) = self.current(&route.account)? else { return Ok(None) };
+        let Some((current, record)) = self.current(&route.account)? else { return Ok(DetailLookup::Missing) };
         // The plan's route moved while building: refuse this build (F1 retries).
         if current != *route { return Err(VerificationError::Unavailable); }
+        // Pinned to another employee: not this employee's account. Decided
+        // from the secret-free pin before any token is resolved, so another
+        // employee's bot token is never decrypted here and its missing token
+        // cannot make this employee's provider setup-required.
+        if record.employee != employee || record.agent != agent { return Ok(DetailLookup::Foreign); }
         let detail = match &record.reference {
             DetailReference::Database { source } => ConnectorAccountDetail::Database { source: source.clone() },
             DetailReference::Computer { credential } => ConnectorAccountDetail::Computer { credential: credential.clone() },
             DetailReference::Channel { channel, scope, status_label, token, extra_id } => {
                 let token = match resolve_token(&self.home, &record.agent, channel, *token)? {
-                    TokenOutcome::Missing => return Ok(None),
+                    TokenOutcome::Missing => return Ok(DetailLookup::Missing),
                     TokenOutcome::NoToken => None,
                     TokenOutcome::Token(token) => Some(token),
                 };
@@ -430,7 +438,7 @@ impl ConnectorAccountDetails for CatalogAccountDetails {
             }
         };
         let pin = DetailPin::new(&current, record.employee, record.agent, record.reference);
-        Ok(Some(ProvisionedDetail { detail, pin }))
+        Ok(DetailLookup::Ready(ProvisionedDetail { detail, pin }))
     }
     fn current_pin(&self, account: &AccountId) -> Result<Option<DetailPin>, VerificationError> {
         Ok(self.current(account)?.map(|(route, record)| DetailPin::new(&route, record.employee, record.agent, record.reference)))
