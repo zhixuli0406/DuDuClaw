@@ -514,4 +514,31 @@ mod tests {
         }
         assert_eq!(serde_json::to_value(Event::HelperStopRequested).unwrap(), "helper_stop_requested");
     }
+    #[test]
+    fn hxfix_helper_stop_cancel_requests_share_audit_rate_limit() {
+        // Round 3: `server::send` emits every reply record, including accepted
+        // HelperStop/HelperCancel, on source 0 through the same bounded queue
+        // the worker drains into `AuditLog::write`, whose `AuditBudget` keys on
+        // the source only. A flood of stop/cancel requests is therefore
+        // throttled with the other server events and reported in `suppressed`.
+        use duduclaw_isolation::ipc::HelperCallId;
+        let call = HelperCallId::new([7; 16]).unwrap();
+        let request = |n: u64| Record { at_unix_ms: n,
+            event: if n % 2 == 0 { Event::HelperStopRequested } else { Event::HelperCancelRequested },
+            employee: Some(EmployeeId([1; 16])), run: Some(RunId([2; 16])), suppressed: 0, detail: Some(Detail::HelperCall { call }) };
+        let (queue, receiver) = audit_channel();
+        for n in 0..QUEUE_LENGTH as u64 { assert!(queue.emit(0, request(n))); }
+        // A full queue drops (counted), never blocks the server.
+        assert!(!queue.emit(0, request(QUEUE_LENGTH as u64)));
+        assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // The worker's admission (the default `AuditLog` budget: 60/min/source).
+        let mut budget = AuditBudget::new(60);
+        let admitted = receiver.try_iter().filter(|(source, record)| {
+            assert_eq!(*source, 0);
+            budget.admit(*source, record.at_unix_ms).is_some()
+        }).count();
+        assert_eq!(admitted, 60, "helper stop/cancel events are rate limited like every server event");
+        // The next window's first record carries the suppressed count.
+        assert_eq!(budget.admit(0, 60_000), Some(QUEUE_LENGTH as u64 - 60));
+    }
 }

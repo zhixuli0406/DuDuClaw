@@ -39,6 +39,11 @@ fn hxfix_offline_helper_socket_eperm_and_uncovered_calls_denied() {
         for nr in landlock_uncovered_calls(arch).iter().copied().chain(ipc_namespace_calls(arch)) {
             for filter in [&offline, &egress] { assert_eq!(evaluate(filter, audit, nr, [0; 6]), DENY, "{arch:?} {nr}"); }
         }
+        // Round 3: the chown family (fchownat/fchown everywhere, chown/lchown on x86_64).
+        let chown: &[u32] = match arch { Architecture::X86_64 => &[92, 94, 260, 93], Architecture::Aarch64 => &[54, 55] };
+        for &nr in chown {
+            for filter in [&offline, &egress] { assert_eq!(evaluate(filter, audit, nr, [0; 6]), DENY, "{arch:?} chown {nr}"); }
+        }
         // fd forms and ordinary calls are untouched.
         for nr in [arch.nr(0, 63), arch.nr(1, 64), arch.nr(77, 46), arch.execveat()] {
             assert_eq!(evaluate(&offline, audit, nr, [3, 0, 0, 0, 0, 0]), ALLOW, "{arch:?} {nr}");

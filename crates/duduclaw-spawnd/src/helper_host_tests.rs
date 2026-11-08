@@ -371,6 +371,49 @@ fn hxfix_draining_revokes_run_mcp_channel() {
 }
 
 #[test]
+fn hxfix_close_channel_and_cgroup_failure_revoke_mcp() {
+    // Round 3: MCP revocation no longer depends on the drain being detected.
+    // case 0: launcher EOF (close_channel); 1: a slot's cgroup.events is
+    // unreadable at Start (fail_cgroups); 2: rt-runtime's cgroup.events is
+    // unreadable (treated as draining, fail closed); 3: it is malformed.
+    for case in 0..4 {
+        let pair = crate::channels::RevocablePair::new().unwrap();
+        let (engine, launcher) = fixture();
+        let mut engine = engine.with_mcp_revoker(Some(Arc::new(pair.revoker().unwrap())));
+        let (runtime_end, _gateway_end) = (pair.runtime, pair.gateway);
+        let mut launcher = Some(launcher);
+        match case {
+            0 => { drop(launcher.take()); engine.service(1); }
+            1 => {
+                engine.link.tree.files.remove("hx/fg/cgroup.events");
+                assert_eq!(engine.start(1, plan(1, 3, HelperSlot::Foreground), memfd()).err(),
+                    Some(ErrorCode::HelperCgroupUnavailable));
+            }
+            2 => { engine.link.tree.files.remove(&format!("{RT_RUNTIME}/cgroup.events")); engine.service(1); }
+            _ => { engine.link.tree.files.insert(format!("{RT_RUNTIME}/cgroup.events"), "bogus\n".into()); engine.service(1); }
+        }
+        match case {
+            0 | 1 => assert!(engine.is_closed() && !engine.is_draining(), "case {case}"),
+            _ => {
+                assert!(engine.is_draining() && !engine.is_closed(), "case {case}");
+                assert_eq!(engine.start(2, plan(2, 3, HelperSlot::Foreground), memfd()).err(), Some(ErrorCode::NotReady));
+            }
+        }
+        assert!(!engine.mcp_revoke_failed(), "case {case}");
+        let mut byte = [0u8; 1];
+        assert_eq!(nix::unistd::read(runtime_end.as_raw_fd(), &mut byte).unwrap(), 0, "MCP revoked (case {case})");
+        drop(launcher);
+    }
+    // A revoke that fails on close is reported, so `Core` fences the run.
+    let (engine, launcher) = fixture();
+    let not_a_socket = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+    let mut engine = engine.with_mcp_revoker(Some(Arc::new(crate::channels::ConnectionRevoker::from_fd_for_test(not_a_socket))));
+    drop(launcher);
+    engine.service(1);
+    assert!(engine.is_closed() && engine.mcp_revoke_failed());
+}
+
+#[test]
 fn hxfix_audit_reasons_watchdog_timeout_start_failure_and_close() {
     // (c) the launcher's own timerfd vs spawnd's watchdog.
     let (mut engine, launcher) = fixture();

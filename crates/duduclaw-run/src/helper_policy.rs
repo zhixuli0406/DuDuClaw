@@ -90,10 +90,17 @@ pub fn offline_network_calls(arch: Architecture) -> [u32; 7] {
 /// the helper's Landlock already let it open, and every employee-owned file a
 /// helper can open lies inside one of its RW grants. `utimensat` is refused
 /// in every form, including `futimens` (`utimensat(fd, NULL, …)`).
+///
+/// Round 3: the chown family is not mediated by Landlock on any ABI either:
+/// `chown`, `lchown`, `fchownat` (path forms) and `fchown` (an unprivileged
+/// helper can at most change the group of a file it owns, but there is no
+/// reason any helper needs it, so it is refused with the path forms).
+/// asm-generic has no `chown`/`lchown`.
 pub fn landlock_uncovered_calls(arch: Architecture) -> &'static [u32] {
     match arch {
-        Architecture::X86_64 => &[76, 90, 268, 452, 132, 235, 280, 261, 188, 189, 197, 198, 463, 466],
-        Architecture::Aarch64 => &[45, 53, 452, 88, 5, 6, 14, 15, 463, 466],
+        Architecture::X86_64 => &[76, 90, 268, 452, 132, 235, 280, 261, 188, 189, 197, 198, 463, 466,
+            92, 94, 260, 93],
+        Architecture::Aarch64 => &[45, 53, 452, 88, 5, 6, 14, 15, 463, 466, 54, 55],
     }
 }
 /// Finding 4: IPC-namespace objects (shared with the runtime) that Landlock
@@ -346,6 +353,15 @@ mod tests {
                 Architecture::Aarch64 => [46, 52, 7, 16, 63, 64, 281, 94],
             };
             for nr in keep { assert!(!offline.contains(&nr), "{arch:?} {nr}"); }
+            // Round 3: the chown family (path forms and fchown) is refused for every helper.
+            let chown: &[u32] = match arch {
+                Architecture::X86_64 => &[92 /* chown */, 94 /* lchown */, 260 /* fchownat */, 93 /* fchown */],
+                Architecture::Aarch64 => &[54 /* fchownat */, 55 /* fchown */],
+            };
+            for nr in chown {
+                assert!(offline.contains(nr) && egress.contains(nr), "{arch:?} chown {nr}");
+                assert_eq!(first_refused_helper_call(arch, &profile(&[*nr]), true), Some(*nr));
+            }
             assert_eq!(first_refused_helper_call(arch, &profile(&keep), false), None);
             let socket = offline_network_calls(arch)[0];
             assert_eq!(first_refused_helper_call(arch, &profile(&[socket]), false), Some(socket));
@@ -362,10 +378,11 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         let metadata = vec![libc::SYS_truncate, libc::SYS_chmod, libc::SYS_fchmodat, 452, libc::SYS_utime, libc::SYS_utimes,
             libc::SYS_utimensat, libc::SYS_futimesat, libc::SYS_setxattr, libc::SYS_lsetxattr, libc::SYS_removexattr,
-            libc::SYS_lremovexattr, 463, 466];
+            libc::SYS_lremovexattr, 463, 466, libc::SYS_chown, libc::SYS_lchown, libc::SYS_fchownat, libc::SYS_fchown];
         #[cfg(not(target_arch = "x86_64"))]
         let metadata = vec![libc::SYS_truncate, libc::SYS_fchmodat, 452, libc::SYS_utimensat, libc::SYS_setxattr,
-            libc::SYS_lsetxattr, libc::SYS_removexattr, libc::SYS_lremovexattr, 463, 466];
+            libc::SYS_lsetxattr, libc::SYS_removexattr, libc::SYS_lremovexattr, 463, 466, libc::SYS_fchownat,
+            libc::SYS_fchown];
         assert_eq!(landlock_uncovered_calls(arch), metadata.into_iter().map(|nr| nr as u32).collect::<Vec<_>>().as_slice());
         let ipc = [libc::SYS_shmget, libc::SYS_shmat, libc::SYS_shmctl, libc::SYS_shmdt, libc::SYS_semget, libc::SYS_semop,
             libc::SYS_semctl, libc::SYS_semtimedop, libc::SYS_msgget, libc::SYS_msgsnd, libc::SYS_msgrcv, libc::SYS_msgctl,

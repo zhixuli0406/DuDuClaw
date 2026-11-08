@@ -30,7 +30,10 @@
 //! - [F4] `rt-runtime` `populated 0` after it was populated (or the launcher's
 //!   `Draining`) reports `Draining`; `Start` is refused from then on, and the
 //!   run's MCP connection is revoked (finding 4: no runtime descendant or
-//!   helper-reachable channel keeps MCP after the runtime exited).
+//!   helper-reachable channel keeps MCP after the runtime exited). Round 3:
+//!   an unreadable/malformed `rt-runtime/cgroup.events` counts as draining
+//!   (fail closed), and MCP is also revoked on every channel close and slot
+//!   cgroup failure, so revocation never depends on detecting the drain.
 use std::{os::fd::{AsFd, AsRawFd, OwnedFd}, sync::Arc};
 use duduclaw_isolation::{egress::ProfileId, execution::{RunHandle, RuntimeKind}, ids::Sha256Digest,
     ipc::{ErrorCode, HelperCallId, HelperOutcome, HelperSlot}};
@@ -281,7 +284,11 @@ impl<T: CgroupTree> HelperEngine<T> {
                 .and_then(|events| crate::systemd::cgroup_empty(&events).ok()) {
                 Some(false) => self.runtime_seen = true,
                 Some(true) if self.runtime_seen => self.begin_draining(),
-                _ => {}
+                Some(true) => {}
+                // Round 3: an unreadable or malformed `cgroup.events` means
+                // root can no longer see whether the runtime is alive: treat
+                // it as draining (fail closed), which also revokes MCP.
+                None => self.begin_draining(),
             }
         }
     }
@@ -315,8 +322,16 @@ impl<T: CgroupTree> HelperEngine<T> {
         self.draining = true;
         // Finding 4: channels outside Landlock (abstract unix sockets, SysV
         // IPC) cannot relay MCP once the runtime is gone.
-        if let Some(revoker) = &self.mcp_revoker { self.mcp_revoke_failed |= revoker.revoke().is_err(); }
+        self.revoke_mcp();
         self.events.push(HelperEvent::Draining { run: self.run });
+    }
+    /// Revoke the run's MCP connection (idempotent: `shutdown` of an already
+    /// revoked socket is `ENOTCONN` = Ok). A failure is sticky and makes
+    /// `Core` fence the whole run. Round 3: called on drain, on every channel
+    /// close and on every cgroup failure, so revocation never depends on the
+    /// drain alone being detected.
+    fn revoke_mcp(&mut self) {
+        if let Some(revoker) = &self.mcp_revoker { self.mcp_revoke_failed |= revoker.revoke().is_err(); }
     }
 
     /// End one call root-side: kill + drain the slot, OOM from `memory.events`,
@@ -358,6 +373,9 @@ impl<T: CgroupTree> HelperEngine<T> {
         if self.closed { return; }
         self.closed = true;
         self.channel.close();
+        // Round 3: the launcher (and anything it forked) may outlive our view
+        // of it; no helper-reachable channel keeps MCP after a close.
+        self.revoke_mcp();
         // The launcher sees EOF and exits once idle (HX3b).
         unsafe { libc::shutdown(self.link.control.as_raw_fd(), libc::SHUT_RDWR) };
         self.kill_both_slots();
@@ -369,6 +387,9 @@ impl<T: CgroupTree> HelperEngine<T> {
     /// Slot cgroups failed a write/readback: no more helpers in this run.
     fn fail_cgroups(&mut self, code: ErrorCode) -> ErrorCode {
         let code = if code == ErrorCode::HelperBusy { code } else { ErrorCode::HelperCgroupUnavailable };
+        // Round 3: a slot root cannot confirm empty may hold a helper; revoke
+        // MCP whether or not the channel was already closed.
+        if code == ErrorCode::HelperCgroupUnavailable { self.revoke_mcp(); }
         if code == ErrorCode::HelperCgroupUnavailable && !self.closed {
             self.closed = true;
             self.channel.close();
