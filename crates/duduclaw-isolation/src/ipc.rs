@@ -14,8 +14,13 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// has one collision-checked identity for audit/telemetry and so that parallel
 /// packages coordinate explicitly. Ranges, never reused once assigned:
 /// - `OPCODES_CORE` 0x0001–0x00FF: v1 run lifecycle.
-/// - `OPCODES_WORK` 0x0100–0x01FF: Package H root work broker (D-H1).
+/// - `OPCODES_WORK` 0x0100–0x01FF: Package H root work broker (D-H1) and the
+///   employee-scoped root reads/stops Package H4 added for F6 (tombstone S13,
+///   restore/retire idle check): `stop_employee_runs` 0x0103, `employee_idle` 0x0104.
 /// - `OPCODES_HELPER` 0x0200–0x02FF: HX in-run helpers (D8 revision, option A).
+/// A gateway sends a Package H op only when spawnd's readiness report
+/// advertises `features.work_broker` (an older spawnd decodes an unknown `op`
+/// as a malformed frame and closes the control connection).
 ///   Numbers and names are reserved in `HX_RESERVED_OPS`; HX4 adds the
 ///   variants with exactly those values. Package H must not use this range.
 /// `SpawnRequest::opcode` is an exhaustive match, so a new variant without a
@@ -25,14 +30,17 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub enum Opcode {
     ReserveRun = 0x0001, StartRun = 0x0002, Resize = 0x0003, PtyActivity = 0x0004,
     Cancel = 0x0005, Wait = 0x0006, Status = 0x0007, TakeIo = 0x0008,
-    OpenWorkFile = 0x0101, WorkAnchor = 0x0102,
+    OpenWorkFile = 0x0101, WorkAnchor = 0x0102, StopEmployeeRuns = 0x0103, EmployeeIdle = 0x0104,
 }
 pub const OPCODES_CORE: RangeInclusive<u16> = 0x0001..=0x00ff;
 pub const OPCODES_WORK: RangeInclusive<u16> = 0x0100..=0x01ff;
 pub const OPCODES_HELPER: RangeInclusive<u16> = 0x0200..=0x02ff;
 impl Opcode {
-    pub const ALL: [Self; 10] = [Self::ReserveRun, Self::StartRun, Self::Resize, Self::PtyActivity,
-        Self::Cancel, Self::Wait, Self::Status, Self::TakeIo, Self::OpenWorkFile, Self::WorkAnchor];
+    pub const ALL: [Self; 12] = [Self::ReserveRun, Self::StartRun, Self::Resize, Self::PtyActivity,
+        Self::Cancel, Self::Wait, Self::Status, Self::TakeIo, Self::OpenWorkFile, Self::WorkAnchor,
+        Self::StopEmployeeRuns, Self::EmployeeIdle];
+    /// Package H ops (`OPCODES_WORK`), gated by the `work_broker` feature bit.
+    pub const WORK: [Self; 4] = [Self::OpenWorkFile, Self::WorkAnchor, Self::StopEmployeeRuns, Self::EmployeeIdle];
     pub const fn code(self) -> u16 { self as u16 }
     /// The serde `op` tag of the matching `SpawnRequest` variant.
     pub const fn wire_name(self) -> &'static str {
@@ -41,6 +49,7 @@ impl Opcode {
             Self::PtyActivity => "pty_activity", Self::Cancel => "cancel", Self::Wait => "wait",
             Self::Status => "status", Self::TakeIo => "take_io",
             Self::OpenWorkFile => "open_work_file", Self::WorkAnchor => "work_anchor",
+            Self::StopEmployeeRuns => "stop_employee_runs", Self::EmployeeIdle => "employee_idle",
         }
     }
     pub fn from_code(code: u16) -> Option<Self> { Self::ALL.into_iter().find(|op| op.code() == code) }
@@ -157,6 +166,33 @@ impl WorkAnchorIdentity {
     }
 }
 
+/// Largest `EmployeeRunsStopped` list. While a stop is pending root refuses new
+/// reservations for that employee, so the set is the employee's non-terminal
+/// entries when the stop began (≤ `DEFAULT_QUEUE_LENGTH`); 64 leaves headroom.
+pub const MAX_STOPPED_RUNS: usize = 64;
+
+/// Root liveness readback of one employee (F6 §3.12 step 4, M8). Counts, not
+/// identities; `idle()` only when every count is zero. Root answers an
+/// `Error` instead of a report whenever any source cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmployeeIdleReport {
+    /// Admission entries that are not terminal, open root run records and
+    /// `runs.json` crash-journal records of this employee.
+    pub runs: u16,
+    /// Durable storage leases (attachments) of this employee.
+    pub attachments: u16,
+    /// Processes whose uid or gid fields equal the employee's (any of real,
+    /// effective, saved, filesystem).
+    pub processes: u16,
+    /// `duduclaw-run-*` units mapped to this employee, plus every unit root
+    /// cannot map to any employee (fail closed).
+    pub units: u16,
+}
+impl EmployeeIdleReport {
+    pub fn idle(&self) -> bool { self.runs == 0 && self.attachments == 0 && self.processes == 0 && self.units == 0 }
+}
+
 /// Pair a Package H reply with its request and the number of received fds.
 /// The caller still checks each fd against `FdRole` and the metadata.
 pub fn check_work_reply(request: &SpawnRequest, response: &SpawnResponse, received_fds: usize)
@@ -165,11 +201,17 @@ pub fn check_work_reply(request: &SpawnRequest, response: &SpawnResponse, receiv
     response.validate()?;
     if received_fds != response.fd_plan().len() { return Err(ContractError::InvalidFrame); }
     let paired = match (request, response) {
-        (SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }, SpawnResponse::Error { .. }) => true,
+        (SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }
+            | SpawnRequest::StopEmployeeRuns { .. } | SpawnRequest::EmployeeIdle { .. }, SpawnResponse::Error { .. }) => true,
         (SpawnRequest::OpenWorkFile { run, .. }, SpawnResponse::WorkFile { run: actual, .. }) => run == actual,
         (SpawnRequest::WorkAnchor { employee_id }, SpawnResponse::WorkAnchor { employee_id: actual, .. }) =>
             employee_id == actual,
-        (SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }, _) => false,
+        (SpawnRequest::StopEmployeeRuns { employee_id }, SpawnResponse::EmployeeRunsStopped { employee_id: actual, .. }) =>
+            employee_id == actual,
+        (SpawnRequest::EmployeeIdle { employee_id }, SpawnResponse::EmployeeIdle { employee_id: actual, .. }) =>
+            employee_id == actual,
+        (SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }
+            | SpawnRequest::StopEmployeeRuns { .. } | SpawnRequest::EmployeeIdle { .. }, _) => false,
         _ => return Err(ContractError::InvalidValue("not a work request")),
     };
     if paired { Ok(()) } else { Err(ContractError::InvalidFrame) }
@@ -356,6 +398,20 @@ pub enum SpawnRequest {
     /// work anchor directory (the `employee-work` resource identity). No fds in
     /// either direction. Reply: `WorkAnchor`, or `Error`.
     WorkAnchor { employee_id: EmployeeId },
+    /// Package H4 for F6 (opcode 0x0103; tombstone S13). Root cancels every
+    /// non-terminal run of the employee, whichever gateway connection owns it
+    /// (the same per-run Cancel path), refuses new reservations for it while
+    /// the stop is pending, and waits (bounded, below `CONTROL_TIMEOUT_MS`)
+    /// until each reached a terminal state and the employee reads idle. Reply:
+    /// `EmployeeRunsStopped` (`confirmed = false` after the bounded wait: the
+    /// caller records a pending fence and retries; a retry is idempotent), or
+    /// `Error` (`NotFound` for an employee root never allocated).
+    StopEmployeeRuns { employee_id: EmployeeId },
+    /// Package H4 for F6 (opcode 0x0104; F6c restore precheck, F6l retire):
+    /// root liveness readback, no side effect. Reply: `EmployeeIdle`, or
+    /// `Error` (`NotFound` unknown employee, `IsolationUnavailable` when any
+    /// source is unreadable — never a zero report on uncertainty).
+    EmployeeIdle { employee_id: EmployeeId },
 }
 
 /// Ordered ancillary roles, never OS descriptor numbers (§4 fd matrix).
@@ -372,6 +428,7 @@ impl SpawnRequest {
             Self::Cancel { .. } => Opcode::Cancel, Self::Wait { .. } => Opcode::Wait,
             Self::Status { .. } => Opcode::Status, Self::TakeIo { .. } => Opcode::TakeIo,
             Self::OpenWorkFile { .. } => Opcode::OpenWorkFile, Self::WorkAnchor { .. } => Opcode::WorkAnchor,
+            Self::StopEmployeeRuns { .. } => Opcode::StopEmployeeRuns, Self::EmployeeIdle { .. } => Opcode::EmployeeIdle,
         }
     }
     /// Exact fd order accompanying this message. There are no caller-supplied
@@ -484,6 +541,11 @@ pub enum SpawnResponse {
     WorkFile { run: RunHandle, file: WorkFileMetadata },
     /// Reply to `WorkAnchor`: no fd.
     WorkAnchor { employee_id: EmployeeId, anchor: WorkAnchorIdentity },
+    /// Reply to `StopEmployeeRuns`: the runs root cancelled (or found already
+    /// stopping) and whether every one is terminal and the employee is idle.
+    EmployeeRunsStopped { employee_id: EmployeeId, runs: List<RunHandle, MAX_STOPPED_RUNS>, confirmed: bool },
+    /// Reply to `EmployeeIdle`: no fd.
+    EmployeeIdle { employee_id: EmployeeId, report: EmployeeIdleReport },
 }
 impl SpawnResponse {
     pub fn fd_plan(&self) -> Vec<FdRole> {
@@ -634,7 +696,57 @@ mod tests {
             SpawnRequest::PtyActivity { run: run3() }, SpawnRequest::Cancel { run: run3() },
             SpawnRequest::Wait { run: run3(), caller_run: None }, SpawnRequest::Status { run: run3() },
             SpawnRequest::TakeIo { run: run3() }, open("a.csv"),
-            SpawnRequest::WorkAnchor { employee_id: EmployeeId([1; 16]) }]
+            SpawnRequest::WorkAnchor { employee_id: EmployeeId([1; 16]) },
+            SpawnRequest::StopEmployeeRuns { employee_id: EmployeeId([1; 16]) },
+            SpawnRequest::EmployeeIdle { employee_id: EmployeeId([1; 16]) }]
+    }
+
+    #[test]
+    fn h4_employee_ops_codec_and_pairing() {
+        let employee = EmployeeId([1; 16]);
+        let stop = SpawnRequest::StopEmployeeRuns { employee_id: employee };
+        let idle = SpawnRequest::EmployeeIdle { employee_id: employee };
+        assert_eq!(stop.opcode().code(), 0x0103);
+        assert_eq!(idle.opcode().code(), 0x0104);
+        for request in [stop.clone(), idle.clone()] {
+            assert!(request.fd_plan().unwrap().is_empty());
+            let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: request.clone() };
+            assert_eq!(decode::<SpawnRequest>(&encode(&envelope).unwrap()).unwrap(), envelope);
+            // No caller-chosen run list, uid, deadline or force flag.
+            for forbidden in ["runs", "uid", "deadline_ms", "force", "connection"] {
+                let mut value = serde_json::to_value(&request).unwrap();
+                value[forbidden] = 1.into();
+                assert!(serde_json::from_value::<SpawnRequest>(value).is_err(), "{forbidden}");
+            }
+        }
+        let stopped = SpawnResponse::EmployeeRunsStopped { employee_id: employee,
+            runs: List::new(vec![run3()]).unwrap(), confirmed: true };
+        let report = EmployeeIdleReport { runs: 0, attachments: 0, processes: 0, units: 0 };
+        assert!(report.idle());
+        for busy in [EmployeeIdleReport { runs: 1, ..report }, EmployeeIdleReport { attachments: 1, ..report },
+            EmployeeIdleReport { processes: 1, ..report }, EmployeeIdleReport { units: 1, ..report }] {
+            assert!(!busy.idle());
+        }
+        let idle_reply = SpawnResponse::EmployeeIdle { employee_id: employee, report };
+        for reply in [stopped.clone(), idle_reply.clone()] {
+            assert!(reply.fd_plan().is_empty());
+            let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: reply };
+            assert_eq!(decode::<SpawnResponse>(&encode(&envelope).unwrap()).unwrap(), envelope);
+        }
+        assert_eq!(serde_json::to_value(&stopped).unwrap()["result"], "employee_runs_stopped");
+        assert_eq!(check_work_reply(&stop, &stopped, 0), Ok(()));
+        assert_eq!(check_work_reply(&idle, &idle_reply, 0), Ok(()));
+        assert!(check_work_reply(&stop, &idle_reply, 0).is_err());
+        assert!(check_work_reply(&idle, &stopped, 0).is_err());
+        assert!(check_work_reply(&SpawnRequest::StopEmployeeRuns { employee_id: EmployeeId([2; 16]) }, &stopped, 0).is_err());
+        assert_eq!(check_work_reply(&stop, &SpawnResponse::Error { code: ErrorCode::NotFound }, 0), Ok(()));
+        // The run list is bounded on decode.
+        let mut value = serde_json::to_value(&stopped).unwrap();
+        value["runs"] = serde_json::Value::Array(vec![serde_json::to_value(run3()).unwrap(); MAX_STOPPED_RUNS + 1]);
+        assert!(serde_json::from_value::<SpawnResponse>(value).is_err());
+        let mut value = serde_json::to_value(&idle_reply).unwrap();
+        value["report"]["pids"] = 1.into();
+        assert!(serde_json::from_value::<SpawnResponse>(value).is_err());
     }
 
     #[test]
@@ -791,8 +903,8 @@ mod tests {
             assert!(OPCODES_CORE.contains(&op.code()) || OPCODES_WORK.contains(&op.code())
                 || OPCODES_HELPER.contains(&op.code()), "{op:?} outside every range");
         }
-        assert!(OPCODES_WORK.contains(&Opcode::OpenWorkFile.code()) && OPCODES_WORK.contains(&Opcode::WorkAnchor.code()));
-        for op in Opcode::ALL.into_iter().filter(|op| !matches!(op, Opcode::OpenWorkFile | Opcode::WorkAnchor)) {
+        for op in Opcode::WORK { assert!(OPCODES_WORK.contains(&op.code()), "{op:?}"); }
+        for op in Opcode::ALL.into_iter().filter(|op| !Opcode::WORK.contains(op)) {
             assert!(OPCODES_CORE.contains(&op.code()) || OPCODES_HELPER.contains(&op.code()), "{op:?}");
         }
         // Every request maps to its registry entry, and the registry name is the wire tag.
@@ -816,7 +928,7 @@ mod tests {
             assert!(HX_RESERVED_OPS.iter().any(|r| r.code == op.code()), "unreserved helper opcode {op:?}");
         }
         // Package H claims none of HX's result tags or error-code names.
-        for tag in ["work_file", "work_anchor"] { assert!(!HX_RESERVED_RESULTS.contains(&tag)); }
+        for tag in ["work_file", "work_anchor", "employee_runs_stopped", "employee_idle"] { assert!(!HX_RESERVED_RESULTS.contains(&tag)); }
         for code in [ErrorCode::WorkFileNotFound, ErrorCode::WorkFileRefused, ErrorCode::WorkFileTooLarge,
             ErrorCode::WorkspaceBrokerUnavailable] {
             let name = serde_json::to_value(code).unwrap();

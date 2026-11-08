@@ -1,8 +1,9 @@
 //! Bounded single-owner event loop; no employee program runs in this process.
 use std::{io, os::fd::{AsFd, FromRawFd, OwnedFd}, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
-use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize}, ids::{EmployeeId, RunId},
-    ipc::{self, CleanupReadback, ControlConnectionId, Envelope, ErrorCode, SpawnRequest, SpawnResponse}};
-use crate::{admission::{Coordinator, Host, HostProgress, LaunchPolicy, Limits}, fds::{self, SnapshotAuthority},
+use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize}, ids::{EmployeeId, RequestId, RunId},
+    ipc::{self, CleanupReadback, ControlConnectionId, Envelope, ErrorCode, Opcode, SpawnRequest, SpawnResponse}};
+use crate::{admission::{Coordinator, Host, HostProgress, LaunchPolicy, Limits, Ticket, BROKER_REPLY_MS},
+    audit::{Detail, Event, Record}, fds::{self, SnapshotAuthority},
     readiness::Readiness, transport::{Listener, Seqpacket}, Result};
 
 const MAX_CONNECTIONS: usize = 32;
@@ -63,7 +64,28 @@ pub fn listener(gateway_gid: u32) -> io::Result<Listener> {
     }
 }
 
-struct Client { socket: Seqpacket, id: ControlConnectionId, last_request: u64 }
+/// Audit subject of one request, taken before the message is consumed.
+#[derive(Clone, Copy)]
+struct Subject { op: Opcode, employee: Option<EmployeeId>, run: Option<RunId> }
+impl Subject {
+    fn of(message: &SpawnRequest) -> Self {
+        let (employee, run) = match message {
+            SpawnRequest::OpenWorkFile { run, employee_id, .. } => (Some(*employee_id), Some(run.0)),
+            SpawnRequest::WorkAnchor { employee_id } | SpawnRequest::StopEmployeeRuns { employee_id }
+                | SpawnRequest::EmployeeIdle { employee_id } => (Some(*employee_id), None),
+            _ => (None, None),
+        };
+        Self { op: message.opcode(), employee, run }
+    }
+    fn work(self) -> bool { Opcode::WORK.contains(&self.op) }
+}
+/// H4: a Package H request whose reply waits for root work (lease check,
+/// snapshot copy, stop confirmation). The client gets no other reply until
+/// this one is sent, and it is sent within `BROKER_REPLY_MS`.
+struct Deferred { request_id: RequestId, ticket: Ticket, deadline: u64, subject: Subject }
+struct Client { socket: Seqpacket, id: ControlConnectionId, last_request: u64, deferred: Option<Deferred> }
+enum Dispatched { Now(SpawnResponse, Vec<OwnedFd>), Later(Ticket) }
+enum Reply { Now(Envelope<SpawnResponse>, Vec<OwnedFd>, Subject, Option<Detail>), Later(Deferred) }
 
 /// One monotonic epoch domain for coordinator deadlines and asynchronous host
 /// receipts. Reading wall time independently in a worker can invent activity in
@@ -112,7 +134,7 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
                     socket.set_nonblocking(true)?;
                     let id = ControlConnectionId(random_id()?);
                     if clients.iter().any(|client| client.id == id) { return Err(unavailable()); }
-                    clients.push(Client { socket, id, last_request: now });
+                    clients.push(Client { socket, id, last_request: now, deferred: None });
                 }
                 Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied) => {}
                 Err(error) => return Err(error),
@@ -121,30 +143,26 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
         let mut index = 0;
         while index < clients.len() {
             let client = &mut clients[index];
-            let mut disconnected = now.saturating_sub(client.last_request) >= IDLE_CONNECTION_MS;
-            if !disconnected {
+            let mut disconnected = false;
+            if let Some(deferred) = client.deferred.take() {
+                // A deferred reply is pending: answer it (or keep waiting)
+                // before reading anything else from this connection.
+                client.last_request = now;
+                match finish(&mut coordinator, &deferred, now) {
+                    Some((response, descriptors, detail)) =>
+                        disconnected = send(client, &audit, now, response, descriptors, deferred.subject, detail),
+                    None => client.deferred = Some(deferred),
+                }
+            } else if now.saturating_sub(client.last_request) >= IDLE_CONNECTION_MS {
+                disconnected = true;
+            } else {
                 match client.socket.recv() {
                     Ok(packet) => {
                         client.last_request = now;
-                        let reply = dispatch(&mut coordinator, client.id, packet, snapshots, now);
-                        disconnected = match reply {
-                            Ok((response, descriptors)) => {
-                                use crate::audit::{Event, Record};
-                                let (event, run) = match &response.message {
-                                    SpawnResponse::Reserved { run, .. } => (Event::Reserved, Some(run.0)),
-                                    SpawnResponse::Accepted { run, .. } => (Event::Queued, Some(run.0)),
-                                    SpawnResponse::Error { .. } => (Event::Refused, None),
-                                    _ => (Event::Suppressed, None),
-                                };
-                                if !matches!(event, Event::Suppressed) {
-                                    let _ = audit.emit(0, Record { at_unix_ms: now, event, employee: None, run, suppressed: 0 });
-                                }
-                                let borrowed: Vec<_> = descriptors.iter().map(AsFd::as_fd).collect();
-                                match ipc::encode(&response) {
-                                    Ok(bytes) => client.socket.send(&bytes, &borrowed).is_err(),
-                                    Err(_) => true,
-                                }
-                            }
+                        disconnected = match dispatch(&mut coordinator, client.id, packet, snapshots, now) {
+                            Ok(Reply::Now(response, descriptors, subject, detail)) =>
+                                send(client, &audit, now, response, descriptors, subject, detail),
+                            Ok(Reply::Later(deferred)) => { client.deferred = Some(deferred); false }
                             Err(_) => true,
                         };
                     }
@@ -153,6 +171,7 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
                 }
             }
             if disconnected {
+                if let Some(deferred) = client.deferred.take() { coordinator.abandon_ticket(deferred.ticket); }
                 coordinator.disconnect(client.id, now);
                 clients.swap_remove(index);
             } else { index += 1; }
@@ -161,12 +180,68 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
     }
 }
 
+/// Encode, audit and send one reply. `true` means the connection must close.
+fn send(client: &mut Client, audit: &crate::audit::disk::AuditWorker, now: u64, response: Envelope<SpawnResponse>,
+    descriptors: Vec<OwnedFd>, subject: Subject, detail: Option<Detail>) -> bool {
+    // Exactly the fds the reply's plan names (one for WorkFile, none for an error).
+    if response.message.fd_plan().len() != descriptors.len() { return true; }
+    if let Some(record) = audit_record(now, &response.message, subject, detail) { let _ = audit.emit(0, record); }
+    let borrowed: Vec<_> = descriptors.iter().map(AsFd::as_fd).collect();
+    match ipc::encode(&response) {
+        Ok(bytes) => client.socket.send(&bytes, &borrowed).is_err(),
+        Err(_) => true,
+    }
+}
+
+/// Event-only audit (no path, file name or content ever reaches it).
+fn audit_record(now: u64, message: &SpawnResponse, subject: Subject, detail: Option<Detail>) -> Option<Record> {
+    let record = |event: Event, employee: Option<EmployeeId>, run: Option<RunId>, detail: Option<Detail>|
+        Some(Record { at_unix_ms: now, event, employee, run, suppressed: 0, detail });
+    match message {
+        SpawnResponse::Reserved { run, .. } => record(Event::Reserved, None, Some(run.0), None),
+        SpawnResponse::Accepted { run, .. } => record(Event::Queued, None, Some(run.0), None),
+        SpawnResponse::WorkFile { run, .. } => record(Event::WorkFileOpened, subject.employee, Some(run.0), detail),
+        SpawnResponse::EmployeeRunsStopped { employee_id, runs, confirmed } => record(Event::EmployeeRunsStopped,
+            Some(*employee_id), None, Some(Detail::Stopped { runs: runs.as_slice().len() as u16, confirmed: *confirmed })),
+        SpawnResponse::Error { code } if subject.op == Opcode::OpenWorkFile =>
+            record(Event::WorkFileRefused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
+        SpawnResponse::Error { code } if subject.work() =>
+            record(Event::Refused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
+        SpawnResponse::Error { .. } => record(Event::Refused, None, None, None),
+        _ => None,
+    }
+}
+
+/// Poll a deferred H4 reply. `None` = still pending and within its deadline.
+/// Past the deadline the ticket is abandoned (a late snapshot is dropped by
+/// the host) and the caller gets `workspace_broker_unavailable`.
+fn finish<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut Coordinator<H>, deferred: &Deferred,
+    now: u64) -> Option<(Envelope<SpawnResponse>, Vec<OwnedFd>, Option<Detail>)> {
+    let (message, descriptors, detail) = match coordinator.poll_ticket(deferred.ticket, now) {
+        Ok(Some(outcome)) => {
+            let descriptors: Vec<OwnedFd> = outcome.file.map(OwnedFd::from).into_iter().collect();
+            (outcome.response, descriptors, outcome.detail)
+        }
+        Ok(None) if now < deferred.deadline => return None,
+        Ok(None) => {
+            coordinator.abandon_ticket(deferred.ticket);
+            (SpawnResponse::Error { code: ErrorCode::WorkspaceBrokerUnavailable }, vec![], None)
+        }
+        Err(code) => {
+            coordinator.abandon_ticket(deferred.ticket);
+            (SpawnResponse::Error { code }, vec![], None)
+        }
+    };
+    Some((Envelope { version: ipc::PROTOCOL_VERSION, request_id: deferred.request_id, message }, descriptors, detail))
+}
+
 fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut Coordinator<H>,
     connection: ControlConnectionId, packet: crate::transport::Packet, snapshots: SnapshotAuthority,
-    now: u64) -> io::Result<(Envelope<SpawnResponse>, Vec<OwnedFd>)> {
+    now: u64) -> io::Result<Reply> {
     let frame = ipc::decode::<SpawnRequest>(&packet.bytes).map_err(|_| unavailable())?;
     let request_id = frame.request_id;
-    let result = (|| -> Result<(SpawnResponse, Vec<OwnedFd>)> {
+    let subject = Subject::of(&frame.message);
+    let result = (|| -> Result<Dispatched> {
         fds::validate_start(&frame.message, &packet.fds, snapshots).map_err(|_| ErrorCode::InvalidFds)?;
         let response = match frame.message {
             SpawnRequest::ReserveRun { employee_id } => coordinator.reserve(connection, employee_id,
@@ -183,17 +258,31 @@ fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut
                     let _ = coordinator.cancel(run, connection, now);
                     return Err(ErrorCode::InvalidFds);
                 }
-                return Ok((SpawnResponse::Io { run, delivery }, descriptors));
+                return Ok(Dispatched::Now(SpawnResponse::Io { run, delivery }, descriptors));
             }
-            // Package H (D-H1) ops: protocol only (H1). The root work broker and
-            // anchor land in H2/H3 and are wired in H4; until then fail closed.
-            SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. } =>
-                return Err(ErrorCode::WorkspaceBrokerUnavailable),
+            // Package H (H4). The gateway connection is authenticated by the
+            // listener (SO_PEERCRED gateway uid/gid) like every other op; the
+            // coordinator checks run ownership/state, the host the rest. All
+            // four answer asynchronously within BROKER_REPLY_MS.
+            SpawnRequest::OpenWorkFile { run, employee_id, path, .. } =>
+                return Ok(Dispatched::Later(coordinator.open_work_file(connection, run, employee_id, path, now)?)),
+            SpawnRequest::WorkAnchor { employee_id } =>
+                return Ok(Dispatched::Later(coordinator.work_anchor(employee_id, now)?)),
+            SpawnRequest::StopEmployeeRuns { employee_id } =>
+                return Ok(Dispatched::Later(coordinator.stop_employee_runs(employee_id, now)?)),
+            SpawnRequest::EmployeeIdle { employee_id } =>
+                return Ok(Dispatched::Later(coordinator.employee_idle(employee_id, now)?)),
         };
-        Ok((response, vec![]))
+        Ok(Dispatched::Now(response, vec![]))
     })();
-    let (message, descriptors) = result.unwrap_or_else(|code| (SpawnResponse::Error { code }, vec![]));
-    Ok((Envelope { version: ipc::PROTOCOL_VERSION, request_id, message }, descriptors))
+    Ok(match result {
+        Ok(Dispatched::Now(message, descriptors)) =>
+            Reply::Now(Envelope { version: ipc::PROTOCOL_VERSION, request_id, message }, descriptors, subject, None),
+        Ok(Dispatched::Later(ticket)) => Reply::Later(Deferred { request_id, ticket,
+            deadline: now.saturating_add(BROKER_REPLY_MS), subject }),
+        Err(code) => Reply::Now(Envelope { version: ipc::PROTOCOL_VERSION, request_id,
+            message: SpawnResponse::Error { code } }, vec![], subject, None),
+    })
 }
 
 /// Explicit B2/C/H composition seam. Production cannot set this to ready with a

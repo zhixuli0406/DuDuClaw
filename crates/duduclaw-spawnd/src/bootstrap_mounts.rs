@@ -161,6 +161,16 @@ pub fn prepare_helpers(anchors: &RootPublicationAnchors, helpers: &[&crate::poli
 /// Resolve only a reviewed workspace selector under the just-attached H work
 /// filesystem. The fd remains pinned across open_tree; no gateway host path or
 /// supplied mount descriptor is trusted. The selected cwd becomes /work.
+/// H4 (H2 note): root-held, read-only detached clone of the run's WHOLE H
+/// work tree, taken BEFORE `select_workspace` narrows `storage.work` (so
+/// `.forks` is really the fork area beneath it). Never handed to the
+/// trampoline or the gateway; the broker resolves beneath it with
+/// `RESOLVE_BENEATH|NO_XDEV`. It pins the employee filesystem, so the host
+/// drops it (and waits for in-flight copies) before `Storage::detach`.
+pub fn work_broker_root(storage: &AttachedStorage) -> io::Result<OwnedFd> {
+    if unsafe { libc::geteuid() } != 0 { return Err(io::ErrorKind::PermissionDenied.into()); }
+    detached_clone(storage.work.as_fd(), MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC)
+}
 pub fn select_workspace(storage: &mut AttachedStorage, selection: &duduclaw_isolation::ipc::WorkspaceSelection,
     uid: u32) -> io::Result<()> {
     let fd = workspace_directory(storage.work.as_fd(), &storage.receipt, selection, uid)?;
