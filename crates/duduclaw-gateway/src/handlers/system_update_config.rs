@@ -418,6 +418,86 @@ impl MethodHandler {
             }
         }
 
+        // ── RM-039 [memory_privacy] (automatic-memory topic exclusions) ──
+        // `{"memory_privacy": {"excluded_categories": [...], "custom_keywords":
+        // {...}}}`. Each key given replaces that key; a key left out keeps its
+        // current value (so toggling categories never wipes custom keywords).
+        // Validated with the same rules as the raw editor (unknown category ⇒
+        // refused). Read per write by every automatic memory writer, so it
+        // applies on the next turn — no restart.
+        if let Some(v) = params.get("memory_privacy") {
+            let Some(obj) = v.as_object() else {
+                return WsFrame::error_response("", "[memory_privacy] 必須是物件");
+            };
+            if let Some(k) = obj
+                .keys()
+                .find(|k| !matches!(k.as_str(), "excluded_categories" | "custom_keywords"))
+            {
+                return WsFrame::error_response("", &format!("[memory_privacy] 不支援的欄位：{k}"));
+            }
+            // Current section as written. When it does not parse, a partial
+            // update would have to invent the keys it was not given — starting
+            // from defaults would silently wipe the administrator's
+            // custom_keywords — so it is refused. A request that supplies both
+            // keys replaces the whole section and repairs it.
+            let full_replace =
+                obj.contains_key("excluded_categories") && obj.contains_key("custom_keywords");
+            let mut cfg = match crate::memory_privacy::MemoryPrivacyConfig::from_table(&table) {
+                Ok(c) => c,
+                Err(_) if full_replace => crate::memory_privacy::MemoryPrivacyConfig::default(),
+                Err(e) => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "[memory_privacy] 目前的設定無法解析，為避免清除自訂關鍵字，未儲存這次變更。請先在 config.toml 修正此區段（{e}）"
+                        ),
+                    )
+                }
+            };
+            if let Some(ex) = obj.get("excluded_categories") {
+                match serde_json::from_value::<Vec<String>>(ex.clone()) {
+                    Ok(list) => cfg.excluded_categories = list,
+                    Err(_) => {
+                        return WsFrame::error_response(
+                            "",
+                            "[memory_privacy] excluded_categories 必須是字串陣列",
+                        )
+                    }
+                }
+            }
+            if let Some(ck) = obj.get("custom_keywords") {
+                match serde_json::from_value::<std::collections::BTreeMap<String, Vec<String>>>(
+                    ck.clone(),
+                ) {
+                    Ok(map) => cfg.custom_keywords = map,
+                    Err(_) => {
+                        return WsFrame::error_response(
+                            "",
+                            "[memory_privacy] custom_keywords 必須是「類別 → 字串陣列」的物件",
+                        )
+                    }
+                }
+            }
+            if let Err(e) = cfg.validate() {
+                return WsFrame::error_response("", &format!("[memory_privacy] {e}"));
+            }
+            match toml::Value::try_from(&cfg) {
+                Ok(section) => {
+                    table.insert(crate::memory_privacy::SECTION.into(), section);
+                    changes.push(format!(
+                        "memory_privacy.excluded_categories = [{}]",
+                        cfg.excluded_categories.join(", ")
+                    ));
+                }
+                Err(e) => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("[memory_privacy] 無法寫入設定：{e}"),
+                    )
+                }
+            }
+        }
+
         // ── S20 [miniapp] enabled (Telegram Mini App approval screen) ──
         // Until 2026-09 `[miniapp] enabled` had no dashboard surface at all, so
         // the feature was only reachable by hand-editing `config.toml`. The
@@ -1179,5 +1259,39 @@ impl MethodHandler {
                 "restart_required": restart_required,
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod memory_privacy_toggle_tests {
+    use super::*;
+
+    /// A category toggle on top of an unparsable `[memory_privacy]` section
+    /// used to start from defaults and silently drop `custom_keywords`.
+    #[tokio::test]
+    async fn toggle_on_an_unparsable_section_is_refused_and_keeps_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let original = "[memory_privacy]\nexcluded_categories = [\"religion\"]\n\n\
+                        [memory_privacy.custom_keywords]\nhealth = [\"復健\"]\n";
+        std::fs::write(home.path().join("config.toml"), original).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle_system_update_config(
+                json!({ "memory_privacy": { "excluded_categories": ["health"] } }),
+                &UserContext::admin_fallback(),
+            )
+            .await;
+        match &frame {
+            WsFrame::Response { ok: false, error: Some(e), .. } => {
+                let e = e.as_str().unwrap_or_default();
+                assert!(e.contains("memory_privacy") && e.contains("自訂關鍵字"), "{e}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            original,
+            "custom_keywords survive"
+        );
     }
 }

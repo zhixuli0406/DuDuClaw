@@ -6066,6 +6066,54 @@ export interface UserInviteResult {
 }
 export type UserInviteState = 'none' | 'pending' | 'expired' | 'used';
 
+// ── RM-039 memory privacy ───────────────────────────────────
+/** Built-in categories (all excluded by default); custom ones are lowercase identifiers. */
+export type BuiltinMemoryPrivacyCategory = 'health' | 'family' | 'personal_finance' | 'salary';
+
+/** `system.config` → `memory_privacy`. */
+export interface MemoryPrivacySettings {
+  excluded_categories: string[];
+  /** Extra keywords per category; a non-built-in key defines a custom category. */
+  custom_keywords: Record<string, string[]>;
+  builtin_categories: BuiltinMemoryPrivacyCategory[];
+  /** 'defaults' = no section; 'failed_closed' = config unreadable/invalid, defaults enforced. */
+  load_state: 'defaults' | 'configured' | 'failed_closed';
+}
+
+/** `system.update_config { memory_privacy }` — each key given replaces that key; an omitted key keeps its current value. */
+export interface MemoryPrivacyUpdate {
+  excluded_categories?: string[];
+  custom_keywords?: Record<string, string[]>;
+}
+
+export type MyMemorySourceKind = 'conversation' | 'profile' | 'explicit' | 'footprint' | 'reflexion' | 'other';
+
+/** One `me.memory.list` row — a fact whose subject is the caller. */
+export interface MyMemoryItem {
+  id: string;
+  /** AI employee (namespace) that remembers it. */
+  agent: string;
+  /** Human-readable rendering of the fact. */
+  text: string;
+  /** RFC 3339. */
+  created_at: string;
+  source_kind: MyMemorySourceKind;
+  /** True when the staff member explicitly asked for it to be remembered. */
+  explicit: boolean;
+}
+
+export interface MyMemoryListResult {
+  items: MyMemoryItem[];
+  /** Opaque; pass back as `cursor` for the next page. `null` = last page. */
+  next_cursor: string | null;
+}
+
+export interface MyMemoryForgetResult {
+  forgotten: true;
+  id: string;
+  agent: string;
+}
+
 export interface PersonalGoogleStatus {
   chat_read?: boolean;
   connection: { owner_id: string; account_email: string; granted_scopes: string[]; local_purposes?: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
@@ -7642,6 +7690,9 @@ export const api = {
         // Structured [memory] novelty_gate for the memory-dedup-gate toggle
         // (absent ⇒ true, matching the gateway's fail-closed default).
         novelty_gate_enabled?: boolean;
+        // RM-039 structured [memory_privacy] (effective config; an invalid
+        // or unreadable one reports the defaults with load_state 'failed_closed').
+        memory_privacy?: MemoryPrivacySettings;
         // Structured [miniapp] enabled for the Telegram Mini App toggle (S20;
         // absent ⇒ false, matching `miniapp::enabled`'s opt-in default).
         miniapp_enabled?: boolean;
@@ -7659,6 +7710,9 @@ export const api = {
       client.call('transcription_credentials.clear', {}) as Promise<{ success: boolean }>,
     updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[]; /** v1.68: keys that only apply after a gateway restart. */ restart_required?: string[] }>,
+    /** RM-039: replace `[memory_privacy]` (validated server-side; unknown categories are refused). */
+    updateMemoryPrivacy: (settings: MemoryPrivacyUpdate) =>
+      client.call('system.update_config', { memory_privacy: settings }) as Promise<{ success: boolean; changes: string[] }>,
     checkUpdate: () =>
       client.call('system.check_update') as Promise<{
         available: boolean;
@@ -8224,6 +8278,16 @@ export const api = {
     consent: (agentId: string, allowed: boolean) => client.call('me.google.consents.set', { agent_id: agentId, allowed, confirm_shared_access: allowed }),
     primaryOwner: (agentId: string, userId: string) => client.call('agents.primary_owner_set', { agent_id: agentId, user_id: userId }),
     disconnectUser: (userId: string) => client.call('users.google_disconnect', { user_id: userId, confirm: true }).then(notifyDisconnectForget),
+  },
+  /** RM-039 "my memory": what AI employees automatically remember about the caller. */
+  myMemory: {
+    list: (params: { cursor?: string | null; limit?: number } = {}) =>
+      client.call('me.memory.list', {
+        ...(params.cursor ? { cursor: params.cursor } : {}),
+        ...(params.limit !== undefined ? { limit: params.limit } : {}),
+      }) as Promise<MyMemoryListResult>,
+    forget: (id: string) =>
+      client.call('me.memory.forget', { id }) as Promise<MyMemoryForgetResult>,
   },
   mcp: {
     list: () =>

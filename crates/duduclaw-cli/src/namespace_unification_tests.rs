@@ -272,3 +272,43 @@ async fn dashboard_forget_deletes_a_tool_written_row() {
     let read = h::handle_memory_read(&json!({ "id": id }), &mem, &ns).await;
     assert!(is_error(&read), "forgotten row is gone from the tool too");
 }
+
+/// RM-039: when a staff member explicitly asks to remember something, it is
+/// stored even in a default-excluded category, and tagged `explicit`; the
+/// automatic distiller drops the same topic.
+#[tokio::test]
+async fn explicit_remember_is_exempt_from_privacy_categories() {
+    let home = home_with(&["agnes"]);
+    let ns = employee_ns(home.path(), "agnes");
+    let mem = engine(home.path());
+    let quota = crate::mcp_memory_quota::DailyQuota::new();
+
+    let stored = h::handle_memory_store(
+        &json!({ "content": "我下週三要住院開刀，請幫我記住要請病假" }),
+        &mem,
+        &ns,
+        &quota,
+    )
+    .await;
+    assert!(!is_error(&stored), "{stored}");
+    let id = stored["memory_id"].as_str().unwrap().to_string();
+    let row = mem.subject_fact_by_id(&id).await.unwrap().expect("stored");
+    assert!(row.content.contains("住院"));
+    assert_eq!(row.metadata["explicit"], true, "{:?}", row.metadata);
+
+    let rec = h::handle_user_profile_record(
+        &json!({ "user_id": USER, "predicate": "prefers", "value": "週末陪老婆小孩" }),
+        &mem,
+        &ns,
+    )
+    .await;
+    assert!(!is_error(&rec), "{rec}");
+    assert_eq!(profile_value(&mem, &ns, "prefers").await.as_deref(), Some("週末陪老婆小孩"));
+
+    // The same topic said in conversation is not distilled.
+    distill(home.path(), "agnes", "我不喜歡在老婆生日加班").await;
+    assert_ne!(
+        profile_value(&mem, &ns, "dislikes").await.as_deref(),
+        Some("在老婆生日加班")
+    );
+}

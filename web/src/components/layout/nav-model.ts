@@ -425,6 +425,11 @@ export const navGroups: NavGroup[] = [
       // RM-064: own read-only status credentials. Both editions (the Personal
       // owner connects their own Odoo card too); the admin switch gates use.
       { to: '/me/external-access', icon: Share2, label: 'nav.externalAccess', desc: 'nav.externalAccess.desc', ownScope: true, newIn: '1.81.0' },
+      // 我的記憶 (RM-039, 1.81.0) — what AI employees remember about the viewer,
+      // with delete. Lives in the 設定 group, which Personal also renders
+      // (`navGroupsForEdition` → `navGroups[2]`), so both editions get it from
+      // this one declaration; the employee sidebar reaches it via the account menu.
+      { to: '/me/memory', icon: Brain, label: 'nav.myMemory', desc: 'nav.myMemory.desc', ownScope: true, newIn: '1.81.0' },
       { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
       { to: '/app/system/settings/company', icon: Building2, label: 'companyInfo.title', desc: 'companyInfo.description', minRole: 'admin', newIn: '1.80.0' },

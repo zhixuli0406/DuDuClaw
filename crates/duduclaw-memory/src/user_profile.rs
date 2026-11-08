@@ -141,6 +141,29 @@ pub async fn record_trait_outcome(
         .await
 }
 
+/// [`record_trait_outcome`] for a trait the person **explicitly** asked to be
+/// remembered (MCP `user_profile_record`): the row's metadata carries
+/// `{"explicit": true}` so the "my memory" view can tell it apart from a
+/// distilled trait (both share the `user_profile` origin class).
+#[allow(clippy::too_many_arguments)]
+pub async fn record_explicit_trait_outcome(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+    predicate: &str,
+    value: &str,
+    origin: &str,
+    origin_trust: f64,
+    provenance: crate::lineage::Provenance,
+) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
+    let (entry, mut meta) =
+        trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
+    meta.metadata = Some(serde_json::json!({ "explicit": true }));
+    engine
+        .store_temporal_outcome(agent_id, entry, meta, provenance)
+        .await
+}
+
 /// Hold a refused trait inert for human review
 /// ([`SqliteMemoryEngine::hold_refused_claim`]). Returns the held row id.
 #[allow(clippy::too_many_arguments)]

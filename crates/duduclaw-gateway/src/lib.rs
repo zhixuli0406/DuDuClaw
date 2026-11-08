@@ -276,6 +276,7 @@ pub mod memory_forget_apply;
 pub mod disconnect_forget;
 pub mod memory_forget_steps;
 pub mod memory_migrate;
+pub mod memory_privacy;
 pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;

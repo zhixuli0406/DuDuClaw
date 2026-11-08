@@ -4273,6 +4273,14 @@ impl SqliteMemoryEngine {
                  ON memories(agent_id, valid_until);",
         )
         .map_err(|e| DuDuClawError::Memory(format!("temporal index: {e}")))?;
+        // RM-039 「我的記憶」: rows about a person across every namespace,
+        // newest first with a `(timestamp, id)` keyset cursor
+        // (`list_current_by_subjects`). Without it every page is a full scan.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_subject_ts
+                 ON memories(subject, timestamp DESC, id DESC);",
+        )
+        .map_err(|e| DuDuClawError::Memory(format!("subject index: {e}")))?;
 
         // ── D3.2 entity alias table ──────────────────────────────────────────
         // Maps a surface form (`alias`) to a canonical entity string per agent,
@@ -5004,6 +5012,9 @@ mod namespace_migration;
 pub use namespace_migration::{MigrationDisposition, NamespaceRow, OnRefused};
 
 pub mod forget_source;
+
+pub mod subject_listing;
+pub use subject_listing::{SubjectFact, SubjectTripleForgetReport};
 
 #[cfg(test)]
 mod tests {

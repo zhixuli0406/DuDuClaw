@@ -474,8 +474,12 @@ pub async fn handle_memory_store(
     } else {
         "agent_derived"
     };
+    // RM-039: an explicit "remember this" is exempt from the automatic-memory
+    // privacy categories (this path never consults `memory_privacy`) and is
+    // marked so the "my memory" page can show it as explicitly requested.
     let store_meta = duduclaw_memory::TemporalMeta {
         origin: Some(origin.to_string()),
+        metadata: Some(serde_json::json!({ "explicit": true })),
         ..Default::default()
     };
     let provenance = match mcp_stamped_provenance(&namespace).await {
@@ -1201,7 +1205,8 @@ pub async fn handle_user_profile_record(
             return mcp_error(&malformed_host_env(&e));
         }
     };
-    match duduclaw_memory::user_profile::record_trait_outcome(
+    // RM-039: explicit — exempt from the privacy categories, tagged as such.
+    match duduclaw_memory::user_profile::record_explicit_trait_outcome(
         memory,
         &namespace,
         user_id,
