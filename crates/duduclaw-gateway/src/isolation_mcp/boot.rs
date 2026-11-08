@@ -9,6 +9,8 @@ use super::{Dispatcher, GrantPolicy, LiveAuthority, McpBoundaryService, Protecte
     RuntimeBridgeRegistry, VerificationError};
 use crate::{isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog, LiveConnectorSelectionPolicy},
     isolation_egress::RunTurnResolver, isolation_resources::GatewayResourceResolver};
+use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, RootAllocation, RootAllocator};
+use super::authority::{lifecycle_refusal, personal_facts};
 
 /// CLI supplies its adapter before start_gateway. The gateway owns every input;
 /// the adapter must authenticate its original dispatcher and check completeness.
@@ -291,29 +293,72 @@ pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, e
     let owner = OWNER.get().ok_or(VerificationError::Unavailable)?;
     if owner.home != home || !owner.boundary.healthy() { return Err(VerificationError::Unavailable); }
     let authority = owner.product_authority.as_ref().ok_or(VerificationError::Unavailable)?;
+    let lifecycle = lifecycle::read_lifecycle(&home, &agent).map_err(lifecycle_refusal)?;
     let current = authority.ingress_snapshot(&user, &agent)?;
     super::ingress::require_epoch(epoch, current.human.as_ref().map(|human| human.credential_epoch))?;
-    let receipt = crate::handlers::resolve_confirmed_employee(&home, &agent)
-        .map_err(|_| VerificationError::Unavailable)?;
-    if receipt.disabled { return Err(VerificationError::Revoked); }
+    let principal = issuance_principal(&user, &current)?;
+    issuance_facts(&agent, &lifecycle, &principal, &current, turn.background.is_some())?;
     let policy = crate::approval::strict_policy_revision(&home, &agent)
         .map_err(|_| VerificationError::Unavailable)?;
     let tools = DISPATCHER.get().ok_or(VerificationError::Unavailable)?.ingress_tools(&home, &agent, lane)?;
-    let authorization = human_authorization(home.clone(), agent.clone(), receipt.employee,
-        user.clone(), epoch, lane, &current, tools, turn, credential_expiry)?;
-    let after = authority.ingress_snapshot(&user, &agent)?;
-    if current.acl_generation != after.acl_generation || current.policy_epoch != after.policy_epoch
-        || current.tenant_id != after.tenant_id
-        || after.human.as_ref().map(|human| human.credential_epoch) != Some(epoch)
-        || crate::approval::strict_policy_revision(&home, &agent).ok().as_deref() != Some(policy.as_str()) {
+    // Keep the lifecycle pinned before the policy/catalog I/O; never repin to
+    // a replacement employee in the constructor.
+    let authorization = human_authorization_with(home.clone(), agent.clone(), lifecycle.employee,
+        user.clone(), epoch, lane, &current, tools, turn, credential_expiry, &lifecycle, &RootAllocator)?;
+    if crate::approval::strict_policy_revision(&home, &agent).ok().as_deref() != Some(policy.as_str()) {
         return Err(VerificationError::Revoked);
     }
+    lifecycle::recheck_with(&home, &lifecycle, &RootAllocator).map_err(lifecycle_refusal)?;
+    let after = authority.ingress_snapshot(&user, &agent)?;
+    recheck_issuance_facts(&agent, &lifecycle, &principal, epoch, &current, &after,
+        authorization.turn.as_ref().is_some_and(|turn| turn.background.is_some()))?;
     Ok(authorization)
 }
 
+fn issuance_principal(user: &str, current: &duduclaw_auth::IsolationAuthoritySnapshot)
+    -> Result<duduclaw_isolation::capability::Principal, VerificationError> {
+    Ok(duduclaw_isolation::capability::Principal::Human {
+        user_id: duduclaw_isolation::bounded::Text::new(user.to_owned()).map_err(|_| VerificationError::Invalid)?,
+        generation: current.acl_generation,
+    })
+}
+
+/// Record-backed work must not impersonate a Personal owner's live ingress.
+/// All Personal identity comparisons stay in B1's shared gate.
+fn issuance_facts(agent: &str, lifecycle: &EmployeeLifecycle,
+    principal: &duduclaw_isolation::capability::Principal,
+    current: &duduclaw_auth::IsolationAuthoritySnapshot, record: bool) -> Result<(), VerificationError> {
+    use duduclaw_isolation::capability::EmployeeBinding;
+    match &lifecycle.binding {
+        EmployeeBinding::Personal(owner) => {
+            if record { return Err(VerificationError::Revoked); }
+            personal_facts(agent, owner.as_str(), principal, current)
+        }
+        EmployeeBinding::Shared(tenant) => {
+            if current.tenant_id != tenant.as_str() || current.personal_owner.is_some() {
+                return Err(VerificationError::Revoked);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn recheck_issuance_facts(agent: &str, lifecycle: &EmployeeLifecycle,
+    principal: &duduclaw_isolation::capability::Principal, epoch: u64,
+    before: &duduclaw_auth::IsolationAuthoritySnapshot, after: &duduclaw_auth::IsolationAuthoritySnapshot,
+    record: bool) -> Result<(), VerificationError> {
+    if before.acl_generation != after.acl_generation || before.policy_epoch != after.policy_epoch
+        || before.tenant_id != after.tenant_id
+        || after.human.as_ref().is_none_or(|human| human.credential_epoch != epoch
+            || human.must_change_password || !human.can_assign_to(agent)) {
+        return Err(VerificationError::Revoked);
+    }
+    issuance_facts(agent, lifecycle, principal, after, record)
+}
+
 /// Production capability construction from authenticated host facts. Callers
-/// must authenticate these facts and recheck their store versions after I/O, as
-/// record_authorization does. No MCP, environment or deserialization entry point.
+/// must authenticate these facts. Lifecycle and users.db are rechecked after
+/// resource I/O. No MCP, environment or deserialization entry point.
 /// Inventory tests call this exact constructor, never append resource grants.
 pub fn human_authorization(home: PathBuf, agent: String, employee: EmployeeId,
     user: String, epoch: u64, lane: duduclaw_isolation::capability::Lane,
@@ -321,12 +366,26 @@ pub fn human_authorization(home: PathBuf, agent: String, employee: EmployeeId,
     tools: duduclaw_isolation::bounded::List<duduclaw_isolation::bounded::Text<128>, 256>,
     turn: super::HostTurn, credential_expiry: Option<u64>)
     -> Result<super::RuntimeAuthorization, VerificationError> {
-    use duduclaw_isolation::{bounded::{List, Text}, capability::{EmployeeBinding, Principal, ResourceGrant}};
+    let lifecycle = lifecycle::read_lifecycle(&home, &agent).map_err(lifecycle_refusal)?;
+    human_authorization_with(home, agent, employee, user, epoch, lane, current, tools, turn,
+        credential_expiry, &lifecycle, &RootAllocator)
+}
+
+fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
+    user: String, epoch: u64, lane: duduclaw_isolation::capability::Lane,
+    current: &duduclaw_auth::IsolationAuthoritySnapshot,
+    tools: duduclaw_isolation::bounded::List<duduclaw_isolation::bounded::Text<128>, 256>,
+    turn: super::HostTurn, credential_expiry: Option<u64>, lifecycle: &EmployeeLifecycle, root: &dyn RootAllocation)
+    -> Result<super::RuntimeAuthorization, VerificationError> {
+    use duduclaw_isolation::{bounded::{List, Text}, capability::ResourceGrant};
+    if lifecycle.employee != employee || lifecycle.label != agent { return Err(VerificationError::Revoked); }
     if current.human.as_ref().is_none_or(|human| human.user_id != user
         || human.credential_epoch != epoch || human.must_change_password
         || !human.can_assign_to(&agent)) {
         return Err(VerificationError::Revoked);
     }
+    let principal = issuance_principal(&user, current)?;
+    issuance_facts(&agent, lifecycle, &principal, current, turn.background.is_some())?;
     let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
     let namespace = format!("agent:{agent}");
     let confined = |resource| ResourceGrant::Confined { resource: Box::new(resource) };
@@ -348,9 +407,20 @@ pub fn human_authorization(home: PathBuf, agent: String, employee: EmployeeId,
     let expires_at = now.checked_add(30 * 60).ok_or(VerificationError::InvalidTime)?
         .min(credential_expiry.unwrap_or(u64::MAX));
     if expires_at <= now { return Err(VerificationError::InvalidTime); }
+    // Root/store reads and resource resolution may race with handover or
+    // revocation. Re-read the pinned lifecycle, then the latest users.db facts.
+    lifecycle::recheck_with(&home, lifecycle, root).map_err(lifecycle_refusal)?;
+    let path = home.join("users.db");
+    if !std::fs::symlink_metadata(&path).map_err(|_| VerificationError::Unavailable)?.file_type().is_file() {
+        return Err(VerificationError::Unavailable);
+    }
+    let mut users = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| VerificationError::Unavailable)?;
+    let after = duduclaw_auth::read_isolation_authority(&mut users, Some(&user), &agent)
+        .map_err(|_| VerificationError::Revoked)?;
+    recheck_issuance_facts(&agent, lifecycle, &principal, epoch, current, &after, turn.background.is_some())?;
     Ok(super::RuntimeAuthorization { home, agent, grant: GrantPolicy {
-        task: None, principal: Principal::Human { user_id: text(user)?, generation: current.acl_generation },
-        binding: EmployeeBinding::Shared(text(current.tenant_id.clone())?), lane, tools,
+        task: None, principal, binding: lifecycle.binding.clone(), lane, tools,
         resources: List::new(resources).map_err(|_| VerificationError::Invalid)?,
         policy_revision: current.policy_epoch, not_before: now, expires_at }, roots: Arc::new(roots),
         origin: WaitOrigin::Gateway, caller: None, turn: Some(turn), authenticated_epoch: Some(epoch) })
@@ -495,6 +565,10 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
 #[cfg(test)]
 #[path = "authorization_tests.rs"]
 mod authorization_tests;
+
+#[cfg(test)]
+#[path = "boot_personal_tests.rs"]
+mod boot_personal_tests;
 
 #[cfg(test)]
 mod tests {

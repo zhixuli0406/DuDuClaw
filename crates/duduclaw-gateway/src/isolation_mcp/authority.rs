@@ -39,7 +39,7 @@ struct Identity {
 
 /// Every lifecycle refusal fails closed; only an unreadable store is reported
 /// as unavailable rather than revoked.
-fn lifecycle_refusal(error: LifecycleError) -> VerificationError {
+pub(super) fn lifecycle_refusal(error: LifecycleError) -> VerificationError {
     match error {
         LifecycleError::Unavailable => VerificationError::Unavailable,
         LifecycleError::Denied | LifecycleError::Stale | LifecycleError::Tombstoned => VerificationError::Revoked,
