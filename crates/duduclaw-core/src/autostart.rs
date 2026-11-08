@@ -66,16 +66,35 @@ fn xml_escape(s: &str) -> String {
 /// `duduclaw_home` the resolved state root (`DUDUCLAW_HOME` override honoured
 /// by embedding it so the login-launched gateway uses the same instance).
 pub fn launchd_plist(exe: &Path, home: &Path, duduclaw_home: &Path) -> String {
+    launchd_plist_for(exe, home, duduclaw_home, None)
+}
+
+/// [`launchd_plist`] plus `AssociatedBundleIdentifiers` when the gateway
+/// runs from `DuDuClaw Gateway.app`, so Login Items shows the app's name.
+pub fn launchd_plist_for(
+    exe: &Path,
+    home: &Path,
+    duduclaw_home: &Path,
+    bundle_id: Option<&str>,
+) -> String {
     let exe = xml_escape(&exe.display().to_string());
     let home_s = xml_escape(&home.display().to_string());
     let state = xml_escape(&duduclaw_home.display().to_string());
+    let associated = bundle_id
+        .map(|id| {
+            format!(
+                "\n    <key>AssociatedBundleIdentifiers</key>\n    <array>\n        <string>{}</string>\n    </array>",
+                xml_escape(id)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{LAUNCHD_LABEL}</string>
+    <string>{LAUNCHD_LABEL}</string>{associated}
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
@@ -211,9 +230,188 @@ fn xdg_config_dir() -> PathBuf {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn current_exe() -> Result<PathBuf> {
     std::env::current_exe()
         .map_err(|e| DuDuClawError::Gateway(format!("cannot resolve current executable: {e}")))
+}
+
+/// macOS: the canonical executable (symlinks resolved), so the LaunchAgent
+/// names the real file — inside `DuDuClaw Gateway.app` for bundle installs.
+#[cfg(target_os = "macos")]
+fn current_exe() -> Result<PathBuf> {
+    let exe = crate::platform::executable_path();
+    if exe.as_os_str().is_empty() {
+        return Err(DuDuClawError::Gateway("cannot resolve current executable".into()));
+    }
+    Ok(exe)
+}
+
+// ── LaunchAgent boot migration (RM-155) ─────────────────────────────────────
+
+/// What [`plan_plist_migration`] decided for one LaunchAgent plist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlistMigration {
+    /// Already names `target` exactly (and carries the wanted bundle key).
+    UpToDate,
+    /// Names `target` through another spelling (symlink, old bare path that
+    /// now links into the bundle) — rewrite `ProgramArguments[0]` (and
+    /// `Program` when present) to `target`.
+    Rewrite { program_key: bool },
+    /// Points at a different binary — left alone (logged by the caller).
+    Foreign(String),
+}
+
+/// Pure decision for the boot-time plist migration. `resolves_to_target`
+/// answers "does this path canonicalize to the running executable?".
+pub fn plan_plist_migration(
+    program_arg0: Option<&str>,
+    program: Option<&str>,
+    has_associated_bundle: bool,
+    target: &Path,
+    want_associated_bundle: bool,
+    resolves_to_target: impl Fn(&Path) -> bool,
+) -> PlistMigration {
+    let Some(arg0) = program_arg0 else {
+        return PlistMigration::Foreign("plist has no ProgramArguments[0]".into());
+    };
+    let target_s = target.to_str();
+    let names_target = |p: &str| Some(p) == target_s || resolves_to_target(Path::new(p));
+    if !names_target(arg0) {
+        return PlistMigration::Foreign(format!("ProgramArguments[0] is {arg0}"));
+    }
+    if let Some(program) = program
+        && !names_target(program)
+    {
+        return PlistMigration::Foreign(format!("Program is {program}"));
+    }
+    let spelled_exactly = Some(arg0) == target_s && program.is_none_or(|p| Some(p) == target_s);
+    if spelled_exactly && (has_associated_bundle || !want_associated_bundle) {
+        return PlistMigration::UpToDate;
+    }
+    PlistMigration::Rewrite { program_key: program.is_some() }
+}
+
+/// Boot-time LaunchAgent migration: for each registered plist whose
+/// `ProgramArguments[0]` canonicalizes to the running executable but is
+/// spelled differently, rewrite it to the canonical path (and add
+/// `AssociatedBundleIdentifiers` when running from the gateway bundle).
+/// Plists naming another binary are left untouched. Registration only —
+/// launchd picks the new path up at the next bootstrap.
+#[cfg(target_os = "macos")]
+pub fn migrate_launchd_plists() -> Vec<(PathBuf, std::result::Result<PlistMigration, String>)> {
+    let exe = crate::platform::executable_path();
+    if exe.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let bundle_id = crate::macos_bundle::running_gateway_bundle().map(|_| crate::macos_bundle::BUNDLE_ID);
+    migrate_launchd_plists_to(&exe, bundle_id)
+}
+
+/// [`migrate_launchd_plists`] for an explicit target — the updater calls this
+/// after a bare → bundle migration, once the old bare path has become a
+/// symlink into the bundle (so the old plist's path canonicalizes to `exe`).
+#[cfg(target_os = "macos")]
+pub fn migrate_launchd_plists_to(
+    exe: &Path,
+    bundle_id: Option<&str>,
+) -> Vec<(PathBuf, std::result::Result<PlistMigration, String>)> {
+    let exe = exe.to_path_buf();
+    let home = home_dir();
+    [LAUNCHD_LABEL, LEGACY_LAUNCHD_LABEL]
+        .into_iter()
+        .map(|label| launchd_plist_path_in(&home, label))
+        .filter(|path| path.exists())
+        .map(|path| {
+            let outcome = migrate_one_plist(&path, &exe, bundle_id);
+            match &outcome {
+                Ok(PlistMigration::Rewrite { .. }) => tracing::info!(plist = %path.display(),
+                    exe = %exe.display(), "LaunchAgent now names the canonical gateway executable"),
+                Ok(PlistMigration::Foreign(why)) => tracing::info!(plist = %path.display(),
+                    reason = %why, "LaunchAgent names another binary; left unchanged"),
+                Ok(PlistMigration::UpToDate) => {}
+                Err(e) => tracing::warn!(plist = %path.display(), error = %e, "LaunchAgent migration failed"),
+            }
+            (path, outcome)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn plutil(args: &[&std::ffi::OsStr]) -> std::result::Result<String, String> {
+    let output = std::process::Command::new("/usr/bin/plutil")
+        .args(args)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("/usr/bin/plutil: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("/usr/bin/plutil failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Rewrite one plist in place (temp copy in the same directory → plutil
+/// edits → lint → fsync → rename), so a crash never leaves a torn plist.
+#[cfg(target_os = "macos")]
+pub fn migrate_one_plist(
+    plist: &Path,
+    exe: &Path,
+    bundle_id: Option<&str>,
+) -> std::result::Result<PlistMigration, String> {
+    use std::ffi::OsStr;
+    let json = plutil(&[OsStr::new("-convert"), OsStr::new("json"), OsStr::new("-o"),
+        OsStr::new("-"), OsStr::new("--"), plist.as_os_str()])?;
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    let canonical_exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let decision = plan_plist_migration(
+        value["ProgramArguments"][0].as_str(),
+        value.get("Program").and_then(|v| v.as_str()),
+        value.get("AssociatedBundleIdentifiers").is_some(),
+        exe,
+        bundle_id.is_some(),
+        |p| std::fs::canonicalize(p).is_ok_and(|c| c == canonical_exe),
+    );
+    let program_key = match decision {
+        PlistMigration::Rewrite { program_key } => program_key,
+        other => return Ok(other),
+    };
+    let decision = PlistMigration::Rewrite { program_key };
+    let exe_s = exe.to_str().ok_or("Non-UTF-8 executable path")?;
+    let dir = plist.parent().ok_or("plist has no parent directory")?;
+    let tmp = dir.join(format!(".{}.{}.tmp",
+        plist.file_name().and_then(|n| n.to_str()).unwrap_or("plist"), uuid::Uuid::new_v4()));
+    let result = (|| -> std::result::Result<(), String> {
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let bytes = std::fs::read(plist).map_err(|e| e.to_string())?;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644)
+                .open(&tmp).map_err(|e| e.to_string())?;
+            file.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+        let t = tmp.as_os_str();
+        plutil(&[OsStr::new("-replace"), OsStr::new("ProgramArguments.0"), OsStr::new("-string"),
+            OsStr::new(exe_s), OsStr::new("--"), t])?;
+        if program_key {
+            plutil(&[OsStr::new("-replace"), OsStr::new("Program"), OsStr::new("-string"),
+                OsStr::new(exe_s), OsStr::new("--"), t])?;
+        }
+        if let Some(id) = bundle_id {
+            let ids = serde_json::json!([id]).to_string();
+            plutil(&[OsStr::new("-replace"), OsStr::new("AssociatedBundleIdentifiers"),
+                OsStr::new("-json"), OsStr::new(&ids), OsStr::new("--"), t])?;
+        }
+        plutil(&[OsStr::new("-convert"), OsStr::new("xml1"), OsStr::new("--"), t])?;
+        plutil(&[OsStr::new("-lint"), OsStr::new("-s"), OsStr::new("--"), t])?;
+        std::fs::File::open(&tmp).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, plist).map_err(|e| e.to_string())?;
+        std::fs::File::open(dir).and_then(|f| f.sync_all()).map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map(|()| decision)
 }
 
 // ── Platform implementations ─────────────────────────────────────────────────
@@ -231,7 +429,9 @@ pub fn enable() -> Result<AutostartStatus> {
         if let Some(parent) = plist_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&plist_path, launchd_plist(&exe, &home, &state))?;
+        let bundle_id = crate::macos_bundle::running_gateway_bundle()
+            .map(|_| crate::macos_bundle::BUNDLE_ID);
+        std::fs::write(&plist_path, launchd_plist_for(&exe, &home, &state, bundle_id))?;
         // A stale legacy-label plist would register a second copy — remove it.
         let _ = std::fs::remove_file(launchd_plist_path_in(&home, LEGACY_LAUNCHD_LABEL));
         return Ok(AutostartStatus {
@@ -450,6 +650,67 @@ mod tests {
         );
         assert!(plist.contains("/Users/a&amp;b/&lt;bin&gt;/duduclaw"));
         assert!(!plist.contains("a&b"));
+    }
+
+    #[test]
+    fn launchd_plist_names_associated_bundle_only_for_bundle_installs() {
+        let bare = launchd_plist(Path::new("/x/duduclaw"), Path::new("/Users/kai"), Path::new("/s"));
+        assert!(!bare.contains("AssociatedBundleIdentifiers"));
+        let exe = Path::new("/Users/kai/Applications/DuDuClaw Gateway.app/Contents/MacOS/duduclaw");
+        let app = launchd_plist_for(exe, Path::new("/Users/kai"), Path::new("/s"),
+            Some(crate::macos_bundle::BUNDLE_ID));
+        assert!(app.contains("<key>AssociatedBundleIdentifiers</key>\n    <array>\n        <string>ai.duduclaw.gateway</string>\n    </array>"));
+        assert!(app.contains("<string>/Users/kai/Applications/DuDuClaw Gateway.app/Contents/MacOS/duduclaw</string>"));
+    }
+
+    #[test]
+    fn plist_migration_rewrites_only_aliases_of_the_running_exe() {
+        let target = Path::new("/A/DuDuClaw Gateway.app/Contents/MacOS/duduclaw");
+        let alias = |p: &Path| p == Path::new("/Users/k/.duduclaw/bin/duduclaw");
+        let t = target.to_str().unwrap();
+        assert_eq!(plan_plist_migration(Some(t), None, true, target, true, alias), PlistMigration::UpToDate);
+        assert_eq!(plan_plist_migration(Some(t), None, false, target, false, alias), PlistMigration::UpToDate);
+        // Exact path but missing the bundle key → rewrite (adds the key).
+        assert_eq!(plan_plist_migration(Some(t), None, false, target, true, alias),
+            PlistMigration::Rewrite { program_key: false });
+        assert_eq!(plan_plist_migration(Some("/Users/k/.duduclaw/bin/duduclaw"), None, false, target, true, alias),
+            PlistMigration::Rewrite { program_key: false });
+        assert_eq!(plan_plist_migration(Some("/Users/k/.duduclaw/bin/duduclaw"),
+            Some("/Users/k/.duduclaw/bin/duduclaw"), false, target, false, alias),
+            PlistMigration::Rewrite { program_key: true });
+        // Another binary is never touched.
+        assert!(matches!(plan_plist_migration(Some("/opt/other/duduclaw"), None, false, target, true, alias),
+            PlistMigration::Foreign(_)));
+        assert!(matches!(plan_plist_migration(Some(t), Some("/tmp/evil"), false, target, true, alias),
+            PlistMigration::Foreign(_)));
+        assert!(matches!(plan_plist_migration(None, None, false, target, true, alias),
+            PlistMigration::Foreign(_)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plist_migration_rewrites_symlinked_program_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-duduclaw");
+        std::fs::write(&real, b"x").unwrap();
+        let link = dir.path().join("link-duduclaw");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        let plist = dir.path().join("com.duduclaw.gateway.plist");
+        std::fs::write(&plist, launchd_plist(&link, Path::new("/Users/kai"), dir.path())).unwrap();
+        let outcome = migrate_one_plist(&plist, &real, Some(crate::macos_bundle::BUNDLE_ID)).unwrap();
+        assert_eq!(outcome, PlistMigration::Rewrite { program_key: false });
+        let text = std::fs::read_to_string(&plist).unwrap();
+        assert!(text.contains(real.to_str().unwrap()));
+        assert!(text.contains("AssociatedBundleIdentifiers"));
+        assert!(text.contains("<string>--yes</string>"));
+        assert_eq!(migrate_one_plist(&plist, &real, Some(crate::macos_bundle::BUNDLE_ID)).unwrap(),
+            PlistMigration::UpToDate);
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"y").unwrap();
+        assert!(matches!(migrate_one_plist(&plist, &std::fs::canonicalize(&other).unwrap(), None).unwrap(),
+            PlistMigration::Foreign(_)));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
     }
 
     #[test]

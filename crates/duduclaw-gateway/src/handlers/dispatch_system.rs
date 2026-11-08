@@ -233,6 +233,11 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_system_restart_pending_update()).await
             }
+            // RM-155: bare macOS install → DuDuClaw Gateway.app (admin).
+            "system.migrate_bundle" => {
+                require_admin!();
+                boxed_frame(|| self.handle_system_migrate_bundle()).await
+            }
 
             // ── Logs (manager+) ──────────────────────────────
             "logs.subscribe" => {

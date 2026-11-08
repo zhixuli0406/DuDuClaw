@@ -21,6 +21,7 @@ pub enum ServiceAction {
     Stop,
     Restart { from_updater: Option<String> },
     Status,
+    MigrateBundle,
     Logs { lines: usize },
     Uninstall,
 }
@@ -33,9 +34,33 @@ pub async fn handle_service(action: ServiceAction) -> Result<()> {
         ServiceAction::Stop => stop_service().await,
         ServiceAction::Restart { from_updater } => restart_service(from_updater).await,
         ServiceAction::Status => service_status().await,
+        ServiceAction::MigrateBundle => migrate_bundle().await,
         ServiceAction::Logs { lines } => service_logs(lines).await,
         ServiceAction::Uninstall => uninstall_service().await,
     }
+}
+
+/// RM-155: `duduclaw service migrate-bundle`. The heavy lifting (download,
+/// minisign + SHA-256 + release identity, codesign gate, atomic install,
+/// symlink + LaunchAgent rewrite) is the gateway updater's — the same path
+/// as the dashboard's `system.migrate_bundle`. This process is not the
+/// gateway, so it never restarts one by itself.
+async fn migrate_bundle() -> Result<()> {
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
+    let result = duduclaw_gateway::updater::migrate_to_bundle()
+        .await
+        .map_err(|e| DuDuClawError::Gateway(format!("Migration to DuDuClaw Gateway.app failed: {e}")))?;
+    if !result.success {
+        return Err(DuDuClawError::Gateway(result.message));
+    }
+    println!("✓ {}", result.message);
+    let _ = duduclaw_gateway::updater::take_folder_access_notice();
+    if duduclaw_core::autostart::status().enabled {
+        println!("Restart the gateway to run from the app: duduclaw service restart");
+    } else {
+        println!("Start the gateway again (duduclaw run) to run from the app.");
+    }
+    Ok(())
 }
 
 async fn restart_service(from_updater: Option<String>) -> Result<()> {

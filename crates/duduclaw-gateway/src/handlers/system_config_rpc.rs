@@ -277,10 +277,75 @@ impl MethodHandler {
                         // uses this to show an `update.sh`/image-rebuild
                         // guidance card instead of an install button.
                         "containerized": crate::updater::is_containerized(),
+                        // RM-155 (macOS): running from DuDuClaw Gateway.app?
+                        // When false on a standalone/npm install the update
+                        // page offers `system.migrate_bundle`.
+                        "macos_bundle": duduclaw_core::macos_bundle::running_gateway_bundle().is_some(),
+                        "macos_bundle_migratable": crate::updater::bundle_migration_offered(),
+                        // One-time notice after a migration: macOS asks once
+                        // for folder access for the new app identity.
+                        "macos_bundle_notice": crate::updater::take_folder_access_notice(),
                     }),
                 )
             }
             Err(e) => WsFrame::error_response("", &format!("Update check failed: {e}")),
+        }
+    }
+
+    /// `system.migrate_bundle` — RM-155: install the signed
+    /// `DuDuClaw Gateway.app` for a bare macOS install, point the old binary
+    /// path and the LaunchAgent at it, then relaunch like an update. Same
+    /// verification chain as `system.apply_update`; refused off macOS.
+    pub(crate) async fn handle_system_migrate_bundle(&self) -> WsFrame {
+        crate::security_autopilot::audit_and_emit(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "system_update",
+                "system",
+                duduclaw_security::audit::Severity::Info,
+                json!({ "action": "migrate_bundle" }),
+            ),
+        );
+        match crate::updater::migrate_to_bundle().await {
+            Ok(result) if result.success => {
+                let version = crate::updater::current_version().to_string();
+                if result.needs_restart {
+                    self.schedule_update_restart(&version, &result.message).await;
+                }
+                crate::security_autopilot::audit_and_emit(
+                    &self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "system_update_success",
+                        "system",
+                        duduclaw_security::audit::Severity::Info,
+                        json!({ "action": "migrate_bundle", "needs_restart": result.needs_restart }),
+                    ),
+                );
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": true,
+                        "message": result.message,
+                        "needs_restart": result.needs_restart,
+                        "restart_hint": result.restart_hint,
+                    }),
+                )
+            }
+            Ok(result) => crate::updater::failure_response(&result.message),
+            Err(e) => {
+                let sanitized = crate::updater::sanitize_failure_detail(&e);
+                crate::security_autopilot::audit_and_emit(
+                    &self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "system_update_failed",
+                        "system",
+                        duduclaw_security::audit::Severity::Warning,
+                        json!({ "action": "migrate_bundle", "error": sanitized }),
+                    ),
+                );
+                tracing::warn!(error = %sanitized, "DuDuClaw Gateway.app migration failed");
+                crate::updater::failure_response(&e)
+            }
         }
     }
 

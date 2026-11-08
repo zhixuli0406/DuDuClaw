@@ -37,11 +37,8 @@ impl VerifiedReleaseIdentity {
 /// version/file, never values inferred solely from the downloaded signature.
 pub fn verify_release_archive_with_pubkey(bytes: &[u8], checksum: &str,
     signature: &str, key: &str, version: &str, file: &str) -> Result<VerifiedReleaseIdentity, String> {
-    let product = if file == format!("duduclaw-{}", platform_asset_suffix()) {
-        "duduclaw"
-    } else if file == format!("duduclaw-pro-{}", platform_asset_suffix()) {
-        "duduclaw-pro"
-    } else { return Err("Release file must match this platform and edition".into()); };
+    let product = product_for_file(file, &release_suffixes())
+        .ok_or("Release file must match this platform and edition")?;
     if !plain_version(version) { return Err("Invalid expected release version".into()); }
     verify_archive_with_pubkey(bytes, checksum, signature, key)?;
     let trusted_comment = format!("{product} v{version} {file}");
@@ -50,6 +47,30 @@ pub fn verify_release_archive_with_pubkey(bytes: &[u8], checksum: &str,
         version: version.to_owned(), file: file.to_owned(), trusted_comment,
         signature: signature.to_owned(), archive_sha256: Sha256::digest(bytes).into(),
     })
+}
+
+/// Asset suffixes this platform accepts: the platform archive everywhere,
+/// plus `darwin-<arch>.app.zip` on macOS only (RM-155).
+fn release_suffixes() -> Vec<&'static str> {
+    std::iter::once(platform_asset_suffix()).chain(bundle_asset_suffix()).collect()
+}
+
+/// `duduclaw-<suffix>` → CE, `duduclaw-pro-<suffix>` → Pro, else `None`.
+fn product_for_file(file: &str, suffixes: &[&str]) -> Option<&'static str> {
+    suffixes.iter().find_map(|suffix| {
+        if file == format!("duduclaw-{suffix}") {
+            Some("duduclaw")
+        } else if file == format!("duduclaw-pro-{suffix}") {
+            Some("duduclaw-pro")
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether a verified release file is the macOS app bundle asset.
+pub(super) fn is_bundle_file(file: &str) -> bool {
+    file.ends_with(".app.zip")
 }
 
 pub(super) fn retain_release_version() {
@@ -69,11 +90,13 @@ pub(super) fn release_identity(url: &str) -> Result<(String, String), String> {
     let prefix = format!("/{GITHUB_REPO}/releases/download/v");
     let tail = url.path().strip_prefix(&prefix).ok_or("Invalid release URL path")?;
     let (version, file) = tail.split_once('/').ok_or("Missing release version or file name")?;
-    let expected_file = format!("duduclaw-{}", platform_asset_suffix());
+    // The public channel only ships CE assets: the platform archive, or the
+    // `.app.zip` bundle on macOS.
+    let expected = release_suffixes().iter().any(|suffix| file == format!("duduclaw-{suffix}"));
     if url.scheme() != "https" || url.host_str() != Some("github.com")
         || !url.username().is_empty() || url.password().is_some()
         || url.port_or_known_default() != Some(443) || url.query().is_some()
-        || url.fragment().is_some() || !plain_version(version) || file != expected_file {
+        || url.fragment().is_some() || !plain_version(version) || !expected {
         return Err("Release URL must name an exact stable version and this platform's archive".into());
     }
     Ok((version.to_owned(), file.to_owned()))
@@ -238,6 +261,26 @@ pub(super) mod tests {
             base.replace("duduclaw-", "other-")] {
             assert!(release_identity(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn release_identity_bundle_asset_is_macos_only() {
+        let mac = ["darwin-arm64.tar.gz", "darwin-arm64.app.zip"];
+        assert_eq!(product_for_file("duduclaw-darwin-arm64.app.zip", &mac), Some("duduclaw"));
+        assert_eq!(product_for_file("duduclaw-pro-darwin-arm64.app.zip", &mac), Some("duduclaw-pro"));
+        assert_eq!(product_for_file("duduclaw-darwin-arm64.tar.gz", &mac), Some("duduclaw"));
+        assert_eq!(product_for_file("duduclaw-darwin-x64.app.zip", &mac), None);
+        assert_eq!(product_for_file("duduclaw-linux-x64.app.zip", &["linux-x64.tar.gz"]), None);
+        assert!(is_bundle_file("duduclaw-darwin-arm64.app.zip"));
+        assert!(!is_bundle_file("duduclaw-darwin-arm64.tar.gz"));
+        // This host: the bundle asset is accepted iff it is macOS.
+        let suffixes = release_suffixes();
+        assert_eq!(suffixes.iter().any(|s| s.ends_with(".app.zip")), cfg!(target_os = "macos"));
+        let bundle = format!("https://github.com/{GITHUB_REPO}/releases/download/v1.81.0/duduclaw-{}",
+            bundle_asset_suffix().unwrap_or("darwin-arm64.app.zip"));
+        assert_eq!(release_identity(&bundle).is_ok(), cfg!(target_os = "macos"));
+        let pro = bundle.replace("/duduclaw-", "/duduclaw-pro-");
+        assert!(release_identity(&pro).is_err(), "public channel never serves Pro");
     }
 
     #[test]
