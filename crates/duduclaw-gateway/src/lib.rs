@@ -60,6 +60,7 @@ pub mod isolation_connector_registry;
 pub mod isolation_connector_search;
 pub mod isolation_execution;
 pub mod isolation_worker_plans;
+pub mod isolation_skill_jobs;
 #[cfg(target_os = "linux")]
 pub mod isolation_forks;
 pub mod isolation_readiness;

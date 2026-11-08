@@ -319,6 +319,9 @@ pub(crate) async fn handle_skill_hub_install(
     default_agent: &str,
     caller_is_admin: bool,
 ) -> Value {
+    if crate::mcp_isolation::current().is_some() {
+        return handle_skill_hub_install_owned(params, home_dir, caller_is_admin).await;
+    }
     let hub = params.get("hub").and_then(|v| v.as_str()).unwrap_or("");
     let skill_name = params
         .get("skill_name")
@@ -395,6 +398,39 @@ pub(crate) async fn handle_skill_hub_install(
             "Skill '{}' installed from hub '{}' into scope '{}' (scan: risk {}, {} finding(s); signature: {:?}; publisher: {}; content SHA-256: {}).",
             report.skill_name, report.hub, report.scope, report.risk_level, report.findings,
             report.signature_status.state, report.signature_status.publisher.as_deref().unwrap_or("unknown"),
+            report.content_sha256
+        )),
+        Err(e) => mcp_error(&e),
+    }
+}
+
+/// H12b: protected (isolated) hub install. The subject is the capability-bound
+/// employee of this call (never `scope`/`owner`, which the protected schema
+/// refuses); the host fetches the hub archive, E expands and scans it, the
+/// existing install approval gate runs, and the skill lands only in the
+/// employee's own SKILLS.
+async fn handle_skill_hub_install_owned(params: &Value, home_dir: &Path, caller_is_admin: bool) -> Value {
+    use duduclaw_gateway::skill_lifecycle::hub_install_owned;
+    let refused = || mcp_error("無法確認這次技能安裝的資源授權，已拒絕執行。");
+    let Some(current) = crate::mcp_isolation::current() else { return refused(); };
+    let Ok(call) = crate::mcp_isolation::authorize_gateway_handler(home_dir, "skill_hub_install", params).await else {
+        return refused();
+    };
+    if call.context().record() != current.context.record() { return refused(); }
+    let agent = current.agent.as_str();
+    let gated = match hub_install_owned::fetch_owned(home_dir, &call, agent).await {
+        Ok(gated) => gated,
+        Err(e) => return mcp_error(&e),
+    };
+    let (summary, payload) = hub_install_approval_details(&gated, &gated.hub, &gated.skill_name, None, agent);
+    match gate_install_approval(home_dir, agent, "skill_hub_install", &summary, payload, caller_is_admin).await {
+        InstallApprovalOutcome::Proceed => {}
+        InstallApprovalOutcome::Denied(msg) => return mcp_error(&msg),
+    }
+    match hub_install_owned::install_owned(home_dir, &call, agent, &gated).await {
+        Ok(report) => mcp_text(&format!(
+            "Skill '{}' installed from hub '{}' into your own skills (scan: risk {}, {} finding(s); signature: {:?}; content SHA-256: {}).",
+            report.skill_name, report.hub, report.risk_level, report.findings, report.signature_status.state,
             report.content_sha256
         )),
         Err(e) => mcp_error(&e),

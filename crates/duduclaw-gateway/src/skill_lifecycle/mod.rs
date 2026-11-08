@@ -15,6 +15,7 @@ pub mod gap;
 pub mod gap_accumulator;
 pub mod graduation;
 pub mod hub_install;
+pub mod hub_install_owned;
 pub mod lift;
 pub mod relevance;
 pub mod sandbox_trial;

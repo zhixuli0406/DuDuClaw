@@ -19,11 +19,13 @@ use crate::tool_policy::{employee_service_scope, policy, ResourceKind, Route, IN
 /// (`mcp_isolation_parity_tests::pending_production_selectors`) uses this very
 /// list as its tracked gap. HX5 removed `execute_program`, `code_map` and
 /// `office_script`; H13 removed `spawn_agent` and `spawn_ephemeral` (routed
-/// on the run's own Employee grant, no Workspace). None of them may be added
-/// back here.
+/// on the run's own Employee grant, no Workspace); H12b/H12c removed
+/// `skill_hub_install` (own Employee + PublicOrigins) and `skill_synthesis_run`
+/// (own Employee only). None of them may be added back here.
+/// `skill_from_recording` stays until HX6 installs the H12d `RecordingJobs`
+/// seam.
 pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &["inspect_branches", "diff_branches", "fork_cost", "discovery_catalog", "discovery_list", "discovery_tree", "discovery_artifact",
-    "discovery_cancel", "browser_record_start", "browser_record_stop", "skill_from_recording",
-    "skill_synthesis_run", "skill_hub_install"];
+    "discovery_cancel", "browser_record_start", "browser_record_stop", "skill_from_recording"];
 
 /// Whether a signed `Workspace` grant is what would make `name` eligible on a
 /// non-File route. `employee_scope` is true when the record keeps its
@@ -69,6 +71,16 @@ mod tests {
                 assert!(!drops_from_signed(tool, scoped, helpers), "{tool}");
             }
         }
+        // H12b/H12c: routed on the own Employee grant (+ PublicOrigins for the
+        // hub), never on a Workspace; H12d's recording tool stays pending.
+        for tool in ["skill_hub_install", "skill_synthesis_run"] {
+            assert!(!policy(tool).expect(tool).required.contains(&ResourceKind::Workspace), "{tool}");
+            assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
+            for (scoped, helpers) in [(true, false), (true, true), (false, false), (false, true)] {
+                assert!(!drops_from_signed(tool, scoped, helpers), "{tool}");
+            }
+        }
+        assert!(PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording"));
         for tool in ["file_read", "csv_read", "xlsx_read", "tasks_update", "computer_session_start",
             "computer_login", "skill_curator_status", "unknown_tool"] {
             assert!(!needs_execution_workspace(tool, true), "{tool}");

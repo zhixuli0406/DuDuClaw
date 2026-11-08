@@ -9,6 +9,7 @@ pub mod execution;
 pub mod ids;
 pub mod ipc;
 pub mod migration;
+pub mod recording_layout;
 pub mod update;
 pub mod worker;
 

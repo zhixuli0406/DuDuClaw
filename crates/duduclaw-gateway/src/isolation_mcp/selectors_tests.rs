@@ -180,10 +180,11 @@ fn signed(auth: &Authorization) -> Vec<&str> { auth.grant.tools.as_slice().iter(
 fn h10_file_workspace_never_signs_execution_tools() {
     // `employee-work` is also the A workspace handle. A grant selected for
     // the file tools alone never signs the A/E tools it would enable: the
-    // pending ones (browser recording until HX6, hub install) and — without
-    // spawnd's `helper_calls` — the HX5 in-run helpers too.
+    // pending ones (browser recording and skill_from_recording until HX6) and
+    // — without spawnd's `helper_calls` — the HX5 in-run helpers too. (H12b
+    // hub install is no longer pending: it rests on PublicOrigins, see h9.)
     let names = ["file_read", "browser_record_start", "browser_record_stop", "execute_program", "code_map",
-        "skill_hub_install", "tasks_update"];
+        "skill_from_recording", "tasks_update"];
     for features in [None, Some(SpawndFeatures::NONE), Some(SpawndFeatures::WORK_BROKER)] {
         let f = fixture_with(true, features.map(|features| feature_view(&bits(features))));
         let auth = f.issue(&names).unwrap();
@@ -200,7 +201,7 @@ fn h10_file_workspace_never_signs_execution_tools() {
     assert_eq!(signed(&auth), ["file_read", "execute_program", "code_map", "tasks_update"]);
     let ctx = context(&auth);
     for tool in ["file_read", "execute_program", "code_map"] { assert!(eligible(&ctx, tool), "{tool}"); }
-    for tool in ["browser_record_start", "browser_record_stop", "skill_hub_install"] { assert!(!eligible(&ctx, tool), "{tool}"); }
+    for tool in ["browser_record_start", "browser_record_stop", "skill_from_recording"] { assert!(!eligible(&ctx, tool), "{tool}"); }
     // No Workspace selected: the snapshot is signed unchanged.
     let auth = fixture(false).issue(&names).unwrap();
     assert_eq!(auth.grant.tools.as_slice().len(), names.len());
@@ -309,6 +310,27 @@ fn h9_public_origins_only_when_admin_enabled() {
     let auth = f.issue_task(&web, "task-a").unwrap();
     assert!(!any_public(&auth));
     capability(&auth).canonical_bytes().expect("task-limited record stays signable");
+}
+
+#[test]
+fn h12bc_hub_install_tied_to_public_web_synthesis_needs_own_employee_only() {
+    // Owner decisions: hub install rests on the admin `[isolation] public_web`
+    // switch (its PublicOrigins grant); synthesis needs no admin card and no
+    // grant beyond the own Employee. Neither is a pending workspace tool.
+    let f = fixture(true);
+    let names = ["file_read", "web_fetch_cached", "skill_hub_install", "skill_synthesis_run"];
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &workspace()) && !any_public(&auth));
+    let ctx = context(&auth);
+    assert!(!eligible(&ctx, "skill_hub_install"), "no PublicOrigins without public_web");
+    assert!(eligible(&ctx, "skill_synthesis_run"));
+    f.profile(true, "");
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &public_any()));
+    for tool in ["skill_hub_install", "skill_synthesis_run"] {
+        assert!(signed(&auth).contains(&tool), "{tool}");
+        assert!(eligible(&context(&auth), tool), "{tool}");
+    }
 }
 
 #[test]

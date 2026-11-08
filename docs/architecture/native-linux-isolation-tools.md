@@ -85,7 +85,11 @@ report lacks `work_broker` (helpers: also `helper_calls`) or the backend has no
 feature source, and the readiness report then names
 `workspace_broker_unavailable`, `helper_launcher_unavailable{reason}` and
 `helper_runtime_missing{runtime}`. The own-skill tools below (H12a) never receive a Workspace (or
-Recipient) grant from these selectors.
+Recipient) grant from these selectors; of the H12b/c/d job tools only
+`skill_from_recording` uses the brokered Workspace (its artifacts live there),
+and it stays in `PENDING_WORKSPACE_SELECTOR_TOOLS` until HX6 installs the
+recording job store. `skill_hub_install` and `skill_synthesis_run` are no
+longer on that list.
 
 H12a (v1.81): the own-skill tools `skill_extract`, `shared_skill_adopt`,
 `skill_security_scan`, `skill_graduate` and `skill_curator_status` no longer
@@ -125,6 +129,26 @@ still the same id and incarnation, then starts it as a self-delegation of the
 parent employee (the dispatcher's only self-delegation exception); the child
 holds only the job's tools, uses the parent's model routing (`tier` is
 recorded only) and cannot spawn another child.
+
+H12b/H12c/H12d (v1.81): the own-skill job tools take the exact protected schema
+(`tool_policy::check_own_skill_job_arguments`; no `scope`, `owner`, `target_agent`,
+path or identity key) and publish only into the caller's own `agents/<label>/SKILLS`.
+`skill_hub_install` needs the record's own `Employee` and its signed `PublicOrigins`
+grant; the archive URL is host-selected (`clawhub` only today), re-checked against
+the grant, fetched through the protected public path (DNS pin, public addresses,
+no redirects, 5 MiB) and expanded only in the E worker (traversal, absolute,
+symlink/special entries, case collisions, ratio > 100 and size refuse); the host
+re-checks the worker manifest, takes the single `SKILL.md`, E scans it before the
+existing install approval and again under the install locks. `skill_synthesis_run`
+needs only the own `Employee`: the existing provider plumbing runs under the
+employee's own utility runtime, budget and autonomy gates, only its own events are
+scored, E prepares and scans the model output, and the skill lands in its own
+SKILLS (no global bank, no Workspace grant). `skill_from_recording` needs the own
+`Employee`, the plain brokered `Workspace{employee-work}` and an installed recording
+job store; the artifacts are read through root's broker at the helper's layout
+(`recordings/<id>/{trace.zip,actions.json,network.json}`, shared
+`duduclaw_isolation::recording_layout`) and must match the job manifest. No job
+store is installed until HX6, so it is not eligible (hidden) in production.
 
 Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host handler is selected by `boundary_route` (including the Linux bundled model catalog). Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
 
@@ -291,7 +315,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `browser_record_stop` | A ExecutionBackend + ExecutionPlanFactory; protected route pending (HX6): never signed with `employee-work` (`PENDING_WORKSPACE_SELECTOR_TOOLS`) |
 | `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
-| `skill_from_recording` | Resource → original authenticated host orchestration; checked E parser required |
+| `skill_from_recording` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + brokered Workspace{employee-work}; own finished recording from the job store (HX6 seam), artifacts read through root's broker at the helper layout and matched to the job manifest, summarized by E, staged for approval; not eligible until HX6 installs the recording job store (H12d) |
 | `memory_search` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_store` | Resource → AuthorizedToolCall → original live employee handler |
 | `working_state_set` | Resource → AuthorizedToolCall → original live employee handler |
@@ -330,8 +354,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `skill_security_scan` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; own (else global) skill bytes scanned by E as data with own CONTRACT patterns; report only, findings rendered as one-line data (H12a) |
 | `skill_graduate` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; own skill scanned and prepared by E; global publication needs the dashboard admin card bound to the scanned source, then the journaled atomic publication (H12a) |
 | `skill_synthesis_status` | Resource → AuthorizedToolCall → original live employee handler |
-| `skill_synthesis_run` | Resource → original authenticated host orchestration; checked E parser required |
-| `skill_hub_install` | Resource → original authenticated host orchestration; checked E parser required |
+| `skill_synthesis_run` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee, no Workspace; own events only, host provider call under the employee's own runtime/budget, E prepares and scans, published no-clobber into the caller's own SKILLS (H12c) |
+| `skill_hub_install` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + signed PublicOrigins; host-selected hub archive via the protected public fetch, expanded only by E, single SKILL.md scanned by E before approval and at install, published no-clobber into the caller's own SKILLS (H12b) |
 | `skill_curator_status` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee; status and `run=true` limited to the caller's own skills (D-H4), run admin-approved, report returned and not published to the shared wiki (H12a) |
 | `skill_pin` | Resource → AuthorizedToolCall → original live employee handler |
 | `notion_status` | Resource → Native account-bound executor; product-policy/boot adapter pending |

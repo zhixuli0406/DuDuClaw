@@ -80,6 +80,12 @@ pub struct PipelineConfig {
     ///
     /// Defaults to `"duduclaw-eng-agent"`.
     pub target_agent_id: String,
+
+    /// H12c: a protected (isolated) `skill_synthesis_run` of this employee.
+    /// Must equal `target_agent_id`; only its own events are scored, and
+    /// skills are published into its own SKILLS (see `super::owned`), never
+    /// the global bank. `None` (default) keeps the existing behaviour.
+    pub owned_by: Option<String>,
 }
 
 impl Default for PipelineConfig {
@@ -99,6 +105,7 @@ impl Default for PipelineConfig {
             api_key: None,
             home_dir,
             target_agent_id: "duduclaw-eng-agent".to_string(),
+            owned_by: None,
         }
     }
 }
@@ -114,6 +121,9 @@ impl PipelineConfig {
         }
         if !duduclaw_core::is_valid_agent_id(&self.target_agent_id) {
             return Err("target_agent_id must not be empty".to_string());
+        }
+        if self.owned_by.as_ref().is_some_and(|owner| *owner != self.target_agent_id) {
+            return Err("owned synthesis must target its own employee".to_string());
         }
         Ok(())
     }
@@ -225,6 +235,11 @@ async fn run_scoped(config: &PipelineConfig) -> PipelineRun {
                 total_events_parsed: 0, total_trajectories: 0, top_trajectories: vec![], skills_graduated: 0, errors: vec![error] },
         }
     } else { parse_events_from_dir(&config.events_dir, config.lookback_days) };
+    // H12c: an owned run never scores (or reads memory of) another employee.
+    let events = match config.owned_by.as_deref() {
+        Some(owner) => super::owned::own_events(events, owner),
+        None => events,
+    };
     let total_events_parsed = events.len();
 
     info!(
@@ -363,6 +378,11 @@ async fn graduate_trajectories(
 
     // Load agent SOUL.md for context (prevents duplicate content).
     let protected = duduclaw_parse_worker::client::required();
+    // H12c: owned synthesis parses and scans only through E (fail closed).
+    let owned = config.owned_by.clone();
+    if owned.is_some() && !protected {
+        return (0, vec!["owned synthesis requires the isolated parse worker".into()]);
+    }
     let agent_soul = if protected {
         let path = config.home_dir.join("agents").join(&config.target_agent_id).join("SOUL.md");
         match crate::isolation_worker_plans::absolute_snapshot(&path, 64 * 1024) {
@@ -394,6 +414,10 @@ async fn graduate_trajectories(
             traj.agent_id,
             traj.quality_score
         );
+        if owned.as_deref().is_some_and(|owner| owner != traj.agent_id) {
+            errors.push(format!("{span_prefix} trajectory of another employee skipped"));
+            continue;
+        }
 
         // ── Step 1: Build SynthesisInput ─────────────────────────────────────
 
@@ -594,6 +618,10 @@ async fn graduate_trajectories(
             if used_names.contains(&synthesized.name) {
                 errors.push(format!("{span_prefix} skill destination already exists")); continue;
             }
+        }
+        // H12c: own-SKILLS publication is own-namespace (like H12a adopt); the
+        // admin card below guards only the global bank.
+        if protected && owned.is_none() {
             let state = serde_json::json!({"agent":config.target_agent_id,"key":proposal_key,
                 "name":synthesized.name,"sha256":crate::skill_lifecycle::isolated::digest(synthesized.full_markdown.as_bytes())});
             if let Err(error) = crate::skill_lifecycle::isolated::approve(&config.home_dir, &config.target_agent_id,
@@ -642,8 +670,15 @@ async fn graduate_trajectories(
         let publish_global_dir = global_skills_dir.clone();
         let publish_home = config.home_dir.clone();
         let markdown = synthesized.full_markdown.clone();
+        let publish_owner = owned.clone();
+        // The isolated call's live authority, re-checked before every write.
+        let authority = duduclaw_mcp_boundary::io_authority::capture();
         let publication = tokio::task::spawn_blocking(move || {
             let _leases = (_publication, caller_publication);
+            if let Some(owner) = publish_owner {
+                return authority.run(|| super::owned::publish(&publish_home, &owner, &candidate.skill_name,
+                    &markdown, &proposal_key));
+            }
             if protected {
                 let filename = format!("{}.md", candidate.skill_name);
                 crate::isolation_worker_plans::write_host_file(&publish_home, &["skills"], &filename, markdown.as_bytes())

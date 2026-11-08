@@ -671,15 +671,24 @@ pub(crate) async fn handle_skill_from_recording(
     agent: &str,
 ) -> Value {
     let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
-    if !crate::mcp_recording::is_valid_recording_id(id) {
+    // H12d: an isolated call distills its own finished protected recording
+    // (job store + brokered `employee-work` artifacts), never a host directory.
+    let isolated = crate::mcp_isolation::current().is_some();
+    if !(if isolated { duduclaw_isolation::recording_layout::valid_id(id) }
+        else { crate::mcp_recording::is_valid_recording_id(id) }) {
         return rec_error("skill_from_recording 需要有效的錄製 `id`。");
     }
     let dir = recording_dir(home_dir, id);
-    if !dir.is_dir() {
+    if !isolated && !dir.is_dir() {
         return rec_error(&format!("找不到錄製「{id}」。"));
     }
-    let protected = crate::mcp_isolation::current().is_some() || duduclaw_parse_worker::client::required();
-    let (meta, protected_input) = if protected {
+    let protected = isolated || duduclaw_parse_worker::client::required();
+    let (meta, protected_input) = if isolated {
+        match crate::mcp_skill_jobs::recording_input(home_dir, args, agent).await {
+            Ok((meta, bytes)) => (meta, Some(bytes)),
+            Err(message) => return rec_error(message),
+        }
+    } else if protected {
         let (home, id, agent) = (home_dir.to_owned(), id.to_owned(), agent.to_owned());
         let snapshot = tokio::task::spawn_blocking(move ||
             duduclaw_gateway::isolation_worker_plans::recording_snapshot(&home, &id, &agent)).await;
@@ -818,6 +827,10 @@ pub(crate) async fn handle_skill_from_recording(
         })).collect::<Vec<_>>())
     };
     if !scan_passed || matches!(scan_risk.as_str(), "High" | "Critical") {
+        if isolated {
+            // H12d: no host recording directory exists; never create one.
+            return rec_error(&format!("蒸餾出的 SKILL.md 未通過隔離安全掃描（風險 {scan_risk}），已擋下不送審。"));
+        }
         if let Err(reason) = write_rejected_draft(home_dir, agent, &dir, &skill_md).await {
             return rec_error(&reason);
         }

@@ -135,6 +135,9 @@ fn pending_production_selectors() -> BTreeSet<String> {
     // in-run (`Route::InRunHelper`) on the run's own `Workspace{employee-work}`.
     // H13 removed spawn_agent and spawn_ephemeral: host-queue work of the own
     // Employee grant (live delegation/binding/task checks per call).
+    // H12b/H12c removed skill_hub_install (own Employee + the issuer's
+    // PublicOrigins) and skill_synthesis_run (own Employee). skill_from_recording
+    // stays: it needs the recording job store (HX6), which nothing installs yet.
     let pending: BTreeSet<String> = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS
         .iter().map(|tool| (*tool).to_owned()).collect();
     for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS {
@@ -143,7 +146,10 @@ fn pending_production_selectors() -> BTreeSet<String> {
     for tool in duduclaw_mcp_boundary::tool_policy::SPAWN_TOOLS {
         assert!(!pending.contains(tool), "{tool}: H13 spawn tools have their selector");
     }
-    for tool in ["browser_record_start", "browser_record_stop"] {
+    for tool in H12BC_OWN_SKILL_JOB_TOOLS {
+        assert!(!pending.contains(tool), "{tool}: H12b/H12c skill jobs have their selector");
+    }
+    for tool in ["browser_record_start", "browser_record_stop", "skill_from_recording"] {
         assert!(pending.contains(tool), "{tool}: no protected route before HX6");
     }
     pending
@@ -152,6 +158,8 @@ fn pending_production_selectors() -> BTreeSet<String> {
 /// H12a tools the production issuer must make eligible without new selectors.
 const H12A_OWN_SKILL_TOOLS: [&str; 5] = ["skill_extract", "shared_skill_adopt", "skill_security_scan",
     "skill_graduate", "skill_curator_status"];
+/// H12b/H12c tools eligible from the production issuer's own grants.
+const H12BC_OWN_SKILL_JOB_TOOLS: [&str; 2] = ["skill_hub_install", "skill_synthesis_run"];
 
 fn employee_config(extra_capabilities: &str) -> String {
     format!(r#"[agent]
@@ -402,6 +410,24 @@ async fn employee_tool_parity(home: &std::path::Path) {
             "{tool}: the production issuer's EmployeeScope + own Employee (+ own wiki) must suffice");
         assert!(!pending.contains(tool), "{tool}");
     }
+    // H12b/H12c: own Employee under EmployeeScope (+ the issuer's PublicOrigins
+    // for the hub fetch); the resolver adds nothing, in particular no Workspace.
+    for tool in H12BC_OWN_SKILL_JOB_TOOLS {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: H12b/c selector missing");
+        assert!(!pending.contains(tool), "{tool}");
+        let selection = duduclaw_mcp_boundary::tool_policy::own_skill_job_selector(&context, tool).unwrap();
+        assert!(selection.iter().all(|grant| !matches!(grant, ResourceGrant::Workspace { .. })), "{tool}");
+        assert_eq!(selection[0], ResourceGrant::Employee { id: context.record().employee }, "{tool}");
+        if tool == "skill_hub_install" {
+            assert!(selection.len() == 2 && matches!(selection[1], ResourceGrant::PublicOrigins { .. }), "{tool}");
+        } else {
+            assert_eq!(selection.len(), 1, "{tool}: own Employee only");
+        }
+    }
+    // H12d: routed only once HX6 installs the recording job store.
+    assert!(duduclaw_mcp_boundary::tool_policy::recording_jobs().is_none());
+    assert_eq!(duduclaw_mcp_boundary::tool_policy::own_skill_job_selector(&context, "skill_from_recording"),
+        Err(VerificationError::Unavailable));
     // H9/H10: the production issuer selected the brokered Workspace, the
     // PublicOrigins grant and the interactive NewTask grant for this employee;
     // nothing was appended by the test.
