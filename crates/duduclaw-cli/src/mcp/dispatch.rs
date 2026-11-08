@@ -807,6 +807,11 @@ impl GatewayHandler<'_> {
         "file_read" | "csv_read" | "xlsx_read" => {
             let files_agent = acting_agent_id(caller_client_id, default_agent);
             match tool_name {
+                // H11: protected file_read opens on the blocking pool (root's
+                // work broker for `employee-work`); legacy reader unchanged.
+                "file_read" if crate::mcp_isolation::current().is_some() => {
+                    crate::mcp_files::handle_isolated_file_read(&arguments, home_dir, files_agent).await
+                }
                 "file_read" => {
                     crate::mcp_files::handle_file_read(&arguments, home_dir, files_agent)
                 }
