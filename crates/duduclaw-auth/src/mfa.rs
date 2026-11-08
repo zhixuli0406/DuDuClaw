@@ -827,6 +827,24 @@ fn clear(tx: &Connection, user: &str) -> Result<()> {
     Ok(())
 }
 
+/// Test support for other modules (F6c2 eligibility writer tests): start a
+/// TOTP enrolment through the real API at `now = 3000` and return the
+/// enrolment token and secret; finish with `mfa_confirm(user, Some(&token),
+/// &test_totp_code(&secret, 100), cipher, 3000)`.
+#[cfg(test)]
+pub(crate) fn test_totp_prepare(db: &UserDb, user: &str, password: &str, cipher: &dyn MfaCipher) -> (String, String) {
+    let token = db.mfa_password_challenge(user, password, "test-session", 3000).expect("enrolment challenge");
+    db.mfa_prepare_enrollment(&token, false, 3000).expect("enrolment proof");
+    let secret = db.mfa_begin(user, Some(&token), cipher, 3000).expect("enrolment begin");
+    (token, secret)
+}
+
+/// TOTP code of `secret` at `step` (test support, see [`test_totp_prepare`]).
+#[cfg(test)]
+pub(crate) fn test_totp_code(secret: &str, step: i64) -> String {
+    hotp(&decode_secret(secret).expect("valid secret"), step, 6)
+}
+
 mod enrollment;
 mod migration;
 pub use migration::MigrationConfirmationSession;

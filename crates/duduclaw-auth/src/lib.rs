@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod admin_approval_rule;
 pub mod admin_eligibility;
 pub mod db;
 pub mod jwt;
