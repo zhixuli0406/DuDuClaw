@@ -385,7 +385,6 @@ async fn cancelled_autonomy_rpc_still_completes_audit_and_push() {
     let pushed: Value = serde_json::from_str(&pushed).unwrap();
     assert_eq!(pushed["event"], "autonomy.changed");
     assert_eq!(pushed["payload"]["paused"], true);
-    assert!(autonomy_gate::status(&f.home).global.is_some());
     let audit = duduclaw_security::audit::read_recent_events(&f.home, 100);
     let requested = audit.iter().find(|row| row.event_type == "autonomy_change_requested").unwrap();
     let completed = audit.iter().find(|row| row.event_type == "autonomy_paused").unwrap();
@@ -393,13 +392,28 @@ async fn cancelled_autonomy_rpc_still_completes_audit_and_push() {
     assert_eq!(completed.details["reconciled"], false);
     assert_eq!(requested.details["request_digest"], completed.details["request_digest"]);
     // Push precedes the final locked acknowledgement; wait for that last write.
+    // The detached task is still atomically replacing the state file while we
+    // poll, and a reader racing a replacement may fail closed by contract
+    // (`open_regular`: bounded reopen, exhaustion is an error). Only a
+    // successful read that shows the recorded completion ends the wait; a
+    // state that never becomes readable still fails at the timeout.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let receipts = autonomy_gate::change_receipts(&f.home).unwrap();
-            if receipts.len() == 1 && receipts[0].completion_recorded { break; }
-            tokio::task::yield_now().await;
+            if let Ok(receipts) = autonomy_gate::change_receipts(&f.home)
+                && receipts.len() == 1 && receipts[0].completion_recorded
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }).await.unwrap();
+    // No writer remains: these strict reads must succeed and show the pause.
+    let receipts = autonomy_gate::change_receipts(&f.home).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0].completion_recorded);
+    let state = autonomy_gate::status(&f.home);
+    assert!(state.state_error.is_none(), "{:?}", state.state_error);
+    assert!(state.global.is_some());
 }
 
 async fn applied_receipt(home: &Path, agent: Option<&str>, paused: bool) -> ChangeReceipt {

@@ -145,9 +145,11 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
     if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
     let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     crate::sqlite::harden(&conn)?;check_sqlite(&conn)?;
-    let expected=Connection::open_in_memory()?;
-    expected.execute_batch(include_str!("approvals-v1793.sql"))?;
-    if crate::sqlite::schema(&conn)?!=crate::sqlite::schema(&expected)? {return Err(Error::Schema);}
+    // Exact v1.79.3 or v1.80.x catalog. The v1.80 decision-lease columns are
+    // never authorized below; only ids and the authority schema version are read.
+    match crate::catalog::detect(&conn,crate::catalog::Store::Approvals,None)?.version {
+        crate::catalog::SchemaVersion::V1793|crate::catalog::SchemaVersion::V180=>{}
+    }
     conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
         AuthAction::Select=>Authorization::Allow,
         AuthAction::Read {table_name:"approvals",column_name:"id"}
@@ -171,9 +173,10 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
 mod tests {
     use super::*;
     fn request(kind:SourceKind,title:&str)->ImportRequest {ImportRequest {version:1,migration_id:RequestId([4;16]),employee:None,source_id:"old:store".into(),kind,title:title.into(),legacy_agent:Some("sales".into()),has_wal:false,blob_handle:None}}
-    fn approval_db()->tempfile::NamedTempFile {
+    fn approval_db()->tempfile::NamedTempFile {approval_db_with(crate::catalog::APPROVALS_V1793)}
+    fn approval_db_with(catalog_sql:&str)->tempfile::NamedTempFile {
         let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
-        conn.execute_batch(include_str!("approvals-v1793.sql")).unwrap();
+        conn.execute_batch(catalog_sql).unwrap();
         for (id,status) in [("a","pending"),("b","approved"),("c","denied")] {
             conn.execute("INSERT INTO approvals(id,agent_id,action_kind,summary,payload,status,created_at) VALUES (?1,'sales','SECRET-KIND','SECRET-SUMMARY','{\"token\":\"SECRET-PAYLOAD\"}',?2,'now')",[id,status]).unwrap();
         }
@@ -181,18 +184,31 @@ mod tests {
     }
     #[test]
     fn authority_approvals_db_all_statuses_become_inert_expired_candidates() {
-        let file=approval_db();let p=extract(&request(SourceKind::AuthorityApprovalsSqlite,"approvals.db"),std::fs::File::open(file.path()).unwrap(),None).unwrap();
-        assert_eq!(p.len(),3);assert!(p.iter().all(|p|p.category==C::LegacyApproval&&p.fields.len()==1&&p.fields[0].name=="reference"));
-        assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));
-        let conn=rusqlite::Connection::open(file.path()).unwrap();
-        assert_eq!(conn.query_row("SELECT count(*) FROM approvals WHERE status='approved'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        for catalog_sql in [crate::catalog::APPROVALS_V1793,crate::catalog::APPROVALS_V180] {
+            let file=approval_db_with(catalog_sql);
+            if catalog_sql==crate::catalog::APPROVALS_V180 {
+                let conn=rusqlite::Connection::open(file.path()).unwrap();
+                conn.execute_batch("UPDATE approvals SET lease_token='SECRET-LEASE',lease_until='later' WHERE id='a'; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            }
+            let p=extract(&request(SourceKind::AuthorityApprovalsSqlite,"approvals.db"),std::fs::File::open(file.path()).unwrap(),None).unwrap();
+            assert_eq!(p.len(),3);assert!(p.iter().all(|p|p.category==C::LegacyApproval&&p.fields.len()==1&&p.fields[0].name=="reference"));
+            assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));
+            let conn=rusqlite::Connection::open(file.path()).unwrap();
+            assert_eq!(conn.query_row("SELECT count(*) FROM approvals WHERE status='approved'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        }
     }
     #[test]
     fn authority_approvals_db_rejects_added_trigger_and_version_drift() {
-        for extra in ["CREATE TRIGGER malicious AFTER INSERT ON approvals BEGIN SELECT 1; END;","UPDATE approval_authority_schema SET version=2;"] {
-            let file=approval_db();let conn=rusqlite::Connection::open(file.path()).unwrap();conn.execute_batch(extra).unwrap();drop(conn);
-            assert!(extract(&request(SourceKind::AuthorityApprovalsSqlite,"approvals.db"),std::fs::File::open(file.path()).unwrap(),None).is_err());
+        for catalog_sql in [crate::catalog::APPROVALS_V1793,crate::catalog::APPROVALS_V180] {
+            for extra in ["CREATE TRIGGER malicious AFTER INSERT ON approvals BEGIN SELECT 1; END;","UPDATE approval_authority_schema SET version=2;"] {
+                let file=approval_db_with(catalog_sql);let conn=rusqlite::Connection::open(file.path()).unwrap();conn.execute_batch(extra).unwrap();drop(conn);
+                assert!(extract(&request(SourceKind::AuthorityApprovalsSqlite,"approvals.db"),std::fs::File::open(file.path()).unwrap(),None).is_err());
+            }
         }
+        // Half-upgraded: only one of the two v1.80 lease columns is neither catalog.
+        let file=approval_db();let conn=rusqlite::Connection::open(file.path()).unwrap();
+        conn.execute_batch("ALTER TABLE approvals ADD COLUMN lease_token TEXT;").unwrap();drop(conn);
+        assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite,"approvals.db"),std::fs::File::open(file.path()).unwrap(),None).err(),Some(Error::Schema));
     }
     #[test]
     fn authority_connector_stores_keep_only_reentry_metadata() {

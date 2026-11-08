@@ -395,7 +395,7 @@ impl AuthorizedToolCall {
 
 /// These service routes orchestrate E stages, but retain the finite resource
 /// authority required when they were direct worker routes.
-fn employee_service_scope(policy: &ToolPolicy) -> bool {
+pub(crate) fn employee_service_scope(policy: &ToolPolicy) -> bool {
     policy.route == Route::Service && !matches!(policy.name,
         "skill_from_recording" | "skill_synthesis_run" | "skill_hub_install" |
         "skill_curator_status" | "meeting_transcribe" | "meeting_transcribe_status" |

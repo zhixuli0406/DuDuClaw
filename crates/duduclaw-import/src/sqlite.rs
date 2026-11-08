@@ -206,7 +206,8 @@ mod tests {
     }
 }
 
-/// Exact fresh v1.79.3 memory engine schema. Other historical variants are refused.
+/// Exact fresh memory engine schema of a known version (v1.79.3 or v1.80.x).
+/// Other historical variants are refused.
 pub(crate) fn memories<R: Read,W: Write>(input:R,wal:Option<&mut dyn Read>,emitter:&mut Emitter<'_,W>)->Result<()> {
     let temp=tempfile::tempdir()?;let main=temp.path().join("source.db");copy_bounded(input,&main)?;
     if let Some(wal)=wal {copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
@@ -214,8 +215,8 @@ pub(crate) fn memories<R: Read,W: Write>(input:R,wal:Option<&mut dyn Read>,emitt
     harden(&conn)?;
     if conn.query_row("PRAGMA user_version",[],|r|r.get::<_,u32>(0))? != 0 {return Err(Error::Schema);}
     if conn.query_row("PRAGMA quick_check",[],|r|r.get::<_,String>(0))? != "ok" {return Err(Error::Content);}
-    let expected=Connection::open_in_memory()?;expected.execute_batch(include_str!("memory-v1793.sql"))?;
-    if schema(&conn)? != schema(&expected)? {return Err(Error::Schema);}
+    // Both versions share the column mapping below: v1.80 only adds an index.
+    match catalog::detect(&conn,Store::Memory,None)?.version {SchemaVersion::V1793|SchemaVersion::V180=>{}}
     conn.authorizer(Some(|context:AuthContext<'_>| {
         if context.accessor.is_some() {return Authorization::Deny;}
         match context.action {
@@ -247,8 +248,11 @@ mod memory_tests {
     fn request()->ImportRequest {ImportRequest {version:1,migration_id:RequestId([1;16]),employee:Some(EmployeeId([2;16])),source_id:"memory".into(),
         kind:SourceKind::MemorySqlite,title:String::new(),legacy_agent:Some("sales".into()),has_wal:false,blob_handle:None}}
     fn database(extra:&str)->tempfile::NamedTempFile {
+        database_with(catalog::MEMORY_V1793,extra)
+    }
+    fn database_with(catalog_sql:&str,extra:&str)->tempfile::NamedTempFile {
         let file=tempfile::NamedTempFile::new().unwrap();let conn=Connection::open(file.path()).unwrap();
-        conn.execute_batch(include_str!("memory-v1793.sql")).unwrap();
+        conn.execute_batch(catalog_sql).unwrap();
         conn.execute_batch("INSERT INTO memories(id,agent_id,content,timestamp,origin_trust) VALUES ('m','sales','legacy text','now',1.0);
             INSERT INTO key_facts(id,agent_id,fact,timestamp) VALUES ('f','sales','legacy fact','now');
             INSERT INTO memories(id,agent_id,content,timestamp,quarantined) VALUES ('q','sales','quarantined','now',1);").unwrap();
@@ -256,10 +260,26 @@ mod memory_tests {
     }
     #[test]
     fn memory_import_only_content_never_authority_or_old_trust() {
-        let file=database("");let mut out=Vec::new();
-        assert_eq!(import(&request(),std::fs::File::open(file.path()).unwrap(),None,&mut out),Ok(2));
-        let text=String::from_utf8(out).unwrap();assert!(text.contains("legacy text"));assert!(text.contains("legacy fact"));
-        assert!(!text.contains("origin_trust"));assert!(!text.contains("quarantined"));
+        for catalog_sql in [catalog::MEMORY_V1793,catalog::MEMORY_V180] {
+            let file=database_with(catalog_sql,"");let mut out=Vec::new();
+            assert_eq!(import(&request(),std::fs::File::open(file.path()).unwrap(),None,&mut out),Ok(2));
+            let text=String::from_utf8(out).unwrap();assert!(text.contains("legacy text"));assert!(text.contains("legacy fact"));
+            assert!(!text.contains("origin_trust"));assert!(!text.contains("quarantined"));
+        }
+    }
+    #[test]
+    fn memory_import_detects_each_version_exactly() {
+        for (catalog_sql,version) in [(catalog::MEMORY_V1793,SchemaVersion::V1793),(catalog::MEMORY_V180,SchemaVersion::V180)] {
+            let conn=Connection::open_in_memory().unwrap();conn.execute_batch(catalog_sql).unwrap();
+            assert_eq!(catalog::detect(&conn,Store::Memory,None).unwrap().version,version);
+        }
+        // A v1.80 store with one planted index matches neither catalog and emits nothing.
+        let file=database_with(catalog::MEMORY_V180,"CREATE INDEX planted_idx ON memories(content);");let mut out=Vec::new();
+        assert_eq!(import(&request(),std::fs::File::open(file.path()).unwrap(),None,&mut out),Err(Error::Schema));
+        assert!(out.is_empty());
+        let refusal=catalog::take_schema_refusal().expect("refusal report");
+        assert_eq!((refusal.store,refusal.closest),(Store::Memory,SchemaVersion::V180));
+        assert_eq!(refusal.differences,vec![catalog::Difference::Unexpected{object:"index".into(),name:"planted_idx".into()}]);
     }
     #[test]
     fn memory_import_rejects_planted_table_view_and_trigger() {
