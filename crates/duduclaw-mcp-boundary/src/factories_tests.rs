@@ -80,7 +80,8 @@ async fn isolated_boot_resource_authorization_precedes_factory() {
 async fn isolated_boot_resource_change_during_factory_is_refused() {
     struct ChangedPlans(Arc<AtomicUsize>);
     impl ExecutionPlanFactory for ChangedPlans {
-        fn supports(&self, name: &str) -> bool { name == "execute_program" }
+        // codrive_run is still on the execution/child-run path (execute_program is now InRunHelper).
+        fn supports(&self, name: &str) -> bool { name == "codrive_run" }
         fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
             Box::pin(async move { self.0.fetch_add(1, Ordering::SeqCst); Ok(()) })
         }
@@ -97,7 +98,7 @@ async fn isolated_boot_resource_change_during_factory_is_refused() {
     let calls = Arc::new(AtomicUsize::new(0));
     let factories = GatewayFactories::assemble(Some(Arc::new(TestBackend)), Some(Arc::new(ChangedPlans(calls.clone()))),
         resolver(true, false), None, Arc::new(crate::resources::ResourceRoots::default())).unwrap();
-    assert_eq!(factories.execution.unwrap().execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert_eq!(factories.execution.unwrap().execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
