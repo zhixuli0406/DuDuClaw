@@ -334,6 +334,33 @@ fn h12bc_hub_install_tied_to_public_web_synthesis_needs_own_employee_only() {
 }
 
 #[test]
+fn hub_install_alone_gets_public_origins_when_public_web_on() {
+    let f = fixture(false);
+    f.profile(true, "");
+    let auth = f.issue(&["skill_hub_install"]).unwrap();
+    assert!(has(&auth, &public_any()));
+    assert!(auth.grant.resources.as_slice().contains(&ResourceGrant::EmployeeScope { id: EMPLOYEE }));
+    assert!(eligible(&context(&auth), "skill_hub_install"));
+    // The employee's own denial still wins.
+    f.profile(true, r#"denied_tools = ["skill_hub_install"]"#);
+    assert!(!any_public(&f.issue(&["skill_hub_install"]).unwrap()));
+    // A task-limited run never carries PublicOrigins.
+    f.profile(true, "");
+    f.tasks(&[("task-a", LABEL)]);
+    assert!(!any_public(&f.issue_task(&["skill_hub_install"], "task-a").unwrap()));
+}
+
+#[test]
+fn hub_install_alone_no_grant_when_public_web_off() {
+    let f = fixture(false);
+    let auth = f.issue(&["skill_hub_install"]).unwrap();
+    assert!(!any_public(&auth));
+    assert!(!eligible(&context(&auth), "skill_hub_install"));
+    f.profile(false, "");
+    assert!(!any_public(&f.issue(&["skill_hub_install"]).unwrap()));
+}
+
+#[test]
 fn h9_task_grant_only_for_owned_record_task() {
     let f = fixture(false);
     f.tasks(&[("task-own", LABEL), ("task-other", "bob")]);

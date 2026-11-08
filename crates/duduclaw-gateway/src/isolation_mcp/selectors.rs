@@ -18,7 +18,8 @@
 //!   root gets a fresh broker bound to this capability's employee and
 //!   incarnation (and, at first use, its run and control connection).
 //! * `PublicOrigins { * }` (H7, D-H2) — only for an employee-scope run (no
-//!   task) that lists `web_fetch_cached`/`web_extract`, and only when the admin
+//!   task) that lists `web_fetch_cached`/`web_extract` (or, since 2026-11-09,
+//!   `skill_hub_install`) and the profile allows it, and only when the admin
 //!   enabled protected public web for this employee: `agent.toml [isolation]
 //!   public_web = true` (owner decision 2026-11-08). That switch is separate
 //!   from `[container] network_access`, which keeps controlling only the task
@@ -57,6 +58,9 @@ pub(crate) const FILE_TOOLS: &[&str] = &["file_read", "csv_read", "xlsx_read"];
 /// spawnd's current readiness feature view (`SpawndBackend::features`). Read
 /// at issuance only; no view or an error must read as `SpawndFeatures::NONE`.
 pub(crate) type SpawndFeatureView = Arc<dyn Fn() -> SpawndFeatures + Send + Sync>;
+/// H12b: protected hub install; tied to the `public_web` switch (2026-11-09).
+/// The hub archive URL is host-selected, the grant is the same generic one.
+const HUB_INSTALL_TOOLS: &[&str] = &["skill_hub_install"];
 /// The tool the interactive `NewTask` grant authorizes.
 pub(crate) const NEW_TASK_TOOLS: &[&str] = &["create_task"];
 /// Upper bound for `agent.toml`; a larger file is not a profile we trust.
@@ -166,7 +170,10 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     let wants_helpers = IN_RUN_HELPER_TOOLS.iter().any(|name| listed(*name)) && sources.helper_calls();
     // D-H2: PublicOrigins exists only alongside EmployeeScope; a task-limited
     // run never carries it, so it is not even considered there.
-    let wants_web = input.task.is_none() && PUBLIC_ORIGIN_TOOLS.iter().any(|name| listed(*name));
+    // Owner decision 2026-11-09: protected `skill_hub_install` rests on the
+    // same `public_web` switch, so listing it also considers the grant.
+    let wants_web = input.task.is_none()
+        && PUBLIC_ORIGIN_TOOLS.iter().chain(HUB_INSTALL_TOOLS).any(|name| listed(*name));
     // NewTask: interactive runs only (a record-backed run plans under its own
     // record task, H8, and has no human requester of its own).
     let wants_new_task = !input.record && input.task.is_none() && NEW_TASK_TOOLS.iter().any(|name| listed(*name));
@@ -183,7 +190,7 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     // Owner decision 2026-11-08: its own admin-only switch, independent of
     // `[container] network_access` (task sandbox only).
     let public_web = wants_web && profile.as_ref().is_some_and(|profile| profile.isolation.public_web)
-        && allows(PUBLIC_ORIGIN_TOOLS);
+        && (allows(PUBLIC_ORIGIN_TOOLS) || allows(HUB_INSTALL_TOOLS));
     let new_task = (wants_new_task && allows(NEW_TASK_TOOLS)).then(|| input.user.to_owned());
     if new_task.as_deref().is_some_and(|user| user.is_empty() || user.len() > 128 || user.chars().any(char::is_control)) {
         return Err(VerificationError::Invalid);
