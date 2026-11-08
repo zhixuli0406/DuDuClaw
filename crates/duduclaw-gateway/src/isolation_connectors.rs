@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 #[cfg(test)]
 use duduclaw_mcp_boundary::bindings::BindingStore;
+use crate::isolation_connector_details::{AccountDetailRecord, DETAILS_SCHEMA, DETAILS_TABLE_NAME};
 
 /// Production catalog file. It lives directly in the gateway home, beside the
 /// other isolation stores (`isolation-forks.db`, `isolation-execution-jobs.db`,
@@ -222,10 +223,17 @@ impl ConnectorCatalog {
         connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
             .map_err(unavailable)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
-        let present: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE tbl_name='isolation_connector_routes')",
-            [], |row| row.get(0)).map_err(unavailable)?;
-        if !present {
+        let present = |table: &str| -> Result<bool, CatalogError> {
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE tbl_name=?1)", [table], |row| row.get(0))
+                .map_err(unavailable)
+        };
+        if !present("isolation_connector_routes")? {
             for (_, _, sql) in SCHEMA { tx.execute_batch(sql).map_err(unavailable)?; }
+        }
+        // v1.81 C6: a catalog created before the details table gains it; an
+        // existing details table must match exactly like the routes table.
+        if !present(DETAILS_TABLE_NAME)? {
+            for (_, _, sql) in DETAILS_SCHEMA { tx.execute_batch(sql).map_err(unavailable)?; }
         }
         verify_schema(&tx)?;
         tx.commit().map_err(unavailable)?;
@@ -237,7 +245,16 @@ impl ConnectorCatalog {
     /// relink) always yields a different id. `kind` must agree with `binding`.
     pub fn register(&self, account_label_hint: &str, provider: &str, kind: ConnectorKind, binding: &EmployeeBinding)
         -> Result<AccountId, CatalogError> {
-        self.insert(account_label_hint, provider, kind, binding, None)
+        self.insert(account_label_hint, provider, kind, binding, None, None)
+    }
+
+    /// [`register`](Self::register) plus the account's provider details
+    /// (C6), in the same transaction: either both exist, pinned to the new
+    /// route's generation and binding, or neither does. The record holds
+    /// references only, never a secret value.
+    pub fn register_with_details(&self, account_label_hint: &str, provider: &str, kind: ConnectorKind,
+        binding: &EmployeeBinding, details: &AccountDetailRecord) -> Result<AccountId, CatalogError> {
+        self.insert(account_label_hint, provider, kind, binding, None, Some(details))
     }
 
     /// Test fixture: register with a caller-chosen id in the production id
@@ -246,11 +263,11 @@ impl ConnectorCatalog {
     pub(crate) fn register_fixture(&self, account: &str, provider: &str, kind: ConnectorKind, binding: &EmployeeBinding)
         -> Result<AccountId, CatalogError> {
         let account = AccountId::parse(account)?;
-        self.insert(account.as_str(), provider, kind, binding, Some(account.clone()))
+        self.insert(account.as_str(), provider, kind, binding, Some(account.clone()), None)
     }
 
-    fn insert(&self, label: &str, provider: &str, kind: ConnectorKind, binding: &EmployeeBinding, fixed: Option<AccountId>)
-        -> Result<AccountId, CatalogError> {
+    fn insert(&self, label: &str, provider: &str, kind: ConnectorKind, binding: &EmployeeBinding, fixed: Option<AccountId>,
+        details: Option<&AccountDetailRecord>) -> Result<AccountId, CatalogError> {
         let unavailable = |_| CatalogError::Unavailable;
         let provider = known_provider(provider).ok_or(CatalogError::Invalid)?;
         if label.trim().is_empty() || label.len() > 128 || label.chars().any(char::is_control) || !kind.admits(binding) {
@@ -279,6 +296,9 @@ impl ConnectorCatalog {
                 VALUES (?1,?2,?3,?4,?5,?6,1,?7,NULL)",
                 params![account.as_str(), label, provider, kind.as_str(), binding_id, generation, now])
                 .map_err(unavailable)?;
+            if let Some(details) = details {
+                crate::isolation_connector_details::insert_row(&tx, &account, generation, &binding_id, provider, details, now)?;
+            }
             tx.commit().map_err(unavailable)?;
             return Ok(account);
         }
@@ -325,6 +345,11 @@ impl ConnectorCatalog {
                 params![account.as_str(), next])
         }.map_err(unavailable)?;
         if changed != 1 { return Err(CatalogError::Unavailable); }
+        // C6: details are pinned to the generation that just ended; they go
+        // with it in this same transaction (the delete trigger permits it
+        // only now that the route is revoked or its generation moved).
+        tx.execute("DELETE FROM isolation_connector_details WHERE account=?1", [account.as_str()])
+            .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         u64::try_from(next).map_err(|_| CatalogError::Unavailable)
     }
@@ -339,6 +364,39 @@ impl ConnectorCatalog {
         let route = raw.map(decode_route).transpose()?;
         if route.as_ref().is_some_and(|route| &route.account != account) { return Err(CatalogError::Unavailable); }
         Ok(route)
+    }
+
+    /// C6 reader: the current row for an id together with its provider
+    /// details, both from ONE read snapshot. The details are `Some` only when
+    /// the route is active and the stored row is pinned to exactly its
+    /// current generation; details of an older generation never resolve.
+    /// A row whose provider or binding disagrees with its route, or a row
+    /// without a route, is damage (`Unavailable`).
+    pub fn route_details(&self, account: &AccountId) -> Result<Option<(Route, Option<AccountDetailRecord>)>, CatalogError> {
+        let unavailable = |_| CatalogError::Unavailable;
+        let mut connection = self.lock()?;
+        let tx = connection.transaction().map_err(unavailable)?;
+        let raw = tx.query_row(
+            &format!("SELECT {ROUTE_COLUMNS} FROM isolation_connector_routes WHERE account=?1"),
+            [account.as_str()], raw_route).optional().map_err(unavailable)?;
+        let stored = crate::isolation_connector_details::read_row(&tx, account)?;
+        tx.finish().map_err(unavailable)?;
+        drop(connection);
+        let Some(raw) = raw else {
+            return if stored.is_some() { Err(CatalogError::Unavailable) } else { Ok(None) };
+        };
+        let route = decode_route(raw)?;
+        if &route.account != account { return Err(CatalogError::Unavailable); }
+        let details = match stored {
+            None => None,
+            Some(stored) => {
+                if stored.provider != route.provider || stored.binding_id != binding_id(&route.binding)? {
+                    return Err(CatalogError::Unavailable);
+                }
+                (route.active && stored.generation == route.generation).then_some(stored.record)
+            }
+        };
+        Ok(Some((route, details)))
     }
 
     /// Every active route whose binding is exactly `binding` (any kind),
@@ -421,23 +479,29 @@ fn now_seconds() -> Result<i64, CatalogError> {
 /// trigger/index on the routes table. Whitespace is ignored because SQLite
 /// normalizes it in `sqlite_master.sql`.
 fn verify_schema(connection: &Connection) -> Result<(), CatalogError> {
+    verify_table(connection, "isolation_connector_routes", &SCHEMA)?;
+    verify_table(connection, DETAILS_TABLE_NAME, &DETAILS_SCHEMA)
+}
+fn verify_table(connection: &Connection, table: &str, schema: &[(&str, &str, &str)]) -> Result<(), CatalogError> {
     let unavailable = |_| CatalogError::Unavailable;
     let compact = |sql: &str| sql.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     let mut statement = connection.prepare(
-        "SELECT type, name, sql FROM sqlite_master WHERE tbl_name='isolation_connector_routes'").map_err(unavailable)?;
-    let objects = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+        "SELECT type, name, sql FROM sqlite_master WHERE tbl_name=?1").map_err(unavailable)?;
+    let objects = statement.query_map([table], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
         row.get::<_, Option<String>>(2)?))).map_err(unavailable)?
         .collect::<Result<Vec<_>, _>>().map_err(unavailable)?;
+    let autoindex = format!("sqlite_autoindex_{table}_");
     let mut matched = 0;
     for (kind, name, sql) in objects {
-        if kind == "index" && sql.is_none() && name.starts_with("sqlite_autoindex_isolation_connector_routes_") { continue; }
-        let Some((_, _, expected)) = SCHEMA.iter().find(|(k, n, _)| *k == kind && *n == name) else {
+        if kind == "index" && sql.is_none() && name.strip_prefix(autoindex.as_str())
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) { continue; }
+        let Some((_, _, expected)) = schema.iter().find(|(k, n, _)| *k == kind && *n == name) else {
             return Err(CatalogError::Unavailable);
         };
         if sql.as_deref().map(compact) != Some(compact(*expected)) { return Err(CatalogError::Unavailable); }
         matched += 1;
     }
-    if matched != SCHEMA.len() { return Err(CatalogError::Unavailable); }
+    if matched != schema.len() { return Err(CatalogError::Unavailable); }
     Ok(())
 }
 /// The database and any SQLite sidecar that exists must be a regular,

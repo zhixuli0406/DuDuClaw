@@ -13,14 +13,22 @@
 //! (`AccountCredentialVault::remove`). A failure after the fence leaves the
 //! route revoked; repeating revoke is safe and retries the removal.
 //!
+//! Database, computer (website login) and channel routes are provisioned
+//! together with their per-account details (C6): the references are
+//! validated against their own registries for the named protected employee,
+//! and the route + details rows are committed in one catalog transaction.
+//! Revoke deletes the details in the same transaction that fences the route.
+//!
 //! Audit rows carry the actor, opaque account id, provider, kind, binding
-//! type, Personal owner user id and generation. Never labels, tokens, tenant
-//! ids or email addresses.
+//! type, Personal owner user id, generation and (for details) the employee
+//! id. Never labels, tokens, token references' values, tenant ids or email
+//! addresses.
 use std::{path::Path, sync::{Arc, OnceLock}};
 use duduclaw_isolation::capability::EmployeeBinding;
 use duduclaw_mcp_boundary::VerificationError;
 use serde_json::{Value, json};
 use crate::isolation_connector_clients::AccountCredentialVault;
+use crate::isolation_connector_details::{self as detail_store, AccountDetailRecord, DetailEmployee, DetailError, DetailReference};
 use crate::isolation_connectors::{AccountId, CatalogError, ConnectorCatalog, ConnectorKind, Route};
 
 /// Non-sensitive lifecycle failures.
@@ -28,6 +36,10 @@ use crate::isolation_connectors::{AccountId, CatalogError, ConnectorCatalog, Con
 pub enum LifecycleError {
     #[error(transparent)]
     Catalog(#[from] CatalogError),
+    /// The account details were missing, not applicable, or refused by
+    /// their registry. Nothing was registered.
+    #[error(transparent)]
+    Detail(#[from] DetailError),
     /// The route is revoked and fenced, but in-process credential material
     /// could not be dropped. Repeating revoke retries only the removal.
     #[error("connector route revoked; credential removal pending")]
@@ -70,30 +82,65 @@ pub fn install_credential_material(material: Arc<dyn CredentialMaterial>) -> Res
 
 /// Register one route for an account the admin provisioned. `label` is a
 /// display hint only; the id is always newly minted (a relink never reuses
-/// one). `kind` must agree with `binding`. No credential store is consulted.
+/// one). `kind` must agree with `binding`. No credential store is consulted
+/// to create routes.
+///
+/// `details` is required exactly for the providers in
+/// [`detail_store::DETAIL_PROVIDERS`] and refused for every other provider.
+/// The employee must come from the employee lifecycle (never a request
+/// field); its references are validated by [`detail_store::validate_request`]
+/// and written with the route in one transaction.
 pub fn provision(home: &Path, provider: &str, kind: ConnectorKind, binding: &EmployeeBinding, label: &str,
-    actor: &AdminActor) -> Result<AccountId, LifecycleError> {
+    details: Option<(&DetailEmployee, &DetailReference)>, actor: &AdminActor) -> Result<AccountId, LifecycleError> {
+    let refused = |status: &str| json!({"provider": provider_name(provider), "kind": kind.as_str(),
+        "binding_type": binding_type(binding), "status": status});
+    let record = match (detail_store::needs_details(provider), details) {
+        (true, Some((employee, reference))) =>
+            detail_store::validate_request(home, provider, kind, binding, employee, reference).map(Some),
+        (true, None) => Err(DetailError::Required),
+        (false, Some(_)) => Err(DetailError::NotApplicable),
+        (false, None) => Ok(None),
+    };
+    let record = match record {
+        Ok(record) => record,
+        Err(error) => {
+            audit(home, "isolation.connector_provision_refused", actor, refused(error.code()));
+            return Err(error.into());
+        }
+    };
     let result = ConnectorCatalog::open(home)
-        .and_then(|catalog| catalog.register(label, provider, kind, binding).map(|account| (catalog, account)))
+        .and_then(|catalog| match &record {
+            Some(record) => catalog.register_with_details(label, provider, kind, binding, record),
+            None => catalog.register(label, provider, kind, binding),
+        }.map(|account| (catalog, account)))
         .and_then(|(catalog, account)| {
-            // Read back what selection will read.
-            let route = catalog.route(&account)?.ok_or(CatalogError::Unavailable)?;
-            if !route.active || route.provider != provider || route.kind != kind || &route.binding != binding {
+            // Read back what selection and the details reader will read.
+            let (route, stored) = catalog.route_details(&account)?.ok_or(CatalogError::Unavailable)?;
+            if !route.active || route.provider != provider || route.kind != kind || &route.binding != binding
+                || stored != record {
                 return Err(CatalogError::Unavailable);
             }
             Ok(route)
         });
     match result {
         Ok(route) => {
-            audit(home, "isolation.connector_provisioned", actor, route_details(&route, "provisioned"));
+            let mut audited = route_details(&route, "provisioned");
+            audited["details"] = json!(record.is_some());
+            audited["details_employee"] = json!(record.as_ref().map(|record: &AccountDetailRecord| hex::encode(record.employee.0)));
+            audit(home, "isolation.connector_provisioned", actor, audited);
             Ok(route.account)
         }
         Err(error) => {
-            audit(home, "isolation.connector_provision_refused", actor,
-                json!({"kind": kind.as_str(), "binding_type": binding_type(binding), "status": refusal(error)}));
+            audit(home, "isolation.connector_provision_refused", actor, refused(refusal(error)));
             Err(error.into())
         }
     }
+}
+
+/// Only a known provider name is ever written to the audit log.
+fn provider_name(provider: &str) -> Value {
+    const KNOWN: [&str; 9] = ["google", "notion", "github", "odoo", "database", "channel", "search", "model", "computer"];
+    KNOWN.iter().find(|known| **known == provider).map_or(Value::Null, |known| Value::String((*known).to_owned()))
 }
 
 /// Revoke a route (final): fence through the catalog, then drop material.
@@ -104,10 +151,11 @@ pub fn revoke(home: &Path, account: &AccountId, actor: &AdminActor) -> Result<Ro
 pub(crate) fn revoke_with(home: &Path, account: &AccountId, actor: &AdminActor,
     material: Option<&dyn CredentialMaterial>) -> Result<Route, LifecycleError> {
     let fenced = ConnectorCatalog::open(home).and_then(|catalog| {
+        // Same transaction: deactivate, move the generation, delete details.
         catalog.revoke(account)?;
         // The fence must be durable and visible before any material goes away.
-        let route = catalog.route(account)?.ok_or(CatalogError::Unavailable)?;
-        if route.active || &route.account != account { return Err(CatalogError::Unavailable); }
+        let (route, details) = catalog.route_details(account)?.ok_or(CatalogError::Unavailable)?;
+        if route.active || &route.account != account || details.is_some() { return Err(CatalogError::Unavailable); }
         Ok(route)
     });
     let route = match fenced {

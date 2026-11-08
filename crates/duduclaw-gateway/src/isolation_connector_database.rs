@@ -198,7 +198,9 @@ fn select_only_before_connect(sql: &str) -> Result<(), VerificationError> {
     }
     Ok(())
 }
-fn source_config(home: &std::path::Path, agent: &str, source: &str) -> Result<toml::Value, VerificationError> {
+/// The employee's live grant + `[db_sources.<source>]` entry. Also used by
+/// C6 provision validation, so both check exactly the same thing.
+pub(crate) fn source_config(home: &std::path::Path, agent: &str, source: &str) -> Result<toml::Value, VerificationError> {
     let agent_dir = crate::ephemeral::resolve_agent_dir(home, agent).or_else(||
         (!crate::ephemeral::is_ephemeral_id(agent)).then(|| home.join("agents").join(agent)))
         .ok_or(VerificationError::Unavailable)?;
