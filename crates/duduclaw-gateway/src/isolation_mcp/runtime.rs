@@ -154,6 +154,9 @@ async fn spawn_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolatio
 pub(crate) async fn execute_registered_cli(id: &str, prompt: &str, context: &crate::runtime::RuntimeContext,
     format: duduclaw_core::runtime_catalog::OutputFormat) -> Result<crate::runtime::RuntimeResponse, String> {
     use duduclaw_isolation::bounded::Text;
+    // RM-103 S3: refused before any authority is consumed (see
+    // `runtime::protected_coarse_native_gate`).
+    crate::runtime::protected_coarse_native_gate(context.capabilities.as_ref(), id, &context.agent_id)?;
     let agent_dir = context.agent_dir.as_deref().ok_or_else(refusal)?;
     if context.effort.is_some() || crate::runtime_dispatch::in_utility_call()
         || crate::runtime::spawn_work_dir_override().is_some()
@@ -209,6 +212,11 @@ async fn collect_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolat
 /// selects both adapter and vendor ELF; native gateway configs are never used.
 pub(crate) async fn execute_native(runtime: RuntimeKind, prompt: String, context: &crate::runtime::RuntimeContext)
     -> Result<Vec<u8>, String> {
+    // RM-103 S3: the native write/shell restrictions `execute_native`'s list
+    // checks below do not see (`action_rules`, a malformed `[capabilities]`)
+    // refuse here, before any authority is consumed.
+    let name = match runtime { RuntimeKind::Codex => "codex", RuntimeKind::Grok => "grok", _ => return Err(refusal()) };
+    crate::runtime::protected_coarse_native_gate(context.capabilities.as_ref(), name, &context.agent_id)?;
     let agent_dir = context.agent_dir.as_deref().ok_or_else(refusal)?;
     if context.effort.is_some() || crate::runtime_dispatch::in_utility_call()
         || crate::runtime::spawn_work_dir_override().is_some()
@@ -225,7 +233,6 @@ pub(crate) async fn execute_native(runtime: RuntimeKind, prompt: String, context
     if runtime == RuntimeKind::Codex && std::env::var_os("CODEX_HOME").is_some() { return Err(refusal()); }
     let protocol = match runtime { RuntimeKind::Codex => "codex-v1", RuntimeKind::Grok => "grok-v1", _ => return Err(refusal()) };
     let authorization = take_authorization(agent_dir)?;
-    let name = if runtime == RuntimeKind::Codex { "codex" } else { "grok" };
     crate::product_policy::require_runtime(&context.home_dir, name).map_err(|_| refusal())?;
     crate::product_policy::require_model(crate::product_policy::load(&context.home_dir).map_err(|_| refusal())?,
         &context.model).map_err(|_| refusal())?;
@@ -338,6 +345,75 @@ mod tests {
             assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
         }
     }
+    /// Runs every protected coarse route (Codex, Grok, a registered generic
+    /// CLI) with `caps` inside a live authorization scope and returns the
+    /// errors; asserts the one-shot authority was not consumed by the refusal.
+    async fn protected_coarse_errors(caps: duduclaw_core::types::CapabilitiesConfig) -> Vec<String> {
+        let mut ctx = context();
+        ctx.capabilities = Some(caps);
+        with_runtime_authorization(authorization("alice"), async {
+            let mut errors = Vec::new();
+            for kind in [RuntimeKind::Codex, RuntimeKind::Grok] {
+                errors.push(execute_native(kind, "prompt".into(), &ctx).await.unwrap_err());
+            }
+            errors.push(execute_registered_cli("qwen", "prompt", &ctx,
+                duduclaw_core::runtime_catalog::OutputFormat::Text).await.unwrap_err());
+            // The S3 refusal runs before the authorization is taken.
+            assert_eq!(take_authorization(Path::new("/trusted-home/agents/alice")).unwrap().agent, "alice");
+            errors
+        }).await
+    }
+
+    /// RM-103 S3 after the main merge: a native shell restriction (here one
+    /// only `action_rules` carries, which the list checks above never saw, and
+    /// the fail-closed config of a malformed `[capabilities]`) refuses every
+    /// protected coarse runtime — the isolated route is no bypass.
+    #[tokio::test]
+    async fn protected_mode_still_refuses_shell_constrained_codex_grok_generic() {
+        let admin_ask: duduclaw_core::types::CapabilitiesConfig =
+            toml::from_str("action_rules = [{ effect = \"admin\", verdict = \"ask\" }]\n").unwrap();
+        assert!(admin_ask.native_tool_constraints().needs_no_shell());
+        for caps in [admin_ask, crate::runtime::fail_closed_capabilities()] {
+            for runtime in ["codex", "grok", "qwen"] {
+                assert!(crate::runtime::protected_coarse_native_gate(Some(&caps), runtime, "alice").is_err());
+            }
+            for error in protected_coarse_errors(caps.clone()).await {
+                assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+                assert!(error.contains("cannot enforce") && error.contains("原生指令執行"), "{caps:?}: {error}");
+            }
+        }
+        // Unconstrained configs never get the S3 refusal (they fail later, on
+        // the missing boot owner, with the generic protected-mode refusal).
+        let ctx = context();
+        for kind in [RuntimeKind::Codex, RuntimeKind::Grok] {
+            assert!(!execute_native(kind, "prompt".into(), &ctx).await.unwrap_err().contains("cannot enforce"));
+        }
+        assert!(crate::runtime::protected_coarse_native_gate(
+            Some(&duduclaw_core::types::CapabilitiesConfig::default()), "codex", "alice").is_ok());
+        assert!(crate::runtime::protected_coarse_native_gate(None, "grok", "alice").is_ok());
+    }
+
+    /// RM-103 S3: outside protected mode a write-only constraint narrows the
+    /// coarse sandbox to read-only. The isolated profile is root-derived and
+    /// has no per-run read-only mode, so in protected mode it is refused.
+    #[tokio::test]
+    async fn protected_mode_write_constraint_read_only_or_refused() {
+        let modify_ask: duduclaw_core::types::CapabilitiesConfig =
+            toml::from_str("action_rules = [{ effect = \"modify\", verdict = \"ask\" }]\n").unwrap();
+        let n = modify_ask.native_tool_constraints();
+        assert!(!n.needs_no_shell() && !n.no_write.is_empty(), "{n:?}");
+        // Unprotected Codex: narrowed to the read-only view, not refused.
+        assert!(crate::runtime::coarse_native_caps(Some(&modify_ask), "codex", "alice", true).unwrap().is_some());
+        for runtime in ["codex", "grok", "qwen"] {
+            let error = crate::runtime::protected_coarse_native_gate(Some(&modify_ask), runtime, "alice").unwrap_err();
+            assert!(error.contains("原生檔案寫入"), "{runtime}: {error}");
+        }
+        for error in protected_coarse_errors(modify_ask).await {
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+            assert!(error.contains("cannot enforce") && error.contains("原生檔案寫入"), "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn api_authority_is_one_shot_and_rejects_context_identity_mismatch() {
         with_runtime_authorization(authorization("alice"), async {
