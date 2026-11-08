@@ -84,6 +84,7 @@ impl Builder<'_> {
 /// The request title is a root-classified relative source path. Source ids and
 /// employee names are display/linkage data, not destination filesystem paths.
 pub fn extract(request:&ImportRequest,input:impl Read,wal:Option<&mut dyn Read>)->Result<Vec<AuthorityProposal>> {
+    crate::catalog::clear_schema_refusal();
     request.validate()?;
     if request.has_wal != wal.is_some() {return Err(Error::InvalidRequest);}
     let mut b=Builder {request,proposals:vec![]};
@@ -257,12 +258,45 @@ fn users_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     }
     #[test] fn authority_tasks_only_propose_scheduled_or_open_goal_work() {
         let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
-        conn.execute_batch(include_str!("tasks-v1793.sql")).unwrap();
+        conn.execute_batch(crate::catalog::TASKS_V180).unwrap();
         conn.execute_batch("INSERT INTO tasks(id,title,description,assigned_to,created_at,updated_at,kind,goal_mode) VALUES ('old-goal','Goal','Do work','sales','now','now','goal',1); INSERT INTO tasks(id,title,assigned_to,created_at,updated_at) VALUES ('plain','Historical task','sales','now','now'); INSERT INTO tasks(id,title,description,assigned_to,created_by,created_at,updated_at,kind,goal_mode,a2a_owner,created_via) VALUES ('a2a-goal','A2A-PRIVATE-CANARY','Do work','sales','a2a:user:alice','now','now','goal',1,'user:alice','a2a'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();drop(conn);
         let p=extract(&request(SourceKind::AuthorityTasksSqlite,"tasks.db"),std::fs::File::open(file.path()).unwrap(),None).unwrap();
         assert_eq!(p.len(),1);assert_eq!(p[0].category,C::Schedule);
         assert!(!serde_json::to_string(&p).unwrap().contains("A2A-PRIVATE-CANARY"));
         assert!(p[0].fields.iter().any(|f|f.name=="employee_id"));
+    }
+    #[test] fn a2a_goals_excluded_in_both_versions() {
+        let insert="INSERT INTO tasks(id,title,description,assigned_to,created_by,created_at,updated_at,kind,goal_mode,created_via,parent_task_id) VALUES (?1,?2,'Do work','sales',?3,'now','now','goal',1,?4,?5)";
+        // v1.79.3: no owner column or registry; A2A traces are the creator and channel.
+        let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
+        conn.execute_batch(crate::catalog::TASKS_V1793).unwrap();
+        for (id,title,creator,via,parent) in [("ordinary","Ordinary goal","system",None,None),
+            ("a2a-creator","A2A-PRIVATE-CREATOR","a2a:user:alice",None,None),
+            ("a2a-channel","A2A-PRIVATE-CHANNEL","system",Some("a2a"),None),
+            ("a2a-child","A2A-PRIVATE-CHILD","system",None,Some("a2a-creator")),
+            ("a2a-grandchild","A2A-PRIVATE-GRANDCHILD","system",None,Some("a2a-child"))] {
+            conn.execute(insert,rusqlite::params![id,title,creator,via,parent]).unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();drop(conn);
+        let p=extract(&request(SourceKind::AuthorityTasksSqlite,"tasks.db"),std::fs::File::open(file.path()).unwrap(),None).unwrap();
+        assert_eq!(p.len(),1);assert!(serde_json::to_string(&p).unwrap().contains("Ordinary goal"));
+        assert!(!serde_json::to_string(&p).unwrap().contains("A2A-PRIVATE"));
+        // v1.80: owner column, registry and inherited owners as well.
+        let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
+        conn.execute_batch(crate::catalog::TASKS_V180).unwrap();
+        conn.execute("INSERT INTO tasks(id,title,description,assigned_to,created_by,created_at,updated_at,kind,goal_mode,a2a_owner,created_via) VALUES ('a2a-owned','A2A-PRIVATE-OWNED','Do work','sales','a2a:user:alice','now','now','goal',1,'user:alice','a2a')",[]).unwrap();
+        for (id,title,creator,via,parent) in [("ordinary","Ordinary goal","system",None,None),
+            ("a2a-child","A2A-PRIVATE-CHILD","system",None,Some("a2a-owned")),
+            ("a2a-creator","A2A-PRIVATE-CREATOR","a2a:user:bob",None,None),
+            ("a2a-channel","A2A-PRIVATE-CHANNEL","system",Some("a2a"),None)] {
+            conn.execute(insert,rusqlite::params![id,title,creator,via,parent]).unwrap();
+        }
+        // A registry row alone (owner column cleared by a hostile writer) still excludes.
+        conn.execute_batch("INSERT INTO tasks(id,title,assigned_to,created_at,updated_at,kind,goal_mode) VALUES ('registry-only','A2A-PRIVATE-REGISTRY','sales','now','now','goal',1);
+            INSERT INTO task_access_principals VALUES ('registry-only','user:carol'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();drop(conn);
+        let p=extract(&request(SourceKind::AuthorityTasksSqlite,"tasks.db"),std::fs::File::open(file.path()).unwrap(),None).unwrap();
+        assert_eq!(p.len(),1);assert!(serde_json::to_string(&p).unwrap().contains("Ordinary goal"));
+        assert!(!serde_json::to_string(&p).unwrap().contains("A2A-PRIVATE"));
     }
     #[test] fn authority_secrets_in_all_reviewed_containers_never_leave_worker() {
         let secret_keys=["bot_token","api_hash","signing_secret","app_token","channel_secret","openai_api_key","arbitrary_enc","Service_Account_Json"];
@@ -285,7 +319,7 @@ innocent='SECRET-CANARY'
         }
     }
     #[test] fn authority_users_and_tasks_refuse_version_views_and_triggers() {
-        for (kind,title,schema) in [(SourceKind::AuthorityUsersSqlite,"users.db",include_str!("users-v1793.sql")),(SourceKind::AuthorityTasksSqlite,"tasks.db",include_str!("tasks-v1793.sql"))] {
+        for (kind,title,schema) in [(SourceKind::AuthorityUsersSqlite,"users.db",include_str!("users-v1793.sql")),(SourceKind::AuthorityTasksSqlite,"tasks.db",crate::catalog::TASKS_V1793),(SourceKind::AuthorityTasksSqlite,"tasks.db",crate::catalog::TASKS_V180)] {
             for mutation in ["PRAGMA user_version=1", "CREATE VIEW planted AS SELECT 1", "CREATE TABLE planted_authority(token TEXT)"] {
                 let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();conn.execute_batch(schema).unwrap();conn.execute_batch(mutation).unwrap();conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();drop(conn);
                 assert!(extract(&request(kind,title),std::fs::File::open(file.path()).unwrap(),None).is_err());
@@ -308,19 +342,24 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     // The reviewed task authority trigger covers more than 32 fields. This
     // fixed bound admits that catalog while retaining a small parser ceiling.
     conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH,128);
-    check_sqlite(&conn)?;let expected=Connection::open_in_memory()?;expected.execute_batch(include_str!("tasks-v1793.sql"))?;
-    if crate::sqlite::schema(&conn)?!=crate::sqlite::schema(&expected)? {return Err(Error::Schema);}
-    conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
-        AuthAction::Select=>Authorization::Allow,
-        AuthAction::Read {table_name:"tasks",column_name:"id"|"title"|"description"|"assigned_to"|"kind"|"goal_mode"|"status"|"acceptance_criteria"|"a2a_owner"|"created_via"}
+    check_sqlite(&conn)?;
+    let version=crate::catalog::detect(&conn,crate::catalog::Store::Tasks,None)?.version;
+    conn.authorizer(Some(move |c:AuthContext<'_>|match c.action {
+        // The A2A exclusion follows parent links with a recursive CTE.
+        AuthAction::Select|AuthAction::Recursive=>Authorization::Allow,
+        AuthAction::Read {table_name:"tasks",column_name:"id"|"title"|"description"|"assigned_to"|"kind"|"goal_mode"|"status"|"acceptance_criteria"|"created_via"|"created_by"|"parent_task_id"}
         |AuthAction::Read {table_name:"assign_schedules",column_name:"id"|"agent_id"|"title"|"payload_json"|"schedule_json"|"status"|"timezone"}
         |AuthAction::Read {table_name:"responsibilities",column_name:"responsibility_id"|"owner_agent_id"|"objective"|"acceptance_template"|"scope_json"|"notification_policy_json"|"schedule_json"|"occurrence_hours"|"occurrence_cost_cap_cents"|"budget_period"|"budget_timezone"|"period_cost_limit_cents"|"period_occurrence_limit"|"min_wake_interval_secs"|"max_consecutive_failures"|"stop_at"|"state"}
             if c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
+        // Owner columns exist only in the v1.80 catalog.
+        AuthAction::Read {table_name:"tasks",column_name:"a2a_owner"}
+        |AuthAction::Read {table_name:"task_access_principals",column_name:"task_id"}
+            if version==crate::catalog::SchemaVersion::V180 && c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
         _=>Authorization::Deny,
     }));
     // A2A-owned work is private to its external principal; republishing it as
     // ordinary employee goals would drop that owner restriction. It stays quarantined.
-    let mut query=conn.prepare("SELECT id,title,description,assigned_to,acceptance_criteria FROM tasks WHERE (kind='goal' OR goal_mode=1) AND status NOT IN ('done','cancelled','failed') AND a2a_owner IS NULL AND created_via IS NOT 'a2a' ORDER BY id")?;
+    let mut query=conn.prepare(task_goal_query(version))?;
     let mut rows=query.query([])?;
     while let Some(row)=rows.next()? {
         let settings=serde_json::json!({"kind":"goal","title":row.get::<_,String>(1)?,"description":row.get::<_,String>(2)?,"acceptance_criteria":row.get::<_,Option<String>>(4)?});
@@ -342,6 +381,32 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
         builder.settings(C::Schedule,&row.get::<_,String>(0)?,Value::Object(settings),vec![field("employee_id",row.get::<_,String>(1)?)])?;
     }
     Ok(())
+}
+
+/// Open goals that become Schedule proposals, per source version. A goal is
+/// A2A-owned (and excluded) when it, or any ancestor through
+/// `parent_task_id`, carries an A2A trace: v1.80 `a2a_owner`, a
+/// `task_access_principals` row, `created_via='a2a'`, or an `a2a:` creator
+/// (the gateway's own pre-registry rule). v1.79.3 has neither owner column nor
+/// registry, so only the last two traces apply. The prefix test is a range
+/// comparison so no SQL function needs authorizing.
+fn task_goal_query(version:crate::catalog::SchemaVersion)->&'static str {
+    use crate::catalog::SchemaVersion as V;
+    match version {
+        V::V1793=>"WITH RECURSIVE a2a(id) AS (
+                SELECT id FROM main.tasks WHERE created_via IS 'a2a' OR (created_by>='a2a:' AND created_by<'a2a;')
+                UNION SELECT t.id FROM main.tasks AS t JOIN a2a ON t.parent_task_id=a2a.id)
+            SELECT id,title,description,assigned_to,acceptance_criteria FROM main.tasks AS g
+            WHERE (kind='goal' OR goal_mode=1) AND status NOT IN ('done','cancelled','failed')
+                AND NOT EXISTS (SELECT 1 FROM a2a WHERE a2a.id=g.id) ORDER BY id",
+        V::V180=>"WITH RECURSIVE a2a(id) AS (
+                SELECT id FROM main.tasks WHERE a2a_owner IS NOT NULL OR created_via IS 'a2a' OR (created_by>='a2a:' AND created_by<'a2a;')
+                    OR id IN (SELECT task_id FROM main.task_access_principals)
+                UNION SELECT t.id FROM main.tasks AS t JOIN a2a ON t.parent_task_id=a2a.id)
+            SELECT id,title,description,assigned_to,acceptance_criteria FROM main.tasks AS g
+            WHERE (kind='goal' OR goal_mode=1) AND status NOT IN ('done','cancelled','failed')
+                AND NOT EXISTS (SELECT 1 FROM a2a WHERE a2a.id=g.id) ORDER BY id",
+    }
 }
 
 fn check_sqlite(conn:&rusqlite::Connection)->Result<()> {

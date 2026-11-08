@@ -1,4 +1,8 @@
-"""Generate the reviewed task catalog without loading a legacy database."""
+"""Generate the reviewed task catalog without loading a legacy database.
+
+Writes tasks-v180.sql: the current source is the v1.80.x store. tasks-v1793.sql is
+a separate pinned catalog of the older release and is never regenerated from
+current source (see its header for how it was derived)."""
 import pathlib,re,sqlite3
 root=pathlib.Path('crates/duduclaw-gateway/src/task_store')
 def literals(text):
@@ -39,5 +43,5 @@ for sql in literals(resp.split('pub(super) fn init_responsibility_schema')[1]):
     if sql.startswith(('CREATE ','ALTER ')) and '{' not in sql:run(sql)
 assign=(root/'assign_schedules.rs').read_text();run(next(s for s in literals(assign) if s.lstrip().startswith('CREATE TABLE IF NOT EXISTS assign_schedules')))
 a2a=(root/'a2a.rs').read_text();run(next(s for s in literals(a2a) if s.startswith('CREATE TABLE IF NOT EXISTS a2a_requests')))
-pathlib.Path('crates/duduclaw-import/src/tasks-v1793.sql').write_text('-- Generated from reviewed task-store DDL.\n'+'\n'.join(s.strip()+';' if not s.rstrip().endswith(';') else s.strip() for s in statements)+'\n')
+pathlib.Path('crates/duduclaw-import/src/tasks-v180.sql').write_text('-- Generated from reviewed task-store DDL (v1.80.x tasks.db; scripts/capture_tasks_schema.py).\n'+'\n'.join(s.strip()+';' if not s.rstrip().endswith(';') else s.strip() for s in statements)+'\n')
 print('schema objects:',conn.execute('SELECT count(*) FROM sqlite_schema').fetchone()[0])

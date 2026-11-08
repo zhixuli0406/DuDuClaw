@@ -21,7 +21,6 @@ PRAGMA journal_mode=WAL;
 
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
              CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
-             CREATE INDEX IF NOT EXISTS idx_tasks_a2a_creator_id ON tasks(created_by, id);
              CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
 
              CREATE TABLE IF NOT EXISTS discovery_decision_receipts (
@@ -107,7 +106,6 @@ ALTER TABLE tasks ADD COLUMN criteria_ledger TEXT;
 ALTER TABLE tasks ADD COLUMN authority_revision INTEGER NOT NULL DEFAULT 1 CHECK(authority_revision >= 1);
 ALTER TABLE tasks ADD COLUMN on_behalf_of TEXT;
 ALTER TABLE tasks ADD COLUMN created_via TEXT;
-ALTER TABLE tasks ADD COLUMN a2a_owner TEXT;
 CREATE TRIGGER IF NOT EXISTS task_timeout_follows_assignee
              AFTER UPDATE OF assigned_to ON tasks
              WHEN OLD.assigned_to IS NOT NEW.assigned_to AND NEW.timeout_secs IS NOT NULL
@@ -115,49 +113,8 @@ CREATE TRIGGER IF NOT EXISTS task_timeout_follows_assignee
                  UPDATE tasks SET timeout_secs = NULL WHERE id = NEW.id;
              END;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_discovery_run ON tasks(discovery_run_id) WHERE discovery_run_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_tasks_employee_health ON tasks(assigned_to, goal_mode, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_lease ON tasks(status, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived);
-CREATE INDEX IF NOT EXISTS idx_tasks_on_behalf_of ON tasks(on_behalf_of, updated_at) WHERE on_behalf_of IS NOT NULL;
-CREATE TABLE IF NOT EXISTS task_access_principals (
-                 task_id TEXT PRIMARY KEY,
-                 principal TEXT NOT NULL
-             );
-             UPDATE tasks SET a2a_owner = substr(created_by, 5)
-             WHERE a2a_owner IS NULL AND created_by GLOB 'a2a:user:?*';
-             WITH RECURSIVE inherited(id, principal) AS (
-                 SELECT id, a2a_owner FROM tasks WHERE a2a_owner IS NOT NULL
-                 UNION SELECT t.id, i.principal FROM tasks t JOIN inherited i ON t.parent_task_id = i.id
-             ) UPDATE tasks SET a2a_owner = (SELECT principal FROM inherited WHERE inherited.id = tasks.id)
-               WHERE a2a_owner IS NULL AND id IN (SELECT id FROM inherited);
-             INSERT OR IGNORE INTO task_access_principals
-                 SELECT id, a2a_owner FROM tasks WHERE a2a_owner IS NOT NULL;
-             CREATE TRIGGER IF NOT EXISTS task_a2a_owner_immutable
-             BEFORE UPDATE OF a2a_owner ON tasks
-             WHEN OLD.a2a_owner IS NOT NULL AND NEW.a2a_owner IS NOT OLD.a2a_owner
-             BEGIN SELECT RAISE(ABORT, 'A2A task owner is immutable'); END;
-             CREATE TRIGGER IF NOT EXISTS task_a2a_parent_update
-             BEFORE UPDATE OF parent_task_id ON tasks
-             WHEN (OLD.a2a_owner IS NOT NULL AND NEW.parent_task_id IS NOT OLD.parent_task_id)
-                 OR EXISTS (SELECT 1 FROM task_access_principals
-                 WHERE task_id = NEW.parent_task_id AND principal IS NOT NEW.a2a_owner)
-             BEGIN SELECT RAISE(ABORT, 'A2A parent owner mismatch'); END;
-             CREATE TRIGGER IF NOT EXISTS task_a2a_owner_insert
-             AFTER INSERT ON tasks
-             BEGIN
-                 SELECT CASE WHEN EXISTS (SELECT 1 FROM task_access_principals
-                     WHERE task_id = NEW.id)
-                     THEN RAISE(ABORT, 'A2A task id cannot be reused') END;
-                 SELECT CASE WHEN NEW.a2a_owner IS NOT NULL AND NEW.parent_task_id IS NOT NULL
-                     AND NOT EXISTS (SELECT 1 FROM task_access_principals
-                     WHERE task_id = NEW.parent_task_id AND principal = NEW.a2a_owner)
-                     THEN RAISE(ABORT, 'A2A parent owner mismatch') END;
-                 UPDATE tasks SET a2a_owner = COALESCE(NEW.a2a_owner,
-                     (SELECT principal FROM task_access_principals WHERE task_id = NEW.parent_task_id))
-                     WHERE id = NEW.id;
-                 INSERT INTO task_access_principals SELECT id, a2a_owner FROM tasks
-                     WHERE id = NEW.id AND a2a_owner IS NOT NULL;
-             END;
 CREATE TABLE IF NOT EXISTS task_authority_epochs (
             task_id TEXT PRIMARY KEY, revision_floor INTEGER NOT NULL CHECK(revision_floor>=1));
             INSERT INTO task_authority_epochs(task_id,revision_floor)
@@ -481,28 +438,3 @@ CREATE TABLE IF NOT EXISTS assign_schedules (
 );
 CREATE INDEX IF NOT EXISTS idx_assign_sched_creator ON assign_schedules(creator_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_assign_sched_due ON assign_schedules(status, next_fire_at);
-CREATE TABLE IF NOT EXISTS a2a_requests (
-                owner TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                payload_sha256 TEXT NOT NULL,
-                task_id TEXT NOT NULL UNIQUE,
-                PRIMARY KEY(owner, message_id)
-             );
-             CREATE TABLE IF NOT EXISTS a2a_task_sequence (
-                owner TEXT NOT NULL,
-                seq INTEGER NOT NULL,
-                task_id TEXT NOT NULL UNIQUE,
-                PRIMARY KEY(owner, seq)
-             );
-             CREATE TRIGGER IF NOT EXISTS a2a_task_sequence_insert
-             AFTER INSERT ON tasks WHEN NEW.a2a_owner IS NOT NULL AND NEW.created_via = 'a2a'
-             BEGIN
-                INSERT INTO a2a_task_sequence(owner,seq,task_id)
-                VALUES(NEW.a2a_owner, (SELECT COALESCE(MAX(seq),0)+1 FROM a2a_task_sequence WHERE owner=NEW.a2a_owner), NEW.id);
-             END;
-             INSERT INTO a2a_task_sequence(owner,seq,task_id)
-                SELECT a2a_owner,
-                    COALESCE((SELECT MAX(seq) FROM a2a_task_sequence WHERE owner=tasks.a2a_owner),0)
-                        + ROW_NUMBER() OVER (PARTITION BY a2a_owner ORDER BY created_at,id), id
-                FROM tasks WHERE a2a_owner IS NOT NULL AND created_via = 'a2a'
-                    AND NOT EXISTS (SELECT 1 FROM a2a_task_sequence WHERE task_id=tasks.id);

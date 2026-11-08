@@ -38,17 +38,38 @@ unrequested WAL descriptor, and checks required slots exist before taking Rust
 ownership. A missing close_range syscall fails closed.
 
 Supported sources are inert UTF-8 memory/wiki/conversation/task/audit text and the
-fresh-install sessions and memory schemas at user_version 0. The `*-v1793.sql`
-file names are historical: sessions, tasks and cron catalogs track the current
-(v1.80) fresh stores, so older variants of those stores are refused. Attachment
+sessions and memory schemas at user_version 0. Attachment
 and work-product sources emit only a root-bound handle, size and recomputed SHA-256;
 the root copier publishes bytes after employee allocation is confirmed. SQLite is copied into the
-worker's private temporary directory, with WAL replay only on that copy. Schema
-rows are compared byte-for-byte with the trusted `session-v1793.sql` and
-`memory-v1793.sql` schemas (plus the exact reviewed `channel_settings` extension
-for the shared sessions database);
-extra tables, columns, indexes, views or triggers reject the whole source. Older
-schema variants are deliberately rejected until exact catalogs are reviewed.
+worker's private temporary directory, with WAL replay only on that copy.
+
+Supported source versions: `sessions.db`, `tasks.db` and `cron_tasks.db` are
+accepted from **v1.79.3** and **v1.80.x** (1.80.0/1.80.1 share one catalog).
+Each version has its own pinned catalog (`session-v1793.sql` / `session-v180.sql`,
+`tasks-v1793.sql` / `tasks-v180.sql`, `cron-v1793.sql` / `cron-v180.sql`) and its
+own column mapping (`src/catalog.rs` detects the version). Detection is exact: the
+source's whole `sqlite_schema` must equal one catalog row for row (sessions also
+with the exact reviewed `channel_settings` extension); the closest catalog is used
+only to describe a refusal, never to accept. An unknown schema exits as a schema
+rejection, and the worker writes a bounded report to stderr naming the closest
+version and the differing objects (missing/unexpected/changed table, index, view or
+trigger, and catalog columns absent from a changed table). The report never contains
+SQL text or row content; unexpected names that are not plain identifiers are shown
+as `<unprintable name>`. Mappings: v1.80 sessions also skip unpublished replies
+(`delivery_pending`); tasks exclude A2A-owned goals in both versions (owner
+column/registry in v1.80, `created_via='a2a'` or an `a2a:` creator in both, inherited
+by child tasks); cron actor columns (`on_behalf_of`, and v1.80 `created_by_user_id`
+/ `scoped_by_user_id`) are never authorized for reading. The v1.79.3 sessions,
+tasks and cron catalogs were reconstructed from the v1.80 catalogs and the
+changelog, not captured from a v1.79.3 build; each file header says what was
+removed and why. Verify them against a real v1.79.3 home before release.
+The memory, users, approvals, channel-settings, workflow and autopilot stores still
+have a single `*-v1793.sql` catalog each, compared byte-for-byte as before; whether
+their v1.80 stores differ has not been reviewed (for example, the v1.80.0
+`mfa_email_codes`, `mfa_passkeys` and `remembered_*` tables are not in
+`users-v1793.sql`). Extra tables,
+columns, indexes, views or triggers reject the whole source; other historical
+variants are deliberately rejected until exact catalogs are reviewed.
 `memory-v1793.sql` is reproducible from the reviewed fresh engine SQL with
 `scripts/capture_memory_schema.py`; the gateway regression test compares that
 fixture against an actual fresh `SqliteMemoryEngine`. Memory emits only live,

@@ -1,4 +1,4 @@
--- Exact CronStore initializer and ordered additive columns (v1.79.3 base, v1.80 scoped creator).
+-- Exact CronStore initializer and ordered additive columns, v1.79.3.
 PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;
 
@@ -44,12 +44,3 @@ ALTER TABLE cron_tasks ADD COLUMN condition_script TEXT;
 ALTER TABLE cron_tasks ADD COLUMN condition_state TEXT;
 ALTER TABLE cron_tasks ADD COLUMN watch_command TEXT;
 ALTER TABLE cron_tasks ADD COLUMN on_behalf_of TEXT;
-ALTER TABLE cron_tasks ADD COLUMN created_by_user_id TEXT;
-ALTER TABLE cron_tasks ADD COLUMN scoped_by_user_id TEXT;
-CREATE TABLE IF NOT EXISTS cron_creation_receipts (
-            user_id TEXT NOT NULL, created_unix INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS idx_cron_creation_receipts ON cron_creation_receipts(user_id,created_unix);
-            CREATE INDEX IF NOT EXISTS idx_cron_scoped_creator ON cron_tasks(created_by_user_id,enabled);
-            CREATE INDEX IF NOT EXISTS idx_cron_scoped_actor ON cron_tasks(scoped_by_user_id,enabled);
-            CREATE INDEX IF NOT EXISTS idx_cron_scoped_principal ON cron_tasks(on_behalf_of,enabled);
-            CREATE INDEX IF NOT EXISTS idx_cron_scoped_agent ON cron_tasks(agent_id,enabled);

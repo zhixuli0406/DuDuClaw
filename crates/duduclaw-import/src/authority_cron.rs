@@ -18,26 +18,41 @@ fn propose(builder:&mut Builder<'_>,name:&str,owner:&str,schedule:&str,objective
         field("objective",objective),field("settings",encoded(&settings)?)],None)
 }
 
-pub(super) fn sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'_>)->Result<()> {
-    use rusqlite::{Connection,OpenFlags,hooks::{AuthAction,AuthContext,Authorization}};
-    let temp=tempfile::tempdir()?;let path=temp.path().join("source.db");
-    crate::sqlite::copy_bounded(input,&path)?;
-    if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
-    let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    crate::sqlite::harden(&conn)?;check_sqlite(&conn)?;
-    let expected=Connection::open_in_memory()?;expected.execute_batch(include_str!("cron-v1793.sql"))?;
-    if crate::sqlite::schema(&conn)?!=crate::sqlite::schema(&expected)? {return Err(Error::Schema);}
-    conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
+/// Column mapping per source version. v1.80 only added actor columns and
+/// creation receipts, none of which is read, so both versions share the
+/// schedule columns; the match keeps a new version from defaulting silently.
+fn cron_query(version:crate::catalog::SchemaVersion)->&'static str {
+    const SCHEDULE_COLUMNS:&str="SELECT t.name,t.agent_id,t.cron,t.task,t.cron_timezone,t.trigger_kind,
+        CASE WHEN t.condition_script IS NOT NULL AND t.condition_script<>'' THEN 1 ELSE 0 END,
+        CASE WHEN t.watch_command IS NOT NULL AND t.watch_command<>'' THEN 1 ELSE 0 END,
+        b.cron_id FROM main.cron_tasks t LEFT JOIN main.cron_workflow_bindings b ON b.cron_id=t.id ORDER BY t.id";
+    match version {crate::catalog::SchemaVersion::V1793|crate::catalog::SchemaVersion::V180=>SCHEDULE_COLUMNS}
+}
+
+/// Columns any cron mapping may read. Actor columns (on_behalf_of in every
+/// version, plus created_by_user_id and scoped_by_user_id in v1.80), delivery
+/// routing and execution state are never authorized.
+fn cron_columns(c:rusqlite::hooks::AuthContext<'_>)->rusqlite::hooks::Authorization {
+    use rusqlite::hooks::{AuthAction,Authorization};
+    match c.action {
         AuthAction::Select=>Authorization::Allow,
         AuthAction::Read {table_name:"cron_tasks",column_name:"id"|"name"|"agent_id"|"cron"|"task"|"cron_timezone"|"trigger_kind"|"condition_script"|"watch_command"}
         |AuthAction::Read {table_name:"cron_workflow_bindings",column_name:"cron_id"}
             if c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
         _=>Authorization::Deny,
-    }));
-    let mut query=conn.prepare("SELECT t.name,t.agent_id,t.cron,t.task,t.cron_timezone,t.trigger_kind,
-        CASE WHEN t.condition_script IS NOT NULL AND t.condition_script<>'' THEN 1 ELSE 0 END,
-        CASE WHEN t.watch_command IS NOT NULL AND t.watch_command<>'' THEN 1 ELSE 0 END,
-        b.cron_id FROM main.cron_tasks t LEFT JOIN main.cron_workflow_bindings b ON b.cron_id=t.id ORDER BY t.id")?;
+    }
+}
+
+pub(super) fn sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'_>)->Result<()> {
+    use rusqlite::{Connection,OpenFlags};
+    let temp=tempfile::tempdir()?;let path=temp.path().join("source.db");
+    crate::sqlite::copy_bounded(input,&path)?;
+    if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
+    let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    crate::sqlite::harden(&conn)?;check_sqlite(&conn)?;
+    let version=crate::catalog::detect(&conn,crate::catalog::Store::Cron,None)?.version;
+    conn.authorizer(Some(cron_columns));
+    let mut query=conn.prepare(cron_query(version))?;
     let mut rows=query.query([])?;
     while let Some(row)=rows.next()? {
         let name:String=row.get(0)?;let owner:String=row.get(1)?;let schedule:String=row.get(2)?;let objective:String=row.get(3)?;
@@ -101,7 +116,7 @@ mod tests {
     }
     fn db()->tempfile::NamedTempFile {
         let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
-        conn.execute_batch(include_str!("cron-v1793.sql")).unwrap();drop(conn);file
+        conn.execute_batch(crate::catalog::CRON_V180).unwrap();drop(conn);file
     }
     #[test]
     fn authority_cron_sqlite_emits_actionable_time_schedule_without_old_state() {
@@ -149,6 +164,33 @@ mod tests {
         let p=extract(&request(SourceKind::AuthorityCronJsonl),raw.as_slice(),None).unwrap();
         assert_eq!(value(&p[0],"requires_reentry"),"true");
         assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));
+    }
+    #[test]
+    fn cron_actor_columns_never_read_in_both_versions() {
+        use crate::catalog::{SchemaVersion as V,CRON_V1793,CRON_V180};
+        for (version,schema,actors) in [(V::V1793,CRON_V1793,&["on_behalf_of"][..]),
+            (V::V180,CRON_V180,&["on_behalf_of","created_by_user_id","scoped_by_user_id"][..])] {
+            // The mapping never names an actor column, and the authorizer it
+            // runs under refuses any statement that would read one.
+            let query=cron_query(version);
+            let probe=rusqlite::Connection::open_in_memory().unwrap();probe.execute_batch(schema).unwrap();
+            probe.authorizer(Some(cron_columns));
+            assert!(probe.prepare(query).is_ok());
+            for actor in actors {
+                assert!(!query.contains(actor));
+                assert!(probe.prepare(&format!("SELECT {actor} FROM main.cron_tasks")).is_err(),"{actor} must stay unreadable");
+                assert!(probe.prepare(&format!("SELECT 1 FROM main.cron_tasks WHERE {actor} IS NULL")).is_err());
+            }
+            // End to end: actor values present in the source never reach a proposal.
+            let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
+            conn.execute_batch(schema).unwrap();
+            conn.execute_batch("INSERT INTO cron_tasks(id,name,agent_id,cron,task,created_at,updated_at,on_behalf_of) VALUES ('old','Daily report','sales','0 9 * * *','Prepare report','now','now','user:SECRET-PRINCIPAL');").unwrap();
+            if version==V::V180 {conn.execute_batch("UPDATE cron_tasks SET created_by_user_id='SECRET-CREATOR',scoped_by_user_id='SECRET-SCOPER';").unwrap();}
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();drop(conn);
+            let p=extract(&request(SourceKind::AuthorityCronSqlite),std::fs::File::open(file.path()).unwrap(),None).unwrap();
+            assert_eq!(p.len(),1);assert_eq!(value(&p[0],"employee_id"),"sales");
+            assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));
+        }
     }
     #[test]
     fn authority_cron_sqlite_rejects_unknown_catalog_and_user_version() {

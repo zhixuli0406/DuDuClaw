@@ -1,13 +1,13 @@
 use std::{fs::OpenOptions, io::{Read, Write}, path::Path, time::{Duration, Instant}};
 use rusqlite::{Connection, OpenFlags, config::DbConfig, hooks::{AuthAction, AuthContext, Authorization}, limits::Limit};
-use crate::{Emitter, Error, Result, MAX_SOURCE_BYTES};
+use crate::{Emitter, Error, Result, MAX_SOURCE_BYTES, catalog::{self, Detected, SchemaVersion, Store}};
 use duduclaw_isolation::migration::ImportedContent;
 
-pub(crate) const SESSION_SCHEMA: &str = include_str!("session-v1793.sql");
+/// The channel_settings extension is identical in every known sessions.db version.
 pub(crate) const CHANNEL_SETTINGS_SCHEMA: &str = include_str!("channel-settings-v1793.sql");
 const MAX_SCHEMA_ROWS: usize = 256;
 const MAX_QUERY_SECONDS: u64 = 30;
-type SchemaRow = (String, String, String, Option<String>);
+pub(crate) type SchemaRow = (String, String, String, Option<String>);
 
 pub(crate) fn copy_bounded(mut input: impl Read, path: &Path) -> Result<()> {
     let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -82,15 +82,22 @@ pub(crate) fn harden(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Two reviewed catalogs: SessionManager alone, or the same database with the
-/// channel settings initialized by ChannelReplyEngine. No arbitrary extra table.
-pub(crate) fn session_schema_variant(conn:&Connection)->Result<bool> {
-    let actual=schema(conn)?;
-    let expected=Connection::open_in_memory()?;expected.execute_batch(SESSION_SCHEMA)?;
-    if actual==schema(&expected)? {return Ok(false);}
-    expected.execute_batch(CHANNEL_SETTINGS_SCHEMA)?;
-    if actual==schema(&expected)? {return Ok(true);}
-    Err(Error::Schema)
+/// Reviewed catalogs per known version: SessionManager alone, or the same
+/// database with the channel settings initialized by ChannelReplyEngine. The
+/// whole catalog must match one of them exactly. No arbitrary extra table.
+pub(crate) fn session_schema_variant(conn:&Connection)->Result<Detected> {
+    catalog::detect(conn, Store::Sessions, Some(CHANNEL_SETTINGS_SCHEMA))
+}
+
+/// Column mapping into conversation content, per source version. Both keep
+/// hidden and undone rows out. v1.80 also stores assistant rows that were
+/// never published (`delivery_pending=1`); v1.79.3 has no such column and
+/// removed undelivered rows instead.
+fn session_message_query(version: SchemaVersion) -> &'static str {
+    match version {
+        SchemaVersion::V1793 => "SELECT m.id, m.role, m.content, m.timestamp FROM main.session_messages AS m JOIN main.sessions AS s ON m.session_id = s.id WHERE s.agent_id = ?1 AND m.hidden = 0 AND m.undone_at IS NULL ORDER BY m.id",
+        SchemaVersion::V180 => "SELECT m.id, m.role, m.content, m.timestamp FROM main.session_messages AS m JOIN main.sessions AS s ON m.session_id = s.id WHERE s.agent_id = ?1 AND m.hidden = 0 AND m.undone_at IS NULL AND m.delivery_pending = 0 ORDER BY m.id",
+    }
 }
 
 pub(crate) fn sessions<R: Read, W: Write>(input: R, wal: Option<&mut dyn Read>, emitter: &mut Emitter<'_, W>) -> Result<()> {
@@ -105,18 +112,20 @@ pub(crate) fn sessions<R: Read, W: Write>(input: R, wal: Option<&mut dyn Read>, 
     if version != 0 { return Err(Error::Schema); }
     let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     if check != "ok" { return Err(Error::Content); }
-    session_schema_variant(&conn)?;
-    conn.authorizer(Some(|context: AuthContext<'_>| {
+    let version = session_schema_variant(&conn)?.version;
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
         if context.accessor.is_some() { return Authorization::Deny; }
         match context.action {
             AuthAction::Select => Authorization::Allow,
             AuthAction::Read { table_name: "sessions", column_name: "id" | "agent_id" }
-            | AuthAction::Read { table_name: "session_messages", column_name: "id" | "session_id" | "role" | "content" | "timestamp" | "hidden" | "undone_at" | "delivery_pending" }
+            | AuthAction::Read { table_name: "session_messages", column_name: "id" | "session_id" | "role" | "content" | "timestamp" | "hidden" | "undone_at" }
                 if context.database_name == Some("main") => Authorization::Allow,
+            AuthAction::Read { table_name: "session_messages", column_name: "delivery_pending" }
+                if version == SchemaVersion::V180 && context.database_name == Some("main") => Authorization::Allow,
             _ => Authorization::Deny,
         }
     }));
-    let mut stmt = conn.prepare("SELECT m.id, m.role, m.content, m.timestamp FROM main.session_messages AS m JOIN main.sessions AS s ON m.session_id = s.id WHERE s.agent_id = ?1 AND m.hidden = 0 AND m.undone_at IS NULL AND m.delivery_pending = 0 ORDER BY m.id")?;
+    let mut stmt = conn.prepare(session_message_query(version))?;
     let mut rows = stmt.query([emitter.request.legacy_agent.as_deref().ok_or(Error::InvalidRequest)?])?;
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
@@ -145,7 +154,7 @@ mod tests {
     fn db(extra: &str) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().unwrap();
         let conn = Connection::open(file.path()).unwrap();
-        conn.execute_batch(SESSION_SCHEMA).unwrap();
+        conn.execute_batch(catalog::SESSION_V180).unwrap();
         conn.execute_batch("INSERT INTO sessions(id, agent_id, last_active, created_at) VALUES ('s','sales','now','now'); INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('s','assistant','hello','now');").unwrap();
         conn.execute_batch(extra).unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -178,7 +187,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(SESSION_SCHEMA).unwrap();
+        conn.execute_batch(catalog::SESSION_V1793).unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO sessions(id,agent_id,last_active,created_at) VALUES ('s','sales','now','now'); INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('s','user','in WAL','now');").unwrap();
         let wal_path = dir.path().join("legacy.db-wal");
         let before = (std::fs::read(&path).unwrap(), std::fs::read(&wal_path).unwrap());
