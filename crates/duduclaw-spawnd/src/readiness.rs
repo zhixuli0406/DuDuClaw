@@ -52,6 +52,25 @@ impl Readiness {
     }
 }
 
+/// HX in-run helper readiness (D8 revision §5). Reported beside, never inside,
+/// `Readiness::check`: unavailable helpers must not block ordinary runs. The
+/// IPC projection (feature bit, `ErrorCode::HelperCgroupUnavailable`) is HX4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperReadiness {
+    Ready,
+    /// No helper-enabled run has probed open-time cgroup credentials yet.
+    Unprobed,
+    Unavailable(&'static str),
+}
+pub fn helper_readiness(launcher_supported: bool, open_time_credentials: Option<bool>) -> HelperReadiness {
+    if !launcher_supported { return HelperReadiness::Unavailable("helper_launcher_unavailable"); }
+    match open_time_credentials {
+        None => HelperReadiness::Unprobed,
+        Some(true) => HelperReadiness::Ready,
+        Some(false) => HelperReadiness::Unavailable(crate::helper_cgroup::UNAVAILABLE_REASON),
+    }
+}
+
 /// R7-M2: egress may use resolved's Unix socket or a dedicated DNS broker.
 /// No private resolver address exception is accepted, irrespective of port intent.
 pub fn validate_egress_ip_allow(address_exceptions: &[String]) -> Result<()> {
@@ -89,5 +108,12 @@ mod tests {
         for check in checks { assert_eq!(check.check(), Err(ErrorCode::IsolationUnavailable)); }
         assert!(validate_egress_ip_allow(&["10.0.0.1/32".into()]).is_err());
         assert!(validate_egress_ip_allow(&[]).is_ok());
+    }
+    #[test]
+    fn helper_readiness_fails_closed_without_open_time_credentials() {
+        assert_eq!(helper_readiness(false, Some(true)), HelperReadiness::Unavailable("helper_launcher_unavailable"));
+        assert_eq!(helper_readiness(true, Some(false)), HelperReadiness::Unavailable("helper_cgroup_unavailable"));
+        assert_eq!(helper_readiness(true, None), HelperReadiness::Unprobed);
+        assert_eq!(helper_readiness(true, Some(true)), HelperReadiness::Ready);
     }
 }

@@ -101,7 +101,7 @@ fn prepare(root: &Path, scenario: &str) -> (TrustedRun,Vec<OwnedFd>,OwnedFd,Opti
         supervisor_uid:SUPERVISOR,supervisor_gid:SUPERVISOR,gateway_uid:998,gateway_mount:0,
         program:program(identity,mode,script_identity),forwarder:forwarder_program,
         prompt_bytes:PROMPT.len() as u64,attachments:vec![InputFd::SealedMemfd {bytes:ATTACHMENT.len() as u64}],
-        mcp:true,proc_subset_pid:true};
+        mcp:true,proc_subset_pid:true,launcher:None};
     (plan,descriptors,mcp,egress)
 }
 

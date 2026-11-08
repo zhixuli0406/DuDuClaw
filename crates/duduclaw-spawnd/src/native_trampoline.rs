@@ -20,6 +20,32 @@ pub struct NativeProfile {
     pub tmpfs_bytes: u64,
     pub tmpfs_inodes: u64,
     pub proc_subset_pid: bool,
+    /// HX helper table for this run, already filtered to the run employee's
+    /// entitlements (`RootPolicy::helper_table`). `None` means no launcher.
+    pub launcher: Option<LauncherProfile>,
+}
+pub struct LauncherProfile {
+    pub helpers: Vec<HelperRun>,
+    /// Read-only helper registry clone (`bootstrap_mounts::prepare_helpers`).
+    pub mount: OwnedFd,
+    pub tmpfs_bytes: u64,
+}
+pub struct HelperRun {
+    /// Position in the parent's signed helper list.
+    pub index: u8,
+    pub binding: crate::helper_policy::HelperBinding,
+    pub runtime: crate::policy::PublishedRuntime,
+    pub executable: crate::bootstrap_mounts::VerifiedExecutable,
+    pub script: Option<crate::bootstrap_mounts::VerifiedExecutable>,
+}
+/// Helper availability of one run; HX4 answers `HelperCall` from this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperState {
+    /// The parent has no (entitled) helpers, or the trampoline has no launcher yet.
+    NotPlanned,
+    Available,
+    /// Readiness / per-call reason, e.g. `helper_cgroup_unavailable`.
+    Unavailable(&'static str),
 }
 pub struct ForwarderProfile {
     pub entry: String,
@@ -64,6 +90,65 @@ struct Pending {
     pty: bool,
     uid: u32,
     master: Option<crate::native_pty::ReturnedPty>,
+    /// spawnd's end of the per-run launcher control socketpair (§2.2).
+    control: Option<OwnedFd>,
+    /// Signed indices in run-table order: `Start.helper` is a position in this list.
+    helper_indices: Vec<u8>,
+    /// Launcher rights already in `manifest` (cgroup fds are added at bind).
+    launcher_rights: usize,
+    cgroups: Option<crate::helper_cgroup::linux::RunCgroups>,
+    helpers: HelperState,
+}
+impl NativeTrampoline {
+    pub fn helper_state(&self, run: RunHandle) -> Option<HelperState> { self.runs.get(&run.0).map(|pending| pending.helpers) }
+    /// HX4: the run-table position of a helper derived from `entry.employee`.
+    pub fn helper_position(&self, run: RunHandle, signed_index: u8) -> Option<u8> {
+        let pending = self.runs.get(&run.0)?;
+        if pending.helpers != HelperState::Available { return None; }
+        pending.helper_indices.iter().position(|index| *index == signed_index).and_then(|p| u8::try_from(p).ok())
+    }
+    /// HX4: spawnd's control socket end and root-held slot cgroups of a run.
+    pub fn helper_channel(&mut self, run: RunHandle) -> Option<(&OwnedFd, &mut crate::helper_cgroup::linux::RunCgroups)> {
+        let pending = self.runs.get_mut(&run.0)?;
+        if pending.helpers != HelperState::Available { return None; }
+        Some((pending.control.as_ref()?, pending.cgroups.as_mut()?))
+    }
+}
+const HELPER_CGROUP_FDS: usize = duduclaw_run::helper_policy::HELPER_CGROUP_FDS;
+/// Build the trampoline's helper table and its descriptors (control socket end,
+/// helper registry mount, per helper executable and optional script).
+fn launcher_plan(profile: LauncherProfile, control: OwnedFd) -> Result<(duduclaw_run::linux::runner::LauncherPlan, Vec<OwnedFd>, Vec<u8>)> {
+    use duduclaw_run::linux::runner::{HelperProgram, LauncherPlan};
+    let observed = checked(fd::observe(profile.mount.as_raw_fd()))?;
+    let mounts = vec![MountIdentity { mount: observed.identity.mount, fs_type: observed.fs_type }];
+    let mut rights = vec![control, profile.mount];
+    let mut helpers = Vec::new();
+    let mut indices = Vec::new();
+    for helper in profile.helpers {
+        let (mut argv, script_name) = match &helper.runtime.executable {
+            crate::policy::Executable::Elf { entry, .. } => (vec![format!("/helpers/{}", entry.as_str())], None),
+            crate::policy::Executable::Script { interpreter, script, .. } =>
+                (vec![format!("/helpers/{}", interpreter.as_str()), format!("/helpers/{}", script.as_str())], Some(script.as_str().to_owned())),
+        };
+        argv.extend(helper.runtime.fixed_args.iter().map(|arg| arg.as_str().to_owned()));
+        let script = match (script_name, &helper.script) {
+            (Some(name), Some(value)) => Some((checked(fd::observe(value.fd.as_raw_fd()))?.identity, checked(CString::new(name))?)),
+            (None, None) => None,
+            _ => return Err(unavailable()),
+        };
+        let binding = helper.binding;
+        helpers.push(HelperProgram {
+            program: Program { identity: checked(fd::observe(helper.executable.fd.as_raw_fd()))?.identity, script,
+                argv: argv.into_iter().map(|arg| checked(CString::new(arg))).collect::<Result<_>>()?,
+                environment: vec![], seccomp: binding.seccomp, seccomp_digest: binding.seccomp_digest },
+            self_only: binding.self_only, mount: 0, slot: binding.slot, filesystem: binding.filesystem,
+            open_files: binding.open_files, file_size_bytes: binding.file_size_bytes, timeout_ms: binding.timeout_ms,
+            egress: binding.egress });
+        rights.push(helper.executable.fd);
+        if let Some(script) = helper.script { rights.push(script.fd); }
+        indices.push(helper.index);
+    }
+    Ok((LauncherPlan { helpers, mounts, tmpfs_bytes: profile.tmpfs_bytes }, rights, indices))
 }
 pub struct NativeTrampoline { installation: Box<dyn Installation>, runs: BTreeMap<RunId, Pending> }
 impl NativeTrampoline {
@@ -120,19 +205,35 @@ impl Trampoline for NativeTrampoline {
         if let Some(script) = script { rights.push(script.fd); }
         rights.extend(inputs); rights.extend(stdin); rights.extend(mcp);
         let forwarder = forwarder.map(|(program, executable)| { rights.extend(egress); rights.push(executable); program });
+        // HX launcher descriptors follow the forwarder; cgroup fds come at bind.
+        let (launcher, control, helper_indices, launcher_rights) = match profile.launcher {
+            Some(launcher) if duduclaw_run::linux::runner::LAUNCHER_SUPPORTED && !launcher.helpers.is_empty() => {
+                let (spawnd_end, launcher_end) = checked(nix::sys::socket::socketpair(nix::sys::socket::AddressFamily::Unix,
+                    nix::sys::socket::SockType::SeqPacket, None, nix::sys::socket::SockFlag::SOCK_CLOEXEC))?;
+                let (plan, extra, indices) = launcher_plan(launcher, launcher_end)?;
+                let count = extra.len();
+                rights.extend(extra);
+                (Some(plan), Some(spawnd_end), indices, count)
+            }
+            _ => (None, None, vec![], 0),
+        };
+        let helpers = if launcher.is_some() { HelperState::Available } else { HelperState::NotPlanned };
         let trusted = TrustedRun { root: RootConfig { employee_uid: plan.uid, employee_gid: plan.gid,
             pty: plan.pty, pty_limit: plan.max_ptys.max(1), work_noexec: true, tmp_noexec: true,
             tmpfs_bytes: profile.tmpfs_bytes, tmpfs_inodes: profile.tmpfs_inodes },
             mounts: identities.try_into().map_err(|_| unavailable())?, supervisor_uid: plan.supervisor_uid,
             supervisor_gid: plan.supervisor_gid, gateway_uid: profile.snapshot.gateway_uid,
             gateway_mount: profile.snapshot.mount_id, program, forwarder, prompt_bytes: plan.prompt_bytes,
-            attachments: plan.input_fds, mcp: plan.mcp, proc_subset_pid: profile.proc_subset_pid, stdin: !plan.pty, pty_size: plan.pty_size };
+            attachments: plan.input_fds, mcp: plan.mcp, proc_subset_pid: profile.proc_subset_pid, stdin: !plan.pty, pty_size: plan.pty_size,
+            launcher };
         checked(trusted.validate())?;
-        if trusted.expected_fd_count() != rights.len() { return Err(unavailable()); }
+        let pending_cgroup_fds = if trusted.launcher.is_some() { HELPER_CGROUP_FDS } else { 0 };
+        if trusted.expected_fd_count() != rights.len() + pending_cgroup_fds { return Err(unavailable()); }
         let (socket, bootstrap_for_unit) = checked(nix::sys::socket::socketpair(nix::sys::socket::AddressFamily::Unix,
             nix::sys::socket::SockType::SeqPacket, None, nix::sys::socket::SockFlag::SOCK_CLOEXEC))?;
         self.runs.insert(plan.run.0, Pending { socket, manifest: Some((trusted,rights)), cancelled: None,
-            stages: Stages::default(), prepared_at_ms: checked(crate::server::coordination_time_ms())?, terminal: None, pty: plan.pty, uid: plan.uid, master: None });
+            stages: Stages::default(), prepared_at_ms: checked(crate::server::coordination_time_ms())?, terminal: None, pty: plan.pty, uid: plan.uid, master: None,
+            control, helper_indices, launcher_rights, cgroups: None, helpers });
         Ok(PreparedBootstrap { bootstrap_for_unit })
     }
     fn bind_unit(&mut self, run: RunHandle, unit: &crate::systemd::linux::StartedUnit, cancelled: Arc<AtomicBool>) -> Result<()> {
@@ -142,7 +243,23 @@ impl Trampoline for NativeTrampoline {
         // StartedUnit can only be obtained from Systemd's checked start/adopt.
         // The monitor has installed this cgroup before releasing the B2 barrier.
         let challenge = checked(bootstrap::receive_challenge(pending.socket.as_raw_fd()))?;
-        let (plan, rights) = pending.manifest.take().ok_or_else(unavailable)?;
+        let (mut plan, mut rights) = pending.manifest.take().ok_or_else(unavailable)?;
+        if plan.launcher.is_some() {
+            // The waiting trampoline is the unit's only process: spawnd, as root
+            // outside the unit's mount namespace, builds the HX cgroup leaves now,
+            // before any employee-uid process exists (D8 revision §2.4 [F6]).
+            match crate::helper_cgroup::linux::prepare_run(&unit.cgroup) {
+                Ok((cgroups, fds)) => { rights.extend(fds); pending.cgroups = Some(cgroups); }
+                Err(reason) => {
+                    // Fail closed for helpers only; the run starts without a launcher.
+                    let keep = rights.len().checked_sub(pending.launcher_rights).ok_or_else(unavailable)?;
+                    rights.truncate(keep);
+                    plan.launcher = None;
+                    pending.control = None; pending.helper_indices.clear();
+                    pending.helpers = HelperState::Unavailable(reason.as_reason());
+                }
+            }
+        }
         if cancelled.load(Ordering::Acquire) { return Err(unavailable()); }
         let raw: Vec<_> = rights.iter().map(AsRawFd::as_raw_fd).collect();
         checked(sealed_registry::send(pending.socket.as_raw_fd(), challenge, run.0, plan, &raw))?;

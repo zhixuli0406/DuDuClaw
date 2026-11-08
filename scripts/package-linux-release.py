@@ -231,6 +231,11 @@ def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen, runt
                 if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
                         or not 0 < metadata.st_size <= 1024 * 1024):
                     raise ValueError("invalid signed runtime policy file")
+                # Shape-check the policy (v2 domain/version, helper launcher
+                # bindings) before its digest is bound; spawnd re-checks all of it.
+                signer.validate_policy_document(json.loads(source.read_bytes(),
+                    object_pairs_hook=signer.unique_object, parse_float=signer.reject_number,
+                    parse_constant=signer.reject_number))
             # The signer rechecks immutable staged bytes, hashes and sizes. No
             # acceptance or policy is inferred from the local build outputs.
             shutil.copyfile(source, raw_artifacts / name)

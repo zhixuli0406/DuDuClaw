@@ -652,6 +652,9 @@ mod spawnd_install_tests {
         assert!(service.lines().any(|line| line == "StandardError=null"));
         assert!(service.lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
         assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
+        // HX: cgroupfs is writable only beneath the employees slice; the rest stays protected.
+        assert!(service.lines().any(|line| line == "ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice"));
+        assert!(service.lines().any(|line| line == "ProtectControlGroups=yes"));
         assert!(lookup("duduclaw-employees.slice").lines().any(|line| line == "TasksMax=1024"));
         assert!(lookup("duduclaw.slice").lines().any(|line| line == "MemoryMin=512M"));
     }

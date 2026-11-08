@@ -35,9 +35,52 @@ pub struct EmployeeEntitlement {
     pub profiles: Vec<ProfileId>,
 }
 
+/// One row of a run's helper table. `index` is the launcher `Start.helper` byte.
+pub struct HelperEntry<'a> { pub index: u8, pub binding: &'a crate::helper_policy::HelperBinding, pub runtime: &'a PublishedRuntime }
+
 #[derive(Clone)]
-pub struct RootPolicy { runtimes: Vec<PublishedRuntime>, employees: BTreeMap<EmployeeId, Vec<ProfileId>> }
+pub struct RootPolicy { runtimes: Vec<PublishedRuntime>, employees: BTreeMap<EmployeeId, Vec<ProfileId>>,
+    launchers: BTreeMap<[u8; 32], crate::helper_policy::LauncherRecord> }
 impl RootPolicy {
+    /// Attach the parent profiles' signed helper allowlists after checks 1–7
+    /// (HX D8 revision §2.3). Any failing launcher fails the whole publication.
+    pub fn with_launchers(mut self, arch: duduclaw_run::seccomp::Architecture,
+        launchers: Vec<(ProfileId, duduclaw_run::seccomp::RuntimeProfile, crate::helper_policy::LauncherRecord)>) -> Result<Self> {
+        if launchers.len() > 128 { return Err(ErrorCode::RuntimeDenied); }
+        for (profile, parent_seccomp, launcher) in launchers {
+            let parent = self.runtimes.iter().find(|runtime| runtime.profile == profile).ok_or(ErrorCode::RuntimeDenied)?;
+            crate::helper_policy::validate_launcher(arch, parent, &parent_seccomp, &launcher, &self.runtimes)
+                .map_err(|_| ErrorCode::RuntimeDenied)?;
+            if self.launchers.insert((profile.0).0, launcher).is_some() { return Err(ErrorCode::RuntimeDenied); }
+        }
+        Ok(self)
+    }
+    /// The helper table of a run of `parent` for `employee`, always derived from
+    /// the run entry's employee, never from a request. Check 1's entitlement half
+    /// is applied here because entitlements are host data, not signed policy: a
+    /// helper the employee is not entitled to is absent (refused), not substituted.
+    /// Indices are the positions in the signed list, so they are stable per profile.
+    pub fn helper_table(&self, employee: EmployeeId, parent: &PublishedRuntime) -> Vec<HelperEntry<'_>> {
+        let Some(profiles) = self.employees.get(&employee) else { return vec![]; };
+        let Some(launcher) = self.launchers.get(&(parent.profile.0).0) else { return vec![]; };
+        if !profiles.contains(&parent.profile) { return vec![]; }
+        launcher.helpers.iter().enumerate().filter_map(|(index, binding)| {
+            if !profiles.contains(&binding.profile) { return None; }
+            let runtime = self.runtimes.iter().find(|runtime| runtime.profile == binding.profile)?;
+            Some(HelperEntry { index: u8::try_from(index).ok()?, binding, runtime })
+        }).collect()
+    }
+    pub fn helper_tmpfs_bytes(&self, parent: &PublishedRuntime) -> Option<u64> {
+        self.launchers.get(&(parent.profile.0).0).map(|launcher| launcher.helper_tmpfs_bytes)
+    }
+    /// Per call (§2.3): re-derive the helper for the run's own employee and map it
+    /// to its index in that run's table; absent means refused.
+    pub fn derive_helper(&self, employee: EmployeeId, parent: &PublishedRuntime, helper: &RuntimeKind) -> Result<HelperEntry<'_>> {
+        let mut matching = self.helper_table(employee, parent).into_iter().filter(|entry| entry.runtime.runtime == *helper);
+        let entry = matching.next().ok_or(ErrorCode::RuntimeDenied)?;
+        if matching.next().is_some() { return Err(ErrorCode::RuntimeDenied); }
+        Ok(entry)
+    }
     pub fn from_verified_publication(runtimes: Vec<PublishedRuntime>, entitlements: Vec<EmployeeEntitlement>) -> Result<Self> {
         if runtimes.is_empty() || runtimes.len() > 128 || entitlements.len() > 30_000 { return Err(ErrorCode::RuntimeDenied); }
         let mut profiles = BTreeSet::new();
@@ -65,7 +108,7 @@ impl RootPolicy {
                 || entitlement.profiles.iter().any(|profile| !profiles.contains(&(profile.0).0) || !assigned.insert((profile.0).0))
                 || employees.insert(entitlement.employee, entitlement.profiles).is_some() { return Err(ErrorCode::RuntimeDenied); }
         }
-        Ok(Self { runtimes, employees })
+        Ok(Self { runtimes, employees, launchers: BTreeMap::new() })
     }
     pub fn derive(&self, employee: EmployeeId, request: &RuntimeKind, pty: bool) -> Result<(&PublishedRuntime, LaunchPolicy)> {
         let profiles = self.employees.get(&employee).ok_or(ErrorCode::RuntimeDenied)?;
@@ -148,6 +191,37 @@ mod tests {
         assert_eq!(env["HTTP_PROXY"], "http://127.0.0.1:8080");
         assert!(runtime_environment(&NetworkPolicy::Egress(profile), None).is_err());
         assert!(runtime_environment(&NetworkPolicy::Offline, Some(8080)).is_err());
+    }
+    #[test]
+    fn helper_table_derives_from_run_employee_entitlement() {
+        use crate::helper_policy::*;
+        use duduclaw_run::seccomp::{Architecture, RuntimeProfile};
+        let arch = Architecture::X86_64;
+        let mut parent = runtime(1);
+        parent.resources.memory_bytes = 1 << 30; parent.timeouts.runtime_ms = 600_000; parent.timeouts.termination_grace_ms = 15_000;
+        let mut helper = runtime(2);
+        helper.runtime = RuntimeKind::Registered(Text::new("duduclaw-program-v1".into()).unwrap()); helper.mcp = false;
+        helper.timeouts.runtime_ms = 305_000;
+        let seccomp = RuntimeProfile { allowed_syscalls: vec![0, 231, 322] };
+        let binding = HelperBinding { profile: helper.profile, slot: HelperSlot::Foreground, seccomp_digest: seccomp.digest(arch).unwrap(),
+            seccomp, self_only: vec![], memory_bytes: 1 << 20, tasks: 4, cpu_quota_percent: 50, open_files: 64,
+            file_size_bytes: 512, timeout_ms: 60_000, filesystem: vec![HelperFs::SystemRo, HelperFs::Work], egress: false };
+        let launcher = LauncherRecord { reserve: RuntimeReserve { memory_bytes: 1 << 20, tasks: 4, cpu_quota_percent: 10 }, helpers: vec![binding],
+            helper_tmpfs_bytes: 4096 };
+        let (entitled, other) = (EmployeeId([1; 16]), EmployeeId([2; 16]));
+        let policy = RootPolicy::from_verified_publication(vec![parent.clone(), helper.clone()], vec![
+            EmployeeEntitlement { employee: entitled, profiles: vec![parent.profile, helper.profile] },
+            EmployeeEntitlement { employee: other, profiles: vec![parent.profile] }]).unwrap()
+            .with_launchers(arch, vec![(parent.profile, RuntimeProfile { allowed_syscalls: vec![0, 1, 231, 322] }, launcher.clone())]).unwrap();
+        assert_eq!(policy.helper_table(entitled, &parent).len(), 1);
+        assert_eq!(policy.derive_helper(entitled, &parent, &helper.runtime).unwrap().index, 0);
+        // Not entitled to the helper: absent, never another helper.
+        assert!(policy.helper_table(other, &parent).is_empty());
+        assert!(policy.derive_helper(other, &parent, &helper.runtime).is_err());
+        assert!(policy.derive_helper(entitled, &parent, &RuntimeKind::Claude).is_err());
+        // A parent filter narrower than the helper fails the whole publication.
+        assert!(RootPolicy::from_verified_publication(vec![parent.clone(), helper], vec![]).unwrap()
+            .with_launchers(arch, vec![(parent.profile, RuntimeProfile { allowed_syscalls: vec![231, 322] }, launcher)]).is_err());
     }
     #[test]
     fn executable_names_are_registry_components_only() {

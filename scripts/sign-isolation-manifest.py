@@ -79,6 +79,86 @@ def bind_artifacts(document, directory):
         artifact["size_bytes"] = length
 
 
+POLICY_DOMAIN_V2 = "duduclaw-isolation-policy-v2"
+HELPER_BINDING_KEYS = {"profile", "slot", "seccomp", "seccomp_digest", "self_only", "memory_bytes", "tasks",
+                       "cpu_quota_percent", "open_files", "file_size_bytes", "timeout_ms", "filesystem", "egress"}
+HELPER_FS = {"work", "work_recordings", "system_ro"}
+PRCTL_SELF_ONLY = {1, 2, 3, 4, 7, 16, 21, 27, 30, 38, 39, 42}
+
+
+def _integer(value, low, high):
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def validate_policy_document(document):
+    """Offline shape check of the signed isolation policy artifact.
+
+    spawnd re-runs every publication check (HX D8 revision section 2.3) on the
+    bytes; this only stops a malformed template before it is bound by the
+    release manifest. v2 carries its domain and version in the signed bytes;
+    v1 has neither a domain nor a launcher.
+    """
+    if not isinstance(document, dict):
+        raise ValueError("policy must be an object")
+    version = document.get("version")
+    if version == 1:
+        if set(document) != {"version", "runtimes", "native"}:
+            raise ValueError("v1 policy has exactly version/runtimes/native")
+    elif version == 2:
+        if set(document) != {"domain", "version", "runtimes", "native"} or document["domain"] != POLICY_DOMAIN_V2:
+            raise ValueError("v2 policy requires its signed domain")
+    else:
+        raise ValueError("unsupported policy version")
+    native = document.get("native")
+    if not isinstance(native, list) or not isinstance(document.get("runtimes"), list) \
+            or len(native) != len(document["runtimes"]):
+        raise ValueError("one native record per runtime")
+    for record in native:
+        launcher = record.get("launcher") if isinstance(record, dict) else None
+        if launcher is None:
+            continue
+        if version != 2:
+            raise ValueError("launcher requires policy v2")
+        if not isinstance(launcher, dict) or set(launcher) != {"reserve", "helpers", "helper_tmpfs_bytes"}:
+            raise ValueError("invalid launcher record")
+        if not _integer(launcher["helper_tmpfs_bytes"], 1, record.get("tmpfs_bytes", 0)):
+            raise ValueError("helper tmpfs exceeds the parent tmpfs budget")
+        helpers = launcher["helpers"]
+        if not isinstance(helpers, list) or not 1 <= len(helpers) <= 16:
+            raise ValueError("1 to 16 helper bindings")
+        profiles = set()
+        for binding in helpers:
+            if not isinstance(binding, dict) or not set(binding) <= HELPER_BINDING_KEYS \
+                    or not (HELPER_BINDING_KEYS - {"self_only"}) <= set(binding):
+                raise ValueError("invalid helper binding fields")
+            profile = canonical_bytes(binding["profile"])
+            if profile in profiles or binding["profile"] == record.get("profile"):
+                raise ValueError("duplicate or self helper binding")
+            profiles.add(profile)
+            recording = binding["slot"] == "recording"
+            if binding["slot"] not in ("foreground", "recording") or binding["egress"] is not recording:
+                raise ValueError("recording slot iff egress helper")
+            grants = binding["filesystem"]
+            if not isinstance(grants, list) or not grants or len(set(grants)) != len(grants) \
+                    or not set(grants) <= HELPER_FS or ("work" in grants) == recording \
+                    or ("work_recordings" in grants) != recording:
+                raise ValueError("invalid helper filesystem grants")
+            if not _integer(binding["timeout_ms"], 1, 300_000):
+                raise ValueError("helper timeout must be 1..300000 ms")
+            for key in ("memory_bytes", "tasks", "cpu_quota_percent", "open_files", "file_size_bytes"):
+                if not _integer(binding[key], 1, 2 ** 64 - 1):
+                    raise ValueError("helper limits must be positive integers")
+            for call in binding.get("self_only", []):
+                if call == {"kind": "prlimit64_self_only"}:
+                    continue
+                options = call.get("options") if isinstance(call, dict) and set(call) == {"kind", "options"} \
+                    and call.get("kind") == "prctl" else None
+                if not isinstance(options, list) or not options or len(set(options)) != len(options) \
+                        or not all(_integer(o, 0, 2 ** 32 - 1) and o in PRCTL_SELF_ONLY for o in options):
+                    raise ValueError("invalid self-only seccomp exception")
+    return document
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kind", choices=NAMESPACES, default="release")

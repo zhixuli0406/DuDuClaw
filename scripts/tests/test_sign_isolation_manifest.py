@@ -50,6 +50,36 @@ class ManifestSigningTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 SIGN.bind_artifacts(document, directory)
 
+    def test_policy_template_version_domain_and_launcher_shape(self):
+        binding = {"profile": [2] * 32, "slot": "foreground", "seccomp": {"allowed_syscalls": [0, 231, 322]},
+                   "seccomp_digest": [3] * 32, "memory_bytes": 1, "tasks": 1, "cpu_quota_percent": 1,
+                   "open_files": 64, "file_size_bytes": 1, "timeout_ms": 300_000,
+                   "filesystem": ["system_ro", "work"], "egress": False,
+                   "self_only": [{"kind": "prlimit64_self_only"}, {"kind": "prctl", "options": [1, 4, 38]}]}
+        launcher = {"reserve": {"memory_bytes": 1, "tasks": 1, "cpu_quota_percent": 1},
+                    "helpers": [binding], "helper_tmpfs_bytes": 4096}
+        def policy(version=2, domain=SIGN.POLICY_DOMAIN_V2, launcher=launcher):
+            document = {"version": version, "runtimes": [{}],
+                        "native": [{"profile": [1] * 32, "tmpfs_bytes": 4096, "launcher": launcher}]}
+            if domain is not None:
+                document["domain"] = domain
+            return document
+        SIGN.validate_policy_document(policy())
+        SIGN.validate_policy_document(policy(version=1, domain=None, launcher=None))
+        bad = [policy(version=1, domain=None), policy(version=1), policy(domain=None),
+               policy(domain="duduclaw-isolation-policy-v1"), policy(version=3)]
+        for change in [("timeout_ms", 300_001), ("filesystem", ["work", "home"]), ("filesystem", ["work_recordings"]),
+                       ("egress", True), ("slot", "background"), ("self_only", [{"kind": "prctl", "options": [22]}]),
+                       ("self_only", [{"kind": "prlimit64_any"}]), ("tasks", 0), ("extra", 1)]:
+            wide = dict(binding)
+            wide[change[0]] = change[1]
+            bad.append(policy(launcher=dict(launcher, helpers=[wide])))
+        bad.append(policy(launcher=dict(launcher, helpers=[binding] * 17)))
+        bad.append(policy(launcher=dict(launcher, helper_tmpfs_bytes=8192)))
+        for document in bad:
+            with self.assertRaises(ValueError):
+                SIGN.validate_policy_document(document)
+
     @unittest.skipUnless(shutil.which("ssh-keygen"), "requires system OpenSSH")
     def test_real_ssh_keygen_round_trip_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as temporary:
