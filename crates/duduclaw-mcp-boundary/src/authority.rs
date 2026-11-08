@@ -277,9 +277,12 @@ impl CapabilityVerifier for Boundary {
         if entry.state != snapshot.state { return Err(VerificationError::Revoked); }
         if let Err(error) = live { entry.revoke(); return Err(error); }
         let State::Active(nonce) = entry.state else { return Err(VerificationError::Revoked); };
-        Ok(RequestContext::with_live_verifier(record.clone(), Arc::new(RequestAuthority {
+        // HX5 [F7]: this context came from the run's own activated MCP
+        // connection; the binding's run (== record.run, checked above) is the
+        // transport run that in-run helper calls must target.
+        Ok(RequestContext::with_transport(record.clone(), Arc::new(RequestAuthority {
             boundary: self.weak.clone(), id: record.id, nonce,
-        })))
+        }), binding.run))
     }
 }
 

@@ -43,8 +43,14 @@ fn public_origins_grant(context: &RequestContext) -> Option<&ResourceGrant> {
 
 /// Execution and Worker MUST use packages A/E; neither may spawn under the
 /// gateway uid. Connector execution MUST enforce the current binding/lease.
+/// `InRunHelper` (HX5, D8 revision §5) runs a signed helper inside the
+/// caller's own run: transport run == target run == `record.run`; it never
+/// reserves a child run and never reaches the legacy host execution path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Route { File, Service, Execution, Worker, Connector }
+pub enum Route { File, Service, Execution, Worker, Connector, InRunHelper }
+
+/// HX5: the offline helper tools served synchronously inside the calling run.
+pub const IN_RUN_HELPER_TOOLS: [&str; 3] = ["execute_program", "office_script", "code_map"];
 #[derive(Debug)]
 pub struct ToolPolicy {
     pub name: &'static str,
@@ -142,8 +148,8 @@ pub const POLICIES: &[ToolPolicy] = &[
     // H12a: own skill tools read host-owned skill files of the record's own
     // employee and publish only into its own wiki/SKILLS; no workspace input.
     ToolPolicy { name: "skill_extract", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
-    ToolPolicy { name: "execute_program", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "office_script", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "execute_program", route: Route::InRunHelper, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "office_script", route: Route::InRunHelper, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_bank_feedback", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "computer_screenshot", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "computer_click", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
@@ -225,7 +231,7 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "memory_get_at", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
     ToolPolicy { name: "memory_invalidate_by_origin", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
     ToolPolicy { name: "memory_search_by_layer", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
-    ToolPolicy { name: "code_map", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "code_map", route: Route::InRunHelper, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "user_profile_record", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
     ToolPolicy { name: "user_profile_get", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
     ToolPolicy { name: "user_code_profile", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },

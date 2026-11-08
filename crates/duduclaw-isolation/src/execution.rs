@@ -239,6 +239,85 @@ pub trait ExecutionBackend: Send + Sync {
     fn take_stdio(&self, run: RunHandle) -> BackendFuture<'_, RunStdio>;
     fn take_pty(&self, run: RunHandle) -> BackendFuture<'_, RunPty>;
     fn resize(&self, run: RunHandle, size: PtySize) -> BackendFuture<'_, ()>;
+
+    /// HX5 (§3 step 4): whether this backend implements in-run helper calls at
+    /// all. A per-run feature check (`helper_features`) still gates every call.
+    fn supports_helper_calls(&self) -> bool { false }
+    /// [F17] Feature bits spawnd advertised on the control connection that
+    /// reserved `run` (`SpawnResponse::Reserved.features`). Unknown run: none.
+    fn helper_features(&self, _run: RunHandle) -> crate::ipc::SpawndFeatures { crate::ipc::SpawndFeatures::NONE }
+    /// Start one helper inside the live run `plan.run` (the caller's own run),
+    /// on that run's own control connection. Never reserves or spawns a run.
+    fn start_helper(&self, _plan: HelperPlan) -> HelperFuture<'_, HelperStart> {
+        Box::pin(async { Err(HelperError::Unavailable) })
+    }
+    /// Root-determined end of a started call (polls `HelperWait`).
+    fn wait_helper(&self, _run: RunHandle, _call: crate::ipc::HelperCallId)
+        -> HelperFuture<'_, crate::ipc::HelperOutcome> {
+        Box::pin(async { Err(HelperError::Unavailable) })
+    }
+    /// Kill the call's slot cgroup (queued or running). Never cancels the run [F8].
+    fn cancel_helper(&self, _run: RunHandle, _call: crate::ipc::HelperCallId) -> HelperFuture<'_, ()> {
+        Box::pin(async { Err(HelperError::Unavailable) })
+    }
+}
+
+/// HX5 helper-call future; errors are typed per-call results (§5).
+pub type HelperFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HelperError>> + Send + 'a>>;
+
+/// One in-run helper call (HX §3). Built only by the boundary from a verified
+/// capability: `run` is the caller's own run and `employee` its employee. The
+/// helper is a lookup key; spawnd re-derives it from the run's employee.
+pub struct HelperPlan {
+    pub run: RunHandle,
+    pub employee: EmployeeId,
+    pub helper: RuntimeKind,
+    pub slot: crate::ipc::HelperSlot,
+    /// The tool's own bound; spawnd answers with the effective value.
+    pub timeout_ms: u64,
+    /// Sealed into a memfd by the backend (`MAX_HELPER_INPUT_BYTES`).
+    pub input: Vec<u8>,
+    /// Combined stdout + stderr budget of the returned readers.
+    pub output_limit: u64,
+}
+
+/// Reply to a started helper call: the spawnd call id and the call's own pipes.
+pub struct HelperStart {
+    pub call: crate::ipc::HelperCallId,
+    pub effective_timeout_ms: u64,
+    pub stdout: Box<dyn RunReader>,
+    pub stderr: Box<dyn RunReader>,
+}
+
+/// Typed per-call refusals (HX §5 readiness/per-call results). No paths or content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HelperError {
+    /// spawnd did not advertise `helper_calls` [F17]; nothing was sent.
+    #[error("helper launcher unavailable")] FeatureMissing,
+    #[error("helper busy")] Busy,
+    #[error("run time exhausted")] RunTimeExhausted,
+    #[error("helper unavailable")] Unavailable,
+    #[error("helper cgroup unavailable")] CgroupUnavailable,
+    /// Unknown run, not Running, or not this employee's run.
+    #[error("run not live")] NotLive,
+    #[error("helper call denied")] Denied,
+    /// A request may have reached root; the outcome is unknown.
+    #[error("helper call uncertain")] Uncertain,
+}
+impl HelperError {
+    /// Stable result/readiness code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::FeatureMissing => "helper_launcher_unavailable",
+            Self::Busy => "helper_busy",
+            Self::RunTimeExhausted => "run_time_exhausted",
+            Self::Unavailable => "helper_unavailable",
+            Self::CgroupUnavailable => "helper_cgroup_unavailable",
+            Self::NotLive => "run_ended",
+            Self::Denied => "refused",
+            Self::Uncertain => "uncertain",
+        }
+    }
 }
 
 /// An in-process control token, bound to an already ownership-checked job.

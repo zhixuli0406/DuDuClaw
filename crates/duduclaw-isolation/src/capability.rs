@@ -408,21 +408,34 @@ pub trait LiveRequestVerifier: Send + Sync {
 pub struct RequestContext {
     record: CapabilityRecord,
     live: Option<std::sync::Arc<dyn LiveRequestVerifier>>,
+    /// HX5 [F7]: the run whose own MCP gateway transport carried this request.
+    /// Only the connection-bound verifier sets it (D's `Connection`); delegated,
+    /// Admin-RPC and record-only contexts carry none and never issue helper calls.
+    transport: Option<RunId>,
 }
 impl std::fmt::Debug for RequestContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RequestContext").field("record", &self.record)
-            .field("live_authority_attached", &self.live.is_some()).finish()
+            .field("live_authority_attached", &self.live.is_some())
+            .field("transport_bound", &self.transport.is_some()).finish()
     }
 }
 impl RequestContext {
     /// Record-only contexts cannot authorize irreversible I/O. This constructor
     /// remains for trusted policy evaluation and contract fixtures.
-    pub fn from_verified_record(record: CapabilityRecord) -> Self { Self { record, live: None } }
+    pub fn from_verified_record(record: CapabilityRecord) -> Self { Self { record, live: None, transport: None } }
     /// Trusted verifier integration seam, not a callable/deserializable RPC.
     pub fn with_live_verifier(record: CapabilityRecord, live: std::sync::Arc<dyn LiveRequestVerifier>) -> Self {
-        Self { record, live: Some(live) }
+        Self { record, live: Some(live), transport: None }
     }
+    /// HX5: trusted connection-verifier seam only. `transport` is the run whose
+    /// MCP gateway fd the request arrived on (the connection binding's run).
+    pub fn with_transport(record: CapabilityRecord, live: std::sync::Arc<dyn LiveRequestVerifier>,
+        transport: RunId) -> Self {
+        Self { record, live: Some(live), transport: Some(transport) }
+    }
+    /// The run whose own MCP transport carried this request, if any.
+    pub fn transport_run(&self) -> Option<RunId> { self.transport }
     pub fn record(&self) -> &CapabilityRecord { &self.record }
     pub fn verify_live(&self, now: u64) -> Result<(), VerificationError> {
         if now < self.record.not_before || now >= self.record.expires_at {

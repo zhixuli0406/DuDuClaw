@@ -12,6 +12,10 @@ use serde_json::{Value, json};
 
 pub type PolicyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, VerificationError>> + Send + 'a>>;
 
+#[path = "execution_in_run.rs"]
+mod in_run;
+pub use in_run::{AuthorizedHelperPlan, InRunJob};
+
 /// Trusted Package A / handler integration, never constructed from MCP input.
 /// Implementations must reuse the tool handler's ownership, record, audience,
 /// device and approval checks. `authorize_handler` must not perform the effect.
@@ -39,6 +43,16 @@ pub trait ExecutionPlanFactory: Send + Sync {
     fn prepare_with_roots<'a>(&'a self, call: &'a AuthorizedToolCall, reservation: RunHandle,
         _roots: Arc<crate::resources::ResourceRoots>) -> PolicyFuture<'a, AuthorizedExecutionPlan> {
         self.prepare(call, reservation)
+    }
+    /// HX5: the same-run helper plan of a `Route::InRunHelper` tool, built after
+    /// `authorize_handler`. No reservation exists; the target is the caller's run.
+    fn prepare_in_run<'a>(&'a self, _call: &'a AuthorizedToolCall) -> PolicyFuture<'a, AuthorizedHelperPlan> {
+        Box::pin(async { Err(VerificationError::Unavailable) })
+    }
+    /// HX5: strict decoder of an in-run helper's bounded output.
+    fn decode_helper_result(&self, _tool: &str, _stdout: &[u8], _stderr: &[u8],
+        _outcome: &duduclaw_isolation::ipc::HelperOutcome) -> Result<Value, VerificationError> {
+        Err(VerificationError::Invalid)
     }
 }
 
@@ -74,8 +88,13 @@ impl ExecutionToolBridge {
         Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(), jobs: Some(jobs) }
     }
 
-    /// Use this same predicate for tools/list and tools/call.
+    /// Use this same predicate for tools/list and tools/call. In-run helper
+    /// tools need a backend with helper calls; spawnd's per-run `helper_calls`
+    /// feature bit is checked per call (a missing bit is a named refusal).
     pub fn supports(&self, name: &str) -> bool {
+        if in_run::is_in_run(name) {
+            return self.factory.supports(name) && self.backend.supports_helper_calls();
+        }
         execution_route(name).is_some() && self.factory.supports(name)
             && self.backend.supports_authorized_workspace()
             && (!self.factory.collects_results(name) || self.jobs.is_some())
@@ -84,7 +103,11 @@ impl ExecutionToolBridge {
     /// Called only after the shared MCP dispatcher gates. Same-employee runs
     /// cannot synchronously wait for a child under D8 admission: report the
     /// accepted handle, never fabricate the old synchronous tool result.
+    /// HX5: `execute_program`, `code_map` and `office_script` instead run in
+    /// the caller's own run and return synchronously (`execute_in_run`); they
+    /// never reach the reserve/spawn path below (`execution_route` is `None`).
     pub async fn execute(&self, context: &RequestContext, name: &str, arguments: &Value) -> Value {
+        if in_run::is_in_run(name) { return self.execute_in_run(context, name, arguments).await; }
         let Some(route) = execution_route(name) else { return refused(); };
         if name == "browser_record_stop" { return self.stop_recording(context, arguments).await; }
         if self.factory.collects_results(name) && arguments.get("action").is_some() {
@@ -334,6 +357,8 @@ async fn write_stop(writer: &mut dyn duduclaw_isolation::execution::RunWriter)
     writer.close().await
 }
 
+/// Legacy child-run route. `Route::InRunHelper` is deliberately `None`: those
+/// tools have no reservation, job row or run-killing control [F8].
 fn execution_route(name: &str) -> Option<Route> {
     if name == "hardware_info" {
         return Some(Route::Execution);
