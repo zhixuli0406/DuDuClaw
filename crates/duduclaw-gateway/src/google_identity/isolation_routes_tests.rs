@@ -51,18 +51,27 @@ fn google_routes_personal_refuses_other_users_account() {
 
 #[test]
 fn google_routes_shared_uses_home_routes_only() {
-    for kind in [ConnectorKind::SharedHome, ConnectorKind::SharedTenant] {
-        let catalog = catalog();
-        let home = catalog.register("home", "google", kind, &shared("company")).unwrap();
-        catalog.register("other-home", "google", ConnectorKind::SharedHome, &shared("other")).unwrap();
-        catalog.register("personal", "google", ConnectorKind::Personal, &personal("alice")).unwrap();
-        let routes = routes_for(&catalog, &lifecycle(shared("company"))).unwrap();
-        assert!(routes.personal.is_empty());
-        let route = routes.home.unwrap();
-        assert_eq!(route.product.account(), home.as_str());
-        assert!(matches!(&route.product, ProductConnectorAccount::SharedHome { tenant, .. } if tenant == "company"));
-        assert_eq!(route.kind(), kind);
-    }
+    let catalog = catalog();
+    let home = catalog.register("home", "google", ConnectorKind::SharedHome, &shared("company")).unwrap();
+    // A tenant route alongside the home route is ignored, not ambiguous.
+    catalog.register("tenant", "google", ConnectorKind::SharedTenant, &shared("company")).unwrap();
+    catalog.register("other-home", "google", ConnectorKind::SharedHome, &shared("other")).unwrap();
+    catalog.register("personal", "google", ConnectorKind::Personal, &personal("alice")).unwrap();
+    let routes = routes_for(&catalog, &lifecycle(shared("company"))).unwrap();
+    assert!(routes.personal.is_empty());
+    let route = routes.home.unwrap();
+    assert_eq!(route.product.account(), home.as_str());
+    assert!(matches!(&route.product, ProductConnectorAccount::SharedHome { tenant, .. } if tenant == "company"));
+    assert_eq!(route.kind(), ConnectorKind::SharedHome);
+}
+
+#[test]
+fn google_routes_shared_tenant_route_not_admitted_until_tenant_sources_exist() {
+    // Until E4 adds tenant-scoped credential sources, a SharedTenant route must
+    // never be served from the shared home credential.
+    let catalog = catalog();
+    catalog.register("tenant", "google", ConnectorKind::SharedTenant, &shared("company")).unwrap();
+    assert_eq!(routes_for(&catalog, &lifecycle(shared("company"))).err(), Some(GoogleRoutesError::SetupRequired));
 }
 
 struct Live;

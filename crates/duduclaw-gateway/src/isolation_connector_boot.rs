@@ -386,20 +386,41 @@ pub struct ProvisionedDetail {
     pub pin: DetailPin,
 }
 
+/// Outcome of [`ConnectorAccountDetails::detail`] for one employee.
+pub enum DetailLookup {
+    /// No current details (or this employee's token no longer resolves).
+    Missing,
+    /// Details pinned to another employee/agent; nothing was resolved.
+    Foreign,
+    /// This employee's details, resolved in memory.
+    Ready(ProvisionedDetail),
+}
+impl DetailLookup {
+    /// This employee's resolved details, if any.
+    pub fn ready(self) -> Option<ProvisionedDetail> {
+        match self { Self::Ready(detail) => Some(detail), Self::Missing | Self::Foreign => None }
+    }
+}
+
 /// Gateway-owned store of per-account provisioning details, written by the
 /// connector lifecycle when an account is provisioned (production:
 /// [`crate::isolation_connector_details::CatalogAccountDetails`]). It is only
 /// ever asked about a route the catalog just returned, so it can narrow but
 /// never add an account.
-/// - `detail`: `Ok(None)` = not provisioned for the route's current
-///   generation (or a token reference no longer resolves) ⇒ the provider is a
-///   refusing adapter, [`ProviderRefusal::SetupRequired`]. `Err` (unreadable
-///   or damaged store) refuses the whole build.
+/// - `detail`: asked on behalf of exactly one employee/agent. Details pinned
+///   to another employee are [`DetailLookup::Foreign`], decided from the
+///   secret-free pin BEFORE any token is resolved, so another employee's bot
+///   token is never decrypted into this build and its missing token never
+///   affects this employee. [`DetailLookup::Missing`] = not provisioned for
+///   the route's current generation (or this employee's token reference no
+///   longer resolves) ⇒ the provider is a refusing adapter,
+///   [`ProviderRefusal::SetupRequired`]. `Err` (unreadable or damaged store)
+///   refuses the whole build.
 /// - `current_pin`: the pin of the account's current details, read live at
 ///   each selection recheck; `None` (revoked / generation moved / removed)
 ///   or a different pin refuses that account, `Err` refuses the selection.
 pub trait ConnectorAccountDetails: Send + Sync {
-    fn detail(&self, route: &Route) -> Result<Option<ProvisionedDetail>, VerificationError>;
+    fn detail(&self, route: &Route, employee: EmployeeId, agent: &str) -> Result<DetailLookup, VerificationError>;
     fn current_pin(&self, account: &AccountId) -> Result<Option<DetailPin>, VerificationError>;
 }
 
@@ -518,23 +539,32 @@ impl GatewayConnectorFactory {
     /// - `Ok(None)`: some route has no current details ⇒ setup required.
     /// - Routes whose details were provisioned for another employee (or a
     ///   recreated one under the same agent id) are not this employee's
-    ///   accounts and are skipped (narrowing only).
-    /// - A detail for another provider or another route pin is `Invalid`;
-    ///   a store error is `Unavailable`. Both refuse the build.
+    ///   accounts and are skipped (narrowing only). The store decides this
+    ///   from the pin before resolving any token, so another employee's
+    ///   token is never read and its absence never marks setup required.
+    /// - A detail for another provider or another route pin, or a resolved
+    ///   detail pinned to another employee, is `Invalid`; a store error is
+    ///   `Unavailable`. Both refuse the build.
     fn provisioned<'a>(&self, accounts: &'a [PlannedAccount], employee: EmployeeId, agent: &str)
         -> Result<Option<(Vec<(&'a PlannedAccount, ConnectorAccountDetail)>, DetailFence)>, VerificationError> {
         let mut ready = Vec::new();
         let mut pins = BTreeMap::new();
         for account in accounts {
-            let Some(ProvisionedDetail { detail, pin }) = self.parts.details.detail(&account.route)
-                .map_err(|error| if error == VerificationError::Invalid { error } else { VerificationError::Unavailable })?
-                else { return Ok(None) };
+            let lookup = self.parts.details.detail(&account.route, employee, agent)
+                .map_err(|error| if error == VerificationError::Invalid { error } else { VerificationError::Unavailable })?;
+            let ProvisionedDetail { detail, pin } = match lookup {
+                DetailLookup::Foreign => continue,
+                DetailLookup::Missing => return Ok(None),
+                DetailLookup::Ready(provisioned) => provisioned,
+            };
             let route = &account.route;
             if detail.provider() != route.provider || pin.reference.provider() != route.provider
                 || pin.account != route.account || pin.generation != route.generation || pin.binding != route.binding {
                 return Err(VerificationError::Invalid);
             }
-            if pin.employee != employee || pin.agent != agent { continue; }
+            // A store that resolved another employee's details broke the
+            // contract above: refuse rather than silently skip.
+            if pin.employee != employee || pin.agent != agent { return Err(VerificationError::Invalid); }
             if pins.insert(route.account.as_str().to_owned(), pin).is_some() { return Err(VerificationError::Invalid); }
             ready.push((account, detail));
         }
@@ -819,13 +849,14 @@ mod tests {
         }
     }
     impl ConnectorAccountDetails for Details {
-        fn detail(&self, route: &Route) -> Result<Option<ProvisionedDetail>, VerificationError> {
+        fn detail(&self, route: &Route, employee: EmployeeId, agent: &str) -> Result<DetailLookup, VerificationError> {
             self.asked.lock().unwrap().push(route.account.clone());
             if self.fail { return Err(VerificationError::Unavailable); }
-            let Some(detail) = self.map.get(&route.account).cloned() else { return Ok(None) };
+            let Some(detail) = self.map.get(&route.account).cloned() else { return Ok(DetailLookup::Missing) };
+            if employee != EMPLOYEE || agent != AGENT { return Ok(DetailLookup::Foreign); }
             let pin = DetailPin::new(route, EMPLOYEE, AGENT.into(), reference_of(&detail));
             self.pins.lock().unwrap().insert(route.account.clone(), pin.clone());
-            Ok(Some(ProvisionedDetail { detail, pin }))
+            Ok(DetailLookup::Ready(ProvisionedDetail { detail, pin }))
         }
         fn current_pin(&self, account: &AccountId) -> Result<Option<DetailPin>, VerificationError> {
             if self.fail { return Err(VerificationError::Unavailable); }
@@ -959,6 +990,38 @@ mod tests {
         assert_eq!(installed.registry().candidates(&ctx, "db_sources", "database").unwrap().len(), 0);
         assert_eq!(build().setup_required().collect::<Vec<_>>(), vec!["computer", "database"],
             "details of the old generation never resolve for the new one");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_employee_missing_token_does_not_block_this_employee() {
+        use crate::isolation_connector_details::{CatalogAccountDetails, ChannelTokenRef};
+        let home = crate::fs_safe::private_test_home().unwrap();
+        write_fixture(home.path());
+        let catalog = Arc::new(ConnectorCatalog::open(home.path()).unwrap());
+        let details = Arc::new(CatalogAccountDetails::new(home.path().to_path_buf(), catalog.clone()).unwrap());
+        let factory = factory_for(home.path(), details.clone());
+        let ready = catalog.register_with_details("alice demo", "database", ConnectorKind::Personal, &alice(),
+            &db_record(EMPLOYEE, "demo")).unwrap();
+        // Same owner, another protected employee/agent whose agent bot token
+        // does not exist. Its pin is foreign to EMPLOYEE, so its token is never
+        // resolved here and cannot make this employee's channel setup-required.
+        let other_employee = EmployeeId([9; 16]);
+        let telegram = DetailReference::Channel { channel: "telegram".into(), scope: "123456789".into(),
+            status_label: "telegram".into(), token: ChannelTokenRef::Agent, extra_id: None };
+        let foreign = catalog.register_with_details("other bot", "channel", ConnectorKind::Personal, &alice(),
+            &crate::isolation_connector_details::AccountDetailRecord { employee: other_employee,
+                agent: "employee-b".into(), reference: telegram }).unwrap();
+        let route = catalog.route(&foreign).unwrap().unwrap();
+        assert!(matches!(details.detail(&route, EMPLOYEE, AGENT), Ok(DetailLookup::Foreign)));
+
+        let installed = factory.build(home.path(), AGENT, EMPLOYEE, &alice(), catalog.clone(), empty_bindings()).unwrap();
+        assert_eq!(installed.setup_required().count(), 0, "another employee's missing token is not this employee's setup gap");
+        assert_eq!(installed.refusals().get("channel"), Some(&ProviderRefusal::NoRoute));
+        let ctx = context(alice(), Principal::Human { user_id: text("alice"), generation: 1 });
+        let offered: Vec<_> = installed.registry().candidates(&ctx, "db_sources", "database").unwrap()
+            .iter().map(|a| a.account().to_owned()).collect();
+        assert_eq!(offered, vec![ready.as_str().to_owned()]);
     }
 
     #[cfg(unix)]

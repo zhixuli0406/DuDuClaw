@@ -163,9 +163,24 @@ fn select_only_before_connect(sql: &str) -> Result<(), VerificationError> {
         match ch {
             '\'' | '"' | '`' => {
                 while let Some(next) = chars.next() {
+                    // MySQL (and PostgreSQL with standard_conforming_strings
+                    // off) treat `\` as an escape, so `'a\''` would end the
+                    // literal elsewhere than this scanner thinks. Only the
+                    // dialect-neutral doubled-quote escape is understood.
+                    if next == '\\' { return Err(VerificationError::Invalid); }
                     if next == ch {
                         if chars.peek() == Some(&ch) { chars.next(); } else { break; }
                     }
+                }
+            },
+            // PostgreSQL dollar quoting (`$$…$$`, `$tag$…$tag$`) is a string
+            // form this scanner does not model. Refuse it.
+            '$' => {
+                if chars.peek() == Some(&'$') { return Err(VerificationError::Invalid); }
+                if chars.peek().is_some_and(|c| c.is_ascii_alphabetic() || *c == '_') {
+                    let mut tag = chars.clone();
+                    while tag.peek().is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') { tag.next(); }
+                    if tag.peek() == Some(&'$') { return Err(VerificationError::Invalid); }
                 }
             },
             '-' if chars.peek() == Some(&'-') => {
@@ -186,6 +201,15 @@ fn select_only_before_connect(sql: &str) -> Result<(), VerificationError> {
                 let mut word = ch.to_string();
                 while chars.peek().is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
                     word.push(chars.next().ok_or(VerificationError::Invalid)?);
+                }
+                // PostgreSQL escape-string (`E'…'`) and Unicode-escape
+                // (`U&'…'`) literals use backslash/escape semantics.
+                if (word.eq_ignore_ascii_case("e") && chars.peek() == Some(&'\''))
+                    || (word.eq_ignore_ascii_case("u") && chars.peek() == Some(&'&') && {
+                        let mut after = chars.clone(); after.next();
+                        matches!(after.peek(), Some('\'' | '"'))
+                    }) {
+                    return Err(VerificationError::Invalid);
                 }
                 if matches!(word.to_ascii_uppercase().as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE"
                     | "REPLACE" | "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "INTO" | "COPY"
