@@ -418,6 +418,16 @@ pub(super) fn scaffold_with(
     if !scoped.is_empty() {
         caps_tbl.insert("scoped_tools".into(), toml::Value::Array(scoped));
     }
+    // RM-103 S3 (round 3 #3): `native_sandbox` (OS-native confinement of the
+    // spawned CLI, fail-closed when it cannot apply) only narrows, and Grok /
+    // the generic CLI runtime need it to run a write-constrained member at
+    // all. Without the copy a member of an OS-sandboxed employee spawned on
+    // Codex / Grok / generic unconfined. Read through the parent's typed parse
+    // (a parent whose `[capabilities]` does not parse never gets here); only
+    // `true` is written, so an unsandboxed parent's member is unchanged.
+    if parent_config.capabilities.native_sandbox {
+        caps_tbl.insert("native_sandbox".into(), toml::Value::Boolean(true));
+    }
     table.insert("capabilities".into(), toml::Value::Table(caps_tbl));
 
     let mut perm_tbl = toml::Table::new();

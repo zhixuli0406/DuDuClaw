@@ -659,10 +659,16 @@ impl RuntimeRegistry {
 ///
 /// Returns `None` only when `agent.toml` itself is missing (synthetic /
 /// test agent ids) — callers then keep their legacy capability-less
-/// behavior. When the file exists but `[capabilities]` is absent OR fails
-/// to deserialize, this returns `Some(CapabilitiesConfig::default())`
-/// (deny-by-default: `computer_use = false`, `browser_via_bash = false`)
-/// with a warn on the malformed case — security gates fail closed.
+/// behavior. When the file exists but `[capabilities]` is absent this returns
+/// `Some(CapabilitiesConfig::default())` (deny-by-default: `computer_use =
+/// false`, `browser_via_bash = false`).
+///
+/// RM-103 S3 (round 3 #4): when `agent.toml` or its `[capabilities]` section
+/// cannot be read, the restrictions the operator wrote are unknown, so this
+/// returns [`fail_closed_capabilities`] (with a warn) — never the plain
+/// default, which carries no restriction at all and would give a coarse
+/// runtime (Codex / Grok / generic) a writable sandbox with an unchecked
+/// native shell.
 pub fn load_agent_capabilities(
     agent_dir: &Path,
 ) -> Option<duduclaw_core::types::CapabilitiesConfig> {
@@ -674,9 +680,9 @@ pub fn load_agent_capabilities(
             warn!(
                 agent_dir = %agent_dir.display(),
                 error = %e,
-                "agent.toml parse failed — applying default (deny-by-default) capabilities"
+                "agent.toml parse failed — applying fail-closed capabilities"
             );
-            return Some(duduclaw_core::types::CapabilitiesConfig::default());
+            return Some(fail_closed_capabilities());
         }
     };
     let caps = match parsed.get("capabilities") {
@@ -687,13 +693,28 @@ pub fn load_agent_capabilities(
                 warn!(
                     agent_dir = %agent_dir.display(),
                     error = %e,
-                    "[capabilities] section malformed — applying default (deny-by-default) capabilities"
+                    "[capabilities] section malformed — applying fail-closed capabilities"
                 );
-                duduclaw_core::types::CapabilitiesConfig::default()
+                fail_closed_capabilities()
             }
         },
     };
     Some(caps)
+}
+
+/// The capabilities of an agent whose `[capabilities]` could not be read:
+/// the deny-by-default config with its `action_rules` marked unreadable
+/// ([`duduclaw_core::tool_effect::ActionRules::unreadable`]). A malformed rule
+/// list raises every side-effecting call to at least `ask`, so:
+/// - a coarse runtime sees a native shell **and** write constraint
+///   (`native_tool_constraints`) and refuses to spawn ([`coarse_native_caps`]);
+/// - the Claude CLI keeps its side-effecting built-ins (`Write`, `Edit`,
+///   `Bash`, …) in `--disallowedTools` (`ActionRules::builtins_refused`).
+pub fn fail_closed_capabilities() -> duduclaw_core::types::CapabilitiesConfig {
+    duduclaw_core::types::CapabilitiesConfig {
+        action_rules: duduclaw_core::tool_effect::ActionRules::unreadable(),
+        ..Default::default()
+    }
 }
 
 /// Read an agent's `[model] account_pool` from `agent.toml`.
@@ -1337,6 +1358,42 @@ mod tests {
         .unwrap();
         let caps = load_agent_capabilities(dir.path()).unwrap();
         assert!(!caps.computer_use, "malformed section must fail closed");
+    }
+
+    /// RM-103 S3 (round 3 #4): a malformed `[capabilities]` (or an
+    /// unparsable `agent.toml`) must not come back as the unrestricted
+    /// default — a coarse runtime refuses it, Claude loses its side-effecting
+    /// built-ins.
+    #[test]
+    fn malformed_capabilities_refuse_coarse_runtimes() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [
+            "[capabilities]\ncomputer_use = \"yes please\"\n",
+            "[capabilities]\nnative_sandbox = \"maybe\"\ndenied_tools = [\"Bash\"]\n",
+            "[capabilities\nthis is not toml",
+        ] {
+            std::fs::write(dir.path().join("agent.toml"), text).unwrap();
+            let caps = load_agent_capabilities(dir.path()).unwrap();
+            let n = caps.native_tool_constraints();
+            assert!(n.needs_no_shell() && !n.no_write.is_empty(), "{text:?}: {n:?}");
+            for runtime in ["codex", "grok", "generic"] {
+                assert!(
+                    coarse_native_caps(Some(&caps), runtime, "agnes", true).is_err(),
+                    "{text:?}: {runtime} must refuse"
+                );
+            }
+            let denied = caps.disallowed_tools();
+            for builtin in ["Bash", "Write", "Edit"] {
+                assert!(denied.iter().any(|d| d == builtin), "{text:?}: {builtin} not in {denied:?}");
+            }
+        }
+        // A well-formed section, and an absent one, are untouched.
+        for text in ["[agent]\nname = \"x\"\n", "[capabilities]\nallowed_tools = [\"Read\"]\n"] {
+            std::fs::write(dir.path().join("agent.toml"), text).unwrap();
+            let caps = load_agent_capabilities(dir.path()).unwrap();
+            assert!(caps.native_tool_constraints().is_empty(), "{text:?}");
+            assert!(coarse_native_caps(Some(&caps), "codex", "agnes", true).unwrap().is_none());
+        }
     }
 
     #[test]

@@ -498,8 +498,17 @@ fn scoped_entry_covers_intrinsic(entry: &str) -> bool {
 
 /// Every Claude built-in and DuDuClaw MCP tool (bare names) the `scoped_tools`
 /// entry covers, except the team intrinsics.
+///
+/// RM-103 S3 (round 3 #2): a server-qualified entry (`mcp__duduclaw__*`,
+/// `mcp__duduclaw`, `mcp__x__foo`) names MCP tools only — as a raw
+/// `--disallowedTools` entry it never reaches a Claude built-in — so it
+/// expands into MCP tools only. `tool_entry_matches` reads a bare built-in
+/// name (`Bash`) as a duduclaw tool, which would otherwise turn an inherited
+/// `mcp__duduclaw__*` into a refusal of every built-in. Same prefix test as
+/// `CapabilitiesConfig::native_tool_constraints`.
 fn member_scoped_expansion(entry: &str) -> Vec<String> {
     let set: HashSet<String> = std::iter::once(entry.to_string()).collect();
+    let server_qualified = tool_base(entry).starts_with("mcp__");
     let covers = |name: &str| {
         set_contains_tool(&set, name) || set_contains_tool(&set, &format!("mcp__duduclaw__{name}"))
     };
@@ -511,7 +520,7 @@ fn member_scoped_expansion(entry: &str) -> Vec<String> {
     duduclaw_core::tool_effect::CLAUDE_CLI_BUILTIN_TOOLS
         .iter()
         .copied()
-        .filter(|name| set_contains_tool(&set, name))
+        .filter(|name| !server_qualified && set_contains_tool(&set, name))
         .chain(
             duduclaw_core::mcp_tool_defs::tools()
                 .map(|def| def.name)
@@ -847,6 +856,20 @@ mod tests {
             if scoped == "\"*\"" {
                 assert!(d.contains(&"Bash".to_string()), "{d:?}");
                 assert!(d.contains(&"Write".to_string()), "{d:?}");
+            }
+        }
+
+        // Round 3 #2: a server-qualified entry names MCP tools only — it is
+        // never read as covering the Claude built-ins.
+        for scoped in ["\"mcp__duduclaw__*\"", "\"mcp__duduclaw\"", "\"mcp__duduclaw__team_*\""] {
+            std::fs::write(dir.join("agent.toml"), member_toml(scoped)).unwrap();
+            let d = scoped_disallow_for_agent_dir(&dir);
+            for builtin in duduclaw_core::tool_effect::CLAUDE_CLI_BUILTIN_TOOLS {
+                assert!(!d.contains(&builtin.to_string()), "{scoped}: built-in {builtin} in {d:?}");
+            }
+            assert!(!d.contains(&"mcp__duduclaw__team_handoff".to_string()), "{scoped}: {d:?}");
+            if scoped != "\"mcp__duduclaw__team_*\"" {
+                assert!(d.contains(&"mcp__duduclaw__memory_search".to_string()), "{scoped}: {d:?}");
             }
         }
 

@@ -476,6 +476,34 @@ fn coarse_runtime_sandbox_follows_the_scaffolded_member_config() {
     assert_eq!(caps.sandbox_level(), SandboxLevel::WorkspaceWrite);
 }
 
+/// RM-103 S3 (round 3 #3): an OS-sandboxed employee's member is OS-sandboxed
+/// too (`native_sandbox` only narrows); an unsandboxed employee's member does
+/// not get the key at all.
+#[test]
+fn role_member_inherits_native_sandbox() {
+    let read_caps = |dir: &std::path::Path| {
+        let cfg: duduclaw_core::types::AgentConfig =
+            toml::from_str(&std::fs::read_to_string(dir.join("agent.toml")).unwrap()).unwrap();
+        cfg.capabilities
+    };
+    for runtime in [("codex", "gpt-5.4"), ("claude", "claude-opus-5")] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_parent(tmp.path(), "boss", "[capabilities]\nnative_sandbox = true\n");
+        let spec = role_spec("boss", Role::Executor, runtime.0, runtime.1);
+        let member = scaffold_role_member(tmp.path(), &spec).unwrap();
+        assert_eq!(member_toml(&member.dir)["capabilities"]["native_sandbox"].as_bool(), Some(true), "{runtime:?}");
+        assert!(read_caps(&member.dir).native_sandbox, "{runtime:?}");
+    }
+    for parent in ["", "[capabilities]\nnative_sandbox = false\n"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_parent(tmp.path(), "boss", parent);
+        let spec = role_spec("boss", Role::Executor, "claude", "claude-opus-5");
+        let member = scaffold_role_member(tmp.path(), &spec).unwrap();
+        assert!(member_toml(&member.dir)["capabilities"].get("native_sandbox").is_none(), "{parent:?}");
+        assert!(!read_caps(&member.dir).native_sandbox, "{parent:?}");
+    }
+}
+
 /// RM-103 S3 (v1.81): `egress_guard` (effective mode = max(global, employee))
 /// and `scoped_tools` (adds grant refusals) are copied because they can only
 /// narrow; `grant_ttl_secs` is not (a longer parent TTL would widen).

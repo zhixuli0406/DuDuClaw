@@ -2470,27 +2470,39 @@ impl CapabilitiesConfig {
     ///
     /// - Allowlist mode (`allowed_tools` non-empty): a write tool must appear
     ///   in the allowlist (bare or qualified) and not be bare-denied.
-    /// - Denylist mode: write tools are allowed unless EVERY write tool is
-    ///   bare-denied (a qualified deny such as `Bash(rm:*)` does not count as
-    ///   fully denying Bash).
+    /// - Denylist mode: write tools are allowed unless EVERY Claude write
+    ///   tool is bare-denied (a qualified deny such as `Bash(rm:*)` does not
+    ///   count as fully denying Bash).
+    ///
+    /// RM-103 S3 (round 3 #1): family-aware, on the native classifier's
+    /// family definition. A write tool is any spelling of the write or shell
+    /// family (`apply_patch`, `write_file`, `shell`, `run_shell_command`, …
+    /// and the canonical `fs_write` / `shell_exec`), so an allowlist naming
+    /// another runtime's tool counts; a bare deny of the canonical name
+    /// denies every spelling of its family. In denylist mode a bare deny of a
+    /// non-Claude spelling (`shell`, `apply_patch`) does not make the level
+    /// read-only — it is a constraint the coarse runtime cannot honour, and
+    /// [`Self::native_tool_constraints`] reports it (refusal / read-only).
     pub fn write_tools_allowed(&self) -> bool {
         const WRITE_TOOLS: [&str; 5] = ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"];
-        fn base(entry: &str) -> &str {
-            entry.split('(').next().unwrap_or(entry).trim()
-        }
         let bare_denied = |tool: &str| {
-            self.denied_tools
-                .iter()
-                .any(|d| d.trim().eq_ignore_ascii_case(tool))
+            let canonical = NativeFamily::of(tool).map(NativeFamily::canonical);
+            self.denied_tools.iter().any(|d| {
+                let d = d.trim();
+                d.eq_ignore_ascii_case(tool) || canonical.is_some_and(|c| d.eq_ignore_ascii_case(c))
+            })
         };
         if !self.allowed_tools.is_empty() {
-            WRITE_TOOLS.iter().any(|tool| {
-                !bare_denied(tool)
-                    && self
-                        .allowed_tools
-                        .iter()
-                        .any(|a| base(a).eq_ignore_ascii_case(tool))
-            })
+            NativeFamily::ALL
+                .into_iter()
+                .flat_map(NativeFamily::write_capable_names)
+                .any(|tool| {
+                    !bare_denied(tool)
+                        && self
+                            .allowed_tools
+                            .iter()
+                            .any(|a| entry_base(a).eq_ignore_ascii_case(tool))
+                })
         } else {
             WRITE_TOOLS.iter().any(|tool| !bare_denied(tool))
         }
@@ -2528,12 +2540,18 @@ impl CapabilitiesConfig {
     /// or refuse to run ([`NativeToolConstraints::no_exec`]: none of those
     /// runtimes has a mode without a native shell).
     ///
-    /// Write family: `Write` / `Edit` / `MultiEdit` / `NotebookEdit` (and the
-    /// canonical `fs_write`); shell family: `Bash` / `BashOutput` /
-    /// `KillShell` (and `shell_exec`). What counts:
-    /// - an `action_rules` verdict of `ask` or `block` for a tool of either
-    ///   family (a malformed list counts: it raises every side-effecting call
-    ///   to `ask`);
+    /// Write family: `Write` / `Edit` / `MultiEdit` / `NotebookEdit`, the
+    /// PolicyKernel's other spellings ([`POLICY_FS_WRITE_TOOLS`]:
+    /// `apply_patch`, `write_file`, `write_to_file`) and the canonical
+    /// `fs_write`; shell family: `Bash` / `BashOutput` / `KillShell`,
+    /// [`POLICY_SHELL_EXEC_TOOLS`] (`shell`, `run_shell_command`,
+    /// `run_command`) and `shell_exec`. Every list and `action_rules` are
+    /// matched against all of them by one family-aware matcher (round 3 #1).
+    /// What counts:
+    /// - an `action_rules` verdict of `ask` or `block` for any spelling of
+    ///   either family, resolved with the family's effect class (`modify` /
+    ///   `admin`) unless Claude classes the name itself (a malformed list
+    ///   counts: it raises every side-effecting call to `ask`);
     /// - an `approval_required_tools` / `irreversible_tools` /
     ///   `maybe_irreversible_tools` entry covering one (wildcards included);
     /// - (Daybreak round 2 #2) a `scoped_tools` entry covering one, wildcards
@@ -2556,42 +2574,26 @@ impl CapabilitiesConfig {
     ///   affect the native runtimes — exactly as on Claude, whose native tools
     ///   never reach the kernel either;
     /// - a qualified `allowed_tools` / `denied_tools` entry (`Bash(git:*)`,
-    ///   `Write(src/**)`) — the argument part cannot be enforced natively;
-    ///   an allowlist that also holds the bare name is not narrowed by it;
+    ///   `Write(src/**)`, `shell(git:*)`) — the argument part cannot be
+    ///   enforced natively; an allowlist that also holds the same tool bare
+    ///   is not narrowed by it (a bare grant of another spelling is not the
+    ///   same tool and does not lift it);
     /// - a bare `denied_tools` entry covering one of them while the level
     ///   would still be writable (the documented coarse mapping already
     ///   turns "no write tool at all" into read-only, whose read-only shell
     ///   is the accepted cost of that mapping).
     ///
+    /// A server-qualified entry (`mcp__…`) in `scoped_tools`,
+    /// `allowed_tools` or `denied_tools` names MCP tools only and never
+    /// restricts a native family (round 3 #2); the approval lists keep the
+    /// broader, fail-safe reading.
+    ///
     /// Not counted (unchanged coarse mapping): a tool merely absent from a
     /// non-empty `allowed_tools`.
     pub fn native_tool_constraints(&self) -> NativeToolConstraints {
-        use crate::tool_effect::{ActionVerdict, effect_of_cli_builtin};
-        const WRITE: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
-        const SHELL: &[&str] = &["Bash", "BashOutput", "KillShell"];
-        // List entries (approval / scoped) also count when they name a
-        // non-Claude native spelling of the family (`apply_patch`, `shell`…).
-        let write_entry = |entry: &str| {
-            covers(entry, WRITE)
-                || covers(entry, POLICY_FS_WRITE_TOOLS)
-                || base(entry).eq_ignore_ascii_case("fs_write")
-        };
-        let shell_entry = |entry: &str| {
-            covers(entry, SHELL)
-                || covers(entry, POLICY_SHELL_EXEC_TOOLS)
-                || base(entry).eq_ignore_ascii_case("shell_exec")
-        };
-        fn base(entry: &str) -> &str {
-            entry.split('(').next().unwrap_or(entry).trim()
-        }
+        use crate::tool_effect::ActionVerdict;
         fn qualified(entry: &str) -> bool {
             entry.contains('(')
-        }
-        fn covers(entry: &str, family: &[&str]) -> bool {
-            let b = base(entry);
-            family.iter().any(|tool| {
-                b.eq_ignore_ascii_case(tool) || crate::tool_catalog::tool_entry_matches(b, tool)
-            })
         }
         fn push(list: &mut Vec<String>, reason: String) {
             if !list.contains(&reason) {
@@ -2599,15 +2601,28 @@ impl CapabilitiesConfig {
             }
         }
         let mut out = NativeToolConstraints::default();
+        let add = |out: &mut NativeToolConstraints, family: NativeFamily, reason: String| match family {
+            NativeFamily::Write => push(&mut out.no_write, reason),
+            NativeFamily::Shell => push(&mut out.no_exec, reason),
+        };
 
-        for tool in WRITE {
-            if self.action_rules.resolve(tool, effect_of_cli_builtin(tool)).is_some_and(|v| v >= ActionVerdict::Ask) {
-                push(&mut out.no_write, format!("action_rules: `{tool}` needs approval or is blocked"));
-            }
-        }
-        for tool in SHELL {
-            if self.action_rules.resolve(tool, effect_of_cli_builtin(tool)).is_some_and(|v| v >= ActionVerdict::Ask) {
-                push(&mut out.no_exec, format!("action_rules: `{tool}` needs approval or is blocked"));
+        // Round 3 #1: every spelling of the family — Claude's, the
+        // PolicyKernel's (`apply_patch`, `shell`, `run_shell_command`, …) and
+        // the canonical `fs_write` / `shell_exec` — is resolved against the
+        // rules, each with its family's effect class. One reason per family,
+        // naming the spellings that matched.
+        for family in NativeFamily::ALL {
+            let held: Vec<String> = family
+                .names()
+                .filter(|tool| {
+                    self.action_rules
+                        .resolve(tool, family.effect_of(tool))
+                        .is_some_and(|v| v >= ActionVerdict::Ask)
+                })
+                .map(|tool| format!("`{tool}`"))
+                .collect();
+            if !held.is_empty() {
+                add(&mut out, family, format!("action_rules: {} needs approval or is blocked", held.join(", ")));
             }
         }
 
@@ -2621,20 +2636,16 @@ impl CapabilitiesConfig {
         ] {
             for entry in list {
                 // A server-qualified entry (`mcp__duduclaw__*`, `mcp__x__foo`,
-                // `mcp__duduclaw`) names MCP tools, never a native CLI tool.
-                // `tool_entry_matches` reads a bare native name (`Bash`) as a
-                // duduclaw tool, so without this `mcp__duduclaw__*` would
-                // restrict every native family. Same prefix test as
-                // `tool_catalog::split_tool_ref`; the matcher itself is
-                // unchanged. (Approval lists keep the broader reading.)
-                if key == "scoped_tools" && base(entry).starts_with("mcp__") {
+                // `mcp__duduclaw`) names MCP tools, never a native CLI tool
+                // ([`server_qualified_entry`]). (Approval lists keep the
+                // broader, fail-safe reading.)
+                if key == "scoped_tools" && server_qualified_entry(entry) {
                     continue;
                 }
-                if write_entry(entry) {
-                    push(&mut out.no_write, format!("{key}: `{}`", entry.trim()));
-                }
-                if shell_entry(entry) {
-                    push(&mut out.no_exec, format!("{key}: `{}`", entry.trim()));
+                for family in NativeFamily::ALL {
+                    if native_entry_covers(entry, family) {
+                        add(&mut out, family, format!("{key}: `{}`", entry.trim()));
+                    }
                 }
             }
         }
@@ -2647,8 +2658,21 @@ impl CapabilitiesConfig {
             push(&mut out.no_write, "policy: rule(s) restrict native writes (`fs_write`)".to_string());
         }
 
-        for entry in self.allowed_tools.iter().filter(|e| qualified(e)) {
-            let b = base(entry);
+        // Round 3 #1/#2: `allowed_tools` / `denied_tools` go through the same
+        // family-aware matcher as the approval / scoped lists (so `shell(…)`,
+        // `apply_patch`, `fs_write`, `shell_exec` count), and a
+        // server-qualified entry never names a native tool.
+        for entry in self
+            .allowed_tools
+            .iter()
+            .filter(|e| qualified(e) && !server_qualified_entry(e))
+        {
+            // The narrowing is lifted only by a bare grant of the very same
+            // tool (`Bash` + `Bash(git:*)`). A bare grant of another spelling
+            // of the family (`Bash` + `shell(git:*)`) does not lift it: the
+            // operator narrowed that spelling explicitly, and Claude Code
+            // itself would keep `Bash(git:*)` narrowed next to a bare `shell`.
+            let b = entry_base(entry);
             let bare_too = self
                 .allowed_tools
                 .iter()
@@ -2656,21 +2680,21 @@ impl CapabilitiesConfig {
             if bare_too {
                 continue;
             }
-            if covers(entry, SHELL) {
-                push(&mut out.no_exec, format!("allowed_tools narrows `{}`", entry.trim()));
-            } else if covers(entry, WRITE) {
-                push(&mut out.no_write, format!("allowed_tools narrows `{}`", entry.trim()));
+            for family in NativeFamily::ALL {
+                if native_entry_covers(entry, family) {
+                    add(&mut out, family, format!("allowed_tools narrows `{}`", entry.trim()));
+                }
             }
         }
         let writable = self.sandbox_level() != SandboxLevel::ReadOnly;
         for entry in &self.denied_tools {
-            if !qualified(entry) && !writable {
+            if server_qualified_entry(entry) || (!qualified(entry) && !writable) {
                 continue;
             }
-            if covers(entry, SHELL) {
-                push(&mut out.no_exec, format!("denied_tools: `{}`", entry.trim()));
-            } else if covers(entry, WRITE) {
-                push(&mut out.no_write, format!("denied_tools: `{}`", entry.trim()));
+            for family in NativeFamily::ALL {
+                if native_entry_covers(entry, family) {
+                    add(&mut out, family, format!("denied_tools: `{}`", entry.trim()));
+                }
             }
         }
         out
@@ -2684,7 +2708,9 @@ impl CapabilitiesConfig {
         let mut view = self.clone();
         view.computer_use = false;
         view.browser_via_bash = false;
-        for tool in ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"] {
+        // The canonical names deny every other runtime's spelling too
+        // (`write_tools_allowed` is family-aware).
+        for tool in ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "fs_write", "shell_exec"] {
             if !view.denied_tools.iter().any(|d| d.trim().eq_ignore_ascii_case(tool)) {
                 view.denied_tools.push(tool.to_string());
             }
@@ -2730,6 +2756,101 @@ impl NativeToolConstraints {
             .collect::<Vec<_>>()
             .join("; ")
     }
+}
+
+/// Claude Code's native write built-ins.
+const CLAUDE_NATIVE_WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+/// Claude Code's native shell built-ins.
+const CLAUDE_NATIVE_SHELL_TOOLS: &[&str] = &["Bash", "BashOutput", "KillShell"];
+
+/// RM-103 S3 (round 3 #1): a native tool family as the coarse-runtime
+/// classifier ([`CapabilitiesConfig::native_tool_constraints`],
+/// [`CapabilitiesConfig::write_tools_allowed`]) sees it. Its spellings are
+/// Claude Code's built-ins plus the PolicyKernel's own family lists
+/// ([`POLICY_FS_WRITE_TOOLS`] / [`POLICY_SHELL_EXEC_TOOLS`], the ones
+/// [`policy_canonical_tool`] maps) plus the canonical name — one definition,
+/// so every list, `action_rules` and the kernel agree on what is a native
+/// write or shell tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFamily {
+    Write,
+    Shell,
+}
+
+impl NativeFamily {
+    const ALL: [Self; 2] = [Self::Write, Self::Shell];
+
+    /// The PolicyKernel canonical family name.
+    fn canonical(self) -> &'static str {
+        match self {
+            Self::Write => "fs_write",
+            Self::Shell => "shell_exec",
+        }
+    }
+
+    /// Every spelling: Claude's, the kernel's other runtimes', the canonical.
+    fn names(self) -> impl Iterator<Item = &'static str> {
+        let (claude, policy) = match self {
+            Self::Write => (CLAUDE_NATIVE_WRITE_TOOLS, POLICY_FS_WRITE_TOOLS),
+            Self::Shell => (CLAUDE_NATIVE_SHELL_TOOLS, POLICY_SHELL_EXEC_TOOLS),
+        };
+        claude
+            .iter()
+            .copied()
+            .chain(policy.iter().copied().filter(move |t| !claude.contains(t)))
+            .chain(std::iter::once(self.canonical()))
+    }
+
+    /// The spellings that can mutate the workspace (`BashOutput` /
+    /// `KillShell` only observe or stop a shell).
+    fn write_capable_names(self) -> impl Iterator<Item = &'static str> {
+        self.names().filter(|t| !matches!(*t, "BashOutput" | "KillShell"))
+    }
+
+    /// The family a tool name belongs to (exact spelling).
+    fn of(tool: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.names().any(|t| t == tool))
+    }
+
+    /// The effect class `action_rules` resolve a family member with: the
+    /// Claude built-in class when it has one, otherwise the family's
+    /// (`Write` ⇒ modify, `Bash` ⇒ admin) — so `apply_patch` / `fs_write` are
+    /// judged like `Write`, `shell` / `shell_exec` like `Bash`.
+    fn effect_of(self, tool: &str) -> crate::tool_effect::ToolEffect {
+        use crate::tool_effect::{effect_of_cli_builtin, effect_of_native};
+        effect_of_native(tool).unwrap_or_else(|| {
+            effect_of_cli_builtin(match self {
+                Self::Write => "Write",
+                Self::Shell => "Bash",
+            })
+        })
+    }
+}
+
+/// Base name of a capability list entry: before an optional `(` qualifier,
+/// trimmed (`Bash(git:*)` → `Bash`).
+fn entry_base(entry: &str) -> &str {
+    entry.split('(').next().unwrap_or(entry).trim()
+}
+
+/// A server-qualified entry (`mcp__duduclaw__*`, `mcp__x__foo`,
+/// `mcp__duduclaw`) names MCP tools only, never a native CLI tool. Same
+/// prefix test as `tool_catalog::split_tool_ref`; needed because
+/// `tool_entry_matches` reads a bare native name (`Bash`) as a duduclaw tool.
+fn server_qualified_entry(entry: &str) -> bool {
+    entry_base(entry).starts_with("mcp__")
+}
+
+/// THE family-aware list-entry matcher of the native classifier: does a
+/// capability list entry cover any spelling of `family`? Base name,
+/// ASCII-case-insensitive, or the shared anchored matcher
+/// ([`crate::tool_catalog::tool_entry_matches`]: `*`, `Bash*`, `fs_*`).
+/// Callers decide whether a server-qualified entry is skipped.
+fn native_entry_covers(entry: &str, family: NativeFamily) -> bool {
+    let b = entry_base(entry);
+    family
+        .names()
+        .any(|tool| b.eq_ignore_ascii_case(tool) || crate::tool_catalog::tool_entry_matches(b, tool))
 }
 
 /// RM-103 S3 (Daybreak round 2 #3/#4): does a `policy` restrict the native
@@ -3431,6 +3552,136 @@ mod sandbox_level_tests {
         ] {
             assert!(c.native_tool_constraints().is_empty(), "{c:?}");
         }
+    }
+
+    /// Round 3 #1: `denied_tools`, qualified `allowed_tools` and
+    /// `action_rules` recognise every spelling of the native families — the
+    /// PolicyKernel's (`apply_patch`, `shell`, `run_shell_command`, …) and
+    /// the canonical `fs_write` / `shell_exec` — exactly as the approval /
+    /// scoped lists do. Each of these used to yield no constraint, so Codex
+    /// spawned workspace-write with its own shell / apply_patch.
+    #[test]
+    fn native_tool_constraints_recognise_every_family_spelling() {
+        let rules = |json: serde_json::Value| CapabilitiesConfig {
+            action_rules: crate::tool_effect::ActionRules::from_value(json),
+            ..Default::default()
+        };
+        let block = |tool: &str| rules(serde_json::json!([{ "tool": tool, "verdict": "block" }]));
+        let ask = |tool: &str| rules(serde_json::json!([{ "tool": tool, "verdict": "ask" }]));
+        // The shell ⇒ refused.
+        for c in [
+            caps(false, false, &[], &["shell"]),
+            caps(false, false, &[], &["shell_exec"]),
+            caps(false, false, &[], &["run_shell_command"]),
+            caps(false, false, &[], &["run_command"]),
+            caps(false, false, &[], &["shell(rm:*)"]),
+            caps(false, false, &[], &["run_*"]),
+            caps(false, false, &["Read", "Write", "shell(git:*)"], &[]),
+            caps(false, false, &["Read", "Write", "run_shell_command(git *)"], &[]),
+            // A bare grant of another spelling does not lift the narrowing.
+            caps(false, false, &["Read", "Write", "Bash", "shell(git:*)"], &[]),
+            block("shell"),
+            block("shell_exec"),
+            ask("run_shell_command"),
+            ask("run_command"),
+        ] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_no_shell() && n.needs_read_only(), "{c:?}: {n:?}");
+        }
+        // Writes only ⇒ read-only, the shell stays.
+        for c in [
+            caps(false, false, &[], &["apply_patch"]),
+            caps(false, false, &[], &["fs_write"]),
+            caps(false, false, &[], &["write_file"]),
+            caps(false, false, &[], &["write_to_file"]),
+            caps(false, false, &[], &["apply_patch(secrets/**)"]),
+            caps(false, false, &["Read", "Bash", "apply_patch(src/**)"], &[]),
+            caps(false, false, &["Read", "Bash", "fs_write(src/**)"], &[]),
+            block("apply_patch"),
+            block("fs_write"),
+            ask("write_file"),
+            ask("write_to_file"),
+        ] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_read_only() && !n.needs_no_shell(), "{c:?}: {n:?}");
+        }
+        // Unchanged: the same tool bare and qualified; MCP-only rules / lists.
+        for c in [
+            caps(false, false, &["Read", "shell", "shell(git:*)"], &[]),
+            caps(false, false, &["Read", "apply_patch", "apply_patch(src/**)"], &[]),
+            // Every write spelling denied by canonical name ⇒ read-only by
+            // the coarse mapping, like denying Claude's five write tools.
+            caps(false, false, &[], &["shell_exec", "fs_write"]),
+            block("mail_send"),
+            rules(serde_json::json!([{ "effect": "send", "verdict": "ask" }])),
+        ] {
+            assert!(c.native_tool_constraints().is_empty(), "{c:?}: {:?}", c.native_tool_constraints());
+        }
+        // The family effect class: `modify = ask` reaches `apply_patch` /
+        // `fs_write` (writes only), `admin = ask` the shell spellings.
+        let n = rules(serde_json::json!([{ "effect": "modify", "verdict": "ask" }])).native_tool_constraints();
+        assert!(n.no_exec.is_empty() && n.reasons().contains("`apply_patch`") && n.reasons().contains("`fs_write`"), "{n:?}");
+        let n = rules(serde_json::json!([{ "effect": "admin", "verdict": "ask" }])).native_tool_constraints();
+        assert!(n.reasons().contains("`shell`") && n.reasons().contains("`shell_exec`"), "{n:?}");
+        assert_eq!(n.no_exec.len(), 1, "one action_rules reason per family: {n:?}");
+    }
+
+    /// Round 3 #1: `write_tools_allowed` (the coarse mapping) is family-aware
+    /// on the same family definition.
+    #[test]
+    fn write_tools_allowed_is_family_aware() {
+        let allowlists: [&[&str]; 5] = [
+            &["Read", "apply_patch"],
+            &["Read", "shell"],
+            &["Read", "fs_write"],
+            &["Read", "shell_exec"],
+            &["Read", "write_file(src/**)"],
+        ];
+        for allowed in allowlists {
+            let c = caps(false, false, allowed, &[]);
+            assert!(c.write_tools_allowed(), "{allowed:?}");
+            assert_eq!(c.sandbox_level(), SandboxLevel::WorkspaceWrite, "{allowed:?}");
+            let view = c.read_only_native_view();
+            assert_eq!(view.sandbox_level(), SandboxLevel::ReadOnly, "{allowed:?}");
+        }
+        let not_writable: [(&[&str], &[&str]); 6] = [
+            (&["Read", "BashOutput", "KillShell"], &[]),
+            (&["Read", "apply_patch"], &["fs_write"]),
+            (&["Read", "shell"], &["shell"]),
+            (&["Read", "Bash", "Write"], &["shell_exec", "fs_write"]),
+            (&[], &["shell_exec", "fs_write"]),
+            (&[], &["Bash", "fs_write"]),
+        ];
+        for (allowed, denied) in not_writable {
+            let c = caps(false, false, allowed, denied);
+            assert!(!c.write_tools_allowed(), "{allowed:?} / {denied:?}");
+        }
+        // Denying another runtime's spellings bare keeps the Claude tools, so
+        // the level stays writable — and the constraint refuses the coarse
+        // runtime instead.
+        let c = caps(false, false, &[], &["shell", "apply_patch"]);
+        assert!(c.write_tools_allowed());
+        let n = c.native_tool_constraints();
+        assert!(n.needs_no_shell() && !n.no_write.is_empty(), "{n:?}");
+    }
+
+    /// Round 3 #2: a server-qualified `denied_tools` / `allowed_tools` entry
+    /// names MCP tools only. `denied_tools = ["mcp__duduclaw__*"]` used to
+    /// refuse Codex. The approval lists keep the broader reading.
+    #[test]
+    fn server_qualified_list_entries_never_restrict_native_tools() {
+        for c in [
+            caps(false, false, &[], &["mcp__duduclaw__*"]),
+            caps(false, false, &[], &["mcp__duduclaw"]),
+            caps(false, false, &[], &["mcp__duduclaw__Bash"]),
+            caps(false, false, &[], &["mcp__other__shell", "mcp__other__apply_patch"]),
+            caps(false, false, &["Read", "Write", "Bash", "mcp__duduclaw__*"], &["mcp__duduclaw__*"]),
+            caps(false, false, &["Read", "Write", "Bash", "mcp__duduclaw__memory_search(x)"], &[]),
+        ] {
+            assert!(c.native_tool_constraints().is_empty(), "{c:?}: {:?}", c.native_tool_constraints());
+        }
+        let c = CapabilitiesConfig { approval_required_tools: vec!["mcp__duduclaw__*".into()], ..Default::default() };
+        assert!(c.native_tool_constraints().needs_no_shell(), "approval lists keep the fail-safe reading");
     }
 
     /// Daybreak round 2 #3: the classifier and the PolicyKernel share one
