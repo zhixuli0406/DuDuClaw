@@ -72,6 +72,7 @@ fn enterprise_surfaces_are_listed() {
         "me.isolation.decide_personal_delegation",
         // F6d restore RPCs
         "me.isolation.list_restorable",
+        "me.isolation.restore_challenge",
         "me.isolation.request_restore",
         "me.isolation.cancel_restore",
         "isolation.employee_restore_decide",

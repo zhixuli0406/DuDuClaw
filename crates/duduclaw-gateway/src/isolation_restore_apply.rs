@@ -330,8 +330,9 @@ fn users_error(error: duduclaw_auth::db::PersonalAgentError) -> Refusal {
 }
 
 /// §3.5 c: one users.db IMMEDIATE transaction — tenant, eligibility, the
-/// approval rule (inside the same transaction as the writes), then the
-/// mirror or the selected bindings with the ACL and policy epoch bumps.
+/// approval rule (inside the same transaction as the writes) and, for a
+/// self-approval, its users.db audit row, then the mirror or the selected
+/// bindings with the ACL and policy epoch bumps.
 fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q: &Quarantined, approver: &str)
     -> Result<Approval, Refusal> {
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(from_lifecycle)?;
@@ -341,6 +342,12 @@ fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q:
         if !lifecycle::owner_eligible(&tx, owner).map_err(from_lifecycle)? { return Err(Refusal::OwnerIneligible); }
     }
     let approval = decide(env.rule, &tx, &request.requester, approver, request.kind)?;
+    // F6c2: the sole-Admin users.db audit row, written once, here — in the
+    // write transaction of the decision (tx1's read-only check never writes).
+    if approval.self_approved {
+        env.rule.record_self_approval(&tx, &request.requester, approver, request.kind, &request.request_id)
+            .map_err(Refusal::Approval)?;
+    }
     match &q.owner {
         Some(owner) => duduclaw_auth::db::restore_personal_mirror_in_transaction(&tx, &q.label, owner).map_err(users_error)?,
         None => { duduclaw_auth::db::restore_shared_bindings_in_transaction(&tx, &q.label, &shared_selection(request, q)?)

@@ -145,6 +145,12 @@ impl RetireError {
 pub(crate) trait ApprovalRule: Send + Sync {
     /// `owner`: the Personal owner of the purged row (`approver != owner` too).
     fn decide(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>) -> Result<Approval, ApprovalRefusal>;
+    /// S12 sole-Admin retire: F6c2's users.db self-approval audit row for
+    /// `subject` (the proposal id), written in the users.db transaction of a
+    /// decision that allowed the self-approval, at most once per proposal.
+    /// Called by the stage step before the root retire; `Err` refuses it.
+    fn record_self_approval(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>, subject: &str)
+        -> Result<(), ApprovalRefusal>;
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Approval {

@@ -28,6 +28,9 @@ fn log_rule_requires_step_up_and_transaction() {
     tx.finish().unwrap();
     let autocommit = Connection::open(dir.path().join("users.db")).unwrap();
     assert_eq!(LogRule::new(true, now).decide(&autocommit, "a", "b", RequestKind::SharedRestore), Err("APPROVAL_NOT_IN_TRANSACTION"));
+    // The self-approval audit row is only ever written inside the decision's tx.
+    assert_eq!(LogRule::new(true, now).record_self_approval(&autocommit, "a", "a", RequestKind::PersonalRestore, "req-1"),
+        Err(SELF_APPROVAL_AUDIT_UNAVAILABLE));
 }
 
 #[test]

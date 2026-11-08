@@ -90,6 +90,12 @@ impl RetireBackend {
         let details = json!({"employee": hex, "proposal_id": key, "requested_by": v.spec.requested_by, "approved_by": v.approver,
             "early": v.spec.early, "self_approved": self_approved, "digest_prefix": v.spec.quarantine_digest_prefix, "uid": v.spec.uid});
         if step == Step::Stage && !v.checked.retired {
+            // S12: the users.db self-approval row before any root effect
+            // (idempotent per proposal; a failure refuses the retire).
+            if self_approved {
+                self.rule.record_self_approval(&self.home, &v.spec.requested_by, &v.approver, v.checked.owner.as_deref(), &key)
+                    .map_err(RetireError::Approval)?;
+            }
             audit(&self.home, "isolation.employee_retire_approved", &v.spec.label, false, details.clone());
             if self_approved {
                 audit(&self.home, "isolation.employee_retire_self_approved", &v.spec.label, true, details.clone());

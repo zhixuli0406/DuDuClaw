@@ -135,14 +135,22 @@ impl LogRule {
     }
 }
 
-impl ApprovalRule for LogRule {
-    fn decide(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind) -> Result<Approval, &'static str> {
+impl LogRule {
+    fn request<'a>(&self, requester: &'a str, approver: &'a str, kind: RequestKind) -> ApprovalRequest<'a> {
         let kind = approval_kind(kind);
         // Personal kinds are owner-filed: the owner is the requester.
         let owner = kind.is_personal().then_some(requester);
-        let request = ApprovalRequest { kind, requester_user_id: requester, owner_user_id: owner,
-            approver_user_id: approver, fresh_step_up: self.fresh_step_up, now: self.now };
-        match EligibilityLogRule.decide(users, &request) {
+        ApprovalRequest { kind, requester_user_id: requester, owner_user_id: owner,
+            approver_user_id: approver, fresh_step_up: self.fresh_step_up, now: self.now }
+    }
+}
+
+/// Refusal code when the users.db self-approval audit row cannot be written.
+pub(crate) const SELF_APPROVAL_AUDIT_UNAVAILABLE: &str = "SELF_APPROVAL_AUDIT_UNAVAILABLE";
+
+impl ApprovalRule for LogRule {
+    fn decide(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind) -> Result<Approval, &'static str> {
+        match EligibilityLogRule.decide(users, &self.request(requester, approver, kind)) {
             ApprovalDecision::Allowed { self_approved, notice_addresses } => {
                 if let Ok(mut kept) = self.notices.lock() { *kept = notice_addresses; }
                 Ok(Approval { self_approved })
@@ -150,30 +158,61 @@ impl ApprovalRule for LogRule {
             ApprovalDecision::Refused(refusal) => Err(refusal.code()),
         }
     }
+    fn record_self_approval(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind, subject: &str)
+        -> Result<(), &'static str> {
+        // F6c2 refuses an autocommit connection: only the decision's tx writes it.
+        rule::record_self_approval(users, &self.request(requester, approver, kind), subject)
+            .map_err(|_| SELF_APPROVAL_AUDIT_UNAVAILABLE)
+    }
 }
 
 /// F6l's retire-card rule for an early-purged row (S12), requester = proposer.
 /// The confirmation RPC refuses every approve/apply call without a verified
 /// step-up proof before any backend runs, so the step-up is fresh here.
 pub(crate) struct RetireLogRule { pub(crate) now: fn() -> i64 }
+
+fn retire_approval(decision: ApprovalDecision)
+    -> Result<crate::isolation_retire::Approval, crate::isolation_retire::ApprovalRefusal> {
+    use crate::isolation_retire::{Approval as A, ApprovalRefusal as R};
+    match decision {
+        ApprovalDecision::Allowed { self_approved: true, .. } => Ok(A::SelfApproved),
+        ApprovalDecision::Allowed { .. } => Ok(A::OtherAdmin),
+        ApprovalDecision::Refused(rule::ApprovalRefusal::SecondAdminRequired) => Err(R::NeedsOtherAdmin),
+        ApprovalDecision::Refused(rule::ApprovalRefusal::ApproverNotQualified(_)) => Err(R::NotQualified),
+        ApprovalDecision::Refused(rule::ApprovalRefusal::CoolingWindow) => Err(R::Cooling),
+        ApprovalDecision::Refused(_) => Err(R::LogUnavailable),
+    }
+}
+
 impl crate::isolation_retire::ApprovalRule for RetireLogRule {
     fn decide(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>)
         -> Result<crate::isolation_retire::Approval, crate::isolation_retire::ApprovalRefusal> {
-        use crate::isolation_retire::{Approval as A, ApprovalRefusal as R};
+        use crate::isolation_retire::ApprovalRefusal as R;
         let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadOnly).map_err(|_| R::LogUnavailable)?;
         let tx = users.transaction().map_err(|_| R::LogUnavailable)?;
         let request = ApprovalRequest { kind: ApprovalKind::EarlyPurgedRetire, requester_user_id: requester,
             owner_user_id: owner, approver_user_id: approver, fresh_step_up: true, now: (self.now)() };
         let decision = EligibilityLogRule.decide(&tx, &request);
         tx.finish().map_err(|_| R::LogUnavailable)?;
-        match decision {
-            ApprovalDecision::Allowed { self_approved: true, .. } => Ok(A::SelfApproved),
-            ApprovalDecision::Allowed { .. } => Ok(A::OtherAdmin),
-            ApprovalDecision::Refused(rule::ApprovalRefusal::SecondAdminRequired) => Err(R::NeedsOtherAdmin),
-            ApprovalDecision::Refused(rule::ApprovalRefusal::ApproverNotQualified(_)) => Err(R::NotQualified),
-            ApprovalDecision::Refused(rule::ApprovalRefusal::CoolingWindow) => Err(R::Cooling),
-            ApprovalDecision::Refused(_) => Err(R::LogUnavailable),
-        }
+        retire_approval(decision)
+    }
+
+    /// S12: the retire card has no users.db write of its own, so this opens
+    /// one IMMEDIATE users.db transaction, decides again in it and writes
+    /// F6c2's self-approval row there — once per proposal (`subject`): a
+    /// retried stage finds the row and writes nothing.
+    fn record_self_approval(&self, home: &Path, requester: &str, approver: &str, owner: Option<&str>, subject: &str)
+        -> Result<(), crate::isolation_retire::ApprovalRefusal> {
+        use crate::isolation_retire::{Approval as A, ApprovalRefusal as R};
+        let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(|_| R::LogUnavailable)?;
+        let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| R::LogUnavailable)?;
+        let request = ApprovalRequest { kind: ApprovalKind::EarlyPurgedRetire, requester_user_id: requester,
+            owner_user_id: owner, approver_user_id: approver, fresh_step_up: true, now: (self.now)() };
+        if retire_approval(EligibilityLogRule.decide(&tx, &request))? != A::SelfApproved { return Err(R::LogUnavailable); }
+        let written: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM auth_audit_log WHERE action=?1 AND target=?2)",
+            params![rule::SELF_APPROVED_AUDIT_ACTION, subject], |r| r.get(0)).map_err(|_| R::LogUnavailable)?;
+        if !written { rule::record_self_approval(&tx, &request, subject).map_err(|_| R::LogUnavailable)?; }
+        tx.commit().map_err(|_| R::LogUnavailable)
     }
 }
 

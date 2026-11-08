@@ -5,6 +5,7 @@
 //! | Method | Caller |
 //! |---|---|
 //! | `me.isolation.list_restorable` | owner (own Personal rows only) |
+//! | `me.isolation.restore_challenge` | owner (own row): the strongest factor's purpose-bound challenge |
 //! | `me.isolation.request_restore` / `cancel_restore` | owner + strongest factor (Q2) |
 //! | `isolation.employee_restore_decide` / `employee_restore_cancel` | Admin + MFA + step-up |
 //! | `isolation.employee_restore_regrant` | Admin + MFA + step-up (one listed item, audited) |
@@ -16,22 +17,49 @@ use super::*;
 use crate::isolation_restore::{CatalogRoutes, RestoreEnv, SpawndRootProbe};
 use crate::isolation_restore_rpc::{self as rpc, RpcError};
 use crate::isolation_restore_wiring::{LogRule, RegistryMarks};
+use duduclaw_auth::mfa::owner_factor::{RestoreChallenge, RestoreProof};
+use duduclaw_auth::mfa::OwnerFactorError;
 
 pub(super) const LIST_RESTORABLE: &str = "me.isolation.list_restorable";
+pub(super) const RESTORE_CHALLENGE: &str = "me.isolation.restore_challenge";
 pub(super) const REQUEST_RESTORE: &str = "me.isolation.request_restore";
 pub(super) const CANCEL_RESTORE: &str = "me.isolation.cancel_restore";
 pub(super) const DECIDE: &str = "isolation.employee_restore_decide";
 pub(super) const CANCEL: &str = "isolation.employee_restore_cancel";
 pub(super) const REGRANT: &str = "isolation.employee_restore_regrant";
 pub(super) const RETIRE_PROPOSE: &str = "isolation.employee_retire_propose";
-pub(super) const METHODS: [&str; 7] = [LIST_RESTORABLE, REQUEST_RESTORE, CANCEL_RESTORE, DECIDE, CANCEL, REGRANT, RETIRE_PROPOSE];
+pub(super) const METHODS: [&str; 8] = [LIST_RESTORABLE, RESTORE_CHALLENGE, REQUEST_RESTORE, CANCEL_RESTORE, DECIDE, CANCEL, REGRANT,
+    RETIRE_PROPOSE];
 
+/// `me.isolation.restore_challenge`: the row the proof will be bound to (a
+/// cancel names the row of its request).
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct OwnerRequest { pub(super) employee_id: String, pub(super) incarnation: u32, pub(super) factor: String, pub(super) code: String }
+pub(super) struct OwnerChallenge { pub(super) employee_id: String, pub(super) incarnation: u32 }
+/// `code`: TOTP or email code; `challenge_id`: passkey / email (from
+/// `restore_challenge`); `credential`: the passkey assertion.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct OwnerCancel { pub(super) request_id: String, pub(super) factor: String, pub(super) code: String }
+pub(super) struct OwnerRequest {
+    pub(super) employee_id: String, pub(super) incarnation: u32, pub(super) factor: String,
+    #[serde(default)] pub(super) code: String,
+    #[serde(default)] pub(super) challenge_id: Option<String>,
+    #[serde(default)] pub(super) credential: Option<Value>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OwnerCancel {
+    pub(super) request_id: String, pub(super) factor: String,
+    #[serde(default)] pub(super) code: String,
+    #[serde(default)] pub(super) challenge_id: Option<String>,
+    #[serde(default)] pub(super) credential: Option<Value>,
+}
+
+/// The operator-configured passkey origin (`None`: a passkey owner is
+/// refused unavailable, never offered a weaker factor).
+fn passkey_origin(home: &Path) -> Option<String> {
+    crate::server::server_mfa_passkey::configured_origin(home).ok()
+}
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Decide { pub(super) request_id: String, pub(super) decision: String, pub(super) csrf_token: [u8; 32] }
@@ -105,13 +133,45 @@ impl MethodHandler {
                 let _: NoParams = serde_json::from_value(params).map_err(invalid)?;
                 run(move || Ok(rpc::list_restorable(&home, &user, now()?)?)).await
             }
+            RESTORE_CHALLENGE => {
+                let input: OwnerChallenge = serde_json::from_value(params).map_err(invalid)?;
+                let (mail_home, mail_db, mail_user) = (home.clone(), db.clone(), user.clone());
+                let issued = run(move || {
+                    let now = now()?;
+                    let origin = passkey_origin(&home);
+                    let mail = crate::mfa_email::available(&home);
+                    let issue = |purpose: &str| db.restore_challenge(&user, epoch, purpose, origin.as_deref(), mail, now);
+                    Ok(rpc::restore_challenge(&home, &user, &input.employee_id, input.incarnation, &issue)?)
+                }).await?;
+                let ttl = duduclaw_auth::mfa::owner_factor::RESTORE_CHALLENGE_TTL;
+                match issued {
+                    RestoreChallenge::Totp => Ok(json!({"factor": "totp", "challenge_id": null})),
+                    RestoreChallenge::Passkey(mut options) => {
+                        options["factor"] = json!("passkey");
+                        options["expires_in"] = json!(ttl);
+                        Ok(options)
+                    }
+                    RestoreChallenge::Email { challenge_id, email, code } => {
+                        // The email-factor sender; the code never leaves in the reply.
+                        if crate::mfa_email::send_code(&mail_home, &mail_db, &challenge_id, &email, &code).await.is_err() {
+                            let discard = challenge_id.clone();
+                            let _ = tokio::task::spawn_blocking(move || mail_db.restore_challenge_discard(&mail_user, &discard)).await;
+                            return Err(RpcError::Factor(OwnerFactorError::Unavailable).into());
+                        }
+                        Ok(json!({"factor": "email", "challenge_id": challenge_id, "sent": true, "expires_in": ttl}))
+                    }
+                }
+            }
             REQUEST_RESTORE => {
                 let input: OwnerRequest = serde_json::from_value(params).map_err(invalid)?;
                 let cap = self.effective_agent_cap().await;
                 run(move || {
                     let now = now()?;
                     let cipher = crate::mfa::Cipher(&home);
-                    let check = |factor, code: &str| db.restore_owner_factor(&user, epoch, factor, code, &cipher, now);
+                    let origin = passkey_origin(&home);
+                    let check = |factor, purpose: &str, code: &str| db.restore_owner_factor(&user, epoch, factor,
+                        &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
+                        &cipher, origin.as_deref(), now);
                     // The request stage never approves: no step-up for the rule.
                     let rule = LogRule::new(false, now);
                     Ok(with_env(&home, &user, &rule, cap, now, |env| rpc::request_restore(&home, env, &user,
@@ -123,7 +183,10 @@ impl MethodHandler {
                 run(move || {
                     let now = now()?;
                     let cipher = crate::mfa::Cipher(&home);
-                    let check = |factor, code: &str| db.restore_owner_factor(&user, epoch, factor, code, &cipher, now);
+                    let origin = passkey_origin(&home);
+                    let check = |factor, purpose: &str, code: &str| db.restore_owner_factor(&user, epoch, factor,
+                        &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
+                        &cipher, origin.as_deref(), now);
                     Ok(rpc::cancel_own(&home, &user, &input.request_id, &input.factor, &input.code, &check, now)?)
                 }).await
             }

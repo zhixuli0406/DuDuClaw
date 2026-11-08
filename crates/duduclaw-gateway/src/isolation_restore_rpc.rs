@@ -4,11 +4,13 @@
 //! `system`; Admin + MFA + migration step-up for `isolation.*`; the session
 //! credential epoch for `me.isolation.*`) and runs these on the blocking pool.
 //!
-//! - Owner (`me.isolation.*`): [`list_restorable`], [`request_restore`],
-//!   [`cancel_own`]. Only the receipt owner, exact id equality; any other row
-//!   answers `NOT_FOUND` (no existence oracle, §5). Request and cancel need a
-//!   fresh proof of the owner's strongest factor (Q2), verified before
-//!   anything is filed; a wrong code counts toward the login lockout.
+//! - Owner (`me.isolation.*`): [`list_restorable`], [`restore_challenge`],
+//!   [`request_restore`], [`cancel_own`]. Only the receipt owner, exact id
+//!   equality; any other row answers `NOT_FOUND` (no existence oracle, §5).
+//!   Request and cancel need a fresh proof of the owner's strongest factor
+//!   (Q2: passkey assertion / TOTP / email code), bound to the row's purpose
+//!   `restore:<employee_id>:<incarnation>` and verified before anything is
+//!   filed; a failed proof counts toward the login lockout.
 //!   There is no admin RPC that files a Personal request.
 //! - Admin (`isolation.*`): [`decide`] (approve runs the F6c engine with the
 //!   F6c2 rule inside the users.db transaction; `self_approved` is recorded
@@ -61,9 +63,10 @@ impl RpcError {
             Self::Retire(r) => r.message(),
             Self::Invalid => "申請內容不正確，請重新載入後再試。",
             Self::Factor(OwnerFactorError::NoFactor) => "請先設定兩步驟驗證",
-            Self::Factor(OwnerFactorError::NotStrongest(_)) => "請使用你目前最強的登入驗證方式（通行金鑰優先，其次為驗證器 App）。",
-            Self::Factor(OwnerFactorError::Unsupported(_)) => "你的最強驗證方式目前無法用於申請還原，請聯絡管理員。",
-            Self::Factor(OwnerFactorError::Failed) => "驗證碼不正確，或嘗試次數過多已暫時鎖定。",
+            Self::Factor(OwnerFactorError::NotStrongest(_)) =>
+                "請使用你目前最強的登入驗證方式（通行金鑰優先，其次為驗證器 App，最後為 Email 驗證碼）。",
+            Self::Factor(OwnerFactorError::Failed) => "驗證失敗或已過期，或嘗試次數過多已暫時鎖定，請重新取得驗證後再試。",
+            Self::Factor(OwnerFactorError::RateLimited) => "寄送太頻繁，請稍後再試。",
             Self::Factor(OwnerFactorError::Denied) => "登入憑證已失效，請重新登入。",
             Self::Factor(OwnerFactorError::Unavailable) => "無法讀取帳號資料。",
             Self::Restore(refusal) => match refusal {
@@ -111,9 +114,16 @@ fn request_id(value: &str) -> Result<&str, RpcError> {
     if value.len() == 32 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { Ok(value) } else { Err(RpcError::Invalid) }
 }
 
-/// The owner's factor check, run before anything is filed. Production:
+/// The owner's factor check `(factor, purpose, code)`, run before anything is
+/// filed. `purpose` (`restore:<employee_id>:<incarnation>`) is derived here
+/// from the verified row, never from the client. Production:
 /// `UserDb::restore_owner_factor` (its users.db transaction commits first).
-pub(crate) type FactorCheck<'a> = &'a dyn Fn(OwnerFactor, &str) -> Result<OwnerFactor, OwnerFactorError>;
+pub(crate) type FactorCheck<'a> = &'a dyn Fn(OwnerFactor, &str, &str) -> Result<OwnerFactor, OwnerFactorError>;
+
+/// The proof purpose of one quarantine row.
+fn purpose(employee: EmployeeId, incarnation: u32) -> Result<String, RpcError> {
+    duduclaw_auth::mfa::owner_factor::restore_purpose(&hex::encode(employee.0), incarnation).ok_or(RpcError::Invalid)
+}
 
 /// Who gets a request-side notice: the log-eligible Admins (S16) and, for a
 /// Personal row, the tombstone-time address.
@@ -141,9 +151,20 @@ fn own_row(home: &Path, caller: &str, employee: EmployeeId, incarnation: u32) ->
     Ok(q)
 }
 
-fn verify_factor(check: FactorCheck<'_>, factor: &str, code: &str) -> Result<OwnerFactor, RpcError> {
+fn verify_factor(check: FactorCheck<'_>, factor: &str, purpose: &str, code: &str) -> Result<OwnerFactor, RpcError> {
     let factor = OwnerFactor::parse(factor).ok_or(RpcError::Factor(OwnerFactorError::Denied))?;
-    check(factor, code).map_err(RpcError::Factor)
+    check(factor, purpose, code).map_err(RpcError::Factor)
+}
+
+/// `me.isolation.restore_challenge`: ownership first (`NOT_FOUND` for every
+/// other row, no factor oracle), then `issue(purpose)` — production
+/// `UserDb::restore_challenge` (the strongest factor's passkey ceremony or
+/// email code, or nothing for TOTP; users.db only).
+pub(crate) fn restore_challenge<T>(home: &Path, caller: &str, employee: &str, incarnation: u32,
+    issue: &dyn Fn(&str) -> Result<T, OwnerFactorError>) -> Result<T, RpcError> {
+    let employee = hex16(employee)?;
+    own_row(home, caller, employee, incarnation)?;
+    issue(&purpose(employee, incarnation)?).map_err(RpcError::Factor)
 }
 
 /// `root_state` of each employee id (no root IPC).
@@ -236,7 +257,7 @@ pub(crate) fn request_restore(home: &Path, env: &RestoreEnv<'_>, caller: &str, e
     let employee = hex16(employee)?;
     // Ownership first (NOT_FOUND for every other row), then the factor.
     own_row(home, caller, employee, incarnation)?;
-    let factor = verify_factor(check, factor, code)?;
+    let factor = verify_factor(check, factor, &purpose(employee, incarnation)?, code)?;
     let filed = engine::file_personal_request(home, env, employee, incarnation,
         Some(OwnerProof { user_id: caller, factor: factor.as_str() }))?;
     let request = filed.request;
@@ -254,7 +275,7 @@ pub(crate) fn cancel_own(home: &Path, caller: &str, id: &str, factor: &str, code
     let id = request_id(id)?;
     let request = { let db = engine::open_apply(home)?; engine::read_request(&db, id)? }.ok_or(Refusal::NotFound)?;
     if request.requester != caller || request.owner.as_deref() != Some(caller) { return Err(Refusal::NotFound.into()); }
-    verify_factor(check, factor, code)?;
+    verify_factor(check, factor, &purpose(request.employee, request.incarnation)?, code)?;
     engine::close_request(home, id, caller, Close::Cancelled, now)?;
     if let Some(q) = row_of(home, request.employee, request.incarnation)? {
         notify(home, &q, "isolation.employee_restore_cancelled", json!({"request_id": id, "actor_user_id": caller}), true, now);

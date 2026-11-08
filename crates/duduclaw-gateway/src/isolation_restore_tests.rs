@@ -56,10 +56,33 @@ impl LabelStores for Marks {
 }
 
 /// F6c2 stand-in: any approver; self-approval exactly when approver == requester.
+/// The self-approval row is F6c2's real `record_self_approval` on the given
+/// connection (refused outside a transaction).
 pub(super) struct AllowSelf;
 impl ApprovalRule for AllowSelf {
     fn decide(&self, _: &Connection, requester: &str, approver: &str, _: RequestKind) -> Result<Approval, &'static str> {
         Ok(Approval { self_approved: requester == approver })
+    }
+    fn record_self_approval(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind, subject: &str)
+        -> Result<(), &'static str> {
+        let kind = crate::isolation_restore_wiring::approval_kind(kind);
+        let request = duduclaw_auth::admin_approval_rule::ApprovalRequest { kind, requester_user_id: requester,
+            owner_user_id: kind.is_personal().then_some(requester), approver_user_id: approver, fresh_step_up: true, now: now() };
+        duduclaw_auth::admin_approval_rule::record_self_approval(users, &request, subject).map_err(|_| "SELF_APPROVAL_AUDIT_UNAVAILABLE")
+    }
+}
+
+/// [`AllowSelf`] that logs every call: `("decide" | "record", in_transaction)`.
+pub(super) struct Recording(pub(super) Rc<RefCell<Vec<(&'static str, bool)>>>);
+impl ApprovalRule for Recording {
+    fn decide(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind) -> Result<Approval, &'static str> {
+        self.0.borrow_mut().push(("decide", !users.is_autocommit()));
+        AllowSelf.decide(users, requester, approver, kind)
+    }
+    fn record_self_approval(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind, subject: &str)
+        -> Result<(), &'static str> {
+        self.0.borrow_mut().push(("record", !users.is_autocommit()));
+        AllowSelf.record_self_approval(users, requester, approver, kind, subject)
     }
 }
 
@@ -597,6 +620,46 @@ fn restore_then_tombstone_purge_retire_frees_label() {
     assert_eq!(roots, 1, "one root row per id");
     sql(home, APPLY_DB, "UPDATE root_allocations SET root_state='retired'", &[]);
     assert_eq!(restore_precheck(home, LABEL, EMP, &fx.probe), Ok(RootClass::Retired));
+}
+
+fn self_approval_rows(home: &Path, subject: &str) -> i64 {
+    Connection::open(home.join(USERS_DB)).unwrap().query_row(
+        "SELECT count(*) FROM auth_audit_log WHERE action=?1 AND target=?2",
+        rusqlite::params![duduclaw_auth::admin_approval_rule::SELF_APPROVED_AUDIT_ACTION, subject], |r| r.get(0)).unwrap()
+}
+
+/// F6c2 (§3.4 sole Admin): the rule runs twice (tx1's read-only check, then
+/// the users.db write tx of the apply), but the users.db
+/// `isolation.employee_restore_self_approved` row is written once, by the
+/// apply's write step, right after its own decide and in that transaction
+/// (the real F6c2 writer refuses an autocommit connection, and the row is
+/// in users.db after the apply). Another Admin's approval writes none.
+#[test]
+fn self_approval_row_written_once_in_apply_tx() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let fx = Fakes { rule: Box::new(Recording(calls.clone())), ..fakes(&root) };
+    let request = file(&f, &fx).unwrap();
+    calls.borrow_mut().clear();
+    let restored = approve(home, &fx.env(), &request.request_id, &f.alice).unwrap();
+    assert!(restored.self_approved);
+    assert_eq!(*calls.borrow(), vec![("decide", true), ("decide", true), ("record", true)],
+        "tx1 decides only; the apply decides and records in one transaction");
+    assert_eq!(self_approval_rows(home, &request.request_id), 1);
+    assert_eq!(stored(home, &request.request_id).self_approved, Some(true));
+    // Another Admin approving: the rule never records, no row.
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let fx = Fakes { rule: Box::new(Recording(calls.clone())), ..fakes(&root) };
+    let request = file(&f, &fx).unwrap();
+    calls.borrow_mut().clear();
+    assert!(!approve(home, &fx.env(), &request.request_id, &f.bob).unwrap().self_approved);
+    assert_eq!(*calls.borrow(), vec![("decide", true), ("decide", true)]);
+    assert_eq!(self_approval_rows(home, &request.request_id), 0);
 }
 
 #[path = "isolation_restore_recovery_tests.rs"]

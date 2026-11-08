@@ -99,6 +99,28 @@ fn owner_request_schema_has_no_owner_field() {
         forged[extra] = json!("someone");
         assert!(serde_json::from_value::<OwnerRequest>(forged).is_err(), "{extra}");
     }
+    // Passkey / email proofs carry the challenge (and the assertion); the
+    // purpose is never a request field (the server derives it from the row).
+    let passkey = json!({"employee_id": "0".repeat(32), "incarnation": 0, "factor": "passkey",
+        "challenge_id": "c".repeat(64), "credential": {"id": "x"}});
+    assert!(serde_json::from_value::<OwnerRequest>(passkey.clone()).is_ok());
+    let cancel = json!({"request_id": "0".repeat(32), "factor": "email", "challenge_id": "c".repeat(64), "code": "123456"});
+    assert!(serde_json::from_value::<OwnerCancel>(cancel.clone()).is_ok());
+    for extra in ["purpose", "owner_id", "user_id"] {
+        let mut forged = passkey.clone();
+        forged[extra] = json!("restore:x:0");
+        assert!(serde_json::from_value::<OwnerRequest>(forged).is_err(), "{extra}");
+        let mut forged = cancel.clone();
+        forged[extra] = json!("restore:x:0");
+        assert!(serde_json::from_value::<OwnerCancel>(forged).is_err(), "{extra}");
+    }
+    let challenge = json!({"employee_id": "0".repeat(32), "incarnation": 0});
+    assert!(serde_json::from_value::<OwnerChallenge>(challenge.clone()).is_ok());
+    for extra in ["factor", "purpose", "owner_id", "email"] {
+        let mut forged = challenge.clone();
+        forged[extra] = json!("x");
+        assert!(serde_json::from_value::<OwnerChallenge>(forged).is_err(), "{extra}");
+    }
     let failure = failure_frame(Failure::Rpc(RpcError::Restore(crate::isolation_restore::Refusal::NotFound)));
     assert_eq!(refusal(&failure), "NOT_FOUND");
 }

@@ -23,7 +23,7 @@
 //! - `isolation.employee_tombstone` (Admin + step-up): tombstone of a
 //!   Personal or Shared employee (`isolation_lifecycle::tombstone_employee`, F6d).
 //! - F6d restore RPCs (`isolation_employee_restore.rs`): `me.isolation.list_restorable`,
-//!   `request_restore`, `cancel_restore`; `isolation.employee_restore_decide`,
+//!   `restore_challenge`, `request_restore`, `cancel_restore`; `isolation.employee_restore_decide`,
 //!   `employee_restore_cancel`, `employee_restore_regrant`, `employee_retire_propose`.
 //! - `isolation.employee_list` (Admin): confirmed employees and requests,
 //!   plus the step-up state for the dashboard.

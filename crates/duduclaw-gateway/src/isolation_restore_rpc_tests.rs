@@ -15,7 +15,14 @@ use std::cell::Cell;
 
 fn employee() -> String { hex::encode(EMP.0) }
 
-fn totp_ok(factor: OwnerFactor, _: &str) -> Result<OwnerFactor, OwnerFactorError> { Ok(factor) }
+/// The proof purpose of alice's row (incarnation 0), as the server derives it.
+fn purpose0() -> String { format!("restore:{}:0", employee()) }
+
+/// Accepts any code, but only for the purpose of alice's row.
+fn totp_ok(factor: OwnerFactor, purpose: &str, _: &str) -> Result<OwnerFactor, OwnerFactorError> {
+    assert_eq!(purpose, purpose0(), "the proof is bound to the row acted on");
+    Ok(factor)
+}
 
 fn file(f: &Fixture, fx: &super::restore::Fakes) -> Result<serde_json::Value, RpcError> {
     rpc::request_restore(f.home(), &fx.env(), &f.alice, &employee(), 0, "totp", "123456", &totp_ok)
@@ -29,7 +36,7 @@ fn request_only_by_owner() {
     let (_, root) = tombstoned(&f);
     let fx = fakes(&root);
     let asked = Cell::new(0);
-    let check = |factor: OwnerFactor, _: &str| -> Result<OwnerFactor, OwnerFactorError> { asked.set(asked.get() + 1); Ok(factor) };
+    let check = |factor: OwnerFactor, _: &str, _: &str| -> Result<OwnerFactor, OwnerFactorError> { asked.set(asked.get() + 1); Ok(factor) };
     // Another account (here an Admin) gets NOT_FOUND before any factor check.
     for caller in [f.bob.as_str(), "", "system", &f.alice.to_uppercase()] {
         assert_eq!(rpc::request_restore(f.home(), &fx.env(), caller, &employee(), 0, "totp", "1", &check).err(),
@@ -45,6 +52,28 @@ fn request_only_by_owner() {
     // The owner's listing shows it; bob's listing is empty.
     assert_eq!(rpc::list_restorable(f.home(), &f.alice, now()).unwrap()["restorable"][0]["open_request"]["state"], "requested");
     assert_eq!(rpc::list_restorable(f.home(), &f.bob, now()).unwrap()["restorable"], json!([]));
+}
+
+/// `me.isolation.restore_challenge`: ownership first (no factor oracle),
+/// then the issuer gets the purpose of exactly that row.
+#[test]
+fn restore_challenge_only_by_owner_and_bound_to_row() {
+    let f = fixture();
+    let (_, _root) = tombstoned(&f);
+    let asked = std::cell::RefCell::new(Vec::new());
+    let issue = |purpose: &str| -> Result<&'static str, OwnerFactorError> { asked.borrow_mut().push(purpose.to_owned()); Ok("issued") };
+    for caller in [f.bob.as_str(), "", "system"] {
+        assert_eq!(rpc::restore_challenge(f.home(), caller, &employee(), 0, &issue).err(), Some(RpcError::Restore(Refusal::NotFound)));
+    }
+    assert_eq!(rpc::restore_challenge(f.home(), &f.alice, &employee(), 1, &issue).err(), Some(RpcError::Restore(Refusal::NotFound)),
+        "no row at that incarnation");
+    assert_eq!(rpc::restore_challenge(f.home(), &f.alice, &employee().to_uppercase(), 0, &issue).err(), Some(RpcError::Invalid));
+    assert!(asked.borrow().is_empty(), "no challenge for rows the caller does not own");
+    assert_eq!(rpc::restore_challenge(f.home(), &f.alice, &employee(), 0, &issue), Ok("issued"));
+    assert_eq!(*asked.borrow(), vec![purpose0()]);
+    let locked = |_: &str| -> Result<(), OwnerFactorError> { Err(OwnerFactorError::RateLimited) };
+    let refused = rpc::restore_challenge(f.home(), &f.alice, &employee(), 0, &locked).unwrap_err();
+    assert_eq!(refused.code(), "FACTOR_RATE_LIMITED");
 }
 
 #[test]
@@ -69,10 +98,10 @@ fn request_requires_strongest_factor() {
     let f = fixture();
     let (_, root) = tombstoned(&f);
     let fx = fakes(&root);
-    let weaker = |_: OwnerFactor, _: &str| -> Result<OwnerFactor, OwnerFactorError> { Err(OwnerFactorError::NotStrongest(OwnerFactor::Passkey)) };
+    let weaker = |_: OwnerFactor, _: &str, _: &str| -> Result<OwnerFactor, OwnerFactorError> { Err(OwnerFactorError::NotStrongest(OwnerFactor::Passkey)) };
     let refused = rpc::request_restore(f.home(), &fx.env(), &f.alice, &employee(), 0, "totp", "1", &weaker).unwrap_err();
     assert_eq!((refused.code(), refused), ("FACTOR_NOT_STRONGEST", RpcError::Factor(OwnerFactorError::NotStrongest(OwnerFactor::Passkey))));
-    let failed = |_: OwnerFactor, _: &str| -> Result<OwnerFactor, OwnerFactorError> { Err(OwnerFactorError::Failed) };
+    let failed = |_: OwnerFactor, _: &str, _: &str| -> Result<OwnerFactor, OwnerFactorError> { Err(OwnerFactorError::Failed) };
     assert_eq!(rpc::request_restore(f.home(), &fx.env(), &f.alice, &employee(), 0, "totp", "000000", &failed).err(),
         Some(RpcError::Factor(OwnerFactorError::Failed)));
     // Unknown factor names never reach the check.
@@ -150,7 +179,7 @@ fn cancel_by_requester_or_admin() {
     let id = first["request_id"].as_str().unwrap();
     // Another member is not the requester (no oracle); the owner needs a factor.
     assert_eq!(rpc::cancel_own(f.home(), &f.bob, id, "totp", "1", &totp_ok, now()).err(), Some(RpcError::Restore(Refusal::NotFound)));
-    let failed = |_: OwnerFactor, _: &str| -> Result<OwnerFactor, OwnerFactorError> { Err(OwnerFactorError::Failed) };
+    let failed = |_: OwnerFactor, _: &str, _: &str| -> Result<OwnerFactor, OwnerFactorError> { Err(OwnerFactorError::Failed) };
     assert_eq!(rpc::cancel_own(f.home(), &f.alice, id, "totp", "0", &failed, now()).err(), Some(RpcError::Factor(OwnerFactorError::Failed)));
     assert_eq!(rpc::cancel_own(f.home(), &f.alice, id, "totp", "1", &totp_ok, now()).unwrap()["state"], "cancelled");
     assert_eq!(stored(f.home(), id).state, "cancelled");

@@ -72,7 +72,9 @@ impl RootProbe for SpawndRootProbe {
         {
             use duduclaw_migration::allocation::{Action, Request};
             let nonce = duduclaw_migration::ids::RequestId(*uuid::Uuid::new_v4().as_bytes());
-            match allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone() }) {
+            // `approver` is Retire-only (F6l): a ReadBack carries `None`, as
+            // `isolation_lifecycle`'s schema-1 ReadBack does.
+            match allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone(), approver: None }) {
                 Ok(receipt) => Ok(RootReadBack { receipt, phase: RootPhase::Ready, idle: None }),
                 Err(duduclaw_migration::Error::Authentication) => Err(RootError::Inconsistent),
                 Err(_) => Err(RootError::Transport),
@@ -257,12 +259,24 @@ pub(crate) struct Approval { pub(crate) self_approved: bool }
 /// refusal code (`APPROVER_NOT_QUALIFIED`, `ADMIN_LOG_UNAVAILABLE`, …).
 pub(crate) trait ApprovalRule {
     fn decide(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind) -> Result<Approval, &'static str>;
+    /// The users.db audit row of a sole-Admin self-approval (F6c2
+    /// `record_self_approval`, `isolation.employee_restore_self_approved`,
+    /// target = `subject`, the request id). Called exactly once per apply, by
+    /// the apply-time users.db write step, on the same transaction `decide`
+    /// just allowed `self_approved` in, so the row commits or rolls back with
+    /// the decision. Never called by the read-only tx1 check. `Err` refuses
+    /// the apply (fail closed).
+    fn record_self_approval(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind, subject: &str)
+        -> Result<(), &'static str>;
 }
 
 /// Production rule until F6c2 lands: refuses every approval.
 pub(crate) struct ApprovalRuleUnavailable;
 impl ApprovalRule for ApprovalRuleUnavailable {
     fn decide(&self, _: &Connection, _: &str, _: &str, _: RequestKind) -> Result<Approval, &'static str> {
+        Err("APPROVAL_RULE_UNAVAILABLE")
+    }
+    fn record_self_approval(&self, _: &Connection, _: &str, _: &str, _: RequestKind, _: &str) -> Result<(), &'static str> {
         Err("APPROVAL_RULE_UNAVAILABLE")
     }
 }

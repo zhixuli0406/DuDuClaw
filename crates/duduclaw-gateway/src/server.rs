@@ -19323,7 +19323,7 @@ mod remembered_sessions;
 #[path = "server_mfa_email.rs"]
 mod server_mfa_email;
 #[path = "server_mfa_passkey.rs"]
-mod server_mfa_passkey;
+pub(crate) mod server_mfa_passkey;
 
 #[cfg(test)]
 mod identity_key_startup_tests {

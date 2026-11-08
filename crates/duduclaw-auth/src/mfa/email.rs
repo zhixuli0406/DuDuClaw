@@ -27,10 +27,13 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             DELETE FROM mfa_email_sends WHERE user_id=OLD.id;
             DELETE FROM mfa_factor_preferences WHERE user_id=OLD.id;
             DELETE FROM mfa_factor_failures WHERE user_id=OLD.id;
-        END;") .map_err(|e|e.to_string())
+        END;") .map_err(|e|e.to_string())?;
+    // F6d: purpose-bound restore codes (same sender, own single-use table).
+    super::owner_factor::migrate(conn)
 }
 
-fn numeric_code() -> Result<String> {
+/// Six uniform digits (no modulo bias); shared with the F6d restore code.
+pub(super) fn numeric_code() -> Result<String> {
     loop {
         let mut bytes = [0u8;4];
         SystemRandom::new().fill(&mut bytes).map_err(|_|DENIED)?;

@@ -71,11 +71,17 @@ impl RetireRoot for FakeRoot {
     }
 }
 /// F6c2's rule as a fake: a configured answer, every call recorded.
-struct Rule { answer: Mutex<std::result::Result<Approval, ApprovalRefusal>>, calls: Mutex<Vec<(String, String, Option<String>)>> }
+struct Rule { answer: Mutex<std::result::Result<Approval, ApprovalRefusal>>, calls: Mutex<Vec<(String, String, Option<String>)>>,
+    /// Subjects of every users.db self-approval row requested (S12).
+    recorded: Mutex<Vec<String>> }
 impl ApprovalRule for Rule {
     fn decide(&self, _: &Path, requester: &str, approver: &str, owner: Option<&str>) -> std::result::Result<Approval, ApprovalRefusal> {
         self.calls.lock().unwrap().push((requester.into(), approver.into(), owner.map(str::to_owned)));
         *self.answer.lock().unwrap()
+    }
+    fn record_self_approval(&self, _: &Path, _: &str, _: &str, _: Option<&str>, subject: &str) -> std::result::Result<(), ApprovalRefusal> {
+        self.recorded.lock().unwrap().push(subject.into());
+        Ok(())
     }
 }
 #[derive(Default)]
@@ -183,7 +189,7 @@ fn fixture(early: bool) -> Fx {
     let receipt = Receipt { binding: item.binding, label: LABEL.into(), employee: EMPLOYEE, uid: 70_001, bytes: spec.bytes,
         inodes: spec.inodes, disabled: false, principal_binding: spec.binding };
     let fx = Fx { dir, root: Arc::new(FakeRoot { state: Mutex::new(Spawnd { phase: Some(Phase::Ready), ..Spawnd::default() }), receipt: receipt.clone() }),
-        rule: Arc::new(Rule { answer: Mutex::new(Ok(Approval::OtherAdmin)), calls: Mutex::new(Vec::new()) }),
+        rule: Arc::new(Rule { answer: Mutex::new(Ok(Approval::OtherAdmin)), calls: Mutex::new(Vec::new()), recorded: Mutex::new(Vec::new()) }),
         notices: Arc::new(Notices::default()), now: Arc::new(AtomicI64::new(1_000_000)) };
     let mut dead = receipt.clone(); dead.disabled = true;
     fx.sql("INSERT INTO confirmed_employees(label,operation,digest,receipt,tenant_id,incarnation) VALUES(?1,'op-1',X'01',?2,'tenant-a',0)",
@@ -303,12 +309,15 @@ fn retire_early_purged_row_needs_second_admin() {
     fx.apply_all(&binding).unwrap();
     assert!(fx.audit_log().contains("isolation.employee_retire_self_approved"));
     assert!(fx.audit_log().contains(r#""self_approved":true"#));
+    // F6c2's users.db row: requested once, at stage, for this proposal.
+    assert_eq!(*fx.rule.recorded.lock().unwrap(), vec![hex::encode(binding.operation_id.proposal_id.0)]);
     // A row purged after 90 days: Admin + step-up only, the rule is never consulted.
     let fx = fixture(false);
     let binding = fx.staged();
     fx.approve(&binding, PROPOSER).unwrap();
     fx.apply_all(&binding).unwrap();
     assert!(fx.rule.calls.lock().unwrap().is_empty());
+    assert!(fx.rule.recorded.lock().unwrap().is_empty(), "no self-approval row without the rule");
 }
 
 #[test]
