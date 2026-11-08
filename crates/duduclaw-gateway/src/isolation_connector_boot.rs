@@ -14,7 +14,7 @@ use duduclaw_isolation::{capability::EmployeeBinding, ids::EmployeeId};
 use duduclaw_mcp_boundary::{bindings::BindingAuthority, tool_policy::{AuthorizedToolCall, POLICIES, Route as ToolRoute},
     RequestContext, VerificationError};
 use serde_json::Value;
-use crate::{google_identity::isolation_bridge::{GoogleAccountRoutes, GoogleIsolationBridge},
+use crate::{google_identity::isolation_bridge::GoogleIsolationBridge,
     isolation_connectors::{AccountId, BoundConnectorExecutor, ConnectorCatalog, ConnectorKind,
         LiveConnectorSelectionPolicy, ProductConnectorAccount, Route, SelectedConnector, provider_for_tool},
     isolation_connector_clients::{AccountCredentialProvider, NativeConnectorExecutor},
@@ -276,9 +276,9 @@ pub trait ConnectorAccountDetails: Send + Sync {
     fn detail(&self, route: &Route) -> Result<Option<ConnectorAccountDetail>, VerificationError>;
 }
 
-/// Non-account Google bridge inputs. Routes always come from the catalog plan.
+/// Non-account Google bridge inputs. The bridge reads its live lifecycle and catalog.
 pub trait GoogleBridgeFactory: Send + Sync {
-    fn bridge(&self, home: &Path, agent: &str, employee: EmployeeId, routes: GoogleAccountRoutes)
+    fn bridge(&self, home: &Path, agent: &str, employee: EmployeeId, catalog: Arc<ConnectorCatalog>)
         -> Result<Arc<GoogleIsolationBridge>, VerificationError>;
 }
 pub struct GoogleBridgeInputs {
@@ -287,10 +287,10 @@ pub struct GoogleBridgeInputs {
     pub turns: Arc<dyn crate::isolation_egress::RunTurnResolver>,
 }
 impl GoogleBridgeFactory for GoogleBridgeInputs {
-    fn bridge(&self, home: &Path, agent: &str, employee: EmployeeId, routes: GoogleAccountRoutes)
+    fn bridge(&self, home: &Path, agent: &str, employee: EmployeeId, catalog: Arc<ConnectorCatalog>)
         -> Result<Arc<GoogleIsolationBridge>, VerificationError> {
         GoogleIsolationBridge::new(home.to_path_buf(), agent.to_owned(), employee, self.users.clone(),
-            self.reference.clone(), routes, self.turns.clone()).map(Arc::new)
+            self.reference.clone(), catalog, self.turns.clone()).map(Arc::new)
     }
 }
 
@@ -384,16 +384,7 @@ impl ConnectorProviderFactory for GatewayConnectorFactory {
         let plan = plan_connector_accounts(&catalog, binding, parts.home_binding.as_ref())?;
         let (home_dir, name) = (home.to_path_buf(), agent.to_owned());
 
-        let google = plan.accounts("google");
-        let (own, fallback): (Vec<_>, Vec<_>) = google.iter().partition(|account| !account.via_home);
-        if own.len() > 1 || fallback.len() > 1 { return Err(VerificationError::Invalid); }
-        let mut routes = GoogleAccountRoutes::default();
-        for account in own {
-            let EmployeeBinding::Personal(owner) = &account.route.binding else { return Err(VerificationError::Unavailable) };
-            routes.personal.insert(owner.as_str().to_owned(), account.product());
-        }
-        routes.home = fallback.first().map(|account| account.product());
-        let google = parts.google.bridge(home, agent, employee, routes)?;
+        let google = parts.google.bridge(home, agent, employee, catalog.clone())?;
 
         let notion_policy = match plan.single("notion")? {
             Some(account) => Some(Arc::new(NotionPolicy::new(home_dir.clone(), name.clone(), employee,
@@ -622,15 +613,13 @@ mod tests {
             Err(VerificationError::Unavailable)
         }
     }
-    /// Real bridge construction; records the routes the factory handed it.
-    struct RecordingGoogle { inputs: GoogleBridgeInputs, seen: Mutex<Option<(Vec<String>, Option<String>)>> }
+    /// Real bridge construction; records the exact catalog handed to the bridge.
+    struct RecordingGoogle { inputs: GoogleBridgeInputs, seen: Mutex<Option<Arc<ConnectorCatalog>>> }
     impl GoogleBridgeFactory for RecordingGoogle {
-        fn bridge(&self, home: &Path, agent: &str, employee: EmployeeId, routes: GoogleAccountRoutes)
+        fn bridge(&self, home: &Path, agent: &str, employee: EmployeeId, catalog: Arc<ConnectorCatalog>)
             -> Result<Arc<GoogleIsolationBridge>, VerificationError> {
-            *self.seen.lock().unwrap() = Some((
-                routes.personal.iter().map(|(owner, account)| format!("{owner}={}", account.account())).collect(),
-                routes.home.as_ref().map(|account| account.account().to_owned())));
-            self.inputs.bridge(home, agent, employee, routes)
+            *self.seen.lock().unwrap() = Some(catalog.clone());
+            self.inputs.bridge(home, agent, employee, catalog)
         }
     }
 
@@ -691,8 +680,8 @@ mod tests {
             "providers without a route still leave a complete, refusing registry");
         assert_eq!(s.details.asked(&routes), vec!["alice_db", "home_db"],
             "only this employee's own and home routes are resolved");
-        assert_eq!(*s.google.seen.lock().unwrap(), Some((vec![format!("alice={}", id("alice_google"))],
-            Some(id("home_google").as_str().to_owned()))), "no bob, tenant or revoked Google route");
+        assert!(Arc::ptr_eq(s.google.seen.lock().unwrap().as_ref().unwrap(), &routes.catalog),
+            "Google receives the live catalog, never a precomputed fallback account list");
         let ctx = context(alice(), Principal::Human { user_id: text("alice"), generation: 1 });
         let registry = installed.registry();
         assert_eq!(routes.offered(registry.candidates(&ctx, "db_sources", "database").unwrap()), vec!["alice_db", "home_db"]);
@@ -709,7 +698,7 @@ mod tests {
         s.details.asked.lock().unwrap().clear();
         let installed = s.factory.build(s.home.path(), AGENT, EMPLOYEE, &company(), routes.catalog.clone(), empty_bindings()).unwrap();
         assert_eq!(s.details.asked(&routes), vec!["company_db", "home_db"]);
-        assert_eq!(*s.google.seen.lock().unwrap(), Some((vec![], Some(id("home_google").as_str().to_owned()))));
+        assert!(Arc::ptr_eq(s.google.seen.lock().unwrap().as_ref().unwrap(), &routes.catalog));
         let ctx = context(company(), Principal::Background { tenant_id: text("company"), generation: 1 });
         assert_eq!(routes.offered(installed.registry().candidates(&ctx, "db_sources", "database").unwrap()),
             vec!["company_db", "home_db"]);

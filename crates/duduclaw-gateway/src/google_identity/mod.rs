@@ -31,6 +31,7 @@ pub(crate) mod effect_authority;
 pub mod delegation_key;
 pub mod execute;
 pub mod isolation_bridge;
+pub mod isolation_routes;
 pub(crate) mod home_source;
 pub mod mailbox;
 pub(crate) mod mcp_mount;

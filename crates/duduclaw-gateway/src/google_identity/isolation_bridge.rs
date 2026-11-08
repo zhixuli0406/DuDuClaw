@@ -8,10 +8,11 @@ use duduclaw_isolation::{capability::Principal, ids::EmployeeId};
 use duduclaw_knowledge::requester::RequesterIdentity;
 use duduclaw_mcp_boundary::{RequestContext, VerificationError, tool_policy::AuthorizedToolCall};
 use serde_json::{Value, json};
-use super::{effect_authority::{Clock, SelectionStore}, home_source};
+use super::{effect_authority::{Clock, SelectionStore}, home_source,
+    isolation_routes::{GoogleAccountRoutes, GoogleRoute, GoogleRoutesError}};
 use crate::{google_personal::authority::PersonalSelection,
     isolation_egress::{IngressRequester, RunTurnResolver},
-    isolation_connectors::{BoundConnectorExecutor, LiveConnectorSelectionPolicy,
+    isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog, LiveConnectorSelectionPolicy,
         ProductConnectorAccount, SelectedConnector, provider_for_tool}};
 
 /// The authenticated requester of one capability call, derived from the
@@ -30,24 +31,16 @@ impl Requester {
     }
 }
 
-/// These routes are installed by the trusted boot registry, never from a tool
-/// argument. Personal routes are indexed by the actual users.db owner id.
-#[derive(Default)]
-pub struct GoogleAccountRoutes {
-    pub personal: BTreeMap<String, ProductConnectorAccount>,
-    pub home: Option<ProductConnectorAccount>,
-}
-
 pub struct GoogleIsolationBridge {
     home: PathBuf,
     agent: String,
     employee: EmployeeId,
     users: Option<Arc<UserDb>>,
     reference: CredentialRef,
-    routes: GoogleAccountRoutes,
+    catalog: Arc<ConnectorCatalog>,
     // Freeze each logical source at first use. Refresh is not a new source;
     // owner/consent/ACL/source generation changes require rebuilding boot state.
-    sources: Mutex<BTreeMap<String, String>>,
+    sources: Mutex<BTreeMap<String, (GoogleRoute, String)>>,
     selections: SelectionStore,
     // Host-owned run association (the same resolver the isolation runtime
     // uses for per-run metadata). Never employee arguments or process env.
@@ -55,18 +48,15 @@ pub struct GoogleIsolationBridge {
 }
 impl GoogleIsolationBridge {
     pub fn new(home: PathBuf, agent: String, employee: EmployeeId, users: Option<Arc<UserDb>>,
-        reference: CredentialRef, routes: GoogleAccountRoutes, turns: Arc<dyn RunTurnResolver>)
+        reference: CredentialRef, catalog: Arc<ConnectorCatalog>, turns: Arc<dyn RunTurnResolver>)
         -> Result<Self, VerificationError> {
         if !home.is_absolute() || !reference.is_well_formed()
             || !duduclaw_core::is_valid_agent_id(&agent) || duduclaw_core::is_reserved_agent_id(&agent)
-            || agent == duduclaw_core::UNTRUSTED_AGENT_ID || routes.personal.len() > 128
-            || routes.personal.iter().any(|(id, route)| !matches!(route,
-                ProductConnectorAccount::Personal { owner, .. } if owner == id))
-            || routes.home.as_ref().is_some_and(|route| !matches!(route, ProductConnectorAccount::SharedHome { .. })) {
+            || agent == duduclaw_core::UNTRUSTED_AGENT_ID {
             return Err(VerificationError::Invalid);
         }
         let home = home.canonicalize().map_err(|_| VerificationError::Unavailable)?;
-        Ok(Self { home, agent, employee, users, reference, routes,
+        Ok(Self { home, agent, employee, users, reference, catalog,
             sources: Mutex::new(BTreeMap::new()), selections: SelectionStore::default(), turns })
     }
 
@@ -110,9 +100,9 @@ impl GoogleIsolationBridge {
     }
 
     /// A Personal source is selectable only for the authenticated person who
-    /// owns it, through the boot route installed for exactly that owner.
-    fn personal_route(&self, requester: &Requester, owner: Option<&str>)
-        -> Result<ProductConnectorAccount, VerificationError> {
+    /// owns it, through the catalog route of the lifecycle owner only.
+    fn personal_route(routes: &GoogleAccountRoutes, requester: &Requester, owner: Option<&str>)
+        -> Result<GoogleRoute, VerificationError> {
         let Requester::Human { user_id, .. } = requester else {
             // TODO(B3): System may select a Personal source only with a
             // record-bound background authority that pins the employee binding
@@ -121,43 +111,43 @@ impl GoogleIsolationBridge {
         };
         let owner = owner.filter(|owner| !owner.is_empty()).ok_or(VerificationError::BindingMismatch)?;
         if owner != user_id.as_str() { return Err(VerificationError::BindingMismatch); }
-        let route = self.routes.personal.get(owner).cloned().ok_or(VerificationError::BindingMismatch)?;
-        if !matches!(&route, ProductConnectorAccount::Personal { owner: routed, .. } if routed == owner) {
+        let route = routes.personal.get(owner).cloned().ok_or(VerificationError::BindingMismatch)?;
+        if !matches!(&route.product, ProductConnectorAccount::Personal { owner: routed, .. } if routed == owner) {
             return Err(VerificationError::BindingMismatch);
         }
         Ok(route)
     }
 
-    fn source(&self, context: &RequestContext, tool: &str) -> Result<(ProductConnectorAccount, String), VerificationError> {
+    fn source(&self, context: &RequestContext, tool: &str) -> Result<(GoogleRoute, String), VerificationError> {
         // Resolve first: a failed requester lookup refuses before any source is read.
         let requester = self.requester(context)?;
+        let routes = GoogleAccountRoutes::read(&self.home, &self.agent, self.employee,
+            &context.record().employee_binding, &self.catalog)?;
         super::credential_registry::authorize(&self.home, &self.reference, &self.agent, tool)
             .map_err(|_| VerificationError::BindingMismatch)?;
         if !crate::google_workspace::integration_enabled(&self.home) { return Err(VerificationError::Unavailable); }
         let effective = gi::effective_for(&self.home, Some(&self.agent));
         let people = super::requester_gate::people_for(&self.home, self.users.as_ref());
-        let (personal, route) = match &effective.effective {
+        let route = match &effective.effective {
             Effective::Personal { .. } => {
                 // TODO(B3): the requester gate admits System { on_behalf_of: None },
                 // so System must not even capture a Personal selection until
                 // record-bound background authority exists. Refuse, no home fallback.
                 if matches!(requester, Requester::System(_)) { return Err(VerificationError::BindingMismatch); }
+                // Shared employees cannot select any person's private source.
+                if routes.personal.is_empty() { return Err(VerificationError::BindingMismatch); }
                 let who = requester.identity();
                 let original = PersonalSelection::capture(&self.home, &self.agent,
                     who, people.as_ref(), tool)
                     .map_err(|_| VerificationError::BindingMismatch)?;
-                if original.ensure_healthy_personal().is_ok() {
-                    // A healthy Personal source owned by someone else is refused,
-                    // never substituted by the home account.
-                    let route = self.personal_route(&requester, original.user_id())?;
-                    let digest = serde_json::to_value(&original).map_err(|_| VerificationError::Invalid)?;
-                    return Ok((route, gi::google_arguments_digest(&digest)));
-                }
-                original.validate_original_unavailable(&self.home, &self.agent,
-                    who, people.as_ref(), tool).map_err(|_| VerificationError::BindingMismatch)?;
-                (Some(original), self.routes.home.clone().ok_or(VerificationError::Unavailable)?)
+                // Unhealthy/unavailable Personal sources never fall back to home.
+                original.ensure_healthy_personal().map_err(|_| VerificationError::Unavailable)?;
+                let route = Self::personal_route(&routes, &requester, original.user_id())?;
+                route.recheck(&self.catalog)?;
+                let digest = serde_json::to_value(&original).map_err(|_| VerificationError::Invalid)?;
+                return Ok((route, gi::google_arguments_digest(&digest)));
             }
-            Effective::Home => (None, self.routes.home.clone().ok_or(VerificationError::Unavailable)?),
+            Effective::Home => routes.home.ok_or(GoogleRoutesError::SetupRequired)?,
             // This bridge does not reinterpret delegate/SA/Apps Script material
             // as OAuth. Their own source-owner adapters must be installed.
             _ => return Err(VerificationError::Unavailable),
@@ -165,13 +155,30 @@ impl GoogleIsolationBridge {
         let source = home_source::read_home_native_selection(&self.home, tool)
             .map_err(|_| VerificationError::Unavailable)?;
         let digest = source.binding_digest().map_err(|_| VerificationError::Unavailable)?;
-        Ok((route, gi::google_arguments_digest(&json!({"source":digest,"personal":personal}))))
+        route.recheck(&self.catalog)?;
+        Ok((route, gi::google_arguments_digest(&json!({"source":digest}))))
+    }
+
+    fn pin_source(&self, tool: &str, route: GoogleRoute, digest: String)
+        -> Result<ProductConnectorAccount, VerificationError> {
+        let product = route.product.clone();
+        let proof = (route, digest);
+        let mut sources = self.sources.lock().map_err(|_| VerificationError::Unavailable)?;
+        if let Some(original) = sources.get(tool) {
+            if original != &proof { return Err(VerificationError::BindingMismatch); }
+        } else { sources.insert(tool.into(), proof); }
+        Ok(product)
     }
 
     async fn owned(&self, selected: &SelectedConnector, call: &AuthorizedToolCall) -> Result<Value, VerificationError> {
         selected.verify_call(call)?;
         let tool = call.name();
         let args = call.arguments();
+        let (route, _) = self.source(call.context(), tool)?;
+        if route.product.account() != selected.account() || route.generation() != selected.generation()
+            || route.kind() != selected.kind() {
+            return Err(VerificationError::BindingMismatch);
+        }
         let stamp = self.selections.select_dedicated_async(&self.home, self.users.as_ref(), &self.agent,
             &self.reference, tool, args, Clock::now()).await.map_err(|_| VerificationError::Unavailable)?;
         selected.recheck()?;
@@ -180,12 +187,13 @@ impl GoogleIsolationBridge {
             // chosen by isolation_connectors before any material is resolved.
             match stamp.approval.selected_identity {
                 gi::ApprovedGoogleIdentity::Personal => {
-                    let route = self.routes.personal.get(&stamp.approval.selected_credential_owner)
-                        .ok_or(VerificationError::BindingMismatch)?;
-                    if route.account() != selected.account() { return Err(VerificationError::BindingMismatch); }
+                    if !matches!(&route.product, ProductConnectorAccount::Personal { owner, .. }
+                        if owner == &stamp.approval.selected_credential_owner) {
+                        return Err(VerificationError::BindingMismatch);
+                    }
                 }
                 gi::ApprovedGoogleIdentity::HomeOAuthFallback => {
-                    if self.routes.home.as_ref().map(|r| r.account()) != Some(selected.account()) {
+                    if !matches!(&route.product, ProductConnectorAccount::SharedHome { .. }) {
                         return Err(VerificationError::BindingMismatch);
                     }
                 }
@@ -216,11 +224,7 @@ impl LiveConnectorSelectionPolicy for GoogleIsolationBridge {
             return Err(VerificationError::BindingMismatch);
         }
         let (route, digest) = self.source(context, tool)?;
-        let mut sources = self.sources.lock().map_err(|_| VerificationError::Unavailable)?;
-        if let Some(original) = sources.get(tool) {
-            if original != &digest { return Err(VerificationError::BindingMismatch); }
-        } else { sources.insert(tool.into(), digest); }
-        Ok(vec![route])
+        Ok(vec![self.pin_source(tool, route, digest)?])
     }
 }
 impl BoundConnectorExecutor for GoogleIsolationBridge {
