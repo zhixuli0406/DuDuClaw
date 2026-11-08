@@ -38,6 +38,30 @@ pub(crate) async fn handle_tools_call(
         }
     }
 
+    // ── v1.81 P1: never act on another person's Personal employee ──────────
+    // Protected mode only. Cross-agent management / file tools that name
+    // another employee refuse when it is a Personal employee; the owner
+    // manages it from the dashboard. Runs before any handler or isolation
+    // route, for every principal kind.
+    let acting_for_target = acting_agent_id(caller_client_id, default_agent);
+    if let Some(refusal) = super::personal_target::personal_target_refusal(
+        home_dir,
+        duduclaw_gateway::runtime_readiness::is_protected_linux(),
+        tool_name,
+        &arguments,
+        acting_for_target,
+    ) {
+        duduclaw_security::audit::append_tool_call_denied(
+            home_dir,
+            acting_for_target,
+            tool_name,
+            "personal_employee_target",
+            refusal,
+            None,
+        );
+        return jsonrpc_response(id, tool_error(refusal));
+    }
+
     info!(tool = %tool_name, "MCP tools/call");
 
     // Record state-changing tool calls for post-action hallucination audit.

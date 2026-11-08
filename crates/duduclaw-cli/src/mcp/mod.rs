@@ -218,6 +218,7 @@ mod notion_github;
 mod odoo;
 mod on_behalf_of;
 mod os_tools;
+mod personal_target;
 mod record_authz;
 mod reminders;
 mod responsibilities;

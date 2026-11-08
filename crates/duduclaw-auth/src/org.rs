@@ -222,6 +222,13 @@ const TEAM_CTE: &str = "WITH RECURSIVE team(id, depth) AS (
 /// decides whether `manager_id` may have a team at all (Active and role at
 /// least Manager); this function only walks the tree. On `Err` the caller
 /// must narrow.
+///
+/// Native Linux isolation (v1.81 P1): an agent with an
+/// `isolation_personal_agents` mirror row is a Personal employee and relays
+/// nothing to anyone above its owner — a manager gets no derived access to a
+/// subordinate's Personal employee. Only protected installs write mirror rows,
+/// so other installs are unchanged. A missing mirror table is an error (the
+/// caller narrows), never "no Personal employees".
 pub fn team_grants_on(
     conn: &Connection,
     manager_id: &str,
@@ -230,6 +237,8 @@ pub fn team_grants_on(
         "{TEAM_CTE}
          SELECT t.id, MIN(t.depth), b.agent_name, b.access_level
            FROM team t JOIN user_agent_bindings b ON b.user_id = t.id
+          WHERE NOT EXISTS(SELECT 1 FROM isolation_personal_agents p
+                            WHERE p.agent_name = b.agent_name)
           GROUP BY t.id, b.agent_name"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("team query error: {e}"))?;
@@ -278,6 +287,8 @@ fn grant_rank(g: &TeamGrant) -> (std::cmp::Reverse<u8>, u8, String) {
 /// This is a bounded database query, not an authorization decision: callers
 /// must first verify the viewer's live status, role, edition and settings.
 /// A corrupt binding grants no visibility; a database read failure is an error.
+/// A Personal employee (isolation mirror row, v1.81 P1) has no overseen
+/// reports: its owner's manager never reads its history through the team.
 pub fn overseen_reports_on(
     conn: &Connection,
     manager_id: &str,
@@ -289,6 +300,8 @@ pub fn overseen_reports_on(
            FROM team t JOIN users u ON u.id = t.id
            JOIN user_agent_bindings b ON b.user_id = t.id
           WHERE u.status = 'active' AND b.agent_name = ?3
+            AND NOT EXISTS(SELECT 1 FROM isolation_personal_agents p
+                            WHERE p.agent_name = b.agent_name)
           GROUP BY t.id, u.display_name, b.access_level
           ORDER BY MIN(t.depth), t.id"
     );

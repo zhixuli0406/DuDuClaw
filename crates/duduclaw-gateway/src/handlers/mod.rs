@@ -237,6 +237,7 @@ mod computer_workspaces_rpc;
 mod isolation_recording_rpc;
 mod isolation_connectors_rpc;
 mod isolation_employee_rpc;
+mod personal_data_gate;
 mod computer_sessions_rpc;
 mod computer_team_rpc;
 mod computer_watch_links_rpc;
@@ -554,6 +555,17 @@ impl MethodHandler {
         // RPC path never pays for edition resolution.
         if is_enterprise_only_method(method) && self.resolve_edition_profile().await.is_personal() {
             return enterprise_only_reject_frame();
+        }
+
+        // ── Personal employee private data (v1.81 P1) ───────────────────
+        // Protected mode only: a Personal employee's conversations, memory,
+        // agent files and wiki are readable by its owner; an Admin needs a
+        // fresh step-up and is audited; team grants never reach them. Runs
+        // before any handler or extension sees the call.
+        if let Some(category) = personal_data_gate::agent_scoped(method)
+            && let Err(frame) = self.personal_data_gate_for_params(method, category, &mut params, ctx).await
+        {
+            return frame;
         }
 
         // Migration review is gateway-owned; plugins cannot replace its gates.

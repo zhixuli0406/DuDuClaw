@@ -61,6 +61,9 @@ pub mod isolation_readiness;
 // not yet called from production code.
 #[allow(dead_code)]
 pub(crate) mod isolation_lifecycle;
+/// v1.81 P1: Personal employee data visibility (team grants, Admin reads,
+/// cross-agent management tools). Also used by the CLI MCP server.
+pub mod personal_visibility;
 pub mod migration_import;
 pub mod migration_startup;
 
