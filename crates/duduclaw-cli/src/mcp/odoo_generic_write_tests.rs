@@ -146,6 +146,8 @@ fn lead_snapshot(identity: &str, access: Option<Value>) -> duduclaw_odoo::schema
             scanned_model("crm.lead", vec![
                 plain("name", "char"),
                 plain("active", "boolean"),
+                plain("lead_props", "properties"),
+                plain("lead_props_def", "properties_definition"),
                 field("kanban_state", "selection", None, true, true, Some(false)),
                 field("display_name", "char", None, false, false, Some(false)),
                 field("partner_email", "char", None, false, true, Some(true)),
@@ -162,6 +164,7 @@ fn lead_snapshot(identity: &str, access: Option<Value>) -> duduclaw_odoo::schema
             scanned_model("crm.tag", vec![plain("name", "char"), plain("color", "integer")]),
             scanned_model("crm.lead.line", vec![
                 plain("name", "char"),
+                plain("line_props", "properties"),
                 plain("active", "boolean"),
                 field("price", "float", None, true, true, Some(false)),
                 rel("tag_ids", "many2many", "crm.tag"),
@@ -350,6 +353,32 @@ async fn odoo_error_is_audited_as_class_and_length_only() {
 }
 
 // ── values validation ───────────────────────────────────────────────────────
+
+#[test]
+fn properties_fields_are_refused() {
+    for values in [
+        serde_json::json!({"lead_props": [{"name": "a", "definition_changed": true}]}),
+        serde_json::json!({"lead_props_def": [{"name": "a"}]}),
+        serde_json::json!({"line_ids": [[0, 0, {"name": "x", "line_props": [{"name": "a", "definition_changed": true}]}]]}),
+    ] {
+        let (result, _) = schema_check(values.clone());
+        let error = result.unwrap_err();
+        assert!(error.contains("properties"), "{values}: {error}");
+    }
+    assert!(schema_check(serde_json::json!({"name": "ok"})).0.is_ok());
+}
+
+#[test]
+fn denial_audit_strips_control_characters() {
+    let home = tempfile::tempdir().unwrap();
+    deny(home.path(), "agnes", "odoo_write", "crm.lead\u{1b}[31m\nFORGED", "write", "bad 'x\r\ny\u{7f}z'");
+    let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+    assert_eq!(audit.lines().count(), 1, "{audit}");
+    for escaped in ["\\u001b", "\\n", "\\r", "\\u007f"] {
+        assert!(!audit.contains(escaped), "{escaped} in {audit}");
+    }
+    assert!(audit.contains("crm.lead?[31m?FORGED") && audit.contains("bad 'x??y?z'"), "{audit}");
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn odoo_write_rejects_unlink_commands() {

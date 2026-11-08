@@ -443,6 +443,13 @@ fn check_fields_at(
         if field.readonly {
             return Err(format!("{path}: '{key}' is a read-only field of '{}'", model.model));
         }
+        if matches!(field.ttype.as_str(), "properties" | "properties_definition") {
+            return Err(format!(
+                "{path}: '{key}' is a {} field of '{}' (writing it can change a property definition stored on another \
+                 record) and cannot be written by odoo_create / odoo_write. {UNAVAILABLE_SUFFIX}",
+                field.ttype, model.model
+            ));
+        }
         match field.related {
             Some(false) => {}
             Some(true) => {
@@ -583,12 +590,23 @@ fn error_class(error: &str) -> &'static str {
     }
 }
 
+/// Caller-supplied text bound for the audit line: ASCII control characters
+/// (including DEL) become `?`, so it cannot forge line breaks or terminal
+/// escapes.
+fn audit_safe(text: &str) -> String {
+    text.chars().map(|c| if c.is_ascii_control() { '?' } else { c }).collect()
+}
+
 fn deny(home_dir: &Path, caller_agent: &str, tool: &str, model: &str, verb: &str, reason: &str) {
     duduclaw_security::audit::append_tool_call(
         home_dir,
         caller_agent,
         tool,
-        &format!("DENIED: {model}/{verb} — {}", duduclaw_core::truncate_bytes(reason, 400)),
+        &format!(
+            "DENIED: {}/{verb} — {}",
+            audit_safe(duduclaw_core::truncate_bytes(model, 128)),
+            audit_safe(duduclaw_core::truncate_bytes(reason, 400))
+        ),
         false,
     );
 }
@@ -750,7 +768,7 @@ pub(crate) async fn handle_odoo_generic_write(
     let fields: Vec<&str> = args.values.keys().map(String::as_str).collect();
     let summary = format!(
         "profile={profile}; tool={tool}; model={model}; fields={}; ids={}; ok={}",
-        duduclaw_core::truncate_bytes(&fields.join(","), 400),
+        audit_safe(duduclaw_core::truncate_bytes(&fields.join(","), 400)),
         args.ids.len(),
         result.is_ok(),
     );
