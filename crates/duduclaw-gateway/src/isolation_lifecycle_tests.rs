@@ -36,17 +36,34 @@ impl Fixture {
 }
 
 fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    // The hardened store opener requires a private home (owned by us, no
+    // group/other write) and private stores, as on a protected host.
+    let dir = crate::fs_safe::private_test_home().unwrap();
     let users = UserDb::new(&dir.path().join(USERS_DB)).unwrap();
     let alice = users.create_user("alice@example.test", "Alice", "password1", UserRole::Employee).unwrap().id;
     let bob = users.create_user("bob@example.test", "Bob", "password1", UserRole::Admin).unwrap().id;
     login(dir.path(), &alice);
     login(dir.path(), &bob);
-    std::fs::create_dir_all(dir.path().join("migration-authority")).unwrap();
+    private_dir(&dir.path().join("migration-authority"));
     std::fs::File::create(dir.path().join(APPLY_DB)).unwrap();
     ConfirmationStore::from_connection(Connection::open(dir.path().join(CONFIRMATIONS_DB)).unwrap()).unwrap();
+    for store in [USERS_DB, APPLY_DB, CONFIRMATIONS_DB] { set_mode(&dir.path().join(store), 0o600); }
     let tenant = users.isolation_authority_snapshot(None, LABEL).unwrap().tenant_id;
     Fixture { dir, users, tenant, alice, bob }
+}
+
+fn private_dir(path: &Path) {
+    #[cfg(unix)]
+    { use std::os::unix::fs::DirBuilderExt; std::fs::DirBuilder::new().mode(0o700).create(path).unwrap(); }
+    #[cfg(not(unix))]
+    std::fs::create_dir(path).unwrap();
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap(); }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
 }
 
 fn sql(home: &Path, db: &str, statement: &str, values: &[&dyn rusqlite::ToSql]) {
@@ -130,6 +147,260 @@ fn lifecycle_personal_owner_from_root_receipt() {
     forged.principal_binding = Some(EmployeeBinding::Personal(text(&f.bob)));
     store_receipt(home, LABEL, &forged);
     assert_eq!(read_lifecycle_with(home, LABEL, &Root(vec![forged])), Err(Stale));
+}
+
+/// One confirmed Personal employee owned by alice, plus its root fixture.
+fn personal_employee(f: &Fixture) -> (Root, EmployeeLifecycle) {
+    let item = applied(f.home(), 1, LABEL, &personal(&f.alice));
+    let root = receipt(&item, 1, false);
+    save(f.home(), &item, &root).unwrap();
+    let roots = Root(vec![root]);
+    let lifecycle = read_lifecycle_with(f.home(), LABEL, &roots).unwrap();
+    (roots, lifecycle)
+}
+
+#[test]
+fn lifecycle_personal_owner_forced_password_change_refused() {
+    let f = fixture();
+    let home = f.home();
+    let (roots, held) = personal_employee(&f);
+    assert_eq!(recheck_with(home, &held, &roots), Ok(held.clone()));
+    // A forced password change on the owner after creation stops existing
+    // capabilities (recheck) and receipts (read) at use time.
+    sql(home, USERS_DB, "UPDATE users SET must_change_password=1 WHERE id=?1", &[&f.alice]);
+    assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Denied));
+    assert_eq!(recheck_with(home, &held, &roots), Err(Denied));
+    assert!(resolve(home, LABEL, &roots).is_err());
+    // Status alone is still active: the refusal is the password rule.
+    assert_eq!(f.users.get_user(&f.alice).unwrap().unwrap().status, UserStatus::Active);
+    login(home, &f.alice);
+    assert_eq!(recheck_with(home, &held, &roots), Ok(held.clone()));
+}
+
+#[test]
+fn lifecycle_personal_owner_without_login_refused() {
+    let f = fixture();
+    let home = f.home();
+    let (roots, held) = personal_employee(&f);
+    for marker in [None, Some("")] {
+        sql(home, USERS_DB, "UPDATE users SET last_login=?2 WHERE id=?1", &[&f.alice, &marker]);
+        assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Denied), "{marker:?}");
+        assert_eq!(recheck_with(home, &held, &roots), Err(Denied), "{marker:?}");
+    }
+    login(home, &f.alice);
+    assert!(read_lifecycle_with(home, LABEL, &roots).is_ok());
+    // A Shared employee does not depend on any user's login state.
+    let shared = applied(home, 2, "team", &[("binding_kind", "shared"), ("tenant_id", f.tenant.as_str())]);
+    let shared_root = receipt(&shared, 2, false);
+    save(home, &shared, &shared_root).unwrap();
+    sql(home, USERS_DB, "UPDATE users SET last_login=NULL,must_change_password=1", &[]);
+    assert!(read_lifecycle_with(home, "team", &Root(vec![shared_root])).is_ok());
+}
+
+#[test]
+fn lifecycle_personal_snapshot_is_one_transaction() {
+    let f = fixture();
+    let home = f.home().to_path_buf();
+    let (roots, held) = personal_employee(&f);
+    // Change the owner between the tenant/mirror reads and the owner row read.
+    // One read transaction (WAL snapshot) must not observe the change.
+    let run = |statement: &'static str, expected: Result<EmployeeLifecycle, LifecycleError>| {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (seen, writer_home, owner) = (calls.clone(), home.clone(), f.alice.clone());
+        USERS_SNAPSHOT_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            seen.set(seen.get() + 1);
+            sql(&writer_home, USERS_DB, statement, &[&owner]);
+        })));
+        let result = recheck_with(&home, &held, &roots);
+        USERS_SNAPSHOT_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(calls.get(), 1, "the pause point ran inside check_users");
+        assert_eq!(result, expected, "{statement}");
+    };
+    // Revocation committed mid-read: this read linearizes before it...
+    run("UPDATE users SET must_change_password=1 WHERE id=?1", Ok(held.clone()));
+    // ...and every later read sees it.
+    assert_eq!(recheck_with(&home, &held, &roots), Err(Denied));
+    // Restoration committed mid-read is likewise invisible to that read.
+    run("UPDATE users SET must_change_password=0 WHERE id=?1", Err(Denied));
+    assert_eq!(recheck_with(&home, &held, &roots), Ok(held.clone()));
+    // Status and login are part of the same snapshot.
+    run("UPDATE users SET last_login=NULL WHERE id=?1", Ok(held.clone()));
+    assert_eq!(recheck_with(&home, &held, &roots), Err(Denied));
+    login(&home, &f.alice);
+    run("UPDATE users SET status='suspended' WHERE id=?1", Ok(held.clone()));
+    assert_eq!(recheck_with(&home, &held, &roots), Err(Denied));
+    // The snapshot reader refuses to run outside a transaction.
+    let users = Connection::open(home.join(USERS_DB)).unwrap();
+    assert!(duduclaw_auth::read_isolation_authority_in(&users, None, LABEL).is_err());
+}
+
+#[cfg(unix)]
+mod hardened_stores {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    const STORES: [&str; 3] = [USERS_DB, APPLY_DB, CONFIRMATIONS_DB];
+
+    fn sibling(home: &Path, store: &str, suffix: &str) -> std::path::PathBuf {
+        home.join(format!("{store}{suffix}"))
+    }
+
+    #[test]
+    fn lifecycle_symlinked_store_refused() {
+        let f = fixture();
+        let home = f.home();
+        let (roots, held) = personal_employee(&f);
+        for store in STORES {
+            let path = home.join(store);
+            let real = sibling(home, store, ".real");
+            std::fs::rename(&path, &real).unwrap();
+            symlink(&real, &path).unwrap();
+            assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable), "{store}");
+            assert_eq!(recheck_with(home, &held, &roots), Err(Unavailable), "{store}");
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(&real, &path).unwrap();
+            assert!(read_lifecycle_with(home, LABEL, &roots).is_ok(), "{store} restored");
+        }
+        // The write paths use the same opener.
+        let users = home.join(USERS_DB);
+        std::fs::rename(&users, sibling(home, USERS_DB, ".real")).unwrap();
+        symlink(sibling(home, USERS_DB, ".real"), &users).unwrap();
+        assert_eq!(record_personal_mirror(home, "other", &f.alice), Err(Unavailable));
+        assert_eq!(remove_personal_mirror(home, LABEL, &f.alice), Err(Unavailable));
+        std::fs::remove_file(&users).unwrap();
+        std::fs::rename(sibling(home, USERS_DB, ".real"), &users).unwrap();
+        let apply = home.join(APPLY_DB);
+        std::fs::rename(&apply, sibling(home, APPLY_DB, ".real")).unwrap();
+        symlink(sibling(home, APPLY_DB, ".real"), &apply).unwrap();
+        assert_eq!(tombstone_personal_employee(home, LABEL, held.employee), Err(Unavailable));
+        std::fs::remove_file(&apply).unwrap();
+        std::fs::rename(sibling(home, APPLY_DB, ".real"), &apply).unwrap();
+        // A symlinked store directory is refused as well.
+        let authority = home.join("migration-authority");
+        std::fs::rename(&authority, home.join("authority.real")).unwrap();
+        symlink(home.join("authority.real"), &authority).unwrap();
+        assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable));
+        std::fs::remove_file(&authority).unwrap();
+        std::fs::rename(home.join("authority.real"), &authority).unwrap();
+        assert_eq!(recheck_with(home, &held, &roots), Ok(held.clone()));
+        assert_eq!(mirror(home, LABEL).as_deref(), Some(f.alice.as_str()), "nothing was written");
+    }
+
+    #[test]
+    fn lifecycle_store_swap_between_check_and_open_refused() {
+        let f = fixture();
+        let home = f.home();
+        let (roots, _) = personal_employee(&f);
+        for store in STORES {
+            let (directory, name) = match store.rsplit_once('/') {
+                Some((sub, name)) => (home.join(sub), name),
+                None => (home.to_path_buf(), store),
+            };
+            let path = home.join(store);
+            // An older but otherwise valid copy (e.g. a pre-offboarding
+            // users.db): same owner, 0600, single link, different inode.
+            let older = sibling(home, store, ".older");
+            std::fs::copy(&path, &older).unwrap();
+            set_mode(&older, 0o600);
+            let current = sibling(home, store, ".current");
+            for access in [Access::ReadOnly, Access::ReadWrite] {
+                let opened = crate::fs_safe::sqlite::open_existing_with(&directory, name, access, || {
+                    std::fs::rename(&path, &current).unwrap();
+                    std::fs::rename(&older, &path).unwrap();
+                });
+                assert!(opened.is_err(), "{store} {access:?}");
+                std::fs::rename(&path, &older).unwrap();
+                std::fs::rename(&current, &path).unwrap();
+            }
+            std::fs::remove_file(&older).unwrap();
+        }
+        assert!(read_lifecycle_with(home, LABEL, &roots).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_hardlinked_store_refused() {
+        let f = fixture();
+        let home = f.home();
+        let (roots, held) = personal_employee(&f);
+        for store in STORES {
+            let alias = home.join("alias.db");
+            std::fs::hard_link(home.join(store), &alias).unwrap();
+            assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable), "{store}");
+            assert_eq!(recheck_with(home, &held, &roots), Err(Unavailable), "{store}");
+            std::fs::remove_file(&alias).unwrap();
+        }
+        assert!(read_lifecycle_with(home, LABEL, &roots).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_writable_store_refused() {
+        let f = fixture();
+        let home = f.home();
+        let (roots, held) = personal_employee(&f);
+        for store in STORES {
+            for mode in [0o620, 0o602, 0o666] {
+                set_mode(&home.join(store), mode);
+                assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable), "{store} {mode:o}");
+                assert_eq!(recheck_with(home, &held, &roots), Err(Unavailable), "{store} {mode:o}");
+            }
+            set_mode(&home.join(store), 0o600);
+        }
+        for directory in [home.join("migration-authority"), home.to_path_buf()] {
+            set_mode(&directory, 0o770);
+            assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable), "{}", directory.display());
+            set_mode(&directory, 0o700);
+        }
+        assert!(read_lifecycle_with(home, LABEL, &roots).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_foreign_owner_store_refused() {
+        // Setting a foreign owner needs privileges; skipped as non-root,
+        // like the other ownership tests. The opener enforces it via lstat.
+        if !nix::unistd::geteuid().is_root() { return; }
+        let f = fixture();
+        let home = f.home();
+        let (roots, _) = personal_employee(&f);
+        for store in STORES {
+            let path = home.join(store);
+            nix::unistd::chown(&path, Some(nix::unistd::Uid::from_raw(65534)), None).unwrap();
+            assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable), "{store}");
+            nix::unistd::chown(&path, Some(nix::unistd::geteuid()), None).unwrap();
+        }
+        assert!(read_lifecycle_with(home, LABEL, &roots).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_sidecar_symlink_refused() {
+        let f = fixture();
+        let home = f.home();
+        let (roots, held) = personal_employee(&f);
+        let outside = home.join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        for store in STORES {
+            // users.db is WAL with live -wal/-shm; -journal is absent for all
+            // three between transactions. Replace only absent sidecars.
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let sidecar = sibling(home, store, suffix);
+                if sidecar.exists() { continue; }
+                symlink(&outside, &sidecar).unwrap();
+                assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable), "{store}{suffix}");
+                assert_eq!(recheck_with(home, &held, &roots), Err(Unavailable), "{store}{suffix}");
+                std::fs::remove_file(&sidecar).unwrap();
+                // A writable or hardlinked sidecar is refused the same way.
+                std::fs::File::create(&sidecar).unwrap();
+                set_mode(&sidecar, 0o666);
+                assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable), "{store}{suffix} mode");
+                set_mode(&sidecar, 0o600);
+                std::fs::hard_link(&sidecar, home.join("sidecar-alias")).unwrap();
+                assert_eq!(read_lifecycle_with(home, LABEL, &roots), Err(Unavailable), "{store}{suffix} link");
+                std::fs::remove_file(home.join("sidecar-alias")).unwrap();
+                std::fs::remove_file(&sidecar).unwrap();
+            }
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+        assert!(read_lifecycle_with(home, LABEL, &roots).is_ok());
+    }
 }
 
 #[test]

@@ -79,16 +79,28 @@ pub struct IsolationAuthoritySnapshot {
 /// user ID supplied by an employee.
 pub fn read_isolation_authority(conn: &mut Connection, user_id: Option<&str>, agent: &str)
     -> Result<IsolationAuthoritySnapshot, String> {
+    let tx = conn.transaction().map_err(|_| "isolation authority unavailable".to_string())?;
+    let snapshot = read_isolation_authority_in(&tx, user_id, agent)?;
+    tx.finish().map_err(|_| "isolation authority unavailable".to_string())?;
+    Ok(snapshot)
+}
+
+/// [`read_isolation_authority`] inside a transaction the caller already
+/// holds, so further reads (e.g. a Personal owner's account row) share the
+/// same snapshot. Refuses when `tx` is in autocommit mode (no transaction):
+/// separate statements would then see different database states.
+pub fn read_isolation_authority_in(tx: &Connection, user_id: Option<&str>, agent: &str)
+    -> Result<IsolationAuthoritySnapshot, String> {
     if !duduclaw_core::is_valid_agent_id(agent) || duduclaw_core::is_reserved_agent_id(agent)
         || agent == duduclaw_core::UNTRUSTED_AGENT_ID {
         return Err("invalid isolation agent".into());
     }
-    let tx = conn.transaction().map_err(|_| "isolation authority unavailable".to_string())?;
-    let tenant_id = read_tenant(&tx)?;
-    let acl_generation = crate::user_row::read_acl_generation(&tx)?;
-    let policy_epoch = read_policy_epoch(&tx)?;
+    if tx.is_autocommit() { return Err("isolation authority unavailable".into()); }
+    let tenant_id = read_tenant(tx)?;
+    let acl_generation = crate::user_row::read_acl_generation(tx)?;
+    let policy_epoch = read_policy_epoch(tx)?;
     // A missing/unreadable mirror is unavailable, never "not Personal".
-    let personal_owner = crate::db::personal_agent_owner(&tx, agent)
+    let personal_owner = crate::db::personal_agent_owner(tx, agent)
         .map_err(|_| "isolation authority unavailable".to_string())?;
     let agent_member_count: i64 = tx.query_row(
         "SELECT count(*) FROM user_agent_bindings WHERE agent_name=?1", [agent], |row| row.get(0))
@@ -96,7 +108,7 @@ pub fn read_isolation_authority(conn: &mut Connection, user_id: Option<&str>, ag
     let agent_member_count = u32::try_from(agent_member_count)
         .map_err(|_| "isolation authority unavailable".to_string())?;
     let human = if let Some(user_id) = user_id {
-        let (user, access) = crate::org::load_access_on(&tx, user_id)?
+        let (user, access) = crate::org::load_access_on(tx, user_id)?
             .ok_or_else(|| "isolation principal denied".to_string())?;
         if user.must_change_password || user.last_login.as_ref().is_none_or(|v| v.is_empty())
             || !access.may_assign(agent) {
@@ -104,7 +116,6 @@ pub fn read_isolation_authority(conn: &mut Connection, user_id: Option<&str>, ag
         }
         Some(UserContext::from_live(&user, &access))
     } else { None };
-    tx.finish().map_err(|_| "isolation authority unavailable".to_string())?;
     Ok(IsolationAuthoritySnapshot { tenant_id, acl_generation, policy_epoch, human,
         personal_owner, agent_member_count })
 }

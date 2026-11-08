@@ -12,7 +12,12 @@
 //!   employee id and principal must equal the stored copy);
 //! - users.db: the installation tenant must equal the pin, and a Personal
 //!   employee's `isolation_personal_agents` mirror must name the receipt
-//!   owner, who must still be an Active user.
+//!   owner, who must still be eligible ([`owner_eligible`]: Active, logged
+//!   in, no forced password change) — all read in one read transaction.
+//!
+//! All three stores are opened only through [`open_store`] (the hardened
+//! `fs_safe::sqlite::open_existing`); a symlinked, hardlinked, swapped,
+//! foreign-owned or group/other-writable store or sidecar is `Unavailable`.
 //!
 //! The principal is taken only from the root receipt. A legacy (pre-v1.81)
 //! receipt without `principal_binding` is Shared(pinned tenant) and never
@@ -29,7 +34,9 @@ use duduclaw_isolation::capability::EmployeeBinding;
 use duduclaw_isolation::ids::EmployeeId;
 use duduclaw_migration::allocation::{self, Receipt};
 use duduclaw_migration::contract::{ConfirmationCategory, ConfirmationItem, ConfirmationStatus, ProposalBinding};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+
+use crate::fs_safe::sqlite::Access;
 
 const APPLY_DB: &str = "migration-authority/apply.db";
 const CONFIRMATIONS_DB: &str = "migration-confirmations.db";
@@ -183,8 +190,10 @@ pub(crate) fn validate_proposed_binding(home: &Path, label: &str, binding: Optio
     use LifecycleError::*;
     if !valid_label(label) { return Err(Denied); }
     let existing = confirmed_row(home, label)?;
-    let mut users = open_read_only(&home.join(USERS_DB))?;
-    let snapshot = duduclaw_auth::read_isolation_authority(&mut users, None, label).map_err(|_| Unavailable)?;
+    let mut connection = open_store(home, USERS_DB, Access::ReadOnly)?;
+    // Tenant, mirror, owner row and other bindings: one read snapshot.
+    let users = connection.transaction().map_err(|_| Unavailable)?;
+    let snapshot = duduclaw_auth::read_isolation_authority_in(&users, None, label).map_err(|_| Unavailable)?;
     if let Some((prior, pin)) = &existing {
         // A tombstoned row never constrains a recreate; a live one keeps its pin.
         if !prior.disabled && pin.as_deref() != Some(snapshot.tenant_id.as_str()) { return Err(Denied); }
@@ -206,6 +215,7 @@ pub(crate) fn validate_proposed_binding(home: &Path, label: &str, binding: Optio
             if others { return Err(Denied); }
         }
     }
+    users.finish().map_err(|_| Unavailable)?;
     Ok(())
 }
 
@@ -213,7 +223,7 @@ pub(crate) fn validate_proposed_binding(home: &Path, label: &str, binding: Optio
 /// re-checking the owner in the same users.db transaction. `Ok(false)` is an
 /// idempotent re-apply. Any refusal must refuse the apply step.
 pub(crate) fn record_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
-    let mut users = open_read_write(&home.join(USERS_DB))?;
+    let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     if !owner_eligible(&tx, owner)? { return Err(LifecycleError::Denied); }
     let inserted = duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
@@ -225,7 +235,7 @@ pub(crate) fn record_personal_mirror(home: &Path, label: &str, owner: &str) -> R
 /// (and, per A3, every binding of the agent). `Ok(false)` when absent;
 /// `Stale` when another owner is recorded (left untouched).
 pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
-    let mut users = open_read_write(&home.join(USERS_DB))?;
+    let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     let removed = duduclaw_auth::db::remove_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     tx.commit().map_err(|_| LifecycleError::Unavailable)?;
@@ -251,7 +261,7 @@ pub(crate) fn tombstone_personal_employee(home: &Path, label: &str, employee: Em
     use LifecycleError::*;
     if !valid_label(label) { return Err(Denied); }
     let owner = {
-        let mut db = open_read_write(&home.join(APPLY_DB))?;
+        let mut db = open_store(home, APPLY_DB, Access::ReadWrite)?;
         db.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| Unavailable)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| Unavailable)?;
         let encoded: String = tx.query_row("SELECT receipt FROM confirmed_employees WHERE label=?1", [label], |r| r.get(0))
@@ -291,7 +301,7 @@ fn principal(prior: &Receipt, pinned: &str) -> Result<EmployeeBinding, Lifecycle
 /// `None` when nothing was ever confirmed for the label (including before
 /// the table exists); a corrupt row or unreadable store is `Unavailable`.
 fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<String>)>, LifecycleError> {
-    let db = open_read_only(&home.join(APPLY_DB))?;
+    let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
     let table: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
         [], |r| r.get(0)).map_err(|_| LifecycleError::Unavailable)?;
@@ -308,18 +318,26 @@ fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<Str
 }
 
 fn applied_item(home: &Path, binding: &ProposalBinding) -> Result<ConfirmationItem, LifecycleError> {
-    let store = duduclaw_migration::confirmation::ConfirmationStore::open_read_only(&home.join(CONFIRMATIONS_DB))
-        .map_err(|_| LifecycleError::Unavailable)?;
+    let store = duduclaw_migration::confirmation::ConfirmationStore::from_read_only_connection(
+        open_store(home, CONFIRMATIONS_DB, Access::ReadOnly)?).map_err(|_| LifecycleError::Unavailable)?;
     store.list().map_err(|_| LifecycleError::Unavailable)?.into_iter()
         .find(|item| item.binding == *binding && item.category == ConfirmationCategory::Employee
             && item.status == ConfirmationStatus::Applied)
         .ok_or(LifecycleError::Denied)
 }
 
+/// Use-time users.db check, run on every read and recheck. The tenant, the
+/// Personal mirror and the owner's account row (status, forced password
+/// change, login) are read in ONE read transaction, i.e. one consistent
+/// snapshot: a concurrent owner change is either wholly before or wholly
+/// after this check, never half-observed.
 fn check_users(home: &Path, label: &str, pinned: &str, binding: &EmployeeBinding) -> Result<(), LifecycleError> {
-    let mut users = open_read_only(&home.join(USERS_DB))?;
-    let snapshot = duduclaw_auth::read_isolation_authority(&mut users, None, label)
+    let mut users = open_store(home, USERS_DB, Access::ReadOnly)?;
+    let tx = users.transaction().map_err(|_| LifecycleError::Unavailable)?;
+    let snapshot = duduclaw_auth::read_isolation_authority_in(&tx, None, label)
         .map_err(|_| LifecycleError::Unavailable)?;
+    #[cfg(test)]
+    USERS_SNAPSHOT_HOOK.with(|hook| if let Some(hook) = hook.borrow_mut().as_mut() { hook() });
     // A replaced users database cannot transfer an employee to a new tenant.
     if snapshot.tenant_id != pinned { return Err(LifecycleError::Denied); }
     match binding {
@@ -330,13 +348,22 @@ fn check_users(home: &Path, label: &str, pinned: &str, binding: &EmployeeBinding
             // A missing or different mirror owner means the users.db view was
             // reassigned or removed outside this employee's lifecycle.
             if snapshot.personal_owner.as_deref() != Some(owner.as_str()) { return Err(LifecycleError::Stale); }
-            let status: Option<String> = users.query_row("SELECT status FROM users WHERE id=?1", [owner.as_str()], |r| r.get(0))
-                .optional().map_err(|_| LifecycleError::Unavailable)?;
-            // An offboarded or suspended owner's employee waits for admin handover.
-            if status.as_deref() != Some("active") { return Err(LifecycleError::Denied); }
+            // The complete creation-time rule, not just `status`: an
+            // offboarded/suspended owner, a forced password change or a
+            // missing login all stop existing capabilities and receipts
+            // until the owner is eligible again (or an admin hands over).
+            if !owner_eligible(&tx, owner.as_str())? { return Err(LifecycleError::Denied); }
         }
     }
+    tx.finish().map_err(|_| LifecycleError::Unavailable)?;
     Ok(())
+}
+
+/// Test-only pause point inside [`check_users`]' read transaction, after the
+/// tenant/mirror reads and before the owner row read.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static USERS_SNAPSHOT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
 }
 
 /// Same rule as the Shared binding restoration
@@ -359,22 +386,18 @@ fn mirror_error(error: duduclaw_auth::db::PersonalAgentError) -> LifecycleError 
     }
 }
 
-fn regular(path: &Path) -> Result<(), LifecycleError> {
-    let meta = std::fs::symlink_metadata(path).map_err(|_| LifecycleError::Unavailable)?;
-    if !meta.file_type().is_file() { return Err(LifecycleError::Unavailable); }
-    Ok(())
-}
-
-fn open_read_only(path: &Path) -> Result<Connection, LifecycleError> {
-    regular(path)?;
-    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| LifecycleError::Unavailable)?;
-    db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| LifecycleError::Unavailable)?;
-    Ok(db)
-}
-
-fn open_read_write(path: &Path) -> Result<Connection, LifecycleError> {
-    regular(path)?;
-    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|_| LifecycleError::Unavailable)?;
+/// The single opener for the three authority stores on every lifecycle path
+/// (users.db, migration-authority/apply.db, migration-confirmations.db):
+/// [`crate::fs_safe::sqlite::open_existing`] — no-follow descriptor walk to
+/// the store's directory, owner/mode/link-count/dev+inode checks on the
+/// store and its -journal/-wal/-shm sidecars before and after the open,
+/// `SQLITE_OPEN_NOFOLLOW`, never created. Any violation is `Unavailable`.
+fn open_store(home: &Path, store: &str, access: Access) -> Result<Connection, LifecycleError> {
+    let (directory, name) = match store.rsplit_once('/') {
+        Some((subdirectory, name)) => (home.join(subdirectory), name),
+        None => (home.to_path_buf(), store),
+    };
+    let db = crate::fs_safe::sqlite::open_existing(&directory, name, access).map_err(|_| LifecycleError::Unavailable)?;
     db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| LifecycleError::Unavailable)?;
     Ok(db)
 }

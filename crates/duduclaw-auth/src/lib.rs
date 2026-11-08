@@ -26,6 +26,6 @@ pub use user_update::{NewUser, UserUpdate, UserWriteError};
 pub mod mfa;
 pub mod migration;
 pub mod isolation;
-pub use isolation::{IsolationAuthoritySnapshot, read_isolation_authority};
+pub use isolation::{IsolationAuthoritySnapshot, read_isolation_authority, read_isolation_authority_in};
 
 pub mod remembered_sessions;

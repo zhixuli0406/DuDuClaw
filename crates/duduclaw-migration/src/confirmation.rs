@@ -177,6 +177,15 @@ impl ConfirmationStore {
         conn.query_row("SELECT COUNT(*) FROM migration_proposals", [], |r| r.get::<_, u64>(0))?;
         Ok(Self { conn })
     }
+    /// [`Self::open_read_only`] for a connection the caller already opened
+    /// read-only through its own hardened (no-follow, owner/mode/inode
+    /// checked) opener. Never creates or writes; a writable connection is
+    /// refused so this cannot become a schema-creating side door.
+    pub fn from_read_only_connection(conn: Connection) -> Result<Self> {
+        if !conn.is_readonly(rusqlite::DatabaseName::Main)? { return Err(ConfirmationError::Storage); }
+        conn.query_row("SELECT COUNT(*) FROM migration_proposals", [], |r| r.get::<_, u64>(0))?;
+        Ok(Self { conn })
+    }
     /// The caller supplies a freshly created gateway-owned database, never legacy
     /// input. File ownership and exclusive migration mode are installer obligations.
     pub fn from_connection(conn: Connection) -> Result<Self> {
