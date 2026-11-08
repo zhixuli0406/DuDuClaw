@@ -1,19 +1,28 @@
 //! Account-bound Odoo execution retains the original MCP business policy.
 use std::{future::Future, pin::Pin, sync::Arc};
 use duduclaw_gateway::{isolation_connector_odoo::OdooConnectorProvider,
-    isolation_connectors::{BoundConnectorExecutor, SelectedConnector, provider_for_tool}};
+    isolation_connectors::{BoundConnectorExecutor, SelectedConnector}};
 use duduclaw_mcp_boundary::{tool_policy::AuthorizedToolCall, VerificationError};
 use serde_json::Value;
+
+/// Exact tools handled by the retained Odoo business dispatcher.
+pub const ODOO_EXECUTOR_TOOLS: &[&str] = &[
+    "odoo_connect", "odoo_status", "odoo_crm_leads", "odoo_crm_create_lead", "odoo_crm_update_stage",
+    "odoo_sale_orders", "odoo_sale_create_quotation", "odoo_sale_confirm", "odoo_inventory_products",
+    "odoo_inventory_check", "odoo_invoice_list", "odoo_payment_status", "odoo_search", "odoo_execute",
+    "odoo_report", "odoo_partner_search", "odoo_schema_overview", "odoo_schema_fields",
+];
 
 pub struct OdooBoundExecutor { provider: Arc<OdooConnectorProvider> }
 impl OdooBoundExecutor {
     pub fn new(provider: Arc<OdooConnectorProvider>) -> Self { Self { provider } }
 }
 impl BoundConnectorExecutor for OdooBoundExecutor {
-    fn supports(&self, tool: &str) -> bool { provider_for_tool(tool) == Some("odoo") }
+    fn supports(&self, tool: &str) -> bool { ODOO_EXECUTOR_TOOLS.contains(&tool) }
     fn execute<'a>(&'a self, selected: SelectedConnector, call: AuthorizedToolCall)
         -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
+            if !self.supports(call.name()) { return Err(VerificationError::Unavailable); }
             selected.verify_call(&call)?;
             // Reject disallowed operations before credential resolution or an
             // authentication handshake. The handler repeats these same gates.

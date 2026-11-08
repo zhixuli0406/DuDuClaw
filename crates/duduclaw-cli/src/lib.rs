@@ -65,6 +65,7 @@ pub mod mcp_isolation_disposition;
 pub mod mcp_isolation_resources;
 pub mod mcp_isolation_connector_odoo;
 pub mod mcp_isolation_connector_channel;
+pub mod mcp_isolation_connector_factory;
 pub mod mcp_isolation_boot;
 pub mod mcp_files; // §14.2 WP-F2: local data-file MCP tools (file/csv/xlsx read)
 pub mod mcp_fork; // RFC-26 P3: Live Run Forking tool surface
@@ -9207,6 +9208,9 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         edition: None,
     };
 
+    #[cfg(target_os = "linux")]
+    mcp_isolation_connector_factory::install().map_err(|_| duduclaw_core::error::DuDuClawError::Gateway(
+        "隔離連接器初始化失敗，請重新啟動服務。".into()))?;
     #[cfg(target_os = "linux")]
     mcp_isolation_boot::install().map_err(|_| duduclaw_core::error::DuDuClawError::Gateway(
         "隔離工具介面初始化失敗，請重新啟動服務。".into()))?;
