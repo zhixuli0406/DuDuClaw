@@ -691,12 +691,14 @@ impl SelectedConnector {
         let record = self.context.record();
         self.context.verify_live(duduclaw_mcp_boundary::authority::now_seconds()?)?;
         let bindings = &self.bindings;
+        // The authority also compares the route generation pinned here (C2).
         if self.binding == record.employee_binding {
-            bindings.authorize_connector(record.employee, &record.employee_binding, &record.principal, &self.account)
-                .map_err(|_| VerificationError::BindingMismatch)?;
+            bindings.authorize_connector(record.employee, &record.employee_binding, &record.principal, &self.account,
+                self.generation).map_err(|_| VerificationError::BindingMismatch)?;
         } else if matches!(&self.product_selection.1, ProductConnectorAccount::SharedHome { .. }) {
             bindings.authorize_product_home_connector(record.employee, &record.employee_binding,
-                &record.principal, &self.account, &self.binding).map_err(|_| VerificationError::BindingMismatch)?;
+                &record.principal, &self.account, self.generation, &self.binding)
+                .map_err(|_| VerificationError::BindingMismatch)?;
         } else { return Err(VerificationError::BindingMismatch); }
         // Same route, same state: any revoke/advance/relink since selection
         // moved the generation. Store errors propagate and refuse as well.

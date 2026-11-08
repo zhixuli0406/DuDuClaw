@@ -6,6 +6,11 @@
 //! a Human principal that is its lifecycle owner, while users.db mirrors that
 //! owner and binds exactly one member (the owner); it is never authorized for
 //! a Background principal. Shared employees keep the tenant rules.
+//!
+//! Connector accounts (v1.81 C2) are authorized per use by
+//! `connector_with`: the same identity gate, then the production
+//! `ConnectorCatalog` route (binding, generation pinned by selection,
+//! product-home check, C6 detail pin), then a re-read.
 use std::{collections::BTreeMap, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 use duduclaw_auth::{IsolationAuthoritySnapshot, UserDb};
 use duduclaw_execution::SpawndBackend;
@@ -15,6 +20,9 @@ use duduclaw_mcp_boundary::{bindings::{BindingAuthority, BindingError}, GrantPol
     LiveSnapshot, RequestContext, VerificationError};
 use crate::isolation_egress::{RunMetadata, RunTurnIdentity, RunTurnResolver, ResolvedRunTurn};
 use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, LifecycleError};
+use crate::isolation_connectors::{AccountId, ConnectorCatalog, ConnectorKind, Route};
+use crate::isolation_connector_boot::ConnectorAccountDetails;
+use crate::isolation_connector_details::{CatalogAccountDetails, needs_details};
 
 const MAX_ASSOCIATIONS: usize = 4096;
 
@@ -132,26 +140,194 @@ fn recheck_identity(stores: &Stores<'_>, prepared: &PreparedAuthority) -> Result
 /// removal, a second member, a mirror owner change or removal (tombstone),
 /// a tenant replacement and any ACL/policy/credential epoch change.
 fn check_current(users: &UserDb, prepared: &PreparedAuthority) -> Result<(), VerificationError> {
+    if prepared.binding != prepared.lifecycle.binding { return Err(VerificationError::Revoked); }
     let current = users.isolation_authority_snapshot(snapshot_user(&prepared.principal), &prepared.agent)
         .map_err(|_| VerificationError::Revoked)?;
-    let generation = match &prepared.principal {
+    current_facts(&current, &prepared.agent, &prepared.principal, &prepared.binding, &prepared.tenant_id,
+        prepared.policy_epoch, prepared.credential_epoch)
+}
+
+/// One users.db snapshot still shows exactly the facts an identity check
+/// established: same tenant, policy/ACL/credential epochs, and the binding's
+/// member rules (Shared: no Personal mirror; Personal: [`personal_facts`]).
+fn current_facts(current: &IsolationAuthoritySnapshot, agent: &str, principal: &Principal, binding: &EmployeeBinding,
+    tenant_id: &str, policy_epoch: u64, credential_epoch: Option<u64>) -> Result<(), VerificationError> {
+    let generation = match principal {
         Principal::Human { generation, .. } | Principal::Background { generation, .. } => *generation,
     };
-    if prepared.binding != prepared.lifecycle.binding || current.policy_epoch != prepared.policy_epoch
-        || current.acl_generation != generation || current.tenant_id != prepared.tenant_id
-        || current.human.as_ref().map(|human| human.credential_epoch) != prepared.credential_epoch {
+    if current.policy_epoch != policy_epoch || current.acl_generation != generation || current.tenant_id != tenant_id
+        || current.human.as_ref().map(|human| human.credential_epoch) != credential_epoch {
         return Err(VerificationError::Revoked);
     }
-    match &prepared.binding {
+    match binding {
         EmployeeBinding::Shared(tenant) => {
             // A Personal mirror never appears under a live Shared employee.
             if current.tenant_id != tenant.as_str() || current.personal_owner.is_some() {
                 return Err(VerificationError::Revoked);
             }
         }
-        EmployeeBinding::Personal(owner) => personal_facts(&prepared.agent, owner.as_str(), &prepared.principal, &current)?,
+        EmployeeBinding::Personal(owner) => personal_facts(agent, owner.as_str(), principal, current)?,
     }
     Ok(())
+}
+
+// ── Connector accounts (v1.81 C2) ───────────────────────────────────────────
+
+/// Product half of the product-home check: is the home-wide integration that
+/// owns `provider`'s installed home account still connected in the product?
+/// `Ok(false)` refuses (Revoked); `Err` is an unreadable product state.
+///
+/// Called from `SelectedConnector::recheck_binding`, which may run while a
+/// sealed source owner (Google) holds its source/token locks. Implementations
+/// must therefore never open a credential store, token file or source lock;
+/// they read only lock-free product configuration.
+pub(crate) trait ProductHome: Send + Sync {
+    fn connected(&self, provider: &str) -> Result<bool, VerificationError>;
+}
+
+/// Production [`ProductHome`]: the current `config.toml [integrations]` gate
+/// of the OAuth home integrations, with the same rules as their product
+/// tools and the D2 home policies. Unreadable or malformed config (including
+/// a non-boolean flag) is `Unavailable`, never "enabled".
+/// - google: `google_workspace = true`; github: `github = true`;
+/// - notion: no enable flag exists (connecting is the opt-in), so absent is
+///   connected and an explicit `notion = false` is the kill switch.
+/// - Every other provider's home account is home configuration that its own
+///   provider re-reads at each use (database/computer/channel additionally
+///   through the C6 detail pin checked by the authority); there is no
+///   separate product connection to read, so the active SharedHome catalog
+///   route of this installation (moved by C3/C4 on revoke/disconnect) is the
+///   connection.
+/// - An unknown provider is never connected.
+///
+/// The OAuth token itself is read only by the credential providers at
+/// acquisition, before and after their await (D2, E2).
+pub(crate) struct ConfiguredProductHome { home: PathBuf }
+impl ConfiguredProductHome {
+    pub(crate) fn new(home: PathBuf) -> Result<Self, VerificationError> {
+        if !home.is_absolute() { return Err(VerificationError::Invalid); }
+        Ok(Self { home })
+    }
+    fn integration_flag(&self, key: &str) -> Result<Option<bool>, VerificationError> {
+        let raw = std::fs::read_to_string(self.home.join("config.toml")).map_err(|_| VerificationError::Unavailable)?;
+        let table: toml::Table = toml::from_str(&raw).map_err(|_| VerificationError::Unavailable)?;
+        let Some(section) = table.get("integrations") else { return Ok(None) };
+        match section.as_table().ok_or(VerificationError::Unavailable)?.get(key) {
+            None => Ok(None),
+            Some(value) => value.as_bool().map(Some).ok_or(VerificationError::Unavailable),
+        }
+    }
+}
+impl ProductHome for ConfiguredProductHome {
+    fn connected(&self, provider: &str) -> Result<bool, VerificationError> {
+        Ok(match provider {
+            "google" => self.integration_flag("google_workspace")? == Some(true),
+            "github" => self.integration_flag("github")? == Some(true),
+            "notion" => self.integration_flag("notion")? != Some(false),
+            "odoo" | "database" | "channel" | "search" | "model" | "computer" => true,
+            _ => false,
+        })
+    }
+}
+
+/// The stores a connector authorization reads besides the identity stores.
+/// `details` must be built over this same `catalog`.
+pub(crate) struct ConnectorStores {
+    catalog: Arc<ConnectorCatalog>,
+    details: Arc<dyn ConnectorAccountDetails>,
+    product: Arc<dyn ProductHome>,
+}
+impl ConnectorStores {
+    fn production(home: &Path, catalog: Arc<ConnectorCatalog>) -> Result<Self, VerificationError> {
+        Ok(Self { details: Arc::new(CatalogAccountDetails::new(home.to_owned(), catalog.clone())?),
+            product: Arc::new(ConfiguredProductHome::new(home.to_owned())?), catalog })
+    }
+}
+
+/// Is `binding` exactly this installation's home binding, `Shared(tenant)`
+/// with the users.db installation tenant (which the lifecycle read has just
+/// required to equal the tenant pinned in apply.db)?
+fn installation_home(binding: &EmployeeBinding, tenant_id: &str) -> bool {
+    matches!(binding, EmployeeBinding::Shared(tenant) if tenant.as_str() == tenant_id)
+}
+
+/// Catalog half of a connector use, on one route row. State first: an
+/// inactive route or one whose generation moved since selection is Revoked
+/// whatever its binding. Then the binding (BindingMismatch):
+/// - own binding (`home` = None): Personal employee ⇒ Personal route of the
+///   same owner; Shared employee ⇒ SharedTenant route of the same tenant, or
+///   SharedHome route of this installation;
+/// - explicit home fallback (`home` = Some): only a SharedHome route whose
+///   binding is the claimed home binding, which must be this installation's;
+///   a Shared employee may only name its own tenant there.
+fn route_use(route: &Route, employee: &EmployeeBinding, tenant_id: &str, home: Option<&EmployeeBinding>,
+    generation: u64) -> Result<(), VerificationError> {
+    if !route.active || route.generation != generation { return Err(VerificationError::Revoked); }
+    let admitted = match home {
+        None => &route.binding == employee && match (employee, route.kind) {
+            (EmployeeBinding::Personal(_), ConnectorKind::Personal) => true,
+            (EmployeeBinding::Shared(_), ConnectorKind::SharedTenant) => true,
+            (EmployeeBinding::Shared(_), ConnectorKind::SharedHome) => installation_home(&route.binding, tenant_id),
+            _ => false,
+        },
+        Some(home) => route.kind == ConnectorKind::SharedHome && &route.binding == home
+            && installation_home(home, tenant_id)
+            && match employee {
+                EmployeeBinding::Personal(_) => true,
+                EmployeeBinding::Shared(_) => employee == home,
+            },
+    };
+    if admitted { Ok(()) } else { Err(VerificationError::BindingMismatch) }
+}
+
+/// The C2 connector contract, for one use of `account` at the route
+/// `generation` pinned by selection:
+/// (a) the employee identity/lifecycle check exactly as for any tool (fresh
+///     lifecycle read; B1/B2 Personal and Shared rules);
+/// (b)+(c) the account is an active catalog route at exactly `generation`
+///     whose binding is the lifecycle binding ([`route_use`]);
+/// (d) a SharedHome route is this installation's home account and its
+///     integration is still connected in the product ([`ProductHome`]);
+/// (e) a provider needing C6 details has current details pinned to exactly
+///     this generation, employee and agent (`current_pin`).
+/// Then the route and users.db are re-read after that I/O. Unreadable stores
+/// are Unavailable; a malformed account id is Invalid; every mismatch is
+/// Revoked or BindingMismatch.
+#[allow(clippy::too_many_arguments)]
+fn connector_with(stores: &Stores<'_>, connectors: &ConnectorStores, agent: &str, employee: EmployeeId,
+    binding: &EmployeeBinding, principal: &Principal, account: &str, generation: u64,
+    home: Option<&EmployeeBinding>) -> Result<(), VerificationError> {
+    let account = AccountId::parse(account).map_err(|_| VerificationError::Invalid)?;
+    let identity = identity_with(stores, agent, employee, binding, principal, None)?;
+    let route = connectors.catalog.route(&account)?.ok_or(VerificationError::Revoked)?;
+    if route.account != account { return Err(VerificationError::Unavailable); }
+    route_use(&route, &identity.lifecycle.binding, &identity.tenant_id, home, generation)?;
+    if route.kind == ConnectorKind::SharedHome && !connectors.product.connected(route.provider)? {
+        return Err(VerificationError::Revoked);
+    }
+    if needs_details(route.provider) {
+        let pin = connectors.details.current_pin(&account)?.ok_or(VerificationError::Revoked)?;
+        if pin.account() != &account || pin.generation() != generation || pin.employee() != employee
+            || pin.agent() != agent {
+            return Err(VerificationError::Revoked);
+        }
+    }
+    // Re-read after the catalog/details/config I/O: the route must be the
+    // very same row state, and users.db must still show the identity's facts.
+    if connectors.catalog.route(&account)?.as_ref() != Some(&route) { return Err(VerificationError::Revoked); }
+    let current = stores.users.isolation_authority_snapshot(snapshot_user(principal), agent)
+        .map_err(|_| VerificationError::Unavailable)?;
+    current_facts(&current, agent, principal, &identity.lifecycle.binding, &identity.tenant_id,
+        identity.policy_epoch, identity.credential_epoch)
+}
+
+/// Trait-level refusal kinds: only an unreadable store stays distinguishable.
+fn binding_refusal(error: VerificationError) -> BindingError {
+    match error {
+        VerificationError::Unavailable => BindingError::Unavailable,
+        VerificationError::Invalid => BindingError::Invalid,
+        _ => BindingError::Denied,
+    }
 }
 
 /// Captured by the authenticated gateway turn/dispatch path. Missing values stay
@@ -207,6 +383,9 @@ pub struct GatewayAuthority {
     backend: Arc<SpawndBackend>,
     agents: Arc<super::AgentAdmission>,
     root: Arc<RootSource>,
+    /// `None` when boot has no production catalog: every connector use is
+    /// then Unavailable (never a fallback store).
+    connectors: Option<ConnectorStores>,
     next_revision: AtomicU64,
     employees: Mutex<BTreeMap<EmployeeId, String>>,
     runs: Mutex<BTreeMap<RunId, PreparedAuthority>>,
@@ -217,12 +396,27 @@ impl GatewayAuthority {
         (self.agents)(agent)?;
         self.users.isolation_authority_snapshot(Some(user), agent).map_err(|_| VerificationError::Revoked)
     }
-    pub fn new(home: PathBuf, users: Arc<UserDb>, backend: Arc<SpawndBackend>, agents: Arc<super::AgentAdmission>)
-        -> Result<Self, VerificationError> {
+    /// `catalog` must be the same production `ConnectorCatalog` instance boot
+    /// gives selection and the connector factory (F1).
+    pub fn new(home: PathBuf, users: Arc<UserDb>, backend: Arc<SpawndBackend>, agents: Arc<super::AgentAdmission>,
+        catalog: Option<Arc<ConnectorCatalog>>) -> Result<Self, VerificationError> {
         if !home.is_absolute() { return Err(VerificationError::Invalid); }
-        Ok(Self { home, users, backend, agents, root: Arc::new(lifecycle::RootAllocator),
+        let connectors = catalog.map(|catalog| ConnectorStores::production(&home, catalog)).transpose()?;
+        Ok(Self { home, users, backend, agents, root: Arc::new(lifecycle::RootAllocator), connectors,
             next_revision: AtomicU64::new(1),
             employees: Mutex::new(BTreeMap::new()), runs: Mutex::new(BTreeMap::new()) })
+    }
+
+    /// Shared by both `BindingAuthority` connector methods. The agent comes
+    /// only from this epoch's prepared association for the employee id.
+    fn connector(&self, employee: EmployeeId, binding: &EmployeeBinding, principal: &Principal, account: &str,
+        generation: u64, home: Option<&EmployeeBinding>) -> Result<(), BindingError> {
+        let agent = self.employees.lock().map_err(|_| BindingError::Unavailable)?.get(&employee)
+            .cloned().ok_or(BindingError::Denied)?;
+        let connectors = self.connectors.as_ref().ok_or(BindingError::Unavailable)?;
+        (self.agents)(&agent).map_err(binding_refusal)?;
+        connector_with(&self.stores(), connectors, &agent, employee, binding, principal, account, generation, home)
+            .map_err(binding_refusal)
     }
 
     fn stores(&self) -> Stores<'_> {
@@ -365,11 +559,19 @@ impl BindingAuthority for GatewayAuthority {
         // principal or a lost Personal owner/membership is refused.
         self.identity(&agent, employee, binding, principal, None).map(|_|()).map_err(|_| BindingError::Denied)
     }
-    fn authorize_connector(&self, _employee: EmployeeId, _binding: &EmployeeBinding,
-        _principal: &Principal, _account: &str) -> Result<(), BindingError> {
-        // No product connector-to-tenant adapter has been installed. In
-        // particular, Shared employees cannot inherit personal credentials.
-        Err(BindingError::Denied)
+    /// Own-binding use: Personal route of the owner, SharedTenant route of the
+    /// tenant, or SharedHome route of this installation for a Shared employee.
+    fn authorize_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal, account: &str, generation: u64) -> Result<(), BindingError> {
+        self.connector(employee, binding, principal, account, generation, None)
+    }
+    /// Explicit home fallback: only this installation's SharedHome route, and
+    /// only while its integration is connected. Shared employees can never
+    /// reach a Personal credential through it.
+    fn authorize_product_home_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal, account: &str, generation: u64, home_binding: &EmployeeBinding)
+        -> Result<(), BindingError> {
+        self.connector(employee, binding, principal, account, generation, Some(home_binding))
     }
 }
 impl LiveAuthority for GatewayAuthority {

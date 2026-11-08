@@ -165,7 +165,14 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
     // No parallel principal/binding database is created for the boundary.
     if sources.authority.is_none() && sources.bindings.is_none() {
         if let Ok(backend) = &backend {
-            if let Ok(authority) = super::authority::GatewayAuthority::new(home.to_owned(), users, backend.clone(), agents) {
+            // C2: the authority checks connector uses against the production
+            // catalog, and must read the very instance selection pins against.
+            // Without one, every connector use is Unavailable.
+            if sources.connector_catalog.is_none() {
+                sources.connector_catalog = ConnectorCatalog::open(home).ok().map(Arc::new);
+            }
+            if let Ok(authority) = super::authority::GatewayAuthority::new(home.to_owned(), users, backend.clone(), agents,
+                sources.connector_catalog.clone()) {
                 let authority = Arc::new(authority);
                 sources.authority = Some(authority.clone());
                 sources.bindings = Some(authority.clone());

@@ -18,13 +18,18 @@ type Result<T> = std::result::Result<T, BindingError>;
 /// Fresh binding checks supplied by the host's authoritative registries. A
 /// product adapter can reuse its existing stores without copying authority into
 /// the standalone BindingStore. Unreadable or unknown state must reject.
+///
+/// `generation` is the account route generation the caller's selection pinned
+/// (v1.81 C2). A host whose account store has generations must refuse when the
+/// current route generation differs; the standalone [`BindingStore`] test
+/// double has none and leaves that comparison to its caller.
 pub trait BindingAuthority: Send + Sync {
     fn validate(&self, employee: EmployeeId, binding: &EmployeeBinding,
         principal: &Principal) -> Result<()>;
     fn authorize_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
-        principal: &Principal, account: &str) -> Result<()>;
+        principal: &Principal, account: &str, generation: u64) -> Result<()>;
     fn authorize_product_home_connector(&self, _employee: EmployeeId, _binding: &EmployeeBinding,
-        _principal: &Principal, _account: &str, _home_binding: &EmployeeBinding) -> Result<()> {
+        _principal: &Principal, _account: &str, _generation: u64, _home_binding: &EmployeeBinding) -> Result<()> {
         Err(BindingError::Denied)
     }
 }
@@ -59,13 +64,14 @@ impl BindingAuthority for std::sync::Mutex<BindingStore> {
         principal: &Principal) -> Result<()> {
         self.lock().map_err(|_| BindingError::Unavailable)?.validate(employee, binding, principal)
     }
+    // Test double: no route generations here; the catalog caller compares them.
     fn authorize_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
-        principal: &Principal, account: &str) -> Result<()> {
+        principal: &Principal, account: &str, _generation: u64) -> Result<()> {
         self.lock().map_err(|_| BindingError::Unavailable)?
             .authorize_connector(employee, binding, principal, account)
     }
     fn authorize_product_home_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
-        principal: &Principal, account: &str, home_binding: &EmployeeBinding) -> Result<()> {
+        principal: &Principal, account: &str, _generation: u64, home_binding: &EmployeeBinding) -> Result<()> {
         self.lock().map_err(|_| BindingError::Unavailable)?
             .authorize_product_home_connector(employee, binding, principal, account, home_binding)
     }
