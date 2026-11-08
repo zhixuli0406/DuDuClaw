@@ -712,7 +712,14 @@ impl MethodHandler {
             }
             Err(e) => return WsFrame::error_response("", &format!("沒有套用，無法鎖定這筆審核：{e}")),
         };
-        let frame = self.apply_leased(broker, &lease, approval_id, ctx, decision_reason).await;
+        // RM-027 round 4: the lease is kept alive in the background for the
+        // whole decision — the org-lock wait, prepared journal, authority,
+        // mirror (its `agent.toml` lock wait is unbounded) and the terminal
+        // decision — so the TTL sweep can never expire the card under a
+        // commit that is still landing.
+        let keeper = broker.keep_decision_lease(approval_id, &lease, oc::DECISION_LEASE_SECS);
+        let frame = self.apply_leased(broker, &lease, &keeper, approval_id, ctx, decision_reason).await;
+        drop(keeper);
         // A lease the decision did not consume is given back (no-op otherwise).
         broker.release_decision_lease(approval_id, &lease).await;
         frame
@@ -724,6 +731,7 @@ impl MethodHandler {
         &self,
         broker: &crate::approval::ApprovalBroker,
         lease: &crate::approval::DecisionLease,
+        keeper: &crate::approval::LeaseKeeper,
         approval_id: &crate::approval::ApprovalId,
         ctx: &UserContext,
         decision_reason: &str,
@@ -804,6 +812,33 @@ impl MethodHandler {
                     duduclaw_core::truncate_chars(&e, 300)
                 ),
             );
+        }
+        // RM-027 round 4: the final in-TTL check, right before the authority
+        // commit. A lease that lapsed or a TTL that passed since the org lock
+        // was taken aborts cleanly here — nothing was committed, the prepared
+        // entry is dropped and the card is expired / left pending. Past this
+        // point the keeper extends the lease without the TTL until the
+        // terminal decision is recorded.
+        match broker.renew_decision_lease(approval_id, lease, oc::DECISION_LEASE_SECS).await {
+            Ok(true) if !keeper.lost() => keeper.mark_committed(),
+            Ok(_) => {
+                journal::clear(&self.home_dir, rec.id.as_str());
+                drop(org_lock);
+                broker.release_decision_lease(approval_id, lease).await;
+                return match broker.get(approval_id).await {
+                    Ok(Some(now)) if now.is_stale(chrono::Utc::now()) => {
+                        self.expire_org_card(broker, &now, ctx, decision_reason).await
+                    }
+                    _ => coded(
+                        "decision_lease_lost",
+                        "這筆審核的鎖定在套用前失效，這次沒有套用；這筆審核仍待決定，請再按一次「同意」。",
+                    ),
+                };
+            }
+            Err(e) => {
+                journal::clear(&self.home_dir, rec.id.as_str());
+                return WsFrame::error_response("", &format!("沒有套用，無法確認這筆審核的鎖定：{e}"));
+            }
         }
         let commit = match self
             .commit_org_entry(&org_lock, &proposal.agent_id, &proposal.after, "org.change_approved", ctx)
@@ -1013,7 +1048,47 @@ impl MethodHandler {
                 {
                     return WsFrame::error_response("", SELF_APPROVAL_REFUSAL);
                 }
-                self.complete_applied(broker, rec, &applied, proposal.as_ref(), ctx, None, None).await
+                // RM-027 round 4: the recovery records the decision under a
+                // decision lease like the first attempt — without one the TTL
+                // sweep could expire the card between this read and the write.
+                let lease = match broker.take_decision_lease(&rec.id, oc::DECISION_LEASE_SECS).await {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => {
+                        return match broker.poll(&rec.id).await {
+                            // Another attempt recorded the approval meanwhile.
+                            Ok(crate::approval::ApprovalStatus::Approved) => {
+                                self.finalize_applied(rec, &applied, proposal.as_ref(), ctx).await;
+                                WsFrame::ok_response("", json!({ "id": rec.id.as_str(), "decided": "approved", "side_effect": {
+                                    "applied": true,
+                                    "agent_id": applied.agent_id,
+                                    "before": oc::entry_json(&applied.before),
+                                    "after": oc::entry_json(&applied.after),
+                                } }))
+                            }
+                            // The TTL passed: report the recorded outcome
+                            // against the apply instead of hiding it.
+                            Ok(status) if status != crate::approval::ApprovalStatus::Pending => {
+                                self.journaled_status_mismatch(rec, &applied, &status)
+                            }
+                            _ => coded(
+                                "decision_in_progress",
+                                "另一位管理員正在處理這筆組織調整的審核，這次沒有做任何變更；請稍後重新整理再看結果。",
+                            ),
+                        };
+                    }
+                    Err(e) => {
+                        return WsFrame::error_response("", &format!("無法鎖定這筆審核，決定沒有記錄：{e}"));
+                    }
+                };
+                let keeper = broker.keep_decision_lease(&rec.id, &lease, oc::DECISION_LEASE_SECS);
+                // The change is already committed: the TTL no longer applies.
+                keeper.mark_committed();
+                let frame = self
+                    .complete_applied(broker, rec, &applied, proposal.as_ref(), ctx, None, Some(&lease))
+                    .await;
+                drop(keeper);
+                broker.release_decision_lease(&rec.id, &lease).await;
+                frame
             }
             crate::approval::ApprovalStatus::Approved => {
                 // The decision did land; only the bookkeeping was missing.
@@ -1025,33 +1100,41 @@ impl MethodHandler {
                     "after": oc::entry_json(&applied.after),
                 } }))
             }
-            other => {
-                // e.g. the TTL sweep expired it after the apply: say so
-                // instead of pretending it was not applied.
-                audit(
-                    &self.home_dir,
-                    "org_change_decision_mismatch",
-                    &applied.agent_id,
-                    duduclaw_security::audit::Severity::Warning,
-                    json!({
-                        "approval_id": rec.id.as_str(),
-                        "recorded_status": other.as_str(),
-                        "applied": true,
-                        "approved_by": applied.approved_by,
-                        "before": oc::entry_json(&applied.before),
-                        "after": oc::entry_json(&applied.after),
-                    }),
-                );
-                journal::clear(&self.home_dir, rec.id.as_str());
-                WsFrame::error_response(
-                    "",
-                    &format!(
-                        "這筆組織調整其實已經套用，但審核紀錄顯示為「{}」；實際結果已寫入稽核紀錄。需要還原的話，請在組織圖直接調整。",
-                        other.as_str()
-                    ),
-                )
-            }
+            other => self.journaled_status_mismatch(rec, &applied, other),
         }
+    }
+
+    /// A journaled apply whose card ended in another terminal state (e.g.
+    /// the TTL sweep expired it after the apply): say so instead of
+    /// pretending it was not applied.
+    fn journaled_status_mismatch(
+        &self,
+        rec: &crate::approval::ApprovalRecord,
+        applied: &journal::Applied,
+        other: &crate::approval::ApprovalStatus,
+    ) -> WsFrame {
+        audit(
+            &self.home_dir,
+            "org_change_decision_mismatch",
+            &applied.agent_id,
+            duduclaw_security::audit::Severity::Warning,
+            json!({
+                "approval_id": rec.id.as_str(),
+                "recorded_status": other.as_str(),
+                "applied": true,
+                "approved_by": applied.approved_by,
+                "before": oc::entry_json(&applied.before),
+                "after": oc::entry_json(&applied.after),
+            }),
+        );
+        journal::clear(&self.home_dir, rec.id.as_str());
+        WsFrame::error_response(
+            "",
+            &format!(
+                "這筆組織調整其實已經套用，但審核紀錄顯示為「{}」；實際結果已寫入稽核紀錄。需要還原的話，請在組織圖直接調整。",
+                other.as_str()
+            ),
+        )
     }
 
     /// Deny a card that can no longer be applied (stale, invalid, malformed),

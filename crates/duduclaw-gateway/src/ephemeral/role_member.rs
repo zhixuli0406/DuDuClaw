@@ -71,6 +71,7 @@ pub fn scaffold_role_member(
         ScaffoldPlan {
             agent_id: Some(agent_id),
             role: Some(&normalized),
+            org: None,
         },
     )
 }

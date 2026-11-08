@@ -883,6 +883,59 @@ async fn an_approval_that_expires_while_waiting_for_the_org_lock_is_not_applied(
     assert!(!crate::org_change_approval::journal::exists(&f.home, &id));
 }
 
+/// Round 4, finding 3: the journal recovery records the decision under a
+/// decision lease of its own — it waits out another holder instead of
+/// racing it, and a card whose TTL passed after the apply is reported as
+/// such (with an audit row) instead of being recorded without a lease.
+#[tokio::test]
+async fn journal_recovery_records_the_decision_under_a_lease() {
+    use crate::handlers::org_change_rpc::decide_failpoint;
+    let f = fixture().await;
+    let id = f.propose().await;
+    decide_failpoint::arm(&id);
+    let (code, _) = refusal(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    decide_failpoint::disarm(&id);
+    assert_eq!(code, "decision_unrecorded");
+    assert_eq!(f.authority("rep"), OrgEntry::new("other", "業務"));
+
+    // Someone else holds the card's lease: the recovery does not record
+    // around it.
+    let broker = ApprovalBroker::open(&f.home).unwrap();
+    let approval = ApprovalId::from(id.clone());
+    let other = broker.take_decision_lease(&approval, 30).await.unwrap().expect("the failed attempt gave its lease back");
+    let (code, msg) = refusal(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    assert_eq!(code, "decision_in_progress", "{msg}");
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    broker.release_decision_lease(&approval, &other).await;
+
+    // Freed: the recovery leases the card and records the approval.
+    let d = ok(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    assert_eq!(d["decided"], "approved", "{d}");
+    assert_eq!(f.status(&id).await, ApprovalStatus::Approved);
+    let lease: Option<String> = rusqlite::Connection::open(f.home.join("approvals.db"))
+        .unwrap()
+        .query_row("SELECT lease_token FROM approvals WHERE id=?1", [id.as_str()], |r| r.get(0))
+        .unwrap();
+    assert!(lease.is_none());
+    assert!(!crate::org_change_approval::journal::exists(&f.home, &id));
+
+    // The TTL passed between the apply and the retry: no lease can be
+    // taken any more, so the outcome is reported (expired + applied, with an
+    // audit row) instead of recorded without one.
+    let g = fixture().await;
+    let id = g.propose().await;
+    decide_failpoint::arm(&id);
+    let (code, _) = refusal(&g.call("approvals.decide", json!({ "id": id, "approve": true }), &g.admin).await);
+    decide_failpoint::disarm(&id);
+    assert_eq!(code, "decision_unrecorded");
+    g.expire_in(&id, -5);
+    let (_, e) = refusal(&g.call("approvals.decide", json!({ "id": id, "approve": true }), &g.admin).await);
+    assert!(e.contains("其實已經套用"), "{e}");
+    assert_eq!(g.status(&id).await, ApprovalStatus::Expired);
+    assert_eq!(audit_rows(&g.home, "org_change_decision_mismatch").len(), 1);
+    assert!(!crate::org_change_approval::journal::exists(&g.home, &id));
+}
+
 /// Round 3, finding 5: an approval decided inside its TTL completes its
 /// effect and terminal state under the lease (no lease left behind).
 #[tokio::test]

@@ -395,3 +395,49 @@ fn scaffold_cap_is_configurable_and_zero_is_clamped_to_one() {
     );
     assert!(err.contains("(1 live scaffolds)"), "got: {err}");
 }
+
+/// RM-027 round 4, finding 1: a scaffold takes the org lock before it
+/// creates anything (nothing is visible while it waits), and an authority
+/// refusal fails the scaffold with no directory left — never an ephemeral
+/// governed by the `agent.toml` inside its own workspace.
+#[test]
+fn scaffold_waits_for_the_org_lock_and_fails_closed_on_an_unusable_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    write_parent(&home, "boss", "[capabilities]\nallowed_tools = [\"Read\"]\n");
+    duduclaw_core::org_store::seed_if_absent(&home).unwrap();
+    let spec = EphemeralSpawnSpec {
+        parent: "boss".into(),
+        instruction: "x".into(),
+        tools: strs(&["Read"]),
+        tier: "standard".into(),
+    };
+
+    // Waits for a held org lock; nothing appears meanwhile.
+    let held = duduclaw_core::org_store::lock_org_mutations(&home).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let home = home.clone();
+        let spec = spec.clone();
+        std::thread::spawn(move || tx.send(scaffold(&home, &spec)).unwrap())
+    };
+    assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "scaffold must wait for the org lock");
+    assert_no_scaffold(&home);
+    drop(held);
+    let result = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap().unwrap();
+    worker.join().unwrap();
+    assert!(result.dir.join("agent.toml").is_file());
+    assert_eq!(
+        duduclaw_core::org_store::load(&home).get(&result.agent_id).unwrap().reports_to,
+        "boss"
+    );
+    std::fs::remove_dir_all(&result.dir).unwrap();
+
+    // Corrupt authority: refused, no scaffold (and no staging dir) remains.
+    let store = duduclaw_core::org_store::org_store_path(&home);
+    std::fs::write(&store, "schema = \"x\"\n").unwrap();
+    let err = scaffold(&home, &spec).unwrap_err();
+    assert!(err.contains("org authority refused"), "got: {err}");
+    assert_no_scaffold(&home);
+    assert_eq!(std::fs::read_to_string(&store).unwrap(), "schema = \"x\"\n");
+}

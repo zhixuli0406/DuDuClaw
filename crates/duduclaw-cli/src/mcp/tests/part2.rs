@@ -225,6 +225,86 @@ async fn gated_writers_keep_store_and_mirror_in_sync() {
     );
 }
 
+/// RM-027 round 4, finding 1: `create_agent` takes the org lock at its
+/// start — while another writer holds it the new employee is not visible
+/// (no directory, no staging dir, no row) — and publishes directory and
+/// authority row together once it gets the lock.
+#[tokio::test]
+async fn create_agent_waits_for_the_org_lock_before_anything_is_visible() {
+    let tmp = delegation_home();
+    let home = tmp.path().to_path_buf();
+    duduclaw_core::org_store::seed_if_absent(&home).unwrap();
+    let held = duduclaw_core::org_store::lock_org_mutations(&home).unwrap();
+    let path = home.clone();
+    let checker = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(!path.join("agents/late-intern").exists());
+        assert!(fs::read_dir(path.join("agents")).unwrap().filter_map(|e| e.ok()).all(|e| {
+            !e.file_name().to_string_lossy().starts_with(duduclaw_core::org_store::AGENT_STAGING_PREFIX)
+        }));
+        assert!(duduclaw_core::org_store::load(&path).get("late-intern").is_none());
+        drop(held);
+    };
+    let params = serde_json::json!({
+        "name": "late-intern",
+        "display_name": "晚到的實習生",
+        "reports_to": "sales-rep",
+    });
+    let (out, ()) = tokio::join!(handle_create_agent(&params, &home, "sales-lead"), checker);
+    assert!(out.get("isError").is_none(), "{out}");
+    assert!(home.join("agents/late-intern/agent.toml").is_file());
+    assert_eq!(duduclaw_core::org_store::load(&home).get("late-intern").unwrap().reports_to, "sales-rep");
+}
+
+/// An authority refusal (strict parser, cycle) fails `create_agent` and no
+/// directory remains — the old "warn and fall back to the mirror" made the
+/// employee govern itself.
+#[tokio::test]
+async fn create_agent_fails_closed_when_the_authority_refuses() {
+    // Corrupt store.
+    let tmp = delegation_home();
+    let home = tmp.path();
+    duduclaw_core::org_store::seed_if_absent(home).unwrap();
+    let store = duduclaw_core::org_store::org_store_path(home);
+    fs::write(&store, "schema = \"x\"\n").unwrap();
+    let out = handle_create_agent(
+        &serde_json::json!({ "name": "lost-intern", "display_name": "x", "reports_to": "sales-rep" }),
+        home,
+        "sales-lead",
+    )
+    .await;
+    assert_eq!(out["isError"], true, "{out}");
+    assert!(!home.join("agents/lost-intern").exists());
+    assert!(fs::read_dir(home.join("agents")).unwrap().filter_map(|e| e.ok()).all(|e| {
+        !e.file_name().to_string_lossy().starts_with(duduclaw_core::org_store::AGENT_STAGING_PREFIX)
+    }));
+    assert_eq!(fs::read_to_string(&store).unwrap(), "schema = \"x\"\n");
+
+    // A placement that closes a loop through stale authority rows
+    // (sales-rep → loop-intern → sales-lead) is refused.
+    let tmp = delegation_home();
+    let home = tmp.path();
+    duduclaw_core::org_store::seed_if_absent(home).unwrap();
+    duduclaw_core::org_store::with_org_lock(home, |org| {
+        duduclaw_core::org_store::upsert(org, "loop-intern", duduclaw_core::OrgEntry::new("sales-lead", ""))?;
+        duduclaw_core::org_store::upsert(org, "sales-rep", duduclaw_core::OrgEntry::new("loop-intern", "業務"))
+    })
+    .unwrap();
+    let out = handle_create_agent(
+        &serde_json::json!({ "name": "loop-intern", "display_name": "x", "reports_to": "sales-rep" }),
+        home,
+        "sales-lead",
+    )
+    .await;
+    assert_eq!(out["isError"], true, "{out}");
+    assert!(!home.join("agents/loop-intern").exists());
+    assert_eq!(
+        duduclaw_core::org_store::load(home).get("loop-intern").unwrap().reports_to,
+        "sales-lead",
+        "the refused create must not rewrite the authority"
+    );
+}
+
 /// A rejected `agent_update` must leave the authority untouched — the
 /// store write sits behind the same C4 gate as the file write.
 #[tokio::test]

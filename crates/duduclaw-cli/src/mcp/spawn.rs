@@ -348,13 +348,26 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
     // REQUEST, not of when it happens to be admitted.
     let incoming_hop_for_admission_queue = incoming_hop_depth();
     let home = home_dir.to_path_buf();
+    // RM-027 round 4: the scaffold holds the global org lock from its start
+    // to its publish. Lock order is the org lock first, then the lifecycle
+    // barrier — so take it here, before the admission held across the
+    // scaffold, and hand it in.
+    let org = {
+        let home = home.clone();
+        match tokio::task::spawn_blocking(move || duduclaw_core::org_store::lock_org_mutations(&home)).await {
+            Ok(Ok(guard)) => guard,
+            Ok(Err(e)) => return tool_error(&format!("Error: 暫時無法取得組織資料的寫入鎖，沒有建立臨時助手：{e}")),
+            Err(e) => return tool_error(&format!("Error: 暫時無法取得組織資料的寫入鎖，沒有建立臨時助手：{e}")),
+        }
+    };
     let admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
     let scaffolded = tokio::task::spawn_blocking(move || {
         let _admission = admission;
-        duduclaw_gateway::ephemeral::scaffold(&home, &spec)
+        let org = org;
+        duduclaw_gateway::ephemeral::scaffold_under_org_lock(&home, &spec, &org)
     })
     .await
     .unwrap_or_else(|join_err| Err(format!("spawn_blocking panicked: {join_err}")));

@@ -505,6 +505,25 @@ impl ApprovalStore {
         Ok(n > 0)
     }
 
+    /// RM-027 round 4: extend a lease the caller still holds **without**
+    /// re-judging the TTL — only while the lease is live and the row pending.
+    /// For a holder that already passed its final in-TTL check and is
+    /// committing its side effect: the TTL sweep must stay off the row until
+    /// the terminal decision lands ([`Self::decide_leased`] does not re-judge
+    /// the TTL either).
+    pub(super) async fn extend_lease(&self, id: &ApprovalId, token: &str, now: &str, until: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE approvals SET lease_until = ?1
+                 WHERE id = ?2 AND status = 'pending' AND lease_token = ?3
+                 AND julianday(lease_until) IS NOT NULL AND julianday(lease_until) > julianday(?4)",
+                params![until, id.as_str(), token, now],
+            )
+            .map_err(|e| format!("extend decision lease: {e}"))?;
+        Ok(n > 0)
+    }
+
     /// Drop a lease the caller holds (no-op when it is no longer theirs).
     pub(super) async fn release_lease(&self, id: &ApprovalId, token: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;

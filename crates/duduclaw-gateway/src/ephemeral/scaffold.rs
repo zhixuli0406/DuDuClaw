@@ -53,6 +53,28 @@ pub fn scaffold(home_dir: &Path, spec: &EphemeralSpawnSpec) -> Result<ScaffoldRe
         ScaffoldPlan {
             agent_id: None,
             role: None,
+            org: None,
+        },
+    )
+}
+
+/// [`scaffold`] for a caller that already holds the global org lock — one
+/// that must take it **before** an autonomy admission it holds across the
+/// scaffold (lock order: the org lock, then the lifecycle barrier). Taking
+/// the lock inside the scaffold while holding an admission would invert
+/// that order against a barrier holder waiting on the org lock's other side.
+pub fn scaffold_under_org_lock(
+    home_dir: &Path,
+    spec: &EphemeralSpawnSpec,
+    org: &duduclaw_core::org_store::OrgMutationGuard,
+) -> Result<ScaffoldResult, String> {
+    scaffold_with(
+        home_dir,
+        spec,
+        ScaffoldPlan {
+            agent_id: None,
+            role: None,
+            org: Some(org),
         },
     )
 }
@@ -156,6 +178,25 @@ pub(super) fn scaffold_with(
         return Err("instruction too long (max 16000 chars)".to_string());
     }
 
+    // ── Global org lock, taken at the START (RM-027 round 4) ─────────────
+    // Held to the publish below. The scaffold is built in an invisible
+    // staging directory and renamed into place only after its authority row
+    // committed; an authority refusal (lock, corrupt / newer store, a cycle)
+    // fails the whole scaffold. A scaffold with no row would be governed by
+    // the `agent.toml` inside its own workspace — never acceptable. Lock
+    // order: this lock first, then the `.ephemeral` root lock and the
+    // autonomy gate. A caller that already holds it (because it must take
+    // it before an autonomy admission) passes it in.
+    let owned_org;
+    let org = match plan.org {
+        Some(org) => org,
+        None => {
+            owned_org = duduclaw_core::org_store::lock_org_mutations(home_dir)
+                .map_err(|e| format!("org lock unavailable — scaffold not created: {e}"))?;
+            &owned_org
+        }
+    };
+
     // ── Parent capability envelope (fail-closed) ────────────────────────
     let (parent_raw, parent_config) = read_parent_config(home_dir, &spec.parent)?;
     // Team role members carry the handoff channel itself; an ordinary
@@ -190,21 +231,26 @@ pub(super) fn scaffold_with(
     let root = ephemeral_root(home_dir);
     let agent_id = plan.agent_id.clone().unwrap_or_else(new_ephemeral_id);
     let dir = root.join(&agent_id);
-    let created = duduclaw_core::with_file_lock(&root, || {
+    // The staging directory lives inside the root, so it holds its cap slot
+    // from the moment it is counted; dropping it (any early return) frees
+    // the slot and leaves nothing behind.
+    let mut staged: Option<duduclaw_core::org_store::StagedAgentDir> = None;
+    duduclaw_core::with_file_lock(&root, || {
         check_parent_autonomy(home_dir, &spec.parent).map_err(std::io::Error::other)?;
         if active_count(&root) >= cap {
-            return Ok(false);
+            return Ok(());
         }
-        std::fs::create_dir_all(&dir)?;
-        Ok(true)
+        staged = Some(duduclaw_core::org_store::StagedAgentDir::create(org, &dir, &agent_id)?);
+        Ok(())
     })
     .map_err(|e| format!("create scaffold dir: {e}"))?;
-    if !created {
+    let Some(staged) = staged else {
         return Err(format!(
             "{EPHEMERAL_CAPACITY_ERROR_PREFIX} ({cap} live scaffolds) — \
              wait for the hourly GC sweep or complete running tasks first"
         ));
-    }
+    };
+    let stage = staged.path().to_path_buf();
 
     // ── agent.toml — built as a toml::Table (injection-safe serializer) ──
     let parent_value: toml::Value = parent_raw
@@ -370,7 +416,7 @@ pub(super) fn scaffold_with(
 
     let agent_toml = toml::to_string_pretty(&toml::Value::Table(table))
         .map_err(|e| format!("serialize agent.toml: {e}"))?;
-    std::fs::write(dir.join("agent.toml"), agent_toml)
+    std::fs::write(stage.join("agent.toml"), agent_toml)
         .map_err(|e| format!("write agent.toml: {e}"))?;
 
     // ── SOUL.md (stable role prefix or ordinary ephemeral instruction) ───
@@ -384,7 +430,7 @@ pub(super) fn scaffold_with(
                 Ok(text) => text,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(e) => {
-                    let _ = std::fs::remove_dir_all(&dir);
+                    // `staged` is dropped on return: the staging dir goes.
                     return Err(format!(
                         "read parent identity {}: {e}",
                         identity_path.display()
@@ -404,7 +450,32 @@ pub(super) fn scaffold_with(
         }
         None => spec.instruction.clone(),
     };
-    std::fs::write(dir.join("SOUL.md"), soul).map_err(|e| format!("write SOUL.md: {e}"))?;
+    std::fs::write(stage.join("SOUL.md"), soul).map_err(|e| format!("write SOUL.md: {e}"))?;
+
+    let now = chrono::Utc::now();
+    let meta = EphemeralMeta {
+        parent: spec.parent.clone(),
+        tier: tier.as_str().to_string(),
+        created_at: now.to_rfc3339(),
+        expires_at: (now + chrono::Duration::hours(EPHEMERAL_TTL_HOURS)).to_rfc3339(),
+    };
+    let meta_toml =
+        toml::to_string_pretty(&meta).map_err(|e| format!("serialize ephemeral.toml: {e}"))?;
+    std::fs::write(stage.join("ephemeral.toml"), meta_toml)
+        .map_err(|e| format!("write ephemeral.toml: {e}"))?;
+
+    // WP22 T1 / RM-027 round 4 — inside the org lock: validate and commit the
+    // ephemeral's placement in the authoritative store, then publish the
+    // directory. `reports_to = <parent>` is precisely the relation that
+    // authorises this scaffold's dispatch, and `DispatchOrgView` reads the
+    // store first; an ephemeral with no record would fall back to the
+    // `agent.toml` written above, i.e. to a file inside its own workspace —
+    // so a refused row fails the scaffold (the staging dir is removed).
+    // Department-less by design (an ephemeral inherits isolation, not org
+    // membership). Symmetric teardown lives in `sweep`.
+    staged
+        .publish(org, duduclaw_core::OrgEntry::new(&spec.parent, ""))
+        .map_err(|e| format!("scaffold '{agent_id}' not created — org authority refused: {e}"))?;
 
     // ── .mcp.json — the scaffold's ONLY route to the duduclaw MCP server ──
     //
@@ -433,42 +504,17 @@ pub(super) fn scaffold_with(
     // reach nobody granted it. Revisit only if a role genuinely needs one.
     //
     // Fail-closed: a member that cannot reach the MCP server cannot hand its
-    // work back, so a failure here aborts the scaffold and removes the
-    // directory instead of leaving a mute agent that still occupies a cap
-    // slot.
+    // work back, so a failure here aborts the scaffold — the published
+    // directory and its authority row are both removed (still under the org
+    // lock) instead of leaving a mute agent that still occupies a cap slot.
+    // Written after the publish because the identity it carries is derived
+    // from the final directory name.
     if let Err(e) = ensure_scaffold_mcp_config(&dir) {
         let _ = std::fs::remove_dir_all(&dir);
+        if let Err(re) = duduclaw_core::org_store::remove(org, &agent_id) {
+            tracing::warn!(ephemeral = %agent_id, error = %re, "org.toml rollback failed for an aborted scaffold");
+        }
         return Err(format!("scaffold '{agent_id}' MCP config: {e}"));
-    }
-
-    let now = chrono::Utc::now();
-    let meta = EphemeralMeta {
-        parent: spec.parent.clone(),
-        tier: tier.as_str().to_string(),
-        created_at: now.to_rfc3339(),
-        expires_at: (now + chrono::Duration::hours(EPHEMERAL_TTL_HOURS)).to_rfc3339(),
-    };
-    let meta_toml =
-        toml::to_string_pretty(&meta).map_err(|e| format!("serialize ephemeral.toml: {e}"))?;
-    std::fs::write(dir.join("ephemeral.toml"), meta_toml)
-        .map_err(|e| format!("write ephemeral.toml: {e}"))?;
-
-    // WP22 T1 — record the ephemeral's placement in the authoritative store.
-    // `reports_to = <parent>` is precisely the relation that authorises this
-    // scaffold's dispatch, and `DispatchOrgView` now reads the store first; an
-    // ephemeral with no record would fall back to the `agent.toml` written
-    // above, i.e. to a file inside its own workspace. Department-less by
-    // design (an ephemeral inherits isolation, not org membership).
-    // Symmetric teardown lives in `sweep`. Like every authority write it runs
-    // under the global org lock (RM-027 round 3), which also cycle-checks it.
-    if let Err(e) = duduclaw_core::org_store::with_org_lock(home_dir, |org| {
-        duduclaw_core::org_store::upsert(org, &agent_id, duduclaw_core::OrgEntry::new(&spec.parent, ""))
-    }) {
-        tracing::warn!(
-            ephemeral = %agent_id,
-            error = %e,
-            "org.toml upsert failed for ephemeral scaffold"
-        );
     }
 
     // Audit: creation (existing tool_calls.jsonl convention). Role members get

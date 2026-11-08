@@ -603,6 +603,10 @@ fn mutate<T>(
     let path = org_store_path(home);
     crate::config::create_home_dir(home).map_err(|e| OrgStoreError::Io(e.to_string()))?;
     let locked = with_file_lock(&path, || {
+        // Set when this write adopts the mirrors wholesale (first-run
+        // bootstrap, `org sync` rebuild): the result is a batch write and
+        // gets the whole-graph cycle walk below.
+        let mut batch_import = mode == WriteMode::Rebuild;
         let mut store = match std::fs::read_to_string(&path) {
             Ok(content) => match parse_strict(&content) {
                 Ok(s) => s,
@@ -674,6 +678,7 @@ fn mutate<T>(
                     for (agent_id, entry) in scan_mirrors(home) {
                         seeded.set(agent_id, entry);
                     }
+                    batch_import = true;
                     seeded
                 }
             }
@@ -686,6 +691,20 @@ fn mutate<T>(
             // Refused (a cycle, an invalid id, …): leave the bytes alone.
             Err(e) => return Ok(Err(e)),
         };
+        // RM-027 round 4: a wholesale import is a batch write — the mirrors
+        // it adopted are never trusted to be acyclic. Refuse the whole write
+        // (nothing is written) when the resulting stored graph has a loop.
+        if batch_import {
+            if let Err(e) = check_store_graph(&store) {
+                tracing::warn!(
+                    path = %path.display(),
+                    reason = %e,
+                    "the agent.toml mirrors form a reporting cycle — refusing to adopt them \
+                     as the org authority (fix the agent.toml files, then run `duduclaw org sync`)"
+                );
+                return Ok(Err(e));
+            }
+        }
         // Rewrite when the content changed, and always on first creation — the
         // file's *existence* is the "already bootstrapped" flag that stops the
         // gateway re-seeding (and re-adopting tampered mirrors) every boot.
@@ -875,9 +894,46 @@ fn set_checked(store: &mut OrgStore, home: &Path, agent_id: &str, entry: OrgEntr
     Ok(changed)
 }
 
+/// RM-027 round 4: walk the **whole** stored graph — every row with a
+/// non-empty `reports_to` — using the store's own rows only (no mirror
+/// fallback). A batch write (`org sync`, a corrupt / lost rebuild, the
+/// first-write bootstrap, [`upsert_many`]) cannot rely on [`adds_edge`]: when
+/// the store started empty, the mirror fallback makes every adopted edge
+/// look pre-existing, so a mirror cycle `A→B, B→A` would be promoted to
+/// authority unchecked. The walk stops at a parent the store has no row for.
+fn check_store_graph(store: &OrgStore) -> Result<(), OrgStoreError> {
+    for (agent_id, entry) in store.iter() {
+        if entry.reports_to.is_empty() {
+            continue;
+        }
+        let cycle = || OrgStoreError::Cycle { agent_id: agent_id.clone(), reports_to: entry.reports_to.clone() };
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut current: &str = entry.reports_to.as_str();
+        let mut closed = true;
+        for _ in 0..MAX_CHAIN_DEPTH {
+            if current == agent_id.as_str() || !visited.insert(current) {
+                return Err(cycle());
+            }
+            match store.get(current) {
+                Some(next) if !next.reports_to.is_empty() => current = next.reports_to.as_str(),
+                _ => {
+                    closed = false;
+                    break;
+                }
+            }
+        }
+        if closed {
+            return Err(cycle());
+        }
+    }
+    Ok(())
+}
+
 /// [`set_checked`] for a batch: every row is applied first, then every row
 /// that added an edge is walked (a batch can close a loop across several of
-/// its own rows). Returns the number of rows whose value changed.
+/// its own rows), and finally the whole resulting stored graph is walked
+/// without mirror fallback ([`check_store_graph`]) — any cycle refuses the
+/// whole batch. Returns the number of rows whose value changed.
 fn set_all_checked(store: &mut OrgStore, home: &Path, entries: &[(String, OrgEntry)]) -> Result<usize, OrgStoreError> {
     let mut changed = 0usize;
     let mut new_edges: Vec<&str> = Vec::new();
@@ -897,6 +953,7 @@ fn set_all_checked(store: &mut OrgStore, home: &Path, entries: &[(String, OrgEnt
     for agent_id in new_edges {
         check_no_cycle(store, home, agent_id)?;
     }
+    check_store_graph(store)?;
     Ok(changed)
 }
 
@@ -929,7 +986,9 @@ pub fn upsert(org: &OrgMutationGuard, agent_id: &str, entry: OrgEntry) -> io::Re
 }
 
 /// Replace many entries in one locked write (seeding, migration). Every row
-/// that adds an edge is cycle-checked against the resulting tree.
+/// that adds an edge is cycle-checked against the resulting tree, and the
+/// whole resulting stored graph is walked without mirror fallback (RM-027
+/// round 4) — a loop anywhere refuses the whole batch.
 ///
 /// Returns the number of entries whose value changed.
 pub fn upsert_many(org: &OrgMutationGuard, entries: &[(String, OrgEntry)]) -> io::Result<usize> {
@@ -954,6 +1013,124 @@ pub fn remove(org: &OrgMutationGuard, agent_id: &str) -> io::Result<bool> {
         return Ok(false);
     }
     Ok(mutate(&org.home, WriteMode::Lenient, move |store| Ok(store.entries.remove(&agent_id).is_some()))?)
+}
+
+// ── Staged agent creation (RM-027 round 4) ──────────────────────────────────
+
+/// Basename prefix of a creation's staging directory. Dot-prefixed, so the
+/// registry scan, [`scan_mirrors`] and every `is_internal_agent_dir` filter
+/// skip it: a half-built employee is never visible, and its `agent.toml`
+/// can never be read as a mirror.
+pub const AGENT_STAGING_PREFIX: &str = ".creating-";
+
+/// An agent directory being built **off to the side** of its final path.
+///
+/// # Why (RM-027 round 4)
+///
+/// Creation flows used to publish `agents/<id>/agent.toml` first and only
+/// then wait for the org lock to record the authority row — and when that
+/// wait or the write failed (a corrupt store, a cycle) they only warned and
+/// reported success. The employee was then governed by its own mirror
+/// forever (fail-open), and the cycle check never ran.
+///
+/// Now a creation takes the org lock at its start, builds the directory here
+/// (same parent as the target, so the publish is a same-filesystem
+/// `rename`), and calls [`Self::publish`] while still holding the lock: the
+/// authority row is validated and committed first, the directory renamed
+/// into place second. Any failure on the way — including an authority
+/// refusal — drops the staging directory (see `Drop`) and fails the whole
+/// creation; there is no mirror fallback.
+#[derive(Debug)]
+pub struct StagedAgentDir {
+    staging: PathBuf,
+    target: PathBuf,
+    agent_id: String,
+    published: bool,
+}
+
+impl StagedAgentDir {
+    /// Create an empty staging directory next to `target`, holding the org
+    /// lock (`org` — proof only). Refuses with `AlreadyExists` when `target`
+    /// is already taken.
+    pub fn create(org: &OrgMutationGuard, target: &Path, agent_id: &str) -> io::Result<Self> {
+        let _ = org;
+        let agent_id = agent_id.trim();
+        if !crate::is_valid_agent_id(agent_id) {
+            return Err(OrgStoreError::InvalidAgentId(agent_id.to_string()).into());
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "agent directory has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        if std::fs::symlink_metadata(target).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("agent '{agent_id}' already exists"),
+            ));
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let staging = parent.join(format!(
+            "{AGENT_STAGING_PREFIX}{agent_id}-{}-{nanos:x}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&staging)?;
+        Ok(Self { staging, target: target.to_path_buf(), agent_id: agent_id.to_string(), published: false })
+    }
+
+    /// Where to build the directory's contents.
+    pub fn path(&self) -> &Path {
+        &self.staging
+    }
+
+    /// The final directory [`Self::publish`] renames the staging dir to.
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Inside the org lock: validate and commit the authority row (a lost
+    /// store records only this row, a corrupt / newer store and a cycle are
+    /// refused — [`upsert`]), then publish the directory by `rename`. On any
+    /// failure the row is put back as it was, the staging directory removed,
+    /// and the error returned — the employee never appears.
+    pub fn publish(mut self, org: &OrgMutationGuard, entry: OrgEntry) -> io::Result<PathBuf> {
+        if std::fs::symlink_metadata(&self.target).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("agent '{}' already exists", self.agent_id),
+            ));
+        }
+        let prior = load(org.home()).get(&self.agent_id).cloned();
+        upsert(org, &self.agent_id, entry)?;
+        if let Err(e) = std::fs::rename(&self.staging, &self.target) {
+            let rollback = match prior {
+                Some(p) => upsert(org, &self.agent_id, p).map(|_| ()),
+                None => remove(org, &self.agent_id).map(|_| ()),
+            };
+            if let Err(re) = rollback {
+                tracing::warn!(
+                    agent = %self.agent_id,
+                    error = %re,
+                    "could not roll back the org authority row after a failed agent publish"
+                );
+            }
+            return Err(e);
+        }
+        self.published = true;
+        Ok(self.target.clone())
+    }
+}
+
+impl Drop for StagedAgentDir {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.staging);
+        }
+    }
 }
 
 // ── Mirror scanning (seeding / sync / drift) ────────────────────────────────
@@ -1460,6 +1637,134 @@ mod tests {
         let before = std::fs::read_to_string(org_store_path(h.path())).unwrap();
         assert!(sync_from_mirrors(h.path(), None, false).is_err());
         assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), before);
+    }
+
+    /// RM-027 round 4, finding 2: a rebuild from an empty store used to skip
+    /// the cycle check — `adds_edge` read the same mirror the batch adopted,
+    /// so every edge looked pre-existing. The whole resulting graph is now
+    /// walked without mirror fallback and a loop refuses the whole batch.
+    #[test]
+    fn a_rebuild_or_sync_of_cyclic_mirrors_is_refused_as_a_whole() {
+        // Corrupt store, mirrors A→B, B→A.
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        write_agent(h.path(), "a", "b", "");
+        write_agent(h.path(), "b", "a", "");
+        let corrupt = "this is [not( toml";
+        std::fs::write(org_store_path(h.path()), corrupt).unwrap();
+        std::fs::write(org_seeded_path(h.path()), "").unwrap();
+        let e = sync_from_mirrors(h.path(), None, false).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), corrupt);
+
+        // Lost store (marker present, file gone), same cyclic mirrors.
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        write_agent(h.path(), "a", "b", "");
+        write_agent(h.path(), "b", "a", "");
+        std::fs::write(org_seeded_path(h.path()), "").unwrap();
+        assert!(store_lost(h.path()));
+        assert!(sync_from_mirrors(h.path(), None, false).is_err());
+        assert!(!store_exists(h.path()), "a refused rebuild must not create the store");
+
+        // Healthy store; a brand-new, never-registered pair of mirrors
+        // forms a loop among themselves — `org sync` refuses the batch.
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        seed_if_absent(h.path()).unwrap();
+        write_agent(h.path(), "x", "y", "");
+        write_agent(h.path(), "y", "x", "");
+        write_agent(h.path(), "z", "ceo", "業務");
+        let before = std::fs::read_to_string(org_store_path(h.path())).unwrap();
+        assert!(sync_from_mirrors(h.path(), None, false).is_err());
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), before);
+        assert!(load(h.path()).get("z").is_none(), "the whole batch is refused");
+        // A longer loop (x→y→w→x) is refused too.
+        write_agent(h.path(), "y", "w", "");
+        write_agent(h.path(), "w", "x", "");
+        assert!(sync_from_mirrors(h.path(), None, false).is_err());
+        // Once the loop is broken, the sync adopts everything.
+        write_agent(h.path(), "x", "ceo", "");
+        assert_eq!(sync_from_mirrors(h.path(), None, false).unwrap().len(), 4);
+
+        // `upsert_many` gets the same whole-graph walk.
+        let guard = lock_org_mutations(h.path()).unwrap();
+        let batch = vec![
+            ("p".to_string(), OrgEntry::new("q", "")),
+            ("q".to_string(), OrgEntry::new("p", "")),
+        ];
+        assert!(upsert_many(&guard, &batch).is_err());
+        assert!(load(h.path()).get("p").is_none());
+    }
+
+    /// RM-027 round 4, finding 1: a staged creation is invisible until it
+    /// publishes, and an authority refusal removes it instead of leaving an
+    /// employee governed by its own mirror.
+    #[test]
+    fn a_staged_agent_publishes_only_after_its_authority_row_commits() {
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        seed_if_absent(h.path()).unwrap();
+        let target = h.path().join("agents").join("newbie");
+
+        // Success: invisible while staged, published with its row.
+        let org = lock_org_mutations(h.path()).unwrap();
+        let staged = StagedAgentDir::create(&org, &target, "newbie").unwrap();
+        std::fs::write(staged.path().join("agent.toml"), "[agent]\nname = \"newbie\"\nreports_to = \"ceo\"\n").unwrap();
+        assert!(!target.exists());
+        assert!(scan_mirrors(h.path()).iter().all(|(id, _)| id != "newbie"));
+        assert!(staged.path().file_name().unwrap().to_str().unwrap().starts_with(AGENT_STAGING_PREFIX));
+        assert_eq!(staged.publish(&org, OrgEntry::new("ceo", "")).unwrap(), target);
+        assert!(target.join("agent.toml").is_file());
+        assert_eq!(load(h.path()).get("newbie").unwrap().reports_to, "ceo");
+        // A taken name is refused up front.
+        assert_eq!(
+            StagedAgentDir::create(&org, &target, "newbie").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // Cycle: a stale row says `ceo` reports to `loop`; creating `loop`
+        // under `ceo` would close it — refused, no directory, no row.
+        org.upsert("ceo", OrgEntry::new("loop", "")).unwrap();
+        let looped = h.path().join("agents").join("loop");
+        let staged = StagedAgentDir::create(&org, &looped, "loop").unwrap();
+        let staging = staged.path().to_path_buf();
+        let e = staged.publish(&org, OrgEntry::new("ceo", "")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert!(!looped.exists() && !staging.exists());
+        assert!(load(h.path()).get("loop").is_none());
+        org.upsert("ceo", OrgEntry::new("", "")).unwrap();
+
+        // Corrupt authority: refused, nothing published, bytes untouched.
+        std::fs::write(org_store_path(h.path()), "schema = \"x\"\n").unwrap();
+        let other = h.path().join("agents").join("other");
+        let staged = StagedAgentDir::create(&org, &other, "other").unwrap();
+        let staging = staged.path().to_path_buf();
+        assert!(staged.publish(&org, OrgEntry::new("ceo", "")).is_err());
+        assert!(!other.exists() && !staging.exists());
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), "schema = \"x\"\n");
+
+        // Dropped without publishing (an aborted build): no trace left.
+        let staged = StagedAgentDir::create(&org, &other, "other").unwrap();
+        let staging = staged.path().to_path_buf();
+        drop(staged);
+        assert!(!staging.exists() && !other.exists());
+    }
+
+    /// RM-027 round 4, finding 2: the first-write bootstrap adopts every
+    /// mirror wholesale — a mirror cycle is refused, not promoted.
+    #[test]
+    fn bootstrap_refuses_mirrors_that_form_a_cycle() {
+        let h = home();
+        write_agent(h.path(), "a", "b", "");
+        write_agent(h.path(), "b", "a", "");
+        assert!(seed_if_absent(h.path()).is_err());
+        assert!(put(h.path(), "newcomer", OrgEntry::new("", "")).is_err());
+        assert!(!store_exists(h.path()));
+        assert!(!seeded_marker_exists(h.path()));
+        // The ordinary acyclic bootstrap is unaffected.
+        write_agent(h.path(), "b", "", "");
+        assert_eq!(seed_if_absent(h.path()).unwrap(), Some(2));
     }
 
     #[test]

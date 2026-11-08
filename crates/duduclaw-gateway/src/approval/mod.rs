@@ -158,6 +158,22 @@ pub struct DecisionLease {
     token: String,
 }
 
+/// RM-027 round 4: keeps a [`DecisionLease`] alive in the background for as
+/// long as the decision is in flight ([`ApprovalBroker::keep_decision_lease`]).
+///
+/// A lease renewed once and then left alone lapses during any long internal
+/// wait (an `agent.toml` advisory lock, say); the TTL sweep could then
+/// expire the card while the side effect still commits. The keeper renews
+/// it every quarter of its length: inside the TTL until
+/// [`Self::mark_committed`], then without the TTL (the holder already passed
+/// its final in-TTL check) until the terminal decision. Stops on drop.
+#[derive(Debug)]
+pub struct LeaseKeeper {
+    committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 #[cfg(test)]
 mod tests;
 
