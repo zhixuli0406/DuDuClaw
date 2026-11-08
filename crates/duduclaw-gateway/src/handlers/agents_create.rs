@@ -13,7 +13,28 @@ impl MethodHandler {
 
     /// `agents.create`. `caller` is the authenticated dashboard user; it is
     /// recorded on the `runtime_provider_deprecated` audit row (R1, 2026-10).
+    ///
+    /// Native Linux protected mode (v1.81, A4): a protected employee exists
+    /// only through an approved Employee proposal and its root allocation, so
+    /// direct creation is refused here. Admins use `isolation.employee_propose`
+    /// (step-up, then the approval card); staff request a Personal employee
+    /// with `me.isolation.request_personal_employee`.
     pub(crate) async fn handle_agents_create_as(
+        &self,
+        params: Value,
+        caller: Option<&UserContext>,
+    ) -> WsFrame {
+        if crate::runtime_readiness::is_protected_linux() {
+            return WsFrame::error_response("", super::isolation_employee_rpc::DIRECT_CREATE_REFUSED);
+        }
+        self.create_agent_files(params, caller).await
+    }
+
+    /// The product writer behind `agents.create`: agent directory, agent.toml,
+    /// SOUL.md, hook settings, registry rescan. Callers own authorization; in
+    /// protected mode only the admin Employee proposal path may call it, and
+    /// the result is inert until its proposal is approved and allocated.
+    pub(crate) async fn create_agent_files(
         &self,
         params: Value,
         caller: Option<&UserContext>,

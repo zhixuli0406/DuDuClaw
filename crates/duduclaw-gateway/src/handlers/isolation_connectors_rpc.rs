@@ -128,7 +128,8 @@ fn serve(home: &Path, db: &UserDb, user: &str, session: &str, epoch: u64, method
 /// The proof is read by the caller from users.db for this exact user, session
 /// and credential epoch (already proving current Admin + enrolled MFA); this
 /// adds the five-minute freshness window and the session-bound CSRF token.
-fn authorize_step_up(proof: Option<&MigrationConfirmationSession>, user: &str, csrf: &[u8; 32], now: i64)
+/// Shared with the employee proposal RPCs (A4), which reuse the same proof.
+pub(super) fn authorize_step_up(proof: Option<&MigrationConfirmationSession>, user: &str, csrf: &[u8; 32], now: i64)
     -> Result<(), &'static str> {
     const REQUIRED: &str = "請先以密碼與雙因素驗證確認身分。";
     let proof = proof.ok_or(REQUIRED)?;

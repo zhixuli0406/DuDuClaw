@@ -127,6 +127,9 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         // 為主機控制，不在此列）
         | "isolation.connector_list" | "isolation.connector_step_up"
         | "isolation.connector_provision" | "isolation.connector_revoke"
+        // 受保護員工配置提案與個人專屬員工申請（同上，Linux 團隊版）
+        | "isolation.employee_list" | "isolation.employee_propose" | "isolation.employee_tombstone"
+        | "me.isolation.request_personal_employee" | "me.isolation.list_personal_employee_requests"
     )
 }
 
