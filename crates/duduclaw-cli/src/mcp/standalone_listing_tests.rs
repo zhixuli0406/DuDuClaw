@@ -212,6 +212,8 @@ async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hid
 
     // No verified employee environment accompanies this shared internal key.
     // Dispatch fails closed for background work, so discovery must hide it.
+    // `code_map` likewise refuses a caller that resolves to no employee
+    // directory (v1.81 S2: listed ⇒ callable).
     let internal = principal(
         duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID,
         "admin",
@@ -222,9 +224,10 @@ async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hid
         per_agent
             .iter()
             .copied()
-            .filter(|name| !creates_background_work(name))
+            .filter(|name| !creates_background_work(name) && *name != "code_map")
             .collect::<BTreeSet<_>>()
     );
+    assert!(per_agent.contains("code_map"));
 
     // An employee process holding some other scoped key keeps the full list
     // its capabilities allow.
@@ -239,6 +242,75 @@ async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hid
     .await;
     assert!(operator_view.contains("credential_declare"));
     assert_eq!(employee_view, operator_view);
+}
+
+// ── code_map: listed ⇔ the caller resolves to an employee dir (v1.81 S2) ───
+
+const ROLE_MEMBER: &str = "eph-boss-r1-exec-abc123";
+
+/// `boss` (an employee) and its role member's `.ephemeral/<id>` scaffold.
+fn role_member_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    let boss = home.path().join("agents").join("boss");
+    std::fs::create_dir_all(&boss).unwrap();
+    std::fs::write(boss.join("agent.toml"), "[agent]\nname = \"boss\"\n").unwrap();
+    let member = home.path().join("agents/.ephemeral").join(ROLE_MEMBER);
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("agent.toml"),
+        "[agent]\nname = \"member\"\nreports_to = \"boss\"\n",
+    )
+    .unwrap();
+    home
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_role_member_sees_code_map() {
+    let home = role_member_home();
+    // A role member runs in a process the gateway spawned for it.
+    let member = principal(ROLE_MEMBER, "", false);
+    let got = names(&member, home.path(), ROLE_MEMBER, true).await;
+    assert!(got.contains("code_map"), "{got:?}");
+    assert_eq!(
+        crate::mcp_memory_handlers::code_map_caller(home.path(), ROLE_MEMBER, None).as_deref(),
+        Some(ROLE_MEMBER)
+    );
+    // Through the shared internal key with the member in the environment.
+    let internal = duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID;
+    assert_eq!(
+        crate::mcp_memory_handlers::code_map_caller(home.path(), internal, Some(ROLE_MEMBER))
+            .as_deref(),
+        Some(ROLE_MEMBER)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_caller_that_resolves_to_no_employee_dir_does_not_see_code_map() {
+    let home = role_member_home();
+    // A valid id with no `agent.toml`, in an employee process.
+    std::fs::create_dir_all(home.path().join("agents/ghost")).unwrap();
+    for (client, employee_process) in [
+        ("ghost", true),
+        ("ghost", false),
+        // An `eph-` id with no scaffold.
+        ("eph-boss-r1-exec-ffffff", true),
+        ("standalone-x", true),
+    ] {
+        let got = names(&principal(client, "", false), home.path(), client, employee_process).await;
+        assert!(!got.contains("code_map"), "{client} / {employee_process}: {got:?}");
+    }
+    // The predicate itself, independent of the test process's environment.
+    let internal = duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID;
+    for env in [None, Some("ghost"), Some("eph-boss-r1-exec-ffffff"), Some("../boss")] {
+        assert!(
+            crate::mcp_memory_handlers::code_map_caller(home.path(), internal, env).is_none(),
+            "{env:?}"
+        );
+    }
+    assert_eq!(
+        crate::mcp_memory_handlers::code_map_caller(home.path(), internal, Some("boss")).as_deref(),
+        Some("boss")
+    );
 }
 
 // ── Dispatch gate: discoverable ⇔ callable (review 2026-10-07) ─────────────

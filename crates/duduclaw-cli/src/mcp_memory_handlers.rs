@@ -1078,6 +1078,27 @@ pub const CODE_MAP_UNIDENTIFIED: &str = "code_map 只掃描呼叫它的 AI 員�
      code_map scans only the calling AI employee's own directory; this caller is not an \
      identified employee, so it was refused.";
 
+/// The AI employee a `code_map` call from `caller_client_id` acts for, or
+/// `None` when it acts for nobody `code_map` can serve.
+///
+/// [`ai_employee_caller`] (the dispatch arm's identity) narrowed to ids
+/// [`crate::mcp_files::employee_dir`] resolves — exactly the check
+/// [`handle_code_map`] refuses by. `tools/list` lists `code_map` only when
+/// this is `Some`, so "listed ⇒ callable": a process whose
+/// `DUDUCLAW_AGENT_ID` names no employee does not see the tool.
+pub fn code_map_caller(
+    home_dir: &Path,
+    caller_client_id: &str,
+    env_agent_id: Option<&str>,
+) -> Option<String> {
+    ai_employee_caller(
+        caller_client_id,
+        env_agent_id,
+        crate::mcp_namespace::client_is_agent(home_dir, caller_client_id),
+    )
+    .filter(|id| crate::mcp_files::employee_dir(home_dir, id).is_some())
+}
+
 /// One `tool_calls.jsonl` row per refused `code_map`: the REQUESTED root and
 /// the refusal reason only — nothing was read.
 fn audit_code_map_refusal(home_dir: &Path, agent_id: &str, requested_root: &str, reason: &str) {
@@ -1121,12 +1142,15 @@ fn audit_code_map_refusal(home_dir: &Path, agent_id: &str, requested_root: &str,
 /// of — source anywhere on the host. Now:
 ///
 /// - `acting` must be an identified AI employee (`ai_employee_caller` mapped
-///   to an id with an `agents/<id>/agent.toml`); anyone else is refused with
-///   [`CODE_MAP_UNIDENTIFIED`];
+///   to an id [`crate::mcp_files::employee_dir`] resolves: `agents/<id>` with
+///   an `agent.toml`, or a role member's `agents/.ephemeral/<id>` scaffold);
+///   anyone else is refused with [`CODE_MAP_UNIDENTIFIED`]. `tools/list`
+///   lists `code_map` by the same predicate ([`code_map_caller`]);
 /// - `root` is vetted by [`crate::mcp_files::vet_dir`];
-/// - every file is read through [`crate::mcp_files::ContainedTree`]: a
-///   per-component no-follow descriptor walk from the vetted root that refuses
-///   symlinks, mount crossings, non-regular and multiply-linked files.
+/// - the root is opened descriptor-relatively from its trusted allowed root
+///   and every file is read through [`crate::mcp_files::ContainedTree`]: a
+///   per-component no-follow descriptor walk that refuses symlinks, mount
+///   crossings, non-regular and multiply-linked files.
 ///
 /// Every refusal is audited (`tool_calls.jsonl`, `refused = true`) with the
 /// requested root only. The map is rebuilt per call (no cache yet); the scan
@@ -1140,8 +1164,9 @@ pub async fn handle_code_map(params: &Value, home_dir: &Path, acting: Option<&st
         .to_string();
 
     // Fail closed on identity before anything else touches the filesystem.
+    // Same resolver as `code_map_caller` (the `tools/list` predicate).
     let agent_id = match acting {
-        Some(id) if crate::mcp_namespace::client_is_agent(home_dir, id) => id,
+        Some(id) if crate::mcp_files::employee_dir(home_dir, id).is_some() => id,
         _ => {
             audit_code_map_refusal(home_dir, acting.unwrap_or(""), &requested_root, "unidentified_caller");
             return mcp_error(CODE_MAP_UNIDENTIFIED);
@@ -1172,10 +1197,10 @@ pub async fn handle_code_map(params: &Value, home_dir: &Path, acting: Option<&st
         .unwrap_or(15)
         .clamp(1, 100) as usize;
 
-    let cfg = CodeMapConfig::new(root);
+    let cfg = CodeMapConfig::new(root.path().to_path_buf());
     // CPU-bound directory walk + parse: keep it off the async reactor.
     let built = tokio::task::spawn_blocking(move || -> Result<CodeMap, String> {
-        let tree = crate::mcp_files::ContainedTree::open(&cfg.root)
+        let tree = crate::mcp_files::ContainedTree::open(&root)
             .map_err(|e| format!("code_map root could not be opened safely: {e}"))?;
         CodeMap::build_with_reader(&cfg, |_walked, rel, max_bytes| {
             tree.read_to_string(rel, max_bytes as u64).ok()
@@ -1598,6 +1623,72 @@ mod tests {
         .await;
         let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
         assert_eq!(payload["files"][0]["path"], "lib.rs", "{payload}");
+    }
+
+    /// A role member (`eph-…`) is identified through its `.ephemeral/<id>`
+    /// scaffold: no `root` scans that scaffold, a relative root resolves
+    /// under it, and its employee's directory stays outside the fence.
+    #[tokio::test]
+    async fn code_map_serves_a_role_member_from_its_ephemeral_directory() {
+        let home = code_map_home();
+        let id = "eph-coder-r1-exec-abc123";
+        let member = home.path().join("agents/.ephemeral").join(id);
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(member.join("agent.toml"), "[agent]\nname = \"m\"\n").unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn member_symbol_xyz() {}\n").unwrap();
+        std::fs::write(
+            home.path().join("agents/coder/parent.rs"),
+            "pub fn parent_secret_xyz() {}\n",
+        )
+        .unwrap();
+
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "member_symbol_xyz" })),
+            home.path(),
+            Some(id),
+        )
+        .await;
+        assert!(!is_error(&resp), "{resp}");
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert_eq!(payload["files"][0]["path"], "src/lib.rs", "{payload}");
+        assert!(!text_of(&resp).contains("parent_secret_xyz"), "{resp}");
+
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "member_symbol_xyz", "root": "src" })),
+            home.path(),
+            Some(id),
+        )
+        .await;
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert_eq!(payload["files"][0]["path"], "lib.rs", "{payload}");
+
+        // Escapes: the employee's own directory, `agents/`, `..`.
+        for root in [
+            home.path().join("agents/coder").to_str().unwrap().to_string(),
+            home.path().join("agents").to_str().unwrap().to_string(),
+            "../".to_string(),
+        ] {
+            let resp = handle_code_map(
+                &params(serde_json::json!({ "query": "parent_secret_xyz", "root": root })),
+                home.path(),
+                Some(id),
+            )
+            .await;
+            assert!(is_error(&resp), "{root}: {resp}");
+            assert!(!text_of(&resp).contains("parent_secret_xyz("), "{root}: {resp}");
+        }
+        let rows = code_map_audit(home.path());
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|r| r["reason"] == "root_outside_fence"), "{rows:?}");
+
+        // An `eph-` id with no scaffold is not identified.
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "x" })),
+            home.path(),
+            Some("eph-coder-r1-exec-ffffff"),
+        )
+        .await;
+        assert_eq!(text_of(&resp), CODE_MAP_UNIDENTIFIED);
     }
 
     /// Unidentified callers (operator key ⇒ `None`, the bare internal id,

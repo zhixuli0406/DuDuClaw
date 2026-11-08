@@ -526,6 +526,17 @@ pub(crate) async fn visible_tools_in_lane(
     };
     let scoped = duduclaw_gateway::capability_grants::scoped_tools(&agent_dir);
 
+    // v1.81 (S2): `code_map` refuses every caller whose identity does not
+    // resolve to an employee directory (role members included). Listed by
+    // the handler's own predicate — `DUDUCLAW_AGENT_ID` being set is not
+    // enough — so listed ⇒ callable.
+    let code_map_listed = crate::mcp_memory_handlers::code_map_caller(
+        home_dir,
+        &principal.client_id,
+        std::env::var(duduclaw_core::ENV_AGENT_ID).ok().as_deref(),
+    )
+    .is_some();
+
     tools()
         .filter(|t| !matches!(t.name, "meeting_transcribe" | "meeting_transcribe_status" | "meeting_transcribe_cancel" | "meeting_upload_link") || meeting_listed(home_dir, principal))
         .filter(|t| background_allowed || !super::creates_background_work(t.name))
@@ -581,6 +592,7 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| {
             !process_agent_tool_refused(t.name, principal, client_is_agent, employee_process)
         })
+        .filter(|t| t.name != "code_map" || code_map_listed)
         // Discovery only, LAST: neither grants nor authorization are changed.
         // An active scoped task grant always remains discoverable.
         .filter(|t| pruning_mode != duduclaw_core::tool_pruning::Mode::On

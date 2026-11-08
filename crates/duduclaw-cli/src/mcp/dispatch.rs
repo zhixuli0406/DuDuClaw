@@ -282,6 +282,9 @@ pub(crate) async fn handle_tools_call(
         // v1.81 (S1): contained to the acting employee's own roots. Identity
         // follows `ai_employee_caller` (fail closed): the shared internal key
         // without `DUDUCLAW_AGENT_ID` and operator keys are not an employee.
+        // The handler then requires `mcp_files::employee_dir` to resolve it
+        // (role members → `.ephemeral/<id>`) — the `tools/list` predicate
+        // `code_map_caller` is these two steps.
         "code_map" => {
             let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
             let acting = crate::mcp_memory_handlers::ai_employee_caller(
