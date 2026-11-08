@@ -336,13 +336,18 @@ pub fn launcher(arch: Architecture, parent: &RuntimeProfile, parent_digest: Sha2
 /// allows beyond the parent are `prlimit64(0, …)` and the listed `prctl`
 /// options, compiled as argument checks. Installed by the helper child under
 /// F_L immediately before `execveat`; the kernel then enforces F_L ∩ F_H.
+/// HX security fix round: `helper_policy::refused_helper_calls(arch, egress)`
+/// is EPERM first, whatever the signed list says — for an offline helper
+/// (`!egress`) every socket-family call, for every helper the path-based
+/// metadata calls Landlock does not mediate and SysV/POSIX-mq IPC.
 pub fn helper(arch: Architecture, parent: &RuntimeProfile, parent_digest: Sha256Digest, profile: &RuntimeProfile,
-    expected_digest: Sha256Digest, self_only: &[crate::helper_policy::SelfOnlyCall]) -> Result<Filter, FilterError> {
-    use crate::helper_policy::{seccomp_within_parent, SelfOnlyCall};
+    expected_digest: Sha256Digest, self_only: &[crate::helper_policy::SelfOnlyCall], egress: bool) -> Result<Filter, FilterError> {
+    use crate::helper_policy::{refused_helper_calls, seccomp_within_parent, SelfOnlyCall};
     checked_profile(arch, parent, parent_digest)?;
     checked_profile(arch, profile, expected_digest)?;
     if !seccomp_within_parent(arch, parent, profile, self_only) { return Err(FilterError::Policy); }
     let mut filter = Filter::new(arch);
+    for nr in refused_helper_calls(arch, egress) { filter.action(nr, DENY); }
     common_rules(&mut filter, arch, |nr| if profile.allows(nr) { ALLOW } else { DENY });
     for call in self_only {
         match call {
@@ -355,10 +360,14 @@ pub fn helper(arch: Architecture, parent: &RuntimeProfile, parent_digest: Sha256
 }
 
 #[cfg(test)]
+#[path = "seccomp_hxfix_tests.rs"]
+mod hxfix_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     // Interpret the emitted cBPF, rather than testing the policy source table only.
-    fn evaluate(filter: &Filter, arch: u32, nr: u32, args: [u64;6]) -> u32 {
+    pub(super) fn evaluate(filter: &Filter, arch: u32, nr: u32, args: [u64;6]) -> u32 {
         let mut acc = 0;
         let mut pc = 0;
         for _ in 0..4096 {
@@ -488,7 +497,7 @@ mod tests {
     fn f_l(arch: Architecture, parent: &RuntimeProfile) -> Filter { launcher(arch, parent, parent.digest(arch).unwrap()).unwrap() }
     fn f_h(arch: Architecture, profile: &RuntimeProfile, self_only: &[SelfOnlyCall]) -> Result<Filter, FilterError> {
         let parent = parent_profile(arch);
-        helper(arch, &parent, parent.digest(arch).unwrap(), profile, profile.digest(arch).unwrap(), self_only)
+        helper(arch, &parent, parent.digest(arch).unwrap(), profile, profile.digest(arch).unwrap(), self_only, false)
     }
 
     #[test]
@@ -630,8 +639,8 @@ mod tests {
             }
             let parent_digest = parent.digest(arch).unwrap();
             let profile = helper_profile(arch);
-            assert_eq!(helper(arch, &parent, parent_digest, &profile, Sha256Digest([0; 32]), &[]).err(), Some(FilterError::Digest));
-            assert_eq!(helper(arch, &parent, Sha256Digest([0; 32]), &profile, profile.digest(arch).unwrap(), &[]).err(),
+            assert_eq!(helper(arch, &parent, parent_digest, &profile, Sha256Digest([0; 32]), &[], false).err(), Some(FilterError::Digest));
+            assert_eq!(helper(arch, &parent, Sha256Digest([0; 32]), &profile, profile.digest(arch).unwrap(), &[], false).err(),
                 Some(FilterError::Digest));
             // F_H embeds the common refusals and execs nothing but via execveat.
             for nr in denied_syscalls(arch) { assert_eq!(evaluate(&filter, arch.audit(), nr, [0; 6]), DENY); }

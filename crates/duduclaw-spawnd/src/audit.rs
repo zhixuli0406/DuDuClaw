@@ -22,8 +22,65 @@ pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, O
     HelperEnded,
     /// HX4: a `HelperCall` was refused (detail: the wire code).
     HelperRefused,
-    /// HX4: the run's launcher channel or slot cgroups were lost (detail: code).
+    /// HX4: the run's launcher channel or slot cgroups were lost (detail:
+    /// `helper_closed` with the code and the wire/cgroup reason).
     HelperChannelClosed,
+    /// HX security fix round: an accepted `HelperStop` (detail: `helper_call`).
+    HelperStopRequested,
+    /// HX security fix round: an accepted `HelperCancel` (detail: `helper_call`).
+    HelperCancelRequested,
+}
+/// Why a helper call ended root-side (HX security fix round, finding 7c/d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelperEndReason {
+    /// The launcher reported the helper's exit status or signal.
+    LauncherExit,
+    /// The launcher's own timerfd fired and it killed the process group.
+    LauncherTimeout,
+    /// spawnd's watchdog fired (effective timeout + grace) and killed the slot as root.
+    WatchdogKill,
+    /// `HelperCancel` (or an orphaned start) killed the slot.
+    Cancelled,
+    /// The control channel closed while the call was live.
+    ChannelLost,
+    RunEnded,
+    /// The launcher refused or failed the start (`End::StartFailed` reason).
+    StartFailedSlotBusy,
+    StartFailedDraining,
+    StartFailedDescriptors,
+    StartFailedSandbox,
+    StartFailedExec,
+    StartFailedInternal,
+}
+/// Why the launcher control channel closed (finding 7e). Wire variants mirror
+/// `duduclaw_run::helper_wire::WireError`; no frame content is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelperCloseReason {
+    /// EOF: the launcher died or closed its end.
+    Eof,
+    /// `recvmsg` failed.
+    Receive,
+    /// `sendmsg` of a spawnd frame failed.
+    Send,
+    Truncated,
+    ControlTruncated,
+    Ancillary,
+    Descriptors,
+    /// Bad length, magic, kind or field.
+    Malformed,
+    UnknownCall,
+    IllegalState,
+    Rate,
+    /// The launcher sent a fatal `Error` frame.
+    LauncherFatal,
+    /// The channel state was already closed.
+    Closed,
+    /// Too many abandoned calls awaiting late frames.
+    LateFrames,
+    /// A slot cgroup write/readback or drain failed.
+    Cgroup,
 }
 /// Bounded, content-free detail. Never a path, file name, file content or
 /// free-form text: identities and counts only.
@@ -38,8 +95,21 @@ pub enum Detail {
     /// HX4 helper call: spawnd's call id, the signed helper index in the
     /// parent's list, the slot, the input memfd size and, once ended, the
     /// root-determined outcome. No argv, path, input or output content.
+    /// `reason` and `drained` are set on `helper_ended` only (omitted otherwise).
     Helper { call: duduclaw_isolation::ipc::HelperCallId, helper: u8, slot: duduclaw_isolation::ipc::HelperSlot,
-        input_bytes: u64, effective_timeout_ms: Option<u64>, outcome: Option<duduclaw_isolation::ipc::HelperOutcome> },
+        input_bytes: u64, effective_timeout_ms: Option<u64>, outcome: Option<duduclaw_isolation::ipc::HelperOutcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<HelperEndReason>,
+        /// `false`: the slot was not confirmed empty (`populated 0`) after the kill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drained: Option<bool> },
+    /// A refused helper op: the wire code and the `employee_id` the request
+    /// claimed (the record's `employee` is root's record of the run's employee).
+    HelperRefusal { code: duduclaw_isolation::ipc::ErrorCode, claimed_employee: Option<EmployeeId> },
+    /// An accepted per-call `HelperStop`/`HelperCancel`.
+    HelperCall { call: duduclaw_isolation::ipc::HelperCallId },
+    /// The launcher channel closed: the code later calls get, and why.
+    HelperClosed { code: duduclaw_isolation::ipc::ErrorCode, reason: HelperCloseReason },
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -395,7 +465,7 @@ mod tests {
     fn hx4_helper_events_carry_ids_sizes_and_outcome_never_content() {
         use duduclaw_isolation::ipc::{HelperCallId, HelperOutcome, HelperSlot};
         let detail = Detail::Helper { call: HelperCallId::new([7; 16]).unwrap(), helper: 2, slot: HelperSlot::Recording,
-            input_bytes: 12, effective_timeout_ms: None, outcome: Some(HelperOutcome::OomKilled) };
+            input_bytes: 12, effective_timeout_ms: None, outcome: Some(HelperOutcome::OomKilled), reason: None, drained: None };
         let record = Record { at_unix_ms: 1, event: Event::HelperEnded, employee: Some(EmployeeId([1; 16])),
             run: Some(RunId([2; 16])), suppressed: 0, detail: Some(detail.clone()) };
         let value = serde_json::to_value(&record).unwrap();
@@ -413,5 +483,35 @@ mod tests {
         for event in [Event::HelperStarted, Event::HelperRefused, Event::HelperChannelClosed] {
             assert!(serde_json::to_value(event).unwrap().as_str().unwrap().starts_with("helper_"));
         }
+    }
+    #[test]
+    fn hxfix_helper_audit_reasons_claims_and_close_cause() {
+        use duduclaw_isolation::ipc::{ErrorCode, HelperCallId, HelperOutcome, HelperSlot};
+        let call = HelperCallId::new([7; 16]).unwrap();
+        // (c, d) watchdog vs launcher timeout, start-failure cause, undrained slot.
+        let ended = Detail::Helper { call, helper: 1, slot: HelperSlot::Foreground, input_bytes: 3, effective_timeout_ms: None,
+            outcome: Some(HelperOutcome::StartFailed), reason: Some(HelperEndReason::StartFailedSandbox), drained: Some(false) };
+        let value = serde_json::to_value(&ended).unwrap();
+        assert_eq!(value["reason"], "start_failed_sandbox");
+        assert_eq!(value["drained"], false);
+        assert_ne!(serde_json::to_value(HelperEndReason::WatchdogKill).unwrap(), serde_json::to_value(HelperEndReason::LauncherTimeout).unwrap());
+        // Started records keep their HX4 shape (no reason/drained keys).
+        let started = Detail::Helper { call, helper: 1, slot: HelperSlot::Foreground, input_bytes: 3,
+            effective_timeout_ms: Some(10), outcome: None, reason: None, drained: None };
+        let keys = serde_json::to_value(&started).unwrap().as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert!(!keys.iter().any(|key| key == "reason" || key == "drained"), "{keys:?}");
+        // (a) the claim is detail; (e) close reason; (f) per-call request.
+        let records = [(Event::HelperRefused, Detail::HelperRefusal { code: ErrorCode::Unauthorized, claimed_employee: Some(EmployeeId([2; 16])) }),
+            (Event::HelperChannelClosed, Detail::HelperClosed { code: ErrorCode::HelperUnavailable, reason: HelperCloseReason::Rate }),
+            (Event::HelperStopRequested, Detail::HelperCall { call }), (Event::HelperCancelRequested, Detail::HelperCall { call }),
+            (Event::HelperEnded, ended)];
+        for (event, detail) in records {
+            let record = Record { at_unix_ms: 1, event, employee: Some(EmployeeId([1; 16])), run: Some(RunId([2; 16])),
+                suppressed: 0, detail: Some(detail.clone()) };
+            let line = serde_json::to_vec(&record).unwrap();
+            assert!(line.len() < LINE_BYTES);
+            assert_eq!(serde_json::from_slice::<Record>(&line).unwrap().detail, Some(detail));
+        }
+        assert_eq!(serde_json::to_value(Event::HelperStopRequested).unwrap(), "helper_stop_requested");
     }
 }

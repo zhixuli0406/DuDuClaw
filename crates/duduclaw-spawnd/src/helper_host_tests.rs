@@ -4,11 +4,12 @@
 //! work breakdown's "From HX4" note.
 use super::*;
 use std::{collections::BTreeMap, io, os::fd::BorrowedFd};
-use duduclaw_isolation::ids::RunId;
+use duduclaw_isolation::{bounded::Text, ids::RunId};
 use duduclaw_run::helper_wire::{FromLauncher, LauncherError, Receipt, ToLauncher};
 
+/// `stuck`: `cgroup.kill` does not empty the slot (an unkillable/escaping process).
 #[derive(Default)]
-struct Tree { files: BTreeMap<String, String>, log: Vec<String> }
+struct Tree { files: BTreeMap<String, String>, log: Vec<String>, stuck: bool }
 impl Tree {
     fn unit() -> Self {
         let mut tree = Self::default();
@@ -30,7 +31,7 @@ impl CgroupTree for Tree {
         self.log.push(format!("write {path} {value}"));
         let entry = self.files.get_mut(path).ok_or(io::ErrorKind::NotFound)?;
         *entry = value.into();
-        if let Some(slot) = path.strip_suffix("/cgroup.kill") {
+        if let Some(slot) = path.strip_suffix("/cgroup.kill").filter(|_| !self.stuck) {
             self.files.insert(format!("{slot}/cgroup.events"), "populated 0\nfrozen 0\n".into());
         }
         Ok(())
@@ -40,18 +41,35 @@ impl CgroupTree for Tree {
 
 const FG_LIMITS: SlotLimits = SlotLimits { memory_bytes: 1 << 26, tasks: 16, cpu_quota_percent: 50 };
 const REC_LIMITS: SlotLimits = SlotLimits { memory_bytes: 1 << 28, tasks: 64, cpu_quota_percent: 100 };
+fn kind(name: &str) -> RuntimeKind { RuntimeKind::Registered(Text::new(name.into()).unwrap()) }
+/// The identity the run's table was built from: program-v1 at 3, recording at 5.
+fn identity(index: u8) -> (RuntimeKind, ProfileId, Sha256Digest) {
+    if index == 5 { (kind("duduclaw-browser-record-v1"), ProfileId(Sha256Digest([5; 32])), Sha256Digest([50; 32])) }
+    else { (kind("duduclaw-program-v1"), ProfileId(Sha256Digest([3; 32])), Sha256Digest([30; 32])) }
+}
+fn linked(index: u8, slot: HelperSlot, limits: SlotLimits, timeout_ms: u64) -> LinkedHelper {
+    let (runtime, profile, binding_digest) = identity(index);
+    LinkedHelper { index, slot, limits, timeout_ms, runtime, profile, binding_digest }
+}
 fn fixture() -> (HelperEngine<Tree>, OwnedFd) {
     use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
     let (spawnd, launcher) = socketpair(AddressFamily::Unix, SockType::SeqPacket, None, SockFlag::SOCK_CLOEXEC).unwrap();
-    let helpers = vec![LinkedHelper { index: 3, slot: HelperSlot::Foreground, limits: FG_LIMITS, timeout_ms: 60_000 },
-        LinkedHelper { index: 5, slot: HelperSlot::Recording, limits: REC_LIMITS, timeout_ms: 120_000 }];
+    let helpers = vec![linked(3, HelperSlot::Foreground, FG_LIMITS, 60_000), linked(5, HelperSlot::Recording, REC_LIMITS, 120_000)];
     let engine = HelperEngine::new(RunHandle(RunId([1; 16])), HelperLink { control: spawnd, tree: Tree::unit(), helpers })
         .unwrap().with_settle(|| {});
     (engine, launcher)
 }
 fn id(n: u8) -> HelperCallId { HelperCallId::new([n; 16]).unwrap() }
 fn plan(n: u8, index: u8, slot: HelperSlot) -> CallPlan {
-    CallPlan { call: id(n), index, slot, requested_ms: 30_000, input_bytes: 5, run_remaining_ms: 600_000, termination_grace_ms: 15_000 }
+    let (runtime, profile, binding_digest) = identity(index);
+    CallPlan { call: id(n), index, slot, runtime, profile, binding_digest, requested_ms: 30_000, input_bytes: 5,
+        run_remaining_ms: 600_000, termination_grace_ms: 15_000 }
+}
+const RUN: RunHandle = RunHandle(RunId([1; 16]));
+/// (outcome, reason, drained) of every `Ended` audit fact.
+fn ended_audit(engine: &mut HelperEngine<Tree>) -> Vec<(HelperOutcome, HelperEndReason, bool)> {
+    engine.take_audit().into_iter().filter_map(|fact| match fact {
+        HelperAudit::Ended { outcome, reason, drained, .. } => Some((outcome, reason, drained)), _ => None }).collect()
 }
 fn memfd() -> OwnedFd { crate::fds::sealed_plan(b"input").unwrap() }
 /// The launcher end receives exactly one `Start` with its 3 fds.
@@ -274,4 +292,122 @@ fn runtime_exit_reports_draining_and_refuses_start() {
     let _ = launcher_start(&launcher);
     engine.shutdown();
     assert_eq!(engine.take_events(), vec![HelperEvent::Ended { run: RunHandle(RunId([1; 16])), call: id(1), outcome: HelperOutcome::RunEnded }]);
+}
+
+#[test]
+fn hxfix_reloaded_policy_cannot_reuse_index_for_other_helper() {
+    // Finding 1: a reload withdrew program-v1 and put code-map at signed index 3.
+    let (mut engine, launcher) = fixture();
+    let mut swapped = plan(1, 3, HelperSlot::Foreground);
+    swapped.runtime = kind("duduclaw-code-map-v1");
+    swapped.profile = ProfileId(Sha256Digest([7; 32]));
+    swapped.binding_digest = Sha256Digest([70; 32]);
+    assert_eq!(engine.start(0, swapped, memfd()).err(), Some(ErrorCode::RuntimeDenied));
+    // Same kind but an edited binding, or a re-signed profile: refused too.
+    let mut edited = plan(2, 3, HelperSlot::Foreground);
+    edited.binding_digest = Sha256Digest([31; 32]);
+    assert_eq!(engine.start(0, edited, memfd()).err(), Some(ErrorCode::RuntimeDenied));
+    let mut reprofiled = plan(3, 3, HelperSlot::Foreground);
+    reprofiled.profile = ProfileId(Sha256Digest([4; 32]));
+    assert_eq!(engine.start(0, reprofiled, memfd()).err(), Some(ErrorCode::RuntimeDenied));
+    // Nothing reached the launcher, no slot was touched, the channel stays usable.
+    nothing_sent(&launcher);
+    assert!(engine.link.tree.log.is_empty());
+    assert!(!engine.is_closed());
+    let started = engine.start(0, plan(4, 3, HelperSlot::Foreground), memfd()).unwrap();
+    assert_eq!(launcher_start(&launcher).0.call, id(4));
+    drop(started);
+}
+
+#[test]
+fn hxfix_undrained_slot_reports_start_failed_not_exit() {
+    // Finding 5: the launcher claims a clean exit, but cgroup.kill never empties the slot.
+    let (mut engine, launcher) = fixture();
+    let _started = engine.start(0, plan(1, 3, HelperSlot::Foreground), memfd()).unwrap();
+    let _ = launcher_start(&launcher);
+    say(&launcher, FromLauncher::Started { call: id(1) }, &[]);
+    engine.link.tree.stuck = true;
+    engine.link.tree.files.insert("hx/fg/cgroup.events".into(), "populated 1\nfrozen 0\n".into());
+    say(&launcher, FromLauncher::Ended { call: id(1), end: End::Exited(0) }, &[]);
+    engine.service(5);
+    let events = engine.take_events();
+    assert!(events.contains(&HelperEvent::Ended { run: RUN, call: id(1), outcome: HelperOutcome::StartFailed }), "{events:?}");
+    assert!(!events.contains(&HelperEvent::Ended { run: RUN, call: id(1), outcome: HelperOutcome::Exited(0) }));
+    assert!(events.contains(&HelperEvent::Closed { run: RUN, code: ErrorCode::HelperCgroupUnavailable }));
+    assert!(engine.is_closed());
+    let audit = engine.take_audit();
+    assert!(audit.iter().any(|fact| matches!(fact, HelperAudit::Ended { outcome: HelperOutcome::StartFailed,
+        reason: HelperEndReason::LauncherExit, drained: false, .. })), "{audit:?}");
+    assert!(audit.contains(&HelperAudit::Closed { code: ErrorCode::HelperCgroupUnavailable, reason: HelperCloseReason::Cgroup }));
+    assert_eq!(engine.start(6, plan(2, 3, HelperSlot::Foreground), memfd()).err(), Some(ErrorCode::HelperUnavailable));
+}
+
+#[test]
+fn hxfix_draining_revokes_run_mcp_channel() {
+    // Finding 4: runtime exit (rt-runtime empties) and the launcher's Draining both revoke MCP.
+    for via_frame in [false, true] {
+        let pair = crate::channels::RevocablePair::new().unwrap();
+        let (engine, launcher) = fixture();
+        let mut engine = engine.with_mcp_revoker(Some(Arc::new(pair.revoker().unwrap())));
+        let (runtime_end, _gateway_end) = (pair.runtime, pair.gateway);
+        engine.service(0);
+        if via_frame {
+            say(&launcher, FromLauncher::Draining, &[]);
+        } else {
+            engine.link.tree.files.insert(format!("{RT_RUNTIME}/cgroup.events"), "populated 1\nfrozen 0\n".into());
+            engine.service(1);
+            engine.link.tree.files.insert(format!("{RT_RUNTIME}/cgroup.events"), "populated 0\nfrozen 0\n".into());
+        }
+        engine.service(2);
+        assert!(engine.is_draining() && !engine.mcp_revoke_failed(), "{via_frame}");
+        let mut byte = [0u8; 1];
+        assert_eq!(nix::unistd::read(runtime_end.as_raw_fd(), &mut byte).unwrap(), 0, "MCP revoked ({via_frame})");
+    }
+    // Without a revoker (no MCP runtime) draining still works.
+    let (mut engine, launcher) = fixture();
+    say(&launcher, FromLauncher::Draining, &[]);
+    engine.service(1);
+    assert!(engine.is_draining() && !engine.mcp_revoke_failed());
+}
+
+#[test]
+fn hxfix_audit_reasons_watchdog_timeout_start_failure_and_close() {
+    // (c) the launcher's own timerfd vs spawnd's watchdog.
+    let (mut engine, launcher) = fixture();
+    engine.start(0, plan(1, 3, HelperSlot::Foreground), memfd()).unwrap();
+    let _ = launcher_start(&launcher);
+    say(&launcher, FromLauncher::Started { call: id(1) }, &[]);
+    say(&launcher, FromLauncher::Ended { call: id(1), end: End::TimedOut }, &[]);
+    engine.service(5);
+    assert_eq!(ended_audit(&mut engine), vec![(HelperOutcome::TimedOut, HelperEndReason::LauncherTimeout, true)]);
+    let (mut engine, launcher) = fixture();
+    let started = engine.start(0, plan(1, 3, HelperSlot::Foreground), memfd()).unwrap();
+    let _ = launcher_start(&launcher);
+    say(&launcher, FromLauncher::Started { call: id(1) }, &[]);
+    engine.service(started.effective_timeout_ms + WATCHDOG_GRACE_MS);
+    assert_eq!(ended_audit(&mut engine), vec![(HelperOutcome::TimedOut, HelperEndReason::WatchdogKill, true)]);
+    // (d) the StartFailed cause reaches the audit detail.
+    let (mut engine, launcher) = fixture();
+    for (n, cause, reason) in [(1, LauncherError::Descriptors, HelperEndReason::StartFailedDescriptors),
+        (2, LauncherError::Sandbox, HelperEndReason::StartFailedSandbox), (3, LauncherError::Exec, HelperEndReason::StartFailedExec)] {
+        engine.start(u64::from(n), plan(n, 3, HelperSlot::Foreground), memfd()).unwrap();
+        let _ = launcher_start(&launcher);
+        say(&launcher, FromLauncher::Ended { call: id(n), end: End::StartFailed(cause) }, &[]);
+        engine.service(u64::from(n));
+        assert_eq!(ended_audit(&mut engine), vec![(HelperOutcome::StartFailed, reason, true)], "{cause:?}");
+    }
+    // (e) the channel close records the wire reason.
+    for (case, reason) in [(0, HelperCloseReason::Ancillary), (1, HelperCloseReason::Eof), (2, HelperCloseReason::LauncherFatal)] {
+        let (mut engine, launcher) = fixture();
+        match case {
+            0 => {
+                let stray = std::fs::File::open("/dev/null").unwrap();
+                say(&launcher, FromLauncher::Draining, &[stray.as_fd()]);
+            }
+            1 => drop(launcher),
+            _ => say(&launcher, FromLauncher::Error { code: LauncherError::Internal }, &[]),
+        }
+        engine.service(1);
+        assert!(engine.take_audit().contains(&HelperAudit::Closed { code: ErrorCode::HelperUnavailable, reason }), "{reason:?}");
+    }
 }

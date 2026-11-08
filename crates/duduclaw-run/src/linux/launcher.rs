@@ -51,7 +51,7 @@ impl Filters {
         if !seccomp::parent_supports_launcher(arch, &parent.seccomp) { return Err(Error::Seccomp); }
         let launcher = seccomp::launcher(arch, &parent.seccomp, parent.seccomp_digest).map_err(|_| Error::Seccomp)?;
         let helpers = plan.helpers.iter().map(|helper| seccomp::helper(arch, &parent.seccomp, parent.seccomp_digest,
-            &helper.program.seccomp, helper.program.seccomp_digest, &helper.self_only).map_err(|_| Error::Seccomp))
+            &helper.program.seccomp, helper.program.seccomp_digest, &helper.self_only, helper.egress).map_err(|_| Error::Seccomp))
             .collect::<Result<_>>()?;
         Ok(Self { launcher, helpers })
     }

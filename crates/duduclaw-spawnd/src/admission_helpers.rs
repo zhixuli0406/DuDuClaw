@@ -140,11 +140,23 @@ pub(super) struct RunHelpers<I> {
     draining: bool,
     /// Launcher or slot cgroups gone: every new call gets this code.
     closed: Option<ErrorCode>,
+    /// HX security fix round (finding 6): per-call signals the host's mailbox
+    /// refused. Retried every tick until delivered or the host reports the
+    /// call ended root-side (slot killed and drained). One entry per call id
+    /// (a `Cancel` replaces a `Stop`), so bounded by `MAX_CALLS_PER_RUN`.
+    pending_signals: Vec<(HelperCallId, HelperSignal)>,
 }
 impl<I> RunHelpers<I> {
     fn new() -> Self {
         Self { queue: VecDeque::new(), calls: BTreeMap::new(), ended: VecDeque::new(), used: BTreeSet::new(),
-            draining: false, closed: None }
+            draining: false, closed: None, pending_signals: Vec::new() }
+    }
+    /// Record an undelivered signal; `Cancel` always wins over `Stop`.
+    fn hold_signal(&mut self, call: HelperCallId, signal: HelperSignal) {
+        match self.pending_signals.iter_mut().find(|(pending, _)| *pending == call) {
+            Some(entry) => if signal == HelperSignal::Cancel { entry.1 = HelperSignal::Cancel },
+            None => self.pending_signals.push((call, signal)),
+        }
     }
     fn slot_active(&self, slot: HelperSlot) -> bool {
         self.calls.values().any(|call| call.slot == slot && matches!(call.state, CallState::Starting | CallState::Live))
@@ -285,6 +297,8 @@ impl<H: Host> Coordinator<H> {
         match event {
             HelperEvent::Ended { run, call, outcome } => {
                 let Some(helpers) = self.helpers.get_mut(&run.0) else { return };
+                // The slot was killed and drained root-side: nothing left to signal.
+                helpers.pending_signals.retain(|(pending, _)| *pending != call);
                 if helpers.calls.get(&call).is_some_and(|record| record.state == CallState::Live) {
                     helpers.end(call, outcome);
                     self.pump_helpers(run, now);
@@ -313,7 +327,25 @@ impl<H: Host> Coordinator<H> {
                 Some(_) => self.end_helpers(run, true),
             }
             self.poll_orphans(run);
+            self.retry_signals(run);
             self.pump_helpers(run, now);
+        }
+    }
+    /// [finding 6] A per-call signal is never dropped: a refused delivery
+    /// (full worker mailbox) is held and retried here.
+    fn signal_call(&mut self, run: RunHandle, call: HelperCallId, signal: HelperSignal) {
+        if self.host.helper_signal(run, call, signal).is_ok() { return; }
+        if let Some(helpers) = self.helpers.get_mut(&run.0) { helpers.hold_signal(call, signal); }
+    }
+    fn retry_signals(&mut self, run: RunHandle) {
+        let Some(helpers) = self.helpers.get_mut(&run.0) else { return };
+        let pending = std::mem::take(&mut helpers.pending_signals);
+        let mut undelivered = Vec::new();
+        for (call, signal) in pending {
+            if self.host.helper_signal(run, call, signal).is_err() { undelivered.push((call, signal)); }
+        }
+        if let Some(helpers) = self.helpers.get_mut(&run.0) {
+            for (call, signal) in undelivered { helpers.hold_signal(call, signal); }
         }
     }
     /// Starts whose ticket the server abandoned: nobody receives the reply, so
@@ -329,7 +361,7 @@ impl<H: Host> Coordinator<H> {
                 Ok(None) => {}
                 Ok(Some(started)) => {
                     drop(started.pipes);
-                    let _ = self.host.helper_signal(run, call, HelperSignal::Cancel);
+                    self.signal_call(run, call, HelperSignal::Cancel);
                     if let Some(helpers) = self.helpers.get_mut(&run.0) {
                         if let Some(record) = helpers.calls.get_mut(&call) { record.state = CallState::Live; }
                         if helpers.draining { helpers.end(call, HelperOutcome::RunEnded); }
@@ -385,13 +417,13 @@ impl<H: Host> Coordinator<H> {
         let valid = started.effective_timeout_ms != 0 && started.effective_timeout_ms <= requested.min(MAX_HELPER_TIMEOUT_MS);
         if orphaned || cancel || !valid {
             drop(started.pipes);
-            let _ = self.host.helper_signal(run, call, HelperSignal::Cancel);
+            self.signal_call(run, call, HelperSignal::Cancel);
             if let Some(helpers) = self.helpers.get_mut(&run.0) {
                 if orphaned { helpers.end(call, HelperOutcome::RunEnded); }
             }
             return HelperReply::error(if !valid { ErrorCode::Internal } else { ErrorCode::NotReady });
         }
-        if stop { let _ = self.host.helper_signal(run, call, HelperSignal::Stop); }
+        if stop { self.signal_call(run, call, HelperSignal::Stop); }
         HelperReply { response: SpawnResponse::HelperStarted { run, call, effective_timeout_ms: started.effective_timeout_ms },
             pipes: Some(started.pipes) }
     }
@@ -408,16 +440,24 @@ impl<H: Host> Coordinator<H> {
             _ => {}
         }
     }
-    fn helper_record(&self, run: RunHandle, call: HelperCallId, connection: ControlConnectionId) -> Result<(HelperSlot, CallState)> {
-        self.owned(run, connection)?;
+    /// [F7, finding 8] Wait/Stop/Cancel are scoped like `HelperCall`: the
+    /// owning connection AND the run's own employee.
+    fn helper_record(&self, run: RunHandle, employee: EmployeeId, call: HelperCallId, connection: ControlConnectionId)
+        -> Result<(HelperSlot, CallState)> {
+        let entry = self.owned(run, connection)?;
+        if entry.employee != employee { return Err(ErrorCode::Unauthorized); }
         let record = self.helpers.get(&run.0).and_then(|helpers| helpers.calls.get(&call)).ok_or(ErrorCode::NotFound)?;
         Ok((record.slot, record.state))
     }
+    /// The admission entry's employee of `run` (audit attribution only; the
+    /// server logs it instead of a request's claim).
+    pub fn run_employee(&self, run: RunHandle) -> Option<EmployeeId> { self.entries.get(&run.0).map(|entry| entry.employee) }
     /// HX4 `HelperWait`: a bounded poll like `Wait` on wire v1 (no reply is
     /// held). `NotReady` while queued/starting/live; the outcome exactly once.
     /// Allowed in every admission state while the entry exists.
-    pub fn helper_wait(&mut self, run: RunHandle, call: HelperCallId, connection: ControlConnectionId) -> Result<SpawnResponse> {
-        match self.helper_record(run, call, connection)?.1 {
+    pub fn helper_wait(&mut self, run: RunHandle, employee: EmployeeId, call: HelperCallId, connection: ControlConnectionId)
+        -> Result<SpawnResponse> {
+        match self.helper_record(run, employee, call, connection)?.1 {
             CallState::Ended(outcome) => {
                 if let Some(helpers) = self.helpers.get_mut(&run.0) {
                     helpers.calls.remove(&call);
@@ -429,25 +469,30 @@ impl<H: Host> Coordinator<H> {
         }
     }
     /// HX4 `HelperStop` (recording only): flush and exit. Never touches the run.
-    pub fn helper_stop(&mut self, run: RunHandle, call: HelperCallId, connection: ControlConnectionId, now: u64) -> Result<()> {
+    /// A refused delivery is held and retried each tick (finding 6), so the
+    /// stop is accepted once the call is known and live.
+    pub fn helper_stop(&mut self, run: RunHandle, employee: EmployeeId, call: HelperCallId, connection: ControlConnectionId,
+        now: u64) -> Result<()> {
         self.time(now)?;
-        let (slot, state) = self.helper_record(run, call, connection)?;
+        let (slot, state) = self.helper_record(run, employee, call, connection)?;
         if slot != HelperSlot::Recording { return Err(ErrorCode::InvalidRequest); }
         match state {
             CallState::Queued => { self.refuse_call(run, call, ErrorCode::NotReady); Ok(()) }
             CallState::Starting => { self.mark(run, call, |record| record.stop_pending = true); Ok(()) }
-            CallState::Live => self.host.helper_signal(run, call, HelperSignal::Stop),
+            CallState::Live => { self.signal_call(run, call, HelperSignal::Stop); Ok(()) }
             CallState::Ended(_) => Ok(()),
         }
     }
     /// HX4 `HelperCancel`: kill the call's slot cgroup, queued or running
     /// [F8]. Idempotent. The run, its lease, MCP and egress are never touched.
-    pub fn helper_cancel(&mut self, run: RunHandle, call: HelperCallId, connection: ControlConnectionId, now: u64) -> Result<()> {
+    /// A refused delivery is held and retried until the call ends root-side.
+    pub fn helper_cancel(&mut self, run: RunHandle, employee: EmployeeId, call: HelperCallId, connection: ControlConnectionId,
+        now: u64) -> Result<()> {
         self.time(now)?;
-        match self.helper_record(run, call, connection)?.1 {
+        match self.helper_record(run, employee, call, connection)?.1 {
             CallState::Queued => { self.refuse_call(run, call, ErrorCode::NotReady); self.pump_helpers(run, now); Ok(()) }
             CallState::Starting => { self.mark(run, call, |record| record.cancel_pending = true); Ok(()) }
-            CallState::Live => self.host.helper_signal(run, call, HelperSignal::Cancel),
+            CallState::Live => { self.signal_call(run, call, HelperSignal::Cancel); Ok(()) }
             CallState::Ended(_) => Ok(()),
         }
     }

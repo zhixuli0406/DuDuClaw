@@ -216,12 +216,16 @@ answers `helper_unavailable` / `helper_cgroup_unavailable`.
   StderrRead]`); `HelperWait` is a bounded poll (`not_ready`, then
   `HelperEnded` once; `run_ended` for calls live when the run left Running);
   `HelperStop`/`HelperCancel` reach only the call (F8) — no path to the run's
-  revoke/kill.
+  revoke/kill. `HelperWait`/`HelperStop`/`HelperCancel` carry `employee_id`
+  and are checked like `HelperCall` (owning connection and run employee,
+  `unauthorized`); a stop/cancel the worker mailbox refuses is retried every
+  tick until delivered or the call ended root-side (security fix round).
 - **Root engine** (`helper_host.rs`, lifecycle thread, one per Running run):
   the launcher link (control socket end, slot cgroups, run helper table) moves
   out of the trampoline once (`Trampoline::take_helper_link`). Per call: the
   helper is re-derived from the run's own employee (`RootPolicy::derive_helper`,
-  `runtime_denied` if no longer entitled), slot must match the binding, the
+  `runtime_denied` if no longer entitled, or if its kind, profile or binding
+  digest differs from the run table's after a reload), slot must match the binding, the
   memfd is revalidated (tmpfs, seals, size, CLOEXEC; `invalid_fds`), effective
   timeout = min(tool, binding, run deadline − termination grace − 5 s), slot
   must be empty, the signed binding's `memory.max`/`pids.max`/`cpu.max` are

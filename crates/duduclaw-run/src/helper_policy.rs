@@ -71,6 +71,54 @@ pub const PRCTL_SELF_ONLY: [u32; 12] = [PR_SET_PDEATHSIG, 2, 3, PR_SET_DUMPABLE,
 pub fn prlimit64(arch: Architecture) -> u32 { match arch { Architecture::X86_64 => 302, Architecture::Aarch64 => 261 } }
 pub fn prctl(arch: Architecture) -> u32 { match arch { Architecture::X86_64 => 157, Architecture::Aarch64 => 167 } }
 
+/// HX security fix round, finding 2 (§2.4 "offline helper: F_H omits
+/// `socket`"): every call that creates, names or connects a socket. The §2.2
+/// control channel is spawnd's own socketpair, never a helper's, so an offline
+/// helper needs none of them: `socket`, `socketpair`, `connect`, `bind`,
+/// `listen`, `accept`, `accept4`.
+pub fn offline_network_calls(arch: Architecture) -> [u32; 7] {
+    match arch { Architecture::X86_64 => [41, 53, 42, 49, 50, 43, 288], Architecture::Aarch64 => [198, 199, 203, 200, 201, 202, 242] }
+}
+/// Finding 3: path-based metadata writes Landlock does not mediate (chmod,
+/// utimes and xattr writes on every ABI; `truncate` below ABI 3), so a helper
+/// could change files outside its grants (e.g. `/home/employee`) by path:
+/// `truncate`, `chmod`, `fchmodat`, `fchmodat2`, `utime`, `utimes`,
+/// `utimensat`, `futimesat`, `setxattr`, `lsetxattr`, `removexattr`,
+/// `lremovexattr`, `setxattrat`, `removexattrat` (asm-generic has no `chmod`,
+/// `utime`, `utimes`, `futimesat`). The fd forms (`ftruncate`, `fchmod`,
+/// `fsetxattr`, `fremovexattr`) stay allowed: they act only on a descriptor
+/// the helper's Landlock already let it open, and every employee-owned file a
+/// helper can open lies inside one of its RW grants. `utimensat` is refused
+/// in every form, including `futimens` (`utimensat(fd, NULL, …)`).
+pub fn landlock_uncovered_calls(arch: Architecture) -> &'static [u32] {
+    match arch {
+        Architecture::X86_64 => &[76, 90, 268, 452, 132, 235, 280, 261, 188, 189, 197, 198, 463, 466],
+        Architecture::Aarch64 => &[45, 53, 452, 88, 5, 6, 14, 15, 463, 466],
+    }
+}
+/// Finding 4: IPC-namespace objects (shared with the runtime) that Landlock
+/// does not scope: SysV shm/sem/msg and POSIX message queues.
+pub fn ipc_namespace_calls(arch: Architecture) -> [u32; 18] {
+    match arch {
+        Architecture::X86_64 => [29, 30, 31, 67, 64, 65, 66, 220, 68, 69, 70, 71, 240, 241, 242, 243, 244, 245],
+        Architecture::Aarch64 => [194, 196, 195, 197, 190, 193, 191, 192, 186, 189, 188, 187, 180, 181, 182, 183, 184, 185],
+    }
+}
+/// The calls no F_H may hold (publication check) and that the trampoline's
+/// F_H denies with EPERM before anything else: findings 3 and 4 always, the
+/// socket family too for an offline (`!egress`) helper.
+pub fn refused_helper_calls(arch: Architecture, egress: bool) -> Vec<u32> {
+    let mut calls = landlock_uncovered_calls(arch).to_vec();
+    calls.extend(ipc_namespace_calls(arch));
+    if !egress { calls.extend(offline_network_calls(arch)); }
+    calls
+}
+/// Publication form of [`refused_helper_calls`]: the first refused call the
+/// signed flat F_H allowlist names, if any.
+pub fn first_refused_helper_call(arch: Architecture, helper: &RuntimeProfile, egress: bool) -> Option<u32> {
+    refused_helper_calls(arch, egress).into_iter().find(|nr| helper.allows(*nr))
+}
+
 /// Check 2 [F3]: the flat helper allowlist is a subset of the parent's, and every
 /// self-only exception is well formed and not also granted unconstrained.
 pub fn seccomp_within_parent(arch: Architecture, parent: &RuntimeProfile, helper: &RuntimeProfile,
@@ -278,5 +326,51 @@ mod tests {
         }
         assert!(!seccomp_within_parent(arch, &parent, &profile(&[231, 322]),
             &[SelfOnlyCall::Prlimit64SelfOnly, SelfOnlyCall::Prlimit64SelfOnly]));
+    }
+    #[test]
+    fn hxfix_refused_helper_call_tables() {
+        for arch in [Architecture::X86_64, Architecture::Aarch64] {
+            let offline = refused_helper_calls(arch, false);
+            let egress = refused_helper_calls(arch, true);
+            let mut sorted = offline.clone(); sorted.sort_unstable(); sorted.dedup();
+            assert_eq!(sorted.len(), offline.len(), "{arch:?} duplicate refused call");
+            // Socket family only for offline helpers; metadata and IPC always.
+            for nr in offline_network_calls(arch) { assert!(offline.contains(&nr) && !egress.contains(&nr), "{nr}"); }
+            for nr in landlock_uncovered_calls(arch).iter().chain(ipc_namespace_calls(arch).iter()) {
+                assert!(offline.contains(nr) && egress.contains(nr), "{nr}");
+            }
+            // The fd forms and the calls every helper needs are never refused.
+            let keep: [u32; 8] = match arch {
+                Architecture::X86_64 => [77 /* ftruncate */, 91 /* fchmod */, 190 /* fsetxattr */, 199 /* fremovexattr */,
+                    0, 1, 322, 231],
+                Architecture::Aarch64 => [46, 52, 7, 16, 63, 64, 281, 94],
+            };
+            for nr in keep { assert!(!offline.contains(&nr), "{arch:?} {nr}"); }
+            assert_eq!(first_refused_helper_call(arch, &profile(&keep), false), None);
+            let socket = offline_network_calls(arch)[0];
+            assert_eq!(first_refused_helper_call(arch, &profile(&[socket]), false), Some(socket));
+            assert_eq!(first_refused_helper_call(arch, &profile(&[socket]), true), None);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hxfix_refused_helper_calls_match_native_uapi() {
+        let arch = Architecture::native().unwrap();
+        let network = [libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind, libc::SYS_listen,
+            libc::SYS_accept, libc::SYS_accept4];
+        assert_eq!(offline_network_calls(arch), network.map(|nr| nr as u32));
+        #[cfg(target_arch = "x86_64")]
+        let metadata = vec![libc::SYS_truncate, libc::SYS_chmod, libc::SYS_fchmodat, 452, libc::SYS_utime, libc::SYS_utimes,
+            libc::SYS_utimensat, libc::SYS_futimesat, libc::SYS_setxattr, libc::SYS_lsetxattr, libc::SYS_removexattr,
+            libc::SYS_lremovexattr, 463, 466];
+        #[cfg(not(target_arch = "x86_64"))]
+        let metadata = vec![libc::SYS_truncate, libc::SYS_fchmodat, 452, libc::SYS_utimensat, libc::SYS_setxattr,
+            libc::SYS_lsetxattr, libc::SYS_removexattr, libc::SYS_lremovexattr, 463, 466];
+        assert_eq!(landlock_uncovered_calls(arch), metadata.into_iter().map(|nr| nr as u32).collect::<Vec<_>>().as_slice());
+        let ipc = [libc::SYS_shmget, libc::SYS_shmat, libc::SYS_shmctl, libc::SYS_shmdt, libc::SYS_semget, libc::SYS_semop,
+            libc::SYS_semctl, libc::SYS_semtimedop, libc::SYS_msgget, libc::SYS_msgsnd, libc::SYS_msgrcv, libc::SYS_msgctl,
+            libc::SYS_mq_open, libc::SYS_mq_unlink, libc::SYS_mq_timedsend, libc::SYS_mq_timedreceive, libc::SYS_mq_notify,
+            libc::SYS_mq_getsetattr];
+        assert_eq!(ipc_namespace_calls(arch), ipc.map(|nr| nr as u32));
     }
 }

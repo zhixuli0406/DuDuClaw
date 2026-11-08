@@ -99,7 +99,7 @@ struct Pending {
     /// spawnd's end of the per-run launcher control socketpair (§2.2).
     control: Option<OwnedFd>,
     /// The run's helper table in position order (`Start.helper` is a position
-    /// in this list): signed index, slot and the binding's limits/timeout.
+    /// in this list): signed index, slot, the binding's limits/timeout and identity.
     helper_table: Vec<crate::helper_host::LinkedHelper>,
     /// Launcher rights already in `manifest` (cgroup fds are added at bind).
     launcher_rights: usize,
@@ -139,9 +139,13 @@ fn launcher_plan(profile: LauncherProfile, control: OwnedFd)
             _ => return Err(unavailable()),
         };
         let binding = helper.binding;
-        // HX4 writes these signed limits into the slot before every Start.
+        // HX4 writes these signed limits into the slot before every Start; the
+        // identity (kind, profile, binding digest) pins what this table's exec
+        // fds were built from, so a later policy cannot reuse the index (finding 1).
+        let binding_digest = crate::helper_policy::binding_digest(&binding).ok_or_else(unavailable)?;
         indices.push(crate::helper_host::LinkedHelper { index: helper.index, slot: binding.slot,
-            limits: crate::helper_cgroup::SlotLimits::from_binding(&binding), timeout_ms: binding.timeout_ms });
+            limits: crate::helper_cgroup::SlotLimits::from_binding(&binding), timeout_ms: binding.timeout_ms,
+            runtime: helper.runtime.runtime.clone(), profile: binding.profile, binding_digest });
         helpers.push(HelperProgram {
             program: Program { identity: checked(fd::observe(helper.executable.fd.as_raw_fd()))?.identity, script,
                 argv: argv.into_iter().map(|arg| checked(CString::new(arg))).collect::<Result<_>>()?,
