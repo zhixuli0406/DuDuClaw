@@ -185,6 +185,10 @@ fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut
                 }
                 return Ok((SpawnResponse::Io { run, delivery }, descriptors));
             }
+            // Package H (D-H1) ops: protocol only (H1). The root work broker and
+            // anchor land in H2/H3 and are wired in H4; until then fail closed.
+            SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. } =>
+                return Err(ErrorCode::WorkspaceBrokerUnavailable),
         };
         Ok((response, vec![]))
     })();

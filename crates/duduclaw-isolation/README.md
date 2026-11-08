@@ -126,6 +126,36 @@ A is part of the trusted gateway, so this is not independent kernel byte
 telemetry. An older peer rejects the unknown operation; components must be
 upgraded together. No compatibility fallback disables the idle timeout.
 
+## Package H work broker ops (H1) and opcode registry
+
+`ipc::Opcode` gives every `SpawnRequest` variant a stable number. The JSON
+wire still carries only the `op` name; the number is for audit/telemetry and
+collision checks, and `SpawnRequest::opcode` is exhaustive so an unregistered
+variant does not compile. Ranges, never reused: `0x0001–0x00FF` core run
+lifecycle (`reserve_run` 0x01 … `take_io` 0x08), `0x0100–0x01FF` Package H
+(`open_work_file` 0x0101, `work_anchor` 0x0102), `0x0200–0x02FF` HX in-run
+helpers, reserved in `HX_RESERVED_OPS` (`helper_call` 0x0201, `helper_wait`
+0x0202, `helper_stop` 0x0203, `helper_cancel` 0x0204). HX also owns the result
+tags `helper_started`/`helper_ended` and the error codes `helper_busy`,
+`helper_unavailable`, `run_time_exhausted`, `helper_cgroup_unavailable`.
+
+- `OpenWorkFile { run, employee_id, path: WorkPath, mode: read_only }`, no fds →
+  `WorkFile { run, file: { size, inode, device } }` + exactly one `WorkFileRead`
+  fd (regular file, O_RDONLY, FD_CLOEXEC). `WorkPath` is relative to the live
+  run's attached `employee-work` mount: non-empty, ≤ 4096 bytes, ≤ 64 components
+  of ≤ 255 bytes, no `.`/`..`/empty component, no leading `/`, NUL, `\` or ASCII
+  control byte, first component not `.forks`; checked on construction and on
+  decode. `size` ≤ 16 MiB, `inode`/`device` non-zero.
+- `WorkAnchor { employee_id }` → `WorkAnchor { employee_id, anchor: { device, inode } }`,
+  no fds.
+- New `ErrorCode`s: `work_file_not_found`, `work_file_refused`,
+  `work_file_too_large`, `workspace_broker_unavailable`.
+- `check_work_reply(request, response, received_fds)` pairs a reply with its
+  request (run/employee) and checks the fd count. Callers still `fstat` the fd.
+
+Protocol stays v1 (additive variants); gateway and spawnd ship together. Until
+H2–H4 land, spawnd answers both ops with `workspace_broker_unavailable`.
+
 ## License
 
 Apache-2.0, as declared by the workspace.
