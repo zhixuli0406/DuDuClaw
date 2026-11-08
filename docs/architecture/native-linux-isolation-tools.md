@@ -27,9 +27,10 @@ Existing scope, allowed/denied tools, permissions, approvals, record/audience, e
 | Existing Admin/operator gate | The original employee policy decides access. |
 | HostAuthority | A run cannot control or observe the host desktop, devices, power, network configuration or local model services. |
 | Missing adapter | Boot fails; this is unfinished parity, not an intentional tool restriction. |
+| ProposalRequired | v1.81 protected mode: `create_agent` is refused; a protected employee exists only through an approved Employee proposal and its root allocation. |
 | ForkNextRelease | v1.80.0 protected TEAM only: `fork_run`, `merge_or_select`, `terminate_branch` are deferred until fresh child capability/account/budget authority and immutable result apply are complete. Non-protected installations retain their existing behavior. |
 
-`Refused: HostAuthority` and `Refused: ForkNextRelease` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
+`Refused: HostAuthority`, `Refused: ProposalRequired` and `Refused: ForkNextRelease` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
 
 A readiness excludes exactly the three deferred mutations and requires all five signed helper/control producers plus the three host fork readers. An absent or changed signed helper publication still blocks readiness. This does not enable the other composite components, claim native/provider acceptance, or remove any of the original 22 A tools from the inventory.
 
@@ -89,7 +90,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `os_display_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_audio_get` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_audio_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
-| `create_agent` | Resource → AuthorizedToolCall → original live employee handler |
+| `create_agent` | Refused: ProposalRequired — protected employees are created only through an approved Employee proposal. |
 | `list_agents` | Resource → AuthorizedToolCall → original live employee handler |
 | `create_task` | Host authenticated target queue admission; fresh target run authority required |
 | `check_responses` | Resource → AuthorizedToolCall → original live employee handler |

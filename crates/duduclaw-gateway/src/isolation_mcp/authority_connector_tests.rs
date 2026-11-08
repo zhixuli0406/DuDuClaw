@@ -5,7 +5,7 @@
 //! so, the product-home switch or the details reader are fixtures.
 use super::*;
 use std::sync::atomic::AtomicBool;
-use crate::isolation_connector_boot::{DetailPin, ProvisionedDetail};
+use crate::isolation_connector_boot::{DetailLookup, DetailPin};
 use crate::isolation_connector_details::{AccountDetailRecord, DetailReference};
 
 const TEAM: &str = "team";
@@ -25,7 +25,7 @@ impl ProductHome for BrokenProduct {
 /// Details reader returning a fixed pin (or an unreadable store).
 struct Pinned { pin: Option<DetailPin>, broken: bool }
 impl ConnectorAccountDetails for Pinned {
-    fn detail(&self, _: &Route) -> Result<Option<ProvisionedDetail>, VerificationError> { Err(VerificationError::Invalid) }
+    fn detail(&self, _: &Route, _: EmployeeId, _: &str) -> Result<DetailLookup, VerificationError> { Err(VerificationError::Invalid) }
     fn current_pin(&self, _: &AccountId) -> Result<Option<DetailPin>, VerificationError> {
         if self.broken { return Err(VerificationError::Unavailable); }
         Ok(self.pin.clone())
