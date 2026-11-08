@@ -27,6 +27,13 @@ def payload(version=VERSION):
     return f"#!/bin/sh\nprintf 'duduclaw {version}\\n'\n".encode()
 
 
+def _reg(name, mode=0o644):
+    entry = zipfile.ZipInfo(name)
+    entry.create_system = 3
+    entry.external_attr = (0o100000 | mode) << 16
+    return entry
+
+
 def info_plist(identifier='ai.duduclaw.gateway', version=VERSION, executable='duduclaw'):
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -102,10 +109,8 @@ class InstallTests(unittest.TestCase):
         fixture = root / 'fixtures'
         fixture.mkdir()
         with zipfile.ZipFile(fixture / 'app.zip', 'w') as z:
-            entry = zipfile.ZipInfo(EXE)
-            entry.external_attr = 0o100755 << 16
-            z.writestr(entry, payload())
-            z.writestr(PLIST, info_plist())
+            z.writestr(_reg(EXE, 0o755), payload())
+            z.writestr(_reg(PLIST), info_plist())
         with tarfile.open(fixture / 'bare.tar.gz', 'w:gz') as tar:
             entry = tarfile.TarInfo('duduclaw')
             entry.size = len(payload())
