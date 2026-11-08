@@ -256,6 +256,66 @@ impl AgentOdooConfig {
     pub fn permits_model(&self, model: &str) -> bool {
         self.allowed_models.is_empty() || self.allowed_models.iter().any(|m| m == model)
     }
+
+    /// RM-120: explicit grant for the generic `odoo_create` / `odoo_write`
+    /// tools. Unlike [`Self::permits`] / [`Self::permits_model`], an empty
+    /// list grants nothing: `allowed_models` must name `model` exactly (no
+    /// wildcard) and `allowed_actions` must hold the bare `verb` or the
+    /// qualified `verb:model` token, compared exactly.
+    pub fn grants_explicitly(&self, verb: &str, model: &str) -> bool {
+        // A name the dispatch gate would refuse as invalid never grants, so
+        // `grants_explicitly_any` cannot list a tool through e.g. `"*"`.
+        crate::schema::valid_model_name(model)
+            && self.allowed_models.iter().any(|m| m == model)
+            && self.allowed_actions.iter().any(|tok| {
+                tok == verb || tok.split_once(':').is_some_and(|(v, m)| v == verb && m == model)
+            })
+    }
+
+    /// Whether [`Self::grants_explicitly`] holds for at least one model in
+    /// `allowed_models`. The `tools/list` filter uses this, so a tool is
+    /// listed exactly when some call to it could pass the grant gate.
+    pub fn grants_explicitly_any(&self, verb: &str) -> bool {
+        self.allowed_models.iter().any(|m| self.grants_explicitly(verb, m))
+    }
+}
+
+#[cfg(test)]
+mod explicit_grant_tests {
+    use super::*;
+
+    #[test]
+    fn empty_lists_grant_nothing() {
+        let cfg = AgentOdooConfig::default();
+        assert!(!cfg.grants_explicitly("create", "crm.lead"));
+        assert!(!cfg.grants_explicitly_any("create"));
+        let models_only = AgentOdooConfig { allowed_models: vec!["crm.lead".into()], ..Default::default() };
+        assert!(!models_only.grants_explicitly("create", "crm.lead"));
+        let actions_only = AgentOdooConfig { allowed_actions: vec!["create".into()], ..Default::default() };
+        assert!(!actions_only.grants_explicitly("create", "crm.lead"));
+        assert!(!actions_only.grants_explicitly_any("create"));
+    }
+
+    #[test]
+    fn exact_model_and_verb_required() {
+        let cfg = AgentOdooConfig {
+            allowed_models: vec!["crm.lead".into(), "*".into()],
+            allowed_actions: vec!["create".into(), "write:sale.order".into(), "write:*".into()],
+            ..Default::default()
+        };
+        assert!(cfg.grants_explicitly("create", "crm.lead"));
+        assert!(!cfg.grants_explicitly("create", "sale.order"), "'*' is not a wildcard");
+        assert!(!cfg.grants_explicitly("write", "crm.lead"), "qualified write names another model");
+        assert!(cfg.grants_explicitly_any("create"));
+        assert!(!cfg.grants_explicitly_any("write"));
+        let qualified = AgentOdooConfig {
+            allowed_models: vec!["sale.order".into()],
+            allowed_actions: vec!["write:sale.order".into()],
+            ..Default::default()
+        };
+        assert!(qualified.grants_explicitly("write", "sale.order"));
+        assert!(!qualified.grants_explicitly("create", "sale.order"));
+    }
 }
 
 /// Resolves `(global, per-agent)` into the right configuration to hand to

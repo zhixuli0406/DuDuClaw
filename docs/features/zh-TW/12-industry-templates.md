@@ -148,16 +148,16 @@ Agent：「已建立銷售訂單 SO-2024-0042，客戶 ABC。
         Widget X 10 個，合計：$1,500。」
 ```
 
-### 可用操作（18 個 MCP 工具）
+### 可用操作（20 個 MCP 工具）
 
-橋接提供以下工具（`crates/duduclaw-cli/src/mcp/tools_def/odoo.rs`）：
+橋接提供以下工具（`crates/duduclaw-core/src/mcp_tool_defs/odoo.rs`）：
 
 - **連線**：`odoo_connect`、`odoo_status`
 - **CRM**：`odoo_crm_leads`（列出潛客）、`odoo_crm_create_lead`、`odoo_crm_update_stage`
 - **銷售**：`odoo_sale_orders`（列出訂單）、`odoo_sale_create_quotation`、`odoo_sale_confirm`
 - **庫存**：`odoo_inventory_products`（搜尋產品）、`odoo_inventory_check`（庫存水位）
 - **會計**：`odoo_invoice_list`、`odoo_payment_status`
-- **通用**：`odoo_search`（搜尋任一模型）、`odoo_execute`（呼叫模型方法）、`odoo_report`、`odoo_partner_search`、`odoo_schema_fields`、`odoo_schema_overview`
+- **通用**：`odoo_search`（搜尋任一模型）、`odoo_execute`（呼叫模型方法）、`odoo_report`、`odoo_partner_search`、`odoo_schema_fields`、`odoo_schema_overview`、`odoo_create`／`odoo_write`（在明確授權的資料表新增或修改紀錄，v1.81.0）
 
 ### 結構掃描與欄位相容
 
@@ -184,6 +184,12 @@ Odoo 升級或客製後，管理員可以在 Odoo 頁按「**重新掃描 Odoo �
 `allowed_models`、`allowed_actions` 空清單代表不增加員工限制。功能模組關閉、通用工具的內建封鎖清單、MCP scope／工具白名單及 Odoo 自己的 ACL 仍會拒絕。查 `res.partner` 這類預設封鎖模型的業務資料，需要管理員在儀表板選取標示「敏感」的資料表並確認，畫面才會自動加入 `unblock_models`；直接編輯設定檔時，只加入 `allowed_models` 不會解除封鎖。移除最後一個資料表選取或動作規則時，也會移除畫面管理的例外。「查詢與讀取」同時儲存 `read`、`search`；只有其中一個動詞的舊規則會標示「僅部分」，儲存時補齊。員工未設定 `unblock_models` 時會沿用整體清單，只覆寫帳號或金鑰也一樣。明確設定空清單代表不解除任何預設封鎖；明確設定清單則取代整體值。員工編輯頁會顯示目前生效的封鎖項目，並標示是否沿用整體設定。專用 `odoo_partner_search` 維持固定的安全欄位範圍。
 
 動作編輯器提供 `read`／`search`（查詢與讀取）、`create`（新增）、`write`（修改）、`unlink`（刪除）、`action`（按鈕動作）及 `execute`（其他方法）。通用 `odoo_execute` 呼叫的按鈕動作涵蓋確認、驗證、封存等 `action_*`、`button_*`、`toggle_*` 方法，其餘方法使用 `execute`。所有資料表用 `action`，指定資料表用 `action:sale.order`。兩種方法都以修改權限作為提示，實際操作仍由 Odoo 檢查。
+
+### 通用新增與修改：只認明確授權（v1.81.0）
+
+`odoo_create` 與 `odoo_write` 可以在任意資料表新增或修改紀錄，但和其他 Odoo 工具不同，採用**明確授權規則**：員工必須有自己的 Odoo 設定，資料表必須在「資料表」勾選（`allowed_models` 寫出完整名稱），且有一條規則給該資料表「新增」或「修改」（`allowed_actions` 有 `create`／`write`，或 `create:<model>`／`write:<model>`）。沒有自己的設定、清單留空或寫 `*` 都不算授權；在授權任何資料表之前，員工連這兩個工具都看不到。上面「空清單代表不限制」的規則仍適用於其他所有 Odoo 工具，`odoo_crm_create_lead`、`odoo_sale_create_quotation` 等工具的用法完全不變。
+
+通過授權的呼叫仍要經過功能模組開關、封鎖清單（`ir.model` 等系統中繼資料表永遠不能寫入，回覆「這項功能不提供」）、結構快照記錄的 Odoo 帳號新增／修改權限（未知視同不允許），以及欄位檢查：每個欄位都必須是已掃描模型中有儲存且非唯讀的欄位，`values` 上限 64 KiB，x2many 清單只能新增（0）、修改（1）、連結（4）或設定（6），刪除、解除連結或清空（2、3、5）一律拒絕。所有工具都不提供刪除紀錄。這條連線的背景結構準備完成前，呼叫會請員工稍候。
 
 DuDuClaw 的拒絕訊息會指出是哪一道關卡與對應設定。唯讀 SQL 連接器的 `allowed_tables` 語義不同：必須非空，儲存 RPC 會拒絕空清單，不能套用 Odoo 模型白名單的解讀。
 

@@ -9749,6 +9749,7 @@
   "odoo.permissions.modelsUnrestricted": "未選択の場合、テーブルの範囲は制限しません。機密テーブルは既定でブロックされます。",
   "odoo.permissions.actionsUnrestricted": "操作の設定が空の場合、操作は制限しません。テーブル制限と機密データ保護は引き続き適用されます。",
   "odoo.permissions.intersection": "アクセスにはテーブル範囲と操作ルールの両方を満たす必要があります。",
+  "odoo.permissions.genericWriteRule": "汎用の作成・更新（任意のテーブル）には明示的な許可が必要です。「テーブル」で対象を選び、ルールで「作成」または「更新」を付けてください。未設定では許可されません。組み込みのリード・見積ツールには影響しません。",
   "odoo.permissions.table": "テーブル",
   "odoo.permissions.allTables": "すべてのテーブル",
   "odoo.permissions.read": "検索・読み取り",

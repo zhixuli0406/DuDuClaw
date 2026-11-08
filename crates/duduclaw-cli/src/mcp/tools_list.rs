@@ -430,6 +430,14 @@ pub(crate) async fn visible_tools_in_lane(
     let allow_responsibilities = gated_caller
         && !member_invalid
         && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
+    // RM-120: generic `odoo_create` / `odoo_write` need an explicit grant in
+    // the employee's own Odoo settings. The Odoo handler acts for
+    // `default_agent`, so the same agent and the same predicate
+    // (`generic_write_grant` over `allowed_models`) decide the listing.
+    let allow_odoo_create =
+        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_create");
+    let allow_odoo_write =
+        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_write");
 
     // RFC-26: `[fork] enabled` is opt-in per agent and `mcp_fork`'s handlers
     // refuse every fork tool without it. Read through the same shared typed
@@ -556,6 +564,8 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
+        .filter(|t| t.name != "odoo_create" || allow_odoo_create)
+        .filter(|t| t.name != "odoo_write" || allow_odoo_write)
         // O7: PORTICO scoped tools without an active grant.
         .filter(|t| {
             (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))

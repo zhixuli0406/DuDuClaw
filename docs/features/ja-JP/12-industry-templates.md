@@ -148,16 +148,16 @@ Bridgeが結果を返却（注文番号、合計金額）
                Widget X 10個、合計：$1,500。」
 ```
 
-### 利用可能な操作（18 MCPツール）
+### 利用可能な操作（20 MCPツール）
 
-ブリッジは次のツールを公開します（`crates/duduclaw-cli/src/mcp/tools_def/odoo.rs`）：
+ブリッジは次のツールを公開します（`crates/duduclaw-core/src/mcp_tool_defs/odoo.rs`）：
 
 - **接続**：`odoo_connect`、`odoo_status`
 - **CRM**：`odoo_crm_leads`（リード一覧）、`odoo_crm_create_lead`、`odoo_crm_update_stage`
 - **販売**：`odoo_sale_orders`（注文一覧）、`odoo_sale_create_quotation`、`odoo_sale_confirm`
 - **在庫**：`odoo_inventory_products`（製品検索）、`odoo_inventory_check`（在庫レベル）
 - **会計**：`odoo_invoice_list`、`odoo_payment_status`
-- **汎用**：`odoo_search`（任意モデルの検索）、`odoo_execute`（モデルメソッドの呼び出し）、`odoo_report`、`odoo_partner_search`、`odoo_schema_fields`、`odoo_schema_overview`
+- **汎用**：`odoo_search`（任意モデルの検索）、`odoo_execute`（モデルメソッドの呼び出し）、`odoo_report`、`odoo_partner_search`、`odoo_schema_fields`、`odoo_schema_overview`、`odoo_create`／`odoo_write`（明示的に許可されたテーブルでのレコード作成・更新、v1.81.0）
 
 ### 構造スキャンとフィールドの互換性
 
@@ -184,6 +184,12 @@ Odoo のアップグレードやカスタマイズ後、管理者は Odoo ペー
 空の `allowed_models` / `allowed_actions` は社員側の追加制限なしを意味します。無効な機能モジュール、汎用ツールの組み込みブロックリスト、MCP scope／ツール許可リスト、Odoo 自体の ACL は引き続き拒否できます。`res.partner` などの業務レコードへの汎用アクセスには、管理者がダッシュボードで「機密」テーブルの選択を確認する必要があり、確認後に `unblock_models` へ自動追加されます。設定ファイルの `allowed_models` に追加するだけでは解除されません。最後の選択または操作ルールを削除すると例外も削除されます。「検索と読み取り」は `read` と `search` の両方を保存し、片方だけの旧ルールは一部のみと表示して保存時に補完します。社員の `unblock_models` が未設定なら、ユーザー名や認証情報だけを上書きしても全体設定を継承します。明示的な空リストは既定のブロックを解除せず、明示的なリストは全体設定を置き換えます。社員の編集画面には現在有効なブロック項目と継承の有無が表示されます。専用の `odoo_partner_search` は固定の安全なフィールド範囲を保ちます。
 
 操作エディターは `read`／`search`（検索・読み取り）、`create`（作成）、`write`（更新）、`unlink`（削除）、`action`（ボタン操作）、`execute`（その他のメソッド）を提供します。汎用 `odoo_execute` 呼び出しでは、ボタン操作は確認・検証・アーカイブなどの `action_*`・`button_*`・`toggle_*` メソッド、それ以外は `execute` に対応します。全テーブルには `action`、個別テーブルには `action:sale.order` を指定します。両方とも更新権限を目安とし、実際の操作は Odoo が検証します。
+
+### 汎用の作成と更新：明示的な許可のみ（v1.81.0）
+
+`odoo_create` と `odoo_write` は任意のテーブルでレコードを作成・更新できますが、他の Odoo ツールと違い**明示的な許可のルール**に従います。社員に自分の Odoo 設定があり、「テーブル」でそのテーブルを選び（`allowed_models` に完全一致の名前）、ルールでそのテーブルに「作成」または「更新」を付ける（`allowed_actions` に `create`／`write`、または `create:<model>`／`write:<model>`）必要があります。自分の設定がない、リストが空、`*` のいずれも許可にならず、どのテーブルも許可されるまで社員にはツール自体が表示されません。上記の「空なら制限しない」ルールは他のすべての Odoo ツールに引き続き適用され、`odoo_crm_create_lead`、`odoo_sale_create_quotation` などの使い方は変わりません。
+
+許可された呼び出しも、機能モジュールのスイッチ、ブロックリスト（`ir.model` などのシステムメタデータテーブルは書き込めず「この機能は提供していません」と返します）、スキーマスナップショットにある Odoo アカウントの作成／更新権限（不明は許可なしとして扱います）、フィールドの確認を通ります。各キーはスキャン済みモデルの保存される読み取り専用でないフィールドである必要があり、`values` は 64 KiB まで、x2many のリストは作成（0）・更新（1）・リンク（4）・設定（6）のみで、削除・リンク解除・全解除（2、3、5）は拒否します。レコードの削除はどのツールでも提供しません。その接続のバックグラウンド構造準備が終わるまでは、待つように返します。
 
 DuDuClaw の拒否メッセージは該当するゲートと設定を示します。別の読み取り専用 SQL コネクターでは `allowed_tables` が必須で、空の一覧は保存 RPC が拒否します。Odoo のモデル許可リストとは意味が異なります。
 

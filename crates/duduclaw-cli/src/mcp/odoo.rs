@@ -76,6 +76,13 @@ pub(crate) async fn handle_odoo_tool(
         };
     }
 
+    // RM-120: generic create / write carry their own explicit-grant gate
+    // chain (`odoo_generic_write.rs`); the permissive per-agent filter below
+    // never authorizes them.
+    if matches!(tool, "odoo_create" | "odoo_write") {
+        return super::odoo_generic_write::handle_odoo_generic_write(tool, params, home_dir, odoo, caller_agent).await;
+    }
+
     if !matches!(tool,
         "odoo_schema_overview" | "odoo_schema_fields" | "odoo_crm_leads" | "odoo_crm_create_lead"
         | "odoo_crm_update_stage" | "odoo_sale_orders" | "odoo_sale_create_quotation" | "odoo_sale_confirm"
@@ -844,7 +851,7 @@ pub(crate) async fn handle_odoo_connect(
     })
 }
 
-async fn connect_odoo_pool(
+pub(crate) async fn connect_odoo_pool(
     home_dir: &Path, odoo: &OdooState, caller_agent: &str,
 ) -> std::result::Result<std::sync::Arc<duduclaw_odoo::OdooConnector>, String> {
     let home_dir_owned = home_dir.to_path_buf();

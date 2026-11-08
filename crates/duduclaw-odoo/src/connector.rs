@@ -122,12 +122,14 @@ pub fn check_blocklist(
     if !BLOCKED_MODELS.contains(&model) {
         return Ok(());
     }
+    // RM-120: mutating a system metadata table is never available, unblocked
+    // or not, so the denial must not suggest that unblocking would help.
+    if READ_ONLY_WHEN_UNBLOCKED.contains(&model) && kind == AccessKind::Mutate {
+        return Err(BlockDenial::SystemReadOnly);
+    }
     let unblocked = unblock_models.iter().any(|m| m == model);
     if !unblocked {
         return Err(BlockDenial::SecurityDefault);
-    }
-    if READ_ONLY_WHEN_UNBLOCKED.contains(&model) && kind == AccessKind::Mutate {
-        return Err(BlockDenial::SystemReadOnly);
     }
     Ok(())
 }
@@ -1246,6 +1248,16 @@ mod tests {
             check_blocklist("ir.model.fields", AccessKind::Mutate, &unblock),
             Err(BlockDenial::SystemReadOnly)
         );
+    }
+
+    #[test]
+    fn check_blocklist_system_model_mutation_is_unavailable_without_unblock_too() {
+        // RM-120: unblocking can never enable a write, so the denial for a
+        // mutation is the "not available" kind, not the unlockable one.
+        for model in READ_ONLY_WHEN_UNBLOCKED.iter().copied().filter(|m| BLOCKED_MODELS.contains(m)) {
+            assert_eq!(check_blocklist(model, AccessKind::Mutate, &[]), Err(BlockDenial::SystemReadOnly), "{model}");
+            assert_eq!(check_blocklist(model, AccessKind::Read, &[]), Err(BlockDenial::SecurityDefault), "{model}");
+        }
     }
 
     #[test]

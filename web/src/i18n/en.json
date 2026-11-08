@@ -9749,6 +9749,7 @@
   "odoo.permissions.modelsUnrestricted": "No tables selected means no table restriction. Sensitive tables remain blocked by default.",
   "odoo.permissions.actionsUnrestricted": "No action settings means no action restriction. Table restrictions and sensitive data protection still apply.",
   "odoo.permissions.intersection": "Access must satisfy both the table selection and the action rules.",
+  "odoo.permissions.genericWriteRule": "General create and update (for any table) need an explicit grant: tick the table under Tables and give it Create or Update in a rule. Empty settings do not grant them. Built-in lead and quotation tools are unaffected.",
   "odoo.permissions.table": "Table",
   "odoo.permissions.allTables": "All tables",
   "odoo.permissions.read": "Search and read",

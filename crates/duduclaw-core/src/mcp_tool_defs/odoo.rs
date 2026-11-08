@@ -286,4 +286,43 @@ pub(super) const TOOLS: &[ToolDef] = &[
             required: true,
         }],
     },
+    // RM-120: listed only when the employee's Odoo settings explicitly grant
+    // `create` / `write` on at least one model (`mcp::tools_list`).
+    ToolDef {
+        name: "odoo_create",
+        description: "Create one record in an Odoo model granted in the employee's Odoo settings. Keys must be writable fields of the scanned schema. Returns the new ID.",
+        params: &[
+            ParamDef {
+                name: "model",
+                description: "Odoo model name (e.g. crm.lead)",
+                required: true,
+            },
+            ParamDef {
+                name: "values",
+                description: "Field values object, max 64 KiB. x2many lists may use commands 0, 1, 4, 6 only",
+                required: true,
+            },
+        ],
+    },
+    ToolDef {
+        name: "odoo_write",
+        description: "Update records in an Odoo model granted in the employee's Odoo settings. Keys must be writable fields of the scanned schema. Cannot delete records.",
+        params: &[
+            ParamDef {
+                name: "model",
+                description: "Odoo model name (e.g. crm.lead)",
+                required: true,
+            },
+            ParamDef {
+                name: "ids",
+                description: "Record IDs: 1 to 100 positive integers",
+                required: true,
+            },
+            ParamDef {
+                name: "values",
+                description: "Field values object, max 64 KiB. x2many lists may use commands 0, 1, 4, 6 only",
+                required: true,
+            },
+        ],
+    },
 ];

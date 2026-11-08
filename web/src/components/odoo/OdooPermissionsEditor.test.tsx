@@ -194,6 +194,11 @@ describe('Odoo account rights', () => {
     expect(screen.getByText(/Button actions cover confirm, validate and archive/)).toBeInTheDocument();
   });
 
+  it('explains that general create and update need an explicit table grant', () => {
+    renderWithProviders(<Harness />);
+    expect(screen.getByText(/General create and update \(for any table\) need an explicit grant/)).toBeInTheDocument();
+  });
+
   it('reads cached rights on load and refreshes only after explicit rescan', async () => {
     const user = userEvent.setup();
     renderWithProviders(<Harness initial={{ allowed_actions: ['read:crm.lead'] }} />);

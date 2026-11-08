@@ -93,6 +93,7 @@ export function OdooPermissionsEditor({ value, onChange, disabled = false, defau
       <legend className="text-sm font-medium">{t('rules')}</legend>
       <p className="text-xs text-muted-foreground">{t('actionsUnrestricted')}</p>
       <p className="text-xs text-muted-foreground">{t('intersection')}</p>
+      <p className="text-xs text-muted-foreground">{t('genericWriteRule')}</p>
       {rules.map((rule, index) => <fieldset key={index} className="space-y-3 rounded-lg border border-border p-3">
         <legend className="px-1 text-xs">{t('rule')} {index + 1}</legend>
         <div className="flex items-center gap-2">
