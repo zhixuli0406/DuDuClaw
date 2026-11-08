@@ -3239,6 +3239,22 @@ export interface McpOAuthProvider {
 }
 
 /** Fields that can be updated on an agent via `agents.update`. All optional. */
+/** RM-026 — one `agent_authority_changed` row, reduced to the permission keys. */
+export interface PermissionHistoryEvent {
+  timestamp: string;
+  agent_id: string;
+  /** User id of whoever saved the change. */
+  actor: string;
+  /** Display name of `actor` when the account still exists. */
+  actor_name: string | null;
+  changes: Array<{ key: string; before: unknown; after: unknown }>;
+}
+
+export interface PermissionHistoryPage {
+  events: PermissionHistoryEvent[];
+  next_cursor: string | null;
+}
+
 export interface AgentUpdateParams {
   // Identity
   display_name?: string;
@@ -6498,6 +6514,14 @@ export const api = {
       client.call('agents.tool_pruning_restore', { agent_id: agentId }) as Promise<ToolPruningStatus>,
     inspect: (agentId: string) =>
       client.call('agents.inspect', { agent_id: agentId }) as Promise<AgentDetail>,
+    /** RM-026 — Admin-only. Permission changes of one employee, newest first;
+     *  pass the previous page's `next_cursor` to load older rows. */
+    permissionHistory: (agentId: string, opts: { limit?: number; cursor?: string } = {}) =>
+      client.call('agents.permission_history', {
+        agent_id: agentId,
+        ...(opts.limit ? { limit: opts.limit } : {}),
+        ...(opts.cursor ? { cursor: opts.cursor } : {}),
+      }) as Promise<PermissionHistoryPage>,
     /** E1 — lightweight avatar-only fetch. Unlike `inspect` this does NOT run a
      *  telemetry aggregate or serialize SOUL/skills/model config; it reads only
      *  the uploaded `avatar.<ext>` bytes. Used by the avatar store for first-paint
