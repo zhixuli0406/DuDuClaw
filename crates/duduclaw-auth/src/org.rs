@@ -40,6 +40,7 @@ pub const MANAGER_HAS_REPORTS: &str = "manager_has_reports";
 pub const MANAGER_NOT_FOUND: &str = "manager_not_found";
 pub const MANAGER_INACTIVE: &str = "manager_inactive";
 pub const TRANSFER_TARGET_INVALID: &str = "transfer_target_invalid";
+pub const PERSONAL_EMPLOYEE_HANDOVER: &str = "personal_employee_handover_required";
 
 /// Why a reporting-line write was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,11 @@ pub enum OrgError {
     TooDeep,
     HasReports,
     TransferTargetInvalid,
+    /// Offboarding with a transfer would move the binding of this Personal
+    /// employee (native Linux isolation) to another user. A Personal
+    /// employee is never transferred: an admin must hand it over (tombstone
+    /// it through the employee lifecycle) first.
+    PersonalEmployee(String),
     Db(String),
 }
 
@@ -68,6 +74,7 @@ impl OrgError {
             Self::TooDeep => MANAGER_TOO_DEEP,
             Self::HasReports => MANAGER_HAS_REPORTS,
             Self::TransferTargetInvalid => TRANSFER_TARGET_INVALID,
+            Self::PersonalEmployee(_) => PERSONAL_EMPLOYEE_HANDOVER,
             Self::Db(_) => "internal_error",
         }
     }
@@ -77,6 +84,9 @@ impl std::fmt::Display for OrgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Db(e) => write!(f, "{e}"),
+            Self::PersonalEmployee(agent) => write!(f,
+                "{agent} is a personal employee and cannot be transferred with the offboarding; \
+                 an admin must hand it over (tombstone the personal employee) first"),
             other => write!(f, "{}", other.code()),
         }
     }

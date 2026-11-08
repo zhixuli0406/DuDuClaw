@@ -10192,6 +10192,7 @@
   "members.error.invitationUrl": "Set an HTTPS address that recipients can access before sending invitations.",
   "members.error.staffUnavailable": "A selected AI staff member is no longer available. Choose another one.",
   "members.error.staffRestricted": "This AI staff member can only be assigned after the member finishes account setup. Choose another staff member for now.",
+  "members.error.staffPersonal": "This AI staff member is a personal employee and belongs only to its owner, so it cannot be assigned to a new member. An admin must hand it over first.",
   "compliance.open": "Compliance report",
   "compliance.title": "Export compliance report",
   "compliance.description": "Collect recorded outbound decisions, approvals and data-source accesses for internal personal-data reviews. Approval does not confirm successful delivery.",

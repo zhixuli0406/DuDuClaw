@@ -3,6 +3,8 @@
 use super::*;
 use duduclaw_migration::allocation::{self, Action, Receipt, Request};
 use duduclaw_migration::ids::RequestId;
+use duduclaw_isolation::capability::EmployeeBinding;
+use crate::isolation_lifecycle::{self as lifecycle, LifecycleError};
 use std::sync::Arc;
 
 pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority> }
@@ -11,8 +13,10 @@ impl EmployeeAuthority {
     fn validate_current(&self,item:&ConfirmationItem)->Result<()> {
         if item.status==ConfirmationStatus::Failed { return Err(Error::Denied); }
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
-        if item.fields.iter().any(|f| !matches!(f.name.as_str(),"employee_id"|"disk_bytes"|"settings"))
+        if item.fields.iter().any(|f| !matches!(f.name.as_str(),"employee_id"|"disk_bytes"|"settings"|"binding_kind"|"owner_id"|"tenant_id"))
             || !duduclaw_core::is_valid_agent_id(&spec.label) || duduclaw_core::is_reserved_agent_id(&spec.label) {return Err(Error::Denied);}
+        // Personal owner eligibility / Shared tenant pin, against users.db and apply.db.
+        lifecycle::validate_proposed_binding(&self.home,&spec.label,spec.binding.as_ref()).map_err(lifecycle_error)?;
         let expected:serde_json::Value=serde_json::from_str(text(item,"settings")?).map_err(|_|Error::Invalid)?;
         bounded(&self.live.handle,async {
             let registry=self.live.registry.read().await;
@@ -27,22 +31,56 @@ impl EmployeeAuthority {
         })?
     }
     fn exchange(&self,item:&ConfirmationItem,action:Action)->Result<Receipt>{exchange(item,action)}
-    fn save(&self,item:&ConfirmationItem,receipt:&Receipt)->Result<()> {
-        let path=self.home.join("migration-authority/apply.db");
+    fn save(&self,item:&ConfirmationItem,receipt:&Receipt)->Result<()> {save_confirmed_receipt(&self.home,item,receipt)}
+}
+
+/// Apply bookkeeping for one root receipt. A Personal allocation also writes
+/// the users.db mirror: users.db and apply.db cannot share an atomic
+/// transaction (users.db is WAL), so the mirror is committed while the
+/// apply.db writer lock is held and before the confirmed row; a mirror
+/// failure refuses the step and leaves no confirmed row. Compensation
+/// removes the mirror only after the disabled row is durable.
+pub(crate) fn save_confirmed_receipt(home:&Path,item:&ConfirmationItem,receipt:&Receipt)->Result<()> {
+        let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
+        // The root copies the principal from this confirmed proposal only.
+        if receipt.binding!=item.binding || receipt.label!=spec.label || receipt.principal_binding!=spec.binding {return Err(Error::Stale);}
+        let path=home.join("migration-authority/apply.db");
         let mut db=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|_|Error::Storage)?;
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_|Error::Storage)?;
         ensure_employee_schema(&db)?;
-        let tenant = current_tenant(&self.home, &receipt.label)?;
+        let tenant = current_tenant(home, &receipt.label)?;
         let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|Error::Storage)?;
         let previous:Option<(String,Option<String>)>=tx.query_row(
             "SELECT receipt,tenant_id FROM confirmed_employees WHERE label=?1",[&receipt.label],
             |r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|Error::Storage)?;
         let pinned_tenant = checked_tenant(previous.as_ref(), receipt, &tenant)?;
+        let personal_owner=match &receipt.principal_binding {
+            // Shared carries the proposal tenant; it must be the pinned one.
+            Some(EmployeeBinding::Shared(t)) if !receipt.disabled && pinned_tenant.as_deref()!=Some(t.as_str()) => return Err(Error::Denied),
+            Some(EmployeeBinding::Personal(owner)) => Some(owner.as_str()),
+            _ => None,
+        };
+        if let (Some(owner),false)=(personal_owner,receipt.disabled) {
+            lifecycle::record_personal_mirror(home,&receipt.label,owner).map_err(lifecycle_error)?;
+        }
         tx.execute("INSERT INTO confirmed_employees(label,operation,digest,receipt,tenant_id) VALUES(?1,?2,?3,?4,?5)
             ON CONFLICT(label) DO UPDATE SET operation=excluded.operation,digest=excluded.digest,receipt=excluded.receipt,tenant_id=excluded.tenant_id",
             params![receipt.label,operation(&item.binding),item.binding.proposal_digest.0.as_slice(),serde_json::to_string(receipt).map_err(|_|Error::Storage)?,pinned_tenant]).map_err(|_|Error::Storage)?;
-        tx.commit().map_err(|_|Error::Storage)
-
+        tx.commit().map_err(|_|Error::Storage)?;
+        if let (Some(owner),true)=(personal_owner,receipt.disabled) {
+            // Another owner's mirror (Stale) is not this allocation's to remove.
+            match lifecycle::remove_personal_mirror(home,&receipt.label,owner) {
+                Ok(_)|Err(LifecycleError::Stale)=>{}
+                Err(e)=>return Err(lifecycle_error(e)),
+            }
+        }
+        Ok(())
+}
+fn lifecycle_error(e:LifecycleError)->Error {
+    match e {
+        LifecycleError::Unavailable=>Error::Storage,
+        LifecycleError::Denied|LifecycleError::Tombstoned=>Error::Denied,
+        LifecycleError::Stale=>Error::Stale,
     }
 }
 fn exchange(item:&ConfirmationItem,action:Action)->Result<Receipt>{
@@ -61,25 +99,22 @@ impl MigrationAuthorityBackend for EmployeeAuthority {
     fn publish(&self,item:&ConfirmationItem)->Result<()>{self.validate(item)?;let receipt=self.exchange(item,Action::ReadBack)?;self.save(item,&receipt)}
     fn read_back(&self,item:&ConfirmationItem)->Result<()>{self.publish(item)}
     fn disable(&self,item:&ConfirmationItem)->Result<()>{let receipt=self.exchange(item,Action::Disable)?;self.save(item,&receipt)}
-    fn readback_shared_employee(&self,agent:&str)->Result<()>{resolve_confirmed_employee(&self.home,agent).map(|_|())}
+    fn readback_shared_employee(&self,agent:&str)->Result<()>{
+        let (_,employee)=lifecycle::resolve(&self.home,agent,&lifecycle::RootAllocator).map_err(lifecycle_error)?;
+        // Shared ACL/grant restoration never targets a Personal employee.
+        if !matches!(employee.binding,EmployeeBinding::Shared(_)){return Err(Error::Denied)}
+        Ok(())
+    }
 }
 
-/// Read-only label resolution for A/D. A stored mapping is only an index: each
-/// lookup rechecks the Applied confirmation and the root UID/quota readback.
-/// The tenant pin lives in this existing confirmed registry; a deleted or
-/// replaced users database cannot transfer an employee to a new tenant.
+/// Read-only label resolution for A/D, now the `EmployeeLifecycle` read model
+/// (`crate::isolation_lifecycle`). A stored mapping is only an index: each
+/// lookup rechecks the Applied confirmation (including its principal), the
+/// root UID/quota/principal readback, the tenant pin and, for a Personal
+/// employee, the users.db mirror owner. A deleted or replaced users database
+/// cannot transfer an employee to a new tenant.
 pub(crate) fn resolve_confirmed_employee(home:&Path,label:&str)->Result<Receipt>{
-    let db=Connection::open_with_flags(home.join("migration-authority/apply.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_|Error::Storage)?;
-    let (encoded,tenant):(String,Option<String>)=db.query_row("SELECT receipt,tenant_id FROM confirmed_employees WHERE label=?1",[label],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|Error::Denied)?;
-    if tenant.as_deref()!=Some(current_tenant(home,label)?.as_str()){return Err(Error::Denied);}
-    let prior:Receipt=serde_json::from_str(&encoded).map_err(|_|Error::Storage)?;
-    if prior.disabled || prior.label!=label{return Err(Error::Denied)}
-    let store=duduclaw_migration::confirmation::ConfirmationStore::open_read_only(&home.join("migration-confirmations.db")).map_err(|_|Error::Storage)?;
-    let item=store.list().map_err(|_|Error::Storage)?.into_iter().find(|i|i.binding==prior.binding && i.status==ConfirmationStatus::Applied).ok_or(Error::Denied)?;
-    let current=exchange(&item,Action::ReadBack)?;
-    if current.disabled || current.employee!=prior.employee || current.uid!=prior.uid
-        || current.binding!=prior.binding || current.label!=prior.label
-        || current.bytes!=prior.bytes || current.inodes!=prior.inodes {return Err(Error::Stale)}Ok(current)
+    lifecycle::resolve(home,label,&lifecycle::RootAllocator).map(|(receipt,_)|receipt).map_err(lifecycle_error)
 }
 
 // Extend the existing allocation index rather than creating a second ACL store.
@@ -104,6 +139,8 @@ fn checked_tenant(previous:Option<&(String,Option<String>)>,receipt:&Receipt,ten
     if let Some((encoded,pinned))=previous {
         let prior:Receipt=serde_json::from_str(encoded).map_err(|_|Error::Storage)?;
         if prior.employee==receipt.employee {
+            // The principal is immutable for an employee's whole lifetime.
+            if prior.principal_binding!=receipt.principal_binding {return Err(Error::Stale);}
             // Compensation may disable an old unpinned row, but never assigns
             // that employee a tenant retroactively or transfers its lifetime.
             if receipt.disabled { return Ok(pinned.clone()); }

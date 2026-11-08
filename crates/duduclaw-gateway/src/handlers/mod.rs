@@ -693,6 +693,8 @@ mod mfa_rpc;
 mod migration_confirmations_rpc;
 mod migration_authority;
 pub(crate) use migration_authority::employee::resolve_confirmed_employee;
+#[cfg(test)]
+pub(crate) use migration_authority::employee::save_confirmed_receipt;
 pub(crate) use migration_authority::stage_import_proposals;
 mod session_policy_rpc;
 mod a2a_rpc;

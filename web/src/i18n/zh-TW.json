@@ -10192,6 +10192,7 @@
   "members.error.invitationUrl": "請先設定收件者能存取的 HTTPS 網址，再寄出邀請。",
   "members.error.staffUnavailable": "選擇的 AI 員工已無法使用，請重新選擇。",
   "members.error.staffRestricted": "這位 AI 員工須等同仁完成帳號設定後才能綁定。請先選擇其他 AI 員工。",
+  "members.error.staffPersonal": "這位 AI 員工是個人專屬員工，只屬於它的擁有者，不能綁定給新同仁。如需移交，請由管理員先處理。",
   "compliance.open": "合規報表",
   "compliance.title": "匯出合規報表",
   "compliance.description": "彙整既有外送決策、審批與已記錄的資料來源存取，供內部個資管理查核。核准不代表資料已成功送出。",

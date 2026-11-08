@@ -53,6 +53,10 @@ pub mod isolation_worker_plans;
 #[cfg(target_os = "linux")]
 pub mod isolation_forks;
 pub mod isolation_readiness;
+// Read model and handover path; B1–B3 and the A4 admin RPC consume the parts
+// not yet called from production code.
+#[allow(dead_code)]
+pub(crate) mod isolation_lifecycle;
 pub mod migration_import;
 pub mod migration_startup;
 

@@ -10192,6 +10192,7 @@
   "members.error.invitationUrl": "招待を送信する前に、受信者がアクセスできる HTTPS アドレスを設定してください。",
   "members.error.staffUnavailable": "選択した AI スタッフは利用できなくなりました。選び直してください。",
   "members.error.staffRestricted": "この AI スタッフは、メンバーのアカウント設定完了後に割り当てられます。先に別のスタッフを選択してください。",
+  "members.error.staffPersonal": "この AI スタッフは所有者専用の個人スタッフのため、新しいメンバーには割り当てられません。引き継ぎは管理者が先に行ってください。",
   "compliance.open": "コンプライアンス報告",
   "compliance.title": "コンプライアンス報告を出力",
   "compliance.description": "記録済みの外部送信判断、承認、データソースへのアクセスを、個人情報の内部点検用にまとめます。承認は送信成功を示すものではありません。",

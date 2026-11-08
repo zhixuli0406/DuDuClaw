@@ -84,6 +84,15 @@ impl UserDb {
             [member.email.trim()], |row| row.get(0),
         ).map_err(|_| "member_storage_unavailable")?;
         if duplicate { return Err("member_email_exists"); }
+        // A Personal employee (isolation mirror row) belongs to its owner only;
+        // refuse explicitly instead of failing on the mirror trigger.
+        for binding in &member.bindings {
+            match crate::db::personal_agent_owner(&tx, &binding.agent_name) {
+                Ok(None) => {}
+                Ok(Some(_)) => return Err("member_agent_personal"),
+                Err(_) => return Err("member_storage_unavailable"),
+            }
+        }
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         tx.execute(

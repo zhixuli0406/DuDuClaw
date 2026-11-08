@@ -61,6 +61,7 @@ fn org_error_message(e: &OrgError) -> &'static str {
         OrgError::ManagerInactive => "指定的主管目前已停權或離職。",
         OrgError::HasReports => "這位使用者還有直屬部屬，請先把部屬改掛到其他主管，再調整角色。",
         OrgError::TransferTargetInvalid => "交接對象必須是另一位在職的使用者。",
+        OrgError::PersonalEmployee(_) => "這位使用者有個人專屬的 AI 員工，不能隨離職交接轉給別人。請管理員先移交（停用）這位個人員工，再辦理離職交接。",
         OrgError::Db(_) => "目前無法更新組織關係，請稍後再試。",
     }
 }
@@ -72,14 +73,19 @@ pub(crate) fn org_error_frame(e: &OrgError) -> WsFrame {
     if let OrgError::Db(detail) = e {
         tracing::warn!(error = %detail, "reporting-line write failed");
     }
+    let mut error = json!({
+        "code": e.code(),
+        "message": org_error_message(e),
+    });
+    // Name the Personal employee that needs an admin handover.
+    if let OrgError::PersonalEmployee(agent) = e {
+        error["agent"] = json!(agent);
+    }
     WsFrame::Response {
         id: String::new(),
         ok: false,
         payload: None,
-        error: Some(json!({
-            "code": e.code(),
-            "message": org_error_message(e),
-        })),
+        error: Some(error),
     }
 }
 
@@ -126,6 +132,19 @@ mod tests {
         match org_error_frame(&OrgError::Db("disk I/O error at /secret/path".into())) {
             WsFrame::Response { error: Some(err), .. } => {
                 assert!(!err.to_string().contains("/secret/path"), "no DB detail to the client");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn personal_employee_offboarding_refusal_names_agent_and_handover() {
+        match org_error_frame(&OrgError::PersonalEmployee("alice-personal".into())) {
+            WsFrame::Response { ok: false, error: Some(err), .. } => {
+                assert_eq!(err["code"], "personal_employee_handover_required");
+                assert_eq!(err["agent"], "alice-personal");
+                let message = err["message"].as_str().unwrap();
+                assert!(message.contains("個人專屬") && message.contains("管理員"), "{message}");
             }
             other => panic!("unexpected {other:?}"),
         }
