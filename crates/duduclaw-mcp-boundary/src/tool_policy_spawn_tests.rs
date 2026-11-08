@@ -57,6 +57,17 @@ fn spawn_ephemeral_tools_are_intersection() {
 }
 
 #[test]
+fn h13c_ephemeral_job_never_grants_spawn_tools() {
+    let context = record(&["spawn_ephemeral", "spawn_agent", "wiki_read"], vec![own()], shared(), human("alice"));
+    // Held by the parent run, but never part of the child's job.
+    assert_eq!(ephemeral_tools(&context, &ephemeral_args(json!(["spawn_agent", "mcp__duduclaw__spawn_ephemeral",
+        "wiki_read"]))).unwrap(), vec!["wiki_read".to_owned()]);
+    for tools in [json!(["spawn_agent"]), json!(["spawn_ephemeral", "mcp__duduclaw__spawn_agent"])] {
+        assert_eq!(ephemeral_tools(&context, &ephemeral_args(tools)), Err(VerificationError::Invalid));
+    }
+}
+
+#[test]
 fn spawn_ephemeral_personal_parent_owner_only() {
     let args = ephemeral_args(json!(["wiki_read"]));
     let tools = ["spawn_ephemeral", "wiki_read"];

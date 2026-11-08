@@ -363,15 +363,21 @@ pub(crate) async fn handle_skill_synthesis_run(
     // H12c: an isolated call synthesizes only for its capability-bound
     // employee (re-authorized here; `agent_id` may only name itself) and
     // publishes into that employee's own SKILLS, never the global bank.
-    let owned = match crate::mcp_isolation::current() {
+    // H13c: the authorized call is kept; its context is the live authority
+    // every owned publication re-checks (like `install_owned`).
+    let (owned, authority) = match crate::mcp_isolation::current() {
         Some(current) => {
             let authorized = crate::mcp_isolation::authorize_gateway_handler(home_dir, "skill_synthesis_run", params).await;
-            if authorized.is_err() || (!agent_id_param.is_empty() && agent_id_param != current.agent) {
+            let Ok(call) = authorized else {
+                return refusal("無法確認這次技能合成的員工授權，已拒絕執行。".into());
+            };
+            if call.context().record() != current.context.record()
+                || (!agent_id_param.is_empty() && agent_id_param != current.agent) {
                 return refusal("無法確認這次技能合成的員工授權，已拒絕執行。".into());
             }
-            Some(current.agent.clone())
+            (Some(current.agent.clone()), Some(call.context().clone()))
         }
-        None => None,
+        None => (None, None),
     };
     let target_agent = if let Some(own) = owned.as_deref() {
         own
@@ -450,7 +456,10 @@ pub(crate) async fn handle_skill_synthesis_run(
         ..Default::default()
     };
 
-    let result = run_pipeline(&config, actor.agent()).await;
+    let result = match authority {
+        Some(context) => duduclaw_mcp_boundary::io_authority::scope(context, run_pipeline(&config, actor.agent())).await,
+        None => run_pipeline(&config, actor.agent()).await,
+    };
 
     let mode = if result.dry_run { "DRY RUN" } else { "FULL" };
     let summary = result.summary();

@@ -314,6 +314,8 @@ pub async fn scope_record<F: Future>(home: &Path, kind: &str, id: &str, agent: &
         let captured = (|| {
             let receipt = store::load(&home, &kind, &id)?.ok_or_else(unavailable)?;
             legacy = receipt.is_legacy();
+            // H13c: an ephemeral child's material also binds its job's tools.
+            let material = ephemeral_child::bind_job_tools(&home, &kind, &id, material.clone())?;
             check_material(&receipt, &agent, owner.as_deref(), &store::material_digest(&material)?)?;
             pending = store::approval_pending(&receipt).unwrap_or(false);
             recheck(&receipt)?;
@@ -465,6 +467,7 @@ fn recheck_receipt(receipt: &RecordAuthority, ancestor: bool, check_decision: bo
         let material = if ancestor { material::read_ancestor(&receipt.home, &receipt.kind, &receipt.id) }
             else { material::read_current(&receipt.home, &receipt.kind, &receipt.id) }
             .map_err(|_| VerificationError::Revoked)?;
+        let material = ephemeral_child::bind_job_tools(&receipt.home, &receipt.kind, &receipt.id, material)?;
         if store::material_digest(&material)? != receipt.material { return Err(VerificationError::Revoked); }
     }
     let current = snapshot(&receipt.home, &receipt.owner, &receipt.agent)?;
@@ -531,10 +534,11 @@ pub(crate) async fn authorize_current(agent_dir: &Path, principal_context: Optio
                 turn, approval_session: session }, metadata: Some(metadata), principal_context,
                 egress_turn, background: Some(receipt.clone()) }, Some(receipt.expires_at), task)?;
         // H13b: an ephemeral child (self-delegation) holds only its job's
-        // tools; any other self-delegation, or a job that is not released or
-        // does not match this receipt exactly, refuses the run.
+        // tools; any other self-delegation, or a job that is not started
+        // (H13c: admitted once by the dispatcher gate) or does not match this
+        // receipt exactly, refuses the run.
         if let Some(tools) = ephemeral_child::child_tools(&receipt, auth.grant.tools.as_slice(),
-            |id| crate::isolation_ephemeral::EphemeralJobs::open(&receipt.home)?.released(id))? {
+            |id| crate::isolation_ephemeral::EphemeralJobs::open(&receipt.home)?.started(id))? {
             auth.grant.tools = tools;
         }
         // Queue consumers are detached host waiters. The initiating employee
@@ -616,11 +620,13 @@ async fn record_delegation_inner(home: &Path, sender: &str,
             // Personal target is refused before any receipt is stored, unless
             // (H13b, owner decision B) the source is a Personal employee of the
             // very same owner and that owner started this run. The target may be
-            // the source itself (a `spawn_ephemeral` child, decision A).
+            // the source itself (a `spawn_ephemeral` child, decision A). H13c:
+            // "started" means a live run — a source run that itself came from a
+            // background receipt (`source.parent`) never reaches a Personal target.
             let principal = user_id(&source.owner)?;
             let (employee, binding, allocation, incarnation) = capture_lifecycle(&home, &target, &lifecycle::RootAllocator)?;
             let personal_target = matches!(binding, EmployeeBinding::Personal(_));
-            if same_owner::personal_target_allowed(&source.binding, &binding, &principal).is_err() {
+            if same_owner::personal_target_from_run(&source.binding, &binding, &principal, source.parent.as_ref()).is_err() {
                 tracing::warn!(agent = target.as_str(), "delegation refused: a personal employee runs background work only for its own owner's personal employees");
                 return Err(VerificationError::Invalid);
             }

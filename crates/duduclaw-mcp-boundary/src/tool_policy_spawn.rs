@@ -106,6 +106,12 @@ pub fn check_spawn_arguments(name: &str, arguments: &Value) -> Result<(), Verifi
 /// record principal must be the Human owner of the Personal binding. A Shared
 /// parent has no owner restriction beyond its live membership (the host
 /// resolver re-validates the binding on every call).
+///
+/// H13c: a run started from a background receipt also carries the receipt
+/// owner's `Human` principal, so this record check alone cannot tell it from
+/// a live owner session. The gateway issuer never signs either spawn tool
+/// into such a run of a Personal employee (so it is not eligible here), and
+/// the host queue captures refuse it for a Personal target.
 pub fn ephemeral_parent_allowed(context: &RequestContext) -> Result<(), VerificationError> {
     let record = context.record();
     match (&record.employee_binding, &record.principal) {
@@ -141,12 +147,14 @@ pub fn spawn_selector(context: &RequestContext, name: &str) -> Result<Vec<Resour
 /// snapshot (`record.tools`), in request order, without duplicates. Anything
 /// else (native tools, unknown or unlisted names) is dropped, so the child can
 /// never hold a tool the parent run does not; an empty intersection refuses.
+/// H13c: [`SPAWN_TOOLS`] are never part of a job (a child cannot spawn).
 pub fn ephemeral_tools(context: &RequestContext, arguments: &Value) -> Result<Vec<String>, VerificationError> {
     let parent = context.record().tools.as_slice();
     let mut granted: Vec<String> = Vec::new();
     for name in requested_tools(arguments)? {
         let bare = name.strip_prefix(MCP_TOOL_PREFIX).unwrap_or(name.as_str());
-        if parent.iter().any(|tool| tool.as_str() == bare) && !granted.iter().any(|tool| tool == bare) {
+        if !SPAWN_TOOLS.contains(&bare) && parent.iter().any(|tool| tool.as_str() == bare)
+            && !granted.iter().any(|tool| tool == bare) {
             granted.push(bare.to_owned());
         }
     }

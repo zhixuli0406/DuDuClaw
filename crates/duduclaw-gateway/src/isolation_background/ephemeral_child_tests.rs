@@ -75,6 +75,78 @@ fn h13b_personal_spawn_ephemeral_requires_owner_initiated_parent() {
     assert_eq!(super::super::store::validate(&cron), Err(VerificationError::Invalid));
 }
 
+/// A same-owner delegated background receipt: `bob` (Personal, same owner)
+/// delegated to `alice` from the owner's live run.
+fn delegated_receipt(owner: &str) -> RecordAuthority {
+    let mut receipt = super::super::tests::receipt(Path::new("/trusted-home"));
+    receipt.kind = "delegation".into();
+    receipt.id = "message-1".into();
+    receipt.binding = Some(personal(owner));
+    receipt.approval = None;
+    receipt.caller = Some(EmployeeId([2; 16]));
+    receipt.parent_run = Some(RUN);
+    receipt.parent_agent = Some("bob".into());
+    receipt.parent_policy = Some("original-policy".into());
+    receipt
+}
+
+#[test]
+fn h13c_background_source_never_reaches_personal_target() {
+    let owned = personal("original-user");
+    let job = EphemeralJob::new(parent(owned.clone(), "original-user"), request(), 1).unwrap();
+    // Both runs below are issued for `Principal::Human { original-user }`, yet
+    // no owner is present: their `DelegationSource.parent` is a receipt.
+    let background = delegated_receipt("original-user");
+    let child = child_receipt(&job);
+    assert!(same_owner::personal_receipt_allowed(&background) && same_owner::personal_receipt_allowed(&child));
+    for parent in [&background, &child] {
+        // spawn_agent / delegation to a same-owner Personal employee: refused …
+        assert_eq!(same_owner::personal_target_from_run(&owned, &owned, "original-user", Some(parent)),
+            Err(VerificationError::BindingMismatch));
+        // … and spawn_ephemeral of the Personal employee itself: refused.
+        assert_eq!(same_owner::ephemeral_parent_live(&owned, Some(parent)), Err(VerificationError::BindingMismatch));
+    }
+    // The live owner session (no parent receipt): allowed, no card.
+    assert_eq!(same_owner::personal_target_from_run(&owned, &owned, "original-user", None), Ok(()));
+    assert_eq!(same_owner::ephemeral_parent_live(&owned, None), Ok(()));
+    // A live session of someone else is still refused (H13b rule kept).
+    assert_eq!(same_owner::personal_target_from_run(&owned, &owned, "intruder", None), Err(VerificationError::BindingMismatch));
+    // Shared targets and Shared parents are unchanged (a Personal source's
+    // Shared target keeps the owner card path).
+    for parent in [None, Some(&background)] {
+        assert_eq!(same_owner::personal_target_from_run(&owned, &shared(), "original-user", parent), Ok(()));
+        assert_eq!(same_owner::personal_target_from_run(&shared(), &shared(), "anyone", parent), Ok(()));
+        assert_eq!(same_owner::ephemeral_parent_live(&shared(), parent), Ok(()));
+    }
+}
+
+#[test]
+fn h13c_spawn_tools_not_offered_to_personal_background_runs() {
+    let tools = || List::new(vec![t("spawn_agent"), t("wiki_read"), t("spawn_ephemeral"), t("memory_search")]).unwrap();
+    let names = |list: List<Text<128>, 256>| list.as_slice().iter().map(|tool| tool.as_str().to_owned()).collect::<Vec<_>>();
+    // A record-backed run of a Personal employee: neither spawn tool is signed,
+    // so neither is discovered nor eligible.
+    assert_eq!(names(same_owner::record_run_tools(&personal("original-user"), true, tools()).unwrap()),
+        vec!["wiki_read".to_owned(), "memory_search".to_owned()]);
+    // The owner's live session, and any Shared run, keep their snapshot.
+    for (binding, record) in [(personal("original-user"), false), (shared(), true), (shared(), false)] {
+        assert_eq!(names(same_owner::record_run_tools(&binding, record, tools()).unwrap()), names(tools()));
+    }
+}
+
+#[test]
+fn h13c_child_never_holds_spawn_tools() {
+    let job = EphemeralJob { tools: vec!["spawn_agent".into(), "spawn_ephemeral".into(), "wiki_read".into()],
+        ..EphemeralJob::new(parent(shared(), "original-user"), request(), 1).unwrap() };
+    let granted = [t("spawn_agent"), t("spawn_ephemeral"), t("wiki_read")];
+    assert_eq!(narrowed_tools(&granted, &job.tools).unwrap().as_slice(), &[t("wiki_read")]);
+    // A job naming only spawn tools grants nothing: the child run is refused.
+    assert_eq!(narrowed_tools(&granted, &["spawn_agent".into(), "spawn_ephemeral".into()]).err(),
+        Some(VerificationError::Invalid));
+    let receipt = child_receipt(&job);
+    assert_eq!(child_tools(&receipt, &granted, |_| Ok(Some(job.clone()))).unwrap().unwrap().as_slice(), &[t("wiki_read")]);
+}
+
 #[test]
 fn h13b_child_tools_narrowed_to_job() {
     let job = EphemeralJob::new(parent(shared(), "original-user"), request(), 1).unwrap();

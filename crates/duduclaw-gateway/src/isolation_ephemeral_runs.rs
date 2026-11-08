@@ -13,6 +13,14 @@
 //! after its TTL rather than starting on a guess. A known exited run still
 //! counts as holding while ANOTHER run of the same employee is bound (D8:
 //! one capability-holding run per employee; a released child waits for it).
+//!
+//! H13c: the ledger only sees runs from `bind_run` on, so a run that A has
+//! reserved but D has not bound yet is invisible here. The job store covers
+//! the child's own window (a `released`, not yet admitted job holds its
+//! employee; one release per employee per tick: `take_startable`), and
+//! spawnd's admission coordinator is the authoritative per-employee slot: a
+//! second run of the same employee is queued behind the first
+//! (`deferred_until_current_run_ends`) whatever the gateway releases.
 use std::{collections::{BTreeMap, VecDeque}, sync::Mutex};
 use duduclaw_isolation::{execution::RunHandle, ids::{EmployeeId, RunId}};
 use duduclaw_mcp_boundary::VerificationError;
