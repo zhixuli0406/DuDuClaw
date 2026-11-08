@@ -6,6 +6,18 @@ Official Linux CLI binaries require **glibc ≥ 2.31**: Ubuntu 20.04+, Debian 11
 
 ---
 
+## macOS installation
+
+On macOS, we recommend `install.sh` over npm so the signed gateway app has a stable location. The installer uses built-in macOS tools:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | bash
+```
+
+The installer downloads the signed and notarized `.app.zip`, verifies its SHA-256 checksum, and installs `~/Applications/DuDuClaw Gateway.app`. The CLI at `~/.duduclaw/bin/duduclaw` is a symlink to `DuDuClaw Gateway.app/Contents/MacOS/duduclaw`; add `~/.duduclaw/bin` to your `PATH`.
+
+Set `DUDUCLAW_APP_DIR` to change the app directory and `DUDUCLAW_HOME` to change the CLI home. Older releases without an `.app.zip` use the legacy tarball. npm remains available and includes the app inside its macOS platform package.
+
 ## 1. Local development
 
 ```bash

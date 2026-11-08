@@ -11,6 +11,9 @@
 ### Fixed
 
 - macOS 尚未允許存取「文件」「桌面」「下載項目」、iCloud 雲碟或外接磁碟時，AI 員工讀檔不再一直卡到逾時：檔案工具會在短時間內回覆，並清楚說明是 macOS 資料夾權限、該到哪裡開啟；對話回覆逾時時也會說明是 macOS 正在等待有人按「允許」。
+### Changed
+
+- macOS Gateway 改以已簽署及公證的 `DuDuClaw Gateway.app` 發布；建議透過安裝腳本安裝至 `~/Applications`，CLI 以符號連結啟動，並保留舊版更新所需的獨立執行檔。
 
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 

@@ -110,6 +110,54 @@ jobs:
         if: runner.os == 'macOS'
         run: python3 scripts/check_portable_binary.py target/${{ matrix.target }}/release/duduclaw
 
+      - name: Check macOS signing secrets
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!key}" ]; then
+              echo "::error::$key secret is required for macOS gateway releases"
+              exit 1
+            fi
+          done
+
+      - name: Import macOS gateway signing certificate
+        if: runner.os == 'macOS'
+        uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d  # v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build, sign and notarize macOS gateway
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          python3 scripts/macos/build-gateway-bundle.py --exe target/${{ matrix.target }}/release/duduclaw --name duduclaw --version "${TAG#v}" --out _gateway
+          bash scripts/macos/sign-gateway.sh --app "_gateway/DuDuClaw Gateway.app" --exe target/${{ matrix.target }}/release/duduclaw --out ${{ matrix.artifact }}.app.zip
+          bash scripts/macos/verify-gateway-signature.sh --app "_gateway/DuDuClaw Gateway.app" --exe target/${{ matrix.target }}/release/duduclaw --tag "$TAG"
+          python3 scripts/verify_release_marker.py --tag "$TAG" --archive ${{ matrix.artifact }}.app.zip
+          python3 scripts/check_update_archive_size.py ${{ matrix.artifact }}.app.zip
+          shasum -a 256 ${{ matrix.artifact }}.app.zip > ${{ matrix.artifact }}.app.zip.sha256
+
+      - name: Sign gateway bundle with cosign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cosign sign-blob --yes \
+            --output-signature ${{ matrix.artifact }}.app.zip.sig \
+            --output-certificate ${{ matrix.artifact }}.app.zip.pem \
+            ${{ matrix.artifact }}.app.zip
+
       - name: Check binary is portable (Windows)
         if: runner.os == 'Windows'
         run: |

@@ -73,6 +73,7 @@ for arg in "$@"; do
       echo ""
       echo "Environment variables:"
       echo "  DUDUCLAW_HOME    Override install directory (default: ~/.duduclaw)"
+      echo "  DUDUCLAW_APP_DIR Override macOS app directory (default: ~/Applications)"
       exit 0
       ;;
     *)
@@ -162,6 +163,77 @@ download() {
   fi
 }
 
+# Install a validated bundle using only shell and built-in macOS tools.
+install_macos_bundle() (
+  archive="$1"
+  app_dir="$2"
+  bin_dir="$3"
+  app_name='DuDuClaw Gateway.app'
+  mkdir -p "$app_dir" "$bin_dir" || fatal "Cannot create install directories"
+  app_dir="$(CDPATH= cd "$app_dir" && pwd -P)" || fatal "Cannot resolve app directory"
+  bin_dir="$(CDPATH= cd "$bin_dir" && pwd -P)" || fatal "Cannot resolve CLI directory"
+  stage="$(mktemp -d "$app_dir/.duduclaw-install.XXXXXX")" || fatal "Cannot stage gateway bundle"
+  link_stage=""
+  trap 'rm -rf "$stage"; if [ -n "$link_stage" ]; then rm -rf "$link_stage"; fi' EXIT
+
+  /usr/bin/zipinfo -1 "$archive" > "$stage/members" || fatal "Cannot list gateway bundle"
+  LC_ALL=C awk '
+    {
+      if ($0 !~ /^DuDuClaw Gateway[.]app\// || $0 ~ /[[:cntrl:]\\]/ || seen[$0]++) bad = 1
+      n = split($0, parts, "/")
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == ".." || parts[i] == "." || (parts[i] == "" && i != n)) bad = 1
+      }
+      if ($0 ~ /^DuDuClaw Gateway[.]app\/Contents\/MacOS\// && $0 !~ /\/$/) {
+        files++
+        if ($0 != "DuDuClaw Gateway.app/Contents/MacOS/duduclaw") bad = 1
+      }
+    }
+    END { if (bad || files != 1) exit 1 }
+  ' "$stage/members" || fatal "Unsafe gateway bundle listing"
+  rm "$stage/members"
+  /usr/bin/ditto -x -k "$archive" "$stage" || fatal "Cannot extract gateway bundle"
+  find "$stage" -type l > "$stage/symlinks" || fatal "Cannot inspect gateway bundle"
+  [ ! -s "$stage/symlinks" ] || fatal "Gateway bundle contains symlinks"
+  rm "$stage/symlinks"
+  source="$stage/$app_name"
+  destination="$app_dir/$app_name"
+  [ -f "$source/Contents/MacOS/duduclaw" ] && [ -x "$source/Contents/MacOS/duduclaw" ] || fatal "Gateway executable missing or not executable"
+  if [ -e /usr/bin/codesign ]; then
+    /usr/bin/codesign --verify --strict "$source" || fatal "Gateway bundle signature verification failed"
+  fi
+
+  # Reserve temporary names on each destination volume before changing the app.
+  link_stage="$(mktemp -d "$bin_dir/.duduclaw-link.XXXXXX")" || fatal "Cannot stage CLI symlink"
+  ln -s "$destination/Contents/MacOS/duduclaw" "$link_stage/duduclaw" || fatal "Cannot create CLI symlink"
+  [ ! -d "$bin_dir/duduclaw" ] || fatal "CLI destination is a directory"
+  backup="$(mktemp -d "$app_dir/.duduclaw-backup.XXXXXX")" || fatal "Cannot reserve gateway backup"
+  existing=false
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    if ! mv "$destination" "$backup/$app_name"; then
+      rmdir "$backup"
+      fatal "Cannot back up existing gateway"
+    fi
+    existing=true
+  fi
+  if ! mv "$source" "$destination"; then
+    if [ "$existing" = true ]; then
+      mv "$backup/$app_name" "$destination" || fatal "Cannot restore gateway; backup retained at $backup"
+    fi
+    rmdir "$backup"
+    fatal "Cannot install gateway bundle"
+  fi
+  if ! mv -f "$link_stage/duduclaw" "$bin_dir/duduclaw"; then
+    mv "$destination" "$source" || fatal "Cannot roll back gateway; backup retained at $backup"
+    if [ "$existing" = true ]; then
+      mv "$backup/$app_name" "$destination" || fatal "Cannot restore gateway; backup retained at $backup"
+    fi
+    rmdir "$backup"
+    fatal "Cannot install CLI symlink"
+  fi
+  rm -rf "$backup"
+)
+
 # ---------------------------------------------------------------------------
 # Install binary from GitHub release
 # ---------------------------------------------------------------------------
@@ -173,25 +245,50 @@ install_from_release() {
   local tmp_dir
 
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  INSTALL_TMP="$tmp_dir"
+  trap 'rm -rf "$INSTALL_TMP"' EXIT
 
   heading "Downloading DuDuClaw v${DUDUCLAW_VERSION} (${target})..."
   echo "  URL: ${release_url}"
 
-  if ! download "$release_url" "${tmp_dir}/${target}.${archive_ext}" 2>/dev/null; then
-    return 1
+  if [[ "$target" == duduclaw-darwin-* ]]; then
+    local bundle_url="${release_url%.tar.gz}.app.zip" status
+    has_cmd curl || fatal "curl is required to download the macOS gateway bundle"
+    status="$(curl -sSL --retry 3 --retry-delay 2 -w '%{http_code}' -o "${tmp_dir}/${target}.app.zip" "$bundle_url")" || fatal "Gateway bundle download failed"
+    case "$status" in
+      200) archive_ext="app.zip"; release_url="$bundle_url" ;;
+      404) warn "Gateway bundle unavailable for this release; using legacy tarball" ;;
+      *) fatal "Gateway bundle download failed (HTTP $status)" ;;
+    esac
+    sha_url="${release_url}.sha256"
+  fi
+  if [ "$archive_ext" != "app.zip" ]; then
+    if ! download "$release_url" "${tmp_dir}/${target}.${archive_ext}" 2>/dev/null; then
+      return 1
+    fi
   fi
 
-  # Verify checksum if available
+  # Bundle checksums are required; a mismatch is fatal on every platform.
   if download "$sha_url" "${tmp_dir}/${target}.${archive_ext}.sha256" 2>/dev/null; then
     heading "Verifying checksum..."
     cd "$tmp_dir"
     if has_cmd sha256sum; then
-      sha256sum -c "${target}.${archive_ext}.sha256" >/dev/null 2>&1 && info "Checksum verified" || warn "Checksum verification failed"
+      sha256sum -c "${target}.${archive_ext}.sha256" >/dev/null 2>&1 && info "Checksum verified" || fatal "Checksum verification failed"
     elif has_cmd shasum; then
-      shasum -a 256 -c "${target}.${archive_ext}.sha256" >/dev/null 2>&1 && info "Checksum verified" || warn "Checksum verification failed"
+      shasum -a 256 -c "${target}.${archive_ext}.sha256" >/dev/null 2>&1 && info "Checksum verified" || fatal "Checksum verification failed"
+    else
+      fatal "No SHA-256 verification tool found"
     fi
     cd - >/dev/null
+  elif [ "$archive_ext" = "app.zip" ]; then
+    fatal "Gateway bundle checksum is unavailable"
+  fi
+
+  if [ "$archive_ext" = "app.zip" ]; then
+    local app_dir="${DUDUCLAW_APP_DIR:-$HOME/Applications}"
+    install_macos_bundle "${tmp_dir}/${target}.app.zip" "$app_dir" "$INSTALL_DIR" || fatal "Gateway bundle installation failed"
+    info "Installed to $app_dir/DuDuClaw Gateway.app (CLI: $INSTALL_DIR/duduclaw)"
+    return 0
   fi
 
   # Extract

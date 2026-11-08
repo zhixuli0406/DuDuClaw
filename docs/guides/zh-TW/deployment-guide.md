@@ -6,6 +6,18 @@
 
 ---
 
+## macOS 安裝
+
+macOS 建議使用 `install.sh`，讓已簽署的 Gateway App 安裝在固定位置。安裝程式使用 macOS 內建工具：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | bash
+```
+
+安裝程式會下載已簽署及公證的 `.app.zip`，驗證 SHA-256 校驗碼後安裝至 `~/Applications/DuDuClaw Gateway.app`。CLI `~/.duduclaw/bin/duduclaw` 是指向 `DuDuClaw Gateway.app/Contents/MacOS/duduclaw` 的符號連結；請將 `~/.duduclaw/bin` 加入 `PATH`。
+
+可用 `DUDUCLAW_APP_DIR` 指定 App 目錄、`DUDUCLAW_HOME` 指定 CLI 的安裝家目錄。沒有 `.app.zip` 的舊版仍會使用 tarball。npm 仍可使用，macOS 平台套件內也包含 App；macOS 安裝優先建議使用 `install.sh`。
+
 ## 1. 本機開發
 
 ```bash

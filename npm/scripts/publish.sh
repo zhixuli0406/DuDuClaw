@@ -67,6 +67,17 @@ for artifact in "${!PLATFORM_MAP[@]}"; do
   tar xzf "$tarball" -C "$bin_dir" --strip-components=0 duduclaw
   chmod +x "${bin_dir}/duduclaw"
   echo "  Extracted ${artifact} → ${platform_dir}/bin/duduclaw"
+  if [[ "$platform_dir" == darwin-* ]]; then
+    app_zip="${ARTIFACTS_DIR}/${artifact}.app.zip"
+    if [ ! -f "$app_zip" ]; then
+      echo "ERROR: missing macOS gateway bundle: $app_zip" >&2
+      exit 1
+    fi
+    python3 "${SCRIPT_DIR}/../../scripts/check_update_archive_size.py" "$app_zip"
+    # Remove the previous bundle so stale signed files cannot survive a rerun.
+    rm -rf "${NPM_DIR}/${platform_dir}/DuDuClaw Gateway.app"
+    unzip -q "$app_zip" -d "${NPM_DIR}/${platform_dir}"
+  fi
 done
 
 # Step 2b: Extract Windows binary from zip
