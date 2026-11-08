@@ -3311,6 +3311,9 @@ export interface AgentUpdateParams {
   heartbeat_cron_timezone?: string;
   // G.8 — free-form scalar tables
   prompt?: Record<string, string | number | boolean>;
+  /** `[prompt] reply_language`: `auto` | `zh-TW` | `zh-CN` | `en` | `ja-JP`;
+   *  empty string clears the override (inherit the global default). */
+  reply_language?: string;
 }
 
 // ── WP4: agent handoff (offboard with transfer) ─────────────────

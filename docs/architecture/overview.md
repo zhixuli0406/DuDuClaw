@@ -19,7 +19,7 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 ### Channels (11)
 - **Telegram** (long polling) — file/photo/sticker/voice, forums/topics, mention-only, voice transcription through the OpenAI Whisper API.
 - **LINE** (webhook) — HMAC-SHA256 signature, sticker catalog, per-chat settings.
-- **Discord** (Gateway WebSocket) — `tokio::select!` heartbeat, slash commands, auto-thread; voice channels (Songbird) only in builds with the non-default `discord-voice` feature, which release binaries do not include. v1.9.2 hardened: real op 6 RESUME (persists `session_id` + `resume_gateway_url` + sequence), stall watchdog (break if no traffic for 2× heartbeat interval), heartbeat capacity 1→16 with `try_send`, op 9 jitter 1-5s, RESUMED dispatch handling, backoff cap 60s.
+- **Discord** (Gateway WebSocket) — `tokio::select!` heartbeat, slash commands, auto-thread v1.9.2 hardened: real op 6 RESUME (persists `session_id` + `resume_gateway_url` + sequence), stall watchdog (break if no traffic for 2× heartbeat interval), heartbeat capacity 1→16 with `try_send`, op 9 jitter 1-5s, RESUMED dispatch handling, backoff cap 60s.
 - **Slack** (Socket Mode), **WhatsApp** (Cloud API webhook, signature fail-closed), **Feishu** (Open Platform v2), **Google Chat** (webhook, JWT-verified), **Microsoft Teams** (Azure Bot / Connector v3, JWT-verified), **WeCom** (HMAC-SHA1 + AES-256-CBC), **DingTalk** (HMAC-SHA256 + time window), **WebChat** (`/ws/chat` + React frontend).
 - The generic `POST /webhook/{agent_id}` endpoint was never mounted and was removed in v1.66; inbound webhooks belong to individual channels and to Odoo (`POST /webhook/odoo`).
 - **Channel hot-start/stop**: Dashboard `channels.add` / `channels.remove` launches/aborts the channel task without gateway restart.
@@ -86,7 +86,6 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - **HTTP endpoints**: `POST /api/stt` (an OpenAI-compatible transcription API or a local command template; 501 when no STT provider is configured), `POST /api/tts` over Piper (local) / Kokoro / Azure / MiniMax T2A / OpenAI TTS.
 - **Telegram voice**: transcription follows the configured STT provider (with the existing Whisper fallback when unconfigured); spoken replies use the shared TTS router and dashboard TTS settings, with a text fallback.
 - Local Kokoro-82M v1.1-zh (Apache-2.0; download about 134 MB from Settings → Voice) replaces the optional CLI. Auto routing: installed Piper → installed Kokoro → MiniMax → OpenAI → Azure. Kokoro Chinese has a mainland accent and can misread polyphonic words. Azure AI Speech REST offers Taiwanese Mandarin voices; it sends text to Microsoft and requires `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION`. Telegram receives local Kokoro audio as WAV (`sendAudio`).
-- **Not in release binaries**: in-process Whisper (`whisper` feature), ONNX embedding (`onnx` feature) and Discord voice (`discord-voice` feature).
 - SenseVoice, Deepgram, Silero VAD, `symphonia` decoding and LiveKit voice rooms were listed here before; none of them has code. See [`docs/features/14-voice-pipeline.md`](../features/14-voice-pipeline.md).
 
 ### Security

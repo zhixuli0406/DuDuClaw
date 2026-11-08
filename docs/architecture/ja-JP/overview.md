@@ -19,7 +19,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 ### チャネル（11種類）
 - **Telegram**（ロングポーリング）— ファイル/写真/スタンプ/音声、フォーラム/トピック、メンション限定、OpenAI Whisper API による音声文字起こし。
 - **LINE**（webhook）— HMAC-SHA256署名、スタンプカタログ、チャットごとの設定。
-- **Discord**（Gateway WebSocket）— `tokio::select!` によるハートビート、スラッシュコマンド、自動スレッド。ボイスチャンネル（Songbird）はデフォルト無効の `discord-voice` feature を有効にしたビルドでのみ使え、リリースバイナリには含まれません。v1.9.2で強化：本物のop 6 RESUME（`session_id` + `resume_gateway_url` + シーケンス番号を永続化）、スタール監視（ハートビート間隔の2倍を超えて通信がなければ切断）、ハートビートチャネルの容量を1→16にし `try_send` へ変更、op 9に1〜5秒のジッターを追加、RESUMEDディスパッチの処理、backoff上限を60秒に短縮。
+- **Discord**（Gateway WebSocket）— `tokio::select!` によるハートビート、スラッシュコマンド、自動スレッド。v1.9.2で強化：本物のop 6 RESUME（`session_id` + `resume_gateway_url` + シーケンス番号を永続化）、スタール監視（ハートビート間隔の2倍を超えて通信がなければ切断）、ハートビートチャネルの容量を1→16にし `try_send` へ変更、op 9に1〜5秒のジッターを追加、RESUMEDディスパッチの処理、backoff上限を60秒に短縮。
 - **Slack**（Socket Mode）、**WhatsApp**（Cloud API webhook、署名検証は fail-closed）、**Feishu**（Open Platform v2）、**Google Chat**（webhook、JWT 検証）、**Microsoft Teams**（Azure Bot / Connector v3、JWT 検証）、**WeCom**（HMAC-SHA1 + AES-256-CBC）、**DingTalk**（HMAC-SHA256 + 時間窓）、**WebChat**（`/ws/chat` + Reactフロントエンド）。
 - 汎用の `POST /webhook/{agent_id}` エンドポイントは一度もマウントされたことがなく、v1.66 で削除されました。受信 webhook は個々のチャネルと Odoo（`POST /webhook/odoo`）に属します。
 - **チャネルのホットスタート/ストップ**：Dashboardの `channels.add` / `channels.remove` でgatewayを再起動せずにチャネルタスクを起動/中断できます。
@@ -86,7 +86,6 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - **HTTP エンドポイント**：`POST /api/stt`（OpenAI 互換の文字起こし API またはローカルのコマンドテンプレート。STT provider が未設定なら 501）、`POST /api/tts`（Piper（ローカル）/ Kokoro / Azure / MiniMax T2A / OpenAI TTS）。
 - **Telegram の音声**：文字起こしは設定済み STT プロバイダーを使用（未設定時は従来の Whisper にフォールバック）。音声返信は共通 TTS ルーターとダッシュボードの TTS 設定に従い、失敗時はテキストに戻ります。
 - ローカル Kokoro-82M v1.1-zh（Apache-2.0、設定 → 音声から約 134 MB をダウンロード）が従来の任意 CLI に代わります。自動選択順はインストール済み Piper → インストール済み Kokoro → MiniMax → OpenAI → Azure。Kokoro の中国語は中国大陸のアクセントで、多音字を誤読する場合があります。公式 Azure AI Speech REST は台湾の中国語音声を提供し、テキストを Microsoft に送信します。`AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` が必要です。Telegram はローカル Kokoro 音声を WAV として受信します（`sendAudio`）。
-- **リリースバイナリに含まれないもの**：プロセス内 Whisper（`whisper` feature）、ONNX 埋め込み（`onnx` feature）、Discord ボイス（`discord-voice` feature）。
 - SenseVoice、Deepgram、Silero VAD、`symphonia` によるデコード、LiveKit の音声ルームは以前ここに記載されていましたが、いずれもコードが存在しません。[`docs/features/ja-JP/14-voice-pipeline.md`](../../features/ja-JP/14-voice-pipeline.md) を参照。
 
 ### セキュリティ

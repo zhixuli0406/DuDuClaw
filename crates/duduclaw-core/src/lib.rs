@@ -1,3 +1,4 @@
+pub mod module_lease;
 pub mod autonomy_gate;
 pub mod autonomy_handoff;
 pub mod agent_guard;

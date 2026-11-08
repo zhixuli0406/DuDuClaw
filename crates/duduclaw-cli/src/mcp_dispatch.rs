@@ -1417,8 +1417,9 @@ impl McpDispatcher {
         {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             self.audit_dispatch_denial(principal, tool_name, &params_owned, "system_operation_human_denied", "A live administrator or proven background context is required");
-            let language = duduclaw_gateway::prompt_identity::read_default_language(&self.home_dir).await;
+            let language = duduclaw_gateway::prompt_identity::resolve_fixed_message_language_for_id(&self.home_dir, gate_agent).await;
             let message = match language.as_deref() {
+                Some("zh-CN" | "zh_CN") => "只有系统管理员可以操作机器。",
                 Some("en") => "Only an administrator can operate the machine.",
                 Some("ja" | "ja-JP") => "機器を操作できるのは管理者だけです。",
                 _ => "只有系統管理員可以操作機器。",

@@ -3853,6 +3853,12 @@ pub struct PromptConfig {
     ///
     /// See [#15 in commercial/docs/plans/TODO-runtime-health-fixes-202605.md].
     pub cli_bare_mode: bool,
+    /// Per-employee reply language override (`[prompt] reply_language`).
+    /// One of `auto` / `zh-TW` / `zh-CN` / `en` / `ja-JP`; `auto` follows the
+    /// user's input language. Absent ⇒ inherit `config.toml [general]
+    /// default_language`. See `profile_sections::resolve_reply_language_setting`.
+    #[serde(default, deserialize_with = "crate::lenient::opt", skip_serializing_if = "Option::is_none")]
+    pub reply_language: Option<String>,
 }
 
 impl Default for PromptConfig {
@@ -3861,6 +3867,7 @@ impl Default for PromptConfig {
             mode: PromptMode::Full,
             minimal_core_kb: 5,
             cli_bare_mode: false,
+            reply_language: None,
         }
     }
 }

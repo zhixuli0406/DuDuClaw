@@ -78,12 +78,6 @@ v1.67.1 起，「語音」分頁拿掉了「語音回覆模式」「語音辨識
 
 ---
 
-## Discord 語音
-
-`discord_voice.rs` 在**非預設的 `discord-voice` Cargo feature** 之後包裝 **Songbird**；gateway 的 `default` 是 `["dashboard", "desktop"]`，所以出廠 build 不含它。它背後今天也沒有 VAD、沒有接 ASR——這個模組涵蓋的是加入頻道與播放音訊。
-
----
-
 ## ONNX embedding
 
 `duduclaw-inference` 的 `onnx` feature 啟用 `OnnxEmbeddingProvider`（ONNX Runtime ＋ WordPiece tokenizer），用於 `bge-small-zh` 之類的模型。它不是語音元件，而是記憶系統語意搜尋共用的基礎設施（見 [10-cognitive-memory.md](10-cognitive-memory.md)），而且同樣**不在**該 crate 的 default features 裡。

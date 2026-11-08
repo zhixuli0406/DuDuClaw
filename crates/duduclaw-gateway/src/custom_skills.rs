@@ -33,7 +33,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::debug;
 
 use crate::skill_lifecycle::security_scanner::RiskLevel;
 
@@ -68,6 +68,38 @@ pub fn draft_dir(home_dir: &Path, id: &str) -> PathBuf {
 /// The `SKILL.md` path for a draft.
 pub fn draft_skill_path(home_dir: &Path, id: &str) -> PathBuf {
     draft_dir(home_dir, id).join("SKILL.md")
+}
+
+/// Per-attempt draft directory: `<home>/skills-drafts/<id>/<message_id>/`.
+/// Each generation attempt writes to its own path so output from a superseded
+/// (late / re-queued) attempt can never be mistaken for the current one.
+/// The message id is filtered to `[A-Za-z0-9_-]` so it can't escape the dir.
+pub fn draft_attempt_dir(home_dir: &Path, id: &str, message_id: &str) -> PathBuf {
+    let safe: String = message_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    draft_dir(home_dir, id).join(safe)
+}
+
+/// The `SKILL.md` path for one generation attempt.
+pub fn draft_attempt_skill_path(home_dir: &Path, id: &str, message_id: &str) -> PathBuf {
+    draft_attempt_dir(home_dir, id, message_id).join("SKILL.md")
+}
+
+/// The draft path that counts for `rec` right now: the current attempt's file
+/// when a generation was started, else the legacy un-suffixed path (drafts
+/// written directly, e.g. by recording distillation).
+pub fn current_draft_path(home_dir: &Path, rec: &CustomSkillRecord) -> PathBuf {
+    match rec.generation_message_id.as_deref() {
+        Some(m) if !m.is_empty() => draft_attempt_skill_path(home_dir, &rec.id, m),
+        _ => draft_skill_path(home_dir, &rec.id),
+    }
+}
+
+/// True when `path` is a non-empty file.
+pub fn file_nonempty(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
 }
 
 /// The skill-loader scan roots (must stay in sync with
@@ -152,7 +184,9 @@ pub fn is_valid_transition(from: CustomSkillStatus, to: CustomSkillStatus) -> bo
         (from, to),
         (Draft, Generating)
             | (Draft, PendingApproval)      // submit straight from a hand-written draft
-            | (Generating, Draft)           // generation finished / re-draft
+            | (Generating, Draft)           // generation finished / failed / re-draft
+            | (Generating, Generating)      // regenerate after a stalled attempt
+            | (Rejected, Generating)        // regenerate straight from a rejection
             | (Generating, PendingApproval)
             | (PendingApproval, Approved)
             | (PendingApproval, Rejected)
@@ -205,6 +239,114 @@ pub struct CustomSkillRecord {
     /// a struct field (existing literal constructors live outside this module);
     /// read it via [`CustomSkillStore::registry_last_used_map`].
     pub usage_count: u64,
+    /// Bus message id of the in-flight (or last) generation request. Lets the
+    /// dispatcher map a failed agent reply back to this row.
+    pub generation_message_id: Option<String>,
+    /// RFC-3339 time the current generation attempt was queued.
+    pub generation_started_at: Option<String>,
+    /// Machine-readable reason code the last generation attempt failed (see the
+    /// `GEN_ERR_*` constants / `dispatch:<label>`); the UI maps it to localized
+    /// text. Cleared when a new attempt starts. A `draft` row with this set =
+    /// "failed".
+    pub generation_error: Option<String>,
+}
+
+/// Failure code: the attempt exceeded [`GENERATION_TIMEOUT_SECS`].
+pub const GEN_ERR_TIMEOUT: &str = "timeout";
+/// Failure code: the agent finished but wrote no draft.
+pub const GEN_ERR_NO_DRAFT: &str = "no_draft";
+/// Error code: a fresh generation is already running for this skill.
+pub const GEN_ERR_IN_PROGRESS: &str = "in_progress";
+/// Failure code: the request could not be queued.
+pub const GEN_ERR_ENQUEUE: &str = "dispatch:enqueue";
+
+/// Seconds since the current attempt was queued (server clock); `None` unless
+/// the record is `generating` with a parseable start time.
+pub fn generation_age_secs(rec: &CustomSkillRecord, now: DateTime<Utc>) -> Option<i64> {
+    if rec.status != CustomSkillStatus::Generating {
+        return None;
+    }
+    let ts = rec
+        .generation_started_at
+        .as_deref()
+        .unwrap_or(rec.updated_at.as_str());
+    age_secs(ts, now).map(|a| a.max(0))
+}
+
+/// Whether the server would accept a (re)generate request right now.
+pub fn can_regenerate(rec: &CustomSkillRecord, now: DateTime<Utc>) -> bool {
+    if !is_valid_transition(rec.status, CustomSkillStatus::Generating) {
+        return false;
+    }
+    rec.status != CustomSkillStatus::Generating
+        || generation_older_than(rec, GENERATION_STALE_SECS, now)
+}
+
+/// A generation attempt still `generating` after this long is declared failed.
+pub const GENERATION_TIMEOUT_SECS: i64 = 10 * 60;
+/// Regenerate is allowed while `generating` once the attempt is this old.
+pub const GENERATION_STALE_SECS: i64 = 3 * 60;
+/// Max stored length of `generation_error` (chars).
+pub const GENERATION_ERROR_MAX_CHARS: usize = 500;
+
+/// Collapse whitespace/control chars and cap length so an agent/CLI error is
+/// safe to store and show to an end user.
+pub fn sanitize_generation_error(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    duduclaw_core::truncate_chars(&cleaned, GENERATION_ERROR_MAX_CHARS)
+}
+
+/// Age in seconds of an RFC-3339 timestamp; `None` when unparseable.
+fn age_secs(ts: &str, now: DateTime<Utc>) -> Option<i64> {
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| (now - dt.with_timezone(&Utc)).num_seconds())
+}
+
+/// True when a `generating` record has been waiting longer than `limit_secs`.
+/// Legacy rows without `generation_started_at` fall back to `updated_at`.
+pub fn generation_older_than(rec: &CustomSkillRecord, limit_secs: i64, now: DateTime<Utc>) -> bool {
+    if rec.status != CustomSkillStatus::Generating {
+        return false;
+    }
+    let ts = rec
+        .generation_started_at
+        .as_deref()
+        .unwrap_or(rec.updated_at.as_str());
+    age_secs(ts, now).map(|a| a >= limit_secs).unwrap_or(false)
+}
+
+/// Decide whether a finished dispatch means generation failed for `rec`.
+///
+/// Pure matching function used by the dispatcher: only dashboard-origin
+/// replies to the exact message id stored on a still-`generating` row count.
+/// `outcome`'s `Err` carries an already-classified reason *code*
+/// (`dispatch:<label>`), never raw agent/CLI text. Returns the failure code, or
+/// `None` when it is not ours / fine.
+pub fn generation_failure_reason(
+    rec: &CustomSkillRecord,
+    origin_agent: Option<&str>,
+    in_reply_to: &str,
+    outcome: Result<(), &str>,
+    draft_nonempty: bool,
+) -> Option<String> {
+    if origin_agent != Some("dashboard")
+        || rec.status != CustomSkillStatus::Generating
+        || rec.generation_message_id.as_deref() != Some(in_reply_to)
+    {
+        return None;
+    }
+    match outcome {
+        Err(e) => Some(sanitize_generation_error(e)),
+        Ok(()) if !draft_nonempty => Some(GEN_ERR_NO_DRAFT.to_string()),
+        Ok(()) => None,
+    }
 }
 
 // ── Curation (G5 curator lifecycle) ─────────────────────────
@@ -272,6 +414,9 @@ pub struct SkillCurationRecord {
 
 // ── Store ───────────────────────────────────────────────────
 
+/// `PRAGMA user_version` stamped once `init_schema` has fully run.
+const SCHEMA_USER_VERSION: i64 = 1;
+
 /// SQLite-backed registry for custom skills. Mirrors the project store idioms
 /// (`Mutex<Connection>`, WAL, self-healing schema, parameterized SQL only).
 pub struct CustomSkillStore {
@@ -283,11 +428,38 @@ pub struct CustomSkillStore {
 impl CustomSkillStore {
     /// Open (or create) `<home>/custom_skills.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
+        static INITIALIZED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+            std::sync::OnceLock::new();
         let db_path = home_dir.join("custom_skills.db");
+        // Schema init is once per process per path — but only trusted while the
+        // file still exists (a deleted db must be re-initialised).
+        let existed = db_path.exists();
         let conn =
             Connection::open(&db_path).map_err(|e| format!("open custom skills store: {e}"))?;
-        Self::init_schema(&conn)?;
-        info!(?db_path, "CustomSkillStore initialized");
+        let seen = INITIALIZED.get_or_init(Default::default);
+        let already = existed
+            && seen
+                .lock()
+                .map(|s| s.contains(&db_path))
+                .unwrap_or(false);
+        // A cache hit is only trusted while the file carries our schema stamp:
+        // a replaced/restored db file reads back a different `user_version`.
+        let already = already
+            && conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .map(|v| v == SCHEMA_USER_VERSION)
+                .unwrap_or(false);
+        if already {
+            // Per-connection setting; journal_mode=WAL persists in the file.
+            conn.busy_timeout(std::time::Duration::from_millis(5000))
+                .map_err(|e| format!("custom skills busy_timeout: {e}"))?;
+        } else {
+            Self::init_schema(&conn)?;
+            if let Ok(mut s) = seen.lock() {
+                s.insert(db_path.clone());
+            }
+            debug!(?db_path, "CustomSkillStore initialized");
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: Some(db_path),
@@ -333,17 +505,33 @@ impl CustomSkillStore {
         )
         .map_err(|e| format!("init custom skills schema: {e}"))?;
 
-        // Idempotent migrations: `ADD COLUMN` on a live table re-runs on every
-        // open, so we swallow the "duplicate column name" error (the only
-        // expected failure) and surface any other.
+        // Idempotent migrations: only ALTER when the column is missing
+        // (PRAGMA table_info), so an up-to-date db issues no failing DDL.
         //   - `usage_count` (L5 §14 — per-skill invocation counter)
         //   - `last_used_at` (G5 curator — last-invocation timestamp)
-        for ddl in [
-            "ALTER TABLE custom_skill_registry ADD COLUMN usage_count INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE custom_skill_registry ADD COLUMN last_used_at TEXT",
+        //   - `generation_*` (RM-087 — generation failure tracking)
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(custom_skill_registry)")
+                .map_err(|e| format!("read custom_skill_registry columns: {e}"))?;
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| format!("read custom_skill_registry columns: {e}"))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("read custom_skill_registry columns: {e}"))?
+        };
+        for (col, ddl) in [
+            ("usage_count", "ALTER TABLE custom_skill_registry ADD COLUMN usage_count INTEGER NOT NULL DEFAULT 0"),
+            ("last_used_at", "ALTER TABLE custom_skill_registry ADD COLUMN last_used_at TEXT"),
+            ("generation_message_id", "ALTER TABLE custom_skill_registry ADD COLUMN generation_message_id TEXT"),
+            ("generation_started_at", "ALTER TABLE custom_skill_registry ADD COLUMN generation_started_at TEXT"),
+            ("generation_error", "ALTER TABLE custom_skill_registry ADD COLUMN generation_error TEXT"),
         ] {
+            if existing.contains(col) {
+                continue;
+            }
             if let Err(e) = conn.execute(ddl, []) {
                 let msg = e.to_string();
+                // Lost a race with another process adding it — fine.
                 if !msg.contains("duplicate column name") {
                     return Err(format!("migrate custom_skill_registry: {msg}"));
                 }
@@ -379,6 +567,8 @@ impl CustomSkillStore {
              );",
         )
         .map_err(|e| format!("init skill curation schema: {e}"))?;
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_USER_VERSION};"))
+            .map_err(|e| format!("stamp custom skills schema version: {e}"))?;
         Ok(())
     }
 
@@ -388,8 +578,9 @@ impl CustomSkillStore {
             "INSERT INTO custom_skill_registry
                 (id, slug, display_name, description_human, time_saved_value, time_saved_unit,
                  tags, created_by_user, built_by_agent, status, approval_id, rejection_reason,
-                 created_at, updated_at, approved_at, usage_count)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                 created_at, updated_at, approved_at, usage_count,
+                 generation_message_id, generation_started_at, generation_error)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 rec.id,
                 rec.slug,
@@ -407,10 +598,134 @@ impl CustomSkillStore {
                 rec.updated_at,
                 rec.approved_at,
                 rec.usage_count as i64,
+                rec.generation_message_id,
+                rec.generation_started_at,
+                rec.generation_error,
             ],
         )
         .map_err(|e| format!("insert custom skill: {e}"))?;
         Ok(())
+    }
+
+    /// Look up a record by the bus message id of its generation request.
+    pub async fn get_by_generation_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<CustomSkillRecord>, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            &SELECT_ALL.replace(
+                "FROM custom_skill_registry",
+                "FROM custom_skill_registry WHERE generation_message_id = ?1",
+            ),
+            params![message_id],
+            row_to_record,
+        )
+        .optional()
+        .map_err(|e| format!("get custom skill by generation message: {e}"))
+    }
+
+    /// Start (or restart) a generation attempt as ONE conditional UPDATE
+    /// (compare-and-swap), so concurrent requests cannot both win: it succeeds
+    /// only from `draft`/`rejected`, or from `generating` when the running
+    /// attempt started before `stale_cutoff` (RFC-3339) — i.e. is stale.
+    /// Stores the queued message id + start time and clears any previous error.
+    ///
+    /// `Err(GEN_ERR_IN_PROGRESS)` when a fresh attempt is running; other `Err`s
+    /// for a missing row / illegal source status.
+    pub async fn begin_generation(
+        &self,
+        id: &str,
+        message_id: &str,
+        started_at: &str,
+        stale_cutoff: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE custom_skill_registry SET
+                    status = 'generating',
+                    rejection_reason = NULL,
+                    generation_message_id = ?2,
+                    generation_started_at = ?3,
+                    generation_error = NULL,
+                    updated_at = ?3
+                 WHERE id = ?1
+                   AND status IN ('draft', 'rejected', 'generating')
+                   AND (status <> 'generating'
+                        OR generation_started_at IS NULL
+                        OR julianday(generation_started_at) IS NULL
+                        OR julianday(generation_started_at) < julianday(?4))",
+                params![id, message_id, started_at, stale_cutoff],
+            )
+            .map_err(|e| format!("begin generation: {e}"))?;
+        if n > 0 {
+            return Ok(());
+        }
+        // CAS lost — report why.
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT status FROM custom_skill_registry WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("read status: {e}"))?;
+        match current.map(|s| CustomSkillStatus::from_db(&s)) {
+            None => Err(format!("custom skill {id} not found")),
+            Some(CustomSkillStatus::Generating) => Err(GEN_ERR_IN_PROGRESS.to_string()),
+            Some(from) => Err(format!("cannot generate from status {}", from.as_str())),
+        }
+    }
+
+    /// Record a generation failure for ONE specific attempt: only acts on a
+    /// `generating` row whose `generation_message_id` is still
+    /// `expected_message_id` (so a late timeout / dispatcher settle for an old
+    /// attempt cannot fail a newer one). Stores the reason code and returns the
+    /// row to `draft` (`draft` + `generation_error` = "failed" in the UI).
+    /// Returns true when a row was changed.
+    pub async fn fail_generation(
+        &self,
+        id: &str,
+        expected_message_id: Option<&str>,
+        reason: &str,
+    ) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let reason = sanitize_generation_error(reason);
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE custom_skill_registry SET
+                    status = 'draft',
+                    generation_error = ?2,
+                    updated_at = ?3
+                 WHERE id = ?1 AND status = 'generating'
+                   AND generation_message_id IS ?4",
+                params![id, reason, now, expected_message_id],
+            )
+            .map_err(|e| format!("fail generation: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// Clear a recorded failure because the attempt `expected_message_id`
+    /// actually completed late (its draft file exists). Only acts on a `draft`
+    /// row whose current attempt is that message. Returns true when changed.
+    pub async fn clear_generation_error(
+        &self,
+        id: &str,
+        expected_message_id: &str,
+    ) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE custom_skill_registry SET generation_error = NULL, updated_at = ?3
+                 WHERE id = ?1 AND status = 'draft' AND generation_error IS NOT NULL
+                   AND generation_message_id = ?2",
+                params![id, expected_message_id, now],
+            )
+            .map_err(|e| format!("clear generation error: {e}"))?;
+        Ok(n > 0)
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<CustomSkillRecord>, String> {
@@ -429,7 +744,8 @@ impl CustomSkillStore {
         conn.query_row(
             "SELECT id, slug, display_name, description_human, time_saved_value, time_saved_unit,
                     tags, created_by_user, built_by_agent, status, approval_id, rejection_reason,
-                    created_at, updated_at, approved_at, usage_count
+                    created_at, updated_at, approved_at, usage_count,
+                    generation_message_id, generation_started_at, generation_error
              FROM custom_skill_registry WHERE approval_id = ?1",
             params![approval_id],
             row_to_record,
@@ -826,11 +1142,13 @@ impl CustomSkillStore {
 
 const SELECT_COLS: &str = "SELECT id, slug, display_name, description_human, time_saved_value, \
     time_saved_unit, tags, created_by_user, built_by_agent, status, approval_id, rejection_reason, \
-    created_at, updated_at, approved_at, usage_count FROM custom_skill_registry WHERE id = ?1";
+    created_at, updated_at, approved_at, usage_count, generation_message_id, \
+    generation_started_at, generation_error FROM custom_skill_registry WHERE id = ?1";
 
 const SELECT_ALL: &str = "SELECT id, slug, display_name, description_human, time_saved_value, \
     time_saved_unit, tags, created_by_user, built_by_agent, status, approval_id, rejection_reason, \
-    created_at, updated_at, approved_at, usage_count FROM custom_skill_registry";
+    created_at, updated_at, approved_at, usage_count, generation_message_id, \
+    generation_started_at, generation_error FROM custom_skill_registry";
 
 fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<CustomSkillRecord> {
     let status_text: String = row.get(9)?;
@@ -851,6 +1169,9 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<CustomSkillRecord> {
         updated_at: row.get(13)?,
         approved_at: row.get(14)?,
         usage_count: row.get::<_, i64>(15)?.max(0) as u64,
+        generation_message_id: row.get(16)?,
+        generation_started_at: row.get(17)?,
+        generation_error: row.get(18)?,
     })
 }
 
@@ -970,7 +1291,231 @@ mod tests {
             updated_at: now,
             approved_at: None,
             usage_count: 0,
+            generation_message_id: None,
+            generation_started_at: None,
+            generation_error: None,
         }
+    }
+
+    // ── RM-087: generation failure tracking ─────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_columns_roundtrip_and_failure() {
+        let store = CustomSkillStore::open_in_memory().unwrap();
+        store.insert(&rec("g1", "alice")).await.unwrap();
+        let t0 = Utc::now().to_rfc3339();
+        // Cutoff far in the past ⇒ a running attempt is never stale here.
+        let never = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        store.begin_generation("g1", "msg-1", &t0, &never).await.unwrap();
+        let got = store.get("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, CustomSkillStatus::Generating);
+        assert_eq!(got.generation_message_id.as_deref(), Some("msg-1"));
+        assert_eq!(got.generation_started_at.as_deref(), Some(t0.as_str()));
+        assert!(got.generation_error.is_none());
+        assert_eq!(
+            store.get_by_generation_message("msg-1").await.unwrap().unwrap().id,
+            "g1"
+        );
+
+        assert!(store.fail_generation("g1", Some("msg-1"), "boom\n  bad").await.unwrap());
+        let got = store.get("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, CustomSkillStatus::Draft);
+        assert_eq!(got.generation_error.as_deref(), Some("boom bad"));
+        // Only acts on generating rows.
+        assert!(!store.fail_generation("g1", Some("msg-1"), "again").await.unwrap());
+
+        // Retry clears the error and may restart from draft.
+        store.begin_generation("g1", "msg-2", &t0, &never).await.unwrap();
+        assert!(store.get("g1").await.unwrap().unwrap().generation_error.is_none());
+        // Illegal source states are refused (error surfaced, not dropped).
+        store.insert(&rec("g2", "alice")).await.unwrap();
+        store
+            .transition("g2", CustomSkillStatus::Retired, None, None, false)
+            .await
+            .unwrap();
+        assert!(store.begin_generation("g2", "m", &t0, &never).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn begin_generation_is_compare_and_swap() {
+        let store = CustomSkillStore::open_in_memory().unwrap();
+        store.insert(&rec("c1", "alice")).await.unwrap();
+        let now = Utc::now();
+        let started = now.to_rfc3339();
+        let cutoff = (now - chrono::Duration::seconds(GENERATION_STALE_SECS)).to_rfc3339();
+        store.begin_generation("c1", "m1", &started, &cutoff).await.unwrap();
+        // Second begin inside the stale window loses; the first attempt stays.
+        let err = store.begin_generation("c1", "m2", &started, &cutoff).await.unwrap_err();
+        assert_eq!(err, GEN_ERR_IN_PROGRESS);
+        let got = store.get("c1").await.unwrap().unwrap();
+        assert_eq!(got.generation_message_id.as_deref(), Some("m1"));
+        // Once the cutoff passes the start time (attempt is stale), it wins.
+        let later_cutoff = (now + chrono::Duration::seconds(5)).to_rfc3339();
+        let later = (now + chrono::Duration::seconds(6)).to_rfc3339();
+        store.begin_generation("c1", "m3", &later, &later_cutoff).await.unwrap();
+        assert_eq!(
+            store.get("c1").await.unwrap().unwrap().generation_message_id.as_deref(),
+            Some("m3")
+        );
+        // Missing row.
+        assert!(store.begin_generation("nope", "m", &started, &cutoff).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fail_generation_ignores_superseded_attempt() {
+        let store = CustomSkillStore::open_in_memory().unwrap();
+        store.insert(&rec("f1", "alice")).await.unwrap();
+        let now = Utc::now();
+        let t = now.to_rfc3339();
+        let past = (now - chrono::Duration::days(1)).to_rfc3339();
+        store.begin_generation("f1", "old", &t, &past).await.unwrap();
+        let future = (now + chrono::Duration::seconds(10)).to_rfc3339();
+        store.begin_generation("f1", "new", &t, &future).await.unwrap();
+        // A late failure for the OLD attempt is a no-op.
+        assert!(!store.fail_generation("f1", Some("old"), GEN_ERR_TIMEOUT).await.unwrap());
+        let got = store.get("f1").await.unwrap().unwrap();
+        assert_eq!(got.status, CustomSkillStatus::Generating);
+        assert!(got.generation_error.is_none());
+        // The current attempt can be failed, and then cleared when it completes late.
+        assert!(store.fail_generation("f1", Some("new"), GEN_ERR_TIMEOUT).await.unwrap());
+        assert!(!store.clear_generation_error("f1", "old").await.unwrap());
+        assert!(store.clear_generation_error("f1", "new").await.unwrap());
+        assert!(store.get("f1").await.unwrap().unwrap().generation_error.is_none());
+    }
+
+    #[test]
+    fn draft_path_is_per_attempt() {
+        let home = Path::new("/h");
+        let mut r = rec("p1", "alice");
+        assert_eq!(current_draft_path(home, &r), draft_skill_path(home, "p1"));
+        r.generation_message_id = Some("m-1".into());
+        let a = current_draft_path(home, &r);
+        r.generation_message_id = Some("m-2".into());
+        let b = current_draft_path(home, &r);
+        assert_ne!(a, b);
+        assert!(a.starts_with(draft_dir(home, "p1")));
+        // Traversal characters in a message id cannot escape the draft dir.
+        assert!(draft_attempt_skill_path(home, "p1", "../../x").starts_with(draft_dir(home, "p1")));
+    }
+
+    #[test]
+    fn age_and_can_regenerate_are_server_computed() {
+        let now = Utc::now();
+        let mut r = rec("a1", "alice");
+        assert!(can_regenerate(&r, now));
+        assert_eq!(generation_age_secs(&r, now), None);
+        r.status = CustomSkillStatus::Generating;
+        r.generation_started_at = Some((now - chrono::Duration::seconds(30)).to_rfc3339());
+        assert_eq!(generation_age_secs(&r, now), Some(30));
+        assert!(!can_regenerate(&r, now));
+        r.generation_started_at = Some((now - chrono::Duration::seconds(GENERATION_STALE_SECS + 1)).to_rfc3339());
+        assert!(can_regenerate(&r, now));
+        r.status = CustomSkillStatus::Retired;
+        assert!(!can_regenerate(&r, now));
+    }
+
+    #[test]
+    fn open_reinitialises_a_replaced_db_file() {
+        let home = std::env::temp_dir().join(format!("duduclaw-cs-swap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let a = CustomSkillStore::open(&home).unwrap();
+        rt.block_on(async { a.insert(&rec("s1", "alice")).await.unwrap() });
+        drop(a);
+        // Replace the file with a pre-RM-087 db (the path stays cached).
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(home.join(format!("custom_skills.db{ext}")));
+        }
+        {
+            let c = Connection::open(home.join("custom_skills.db")).unwrap();
+            c.execute_batch(
+                "CREATE TABLE custom_skill_registry (id TEXT PRIMARY KEY, slug TEXT NOT NULL,
+                 display_name TEXT NOT NULL, description_human TEXT NOT NULL DEFAULT '',
+                 time_saved_value REAL NOT NULL DEFAULT 0, time_saved_unit TEXT NOT NULL DEFAULT 'minutes_per_use',
+                 tags TEXT NOT NULL DEFAULT '', created_by_user TEXT NOT NULL, built_by_agent TEXT NOT NULL DEFAULT '',
+                 status TEXT NOT NULL DEFAULT 'draft', approval_id TEXT, rejection_reason TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, approved_at TEXT);",
+            )
+            .unwrap();
+        }
+        let b = CustomSkillStore::open(&home).unwrap();
+        rt.block_on(async {
+            b.insert(&rec("s2", "alice")).await.unwrap();
+            assert!(b.get("s2").await.unwrap().is_some());
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn generation_timeout_detection() {
+        let now = Utc::now();
+        let mut r = rec("t1", "alice");
+        r.status = CustomSkillStatus::Generating;
+        r.generation_started_at = Some((now - chrono::Duration::minutes(11)).to_rfc3339());
+        assert!(generation_older_than(&r, GENERATION_TIMEOUT_SECS, now));
+        r.generation_started_at = Some((now - chrono::Duration::minutes(2)).to_rfc3339());
+        assert!(!generation_older_than(&r, GENERATION_TIMEOUT_SECS, now));
+        assert!(!generation_older_than(&r, GENERATION_STALE_SECS, now));
+        // Legacy row: falls back to updated_at.
+        r.generation_started_at = None;
+        r.updated_at = (now - chrono::Duration::minutes(20)).to_rfc3339();
+        assert!(generation_older_than(&r, GENERATION_TIMEOUT_SECS, now));
+        // Not generating ⇒ never timed out.
+        r.status = CustomSkillStatus::Draft;
+        assert!(!generation_older_than(&r, GENERATION_TIMEOUT_SECS, now));
+    }
+
+    #[test]
+    fn generation_failure_matching() {
+        let mut r = rec("m1", "alice");
+        r.status = CustomSkillStatus::Generating;
+        r.generation_message_id = Some("msg-1".into());
+        // Error from dashboard-origin reply to our message ⇒ failure code.
+        let reason =
+            generation_failure_reason(&r, Some("dashboard"), "msg-1", Err("dispatch:timeout"), false)
+                .unwrap();
+        assert_eq!(reason, "dispatch:timeout");
+        assert_eq!(
+            generation_failure_reason(&r, Some("dashboard"), "msg-1", Ok(()), false).as_deref(),
+            Some(GEN_ERR_NO_DRAFT)
+        );
+        // Ok but no draft ⇒ failure; Ok with draft ⇒ none.
+        assert!(generation_failure_reason(&r, Some("dashboard"), "msg-1", Ok(()), false).is_some());
+        assert!(generation_failure_reason(&r, Some("dashboard"), "msg-1", Ok(()), true).is_none());
+        // Wrong message id / origin / status ⇒ not ours.
+        assert!(generation_failure_reason(&r, Some("dashboard"), "other", Err("e"), false).is_none());
+        assert!(generation_failure_reason(&r, Some("agnes"), "msg-1", Err("e"), false).is_none());
+        assert!(generation_failure_reason(&r, None, "msg-1", Err("e"), false).is_none());
+        r.status = CustomSkillStatus::Draft;
+        assert!(generation_failure_reason(&r, Some("dashboard"), "msg-1", Err("e"), false).is_none());
+    }
+
+    #[test]
+    fn open_runs_schema_once_and_migrates_old_db() {
+        let home = std::env::temp_dir().join(format!("duduclaw-cs-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        // Pre-RM-087 db: old table without any optional columns.
+        {
+            let c = Connection::open(home.join("custom_skills.db")).unwrap();
+            c.execute_batch(
+                "CREATE TABLE custom_skill_registry (id TEXT PRIMARY KEY, slug TEXT NOT NULL,
+                 display_name TEXT NOT NULL, description_human TEXT NOT NULL DEFAULT '',
+                 time_saved_value REAL NOT NULL DEFAULT 0, time_saved_unit TEXT NOT NULL DEFAULT 'minutes_per_use',
+                 tags TEXT NOT NULL DEFAULT '', created_by_user TEXT NOT NULL, built_by_agent TEXT NOT NULL DEFAULT '',
+                 status TEXT NOT NULL DEFAULT 'draft', approval_id TEXT, rejection_reason TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, approved_at TEXT);",
+            )
+            .unwrap();
+        }
+        let _a = CustomSkillStore::open(&home).unwrap();
+        // Second open (cached path) must still yield a usable connection.
+        let b = CustomSkillStore::open(&home).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            b.insert(&rec("o1", "alice")).await.unwrap();
+            assert!(b.get("o1").await.unwrap().unwrap().generation_error.is_none());
+        });
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // ── Fail-closed #1: TTL expiry (and any non-approved) must NOT install ──
