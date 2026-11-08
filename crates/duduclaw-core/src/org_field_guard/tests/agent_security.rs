@@ -105,7 +105,48 @@ const SECTION_CASES: &[(&str, &str, &str)] = &[
         "[os_watch]\npaths = [\"~/Documents\"]",
         "[os_watch]\npaths = [\"~/\"]",
     ),
+    (
+        "isolation",
+        "[isolation]\npublic_web = false",
+        "[isolation]\npublic_web = true",
+    ),
 ];
+
+/// Owner decision 2026-11-08: the protected-mode public-web switch is its own
+/// admin-only field. The employee can neither turn it on, add it, nor remove
+/// it; the operator (no agent identity) keeps editing it, and it parses as a
+/// typed default-off field independent of `[container] network_access`.
+#[test]
+fn public_web_switch_is_admin_only_field() {
+    assert!(AGENT_SECURITY_SECTIONS.contains(&"isolation"));
+    assert!(!AGENT_EDITABLE_SECTIONS.contains(&"isolation"));
+    let off = with("[isolation]\npublic_web = false");
+    let on = with("[isolation]\npublic_web = true");
+    for (before, after) in [(off.as_str(), on.as_str()), (BASE, on.as_str()), (on.as_str(), BASE)] {
+        let d = as_agent(before, after);
+        match &d {
+            GuardDecision::BlockedAgentSecuritySection { changed, .. } => assert!(
+                changed.iter().any(|c| c.starts_with("isolation.") || c.starts_with("[isolation]")),
+                "{changed:?}"
+            ),
+            other => panic!("expected BlockedAgentSecuritySection, got {other:?}"),
+        }
+    }
+    // Turning on the sandbox network does not touch the protected switch,
+    // and is itself frozen for the employee as before.
+    let network = with("[container]\nnetwork_access = true\n[isolation]\npublic_web = false");
+    assert!(matches!(as_agent(&off, &network), GuardDecision::BlockedAgentSecuritySection { .. }));
+    // The operator path keeps its pre-existing contract.
+    assert_eq!(
+        check_protected_toml_write_as(&agent_path(), &home(), &HookCaller::Absent, Some(&off), &on),
+        GuardDecision::AllowedAgentWrite
+    );
+    // Typed parse: absent ⇒ off; the switch never follows `network_access`.
+    let parse = |body: &str| toml::from_str::<crate::types::IsolationSection>(body).unwrap();
+    assert!(!parse("").public_web);
+    assert!(parse("public_web = true").public_web);
+    assert!(crate::types::IsolationSection::default().is_default());
+}
 
 #[test]
 fn every_security_section_change_is_refused_for_an_agent() {

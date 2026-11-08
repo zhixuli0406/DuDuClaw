@@ -93,9 +93,42 @@ impl GatewayResourceResolver {
         if !self.task_owned("create_task", id.as_str())? { return Err(VerificationError::Invalid); }
         Ok(vec![selector])
     }
+    /// H9 owner decision 3: `create_task` of an interactive run files a NEW
+    /// top-level plan only. Fixed fields, none from arguments: the assignee is
+    /// this employee (every step targets this employee's own agent or names
+    /// none, which the handler reads as the caller), and the creator/audience
+    /// is the signed requester, which must be the record's human principal
+    /// (`new_task_grant`) and, for a Personal employee, its owner (B1). Task,
+    /// goal and dependency selectors are refused; nothing is read from tasks.db.
+    fn new_task_selector(&self, context: &RequestContext, args: &Value)
+        -> Result<Vec<ResourceGrant>, VerificationError> {
+        use duduclaw_mcp_boundary::tool_policy::{new_task_grant, new_task_steps, TASK_SELECTOR_KEYS};
+        if TASK_SELECTOR_KEYS.iter().any(|key| args.get(*key).is_some()) { return Err(VerificationError::Invalid); }
+        let grant = new_task_grant(context)?;
+        let ResourceGrant::NewTask { requester } = &grant else { return Err(VerificationError::Invalid); };
+        let record = context.record();
+        if let duduclaw_isolation::capability::EmployeeBinding::Personal(_) = &record.employee_binding {
+            if !record.personal_owner_matches(requester.as_str()) { return Err(VerificationError::BindingMismatch); }
+        }
+        for step in new_task_steps(args)? {
+            for key in ["agent", "agent_id", "assigned_to", "assignee"] {
+                match step.get(key) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(agent)) if agent.is_empty() || *agent == self.agent => {}
+                    Some(_) => return Err(VerificationError::BindingMismatch),
+                }
+            }
+        }
+        Ok(vec![grant])
+    }
     fn selected_tasks(&self, context: &RequestContext, policy: &ToolPolicy, args: &Value)
         -> Result<Vec<ResourceGrant>, VerificationError> {
-        if policy.name == "create_task" { return self.create_task_selector(context, args); }
+        if policy.name == "create_task" {
+            // A task/schedule run plans under its own record task (H8); an
+            // interactive run (no record task) may only file a new plan.
+            return if context.record().task.is_some() { self.create_task_selector(context, args) }
+                else { self.new_task_selector(context, args) };
+        }
         let mut selected = Vec::new();
         for key in ["task_id", "parent_task_id", "goal_id", "parent_goal_id"] {
             if let Some(id) = string(args, key)? { selected.push(id.to_owned()); }

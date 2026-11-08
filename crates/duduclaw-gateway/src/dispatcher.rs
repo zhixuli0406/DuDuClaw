@@ -294,6 +294,12 @@ async fn pending_isolation_approval<F: std::future::Future<Output = Result<Strin
     if crate::isolation_background::approval_pending() {
         return Err(DispatchError::AutonomyPaused("背景工作正在等候管理員核准。".into()));
     }
+    // A scope that holds no authority and knows why (a task reassigned to
+    // another employee or deleted, a Personal employee, a pre-v1.81 receipt)
+    // records that reason instead of failing later at the protected launch.
+    if let Some(reason) = crate::isolation_background::refusal_reason() {
+        return Err(DispatchError::Other(reason.into()));
+    }
     future.await
 }
 

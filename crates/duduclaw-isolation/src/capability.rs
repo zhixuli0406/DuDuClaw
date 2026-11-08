@@ -56,6 +56,15 @@ pub enum ResourceGrant {
     /// (see [`PublicOrigin`]). It never weakens the host fetch: DNS answers are
     /// pinned, non-public addresses are refused and redirects are not followed.
     PublicOrigins { origins: List<PublicOrigin, PUBLIC_ORIGINS_MAX> },
+    /// CONTRACT CHANGE (H9 owner decision 3, tag 12): `create_task` authority
+    /// of an interactive run to file new top-level plans that are assigned to
+    /// the record's own employee and filed on behalf of `requester`. It selects
+    /// no existing task, goal or dependency. Valid only alongside
+    /// `EmployeeScope` for the record's own employee, with no record task, at
+    /// most once, never `Confined`, and only when the record principal is
+    /// `Human { user_id == requester }`: a Background principal never holds it
+    /// (see [`CapabilityRecord::check_new_task`]).
+    NewTask { requester: Text<128> },
 }
 
 /// Most entries in one `PublicOrigins` grant.
@@ -120,8 +129,9 @@ impl<'de> Deserialize<'de> for PublicOrigin {
 /// Persistable capability claims (§6.1). Hashes/nonces are metadata, not bearers.
 /// Epoch changes invalidate all old records after gateway restart; policy and
 /// principal generations must be checked live on every call, not just at mint.
-/// Decoding refuses a `PublicOrigins` grant that is not valid for the record
-/// (see [`CapabilityRecord::check_public_origins`]); signing re-checks it.
+/// Decoding refuses a `PublicOrigins` or `NewTask` grant that is not valid for
+/// the record (see [`CapabilityRecord::check_public_origins`] and
+/// [`CapabilityRecord::check_new_task`]); signing re-checks both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "CapabilityRecordWire")]
 pub struct CapabilityRecord {
@@ -173,6 +183,7 @@ impl TryFrom<CapabilityRecordWire> for CapabilityRecord {
         let record = Self { id, employee, run, task, principal, employee_binding, lane, tools, resources,
             policy_revision, gateway_epoch, issued_at, not_before, expires_at, nonce, jti };
         record.check_public_origins()?;
+        record.check_new_task()?;
         Ok(record)
     }
 }
@@ -220,6 +231,7 @@ fn resource_bytes(resource: &ResourceGrant) -> Vec<u8> {
             out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
             for entry in entries { text_bytes(&mut out, entry); }
         }
+        ResourceGrant::NewTask { requester } => { out.push(12); text_bytes(&mut out, requester.as_str()); }
     }
     out
 }
@@ -251,20 +263,22 @@ impl CapabilityRecord {
     /// not narrow the employee-scope authority of Service/Connector handlers.
     pub fn validate_resource_mode(&self) -> Result<(), ContractError> {
         self.check_public_origins()?;
+        self.check_new_task()?;
         let scopes: Vec<_> = self.resources.as_slice().iter().filter_map(|grant| match grant {
             ResourceGrant::EmployeeScope { id } => Some(*id), _ => None,
         }).collect();
         if !scopes.is_empty() && (scopes != [self.employee] || self.task.is_some()
             || self.resources.as_slice().iter().any(|grant| !matches!(grant,
                 ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::Workspace { .. }
-                | ResourceGrant::UrlOrigin { .. } | ResourceGrant::Confined { .. } | ResourceGrant::PublicOrigins { .. }))) {
+                | ResourceGrant::UrlOrigin { .. } | ResourceGrant::Confined { .. } | ResourceGrant::PublicOrigins { .. }
+                | ResourceGrant::NewTask { .. }))) {
             return Err(ContractError::InvalidValue("ambiguous employee-scope resource policy"));
         }
         for grant in self.resources.as_slice() {
             if let ResourceGrant::Confined { resource } = grant {
                 if scopes.is_empty() || matches!(resource.as_ref(), ResourceGrant::Confined { .. }
                     | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. }
-                    | ResourceGrant::PublicOrigins { .. }) {
+                    | ResourceGrant::PublicOrigins { .. } | ResourceGrant::NewTask { .. }) {
                     return Err(ContractError::InvalidValue("invalid confined resource"));
                 }
             }
@@ -297,6 +311,35 @@ impl CapabilityRecord {
             || self.resources.as_slice().iter().any(|grant|
                 matches!(grant, ResourceGrant::EmployeeScope { id } if *id != self.employee)))) {
             return Err(ContractError::InvalidValue("public origins require own employee scope"));
+        }
+        Ok(())
+    }
+
+    /// The `NewTask` rules, applied on decode and before signing: only in an
+    /// employee-scope record (EmployeeScope for this record's own employee, no
+    /// task), at most one such grant, never `Confined`, and its `requester` must
+    /// be the record's own `Human` principal. A Background principal (no human
+    /// requester) can never carry it.
+    pub fn check_new_task(&self) -> Result<(), ContractError> {
+        let mut found = 0;
+        for grant in self.resources.as_slice() {
+            match grant {
+                ResourceGrant::Confined { resource } if matches!(resource.as_ref(), ResourceGrant::NewTask { .. }) =>
+                    return Err(ContractError::InvalidValue("confined new task")),
+                ResourceGrant::NewTask { requester } => {
+                    found += 1;
+                    let human = matches!(&self.principal, Principal::Human { user_id, .. } if user_id == requester);
+                    if !human || requester.as_str().is_empty() {
+                        return Err(ContractError::InvalidValue("new task requires the human requester"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if found > 1 || (found == 1 && (!self.employee_scope() || self.task.is_some()
+            || self.resources.as_slice().iter().any(|grant|
+                matches!(grant, ResourceGrant::EmployeeScope { id } if *id != self.employee)))) {
+            return Err(ContractError::InvalidValue("new task requires own employee scope"));
         }
         Ok(())
     }
@@ -607,6 +650,53 @@ mod tests {
         let mut scope_only = public_scoped(origins(&["*"]));
         scope_only.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scope_only.employee }]).unwrap();
         assert_ne!(scope_only.canonical_bytes().unwrap(), public_scoped(origins(&["*"])).canonical_bytes().unwrap());
+    }
+    fn new_task(requester: &str) -> ResourceGrant { ResourceGrant::NewTask { requester: Text::new(requester.into()).unwrap() } }
+    #[test]
+    fn new_task_grant_mac_covered() {
+        // Tag 12 + u32-length requester; additive, encoding version unchanged.
+        let actual: String = resource_bytes(&new_task("u")).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(actual, "0c0000000175");
+        // record() is Human { user_id: "u" }: the requester is that principal.
+        let scoped = public_scoped(new_task("u"));
+        let bytes = scoped.canonical_bytes().unwrap();
+        assert_eq!(&bytes[CAPABILITY_DOMAIN.len()..CAPABILITY_DOMAIN.len() + 2], &[0, 2]);
+        let encoded = resource_bytes(&new_task("u"));
+        assert!(bytes.windows(encoded.len()).any(|window| window == encoded.as_slice()));
+        let mut without = scoped.clone();
+        without.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scoped.employee }]).unwrap();
+        assert_ne!(without.canonical_bytes().unwrap(), bytes, "the grant is MAC-covered");
+        // Distinct from a record Task grant with the same text.
+        let task = ResourceGrant::Task { id: Text::new("u".into()).unwrap() };
+        assert_ne!(resource_bytes(&task), encoded);
+        // Serde round trip, then decode/sign refusals with the same rules.
+        let json = serde_json::to_value(&scoped).unwrap();
+        assert_eq!(serde_json::from_value::<CapabilityRecord>(json.clone()).unwrap(), scoped);
+        let mut other = json.clone();
+        other["resources"][1]["requester"] = serde_json::json!("v");
+        assert!(serde_json::from_value::<CapabilityRecord>(other).is_err(), "requester must be the principal");
+        let mut background = json.clone();
+        background["principal"] = serde_json::json!({"kind":"background","tenant_id":"u","generation":4});
+        assert!(serde_json::from_value::<CapabilityRecord>(background).is_err(), "never a Background principal");
+        let mut tasked = json.clone();
+        tasked["task"] = serde_json::json!("t");
+        assert!(serde_json::from_value::<CapabilityRecord>(tasked).is_err());
+        let mut confined = json;
+        confined["resources"][1] = serde_json::json!({"kind":"confined","resource":{"kind":"new_task","requester":"u"}});
+        assert!(serde_json::from_value::<CapabilityRecord>(confined).is_err());
+        let mut bad = scoped.clone();
+        bad.principal = Principal::Background { tenant_id: Text::new("u".into()).unwrap(), generation: 4 };
+        assert!(bad.canonical_bytes().is_err() && bad.validate_resource_mode().is_err());
+        bad = record();
+        bad.resources = List::new(vec![new_task("u")]).unwrap();
+        assert!(bad.canonical_bytes().is_err(), "requires own EmployeeScope and no task");
+        bad.task = None;
+        bad.resources = List::new(vec![ResourceGrant::Employee { id: bad.employee }, new_task("u")]).unwrap();
+        assert!(bad.canonical_bytes().is_err());
+        bad.resources = List::new(vec![ResourceGrant::EmployeeScope { id: bad.employee }, new_task("u"), new_task("u")]).unwrap();
+        assert!(bad.canonical_bytes().is_err(), "at most once");
+        bad.resources = List::new(vec![ResourceGrant::EmployeeScope { id: bad.employee }, new_task("")]).unwrap();
+        assert!(bad.canonical_bytes().is_err());
     }
     #[test]
     fn public_origins_rejects_ip_literal_and_userinfo() {
