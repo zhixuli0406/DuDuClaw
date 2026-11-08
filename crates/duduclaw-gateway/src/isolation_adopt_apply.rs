@@ -354,12 +354,20 @@ pub(crate) fn sealed_inputs(home: &Path, q: &Quarantined, target: &str) -> Resul
 /// Re-key every registered store except the digest-covered org entry (the
 /// proposal states the new one) under the row key. Idempotent.
 pub(crate) fn rekey_row(home: &Path, q: &Quarantined, adopt: &AdoptRef) -> Result<(), AdoptError> {
+    rekey_stores(home, q, adopt, false).map(|_| ())
+}
+
+/// [`rekey_row`], with `Ok(true)` when the `MidRekey` crash point fired after
+/// a store moved. The crash is reported apart from a store failure: a
+/// failure rolls back (§3.10 step 6), a crash must leave the row `adopting`
+/// and the request `applying` for recovery to finish the re-key (S10).
+fn rekey_stores(home: &Path, q: &Quarantined, adopt: &AdoptRef, crash_point: bool) -> Result<bool, AdoptError> {
     use crate::isolation_label_stores::{TombstoneAction, LABEL_KEYED_STORES};
     for store in LABEL_KEYED_STORES.iter().filter(|store| store.action != TombstoneAction::Digest) {
         store.rekey(home, &q.label, &adopt.store_key()).map_err(unavailable)?;
-        if crash_at(AdoptHook::MidRekey) { return Err(AdoptError::Unavailable); }
+        if crash_point && crash_at(AdoptHook::MidRekey) { return Ok(true); }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// A positive zero count under every label (an unreadable store is not zero).
@@ -546,7 +554,8 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     let snapshot = crate::handlers::employee_dirs::snapshot(home, &agents, &target).map_err(|_| fail(AdoptError::ForeignDir))?;
     if snapshot.settings().map_err(|_| fail(AdoptError::SettingsInvalid))? != settings { return Err(fail(AdoptError::SettingsChanged)); }
     // 4. Nothing label-keyed is carried (N1, S10).
-    rekey_row(home, &q, &adopt).map_err(fail)?;
+    // A crash point ends the call without `fail` (no cleanup, as on process death).
+    if rekey_stores(home, &q, &adopt, true).map_err(fail)? { return Err(AdoptError::Unavailable); }
     require_zero(home, &[&q.label, &target]).map_err(fail)?;
     // 5. Marker (R8), confirmed row + mirror, Shared bindings, commit.
     write_marker(home, &target, q.owner.as_deref().unwrap_or(""), &snapshot.digest, &adopt).map_err(fail)?;

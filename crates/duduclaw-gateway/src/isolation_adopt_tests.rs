@@ -374,6 +374,39 @@ fn adopt_crash_mid_rekey_never_goes_live_with_old_rows() {
     assert_eq!(seal_of(f.home()), "sealed");
 }
 
+/// Regression: the `MidRekey` crash point used to surface through the apply
+/// step's failure path, which rolled the row back to `sealed` and the request
+/// to `failed` in-process, so recovery never saw an `adopting` row and never
+/// finished the re-key. A crash leaves the row for recovery, which re-keys
+/// every store before it rolls back (proposal gone).
+#[test]
+fn adopt_mid_rekey_crash_leaves_row_adopting_for_recovery() {
+    let f = fixture();
+    tombstoned_full(&f, "soul");
+    tasks_db(f.home(), LABEL);
+    let ax = ax();
+    let request = file_personal(&f, &ax, None).unwrap();
+    let (plan, item) = propose(&f, &ax, &request);
+    ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::MidRekey)));
+    let (crashed, _) = apply(&f, &ax, &item);
+    ADOPT_HOOK.with(|h| *h.borrow_mut() = None);
+    assert_eq!(crashed.err(), Some(AdoptError::Unavailable));
+    // No cleanup ran: the moved tree, the `adopting` row and the `applying` request stay.
+    assert_eq!(seal_of(f.home()), "adopting");
+    assert_eq!(stored(f.home(), &request.request_id).state, "applying");
+    assert!(f.home().join("agents").join(LABEL).join("SOUL.md").exists());
+    assert_eq!(tasks_under(f.home(), LABEL), 1);
+    // The proposal is gone: recovery re-keys first, then rolls back.
+    sql(f.home(), APPLY_DB, "UPDATE employee_restores SET proposal_id=?1 WHERE request_id=?2", &[&"f".repeat(32), &request.request_id]);
+    let done = recover_adoptions(f.home(), &env(&ax), LABEL).unwrap();
+    assert_eq!(done, vec![(request.request_id.clone(), "rolled_back")]);
+    assert_eq!(tasks_under(f.home(), LABEL), 0);
+    assert_eq!(tasks_under(f.home(), &plan.adopt.store_key()), 1);
+    assert!(quarantined(f.home(), "SOUL.md") && !f.home().join("agents").join(LABEL).exists());
+    assert_eq!(seal_of(f.home()), "sealed");
+    assert_eq!(stored(f.home(), &request.request_id).state, "failed");
+}
+
 #[test]
 fn adopt_records_root_absent() {
     let f = fixture();
