@@ -124,9 +124,17 @@ impl SpawndFeatures {
     /// (`Opcode::WORK`). A decode bit, not availability: each op still fails
     /// closed (`workspace_broker_unavailable`, …) on a host without the broker.
     pub const WORK_BROKER: Self = Self(1 << 1);
+    /// `helper_recording` (HX6 gate, D8 revision §4): on this host Chromium
+    /// was proven to launch under F_L ∩ F_H and the recording's nested
+    /// Landlock (root probe, `Host::recording_ready`). Requires
+    /// `helper_calls`. Without it the recording tools are not signed and a
+    /// start answers `helper_recording_unsupported`; no sandbox is weakened.
+    /// An availability bit only: it gates no opcode.
+    pub const HELPER_RECORDING: Self = Self(1 << 2);
     /// Bit → wire name, for readiness and audit output.
-    pub const NAMES: [(Self, &'static str); 2] =
-        [(Self::HELPER_CALLS, "helper_calls"), (Self::WORK_BROKER, "work_broker")];
+    pub const NAMES: [(Self, &'static str); 3] =
+        [(Self::HELPER_CALLS, "helper_calls"), (Self::WORK_BROKER, "work_broker"),
+            (Self::HELPER_RECORDING, "helper_recording")];
     pub const fn contains(self, feature: Self) -> bool { feature.0 != 0 && self.0 & feature.0 == feature.0 }
     pub const fn with(self, feature: Self) -> Self { Self(self.0 | feature.0) }
     pub const fn without(self, feature: Self) -> Self { Self(self.0 & !feature.0) }

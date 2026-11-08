@@ -6,6 +6,8 @@
   "isolationReadiness.reason.setup": "External connection service setup is not complete.",
   "isolationReadiness.reason.revoked": "Access has been revoked. Ask an administrator to check the account binding.",
   "isolationReadiness.reason.temporary": "The service is temporarily unavailable. Check again later.",
+  "isolationReadiness.reason.recording": "Protected browser recording is disabled on this host: the browser has not been proven to start inside the helper sandbox.",
+  "isolationReadiness.recordingEgress": "Enabling browser recording for an AI employee ([isolation] public_web = true) grants that employee’s protected runtime public-web egress; recordings reach only what that egress allows.",
   "isolationReadiness.hint.binding": "Finish employee setup in migration confirmations",
   "isolationReadiness.hint.connector": "Go to connector settings",
   "isolationReadiness.hint.personal": "Check members in user management",

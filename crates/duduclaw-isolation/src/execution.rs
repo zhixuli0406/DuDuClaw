@@ -260,6 +260,12 @@ pub trait ExecutionBackend: Send + Sync {
     fn cancel_helper(&self, _run: RunHandle, _call: crate::ipc::HelperCallId) -> HelperFuture<'_, ()> {
         Box::pin(async { Err(HelperError::Unavailable) })
     }
+    /// HX6: ask a recording-slot call to flush and exit (`HelperStop`: the
+    /// launcher writes `stop\n` to its stdin). `Ok` is root's acceptance only;
+    /// the end is `wait_helper`'s `HelperEnded`. Never stops the run [F8].
+    fn stop_helper(&self, _run: RunHandle, _call: crate::ipc::HelperCallId) -> HelperFuture<'_, ()> {
+        Box::pin(async { Err(HelperError::Unavailable) })
+    }
 }
 
 /// HX5 helper-call future; errors are typed per-call results (§5).
@@ -301,6 +307,10 @@ pub enum HelperError {
     /// Unknown run, not Running, or not this employee's run.
     #[error("run not live")] NotLive,
     #[error("helper call denied")] Denied,
+    /// HX6: root has no such helper in this run's signed table (spawnd
+    /// `runtime_denied`). For the recording this is the offline parent: an
+    /// egress binding exists only under an Egress parent (publication check 4).
+    #[error("helper absent from the run")] Absent,
     /// A request may have reached root; the outcome is unknown.
     #[error("helper call uncertain")] Uncertain,
 }
@@ -315,6 +325,7 @@ impl HelperError {
             Self::CgroupUnavailable => "helper_cgroup_unavailable",
             Self::NotLive => "run_ended",
             Self::Denied => "refused",
+            Self::Absent => "helper_runtime_missing",
             Self::Uncertain => "uncertain",
         }
     }

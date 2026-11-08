@@ -66,9 +66,20 @@ rechecks (a change refuses the run):
   each refusal writes an `isolation_task_run_refused` security-audit row
   (`reason: task_not_owned`, `stage: schedule` or `issuance`).
 
+HX6: browser recording (`browser_record_start` / `browser_record_stop`) is an
+in-run helper in the caller's recording slot. The issuer selects
+`Workspace{employee-work}` for it only when spawnd advertises `helper_calls`
+and `helper_recording` (Chromium proven to start under the helper sandbox on
+this host; until then readiness names `helper_recording_unsupported`), the
+employee's admin-only `[isolation] public_web` switch is on (enabling recording
+grants that employee's runtime public-web egress, owner decision Q3) and the run
+is interactive (`workspace_selection::drops_from_signed_with`). An offline parent
+answers `helper_parent_offline`. Results are stored per `(run, call)` with each
+artifact's sha256 (`recording_jobs`); a later read must match them
+(`artifact_modified`).
+
 Workspace and URL-origin selection for the other File/A/E tools is still
-missing, including browser recording (`browser_record_start` /
-`browser_record_stop`, task HX6). `employee-work` is also the A execution
+missing. `employee-work` is also the A execution
 workspace handle, so when the issuer selects it (for the file tools or the HX5
 helpers) it leaves every other listed tool whose eligibility would rest on that
 grant out of the signed tool snapshot (`Selection::signed_tools`, `mcp-boundary`
@@ -258,8 +269,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; shared skill scanned and prepared by E as data; scanned body copied only into the caller's own SKILLS (no clobber, read back); no target argument (H12a) |
 | `plan_start` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_improve` | Resource → AuthorizedToolCall → original live employee handler |
-| `browser_record_start` | A ExecutionBackend + ExecutionPlanFactory; protected route pending (HX6): never signed with `employee-work` (`PENDING_WORKSPACE_SELECTOR_TOOLS`) |
-| `browser_record_stop` | A ExecutionBackend + ExecutionPlanFactory; protected route pending (HX6): never signed with `employee-work` (`PENDING_WORKSPACE_SELECTOR_TOOLS`) |
+| `browser_record_start` | HX6 `Route::InRunHelper`, recording slot of the caller's own run (`ExecutionToolBridge::execute_recording`, `prepare_in_run` → `AuthorizedHelperPlan::recording`, spawnd `HelperCall{slot: recording}`); returns `{status: recording, id}` (spawnd call id); gateway collector stores the decoded result + artifact sha256 per `(run, call)` (`recording_jobs`); flushed at run end (`ended_by: run_end`), hard kill ⇒ `uncertain/run_killed`; offline parent ⇒ `helper_parent_offline`; needs `Workspace{employee-work}`, spawnd `helper_calls` + `helper_recording` and `[isolation] public_web` |
+| `browser_record_stop` | HX6 `Route::InRunHelper`: same run ⇒ `HelperStop` for that `(run, call)` and the stored result (the old `:180` refusal inverted, never `parse_handle`); later run or terminal row ⇒ stored result, no helper interaction; revocation ⇒ `HelperStop`, `ended_by: revoked`; same selector as `browser_record_start` |
 | `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `skill_from_recording` | Resource → original authenticated host orchestration; checked E parser required |

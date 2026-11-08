@@ -352,6 +352,8 @@ struct BootOwner {
     main_plans: Arc<duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory>,
     execution_plans: Arc<dyn ExecutionPlanFactory>,
     execution_jobs: Arc<duduclaw_mcp_boundary::execution_jobs::SqliteExecutionJobs>,
+    /// HX6: `(run, call)` rows of in-run browser recordings (same DB file).
+    recording_jobs: Arc<duduclaw_mcp_boundary::recording_jobs::SqliteRecordingJobs>,
     fork_tools: Arc<dyn duduclaw_mcp_boundary::forks::ForkToolService>,
     worker_plans: Arc<dyn WorkerPlanFactory>,
     #[cfg(feature = "isolation-worker-integration")]
@@ -611,6 +613,7 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
         if let Some(inputs) = sources.connector_inputs.take() { install_stack_factory(home, stack, inputs, &worker); }
     }
     let execution_jobs = duduclaw_mcp_boundary::execution_jobs::SqliteExecutionJobs::open(&home.join("isolation-execution-jobs.db"))?;
+    let recording_jobs = duduclaw_mcp_boundary::recording_jobs::SqliteRecordingJobs::open(&home.join("isolation-execution-jobs.db"))?;
     let fork_tools = match sources.fork_tools.take() {
         Some(service) => service,
         None => Arc::new(duduclaw_mcp_boundary::forks::ForkHostControl {
@@ -618,7 +621,7 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
             backend: backend.clone(),
         }),
     };
-    Ok(BootOwner { generation: sources.installed_generation.ok_or(VerificationError::Unavailable)?, fork_tools, execution_jobs, product_authority: sources.product_authority, home: home.to_owned(), backend: backend.clone(), boundary, bindings, worker,
+    Ok(BootOwner { generation: sources.installed_generation.ok_or(VerificationError::Unavailable)?, fork_tools, execution_jobs, recording_jobs, product_authority: sources.product_authority, home: home.to_owned(), backend: backend.clone(), boundary, bindings, worker,
         registry: sources.runtime_registry.take().ok_or(VerificationError::Unavailable)?,
         main_plans: sources.main_plans.take().ok_or(VerificationError::Unavailable)?,
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,
@@ -712,6 +715,7 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
         let factories = GatewayFactories::assemble(Some(owner.backend.clone()), Some(owner.execution_plans.clone()),
             resolver.clone(), Some(owner.worker.parser.clone()), input.roots.clone())?
             .with_execution_jobs(owner.execution_jobs.clone())
+            .with_recording_jobs(owner.recording_jobs.clone())
             .with_forks(owner.fork_tools.clone())
             .with_worker(owner.worker.tools(worker_plans, resolver.clone()));
         let dispatcher_input = DispatcherInput {
@@ -781,15 +785,19 @@ mod tests {
     }
 }
 
-/// Dashboard control stays available while D8 is occupied by a recording. It
-/// never mints an employee context or waits synchronously for that employee.
+/// Dashboard control of an in-run recording (HX6, D8 revision §4). Live run:
+/// `HelperStop` for exactly that `(run, call)` through spawnd; ended: the
+/// stored result. It never issues `HelperCall`, never mints an employee
+/// context and never stops the run. Called on a blocking thread.
 pub(crate) fn control_recording(home: &Path, ctx: &duduclaw_auth::UserContext, id: &str, stop: bool)
     -> Result<serde_json::Value, VerificationError> {
     crate::approval::require_current_dashboard_role_in_home(home, ctx, duduclaw_auth::UserRole::Admin)
         .map_err(|_| VerificationError::Invalid)?;
-    let run = duduclaw_mcp_boundary::execution_jobs::parse_handle(id)?;
+    duduclaw_mcp_boundary::recording_jobs::parse_id(id)?;
     let owner = OWNER.get().filter(|owner| owner.home == home).ok_or(VerificationError::Unavailable)?;
-    let result = owner.execution_jobs.admin_recording_control(run, stop)?;
+    let runtime = tokio::runtime::Handle::try_current().map_err(|_| VerificationError::Unavailable)?;
+    let result = runtime.block_on(duduclaw_mcp_boundary::execution::control_recording(
+        owner.recording_jobs.clone(), owner.backend.clone(), id, stop))?;
     if stop {
         duduclaw_security::audit::append_audit_event(home, &duduclaw_security::audit::AuditEvent::new(
             "isolation_recording_stop_requested", "gateway", duduclaw_security::audit::Severity::Info,

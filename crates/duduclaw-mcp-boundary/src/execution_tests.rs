@@ -506,14 +506,14 @@ async fn isolated_execution_aborted_insert_cannot_leave_a_pending_record() {
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
 }
 
-struct RecordingFactory;
-impl ExecutionPlanFactory for RecordingFactory {
+/// HX6: the browser recording left the child-run path. Even a factory that
+/// would plan it as a child run never gets a reservation, spawn or kill: the
+/// tools are `Route::InRunHelper` and need the `(run, call)` recording store.
+struct LegacyRecordingFactory;
+impl ExecutionPlanFactory for LegacyRecordingFactory {
     fn supports(&self, name: &str) -> bool { matches!(name, "browser_record_start" | "browser_record_stop") }
     fn collects_results(&self, _: &str) -> bool { true }
     fn cooperative_stop(&self, name: &str) -> bool { name == "browser_record_start" }
-    fn decode_result(&self, _: &str, _: &[u8], _: &[u8], _: &RunOutcome) -> Result<Value, VerificationError> {
-        Ok(json!({"id":"09".repeat(16),"status":"recorded"}))
-    }
     fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -524,51 +524,19 @@ impl ExecutionPlanFactory for RecordingFactory {
 
 #[cfg(feature = "binding-store")]
 #[tokio::test]
-async fn isolated_recording_stop_is_owned_durable_control_without_reservation() {
-    use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
+async fn hx6_recording_never_uses_the_child_run_path() {
+    use crate::execution_jobs::SqliteExecutionJobs;
     let home = tempfile::tempdir().unwrap();
     let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
-    let run = RunHandle(RunId([9; 16]));
-    let owner = context("browser_record_start");
-    jobs.insert(&owner, "browser_record_start", run).unwrap();
-    let backend = Arc::new(Backend::default());
-    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(RecordingFactory), Arc::new(Resolver)).with_jobs(jobs.clone());
-    let stop = context("browser_record_stop");
-    let args = json!({"id":"09".repeat(16)});
-    let stopped = bridge.execute(&stop, "browser_record_stop", &args).await;
-    assert_ne!(stopped["isError"], true, "{stopped}");
-    assert_eq!(jobs.read(&owner, "browser_record_start", run).unwrap()["status"], "stop_requested");
-    assert!(jobs.stop_requested(run).unwrap());
-    assert_eq!(backend.reserved.load(Ordering::SeqCst), 0);
-    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
-    assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
-    let mut thief = stop.record().clone();
-    thief.principal = Principal::Human { user_id: Text::new("thief".into()).unwrap(), generation: 1 };
-    assert_eq!(bridge.execute(&RequestContext::from_verified_record(thief), "browser_record_stop", &args).await["isError"], true);
-    for args in [json!({"id":"09".repeat(16),"action":"cancel"}), json!({"id":"../recording"}), json!({"id":"03".repeat(16)})] {
-        assert_eq!(bridge.execute(&stop, "browser_record_stop", &args).await["isError"], true);
+    let backend = Arc::new(Backend { collecting: true, ..Default::default() });
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(LegacyRecordingFactory), Arc::new(Resolver)).with_jobs(jobs);
+    for (tool, args) in [("browser_record_start", json!({})), ("browser_record_stop", json!({"id":"09".repeat(16)})),
+        ("browser_record_start", json!({"action":"cancel","job":"09".repeat(16)}))] {
+        assert_eq!(bridge.execute(&context(tool), tool, &args).await["isError"], true, "{tool}");
     }
-    jobs.finish(run, json!({"status":"recorded"})).unwrap();
-    assert_ne!(bridge.execute(&stop, "browser_record_stop", &args).await["isError"], true);
-    assert_eq!(jobs.read(&owner, "browser_record_start", run).unwrap()["status"], "complete");
-}
-
-#[cfg(feature = "binding-store")]
-#[tokio::test]
-async fn isolated_recording_stop_cannot_target_program_job_or_use_start_capability() {
-    use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
-    let home = tempfile::tempdir().unwrap();
-    let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
-    let run = RunHandle(RunId([9; 16]));
-    jobs.insert(&context("codrive_run"), "codrive_run", run).unwrap();
-    let backend = Arc::new(Backend::default());
-    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(RecordingFactory), Arc::new(Resolver)).with_jobs(jobs);
-    let args = json!({"id":"09".repeat(16)});
-    for caller in [context("browser_record_stop"), context("browser_record_start")] {
-        assert_eq!(bridge.execute(&caller, "browser_record_stop", &args).await["isError"], true);
-    }
-    assert_eq!(backend.reserved.load(Ordering::SeqCst), 0);
-    assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
+    assert!(execution_route("browser_record_start").is_none() && execution_route("browser_record_stop").is_none());
+    assert_eq!((backend.reserved.load(Ordering::SeqCst), backend.spawned.load(Ordering::SeqCst),
+        backend.killed.load(Ordering::SeqCst)), (0, 0, 0));
 }
 
 #[tokio::test]
@@ -593,30 +561,6 @@ impl RunWriter for RecordingWriter {
         Box::pin(async move { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) })
     }
     fn close(&mut self) -> BackendFuture<'_, ()> { Box::pin(async { Ok(()) }) }
-}
-#[cfg(feature = "binding-store")]
-#[tokio::test]
-async fn isolated_recording_collector_delivers_persisted_stop_and_only_then_collects_terminal_result() {
-    use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
-    let home = tempfile::tempdir().unwrap();
-    let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
-    let bytes = Arc::new(std::sync::Mutex::new(vec![]));
-    let backend = Arc::new(Backend { collecting: true, stop_bytes: Some(bytes.clone()), ..Default::default() });
-    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(RecordingFactory), Arc::new(Resolver)).with_jobs(jobs.clone());
-    let response = bridge.execute(&context("browser_record_start"), "browser_record_start", &json!({})).await;
-    assert_ne!(response["isError"], true, "{response}");
-    let response = bridge.execute(&context("browser_record_stop"), "browser_record_stop", &json!({"id":"09".repeat(16)})).await;
-    assert_ne!(response["isError"], true, "{response}");
-    assert_eq!(jobs.read(&context("browser_record_start"), "browser_record_start", RunHandle(RunId([9; 16]))).unwrap()["status"], "stop_requested");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let result = jobs.read(&context("browser_record_start"), "browser_record_start", RunHandle(RunId([9; 16]))).unwrap();
-            if result["status"] == "complete" { assert_eq!(result["result"]["status"], "recorded"); break; }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }).await.unwrap();
-    assert_eq!(*bytes.lock().unwrap(), b"stop\n");
-    assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
 }
 
 

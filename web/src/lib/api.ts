@@ -347,7 +347,7 @@ export type EditionProfile = 'personal' | 'enterprise';
 
 export type IsolationComponentState = 'ready' | 'unavailable' | 'pending_integration';
 export type IsolationReasonCode = 'binding_evidence_missing' | 'connector_setup_required' |
-  'personal_binding_conflict' | 'revoked' | 'service_unavailable';
+  'personal_binding_conflict' | 'revoked' | 'service_unavailable' | 'helper_recording_unsupported';
 export interface IsolationReason {
   code: IsolationReasonCode;
   /** Connector provider family (only for `connector_setup_required`). */

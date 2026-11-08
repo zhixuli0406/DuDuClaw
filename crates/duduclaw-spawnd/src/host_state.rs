@@ -79,6 +79,12 @@ pub use duduclaw_isolation::ipc::SpawndFeatures;
 /// What this binary always decodes; `Core::refresh` adds `helper_calls` when
 /// helpers can run on this host (launcher plans active, slot cgroups usable).
 pub const DECODED_FEATURES: SpawndFeatures = SpawndFeatures::WORK_BROKER;
+/// HX6 gate (D8 revision §4): whether this binary has proven that Chromium
+/// launches under F_L ∩ F_H and the recording's nested Landlock on this host.
+/// There is no in-process probe yet; the proof is the H15 root test
+/// `iso_root_helper_chromium_launches_under_helper_sandbox` on each host. Until
+/// a probe sets it, `helper_recording` is never advertised (fail closed).
+pub const RECORDING_PROBE_PASSED: bool = false;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceReport {
@@ -105,6 +111,10 @@ impl EvidenceReport {
     /// Gateway gate for every `ipc::Opcode::HELPER` op (HX5); without it the
     /// gateway reports `helper_launcher_unavailable{spawnd_feature_missing}`.
     pub fn helper_calls(&self) -> bool { self.features.contains(SpawndFeatures::HELPER_CALLS) }
+    /// HX6: Chromium proven to launch under the helper sandbox (recording gate).
+    pub fn helper_recording(&self) -> bool {
+        self.helper_calls() && self.features.contains(SpawndFeatures::HELPER_RECORDING)
+    }
     pub fn check_at(&self, boot_id: &str, now: u64) -> crate::Result<()> {
         if self.version != 1 || self.boot_id != boot_id || self.valid_for_ms == 0 || self.valid_for_ms > 1_000
             || now < self.checked_boottime_ms || now - self.checked_boottime_ms >= self.valid_for_ms

@@ -124,9 +124,9 @@ fn documented_refusals() -> BTreeSet<String> {
 // tool below whose eligibility would rest on that grant (`Selection::signed_tools`).
 // The list is the one the issuer uses (`PENDING_WORKSPACE_SELECTOR_TOOLS`); the
 // issuer additionally drops any unreviewed workspace tool by policy, which this
-// inventory would report as an untracked gap. Browser recording is not routed
-// in protected mode yet (HX6), so browser_record_start/stop stay hidden and
-// refused here.
+// inventory would report as an untracked gap. HX6 routed browser recording
+// in-run (recording slot): the fixture's spawnd advertises `helper_recording`
+// and the admin's `public_web` switch is on, so the issuer signs it.
 fn pending_production_selectors() -> BTreeSet<String> {
     // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
     // skill_graduate and skill_curator_status: they select the issuer's own
@@ -138,8 +138,8 @@ fn pending_production_selectors() -> BTreeSet<String> {
     for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS {
         assert!(!pending.contains(tool), "{tool}: HX5 in-run helpers have their selector");
     }
-    for tool in ["browser_record_start", "browser_record_stop"] {
-        assert!(pending.contains(tool), "{tool}: no protected route before HX6");
+    for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_RECORDING_TOOLS {
+        assert!(!pending.contains(tool), "{tool}: HX6 in-run recording has its selector");
     }
     pending
 }
@@ -277,7 +277,9 @@ enabled = true
     // issuer selects the helper workspace too.
     let shared = SharedEmployee::new(home, "main", employee).with_work_broker(Arc::new(ListingBroker))
         .with_spawnd_features(Arc::new(|| duduclaw_isolation::ipc::SpawndFeatures::HELPER_CALLS
-            .with(duduclaw_isolation::ipc::SpawndFeatures::WORK_BROKER)));
+            .with(duduclaw_isolation::ipc::SpawndFeatures::WORK_BROKER)
+            // HX6: Chromium proven under the helper sandbox on this (fixture) host.
+            .with(duduclaw_isolation::ipc::SpawndFeatures::HELPER_RECORDING)));
     let snapshot = shared.snapshot();
     let authorization = shared.authorize(&snapshot, Lane::Standard,
         crate::mcp_isolation_boot::CliDispatcherFactory.ingress_tools(home, "main", Lane::Standard).unwrap(),
@@ -335,6 +337,8 @@ enabled = true
     let parser = Arc::new(GatewayTableParser::new(Arc::new(|_, _, _| panic!("listing parsed a file"))));
     let factories = GatewayFactories::assemble(Some(Arc::new(ListingBackend)), Some(Arc::new(ListingPlans)),
         resolver.clone(), Some(parser), roots.clone()).unwrap()
+        .with_recording_jobs(duduclaw_mcp_boundary::recording_jobs::SqliteRecordingJobs::open(
+            &home.join("isolation-execution-jobs.db")).unwrap())
         .with_forks(Arc::new(duduclaw_mcp_boundary::forks::ForkHostControl {
             store: duduclaw_mcp_boundary::forks::ForkStore::open(&home.join("isolation-forks.db")).unwrap(),
             backend: Arc::new(ListingBackend),
@@ -407,6 +411,10 @@ async fn employee_tool_parity(home: &std::path::Path) {
     for tool in ["execute_program", "code_map"] {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: HX5 in-run route not eligible");
         assert!(!pending.contains(tool), "{tool}");
+    }
+    // HX6: the recording rides the same grant, signed by its own selector.
+    for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_RECORDING_TOOLS {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: HX6 recording route not eligible");
     }
     assert!(context.record().resources.as_slice().iter().any(|grant| matches!(grant,
         ResourceGrant::NewTask { requester } if matches!(&context.record().principal,

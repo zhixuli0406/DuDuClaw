@@ -37,6 +37,14 @@ impl GatewayFactories {
         self
     }
 
+    /// HX6: the gateway's `(run, call)` store of in-run browser recordings.
+    pub fn with_recording_jobs(mut self, jobs: Arc<dyn crate::recording_jobs::RecordingJobs>) -> Self {
+        if let Some(bridge) = self.execution.take() {
+            self.execution = Some(Arc::new(bridge.with_recordings(jobs)));
+        }
+        self
+    }
+
     #[cfg(feature = "binding-store")]
     pub fn with_forks(mut self, forks: Arc<dyn crate::forks::ForkToolService>) -> Self {
         self.forks = Some(forks); self

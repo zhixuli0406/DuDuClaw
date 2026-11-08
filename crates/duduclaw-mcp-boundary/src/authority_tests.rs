@@ -124,8 +124,9 @@ fn personal_and_shared_credential_rules_and_argument_authority() {
         arguments[key] = "other".into();
         assert!(crate::check_arguments(&arguments).is_err());
     }
-    for tool in ["code_map", "codrive_run", "office_script", "execute_program"] {
-        assert_eq!(crate::tool_policy::policy(tool).unwrap().route, crate::tool_policy::Route::Execution);
+    assert_eq!(crate::tool_policy::policy("codrive_run").unwrap().route, crate::tool_policy::Route::Execution);
+    for tool in ["code_map", "office_script", "execute_program"] {
+        assert_eq!(crate::tool_policy::policy(tool).unwrap().route, crate::tool_policy::Route::InRunHelper);
     }
     assert!(crate::tool_policy::policy("unknown").is_none());
 }

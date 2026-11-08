@@ -477,8 +477,16 @@ impl Host for Core {
     }
     fn features(&mut self) -> Features {
         let features = crate::host_state::DECODED_FEATURES;
-        if self.helpers_ready().is_ok() { features.with(Features::HELPER_CALLS) } else { features }
+        if self.helpers_ready().is_err() { return features; }
+        let features = features.with(Features::HELPER_CALLS);
+        if self.recording_ready() { features.with(Features::HELPER_RECORDING) } else { features }
     }
+    /// HX6 gate: `helper_recording` is advertised only after a root probe
+    /// launched Chromium under F_L ∩ F_H and the nested recording Landlock on
+    /// this host. No in-process probe exists yet (the H15 root test
+    /// `iso_root_helper_chromium_launches_under_helper_sandbox` is the proof),
+    /// so this host fails closed: recording reads `helper_recording_unsupported`.
+    fn recording_ready(&mut self) -> bool { crate::host_state::RECORDING_PROBE_PASSED }
     fn helper_run(&mut self, job: HelperStart<Vec<OwnedFd>>) -> Result<HelperStarted<Vec<OwnedFd>>> { self.run_helper(job) }
     fn helper_signal(&mut self, run: RunHandle, call: HelperCallId, signal: HelperSignal) -> Result<()> {
         self.signal_helper(run, call, signal)

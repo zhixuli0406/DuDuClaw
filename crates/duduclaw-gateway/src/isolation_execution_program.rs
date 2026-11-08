@@ -35,6 +35,12 @@ impl InstalledProgramPlans {
     }
 }
 
+/// HX5 foreground helpers and the HX6 recording tools: in-run only.
+fn in_run_tool(name: &str) -> bool {
+    duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&name)
+        || duduclaw_mcp_boundary::tool_policy::IN_RUN_RECORDING_TOOLS.contains(&name)
+}
+
 fn is_program_runtime(runtime: &RuntimeKind) -> bool {
     matches!(runtime, RuntimeKind::Registered(name) if name.as_str() == PROGRAM_RUNTIME)
 }
@@ -177,21 +183,24 @@ impl ExecutionPlanFactory for InstalledProgramPlans {
             }
         }))
     }
-    // HX5: execute_program / office_script / code_map run in the caller's own
-    // run and answer synchronously; no job row exists for them.
-    fn collects_results(&self, name: &str) -> bool { matches!(name, "browser_record_start" | "browser_record_stop") }
-    fn cooperative_stop(&self, name: &str) -> bool { name == "browser_record_start" }
+    // HX5/HX6: execute_program / office_script / code_map and the browser
+    // recording run in the caller's own run; none has a child-run job row
+    // (the recording's `(run, call)` rows live in `recording_jobs`).
+    fn collects_results(&self, _name: &str) -> bool { false }
     fn decode_result(&self, name: &str, stdout: &[u8], stderr: &[u8], outcome: &RunOutcome) -> Result<Value, VerificationError> {
         if !stderr.is_empty() || *outcome != RunOutcome::Exited(0) { return Err(VerificationError::Invalid); }
         // In-run tools never have a child-run result to decode.
-        if duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&name) { return Err(VerificationError::Invalid); }
+        if in_run_tool(name) { return Err(VerificationError::Invalid); }
         decode_output(name, stdout)
     }
     fn decode_helper_result(&self, name: &str, stdout: &[u8], stderr: &[u8], outcome: &HelperOutcome)
         -> Result<Value, VerificationError> {
-        // Same strict decoders: stderr must be empty, outcome `Exited(0)`.
-        if !stderr.is_empty() || *outcome != HelperOutcome::Exited(0)
-            || !duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&name) {
+        // Same strict decoders: stderr must be empty, outcome `Exited(0)`. The
+        // recording also accepts `RunEnded`: the launcher flushes it on
+        // SIGTERM (§2.5 (b)) and root reports the run's end, not the exit.
+        let ended = *outcome == HelperOutcome::Exited(0)
+            || (name == "browser_record_start" && *outcome == HelperOutcome::RunEnded);
+        if !stderr.is_empty() || !ended || !(in_run_tool(name) && name != "browser_record_stop") {
             return Err(VerificationError::Invalid);
         }
         decode_output(name, stdout)
@@ -202,17 +211,25 @@ impl ExecutionPlanFactory for InstalledProgramPlans {
     fn prepare_in_run<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, AuthorizedHelperPlan> {
         Box::pin(async move {
             let (context, name, arguments) = (call.context(), call.name(), call.arguments());
-            if !duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&name) { return Err(VerificationError::Invalid); }
+            let recording = name == "browser_record_start";
+            if !duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&name) && !recording {
+                return Err(VerificationError::Invalid);
+            }
             self.authorize_handler(call).await?;
+            // HX6: the recording request keeps the all-zero id placeholder; the
+            // in-run helper takes its id from its launcher-made scratch
+            // directory `/helper-tmp/<call>` (= spawnd's call id, never ours).
             let request = helper_request(context, name, arguments)?;
             let publication = self.publication()?;
             let policy = publication.policy().map_err(|_| VerificationError::Invalid)?;
             let (runtime, _) = policy.derive(context.record().employee, &request.kind, false)
                 .map_err(|_| VerificationError::Invalid)?;
-            if !valid_helper(runtime) || request.bytes.len() as u64 > runtime.resources.memfd_total_bytes {
+            if !valid_helper(runtime) || request.bytes.len() as u64 > runtime.resources.memfd_total_bytes
+                || recording != valid_recording_runtime(runtime) {
                 return Err(VerificationError::Invalid);
             }
-            AuthorizedHelperPlan::new(RunHandle(context.record().run), context.record().employee, request.kind,
+            let plan = if recording { AuthorizedHelperPlan::recording } else { AuthorizedHelperPlan::new };
+            plan(RunHandle(context.record().run), context.record().employee, request.kind,
                 in_run_timeout_ms(request.timeout), request.bytes, runtime.resources.output_total_bytes)
         })
     }
@@ -235,10 +252,9 @@ impl ExecutionPlanFactory for InstalledProgramPlans {
     fn prepare_with_roots<'a>(&'a self, call: &'a AuthorizedToolCall, run: RunHandle,
         roots: Arc<ResourceRoots>) -> PolicyFuture<'a, AuthorizedExecutionPlan> {
         Box::pin(async move {
-            // [F8] In-run tools never become a child-run SpawnPolicy.
-            if duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&call.name()) {
-                return Err(VerificationError::Invalid);
-            }
+            // [F8] In-run tools (incl. the HX6 recording) never become a
+            // child-run SpawnPolicy.
+            if in_run_tool(call.name()) { return Err(VerificationError::Invalid); }
             self.authorize_handler(call).await?;
             let (context, name, arguments) = (call.context(), call.name(), call.arguments());
             let workspace = roots.authorize_workspace(call, "employee-work")?;
@@ -324,8 +340,11 @@ mod tests {
         // tools have no job row (only the recording collects results).
         assert!(factory.decode_result("execute_program", &result, &[], &RunOutcome::Exited(0)).is_err());
         assert!(factory.decode_result("fork_run", &result, &[], &RunOutcome::Exited(0)).is_err());
-        for name in ["execute_program", "office_script", "code_map"] { assert!(!factory.collects_results(name)); }
-        assert!(factory.collects_results("browser_record_start"));
+        // HX6: no in-run tool has a child-run job row, the recording included.
+        for name in ["execute_program", "office_script", "code_map", "browser_record_start", "browser_record_stop"] {
+            assert!(!factory.collects_results(name));
+            assert!(factory.decode_result(name, &result, &[], &RunOutcome::Exited(0)).is_err());
+        }
         assert_eq!(in_run_timeout_ms(60), 60_000);
         assert_eq!(in_run_timeout_ms(10_000), duduclaw_isolation::ipc::MAX_HELPER_TIMEOUT_MS);
         assert_eq!(in_run_timeout_ms(0), 1);
@@ -405,15 +424,35 @@ mod recording_tests {
         assert_eq!(prepared.timeout, 45);
         let request = recording_helper::Request::decode(&prepared.bytes).unwrap();
         assert_eq!(request.max_seconds, 30);
-        assert_eq!(request.id, "0".repeat(32)); // Replaced only after backend reservation.
+        // HX6: never chosen by the gateway; the in-run helper takes spawnd's call id.
+        assert_eq!(request.id, "0".repeat(32));
         for field in ["id", "root", "cwd", "run", "employee_id", "env", "proxy", "argv"] {
             let mut args = json!({"url":"https://example.com", "headless":true}); args[field] = json!("forged");
             assert!(helper_request(&context(), "browser_record_start", &args).is_err());
         }
         let factory = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1 };
-        assert!(factory.cooperative_stop("browser_record_start"));
-        assert!(!factory.cooperative_stop("execute_program"));
+        // HX6: the stop is `HelperStop` from the bridge, not a child-run stdin write.
+        assert!(!factory.cooperative_stop("browser_record_start"));
         for name in ["fork_run", "merge_or_select", "terminate_branch"] { assert!(!factory.supports(name)); }
+    }
+
+    /// HX6: the in-run recording decodes strictly; the launcher's run-end
+    /// flush (`RunEnded`) is accepted for the recording only.
+    #[test]
+    fn hx6_recording_helper_result_decoder_accepts_flush_at_run_end_only_for_recording() {
+        let factory = InstalledProgramPlans { generation: Sha256Digest([1; 32]), gateway_gid: 1 };
+        let artifacts = ["trace.zip", "actions.json", "network.json"].map(|name| json!({"name":name,"bytes":1,"sha256":"a".repeat(64)}));
+        let bytes = serde_json::to_vec(&json!({"id":"ab".repeat(16),"status":"recorded","reason":"stop","actions":0,
+            "artifacts":artifacts,"navigation":"completed"})).unwrap();
+        for outcome in [HelperOutcome::Exited(0), HelperOutcome::RunEnded] {
+            assert!(factory.decode_helper_result("browser_record_start", &bytes, &[], &outcome).is_ok());
+        }
+        for outcome in [HelperOutcome::Exited(1), HelperOutcome::Signalled(9), HelperOutcome::TimedOut, HelperOutcome::OomKilled] {
+            assert!(factory.decode_helper_result("browser_record_start", &bytes, &[], &outcome).is_err());
+        }
+        assert!(factory.decode_helper_result("browser_record_start", &bytes, b"x", &HelperOutcome::Exited(0)).is_err());
+        assert!(factory.decode_helper_result("browser_record_stop", &bytes, &[], &HelperOutcome::Exited(0)).is_err());
+        assert!(factory.decode_helper_result("execute_program", &bytes, &[], &HelperOutcome::RunEnded).is_err());
     }
     #[test]
     fn program_plans_recording_profile_requires_egress_and_exact_dependency_protocol() {

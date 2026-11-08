@@ -24,6 +24,7 @@ const NEXT_STEPS: Record<IsolationReasonCode, { hint: string; to: string }> = {
   personal_binding_conflict: { hint: 'isolationReadiness.hint.personal', to: '/manage/users' },
   revoked: { hint: 'isolationReadiness.hint.revoked', to: '/manage/integrations' },
   service_unavailable: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
+  helper_recording_unsupported: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
 };
 
 interface ReasonView { key: string; message: string; step?: { hint: string; to: string } }
@@ -48,6 +49,8 @@ function describeReason(intl: IntlShape, reason: IsolationReason): ReasonView {
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.revoked' }) };
     case 'service_unavailable':
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.temporary' }) };
+    case 'helper_recording_unsupported':
+      return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.recording' }) };
     default:
       return { key: 'unknown', message: intl.formatMessage({ id: 'isolationReadiness.reason.setup' }) };
   }
@@ -118,6 +121,10 @@ export function IsolationReadinessBanner() {
                 ))}
               </ul>
             </div>
+          )}
+          {admin && reasons.some(reason => reason.key === 'helper_recording_unsupported') && (
+            // D8 revision §4 / Q3 = A: recording egress is the employee's public-web egress.
+            <p className="text-muted-foreground">{intl.formatMessage({ id: 'isolationReadiness.recordingEgress' })}</p>
           )}
           {admin && (
             <div className="space-y-1">

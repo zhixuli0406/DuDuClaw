@@ -51,6 +51,10 @@ pub enum Route { File, Service, Execution, Worker, Connector, InRunHelper }
 
 /// HX5: the offline helper tools served synchronously inside the calling run.
 pub const IN_RUN_HELPER_TOOLS: [&str; 3] = ["execute_program", "office_script", "code_map"];
+/// HX6: the recording-slot helper tools (egress parent only, D8 revision §4).
+/// Same route and workspace grant as the foreground helpers, but a separate
+/// selector condition (`public_web`) and the `(run, call)` job store.
+pub const IN_RUN_RECORDING_TOOLS: [&str; 2] = ["browser_record_start", "browser_record_stop"];
 #[derive(Debug)]
 pub struct ToolPolicy {
     pub name: &'static str,
@@ -206,8 +210,9 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "plan_start", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "memory_improve", route: Route::Service, required: &[ResourceKind::Employee] },
     // recording
-    ToolPolicy { name: "browser_record_start", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "browser_record_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    // HX6: recording-slot in-run helper; jobs keyed (run, call), never a run handle.
+    ToolPolicy { name: "browser_record_start", route: Route::InRunHelper, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "browser_record_stop", route: Route::InRunHelper, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "desktop_record_start", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "desktop_record_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_from_recording", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },

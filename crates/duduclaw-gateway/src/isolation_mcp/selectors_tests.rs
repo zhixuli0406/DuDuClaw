@@ -271,8 +271,9 @@ fn hx5_pending_tools_still_never_signed() {
                 assert!(!signed(&auth).contains(tool), "{tool} signed ({with_files} {task:?})");
                 assert!(!eligible(&ctx, tool), "{tool} ({with_files} {task:?})");
             }
+            // HX6: routed (own selector), so no longer on the pending list.
             for tool in ["browser_record_start", "browser_record_stop"] {
-                assert!(PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool} stays pending until HX6");
+                assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
             }
             for tool in IN_RUN_HELPER_TOOLS {
                 assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
@@ -280,6 +281,42 @@ fn hx5_pending_tools_still_never_signed() {
             }
         }
     }
+}
+
+/// HX6: the recording is signed only with spawnd's `helper_calls` AND
+/// `helper_recording` (Chromium proven under the helper sandbox), the
+/// admin-only public-web egress switch (Q3 = A) and an interactive run.
+#[test]
+fn hx6_recording_selector_requires_host_gate_and_public_web() {
+    let names = ["browser_record_start", "browser_record_stop", "tasks_update"];
+    let recording = SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING);
+    let (f, view) = helper_fixture(recording);
+    // No public-web switch: no workspace, nothing signed for recording.
+    let auth = f.issue(&names).unwrap();
+    assert!(!has(&auth, &workspace()));
+    for tool in &names[..2] { assert!(!eligible(&context(&auth), tool), "{tool}"); }
+    f.profile(true, "");
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &workspace()) && auth.roots.is_brokered(EMPLOYEE_WORK_ROOT));
+    assert_eq!(signed(&auth), names);
+    for tool in &names[..2] { assert!(eligible(&context(&auth), tool), "{tool}"); }
+    // Fail closed: helper calls without the recording gate, no bits, or a task run.
+    for bits in [SpawndFeatures::HELPER_CALLS, SpawndFeatures::HELPER_RECORDING, SpawndFeatures::NONE] {
+        view.store(bits.0, Ordering::SeqCst);
+        let auth = f.issue(&names).unwrap();
+        for tool in &names[..2] { assert!(!eligible(&context(&auth), tool), "{bits:?} {tool}"); }
+    }
+    view.store(recording.0, Ordering::SeqCst);
+    f.tasks(&[("task-a", LABEL)]);
+    let auth = f.issue_task(&names, "task-a").unwrap();
+    assert!(!has(&auth, &workspace()));
+    for tool in &names[..2] { assert!(!eligible(&context(&auth), tool), "task runs never record: {tool}"); }
+    // The foreground helper bit alone never signs the recording.
+    let auth = f.issue(&["browser_record_start", "execute_program"]).unwrap();
+    assert_eq!(signed(&auth), ["browser_record_start", "execute_program"]);
+    f.profile(false, "");
+    let auth = f.issue(&["browser_record_start", "execute_program"]).unwrap();
+    assert_eq!(signed(&auth), ["execute_program"]);
 }
 
 #[test]

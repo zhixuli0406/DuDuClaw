@@ -646,8 +646,11 @@ fn isolated_i1b_recording_schema_requires_headless_and_reports_host_stop_semanti
     project_tool_schema(&mut start);
     assert_eq!(start["inputSchema"]["properties"]["headless"]["const"], true);
     assert_eq!(start["inputSchema"]["properties"]["max_seconds"]["maximum"], 300);
-    assert_eq!(start["inputSchema"]["anyOf"][0]["required"], json!(["url","headless"]));
-    assert_eq!(start["inputSchema"]["anyOf"][1]["required"], json!(["action","job"]));
+    // HX6: in-run recording; no pending-job controls remain.
+    assert_eq!(start["inputSchema"]["required"], json!(["url","headless"]));
+    assert!(start["inputSchema"].get("anyOf").is_none());
+    assert!(start["inputSchema"]["properties"].get("action").is_none());
+    assert!(start["inputSchema"]["properties"].get("job").is_none());
     let mut stop = json!({"name":"browser_record_stop","inputSchema":{"required":["id"],"properties":{"id":{"type":"string"}}}});
     project_tool_schema(&mut stop);
     assert_eq!(stop["inputSchema"]["properties"]["id"]["pattern"], "^[0-9a-f]{32}$");

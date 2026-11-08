@@ -49,7 +49,7 @@ use std::{io::Read, path::Path, sync::Arc};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{PublicOrigin, ResourceGrant}, ids::EmployeeId,
     ipc::SpawndFeatures};
 use duduclaw_mcp_boundary::{resources::{ResourceRoots, WorkBroker, EMPLOYEE_WORK_ROOT},
-    tool_policy::{IN_RUN_HELPER_TOOLS, PUBLIC_ORIGIN_TOOLS}};
+    tool_policy::{IN_RUN_HELPER_TOOLS, IN_RUN_RECORDING_TOOLS, PUBLIC_ORIGIN_TOOLS}};
 use super::VerificationError;
 
 /// File tools served from the brokered `employee-work` root (H6/H11).
@@ -107,6 +107,12 @@ impl SelectorSources {
         self.broker_available()
             && self.spawnd_features.as_ref().is_some_and(|view| view().contains(SpawndFeatures::HELPER_CALLS))
     }
+    /// HX6 gate: helper calls AND spawnd's `helper_recording` (Chromium proven
+    /// to launch under the helper sandbox on this host). Anything else ⇒ false.
+    fn recording_ready(&self) -> bool {
+        self.helper_calls() && self.spawnd_features.as_ref().is_some_and(|view|
+            view().contains(SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING)))
+    }
 }
 
 /// Facts the issuer passes in; all host-pinned, none from the employee.
@@ -135,6 +141,9 @@ pub(super) struct Selection {
     /// HX5: `workspace` was (also) selected for the in-run helper tools, so
     /// exactly those are signed alongside it (`workspace_selection`).
     pub helpers: bool,
+    /// HX6: `workspace` was (also) selected for the in-run browser recording
+    /// (`IN_RUN_RECORDING_TOOLS`), which is signed alongside it.
+    pub recording: bool,
     pub public_web: bool,
     /// The requester of an interactive run's `NewTask` grant.
     pub new_task: Option<String>,
@@ -147,13 +156,17 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     let wants_files = sources.broker_available() && FILE_TOOLS.iter().any(|name| listed(*name));
     // HX5: checked only when a helper tool is listed (no view read otherwise).
     let wants_helpers = IN_RUN_HELPER_TOOLS.iter().any(|name| listed(*name)) && sources.helper_calls();
+    // HX6: the recording needs the host gate and an interactive run (its
+    // egress is the employee's public-web authority, D-H2 / Q3 = A).
+    let wants_recording = input.task.is_none() && IN_RUN_RECORDING_TOOLS.iter().any(|name| listed(*name))
+        && sources.recording_ready();
     // D-H2: PublicOrigins exists only alongside EmployeeScope; a task-limited
     // run never carries it, so it is not even considered there.
     let wants_web = input.task.is_none() && PUBLIC_ORIGIN_TOOLS.iter().any(|name| listed(*name));
     // NewTask: interactive runs only (a record-backed run plans under its own
     // record task, H8, and has no human requester of its own).
     let wants_new_task = !input.record && input.task.is_none() && NEW_TASK_TOOLS.iter().any(|name| listed(*name));
-    let profile = if wants_files || wants_helpers || wants_web || wants_new_task {
+    let profile = if wants_files || wants_helpers || wants_recording || wants_web || wants_new_task {
         Some(read_profile(input.home, input.agent)?)
     } else { None };
     let allows = |names: &[&str]| profile.as_ref().is_some_and(|profile| {
@@ -162,7 +175,12 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
             *name, &caps.denied_tools, &caps.allowed_tools) == duduclaw_core::tool_catalog::ToolListVerdict::Allowed)
     });
     let helpers = wants_helpers && allows(&IN_RUN_HELPER_TOOLS[..]);
-    let workspace = (wants_files && allows(FILE_TOOLS)) || helpers;
+    // Owner decision Q3 = A: enabling recording means granting this
+    // employee's runtime public-web egress, so the same admin-only switch
+    // (`[isolation] public_web`) gates it. No switch ⇒ no recording.
+    let recording = wants_recording && profile.as_ref().is_some_and(|profile| profile.isolation.public_web)
+        && allows(&IN_RUN_RECORDING_TOOLS[..]);
+    let workspace = (wants_files && allows(FILE_TOOLS)) || helpers || recording;
     // Owner decision 2026-11-08: its own admin-only switch, independent of
     // `[container] network_access` (task sandbox only).
     let public_web = wants_web && profile.as_ref().is_some_and(|profile| profile.isolation.public_web)
@@ -183,7 +201,7 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
             Some(SelectedTask { id: id.to_owned() })
         }
     };
-    Ok(Selection { workspace, helpers, public_web, new_task, task })
+    Ok(Selection { workspace, helpers, recording, public_web, new_task, task })
 }
 
 impl Selection {
@@ -228,7 +246,8 @@ impl Selection {
         // A task run is limited to its task and loses EmployeeScope.
         let scoped = self.task.is_none();
         List::new(tools.as_slice().iter().filter(|tool|
-            !duduclaw_mcp_boundary::workspace_selection::drops_from_signed(tool.as_str(), scoped, self.helpers))
+            !duduclaw_mcp_boundary::workspace_selection::drops_from_signed_with(tool.as_str(), scoped, self.helpers,
+                self.recording))
             .cloned().collect()).map_err(|_| VerificationError::Invalid)
     }
 }

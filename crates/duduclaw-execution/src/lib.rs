@@ -13,6 +13,9 @@ pub mod office_helper;
 pub mod recording_helper;
 #[cfg(target_os = "linux")]
 mod recording_io;
+/// HX6: nested Landlock (fs + TCP pin + scoping) for the recording's browser.
+#[cfg(target_os = "linux")]
+pub mod recording_sandbox;
 #[cfg(target_os = "linux")]
 mod office_io;
 #[cfg(target_os = "linux")]
