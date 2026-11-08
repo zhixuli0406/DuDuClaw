@@ -38,6 +38,180 @@ pub fn relative_path(path: &str) -> Result<&Path, VerificationError> {
     Ok(path)
 }
 
+/// Fixed handle of the brokered employee work root (D-H1). The employee work
+/// directory is employee-uid 0700 and attached only during a run's storage
+/// lease, so the gateway never holds a dirfd for it: root opens each file.
+pub const EMPLOYEE_WORK_ROOT: &str = "employee-work";
+/// Largest regular file a brokered open may return.
+pub const BROKERED_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Work path bounds shared with the root IPC `OpenWorkFile` (H1) and the broker
+/// core (H2). They must apply exactly these rules; see [`WorkRelativePath::parse`].
+pub const WORK_PATH_MAX_BYTES: usize = 4096;
+pub const WORK_PATH_MAX_COMPONENT_BYTES: usize = 255;
+pub const WORK_PATH_MAX_DEPTH: usize = 64;
+
+/// Shared conformance vectors for the work path rules. H1 (IPC decode) and H2
+/// (broker) cannot depend on this crate and must pass the same vectors.
+pub const WORK_PATH_CONFORMANCE: &[(&str, bool)] = &[
+    ("a", true), ("notes/員工.md", true), ("a/b/c.csv", true), (".hidden", true), ("..a/b..", true),
+    ("a b/c-d_e.txt", true),
+    ("", false), (".", false), ("..", false), ("/", false), ("/etc/passwd", false), ("../x", false),
+    ("a/../b", false), ("a/./b", false), ("./a", false), ("a/.", false), ("a//b", false), ("a/", false),
+    ("a\\b", false), ("a\0b", false), ("a\nb", false), ("a\tb", false), ("a\u{7f}b", false), ("a\u{85}b", false),
+];
+
+/// A validated path relative to the employee work root. It is never rewritten
+/// (no case, Unicode or separator normalization): either the exact argument
+/// bytes satisfy the rules or the call is refused, so the argument-bound
+/// selection and the path root opens are byte-identical.
+///
+/// Rules (identical in H1/H2): 1..=4096 bytes of UTF-8; no NUL, `\` or Unicode
+/// control character; `/`-separated components, each non-empty, not `.` or
+/// `..`, at most 255 bytes; at most 64 components; no leading or trailing `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkRelativePath(String);
+impl WorkRelativePath {
+    pub fn parse(path: &str) -> Result<Self, VerificationError> {
+        relative_path(path)?;
+        if path.len() > WORK_PATH_MAX_BYTES || path.chars().any(char::is_control)
+            || path.split('/').count() > WORK_PATH_MAX_DEPTH
+            || path.split('/').any(|part| part.len() > WORK_PATH_MAX_COMPONENT_BYTES) {
+            return Err(VerificationError::Invalid);
+        }
+        Ok(Self(path.to_owned()))
+    }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+/// What root reports about the descriptor it opened. The boundary re-checks
+/// every field it can against `fstat` of the received fd and never trusts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkFileMetadata {
+    pub regular: bool,
+    pub size: u64,
+    pub device: u64,
+    pub inode: u64,
+    pub nlink: u64,
+}
+
+/// An owned read-only descriptor opened by root under the live run's attached
+/// work mount, plus its metadata.
+pub struct BrokeredWorkFile {
+    pub file: File,
+    pub metadata: WorkFileMetadata,
+}
+
+/// Broker diagnostics. The boundary maps every variant to `Unavailable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkBrokerError {
+    /// The run is not live or its storage lease is not attached.
+    NotLive,
+    NotFound,
+    /// Symlink, other mount, wrong owner/device, not a regular file, nlink > 1.
+    Refused,
+    TooLarge,
+    /// Root IPC or the broker itself failed.
+    Unavailable,
+}
+
+/// One brokered open. Only this crate constructs it, and only from the verified
+/// capability (run and employee), never from tool arguments.
+pub struct WorkFileRequest<'a> {
+    run: duduclaw_isolation::ids::RunId,
+    employee: EmployeeId,
+    path: &'a WorkRelativePath,
+    max_bytes: u64,
+}
+impl WorkFileRequest<'_> {
+    pub fn run(&self) -> duduclaw_isolation::ids::RunId { self.run }
+    pub fn employee(&self) -> EmployeeId { self.employee }
+    pub fn path(&self) -> &WorkRelativePath { self.path }
+    pub fn max_bytes(&self) -> u64 { self.max_bytes }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl<'a> WorkFileRequest<'a> {
+    pub fn for_test(run: duduclaw_isolation::ids::RunId, employee: EmployeeId, path: &'a WorkRelativePath) -> Self {
+        Self { run, employee, path, max_bytes: BROKERED_FILE_MAX_BYTES }
+    }
+}
+
+/// Root work broker (D-H1). Implemented by H5 over spawnd `OpenWorkFile`: root
+/// opens `path` with openat2 BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV under the
+/// work mount of `run`, only while that run is live, owned by `employee` and
+/// holds its storage lease; regular file, nlink 1, employee uid, at most
+/// `max_bytes`; O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK. Blocking: call it from
+/// the blocking pool. An implementation must never fall back to a host path.
+pub trait WorkBroker: Send + Sync {
+    fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError>;
+}
+
+/// Check the received descriptor itself: regular, single link, within the size
+/// limit, read-only, and the inode root said it opened.
+fn verify_brokered(opened: BrokeredWorkFile) -> Result<File, VerificationError> {
+    let BrokeredWorkFile { file, metadata: claimed } = opened;
+    if !claimed.regular || claimed.nlink != 1 || claimed.size > BROKERED_FILE_MAX_BYTES {
+        return Err(VerificationError::Invalid);
+    }
+    let actual = file.metadata().map_err(|_| VerificationError::Unavailable)?;
+    if !actual.is_file() || actual.len() > BROKERED_FILE_MAX_BYTES {
+        return Err(VerificationError::Invalid);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if actual.nlink() != 1 { return Err(VerificationError::Invalid); }
+        if (actual.dev(), actual.ino()) != (claimed.device, claimed.inode) {
+            return Err(VerificationError::Unavailable);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{fcntl_getfl, OFlags};
+            let flags = fcntl_getfl(&file).map_err(|_| VerificationError::Unavailable)?;
+            if flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::PATH) {
+                return Err(VerificationError::Invalid);
+            }
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    { let _ = file; Err(VerificationError::Unavailable) }
+}
+
+/// The workspace grant this call selected for `handle`: explicit selectors must
+/// name it, and an implicit target is valid only when resolution chose one.
+fn selected_workspace_grant<'c>(call: &'c crate::tool_policy::AuthorizedToolCall, handle: &str)
+    -> Result<&'c ResourceGrant, VerificationError> {
+    // A resolver may return several granted workspaces for a compound call.
+    // The adapter cannot substitute one for the explicit execution target.
+    let selectors = ["workspace", "workspace_id"].iter()
+        .filter_map(|key| call.arguments().get(key))
+        .map(|value| value.as_str().ok_or(VerificationError::Invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    if selectors.iter().any(|selected| *selected != handle) {
+        return Err(VerificationError::BindingMismatch);
+    }
+    let workspaces = call.resources().iter().filter(|grant|
+        matches!(grant, ResourceGrant::Workspace { .. })).collect::<Vec<_>>();
+    if selectors.is_empty() && workspaces.len() != 1 {
+        return Err(VerificationError::BindingMismatch);
+    }
+    workspaces.into_iter().find(|grant|
+        matches!(grant, ResourceGrant::Workspace { handle: selected } if selected.as_str() == handle))
+        .ok_or(VerificationError::BindingMismatch)
+}
+
+/// The selected input path must be explicitly present in this call.
+fn require_selected_input(arguments: &serde_json::Value, relative: &str) -> Result<(), VerificationError> {
+    let selected = ["path", "file_path", "input_path", "source_path"]
+        .iter().filter_map(|key| arguments.get(key))
+        .map(|value| value.as_str().ok_or(VerificationError::Invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    if selected.is_empty() || selected.iter().any(|selected| *selected != relative) {
+        return Err(VerificationError::BindingMismatch);
+    }
+    Ok(())
+}
+
 /// A resource selection bound to one authorized call, including its arguments.
 /// Private fields prevent an adapter from substituting a capability-wide grant.
 #[derive(Clone)]
@@ -83,13 +257,7 @@ impl AuthorizedWorkspace {
     /// be promoted to authorized inputs.
     pub fn open_file(&self, relative: &str) -> Result<AuthorizedFile, VerificationError> {
         let path = relative_path(relative)?;
-        let selected = ["path", "file_path", "input_path", "source_path"]
-            .iter().filter_map(|key| self.binding.arguments.get(key))
-            .map(|value| value.as_str().ok_or(VerificationError::Invalid))
-            .collect::<Result<Vec<_>, _>>()?;
-        if selected.is_empty() || selected.iter().any(|selected| *selected != relative) {
-            return Err(VerificationError::BindingMismatch);
-        }
+        require_selected_input(&self.binding.arguments, relative)?;
         self.binding.context.verify_live(crate::authority::now_seconds()?)?;
         let file = open_resource(&self.directory, path, false)?;
         AuthorizedFile::from_opened(self.binding.clone(), self.grant.clone(), file)
@@ -310,6 +478,8 @@ impl AuthorizedHelperWorkspace {
 pub struct ResourceRoots {
     roots: BTreeMap<String, (EmployeeId, File)>,
     wiki_roots: BTreeMap<String, (EmployeeId, File)>,
+    /// The `employee-work` root: no dirfd, only root's broker (D-H1).
+    brokered: Option<(EmployeeId, std::sync::Arc<dyn WorkBroker>)>,
 }
 impl ResourceRoots {
     /// File tools have exactly one explicit workspace selector. Resolve it here
@@ -332,29 +502,62 @@ impl ResourceRoots {
         let call = tool_policy::authorize(context, tool, arguments, &FileSelection)?;
         let handle = arguments.get("workspace").and_then(serde_json::Value::as_str).ok_or(VerificationError::Invalid)?;
         let path = arguments.get("path").and_then(serde_json::Value::as_str).ok_or(VerificationError::Invalid)?;
-        let input = self.authorize_workspace(&call, handle)?.open_file(path)?;
+        // The brokered root has no gateway dirfd; it never reaches open_resource.
+        let input = if self.is_brokered(handle) { self.authorize_brokered_file(&call, handle, path)? }
+            else { self.authorize_workspace(&call, handle)?.open_file(path)? };
         Ok((call, input))
+    }
+
+    /// Register root's work broker as the `employee-work` root of `employee`.
+    /// Exclusive with a dirfd root of the same handle, so there is never a
+    /// host-path alternative to the broker.
+    pub fn insert_brokered(&mut self, handle: String, employee: EmployeeId,
+        broker: std::sync::Arc<dyn WorkBroker>) -> Result<(), VerificationError> {
+        if handle != EMPLOYEE_WORK_ROOT || self.brokered.is_some() || self.roots.contains_key(&handle) {
+            return Err(VerificationError::Invalid);
+        }
+        self.brokered = Some((employee, broker));
+        Ok(())
+    }
+
+    pub fn is_brokered(&self, handle: &str) -> bool {
+        handle == EMPLOYEE_WORK_ROOT && self.brokered.is_some()
+    }
+
+    /// Open `relative` in the brokered work root for this call's live run.
+    /// Run and employee come only from the verified capability. A broker error
+    /// is `Unavailable`; there is no fallback to opening a host path.
+    pub fn authorize_brokered_file(&self, call: &crate::tool_policy::AuthorizedToolCall, handle: &str,
+        relative: &str) -> Result<AuthorizedFile, VerificationError> {
+        let path = WorkRelativePath::parse(relative)?;
+        let grant = selected_workspace_grant(call, handle)?.clone();
+        let broker = self.brokered_root(call.context(), handle)?;
+        require_selected_input(call.arguments(), relative)?;
+        let context = call.context();
+        context.verify_live(crate::authority::now_seconds()?)?;
+        let record = context.record();
+        let request = WorkFileRequest { run: record.run, employee: record.employee, path: &path,
+            max_bytes: BROKERED_FILE_MAX_BYTES };
+        let opened = broker.open_work_file(&request).map_err(|_| VerificationError::Unavailable)?;
+        let file = verify_brokered(opened)?;
+        // The run may have ended while root was opening the file.
+        context.verify_live(crate::authority::now_seconds()?)?;
+        AuthorizedFile::from_opened(CallBinding::new(call), grant, file)
+    }
+
+    fn brokered_root(&self, context: &RequestContext, handle: &str) -> Result<&dyn WorkBroker, VerificationError> {
+        let (owner, broker) = self.brokered.as_ref().filter(|_| handle == EMPLOYEE_WORK_ROOT)
+            .ok_or(VerificationError::Invalid)?;
+        if owner != &context.record().employee || !context.record().io_resources()
+            .any(|r| matches!(r, ResourceGrant::Workspace { handle: h } if h.as_str() == handle)) {
+            return Err(VerificationError::Invalid);
+        }
+        Ok(broker.as_ref())
     }
     /// Mint authority only for a workspace selected by this call's resolver.
     pub fn authorize_workspace(&self, call: &crate::tool_policy::AuthorizedToolCall, handle: &str)
         -> Result<AuthorizedWorkspace, VerificationError> {
-        // A resolver may return several granted workspaces for a compound call.
-        // The adapter cannot substitute one for the explicit execution target.
-        let selectors = ["workspace", "workspace_id"].iter()
-            .filter_map(|key| call.arguments().get(key))
-            .map(|value| value.as_str().ok_or(VerificationError::Invalid))
-            .collect::<Result<Vec<_>, _>>()?;
-        if selectors.iter().any(|selected| *selected != handle) {
-            return Err(VerificationError::BindingMismatch);
-        }
-        let workspaces = call.resources().iter().filter(|grant|
-            matches!(grant, ResourceGrant::Workspace { .. })).collect::<Vec<_>>();
-        if selectors.is_empty() && workspaces.len() != 1 {
-            return Err(VerificationError::BindingMismatch);
-        }
-        let grant = workspaces.into_iter().find(|grant|
-            matches!(grant, ResourceGrant::Workspace { handle: selected } if selected.as_str() == handle))
-            .ok_or(VerificationError::BindingMismatch)?;
+        let grant = selected_workspace_grant(call, handle)?;
         let root = self.authorized_root(call.context(), handle)?;
         let directory = root.try_clone().map_err(|_| VerificationError::Unavailable)?;
         let identity = file_identity(&directory)?;
@@ -406,7 +609,7 @@ impl ResourceRoots {
 
     pub fn insert(&mut self, handle: String, employee: EmployeeId, directory: File) -> Result<(), VerificationError> {
         if handle.is_empty() || handle.len() > 128 || self.roots.contains_key(&handle)
-            || self.roots.len() >= 128 || !directory.metadata().map_err(|_| VerificationError::Unavailable)?.is_dir() {
+            || self.is_brokered(&handle) || self.roots.len() >= 128 || !directory.metadata().map_err(|_| VerificationError::Unavailable)?.is_dir() {
             return Err(VerificationError::Invalid);
         }
         self.roots.insert(handle, (employee, directory));
@@ -445,6 +648,66 @@ impl ResourceRoots {
             return Err(VerificationError::Invalid);
         }
         Ok(root)
+    }
+}
+
+/// Test double for root's work broker. It emulates H2's checks on an ordinary
+/// directory standing in for the live run's attached work mount. Production
+/// brokers are H5's spawnd client; this double must never be wired at boot.
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod test_broker {
+    use super::{BrokeredWorkFile, WorkBroker, WorkBrokerError, WorkFileMetadata, WorkFileRequest};
+    use duduclaw_isolation::ids::{EmployeeId, RunId};
+    use std::{os::unix::fs::MetadataExt, path::PathBuf, sync::Mutex};
+
+    type Misreport = Box<dyn Fn(&mut WorkFileMetadata) + Send + Sync>;
+    pub struct TestWorkBroker {
+        root: PathBuf,
+        live: Mutex<Option<(RunId, EmployeeId)>>,
+        fail: Mutex<Option<WorkBrokerError>>,
+        misreport: Mutex<Option<Misreport>>,
+        calls: Mutex<Vec<(RunId, EmployeeId, String)>>,
+        checked: bool,
+    }
+    impl TestWorkBroker {
+        /// A broker that applies H2's refusals (symlink, non-regular, nlink, size).
+        pub fn new(root: PathBuf, run: RunId, employee: EmployeeId) -> Self {
+            Self { root, live: Mutex::new(Some((run, employee))), fail: Mutex::new(None),
+                misreport: Mutex::new(None), calls: Mutex::new(Vec::new()), checked: true }
+        }
+        /// A faulty broker that returns whatever it opened, so tests can prove
+        /// the boundary's own checks on the received descriptor.
+        pub fn unchecked(root: PathBuf, run: RunId, employee: EmployeeId) -> Self {
+            Self { checked: false, ..Self::new(root, run, employee) }
+        }
+        /// The run exits / its storage lease is detached.
+        pub fn end_run(&self) { *self.live.lock().unwrap() = None; }
+        pub fn fail_with(&self, error: Option<WorkBrokerError>) { *self.fail.lock().unwrap() = error; }
+        pub fn misreport(&self, edit: impl Fn(&mut WorkFileMetadata) + Send + Sync + 'static) {
+            *self.misreport.lock().unwrap() = Some(Box::new(edit));
+        }
+        pub fn calls(&self) -> Vec<(RunId, EmployeeId, String)> { self.calls.lock().unwrap().clone() }
+    }
+    impl WorkBroker for TestWorkBroker {
+        fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError> {
+            self.calls.lock().unwrap().push((request.run(), request.employee(), request.path().as_str().to_owned()));
+            if let Some(error) = *self.fail.lock().unwrap() { return Err(error); }
+            if *self.live.lock().unwrap() != Some((request.run(), request.employee())) {
+                return Err(WorkBrokerError::NotLive);
+            }
+            let path = self.root.join(request.path().as_str());
+            if self.checked {
+                let link = std::fs::symlink_metadata(&path).map_err(|_| WorkBrokerError::NotFound)?;
+                if !link.file_type().is_file() || link.nlink() != 1 { return Err(WorkBrokerError::Refused); }
+                if link.len() > request.max_bytes() { return Err(WorkBrokerError::TooLarge); }
+            }
+            let file = std::fs::File::open(&path).map_err(|_| WorkBrokerError::NotFound)?;
+            let stat = file.metadata().map_err(|_| WorkBrokerError::Unavailable)?;
+            let mut metadata = WorkFileMetadata { regular: stat.is_file(), size: stat.len(),
+                device: stat.dev(), inode: stat.ino(), nlink: stat.nlink() };
+            if let Some(edit) = self.misreport.lock().unwrap().as_ref() { edit(&mut metadata); }
+            Ok(BrokeredWorkFile { file, metadata })
+        }
     }
 }
 
