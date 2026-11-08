@@ -3,11 +3,28 @@
 use std::{future::Future, path::{Path, PathBuf}, sync::Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use duduclaw_isolation::{capability::Lane, execution::{RunHandle, WaitOrigin}, ids::EmployeeId};
+use duduclaw_isolation::{capability::{EmployeeBinding, Lane}, execution::{RunHandle, WaitOrigin}, ids::EmployeeId};
 use duduclaw_mcp_boundary::VerificationError;
+use duduclaw_migration::contract::ProposalBinding;
+use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, LifecycleError, RootAllocation};
 
 pub mod material;
 mod store;
+#[cfg(test)]
+mod lifecycle_tests;
+/// Shown when background work is asked of a Personal employee. Such an
+/// employee only acts for its owner in a live session (never a Background
+/// principal), so no approval card is filed.
+pub const PERSONAL_REFUSAL: &str =
+    "個人專屬員工不能執行背景工作（排程、提醒、定期檢查或自動交辦）；請由擁有者直接在對話中交辦。";
+/// Shown when a receipt approved before v1.81 (without the employee binding
+/// and allocation) is found. It never authorizes a run.
+pub const LEGACY_REFUSAL: &str =
+    "這筆背景工作的執行授權是在目前版本之前核准的，需要由管理員到儀表板重新核准後才會執行。";
+const REQUEST_TEXT: &str =
+    "請於 24 小時內決定；核准後最多執行 30 天。內容、權限或交辦人憑證變更、取消工作後立即失效。";
+const LEGACY_REQUEST_TEXT: &str = "這筆背景工作的執行授權是在目前版本之前核准的，需要重新核准。\
+    請於 24 小時內決定；核准後最多執行 30 天。內容、權限或交辦人憑證變更、取消工作後立即失效。";
 pub const APPROVAL_KIND: &str = "isolation_background_execution";
 pub const APPROVAL_SPEC: crate::approval::operator_cli_gate::KindSpec = crate::approval::operator_cli_gate::KindSpec {
     kind: APPROVAL_KIND,
@@ -32,6 +49,17 @@ pub struct RecordAuthority {
     id: String,
     agent: String,
     employee: EmployeeId,
+    /// v1.81: the principal the employee was allocated for (A1 root receipt
+    /// `principal_binding`, read through the A2 lifecycle). Always Shared:
+    /// a Personal employee never runs background work. `None` only in a
+    /// receipt stored before v1.81; such a receipt never authorizes a run.
+    #[serde(default)]
+    binding: Option<EmployeeBinding>,
+    /// v1.81: the confirmed Employee proposal the root allocation was made
+    /// for (A2 lifecycle `allocation`). A delete/recreate under the same
+    /// label never matches. `None` only in a receipt stored before v1.81.
+    #[serde(default)]
+    allocation: Option<ProposalBinding>,
     owner: String,
     epoch: u64,
     acl_generation: u64,
@@ -49,7 +77,34 @@ pub struct RecordAuthority {
     detached_bus: bool,
 }
 
-tokio::task_local! { static RECORD: Mutex<Option<RecordAuthority>>; static PENDING: bool; }
+impl RecordAuthority {
+    /// Stored before v1.81: approved without the employee binding and
+    /// allocation. Readable only so a new request can replace it.
+    fn is_legacy(&self) -> bool { self.binding.is_none() && self.allocation.is_none() }
+}
+
+/// Why a background authority request was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// A Personal employee: background runs are refused entirely.
+    PersonalEmployee,
+    Failed(VerificationError),
+}
+impl From<VerificationError> for RequestError {
+    fn from(error: VerificationError) -> Self { Self::Failed(error) }
+}
+impl RequestError {
+    /// User-facing reason, when one is more specific than a generic failure.
+    pub fn user_message(&self) -> Option<&'static str> {
+        match self { Self::PersonalEmployee => Some(PERSONAL_REFUSAL), Self::Failed(_) => None }
+    }
+}
+
+tokio::task_local! {
+    static RECORD: Mutex<Option<RecordAuthority>>;
+    static PENDING: bool;
+    static REFUSAL: Option<&'static str>;
+}
 static REQUEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn unavailable() -> VerificationError { VerificationError::Unavailable }
@@ -73,20 +128,34 @@ pub async fn request_record(home: &Path, kind: &str, id: &str, agent: &str,
     owner: Option<&str>, material: &Value) -> Result<(), VerificationError> {
     if !duduclaw_core::execution_gate::isolation_required() { return Ok(()); }
     if kind == "delegation" { return Err(VerificationError::Invalid); }
-    request_record_inner(home, kind, id, agent, owner, material, false).await
+    request_record_inner(home, kind, id, agent, owner, material, false).await.map_err(|error| match error {
+        RequestError::PersonalEmployee => VerificationError::Invalid,
+        RequestError::Failed(error) => error,
+    })
 }
 
 /// Explicit authenticated settings saves may request a new approval after a
 /// previous receipt expires or is revoked. Scheduler ticks cannot renew it.
 pub async fn request_record_from_settings(home: &Path, kind: &str, id: &str, agent: &str,
-    owner: &str, material: &Value) -> Result<(), VerificationError> {
+    owner: &str, material: &Value) -> Result<(), RequestError> {
     if !duduclaw_core::execution_gate::isolation_required() { return Ok(()); }
-    if kind != "heartbeat" { return Err(VerificationError::Invalid); }
+    if kind != "heartbeat" { return Err(VerificationError::Invalid.into()); }
     request_record_inner(home, kind, id, agent, Some(owner), material, true).await
 }
 
+/// Outcome of the blocking capture step.
+enum Capture {
+    /// The stored receipt stays; nothing is filed.
+    Reuse,
+    /// A Personal employee: refused before any approval card is filed.
+    Personal,
+    /// A new receipt awaiting an approval card. `legacy` when it replaces a
+    /// receipt stored before v1.81.
+    New { receipt: RecordAuthority, legacy: bool },
+}
+
 async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
-    owner: Option<&str>, material: &Value, renew: bool) -> Result<(), VerificationError> {
+    owner: Option<&str>, material: &Value, renew: bool) -> Result<(), RequestError> {
     let owner = owner.ok_or(VerificationError::Invalid)?.to_owned();
     let digest = store::material_digest(material)?;
     let _lock = REQUEST_LOCK.try_lock().map_err(|_| unavailable())?;
@@ -94,41 +163,77 @@ async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
         (home.to_owned(), kind.to_owned(), id.to_owned(), agent.to_owned());
     let captured = duduclaw_mcp_boundary::authority::verify_blocking(move || {
         let (home, kind, id, agent) = (&capture_home, capture_kind.as_str(), capture_id.as_str(), capture_agent.as_str());
+        let root = &lifecycle::RootAllocator;
+        // Up front, before any stored receipt is reused or a card is filed: a
+        // Personal employee is never authorized for background work (B1).
+        let Some((employee, binding, allocation)) = capture_binding(home, agent, root)? else {
+            return Ok(Capture::Personal);
+        };
+        let mut legacy = false;
         if let Some(existing) = store::load(home, kind, id)? {
-            if existing.material == digest && existing.agent == agent && existing.owner == owner {
-                if !renew { return Ok(None); }
+            if existing.is_legacy() {
+                // Approved before v1.81 without the binding/allocation, so its
+                // approval never covered them and it can never authorize a run.
+                // Treated like a missing receipt: one new card replaces it, and
+                // later ticks reuse the replacement under the rules below.
+                legacy = true;
+            } else if existing.material == digest && existing.agent == agent && existing.owner == owner {
+                if !renew { return Ok(Capture::Reuse); }
                 // A still-pending card can already be stale after credential or
                 // policy changes. Only an explicitly authenticated settings save
                 // can replace it; polling never refreshes captured authority.
-                if recheck_receipt(&existing, false, false).is_ok()
-                    && (store::approval_pending(&existing)? || recheck(&existing).is_ok()) { return Ok(None); }
+                if recheck_receipt(&existing, false, false, root).is_ok()
+                    && (store::approval_pending(&existing)? || recheck(&existing).is_ok()) { return Ok(Capture::Reuse); }
             }
         }
         let current = snapshot(home, &owner, agent)?;
-        let employee = confirmed_employee(home, agent)?;
+        check_tenant(&binding, &current.tenant_id)?;
         let epoch = current.human.as_ref().ok_or(VerificationError::Invalid)?.credential_epoch;
         let captured = RecordAuthority { home: home.to_owned(), kind: kind.into(), id: id.into(),
-            agent: agent.into(), employee, owner, epoch, acl_generation: current.acl_generation,
+            agent: agent.into(), employee, binding: Some(binding), allocation: Some(allocation),
+            owner, epoch, acl_generation: current.acl_generation,
             policy_epoch: current.policy_epoch,
             policy: crate::approval::strict_policy_revision(home, agent).map_err(|_| unavailable())?,
             material: digest, approval: None, expires_at: now()?.checked_add(MAX_AUTHORITY_SECONDS)
                 .ok_or(VerificationError::InvalidTime)?, lane: Lane::Standard,
             caller: None, parent_run: None, parent_agent: None, parent_policy: None, parent: None, detached_bus: false };
-        store::validate(&captured)?;
-        Ok(Some(captured))
+        store::validate_current(&captured)?;
+        Ok(Capture::New { receipt: captured, legacy })
     }).await?;
-    let Some(captured) = captured else { return Ok(()); };
+    let (captured, legacy) = match captured {
+        Capture::Reuse => return Ok(()),
+        Capture::Personal => {
+            tracing::warn!(agent, kind, "background work refused: personal employees never run background work");
+            return Err(RequestError::PersonalEmployee);
+        }
+        Capture::New { receipt, legacy } => (receipt, legacy),
+    };
+    if legacy {
+        tracing::warn!(agent, kind, "background receipt approved before v1.81 requires re-approval");
+    }
     let broker = crate::approval::ApprovalBroker::open(home).map_err(|_| unavailable())?;
     // Cap pending cards independently of polling cadence and record churn.
     let pending = broker.list_pending(None).await.map_err(|_| unavailable())?;
-    if pending.iter().filter(|r| r.action_kind == APPROVAL_KIND).count() >= 20 { return Err(unavailable()); }
+    if pending.iter().filter(|r| r.action_kind == APPROVAL_KIND).count() >= 20 { return Err(unavailable().into()); }
     let payload = json!({"authority": captured, "record": material});
     let approval = broker.request(agent, APPROVAL_KIND,
-        "請於 24 小時內決定；核准後最多執行 30 天。內容、權限或交辦人憑證變更、取消工作後立即失效。", payload, 24 * 60 * 60)
+        if legacy { LEGACY_REQUEST_TEXT } else { REQUEST_TEXT }, payload, 24 * 60 * 60)
         .await.map_err(|_| unavailable())?;
     let mut captured = captured;
     captured.approval = Some(approval.to_string());
-    duduclaw_mcp_boundary::authority::verify_blocking(move || store::save(&captured)).await
+    Ok(duduclaw_mcp_boundary::authority::verify_blocking(move || store::save(&captured)).await?)
+}
+
+/// Employee identity, binding and allocation for a new background receipt,
+/// from the A2 lifecycle. `None` for a Personal employee: background runs
+/// are refused entirely, so no receipt or approval card is ever created.
+fn capture_binding(home: &Path, agent: &str, root: &dyn RootAllocation)
+    -> Result<Option<(EmployeeId, EmployeeBinding, ProposalBinding)>, VerificationError> {
+    let current = current_lifecycle(home, agent, root)?;
+    match &current.binding {
+        EmployeeBinding::Shared(_) => Ok(Some((current.employee, current.binding.clone(), current.allocation))),
+        EmployeeBinding::Personal(_) => Ok(None),
+    }
 }
 
 /// The owning scheduler reads the record again on each fire and supplies its
@@ -138,21 +243,29 @@ pub async fn scope_record<F: Future>(home: &Path, kind: &str, id: &str, agent: &
     let future = Box::pin(future);
     if !duduclaw_core::execution_gate::isolation_required() { return future.await; }
     if RECORD.try_with(|_| ()).is_ok() { return future.await; }
-    if kind != "delegation" { let _ = request_record(home, kind, id, agent, owner, material).await; }
+    let mut refusal = None;
+    if kind != "delegation" {
+        refusal = request_record_inner(home, kind, id, agent, owner, material, false).await
+            .err().and_then(|error| error.user_message());
+    }
     let (home, kind, id, agent, owner, material) = (home.to_owned(), kind.to_owned(), id.to_owned(),
         agent.to_owned(), owner.map(str::to_owned), material.clone());
-    let (captured, pending) = duduclaw_mcp_boundary::authority::verify_blocking(move || {
-        let mut pending = false;
+    let (captured, pending, legacy) = duduclaw_mcp_boundary::authority::verify_blocking(move || {
+        let (mut pending, mut legacy) = (false, false);
         let captured = (|| {
             let receipt = store::load(&home, &kind, &id)?.ok_or_else(unavailable)?;
+            legacy = receipt.is_legacy();
             check_material(&receipt, &agent, owner.as_deref(), &store::material_digest(&material)?)?;
             pending = store::approval_pending(&receipt).unwrap_or(false);
             recheck(&receipt)?;
             Ok::<_, VerificationError>(receipt)
         })().ok();
-        Ok((captured, pending))
-    }).await.unwrap_or((None, false));
-    PENDING.scope(pending, RECORD.scope(Mutex::new(captured), future)).await
+        Ok((captured, pending, legacy))
+    }).await.unwrap_or((None, false, false));
+    // A receipt still in the pre-v1.81 form (its replacement could not be
+    // filed) is refused by recheck; tell the scheduler why.
+    if legacy && refusal.is_none() { refusal = Some(LEGACY_REFUSAL); }
+    REFUSAL.scope(refusal, PENDING.scope(pending, RECORD.scope(Mutex::new(captured), future))).await
 }
 
 fn check_material(receipt: &RecordAuthority, agent: &str, owner: Option<&str>, digest: &str)
@@ -172,10 +285,47 @@ fn check_identity(receipt: &RecordAuthority, epoch: Option<u64>, acl: u64, polic
     Ok(())
 }
 
-fn confirmed_employee(home: &Path, agent: &str) -> Result<EmployeeId, VerificationError> {
-    let current = crate::handlers::resolve_confirmed_employee(home, agent).map_err(|_| unavailable())?;
-    if current.disabled || current.label != agent { return Err(VerificationError::Revoked); }
-    Ok(current.employee)
+/// The A2 lifecycle of the confirmed employee holding `agent`. Disabled,
+/// tombstoned, stale or denied employees are `Revoked`; unreadable stores or
+/// an unreachable root allocator are `Unavailable`.
+fn current_lifecycle(home: &Path, agent: &str, root: &dyn RootAllocation)
+    -> Result<EmployeeLifecycle, VerificationError> {
+    let current = lifecycle::read_lifecycle_with(home, agent, root).map_err(|error| match error {
+        LifecycleError::Unavailable => unavailable(),
+        LifecycleError::Denied | LifecycleError::Stale | LifecycleError::Tombstoned => VerificationError::Revoked,
+    })?;
+    if current.label != agent { return Err(VerificationError::Revoked); }
+    Ok(current)
+}
+
+/// The receipt's employee, binding and allocation must equal the live
+/// lifecycle exactly, and the binding must still be Shared.
+fn check_lifecycle(receipt: &RecordAuthority, current: &EmployeeLifecycle) -> Result<(), VerificationError> {
+    let (Some(binding), Some(allocation)) = (&receipt.binding, &receipt.allocation) else {
+        return Err(VerificationError::Revoked);
+    };
+    if current.employee != receipt.employee || current.label != receipt.agent
+        || current.allocation != *allocation || current.binding != *binding {
+        return Err(VerificationError::Revoked);
+    }
+    // B1: a Personal employee is never authorized for background work.
+    if !matches!(current.binding, EmployeeBinding::Shared(_)) { return Err(VerificationError::Revoked); }
+    Ok(())
+}
+
+/// Legacy receipts are refused before any store is read; otherwise the
+/// lifecycle is re-read and compared.
+fn check_receipt_lifecycle(receipt: &RecordAuthority, root: &dyn RootAllocation) -> Result<(), VerificationError> {
+    if receipt.is_legacy() { return Err(VerificationError::Revoked); }
+    check_lifecycle(receipt, &current_lifecycle(&receipt.home, &receipt.agent, root)?)
+}
+
+/// A Shared binding's tenant must equal the installation tenant read now.
+fn check_tenant(binding: &EmployeeBinding, tenant: &str) -> Result<(), VerificationError> {
+    match binding {
+        EmployeeBinding::Shared(pinned) if pinned.as_str() == tenant => Ok(()),
+        _ => Err(VerificationError::Revoked),
+    }
 }
 
 fn take_record() -> Result<RecordAuthority, VerificationError> {
@@ -190,12 +340,15 @@ pub fn record_owner(home: &Path, kind: &str, id: &str) -> Option<String> {
 }
 
 pub(crate) fn recheck(receipt: &RecordAuthority) -> Result<(), VerificationError> {
-    recheck_receipt(receipt, false, true)
+    recheck_receipt(receipt, false, true, &lifecycle::RootAllocator)
 }
-fn recheck_receipt(receipt: &RecordAuthority, ancestor: bool, check_decision: bool) -> Result<(), VerificationError> {
+fn recheck_receipt(receipt: &RecordAuthority, ancestor: bool, check_decision: bool, root: &dyn RootAllocation)
+    -> Result<(), VerificationError> {
     store::validate(receipt)?;
+    // Approved before v1.81: needs a new approval, whatever else is current.
+    if receipt.is_legacy() { return Err(VerificationError::Revoked); }
     if now()? >= receipt.expires_at { return Err(VerificationError::InvalidTime); }
-    if confirmed_employee(&receipt.home, &receipt.agent)? != receipt.employee { return Err(VerificationError::Revoked); }
+    check_receipt_lifecycle(receipt, root)?;
     if store::load(&receipt.home, &receipt.kind, &receipt.id)?.as_ref() != Some(receipt) {
         return Err(VerificationError::Revoked);
     }
@@ -206,14 +359,17 @@ fn recheck_receipt(receipt: &RecordAuthority, ancestor: bool, check_decision: bo
         if store::material_digest(&material)? != receipt.material { return Err(VerificationError::Revoked); }
     }
     let current = snapshot(&receipt.home, &receipt.owner, &receipt.agent)?;
+    check_tenant(receipt.binding.as_ref().ok_or(VerificationError::Revoked)?, &current.tenant_id)?;
     let policy = crate::approval::strict_policy_revision(&receipt.home, &receipt.agent).map_err(|_| unavailable())?;
     check_identity(receipt, current.human.as_ref().map(|h| h.credential_epoch),
         current.acl_generation, current.policy_epoch, &policy)?;
     if let Some(approval) = &receipt.approval { if check_decision { store::check_approval(receipt, approval)?; } }
     else if receipt.kind != "delegation" { return Err(VerificationError::Invalid); }
-    if let Some(parent) = &receipt.parent { recheck_receipt(parent, true, true)?; }
+    if let Some(parent) = &receipt.parent { recheck_receipt(parent, true, true, root)?; }
     if let (Some(agent), Some(policy)) = (&receipt.parent_agent, &receipt.parent_policy) {
-        if Some(confirmed_employee(&receipt.home, agent)?) != receipt.caller { return Err(VerificationError::Revoked); }
+        if Some(current_lifecycle(&receipt.home, agent, root)?.employee) != receipt.caller {
+            return Err(VerificationError::Revoked);
+        }
         let origin = snapshot(&receipt.home, &receipt.owner, agent)?;
         if origin.human.as_ref().map(|h| h.credential_epoch) != Some(receipt.epoch)
             || origin.acl_generation != receipt.acl_generation || origin.policy_epoch != receipt.policy_epoch
@@ -280,6 +436,10 @@ fn delegation_metadata(receipt: &RecordAuthority) -> Result<crate::isolation_egr
 
 pub(crate) fn has_scope() -> bool { RECORD.try_with(|_| ()).is_ok() }
 pub fn approval_pending() -> bool { PENDING.try_with(|pending| *pending).unwrap_or(false) }
+/// User-facing reason the current background scope holds no authority, when
+/// one is known (Personal employee, receipt approved before v1.81). Only an
+/// explanation for the owning scheduler; its absence is never a grant.
+pub fn refusal_reason() -> Option<&'static str> { REFUSAL.try_with(|reason| *reason).ok().flatten() }
 
 #[cfg(target_os = "linux")]
 pub(crate) struct DelegationSource {
@@ -318,14 +478,20 @@ async fn record_delegation_inner(home: &Path, sender: &str,
         return duduclaw_mcp_boundary::authority::verify_blocking(move || {
             let source = crate::isolation_mcp::delegation_source(&home, &sender, &context)?;
             let current = snapshot(&home, &source.owner, &target)?;
-            let employee = confirmed_employee(&home, &target)?;
+            // A queued delegation runs as background work of the target: a
+            // Personal target is refused before any receipt is stored.
+            let Some((employee, binding, allocation)) = capture_binding(&home, &target, &lifecycle::RootAllocator)? else {
+                tracing::warn!(agent = target.as_str(), "delegation refused: personal employees never run background work");
+                return Err(VerificationError::Invalid);
+            };
+            check_tenant(&binding, &current.tenant_id)?;
             if current.human.as_ref().map(|h| h.credential_epoch) != Some(source.epoch)
                 || current.acl_generation != source.acl_generation || current.policy_epoch != source.policy_epoch {
                 return Err(VerificationError::Revoked);
             }
             let policy = crate::approval::strict_policy_revision(&home, &target).map_err(|_| unavailable())?;
             let value = RecordAuthority { home, kind: "delegation".into(), id, agent: target.clone(), employee,
-                owner: source.owner, epoch: source.epoch, acl_generation: source.acl_generation,
+                binding: Some(binding), allocation: Some(allocation), owner: source.owner, epoch: source.epoch, acl_generation: source.acl_generation,
                 policy_epoch: source.policy_epoch,
                 policy,
                 material: store::material_digest(&material)?, approval: None, expires_at: source.expires_at,
@@ -342,9 +508,16 @@ async fn record_delegation_inner(home: &Path, sender: &str,
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) fn allocation(id: u8) -> ProposalBinding {
+        ProposalBinding { operation_id: duduclaw_migration::contract::ProposalOperationId {
+            proposal_id: duduclaw_migration::ids::RequestId([id; 16]), revision: 1 },
+            proposal_digest: duduclaw_isolation::ids::Sha256Digest([id; 32]) }
+    }
     pub(super) fn receipt(home: &Path) -> RecordAuthority {
         RecordAuthority { home: home.to_owned(), kind: "cron".into(), id: "original-record".into(),
-            agent: "alice".into(), employee: EmployeeId([1;16]), owner: "user:original-user".into(), epoch: 7,
+            agent: "alice".into(), employee: EmployeeId([1;16]),
+            binding: Some(EmployeeBinding::Shared(duduclaw_isolation::bounded::Text::new("tenant-1".into()).unwrap())),
+            allocation: Some(allocation(1)), owner: "user:original-user".into(), epoch: 7,
             acl_generation: 11, policy_epoch: 13, policy: "original-policy".into(),
             material: store::material_digest(&json!({"task":"original"})).unwrap(),
             approval: Some("approval-id".into()), expires_at: now().unwrap() + 3600,
