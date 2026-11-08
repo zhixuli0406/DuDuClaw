@@ -156,6 +156,13 @@ Enterprise setting (v1.76.0, User Management → Organisation settings): `users.
 |---|---|---|
 | Global background tasks → Global utility provider / model | `[runtime] utility_provider` / `utility_model` | Immediately (read per call) |
 | General → Log format | `[logging] format` (`json`; any other value is plain text) | After restart |
+| General → AI employee reply language (default) | `[general] default_language` (`zh-TW`, `zh-CN`, `en`, `ja-JP`; empty or "Follow input language" = reply in the user's language). Pins the reply language for every AI employee, and a one-line reminder is added to the end of each turn so long content in other languages does not pull the reply away | Next message |
+| Edit AI employee → Basics → Reply language | `[prompt] reply_language` in the employee's `agent.toml` (`auto`, `zh-TW`, `zh-CN`, `en`, `ja-JP`; also settable through `agents.update` `reply_language` and the MCP `agent_update` tool). "Use global setting" removes the key and falls back to `[general] default_language`; `auto` follows the user's language for this employee even when a global language is pinned. Any other value is refused | Next message |
+
+Reply language applies to channel replies, dispatched tasks, cron jobs, goal loops, sub-agents and task sandbox system prompts. A user's explicit request for another language takes priority. Only administrators can change an employee's `reply_language`; employees cannot edit that key themselves. RPC/MCP writes reject values outside the employee choices. Invalid values already on disk are ignored with a warning and fall back to the global setting. Global codes must match `^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8}){0,2}$`; only recognised Chinese, English and Japanese codes produce prompt instructions or reminders.
+
+Fixed failure and machine-operation refusal messages support zh-TW, zh-CN, en and ja-JP. With employee `auto`, these messages use the global language because no user-language detection is available; an unset or unsupported global language falls back to zh-TW. Other system notices, including channel `@` routing notices, currently support zh-TW/en/ja only and fall back to zh-TW for zh-CN.
+
 | Display name | `[general] name` | After restart (the local-network announcement is built at boot) |
 | Account health check interval | `[rotation] health_check_interval_seconds` | After restart |
 | Task sandbox → sandbox image, when the sandbox is unavailable (tasks), when the sandbox is unavailable (scripts) | `[container.sandbox] image`, `when_unavailable`, `script_when_unavailable` | Immediately (read per task) |

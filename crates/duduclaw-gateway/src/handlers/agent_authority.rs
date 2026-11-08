@@ -104,6 +104,7 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("runtime.timeout_secs", &["runtime.timeout_secs"], Loosen),
     // `--bare` skips the hooks, the employee file guard included.
     key("prompt.cli_bare_mode", &[], Change),
+    key("prompt.reply_language", &["form.reply_language"], Change),
     // Widens what the employee watches on the machine.
     key("os_watch", &["osWatch."], Change),
     // Which accounts' quota the employee spends.
@@ -274,6 +275,7 @@ mod tests {
             ("[runtime]\nprovider='codex'\n", "runtime.provider"),
             ("[runtime]\nfallback='claude'\n", "runtime.fallback"),
             ("[prompt]\ncli_bare_mode=true\n", "prompt.cli_bare_mode"),
+            ("[prompt]\nreply_language='en'\n", "prompt.reply_language"),
             ("[container]\nreadonly_project=false\n", "container.readonly_project"),
             ("[os_watch]\npaths=['/']\n", "os_watch"),
             ("[model]\naccount_pool=['acct']\n", "model.account_pool"),

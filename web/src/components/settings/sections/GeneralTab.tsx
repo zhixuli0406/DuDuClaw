@@ -119,7 +119,7 @@ export function GeneralTab() {
 
   // Empty string = "follow the user's input language" (pre-existing
   // behaviour, unchanged). Non-empty pins a global default reply language.
-  const languageOptions: SelectOption[] = ['', 'zh-TW', 'en', 'ja-JP'].map((code) => ({
+  const languageOptions: SelectOption[] = ['', 'zh-TW', 'zh-CN', 'en', 'ja-JP'].map((code) => ({
     value: code,
     label: intl.formatMessage({
       id: code === '' ? 'settings.general.defaultLanguage.followInput' : `settings.general.defaultLanguage.${code}`,

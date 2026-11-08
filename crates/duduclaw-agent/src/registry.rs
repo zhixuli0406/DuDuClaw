@@ -881,6 +881,26 @@ skill_security_scan = true
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn lenient_reply_language_wrong_types_keep_employee_registered() {
+        for value in ["5", "true", "1.5", "['en']", "{ language = 'en' }"] {
+            let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let agents_dir = tmp.path().join("agents");
+            let dir = agents_dir.join("helper");
+            write_full_agent_toml(&dir, "helper");
+            let path = dir.join("agent.toml");
+            let mut raw = std::fs::read_to_string(&path).unwrap();
+            raw.push_str(&format!("\n[prompt]\nreply_language = {value}\n"));
+            std::fs::write(path, raw).unwrap();
+            let mut registry = AgentRegistry::new(agents_dir);
+            registry.scan().await.unwrap();
+            let agents = registry.list();
+            assert_eq!(agents.len(), 1, "{value}");
+            assert_eq!(agents[0].config.agent.name, "helper");
+            assert_eq!(agents[0].config.prompt.reply_language, None, "{value}");
+        }
+    }
+
     /// Two directories, same `[agent] name` — `scan()` must complete without
     /// panicking or erroring, and the registry ends up with exactly one
     /// `name`-keyed entry (not two, not zero) pointing at *some* directory.
