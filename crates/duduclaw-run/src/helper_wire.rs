@@ -575,7 +575,7 @@ pub mod linux {
         let raw: Vec<libc::c_int> = fds.iter().map(AsRawFd::as_raw_fd).collect();
         let payload = std::mem::size_of_val(raw.as_slice());
         // SAFETY: CMSG_SPACE is a pure size computation.
-        let space = if raw.is_empty() { 0 } else { unsafe { libc::CMSG_SPACE(payload as u32) } as usize };
+        let space = if raw.is_empty() { 0 } else { (unsafe { libc::CMSG_SPACE(payload as u32) }) as usize };
         // usize storage satisfies cmsghdr alignment.
         let mut control = vec![0usize; space.div_ceil(std::mem::size_of::<usize>())];
         let mut iov = libc::iovec { iov_base: frame.as_ptr().cast_mut().cast(), iov_len: frame.len() };
