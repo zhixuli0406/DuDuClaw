@@ -74,8 +74,17 @@ pub struct GoogleAccountRoutes {
     pub(crate) personal: BTreeMap<String, GoogleRoute>,
     pub(crate) home: Option<GoogleRoute>,
     pub(crate) tenant: Option<GoogleRoute>,
+    /// F6b (A5): the `(employee, incarnation)` this selection was read for.
+    pub(crate) pinned: (EmployeeId, u32),
 }
 impl GoogleAccountRoutes {
+    /// F6b (A5): whether this selection belongs to exactly `lifecycle`'s
+    /// employee id and incarnation; a selection of a prior incarnation (or
+    /// of another employee on the label) never serves the current one.
+    pub(crate) fn pinned_to(&self, lifecycle: &EmployeeLifecycle) -> bool {
+        self.pinned == (lifecycle.employee, lifecycle.incarnation)
+    }
+
     /// Blocking lifecycle (SQLite/root IPC) and catalog reads; call on the same
     /// blocking boundary as the other live protected authority checks.
     /// `tenant_source` is the kind of the tenant credential source currently
@@ -145,6 +154,7 @@ impl GoogleAccountRoutes {
                     })]),
                     home: None,
                     tenant: None,
+                    pinned: (lifecycle.employee, lifecycle.incarnation),
                 })
             }
             EmployeeBinding::Shared(tenant) => {
@@ -161,7 +171,8 @@ impl GoogleAccountRoutes {
                 let product = |route: Route| GoogleRoute { product: ProductConnectorAccount::SharedHome {
                     account: route.account.as_str().to_owned(), tenant: tenant.as_str().to_owned(),
                 }, route };
-                Ok(Self { personal: BTreeMap::new(), home: home.map(product), tenant: tenant_route.map(product) })
+                Ok(Self { personal: BTreeMap::new(), home: home.map(product), tenant: tenant_route.map(product),
+                    pinned: (lifecycle.employee, lifecycle.incarnation) })
             }
         }
     }

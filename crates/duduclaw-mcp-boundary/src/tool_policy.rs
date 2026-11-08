@@ -2,12 +2,12 @@
 //!
 //! This registry is independent of handler execution. Listing does not authorize
 //! a call: each call resolves all of its resources and verifies the signed grants.
-use duduclaw_isolation::capability::{EmployeeBinding, ResourceGrant};
+use duduclaw_isolation::capability::{EmployeeBinding, Principal, ResourceGrant};
 use serde_json::Value;
 use crate::{RequestContext, VerificationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin, PublicOrigins }
+pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin, PublicOrigins, NewTask }
 impl ResourceKind {
     pub fn of(resource: &ResourceGrant) -> Self {
         match resource {
@@ -23,6 +23,7 @@ impl ResourceKind {
             ResourceGrant::Recipient { .. } => Self::Recipient,
             ResourceGrant::UrlOrigin { .. } => Self::UrlOrigin,
             ResourceGrant::PublicOrigins { .. } => Self::PublicOrigins,
+            ResourceGrant::NewTask { .. } => Self::NewTask,
         }
     }
 }
@@ -106,7 +107,9 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "create_agent", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "list_agents", route: Route::Service, required: &[ResourceKind::Employee] },
     // H8: a TaskSpec plan is host-queue work under the run's own live task
-    // (`create_task_selector`), not a workspace operation.
+    // (`create_task_selector`), not a workspace operation. An interactive run
+    // instead uses its signed `NewTask` grant (`new_task_grant`, H9 decision 3);
+    // `required` lists the record-task path.
     ToolPolicy { name: "create_task", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Task] },
     ToolPolicy { name: "check_responses", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "task_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
@@ -140,7 +143,9 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "odoo_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "odoo_write", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     // exec
-    ToolPolicy { name: "skill_extract", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace, ResourceKind::Wiki] },
+    // H12a: own skill tools read host-owned skill files of the record's own
+    // employee and publish only into its own wiki/SKILLS; no workspace input.
+    ToolPolicy { name: "skill_extract", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "execute_program", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "office_script", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_bank_feedback", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
@@ -191,7 +196,7 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "autopilot_list", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "shared_skill_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "shared_skill_share", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
-    ToolPolicy { name: "shared_skill_adopt", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "shared_skill_adopt", route: Route::Worker, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "plan_start", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "memory_improve", route: Route::Service, required: &[ResourceKind::Employee] },
     // recording
@@ -237,12 +242,12 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "skill_search", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "skill_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "skill_gaps", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
-    ToolPolicy { name: "skill_security_scan", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "skill_graduate", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_security_scan", route: Route::Worker, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "skill_graduate", route: Route::Worker, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "skill_synthesis_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "skill_synthesis_run", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_hub_install", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "skill_curator_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_curator_status", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "skill_pin", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     // integrations
     ToolPolicy { name: "notion_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
@@ -420,6 +425,104 @@ pub fn create_task_selector(context: &RequestContext) -> Result<ResourceGrant, V
     Ok(selector)
 }
 
+/// H12a own-skill tools. They act only on the record's own employee: its
+/// host-owned skill files (`agents/<label>/SKILLS`, read by the trusted
+/// producer and parsed as data by the E worker) and its own wiki/SKILLS
+/// publication. Identity is the verified record (EmployeeScope + its own
+/// `Employee` grant); the agent label is bound by the host producer, never an
+/// argument. Task-limited records (no EmployeeScope) never list them.
+pub const OWN_SKILL_TOOLS: &[&str] = &["skill_extract", "shared_skill_adopt", "skill_security_scan",
+    "skill_graduate", "skill_curator_status"];
+
+/// The exact argument schema of [`OWN_SKILL_TOOLS`] in protected mode. No
+/// selector names another employee: `target_agent`, `scope`, `namespace`,
+/// paths and execution identities refuse. `agent_id` is accepted only as the
+/// legacy schema's self-reference; the producer requires it to equal the bound
+/// employee. Values are short slugs, so skill content never travels here.
+pub fn check_own_skill_arguments(name: &str, arguments: &Value) -> Result<(), VerificationError> {
+    let object = arguments.as_object().ok_or(VerificationError::Invalid)?;
+    let allowed: &[&str] = match name {
+        "skill_curator_status" => &["run"],
+        "shared_skill_adopt" => &["skill_name"],
+        "skill_extract" | "skill_security_scan" | "skill_graduate" => &["skill_name", "agent_id"],
+        _ => return Err(VerificationError::Invalid),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) { return Err(VerificationError::Invalid); }
+    if object.get("run").is_some_and(|value| !value.is_boolean()) { return Err(VerificationError::Invalid); }
+    let slug = |value: &Value| value.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+    if name != "skill_curator_status" && !object.get("skill_name").is_some_and(slug) {
+        return Err(VerificationError::Invalid);
+    }
+    if object.get("agent_id").is_some_and(|value| !slug(value)) { return Err(VerificationError::Invalid); }
+    Ok(())
+}
+
+/// Record-side selection for [`OWN_SKILL_TOOLS`], shared by discovery and
+/// calls: the employee's own `Employee` grant under its own EmployeeScope,
+/// plus (skill_extract only) exactly one own-namespace wiki output grant.
+/// Which `agent:<label>` namespace is "own" is the host resolver's and the
+/// producer's decision (`verify_wiki_root`); here only the shape is pinned.
+pub fn own_skill_selector(context: &RequestContext, name: &str) -> Result<Vec<ResourceGrant>, VerificationError> {
+    if !OWN_SKILL_TOOLS.contains(&name) { return Err(VerificationError::Invalid); }
+    let record = context.record();
+    let own = own_employee(context);
+    if !record.employee_scope() || !record.io_resources().any(|grant| grant == &own) {
+        return Err(VerificationError::Invalid);
+    }
+    let mut selection = vec![own];
+    if name == "skill_extract" {
+        let wikis: Vec<_> = record.io_resources().filter(|grant| matches!(grant, ResourceGrant::Wiki { namespace }
+            if namespace.as_str().strip_prefix("agent:").is_some_and(|label| !label.is_empty()))
+            && validate_resource(grant).is_ok()).collect();
+        let [wiki] = wikis.as_slice() else { return Err(VerificationError::Invalid); };
+        selection.push((*wiki).clone());
+    }
+    Ok(selection)
+}
+
+/// H9 owner decision 3: the interactive-run `create_task` authority. The record
+/// must be an employee-scope record without a task, its principal a `Human`,
+/// and it must carry the plain (never `Confined`) signed
+/// `NewTask { requester }` grant for exactly that human. The requester is the
+/// authenticated person of the run; it is never read from arguments. A
+/// Background principal never qualifies (the capability decoder refuses such
+/// a grant too).
+pub fn new_task_grant(context: &RequestContext) -> Result<ResourceGrant, VerificationError> {
+    let record = context.record();
+    let Principal::Human { user_id, .. } = &record.principal else { return Err(VerificationError::Invalid); };
+    if record.task.is_some() || !record.employee_scope() { return Err(VerificationError::Invalid); }
+    let grant = ResourceGrant::NewTask { requester: user_id.clone() };
+    validate_resource(&grant)?;
+    if !record.resources.as_slice().contains(&grant) { return Err(VerificationError::Invalid); }
+    Ok(grant)
+}
+
+/// Top-level `create_task` arguments a `NewTask` call may carry. Everything
+/// else (task/goal/dependency selectors, assignee or creator fields, identity
+/// keys) is refused instead of being ignored.
+pub const NEW_TASK_KEYS: [&str; 2] = ["goal", "steps"];
+/// Keys a `NewTask` plan step may carry (the existing step schema). The step
+/// `agent` must name the calling employee or be empty; the resolver, which
+/// knows the employee's agent label, enforces that.
+pub const NEW_TASK_STEP_KEYS: [&str; 4] = ["description", "agent", "depends_on", "acceptance_criteria"];
+/// Most steps in one interactive plan.
+pub const NEW_TASK_MAX_STEPS: usize = 64;
+
+/// The plan steps of a `create_task` call, parsed exactly as the handler parses
+/// them (a JSON array, or a JSON string holding one), each a JSON object.
+pub fn new_task_steps(arguments: &Value) -> Result<Vec<Value>, VerificationError> {
+    let steps = match arguments.get("steps").ok_or(VerificationError::Invalid)? {
+        Value::Array(steps) => steps.clone(),
+        Value::String(raw) => serde_json::from_str::<Vec<Value>>(raw).map_err(|_| VerificationError::Invalid)?,
+        _ => return Err(VerificationError::Invalid),
+    };
+    if steps.is_empty() || steps.len() > NEW_TASK_MAX_STEPS || steps.iter().any(|step| !step.is_object()) {
+        return Err(VerificationError::Invalid);
+    }
+    Ok(steps)
+}
+
 /// Discovery shares the exact tool and mandatory resource policy with calls.
 /// The transport additionally checks that the corresponding host service exists.
 /// Optional argument-dependent resources are checked by `authorize`, not guessed
@@ -427,14 +530,24 @@ pub fn create_task_selector(context: &RequestContext) -> Result<ResourceGrant, V
 pub fn eligible(context: &RequestContext, name: &str) -> bool {
     let Some(policy) = policy(name) else { return false; };
     let record = context.record();
-    record.validate_resource_mode().is_ok()
-        && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
-        // D-H2: the URL itself is matched against the grant by `authorize`.
-        && ((PUBLIC_ORIGIN_TOOLS.contains(&name) && public_origins_grant(context).is_some())
+    if !(record.validate_resource_mode().is_ok() && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)) {
+        return false;
+    }
+    if name == "create_task" {
+        // Either the run's own signed record task (H8; task/schedule runs) or
+        // the interactive run's signed NewTask grant, always with the own
+        // Employee grant. Live ownership/requester checks run per call.
+        return record.io_resources().any(|grant| grant == &own_employee(context))
+            && (create_task_selector(context).is_ok() || new_task_grant(context).is_ok());
+    }
+    // D-H2: the URL itself is matched against the grant by `authorize`.
+    // H12a: own-skill tools additionally need their record-side selector
+    // (applies to the whole disjunction, not only the required-kind branch).
+    ((PUBLIC_ORIGIN_TOOLS.contains(&name) && public_origins_grant(context).is_some())
         || (record.employee_scope() && (employee_service_scope(policy) || policy.route == Route::Connector)) || policy.required.iter().all(|kind| record.io_resources()
             .any(|grant| ResourceKind::of(grant) == *kind && validate_resource(grant).is_ok()
                 && (*kind != ResourceKind::Employee || grant == &own_employee(context)))))
-        && (name != "create_task" || create_task_selector(context).is_ok())
+        && (!OWN_SKILL_TOOLS.contains(&name) || own_skill_selector(context, name).is_ok())
 }
 
 fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<ResourceKind>, VerificationError> {
@@ -506,8 +619,12 @@ pub fn validate_resource(resource: &ResourceGrant) -> Result<(), VerificationErr
     let exact = |value: &str| !value.is_empty() && value != "*" && !value.chars().any(char::is_control);
     let valid = match resource {
         ResourceGrant::Confined { resource } => !matches!(resource.as_ref(), ResourceGrant::Confined { .. }
-            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::PublicOrigins { .. })
+            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::PublicOrigins { .. }
+            | ResourceGrant::NewTask { .. })
             && validate_resource(resource).is_ok(),
+        // The requester/principal and employee-scope rules are
+        // `CapabilityRecord::check_new_task`; here only an exact identifier.
+        ResourceGrant::NewTask { requester } => exact(requester.as_str()),
         // Entries are validated by construction/decode (`PublicOrigin::parse`);
         // the set and employee-scope rules by `validate_resource_mode`. `*` here
         // is the reviewed D-H2 public-origin authority, not a collection grant.
@@ -645,6 +762,36 @@ fn authorize_public_origin(context: &RequestContext, policy: &'static ToolPolicy
         resources: vec![scope, grant.clone()] })
 }
 
+/// H9 owner decision 3: `create_task` in an interactive run. Only a new
+/// top-level plan: the arguments are exactly the plan (`goal`, `steps`), so no
+/// parent task, goal, dependency, assignee or creator can be selected; every
+/// step keeps the existing step schema. The resolver must vouch for exactly the
+/// own Employee grant and the record's signed `NewTask` grant (it checks the
+/// step targets and the live binding); the requester is the signed principal.
+fn authorize_new_task(context: &RequestContext, policy: &'static ToolPolicy, arguments: &Value,
+    grant: ResourceGrant, resolver: &dyn ResourceResolver) -> Result<AuthorizedToolCall, VerificationError> {
+    let object = arguments.as_object().ok_or(VerificationError::Invalid)?;
+    if object.keys().any(|key| !NEW_TASK_KEYS.contains(&key.as_str())) { return Err(VerificationError::Invalid); }
+    if !object.get("goal").and_then(Value::as_str).is_some_and(|goal| !goal.is_empty()) {
+        return Err(VerificationError::Invalid);
+    }
+    for step in new_task_steps(arguments)? {
+        let step = step.as_object().ok_or(VerificationError::Invalid)?;
+        if step.keys().any(|key| !NEW_TASK_STEP_KEYS.contains(&key.as_str())) { return Err(VerificationError::Invalid); }
+    }
+    let employee = own_employee(context);
+    let resources = resolver.resolve(context, policy, arguments)?;
+    if resources.len() != 2 || !resources.contains(&employee) || !resources.contains(&grant) {
+        return Err(VerificationError::Invalid);
+    }
+    for resource in [&employee, &grant] {
+        crate::resources::require_resource(context, resource)?;
+        validate_resource(resource)?;
+    }
+    Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),
+        resources: vec![employee, grant] })
+}
+
 /// Async callers resolve live resources on the bounded authority worker pool.
 /// The returned call owns its context, arguments and exact finite resources.
 pub async fn authorize_async(context: &RequestContext, name: &str, arguments: &Value,
@@ -657,28 +804,25 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
     -> Result<AuthorizedToolCall, VerificationError> {
     let policy = policy(name).ok_or(VerificationError::Invalid)?;
     // Service selectors remain data under the original schema.
-    // `run` is the curator's typed control flag, not an execution identity.
-    if name == "skill_curator_status" {
-        let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
-        if fields.keys().any(|key| key != "run")
-            || fields.get("run").is_some_and(|value| !value.is_boolean()) {
-            return Err(VerificationError::Invalid);
-        }
+    // H12a: own-skill tools accept only their exact protected schema; the
+    // curator's `run` is a typed control flag, not an execution identity.
+    if OWN_SKILL_TOOLS.contains(&name) {
+        check_own_skill_arguments(name, arguments)?;
     } else if context.record().employee_scope() && matches!(policy.route, Route::Service | Route::Connector) {
         let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
         if ["principal", "root", "cwd", "run", "run_id", "employee_id"].iter().any(|k| fields.contains_key(*k)) {
             return Err(VerificationError::Invalid);
         }
-    } else if matches!(name, "skill_security_scan" | "skill_graduate" | "skill_extract") {
-        let mut data = arguments.clone();
-        data.as_object_mut().ok_or(VerificationError::Invalid)?.remove("agent_id");
-        crate::check_arguments(&data)?;
     } else { crate::check_arguments(arguments)?; }
     if !eligible(context, name) { return Err(VerificationError::Invalid); }
     if PUBLIC_ORIGIN_TOOLS.contains(&name) {
         if let Some(grant) = public_origins_grant(context) {
             return authorize_public_origin(context, policy, arguments, grant);
         }
+    }
+    if name == "create_task" && context.record().task.is_none() {
+        // No record task: only the interactive NewTask path exists.
+        return authorize_new_task(context, policy, arguments, new_task_grant(context)?, resolver);
     }
     if context.record().employee_scope() && employee_service_scope(policy) {
         return Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),
@@ -726,6 +870,15 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
         // ownership and cannot substitute or add another task.
         let selector = create_task_selector(context)?;
         if !resources.iter().filter(|resource| ResourceKind::of(resource) == ResourceKind::Task).eq([&selector]) {
+            return Err(VerificationError::Invalid);
+        }
+    }
+    if OWN_SKILL_TOOLS.contains(&name) {
+        // H12a: exactly the record's own selection. The resolver vouched for
+        // live identity and the own wiki namespace; it cannot add a workspace,
+        // a recipient (another employee) or a second namespace.
+        let selection = own_skill_selector(context, name)?;
+        if resources.len() != selection.len() || !selection.iter().all(|grant| resources.contains(grant)) {
             return Err(VerificationError::Invalid);
         }
     }

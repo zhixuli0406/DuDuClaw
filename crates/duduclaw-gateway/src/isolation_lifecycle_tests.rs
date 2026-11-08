@@ -680,3 +680,7 @@ fn offboarding_personal_owner_refuses_transfer_with_message() {
 /// F3 readiness reasons reuse this module's real-store fixture.
 #[path = "isolation_readiness/reasons_tests.rs"]
 mod readiness_reasons;
+
+/// F6a/F6b: incarnation, schema and the sealing tombstone.
+#[path = "isolation_lifecycle_f6_tests.rs"]
+mod f6;

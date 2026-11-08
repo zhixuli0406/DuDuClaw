@@ -557,7 +557,12 @@ impl GatewayHandler<'_> {
         "skill_hub_install" => {
             handle_skill_hub_install(&arguments, home_dir, default_agent, caller_is_admin).await
         }
-        "skill_curator_status" => handle_skill_curator_status(&arguments, home_dir).await,
+        // H12a / D-H4: in isolation the curator acts only on the
+        // capability-bound employee's own skills (never an argument).
+        "skill_curator_status" => match crate::mcp_isolation::current() {
+            Some(current) => handle_skill_curator_status_owned(&arguments, home_dir, &current.agent).await,
+            None => handle_skill_curator_status(&arguments, home_dir).await,
+        },
         "skill_pin" => handle_skill_pin(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir, record_actor).await,
@@ -827,6 +832,11 @@ impl GatewayHandler<'_> {
         "file_read" | "csv_read" | "xlsx_read" => {
             let files_agent = acting_agent_id(caller_client_id, default_agent);
             match tool_name {
+                // H11: protected file_read opens on the blocking pool (root's
+                // work broker for `employee-work`); legacy reader unchanged.
+                "file_read" if crate::mcp_isolation::current().is_some() => {
+                    crate::mcp_files::handle_isolated_file_read(&arguments, home_dir, files_agent).await
+                }
                 "file_read" => {
                     crate::mcp_files::handle_file_read(&arguments, home_dir, files_agent)
                 }

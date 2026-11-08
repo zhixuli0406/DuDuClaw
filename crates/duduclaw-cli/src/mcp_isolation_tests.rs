@@ -6,6 +6,9 @@ use duduclaw_mcp_boundary::server::Dispatcher;
 #[path = "mcp_file_isolation_tests.rs"]
 mod file_tests;
 
+#[path = "mcp_files_h11_tests.rs"]
+mod h11_file_tests;
+
 #[path = "mcp_isolation_parity_tests.rs"]
 mod parity_tests;
 
@@ -508,17 +511,27 @@ async fn isolated_records_use_employee_authority_not_run_record_grants() {
 }
 
 #[test]
-fn i1c_worker_skill_schema_keeps_the_subject_checked_by_the_producer() {
-    for name in ["skill_security_scan", "skill_graduate", "skill_extract"] {
+fn h12a_worker_skill_schema_offers_no_subject_selector() {
+    for name in ["skill_security_scan", "skill_graduate", "skill_extract", "shared_skill_adopt"] {
         let mut tool = json!({"name":name,"inputSchema":{"properties":{
-            "agent_id":{"type":"string"},"skill_name":{"type":"string"}},
+            "agent_id":{"type":"string"},"target_agent":{"type":"string"},"skill_name":{"type":"string"}},
             "required":["agent_id","skill_name"]}});
         project_tool_schema(&mut tool);
-        assert_eq!(tool["inputSchema"]["required"], json!(["agent_id","skill_name"]));
-        assert!(tool["inputSchema"]["properties"].get("agent_id").is_some());
-        assert!(tool["inputSchema"]["properties"].get("target_employee").is_none());
+        assert_eq!(tool["inputSchema"]["required"], json!(["skill_name"]), "{name}");
+        for key in ["agent_id", "target_agent", "target_employee"] {
+            assert!(tool["inputSchema"]["properties"].get(key).is_none(), "{name} {key}");
+        }
+        assert!(check_tool_arguments(name, &json!({"skill_name":"demo"})).is_ok(), "{name}");
+        for args in [json!({"skill_name":"demo","target_agent":"bob"}), json!({"skill_name":"demo","employee_id":"x"}),
+            json!({"skill_name":"../demo"}), json!({"skill_name":"demo","path":"SKILLS/demo.md"})] {
+            assert!(check_tool_arguments(name, &args).is_err(), "{name} {args}");
+        }
+    }
+    // The legacy self-reference stays accepted (the producer requires equality).
+    for name in ["skill_security_scan", "skill_graduate", "skill_extract"] {
         assert!(check_tool_arguments(name, &json!({"agent_id":"main","skill_name":"demo"})).is_ok());
     }
+    assert!(check_tool_arguments("shared_skill_adopt", &json!({"agent_id":"main","skill_name":"demo"})).is_err());
 }
 
 #[test]

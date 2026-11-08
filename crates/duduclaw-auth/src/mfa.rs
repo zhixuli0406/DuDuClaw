@@ -741,7 +741,9 @@ impl UserDb {
             tx.commit().map_err(|e| e.to_string())?;
             return Err(DENIED.into());
         }
+        let since = crate::admin_eligibility::high_water(&tx)?;
         clear(&tx, user)?;
+        crate::admin_eligibility::stamp_actor(&tx, since, actor)?;
         audit(&tx, user, "mfa.reset", Some(actor))?;
         tx.commit().map_err(|e| e.to_string())
     }

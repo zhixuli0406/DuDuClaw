@@ -25,7 +25,8 @@
 //!
 //! This module also owns the users.db Personal mirror writes made by the
 //! employee apply path ([`record_personal_mirror`], [`remove_personal_mirror`])
-//! and the admin handover path ([`tombstone_personal_employee`]). Everything
+//! and the admin tombstone path ([`tombstone_employee`], F6a: Personal and
+//! Shared, sealed quarantine keyed by `(employee, incarnation)`). Everything
 //! here is blocking SQLite/IPC and must run on the blocking pool.
 use std::path::Path;
 
@@ -83,6 +84,12 @@ pub(crate) struct EmployeeLifecycle {
     pub(crate) uid: u32,
     /// Principal from the root receipt (legacy receipts: Shared(pinned tenant)).
     pub(crate) binding: EmployeeBinding,
+    /// F6 §3.1 (H1): `confirmed_employees.incarnation`, read in the same row
+    /// read as the receipt (0 before the column exists, as the F6m token
+    /// reader does). Only a same-id restore changes it (+1); every persisted
+    /// authority binds `(employee, incarnation)` and [`recheck_with`]
+    /// refuses a holder of another incarnation.
+    pub(crate) incarnation: u32,
 }
 
 impl EmployeeLifecycle {
@@ -138,6 +145,9 @@ pub(crate) fn recheck_with(home: &Path, expected: &EmployeeLifecycle, root: &dyn
     -> Result<EmployeeLifecycle, LifecycleError> {
     let current = read_lifecycle_with(home, &expected.label, root)?;
     if current.employee != expected.employee { return Err(LifecycleError::Tombstoned); }
+    // A1: the same employee id after a restore is another incarnation; a
+    // holder of the prior one is out of date (never silently upgraded).
+    if current.incarnation != expected.incarnation { return Err(LifecycleError::Stale); }
     if current != *expected { return Err(LifecycleError::Stale); }
     Ok(current)
 }
@@ -148,7 +158,7 @@ pub(crate) fn resolve(home: &Path, label: &str, root: &dyn RootAllocation)
     -> Result<(Receipt, EmployeeLifecycle), LifecycleError> {
     use LifecycleError::*;
     if !valid_label(label) { return Err(Denied); }
-    let (prior, pinned) = confirmed_row(home, label)?.ok_or(Denied)?;
+    let (prior, pinned, incarnation) = confirmed_row(home, label)?.ok_or(Denied)?;
     if prior.label != label { return Err(Denied); }
     if prior.disabled { return Err(Tombstoned); }
     // Legacy rows confirmed before the tenant pin existed never acquire one.
@@ -171,7 +181,7 @@ pub(crate) fn resolve(home: &Path, label: &str, root: &dyn RootAllocation)
     check_users(home, label, &pinned, &binding)?;
     let lifecycle = EmployeeLifecycle {
         employee: current.employee, label: current.label.clone(), allocation: current.binding,
-        uid: current.uid, binding,
+        uid: current.uid, binding, incarnation,
     };
     Ok((current, lifecycle))
 }
@@ -194,7 +204,7 @@ pub(crate) fn validate_proposed_binding(home: &Path, label: &str, binding: Optio
     // Tenant, mirror, owner row and other bindings: one read snapshot.
     let users = connection.transaction().map_err(|_| Unavailable)?;
     let snapshot = duduclaw_auth::read_isolation_authority_in(&users, None, label).map_err(|_| Unavailable)?;
-    if let Some((prior, pin)) = &existing {
+    if let Some((prior, pin, _)) = &existing {
         // A tombstoned row never constrains a recreate; a live one keeps its pin.
         if !prior.disabled && pin.as_deref() != Some(snapshot.tenant_id.as_str()) { return Err(Denied); }
     }
@@ -277,62 +287,342 @@ pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> R
     Ok(removed)
 }
 
-/// Admin handover of a Personal employee (e.g. before offboarding its
-/// owner with a transfer). The caller must already have verified a live
-/// Admin with step-up; this function performs no authorization.
+/// F6a §3.2 step 5 (Shared): remove every member binding of the agent and
+/// bump the ACL generation, in one users.db transaction. A Personal mirror
+/// for the label refuses (`Stale`, left untouched).
+pub(crate) fn remove_shared_bindings(home: &Path, label: &str) -> Result<usize, LifecycleError> {
+    let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
+    let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
+    let removed = duduclaw_auth::db::remove_shared_bindings_in_transaction(&tx, label).map_err(mirror_error)?;
+    tx.commit().map_err(|_| LifecycleError::Unavailable)?;
+    Ok(removed)
+}
+
+/// Personal or Shared, as recorded in the quarantine row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmployeeKind { Personal, Shared }
+
+/// What a tombstone call did (the RPC returns it; Q6: the seal state is
+/// reported, a failed seal never blocks the tombstone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TombstoneOutcome {
+    pub(crate) employee: EmployeeId,
+    pub(crate) incarnation: u32,
+    pub(crate) kind: EmployeeKind,
+    /// The quarantine row's state after this call (`sealed`, `oversize`,
+    /// `invalid`, `absent`, or `pending` when the seal could not be written).
+    pub(crate) seal: String,
+    pub(crate) digest_prefix: Option<String>,
+    /// Catalog routes whose C6 detail row named this employee, revoked now.
+    pub(crate) routes_revoked: Vec<String>,
+    /// Fences that still need a retry (H2); empty = fully fenced.
+    pub(crate) pending_fences: Vec<String>,
+    /// Run ids confirmed stopped (S13); `None` when the stop is unconfirmed
+    /// (then [`crate::isolation_quarantine::RUN_STOP_FENCE`] is pending).
+    pub(crate) runs_stopped: Option<Vec<String>>,
+}
+
+/// Collaborators of one tombstone call.
+pub(crate) struct TombstoneEnv<'a> {
+    /// The verified Admin (audit attribution only; the caller authorized).
+    pub(crate) actor: &'a str,
+    /// Stops the employee's live runs (production: [`crate::isolation_quarantine::SpawndRunStopper`]).
+    pub(crate) runs: &'a dyn crate::isolation_quarantine::RunStopper,
+    /// Unix seconds.
+    pub(crate) now: i64,
+}
+
+/// Tombstone one Personal or Shared protected employee (F6 design r5
+/// §3.2, task F6a). The caller must already have verified a live Admin with
+/// step-up; this function performs no authorization.
 ///
-/// 1. In one apply.db transaction (writer lock held throughout), the
-///    employee's `agents/<label>` directory is first moved into
-///    [`QUARANTINE_DIR`]`/<employee id>-<label>` (0700) by an atomic
-///    same-filesystem rename (SR2 finding 4); a failed move refuses the
-///    whole tombstone and the row stays live. Then the confirmed row of
-///    exactly `employee` is marked disabled and the proposal flow's creation
-///    marker for the label is deleted. From then on every lifecycle read is
-///    `Tombstoned`, no later apply step can revive it (`checked_tenant`
-///    refuses), and a later Personal proposal for the label never adopts a
-///    directory: the former owner's data never passes to a new owner and no
-///    directory is reused across employee ids.
-/// 2. The users.db mirror and all bindings of the agent are removed.
+/// 0. Read (no lock): the confirmed row (receipt, tenant pin, incarnation),
+///    the Applied allocation item, and the principal snapshot — Personal
+///    (H3): owner `credential_epoch`, email, Google `sub`, MFA/passkey-set
+///    digest, notice address; Shared (R4): the pinned tenant and every member
+///    binding `(user_id, access_level, is_primary)`. A legacy unpinned row
+///    is refused (`Denied`), as `resolve` refuses it.
+/// 1. One apply.db `BEGIN IMMEDIATE` transaction: re-read the row (same
+///    employee id and incarnation, else `Stale`); move `agents/<label>` to
+///    `isolation-quarantine/<hex>-<incarnation>-<label>` (0700) with one
+///    `renameat2(RENAME_NOREPLACE)` between held descriptors (SR2 finding 4;
+///    a refused move refuses the whole tombstone and nothing changes); then
+///    strip `[channels.*]` and `[capabilities] db_sources` from the moved
+///    `agent.toml` through the held descriptor (H5; names recorded in
+///    `stripped`; done right after the move rather than before it so a
+///    refused move never edits a live employee); mark the row disabled;
+///    delete the creation marker; insert the `employee_quarantine` row keyed
+///    `(employee_hex, incarnation)` (`pending`, or `absent` for a missing
+///    tree, M2) and, once per employee id, the `root_allocations` row (S7).
+/// 2. Seal outside the lock (M1) through the descriptor held since the move,
+///    root `(dev, ino)` checked; a short transaction writes the result.
+/// 3. Stop live runs (S13, [`TombstoneEnv::runs`]; unconfirmed ⇒ pending
+///    fence) and revoke every catalog route whose C6 detail row names this
+///    employee (H2; failures ⇒ pending fences). Tenant routes stay.
+/// 4. users.db: Personal mirror and bindings, or every Shared binding, with
+///    an ACL bump. A failure leaves the employee unusable (row disabled) and
+///    is retried by calling again.
+/// 5. Audit `isolation.employee_tombstoned`.
 ///
-/// The two stores cannot share a transaction; the order fails closed: if
-/// step 2 fails the employee is already unusable and the lingering mirror
-/// still blocks every other binding. Retrying is idempotent (an already
-/// quarantined directory is not moved again; an already disabled row never
-/// moves a directory that appeared under the label afterwards).
+/// Retrying is idempotent: a disabled row is never moved again (a directory
+/// that appeared under the label later stays where it is), the first
+/// quarantine row and principal snapshot are kept, a still-`pending` seal is
+/// re-run through the quarantined directory, fences are recomputed.
 ///
-/// Not done here: root-side disable of an Applied allocation (UID, storage)
-/// has no allocator action yet; the root resources stay reserved.
-pub(crate) fn tombstone_personal_employee(home: &Path, label: &str, employee: EmployeeId) -> Result<(), LifecycleError> {
+/// Not done here (later tasks): approval invalidation runs in the RPC after
+/// this call (async broker); store marks and the label-keyed writer gate /
+/// global route pause (F6h); provider cache eviction beyond the registry
+/// rescan (F6c); root retire (F6l).
+pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId, env: &TombstoneEnv<'_>)
+    -> Result<TombstoneOutcome, LifecycleError> {
+    use crate::isolation_quarantine as quarantine;
     use LifecycleError::*;
     if !valid_label(label) { return Err(Denied); }
-    let owner = {
+    // 0. Reads before the lock.
+    let (prior, pinned, incarnation) = confirmed_row(home, label)?.ok_or(Denied)?;
+    if prior.label != label { return Err(Denied); }
+    if prior.employee != employee { return Err(Stale); }
+    // Legacy rows confirmed before the tenant pin existed are refused (R4).
+    let pinned = pinned.ok_or(Denied)?;
+    let binding = principal(&prior, &pinned)?;
+    let (kind, owner) = match &binding {
+        EmployeeBinding::Personal(owner) => (EmployeeKind::Personal, Some(owner.as_str().to_owned())),
+        EmployeeBinding::Shared(_) => (EmployeeKind::Shared, None),
+    };
+    let item = applied_item(home, &prior.binding)?;
+    let root_item = serde_json::json!({"item": item, "receipt": prior});
+    let snapshot = principal_snapshot(home, label, &binding, &pinned)?;
+
+    // 1. The apply.db transaction.
+    let (held, stripped, seal_state) = {
         let mut db = open_store(home, APPLY_DB, Access::ReadWrite)?;
-        db.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| Unavailable)?;
+        quarantine::ensure_employee_schema(&db).map_err(|_| Unavailable)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| Unavailable)?;
-        let encoded: String = tx.query_row("SELECT receipt FROM confirmed_employees WHERE label=?1", [label], |r| r.get(0))
+        let (encoded, stored_incarnation): (String, i64) = tx.query_row(
+            "SELECT receipt,incarnation FROM confirmed_employees WHERE label=?1", [label], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional().map_err(|_| Unavailable)?.ok_or(Denied)?;
-        let prior: Receipt = serde_json::from_str(&encoded).map_err(|_| Unavailable)?;
-        if prior.label != label { return Err(Denied); }
-        if prior.employee != employee { return Err(Stale); }
-        let Some(EmployeeBinding::Personal(owner)) = prior.principal_binding.clone() else { return Err(Denied) };
-        if !prior.disabled {
-            quarantine_agent_dir(home, label, employee)?;
-            let mut dead = prior;
+        let current: Receipt = serde_json::from_str(&encoded).map_err(|_| Unavailable)?;
+        if current.label != label { return Err(Denied); }
+        if current.employee != employee || stored_incarnation != i64::from(incarnation)
+            || current.principal_binding != prior.principal_binding {
+            return Err(Stale);
+        }
+        let existing = quarantine::read_quarantine(&tx, employee, incarnation).map_err(|_| Unavailable)?;
+        let (held, stripped, seal_state) = if !current.disabled {
+            let (held, stripped) = quarantine_agent_dir(home, label, employee, incarnation)?;
+            let mut dead = current;
             dead.disabled = true;
             let changed = tx.execute("UPDATE confirmed_employees SET receipt=?1 WHERE label=?2 AND receipt=?3",
                 params![serde_json::to_string(&dead).map_err(|_| Unavailable)?, label, encoded]).map_err(|_| Unavailable)?;
             if changed != 1 { return Err(Stale); }
-        }
+            // A moved symlink or file (not a directory) can never be sealed.
+            let state = match (&held, stripped.agent_toml) {
+                (Some(_), _) => "pending",
+                (None, "not_a_directory") => "invalid",
+                (None, _) => "absent",
+            };
+            (held, stripped, state)
+        } else {
+            // Retry: never move again. A pending seal is re-run through the
+            // quarantined directory; a disabled row without a quarantine row
+            // (compensation, dev builds) reads `invalid`.
+            let held = match &existing {
+                // The recorded root (dev, ino) is what the seal must find.
+                Some(row) if row.seal == "pending" => reopen_quarantined(home, label, employee, incarnation)?
+                    .and_then(|dir| row.root.map(|root| (dir, root))),
+                _ => None,
+            };
+            (held, quarantine::Stripped::status("unchanged"), "invalid")
+        };
         let markers: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='employee_dir_markers')",
             [], |r| r.get(0)).map_err(|_| Unavailable)?;
         if markers {
             tx.execute("DELETE FROM employee_dir_markers WHERE label=?1", [label]).map_err(|_| Unavailable)?;
         }
+        if existing.is_none() {
+            quarantine::insert_quarantine(&tx, &quarantine::NewQuarantine {
+                employee, incarnation, label, owner: owner.as_deref(), tenant: &pinned, quarantined_at: env.now,
+                root: held.as_ref().map(|(_, root)| *root), seal: seal_state,
+                principal_snapshot: &snapshot, stripped: &stripped.to_value(),
+            }).map_err(|_| Unavailable)?;
+        }
+        quarantine::insert_root_allocation(&tx, employee, &root_item).map_err(|_| Unavailable)?;
         tx.commit().map_err(|_| Unavailable)?;
-        owner
+        (held, stripped, seal_state)
     };
-    remove_personal_mirror(home, label, owner.as_str()).map(|_| ())
+    let _ = seal_state;
+
+    // 2. Seal outside the lock, through the held descriptor.
+    #[cfg(unix)]
+    {
+        if let Some((dir, root)) = &held {
+            let sealed = quarantine::seal(home, label, dir, *root);
+            if let Some(reason) = sealed.reason {
+                tracing::warn!(agent = label, reason, "tombstoned employee tree could not be sealed");
+            }
+            let mut db = open_store(home, APPLY_DB, Access::ReadWrite)?;
+            if quarantine::record_seal(&mut db, employee, incarnation, &sealed).is_err() {
+                tracing::warn!(agent = label, "tombstone seal result not recorded; the row stays pending");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    { let _ = &held; }
+
+    // 3. Stop runs and fence.
+    let mut fences = Vec::new();
+    let runs_stopped = match env.runs.stop_employee_runs(employee) {
+        Ok(ids) => Some(ids),
+        Err(()) => { fences.push(quarantine::RUN_STOP_FENCE.to_owned()); None }
+    };
+    let (routes_revoked, route_fences) = quarantine::revoke_employee_detail_routes(home, employee, env.actor);
+    fences.extend(route_fences);
+    {
+        let mut db = open_store(home, APPLY_DB, Access::ReadWrite)?;
+        for group in ["runs:", "route"] {
+            let members: Vec<String> = fences.iter().filter(|f| f.starts_with(group)).cloned().collect();
+            quarantine::replace_fence_group(&mut db, employee, incarnation, group, &members).map_err(|_| Unavailable)?;
+        }
+    }
+    let row = {
+        let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
+        quarantine::read_quarantine(&db, employee, incarnation).map_err(|_| Unavailable)?.ok_or(Unavailable)?
+    };
+
+    // 4. users.db.
+    let users = match &owner {
+        Some(owner) => remove_personal_mirror(home, label, owner).map(|_| ()),
+        None => remove_shared_bindings(home, label).map(|_| ()),
+    };
+
+    // 5. Audit (also when the users.db step must be retried).
+    let outcome = TombstoneOutcome {
+        employee, incarnation, kind, seal: row.seal.clone(),
+        digest_prefix: row.digest.as_ref().map(|digest| digest.chars().take(16).collect()),
+        routes_revoked, pending_fences: row.pending_fences.clone(), runs_stopped,
+    };
+    let details = serde_json::json!({
+        "actor_user_id": env.actor, "kind": match kind { EmployeeKind::Personal => "personal", EmployeeKind::Shared => "shared" },
+        "label": label, "employee": hex::encode(employee.0), "incarnation": incarnation,
+        "seal": outcome.seal, "digest_prefix": outcome.digest_prefix, "routes_revoked": outcome.routes_revoked,
+        "pending_fences": outcome.pending_fences, "runs_stopped": outcome.runs_stopped,
+        "stripped": stripped.to_value(), "users_removed": users.is_ok(),
+    });
+    let severity = if users.is_ok() && outcome.pending_fences.is_empty() {
+        duduclaw_security::audit::Severity::Info
+    } else {
+        duduclaw_security::audit::Severity::Warning
+    };
+    crate::security_autopilot::audit_and_emit(home, &duduclaw_security::audit::AuditEvent::new(
+        "isolation.employee_tombstoned", label, severity, details));
+    users?;
+    Ok(outcome)
+}
+
+/// The stored receipt of the confirmed row holding `label` (live or
+/// disabled), without any other check. Never authority: callers use it only
+/// to choose which refusal to report before the real lifecycle call.
+pub(crate) fn confirmed_receipt(home: &Path, label: &str) -> Result<Option<Receipt>, LifecycleError> {
+    if !valid_label(label) { return Ok(None); }
+    Ok(confirmed_row(home, label)?.map(|(receipt, _, _)| receipt))
+}
+
+/// Replace one fence group (`approvals:` …) of the quarantine row of the
+/// employee currently recorded for `label` (its incarnation is read from
+/// the row). Refuses (`Stale`) when the label now holds another employee.
+pub(crate) fn record_fence_group(home: &Path, label: &str, employee: EmployeeId, group: &str, fences: &[String])
+    -> Result<(), LifecycleError> {
+    let (receipt, _, incarnation) = confirmed_row(home, label)?.ok_or(LifecycleError::Denied)?;
+    if receipt.employee != employee { return Err(LifecycleError::Stale); }
+    let mut db = open_store(home, APPLY_DB, Access::ReadWrite)?;
+    crate::isolation_quarantine::replace_fence_group(&mut db, employee, incarnation, group, fences)
+        .map_err(|_| LifecycleError::Unavailable)
+}
+
+/// The Personal (H3) or Shared (R4) principal snapshot of §3.2 step 3, from
+/// one users.db read transaction. Never holds a credential value: the
+/// MFA/passkey set is a digest, the Google link is the `sub` only.
+fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinned: &str)
+    -> Result<serde_json::Value, LifecycleError> {
+    use LifecycleError::Unavailable;
+    use sha2::{Digest, Sha256};
+    let mut users = open_store(home, USERS_DB, Access::ReadOnly)?;
+    let tx = users.transaction().map_err(|_| Unavailable)?;
+    let strings = |sql: &str, key: &str| -> Result<Vec<String>, LifecycleError> {
+        let mut statement = tx.prepare(sql).map_err(|_| Unavailable)?;
+        let rows = statement.query_map([key], |r| r.get::<_, String>(0)).map_err(|_| Unavailable)?
+            .collect::<Result<Vec<_>, _>>().map_err(|_| Unavailable)?;
+        Ok(rows)
+    };
+    let value = match binding {
+        EmployeeBinding::Personal(owner) => {
+            let owner = owner.as_str();
+            let account: Option<(i64, String)> = tx.query_row(
+                "SELECT credential_epoch,email FROM users WHERE id=?1", [owner], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional().map_err(|_| Unavailable)?;
+            let mut factors = Sha256::new();
+            factors.update(b"duduclaw-owner-factors-v1\0");
+            for (tag, sql) in [
+                ("totp", "SELECT 'enrolled' FROM mfa_credentials WHERE user_id=?1"),
+                ("email", "SELECT email FROM mfa_email_credentials WHERE user_id=?1 ORDER BY email"),
+                ("passkey", "SELECT id FROM mfa_passkeys WHERE user_id=?1 ORDER BY id"),
+            ] {
+                for value in strings(sql, owner)? {
+                    factors.update((tag.len() as u64).to_be_bytes());
+                    factors.update(tag.as_bytes());
+                    factors.update((value.len() as u64).to_be_bytes());
+                    factors.update(value.as_bytes());
+                }
+            }
+            let google = match crate::person_credentials::get(home, owner) {
+                Ok(Some(record)) => serde_json::json!(record.metadata.google_sub),
+                Ok(None) => serde_json::Value::Null,
+                Err(_) => serde_json::json!("unreadable"),
+            };
+            serde_json::json!({
+                "kind": "personal", "owner_user_id": owner,
+                "credential_epoch": account.as_ref().map(|(epoch, _)| *epoch),
+                "email": account.as_ref().map(|(_, email)| email.clone()),
+                "google_sub": google,
+                "factors_digest": hex::encode(factors.finalize()),
+                "notice_address": account.as_ref().map(|(_, email)| email.clone()),
+            })
+        }
+        EmployeeBinding::Shared(_) => {
+            let mut statement = tx.prepare(
+                "SELECT user_id,access_level,is_primary FROM user_agent_bindings WHERE agent_name=?1 ORDER BY user_id")
+                .map_err(|_| Unavailable)?;
+            let members = statement.query_map([label], |r| Ok(serde_json::json!({
+                "user_id": r.get::<_, String>(0)?, "access_level": r.get::<_, String>(1)?,
+                "is_primary": r.get::<_, i64>(2)? == 1,
+            }))).map_err(|_| Unavailable)?.collect::<Result<Vec<_>, _>>().map_err(|_| Unavailable)?;
+            serde_json::json!({"kind": "shared", "tenant_id": pinned, "members": members})
+        }
+    };
+    tx.finish().map_err(|_| Unavailable)?;
+    Ok(value)
+}
+
+/// Test-only stopper: the employee has no live run.
+#[cfg(test)]
+pub(crate) struct NoLiveRuns;
+#[cfg(test)]
+impl crate::isolation_quarantine::RunStopper for NoLiveRuns {
+    fn stop_employee_runs(&self, _: EmployeeId) -> Result<Vec<String>, ()> { Ok(Vec::new()) }
+}
+
+/// The pre-F6 Personal-only entry point, kept for the existing tests: a
+/// Shared row is refused (`Denied`) exactly as before F6a.
+#[cfg(test)]
+pub(crate) fn tombstone_personal_employee(home: &Path, label: &str, employee: EmployeeId) -> Result<(), LifecycleError> {
+    if !valid_label(label) { return Err(LifecycleError::Denied); }
+    let (prior, _, _) = confirmed_row(home, label)?.ok_or(LifecycleError::Denied)?;
+    if prior.employee == employee && !matches!(prior.principal_binding, Some(EmployeeBinding::Personal(_))) {
+        return Err(LifecycleError::Denied);
+    }
+    tombstone_employee(home, label, employee, &TombstoneEnv { actor: "test-admin", runs: &NoLiveRuns, now: 1_000 })
+        .map(|_| ())
 }
 
 /// One confirmed protected employee as listed for readiness (F3): the label
@@ -393,16 +683,35 @@ pub(crate) fn personal_snapshot(home: &Path, label: &str, owner: &str)
 /// directly in the DuDuClaw home (same filesystem as `agents/`).
 pub(crate) const QUARANTINE_DIR: &str = "isolation-quarantine";
 
-/// Where the tombstone of `employee` puts its `agents/<label>` directory.
+/// Where the tombstone of incarnation `incarnation` of `employee` puts its
+/// `agents/<label>` directory (M4: one path per quarantine row).
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn quarantine_path(home: &Path, label: &str, employee: EmployeeId) -> std::path::PathBuf {
-    home.join(QUARANTINE_DIR).join(quarantine_name(label, employee))
+pub(crate) fn quarantine_path(home: &Path, label: &str, employee: EmployeeId, incarnation: u32) -> std::path::PathBuf {
+    home.join(QUARANTINE_DIR).join(crate::isolation_quarantine::quarantine_name(label, employee, incarnation))
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
-fn quarantine_name(label: &str, employee: EmployeeId) -> String {
-    format!("{}-{label}", hex::encode(employee.0))
+/// A quarantined directory, by descriptor (retry of a pending seal). The
+/// quarantine root must be private as at the move; `Ok(None)` when absent.
+fn reopen_quarantined(home: &Path, label: &str, employee: EmployeeId, incarnation: u32)
+    -> Result<Option<crate::fs_safe::SafeDir>, LifecycleError> {
+    use LifecycleError::Unavailable;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use crate::fs_safe::SafeDir;
+        let home_dir = SafeDir::open_nofollow(home, false).map_err(|_| Unavailable)?;
+        let Some(root) = home_dir.child_dir(QUARANTINE_DIR, false).map_err(|_| Unavailable)? else { return Ok(None) };
+        let metadata = root.metadata().map_err(|_| Unavailable)?;
+        if metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o077 != 0 { return Err(Unavailable); }
+        root.child_dir(&crate::isolation_quarantine::quarantine_name(label, employee, incarnation), false)
+            .map_err(|_| Unavailable)
+    }
+    #[cfg(not(unix))]
+    { let _ = (home, label, employee, incarnation); Err(Unavailable) }
 }
+
+/// The moved tree held by descriptor, with its `(dev, ino)`.
+type Held = (crate::fs_safe::SafeDir, (u64, u64));
 
 /// SR2 finding 4 (round 3, N5: descriptor-relative, no check-then-rename):
 /// move `agents/<label>` (whatever it is; the rename never follows a
@@ -415,34 +724,53 @@ fn quarantine_name(label: &str, employee: EmployeeId) -> String {
 /// group/other access (checked on its descriptor); an existing target is
 /// refused by the kernel, never overwritten (not even an empty directory);
 /// a cross-filesystem or any other failure is `Unavailable` (fail closed).
-fn quarantine_agent_dir(home: &Path, label: &str, employee: EmployeeId) -> Result<(), LifecycleError> {
+///
+/// F6a: the target is keyed by `(employee, incarnation)`; after the move the
+/// moved directory is opened by descriptor (held for the seal, its
+/// `(dev, ino)` recorded) and its `agent.toml` stripped through that
+/// descriptor. `Ok((None, …))` when nothing was moved (absent tree) or the
+/// moved entry is not a directory (it seals `absent`/`invalid` respectively
+/// through the caller). A strip failure never undoes the move: it is
+/// recorded (`unreadable`) and the tombstone continues.
+fn quarantine_agent_dir(home: &Path, label: &str, employee: EmployeeId, incarnation: u32)
+    -> Result<(Option<Held>, crate::isolation_quarantine::Stripped), LifecycleError> {
     use LifecycleError::Unavailable;
+    use crate::isolation_quarantine::Stripped;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         use crate::fs_safe::{EntryKind, SafeDir};
         let home_dir = SafeDir::open_nofollow(home, false).map_err(|_| Unavailable)?;
-        let Some(agents) = home_dir.child_dir("agents", false).map_err(|_| Unavailable)? else { return Ok(()) };
-        if agents.entry(label).map_err(|_| Unavailable)?.is_none() { return Ok(()); }
+        let Some(agents) = home_dir.child_dir("agents", false).map_err(|_| Unavailable)? else {
+            return Ok((None, Stripped::status("absent")));
+        };
+        if agents.entry(label).map_err(|_| Unavailable)?.is_none() { return Ok((None, Stripped::status("absent"))); }
         let root = home_dir.child_dir(QUARANTINE_DIR, true).map_err(|_| Unavailable)?.ok_or(Unavailable)?;
         let metadata = root.metadata().map_err(|_| Unavailable)?;
         if !metadata.is_dir() || metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
             return Err(Unavailable);
         }
-        let target = quarantine_name(label, employee);
+        let target = crate::isolation_quarantine::quarantine_name(label, employee, incarnation);
         // The kernel refuses an existing target atomically; there is no
         // separate existence check to race.
         agents.rename_noreplace(label, &root, &target).map_err(|_| Unavailable)?;
+        tracing::info!(agent = label, incarnation, "tombstoned employee directory moved to quarantine");
         // The moved entry itself, by descriptor: never chmod through a symlink.
-        if root.entry(&target).map_err(|_| Unavailable)?.is_some_and(|entry| entry.kind == EntryKind::Dir) {
-            root.child_dir(&target, false).map_err(|_| Unavailable)?.ok_or(Unavailable)?
-                .set_mode(0o700).map_err(|_| Unavailable)?;
+        if !root.entry(&target).map_err(|_| Unavailable)?.is_some_and(|entry| entry.kind == EntryKind::Dir) {
+            // A symlink or file was moved as-is; nothing to strip or seal.
+            return Ok((None, Stripped::status("not_a_directory")));
         }
-        tracing::info!(agent = label, "tombstoned personal employee directory moved to quarantine");
-        Ok(())
+        let moved = root.child_dir(&target, false).map_err(|_| Unavailable)?.ok_or(Unavailable)?;
+        moved.set_mode(0o700).map_err(|_| Unavailable)?;
+        let moved_meta = moved.metadata().map_err(|_| Unavailable)?;
+        let stripped = crate::isolation_quarantine::strip_agent_dir(&root, &target).unwrap_or_else(|error| {
+            tracing::warn!(agent = label, error = %error, "tombstone: agent.toml could not be stripped");
+            Stripped::status("unreadable")
+        });
+        Ok((Some((moved, (moved_meta.dev(), moved_meta.ino()))), stripped))
     }
     #[cfg(not(unix))]
-    { let _ = (home, label, employee); Err(Unavailable) }
+    { let _ = (home, label, employee, incarnation); Err(Unavailable) }
 }
 
 fn valid_label(label: &str) -> bool {
@@ -462,21 +790,30 @@ fn principal(prior: &Receipt, pinned: &str) -> Result<EmployeeBinding, Lifecycle
 
 /// `None` when nothing was ever confirmed for the label (including before
 /// the table exists); a corrupt row or unreadable store is `Unavailable`.
-fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<String>)>, LifecycleError> {
+/// The incarnation comes from the same row read (0 before F6a added the
+/// column); a NULL, negative or out-of-range value, or an employee schema
+/// newer than this build, is `Unavailable`.
+fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<String>, u32)>, LifecycleError> {
     let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
     let table: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
         [], |r| r.get(0)).map_err(|_| LifecycleError::Unavailable)?;
     if !table { return Ok(None); }
-    let row: Option<(String, Option<String>)> = db.query_row(
-        "SELECT receipt,tenant_id FROM confirmed_employees WHERE label=?1", [label], |r| Ok((r.get(0)?, r.get(1)?)))
+    crate::isolation_quarantine::check_readable(&db).map_err(|_| LifecycleError::Unavailable)?;
+    let sql = if crate::isolation_quarantine::has_incarnation(&db).map_err(|_| LifecycleError::Unavailable)? {
+        "SELECT receipt,tenant_id,incarnation FROM confirmed_employees WHERE label=?1"
+    } else {
+        "SELECT receipt,tenant_id,0 FROM confirmed_employees WHERE label=?1"
+    };
+    let row: Option<(String, Option<String>, i64)> = db.query_row(sql, [label], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional().map_err(|_| LifecycleError::Unavailable)?;
-    let Some((encoded, tenant)) = row else { return Ok(None) };
+    let Some((encoded, tenant, incarnation)) = row else { return Ok(None) };
+    let incarnation = u32::try_from(incarnation).map_err(|_| LifecycleError::Unavailable)?;
     let receipt: Receipt = serde_json::from_str(&encoded).map_err(|_| LifecycleError::Unavailable)?;
     if let Some(binding) = &receipt.principal_binding {
         allocation::validate_principal_binding(binding).map_err(|_| LifecycleError::Unavailable)?;
     }
-    Ok(Some((receipt, tenant)))
+    Ok(Some((receipt, tenant, incarnation)))
 }
 
 fn applied_item(home: &Path, binding: &ProposalBinding) -> Result<ConfirmationItem, LifecycleError> {

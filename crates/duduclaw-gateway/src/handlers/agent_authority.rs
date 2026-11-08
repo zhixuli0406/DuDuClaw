@@ -115,6 +115,9 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("budget.hard_stop", &["form.hard_stop"], Loosen),
     // Whose Google account the employee acts as (a colleague's mailbox).
     key("google", &["form.google."], GoogleNarrow),
+    // Protected mode: whether the issuer grants the public-web tools (owner
+    // decision 2026-11-08, separate from `container.network_access`).
+    key("isolation.public_web", &[], Change),
 ];
 
 /// The effective value of an authority key: an absent key reads as the value
@@ -135,6 +138,7 @@ fn effective(table: &toml::Table, key: &str) -> Value {
         | "guardrails.enabled"
         | "channels.public_trigger"
         | "prompt.cli_bare_mode"
+        | "isolation.public_web"
         | "budget.hard_stop" => or(Value::Bool(false)),
         // v1.81 (S2): what the MCP gate enforces — an absent (or
         // wrong-typed) key resolves by role, `true` only for `main`. Reading
@@ -290,13 +294,14 @@ mod tests {
             ("[os_watch]\npaths=['/']\n", "os_watch"),
             ("[model]\naccount_pool=['acct']\n", "model.account_pool"),
             ("[permissions]\nallowed_channels=['line']\n", "permissions.allowed_channels"),
+            ("[isolation]\npublic_web=true\n", "isolation.public_web"),
         ] {
             let after = t(&format!("[agent]\nname='a'\nrole='specialist'\n[budget]\nmonthly_limit_cents=1000\nhard_stop=true\n{frag}"));
             let diff = authority_diff(&before, &after);
             assert!(diff.iter().any(|c| c.key == k), "{k}: {diff:?}");
         }
         // Explicit defaults over absent keys are not changes.
-        let same = t("[agent]\nname='a'\nrole='specialist'\n[budget]\nmonthly_limit_cents=1000\nhard_stop=true\n[runtime]\nprovider='claude'\n[prompt]\ncli_bare_mode=false\n[model]\naccount_pool=[]\n[os_watch]\n");
+        let same = t("[agent]\nname='a'\nrole='specialist'\n[budget]\nmonthly_limit_cents=1000\nhard_stop=true\n[runtime]\nprovider='claude'\n[prompt]\ncli_bare_mode=false\n[model]\naccount_pool=[]\n[os_watch]\n[isolation]\npublic_web=false\n");
         assert!(authority_diff(&before, &same).is_empty(), "{:?}", authority_diff(&before, &same));
     }
 

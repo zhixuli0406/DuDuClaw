@@ -233,12 +233,13 @@ fn selected_call(workspace: &str, path: &str) -> crate::tool_policy::AuthorizedT
         }
     }
     let mut record = context().record().clone();
-    record.tools = List::new(vec![Text::new("skill_security_scan".into()).unwrap()]).unwrap();
+    // A generic workspace-selecting Worker route (H12a skill tools no longer select workspaces).
+    record.tools = List::new(vec![Text::new("model_load".into()).unwrap()]).unwrap();
     record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
         ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
         ResourceGrant::Workspace { handle: Text::new("other".into()).unwrap() }]).unwrap();
     record.expires_at = u64::MAX;
-    crate::tool_policy::authorize(&RequestContext::with_live_verifier(record, std::sync::Arc::new(TestLive)), "skill_security_scan",
+    crate::tool_policy::authorize(&RequestContext::with_live_verifier(record, std::sync::Arc::new(TestLive)), "model_load",
         &serde_json::json!({"path":path}), &Selected(workspace.into())).unwrap()
 }
 
@@ -303,7 +304,7 @@ fn overbroad_resolver_cannot_replace_explicit_or_ambiguous_workspace_selection()
     }
     for key in ["workspace", "workspace_id"] {
         let arguments = serde_json::json!({(key):"work", "path":"input.txt"});
-        let call = crate::tool_policy::authorize(baseline.context(), "skill_security_scan",
+        let call = crate::tool_policy::authorize(baseline.context(), "model_load",
             &arguments, &Overbroad).unwrap();
         assert!(roots.authorize_workspace(&call, "work").is_ok());
         // Both are capability grants and resolver results; the arguments pick work.
@@ -311,7 +312,7 @@ fn overbroad_resolver_cannot_replace_explicit_or_ambiguous_workspace_selection()
     }
     for arguments in [serde_json::json!({"path":"input.txt"}),
         serde_json::json!({"workspace":"work", "workspace_id":"other", "path":"input.txt"})] {
-        let call = crate::tool_policy::authorize(baseline.context(), "skill_security_scan",
+        let call = crate::tool_policy::authorize(baseline.context(), "model_load",
             &arguments, &Overbroad).unwrap();
         assert!(roots.authorize_workspace(&call, "work").is_err());
         assert!(roots.authorize_workspace(&call, "other").is_err());

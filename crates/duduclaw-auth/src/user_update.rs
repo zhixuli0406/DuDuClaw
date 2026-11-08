@@ -130,13 +130,22 @@ impl UserDb {
     /// while direct reports exist ([`OrgError::HasReports`]), and every
     /// [`Self::set_manager`] refusal for the manager field.
     pub fn apply_user_update(&self, user_id: &str, update: &UserUpdate<'_>) -> Result<(), UserWriteError> {
+        self.apply_user_update_as(None, user_id, update)
+    }
+
+    /// [`Self::apply_user_update`] attributed to the acting Admin in the
+    /// admin eligibility log, in the same transaction (F6 S1/S2: a role
+    /// change records who promoted or demoted the account).
+    pub fn apply_user_update_as(&self, actor: Option<&str>, user_id: &str, update: &UserUpdate<'_>) -> Result<(), UserWriteError> {
         // Hash before taking the write lock: argon2 is slow on purpose.
         let password_hash = update.password.map(hash_password).transpose().map_err(UserWriteError::Other)?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(other)?;
+        let since = crate::admin_eligibility::high_water(&tx).map_err(other)?;
         apply_update(&tx, user_id, update, password_hash.as_deref())?;
+        if let Some(actor) = actor { crate::admin_eligibility::stamp_actor(&tx, since, actor).map_err(other)?; }
         tx.commit().map_err(other)
     }
 
@@ -144,17 +153,24 @@ impl UserDb {
     /// transaction: a manager that fails the [`Self::set_manager`] checks
     /// means no account is created at all.
     pub fn create_user_with(&self, new: &NewUser<'_>) -> Result<User, UserWriteError> {
-        self.create_user_with_credentials(new, false)
+        self.create_user_with_credentials(None, new, false)
     }
 
     /// Create an invitation-only account. An empty stored hash is not a valid
     /// Argon2 hash, so no password (including an empty one) can authenticate.
     /// The supplied `NewUser.password` is deliberately ignored.
     pub fn create_invited_user_with(&self, new: &NewUser<'_>) -> Result<User, UserWriteError> {
-        self.create_user_with_credentials(new, true)
+        self.create_user_with_credentials(None, new, true)
     }
 
-    fn create_user_with_credentials(&self, new: &NewUser<'_>, invite: bool) -> Result<User, UserWriteError> {
+    /// [`Self::create_user_with`] / [`Self::create_invited_user_with`]
+    /// attributed to the acting Admin in the admin eligibility log (an Admin
+    /// creation records its creator, F6 S2).
+    pub fn create_user_as(&self, actor: Option<&str>, new: &NewUser<'_>, invite: bool) -> Result<User, UserWriteError> {
+        self.create_user_with_credentials(actor, new, invite)
+    }
+
+    fn create_user_with_credentials(&self, actor: Option<&str>, new: &NewUser<'_>, invite: bool) -> Result<User, UserWriteError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let password_hash = if invite {
@@ -167,6 +183,7 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(other)?;
+        let since = crate::admin_eligibility::high_water(&tx).map_err(other)?;
         tx.execute(
             "INSERT INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at, department, must_change_password)
              VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7, ?8)",
@@ -178,6 +195,7 @@ impl UserDb {
             write_manager(&tx, &id, Some(m))?;
             bump_acl_generation(&tx).map_err(other)?;
         }
+        if let Some(actor) = actor { crate::admin_eligibility::stamp_actor(&tx, since, actor).map_err(other)?; }
         // Return the row as stored (timestamps included).
         let user = load_user(&tx, &id)
             .map_err(other)?

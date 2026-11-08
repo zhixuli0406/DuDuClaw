@@ -105,6 +105,11 @@ pub(crate) struct Gate {
     /// The stable delivery fields of the delegation besides the task text
     /// (`material::delegation_resend_binding` without `payload`).
     delivery: Value,
+    /// F6b (A4): the source employee's incarnation pinned for the live run.
+    /// Bound in the card payload, compared at `admit` with the receipt's
+    /// `caller_incarnation` and by the owner's decide with the live
+    /// lifecycle: a card filed for a prior incarnation never binds.
+    pub(crate) source_incarnation: u32,
 }
 
 /// Digest of the exact task text the owner approves.
@@ -231,10 +236,16 @@ pub(crate) fn gate(source_binding: &EmployeeBinding, principal_user: &str, sourc
     delivery.as_object_mut().ok_or(VerificationError::Invalid)?.remove("payload");
     Ok(Some(Gate { owner: owner.as_str().to_owned(), source_agent: source_agent.to_owned(), source_employee,
         target_agent: target_agent.to_owned(), target_employee, task_digest: task_digest(task), task: task.to_owned(),
-        delivery }))
+        delivery, source_incarnation: 0 }))
 }
 
 impl Gate {
+    /// Pin the source incarnation (from the live run's prepared lifecycle).
+    pub(crate) fn with_source_incarnation(mut self, incarnation: u32) -> Self {
+        self.source_incarnation = incarnation;
+        self
+    }
+
     /// The exact binding of the card; compared whole on consumption. It
     /// carries the full task text: what the owner is shown is what is bound.
     pub(crate) fn payload(&self) -> Value {
@@ -242,6 +253,7 @@ impl Gate {
             "owner_user_id": self.owner,
             "source_agent": self.source_agent,
             "source_employee": hex::encode(self.source_employee.0),
+            "source_incarnation": self.source_incarnation,
             "target_agent": self.target_agent,
             "target_employee": hex::encode(self.target_employee.0),
             "task": self.task,
@@ -283,7 +295,8 @@ fn decided_by_owner(record: &ApprovalRecord, gate: &Gate, now: i64) -> bool {
 /// refuse. Nothing is queued unless this returns `Ok`.
 pub(crate) async fn admit(home: &Path, gate: &Gate, value: &RecordAuthority) -> Result<(), DelegationError> {
     if value.kind != "delegation" || value.home != home || value.agent != gate.target_agent
-        || value.employee != gate.target_employee || value.caller != Some(gate.source_employee) {
+        || value.employee != gate.target_employee || value.caller != Some(gate.source_employee)
+        || value.caller_incarnation != gate.source_incarnation {
         return Err(VerificationError::BindingMismatch.into());
     }
     // N1: a task the owner cannot be shown exactly is never filed or sent.

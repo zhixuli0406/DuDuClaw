@@ -38,7 +38,10 @@ mod tests {
         db.execute("DELETE FROM auth_meta WHERE key IN ('isolation_tenant_id','isolation_policy_epoch')", []).unwrap();
         assert!(duduclaw_core::isolation_policy::fence_change(home.path()).is_err());
         prepare_existing_authority(home.path()).unwrap();
-        duduclaw_core::org_store::upsert(home.path(), "alice", duduclaw_core::OrgEntry::new("boss", "sales")).unwrap();
+        {
+            let org = duduclaw_core::org_store::lock_org_mutations(home.path()).unwrap();
+            duduclaw_core::org_store::upsert(&org, "alice", duduclaw_core::OrgEntry::new("boss", "sales")).unwrap();
+        }
         let epoch: i64 = db.query_row("SELECT value FROM auth_meta WHERE key='isolation_policy_epoch'", [], |row| row.get(0)).unwrap();
         assert_eq!(epoch, 2);
     }

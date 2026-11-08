@@ -536,9 +536,15 @@ fn propose_retry_accepts_own_marker() {
             &|| std::fs::write(dir.join("SKILLS/notes/SKILL.md"), "# notes\n").unwrap()),
         ("skill listing", &|| std::fs::write(dir.join("SKILLS/extra.md"), "").unwrap(),
             &|| std::fs::remove_file(dir.join("SKILLS/extra.md")).unwrap()),
-        ("org entry", &|| { duduclaw_core::org_store::upsert(home, LABEL,
-            duduclaw_core::org_store::OrgEntry::new("ceo", "")).unwrap(); },
-            &|| { duduclaw_core::org_store::remove(home, LABEL).unwrap(); }),
+        ("org entry", &|| {
+            let org = duduclaw_core::org_store::lock_org_mutations(home).unwrap();
+            duduclaw_core::org_store::upsert(&org, LABEL,
+                duduclaw_core::org_store::OrgEntry::new("ceo", "")).unwrap();
+        },
+            &|| {
+                let org = duduclaw_core::org_store::lock_org_mutations(home).unwrap();
+                duduclaw_core::org_store::remove(&org, LABEL).unwrap();
+            }),
     ];
     for (what, change, revert) in changes {
         change();
@@ -631,8 +637,9 @@ fn tombstone_quarantines_directory() {
     let now = 10_000;
     tombstone(f.home(), Some(&proof(now)), &f.bob, input(), now).unwrap();
     assert!(!agents.join(LABEL).exists());
-    let quarantined = lifecycle::quarantine_path(f.home(), LABEL, receipt.employee);
-    assert_eq!(quarantined, f.home().join("isolation-quarantine").join(format!("{employee}-{LABEL}")));
+    let quarantined = lifecycle::quarantine_path(f.home(), LABEL, receipt.employee, 0);
+    // F6a (M4): keyed by (employee id, incarnation).
+    assert_eq!(quarantined, f.home().join("isolation-quarantine").join(format!("{employee}-0-{LABEL}")));
     assert_eq!(std::fs::read_to_string(quarantined.join("SOUL.md")).unwrap(), SOUL);
     #[cfg(unix)]
     {
@@ -656,7 +663,7 @@ fn tombstone_quarantines_directory() {
     let (_, receipt) = applied_personal(&f, 0xcd, LABEL, &f.alice);
     let agents = f.home().join("agents");
     write_agent_dir(&agents, LABEL);
-    let blocked = lifecycle::quarantine_path(f.home(), LABEL, receipt.employee);
+    let blocked = lifecycle::quarantine_path(f.home(), LABEL, receipt.employee, 0);
     std::fs::create_dir_all(&blocked).unwrap();
     #[cfg(unix)]
     {
@@ -737,6 +744,40 @@ async fn personal_delegation_shown_text_equals_bound_text() {
     let decision = delegation::parse_decision(json!({"id": card.id.as_str(), "approve": true})).unwrap();
     assert!(delegation::decide(home, &f.alice, decision).await.is_err());
     assert_eq!(broker.get(&card.id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+}
+
+/// F6a (A8) and S13: after the tombstone, every open card naming the
+/// employee (its delegation cards, from or to it) is invalidated, others
+/// stay; the RPC reports the seal state and the pending run-stop fence of
+/// the fail-closed production stopper.
+#[tokio::test]
+async fn tombstone_invalidates_employee_approvals() {
+    use crate::approval::{ApprovalBroker, ApprovalStatus};
+    use crate::isolation_background::{personal_delegation_test_support as support, PERSONAL_DELEGATION_KIND};
+    let f = fixture();
+    let home = f.home();
+    let (_, receipt) = applied_personal(&f, 0xab, LABEL, &f.alice);
+    let _ = support::file_card(home, &f.alice, LABEL, receipt.employee, "team", EmployeeId([2; 16]), "整理工單").await;
+    let _ = support::file_card(home, &f.alice, "other-personal", EmployeeId([3; 16]), "team", EmployeeId([2; 16]), "別的工作").await;
+    let broker = ApprovalBroker::open(home).unwrap();
+    let cards = broker.list_by_kind(PERSONAL_DELEGATION_KIND).await.unwrap();
+    assert_eq!(cards.len(), 2);
+    let now = 10_000;
+    let input: TombstoneRequest = serde_json::from_value(json!({"label": LABEL,
+        "employee_id": hex::encode(receipt.employee.0), "csrf_token": CSRF})).unwrap();
+    let done = tombstone(home, Some(&proof(now)), &f.bob, input, now).unwrap();
+    assert_eq!(done["pending_fences"], json!([crate::isolation_quarantine::RUN_STOP_FENCE]));
+    assert!(matches!(done["seal"].as_str(), Some("absent" | "sealed")), "{done}");
+    assert_eq!((done["incarnation"].as_u64(), done["runs_stopped"].as_bool()), (Some(0), Some(false)));
+    invalidate_employee_approvals(home, LABEL, receipt.employee).await;
+    for card in broker.list_by_kind(PERSONAL_DELEGATION_KIND).await.unwrap() {
+        let expected = if card.payload["source_agent"] == LABEL { ApprovalStatus::Invalidated } else { ApprovalStatus::Pending };
+        assert_eq!(card.status, expected, "{}", card.payload["source_agent"]);
+    }
+    // No approvals fence: the invalidation succeeded.
+    let row = crate::isolation_quarantine::read_quarantine(
+        &rusqlite::Connection::open(home.join("migration-authority/apply.db")).unwrap(), receipt.employee, 0).unwrap().unwrap();
+    assert_eq!(row.pending_fences, vec![crate::isolation_quarantine::RUN_STOP_FENCE.to_owned()]);
 }
 
 /// SR2 1b (round 3): an adopted folder holding anything outside the
@@ -836,7 +877,7 @@ fn tombstone_quarantine_rename_noreplace() {
     let f = fixture();
     let (_, receipt) = applied_personal(&f, 0xab, LABEL, &f.alice);
     write_agent_dir(&f.home().join("agents"), LABEL);
-    let target = lifecycle::quarantine_path(f.home(), LABEL, receipt.employee);
+    let target = lifecycle::quarantine_path(f.home(), LABEL, receipt.employee, 0);
     std::fs::create_dir_all(&target).unwrap();
     std::fs::set_permissions(f.home().join("isolation-quarantine"), std::fs::Permissions::from_mode(0o700)).unwrap();
     refused(&f, &receipt);
@@ -864,5 +905,5 @@ fn tombstone_quarantine_rename_noreplace() {
     symlink(&real, f.home().join("agents")).unwrap();
     refused(&f, &receipt);
     assert!(real.join(LABEL).join("SOUL.md").exists());
-    assert!(!lifecycle::quarantine_path(f.home(), LABEL, receipt.employee).exists());
+    assert!(!lifecycle::quarantine_path(f.home(), LABEL, receipt.employee, 0).exists());
 }

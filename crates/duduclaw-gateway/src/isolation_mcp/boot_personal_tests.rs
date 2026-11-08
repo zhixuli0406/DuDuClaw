@@ -118,7 +118,7 @@ fn issue_pinned(f: &Fixture, root: &dyn RootAllocation, user: &str, lifecycle: &
     let epoch = current.human.as_ref().unwrap().credential_epoch;
     human_authorization_with(f.home().to_owned(), LABEL.into(), lifecycle.employee, user.into(), epoch,
         Lane::Standard, &current, duduclaw_isolation::bounded::List::new(vec![text("tasks_update")]).unwrap(),
-        turn(), None, lifecycle, root)
+        turn(), None, lifecycle, root, &SelectorSources::default(), None)
 }
 
 #[test]
@@ -172,7 +172,7 @@ fn issuer_personal_background_refused() {
     })).unwrap());
     assert_eq!(human_authorization_with(f.home().to_owned(), LABEL.into(), receipt.employee,
         f.alice.clone(), epoch, Lane::Standard, &current, duduclaw_isolation::bounded::List::new(vec![]).unwrap(),
-        record_turn, None, &lifecycle, &root).err(), Some(VerificationError::Revoked));
+        record_turn, None, &lifecycle, &root, &SelectorSources::default(), None).err(), Some(VerificationError::Revoked));
 }
 
 /// Deterministically change durable state at the post-resource root readback.
