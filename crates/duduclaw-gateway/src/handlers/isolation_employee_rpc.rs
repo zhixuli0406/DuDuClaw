@@ -222,6 +222,8 @@ impl MethodHandler {
             TOMBSTONE => {
                 let input: TombstoneRequest = serde_json::from_value(params).map_err(|_| PROPOSAL_INVALID)?;
                 let session = session.ok_or(ADMIN_REQUIRED)?;
+                let (approvals_home, label) = (home.clone(), input.label.clone());
+                let employee = parse_hex16(&input.employee_id).map(EmployeeId);
                 let done = blocking(move || {
                     let now = now()?;
                     let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
@@ -230,6 +232,10 @@ impl MethodHandler {
                 // The directory is now in quarantine (SR2 finding 4).
                 if let Err(error) = self.registry.write().await.scan().await {
                     warn!(error = %error, "employee tombstone: registry rescan failed");
+                }
+                // F6a (A8): approvals naming the employee die with it.
+                if let Some(employee) = employee {
+                    invalidate_employee_approvals(&approvals_home, &label, employee).await;
                 }
                 Ok(done)
             }
@@ -838,17 +844,69 @@ fn purge_requests(home: &Path, proof: Option<&MigrationConfirmationSession>, use
 }
 
 /// `isolation.employee_tombstone`: admin handover of a Personal employee.
+///
+/// F6a: runs the sealing tombstone (`lifecycle::tombstone_employee`, §3.2)
+/// and returns the seal state (Q6), the revoked detail routes and the
+/// pending fences. Still Personal-only at this RPC: accepting a Shared row
+/// (and dropping `NOT_PERSONAL`) is F6d (`tombstone_accepts_shared`); the
+/// lifecycle function itself handles both kinds.
 fn tombstone(home: &Path, proof: Option<&MigrationConfirmationSession>, user: &str, input: TombstoneRequest, now: i64)
     -> Result<Value, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
     if !valid_existing_label(&input.label) { return Err(LABEL_INVALID); }
     let employee = EmployeeId(parse_hex16(&input.employee_id).ok_or(EMPLOYEE_NOT_FOUND)?);
-    lifecycle::tombstone_personal_employee(home, &input.label, employee).map_err(|error| match error {
+    let refusal = |error| match error {
         LifecycleError::Unavailable => STORE_UNAVAILABLE,
         LifecycleError::Denied | LifecycleError::Tombstoned => NOT_PERSONAL,
         LifecycleError::Stale => STALE,
-    })?;
-    Ok(json!({ "label": input.label, "tombstoned": true, "readback_required": true }))
+    };
+    // Personal only here (F6d widens the RPC); the principal is read from
+    // the stored receipt, never from the request.
+    let personal = lifecycle::confirmed_receipt(home, &input.label).map_err(refusal)?
+        .is_some_and(|receipt| receipt.employee != employee
+            || matches!(receipt.principal_binding, Some(duduclaw_isolation::capability::EmployeeBinding::Personal(_))));
+    if !personal { return Err(NOT_PERSONAL); }
+    let env = lifecycle::TombstoneEnv { actor: user, runs: &crate::isolation_quarantine::SpawndRunStopper, now };
+    let outcome = lifecycle::tombstone_employee(home, &input.label, employee, &env).map_err(refusal)?;
+    Ok(json!({ "label": input.label, "tombstoned": true, "readback_required": true,
+        "incarnation": outcome.incarnation, "seal": outcome.seal, "digest_prefix": outcome.digest_prefix,
+        "routes_revoked": outcome.routes_revoked.len(), "pending_fences": outcome.pending_fences,
+        "runs_stopped": outcome.runs_stopped.is_some() }))
+}
+
+/// F6a (A8): after a tombstone, invalidate every open or approved approval
+/// card naming the employee's label (its own cards, and Personal-delegation
+/// cards from or to it). A failure is recorded as the `approvals:` pending
+/// fence (H2), which blocks a restore until a retry succeeds.
+pub(crate) async fn invalidate_employee_approvals(home: &Path, label: &str, employee: EmployeeId) {
+    use crate::approval::{ApprovalBroker, ApprovalStatus};
+    let result = async {
+        let broker = ApprovalBroker::open(home).map_err(|_| ())?;
+        let mut ids = Vec::new();
+        for card in broker.list_pending(Some(label)).await.map_err(|_| ())? { ids.push(card.id); }
+        for card in broker.list_by_kind(crate::isolation_background::PERSONAL_DELEGATION_KIND).await.map_err(|_| ())? {
+            let names = card.agent_id == label
+                || card.payload.get("target_agent").and_then(Value::as_str) == Some(label)
+                || card.payload.get("source_agent").and_then(Value::as_str) == Some(label);
+            if names && matches!(card.status, ApprovalStatus::Pending | ApprovalStatus::Approved) { ids.push(card.id); }
+        }
+        let mut invalidated = 0usize;
+        for id in ids {
+            broker.invalidate_request(&id, "employee_tombstoned").await.map_err(|_| ())?;
+            invalidated += 1;
+        }
+        Ok::<usize, ()>(invalidated)
+    }.await;
+    let fences: Vec<String> = match result {
+        Ok(_) => Vec::new(),
+        Err(()) => vec!["approvals:unavailable".to_owned()],
+    };
+    let (home, label) = (home.to_path_buf(), label.to_owned());
+    let recorded = tokio::task::spawn_blocking(move || lifecycle::record_fence_group(&home, &label, employee, "approvals:", &fences))
+        .await;
+    if !matches!(recorded, Ok(Ok(()))) {
+        warn!("employee tombstone: approval fence could not be recorded");
+    }
 }
 
 #[cfg(test)]

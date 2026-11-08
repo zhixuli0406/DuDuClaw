@@ -64,9 +64,17 @@ pub(crate) fn save_confirmed_receipt(home:&Path,item:&ConfirmationItem,receipt:&
         if let (Some(owner),false)=(personal_owner,receipt.disabled) {
             lifecycle::record_personal_mirror(home,&receipt.label,owner).map_err(lifecycle_error)?;
         }
-        tx.execute("INSERT INTO confirmed_employees(label,operation,digest,receipt,tenant_id) VALUES(?1,?2,?3,?4,?5)
-            ON CONFLICT(label) DO UPDATE SET operation=excluded.operation,digest=excluded.digest,receipt=excluded.receipt,tenant_id=excluded.tenant_id",
-            params![receipt.label,operation(&item.binding),item.binding.proposal_digest.0.as_slice(),serde_json::to_string(receipt).map_err(|_|Error::Storage)?,pinned_tenant]).map_err(|_|Error::Storage)?;
+        // F6 §3.1: only restore writes `incarnation` (+1). A re-save of the
+        // same employee id preserves it; a new id on the label starts at 0
+        // (adoption and label reuse never inherit an incarnation).
+        let same_employee=match &previous {
+            Some((encoded,_))=>serde_json::from_str::<Receipt>(encoded).map_err(|_|Error::Storage)?.employee==receipt.employee,
+            None=>false,
+        };
+        tx.execute("INSERT INTO confirmed_employees(label,operation,digest,receipt,tenant_id,incarnation) VALUES(?1,?2,?3,?4,?5,0)
+            ON CONFLICT(label) DO UPDATE SET operation=excluded.operation,digest=excluded.digest,receipt=excluded.receipt,tenant_id=excluded.tenant_id,
+            incarnation=CASE WHEN ?6 THEN confirmed_employees.incarnation ELSE 0 END",
+            params![receipt.label,operation(&item.binding),item.binding.proposal_digest.0.as_slice(),serde_json::to_string(receipt).map_err(|_|Error::Storage)?,pinned_tenant,same_employee]).map_err(|_|Error::Storage)?;
         tx.commit().map_err(|_|Error::Storage)?;
         if let (Some(owner),true)=(personal_owner,receipt.disabled) {
             // Another owner's mirror (Stale) is not this allocation's to remove.
@@ -119,17 +127,10 @@ pub(crate) fn resolve_confirmed_employee(home:&Path,label:&str)->Result<Receipt>
 }
 
 // Extend the existing allocation index rather than creating a second ACL store.
+// F6a: the schema (incl. `incarnation`, the quarantine and root-allocation
+// tables) lives in `isolation_quarantine`; a newer schema refuses.
 fn ensure_employee_schema(db:&Connection)->Result<()> {
-    db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS confirmed_employees (
-        label TEXT PRIMARY KEY,operation TEXT NOT NULL UNIQUE,digest BLOB NOT NULL,
-        receipt TEXT NOT NULL,tenant_id TEXT);").map_err(|_|Error::Storage)?;
-    let columns=db.prepare("PRAGMA table_info(confirmed_employees)").map_err(|_|Error::Storage)?
-        .query_map([],|r|r.get::<_,String>(1)).map_err(|_|Error::Storage)?
-        .collect::<std::result::Result<Vec<_>,_>>().map_err(|_|Error::Storage)?;
-    if !columns.iter().any(|column|column=="tenant_id") {
-        db.execute_batch("ALTER TABLE confirmed_employees ADD COLUMN tenant_id TEXT;").map_err(|_|Error::Storage)?;
-    }
-    Ok(())
+    crate::isolation_quarantine::ensure_employee_schema(db).map_err(|_|Error::Storage)
 }
 fn current_tenant(home:&Path,agent:&str)->Result<String> {
     // SR2 finding 7: the hardened private-SQLite opener, read-only.

@@ -201,6 +201,13 @@ mod imp {
             std::fs::File::from(self.fd.try_clone()?).metadata()
         }
 
+        /// A duplicate of the pinned descriptor (same open directory), for a
+        /// descriptor-relative walk that must not reopen anything by path
+        /// (F6 quarantine seal).
+        pub(crate) fn duplicate_fd(&self) -> io::Result<OwnedFd> {
+            self.fd.try_clone()
+        }
+
         fn stat(&self, name: &str) -> io::Result<Option<FileStat>> {
             match fstatat(
                 Some(self.fd.as_raw_fd()),

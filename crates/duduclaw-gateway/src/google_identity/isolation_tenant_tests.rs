@@ -146,7 +146,8 @@ fn e4_tenant_mismatch_refused() {
     assert_eq!(GoogleIsolationBridge::tenant_route(&other, &shared("company"), &system(), &source, &[], "gmail_read").err(),
         Some(VerificationError::BindingMismatch));
     // No tenant route at all is setup-required (Unavailable at this boundary).
-    let none = GoogleAccountRoutes { personal: Default::default(), home: routes.home.clone(), tenant: None };
+    let none = GoogleAccountRoutes { personal: Default::default(), home: routes.home.clone(), tenant: None,
+        pinned: routes.pinned };
     assert_eq!(GoogleIsolationBridge::tenant_route(&none, &shared("company"), &system(), &source, &[], "gmail_read").err(),
         Some(VerificationError::Unavailable));
 }
