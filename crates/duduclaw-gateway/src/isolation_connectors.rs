@@ -12,6 +12,10 @@ use crate::isolation_connector_details::{AccountDetailRecord, DETAILS_SCHEMA, DE
 #[path = "isolation_connector_relink.rs"]
 mod relink;
 pub(crate) use relink::{RELINK_PROVIDERS, RelinkSubject, RouteScope};
+// v1.81 C5: provenance of routes created by an applied migration proposal.
+#[path = "isolation_connector_origin.rs"]
+mod origin;
+pub(crate) use origin::{MigratedRoute, MigrationOrigin};
 
 /// Production catalog file. It lives directly in the gateway home, beside the
 /// other isolation stores (`isolation-forks.db`, `isolation-execution-jobs.db`,
@@ -242,6 +246,10 @@ impl ConnectorCatalog {
         // v1.81 C4: likewise for the relink-hint table.
         if !present(relink::RELINK_TABLE_NAME)? {
             for (_, _, sql) in relink::RELINK_SCHEMA { tx.execute_batch(sql).map_err(unavailable)?; }
+        }
+        // v1.81 C5: likewise for the migration provenance table.
+        if !present(origin::ORIGIN_TABLE_NAME)? {
+            for (_, _, sql) in origin::ORIGIN_SCHEMA { tx.execute_batch(sql).map_err(unavailable)?; }
         }
         verify_schema(&tx)?;
         tx.commit().map_err(unavailable)?;
@@ -515,7 +523,8 @@ fn now_seconds() -> Result<i64, CatalogError> {
 fn verify_schema(connection: &Connection) -> Result<(), CatalogError> {
     verify_table(connection, "isolation_connector_routes", &SCHEMA)?;
     verify_table(connection, DETAILS_TABLE_NAME, &DETAILS_SCHEMA)?;
-    verify_table(connection, relink::RELINK_TABLE_NAME, &relink::RELINK_SCHEMA)
+    verify_table(connection, relink::RELINK_TABLE_NAME, &relink::RELINK_SCHEMA)?;
+    verify_table(connection, origin::ORIGIN_TABLE_NAME, &origin::ORIGIN_SCHEMA)
 }
 fn verify_table(connection: &Connection, table: &str, schema: &[(&str, &str, &str)]) -> Result<(), CatalogError> {
     let unavailable = |_| CatalogError::Unavailable;

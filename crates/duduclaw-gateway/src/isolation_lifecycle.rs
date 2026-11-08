@@ -219,6 +219,38 @@ pub(crate) fn validate_proposed_binding(home: &Path, label: &str, binding: Optio
     Ok(())
 }
 
+/// C5 legacy proof: whether `user` is a users.db row (any status). The
+/// legacy connector import proposes a Personal route only for an owner this
+/// returns `true` for; an unreadable users.db is `Unavailable` (refuse).
+pub(crate) fn user_exists(home: &Path, user: &str) -> Result<bool, LifecycleError> {
+    let connection = open_store(home, USERS_DB, Access::ReadOnly)?;
+    connection.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1)", [user], |r| r.get(0))
+        .map_err(|_| LifecycleError::Unavailable)
+}
+
+/// C5 apply path: the binding of a migrated connector route, from one
+/// users.db read transaction. `Some(owner)`: the owner must be eligible
+/// ([`owner_eligible`]: Active, logged in, no forced password change), same
+/// rule as C3 provisioning. `None`: Shared in the installation tenant; no
+/// request field can name a tenant.
+pub(crate) fn connector_route_binding(home: &Path, owner: Option<&str>) -> Result<EmployeeBinding, LifecycleError> {
+    use LifecycleError::*;
+    let mut connection = open_store(home, USERS_DB, Access::ReadOnly)?;
+    let users = connection.transaction().map_err(|_| Unavailable)?;
+    let binding = match owner {
+        Some(owner) => {
+            if !owner_eligible(&users, owner)? { return Err(Denied); }
+            EmployeeBinding::Personal(Text::new(owner.to_owned()).map_err(|_| Denied)?)
+        }
+        None => {
+            let tenant = duduclaw_auth::isolation::read_isolation_tenant(&users).map_err(|_| Unavailable)?;
+            EmployeeBinding::Shared(Text::new(tenant).map_err(|_| Unavailable)?)
+        }
+    };
+    users.finish().map_err(|_| Unavailable)?;
+    Ok(binding)
+}
+
 /// Apply path: record the Personal mirror for a confirmed allocation, after
 /// re-checking the owner in the same users.db transaction, and bind the owner
 /// to the employee with Owner access in that same transaction (A4), so the

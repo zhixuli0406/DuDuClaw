@@ -892,6 +892,15 @@ pub fn load_tokens(home_dir: &Path) -> Vec<McpOAuthToken> {
     home_store::load_decoded_public(home_dir, None).unwrap_or_default()
 }
 
+/// v1.81 C5: provider ids that have a visible stored home OAuth credential.
+/// Presence only: no secret is decoded or returned. `Err` = the token store
+/// is unreadable or damaged; callers must refuse rather than treat it as empty.
+pub(crate) fn stored_home_providers(home_dir: &Path) -> Result<Vec<String>, String> {
+    home_store::load_public(home_dir)
+        .map(|tokens| tokens.iter().map(|token| token.provider_id.clone()).collect())
+        .map_err(|e| e.to_string())
+}
+
 /// Save tokens to disk using atomic write (temp + rename), encrypting secrets.
 pub fn save_tokens(home_dir: &Path, tokens: &[McpOAuthToken]) -> Result<(), String> {
     home_store::save_public(home_dir, tokens).map_err(|e| e.to_string())
