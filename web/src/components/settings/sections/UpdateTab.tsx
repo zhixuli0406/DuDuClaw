@@ -97,6 +97,8 @@ export function UpdateTab() {
     restart_pending_version?: string | null;
     update_channel?: 'control_plane' | 'github' | 'none';
     containerized?: boolean;
+    macos_bundle_migratable?: boolean;
+    macos_bundle_notice?: string | null;
   } | null>(null);
 
   // Load edition + auto_update state on mount
@@ -247,6 +249,24 @@ export function UpdateTab() {
     } finally {
       setInstalling(false);
       setRetry(null);
+      installingRef.current = false;
+    }
+  };
+
+  // RM-155: bare macOS install → DuDuClaw Gateway.app (verified like an update).
+  const handleMigrateBundle = async () => {
+    if (installingRef.current) return;
+    installingRef.current = true;
+    setInstalling(true);
+    setError(null);
+    try {
+      const result = await api.system.migrateBundle();
+      if (result.success) setInstalled(true);
+      else showFailure(result.message);
+    } catch (err) {
+      showFailure(err);
+    } finally {
+      setInstalling(false);
       installingRef.current = false;
     }
   };
@@ -451,6 +471,26 @@ export function UpdateTab() {
                   { version: updateInfo.restart_pending_version },
                 )}
               </span>
+            </div>
+          )}
+          {/* Shown once after a DuDuClaw Gateway.app migration (the gateway
+              consumes the marker): macOS asks for folder access one time. */}
+          {updateInfo.macos_bundle_notice && (
+            <div className="flex items-center gap-2 rounded-lg bg-muted/60 p-4 ring-1 ring-inset ring-surface-border">
+              <CheckCircle className="h-5 w-5 shrink-0 text-muted-foreground" />
+              <span className="text-sm text-muted-foreground">{updateInfo.macos_bundle_notice}</span>
+            </div>
+          )}
+          {updateInfo.macos_bundle_migratable && (
+            <div className="flex flex-wrap items-center gap-3 rounded-lg p-4 ring-1 ring-inset ring-surface-border">
+              <span className="min-w-0 flex-1 text-sm text-muted-foreground">
+                {intl.formatMessage({ id: 'settings.update.migrateBundle.desc' })}
+              </span>
+              <Button variant="brand" size="sm" onClick={handleMigrateBundle} disabled={installing || restarting}>
+                {installing
+                  ? intl.formatMessage({ id: 'settings.update.migrateBundle.working' })
+                  : intl.formatMessage({ id: 'settings.update.migrateBundle.action' })}
+              </Button>
             </div>
           )}
           {/* Version info */}

@@ -1002,6 +1002,32 @@ package_and_upload_pro_bin() {
             return 1
         fi
     fi
+    local app_path="${staged_dir}/duduclaw-pro-${plat}.app.zip"
+    if [[ "$plat" == darwin-* ]]; then
+        # Sign before creating either asset. A signing failure skips this platform.
+        if ! python3 scripts/macos/build-gateway-bundle.py \
+                --exe "$staged_dir/$plat/duduclaw-pro" --name duduclaw-pro \
+                --version "$version" --out "$staged_dir/$plat" ||
+           ! bash scripts/macos/sign-gateway.sh \
+                --app "$staged_dir/$plat/DuDuClaw Gateway.app" \
+                --exe "$staged_dir/$plat/duduclaw-pro" --out "$app_path" \
+                --keychain-profile "${DUDUCLAW_NOTARY_PROFILE:-duduclaw-notary}" ||
+           ! bash scripts/macos/verify-gateway-signature.sh \
+                --app "$staged_dir/$plat/DuDuClaw Gateway.app" \
+                --exe "$staged_dir/$plat/duduclaw-pro" --tag "v$version"; then
+            echo "  WARNING: gateway signing/notarization unavailable — skipping $plat."
+            PRO_GAPS+=("pro-bin $plat v$version signing/notarization failed — no darwin assets uploaded")
+            return 1
+        fi
+        if ! python3 scripts/check_update_archive_size.py "$app_path" ||
+           ! python3 scripts/verify_release_marker.py --tag "v$version" --archive "$app_path" ||
+           ! shasum -a 256 "$app_path" > "${app_path}.sha256" ||
+           ! minisign -S -s "$PRO_BIN_KEY" -m "$app_path" \
+                -t "duduclaw-pro v$version $(basename "$app_path")"; then
+            echo "  WARNING: gateway bundle validation/signing failed — skipping $plat."
+            return 1
+        fi
+    fi
     if ! ( cd "$staged_dir/$plat" && tar czf "$tar_path" duduclaw-pro ); then
         echo "  WARNING: failed to package $tar_name — skipping."
         return 1
@@ -1025,7 +1051,11 @@ package_and_upload_pro_bin() {
         echo "  WARNING: gcloud not found — $tar_name built + signed locally, not uploaded."
         return 1
     fi
-    if gcloud storage cp "$tar_path" "${tar_path}.sha256" "${tar_path}.minisig" "$dest"; then
+    local extra_assets=()
+    if [[ "$plat" == darwin-* ]]; then
+        extra_assets=("$app_path" "${app_path}.sha256" "${app_path}.minisig")
+    fi
+    if gcloud storage cp "$tar_path" "${tar_path}.sha256" "${tar_path}.minisig" ${extra_assets[@]+"${extra_assets[@]}"} "$dest"; then
         echo "  Uploaded: ${dest}${tar_name} (+ .sha256 + .minisig)"
         return 0
     fi

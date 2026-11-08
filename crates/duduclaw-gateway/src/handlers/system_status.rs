@@ -93,6 +93,13 @@ impl MethodHandler {
         });
         let policy = crate::mfa::policy_status(&self.home_dir);
         if policy["degraded"] == true { payload["mfa_policy"] = policy; }
+        // RM-155: present only while macOS folder access (TCC) is pending or
+        // denied for a protected location this gateway uses; the dashboard
+        // banner keys off its presence. Never populated off macOS (no
+        // watcher runs there).
+        if let Some(folder_access) = crate::macos_folder_access::status_json(&self.home_dir) {
+            payload["folder_access"] = folder_access;
+        }
         payload
     }
 

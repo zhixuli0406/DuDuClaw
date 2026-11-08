@@ -13,6 +13,7 @@ import { TourPrompt } from '@/components/tour/TourPrompt';
 import { OwnerEmailPrompt } from '@/components/OwnerEmailPrompt';
 import { SoftLimitBanner } from '@/components/SoftLimitBanner';
 import { CodexUpdateBanner } from '@/components/CodexUpdateBanner';
+import { FolderAccessBanner } from '@/components/FolderAccessBanner';
 import { LicenseExpiryBanner } from '@/components/LicenseExpiryBanner';
 import { CommandPalette } from '@/components/CommandPalette';
 import { DevPanel } from '@/components/devpanel';
@@ -161,6 +162,7 @@ function AppShell() {
             <SoftLimitBanner />
             <LicenseExpiryBanner />
             <CodexUpdateBanner />
+            <FolderAccessBanner />
             <UpdateBanner />
           </div>
           {/* Re-key on route change to replay the entrance reveal */}

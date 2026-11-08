@@ -656,6 +656,11 @@ pub fn restart_requested() -> bool {
 /// Path of the binary this process was started from, captured once per
 /// process. Self-update replaces the file at this path in place, so the
 /// same path is valid for re-exec after an update.
+///
+/// macOS: `current_exe()` keeps the spelling the process was launched with
+/// (e.g. the `~/.duduclaw/bin/duduclaw` symlink into
+/// `DuDuClaw Gateway.app`), so it is canonicalized once here — the
+/// LaunchAgent, bundle detection and the updater all need the real file.
 pub fn executable_path() -> std::path::PathBuf {
     static EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     EXE.get_or_init(|| {
@@ -664,12 +669,26 @@ pub fn executable_path() -> std::path::PathBuf {
         // running inode was already unlinked by an update — strip it so
         // re-exec targets the freshly installed binary at the same path.
         let s = p.to_string_lossy();
-        match s.strip_suffix(" (deleted)") {
+        let p = match s.strip_suffix(" (deleted)") {
             Some(stripped) => std::path::PathBuf::from(stripped),
             None => p,
-        }
+        };
+        canonical_executable(p)
     })
     .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn canonical_executable(p: std::path::PathBuf) -> std::path::PathBuf {
+    if p.as_os_str().is_empty() {
+        return p;
+    }
+    std::fs::canonicalize(&p).unwrap_or(p)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn canonical_executable(p: std::path::PathBuf) -> std::path::PathBuf {
+    p
 }
 
 /// Replace the current process with a fresh instance of the binary at

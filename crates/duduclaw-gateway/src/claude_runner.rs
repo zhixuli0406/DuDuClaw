@@ -973,6 +973,11 @@ async fn call_claude_for_agent_impl(
             "dispatch work_dir override does not exist — falling back to the agent directory"
         );
     }
+    // RM-155: a work dir in a macOS-protected folder joins the folder-access
+    // probe set (no-op off macOS or for unprotected paths).
+    if let Some(dir) = &work_dir_override {
+        crate::macos_folder_access::note_work_dir(home_dir, dir);
+    }
     // Identity-scoped config always stays with the agent directory, so an
     // overridden cwd never silently swaps the member's `[model] effort`,
     // scoped-tool grants or minimal-context setting for the employee's.
