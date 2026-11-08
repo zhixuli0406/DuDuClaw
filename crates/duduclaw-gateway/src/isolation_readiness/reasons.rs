@@ -20,6 +20,9 @@
 //!   boot's work broker installation ⇒ `workspace_broker_unavailable`; HX5's
 //!   `helper_calls` bit and the published runtime ids ⇒
 //!   `helper_launcher_unavailable{reason}` / `helper_runtime_missing{runtime}`.
+//!   These are action-required only while some protected employee's
+//!   configured tool list names a tool that needs them ([`ToolNeeds`]);
+//!   otherwise `report` lists them as informational `notices`.
 //!
 //! Fail closed: an unreadable source is `service_unavailable`, never "ready".
 //! The payload holds fixed codes, provider family names from the factory's
@@ -90,6 +93,90 @@ pub fn feature_reasons(features: Option<duduclaw_isolation::ipc::SpawndFeatures>
     reasons.extend(helper_reasons(features.contains(SpawndFeatures::HELPER_CALLS),
         published.unwrap_or_default().iter().copied()));
     reasons
+}
+
+/// File tools served from the brokered `employee-work` root.
+const FILE_TOOLS: [&str; 3] = ["file_read", "csv_read", "xlsx_read"];
+/// Browser recording tools (HX6; in-run helper + work root).
+const RECORDING_TOOLS: [&str; 2] = ["browser_record_start", "browser_record_stop"];
+
+/// W1 follow-up: which host-wide feature reasons concern any protected
+/// employee. A reason only makes the status `action_required` when at least
+/// one employee's configured `[capabilities]` list actually names a tool that
+/// needs it; otherwise it is reported as an informational notice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolNeeds {
+    /// `file_read` / `csv_read` / `xlsx_read` (work broker).
+    pub files: bool,
+    /// `execute_program` (program helper runtime).
+    pub program: bool,
+    /// `code_map` (code-map helper runtime).
+    pub code_map: bool,
+    /// `office_script` (office helper runtimes).
+    pub office: bool,
+    /// `browser_record_*` (recording helper).
+    pub recording: bool,
+}
+
+impl ToolNeeds {
+    /// Fail closed: an unreadable profile counts as needing everything.
+    pub const ALL: Self = Self { files: true, program: true, code_map: true, office: true, recording: true };
+
+    /// From one employee's `[capabilities] denied_tools` / `allowed_tools`,
+    /// with the same `tool_list_verdict` the gates use. Only an explicit
+    /// allowlist "configures" tools: an empty `allowed_tools` names none.
+    pub fn from_lists(denied: &[String], allowed: &[String]) -> Self {
+        use duduclaw_core::tool_catalog::{tool_list_verdict, ToolListVerdict};
+        let names = |tools: &[&str]| !allowed.is_empty() && tools.iter()
+            .any(|tool| tool_list_verdict(tool, denied, allowed) == ToolListVerdict::Allowed);
+        Self { files: names(&FILE_TOOLS), program: names(&["execute_program"]), code_map: names(&["code_map"]),
+            office: names(&["office_script"]), recording: names(&RECORDING_TOOLS) }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self { files: self.files || other.files, program: self.program || other.program,
+            code_map: self.code_map || other.code_map, office: self.office || other.office,
+            recording: self.recording || other.recording }
+    }
+
+    fn helpers(&self) -> bool { self.program || self.code_map || self.office }
+
+    /// Whether `reason` (a [`feature_reasons`] entry) concerns these tools.
+    /// Non-feature reasons always do.
+    pub fn concerns(&self, reason: &Reason) -> bool {
+        match reason {
+            // The in-run helpers need the same Workspace grant as the file tools.
+            Reason::WorkspaceBrokerUnavailable => self.files || self.helpers(),
+            Reason::HelperLauncherUnavailable { .. } => self.helpers() || self.recording,
+            Reason::HelperRuntimeMissing { runtime } => match *runtime {
+                duduclaw_execution::program_helper::PROGRAM_RUNTIME => self.program,
+                duduclaw_execution::code_map_helper::RUNTIME => self.code_map,
+                _ => self.office,
+            },
+            _ => true,
+        }
+    }
+
+    /// Split feature reasons into (action required, informational).
+    pub fn split(&self, reasons: Vec<Reason>) -> (Vec<Reason>, Vec<Reason>) {
+        reasons.into_iter().partition(|reason| self.concerns(reason))
+    }
+}
+
+/// The union of [`ToolNeeds`] over the given protected employees' current
+/// profiles (gateway-private `agents/<label>/agent.toml`, the same no-follow
+/// reader the H9 selectors use). Blocking.
+#[cfg(target_os = "linux")]
+pub(crate) fn installed_tool_needs<'a>(home: &Path, labels: impl IntoIterator<Item = &'a str>) -> ToolNeeds {
+    labels.into_iter().fold(ToolNeeds::default(), |needs, label| {
+        needs.union(crate::isolation_mcp::read_employee_profile(home, label).map_or(ToolNeeds::ALL, |profile|
+            ToolNeeds::from_lists(&profile.capabilities.denied_tools, &profile.capabilities.allowed_tools)))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn installed_tool_needs<'a>(_: &Path, _: impl IntoIterator<Item = &'a str>) -> ToolNeeds {
+    ToolNeeds::ALL
 }
 
 /// [`feature_reasons`] from the live sources the gates read: the backend's

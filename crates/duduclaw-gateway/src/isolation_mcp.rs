@@ -122,6 +122,9 @@ pub(crate) mod ingress;
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/selectors.rs"]
 mod selectors;
+/// Readiness gates host-wide W1/HX5 reasons on the employees' tool lists.
+#[cfg(target_os = "linux")]
+pub(crate) use selectors::read_profile as read_employee_profile;
 /// W1 production work broker (run-bound) and spawnd feature source.
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/run_broker.rs"]

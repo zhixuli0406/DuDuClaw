@@ -12,7 +12,7 @@
 //! (`nlink` 0), and the boundary's `verify_brokered` checks it again.
 use std::sync::Arc;
 use duduclaw_execution::{spawnd::WorkFileError, SpawndBackend};
-use duduclaw_isolation::execution::RunHandle;
+use duduclaw_isolation::{execution::RunHandle, ipc::ControlConnectionId};
 use crate::resources::{BrokeredWorkFile, WorkBroker, WorkBrokerError, WorkFileMetadata, WorkFileRequest};
 
 pub struct SpawndWorkspaceBridge { backend: Arc<SpawndBackend> }
@@ -22,15 +22,29 @@ impl SpawndWorkspaceBridge {
     /// runs (the control connection that owns a run is the only one root
     /// accepts for its work ops). Wire with `ResourceRoots::insert_brokered`.
     pub fn new(backend: Arc<SpawndBackend>) -> Self { Self { backend } }
+
+    /// W1: [`WorkBroker::open_work_file`] only while `request.run()` is still
+    /// reserved on the control connection `control` (the one a run-bound
+    /// broker latched); otherwise `NotLive` and nothing is sent.
+    pub fn open_on_control(&self, request: &WorkFileRequest<'_>, control: ControlConnectionId)
+        -> Result<BrokeredWorkFile, WorkBrokerError> {
+        brokered(self.backend.open_work_file_on(RunHandle(request.run()), Some(control), request.employee(),
+            request.path().as_str(), request.max_bytes()))
+    }
 }
 
 impl WorkBroker for SpawndWorkspaceBridge {
     fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError> {
-        let snapshot = self.backend.open_work_file(RunHandle(request.run()), request.employee(),
-            request.path().as_str(), request.max_bytes()).map_err(broker_error)?;
-        Ok(BrokeredWorkFile { file: snapshot.file, metadata: WorkFileMetadata { regular: true,
-            size: snapshot.size, device: snapshot.device, inode: snapshot.inode, nlink: snapshot.nlink } })
+        brokered(self.backend.open_work_file(RunHandle(request.run()), request.employee(),
+            request.path().as_str(), request.max_bytes()))
     }
+}
+
+fn brokered(result: Result<duduclaw_execution::spawnd::WorkFileSnapshot, WorkFileError>)
+    -> Result<BrokeredWorkFile, WorkBrokerError> {
+    let snapshot = result.map_err(broker_error)?;
+    Ok(BrokeredWorkFile { file: snapshot.file, metadata: WorkFileMetadata { regular: true,
+        size: snapshot.size, device: snapshot.device, inode: snapshot.inode, nlink: snapshot.nlink } })
 }
 
 /// spawnd refusal → boundary diagnostic (→ `WorkBrokerError::user_message`).

@@ -24,6 +24,17 @@ const NEXT_STEPS: Record<IsolationReasonCode, { hint: string; to: string }> = {
   personal_binding_conflict: { hint: 'isolationReadiness.hint.personal', to: '/manage/users' },
   revoked: { hint: 'isolationReadiness.hint.revoked', to: '/manage/integrations' },
   service_unavailable: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
+  workspace_broker_unavailable: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
+  helper_launcher_unavailable: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
+  helper_runtime_missing: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
+  helper_recording_unsupported: { hint: 'isolationReadiness.hint.temporary', to: '/app/system/security' },
+};
+
+// Only known helper runtime ids may become user-facing feature names.
+const HELPER_FEATURES: Record<string, string> = {
+  'duduclaw-program-v1': 'program',
+  'duduclaw-code-map-v1': 'codeMap',
+  'duduclaw-office-*-v1': 'office',
 };
 
 interface ReasonView { key: string; message: string; step?: { hint: string; to: string } }
@@ -48,6 +59,21 @@ function describeReason(intl: IntlShape, reason: IsolationReason): ReasonView {
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.revoked' }) };
     case 'service_unavailable':
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.temporary' }) };
+    case 'workspace_broker_unavailable':
+      return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.workspaceBroker' }) };
+    case 'helper_launcher_unavailable':
+      return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperLauncher' }) };
+    case 'helper_runtime_missing': {
+      const feature = reason.runtime && Object.hasOwn(HELPER_FEATURES, reason.runtime)
+        ? HELPER_FEATURES[reason.runtime] : undefined;
+      return feature
+        ? { key: `${reason.code}:${feature}`, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRuntime' }, {
+          feature: intl.formatMessage({ id: `isolationReadiness.feature.${feature}` }),
+        }) }
+        : { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRuntimeGeneric' }) };
+    }
+    case 'helper_recording_unsupported':
+      return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRecording' }) };
     default:
       return { key: 'unknown', message: intl.formatMessage({ id: 'isolationReadiness.reason.setup' }) };
   }

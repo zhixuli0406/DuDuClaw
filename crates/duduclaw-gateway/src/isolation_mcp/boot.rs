@@ -61,11 +61,13 @@ pub struct BootSources {
     pub connector_catalog: Option<Arc<ConnectorCatalog>>,
     pub connectors: Option<Arc<dyn BoundConnectorExecutor>>,
     pub connector_selection: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
-    /// H9/H10: optional host override of the root work broker. Production
-    /// leaves it `None`: W1's `assemble` then installs run-bound brokers over
-    /// the protected backend (`run_broker.rs`, H5 `SpawndWorkspaceBridge`).
-    /// Without either the issuer never selects a Workspace grant (tools hidden,
-    /// fail closed); it is not a boot-completeness producer.
+    /// H9/H10: test-only override of the root work broker (a double). It does
+    /// not exist in production builds: there W1's `assemble` always installs
+    /// run-bound brokers over the protected backend (`run_broker.rs`, H5
+    /// `SpawndWorkspaceBridge`). Without them the issuer never selects a
+    /// Workspace grant (tools hidden, fail closed); it is not a
+    /// boot-completeness producer.
+    #[cfg(any(test, feature = "test-support"))]
     pub work_broker: Option<Arc<dyn duduclaw_mcp_boundary::resources::WorkBroker>>,
     /// F1: per-employee connector stack over `connector_catalog`. When boot
     /// creates it, `connectors`/`connector_selection` are this same object
@@ -618,14 +620,22 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
             backend: backend.clone(),
         }),
     };
+    #[cfg(any(test, feature = "test-support"))]
+    let host_broker = sources.work_broker.take();
     Ok(BootOwner { generation: sources.installed_generation.ok_or(VerificationError::Unavailable)?, fork_tools, execution_jobs, product_authority: sources.product_authority, home: home.to_owned(), backend: backend.clone(), boundary, bindings, worker,
         registry: sources.runtime_registry.take().ok_or(VerificationError::Unavailable)?,
         main_plans: sources.main_plans.take().ok_or(VerificationError::Unavailable)?,
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,
         worker_plans: sources.worker_plans.take().ok_or(VerificationError::Unavailable)?,
         turns: sources.turns.take().ok_or(VerificationError::Unavailable)?,
-        // W1: run-bound work brokers (unless a host broker is supplied) + HX5 feature view.
-        selectors: SelectorSources::installed(home, sources.work_broker.take(), backend),
+        // W1: run-bound work brokers + HX5 feature view (evaluated last, after
+        // every fallible producer; a test build may swap in a host double).
+        selectors: {
+            let selectors = SelectorSources::installed(home, backend);
+            #[cfg(any(test, feature = "test-support"))]
+            let selectors = match host_broker { Some(broker) => selectors.with_host_broker(broker), None => selectors };
+            selectors
+        },
         catalog: sources.connector_catalog, connectors: sources.connectors,
         connector_selection: sources.connector_selection, connector_stack: sources.connector_stack })
 }

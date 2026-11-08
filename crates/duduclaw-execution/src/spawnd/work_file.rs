@@ -127,10 +127,22 @@ impl SpawndBackend {
     /// decides liveness and ownership. Blocking (≤ 12 s): blocking pool only.
     pub fn open_work_file(&self, run: RunHandle, employee: EmployeeId, path: &str, max_bytes: u64)
         -> Result<WorkFileSnapshot, WorkFileError> {
+        self.open_work_file_on(run, None, employee, path, max_bytes)
+    }
+
+    /// [`Self::open_work_file`], additionally pinned to the control connection
+    /// a W1 run broker latched (`RunTransport.control`): if `run` is now
+    /// reserved on another connection the open is refused `NotLive` before
+    /// anything is sent. `None` = no pin (H5 behaviour).
+    pub fn open_work_file_on(&self, run: RunHandle, expected_control: Option<ipc::ControlConnectionId>,
+        employee: EmployeeId, path: &str, max_bytes: u64) -> Result<WorkFileSnapshot, WorkFileError> {
         let entry = self.entry(run).map_err(|error| match error {
             BackendError::NotFound => WorkFileError::NotLive,
             _ => WorkFileError::Unavailable,
         })?;
+        if expected_control.is_some_and(|control| control != entry.connection.id) {
+            return Err(WorkFileError::NotLive);
+        }
         // Never send an op an older spawnd cannot decode (it would drop the
         // run's whole control connection). H5 keeps its default: without an
         // installed readiness source no work op is sent.

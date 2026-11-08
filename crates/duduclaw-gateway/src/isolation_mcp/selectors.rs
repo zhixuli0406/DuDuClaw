@@ -66,7 +66,10 @@ const PROFILE_MAX_BYTES: u64 = 1024 * 1024;
 /// supply the spawnd work broker); absent producers withhold their grant.
 #[derive(Clone, Default)]
 pub(crate) struct SelectorSources {
-    /// Host-supplied broker (tests / host integration); latched per capability.
+    /// Test-only host broker double (`SharedEmployee::with_work_broker`,
+    /// `BootSources.work_broker`); wrapped per capability by the weaker
+    /// `run_broker::latched`, so it never exists in a production build.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) work_broker: Option<Arc<dyn WorkBroker>>,
     /// W1: production run-bound broker factory over the protected backend
     /// (`run_broker.rs`); used when no host broker is supplied.
@@ -76,30 +79,42 @@ pub(crate) struct SelectorSources {
 }
 
 impl SelectorSources {
-    /// Boot's producers: the host work broker if supplied, else W1's
-    /// run-bound brokers over the protected backend (none if the backend has
-    /// no readiness source), and the backend's readiness feature view
-    /// (`SpawndBackend::features`; no source reads as no features).
+    /// Boot's producers: W1's run-bound brokers over the protected backend
+    /// (none if the backend has no readiness source), and the backend's
+    /// readiness feature view (`SpawndBackend::features`; no source reads as
+    /// no features).
     #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
-    pub(crate) fn installed(home: &Path, work_broker: Option<Arc<dyn WorkBroker>>,
-        backend: Arc<duduclaw_execution::SpawndBackend>) -> Self {
-        let sources = Self::installed_over(home, work_broker,
-            Arc::new(super::run_broker::SpawndRunTransport::new(backend)));
-        super::run_broker::mark_installed(sources.work_broker.is_some() || sources.run_brokers.is_some());
+    pub(crate) fn installed(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>) -> Self {
+        let sources = Self::installed_over(home, Arc::new(super::run_broker::SpawndRunTransport::new(backend)));
+        super::run_broker::mark_installed(sources.run_brokers.is_some());
         sources
     }
     /// [`Self::installed`] over any transport (boot and W1 tests).
     #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
-    pub(crate) fn installed_over(home: &Path, work_broker: Option<Arc<dyn WorkBroker>>,
-        transport: Arc<dyn super::run_broker::RunWorkTransport>) -> Self {
-        let run_brokers = if work_broker.is_some() { None }
-            else { super::run_broker::RunBrokers::new(home, transport.clone()) };
-        Self { work_broker, run_brokers, spawnd_features: Some(Arc::new(move || transport.host_features())) }
+    pub(crate) fn installed_over(home: &Path, transport: Arc<dyn super::run_broker::RunWorkTransport>) -> Self {
+        let run_brokers = super::run_broker::RunBrokers::new(home, transport.clone());
+        Self { #[cfg(any(test, feature = "test-support"))] work_broker: None, run_brokers,
+            spawnd_features: Some(Arc::new(move || transport.host_features())) }
     }
-    /// A broker can be bound for this issuance: a host broker, or the
-    /// run-bound factory while spawnd advertises `work_broker`.
+    /// Test fixtures only: replace the run-bound factory with a host broker
+    /// double (`BootSources.work_broker`).
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
+    pub(crate) fn with_host_broker(mut self, broker: Arc<dyn WorkBroker>) -> Self {
+        self.work_broker = Some(broker);
+        self.run_brokers = None;
+        super::run_broker::mark_installed(true);
+        self
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    fn host_broker(&self) -> Option<&Arc<dyn WorkBroker>> { self.work_broker.as_ref() }
+    #[cfg(not(any(test, feature = "test-support")))]
+    fn host_broker(&self) -> Option<&Arc<dyn WorkBroker>> { None }
+    /// A broker can be bound for this issuance: the run-bound factory while
+    /// spawnd advertises `work_broker` (or a test host broker).
     fn broker_available(&self) -> bool {
-        self.work_broker.is_some() || self.run_brokers.as_ref().is_some_and(super::run_broker::RunBrokers::available)
+        self.host_broker().is_some()
+            || self.run_brokers.as_ref().is_some_and(super::run_broker::RunBrokers::available)
     }
     /// HX5 precondition of the helper workspace: a work broker is installed
     /// and spawnd advertises `helper_calls` now. Anything else ⇒ false.
@@ -144,7 +159,9 @@ pub(super) struct Selection {
 pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Result<Selection, VerificationError> {
     if input.task.is_some() && !input.record { return Err(VerificationError::Invalid); }
     let listed = |name: &str| input.tools.as_slice().iter().any(|tool| tool.as_str() == name);
-    let wants_files = sources.broker_available() && FILE_TOOLS.iter().any(|name| listed(*name));
+    // H9: the readiness view (`broker_available` reads spawnd's report) is
+    // only consulted when a file tool is listed.
+    let wants_files = FILE_TOOLS.iter().any(|name| listed(*name)) && sources.broker_available();
     // HX5: checked only when a helper tool is listed (no view read otherwise).
     let wants_helpers = IN_RUN_HELPER_TOOLS.iter().any(|name| listed(*name)) && sources.helper_calls();
     // D-H2: PublicOrigins exists only alongside EmployeeScope; a task-limited
@@ -196,10 +213,11 @@ impl Selection {
         resources: &mut Vec<ResourceGrant>, roots: &mut ResourceRoots) -> Result<(), VerificationError> {
         let employee: EmployeeId = lifecycle.employee;
         if self.workspace {
-            let broker = match (&sources.work_broker, &sources.run_brokers) {
+            let broker = match (sources.host_broker(), &sources.run_brokers) {
+                #[cfg(any(test, feature = "test-support"))]
                 (Some(broker), _) => super::run_broker::latched(broker.clone(), employee),
-                (None, Some(brokers)) => brokers.bind(&lifecycle.label, employee, lifecycle.incarnation),
-                (None, None) => return Err(VerificationError::Unavailable),
+                (_, Some(brokers)) => brokers.bind(&lifecycle.label, employee, lifecycle.incarnation),
+                (_, None) => return Err(VerificationError::Unavailable),
             };
             roots.insert_brokered(EMPLOYEE_WORK_ROOT.to_owned(), employee, broker)?;
             resources.push(ResourceGrant::Workspace {
@@ -236,7 +254,8 @@ impl Selection {
 /// The employee's current `agent.toml`, read without following symlinks from
 /// gateway-private state. Missing, unsafe (symlink, not regular, hard-linked,
 /// foreign owner, oversized), unreadable or malformed ⇒ `Unavailable`.
-fn read_profile(home: &Path, agent: &str) -> Result<duduclaw_core::types::AgentConfig, VerificationError> {
+/// Also read by readiness (`reasons::installed_tool_needs`).
+pub(crate) fn read_profile(home: &Path, agent: &str) -> Result<duduclaw_core::types::AgentConfig, VerificationError> {
     use std::os::{fd::{AsRawFd, FromRawFd}, unix::fs::MetadataExt};
     use nix::fcntl::{openat, OFlag};
     use nix::sys::stat::Mode;

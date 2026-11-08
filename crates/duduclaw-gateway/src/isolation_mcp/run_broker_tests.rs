@@ -21,12 +21,18 @@ const CONTROL_B: ControlConnectionId = ControlConnectionId([59; 16]);
 struct Transport {
     source: bool,
     host: AtomicU32,
+    /// Readiness-view reads (`host_features`), i.e. readiness I/O.
+    reads: AtomicU32,
     runs: Mutex<BTreeMap<RunId, RunTransport>>,
+    /// Reconnect the run on this connection right after the broker's lookup
+    /// (between its admit and the open).
+    reconnect: Mutex<Option<ControlConnectionId>>,
     opens: Mutex<Vec<(RunId, EmployeeId, String)>>,
 }
 impl Transport {
     fn new(source: bool, host: SpawndFeatures) -> Arc<Self> {
-        Arc::new(Self { source, host: AtomicU32::new(host.0), runs: Mutex::default(), opens: Mutex::default() })
+        Arc::new(Self { source, host: AtomicU32::new(host.0), reads: AtomicU32::new(0), runs: Mutex::default(),
+            reconnect: Mutex::default(), opens: Mutex::default() })
     }
     fn reserve(&self, run: RunId, employee: EmployeeId, control: ControlConnectionId, features: SpawndFeatures) {
         self.runs.lock().unwrap().insert(run, RunTransport { employee, control, features });
@@ -35,10 +41,25 @@ impl Transport {
 }
 impl RunWorkTransport for Transport {
     fn has_feature_source(&self) -> bool { self.source }
-    fn host_features(&self) -> SpawndFeatures { SpawndFeatures(self.host.load(Ordering::SeqCst)) }
-    fn run_transport(&self, run: RunHandle) -> Option<RunTransport> { self.runs.lock().unwrap().get(&run.0).copied() }
-    /// Reaching root answers `NotFound`, which no local refusal produces.
-    fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError> {
+    fn host_features(&self) -> SpawndFeatures {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        SpawndFeatures(self.host.load(Ordering::SeqCst))
+    }
+    fn run_transport(&self, run: RunHandle) -> Option<RunTransport> {
+        let mut runs = self.runs.lock().unwrap();
+        let view = runs.get(&run.0).copied();
+        if let (Some(control), Some(entry)) = (self.reconnect.lock().unwrap().take(), runs.get_mut(&run.0)) {
+            entry.control = control;
+        }
+        view
+    }
+    /// Like `SpawndBackend::open_work_file_on`: the run must still be on
+    /// `control`. Reaching root answers `NotFound`, which no local refusal produces.
+    fn open_work_file(&self, request: &WorkFileRequest<'_>, control: ControlConnectionId)
+        -> Result<BrokeredWorkFile, WorkBrokerError> {
+        if self.runs.lock().unwrap().get(&request.run()).is_none_or(|live| live.control != control) {
+            return Err(WorkBrokerError::NotLive);
+        }
         self.opens.lock().unwrap().push((request.run(), request.employee(), request.path().as_str().to_owned()));
         Err(WorkBrokerError::NotFound)
     }
@@ -86,7 +107,7 @@ fn w1_production_boot_installs_run_bound_work_broker() {
     let transport = Transport::new(true, SpawndFeatures::WORK_BROKER);
     transport.reserve(RUN_A, EMPLOYEE, CONTROL_A, SpawndFeatures::WORK_BROKER);
     // Boot's composition without a host broker: the run-bound factory.
-    let sources = SelectorSources::installed_over(dir.path(), None, transport.clone());
+    let sources = SelectorSources::installed_over(dir.path(), transport.clone());
     assert!(sources.work_broker.is_none(), "no shared broker handle is installed");
     let brokers = sources.run_brokers.clone().expect("run-bound brokers over the protected backend");
     // The issuer now selects the Workspace grant with the brokered root.
@@ -106,7 +127,7 @@ fn w1_production_boot_installs_run_bound_work_broker() {
     // The bridge cannot be built (backend without a readiness source): no
     // factory, no grant, no root.
     let dir = tempfile::tempdir().unwrap();
-    let sources = SelectorSources::installed_over(dir.path(), None, Transport::new(false, SpawndFeatures::WORK_BROKER));
+    let sources = SelectorSources::installed_over(dir.path(), Transport::new(false, SpawndFeatures::WORK_BROKER));
     assert!(sources.run_brokers.is_none() && sources.work_broker.is_none());
     let auth = issue(&employee(&dir).with_selector_sources(sources), &["file_read"]);
     assert!(!has_workspace(&auth) && !auth.roots.is_brokered(EMPLOYEE_WORK_ROOT));
@@ -131,7 +152,7 @@ fn w1_feature_source_comes_from_run_admission() {
     assert_eq!(open(broker.as_ref(), RUN_A, EMPLOYEE).unwrap_err(), WorkBrokerError::NotFound);
     assert_eq!(transport.opens().len(), 1);
     // The selectors' helper view is the same live readiness source.
-    let sources = SelectorSources::installed_over(Path::new("/home-w1"), None, transport.clone());
+    let sources = SelectorSources::installed_over(Path::new("/home-w1"), transport.clone());
     let view = sources.spawnd_features.as_ref().unwrap();
     assert!(view().contains(SpawndFeatures::HELPER_CALLS));
     transport.host.store(SpawndFeatures::NONE.0, Ordering::SeqCst);
@@ -143,7 +164,7 @@ fn w1_missing_feature_bit_keeps_tools_hidden_and_reports_reason() {
     let dir = tempfile::tempdir().unwrap();
     let transport = Transport::new(true, SpawndFeatures::HELPER_CALLS);
     let shared = employee(&dir).with_selector_sources(
-        SelectorSources::installed_over(dir.path(), None, transport.clone()));
+        SelectorSources::installed_over(dir.path(), transport.clone()));
     let names = ["file_read", "csv_read", "xlsx_read", "execute_program", "code_map", "office_script"];
     // spawnd lacks `work_broker` (older build): no grant, no root, so the file
     // tools and the in-run helpers (same grant) stay hidden.
@@ -207,13 +228,58 @@ fn w1_broker_never_shared_across_runs() {
     assert_eq!(open(second.as_ref(), RUN_B, EMPLOYEE).unwrap_err(), WorkBrokerError::NotLive);
     assert_eq!(transport.opens(), [(RUN_A, EMPLOYEE, "notes/a.txt".to_owned()),
         (RUN_B, EMPLOYEE, "notes/a.txt".to_owned())]);
-    // A host-supplied broker gets the same employee check and run latch.
+    // The test-only host double (`latched`, not in production builds) still
+    // gets an employee check and a first-run latch.
     let host = latched(Arc::new(RunBoundBroker { transport: transport.clone(), home: "/home-w1".into(),
         agent: LABEL.into(), identity: identity(Arc::new(Mutex::new(Some((EMPLOYEE, 0))))), employee: EMPLOYEE,
         incarnation: 0, run: OnceLock::new() }), EMPLOYEE);
     assert_eq!(open(host.as_ref(), RUN_B, EMPLOYEE).unwrap_err(), WorkBrokerError::NotFound);
     assert_eq!(open(host.as_ref(), RUN_A, EMPLOYEE).unwrap_err(), WorkBrokerError::NotLive);
     assert_eq!(open(host.as_ref(), RUN_B, other).unwrap_err(), WorkBrokerError::NotLive);
+}
+
+/// Security review item 2: the control connection the broker latched is the
+/// one the open must still be on. A reconnect between the broker's admit and
+/// the transport's own re-lookup is refused and nothing reaches root.
+#[test]
+fn w1_open_refused_when_control_connection_changed() {
+    let live = Arc::new(Mutex::new(Some((EMPLOYEE, 0))));
+    let transport = Transport::new(true, SpawndFeatures::WORK_BROKER);
+    let brokers = RunBrokers::with_identity(Path::new("/home-w1"), transport.clone(), identity(live)).unwrap();
+    transport.reserve(RUN_A, EMPLOYEE, CONTROL_A, SpawndFeatures::WORK_BROKER);
+    let broker = brokers.bind(LABEL, EMPLOYEE, 0);
+    // First open latches (RUN_A, CONTROL_A); the run reconnects right after
+    // admit, so the open (pinned to CONTROL_A) is refused.
+    *transport.reconnect.lock().unwrap() = Some(CONTROL_B);
+    assert_eq!(open(broker.as_ref(), RUN_A, EMPLOYEE).unwrap_err(), WorkBrokerError::NotLive);
+    assert!(transport.opens().is_empty(), "nothing reached root");
+    // The run is now on CONTROL_B: the latched broker refuses at admit too.
+    assert_eq!(open(broker.as_ref(), RUN_A, EMPLOYEE).unwrap_err(), WorkBrokerError::NotLive);
+    // Back on the latched connection the same broker serves it.
+    transport.reserve(RUN_A, EMPLOYEE, CONTROL_A, SpawndFeatures::WORK_BROKER);
+    assert_eq!(open(broker.as_ref(), RUN_A, EMPLOYEE).unwrap_err(), WorkBrokerError::NotFound);
+    assert_eq!(transport.opens().len(), 1);
+}
+
+/// Security review item 3 (H9 "no I/O when not needed"): a run listing no
+/// file or helper tool never reads the readiness view.
+#[test]
+fn w1_selector_without_file_or_helper_tools_does_no_readiness_io() {
+    use super::super::selectors::{select, SelectorInput};
+    let transport = Transport::new(true, SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_CALLS));
+    let sources = SelectorSources::installed_over(Path::new("/nonexistent-w1"), transport.clone());
+    let listed = tools(&["memory_search", "send_message"]);
+    let input = SelectorInput { home: Path::new("/nonexistent-w1"), agent: LABEL, user: "owner",
+        tools: &listed, task: None, record: false };
+    let selection = select(&sources, &input).unwrap();
+    assert!(!selection.workspace && !selection.helpers);
+    assert_eq!(transport.reads.load(Ordering::SeqCst), 0, "no readiness read without a file/helper tool");
+    // Reverse check: a listed file tool does consult it (the missing profile
+    // then fails the issuance closed).
+    let listed = tools(&["file_read"]);
+    let input = SelectorInput { tools: &listed, ..input };
+    assert!(select(&sources, &input).is_err());
+    assert!(transport.reads.load(Ordering::SeqCst) > 0);
 }
 
 #[test]

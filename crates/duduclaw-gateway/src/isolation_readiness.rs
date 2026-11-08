@@ -80,6 +80,11 @@ pub struct Readiness {
     /// F3, admins only: per-employee reasons (labels, no other identifiers).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub employees: Option<Vec<EmployeeReadiness>>,
+    /// W1, set only by [`report`]: host-wide work-broker / in-run helper
+    /// reasons that no protected employee's configured tool list needs right
+    /// now. Informational: they never make `status` `action_required`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notices: Option<Vec<Reason>>,
 }
 
 fn applies(linux: bool, protected: bool, team: bool) -> bool { linux && protected && team }
@@ -213,19 +218,31 @@ pub fn status() -> Option<Readiness> {
     if !REQUIRED.load(Ordering::Acquire) { return None; }
     let components = Components::current(spawnd_verified());
     Some(Readiness { required: true, ready: components.all_ready(), components,
-        status: None, reasons: None, employees: None })
+        status: None, reasons: None, employees: None, notices: None })
 }
 
 /// [`status`] plus the F3 reasons, for the dashboard. Blocking (SQLite and
 /// root ReadBack per employee): call on the blocking pool. Diagnosis only;
 /// it never admits anything. Employee labels are included for admins only.
 pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
-    let mut readiness = status()?;
-    let mut assessment = reasons::assess_installed(home);
-    // W1: host-wide work-broker / in-run helper reasons (live feature view).
-    assessment.reasons.extend(reasons::installed_feature_reasons());
-    readiness = with_assessment(readiness, assessment, admin);
-    Some(readiness)
+    let readiness = status()?;
+    let assessment = reasons::assess_installed(home);
+    // W1: host-wide work-broker / in-run helper reasons (live feature view),
+    // action-required only for tools some protected employee is configured with.
+    let needs = reasons::installed_tool_needs(home,
+        assessment.employees.iter().map(|employee| employee.label.as_str()));
+    Some(with_features(readiness, assessment, reasons::installed_feature_reasons(), needs, admin))
+}
+
+/// [`with_assessment`] after splitting the host-wide feature reasons by
+/// `needs`: the concerned ones join the reasons, the rest become notices.
+fn with_features(readiness: Readiness, mut assessment: reasons::Assessment, features: Vec<Reason>,
+    needs: reasons::ToolNeeds, admin: bool) -> Readiness {
+    let (action, notices) = needs.split(features);
+    assessment.reasons.extend(action);
+    let mut readiness = with_assessment(readiness, assessment, admin);
+    readiness.notices = (!notices.is_empty()).then_some(notices);
+    readiness
 }
 
 /// The assessment itself could not run (blocking task failed): fail closed.
@@ -357,7 +374,7 @@ mod tests {
     fn operator_payload_has_fixed_component_states_only() {
         let components = Components::current(false);
         let value = serde_json::to_value(Readiness { required: true, ready: false, components,
-            status: None, reasons: None, employees: None }).unwrap();
+            status: None, reasons: None, employees: None, notices: None }).unwrap();
         assert_eq!(value["required"], true);
         assert_eq!(value["ready"], false);
         assert_eq!(value["components"].as_object().unwrap().len(), 8);
@@ -375,7 +392,62 @@ mod tests {
     }
 
     fn base(components: Components) -> Readiness {
-        Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None, employees: None }
+        Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None,
+            employees: None, notices: None }
+    }
+
+    /// W1 follow-up: a host that publishes no helpers (and whose spawnd lacks
+    /// both bits) is not `action_required` while no protected employee's
+    /// configured tool list names a file/helper/recording tool; the reasons
+    /// are kept as informational notices. Once an employee is configured with
+    /// one, exactly the reasons that tool needs become action-required.
+    #[test]
+    fn w1_helper_reasons_informational_when_no_employee_uses_helper_tools() {
+        use duduclaw_isolation::ipc::SpawndFeatures;
+        use reasons::{feature_reasons, Assessment, ToolNeeds};
+        let features = || feature_reasons(Some(SpawndFeatures::NONE), true, Some(&[] as &[&str]));
+        let strings = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        assert_eq!(features().len(), 5, "broker + launcher + three runtimes");
+
+        // Default profiles (no explicit allowlist) and an allowlist without
+        // any such tool: nothing needs them.
+        for needs in [ToolNeeds::default(), ToolNeeds::from_lists(&[], &[]),
+            ToolNeeds::from_lists(&[], &strings(&["web_search", "send_message"])),
+            ToolNeeds::from_lists(&strings(&["file_read", "execute_program"]), &strings(&["file_read", "execute_program"]))] {
+            let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, true);
+            assert_eq!(readiness.status, Some(Overall::Ready), "{needs:?}");
+            assert_eq!(readiness.reasons, Some(vec![]));
+            assert_eq!(readiness.notices.as_ref().map(Vec::len), Some(5));
+            let value = serde_json::to_value(&readiness).unwrap();
+            assert_eq!(value["status"], "ready");
+            assert!(value["notices"].as_array().unwrap().contains(&serde_json::json!({"code": "workspace_broker_unavailable"})));
+        }
+
+        // One employee configured with `execute_program`: the broker, the
+        // launcher and the program runtime need action; the others stay notices.
+        let needs = ToolNeeds::default().union(ToolNeeds::from_lists(&[], &strings(&["execute_program"])));
+        let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, true);
+        assert_eq!(readiness.status, Some(Overall::ActionRequired));
+        let action = readiness.reasons.unwrap();
+        assert!(action.contains(&Reason::WorkspaceBrokerUnavailable));
+        assert!(action.contains(&Reason::HelperLauncherUnavailable { reason: "spawnd_feature_missing" }));
+        assert!(action.contains(&Reason::HelperRuntimeMissing { runtime: "duduclaw-program-v1" }));
+        let notices = readiness.notices.unwrap();
+        assert!(notices.contains(&Reason::HelperRuntimeMissing { runtime: "duduclaw-code-map-v1" }));
+        assert!(notices.contains(&Reason::HelperRuntimeMissing { runtime: "duduclaw-office-*-v1" }));
+
+        // File tools only: broker only.
+        let needs = ToolNeeds::from_lists(&[], &strings(&["csv_read"]));
+        assert_eq!(needs.split(features()).0, vec![Reason::WorkspaceBrokerUnavailable]);
+        // Recording tools need the helper launcher.
+        let needs = ToolNeeds::from_lists(&[], &strings(&["browser_record_start"]));
+        assert_eq!(needs.split(features()).0, vec![Reason::HelperLauncherUnavailable { reason: "spawnd_feature_missing" }]);
+        // Fail closed: an unreadable profile counts as needing everything.
+        let readiness = with_features(base(all_ready()), Assessment::default(), features(), ToolNeeds::ALL, true);
+        assert_eq!(readiness.status, Some(Overall::ActionRequired));
+        assert!(readiness.notices.is_none());
+        // Non-feature reasons are never demoted.
+        assert!(ToolNeeds::default().concerns(&Reason::Revoked));
     }
 
     #[test]

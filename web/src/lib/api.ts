@@ -347,11 +347,17 @@ export type EditionProfile = 'personal' | 'enterprise';
 
 export type IsolationComponentState = 'ready' | 'unavailable' | 'pending_integration';
 export type IsolationReasonCode = 'binding_evidence_missing' | 'connector_setup_required' |
-  'personal_binding_conflict' | 'revoked' | 'service_unavailable';
+  'personal_binding_conflict' | 'revoked' | 'service_unavailable' |
+  'workspace_broker_unavailable' | 'helper_launcher_unavailable' | 'helper_runtime_missing' |
+  'helper_recording_unsupported';
 export interface IsolationReason {
   code: IsolationReasonCode;
   /** Connector provider family (only for `connector_setup_required`). */
   provider?: string;
+  /** Fixed launcher reason code (only for `helper_launcher_unavailable`). */
+  reason?: string;
+  /** Fixed helper runtime id (only for `helper_runtime_missing`). */
+  runtime?: string;
 }
 export interface IsolationReadiness {
   required: boolean;
@@ -363,6 +369,8 @@ export interface IsolationReadiness {
   reasons?: IsolationReason[];
   /** Admins only: per-employee reasons. */
   employees?: Array<{ label: string; ready: boolean; reasons: IsolationReason[] }>;
+  /** Informational host-wide reasons no protected employee's tools need now. */
+  notices?: IsolationReason[];
   correlation_id?: string;
   components: Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
     'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', IsolationComponentState>;

@@ -14,7 +14,9 @@
 //!   then requires exact equality of all four (request employee, live
 //!   incarnation, run, control connection) plus the `work_broker` bit of that
 //!   run's admission, before H5's `SpawndWorkspaceBridge` sends `OpenWorkFile`
-//!   on that same connection. A broker is reachable only through the
+//!   on that same connection: the latched control id is handed to the open
+//!   (`SpawndBackend::open_work_file_on`), which refuses `NotLive` when the
+//!   run's connection is no longer that one. A broker is reachable only through the
 //!   `ResourceRoots` of the one authorization that minted it; another run (or
 //!   a later run of the same employee) is refused even if it obtained it.
 //! * Fail closed: no backend, no feature source, a readiness view without
@@ -35,8 +37,10 @@ pub(crate) trait RunWorkTransport: Send + Sync {
     fn host_features(&self) -> SpawndFeatures;
     /// The run's own control connection as this backend reserved it.
     fn run_transport(&self, run: RunHandle) -> Option<duduclaw_execution::spawnd::RunTransport>;
-    /// H5 `OpenWorkFile` on `request.run()`'s own control connection.
-    fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError>;
+    /// H5 `OpenWorkFile` on `request.run()`'s own control connection, only
+    /// while that connection is still `control` (else `NotLive`, nothing sent).
+    fn open_work_file(&self, request: &WorkFileRequest<'_>, control: ControlConnectionId)
+        -> Result<BrokeredWorkFile, WorkBrokerError>;
 }
 
 /// [`RunWorkTransport`] over the protected backend and H5's bridge.
@@ -55,8 +59,9 @@ impl RunWorkTransport for SpawndRunTransport {
     fn run_transport(&self, run: RunHandle) -> Option<duduclaw_execution::spawnd::RunTransport> {
         self.backend.run_transport(run)
     }
-    fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError> {
-        self.bridge.open_work_file(request)
+    fn open_work_file(&self, request: &WorkFileRequest<'_>, control: ControlConnectionId)
+        -> Result<BrokeredWorkFile, WorkBrokerError> {
+        self.bridge.open_on_control(request, control)
     }
 }
 
@@ -121,7 +126,8 @@ struct RunBoundBroker {
 }
 
 impl RunBoundBroker {
-    fn admit(&self, request: &WorkFileRequest<'_>) -> Result<(), WorkBrokerError> {
+    /// The latched control connection the open must still be on.
+    fn admit(&self, request: &WorkFileRequest<'_>) -> Result<ControlConnectionId, WorkBrokerError> {
         if request.employee() != self.employee { return Err(WorkBrokerError::NotLive); }
         if (self.identity)(&self.home, &self.agent) != Some((self.employee, self.incarnation)) {
             return Err(WorkBrokerError::NotLive);
@@ -132,23 +138,32 @@ impl RunBoundBroker {
         if !live.features.contains(SpawndFeatures::WORK_BROKER) { return Err(WorkBrokerError::Unavailable); }
         let bound = *self.run.get_or_init(|| (request.run(), live.control));
         if bound != (request.run(), live.control) { return Err(WorkBrokerError::NotLive); }
-        Ok(())
+        Ok(bound.1)
     }
 }
 
 impl WorkBroker for RunBoundBroker {
     fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError> {
-        self.admit(request)?;
-        self.transport.open_work_file(request)
+        let control = self.admit(request)?;
+        // The open re-looks the run up; it must still be on the latched
+        // connection (a reconnect between admit and send is refused).
+        self.transport.open_work_file(request, control)
     }
 }
 
-/// A host-supplied `BootSources.work_broker` (tests, host integration) gets
-/// the same per-capability employee check and first-run latch.
+/// Test fixtures only (`BootSources.work_broker` / `SharedEmployee::
+/// with_work_broker` doubles): a per-capability employee check and first-run
+/// latch. Deliberately weaker than [`RunBoundBroker`] (no incarnation pin, no
+/// control-connection latch, no per-run `work_broker` bit, and the latch is
+/// set before the inner broker accepts), so it is not compiled into
+/// production builds.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn latched(inner: Arc<dyn WorkBroker>, employee: EmployeeId) -> Arc<dyn WorkBroker> {
     Arc::new(Latched { inner, employee, run: OnceLock::new() })
 }
+#[cfg(any(test, feature = "test-support"))]
 struct Latched { inner: Arc<dyn WorkBroker>, employee: EmployeeId, run: OnceLock<RunId> }
+#[cfg(any(test, feature = "test-support"))]
 impl WorkBroker for Latched {
     fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError> {
         if request.employee() != self.employee || *self.run.get_or_init(|| request.run()) != request.run() {
@@ -158,7 +173,7 @@ impl WorkBroker for Latched {
     }
 }
 
-/// Boot installed a broker producer (run-bound factory or host broker).
+/// Boot installed a broker producer (run-bound factory, or a test host broker).
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 pub(crate) fn mark_installed(installed: bool) { if installed { INSTALLED.store(true, Ordering::Release); } }
 /// Readiness: whether boot installed a work broker producer.

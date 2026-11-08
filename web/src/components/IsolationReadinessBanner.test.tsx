@@ -197,6 +197,39 @@ describe('IsolationReadinessBanner', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it.each([
+    [{ code: 'workspace_broker_unavailable' as const },
+      'The file access service is not ready yet, so AI employees can’t read files in their work folder for now.'],
+    [{ code: 'helper_launcher_unavailable' as const, reason: 'spawnd_feature_missing' },
+      'The program run service is not ready yet, so AI employees can’t run programs, analyze code or work on Office documents for now.'],
+    [{ code: 'helper_runtime_missing' as const, runtime: 'duduclaw-program-v1' },
+      'A component needed for running programs is not installed, so AI employees can’t use it for now.'],
+    [{ code: 'helper_runtime_missing' as const, runtime: 'duduclaw-code-map-v1' },
+      'A component needed for code analysis is not installed, so AI employees can’t use it for now.'],
+    [{ code: 'helper_runtime_missing' as const, runtime: 'duduclaw-office-*-v1' },
+      'A component needed for Office document work is not installed, so AI employees can’t use it for now.'],
+    [{ code: 'helper_runtime_missing' as const, runtime: 'duduclaw-unknown-v9' },
+      'A component some AI employee features need is not installed, so those features can’t be used for now.'],
+    [{ code: 'helper_recording_unsupported' as const },
+      'Browser recording isn’t supported on this computer yet, so AI employees can’t record browser sessions for now.'],
+  ])('explains file and helper readiness in plain language: %o', (reason, message) => {
+    setReadiness({ ...readiness(), ready: true, status: 'action_required', reasons: [reason] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByText(message, { selector: 'li' })).toBeInTheDocument();
+    const alert = screen.getByRole('alert');
+    for (const internal of ['spawnd', 'duduclaw-', 'broker', 'runtime', 'helper']) {
+      expect(alert).not.toHaveTextContent(internal);
+    }
+    expect(screen.getByRole('link', { name: 'View service status' })).toHaveAttribute('href', '/app/system/security');
+  });
+
+  it('does not show informational notices on their own', () => {
+    setReadiness({ ...readiness(), ready: true, status: 'ready', reasons: [],
+      notices: [{ code: 'workspace_broker_unavailable' }, { code: 'helper_runtime_missing', runtime: 'duduclaw-code-map-v1' }] });
+    const { container } = renderWithProviders(<IsolationReadinessBanner />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it('preserves the legacy description when reasons are absent', () => {
     renderWithProviders(<IsolationReadinessBanner />);
     expect(screen.getByRole('alert')).toHaveTextContent('Required isolation services are not ready.');

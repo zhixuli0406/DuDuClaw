@@ -143,6 +143,26 @@ fn w1_feature_source_comes_from_run_admission() {
     assert!(nothing_sent(&peer));
 }
 
+/// W1: an open pinned to the control connection a run broker latched is
+/// refused (`NotLive`, nothing sent, run not fenced) once the run handle maps
+/// to another connection; on the latched connection it is sent as usual.
+#[test]
+fn w1_open_refused_when_control_connection_changed() {
+    let (backend, entry, peer) = fixture(advertised(&["work_broker"]));
+    let mut other = entry.connection.id;
+    other.0[0] ^= 0xff;
+    assert_eq!(backend.open_work_file_on(RUN, Some(other), EMPLOYEE, "a.txt", u64::MAX).unwrap_err(),
+        WorkFileError::NotLive);
+    assert!(nothing_sent(&peer));
+    assert!(!entry.connection.is_closed(), "refusing locally must not fence the run");
+    // The latched connection itself: the op reaches root.
+    let worker = root(peer, |_| (SpawnResponse::Error { code: ErrorCode::WorkFileNotFound }, vec![]));
+    assert_eq!(backend.open_work_file_on(RUN, Some(entry.connection.id), EMPLOYEE, "a.txt", u64::MAX).unwrap_err(),
+        WorkFileError::NotFound);
+    let SpawnRequest::OpenWorkFile { run, employee_id, .. } = worker.join().unwrap() else { panic!("not a work op") };
+    assert_eq!((run, employee_id), (RUN, EMPLOYEE));
+}
+
 #[test]
 fn h5_bridge_validates_reply_and_single_fd() {
     // Accepted: exactly one sealed read-only memfd whose fstat equals the reply.
