@@ -2539,7 +2539,8 @@ impl CapabilitiesConfig {
     /// - (Daybreak round 2 #2) a `scoped_tools` entry covering one, wildcards
     ///   included: a scoped tool needs an active task grant, and no grant
     ///   context exists at spawn, so the native family is restricted
-    ///   (conservative);
+    ///   (conservative). A server-qualified `mcp__<server>__…` entry names
+    ///   MCP tools only and never restricts a native family;
     /// - (Daybreak round 2 #3/#4) a `policy` that speaks about the native
     ///   tools — some rule's selector names a native shell / write tool, its
     ///   canonical family (`shell_exec` / `fs_write`), `*`, or is not a plain
@@ -2619,6 +2620,16 @@ impl CapabilitiesConfig {
             ("scoped_tools", &self.scoped_tools),
         ] {
             for entry in list {
+                // A server-qualified entry (`mcp__duduclaw__*`, `mcp__x__foo`,
+                // `mcp__duduclaw`) names MCP tools, never a native CLI tool.
+                // `tool_entry_matches` reads a bare native name (`Bash`) as a
+                // duduclaw tool, so without this `mcp__duduclaw__*` would
+                // restrict every native family. Same prefix test as
+                // `tool_catalog::split_tool_ref`; the matcher itself is
+                // unchanged. (Approval lists keep the broader reading.)
+                if key == "scoped_tools" && base(entry).starts_with("mcp__") {
+                    continue;
+                }
                 if write_entry(entry) {
                     push(&mut out.no_write, format!("{key}: `{}`", entry.trim()));
                 }
@@ -3408,8 +3419,16 @@ mod sandbox_level_tests {
             let n = c.native_tool_constraints();
             assert!(n.needs_read_only() && !n.needs_no_shell(), "{c:?}: {n:?}");
         }
-        // MCP-only scoped entries leave the native tools alone.
-        for c in [scoped(&["mail_send"]), scoped(&["mcp__duduclaw__*"]), scoped(&["memory_*"]), scoped(&["team_handoff"])] {
+        // MCP-only scoped entries leave the native tools alone — a
+        // server-qualified entry names MCP tools, never a native CLI tool.
+        for c in [
+            scoped(&["mail_send"]),
+            scoped(&["mcp__duduclaw__*"]),
+            scoped(&["mcp__duduclaw"]),
+            scoped(&["mcp__other__Bash"]),
+            scoped(&["memory_*"]),
+            scoped(&["team_handoff"]),
+        ] {
             assert!(c.native_tool_constraints().is_empty(), "{c:?}");
         }
     }
