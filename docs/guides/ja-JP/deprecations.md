@@ -234,11 +234,11 @@ OS ユーザーの CLI 設定に追加された許可ルールは自動削除し
 
 MFAフェーズ1では `/api/login` と `/api/otp/verify` に条件付き応答を追加します。未登録かつ非強制の場合は従来の `access_token`、`refresh_token`、`user` を維持します。登録済みなら `mfa_required`、`challenge_id` のみ、強制中の未登録なら `mfa_enrollment_required`、`enrollment_token` のみです。クライアントは `/api/mfa/verify` または `/api/mfa/enroll/*` を完了してからログイン成功と判断してください。既存端点は削除せず、Dashboardは次フェーズで対応します。
 
-## 非推奨の音声設定
+## v1.81.0 で削除
 
-| 非推奨の値 | 開始 | 削除 | 動作と移行先 |
-|---|---|---|---|
-| `edge-tts`、`edge` | v1.79.0 | v1.81.0 | 設定値は受け付けますが `auto` として扱い、プロセスごとに一度警告します。旧実装は削除済みです。ローカル Kokoro または公式 Azure AI Speech REST を選択してください。 |
+### 音声プロバイダー設定
+
+`edge-tts` と `edge` の互換値は受け付けなくなりました。既存設定にどちらかが残っている場合、TTS は利用不可となり、プロセスごとに一度だけ警告します。代わりに `kokoro` を選択してください。`system.update_config` も削除済みの値を拒否します。
 
 ## 外部 MCP の環境変数資格情報
 
