@@ -272,8 +272,12 @@ fn shared_employee_cannot_use_personal_connector_even_with_forged_grant() {
 
 #[test]
 fn high_risk_tools_are_never_classified_as_plain_gateway_services() {
-    for name in ["code_map", "codrive_run", "execute_program", "fork_run", "spawn_agent", "os_open"] {
+    for name in ["codrive_run", "fork_run", "spawn_agent", "os_open"] {
         assert_eq!(policy(name).unwrap().route, Route::Execution);
+    }
+    // HX5: in-run helpers run inside the employee's run, never as plain gateway services.
+    for name in ["code_map", "execute_program", "office_script"] {
+        assert_eq!(policy(name).unwrap().route, Route::InRunHelper, "{name}");
     }
     for name in ["transcribe_audio", "model_load", "llamafile_start"] {
         assert_eq!(policy(name).unwrap().route, Route::Worker);
