@@ -404,6 +404,14 @@ async fn spawn_telegram_bot(
     ctx: Arc<ReplyContext>,
     _home_dir: &Path,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // F6h (H5, A11): in protected mode an employee's own bot needs a live
+    // lifecycle and an active channel route; unchanged otherwise.
+    if let Some(agent) = &agent_name {
+        if !crate::isolation_label_stores::channel_bot_allowed(_home_dir, agent, "telegram").await {
+            warn!(agent = %agent, "per-agent Telegram bot not started: no live protected lifecycle or channel route");
+            return None;
+        }
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
         .build()

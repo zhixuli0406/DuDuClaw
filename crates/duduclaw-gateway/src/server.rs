@@ -594,6 +594,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Validate the installation policy after a possible restore and before runtime startup.
     crate::product_policy::load(&home_dir).map_err(duduclaw_core::error::DuDuClawError::Config)?;
     crate::runtime_readiness::log_startup_missing(&home_dir);
+    // F6h: memory namespace writer gate (a no-op outside protected mode).
+    crate::isolation_label_stores::install_memory_gate();
     crate::data_exports::initialize(&home_dir)
         .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
     {

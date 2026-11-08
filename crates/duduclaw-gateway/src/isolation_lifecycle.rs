@@ -485,6 +485,9 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
             quarantine::replace_fence_group(&mut db, employee, incarnation, group, &members).map_err(|_| Unavailable)?;
         }
     }
+    // F6h (§3.2 step 4, S9): strip global routes to the label, pause its
+    // work, record store marks; failures become `stores:` fences.
+    let label_stores = crate::isolation_label_stores::tombstone_effects(home, label, employee, incarnation);
     let row = {
         let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
         quarantine::read_quarantine(&db, employee, incarnation).map_err(|_| Unavailable)?.ok_or(Unavailable)?
@@ -507,7 +510,7 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
         "label": label, "employee": hex::encode(employee.0), "incarnation": incarnation,
         "seal": outcome.seal, "digest_prefix": outcome.digest_prefix, "routes_revoked": outcome.routes_revoked,
         "pending_fences": outcome.pending_fences, "runs_stopped": outcome.runs_stopped,
-        "stripped": stripped.to_value(), "users_removed": users.is_ok(),
+        "stripped": stripped.to_value(), "users_removed": users.is_ok(), "label_stores": label_stores,
     });
     let severity = if users.is_ok() && outcome.pending_fences.is_empty() {
         duduclaw_security::audit::Severity::Info

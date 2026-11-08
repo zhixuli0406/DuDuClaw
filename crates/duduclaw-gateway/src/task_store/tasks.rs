@@ -751,6 +751,8 @@ pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
 /// P2-A C7: a task whose `parent_task_id` lies inside a stop request's tree is
 /// refused — an employee cannot open new sub-tasks under a stopped run.
 pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), String> {
+    // F6h writer gate (protected mode only): no task for a tombstoned label.
+    crate::isolation_label_stores::check_label_writable_at(conn, &row.assigned_to)?;
     for contract in [&row.team_spec_json, &row.discovery_spec_json, &row.criteria_ledger,
         &row.acceptance_criteria_baseline].into_iter().flatten()
     {

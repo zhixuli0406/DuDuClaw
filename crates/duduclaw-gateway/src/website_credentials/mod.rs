@@ -344,5 +344,56 @@ pub fn delete(home: &Path, id: &str) -> Result<bool, String> {
     })
 }
 
+// ── F6h (isolation_label_stores, §3.3): grants keyed by one label ──
+
+/// Records granting `agent` (exact label). A missing store is 0; an
+/// unreadable one is `Err`, never zero.
+pub(crate) fn agent_grant_count(home: &Path, agent: &str) -> Result<u64, String> {
+    Ok(list(home)?.iter().filter(|m| m.allowed_agents.iter().any(|a| a == agent)).count() as u64)
+}
+
+/// Remove `agent` from every grant list under the store lock, re-sealing the
+/// changed records. A record granted to nobody else is deleted (an empty
+/// grant list is not a valid record); the admin re-creates it. Returns the
+/// credential labels (never a username or password).
+pub(crate) fn strip_agent(home: &Path, agent: &str) -> Result<Vec<String>, String> {
+    if matches!(std::fs::symlink_metadata(path(home)), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(Vec::new());
+    }
+    modify(home, |store, records| {
+        if !records.iter().any(|r| r.metadata.allowed_agents.iter().any(|a| a == agent)) { return Ok(Vec::new()); }
+        let engine = read_engine(home).ok_or(UNAVAILABLE)?;
+        let mut kept = Vec::with_capacity(records.len());
+        let mut labels = Vec::new();
+        for record in &records {
+            if !record.metadata.allowed_agents.iter().any(|a| a == agent) {
+                kept.push(None);
+                continue;
+            }
+            labels.push(record.metadata.label.clone());
+            let mut metadata = record.metadata.clone();
+            metadata.allowed_agents.retain(|a| a != agent);
+            if metadata.allowed_agents.is_empty() { kept.push(Some(None)); continue; }
+            metadata.updated_at = chrono::Utc::now().to_rfc3339();
+            let envelope = SealedRecord { purpose: "website_credentials/v1".into(),
+                record: SecretRecord { metadata, password: record.password.clone() } };
+            let plain = Zeroizing::new(serde_json::to_string(&envelope).map_err(|_| UNAVAILABLE)?);
+            kept.push(Some(Some(engine.encrypt_string(&plain).map_err(|_| UNAVAILABLE)?)));
+        }
+        // `None` keeps the stored ciphertext; `Some(None)` drops the record.
+        let mut next = Vec::with_capacity(store.records.len());
+        for (sealed, change) in store.records.drain(..).zip(kept) {
+            match change {
+                None => next.push(sealed),
+                Some(Some(resealed)) => next.push(resealed),
+                Some(None) => {}
+            }
+        }
+        store.records = next;
+        labels.sort();
+        Ok(labels)
+    })
+}
+
 #[cfg(test)]
 mod tests;

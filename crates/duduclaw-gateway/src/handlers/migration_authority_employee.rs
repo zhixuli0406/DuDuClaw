@@ -15,6 +15,8 @@ impl EmployeeAuthority {
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
         if item.fields.iter().any(|f| !matches!(f.name.as_str(),"employee_id"|"disk_bytes"|"settings"|"binding_kind"|"owner_id"|"tenant_id"))
             || !duduclaw_core::is_valid_agent_id(&spec.label) || duduclaw_core::is_reserved_agent_id(&spec.label) {return Err(Error::Denied);}
+        // F6h R7: approval and apply refuse a label held by a quarantine row (LABEL_QUARANTINED).
+        crate::isolation_label_stores::check_label_not_quarantined(&self.home,&spec.label,None).map_err(label_hold_error)?;
         // Personal owner eligibility / Shared tenant pin, against users.db and apply.db.
         lifecycle::validate_proposed_binding(&self.home,&spec.label,spec.binding.as_ref()).map_err(lifecycle_error)?;
         let expected:serde_json::Value=serde_json::from_str(text(item,"settings")?).map_err(|_|Error::Invalid)?;
@@ -84,6 +86,9 @@ pub(crate) fn save_confirmed_receipt(home:&Path,item:&ConfirmationItem,receipt:&
             }
         }
         Ok(())
+}
+fn label_hold_error(e:crate::isolation_label_stores::GateRefusal)->Error {
+    match e { crate::isolation_label_stores::GateRefusal::Unavailable=>Error::Storage, _=>Error::Denied }
 }
 fn lifecycle_error(e:LifecycleError)->Error {
     match e {

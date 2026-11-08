@@ -62,6 +62,10 @@ pub mod isolation_readiness;
 #[allow(dead_code)]
 pub(crate) mod isolation_lifecycle;
 pub(crate) mod isolation_quarantine;
+// F6h: label-keyed stores registry, writer gate, route pause, bot gate.
+// Purge / re-key entry points are consumed by F6i / F6g (not yet merged).
+#[allow(dead_code)]
+pub(crate) mod isolation_label_stores;
 pub mod migration_import;
 pub mod migration_startup;
 

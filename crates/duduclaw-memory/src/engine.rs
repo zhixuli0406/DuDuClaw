@@ -1965,6 +1965,7 @@ impl SqliteMemoryEngine {
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
         verify()?;
         Self::in_immediate_txn(&conn, || {
             verify()?;
@@ -4483,6 +4484,7 @@ impl MemoryEngine for SqliteMemoryEngine {
         let entry = mask_memory_entry(entry);
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
         // M1 moat-gate: reject once the Cloud paid-tier quota is hit. No-op when
         // unlimited (quota 0). Runs before any write so a rejection loses nothing.
         self.enforce_quota(&conn)?;
@@ -4951,6 +4953,7 @@ impl SqliteMemoryEngine {
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 

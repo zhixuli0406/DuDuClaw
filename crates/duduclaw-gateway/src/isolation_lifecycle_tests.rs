@@ -684,3 +684,7 @@ mod readiness_reasons;
 /// F6a/F6b: incarnation, schema and the sealing tombstone.
 #[path = "isolation_lifecycle_f6_tests.rs"]
 mod f6;
+
+/// F6h: channel bot gate and the tombstone label-store hook.
+#[path = "isolation_label_stores_lifecycle_tests.rs"]
+mod f6h;

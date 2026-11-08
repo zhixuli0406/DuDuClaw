@@ -1,0 +1,478 @@
+//! F6h (design r5 §3.3, §3.10 step 7, §3.12): the label-keyed stores
+//! registry, the writer gate on every writer path, the global route pause
+//! and the R7 proposal refusal, against the real stores in a private home.
+//! The lifecycle-dependent tests (bot gate, tombstone) are in
+//! `isolation_label_stores_lifecycle_tests.rs` (a child of the lifecycle
+//! test module, which owns the confirmed-employee fixtures).
+use super::*;
+use crate::isolation_quarantine as quarantine;
+use std::collections::BTreeSet;
+
+const LABEL: &str = "alice-desk";
+const OTHER: &str = "bob-desk";
+const NOW: &str = "2026-11-08T00:00:00Z";
+
+/// Protected mode forced on (or off) for this thread while the guard lives.
+struct Mode;
+impl Mode {
+    fn protected(on: bool) -> Self { TEST_PROTECTED.with(|cell| cell.set(Some(on))); Mode }
+}
+impl Drop for Mode {
+    fn drop(&mut self) { TEST_PROTECTED.with(|cell| cell.set(None)); }
+}
+
+fn private_home() -> tempfile::TempDir { crate::fs_safe::private_test_home().unwrap() }
+
+fn private_dir(path: &Path) {
+    #[cfg(unix)]
+    { use std::os::unix::fs::DirBuilderExt; std::fs::DirBuilder::new().mode(0o700).create(path).unwrap(); }
+    #[cfg(not(unix))]
+    std::fs::create_dir(path).unwrap();
+}
+
+fn apply_db(home: &Path) -> Connection {
+    let dir = home.join(APPLY_DIR);
+    if !dir.exists() { private_dir(&dir); }
+    let db = Connection::open(dir.join(APPLY_DB)).unwrap();
+    quarantine::ensure_employee_schema(&db).unwrap();
+    db
+}
+
+fn quarantine_row(home: &Path, label: &str, employee: u8, seal: &'static str) {
+    let db = apply_db(home);
+    assert!(quarantine::insert_quarantine(&db, &quarantine::NewQuarantine {
+        employee: EmployeeId([employee; 16]), incarnation: 0, label, owner: None, tenant: "tenant-a",
+        quarantined_at: 1, root: None, seal, principal_snapshot: &json!({"kind": "shared"}), stripped: &json!({}),
+    }).unwrap());
+}
+
+fn set_seal(home: &Path, label: &str, seal: &str) {
+    apply_db(home).execute("UPDATE employee_quarantine SET seal=?1 WHERE label=?2", params![seal, label]).unwrap();
+}
+
+/// Create every SQLite store through its real constructor (schemas only).
+fn real_stores(home: &Path) {
+    duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db")).unwrap();
+    crate::session::SessionManager::new(&home.join("sessions.db")).unwrap();
+    crate::task_store::TaskStore::open(home).unwrap();
+    crate::cron_store::CronStore::open(home).unwrap();
+}
+
+fn memory_entry(label: &str) -> duduclaw_core::types::MemoryEntry {
+    duduclaw_core::types::MemoryEntry {
+        id: uuid::Uuid::new_v4().to_string(), agent_id: label.to_owned(), content: format!("{label} remembers"),
+        timestamp: chrono::Utc::now(), tags: vec![], embedding: None,
+        layer: duduclaw_core::types::MemoryLayer::Episodic, importance: 5.0, access_count: 0,
+        last_accessed: None, source_event: "f6h_test".to_owned(),
+    }
+}
+
+fn task_row(id: &str, label: &str) -> crate::task_store::TaskRow {
+    crate::task_store::TaskRow::new(id.to_owned(), "report".into(), String::new(), "medium".into(), label.into(), "system".into())
+}
+
+fn cron_row(id: &str, label: &str) -> crate::cron_store::CronTaskRow {
+    crate::cron_store::CronTaskRow::new(id.to_owned(), format!("{id}-name"), label.into(), "0 * * * *".into(), "report".into())
+}
+
+/// One row under `label` in every SQLite store, through the real writers.
+async fn seed(home: &Path, label: &str) {
+    use duduclaw_core::traits::MemoryEngine;
+    let memory = duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db")).unwrap();
+    memory.store(label, memory_entry(label)).await.unwrap();
+    let sessions = crate::session::SessionManager::new(&home.join("sessions.db")).unwrap();
+    let session = format!("webchat:{label}");
+    sessions.get_or_create(&session, label).await.unwrap();
+    sessions.append_message(&session, "user", "hello", 1).await.unwrap();
+    crate::task_store::TaskStore::open(home).unwrap().insert_task(&task_row(&format!("task-{label}"), label)).await.unwrap();
+    crate::cron_store::CronStore::open(home).unwrap().insert(&cron_row(&format!("cron-{label}"), label)).await.unwrap();
+}
+
+/// Config-map entries: `label` in org.toml (reporting to nobody), `other`
+/// reporting to `label`, a channel binding and a bind token to `label`, a
+/// website credential shared with `other` and one granted to `label` only.
+fn seed_config(home: &Path, label: &str, other: &str) {
+    use duduclaw_core::org_store::{self as org, OrgEntry};
+    org::with_org_lock(home, |guard| {
+        org::upsert(guard, label, OrgEntry::new("", "sales"))?;
+        org::upsert(guard, other, OrgEntry::new(label, "sales"))?;
+        Ok(())
+    }).unwrap();
+    let bindings = json!({
+        "bindings": {"telegram": {"u1": label, "u2": other}},
+        "tokens": {"d1": {"token_sha256": "d1", "channel": "telegram", "agent_id": label,
+            "expires_at": "2099-01-01T00:00:00Z", "max_uses": 1, "used": 0}},
+    });
+    let path = home.join("agent_bindings.json");
+    std::fs::write(&path, bindings.to_string()).unwrap();
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap(); }
+    for (name, agents) in [("crm", vec![label.to_owned(), other.to_owned()]), ("erp", vec![label.to_owned()])] {
+        crate::website_credentials::upsert(home, crate::website_credentials::Upsert {
+            id: None, label: name.into(), login_url: format!("https://{name}.example.test/login"), allowed_paths: vec![],
+            username: "svc".into(), password: "secret-password".into(), allowed_agents: agents,
+        }, "admin-1").unwrap();
+    }
+}
+
+fn store(name: &str) -> &'static LabelStore {
+    LABEL_KEYED_STORES.iter().find(|store| store.name == name).unwrap()
+}
+
+fn sqlite_stores() -> impl Iterator<Item = &'static LabelStore> {
+    LABEL_KEYED_STORES.iter().filter(|store| matches!(store.backend, Backend::Sqlite { .. }))
+}
+
+/// Home databases the real constructors create that hold no agent label.
+const NOT_LABEL_KEYED_DBS: [&str; 0] = [];
+/// Config maps keyed by agent label (§3.3, S9) and where they live.
+const KNOWN_AGENT_KEYED_CONFIG: [&str; 3] = ["org.toml", "secrets/website_credentials.enc", "agent_bindings.json"];
+/// Columns whose name mentions an agent but hold no label.
+const NOT_A_LABEL: [&str; 1] = ["agent_seconds"];
+
+/// S9: one registry; every §3.3 row and every agent-keyed config map is an
+/// entry, every database the stores create is registered, and a schema scan
+/// finds no agent/label column the store operations would miss.
+#[test]
+fn label_keyed_stores_registry_complete() {
+    let dir = private_home();
+    let home = dir.path();
+    real_stores(home);
+    let names: BTreeSet<&str> = LABEL_KEYED_STORES.iter().map(|store| store.name).collect();
+    assert_eq!(names.len(), LABEL_KEYED_STORES.len(), "store names are unique");
+    for required in ["org_entry", "memory", "sessions", "tasks", "cron", "website_credentials", "channel_routes",
+        "delegation_targets"] {
+        assert!(names.contains(required), "{required} is registered");
+    }
+    let sources: BTreeSet<&str> = LABEL_KEYED_STORES.iter().map(|store| store.source).collect();
+    for config in KNOWN_AGENT_KEYED_CONFIG { assert!(sources.contains(config), "{config} is registered"); }
+    for entry in std::fs::read_dir(home).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if name.ends_with(".db") {
+            assert!(sources.contains(name.as_str()) || NOT_LABEL_KEYED_DBS.contains(&name.as_str()), "{name} is not registered");
+        }
+    }
+    for store in sqlite_stores() {
+        let db = Connection::open(home.join(store.source)).unwrap();
+        let keyed = sqlite::keyed_columns(&db).unwrap();
+        let tables: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            .unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        for table in tables {
+            let columns: Vec<String> = db.prepare("SELECT name FROM pragma_table_info(?1)").unwrap()
+                .query_map([&table], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            for column in columns {
+                let lower = column.to_ascii_lowercase();
+                if (lower.contains("agent") || lower == "assigned_to") && !NOT_A_LABEL.contains(&lower.as_str()) {
+                    assert!(keyed.contains(&(table.clone(), column.clone())), "{}: {table}.{column} is not covered", store.source);
+                }
+            }
+        }
+    }
+    for (file, table, column) in [("memory.db", "memories", "agent_id"), ("memory.db", "key_facts", "agent_id"),
+        ("sessions.db", "sessions", "agent_id"), ("tasks.db", "tasks", "assigned_to"),
+        ("tasks.db", "responsibilities", "owner_agent_id"), ("cron_tasks.db", "cron_tasks", "agent_id")] {
+        let keyed = sqlite::keyed_columns(&Connection::open(home.join(file)).unwrap()).unwrap();
+        assert!(keyed.contains(&(table.to_owned(), column.to_owned())), "{file}: {table}.{column}");
+    }
+}
+
+/// S10: `rekey` moves a store once; a second call is a no-op; other labels
+/// are untouched; SQLite rows end up under the quarantine key.
+#[tokio::test]
+async fn rekey_idempotent_per_store() {
+    let dir = private_home();
+    let home = dir.path();
+    seed(home, LABEL).await;
+    seed(home, OTHER).await;
+    seed_config(home, LABEL, OTHER);
+    let key = quarantine_key(EmployeeId([9; 16]), 0);
+    for store in LABEL_KEYED_STORES {
+        let other_before = store.count_under(home, OTHER).unwrap();
+        assert!(store.count_under(home, LABEL).unwrap() > 0, "{} holds the label", store.name);
+        let moved = store.rekey(home, LABEL, &key).unwrap();
+        assert!(moved > 0, "{} moved", store.name);
+        assert_eq!(store.count_under(home, LABEL), Ok(0), "{}", store.name);
+        assert_eq!(store.rekey(home, LABEL, &key), Ok(0), "{}: a store already moved is a no-op", store.name);
+        assert_eq!(store.count_under(home, OTHER), Ok(other_before), "{}: other labels untouched", store.name);
+        if matches!(store.backend, Backend::Sqlite { .. }) {
+            assert_eq!(store.count_under(home, &key), Ok(moved), "{}: sealed under the row", store.name);
+        }
+    }
+    assert_eq!(label_free(home, LABEL), Ok(true));
+    assert_eq!(rekey_all(home, LABEL, &key).map(|moved| moved.iter().map(|(_, n)| n).sum::<u64>()), Ok(0));
+    assert_eq!(store("memory").rekey(home, LABEL, LABEL), Err(StoreError::Unavailable), "a self re-key is refused");
+}
+
+/// S10: free only on a positive zero from every store.
+#[tokio::test]
+async fn label_free_requires_positive_zero_count() {
+    let dir = private_home();
+    let home = dir.path();
+    assert_eq!(label_free(home, LABEL), Ok(true), "no store yet: nothing under the label");
+    real_stores(home);
+    assert_eq!(label_free(home, LABEL), Ok(true));
+    let sessions = crate::session::SessionManager::new(&home.join("sessions.db")).unwrap();
+    sessions.get_or_create("webchat:x", LABEL).await.unwrap();
+    assert_eq!(label_free(home, LABEL), Ok(false), "one session holds the label");
+    assert_eq!(label_free(home, OTHER), Ok(true));
+    assert!(store("sessions").purge(home, LABEL).unwrap() >= 1);
+    assert_eq!(label_free(home, LABEL), Ok(true));
+}
+
+/// S10: an unreadable store is never zero, so the label is never free.
+#[test]
+fn unreadable_store_is_not_zero() {
+    let dir = private_home();
+    let home = dir.path();
+    real_stores(home);
+    std::fs::remove_file(home.join("tasks.db")).unwrap();
+    std::fs::write(home.join("tasks.db"), b"not a SQLite database").unwrap();
+    assert_eq!(store("tasks").count_under(home, LABEL), Err(StoreError::Unavailable));
+    assert_eq!(label_free(home, LABEL), Err(StoreError::Unavailable));
+    assert!(counts_under(home, LABEL).iter().any(|(name, count)| *name == "tasks" && count.is_err()));
+    std::fs::remove_file(home.join("tasks.db")).unwrap();
+    assert_eq!(label_free(home, LABEL), Ok(true));
+    // A directory where a store is expected, or a corrupt config map.
+    std::fs::create_dir(home.join("cron_tasks.db.tmp")).unwrap();
+    std::fs::remove_file(home.join("cron_tasks.db")).unwrap();
+    std::fs::rename(home.join("cron_tasks.db.tmp"), home.join("cron_tasks.db")).unwrap();
+    assert_eq!(store("cron").count_under(home, LABEL), Err(StoreError::Unavailable));
+    std::fs::write(home.join("agent_bindings.json"), b"{not json").unwrap();
+    assert_eq!(store("channel_routes").count_under(home, LABEL), Err(StoreError::Unavailable));
+    // An unreadable lifecycle index is not "no quarantine".
+    apply_db(home);
+    std::fs::write(home.join(APPLY_DIR).join(APPLY_DB), b"not a SQLite database").unwrap();
+    assert_eq!(label_hold(home, LABEL), Err(StoreError::Unavailable));
+}
+
+/// §3.8 entry point for F6i: purge removes every store's rows (and session
+/// messages) under the label, idempotently, and nothing of another label.
+#[tokio::test]
+async fn purge_removes_label_stores() {
+    let dir = private_home();
+    let home = dir.path();
+    seed(home, LABEL).await;
+    seed(home, OTHER).await;
+    seed_config(home, LABEL, OTHER);
+    let other_before: Vec<u64> = LABEL_KEYED_STORES.iter().map(|store| store.count_under(home, OTHER).unwrap()).collect();
+    let purged = purge_all(home, LABEL).unwrap();
+    assert!(purged.iter().all(|(_, removed)| *removed > 0), "{purged:?}");
+    for store in LABEL_KEYED_STORES { assert_eq!(store.count_under(home, LABEL), Ok(0), "{}", store.name); }
+    let other_after: Vec<u64> = LABEL_KEYED_STORES.iter().map(|store| store.count_under(home, OTHER).unwrap()).collect();
+    assert_eq!(other_after, other_before);
+    let messages = |session: &str| -> i64 {
+        Connection::open(home.join("sessions.db")).unwrap()
+            .query_row("SELECT COUNT(*) FROM session_messages WHERE session_id=?1", [session], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(messages(&format!("webchat:{LABEL}")), 0, "child rows go with the session");
+    assert_eq!(messages(&format!("webchat:{OTHER}")), 1);
+    assert_eq!(label_free(home, LABEL), Ok(true));
+    assert!(purge_all(home, LABEL).unwrap().iter().all(|(_, removed)| *removed == 0), "idempotent");
+    // The credential shared with the other label survives without the purged one.
+    let left = crate::website_credentials::list(home).unwrap();
+    assert_eq!(left.iter().map(|m| (m.label.as_str(), m.allowed_agents.clone())).collect::<Vec<_>>(),
+        vec![("crm", vec![OTHER.to_owned()])]);
+}
+
+/// H4 memory writer path.
+#[tokio::test]
+async fn memory_writer_refused_for_quarantined_label() {
+    use duduclaw_core::traits::MemoryEngine;
+    install_memory_gate();
+    let dir = private_home();
+    let home = dir.path();
+    let memory = duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db")).unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    let _mode = Mode::protected(true);
+    let refused = memory.store(LABEL, memory_entry(LABEL)).await.unwrap_err();
+    assert!(refused.to_string().contains(LABEL_QUARANTINED), "{refused}");
+    let refused = memory.store(&format!("agent:{LABEL}"), memory_entry(LABEL)).await.unwrap_err();
+    assert!(refused.to_string().contains(LABEL_QUARANTINED), "the agent:<label> namespace is the same label");
+    memory.store(OTHER, memory_entry(OTHER)).await.unwrap();
+    assert_eq!(store("memory").count_under(home, LABEL), Ok(0));
+}
+
+/// H4 sessions writer paths: a new session and a message append.
+#[tokio::test]
+async fn session_writer_refused_for_quarantined_label() {
+    let dir = private_home();
+    let home = dir.path();
+    let sessions = crate::session::SessionManager::new(&home.join("sessions.db")).unwrap();
+    sessions.get_or_create("webchat:old", LABEL).await.unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    let _mode = Mode::protected(true);
+    let refused = sessions.append_message("webchat:old", "user", "planted", 1).await.unwrap_err();
+    assert!(refused.to_string().contains(LABEL_QUARANTINED), "{refused}");
+    let refused = sessions.get_or_create("webchat:new", LABEL).await.unwrap_err();
+    assert!(refused.to_string().contains(LABEL_QUARANTINED), "{refused}");
+    sessions.get_or_create("webchat:bob", OTHER).await.unwrap();
+    sessions.append_message("webchat:bob", "user", "hello", 1).await.unwrap();
+    let planted: i64 = Connection::open(home.join("sessions.db")).unwrap()
+        .query_row("SELECT COUNT(*) FROM session_messages WHERE session_id='webchat:old'", [], |r| r.get(0)).unwrap();
+    assert_eq!(planted, 0);
+}
+
+/// H4 tasks writer path (`insert_task_tx`, shared by every task insert).
+#[tokio::test]
+async fn task_writer_refused_for_quarantined_label() {
+    let dir = private_home();
+    let home = dir.path();
+    let tasks = crate::task_store::TaskStore::open(home).unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    let _mode = Mode::protected(true);
+    assert_eq!(tasks.insert_task(&task_row("t1", LABEL)).await.err().as_deref(), Some(LABEL_QUARANTINED));
+    tasks.insert_task(&task_row("t2", OTHER)).await.unwrap();
+    assert_eq!(store("tasks").count_under(home, LABEL), Ok(0));
+}
+
+/// H4 cron writer paths: insert and a scoped edit.
+#[tokio::test]
+async fn cron_writer_refused_for_quarantined_label() {
+    let dir = private_home();
+    let home = dir.path();
+    let cron = crate::cron_store::CronStore::open(home).unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    let _mode = Mode::protected(true);
+    assert_eq!(cron.insert(&cron_row("c1", LABEL)).await.err().as_deref(), Some(LABEL_QUARANTINED));
+    cron.insert(&cron_row("c2", OTHER)).await.unwrap();
+    assert_eq!(store("cron").count_under(home, LABEL), Ok(0));
+}
+
+/// Fail closed: an unreadable lifecycle index refuses every writer; a
+/// readable one without a row for the label allows it.
+#[tokio::test]
+async fn writer_gate_fails_closed_when_lifecycle_unreadable() {
+    let dir = private_home();
+    let home = dir.path();
+    let tasks = crate::task_store::TaskStore::open(home).unwrap();
+    apply_db(home);
+    let _mode = Mode::protected(true);
+    assert_eq!(check_label_writable(home, LABEL), Ok(()));
+    std::fs::write(home.join(APPLY_DIR).join(APPLY_DB), b"not a SQLite database").unwrap();
+    assert_eq!(check_label_writable(home, LABEL), Err(GateRefusal::Unavailable));
+    assert_eq!(tasks.insert_task(&task_row("t1", OTHER)).await.err().as_deref(), Some(LABEL_STATE_UNAVAILABLE));
+    assert_eq!(memory_write_gate(None, LABEL), Err(LABEL_STATE_UNAVAILABLE.to_owned()), "an unknown database file refuses");
+}
+
+/// Unprotected installs are unchanged: no gate, whatever apply.db says.
+#[tokio::test]
+async fn writer_gate_unchanged_outside_protected_mode() {
+    let dir = private_home();
+    let home = dir.path();
+    let tasks = crate::task_store::TaskStore::open(home).unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    let _mode = Mode::protected(false);
+    assert_eq!(check_label_writable(home, LABEL), Ok(()));
+    assert_eq!(memory_write_gate(None, LABEL), Ok(()));
+    tasks.insert_task(&task_row("t1", LABEL)).await.unwrap();
+    assert!(channel_bot_allowed(home, LABEL, "telegram").await);
+}
+
+/// S9: channel→agent routes to the label are stripped into `stripped` at
+/// tombstone (names only), other labels keep theirs, the label's schedules
+/// are paused and its store marks recorded.
+#[tokio::test]
+async fn global_channel_route_to_label_paused() {
+    let dir = private_home();
+    let home = dir.path();
+    seed(home, LABEL).await;
+    seed_config(home, LABEL, OTHER);
+    quarantine_row(home, LABEL, 1, "sealed");
+    let summary = tombstone_effects(home, LABEL, EmployeeId([1; 16]), 0);
+    assert_eq!(summary["fences"], json!([]), "{summary}");
+    assert_eq!(summary["recorded"], true);
+    assert_eq!(store("channel_routes").count_under(home, LABEL), Ok(0));
+    assert_eq!(store("channel_routes").count_under(home, OTHER), Ok(1));
+    let bindings = crate::agent_binding::AgentBindingStore::with_persistence(home.join("agent_bindings.json"));
+    assert_eq!(bindings.resolve_bound_agent("telegram", "u1").await, None);
+    assert_eq!(bindings.resolve_bound_agent("telegram", "u2").await.as_deref(), Some(OTHER));
+    let row = quarantine::read_quarantine(&apply_db(home), EmployeeId([1; 16]), 0).unwrap().unwrap();
+    assert_eq!(row.stripped["global_routes"]["channel_routes"], json!(["binding:telegram:u1", "token:telegram"]));
+    assert_eq!(row.stripped["global_routes"]["website_credentials"], json!(["crm", "erp"]));
+    assert_eq!(row.stripped["paused_work"]["cron"], json!([format!("cron-{LABEL}")]));
+    let enabled: i64 = Connection::open(home.join("cron_tasks.db")).unwrap()
+        .query_row("SELECT enabled FROM cron_tasks WHERE id=?1", [format!("cron-{LABEL}")], |r| r.get(0)).unwrap();
+    assert_eq!(enabled, 0, "the label's schedule is paused");
+    let marks: Value = serde_json::from_str(&apply_db(home).query_row(
+        "SELECT store_marks FROM employee_quarantine WHERE label=?1", [LABEL], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+    for name in ["memory", "sessions", "tasks", "cron"] { assert!(marks[name].as_u64().unwrap() > 0, "{name}: {marks}"); }
+    // A retry keeps the recorded names (nothing left to strip now).
+    tombstone_effects(home, LABEL, EmployeeId([1; 16]), 0);
+    let row = quarantine::read_quarantine(&apply_db(home), EmployeeId([1; 16]), 0).unwrap().unwrap();
+    assert_eq!(row.stripped["global_routes"]["channel_routes"], json!(["binding:telegram:u1", "token:telegram"]));
+    assert!(row.pending_fences.is_empty());
+}
+
+/// S9: other employees' delegation (org `reports_to`) pointing at the label
+/// is re-rooted at tombstone and recorded; nothing else in the org changes.
+#[test]
+fn delegation_target_to_label_paused() {
+    use duduclaw_core::org_store::{self as org, OrgEntry};
+    let dir = private_home();
+    let home = dir.path();
+    seed_config(home, LABEL, OTHER);
+    org::with_org_lock(home, |guard| org::upsert(guard, "carol-desk", OrgEntry::new(OTHER, "ops")).map(|_| ())).unwrap();
+    assert_eq!(store("delegation_targets").count_under(home, LABEL), Ok(1));
+    quarantine_row(home, LABEL, 1, "sealed");
+    tombstone_effects(home, LABEL, EmployeeId([1; 16]), 0);
+    assert_eq!(store("delegation_targets").count_under(home, LABEL), Ok(0));
+    let current = org::load_for_write(home).unwrap();
+    assert_eq!(current.get(OTHER), Some(&OrgEntry::new("", "sales")), "re-rooted, department kept");
+    assert_eq!(current.get("carol-desk"), Some(&OrgEntry::new(OTHER, "ops")), "unrelated edge untouched");
+    assert!(current.contains(LABEL), "the label's own entry is in the seal digest, not stripped");
+    let row = quarantine::read_quarantine(&apply_db(home), EmployeeId([1; 16]), 0).unwrap().unwrap();
+    assert_eq!(row.stripped["global_routes"]["delegation_targets"], json!([format!("reports_to:{OTHER}")]));
+}
+
+/// R7: an open quarantine row refuses every proposal for the label except
+/// the adoption of that row; a purged label frees only on a positive zero.
+#[tokio::test]
+async fn proposal_on_quarantined_label_refused() {
+    let dir = private_home();
+    let home = dir.path();
+    assert_eq!(check_label_not_quarantined(home, LABEL, None), Ok(()), "no apply.db: nothing holds the label");
+    quarantine_row(home, LABEL, 1, "sealed");
+    assert_eq!(check_label_not_quarantined(home, LABEL, None), Err(GateRefusal::Quarantined));
+    assert_eq!(proposal_refusal(home, LABEL), Err(LABEL_QUARANTINED));
+    assert_eq!(check_label_not_quarantined(home, LABEL, Some((EmployeeId([1; 16]), 0))), Ok(()), "adoption of that row");
+    assert_eq!(check_label_not_quarantined(home, LABEL, Some((EmployeeId([2; 16]), 0))), Err(GateRefusal::Quarantined));
+    assert_eq!(check_label_not_quarantined(home, OTHER, None), Ok(()), "exact label only");
+    assert_eq!(check_label_not_quarantined(home, "alice-desk-2", None), Ok(()), "never a prefix match");
+    for seal in ["pending", "oversize", "invalid", "absent", "restoring", "adopting", "needs_reseal", "purging"] {
+        set_seal(home, LABEL, seal);
+        assert_eq!(check_label_not_quarantined(home, LABEL, None), Err(GateRefusal::Quarantined), "{seal}");
+    }
+    // Purged, but the purge left state behind (crash): still held (S10, §3.6).
+    set_seal(home, LABEL, "purged");
+    seed(home, LABEL).await;
+    assert_eq!(check_label_not_quarantined(home, LABEL, None), Err(GateRefusal::Quarantined));
+    purge_all(home, LABEL).unwrap();
+    assert_eq!(check_label_not_quarantined(home, LABEL, None), Ok(()));
+    // An unreadable store is not zero.
+    std::fs::remove_file(home.join("tasks.db")).unwrap();
+    std::fs::write(home.join("tasks.db"), b"not a SQLite database").unwrap();
+    assert_eq!(check_label_not_quarantined(home, LABEL, None), Err(GateRefusal::Unavailable));
+}
+
+/// S7: a `restored` (or `adopted`) row is closed: it no longer blocks the
+/// label for writers or proposals; `restoring` still does.
+#[tokio::test]
+async fn restored_row_counts_as_closed() {
+    let dir = private_home();
+    let home = dir.path();
+    let tasks = crate::task_store::TaskStore::open(home).unwrap();
+    quarantine_row(home, LABEL, 1, "restoring");
+    let _mode = Mode::protected(true);
+    assert_eq!(check_label_writable(home, LABEL), Err(GateRefusal::Quarantined));
+    for closed in ["restored", "adopted"] {
+        set_seal(home, LABEL, closed);
+        let hold = label_hold(home, LABEL).unwrap();
+        assert!(hold.open_rows.is_empty(), "{closed}");
+        assert_eq!(check_label_writable(home, LABEL), Ok(()), "{closed}");
+        assert_eq!(check_label_not_quarantined(home, LABEL, None), Ok(()), "{closed}");
+    }
+    tasks.insert_task(&task_row("t1", LABEL)).await.unwrap();
+    // A second, open row of another id on the same label still holds it.
+    quarantine_row(home, LABEL, 2, "sealed");
+    assert_eq!(check_label_writable(home, LABEL), Err(GateRefusal::Quarantined));
+}

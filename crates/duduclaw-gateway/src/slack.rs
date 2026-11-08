@@ -180,6 +180,14 @@ async fn spawn_slack_bot(
     agent_name: Option<String>,
     ctx: Arc<ReplyContext>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // F6h (H5, A11): in protected mode an employee's own bot needs a live
+    // lifecycle and an active channel route; unchanged otherwise.
+    if let Some(agent) = &agent_name {
+        if !crate::isolation_label_stores::channel_bot_allowed(&ctx.home_dir, agent, "slack").await {
+            warn!(agent = %agent, "per-agent Slack bot not started: no live protected lifecycle or channel route");
+            return None;
+        }
+    }
     info!("Slack Socket Mode starting (label: {label})...");
 
     let handle = tokio::spawn(async move {
