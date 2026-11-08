@@ -140,7 +140,10 @@ pub(crate) fn ephemeral(home: &Path, id: &str, sidecar_parent: &str, org_parent:
     std::fs::write(dir.join("ephemeral.toml"), format!(
         "parent = \"{sidecar_parent}\"\ntier = \"standard\"\ncreated_at = \"2026-11-08T00:00:00Z\"\n\
          expires_at = \"2026-11-09T00:00:00Z\"\n")).unwrap();
-    duduclaw_core::org_store::upsert(home, id, duduclaw_core::org_store::OrgEntry::new(org_parent, "")).unwrap();
+    {
+        let org = duduclaw_core::org_store::lock_org_mutations(home).unwrap();
+        duduclaw_core::org_store::upsert(&org, id, duduclaw_core::org_store::OrgEntry::new(org_parent, "")).unwrap();
+    }
 }
 
 #[test]
