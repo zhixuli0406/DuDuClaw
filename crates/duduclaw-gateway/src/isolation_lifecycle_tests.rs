@@ -690,3 +690,6 @@ mod f6;
 #[cfg(unix)]
 #[path = "isolation_restore_tests.rs"]
 mod restore;
+/// F6h: channel bot gate and the tombstone label-store hook.
+#[path = "isolation_label_stores_lifecycle_tests.rs"]
+mod f6h;

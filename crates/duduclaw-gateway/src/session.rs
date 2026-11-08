@@ -368,6 +368,8 @@ impl SessionManager {
         client_msg_id: Option<&str>, pending: bool,
     ) -> Result<i64> {
         let conn = self.acquire().await;
+        // F6h writer gate (protected mode only): the session's agent must be live.
+        crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?;
         let now = chrono::Utc::now().to_rfc3339();
 
         // G4 checkpoint: every user turn starts a (potentially file-writing)

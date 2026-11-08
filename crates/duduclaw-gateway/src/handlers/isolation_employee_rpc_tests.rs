@@ -907,3 +907,7 @@ fn tombstone_quarantine_rename_noreplace() {
     assert!(real.join(LABEL).join("SOUL.md").exists());
     assert!(!lifecycle::quarantine_path(f.home(), LABEL, receipt.employee, 0).exists());
 }
+
+/// F6h R7: `LABEL_QUARANTINED` through the real propose path.
+#[path = "isolation_employee_rpc_f6h_tests.rs"]
+mod f6h;

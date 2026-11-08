@@ -498,6 +498,8 @@ impl CronStore {
     pub async fn insert(&self, row: &CronTaskRow) -> Result<(), String> {
         let mut guard = self.conn.lock().await;
         let tx = begin_write(&mut guard)?;
+        // F6h writer gate (protected mode only): no schedule for a tombstoned label.
+        crate::isolation_label_stores::check_label_writable_at(&tx, &row.agent_id)?;
         scoped::check_write(&tx, row)?;
         scoped::record_creation(&tx, row, None)?;
         insert_cron_row(&tx, row)?;
@@ -530,6 +532,8 @@ impl CronStore {
             if row.id != current.id || row.agent_id != current.agent_id || row.created_by_user_id != current.created_by_user_id {
                 return Err("Automation identity cannot change".into());
             }
+            // F6h writer gate: a tombstoned label's schedule stays as paused.
+            crate::isolation_label_stores::check_label_writable_at(&tx, &row.agent_id)?;
             scoped::check_transition(&tx, &current, row)?;
             tx.execute("UPDATE cron_tasks SET name=?2,cron=?3,task=?4,enabled=?5,on_behalf_of=?6,updated_at=?7,scoped_by_user_id=?8 WHERE id=?1",
                 params![expected.id,row.name,row.cron,row.task,row.enabled,row.on_behalf_of,Utc::now().to_rfc3339(),row.scoped_by_user_id])

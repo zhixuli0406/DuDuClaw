@@ -371,9 +371,12 @@ pub(crate) struct TombstoneEnv<'a> {
 /// quarantine row and principal snapshot are kept, a still-`pending` seal is
 /// re-run through the quarantined directory, fences are recomputed.
 ///
+/// F6h: right after step 1 the employee's running per-agent channel bots are
+/// stopped (`isolation_label_bots::stop_label`); after step 3 the label-keyed
+/// stores are marked, held or paused (`isolation_label_stores::tombstone_effects`).
+///
 /// Not done here (later tasks): approval invalidation runs in the RPC after
-/// this call (async broker); store marks and the label-keyed writer gate /
-/// global route pause (F6h); provider cache eviction beyond the registry
+/// this call (async broker); provider cache eviction beyond the registry
 /// rescan (F6c); root retire (F6l).
 pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId, env: &TombstoneEnv<'_>)
     -> Result<TombstoneOutcome, LifecycleError> {
@@ -454,6 +457,10 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
         (held, stripped, seal_state)
     };
     let _ = seal_state;
+    // F6h (H5, A11): the row is disabled and the quarantine row open, so a
+    // new bot start is refused; stop the employee's running channel bots now
+    // (also on a retry), before anything that can fail.
+    let bots_stopped = crate::isolation_label_bots::stop_label(home, label);
 
     // 2. Seal outside the lock, through the held descriptor.
     #[cfg(unix)]
@@ -487,6 +494,9 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
             quarantine::replace_fence_group(&mut db, employee, incarnation, group, &members).map_err(|_| Unavailable)?;
         }
     }
+    // F6h (§3.2 step 4, S9): strip global routes to the label, pause its
+    // work, record store marks; failures become `stores:` fences.
+    let label_stores = crate::isolation_label_stores::tombstone_effects(home, label, employee, incarnation);
     let row = {
         let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
         quarantine::read_quarantine(&db, employee, incarnation).map_err(|_| Unavailable)?.ok_or(Unavailable)?
@@ -509,7 +519,8 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
         "label": label, "employee": hex::encode(employee.0), "incarnation": incarnation,
         "seal": outcome.seal, "digest_prefix": outcome.digest_prefix, "routes_revoked": outcome.routes_revoked,
         "pending_fences": outcome.pending_fences, "runs_stopped": outcome.runs_stopped,
-        "stripped": stripped.to_value(), "users_removed": users.is_ok(),
+        "stripped": stripped.to_value(), "users_removed": users.is_ok(), "label_stores": label_stores,
+        "channel_bots_stopped": bots_stopped,
     });
     let severity = if users.is_ok() && outcome.pending_fences.is_empty() {
         duduclaw_security::audit::Severity::Info

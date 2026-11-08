@@ -464,6 +464,15 @@ async fn spawn_discord_bot(
     home_dir: &Path,
     quiet_on_auth_failure: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // F6h (H5, A11): in protected mode an employee's own bot needs a live
+    // lifecycle and an active channel route; unchanged otherwise.
+    if let Some(agent) = &agent_name {
+        if !crate::isolation_label_stores::channel_bot_allowed(home_dir, agent, "discord").await {
+            warn!(agent = %agent, "per-agent Discord bot not started: no live protected lifecycle or channel route");
+            crate::isolation_label_bots::refused(home_dir, "discord", agent);
+            return None;
+        }
+    }
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -567,6 +576,7 @@ async fn spawn_discord_bot(
     let gateway_url = format!("{gateway_url}/?v=10&encoding=json");
     info!("   Discord [{label}] Gateway: {gateway_url}");
 
+    let agent = agent_name.clone();
     let handle = tokio::spawn(async move {
         gateway_loop(
             token,
@@ -580,6 +590,13 @@ async fn spawn_discord_bot(
         )
         .await;
     });
+    // F6h (H5): a per-agent bot is registered so a tombstone can stop it.
+    if let Some(agent) = agent {
+        if !crate::isolation_label_bots::admit(home_dir, "discord", &agent, handle.abort_handle()).await {
+            warn!(agent = %agent, "per-agent Discord bot stopped: the employee is no longer live");
+            return None;
+        }
+    }
 
     Some(handle)
 }

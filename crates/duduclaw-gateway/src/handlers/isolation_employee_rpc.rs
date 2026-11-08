@@ -233,6 +233,11 @@ impl MethodHandler {
                 if let Err(error) = self.registry.write().await.scan().await {
                     warn!(error = %error, "employee tombstone: registry rescan failed");
                 }
+                // F6h (H5): the tombstone aborted the employee's running bots;
+                // drop their handles and status here (exact `<channel>:<label>`).
+                for channel in crate::isolation_label_bots::BOT_CHANNELS {
+                    self.hot_stop_channel(&format!("{channel}:{label}")).await;
+                }
                 // F6a (A8): approvals naming the employee die with it.
                 if let Some(employee) = employee {
                     invalidate_employee_approvals(&approvals_home, &label, employee).await;
@@ -730,6 +735,7 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
     };
     // One open Employee proposal per label; the request itself is superseded.
     if label_pending(&items, &input.label, request) { return Err(LABEL_PENDING); }
+    crate::isolation_label_stores::proposal_refusal(home, &input.label)?; // F6h R7: LABEL_QUARANTINED
     lifecycle::validate_proposed_binding(home, &input.label, Some(&binding)).map_err(binding_error)?;
     let display_name = match (input.display_name.as_deref(), request) {
         (Some(name), _) => checked_display(name)?,
@@ -779,6 +785,7 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     let mut store = open_confirmations(home)?;
     let items = store.list().map_err(|_| STORE_UNAVAILABLE)?;
     if label_pending(&items, &prepared.label, prepared.request) { return Err(LABEL_PENDING); }
+    crate::isolation_label_stores::proposal_refusal(home, &prepared.label)?; // F6h R7: LABEL_QUARANTINED
     // SR2 finding 1b: the adopted directory still carries this flow's marker,
     // holds nothing outside the allowlist, and the staged settings are
     // exactly those parsed from the agent.toml bytes inside that digest.
