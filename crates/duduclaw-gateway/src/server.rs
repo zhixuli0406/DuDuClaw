@@ -17239,23 +17239,39 @@ async fn handle_mcp_oauth_callback(
     // Google master enable already belongs to its same-ticket three-point
     // publication. A generic enable here would rotate/invalidate its source.
     let error = result.as_ref().err().and_then(crate::mcp_oauth::CallbackFailure::google_code);
-    mcp_oauth_callback_html_with_error(result.is_ok(), error)
+    // RM-129: link back through the operator-declared public_url (sub-path
+    // included). Unset or invalid → no link, as before; the query/provider
+    // text never influences the target beyond picking a fixed tab.
+    let google = matches!(result.as_deref(), Ok("google")) || error.is_some();
+    let back = mcp_oauth_callback_back_link(state.handler.home_dir(), google);
+    mcp_oauth_callback_html_with_error(result.is_ok(), error, back.as_deref())
+}
+/// `<public_url>/manage/integrations?tab=google|mcp`, or `None` when no valid
+/// `[dashboard] public_url` is configured.
+fn mcp_oauth_callback_back_link(home: &std::path::Path, google: bool) -> Option<String> {
+    let base = crate::deep_link::configured_public_base(home).ok().flatten()?;
+    let tab = if google { "google" } else { "mcp" };
+    Some(format!("{}/manage/integrations?tab={tab}", crate::deep_link::base_prefix(&base)))
 }
 #[cfg(test)]
 fn mcp_oauth_callback_html(success: bool) -> axum::response::Response {
-    mcp_oauth_callback_html_with_error(success, None)
+    mcp_oauth_callback_html_with_error(success, None, None)
 }
-fn mcp_oauth_callback_html_with_error(success: bool, error: Option<&str>) -> axum::response::Response {
-    let body = if success {
-        "<!doctype html><html><body><h2>Authentication Successful</h2><p>You can close this window and return to the dashboard.</p></body></html>"
+fn mcp_oauth_callback_html_with_error(success: bool, error: Option<&str>, back: Option<&str>) -> axum::response::Response {
+    let text = if success {
+        "<h2>Authentication Successful</h2><p>You can close this window and return to the dashboard.</p>"
     } else {
         match error.map(crate::mcp_oauth::google_callback_error) {
-            Some("access_denied") => "<!doctype html><html><body><h2>Authentication failed</h2><p>access_denied: Consent was declined. Return to the dashboard, retry, and allow the requested access.</p></body></html>",
-            Some("admin_policy_enforced") => "<!doctype html><html><body><h2>Authentication failed</h2><p>admin_policy_enforced: Ask your Workspace administrator to allow this app, then retry from the dashboard.</p></body></html>",
-            Some("invalid_scope") => "<!doctype html><html><body><h2>Authentication failed</h2><p>invalid_scope: Check Data Access scopes in Google Cloud Console, then retry from the dashboard.</p></body></html>",
-            _ => "<!doctype html><html><body><h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p></body></html>",
+            Some("access_denied") => "<h2>Authentication failed</h2><p>access_denied: Consent was declined. Return to the dashboard, retry, and allow the requested access.</p>",
+            Some("admin_policy_enforced") => "<h2>Authentication failed</h2><p>admin_policy_enforced: Ask your Workspace administrator to allow this app, then retry from the dashboard.</p>",
+            Some("invalid_scope") => "<h2>Authentication failed</h2><p>invalid_scope: Check Data Access scopes in Google Cloud Console, then retry from the dashboard.</p>",
+            _ => "<h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p>",
         }
     };
+    let link = back
+        .map(|href| format!("<p><a href=\"{}\">Back to the dashboard</a></p>", html_escape(href)))
+        .unwrap_or_default();
+    let body = format!("<!doctype html><html><body>{text}{link}</body></html>");
     let mut response = axum::response::Html(body).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -17281,7 +17297,7 @@ mod home_callback_response_tests {
     #[tokio::test]
     async fn google_callback_html_uses_closed_actionable_errors_only() {
         for (code, expected) in [("access_denied", "Consent was declined"), ("admin_policy_enforced", "Workspace administrator"), ("invalid_scope", "Data Access"), ("<script>private-token</script>", "start a new connection")] {
-            let response = mcp_oauth_callback_html_with_error(false, Some(code));
+            let response = mcp_oauth_callback_html_with_error(false, Some(code), None);
             let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
             let text = std::str::from_utf8(&body).unwrap();
             assert!(text.contains(expected));
@@ -17397,6 +17413,70 @@ mod personal_google_callback_tests {
                 assert!(!html.contains("different.example"));
             }
         }
+    }
+
+    /// RM-129 end to end inside the gateway: a sub-path public_url produces a
+    /// prefixed Google callback URI at start and a prefixed landing redirect,
+    /// even when the browser origin differs; the allowlist is still applied.
+    #[tokio::test]
+    async fn sub_path_public_url_prefixes_google_callback_and_landing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[dashboard]\npublic_url = \"https://example.com/agents/\"\n").unwrap();
+        let allowed = vec!["example.com".to_string(), "alt.example.com".to_string()];
+        for origin in ["https://example.com", "https://alt.example.com"] {
+            let (plan, base) = crate::remote_mcp::connect::dashboard_redirect_plan(
+                home.path(), origin, &allowed, crate::google_personal::flow::CALLBACK_PATH,
+            ).unwrap();
+            assert_eq!(plan.redirect_uri(), "https://example.com/agents/api/me/google/callback", "{origin}");
+            assert_eq!(base, "https://example.com/agents");
+            let nonce = crate::google_personal::pending::insert(crate::google_personal::pending::Pending {
+                home: home.path().into(),
+                user_id: "alice".into(),
+                session_ref: uuid::Uuid::new_v4().to_string(),
+                redirect_uri: plan.redirect_uri().into(),
+                dashboard_base: base,
+                paste: false,
+                code_verifier: "verifier".into(),
+                client_id: "fixture".into(),
+                client_secret: "secret".into(),
+                epoch: 1,
+                google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
+                meeting_recordings: false,
+                drive_tools: false,
+                chat_read: false,
+                expected_connection: None,
+                created: std::time::Instant::now(),
+                code: None,
+            });
+            let response = personal_google_callback_response(home.path(), &format!("state={nonce}&code=fixture"));
+            assert_eq!(response.headers()[axum::http::header::LOCATION],
+                format!("https://example.com/agents/me/connections?google_state={nonce}"));
+        }
+        // An unlisted origin is never promoted to a direct redirect.
+        let (plan, _) = crate::remote_mcp::connect::dashboard_redirect_plan(
+            home.path(), "https://evil.example.org", &allowed, crate::google_personal::flow::CALLBACK_PATH,
+        ).unwrap();
+        assert!(matches!(plan, crate::remote_mcp::connect::RedirectPlan::Paste { .. }));
+    }
+
+    #[tokio::test]
+    async fn builtin_oauth_callback_page_links_back_through_public_url() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(mcp_oauth_callback_back_link(home.path(), true), None, "unset → no link");
+        std::fs::write(home.path().join("config.toml"),
+            "[dashboard]\npublic_url = \"https://example.com/agents/\"\n").unwrap();
+        assert_eq!(mcp_oauth_callback_back_link(home.path(), true).as_deref(),
+            Some("https://example.com/agents/manage/integrations?tab=google"));
+        let back = mcp_oauth_callback_back_link(home.path(), false);
+        assert_eq!(back.as_deref(), Some("https://example.com/agents/manage/integrations?tab=mcp"));
+        let response = mcp_oauth_callback_html_with_error(true, None, back.as_deref());
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("href=\"https://example.com/agents/manage/integrations?tab=mcp\""), "{html}");
+        std::fs::write(home.path().join("config.toml"),
+            "[dashboard]\npublic_url = \"https://example.com/agents?x=1\"\n").unwrap();
+        assert_eq!(mcp_oauth_callback_back_link(home.path(), false), None, "invalid → no link");
     }
 
     #[tokio::test]

@@ -148,7 +148,25 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 - `config.toml` 無法解析時，`system.update_config`、常駐感知資料來源與設定檔進階編輯都會拒絕寫入，請先在設定檔進階編輯修好語法。其他會寫 `config.toml` 的設定頁（通道、帳號、Odoo 等）也一樣拒絕寫入。
 - 存檔是原地修改檔案，只改你動到的鍵。你寫的註解、空行、鍵的順序和沒動到的鍵的排版都原樣保留，改了值的那一行行尾註解也還在。新增的鍵放在所屬區段的最後，新增的區段放在檔案最後。所有會寫 `config.toml` 或 `inference.toml` 的設定頁都是這樣，不只設定檔進階編輯。
 - 需要重啟才生效的鍵會出現在回應的 `restart_required`。系統設定頁與通道管理頁上方會顯示「以下設定要重啟 gateway 才生效」，gateway 重啟後自動消失，也可以手動關閉。推理頁與 AI 員工編輯頁不顯示這條提示。
-- 下列鍵每次改動都會另寫一筆稽核事件 `config_protected_key_changed`（含改動前後的值）：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`。
+- 下列鍵每次改動都會另寫一筆稽核事件 `config_protected_key_changed`（含改動前後的值）：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`、`dashboard.public_url`。
+
+## 系統設定 → 一般 → 控制台公開網址
+
+管理員在這裡設定 `[dashboard] public_url`：外部連到控制台的完整網址，含反向代理子路徑，例如 `https://example.com/agents/`。必須使用 HTTPS；只有 `localhost`、`127.0.0.0/8` 或 `::1` 可用 HTTP。網址不可含帳號密碼、查詢字串（`?`）、片段（`#`）、`..` 或編碼後的 `/`、`\`。儲存時 gateway 會拒絕其他格式；若 `config.toml` 裡手動寫入了不合格的值，OAuth 連結會拒絕開始，直到修正為止（絕不會默默改用沒有子路徑的網址）。清空欄位即移除這個鍵。立即生效，每次改動都會寫入 `config_protected_key_changed`。
+
+設定 public_url 後，所有 OAuth 回呼與返回連結都會使用它，並保留子路徑：
+
+| 流程 | 服務商導回的回呼網址 | 完成後瀏覽器回到 |
+|---|---|---|
+| 遠端 MCP 伺服器（整合 → MCP → 遠端伺服器） | `<public_url>/oauth/mcp/callback`（動態用戶端註冊會自動登記） | `<public_url>/manage/integrations?tab=mcp&mcp_tab=remote` |
+| 個人 Google 帳號（我的連線） | `<public_url>/api/me/google/callback` | `<public_url>/me/connections` |
+| 內建 Google Workspace、GitHub、Notion、Slack OAuth | `<public_url>/api/mcp/oauth/callback` | 結果頁連回 `<public_url>/manage/integrations?tab=google`（Google）或 `?tab=mcp` |
+
+- **註冊新的回呼網址。** 設定或變更 public_url 後，請到每個使用中的 OAuth 應用程式加入新的回呼網址：Google Cloud Console → 憑證 → 你的 OAuth 用戶端 → 已授權的重新導向 URI；GitHub OAuth App 的 Authorization callback URL（GitHub OAuth App 只有一個回呼網址，請直接替換）。Notion 與 Slack 應用程式也一樣。整合頁會顯示要註冊的確切網址。已經進行中的連結會用開始時的網址完成。
+- 仍會先檢查瀏覽器本身的來源：只有在控制台以本機位址或 `[gateway] allowed_origins` 內的 https 來源開啟時才直接導回；否則照舊改走 `http://127.0.0.1:<port>/…` 的貼上返回網址流程（這個本機位址不加子路徑）。若控制台以 public_url 以外的允許來源開啟，仍會導回 public_url，gateway 只記錄一次警告。
+- 未設定 public_url 時行為不變：遠端 MCP 與個人 Google 回到瀏覽器來源（不含路徑），內建服務商使用 `http://localhost:<port>/api/mcp/oauth/callback`。
+- 反向代理：把 `<子路徑>/oauth/mcp/callback` 與 `<子路徑>/api/…` 去掉子路徑後轉給 gateway。
+- 限制：控制台網頁本身是為根路徑建置的，會載入 `/assets/…`、呼叫 `/api/…` 與 `/ws`，頁面路由也沒有基底路徑。因此放在子路徑下時，代理還必須把這些根路徑轉給 gateway，或改用獨立主機名稱。public_url 修正的是 OAuth 回呼與返回網址，不會讓控制台網頁本身支援子路徑。若頁面有同來源的 `<base href>`（例如由代理插入），控制台會在開始 OAuth 與邀請成員時附上該子路徑，gateway 仍會再次驗證。
 
 ## 系統設定 → 進階設定 → 自動化引擎
 
@@ -605,7 +623,7 @@ Admin 可在「系統 → 安全 → 憑證稽核」查看中繼資料、篩選�
 mfa_enforced = true
 ```
 
-新的團隊安裝預設強制 MFA；既有安裝保留目前政策，尚無 MFA 政策紀錄的舊版也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」的專用開關啟用或停用強制。新團隊的第一位 Admin 以密碼登入後，需由主機操作員執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再完成驗證器註冊；未設定 Email 寄信時，首次註冊無法只靠儀表板完成；已設定者可改用信箱驗證。既有未強制的安裝可繼續自願註冊，開啟前請查看 `mfa.overview`、確認通道送達並測試主機救援。兩種 dashboard 設定寫入都要求目前有效的 Admin。註冊及後續憑證變更透過帳號 epoch 作廢舊 JWT；單純切換強制則讓既有 access token 自然到期，拒絕未註冊者 refresh。強制時拒絕舊共用 token WebSocket 登入。
+新的團隊安裝預設強制 MFA；既有安裝保留目前政策，尚無 MFA 政策紀錄的舊版也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」的專用開關啟用或停用強制。新團隊的第一位 Admin 以密碼登入後，若 SMTP 或授權代寄可用，可改用信箱驗證完成首次註冊；若兩者皆不可用，須由主機操作員執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再完成驗證器註冊，無法只靠儀表板完成。既有未強制的安裝可繼續自願註冊，開啟前請查看 `mfa.overview`、確認通道送達並測試主機救援。兩種 dashboard 設定寫入都要求目前有效的 Admin。註冊及後續憑證變更透過帳號 epoch 作廢舊 JWT；單純切換強制則讓既有 access token 自然到期，拒絕未註冊者 refresh。強制時拒絕舊共用 token WebSocket 登入。
 
 設定使用啟動時載入的記憶體快照；dashboard 寫入後更新，外部檔案每 30 秒重載。失敗時警告並保留最後有效值，任何版本從未載入有效值都拒絕；啟動時既有政策資料庫無法讀取或已損壞也會拒絕。缺少 `[auth]` 表格或設定鍵時保留資料庫中的政策；新團隊初始化會在設定檔及帳號資料庫明確記錄 true。所有版本都依儲存的政策強制驗證，授權過期、驗證失敗回退或指定 Personal 啟動都不會停用；只有 Admin 主動關閉才取消強制。沒有政策資料庫的全新 Personal 安裝仍預設不強制；本機自動登入不能略過已啟用的強制驗證。Personal 同樣可使用主機救援。證明欄位、工作階段綁定及 `duduclaw ops users mfa-reset`／`mfa-enrollment-code` 主機救援見[安全防禦](../../features/zh-TW/05-security-defense.md)。金鑰輪替不在本階段範圍。
 
@@ -619,7 +637,42 @@ CLI 家目錄匯入以同一份私有快照檢查並解壓縮，壓縮備份上�
 
 ### Email 驗證碼、通行金鑰與保持登入（v1.80.0 起）
 
-在「設定 → 帳號」可保留原有驗證器 App，再加入 Email 驗證碼或多把具名的通行金鑰（Passkey）。新增或移除前需輸入目前密碼。Email 設定會將六位數代碼寄到帳號信箱，驗證成功才啟用。管理員需先完成既有 `[channels.email]` SMTP 寄信設定（`smtp_host`、`from_addr`，以及寄信服務需要的帳密）；未設定可用的寄信服務時，介面會顯示無法使用。因素變更會留下稽核，已設定寄信時也會通知本人。
+在「設定 → 帳號」可保留原有驗證器 App，再加入 Email 驗證碼或多把具名的通行金鑰（Passkey）。新增或移除前需輸入目前密碼。Email 設定會將六位數代碼寄到帳號信箱，驗證成功才啟用。系統優先使用既有 `[channels.email]` SMTP 寄信設定（`smtp_host`、`from_addr`，以及寄信服務需要的帳密）。未設定 SMTP 時，已綁定本機且有效的付費授權可透過 DuDuClaw 代寄驗證碼；NFR 授權不適用，且須啟用下述代寄設定。因素變更會留下稽核；安全設定變更通知仍只使用已設定的 SMTP。
+
+#### Email 驗證碼代寄設定
+
+在 gateway 的 `config.toml` 設定：
+
+```toml
+[mfa]
+email_relay = true
+```
+
+`email_relay` 預設為 `true`。設為 `false` 只停用授權代寄，不會停用自有 SMTP，也不會關閉兩步驟驗證強制政策。OpenSource、Hobby 試用版、Partner、NFR、未綁定機器的 OEM、無效或過期授權都不能代寄，請設定 SMTP。Partner 即使是標示 `nfr = false` 的舊授權，也不提供代寄。代寄使用編譯時固定的官方主機，與授權更新設定分開；`DUDUCLAW_CONTROL_URL`、授權中的 `control_url`、設定檔及環境變數都不能變更代寄目的地。專用傳輸只使用 HTTPS 443、釘選公開 DNS 解析結果、禁用 proxy 與重新導向，逾時為 10 秒，回應上限為 4 KiB。
+
+第一次符合資格的寄送會以挑戰－回應方式註冊：gateway 先為所屬訂閱取得一次性 challenge，再送出簽章授權、機器指紋、challenge 與簽發時間，並附上安裝金鑰（見下節）的 Ed25519 簽章；安裝識別碼由伺服器依核准的公鑰推導。註冊會取代既有代寄憑證時，請求另以同一份簽章內容的 HMAC 證明持有該憑證。回應內容存放在固定容量、釋放時清零的緩衝區；HTTP 與 TLS 函式庫內部的副本無法清除。憑證存於 `<home>/state/mfa-relay.json`，僅限擁有者存取：Unix 使用 0600 權限，macOS 另拒絕擴充 ACL；Windows 使用私有 DACL 與釘選控制代碼。寫入透過釘選目錄控制代碼、拒絕符號連結，再以原子改名發布。後續寄送只包含收件信箱、驗證碼與語言，HMAC 簽章綁定方法、路徑、時間、nonce 及實際請求內容，不會再次傳送授權。所有註冊嘗試共用持久保存的每小時一次上限，初次註冊失敗也計入，重啟 gateway 不會重設額度。收到 `403 relay_not_allowed` 時，若額度允許，該次寄送最多重新註冊並重送一次。每份訂閱只保留一組有效代寄憑證，且只有帳號擁有者核准其金鑰的安裝能註冊。
+
+#### 安裝金鑰與授權控制台核准
+
+每個安裝都有自己的 Ed25519 金鑰，存於 `<home>/state/installation.key`（32 bytes 種子，與代寄憑證相同的僅限擁有者存取保護），與 `identity.key` 分開。只有檔案不存在時才會建立：執行 `duduclaw license activate`、授權更新（gateway 自動更新或 `duduclaw license refresh`），或執行 `duduclaw license installation-key` 時。無法讀取、格式錯誤或不安全的檔案（擁有者或權限不符、符號連結、多重硬連結、擴充 ACL）只會回報錯誤，絕不覆寫；修正或還原前代寄維持不可用。AI 員工無法透過檔案守門讀取 `state/` 下的任何檔案。備份資料目錄時請一併保留此金鑰。
+
+授權更新與換綁請求會以 `installation_pubkey` 送出公鑰。授權內含相同的已簽章公鑰後才能代寄。授權服務未見過的金鑰會在授權控制台建立待核准申請，並通知帳號擁有者。等待核准期間付費功能照常運作，SMTP 也仍可寄送驗證碼，只有代寄需要等待。每個既有安裝都要核准一次。
+
+核准前請比對金鑰指紋。在 gateway 主機執行：
+
+```bash
+duduclaw license installation-key
+```
+
+第一行是 16 字元指紋，例如 `1a2b-3c4d-5e6f-7a8b`：對 32 bytes 原始公鑰計算 SHA-256 後取前 16 個十六進位字元，每 4 個一組。公鑰與核准狀態等詳細資訊輸出到 stderr。等待核准期間，管理員也會在「設定 → 帳號」的 Email 說明下方看到此指紋。只有控制台顯示的指紋相同時才核准；不認得的申請代表有人持有授權檔副本，請拒絕。
+
+金鑰遺失時（例如換機但沒有帶走資料目錄），下一次授權更新會產生新金鑰並重新申請核准。已登入的帳號擁有者可在控制台預先授權一個指紋，24 小時內相同指紋的更新會自動核准。若只遺失代寄憑證，可在控制台使用「重設代寄憑證」，下一次註冊視為首次註冊。
+
+等待核准時，Email 說明會顯示此安裝正等待核准（授權尚未含金鑰），或此安裝的金鑰與核准的金鑰不同（例如還原到另一台機器）。
+
+代寄僅使用固定驗證碼信件，不能自訂主旨或內文。驗證碼與代寄秘密不寫入日誌；gateway 的收件者紀錄使用既有每個資料目錄專屬的稽核金鑰，以獨立用途標記計算 HMAC，無法取得金鑰時只記錄固定值 `unavailable`。控制平面另有寄送額度；看到「寄送太頻繁，請稍後再試」時請等待，其他寄送失敗可稍後再試或聯絡管理員。已在本機簽發的驗證碼，即使之後寄送服務不可用，仍可驗證。代寄的可用資格不保證信件已送達，實際代寄仍須另行驗收。
+
+Email 選項停用時，介面會說明沒有可用寄信方式、代寄已關閉、此授權類型不提供代寄（NFR 或未綁定的 OEM），或安裝金鑰正等待授權控制台核准，並提示管理員在此之前先設定 SMTP。通行金鑰停用時，介面會區分非安全連線與瀏覽器不支援：以 `http://` 區網位址開啟者，請改用設定好的 HTTPS 網址或在 gateway 主機使用 localhost；瀏覽器不支援者，請改用支援通行金鑰的瀏覽器。
 
 各選項需要的條件：
 
@@ -649,7 +702,7 @@ CLI 家目錄匯入以同一份私有快照檢查並解壓縮，壓縮備份上�
 
 長期憑證不放入 localStorage，JavaScript 也無法讀取：Cookie 使用 HttpOnly、SameSite=Strict，範圍限定 `/api/session`，HTTPS 下加上 Secure。伺服器只保存雜湊，每次使用就輪替；舊憑證重用會撤銷整個憑證家族。Cookie 端點會檢查 Origin，儀表板 WebSocket 升級也會檢查 Origin。
 
-實際 SMTP 送達、各平台瀏覽器的通行金鑰註冊與登入、跨平台 Rust 建置、依賴稽核及完整 gateway 整合測試仍待驗收；介面程式與已撰寫測試不代表上述項目已通過。
+實際 SMTP／授權代寄送達、各平台瀏覽器的通行金鑰註冊與登入、跨平台 Rust 建置、依賴稽核及完整 gateway 整合測試仍待驗收；介面程式與已撰寫測試不代表上述項目已通過。
 
 ### 儀表板雙因素登入
 

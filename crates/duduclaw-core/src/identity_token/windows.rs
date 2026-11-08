@@ -27,7 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-struct LocalAllocation(*mut core::ffi::c_void);
+pub(crate) struct LocalAllocation(pub(crate) *mut core::ffi::c_void);
 impl Drop for LocalAllocation {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -42,7 +42,7 @@ fn denied(message: &'static str) -> io::Error {
 }
 
 // A pointer-aligned buffer owns the TOKEN_USER and its variable-length SID.
-fn current_user() -> io::Result<Vec<usize>> {
+pub(crate) fn current_user() -> io::Result<Vec<usize>> {
     let mut raw = null_mut();
     // SAFETY: valid process pseudo-handle and output pointer; token is owned below.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
@@ -69,7 +69,7 @@ fn user_sid(user: &[usize]) -> PSID {
     unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid }
 }
 
-fn descriptor(sddl: &str) -> io::Result<LocalAllocation> {
+pub(crate) fn descriptor(sddl: &str) -> io::Result<LocalAllocation> {
     let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut raw = null_mut();
     // SAFETY: NUL-terminated input and valid output pointer; revision 1 is SDDL_REVISION_1.
@@ -79,7 +79,7 @@ fn descriptor(sddl: &str) -> io::Result<LocalAllocation> {
     Ok(LocalAllocation(raw))
 }
 
-fn private_descriptor(user: &[usize]) -> io::Result<LocalAllocation> {
+pub(crate) fn private_descriptor(user: &[usize]) -> io::Result<LocalAllocation> {
     let mut raw = null_mut();
     if unsafe { ConvertSidToStringSidW(user_sid(user), &mut raw) } == 0 {
         return Err(io::Error::last_os_error());
@@ -136,6 +136,16 @@ fn validate(file: &File, user: &[usize]) -> io::Result<()> {
     if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
         return Err(denied("identity key must be a regular file, not a reparse point"));
     }
+    validate_acl(file, user, true)
+}
+
+/// Shared handle-based ACL check. Existing homes may grant outsiders read-only
+/// access; private state and secrets permit only owner, SYSTEM and Administrators.
+pub(crate) fn validate_acl(file: &File, user: &[usize], private: bool) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, WRITE_DAC, WRITE_OWNER,
+        FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES, FILE_DELETE_CHILD};
+    let handle = file.as_raw_handle();
     let mut owner = null_mut();
     let mut dacl: *mut ACL = null_mut();
     let mut raw = null_mut();
@@ -174,12 +184,16 @@ fn validate(file: &File, user: &[usize]) -> io::Result<()> {
         }
         let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
         let sid = unsafe { std::ptr::addr_of!((*allowed).SidStart) }.cast_mut().cast();
-        if unsafe { IsValidSid(sid) } == 0
-            || (unsafe { EqualSid(sid, owner) } == 0
-                && unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } == 0
-                && unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } == 0)
-        {
-            return Err(denied("identity key grants access outside its owner, SYSTEM and Administrators"));
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(denied("invalid access-control SID"));
+        }
+        let trusted = unsafe { EqualSid(sid, owner) } != 0
+            || unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0
+            || unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } != 0;
+        let mutation_rights = GENERIC_ALL | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER
+            | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD;
+        if !trusted && (private || unsafe { (*allowed).Mask } & mutation_rights != 0) {
+            return Err(denied("file grants unsafe access outside its owner, SYSTEM and Administrators"));
         }
     }
     Ok(())

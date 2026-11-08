@@ -60,6 +60,88 @@ export CLOUD_BUILD="${CLOUD_BUILD:-1}"
 # Extended-regex semver matcher (no leading anchor — reused in several patterns).
 SEMVER='[0-9]+\.[0-9]+\.[0-9]+'
 
+# Control-plane regions are independent of the artifact registry region.
+# Both callers declare CONTROL_PLANE_REGIONS locally where applicable.
+resolve_cp_regions() {
+    local configured
+    if [[ "${CP_REGIONS+x}" == "x" ]]; then
+        configured="$CP_REGIONS"
+    elif [[ -n "${CP_REGION:-}" ]]; then
+        configured="$CP_REGION"
+        echo "WARNING: CP_REGION-only fallback uses $CP_REGION; the other control-plane region is skipped. Set CP_REGIONS to sync both regions." >&2
+    else
+        configured="asia-east1 us-east4"
+    fi
+    # Split whitespace only; never expand region names as filesystem globs.
+    configured="${configured//$'\n'/ }"
+    read -r -a CONTROL_PLANE_REGIONS <<< "$configured"
+    if [[ ${#CONTROL_PLANE_REGIONS[@]} -eq 0 ]]; then
+        echo "ERROR: CP_REGIONS must contain at least one region." >&2
+        return 1
+    fi
+}
+
+# Read the revision actually serving traffic, never just the proposed template.
+# Empty/unreadable or split traffic fails the caller's comparisons closed.
+read_cp_serving_env() {
+    local service="$1" project="$2" region="$3" env_json
+    CP_SERVING_REV="$(gcloud run services describe "$service" --project "$project" --region "$region" \
+        --format=json 2>/dev/null | python3 -c 'import json, sys
+live = [t["revisionName"] for t in json.load(sys.stdin)["status"].get("traffic", []) if t.get("percent")]
+print(live[0] if len(live) == 1 else "")' 2>/dev/null || true)"
+    CP_SERVING_VERSIONS=""
+    CP_SERVING_MANIFEST=""
+    if [[ -n "$CP_SERVING_REV" ]]; then
+        env_json="$(gcloud run revisions describe "$CP_SERVING_REV" --project "$project" --region "$region" \
+            --format=json 2>/dev/null || true)"
+        CP_SERVING_VERSIONS="$(printf '%s' "$env_json" | python3 -c 'import json, sys
+env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
+print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIONS"), ""))' 2>/dev/null || true)"
+        CP_SERVING_MANIFEST="$(printf '%s' "$env_json" | python3 -c 'import json, sys
+env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
+print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DELIVERY_MANIFEST"), ""))' 2>/dev/null || true)"
+    fi
+    echo "  Control-plane [$region] serving revision: ${CP_SERVING_REV:-unknown}"
+}
+
+verify_cp_regions() {
+    local service="$1" project="$2" want="$3" cp_region rc=0 checks=0 passed=0
+    local CP_SERVING_REV CP_SERVING_VERSIONS CP_SERVING_MANIFEST
+    local first=1 baseline_versions="" baseline_manifest=""
+    local -a CONTROL_PLANE_REGIONS=()
+    resolve_cp_regions || return 1
+    for cp_region in "${CONTROL_PLANE_REGIONS[@]}"; do
+        read_cp_serving_env "$service" "$project" "$cp_region"
+        checks=$((checks + 2))
+        if [[ ",$CP_SERVING_VERSIONS," == *",v$want,"* ]]; then
+            echo "  pro-offer [$cp_region] v$want OK ($CP_SERVING_REV)"
+            passed=$((passed + 1))
+        else
+            echo "  pro-offer [$cp_region] v$want MISSING (revision ${CP_SERVING_REV:-unknown}, offers ${CP_SERVING_VERSIONS:-unknown})"
+            rc=1
+        fi
+        if printf '%s' "$CP_SERVING_MANIFEST" | python3 -c 'import json, re, sys
+doc = json.load(sys.stdin)
+assert doc["schema_version"] == 1 and doc["profile"] == "general-distributor" and doc["platform"] == "linux/amd64"
+assert any(a["version"] == sys.argv[1] and re.fullmatch(r"[0-9a-f]{64}", a["sha256"]) for a in doc["artifacts"])
+' "v$want" 2>/dev/null && \
+            { [[ "$first" == "1" ]] || [[ "$CP_SERVING_VERSIONS" == "$baseline_versions" && "$CP_SERVING_MANIFEST" == "$baseline_manifest" ]]; }; then
+            echo "  delivery-manifest [$cp_region] v$want OK ($CP_SERVING_REV)"
+            passed=$((passed + 1))
+        else
+            echo "  delivery-manifest [$cp_region] v$want MISSING/INVALID or differs between regions ($CP_SERVING_REV)"
+            rc=1
+        fi
+        if [[ "$first" == "1" ]]; then
+            baseline_versions="$CP_SERVING_VERSIONS"
+            baseline_manifest="$CP_SERVING_MANIFEST"
+            first=0
+        fi
+    done
+    echo "Control-plane verification: $passed/$checks checks passed across ${#CONTROL_PLANE_REGIONS[@]} region(s)."
+    return "$rc"
+}
+
 # --- Enumerate every version-bearing platform manifest as "kind|path" lines. ---
 # Adding a new publish target = add it here, and audit/bump/assert all pick it up.
 platform_manifests() {
@@ -274,28 +356,7 @@ run_verify() {
                 rc=1
             fi
 
-            # The control plane offers a version only when it is in the
-            # allowlist of the revision that actually serves traffic.
-            local cp_service cp_rev cp_versions
-            cp_service="${DUDUCLAW_CP_SERVICE:-duduclaw-control-plane}"
-            cp_rev="$(gcloud run services describe "$cp_service" --project "$proj" --region "$region" \
-                --format=json 2>/dev/null | python3 -c 'import json, sys
-live = [t["revisionName"] for t in json.load(sys.stdin)["status"].get("traffic", []) if t.get("percent")]
-print(live[0] if len(live) == 1 else "")' 2>/dev/null || true)"
-            cp_versions=""
-            if [[ -n "$cp_rev" ]]; then
-                cp_versions="$(gcloud run revisions describe "$cp_rev" --project "$proj" --region "$region" \
-                    --format=json 2>/dev/null | python3 -c 'import json, sys
-env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
-print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIONS"), ""))' 2>/dev/null || true)"
-            fi
-            if [[ ",$cp_versions," == *",v$want,"* ]]; then
-                printf "  %-10s %-10s OK (%s)\n" "pro-offer" "v$want" "$cp_rev"
-            else
-                printf "  %-10s %-10s MISSING — serving revision '%s' offers '%s'\n" \
-                    "pro-offer" "v$want" "${cp_rev:-unknown}" "${cp_versions:-unknown}"
-                rc=1
-            fi
+            verify_cp_regions "${DUDUCLAW_CP_SERVICE:-duduclaw-control-plane}" "$proj" "$want" || rc=1
         else
             echo "  pro-image / oem-tar: NOT VERIFIED (no GCP project configured)"
             rc=1
@@ -1075,8 +1136,8 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
     # per-release HERE as the authoritative source; discovery + the registry
     # fallback stay behind it as the safety net. Newest-first, top 3 release
     # tags from git (desktop-v* excluded); first entry doubles as the console
-    # packaging default pin. Best-effort like every step above — a failure
-    # WARNs with the manual command, never fails the release.
+    # packaging default pin. Any failed regional update/readback is recorded
+    # in PRO_GAPS and fails the enterprise release gate below.
     # Opt out: DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1.
     # With neither the image nor a binary uploaded the sync below does not
     # run (it would offer a version with nothing behind it); v1.76.2's first
@@ -1091,7 +1152,9 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
         PRO_GAPS+=("control-plane allowlist not synced (DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1)")
     elif [[ "$PRO_IMAGE_PUSHED" == "1" || "$PRO_BIN_UPLOADED" == "1" ]]; then
         CP_SERVICE="${DUDUCLAW_CP_SERVICE:-duduclaw-control-plane}"
-        CP_REGION="${DUDUCLAW_GCP_REGION:-asia-east1}"
+        CONTROL_PLANE_REGIONS=()
+        resolve_cp_regions || exit 1
+        CP_SOURCE_REGION="${CONTROL_PLANE_REGIONS[0]}"
         CP_PROJECT="${DUDUCLAW_GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
         # Newest three vX.Y.Z tags — the tag for THIS release already exists
         # at this point in the flow, so it is the natural first entry.
@@ -1101,7 +1164,7 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
             echo ""
             echo "  WARNING: gcloud/project unavailable — control-plane version allowlist NOT synced."
             PRO_GAPS+=("control-plane allowlist not synced (gcloud/project unavailable)")
-            echo "           Run manually:  gcloud run services update $CP_SERVICE --region $CP_REGION \\"
+            echo "           Run manually for each region (${CONTROL_PLANE_REGIONS[*]}): gcloud run services update $CP_SERVICE --region REGION \\"
             echo "                            --update-env-vars '^:^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS:-v$NEW_VERSION}'"
         elif [[ -z "$CP_VERSIONS" ]]; then
             echo ""
@@ -1121,7 +1184,7 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
                 # A failed read must not look like "no manifest yet": that would
                 # rewrite it with only the new release and drop every approved one.
                 CP_MANIFEST_READ=1
-                CP_CURRENT_MANIFEST="$(gcloud run services describe "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
+                CP_CURRENT_MANIFEST="$(gcloud run services describe "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_SOURCE_REGION" \
                     --format=json 2>/dev/null | python3 -c 'import json, sys
 env = json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env", [])
 print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DELIVERY_MANIFEST"), ""))')" || CP_MANIFEST_READ=0
@@ -1150,52 +1213,42 @@ print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DE
             [[ -n "$CP_MANIFEST" ]] && echo "Syncing control-plane delivery manifest: $CP_MANIFEST"
             # ^|^ switches the pair delimiter to '|' so the comma-separated
             # version list and the JSON manifest each survive as ONE value.
-            if gcloud run services update "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
-                --update-env-vars "^|^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS}${CP_MANIFEST:+|DUDUCLAW_GENERAL_DELIVERY_MANIFEST=${CP_MANIFEST}}" >/dev/null 2>&1; then
-                # A staged rollout (update-traffic --to-revisions) pins traffic to
-                # one revision, and `services update` then creates a revision that
-                # never serves (pinned 2026-10-12 to 10-14, so the v1.73.0 and
-                # v1.73.1 allowlists never took effect). Route to the latest
-                # revision and check what the serving revision actually carries.
-                gcloud run services update-traffic "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
-                    --to-latest --quiet >/dev/null 2>&1 || true
-                CP_SERVING_REV="$(gcloud run services describe "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
-                    --format=json 2>/dev/null | python3 -c 'import json, sys
-live = [t["revisionName"] for t in json.load(sys.stdin)["status"].get("traffic", []) if t.get("percent")]
-print(live[0] if len(live) == 1 else "")' 2>/dev/null || true)"
-                CP_SERVING_VERSIONS=""
-                CP_SERVING_MANIFEST=""
-                if [[ -n "$CP_SERVING_REV" ]]; then
-                    CP_SERVING_ENV="$(gcloud run revisions describe "$CP_SERVING_REV" --project "$CP_PROJECT" --region "$CP_REGION" \
-                        --format=json 2>/dev/null || true)"
-                    CP_SERVING_VERSIONS="$(printf '%s' "$CP_SERVING_ENV" | python3 -c 'import json, sys
-env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
-print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIONS"), ""))' 2>/dev/null || true)"
-                    CP_SERVING_MANIFEST="$(printf '%s' "$CP_SERVING_ENV" | python3 -c 'import json, sys
-env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
-print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DELIVERY_MANIFEST"), ""))' 2>/dev/null || true)"
-                fi
-                if [[ -n "$CP_MANIFEST" && "$CP_SERVING_MANIFEST" != "$CP_MANIFEST" ]]; then
-                    PRO_GAPS+=("delivery manifest written but not serving on '${CP_SERVING_REV:-unknown}'")
-                    echo "  WARNING: delivery manifest was written but the serving revision"
-                    echo "           '${CP_SERVING_REV:-unknown}' does not carry it."
-                fi
-                if [[ "$CP_SERVING_VERSIONS" == "$CP_VERSIONS" ]]; then
-                    echo "  Control-plane allowlist updated; serving revision $CP_SERVING_REV carries it."
-                else
-                    PRO_GAPS+=("control-plane allowlist written but not serving on '${CP_SERVING_REV:-unknown}'")
-                    echo "  WARNING: control-plane allowlist was written but is NOT serving"
-                    echo "           (serving revision '${CP_SERVING_REV:-unknown}' has '${CP_SERVING_VERSIONS:-unknown}')."
-                    echo "           Check: gcloud run services describe $CP_SERVICE --region $CP_REGION --format='yaml(spec.traffic,status.traffic)'"
-                fi
+            if [[ -z "$CP_MANIFEST" ]]; then
+                PRO_GAPS+=("control-plane delivery manifest not computed — no regions updated")
             else
-                PRO_GAPS+=("control-plane env update failed — see the manual command above")
-                echo "  WARNING: control-plane env update FAILED. Run manually:"
-                echo "    gcloud run services update $CP_SERVICE --region $CP_REGION \\"
-                echo "      --update-env-vars '^|^DUDUCLAW_PRO_VERSIONS=$CP_VERSIONS${CP_MANIFEST:+|DUDUCLAW_GENERAL_DELIVERY_MANIFEST=$CP_MANIFEST}'"
+                for CP_REGION in "${CONTROL_PLANE_REGIONS[@]}"; do
+                    if gcloud run services update "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
+                        --update-env-vars "^|^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS}|DUDUCLAW_GENERAL_DELIVERY_MANIFEST=${CP_MANIFEST}" >/dev/null 2>&1; then
+                        # Explicitly move pinned traffic to the updated revision.
+                        if ! gcloud run services update-traffic "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
+                            --to-latest --quiet >/dev/null 2>&1; then
+                            PRO_GAPS+=("[$CP_REGION] control-plane traffic update failed")
+                        fi
+                    else
+                        PRO_GAPS+=("[$CP_REGION] control-plane env update failed")
+                        echo "  WARNING: [$CP_REGION] control-plane env update FAILED. Run manually:"
+                        echo "    gcloud run services update $CP_SERVICE --project $CP_PROJECT --region $CP_REGION \\"
+                        echo "      --update-env-vars '^|^DUDUCLAW_PRO_VERSIONS=$CP_VERSIONS|DUDUCLAW_GENERAL_DELIVERY_MANIFEST=$CP_MANIFEST'"
+                    fi
+                done
+                # Read back every region after all updates, including failed ones.
+                for CP_REGION in "${CONTROL_PLANE_REGIONS[@]}"; do
+                    read_cp_serving_env "$CP_SERVICE" "$CP_PROJECT" "$CP_REGION"
+                    if [[ "$CP_SERVING_MANIFEST" != "$CP_MANIFEST" ]]; then
+                        PRO_GAPS+=("[$CP_REGION] delivery manifest written but not serving on '${CP_SERVING_REV:-unknown}'")
+                        echo "  WARNING: [$CP_REGION] serving delivery manifest differs from intended value."
+                    fi
+                    if [[ "$CP_SERVING_VERSIONS" == "$CP_VERSIONS" ]]; then
+                        echo "  Control-plane [$CP_REGION] allowlist updated; serving revision $CP_SERVING_REV carries it."
+                    else
+                        PRO_GAPS+=("[$CP_REGION] control-plane allowlist written but not serving on '${CP_SERVING_REV:-unknown}'")
+                        echo "  WARNING: [$CP_REGION] serving allowlist differs from intended value (${CP_SERVING_VERSIONS:-unknown})."
+                    fi
+                done
             fi
         fi
     fi
+    # --- End control-plane env sync ---
 fi
 
 rm -f "${PRO_TAR_SHA_FILE:-}"
