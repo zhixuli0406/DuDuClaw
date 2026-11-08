@@ -472,7 +472,12 @@ impl MethodHandler {
             }
 
             // ── System (admin only for config changes) ───────
-            "system.status" => boxed_frame(|| self.handle_system_status()).await,
+            // Every role may read it; per-employee isolation readiness labels
+            // (F3) only for the same Admin check `require_admin!` applies.
+            "system.status" => {
+                let admin = acl::require_role(ctx, UserRole::Admin).is_ok();
+                boxed_frame(|| self.handle_system_status(admin)).await
+            }
             "system.doctor" => {
                 require_admin!();
                 boxed_frame(|| self.handle_system_doctor()).await

@@ -676,3 +676,7 @@ fn offboarding_personal_owner_refuses_transfer_with_message() {
     assert_eq!(outcome.transferred_agents, vec!["team".to_string()]);
     assert_eq!(f.users.check_agent_access(&f.bob, LABEL).unwrap(), None);
 }
+
+/// F3 readiness reasons reuse this module's real-store fixture.
+#[path = "isolation_readiness/reasons_tests.rs"]
+mod readiness_reasons;

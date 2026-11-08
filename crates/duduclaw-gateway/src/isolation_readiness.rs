@@ -9,6 +9,10 @@ mod integration;
 pub use integration::{IntegrationComponent, IntegrationProbe, ProbeError, PtyRequirement,
     ServiceObservation, ServiceObservationCache, install_integration_probe};
 
+#[path = "isolation_readiness/reasons.rs"]
+pub(crate) mod reasons;
+pub use reasons::{EmployeeReadiness, Overall, Reason, record_connector_build};
+
 static REQUIRED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -64,8 +68,18 @@ fn runtime_adapters_state() -> ComponentState {
 #[derive(Clone, Debug, Serialize)]
 pub struct Readiness {
     pub required: bool,
+    /// Admission truth: every component verified (see [`check_execution`]).
     pub ready: bool,
     pub components: Components,
+    /// F3, set only by [`report`]: overall status over components and reasons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Overall>,
+    /// F3, set only by [`report`]: distinct reasons over all employees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasons: Option<Vec<Reason>>,
+    /// F3, admins only: per-employee reasons (labels, no other identifiers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub employees: Option<Vec<EmployeeReadiness>>,
 }
 
 fn applies(linux: bool, protected: bool, team: bool) -> bool { linux && protected && team }
@@ -196,7 +210,37 @@ fn backend_admission() -> Result<(), duduclaw_isolation::execution::BackendError
 pub fn status() -> Option<Readiness> {
     if !REQUIRED.load(Ordering::Acquire) { return None; }
     let components = Components::current(spawnd_verified());
-    Some(Readiness { required: true, ready: components.all_ready(), components })
+    Some(Readiness { required: true, ready: components.all_ready(), components,
+        status: None, reasons: None, employees: None })
+}
+
+/// [`status`] plus the F3 reasons, for the dashboard. Blocking (SQLite and
+/// root ReadBack per employee): call on the blocking pool. Diagnosis only;
+/// it never admits anything. Employee labels are included for admins only.
+pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
+    let mut readiness = status()?;
+    let assessment = reasons::assess_installed(home);
+    readiness = with_assessment(readiness, assessment, admin);
+    Some(readiness)
+}
+
+/// The assessment itself could not run (blocking task failed): fail closed.
+pub fn report_failed() -> Option<Readiness> {
+    let failed = reasons::Assessment { reasons: [Reason::ServiceUnavailable].into(), employees: Vec::new() };
+    status().map(|readiness| with_assessment(readiness, failed, false))
+}
+
+fn with_assessment(mut readiness: Readiness, assessment: reasons::Assessment, admin: bool) -> Readiness {
+    let mut all = assessment.reasons;
+    // spawnd unreachable / receipt unreadable: the host evidence components.
+    if readiness.components.launch_service == ComponentState::Unavailable {
+        all.insert(Reason::ServiceUnavailable);
+    }
+    readiness.status = Some(if all.contains(&Reason::ServiceUnavailable) { Overall::ServiceUnavailable }
+        else if readiness.ready && all.is_empty() { Overall::Ready } else { Overall::ActionRequired });
+    readiness.reasons = Some(all.into_iter().collect());
+    readiness.employees = admin.then_some(assessment.employees);
+    readiness
 }
 
 #[cfg(target_os = "linux")]
@@ -308,11 +352,55 @@ mod tests {
     #[test]
     fn operator_payload_has_fixed_component_states_only() {
         let components = Components::current(false);
-        let value = serde_json::to_value(Readiness { required: true, ready: false, components }).unwrap();
+        let value = serde_json::to_value(Readiness { required: true, ready: false, components,
+            status: None, reasons: None, employees: None }).unwrap();
         assert_eq!(value["required"], true);
         assert_eq!(value["ready"], false);
         assert_eq!(value["components"].as_object().unwrap().len(), 8);
         assert_eq!(value["components"]["launch_service"], "unavailable");
         assert_eq!(value["components"]["mcp_boundary"], "pending_integration");
+        // Legacy shape: no F3 keys unless `report` set them.
+        assert_eq!(value.as_object().unwrap().len(), 3);
+    }
+
+    fn all_ready() -> Components {
+        Components { launch_service: ComponentState::Ready, sandbox: ComponentState::Ready,
+            network: ComponentState::Ready, storage: ComponentState::Ready,
+            parse_worker: ComponentState::Ready, update_service: ComponentState::Ready,
+            mcp_boundary: ComponentState::Ready, runtime_adapters: ComponentState::Ready }
+    }
+
+    fn base(components: Components) -> Readiness {
+        Readiness { required: true, ready: components.all_ready(), components, status: None, reasons: None, employees: None }
+    }
+
+    #[test]
+    fn readiness_overall_status_and_admin_only_employee_labels() {
+        use reasons::{Assessment, EmployeeReadiness};
+        let employee = EmployeeReadiness { label: "team".into(), ready: false,
+            reasons: vec![Reason::ConnectorSetupRequired { provider: Some("database") }] };
+        let assessment = Assessment { reasons: [Reason::ConnectorSetupRequired { provider: Some("database") }].into(),
+            employees: vec![employee] };
+        let admin = serde_json::to_value(with_assessment(base(all_ready()), assessment.clone(), true)).unwrap();
+        assert_eq!(admin["status"], "action_required");
+        assert_eq!(admin["ready"], true, "admission truth is unchanged");
+        assert_eq!(admin["reasons"], serde_json::json!([{ "code": "connector_setup_required", "provider": "database" }]));
+        assert_eq!(admin["employees"][0]["label"], "team");
+        let staff = serde_json::to_value(with_assessment(base(all_ready()), assessment, false)).unwrap();
+        assert!(staff.get("employees").is_none());
+        assert_eq!(staff["reasons"].as_array().unwrap().len(), 1);
+        // No reasons and every component verified: the only "ready".
+        let ready = with_assessment(base(all_ready()), Assessment::default(), true);
+        assert_eq!(ready.status, Some(Overall::Ready));
+        // Unreachable spawnd is service_unavailable even with no employees.
+        let mut down = all_ready();
+        down.launch_service = ComponentState::Unavailable;
+        let value = with_assessment(base(down), Assessment::default(), true);
+        assert_eq!(value.status, Some(Overall::ServiceUnavailable));
+        assert_eq!(value.reasons, Some(vec![Reason::ServiceUnavailable]));
+        // Components not ready without reasons is never "ready".
+        let mut pending = all_ready();
+        pending.mcp_boundary = ComponentState::PendingIntegration;
+        assert_eq!(with_assessment(base(pending), Assessment::default(), true).status, Some(Overall::ActionRequired));
     }
 }

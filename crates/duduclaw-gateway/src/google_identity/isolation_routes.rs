@@ -103,6 +103,21 @@ impl GoogleAccountRoutes {
         Ok(routes)
     }
 
+    /// Readiness (F3): the same route resolution as [`Self::read`] for a
+    /// lifecycle the caller has just read; only the typed outcome is kept.
+    /// The tenant source is read exactly as `Self::read`'s caller (the bridge)
+    /// reads it: `tenant_source::read(home, agent)` with the employee's label.
+    /// Fail closed: an unreadable source is `Unavailable`, a refused one
+    /// `BindingMismatch` (the same mapping as its `VerificationError`).
+    pub(crate) fn readiness(home: &Path, catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle)
+        -> Result<(), GoogleRoutesError> {
+        let tenant_source = super::tenant_source::read(home, &lifecycle.label).map_err(|error| match error {
+            super::tenant_source::TenantSourceError::Unavailable => GoogleRoutesError::Unavailable,
+            super::tenant_source::TenantSourceError::Refused => GoogleRoutesError::BindingMismatch,
+        })?;
+        Self::from_lifecycle(catalog, lifecycle, tenant_source.as_ref().map(|source| source.kind())).map(|_| ())
+    }
+
     fn from_lifecycle(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle,
         tenant_source: Option<TenantSourceKind>) -> Result<Self, GoogleRoutesError> {
         let routes = catalog.active_routes_for(&lifecycle.binding).map_err(|_| GoogleRoutesError::Unavailable)?;

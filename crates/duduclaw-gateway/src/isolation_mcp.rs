@@ -106,6 +106,9 @@ pub use linux::{McpBoundaryService, McpRunSession};
 mod authority;
 #[cfg(target_os = "linux")]
 pub use authority::HostTurn;
+/// F3 readiness applies the exact B1 Personal rule (no copy of it).
+#[cfg(target_os = "linux")]
+pub(crate) use authority::personal_facts;
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/launch.rs"]
 mod launch;
