@@ -3578,6 +3578,10 @@ mod cli_composed;
 #[path = "effect_authority_w3_tests.rs"]
 mod w3;
 
+/// v1.81 E3: pinned Personal refresh — consent revoke and revoke during refresh.
+#[path = "effect_authority_e3_tests.rs"]
+mod e3;
+
 #[tokio::test]
 async fn google_chat_native_personal_and_home_owners_obey_opt_in() {
     use serde_json::json;

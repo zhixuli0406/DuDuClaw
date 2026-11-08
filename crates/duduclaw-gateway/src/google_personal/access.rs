@@ -286,6 +286,14 @@ pub async fn resolve(
         };
         match oauth::refresh(&config.client_id, &config.client_secret, refresh_token).await {
             Ok(mut tokens) => {
+                // v1.81 E3 (matrix 8): an isolated request re-checks its
+                // selection (route active + generation + binding) after the
+                // exchange and BEFORE the new token is stored or used. A
+                // route revoked during the refresh discards the new token.
+                if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() {
+                    zeroize::Zeroize::zeroize(&mut tokens.secret.access_token);
+                    return Err(refresh_route_changed());
+                }
                 if tokens.secret.refresh_token.is_none() {
                     tokens.secret.refresh_token = secret.refresh_token.take();
                 }
@@ -327,10 +335,10 @@ pub async fn resolve(
                         crate::notify_push::push_person_notice(&notify_home, &notify_user, "你的 Google 連線已失效，AI 員工暫時不能使用。請到 DuDuClaw「我的連線」重新連結。").await;
                     });
                 }
-                return Err(Refusal::soft(
-                    "needs_reconnect",
-                    "你的 Google 連線已失效，請本人到「我的連線」重新連結。",
-                ));
+                // v1.81 E3: in protected mode (or inside an isolated request)
+                // the call that observed the revoked consent fails; it never
+                // continues on the configured home fallback account.
+                return Err(consent_revoked_refusal());
             }
             Err(_) => {
                 return Err(Refusal::soft(
@@ -417,6 +425,28 @@ impl PinnedPersonalToken {
             return Err(pinned_changed());
         }
         Ok(())
+    }
+}
+
+/// v1.81 E3: the isolated selection changed while a refresh was in flight.
+/// The provider's new token was discarded; the result is uncertain/refused
+/// and never eligible for a fallback account.
+fn refresh_route_changed() -> Refusal {
+    Refusal::hard(
+        "identity_changed",
+        "Google 連線路由在更新期間已變更，這次操作已停止，沒有使用新的權杖。",
+    )
+}
+
+/// v1.81 E3: consent revoked at Google (`invalid_grant`). Protected mode and
+/// isolated requests refuse without the configured home fallback; elsewhere
+/// the existing (notice-bearing) fallback policy is unchanged.
+fn consent_revoked_refusal() -> Refusal {
+    const MESSAGE: &str = "你的 Google 連線已失效，請本人到「我的連線」重新連結。";
+    if crate::runtime_readiness::is_protected_linux() || duduclaw_mcp_boundary::io_authority::is_scoped() {
+        Refusal::hard("needs_reconnect", MESSAGE)
+    } else {
+        Refusal::soft("needs_reconnect", MESSAGE)
     }
 }
 
@@ -614,6 +644,14 @@ async fn resolve_pinned_core(
                 }
             },
         };
+        if matches!(result, Err(oauth::Error::InvalidGrant)) {
+            // v1.81 E3: consent revoked at Google. Fence the owner's Personal
+            // google routes (catalog first; C4 helper) before any gate below
+            // can end this call — the fence is a product event, not an effect
+            // of this request. This pinned path never marks or reselects, and
+            // the call fails below as `needs_reconnect` (no fallback).
+            super::lifecycle::consent_revoked(home, &record.metadata);
+        }
         if matches!(read_mode, PinnedReadMode::Remote(_)) {
             read_mode.check()?;
             validate_pinned_selection(home, agent, requester, people, selected, purpose_key)?;

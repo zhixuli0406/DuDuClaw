@@ -308,3 +308,7 @@ fn audit(home: &Path, event: &str, reason: &'static str, target: &Target, routes
 #[cfg(test)]
 #[path = "isolation_connector_events_tests.rs"]
 mod tests;
+/// v1.81 E3: real catalog-backed selections for refresh-path tests.
+#[cfg(test)]
+#[path = "isolation_connector_e3_test_support.rs"]
+pub(crate) mod e3_test_support;
