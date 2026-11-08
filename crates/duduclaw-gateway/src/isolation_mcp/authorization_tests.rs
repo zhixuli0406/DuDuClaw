@@ -50,7 +50,7 @@ fn isolation_issuer_real_output_preserves_service_and_connector_scope() {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}");
     }
     // H9 selects Workspace only with an installed work broker and PublicOrigins
-    // only when the admin enabled network access (neither here); skill_extract
+    // only when the admin set [isolation] public_web (neither here); skill_extract
     // has no selector yet. Do not fabricate these grants.
     for tool in ["file_read", "web_extract", "skill_extract"] {
         assert!(!duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}");

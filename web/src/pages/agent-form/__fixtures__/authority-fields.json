@@ -33,7 +33,8 @@
     { "key": "budget.daily_cap_cents", "form_paths": ["v.daily_cap_cents"], "kind": "loosen" },
     { "key": "budget.when_unavailable", "form_paths": ["form.when_unavailable"], "kind": "loosen" },
     { "key": "budget.hard_stop", "form_paths": ["form.hard_stop"], "kind": "loosen" },
-    { "key": "google", "form_paths": ["form.google."], "kind": "google_narrow" }
+    { "key": "google", "form_paths": ["form.google."], "kind": "google_narrow" },
+    { "key": "isolation.public_web", "form_paths": [], "kind": "change" }
   ],
-  "kv_refused_sections": ["ptc", "cultural_context", "sticker", "agent", "capabilities", "container", "permissions", "channels", "odoo", "mcp", "runtime", "prompt", "os_watch", "budget"]
+  "kv_refused_sections": ["ptc", "cultural_context", "sticker", "agent", "capabilities", "container", "permissions", "channels", "odoo", "mcp", "runtime", "prompt", "os_watch", "budget", "isolation"]
 }

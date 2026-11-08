@@ -26,10 +26,19 @@ struct Fixture { dir: tempfile::TempDir, employee: test_support::SharedEmployee 
 impl Fixture {
     fn home(&self) -> &Path { self.dir.path() }
     fn profile_path(&self) -> std::path::PathBuf { self.home().join("agents").join(LABEL).join("agent.toml") }
-    fn profile(&self, network_access: bool, capabilities: &str) {
+    /// `public_web` is the admin-only `[isolation]` switch; the task sandbox's
+    /// `[container] network_access` stays off.
+    fn profile(&self, public_web: bool, capabilities: &str) { self.profile_with(false, public_web, capabilities); }
+    fn profile_with(&self, network_access: bool, public_web: bool, capabilities: &str) {
         let path = self.profile_path();
         let _ = std::fs::remove_file(&path);
-        std::fs::write(path, test_support::agent_toml(LABEL, network_access, capabilities)).unwrap();
+        std::fs::write(path, test_support::agent_toml_with(LABEL, network_access, public_web, capabilities)).unwrap();
+    }
+    /// `security_audit.jsonl` rows of `event_type`.
+    fn audit(&self, event_type: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.home().join("security_audit.jsonl")).unwrap_or_default().lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|row| row["event_type"] == event_type).collect()
     }
     fn tasks(&self, rows: &[(&str, &str)]) {
         let path = self.home().join("tasks.db");
@@ -111,6 +120,10 @@ fn any_public(auth: &Authorization) -> bool {
 fn any_task(auth: &Authorization) -> bool {
     auth.grant.resources.as_slice().iter().any(|grant| matches!(grant, ResourceGrant::Task { .. }))
 }
+fn new_task(requester: &str) -> ResourceGrant { ResourceGrant::NewTask { requester: Text::new(requester.into()).unwrap() } }
+fn any_new_task(auth: &Authorization) -> bool {
+    auth.grant.resources.as_slice().iter().any(|grant| matches!(grant, ResourceGrant::NewTask { .. }))
+}
 
 #[test]
 fn h9_workspace_grant_only_when_profile_allows() {
@@ -148,7 +161,7 @@ fn h9_workspace_grant_only_when_profile_allows() {
 fn h9_public_origins_only_when_admin_enabled() {
     let f = fixture(false);
     let web = ["web_fetch_cached", "web_extract"];
-    // Default (network_access = false): no web authority.
+    // Default ([isolation] public_web = false): no web authority.
     let auth = f.issue(&web).unwrap();
     assert!(!any_public(&auth));
     for tool in web { assert!(!eligible(&context(&auth), tool), "{tool}"); }
@@ -183,27 +196,108 @@ fn h9_task_grant_only_for_owned_record_task() {
     assert!(!auth.grant.resources.as_slice().contains(&ResourceGrant::EmployeeScope { id: EMPLOYEE }));
     capability(&auth).canonical_bytes().unwrap();
     assert!(eligible(&context(&auth), "create_task"));
-
-    // Another employee's task, or one that does not exist: the run is still
-    // limited to it, but carries no Task grant, so create_task stays hidden.
-    for task in ["task-other", "task-missing"] {
-        let auth = f.issue_task(&["create_task"], task).unwrap();
-        assert_eq!(auth.grant.task.as_ref().map(|current| current.as_str()), Some(task));
-        assert!(!any_task(&auth), "{task}");
-        assert!(!eligible(&context(&auth), "create_task"), "{task}");
-    }
-    // A reassignment before issuance is read live.
+    assert!(!any_new_task(&auth), "a task run plans under its record task, never NewTask");
+    // Another employee's task, a missing one or a reassignment before
+    // issuance refuse the run outright (`foreign_task_run_refused`).
     f.tasks(&[("task-own", "bob")]);
-    assert!(!any_task(&f.issue_task(&["create_task"], "task-own").unwrap()));
+    assert_eq!(f.issue_task(&["create_task"], "task-own").err(), Some(VerificationError::Revoked));
 
     // Interactive ingress cannot name a record task.
     assert_eq!(f.employee.authorize_record(&f.employee.snapshot(), Lane::Standard, tools(&["create_task"]),
         turn(None), None, Some("task-own")).err(), Some(VerificationError::Invalid));
-    // An interactive run has no task: no Task grant and no task-store read.
+    // An interactive run has no task: no Task grant and no task-store read
+    // (it may carry the NewTask grant instead, `create_task_interactive_new_task_only`).
     std::fs::remove_file(f.home().join("tasks.db")).unwrap();
     let auth = f.issue(&["create_task"]).unwrap();
     assert!(auth.grant.task.is_none() && !any_task(&auth));
-    assert!(!eligible(&context(&auth), "create_task"));
+}
+
+#[test]
+fn foreign_task_run_refused() {
+    let f = fixture(false);
+    f.tasks(&[("task-own", LABEL), ("task-other", "bob")]);
+    // Reassigned to another employee, or deleted: the issuer refuses the run
+    // outright (no task-limited run without the grant) and records why.
+    for task in ["task-other", "task-missing"] {
+        assert_eq!(f.issue_task(&["create_task", "task_status"], task).err(), Some(VerificationError::Revoked), "{task}");
+        let rows = f.audit("isolation_task_run_refused");
+        assert!(rows.iter().any(|row| row["details"]["task"] == task
+            && row["details"]["reason"] == crate::isolation_background::FOREIGN_TASK_REASON
+            && row["details"]["stage"] == "issuance" && row["agent_id"] == LABEL), "{task}: {rows:?}");
+    }
+    // The owned task still runs, with its grant.
+    assert!(has(&f.issue_task(&["create_task"], "task-own").unwrap(), &task_grant("task-own")));
+    // The background scheduler refuses the same run before any approval card,
+    // with the zh-TW reason the owning scheduler records.
+    use crate::isolation_background::{task_run_precheck, FOREIGN_TASK_REFUSAL};
+    assert_eq!(task_run_precheck(f.home(), "task-own", LABEL), Ok(()));
+    assert_eq!(task_run_precheck(f.home(), "task-other", LABEL), Err(Some(FOREIGN_TASK_REFUSAL)));
+    assert!(f.audit("isolation_task_run_refused").iter().any(|row|
+        row["details"]["task"] == "task-other" && row["details"]["stage"] == "schedule"));
+    // Unreadable ownership fails closed without claiming a reassignment.
+    std::fs::remove_file(f.home().join("tasks.db")).unwrap();
+    assert_eq!(task_run_precheck(f.home(), "task-own", LABEL), Err(None));
+    assert_eq!(f.issue_task(&["create_task"], "task-own").err(), Some(VerificationError::Unavailable));
+}
+
+#[test]
+fn create_task_interactive_new_task_only() {
+    let f = fixture(false);
+    let user = f.employee.user().to_owned();
+    // An interactive run listing create_task: the issuer signs NewTask for the
+    // authenticated human, never a task, and never reads tasks.db.
+    let auth = f.issue(&["create_task"]).unwrap();
+    assert!(has(&auth, &new_task(&user)), "requester is the run's human principal");
+    assert!(auth.grant.task.is_none() && !any_task(&auth));
+    assert!(matches!(&auth.grant.principal, duduclaw_isolation::capability::Principal::Human { user_id, .. }
+        if user_id.as_str() == user));
+    let record = capability(&auth);
+    record.canonical_bytes().expect("signable with EmployeeScope");
+    let ctx = context(&auth);
+    assert!(eligible(&ctx, "create_task"));
+    assert_eq!(duduclaw_mcp_boundary::tool_policy::new_task_grant(&ctx).unwrap(), new_task(&user));
+    assert!(!f.home().join("tasks.db").exists());
+    // Not listed ⇒ not selected; the profile's own denial still wins.
+    assert!(!any_new_task(&f.issue(&["tasks_update"]).unwrap()));
+    for capabilities in [r#"denied_tools = ["create_task"]"#, r#"allowed_tools = ["tasks_update"]"#] {
+        f.profile(false, capabilities);
+        let auth = f.issue(&["create_task"]).unwrap();
+        assert!(!any_new_task(&auth), "{capabilities}");
+        assert!(!eligible(&context(&auth), "create_task"), "{capabilities}");
+    }
+    f.profile(false, "");
+    // A record-backed (task/schedule) run never gets NewTask: it is task
+    // limited (no EmployeeScope) and plans under its own record task (H8).
+    f.tasks(&[("task-a", LABEL)]);
+    let auth = f.issue_task(&["create_task"], "task-a").unwrap();
+    assert!(!any_new_task(&auth) && has(&auth, &task_grant("task-a")));
+    // An unreadable profile fails the issuance closed, as for the other selectors.
+    std::fs::remove_file(f.profile_path()).unwrap();
+    assert_eq!(f.issue(&["create_task"]).err(), Some(VerificationError::Unavailable));
+}
+
+#[test]
+fn public_web_switch_independent_of_network_access() {
+    let f = fixture(false);
+    let web = ["web_fetch_cached", "web_extract"];
+    // The task-sandbox network switch alone grants no protected public web…
+    f.profile_with(true, false, "");
+    let auth = f.issue(&web).unwrap();
+    assert!(!any_public(&auth));
+    for tool in web { assert!(!eligible(&context(&auth), tool), "{tool}"); }
+    // …and the protected switch works with the sandbox network off.
+    f.profile_with(false, true, "");
+    let auth = f.issue(&web).unwrap();
+    assert!(has(&auth, &public_any()));
+    for tool in web { assert!(eligible(&context(&auth), tool), "{tool}"); }
+    f.profile_with(true, true, "");
+    assert!(has(&f.issue(&web).unwrap(), &public_any()));
+    // Turning only network_access off mid-issuance changes no selector input;
+    // turning public_web off does (the B2 re-read refuses the run).
+    let sandbox_only = during(&f, Box::new(|| f.profile_with(false, true, "")));
+    assert!(has(&f.issue_with(&sandbox_only, &web, None).unwrap(), &public_any()));
+    let switch_off = during(&f, Box::new(|| f.profile_with(false, false, "")));
+    assert_eq!(f.issue_with(&switch_off, &web, None).err(), Some(VerificationError::Revoked));
 }
 
 #[test]

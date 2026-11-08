@@ -126,6 +126,86 @@ fn create_task_boundary_pins_the_record_task() {
     }
 }
 
+// H9 owner decision 3: interactive `create_task` through the signed NewTask grant.
+fn new_task(requester: &str) -> ResourceGrant { ResourceGrant::NewTask { requester: text(requester) } }
+fn interactive(resources: Vec<ResourceGrant>) -> RequestContext { context("create_task", resources) }
+
+#[test]
+fn create_task_interactive_refuses_parent_and_goal_args() {
+    let own = new_task("owner");
+    let ctx = interactive(vec![scope(), employee(), own.clone()]);
+    assert!(ctx.record().canonical_bytes().is_ok(), "an interactive employee-scope record is signable");
+    assert!(eligible(&ctx, "create_task"));
+    assert_eq!(new_task_grant(&ctx).unwrap(), own);
+    let resolver = Fixed(vec![employee(), own.clone()]);
+    let args = json!({"goal":"g", "steps":[{"description":"s", "depends_on":[0]}]});
+    let call = authorize(&ctx, "create_task", &args, &resolver).unwrap();
+    assert_eq!(call.resources(), &[employee(), own.clone()], "exactly the employee and the new-task grant");
+    // A plan in the JSON-string form the handler also accepts.
+    assert!(authorize(&ctx, "create_task", &json!({"goal":"g", "steps":"[{\"description\":\"s\"}]"}), &resolver).is_ok());
+    // Selecting an existing task, goal or dependency is refused, even null.
+    for key in TASK_SELECTOR_KEYS {
+        for value in [json!("task-a"), json!(["task-a"]), Value::Null] {
+            let mut forged = args.clone();
+            forged[key] = value.clone();
+            assert!(authorize(&ctx, "create_task", &forged, &resolver).is_err(), "{key}={value}");
+        }
+    }
+    // Only the plan itself: no assignee, creator or other extra field.
+    for key in ["assigned_to", "assignee", "created_by", "creator", "on_behalf_of", "requester", "audience", "owner",
+        "schedule", "priority"] {
+        let mut forged = args.clone();
+        forged[key] = json!("someone");
+        assert!(authorize(&ctx, "create_task", &forged, &resolver).is_err(), "{key}");
+    }
+    // Steps keep the existing step schema; no hidden parent/assignee per step.
+    for step in [json!({"description":"s", "parent_task_id":"task-a"}), json!({"description":"s", "assigned_to":"other"}),
+        json!({"description":"s", "agent_id":"other"}), json!("not an object")] {
+        assert!(authorize(&ctx, "create_task", &json!({"goal":"g", "steps":[step]}), &resolver).is_err(), "{step}");
+    }
+    for plan in [json!({"goal":"g"}), json!({"goal":"", "steps":[{"description":"s"}]}), json!({"goal":"g", "steps":[]}),
+        json!({"goal":"g", "steps":{"description":"s"}})] {
+        assert!(authorize(&ctx, "create_task", &plan, &resolver).is_err(), "{plan}");
+    }
+    // The resolver can neither add a record task nor drop or swap the grant.
+    for resources in [vec![employee()], vec![own.clone()], vec![employee(), own.clone(), ResourceGrant::Task { id: text("task-a") }],
+        vec![employee(), new_task("other")], vec![employee(), ResourceGrant::Task { id: text("task-a") }]] {
+        assert!(authorize(&ctx, "create_task", &args, &Fixed(resources)).is_err());
+    }
+    // Without the grant (or with one for another person) nothing is listed.
+    for resources in [vec![scope(), employee()], vec![scope(), employee(), new_task("other")]] {
+        let ctx = interactive(resources);
+        assert!(!eligible(&ctx, "create_task"));
+        assert!(authorize(&ctx, "create_task", &args, &resolver).is_err());
+    }
+}
+
+#[test]
+fn create_task_background_principal_refused() {
+    // The record of a Background principal (no human requester) carrying a
+    // NewTask grant is refused by decode and signing alike…
+    let mut record = interactive(vec![scope(), employee(), new_task("owner")]).record().clone();
+    record.principal = Principal::Background { tenant_id: text("owner"), generation: 1 };
+    record.employee_binding = EmployeeBinding::Shared(text("owner"));
+    assert!(record.canonical_bytes().is_err());
+    assert!(serde_json::from_value::<CapabilityRecord>(serde_json::to_value(&record).unwrap()).is_err());
+    // …and the boundary neither lists nor authorizes it.
+    let ctx = RequestContext::from_verified_record(record);
+    assert!(new_task_grant(&ctx).is_err());
+    assert!(!eligible(&ctx, "create_task"));
+    let args = json!({"goal":"g", "steps":[{"description":"s"}]});
+    assert!(authorize(&ctx, "create_task", &args, &Fixed(vec![employee(), new_task("owner")])).is_err());
+    // A confined or task-limited NewTask grant is not authority either.
+    let mut record = interactive(vec![scope(), employee(),
+        ResourceGrant::Confined { resource: Box::new(new_task("owner")) }]).record().clone();
+    assert!(record.canonical_bytes().is_err());
+    assert!(!eligible(&RequestContext::from_verified_record(record.clone()), "create_task"));
+    record.resources = List::new(vec![employee(), new_task("owner")]).unwrap();
+    record.task = Some(text("task-a"));
+    assert!(record.canonical_bytes().is_err());
+    assert!(!eligible(&RequestContext::from_verified_record(record), "create_task"));
+}
+
 #[test]
 fn file_resources_preserve_workspace_only_and_reject_escape() {
     let resources = vec![ResourceGrant::Workspace { handle: text("work") }];

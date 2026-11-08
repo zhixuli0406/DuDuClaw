@@ -2,12 +2,12 @@
 //!
 //! This registry is independent of handler execution. Listing does not authorize
 //! a call: each call resolves all of its resources and verifies the signed grants.
-use duduclaw_isolation::capability::{EmployeeBinding, ResourceGrant};
+use duduclaw_isolation::capability::{EmployeeBinding, Principal, ResourceGrant};
 use serde_json::Value;
 use crate::{RequestContext, VerificationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin, PublicOrigins }
+pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin, PublicOrigins, NewTask }
 impl ResourceKind {
     pub fn of(resource: &ResourceGrant) -> Self {
         match resource {
@@ -23,6 +23,7 @@ impl ResourceKind {
             ResourceGrant::Recipient { .. } => Self::Recipient,
             ResourceGrant::UrlOrigin { .. } => Self::UrlOrigin,
             ResourceGrant::PublicOrigins { .. } => Self::PublicOrigins,
+            ResourceGrant::NewTask { .. } => Self::NewTask,
         }
     }
 }
@@ -106,7 +107,9 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "create_agent", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "list_agents", route: Route::Service, required: &[ResourceKind::Employee] },
     // H8: a TaskSpec plan is host-queue work under the run's own live task
-    // (`create_task_selector`), not a workspace operation.
+    // (`create_task_selector`), not a workspace operation. An interactive run
+    // instead uses its signed `NewTask` grant (`new_task_grant`, H9 decision 3);
+    // `required` lists the record-task path.
     ToolPolicy { name: "create_task", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Task] },
     ToolPolicy { name: "check_responses", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "task_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
@@ -416,6 +419,48 @@ pub fn create_task_selector(context: &RequestContext) -> Result<ResourceGrant, V
     Ok(selector)
 }
 
+/// H9 owner decision 3: the interactive-run `create_task` authority. The record
+/// must be an employee-scope record without a task, its principal a `Human`,
+/// and it must carry the plain (never `Confined`) signed
+/// `NewTask { requester }` grant for exactly that human. The requester is the
+/// authenticated person of the run; it is never read from arguments. A
+/// Background principal never qualifies (the capability decoder refuses such
+/// a grant too).
+pub fn new_task_grant(context: &RequestContext) -> Result<ResourceGrant, VerificationError> {
+    let record = context.record();
+    let Principal::Human { user_id, .. } = &record.principal else { return Err(VerificationError::Invalid); };
+    if record.task.is_some() || !record.employee_scope() { return Err(VerificationError::Invalid); }
+    let grant = ResourceGrant::NewTask { requester: user_id.clone() };
+    validate_resource(&grant)?;
+    if !record.resources.as_slice().contains(&grant) { return Err(VerificationError::Invalid); }
+    Ok(grant)
+}
+
+/// Top-level `create_task` arguments a `NewTask` call may carry. Everything
+/// else (task/goal/dependency selectors, assignee or creator fields, identity
+/// keys) is refused instead of being ignored.
+pub const NEW_TASK_KEYS: [&str; 2] = ["goal", "steps"];
+/// Keys a `NewTask` plan step may carry (the existing step schema). The step
+/// `agent` must name the calling employee or be empty; the resolver, which
+/// knows the employee's agent label, enforces that.
+pub const NEW_TASK_STEP_KEYS: [&str; 4] = ["description", "agent", "depends_on", "acceptance_criteria"];
+/// Most steps in one interactive plan.
+pub const NEW_TASK_MAX_STEPS: usize = 64;
+
+/// The plan steps of a `create_task` call, parsed exactly as the handler parses
+/// them (a JSON array, or a JSON string holding one), each a JSON object.
+pub fn new_task_steps(arguments: &Value) -> Result<Vec<Value>, VerificationError> {
+    let steps = match arguments.get("steps").ok_or(VerificationError::Invalid)? {
+        Value::Array(steps) => steps.clone(),
+        Value::String(raw) => serde_json::from_str::<Vec<Value>>(raw).map_err(|_| VerificationError::Invalid)?,
+        _ => return Err(VerificationError::Invalid),
+    };
+    if steps.is_empty() || steps.len() > NEW_TASK_MAX_STEPS || steps.iter().any(|step| !step.is_object()) {
+        return Err(VerificationError::Invalid);
+    }
+    Ok(steps)
+}
+
 /// Discovery shares the exact tool and mandatory resource policy with calls.
 /// The transport additionally checks that the corresponding host service exists.
 /// Optional argument-dependent resources are checked by `authorize`, not guessed
@@ -423,14 +468,21 @@ pub fn create_task_selector(context: &RequestContext) -> Result<ResourceGrant, V
 pub fn eligible(context: &RequestContext, name: &str) -> bool {
     let Some(policy) = policy(name) else { return false; };
     let record = context.record();
-    record.validate_resource_mode().is_ok()
-        && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
-        // D-H2: the URL itself is matched against the grant by `authorize`.
-        && ((PUBLIC_ORIGIN_TOOLS.contains(&name) && public_origins_grant(context).is_some())
+    if !(record.validate_resource_mode().is_ok() && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)) {
+        return false;
+    }
+    if name == "create_task" {
+        // Either the run's own signed record task (H8; task/schedule runs) or
+        // the interactive run's signed NewTask grant, always with the own
+        // Employee grant. Live ownership/requester checks run per call.
+        return record.io_resources().any(|grant| grant == &own_employee(context))
+            && (create_task_selector(context).is_ok() || new_task_grant(context).is_ok());
+    }
+    // D-H2: the URL itself is matched against the grant by `authorize`.
+    (PUBLIC_ORIGIN_TOOLS.contains(&name) && public_origins_grant(context).is_some())
         || (record.employee_scope() && (employee_service_scope(policy) || policy.route == Route::Connector)) || policy.required.iter().all(|kind| record.io_resources()
             .any(|grant| ResourceKind::of(grant) == *kind && validate_resource(grant).is_ok()
-                && (*kind != ResourceKind::Employee || grant == &own_employee(context)))))
-        && (name != "create_task" || create_task_selector(context).is_ok())
+                && (*kind != ResourceKind::Employee || grant == &own_employee(context))))
 }
 
 fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<ResourceKind>, VerificationError> {
@@ -502,8 +554,12 @@ pub fn validate_resource(resource: &ResourceGrant) -> Result<(), VerificationErr
     let exact = |value: &str| !value.is_empty() && value != "*" && !value.chars().any(char::is_control);
     let valid = match resource {
         ResourceGrant::Confined { resource } => !matches!(resource.as_ref(), ResourceGrant::Confined { .. }
-            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::PublicOrigins { .. })
+            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::PublicOrigins { .. }
+            | ResourceGrant::NewTask { .. })
             && validate_resource(resource).is_ok(),
+        // The requester/principal and employee-scope rules are
+        // `CapabilityRecord::check_new_task`; here only an exact identifier.
+        ResourceGrant::NewTask { requester } => exact(requester.as_str()),
         // Entries are validated by construction/decode (`PublicOrigin::parse`);
         // the set and employee-scope rules by `validate_resource_mode`. `*` here
         // is the reviewed D-H2 public-origin authority, not a collection grant.
@@ -641,6 +697,36 @@ fn authorize_public_origin(context: &RequestContext, policy: &'static ToolPolicy
         resources: vec![scope, grant.clone()] })
 }
 
+/// H9 owner decision 3: `create_task` in an interactive run. Only a new
+/// top-level plan: the arguments are exactly the plan (`goal`, `steps`), so no
+/// parent task, goal, dependency, assignee or creator can be selected; every
+/// step keeps the existing step schema. The resolver must vouch for exactly the
+/// own Employee grant and the record's signed `NewTask` grant (it checks the
+/// step targets and the live binding); the requester is the signed principal.
+fn authorize_new_task(context: &RequestContext, policy: &'static ToolPolicy, arguments: &Value,
+    grant: ResourceGrant, resolver: &dyn ResourceResolver) -> Result<AuthorizedToolCall, VerificationError> {
+    let object = arguments.as_object().ok_or(VerificationError::Invalid)?;
+    if object.keys().any(|key| !NEW_TASK_KEYS.contains(&key.as_str())) { return Err(VerificationError::Invalid); }
+    if !object.get("goal").and_then(Value::as_str).is_some_and(|goal| !goal.is_empty()) {
+        return Err(VerificationError::Invalid);
+    }
+    for step in new_task_steps(arguments)? {
+        let step = step.as_object().ok_or(VerificationError::Invalid)?;
+        if step.keys().any(|key| !NEW_TASK_STEP_KEYS.contains(&key.as_str())) { return Err(VerificationError::Invalid); }
+    }
+    let employee = own_employee(context);
+    let resources = resolver.resolve(context, policy, arguments)?;
+    if resources.len() != 2 || !resources.contains(&employee) || !resources.contains(&grant) {
+        return Err(VerificationError::Invalid);
+    }
+    for resource in [&employee, &grant] {
+        crate::resources::require_resource(context, resource)?;
+        validate_resource(resource)?;
+    }
+    Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),
+        resources: vec![employee, grant] })
+}
+
 /// Async callers resolve live resources on the bounded authority worker pool.
 /// The returned call owns its context, arguments and exact finite resources.
 pub async fn authorize_async(context: &RequestContext, name: &str, arguments: &Value,
@@ -675,6 +761,10 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
         if let Some(grant) = public_origins_grant(context) {
             return authorize_public_origin(context, policy, arguments, grant);
         }
+    }
+    if name == "create_task" && context.record().task.is_none() {
+        // No record task: only the interactive NewTask path exists.
+        return authorize_new_task(context, policy, arguments, new_task_grant(context)?, resolver);
     }
     if context.record().employee_scope() && employee_service_scope(policy) {
         return Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),

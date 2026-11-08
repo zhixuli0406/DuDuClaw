@@ -7,11 +7,11 @@
 
 The production human/background issuer now emits canonical EmployeeScope and
 Confined mailbox/table/wiki grants from its own host roots. Task-limited
-background work removes EmployeeScope (and any PublicOrigins grant) and unwraps
-those exact grants. Inventory tests consume this issuer output.
+background work removes EmployeeScope (and any PublicOrigins or NewTask grant)
+and unwraps those exact grants. Inventory tests consume this issuer output.
 
 v1.81 Package H (H9 selectors in `isolation_mcp/selectors.rs`, H10 issuer hook in
-`isolation_mcp/boot.rs`) adds three issuer-selected, MAC-covered grants, each read
+`isolation_mcp/boot.rs`) adds four issuer-selected, MAC-covered grants, each read
 at issuance from its authoritative store and fail-closed when that store is
 unsafe or unreadable, then re-read after the issuer's lifecycle/users.db
 rechecks (a change refuses the run):
@@ -21,12 +21,34 @@ rechecks (a change refuses the run):
   (`BootSources.work_broker`, H5), the run's tool snapshot lists a file tool and
   the employee's current `agent.toml` allowed/denied tools still allow it.
 - `PublicOrigins { * }` (H7) for `web_fetch_cached` and `web_extract`: only for
-  an employee-scope run and only when the admin set `agent.toml [container]
-  network_access = true` for that employee (an admin-only section; default
-  `false` = no web authority). Never derived from tool arguments.
+  an employee-scope run and only when the admin set `agent.toml [isolation]
+  public_web = true` for that employee (owner decision 2026-11-08: its own
+  admin-only switch, default `false` = no web authority; `[container]
+  network_access` keeps controlling only the task sandbox). `[isolation]` is
+  frozen against the employee's own writes and refused by the dashboard
+  key/value editor; it is changed in the configuration file (or the admin raw
+  configuration editor). Never derived from tool arguments.
+- `NewTask { requester }` (CONTRACT CHANGE, capability tag 12, H9 owner
+  decision 3) for `create_task` in an interactive (chat) run: only when the run
+  is not record-backed, lists `create_task` and the profile still allows it.
+  `requester` is the run's authenticated human; the capability decoder and
+  signer refuse the grant unless the record principal is `Human` with that
+  user id, the record has its own EmployeeScope and no task, and it is a plain
+  (not Confined) single grant, so a Background principal never holds it. A
+  Personal employee's requester is its owner (B1 at issuance; the resolver
+  rechecks it). At call time the boundary accepts only `goal` and `steps`
+  (every step with the existing step keys), so no parent task, goal,
+  dependency, assignee or creator can be selected; the gateway resolver
+  requires every step to target this employee (or none) and returns exactly
+  the own Employee grant plus the signed NewTask grant; the handler files the
+  TaskSpec as this employee on behalf of that requester.
 - the record `Task` grant (H8) for `create_task`: only for a task/schedule run
-  whose record task is assigned to the employee in `tasks.db` at issuance; a
-  run for another employee's task stays task-limited without the grant.
+  whose record task is assigned to the employee in `tasks.db` at issuance.
+  Owner decision 2026-11-08: a run whose task was reassigned or deleted is
+  refused outright, both before any approval card (`isolation_background`
+  `scope_record`, reason shown to the scheduler) and in the issuer (`Revoked`);
+  each refusal writes an `isolation_task_run_refused` security-audit row
+  (`reason: task_not_owned`, `stage: schedule` or `issuance`).
 
 Workspace and URL-origin selection for the other File/A/E tools is still
 missing, including `skill_extract` and `execute_program`. The parity test tracks
@@ -113,7 +135,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `os_audio_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `create_agent` | Refused: ProposalRequired — protected employees are created only through an approved Employee proposal. |
 | `list_agents` | Resource → AuthorizedToolCall → original live employee handler |
-| `create_task` | Host authenticated target queue admission; fresh target run authority required; H10 issues the record Task grant (H8 selector) only to a task/schedule run whose record task the employee owns in tasks.db at issuance, so interactive runs never list it |
+| `create_task` | Host authenticated target queue admission; fresh target run authority required; each call is authorized against the capability before the TaskSpec is written; a task/schedule run plans under its record Task grant (H8 selector, issued only while the employee owns the task, otherwise the run is refused); an interactive run uses the NewTask grant (tag 12) for new top-level plans only, assigned to the calling employee and filed for the signed human requester |
 | `check_responses` | Resource → AuthorizedToolCall → original live employee handler |
 | `task_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `agent_status` | Resource → AuthorizedToolCall → original live employee handler |
@@ -302,7 +324,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `create_reminder` | Resource → AuthorizedToolCall → original live employee handler |
 | `list_reminders` | Resource → EmployeeScope original handler / finite immutable reminder IDs + bounded reader |
 | `cancel_reminder` | Resource → AuthorizedToolCall → original live employee handler |
-| `web_fetch_cached` | Resource → original authenticated cache/fetch handler; existing egress and cache policy; H10 issues PublicOrigins * (H7) only to an employee-scope run of an employee whose admin set agent.toml container network_access = true (default none) |
+| `web_fetch_cached` | Resource → original authenticated cache/fetch handler; existing egress and cache policy; H10 issues PublicOrigins * (H7) only to an employee-scope run of an employee whose admin set agent.toml isolation public_web = true (default none; independent of the task sandbox network_access) |
 | `web_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; same H10 PublicOrigins grant as web_fetch_cached |
 | `inference_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `model_list` | Resource → AuthorizedToolCall → original live employee handler |

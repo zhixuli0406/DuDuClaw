@@ -788,7 +788,8 @@ pub(crate) fn protected_changed(file: &RawFile, before: &toml::Table, after: &to
         RawFile::Inference => false,
         RawFile::Agent(_) => {
             sections.iter().any(|s| s == "agent" || s == "capabilities")
-                || ["container.sandbox_enabled", "container.network_access", "permissions.can_modify_own_soul"]
+                || ["container.sandbox_enabled", "container.network_access", "permissions.can_modify_own_soul",
+                    "isolation.public_web"]
                     .iter()
                     .any(|p| key_changed(before, after, p))
         }

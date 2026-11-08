@@ -415,7 +415,8 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     // failed read may be a tombstone moving `agents/<label>` away: the durable
     // lifecycle decides first (as for the wiki walk below).
     let record = turn.background.is_some();
-    let select = || selectors::select(sources, &SelectorInput { home: &home, agent: &agent, tools: &tools, task, record })
+    let select = || selectors::select(sources, &SelectorInput { home: &home, agent: &agent, user: &user,
+        tools: &tools, task, record })
         .map_err(|error| lifecycle::recheck_with(&home, lifecycle, root).err().map_or(error, lifecycle_refusal));
     let selection = select()?;
     let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
@@ -441,8 +442,8 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
         roots.insert_wiki(namespace.clone(), employee, wiki)?;
         resources.push(confined(ResourceGrant::Wiki { namespace: text(namespace)? }));
     }
-    // Workspace{employee-work} + brokered root, PublicOrigins: plain grants in
-    // the signed resource set, so the capability MAC covers them.
+    // Workspace{employee-work} + brokered root, PublicOrigins, NewTask: plain
+    // grants in the signed resource set, so the capability MAC covers them.
     selection.apply(sources, employee, &mut resources, &mut roots)?;
     let now = duduclaw_mcp_boundary::authority::now_seconds()?;
     let expires_at = now.checked_add(30 * 60).ok_or(VerificationError::InvalidTime)?
@@ -460,17 +461,18 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
         .map_err(|_| VerificationError::Revoked)?;
     recheck_issuance_facts(&agent, lifecycle, &principal, epoch, current, &after, turn.background.is_some())?;
     // H10: re-read every selector input after all issuance I/O; a profile,
-    // web setting or task ownership that changed meanwhile refuses the run.
+    // public-web switch or task ownership that changed meanwhile refuses the run.
     if select()? != selection { return Err(VerificationError::Revoked); }
     let mut authorization = super::RuntimeAuthorization { home, agent, grant: GrantPolicy {
         task: None, principal, binding: lifecycle.binding.clone(), lane, tools,
         resources: List::new(resources).map_err(|_| VerificationError::Invalid)?,
         policy_revision: current.policy_epoch, not_before: now, expires_at }, roots: Arc::new(roots),
         origin: WaitOrigin::Gateway, caller: None, turn: Some(turn), authenticated_epoch: Some(epoch) };
-    // Task/schedule runs are task-limited (no EmployeeScope, no PublicOrigins);
-    // the record Task grant (H8) only for a task the employee owns now.
+    // Task/schedule runs are task-limited (no EmployeeScope, PublicOrigins or
+    // NewTask) with the record Task grant (H8); `select` has already refused a
+    // task the employee no longer owns.
     if let Some(task) = &selection.task {
-        authorization.limit_to_task_with(task.id.clone(), task.owned)?;
+        authorization.limit_to_task(task.id.clone())?;
     }
     Ok(authorization)
 }

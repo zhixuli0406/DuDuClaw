@@ -41,9 +41,15 @@ pub struct SharedEmployee {
 
 /// A complete `agent.toml` that the typed `AgentConfig` parser accepts, for
 /// fixtures whose issuer selectors (H9) read the employee profile.
-/// `network_access` is the admin-only per-employee web switch; `capabilities`
-/// is appended verbatim to the `[capabilities]` table.
-pub fn agent_toml(label: &str, network_access: bool, capabilities: &str) -> String {
+/// `public_web` is the admin-only protected-mode web switch (`[isolation]`);
+/// `capabilities` is appended verbatim to the `[capabilities]` table. The task
+/// sandbox's `[container] network_access` stays `false`.
+pub fn agent_toml(label: &str, public_web: bool, capabilities: &str) -> String {
+    agent_toml_with(label, false, public_web, capabilities)
+}
+
+/// [`agent_toml`] with the task-sandbox network switch set independently.
+pub fn agent_toml_with(label: &str, network_access: bool, public_web: bool, capabilities: &str) -> String {
     format!(r#"[agent]
 name = "{label}"
 display_name = "Fixture employee"
@@ -83,6 +89,8 @@ allowed_channels = []
 [evolution]
 skill_auto_activate = false
 skill_security_scan = false
+[isolation]
+public_web = {public_web}
 [capabilities]
 {capabilities}
 "#)

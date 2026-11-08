@@ -18,15 +18,11 @@ impl RuntimeAuthorization {
     /// A task-limited background run must not retain broad employee authority.
     /// Confined IO inputs become exact finite grants; no new service authority
     /// is inferred from the task or from a background/system sender name.
+    /// The record `Task` grant (H8) is added; the H10 issuer only narrows to a
+    /// task its H9 selector proved the employee owns (otherwise it refuses the
+    /// run). `PublicOrigins` and `NewTask` require EmployeeScope (D-H2, H9
+    /// decision 3), so they never survive task narrowing.
     pub fn limit_to_task(&mut self, task: String) -> Result<(), super::VerificationError> {
-        self.limit_to_task_with(task, true)
-    }
-
-    /// H10: the issuer adds the record `Task` grant (H8) only when the H9 task
-    /// selector proved at issuance that the employee owns the task; otherwise
-    /// the run is still limited to the task, without that grant. `PublicOrigins`
-    /// requires EmployeeScope (D-H2), so it never survives task narrowing.
-    pub(super) fn limit_to_task_with(&mut self, task: String, with_grant: bool) -> Result<(), super::VerificationError> {
         use duduclaw_isolation::{bounded::{List, Text}, capability::ResourceGrant};
         let task = Text::new(task).map_err(|_| super::VerificationError::Invalid)?;
         let selected = ResourceGrant::Task { id: task.clone() };
@@ -35,11 +31,11 @@ impl RuntimeAuthorization {
             return Err(super::VerificationError::BindingMismatch);
         }
         let mut resources: Vec<_> = self.grant.resources.as_slice().iter().filter_map(|grant| match grant {
-            ResourceGrant::EmployeeScope { .. } | ResourceGrant::PublicOrigins { .. } => None,
+            ResourceGrant::EmployeeScope { .. } | ResourceGrant::PublicOrigins { .. } | ResourceGrant::NewTask { .. } => None,
             ResourceGrant::Confined { resource } => Some(resource.as_ref().clone()),
             _ => Some(grant.clone()),
         }).collect();
-        if with_grant && !resources.contains(&selected) { resources.push(selected); }
+        if !resources.contains(&selected) { resources.push(selected); }
         let resources = List::new(resources).map_err(|_| super::VerificationError::Invalid)?;
         self.grant.task = Some(task);
         self.grant.resources = resources;
