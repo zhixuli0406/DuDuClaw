@@ -359,6 +359,240 @@ fn host_snapshots_bind_selected_origin_call_and_operation() {
         HostSnapshotSource::WebFetch { url: "https://example.com/a" }, &vec![0; 5 * 1024 * 1024 + 1]).is_err());
 }
 
+// ── H6 brokered employee-work root ─────────────────────────────────────────
+#[cfg(unix)]
+mod h6 {
+    use super::*;
+    use crate::resources::test_broker::TestWorkBroker;
+    use serde_json::json;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    const RUN: RunId = RunId([3; 16]);
+    const EMPLOYEE: EmployeeId = EmployeeId([2; 16]);
+
+    struct Toggle(Arc<AtomicBool>);
+    impl LiveRequestVerifier for Toggle {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
+            if self.0.load(Ordering::Acquire) { Ok(()) } else { Err(VerificationError::Revoked) }
+        }
+    }
+    fn record(run: RunId) -> CapabilityRecord {
+        let mut record = context().record().clone();
+        record.run = run;
+        record.tools = List::new(vec![Text::new("file_read".into()).unwrap(), Text::new("csv_read".into()).unwrap()]).unwrap();
+        record.resources = List::new(vec![ResourceGrant::Workspace { handle: Text::new(EMPLOYEE_WORK_ROOT.into()).unwrap() }]).unwrap();
+        record.expires_at = u64::MAX;
+        record
+    }
+    fn live(run: RunId) -> (RequestContext, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(true));
+        (RequestContext::with_live_verifier(record(run), Arc::new(Toggle(flag.clone()))), flag)
+    }
+    fn setup(broker: TestWorkBroker) -> (ResourceRoots, Arc<TestWorkBroker>) {
+        let broker = Arc::new(broker);
+        let mut roots = ResourceRoots::default();
+        roots.insert_brokered(EMPLOYEE_WORK_ROOT.into(), EMPLOYEE, broker.clone()).unwrap();
+        (roots, broker)
+    }
+    fn read(roots: &ResourceRoots, context: &RequestContext, tool: &str, path: &str)
+        -> Result<(crate::tool_policy::AuthorizedToolCall, AuthorizedFile), VerificationError> {
+        roots.authorize_file(context, tool, &json!({"workspace": EMPLOYEE_WORK_ROOT, "path": path}))
+    }
+    fn contents(mut file: AuthorizedFile) -> std::io::Result<String> {
+        use std::io::Read;
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        Ok(text)
+    }
+
+    #[test]
+    fn h6_brokered_root_requires_live_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("notes")).unwrap();
+        std::fs::write(dir.path().join("notes/a.txt"), b"brokered").unwrap();
+        std::fs::write(dir.path().join("t.csv"), b"a,b\n1,2\n").unwrap();
+        let (roots, broker) = setup(TestWorkBroker::new(dir.path().to_owned(), RUN, EMPLOYEE));
+        let (context, flag) = live(RUN);
+
+        // The live run reads through the broker; run and employee come from the capability.
+        let (call, file) = read(&roots, &context, "file_read", "notes/a.txt").unwrap();
+        assert!(file.verify(&call).is_ok());
+        assert_eq!(broker.calls(), vec![(RUN, EMPLOYEE, "notes/a.txt".to_owned())]);
+        assert_eq!(contents(file).unwrap(), "brokered");
+        assert!(read(&roots, &context, "csv_read", "t.csv").is_ok());
+        assert_eq!(broker.calls().len(), 2);
+
+        // An open descriptor stops serving once the run is no longer live.
+        let (_, file) = read(&roots, &context, "file_read", "notes/a.txt").unwrap();
+        flag.store(false, Ordering::Release);
+        assert!(contents(file).is_err());
+        // A capability whose run is no longer live never reaches root.
+        assert!(read(&roots, &context, "file_read", "notes/a.txt").is_err());
+        let consulted = broker.calls().len();
+        // Record-only (no live authority) and expired capabilities never reach root.
+        let record_only = RequestContext::from_verified_record(record(RUN));
+        assert!(matches!(read(&roots, &record_only, "file_read", "notes/a.txt").err(), Some(VerificationError::Unavailable)));
+        let mut expired = record(RUN);
+        expired.expires_at = 2;
+        let expired = RequestContext::with_live_verifier(expired, Arc::new(TestLive));
+        assert!(read(&roots, &expired, "file_read", "notes/a.txt").is_err());
+        // Another employee's capability, or one without the employee-work grant.
+        let mut foreign = record(RUN);
+        foreign.employee = EmployeeId([9; 16]);
+        let foreign = RequestContext::with_live_verifier(foreign, Arc::new(TestLive));
+        assert!(read(&roots, &foreign, "file_read", "notes/a.txt").is_err());
+        let mut ungranted = record(RUN);
+        ungranted.resources = List::new(vec![ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() }]).unwrap();
+        let ungranted = RequestContext::with_live_verifier(ungranted, Arc::new(TestLive));
+        assert!(read(&roots, &ungranted, "file_read", "notes/a.txt").is_err());
+        assert_eq!(broker.calls().len(), consulted);
+
+        // A capability for another run is passed through as that run; root refuses it.
+        let (other_run, _) = live(RunId([4; 16]));
+        assert!(matches!(read(&roots, &other_run, "file_read", "notes/a.txt").err(), Some(VerificationError::Unavailable)));
+        assert_eq!(broker.calls().last().unwrap().0, RunId([4; 16]));
+        // After the run exits root refuses even a still-valid capability.
+        let (context, _) = live(RUN);
+        broker.end_run();
+        assert!(matches!(read(&roots, &context, "file_read", "notes/a.txt").err(), Some(VerificationError::Unavailable)));
+    }
+
+    #[test]
+    fn h6_path_from_args_normalized_and_bounded() {
+        for (path, ok) in WORK_PATH_CONFORMANCE {
+            assert_eq!(WorkRelativePath::parse(path).is_ok(), *ok, "{path:?}");
+        }
+        let component = "a".repeat(WORK_PATH_MAX_COMPONENT_BYTES);
+        assert!(WorkRelativePath::parse(&component).is_ok());
+        assert!(WorkRelativePath::parse(&format!("{component}a")).is_err());
+        let deep = vec!["d"; WORK_PATH_MAX_DEPTH];
+        assert!(WorkRelativePath::parse(&deep.join("/")).is_ok());
+        assert!(WorkRelativePath::parse(&format!("{}/d", deep.join("/"))).is_err());
+        let body = vec!["b".repeat(100); 40].join("/"); // 4039 bytes, 40 components
+        assert!(WorkRelativePath::parse(&format!("{body}/{}", "x".repeat(56))).is_ok()); // 4096
+        assert!(WorkRelativePath::parse(&format!("{body}/{}", "x".repeat(57))).is_err()); // 4097
+        // Never rewritten: the exact argument bytes are what root opens.
+        assert_eq!(WorkRelativePath::parse("notes/員工.md").unwrap().as_str(), "notes/員工.md");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.txt"), b"x").unwrap();
+        let (roots, broker) = setup(TestWorkBroker::new(dir.path().to_owned(), RUN, EMPLOYEE));
+        let (context, _) = live(RUN);
+        let long = format!("{component}a");
+        for path in ["../in.txt", "/in.txt", "a//in.txt", "./in.txt", "in.txt/", "a\nb", "a\\in.txt", long.as_str()] {
+            assert!(read(&roots, &context, "file_read", path).is_err(), "{path:?}");
+        }
+        // Identity is never taken from arguments.
+        for key in ["run_id", "employee_id", "root", "cwd"] {
+            let arguments = json!({"workspace": EMPLOYEE_WORK_ROOT, "path": "in.txt", (key): "x"});
+            assert!(roots.authorize_file(&context, "file_read", &arguments).is_err(), "{key}");
+        }
+        assert!(broker.calls().is_empty());
+        // The opened path must be the one this call selected.
+        let (call, _) = read(&roots, &context, "file_read", "in.txt").unwrap();
+        assert!(matches!(roots.authorize_brokered_file(&call, EMPLOYEE_WORK_ROOT, "other.txt").err(),
+            Some(VerificationError::BindingMismatch)));
+        assert!(roots.authorize_brokered_file(&call, "work", "in.txt").is_err());
+        assert_eq!(broker.calls(), vec![(RUN, EMPLOYEE, "in.txt".to_owned())]);
+    }
+
+    #[test]
+    fn h6_no_host_path_fallback() {
+        use crate::tool_policy::{authorize, ResourceResolver, ToolPolicy};
+        struct Selected;
+        impl ResourceResolver for Selected {
+            fn resolve(&self, _: &RequestContext, _: &ToolPolicy, _: &serde_json::Value)
+                -> Result<Vec<ResourceGrant>, VerificationError> {
+                Ok(vec![ResourceGrant::Workspace { handle: Text::new(EMPLOYEE_WORK_ROOT.into()).unwrap() }])
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"host bytes").unwrap();
+        let (mut roots, broker) = setup(TestWorkBroker::new(dir.path().to_owned(), RUN, EMPLOYEE));
+        broker.fail_with(Some(WorkBrokerError::Unavailable));
+        let (context, _) = live(RUN);
+        assert!(matches!(read(&roots, &context, "file_read", "a.txt").err(), Some(VerificationError::Unavailable)));
+        // No gateway dirfd exists for the brokered handle: every pathname route refuses.
+        assert!(roots.open_read(&context, EMPLOYEE_WORK_ROOT, "a.txt").is_err());
+        assert!(roots.open_directory(&context, EMPLOYEE_WORK_ROOT, None).is_err());
+        let call = authorize(&context, "file_read", &json!({"workspace": EMPLOYEE_WORK_ROOT, "path": "a.txt"}), &Selected).unwrap();
+        assert!(roots.authorize_workspace(&call, EMPLOYEE_WORK_ROOT).is_err());
+        let policy = duduclaw_isolation::execution::WorkspacePolicy { workspace: Text::new(EMPLOYEE_WORK_ROOT.into()).unwrap(),
+            relative_cwd: Text::new(".".into()).unwrap() };
+        assert!(roots.authorize_helper_workspace(&context, &policy).is_err());
+        // A host dirfd cannot be registered beside (or instead of) the broker.
+        assert!(roots.insert(EMPLOYEE_WORK_ROOT.into(), EMPLOYEE, directory(dir.path())).is_err());
+        assert!(roots.insert_brokered(EMPLOYEE_WORK_ROOT.into(), EMPLOYEE, broker.clone()).is_err());
+        let mut plain = ResourceRoots::default();
+        assert!(plain.insert_brokered("work".into(), EMPLOYEE, broker.clone()).is_err());
+        plain.insert(EMPLOYEE_WORK_ROOT.into(), EMPLOYEE, directory(dir.path())).unwrap();
+        assert!(plain.insert_brokered(EMPLOYEE_WORK_ROOT.into(), EMPLOYEE, broker.clone()).is_err());
+        // Every failed attempt above went to root only, never to the host file.
+        assert!(broker.calls().iter().all(|(run, employee, path)| *run == RUN && *employee == EMPLOYEE && path == "a.txt"));
+    }
+
+    #[test]
+    fn h6_broker_error_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"data").unwrap();
+        let (roots, broker) = setup(TestWorkBroker::new(dir.path().to_owned(), RUN, EMPLOYEE));
+        let (context, _) = live(RUN);
+        for error in [WorkBrokerError::NotLive, WorkBrokerError::NotFound, WorkBrokerError::Refused,
+            WorkBrokerError::TooLarge, WorkBrokerError::Unavailable] {
+            broker.fail_with(Some(error));
+            assert!(matches!(read(&roots, &context, "file_read", "a.txt").err(), Some(VerificationError::Unavailable)), "{error:?}");
+        }
+        broker.fail_with(None);
+        assert!(matches!(read(&roots, &context, "file_read", "missing.txt").err(), Some(VerificationError::Unavailable)));
+        assert!(read(&roots, &context, "file_read", "a.txt").is_ok());
+        // A descriptor that is not the inode root reported is refused.
+        broker.misreport(|metadata| metadata.inode ^= 1);
+        assert!(matches!(read(&roots, &context, "file_read", "a.txt").err(), Some(VerificationError::Unavailable)));
+        broker.misreport(|metadata| metadata.device ^= 1);
+        assert!(matches!(read(&roots, &context, "file_read", "a.txt").err(), Some(VerificationError::Unavailable)));
+    }
+
+    #[test]
+    fn h6_non_regular_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        std::fs::write(dir.path().join("file"), b"data").unwrap();
+        std::fs::write(dir.path().join("single"), b"data").unwrap();
+        std::fs::hard_link(dir.path().join("file"), dir.path().join("hard")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", dir.path().join("null")).unwrap();
+        std::os::unix::fs::symlink("file", dir.path().join("link")).unwrap();
+        std::fs::File::create(dir.path().join("limit")).unwrap().set_len(BROKERED_FILE_MAX_BYTES).unwrap();
+        std::fs::File::create(dir.path().join("big")).unwrap().set_len(BROKERED_FILE_MAX_BYTES + 1).unwrap();
+        let (context, _) = live(RUN);
+
+        // A correct broker refuses them itself (fail closed as Unavailable).
+        let (roots, _) = setup(TestWorkBroker::new(dir.path().to_owned(), RUN, EMPLOYEE));
+        for path in ["dir", "hard", "null", "link", "big"] {
+            assert!(matches!(read(&roots, &context, "file_read", path).err(), Some(VerificationError::Unavailable)), "{path}");
+        }
+        assert!(read(&roots, &context, "file_read", "limit").is_ok());
+
+        // A faulty broker that hands back the descriptor anyway is still refused,
+        // whether it reports the truth or claims a single-link regular small file.
+        let (roots, broker) = setup(TestWorkBroker::unchecked(dir.path().to_owned(), RUN, EMPLOYEE));
+        for lie in [false, true] {
+            if lie { broker.misreport(|metadata| { metadata.regular = true; metadata.nlink = 1; metadata.size = 0; }); }
+            for path in ["dir", "hard", "null", "big"] {
+                assert!(matches!(read(&roots, &context, "file_read", path).err(), Some(VerificationError::Invalid)), "{path} lie={lie}");
+            }
+        }
+        // A broker-reported non-regular or linked file is refused before use.
+        let (roots, broker) = setup(TestWorkBroker::unchecked(dir.path().to_owned(), RUN, EMPLOYEE));
+        assert!(read(&roots, &context, "file_read", "single").is_ok());
+        broker.misreport(|metadata| metadata.regular = false);
+        assert!(matches!(read(&roots, &context, "file_read", "single").err(), Some(VerificationError::Invalid)));
+        broker.misreport(|metadata| metadata.nlink = 2);
+        assert!(matches!(read(&roots, &context, "file_read", "single").err(), Some(VerificationError::Invalid)));
+        broker.misreport(|metadata| metadata.size = BROKERED_FILE_MAX_BYTES + 1);
+        assert!(matches!(read(&roots, &context, "file_read", "single").err(), Some(VerificationError::Invalid)));
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn helper_workspace_token_binds_owner_run_and_relative_directory() {

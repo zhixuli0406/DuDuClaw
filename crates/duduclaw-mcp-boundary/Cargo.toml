@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 execution-integration = ["dep:duduclaw-execution"]
 binding-store = ["dep:rusqlite"]
+# Exposes resources::test_broker::TestWorkBroker for downstream tests (H5/H11).
+test-support = []
 
 [dependencies]
 duduclaw-isolation.workspace = true
