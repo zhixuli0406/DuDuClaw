@@ -408,15 +408,16 @@ fn public_origin_url_resolves_to_the_exact_authorized_origin() {
 }
 
 // ── H6 brokered employee-work root ─────────────────────────────────────────
-#[cfg(unix)]
+// Linux only since H5: the broker hands out sealed memfd snapshots.
+#[cfg(target_os = "linux")]
 mod h6 {
     use super::*;
     use crate::resources::test_broker::TestWorkBroker;
     use serde_json::json;
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-    const RUN: RunId = RunId([3; 16]);
-    const EMPLOYEE: EmployeeId = EmployeeId([2; 16]);
+    pub(super) const RUN: RunId = RunId([3; 16]);
+    pub(super) const EMPLOYEE: EmployeeId = EmployeeId([2; 16]);
 
     struct Toggle(Arc<AtomicBool>);
     impl LiveRequestVerifier for Toggle {
@@ -432,11 +433,11 @@ mod h6 {
         record.expires_at = u64::MAX;
         record
     }
-    fn live(run: RunId) -> (RequestContext, Arc<AtomicBool>) {
+    pub(super) fn live(run: RunId) -> (RequestContext, Arc<AtomicBool>) {
         let flag = Arc::new(AtomicBool::new(true));
         (RequestContext::with_live_verifier(record(run), Arc::new(Toggle(flag.clone()))), flag)
     }
-    fn setup(broker: TestWorkBroker) -> (ResourceRoots, Arc<TestWorkBroker>) {
+    pub(super) fn setup(broker: TestWorkBroker) -> (ResourceRoots, Arc<TestWorkBroker>) {
         let broker = Arc::new(broker);
         let mut roots = ResourceRoots::default();
         roots.insert_brokered(EMPLOYEE_WORK_ROOT.into(), EMPLOYEE, broker.clone()).unwrap();
@@ -620,24 +621,197 @@ mod h6 {
         }
         assert!(read(&roots, &context, "file_read", "limit").is_ok());
 
-        // A faulty broker that hands back the descriptor anyway is still refused,
-        // whether it reports the truth or claims a single-link regular small file.
+        // A faulty broker that hands back the live descriptor anyway is still
+        // refused, whether it reports the truth or claims a sealed snapshot's
+        // shape (regular, nlink 0, small). Since H5 that includes the plain
+        // single-link file: only a sealed memfd snapshot is accepted.
         let (roots, broker) = setup(TestWorkBroker::unchecked(dir.path().to_owned(), RUN, EMPLOYEE));
         for lie in [false, true] {
-            if lie { broker.misreport(|metadata| { metadata.regular = true; metadata.nlink = 1; metadata.size = 0; }); }
-            for path in ["dir", "hard", "null", "big"] {
+            if lie { broker.misreport(|metadata| { metadata.regular = true; metadata.nlink = 0; metadata.size = 0; }); }
+            for path in ["dir", "hard", "null", "big", "single"] {
                 assert!(matches!(read(&roots, &context, "file_read", path).err(), Some(VerificationError::Invalid)), "{path} lie={lie}");
             }
         }
-        // A broker-reported non-regular or linked file is refused before use.
-        let (roots, broker) = setup(TestWorkBroker::unchecked(dir.path().to_owned(), RUN, EMPLOYEE));
+        // A broker-reported non-regular, linked or oversized snapshot is refused before use.
+        let (roots, broker) = setup(TestWorkBroker::new(dir.path().to_owned(), RUN, EMPLOYEE));
         assert!(read(&roots, &context, "file_read", "single").is_ok());
         broker.misreport(|metadata| metadata.regular = false);
         assert!(matches!(read(&roots, &context, "file_read", "single").err(), Some(VerificationError::Invalid)));
-        broker.misreport(|metadata| metadata.nlink = 2);
-        assert!(matches!(read(&roots, &context, "file_read", "single").err(), Some(VerificationError::Invalid)));
+        for nlink in [1, 2] {
+            broker.misreport(move |metadata| metadata.nlink = nlink);
+            assert!(matches!(read(&roots, &context, "file_read", "single").err(), Some(VerificationError::Invalid)), "{nlink}");
+        }
         broker.misreport(|metadata| metadata.size = BROKERED_FILE_MAX_BYTES + 1);
         assert!(matches!(read(&roots, &context, "file_read", "single").err(), Some(VerificationError::Invalid)));
+    }
+}
+
+// ── H5 sealed snapshot + file-tool refusals ────────────────────────────────
+#[cfg(target_os = "linux")]
+mod h5 {
+    use super::*;
+    use super::h6::{live, setup, EMPLOYEE, RUN};
+    use crate::resources::test_broker::{sealed_snapshot, TestWorkBroker};
+    use serde_json::json;
+    use std::{io::{Read, Write}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::{MetadataExt, OpenOptionsExt}}};
+    type Edit = fn(&mut WorkFileMetadata);
+
+    fn claim(file: &File) -> WorkFileMetadata {
+        let stat = file.metadata().unwrap();
+        WorkFileMetadata { regular: stat.is_file(), size: stat.len(), device: stat.dev(), inode: stat.ino(), nlink: stat.nlink() }
+    }
+    fn verify(file: File) -> Result<File, VerificationError> {
+        let metadata = claim(&file);
+        verify_brokered(BrokeredWorkFile { file, metadata })
+    }
+    /// A writable memfd with exactly `seals` added (0 = none).
+    fn memfd(bytes: &[u8], seals: i32) -> File {
+        let raw = unsafe { libc::memfd_create(c"h5-test".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+        assert!(raw >= 0);
+        let mut file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        file.write_all(bytes).unwrap();
+        if seals != 0 { assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) }, 0); }
+        file
+    }
+    fn read_only(file: &File) -> File { File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap() }
+    const ALL: i32 = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+
+    #[test]
+    fn h5_verify_brokered_accepts_sealed_memfd() {
+        let dir = tempfile::tempdir().unwrap();
+        for bytes in [b"snapshot bytes".to_vec(), Vec::new(), vec![7u8; BROKERED_FILE_MAX_BYTES as usize]] {
+            std::fs::write(dir.path().join("source"), &bytes).unwrap();
+            let snapshot = sealed_snapshot(&mut File::open(dir.path().join("source")).unwrap()).unwrap();
+            let metadata = claim(&snapshot);
+            assert_eq!((metadata.regular, metadata.nlink, metadata.size), (true, 0, bytes.len() as u64));
+            let mut file = verify_brokered(BrokeredWorkFile { file: snapshot, metadata }).unwrap();
+            let mut read = Vec::new();
+            file.read_to_end(&mut read).unwrap();
+            assert_eq!(read, bytes);
+            // Immutable and read-only: the received fd can neither write nor resize.
+            assert!(file.write_all(b"x").is_err());
+            assert!(file.set_len(0).is_err());
+        }
+        // The snapshot is a copy: rewriting the source afterwards changes nothing.
+        std::fs::write(dir.path().join("source"), b"before").unwrap();
+        let snapshot = sealed_snapshot(&mut File::open(dir.path().join("source")).unwrap()).unwrap();
+        std::fs::write(dir.path().join("source"), b"after!").unwrap();
+        let mut text = String::new();
+        verify(snapshot).unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, "before");
+        // A hand-built O_RDONLY reopen of a fully sealed memfd is equally fine.
+        assert!(verify(read_only(&memfd(b"x", ALL))).is_ok());
+        // The claim must be honest: the old nlink-1 claim, or another inode/size.
+        let snapshot = read_only(&memfd(b"xyz", ALL));
+        let invalid: [Edit; 3] = [|m: &mut WorkFileMetadata| m.nlink = 1, |m: &mut WorkFileMetadata| m.regular = false,
+            |m: &mut WorkFileMetadata| m.size = BROKERED_FILE_MAX_BYTES + 1];
+        for edit in invalid {
+            let mut metadata = claim(&snapshot);
+            edit(&mut metadata);
+            let file = snapshot.try_clone().unwrap();
+            assert_eq!(verify_brokered(BrokeredWorkFile { file, metadata }).err(), Some(VerificationError::Invalid));
+        }
+        let mismatched: [Edit; 3] = [|m: &mut WorkFileMetadata| m.inode ^= 1, |m: &mut WorkFileMetadata| m.device ^= 1,
+            |m: &mut WorkFileMetadata| m.size = 2];
+        for edit in mismatched {
+            let mut metadata = claim(&snapshot);
+            edit(&mut metadata);
+            let file = snapshot.try_clone().unwrap();
+            assert_eq!(verify_brokered(BrokeredWorkFile { file, metadata }).err(), Some(VerificationError::Unavailable));
+        }
+    }
+
+    #[test]
+    fn h5_verify_brokered_refuses_unsealed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("plain"), b"live").unwrap();
+        // The employee's live inode (nlink 1), honestly reported or claimed as nlink 0.
+        let plain = File::open(dir.path().join("plain")).unwrap();
+        assert_eq!(verify(plain.try_clone().unwrap()).err(), Some(VerificationError::Invalid));
+        let mut lie = claim(&plain);
+        lie.nlink = 0;
+        assert_eq!(verify_brokered(BrokeredWorkFile { file: plain, metadata: lie }).err(), Some(VerificationError::Invalid));
+        // An unlinked regular file (nlink 0, but no seals).
+        let unlinked = File::open(dir.path().join("plain")).unwrap();
+        std::fs::remove_file(dir.path().join("plain")).unwrap();
+        assert_eq!(unlinked.metadata().unwrap().nlink(), 0);
+        assert_eq!(verify(unlinked).err(), Some(VerificationError::Invalid));
+        // memfds that are not fully sealed: none, missing one seal each.
+        for seals in [0, ALL & !libc::F_SEAL_WRITE, ALL & !libc::F_SEAL_GROW, ALL & !libc::F_SEAL_SHRINK, ALL & !libc::F_SEAL_SEAL] {
+            assert_eq!(verify(read_only(&memfd(b"x", seals))).err(), Some(VerificationError::Invalid), "{seals:#x}");
+        }
+        // A fully sealed memfd on a writable description.
+        assert_eq!(verify(memfd(b"x", ALL)).err(), Some(VerificationError::Invalid));
+        // An unlinked O_TMPFILE on tmpfs: nlink 0 and F_GET_SEALS works, but it
+        // starts with F_SEAL_SEAL only and can never be write-sealed.
+        if let Ok(tmpfile) = std::fs::OpenOptions::new().read(true).write(true)
+            .custom_flags(libc::O_TMPFILE).open("/dev/shm") {
+            let mut tmpfile = tmpfile;
+            tmpfile.write_all(b"x").unwrap();
+            assert_eq!(tmpfile.metadata().unwrap().nlink(), 0);
+            assert_eq!(verify(read_only(&tmpfile)).err(), Some(VerificationError::Invalid));
+        }
+        // Through the boundary: the unchecked broker's live fd never authorizes a read.
+        std::fs::write(dir.path().join("a.txt"), b"live").unwrap();
+        let (roots, _) = setup(TestWorkBroker::unchecked(dir.path().to_owned(), RUN, EMPLOYEE));
+        let (context, _) = live(RUN);
+        assert!(matches!(roots.authorize_file(&context, "file_read", &json!({"workspace": EMPLOYEE_WORK_ROOT, "path": "a.txt"})).err(),
+            Some(VerificationError::Invalid)));
+    }
+
+    #[test]
+    fn h5_error_mapping_no_path_leak() {
+        let all = [WorkBrokerError::NotLive, WorkBrokerError::NotFound, WorkBrokerError::Refused,
+            WorkBrokerError::TooLarge, WorkBrokerError::Unavailable];
+        let messages: std::collections::BTreeSet<_> = all.iter().map(|error| error.user_message()).collect();
+        assert_eq!(messages.len(), all.len(), "each refusal has its own message");
+        assert_eq!(WorkBrokerError::Unavailable.code(), "workspace_broker_unavailable");
+        assert_eq!(WorkBrokerError::NotFound.code(), "work_file_not_found");
+        assert_eq!(WorkBrokerError::Refused.code(), "work_file_refused");
+        assert_eq!(WorkBrokerError::TooLarge.code(), "work_file_too_large");
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "機密資料夾/薪資-2026.xlsx";
+        std::fs::create_dir(dir.path().join("機密資料夾")).unwrap();
+        std::fs::write(dir.path().join("target.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink("../target.txt", dir.path().join("機密資料夾/捷徑-2026.xlsx")).unwrap();
+        std::fs::File::create(dir.path().join("機密資料夾/巨大-2026.xlsx")).unwrap().set_len(BROKERED_FILE_MAX_BYTES + 1).unwrap();
+        let (roots, broker) = setup(TestWorkBroker::new(dir.path().to_owned(), RUN, EMPLOYEE));
+        let (context, _) = live(RUN);
+        let refusal = |path: &str| roots.authorize_file_with_refusal(&context, "file_read",
+            &json!({"workspace": EMPLOYEE_WORK_ROOT, "path": path})).err().unwrap();
+        let mut seen = Vec::new();
+        for (path, expected) in [(secret, WorkBrokerError::NotFound),
+            ("機密資料夾/捷徑-2026.xlsx", WorkBrokerError::Refused), ("機密資料夾/巨大-2026.xlsx", WorkBrokerError::TooLarge)] {
+            let refusal = refusal(path);
+            assert_eq!(refusal.broker(), Some(expected), "{path}");
+            // The boundary contract is unchanged: every broker refusal is Unavailable.
+            assert_eq!(refusal.verification(), VerificationError::Unavailable);
+            assert!(matches!(roots.authorize_file(&context, "file_read", &json!({"workspace": EMPLOYEE_WORK_ROOT, "path": path})).err(),
+                Some(VerificationError::Unavailable)));
+            seen.push((path, refusal));
+        }
+        for error in [WorkBrokerError::Unavailable, WorkBrokerError::NotLive] {
+            broker.fail_with(Some(error));
+            let refusal = refusal(secret);
+            assert_eq!(refusal.broker(), Some(error));
+            seen.push((secret, refusal));
+        }
+        broker.fail_with(None);
+        // A boundary refusal (bad path) is not a broker refusal and never reaches root.
+        let calls = broker.calls().len();
+        assert!(matches!(refusal("../機密資料夾/薪資-2026.xlsx"), FileRefusal::Verification(_)));
+        assert_eq!(broker.calls().len(), calls);
+
+        let host = dir.path().to_string_lossy().into_owned();
+        for (path, refusal) in seen {
+            let message = refusal.broker().unwrap().user_message();
+            for fragment in path.split('/').chain(path.split(['/', '-', '.'])).filter(|part| !part.is_empty()) {
+                assert!(!message.contains(fragment), "{message} leaks {fragment:?}");
+            }
+            assert!(!message.contains(&host) && !message.contains(EMPLOYEE_WORK_ROOT) && !message.contains('/'), "{message}");
+            assert!(!format!("{refusal:?}").contains("2026"));
+        }
     }
 }
 

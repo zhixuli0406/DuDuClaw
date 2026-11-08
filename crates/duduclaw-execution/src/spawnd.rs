@@ -4,6 +4,8 @@
 
 mod transport;
 mod fd_io;
+mod work_file;
+pub use work_file::{FeatureSource, SpawndFeatures, WorkFileError, WorkFileSnapshot, WORK_BROKER_FEATURE};
 
 use std::{collections::BTreeMap, os::fd::OwnedFd, sync::{Arc, Mutex as StdMutex}, time::Duration};
 use duduclaw_isolation::{bounded::{List, Text}, execution::*, ids::{EmployeeId, RunId}, ipc::{self, SpawnRequest, SpawnResponse, RunStatus}};
@@ -30,6 +32,10 @@ pub struct SpawndBackend {
     slots: Arc<Semaphore>,
     workspace_bridge: Option<Arc<dyn RootWorkspaceBridge>>,
     admission: Option<fn() -> Result<(), BackendError>>,
+    /// H5: where spawnd's advertised features are read per call. `None` (the
+    /// default) means no Package H op is ever sent: an older spawnd decodes an
+    /// unknown `op` as a malformed frame and drops the whole control connection.
+    features: Option<FeatureSource>,
 }
 
 /// Read-only host metadata; generated only after peer and reply validation.
@@ -78,7 +84,8 @@ impl SpawndBackend {
     /// Package B performs readiness checks for the trampoline, egress and quotas.
     pub async fn connect() -> Result<Self, BackendError> {
         let _probe = transport::connect()?;
-        Ok(Self { runs: StdMutex::new(BTreeMap::new()), slots: Arc::new(Semaphore::new(MAX_TRACKED_RUNS)), admission: None, workspace_bridge: None })
+        Ok(Self { runs: StdMutex::new(BTreeMap::new()), slots: Arc::new(Semaphore::new(MAX_TRACKED_RUNS)), admission: None, workspace_bridge: None,
+            features: None })
     }
 
     /// Gateway boot uses this constructor so retained backend Arcs cannot
@@ -636,7 +643,8 @@ mod tests {
                 pty: false, mcp: false, output_bytes: 1, output_buffer: 1, io_received: false,
                 stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None, workspace: None,
             }) });
-        let backend = SpawndBackend { runs: StdMutex::new(BTreeMap::from([(run.0, entry.clone())])), slots, admission: None, workspace_bridge: None };
+        let backend = SpawndBackend { runs: StdMutex::new(BTreeMap::from([(run.0, entry.clone())])), slots, admission: None, workspace_bridge: None,
+            features: None };
         (backend, run, entry, peer)
     }
 

@@ -7,6 +7,8 @@ pub mod execution_jobs;
 pub mod fork_policy;
 #[cfg(all(target_os = "linux", feature = "execution-integration"))]
 pub mod protected_launch;
+#[cfg(all(target_os = "linux", feature = "execution-integration"))]
+pub mod work_bridge;
 pub mod factories;
 pub mod worker_execution;
 pub mod resources;
