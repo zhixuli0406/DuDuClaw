@@ -7,9 +7,12 @@ use duduclaw_isolation::capability::EmployeeBinding;
 use crate::isolation_lifecycle::{self as lifecycle, LifecycleError};
 use std::sync::Arc;
 
-pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority> }
+pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority>, agent_cap:usize }
 impl EmployeeAuthority {
-    pub(crate) fn new(home:PathBuf,live:Arc<LiveAuthority>)->Self{Self{home,live}}
+    pub(crate) fn new(home:PathBuf,live:Arc<LiveAuthority>)->Self{Self{home,live,agent_cap:0}}
+    /// F6fb item 8: the licence agent cap (`MethodHandler::effective_agent_cap`,
+    /// 0 = unlimited) that an adoption's approval and apply enforce.
+    pub(crate) fn with_agent_cap(mut self,agent_cap:usize)->Self{self.agent_cap=agent_cap;self}
     fn validate_current(&self,item:&ConfirmationItem)->Result<()> {
         if item.status==ConfirmationStatus::Failed { return Err(Error::Denied); }
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
@@ -65,7 +68,7 @@ impl EmployeeAuthority {
         };
         let env=crate::isolation_adopt::AdoptEnv { root:&crate::isolation_retire::SpawndRetireRoot, routes:&routes,
             runs:&crate::isolation_quarantine::SpawndRunStopper, rule:&duduclaw_auth::admin_approval_rule::EligibilityLogRule,
-            hooks:&hooks, agent_cap:0, actor, now:chrono::Utc::now().timestamp() };
+            hooks:&hooks, agent_cap:self.agent_cap, actor, now:chrono::Utc::now().timestamp() };
         run(&env)
     }
 }

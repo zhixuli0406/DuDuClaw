@@ -297,7 +297,7 @@ fn adopt_post_transform_passes_v2_digest() {
     assert_eq!(snapshot.digest, digest);
     assert_eq!(snapshot.settings().unwrap(), plan.settings);
     // Publish / read-back re-validate against the marker.
-    assert_eq!(validate_item(f.home(), &env(&ax), &item, &plan.adopt, &f.bob), Ok(AdoptPhase::Adopted));
+    assert_eq!(validate_item(f.home(), &env(&ax), &item, &plan.adopt, &f.bob), Ok(AdoptPhase::Adopted { employee: NEW }));
     std::fs::write(f.home().join("agents").join(LABEL).join("SOUL.md"), "edited").unwrap();
     assert_eq!(validate_item(f.home(), &env(&ax), &item, &plan.adopt, &f.bob).err(), Some(AdoptError::ForeignDir));
 }
@@ -598,3 +598,8 @@ fn adopt_single_use_per_row() {
 /// F6d: the adoption request RPC bodies, post-commit hook and boot recovery.
 #[path = "isolation_adopt_rpc_tests.rs"]
 mod f6d;
+
+/// F6fb fix round: resume after `save()`, Shared rollback, replay binding,
+/// compensation after commit, path check, licence cap.
+#[path = "isolation_adopt_f6fb_tests.rs"]
+mod f6fb;

@@ -79,7 +79,7 @@ pub(super) struct Fx{pub(super) dir:PathBuf,pub(super) registry:Box<dyn Registry
 impl Fx{
     pub(super) fn portable()->Self{
         let temp=tempfile::tempdir().unwrap();let dir=temp.path().to_path_buf();
-        let allocator=Allocator{directory:dir.clone(),journal:Journal{schema:JOURNAL_SCHEMA,entries:vec![]},poisoned:false,events:vec![]};
+        let allocator=Allocator{directory:dir.clone(),journal:Journal{schema:JOURNAL_SCHEMA,entries:vec![]},poisoned:false,events:vec![],traces_verified:true};
         Self{dir,registry:Box::new(FakeRegistry(Registry::default())),accounts:Accounts::new(),disk:Disk::new(),allocator,root:false,_temp:Some(temp)}
     }
     pub(super) fn root(name:&str)->Self{
@@ -100,7 +100,7 @@ impl Fx{
     /// A daemon restart of the allocator (the journal is re-read from disk).
     pub(super) fn reopen(&mut self){
         self.allocator=if self.root{Allocator::open_at(&self.dir,self.registry.registry(),&mut self.disk).unwrap()}
-            else{Allocator{directory:self.dir.clone(),journal:decode_journal(&fs::read(self.dir.join("allocations.json")).unwrap()).unwrap(),poisoned:false,events:vec![]}};
+            else{Allocator{directory:self.dir.clone(),journal:decode_journal(&fs::read(self.dir.join("allocations.json")).unwrap()).unwrap(),poisoned:false,events:vec![],traces_verified:true}};
     }
     pub(super) fn phase(&self,employee:EmployeeId)->Phase{self.allocator.journal.entries.iter().find(|e|e.receipt.employee==employee).unwrap().phase}
     pub(super) fn account(&self,employee:EmployeeId)->EmployeeAccount{self.registry.registry().employees.iter().find(|a|a.employee==employee).unwrap().clone()}
@@ -150,7 +150,7 @@ fn entry(request:&Request,phase:Phase)->Entry{
 fn retire_binding(id:u8)->ProposalBinding{ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([id;16]),revision:1},proposal_digest:Sha256Digest([id;32])}}
 fn saved(journal:Journal)->Journal{
     let dir=tempfile::tempdir().unwrap();
-    let mut allocator=Allocator{directory:dir.path().into(),journal,poisoned:false,events:vec![]};
+    let mut allocator=Allocator{directory:dir.path().into(),journal,poisoned:false,events:vec![],traces_verified:true};
     allocator.save().unwrap();
     decode_journal(&fs::read(dir.path().join("allocations.json")).unwrap()).unwrap()
 }
@@ -337,6 +337,31 @@ fn allocation_readback_reports_idle(){
     readback.schema=1;
     assert_eq!(fx.allocator.subject(&readback),None,"schema 1 never pays for the idle readback");
     assert_eq!(fx.handle_with(&readback,false,Some(Ok(quiet()))).unwrap().idle,None);
+}
+/// F6fb item 7 (S5a): a missing journal with unreadable storage opens empty
+/// but unverified; no entry (so no label) is created until storage has been
+/// read once and shows no image the journal does not know.
+#[test]
+fn f6fb_empty_open_with_unreadable_storage_refuses_allocate_until_traces_read(){
+    let mut disk=Disk::new();disk.traces_fail=true;
+    assert!(!missing_journal(&Registry::default(),&mut disk).unwrap(),"opened, but not verified");
+    disk.traces_fail=false;
+    assert!(missing_journal(&Registry::default(),&mut disk).unwrap());
+    let mut fx=Fx::portable();fx.allocator.traces_verified=false;
+    let request=employee_request(1,"sales",ConfirmationStatus::Applying,ALICE);
+    fx.disk.traces_fail=true;
+    assert_eq!(fx.handle(&request).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
+    assert!(fx.allocator.journal.entries.is_empty(),"no entry while storage is unread");
+    // Readable, but an old image the empty journal does not know (its label may be taken).
+    fx.disk.traces_fail=false;fx.disk.extra_traces.push(EmployeeId([5;16]));
+    assert_eq!(fx.handle(&request).unwrap_err(),wire::ErrorCode::IsolationUnavailable);
+    assert!(fx.allocator.journal.entries.is_empty() && !fx.allocator.traces_verified);
+    // Readable and clean: the allocation proceeds; verified from then on.
+    fx.disk.extra_traces.clear();
+    assert_eq!(fx.handle(&request).unwrap().phase,Phase::Ready);
+    assert!(fx.allocator.traces_verified);
+    fx.disk.traces_fail=true;
+    assert_eq!(allocate(&mut fx,2,"ops").label,"ops","verified once is enough");
 }
 #[test]
 fn retire_scenarios_with_in_memory_registry(){

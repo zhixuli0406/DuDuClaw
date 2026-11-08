@@ -323,6 +323,10 @@ impl IsolationDispatcher {
             .map_err(|_| VerificationError::Invalid)?;
         let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30))
             .build().map_err(|_| VerificationError::Unavailable)?;
+        // F6fb item 2 (H4): this process writes the home's memory.db itself, so
+        // it carries the same label writer gate as the gateway (every write of
+        // a tombstoned or quarantined label refused, triggers included).
+        let _ = duduclaw_gateway::install_isolated_process_writer_gate();
         let memory = duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db"))
             .map_err(|_| VerificationError::Unavailable)?;
         let redaction = crate::mcp_redaction::McpRedactionLayer::try_init_for_identity(

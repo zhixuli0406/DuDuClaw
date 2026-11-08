@@ -506,12 +506,15 @@ async fn spawn_telegram_bot(
     // lifetime, so a token change lands within one `getUpdates` cycle instead
     // of requiring this task (or the gateway) to be restarted.
     let agent = agent_name.clone();
-    let handle = tokio::spawn(async move {
+    // F6fb item 9: the bot's per-update tasks are tracked in its scope and
+    // stop with it.
+    let scope = crate::isolation_label_bots::BotScope::new();
+    let handle = tokio::spawn(crate::isolation_label_bots::scoped(scope.clone(), async move {
         poll_loop(client, token, ctx, label, agent_name).await;
-    });
+    }));
     // F6h (H5): a per-agent bot is registered so a tombstone can stop it.
     if let Some(agent) = agent {
-        if !crate::isolation_label_bots::admit(_home_dir, "telegram", &agent, handle.abort_handle()).await {
+        if !crate::isolation_label_bots::admit(_home_dir, "telegram", &agent, handle.abort_handle(), scope).await {
             warn!(agent = %agent, "per-agent Telegram bot stopped: the employee is no longer live");
             return None;
         }
@@ -1296,7 +1299,8 @@ async fn process_telegram_message(
         let c = progress_client.clone();
         let api = progress_api.clone();
         let msg_id = progress_msg_id.clone();
-        tokio::spawn(async move {
+        // F6fb item 9: tracked in the bot's scope (stops with the bot).
+        crate::isolation_label_bots::spawn_scoped(async move {
             let mut id_guard = msg_id.lock().await;
             match *id_guard {
                 Some(mid) => {
@@ -1916,7 +1920,8 @@ async fn handle_callback_query(
         let api_base = api_base.to_string();
         let sender = cb.from.as_ref().filter(|user| !user.is_bot)
             .map(|user| user.id.to_string()).unwrap_or_default();
-        tokio::spawn(async move {
+        // F6fb item 9: tracked in the bot's scope (stops with the bot).
+        crate::isolation_label_bots::spawn_scoped(async move {
             let outcome = crate::goal_intent::handle_gintent_button_for_sender(&ctx, choice, &nonce, "telegram", &sender).await;
             send_reply_markdown(
                 &client,

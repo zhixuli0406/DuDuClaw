@@ -69,6 +69,14 @@ pub(crate) mod isolation_restore;
 // Purge / re-key entry points are consumed by F6i / F6g (not yet merged).
 #[allow(dead_code)]
 pub(crate) mod isolation_label_stores;
+
+/// F6fb item 2: install the F6 label writer gate in the isolated MCP server
+/// process before it opens the home's memory.db (always active there; that
+/// process exists only in protected mode). `false` when a gate was already
+/// installed in this process (the first one stays).
+pub fn install_isolated_process_writer_gate() -> bool {
+    duduclaw_memory::install_label_write_gate(isolation_label_stores::isolated_process_write_gate)
+}
 // F6h: running per-employee channel bots (tombstone stop hook).
 pub(crate) mod isolation_label_bots;
 // F6h: restore / purge of the label-keyed state the tombstone held (F6c, F6i).

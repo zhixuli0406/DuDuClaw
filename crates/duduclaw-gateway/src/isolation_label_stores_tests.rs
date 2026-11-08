@@ -115,6 +115,19 @@ fn seed_config(home: &Path, label: &str, other: &str) {
     }
 }
 
+/// users.db member bindings: one user bound to `label`, one to `other`.
+fn seed_bindings(home: &Path, label: &str, other: &str) {
+    let path = home.join("users.db");
+    let users = duduclaw_auth::UserDb::new(&path).unwrap();
+    for (n, agent) in [(1, label), (2, other)] {
+        let user = users.create_user(&format!("member{n}-{agent}@example.test"), "Member", "password1",
+            duduclaw_auth::UserRole::Employee).unwrap();
+        users.bind_agent(&user.id, agent, duduclaw_auth::AccessLevel::Operator).unwrap();
+    }
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap(); }
+}
+
 fn store(name: &str) -> &'static LabelStore {
     LABEL_KEYED_STORES.iter().find(|store| store.name == name).unwrap()
 }
@@ -141,7 +154,7 @@ fn label_keyed_stores_registry_complete() {
     let names: BTreeSet<&str> = LABEL_KEYED_STORES.iter().map(|store| store.name).collect();
     assert_eq!(names.len(), LABEL_KEYED_STORES.len(), "store names are unique");
     for required in ["org_entry", "memory", "sessions", "tasks", "cron", "website_credentials", "channel_routes",
-        "delegation_targets"] {
+        "delegation_targets", "member_bindings"] {
         assert!(names.contains(required), "{required} is registered");
     }
     let sources: BTreeSet<&str> = LABEL_KEYED_STORES.iter().map(|store| store.source).collect();
@@ -185,10 +198,21 @@ async fn rekey_idempotent_per_store() {
     seed(home, LABEL).await;
     seed(home, OTHER).await;
     seed_config(home, LABEL, OTHER);
+    seed_bindings(home, LABEL, OTHER);
     let key = quarantine_key(EmployeeId([9; 16]), 0);
     for store in LABEL_KEYED_STORES {
         let other_before = store.count_under(home, OTHER).unwrap();
         assert!(store.count_under(home, LABEL).unwrap() > 0, "{} holds the label", store.name);
+        if store.action == TombstoneAction::Principal {
+            // Never moved (a new id's own bindings may be on the label): the
+            // count gates the commit, the purge removes what is left.
+            assert_eq!(store.rekey(home, LABEL, &key), Ok(0), "{}", store.name);
+            assert!(store.count_under(home, LABEL).unwrap() > 0);
+            assert!(store.purge(home, LABEL).unwrap() > 0);
+            assert_eq!(store.count_under(home, LABEL), Ok(0));
+            assert_eq!(store.count_under(home, OTHER), Ok(other_before), "{}: other labels untouched", store.name);
+            continue;
+        }
         let moved = store.rekey(home, LABEL, &key).unwrap();
         assert!(moved > 0, "{} moved", store.name);
         assert_eq!(store.count_under(home, LABEL), Ok(0), "{}", store.name);
@@ -254,6 +278,7 @@ async fn purge_removes_label_stores() {
     seed(home, LABEL).await;
     seed(home, OTHER).await;
     seed_config(home, LABEL, OTHER);
+    seed_bindings(home, LABEL, OTHER);
     let other_before: Vec<u64> = LABEL_KEYED_STORES.iter().map(|store| store.count_under(home, OTHER).unwrap()).collect();
     let purged = purge_all(home, LABEL).unwrap();
     assert!(purged.iter().all(|(_, removed)| *removed > 0), "{purged:?}");
@@ -623,4 +648,158 @@ async fn restored_row_counts_as_closed() {
     // A second, open row of another id on the same label still holds it.
     quarantine_row(home, LABEL, 2, "sealed");
     assert_eq!(check_label_writable(home, LABEL), Err(GateRefusal::Quarantined));
+}
+
+/// A virtual table or one of its shadow tables (no triggers possible).
+fn virtual_or_shadow(db: &Connection, table: &str) -> bool {
+    let virtuals: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE 'CREATE VIRTUAL TABLE%'")
+        .unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    virtuals.iter().any(|v| table == v || table.starts_with(&format!("{v}_")))
+}
+
+/// Registry-based coverage (F6fb item 2): every non-virtual table of the
+/// connection that has a registered label column carries the INSERT and the
+/// UPDATE gate trigger for that column, and every child table of the
+/// registered parent carries the parent-lookup pair.
+fn assert_every_label_table_gated(db: &Connection, parent_child: Option<&str>, exempt: &[&str]) {
+    use duduclaw_memory::label_gate::{gated_tables, TRIGGER_PREFIX};
+    assert_eq!(duduclaw_memory::label_gate::LABEL_COLUMNS, AGENT_COLUMNS, "one list of label columns");
+    let gated = gated_tables(db).unwrap();
+    let names = |table: &str| gated.iter().find(|(t, _)| t == table).map(|(_, n)| n.clone()).unwrap_or_default();
+    let mut checked = 0;
+    for (table, column) in sqlite::keyed_columns(db).unwrap() {
+        if virtual_or_shadow(db, &table) || exempt.contains(&table.as_str()) {
+            assert!(names(&table).is_empty(), "{table}: exempt tables carry no gate");
+            continue;
+        }
+        for kind in ["i", "u"] {
+            let name = format!("{TRIGGER_PREFIX}{kind}_{table}_c_{column}");
+            assert!(names(&table).contains(&name), "{table}.{column}: no {kind} gate ({:?})", names(&table));
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "the store has label-keyed tables");
+    if let Some(child) = parent_child {
+        let tables: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            .unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        for table in tables {
+            let has_child: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                [table.as_str(), child], |r| r.get(0)).unwrap();
+            if !has_child || table == "sessions" || virtual_or_shadow(db, &table) { continue; }
+            let name = format!("{TRIGGER_PREFIX}i_{table}_p_{child}");
+            assert!(names(&table).contains(&name), "{table}.{child}: no parent gate ({:?})", names(&table));
+        }
+    }
+}
+
+/// F6fb item 2: every memory write that carries a label passes the gate —
+/// not only `store`: the entity alias upsert, any `UPDATE memories …`
+/// (content, re-key into the label), through the engine's own connection.
+/// A closing write (expiry) still narrows the quarantined label's rows.
+#[tokio::test]
+async fn f6fb_memory_every_label_write_gated() {
+    use duduclaw_core::traits::MemoryEngine;
+    install_memory_gate();
+    let dir = private_home();
+    let home = dir.path();
+    let memory = duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db")).unwrap();
+    let mine = memory_entry(LABEL);
+    let id = mine.id.clone();
+    memory.store(LABEL, mine).await.unwrap();
+    memory.store(OTHER, memory_entry(OTHER)).await.unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    let _mode = Mode::protected(true);
+    let conn = memory.conn_for_maintenance().await;
+    let alias = "INSERT INTO entity_alias (agent_id, canonical, alias, created_at) VALUES (?1, 'acme', 'acme inc', 'now')
+        ON CONFLICT(agent_id, alias) DO UPDATE SET canonical = excluded.canonical";
+    let refused = conn.execute(alias, [LABEL]).unwrap_err();
+    assert!(refused.to_string().contains(duduclaw_memory::label_gate::REFUSED), "{refused}");
+    conn.execute(alias, [OTHER]).unwrap();
+    assert_eq!(conn.execute("UPDATE memories SET content = 'planted' WHERE agent_id = ?1", [LABEL]).unwrap(), 0);
+    assert_eq!(conn.execute("UPDATE memories SET content = 'edited' WHERE agent_id = ?1", [OTHER]).unwrap(), 1);
+    assert_eq!(conn.execute("UPDATE memories SET agent_id = ?1 WHERE agent_id = ?2", [LABEL, OTHER]).unwrap(), 0,
+        "nothing is re-keyed into a quarantined label");
+    assert_eq!(conn.execute("UPDATE memories SET agent_id = ?1 WHERE agent_id = ?2", [OTHER, LABEL]).unwrap(), 0,
+        "nothing leaves a quarantined label either");
+    // Narrowing writes still run: expiry, clearing to NULL, lowering trust (never raising it).
+    assert_eq!(conn.execute("UPDATE memories SET valid_until = '2026-01-01T00:00:00Z' WHERE agent_id = ?1", [LABEL]).unwrap(), 1,
+        "an expiry still closes the row");
+    assert_eq!(conn.execute("UPDATE memories SET supersedes = NULL WHERE agent_id = ?1", [LABEL]).unwrap(), 1);
+    assert_eq!(conn.execute("UPDATE memories SET origin_trust = 0.05 WHERE agent_id = ?1", [LABEL]).unwrap(), 1);
+    assert_eq!(conn.execute("UPDATE memories SET origin_trust = 0.9 WHERE agent_id = ?1", [LABEL]).unwrap(), 0);
+    let content: String = conn.query_row("SELECT content FROM memories WHERE id = ?1", [&id], |r| r.get(0)).unwrap();
+    assert_eq!(content, format!("{LABEL} remembers"));
+    // A forget tombstone (narrowing table) is never blocked.
+    assert!(duduclaw_memory::label_gate::MEMORY_NARROWING_TABLES.contains(&"forgotten_memories"));
+    conn.execute("INSERT INTO forgotten_memories (memory_store, memory_id, agent_id, plan_id, forgotten_at)
+        VALUES ('memories', 'gone', ?1, 'plan', 'now')", [LABEL]).unwrap();
+    assert_every_label_table_gated(&conn, None, &duduclaw_memory::label_gate::MEMORY_NARROWING_TABLES);
+    drop(conn);
+    assert!(memory.store(LABEL, memory_entry(LABEL)).await.is_err());
+}
+
+/// F6fb item 2: sessions writers without their own check before this round
+/// (failure records, compression, pinned instructions, titles) refuse, and
+/// a raw write on any pool connection is gated through the session's agent.
+#[tokio::test]
+async fn f6fb_session_every_label_write_gated() {
+    let dir = private_home();
+    let home = dir.path();
+    let sessions = crate::session::SessionManager::new(&home.join("sessions.db")).unwrap();
+    sessions.get_or_create("webchat:old", LABEL).await.unwrap();
+    sessions.append_message("webchat:old", "user", "hello", 1).await.unwrap();
+    sessions.get_or_create("webchat:bob", OTHER).await.unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    let _mode = Mode::protected(true);
+    let refused = sessions.record_webchat_failure("webchat:old", "boom").await.unwrap_err();
+    assert!(refused.to_string().contains(LABEL_QUARANTINED), "{refused}");
+    assert!(sessions.compress("webchat:old", "planted summary").await.is_err());
+    assert!(sessions.set_pinned("webchat:old", "planted").await.is_err());
+    assert!(sessions.set_title("webchat:old", "planted", 1).await.is_err());
+    assert_eq!(sessions.get_pinned("webchat:old").await.unwrap(), "");
+    assert_eq!(sessions.get_title("webchat:old").await.unwrap().0, "");
+    let kept: i64 = Connection::open(home.join("sessions.db")).unwrap()
+        .query_row("SELECT COUNT(*) FROM session_messages WHERE session_id = 'webchat:old' AND content = 'hello'", [], |r| r.get(0)).unwrap();
+    assert_eq!(kept, 1, "compression deleted nothing");
+    // Other labels are untouched by the gate.
+    sessions.set_title("webchat:bob", "fine", 1).await.unwrap();
+    sessions.record_webchat_failure("webchat:bob", "boom").await.unwrap();
+    // The connection-level backstop on every pool connection (each guard is
+    // held, so the next `acquire` returns another connection).
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let conn = sessions.acquire().await;
+        let raw = conn.execute("INSERT INTO session_messages (session_id, role, content, tokens, timestamp)
+            VALUES ('webchat:old', 'assistant', 'planted', 0, 'now')", []);
+        assert!(raw.unwrap_err().to_string().contains(duduclaw_memory::label_gate::REFUSED));
+        assert_eq!(conn.execute("UPDATE sessions SET pinned_instructions = 'planted' WHERE id = 'webchat:old'", []).unwrap(), 0);
+        assert_eq!(conn.execute("UPDATE sessions SET agent_id = ?1 WHERE id = 'webchat:bob'", [LABEL]).unwrap(), 0);
+        assert_every_label_table_gated(&conn, Some("session_id"), &[]);
+        held.push(conn);
+    }
+}
+
+/// F6fb item 3: any closed row (purged, adopted, restored) with no live
+/// confirmed row frees the label only on a positive zero count — including
+/// the users.db member bindings (item 1).
+#[tokio::test]
+async fn f6fb_zero_count_required_for_any_closed_row() {
+    for closed in ["adopted", "restored", "purged"] {
+        let dir = private_home();
+        let home = dir.path();
+        quarantine_row(home, LABEL, 1, "sealed");
+        set_seal(home, LABEL, closed);
+        seed(home, LABEL).await;
+        seed_bindings(home, LABEL, OTHER);
+        assert_eq!(check_label_not_quarantined(home, LABEL, None), Err(GateRefusal::Quarantined), "{closed}: rows left");
+        for store in LABEL_KEYED_STORES.iter().filter(|s| s.name != "member_bindings") { store.purge(home, LABEL).unwrap(); }
+        assert_eq!(check_label_not_quarantined(home, LABEL, None), Err(GateRefusal::Quarantined), "{closed}: a binding left");
+        assert!(store("member_bindings").purge(home, LABEL).unwrap() > 0);
+        assert_eq!(check_label_not_quarantined(home, LABEL, None), Ok(()), "{closed}");
+        assert_eq!(store("member_bindings").count_under(home, OTHER), Ok(1), "{closed}: other labels untouched");
+        // An unreadable store is not zero.
+        std::fs::remove_file(home.join("tasks.db")).unwrap();
+        std::fs::write(home.join("tasks.db"), b"not a SQLite database").unwrap();
+        assert_eq!(check_label_not_quarantined(home, LABEL, None), Err(GateRefusal::Unavailable), "{closed}");
+    }
 }

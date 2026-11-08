@@ -13,7 +13,9 @@ duduclaw-core = { workspace = true }
 duduclaw-mcp-boundary = { workspace = true }
 duduclaw-security = { workspace = true }
 tokio = { workspace = true }
-rusqlite = { workspace = true }
+# `functions`: the F6 label write gate is a per-connection SQL function used
+# by TEMP triggers (`label_gate::install_write_triggers`).
+rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
