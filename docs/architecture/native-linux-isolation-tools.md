@@ -51,7 +51,13 @@ rechecks (a change refuses the run):
   (`reason: task_not_owned`, `stage: schedule` or `issuance`).
 
 Workspace and URL-origin selection for the other File/A/E tools is still
-missing, including `execute_program`. The parity test tracks this gap
+missing, including `execute_program` and browser recording
+(`browser_record_start` / `browser_record_stop`, task HX6). `employee-work` is
+also the A execution workspace handle, so when the issuer selects it for the
+file tools it leaves every other listed tool whose eligibility would rest on
+that grant out of the signed tool snapshot (`Selection::signed_tools`,
+`mcp-boundary` `workspace_selection::needs_execution_workspace`); those tools
+stay hidden and refused. The parity test tracks this gap
 explicitly; it is unfinished wiring, not another intentional isolation refusal
 or evidence of full employee parity. Until H5 installs the production work
 broker, the file tools stay hidden in production even though the selector

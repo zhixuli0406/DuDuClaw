@@ -158,6 +158,25 @@ fn h9_workspace_grant_only_when_profile_allows() {
 }
 
 #[test]
+fn h10_file_workspace_never_signs_execution_tools() {
+    // `employee-work` is also the A workspace handle. Without an execution
+    // selector the issuer must not sign the A/E tools that grant would enable
+    // (browser recording stays hidden and refused until HX6).
+    let names = ["file_read", "browser_record_start", "browser_record_stop", "execute_program", "code_map",
+        "skill_hub_install", "tasks_update"];
+    let auth = fixture(true).issue(&names).unwrap();
+    assert!(has(&auth, &workspace()));
+    let signed: Vec<_> = auth.grant.tools.as_slice().iter().map(|tool| tool.as_str()).collect();
+    assert_eq!(signed, ["file_read", "tasks_update"]);
+    let ctx = context(&auth);
+    assert!(eligible(&ctx, "file_read"));
+    for tool in &names[1..6] { assert!(!eligible(&ctx, tool), "{tool}"); }
+    // No Workspace selected: the snapshot is signed unchanged.
+    let auth = fixture(false).issue(&names).unwrap();
+    assert_eq!(auth.grant.tools.as_slice().len(), names.len());
+}
+
+#[test]
 fn h9_public_origins_only_when_admin_enabled() {
     let f = fixture(false);
     let web = ["web_fetch_cached", "web_extract"];
