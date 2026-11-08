@@ -731,9 +731,9 @@ impl MethodHandler {
         let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
         let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
         match store
-            .list_tasks_page_for_principal(
+            .list_tasks_page_hiding(
                 status, agent_id, priority, goal_mode, archived, limit, offset,
-                Some(&format!("user:{}", reader.live().user_id)),
+                Some(&format!("user:{}", reader.live().user_id)), reader.hidden(),
             )
             .await
         {
@@ -785,7 +785,7 @@ impl MethodHandler {
         let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
         let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
         match store
-            .list_principal_page(&principal, status, agent_id, goal_mode, archived, limit, offset)
+            .list_principal_page_hiding(&principal, status, agent_id, goal_mode, archived, limit, offset, reader.hidden())
             .await
         {
             Ok((mut rows, total)) => { rows.retain(|r| !reader.hides(&r.assigned_to));

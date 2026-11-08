@@ -28,6 +28,12 @@
 //!   Approval cards of another person's Personal employee are metadata only
 //!   ([`personal_metadata_card`]); `approvals.get` with a step-up returns the
 //!   full card, audited.
+//! - **P1c.** Deciding such a card (`personal_decide_gate.rs`, category
+//!   [`DataCategory::Approval`]) and handing work to another person's
+//!   Personal employee (`personal_delegation_gate.rs`, run first in
+//!   [`MethodHandler::personal_gates_for_params`]); list totals and flow
+//!   metrics are computed over the hidden-filtered set; push events are
+//!   filtered per subscriber (`personal_push.rs`).
 use super::*;
 use super::isolation_connectors_rpc::authorize_step_up;
 use crate::personal_visibility::{self as visibility, DataCategory, Reader};
@@ -45,7 +51,7 @@ pub(crate) const REFUSED_ACTION: &str = "isolation.personal_data_read_refused";
 pub(super) const STEP_UP_REQUIRED: &str = "這是個人專屬員工的私人資料（對話、記憶、設定檔或 Wiki）。管理員需先以密碼與雙因素驗證確認身分\
     （有效 5 分鐘），並在請求中帶入驗證後的 step_up_csrf；每次讀取都會寫入稽核紀錄。 / This is a Personal employee's private \
     data. An Admin needs a fresh password + TOTP step-up and its step_up_csrf token; every read is audited.";
-const NOT_ALLOWED: &str = "permission denied";
+pub(super) const NOT_ALLOWED: &str = "permission denied";
 const UNAVAILABLE: &str = "無法確認這位員工的歸屬，已拒絕讀取。";
 const AUDIT_FAILED: &str = "無法寫入稽核紀錄，已拒絕讀取。";
 
@@ -223,6 +229,7 @@ impl MethodHandler {
         params: &mut Value,
         ctx: &UserContext,
     ) -> Result<(), WsFrame> {
+        self.personal_delegation_gate(method, params, ctx).await?;
         let category = agent_scoped(method);
         let by_task = task_scoped(method);
         if (category.is_none() && !by_task) || !crate::runtime_readiness::is_protected_linux() {

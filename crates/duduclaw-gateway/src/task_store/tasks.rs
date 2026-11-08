@@ -127,82 +127,16 @@ impl TaskStore {
     }
 
     /// Dashboard pagination applies the owner restriction before LIMIT and COUNT.
+    /// (v1.81 P1c: the query lives in `personal_hiding.rs`, which can also
+    /// exclude hidden Personal employees; none are excluded here.)
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_tasks_page_for_principal(
         &self, status: Option<&str>, agent_id: Option<&str>, priority: Option<&str>,
         goal_mode: Option<bool>, archived: Option<bool>, limit: i64, offset: i64,
         principal: Option<&str>,
     ) -> Result<(Vec<TaskRow>, i64), String> {
-        let conn = self.conn.lock().await;
-        let mut count_sql = "SELECT COUNT(*) FROM tasks WHERE 1=1".to_string();
-        let mut query_sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE 1=1");
-        let mut binds: Vec<String> = Vec::new();
-        if let Some(s) = status {
-            binds.push(s.to_string());
-            let clause = format!(" AND status = ?{}", binds.len());
-            count_sql.push_str(&clause);
-            query_sql.push_str(&clause);
-        }
-        if let Some(a) = agent_id {
-            binds.push(a.to_string());
-            let clause = format!(" AND assigned_to = ?{}", binds.len());
-            count_sql.push_str(&clause);
-            query_sql.push_str(&clause);
-        }
-        if let Some(p) = priority {
-            binds.push(p.to_string());
-            let clause = format!(" AND priority = ?{}", binds.len());
-            count_sql.push_str(&clause);
-            query_sql.push_str(&clause);
-        }
-        if let Some(g) = goal_mode {
-            let clause = if g {
-                " AND goal_mode = 1"
-            } else {
-                " AND goal_mode = 0"
-            };
-            count_sql.push_str(clause);
-            query_sql.push_str(clause);
-        }
-        let archived_clause = if archived == Some(true) {
-            " AND archived = 1"
-        } else {
-            " AND archived = 0"
-        };
-        count_sql.push_str(archived_clause);
-        query_sql.push_str(archived_clause);
-
-        if let Some(principal) = principal {
-            binds.push(principal.to_string());
-            let clause = format!(" AND (a2a_owner IS NULL OR a2a_owner = ?{})", binds.len());
-            count_sql.push_str(&clause);
-            query_sql.push_str(&clause);
-        }
-
-        let bounded_limit = limit.clamp(1, 200);
-        let bounded_offset = offset.max(0);
-        query_sql.push_str(&format!(
-            " ORDER BY pinned DESC, updated_at DESC LIMIT {bounded_limit} OFFSET {bounded_offset}"
-        ));
-
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = binds
-            .iter()
-            .map(|s| s as &dyn rusqlite::types::ToSql)
-            .collect();
-
-        let total: i64 = conn
-            .query_row(&count_sql, params_ref.as_slice(), |r| r.get(0))
-            .map_err(|e| format!("count tasks page: {e}"))?;
-
-        let mut stmt = conn
-            .prepare(&query_sql)
-            .map_err(|e| format!("prepare list page: {e}"))?;
-        let rows = stmt
-            .query_map(params_ref.as_slice(), row_to_task)
-            .map_err(|e| format!("query list page: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect list page: {e}"))?;
-        Ok((rows, total))
+        self.list_tasks_page_hiding(status, agent_id, priority, goal_mode, archived, limit, offset, principal,
+            &std::collections::BTreeSet::new()).await
     }
 
     pub async fn get_task(&self, id: &str) -> Result<Option<TaskRow>, String> {

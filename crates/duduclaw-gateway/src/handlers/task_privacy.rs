@@ -155,6 +155,13 @@ impl<'a> TaskReader<'a> {
         self.hidden.contains(agent)
     }
 
+    /// The employees [`Self::hides`] (P1c): store page queries exclude them
+    /// before LIMIT and COUNT so totals match the listing. Empty outside
+    /// protected mode.
+    pub(crate) fn hidden(&self) -> &std::collections::BTreeSet<String> {
+        &self.hidden
+    }
+
     /// The listing is scoped to `agent`, which the dispatch gate
     /// (`personal_gates_for_params`) already admitted (owner, or an audited
     /// Admin step-up). Only call with the request's own `agent_id`.

@@ -21,6 +21,14 @@
 //! entirely ([`list_agents_hiding`]; no metadata for other AI employees) and
 //! `task_status` hides the output of a step run by one ([`hidden_step_agents`]).
 //!
+//! P1c: every other tool whose schema names a target employee is in the
+//! table (delegation: `tasks_create`/`tasks_update` `assigned_to`,
+//! `discovery_catalog`; org placement: `reports_to`; work-record, schedule,
+//! feedback, audit, reliability and cost reads), tasks and plans named by id
+//! resolve their employee from `tasks.db` ([`id_target_refusal`]), and the
+//! delegation tools ([`DELEGATION_TOOLS`]) also let another Personal employee
+//! of the same owner hand work over (the owner's own work).
+//!
 //! A self-target (target == acting employee, own namespace, own store) is
 //! decided before any `users.db` read, so it keeps working inside an
 //! isolated run whose MCP process cannot open `users.db`; every
@@ -77,7 +85,83 @@ pub(crate) const PERSONAL_TARGET_TOOLS: &[(&str, &str)] = &[
     ("send_to_agent", "agent_id"),
     ("send_to_agent", "agent"),
     ("check_responses", "agent_id"),
+    // P1c: every remaining tool whose schema (`duduclaw_core::mcp_tool_defs`)
+    // names a target employee. Delegation (also [`DELEGATION_TOOLS`]):
+    ("tasks_create", "assigned_to"),
+    ("tasks_update", "assigned_to"),
+    ("discovery_catalog", "agent_id"),
+    // Org placement under another employee.
+    ("create_agent", "reports_to"),
+    ("agent_update", "reports_to"),
+    // Reads of / writes to another employee's work record, schedules,
+    // feedback, audit trail, reliability and cost.
+    ("tasks_list", "assigned_to"),
+    ("activity_list", "agent_id"),
+    ("discovery_list", "agent_id"),
+    ("list_cron_tasks", "agent_id"),
+    ("list_reminders", "agent_id"),
+    ("submit_feedback", "agent_id"),
+    ("audit_trail_query", "agent_id"),
+    ("reliability_summary", "agent_id"),
+    ("cost_summary", "agent_id"),
 ];
+
+/// P1c: tools of [`PERSONAL_TARGET_TOOLS`] that hand work to the target.
+/// For these the owner's own work may move between the owner's own Personal
+/// employees (`personal_visibility::delegation_refusal`); everything else
+/// stays "the employee itself only".
+pub(crate) const DELEGATION_TOOLS: &[&str] =
+    &["spawn_agent", "send_to_agent", "tasks_create", "tasks_update", "discovery_catalog"];
+
+/// P1c: tools naming a work item by id whose employee is read from
+/// `tasks.db` (`personal_visibility::work_item_employee`). `goals_create`,
+/// `plan_start`, `plan_update_step` (holder rule: own steps only) and
+/// `team_handoff` (role to role inside the member's own host-pinned task)
+/// name no other employee and are not listed.
+pub(crate) const PERSONAL_ID_TARGETS: &[(&str, &str, visibility::WorkItem)] = &[
+    ("tasks_update", "task_id", visibility::WorkItem::Task),
+    ("activity_list", "task_id", visibility::WorkItem::Task),
+    ("plan_get", "plan_id", visibility::WorkItem::Plan),
+];
+
+/// The rule for `tool` on `target`: delegation tools allow the same owner's
+/// Personal employees, the rest only the employee itself.
+fn target_refusal(home_dir: &Path, tool: &str, acting_agent: &str, target: &str) -> Option<&'static str> {
+    if DELEGATION_TOOLS.contains(&tool) {
+        visibility::delegation_refusal(home_dir, true, acting_agent, target)
+    } else {
+        visibility::management_refusal(home_dir, true, acting_agent, target)
+    }
+}
+
+/// [`PERSONAL_ID_TARGETS`]: the employee of the task / plan a call names by
+/// id must not be another person's Personal employee. Unknown ids are left
+/// to the tool; an unreadable `tasks.db` refuses (fail closed). A work item
+/// of the acting employee itself never reads `users.db`.
+pub(crate) fn id_target_refusal(
+    home_dir: &Path,
+    protected: bool,
+    tool: &str,
+    arguments: &Value,
+    acting_agent: &str,
+) -> Option<&'static str> {
+    if !protected {
+        return None;
+    }
+    PERSONAL_ID_TARGETS
+        .iter()
+        .filter(|(name, _, _)| *name == tool)
+        .filter_map(|(_, key, item)| {
+            let id = arguments.get(*key).and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty())?;
+            Some((id, *item))
+        })
+        .find_map(|(id, item)| match visibility::work_item_employee(home_dir, item, id) {
+            Ok(Some(employee)) if employee == acting_agent => None,
+            Ok(Some(employee)) => target_refusal(home_dir, tool, acting_agent, &employee),
+            Ok(None) => None,
+            Err(visibility::Unavailable) => Some(visibility::OWNERSHIP_UNAVAILABLE),
+        })
+}
 
 /// Tools that read the store of the MCP process's own employee
 /// (`default_agent`) rather than a named argument: an external key (whose
@@ -112,7 +196,7 @@ pub(crate) fn personal_target_refusal(
         // Self-targeting needs no ownership read (the mirror check would
         // allow it anyway); an ephemeral sub-agent resolves its parent first.
         .filter(|target| *target != acting_agent)
-        .find_map(|target| visibility::management_refusal(home_dir, true, acting_agent, target))
+        .find_map(|target| target_refusal(home_dir, tool, acting_agent, target))
 }
 
 /// [`PROCESS_STORE_TOOLS`]: refused when the acting caller is not the
@@ -178,6 +262,15 @@ pub(crate) fn pre_dispatch_refusal(
         return None;
     }
     personal_target_refusal(home_dir, true, tool, arguments, acting_agent)
+        // An isolated call names its task/plan through the signed Task grant,
+        // which the boundary resolver checks against live ownership; only the
+        // legacy path needs the tasks.db lookup.
+        .or_else(|| {
+            crate::mcp_isolation::current()
+                .is_none()
+                .then(|| id_target_refusal(home_dir, true, tool, arguments, acting_agent))
+                .flatten()
+        })
         .or_else(|| process_store_refusal(home_dir, true, tool, acting_agent, process_agent))
         .or_else(|| {
             let requested = arguments.get("namespace").and_then(Value::as_str)?;

@@ -339,7 +339,10 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_mail_decide(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_mail_decide(&self, mut params: Value, ctx: &UserContext) -> WsFrame {
+        // v1.81 P1c: a Personal employee's mail card needs its owner or an
+        // audited Admin step-up (`personal_decide_gate.rs`).
+        let step_up = super::personal_data_gate::take_step_up(&mut params);
         let Some(mail_id) = params
             .get("mail_id")
             .and_then(|v| v.as_str())
@@ -398,7 +401,11 @@ impl MethodHandler {
         // deciding it — otherwise a crafted mail_id could be used to decide an
         // unrelated approval through this narrower gate.
         match broker.get(&approval_id).await {
-            Ok(Some(rec)) if rec.action_kind == crate::mail::OUTBOUND_ACTION_KIND => {}
+            Ok(Some(rec)) if rec.action_kind == crate::mail::OUTBOUND_ACTION_KIND => {
+                if let Err(frame) = self.personal_decide_gate(ctx, &rec, step_up, "mail.decide").await {
+                    return frame;
+                }
+            }
             Ok(Some(_)) => {
                 return WsFrame::error_response("", "審核紀錄與這封信不相符，已拒絕操作。");
             }

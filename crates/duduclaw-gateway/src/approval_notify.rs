@@ -615,6 +615,8 @@ pub(crate) async fn apply_decision(
     if is_dashboard_only_record(Some(home_dir), &rec) {
         return Err(dashboard_only_refusal(&rec.action_kind).into());
     }
+    // v1.81 P1c: a Personal employee's card is decided on a channel by its owner only (no step-up here).
+    if let Some(refusal) = crate::personal_decision::channel_card_refusal(home_dir, &rec, channel, channel_user_id) { return Err(refusal.into()); }
     if rec.status.is_terminal() {
         return Ok(match rec.status {
             ApprovalStatus::Approved => "這項要求先前已同意。".into(),

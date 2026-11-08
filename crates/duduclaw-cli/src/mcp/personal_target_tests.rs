@@ -241,6 +241,119 @@ fn p1b_ephemeral_subagent_acts_as_its_parent() {
         Some(REFUSED));
 }
 
+// ── v1.81 P1c ────────────────────────────────────────────────────────────
+
+/// Record `agent` as `owner`'s Personal employee (the apply path's write)
+/// and keep the store private for the hardened opener.
+fn record_personal(home: &Path, agent: &str, owner: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = home.join("users.db");
+    let mut conn = rusqlite::Connection::open(&path).unwrap();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+    assert!(duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, agent, owner).unwrap());
+    assert!(duduclaw_auth::db::bind_personal_owner_in_transaction(&tx, agent, owner).unwrap());
+    tx.commit().unwrap();
+    drop(conn);
+    for name in ["users.db", "users.db-wal", "users.db-shm", "users.db-journal"] {
+        let sidecar = home.join(name);
+        if sidecar.exists() {
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+}
+
+/// Keys under which a tool schema names another employee.
+const TARGET_KEYS: &[&str] = &["agent_id", "agent", "assigned_to", "target_agent", "reports_to"];
+
+#[test]
+fn p1c_every_schema_target_key_is_in_the_table() {
+    // Scan the shared schema registry: a tool parameter that names an
+    // employee is checked by the pre-dispatch gate (listing ⇔ calling).
+    let mut missing = Vec::new();
+    for tool in duduclaw_core::mcp_tool_defs::tools() {
+        for param in tool.params.iter().filter(|p| TARGET_KEYS.contains(&p.name)) {
+            if !PERSONAL_TARGET_TOOLS.contains(&(tool.name, param.name)) {
+                missing.push(format!("{}.{}", tool.name, param.name));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "tools naming an employee but not in PERSONAL_TARGET_TOOLS: {missing:?}");
+    // Delegation tools are a subset of the table.
+    for tool in DELEGATION_TOOLS {
+        assert!(PERSONAL_TARGET_TOOLS.iter().any(|(name, _)| name == tool), "{tool}");
+    }
+}
+
+#[tokio::test]
+async fn p1c_delegation_and_target_tools_refuse_another_owners_personal_employee() {
+    let dir = home();
+    let home = dir.path();
+    for (tool, key) in [("tasks_create", "assigned_to"), ("tasks_update", "assigned_to"),
+        ("discovery_catalog", "agent_id"), ("create_agent", "reports_to"), ("agent_update", "reports_to"),
+        ("tasks_list", "assigned_to"), ("activity_list", "agent_id"), ("discovery_list", "agent_id"),
+        ("list_cron_tasks", "agent_id"), ("list_reminders", "agent_id"), ("submit_feedback", "agent_id"),
+        ("audit_trail_query", "agent_id"), ("reliability_summary", "agent_id"), ("cost_summary", "agent_id")] {
+        let personal = args(key, PERSONAL);
+        // Another AI employee or an external key: refused.
+        assert_eq!(personal_target_refusal(home, true, tool, &personal, SHARED), Some(REFUSED), "{tool}.{key}");
+        assert_eq!(personal_target_refusal(home, true, tool, &personal, "external-client"), Some(REFUSED));
+        // The employee itself: allowed (left to the tool's own gates).
+        assert_eq!(personal_target_refusal(home, true, tool, &personal, PERSONAL), None, "{tool}.{key}");
+        // Shared targets: unchanged.
+        assert_eq!(personal_target_refusal(home, true, tool, &args(key, SHARED), "other"), None);
+    }
+
+    // The owner's own work: another Personal employee of the same owner may
+    // hand work over; another person's Personal employee may not.
+    let users = UserDb::new(&home.join("users.db")).unwrap();
+    let bob = users.create_user("bob@example.test", "Bob", "password1", UserRole::Employee).unwrap().id;
+    drop(users);
+    let alice: String = rusqlite::Connection::open(home.join("users.db")).unwrap()
+        .query_row("SELECT id FROM users WHERE email = ?1", ["alice@example.test"], |row| row.get(0))
+        .unwrap();
+    record_personal(home, "alice-second", &alice);
+    record_personal(home, "bob-personal", &bob);
+    for tool in DELEGATION_TOOLS {
+        let key = PERSONAL_TARGET_TOOLS.iter().find(|(name, _)| name == tool).unwrap().1;
+        let personal = args(key, PERSONAL);
+        assert_eq!(personal_target_refusal(home, true, tool, &personal, "alice-second"), None, "{tool}");
+        assert_eq!(personal_target_refusal(home, true, tool, &personal, "bob-personal"), Some(REFUSED), "{tool}");
+    }
+    // Reads and management stay "the employee itself only".
+    assert_eq!(personal_target_refusal(home, true, "agent_update", &args("agent_id", PERSONAL), "alice-second"),
+        Some(REFUSED));
+    assert_eq!(personal_target_refusal(home, true, "activity_list", &args("agent_id", PERSONAL), "alice-second"),
+        Some(REFUSED));
+
+    // Work items named by id resolve their employee from tasks.db.
+    let store = duduclaw_gateway::task_store::TaskStore::open(home).unwrap();
+    store.insert_task(&duduclaw_gateway::task_store::TaskRow::new("personal-task".into(), "t".into(), String::new(),
+        "normal".into(), PERSONAL.into(), "system".into())).await.unwrap();
+    store.insert_plan(&duduclaw_gateway::task_store::PlanRow::new("personal-plan".into(), "p".into(),
+        PERSONAL.into(), "system".into())).await.unwrap();
+    drop(store);
+    let task = json!({"task_id": "personal-task", "title": "x"});
+    let plan = json!({"plan_id": "personal-plan"});
+    for (tool, arguments) in [("tasks_update", &task), ("activity_list", &task), ("plan_get", &plan)] {
+        assert_eq!(id_target_refusal(home, true, tool, arguments, SHARED), Some(REFUSED), "{tool}");
+        assert_eq!(pre_dispatch_refusal(home, true, tool, arguments, SHARED, SHARED, SHARED), Some(REFUSED), "{tool}");
+        assert_eq!(id_target_refusal(home, true, tool, arguments, PERSONAL), None, "{tool}");
+        assert_eq!(id_target_refusal(home, true, tool, arguments, "bob-personal"), Some(REFUSED), "{tool}");
+    }
+    // Same owner: delegation (tasks_update) yes, reads no.
+    assert_eq!(id_target_refusal(home, true, "tasks_update", &task, "alice-second"), None);
+    assert_eq!(id_target_refusal(home, true, "plan_get", &plan, "alice-second"), Some(REFUSED));
+    // Unknown ids are left to the tool; unlisted tools are untouched.
+    assert_eq!(id_target_refusal(home, true, "plan_get", &json!({"plan_id": "missing"}), SHARED), None);
+    assert_eq!(id_target_refusal(home, true, "tasks_claim", &task, SHARED), None);
+    // No readable task store: refused (fail closed).
+    let missing = tempfile::tempdir().unwrap();
+    assert_eq!(id_target_refusal(missing.path(), true, "plan_get", &plan, SHARED), Some(UNAVAILABLE));
+    // Unprotected: unchanged.
+    assert_eq!(id_target_refusal(home, false, "plan_get", &plan, SHARED), None);
+    assert_eq!(personal_target_refusal(home, false, "tasks_create", &args("assigned_to", PERSONAL), SHARED), None);
+}
+
 #[test]
 fn p1b_unprotected_install_unchanged() {
     let dir = home();

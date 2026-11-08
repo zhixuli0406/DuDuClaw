@@ -45,7 +45,8 @@ impl MethodHandler {
             Err(f) => return f,
         };
         match store
-            .list_activity_for_principal(agent_id, event_type, limit, offset, Some(&format!("user:{}", reader.live().user_id)))
+            // v1.81 P1c: hidden employees are excluded before LIMIT and COUNT.
+            .list_activity_hiding(agent_id, event_type, limit, offset, &format!("user:{}", reader.live().user_id), reader.hidden())
             .await
         {
             Ok((rows, total)) => {
@@ -115,7 +116,7 @@ impl MethodHandler {
         // newest cap-full may be missing from wide windows — the `truncated`
         // flag + `cap` in the response make that visible to the client.
         let (activities, _total) = match store
-            .list_activity_for_principal(agent_id, None, TIMELINE_ROW_CAP as i64, 0, Some(&format!("user:{}", reader.live().user_id)))
+            .list_activity_hiding(agent_id, None, TIMELINE_ROW_CAP as i64, 0, &format!("user:{}", reader.live().user_id), reader.hidden())
             .await
         {
             Ok(r) => r,

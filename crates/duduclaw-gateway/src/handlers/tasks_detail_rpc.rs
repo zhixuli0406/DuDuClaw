@@ -766,12 +766,11 @@ impl MethodHandler {
         {
             return WsFrame::error_response("", PERMISSION_DENIED);
         }
-        let store = match self.task_store().await {
-            Ok(s) => s,
-            Err(f) => return f,
-        };
+        let store = match self.task_store().await { Ok(s) => s, Err(f) => return f };
+        // v1.81 P1c: hidden Personal employees are neither counted nor broken out.
+        let hidden = match self.flow_metrics_hidden(&live, params.get("agent_id").and_then(Value::as_str)).await { Ok(h) => h, Err(f) => return f };
         let now = Utc::now().to_rfc3339();
-        let metrics = match store.flow_metrics(&now, &format!("user:{}", live.user_id)).await {
+        let metrics = match store.flow_metrics_hiding(&now, &format!("user:{}", live.user_id), &hidden).await {
             Ok(m) => m,
             Err(e) => return WsFrame::error_response("", &format!("flow metrics: {e}")),
         };

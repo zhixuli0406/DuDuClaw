@@ -27,6 +27,14 @@
 //!   ephemeral sub-agent acts as its parent ([`acting_employee`]); task,
 //!   activity, timeline, decision, canvas and approval reads are category
 //!   [`DataCategory::Work`] on the dashboard.
+//! - **P1c:** deciding a Personal employee's approval card is category
+//!   [`DataCategory::Approval`] (owner, or an audited Admin step-up on the
+//!   dashboard; owner only on channels — `crate::personal_decision`);
+//!   handing work to one is owner-only on the dashboard
+//!   ([`delegation_refusal_for_user`]) and, for AI callers, allowed only from
+//!   the employee itself or another Personal employee of the same owner
+//!   ([`delegation_refusal`]); tasks and plans named by id resolve their
+//!   employee through [`work_item_employee`].
 //!
 //! Every check here runs only in protected mode (`protected = true`, from
 //! `runtime_readiness::is_protected_linux()`); otherwise nothing is read and
@@ -54,6 +62,9 @@ pub enum DataCategory {
     /// Its work record (P1b): tasks and their detail, activity, timeline,
     /// open decisions, canvas and approval payloads.
     Work,
+    /// A decision on one of its approval cards (P1c): `approvals.decide`,
+    /// `mail.decide`.
+    Approval,
 }
 
 impl DataCategory {
@@ -64,8 +75,18 @@ impl DataCategory {
             Self::AgentFiles => "agent_files",
             Self::Wiki => "wiki",
             Self::Work => "work",
+            Self::Approval => "approval",
         }
     }
+}
+
+/// A work item named by id in a tool argument (P1c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkItem {
+    /// `tasks.db` `tasks.id` → `assigned_to`.
+    Task,
+    /// `tasks.db` `plans.id` → `agent_id`.
+    Plan,
 }
 
 /// What a dashboard caller may do with one employee's private data.
@@ -93,6 +114,15 @@ pub const PERSONAL_TARGET_REFUSED: &str = "這位 AI 員工是某位同仁的個
 /// Shown when the Personal mirror cannot be read (fail closed).
 pub const OWNERSHIP_UNAVAILABLE: &str = "無法確認這位 AI 員工的歸屬，已拒絕操作。 / Employee ownership could not be \
     verified; the operation was refused.";
+/// Shown when a dashboard user who is not the owner hands work to a
+/// Personal employee (P1c).
+pub const PERSONAL_DELEGATION_REFUSED: &str = "這位 AI 員工是某位同仁的個人專屬員工，只有它的擁有者能交辦工作給它。 / This is a \
+    person's Personal employee; only its owner can hand work to it.";
+/// Shown when someone who is not the owner decides a Personal employee's
+/// approval card where no step-up is possible (channels, chat replies) or
+/// is not an Admin (P1c).
+pub const PERSONAL_DECISION_REFUSED: &str = "這張審核卡屬於某位同仁的個人專屬員工，只有它的擁有者能決定。 / This approval \
+    belongs to a person's Personal employee; only its owner can decide it.";
 
 fn open(home: &Path) -> Result<rusqlite::Connection, Unavailable> {
     open_existing(home, USERS_DB, Access::ReadOnly).map_err(|_| Unavailable)
@@ -219,6 +249,61 @@ pub fn management_refusal(home: &Path, protected: bool, acting_agent: &str, targ
         Ok(Some(_)) => Some(PERSONAL_TARGET_REFUSED),
         Err(Unavailable) => Some(OWNERSHIP_UNAVAILABLE),
     }
+}
+
+/// P1c: an AI caller handing work to `target` (MCP `spawn_agent`,
+/// `send_to_agent`, `tasks_create`/`tasks_update` `assigned_to`, …). As
+/// [`management_refusal`], except that an acting employee which is itself a
+/// Personal employee of the same owner may hand work to it: that is the
+/// owner's own work moving between the owner's own employees. Both owners
+/// are read fresh; an unreadable store refuses. `None` = allowed.
+pub fn delegation_refusal(home: &Path, protected: bool, acting_agent: &str, target: &str)
+    -> Option<&'static str> {
+    let refusal = management_refusal(home, protected, acting_agent, target)?;
+    if refusal != PERSONAL_TARGET_REFUSED {
+        return Some(refusal);
+    }
+    let Some(me) = acting_employee(home, acting_agent) else {
+        return Some(refusal);
+    };
+    match (personal_owner(home, &me), personal_owner(home, target)) {
+        (Ok(Some(mine)), Ok(Some(theirs))) if !mine.is_empty() && mine == theirs => None,
+        (Err(Unavailable), _) | (_, Err(Unavailable)) => Some(OWNERSHIP_UNAVAILABLE),
+        _ => Some(refusal),
+    }
+}
+
+/// P1c: a dashboard user (`user_id` from the live users.db context) handing
+/// work to `agent` (`tasks.create`/`tasks.update` `assigned_to`,
+/// `tasks.goal_create`/`plans.create` `agent_id`). A Personal employee takes
+/// work only from its owner — an Admin who is not the owner is refused too
+/// (delegation has no break-glass). `None` = allowed (the existing checks
+/// still apply). Empty outside protected mode.
+pub fn delegation_refusal_for_user(home: &Path, protected: bool, user_id: &str, agent: &str)
+    -> Option<&'static str> {
+    if !protected {
+        return None;
+    }
+    match classify_reader(home, true, user_id, false, agent) {
+        Ok(Reader::Unrestricted | Reader::Owner) => None,
+        Ok(Reader::BreakGlass { .. } | Reader::Refused) => Some(PERSONAL_DELEGATION_REFUSED),
+        Err(Unavailable) => Some(OWNERSHIP_UNAVAILABLE),
+    }
+}
+
+/// P1c: the employee a task or plan named by `id` belongs to, read from
+/// `tasks.db` without opening a writable store. `Ok(None)` = no such item
+/// (the tool answers); `Err` = the store could not be read (callers refuse).
+pub fn work_item_employee(home: &Path, item: WorkItem, id: &str) -> Result<Option<String>, Unavailable> {
+    use rusqlite::OptionalExtension;
+    let sql = match item {
+        WorkItem::Task => "SELECT assigned_to FROM tasks WHERE id=?1",
+        WorkItem::Plan => "SELECT agent_id FROM plans WHERE id=?1",
+    };
+    let conn = crate::review_evidence::audience::readonly_db(&home.join("tasks.db")).map_err(|_| Unavailable)?;
+    conn.query_row(sql, [id], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|_| Unavailable)
 }
 
 /// Shared with the dashboard gate tests (`handlers/personal_data_gate_tests.rs`).
