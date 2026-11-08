@@ -305,7 +305,7 @@ pub(crate) fn card(item: &ConfirmationItem) -> Option<Value> {
 pub(crate) struct ImportSummary {
     /// New proposals (or new revisions of still-pending ones).
     pub(crate) staged: usize,
-    /// Already staged with identical content.
+    /// Still pending with identical content.
     pub(crate) unchanged: usize,
     /// Already decided (approved, applied, rejected, expired): never re-staged.
     pub(crate) closed: usize,
@@ -330,15 +330,20 @@ pub(crate) fn import_legacy_with(home: &Path, env: &ConnectorEnv) -> Result<Impo
     for (id, fields) in proposals {
         let latest = items.iter().filter(|item| item.binding.operation_id.proposal_id == id)
             .max_by_key(|item| item.binding.operation_id.revision);
+        // The decision status is checked before the content: a decided (or
+        // in-flight) proposal is closed whatever the legacy stores say now.
         let revision = match latest {
             None => 1,
-            Some(item) if item.category == ConfirmationCategory::Connector && item.fields == fields => {
-                summary.unchanged += 1;
-                continue;
+            Some(item) if item.category == ConfirmationCategory::Connector && item.status == ConfirmationStatus::Pending => {
+                if item.fields == fields {
+                    summary.unchanged += 1;
+                    continue;
+                }
+                // Changed legacy content supersedes only an undecided proposal.
+                item.binding.operation_id.revision.checked_add(1).ok_or(Error::Limit)?
             }
-            // Changed legacy content supersedes only an undecided proposal.
-            Some(item) if item.category == ConfirmationCategory::Connector && item.status == ConfirmationStatus::Pending =>
-                item.binding.operation_id.revision.checked_add(1).ok_or(Error::Limit)?,
+            // Approved, applying, applied, failed, rejecting, rejected,
+            // expired, or another category's id: never re-staged.
             Some(_) => {
                 summary.closed += 1;
                 continue;
