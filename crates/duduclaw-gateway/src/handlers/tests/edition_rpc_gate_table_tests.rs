@@ -54,6 +54,11 @@ fn enterprise_surfaces_are_listed() {
         // 可靠性報告
         "audit.reliability_summary",
         "compliance.generate",
+        // 隔離連線帳號（受保護模式＝Linux 團隊版）
+        "isolation.connector_list",
+        "isolation.connector_step_up",
+        "isolation.connector_provision",
+        "isolation.connector_revoke",
     ] {
         assert!(
             is_enterprise_only_method(method),

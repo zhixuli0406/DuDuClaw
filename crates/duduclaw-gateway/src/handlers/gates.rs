@@ -123,6 +123,10 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         // 可靠性報告 — SRE 式機隊指標（`audit.unified_log` / `audit.evolution_query`
         // 為個人版開放的日誌與演化查詢，不在此列）
         | "audit.reliability_summary"
+        // 隔離連線帳號 — 受保護模式只出貨於 Linux 團隊版（`isolation.recording_*`
+        // 為主機控制，不在此列）
+        | "isolation.connector_list" | "isolation.connector_step_up"
+        | "isolation.connector_provision" | "isolation.connector_revoke"
     )
 }
 

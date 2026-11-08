@@ -16,6 +16,8 @@ pub const CATALOG_FILE: &str = "isolation-connectors.db";
 const MAX_ROUTES: i64 = 100_000;
 /// Upper bound on routes returned for one binding; more is treated as damage.
 const MAX_ROUTES_PER_BINDING: usize = 1024;
+/// Largest page [`ConnectorCatalog::list`] returns.
+pub const MAX_LIST_PAGE: usize = 200;
 const PROVIDERS: [&str; 9] = ["google", "notion", "github", "odoo", "database", "channel", "search", "model", "computer"];
 
 /// Non-sensitive catalog failures. Every variant refuses the operation.
@@ -354,6 +356,27 @@ impl ConnectorCatalog {
         if raw.len() > MAX_ROUTES_PER_BINDING { return Err(CatalogError::Unavailable); }
         let routes = raw.into_iter().map(decode_route).collect::<Result<Vec<_>, _>>()?;
         if routes.iter().any(|route| !route.active || &route.binding != binding) { return Err(CatalogError::Unavailable); }
+        Ok(routes)
+    }
+
+    /// Admin listing: one page of routes, active and revoked, ordered by id and
+    /// starting strictly after `after`. `limit` is clamped to 1..=[`MAX_LIST_PAGE`].
+    /// Rows are re-validated like every other read; damage refuses the page.
+    pub fn list(&self, after: Option<&AccountId>, limit: usize) -> Result<Vec<Route>, CatalogError> {
+        let limit = limit.clamp(1, MAX_LIST_PAGE);
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {ROUTE_COLUMNS} FROM isolation_connector_routes WHERE account > ?1 ORDER BY account LIMIT {limit}"))
+            .map_err(|_| CatalogError::Unavailable)?;
+        let raw = statement.query_map([after.map_or("", AccountId::as_str)], raw_route).map_err(|_| CatalogError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>().map_err(|_| CatalogError::Unavailable)?;
+        drop(statement);
+        drop(connection);
+        let routes = raw.into_iter().map(decode_route).collect::<Result<Vec<_>, _>>()?;
+        if routes.windows(2).any(|pair| pair[0].account >= pair[1].account)
+            || after.is_some_and(|after| routes.first().is_some_and(|first| &first.account <= after)) {
+            return Err(CatalogError::Unavailable);
+        }
         Ok(routes)
     }
 

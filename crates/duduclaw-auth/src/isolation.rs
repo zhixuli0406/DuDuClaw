@@ -50,6 +50,12 @@ fn read_tenant(conn: &Connection) -> Result<String, String> {
     Ok(value)
 }
 
+/// The installation tenant alone, validated exactly as in
+/// [`read_isolation_authority`]. Never initializes or repairs a missing key.
+pub fn read_isolation_tenant(conn: &Connection) -> Result<String, String> {
+    read_tenant(conn)
+}
+
 #[derive(Debug, Clone)]
 pub struct IsolationAuthoritySnapshot {
     pub tenant_id: String,
