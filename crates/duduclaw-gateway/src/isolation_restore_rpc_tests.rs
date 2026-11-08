@@ -15,6 +15,14 @@ use std::cell::Cell;
 
 fn employee() -> String { hex::encode(EMP.0) }
 
+/// Ids that are not canonical lowercase 32-hex. `EMP`'s hex is all digits,
+/// so `employee().to_uppercase()` would be the valid id itself; the
+/// uppercase case uses an id with hex letters (its lowercase form is
+/// well-formed, so a loose match would accept it).
+fn malformed_ids() -> [String; 4] {
+    ["AB".repeat(16), employee()[..30].to_owned(), format!("{}g", &employee()[..31]), format!("{}0", employee())]
+}
+
 /// The proof purpose of alice's row (incarnation 0), as the server derives it.
 fn purpose0() -> String { format!("restore:{}:0", employee()) }
 
@@ -44,8 +52,11 @@ fn request_only_by_owner() {
     }
     assert_eq!(asked.get(), 0, "no factor oracle for rows the caller does not own");
     // Malformed ids are refused, never matched loosely.
-    assert_eq!(rpc::request_restore(f.home(), &fx.env(), &f.alice, &employee().to_uppercase(), 0, "totp", "1", &check).err(),
-        Some(RpcError::Invalid));
+    for id in malformed_ids() {
+        assert_eq!(rpc::request_restore(f.home(), &fx.env(), &f.alice, &id, 0, "totp", "1", &check).err(),
+            Some(RpcError::Invalid), "{id}");
+    }
+    assert_eq!(asked.get(), 0, "no factor check for a malformed id");
     let filed = rpc::request_restore(f.home(), &fx.env(), &f.alice, &employee(), 0, "totp", "1", &check).unwrap();
     assert_eq!(asked.get(), 1);
     assert_eq!(stored(f.home(), filed["request_id"].as_str().unwrap()).requester, f.alice);
@@ -67,7 +78,9 @@ fn restore_challenge_only_by_owner_and_bound_to_row() {
     }
     assert_eq!(rpc::restore_challenge(f.home(), &f.alice, &employee(), 1, &issue).err(), Some(RpcError::Restore(Refusal::NotFound)),
         "no row at that incarnation");
-    assert_eq!(rpc::restore_challenge(f.home(), &f.alice, &employee().to_uppercase(), 0, &issue).err(), Some(RpcError::Invalid));
+    for id in malformed_ids() {
+        assert_eq!(rpc::restore_challenge(f.home(), &f.alice, &id, 0, &issue).err(), Some(RpcError::Invalid), "{id}");
+    }
     assert!(asked.borrow().is_empty(), "no challenge for rows the caller does not own");
     assert_eq!(rpc::restore_challenge(f.home(), &f.alice, &employee(), 0, &issue), Ok("issued"));
     assert_eq!(*asked.borrow(), vec![purpose0()]);
@@ -236,10 +249,12 @@ fn lock_order_apply_db_before_users_db() {
     let (_, root) = tombstoned(&f);
     let alice = f.alice.clone();
     let bob = f.bob.clone();
+    // The approve step decides the request the request step filed: a second
+    // filing for the same row would be refused while that one is open (L1).
+    let mut filed: Option<String> = None;
     for step in ["request", "approve"] {
         let pending = if step == "approve" {
-            let fx = fakes(&root);
-            Some(file(&f, &fx).unwrap()["request_id"].as_str().unwrap().to_owned())
+            Some(filed.clone().expect("the request step filed the open request"))
         } else { None };
         let mut apply = Connection::open(home.join(APPLY_DB)).unwrap();
         let held = apply.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
@@ -247,8 +262,9 @@ fn lock_order_apply_db_before_users_db() {
         let worker = std::thread::spawn(move || {
             let fx = fakes(&root2);
             match &pending {
-                None => rpc::request_restore(&home2, &fx.env(), &alice2, &hex::encode(EMP.0), 0, "totp", "1", &totp_ok).map(|_| ()),
-                Some(id) => { let notices = Vec::<String>::new; rpc::decide(&home2, &fx.env(), &bob2, id, true, &notices).map(|_| ()) }
+                None => rpc::request_restore(&home2, &fx.env(), &alice2, &hex::encode(EMP.0), 0, "totp", "1", &totp_ok)
+                    .map(|value| value["request_id"].as_str().map(str::to_owned)),
+                Some(id) => { let notices = Vec::<String>::new; rpc::decide(&home2, &fx.env(), &bob2, id, true, &notices).map(|_| None) }
             }
         });
         std::thread::sleep(std::time::Duration::from_millis(400));
@@ -260,7 +276,11 @@ fn lock_order_apply_db_before_users_db() {
         drop(apply);
         let result = worker.join().unwrap();
         assert!(!matches!(result, Err(RpcError::Restore(Refusal::Root(_)))), "{step}: {result:?}");
-        if step == "request" { assert!(result.is_ok(), "{result:?}"); }
+        if step == "request" {
+            assert!(result.is_ok(), "{result:?}");
+            filed = result.unwrap();
+            assert!(filed.is_some(), "the request RPC returns its request_id");
+        }
     }
     let _ = RootError::Transport;
 }

@@ -34,8 +34,12 @@ fn adoption_request_owner_strongest_factor() {
     }
     assert!(asked.borrow().is_empty(), "no factor check for rows the caller does not own");
     // Malformed ids / target labels are refused before anything is read.
-    assert_eq!(rpc::request_adoption(f.home(), &env(&ax), &f.alice, &employee().to_uppercase(), 0, None, "totp", "1", &check).err(),
-        Some(RpcError::Invalid));
+    // (`EMP`'s hex is all digits, so its uppercase is the valid id itself:
+    // the uppercase case uses an id with hex letters.)
+    for id in ["AB".repeat(16), employee()[..30].to_owned(), format!("{}g", &employee()[..31]), format!("{}0", employee())] {
+        assert_eq!(rpc::request_adoption(f.home(), &env(&ax), &f.alice, &id, 0, None, "totp", "1", &check).err(),
+            Some(RpcError::Invalid), "{id}");
+    }
     assert_eq!(rpc::request_adoption(f.home(), &env(&ax), &f.alice, &employee(), 0, Some("../x"), "totp", "1", &check).err(),
         Some(RpcError::Invalid));
     // The challenge: owner only, bound to the adoption purpose.

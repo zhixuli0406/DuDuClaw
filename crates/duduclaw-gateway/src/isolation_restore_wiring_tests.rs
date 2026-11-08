@@ -38,7 +38,15 @@ fn retire_rule_fails_closed() {
     use crate::isolation_retire::{ApprovalRefusal, ApprovalRule as _};
     let (dir, _db) = users();
     let rule = RetireLogRule { now: unix_now };
-    assert_eq!(rule.decide(dir.path(), "a", "b", None), Err(ApprovalRefusal::LogUnavailable));
+    // A fresh, intact log with no accounts: the non-party approver "b" is not
+    // an eligible Admin, so F6c2 refuses `APPROVER_NOT_QUALIFIED` (the log
+    // itself is readable; coverage only gates the sole-Admin path).
+    assert_eq!(rule.decide(dir.path(), "a", "b", None), Err(ApprovalRefusal::NotQualified));
+    assert_eq!(rule.decide(dir.path(), "a", "a", None), Err(ApprovalRefusal::NotQualified), "self, not eligible now");
+    // A log missing one of its append-only triggers is unavailable, for every path.
+    Connection::open(dir.path().join("users.db")).unwrap().execute_batch("DROP TRIGGER admin_eligibility_log_no_delete").unwrap();
+    assert_eq!(rule.decide(dir.path(), "a", "b", None), Err(ApprovalRefusal::LogUnavailable), "log trigger missing");
+    assert_eq!(rule.decide(dir.path(), "a", "a", None), Err(ApprovalRefusal::LogUnavailable), "log trigger missing, self");
     let empty = tempfile::tempdir().unwrap();
     assert_eq!(rule.decide(empty.path(), "a", "b", None), Err(ApprovalRefusal::LogUnavailable), "no users.db");
 }

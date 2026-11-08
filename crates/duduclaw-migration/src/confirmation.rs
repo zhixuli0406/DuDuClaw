@@ -102,8 +102,11 @@ fn fields_for(category: ConfirmationCategory) -> &'static [&'static str] {
         Department => &["name", "display_name"],
         // binding_kind/owner_id/tenant_id: immutable principal binding, parsed
         // and strictly validated by allocation::specification (v1.81).
+        // adopt_quarantine: F6 §3.10 (F6g) digest-covered adoption reference
+        // `<hex>:<incarnation>:<digest>`, strictly parsed and bound to its
+        // quarantine row by the gateway's EmployeeAuthority.
         Employee => &["employee_id", "runtime", "model", "capabilities", "permissions", "account_pool", "disk_bytes", "settings",
-            "binding_kind", "owner_id", "tenant_id"],
+            "binding_kind", "owner_id", "tenant_id", "adopt_quarantine"],
         EmployeeInstructions => &["employee_id", "instruction_kind", "text"],
         UserAgentBinding => &["employee_id", "owner_id", "binding_kind"],
         ChannelBinding => &["employee_id", "channel", "binding"],
