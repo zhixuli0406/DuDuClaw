@@ -138,6 +138,7 @@ fn provision_with(home: &Path, provider: &str, kind: ConnectorKind, binding: &Em
         (false, Some(_)) => Err(DetailError::NotApplicable),
         (false, None) => Ok(None),
     };
+    let record = record.and_then(|record| google_tenant_source_gate(home, provider, kind).map(|()| record));
     let record = match record {
         Ok(record) => record,
         Err(error) => {
@@ -194,6 +195,18 @@ fn provision_with(home: &Path, provider: &str, kind: ConnectorKind, binding: &Em
 /// Audit marker for where a provision came from; never the operation id.
 fn origin_name(origin: Option<&MigrationOrigin>) -> Value {
     Value::String(if origin.is_some() { "migration" } else { "admin" }.to_owned())
+/// v1.81 E4: a Google SharedTenant route stands for a tenant credential
+/// source (sealed delegation key or `[integrations.google_service_account]`).
+/// Refuse to register one while no such source is installed, so a tenant
+/// route can never be provisioned onto the home credential. The subject and
+/// requester rules are enforced per call by the Google bridge.
+fn google_tenant_source_gate(home: &Path, provider: &str, kind: ConnectorKind) -> Result<(), DetailError> {
+    if provider != "google" || kind != ConnectorKind::SharedTenant { return Ok(()); }
+    match crate::google_identity::tenant_source::installed(home) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(DetailError::Unknown),
+        Err(_) => Err(DetailError::Unavailable),
+    }
 }
 
 /// Only a known provider name is ever written to the audit log.

@@ -16,6 +16,8 @@
 //! [integrations.google_identity]
 //! default_identity = "home"                  # home (default) | none
 //! allowed_subject_domains = ["customer.com"] # delegate:<email> only in these domains
+//! service_mailboxes = ["support@customer.com"] # protected mode: shared service mailboxes
+//! tenant_scopes = ["https://www.googleapis.com/auth/gmail.readonly"] # protected mode: tenant-source scopes
 //! ```
 //!
 //! This module is the single parse point, shared by the MCP server (which
@@ -317,6 +319,14 @@ pub struct HomeIdentityConfig {
     /// Domains accepted for a person's own OAuth connection; empty allows
     /// any verified Google account, including a consumer Gmail account.
     pub allowed_domains: Vec<String>,
+    /// v1.81 E4 (protected mode): normalized mailboxes an admin designated as
+    /// shared service mailboxes (never a person's account). A tenant source
+    /// (delegation key or `[integrations.google_service_account]`) may act as
+    /// one of these for any admitted requester of a Shared employee.
+    pub service_mailboxes: Vec<String>,
+    /// v1.81 E4 (protected mode): the Google OAuth scopes a tenant source may
+    /// serve. Empty ⇒ a tenant source serves no data tool (fail closed).
+    pub tenant_scopes: Vec<String>,
 }
 
 impl Default for HomeIdentityConfig {
@@ -325,6 +335,8 @@ impl Default for HomeIdentityConfig {
             default_identity: Selector::Home,
             allowed_subject_domains: Vec::new(),
             allowed_domains: Vec::new(),
+            service_mailboxes: Vec::new(),
+            tenant_scopes: Vec::new(),
         }
     }
 }
@@ -333,7 +345,18 @@ const HOME_KEYS: &[&str] = &[
     "default_identity",
     "allowed_subject_domains",
     "allowed_domains",
+    "service_mailboxes",
+    "tenant_scopes",
 ];
+
+/// A Google OAuth scope URL as written in config: bounded, no whitespace or
+/// control characters. Membership in the minted scope set is decided by the
+/// gateway (exact equality), not here.
+fn is_scope_shape(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope.len() <= 256
+        && !scope.chars().any(|c| c.is_whitespace() || c.is_control())
+}
 
 /// Parse the home section out of a `config.toml` body. Absent ⇒ defaults
 /// (today's behaviour); present but wrong ⇒ error.
@@ -384,7 +407,34 @@ pub fn parse_home_config(text: &str) -> Result<HomeIdentityConfig, String> {
             .collect::<Result<Vec<_>, String>>()?,
         Some(_) => return Err("allowed_subject_domains 必須是字串陣列".into()),
     };
+    let service_mailboxes = match section.get("service_mailboxes") {
+        None => Vec::new(),
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| "service_mailboxes 必須是字串陣列".to_string())
+                    .and_then(|s| {
+                        normalize_email(s).map_err(|_| "service_mailboxes 含有無效 email".to_string())
+                    })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        Some(_) => return Err("service_mailboxes 必須是字串陣列".into()),
+    };
+    let tenant_scopes = match section.get("tenant_scopes") {
+        None => Vec::new(),
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .map(|v| match v.as_str() {
+                Some(s) if is_scope_shape(s) => Ok(s.to_string()),
+                _ => Err("tenant_scopes 必須是 Google 權限網址的字串陣列".to_string()),
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        Some(_) => return Err("tenant_scopes 必須是字串陣列".into()),
+    };
     Ok(HomeIdentityConfig {
+        service_mailboxes,
+        tenant_scopes,
         default_identity,
         allowed_subject_domains,
         allowed_domains: match section.get("allowed_domains") {

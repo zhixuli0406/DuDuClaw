@@ -6,6 +6,7 @@ use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, Capab
 use duduclaw_mcp_boundary::{bindings::BindingStore, RequestContext};
 use rusqlite::Connection;
 use crate::isolation_connectors::{LiveConnectorSelectionPolicy, SelectedConnector};
+use crate::google_identity::tenant_source::TenantSourceKind;
 
 fn personal(owner: &str) -> EmployeeBinding { EmployeeBinding::Personal(Text::new(owner.into()).unwrap()) }
 fn shared(tenant: &str) -> EmployeeBinding { EmployeeBinding::Shared(Text::new(tenant.into()).unwrap()) }
@@ -19,8 +20,13 @@ pub(crate) fn lifecycle(binding: EmployeeBinding) -> EmployeeLifecycle {
 }
 pub(crate) fn routes_for(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle)
     -> Result<GoogleAccountRoutes, GoogleRoutesError> {
+    routes_with_source(catalog, lifecycle, None)
+}
+/// v1.81 E4: the same read with a configured tenant credential source.
+pub(crate) fn routes_with_source(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle,
+    tenant_source: Option<TenantSourceKind>) -> Result<GoogleAccountRoutes, GoogleRoutesError> {
     GoogleAccountRoutes::read_with(&lifecycle.label, lifecycle.employee, &lifecycle.binding,
-        catalog, || Ok(lifecycle.clone()))
+        catalog, tenant_source, || Ok(lifecycle.clone()))
 }
 
 #[test]
@@ -46,7 +52,7 @@ fn google_routes_personal_refuses_other_users_account() {
     assert_eq!(routes_for(&catalog, &alice).err(), Some(GoogleRoutesError::SetupRequired));
     // A capability claiming Bob cannot replace Alice's root lifecycle owner.
     assert_eq!(GoogleAccountRoutes::read_with("bot", alice.employee, &personal("bob"),
-        &catalog, || Ok(alice.clone())).err(), Some(GoogleRoutesError::BindingMismatch));
+        &catalog, None, || Ok(alice.clone())).err(), Some(GoogleRoutesError::BindingMismatch));
 }
 
 #[test]
@@ -152,9 +158,9 @@ fn google_routes_unreadable_or_changed_lifecycle_refused() {
     let lifecycle = lifecycle(personal("alice"));
     catalog.register("alice", "google", ConnectorKind::Personal, &lifecycle.binding).unwrap();
     assert_eq!(GoogleAccountRoutes::read(home.path(), "bot", lifecycle.employee, &lifecycle.binding,
-        &catalog).err(), Some(GoogleRoutesError::Unavailable));
+        &catalog, None).err(), Some(GoogleRoutesError::Unavailable));
     let reads = std::cell::Cell::new(0);
-    assert_eq!(GoogleAccountRoutes::read_with("bot", lifecycle.employee, &lifecycle.binding, &catalog, || {
+    assert_eq!(GoogleAccountRoutes::read_with("bot", lifecycle.employee, &lifecycle.binding, &catalog, None, || {
         reads.set(reads.get() + 1);
         let mut current = lifecycle.clone();
         if reads.get() > 1 { current.binding = personal("bob"); }
@@ -172,4 +178,49 @@ fn google_routes_ambiguous_accounts_require_setup() {
         for _ in 0..2 { catalog.register("same-label", "google", kind, &binding).unwrap(); }
         assert_eq!(routes_for(&catalog, &lifecycle(binding)).err(), Some(GoogleRoutesError::SetupRequired));
     }
+}
+
+#[test]
+fn e4_shared_tenant_route_admitted_only_for_tenant_source() {
+    let catalog = catalog();
+    let tenant = catalog.register("tenant", "google", ConnectorKind::SharedTenant, &shared("company")).unwrap();
+    let company = lifecycle(shared("company"));
+    // No tenant credential source: never served (SR3 rule kept).
+    assert_eq!(routes_for(&catalog, &company).err(), Some(GoogleRoutesError::SetupRequired));
+    for kind in [TenantSourceKind::Delegate, TenantSourceKind::ServiceAccount] {
+        let routes = routes_with_source(&catalog, &company, Some(kind)).unwrap();
+        let route = routes.tenant.expect("tenant route admitted for a real tenant source");
+        assert!(routes.home.is_none() && routes.personal.is_empty());
+        assert_eq!(route.product.account(), tenant.as_str());
+        assert_eq!(route.kind(), ConnectorKind::SharedTenant);
+        assert_eq!(route.binding(), &shared("company"));
+        assert!(matches!(&route.product, ProductConnectorAccount::SharedHome { tenant, .. } if tenant == "company"));
+    }
+    // Home and tenant routes are kept apart; the bridge picks by source.
+    let home = catalog.register("home", "google", ConnectorKind::SharedHome, &shared("company")).unwrap();
+    let both = routes_with_source(&catalog, &company, Some(TenantSourceKind::Delegate)).unwrap();
+    assert_eq!(both.home.unwrap().product.account(), home.as_str());
+    assert_eq!(both.tenant.unwrap().product.account(), tenant.as_str());
+    assert!(routes_for(&catalog, &company).unwrap().tenant.is_none());
+    // A Personal employee never receives a tenant route, source or not.
+    catalog.register("alice", "google", ConnectorKind::Personal, &personal("alice")).unwrap();
+    let alice = routes_with_source(&catalog, &lifecycle(personal("alice")), Some(TenantSourceKind::Delegate)).unwrap();
+    assert!(alice.tenant.is_none() && alice.home.is_none());
+    // Two tenant routes are ambiguous, never "the first one".
+    catalog.register("tenant-2", "google", ConnectorKind::SharedTenant, &shared("company")).unwrap();
+    assert_eq!(routes_with_source(&catalog, &company, Some(TenantSourceKind::ServiceAccount)).err(),
+        Some(GoogleRoutesError::SetupRequired));
+}
+
+#[test]
+fn e4_tenant_mismatch_refused_at_route_read() {
+    let catalog = catalog();
+    catalog.register("other-tenant", "google", ConnectorKind::SharedTenant, &shared("other")).unwrap();
+    let company = lifecycle(shared("company"));
+    // Another tenant's route is not this employee's route.
+    assert_eq!(routes_with_source(&catalog, &company, Some(TenantSourceKind::Delegate)).err(),
+        Some(GoogleRoutesError::SetupRequired));
+    // A capability naming another tenant cannot replace the pinned lifecycle tenant.
+    assert_eq!(GoogleAccountRoutes::read_with("bot", company.employee, &shared("other"), &catalog,
+        Some(TenantSourceKind::Delegate), || Ok(company.clone())).err(), Some(GoogleRoutesError::BindingMismatch));
 }

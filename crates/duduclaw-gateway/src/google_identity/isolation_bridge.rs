@@ -4,16 +4,25 @@
 use std::{collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::{Arc, Mutex}};
 use duduclaw_auth::UserDb;
 use duduclaw_core::google_identity::{self as gi, CredentialRef, Effective};
-use duduclaw_isolation::{capability::Principal, ids::EmployeeId};
+use duduclaw_isolation::{capability::{EmployeeBinding, Principal}, ids::EmployeeId};
 use duduclaw_knowledge::requester::RequesterIdentity;
 use duduclaw_mcp_boundary::{RequestContext, VerificationError, tool_policy::AuthorizedToolCall};
 use serde_json::{Value, json};
 use super::{effect_authority::{Clock, SelectionStore}, home_source,
-    isolation_routes::{GoogleAccountRoutes, GoogleRoute, GoogleRoutesError}};
+    isolation_routes::{GoogleAccountRoutes, GoogleRoute, GoogleRoutesError},
+    tenant_source::{self, Actor, SubjectAccount, TenantSource, TenantSourceKind}};
 use crate::{google_personal::authority::PersonalSelection,
     isolation_egress::{IngressRequester, RunTurnResolver},
-    isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog, LiveConnectorSelectionPolicy,
+    isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog, ConnectorKind, LiveConnectorSelectionPolicy,
         ProductConnectorAccount, SelectedConnector, provider_for_tool}};
+
+/// v1.81 E4: argument keys that would name a Google identity/impersonation
+/// subject. No native Google tool accepts any of them (exact key equality;
+/// `subject` stays allowed because it is a mail subject line). Their presence
+/// refuses the call: the subject is admin configuration only.
+const IDENTITY_SELECTOR_ARGUMENTS: [&str; 14] = ["delegate", "impersonate", "impersonate_user", "impersonation",
+    "as_user", "act_as", "run_as", "on_behalf_of", "google_identity", "identity", "user_email", "subject_email",
+    "sub", "principal"];
 
 /// The authenticated requester of one capability call, derived from the
 /// capability principal plus the host's live run association only.
@@ -118,11 +127,54 @@ impl GoogleIsolationBridge {
         Ok(route)
     }
 
+    /// v1.81 E4: a tenant source (delegation key / service account) is served
+    /// only through the Shared employee's own SharedTenant route of its pinned
+    /// tenant, only for configured scopes, and only for a subject admitted by
+    /// the D-5 rule ([`tenant_source::admit_subject`]). `accounts` are the
+    /// users.db accounts whose normalized email equals the configured subject.
+    fn tenant_route(routes: &GoogleAccountRoutes, binding: &EmployeeBinding, requester: &Requester,
+        source: &TenantSource, accounts: &[SubjectAccount], tool: &str) -> Result<GoogleRoute, VerificationError> {
+        // Tenant sources are Shared-only: a Personal employee never reaches one.
+        let EmployeeBinding::Shared(tenant) = binding else { return Err(VerificationError::BindingMismatch) };
+        let route = routes.tenant.clone().ok_or(GoogleRoutesError::SetupRequired)?;
+        if route.kind() != ConnectorKind::SharedTenant || route.binding() != binding
+            || !matches!(&route.product, ProductConnectorAccount::SharedHome { tenant: routed, .. }
+                if routed.as_str() == tenant.as_str()) {
+            return Err(VerificationError::BindingMismatch);
+        }
+        if !source.serves(tool) { return Err(VerificationError::BindingMismatch); }
+        let actor = match requester {
+            Requester::Human { user_id, .. } => Actor::Human(user_id.as_str()),
+            Requester::System(_) => Actor::System,
+        };
+        tenant_source::admit_subject(source, actor, accounts)?;
+        Ok(route)
+    }
+
+    fn tenant_selection(&self, context: &RequestContext, routes: &GoogleAccountRoutes, requester: &Requester,
+        source: &TenantSource, people: &dyn super::requester_gate::People, tool: &str)
+        -> Result<(GoogleRoute, String), VerificationError> {
+        // Without a readable users.db nobody can prove the subject is (or is
+        // not) a person: refuse rather than guess.
+        let db = people.user_db().ok_or(VerificationError::Unavailable)?;
+        let accounts = tenant_source::subject_accounts(db, source.subject())?;
+        let route = Self::tenant_route(routes, &context.record().employee_binding, requester, source, &accounts, tool)?;
+        // Use-time recheck: the source (config + key material) and the catalog
+        // row must be exactly what was decided on.
+        if tenant_source::read(&self.home, &self.agent)?.as_ref() != Some(source) {
+            return Err(VerificationError::BindingMismatch);
+        }
+        route.recheck(&self.catalog)?;
+        Ok((route, source.digest()))
+    }
+
     fn source(&self, context: &RequestContext, tool: &str) -> Result<(GoogleRoute, String), VerificationError> {
         // Resolve first: a failed requester lookup refuses before any source is read.
         let requester = self.requester(context)?;
+        // Unreadable config/key material refuses before any route is read.
+        let tenant = tenant_source::read(&self.home, &self.agent)?;
         let routes = GoogleAccountRoutes::read(&self.home, &self.agent, self.employee,
-            &context.record().employee_binding, &self.catalog)?;
+            &context.record().employee_binding, &self.catalog, tenant.as_ref().map(TenantSource::kind))?;
         super::credential_registry::authorize(&self.home, &self.reference, &self.agent, tool)
             .map_err(|_| VerificationError::BindingMismatch)?;
         if !crate::google_workspace::integration_enabled(&self.home) { return Err(VerificationError::Unavailable); }
@@ -147,9 +199,22 @@ impl GoogleIsolationBridge {
                 let digest = serde_json::to_value(&original).map_err(|_| VerificationError::Invalid)?;
                 return Ok((route, gi::google_arguments_digest(&digest)));
             }
-            Effective::Home => routes.home.ok_or(GoogleRoutesError::SetupRequired)?,
-            // This bridge does not reinterpret delegate/SA/Apps Script material
-            // as OAuth. Their own source-owner adapters must be installed.
+            // v1.81 E4: domain-wide delegation is a tenant source. The subject
+            // is the admin-written selector, never an argument.
+            Effective::Delegate { email } => {
+                let source = tenant.as_ref().filter(|source| source.kind() == TenantSourceKind::Delegate
+                    && source.subject() == email.as_str()).ok_or(VerificationError::BindingMismatch)?;
+                return self.tenant_selection(context, &routes, &requester, source, people.as_ref(), tool);
+            }
+            // A configured service account replaces home OAuth on the home
+            // path; in protected mode it is a tenant source, never SharedHome.
+            Effective::Home => match tenant.as_ref() {
+                Some(source) if source.kind() == TenantSourceKind::ServiceAccount =>
+                    return self.tenant_selection(context, &routes, &requester, source, people.as_ref(), tool),
+                Some(_) => return Err(VerificationError::BindingMismatch),
+                None => routes.home.ok_or(GoogleRoutesError::SetupRequired)?,
+            },
+            // This bridge does not reinterpret Apps Script material as OAuth.
             _ => return Err(VerificationError::Unavailable),
         };
         let source = home_source::read_home_native_selection(&self.home, tool)
@@ -174,6 +239,7 @@ impl GoogleIsolationBridge {
         selected.verify_call(call)?;
         let tool = call.name();
         let args = call.arguments();
+        Self::refuse_identity_arguments(args)?;
         let (route, _) = self.source(call.context(), tool)?;
         if route.product.account() != selected.account() || route.generation() != selected.generation()
             || route.kind() != selected.kind() {
@@ -226,6 +292,21 @@ impl LiveConnectorSelectionPolicy for GoogleIsolationBridge {
         let (route, digest) = self.source(context, tool)?;
         Ok(vec![self.pin_source(tool, route, digest)?])
     }
+    fn candidates_for_call(&self, context: &RequestContext, tool: &str, provider: &str, arguments: &Value)
+        -> Result<Vec<ProductConnectorAccount>, VerificationError> {
+        Self::refuse_identity_arguments(arguments)?;
+        self.candidates(context, tool, provider)
+    }
+}
+impl GoogleIsolationBridge {
+    /// An employee can never choose whose Google account is used.
+    fn refuse_identity_arguments(arguments: &Value) -> Result<(), VerificationError> {
+        let Some(object) = arguments.as_object() else { return Err(VerificationError::Invalid) };
+        if object.keys().any(|key| IDENTITY_SELECTOR_ARGUMENTS.iter().any(|selector| *selector == key.as_str())) {
+            return Err(VerificationError::BindingMismatch);
+        }
+        Ok(())
+    }
 }
 impl BoundConnectorExecutor for GoogleIsolationBridge {
     fn supports(&self, tool: &str) -> bool { LiveConnectorSelectionPolicy::supports(self, tool) }
@@ -250,3 +331,6 @@ impl BoundConnectorExecutor for GoogleIsolationBridge {
 #[cfg(test)]
 #[path = "isolation_bridge_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "isolation_tenant_tests.rs"]
+mod tenant_tests;

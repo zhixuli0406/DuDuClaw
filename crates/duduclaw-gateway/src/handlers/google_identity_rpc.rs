@@ -165,6 +165,8 @@ impl MethodHandler {
                         "default_identity": c.default_identity.to_config_value(),
                         "allowed_subject_domains": c.allowed_subject_domains,
                         "allowed_domains": c.allowed_domains,
+                        "service_mailboxes": c.service_mailboxes,
+                        "tenant_scopes": c.tenant_scopes,
                     }),
                     Err(_) => Value::Null,
                 },
@@ -316,6 +318,13 @@ impl MethodHandler {
             Some(_) => return WsFrame::error_response("", "allowed_domains 必須是字串陣列"),
         };
         if !personal_domains.is_empty() { section.insert("allowed_domains".into(), toml::Value::Array(personal_domains.iter().cloned().map(toml::Value::String).collect())); }
+        // v1.81 E4: protected-mode tenant-source settings are not edited here;
+        // keep them exactly as they are instead of dropping them on rewrite.
+        for (key, values) in [("service_mailboxes", &current.service_mailboxes), ("tenant_scopes", &current.tenant_scopes)] {
+            if !values.is_empty() {
+                section.insert(key.into(), toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect()));
+            }
+        }
         let config_path = self.home_dir.join("config.toml");
         let original=match super::config_commit::read_text_or_empty(&config_path) {Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("無法寫入 config.toml：{e}"))};
         let config_expected_hash=super::config_commit::content_hash(&original);
