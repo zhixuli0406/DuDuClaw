@@ -128,7 +128,8 @@ async fn exchange(home: &Path, agent: &str, turn: &str, tool: &str, args: Value)
     let key = duduclaw_gateway::mcp_internal_key::valid_internal_keys(home).into_iter().next()
         .ok_or("gateway key unavailable")?;
     let identity = duduclaw_core::load_identity_key(home).ok_or("identity key unavailable")?;
-    let token = duduclaw_core::mint_identity_token(&identity, agent);
+    let token = duduclaw_core::current_agent_token(home, &identity, agent)
+        .ok_or("employee identity unavailable")?;
     let context = std::env::var("DUDUCLAW_PRINCIPAL_CONTEXT").ok();
     let body = serde_json::to_vec(&json!({"turn_id": turn, "tool": tool, "args": args, "principal_context": context})).map_err(|_| "bad hook request")?;
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "clock unavailable")?.as_secs().to_string();

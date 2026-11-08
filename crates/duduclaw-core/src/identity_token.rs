@@ -68,13 +68,47 @@
 //! | present | valid | (any) | [`IdentityVerdict::Verified`] |
 //! | present | missing/invalid | `false` + valid grace | [`IdentityVerdict::Unverified`] — one `warn!` per process, then proceed |
 //! | present | missing/invalid | `true` | [`IdentityVerdict::Rejected`] — fail closed |
+//!
+//! # Token v2 for protected employees (F6m, S8)
+//!
+//! The v1 tag above covers the label only and never expires, so a copied or
+//! logged token of a tombstoned employee would verify as any later employee
+//! on the same label. For a **protected employee** (a label with a row in the
+//! confirmed employee index, see [`protected_employee`]) the token is instead
+//!
+//! ```text
+//!   DUDUCLAW_AGENT_TOKEN = "v2." + hex(HMAC-SHA256(identity.key,
+//!       "duduclaw-agent-token-v2" ‖ u32be(len(label)) ‖ label
+//!       ‖ employee_hex(32 chars) ‖ u64be(incarnation)))
+//! ```
+//!
+//! minted from the live index row at every spawn, and verified against a
+//! fresh read of that row. Rules (applied before the rollout table above):
+//! - protected, live: only a v2 token for the current employee id and
+//!   incarnation verifies, in **both** modes; a v1 token, a v2 token of an
+//!   older incarnation or of another employee id on the label is `Rejected`;
+//! - protected, tombstoned: `Rejected`, and no token is minted;
+//! - index present but unreadable or corrupt: `Rejected`, no token is minted;
+//! - unprotected (no index, or no row for the label): v1, exactly as before.
+//!
+//! The delegation context ([`mint_delegation_context_in`]) binds its `worker`
+//! to the same tuple, and internal request signatures bind it through the v2
+//! token they MAC ([`current_agent_token`]).
 
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 mod windows;
+mod lifecycle;
 #[cfg(test)]
 mod tests_security;
+#[cfg(test)]
+mod tests_v2;
+
+pub use lifecycle::{
+    protected_employee, AgentIncarnation, LifecycleUnavailable, ProtectedEmployee, APPLY_DB_DIR,
+    APPLY_DB_FILE,
+};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -340,6 +374,88 @@ pub fn verify_token(key: &[u8], agent_id: &str, token: &str) -> bool {
     mac.verify_slice(&bytes).is_ok()
 }
 
+// ── Token v2 (F6m) ───────────────────────────────────────────────────────────
+
+/// Prefix of every v2 token. A v1 verifier rejects it (`v` is not hex) and a
+/// v2 verifier rejects every prefix-less (v1) token.
+pub const AGENT_TOKEN_V2_PREFIX: &str = "v2.";
+const AGENT_TOKEN_V2_DOMAIN: &[u8] = b"duduclaw-agent-token-v2";
+
+fn token_v2_mac(key: &[u8], label: &str, binding: &AgentIncarnation) -> Option<HmacSha256> {
+    // Labels are short agent ids; anything beyond u32 cannot be a label.
+    let length = u32::try_from(label.len()).ok()?;
+    let mut mac = HmacSha256::new_from_slice(key).ok()?;
+    mac.update(AGENT_TOKEN_V2_DOMAIN);
+    mac.update(&length.to_be_bytes());
+    mac.update(label.as_bytes());
+    // Fixed width (32 hex chars, 8 bytes): no framing ambiguity after the label.
+    mac.update(binding.employee_hex().as_bytes());
+    mac.update(&binding.incarnation.to_be_bytes());
+    Some(mac)
+}
+
+/// `"v2." + hex(HMAC-SHA256(key, domain ‖ len(label) ‖ label ‖ employee_hex ‖
+/// incarnation))`. See the module docs.
+pub fn mint_token_v2(key: &[u8], label: &str, binding: &AgentIncarnation) -> String {
+    let tag = token_v2_mac(key, label, binding)
+        .expect("agent labels are far shorter than u32::MAX")
+        .finalize().into_bytes();
+    format!("{AGENT_TOKEN_V2_PREFIX}{}", hex_lower(&tag))
+}
+
+/// Constant-time check of a [`mint_token_v2`] token for exactly this tuple.
+pub fn verify_token_v2(key: &[u8], label: &str, binding: &AgentIncarnation, token: &str) -> bool {
+    let Some(tag) = token.trim().strip_prefix(AGENT_TOKEN_V2_PREFIX) else {
+        return false;
+    };
+    let Some(bytes) = decode_hex(tag) else {
+        return false;
+    };
+    token_v2_mac(key, label, binding).is_some_and(|mac| mac.verify_slice(&bytes).is_ok())
+}
+
+static LIFECYCLE_ERROR_LOGGED: std::sync::Once = std::sync::Once::new();
+
+/// [`protected_employee`] with one `error!` per process on failure.
+fn protected_employee_logged(home_dir: &Path, label: &str) -> Result<ProtectedEmployee, LifecycleUnavailable> {
+    let result = protected_employee(home_dir, label);
+    if result.is_err() {
+        LIFECYCLE_ERROR_LOGGED.call_once(|| {
+            tracing::error!(
+                path = %home_dir.join(APPLY_DB_DIR).join(APPLY_DB_FILE).display(),
+                "employee identity refused: the confirmed employee index exists but cannot be read \
+                 safely (owner-only regular file, single link, not a symlink). Protected-employee \
+                 tokens are neither minted nor accepted until it is repaired."
+            );
+        });
+    }
+    result
+}
+
+/// The token DuDuClaw currently issues for `label`: v1 when unprotected, v2
+/// for a live protected employee, `None` (issue nothing, accept nothing) when
+/// the employee is tombstoned or the index cannot be read.
+///
+/// Every place that recomputes the expected token (spawn env, internal
+/// request receivers and signers) must use this, never [`mint_token`].
+pub fn current_agent_token(home_dir: &Path, key: &[u8], label: &str) -> Option<String> {
+    match protected_employee_logged(home_dir, label).ok()? {
+        ProtectedEmployee::Unprotected => Some(mint_token(key, label)),
+        ProtectedEmployee::Live(binding) => Some(mint_token_v2(key, label, &binding)),
+        ProtectedEmployee::Tombstoned => None,
+    }
+}
+
+/// Lifecycle-aware token check: v1 only for unprotected labels, v2 for the
+/// live tuple of a protected employee, never for a tombstoned or unreadable one.
+pub fn verify_agent_token(home_dir: &Path, key: &[u8], label: &str, token: &str) -> bool {
+    match protected_employee_logged(home_dir, label) {
+        Ok(ProtectedEmployee::Unprotected) => verify_token(key, label, token),
+        Ok(ProtectedEmployee::Live(binding)) => verify_token_v2(key, label, &binding, token),
+        Ok(ProtectedEmployee::Tombstoned) | Err(_) => false,
+    }
+}
+
 /// Legacy proof name, retained only so process boundaries can scrub it.
 pub const ENV_DELEGATION_AUDIT_TOKEN: &str = "DUDUCLAW_DELEGATION_AUDIT_TOKEN";
 /// Secret, per-spawn host proof. Never persist this envelope in runtime argv.
@@ -348,6 +464,8 @@ pub const ENV_DELEGATION_CONTEXT: &str = "DUDUCLAW_DELEGATION_CONTEXT";
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationContext {
+    /// 1: `worker` by label (unprotected workers). 2 (F6m): `worker` also
+    /// bound to its employee id and incarnation (protected workers).
     pub version: u8,
     pub worker: String,
     pub sender: String,
@@ -356,6 +474,13 @@ pub struct DelegationContext {
     pub run_id: Option<String>,
     pub expires_at: u64,
     pub nonce: String,
+    /// Version 2 only: lowercase hex of the worker's employee id. Omitted
+    /// from version 1 so v1 contexts serialize exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_employee: Option<String>,
+    /// Version 2 only: the worker's incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_incarnation: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -390,8 +515,25 @@ pub fn is_system_delegation_origin(origin: &str) -> bool {
 }
 
 impl DelegationContext {
+    /// The worker tuple a version 2 context is bound to (`None` for version 1).
+    pub fn worker_binding(&self) -> Option<AgentIncarnation> {
+        let hex = self.worker_employee.as_deref()?;
+        let bytes = decode_hex(hex)?;
+        Some(AgentIncarnation { employee: bytes.try_into().ok()?, incarnation: self.worker_incarnation? })
+    }
+
+    fn binding_well_formed(&self) -> bool {
+        match self.version {
+            1 => self.worker_employee.is_none() && self.worker_incarnation.is_none(),
+            2 => self.worker_incarnation.is_some()
+                && self.worker_employee.as_ref().is_some_and(|hex| hex.len() == 32
+                    && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            _ => false,
+        }
+    }
+
     fn well_formed(&self) -> bool {
-        self.version == 1
+        self.binding_well_formed()
             && delegation_employee_id(&self.worker)
             && delegation_employee_id(&self.sender)
             && (delegation_employee_id(&self.origin)
@@ -408,46 +550,113 @@ impl DelegationContext {
     fn mac_payload(&self) -> String {
         // Every field is NUL-free before this method is used. The optional run
         // binding uses an empty field only for None (Some("") is rejected).
-        format!("duduclaw-delegation-context\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        let common = format!("{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.version, self.worker, self.sender, self.origin, self.depth,
-            self.run_id.as_deref().unwrap_or(""), self.expires_at, self.nonce)
+            self.run_id.as_deref().unwrap_or(""), self.expires_at, self.nonce);
+        match (&self.worker_employee, self.worker_incarnation) {
+            // Version 2 has its own domain; the version field is also covered.
+            (Some(employee), Some(incarnation)) =>
+                format!("duduclaw-delegation-context-v2\0{common}\0{employee}\0{incarnation}"),
+            _ => format!("duduclaw-delegation-context\0{common}"),
+        }
     }
 }
 
 /// Mint one context per MCP child. Randomness failure rejects delegation.
+/// Version 1 (label-only worker); for a worker that may be a protected
+/// employee use [`mint_delegation_context_in`].
 #[allow(clippy::too_many_arguments)]
 pub fn mint_delegation_context(
     key: &[u8], worker: &str, sender: &str, origin: &str, depth: u8,
     run_id: Option<&str>, expires_at: u64,
 ) -> Option<String> {
+    mint_delegation_context_for(key, worker, None, sender, origin, depth, run_id, expires_at)
+}
+
+/// Mint a context whose worker is bound to `worker_binding` (version 2) or to
+/// its label only (`None`, version 1).
+#[allow(clippy::too_many_arguments)]
+pub fn mint_delegation_context_for(
+    key: &[u8], worker: &str, worker_binding: Option<&AgentIncarnation>, sender: &str,
+    origin: &str, depth: u8, run_id: Option<&str>, expires_at: u64,
+) -> Option<String> {
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).ok()?;
     let context = DelegationContext {
-        version: 1, worker: worker.to_owned(), sender: sender.to_owned(),
+        version: if worker_binding.is_some() { 2 } else { 1 },
+        worker: worker.to_owned(), sender: sender.to_owned(),
         origin: origin.to_owned(), depth, run_id: run_id.map(str::to_owned),
         expires_at, nonce: hex_lower(&nonce),
+        worker_employee: worker_binding.map(AgentIncarnation::employee_hex),
+        worker_incarnation: worker_binding.map(|binding| binding.incarnation),
     };
     if !context.well_formed() { return None; }
     let signature = mint_token(key, &context.mac_payload());
     serde_json::to_string(&SignedDelegationContext { context, signature }).ok()
 }
 
+/// Host mint path (F6m): a protected worker gets a version 2 context bound to
+/// its live employee id and incarnation, an unprotected worker version 1; a
+/// tombstoned worker or an unreadable index gets no context (delegation is
+/// then refused by the MCP side).
+#[allow(clippy::too_many_arguments)]
+pub fn mint_delegation_context_in(
+    home_dir: &Path, key: &[u8], worker: &str, sender: &str, origin: &str, depth: u8,
+    run_id: Option<&str>, expires_at: u64,
+) -> Option<String> {
+    let binding = match protected_employee_logged(home_dir, worker).ok()? {
+        ProtectedEmployee::Unprotected => None,
+        ProtectedEmployee::Live(binding) => Some(binding),
+        ProtectedEmployee::Tombstoned => return None,
+    };
+    mint_delegation_context_for(key, worker, binding.as_ref(), sender, origin, depth, run_id, expires_at)
+}
+
 /// Verify attribution and delegation bounds against the authenticated worker
 /// and this spawn's run/task/turn identity. Legacy audit tokens are rejected.
 /// Call [`claim_delegation_context`] before using the returned context.
+/// Accepts only version 1 (label-only worker); MCP verification uses
+/// [`verify_delegation_context_in`].
 pub fn verify_delegation_context(
     key: &[u8], worker: &str, expected_run_id: Option<&str>, token: &str, now: u64,
+) -> Option<DelegationContext> {
+    verify_delegation_context_for(key, worker, None, expected_run_id, token, now)
+}
+
+/// [`verify_delegation_context`] that also requires the context's worker
+/// binding to equal `worker_binding` exactly: `None` accepts only version 1,
+/// `Some` only a version 2 context for that employee id and incarnation.
+pub fn verify_delegation_context_for(
+    key: &[u8], worker: &str, worker_binding: Option<&AgentIncarnation>,
+    expected_run_id: Option<&str>, token: &str, now: u64,
 ) -> Option<DelegationContext> {
     if token.len() > 16384 { return None; }
     let signed: SignedDelegationContext = serde_json::from_str(token).ok()?;
     let context = signed.context;
     if !context.well_formed() || context.worker != worker
+        || context.worker_binding().as_ref() != worker_binding
         || context.run_id.as_deref() != expected_run_id || now >= context.expires_at
         || !verify_token(key, &context.mac_payload(), &signed.signature)
     {
         return None;
     }
     Some(context)
+}
+
+/// MCP verify path (F6m): the worker binding comes from a fresh read of the
+/// confirmed employee index, never from the context. A protected worker
+/// accepts only a version 2 context of its live tuple (a context of an older
+/// incarnation or another employee id on the label is refused); a tombstoned
+/// worker or an unreadable index accepts none; an unprotected worker version 1.
+pub fn verify_delegation_context_in(
+    home_dir: &Path, key: &[u8], worker: &str, expected_run_id: Option<&str>, token: &str, now: u64,
+) -> Option<DelegationContext> {
+    let binding = match protected_employee_logged(home_dir, worker).ok()? {
+        ProtectedEmployee::Unprotected => None,
+        ProtectedEmployee::Live(binding) => Some(binding),
+        ProtectedEmployee::Tombstoned => return None,
+    };
+    verify_delegation_context_for(key, worker, binding.as_ref(), expected_run_id, token, now)
 }
 
 type DelegationClaims = std::collections::HashSet<(PathBuf, u32, String)>;
@@ -763,10 +972,17 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// this one is per-call because the identity is.
 ///
 /// No key ⇒ just the id, i.e. exactly the pre-WP21 env block.
+///
+/// F6m: the token is [`current_agent_token`] — v2 for a live protected
+/// employee (so it rotates with every incarnation or employee-id change at
+/// the next spawn), v1 otherwise. A tombstoned employee or an unreadable
+/// employee index gets no token at all (the MCP side then refuses).
 pub fn agent_identity_env_vars(home_dir: &Path, agent_id: &str) -> Vec<(String, String)> {
     let mut out = vec![(crate::ENV_AGENT_ID.to_string(), agent_id.to_string())];
     if let Some(key) = load_key(home_dir) {
-        out.push((ENV_AGENT_TOKEN.to_string(), mint_token(&key, agent_id)));
+        if let Some(token) = current_agent_token(home_dir, &key, agent_id) {
+            out.push((ENV_AGENT_TOKEN.to_string(), token));
+        }
     }
     out
 }
@@ -874,8 +1090,21 @@ pub fn verify_claim(
     {
         return IdentityVerdict::Rejected;
     }
+    // F6m: read the employee index before anything else can return. An
+    // unreadable index or a tombstoned employee refuses in both modes; a live
+    // protected employee needs its current v2 token in both modes.
+    let protected = match protected_employee_logged(home_dir, claimed_id) {
+        Ok(ProtectedEmployee::Tombstoned) | Err(_) => return IdentityVerdict::Rejected,
+        Ok(ProtectedEmployee::Live(binding)) => Some(binding),
+        Ok(ProtectedEmployee::Unprotected) => None,
+    };
     let key = match read_key(home_dir) {
         Ok(Some(key)) => key,
+        Ok(None) if protected.is_some() => {
+            error_key_once(home_dir, &std::io::Error::new(std::io::ErrorKind::NotFound,
+                "identity key is required for a protected employee but missing"));
+            return IdentityVerdict::Rejected;
+        }
         Ok(None) if !require && matches!(initialized(home_dir), Ok(false)) =>
             return IdentityVerdict::Disabled,
         Ok(None) => {
@@ -892,6 +1121,14 @@ pub fn verify_claim(
     // `config.toml [general] default_agent`. In strict mode that fallback is
     // itself an escalation route (unset the env var, inherit the default
     // agent's authority), so it is refused there too.
+    if let Some(binding) = protected {
+        // Soft mode never applies: a v1 token is refused for every protected employee.
+        return if !token.is_empty() && verify_token_v2(&key, claimed_id, &binding, token) {
+            IdentityVerdict::Verified
+        } else {
+            IdentityVerdict::Rejected
+        };
+    }
     if !claimed_id.is_empty() && !token.is_empty() && verify_token(&key, claimed_id, token) {
         return IdentityVerdict::Verified;
     }

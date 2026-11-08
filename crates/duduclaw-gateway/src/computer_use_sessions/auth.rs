@@ -144,7 +144,11 @@ pub fn authenticate(
     let Some(identity_key) = duduclaw_core::load_identity_key(home) else {
         return Err(AuthFailure::NoIdentityKey);
     };
-    let agent_token = duduclaw_core::mint_identity_token(&identity_key, agent_id);
+    // F6m: v2 for a live protected employee (binds the signature to its
+    // employee id and incarnation), v1 otherwise; none when tombstoned/unreadable.
+    let Some(agent_token) = duduclaw_core::current_agent_token(home, &identity_key, agent_id) else {
+        return Err(AuthFailure::BadSignature);
+    };
     // Every valid internal key is tried, without early exit.
     let verified = crate::mcp_internal_key::valid_internal_keys(home).iter().fold(false, |ok, key| {
         ok | duduclaw_core::verify_internal_request_signature(

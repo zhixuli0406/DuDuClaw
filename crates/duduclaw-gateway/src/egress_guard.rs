@@ -762,7 +762,9 @@ fn handle(
     let Some(identity_key) = duduclaw_core::load_identity_key(&state.home) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let token = duduclaw_core::mint_identity_token(&identity_key, &caller.agent_id);
+    let Some(token) = duduclaw_core::current_agent_token(&state.home, &identity_key, &caller.agent_id) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let timestamp = headers
         .get(TIMESTAMP_HEADER)
         .and_then(|v| v.to_str().ok())

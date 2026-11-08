@@ -1766,7 +1766,7 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
 /// calls are signed at depth zero; inherited process env never grants headroom.
 pub fn delegation_context_env(home: &Path, worker: &str, timeout_secs: u64) -> Vec<(String, String)> {
     use duduclaw_core::identity_token::{ENV_DELEGATION_CONTEXT, ENV_DELEGATION_AUDIT_TOKEN,
-        delegation_run_binding, mint_delegation_context};
+        delegation_run_binding, mint_delegation_context_in};
     let scoped = DELEGATION_ENV.try_with(Clone::clone).ok();
     let employee = |id: &str| duduclaw_core::is_valid_agent_id(id)
         && !duduclaw_core::is_system_sender(id)
@@ -1803,7 +1803,10 @@ pub fn delegation_context_env(home: &Path, worker: &str, timeout_secs: u64) -> V
     let expiry = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|now| now.as_secs().saturating_add(timeout_secs).saturating_add(60)).unwrap_or(0);
     let token = duduclaw_core::load_identity_key(home).map(zeroize::Zeroizing::new)
-        .and_then(|key| mint_delegation_context(&key, worker, &sender, &origin, depth, binding.as_deref(), expiry))
+        // F6m: a protected worker's context is bound to its live employee id
+        // and incarnation; tombstoned or unreadable ⇒ no context (fail closed).
+        .and_then(|key| mint_delegation_context_in(home, &key, worker, &sender, &origin, depth,
+            binding.as_deref(), expiry))
         .unwrap_or_default();
     let mut envs = vec![(ENV_DELEGATION_CONTEXT.to_string(), token),
          (ENV_DELEGATION_AUDIT_TOKEN.to_string(), String::new()),

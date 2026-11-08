@@ -41,7 +41,9 @@ async fn handle(state: &RouteState, peer: SocketAddr, headers: &HeaderMap, body:
     let Some(identity) = duduclaw_core::load_identity_key(&state.home) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let token = duduclaw_core::mint_identity_token(&identity, &caller.agent_id);
+    let Some(token) = duduclaw_core::current_agent_token(&state.home, &identity, &caller.agent_id) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let timestamp = headers.get(TIMESTAMP_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("");
     let signature = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Some(key) = crate::mcp_internal_key::valid_internal_keys(&state.home).into_iter().find(|key| {
