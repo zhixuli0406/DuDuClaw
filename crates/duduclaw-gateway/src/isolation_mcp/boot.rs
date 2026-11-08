@@ -61,10 +61,11 @@ pub struct BootSources {
     pub connector_catalog: Option<Arc<ConnectorCatalog>>,
     pub connectors: Option<Arc<dyn BoundConnectorExecutor>>,
     pub connector_selection: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
-    /// H9/H10: root work broker (H5 `SpawndWorkspaceBridge` over spawnd
-    /// `OpenWorkFile`) for the brokered `employee-work` root. Optional: without
-    /// it the issuer never selects a Workspace grant, so the file tools stay
-    /// hidden and refused (fail closed); it is not a boot-completeness producer.
+    /// H9/H10: optional host override of the root work broker. Production
+    /// leaves it `None`: W1's `assemble` then installs run-bound brokers over
+    /// the protected backend (`run_broker.rs`, H5 `SpawndWorkspaceBridge`).
+    /// Without either the issuer never selects a Workspace grant (tools hidden,
+    /// fail closed); it is not a boot-completeness producer.
     pub work_broker: Option<Arc<dyn duduclaw_mcp_boundary::resources::WorkBroker>>,
     /// F1: per-employee connector stack over `connector_catalog`. When boot
     /// creates it, `connectors`/`connector_selection` are this same object
@@ -544,7 +545,7 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     }
     // Workspace{employee-work} + brokered root, PublicOrigins, NewTask: plain
     // grants in the signed resource set, so the capability MAC covers them.
-    selection.apply(sources, employee, &mut resources, &mut roots)?;
+    selection.apply(sources, lifecycle, &mut resources, &mut roots)?; // W1: broker bound to employee+incarnation
     let now = duduclaw_mcp_boundary::authority::now_seconds()?;
     let expires_at = now.checked_add(30 * 60).ok_or(VerificationError::InvalidTime)?
         .min(credential_expiry.unwrap_or(u64::MAX));
@@ -623,7 +624,8 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,
         worker_plans: sources.worker_plans.take().ok_or(VerificationError::Unavailable)?,
         turns: sources.turns.take().ok_or(VerificationError::Unavailable)?,
-        selectors: SelectorSources::installed(sources.work_broker.take(), backend), // HX5: + spawnd feature view
+        // W1: run-bound work brokers (unless a host broker is supplied) + HX5 feature view.
+        selectors: SelectorSources::installed(home, sources.work_broker.take(), backend),
         catalog: sources.connector_catalog, connectors: sources.connectors,
         connector_selection: sources.connector_selection, connector_stack: sources.connector_stack })
 }

@@ -142,6 +142,13 @@ impl SharedEmployee {
         self
     }
 
+    /// W1: replace every selector producer, e.g. with boot's
+    /// `SelectorSources::installed_over` (run-bound work brokers).
+    pub(crate) fn with_selector_sources(mut self, sources: SelectorSources) -> Self {
+        self.sources = sources;
+        self
+    }
+
     pub fn employee(&self) -> EmployeeId { self.root.0.employee }
     pub fn user(&self) -> &str { &self.user }
     pub fn epoch(&self) -> u64 { self.epoch }

@@ -15,7 +15,11 @@
 //! - E2's Google route resolution on the employee's catalog routes ⇒
 //!   `connector_setup_required{google}`;
 //! - C4 relink hints (an owner/home disconnect revoked a route that waits for
-//!   reconnect) ⇒ `revoked`.
+//!   reconnect) ⇒ `revoked`;
+//! - W1, host-wide: the protected backend's live spawnd feature source and
+//!   boot's work broker installation ⇒ `workspace_broker_unavailable`; HX5's
+//!   `helper_calls` bit and the published runtime ids ⇒
+//!   `helper_launcher_unavailable{reason}` / `helper_runtime_missing{runtime}`.
 //!
 //! Fail closed: an unreadable source is `service_unavailable`, never "ready".
 //! The payload holds fixed codes, provider family names from the factory's
@@ -64,7 +68,47 @@ pub enum Reason {
     /// HX5 (H16): a helper runtime of an in-run tool is not in the signed
     /// publication; that tool stays hidden. `runtime` is a fixed runtime id.
     HelperRuntimeMissing { runtime: &'static str },
+    /// W1 (H16): the brokered file tools (and the in-run helpers, which need
+    /// the same Workspace grant) are hidden because spawnd's live readiness
+    /// view lacks `work_broker`, or boot installed no work broker.
+    WorkspaceBrokerUnavailable,
 }
+
+/// W1: host-wide reasons of the brokered work root and the in-run helpers.
+/// `features` = spawnd's checked readiness bits (`None` = unreadable, read as
+/// none); `broker_installed` = boot installed a work broker producer;
+/// `published` = registered runtime ids of the fresh gateway publication
+/// (`None` = unreadable, read as none published). Pure; fail closed.
+pub fn feature_reasons(features: Option<duduclaw_isolation::ipc::SpawndFeatures>, broker_installed: bool,
+    published: Option<&[&str]>) -> Vec<Reason> {
+    use duduclaw_isolation::ipc::SpawndFeatures;
+    let features = features.unwrap_or(SpawndFeatures::NONE);
+    let mut reasons = Vec::new();
+    if !broker_installed || !features.contains(SpawndFeatures::WORK_BROKER) {
+        reasons.push(Reason::WorkspaceBrokerUnavailable);
+    }
+    reasons.extend(helper_reasons(features.contains(SpawndFeatures::HELPER_CALLS),
+        published.unwrap_or_default().iter().copied()));
+    reasons
+}
+
+/// [`feature_reasons`] from the live sources the gates read: the backend's
+/// readiness feature source, boot's broker installation and the fresh
+/// gateway publication's runtime ids. Blocking (two small root-owned files).
+#[cfg(target_os = "linux")]
+pub(crate) fn installed_feature_reasons() -> Vec<Reason> {
+    use duduclaw_isolation::execution::RuntimeKind;
+    let features = crate::isolation_mcp::readiness_features().ok();
+    let publication = duduclaw_spawnd::installed::GatewayPublication::read(nix::unistd::getegid().as_raw()).ok();
+    let published: Option<Vec<&str>> = publication.as_ref().map(|publication| publication.runtimes.iter()
+        .filter_map(|record| match &record.runtime { RuntimeKind::Registered(id) => Some(id.as_str()), _ => None })
+        .collect());
+    feature_reasons(features, crate::isolation_mcp::work_broker_installed(), published.as_deref())
+}
+
+/// Protected mode exists only on Linux; elsewhere `report` never runs.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn installed_feature_reasons() -> Vec<Reason> { Vec::new() }
 
 /// Fixed ids reported by `helper_runtime_missing` (office scripts are one
 /// family of `duduclaw-office-<skill>-<script>-v1` runtimes).

@@ -122,6 +122,12 @@ pub(crate) mod ingress;
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/selectors.rs"]
 mod selectors;
+/// W1 production work broker (run-bound) and spawnd feature source.
+#[cfg(target_os = "linux")]
+#[path = "isolation_mcp/run_broker.rs"]
+mod run_broker;
+#[cfg(target_os = "linux")]
+pub(crate) use run_broker::{readiness_feature_source, readiness_features, work_broker_installed};
 #[cfg(target_os = "linux")]
 pub(crate) use boot::a_producers_ready;
 #[cfg(target_os = "linux")]

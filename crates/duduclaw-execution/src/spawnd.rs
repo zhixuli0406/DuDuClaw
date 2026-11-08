@@ -6,8 +6,8 @@ mod transport;
 mod fd_io;
 mod work_file;
 mod helper_call;
-pub use work_file::{features_from_advertised, FeatureSource, SpawndFeatures, WorkFileError, WorkFileSnapshot,
-    WORK_BROKER_FEATURE};
+pub use work_file::{features_from_advertised, FeatureSource, RunTransport, SpawndFeatures, WorkFileError,
+    WorkFileSnapshot, WORK_BROKER_FEATURE};
 
 use std::{collections::BTreeMap, os::fd::OwnedFd, sync::{Arc, Mutex as StdMutex}, time::Duration};
 use duduclaw_isolation::{bounded::{List, Text}, execution::*, ids::{EmployeeId, RunId}, ipc::{self, SpawnRequest, SpawnResponse, RunStatus}};

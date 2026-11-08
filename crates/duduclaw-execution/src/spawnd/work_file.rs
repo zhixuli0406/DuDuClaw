@@ -60,6 +60,18 @@ pub enum WorkFileError {
     Unavailable,
 }
 
+/// W1: what this backend knows about one reserved run's own control
+/// connection, read without any root I/O. `features` is that connection's
+/// `Reserved.features` narrowed by the installed readiness source
+/// (`connection_features`); a run broker binds to `(run, control)` and checks
+/// `employee` with exact equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunTransport {
+    pub employee: EmployeeId,
+    pub control: ipc::ControlConnectionId,
+    pub features: SpawndFeatures,
+}
+
 /// A verified snapshot: sealed (SEAL|SHRINK|GROW|WRITE) read-only memfd,
 /// nlink 0, whose fstat equals root's reply. `nlink` is reported as read.
 #[derive(Debug)]
@@ -77,6 +89,19 @@ impl SpawndBackend {
     pub fn with_feature_source(mut self, source: FeatureSource) -> Self {
         self.features = Some(source);
         self
+    }
+
+    /// W1: whether boot installed a readiness source. Without one no work op
+    /// is ever sent (`open_work_file` refuses `BrokerUnavailable`).
+    pub fn has_feature_source(&self) -> bool { self.features.is_some() }
+
+    /// W1: the live control connection of `run` as reserved by this backend.
+    /// `None` for an unknown run or a closed (fenced) connection.
+    pub fn run_transport(&self, run: RunHandle) -> Option<RunTransport> {
+        let entry = self.entry(run).ok()?;
+        if entry.connection.is_closed() { return None; }
+        Some(RunTransport { employee: entry.employee, control: entry.connection.id,
+            features: self.connection_features(run) })
     }
 
     /// The installed readiness view; no source reads as no features.

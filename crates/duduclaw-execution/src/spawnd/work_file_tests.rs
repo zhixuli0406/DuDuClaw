@@ -110,6 +110,39 @@ fn h5_bridge_requires_feature_bit() {
     assert!(!entry.connection.is_closed());
 }
 
+/// W1: the per-run view a gateway run broker binds to is the run's own
+/// admission (`Reserved.features`), only ever narrowed by the readiness source;
+/// the control id is that connection's; a fenced connection has no view.
+#[test]
+fn w1_feature_source_comes_from_run_admission() {
+    let both = SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_CALLS);
+    // Readiness advertises both, admission granted only helper calls.
+    let (backend, entry, peer) = fixture_with(advertised(&["work_broker", "helper_calls"]), SpawndFeatures::HELPER_CALLS);
+    assert!(backend.has_feature_source());
+    let view = backend.run_transport(RUN).unwrap();
+    assert_eq!(view.employee, EMPLOYEE);
+    assert_eq!(view.control, entry.connection.id);
+    assert_eq!(view.features, SpawndFeatures::HELPER_CALLS, "readiness can never add a bit admission lacked");
+    assert_eq!(backend.features(), both, "the host-wide view is separate from the run's");
+    // Admission granted both, readiness lost the broker bit: narrowed.
+    let (backend, _entry, _peer2) = fixture_with(advertised(&["helper_calls"]), both);
+    assert_eq!(backend.run_transport(RUN).unwrap().features, SpawndFeatures::HELPER_CALLS);
+    // Unreadable readiness: nothing.
+    let failing: FeatureSource = std::sync::Arc::new(|| Err(BackendError::Unavailable));
+    let (backend, _entry, _peer3) = fixture_with(Some(failing), both);
+    assert_eq!(backend.run_transport(RUN).unwrap().features, SpawndFeatures::NONE);
+    // No source installed: work ops stay impossible (H5 default).
+    let (backend, _entry, _peer4) = fixture_with(None, both);
+    assert!(!backend.has_feature_source());
+    assert_eq!(backend.open_work_file(RUN, EMPLOYEE, "a.txt", u64::MAX).unwrap_err(), WorkFileError::BrokerUnavailable);
+    // Unknown run or a fenced connection: no view at all.
+    let (backend, entry, _peer5) = fixture_with(advertised(&["work_broker"]), both);
+    assert!(backend.run_transport(RunHandle(RunId([2; 16]))).is_none());
+    entry.connection.close_now();
+    assert!(backend.run_transport(RUN).is_none());
+    assert!(nothing_sent(&peer));
+}
+
 #[test]
 fn h5_bridge_validates_reply_and_single_fd() {
     // Accepted: exactly one sealed read-only memfd whose fstat equals the reply.

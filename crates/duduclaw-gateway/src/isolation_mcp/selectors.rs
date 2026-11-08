@@ -12,7 +12,11 @@
 //!   spawnd's readiness view advertises `helper_calls` right now; any of
 //!   those missing (or an unreadable view) withholds it (fail closed). Only
 //!   then are the helper tools signed (`workspace_selection`); each call still
-//!   checks the run's own `Reserved.features`.
+//!   checks the run's own `Reserved.features`. W1: in production "a work
+//!   broker is installed" means boot's run-bound factory (`run_broker.rs`)
+//!   exists and spawnd's readiness view advertises `work_broker` now; the
+//!   root gets a fresh broker bound to this capability's employee and
+//!   incarnation (and, at first use, its run and control connection).
 //! * `PublicOrigins { * }` (H7, D-H2) — only for an employee-scope run (no
 //!   task) that lists `web_fetch_cached`/`web_extract`, and only when the admin
 //!   enabled protected public web for this employee: `agent.toml [isolation]
@@ -62,24 +66,45 @@ const PROFILE_MAX_BYTES: u64 = 1024 * 1024;
 /// supply the spawnd work broker); absent producers withhold their grant.
 #[derive(Clone, Default)]
 pub(crate) struct SelectorSources {
+    /// Host-supplied broker (tests / host integration); latched per capability.
     pub(crate) work_broker: Option<Arc<dyn WorkBroker>>,
+    /// W1: production run-bound broker factory over the protected backend
+    /// (`run_broker.rs`); used when no host broker is supplied.
+    pub(crate) run_brokers: Option<super::run_broker::RunBrokers>,
     /// HX5: spawnd's advertised features; absent ⇒ no helper workspace.
     pub(crate) spawnd_features: Option<SpawndFeatureView>,
 }
 
 impl SelectorSources {
-    /// Boot's producers: the optional work broker and the protected backend's
-    /// readiness feature view (`SpawndBackend::features`; a backend without a
-    /// feature source reads as no features, so no helper workspace).
+    /// Boot's producers: the host work broker if supplied, else W1's
+    /// run-bound brokers over the protected backend (none if the backend has
+    /// no readiness source), and the backend's readiness feature view
+    /// (`SpawndBackend::features`; no source reads as no features).
     #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
-    pub(crate) fn installed(work_broker: Option<Arc<dyn WorkBroker>>, backend: Arc<duduclaw_execution::SpawndBackend>)
-        -> Self {
-        Self { work_broker, spawnd_features: Some(Arc::new(move || backend.features())) }
+    pub(crate) fn installed(home: &Path, work_broker: Option<Arc<dyn WorkBroker>>,
+        backend: Arc<duduclaw_execution::SpawndBackend>) -> Self {
+        let sources = Self::installed_over(home, work_broker,
+            Arc::new(super::run_broker::SpawndRunTransport::new(backend)));
+        super::run_broker::mark_installed(sources.work_broker.is_some() || sources.run_brokers.is_some());
+        sources
+    }
+    /// [`Self::installed`] over any transport (boot and W1 tests).
+    #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
+    pub(crate) fn installed_over(home: &Path, work_broker: Option<Arc<dyn WorkBroker>>,
+        transport: Arc<dyn super::run_broker::RunWorkTransport>) -> Self {
+        let run_brokers = if work_broker.is_some() { None }
+            else { super::run_broker::RunBrokers::new(home, transport.clone()) };
+        Self { work_broker, run_brokers, spawnd_features: Some(Arc::new(move || transport.host_features())) }
+    }
+    /// A broker can be bound for this issuance: a host broker, or the
+    /// run-bound factory while spawnd advertises `work_broker`.
+    fn broker_available(&self) -> bool {
+        self.work_broker.is_some() || self.run_brokers.as_ref().is_some_and(super::run_broker::RunBrokers::available)
     }
     /// HX5 precondition of the helper workspace: a work broker is installed
     /// and spawnd advertises `helper_calls` now. Anything else ⇒ false.
     fn helper_calls(&self) -> bool {
-        self.work_broker.is_some()
+        self.broker_available()
             && self.spawnd_features.as_ref().is_some_and(|view| view().contains(SpawndFeatures::HELPER_CALLS))
     }
 }
@@ -119,7 +144,7 @@ pub(super) struct Selection {
 pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Result<Selection, VerificationError> {
     if input.task.is_some() && !input.record { return Err(VerificationError::Invalid); }
     let listed = |name: &str| input.tools.as_slice().iter().any(|tool| tool.as_str() == name);
-    let wants_files = sources.work_broker.is_some() && FILE_TOOLS.iter().any(|name| listed(*name));
+    let wants_files = sources.broker_available() && FILE_TOOLS.iter().any(|name| listed(*name));
     // HX5: checked only when a helper tool is listed (no view read otherwise).
     let wants_helpers = IN_RUN_HELPER_TOOLS.iter().any(|name| listed(*name)) && sources.helper_calls();
     // D-H2: PublicOrigins exists only alongside EmployeeScope; a task-limited
@@ -165,10 +190,17 @@ impl Selection {
     /// Add the selected Workspace/PublicOrigins/NewTask grants (and the
     /// brokered root they need) to the issuer's resources. The Task grant is
     /// applied by the issuer through `RuntimeAuthorization::limit_to_task`.
-    pub(super) fn apply(&self, sources: &SelectorSources, employee: EmployeeId,
+    /// W1: the brokered root gets a fresh broker bound to this capability's
+    /// employee and pinned incarnation (and, at first use, its run).
+    pub(super) fn apply(&self, sources: &SelectorSources, lifecycle: &crate::isolation_lifecycle::EmployeeLifecycle,
         resources: &mut Vec<ResourceGrant>, roots: &mut ResourceRoots) -> Result<(), VerificationError> {
+        let employee: EmployeeId = lifecycle.employee;
         if self.workspace {
-            let broker = sources.work_broker.clone().ok_or(VerificationError::Unavailable)?;
+            let broker = match (&sources.work_broker, &sources.run_brokers) {
+                (Some(broker), _) => super::run_broker::latched(broker.clone(), employee),
+                (None, Some(brokers)) => brokers.bind(&lifecycle.label, employee, lifecycle.incarnation),
+                (None, None) => return Err(VerificationError::Unavailable),
+            };
             roots.insert_brokered(EMPLOYEE_WORK_ROOT.to_owned(), employee, broker)?;
             resources.push(ResourceGrant::Workspace {
                 handle: Text::new(EMPLOYEE_WORK_ROOT.to_owned()).map_err(|_| VerificationError::Invalid)? });

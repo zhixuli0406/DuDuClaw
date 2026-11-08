@@ -17,9 +17,17 @@ unsafe or unreadable, then re-read after the issuer's lifecycle/users.db
 rechecks (a change refuses the run):
 
 - `Workspace { employee-work }` with the brokered root (H6) for `file_read`,
-  `csv_read` and `xlsx_read`: only when boot installed a root work broker
-  (`BootSources.work_broker`, H5), the run's tool snapshot lists a file tool and
-  the employee's current `agent.toml` allowed/denied tools still allow it.
+  `csv_read` and `xlsx_read`: only when boot installed a root work broker, the
+  run's tool snapshot lists a file tool and the employee's current `agent.toml`
+  allowed/denied tools still allow it. W1: production boot installs run-bound
+  brokers (`isolation_mcp/run_broker.rs`) over the protected backend, which has
+  spawnd's checked readiness report as its feature source; "installed" then
+  also requires that report to advertise `work_broker` at issuance. Each
+  capability gets its own broker (H5 `SpawndWorkspaceBridge` underneath), bound
+  to the employee id and incarnation the issuer pinned and, at its first open,
+  to that run and its control connection; every open needs exact equality of
+  all of them plus the `work_broker` bit in that run's own `Reserved.features`.
+  `BootSources.work_broker` remains an optional host override.
   HX5: the same grant is also selected for the in-run helper tools
   `execute_program`, `code_map` and `office_script` (an employee without file
   tools still sees and can call them): only when a root work broker is
@@ -70,9 +78,13 @@ non-File tool that needs a Workspace. The in-run helpers are signed only when
 the grant was selected for them. Those dropped tools stay hidden and refused.
 The parity test tracks this gap explicitly, using that same list; it is
 unfinished wiring, not another intentional isolation refusal or evidence of
-full employee parity. Until H5 installs the production work
-broker, the file tools stay hidden in production even though the selector
-exists. The own-skill tools below (H12a) never receive a Workspace (or
+full employee parity. Since W1 production boot installs the work broker and the
+spawnd feature source, so the file tools and the HX5 in-run helpers can be
+listed in production; they stay hidden (fail closed) while spawnd's readiness
+report lacks `work_broker` (helpers: also `helper_calls`) or the backend has no
+feature source, and the readiness report then names
+`workspace_broker_unavailable`, `helper_launcher_unavailable{reason}` and
+`helper_runtime_missing{runtime}`. The own-skill tools below (H12a) never receive a Workspace (or
 Recipient) grant from these selectors.
 
 H12a (v1.81): the own-skill tools `skill_extract`, `shared_skill_adopt`,

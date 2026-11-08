@@ -180,8 +180,10 @@ pub async fn connect_backend() {
     #[cfg(target_os = "linux")]
     {
         let result = match duduclaw_execution::SpawndBackend::connect_with_admission(backend_admission).await {
-            Ok(backend) => duduclaw_execution::selection::install_protected_backend(
-                std::sync::Arc::new(backend), backend_admission),
+            // W1: spawnd's checked readiness bits narrow every run's own
+            // `Reserved.features`; without this source no work op is sent.
+            Ok(backend) => duduclaw_execution::selection::install_protected_backend(std::sync::Arc::new(
+                backend.with_feature_source(crate::isolation_mcp::readiness_feature_source())), backend_admission),
             Err(error) => Err(error),
         };
         if result.is_err() { tracing::error!("受保護團隊無法連接隔離執行服務，員工執行維持暫停。"); }
@@ -219,7 +221,9 @@ pub fn status() -> Option<Readiness> {
 /// it never admits anything. Employee labels are included for admins only.
 pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
     let mut readiness = status()?;
-    let assessment = reasons::assess_installed(home);
+    let mut assessment = reasons::assess_installed(home);
+    // W1: host-wide work-broker / in-run helper reasons (live feature view).
+    assessment.reasons.extend(reasons::installed_feature_reasons());
     readiness = with_assessment(readiness, assessment, admin);
     Some(readiness)
 }
