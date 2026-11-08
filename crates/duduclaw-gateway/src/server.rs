@@ -864,6 +864,35 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         Ok(())
     })).await;
 
+    // F6g §3.6 (F6d boot wiring): finish, roll forward or roll back every
+    // interrupted adoption (`adopting` quarantine row). Protected mode only;
+    // spawnd IPC on the blocking pool, never delays boot. A roll-forward puts
+    // the adopted tree under agents/, so the registry is rescanned after.
+    if crate::runtime_readiness::is_protected_linux() {
+        let (recover_home, recover_registry) = (home_dir.clone(), handler.registry().clone());
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            let home = recover_home.clone();
+            match tokio::task::spawn_blocking(move || crate::isolation_restore_rpc::recover_adoptions_on_boot(&home, now)).await {
+                Ok(Ok(report)) => {
+                    for (label, code) in &report.failed {
+                        warn!(label = %label, code, "employee adoption recovery at boot refused; retried on the next request");
+                    }
+                    if !report.done.is_empty() {
+                        info!(count = report.done.len(), "employee adoptions recovered at boot");
+                        if report.done.iter().any(|(_, _, action)| *action == "rolled_forward") {
+                            if let Err(error) = recover_registry.write().await.scan().await {
+                                warn!(error = %error, "employee adoption recovery: registry rescan failed");
+                            }
+                        }
+                    }
+                }
+                Ok(Err(error)) => warn!(code = error.code(), "employee adoption recovery at boot unavailable"),
+                Err(_) => warn!("employee adoption recovery at boot panicked"),
+            }
+        });
+    }
+
     // Initialize cost telemetry (must happen before any Claude CLI calls)
     if let Err(e) = crate::cost_telemetry::init_telemetry(&home_dir) {
         tracing::warn!(error = %e, "Failed to initialize cost telemetry — continuing without it");

@@ -8,7 +8,9 @@
 //! any counter or challenge; there is never a fallback to a weaker factor.
 //!
 //! Every proof is bound to a **purpose** `restore:<employee_id>:<incarnation>`
-//! ([`restore_purpose`]) that the server derives from the row acted on:
+//! ([`restore_purpose`]; an adoption request, F6g, uses
+//! `adopt:<employee_id>:<incarnation>`, [`adopt_purpose`]) that the server
+//! derives from the row acted on:
 //! - **passkey**: [`UserDb::restore_challenge`] (`me.isolation.restore_challenge`)
 //!   saves a WebAuthn assertion ceremony bound to user + purpose (the passkey
 //!   login's ceremony table, relying party, verifier and counter update,
@@ -101,11 +103,22 @@ pub fn restore_purpose(employee_hex: &str, incarnation: u32) -> Option<String> {
     hex.then(|| format!("{PURPOSE_PREFIX}{employee_hex}:{incarnation}"))
 }
 
-/// Only the canonical form [`restore_purpose`] builds.
+/// `adopt:<employee_id>:<incarnation>` (F6g adoption request, §3.10 step 1):
+/// the same strongest-factor ceremony as a restore, under its own purpose so
+/// a restore proof never files an adoption and the reverse.
+pub fn adopt_purpose(employee_hex: &str, incarnation: u32) -> Option<String> {
+    restore_purpose(employee_hex, incarnation).map(|restore| format!("{ADOPT_PURPOSE_PREFIX}{}", &restore[PURPOSE_PREFIX.len()..]))
+}
+const ADOPT_PURPOSE_PREFIX: &str = "adopt:";
+
+/// Only the canonical forms [`restore_purpose`] and [`adopt_purpose`] build.
 fn valid_purpose(purpose: &str) -> bool {
-    let Some(rest) = purpose.strip_prefix(PURPOSE_PREFIX) else { return false };
+    let (rest, build): (&str, fn(&str, u32) -> Option<String>) = match purpose.strip_prefix(PURPOSE_PREFIX) {
+        Some(rest) => (rest, restore_purpose),
+        None => match purpose.strip_prefix(ADOPT_PURPOSE_PREFIX) { Some(rest) => (rest, adopt_purpose), None => return false },
+    };
     let Some((hex, incarnation)) = rest.split_once(':') else { return false };
-    incarnation.parse::<u32>().is_ok_and(|n| restore_purpose(hex, n).as_deref() == Some(purpose))
+    incarnation.parse::<u32>().is_ok_and(|n| build(hex, n).as_deref() == Some(purpose))
 }
 
 /// What the owner presents for one proof. `purpose` comes from the server

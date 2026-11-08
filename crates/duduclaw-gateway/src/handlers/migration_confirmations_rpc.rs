@@ -44,6 +44,9 @@ impl MethodHandler {
         let method = method.to_owned();
         let runtime = tokio::runtime::Handle::current();
         let live=Arc::new(LiveAuthority {registry:self.registry.clone(),context:ctx.clone(),handle:runtime.clone(),scheduler:self.cron_scheduler.read().await.clone()});
+        // F6g: set when an apply committed an adoption (its tree is now under agents/).
+        let adopted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adopted_flag = adopted.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<Value, &'static str> {
             let now = chrono::Utc::now().timestamp();
             if now < 0 { return Err("無法確認目前時間。"); }
@@ -151,6 +154,7 @@ impl MethodHandler {
             let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
                 Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user);
             let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
+            let adopt_home = home.clone();
             let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
             let error = "項目已變更、尚未支援或套用失敗，請重新載入確認目前狀態。";
             match method.as_str() {
@@ -196,7 +200,13 @@ impl MethodHandler {
                     if db.migration_confirmation_session(&user, &session, epoch, chrono::Utc::now().timestamp())
                         .ok().flatten().is_none() { return Err("身分驗證已失效，請重新驗證後繼續。"); }
                     match store.apply_next(binding, &mut applier) {
-                        Ok(item) if item.status == ConfirmationStatus::Applied => break,
+                        Ok(item) if item.status == ConfirmationStatus::Applied => {
+                            // F6g: an adoption committed inside this call — notice now, rescan below.
+                            if crate::isolation_restore_rpc::adoption_committed(&adopt_home, &item, &user, chrono::Utc::now().timestamp()) {
+                                adopted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            break
+                        }
                         Ok(_) => {},
                         Err(_) => { failed += 1; break; },
                     }
@@ -204,6 +214,12 @@ impl MethodHandler {
             }
             Ok(json!({ "readback_required": true, "failed": failed }))
         }).await;
+        if adopted.load(std::sync::atomic::Ordering::SeqCst) {
+            // Same as a restore: the adopted tree is back under agents/ (F6d).
+            if let Err(error) = self.registry.write().await.scan().await {
+                warn!(error = %error, "employee adoption: registry rescan failed");
+            }
+        }
         match result {
             Ok(Ok(value)) => WsFrame::ok_response("", value),
             Ok(Err(message)) => WsFrame::error_response("", message),

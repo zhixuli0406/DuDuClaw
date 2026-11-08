@@ -664,3 +664,6 @@ fn self_approval_row_written_once_in_apply_tx() {
 
 #[path = "isolation_restore_recovery_tests.rs"]
 mod recovery;
+/// F6g adoption under a new employee id (same fixture and fakes).
+#[path = "isolation_adopt_tests.rs"]
+mod adopt;

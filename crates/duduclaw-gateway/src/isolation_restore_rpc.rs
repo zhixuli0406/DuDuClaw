@@ -20,6 +20,12 @@
 //!   (`BEGIN IMMEDIATE`) before users.db (M6, S17); the factor proof commits
 //!   its users.db transaction before any apply.db lock is taken.
 //! - Notices (L1, S16) go to the apply.db outbox (`isolation_restore_wiring`).
+//! - Adoption under a new employee id (F6g engine `isolation_adopt`, §3.10
+//!   step 1): owner [`adoption_challenge`] + [`request_adoption`] (same
+//!   ownership-first and strongest-factor rule, purpose
+//!   `adopt:<employee_id>:<incarnation>`), Admin [`shared_adoption_request`];
+//!   [`adoption_committed`] after the confirmation apply commits one;
+//!   [`recover_adoptions_at_boot`] for every `adopting` row.
 use std::path::Path;
 
 use duduclaw_auth::mfa::{OwnerFactor, OwnerFactorError};
@@ -29,6 +35,7 @@ use duduclaw_security::audit::Severity;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
+use crate::isolation_adopt::{self as adopt, AdoptEnv, AdoptError, Filer};
 use crate::isolation_lifecycle::EmployeeKind;
 use crate::isolation_restore::{self as engine, Close, OwnerProof, Refusal, RestoreEnv, RESTORE_WINDOW_SECS};
 use crate::isolation_restore_wiring::{self as wiring, NoticeScope};
@@ -43,10 +50,15 @@ pub(crate) enum RpcError {
     Restore(Refusal),
     Factor(OwnerFactorError),
     Retire(crate::isolation_retire::RetireError),
+    /// F6g adoption engine (`isolation_adopt::AdoptError`).
+    Adopt(AdoptError),
     Invalid,
 }
 
 impl From<Refusal> for RpcError { fn from(r: Refusal) -> Self { Self::Restore(r) } }
+impl From<AdoptError> for RpcError {
+    fn from(e: AdoptError) -> Self { match e { AdoptError::Restore(r) => Self::Restore(r), other => Self::Adopt(other) } }
+}
 
 impl RpcError {
     pub(crate) fn code(self) -> &'static str {
@@ -54,6 +66,7 @@ impl RpcError {
             Self::Restore(r) => r.code(),
             Self::Factor(f) => f.code(),
             Self::Retire(r) => r.code(),
+            Self::Adopt(a) => a.code(),
             Self::Invalid => "INVALID_REQUEST",
         }
     }
@@ -61,6 +74,7 @@ impl RpcError {
         use crate::isolation_restore::RootClass as C;
         match self {
             Self::Retire(r) => r.message(),
+            Self::Adopt(a) => a.message(),
             Self::Invalid => "申請內容不正確，請重新載入後再試。",
             Self::Factor(OwnerFactorError::NoFactor) => "請先設定兩步驟驗證",
             Self::Factor(OwnerFactorError::NotStrongest(_)) =>
@@ -390,6 +404,130 @@ pub(crate) fn retire_propose(home: &Path, actor: &str, employee: &str, now: i64)
         ProposeOutcome::RootAbsent => Ok(json!({"state": "root_absent"})),
         ProposeOutcome::AlreadyRetired => Ok(json!({"state": "retired"})),
     }
+}
+
+// ── F6g adoption requests (§3.10 step 1, Q2, Q8) ───────────────────────
+
+/// The proof purpose of an adoption of one row (never a restore's).
+fn adopt_purpose(employee: EmployeeId, incarnation: u32) -> Result<String, RpcError> {
+    duduclaw_auth::mfa::owner_factor::adopt_purpose(&hex::encode(employee.0), incarnation).ok_or(RpcError::Invalid)
+}
+
+/// A requested target label: `None` = the original label; else a valid,
+/// non-reserved agent id (the engine checks that it is free, R6).
+fn target_label(target: Option<&str>) -> Result<Option<&str>, RpcError> {
+    match target {
+        Some(t) if !duduclaw_core::is_valid_agent_id(t) || duduclaw_core::is_reserved_agent_id(t) => Err(RpcError::Invalid),
+        other => Ok(other),
+    }
+}
+
+/// `me.isolation.restore_challenge` with `for_adoption: true`: ownership
+/// first, then the strongest factor's challenge bound to
+/// `adopt:<employee_id>:<incarnation>` (same issuer as a restore).
+pub(crate) fn adoption_challenge<T>(home: &Path, caller: &str, employee: &str, incarnation: u32,
+    issue: &dyn Fn(&str) -> Result<T, OwnerFactorError>) -> Result<T, RpcError> {
+    let employee = hex16(employee)?;
+    own_row(home, caller, employee, incarnation)?;
+    issue(&adopt_purpose(employee, incarnation)?).map_err(RpcError::Factor)
+}
+
+/// The reply and the request-side notice (L1-capped) of a filed adoption.
+fn adoption_filed(home: &Path, request: &engine::RestoreRequest, now: i64) -> Result<Value, RpcError> {
+    let (target, _) = { let db = engine::open_apply(home)?; adopt::adoption_columns(&db, &request.request_id)? };
+    let notified = match row_of(home, request.employee, request.incarnation)? {
+        Some(q) => notify(home, &q, "isolation.employee_adoption_requested",
+            json!({"request_id": request.request_id, "expires_at": request.expires_at, "target_label": target}), true, now),
+        None => false,
+    };
+    Ok(json!({"request_id": request.request_id, "state": request.state, "label": request.label, "target_label": target,
+        "expires_at": request.expires_at, "approval_required": true, "notified": notified}))
+}
+
+/// `me.isolation.request_adoption`: the owner files a Personal adoption
+/// (F6g `file_adoption`). Ownership first (`NOT_FOUND` for every other row,
+/// no factor oracle), then the owner's strongest factor bound to
+/// `adopt:<employee_id>:<incarnation>`; the engine re-checks the owner.
+pub(crate) fn request_adoption(home: &Path, env: &AdoptEnv<'_>, caller: &str, employee: &str, incarnation: u32,
+    target: Option<&str>, factor: &str, code: &str, check: FactorCheck<'_>) -> Result<Value, RpcError> {
+    let employee = hex16(employee)?;
+    let target = target_label(target)?;
+    own_row(home, caller, employee, incarnation)?;
+    let factor = verify_factor(check, factor, &adopt_purpose(employee, incarnation)?, code)?;
+    let request = adopt::file_adoption(home, env, employee, incarnation, target,
+        Filer::Personal(Some(OwnerProof { user_id: caller, factor: factor.as_str() })))?;
+    adoption_filed(home, &request, env.now)
+}
+
+/// `isolation.shared_adoption_request` (Admin + MFA + step-up, checked by
+/// the caller): a Shared adoption with the member selection
+/// `[{user_id, access_level}]` ⊆ the tombstone snapshot (F6g `check_members`).
+pub(crate) fn shared_adoption_request(home: &Path, env: &AdoptEnv<'_>, actor: &str, employee: &str, incarnation: u32,
+    target: Option<&str>, members: Value) -> Result<Value, RpcError> {
+    let employee = hex16(employee)?;
+    let target = target_label(target)?;
+    if !members.is_array() { return Err(RpcError::Invalid); }
+    let request = adopt::file_adoption(home, env, employee, incarnation, target, Filer::Shared { requester: actor, members })?;
+    adoption_filed(home, &request, env.now)
+}
+
+/// After the confirmation store applied `item` (the Employee backend commits
+/// an adoption inside that call): `true` when it was an adoption, so the
+/// caller rescans the registry; the approval notice (never dropped) goes to
+/// the log-eligible Admins and the owner's tombstone-time address.
+pub(crate) fn adoption_committed(home: &Path, item: &duduclaw_migration::contract::ConfirmationItem, approver: &str, now: i64) -> bool {
+    let Ok(Some(reference)) = adopt::proposal_ref(item) else { return false };
+    let key = adopt::proposal_key(item);
+    let found = engine::open_apply(home).ok().and_then(|db| {
+        let request = adopt::request_for_proposal(&db, reference.employee, reference.incarnation, &key).ok().flatten()?;
+        let target = adopt::adoption_columns(&db, &request.request_id).ok().and_then(|(target, _)| target);
+        Some((request, target))
+    });
+    if let (Some((request, target)), Ok(Some(q))) = (found, row_of(home, reference.employee, reference.incarnation)) {
+        notify(home, &q, "isolation.employee_adopted", json!({"request_id": request.request_id, "approver_user_id": approver,
+            "self_approved": request.self_approved, "target_label": target}), false, now);
+    }
+    true
+}
+
+/// What boot recovery did: `(old label, request id, action)` per adoption,
+/// and `(label, code)` per label whose recovery refused (retried at the
+/// next request, proposal or boot).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct BootAdoptions {
+    pub(crate) done: Vec<(String, String, &'static str)>,
+    pub(crate) failed: Vec<(String, &'static str)>,
+}
+
+/// Boot (F6g §3.6, §3.10 step 6): `recover_adoptions` for every label with
+/// an `adopting` row. A home without apply.db has nothing to recover.
+pub(crate) fn recover_adoptions_at_boot(home: &Path, env: &AdoptEnv<'_>) -> Result<BootAdoptions, RpcError> {
+    if matches!(std::fs::symlink_metadata(home.join(crate::isolation_lifecycle::APPLY_DB)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(BootAdoptions::default());
+    }
+    let labels: Vec<String> = {
+        let db = engine::open_apply(home)?;
+        let mut statement = db.prepare("SELECT DISTINCT label FROM employee_quarantine WHERE seal='adopting' ORDER BY label")
+            .map_err(|_| Refusal::Unavailable)?;
+        let rows = statement.query_map([], |r| r.get(0)).map_err(|_| Refusal::Unavailable)?
+            .collect::<Result<_, _>>().map_err(|_| Refusal::Unavailable)?;
+        rows
+    };
+    let mut out = BootAdoptions::default();
+    for label in labels {
+        match adopt::recover_adoptions(home, env, &label) {
+            Ok(done) => out.done.extend(done.into_iter().map(|(request, action)| (label.clone(), request, action))),
+            Err(error) => out.failed.push((label, error.code())),
+        }
+    }
+    Ok(out)
+}
+
+/// Production boot recovery (protected mode): the schema-2 root, catalog
+/// routes, run stopper and F6c2 rule (`isolation_adopt::with_production_env`).
+pub(crate) fn recover_adoptions_on_boot(home: &Path, now: i64) -> Result<BootAdoptions, RpcError> {
+    adopt::with_production_env(home, "system", now, |env| recover_adoptions_at_boot(home, env))
 }
 
 /// §3.5 mutual exclusion (`RESTORE_IN_PROGRESS`) for the tombstone and

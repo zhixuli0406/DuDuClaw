@@ -141,6 +141,8 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "me.isolation.request_restore" | "me.isolation.cancel_restore"
         | "isolation.employee_restore_decide" | "isolation.employee_restore_cancel"
         | "isolation.employee_restore_regrant" | "isolation.employee_retire_propose"
+        // F6g 由新員工接手（申請）
+        | "me.isolation.request_adoption" | "isolation.shared_adoption_request"
     )
 }
 

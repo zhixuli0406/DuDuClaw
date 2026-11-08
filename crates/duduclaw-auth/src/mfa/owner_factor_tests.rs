@@ -64,11 +64,18 @@ fn restore_purpose_is_canonical() {
     assert!(restore_purpose(&EMPLOYEE.to_uppercase(), 0).is_none());
     assert!(restore_purpose("abc", 0).is_none());
     let bad: Vec<String> = vec!["".into(), "restore:".into(), "restore:x:0".into(), format!("restore:{EMPLOYEE}:"),
-        format!("restore:{EMPLOYEE}:01"), format!("restore:{EMPLOYEE}:0:1"), format!("login:{EMPLOYEE}:0")];
+        format!("restore:{EMPLOYEE}:01"), format!("restore:{EMPLOYEE}:0:1"), format!("login:{EMPLOYEE}:0"),
+        "adopt:".into(), "adopt:x:0".into(), format!("adopt:{EMPLOYEE}:01"), format!("adopt:{EMPLOYEE}:0:1"),
+        format!("adoptrestore:{EMPLOYEE}:0")];
     for purpose in &bad {
         assert!(!valid_purpose(purpose), "{purpose}");
     }
     assert!(valid_purpose(&purpose(0)));
+    // F6g adoption: its own canonical purpose, never equal to the restore one.
+    assert_eq!(adopt_purpose(EMPLOYEE, 7), Some(format!("adopt:{EMPLOYEE}:7")));
+    assert!(adopt_purpose(&EMPLOYEE.to_uppercase(), 0).is_none());
+    assert!(valid_purpose(&adopt_purpose(EMPLOYEE, 0).unwrap()));
+    assert_ne!(adopt_purpose(EMPLOYEE, 0), restore_purpose(EMPLOYEE, 0));
 }
 
 #[test]

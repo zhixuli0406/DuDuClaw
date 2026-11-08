@@ -34,7 +34,7 @@ async fn restore_rpcs_not_listed_to_ai() {
         assert_eq!(refusal(&frame), NOT_ALLOWED, "{method}");
     }
     // Admin methods refuse non-Admins before reading anything.
-    for method in [DECIDE, CANCEL, REGRANT, RETIRE_PROPOSE] {
+    for method in [DECIDE, CANCEL, REGRANT, RETIRE_PROPOSE, SHARED_ADOPTION_REQUEST] {
         let frame = handler.handle_isolation_employee(method, json!({}), &ctx("u-1", UserRole::Employee)).await;
         assert_eq!(refusal(&frame), ADMIN_REQUIRED, "{method}");
     }
@@ -87,6 +87,65 @@ async fn regrant_requires_admin_step_up_and_audits_gate() {
         forged[extra] = json!(true);
         assert!(serde_json::from_value::<Regrant>(forged).is_err(), "{extra}");
     }
+}
+
+/// `isolation.shared_adoption_request` (F6g): Admin + current MFA at the
+/// gate, then the migration step-up with its CSRF token in the call; no
+/// request field names the requester, an approver or an owner.
+#[tokio::test]
+async fn shared_adoption_request_admin_step_up() {
+    let dir = crate::fs_safe::private_test_home().unwrap();
+    let handler = MethodHandler::new(dir.path().to_path_buf()).await;
+    let params = json!({"employee_id": "0".repeat(32), "incarnation": 0, "members": [], "csrf_token": [7u8; 32]});
+    assert!(super::super::owns(SHARED_ADOPTION_REQUEST));
+    for role in [UserRole::Employee, UserRole::Manager] {
+        assert_eq!(refusal(&handler.handle_isolation_employee(SHARED_ADOPTION_REQUEST, params.clone(), &ctx("staff", role)).await),
+            ADMIN_REQUIRED);
+    }
+    // An Admin without a current MFA enrolment is refused at the gate.
+    assert_eq!(refusal(&handler.handle_isolation_employee(SHARED_ADOPTION_REQUEST, params.clone(), &ctx("admin-1", UserRole::Admin)).await),
+        ADMIN_REQUIRED);
+    assert_eq!(refusal(&handler.handle_isolation_employee(SHARED_ADOPTION_REQUEST, params.clone(), &ctx("system", UserRole::Admin)).await),
+        NOT_ALLOWED);
+    assert!(serde_json::from_value::<SharedAdoption>(params.clone()).is_ok());
+    let mut with_target = params.clone();
+    with_target["target_label"] = json!("team-y");
+    assert!(serde_json::from_value::<SharedAdoption>(with_target).is_ok());
+    for extra in ["requester_user_id", "approver_user_id", "owner_id", "tenant_id", "step_up", "self_approved"] {
+        let mut forged = params.clone();
+        forged[extra] = json!("x");
+        assert!(serde_json::from_value::<SharedAdoption>(forged).is_err(), "{extra}");
+    }
+    for missing in ["csrf_token", "members"] {
+        let mut partial = params.clone();
+        partial.as_object_mut().unwrap().remove(missing);
+        assert!(serde_json::from_value::<SharedAdoption>(partial).is_err(), "{missing} required");
+    }
+    // The step-up itself: none, stale or a wrong token refuse.
+    let now = 10_000;
+    let proof = |at: i64| duduclaw_auth::mfa::MigrationConfirmationSession { verified_at: at as u64, csrf: [7; 32] };
+    assert!(authorize_step_up(None, "admin-1", &[7; 32], now).is_err());
+    assert!(authorize_step_up(Some(&proof(now - 301)), "admin-1", &[7; 32], now).is_err());
+    assert!(authorize_step_up(Some(&proof(now)), "00000000-0000-4000-8000-000000000001", &[8; 32], now).is_err());
+}
+
+/// `me.isolation.request_adoption`: the owner's proof fields only; the
+/// adoption challenge is the restore challenge with `for_adoption`.
+#[test]
+fn owner_adoption_schema_has_no_owner_field() {
+    let ok = json!({"employee_id": "0".repeat(32), "incarnation": 0, "factor": "passkey", "challenge_id": "c".repeat(64),
+        "credential": {"id": "x"}, "target_label": "alice-next"});
+    assert!(serde_json::from_value::<OwnerAdoption>(ok.clone()).is_ok());
+    for extra in ["owner_id", "user_id", "requester_user_id", "purpose", "members"] {
+        let mut forged = ok.clone();
+        forged[extra] = json!("adopt:x:0");
+        assert!(serde_json::from_value::<OwnerAdoption>(forged).is_err(), "{extra}");
+    }
+    let challenge = json!({"employee_id": "0".repeat(32), "incarnation": 0, "for_adoption": true});
+    assert!(serde_json::from_value::<OwnerChallenge>(challenge.clone()).is_ok_and(|c| c.for_adoption));
+    let mut forged = challenge;
+    forged["purpose"] = json!("adopt:x:0");
+    assert!(serde_json::from_value::<OwnerChallenge>(forged).is_err());
 }
 
 /// Owner requests carry the factor proof; no field names an owner.

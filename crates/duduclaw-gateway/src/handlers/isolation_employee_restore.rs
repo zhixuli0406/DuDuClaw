@@ -10,6 +10,11 @@
 //! | `isolation.employee_restore_decide` / `employee_restore_cancel` | Admin + MFA + step-up |
 //! | `isolation.employee_restore_regrant` | Admin + MFA + step-up (one listed item, audited) |
 //! | `isolation.employee_retire_propose` | Admin + MFA + step-up (F6l) |
+//! | `me.isolation.request_adoption` | owner + strongest factor (Q2), purpose `adopt:<employee_id>:<incarnation>` (F6g) |
+//! | `isolation.shared_adoption_request` | Admin + MFA + step-up (F6g, member selection ⊆ snapshot) |
+//!
+//! The adoption challenge is `me.isolation.restore_challenge` with
+//! `for_adoption: true` (same issuer; the server builds the `adopt:` purpose).
 //!
 //! Refusals are `{code, message}` objects (code: `isolation_restore_rpc::RpcError::code`).
 //! The bodies live in `crate::isolation_restore_rpc` (blocking pool).
@@ -28,14 +33,41 @@ pub(super) const DECIDE: &str = "isolation.employee_restore_decide";
 pub(super) const CANCEL: &str = "isolation.employee_restore_cancel";
 pub(super) const REGRANT: &str = "isolation.employee_restore_regrant";
 pub(super) const RETIRE_PROPOSE: &str = "isolation.employee_retire_propose";
-pub(super) const METHODS: [&str; 8] = [LIST_RESTORABLE, RESTORE_CHALLENGE, REQUEST_RESTORE, CANCEL_RESTORE, DECIDE, CANCEL, REGRANT,
-    RETIRE_PROPOSE];
+/// F6g adoption requests (engine `isolation_adopt::file_adoption`).
+pub(super) const REQUEST_ADOPTION: &str = "me.isolation.request_adoption";
+pub(super) const SHARED_ADOPTION_REQUEST: &str = "isolation.shared_adoption_request";
+pub(super) const METHODS: [&str; 10] = [LIST_RESTORABLE, RESTORE_CHALLENGE, REQUEST_RESTORE, CANCEL_RESTORE, DECIDE, CANCEL, REGRANT,
+    RETIRE_PROPOSE, REQUEST_ADOPTION, SHARED_ADOPTION_REQUEST];
 
 /// `me.isolation.restore_challenge`: the row the proof will be bound to (a
-/// cancel names the row of its request).
+/// cancel names the row of its request). `for_adoption`: the challenge of a
+/// `request_adoption` (purpose `adopt:…`, built by the server).
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct OwnerChallenge { pub(super) employee_id: String, pub(super) incarnation: u32 }
+pub(super) struct OwnerChallenge {
+    pub(super) employee_id: String, pub(super) incarnation: u32,
+    #[serde(default)] pub(super) for_adoption: bool,
+}
+/// `me.isolation.request_adoption`: the proof fields of [`OwnerRequest`]
+/// plus the optional target label (default: the original label).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OwnerAdoption {
+    pub(super) employee_id: String, pub(super) incarnation: u32, pub(super) factor: String,
+    #[serde(default)] pub(super) target_label: Option<String>,
+    #[serde(default)] pub(super) code: String,
+    #[serde(default)] pub(super) challenge_id: Option<String>,
+    #[serde(default)] pub(super) credential: Option<Value>,
+}
+/// `isolation.shared_adoption_request`: `members` = `[{user_id, access_level}]`
+/// ⊆ the tombstone snapshot at ≤ its level (empty: re-bound later).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SharedAdoption {
+    pub(super) employee_id: String, pub(super) incarnation: u32,
+    #[serde(default)] pub(super) target_label: Option<String>,
+    pub(super) members: Value, pub(super) csrf_token: [u8; 32],
+}
 /// `code`: TOTP or email code; `challenge_id`: passkey / email (from
 /// `restore_challenge`); `credential`: the passkey assertion.
 #[derive(serde::Deserialize)]
@@ -99,6 +131,18 @@ pub(super) fn with_env<T>(home: &Path, actor: &str, rule: &LogRule, cap: usize, 
     f(&env)
 }
 
+/// The production collaborators of one adoption request (F6g): schema-2
+/// root, catalog routes, run stopper, F6c2 rule, the license cap read here
+/// (L2). The request step never transforms, so no hooks.
+pub(super) fn with_adopt_env<T>(home: &Path, actor: &str, cap: usize, now: i64,
+    f: impl FnOnce(&crate::isolation_adopt::AdoptEnv<'_>) -> T) -> T {
+    let routes = CatalogRoutes(home);
+    let env = crate::isolation_adopt::AdoptEnv { root: &crate::isolation_retire::SpawndRetireRoot, routes: &routes,
+        runs: &crate::isolation_quarantine::SpawndRunStopper, rule: &duduclaw_auth::admin_approval_rule::EligibilityLogRule,
+        hooks: &crate::isolation_adopt::no_hooks, agent_cap: cap, actor, now };
+    f(&env)
+}
+
 impl MethodHandler {
     pub(super) async fn handle_isolation_restore(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
         match self.isolation_restore(method, params, ctx).await {
@@ -141,6 +185,9 @@ impl MethodHandler {
                     let origin = passkey_origin(&home);
                     let mail = crate::mfa_email::available(&home);
                     let issue = |purpose: &str| db.restore_challenge(&user, epoch, purpose, origin.as_deref(), mail, now);
+                    if input.for_adoption {
+                        return Ok(rpc::adoption_challenge(&home, &user, &input.employee_id, input.incarnation, &issue)?);
+                    }
                     Ok(rpc::restore_challenge(&home, &user, &input.employee_id, input.incarnation, &issue)?)
                 }).await?;
                 let ttl = duduclaw_auth::mfa::owner_factor::RESTORE_CHALLENGE_TTL;
@@ -236,6 +283,30 @@ impl MethodHandler {
                     let now = now()?;
                     step_up(db.as_ref(), &user, &session, &input.csrf_token, now)?;
                     Ok(rpc::retire_propose(&home, &user, &input.employee_id, now)?)
+                }).await
+            }
+            REQUEST_ADOPTION => {
+                let input: OwnerAdoption = serde_json::from_value(params).map_err(invalid)?;
+                let cap = self.effective_agent_cap().await;
+                run(move || {
+                    let now = now()?;
+                    let cipher = crate::mfa::Cipher(&home);
+                    let origin = passkey_origin(&home);
+                    let check = |factor, purpose: &str, code: &str| db.restore_owner_factor(&user, epoch, factor,
+                        &RestoreProof { purpose, code, challenge_id: input.challenge_id.as_deref(), credential: input.credential.as_ref() },
+                        &cipher, origin.as_deref(), now);
+                    Ok(with_adopt_env(&home, &user, cap, now, |env| rpc::request_adoption(&home, env, &user, &input.employee_id,
+                        input.incarnation, input.target_label.as_deref(), &input.factor, &input.code, &check))?)
+                }).await
+            }
+            SHARED_ADOPTION_REQUEST => {
+                let input: SharedAdoption = serde_json::from_value(params).map_err(invalid)?;
+                let (session, cap) = (session.ok_or(ADMIN_REQUIRED)?, self.effective_agent_cap().await);
+                run(move || {
+                    let now = now()?;
+                    step_up(db.as_ref(), &user, &session, &input.csrf_token, now)?;
+                    Ok(with_adopt_env(&home, &user, cap, now, |env| rpc::shared_adoption_request(&home, env, &user,
+                        &input.employee_id, input.incarnation, input.target_label.as_deref(), input.members))?)
                 }).await
             }
             _ => Err(NOT_ALLOWED.into()),

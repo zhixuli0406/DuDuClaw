@@ -80,6 +80,9 @@ pub(crate) mod isolation_retire;
 // F6d: production seams of the restore/retire engines and the RPC bodies.
 pub(crate) mod isolation_restore_wiring;
 pub(crate) mod isolation_restore_rpc;
+// F6g adoption under a new employee id (§3.10); the request RPCs are F6d's.
+#[allow(dead_code)]
+pub(crate) mod isolation_adopt;
 pub mod migration_import;
 pub mod migration_startup;
 

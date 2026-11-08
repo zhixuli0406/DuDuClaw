@@ -79,6 +79,9 @@ fn enterprise_surfaces_are_listed() {
         "isolation.employee_restore_cancel",
         "isolation.employee_restore_regrant",
         "isolation.employee_retire_propose",
+        // F6g adoption request RPCs (F6d surface)
+        "me.isolation.request_adoption",
+        "isolation.shared_adoption_request",
     ] {
         assert!(
             is_enterprise_only_method(method),
