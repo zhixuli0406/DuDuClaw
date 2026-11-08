@@ -104,18 +104,6 @@ pub fn parent_capabilities(home_dir: &Path, parent: &str) -> Option<Capabilities
         .map(|(_, config)| config.capabilities)
 }
 
-/// Would the `scoped_tools` entry `entry` cover any of `tools` (bare or
-/// `mcp__duduclaw__`-qualified)? Uses the grant gate's own matcher
-/// ([`crate::capability_grants::set_contains_tool`]), so a wildcard entry
-/// that would scope an intrinsic is recognised exactly as the gate would.
-fn scoped_entry_covers_any(entry: &str, tools: &[&str]) -> bool {
-    let set: std::collections::HashSet<String> = std::iter::once(entry.to_string()).collect();
-    tools.iter().any(|tool| {
-        crate::capability_grants::set_contains_tool(&set, tool)
-            || crate::capability_grants::set_contains_tool(&set, &format!("mcp__duduclaw__{tool}"))
-    })
-}
-
 /// Write the scaffold's `.mcp.json` (duduclaw server + identity env) and
 /// verify the file actually landed.
 ///
@@ -412,17 +400,19 @@ pub(super) fn scaffold_with(
     // v1.81: `scoped_tools` only adds "needs an active task grant" refusals,
     // so the copy narrows (grants are keyed by agent id; a member starts with
     // none). Read through the parent's typed parse (fail-safe empty, as for
-    // the parent). An entry that would cover an intrinsic — the bare name, a
-    // qualified spelling or a wildcard — is dropped, so the copy can never
-    // block `team_handoff`. `grant_ttl_secs` is deliberately NOT copied: a
-    // parent TTL longer than the default would make grants minted for the
-    // member outlive the default, i.e. widen.
-    // (An ordinary ephemeral has no intrinsics, so it keeps every entry.)
+    // the parent). Daybreak round 2: copied COMPLETELY — an entry covering an
+    // intrinsic (`team_handoff`, `team_*`, `mcp__duduclaw__*`, `*`) used to be
+    // dropped, and dropping a wildcard silently removed the grant requirement
+    // for every other tool it covers. The intrinsic is instead carved out at
+    // the gates (MCP dispatch §3.65 and `tools/list`), for an exact intrinsic
+    // call by a verified role member only
+    // ([`super::is_role_member_intrinsic_call`]). `grant_ttl_secs` is
+    // deliberately NOT copied: a parent TTL longer than the default would make
+    // grants minted for the member outlive the default, i.e. widen.
     let scoped: Vec<toml::Value> = parent_config
         .capabilities
         .scoped_tools
         .iter()
-        .filter(|entry| !scoped_entry_covers_any(entry, intrinsics))
         .map(|entry| toml::Value::String(entry.clone()))
         .collect();
     if !scoped.is_empty() {

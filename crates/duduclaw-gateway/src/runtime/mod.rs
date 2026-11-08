@@ -852,6 +852,12 @@ pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &
 ///
 /// Never just a warning: the warn line accompanies the refusal or the
 /// narrowing.
+///
+/// Daybreak round 2 #4: only what can reach a native tool counts — a `policy`
+/// whose rules all name MCP tools (e.g. `allow "*"` + `forbid "mail_send"`)
+/// yields no constraint here, so it no longer refuses every coarse spawn.
+/// `scoped_tools` covering a native family counts (no grant is known at
+/// spawn). See `CapabilitiesConfig::native_tool_constraints`.
 pub(crate) fn coarse_native_caps(
     caps: Option<&duduclaw_core::types::CapabilitiesConfig>,
     runtime_name: &str,

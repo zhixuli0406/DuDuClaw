@@ -2722,6 +2722,54 @@ mod tests {
         }
     }
 
+    /// Daybreak round 2 #2/#3/#4 at the Codex spawn: a scoped native tool or a
+    /// policy that reaches the native tools restricts Codex; a policy whose
+    /// rules only name MCP tools does not (it used to refuse every spawn).
+    #[test]
+    fn scoped_tools_and_native_policy_rules_restrict_codex_mcp_only_policy_does_not() {
+        use duduclaw_core::types::{PolicyEffect, ToolPolicy};
+        let rule = |tool: &str, effect: PolicyEffect| ToolPolicy { tool: tool.into(), effect, when: vec![] };
+        let executor = || caps(false, false, &["team_handoff", "Read", "Write", "Edit", "Bash"], &[]);
+
+        // MCP-only policies: the executor keeps its workspace-write argv.
+        for policy in [
+            vec![rule("*", PolicyEffect::Allow), rule("mail_send", PolicyEffect::Forbid)],
+            vec![rule("memory_search", PolicyEffect::Allow)],
+        ] {
+            let mut c = executor();
+            c.policy = policy;
+            assert_eq!(codex_spawn_sandbox(&c).unwrap(), sandbox_args(Some(&c)), "{:?}", c.policy);
+            assert_eq!(
+                declared_sandbox(&codex_spawn_sandbox(&c).unwrap()).as_deref(),
+                Some("workspace-write"),
+                "{:?}",
+                c.policy
+            );
+        }
+
+        // Shell restricted ⇒ refused: scoped `Bash`, a `" * "` allow (not a
+        // kernel wildcard), a shell forbid.
+        let mut scoped_bash = executor();
+        scoped_bash.scoped_tools = vec!["Bash".into()];
+        let mut spaced = executor();
+        spaced.policy = vec![rule(" * ", PolicyEffect::Allow)];
+        let mut shell_forbid = executor();
+        shell_forbid.policy = vec![rule("*", PolicyEffect::Allow), rule("shell_exec", PolicyEffect::Forbid)];
+        for c in [scoped_bash, spaced, shell_forbid] {
+            let error = codex_spawn_sandbox(&c).unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+        }
+
+        // Writes restricted only ⇒ `-s read-only`.
+        let mut scoped_write = executor();
+        scoped_write.scoped_tools = vec!["Write".into()];
+        let mut write_ask = executor();
+        write_ask.policy = vec![rule("*", PolicyEffect::Allow), rule("fs_write", PolicyEffect::Ask)];
+        for c in [scoped_write, write_ask] {
+            assert_eq!(declared_sandbox(&codex_spawn_sandbox(&c).unwrap()).as_deref(), Some("read-only"));
+        }
+    }
+
     /// Unconstrained configs keep exactly the argv they had.
     #[test]
     fn unconstrained_caps_keep_their_codex_sandbox() {

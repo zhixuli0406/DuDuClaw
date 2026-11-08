@@ -470,6 +470,18 @@ pub(crate) async fn visible_tools_in_lane(
                 if !duduclaw_gateway::capability_grants::set_contains_tool(&scoped, tool.name) {
                     continue;
                 }
+                // RM-103 S3: mirror of the dispatch §3.65 exemption — only the
+                // exact intrinsic (`team_handoff`) of a verified role member;
+                // every other tool a wildcard entry covers stays hidden.
+                if gated_caller
+                    && duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+                        home_dir,
+                        effective_agent,
+                        tool.name,
+                    )
+                {
+                    continue;
+                }
                 let granted = match store.as_ref() {
                     Some(s) => s.has_active_grant(effective_agent, tool.name).await,
                     None => false,

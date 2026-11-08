@@ -1563,7 +1563,12 @@ impl McpDispatcher {
         // opened/queried is denied (`has_active_grant` returns false on error).
         // Zero-overhead for the vast majority of agents: an empty `scoped_tools`
         // set short-circuits before any DB work.
-        if employee_policy_applies {
+        //
+        // RM-103 S3 (Daybreak round 2): a role member inherits the employee's
+        // `scoped_tools` complete (wildcards included), so only the exact
+        // intrinsic call by a verified role member (`intrinsic_exempt`) skips
+        // this gate; every other tool a wildcard covers still needs a grant.
+        if employee_policy_applies && !intrinsic_exempt {
             // W3-3b: use the SAME acting-agent resolution as §3.4's capability
             // gate. `principal.client_id` is `gateway-internal` for every
             // MCP child the gateway spawns, so reading
@@ -2765,6 +2770,67 @@ mod tests {
         .await;
         assert_eq!(rec.agent_id, S3_MEMBER);
         assert_eq!(result["error"]["code"], -32003, "{result}");
+    }
+
+    /// Daybreak round 2 #1: the member inherits a wildcard `scoped_tools`
+    /// entry complete. Only the exact intrinsic call is carved out of the
+    /// grant gate; every other tool the wildcard covers still needs a grant,
+    /// and a non-member keeps the gate for `team_handoff` too.
+    #[tokio::test]
+    async fn inherited_wildcard_scoped_tools_exempt_only_the_exact_intrinsic() {
+        for entry in ["*", "mcp__duduclaw__*", "team_*", "team_handoff"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_s3_member(
+                &tmp,
+                &format!("[capabilities]\nscoped_tools = [\"{entry}\", \"memory_search\"]\n"),
+            );
+            let dispatcher = make_dispatcher(&tmp).await;
+            for tool in ["team_handoff", "mcp__duduclaw__team_handoff"] {
+                let result = s3_call(&dispatcher, tool, serde_json::json!({})).await;
+                let msg = result["error"]["message"].as_str().unwrap_or("");
+                assert!(
+                    !msg.contains("階段性授權"),
+                    "{entry}/{tool}: the intrinsic must not need a grant: {result}"
+                );
+            }
+            let other = s3_call(&dispatcher, "memory_search", serde_json::json!({ "query": "x" })).await;
+            assert!(
+                other["error"]["message"].as_str().unwrap_or("").contains("階段性授權"),
+                "{entry}: other scoped tools keep the grant requirement: {other}"
+            );
+            if matches!(entry, "*" | "mcp__duduclaw__*") {
+                // Covered only by the wildcard entry, which is never dropped.
+                let other =
+                    s3_call(&dispatcher, "memory_store", serde_json::json!({ "content": "x" })).await;
+                assert!(
+                    other["error"]["message"].as_str().unwrap_or("").contains("階段性授權"),
+                    "{entry}: a wildcard-covered tool keeps the grant requirement: {other}"
+                );
+            }
+
+            // Not a verified role member: the intrinsic is gated like any tool.
+            let dir = tmp
+                .path()
+                .join("agents")
+                .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+                .join(S3_MEMBER);
+            let raw = std::fs::read_to_string(dir.join("agent.toml")).unwrap();
+            std::fs::write(dir.join("agent.toml"), raw.replace("[team_member]", "[not_a_member]"))
+                .unwrap();
+            let plain = s3_call(&dispatcher, "team_handoff", serde_json::json!({})).await;
+            assert_eq!(plain["error"]["code"], -32003, "{entry}: {plain}");
+        }
+    }
+
+    async fn s3_call(dispatcher: &McpDispatcher, tool: &str, args: Value) -> Value {
+        dispatcher
+            .dispatch_tool_call(
+                &s3_member_principal(),
+                &make_ns_ctx(false),
+                &make_params(tool, args),
+                &serde_json::json!(1),
+            )
+            .await
     }
 
     // ── Test: rate-limit exceeded returns JSON-RPC -32029 ────────────────────

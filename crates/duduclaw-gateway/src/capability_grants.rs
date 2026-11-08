@@ -452,17 +452,73 @@ pub fn scoped_disallow_for_agent_dir(agent_dir: &Path) -> Vec<String> {
         _ => HashSet::new(),
     };
 
+    // RM-103 S3 (Daybreak round 2 #1): a team role member inherits the
+    // employee's `scoped_tools` complete. A `--disallowedTools` entry cannot
+    // carve the member's intrinsic (`team_handoff`) out of `*` / `team_*` /
+    // `mcp__duduclaw__*`, so for a verified member such an entry is expanded
+    // into every OTHER tool it covers (Claude built-ins and DuDuClaw MCP
+    // tools) instead of being passed through or dropped.
+    let member = crate::ephemeral::is_verified_role_member_dir(agent_dir);
     let mut out = Vec::new();
     for tool in scoped {
         let has_grant = granted.iter().any(|g| tool_token_matches(g, &tool));
-        if !has_grant {
-            out.push(format!("mcp__duduclaw__{tool}"));
-            out.push(tool);
+        if has_grant {
+            continue;
         }
+        if member && scoped_entry_covers_intrinsic(&tool) {
+            for covered in member_scoped_expansion(&tool) {
+                if !granted.iter().any(|g| tool_token_matches(g, &covered)) {
+                    if duduclaw_core::tool_effect::CLAUDE_CLI_BUILTIN_TOOLS.contains(&covered.as_str()) {
+                        out.push(covered);
+                    } else {
+                        out.push(format!("mcp__duduclaw__{covered}"));
+                        out.push(covered);
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(format!("mcp__duduclaw__{tool}"));
+        out.push(tool);
     }
     out.sort();
     out.dedup();
     out
+}
+
+/// Does the `scoped_tools` entry cover a team intrinsic
+/// ([`crate::ephemeral::TEAM_INTRINSIC_TOOLS`]), bare or
+/// `mcp__duduclaw__`-qualified, by the grant gate's own matcher?
+fn scoped_entry_covers_intrinsic(entry: &str) -> bool {
+    let set: HashSet<String> = std::iter::once(entry.to_string()).collect();
+    crate::ephemeral::TEAM_INTRINSIC_TOOLS.iter().any(|tool| {
+        set_contains_tool(&set, tool) || set_contains_tool(&set, &format!("mcp__duduclaw__{tool}"))
+    })
+}
+
+/// Every Claude built-in and DuDuClaw MCP tool (bare names) the `scoped_tools`
+/// entry covers, except the team intrinsics.
+fn member_scoped_expansion(entry: &str) -> Vec<String> {
+    let set: HashSet<String> = std::iter::once(entry.to_string()).collect();
+    let covers = |name: &str| {
+        set_contains_tool(&set, name) || set_contains_tool(&set, &format!("mcp__duduclaw__{name}"))
+    };
+    let intrinsic = |name: &str| {
+        crate::ephemeral::TEAM_INTRINSIC_TOOLS
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(name))
+    };
+    duduclaw_core::tool_effect::CLAUDE_CLI_BUILTIN_TOOLS
+        .iter()
+        .copied()
+        .filter(|name| set_contains_tool(&set, name))
+        .chain(
+            duduclaw_core::mcp_tool_defs::tools()
+                .map(|def| def.name)
+                .filter(|name| !intrinsic(*name) && covers(*name)),
+        )
+        .map(str::to_string)
+        .collect()
 }
 
 /// Synchronous read of the set of tools an agent currently holds an active
@@ -749,6 +805,59 @@ mod tests {
         assert!(disallow.contains(&"mcp__duduclaw__send_message".to_string()));
         let _ = std::fs::remove_dir_all(home.join(dir.file_name().unwrap()));
         let _ = std::fs::remove_dir_all(&bad_db);
+    }
+
+    /// RM-103 S3 (Daybreak round 2 #1): a verified role member's inherited
+    /// wildcard `scoped_tools` entry is expanded for `--disallowedTools`
+    /// into every covered tool except the intrinsic — never passed through
+    /// (it would block `team_handoff`) and never dropped (it would unscope
+    /// everything else). A non-member keeps the raw entry.
+    #[test]
+    fn spawn_disallow_expands_a_role_members_intrinsic_covering_wildcard() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join("agents")
+            .join(crate::ephemeral::EPHEMERAL_DIR_NAME)
+            .join("eph-boss-r1-executor-ab12cd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let member_toml = |scoped: &str| {
+            format!(
+                "[agent]\nname = \"eph-boss-r1-executor-ab12cd\"\n\
+                 [team_member]\nrole = \"executor\"\ntask_id = \"t\"\nround = 1\nparent = \"boss\"\n\
+                 [capabilities]\nscoped_tools = [{scoped}]\n"
+            )
+        };
+        std::fs::write(
+            dir.join("ephemeral.toml"),
+            "parent = \"boss\"\ntier = \"standard\"\n\
+             created_at = \"2026-11-08T00:00:00Z\"\nexpires_at = \"2099-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+        for scoped in ["\"*\"", "\"mcp__duduclaw__*\"", "\"team_*\"", "\"team_handoff\", \"memory_search\""] {
+            std::fs::write(dir.join("agent.toml"), member_toml(scoped)).unwrap();
+            assert!(crate::ephemeral::is_verified_role_member_dir(&dir));
+            let d = scoped_disallow_for_agent_dir(&dir);
+            for forbidden in ["team_handoff", "mcp__duduclaw__team_handoff", "*", "mcp__duduclaw__*", "team_*"] {
+                assert!(!d.contains(&forbidden.to_string()), "{scoped}: {forbidden} in {d:?}");
+            }
+            if scoped != "\"team_*\"" {
+                assert!(d.contains(&"mcp__duduclaw__memory_search".to_string()), "{scoped}: {d:?}");
+            }
+            if scoped == "\"*\"" {
+                assert!(d.contains(&"Bash".to_string()), "{d:?}");
+                assert!(d.contains(&"Write".to_string()), "{d:?}");
+            }
+        }
+
+        // Not a verified member: the wildcard passes through unchanged.
+        std::fs::write(
+            dir.join("agent.toml"),
+            member_toml("\"*\"").replace("[team_member]", "[not_a_member]"),
+        )
+        .unwrap();
+        assert!(!crate::ephemeral::is_verified_role_member_dir(&dir));
+        assert!(scoped_disallow_for_agent_dir(&dir).contains(&"*".to_string()));
     }
 
     // ── scoped_tools parser ─────────────────────────────────

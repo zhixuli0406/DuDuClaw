@@ -153,7 +153,28 @@ pub fn is_role_member_intrinsic_call(home_dir: &Path, agent_id: &str, tool_name:
     let Some(dir) = resolve_agent_dir(home_dir, agent_id) else {
         return false;
     };
-    match (read_role_member(&dir), read_meta(&dir)) {
+    is_verified_role_member_dir(&dir)
+}
+
+/// RM-103 S3: is `dir` a team role member scaffold whose `[team_member]`
+/// record parses completely and names the same parent as its
+/// `ephemeral.toml`? The record half of [`is_role_member_intrinsic_call`],
+/// for callers that hold a scaffold directory rather than an id (the Claude
+/// spawn's `--disallowedTools` mirror of `scoped_tools`). The directory must
+/// sit directly under [`EPHEMERAL_DIR_NAME`] and carry an ephemeral id.
+pub fn is_verified_role_member_dir(dir: &Path) -> bool {
+    let in_ephemeral_root = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == std::ffi::OsStr::new(EPHEMERAL_DIR_NAME));
+    let id_ok = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_ephemeral_id);
+    if !in_ephemeral_root || !id_ok {
+        return false;
+    }
+    match (read_role_member(dir), read_meta(dir)) {
         (Some(record), Some(meta)) => record.parent == meta.parent,
         _ => false,
     }

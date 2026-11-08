@@ -2456,8 +2456,25 @@ const DUDUCLAW_MCP_PREFIX: &str = "mcp__duduclaw__";
 /// `mcp__duduclaw__*`. Built-ins (`Bash`, `Read`, …) are CamelCase and never
 /// take that path. The scaffold's `check_tool_subset_with_intrinsics` remains
 /// the authoritative backstop — this can only ever refuse more, not less.
+///
+/// Daybreak round 2 #5: a qualified request (`Bash(git:*)`) is covered by a
+/// bare base entry of the same tool (`Bash`) — bare → qualified is a
+/// narrowing. Never the reverse: a bare request is not covered by a
+/// qualified base entry, and two different qualifiers do not cover each
+/// other (only exact equality does).
 fn base_covers(base: &[String], tool: &str) -> bool {
     let tool = tool.trim();
+    if let Some((tool_base, _)) = tool.split_once('(') {
+        let tool_base = tool_base.trim();
+        if !tool_base.is_empty()
+            && !tool_base.contains('*')
+            && base
+                .iter()
+                .any(|entry| !entry.contains('(') && tool_name_eq(entry, tool_base))
+        {
+            return true;
+        }
+    }
     let lower_snake = !tool.is_empty()
         && tool
             .chars()
@@ -7493,6 +7510,54 @@ skill_security_scan = false
             narrow_tools(base, &scope(&["  "], &[])),
             Err(ToolScopeRefusal::Malformed(_))
         ));
+    }
+
+    /// Daybreak round 2 #5: bare → qualified is a narrowing (accepted, and the
+    /// scaffold's subset check agrees); qualified → bare, or a different
+    /// qualifier, is still an escalation; a bare parent deny vetoes the
+    /// qualified spelling at the scaffold.
+    #[test]
+    fn narrow_tools_accepts_a_qualified_narrowing_of_a_bare_base_tool() {
+        use crate::ephemeral::{TEAM_INTRINSIC_TOOLS, check_tool_subset_with_intrinsics};
+        let parent = parent_caps(&["Read", "Bash"], &[]);
+        let out = narrow_tools(plan_tools(Role::Executor, &parent), &scope(&["Read", "Bash(git:*)"], &[]))
+            .unwrap();
+        assert_eq!(
+            out.tools,
+            vec!["team_handoff".to_string(), "Read".to_string(), "Bash(git:*)".to_string()]
+        );
+        check_tool_subset_with_intrinsics(&parent, &out.tools, TEAM_INTRINSIC_TOOLS).unwrap();
+        // Unrestricted employee: the default list holds bare `Bash`.
+        let open = parent_caps(&[], &[]);
+        let out = narrow_tools(plan_tools(Role::Executor, &open), &scope(&["Bash(git:*)"], &[])).unwrap();
+        assert!(out.tools.iter().any(|t| t == "Bash(git:*)"), "{:?}", out.tools);
+        check_tool_subset_with_intrinsics(&open, &out.tools, TEAM_INTRINSIC_TOOLS).unwrap();
+
+        // Never the reverse, never a different qualifier.
+        let narrow_parent = parent_caps(&["Read", "Bash(git:*)"], &[]);
+        let base = plan_tools(Role::Executor, &narrow_parent);
+        for wider in ["Bash", "Bash(rm:*)", "Bash(*)", "Write(src:*)"] {
+            assert!(
+                matches!(narrow_tools(base.clone(), &scope(&[wider], &[])), Err(ToolScopeRefusal::Escalation(_))),
+                "{wider}"
+            );
+        }
+        let exact = narrow_tools(base, &scope(&["Bash(git:*)"], &[])).unwrap();
+        check_tool_subset_with_intrinsics(&narrow_parent, &exact.tools, TEAM_INTRINSIC_TOOLS).unwrap();
+        for wider in [&["Bash"][..], &["Bash(rm:*)"][..]] {
+            let wider: Vec<String> = wider.iter().map(|s| s.to_string()).collect();
+            assert!(check_tool_subset_with_intrinsics(&narrow_parent, &wider, TEAM_INTRINSIC_TOOLS).is_err());
+        }
+        // A wildcard base name is not a bare tool.
+        let base = plan_tools(Role::Executor, &parent_caps(&["mcp__duduclaw__*"], &[]));
+        assert!(matches!(
+            narrow_tools(base, &scope(&["Bash(git:*)"], &[])),
+            Err(ToolScopeRefusal::Escalation(_))
+        ));
+        // A bare parent deny vetoes the qualified spelling at the scaffold.
+        let denying = parent_caps(&["Read", "Bash"], &["Bash"]);
+        let req = vec!["Bash(git:*)".to_string()];
+        assert!(check_tool_subset_with_intrinsics(&denying, &req, TEAM_INTRINSIC_TOOLS).is_err());
     }
 
     #[test]

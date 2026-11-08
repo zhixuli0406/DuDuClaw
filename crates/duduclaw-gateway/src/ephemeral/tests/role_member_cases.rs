@@ -478,9 +478,11 @@ fn coarse_runtime_sandbox_follows_the_scaffolded_member_config() {
 
 /// RM-103 S3 (v1.81): `egress_guard` (effective mode = max(global, employee))
 /// and `scoped_tools` (adds grant refusals) are copied because they can only
-/// narrow; `grant_ttl_secs` is not (a longer parent TTL would widen). A
-/// `scoped_tools` entry covering the intrinsic — bare, qualified or by
-/// wildcard — is dropped for a role member only.
+/// narrow; `grant_ttl_secs` is not (a longer parent TTL would widen).
+/// Daybreak round 2 #1: `scoped_tools` is copied COMPLETE, including entries
+/// covering the intrinsic — dropping `*` / `mcp__duduclaw__*` / `team_*` used
+/// to remove every other tool's grant requirement. The intrinsic is carved out
+/// at the gates for a verified member's exact call instead.
 #[test]
 fn role_member_scaffold_copies_only_narrowing_grant_and_egress_settings() {
     let tmp = tempfile::tempdir().unwrap();
@@ -505,7 +507,24 @@ fn role_member_scaffold_copies_only_narrowing_grant_and_egress_settings() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(scoped, vec!["mail_send", "Bash"]);
+    assert_eq!(
+        scoped,
+        vec!["mail_send", "team_handoff", "mcp__duduclaw__team_handoff", "mcp__duduclaw__*", "team_*", "Bash"]
+    );
+    // A parent scoping everything: the member scopes everything too, and only
+    // the exact intrinsic call is exempt from the grant gate.
+    let tmp_all = tempfile::tempdir().unwrap();
+    write_parent(tmp_all.path(), "boss", "[capabilities]\nscoped_tools = [\"*\"]\n");
+    let all = scaffold_role_member(tmp_all.path(), &spec).unwrap();
+    let child_all = member_toml(&all.dir);
+    assert_eq!(
+        child_all["capabilities"]["scoped_tools"].as_array().unwrap(),
+        &vec![toml::Value::String("*".into())]
+    );
+    let set = crate::capability_grants::scoped_tools(&all.dir);
+    assert!(crate::capability_grants::set_contains_tool(&set, "memory_search"));
+    assert!(is_role_member_intrinsic_call(tmp_all.path(), &all.agent_id, "team_handoff"));
+    assert!(!is_role_member_intrinsic_call(tmp_all.path(), &all.agent_id, "memory_search"));
     assert_eq!(
         duduclaw_core::egress_guard::effective_mode(home, Some(&member.dir)),
         duduclaw_core::egress_guard::Mode::Block
