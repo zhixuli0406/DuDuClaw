@@ -22,6 +22,11 @@ Before v1.81 `code_map` scanned any directory the MCP server could read (default
 
 **Behaviour change:** a non-main employee whose `agent.toml` has no `can_create_agents` key could create employees before v1.81 and is refused now. To keep that, turn it on in the dashboard (「工具與權限」, admin only).
 
+## Team delegation keeps the employee's restrictions (v1.81)
+
+- **A planner packet's `tool_scope` can only narrow an executor.** A non-empty `allowed` limits the executor to those tools (plus `team_handoff`); naming any tool the employee does not hold refuses that delegation and writes a `team_tool_scope_escalation` Warning audit row. `denied` is removed from the executor's tools and added to the member's `denied_tools`. Role members (and ordinary ephemeral helpers) also inherit the employee's `approval_required_tools`, `irreversible_tools`, `maybe_irreversible_tools`, `action_rules`, `policy`, `egress_guard` and `scoped_tools`, so they face the same approvals as the employee. `grant_ttl_secs` is not inherited, because a longer parent TTL would extend the member's grants.
+- **Inherited approvals never block the team's own channel.** For a role member, the MCP gate skips the inherited `action_rules`, `policy`, approval lists and `scoped_tools` grant requirement for `team_handoff` only (`ephemeral::is_role_member_intrinsic_call`; it requires a complete `[team_member]` record whose parent matches `ephemeral.toml`). `scoped_tools` is copied complete, wildcards included, so every other tool a wildcard covers still needs a grant. `allowed_tools`, an explicit `denied_tools` entry, `[permissions]` and the egress guard still apply.
+
 ## Customer company identity (v1.80.0)
 
 Customer company name and logo are separate from signed distributor branding. `company.get` and `company.update` are explicit Admin RPCs; `company.update` accepts only the name and optional logo removal, and rejects the former `logo_base64` field. Company names reject control, line-separator and Unicode format (`Cf`, including bidi override/isolate) characters. Updates repeat the live identity check under the existing configuration write lock. The `company_info` audit records actor, method and outcome without the image or name. Advanced settings navigation and routes are Admin-only; moving controls there does not relax their existing RPC permissions.
