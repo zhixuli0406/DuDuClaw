@@ -2369,6 +2369,7 @@ dependencies = [
  "duduclaw-core",
  "duduclaw-security",
  "fs2",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

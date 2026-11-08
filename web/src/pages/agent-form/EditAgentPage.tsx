@@ -27,6 +27,7 @@ import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { normalizeActions } from '@/components/odoo/permissions';
 import { OdooPermissionsEditor } from '@/components/odoo/OdooPermissionsEditor';
+import { OdooPermissionSummary } from '@/components/odoo/OdooPermissionSummary';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { AccountPoolSelect } from '@/components/shared/AccountPoolSelect';
 import { SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
@@ -437,6 +438,17 @@ function EditAgentPageContent() {
   // ODO — per-agent Odoo override form. Non-secret fields prefill from
   // inspect; api_key/password stay write-only.
   const [odoo, setOdoo] = useState<OdooFormState>(DEFAULT_ODOO_FORM);
+  const [odooEffective, setOdooEffective] = useState<import('@/lib/api').OdooAgentConfig | null>(null);
+  useEffect(() => {
+    let active = true;
+    setOdooEffective(null);
+    if (agent) {
+      api.odoo.agentConfigGet(agent.name).then((config) => {
+        if (active) setOdooEffective(config);
+      }).catch(() => { if (active) setOdooEffective(null); });
+    }
+    return () => { active = false; };
+  }, [agent]);
 
   // v1.68 W1 — the new per-employee controls (budget daily cap, effort,
   // minimal context, team roles, guardrails, decision continuity, night
@@ -1627,6 +1639,9 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowText label={t('agents.odoo.profile')} description={t('agents.odoo.profile.hint')} value={odoo.profile} placeholder="default" onChange={(v) => updateOdoo('profile', v)} />
             </SettingsCard>
+            {odooEffective && <OdooPermissionSummary actions={agent.odoo?.allowed_actions ?? []}
+              effectiveBlockedModels={odooEffective.effective_blocked_models}
+              unblockInherited={odooEffective.unblock_inherited} />}
             <OdooPermissionsEditor key={agent.name} value={odoo}
               defaultAccount={!odoo.url && !odoo.db && !odoo.username && !odoo.company_ids
                 && !odoo.api_key && !odoo.password && !agent.odoo_api_key_set && !agent.odoo_password_set

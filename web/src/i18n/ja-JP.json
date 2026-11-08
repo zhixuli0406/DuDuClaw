@@ -1,4 +1,7 @@
 {
+  "odoo.permissions.effectiveBlockedModels": "現在有効なブロック項目",
+  "odoo.permissions.unblockInherited": "全体設定を継承",
+  "odoo.permissions.noBlockedModels": "ブロック項目なし",
   "agent.selection.revoked": "この AI スタッフは現在利用できません。選び直してください。",
   "settings.update.failure.download": "更新をダウンロードできません。接続を確認し、更新を再確認してください。",
   "settings.update.failure.verify": "更新ファイルの検証に失敗したため、インストールを停止しました。公式版を再ダウンロードしてください。",
@@ -10186,5 +10189,9 @@
   "google.chatRead.title": "Google Chat の読み取り",
   "google.chatRead.hint": "有効にした後、ユーザーは「自分の接続」で Google に再接続し、Chat の権限を選択してください。AI 従業員はそのアカウントのスペースと最近のメッセージを読み取れます。メッセージ送信や添付ファイルのダウンロードは行いません。",
   "google.chatRead.setup": "OAuth クライアントの Google Cloud プロジェクトで Google Chat API を有効にして、Chat アプリを設定してください。Workspace 管理者によるアプリの許可が必要な場合もあります。",
-  "myConnections.service.chat": "Google Chat"
+  "myConnections.service.chat": "Google Chat",
+  "odoo.scan.employeeResults": "社員ごとのスキャン結果",
+  "odoo.scan.globalConnection": "全体の接続",
+  "odoo.scan.employeeOk": "準備完了",
+  "odoo.scan.employeeFailed": "スキャン失敗"
 }

@@ -1,6 +1,7 @@
 pub mod agent_config;
 pub mod config;
 pub mod connector;
+mod connection_cache;
 pub mod edition;
 pub mod events;
 /// Odoo website Live Chat bridge (DuDuClaw answers as an operator).
