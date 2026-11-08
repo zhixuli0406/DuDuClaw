@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, path::Path};
 use duduclaw_isolation::{capability::EmployeeBinding, ids::EmployeeId};
 use duduclaw_mcp_boundary::VerificationError;
 
+use super::tenant_source::TenantSourceKind;
 use crate::{
     isolation_connectors::{ConnectorCatalog, ConnectorKind, ProductConnectorAccount, Route},
     isolation_lifecycle::{self, EmployeeLifecycle, LifecycleError},
@@ -56,6 +57,7 @@ pub(crate) struct GoogleRoute {
 impl GoogleRoute {
     pub(crate) fn generation(&self) -> u64 { self.route.generation }
     pub(crate) fn kind(&self) -> ConnectorKind { self.route.kind }
+    pub(crate) fn binding(&self) -> &EmployeeBinding { &self.route.binding }
     pub(crate) fn recheck(&self, catalog: &ConnectorCatalog) -> Result<(), VerificationError> {
         let current = catalog.route(&self.route.account)?.ok_or(VerificationError::BindingMismatch)?;
         if current != self.route || !current.active { return Err(VerificationError::BindingMismatch); }
@@ -65,27 +67,34 @@ impl GoogleRoute {
 
 /// Constructible only by catalog/lifecycle reads. A Personal map has exactly
 /// the lifecycle owner as its key and never contains a shared home fallback.
+/// `tenant` (v1.81 E4) is the employee's own SharedTenant route, present only
+/// for a Shared employee and only while a real tenant credential source
+/// (delegation key or service account) is configured.
 pub struct GoogleAccountRoutes {
     pub(crate) personal: BTreeMap<String, GoogleRoute>,
     pub(crate) home: Option<GoogleRoute>,
+    pub(crate) tenant: Option<GoogleRoute>,
 }
 impl GoogleAccountRoutes {
     /// Blocking lifecycle (SQLite/root IPC) and catalog reads; call on the same
     /// blocking boundary as the other live protected authority checks.
-    pub fn read(home: &Path, agent: &str, employee: EmployeeId, binding: &EmployeeBinding,
-        catalog: &ConnectorCatalog) -> Result<Self, GoogleRoutesError> {
-        Self::read_with(agent, employee, binding, catalog,
+    /// `tenant_source` is the kind of the tenant credential source currently
+    /// configured for this employee (from `tenant_source::read`); without one
+    /// SharedTenant routes are never admitted.
+    pub(crate) fn read(home: &Path, agent: &str, employee: EmployeeId, binding: &EmployeeBinding,
+        catalog: &ConnectorCatalog, tenant_source: Option<TenantSourceKind>) -> Result<Self, GoogleRoutesError> {
+        Self::read_with(agent, employee, binding, catalog, tenant_source,
             || isolation_lifecycle::read_lifecycle(home, agent))
     }
 
     fn read_with(agent: &str, employee: EmployeeId, binding: &EmployeeBinding,
-        catalog: &ConnectorCatalog, read: impl Fn() -> Result<EmployeeLifecycle, LifecycleError>)
-        -> Result<Self, GoogleRoutesError> {
+        catalog: &ConnectorCatalog, tenant_source: Option<TenantSourceKind>,
+        read: impl Fn() -> Result<EmployeeLifecycle, LifecycleError>) -> Result<Self, GoogleRoutesError> {
         let lifecycle = read().map_err(lifecycle_error)?;
         if lifecycle.employee != employee || lifecycle.label != agent || &lifecycle.binding != binding {
             return Err(GoogleRoutesError::BindingMismatch);
         }
-        let routes = Self::from_lifecycle(catalog, &lifecycle)?;
+        let routes = Self::from_lifecycle(catalog, &lifecycle, tenant_source)?;
         // A handover/delete/recreate during the catalog read cannot authorize
         // an account using a stale owner or an old root allocation.
         if read().map_err(lifecycle_error)? != lifecycle {
@@ -94,35 +103,51 @@ impl GoogleAccountRoutes {
         Ok(routes)
     }
 
-    fn from_lifecycle(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle)
-        -> Result<Self, GoogleRoutesError> {
+    fn from_lifecycle(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle,
+        tenant_source: Option<TenantSourceKind>) -> Result<Self, GoogleRoutesError> {
         let routes = catalog.active_routes_for(&lifecycle.binding).map_err(|_| GoogleRoutesError::Unavailable)?;
-        // Shared employees admit only the home route. SharedTenant routes have
-        // no tenant-scoped credential source yet (task E4); until one exists a
-        // tenant route would be served from the home credential, so it is
-        // ignored here and a tenant-only catalog is setup-required.
-        let mut routes = routes.into_iter().filter(|route| route.provider == "google" && route.active
-            && route.binding == lifecycle.binding && matches!((&lifecycle.binding, route.kind),
-                (EmployeeBinding::Personal(_), ConnectorKind::Personal)
-                | (EmployeeBinding::Shared(_), ConnectorKind::SharedHome)));
-        let route = routes.next().ok_or(GoogleRoutesError::SetupRequired)?;
-        // The sealed source has one account per owner/home. Multiple routes
-        // have no trustworthy credential mapping: never choose the first one.
-        if routes.next().is_some() { return Err(GoogleRoutesError::SetupRequired); }
-        let account = route.account.as_str().to_owned();
+        // Only this exact binding's active Google rows. For a Shared employee
+        // the binding is Shared(tenant pinned in apply.db), so a route of any
+        // other tenant never appears here.
+        let google: Vec<Route> = routes.into_iter().filter(|route| route.provider == "google" && route.active
+            && route.binding == lifecycle.binding).collect();
+        // The sealed source has one account per owner/home/tenant. Multiple
+        // routes of one kind have no trustworthy credential mapping: never
+        // choose the first one.
+        let unique = |kind: ConnectorKind| -> Result<Option<Route>, GoogleRoutesError> {
+            let mut matching = google.iter().filter(|route| route.kind == kind);
+            let first = matching.next().cloned();
+            if matching.next().is_some() { return Err(GoogleRoutesError::SetupRequired); }
+            Ok(first)
+        };
         match &lifecycle.binding {
-            EmployeeBinding::Personal(owner) => Ok(Self {
-                personal: BTreeMap::from([(owner.as_str().to_owned(), GoogleRoute {
-                    product: ProductConnectorAccount::Personal { account, owner: owner.as_str().to_owned() }, route,
-                })]),
-                home: None,
-            }),
-            EmployeeBinding::Shared(tenant) => Ok(Self {
-                personal: BTreeMap::new(),
-                home: Some(GoogleRoute { product: ProductConnectorAccount::SharedHome {
-                    account, tenant: tenant.as_str().to_owned(),
-                }, route }),
-            }),
+            EmployeeBinding::Personal(owner) => {
+                let route = unique(ConnectorKind::Personal)?.ok_or(GoogleRoutesError::SetupRequired)?;
+                let account = route.account.as_str().to_owned();
+                Ok(Self {
+                    personal: BTreeMap::from([(owner.as_str().to_owned(), GoogleRoute {
+                        product: ProductConnectorAccount::Personal { account, owner: owner.as_str().to_owned() }, route,
+                    })]),
+                    home: None,
+                    tenant: None,
+                })
+            }
+            EmployeeBinding::Shared(tenant) => {
+                let home = unique(ConnectorKind::SharedHome)?;
+                // v1.81 E4: a SharedTenant route is admitted only while a real
+                // tenant credential source exists. Without one it would be
+                // served from the home credential (SR3), so it is ignored and
+                // a tenant-only catalog stays setup-required.
+                let tenant_route = match tenant_source {
+                    Some(_) => unique(ConnectorKind::SharedTenant)?,
+                    None => None,
+                };
+                if home.is_none() && tenant_route.is_none() { return Err(GoogleRoutesError::SetupRequired); }
+                let product = |route: Route| GoogleRoute { product: ProductConnectorAccount::SharedHome {
+                    account: route.account.as_str().to_owned(), tenant: tenant.as_str().to_owned(),
+                }, route };
+                Ok(Self { personal: BTreeMap::new(), home: home.map(product), tenant: tenant_route.map(product) })
+            }
         }
     }
 }

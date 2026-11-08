@@ -152,6 +152,31 @@ fn provision_never_scans_credentials() {
     for secret in ["legacy-", "owner@example.com", "org bot", "company"] { assert!(!audit.contains(secret), "{secret}"); }
 }
 
+#[cfg(unix)]
+#[test]
+fn e4_google_shared_tenant_provision_requires_tenant_source() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    let company = EmployeeBinding::Shared(text("company"));
+    // Home OAuth only: a tenant route would be served from the home credential.
+    std::fs::write(home.path().join("config.toml"), "[integrations]\ngoogle_workspace = true\n").unwrap();
+    assert_eq!(provision(home.path(), "google", ConnectorKind::SharedTenant, &company, "tenant mail", None, &actor()),
+        Err(LifecycleError::Detail(DetailError::Unknown)));
+    // A configured service account whose key cannot be read refuses as unavailable.
+    std::fs::write(home.path().join("config.toml"), "[integrations]\ngoogle_workspace = true\n\
+        [integrations.google_service_account]\nkey_file = \"sa.json\"\nsubject = \"support@customer.com\"\n").unwrap();
+    assert_eq!(provision(home.path(), "google", ConnectorKind::SharedTenant, &company, "tenant mail", None, &actor()),
+        Err(LifecycleError::Detail(DetailError::Unavailable)));
+    assert!(ConnectorCatalog::open(home.path()).unwrap().list(None, 200).unwrap().is_empty());
+    std::fs::write(home.path().join("sa.json"), "{\"client_email\":\"sa@p\",\"private_key\":\"k\"}").unwrap();
+    let account = provision(home.path(), "google", ConnectorKind::SharedTenant, &company, "tenant mail", None, &actor()).unwrap();
+    let route = ConnectorCatalog::open(home.path()).unwrap().route(&account).unwrap().unwrap();
+    assert_eq!((route.provider, route.kind, route.binding), ("google", ConnectorKind::SharedTenant, company));
+    // Other providers' tenant routes are unaffected by the Google gate.
+    std::fs::remove_file(home.path().join("config.toml")).unwrap();
+    assert!(provision(home.path(), "github", ConnectorKind::SharedTenant,
+        &EmployeeBinding::Shared(text("company")), "org bot", None, &actor()).is_ok());
+}
+
 #[test]
 fn admin_actor_refuses_system_and_malformed_ids() {
     for id in ["", "system", "a\nb"] { assert!(AdminActor::verified(id).is_err()); }

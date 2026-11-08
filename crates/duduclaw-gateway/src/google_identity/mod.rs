@@ -39,6 +39,7 @@ pub mod native_tools;
 pub mod requester_gate;
 pub mod resolve;
 pub mod route;
+pub(crate) mod tenant_source;
 
 #[cfg(test)]
 pub(crate) mod route_test_probe;
