@@ -220,20 +220,13 @@ enabled = true
     } else { "main".into() };
     principal.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
     assert_eq!(crate::mcp::record_actor_for(home, &principal.client_id, "main").agent(), Some("main"));
-    // Only process/provider transports and live store facts are doubles. The
-    // capability and resource roots below are the unmodified production output.
-    use duduclaw_gateway::isolation_mcp::{human_authorization, DispatcherFactory, HostTurn};
-    let human = duduclaw_auth::UserContext {
-        credential_epoch: 1, user_id: "owner".into(), email: "owner@example.invalid".into(),
-        role: duduclaw_auth::UserRole::Admin, agent_access: Default::default(),
-        must_change_password: false, team_access: Default::default(), acl_generation: 1,
-    };
-    let snapshot = duduclaw_auth::IsolationAuthoritySnapshot { tenant_id: "tenant".into(),
-        acl_generation: 1, policy_epoch: 1, human: Some(human), personal_owner: None,
-        agent_member_count: 1 };
+    // Only process/provider transports and allocator ReadBack are doubles here.
+    // The issuer reads real Shared lifecycle and users.db evidence.
+    use duduclaw_gateway::isolation_mcp::{test_support::SharedEmployee, DispatcherFactory, HostTurn};
     let employee = context().record().employee;
-    let authorization = human_authorization(home.to_owned(), "main".into(), employee, "owner".into(),
-        1, Lane::Standard, &snapshot,
+    let shared = SharedEmployee::new(home, "main", employee);
+    let snapshot = shared.snapshot();
+    let authorization = shared.authorize(&snapshot, Lane::Standard,
         crate::mcp_isolation_boot::CliDispatcherFactory.ingress_tools(home, "main", Lane::Standard).unwrap(),
         HostTurn { identity: duduclaw_gateway::isolation_egress::RunTurnIdentity {
             turn: "parity-turn".into(), approval_session: None }, egress_turn: None,
@@ -253,7 +246,8 @@ enabled = true
     if background {
         // Exercise the existing background principal verifier separately. The
         // production record-based scheduler currently retains its human owner.
-        record.principal = RunPrincipal::Background { tenant_id: Text::new("tenant".into()).unwrap(), generation: 1 };
+        record.principal = RunPrincipal::Background { tenant_id: Text::new(snapshot.tenant_id.clone()).unwrap(),
+            generation: snapshot.acl_generation };
     }
     record.canonical_bytes().expect("production issuer must produce a signable capability");
     let context = live_context(record);

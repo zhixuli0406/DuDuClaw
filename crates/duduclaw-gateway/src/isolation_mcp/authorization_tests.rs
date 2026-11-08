@@ -2,18 +2,17 @@ use super::*;
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
     Lane, ResourceGrant}, ids::{RunId, Sha256Digest}};
 
-fn snapshot() -> duduclaw_auth::IsolationAuthoritySnapshot {
-    duduclaw_auth::IsolationAuthoritySnapshot { tenant_id: "tenant".into(), acl_generation: 7,
-        policy_epoch: 9, human: Some(duduclaw_auth::UserContext {
-            user_id: "owner".into(), credential_epoch: 3, email: "owner@example.invalid".into(),
-            role: duduclaw_auth::UserRole::Admin, agent_access: Default::default(),
-            team_access: Default::default(), must_change_password: false, acl_generation: 7,
-        }), personal_owner: None, agent_member_count: 1 }
+struct Fixture {
+    dir: tempfile::TempDir,
+    employee: test_support::SharedEmployee,
 }
-fn issue(home: &Path, current: &duduclaw_auth::IsolationAuthoritySnapshot, expiry: Option<u64>)
+impl Fixture {
+    fn path(&self) -> &Path { self.dir.path() }
+    fn snapshot(&self) -> duduclaw_auth::IsolationAuthoritySnapshot { self.employee.snapshot() }
+}
+fn issue(home: &Fixture, current: &duduclaw_auth::IsolationAuthoritySnapshot, expiry: Option<u64>)
     -> Result<super::super::RuntimeAuthorization, VerificationError> {
-    human_authorization(home.to_owned(), "alice".into(), EmployeeId([2;16]), "owner".into(), 3,
-        Lane::Standard, current, List::new(["tasks_update", "computer_workspace_write",
+    home.employee.authorize(current, Lane::Standard, List::new(["tasks_update", "computer_workspace_write",
             "gmail_create_draft", "send_message", "skill_extract", "file_read", "web_extract"]
             .into_iter().map(|name| Text::new(name.into()).unwrap()).collect()).unwrap(),
         super::super::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
@@ -28,16 +27,17 @@ fn record(auth: &super::super::RuntimeAuthorization) -> CapabilityRecord {
         policy_revision: auth.grant.policy_revision, gateway_epoch: [4;16], issued_at: auth.grant.not_before,
         not_before: auth.grant.not_before, expires_at: auth.grant.expires_at, nonce: [5;32], jti: [6;16] }
 }
-fn home() -> tempfile::TempDir {
+fn home() -> Fixture {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("agents/alice/wiki")).unwrap();
-    home
+    let employee = test_support::SharedEmployee::new(home.path(), "alice", EmployeeId([2;16]));
+    Fixture { dir: home, employee }
 }
 
 #[test]
 fn isolation_issuer_real_output_preserves_service_and_connector_scope() {
     let home = home();
-    let auth = issue(home.path(), &snapshot(), None).unwrap();
+    let auth = issue(&home, &home.snapshot(), None).unwrap();
     let record = record(&auth);
     record.canonical_bytes().unwrap();
     assert!(record.employee_scope());
@@ -57,7 +57,7 @@ fn isolation_issuer_real_output_preserves_service_and_connector_scope() {
 #[test]
 fn isolation_issuer_task_background_is_finite_and_canonical() {
     let home = home();
-    let mut auth = issue(home.path(), &snapshot(), None).unwrap();
+    let mut auth = issue(&home, &home.snapshot(), None).unwrap();
     auth.limit_to_task("task-a".into()).unwrap();
     let finite = record(&auth);
     finite.canonical_bytes().unwrap();
@@ -79,20 +79,22 @@ fn isolation_issuer_task_background_is_finite_and_canonical() {
 fn isolation_issuer_no_wiki_root_means_no_confined_wiki_grant() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("agents/alice")).unwrap();
-    let auth = issue(home.path(), &snapshot(), None).unwrap();
+    let employee = test_support::SharedEmployee::new(home.path(), "alice", EmployeeId([2;16]));
+    let home = Fixture { dir: home, employee };
+    let auth = issue(&home, &home.snapshot(), None).unwrap();
     assert!(!record(&auth).io_resources().any(|grant| matches!(grant, ResourceGrant::Wiki { .. })));
     std::os::unix::fs::symlink(home.path(), home.path().join("agents/alice/wiki")).unwrap();
-    assert!(issue(home.path(), &snapshot(), None).is_err());
+    assert!(issue(&home, &home.snapshot(), None).is_err());
 }
 
 #[test]
 fn isolation_issuer_refuses_stale_epoch_wrong_user_and_expiry() {
     let home = home();
-    let mut current = snapshot();
+    let mut current = home.snapshot();
     current.human.as_mut().unwrap().credential_epoch += 1;
-    assert!(issue(home.path(), &current, None).is_err());
-    current = snapshot();
+    assert!(issue(&home, &current, None).is_err());
+    current = home.snapshot();
     current.human.as_mut().unwrap().user_id = "other".into();
-    assert!(issue(home.path(), &current, None).is_err());
-    assert!(issue(home.path(), &snapshot(), Some(1)).is_err());
+    assert!(issue(&home, &current, None).is_err());
+    assert!(issue(&home, &home.snapshot(), Some(1)).is_err());
 }

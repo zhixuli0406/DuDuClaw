@@ -205,6 +205,8 @@ atspi = "0.30"
 songbird = { version = "0.5", optional = true, features = ["driver", "rustls", "receive"] }
 
 [features]
+# Shared lifecycle fixtures for downstream crate tests; never enabled by default.
+test-support = []
 # Integration branch supplies Package E's dependency; Package D alone does not.
 isolation-worker-integration = []
 default = ["dashboard", "desktop", "isolation-worker-integration"]

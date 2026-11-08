@@ -111,6 +111,7 @@ duduclaw-migration = { path = "../duduclaw-migration" }
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+duduclaw-gateway = { workspace = true, features = ["test-support"] }
 duduclaw-license = { workspace = true, features = ["test-support"] }
 duduclaw-core = { workspace = true, features = ["installation-policy-test-hooks"] }
 # P2-B: `Provenance::test_only` exists only with this feature (never in a
