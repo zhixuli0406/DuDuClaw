@@ -597,7 +597,7 @@ fn audit_safe(text: &str) -> String {
     text.chars().map(|c| if c.is_ascii_control() { '?' } else { c }).collect()
 }
 
-fn deny(home_dir: &Path, caller_agent: &str, tool: &str, model: &str, verb: &str, reason: &str) {
+pub(super) fn deny(home_dir: &Path, caller_agent: &str, tool: &str, model: &str, verb: &str, reason: &str) {
     duduclaw_security::audit::append_tool_call(
         home_dir,
         caller_agent,
