@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::{RequestContext, VerificationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin }
+pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin, PublicOrigins }
 impl ResourceKind {
     pub fn of(resource: &ResourceGrant) -> Self {
         match resource {
@@ -22,8 +22,22 @@ impl ResourceKind {
             ResourceGrant::Connector { .. } => Self::Connector,
             ResourceGrant::Recipient { .. } => Self::Recipient,
             ResourceGrant::UrlOrigin { .. } => Self::UrlOrigin,
+            ResourceGrant::PublicOrigins { .. } => Self::PublicOrigins,
         }
     }
+}
+
+/// The only tools a `PublicOrigins` grant (D-H2) can authorize. Their URL
+/// argument must resolve to a granted public HTTPS origin; the host fetch
+/// (`web_fetch_protected_cached`) pins DNS, refuses non-public addresses and
+/// follows no redirect, so the grant never reaches a second origin.
+pub const PUBLIC_ORIGIN_TOOLS: &[&str] = &["web_fetch_cached", "web_extract"];
+
+/// The record's signed `PublicOrigins` grant, only for an employee-scope record.
+fn public_origins_grant(context: &RequestContext) -> Option<&ResourceGrant> {
+    let record = context.record();
+    if !record.employee_scope() { return None; }
+    record.resources.as_slice().iter().find(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. }))
 }
 
 /// Execution and Worker MUST use packages A/E; neither may spawn under the
@@ -391,7 +405,9 @@ pub fn eligible(context: &RequestContext, name: &str) -> bool {
     let record = context.record();
     record.validate_resource_mode().is_ok()
         && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
-        && ((record.employee_scope() && (employee_service_scope(policy) || policy.route == Route::Connector)) || policy.required.iter().all(|kind| record.io_resources()
+        // D-H2: the URL itself is matched against the grant by `authorize`.
+        && ((PUBLIC_ORIGIN_TOOLS.contains(&name) && public_origins_grant(context).is_some())
+        || (record.employee_scope() && (employee_service_scope(policy) || policy.route == Route::Connector)) || policy.required.iter().all(|kind| record.io_resources()
             .any(|grant| ResourceKind::of(grant) == *kind && validate_resource(grant).is_ok()
                 && (*kind != ResourceKind::Employee || grant == &own_employee(context)))))
 }
@@ -461,7 +477,12 @@ pub fn validate_resource(resource: &ResourceGrant) -> Result<(), VerificationErr
     let exact = |value: &str| !value.is_empty() && value != "*" && !value.chars().any(char::is_control);
     let valid = match resource {
         ResourceGrant::Confined { resource } => !matches!(resource.as_ref(), ResourceGrant::Confined { .. }
-            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. }) && validate_resource(resource).is_ok(),
+            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::PublicOrigins { .. })
+            && validate_resource(resource).is_ok(),
+        // Entries are validated by construction/decode (`PublicOrigin::parse`);
+        // the set and employee-scope rules by `validate_resource_mode`. `*` here
+        // is the reviewed D-H2 public-origin authority, not a collection grant.
+        ResourceGrant::PublicOrigins { origins } => !origins.as_slice().is_empty(),
         ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } => true,
         ResourceGrant::Workspace { handle } => exact(handle.as_str()),
         ResourceGrant::Mailbox { id } | ResourceGrant::Task { id } => exact(id.as_str()),
@@ -575,6 +596,26 @@ fn check_selected_resources(policy: &ToolPolicy, arguments: &Value, resources: &
     Ok(())
 }
 
+/// D-H2 call path for [`PUBLIC_ORIGIN_TOOLS`]. The selected resources are
+/// exactly the record's own signed EmployeeScope and PublicOrigins grants: no
+/// resolver is consulted, so host resolution can neither widen nor substitute
+/// the origin. Only the declared tool arguments are accepted, and the URL must
+/// resolve (same WHATWG parser as the fetcher) to an origin the grant permits.
+fn authorize_public_origin(context: &RequestContext, policy: &'static ToolPolicy, arguments: &Value,
+    grant: &ResourceGrant) -> Result<AuthorizedToolCall, VerificationError> {
+    let object = arguments.as_object().ok_or(VerificationError::Invalid)?;
+    let allowed: &[&str] = if policy.name == "web_extract" { &["url", "ttl_seconds", "selector", "format"] }
+        else { &["url", "ttl_seconds"] };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) { return Err(VerificationError::Invalid); }
+    let url = object.get("url").and_then(Value::as_str).ok_or(VerificationError::Invalid)?;
+    crate::resources::permitted_public_origin(grant, url)?;
+    let scope = ResourceGrant::EmployeeScope { id: context.record().employee };
+    crate::resources::require_resource(context, &scope)?;
+    crate::resources::require_resource(context, grant)?;
+    Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),
+        resources: vec![scope, grant.clone()] })
+}
+
 /// Async callers resolve live resources on the bounded authority worker pool.
 /// The returned call owns its context, arguments and exact finite resources.
 pub async fn authorize_async(context: &RequestContext, name: &str, arguments: &Value,
@@ -605,6 +646,11 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
         crate::check_arguments(&data)?;
     } else { crate::check_arguments(arguments)?; }
     if !eligible(context, name) { return Err(VerificationError::Invalid); }
+    if PUBLIC_ORIGIN_TOOLS.contains(&name) {
+        if let Some(grant) = public_origins_grant(context) {
+            return authorize_public_origin(context, policy, arguments, grant);
+        }
+    }
     if context.record().employee_scope() && employee_service_scope(policy) {
         return Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),
             resources: vec![ResourceGrant::EmployeeScope { id: context.record().employee }] });
