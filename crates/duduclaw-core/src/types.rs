@@ -2676,7 +2676,7 @@ impl CapabilitiesConfig {
             let bare_too = self
                 .allowed_tools
                 .iter()
-                .any(|a| !qualified(a) && a.trim().eq_ignore_ascii_case(b));
+                .any(|a| !qualified(a) && a.trim() == b);
             if bare_too {
                 continue;
             }
@@ -3521,6 +3521,20 @@ mod sandbox_level_tests {
 
     fn with_policy(policy: Vec<ToolPolicy>) -> CapabilitiesConfig {
         CapabilitiesConfig { policy, ..Default::default() }
+    }
+
+    /// A bare grant lifts a qualified narrowing only on an exact spelling
+    /// match: `bash` does not lift `Bash(git:*)`.
+    #[test]
+    fn bare_grant_lifts_qualified_narrowing_only_on_exact_case() {
+        let allowed = |entries: &[&str]| CapabilitiesConfig {
+            allowed_tools: entries.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let n = allowed(&["bash", "Bash(git:*)"]).native_tool_constraints();
+        assert!(n.needs_no_shell(), "case-mismatched bare grant must not lift: {n:?}");
+        let n = allowed(&["Bash", "Bash(git:*)"]).native_tool_constraints();
+        assert!(!n.needs_no_shell(), "exact bare grant lifts the narrowing: {n:?}");
     }
 
     /// Daybreak round 2 #2: `scoped_tools` copied to a member restricts the

@@ -673,7 +673,20 @@ pub fn load_agent_capabilities(
     agent_dir: &Path,
 ) -> Option<duduclaw_core::types::CapabilitiesConfig> {
     let path = agent_dir.join("agent.toml");
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            // Unreadable / non-UTF-8 / not a file: the operator's restrictions
+            // are unknown, so fail closed (never log file contents).
+            warn!(
+                path = %path.display(),
+                error_kind = ?e.kind(),
+                "agent.toml unreadable — applying fail-closed capabilities"
+            );
+            return Some(fail_closed_capabilities());
+        }
+    };
     let parsed = match text.parse::<toml::Value>() {
         Ok(v) => v,
         Err(e) => {
@@ -1393,6 +1406,44 @@ mod tests {
             let caps = load_agent_capabilities(dir.path()).unwrap();
             assert!(caps.native_tool_constraints().is_empty(), "{text:?}");
             assert!(coarse_native_caps(Some(&caps), "codex", "agnes", true).unwrap().is_none());
+        }
+    }
+
+    /// A read error other than NotFound (non-UTF-8 Big5 bytes, EACCES, a
+    /// directory) must fail closed; only a missing file means "no constraints".
+    #[test]
+    fn unreadable_agent_toml_fails_closed() {
+        let assert_closed = |dir: &std::path::Path, what: &str| {
+            let caps = load_agent_capabilities(dir)
+                .unwrap_or_else(|| panic!("{what}: must not be None"));
+            let n = caps.native_tool_constraints();
+            assert!(n.needs_no_shell() && !n.no_write.is_empty(), "{what}: {n:?}");
+            assert!(coarse_native_caps(Some(&caps), "codex", "agnes", true).is_err(), "{what}");
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_agent_capabilities(dir.path()).is_none(), "missing file stays None");
+
+        std::fs::write(dir.path().join("agent.toml"), [0xffu8, 0xfe, 0xa4, 0xa4]).unwrap();
+        assert_closed(dir.path(), "non-UTF-8");
+
+        // EISDIR: agent.toml is a directory.
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir2.path().join("agent.toml")).unwrap();
+        assert_closed(dir2.path(), "directory");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir3 = tempfile::tempdir().unwrap();
+            let p = dir3.path().join("agent.toml");
+            std::fs::write(&p, "[capabilities]\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root bypasses mode bits; only assert when the file is truly unreadable.
+            if std::fs::read_to_string(&p).is_err() {
+                assert_closed(dir3.path(), "0o000");
+            }
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
     }
 
