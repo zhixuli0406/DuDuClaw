@@ -459,7 +459,7 @@ async fn a_kept_lease_outlives_its_length_and_the_ttl_once_committed() {
     // Kept and committed: alive well past its 1 s length and past the TTL.
     let id = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
     let lease = b.take_decision_lease(&id, 1).await.unwrap().unwrap();
-    let keeper = b.keep_decision_lease(&id, &lease, 1);
+    let keeper = b.keep_decision_lease(&id, &lease, 1, std::time::Duration::from_secs(60));
     keeper.mark_committed();
     backdate(&b, &id, 600).await;
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
@@ -475,12 +475,57 @@ async fn a_kept_lease_outlives_its_length_and_the_ttl_once_committed() {
     // expires the row (nothing may be committed under it any more).
     let early = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
     let early_lease = b.take_decision_lease(&early, 1).await.unwrap().unwrap();
-    let keeper = b.keep_decision_lease(&early, &early_lease, 1);
+    let keeper = b.keep_decision_lease(&early, &early_lease, 1, std::time::Duration::from_secs(60));
     backdate(&b, &early, 600).await;
     tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
     assert!(keeper.lost());
     assert!(!b.renew_decision_lease(&early, &early_lease, 1).await.unwrap());
     assert_eq!(b.expire_stale().await.unwrap(), 1);
+    drop(keeper);
+}
+
+/// RM-027 round 5, finding 1: after `mark_committed` the keeper used to
+/// extend the lease forever, so a holder stuck after its commit kept the
+/// card pending (and `await_decision` waiting) indefinitely. A committed
+/// lease now lives at most `committed_max`: it is held up to the cap, then
+/// the keeper stops (`expired`), the lease lapses, the TTL sweep can expire
+/// the row and a recovery can take a lease of its own.
+#[tokio::test(flavor = "current_thread")]
+async fn committed_lease_has_max_lifetime() {
+    let b = broker();
+    let id = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let lease = b.take_decision_lease(&id, 1).await.unwrap().unwrap();
+    let keeper = b.keep_decision_lease(&id, &lease, 1, std::time::Duration::from_millis(1500));
+    keeper.mark_committed();
+    // Past the TTL, so only the lease keeps the row pending.
+    backdate(&b, &id, 600).await;
+
+    // Inside the cap: still held (past its 1 s length).
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(!keeper.expired());
+    assert_eq!(b.expire_stale().await.unwrap(), 0, "held inside the committed lifetime");
+
+    // Past the cap (+ the last ≤ 1 s grant + a tick): stopped and lapsed.
+    tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+    assert!(keeper.expired(), "the keeper must stop at the committed cap");
+    assert!(!b.extend_decision_lease(&id, &lease, 1).await.unwrap(), "the lease lapsed");
+    assert!(b.decide_with_lease(&id, &lease, true, "x").await.is_err());
+    // The row is free again: the sweep records the honest TTL outcome.
+    assert_eq!(b.expire_stale().await.unwrap(), 1);
+    assert_eq!(b.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Expired);
+    drop(keeper);
+
+    // Inside the TTL, a recovery can take its own lease once the cap ran out.
+    let live = b.request("a", "org_change", "s", json!({}), 3600).await.unwrap();
+    let first = b.take_decision_lease(&live, 1).await.unwrap().unwrap();
+    let keeper = b.keep_decision_lease(&live, &first, 1, std::time::Duration::from_millis(500));
+    keeper.mark_committed();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(b.take_decision_lease(&live, 1).await.unwrap().is_none(), "still held right at the cap");
+    tokio::time::sleep(std::time::Duration::from_millis(2400)).await;
+    assert!(keeper.expired());
+    let recovery = b.take_decision_lease(&live, 30).await.unwrap().expect("a recovery takes its own lease after the cap");
+    b.decide_with_lease(&live, &recovery, true, "dashboard:admin").await.unwrap();
     drop(keeper);
 }
 

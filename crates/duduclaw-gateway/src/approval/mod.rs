@@ -167,10 +167,18 @@ pub struct DecisionLease {
 /// it every quarter of its length: inside the TTL until
 /// [`Self::mark_committed`], then without the TTL (the holder already passed
 /// its final in-TTL check) until the terminal decision. Stops on drop.
+///
+/// RM-027 round 5: a committed lease has a **maximum lifetime**
+/// (`committed_max`, counted from [`Self::mark_committed`]). Extensions
+/// never reach past it, and once it is spent the keeper stops
+/// ([`Self::expired`]) and the lease lapses: a holder stuck after its commit
+/// can no longer keep the card pending forever — the journal of the
+/// committed side effect takes over (its recovery takes a lease of its own).
 #[derive(Debug)]
 pub struct LeaseKeeper {
-    committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    committed: std::sync::Arc<std::sync::OnceLock<std::time::Instant>>,
     lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 

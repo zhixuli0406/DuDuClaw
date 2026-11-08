@@ -952,3 +952,131 @@ async fn an_approval_in_time_applies_under_the_lease_and_releases_it() {
         .unwrap();
     assert!(lease.is_none(), "the lease is cleared with the decision");
 }
+
+// ── Daybreak review round 5 regressions ─────────────────────────────────────
+
+/// Round 5, finding 1: a stuck `agent.toml` writer used to keep the mirror
+/// write (under the global org lock) waiting forever — the approval stayed
+/// pending, its lease was extended forever and every org change was blocked.
+/// The mirror's lock wait is now bounded: the approval reaches a terminal,
+/// honest state (approved — the authority moved — with the mirror reported
+/// as pending), the org lock is released, the journal keeps a "mirror
+/// pending" entry, and the recovery finishes the mirror once the writer is
+/// gone (without re-recording or re-auditing the decision).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mirror_lock_timeout_releases_org_lock_and_journal_finishes_later() {
+    use crate::org_change_approval::{journal, mirror_wait_override};
+    let f = fixture().await;
+    let id = f.propose().await;
+    mirror_wait_override::set(&f.home, std::time::Duration::from_millis(300));
+    // A stuck writer holds rep's agent.toml advisory lock.
+    let stuck = duduclaw_core::fs_lock::lock_exclusive(&f.home.join("agents/rep/agent.toml")).unwrap();
+
+    let started = std::time::Instant::now();
+    let frame = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin),
+    )
+    .await
+    .expect("the approval must not wait for the stuck agent.toml writer");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    let (code, msg) = refusal(&frame);
+    assert_eq!(code, "mirror_sync_failed", "{msg}");
+    assert!(msg.contains("已經生效"), "{msg}");
+    // Terminal and honest: approved (the authority moved), mirror behind.
+    assert_eq!(f.status(&id).await, ApprovalStatus::Approved);
+    assert_eq!(f.authority("rep"), OrgEntry::new("other", "業務"));
+    assert_eq!(f.mirror("rep"), OrgEntry::new("lead", "業務"));
+    // The org lock was released: another thread takes it at once.
+    let home = f.home.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let taken = org_store::lock_org_mutations(&home).map(drop).is_ok();
+        let _ = tx.send(taken);
+    });
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "the org lock must be free");
+    // The journal records "mirror pending" after the recorded decision.
+    let entry = journal::read(&f.home, &id).unwrap().expect("mirror-pending journal entry");
+    assert_eq!(entry.state, journal::State::Applied);
+    assert!(!entry.mirror_synced && entry.decision_recorded, "{entry:?}");
+    // Other org changes are not blocked by the stuck writer.
+    let base = duduclaw_core::org_change::entry_hash(&f.home, "lead");
+    ok(&f.call("org.apply_change", json!({ "agent_id": "lead", "department": "經營", "expected_base": base }), &f.admin).await);
+    assert_eq!(f.mirror("lead"), OrgEntry::new("ceo", "經營"));
+
+    // While the writer is still stuck, the recovery is bounded too.
+    let (code, _) = refusal(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    assert_eq!(code, "mirror_sync_failed");
+    assert!(journal::exists(&f.home, &id));
+    assert_eq!(f.mirror("rep"), OrgEntry::new("lead", "業務"));
+
+    // The writer is gone: the journal recovery finishes the mirror.
+    drop(stuck);
+    let d = ok(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    assert_eq!(d["decided"], "approved", "{d}");
+    assert_eq!(f.mirror("rep"), OrgEntry::new("other", "業務"));
+    assert!(org_store::detect_drift(&f.home).is_empty());
+    assert!(!journal::exists(&f.home, &id));
+    assert_eq!(f.status(&id).await, ApprovalStatus::Approved);
+    // The decision was recorded and audited exactly once.
+    let applied: Vec<_> = audit_rows(&f.home, "org_change_applied")
+        .into_iter()
+        .filter(|r| r["details"]["approval_id"] == json!(id))
+        .collect();
+    assert_eq!(applied.len(), 1, "{applied:?}");
+    assert_eq!(audit_rows(&f.home, "org_change_mirror_resynced").len(), 1);
+    mirror_wait_override::clear(&f.home);
+}
+
+/// Round 5, finding 3: creating a new Main demotes the current one before
+/// the authority commit / publish. When that commit is refused (a cycle in
+/// the effective tree, a corrupt authority), the create fails — and the old
+/// Main must be Main again, not left `specialist`.
+#[tokio::test]
+async fn main_create_failure_restores_previous_main() {
+    let f = fixture().await;
+    ok(&f.h.handle_agents_create_as(json!({ "name": "boss", "role": "main" }), Some(&f.admin)).await);
+    let role = |id: &str| -> String {
+        let raw = std::fs::read_to_string(f.home.join("agents").join(id).join("agent.toml")).unwrap();
+        raw.parse::<toml::Table>().unwrap()["agent"]["role"].as_str().unwrap().to_string()
+    };
+    assert_eq!(role("boss"), "main");
+
+    // (a) Cycle: lead and rep fall back to their mirrors, which now loop
+    // (lead → rep → lead); a new Main reporting to lead closes nothing new
+    // itself, but its authority row's cycle walk refuses the create.
+    org_store::with_org_lock(&f.home, |org| {
+        org_store::remove(org, "lead")?;
+        org_store::remove(org, "rep")
+    })
+    .unwrap();
+    f.tamper_mirror("lead", "reports_to = \"ceo\"", "reports_to = \"rep\"");
+    let (_, e) = refusal(&f
+        .h
+        .handle_agents_create_as(json!({ "name": "newmain", "role": "main", "reports_to": "lead" }), Some(&f.admin))
+        .await);
+    assert!(e.contains("沒有建立"), "{e}");
+    assert!(!e.contains("沒有成功恢復"), "the restore must have succeeded: {e}");
+    assert_eq!(role("boss"), "main", "the previous main is restored after a cycle refusal");
+    assert!(!f.home.join("agents/newmain").exists());
+    assert!(org_store::load(&f.home).get("newmain").is_none());
+    assert_eq!(
+        f.h.registry.read().await.main_agent().map(|a| a.config.agent.name.clone()).as_deref(),
+        Some("boss"),
+        "the registry sees the restored main"
+    );
+
+    // (b) Corrupt authority: refused, the old Main is restored, the store is
+    // left exactly as it was.
+    let store = org_store::org_store_path(&f.home);
+    std::fs::write(&store, "schema = \"x\"\n").unwrap();
+    let (_, e) = refusal(&f.h.handle_agents_create_as(json!({ "name": "newmain2", "role": "main" }), Some(&f.admin)).await);
+    assert!(e.contains("沒有建立"), "{e}");
+    assert_eq!(role("boss"), "main", "the previous main is restored after a corrupt-authority refusal");
+    assert!(!f.home.join("agents/newmain2").exists());
+    assert_eq!(std::fs::read_to_string(&store).unwrap(), "schema = \"x\"\n");
+    assert_eq!(
+        f.h.registry.read().await.main_agent().map(|a| a.config.agent.name.clone()).as_deref(),
+        Some("boss")
+    );
+}

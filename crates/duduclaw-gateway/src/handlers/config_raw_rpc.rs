@@ -1073,7 +1073,11 @@ impl MethodHandler {
             // agent.toml goes through the profile file writer (version kept
             // outside the employee directory, `agent_file_changed` audit).
             let text = new_text.clone();
-            let committed = crate::agent_files::writer::commit(
+            // RM-027 round 5: while the global org lock is held, the
+            // agent.toml lock wait is bounded — a stuck writer turns into a
+            // refused save (authority put back below), never a pinned org lock.
+            let lock_wait = org_lock.as_ref().map(|_| crate::org_change_approval::mirror_lock_wait(&self.home_dir));
+            let committed = crate::agent_files::writer::commit_within(
                 &self.registry,
                 crate::agent_files::writer::Commit {
                     home: &self.home_dir,
@@ -1093,6 +1097,7 @@ impl MethodHandler {
                     }
                     Ok(())
                 },
+                lock_wait,
             )
             .await
             .map_err(|e| rctx.scrub(&e.message()));

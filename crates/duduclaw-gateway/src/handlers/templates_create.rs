@@ -300,11 +300,14 @@ impl MethodHandler {
         // only after every write succeeded and right before the publish, so
         // a doomed create can no longer demote the live main as a side
         // effect (org lock first, then the agent.toml lock).
-        if final_role == "main" {
-            if let Err(e) = self.demote_current_main(&name).await {
-                return WsFrame::error_response("", &e);
+        let demotion = if final_role == "main" {
+            match self.demote_current_main(&name).await {
+                Ok(d) => d,
+                Err(e) => return WsFrame::error_response("", &e),
             }
-        }
+        } else {
+            None
+        };
 
         // WP22 T1 / RM-027 round 4 — inside the org lock: validate and commit
         // the authoritative org placement, then publish the directory. Values
@@ -329,7 +332,17 @@ impl MethodHandler {
                 if !disabled_skills.is_empty() {
                     let _ = duduclaw_agent::skill_state::set_disabled(&self.home_dir, &name, disabled_skills, false);
                 }
-                return WsFrame::error_response("", &format!("AI 員工沒有建立：{e}"));
+                // RM-027 round 5: the create did not happen — put back the
+                // main it demoted (still under the org lock).
+                let restore = match demotion {
+                    Some(d) => self.restore_demoted_main(d).await.err(),
+                    None => None,
+                };
+                drop(org);
+                return WsFrame::error_response(
+                    "",
+                    &super::agents_create::create_failed_text(&e.to_string(), restore.as_deref()),
+                );
             }
         }
         drop(org);

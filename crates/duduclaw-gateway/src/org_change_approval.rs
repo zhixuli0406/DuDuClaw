@@ -40,6 +40,66 @@ pub(crate) const EXPIRED_TEXT: &str =
 /// change lands: long enough for the org lock + authority + mirror write,
 /// short enough that a crashed attempt frees the card quickly.
 pub(crate) const DECISION_LEASE_SECS: i64 = 120;
+/// RM-027 round 5: the longest an `agent.toml` mirror write made under the
+/// global org lock waits for that file's lock (in-process mutex + advisory
+/// lock, one budget). An ordinary write holds it for milliseconds; 30 s
+/// absorbs a slow disk or a lifecycle-barrier drain (`ADMISSION_WAIT` is
+/// also 30 s) yet stays well under [`DECISION_LEASE_SECS`] — so even an
+/// unrenewed lease outlives one full wait, and the org lock is never pinned
+/// longer than this by a stuck writer. Past it the authority stays committed,
+/// the journal records "mirror pending" and the recovery finishes the mirror.
+pub(crate) const MIRROR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// RM-027 round 5: the maximum life of a decision lease after its holder
+/// committed (counted from `mark_committed`). What is left at that point is
+/// one bounded mirror write ([`MIRROR_LOCK_WAIT`]), a journal write, the
+/// registry rescan and the decision row — seconds. 180 s (six mirror waits,
+/// 1.5 leases) is far beyond that; a holder still not done is stuck, and its
+/// lease lapses so the applied journal's recovery (which takes a lease of
+/// its own) records the outcome instead of the card staying pending forever.
+pub(crate) const COMMITTED_LEASE_MAX: std::time::Duration = std::time::Duration::from_secs(180);
+/// RM-027 round 5: when a background attempt finishes a "mirror pending"
+/// journal entry after the approval (any later approve click on the card,
+/// and an Admin re-applying the placement, also finish it).
+pub(crate) const MIRROR_RECOVERY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(300),
+    std::time::Duration::from_secs(1800),
+];
+
+/// [`MIRROR_LOCK_WAIT`] for `home` (tests shorten it per home).
+pub(crate) fn mirror_lock_wait(home: &std::path::Path) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = mirror_wait_override::get(home) {
+            return d;
+        }
+    }
+    let _ = home;
+    MIRROR_LOCK_WAIT
+}
+
+/// Test seam: a shorter mirror lock wait for one home.
+#[cfg(test)]
+pub(crate) mod mirror_wait_override {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static WAITS: Mutex<BTreeMap<PathBuf, Duration>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn set(home: &Path, wait: Duration) {
+        WAITS.lock().unwrap().insert(home.to_path_buf(), wait);
+    }
+
+    pub(crate) fn clear(home: &Path) {
+        WAITS.lock().unwrap().remove(home);
+    }
+
+    pub(super) fn get(home: &Path) -> Option<Duration> {
+        WAITS.lock().ok().and_then(|w| w.get(home).copied())
+    }
+}
 /// Longest `reason` kept in the payload.
 pub(crate) const MAX_REASON_CHARS: usize = 1000;
 
@@ -156,6 +216,14 @@ pub(crate) fn summary(p: &Proposal) -> String {
 /// reconciles it against the authority under the org lock (see
 /// `decide_org_change`). The entry is removed once the decision is recorded,
 /// or when the commit itself failed.
+///
+/// RM-027 round 5 — **mirror pending**: when the `agent.toml` mirror write
+/// did not land (its lock wait is bounded by [`MIRROR_LOCK_WAIT`]) the entry
+/// outlives the recorded decision (`mirror_synced = false`,
+/// `decision_recorded = true`). The recovery (a background retry, the next
+/// approve click on the card) re-checks under the org lock that the
+/// authority still holds `after` and finishes the mirror; the entry is
+/// removed once the mirror follows (or a later change superseded it).
 pub(crate) mod journal {
     use super::*;
     use std::path::{Path, PathBuf};
@@ -207,6 +275,11 @@ pub(crate) mod journal {
         pub applied_at: String,
         pub registry_reloaded: bool,
         pub mirror_synced: bool,
+        /// RM-027 round 5: the approval was recorded (and audited) but the
+        /// `agent.toml` mirror is still behind — the entry is kept as the
+        /// "mirror pending" record the recovery finishes, and nothing about
+        /// the decision is redone.
+        pub decision_recorded: bool,
     }
 
     /// Digest of an approval's payload, as journaled.
@@ -235,7 +308,13 @@ pub(crate) mod journal {
                 applied_at: String::new(),
                 registry_reloaded: false,
                 mirror_synced: false,
+                decision_recorded: false,
             }
+        }
+
+        /// Kept after the decision was recorded: the mirror is still pending.
+        pub(crate) fn mirror_pending_after_decision(self) -> Self {
+            Self { decision_recorded: true, ..self }
         }
 
         /// The same entry, marked applied.
@@ -267,6 +346,7 @@ pub(crate) mod journal {
                 "applied_at": self.applied_at,
                 "registry_reloaded": self.registry_reloaded,
                 "mirror_synced": self.mirror_synced,
+                "decision_recorded": self.decision_recorded,
             })
         }
 
@@ -284,6 +364,7 @@ pub(crate) mod journal {
                 applied_at: s("applied_at").unwrap_or_default(),
                 registry_reloaded: v.get("registry_reloaded").and_then(Value::as_bool).unwrap_or(false),
                 mirror_synced: v.get("mirror_synced").and_then(Value::as_bool).unwrap_or(false),
+                decision_recorded: v.get("decision_recorded").and_then(Value::as_bool).unwrap_or(false),
             })
         }
     }

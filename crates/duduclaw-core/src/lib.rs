@@ -119,7 +119,7 @@ pub use dispatch_guard::{
     DEFAULT_ROLE_TEAM_MAX_IN_WINDOW, PATH_KIND_ROLE_TEAM,
 };
 pub use error::{DuDuClawError, Result};
-pub use fs_lock::with_file_lock;
+pub use fs_lock::{with_file_lock, with_file_lock_timeout};
 pub use grounding::{
     check_grounded, is_self_echo_tool, matching_result_texts, shares_contiguous_run,
     shares_contiguous_run_excluding_echo, tool_name_matches, GroundingOutcome,

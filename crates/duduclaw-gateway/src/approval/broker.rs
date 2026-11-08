@@ -400,30 +400,70 @@ impl ApprovalBroker {
     /// [`Self::extend_decision_lease`] afterwards. A refused renewal marks
     /// the keeper [`LeaseKeeper::lost`] and stops it; a transient store
     /// error is retried on the next tick.
-    pub fn keep_decision_lease(&self, id: &ApprovalId, lease: &DecisionLease, secs: i64) -> LeaseKeeper {
+    ///
+    /// RM-027 round 5: `committed_max` caps the lease's life after
+    /// [`LeaseKeeper::mark_committed`]. No extension reaches past
+    /// `mark_committed + committed_max` (each one is shortened to what is
+    /// left), and once it is spent the keeper stops, marks itself
+    /// [`LeaseKeeper::expired`] and lets the lease lapse (it ends within
+    /// about a second of the cap). From then on the row is free again: the
+    /// TTL sweep can expire it, and the side effect's journal recovery takes
+    /// a lease of its own to record the outcome.
+    pub fn keep_decision_lease(
+        &self,
+        id: &ApprovalId,
+        lease: &DecisionLease,
+        secs: i64,
+        committed_max: Duration,
+    ) -> LeaseKeeper {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let committed = std::sync::Arc::new(AtomicBool::new(false));
+        let committed = std::sync::Arc::new(std::sync::OnceLock::<std::time::Instant>::new());
         let lost = std::sync::Arc::new(AtomicBool::new(false));
+        let expired = std::sync::Arc::new(AtomicBool::new(false));
         let broker = self.clone();
         let id = id.clone();
         let lease = DecisionLease { token: lease.token.clone() };
         let secs = secs.max(1);
         let interval = Duration::from_millis(((secs as u64) * 1000 / 4).max(250));
-        let (c, l) = (committed.clone(), lost.clone());
+        let (c, l, x) = (committed.clone(), lost.clone(), expired.clone());
+        // Seconds an extension may still grant: `None` = the committed
+        // lifetime is spent (stop extending).
+        let extension = move |since: std::time::Instant| -> Option<i64> {
+            let left = committed_max.saturating_sub(since.elapsed());
+            if left.is_zero() {
+                return None;
+            }
+            Some((left.as_secs_f64().ceil() as i64).clamp(1, secs))
+        };
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let renewed = if c.load(Ordering::SeqCst) {
-                    broker.extend_decision_lease(&id, &lease, secs).await
-                } else {
-                    match broker.renew_decision_lease(&id, &lease, secs).await {
+                let renewed = match c.get().copied() {
+                    Some(since) => match extension(since) {
+                        Some(grant) => broker.extend_decision_lease(&id, &lease, grant).await,
+                        None => {
+                            x.store(true, Ordering::SeqCst);
+                            warn!(
+                                approval_id = %id,
+                                max_secs = committed_max.as_secs(),
+                                "committed decision lease reached its maximum lifetime — \
+                                 letting it lapse (the journal recovery completes the decision)"
+                            );
+                            break;
+                        }
+                    },
+                    None => match broker.renew_decision_lease(&id, &lease, secs).await {
                         // The holder marked the commit while this in-TTL
                         // renewal was in flight: retry as an extension.
-                        Ok(false) if c.load(Ordering::SeqCst) => {
-                            broker.extend_decision_lease(&id, &lease, secs).await
-                        }
+                        Ok(false) if c.get().is_some() => match c.get().copied().and_then(extension) {
+                            Some(grant) => broker.extend_decision_lease(&id, &lease, grant).await,
+                            None => {
+                                x.store(true, Ordering::SeqCst);
+                                Ok(false)
+                            }
+                        },
                         other => other,
-                    }
+                    },
                 };
                 match renewed {
                     Ok(true) => {}
@@ -435,7 +475,7 @@ impl ApprovalBroker {
                 }
             }
         });
-        LeaseKeeper { committed, lost, task }
+        LeaseKeeper { committed, lost, expired, task }
     }
 
     /// Give a lease back without deciding (best-effort; it lapses anyway).
@@ -627,9 +667,17 @@ impl ApprovalBroker {
 
 impl LeaseKeeper {
     /// The holder passed its final in-TTL check and is committing: from now
-    /// on renew without re-judging the TTL.
+    /// on renew without re-judging the TTL — for at most the keeper's
+    /// `committed_max` (counted from the first call; later calls are no-ops).
     pub fn mark_committed(&self) {
-        self.committed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.committed.set(std::time::Instant::now());
+    }
+
+    /// The committed lifetime ran out: the keeper stopped extending and the
+    /// lease lapses (RM-027 round 5). The holder's own decision write may
+    /// then fail; the journal recovery completes it under a new lease.
+    pub fn expired(&self) -> bool {
+        self.expired.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// A renewal was refused (the lease lapsed, the row was decided, or —

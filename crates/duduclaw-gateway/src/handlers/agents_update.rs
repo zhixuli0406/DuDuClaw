@@ -417,7 +417,11 @@ impl MethodHandler {
             }
         }
 
-        let result = self.update_agent_toml_as(&agent_id, "agents.update", caller, session, move |table| {
+        // RM-027 round 5: while the org lock is held the agent.toml lock wait
+        // is bounded — a stuck writer fails this update (the pre-written
+        // authority entry is put back below) instead of pinning the org lock.
+        let lock_wait = org_lock.as_ref().map(|_| crate::org_change_approval::mirror_lock_wait(&self.home_dir));
+        let result = self.update_agent_toml_as_within(&agent_id, "agents.update", caller, session, lock_wait, move |table| {
             // v1.68: snapshot for the authority diff and the final typed
             // check (only enforced when the file parsed before this write, so
             // an already-broken file can still be repaired through here).

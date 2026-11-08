@@ -283,12 +283,16 @@ impl MethodHandler {
         // If creating as main, demote the current main agent — only after
         // every validation passed and right before the publish, so a doomed
         // create can no longer demote the live main as a side effect. Taken
-        // under the org lock (lock order: org lock, then agent.toml locks).
-        if role == "main" {
-            if let Err(e) = self.demote_current_main(name).await {
-                return WsFrame::error_response("", &e);
+        // under the org lock (lock order: org lock, then agent.toml locks;
+        // the agent.toml lock wait is bounded).
+        let demotion = if role == "main" {
+            match self.demote_current_main(name).await {
+                Ok(d) => d,
+                Err(e) => return WsFrame::error_response("", &e),
             }
-        }
+        } else {
+            None
+        };
 
         // WP22 T1 / RM-027 round 4 — inside the org lock: validate and commit
         // the authoritative org placement in `<home>/org.toml`, then publish
@@ -299,7 +303,14 @@ impl MethodHandler {
         // Short synchronous file operations (as the upsert always was).
         if let Err(e) = staged.publish(&org, org_entry) {
             warn!(agent = %name, error = %e, "agents.create refused: org authority not committed");
-            return WsFrame::error_response("", &format!("AI 員工沒有建立：{e}"));
+            // RM-027 round 5: the create did not happen, so the main it
+            // demoted is put back (still under the org lock).
+            let restore = match demotion {
+                Some(d) => self.restore_demoted_main(d).await.err(),
+                None => None,
+            };
+            drop(org);
+            return WsFrame::error_response("", &create_failed_text(&e.to_string(), restore.as_deref()));
         }
         drop(org);
 
@@ -351,5 +362,17 @@ impl MethodHandler {
                 "agent": { "name": name, "display_name": display_name, "role": role, "status": "active" }
             }),
         )
+    }
+}
+
+/// The refusal of a create whose publish failed after the old main was
+/// demoted; says so when putting the old main back failed too.
+pub(crate) fn create_failed_text(error: &str, restore_error: Option<&str>) -> String {
+    match restore_error {
+        None => format!("AI 員工沒有建立：{error}"),
+        Some(re) => format!(
+            "AI 員工沒有建立：{error}（另外，原本的主代理沒有成功恢復為主代理：{}；請管理員在 AI 員工設定把它改回主代理）",
+            duduclaw_core::truncate_chars(re, 300)
+        ),
     }
 }

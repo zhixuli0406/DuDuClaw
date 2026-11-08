@@ -131,9 +131,41 @@ pub(crate) fn commit_locked_with_lifecycle(
     guard: impl FnOnce() -> Result<(), String>,
     force_lifecycle_barrier: bool,
 ) -> Result<Outcome, CommitError> {
+    commit_locked_inner(c, render, guard, force_lifecycle_barrier, None)
+}
+
+/// Marker carried by every [`CommitError::Failed`] that means "the file lock
+/// was not acquired within the caller's bound — nothing was written".
+pub(crate) const LOCK_WAIT_TIMEOUT: &str = "lock_wait_timeout";
+
+/// Does `message` (a [`CommitError::message`]) report a bounded lock wait
+/// that ran out (nothing written)?
+pub(crate) fn is_lock_wait_timeout(message: &str) -> bool {
+    message.contains(LOCK_WAIT_TIMEOUT)
+}
+
+fn lock_timeout_error(c: &Commit<'_>, wait: std::time::Duration) -> CommitError {
+    CommitError::Failed(format!(
+        "{} 正被其他寫入佔用，等待 {} 秒後仍無法取得寫入鎖（{LOCK_WAIT_TIMEOUT}），沒有寫入",
+        c.key.file_name(),
+        wait.as_secs_f32()
+    ))
+}
+
+/// The locked section. `lock_wait`: `None` = wait for the file lock as long
+/// as it takes; `Some(d)` = give up after `d` (RM-027 round 5 — for a caller
+/// that holds the global org lock and must never wait unboundedly).
+fn commit_locked_inner(
+    c: &Commit<'_>,
+    render: impl FnOnce(&str) -> Result<String, String>,
+    guard: impl FnOnce() -> Result<(), String>,
+    force_lifecycle_barrier: bool,
+    lock_wait: Option<std::time::Duration>,
+) -> Result<Outcome, CommitError> {
     let path = super::file_path(c.home, c.agent_id, &c.key).map_err(CommitError::Refused)?;
     let keep = AgentFilesConfig::load(c.home).history_keep;
-    let result = duduclaw_core::with_file_lock(&lock_anchor(c, &path), || {
+    let anchor = lock_anchor(c, &path);
+    let locked_section = || -> std::io::Result<Locked> {
         // A skill is never created here, and its folder is writable by the
         // employee: bind it again under the lock (same existing regular
         // file, same folders) and check that binding once more right before
@@ -246,7 +278,14 @@ pub(crate) fn commit_locked_with_lifecycle(
             unchanged: false,
             registry_reloaded: false,
         }))
-    });
+    };
+    let result = match lock_wait {
+        None => duduclaw_core::with_file_lock(&anchor, locked_section),
+        Some(wait) => match duduclaw_core::with_file_lock_timeout(&anchor, wait, locked_section) {
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(lock_timeout_error(c, wait)),
+            other => other,
+        },
+    };
     match result {
         Ok(Locked::Done(o)) => {
             if !o.unchanged {
@@ -362,9 +401,36 @@ pub(crate) async fn commit(
     render: impl FnOnce(&str) -> Result<String, String>,
     guard: impl FnOnce() -> Result<(), String>,
 ) -> Result<Outcome, CommitError> {
+    commit_within(registry, c, render, guard, None).await
+}
+
+/// [`commit`] with an optional hard bound on **both** lock waits (the
+/// in-process per-file mutex and the cross-process advisory file lock, one
+/// shared budget): `Some(d)` gives up after `d` with a [`LOCK_WAIT_TIMEOUT`]
+/// error and nothing written; `None` waits as long as it takes.
+/// RM-027 round 5: every `agent.toml` write made while the global org lock
+/// is held passes `Some`, so a stuck writer can never pin the org lock.
+pub(crate) async fn commit_within(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    c: Commit<'_>,
+    render: impl FnOnce(&str) -> Result<String, String>,
+    guard: impl FnOnce() -> Result<(), String>,
+    lock_wait: Option<std::time::Duration>,
+) -> Result<Outcome, CommitError> {
     let lock = super::file_mutex(c.home, c.agent_id, &c.key);
-    let _held = lock.lock().await;
-    let mut out = run_blocking(|| commit_locked(&c, render, guard))?;
+    let started = std::time::Instant::now();
+    let _held = match lock_wait {
+        None => lock.lock().await,
+        Some(wait) => tokio::time::timeout(wait, lock.lock())
+            .await
+            .map_err(|_| lock_timeout_error(&c, wait))?,
+    };
+    // The file lock gets what is left of the same budget (one bound total).
+    let file_wait = lock_wait.map(|wait| wait.saturating_sub(started.elapsed()));
+    let mut out = run_blocking(|| match file_wait {
+        None => commit_locked(&c, render, guard),
+        Some(wait) => commit_locked_inner(&c, render, guard, false, Some(wait)),
+    })?;
     if out.unchanged {
         return Ok(out);
     }

@@ -126,18 +126,24 @@ pub fn parent_capabilities(home_dir: &Path, parent: &str) -> Option<Capabilities
         .map(|(_, config)| config.capabilities)
 }
 
-/// Write the scaffold's `.mcp.json` (duduclaw server + identity env) and
-/// verify the file actually landed.
+/// Write the scaffold's `.mcp.json` (duduclaw server + identity env) into the
+/// **staging** directory `stage`, for the scaffold that will be published at
+/// `dir`, and verify the file actually landed.
 ///
-/// [`duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path`] is a
-/// *migration* helper: it reports `Ok(false)` and writes nothing when the
-/// duduclaw binary cannot be resolved to an absolute path, which is the right
-/// silence for a boot sweep over existing agents but a mute agent here. The
-/// existence re-check converts that silence into an error so the caller can
-/// fail the scaffold closed.
-fn ensure_scaffold_mcp_config(dir: &Path) -> Result<(), String> {
-    duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path(dir)?;
-    let path = dir.join(".mcp.json");
+/// RM-027 round 5: written *before* the publish. The identity it carries is
+/// derived from the final directory (`dir`), not from the staging name, so
+/// the rename does not change it — and a failure here only drops the
+/// invisible staging directory: no published scaffold (whose `agent.toml`
+/// could otherwise be read as a mirror) and no authority row to roll back.
+fn write_scaffold_mcp_config(stage: &Path, dir: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        if mcp_failpoint::armed() {
+            return Err("injected MCP config failure".into());
+        }
+    }
+    duduclaw_agent::mcp_template::write_fresh_duduclaw_config(stage, dir)?;
+    let path = stage.join(".mcp.json");
     if path.is_file() {
         Ok(())
     } else {
@@ -146,6 +152,30 @@ fn ensure_scaffold_mcp_config(dir: &Path) -> Result<(), String> {
              absolute location)",
             path.display()
         ))
+    }
+}
+
+/// Test seam: make [`write_scaffold_mcp_config`] fail on this thread (the
+/// scaffold is synchronous, so a thread-local cannot leak into a parallel
+/// test).
+#[cfg(test)]
+pub(crate) mod mcp_failpoint {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn arm() {
+        ARMED.with(|a| a.set(true));
+    }
+
+    pub(crate) fn disarm() {
+        ARMED.with(|a| a.set(false));
+    }
+
+    pub(super) fn armed() -> bool {
+        ARMED.with(Cell::get)
     }
 }
 
@@ -464,19 +494,6 @@ pub(super) fn scaffold_with(
     std::fs::write(stage.join("ephemeral.toml"), meta_toml)
         .map_err(|e| format!("write ephemeral.toml: {e}"))?;
 
-    // WP22 T1 / RM-027 round 4 — inside the org lock: validate and commit the
-    // ephemeral's placement in the authoritative store, then publish the
-    // directory. `reports_to = <parent>` is precisely the relation that
-    // authorises this scaffold's dispatch, and `DispatchOrgView` reads the
-    // store first; an ephemeral with no record would fall back to the
-    // `agent.toml` written above, i.e. to a file inside its own workspace —
-    // so a refused row fails the scaffold (the staging dir is removed).
-    // Department-less by design (an ephemeral inherits isolation, not org
-    // membership). Symmetric teardown lives in `sweep`.
-    staged
-        .publish(org, duduclaw_core::OrgEntry::new(&spec.parent, ""))
-        .map_err(|e| format!("scaffold '{agent_id}' not created — org authority refused: {e}"))?;
-
     // ── .mcp.json — the scaffold's ONLY route to the duduclaw MCP server ──
     //
     // The Claude CLI auto-discovers `<work_dir>/.mcp.json` at spawn, and the
@@ -492,9 +509,10 @@ pub(super) fn scaffold_with(
     // mcp-server child learns the home/port: `duduclaw_core::spawn_env`'s
     // allowlist deliberately strips `DUDUCLAW_HOME` / `DUDUCLAW_PORT` from
     // the spawned CLI's environment, so an inherited env cannot stand in for
-    // it. `derive_home_from_agent_dir` inside the helper already accounts for
-    // the extra `.ephemeral/` path segment, so the signed identity token is
-    // minted against this `home_dir`'s key, not `<home>/agents`'s.
+    // it. The identity (agent id, home → signed token key root) is derived
+    // from the FINAL directory `dir` — `derive_home_from_agent_dir` already
+    // accounts for the extra `.ephemeral/` path segment — so writing it into
+    // the staging directory yields the same file the published one needs.
     //
     // Deliberately duduclaw-only: the parent's other MCP servers (playwright,
     // browserbase, …) are NOT copied. A scaffold's capability envelope is the
@@ -503,19 +521,26 @@ pub(super) fn scaffold_with(
     // copying the parent's server list here would hand a role member browser
     // reach nobody granted it. Revisit only if a role genuinely needs one.
     //
-    // Fail-closed: a member that cannot reach the MCP server cannot hand its
-    // work back, so a failure here aborts the scaffold — the published
-    // directory and its authority row are both removed (still under the org
-    // lock) instead of leaving a mute agent that still occupies a cap slot.
-    // Written after the publish because the identity it carries is derived
-    // from the final directory name.
-    if let Err(e) = ensure_scaffold_mcp_config(&dir) {
-        let _ = std::fs::remove_dir_all(&dir);
-        if let Err(re) = duduclaw_core::org_store::remove(org, &agent_id) {
-            tracing::warn!(ephemeral = %agent_id, error = %re, "org.toml rollback failed for an aborted scaffold");
-        }
-        return Err(format!("scaffold '{agent_id}' MCP config: {e}"));
-    }
+    // Fail-closed, and RM-027 round 5: written INSIDE the staging directory,
+    // BEFORE the publish. A failure drops `staged` (the invisible staging dir
+    // is removed) before any authority row exists — there is never a
+    // published scaffold to clean up, and so never an authority row deleted
+    // while a visible directory (whose `agent.toml` would then be read as a
+    // mirror) still exists.
+    write_scaffold_mcp_config(&stage, &dir).map_err(|e| format!("scaffold '{agent_id}' MCP config: {e}"))?;
+
+    // WP22 T1 / RM-027 round 4 — inside the org lock: validate and commit the
+    // ephemeral's placement in the authoritative store, then publish the
+    // directory. `reports_to = <parent>` is precisely the relation that
+    // authorises this scaffold's dispatch, and `DispatchOrgView` reads the
+    // store first; an ephemeral with no record would fall back to the
+    // `agent.toml` written above, i.e. to a file inside its own workspace —
+    // so a refused row fails the scaffold (the staging dir is removed).
+    // Department-less by design (an ephemeral inherits isolation, not org
+    // membership). Symmetric teardown lives in `sweep`.
+    staged
+        .publish(org, duduclaw_core::OrgEntry::new(&spec.parent, ""))
+        .map_err(|e| format!("scaffold '{agent_id}' not created — org authority refused: {e}"))?;
 
     // Audit: creation (existing tool_calls.jsonl convention). Role members get
     // their assignment recorded as extras — never colliding with the five

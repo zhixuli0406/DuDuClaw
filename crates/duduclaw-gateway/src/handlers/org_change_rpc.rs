@@ -16,7 +16,11 @@
 //! `duduclaw_core::org_change::validate_org_change_in` over the whole tree,
 //! then commit — the `org.toml` **authority first**, the `agent.toml` display
 //! mirror second. A mirror that fails to follow is recorded as drift and
-//! reported; the authority is never left behind a changed mirror. Stale state
+//! reported; the authority is never left behind a changed mirror. The mirror
+//! write's `agent.toml` lock wait is bounded (`MIRROR_LOCK_WAIT`, round 5),
+//! so the org lock is never pinned by a stuck writer; for an approval the
+//! journal then keeps a "mirror pending" entry that the recovery (a
+//! background retry, the next approve click) finishes. Stale state
 //! fails closed: a change made against a `base` that no longer matches is
 //! refused (and a waiting proposal is denied).
 
@@ -66,6 +70,11 @@ fn mirror_failed(error: &str, extra: Value) -> WsFrame {
         extra,
     )
 }
+
+/// RM-027 round 5: the mirror of an applied approval is still behind (the
+/// recovery could not write it yet); it is retried automatically.
+const MIRROR_STILL_PENDING: &str =
+    "顯示用的 agent.toml 目前仍被其他寫入佔用或無法寫入，系統會在稍後自動重試同步";
 
 /// Optional string param: absent / `null` ⇒ `None`; any other type is refused.
 fn opt_str(params: &Value, key: &str) -> Result<Option<String>, WsFrame> {
@@ -714,10 +723,13 @@ impl MethodHandler {
         };
         // RM-027 round 4: the lease is kept alive in the background for the
         // whole decision — the org-lock wait, prepared journal, authority,
-        // mirror (its `agent.toml` lock wait is unbounded) and the terminal
-        // decision — so the TTL sweep can never expire the card under a
-        // commit that is still landing.
-        let keeper = broker.keep_decision_lease(approval_id, &lease, oc::DECISION_LEASE_SECS);
+        // mirror and the terminal decision — so the TTL sweep can never
+        // expire the card under a commit that is still landing. Round 5: the
+        // mirror's `agent.toml` lock wait is bounded (`oc::MIRROR_LOCK_WAIT`)
+        // and a committed lease lives at most `oc::COMMITTED_LEASE_MAX`;
+        // past that the applied journal's recovery records the outcome.
+        let keeper =
+            broker.keep_decision_lease(approval_id, &lease, oc::DECISION_LEASE_SECS, oc::COMMITTED_LEASE_MAX);
         let frame = self.apply_leased(broker, &lease, &keeper, approval_id, ctx, decision_reason).await;
         drop(keeper);
         // A lease the decision did not consume is given back (no-op otherwise).
@@ -851,6 +863,11 @@ impl MethodHandler {
                 return WsFrame::error_response("", &format!("沒有套用，這筆審核仍待決定，可以再試一次：{e}"));
             }
         };
+        // A mirror that did not follow (a refused write, or its bounded
+        // `agent.toml` lock wait ran out) is journaled as pending: the org
+        // lock is released right below, the approval is still recorded
+        // (honestly: the authority moved), and the recovery finishes the
+        // mirror later.
         let applied = prepared.into_applied(commit.registry_reloaded, commit.mirror_error.is_none());
         if let Err(e) = journal::record(&self.home_dir, &applied) {
             // The prepared entry stays: a retry settles it against the
@@ -986,13 +1003,24 @@ impl MethodHandler {
         }
         self.finalize_applied(rec, applied, proposal, ctx).await;
         if let Some(e) = mirror_error {
-            return mirror_failed(&e, json!({ "id": rec.id.as_str(), "decided": "approved", "side_effect": side_effect }));
+            return mirror_failed(
+                &e,
+                json!({
+                    "id": rec.id.as_str(),
+                    "decided": "approved",
+                    "side_effect": side_effect,
+                    "mirror_pending": true,
+                    "lock_wait_timeout": crate::agent_files::writer::is_lock_wait_timeout(&e),
+                }),
+            );
         }
         WsFrame::ok_response("", json!({ "id": rec.id.as_str(), "decided": "approved", "side_effect": side_effect }))
     }
 
     /// The decision is recorded as approved: drop the journal entry, write
-    /// the terminal audit row, retire the channel notice.
+    /// the terminal audit row, retire the channel notice. RM-027 round 5: a
+    /// mirror that is still behind keeps the entry as the "mirror pending"
+    /// record (`decision_recorded`) and schedules its recovery.
     async fn finalize_applied(
         &self,
         rec: &crate::approval::ApprovalRecord,
@@ -1000,7 +1028,16 @@ impl MethodHandler {
         proposal: Option<&Proposal>,
         ctx: &UserContext,
     ) {
-        journal::clear(&self.home_dir, rec.id.as_str());
+        if applied.mirror_synced {
+            journal::clear(&self.home_dir, rec.id.as_str());
+        } else {
+            let pending = applied.clone().mirror_pending_after_decision();
+            if let Err(e) = journal::record(&self.home_dir, &pending) {
+                warn!(approval_id = %rec.id, error = %e,
+                      "org_change mirror-pending journal entry could not be written (re-apply the placement to re-sync)");
+            }
+            self.spawn_mirror_recovery(rec.id.as_str());
+        }
         audit(
             &self.home_dir,
             "org_change_applied",
@@ -1033,7 +1070,38 @@ impl MethodHandler {
         ctx: &UserContext,
     ) -> WsFrame {
         let proposal = Proposal::from_record(rec);
+        // RM-027 round 5: a mirror the first attempt could not write (e.g.
+        // its bounded `agent.toml` lock wait ran out) is finished first —
+        // under the org lock, against the authority, bounded again. An
+        // approve click on an applied card is its recovery path. A denial
+        // never touches it (the change is live either way).
+        let applied = if approve && !applied.mirror_synced {
+            self.try_finish_mirror(rec, applied).await
+        } else {
+            applied
+        };
+        let mirror_error = (!applied.mirror_synced).then(|| MIRROR_STILL_PENDING.to_string());
         match &rec.status {
+            crate::approval::ApprovalStatus::Approved if applied.decision_recorded => {
+                // The decision and its audit landed earlier; only the mirror
+                // was pending. Nothing about the decision is redone.
+                let side_effect = json!({
+                    "applied": true,
+                    "agent_id": applied.agent_id,
+                    "before": oc::entry_json(&applied.before),
+                    "after": oc::entry_json(&applied.after),
+                    "mirror_synced": applied.mirror_synced,
+                });
+                let body = json!({ "id": rec.id.as_str(), "decided": "approved", "side_effect": side_effect });
+                match mirror_error {
+                    Some(e) => {
+                        let mut extra = body;
+                        extra["mirror_pending"] = json!(true);
+                        mirror_failed(&e, extra)
+                    }
+                    None => WsFrame::ok_response("", body),
+                }
+            }
             crate::approval::ApprovalStatus::Pending => {
                 if !approve {
                     // The change is live; recording a denial would lie.
@@ -1080,11 +1148,12 @@ impl MethodHandler {
                         return WsFrame::error_response("", &format!("無法鎖定這筆審核，決定沒有記錄：{e}"));
                     }
                 };
-                let keeper = broker.keep_decision_lease(&rec.id, &lease, oc::DECISION_LEASE_SECS);
+                let keeper =
+                    broker.keep_decision_lease(&rec.id, &lease, oc::DECISION_LEASE_SECS, oc::COMMITTED_LEASE_MAX);
                 // The change is already committed: the TTL no longer applies.
                 keeper.mark_committed();
                 let frame = self
-                    .complete_applied(broker, rec, &applied, proposal.as_ref(), ctx, None, Some(&lease))
+                    .complete_applied(broker, rec, &applied, proposal.as_ref(), ctx, mirror_error, Some(&lease))
                     .await;
                 drop(keeper);
                 broker.release_decision_lease(&rec.id, &lease).await;
@@ -1208,7 +1277,9 @@ impl MethodHandler {
 
     /// Write the placement into the `agent.toml` display mirror through the
     /// writer `agents.update` uses (current Admin re-checked inside the file
-    /// lock). Returns whether the registry re-scan succeeded.
+    /// lock). Returns whether the registry re-scan succeeded. RM-027 round 5:
+    /// the `agent.toml` lock wait is bounded ([`oc::MIRROR_LOCK_WAIT`]) —
+    /// every caller holds the global org lock.
     async fn sync_mirror(
         &self,
         agent_id: &str,
@@ -1218,30 +1289,52 @@ impl MethodHandler {
     ) -> Result<bool, String> {
         let home = self.home_dir.clone();
         let decider = ctx.clone();
-        let reports_to = after.reports_to.clone();
-        let department = after.department.clone();
-        let edit = crate::channel_reply::AgentTomlEdit {
-            source,
-            user_id: &ctx.user_id,
-            guard: move || {
-                crate::approval::operator_cli_gate::require_admin_decider(&home, &decider)
-                    .map_err(|_| "只有管理員可以套用組織調整".to_string())
-            },
-        };
-        crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, move |table| {
-            let agent = table
-                .get_mut("agent")
-                .and_then(|v| v.as_table_mut())
-                .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
-            agent.insert("reports_to".into(), toml::Value::String(reports_to));
-            if department.is_empty() {
-                agent.remove("department");
-            } else {
-                agent.insert("department".into(), toml::Value::String(department));
-            }
-            Ok(())
+        sync_mirror_with(&self.home_dir, &self.registry, agent_id, after, source, &ctx.user_id, move || {
+            crate::approval::operator_cli_gate::require_admin_decider(&home, &decider)
+                .map_err(|_| "只有管理員可以套用組織調整".to_string())
         })
         .await
+    }
+
+    /// One recovery attempt for the card's "mirror pending" journal entry;
+    /// returns the entry as it stands afterwards (`mirror_synced` when the
+    /// mirror now follows the authority).
+    async fn try_finish_mirror(
+        &self,
+        rec: &crate::approval::ApprovalRecord,
+        applied: journal::Applied,
+    ) -> journal::Applied {
+        match finish_pending_mirror(&self.home_dir, &self.registry, rec.id.as_str()).await {
+            Ok(true) => journal::Applied { mirror_synced: true, ..applied },
+            Ok(false) => applied,
+            Err(e) => {
+                warn!(approval_id = %rec.id, error = %e, "org_change mirror recovery failed (retried later)");
+                applied
+            }
+        }
+    }
+
+    /// Finish a "mirror pending" entry in the background (RM-027 round 5),
+    /// at [`oc::MIRROR_RECOVERY_DELAYS`]; stops as soon as it is settled.
+    fn spawn_mirror_recovery(&self, approval_id: &str) {
+        let home = self.home_dir.clone();
+        let registry = self.registry.clone();
+        let id = approval_id.to_string();
+        tokio::spawn(async move {
+            for delay in oc::MIRROR_RECOVERY_DELAYS {
+                tokio::time::sleep(delay).await;
+                match finish_pending_mirror(&home, &registry, &id).await {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(e) => warn!(approval_id = %id, error = %e, "org_change mirror recovery attempt failed"),
+                }
+            }
+            warn!(
+                approval_id = %id,
+                "org_change mirror still pending after the background retries — it finishes on the next \
+                 approve click on the card or when an Admin re-applies the placement"
+            );
+        });
     }
 
     /// Explicit drift record: the authority holds `after`, the mirror did not
@@ -1266,5 +1359,116 @@ impl MethodHandler {
                 "error": duduclaw_core::truncate_chars(error, 300),
             }),
         );
+    }
+}
+
+/// Write `after` into `agent_id`'s `agent.toml` display mirror. The caller
+/// holds the global org lock, so the `agent.toml` lock wait is bounded by
+/// [`oc::mirror_lock_wait`] (RM-027 round 5): past it nothing is written and
+/// the error carries `lock_wait_timeout` — the org lock is never pinned by a
+/// stuck writer. `guard` is re-checked inside the file lock.
+async fn sync_mirror_with<G>(
+    home: &Path,
+    registry: &Arc<RwLock<duduclaw_agent::registry::AgentRegistry>>,
+    agent_id: &str,
+    after: &OrgEntry,
+    source: &'static str,
+    user_id: &str,
+    guard: G,
+) -> Result<bool, String>
+where
+    G: FnOnce() -> Result<(), String>,
+{
+    let reports_to = after.reports_to.clone();
+    let department = after.department.clone();
+    let edit = crate::channel_reply::AgentTomlEdit { source, user_id, guard };
+    crate::channel_reply::update_agent_toml_edit_bounded(registry, agent_id, edit, oc::mirror_lock_wait(home), move |table| {
+        let agent = table
+            .get_mut("agent")
+            .and_then(|v| v.as_table_mut())
+            .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
+        agent.insert("reports_to".into(), toml::Value::String(reports_to));
+        if department.is_empty() {
+            agent.remove("department");
+        } else {
+            agent.insert("department".into(), toml::Value::String(department));
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// RM-027 round 5 — the recovery of a "mirror pending" journal entry: the
+/// authority committed an approved placement but the `agent.toml` mirror did
+/// not follow (its bounded lock wait ran out, or the write was refused).
+///
+/// Under the global org lock: re-read the entry; when the authority still
+/// holds `after` and the mirror differs, write the mirror (bounded again,
+/// system guard — the mirror only follows what an authorized Admin's
+/// approval already committed to the authority). A mirror that already
+/// matches, or an authority that a later change moved on (that change owns
+/// the mirror now), settles the entry too. Settled ⇒ the entry is removed
+/// once the decision is recorded (`decision_recorded`), else kept with
+/// `mirror_synced = true` for the decision recovery.
+///
+/// `Ok(true)` = settled (or nothing to do); `Ok(false)` = still pending.
+pub(crate) async fn finish_pending_mirror(
+    home: &Path,
+    registry: &Arc<RwLock<duduclaw_agent::registry::AgentRegistry>>,
+    approval_id: &str,
+) -> Result<bool, String> {
+    let org_lock = lock_org(home).await?;
+    let Some(entry) = journal::read(home, approval_id)? else { return Ok(true) };
+    if entry.state != journal::State::Applied {
+        // Not committed (yet): the prepared-entry settlement owns it.
+        return Ok(false);
+    }
+    let settle = |entry: journal::Applied| -> Result<bool, String> {
+        if entry.decision_recorded {
+            journal::clear(home, approval_id);
+        } else {
+            journal::record(home, &journal::Applied { mirror_synced: true, ..entry })?;
+        }
+        Ok(true)
+    };
+    if entry.mirror_synced {
+        return settle(entry);
+    }
+    let store = org_lock.load().map_err(|e| e.to_string())?;
+    if store.get(&entry.agent_id) != Some(&entry.after) {
+        info!(
+            approval_id,
+            agent = %entry.agent_id,
+            "org_change mirror recovery: the authority moved on since — the later change owns the mirror"
+        );
+        return settle(entry);
+    }
+    if mirror_of(home, &entry.agent_id).as_ref() == Some(&entry.after) {
+        return settle(entry);
+    }
+    match sync_mirror_with(home, registry, &entry.agent_id, &entry.after, "org.mirror_recovery", "system", || Ok(())).await {
+        Ok(reloaded) => {
+            audit(
+                home,
+                "org_change_mirror_resynced",
+                &entry.agent_id,
+                duduclaw_security::audit::Severity::Info,
+                json!({
+                    "agent_id": entry.agent_id,
+                    "placement": oc::entry_json(&entry.after),
+                    "approval_id": approval_id,
+                    "actor": "system",
+                    "source": "org.mirror_recovery",
+                    "registry_reloaded": reloaded,
+                }),
+            );
+            let settled = settle(entry);
+            drop(org_lock);
+            settled
+        }
+        Err(e) => {
+            warn!(approval_id, agent = %entry.agent_id, error = %e, "org_change mirror recovery: the mirror is still behind");
+            Ok(false)
+        }
     }
 }
