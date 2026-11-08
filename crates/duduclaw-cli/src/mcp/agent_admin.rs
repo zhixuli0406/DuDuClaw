@@ -77,6 +77,23 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
         });
     }
 
+    // RM-027 round 6: the employee's MCP credential store is a per-agent
+    // file lock taken while the org lock is held — bounded, and taken BEFORE
+    // anything moves, so a stuck writer fails the removal with nothing
+    // changed instead of pinning the org lock (or leaving a trashed employee
+    // whose credentials could not be cleaned up).
+    let store = match duduclaw_security::mcp_secret_store::lock_agent_store_within(
+        home_dir,
+        agent_id,
+        org_locked_file_wait(home_dir),
+    ) {
+        Ok(store) => store,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            return org_locked_wait_timeout_error("MCP 憑證儲存", &e.to_string());
+        }
+        Err(e) => return tool_error(&format!("Error: MCP 憑證儲存無法鎖定，AI 員工沒有移除：{e}")),
+    };
+
     // Move to trash instead of hard delete
     let trash_dir = home_dir.join("agents").join("_trash");
     let _ = std::fs::create_dir_all(&trash_dir);
@@ -99,7 +116,7 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
         tracing::warn!(agent = %agent_id, error = %e, "org.toml removal failed on agent_remove");
     }
 
-    if let Err(e) = duduclaw_security::mcp_secret_store::remove_agent(home_dir, agent_id) {
+    if let Err(e) = store.remove() {
         tracing::warn!(agent = %agent_id, error = %e, "MCP credential cleanup failed after agent removal");
         return tool_error("Employee removed, but encrypted MCP credential cleanup failed");
     }

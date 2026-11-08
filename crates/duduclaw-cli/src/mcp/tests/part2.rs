@@ -225,6 +225,69 @@ async fn gated_writers_keep_store_and_mirror_in_sync() {
     );
 }
 
+/// RM-027 round 6: an MCP `agent_update` re-parent holds the global org lock
+/// while it writes `agent.toml`. A stuck writer on that file used to pin the
+/// org lock forever; the wait is now bounded — the update fails with a clear
+/// `lock_wait_timeout`, writes nothing (neither the mirror nor the
+/// authority), releases the org lock, and succeeds once the writer is gone.
+#[tokio::test]
+async fn cli_agent_update_bounded_lock_wait() {
+    use crate::mcp::agent_update::org_locked_wait_override;
+    let tmp = delegation_home();
+    let home = tmp.path();
+    duduclaw_core::org_store::seed_if_absent(home).unwrap();
+    org_locked_wait_override::set(home, std::time::Duration::from_millis(300));
+    let toml_path = home.join("agents/sales-rep/agent.toml");
+    let before = fs::read_to_string(&toml_path).unwrap();
+    // A stuck writer holds sales-rep's agent.toml advisory lock.
+    let stuck = duduclaw_core::fs_lock::lock_exclusive(&toml_path).unwrap();
+
+    let started = std::time::Instant::now();
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "reports_to": "sales-rep2" }),
+            home,
+            "sales-lead",
+        ),
+    )
+    .await
+    .expect("agent_update must not wait unboundedly for the stuck agent.toml writer");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(out["isError"], true, "{out}");
+    let text = update_text(&out);
+    assert!(text.contains("lock_wait_timeout"), "{text}");
+    // Nothing written: the mirror and the authority are unchanged.
+    assert_eq!(fs::read_to_string(&toml_path).unwrap(), before);
+    assert_eq!(
+        duduclaw_core::org_store::load(home).get("sales-rep").unwrap().reports_to,
+        "sales-lead"
+    );
+    // The org lock was released: another thread takes it at once.
+    let h = home.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(duduclaw_core::org_store::lock_org_mutations(&h).map(drop).is_ok());
+    });
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "the org lock must be free");
+
+    // The writer is gone: the same update goes through.
+    drop(stuck);
+    let out = handle_agent_update(
+        &serde_json::json!({ "agent_id": "sales-rep", "reports_to": "sales-rep2" }),
+        home,
+        "sales-lead",
+    )
+    .await;
+    assert_ne!(out["isError"], true, "{out}");
+    assert_eq!(
+        duduclaw_core::org_store::load(home).get("sales-rep").unwrap().reports_to,
+        "sales-rep2"
+    );
+    assert!(duduclaw_core::org_store::detect_drift(home).is_empty());
+    org_locked_wait_override::clear(home);
+}
+
 /// RM-027 round 4, finding 1: `create_agent` takes the org lock at its
 /// start — while another writer holds it the new employee is not visible
 /// (no directory, no staging dir, no row) — and publishes directory and

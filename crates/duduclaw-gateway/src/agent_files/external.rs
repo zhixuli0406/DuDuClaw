@@ -65,9 +65,10 @@ pub fn write_file(
     baseline: ExternalBaseline,
     render: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<ExternalOutcome, String> {
-    write_file_guarded(home, agent_id, file, source, user_id, baseline, render, || Ok(()), false)
+    write_file_guarded(home, agent_id, file, source, user_id, baseline, render, || Ok(()), false, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_file_guarded(
     home: &Path,
     agent_id: &str,
@@ -78,6 +79,7 @@ fn write_file_guarded(
     render: impl FnOnce(&str) -> Result<String, String>,
     guard: impl FnOnce() -> Result<(), String>,
     force_lifecycle_barrier: bool,
+    lock_wait: Option<std::time::Duration>,
 ) -> Result<ExternalOutcome, String> {
     let c = Commit {
         home,
@@ -90,7 +92,10 @@ fn write_file_guarded(
             ExternalBaseline::AcceptIfWasIntact => Baseline::AcceptIfWasIntact,
         },
     };
-    let o = writer::run_blocking(|| writer::commit_locked_with_lifecycle(&c, render, guard, force_lifecycle_barrier)).map_err(|e| e.message())?;
+    let o = writer::run_blocking(|| {
+        writer::commit_locked_with_lifecycle_within(&c, render, guard, force_lifecycle_barrier, lock_wait)
+    })
+    .map_err(|e| e.message())?;
     Ok(ExternalOutcome { before: o.before, after: o.after, changed: !o.unchanged, version_id: o.version_id })
 }
 
@@ -116,11 +121,37 @@ pub fn edit_agent_toml_guarded(
     guard: impl FnOnce() -> Result<(), String>,
     force_lifecycle_barrier: bool,
 ) -> Result<ExternalOutcome, String> {
+    edit_agent_toml_guarded_within(home, agent_id, source, user_id, mutate, guard, force_lifecycle_barrier, None)
+}
+
+/// [`edit_agent_toml_guarded`] with an optional hard bound on the
+/// `agent.toml` lock wait. RM-027 round 6: a caller holding the global org
+/// lock passes `Some(duduclaw_core::org_store::MIRROR_LOCK_WAIT)`; past it
+/// the edit fails with a `lock_wait_timeout` error (see
+/// [`is_lock_wait_timeout`]) and nothing — `mutate`, `guard`, the file — ran
+/// or was written.
+#[allow(clippy::too_many_arguments)]
+pub fn edit_agent_toml_guarded_within(
+    home: &Path,
+    agent_id: &str,
+    source: &'static str,
+    user_id: &str,
+    mutate: impl FnOnce(&mut toml::Table) -> Result<(), String>,
+    guard: impl FnOnce() -> Result<(), String>,
+    force_lifecycle_barrier: bool,
+    lock_wait: Option<std::time::Duration>,
+) -> Result<ExternalOutcome, String> {
     write_file_guarded(home, agent_id, ExternalFile::AgentToml, source, user_id, ExternalBaseline::Accept, |current| {
         let mut table: toml::Table = current.parse().map_err(|e| format!("agent.toml does not parse: {e}"))?;
         mutate(&mut table)?;
         crate::handlers::config_commit::render_preserving(current, &table)
-    }, guard, force_lifecycle_barrier)
+    }, guard, force_lifecycle_barrier, lock_wait)
+}
+
+/// Does an error from [`edit_agent_toml_guarded_within`] report a bounded
+/// lock wait that ran out (nothing written)?
+pub fn is_lock_wait_timeout(message: &str) -> bool {
+    writer::is_lock_wait_timeout(message)
 }
 
 /// Bring `raw` (the file as written) along with a typed edit: every key

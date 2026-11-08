@@ -134,6 +134,21 @@ pub(crate) fn commit_locked_with_lifecycle(
     commit_locked_inner(c, render, guard, force_lifecycle_barrier, None)
 }
 
+/// [`commit_locked_with_lifecycle`] with an optional hard bound on the
+/// advisory file-lock wait (`Some(d)`: give up after `d` with a
+/// [`LOCK_WAIT_TIMEOUT`] error, nothing written). RM-027 round 6: for an
+/// out-of-process writer (the CLI's MCP `agent_update`) that holds the
+/// global org lock.
+pub(crate) fn commit_locked_with_lifecycle_within(
+    c: &Commit<'_>,
+    render: impl FnOnce(&str) -> Result<String, String>,
+    guard: impl FnOnce() -> Result<(), String>,
+    force_lifecycle_barrier: bool,
+    lock_wait: Option<std::time::Duration>,
+) -> Result<Outcome, CommitError> {
+    commit_locked_inner(c, render, guard, force_lifecycle_barrier, lock_wait)
+}
+
 /// Marker carried by every [`CommitError::Failed`] that means "the file lock
 /// was not acquired within the caller's bound — nothing was written".
 pub(crate) const LOCK_WAIT_TIMEOUT: &str = "lock_wait_timeout";

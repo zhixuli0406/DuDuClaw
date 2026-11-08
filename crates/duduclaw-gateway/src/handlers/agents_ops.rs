@@ -293,8 +293,9 @@ impl MethodHandler {
     /// directory publish) must hand it to [`Self::restore_demoted_main`] on
     /// every failure, so the old main never stays `specialist` for a create
     /// that did not happen. The `agent.toml` lock wait is bounded by
-    /// [`crate::org_change_approval::MIRROR_LOCK_WAIT`] (creation calls this
-    /// under the global org lock).
+    /// [`crate::org_change_approval::MIRROR_LOCK_WAIT`] (creation and, since
+    /// round 6, an `agents.update` promotion call this under the global org
+    /// lock, and restore on failure).
     pub(crate) async fn demote_current_main(&self, except_id: &str) -> Result<Option<MainDemotion>, String> {
         let current_main = {
             let reg = self.registry.read().await;
@@ -340,7 +341,7 @@ impl MethodHandler {
                 .await;
             match result {
                 Ok(()) => {
-                    info!(old_main = old_main.as_str(), "Restored the previous main agent after a failed create");
+                    info!(old_main = old_main.as_str(), "Restored the previous main agent after a failed create / promotion");
                     return Ok(());
                 }
                 Err(e) => {

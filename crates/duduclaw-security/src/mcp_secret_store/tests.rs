@@ -45,6 +45,27 @@ fn config() -> Value {
     }})
 }
 
+/// RM-027 round 6: the store lock for a removal is taken with a bounded wait
+/// (the caller holds the global org lock): a held store times out with
+/// `lock_wait_timeout` and is left untouched; once free it is removed.
+#[test]
+fn bounded_store_lock_times_out_then_removes() {
+    let home = Home::new();
+    let protected = store_mcp_env(home.path(), "alice", "vendor", &env(json!({"TOKEN":"sk-test-only"}))).unwrap();
+    assert_eq!(protected["TOKEN"], "secret://mcp/vendor/TOKEN");
+    let path = home.path().join("secrets/mcp/alice.enc");
+    let held = duduclaw_core::fs_lock::lock_exclusive(&path).unwrap();
+    let err = lock_agent_store_within(home.path(), "alice", std::time::Duration::from_millis(100)).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert!(err.to_string().contains("lock_wait_timeout"), "{err}");
+    assert!(path.exists(), "a timed-out removal changes nothing");
+    drop(held);
+    lock_agent_store_within(home.path(), "alice", std::time::Duration::from_millis(100)).unwrap().remove().unwrap();
+    assert!(!path.exists());
+    // No store: nothing to lock, nothing to remove.
+    lock_agent_store_within(home.path(), "bob", std::time::Duration::from_millis(100)).unwrap().remove().unwrap();
+}
+
 #[test]
 fn round_trip_seals_third_party_values_and_preserves_duduclaw_env() {
     let home = Home::new();

@@ -198,12 +198,11 @@ impl MethodHandler {
             }
         };
 
-        // If promoting to main, demote the current main agent first
-        if let Some("main") = params.get("role").and_then(|v| v.as_str()) {
-            if let Err(e) = self.demote_current_main(&agent_id).await {
-                return WsFrame::error_response("", &e);
-            }
-        }
+        // RM-027 round 6: promoting to main demotes the current main — but
+        // only under the global org lock and right before the write (below),
+        // and a failed write puts the old main back (`MainDemotion`). Never
+        // here, ahead of the refusals that follow.
+        let promote_main = params.get("role").and_then(|v| v.as_str()) == Some("main");
 
         // One Telegram bot per employee (B11): refuse a bot another employee
         // already uses before anything is written; the bind lock is held
@@ -349,7 +348,9 @@ impl MethodHandler {
         // mirror write puts the previous authority entry back (still inside
         // the lock), so a refused request never moves the employee. A
         // non-admin's move is never pre-written: the closure refuses it.
-        let mut org_lock = if org_params {
+        // A promotion to main holds it too (round 6): the demotion of the
+        // old main, the write and any restore form one org mutation.
+        let mut org_lock = if org_params || promote_main {
             match super::org_change_rpc::lock_org(&self.home_dir).await {
                 Ok(g) => Some(g),
                 Err(e) => return WsFrame::error_response("", &e),
@@ -421,6 +422,29 @@ impl MethodHandler {
         // is bounded — a stuck writer fails this update (the pre-written
         // authority entry is put back below) instead of pinning the org lock.
         let lock_wait = org_lock.as_ref().map(|_| crate::org_change_approval::mirror_lock_wait(&self.home_dir));
+
+        // RM-027 round 6: the demotion happens here — under the org lock,
+        // after every refusal above, right before the write — with its
+        // `agent.toml` wait bounded. A failed demotion writes nothing else;
+        // the pre-written authority entry (if any) is put back.
+        let demotion = if promote_main {
+            match self.demote_current_main(&agent_id).await {
+                Ok(d) => d,
+                Err(e) => {
+                    let rollback = match (org_lock.take(), &org_prewrite) {
+                        (Some(lock), Some((prior, _))) => lock.restore(&agent_id, prior.clone()).err(),
+                        _ => None,
+                    };
+                    return WsFrame::error_response("", &match rollback {
+                        None => e,
+                        Some(re) => format!("{e}（另外，組織權威資料沒有還原成功：{re}；請管理員在組織圖確認這位 AI 員工的位置）"),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         let result = self.update_agent_toml_as_within(&agent_id, "agents.update", caller, session, lock_wait, move |table| {
             // v1.68: snapshot for the authority diff and the final typed
             // check (only enforced when the file parsed before this write, so
@@ -1348,6 +1372,18 @@ impl MethodHandler {
                 )
             }
             Err(e) => {
+                // RM-027 round 6: the promotion did not happen, so the main
+                // it demoted is put back — still under the org lock.
+                let e = match demotion {
+                    Some(d) => match self.restore_demoted_main(d).await {
+                        Ok(()) => e,
+                        Err(re) => format!(
+                            "{e}（另外，原本的主代理沒有成功恢復為主代理：{}；請管理員在 AI 員工設定把它改回主代理）",
+                            duduclaw_core::truncate_chars(&re, 300)
+                        ),
+                    },
+                    None => e,
+                };
                 // The mirror was not written: put the authority back so a
                 // refused request never moves the employee.
                 if let (Some(lock), Some((prior, written))) = (org_lock.take(), &org_prewrite)

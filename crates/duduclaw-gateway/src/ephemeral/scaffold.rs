@@ -265,7 +265,10 @@ pub(super) fn scaffold_with(
     // from the moment it is counted; dropping it (any early return) frees
     // the slot and leaves nothing behind.
     let mut staged: Option<duduclaw_core::org_store::StagedAgentDir> = None;
-    duduclaw_core::with_file_lock(&root, || {
+    // RM-027 round 6: taken while the org lock is held, so the wait is
+    // bounded (`MIRROR_LOCK_WAIT`): past it the scaffold fails with a
+    // `lock_wait_timeout` error and nothing is created.
+    duduclaw_core::with_file_lock_timeout(&root, duduclaw_core::org_store::MIRROR_LOCK_WAIT, || {
         check_parent_autonomy(home_dir, &spec.parent).map_err(std::io::Error::other)?;
         if active_count(&root) >= cap {
             return Ok(());

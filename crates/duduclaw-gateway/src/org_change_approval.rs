@@ -48,7 +48,9 @@ pub(crate) const DECISION_LEASE_SECS: i64 = 120;
 /// unrenewed lease outlives one full wait, and the org lock is never pinned
 /// longer than this by a stuck writer. Past it the authority stays committed,
 /// the journal records "mirror pending" and the recovery finishes the mirror.
-pub(crate) const MIRROR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Round 6: the value lives in core ([`duduclaw_core::org_store::MIRROR_LOCK_WAIT`])
+/// so the CLI's org-lock holders use the same bound.
+pub(crate) const MIRROR_LOCK_WAIT: std::time::Duration = duduclaw_core::org_store::MIRROR_LOCK_WAIT;
 /// RM-027 round 5: the maximum life of a decision lease after its holder
 /// committed (counted from `mark_committed`). What is left at that point is
 /// one bounded mirror write ([`MIRROR_LOCK_WAIT`]), a journal write, the

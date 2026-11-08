@@ -735,6 +735,15 @@ pub const ORG_MUTATION_LOCK: &str = "org-mutation";
 /// (`org_change_journal/<id>.json`). AI-unwritable like `org.toml`.
 pub const ORG_CHANGE_JOURNAL_DIR: &str = "org_change_journal";
 
+/// RM-027 round 5 (moved to core in round 6 so the CLI shares it): the
+/// longest a writer holding the global org lock ([`OrgMutationGuard`]) waits
+/// for an `agent.toml` — or any other per-agent file — lock (in-process
+/// mutex + advisory lock, one budget). An ordinary write holds such a lock
+/// for milliseconds; 30 s absorbs a slow disk or a lifecycle-barrier drain
+/// (the admission wait is also 30 s). Past it the waiter gives up with a
+/// `lock_wait_timeout` error and writes nothing.
+pub const MIRROR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `<home>/locks/org-mutation` (the advisory lock lives on `<that>.lock`).
 pub fn org_mutation_lock_path(home: &Path) -> PathBuf {
     home.join("locks").join(ORG_MUTATION_LOCK)
@@ -766,6 +775,11 @@ pub fn org_mutation_lock_path(home: &Path) -> PathBuf {
 /// lock while holding an `agent.toml` lock or the barrier.
 ///
 /// Not re-entrant: never take it twice in one call chain.
+///
+/// RM-027 round 5/6: while this lock is held, every wait on an `agent.toml`
+/// (or other per-agent file) lock is bounded by [`MIRROR_LOCK_WAIT`] — a
+/// stuck writer fails the org mutation (nothing written) instead of pinning
+/// this lock for every other org writer.
 #[derive(Debug)]
 pub struct OrgMutationGuard {
     home: PathBuf,

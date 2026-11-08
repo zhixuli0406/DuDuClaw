@@ -1028,6 +1028,78 @@ async fn mirror_lock_timeout_releases_org_lock_and_journal_finishes_later() {
     mirror_wait_override::clear(&f.home);
 }
 
+/// Round 6: `agents.update` promoting an employee to Main used to demote the
+/// current Main first — before taking the org lock and before any of the
+/// refusals that followed — so a failed update left the company with no
+/// Main. The demotion now runs under the org lock right before the write,
+/// and any failure of the write restores the old Main.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_update_promote_failure_restores_previous_main() {
+    use crate::org_change_approval::mirror_wait_override;
+    let f = fixture().await;
+    ok(&f.h.handle_agents_create_as(json!({ "name": "boss", "role": "main" }), Some(&f.admin)).await);
+    let role = |id: &str| -> String {
+        let raw = std::fs::read_to_string(f.home.join("agents").join(id).join("agent.toml")).unwrap();
+        raw.parse::<toml::Table>().unwrap()["agent"]["role"].as_str().unwrap().to_string()
+    };
+    assert_eq!(role("boss"), "main");
+    assert_eq!(role("rep"), "specialist");
+    let rep_before = std::fs::read_to_string(f.home.join("agents/rep/agent.toml")).unwrap();
+
+    // (a) The write itself is refused (an invalid field in the same request).
+    let (_, e) = refusal(&f
+        .h
+        .handle_agents_update_as(json!({ "agent_id": "rep", "role": "main", "status": "bogus" }), Some(&f.admin))
+        .await);
+    assert!(e.contains("Invalid status"), "{e}");
+    assert!(!e.contains("沒有成功恢復"), "the restore must have succeeded: {e}");
+    assert_eq!(role("boss"), "main", "the previous main is restored after a refused promotion");
+    assert_eq!(std::fs::read_to_string(f.home.join("agents/rep/agent.toml")).unwrap(), rep_before);
+    assert_eq!(
+        f.h.registry.read().await.main_agent().map(|a| a.config.agent.name.clone()).as_deref(),
+        Some("boss"),
+        "the registry sees the restored main"
+    );
+
+    // (b) A stuck writer on the promoted employee's agent.toml: the bounded
+    // wait runs out (org lock held), the update fails, the old Main is back.
+    mirror_wait_override::set(&f.home, std::time::Duration::from_millis(300));
+    let stuck = duduclaw_core::fs_lock::lock_exclusive(&f.home.join("agents/rep/agent.toml")).unwrap();
+    let frame = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.h.handle_agents_update_as(json!({ "agent_id": "rep", "role": "main" }), Some(&f.admin)),
+    )
+    .await
+    .expect("the promotion must not wait unboundedly for the stuck writer");
+    let (_, e) = refusal(&frame);
+    assert!(crate::agent_files::writer::is_lock_wait_timeout(&e), "{e}");
+    assert!(!e.contains("沒有成功恢復"), "the restore must have succeeded: {e}");
+    assert_eq!(role("boss"), "main", "the previous main is restored after a lock-wait timeout");
+    assert_eq!(role("rep"), "specialist");
+    assert_eq!(
+        f.h.registry.read().await.main_agent().map(|a| a.config.agent.name.clone()).as_deref(),
+        Some("boss")
+    );
+    // The org lock was released.
+    let home = f.home.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(org_store::lock_org_mutations(&home).map(drop).is_ok());
+    });
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "the org lock must be free");
+
+    // (c) The writer is gone: the promotion goes through and demotes boss.
+    drop(stuck);
+    ok(&f.h.handle_agents_update_as(json!({ "agent_id": "rep", "role": "main" }), Some(&f.admin)).await);
+    assert_eq!(role("rep"), "main");
+    assert_eq!(role("boss"), "specialist");
+    assert_eq!(
+        f.h.registry.read().await.main_agent().map(|a| a.config.agent.name.clone()).as_deref(),
+        Some("rep")
+    );
+    mirror_wait_override::clear(&f.home);
+}
+
 /// Round 5, finding 3: creating a new Main demotes the current one before
 /// the authority commit / publish. When that commit is refused (a cycle in
 /// the effective tree, a corrupt authority), the create fails — and the old

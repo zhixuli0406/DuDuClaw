@@ -51,6 +51,15 @@ pub fn lock_exclusive(path: &Path) -> io::Result<FileLockGuard> {
     Ok(FileLockGuard { file: acquire(path)? })
 }
 
+/// [`lock_exclusive`] with a **hard upper bound** on the wait: when the lock
+/// is not acquired within `wait`, an [`io::ErrorKind::TimedOut`] error
+/// (message starting `lock_wait_timeout`) is returned and nothing is held.
+/// RM-027 round 6: for a holder of the global org lock that must keep a
+/// per-agent file lock across several steps.
+pub fn lock_exclusive_within(path: &Path, wait: std::time::Duration) -> io::Result<FileLockGuard> {
+    Ok(FileLockGuard { file: acquire_within(path, wait)? })
+}
+
 /// [`with_file_lock`] with a **hard upper bound** on the wait: when the lock
 /// is not acquired within `wait`, `f` does not run and an
 /// [`io::ErrorKind::TimedOut`] error is returned. For a caller that must not
@@ -188,6 +197,21 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         drop(held);
         assert_eq!(with_file_lock_timeout(&target, std::time::Duration::from_millis(150), || Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_bounded_guard_times_out_then_succeeds_once_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bounded-guard");
+        let held = lock_exclusive(&target).unwrap();
+        let err = lock_exclusive_within(&target, std::time::Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("lock_wait_timeout"), "{err}");
+        drop(held);
+        let guard = lock_exclusive_within(&target, std::time::Duration::from_millis(100)).unwrap();
+        // The bounded guard excludes a closure-style holder too.
+        assert!(with_file_lock_timeout(&target, std::time::Duration::from_millis(50), || Ok(())).is_err());
+        drop(guard);
     }
 
     #[test]

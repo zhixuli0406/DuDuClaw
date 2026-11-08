@@ -1,5 +1,54 @@
 use super::*;
 
+/// RM-027 round 6: how long a CLI writer that holds the global org lock waits
+/// for an `agent.toml` (or other per-agent file) lock —
+/// [`duduclaw_core::org_store::MIRROR_LOCK_WAIT`], the bound the gateway's
+/// org-lock holders use. Tests shorten it per home.
+pub(crate) fn org_locked_file_wait(home: &Path) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = org_locked_wait_override::get(home) {
+            return d;
+        }
+    }
+    let _ = home;
+    duduclaw_core::org_store::MIRROR_LOCK_WAIT
+}
+
+/// Test seam: a shorter [`org_locked_file_wait`] for one home.
+#[cfg(test)]
+pub(crate) mod org_locked_wait_override {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static WAITS: Mutex<BTreeMap<PathBuf, Duration>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn set(home: &Path, wait: Duration) {
+        WAITS.lock().unwrap().insert(home.to_path_buf(), wait);
+    }
+
+    pub(crate) fn clear(home: &Path) {
+        WAITS.lock().unwrap().remove(home);
+    }
+
+    pub(super) fn get(home: &Path) -> Option<Duration> {
+        WAITS.lock().unwrap().get(home).copied()
+    }
+}
+
+/// The tool error for a per-agent file lock that was not acquired within
+/// [`org_locked_file_wait`] while the org lock was held: nothing was written.
+pub(crate) fn org_locked_wait_timeout_error(what: &str, detail: &str) -> Value {
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Error: lock_wait_timeout — {what} 正被其他寫入佔用，等待後仍無法取得寫入鎖，沒有做任何變更（組織資料也沒有改動）；請稍後再試。（{detail}）"
+        )}],
+        "isError": true
+    })
+}
+
 // Update one or more fields in an existing agent's agent.toml.
 //
 // Reads the current config, applies the requested changes, and writes back.
@@ -629,7 +678,12 @@ pub(crate) async fn handle_agent_update(
     };
     // The authority entry before this write, once it was replaced.
     let mut org_prior: Option<Option<duduclaw_core::OrgEntry>> = None;
-    let written = duduclaw_gateway::agent_files::external::edit_agent_toml_guarded(home_dir, agent_id, "mcp", caller, |raw| {
+    // RM-027 round 6: while the org lock is held the agent.toml lock wait is
+    // bounded — a stuck writer fails this update (nothing written, the
+    // authority untouched: the guard below never ran) instead of pinning the
+    // org lock for every other org writer.
+    let lock_wait = org_lock.as_ref().map(|_| org_locked_file_wait(home_dir));
+    let written = duduclaw_gateway::agent_files::external::edit_agent_toml_guarded_within(home_dir, agent_id, "mcp", caller, |raw| {
         duduclaw_gateway::agent_files::external::apply_typed_changes(raw, &before_t, &after_t);
         // A requested stop must reach the fresh artifact even if the initial
         // snapshot had that status already and another writer resumed it.
@@ -667,15 +721,20 @@ pub(crate) async fn handle_agent_update(
             org_prior = Some(store.get(agent_id).cloned());
         }
         Ok(())
-    }, stopping);
+    }, stopping, lock_wait);
     drop(admission);
     if let Err(e) = written {
         // The mirror was not written: put the authority back (still inside
-        // the org lock) so a failed request moves nobody.
+        // the org lock) so a failed request moves nobody. (On a lock-wait
+        // timeout the guard never ran, so there is nothing to put back.)
         if let (Some(lock), Some(prior)) = (org_lock.as_ref(), org_prior.take())
             && let Err(re) = lock.restore(agent_id, prior)
         {
             tracing::warn!(agent = %agent_id, error = %re, "org.toml rollback failed on agent_update");
+        }
+        drop(org_lock);
+        if duduclaw_gateway::agent_files::external::is_lock_wait_timeout(&e) {
+            return org_locked_wait_timeout_error("agent.toml", &e);
         }
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
