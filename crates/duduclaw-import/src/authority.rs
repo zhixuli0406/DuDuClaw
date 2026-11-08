@@ -344,18 +344,30 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH,128);
     check_sqlite(&conn)?;
     let version=crate::catalog::detect(&conn,crate::catalog::Store::Tasks,None)?.version;
-    conn.authorizer(Some(move |c:AuthContext<'_>|match c.action {
+    conn.authorizer(Some(move |c:AuthContext<'_>| {
+        // SQLite names the FROM-clause subquery being resolved as the accessor,
+        // so reads inside the CTE body arrive with accessor `a2a`, not None.
+        // `a2a` is the fixed name of the CTE in `task_goal_query`. Views and
+        // triggers are disabled and refused by the catalog check, so no source
+        // object can borrow the name. Only the trace columns get this grant.
+        let top=c.accessor.is_none();
+        let a2a_cte=c.accessor==Some("a2a");
+        match c.action {
         // The A2A exclusion follows parent links with a recursive CTE.
         AuthAction::Select|AuthAction::Recursive=>Authorization::Allow,
         AuthAction::Read {table_name:"tasks",column_name:"id"|"title"|"description"|"assigned_to"|"kind"|"goal_mode"|"status"|"acceptance_criteria"|"created_via"|"created_by"|"parent_task_id"}
         |AuthAction::Read {table_name:"assign_schedules",column_name:"id"|"agent_id"|"title"|"payload_json"|"schedule_json"|"status"|"timezone"}
         |AuthAction::Read {table_name:"responsibilities",column_name:"responsibility_id"|"owner_agent_id"|"objective"|"acceptance_template"|"scope_json"|"notification_policy_json"|"schedule_json"|"occurrence_hours"|"occurrence_cost_cap_cents"|"budget_period"|"budget_timezone"|"period_cost_limit_cents"|"period_occurrence_limit"|"min_wake_interval_secs"|"max_consecutive_failures"|"stop_at"|"state"}
-            if c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
+            if c.database_name==Some("main") && top=>Authorization::Allow,
+        // Columns the CTE body reads: the task link and the A2A traces.
+        AuthAction::Read {table_name:"tasks",column_name:"id"|"created_via"|"created_by"|"parent_task_id"}
+            if c.database_name==Some("main") && a2a_cte=>Authorization::Allow,
         // Owner columns exist only in the v1.80 catalog.
         AuthAction::Read {table_name:"tasks",column_name:"a2a_owner"}
         |AuthAction::Read {table_name:"task_access_principals",column_name:"task_id"}
-            if version==crate::catalog::SchemaVersion::V180 && c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
+            if version==crate::catalog::SchemaVersion::V180 && c.database_name==Some("main") && (top||a2a_cte)=>Authorization::Allow,
         _=>Authorization::Deny,
+        }
     }));
     // A2A-owned work is private to its external principal; republishing it as
     // ordinary employee goals would drop that owner restriction. It stays quarantined.
