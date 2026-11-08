@@ -226,10 +226,11 @@ pub fn employee_dir(home_dir: &Path, agent_id: &str) -> Option<PathBuf> {
 pub struct VettedDir {
     /// Canonical directory to scan.
     path: PathBuf,
-    /// Canonical allowed root the descriptor walk starts from: the parent of
-    /// the employee's own directory (`agents/` or `agents/.ephemeral/`) when
-    /// the target IS the own directory, the own directory when the target is
-    /// below it, else the operator-declared root that contains it.
+    /// Canonical allowed root the descriptor walk starts from: the trusted
+    /// `<home>/agents/` directory whenever the target is the employee's own
+    /// directory or below it (`rel` then starts with `<id>`, or with
+    /// `.ephemeral`, `<id>` for a role member), else the operator-declared
+    /// root that contains it.
     anchor: PathBuf,
     /// Normal components from `anchor` to `path`.
     rel: Vec<String>,
@@ -300,12 +301,22 @@ pub fn vet_dir(raw: &str, home_dir: &Path, agent_id: &str) -> Result<VettedDir, 
     let own_real = own
         .canonicalize()
         .map_err(|e| format!("目錄「{}」無法讀取：{e}", own.display()))?;
-    let anchor = if real == own_real {
-        // The implicit (or explicitly named) own directory: its mount must be
-        // the one its parent `agents/` (or `agents/.ephemeral/`) lives on.
-        own_real.parent().map(Path::to_path_buf).ok_or_else(outside)?
-    } else if real.starts_with(&own_real) {
-        own_real.clone()
+    let anchor = if real.starts_with(&own_real) {
+        // The own directory or anything below it — for an employee
+        // `agents/<id>/…`, for a role member `agents/.ephemeral/<id>/…` — is
+        // always walked from the trusted `agents/` directory itself, so every
+        // component on the way (`.ephemeral`, `<id>`, then the sub-root) is
+        // opened no-follow and compared with the `agents/` mount. Anchoring
+        // at the own directory (or at `.ephemeral`) would make a bind-mounted
+        // own directory (or `.ephemeral`) the mount baseline (Daybreak Low).
+        let agents_real = home_dir
+            .join("agents")
+            .canonicalize()
+            .map_err(|e| format!("目錄「{}」無法讀取：{e}", home_dir.join("agents").display()))?;
+        if own_real == agents_real || !own_real.starts_with(&agents_real) {
+            return Err(outside());
+        }
+        agents_real
     } else {
         operator_roots
             .iter()
@@ -408,14 +419,17 @@ pub struct ContainedTree {
 }
 
 impl ContainedTree {
-    /// Open a [`vet_dir`] result. The trusted allowed root (`anchor`) is
+    /// Open a [`vet_dir`] result. The trusted allowed root (`anchor` —
+    /// `<home>/agents/` for anything in the employee's own directory) is
     /// opened from `/` with `O_NOFOLLOW` on every component (the path to it
     /// may cross mounts); the scan root is then opened **descriptor-relative
-    /// from it**, component by component, under the same rules the reads use
-    /// — no symlink, no mount crossing — and must be the very directory
-    /// [`vet_dir`] saw (Unix `st_dev` / `st_ino`). So a scan root that is
-    /// itself a (same-filesystem) bind mount, or that is swapped for a
-    /// symlink or another directory between vetting and opening, is refused.
+    /// from it**, component by component (`<id>`, or `.ephemeral` and `<id>`,
+    /// included), under the same rules the reads use — no symlink, no mount
+    /// crossing — and must be the very directory [`vet_dir`] saw (Unix
+    /// `st_dev` / `st_ino`). So a scan root, own directory or `.ephemeral`
+    /// that is itself a (same-filesystem) bind mount, or that is swapped for
+    /// a symlink, a bind mount or another directory between vetting and
+    /// opening, is refused.
     pub fn open(vetted: &VettedDir) -> std::io::Result<Self> {
         Ok(Self {
             root: vetted.path.clone(),
@@ -1460,14 +1474,14 @@ mod tests {
         let own = dir.canonicalize().unwrap();
         let vetted = vet_dir("", home.path(), "coder").unwrap();
         assert_eq!(vetted.path(), own.as_path());
-        // The implicit own root is walked from its parent `agents/`.
+        // The implicit own root is walked from the trusted `agents/`.
         assert_eq!(vetted.anchor, own.parent().unwrap());
         assert_eq!(vetted.rel, vec!["coder".to_string()]);
         assert_eq!(vet_dir("  ", home.path(), "coder").unwrap().path(), own.as_path());
         let src = vet_dir("src", home.path(), "coder").unwrap();
         assert_eq!(src.path(), own.join("src").as_path());
-        assert_eq!(src.anchor, own, "a sub-root is walked from the own directory");
-        assert_eq!(src.rel, vec!["src".to_string()]);
+        assert_eq!(src.anchor, own.parent().unwrap(), "a sub-root is walked from `agents/` too");
+        assert_eq!(src.rel, vec!["coder".to_string(), "src".to_string()]);
         assert_eq!(
             vet_dir(own.join("src").to_str().unwrap(), home.path(), "coder").unwrap().path(),
             own.join("src").as_path()
@@ -1491,8 +1505,16 @@ mod tests {
         assert_eq!(employee_dir(home.path(), id).unwrap(), member_real);
         let vetted = vet_dir("", home.path(), id).unwrap();
         assert_eq!(vetted.path(), member_real.as_path());
-        assert_eq!(vetted.anchor, member_real.parent().unwrap());
-        assert_eq!(vet_dir("src", home.path(), id).unwrap().path(), member_real.join("src").as_path());
+        // Walked from `agents/`, through `.ephemeral` — never anchored at it.
+        let agents_real = home.path().join("agents").canonicalize().unwrap();
+        assert_eq!(vetted.anchor, agents_real);
+        assert_eq!(vetted.rel, vec![".ephemeral".to_string(), id.to_string()]);
+        let src = vet_dir("src", home.path(), id).unwrap();
+        assert_eq!(src.path(), member_real.join("src").as_path());
+        assert_eq!(src.anchor, agents_real);
+        assert_eq!(src.rel, vec![".ephemeral".to_string(), id.to_string(), "src".to_string()]);
+        let tree = ContainedTree::open(&vetted).expect("an ordinary role member root opens");
+        assert_eq!(tree.read_to_string(Path::new("agent.toml"), 1024).unwrap(), "[agent]\nname = \"m\"\n");
         let err = vet_dir(parent.to_str().unwrap(), home.path(), id).unwrap_err();
         assert!(err.contains("不在允許的目錄範圍內"), "{err}");
         // An `eph-` id with no scaffold resolves to nothing — even when an
@@ -1795,6 +1817,154 @@ mod tests {
         let vetted = vet_dir("", home.path(), "mounted").expect("agent.toml is visible through the mount");
         let err = ContainedTree::open(&vetted).err().expect("bind-mounted own root must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// Bind-mount helpers for the round-2 tests below (same mount call,
+    /// unmount guard and skip message as the tests above).
+    #[cfg(target_os = "linux")]
+    struct Unmount(std::ffi::CString);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            // SAFETY: NUL-terminated path of a mount made by `bind_mount`.
+            unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bind_mount(src: &Path, dst: &Path) -> Option<Unmount> {
+        let s = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+        let d = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+        // SAFETY: NUL-terminated paths; a bind mount with no data argument.
+        let rc = unsafe {
+            libc::mount(s.as_ptr(), d.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null())
+        };
+        if rc != 0 {
+            eprintln!("skipped: bind mount failed: {}", std::io::Error::last_os_error());
+            return None;
+        }
+        Some(Unmount(d))
+    }
+
+    /// Daybreak round 2 Low (a): the own directory `agents/<id>` is itself a
+    /// same-filesystem bind mount and the caller names a sub-root
+    /// (`root = "src"`). The walk starts at `agents/`, so `<id>` is compared
+    /// with the `agents/` mount and refused — the bind mount is never the
+    /// baseline. Needs root to mount; skips (passes) otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_tree_refuses_a_sub_root_of_a_bind_mounted_own_root() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: creating a bind mount needs root");
+            return;
+        }
+        let home = tmp_home();
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::write(outside.path().join("agent.toml"), "[agent]\nname = \"x\"\n").unwrap();
+        std::fs::create_dir_all(outside.path().join("src")).unwrap();
+        std::fs::write(outside.path().join("src/secret.rs"), "fn secret() {}\n").unwrap();
+        let own = home.path().join("agents").join("mounted");
+        std::fs::create_dir_all(&own).unwrap();
+        let Some(_m) = bind_mount(outside.path(), &own) else { return };
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&own).unwrap().dev(),
+            std::fs::metadata(home.path().join("agents")).unwrap().dev(),
+            "fixture: the bind mount shares the agents/ st_dev"
+        );
+
+        let vetted = vet_dir("src", home.path(), "mounted").expect("a bind mount is not a symlink");
+        assert_eq!(vetted.rel, vec!["mounted".to_string(), "src".to_string()]);
+        let err = ContainedTree::open(&vetted).err().expect("sub-root of a bind-mounted own root must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        // The absolute spelling of the same directory is refused too.
+        let abs = own.join("src");
+        let vetted = vet_dir(abs.to_str().unwrap(), home.path(), "mounted").unwrap();
+        let err = ContainedTree::open(&vetted).err().expect("absolute sub-root must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// Daybreak round 2 Low (b): `agents/.ephemeral` is itself a
+    /// same-filesystem bind mount. A role member's default root is walked
+    /// from `agents/` through `.ephemeral`, which is compared with the
+    /// `agents/` mount and refused. Needs root to mount; skips (passes)
+    /// otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_tree_refuses_a_role_member_under_a_bind_mounted_ephemeral_dir() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: creating a bind mount needs root");
+            return;
+        }
+        let home = tmp_home();
+        agent_dir(home.path(), "boss");
+        let id = "eph-boss-r1-exec-abc123";
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::create_dir_all(outside.path().join(id)).unwrap();
+        std::fs::write(outside.path().join(id).join("agent.toml"), "[agent]\nname = \"m\"\n").unwrap();
+        std::fs::write(outside.path().join(id).join("secret.rs"), "fn secret() {}\n").unwrap();
+        let ephemeral = home.path().join("agents/.ephemeral");
+        std::fs::create_dir_all(&ephemeral).unwrap();
+        let Some(_m) = bind_mount(outside.path(), &ephemeral) else { return };
+
+        let vetted = vet_dir("", home.path(), id).expect("the scaffold is visible through the mount");
+        assert_eq!(vetted.rel, vec![".ephemeral".to_string(), id.to_string()]);
+        let err = ContainedTree::open(&vetted).err().expect("role member under a bind-mounted .ephemeral must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// Daybreak round 2 Low (c): the own directory is swapped for a bind
+    /// mount between [`vet_dir`] and [`ContainedTree::open`] — of an outside
+    /// tree, and of the original directory itself (so the vetted inode
+    /// identity still matches and only the mount comparison at `<id>` can
+    /// refuse it). Needs root to mount; skips (passes) otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_tree_refuses_an_own_root_swapped_for_a_bind_mount_between_vet_and_open() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: creating a bind mount needs root");
+            return;
+        }
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn inside() {}\n").unwrap();
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::create_dir_all(outside.path().join("src")).unwrap();
+        std::fs::write(outside.path().join("src/a.rs"), "fn outside() {}\n").unwrap();
+        let agents = home.path().join("agents");
+
+        let vetted = vet_dir("src", home.path(), "coder").unwrap();
+        std::fs::rename(agents.join("coder"), agents.join("coder.old")).unwrap();
+        std::fs::create_dir(agents.join("coder")).unwrap();
+
+        // 1. Swapped for a bind mount of an outside tree.
+        {
+            let Some(_m) = bind_mount(outside.path(), &agents.join("coder")) else { return };
+            let err = ContainedTree::open(&vetted).err().expect("outside bind-mount swap must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        }
+
+        // 2. Swapped for a bind mount of the original directory: `src` keeps
+        // its vetted (st_dev, st_ino), so the refusal is the mount check.
+        {
+            let Some(_m) = bind_mount(&agents.join("coder.old"), &agents.join("coder")) else { return };
+            use std::os::unix::fs::MetadataExt;
+            let through = std::fs::metadata(agents.join("coder/src")).unwrap();
+            assert_eq!(vetted.identity, Some((through.dev(), through.ino())), "fixture: identity still matches");
+            let err = ContainedTree::open(&vetted).err().expect("self bind-mount swap must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        }
+
+        // Unswapped, the same vetting opens and reads the inside file.
+        std::fs::remove_dir(agents.join("coder")).unwrap();
+        std::fs::rename(agents.join("coder.old"), agents.join("coder")).unwrap();
+        let tree = ContainedTree::open(&vetted).expect("the vetted directory is back");
+        assert_eq!(tree.read_to_string(Path::new("a.rs"), 1024).unwrap(), "fn inside() {}\n");
     }
 
     // ── csv_read ────────────────────────────────────────────────────────────
