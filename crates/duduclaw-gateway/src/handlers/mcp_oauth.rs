@@ -165,8 +165,13 @@ impl MethodHandler {
             .unwrap_or("")
             .to_string();
 
-        // Find the built-in provider or create a custom one
-        let redirect_uri = mcp_oauth::redirect_uri(&self.home_dir);
+        // Find the built-in provider or create a custom one. RM-129: the
+        // callback follows `[dashboard] public_url` (sub-path included) when
+        // set; an invalid public_url refuses the start (fail closed).
+        let redirect_uri = match mcp_oauth::try_redirect_uri(&self.home_dir) {
+            Ok(uri) => uri,
+            Err(e) => return WsFrame::error_response("", &e.to_string()),
+        };
         let mut config = mcp_oauth::builtin_providers(&redirect_uri)
             .into_iter()
             .find(|p| p.provider_id == provider_id)

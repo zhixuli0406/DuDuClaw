@@ -110,7 +110,8 @@ minisign-verify = "0.2"
 # A2A v1.0 signed Agent Card — EdDSA/JWS signing (a2a_signing.rs). Same crate
 # convention as duduclaw-license; `rand_core` enables SigningKey::generate for
 # first-run key material. Signing (not just verify) so full feature set here.
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+# `zeroize` clears SigningKey seeds (A2A and MFA relay installation.key) on drop.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
 rand = "0.8"
 
 duduclaw-inference = { workspace = true }

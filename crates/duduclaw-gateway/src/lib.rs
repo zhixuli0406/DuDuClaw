@@ -418,6 +418,8 @@ pub mod secret_redact;
 pub mod server;
 mod mfa;
 mod mfa_email;
+/// Installation Ed25519 key and the shared descriptor-pinned `state/` store.
+pub mod installation_identity;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;

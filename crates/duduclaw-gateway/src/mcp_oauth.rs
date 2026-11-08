@@ -372,11 +372,38 @@ pub fn gateway_port(home: &Path) -> u16 {
 /// listened on 18889, so every provider redirected the browser to a port with
 /// nothing on it and no OAuth flow could complete — the callback never fired,
 /// no token was ever stored, and the dashboard sat on "not connected".
+///
+/// RM-129: when `[dashboard] public_url` is configured the URI is
+/// `<public_url>/api/mcp/oauth/callback` (sub-path preserved), so a dashboard
+/// behind a reverse proxy prefix receives the callback itself; administrators
+/// must register that URL with the provider. Without public_url the localhost
+/// default is unchanged. A configured but invalid public_url is an error
+/// (fail closed): a sign-in must not start against an address the operator
+/// did not declare.
+///
+/// In-flight sign-ins are unaffected by later config changes: the URI is
+/// captured with the state (`PendingOAuth::other` keeps the whole config, the
+/// Google Home flow captures the client row) and the token exchange sends
+/// exactly that stored value.
+pub(crate) fn try_redirect_uri(home: &Path) -> Result<String, crate::deep_link::PublicBaseError> {
+    Ok(match crate::deep_link::configured_public_base(home)? {
+        Some(base) => format!("{}{CALLBACK_ROUTE}", crate::deep_link::base_prefix(&base)),
+        None => localhost_redirect_uri(home),
+    })
+}
+
+/// Display form of [`try_redirect_uri`] for the provider list: an invalid
+/// public_url shows an empty URI (nothing to register) instead of a guess.
+/// Starting a sign-in always goes through [`try_redirect_uri`].
 pub fn redirect_uri(home: &Path) -> String {
-    format!(
-        "http://localhost:{}/api/mcp/oauth/callback",
-        gateway_port(home)
-    )
+    try_redirect_uri(home).unwrap_or_default()
+}
+
+/// The route the gateway serves the built-in provider callback on.
+pub const CALLBACK_ROUTE: &str = "/api/mcp/oauth/callback";
+
+fn localhost_redirect_uri(home: &Path) -> String {
+    format!("http://localhost:{}{CALLBACK_ROUTE}", gateway_port(home))
 }
 
 pub fn builtin_providers(redirect_uri: &str) -> Vec<McpOAuthConfig> {
@@ -1031,6 +1058,49 @@ mod redirect_uri_tests {
         for p in &providers {
             assert_eq!(p.redirect_uri, uri, "provider {} drifted", p.provider_id);
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RM-129: a sub-path public_url prefixes the built-in provider callback;
+    /// it wins over the localhost/port default.
+    #[test]
+    fn redirect_uri_uses_the_sub_path_public_url_when_configured() {
+        let home = tmp_home();
+        for raw in ["https://example.com/agents", "https://example.com/agents/"] {
+            std::fs::write(home.join("config.toml"),
+                format!("[gateway]\nport = 9100\n[dashboard]\npublic_url = {raw:?}\n")).unwrap();
+            assert_eq!(try_redirect_uri(&home).unwrap(), "https://example.com/agents/api/mcp/oauth/callback");
+            assert_eq!(redirect_uri(&home), "https://example.com/agents/api/mcp/oauth/callback");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An invalid configured public_url refuses to start a sign-in and shows
+    /// no URI to register, never a silently prefix-less guess.
+    #[test]
+    fn redirect_uri_fails_closed_on_an_invalid_public_url() {
+        let home = tmp_home();
+        std::fs::write(home.join("config.toml"),
+            "[dashboard]\npublic_url = \"https://example.com/agents?x=1\"\n").unwrap();
+        assert!(try_redirect_uri(&home).is_err());
+        assert_eq!(redirect_uri(&home), "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The Other-provider pending entry carries the redirect URI used at
+    /// authorization time; the exchange reads that copy, not the live config.
+    #[test]
+    fn pending_flow_keeps_the_redirect_uri_used_at_authorization() {
+        let home = tmp_home();
+        std::fs::write(home.join("config.toml"),
+            "[dashboard]\npublic_url = \"https://example.com/agents\"\n").unwrap();
+        let uri = try_redirect_uri(&home).unwrap();
+        let config = builtin_providers(&uri).into_iter().find(|p| p.provider_id == "github").unwrap();
+        let pending = PendingOAuth::other(config, "verifier".into()).unwrap();
+        std::fs::write(home.join("config.toml"),
+            "[dashboard]\npublic_url = \"https://changed.example\"\n").unwrap();
+        let PendingOAuthFlow::Other { config, .. } = &pending.flow else { panic!("expected other flow") };
+        assert_eq!(config.redirect_uri, "https://example.com/agents/api/mcp/oauth/callback");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

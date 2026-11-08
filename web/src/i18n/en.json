@@ -9973,7 +9973,14 @@
   "mfa.reauthHint": "Enter your current password before adding or removing a verification method.",
   "mfa.factorPassword": "Password to change verification methods",
   "mfa.lastFactor": "Two-step verification is required. Keep at least one verification method.",
-  "mfa.email.unavailable": "The server has no outgoing email (SMTP) configured. Ask your administrator to configure the mail server and sender address under [channels.email] in Settings → Advanced → Advanced config editor.",
+  "mfa.email.relayDisabled": "The server has no email delivery configured, and the administrator has disabled the licensed email relay. Ask your administrator to configure the system SMTP server and sender address, or enable the email relay with an eligible license.",
+  "mfa.email.relayNfr": "This license type does not include email relay. Ask your administrator to configure the system SMTP server and sender address.",
+  "mfa.email.relayUnbound": "This license type does not include email relay. Ask your administrator to configure the system SMTP server and sender address.",
+  "mfa.email.relayKeyUnbound": "The server has no outgoing email (SMTP) configured, and the licensed email relay is waiting for this installation to be approved. The license account owner must compare the installation key fingerprint (shown below, or run duduclaw license installation-key on the server) and approve this installation in the license console. Until then, configure SMTP to send codes.",
+  "mfa.email.relayKeyMismatch": "The server has no outgoing email (SMTP) configured, and the key of this installation does not match the key approved for the license (for example after moving to another machine or restoring a backup), so the email relay is unavailable. The license account owner must compare the installation key fingerprint and approve this installation again in the license console. Until then, configure SMTP to send codes.",
+  "mfa.email.relayKeyFingerprint": "Installation key fingerprint: {fingerprint}",
+  "mfa.email.rateLimited": "Too many code delivery requests. Please try again later.",
+  "mfa.email.unavailable": "The server has no outgoing email (SMTP) configured, and this installation has no eligible licensed email relay. Ask your administrator to configure the mail server and sender address under [channels.email] in Settings → Advanced → Advanced config editor, or install a valid license that supports the relay.",
   "mfa.email.enrollHint": "A code will be sent to your account email. Email verification is enabled only after you enter the six-digit code.",
   "mfa.email.loginHint": "Enter the six-digit code sent to your account email. The code expires in 10 minutes and allows up to 5 attempts.",
   "mfa.email.send": "Send code",
@@ -10215,5 +10222,8 @@
   "google.chatRead.title": "Read Google Chat",
   "google.chatRead.hint": "After enabling, users reconnect Google in My Connections and select the Chat permissions. AI employees can read spaces and recent messages available to that account. They cannot send messages or download attachments.",
   "google.chatRead.setup": "Enable the Google Chat API and configure a Chat app in the OAuth client’s Google Cloud project. A Workspace administrator may also need to allow the app.",
-  "myConnections.service.chat": "Google Chat"
+  "myConnections.service.chat": "Google Chat",
+  "settings.general.publicUrl": "Dashboard public URL",
+  "settings.general.publicUrl.help": "The full address people use to reach the dashboard, including any reverse proxy sub-path, for example https://example.com/agents/. OAuth callbacks and return links use it; after setting it, register the new callback URL in your Google, GitHub and other OAuth apps. Leave empty to use the address the dashboard was opened on.",
+  "settings.general.publicUrl.invalid": "Enter an HTTPS URL (HTTP only for localhost, 127.0.0.0/8 or ::1), without a user name or password, query (?), fragment (#) or \"..\"."
 }
