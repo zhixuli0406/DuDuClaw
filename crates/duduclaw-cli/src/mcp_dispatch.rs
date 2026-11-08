@@ -26,8 +26,10 @@ use duduclaw_core::types::ToolPolicy;
 use duduclaw_memory::SqliteMemoryEngine;
 
 fn scope_denial_message(tool: &str, required: Scope) -> String {
-    if tool.starts_with("odoo_") {
-        format!("Insufficient scope: MCP scope gate requires '{required}' for '{tool}'. Ask an admin to check the MCP key scopes and the agent's tool permissions; allowed_models/unblock_models do not grant MCP scopes.")
+    if tool.starts_with("odoo_") && matches!(required, Scope::Admin) {
+        format!("Odoo capability is not available: '{tool}' is not offered. This is a policy decision; retrying the same call will not succeed. 這項功能不提供；這是政策限制，重試相同呼叫不會成功。")
+    } else if tool.starts_with("odoo_") {
+        format!("Insufficient scope: MCP scope gate requires '{required}' for '{tool}'. Ask an admin to check the MCP key scopes and the agent's tool permissions; allowed_models/unblock_models do not grant MCP scopes. This is a policy decision; retrying the same call will not succeed. 這是政策限制，重試相同呼叫不會成功。")
     } else {
         format!("Insufficient scope: {required:?} required for '{tool}'")
     }
@@ -468,14 +470,43 @@ pub type OdooState = Arc<crate::odoo_pool::OdooConnectorPool>;
 // need to depend on the internal `mcp` module.
 
 pub fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
-    serde_json::json!({
+    let mut frame = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": code,
             "message": message
         }
-    })
+    });
+    // RM-130: never an empty message. No `data` is added, so the egress
+    // gate's payload accounting for this frame is unchanged.
+    duduclaw_core::ensure_error_reason_with("", None, &mut frame, duduclaw_core::ToolErrorDetail::CodeOnly);
+    frame
+}
+
+/// RM-130: the last step of a `tools/call` reply — fill a reason into an
+/// error that carries none. Must run after egress / private-read accounting
+/// and after redaction (it is called on the value about to be returned).
+/// `structuredContent` is summarised only when redaction either is off or
+/// actually ran over `result` (string values only); JSON-RPC `error.data` is never redacted, so
+/// with redaction on only its code is named.
+pub(crate) fn finalize_tool_reply(tool_name: &str, redaction_active: bool, mut reply: Value) -> Value {
+    let detail = if !redaction_active {
+        duduclaw_core::ToolErrorDetail::Full
+    } else if reply.get("result").is_some_and(Value::is_object) {
+        duduclaw_core::ToolErrorDetail::StringValues
+    } else {
+        duduclaw_core::ToolErrorDetail::CodeOnly
+    };
+    duduclaw_core::ensure_error_reason_with(tool_name, Some("duduclaw"), &mut reply, detail);
+    reply
+}
+
+/// Finalize the model-visible workflow operation result after accounting/redaction.
+fn finalize_workflow_operation_reply(tool_name: &str, redaction_active: bool, result: Value, mut reply: Value) -> Value {
+    let result = finalize_tool_reply(tool_name, redaction_active, result);
+    reply["result"] = result;
+    reply
 }
 
 pub fn jsonrpc_response(id: &Value, result: Value) -> Value {
@@ -1955,7 +1986,7 @@ impl McpDispatcher {
         );
         if let Some(mut reply) = workflow_response {
             if operation_claim.is_some() {
-                reply["result"] = result.clone();
+                reply = finalize_workflow_operation_reply(tool_name, self.redaction.is_some(), result, reply);
             } else if let Some(layer) = &self.redaction {
                 if let Some(output) = reply.get_mut("result") {
                     crate::mcp_redaction::redact_tool_result_with(
@@ -1972,7 +2003,9 @@ impl McpDispatcher {
             }
             return jsonrpc_response(id, reply);
         }
-        result
+        // RM-130: after the egress / private-read accounting above (which
+        // counted a content-less error as payload-free) and after redaction.
+        finalize_tool_reply(tool_name, self.redaction.is_some(), result)
     }
 }
 
@@ -1982,6 +2015,10 @@ impl McpDispatcher {
 mod tests {
     #[test]
     fn odoo_scope_denial_names_gate_and_operator_scopes() {
+        let unavailable = super::scope_denial_message("odoo_unoffered", super::Scope::Admin);
+        assert!(unavailable.contains("not available"));
+        assert!(!unavailable.contains("Ask an admin"));
+        assert!(unavailable.contains("retrying the same call will not succeed"));
         for (tool, scope) in [("odoo_search", super::Scope::OdooRead), ("odoo_execute", super::Scope::OdooExecute), ("odoo_schema_overview", super::Scope::OdooRead)] {
             let message = super::scope_denial_message(tool, scope.clone());
             assert!(message.contains("MCP scope gate"));
@@ -2170,6 +2207,74 @@ mod tests {
         }
         assert!(crate::mcp::egress_gate::confirmed_sink_completion("send_message",
             &serde_json::json!({"id":1,"result":{"isError":false,"content":[]}})));
+    }
+
+    fn reply_text(reply: &serde_json::Value) -> String {
+        reply["result"]["content"].as_array().unwrap().iter()
+            .filter_map(|b| b["text"].as_str()).collect()
+    }
+
+    #[test]
+    fn rm130_empty_tool_error_gets_reason_after_accounting() {
+        let raw = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"isError":true}});
+        // Accounting runs on the raw reply: a content-less error is payload-free…
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&raw));
+        let finished = super::finalize_tool_reply("db_query", false, raw.clone());
+        // …and the reason is only added afterwards (it would otherwise count).
+        assert!(reply_text(&finished).contains("Tool call failed and returned no error message. Tool: db_query."));
+        assert_eq!(finished["result"]["isError"], true);
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&raw), "accounting input untouched");
+    }
+
+    #[test]
+    fn rm130_active_redaction_summary_excludes_keys_and_numbers() {
+        let raw = serde_json::json!({"result":{"isError":true,"structuredContent":{"王小明":{"phone":912345678,"status":"safe"}}}});
+        let finished = super::finalize_tool_reply("db_query", true, raw);
+        let text = reply_text(&finished);
+        assert!(text.contains("safe"), "{text}");
+        assert!(!text.contains("王小明") && !text.contains("912345678") && !text.contains("status"), "{text}");
+    }
+
+    #[test]
+    fn rm130_workflow_operation_result_is_finalized_after_accounting() {
+        // Even an empty `content` field counts as payload; accounting must
+        // observe an error without that field before the reason is injected.
+        let raw = serde_json::json!({"id":1,"result":{"isError":true}});
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&raw));
+        let reply = serde_json::json!({"state":"failed","result":raw.clone()});
+        let finished = super::finalize_workflow_operation_reply("db_query", true, raw.clone(), reply);
+        assert!(reply_text(&finished["result"]).contains("Tool: db_query."));
+        assert!(crate::mcp::egress_gate::model_visible_payload(&finished["result"]));
+        assert_eq!(finished["state"], "failed");
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&raw));
+    }
+
+    #[test]
+    fn rm130_non_empty_error_withheld_and_success_unchanged() {
+        for reply in [
+            serde_json::json!({"id":1,"result":{"isError":true,"content":[{"type":"text","text":"boom"}]}}),
+            serde_json::json!({"id":1,"result":{"isError":true,"content":[{"type":"text","text":"Wiki page is quarantined; content withheld"}]}}),
+            serde_json::json!({"id":1,"result":{"content":[]}}),
+            serde_json::json!({"id":1,"error":{"code":-32602,"message":"Unknown tool: x"}}),
+        ] {
+            assert_eq!(super::finalize_tool_reply("t", true, reply.clone()), reply);
+        }
+    }
+
+    #[test]
+    fn rm130_jsonrpc_error_with_empty_message_gets_reason() {
+        let err = super::jsonrpc_error(&serde_json::json!(3), -32003, "");
+        let msg = err["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("Tool call failed and returned no error message."), "{msg}");
+        assert!(msg.contains("-32003"), "{msg}");
+        assert!(err["error"].get("data").is_none());
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&err), "still payload-free");
+        assert_eq!(super::jsonrpc_error(&serde_json::json!(3), -1, "kept")["error"]["message"], "kept");
+        // With redaction on, an unredacted `error.data` is never summarised.
+        let raw = serde_json::json!({"id":1,"error":{"code":-1,"data":{"secret":"s3cr3t"}}});
+        let finished = super::finalize_tool_reply("t", true, raw);
+        let msg = finished["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("-1") && !msg.contains("s3cr3t"), "{msg}");
     }
 
     #[tokio::test]

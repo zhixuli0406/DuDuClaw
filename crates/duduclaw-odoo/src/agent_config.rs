@@ -37,7 +37,7 @@ pub const ODOO_UNREADABLE: &str =
 /// Every field is optional — present fields override the global default;
 /// absent fields inherit. `profile` defaults to `"default"` so deployments
 /// without overrides work unchanged.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentOdooConfig {
     /// Audit-log label for this connection. Falls back to `"default"` so
@@ -75,8 +75,31 @@ pub struct AgentOdooConfig {
     /// models named here (e.g. `res.partner`) become reachable via the generic
     /// `odoo_search` / `odoo_execute` tools — still subject to `allowed_models`
     /// / `allowed_actions` and, for system metadata tables, read-only
-    /// enforcement. Empty ⇒ the default block list is fully in force.
-    pub unblock_models: Vec<String>,
+    /// enforcement. None inherits global settings; Some([]) explicitly blocks all defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unblock_models: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod unblock_regression_tests {
+    use super::*;
+
+    #[test]
+    fn toml_preserves_absent_empty_and_explicit_unblocks() {
+        for (raw, expected) in [
+            ("[odoo]\nusername = 'own'", None),
+            ("[odoo]\nunblock_models = []", Some(vec![])),
+            ("[odoo]\nunblock_models = ['hr.employee']", Some(vec!["hr.employee".to_string()])),
+        ] {
+            let cfg = AgentOdooConfig::parse_agent_toml(raw).unwrap().unwrap();
+            assert_eq!(cfg.unblock_models, expected);
+            let roundtrip: AgentOdooConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(roundtrip.unblock_models, expected);
+            let mut global = OdooConfig { unblock_models: vec!["res.partner".into()], ..Default::default() };
+            cfg.apply_to(&mut global).unwrap();
+            assert_eq!(global.unblock_models, expected.unwrap_or_else(|| vec!["res.partner".into()]));
+        }
+    }
 }
 
 impl AgentOdooConfig {
@@ -99,7 +122,7 @@ impl AgentOdooConfig {
             && self.allowed_models.is_empty()
             && self.allowed_actions.is_empty()
             && self.company_ids.is_empty()
-            && self.unblock_models.is_empty()
+            && self.unblock_models.is_none()
     }
 
     /// Parse from raw `agent.toml` text — looks for the `[odoo]` section.
@@ -193,6 +216,9 @@ impl AgentOdooConfig {
         }
         if let Some(p) = &self.password_enc {
             config.password_enc = p.clone();
+        }
+        if let Some(models) = &self.unblock_models {
+            config.unblock_models = models.clone();
         }
         Ok(())
     }

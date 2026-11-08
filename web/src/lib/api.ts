@@ -2573,6 +2573,7 @@ export interface OdooStatus {
   uid?: number;
   error?: string;
   schema?: OdooSchemaScanStatus;
+  results?: { employee: string; status: 'ok' | 'failed'; message?: string; schema?: OdooSchemaScanStatus }[];
 }
 
 export interface OdooSchemaScanStatus {
@@ -2592,8 +2593,16 @@ export interface OdooSchemaDiff {
 
 export interface OdooSchemaScanResult {
   success: boolean;
+  message?: string | null;
+  diff?: OdooSchemaDiff | null;
+  schema?: OdooSchemaScanStatus | null;
+  results?: OdooSchemaEmployeeScanResult[];
+}
+
+export interface OdooSchemaEmployeeScanResult {
+  employee: string;
+  status: 'ok' | 'failed';
   message?: string;
-  diff?: OdooSchemaDiff;
   schema?: OdooSchemaScanStatus;
 }
 
@@ -3231,6 +3240,22 @@ export interface McpOAuthProvider {
 }
 
 /** Fields that can be updated on an agent via `agents.update`. All optional. */
+/** RM-026 — one `agent_authority_changed` row, reduced to the permission keys. */
+export interface PermissionHistoryEvent {
+  timestamp: string;
+  agent_id: string;
+  /** User id of whoever saved the change. */
+  actor: string;
+  /** Display name of `actor` when the account still exists. */
+  actor_name: string | null;
+  changes: Array<{ key: string; before: unknown; after: unknown }>;
+}
+
+export interface PermissionHistoryPage {
+  events: PermissionHistoryEvent[];
+  next_cursor: string | null;
+}
+
 export interface AgentUpdateParams {
   // Identity
   display_name?: string;
@@ -5293,6 +5318,72 @@ export interface McpKeyCreateResult {
   message: string;
 }
 
+// ── RM-064: read-only status credentials (external work-status query) ──
+
+/** One `ddc_status_…` credential as listed. Never carries the secret. */
+export interface StatusTokenInfo {
+  id: string;
+  name: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  active: boolean;
+}
+
+/** `status_tokens.admin_list` row: the credential plus its owner. */
+export interface StatusTokenAdminEntry extends StatusTokenInfo {
+  user_id: string;
+  /** `null` when the owner account no longer exists. */
+  user_email: string | null;
+  user_display_name: string | null;
+}
+
+export interface StatusTokenListResult {
+  /** `[external_status] enabled`; while false, creation is refused and every
+   *  credential is refused by the endpoint (existing ones are kept). */
+  enabled: boolean;
+  max_active: number;
+  /** Path of the only endpoint the credential can call. */
+  endpoint_path: string;
+  tokens: StatusTokenInfo[];
+}
+
+export interface StatusTokenCreateResult {
+  /** `ddc_status_…` — shown exactly once, never recoverable afterward. */
+  secret: string;
+  token: StatusTokenInfo;
+  endpoint_path: string;
+}
+
+/** Stable `error.code` values of the status-credential RPCs. */
+export type StatusTokenErrorCode =
+  | 'external_status_disabled'
+  | 'status_token_invalid_name'
+  | 'status_token_limit_reached'
+  | 'status_token_account_inactive'
+  | 'status_token_not_found'
+  | 'status_token_unavailable';
+
+/** Body of `GET /api/v1/status/employees` (called by the external system,
+ *  not by the dashboard — typed here for the account-page design). */
+export interface ExternalEmployeeStatus {
+  agent_id: string;
+  display_name: string;
+  /** todo + pending + in_progress + revising tasks. */
+  in_progress: number;
+  /** review + needs_human + pending_approval tasks, plus pending approvals. */
+  awaiting_confirmation: number;
+  done_today: number;
+  done_7d: number;
+  /** Title is masked and at most 60 characters. */
+  latest_done: { title: string; completed_at: string } | null;
+}
+
+export interface ExternalStatusResponse {
+  generated_at: string;
+  employees: ExternalEmployeeStatus[];
+}
+
 export type McpScope =
   | 'memory:read'
   | 'memory:write'
@@ -5539,6 +5630,9 @@ export interface MemoryGraphResult {
  *  agent inherits the global config. `api_key`/`password` are never returned in
  *  cleartext — only the `*_set` booleans plus a masked placeholder. */
 export interface OdooAgentConfig {
+  effective_unblock_models: string[];
+  unblock_inherited: boolean;
+  effective_blocked_models: string[];
   agent_id: string;
   configured: boolean;
   profile?: string;
@@ -5546,8 +5640,8 @@ export interface OdooAgentConfig {
   db?: string;
   username?: string;
   allowed_models: string[];
-  /** Models opted out of the built-in security block list. */
-  unblock_models?: string[];
+  /** Absent/null inherits the global list; [] explicitly unblocks nothing. */
+  unblock_models?: string[] | null;
   allowed_actions: string[];
   company_ids: number[];
   api_key_set: boolean;
@@ -5972,6 +6066,54 @@ export interface UserInviteResult {
   link?: string;
 }
 export type UserInviteState = 'none' | 'pending' | 'expired' | 'used';
+
+// ── RM-039 memory privacy ───────────────────────────────────
+/** Built-in categories (all excluded by default); custom ones are lowercase identifiers. */
+export type BuiltinMemoryPrivacyCategory = 'health' | 'family' | 'personal_finance' | 'salary';
+
+/** `system.config` → `memory_privacy`. */
+export interface MemoryPrivacySettings {
+  excluded_categories: string[];
+  /** Extra keywords per category; a non-built-in key defines a custom category. */
+  custom_keywords: Record<string, string[]>;
+  builtin_categories: BuiltinMemoryPrivacyCategory[];
+  /** 'defaults' = no section; 'failed_closed' = config unreadable/invalid, defaults enforced. */
+  load_state: 'defaults' | 'configured' | 'failed_closed';
+}
+
+/** `system.update_config { memory_privacy }` — each key given replaces that key; an omitted key keeps its current value. */
+export interface MemoryPrivacyUpdate {
+  excluded_categories?: string[];
+  custom_keywords?: Record<string, string[]>;
+}
+
+export type MyMemorySourceKind = 'conversation' | 'profile' | 'explicit' | 'footprint' | 'reflexion' | 'other';
+
+/** One `me.memory.list` row — a fact whose subject is the caller. */
+export interface MyMemoryItem {
+  id: string;
+  /** AI employee (namespace) that remembers it. */
+  agent: string;
+  /** Human-readable rendering of the fact. */
+  text: string;
+  /** RFC 3339. */
+  created_at: string;
+  source_kind: MyMemorySourceKind;
+  /** True when the staff member explicitly asked for it to be remembered. */
+  explicit: boolean;
+}
+
+export interface MyMemoryListResult {
+  items: MyMemoryItem[];
+  /** Opaque; pass back as `cursor` for the next page. `null` = last page. */
+  next_cursor: string | null;
+}
+
+export interface MyMemoryForgetResult {
+  forgotten: true;
+  id: string;
+  agent: string;
+}
 
 export interface PersonalGoogleStatus {
   chat_read?: boolean;
@@ -6421,6 +6563,14 @@ export const api = {
       client.call('agents.tool_pruning_restore', { agent_id: agentId }) as Promise<ToolPruningStatus>,
     inspect: (agentId: string) =>
       client.call('agents.inspect', { agent_id: agentId }) as Promise<AgentDetail>,
+    /** RM-026 — Admin-only. Permission changes of one employee, newest first;
+     *  pass the previous page's `next_cursor` to load older rows. */
+    permissionHistory: (agentId: string, opts: { limit?: number; cursor?: string } = {}) =>
+      client.call('agents.permission_history', {
+        agent_id: agentId,
+        ...(opts.limit ? { limit: opts.limit } : {}),
+        ...(opts.cursor ? { cursor: opts.cursor } : {}),
+      }) as Promise<PermissionHistoryPage>,
     /** E1 — lightweight avatar-only fetch. Unlike `inspect` this does NOT run a
      *  telemetry aggregate or serialize SOUL/skills/model config; it reads only
      *  the uploaded `avatar.<ext>` bytes. Used by the avatar store for first-paint
@@ -7541,9 +7691,15 @@ export const api = {
         // Structured [memory] novelty_gate for the memory-dedup-gate toggle
         // (absent ⇒ true, matching the gateway's fail-closed default).
         novelty_gate_enabled?: boolean;
+        // RM-039 structured [memory_privacy] (effective config; an invalid
+        // or unreadable one reports the defaults with load_state 'failed_closed').
+        memory_privacy?: MemoryPrivacySettings;
         // Structured [miniapp] enabled for the Telegram Mini App toggle (S20;
         // absent ⇒ false, matching `miniapp::enabled`'s opt-in default).
         miniapp_enabled?: boolean;
+        // Structured [external_status] enabled (RM-064; absent ⇒ false).
+        // Written back through `updateConfig({ external_status_enabled })`.
+        external_status_enabled?: boolean;
         // Structured [notify] daily_digest for the daily-digest toggle
         // (W2-8; absent ⇒ false/"09:00", matching `DigestConfig::default()`).
         daily_digest_enabled?: boolean;
@@ -7555,6 +7711,9 @@ export const api = {
       client.call('transcription_credentials.clear', {}) as Promise<{ success: boolean }>,
     updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[]; /** v1.68: keys that only apply after a gateway restart. */ restart_required?: string[] }>,
+    /** RM-039: replace `[memory_privacy]` (validated server-side; unknown categories are refused). */
+    updateMemoryPrivacy: (settings: MemoryPrivacyUpdate) =>
+      client.call('system.update_config', { memory_privacy: settings }) as Promise<{ success: boolean; changes: string[] }>,
     checkUpdate: () =>
       client.call('system.check_update') as Promise<{
         available: boolean;
@@ -7951,8 +8110,8 @@ export const api = {
   },
   odoo: {
     permissionOptions: () => client.call('odoo.permission_options') as Promise<OdooPermissionOptions>,
-    // Gateway bounds connect + scan at 240s; leave time for the final response.
-    scanSchema: () => client.call('odoo.schema_scan', {}, false, 300000) as Promise<OdooSchemaScanResult>,
+    // The gateway scans each effective identity in bounded batches.
+    scanSchema: () => client.call('odoo.schema_scan', {}, false, 3600000) as Promise<OdooSchemaScanResult>,
     status: () =>
       client.call('odoo.status') as Promise<OdooStatus>,
     config: () =>
@@ -8120,6 +8279,16 @@ export const api = {
     consent: (agentId: string, allowed: boolean) => client.call('me.google.consents.set', { agent_id: agentId, allowed, confirm_shared_access: allowed }),
     primaryOwner: (agentId: string, userId: string) => client.call('agents.primary_owner_set', { agent_id: agentId, user_id: userId }),
     disconnectUser: (userId: string) => client.call('users.google_disconnect', { user_id: userId, confirm: true }).then(notifyDisconnectForget),
+  },
+  /** RM-039 "my memory": what AI employees automatically remember about the caller. */
+  myMemory: {
+    list: (params: { cursor?: string | null; limit?: number } = {}) =>
+      client.call('me.memory.list', {
+        ...(params.cursor ? { cursor: params.cursor } : {}),
+        ...(params.limit !== undefined ? { limit: params.limit } : {}),
+      }) as Promise<MyMemoryListResult>,
+    forget: (id: string) =>
+      client.call('me.memory.forget', { id }) as Promise<MyMemoryForgetResult>,
   },
   mcp: {
     list: () =>
@@ -8841,6 +9010,24 @@ export const api = {
       client.call('mcp_keys.create', { ...params }) as Promise<McpKeyCreateResult>,
     revoke: (key: string) =>
       client.call('mcp_keys.revoke', { key }) as Promise<{ success: boolean; revoked: string }>,
+  },
+  /** RM-064: the caller's own read-only status credentials. */
+  statusTokens: {
+    list: () => client.call('me.status_tokens.list') as Promise<StatusTokenListResult>,
+    create: (name: string) =>
+      client.call('me.status_tokens.create', { name }) as Promise<StatusTokenCreateResult>,
+    revoke: (id: string) =>
+      client.call('me.status_tokens.revoke', { id }) as Promise<{ id: string; revoked: boolean }>,
+    /** Admin only. */
+    adminList: () =>
+      client.call('status_tokens.admin_list') as Promise<{
+        enabled: boolean;
+        endpoint_path: string;
+        tokens: StatusTokenAdminEntry[];
+      }>,
+    /** Admin only. */
+    adminRevoke: (id: string) =>
+      client.call('status_tokens.admin_revoke', { id }) as Promise<{ id: string; revoked: boolean }>,
   },
   killswitch: {
     get: () => client.call('killswitch.get') as Promise<KillswitchConfig>,

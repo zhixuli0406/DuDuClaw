@@ -438,8 +438,6 @@ async fn connect(home_dir: &Path, cfg: &OdooConfig) -> Option<Arc<OdooConnector>
     match OdooConnector::connect(cfg, &credential).await {
         Ok(c) => {
             let conn = Arc::new(c);
-            let profile = conn.schema_profile("default");
-            duduclaw_odoo::schema::spawn_auto_scan(conn.clone(), home_dir.to_path_buf(), profile);
             Some(conn)
         },
         Err(_) => {

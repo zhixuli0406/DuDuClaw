@@ -8,11 +8,15 @@ use std::hash::{Hash, Hasher};
 use tokio::sync::Mutex;
 
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::config::OdooConfig;
 use crate::edition::EditionGate;
 use crate::rpc;
+
+#[cfg(test)]
+#[path = "connector_cache_tests.rs"]
+mod cache_tests;
 
 /// Sensitive models that are never allowed via generic search/execute.
 /// Covers system internals, PII-heavy tables, financial records, and communications.
@@ -303,6 +307,14 @@ impl OdooStatus {
 impl OdooConnector {
     /// Connect to Odoo, authenticate, and detect edition.
     pub async fn connect(config: &OdooConfig, credential: &str) -> Result<Self, String> {
+        Self::connect_cached(config, credential, None, Vec::new()).await
+    }
+
+    /// The RPC client is stateless: execute_kw sends uid AND credential every time.
+    /// Reusing a uid never bypasses server-side authentication or ACL checks.
+    pub async fn connect_cached(
+        config: &OdooConfig, credential: &str, home: Option<&std::path::Path>, company_ids: Vec<i64>,
+    ) -> Result<Self, String> {
         if !config.is_configured() {
             return Err("Odoo not configured: url and db are required".to_string());
         }
@@ -328,31 +340,14 @@ impl OdooConnector {
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
 
-        // Authenticate with exponential backoff retry (MW-H5)
-        let mut uid = None;
-        let retries = [100, 500, 1000]; // ms
-        for (attempt, delay_ms) in retries.iter().enumerate() {
-            match rpc::authenticate(&http, &config.url, &config.db, &config.username, credential).await {
-                Ok(u) => { uid = Some(u); break; }
-                Err(_) if attempt < retries.len() - 1 => {
-                    warn!(attempt = attempt + 1, "Odoo auth failed, retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
-                }
-                Err(e) => return Err(format!("Odoo authentication failed after {} attempts: {e}", retries.len())),
-            }
-        }
-        let uid = uid.unwrap();
-
-        info!(host = %crate::url_guard::host_of(&config.url), db = %config.db, uid, "Odoo connected");
-
         let mut conn = Self {
             url: config.url.clone(),
             db: config.db.clone(),
-            uid: Some(uid),
+            uid: None,
             credential: credential.to_string(),
             edition_gate: EditionGate::unknown(),
             http,
-            company_ids: Vec::new(),
+            company_ids,
             field_cache: Mutex::new(BTreeMap::new()),
             missing_fields: std::sync::Mutex::new(HashSet::new()),
             observed_server_version: std::sync::Mutex::new(None),
@@ -363,13 +358,52 @@ impl OdooConnector {
             mock_rpc: None,
         };
 
+        // Compute the same identity as connection_identity, before uid is known.
+        let cache_key = crate::connection_cache::identity_hash(&conn.connection_identity());
+        if let Some(entry) = home.and_then(|h| crate::connection_cache::load(h, &cache_key, crate::connection_cache::now())) {
+            conn.uid = Some(entry.uid);
+            *conn.observed_server_version.lock().unwrap() = Some(entry.server_version);
+            conn.edition_gate = entry.edition;
+            return Ok(conn);
+        }
+        let delays = [100, 500, 1000];
+        for (attempt, delay) in delays.iter().enumerate() {
+            match rpc::authenticate_classified(&conn.http, &config.url, &config.db, &config.username, credential).await {
+                Ok(uid) => { conn.uid = Some(uid); break; }
+                Err(error) if error.retryable && attempt + 1 < delays.len() => {
+                    warn!(attempt = attempt + 1, "Odoo authentication transport failure; retrying");
+                    tokio::time::sleep(Duration::from_millis(*delay)).await;
+                }
+                Err(error) => return Err(format!("Odoo authentication failed after {} attempt(s): {}", attempt + 1, error.message)),
+            }
+        }
+
         // Detect edition
         conn.edition_gate = EditionGate::detect(&conn).await.unwrap_or_else(|_| {
             warn!("Odoo edition detection failed");
-            EditionGate::unknown()
+            let mut gate = EditionGate::unknown();
+            gate.odoo_version = "unknown".into();
+            gate
         });
 
+        if let Some(home) = home {
+            let entry = crate::connection_cache::CachedConnection {
+                identity_hash: cache_key, uid: conn.uid.expect("authenticated uid"),
+                server_version: conn.edition_gate.odoo_version.clone(), edition: conn.edition_gate.clone(),
+                created_at: crate::connection_cache::now(),
+            };
+            if crate::connection_cache::save(home, &entry).is_err() {
+                warn!("Could not save Odoo connection metadata cache");
+            }
+        }
         Ok(conn)
+    }
+
+    /// Compare resolved credentials too: a secret reference can rotate in place.
+    pub fn matches_connection(&self, config: &OdooConfig, credential: &str, company_ids: &[i64]) -> bool {
+        self.url == config.url && self.db == config.db && self.credential == credential
+            && self.company_ids.as_slice() == company_ids && self.access_unblocks == config.unblock_models
+            && self.access_connection_options == json!([config.username, config.auth_method, config.protocol, config.allow_private_network]).to_string()
     }
 
     /// Scope this connector to a set of `res.company` ids (RFC-21 §2 / M18).
@@ -628,14 +662,20 @@ impl OdooConnector {
 
     /// Introspect the Odoo schema — models plus their field metadata.
     ///
-    /// Privileged management operation: reads `ir.model` / `ir.model.fields`
-    /// directly. The generic-tool block list is an MCP-layer concern and does
-    /// not apply to this admin sweep. Returns **metadata only** — never a
-    /// business row. Framework/transient noise is filtered out, the model count
-    /// is capped at `max_models`, and fields-per-model is capped so a large
-    /// database can't produce an unbounded payload.
-    pub async fn introspect_schema(&self, max_models: usize) -> Result<SchemaReport, String> {
+    /// Reads `ir.model` / `ir.model.fields` directly, filtered by the
+    /// effective [`ScanPolicy`](crate::schema::ScanPolicy) (further narrowed
+    /// to this connector's own unblock list): blocked or switched-off models
+    /// are dropped before the field query is built, so their fields are never
+    /// requested, and relations naming an invisible model are stripped.
+    /// Returns **metadata only** — never a business row. Framework/transient
+    /// noise is filtered out, the model count is capped at `max_models`, and
+    /// fields-per-model is capped so a large database can't produce an
+    /// unbounded payload.
+    pub async fn introspect_schema(
+        &self, max_models: usize, policy: &crate::schema::ScanPolicy,
+    ) -> Result<SchemaReport, String> {
         const MAX_FIELDS_PER_MODEL: usize = 80;
+        let policy = self.effective_scan_policy(policy);
 
         // 1. Enumerate non-transient models.
         let model_domain = vec![json!(["transient", "=", false])];
@@ -654,7 +694,7 @@ impl OdooConnector {
                 invalid_models_dropped += 1;
                 continue;
             }
-            if is_introspection_noise(model) {
+            if is_introspection_noise(model) || !policy.allows(model) {
                 continue;
             }
             let name = m
@@ -744,6 +784,8 @@ impl OdooConnector {
 
         let mut report = SchemaReport { models, total_models, truncated, invalid_models_dropped, invalid_fields_dropped };
         crate::schema::sanitize_report(&mut report);
+        // Also strips relations pointing at invisible models.
+        policy.retain_report(&mut report);
         Ok(report)
     }
 
@@ -983,13 +1025,54 @@ mod tests {
                 {"model":"crm.lead", "name":"partner_id", "ttype":"many2one", "relation":"res.partner", "field_description":"客戶"}
             ])),
         ]);
-        let report = conn.introspect_schema(10).await.unwrap();
+        let policy = crate::schema::ScanPolicy::from_config(&crate::OdooConfig::default());
+        let report = conn.introspect_schema(10, &policy).await.unwrap();
         assert_eq!(report.invalid_models_dropped, 1);
         assert_eq!(report.invalid_fields_dropped, 1);
         assert_eq!(report.models[0].name, "[Odoo label withheld]");
         assert_eq!(report.models[0].fields[0].label, "[Odoo label withheld]");
-        assert_eq!(report.models[0].fields[1].relation.as_deref(), Some("res.partner"));
+        // res.partner is security-blocked by default: the relation is stripped.
+        assert_eq!(report.models[0].fields[1].name, "partner_id");
+        assert_eq!(report.models[0].fields[1].relation, None);
         assert!(!serde_json::to_string(&report).unwrap().contains("previous instructions"));
+    }
+
+    #[tokio::test]
+    async fn legacy_schema_discovery_never_queries_or_returns_invisible_models() {
+        let conn = mocked_connector(vec![
+            Ok(json!({"model":{}, "name":{}, "transient":{}})),
+            Ok(json!([
+                {"model":"res.partner", "name":"Contacts"},   // security-blocked
+                {"model":"project.task", "name":"Task"},      // project switched off
+                {"model":"crm.lead", "name":"Lead"},
+                {"model":"x_ok", "name":"Visible"},
+            ])),
+            Ok(json!({"model":{}, "name":{}, "ttype":{}, "field_description":{}, "required":{}, "relation":{}})),
+            Ok(json!([
+                // A server returning rows for a model that was not requested.
+                {"model":"res.partner", "name":"vat", "ttype":"char", "field_description":"Tax ID"},
+                {"model":"crm.lead", "name":"partner_id", "ttype":"many2one", "relation":"res.partner"},
+                {"model":"crm.lead", "name":"task_id", "ttype":"many2one", "relation":"project.task"},
+                {"model":"crm.lead", "name":"x_ref", "ttype":"many2one", "relation":"x_ok"},
+                {"model":"x_ok", "name":"name", "ttype":"char"},
+            ])),
+        ]);
+        let policy = crate::schema::ScanPolicy::from_config(&crate::OdooConfig::default());
+        let report = conn.introspect_schema(10, &policy).await.unwrap();
+        // The ir.model.fields query names visible models only.
+        let requests = conn.mocked_requests();
+        let field_query = requests.iter()
+            .find(|(model, method, _, _)| model == "ir.model.fields" && method == "search_read").unwrap();
+        assert_eq!(field_query.2[0], json!([["model", "in", ["crm.lead", "x_ok"]]]));
+        assert_eq!(report.models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), vec!["crm.lead", "x_ok"]);
+        assert_eq!(report.total_models, 2);
+        let lead = &report.models[0];
+        let rel = |name: &str| lead.fields.iter().find(|f| f.name == name).unwrap().relation.clone();
+        assert_eq!(rel("partner_id"), None);
+        assert_eq!(rel("task_id"), None);
+        assert_eq!(rel("x_ref").as_deref(), Some("x_ok"));
+        let text = serde_json::to_string(&report).unwrap();
+        assert!(!text.contains("res.partner") && !text.contains("project.task") && !text.contains("Tax ID"), "{text}");
     }
 
     #[tokio::test]

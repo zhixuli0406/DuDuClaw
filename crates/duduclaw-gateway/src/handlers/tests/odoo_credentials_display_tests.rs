@@ -192,7 +192,11 @@ async fn odoo_schema_wiki_never_persists_instruction_labels_or_invalid_identifie
             duduclaw_odoo::SchemaModel { model: "bad model".into(), name: "Bad".into(), custom: false, field_count: 0, fields: vec![] },
         ],
     };
-    let (written, note) = handler.write_odoo_schema_wiki(&report).await;
+    // Unblock res.partner so the relation survives the visibility filter.
+    let mut cfg = duduclaw_odoo::OdooConfig::default();
+    cfg.unblock_models = vec!["res.partner".into()];
+    let policy = duduclaw_odoo::schema::ScanPolicy::from_config(&cfg);
+    let (written, note) = handler.write_odoo_schema_wiki(&report, &policy).await;
     assert!(written, "{note}");
     for page in ["schema.md", "schema-fields.md"] {
         let text = std::fs::read_to_string(home.path().join("shared/wiki/odoo").join(page)).unwrap();
@@ -202,11 +206,54 @@ async fn odoo_schema_wiki_never_persists_instruction_labels_or_invalid_identifie
         assert!(text.contains("Odoo label withheld"));
         assert!(text.contains("外部 Odoo") && text.contains("不是指令"));
         assert!(text.contains("crm.lead"));
+        // Neither page is auto-injected into context.
+        assert!(text.contains("layer: deep"), "{page}");
+        assert!(!text.contains("layer: context"), "{page}");
         if page == "schema-fields.md" {
             assert!(text.contains("partner_id") && text.contains("many2one") && text.contains("res.partner"));
             assert!(!text.contains("\n## example"));
         }
     }
+}
+
+#[tokio::test]
+async fn odoo_schema_wiki_never_persists_blocked_or_switched_off_models() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let field = |name: &str, relation: Option<&str>| duduclaw_odoo::SchemaField {
+        name: name.into(), ttype: "many2one".into(), label: "Link".into(), label_flagged: false,
+        required: false, relation: relation.map(str::to_owned),
+    };
+    let model = |model: &str, fields: Vec<duduclaw_odoo::SchemaField>| duduclaw_odoo::SchemaModel {
+        model: model.into(), name: "Model".into(), custom: model.starts_with("x_"),
+        field_count: fields.len(), fields,
+    };
+    // A report that (incorrectly) still contains invisible models.
+    let report = duduclaw_odoo::SchemaReport {
+        invalid_models_dropped: 0, invalid_fields_dropped: 0, total_models: 4, truncated: false,
+        models: vec![
+            model("crm.lead", vec![field("partner_id", Some("res.partner")),
+                field("task_id", Some("project.task")), field("x_ref", Some("x_ok"))]),
+            model("project.task", vec![field("lead_id", Some("crm.lead"))]),
+            model("res.partner", vec![field("vat_ref", None)]),
+            model("x_ok", vec![]),
+        ],
+    };
+    // Default config: res.partner is security-blocked, project is switched off.
+    let policy = duduclaw_odoo::schema::ScanPolicy::from_config(&duduclaw_odoo::OdooConfig::default());
+    let (written, note) = handler.write_odoo_schema_wiki(&report, &policy).await;
+    assert!(written, "{note}");
+    for page in ["schema.md", "schema-fields.md"] {
+        let text = std::fs::read_to_string(home.path().join("shared/wiki/odoo").join(page)).unwrap();
+        assert!(text.contains("crm.lead") && text.contains("x_ok"), "{page}: {text}");
+        assert!(!text.contains("res.partner") && !text.contains("project.task"), "{page}: {text}");
+        assert!(!text.contains("vat_ref") && !text.contains("lead_id"), "{page}: {text}");
+        assert!(text.contains("layer: deep") && !text.contains("layer: context"), "{page}");
+    }
+    let mut filtered = report.clone();
+    policy.retain_report(&mut filtered);
+    assert_eq!(filtered.models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), vec!["crm.lead", "x_ok"]);
+    assert_eq!(filtered.total_models, 2);
 }
 
 #[tokio::test]
@@ -223,4 +270,117 @@ async fn odoo_permission_options_require_admin_and_return_policy_without_connect
     assert_eq!(body["read_only_models"], json!(duduclaw_odoo::connector::READ_ONLY_WHEN_UNBLOCKED));
     assert_eq!(body["scan_available"], false);
     assert_eq!(body["models"], json!([]));
+}
+
+#[tokio::test]
+async fn odoo_rescan_enumerates_employee_specific_connection() {
+    let (home, handler) = handler_with_stored_credentials().await;
+    let admin = UserContext::admin_fallback();
+    payload(handler.handle_agents_create_as(json!({"name":"project-agent","display_name":"Projects"}), Some(&admin)).await);
+    let path = handler.registry.read().await.get("project-agent").unwrap().dir.join("agent.toml");
+    let mut table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    table.insert("odoo".into(), toml::Value::Table(toml::from_str(
+        "url = 'https://projects.example.com'\ndb = 'projects'\nusername = 'project-user'\ncompany_ids = [2]\n"
+    ).unwrap()));
+    std::fs::write(path, toml::to_string(&table).unwrap()).unwrap();
+    let (targets, failures) = handler.effective_odoo_scan_targets().await;
+    assert!(failures.is_empty(), "{failures:?}");
+    let global = targets.iter().find(|t| t.employee == "default").unwrap();
+    let agent = targets.iter().find(|t| t.employee == "project-agent").unwrap();
+    assert_eq!(global.cfg.db, "mycompany");
+    assert_eq!(agent.cfg.url, "https://projects.example.com");
+    assert_eq!(agent.cfg.db, "projects");
+    assert_eq!(agent.cfg.username, "project-user");
+    // Missing credentials are reported per employee without attempting either
+    // connection. No network access is needed for this failure case.
+    std::fs::write(home.path().join("config.toml"), "[odoo]\nurl = 'https://global.example.com'\ndb = 'global'\n").unwrap();
+    let response = payload(handler.handle_odoo_schema_scan().await);
+    assert_eq!(response["success"], false);
+    let rows = response["results"].as_array().unwrap();
+    assert!(rows.iter().any(|r| r["employee"] == "project-agent" && r["status"] == "failed"));
+    assert!(rows.iter().any(|r| r["employee"] == "default" && r["status"] == "failed"));
+    assert!(!response.to_string().contains(API_KEY));
+}
+
+#[tokio::test]
+async fn odoo_rescan_saves_distinct_global_and_employee_snapshots() {
+    async fn rpc(axum::Json(body): axum::Json<Value>) -> axum::Json<Value> {
+        let args = &body["params"]["args"];
+        let result = match body["params"]["method"].as_str().unwrap_or("") {
+            "authenticate" => json!(if args[0] == "projects" { 2 } else { 1 }),
+            "version" => json!({"server_version":"19.0"}),
+            "execute_kw" => {
+                let model = args[3].as_str().unwrap_or("");
+                let method = args[4].as_str().unwrap_or("");
+                // Daybreak (a): a security-blocked model (res.partner) and a model of
+                // a switched-off module (hr) are never field- or ACL-probed.
+                if matches!(model, "res.partner" | "hr.job") {
+                    panic!("blocked model probed: {model}.{method}");
+                }
+                match method {
+                    "fields_get" => json!({
+                        "name":{"type":"char","string":"Name"},
+                        "latest_version":{"type":"char","string":"Version"},
+                        "model":{"type":"char","string":"Model"},
+                        "transient":{"type":"boolean","string":"Transient"},
+                        "modules":{"type":"char","string":"Modules"},
+                        "info":{"type":"char","string":"Info"},
+                    }),
+                    "search_read" if model == "ir.module.module" => json!([{"name":"project","latest_version":"19.0.1.0.0"}]),
+                    "search_read" if model == "ir.model" => {
+                        if args[0] == "projects" {
+                            json!([{"model":"project.project","name":"Projects","modules":"project"}])
+                        } else { json!([
+                            {"model":"crm.lead","name":"Leads","modules":"crm"},
+                            {"model":"res.partner","name":"Contacts","modules":"base"},
+                            {"model":"hr.job","name":"Job Position","modules":"hr"},
+                        ]) }
+                    }
+                    "has_access" | "check_access_rights" => json!(true),
+                    _ => panic!("unexpected metadata request: {model}.{method}"),
+                }
+            }
+            _ => panic!("unexpected RPC method"),
+        };
+        axum::Json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().route("/jsonrpc", axum::routing::post(rpc))).await.unwrap();
+    });
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), format!(
+        "[odoo]\nurl = '{url}'\ndb = 'global'\nusername = 'global-user'\napi_key = 'global-key'\nfeatures_project = true\n"
+    )).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let admin = UserContext::admin_fallback();
+    payload(handler.handle_agents_create_as(json!({"name":"project-agent","display_name":"Projects"}), Some(&admin)).await);
+    let path = handler.registry.read().await.get("project-agent").unwrap().dir.join("agent.toml");
+    let mut agent: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    agent.insert("odoo".into(), toml::Value::Table(toml::from_str(
+        "db = 'projects'\nusername = 'project-user'\ncompany_ids = [2]\n"
+    ).unwrap()));
+    std::fs::write(path, toml::to_string(&agent).unwrap()).unwrap();
+    let body = payload(handler.handle_odoo_schema_scan().await);
+    assert_eq!(body["success"], true, "{body}");
+    assert!(body["results"].as_array().unwrap().iter()
+        .any(|r| r["employee"] == "project-agent" && r["status"] == "ok"));
+    let table: toml::Table = std::fs::read_to_string(home.path().join("config.toml")).unwrap().parse().unwrap();
+    let global_cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
+    let mut employee_cfg = global_cfg.clone();
+    duduclaw_odoo::AgentOdooConfig::from_table(&agent).unwrap().unwrap().apply_to(&mut employee_cfg).unwrap();
+    let global = duduclaw_odoo::OdooConnector::connect(&global_cfg, "global-key").await.unwrap();
+    let employee = duduclaw_odoo::OdooConnector::connect(&employee_cfg, "global-key").await.unwrap().with_company_ids(vec![2]);
+    let global_profile = global.schema_profile("default");
+    let employee_profile = employee.schema_profile("default");
+    assert_ne!(global_profile, employee_profile);
+    let saved = duduclaw_odoo::schema::load_snapshot(home.path(), &employee_profile).unwrap().unwrap();
+    assert_eq!(saved.connection_identity, employee.connection_identity());
+    assert_eq!(saved.models[0].model, "project.project");
+    let global_saved = duduclaw_odoo::schema::load_snapshot(home.path(), &global_profile).unwrap().unwrap();
+    assert_eq!(global_saved.models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), vec!["crm.lead"]);
+    let stored = serde_json::to_string(&global_saved).unwrap();
+    assert!(!stored.contains("res.partner") && !stored.contains("hr.job"), "{stored}");
+    server.abort();
 }

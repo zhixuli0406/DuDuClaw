@@ -77,6 +77,14 @@ impl OdooConnector {
     /// eight requests at once. Worst-case call budget: 100s plus 1.5s detection.
     /// Errors/timeouts become null cells; page loads only read the snapshot.
     pub async fn probe_model_access(&self, models: Vec<String>) -> BTreeMap<String, ModelAccess> {
+        self.probe_model_access_bounded(models, Duration::from_secs(120)).await.0
+    }
+
+    /// Return completed rows on deadline so the gateway can resume the missing
+    /// models next cycle. Cancellation drops all borrowed workers together.
+    pub async fn probe_model_access_bounded(
+        &self, models: Vec<String>, budget: Duration,
+    ) -> (BTreeMap<String, ModelAccess>, bool) {
         let models: Vec<_> = models.into_iter().take(crate::schema::MAX_MODELS).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let results = tokio::sync::Mutex::new(BTreeMap::new());
@@ -89,8 +97,10 @@ impl OdooConnector {
             }
         };
         // Borrowed futures avoid detached tasks when the scan is cancelled.
-        tokio::join!(worker(), worker(), worker(), worker(), worker(), worker(), worker(), worker());
-        results.into_inner()
+        let timed_out = tokio::time::timeout(budget, async {
+            tokio::join!(worker(), worker(), worker(), worker(), worker(), worker(), worker(), worker());
+        }).await.is_err();
+        (results.into_inner(), timed_out)
     }
 }
 

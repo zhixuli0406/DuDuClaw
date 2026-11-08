@@ -3,7 +3,8 @@ import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { Plus, X } from 'lucide-react';
 import { useAgentsStore } from '@/stores/agents-store';
-import { api } from '@/lib/api';
+import { api, type MemoryPrivacySettings } from '@/lib/api';
+import { MemoryPrivacyCard, MEMORY_PRIVACY_DEFAULTS, canonicalPrivacy } from './MemoryPrivacyCard';
 import { isImeComposing } from '@/lib/keyboard';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -167,6 +168,9 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
   const [originDraft, setOriginDraft] = useState('');
   // [memory] novelty_gate — B1 write-time memory dedup gate (default: on).
   const [noveltyGate, setNoveltyGate] = useState(true);
+  // RM-039 [memory_privacy] — owned by MemoryPrivacyCard, which saves each
+  // change itself (so it is deliberately NOT part of the form-wide snapshot).
+  const [memoryPrivacy, setMemoryPrivacy] = useState<MemoryPrivacySettings>(MEMORY_PRIVACY_DEFAULTS);
   // S20: `[miniapp] enabled` — the Telegram Mini App approval screen. Default
   // off; before 2026-09 it had no dashboard surface at all.
   const [miniappEnabled, setMiniappEnabled] = useState(false);
@@ -245,6 +249,16 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
       setOrigins(Array.isArray(ao) ? (ao.filter((v) => typeof v === 'string') as string[]) : []);
       // novelty_gate_enabled comes back structured too (not parsed from TOML).
       setNoveltyGate(res.novelty_gate_enabled ?? true);
+      // RM-039: an older gateway omits memory_privacy ⇒ the gateway defaults.
+      const privacy = res.memory_privacy;
+      setMemoryPrivacy(privacy
+        ? {
+            ...MEMORY_PRIVACY_DEFAULTS,
+            ...privacy,
+            excluded_categories: canonicalPrivacy(privacy.excluded_categories ?? MEMORY_PRIVACY_DEFAULTS.excluded_categories),
+            custom_keywords: privacy.custom_keywords ?? {},
+          }
+        : MEMORY_PRIVACY_DEFAULTS);
       // miniapp_enabled likewise; an older gateway omits it ⇒ off (the
       // same fail-closed default `miniapp::enabled` uses).
       setMiniappEnabled(res.miniapp_enabled ?? false);
@@ -657,6 +671,12 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
             onChange={setNoveltyGate}
           />
         </SettingsCard>
+        {/* RM-039 — topics automatic memory never stores (saves on change) */}
+        <MemoryPrivacyCard
+          settings={memoryPrivacy}
+          onSettingsChange={setMemoryPrivacy}
+          disabled={!loaded || loadError != null}
+        />
       </SettingsSection>
 
       </>}
