@@ -237,6 +237,8 @@ impl UserDb {
         crate::isolation::initialize_tenant(&conn)?;
         // Last: its triggers read users and every MFA table (F6 S1/S16).
         crate::admin_eligibility::migrate(&conn)?;
+        // F6c (Q3): owner credential change log, also over users + MFA tables.
+        crate::credential_changes::migrate(&conn)?;
         Ok(())
     }
 
@@ -1797,10 +1799,15 @@ pub fn bind_personal_owner_in_transaction(
 
 /// Remove the Personal mirror row of a tombstoned employee.
 ///
-/// **Only the gateway employee lifecycle apply path may call this**, in the
-/// same users.db transaction in which it records the employee as tombstoned.
-/// No RPC, migration, repair or cleanup path may call it: deleting the row
-/// turns the agent name back into an unrestricted (Shared) binding target.
+/// **Only the gateway employee lifecycle may call this**, and only on three
+/// paths: the apply compensation (after the disabled confirmed row is
+/// durable), the tombstone (F6 §3.2 step 5, after the disabled row and the
+/// quarantine row are committed), and the F6 same-id restore crash recovery
+/// (F6 §3.6: a `restoring` quarantine row whose confirmed row is still
+/// disabled; the mirror written by the interrupted apply is undone so the
+/// label reads `Tombstoned` again). No RPC, migration, repair or cleanup path
+/// may call it: deleting the row turns the agent name back into an
+/// unrestricted (Shared) binding target.
 ///
 /// In the caller's IMMEDIATE transaction it deletes the mirror row and every
 /// `user_agent_bindings` row of the agent (a Personal binding never outlives
@@ -1862,4 +1869,106 @@ pub fn remove_shared_bindings_in_transaction(
     ).map_err(PersonalAgentError::store)?;
     bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
     Ok(removed)
+}
+
+/// Bump the isolation policy epoch (F6 H1a): exactly one valid row must
+/// change, else the store is refused (a missing, corrupt or exhausted epoch
+/// is never recreated, which could revive a run).
+fn bump_policy_epoch(tx: &Connection) -> Result<(), PersonalAgentError> {
+    let changed = tx.execute("UPDATE auth_meta SET value=value+1 WHERE key=?1
+        AND typeof(value)='integer' AND value>0 AND value<9223372036854775807",
+        [duduclaw_core::isolation_policy::POLICY_EPOCH_KEY]).map_err(PersonalAgentError::store)?;
+    if changed != 1 { return Err(PersonalAgentError::Store("isolation policy epoch unavailable".into())); }
+    Ok(())
+}
+
+/// No mirror row and no binding of `agent` exists (a restore never merges
+/// into, or takes over, a live users.db side).
+fn require_unbound(tx: &Connection, agent: &str) -> Result<(), PersonalAgentError> {
+    if personal_agent_owner(tx, agent)?.is_some() { return Err(PersonalAgentError::OwnerConflict); }
+    let bound: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name = ?1)",
+        [agent], |row| row.get(0)).map_err(PersonalAgentError::store)?;
+    if bound { return Err(PersonalAgentError::BindingConflict); }
+    let removal: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM isolation_personal_agent_removals WHERE agent_name = ?1)",
+        [agent], |row| row.get(0)).map_err(PersonalAgentError::store)?;
+    if removal { return Err(PersonalAgentError::Store("personal agent removal still pending".into())); }
+    Ok(())
+}
+
+/// Same-id restore of a tombstoned **Personal** employee (native Linux
+/// isolation v1.81, F6 §3.5 step c).
+///
+/// **Only the gateway F6 restore apply step may call this**, in a
+/// caller-owned IMMEDIATE users.db transaction (taken after the apply.db
+/// writer lock, never before), after the caller re-checked the owner's
+/// eligibility and the approval rule in that same transaction; nothing here
+/// commits. Refuses `OwnerConflict` when any mirror row exists for the
+/// agent, `BindingConflict` when any user is bound to it, `UnknownOwner` for
+/// a missing account. Inserts the mirror row, binds the owner with Owner
+/// access (the normal binding writer, so `is_primary` is recomputed),
+/// audits, and bumps `acl_generation` **and** the isolation policy epoch
+/// unconditionally (H1a: no authority of the prior incarnation survives).
+pub fn restore_personal_mirror_in_transaction(
+    tx: &rusqlite::Transaction<'_>, agent: &str, owner_user_id: &str,
+) -> Result<(), PersonalAgentError> {
+    if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
+    if owner_user_id.is_empty() { return Err(PersonalAgentError::UnknownOwner); }
+    require_unbound(tx, agent)?;
+    if !insert_personal_agent_in_transaction(tx, agent, owner_user_id)? {
+        return Err(PersonalAgentError::OwnerConflict);
+    }
+    if !bind_personal_owner_in_transaction(tx, agent, owner_user_id)? {
+        return Err(PersonalAgentError::BindingConflict);
+    }
+    tx.execute(
+        "INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
+         VALUES(NULL, 'isolation.personal_agent_restored', ?1, ?2, ?3)",
+        params![agent, serde_json::json!({"owner_user_id": owner_user_id}).to_string(), Utc::now().to_rfc3339()],
+    ).map_err(PersonalAgentError::store)?;
+    bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
+    bump_policy_epoch(tx)
+}
+
+/// One member binding a Shared restore re-creates (F6 §3.9, S11): the level
+/// is at most the tombstone-time level (the caller checks that against the
+/// digest-bound selection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredMember {
+    pub user_id: String,
+    pub access_level: AccessLevel,
+}
+
+/// Same-id restore of a tombstoned **Shared** employee (F6 §3.5 step c,
+/// §3.9). **Only the gateway F6 restore apply step may call this**, in a
+/// caller-owned IMMEDIATE users.db transaction; nothing here commits.
+/// Refuses `OwnerConflict` when a Personal mirror exists, `BindingConflict`
+/// when any binding exists (nothing is merged), `UnknownOwner` when a member
+/// is missing or not active, `InvalidAgent` for an empty or duplicate
+/// selection. Inserts exactly the selected bindings through the normal
+/// binding writer (`bound_at = now`, `is_primary` recomputed, never copied),
+/// audits the count, and bumps `acl_generation` and the policy epoch.
+pub fn restore_shared_bindings_in_transaction(
+    tx: &rusqlite::Transaction<'_>, agent: &str, members: &[RestoredMember],
+) -> Result<usize, PersonalAgentError> {
+    if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
+    let mut ids: Vec<&str> = members.iter().map(|member| member.user_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if members.is_empty() || ids.len() != members.len() { return Err(PersonalAgentError::InvalidAgent); }
+    require_unbound(tx, agent)?;
+    let now = Utc::now().to_rfc3339();
+    for member in members {
+        let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
+            [&member.user_id], |row| row.get(0)).map_err(PersonalAgentError::store)?;
+        if !active { return Err(PersonalAgentError::UnknownOwner); }
+        bind_agent_in_transaction(tx, &member.user_id, agent, member.access_level, &now)?;
+    }
+    tx.execute(
+        "INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
+         VALUES(NULL, 'isolation.shared_agent_bindings_restored', ?1, ?2, ?3)",
+        params![agent, serde_json::json!({"restored": members.len()}).to_string(), now],
+    ).map_err(PersonalAgentError::store)?;
+    bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
+    bump_policy_epoch(tx)?;
+    Ok(members.len())
 }

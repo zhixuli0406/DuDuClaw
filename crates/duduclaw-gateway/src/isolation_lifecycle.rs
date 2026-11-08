@@ -39,9 +39,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::fs_safe::sqlite::Access;
 
-const APPLY_DB: &str = "migration-authority/apply.db";
-const CONFIRMATIONS_DB: &str = "migration-confirmations.db";
-const USERS_DB: &str = "users.db";
+pub(crate) const APPLY_DB: &str = "migration-authority/apply.db";
+pub(crate) const CONFIRMATIONS_DB: &str = "migration-confirmations.db";
+pub(crate) const USERS_DB: &str = "users.db";
 
 /// Why a lifecycle read or write was refused. Every variant is a refusal;
 /// none is a hint that a weaker check may be used instead.
@@ -276,7 +276,9 @@ pub(crate) fn record_personal_mirror(home: &Path, label: &str, owner: &str) -> R
     Ok(inserted)
 }
 
-/// Apply/compensation and tombstone path only: remove the Personal mirror
+/// Apply/compensation, tombstone and F6 restore crash-recovery paths only
+/// (`isolation_restore`, §3.6: undo the mirror an interrupted restore wrote
+/// while its confirmed row is still disabled): remove the Personal mirror
 /// (and, per A3, every binding of the agent). `Ok(false)` when absent;
 /// `Stale` when another owner is recorded (left untouched).
 pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
@@ -543,7 +545,7 @@ pub(crate) fn record_fence_group(home: &Path, label: &str, employee: EmployeeId,
 /// The Personal (H3) or Shared (R4) principal snapshot of §3.2 step 3, from
 /// one users.db read transaction. Never holds a credential value: the
 /// MFA/passkey set is a digest, the Google link is the `sub` only.
-fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinned: &str)
+pub(crate) fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinned: &str)
     -> Result<serde_json::Value, LifecycleError> {
     use LifecycleError::Unavailable;
     use sha2::{Digest, Sha256};
@@ -692,7 +694,7 @@ pub(crate) fn quarantine_path(home: &Path, label: &str, employee: EmployeeId, in
 
 /// A quarantined directory, by descriptor (retry of a pending seal). The
 /// quarantine root must be private as at the move; `Ok(None)` when absent.
-fn reopen_quarantined(home: &Path, label: &str, employee: EmployeeId, incarnation: u32)
+pub(crate) fn reopen_quarantined(home: &Path, label: &str, employee: EmployeeId, incarnation: u32)
     -> Result<Option<crate::fs_safe::SafeDir>, LifecycleError> {
     use LifecycleError::Unavailable;
     #[cfg(unix)]
@@ -773,12 +775,12 @@ fn quarantine_agent_dir(home: &Path, label: &str, employee: EmployeeId, incarnat
     { let _ = (home, label, employee, incarnation); Err(Unavailable) }
 }
 
-fn valid_label(label: &str) -> bool {
+pub(crate) fn valid_label(label: &str) -> bool {
     duduclaw_core::is_valid_agent_id(label) && !duduclaw_core::is_reserved_agent_id(label)
         && label != duduclaw_core::UNTRUSTED_AGENT_ID
 }
 
-fn principal(prior: &Receipt, pinned: &str) -> Result<EmployeeBinding, LifecycleError> {
+pub(crate) fn principal(prior: &Receipt, pinned: &str) -> Result<EmployeeBinding, LifecycleError> {
     match &prior.principal_binding {
         // Legacy: Shared in the pinned tenant only, never Personal.
         None => Text::new(pinned.to_owned()).map(EmployeeBinding::Shared).map_err(|_| LifecycleError::Denied),
@@ -793,7 +795,7 @@ fn principal(prior: &Receipt, pinned: &str) -> Result<EmployeeBinding, Lifecycle
 /// The incarnation comes from the same row read (0 before F6a added the
 /// column); a NULL, negative or out-of-range value, or an employee schema
 /// newer than this build, is `Unavailable`.
-fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<String>, u32)>, LifecycleError> {
+pub(crate) fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<String>, u32)>, LifecycleError> {
     let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
     let table: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
@@ -816,7 +818,7 @@ fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<Str
     Ok(Some((receipt, tenant, incarnation)))
 }
 
-fn applied_item(home: &Path, binding: &ProposalBinding) -> Result<ConfirmationItem, LifecycleError> {
+pub(crate) fn applied_item(home: &Path, binding: &ProposalBinding) -> Result<ConfirmationItem, LifecycleError> {
     let store = duduclaw_migration::confirmation::ConfirmationStore::from_read_only_connection(
         open_store(home, CONFIRMATIONS_DB, Access::ReadOnly)?).map_err(|_| LifecycleError::Unavailable)?;
     store.list().map_err(|_| LifecycleError::Unavailable)?.into_iter()
@@ -868,7 +870,7 @@ thread_local! {
 /// Same rule as the Shared binding restoration
 /// (`migration_authority_bindings.rs`): Active, logged in, no forced
 /// password change.
-fn owner_eligible(conn: &Connection, owner: &str) -> Result<bool, LifecycleError> {
+pub(crate) fn owner_eligible(conn: &Connection, owner: &str) -> Result<bool, LifecycleError> {
     let row: Option<(String, bool, Option<String>)> = conn.query_row(
         "SELECT status,must_change_password,last_login FROM users WHERE id=?1", [owner],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(|_| LifecycleError::Unavailable)?;
@@ -876,7 +878,7 @@ fn owner_eligible(conn: &Connection, owner: &str) -> Result<bool, LifecycleError
         status == "active" && !must_change && last_login.is_some_and(|login| !login.is_empty())))
 }
 
-fn mirror_error(error: duduclaw_auth::db::PersonalAgentError) -> LifecycleError {
+pub(crate) fn mirror_error(error: duduclaw_auth::db::PersonalAgentError) -> LifecycleError {
     use duduclaw_auth::db::PersonalAgentError as E;
     match error {
         E::Store(_) => LifecycleError::Unavailable,
@@ -891,7 +893,7 @@ fn mirror_error(error: duduclaw_auth::db::PersonalAgentError) -> LifecycleError 
 /// the store's directory, owner/mode/link-count/dev+inode checks on the
 /// store and its -journal/-wal/-shm sidecars before and after the open,
 /// `SQLITE_OPEN_NOFOLLOW`, never created. Any violation is `Unavailable`.
-fn open_store(home: &Path, store: &str, access: Access) -> Result<Connection, LifecycleError> {
+pub(crate) fn open_store(home: &Path, store: &str, access: Access) -> Result<Connection, LifecycleError> {
     let (directory, name) = match store.rsplit_once('/') {
         Some((subdirectory, name)) => (home.join(subdirectory), name),
         None => (home.to_path_buf(), store),

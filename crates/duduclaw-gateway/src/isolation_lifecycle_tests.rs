@@ -684,3 +684,9 @@ mod readiness_reasons;
 /// F6a/F6b: incarnation, schema and the sealing tombstone.
 #[path = "isolation_lifecycle_f6_tests.rs"]
 mod f6;
+
+/// F6c: the same-id restore engine (`crate::isolation_restore`), over this
+/// module's real-store fixture.
+#[cfg(unix)]
+#[path = "isolation_restore_tests.rs"]
+mod restore;

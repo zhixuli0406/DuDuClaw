@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod admin_eligibility;
+pub mod credential_changes;
 pub mod db;
 pub mod jwt;
 pub mod google_identity;
