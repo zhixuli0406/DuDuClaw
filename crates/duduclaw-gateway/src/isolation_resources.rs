@@ -77,8 +77,25 @@ impl GatewayResourceResolver {
         }
         Ok(found)
     }
+    /// H8 live task selector for `create_task`. The task is the run's own task
+    /// from the verified record (never an argument; selector arguments are
+    /// refused), it must carry the exact signed grant, and the task store must
+    /// say NOW that this employee's agent owns it (`tasks.assigned_to` + the
+    /// existing audience rule). Re-read on every call: no caching, so a task
+    /// reassigned or deleted mid-run stops authorizing new plans immediately.
+    fn create_task_selector(&self, context: &RequestContext, args: &Value)
+        -> Result<Vec<ResourceGrant>, VerificationError> {
+        if duduclaw_mcp_boundary::tool_policy::TASK_SELECTOR_KEYS.iter().any(|key| args.get(*key).is_some()) {
+            return Err(VerificationError::Invalid);
+        }
+        let selector = duduclaw_mcp_boundary::tool_policy::create_task_selector(context)?;
+        let ResourceGrant::Task { id } = &selector else { return Err(VerificationError::Invalid); };
+        if !self.task_owned("create_task", id.as_str())? { return Err(VerificationError::Invalid); }
+        Ok(vec![selector])
+    }
     fn selected_tasks(&self, context: &RequestContext, policy: &ToolPolicy, args: &Value)
         -> Result<Vec<ResourceGrant>, VerificationError> {
+        if policy.name == "create_task" { return self.create_task_selector(context, args); }
         let mut selected = Vec::new();
         for key in ["task_id", "parent_task_id", "goal_id", "parent_goal_id"] {
             if let Some(id) = string(args, key)? { selected.push(id.to_owned()); }

@@ -79,8 +79,10 @@ pub const WORK_RESERVED_FIRST_COMPONENT: &str = ".forks";
 /// `employee-work` mount. Validated on construction and on deserialization,
 /// so an unsafe path is unrepresentable on the sender and fails frame decode
 /// on the receiver. Rules: non-empty, ≤ 4096 bytes, ≤ 64 components, each
-/// component non-empty, ≤ 255 bytes, not `.`/`..`, no NUL, `\` or ASCII
-/// control byte; no leading `/` (absolute), no trailing or doubled `/`; first
+/// component non-empty, ≤ 255 bytes, not `.`/`..`, no `\` and no
+/// `char::is_control` character (C0 incl. NUL, DEL, C1 incl. U+0085 — the
+/// same rule as mcp-boundary's `WorkRelativePath`); no leading `/`
+/// (absolute), no trailing or doubled `/`; first
 /// component not `.forks`. Syntax only: the H2 broker still resolves it with
 /// `openat2(RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV)` and checks the
 /// opened inode, so symlinks, hard links and mounts are not decided here.
@@ -117,7 +119,7 @@ fn validate_work_path(path: &str) -> Result<(), ContractError> {
         if part.len() > MAX_WORK_COMPONENT_BYTES { return Err(ContractError::LimitExceeded("work path component")); }
         if part.is_empty() || part == "." || part == ".."
             || (index == 0 && part == WORK_RESERVED_FIRST_COMPONENT)
-            || part.bytes().any(|b| b == b'\\' || b.is_ascii_control()) {
+            || part.chars().any(|c| c == '\\' || c.is_control()) {
             return Err(INVALID);
         }
     }
@@ -702,6 +704,47 @@ mod tests {
             assert!(open(path).validate().is_ok(), "{path}");
         }
         assert_eq!(WorkPath::new("a/b/c".into()).unwrap().components().collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
+
+    /// Copy of `duduclaw_mcp_boundary::resources::WORK_PATH_CONFORMANCE` (H6).
+    /// duduclaw-isolation cannot depend on mcp-boundary, so the vectors are
+    /// duplicated; keep both lists identical.
+    const H6_WORK_PATH_CONFORMANCE: &[(&str, bool)] = &[
+        ("a", true), ("notes/員工.md", true), ("a/b/c.csv", true), (".hidden", true), ("..a/b..", true),
+        ("a b/c-d_e.txt", true),
+        ("", false), (".", false), ("..", false), ("/", false), ("/etc/passwd", false), ("../x", false),
+        ("a/../b", false), ("a/./b", false), ("./a", false), ("a/.", false), ("a//b", false), ("a/", false),
+        ("a\\b", false), ("a\0b", false), ("a\nb", false), ("a\tb", false), ("a\u{7f}b", false), ("a\u{85}b", false),
+    ];
+
+    #[test]
+    fn work_path_refuses_unicode_controls() {
+        // Every `char::is_control` scalar (C0, DEL, C1 incl. U+0085 NEL) is
+        // refused, in any component, both at construction and at decode.
+        let controls = (0u32..=0x1f).chain(0x7f..=0x9f).filter_map(char::from_u32);
+        for control in controls {
+            assert!(control.is_control());
+            for path in [format!("a{control}b"), format!("dir/{control}"), format!("{control}/x")] {
+                assert!(WorkPath::new(path.clone()).is_err(), "{:?}", path);
+                let mut value = serde_json::to_value(open("a")).unwrap();
+                value["path"] = path.clone().into();
+                assert!(serde_json::from_value::<SpawnRequest>(value).is_err(), "{:?}", path);
+            }
+        }
+        // Not controls: format characters are outside this rule (H6 agrees).
+        for path in ["a\u{a0}b", "a\u{200b}b", "名\u{3000}稱"] {
+            assert!(WorkPath::new(path.into()).is_ok(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn work_path_conformance_vectors_match_h6() {
+        for (path, ok) in H6_WORK_PATH_CONFORMANCE {
+            assert_eq!(WorkPath::new((*path).into()).is_ok(), *ok, "{path:?}");
+            let mut value = serde_json::to_value(open("a")).unwrap();
+            value["path"] = (*path).into();
+            assert_eq!(serde_json::from_value::<SpawnRequest>(value).is_ok(), *ok, "{path:?}");
+        }
     }
 
     #[test]

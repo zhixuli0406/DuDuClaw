@@ -156,9 +156,11 @@ tags `helper_started`/`helper_ended` and the error codes `helper_busy`,
   `WorkFile { run, file: { size, inode, device } }` + exactly one `WorkFileRead`
   fd (regular file, O_RDONLY, FD_CLOEXEC). `WorkPath` is relative to the live
   run's attached `employee-work` mount: non-empty, ≤ 4096 bytes, ≤ 64 components
-  of ≤ 255 bytes, no `.`/`..`/empty component, no leading `/`, NUL, `\` or ASCII
-  control byte, first component not `.forks`; checked on construction and on
-  decode. `size` ≤ 16 MiB, `inode`/`device` non-zero.
+  of ≤ 255 bytes, no `.`/`..`/empty component, no leading `/`, no `\` and no
+  `char::is_control` character (C0 incl. NUL, DEL, C1 incl. U+0085; same rule
+  and conformance vectors as mcp-boundary `WorkRelativePath`), first component
+  not `.forks`; checked on construction and on decode. `size` ≤ 16 MiB,
+  `inode`/`device` non-zero.
 - `WorkAnchor { employee_id }` → `WorkAnchor { employee_id, anchor: { device, inode } }`,
   no fds.
 - New `ErrorCode`s: `work_file_not_found`, `work_file_refused`,

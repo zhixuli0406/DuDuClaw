@@ -9,6 +9,8 @@ pub mod policy;
 pub mod helper_policy;
 pub mod helper_cgroup;
 pub mod storage;
+#[cfg(unix)]
+pub mod work_anchor;
 pub mod bootstrap;
 #[cfg(target_os = "linux")]
 pub mod bootstrap_mounts;

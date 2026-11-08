@@ -112,6 +112,13 @@ pub trait Storage: Send {
     /// Durable attachments left by an earlier daemon. An unavailable inventory
     /// is an error, not an empty list. B1 reconciles every listed run first.
     fn attachments(&mut self) -> Result<Vec<Attachment>>;
+    /// H3 (D-H1): `(dev, inode)` of the employee's root-owned work anchor, the
+    /// stable `employee-work` identity. Only `work_anchor::AnchoredStorage`
+    /// (the allocation/retire hook) has one; everything else fails closed.
+    /// Absent anchor ⇒ `NotFound`. Never creates.
+    fn work_anchor(&mut self, _employee: EmployeeId) -> Result<duduclaw_isolation::ipc::WorkAnchorIdentity> {
+        Err(ErrorCode::WorkspaceBrokerUnavailable)
+    }
 }
 
 pub struct UnavailableStorage;
