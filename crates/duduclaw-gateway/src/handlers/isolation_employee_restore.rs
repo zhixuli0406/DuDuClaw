@@ -282,7 +282,12 @@ impl MethodHandler {
                     // freshness computed from the proof (F6fa), never assumed.
                     let rule = LogRule::new(crate::isolation_restore_wiring::step_up_fresh(Some(verified_at), now), now);
                     let notices = || rule.notice_addresses();
-                    Ok(with_env(&home, &user, &rule, cap, now, |env| rpc::decide(&home, env, &user, &input.request_id, approve, &notices))?)
+                    Ok(with_env(&home, &user, &rule, cap, now, |env| {
+                        // F6i: an `early_purge` request is decided (and purged) by the purge engine.
+                        if let Some(done) = crate::isolation_purge::decide_early(&home, env, &rule, &user, &input.request_id, approve,
+                            &crate::isolation_retire::SpawndRetireRoot) { return done; }
+                        rpc::decide(&home, env, &user, &input.request_id, approve, &notices)
+                    })?)
                 }).await?;
                 if approve {
                     // The restored tree is back under agents/.

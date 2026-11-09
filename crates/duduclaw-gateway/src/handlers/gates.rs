@@ -145,6 +145,8 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "me.isolation.request_adoption" | "isolation.shared_adoption_request"
         // F6fa2 管理員代未設定兩步驟驗證的主人申請還原／接手
         | "isolation.employee_restore_request_for_owner" | "isolation.adoption_request_for_owner"
+        // F6i 清除隔離區（滿 90 天直接清除；未滿 90 天申請提前清除）
+        | "isolation.quarantine_purge"
     )
 }
 

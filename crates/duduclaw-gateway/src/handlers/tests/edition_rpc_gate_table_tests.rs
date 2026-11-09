@@ -85,6 +85,8 @@ fn enterprise_surfaces_are_listed() {
         // F6fa2 Admin filing for an owner without a second factor
         "isolation.employee_restore_request_for_owner",
         "isolation.adoption_request_for_owner",
+        // F6i quarantine cleanup
+        "isolation.quarantine_purge",
     ] {
         assert!(
             is_enterprise_only_method(method),
