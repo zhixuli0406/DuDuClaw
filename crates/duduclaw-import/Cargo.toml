@@ -8,6 +8,9 @@ license.workspace = true
 sha2 = "0.10"
 toml.workspace = true
 duduclaw-isolation.workspace = true
+# RM-173: the legacy archived-conversation classification shared with the
+# gateway (`duduclaw_core::session_legacy`), so both always agree on a row.
+duduclaw-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

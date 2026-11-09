@@ -344,6 +344,9 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH,128)?;
     check_sqlite(&conn)?;
     let version=crate::catalog::detect(&conn,crate::catalog::Store::Tasks,None)?.version;
+    // V181 is a sessions.db-only mapping (the v1.81 tasks catalog maps as
+    // V180); a tasks store that ever yielded it is refused (fail closed).
+    let query_sql=task_goal_query(version)?;
     conn.authorizer(Some(move |c:AuthContext<'_>| {
         // SQLite names the FROM-clause subquery being resolved as the accessor,
         // so reads inside the CTE body arrive with accessor `a2a`, not None.
@@ -362,7 +365,8 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
         // Columns the CTE body reads: the task link and the A2A traces.
         AuthAction::Read {table_name:"tasks",column_name:"id"|"created_via"|"created_by"|"parent_task_id"}
             if c.database_name==Some("main") && a2a_cte=>Authorization::Allow,
-        // Owner columns exist only in the v1.80 catalog.
+        // Owner columns exist only in the v1.80 catalog (and the v1.81 one,
+        // which maps as V180; V181 itself is refused above).
         AuthAction::Read {table_name:"tasks",column_name:"a2a_owner"}
         |AuthAction::Read {table_name:"task_access_principals",column_name:"task_id"}
             if version==crate::catalog::SchemaVersion::V180 && c.database_name==Some("main") && (top||a2a_cte)=>Authorization::Allow,
@@ -371,7 +375,7 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     }))?;
     // A2A-owned work is private to its external principal; republishing it as
     // ordinary employee goals would drop that owner restriction. It stays quarantined.
-    let mut query=conn.prepare(task_goal_query(version))?;
+    let mut query=conn.prepare(query_sql)?;
     let mut rows=query.query([])?;
     while let Some(row)=rows.next()? {
         let settings=serde_json::json!({"kind":"goal","title":row.get::<_,String>(1)?,"description":row.get::<_,String>(2)?,"acceptance_criteria":row.get::<_,Option<String>>(4)?});
@@ -401,16 +405,19 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
 /// `task_access_principals` row, `created_via='a2a'`, or an `a2a:` creator
 /// (the gateway's own pre-registry rule). v1.79.3 has neither owner column nor
 /// registry, so only the last two traces apply. The prefix test is a range
-/// comparison so no SQL function needs authorizing.
-fn task_goal_query(version:crate::catalog::SchemaVersion)->&'static str {
+/// comparison so no SQL function needs authorizing. `V181` never comes from
+/// tasks.db (its v1.81 catalog maps as V180) and is refused: fail closed.
+fn task_goal_query(version:crate::catalog::SchemaVersion)->Result<&'static str> {
     use crate::catalog::SchemaVersion as V;
-    match version {
+    Ok(match version {
+        V::V181=>return Err(Error::Schema),
         V::V1793=>"WITH RECURSIVE a2a(id) AS (
                 SELECT id FROM main.tasks WHERE created_via IS 'a2a' OR (created_by>='a2a:' AND created_by<'a2a;')
                 UNION SELECT t.id FROM main.tasks AS t JOIN a2a ON t.parent_task_id=a2a.id)
             SELECT id,title,description,assigned_to,acceptance_criteria FROM main.tasks AS g
             WHERE (kind='goal' OR goal_mode=1) AND status NOT IN ('done','cancelled','failed')
                 AND NOT EXISTS (SELECT 1 FROM a2a WHERE a2a.id=g.id) ORDER BY id",
+        // The v1.81 tasks catalog maps as V180.
         V::V180=>"WITH RECURSIVE a2a(id) AS (
                 SELECT id FROM main.tasks WHERE a2a_owner IS NOT NULL OR created_via IS 'a2a' OR (created_by>='a2a:' AND created_by<'a2a;')
                     OR id IN (SELECT task_id FROM main.task_access_principals)
@@ -418,7 +425,7 @@ fn task_goal_query(version:crate::catalog::SchemaVersion)->&'static str {
             SELECT id,title,description,assigned_to,acceptance_criteria FROM main.tasks AS g
             WHERE (kind='goal' OR goal_mode=1) AND status NOT IN ('done','cancelled','failed')
                 AND NOT EXISTS (SELECT 1 FROM a2a WHERE a2a.id=g.id) ORDER BY id",
-    }
+    })
 }
 
 fn check_sqlite(conn:&rusqlite::Connection)->Result<()> {

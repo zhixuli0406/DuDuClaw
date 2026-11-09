@@ -147,9 +147,12 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
     crate::sqlite::harden(&mut conn)?;check_sqlite(&conn)?;
     // Exact v1.79.3, v1.80.x or v1.81 catalog. The v1.80 decision-lease columns
     // and the v1.81 `employee_incarnation` column are never authorized below;
-    // only ids and the authority schema version are read.
+    // only ids and the authority schema version are read. (The v1.81 approvals
+    // catalog maps as V180; only sessions.db yields V181, refused here: fail
+    // closed.)
     match crate::catalog::detect(&conn,crate::catalog::Store::Approvals,None)?.version {
         crate::catalog::SchemaVersion::V1793|crate::catalog::SchemaVersion::V180=>{}
+        crate::catalog::SchemaVersion::V181=>return Err(Error::Schema),
     }
     conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
         AuthAction::Select=>Authorization::Allow,

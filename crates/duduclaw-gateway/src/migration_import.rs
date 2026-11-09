@@ -272,8 +272,12 @@ impl crate::session::SessionManager {
             return Ok(());
         }
         let now = Utc::now().to_rfc3339();
-        tx.execute("INSERT OR IGNORE INTO sessions(id,agent_id,last_active,created_at,archived_at,title)
-            VALUES (?1,?2,?3,?3,?3,?4)", params![session_id,agent,now,source])?;
+        // RM-173: labelled `retention` explicitly. Imported history is never a
+        // user clear (the importer already left those out), and an archived
+        // row with a NULL reason is classified at every gateway start by the
+        // legacy rule — which reads `archived_at == last_active` as a clear.
+        tx.execute("INSERT OR IGNORE INTO sessions(id,agent_id,last_active,created_at,archived_at,archive_reason,title)
+            VALUES (?1,?2,?3,?3,?3,'retention',?4)", params![session_id,agent,now,source])?;
         let (owner, archived): (String, Option<String>) = tx.query_row("SELECT agent_id,archived_at FROM sessions WHERE id=?1", [session_id],
             |r| Ok((r.get(0)?,r.get(1)?)))?;
         if owner != agent || archived.is_none() { return Err(Error::Conflict); }
@@ -400,6 +404,34 @@ mod tests {
         let conn = sessions.acquire().await;
         let archived: Option<String> = conn.query_row("SELECT archived_at FROM sessions WHERE id='legacy-session'",[],|r|r.get(0)).unwrap();
         assert!(archived.is_some());
+    }
+    /// RM-173: imported history is written as a `retention` archive (never a
+    /// user clear), so the every-start classification of reason-less archives
+    /// — which would read `archived_at == last_active` as a clear — leaves it
+    /// alone: same id, same label, no clear mark, across restarts.
+    #[tokio::test]
+    async fn migration_import_sessions_are_retention_archives_across_restarts() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("sessions.db");
+        let sessions = crate::session::SessionManager::new(&path).unwrap();
+        sessions.import_legacy_message("legacy-session","sales","record-1","legacy_import:test","old text").await.unwrap();
+        let stored: Option<String> = sessions.acquire().await.query_row(
+            "SELECT archive_reason FROM sessions WHERE id='legacy-session'",[],|r|r.get(0)).unwrap();
+        assert_eq!(stored.as_deref(), Some(crate::session::ARCHIVE_REASON_RETENTION), "written, not defaulted");
+        let before = sessions.archive_state("legacy-session").await.unwrap().expect("archived");
+        drop(sessions);
+        for _ in 0..2 {
+            let sessions = crate::session::SessionManager::new(&path).unwrap();
+            assert_eq!(sessions.archive_state("legacy-session").await.unwrap(), Some(before.clone()));
+            assert!(sessions.user_cleared_at("legacy-session").await.unwrap().is_none());
+            assert!(sessions.session_agent("legacy-session").await.unwrap().is_some(), "not moved");
+            let cleared: i64 = sessions.acquire().await.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE instr(id,'#cleared:') > 0",[],|r|r.get(0)).unwrap();
+            assert_eq!(cleared, 0);
+            assert_eq!(sessions.get_messages("legacy-session").await.unwrap().len(), 1);
+            // A retried record is still recognised after the restart.
+            sessions.import_legacy_message("legacy-session","sales","record-1","legacy_import:test","old text").await.unwrap();
+        }
     }
     #[cfg(target_os="linux")]
     #[tokio::test]
@@ -557,8 +589,10 @@ mod tests {
         drop(crate::channel_settings::ChannelSettingsManager::from_session_db(&path).unwrap());
         let actual=Connection::open(path).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        // Fresh stores are the newest known catalog; session/cron-v1793.sql pin the older release.
-        expected.execute_batch(include_str!("../../duduclaw-import/src/session-v180.sql")).unwrap();
+        // Fresh stores are the newest known catalog (v1.81: v1.80.x plus the RM-173
+        // archive_reason/user_cleared_at columns and the session_migrations marker
+        // table); session-v1793/-v180.sql pin older releases.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/session-v181.sql")).unwrap();
         expected.execute_batch(include_str!("../../duduclaw-import/src/channel-settings-v1793.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
 
@@ -579,6 +613,41 @@ mod tests {
         let expected=Connection::open_in_memory().unwrap();
         expected.execute_batch(include_str!("../../duduclaw-import/src/workflow-v1793.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
+    }
+
+    /// RM-173: a v1.80.x or v1.79.3 sessions.db opened by this release gets the
+    /// RM-173 columns appended after `origin_at` (ALTER TABLE appends to the
+    /// stored CREATE TABLE text) — the pinned upgraded catalog, not the fresh
+    /// one. (The v1.79.3 -> v1.80.x -> v1.81 path is checked by the import
+    /// crate's `rm173_upgraded_session_stores_match_a_pinned_catalog`.)
+    #[test]
+    fn migration_import_schema_catalog_matches_upgraded_session_stores() {
+        fn schema(conn:&Connection)->Vec<(String,String,String,Option<String>)> {
+            conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql").unwrap()
+                .query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect()
+        }
+        fn catalog(parts:&[&str])->Vec<(String,String,String,Option<String>)> {
+            let conn=Connection::open_in_memory().unwrap();
+            for part in parts {conn.execute_batch(part).unwrap();}
+            schema(&conn)
+        }
+        let channel=include_str!("../../duduclaw-import/src/channel-settings-v1793.sql");
+        let upgraded=catalog(&[include_str!("../../duduclaw-import/src/session-v181-upgraded.sql"),channel]);
+        let fresh=catalog(&[include_str!("../../duduclaw-import/src/session-v181.sql"),channel]);
+        for (release,start) in [("v1.80.x",include_str!("../../duduclaw-import/src/session-v180.sql")),
+            ("v1.79.3",include_str!("../../duduclaw-import/src/session-v1793.sql"))] {
+            let home=tempfile::tempdir().unwrap();
+            let path=home.path().join("sessions.db");
+            Connection::open(&path).unwrap().execute_batch(start).unwrap();
+            drop(crate::session::SessionManager::new(&path).unwrap());
+            drop(crate::channel_settings::ChannelSettingsManager::from_session_db(&path).unwrap());
+            let actual=schema(&Connection::open(&path).unwrap());
+            assert_eq!(actual,upgraded,"{release} store upgraded to v1.81");
+            assert_ne!(actual,fresh,"{release}");
+            // Reopening (the next start) changes nothing.
+            drop(crate::session::SessionManager::new(&path).unwrap());
+            assert_eq!(schema(&Connection::open(&path).unwrap()),upgraded,"{release} reopened");
+        }
     }
 
 }

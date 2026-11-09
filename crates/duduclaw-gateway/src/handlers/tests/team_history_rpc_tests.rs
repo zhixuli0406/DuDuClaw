@@ -1502,6 +1502,80 @@ async fn rm173_restore_never_launders_a_user_clear() {
     assert!(rm173_is_archived(&f, &customer).await);
 }
 
+/// Downgrade: a v1.80 binary run on an already migrated store archives a
+/// `/new` in place — no reason, no clear mark. The next v1.81 start
+/// classifies it by the legacy rule (archived 1 h after the last activity: a
+/// user clear): labelled, moved to `#cleared:`, out of team history, and not
+/// restorable by a non-Admin.
+#[tokio::test]
+async fn rm173_v180_clear_after_downgrade_is_a_user_clear_at_the_next_start() {
+    let f = fixture().await;
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    let sm = &rc.session_manager;
+    let migrated: bool = sm
+        .acquire()
+        .await
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_migrations WHERE name='rm173_legacy_user_clears')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(migrated, "the store was already migrated");
+    let before = payload(f.handler.handle("users.team_history.list", json!({"agent_id":"sales"}), &f.manager).await);
+    assert_eq!(before["sessions"].as_array().unwrap().len(), 2);
+    {
+        // v1.80 `delete_session` on the report's WebChat.
+        let conn = sm.acquire().await;
+        let last_active: String = conn
+            .query_row("SELECT last_active FROM sessions WHERE id='report'", [], |r| r.get(0))
+            .unwrap();
+        let archived_at = (DateTime::parse_from_rfc3339(&last_active).unwrap() + chrono::Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE sessions SET archived_at=?1, archive_reason=NULL, user_cleared_at=NULL WHERE id='report'",
+            params![archived_at],
+        )
+        .unwrap();
+    }
+    // The next start (the migration runs when the store is opened).
+    drop(crate::session::SessionManager::new(&f.home.path().join("sessions.db")).unwrap());
+
+    assert!(sm.session_agent("report").await.unwrap().is_none(), "moved off its reusable id");
+    let ids = sm.sessions_for_contact("report").await.unwrap();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let moved = ids[0].clone();
+    assert!(moved.starts_with("report#cleared:"), "{moved}");
+    assert_eq!(sm.archive_state(&moved).await.unwrap().unwrap().1, crate::session::ARCHIVE_REASON_USER);
+    assert!(sm.user_cleared_at(&moved).await.unwrap().is_some());
+
+    // Out of the team-history listing (the reader's SQL filter) and unreadable.
+    let list = payload(f.handler.handle("users.team_history.list", json!({"agent_id":"sales"}), &f.manager).await);
+    let sessions = list["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "{list}");
+    assert_eq!(sessions[0]["class"], "external");
+    let missing = denied(f.handler.handle("users.team_history.get", json!({"session_id":"missing"}), &f.manager).await);
+    for id in [moved.as_str(), "report"] {
+        assert_eq!(denied(f.handler.handle("users.team_history.get", json!({"session_id":id}), &f.manager).await), missing, "{id}");
+    }
+
+    // A non-Admin restore is refused: the manager, and the agent's Owner.
+    let refused = denied(f.handler.handle("users.team_history.restore", json!({"session_id":moved}), &f.manager).await);
+    assert_eq!(refused["code"], "not_found");
+    let owner_id = f
+        .db
+        .create_user("owner@test.invalid", "店長", "isolated-password", UserRole::Employee)
+        .unwrap()
+        .id;
+    f.db.bind_agent(&owner_id, "sales", AccessLevel::Owner).unwrap();
+    let owner = f.db.live_user_context(&owner_id).unwrap().unwrap();
+    denied(f.handler.handle("chat.sessions.restore", json!({"session_id":moved}), &owner).await);
+    assert!(rm173_is_archived(&f, &moved).await);
+    // An Admin still can (audited as a user clear).
+    let admin = payload(f.handler.handle("users.team_history.restore", json!({"session_id":moved}), &f.admin).await);
+    assert_eq!(admin["restored"], true);
+    assert!(rm173_audit(&f).contains("\"user_cleared\":true"));
+}
+
 /// F3/F4: the boundary never moves for the shared-token context; it is never
 /// combined with retention in one request; a failed step-up is also logged
 /// in the user DB.

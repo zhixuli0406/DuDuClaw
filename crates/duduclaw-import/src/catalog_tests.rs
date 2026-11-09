@@ -114,6 +114,168 @@ fn import_accepts_v181_tasks_and_never_reads_markers() {
 }
 
 #[test]
+fn rm173_import_accepts_v181_sessions_and_skips_user_cleared_conversations() {
+    // A store made by this release is detected as v1.81, with or without the
+    // channel settings; the older catalogs still detect as themselves.
+    // Both pinned v1.81 shapes (fresh, and upgraded from an older store).
+    for schema in [SESSION_V181, SESSION_V181_UPGRADED] {
+        assert_eq!(detected(schema, Store::Sessions, None), Detected { version: SchemaVersion::V181, extension: false });
+        assert_eq!(detected(schema, Store::Sessions, Some(CHANNEL_SETTINGS_SCHEMA)), Detected { version: SchemaVersion::V181, extension: true });
+    }
+    assert_eq!(detected(SESSION_V180, Store::Sessions, None).version, SchemaVersion::V180);
+    assert_eq!(detected(SESSION_V1793, Store::Sessions, None).version, SchemaVersion::V1793);
+    assert!(take_schema_refusal().is_none());
+
+    // 's' live, 'r' archived by retention: imported. A cleared conversation
+    // (moved to `#cleared:`) and a restored former clear (user_cleared_at is
+    // sticky) are never imported, nor is the migration marker. Archives with
+    // no recorded reason (an interrupted migration, or a v1.80 binary after a
+    // downgrade) follow the shared legacy rule: 80 hours after the last
+    // activity is an inactivity archive ('g80', imported), 1 hour a user clear
+    // ('g1'). A `user` reason without the clear mark, an unknown reason, an
+    // empty clear mark and an orphan message are never imported.
+    let rows = "INSERT INTO sessions(id,agent_id,last_active,created_at) VALUES ('s','sales','now','now'),('o','other','now','now');
+        INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at,archive_reason) VALUES ('r','sales','now','now','then','retention');
+        INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at,archive_reason,user_cleared_at)
+            VALUES ('c#cleared:1700000000000','sales','now','now','then','user','then');
+        INSERT INTO sessions(id,agent_id,last_active,created_at,user_cleared_at) VALUES ('u','sales','now','now','then');
+        INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at) VALUES
+            ('g1','sales','2026-01-01T00:00:00Z','now','2026-01-01T01:00:00Z'),
+            ('g80','sales','2026-01-01T00:00:00Z','now','2026-01-04T08:00:00Z');
+        INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at,archive_reason) VALUES
+            ('ru','sales','2026-01-01T00:00:00Z','now','2026-01-04T08:00:00Z','user'),
+            ('rb','sales','2026-01-01T00:00:00Z','now','2026-01-04T08:00:00Z','bogus');
+        INSERT INTO sessions(id,agent_id,last_active,created_at,user_cleared_at) VALUES ('ue','sales','now','now','');
+        INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('s','user','legacy question','now'),
+            ('r','assistant','retained answer','now'),('o','user','OTHER-AGENT','now'),
+            ('c#cleared:1700000000000','user','CLEARED-TEXT','now'),('u','user','RESTORED-CLEAR-TEXT','now'),
+            ('g1','user','UNLABELLED-CLEAR-TEXT','now'),('g80','assistant','unlabelled idle answer','now'),
+            ('ru','user','USER-REASON-TEXT','now'),('rb','user','BOGUS-REASON-TEXT','now'),('ue','user','EMPTY-MARK-TEXT','now');
+        INSERT INTO session_messages(session_id,role,content,timestamp,hidden) VALUES ('s','assistant','HIDDEN-TEXT','now',1);
+        INSERT INTO session_messages(session_id,role,content,timestamp,undone_at) VALUES ('s','assistant','UNDONE-TEXT','now','now');
+        INSERT INTO session_messages(session_id,role,content,timestamp,delivery_pending) VALUES ('s','assistant','PENDING-TEXT','now',1);
+        INSERT INTO session_migrations(name,applied_at) VALUES ('MARKER-CANARY','now');
+        PRAGMA foreign_keys=OFF;
+        INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('ghost','user','ORPHAN-TEXT','now');";
+    for base in [SESSION_V181, SESSION_V181_UPGRADED] {
+        for schema in [base.to_owned(), format!("{base}\n{CHANNEL_SETTINGS_SCHEMA}")] {
+            let file = store(&schema, rows);
+            let mut out = Vec::new();
+            assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, &mut out), Ok(3));
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("legacy question") && text.contains("retained answer") && text.contains("unlabelled idle answer"), "{text}");
+            for hidden in ["CLEARED-TEXT", "RESTORED-CLEAR-TEXT", "HIDDEN-TEXT", "UNDONE-TEXT", "PENDING-TEXT", "OTHER-AGENT", "MARKER-CANARY", "cleared:",
+                "UNLABELLED-CLEAR-TEXT", "USER-REASON-TEXT", "BOGUS-REASON-TEXT", "EMPTY-MARK-TEXT", "ORPHAN-TEXT",
+                "2026-01-04T08:00:00Z", "retention", "bogus"] {
+                assert!(!text.contains(hidden), "{hidden} leaked: {text}");
+            }
+            assert!(take_schema_refusal().is_none());
+        }
+    }
+
+    // The authority reader accepts the v1.81 store too; only channel settings become a proposal.
+    let file = store(&format!("{SESSION_V181}\n{CHANNEL_SETTINGS_SCHEMA}"),
+        "INSERT INTO channel_settings VALUES('telegram','SECRET-USER','allowed_users','SECRET-VALUE','now');
+         INSERT INTO session_migrations(name,applied_at) VALUES ('SECRET-MARKER','now');");
+    let p = extract(&request(SourceKind::AuthoritySessionsSqlite, "sessions.db"), source(&file), None).unwrap();
+    assert_eq!(p.len(), 1); assert_eq!(p[0].category, C::Policy);
+    assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));
+}
+
+#[test]
+fn rm173_import_classifies_archived_conversations_of_v180_and_v1793_sources() {
+    // Before v1.81 both a user clear and the 72-hour inactivity task set
+    // `sessions.archived_at`. The shared legacy rule tells them apart: an
+    // archive at least 72 hours after the last activity is an inactivity
+    // archive (imported); a shorter gap or an unparseable time is a user clear
+    // (never imported).
+    let rows = "INSERT INTO sessions(id,agent_id,last_active,created_at) VALUES ('live','sales','now','now');
+        INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at) VALUES
+            ('cleared','sales','2026-01-01T00:00:00Z','now','2026-01-01T01:00:00Z'),
+            ('idle','sales','2026-01-01T00:00:00Z','now','2026-01-04T08:00:00.123456789+00:00'),
+            ('unparsed','sales','now','now','then');
+        INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('live','user','LIVE-QUESTION','now'),
+            ('live','assistant','LIVE-ANSWER','now'),('cleared','user','CLEARED-QUESTION','now'),('cleared','assistant','CLEARED-ANSWER','now'),
+            ('idle','assistant','IDLE-ANSWER','now'),('unparsed','user','UNPARSED-TEXT','now');";
+    for (schema, version) in [(SESSION_V180, SchemaVersion::V180), (SESSION_V1793, SchemaVersion::V1793)] {
+        assert_eq!(detected(schema, Store::Sessions, None).version, version);
+        for schema in [schema.to_owned(), format!("{schema}\n{CHANNEL_SETTINGS_SCHEMA}")] {
+            let file = store(&schema, rows);
+            let mut out = Vec::new();
+            assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, &mut out), Ok(3), "{version:?}");
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("LIVE-QUESTION") && text.contains("LIVE-ANSWER") && text.contains("IDLE-ANSWER"), "{version:?}: {text}");
+            for hidden in ["CLEARED-QUESTION", "CLEARED-ANSWER", "UNPARSED-TEXT", "2026-01-04T08:00:00"] {
+                assert!(!text.contains(hidden), "{version:?}: {hidden} leaked: {text}");
+            }
+            assert!(take_schema_refusal().is_none());
+        }
+    }
+}
+
+/// Replays `catalog` statement by statement on `conn`, ignoring each failure:
+/// what `SessionManager::init_tables` does on an existing store (its ALTERs
+/// ignore "duplicate column", its CREATEs are IF NOT EXISTS). The catalogs'
+/// comments contain no `;`. The gateway test
+/// `migration_import_schema_catalog_matches_upgraded_session_stores` checks
+/// the same paths with the real `SessionManager`.
+fn upgrade(conn: &Connection, catalog: &str) {
+    for statement in catalog.split(';') { let _ = conn.execute_batch(statement); }
+}
+
+#[test]
+fn rm173_upgraded_session_stores_match_a_pinned_catalog() {
+    // v1.79.3 -> v1.80.x yields exactly the fresh v1.80.x catalog.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(SESSION_V1793).unwrap();
+    upgrade(&conn, SESSION_V180);
+    assert_eq!(detect(&conn, Store::Sessions, None).unwrap(), Detected { version: SchemaVersion::V180, extension: false });
+    // Every path into v1.81 from an older store yields the upgraded shape,
+    // never the fresh one.
+    let (upgraded, fresh) = (Connection::open_in_memory().unwrap(), Connection::open_in_memory().unwrap());
+    upgraded.execute_batch(SESSION_V181_UPGRADED).unwrap();
+    fresh.execute_batch(SESSION_V181).unwrap();
+    for path in [&[SESSION_V180, SESSION_V181][..], &[SESSION_V1793, SESSION_V181], &[SESSION_V1793, SESSION_V180, SESSION_V181]] {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(path[0]).unwrap();
+        for next in &path[1..] { upgrade(&conn, next); }
+        let actual = schema(&conn).unwrap();
+        assert_eq!(actual, schema(&upgraded).unwrap());
+        assert_ne!(actual, schema(&fresh).unwrap());
+        assert_eq!(detect(&conn, Store::Sessions, Some(CHANNEL_SETTINGS_SCHEMA)).unwrap(), Detected { version: SchemaVersion::V181, extension: false });
+    }
+    assert!(take_schema_refusal().is_none());
+}
+
+#[test]
+fn rm173_import_refuses_v181_sessions_with_planted_objects() {
+    for sql in ["CREATE INDEX planted_idx ON sessions(user_cleared_at);", "CREATE INDEX planted_idx ON session_migrations(applied_at);",
+        "CREATE TABLE planted_markers(name TEXT);", "CREATE VIEW planted AS SELECT * FROM session_migrations;",
+        "CREATE TRIGGER planted AFTER INSERT ON session_migrations BEGIN DELETE FROM session_messages; END;",
+        "ALTER TABLE session_migrations ADD COLUMN planted TEXT;", "ALTER TABLE sessions ADD COLUMN planted TEXT;"] {
+        let file = store(SESSION_V181, &format!("{sql}
+            INSERT INTO sessions(id,agent_id,last_active,created_at) VALUES ('s','sales','now','now');
+            INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('s','user','NEVER-EMITTED','now');"));
+        let mut out = Vec::new();
+        assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, &mut out), Err(Error::Schema), "{sql}");
+        assert!(out.is_empty());
+        let refusal = take_schema_refusal().expect("refusal report");
+        assert_eq!((refusal.store, refusal.closest, refusal.closest_extension), (Store::Sessions, SchemaVersion::V181, false), "{sql}");
+        assert_eq!(refusal.differences.len(), 1, "{sql}: {:?}", refusal.differences);
+        let message = refusal.to_string();
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81)") && message.contains("closest (v1.81)"), "{message}");
+    }
+    let file = store(SESSION_V181, "CREATE INDEX planted_idx ON sessions(user_cleared_at);");
+    assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, Vec::new()), Err(Error::Schema));
+    assert_eq!(take_schema_refusal().expect("refusal report").differences,
+        vec![Difference::Unexpected { object: "index".into(), name: "planted_idx".into() }]);
+    // Half-upgraded: v1.80.x plus only one RM-173 column (and no marker table) is neither catalog.
+    let file = store(SESSION_V180, "ALTER TABLE sessions ADD COLUMN user_cleared_at TEXT;");
+    assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, Vec::new()), Err(Error::Schema));
+    let _ = take_schema_refusal();
+}
+
+#[test]
 fn import_refuses_tasks_store_with_extra_unknown_table() {
     for schema in [TASKS_V180, TASKS_V181] {
         let file = store(schema, "CREATE TABLE planted_markers(name TEXT);");

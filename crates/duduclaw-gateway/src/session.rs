@@ -94,9 +94,11 @@ pub struct SessionSummary {
 /// restore it, and new activity never un-archives it.
 pub const ARCHIVE_REASON_USER: &str = "user";
 /// RM-173: `sessions.archive_reason` of a conversation archived by the
-/// inactivity maintenance task. (Rows archived before the column existed were
-/// all user clears — `delete_session` was the only writer of `archived_at` —
-/// and are migrated to [`ARCHIVE_REASON_USER`], see
+/// inactivity maintenance task. (Rows archived before the column existed are
+/// a mix of user clears and inactivity archives — before RM-173 both
+/// `delete_session` and `cleanup_inactive(72)` wrote `archived_at`. They are
+/// classified with `duduclaw_core::session_legacy::legacy_archive_is_retention`
+/// and labelled one or the other, see
 /// `SessionManager::migrate_legacy_user_clears`.)
 pub const ARCHIVE_REASON_RETENTION: &str = "retention";
 
@@ -110,8 +112,20 @@ pub(crate) fn is_cleared_during_turn(e: &DuDuClawError) -> bool {
     matches!(e, DuDuClawError::Gateway(m) if m == CLEARED_DURING_TURN)
 }
 
-/// RM-173: one-time migration marker (table `session_migrations`).
+/// RM-173: marker (table `session_migrations`) of the first completed run of
+/// [`SessionManager::migrate_legacy_user_clears`]. Informational only — that
+/// migration runs in full at every start.
 const MIGRATION_LEGACY_USER_CLEARS: &str = "rm173_legacy_user_clears";
+
+/// RM-173: what step 1 of [`SessionManager::migrate_legacy_user_clears`] did.
+struct Labelled {
+    /// Archived rows with no reason labelled `retention`.
+    retention: u64,
+    /// Archived rows with no reason labelled `user`.
+    user: u64,
+    /// Live rows whose stale `archive_reason` was dropped.
+    stale: u64,
+}
 
 /// RM-173: the `SET` fragment every "new activity" write uses. It lifts an
 /// archive caused by retention only; a user-cleared row (normally already
@@ -317,15 +331,17 @@ impl SessionManager {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT", []);
         // RM-173: WHY a row is archived — `user` (a user cleared it: never
         // shown to managers, never un-archived by activity) or `retention`
-        // (maintenance task). NULL while live (a NULL on an archived row
-        // reads as `retention`).
+        // (maintenance task). NULL while live. Archived rows with no reason
+        // (archived before this column existed, or by an older binary after
+        // a downgrade) are classified and labelled at every start, see
+        // `migrate_legacy_user_clears` (before any request is served).
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN archive_reason TEXT", []);
         // RM-173: when a user cleared this conversation. Sticky — set on
         // clear, NEVER reset by a restore — so a restored user clear stays out
         // of team history and stays restorable only by an Admin or its own
         // WebChat owner.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN user_cleared_at TEXT", []);
-        // (Legacy archived rows are migrated at the end, once every table a
+        // (Legacy archived rows are classified at the end, once every table a
         // clear touches exists — see `migrate_legacy_user_clears`.)
 
         // G4 session portability (2026-07-11):
@@ -399,29 +415,49 @@ impl SessionManager {
         Ok(())
     }
 
-    /// RM-173 one-time migration (marker `rm173_legacy_user_clears` in
-    /// `session_migrations`). Before RM-173 the ONLY writer of
-    /// `sessions.archived_at` was `delete_session` — a user's `/new`, a
-    /// channel reset, a deleted Discord thread — so every row archived before
-    /// `archive_reason` existed is a user clear. Each one is:
+    /// RM-173 migration of conversations archived with no recorded reason
+    /// (marker `rm173_legacy_user_clears` in `session_migrations`).
     ///
-    /// 1. labelled `archive_reason = 'user'` with `user_cleared_at` set (one
-    ///    statement in its own committed transaction, before anything else —
-    ///    the privacy-relevant part cannot be lost to a later failure);
-    /// 2. moved to `{id}#cleared:{archived_at ms}` exactly like
-    ///    [`Self::clear_for_user`], so the next message on the original id
-    ///    starts a genuinely fresh conversation. Every move runs in its own
+    /// Before RM-173 two writers set `sessions.archived_at`: `delete_session`
+    /// (a user's `/new`, a channel reset, a deleted Discord thread) and the
+    /// inactivity maintenance task (`cleanup_inactive(72)`, at boot and every
+    /// 6 hours). So a legacy archived row is either; it is classified by
+    /// [`duduclaw_core::session_legacy::legacy_archive_is_retention`]
+    /// (`archived_at - last_active >= 72h` with both timestamps parseable:
+    /// an inactivity archive; anything else, including every doubtful row:
+    /// a user clear — the privacy-safe side). Then:
+    ///
+    /// 1. every such row is labelled — an inactivity archive
+    ///    `archive_reason = 'retention'` (left at its id, so it behaves like
+    ///    any RM-173 retention archive: team history lists it, activity
+    ///    un-archives it, a manager may restore it); a user clear
+    ///    `archive_reason = 'user'` with `user_cleared_at` set. All labels go
+    ///    in ONE committed transaction, before anything else — the
+    ///    privacy-relevant part cannot be lost to a later failure, and a
+    ///    failure here fails the start (rows stay archived, never exposed);
+    /// 2. every user clear is moved to `{id}#cleared:{archived_at ms}` exactly
+    ///    like [`Self::clear_for_user`], so the next message on the original
+    ///    id starts a genuinely fresh conversation. Every move runs in its own
     ///    savepoint; a move that fails is rolled back alone and logged,
     ///    leaving that row labelled `user` at its original id (still hidden
     ///    from team history; every write path refuses or repairs such a row —
     ///    see [`STUCK_USER_CLEAR`]).
     ///
-    /// Step 2's work list is read from the DB on EVERY start — any
-    /// [`STUCK_USER_CLEAR`] row, whatever left it there (a crash between the
-    /// steps, a failed move, an older build that wrote the marker anyway).
-    /// The marker is written only once step 2 left nothing behind
-    /// (`failed == 0`) and only short-circuits step 1, so rows archived later
-    /// with a NULL reason (only direct SQL does that) are not relabelled.
+    /// Both steps run on EVERY start. No RM-173 writer archives a row without
+    /// a reason (`import_legacy_message` writes `retention`), so an archived
+    /// row with a NULL reason can only come from an older binary run on this
+    /// store — e.g. a downgrade to v1.80 whose `/new` archived in place — and
+    /// the legacy rule (privacy first) is the right one for it. Step 1 also
+    /// drops a stale `archive_reason` from a live row (an older binary
+    /// un-archived it without knowing the column; every RM-173 un-archive —
+    /// `restore_archived`, [`UNARCHIVE_ON_ACTIVITY`] — clears both), except a [`STUCK_USER_CLEAR`] row, which
+    /// step 2 moves. `user_cleared_at` is sticky and never touched. Step 2's
+    /// work list is read from the DB: any [`STUCK_USER_CLEAR`] row, whatever
+    /// left it there (a crash between the steps, a failed move, a downgrade).
+    ///
+    /// The marker is written once step 2 left nothing behind (`failed == 0`);
+    /// it gates nothing and only tells the first completed run apart in the
+    /// log.
     fn migrate_legacy_user_clears(conn: &Connection) -> Result<()> {
         let gw = |e: rusqlite::Error| DuDuClawError::Gateway(e.to_string());
         conn.execute_batch(
@@ -439,23 +475,9 @@ impl SessionManager {
             )
             .map_err(gw)?;
 
-        // Step 1 (until the marker exists): label (privacy first, committed
-        // on its own).
-        let labelled = if done {
-            0
-        } else {
-            let tx = conn.unchecked_transaction().map_err(gw)?;
-            let n = tx
-                .execute(
-                    "UPDATE sessions
-                     SET archive_reason = 'user', user_cleared_at = COALESCE(user_cleared_at, archived_at)
-                     WHERE archived_at IS NOT NULL AND archive_reason IS NULL",
-                    [],
-                )
-                .map_err(gw)?;
-            tx.commit().map_err(gw)?;
-            n
-        };
+        // Step 1 (every start): drop stale reasons from live rows, then
+        // classify and label (privacy first, committed on its own).
+        let Labelled { retention, user: labelled, stale } = Self::label_unlabelled_archives(conn)?;
 
         // Step 2 (every start): every labelled-but-unmoved row, from the DB.
         let stuck: Vec<String> = {
@@ -465,6 +487,19 @@ impl SessionManager {
             let mapped = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(gw)?;
             mapped.collect::<rusqlite::Result<Vec<_>>>().map_err(gw)?
         };
+        if stale > 0 {
+            info!(stale, "RM-173: stale archive reasons dropped from live conversations");
+        }
+        if retention > 0 {
+            if done {
+                tracing::warn!(retention, "RM-173: archives written without a reason (older binary run on this store?) labelled as retention archives");
+            } else {
+                info!(retention, "RM-173: legacy inactivity archives labelled as retention archives");
+            }
+        }
+        if done && labelled > 0 {
+            tracing::warn!(labelled, "RM-173: archives written without a reason (older binary run on this store?) treated as user clears");
+        }
         if done && stuck.is_empty() {
             return Ok(());
         }
@@ -505,6 +540,74 @@ impl SessionManager {
             );
         }
         Ok(())
+    }
+
+    /// Step 1 of [`Self::migrate_legacy_user_clears`], in one IMMEDIATE
+    /// transaction: drop the stale `archive_reason` of every live row (but a
+    /// [`STUCK_USER_CLEAR`] one, left for step 2), then label every archived
+    /// row with a NULL `archive_reason` (read, classify in Rust, update by
+    /// id). A row already carrying `user_cleared_at` is a user clear whatever
+    /// its timestamps say; a non-text timestamp counts as unparseable. Both
+    /// statements touch only the rows they change (plain WHERE scans; the
+    /// pinned schema has no index for them, and none is added).
+    fn label_unlabelled_archives(conn: &Connection) -> Result<Labelled> {
+        use duduclaw_core::session_legacy::legacy_archive_is_retention;
+        let gw = |e: rusqlite::Error| DuDuClawError::Gateway(e.to_string());
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(gw)?;
+        let stale = tx
+            .execute(
+                &format!(
+                    "UPDATE sessions SET archive_reason = NULL
+                     WHERE archived_at IS NULL AND archive_reason IS NOT NULL
+                       AND NOT {STUCK_USER_CLEAR}"
+                ),
+                [],
+            )
+            .map_err(gw)? as u64;
+        let rows: Vec<(String, bool)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, archived_at, last_active, user_cleared_at IS NULL FROM sessions
+                     WHERE archived_at IS NOT NULL AND archive_reason IS NULL",
+                )
+                .map_err(gw)?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    let archived_at = r.get_ref(1)?.as_str().ok();
+                    let last_active = r.get_ref(2)?.as_str().ok();
+                    let retention = r.get::<_, bool>(3)?
+                        && matches!((archived_at, last_active),
+                            (Some(a), Some(l)) if legacy_archive_is_retention(a, l));
+                    Ok((r.get::<_, String>(0)?, retention))
+                })
+                .map_err(gw)?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>().map_err(gw)?
+        };
+        let (mut retention, mut user) = (0u64, 0u64);
+        for (id, is_retention) in &rows {
+            if *is_retention {
+                retention += tx
+                    .execute(
+                        "UPDATE sessions SET archive_reason = 'retention'
+                         WHERE id = ?1 AND archived_at IS NOT NULL AND archive_reason IS NULL
+                           AND user_cleared_at IS NULL",
+                        params![id],
+                    )
+                    .map_err(gw)? as u64;
+            } else {
+                user += tx
+                    .execute(
+                        "UPDATE sessions
+                         SET archive_reason = 'user', user_cleared_at = COALESCE(user_cleared_at, archived_at)
+                         WHERE id = ?1 AND archived_at IS NOT NULL AND archive_reason IS NULL",
+                        params![id],
+                    )
+                    .map_err(gw)? as u64;
+            }
+        }
+        tx.commit().map_err(gw)?;
+        Ok(Labelled { retention, user, stale })
     }
 
     /// RM-173 repair of a [`STUCK_USER_CLEAR`] row: move it off its original
@@ -3228,33 +3331,58 @@ mod rm173_retention_tests {
         assert_eq!(mgr.erase_sessions_for_contact(id).await.unwrap(), (2, 3));
     }
 
-    /// N1: before RM-173 the only writer of `archived_at` was `delete_session`
-    /// (a user's `/new`), so every legacy archived row is a user clear: it is
-    /// labelled `user`, moved off its reusable id, hidden from team history,
-    /// and the next message on the original id starts a fresh conversation.
+    /// A pre-RM-173 (v1.79.3 / v1.80.x shaped) sessions table: `archived_at`
+    /// but no `archive_reason` / `user_cleared_at`. `rows` are
+    /// `(id, last_active, archived_at)`; each gets one message
+    /// `SECRET-{id}`.
+    fn legacy_store(db: &Path, rows: &[(&str, &str, Option<&str>)]) {
+        let c = Connection::open(db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+               summary TEXT DEFAULT '', total_tokens INTEGER DEFAULT 0,
+               last_active TEXT NOT NULL, model TEXT DEFAULT 'auto',
+               created_at TEXT NOT NULL, archived_at TEXT);
+             CREATE TABLE session_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
+               session_id TEXT NOT NULL REFERENCES sessions(id), role TEXT NOT NULL,
+               content TEXT NOT NULL, tokens INTEGER DEFAULT 0, timestamp TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (id, active, archived) in rows {
+            c.execute(
+                "INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at)
+                 VALUES (?1,'sales',?2,'2026-01-01T00:00:00Z',?3)",
+                params![id, active, archived],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO session_messages(session_id,role,content,timestamp)
+                 VALUES (?1,'user',?2,'2026-01-01T00:00:00Z')",
+                params![id, format!("SECRET-{id}")],
+            )
+            .unwrap();
+        }
+    }
+
+    /// N1: before RM-173 both `delete_session` (a user's `/new`) and the
+    /// inactivity task (`cleanup_inactive(72)`) wrote `archived_at`. A legacy
+    /// archive less than 72 hours after the last activity is a user clear: it
+    /// is labelled `user`, moved off its reusable id, hidden from team
+    /// history, and the next message on the original id starts a fresh
+    /// conversation. Unparseable timestamps are user clears too.
     #[tokio::test]
     async fn rm173_migration_moves_legacy_archives_as_user_clears() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("sessions.db");
-        {
-            let c = Connection::open(&db).unwrap();
-            c.execute_batch(
-                "CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
-                   summary TEXT DEFAULT '', total_tokens INTEGER DEFAULT 0,
-                   last_active TEXT NOT NULL, model TEXT DEFAULT 'auto',
-                   created_at TEXT NOT NULL, archived_at TEXT);
-                 CREATE TABLE session_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   session_id TEXT NOT NULL REFERENCES sessions(id), role TEXT NOT NULL,
-                   content TEXT NOT NULL, tokens INTEGER DEFAULT 0, timestamp TEXT NOT NULL);
-                 INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at)
-                   VALUES ('line:Uold','sales','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-02-01T00:00:00Z'),
-                          ('line:Ulive','sales','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);
-                 INSERT INTO session_messages(session_id,role,content,timestamp)
-                   VALUES ('line:Uold','user','LEGACY-CLEARED-SECRET','2026-01-01T00:00:00Z'),
-                          ('line:Ulive','user','still here','2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        }
+        legacy_store(
+            &db,
+            &[
+                // Cleared 1 hour after the last message.
+                ("line:Uold", "2026-01-01T00:00:00Z", Some("2026-01-01T01:00:00Z")),
+                ("line:Ulive", "2026-01-01T00:00:00Z", None),
+                // A long gap, but an unparseable archive time: a user clear.
+                ("line:Ubad", "2026-01-01T00:00:00Z", Some("then")),
+            ],
+        );
         let mgr = SessionManager::new(&db).unwrap();
         // Moved: no row at the reusable id any more.
         assert!(mgr.session_agent("line:Uold").await.unwrap().is_none());
@@ -3264,9 +3392,17 @@ mod rm173_retention_tests {
         assert!(moved.starts_with("line:Uold#cleared:"), "{moved}");
         let (archived_at, reason) = mgr.archive_state(moved).await.unwrap().unwrap();
         assert_eq!(reason, ARCHIVE_REASON_USER);
-        assert_eq!(archived_at, "2026-02-01T00:00:00Z", "original archive time kept");
-        assert_eq!(mgr.user_cleared_at(moved).await.unwrap().as_deref(), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(archived_at, "2026-01-01T01:00:00Z", "original archive time kept");
+        assert_eq!(mgr.user_cleared_at(moved).await.unwrap().as_deref(), Some("2026-01-01T01:00:00Z"));
         assert_eq!(mgr.get_messages(moved).await.unwrap().len(), 1, "messages moved with it");
+        // Unparseable: a user clear, moved too (its new id stamped with the
+        // repair time).
+        assert!(mgr.session_agent("line:Ubad").await.unwrap().is_none());
+        let bad = mgr.sessions_for_contact("line:Ubad").await.unwrap();
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(bad[0].starts_with("line:Ubad#cleared:"), "{}", bad[0]);
+        assert_eq!(mgr.archive_state(&bad[0]).await.unwrap().unwrap().1, ARCHIVE_REASON_USER);
+        assert!(mgr.user_cleared_at(&bad[0]).await.unwrap().is_some());
         // A live row is untouched.
         assert!(mgr.archive_state("line:Ulive").await.unwrap().is_none());
         assert!(mgr.user_cleared_at("line:Ulive").await.unwrap().is_none());
@@ -3289,21 +3425,101 @@ mod rm173_retention_tests {
         mgr.append_message("line:Uold", "user", "new topic", 1).await.unwrap();
         let context = mgr.get_messages("line:Uold").await.unwrap();
         assert_eq!(context.len(), 1);
-        assert!(context.iter().all(|m| !m.content.contains("LEGACY-CLEARED-SECRET")));
+        assert!(context.iter().all(|m| !m.content.contains("SECRET-line:Uold")));
         assert!(mgr.archive_state(moved).await.unwrap().is_some(), "the clear stays archived");
 
-        // One-time: rows archived later with a NULL reason are not relabelled.
+        // Every start: a row archived later with a NULL reason (only an older
+        // binary writes one — e.g. a v1.80 `/new` after a downgrade) is
+        // classified by the same rule: a short gap is a user clear, moved.
         mgr.acquire()
             .await
-            .execute("UPDATE sessions SET archived_at='2026-03-01T00:00:00Z' WHERE id='line:Ulive'", [])
+            .execute(
+                "UPDATE sessions SET archived_at='2026-01-01T00:30:00Z' WHERE id='line:Ulive'",
+                [],
+            )
             .unwrap();
         drop(mgr);
         let mgr = SessionManager::new(&db).unwrap();
-        assert_eq!(
-            mgr.archive_state("line:Ulive").await.unwrap().unwrap().1,
-            ARCHIVE_REASON_RETENTION
+        assert!(mgr.session_agent("line:Ulive").await.unwrap().is_none(), "moved");
+        let live = mgr.sessions_for_contact("line:Ulive").await.unwrap();
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(mgr.archive_state(&live[0]).await.unwrap().unwrap().1, ARCHIVE_REASON_USER);
+    }
+
+    /// N1b: a legacy archive at least 72 hours after the last activity was
+    /// written by the inactivity task. It becomes a retention archive at its
+    /// own id — team history lists it (flagged archived), new activity
+    /// un-archives it — while a legacy clear next to it is moved and hidden.
+    #[tokio::test]
+    async fn rm173_migration_keeps_legacy_inactivity_archives_as_retention() {
+        use crate::team_history::reader;
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        legacy_store(
+            &db,
+            &[
+                ("idle", "2026-01-01T00:00:00Z", Some("2026-01-04T08:00:00.123456789+00:00")),
+                ("cleared", "2026-01-01T00:00:00Z", Some("2026-01-01T01:00:00Z")),
+                // Exactly at the threshold, in another offset: retention.
+                ("edge", "2026-01-01T00:00:00Z", Some("2026-01-04T08:00:00+08:00")),
+            ],
         );
-        assert!(mgr.session_agent("line:Ulive").await.unwrap().is_some(), "not moved");
+        let mgr = SessionManager::new(&db).unwrap();
+        for id in ["idle", "edge"] {
+            assert!(mgr.session_agent(id).await.unwrap().is_some(), "{id} stays at its id");
+            let (_, reason) = mgr.archive_state(id).await.unwrap().unwrap();
+            assert_eq!(reason, ARCHIVE_REASON_RETENTION, "{id}");
+            assert!(mgr.user_cleared_at(id).await.unwrap().is_none(), "{id}");
+        }
+        assert_eq!(
+            mgr.archived_at("idle").await.unwrap().as_deref(),
+            Some("2026-01-04T08:00:00.123456789+00:00"),
+            "archive time kept"
+        );
+        assert!(mgr.session_agent("cleared").await.unwrap().is_none(), "the clear is moved");
+        let cleared = mgr.sessions_for_contact("cleared").await.unwrap();
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+
+        // Team history: the inactivity archive is a report's conversation like
+        // any other (flagged archived); the user clear reads as missing.
+        {
+            let conn = mgr.acquire().await;
+            conn.execute(
+                "UPDATE sessions SET origin_kind='webchat_user', owner_user_id='employee'",
+                [],
+            )
+            .unwrap();
+        }
+        let scope = crate::team_oversight::TeamOversight {
+            viewer_user_id: "manager".into(),
+            agent: "sales".into(),
+            reports: [(
+                "employee".into(),
+                duduclaw_auth::org::OverseenReport {
+                    user_id: "employee".into(),
+                    display_name: "Employee".into(),
+                    depth: 1,
+                    level: duduclaw_auth::AccessLevel::Operator,
+                },
+            )]
+            .into(),
+            since: chrono::Utc.timestamp_opt(0, 0).unwrap(),
+            generation: 1,
+        };
+        let idle = reader::get(&mgr, &scope, "idle").await.unwrap().expect("listed");
+        assert!(idle.archived);
+        assert!(idle.rows.iter().any(|m| m.content == "SECRET-idle"));
+        assert!(reader::get(&mgr, &scope, &cleared[0]).await.unwrap().is_none());
+        assert!(reader::get(&mgr, &scope, "cleared").await.unwrap().is_none());
+
+        // New activity un-archives a retention archive, keeping its context.
+        mgr.append_message("idle", "user", "back again", 1).await.unwrap();
+        assert!(mgr.archive_state("idle").await.unwrap().is_none(), "live again");
+        assert_eq!(mgr.get_messages("idle").await.unwrap().len(), 2);
+        // It can also be restored like any retention archive.
+        assert!(mgr.restore_archived("edge").await.unwrap().is_some());
+        assert!(mgr.archive_state("edge").await.unwrap().is_none());
     }
 
     /// N2: a restore keeps the sticky `user_cleared_at`.
@@ -3473,6 +3689,71 @@ mod rm173_retention_tests {
         let moved = moved_clear(&mgr, "line:Ufail").await;
         assert_eq!(mgr.get_messages(&moved).await.unwrap().len(), 1);
         assert!(marker_written(&mgr).await);
+    }
+
+    /// Fix 3: no RM-173 path leaves a reason on a live row (restore and
+    /// activity clear both), so a live row with one was lifted by an older
+    /// binary that did not know the column. The next start drops the reason;
+    /// the sticky `user_cleared_at` stays; a live user clear still at its
+    /// original id is moved rather than unlabelled.
+    #[tokio::test]
+    async fn rm173_start_drops_stale_archive_reasons_from_live_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let mgr = SessionManager::new(&db).unwrap();
+        assert!(marker_written(&mgr).await);
+        aged(&mgr, "line:Ustale", 1).await;
+        aged(&mgr, "line:Urestored", 1).await;
+        aged(&mgr, "line:Ustuck", 1).await;
+        let restored = mgr.clear_for_user("line:Urestored").await.unwrap().unwrap();
+        let mark = mgr.user_cleared_at(&restored).await.unwrap();
+        assert!(mark.is_some());
+        {
+            // What a v1.80 binary leaves behind: archives lifted (activity,
+            // restore) with `archive_reason` untouched.
+            let conn = mgr.acquire().await;
+            conn.execute(
+                "UPDATE sessions SET archived_at=NULL, archive_reason='retention' WHERE id='line:Ustale'",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE sessions SET archived_at=NULL WHERE id=?1", params![restored])
+                .unwrap();
+            conn.execute(
+                "UPDATE sessions SET archived_at=NULL, archive_reason='user',
+                        user_cleared_at='2026-01-01T00:00:00Z' WHERE id='line:Ustuck'",
+                [],
+            )
+            .unwrap();
+        }
+        drop(mgr);
+        let mgr = SessionManager::new(&db).unwrap();
+        /// `(live, archive_reason)` of a row.
+        async fn reason(mgr: &SessionManager, id: &str) -> (bool, Option<String>) {
+            mgr.acquire()
+                .await
+                .query_row(
+                    "SELECT archived_at IS NULL, archive_reason FROM sessions WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get::<_, bool>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap()
+        }
+        assert_eq!(reason(&mgr, "line:Ustale").await, (true, None), "live, reason dropped");
+        assert_eq!(reason(&mgr, &restored).await, (true, None), "live, reason dropped");
+        assert_eq!(mgr.user_cleared_at(&restored).await.unwrap(), mark, "sticky mark untouched");
+        assert!(mgr.user_cleared_at("line:Ustale").await.unwrap().is_none());
+        // The live user clear at its original id: moved, mark kept.
+        let moved = moved_clear(&mgr, "line:Ustuck").await;
+        assert_eq!(
+            mgr.user_cleared_at(&moved).await.unwrap().as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        // Nothing left to do: the next start changes nothing.
+        drop(mgr);
+        let mgr = SessionManager::new(&db).unwrap();
+        assert_eq!(reason(&mgr, "line:Ustale").await, (true, None));
+        assert_eq!(moved_clear(&mgr, "line:Ustuck").await, moved);
     }
 
     #[tokio::test]
