@@ -482,7 +482,9 @@ const EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
     // rows (`agent_id`) go through the hidden-row filter.
     ("google", "Admin Google Workspace integration, delegation keys and tenant-wide tenant-source settings \
         (delegation.get / tenant_settings_set name no employee); per-employee identity is agents.google_identity_*, \
-        delegation.get's agents rows pass the P1g hidden-row filter"),
+        delegation.get's agents rows pass the P1g hidden-row filter; SR4 delegation.attest_subject / \
+        revoke_attestation name a Shared employee (Admin + step-up, refused for Personal ones in the handler, \
+        P1g default deny on agent_id)"),
     ("workflow_drafts", "P1g default deny on the named actor; runs re-checked at fire time (dispatcher)"),
     ("workflow_runs", "P1g default deny + hidden rows; queued runs re-checked at fire time (dispatcher)"),
     ("assign_schedules", "P1g: manage is owner-only for a Personal employee (owner_only_denied); fire-time check pauses others"),

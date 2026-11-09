@@ -172,6 +172,8 @@ mod google_rpc;
 mod google_identity_rpc;
 // v1.81 F5 UI-RPC: protected-mode Google tenant-source settings (Admin + step-up).
 mod google_tenant_settings_rpc;
+// v1.81 SR4 item 1: Admin attestation of a Google delegate subject (Admin + step-up).
+mod google_delegate_attestation_rpc;
 mod google_personal_rpc;
 mod accounts_util;
 mod tasks_rpc;

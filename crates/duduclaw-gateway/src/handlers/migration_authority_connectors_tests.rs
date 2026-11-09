@@ -353,7 +353,7 @@ fn c5_no_secrets_in_proposal() {
         let summary = card(item).unwrap();
         let mut keys: Vec<String> = summary.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["binding", "details", "kind", "label", "legacy_source", "owner_user_id", "provider"]);
+        assert_eq!(keys, ["binding", "created_by", "details", "kind", "label", "legacy_source", "owner_user_id", "provider"]);
         exported.push_str(&summary.to_string());
     }
     for forbidden in ["SECRET", "pk:v1", "example.com", "odoo.example.invalid", "token\":", fx.tenant.as_str()] {
@@ -361,6 +361,49 @@ fn c5_no_secrets_in_proposal() {
     }
     let bytes = std::fs::read(fx.path().join("migration-confirmations.db")).unwrap();
     assert!(!bytes.windows(6).any(|window| window == b"SECRET"));
+}
+
+/// SR4 item 6: a website credential is Personal only for its creator's own
+/// Personal employee; another person's credential on a Personal employee is
+/// not proposed at all; a Shared employee's is shared with the creator shown.
+#[test]
+fn sr4_computer_credential_creator_classifies_the_route() {
+    use crate::website_credentials::Owner;
+    let alice = Owner { owner_kind: "user".into(), owner_id: "alice-id".into() };
+    let personal = |owner: &str| EmployeeBinding::Personal(Text::new(owner.into()).unwrap());
+    let shared = EmployeeBinding::Shared(Text::new("company".into()).unwrap());
+    assert_eq!(computer_route(&alice, &personal("alice-id")), Some(("personal", Some("alice-id".to_owned()))));
+    assert_eq!(computer_route(&alice, &personal("bob-id")), None, "another person's login: unproven");
+    assert_eq!(computer_route(&alice, &shared), Some(("shared_home", None)));
+    for odd in ["", "bad\u{7}id"] {
+        assert_eq!(computer_route(&Owner { owner_kind: "user".into(), owner_id: odd.into() }, &shared), None, "{odd:?}");
+    }
+    let system = Owner { owner_kind: "system".into(), owner_id: "alice-id".into() };
+    assert_eq!(computer_route(&system, &personal("alice-id")), None);
+
+    // Through the import: the card names the creator; the plan carries it.
+    let fx = fixture();
+    crate::website_credentials::upsert(fx.path(), crate::website_credentials::Upsert {
+        id: None, label: "crm".into(), login_url: "https://crm.example.invalid/login".into(), allowed_paths: Vec::new(),
+        username: "SECRET-USER".into(), password: "SECRET-PASSWORD".into(), allowed_agents: vec![AGENT.into()],
+    }, &fx.owner).unwrap();
+    let summary = import_legacy_with(fx.path(), &fx.env).unwrap();
+    assert_eq!((summary.staged, summary.unproven_personal), (3, 0));
+    let items = connector_items(&fx);
+    let computer = card(&by_provider(&items, "computer")).unwrap();
+    assert_eq!(computer["kind"], "shared_home");
+    assert_eq!(computer["created_by"], json!(fx.owner));
+    assert_eq!(computer["details"]["created_by"], json!(fx.owner));
+    assert_eq!(card(&by_provider(&items, "database")).unwrap()["created_by"], Value::Null);
+    let exported = serde_json::to_string(&items).unwrap();
+    assert!(!exported.contains("SECRET") && !exported.contains("crm.example.invalid"));
+    // A plan whose creator does not match the legacy store is stale.
+    let mut forged = parse(&by_provider(&items, "computer")).unwrap();
+    forged.details.as_mut().unwrap().created_by = Some("someone-else".into());
+    assert!(matches!(fresh(fx.path(), &fx.env, &forged), Err(Error::Stale)));
+    // A computer plan without a creator is not a valid plan.
+    forged.details.as_mut().unwrap().created_by = None;
+    assert!(matches!(forged.check(), Err(Error::Invalid)));
 }
 
 #[test]

@@ -241,6 +241,8 @@ impl UserDb {
         crate::credential_changes::migrate(&conn)?;
         // SR5 item 4: every address an account ever held (trigger-written).
         crate::account_email_history::migrate(&conn)?;
+        // SR4 item 1: Admin attestations of Google delegate subjects.
+        crate::google_delegate_attestation::migrate(&conn)?;
         Ok(())
     }
 

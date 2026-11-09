@@ -191,10 +191,15 @@ async fn mint(
         iat: u64,
         exp: u64,
     }
+    // SR4 item 5: on the protected tenant lane exactly the configured
+    // `tenant_scopes` (pinned by the bridge), never the full minted set.
+    let scope = permit
+        .assertion_scope()
+        .map_err(crate::google_identity::effect_authority::CredentialResolveFailure::Authority)?;
     let claims = Claims {
         iss: &key.client_email,
         sub: subject,
-        scope: crate::google_workspace::REQUIRED_SCOPES.join(" "),
+        scope,
         aud: endpoint,
         iat: now.wall,
         exp: now.wall.checked_add(3600).ok_or_else(unavailable)?,

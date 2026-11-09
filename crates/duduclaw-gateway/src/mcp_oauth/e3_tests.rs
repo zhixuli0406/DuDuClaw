@@ -1,7 +1,8 @@
 //! v1.81 E3: the home OAuth exchange never follows a redirect; a dead GitHub
-//! home grant fences the SharedHome github routes; a route revoked during a
-//! GitHub home refresh discards the new token. Owned loopback only; not
-//! compiled or run here (Linux builder).
+//! home grant fences the SharedHome github routes. SR4 item 3: a route
+//! revoked during a GitHub home refresh refuses the call but keeps the
+//! rotated (single-use) grant; refreshes are single-flight. Owned loopback
+//! only; not compiled or run here (Linux builder).
 use super::*;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -159,9 +160,12 @@ async fn e3_github_home_invalid_grant_revokes_shared_home() {
     served.await.unwrap();
 }
 
+/// SR4 item 3 (replaces E3's "discard the new token"): GitHub refresh tokens
+/// are single-use, so a selection that moved during the exchange refuses only
+/// the CALL; the rotated pair is the home's grant and is always stored.
 #[cfg(unix)]
 #[tokio::test]
-async fn e3_revoke_during_github_refresh_discards_new_token() {
+async fn sr4_revoke_during_github_refresh_keeps_rotated_grant_and_refuses_call() {
     let home = crate::fs_safe::private_test_home().unwrap();
     let catalog = ConnectorCatalog::open(home.path()).unwrap();
     let account = catalog.register("home github", "github", ConnectorKind::SharedHome, &company()).unwrap();
@@ -180,10 +184,57 @@ async fn e3_revoke_during_github_refresh_discards_new_token() {
     let error = result.err().expect("refused after the route moved").to_string();
     assert!(!error.contains("fixture-new"), "{error}");
     served.await.unwrap();
-    // The new token was discarded: neither stored nor returned.
-    assert_eq!(stored_github(home.path()), ("fixture-old-access".into(), Some("fixture-old-refresh".into())));
+    // The call was refused, but the rotated grant was stored, not zeroized.
+    assert_eq!(stored_github(home.path()), ("fixture-new-access".into(), Some("fixture-new-refresh".into())));
     assert!(selected.recheck().is_err());
+    // The home grant survives the run: the next use needs no exchange (the
+    // endpoint is gone; a second refresh would fail).
+    assert_eq!(crate::github_workspace::get_valid_github_token(home.path()).await.unwrap(), "fixture-new-access");
     // A revoke is not a dead grant: no consent-revoke event.
     let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();
     assert!(!audit.contains("home_oauth_consent_revoked"));
+}
+
+/// SR4 item 3: concurrent refreshes are single-flight; the single-use refresh
+/// token is spent once and every caller gets the rotated access token.
+#[cfg(unix)]
+#[tokio::test]
+async fn sr4_concurrent_github_refreshes_spend_the_refresh_token_once() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    // The endpoint answers exactly one connection.
+    let (port, served) = token_endpoint("200 OK", serde_json::json!({"access_token":"fixture-new-access",
+        "refresh_token":"fixture-new-refresh","token_type":"bearer","expires_in":28800}), || {}).await;
+    expired_github_home(home.path(), format!("http://127.0.0.1:{port}/login/oauth/access_token"));
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(crate::github_workspace::get_valid_github_token(home.path()),
+            crate::github_workspace::get_valid_github_token(home.path()))
+    }).await.expect("both callers finished");
+    assert_eq!(first.unwrap(), "fixture-new-access");
+    assert_eq!(second.unwrap(), "fixture-new-access", "the waiter reuses the refresh done under the lock");
+    assert!(served.await.unwrap().contains("refresh_token=fixture-old-refresh"));
+    assert_eq!(stored_github(home.path()), ("fixture-new-access".into(), Some("fixture-new-refresh".into())));
+}
+
+/// SR4 item 3: a dead-grant answer revokes the home consent only when the
+/// stored refresh token (re-read under the lock) is still the one spent.
+#[cfg(unix)]
+#[tokio::test]
+async fn sr4_github_invalid_grant_after_reconnect_keeps_consent() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    let catalog = ConnectorCatalog::open(home.path()).unwrap();
+    let github = catalog.register("home github", "github", ConnectorKind::SharedHome, &company()).unwrap();
+    // A reconnect stores a new grant while the old refresh is in flight.
+    let path = home.path().to_path_buf();
+    let (port, served) = token_endpoint("200 OK", serde_json::json!({"error":"bad_refresh_token"}), move || {
+        upsert_token(&path, McpOAuthToken { provider_id: "github".into(), access_token: "fixture-reconnected".into(),
+            refresh_token: Some("fixture-reconnected-refresh".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(8)), scopes: vec!["repo".into()] }).unwrap();
+    }).await;
+    expired_github_home(home.path(), format!("http://127.0.0.1:{port}/login/oauth/access_token"));
+    assert!(crate::github_workspace::get_valid_github_token(home.path()).await.is_err());
+    served.await.unwrap();
+    assert!(catalog.route(&github).unwrap().unwrap().active, "the reconnected grant is not the dead one");
+    let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();
+    assert!(!audit.contains("home_oauth_consent_revoked"));
+    assert_eq!(crate::github_workspace::get_valid_github_token(home.path()).await.unwrap(), "fixture-reconnected");
 }

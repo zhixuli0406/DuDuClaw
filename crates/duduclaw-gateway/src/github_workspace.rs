@@ -266,11 +266,39 @@ pub struct CommentResult {
 
 // ── Token acquisition ───────────────────────────────────────────────────────
 
+/// SR4 item 3: one refresh at a time per home and provider. GitHub refresh
+/// tokens are single-use (each exchange rotates them), so two concurrent
+/// refreshes would spend the same token and the loser would read a dead grant.
+fn refresh_gate(home_dir: &Path, provider: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Gates = std::collections::HashMap<(std::path::PathBuf, String), std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static GATES: std::sync::LazyLock<std::sync::Mutex<Gates>> = std::sync::LazyLock::new(Default::default);
+    let key = (home_dir.canonicalize().unwrap_or_else(|_| home_dir.to_path_buf()), provider.to_owned());
+    let mut gates = GATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.entry(key).or_default().clone()
+}
+
 /// Return a valid GitHub access token, refreshing in place only when the token
 /// actually has an expiry and a stored refresh_token (OAuth App token
 /// expiration enabled). The common no-expiry case returns the stored token.
+///
+/// SR4 item 3 (rotation): refreshes are serialized per home + provider
+/// ([`refresh_gate`]) and the stored token is re-read under that lock, so a
+/// refresh another task just finished is reused instead of spending its
+/// already-rotated refresh token. A successful exchange is ALWAYS persisted
+/// (`upsert_token`): the grant belongs to the home, and the refresh token
+/// that was sent is dead from that moment. Only the CALL is refused when the
+/// isolated selection moved during the exchange. `InvalidGrant` revokes the
+/// home consent only when the stored refresh token, re-read under the lock,
+/// is still the one that was spent.
 pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAuthError> {
     // Fast path: non-expired (or never-expiring) token.
+    if let Some(t) = mcp_oauth::get_token(home_dir, GITHUB_PROVIDER) {
+        return Ok(t.access_token);
+    }
+
+    let gate = refresh_gate(home_dir, GITHUB_PROVIDER);
+    let _refreshing = gate.lock().await;
+    // Re-read under the lock: another task may have refreshed meanwhile.
     if let Some(t) = mcp_oauth::get_token(home_dir, GITHUB_PROVIDER) {
         return Ok(t.access_token);
     }
@@ -310,9 +338,10 @@ pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAut
         Ok(refreshed) => refreshed,
         Err(mcp_oauth::RefreshFailure::InvalidGrant(message)) => {
             // The home grant is dead (app revoked / token rotated away). Fence
-            // the SharedHome github routes first, unless a reconnect already
-            // replaced the token this refresh started from (then the dead
-            // grant is not the current connection). This call fails either way.
+            // the SharedHome github routes first, unless the stored token —
+            // re-read under the refresh lock — is no longer the one spent here
+            // (a reconnect replaced it; the dead grant is not the current
+            // connection). This call fails either way.
             if current_refresh_token(home_dir).is_none_or(|current| current == refresh_tok) {
                 let _ = mcp_oauth::home_consent_revoked(home_dir, GITHUB_PROVIDER);
             }
@@ -320,22 +349,21 @@ pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAut
         }
         Err(failure) => return Err(GithubAuthError::RefreshFailed(failure.into_message())),
     };
-    // v1.81 E3 (matrix 8): re-check the selection (route active + generation
-    // + binding) after the exchange returned and BEFORE the new token is
-    // stored or used. Revoked ⇒ the new token is discarded and this call fails.
-    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() {
-        zeroize::Zeroize::zeroize(&mut refreshed.access_token);
-        if let Some(token) = refreshed.refresh_token.as_mut() {
-            zeroize::Zeroize::zeroize(token);
-        }
-        return Err(GithubAuthError::RefreshFailed(REFRESH_REVOKED.into()));
-    }
     if refreshed.scopes.is_empty() {
         refreshed.scopes = existing.scopes.clone();
     }
-    let access = refreshed.access_token.clone();
+    // SR4 item 3: the exchange rotated the home grant; the refresh token we
+    // sent is dead. Persist the new pair before anything else, whatever the
+    // caller's selection now says — dropping it would kill the home-wide grant.
+    let mut access = zeroize::Zeroizing::new(refreshed.access_token.clone());
     mcp_oauth::upsert_token(home_dir, refreshed).map_err(GithubAuthError::RefreshFailed)?;
-    Ok(access)
+    // v1.81 E3 (matrix 8): re-check the selection (route active + generation
+    // + binding) after the exchange returned and BEFORE the new token is
+    // used. Moved ⇒ this call fails; the stored grant stays the home's.
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() {
+        return Err(GithubAuthError::RefreshFailed(REFRESH_REVOKED.into()));
+    }
+    Ok(std::mem::take(&mut *access))
 }
 
 const REFRESH_REVOKED: &str = "the connector route changed during the refresh";

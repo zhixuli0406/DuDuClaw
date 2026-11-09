@@ -5,6 +5,7 @@ pub mod admin_eligibility;
 pub mod credential_changes;
 pub mod db;
 pub mod jwt;
+pub mod google_delegate_attestation;
 pub mod google_identity;
 pub mod models;
 pub mod org;

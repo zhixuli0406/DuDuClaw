@@ -73,6 +73,7 @@ impl GoogleClosedMount {
                 agent,
                 requester: who,
                 purpose: GooglePurpose::ClosedRemote(bound),
+                tenant: None,
             };
             context.validate()?;
             let selected = match gi::effective_for(&context.home, Some(&context.agent)).effective {

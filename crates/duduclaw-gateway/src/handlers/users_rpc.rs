@@ -641,6 +641,15 @@ impl MethodHandler {
                     Some(&detail),
                     None,
                 );
+                // SR4 item 2(iv): an address that is now a designated Google
+                // service mailbox or a delegate subject stays refused at use
+                // time; the collision is surfaced to Admins as an audit event.
+                if crate::runtime_readiness::is_protected_linux() {
+                    let (home, user_id, address) = (self.home_dir.clone(), ctx.user_id.clone(), email.to_owned());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::google_identity::tenant_source::audit_email_conflict(&home, &user_id, &address)
+                    }).await;
+                }
                 WsFrame::ok_response("", json!({"status": "changed", "email": email}))
             }
             Err(e) if e == duduclaw_auth::db::EMAIL_IN_USE => WsFrame::error_response("", &e),

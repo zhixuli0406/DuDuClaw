@@ -384,6 +384,18 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_google_tenant_settings_set(params, ctx)).await
             }
+            // v1.81 SR4 item 1: Admin attestation that a Shared employee's
+            // delegate subject belongs to one users.db account (D-5 (b)).
+            // Admin here; the handler re-reads Admin, refuses `system` and
+            // needs the isolation step-up + CSRF token.
+            "google.delegation.attest_subject" => {
+                require_admin!();
+                boxed_frame(|| self.handle_google_delegation_attest_subject(params, ctx)).await
+            }
+            "google.delegation.revoke_attestation" => {
+                require_admin!();
+                boxed_frame(|| self.handle_google_delegation_revoke_attestation(params, ctx)).await
+            }
             "google.identity.test" => {
                 require_admin!();
                 boxed_frame(|| self.handle_google_identity_test(params)).await

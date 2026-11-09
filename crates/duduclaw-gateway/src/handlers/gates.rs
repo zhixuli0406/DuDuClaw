@@ -137,6 +137,8 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         // v1.81 F5 UI-RPC (protected mode only): tombstone preview and the
         // Google tenant-source settings.
         | "isolation.employee_tombstone_preview" | "google.delegation.tenant_settings_set"
+        // SR4 item 1: delegate-subject attestation (protected mode only).
+        | "google.delegation.attest_subject" | "google.delegation.revoke_attestation"
         | "me.isolation.request_personal_employee" | "me.isolation.list_personal_employee_requests"
         | "me.isolation.list_personal_delegations" | "me.isolation.decide_personal_delegation"
         // F6d 已註銷員工的還原、核准、重新授權與主機資源釋放
