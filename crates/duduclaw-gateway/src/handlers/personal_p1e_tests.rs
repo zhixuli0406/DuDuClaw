@@ -466,7 +466,15 @@ const EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
     ("departments", "department names and membership (org metadata)"),
     ("org", "P1g default deny on agent_id / reports_to targets; may_move / may_target through the ACL (fails closed)"),
     ("mcp", "P1g default deny: per-employee MCP wiring of another person's Personal employee is refused (owner only)"),
-    ("google", "Admin Google Workspace integration and delegation keys; per-employee identity is agents.google_identity_*"),
+    // Merge P1h × F5 UI-RPC (reviewed 2026-11-09): `google.delegation.get`
+    // (+ `tenant_source` / `tenant_settings_limits`) and
+    // `google.delegation.tenant_settings_set {service_mailboxes, tenant_scopes,
+    // csrf_token}` are tenant-wide configuration and name no employee, so the
+    // P1g default deny never fires on them; `get`'s per-employee `agents`
+    // rows (`agent_id`) go through the hidden-row filter.
+    ("google", "Admin Google Workspace integration, delegation keys and tenant-wide tenant-source settings \
+        (delegation.get / tenant_settings_set name no employee); per-employee identity is agents.google_identity_*, \
+        delegation.get's agents rows pass the P1g hidden-row filter"),
     ("workflow_drafts", "P1g default deny on the named actor; runs re-checked at fire time (dispatcher)"),
     ("workflow_runs", "P1g default deny + hidden rows; queued runs re-checked at fire time (dispatcher)"),
     ("assign_schedules", "P1g: manage is owner-only for a Personal employee (owner_only_denied); fire-time check pauses others"),

@@ -67,8 +67,18 @@ pub(crate) const LOG_TAIL_REFUSED: &str = "受保護模式下，有其他同仁�
 /// `p1h_lifecycle_allowlist_equals_the_dispatch_table` keeps this equal to
 /// the methods the dispatch table really routes in those namespaces.
 pub(crate) const LIFECYCLE_ALLOWLIST: &[(&str, &str)] = &[
-    ("isolation.connector_list", "connector routes name an owner user id (Personal) or nothing (Shared), never an \
-        employee; no per-employee rows"),
+    // Merge P1h × F5 UI-RPC (reviewed 2026-11-09): the rows now carry the
+    // employees that may use each route (`employees`, `employee_*`). The
+    // handler hides another person's Personal rows and employees itself
+    // (`EmployeeView`, `personal_visibility::hidden_from`, fail closed) and
+    // reveals them only with the P1 break-glass step-up — the same
+    // `authorize_step_up` proof + CSRF as `personal_data_gate`, audited in
+    // `auth_audit_log` before the reply (a failed write refuses). Exempt from
+    // the hidden-row filter so it does not filter twice (or strip an audited
+    // reveal); its row fields are not `ROW_EMPLOYEE_FIELDS` anyway.
+    ("isolation.connector_list", "connector routes name an owner user id (Personal) or nothing (Shared); F5 UI-RPC \
+        employee mapping hides another person's Personal rows / employees in the handler unless revealed by the \
+        audited step-up (`step_up_csrf`, same proof as personal_data_gate)"),
     ("isolation.connector_step_up", "Admin step-up proof; returns `verified` only"),
     ("isolation.connector_provision", "Admin + step-up connector authority; returns the new account id only"),
     ("isolation.connector_revoke", "Admin + step-up connector authority; returns account / active only"),
@@ -79,6 +89,12 @@ pub(crate) const LIFECYCLE_ALLOWLIST: &[(&str, &str)] = &[
     ("isolation.employee_list", "lifecycle read model by design: label / owner / status, no private data"),
     ("isolation.employee_propose", "Admin + step-up proposal; creates a confirmation card"),
     ("isolation.employee_tombstone", "Admin + step-up lifecycle removal (F6 rules)"),
+    // Merge P1h × F5 UI-RPC (reviewed 2026-11-09): names the row by
+    // `employee_id` only (no `EMPLOYEE_PARAM_KEYS`); read-only, no write, no
+    // audit row needed — nothing private is read.
+    ("isolation.employee_tombstone_preview", "Admin read of size metadata only, no content: label, employee id, kind, \
+        byte estimate and predicted seal state of the live tree (the seal's metadata walk, no hashing, no file \
+        content read)"),
     ("isolation.employee_purge_requests", "Admin + step-up purge of request records; counts only"),
     ("me.isolation.request_personal_employee", "self-service: files the caller's own request"),
     ("me.isolation.list_personal_employee_requests", "the caller's own requests only"),

@@ -22,6 +22,8 @@
 //!   revision of a staff request or as a new Personal/Shared proposal.
 //! - `isolation.employee_tombstone` (Admin + step-up): tombstone of a
 //!   Personal or Shared employee (`isolation_lifecycle::tombstone_employee`, F6d).
+//! - `isolation.employee_tombstone_preview` (Admin, read-only, F5 UI-RPC):
+//!   estimated size and seal outcome of a tombstone, before the dialog.
 //! - F6d restore RPCs (`isolation_employee_restore.rs`): `me.isolation.list_restorable`,
 //!   `restore_challenge`, `request_restore`, `cancel_restore`; `isolation.employee_restore_decide`,
 //!   `employee_restore_cancel`, `employee_restore_regrant`, `employee_retire_propose`;
@@ -68,8 +70,10 @@ const LIST: &str = "isolation.employee_list";
 const PROPOSE: &str = "isolation.employee_propose";
 const TOMBSTONE: &str = "isolation.employee_tombstone";
 const PURGE: &str = "isolation.employee_purge_requests";
-pub(super) const METHODS: [&str; 8] = [REQUEST, MY_REQUESTS, LIST, PROPOSE, TOMBSTONE, PURGE,
-    delegation::DELEGATIONS, delegation::DECIDE_DELEGATION];
+/// v1.81 F5 UI-RPC: read-only size/seal preview shown before the 註銷 dialog.
+const TOMBSTONE_PREVIEW: &str = "isolation.employee_tombstone_preview";
+pub(super) const METHODS: [&str; 9] = [REQUEST, MY_REQUESTS, LIST, PROPOSE, TOMBSTONE, PURGE,
+    delegation::DELEGATIONS, delegation::DECIDE_DELEGATION, TOMBSTONE_PREVIEW];
 
 #[path = "isolation_employee_dirs.rs"]
 pub(crate) mod employee_dirs;
@@ -144,6 +148,13 @@ const REQUEST_MISMATCH: &str = "這筆申請已處理，或內容與提案不一
 const CREATE_FAILED: &str = "無法建立員工設定，請確認名稱後重試。";
 const SETTINGS_INVALID: &str = "員工設定無法放入提案，已拒絕操作。";
 const EMPLOYEE_NOT_FOUND: &str = "找不到這位員工，請重新載入。";
+// F5 UI-RPC tombstone preview. (`NOT_PERSONAL` is gone: F6d's tombstone
+// accepts Shared employees too.)
+const ALREADY_TOMBSTONED: &str = "這位員工已經註銷。";
+const PRINCIPAL_UNKNOWN: &str = "這位員工的歸屬紀錄不完整，目前無法註銷，請聯絡原廠支援。";
+const PREVIEW_UNAVAILABLE: &str = "目前無法估算這位員工的資料大小，請稍後再試。";
+/// Upper bound of confirmed rows read to find one employee by id.
+const MAX_CONFIRMED: usize = 4096;
 
 /// Namespace owned by this handler; unknown members are refused here.
 pub(super) fn owns(method: &str) -> bool {
@@ -191,6 +202,9 @@ struct TombstoneRequest { label: String, employee_id: String, csrf_token: [u8; 3
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PurgeRequest { csrf_token: [u8; 32] }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TombstonePreviewRequest { employee_id: String }
 
 /// A checked admin proposal, carried from the first blocking step through the
 /// product create to the staging step (which re-checks the step-up).
@@ -284,6 +298,11 @@ impl MethodHandler {
                     invalidate_employee_approvals(&approvals_home, &label, employee).await;
                 }
                 Ok(done)
+            }
+            TOMBSTONE_PREVIEW => {
+                // Admin (checked above), read-only: no step-up, no write.
+                let input: TombstonePreviewRequest = serde_json::from_value(params).map_err(|_| PROPOSAL_INVALID)?;
+                blocking(move || tombstone_preview(&home, &input.employee_id)).await
             }
             PROPOSE => {
                 let input: ProposeRequest = serde_json::from_value(params).map_err(|_| PROPOSAL_INVALID)?;
@@ -1005,6 +1024,55 @@ fn tombstone(home: &Path, proof: Option<&MigrationConfirmationSession>, user: &s
         "incarnation": outcome.incarnation, "seal": outcome.seal, "digest_prefix": outcome.digest_prefix,
         "routes_revoked": outcome.routes_revoked.len(), "pending_fences": outcome.pending_fences,
         "runs_stopped": outcome.runs_stopped.is_some() }))
+}
+
+/// `isolation.employee_tombstone_preview {employee_id}` (F5 UI-RPC): what a
+/// tombstone of this employee would seal now, for the 註銷 dialog
+/// (「超過 1 GiB 的資料之後無法還原」). Read-only and side-effect free: the
+/// confirmed row is read by exact employee id from apply.db, and the live
+/// `agents/<label>` tree is walked with the seal's own walk and bounds
+/// (`isolation_quarantine::preview_live_tree`) without hashing. Nothing is
+/// moved, created, recorded or audited.
+///
+/// `restorable_after` = the tree would seal (`sealed`): the F6 restore and
+/// adoption paths (`restore::METHODS`) need a sealed quarantine row (Q6); the
+/// value states the seal-side precondition only, not the later restore checks.
+/// `tombstone_available` = `isolation.employee_tombstone` accepts the
+/// employee: since F6d both Personal and Shared rows (an unbound row is
+/// refused above with `PRINCIPAL_UNKNOWN`).
+fn tombstone_preview(home: &Path, employee_id: &str) -> Result<Value, &'static str> {
+    tombstone_preview_with(home, employee_id, |label| crate::isolation_quarantine::preview_live_tree(home, label))
+}
+
+fn tombstone_preview_with(home: &Path, employee_id: &str,
+    walk: impl FnOnce(&str) -> Result<crate::isolation_quarantine::SealPreview, ()>) -> Result<Value, &'static str> {
+    use crate::isolation_quarantine::{SealState, LABEL_RESERVED_DAYS, MAX_BYTES};
+    let employee = EmployeeId(parse_hex16(employee_id).ok_or(EMPLOYEE_NOT_FOUND)?);
+    let row = lifecycle::confirmed_by_employee(home, employee, MAX_CONFIRMED).map_err(|_| STORE_UNAVAILABLE)?
+        .ok_or(EMPLOYEE_NOT_FOUND)?;
+    if row.disabled { return Err(ALREADY_TOMBSTONED); }
+    let kind = match row.binding {
+        Some(EmployeeBinding::Personal(_)) => "personal",
+        Some(EmployeeBinding::Shared(_)) => "shared",
+        // The tombstone itself refuses such a row (`Denied`).
+        None => return Err(PRINCIPAL_UNKNOWN),
+    };
+    let preview = walk(&row.label).map_err(|()| PREVIEW_UNAVAILABLE)?;
+    let within_limit = preview.state != SealState::Oversize && preview.bytes <= MAX_BYTES;
+    Ok(json!({
+        "label": row.label,
+        "employee_id": hex::encode(employee.0),
+        "kind": kind,
+        "estimated_bytes": preview.bytes,
+        "estimate_complete": preview.complete,
+        "seal_limit_bytes": MAX_BYTES,
+        "within_limit": within_limit,
+        "predicted_seal": preview.state.as_str(),
+        "restorable_after": preview.state == SealState::Sealed,
+        "label_reserved_days": LABEL_RESERVED_DAYS,
+        // F6d: the tombstone accepts Personal and Shared employees alike.
+        "tombstone_available": true,
+    }))
 }
 
 /// F6a (A8): after a tombstone, invalidate every open or approved approval

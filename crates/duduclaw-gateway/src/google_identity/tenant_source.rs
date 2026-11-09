@@ -264,6 +264,105 @@ fn read_bounded_or_empty(path: &Path, max: u64) -> Result<Zeroizing<Vec<u8>>, Te
     Ok(bytes)
 }
 
+// ── F5 UI-RPC: dashboard view of the tenant sources ───────────────────────
+
+/// Domain tag of the dashboard key fingerprint. Distinct from
+/// [`material_digest`], so the value shown on the dashboard is never the
+/// bridge's pinned source proof.
+const FINGERPRINT_DOMAIN: &[u8] = b"duduclaw.f5.google-tenant-key-fingerprint.v1\0";
+
+/// Length-prefixed, domain-separated SHA-256 (hex) of non-secret parts.
+fn fingerprint(kind: &str, parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(FINGERPRINT_DOMAIN);
+    hasher.update(kind.as_bytes());
+    hasher.update([0u8]);
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// The non-secret identity fields of a service-account key file. Serde skips
+/// every other field (the private key is never kept in this value).
+#[derive(serde::Deserialize)]
+struct KeyIdentity {
+    client_email: String,
+    #[serde(default)]
+    private_key_id: Option<String>,
+}
+
+/// F5 (UI-RPC): what the dashboard's Google tenant-source tab shows. Holds no
+/// secret — the state, identifiers the dashboard already shows elsewhere
+/// (service-account email, the SA `subject`) and a key fingerprint:
+/// - `delegate` (domain-wide delegation): SHA-256 over the sealed record as
+///   stored (ciphertext + public fields); a new key import changes it.
+/// - `service_account`: SHA-256 over the key file's `client_email` and its
+///   Google key id (`private_key_id`, the id the Google console lists);
+///   `null` when the file carries no well-formed key id.
+///
+/// Each entry is `{"state": "not_configured" | "installed" | "unavailable"}`
+/// plus fields when installed. Unreadable or malformed material is
+/// `unavailable`, never a guessed fingerprint. Blocking file reads.
+pub(crate) fn dashboard_view(home: &Path) -> serde_json::Value {
+    json!({ "delegate": delegate_view(home), "service_account": service_account_view(home) })
+}
+
+fn delegate_view(home: &Path) -> serde_json::Value {
+    let unavailable = json!({ "state": "unavailable" });
+    let sealed = super::delegation_key::path(home);
+    match std::fs::symlink_metadata(&sealed) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return json!({ "state": "not_configured" }),
+        Err(_) => return unavailable,
+        Ok(_) => {}
+    }
+    let Ok(bytes) = read_bounded(&sealed, MAX_SEALED_RECORD) else { return unavailable };
+    match super::delegation_key::info(home) {
+        Ok(Some(info)) => json!({ "state": "installed", "client_email": info.client_email,
+            "fingerprint": fingerprint("delegate", &[bytes.as_slice()]) }),
+        _ => unavailable,
+    }
+}
+
+fn service_account_view(home: &Path) -> serde_json::Value {
+    let unavailable = json!({ "state": "unavailable" });
+    let config_path = home.join("config.toml");
+    let raw = match std::fs::symlink_metadata(&config_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return json!({ "state": "not_configured" }),
+        Err(_) => return unavailable,
+        Ok(_) => match read_bounded_or_empty(&config_path, MAX_CONFIG) { Ok(raw) => raw, Err(_) => return unavailable },
+    };
+    let Ok(raw) = std::str::from_utf8(&raw) else { return unavailable };
+    // `parse_config` reads unparsable TOML as "no section"; the view must not.
+    if raw.parse::<toml::Table>().is_err() { return unavailable; }
+    let service_account = match crate::google_service_account::parse_config(raw, home) {
+        Ok(None) => return json!({ "state": "not_configured" }),
+        Ok(Some(service_account)) => service_account,
+        Err(_) => return unavailable,
+    };
+    let subject = gi::normalize_email(&service_account.subject).ok();
+    let Ok(key) = read_bounded(&service_account.key_file, MAX_KEY_FILE) else {
+        return json!({ "state": "unavailable", "subject": subject });
+    };
+    let Ok(text) = std::str::from_utf8(&key) else { return json!({ "state": "unavailable", "subject": subject }) };
+    if crate::google_service_account::parse_key(text).is_err() {
+        return json!({ "state": "unavailable", "subject": subject });
+    }
+    let Ok(identity) = serde_json::from_str::<KeyIdentity>(text) else {
+        return json!({ "state": "unavailable", "subject": subject });
+    };
+    let key_id = identity.private_key_id.filter(|id| !id.is_empty() && id.len() <= 128
+        && id.bytes().all(|b| b.is_ascii_alphanumeric()));
+    let key_fingerprint = key_id.map(|id| fingerprint("service_account", &[identity.client_email.as_bytes(), id.as_bytes()]));
+    json!({
+        "state": "installed",
+        "client_email": identity.client_email,
+        "subject": subject,
+        "fingerprint": key_fingerprint,
+    })
+}
+
 /// Whether any tenant source material is installed in this home at all
 /// (C3 provision gate for Google SharedTenant routes). The per-employee
 /// subject is decided at use time by [`read`].
