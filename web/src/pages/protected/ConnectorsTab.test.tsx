@@ -28,15 +28,20 @@ function setReadiness(readiness: IsolationReadiness) {
   useSystemStore.setState({ status });
 }
 
+const originalFetchStatus = useSystemStore.getState().fetchStatus;
+
 beforeEach(() => {
   vi.clearAllMocks();
+  // Entering `authenticated` makes the store refetch `system.status`, which
+  // (mocked) answers null and would wipe the readiness seeded below.
+  useSystemStore.setState({ fetchStatus: async () => {} });
   useConnectionStore.setState({ state: 'authenticated' });
   setReadiness({ required: true, ready: true, components, employees: [
     { label: 'sales-team', ready: false, reasons: [{ code: 'connector_setup_required', provider: 'database' }] },
   ] });
 });
 afterEach(() => {
-  useSystemStore.setState({ status: null });
+  useSystemStore.setState({ status: null, fetchStatus: originalFetchStatus });
 });
 
 describe('protected mode — connector accounts tab', () => {

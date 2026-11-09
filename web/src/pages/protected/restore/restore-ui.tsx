@@ -2,18 +2,45 @@
  * Small shared pieces of the restore / adoption screens (v1.81 F5/F6e-UI):
  * status badges, the error notice, bidi-safe text and fixed item lists.
  */
-import { Fragment, type ReactNode } from 'react';
+import { createContext, Fragment, useContext, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle } from 'lucide-react';
 import { Badge } from '@/components/mds';
 import { cn } from '@/lib/utils';
 import { describeRestoreError } from '@/lib/restore-errors';
-import { normalizeRootState, type RootState } from '@/lib/isolation-restore-api';
+import type { RootState } from '@/lib/isolation-restore-api';
 import { isStepUpCancelled } from './with-token';
 
 export function useRestoreT() {
   const intl = useIntl();
   return (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
+}
+
+// ── Step-up wording ─────────────────────────────────────────────────────────
+
+/**
+ * `true` while the five-minute step-up has lapsed (from the list RPC), so an
+ * action button reads 「再驗證身分並…」 as on the boards. Presentation only:
+ * `withToken` still asks the server and opens the dialog when needed.
+ */
+const NeedsVerifyContext = createContext(false);
+export const NeedsVerifyProvider = NeedsVerifyContext.Provider;
+export function useNeedsVerify(): boolean {
+  return useContext(NeedsVerifyContext);
+}
+
+// ── People ──────────────────────────────────────────────────────────────────
+
+/** users.db id → display name (Admin `users.list`). The wire carries ids only. */
+const PeopleContext = createContext<ReadonlyMap<string, string>>(new Map());
+export const RestorePeopleProvider = PeopleContext.Provider;
+
+/** A person's name; a legacy name field as fallback; never an internal id. */
+export function usePersonLabel() {
+  const people = useContext(PeopleContext);
+  const intl = useIntl();
+  return (id: string | null | undefined, fallback?: string | null): string =>
+    (id ? people.get(id) : undefined) || fallback || intl.formatMessage({ id: 'protectedMode.unknownPerson' });
 }
 
 // ── Error notice ────────────────────────────────────────────────────────────
@@ -41,11 +68,13 @@ export function RestoreErrorNotice({ error, className }: { error: unknown; class
 
 // ── Badges ──────────────────────────────────────────────────────────────────
 
-export function RootStateBadge({ state }: { state: RootState | string | undefined }) {
+/** Runtime state (`rootStateOf`): 可還原 / 執行環境已不存在 / 執行環境無法確認 / 待釋放 … */
+export function RootStateBadge({ state }: { state: RootState }) {
   const t = useRestoreT();
-  const s = normalizeRootState(state);
-  const variant = s === 'restorable' ? 'secondary' : s === 'root_gone' ? 'destructive' : 'outline';
-  return <Badge variant={variant}>{t(`restoreFlow.root.${s}`)}</Badge>;
+  const variant = state === 'restorable' ? 'secondary'
+    : state === 'unknown' ? 'destructive'
+      : state === 'root_gone' ? 'outline' : 'ghost';
+  return <Badge variant={variant}>{t(`restoreFlow.root.${state}`)}</Badge>;
 }
 
 const SEALS = ['sealed', 'oversize', 'invalid', 'absent', 'pending'] as const;
@@ -119,7 +148,10 @@ export function BidiSafeText({ text, id, className, label }: { text: string; id?
 // ── Item lists ──────────────────────────────────────────────────────────────
 
 /** Known item keys the gateway may name in `carried` / `sealed` / `lost`. */
-const ITEM_KEYS = ['settings', 'memory', 'wiki', 'files', 'sessions', 'work', 'connections', 'credentials', 'org', 'routes', 'runtime'] as const;
+const ITEM_KEYS = [
+  'settings', 'memory', 'wiki', 'files', 'sessions', 'work', 'connections', 'credentials', 'org', 'routes', 'runtime',
+  'role', 'rules', 'skills', 'models',
+] as const;
 
 export function itemLabelId(key: string): string {
   return (ITEM_KEYS as readonly string[]).includes(key) ? `restoreFlow.item.${key}` : 'restoreFlow.item.other';
@@ -184,6 +216,9 @@ export function ProgressSteps({ steps, current, label }: { steps: string[]; curr
  *  screen uses, so the owner and the Admin read identical words. */
 export const RESTORED_ITEMS = ['settings', 'memory', 'wiki', 'files', 'sessions'];
 export const ADMIN_RESETUP_ITEMS = ['credentials', 'org', 'routes'];
-export const ADOPTION_CARRIED = ['settings', 'memory', 'wiki', 'files'];
-export const ADOPTION_NOT_CARRIED = ['sessions', 'connections', 'credentials', 'runtime'];
+// Boards "Restore" / "Adopt": a take-over carries the role, rules, skills and
+// model/safety settings; memories, history, work, connections and the work
+// folder's files stay sealed (purged after 90 days).
+export const ADOPTION_CARRIED = ['role', 'rules', 'skills', 'models'];
+export const ADOPTION_NOT_CARRIED = ['memory', 'sessions', 'work', 'connections', 'files'];
 export const EARLY_PURGE_LOST = ['settings', 'memory', 'wiki', 'files', 'sessions'];

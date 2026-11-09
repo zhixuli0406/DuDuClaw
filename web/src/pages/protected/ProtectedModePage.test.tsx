@@ -20,12 +20,26 @@ function setStatus(over: Partial<SystemStatus>) {
     gateway_address: 'localhost', ...over } });
 }
 
+/**
+ * RPCs this page itself sends. Entering `authenticated` makes the app stores
+ * refetch `system.status` / `about.get` on their own; those are not the page's.
+ */
+function pageCalls(): string[] {
+  return mockWsClient.call.mock.calls
+    .map((call: unknown[]) => String(call[0]))
+    .filter((method: string) => method === 'users.list' || method.startsWith('isolation.') || method.startsWith('security.'));
+}
+
+const originalFetchStatus = useSystemStore.getState().fetchStatus;
+
 beforeEach(() => {
   vi.clearAllMocks();
+  // Keep the status each test seeds: the store's own refetch must not replace it.
+  useSystemStore.setState({ fetchStatus: async () => {} });
   useConnectionStore.setState({ state: 'authenticated' });
 });
 afterEach(() => {
-  useSystemStore.setState({ status: null });
+  useSystemStore.setState({ status: null, fetchStatus: originalFetchStatus });
 });
 
 describe('ProtectedModePage', () => {
@@ -33,7 +47,7 @@ describe('ProtectedModePage', () => {
     useSystemStore.setState({ status: null });
     renderWithProviders(<ProtectedModePage />);
     expect(screen.getByRole('status')).toHaveTextContent('Loading');
-    expect(mockWsClient.call).not.toHaveBeenCalled();
+    expect(pageCalls()).toEqual([]);
   });
 
   it('explains when the install is not in protected mode and calls nothing', () => {
@@ -41,7 +55,7 @@ describe('ProtectedModePage', () => {
     renderWithProviders(<ProtectedModePage />);
     expect(screen.getByText('Protected mode is not turned on here')).toBeInTheDocument();
     expect(screen.queryByRole('tab')).not.toBeInTheDocument();
-    expect(mockWsClient.call).not.toHaveBeenCalled();
+    expect(pageCalls()).toEqual([]);
   });
 
   it('tells Personal installs that protected mode is Enterprise only', () => {

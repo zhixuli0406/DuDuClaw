@@ -2,6 +2,39 @@ import { createContext, useCallback, useContext, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { formatError } from '@/lib/toast';
 import type { ProtectedConnectorKind } from '@/lib/api';
+import { isNewFeature } from '@/apps/registry';
+import { useSystemStore } from '@/stores/system-store';
+import { Badge } from '@/components/mds';
+
+/** Route of the protected-mode admin page (設定 › 受保護模式). */
+export const PROTECTED_MODE_PATH = '/app/system/protected';
+
+/**
+ * 「1.81 新功能」 chip of the v1.81 boards. Same rule as the sidebar's 新功能
+ * chip (`isNewFeature`): shown while the running version is at or below the
+ * release the screen shipped in.
+ */
+export function NewInBadge({ version }: { version: string }) {
+  const intl = useIntl();
+  const running = useSystemStore((s) => s.status?.version ?? null);
+  if (!isNewFeature(version, running)) return null;
+  const short = version.split('.').slice(0, 2).join('.');
+  return (
+    <Badge className="bg-warning/15 text-warning">
+      {intl.formatMessage({ id: 'protectedMode.newIn' }, { version: short })}
+    </Badge>
+  );
+}
+
+/** Small trail above a v1.81 page title: 「設定 › 受保護模式」 + the 新功能 chip. */
+export function PageTrail({ trail, newIn }: { trail: string; newIn?: string }) {
+  return (
+    <p className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+      <span>{trail}</span>
+      {newIn && <NewInBadge version={newIn} />}
+    </p>
+  );
+}
 
 /** Every string of this page lives under `protectedMode.*`. */
 export function useT() {

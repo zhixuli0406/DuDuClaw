@@ -1,26 +1,26 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useIntl } from 'react-intl';
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Skeleton } from '@/components/mds';
 import {
   daysUntil,
   myIsolationApi,
-  normalizeRootState,
+  rootStateOf,
+  toMillis,
   type RestorableEmployee,
 } from '@/lib/isolation-restore-api';
 import { AdoptFlow } from '@/pages/protected/restore/AdoptFlow';
-import { DaysLeft, RestoreErrorNotice, RootStateBadge, useRestoreT } from '@/pages/protected/restore/restore-ui';
+import { RestoreErrorNotice, RootStateBadge, useRestoreT } from '@/pages/protected/restore/restore-ui';
 import { RestoreRequestForm } from './RestoreRequestForm';
-
-function remainingDays(e: RestorableEmployee): number | null {
-  return typeof e.days_left === 'number' ? Math.max(0, Math.floor(e.days_left)) : daysUntil(e.restore_until);
-}
 
 /**
  * 已註銷的員工 — the caller's own tombstoned Personal employees still in the
- * restore window: ask for a restore (or, when the runtime is gone, a
- * take-over by a new employee), or withdraw a pending request.
+ * restore window (`me.isolation.list_restorable`): ask for a restore (or,
+ * when the runtime is gone, a take-over by a new employee), or withdraw a
+ * pending request. The runtime state comes from `root_flag`.
  */
 export function TombstonedEmployeesCard() {
   const t = useRestoreT();
+  const intl = useIntl();
   const [items, setItems] = useState<RestorableEmployee[] | null>(null);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [open, setOpen] = useState<string | null>(null);
@@ -30,7 +30,7 @@ export function TombstonedEmployeesCard() {
   const load = useCallback(async () => {
     try {
       const res = await myIsolationApi.listRestorable();
-      setItems(Array.isArray(res?.employees) ? res.employees : []);
+      setItems(Array.isArray(res?.restorable) ? res.restorable : []);
       setLoadError(null);
     } catch (e) {
       setLoadError(e);
@@ -69,27 +69,32 @@ export function TombstonedEmployeesCard() {
         {items !== null && items.length === 0 && (
           <p className="text-sm text-muted-foreground">{t('myPersonal.tombstoned.empty')}</p>
         )}
-        <ul className="space-y-3">
+        <ul className="divide-y divide-surface-border">
           {items?.map((e) => {
             const key = `${e.employee_id}:${e.incarnation}`;
-            const days = remainingDays(e);
-            const root = normalizeRootState(e.root_state);
+            const days = daysUntil(e.restore_deadline);
+            const root = rootStateOf(e);
             const gone = root === 'root_gone';
             const pending = e.open_request != null;
             const expanded = open === key;
             const regionId = `restore-region-${e.employee_id}-${e.incarnation}`;
             const name = e.display_name || e.label;
-            const closed = days === 0;
+            // 執行環境無法確認 / window closed: nothing can be asked for now.
+            const blocked = days === 0 || (!gone && root !== 'restorable');
+            const removedMs = toMillis(e.tombstoned_at);
+            const meta = [
+              removedMs != null ? t('myPersonal.tombstoned.removedOn', { date: intl.formatDate(removedMs, { month: 'long', day: 'numeric' }) }) : null,
+              days != null ? t(gone ? 'myPersonal.tombstoned.daysLeftAdopt' : 'myPersonal.tombstoned.daysLeft', { days }) : null,
+            ].filter((part): part is string => part !== null);
             return (
-              <li key={key} className="rounded-lg border border-surface-border p-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-medium" title={name}>{name}</p>
-                    <p className="flex flex-wrap items-center gap-2 text-xs">
-                      <span className="font-mono text-muted-foreground">{e.label}</span>
-                      <RootStateBadge state={root} />
-                      <DaysLeft days={days} />
+              <li key={key} className="py-3 first:pt-0">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <p className="flex flex-wrap items-center gap-2">
+                      <span className="truncate text-sm font-medium" title={name}>{name}</span>
+                      {root !== 'restorable' && <RootStateBadge state={root} />}
                     </p>
+                    {meta.length > 0 && <p className="text-xs text-muted-foreground">{meta.join(' · ')}</p>}
                   </div>
                   <div className="flex flex-wrap gap-2">
                     {pending ? (
@@ -98,18 +103,13 @@ export function TombstonedEmployeesCard() {
                       </Button>
                     ) : (
                       <Button
-                        variant={expanded ? 'secondary' : 'brandSubtle'}
-                        size="sm"
-                        disabled={closed || e.credential_changed === true}
+                        variant={expanded ? 'secondary' : 'brand'}
+                        disabled={blocked}
                         aria-expanded={expanded}
                         aria-controls={regionId}
                         onClick={() => setOpen(expanded ? null : key)}
                       >
-                        {gone
-                          ? t('myPersonal.tombstoned.adopt')
-                          : days == null
-                            ? t('myPersonal.tombstoned.restore')
-                            : t('myPersonal.tombstoned.restoreDays', { days })}
+                        {t(gone ? 'myPersonal.tombstoned.adopt' : 'myPersonal.tombstoned.restore')}
                       </Button>
                     )}
                   </div>
@@ -119,15 +119,16 @@ export function TombstonedEmployeesCard() {
                     {t(e.open_request?.kind === 'adoption' ? 'myPersonal.tombstoned.pendingAdoption' : 'myPersonal.tombstoned.pendingRestore')}
                   </p>
                 )}
-                {e.credential_changed === true && !pending && (
-                  <p className="mt-2 text-sm">{t('restoreFlow.error.CREDENTIAL_CHANGED')}</p>
-                )}
                 {root === 'unknown' && !pending && (
                   <p className="mt-2 text-xs text-muted-foreground">{t('myPersonal.tombstoned.unknownRoot')}</p>
                 )}
                 {rowError?.key === key && <RestoreErrorNotice className="mt-2" error={rowError.error} />}
-                {expanded && !pending && (
-                  <section id={regionId} aria-label={t(gone ? 'myPersonal.tombstoned.adopt' : 'myPersonal.tombstoned.restore')} className="mt-3 border-t border-surface-border pt-3">
+                {expanded && !pending && !blocked && (
+                  <section
+                    id={regionId}
+                    aria-label={t(gone ? 'myPersonal.tombstoned.adopt' : 'myPersonal.tombstoned.restore')}
+                    className="mt-3 rounded-lg bg-muted/40 p-4"
+                  >
                     {gone ? (
                       <AdoptFlow employee={e} onFiled={() => void load()} />
                     ) : (

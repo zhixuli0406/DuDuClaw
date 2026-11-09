@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router';
 import { useIntl } from 'react-intl';
-import { AlertTriangle, Plus, Trash2, UserPlus } from 'lucide-react';
+import { AlertTriangle, ArchiveRestore, Plus, Trash2, UserPlus } from 'lucide-react';
 import {
   api,
   type IsolationReason,
@@ -10,9 +10,22 @@ import {
   type ProtectedEmployeeRequest,
   type ProtectedTombstoneResult,
 } from '@/lib/api';
+import {
+  daysUntil,
+  rootStateOf,
+  toMillis,
+  type IsolationEmployeeList,
+  type QuarantineRow,
+  type RestoreRequestRow,
+} from '@/lib/isolation-restore-api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useStepUpToken } from '@/components/step-up/useStepUpToken';
+import { ADMIN_RESTORE_PATH, QuarantineRowDialogs } from './restore/AdminRestorePage';
+import { rowActions, rowKey, type RowAction } from './restore/QuarantineTable';
+import { NeedsVerifyProvider, RestorePeopleProvider } from './restore/restore-ui';
+import { makeWithToken } from './restore/with-token';
 import {
   Badge,
   Button,
@@ -45,6 +58,9 @@ import {
 
 const APPROVAL_CENTER = '/app/system/migration';
 
+/** `isolation.employee_list` also carries the F6 restore lists (`restores`). */
+type EmployeeListWithRestores = ProtectedEmployeeList & Pick<IsolationEmployeeList, 'restores'>;
+
 type RequestView = 'toPrepare' | 'awaitingApproval' | 'applying' | 'failed' | 'rejected' | 'expired';
 
 function requestView(request: ProtectedEmployeeRequest): RequestView | null {
@@ -73,10 +89,18 @@ export function EmployeesTab() {
   const record = stepUp.record;
   const personName = usePersonName();
   const providerName = useProviderName();
-  const { goTo } = useProtectedPage();
+  const { goTo, people } = useProtectedPage();
   const readiness = useSystemStore((s) => s.status?.isolation_readiness);
   const agents = useAgentsStore((s) => s.agents);
-  const [data, setData] = useState<ProtectedEmployeeList | null>(null);
+  const [data, setData] = useState<EmployeeListWithRestores | null>(null);
+  // Retired rows open the restore screen's own dialogs (part B).
+  const [restoreAction, setRestoreAction] = useState<{ row: QuarantineRow; action: RowAction } | null>(null);
+  const { ensure, dialog: restoreStepUp } = useStepUpToken();
+  const withToken = useMemo(() => makeWithToken(ensure), [ensure]);
+  const names = useMemo(
+    () => new Map([...people].map(([id, person]) => [id, person.name || person.email])),
+    [people],
+  );
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [preparing, setPreparing] = useState<ProtectedEmployeeRequest | null>(null);
@@ -123,6 +147,20 @@ export function EmployeesTab() {
     .filter((row): row is { request: ProtectedEmployeeRequest; view: RequestView } => row.view !== null);
   const closedRequests = requests.filter((row) => row.view === 'rejected' || row.view === 'expired').length;
   const employees = data?.employees ?? [];
+  const restoreRequests: RestoreRequestRow[] = data?.restores?.requests ?? [];
+  const live = new Set(employees.map((employee) => employee.employee_id));
+  const retired: QuarantineRow[] = (data?.restores?.quarantine ?? []).filter((row) => !live.has(row.employee_id));
+  const openCount = requests.filter((row) => row.view === 'toPrepare' || row.view === 'awaitingApproval').length
+    + restoreRequests.length;
+
+  const retiredStatus = (row: QuarantineRow): string => {
+    if (row.purge?.purged_at != null) return t('employees.status.purged');
+    const root = rootStateOf(row);
+    if (root === 'root_gone') return t('employees.status.retiredAdopt');
+    if (root !== 'restorable') return t('employees.status.retired');
+    const days = daysUntil(row.restore_deadline ?? row.purge?.purge_after);
+    return days == null ? t('employees.status.retired') : t('employees.status.retiredDays', { days });
+  };
 
   const reasonText = (reason: IsolationReason): string => {
     switch (reason.code) {
@@ -190,11 +228,18 @@ export function EmployeesTab() {
         <>
           <Card>
             <CardHeader>
-              <CardTitle><h2>{t('requests.title')}</h2></CardTitle>
+              <CardTitle>
+                <h2>
+                  {t('requests.title')}
+                  {openCount > 0 && (
+                    <span className="ml-1 text-sm font-normal text-muted-foreground">{t('requests.openCount', { count: openCount })}</span>
+                  )}
+                </h2>
+              </CardTitle>
               <CardDescription>{t('requests.description')}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              {requests.length === 0 ? (
+              {requests.length === 0 && restoreRequests.length === 0 ? (
                 <Empty variant="dashed" icon={UserPlus} title={t('requests.empty')} description={t('requests.emptyHint')} />
               ) : (
                 <TableBox label={t('requests.title')}>
@@ -234,6 +279,34 @@ export function EmployeesTab() {
                           </TableCell>
                         </TableRow>
                       ))}
+                      {/* F6 restore / take-over requests: decided on the restore screen. */}
+                      {restoreRequests.map((request) => {
+                        const adoption = request.kind === 'adoption';
+                        return (
+                          <TableRow key={`restore:${request.request_id}`}>
+                            <TableCell>{personName(request.owner_user_id ?? request.filed_by)}</TableCell>
+                            <TableCell>
+                              <span dir="auto" className="[unicode-bidi:isolate]">
+                                {t(adoption ? 'requests.adoptName' : 'requests.restoreName', { name: displayName(request.label) })}
+                              </span>
+                            </TableCell>
+                            <TableCell>
+                              {toMillis(request.created_at) != null
+                                ? intl.formatDate(toMillis(request.created_at)!, { dateStyle: 'medium', timeStyle: 'short' }) : ''}
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant={request.owner_unverified ? 'destructive' : 'secondary'}>
+                                {t(request.owner_unverified ? 'requests.status.ownerUnverified' : 'requests.status.secondAdmin')}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <Link to={ADMIN_RESTORE_PATH} className="text-sm underline">
+                                {t(adoption ? 'requests.decideAdoption' : 'requests.decideRestore')}
+                              </Link>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
                     </TableBody>
                   </Table>
                 </TableBox>
@@ -254,13 +327,20 @@ export function EmployeesTab() {
               <CardDescription>{t('employees.description')}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              <div className="flex flex-wrap justify-end gap-2">
-                <Button variant="outline" size="sm" onClick={() => setCreating(true)}>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <Link
+                  to={ADMIN_RESTORE_PATH}
+                  className="inline-flex h-7 items-center gap-1 rounded-lg px-2.5 text-[0.8rem] font-medium underline-offset-4 hover:underline"
+                >
+                  <ArchiveRestore className="size-4" aria-hidden="true" />
+                  {t('employees.openRestore')}
+                </Link>
+                <Button variant="brand" size="sm" onClick={() => setCreating(true)}>
                   <Plus aria-hidden="true" />
                   {t('employees.addShared')}
                 </Button>
               </div>
-              {employees.length === 0 ? (
+              {employees.length === 0 && retired.length === 0 ? (
                 <Empty variant="dashed" title={t('employees.empty')} description={t('employees.emptyHint')} />
               ) : (
                 <TableBox label={t('employees.title')}>
@@ -314,6 +394,49 @@ export function EmployeesTab() {
                           </TableRow>
                         );
                       })}
+                      {/* Retired (tombstoned) employees: same actions as the restore screen. */}
+                      {retired.map((row) => {
+                        const actions = rowActions(row);
+                        const adopt = rootStateOf(row) === 'root_gone';
+                        const name = displayName(row.label);
+                        return (
+                          <TableRow key={`retired:${rowKey(row)}`}>
+                            <TableCell>
+                              <span dir="auto" className="text-muted-foreground [unicode-bidi:isolate]">{name}</span>
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="outline">{t(row.kind === 'personal' ? 'type.personal' : 'type.shared')}</Badge>
+                            </TableCell>
+                            <TableCell>
+                              {row.kind === 'personal' ? personName(row.owner_user_id) : <><span aria-hidden="true">—</span><span className="sr-only">{t('none')}</span></>}
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="ghost">{retiredStatus(row)}</Badge>
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {actions.map((action) => {
+                                  const label = intl.formatMessage({ id: `restoreFlow.action.${action}${adopt && (action === 'shared_restore' || action === 'file_for_owner') ? 'Adopt' : ''}` });
+                                  return (
+                                    <Button
+                                      key={action}
+                                      size="sm"
+                                      variant={action === 'retire' || action === 'shared_restore' || action === 'file_for_owner' ? 'outline' : 'destructive'}
+                                      aria-label={intl.formatMessage({ id: 'restoreFlow.action.forRow' }, { action: label, name })}
+                                      onClick={() => setRestoreAction({ row, action })}
+                                    >
+                                      {label}
+                                    </Button>
+                                  );
+                                })}
+                                <Link to={ADMIN_RESTORE_PATH} className="text-sm underline" aria-label={t('employees.viewRetiredNamed', { name })}>
+                                  {t('employees.viewRetired')}
+                                </Link>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
                     </TableBody>
                   </Table>
                 </TableBox>
@@ -322,6 +445,18 @@ export function EmployeesTab() {
           </Card>
         </>
       )}
+
+      <RestorePeopleProvider value={names}>
+        <NeedsVerifyProvider value={!stepUp.status.valid}>
+          <QuarantineRowDialogs
+            active={restoreAction}
+            onClose={() => setRestoreAction(null)}
+            withToken={withToken}
+            onDone={() => void load()}
+          />
+        </NeedsVerifyProvider>
+      </RestorePeopleProvider>
+      {restoreStepUp}
 
       {preparing && (
         <StepUpDialog
@@ -428,12 +563,13 @@ export function EmployeesTab() {
             await load();
           }}
         >
-          <ul className="list-disc space-y-1.5 pl-5 text-sm">
-            <li>{t('retire.quarantine')}</li>
-            <li>{t('retire.restorable')}</li>
-            <li>{t('retire.labelReserved', { label: retiring.label })}</li>
-            <li>{t('retire.connectors')}</li>
-          </ul>
+          {/* Board "Main": what happens, then a note on restorability and the reserved name. */}
+          <p className="text-sm leading-relaxed">{t('retire.quarantine')}</p>
+          <div className="space-y-1 rounded-lg bg-muted/60 px-3 py-2 text-sm">
+            <p>{t('retire.restorable')}</p>
+            <p>{t('retire.labelReserved', { label: retiring.label })}</p>
+          </div>
+          <p className="text-sm text-muted-foreground">{t('retire.connectors')}</p>
         </StepUpDialog>
       )}
     </div>

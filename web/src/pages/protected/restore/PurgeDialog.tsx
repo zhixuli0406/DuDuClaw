@@ -1,4 +1,5 @@
 import { useEffect, useId, useState } from 'react';
+import { useIntl } from 'react-intl';
 import { CheckCircle2 } from 'lucide-react';
 import {
   Button,
@@ -9,9 +10,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/mds';
-import { adminRestoreApi, type PurgeReply, type QuarantineRow } from '@/lib/isolation-restore-api';
+import { adminRestoreApi, toMillis, type PurgeReply, type QuarantineRow } from '@/lib/isolation-restore-api';
 import { errorCode } from '@/lib/restore-errors';
-import { EARLY_PURGE_LOST, ItemList, RestoreErrorNotice, useRestoreT } from './restore-ui';
+import { EARLY_PURGE_LOST, ItemList, RestoreErrorNotice, useNeedsVerify, useRestoreT } from './restore-ui';
 import { isStepUpCancelled, type WithToken } from './with-token';
 
 export type PurgeMode = 'ordinary' | 'early' | 'confirm_early';
@@ -40,6 +41,8 @@ export function PurgeDialog({
   onDone: () => void;
 }) {
   const t = useRestoreT();
+  const intl = useIntl();
+  const needsVerify = useNeedsVerify();
   const ackId = useId();
   const retireId = useId();
   const [ack, setAck] = useState(false);
@@ -88,13 +91,20 @@ export function PurgeDialog({
   };
 
   const title = t(`restoreFlow.purge.${mode}.title`, { name });
+  // Board "Restore": an early purge says until when the data would have been kept.
+  const keptUntilMs = early ? toMillis(row.purge?.purge_after ?? row.restore_deadline ?? null) : null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90svh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>{t(`restoreFlow.purge.${mode}.desc`)}</DialogDescription>
+          <DialogDescription>
+            {t(`restoreFlow.purge.${mode}.desc`)}
+            {keptUntilMs != null && (
+              <> {t('restoreFlow.purge.keptUntil', { date: intl.formatDate(keptUntilMs, { dateStyle: 'medium' }) })}</>
+            )}
+          </DialogDescription>
         </DialogHeader>
 
         {reply ? (
@@ -114,7 +124,7 @@ export function PurgeDialog({
                 <p className="text-sm">{t('restoreFlow.purge.noUndo')}</p>
               </section>
             )}
-            {mode === 'early' && <p className="text-sm">{t('restoreFlow.purge.secondAdmin')}</p>}
+            {mode === 'early' && <p className="rounded-lg bg-muted/60 px-3 py-2 text-sm">{t('restoreFlow.purge.secondAdmin')}</p>}
             {mode === 'ordinary' && (
               <label htmlFor={retireId} className="flex items-start gap-2 text-sm">
                 <input id={retireId} type="checkbox" className="mt-0.5 size-4 accent-primary" checked={retire}
@@ -139,7 +149,7 @@ export function PurgeDialog({
           </Button>
           {!reply && (
             <Button variant="destructive" disabled={busy || !ack} onClick={() => void submit()}>
-              {busy ? t('restoreFlow.common.sending') : t(`restoreFlow.purge.${mode}.submit`)}
+              {busy ? t('restoreFlow.common.sending') : t(`restoreFlow.purge.${mode}.submit${needsVerify ? 'Verify' : ''}`)}
             </Button>
           )}
         </DialogFooter>

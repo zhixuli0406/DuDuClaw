@@ -22,13 +22,17 @@ const components: IsolationReadiness['components'] = {
   parse_worker: 'ready', update_service: 'ready', mcp_boundary: 'ready', runtime_adapters: 'ready',
 };
 
+const originalFetchStatus = useSystemStore.getState().fetchStatus;
+
 beforeEach(() => {
   vi.clearAllMocks();
+  // Entering `authenticated` makes the store refetch `system.status`; keep the seeded readiness.
+  useSystemStore.setState({ fetchStatus: async () => {} });
   useConnectionStore.setState({ state: 'authenticated' });
   setReadiness({ required: true, ready: true, components });
 });
 afterEach(() => {
-  useSystemStore.setState({ status: null });
+  useSystemStore.setState({ status: null, fetchStatus: originalFetchStatus });
 });
 
 describe('protected mode — AI employees tab', () => {
@@ -78,7 +82,8 @@ describe('protected mode — AI employees tab', () => {
     expect(await screen.findByText('1 AI employees need attention')).toBeInTheDocument();
     expect(screen.getByText(/The Google connector is not set up yet\./)).toBeInTheDocument();
     expect(screen.getByText(/has not signed in on this computer yet/)).toBeInTheDocument();
-    expect(screen.getByText('Needs attention')).toBeInTheDocument();
+    // The banner comes from readiness at once; the row badge waits for the list.
+    expect(await screen.findByText('Needs attention')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Finish setup' }));
     expect(goTo).toHaveBeenCalledWith('connectors', { employee: 'alice-helper', provider: 'google' });
   });

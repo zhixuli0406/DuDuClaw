@@ -10,7 +10,7 @@ import {
   DialogTitle,
 } from '@/components/mds';
 import { adminRestoreApi, type QuarantineRow } from '@/lib/isolation-restore-api';
-import { RestoreErrorNotice, useRestoreT } from './restore-ui';
+import { RestoreErrorNotice, useNeedsVerify, useRestoreT } from './restore-ui';
 import { isStepUpCancelled, type WithToken } from './with-token';
 
 /** 釋放執行環境 — after a purge, release the employee's runtime on the host.
@@ -29,6 +29,7 @@ export function RetireDialog({
   onDone: () => void;
 }) {
   const t = useRestoreT();
+  const needsVerify = useNeedsVerify();
   const ackId = useId();
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -69,6 +70,7 @@ export function RetireDialog({
           <DialogDescription>{t('restoreFlow.retire.desc')}</DialogDescription>
         </DialogHeader>
         <p className="text-sm">{t('restoreFlow.retire.neverReused')}</p>
+        <p className="rounded-lg bg-muted/60 px-3 py-2 text-sm">{t('restoreFlow.retire.note')}</p>
         {sent ? (
           <p role="status" className="flex items-start gap-2 text-sm">
             <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
@@ -89,7 +91,7 @@ export function RetireDialog({
           </Button>
           {!sent && (
             <Button variant="destructive" disabled={busy || !ack} onClick={() => void submit()}>
-              {busy ? t('restoreFlow.common.sending') : t('restoreFlow.retire.submit')}
+              {busy ? t('restoreFlow.common.sending') : t(needsVerify ? 'restoreFlow.retire.submitVerify' : 'restoreFlow.retire.submit')}
             </Button>
           )}
         </DialogFooter>

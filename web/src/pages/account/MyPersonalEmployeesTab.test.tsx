@@ -18,8 +18,13 @@ const applied: PersonalEmployeeRequest = {
   request_id: 'r1', label: 'alice-helper', display_name: 'Alice Helper',
   created_at: '2026-11-01T00:00:00Z', status: 'applied', stage: 'proposed',
 };
+const DAY = 86_400_000;
+// `me.isolation.list_restorable` row (backend contract field names).
 const restorable: RestorableEmployee[] = [
-  { employee_id: 'e1', incarnation: 2, label: 'old-helper', display_name: 'Old Helper', root_state: 'restorable', days_left: 12, open_request: null },
+  { employee_id: 'e1', incarnation: 2, label: 'old-helper', display_name: 'Old Helper', kind: 'personal',
+    owner_user_id: 'u1', seal: 'sealed', restorable: true, root_flag: null, open_request: null,
+    tombstoned_at: new Date(Date.now() - 3 * DAY).toISOString(),
+    restore_deadline: new Date(Date.now() + 12 * DAY - 60_000).toISOString() },
 ];
 
 interface World {
@@ -35,7 +40,7 @@ function serve() {
   mockWsClient.call.mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
     switch (method) {
       case 'me.isolation.list_personal_employee_requests': return { requests: world.requests };
-      case 'me.isolation.list_restorable': return { employees: world.employees };
+      case 'me.isolation.list_restorable': return { restorable: world.employees };
       case 'me.isolation.list_personal_delegations': return { delegations: world.delegations };
       case 'me.isolation.decide_personal_delegation': return { id: params.id, decided: params.approve ? 'approved' : 'denied' };
       case 'me.isolation.restore_challenge': return typeof world.challenge === 'function' ? world.challenge() : world.challenge;
@@ -57,14 +62,16 @@ beforeEach(() => {
     requests: [applied],
     employees: restorable,
     challenge: { factor: 'totp', challenge_id: 'c1' },
-    requestRestore: () => ({ request_id: 'rr1', state: 'pending' }),
+    requestRestore: () => ({ request_id: 'rr1', state: 'pending', label: 'old-helper', expires_at: null, approval_required: true, notified: 2 }),
     delegations: [{ id: 'd1', task: LONG_TASK, source_agent: 'alice-helper', target_agent: 'sales-shared', created_at: 1762600000, expires_at: 1762700000 }],
   };
   serve();
 });
 
 async function openRestore(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(await screen.findByRole('button', { name: 'Ask to restore (12 days left)' }));
+  // Board "Mine": the days left sit in the row's meta line, the button says 申請還原.
+  expect(await screen.findByText(/12 days left to ask for a restore/)).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Ask to restore' }));
 }
 
 describe('我的個人 AI 員工 tab', () => {

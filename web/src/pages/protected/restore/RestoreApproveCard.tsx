@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { CheckCircle2, Info } from 'lucide-react';
 import { Badge, Button, Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/mds';
+import { useAuthStore } from '@/stores/auth-store';
 import {
   adminRestoreApi,
   toMillis,
@@ -17,6 +18,8 @@ import {
   RESTORED_ITEMS,
   RestoreErrorNotice,
   TwoLists,
+  useNeedsVerify,
+  usePersonLabel,
   useRestoreT,
 } from './restore-ui';
 import { RegrantList } from './RegrantList';
@@ -26,13 +29,16 @@ export type ApproveState = 'ready' | 'second_admin' | 'sole_admin_self' | 'cooli
 
 /**
  * Who may approve: never the Admin who filed it, unless they are the only
- * Admin — then it is a recorded self-approval, and only after the 7-day
- * cooling period. A request filed for an owner who did not confirm with a
- * second factor always needs a different Admin.
+ * Admin — then the server marks the row `self_approved` and it is a recorded
+ * self-approval, which waits out a 7-day cooling period. A request filed for
+ * an owner who did not confirm with a second factor always needs a different
+ * Admin. "Mine" is `filed_by` = the signed-in user (`filed_by_me` from an
+ * older build is still honoured). The server re-checks every rule.
  */
-export function approveState(req: RestoreRequestRow, now = Date.now()): ApproveState {
-  const mine = req.filed_by_me === true;
-  if (mine && req.sole_admin && !req.owner_unverified) {
+export function approveState(req: RestoreRequestRow, now = Date.now(), me?: string | null): ApproveState {
+  const mine = req.filed_by_me === true || (me != null && req.filed_by != null && req.filed_by === me);
+  const self = req.self_approved === true || (mine && req.sole_admin === true);
+  if (self && !req.owner_unverified) {
     const until = toMillis(req.cooling_until ?? null);
     return until != null && until > now ? 'cooling' : 'sole_admin_self';
   }
@@ -60,11 +66,15 @@ export function RestoreApproveCard({
 }) {
   const t = useRestoreT();
   const intl = useIntl();
+  const person = usePersonLabel();
+  const needsVerify = useNeedsVerify();
+  const me = useAuthStore((s) => s.user?.id ?? null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [reply, setReply] = useState<RestoreApproveReply | null>(null);
   const [denied, setDenied] = useState(false);
-  const state = approveState(request);
+  const state = approveState(request, Date.now(), me);
+  const mine = request.filed_by_me === true || (me != null && request.filed_by === me);
   const name = request.display_name || request.label;
   const adoption = request.kind === 'adoption';
   const shared = request.employee_kind === 'shared';
@@ -109,8 +119,8 @@ export function RestoreApproveCard({
         </CardTitle>
         <CardDescription>
           {request.filed_by_admin
-            ? t('restoreFlow.approve.filedByAdmin', { who: request.filed_by_name || request.filed_by || '' })
-            : t('restoreFlow.approve.filedByOwner', { who: request.filed_by_name || request.filed_by || '' })}
+            ? t('restoreFlow.approve.filedByAdmin', { who: person(request.filed_by, request.filed_by_name) })
+            : t('restoreFlow.approve.filedByOwner', { who: person(request.filed_by ?? request.owner_user_id, request.filed_by_name) })}
           {request.created_at != null && toMillis(request.created_at) != null && (
             <> · {intl.formatDate(toMillis(request.created_at)!, { dateStyle: 'medium', timeStyle: 'short' })}</>
           )}
@@ -155,24 +165,34 @@ export function RestoreApproveCard({
           </section>
         )}
 
-        {request.owner_unverified && (
-          <p className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/5 px-3 py-2 text-sm">
-            <Info className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
-            {t(request.filed_by_me ? 'restoreFlow.approve.ownerUnverifiedMine' : 'restoreFlow.approve.ownerUnverifiedOther')}
-          </p>
+        {request.failure && !reply && (
+          <div className="space-y-1">
+            <p className="text-sm font-medium">{t('restoreFlow.approve.failed')}</p>
+            <RestoreErrorNotice error={request.failure} />
+          </div>
         )}
-        {!request.owner_unverified && state === 'second_admin' && (
-          <p className="text-sm">{t('restoreFlow.approve.secondAdmin')}</p>
-        )}
-        {state === 'sole_admin_self' && (
-          <p className="rounded-lg border border-warning/30 bg-warning/5 px-3 py-2 text-sm">{t('restoreFlow.approve.soleAdmin')}</p>
-        )}
-        {state === 'cooling' && (
-          <p className="text-sm">
-            {t('restoreFlow.approve.cooling', {
-              date: coolingMs != null ? intl.formatDate(coolingMs, { dateStyle: 'medium', timeStyle: 'short' }) : '',
-            })}
-          </p>
+
+        {/* Board "Restore": one note per approve state (second admin / sole admin / cooling). */}
+        {!reply && !denied && (
+          request.owner_unverified ? (
+            <p className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/5 px-3 py-2 text-sm">
+              <Info className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+              {t(mine ? 'restoreFlow.approve.ownerUnverifiedMine' : 'restoreFlow.approve.ownerUnverifiedOther')}
+            </p>
+          ) : state === 'second_admin' ? (
+            <p className="text-sm">{t('restoreFlow.approve.secondAdmin')}</p>
+          ) : (
+            <p className="rounded-lg border border-warning/30 bg-warning/5 px-3 py-2 text-sm">
+              {state === 'ready' && t(adoption ? 'restoreFlow.approve.readyAdopt' : 'restoreFlow.approve.ready')}
+              {state === 'sole_admin_self' && t('restoreFlow.approve.soleAdmin')}
+              {state === 'cooling' && t('restoreFlow.approve.cooling')}
+              {state === 'cooling' && coolingMs != null && (
+                <> {t('restoreFlow.approve.coolingUntil', {
+                  date: intl.formatDate(coolingMs, { dateStyle: 'medium', timeStyle: 'short' }),
+                })}</>
+              )}
+            </p>
+          )
         )}
 
         <RestoreErrorNotice error={error} />
@@ -190,6 +210,9 @@ export function RestoreApproveCard({
               {shared && reply.members && <li>{t('restoreFlow.result.members', { count: reply.members.length })}</li>}
               {shared && count(reply.routes_reapproved) > 0 && (
                 <li>{t('restoreFlow.result.routesReapproved', { count: count(reply.routes_reapproved) })}</li>
+              )}
+              {shared && count(reply.members_notified) > 0 && (
+                <li>{t('restoreFlow.result.membersNotified', { count: count(reply.members_notified) })}</li>
               )}
             </ul>
             {shared && reply.members_dropped && reply.members_dropped.length > 0 && (
@@ -219,7 +242,7 @@ export function RestoreApproveCard({
 
       {!reply && !denied && (
         <CardFooter className="flex flex-wrap justify-end gap-2">
-          {request.filed_by_me && (
+          {mine && (
             <Button variant="ghost" disabled={busy} onClick={() => void withdraw()}>{t('restoreFlow.approve.withdraw')}</Button>
           )}
           <Button variant="outline" disabled={busy} onClick={() => void deny()}>{t('restoreFlow.approve.deny')}</Button>
@@ -228,7 +251,9 @@ export function RestoreApproveCard({
             disabled={busy || state === 'second_admin' || state === 'cooling'}
             onClick={() => void approve()}
           >
-            {busy ? t('restoreFlow.common.sending') : t(state === 'sole_admin_self' ? 'restoreFlow.approve.selfApprove' : 'restoreFlow.approve.approve')}
+            {/* A sole Admin's own request (cooling or not) is always a self-approval. */}
+            {busy ? t('restoreFlow.common.sending') : t(`restoreFlow.approve.${
+              state === 'sole_admin_self' || state === 'cooling' ? 'selfApprove' : 'approve'}${needsVerify ? 'Verify' : ''}`)}
           </Button>
         </CardFooter>
       )}

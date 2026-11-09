@@ -7,9 +7,20 @@
  * token as `csrf_token` (see `lib/step-up.ts`). Errors are `{ code, message }`
  * (or a plain zh-TW string from older handlers) — see `lib/restore-errors.ts`.
  *
- * Wire shapes below follow the F5/F6e owner-approved design. Fields marked
- * optional are tolerated as absent so an older gateway degrades to "unknown"
- * rather than crashing a screen.
+ * CONTRACT SOURCE. The restore handlers (`isolation_restore_rpc.rs`,
+ * `handlers/isolation_employee_restore.rs`) are NOT in this tree; the shapes
+ * below follow the backend implementation reports for v1.81 F6:
+ *   - `me.isolation.list_restorable` → `{ restorable: RestorableEmployee[] }`
+ *   - `me.isolation.request_restore` → `RestoreFiled`
+ *   - `isolation.employee_restore_decide` → `RestoreApproveReply`
+ *   - `isolation.employee_list` → `.restores` (`IsolationEmployeeList`)
+ *   - `isolation.quarantine_purge` → `PurgeReply` / refusal
+ *     `EARLY_PURGE_CONFIRM_REQUIRED`
+ * The runtime state comes from `root_flag` (`rootStateOf`), never from
+ * invented `root_state` strings. Every field the reports do not name is
+ * marked `NOT IN CONTRACT` below: it is read only when present and the
+ * screens work without it. `RestoreChallenge` is the one shape the reports
+ * describe only in prose — keep it here (one file) when the handler lands.
  */
 import { client } from './ws-client';
 import type { StepUpToken } from './step-up';
@@ -37,45 +48,90 @@ export function daysUntil(deadline: WireTime | null | undefined, now = Date.now(
 // ── Shared vocabulary ────────────────────────────────────────────────────────
 
 export type EmployeeKind = 'personal' | 'shared';
-/** 可還原 / 執行環境已不存在 / 無法確認 / 待釋放 */
-export type RootState = 'restorable' | 'root_gone' | 'unknown' | 'pending_release';
 /** Quarantine row seal (`isolation_lifecycle::TombstoneOutcome::seal`). */
 export type SealState = 'sealed' | 'oversize' | 'invalid' | 'absent' | 'pending';
 export type ProofFactor = 'passkey' | 'totp' | 'email';
 export type AccessLevel = 'owner' | 'operator' | 'viewer';
 export const ACCESS_LEVELS: readonly AccessLevel[] = ['owner', 'operator', 'viewer'];
 
-export function normalizeRootState(value: unknown): RootState {
-  const v = typeof value === 'string' ? value.toLowerCase() : '';
-  return v === 'restorable' || v === 'root_gone' || v === 'pending_release' ? v : 'unknown';
+/** Backend runtime flag: `null` means the employee's runtime is intact. */
+export type RootFlag = 'ROOT_GONE' | 'ROOT_RETIRED' | 'ROOT_INCONSISTENT';
+
+/**
+ * What the screens say about the runtime (執行環境), derived from real fields:
+ * - `restorable` 可還原 — no `root_flag`, data kept, still `restorable`
+ * - `root_gone` 執行環境已不存在 — `ROOT_GONE` (only a take-over is possible)
+ * - `unknown` 執行環境無法確認 — `ROOT_INCONSISTENT`, or a flag we do not know
+ * - `pending_release` 待釋放 — data purged, runtime not released yet
+ * - `retired` 已釋放 — `ROOT_RETIRED`
+ * - `closed` 已無法還原 — no flag, but the server says `restorable: false`
+ */
+export type RootState = 'restorable' | 'root_gone' | 'unknown' | 'pending_release' | 'retired' | 'closed';
+
+export function rootStateOf(row: {
+  root_flag?: RootFlag | string | null;
+  restorable?: boolean;
+  purge?: { purged_at?: WireTime | null } | null;
+}): RootState {
+  const flag = row.root_flag ?? null;
+  if (flag === 'ROOT_RETIRED') return 'retired';
+  if (flag === 'ROOT_GONE') return 'root_gone';
+  if (flag !== null) return 'unknown';
+  if (row.purge?.purged_at != null) return 'pending_release';
+  return row.restorable === false ? 'closed' : 'restorable';
 }
 
 export interface OpenRequest {
-  request_id?: string;
   kind: 'restore' | 'adoption';
   filed_by_admin?: boolean;
   owner_unverified?: boolean;
+  /** NOT IN CONTRACT. */
+  request_id?: string;
+  /** NOT IN CONTRACT. */
   created_at?: WireTime;
 }
 
 // ── Staff (me.isolation.*) ───────────────────────────────────────────────────
 
+/** One row of `me.isolation.list_restorable` → `{ restorable: [...] }`. */
 export interface RestorableEmployee {
   employee_id: string;
   incarnation: number;
   label: string;
-  display_name?: string;
   kind?: EmployeeKind;
+  owner_user_id?: string;
+  seal?: SealState | string;
   tombstoned_at?: WireTime;
   /** End of the restore window. */
-  restore_until?: WireTime;
-  days_left?: number;
-  root_state?: RootState | string;
+  restore_deadline?: WireTime | null;
+  /** The server would accept a restore (window open, data sealed, no block). */
+  restorable?: boolean;
+  /** Opaque backend state; the screens read `root_flag`. */
+  root_state?: string;
+  root_flag?: RootFlag | string | null;
   open_request?: OpenRequest | null;
-  /** A credential the owner did not change was changed by someone else. */
-  credential_changed?: boolean;
+  admin_may_file_for_owner?: boolean;
+  /** NOT IN CONTRACT: shown instead of `label` when a gateway sends it. */
+  display_name?: string;
 }
 
+/** `me.isolation.request_restore` / `request_adoption` reply. */
+export interface RestoreFiled {
+  request_id: string;
+  state: string;
+  label?: string;
+  /** The request lapses if no Admin decides by then. */
+  expires_at?: WireTime | null;
+  approval_required?: boolean;
+  /** Admins told about the request (count, or `true`). */
+  notified?: number | boolean;
+}
+
+/**
+ * ASSUMED SHAPE (handler not in this tree): the challenge for the owner's
+ * strongest factor at tombstone time — passkey WebAuthn options, an email
+ * code sent, or the authenticator app.
+ */
 export interface RestoreChallenge {
   /** The strongest factor the owner had before the tombstone. `none`: no
    *  second factor existed; `changed`: it was changed after the tombstone. */
@@ -135,21 +191,19 @@ const withProof = (base: Record<string, unknown>, proof: RestoreProof) => ({
 
 export const myIsolationApi = {
   listRestorable: () =>
-    client.call('me.isolation.list_restorable', {}) as Promise<{ employees: RestorableEmployee[] }>,
+    client.call('me.isolation.list_restorable', {}) as Promise<{ restorable: RestorableEmployee[] }>,
   restoreChallenge: (employee_id: string, incarnation: number, forAdoption = false) =>
     client.call('me.isolation.restore_challenge', {
       employee_id, incarnation, ...(forAdoption ? { for_adoption: true } : {}),
     }) as Promise<RestoreChallenge>,
   requestRestore: (employee_id: string, incarnation: number, proof: RestoreProof) =>
-    client.call('me.isolation.request_restore', withProof({ employee_id, incarnation }, proof)) as Promise<{
-      request_id?: string; state?: string;
-    }>,
+    client.call('me.isolation.request_restore', withProof({ employee_id, incarnation }, proof)) as Promise<RestoreFiled>,
   cancelRestore: (employee_id: string, incarnation: number) =>
     client.call('me.isolation.cancel_restore', { employee_id, incarnation }) as Promise<{ cancelled?: boolean }>,
   requestAdoption: (employee_id: string, incarnation: number, proof: RestoreProof, targetLabel?: string) =>
     client.call('me.isolation.request_adoption', withProof({
       employee_id, incarnation, ...(targetLabel ? { target_label: targetLabel } : {}),
-    }, proof)) as Promise<{ request_id?: string; state?: string; target_label?: string }>,
+    }, proof)) as Promise<RestoreFiled & { target_label?: string }>,
   requestPersonalEmployee: (label: string, display_name: string) =>
     client.call('me.isolation.request_personal_employee', { label, display_name }) as Promise<PersonalEmployeeRequest & {
       approval_required: boolean;
@@ -172,27 +226,34 @@ export interface PurgeBlock {
   purge_after?: WireTime | null;
   /** Early purge allowed (with a second Admin). */
   early?: boolean;
-  /** An early purge is waiting for a second Admin. */
+  /** An early purge is waiting for a second Admin. `by_me` / `lost` are NOT IN CONTRACT. */
   early_purge?: { requested_by?: string; requested_at?: WireTime; by_me?: boolean; lost?: string[] } | null;
   purged_at?: WireTime | null;
 }
 
+/** One row of `isolation.employee_list` → `restores.quarantine`. */
 export interface QuarantineRow {
   employee_id: string;
   incarnation: number;
   label: string;
-  display_name?: string;
   kind: EmployeeKind;
   owner_user_id?: string;
-  owner_name?: string;
   seal: SealState | string;
-  root_state: RootState | string;
   tombstoned_at?: WireTime;
+  restore_deadline?: WireTime | null;
+  restorable?: boolean;
+  /** Opaque backend state; the screens read `root_flag` (`rootStateOf`). */
+  root_state?: string;
+  root_flag?: RootFlag | string | null;
   purge: PurgeBlock;
   /** The owner had no second factor: an Admin may file for them. */
   admin_may_file_for_owner?: boolean;
   open_request?: OpenRequest | null;
-  /** Retire (release the runtime) already proposed. */
+  /** NOT IN CONTRACT: shown instead of `label` when present. */
+  display_name?: string;
+  /** NOT IN CONTRACT: the screens look `owner_user_id` up in the member list. */
+  owner_name?: string;
+  /** NOT IN CONTRACT: retire (release the runtime) already proposed. */
   retire_proposed?: boolean;
 }
 
@@ -210,33 +271,42 @@ export interface RestoreRoute {
   label?: string;
 }
 
+/** One row of `isolation.employee_list` → `restores.requests`. */
 export interface RestoreRequestRow {
   request_id: string;
   employee_id: string;
   incarnation: number;
   label: string;
-  display_name?: string;
   employee_kind: EmployeeKind;
   kind: 'restore' | 'adoption';
-  target_label?: string;
+  owner_user_id?: string;
+  /** users.db id of whoever filed it (owner, or the Admin for the owner). */
   filed_by?: string;
-  filed_by_name?: string;
-  /** Filed by the signed-in Admin. */
-  filed_by_me?: boolean;
   filed_by_admin?: boolean;
   /** The owner did not confirm with a second factor. */
   owner_unverified?: boolean;
-  /** A decision on this request would be the sole Admin approving their own filing. */
+  /** Approving it would be the sole Admin approving their own filing. */
   self_approved?: boolean;
-  /** This installation has a single Admin. */
-  sole_admin?: boolean;
-  /** Self-approval waits until this time (7-day cooling). */
-  cooling_until?: WireTime | null;
+  /** Why an earlier approval could not finish (an error code), if it failed. */
+  failure?: string | null;
   created_at?: WireTime;
-  status?: string;
+  expires_at?: WireTime | null;
+  state?: string;
+  target_label?: string;
+  /** NOT IN CONTRACT: shown instead of `label` when present. */
+  display_name?: string;
+  /** NOT IN CONTRACT: the screens look `filed_by` up in the member list. */
+  filed_by_name?: string;
+  /** NOT IN CONTRACT: the screens compare `filed_by` with the signed-in user. */
+  filed_by_me?: boolean;
+  /** NOT IN CONTRACT: `self_approved` already says the filer is the sole Admin. */
+  sole_admin?: boolean;
+  /** NOT IN CONTRACT: the server refuses with `SELF_APPROVAL_COOLING` instead. */
+  cooling_until?: WireTime | null;
+  /** NOT IN CONTRACT (Shared): snapshot members / routes chosen when filing. */
   members?: RestoreMember[];
   routes?: RestoreRoute[];
-  /** Adoption: what goes over to the new employee / stays sealed. */
+  /** NOT IN CONTRACT (adoption): what goes over / stays sealed. */
   carried?: string[];
   sealed?: string[];
 }
@@ -261,6 +331,7 @@ export interface IsolationEmployeeList {
   };
 }
 
+/** `isolation.employee_restore_decide` (approve) reply: `state: "done"`. */
 export interface RestoreApproveReply {
   state?: string;
   incarnation?: number;
@@ -268,9 +339,11 @@ export interface RestoreApproveReply {
   label_state?: { regrant?: RegrantEntry[]; skipped?: RegrantEntry[]; listed?: RegrantEntry[] };
   work_paused?: boolean | number;
   routes_need_provisioning?: boolean | number | RegrantEntry[];
+  // Shared employees only:
   members?: RestoreMember[];
   members_dropped?: Array<string | { user_id: string; name?: string; reason?: string }>;
   routes_reapproved?: number | RestoreRoute[];
+  members_notified?: number | unknown[];
 }
 
 export interface SharedRestoreOptions {
@@ -285,6 +358,9 @@ export interface SharedRestoreOptions {
   routes: Array<RestoreRoute & { provider: string; kind: string }>;
 }
 
+/** `isolation.quarantine_purge`: done, or an early purge waiting for a second
+ *  Admin (with what will be `lost`). Without `confirm_early` an early purge is
+ *  refused with `EARLY_PURGE_CONFIRM_REQUIRED`. */
 export interface PurgeReply {
   state: 'purged' | 'requested';
   lost?: string[];

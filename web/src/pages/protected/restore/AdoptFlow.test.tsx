@@ -6,8 +6,10 @@ import { renderWithProviders } from '@/test/render';
 import type { RestorableEmployee } from '@/lib/isolation-restore-api';
 import { AdoptFlow } from './AdoptFlow';
 
+// `me.isolation.list_restorable` row whose runtime is gone (`root_flag: ROOT_GONE`).
 const GONE: RestorableEmployee = {
-  employee_id: 'e2', incarnation: 1, label: 'gone-helper', display_name: 'Gone Helper', root_state: 'root_gone', days_left: 30,
+  employee_id: 'e2', incarnation: 1, label: 'gone-helper', display_name: 'Gone Helper', kind: 'personal',
+  restorable: false, root_flag: 'ROOT_GONE', restore_deadline: new Date(Date.now() + 30 * 86_400_000).toISOString(),
 };
 
 let challenge: () => unknown;

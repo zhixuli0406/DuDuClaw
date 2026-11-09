@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle } from 'lucide-react';
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Skeleton } from '@/components/mds';
@@ -73,14 +73,17 @@ export function DelegationRequestsCard() {
           const expires = formatTime(item.expires_at);
           const created = formatTime(item.created_at);
           return (
-            <article key={item.id} aria-labelledby={`${taskId}-h`} className="space-y-3 rounded-lg border border-surface-border p-3">
-              <h3 id={`${taskId}-h`} className="text-sm font-medium break-words">
-                {t('myPersonal.delegation.route', { from: item.source_agent, to: item.target_agent })}
+            // Board "Mine": the card waiting for the owner is outlined in the brand colour.
+            <article key={item.id} aria-labelledby={`${taskId}-h`} className="space-y-3 rounded-lg border-2 border-brand/70 p-4">
+              <h3 id={`${taskId}-h`} className="text-sm break-words">
+                {intl.formatMessage({ id: 'myPersonal.delegation.route' }, {
+                  from: item.source_agent,
+                  to: item.target_agent,
+                  b: (chunks: ReactNode[]) => <strong className="font-semibold">{chunks}</strong>,
+                })}
               </h3>
-              <p className="flex flex-wrap gap-x-3 text-xs text-muted-foreground">
-                {created && <span>{t('myPersonal.delegation.created', { time: created })}</span>}
-                {expires && <span>{t('myPersonal.delegation.expires', { time: expires })}</span>}
-              </p>
+              {created && <p className="text-xs text-muted-foreground">{t('myPersonal.delegation.created', { time: created })}</p>}
+              {/* The full bound text, never shortened (dir=auto, pre-wrap, bidi controls made visible). */}
               <BidiSafeText id={taskId} text={item.task} label={t('myPersonal.delegation.taskLabel')} />
               {hasBidiControls(item.task) && (
                 <p className="text-xs text-amber-700 dark:text-amber-400">{t('myPersonal.delegation.bidiNotice')}</p>
@@ -98,6 +101,9 @@ export function DelegationRequestsCard() {
                   {t('myPersonal.delegation.approve')}
                 </Button>
               </div>
+              <p className="text-xs text-muted-foreground">
+                {expires ? t('myPersonal.delegation.expires', { time: expires }) : t('myPersonal.delegation.expiresNoTime')}
+              </p>
             </article>
           );
         })}

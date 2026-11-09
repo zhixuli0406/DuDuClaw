@@ -12,10 +12,10 @@ import {
 import {
   adminRestoreApi,
   isValidEmployeeLabel,
-  normalizeRootState,
+  rootStateOf,
   type QuarantineRow,
 } from '@/lib/isolation-restore-api';
-import { RestoreErrorNotice, useRestoreT } from './restore-ui';
+import { RestoreErrorNotice, usePersonLabel, useRestoreT } from './restore-ui';
 import { isStepUpCancelled, type WithToken } from './with-token';
 
 /**
@@ -43,6 +43,7 @@ export function FileForOwnerDialog({
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
+  const person = usePersonLabel();
 
   useEffect(() => {
     if (open && row) {
@@ -53,9 +54,9 @@ export function FileForOwnerDialog({
   }, [open, row]);
 
   if (!row) return null;
-  const adopt = normalizeRootState(row.root_state) === 'root_gone';
+  const adopt = rootStateOf(row) === 'root_gone';
   const name = row.display_name || row.label;
-  const owner = row.owner_name || row.owner_user_id || '';
+  const owner = person(row.owner_user_id, row.owner_name);
   const labelOk = !adopt || isValidEmployeeLabel(label);
 
   const submit = async () => {

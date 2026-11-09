@@ -15,12 +15,12 @@ import {
   ACCESS_LEVELS,
   adminRestoreApi,
   isValidEmployeeLabel,
-  normalizeRootState,
+  rootStateOf,
   type AccessLevel,
   type QuarantineRow,
   type SharedRestoreOptions,
 } from '@/lib/isolation-restore-api';
-import { RestoreErrorNotice, useRestoreT } from './restore-ui';
+import { RestoreErrorNotice, useNeedsVerify, useRestoreT } from './restore-ui';
 import { isStepUpCancelled, type WithToken } from './with-token';
 
 /** A member can be restored at their snapshot level or lower, never higher. */
@@ -59,7 +59,8 @@ export function SharedRestoreDialog({
   const [label, setLabel] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
-  const adopt = row ? normalizeRootState(row.root_state) === 'root_gone' : false;
+  const needsVerify = useNeedsVerify();
+  const adopt = row ? rootStateOf(row) === 'root_gone' : false;
 
   useEffect(() => {
     if (!open || !row) return;
@@ -197,17 +198,22 @@ export function SharedRestoreDialog({
               </ul>
             </fieldset>
 
-            <p className="text-sm">{t('restoreFlow.shared.secondAdmin')}</p>
+            <p className="rounded-lg bg-muted/60 px-3 py-2 text-sm">{t('restoreFlow.shared.afterRestore')}</p>
           </div>
         )}
 
         <RestoreErrorNotice error={error} />
 
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>{t('restoreFlow.common.cancel')}</Button>
-          <Button variant="brand" disabled={busy || !options || !labelOk} onClick={() => void submit()}>
-            {busy ? t('restoreFlow.common.sending') : t(adopt ? 'restoreFlow.shared.submitAdopt' : 'restoreFlow.shared.submit')}
-          </Button>
+        <DialogFooter className="sm:flex-col sm:items-end">
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button variant="outline" onClick={() => onOpenChange(false)}>{t('restoreFlow.common.cancel')}</Button>
+            <Button variant="brand" disabled={busy || !options || !labelOk} onClick={() => void submit()}>
+              {busy
+                ? t('restoreFlow.common.sending')
+                : t(`restoreFlow.shared.${adopt ? 'submitAdopt' : 'submit'}${needsVerify ? 'Verify' : ''}`)}
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">{t('restoreFlow.shared.secondAdmin')}</p>
         </DialogFooter>
       </DialogContent>
     </Dialog>

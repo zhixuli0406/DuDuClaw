@@ -13,7 +13,9 @@ import { ConnectorsTab } from './ConnectorsTab';
 import { TenantSourceTab } from './TenantSourceTab';
 import { AuditTab } from './AuditTab';
 import {
+  PROTECTED_MODE_PATH,
   PROTECTED_TABS,
+  PageTrail,
   ProtectedPageProvider,
   useT,
   type Person,
@@ -23,8 +25,8 @@ import {
 
 /** Readiness reasons about connectors land on this page's own tab. */
 const NEXT_STEPS: IsolationNextSteps = {
-  connector_setup_required: { hint: 'isolationReadiness.hint.connector', to: '/app/system/protected?tab=connectors' },
-  revoked: { hint: 'isolationReadiness.hint.revoked', to: '/app/system/protected?tab=connectors' },
+  connector_setup_required: { hint: 'isolationReadiness.hint.connector', to: `${PROTECTED_MODE_PATH}?tab=connectors` },
+  revoked: { hint: 'isolationReadiness.hint.revoked', to: `${PROTECTED_MODE_PATH}?tab=connectors` },
 };
 
 function isTab(value: string | null): value is ProtectedTab {
@@ -82,7 +84,8 @@ export function ProtectedModePage() {
     <div className="mx-auto w-full max-w-[1200px] space-y-6">
       <header className="flex min-w-0 items-start gap-2">
         <ShieldCheck className="mt-0.5 size-5 shrink-0 text-muted-foreground" aria-hidden="true" />
-        <div className="min-w-0">
+        <div className="min-w-0 space-y-1">
+          <PageTrail trail={t('trail')} newIn="1.81.0" />
           <h1 className="text-base font-medium">{t('title')}</h1>
           <p className="text-sm text-muted-foreground">{t('description')}</p>
         </div>

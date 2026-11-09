@@ -66,7 +66,7 @@ export function AdoptFlow({ employee, onFiled }: { employee: RestorableEmployee;
               className="font-mono sm:w-72"
             />
             <p id={labelHintId} className={valid ? 'text-xs text-muted-foreground' : 'text-xs text-destructive'}>
-              {t('myPersonal.new.labelRule')}
+              {t('restoreFlow.adopt.labelHint')} {t('myPersonal.new.labelRule')}
             </p>
           </div>
           <FactorProof
@@ -83,6 +83,7 @@ export function AdoptFlow({ employee, onFiled }: { employee: RestorableEmployee;
               onFiled();
             }}
           />
+          <p className="text-xs text-muted-foreground">{t('restoreFlow.adopt.afterSubmit')}</p>
         </>
       )}
     </div>

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
-import type { IsolationEmployeeList, QuarantineRow, RestoreRequestRow } from '@/lib/isolation-restore-api';
+import { rootStateOf, type IsolationEmployeeList, type QuarantineRow, type RestoreRequestRow } from '@/lib/isolation-restore-api';
 import { AdminRestorePage } from './AdminRestorePage';
 import { rowActions } from './QuarantineTable';
 import { approveState } from './RestoreApproveCard';
@@ -15,7 +15,7 @@ const DAY = 86400;
 
 const row = (over: Partial<QuarantineRow>): QuarantineRow => ({
   employee_id: 'e1', incarnation: 3, label: 'sales-bot', display_name: 'Sales Bot', kind: 'shared',
-  seal: 'sealed', root_state: 'restorable',
+  seal: 'sealed', restorable: true, root_flag: null,
   purge: { purgeable: false, purge_after: now + 20 * DAY, early: true, early_purge: null, purged_at: null },
   ...over,
 });
@@ -39,6 +39,16 @@ beforeEach(() => {
 });
 
 describe('restore rules (pure)', () => {
+  it('runtime state comes from root_flag, the purge block and restorable', () => {
+    expect(rootStateOf(row({}))).toBe('restorable');
+    expect(rootStateOf(row({ root_flag: 'ROOT_GONE', restorable: false }))).toBe('root_gone');
+    expect(rootStateOf(row({ root_flag: 'ROOT_RETIRED' }))).toBe('retired');
+    expect(rootStateOf(row({ root_flag: 'ROOT_INCONSISTENT' }))).toBe('unknown');
+    expect(rootStateOf(row({ root_flag: 'SOMETHING_NEW' }))).toBe('unknown');
+    expect(rootStateOf(row({ purge: { purgeable: false, purged_at: now } }))).toBe('pending_release');
+    expect(rootStateOf(row({ restorable: false }))).toBe('closed');
+  });
+
   it('row actions follow kind, root state and the purge block', () => {
     expect(rowActions(row({}))).toEqual(['shared_restore', 'early_purge']);
     expect(rowActions(row({ kind: 'personal', admin_may_file_for_owner: true }))).toEqual(['file_for_owner', 'early_purge']);
@@ -49,7 +59,13 @@ describe('restore rules (pure)', () => {
     expect(rowActions(row({ purge: { purgeable: false, early: true, early_purge: { by_me: true } } }))).toEqual(['shared_restore']);
     expect(rowActions(row({ purge: { purgeable: false, purged_at: now } }))).toEqual(['retire']);
     expect(rowActions(row({ purge: { purgeable: false, purged_at: now }, retire_proposed: true }))).toEqual([]);
-    expect(rowActions(row({ root_state: 'pending_release' }))).toEqual(['early_purge']);
+    expect(rowActions(row({ purge: { purgeable: false, purged_at: now }, root_flag: 'ROOT_RETIRED' }))).toEqual([]);
+    // 執行環境無法確認: no restore, take-over or purge until the host is checked again.
+    expect(rowActions(row({ root_flag: 'ROOT_INCONSISTENT' }))).toEqual([]);
+    // The server says it can no longer be restored: only the purge remains.
+    expect(rowActions(row({ restorable: false }))).toEqual(['early_purge']);
+    // Runtime gone: a take-over is still possible.
+    expect(rowActions(row({ root_flag: 'ROOT_GONE', restorable: false }))).toEqual(['shared_restore', 'early_purge']);
   });
 
   it('approval needs a different admin; a sole admin waits out the 7-day cooling', () => {
@@ -59,6 +75,10 @@ describe('restore rules (pure)', () => {
     expect(approveState(req({ filed_by_me: true, sole_admin: true, cooling_until: now - DAY }))).toBe('sole_admin_self');
     // Filed for an owner who did not verify: never self-approvable.
     expect(approveState(req({ filed_by_me: true, sole_admin: true, owner_unverified: true }))).toBe('second_admin');
+    // Contract fields: `filed_by` = the signed-in Admin, `self_approved` from the server.
+    expect(approveState(req({ filed_by: 'u-admin' }), Date.now(), 'u-admin')).toBe('second_admin');
+    expect(approveState(req({ filed_by: 'u-admin', self_approved: true }), Date.now(), 'u-admin')).toBe('sole_admin_self');
+    expect(approveState(req({ filed_by: 'u-other' }), Date.now(), 'u-admin')).toBe('ready');
   });
 
   it('member levels are capped at the snapshot level', () => {
@@ -72,9 +92,9 @@ describe('<AdminRestorePage> — 管理員 · 還原、承接與註銷', () => {
   it('lists quarantined employees with seal, runtime state and days left', async () => {
     list.restores!.quarantine = [
       row({}),
-      row({ employee_id: 'e2', label: 'old-helper', display_name: 'Old Helper', kind: 'personal', root_state: 'root_gone', seal: 'oversize', owner_name: 'Bob' }),
-      row({ employee_id: 'e3', label: 'mystery', display_name: 'Mystery', root_state: 'unknown', seal: 'pending' }),
-      row({ employee_id: 'e4', label: 'freed', display_name: 'Freed', root_state: 'pending_release', purge: { purgeable: false, purged_at: now } }),
+      row({ employee_id: 'e2', label: 'old-helper', display_name: 'Old Helper', kind: 'personal', root_flag: 'ROOT_GONE', restorable: false, seal: 'oversize', owner_name: 'Bob' }),
+      row({ employee_id: 'e3', label: 'mystery', display_name: 'Mystery', root_flag: 'ROOT_INCONSISTENT', seal: 'pending' }),
+      row({ employee_id: 'e4', label: 'freed', display_name: 'Freed', purge: { purgeable: false, purged_at: now } }),
     ];
     renderWithProviders(<AdminRestorePage />);
     const table = await screen.findByRole('table', { name: 'Removed employees' });
@@ -95,6 +115,7 @@ describe('<AdminRestorePage> — 管理員 · 還原、承接與註銷', () => {
       req({ request_id: 'b', display_name: 'Cooling', filed_by_me: true, sole_admin: true, cooling_until: now + 3 * DAY }),
       req({ request_id: 'c', display_name: 'Solo', filed_by_me: true, sole_admin: true, cooling_until: now - DAY }),
       req({ request_id: 'd', display_name: 'Unverified', filed_by_admin: true, owner_unverified: true, filed_by_name: 'Carol' }),
+      req({ request_id: 'e', display_name: 'Other' }),
     ];
     renderWithProviders(<AdminRestorePage />);
     const mine = await screen.findByRole('group', { name: /Restore "Mine"/ });
@@ -115,6 +136,11 @@ describe('<AdminRestorePage> — 管理員 · 還原、承接與註銷', () => {
     expect(within(unverified).getByText('Sent for the owner by admin Carol')).toBeInTheDocument();
     expect(within(unverified).getByText(/Check with the owner directly before approving/)).toBeInTheDocument();
     expect(within(unverified).getByRole('button', { name: 'Approve' })).toBeEnabled();
+
+    // Board "Restore", second-admin state: someone else filed it, so this admin may approve.
+    const other = screen.getByRole('group', { name: /Restore "Other"/ });
+    expect(within(other).getByText(/You are not the requester, so you can approve/)).toBeInTheDocument();
+    expect(within(other).getByRole('button', { name: 'Approve' })).toBeEnabled();
   });
 
   it('approving asks for step-up, then shows the outcome and one-click re-grants', async () => {
@@ -128,7 +154,7 @@ describe('<AdminRestorePage> — 管理員 · 還原、承接與註銷', () => {
       }
       if (method === 'isolation.connector_step_up') { verified = true; return { verified: true }; }
       if (method === 'isolation.employee_restore_decide') return {
-        state: 'restored', incarnation: 4, self_approved: false, work_paused: true, routes_need_provisioning: 1,
+        state: 'done', incarnation: 4, self_approved: false, work_paused: true, routes_need_provisioning: 1,
         label_state: { regrant: ['website_credential:crm-login', { item: 'org_edge:lead', kind: 'org_edge', label: 'Reports to Sales Lead' }], skipped: [], listed: ['route:old-mailbox'] },
         members: [{ user_id: 'u1', access_level: 'owner' }, { user_id: 'u2', access_level: 'viewer' }],
         members_dropped: [{ user_id: 'u3', name: 'Dan', reason: '帳號已停用' }], routes_reapproved: 2,
@@ -140,7 +166,8 @@ describe('<AdminRestorePage> — 管理員 · 還原、承接與註銷', () => {
     renderWithProviders(<AdminRestorePage />);
     expect(await screen.findByText(/you will be asked for your password and a code/)).toBeInTheDocument();
     const card = await screen.findByRole('group', { name: /Restore "Desk"/ });
-    await user.click(within(card).getByRole('button', { name: 'Approve' }));
+    // The proof has lapsed, so the button says it will re-verify first (board: 再驗證身分並核准).
+    await user.click(within(card).getByRole('button', { name: 'Verify identity and approve' }));
     const dialog = await screen.findByRole('dialog');
     await user.type(within(dialog).getByLabelText('Current password'), 'pw');
     await user.type(within(dialog).getByLabelText('Verification code'), '123456');
@@ -277,7 +304,7 @@ describe('<AdminRestorePage> — 管理員 · 還原、承接與註銷', () => {
   });
 
   it('an admin files a hand-over for an owner without a second factor; it is marked and needs another admin', async () => {
-    list.restores!.quarantine = [row({ kind: 'personal', root_state: 'root_gone', admin_may_file_for_owner: true, owner_name: 'Bob' })];
+    list.restores!.quarantine = [row({ kind: 'personal', root_flag: 'ROOT_GONE', restorable: false, admin_may_file_for_owner: true, owner_name: 'Bob' })];
     handlers['isolation.adoption_request_for_owner'] = () => ({ request_id: 'fo' });
     const user = userEvent.setup();
     renderWithProviders(<AdminRestorePage />);

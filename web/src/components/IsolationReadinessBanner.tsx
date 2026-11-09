@@ -77,8 +77,7 @@ function describeReason(intl: IntlShape, reason: IsolationReason, overrides?: Is
         : { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRuntimeGeneric' }) };
     }
     case 'helper_recording_unsupported':
-      // W1 plain-language text; HX6's technical `reason.recording` stays in
-      // the catalogs (admin egress statement: `recordingEgress` below).
+      // W1 plain-language text (admin egress statement: `recordingEgress` below).
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRecording' }) };
     default:
       return { key: 'unknown', message: intl.formatMessage({ id: 'isolationReadiness.reason.setup' }) };
