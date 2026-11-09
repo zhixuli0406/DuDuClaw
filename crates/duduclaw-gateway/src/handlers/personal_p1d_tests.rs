@@ -146,7 +146,8 @@ async fn p1d_dashboard_reads_resolve_their_employee() {
     use DataCategory::*;
     let h = home();
     for (method, category) in [
-        ("agents.export_profile", AgentFiles), ("skills.content", AgentFiles), ("skills.share", AgentFiles),
+        // P1g (F4): `skills.share` moved to the owner-only delegation gate.
+        ("agents.export_profile", AgentFiles), ("skills.content", AgentFiles),
         ("playbook.list", Memory), ("playbook.export", Memory), ("playbook.retire", Memory),
         ("wiki.trust_audit", Wiki), ("wiki.trust_history", Wiki), ("wiki.trust_override", Wiki),
     ] {

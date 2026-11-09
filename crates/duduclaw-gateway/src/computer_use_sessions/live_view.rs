@@ -348,6 +348,16 @@ pub enum LiveAction {
 /// Watch: a Manager bound to the employee, or anyone bound at Operator level
 /// or above. Control: a Manager bound at Operator level or above.
 pub fn authorize(live: &UserContext, agent_id: &str, action: LiveAction) -> bool {
+    // v1.81 P1g (F2): another person's Personal employee — watching needs
+    // the owner or the audited Admin step-up of this request (dispatch gate,
+    // category Sessions); controlling it is owner-only (no break-glass).
+    let denied = match action {
+        LiveAction::Watch => live.hides_agent(agent_id),
+        LiveAction::Control => live.owner_only_denied(agent_id),
+    };
+    if denied {
+        return false;
+    }
     if live.is_admin() {
         return true;
     }

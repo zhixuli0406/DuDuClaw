@@ -190,6 +190,12 @@ impl MethodHandler {
         if agent_id.is_empty() || !is_valid_agent_id(&agent_id) {
             return WsFrame::error_response("", "a valid target agent is required");
         }
+        // v1.81 P1g (F3): generating runs work on the target employee —
+        // delegation, owner only (also for a builder stored on the record
+        // before the upgrade, which no request parameter names).
+        if ctx.owner_only_denied(&agent_id) {
+            return WsFrame::error_response("", super::personal_p1g_gate::PERSONAL_DEFAULT_DENIED);
+        }
         {
             let reg = self.registry.read().await;
             if reg.get(&agent_id).is_none() {

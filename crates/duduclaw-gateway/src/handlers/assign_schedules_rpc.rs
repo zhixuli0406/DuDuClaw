@@ -280,9 +280,13 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
+        // v1.81 P1g: a schedule of another person's Personal employee is
+        // managed by its owner only (it makes the employee run work) — the
+        // Admin role and a stale creator right no longer reach it.
         let row = match store.get_assign_schedule(id).await {
-            Ok(Some(row)) if actor.is_admin || row.creator_user_id == actor.user_id
-                || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator) => row,
+            Ok(Some(row)) if !ctx.owner_only_denied(&row.agent_id)
+                && (actor.is_admin || row.creator_user_id == actor.user_id
+                    || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator)) => row,
             _ => return WsFrame::error_response("", "not_found"),
         };
         if matches!(action, ManageAction::Resume) {

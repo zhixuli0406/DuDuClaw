@@ -64,6 +64,41 @@ fn scoped_schedule_allowed(row: &CronTaskRow) -> bool {
     true
 }
 
+/// v1.81 P1g: the people a cron fire is for — manual-run principal,
+/// `on_behalf_of`, last editor, creator (each may be absent).
+pub(crate) fn cron_fire_principals(task: &CronTaskRow, scoped_principal: Option<&str>) -> [Option<String>; 4] {
+    [
+        scoped_principal.map(str::to_owned),
+        task.on_behalf_of.clone(),
+        task.scoped_by_user_id.clone(),
+        task.created_by_user_id.clone(),
+    ]
+}
+
+/// v1.81 P1g: [`crate::personal_visibility::fire_time_refusal`] for one cron
+/// row: every recorded principal (manual-run principal, `on_behalf_of`,
+/// editor, creator) must be the target's CURRENT Personal owner. A row with
+/// no recorded person (legacy / MCP-created) never runs on a Personal
+/// employee in protected mode. `None` = allowed.
+pub(crate) async fn cron_fire_time_refusal(
+    home: &Path,
+    task: &CronTaskRow,
+    scoped_principal: Option<&str>,
+) -> Option<&'static str> {
+    if !crate::runtime_readiness::is_protected_linux() {
+        return None;
+    }
+    let home = home.to_path_buf();
+    let target = task.agent_id.clone();
+    let principals = cron_fire_principals(task, scoped_principal);
+    tokio::task::spawn_blocking(move || {
+        let principals: Vec<Option<&str>> = principals.iter().map(Option::as_deref).collect();
+        crate::personal_visibility::fire_time_refusal(&home, true, &principals, None, &target)
+    })
+    .await
+    .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+}
+
 /// Production [`AgentInvoker`]: routes through the normal per-agent Claude
 /// dispatch (`call_claude_for_agent_with_type`) tagged as a `Cron` request.
 /// Zero-sized, so it is cheap to construct per spawned task.
@@ -594,6 +629,10 @@ async fn enqueue_routine_trigger(
     let task = store.get(task_id).await?.ok_or("workflow cron missing")?;
     if !task.enabled { return Err("workflow cron disabled".into()); }
     if !scoped_schedule_allowed(&task) { return Err("Automation schedule refused".into()); }
+    // v1.81 P1g: fire-time Personal ownership check.
+    if let Some(reason) = cron_fire_time_refusal(home_dir, &task, None).await {
+        return Err(reason.into());
+    }
     if !cron_principal_allowed(home_dir, store, registry, &task).await {
         return Err("workflow cron principal refused".into());
     }
@@ -702,6 +741,13 @@ async fn dispatch_cron_task_checked(
         task.scoped_by_user_id = principal.strip_prefix("user:").map(str::to_string);
     }
     if !scoped_schedule_allowed(&task) { return; }
+    // v1.81 P1g: fire-time Personal ownership check (covers rows created
+    // before the upgrade and ownership changes since).
+    if let Some(reason) = cron_fire_time_refusal(home_dir, &task, scoped_principal).await {
+        warn!(id = %task.id, "cron fire refused: Personal employee not handed over by its owner");
+        let _ = store.record_run(&task.id, false, Some(reason)).await;
+        return;
+    }
     // Dashboard-created or manually run work must retain a current direct Operator binding.
     if task.created_by_user_id.is_some() || task.scoped_by_user_id.is_some() || scoped_principal.is_some() {
         let Some(user) = scoped_principal.and_then(|p| p.strip_prefix("user:"))

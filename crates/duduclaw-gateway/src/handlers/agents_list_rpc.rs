@@ -107,6 +107,24 @@ impl MethodHandler {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // v1.81 P1g: another person's Personal employee is listed to an
+        // Admin as metadata only (label, owner, status) — the allowlisted
+        // employee-list metadata; everything else needs the owner or the
+        // audited step-up of the per-agent RPCs. Non-Admins never see it
+        // (`visible_agents` drops it). Unreadable ownership refuses.
+        let hidden = match self.personal_hidden_agents(ctx).await {
+            Ok(hidden) => hidden,
+            Err(e) => return WsFrame::error_response("", e),
+        };
+        let owners = if hidden.is_empty() {
+            Default::default()
+        } else {
+            let home = self.home_dir.clone();
+            match tokio::task::spawn_blocking(move || crate::personal_visibility::personal_owners(&home)).await {
+                Ok(Ok(owners)) => owners,
+                _ => return WsFrame::error_response("", crate::personal_visibility::OWNERSHIP_UNAVAILABLE),
+            }
+        };
         let reg = self.registry.read().await;
         let visible = ctx.visible_agents();
 
@@ -121,7 +139,7 @@ impl MethodHandler {
                 None => true,
                 Some(names) => names.contains(&name),
             };
-            if visible_here && !agent_spent.contains_key(&name) {
+            if visible_here && !hidden.contains(&name) && !agent_spent.contains_key(&name) {
                 let spent = self.telemetry_spent_cents_for_agent(&name).await;
                 agent_spent.insert(name, spent);
             }
@@ -138,6 +156,9 @@ impl MethodHandler {
             .map(|a| {
                 let cfg = &a.config;
                 let archived = matches!(cfg.agent.status, duduclaw_core::types::AgentStatus::Archived);
+                if hidden.contains(&cfg.agent.name) {
+                    return personal_list_metadata(cfg, archived, owners.get(&cfg.agent.name), self.agent_has_avatar(&cfg.agent.name));
+                }
                 json!({
                     "name": cfg.agent.name,
                     "display_name": cfg.agent.display_name,
@@ -215,4 +236,25 @@ impl MethodHandler {
         );
         WsFrame::ok_response("", json!({ "agents": agents }))
     }
+}
+
+/// v1.81 P1g: the `agents.list` row of another person's Personal employee —
+/// label, status, owner and the avatar flag only. No model, budget, skills,
+/// permissions, heartbeat or evolution settings.
+pub(super) fn personal_list_metadata(
+    cfg: &duduclaw_core::types::AgentConfig,
+    archived: bool,
+    owner: Option<&String>,
+    has_avatar: bool,
+) -> Value {
+    json!({
+        "name": cfg.agent.name,
+        "display_name": cfg.agent.display_name,
+        "status": format!("{:?}", cfg.agent.status).to_lowercase(),
+        "archived": archived,
+        "has_avatar": has_avatar,
+        "personal_employee": true,
+        "owner_user_id": owner,
+        "restricted": true,
+    })
 }

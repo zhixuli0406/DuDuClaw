@@ -37,7 +37,7 @@ fn p1e_config_and_identity_writes_are_gated_methods() {
         ("agents.set_outfit", "agent_id", Config), ("agents.clear_avatar", "agent_id", Config),
         ("agents.tool_pruning_restore", "agent_id", Config), ("agents.archive", "agent_id", Config),
         ("agents.unarchive", "agent_id", Config), ("agents.remove", "agent_id", Config),
-        ("agents.handoff", "from_agent", Config), ("skills.restore", "agent_id", Config),
+        ("skills.restore", "agent_id", Config),
         ("skills.adopt", "target_agent_id", Config), ("agents.google_identity_set", "agent_id", Identity),
         ("agents.channels.telegram.set", "agent_id", Identity), ("agents.channels.googlechat.remove", "agent_id", Identity),
     ] {
@@ -52,8 +52,9 @@ fn p1e_config_and_identity_writes_are_gated_methods() {
     for method in ["agents.status", "agents.google_identity_get", "agents.tool_pruning_status", "agents.list"] {
         assert_eq!(write_scoped(method), None, "{method}");
     }
-    // The destination of a handoff is delegation (owner only).
-    assert_eq!(delegation_target_key("agents.handoff"), Some("to_agent"));
+    // P1g (F4): both ends of a handoff are delegation (owner only).
+    assert_eq!(delegation_target_key("agents.handoff"), Some("from_agent"));
+    assert_eq!(write_scoped("agents.handoff"), None);
     // Multi-target skill switches gate every named employee.
     assert_eq!(items_write_scoped("skills.set_enabled"), Some(("items", "agent_id")));
     assert_eq!(items_write_scoped("skills.remove"), Some(("items", "agent_id")));
@@ -207,7 +208,11 @@ async fn p1e_goal_creators_backfill_once_and_fail_closed() {
     // the migration has run (title matching is gone).
     drop(store);
     let employees = |goal: &str| visibility::work_item_employees(h.path(), WorkItem::Goal, goal).unwrap();
-    assert!(employees("g-legacy").is_empty(), "the store migration already ran at open: no title match");
+    // The store migration already ran at open (no title match), so the two
+    // legacy rows link nothing — P1g (F7): until reviewed, every goal no row
+    // links is held by their creator (fail closed), never title-matched.
+    assert_eq!(employees("g-legacy"), [PERSONAL.to_string()].into());
+    assert_eq!(employees("g-company"), [PERSONAL.to_string()].into());
 
     // Simulate the first open after the upgrade: the marker is absent.
     rusqlite::Connection::open(h.path().join("tasks.db")).unwrap()
@@ -219,12 +224,6 @@ async fn p1e_goal_creators_backfill_once_and_fail_closed() {
     }
     assert_eq!(employees("g-claimed"), [PERSONAL.to_string(), SHARED.to_string()].into());
     assert!(employees("g-company").is_empty());
-    // A later row without metadata is never linked: the migration ran once.
-    store.append_activity(&goal_row("late", PERSONAL, "Created goal: Company goal", None)).await.unwrap();
-    drop(store);
-    let _reopened = TaskStore::open(h.path()).unwrap();
-    assert!(employees("g-company").is_empty(), "the backfill is one-time");
-
     // Several distinct creators: hidden whenever ANY of them is hidden.
     let creators = visibility::goal_creators(h.path()).unwrap();
     let hidden_from_admin = visibility::hidden_from(h.path(), true, &h.admin).unwrap();
@@ -232,6 +231,17 @@ async fn p1e_goal_creators_backfill_once_and_fail_closed() {
     assert!(visibility::goal_hidden(creators.get("g-legacy"), &hidden_from_admin));
     assert!(!visibility::goal_hidden(creators.get("g-company"), &hidden_from_admin));
     assert!(!visibility::goal_hidden(creators.get("g-claimed"), &BTreeSet::new()));
+
+    // A later row without metadata is never title-linked (the migration ran
+    // once) — P1g (F7): it holds every unlinked goal until reviewed.
+    store.append_activity(&goal_row("late", PERSONAL, "Created goal: Company goal", None)).await.unwrap();
+    drop(store);
+    let _reopened = TaskStore::open(h.path()).unwrap();
+    assert_eq!(employees("g-company"), [PERSONAL.to_string()].into(), "the backfill is one-time; unmatched ⇒ held");
+    let creators = visibility::goal_creators(h.path()).unwrap();
+    assert!(visibility::goal_hidden(creators.get("g-company"), &hidden_from_admin));
+    assert!(!visibility::goal_hidden(creators.get("g-company"), &visibility::hidden_from(h.path(), true, &h.alice).unwrap()),
+        "the owner still sees it");
     // Fail closed: no readable tasks.db.
     let empty = crate::fs_safe::private_test_home().unwrap();
     assert!(visibility::goal_creators(empty.path()).is_err());
@@ -324,30 +334,45 @@ const DISPATCH_SOURCES: &[(&str, &str)] = &[
 ];
 
 /// Parameter keys that name an employee.
+/// P1g: + `owner_agent_id`, `built_by_agent`, `slug`, `agent_ids`.
 const EMPLOYEE_KEYS: &[&str] = &["agent_id", "agent", "agent_name", "from_agent", "to_agent", "assigned_to",
-    "target_agent", "target_agent_id", "employee", "assignee"];
+    "target_agent", "target_agent_id", "employee", "assignee", "owner_agent_id", "built_by_agent", "slug", "agent_ids"];
 
 /// Ungated arms that take request parameters naming (or possibly naming)
 /// an employee, method by method, each with its reason. Required for every
 /// such arm in a namespace that also has a gated method.
 const EMPLOYEE_ARMS: &[(&str, &str)] = &[
-    ("agents.list", "metadata listing (name, role, status, avatar); Admins get metadata, private data is gated per method"),
-    ("agents.callable", "who the caller may call (names only): anything listed is callable"),
-    ("agents.health", "health counters of employees the caller has Viewer access to (metadata)"),
-    ("agents.status", "runtime status metadata only (state, model, activity counters)"),
+    // (a) = the P1g explicit Admin management / metadata allowlist
+    // (`personal_p1g_gate::metadata_allowlisted`): exempt from the default
+    // deny and the hidden-row filter, each audited or metadata by design.
+    ("agents.list", "(a) label / owner / status rows for another person's Personal employee (personal_list_metadata)"),
+    ("agents.status", "(a) runtime status metadata only; check_agent_mgmt + best-effort metadata audit"),
+    ("agents.pause", "(a) operational control under Manager + Operator binding; control audit, fail closed"),
+    ("agents.resume", "(a) operational control under Manager + Operator binding; control audit, fail closed"),
+    ("agents.avatar", "(a) the avatar image only; check_agent_mgmt + best-effort metadata audit"),
+    ("presets.status", "(a) the name of the bound preset only; check_agent_mgmt + best-effort metadata audit"),
+    ("autonomy.pause", "(a) background-autonomy pause; management access + control audit (F8)"),
+    ("autonomy.resume", "(a) background-autonomy resume; management access + control audit (F8)"),
+    ("autonomy.status", "(a) pause state, filtered through the ACL (another person's Personal employee is dropped)"),
+    ("topology.list", "(a) approval topology metadata (roles / routes, no content)"),
+    ("approvals.list", "(a) another person's Personal cards are metadata-only cards (personal_metadata_card)"),
+    ("approvals.get", "(a) metadata card; the full card only after the audited step-up (personal_approval_hidden)"),
+    ("users.list", "(a) people and their binding metadata (label, owner); no employee data"),
+    ("users.me", "(a) the caller's own account"),
+    // Everything below is covered by the P1g default deny (a named
+    // Personal employee is refused unless an audited step-up of this
+    // request admitted it) and the hidden-row filter, plus the reason.
+    ("agents.callable", "who the caller may call (names only); can_call_agent refuses another person's Personal employee"),
+    ("agents.health", "health counters filtered through has_agent_access (P1g: fails closed for a non-owned Personal one)"),
     ("agents.create", "creates a new employee; names no existing one"),
-    ("agents.pause", "operational control under Manager + Operator binding; audited for another person's Personal employee"),
-    ("agents.resume", "operational control under Manager + Operator binding; audited for another person's Personal employee"),
-    ("agents.tool_pruning_status", "which tools are pruned (metadata); the restore is a gated config write"),
-    ("agents.avatar", "the avatar image only (also shown in every listing)"),
-    ("agents.google_identity_get", "binding metadata (address, status); mailbox content is gated by mail.*"),
-    ("agents.primary_owner_set", "P1f follow-up: who answers for the employee (Google primary owner) vs. its Personal owner"),
-    ("agents.permission_history", "permission-change history (audit metadata)"),
-    ("presets.status", "the name of the bound preset only"),
+    ("agents.tool_pruning_status", "which tools are pruned (metadata); P1g default deny on agent_id; restore is a gated write"),
+    ("agents.google_identity_get", "binding metadata (address, status); P1g default deny on agent_id (owner only)"),
+    ("agents.primary_owner_set", "P1g default deny: naming another person's Personal employee is refused (owner only)"),
+    ("agents.permission_history", "permission-change history; P1g default deny on agent_id + hidden rows"),
     ("tasks.skill_assign", "the server-picked runner is never a hidden Personal employee (dropped before any refusal)"),
-    ("memory.forget_batch_retry", "P1f follow-up: Admin-decider retry of an approved forget (confirm no memory content)"),
-    ("memory.forget_receipts_list", "P1f follow-up: Admin-decider forget receipts (confirm no memory content)"),
-    ("memory.forget_receipts_get", "P1f follow-up: Admin-decider forget receipts (confirm no memory content)"),
+    ("memory.forget_batch_retry", "P1g default deny on agent_id; forget batches carry ids and counts, never memory text"),
+    ("memory.forget_receipts_list", "P1g hidden rows: receipts naming another person's Personal employee are dropped"),
+    ("memory.forget_receipts_get", "P1g: a receipt naming another person's Personal employee is withheld (names_hidden)"),
     ("agent_files.withdraw", "the requester (or an Admin) withdraws a pending change; reads no file"),
     ("chat.sessions.history", "gated in the handler on the session's employee (personal_data_gate)"),
     ("runs.get", "gated in the handler on the run's employee (personal_data_gate)"),
@@ -362,81 +387,124 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("skills.list", "installed skill names and switches (metadata); content is gated (skills.content)"),
     ("skills.search", "skill hub search; no employee data"),
     ("skills.vet", "security vet of a skill package; no employee data"),
-    ("skills.install", "P1f follow-up: Admin hub install (confirm it never targets a Personal employee's layer)"),
+    ("skills.install", "P1g default deny: an install naming another person's Personal employee is refused (owner only)"),
     ("skills.install_request", "files a request for an Admin decision; installs nothing"),
-    ("skills.leaderboard", "usage counts per skill (metadata)"),
-    ("skills.custom_create", "P1f follow-up: the caller's custom-skill drafts"),
-    ("skills.custom_generate", "P1f follow-up: the caller's custom-skill drafts"),
-    ("skills.custom_update", "P1f follow-up: the caller's custom-skill drafts"),
-    ("skills.custom_submit", "P1f follow-up: the caller's custom-skill drafts"),
-    ("skills.custom_retire", "P1f follow-up: the caller's custom-skill drafts"),
+    ("skills.leaderboard", "usage counts per skill (metadata); P1g hidden rows"),
+    ("skills.custom_update", "the caller's own draft (creator / Admin); running work on its builder is owner-only (F3)"),
+    ("skills.custom_submit", "the caller's own draft (creator / Admin); files an Admin card, runs nothing"),
+    ("skills.custom_retire", "the caller's own draft (creator / Admin); runs nothing"),
     ("digest.latest", "drops another person's Personal employees in the handler, Admins included (P1e)"),
-    ("discovery.catalog", "the evaluator catalog for an assignee; no run data"),
+    ("discovery.catalog", "the evaluator catalog for an assignee; no run data; P1g default deny on the assignee"),
+    // P1g: namespaces that now have a gated method, listed method by method.
+    ("heartbeat.status", "per-employee heartbeat metadata; P1g hidden rows (trigger is owner-only delegation)"),
+    ("cron.list", "Admin rows of another person's Personal employee are dropped (P1g hidden rows; may_read for others)"),
+    ("cron.update", "row's employee resolved first (p1g_admin_cron_guard / may_write): owner only"),
+    ("cron.pause", "row's employee resolved first (p1g_admin_cron_guard / may_write): owner only"),
+    ("cron.resume", "row's employee resolved first (p1g_admin_cron_guard / may_write): owner only; fire-time check"),
+    ("cron.remove", "row's employee resolved first (p1g_admin_cron_guard / may_write): owner only"),
+    ("cron.templates", "static routine templates; no employee data"),
+    ("responsibilities.status", "feature configuration only, no rows"),
+    ("responsibilities.list", "P1g default deny on agent_id; unscoped Admin rows dropped by owner_agent_id (hidden rows)"),
+    ("responsibilities.get", "authorize_responsibility = require_agent_access on its employee (P1g: fails closed)"),
+    ("responsibilities.occurrences", "authorize_responsibility = require_agent_access on its employee (P1g: fails closed)"),
+    ("responsibilities.fires", "authorize_responsibility = require_agent_access on its employee (P1g: fails closed)"),
+    ("responsibilities.update_contract", "authorize_responsibility on its employee (P1g: fails closed); fire-time check"),
+    ("responsibilities.pause", "authorize_responsibility on its employee (P1g: fails closed)"),
+    ("responsibilities.resume", "authorize_responsibility on its employee (P1g: fails closed); fire-time check"),
+    ("responsibilities.disable", "authorize_responsibility on its employee (P1g: fails closed)"),
+    ("responsibilities.enable", "authorize_responsibility on its employee (P1g: fails closed); fire-time check"),
+    ("responsibilities.clear_failures", "authorize_responsibility on its employee (P1g: fails closed)"),
+    ("skill_synthesis.get", "Admin pipeline configuration; P1g hidden rows (update's target is owner-only delegation)"),
+    ("computer_sessions.open_link", "opens a link in its own session: P1g default deny on agent_id (owner only)"),
+    ("computer_sessions.status", "live_view::authorize Watch refuses another person's Personal employee (F2)"),
+    ("computer_sessions.takeover", "live_view::authorize Control: owner only, no break-glass (F2)"),
+    ("computer_sessions.hand_back", "live_view::authorize Control: owner only, no break-glass (F2)"),
+    ("computer_sessions.resume", "live_view::authorize Control: owner only, no break-glass (F2)"),
+    ("computer_sessions.stop", "owner_only_denied in the handler: owner only, no break-glass (F2)"),
+    ("users.mfa_reset", "a person's second factor; names no employee"),
+    ("users.mfa_enrollment_code", "a person's second factor; names no employee"),
+    ("users.google_disconnect", "a person's Google connection; names no employee"),
+    ("users.my_history_views", "the caller's own history views"),
+    ("users.team_history.list", "team oversight skips Personal employees in SQL (P1)"),
+    ("users.team_history.get", "team oversight skips Personal employees in SQL (P1)"),
+    ("users.org_settings.get", "org history settings; names no employee"),
+    ("users.org_settings.update", "org history settings; names no employee"),
+    ("users.subordinates", "reporting lines (people); names no employee"),
+    ("users.my_team", "filtered through can_call_agent (P1g: never another person's Personal employee)"),
+    ("users.invite", "people; names no employee"),
+    ("users.invite_status", "people; names no employee"),
+    ("users.create_members", "people; P1g default deny on any named binding target"),
+    ("users.create", "people; P1g default deny on any named binding target"),
+    ("users.update", "people; names no employee"),
+    ("users.remove", "people; names no employee"),
+    ("users.offboard", "people; P1g default deny on a named hand-over target"),
+    ("users.set_primary_agent", "P1g default deny: another person's Personal employee is refused (owner only)"),
+    ("users.change_password", "the caller's own password"),
+    ("users.change_email", "the caller's own address"),
+    ("users.audit_log", "auth audit rows; P1g hidden rows drop those naming another person's Personal employee"),
 ];
 
 /// Namespaces (no gated method in them) whose arms may name an employee,
 /// with the reviewed rule — or an explicit P1f follow-up.
+/// P1g: every former "P1f follow-up" is now covered by the default deny
+/// (a request naming another person's Personal employee is refused at
+/// dispatch unless an audited step-up of the request admitted it) and the
+/// hidden-row filter (replies drop / withhold its rows); the reason says
+/// what else applies. No entry may say "P1f" any more ([`P1F_CEILING`]).
+const DD: &str = "P1g default deny + hidden rows";
 const EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
-    ("autonomy", "P1f follow-up: pause / resume background autonomy (control, reads no data; audit like agents.pause)"),
     ("templates", "Admin template library: `agent` names a template role or a new employee, never an existing one's data"),
-    ("redaction", "P1f follow-up: Admin redaction policy, model and audit counters (confirm recent_audit has no content)"),
-    ("identity", "P1f follow-up: channel-user identity mapping"),
-    ("skill_synthesis", "P1f follow-up: Admin pipeline config; `target_agent` names where synthesized drafts land"),
-    ("wiki_scope", "P1f follow-up: Admin wiki-scope policy"),
-    ("channels", "Admin channel configuration: `agent` names the employee a channel routes to (routing metadata)"),
-    ("accounts", "P1f follow-up: provider accounts and budget summary"),
-    ("users", "people, bindings and team views; team grants skip Personal employees in SQL (P1). P1f follow-up: binding writes"),
+    ("redaction", "P1g default deny + hidden rows: recent_audit lines carry agent_id + tokens (no text) and are dropped"),
+    ("identity", "P1g default deny + hidden rows: channel-user identity mapping"),
+    ("wiki_scope", "P1g default deny + hidden rows: Admin wiki-scope policy"),
+    ("channels", "Admin channel configuration: `agent` routes a channel; P1g default deny on another person's Personal one"),
+    ("accounts", "P1g default deny + hidden rows: provider accounts and budget summary"),
     ("me", "the caller's own Google connection and consents"),
-    ("dashboard", "P1f follow-up: dashboard layout and widget catalog"),
-    ("widgets", "P1f follow-up: custom widgets may query employee data"),
+    ("dashboard", "P1g default deny + hidden rows: dashboard layout and widget catalog"),
+    ("widgets", "P1g default deny + hidden rows: custom widget queries"),
     ("departments", "department names and membership (org metadata)"),
-    ("org", "P1f follow-up: org placement proposals naming an employee (reports_to)"),
-    ("mcp", "P1f follow-up: Admin MCP server wiring per employee (a config write on a Personal employee)"),
+    ("org", "P1g default deny on agent_id / reports_to targets; may_move / may_target through the ACL (fails closed)"),
+    ("mcp", "P1g default deny: per-employee MCP wiring of another person's Personal employee is refused (owner only)"),
     ("google", "Admin Google Workspace integration and delegation keys; per-employee identity is agents.google_identity_*"),
-    ("responsibilities", "P1f follow-up: an employee's continuous responsibilities"),
-    ("workflow_drafts", "P1f follow-up: workflow drafts naming an employee"),
-    ("workflow_runs", "P1f follow-up: workflow runs naming an employee"),
-    ("assign_schedules", "P1f follow-up: scheduled assignments (the fire-time delegation is gated)"),
-    ("notify", "P1f follow-up: notification statistics per employee"),
+    ("workflow_drafts", "P1g default deny on the named actor; runs re-checked at fire time (dispatcher)"),
+    ("workflow_runs", "P1g default deny + hidden rows; queued runs re-checked at fire time (dispatcher)"),
+    ("assign_schedules", "P1g: manage is owner-only for a Personal employee (owner_only_denied); fire-time check pauses others"),
+    ("notify", DD),
     ("migrate", "Admin migration scan / apply of imported agents (host authority)"),
-    ("approvals", "another person's Personal cards are metadata only in the handler; deciding is personal_decide_gate"),
-    ("topology", "P1f follow-up: approval topology filtered by employee"),
-    ("takeover", "P1f follow-up: takeover list"),
+    ("approvals", "operations / resolve_uncertain / decide: decide is personal_decide_gate; hidden rows elsewhere"),
+    ("takeover", "P1g hidden rows: takeover rows (agent_id, conversation) of another person's Personal employee are dropped"),
     ("install_requests", "requests filed by people for an Admin decision"),
-    ("budget", "P1f follow-up: budget incidents per employee"),
-    ("autopilot", "P1f follow-up: autopilot rules and breakers naming employees"),
+    ("budget", DD),
+    ("autopilot", "P1g default deny on rule targets + hidden rows; queued delegations re-checked at fire time"),
     ("shared_wiki", "the shared wiki, never an employee's own pages"),
-    ("experts", "P1f follow-up: Admin expert packs installed into employees"),
-    ("reminders", "P1f follow-up: an employee's reminders"),
-    ("cron", "P1f follow-up: an employee's cron routines (binding-filtered; Admin sees all)"),
-    ("system", "P1f follow-up: system status, doctor, update and migrate bundle"),
-    ("finetune", "P1f follow-up: datasets built from conversations"),
-    ("compliance", "P1f follow-up: compliance report contents"),
-    ("credentials", "P1f follow-up: credential audit rows"),
-    ("data_exports", "P1f follow-up: data exports"),
-    ("delegation", "P1f follow-up: delegation policy"),
-    ("security", "P1f follow-up: security audit log and credential inventory"),
-    ("secaudit", "P1f follow-up: security audit reports"),
-    ("logs", "P1f follow-up: gateway log stream"),
-    ("audit", "P1f follow-up: unified audit, evolution and reliability views by employee"),
-    ("analytics", "P1f follow-up: conversation analytics by employee"),
-    ("heartbeat", "P1f follow-up: heartbeat status / trigger of an employee"),
-    ("evolution", "P1f follow-up: evolution status and telemetry per employee"),
-    ("forward", "P1f follow-up: prediction ledger by employee"),
-    ("belief", "P1f follow-up: belief ledger by employee"),
-    ("cost", "cost and token metadata per employee (Admins get metadata)"),
-    ("db_sources", "P1f follow-up: data-source grants per employee"),
-    ("odoo", "P1f follow-up: per-employee Odoo configuration"),
-    ("ticks", "P1f follow-up: tick sources"),
-    ("tick", "P1f follow-up: tick sources"),
-    ("channel_ingress", "P1f follow-up: channel ingress inspection"),
-    ("computer_profiles", "P1f follow-up: computer-use profiles of an employee"),
-    ("computer_sessions", "P1f follow-up: computer-use sessions of an employee"),
-    ("computer_workspaces", "P1f follow-up: computer-use workspaces of an employee"),
-    ("os", "P1f follow-up: OS gate events naming an employee"),
-    ("browser", "P1f follow-up: browser audit log"),
-    ("marketplace", "P1f follow-up: marketplace install into an employee"),
-    ("knowledge", "knowledge-base ACLs are their own authority; agent.collections needs Owner binding (Admin: metadata)"),
+    ("experts", "P1g default deny: installing / removing / applying into another person's Personal employee is refused"),
+    ("reminders", "owner only through the ACL (dashboard_reminders); agent callbacks re-checked at fire time"),
+    ("system", DD),
+    ("finetune", "P1g default deny + hidden rows: dataset previews naming another person's Personal employee are withheld"),
+    ("compliance", DD),
+    ("credentials", DD),
+    ("data_exports", "F1: authorize refuses another person's Personal employee (owner only); unscoped rows dropped"),
+    ("delegation", "delegation policy (org-wide rules, names no employee's data)"),
+    ("security", DD),
+    ("secaudit", DD),
+    ("logs", "P1g: the raw log tail is refused while the caller has hidden Personal employees (p1g_log_tail_allowed)"),
+    ("audit", DD),
+    ("analytics", DD),
+    ("evolution", DD),
+    ("forward", DD),
+    ("belief", DD),
+    ("cost", "cost and token metadata per employee; P1g default deny + hidden rows"),
+    ("db_sources", "P1g default deny: data-source grants of another person's Personal employee are refused"),
+    ("odoo", "P1g default deny: per-employee Odoo configuration of another person's Personal employee is refused"),
+    ("ticks", DD),
+    ("tick", DD),
+    ("channel_ingress", "P1g: an inspected event naming another person's Personal employee is withheld (names_hidden)"),
+    ("computer_profiles", "live_view::authorize: status Watch / reset Control refuse another person's Personal one (F2)"),
+    ("computer_workspaces", "P1g default deny + hidden rows: computer-use workspaces of an employee"),
+    ("os", DD),
+    ("browser", DD),
+    ("marketplace", "P1g default deny: installing into another person's Personal employee is refused (owner only)"),
+    ("knowledge", "knowledge-base ACLs are their own authority; agent.collections needs Owner binding; P1g default deny"),
 ];
 
 /// Namespaces that must never name an employee: the scan fails if any arm
@@ -471,8 +539,13 @@ const NO_EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
     ("maintenance", "maintenance mode"),
 ];
 
-/// Ratchet: the number of P1f follow-ups may only go down.
-const FOLLOW_UP_CEILING: usize = 58;
+/// Ratchet (P1g): table entries whose reason mentions "P1f" anywhere,
+/// counted per METHOD (a namespace entry counts every method found in it).
+/// P1g closed them all; this may never go up again.
+const P1F_CEILING: usize = 0;
+/// Ratchet (P1g): the explicit metadata / management allowlist ("(a)"
+/// entries, method by method). Growing it is an owner decision.
+const METADATA_CEILING: usize = 14;
 
 struct Arm {
     methods: Vec<String>,
@@ -608,7 +681,7 @@ fn self_calls(body: &str) -> Vec<String> {
 }
 
 fn arm_names_employee(body: &str) -> bool {
-    ["check_agent!(", "check_agent_filter!(", "check_agent_named!(", "check_task_board_filter!("]
+    ["check_agent!(", "check_agent_mgmt!(", "check_agent_filter!(", "check_agent_named!(", "check_task_board_filter!("]
         .iter()
         .any(|needle| body.contains(needle))
         || EMPLOYEE_KEYS.iter().any(|key| body.contains(&format!("\"{key}\"")))
@@ -694,8 +767,40 @@ fn p1e_every_dashboard_arm_is_gated_or_allowlisted() {
         assert!(!mixed.contains(ns), "{ns} has gated methods: list its other arms method by method");
         assert!(!(in_table(EMPLOYEE_NAMESPACES, ns) && in_table(NO_EMPLOYEE_NAMESPACES, ns)), "{ns} in both tables");
     }
-    let follow_ups = EMPLOYEE_ARMS.iter().chain(EMPLOYEE_NAMESPACES).filter(|(_, r)| r.starts_with("P1f follow-up")).count();
-    assert!(follow_ups <= FOLLOW_UP_CEILING, "{follow_ups} P1f follow-ups; the ceiling only goes down");
+    // ── P1g ratchet ──────────────────────────────────────────────────────
+    // Per METHOD: a namespace entry counts every method found in it; "P1f"
+    // anywhere in a reason counts.
+    let methods_of = |ns: &str| found.keys().filter(|m| namespace(m) == ns).count();
+    let p1f = EMPLOYEE_ARMS.iter().filter(|(_, r)| r.contains("P1f")).count()
+        + EMPLOYEE_NAMESPACES.iter().filter(|(_, r)| r.contains("P1f")).map(|(ns, _)| methods_of(ns)).sum::<usize>();
+    assert!(p1f <= P1F_CEILING, "{p1f} methods still marked P1f; the ceiling only goes down");
+    // The metadata allowlist is method-level only and matches the runtime
+    // allowlist exactly (for every method the scan finds).
+    assert!(!EMPLOYEE_NAMESPACES.iter().any(|(_, r)| r.starts_with("(a)")), "(a) entries are method by method");
+    let metadata: BTreeSet<&str> = EMPLOYEE_ARMS.iter().filter(|(_, r)| r.starts_with("(a)")).map(|(m, _)| *m).collect();
+    assert!(metadata.len() <= METADATA_CEILING, "{} metadata entries; growing the allowlist is an owner decision",
+        metadata.len());
+    for method in &metadata {
+        assert!(super::super::personal_p1g_gate::metadata_allowlisted(method), "{method} is (a) but not allowlisted at runtime");
+    }
+    for method in found.keys().filter(|m| super::super::personal_p1g_gate::metadata_allowlisted(m)) {
+        assert!(metadata.contains(method.as_str()), "{method} is allowlisted at runtime without an (a) review entry");
+    }
+    // Arms WITHOUT params (unscoped listings) are examined too: any that
+    // names an employee must be covered by the hidden-row filter, i.e. not
+    // on the metadata allowlist unless reviewed above.
+    let unscoped: Vec<&String> = found.iter().filter(|(_, (takes, names))| !takes && *names).map(|(m, _)| m).collect();
+    for method in unscoped {
+        assert!(!super::super::personal_p1g_gate::metadata_allowlisted(method) || metadata.contains(method.as_str()),
+            "{method}: an unscoped listing naming employees escapes the hidden-row filter");
+    }
+    // The runtime default deny reads every request key the scan treats as
+    // naming an employee (`slug` names skills / templates in the arms the
+    // scan finds — reviewed: experts, skills — and is scan-only).
+    use super::super::personal_p1g_gate::{EMPLOYEE_ARRAY_KEYS, EMPLOYEE_PARAM_KEYS};
+    for key in EMPLOYEE_KEYS.iter().filter(|key| **key != "slug") {
+        assert!(EMPLOYEE_PARAM_KEYS.contains(key) || EMPLOYEE_ARRAY_KEYS.contains(key), "{key} not checked at runtime");
+    }
 }
 
 #[test]

@@ -246,6 +246,14 @@ impl MethodHandler {
             // ── Logs (manager+) ──────────────────────────────
             "logs.subscribe" => {
                 require_manager!();
+                // v1.81 P1g (a*): the raw log tail is unstructured and can
+                // carry another person's Personal employee's names and
+                // previews; it bypasses the per-subscriber push filter, so in
+                // protected mode it is refused to anyone who has such an
+                // employee hidden (fail closed, no step-up path).
+                if let Err(frame) = self.p1g_log_tail_allowed(ctx).await {
+                    return frame;
+                }
                 self.handle_logs_subscribe(params)
             }
             "logs.unsubscribe" => self.handle_logs_unsubscribe(params),

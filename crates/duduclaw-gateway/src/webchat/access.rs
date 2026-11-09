@@ -148,6 +148,20 @@ impl WebChatState {
         };
         if is_widget_visitor(user) { return Ok(()); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| denied("identity_unavailable"))?;
+        // v1.81 P1g: talking to a Personal employee makes it run work for the
+        // caller — its owner only, whatever the role (read fresh; unreadable
+        // ownership refuses). Checked before the Admin shortcut.
+        if crate::runtime_readiness::is_protected_linux() {
+            let (home, who, target) = (self.ctx.home_dir.clone(), user.to_owned(), agent.to_owned());
+            let refused = tokio::task::spawn_blocking(move || {
+                crate::personal_visibility::acl_denies(&home, true, &who, &target)
+            })
+            .await
+            .unwrap_or(true);
+            if refused {
+                return Err(denied("personal_employee"));
+            }
+        }
         if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }
         let default = gateway_default_id(&self.ctx.home_dir).await.map_err(|_| denied("config_unavailable"))?;
         let sender = SenderAccess::from_effective(snapshot.access.clone()).for_webchat(Ok(default));

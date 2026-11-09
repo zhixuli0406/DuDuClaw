@@ -458,6 +458,9 @@ fn start_gateway_future_is_send() {
 /// Start the WebSocket RPC gateway and block until it shuts down.
 pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Result<()> {
     if crate::migration_startup::maybe_run(&config.home_dir).await? { return Ok(()); }
+    // v1.81 P1g: every ACL predicate refuses another person's Personal
+    // employee in protected mode — installed before any RPC can arrive.
+    crate::personal_visibility::install_acl_restriction(&config.home_dir);
     // Initialise the log broadcast channel (must happen before subscribers connect).
     let log_tx = crate::log::init_log_broadcaster();
     let tx = log_tx;
@@ -5275,6 +5278,17 @@ fn authorize_causal_admin(
     Ok(ctx)
 }
 
+/// v1.81 P1g: the HTTP answer for a route naming another person's Personal
+/// employee (no step-up path over plain HTTP: owner only). Same text as an
+/// unknown / inaccessible employee.
+fn personal_http_refusal() -> axum::response::Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": "access denied" })),
+    )
+        .into_response()
+}
+
 fn causal_store_response(
     result: Result<Result<serde_json::Value, CausalStoreError>, tokio::task::JoinError>,
 ) -> axum::response::Response {
@@ -8868,8 +8882,14 @@ async fn handle_causal_import_memory(
     headers: axum::http::HeaderMap,
     Json(request): Json<CausalImportMemoryRequest>,
 ) -> axum::response::Response {
-    if let Err(response) = authorize_causal_admin(&state, &headers) {
-        return response;
+    let ctx = match authorize_causal_admin(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    // v1.81 P1g: another person's Personal employee's memory is never
+    // imported over this route (no step-up path here: owner only).
+    if ctx.hides_agent(&request.agent_id) {
+        return personal_http_refusal();
     }
     let db = state.home_dir.join("memory.db");
     causal_store_response(
@@ -8887,8 +8907,13 @@ async fn handle_causal_import_wiki(
     headers: axum::http::HeaderMap,
     Json(request): Json<CausalImportWikiRequest>,
 ) -> axum::response::Response {
-    if let Err(response) = authorize_causal_admin(&state, &headers) {
-        return response;
+    let ctx = match authorize_causal_admin(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    // v1.81 P1g: see `handle_causal_import_memory`.
+    if ctx.hides_agent(&request.agent_id) {
+        return personal_http_refusal();
     }
     let db = state.home_dir.join("memory.db");
     causal_store_response(
@@ -17239,13 +17264,13 @@ async fn handle_reliability_summary_http(
                 .into_response();
         }
     };
-    if authenticate_jwt(&state, token).is_err() {
+    let Ok(caller) = authenticate_jwt(&state, token) else {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid or expired token"})),
         )
             .into_response();
-    }
+    };
 
     let agent_id = match params.agent_id.as_deref() {
         Some(id) if !id.is_empty() => id.to_owned(),
@@ -17256,6 +17281,11 @@ async fn handle_reliability_summary_http(
             .into_response();
         }
     };
+    // v1.81 P1g: another person's Personal employee's reliability record is
+    // its owner's (HTTP has no step-up path).
+    if caller.hides_agent(&agent_id) {
+        return personal_http_refusal();
+    }
 
     let window_days = params.window_days.unwrap_or(7).clamp(1, 365);
 

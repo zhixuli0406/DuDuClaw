@@ -74,6 +74,9 @@ pub(crate) const WRITE_REFUSED_ACTION: &str = "isolation.personal_config_write_r
 /// P1e: `auth_audit_log` action of a pause / resume of another person's
 /// Personal employee.
 pub(crate) const CONTROL_ACTION: &str = "isolation.personal_agent_control";
+/// P1g: `auth_audit_log` action of an allowlisted metadata read (status,
+/// preset name, avatar) of another person's Personal employee.
+pub(crate) const METADATA_ACTION: &str = "isolation.personal_metadata_read";
 
 pub(super) const STEP_UP_REQUIRED: &str = "這是個人專屬員工的私人資料（對話、記憶、設定檔或 Wiki）。管理員需先以密碼與雙因素驗證確認身分\
     （有效 5 分鐘），並在請求中帶入驗證後的 step_up_csrf；每次讀取都會寫入稽核紀錄。 / This is a Personal employee's private \
@@ -106,10 +109,14 @@ pub(super) fn agent_scoped(method: &str) -> Option<DataCategory> {
         | "contract.get" | "contract.update"
         // P1d: the full profile export (SOUL, contract, …) and the
         // employee's own skill files (read, or copied to the shared pool).
-        | "agents.export_profile" | "skills.content" | "skills.share"
+        // P1g (F4): `skills.share` is owner-only (delegation gate).
+        | "agents.export_profile" | "skills.content"
         // P1e: its archived skills (names and archived content).
         | "skills.archived" => DataCategory::AgentFiles,
-        "chat.sessions.list" | "search.query" | "runs.list" => DataCategory::Sessions,
+        "chat.sessions.list" | "search.query" | "runs.list"
+        // P1g (F2): watching its live computer-use session / a masked
+        // snapshot of it (take over / hand back / resume / stop: owner only).
+        | "computer_sessions.view" | "computer_sessions.snapshot" => DataCategory::Sessions,
         // `tasks.assign` is delegation (personal_delegation_gate.rs), not a read.
         "activity.list" | "timeline.list" | "decisions.list" | "decisions.dismiss" | "canvas.get"
         | "tasks.list" | "tasks.list_page" | "tasks.flow_metrics"
@@ -128,8 +135,11 @@ pub(super) fn write_scoped(method: &str) -> Option<(&'static str, DataCategory)>
         | "agents.tool_pruning_restore" | "agents.archive" | "agents.unarchive" | "agents.remove" => {
             ("agent_id", DataCategory::Config)
         }
-        // Its work is moved away (the destination is delegation).
-        "agents.handoff" => ("from_agent", DataCategory::Config),
+        // P1g (F4): `agents.handoff` left this table — moving a Personal
+        // employee's work away is owner-only (delegation gate, both ends).
+        // P1g (F10): binding a person to it is an access write (owner, or
+        // an audited Admin step-up).
+        "users.bind_agent" | "users.unbind_agent" => ("agent_name", DataCategory::Config),
         // Its skill layer: restore an archived skill, adopt a shared one.
         "skills.restore" => ("agent_id", DataCategory::Config),
         "skills.adopt" => ("target_agent_id", DataCategory::Config),
@@ -237,6 +247,40 @@ pub(super) fn audit_personal_control(
     db.ok_or(AUDIT_FAILED_WRITE)?
         .log_action(Some(user), CONTROL_ACTION, Some(agent), Some(detail.as_str()), None)
         .map_err(|_| AUDIT_FAILED_WRITE)
+}
+
+/// P1g: audit row for an allowlisted metadata read by `user` of another
+/// person's Personal employee `agent`. `Ok(false)` = nothing to audit
+/// (unprotected, Shared, owner); `Err` = unreadable mirror or failed write.
+pub(super) fn audit_personal_metadata(
+    home: &Path,
+    db: Option<&UserDb>,
+    protected: bool,
+    user: &str,
+    method: &str,
+    agent: &str,
+) -> Result<bool, &'static str> {
+    if !protected {
+        return Ok(false);
+    }
+    let owner = match visibility::personal_owner(home, agent) {
+        Ok(None) => return Ok(false),
+        Ok(Some(owner)) if !user.is_empty() && owner == user => return Ok(false),
+        Ok(Some(owner)) => owner,
+        Err(_) => return Err(visibility::OWNERSHIP_UNAVAILABLE),
+    };
+    let detail = json!({
+        "user_id": user,
+        "employee": agent,
+        "owner_user_id": owner,
+        "category": "metadata",
+        "method": method,
+    })
+    .to_string();
+    db.ok_or(AUDIT_FAILED)?
+        .log_action(Some(user), METADATA_ACTION, Some(agent), Some(detail.as_str()), None)
+        .map(|_| true)
+        .map_err(|_| AUDIT_FAILED)
 }
 
 /// The employee a task is assigned to, read from `tasks.db` without
@@ -381,7 +425,11 @@ impl MethodHandler {
             authorize_break_glass(&db, proof.as_ref(), &admin_id, csrf.as_ref(), now, &target, &owner)
         })
         .await
-        .map_err(|_| UNAVAILABLE)?
+        .map_err(|_| UNAVAILABLE)??;
+        // P1g: the audited step-up admits this employee to the ACL for the
+        // rest of THIS request only (never for delegation).
+        visibility::record_break_glass(&ctx.user_id, target.agent);
+        Ok(())
     }
 
     /// Dispatch-level wrapper for [`agent_scoped`] methods (on `agent_id`)
@@ -505,6 +553,23 @@ impl MethodHandler {
         })
         .await
         .map_err(|_| UNAVAILABLE)?
+    }
+
+    /// P1g: best-effort audit row ([`METADATA_ACTION`]) for an allowlisted
+    /// metadata read (`agents.status`, `presets.status`, `agents.avatar`) of
+    /// another person's Personal employee. Metadata only, so a failed write
+    /// never blocks the read; no row for the owner or a Shared employee.
+    pub(super) async fn personal_metadata_audit(&self, ctx: &UserContext, method: &str, agent: &str) {
+        if !crate::runtime_readiness::is_protected_linux() {
+            return;
+        }
+        let db = self.user_db.read().await.clone();
+        let (home, user, method, agent) =
+            (self.home_dir.clone(), ctx.user_id.clone(), method.to_owned(), agent.to_owned());
+        let _ = tokio::task::spawn_blocking(move || {
+            audit_personal_metadata(&home, db.as_deref(), true, &user, &method, &agent)
+        })
+        .await;
     }
 
     /// Personal employees hidden from `ctx` in cross-agent listings. Empty

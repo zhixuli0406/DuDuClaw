@@ -180,12 +180,16 @@ pub fn collect(
                         return Ok(());
                     }
                     let live = fresh(home, original)?;
-                    if !crate::handlers::task_privacy::task_content_visible(
-                        home,
-                        &live,
-                        text(&cells[0]),
-                        text(&cells[3]),
-                    ) {
+                    // v1.81 P1g (F1): another person's Personal employee's
+                    // rows never enter an export (owner only, no break-glass).
+                    if live.hides_agent(text(&cells[3]))
+                        || !crate::handlers::task_privacy::task_content_visible(
+                            home,
+                            &live,
+                            text(&cells[0]),
+                            text(&cells[3]),
+                        )
+                    {
                         return Ok(());
                     }
                     normalize_time(&mut cells[4])?;
@@ -286,8 +290,14 @@ pub fn collect(
                     }
                     normalize_time(&mut cells[1])?;
                     // Fresh Admin role per batch/row; a downgraded creator cannot finish a cost export.
-                    if !fresh(home, original)?.is_admin() {
+                    let live = fresh(home, original)?;
+                    if !live.is_admin() {
                         return Err("EXPORT_PERMISSION_DENIED".into());
+                    }
+                    // v1.81 P1g (F1): unscoped usage exports drop another
+                    // person's Personal employees (hidden, not redacted).
+                    if live.hides_agent(text(&cells[0])) {
+                        return Ok(());
                     }
                     if selected(request, text(&cells[0])) && in_range(request, text(&cells[1]))? {
                         let has_tokens = cells[4..8]

@@ -61,6 +61,87 @@ use crate::fs_safe::sqlite::{Access, open_existing};
 
 const USERS_DB: &str = "users.db";
 
+/// P1g: the ACL decision installed into `duduclaw_auth::acl` at gateway boot.
+/// `true` = `user_id` must not reach `agent` through any ACL predicate: a
+/// Personal employee recorded for another owner, or a users.db that cannot
+/// be read (fail closed, every employee). The owner and Shared / unknown
+/// employees are not affected; nothing is read outside protected mode.
+pub fn acl_denies(home: &Path, protected: bool, user_id: &str, agent: &str) -> bool {
+    if !protected {
+        return false;
+    }
+    // `is_admin = false`: the ACL never grants break-glass — that is the
+    // audited step-up of the dashboard gate, not a role shortcut.
+    !matches!(classify_reader(home, true, user_id, false, agent), Ok(Reader::Unrestricted | Reader::Owner))
+}
+
+tokio::task_local! {
+    /// P1g: `(user, employee)` pairs an audited Admin step-up admitted during
+    /// THIS dashboard request (`MethodHandler::handle_conn` opens the scope,
+    /// `personal_data_gate` records each successful break-glass). Only the
+    /// request's own task sees it: a spawned task, a blocking-pool closure,
+    /// an HTTP route or a background job has no scope and stays refused.
+    static BREAK_GLASS: std::cell::RefCell<BTreeSet<(String, String)>>;
+}
+
+/// P1g: run `future` (one dashboard request) with an empty break-glass set.
+pub async fn with_break_glass_scope<F: std::future::Future>(future: F) -> F::Output {
+    BREAK_GLASS.scope(std::cell::RefCell::new(BTreeSet::new()), future).await
+}
+
+/// P1g: record that `user` passed the audited step-up for `agent` in the
+/// current request. No-op outside a request scope.
+pub fn record_break_glass(user: &str, agent: &str) {
+    let _ = BREAK_GLASS.try_with(|set| set.borrow_mut().insert((user.to_owned(), agent.to_owned())));
+}
+
+/// P1g: `user` passed the audited step-up for `agent` in the current request.
+pub fn break_glass_granted(user: &str, agent: &str) -> bool {
+    BREAK_GLASS
+        .try_with(|set| set.borrow().contains(&(user.to_owned(), agent.to_owned())))
+        .unwrap_or(false)
+}
+
+/// P1g: the restriction object (`home` fixed at boot; protected mode read
+/// on every call so an unprotected process never touches users.db).
+pub struct AclRestriction {
+    home: std::path::PathBuf,
+    /// `None` = the process flag (production); tests pass it explicitly.
+    protected: Option<bool>,
+}
+
+impl AclRestriction {
+    /// A restriction with an explicit protected flag (tests: no test sets
+    /// the process-wide flag).
+    pub fn with_flag(home: &Path, protected: bool) -> Self {
+        Self { home: home.to_path_buf(), protected: Some(protected) }
+    }
+
+    fn protected(&self) -> bool {
+        self.protected.unwrap_or_else(crate::runtime_readiness::is_protected_linux)
+    }
+}
+
+impl duduclaw_auth::acl::PersonalRestriction for AclRestriction {
+    fn denies(&self, user_id: &str, agent: &str) -> bool {
+        acl_denies(&self.home, self.protected(), user_id, agent) && !break_glass_granted(user_id, agent)
+    }
+
+    /// Delegation never uses a break-glass grant (owner only).
+    fn denies_delegation(&self, user_id: &str, agent: &str) -> bool {
+        acl_denies(&self.home, self.protected(), user_id, agent)
+    }
+}
+
+/// P1g: install [`AclRestriction`] for this gateway's home (once per
+/// process; `server.rs::start_gateway`).
+pub fn install_acl_restriction(home: &Path) {
+    let restriction = AclRestriction { home: home.to_path_buf(), protected: None };
+    if !duduclaw_auth::acl::install_personal_restriction(Box::new(restriction)) {
+        tracing::warn!("Personal ACL restriction was already installed");
+    }
+}
+
 /// The private data category named in the audit row of an Admin read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataCategory {
@@ -157,6 +238,33 @@ pub fn linked_goals(metadata: Option<&str>) -> Vec<String> {
     goals
 }
 
+/// P1g (F7): the metadata of a [`GOAL_CREATED_EVENT`] row when it is exactly
+/// a goal link — an object whose keys are only `goal_id` / `goal_ids` /
+/// `goal_backfill`, with id-shaped values (`[A-Za-z0-9_-]`, ≤ 128). Such
+/// metadata is stored unmasked (canonical JSON); anything else is `None`
+/// and goes through the normal redaction.
+pub fn goal_link_metadata(event_type: &str, raw: &str) -> Option<String> {
+    if event_type != GOAL_CREATED_EVENT {
+        return None;
+    }
+    let id_shaped = |value: &serde_json::Value| {
+        value.as_str().is_some_and(|id| {
+            !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+    };
+    let serde_json::Value::Object(map) = serde_json::from_str::<serde_json::Value>(raw).ok()? else {
+        return None;
+    };
+    let valid = !map.is_empty()
+        && map.iter().all(|(key, value)| match key.as_str() {
+            "goal_id" | "goal_backfill" => id_shaped(value),
+            "goal_ids" => value.as_array().is_some_and(|ids| !ids.is_empty() && ids.iter().all(id_shaped)),
+            _ => false,
+        })
+        && (map.contains_key("goal_id") || map.contains_key("goal_ids"));
+    valid.then(|| serde_json::Value::Object(map).to_string())
+}
+
 /// Shown when an employee id carries surrounding whitespace (P1d).
 pub const NON_CANONICAL_AGENT: &str = "AI 員工代號前後不能有空白。 / An employee id must not have leading or \
     trailing whitespace.";
@@ -214,6 +322,18 @@ fn open(home: &Path) -> Result<rusqlite::Connection, Unavailable> {
 pub fn personal_owner(home: &Path, agent: &str) -> Result<Option<String>, Unavailable> {
     let conn = open(home)?;
     duduclaw_auth::db::personal_agent_owner(&conn, agent).map_err(|_| Unavailable)
+}
+
+/// P1g: every Personal employee → its recorded owner (list metadata).
+pub fn personal_owners(home: &Path) -> Result<std::collections::BTreeMap<String, String>, Unavailable> {
+    let conn = open(home)?;
+    let mut statement = conn
+        .prepare("SELECT agent_name, owner_user_id FROM isolation_personal_agents")
+        .map_err(|_| Unavailable)?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|_| Unavailable)?;
+    rows.collect::<Result<_, _>>().map_err(|_| Unavailable)
 }
 
 /// Personal employees whose private data `user_id` does not own, for hiding
@@ -371,6 +491,56 @@ pub fn delegation_refusal_for_user(home: &Path, protected: bool, user_id: &str, 
     }
 }
 
+/// P1g: shown when a queued / scheduled job would run work on a Personal
+/// employee for someone other than its owner (checked at fire time).
+pub const PERSONAL_FIRE_REFUSED: &str = "這項排程或排隊中的工作要交給某位同仁的個人專屬員工，但不是由它的擁有者交辦，\
+    已在執行前拒絕。 / This scheduled or queued job targets a person's Personal employee and was not handed over by \
+    its owner; it was refused before it ran.";
+
+/// P1g: the dashboard user a stored principal names (`user:<id>`, or a bare
+/// account id from a creator column). `None` for unmapped senders, system
+/// senders and malformed values.
+pub fn principal_user(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let parsed = if raw.contains(':') {
+        duduclaw_core::human_principal::HumanPrincipal::parse(raw).ok()
+    } else {
+        duduclaw_core::human_principal::HumanPrincipal::user(raw)
+    };
+    parsed.and_then(|principal| principal.user_id().map(str::to_owned))
+}
+
+/// P1g fire-time check, run by every queued / scheduled job right before it
+/// makes `target` run work (dispatcher, cron, reminders, workflow routines):
+/// a Personal employee runs only work handed over by its owner (`principals`:
+/// the stored `on_behalf_of` / creator / editor — every one that is set must
+/// be the owner, at least one must be) or by the employee itself / another
+/// Personal employee of the same owner (`acting`, [`delegation_refusal`]).
+/// Ownership is read NOW, so rules created before the upgrade (or before an
+/// adoption changed the owner) are covered. Unreadable store ⇒ refused.
+/// `None` = allowed (outside protected mode always).
+pub fn fire_time_refusal(home: &Path, protected: bool, principals: &[Option<&str>], acting: Option<&str>, target: &str)
+    -> Option<&'static str> {
+    if !protected {
+        return None;
+    }
+    let owner = match personal_owner(home, target) {
+        Ok(None) => return None,
+        Ok(Some(owner)) => owner,
+        Err(Unavailable) => return Some(OWNERSHIP_UNAVAILABLE),
+    };
+    let named: Vec<Option<String>> = principals.iter().flatten().map(|raw| principal_user(raw)).collect();
+    if !named.is_empty() && named.iter().all(|user| user.as_deref() == Some(owner.as_str())) && !owner.is_empty() {
+        return None;
+    }
+    if let Some(acting) = acting.filter(|acting| !acting.is_empty())
+        && delegation_refusal(home, true, acting, target).is_none()
+    {
+        return None;
+    }
+    Some(PERSONAL_FIRE_REFUSED)
+}
+
 /// P1c: the employee a task or plan named by `id` belongs to, read from
 /// `tasks.db` without opening a writable store. `Ok(None)` = no such item
 /// (the tool answers); `Err` = the store could not be read (callers refuse).
@@ -417,13 +587,31 @@ pub fn goal_creators(home: &Path)
         .query_map([GOAL_CREATED_EVENT], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
         .map_err(|_| Unavailable)?;
     let mut creators: std::collections::BTreeMap<String, BTreeSet<String>> = std::collections::BTreeMap::new();
+    // P1g (F7): employees with a `goal_created` row that links no goal (a
+    // legacy row the one-time backfill could not match, or a link the old
+    // masker broke). Which goal it created is unknown, so every goal no row
+    // links is held by these employees until the row is reviewed (linked).
+    let mut unreviewed = BTreeSet::new();
     for row in rows {
         let (agent, metadata) = row.map_err(|_| Unavailable)?;
         if agent.is_empty() {
             continue;
         }
-        for goal in linked_goals(metadata.as_deref()) {
+        let goals = linked_goals(metadata.as_deref());
+        if goals.is_empty() {
+            unreviewed.insert(agent.clone());
+        }
+        for goal in goals {
             creators.entry(goal).or_default().insert(agent.clone());
+        }
+    }
+    drop(statement);
+    if !unreviewed.is_empty() {
+        let mut goals = conn.prepare("SELECT id FROM goals").map_err(|_| Unavailable)?;
+        let ids = goals.query_map([], |row| row.get::<_, String>(0)).map_err(|_| Unavailable)?;
+        for id in ids {
+            let id = id.map_err(|_| Unavailable)?;
+            creators.entry(id).or_insert_with(|| unreviewed.clone());
         }
     }
     Ok(creators)

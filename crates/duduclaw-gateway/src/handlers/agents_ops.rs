@@ -262,7 +262,9 @@ impl MethodHandler {
             source,
             user_id: &ctx.user_id,
             guard: || {
-                let live = crate::agent_files::flow::require_live_agent_access(
+                // P1g allowlist: pause / resume stay open for an Admin on
+                // another person's Personal employee (audited at dispatch).
+                let live = crate::agent_files::flow::require_live_management_access(
                     &self.home_dir, ctx, agent_id, AccessLevel::Operator,
                 )?;
                 acl::require_role(&live, UserRole::Manager)?;

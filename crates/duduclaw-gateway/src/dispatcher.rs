@@ -339,6 +339,66 @@ async fn isolated_queue_scope<F: std::future::Future<Output = Result<String, Dis
         &message.target, message.on_behalf_of.as_deref(), &material, pending_isolation_approval(future)).await
 }
 
+/// v1.81 P1g: [`crate::personal_visibility::fire_time_refusal`] for one
+/// queue row (principal = `on_behalf_of`; acting = the sending employee).
+/// Protected mode only; the users.db read runs on the blocking pool.
+pub(crate) async fn fire_time_personal_refusal(
+    home: &Path,
+    msg: &crate::message_queue::QueueMessage,
+) -> Option<&'static str> {
+    if !crate::runtime_readiness::is_protected_linux() {
+        return None;
+    }
+    let (home, target) = (home.to_path_buf(), msg.target.clone());
+    let principal = msg.on_behalf_of.clone();
+    let acting = msg.sender_agent.clone().or_else(|| Some(msg.sender.clone()));
+    tokio::task::spawn_blocking(move || {
+        crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], acting.as_deref(), &target)
+    })
+    .await
+    .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+}
+
+/// v1.81 P1g: the JSONL rail's fire-time check (principal `on_behalf_of`,
+/// acting = the sending employee).
+async fn bus_fire_time_refusal(home: &Path, msg: &BusMessage) -> Option<&'static str> {
+    if !crate::runtime_readiness::is_protected_linux() {
+        return None;
+    }
+    let (home, target) = (home.to_path_buf(), msg.agent_id.clone());
+    let principal = msg.on_behalf_of.clone();
+    let acting = msg.sender_agent.clone().or_else(|| msg.origin_agent.clone());
+    tokio::task::spawn_blocking(move || {
+        crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], acting.as_deref(), &target)
+    })
+    .await
+    .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+}
+
+/// v1.81 P1g: the `agent_response` that answers a refused JSONL row.
+fn bus_refusal_response(msg: &BusMessage, notice: String) -> BusMessage {
+    BusMessage {
+        msg_type: "agent_response".to_string(),
+        message_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: msg.agent_id.clone(),
+        payload: notice,
+        timestamp: Utc::now().to_rfc3339(),
+        response: None,
+        in_reply_to: Some(msg.message_id.clone()),
+        delegation_depth: msg.delegation_depth,
+        hop_depth: msg.hop_depth,
+        origin_agent: msg.origin_agent.clone(),
+        sender_agent: Some(msg.agent_id.clone()),
+        coalesced_ids: vec![],
+        turn_id: msg.turn_id.clone(),
+        session_id: msg.session_id.clone(),
+        upstream_unknown: false,
+        spawned: false,
+        lane: None,
+        on_behalf_of: msg.on_behalf_of.clone(),
+    }
+}
+
 /// Poll the SQLite message queue for pending messages and dispatch them.
 pub(crate) async fn poll_and_dispatch_sqlite(
     queue: &Arc<crate::message_queue::MessageQueue>,
@@ -399,6 +459,18 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         }
         // ACK immediately to prevent double-pickup
         if !queue.claim_pending(&msg.id).await? {
+            continue;
+        }
+        // ── v1.81 P1g fire-time check ─────────────────────────────────────
+        // Every queued job (delegation, goal round, heartbeat wake-up,
+        // autopilot / assign-schedule / workflow handoff, task dispatch)
+        // re-checks the CURRENT Personal ownership of its target before it
+        // runs, so rows queued before the upgrade or before an ownership
+        // change cannot make another person's Personal employee work.
+        if let Some(reason) = fire_time_personal_refusal(home_dir, &msg).await {
+            warn!(msg_id = %msg.id, "SQLite queue: Personal employee job refused at fire time");
+            queue.fail(&msg.id, reason).await?;
+            forward_delegation_response(home_dir, &msg.id, reason, &msg.target).await;
             continue;
         }
         // Workflow queue rows are authorized by the server-owned handoff outbox,
@@ -1171,6 +1243,14 @@ async fn poll_and_dispatch(
                             error = %e,
                             "Failed to serialize delegation depth-exceeded error response"
                         ),
+                    }
+                } else if let Some(reason) = bus_fire_time_refusal(home_dir, &msg).await {
+                    // v1.81 P1g: fire-time Personal ownership check (same rule
+                    // as the SQLite rail); consumed with a readable refusal.
+                    consumed_without_dispatch += 1;
+                    match serde_json::to_string(&bus_refusal_response(&msg, reason.to_string())) {
+                        Ok(json) => synthetic_responses.push(json),
+                        Err(e) => warn!(id = %msg.message_id, error = %e, "Failed to serialize Personal refusal"),
                     }
                 } else {
                     // ── WP21 C1: department × rank isolation ──────────────
@@ -2193,6 +2273,26 @@ async fn dispatch_taskspec_inner(
                 spec.status = TaskStatus::Failed;
                 spec.save(agent_dir).ok();
                 return Err(notice);
+            }
+        }
+        // v1.81 P1g: fire-time Personal ownership check of the step's
+        // employee (owner principal, or the plan's own / same-owner employee).
+        if crate::runtime_readiness::is_protected_linux() {
+            let (home, target, acting) = (home_dir.to_path_buf(), target_agent.clone(), spec.agent_id.clone());
+            let principal = crate::on_behalf_of::current();
+            let refusal = tokio::task::spawn_blocking(move || {
+                crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], Some(&acting), &target)
+            })
+            .await
+            .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE));
+            if let Some(reason) = refusal {
+                warn!(task = %spec.task_id, step = step_index, "TaskSpec step refused: Personal employee");
+                if let Some(s) = spec.steps.get_mut(step_index) {
+                    s.status = StepStatus::Failed;
+                }
+                spec.status = TaskStatus::Failed;
+                spec.save(agent_dir).ok();
+                return Err(reason.to_string());
             }
         }
 

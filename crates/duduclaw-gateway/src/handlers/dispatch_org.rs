@@ -42,6 +42,12 @@ impl MethodHandler {
         // board cards (`TaskReader`).
         macro_rules! check_task_board_filter {
             () => {
+                // v1.81 P1g: see `check_agent_filter!`.
+                if ctx.is_admin()
+                    && params.get("agent_id").and_then(|v| v.as_str()).is_some_and(|id| !id.is_empty() && ctx.hides_agent(id))
+                {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 if !ctx.is_admin() {
                     match params.get("agent_id").and_then(|v| v.as_str()) {
                         Some(id) if !id.is_empty() => {
@@ -64,6 +70,15 @@ impl MethodHandler {
         // teams' tasks/activity). Mirrors the agent-binding intent of memory.*.
         macro_rules! check_agent_filter {
             ($min_level:expr) => {
+                // v1.81 P1g: an Admin naming another person's Personal
+                // employee is refused too, unless this request's audited
+                // step-up admitted it (dispatch gate); unscoped Admin
+                // listings drop those rows in their handlers.
+                if ctx.is_admin()
+                    && params.get("agent_id").and_then(|v| v.as_str()).is_some_and(|id| !id.is_empty() && ctx.hides_agent(id))
+                {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 if !ctx.is_admin() {
                     match params.get("agent_id").and_then(|v| v.as_str()) {
                         Some(id) if !id.is_empty() => {

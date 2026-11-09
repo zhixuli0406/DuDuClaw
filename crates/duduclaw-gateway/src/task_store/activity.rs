@@ -28,7 +28,16 @@ impl TaskStore {
                 row.task_id,
                 mask_derived_text(&row.summary),
                 row.timestamp,
-                row.metadata.as_deref().map(mask_derived_text),
+                // v1.81 P1g (F7): a goal link (`goal_created` + metadata that
+                // is exactly an id link) is ownership, not text — stored as
+                // is, so the redaction masker can never break the link and
+                // turn a Personal employee's goal into an unowned one.
+                row.metadata.as_deref().map(|raw| {
+                    match crate::personal_visibility::goal_link_metadata(&row.event_type, raw) {
+                        Some(link) => link,
+                        None => mask_derived_text(raw).to_string(),
+                    }
+                }),
             ],
         )
         .map_err(|e| format!("append activity: {e}"))?;
