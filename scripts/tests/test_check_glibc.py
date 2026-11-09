@@ -32,16 +32,24 @@ class GlibcBaselineTests(unittest.TestCase):
         for workflow, job_name in [('release.yml', 'build'), ('release-cache-warm.yml', 'release')]:
             document = yaml.safe_load((root / '.github/workflows' / workflow).read_text())
             steps = document['jobs'][job_name]['steps']
-            build = next(step for step in steps if step.get('run', '').startswith('cross build'))
+            packager = 'python3 scripts/package-linux-release.py --target ${{ matrix.target }}'
+            build = next(step for step in steps
+                         if step.get('run', '').startswith(packager) and '--build-only' in step['run'])
             self.assertEqual(build['if'], "runner.os == 'Linux'")
-            self.assertIn('duduclaw-gateway/vendored-openssl', build['run'])
-            guard = next(step for step in steps if step.get('name') == 'Check Linux glibc baseline')
-            self.assertEqual(guard['if'], "runner.os == 'Linux'")
-            self.assertIn('scripts/check_glibc.py', guard['run'])
-            self.assertGreater(steps.index(guard), steps.index(build))
             if workflow == 'release.yml':
-                package = next(step for step in steps if step.get('name') == 'Package (Unix)')
-                self.assertLess(steps.index(guard), steps.index(package))
+                # The packager runs the glibc guard itself (--skip-build step).
+                guard = next(step for step in steps
+                             if step.get('run', '').startswith(packager) and '--skip-build' in step['run'])
+                self.assertEqual(guard['name'], 'Package Linux binaries and check glibc baseline')
+                self.assertIn('check_glibc',
+                              (root / 'scripts/package-linux-release.py').read_text())
+            else:
+                guard = next(step for step in steps if step.get('name') == 'Check Linux glibc baseline')
+                self.assertIn('scripts/check_glibc.py', guard['run'])
+                self.assertIn('${{ matrix.target }}', guard['run'])
+            self.assertEqual(guard['if'], "runner.os == 'Linux'")
+            self.assertGreater(steps.index(guard), steps.index(build))
+            self.assertIn('${{ matrix.target }}', guard['run'])
 
     def test_sidecar_guard_runs_before_staging(self):
         root = Path(__file__).resolve().parents[2]

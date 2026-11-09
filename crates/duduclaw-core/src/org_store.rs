@@ -709,6 +709,7 @@ fn mutate<T>(
         // file's *existence* is the "already bootstrapped" flag that stops the
         // gateway re-seeding (and re-adopting tampered mirrors) every boot.
         if store != before || !path.exists() {
+            crate::isolation_policy::fence_change(home)?;
             write_atomic(&path, &serialize(&store))?;
         }
         // The marker is written whenever the store file exists, so a home

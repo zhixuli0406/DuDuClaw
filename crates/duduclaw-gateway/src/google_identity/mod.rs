@@ -30,6 +30,8 @@ pub(crate) mod credential_registry;
 pub(crate) mod effect_authority;
 pub mod delegation_key;
 pub mod execute;
+pub mod isolation_bridge;
+pub mod isolation_routes;
 pub(crate) mod home_source;
 pub mod mailbox;
 pub(crate) mod mcp_mount;
@@ -37,6 +39,7 @@ pub mod native_tools;
 pub mod requester_gate;
 pub mod resolve;
 pub mod route;
+pub(crate) mod tenant_source;
 
 #[cfg(test)]
 pub(crate) mod route_test_probe;
@@ -124,7 +127,12 @@ pub fn gate_with(
 /// [`protection_gate`] on the blocking pool.
 pub async fn protection_gate_async(home: &Path) -> Result<ProtectedKey, Refusal> {
     let home = home.to_path_buf();
-    tokio::task::spawn_blocking(move || protection_gate(&home))
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    tokio::task::spawn_blocking(move || authority.run(|| {
+        duduclaw_mcp_boundary::io_authority::verify_before_io()
+            .map_err(|_| Refusal::hard("identity_changed", "本次隔離操作的授權已失效。"))?;
+        protection_gate(&home)
+    }))
         .await
         .unwrap_or_else(|_| {
             Err(Refusal::hard(

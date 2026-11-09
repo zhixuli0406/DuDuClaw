@@ -45,6 +45,9 @@ pub(super) fn agent_unavailable() -> ChatMessage {
 
 impl WebChatState {
     /// None preserves the existing admin/widget default path byte for byte.
+    /// P1h (N1): `None` picks no target by itself — the caller
+    /// (`route::decide_webchat_route`) still runs `authorize_target` on the default
+    /// it falls back to, whose Personal check precedes the Admin shortcut.
     pub(super) async fn resolve_new_agent(&self, user: &str) -> Result<Option<String>, &'static str> {
         if is_widget_visitor(user) { return Ok(None); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| "unavailable")?;
@@ -57,9 +60,7 @@ impl WebChatState {
             .await.map_err(|_| "unavailable")?.map_err(|_| "unavailable")?;
         let reg = self.ctx.registry.read().await;
         let candidates: Vec<String> = reg.list().into_iter().filter_map(|a| {
-            let id = &a.config.agent.name;
-            (a.config.agent.status.is_operational() && snapshot.access.may_assign(id)
-                && sender.webchat_allows(a) && sender.may_call(a, None)).then(|| id.clone())
+            primary_candidate(&sender, a).then(|| a.config.agent.name.clone())
         }).collect();
         if let Some(primary) = primary.filter(|id| candidates.iter().any(|a| a == id)) {
             return Ok(Some(primary));
@@ -81,24 +82,26 @@ impl WebChatState {
         )) { return Ok(()); }
         if is_widget_visitor(user) { return Ok(()); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| agent_unavailable())?;
-        if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }
+        // P1h (N1): no Admin shortcut for assignment targets. An Admin's
+        // targets differ from everyone's only by another person's Personal
+        // employees (`assignment_text_allowed`), and resuming a schedule goes
+        // through `authorize_target`, whose Personal check runs before its own
+        // Admin shortcut. Pausing or removing one of the Admin's OWN schedules
+        // only stops work, so it stays possible (a legacy schedule on someone
+        // else's Personal employee can still be cleaned up).
+        let admin = snapshot.role() == duduclaw_auth::UserRole::Admin;
         if let AssignCommand::Text(text) = command {
-            use duduclaw_agent::trigger_match::{self, MentionScan};
             let sender = SenderAccess::from_effective(snapshot.access)
                 .for_webchat(gateway_default_id(&self.ctx.home_dir).await);
             let reg = self.ctx.registry.read().await;
-            let targets = crate::trigger_route::assign::assignment_mention_targets(
-                &reg, &sender, "webchat", None,
-            );
-            if trigger_match::has_named_mention(text)
-                && !matches!(trigger_match::scan_mentions(text, &targets, &|_| true),
-                    MentionScan::Hit(_) | MentionScan::Partial { .. })
-            {
+            if !assignment_text_allowed(&reg, &sender, text, duduclaw_auth::acl::personal_restriction()) {
                 tracing::warn!(user, "WebChat assignment target unavailable");
                 return Err(agent_unavailable());
             }
             return Ok(());
         }
+        let stops_work = matches!(command,
+            AssignCommand::Schedules(ScheduleCommand::Pause(_) | ScheduleCommand::Remove(_)));
         let AssignCommand::Schedules(
             ScheduleCommand::Pause(arg) | ScheduleCommand::Resume(arg) | ScheduleCommand::Remove(arg),
         ) = command else { return Ok(()); };
@@ -110,7 +113,9 @@ impl WebChatState {
         let mut matches = rows.iter().filter(|r| r.id == *arg || duduclaw_core::truncate_chars(&r.id, 8) == *arg);
         let row = matches.next().ok_or_else(not_found)?;
         if matches.next().is_some() { return Err(not_found()); }
-        self.authorize_target(user, &row.agent_id, false).await?;
+        if !(admin && stops_work) {
+            self.authorize_target(user, &row.agent_id, false).await?;
+        }
         // Bind subsequent command execution to the checked row, never resolve
         // the short display number against a second potentially changed list.
         *arg = row.id.clone();
@@ -148,6 +153,20 @@ impl WebChatState {
         };
         if is_widget_visitor(user) { return Ok(()); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| denied("identity_unavailable"))?;
+        // v1.81 P1g: talking to a Personal employee makes it run work for the
+        // caller — its owner only, whatever the role (read fresh; unreadable
+        // ownership refuses). Checked before the Admin shortcut.
+        if crate::runtime_readiness::is_protected_linux() {
+            let (home, who, target) = (self.ctx.home_dir.clone(), user.to_owned(), agent.to_owned());
+            let refused = tokio::task::spawn_blocking(move || {
+                crate::personal_visibility::acl_denies(&home, true, &who, &target)
+            })
+            .await
+            .unwrap_or(true);
+            if refused {
+                return Err(denied("personal_employee"));
+            }
+        }
         if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }
         let default = gateway_default_id(&self.ctx.home_dir).await.map_err(|_| denied("config_unavailable"))?;
         let sender = SenderAccess::from_effective(snapshot.access.clone()).for_webchat(Ok(default));
@@ -158,6 +177,72 @@ impl WebChatState {
         }
         Ok(())
     }
+}
+
+/// `/交辦 <text>` on WebChat: a named mention must hit (or partially match)
+/// an employee this sender may assign to; otherwise the same
+/// non-enumerating "unavailable" frame as an unknown name. P1h (N1): applies
+/// to Admins too — another person's Personal employee is not a target.
+pub(crate) fn assignment_text_allowed(
+    reg: &duduclaw_agent::registry::AgentRegistry,
+    sender: &SenderAccess,
+    text: &str,
+    restriction: Option<&dyn duduclaw_auth::acl::PersonalRestriction>,
+) -> bool {
+    use crate::trigger_route::assign::{AssignRight, assign_right_under, assignment_mention_targets_under};
+    use duduclaw_agent::trigger_match::{self, MentionScan};
+    if !trigger_match::has_named_mention(text) {
+        return true;
+    }
+    if matches!(sender.sender, crate::trigger_route::Sender::Admin { .. }) {
+        // Admins keep the legacy detail for unknown names (usage reply); only
+        // a mention that resolves to nothing but a refused employee — another
+        // person's Personal one — is stopped here.
+        let all = crate::trigger_route::mention_targets(reg);
+        let allowed = |id: &str| matches!(assign_right_under(reg, sender, id, None, restriction), AssignRight::Allowed(_));
+        return !matches!(trigger_match::scan_mentions(text, &all, &allowed), MentionScan::Forbidden(_));
+    }
+    let targets = assignment_mention_targets_under(reg, sender, "webchat", None, restriction);
+    matches!(trigger_match::scan_mentions(text, &targets, &|_| true), MentionScan::Hit(_) | MentionScan::Partial { .. })
+}
+
+/// Whether `agent` may be what a dashboard account talks to by default: the
+/// filter WebChat applies to a non-admin account's candidates (and so to its
+/// 主要 AI 員工) — live, the account may hand it work (Operator or above, or
+/// Admin), and the WebChat target rules allow it (no main-role or gateway
+/// default employee for non-admins; `sender` should carry
+/// [`SenderAccess::for_webchat`] so those rules apply). The Telegram shared
+/// bot's primary-employee route (RM-172) uses the same check, so an employee
+/// the account may no longer use is skipped there exactly as in WebChat.
+///
+/// v1.81 P1h (N1): another person's Personal employee is never a primary
+/// candidate (owner only, whatever the role; unreadable ownership refuses).
+/// Checked explicitly because `may_assign` ignores the Personal restriction
+/// and `may_call` lets an owner-set `public_trigger` through — that opens
+/// calling, never routing the sender's work to it. This keeps the Telegram
+/// primary route under the same rule WebChat's `authorize_target` enforces.
+pub(crate) fn primary_candidate(sender: &SenderAccess, agent: &duduclaw_agent::registry::LoadedAgent) -> bool {
+    primary_candidate_under(sender, agent, duduclaw_auth::acl::personal_restriction())
+}
+
+/// [`primary_candidate`] under an explicit Personal restriction (tests; the
+/// production path uses the restriction installed at gateway boot).
+pub(crate) fn primary_candidate_under(
+    sender: &SenderAccess,
+    agent: &duduclaw_agent::registry::LoadedAgent,
+    restriction: Option<&dyn duduclaw_auth::acl::PersonalRestriction>,
+) -> bool {
+    let name = agent.config.agent.name.as_str();
+    let may_assign = match &sender.sender {
+        crate::trigger_route::Sender::Admin { .. } => true,
+        crate::trigger_route::Sender::Account { access, .. } => access.may_assign(name),
+        crate::trigger_route::Sender::Unmapped => false,
+    };
+    agent.config.agent.status.is_operational()
+        && may_assign
+        && !sender.personal_denied_under(name, restriction)
+        && sender.webchat_allows(agent)
+        && sender.may_call_under(agent, None, restriction)
 }
 
 /// Shared by async admission and the synchronous final-write policy fence.

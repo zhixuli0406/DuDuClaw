@@ -434,7 +434,7 @@ pub(crate) async fn apply_decision(
                 user.display_name.clone(),
                 crate::decision_card::DecisionVerb::Approved,
             );
-            match apply_install_request(home_dir, &req).await {
+            match apply_install_request(home_dir, &req, Some(&db), &user.id).await {
                 Ok(_) => {
                     let _ = store.mark_executed(request_id, true, None).await;
                     notify_requester(
@@ -587,10 +587,33 @@ pub(crate) fn sanitize_tmp_file_stem(name: &str) -> String {
 /// path has no handler, so a skill installed this way is hot-loaded on the
 /// gateway's next registry scan rather than instantly. Re-scans fail-closed so
 /// a payload whose risk changed since filing is still blocked here.
+///
+/// SR5 item 1: like the dashboard twin, a Personal employee's install runs
+/// only for its owner's request, audited in `audit_db` as a config write
+/// (`handlers::skills_install_target::authorize_requested_write`; protected
+/// mode, fail closed), and only into a live employee tree — never one this
+/// call would create.
 pub async fn apply_install_request(
     home_dir: &Path,
     req: &InstallRequest,
+    audit_db: Option<&UserDb>,
+    decider: &str,
 ) -> Result<serde_json::Value, String> {
+    use crate::handlers::skills_install_target as target;
+    if let Some(employee) = target::request_employee(req) {
+        target::authorize_requested_write(
+            home_dir,
+            audit_db,
+            crate::runtime_readiness::is_protected_linux(),
+            &target::RequestedWrite {
+                method: target::request_method(req),
+                request_id: &req.id,
+                requester: &req.requester_id,
+                decider,
+                employee,
+            },
+        )?;
+    }
     match req.kind.as_str() {
         "skill" => {
             let scope = req
@@ -645,12 +668,16 @@ pub async fn apply_install_request(
                 )
                 .await
             } else {
-                if !crate::handlers::is_valid_agent_id(scope) {
-                    let _ = std::fs::remove_file(&tmp_file);
-                    return Err("invalid agent_id for scope".into());
-                }
-                let dir = home_dir.join("agents").join(scope).join("SKILLS");
-                duduclaw_agent::skill_loader::install_skill(&tmp_file, &dir, &quarantine).await
+                // SR5 item 1: live employee only; `agents/<label>` is never created.
+                let dir = match target::live_employee_dir(home_dir, scope) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp_file);
+                        return Err(e.into());
+                    }
+                };
+                // SR5 round 3 N8: only SKILLS/ inside the checked tree is created.
+                duduclaw_agent::skill_loader::install_skill_into_employee(&tmp_file, &dir, &quarantine).await
             };
             let _ = std::fs::remove_file(&tmp_file);
             let parsed = result?;
@@ -688,10 +715,9 @@ pub async fn apply_install_request(
                     scan.risk_level
                 ));
             }
-            let agent_dir = home_dir.join("agents").join(agent_id);
-            if !agent_dir.is_dir() {
-                return Err(format!("agent '{agent_id}' not found"));
-            }
+            // SR5 item 1: live employee only (F6h gate + lifecycle read).
+            let agent_dir = target::live_employee_dir(home_dir, agent_id)
+                .map_err(|e| format!("agent '{agent_id}': {e}"))?;
             let ad = agent_dir.clone();
             let sn = server_name.to_string();
             let d = def.clone();

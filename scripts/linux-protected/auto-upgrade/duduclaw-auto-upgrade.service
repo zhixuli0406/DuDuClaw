@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/duduclaw-auto-upgrade
-# Explicit root is required for the trusted binary, version ledger and systemctl.
+# Root reads the ledger and drops the network child to duduclaw-dl.
 User=root
 # New temporary files are accessible only to root.
 UMask=0077
@@ -18,12 +18,12 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 # Prevent changes to kernel logs; journald stdout/stderr logging still works.
 ProtectKernelLogs=yes
-# Allow 300 s downloads with retries plus install/restart after version-pending.
-TimeoutStartSec=1h
+# Candidate discovery is bounded; Apply returns after durable queueing.
+TimeoutStartSec=6min
 # Make the host filesystem read-only except the explicit upgrade paths.
 ProtectSystem=strict
-# Staging/binary replacement and the version lock/ledger need these writes.
-ReadWritePaths=/opt/duduclaw /var/lib/duduclaw-protected
+# This requester writes no release files; installation belongs to updated.
+ReadOnlyPaths=/var/lib/duduclaw-updated /etc/duduclaw-updated
 # The upgrade never needs user homes or root's home.
 ProtectHome=yes
 # Give API response files a private writable /tmp.

@@ -585,10 +585,25 @@ impl MethodHandler {
             let Ok(raw) = handles::resolve(&self.home_dir, &ctx.user_id, requested).await else {
                 return error("not_found", "session not found", None);
             };
-            match rc.session_manager.session_agent(&raw).await {
-                Ok(Some(agent)) => (raw, agent, "admin", None),
+            let agent = match rc.session_manager.session_agent(&raw).await {
+                Ok(Some(agent)) => agent,
                 _ => return error("not_found", "session not found", None),
+            };
+            // v1.81 P1: another person's Personal employee's conversation is
+            // restored by an Admin only through the audited break-glass
+            // step-up (protected mode; a no-op elsewhere). The manager path
+            // below never reaches a Personal employee (team oversight skips
+            // them in SQL).
+            let step_up = params.get(super::personal_data_gate::STEP_UP_FIELD)
+                .and_then(|raw| serde_json::from_value::<[u8; 32]>(raw.clone()).ok());
+            if let Err(e) = self.personal_data_gate(ctx, super::personal_data_gate::Target {
+                method: "users.team_history.restore",
+                category: crate::personal_visibility::DataCategory::Sessions,
+                agent: &agent,
+            }, step_up).await {
+                return error("permission_denied", e, None);
             }
+            (raw, agent, "admin", None)
         } else {
             match self.team_history_session_access(&params, ctx).await {
                 Ok(access) => (access.id, access.agent, "team_history", Some(access.scope)),

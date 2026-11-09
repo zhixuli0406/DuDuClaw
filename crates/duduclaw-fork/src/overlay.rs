@@ -73,10 +73,9 @@ fn clone_tree_native(src: &Path, dst: &Path) -> Result<()> {
         // so the probe correctly degrades to Snapshot.
         cmd.arg("--reflink=always").arg("-R");
     }
-    let out = cmd
-        .arg(src)
-        .arg(dst)
-        .output()
+    cmd.arg(src).arg(dst);
+    let out = duduclaw_core::execution_blocking::output(&mut cmd,
+        duduclaw_core::execution_gate::ExecutionClass::Fork)
         .map_err(|e| ForkError::Overlay(format!("spawn cp for CoW clone: {e}")))?;
     if out.status.success() {
         Ok(())

@@ -289,3 +289,15 @@ fn master_off_sa_precedence_and_missing_oauth_never_choose_a_different_backend()
     std::fs::write(d.path().join(crate::mcp_oauth::TOKEN_FILE), "[]").unwrap();
     assert!(prepare_home_native_selection(d.path(), "gmail_read").is_err());
 }
+
+#[test]
+fn isolation_metadata_selection_is_read_only_and_refuses_legacy_unprepared_rows() {
+    let d = fixture(&["https://www.googleapis.com/auth/gmail.readonly"]);
+    let mut value = rows(d.path());
+    value[0].as_object_mut().unwrap().remove("google_home");
+    std::fs::write(d.path().join(crate::mcp_oauth::TOKEN_FILE), serde_json::to_vec(&value).unwrap()).unwrap();
+    let before = std::fs::read(d.path().join(crate::mcp_oauth::TOKEN_FILE)).unwrap();
+    assert!(read_home_native_selection(d.path(), "gmail_read").is_err());
+    assert_eq!(before, std::fs::read(d.path().join(crate::mcp_oauth::TOKEN_FILE)).unwrap());
+    assert!(!d.path().join(".keyfile").exists());
+}

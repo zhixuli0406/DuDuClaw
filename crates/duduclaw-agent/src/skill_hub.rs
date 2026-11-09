@@ -1043,10 +1043,10 @@ impl SkillHub for SkillsShHub {
 #[derive(Debug, Default)]
 pub struct AnthropicSkillsHub;
 
-const ANTHROPIC_OWNER_REPO: &str = "anthropics/skills";
+pub const ANTHROPIC_OWNER_REPO: &str = "anthropics/skills";
 /// Pinned commit SHA (captured 2026-07-27). Indexing + install both resolve
 /// against this immutable ref; bump deliberately, never float to a branch.
-const ANTHROPIC_PIN_SHA: &str = "b29e7cf65e5cb78a5ac33d582270551bc74a14eb";
+pub const ANTHROPIC_PIN_SHA: &str = "b29e7cf65e5cb78a5ac33d582270551bc74a14eb";
 
 /// Parse a GitHub git-trees (recursive) body into official skill entries.
 /// A skill is any blob at `skills/<name>/SKILL.md`; `name` is the middle

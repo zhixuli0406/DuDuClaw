@@ -156,11 +156,11 @@ impl Drop for RemoveOnDrop {
                         // No runtime to drive the client: fall back to the CLI.
                         let mut cmd = std::process::Command::new("docker");
                         duduclaw_core::ns_guard::guard_command_std(&mut cmd);
-                        let _ = cmd.args(["rm", "--force", &cli_id])
+                        cmd.args(["rm", "--force", &cli_id])
                             .stdin(std::process::Stdio::null())
                             .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn();
+                            .stderr(std::process::Stdio::null());
+                        let _ = duduclaw_core::execution_blocking::status(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool);
                     }
                 }
             }

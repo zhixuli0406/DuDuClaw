@@ -14,6 +14,10 @@ use rusqlite::{Connection, params};
 use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
+fn verify_live_io() -> Result<(), String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())
+}
+
 // ── Types ──────────────────────────────────────────────────────
 
 /// Known setting keys (type-safe access).
@@ -99,6 +103,16 @@ pub const MCP_ACCESS_KEYS: &[&str] = &[
     keys::REQUIRE_PAIRING,
     keys::ALLOWED_USERS,
     keys::BLOCKED_USERS,
+];
+
+/// Status reports describe presentation and guild identity only. They do not
+/// enumerate access lists, employee routing, or private administrative settings.
+pub const MCP_STATUS_KEYS: &[&str] = &[
+    keys::GUILD_NAME,
+    keys::MENTION_ONLY,
+    keys::AUTO_THREAD,
+    keys::RESPONSE_MODE,
+    keys::THREAD_ARCHIVE_MINUTES,
 ];
 
 /// Access-control keys the dashboard (admin-only, human-operated GUI) may
@@ -190,12 +204,16 @@ pub struct ChannelSettingsManager {
 impl ChannelSettingsManager {
     /// Open or create the channel settings database.
     pub fn new(db_path: &Path) -> Result<Self, String> {
+        verify_live_io()?;
         let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
         if db_path.to_str() != Some(":memory:") {
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
                 .map_err(|e| e.to_string())?;
         }
-        Self::init_tables(&conn)?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        Self::init_tables(&tx)?;
+        verify_live_io()?;
+        tx.commit().map_err(|e| e.to_string())?;
         info!(?db_path, "Channel settings manager initialized");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -205,10 +223,14 @@ impl ChannelSettingsManager {
 
     /// Initialize using an existing session database connection path.
     pub fn from_session_db(db_path: &Path) -> Result<Self, String> {
+        verify_live_io()?;
         let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
             .map_err(|e| e.to_string())?;
-        Self::init_tables(&conn)?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        Self::init_tables(&tx)?;
+        verify_live_io()?;
+        tx.commit().map_err(|e| e.to_string())?;
         info!(?db_path, "Channel settings (co-located with session DB)");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -217,6 +239,7 @@ impl ChannelSettingsManager {
     }
 
     fn init_tables(conn: &Connection) -> Result<(), String> {
+        verify_live_io()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS channel_settings (
                 channel_type TEXT NOT NULL,
@@ -274,6 +297,7 @@ impl ChannelSettingsManager {
     ) -> Result<Vec<(String, String, String)>, String> {
         let wanted = |key: &str| only.is_none_or(|keys| keys.contains(&key));
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let rows = {
             let disk: String = conn
                 .query_row("PRAGMA database_list", [], |r| r.get(2))
@@ -306,6 +330,7 @@ impl ChannelSettingsManager {
         // All database-to-cache publications keep the connection lock until
         // cache installation completes. No reader holds cache while taking DB.
         let mut cache = self.cache.write().await;
+        verify_live_io()?;
         cache.retain(|(ch, sc, _), _| ch != channel || (sc != "global" && sc != scope));
         for (sc, key, value) in &rows {
             cache.insert(Self::cache_key(channel, sc, key), Some(value.clone()));
@@ -316,11 +341,13 @@ impl ChannelSettingsManager {
     /// Get a setting value. Returns `None` if not set.
     /// Uses in-memory cache for read-heavy path.
     pub async fn get(&self, channel_type: &str, scope_id: &str, key: &str) -> Option<String> {
+        if verify_live_io().is_err() { return None; }
         let ck = Self::cache_key(channel_type, scope_id, key);
 
         // Fast path: check cache (RwLock read — no contention with other readers)
         {
             let cache = self.cache.read().await;
+            if verify_live_io().is_err() { return None; }
             if let Some(cached) = cache.get(&ck) {
                 return cached.clone();
             }
@@ -328,6 +355,7 @@ impl ChannelSettingsManager {
 
         // Slow path: query DB and populate cache
         let conn = self.conn.lock().await;
+        if verify_live_io().is_err() { return None; }
         let result: Option<String> = conn.query_row(
             "SELECT value FROM channel_settings WHERE channel_type = ?1 AND scope_id = ?2 AND key = ?3",
             params![channel_type, scope_id, key],
@@ -338,6 +366,7 @@ impl ChannelSettingsManager {
 
         // Store in cache (including None to avoid repeated DB misses)
         let mut cache = self.cache.write().await;
+        if verify_live_io().is_err() { return None; }
         cache.insert(ck, result.clone());
 
         result
@@ -454,7 +483,14 @@ impl ChannelSettingsManager {
         key: &str,
         value: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        verify_live_io()?;
+        // Wait for cache access before opening the synchronous transaction.
+        let mut cache = self.cache.write().await;
+        verify_live_io()?;
+        let conn = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        verify_live_io()?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO channel_settings (channel_type, scope_id, key, value, updated_at)
@@ -464,8 +500,9 @@ impl ChannelSettingsManager {
         )
         .map_err(|e| e.to_string())?;
 
-        // Invalidate cache
-        let mut cache = self.cache.write().await;
+        verify_live_io()?;
+        conn.commit().map_err(|e| e.to_string())?;
+        // Publish the cache only after the checked transaction committed.
         let ck = Self::cache_key(channel_type, scope_id, key);
         cache.insert(ck, Some(value.to_string()));
 
@@ -479,15 +516,23 @@ impl ChannelSettingsManager {
         scope_id: &str,
         key: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        verify_live_io()?;
+        // Wait for cache access before opening the synchronous transaction.
+        let mut cache = self.cache.write().await;
+        verify_live_io()?;
+        let conn = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        verify_live_io()?;
         conn.execute(
             "DELETE FROM channel_settings WHERE channel_type = ?1 AND scope_id = ?2 AND key = ?3",
             params![channel_type, scope_id, key],
         )
         .map_err(|e| e.to_string())?;
 
-        // Invalidate cache
-        let mut cache = self.cache.write().await;
+        verify_live_io()?;
+        conn.commit().map_err(|e| e.to_string())?;
+        // Publish the cache only after the checked transaction committed.
         let ck = Self::cache_key(channel_type, scope_id, key);
         cache.insert(ck, None);
 
@@ -497,6 +542,7 @@ impl ChannelSettingsManager {
     /// Get all settings for a scope.
     pub async fn get_all(&self, channel_type: &str, scope_id: &str) -> Vec<(String, String)> {
         let conn = self.conn.lock().await;
+        if verify_live_io().is_err() { return Vec::new(); }
         let mut stmt = match conn.prepare(
             "SELECT key, value FROM channel_settings WHERE channel_type = ?1 AND scope_id = ?2",
         ) {
@@ -508,6 +554,20 @@ impl ChannelSettingsManager {
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+
+    /// Read only keys exposed by the MCP channel_config contract.
+    pub async fn get_mcp_config(&self, channel_type: &str, scope_id: &str) -> Vec<(String, String)> {
+        self.get_all(channel_type, scope_id).await.into_iter()
+            .filter(|(key, _)| CONFIG_KEYS.contains(&key.as_str()) || MCP_ACCESS_KEYS.contains(&key.as_str()))
+            .collect()
+    }
+
+    /// Read the narrower status-report projection; unknown future keys stay private.
+    pub async fn get_mcp_status(&self, channel_type: &str, scope_id: &str) -> Vec<(String, String)> {
+        self.get_all(channel_type, scope_id).await.into_iter()
+            .filter(|(key, _)| MCP_STATUS_KEYS.contains(&key.as_str()))
+            .collect()
     }
 
     /// Check if a channel_id is allowed for a given scope.
@@ -573,6 +633,7 @@ impl ChannelSettingsManager {
     /// Used by the `channel_status` MCP tool to enumerate known guilds/chats.
     pub async fn list_scopes(&self, channel_type: &str) -> Vec<String> {
         let conn = self.conn.lock().await;
+        if verify_live_io().is_err() { return Vec::new(); }
         let mut stmt = match conn.prepare(
             "SELECT DISTINCT scope_id FROM channel_settings WHERE channel_type = ?1 AND scope_id != 'global'"
         ) {
@@ -964,6 +1025,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_settings_projections_exclude_private_and_unknown_keys() {
+        let (_tmp, mgr) = temp_db();
+        for key in CONFIG_KEYS.iter().chain(MCP_ACCESS_KEYS).chain(MCP_STATUS_KEYS)
+            .chain([keys::ADMIN_USERS, keys::GROUP_CONTEXT, keys::DISCORD_AGENT_CHOICES,
+                keys::SHARED_BOT_BINDING, "future_private_key"].iter()) {
+            mgr.set("discord", "guild1", key, "canary").await.unwrap();
+        }
+        let config: std::collections::BTreeSet<_> = mgr.get_mcp_config("discord", "guild1").await
+            .into_iter().map(|(key, _)| key).collect();
+        let expected: std::collections::BTreeSet<_> = CONFIG_KEYS.iter().chain(MCP_ACCESS_KEYS)
+            .map(|key| (*key).to_owned()).collect();
+        assert_eq!(config, expected);
+        let status: std::collections::BTreeSet<_> = mgr.get_mcp_status("discord", "guild1").await
+            .into_iter().map(|(key, _)| key).collect();
+        assert_eq!(status, MCP_STATUS_KEYS.iter().map(|key| (*key).to_owned()).collect());
+        assert!(mgr.get_all("discord", "guild1").await.iter().any(|(key, _)| key == keys::ADMIN_USERS));
+    }
+
+    #[tokio::test]
     async fn test_guild_whitelist_empty_allows_all() {
         let (_tmp, mgr) = temp_db();
         assert!(mgr.is_guild_allowed("discord", "g999").await);
@@ -1085,5 +1165,32 @@ mod tests {
         let mut scopes = mgr.list_scopes("discord").await;
         scopes.sort();
         assert_eq!(scopes, vec!["g1".to_string(), "g2".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod isolation_authority_tests {
+    use super::*;
+    use std::{future::Future, sync::{Arc, atomic::{AtomicBool, Ordering}}, task::Poll};
+    use duduclaw_mcp_boundary::io_authority;
+
+    #[tokio::test]
+    async fn revoked_settings_writers_waiting_on_database_do_not_publish_or_cache() {
+        for delete in [false, true] {
+            let manager = ChannelSettingsManager::new(Path::new(":memory:")).unwrap();
+            manager.set("telegram", "global", "mention_only", "true").await.unwrap();
+            let live = Arc::new(AtomicBool::new(true));
+            let held = manager.conn.lock().await;
+            let request = io_authority::scope(crate::isolation_io_test_support::context(live.clone()), async {
+                if delete { manager.delete("telegram", "global", "mention_only").await }
+                else { manager.set("telegram", "global", "mention_only", "false").await }
+            });
+            tokio::pin!(request);
+            std::future::poll_fn(|cx| { assert!(request.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
+            live.store(false, Ordering::SeqCst);
+            drop(held);
+            assert!(request.await.unwrap_err().contains("revoked"));
+            assert_eq!(manager.get("telegram", "global", "mention_only").await.as_deref(), Some("true"));
+        }
     }
 }

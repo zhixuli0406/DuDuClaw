@@ -151,6 +151,8 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
         let mut tokens = match result {
             Ok(tokens) => tokens,
             Err(oauth::Error::InvalidGrant) => {
+                // v1.81 C4: consent revoked at Google; fence catalog routes first.
+                super::lifecycle::consent_revoked(home, &record.metadata);
                 let _ = vault::mark_needs_reconnect(home, &record.metadata)?;
                 return Err("Google 連線已失效，請到「我的連線」重新連結。".into());
             }

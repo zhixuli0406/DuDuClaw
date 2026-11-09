@@ -35,6 +35,17 @@ impl MethodHandler {
                 }
             };
         }
+        // v1.81 P1g: the explicit Admin management allowlist (name / status
+        // metadata, pause / resume). `check_agent!` refuses another person's
+        // Personal employee for every role; this keeps the Admin shortcut.
+        macro_rules! check_agent_mgmt {
+            ($min_level:expr) => {
+                match acl::extract_and_check_management(ctx, &params, $min_level) {
+                    Ok(id) => id,
+                    Err(e) => return WsFrame::error_response("", &e),
+                }
+            };
+        }
 
         match method {
             "connect.challenge" => self.handle_connect_challenge(params),
@@ -68,7 +79,10 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_agents_health(ctx, params)).await
             }
             "agents.status" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                // P1g allowlist: runtime status metadata (audited for an
+                // Admin on another person's Personal employee).
+                let agent_id = check_agent_mgmt!(AccessLevel::Viewer);
+                self.personal_metadata_audit(ctx, method, &agent_id).await;
                 boxed_frame(|| self.handle_agents_status(params)).await
             }
             // ── WP-6F P1: agent presets ("職務組合"), read-only —────────
@@ -79,7 +93,9 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_presets_list()).await
             }
             "presets.status" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                // P1g allowlist: the bound preset's name only.
+                let agent_id = check_agent_mgmt!(AccessLevel::Viewer);
+                self.personal_metadata_audit(ctx, method, &agent_id).await;
                 boxed_frame(|| self.handle_presets_status(params)).await
             }
             "agents.export_profile" => {
@@ -101,8 +117,9 @@ impl MethodHandler {
             }
             "agents.pause" => {
                 require_manager!();
-                let agent_id = check_agent!(AccessLevel::Operator);
-                match crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, &agent_id, AccessLevel::Operator) {
+                // P1g allowlist: operational control (audited below).
+                let agent_id = check_agent_mgmt!(AccessLevel::Operator);
+                match crate::agent_files::flow::require_live_management_access(&self.home_dir, ctx, &agent_id, AccessLevel::Operator) {
                     Ok(live) => {
                         if let Err(e) = acl::require_role(&live, UserRole::Manager) {
                             return WsFrame::error_response("", &e);
@@ -110,24 +127,36 @@ impl MethodHandler {
                     }
                     Err(e) => return WsFrame::error_response("", &e),
                 }
+                // v1.81 P1e: pausing another person's Personal employee is audited.
+                if let Err(e) = self.personal_control_audit(ctx, method, &agent_id).await {
+                    return WsFrame::error_response("", e);
+                }
                 boxed_frame(|| self.handle_agents_pause(params, ctx)).await
             }
             "agents.resume" => {
                 require_manager!();
-                let agent_id = check_agent!(AccessLevel::Operator);
-                match crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, &agent_id, AccessLevel::Operator) {
+                // P1g allowlist: operational control (audited below).
+                let agent_id = check_agent_mgmt!(AccessLevel::Operator);
+                match crate::agent_files::flow::require_live_management_access(&self.home_dir, ctx, &agent_id, AccessLevel::Operator) {
                     Ok(live) => {
                         if let Err(e) = acl::require_role(&live, UserRole::Manager) {
                             return WsFrame::error_response("", &e);
                         }
                     }
                     Err(e) => return WsFrame::error_response("", &e),
+                }
+                // v1.81 P1e: resuming another person's Personal employee is audited.
+                if let Err(e) = self.personal_control_audit(ctx, method, &agent_id).await {
+                    return WsFrame::error_response("", e);
                 }
                 boxed_frame(|| self.handle_agents_resume(params, ctx)).await
             }
             "agents.update" => {
                 // First a quick check against the session; then (D7) the
                 // binding is re-read from users.db for the write itself.
+                // v1.81 P1e: on another person's Personal employee the
+                // dispatch gate (`personal_data_gate::write_scoped`) already
+                // required the owner or an audited Admin step-up.
                 let agent_id = check_agent!(AccessLevel::Owner);
                 match crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, &agent_id, AccessLevel::Owner) {
                     Ok(live) => boxed_frame(|| self.handle_agents_update_live(params, &live, ctx)).await,
@@ -173,7 +202,9 @@ impl MethodHandler {
             }
             // E1: cheap avatar-only read (no telemetry / config serialization).
             "agents.avatar" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                // P1g allowlist: the avatar image (also in every listing).
+                let agent_id = check_agent_mgmt!(AccessLevel::Viewer);
+                self.personal_metadata_audit(ctx, method, &agent_id).await;
                 boxed_frame(|| self.handle_agents_avatar(params)).await
             }
 

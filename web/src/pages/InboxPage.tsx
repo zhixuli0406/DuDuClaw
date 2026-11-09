@@ -18,6 +18,7 @@ import { INBOX_INVALIDATIONS, subscribeInvalidations } from '@/lib/live-events';
 import { useAuthStore } from '@/stores/auth-store';
 import { excludeRecoveredChannelFailures, channelFailureChannel, resolveFailureAgentId, failedRunTitle, failedRunHref, failureRunId } from '@/lib/home-overview';
 import { toast, formatError } from '@/lib/toast';
+import { withBreakGlass } from '@/lib/break-glass';
 import { cn } from '@/lib/utils';
 import {
   Tabs, TabsList, TabsTab,
@@ -492,7 +493,13 @@ export function InboxPage() {
         return rest;
       });
       try {
-        const res = await api.approvals.decide(a.id, approve, undefined, a.digest ?? undefined);
+        // v1.81 P1 break-glass: see lib/break-glass.ts.
+        const res = await withBreakGlass(
+          (token) => (token
+            ? api.approvals.decide(a.id, approve, undefined, a.digest ?? undefined, token)
+            : api.approvals.decide(a.id, approve, undefined, a.digest ?? undefined)),
+          { purpose: 'decide' },
+        );
         if (approve) setApprovedToday(bumpApprovedToday());
         // A knowledge-quarantine decision says what happened to the memory;
         // every other kind keeps the generic text.

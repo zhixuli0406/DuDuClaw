@@ -2,9 +2,15 @@
 use super::*;
 use duduclaw_gateway::discovery::service::{self, TrustedCaller};
 fn caller(home: &Path, agent: &str) -> std::result::Result<TrustedCaller,String> {
-    let claim=std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    if let Some(call) = crate::mcp_isolation::current() {
+        if call.home != home || call.agent != agent {
+            return Err("discovery caller does not match the verified request".into());
+        }
+        return TrustedCaller::from_isolated_agent(home, agent);
+    }
+    let claim=crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
     if claim != agent { return Err("discovery requires an explicit signed caller identity".into()); }
-    let token=std::env::var(duduclaw_core::ENV_AGENT_TOKEN).ok();
+    let token=crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_TOKEN).ok();
     TrustedCaller::from_signed_agent(home,&claim,token.as_deref())
 }
 pub(crate) async fn handle_discovery_create(args: &Value, home: &Path, agent: &str) -> Value {
@@ -31,7 +37,20 @@ pub(crate) async fn handle_discovery_create(args: &Value, home: &Path, agent: &s
         Ok(created)=>tool_text(&serde_json::to_string(&created).unwrap()),Err(error)=>tool_error(&error)
     }
 }
+/// FD-SEL (Package H 22–26): under a verified isolated call the five discovery
+/// job tools accept exactly their protected schema and the record's own
+/// Employee grant (`tool_policy::own_reads`). Ownership itself — the request's
+/// exact `(employee id, incarnation)` creator binding — is checked by the host
+/// service, which answers a foreign and an unknown run alike
+/// (`service::DISCOVERY_NOT_FOUND`). Unprotected calls are unchanged.
+fn protected_refusal(name: &str, args: &Value) -> Option<Value> {
+    let call = crate::mcp_isolation::current()?;
+    let selected = duduclaw_mcp_boundary::tool_policy::check_own_read_arguments(name, args).is_ok()
+        && duduclaw_mcp_boundary::tool_policy::own_read_selector(&call.context, name).is_ok();
+    (!selected).then(|| tool_error("無法確認這次探索操作的員工身分與授權，已拒絕執行。"))
+}
 pub(crate) async fn handle_discovery_query(name: &str,args: &Value,home: &Path,agent: &str) -> Value {
+    if let Some(refused) = protected_refusal(name, args) { return refused; }
     let caller=match caller(home,agent) {Ok(caller)=>caller,Err(error)=>return tool_error(&error)};
     let run=args.get("run_id").and_then(Value::as_str).unwrap_or("");
     let result=match name {
@@ -45,3 +64,7 @@ pub(crate) async fn handle_discovery_query(name: &str,args: &Value,home: &Path,a
     };
     match result {Ok(value)=>tool_text(&value.to_string()),Err(error)=>tool_error(&error)}
 }
+
+#[cfg(test)]
+#[path = "discovery_isolation_tests.rs"]
+mod isolation_tests;

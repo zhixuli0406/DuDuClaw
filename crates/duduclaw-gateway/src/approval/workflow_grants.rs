@@ -374,11 +374,10 @@ impl ApprovalBroker {
             return Err("workflow operation policy changed".into());
         }
         let mut conn = self.store.conn.lock().await;
+        verify_live_io()?;
         self.attach_workflow_reader(&conn)?;
         self.attach_tasks(&conn, binding)?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
         Self::check_granted_material(&tx, reference, step_key, payload, binding)?;
         Self::check_task(&tx, binding)?;
         let id = uuid::Uuid::new_v4().to_string();
@@ -443,7 +442,7 @@ impl ApprovalBroker {
         {
             return Err("step already has different effect authority or contract".into());
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        commit_live_write(tx)?;
         Ok(existing.0)
     }
     /// Capture server-owned run authority; human approval never replaces this fence.
@@ -538,6 +537,23 @@ impl ApprovalBroker {
                     .map_err(|e| e.to_string())?;
                 if !valid {
                     return Err("human operation authority revoked or expired".into());
+                }
+                // SR5 round 3 N1/N2: the approval's employee incarnation, in
+                // this same transaction (rule shared with `consume_approved`).
+                // Refused deterministically on every check; the operation
+                // never runs on a card of another incarnation or on a NULL
+                // card of a protected employee.
+                let (agent, stored): (String, Option<i64>) = tx
+                    .query_row(
+                        "SELECT agent_id,employee_incarnation FROM main.approvals WHERE id=?1",
+                        params![approval],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let home = tx.path().filter(|path| !path.is_empty())
+                    .and_then(|path| std::path::Path::new(path).parent());
+                if let Err((_, refusal)) = super::store::card_consumable(home, &agent, stored) {
+                    return Err(refusal);
                 }
                 if binding.run_origin_kind == "workflow" && binding.resume_handler == "workflow_v1"
                 {

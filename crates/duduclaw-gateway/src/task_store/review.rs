@@ -23,9 +23,9 @@ impl TaskStore {
         let now = Utc::now().to_rfc3339();
         {
             let mut conn = self.conn.lock().await;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|e| format!("complete: begin: {e}"))?;
+            verify_live_io()?;
+            duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+            let tx = begin_live_write(&mut conn)?;
             let row: Option<(bool, Option<String>, i64, Option<String>, String)> = tx
                 .query_row(
                     "SELECT goal_mode, claimed_by, revision_round, claimed_at, created_at
@@ -70,6 +70,7 @@ impl TaskStore {
             // reclaimed and reassigned) could clobber the authoritative result
             // by calling complete on an already-`done`/`cancelled` task.
             if goal_mode {
+                duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
                 let affected = tx
                     .execute(
                         "UPDATE tasks
@@ -85,9 +86,11 @@ impl TaskStore {
                 // effect (a terminal-state clobber attempt records nothing).
                 if affected == 1 {
                     let fallback_dispatch = claimed_at.as_deref().unwrap_or(&created_at);
+                    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
                     let secs =
                         iter_submit_conn(&tx, id, &now, revision_round + 1, fallback_dispatch)?;
                     if secs > 0 {
+                        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
                         tx.execute(
                             "UPDATE tasks SET agent_seconds = agent_seconds + ?2 WHERE id = ?1 AND kind IN ('task','goal')",
                             params![id, secs],
@@ -96,6 +99,7 @@ impl TaskStore {
                     }
                 }
             } else {
+                duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
                 tx.execute(
                     "UPDATE tasks
                         SET status = 'done', result_summary = ?2,
@@ -105,7 +109,8 @@ impl TaskStore {
                 )
                 .map_err(|e| format!("complete (done): {e}"))?;
             }
-            tx.commit().map_err(|e| format!("complete: commit: {e}"))?;
+            duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+            commit_live_write(tx)?;
         }
         self.get_task(id).await
     }
@@ -137,7 +142,9 @@ impl TaskStore {
         verdict_json: Option<&str>,
         knobs_json: Option<&str>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let now = Utc::now().to_rfc3339();
         // A1-2: read the accepted round's own output for its excerpt. The
         // UPDATE below never touches `result_summary`, so reading it first is
@@ -184,6 +191,7 @@ impl TaskStore {
                 &now,
             )?;
         }
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
@@ -245,7 +253,9 @@ impl TaskStore {
         // no result text at all.
         let worker_excerpt: Option<String> =
             crate::goal_budget_best_round::worker_excerpt(row.result_summary.as_deref());
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         if row.retry_count < row.max_retries {
             let new_retry = row.retry_count + 1;
             let new_round = row.revision_round + 1;
@@ -274,6 +284,7 @@ impl TaskStore {
                     &now,
                 )?;
             }
+            commit_live_write(conn)?;
             Ok("revising".to_string())
         } else {
             // H11: the retry budget is spent — a hard cap fired, not a fresh
@@ -329,6 +340,7 @@ impl TaskStore {
                     }
                 }
             }
+            commit_live_write(conn)?;
             Ok("needs_human".to_string())
         }
     }
@@ -368,7 +380,9 @@ impl TaskStore {
         reason: &str,
         pause: crate::pause_reason::PauseReason,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let now = Utc::now().to_rfc3339();
         let n = conn
             .execute(
@@ -379,6 +393,7 @@ impl TaskStore {
                 params![id, mask_derived_text(reason), now, pause.as_str()],
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n > 0)
     }
 
@@ -399,7 +414,9 @@ impl TaskStore {
         pause: crate::pause_reason::PauseReason,
         knobs_json: Option<&str>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let now = Utc::now().to_rfc3339();
         let n = conn
             .execute(
@@ -436,6 +453,7 @@ impl TaskStore {
                 tracing::warn!(task = id, error = %e, "A1 ledger: escalated-round seal failed (non-fatal)");
             }
         }
+        commit_live_write(conn)?;
         Ok(n > 0)
     }
 
@@ -448,12 +466,15 @@ impl TaskStore {
     /// failed clear here is harmless (the plan is simply re-injected next
     /// dispatch, which repeats guidance rather than losing anything).
     pub async fn clear_plan_pending(&self, id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         conn.execute(
             "UPDATE tasks SET plan_pending = NULL WHERE id = ?1 AND kind IN ('task','goal')",
             params![id],
         )
         .map_err(|e| format!("clear plan_pending: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 
@@ -499,8 +520,8 @@ impl TaskStore {
             Some(note)
         };
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("resolve needs_human: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         check_goal_decide_revision(&tx, id, expected_updated_at)?;
         let now = Utc::now().to_rfc3339();
         // H11: the pause is over on every branch — clear the class so a task
@@ -540,7 +561,7 @@ impl TaskStore {
         if n == 1 && authenticated {
             survival_decision_receipt_conn(&tx, id, decision)?;
         }
-        tx.commit().map_err(|e| format!("resolve needs_human: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(n == 1)
     }
 
@@ -599,8 +620,8 @@ impl TaskStore {
         }
         let stamped = format!("{CONTINUE_MESSAGE_PREFIX}{message}");
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("continue from terminal: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         check_goal_decide_revision(&tx, id, expected_updated_at)?;
         // P2-A C7: a run an operator stopped is not reopened by "接著做" —
         // the documented path is a successor task under a new contract.
@@ -626,7 +647,7 @@ impl TaskStore {
         if n == 1 && authenticated {
             survival_decision_receipt_conn(&tx, id, "retry")?;
         }
-        tx.commit().map_err(|e| format!("continue from terminal: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(n == 1)
     }
 
@@ -663,8 +684,8 @@ impl TaskStore {
         &self, id: &str, decider: &str, expected_updated_at: Option<&str>,
     ) -> Result<bool, String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("claim needs_human: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         check_goal_decide_revision(&tx, id, expected_updated_at)?;
         let now = Utc::now().to_rfc3339();
         let n = tx
@@ -674,7 +695,7 @@ impl TaskStore {
                 params![id, decider, now],
             )
             .map_err(|e| format!("claim needs_human: {e}"))?;
-        tx.commit().map_err(|e| format!("claim needs_human: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(n == 1)
     }
 
@@ -703,7 +724,9 @@ impl TaskStore {
         if channel.trim().is_empty() || chat_id.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let now = Utc::now().to_rfc3339();
         let mut stmt = conn
             .prepare(
@@ -729,6 +752,7 @@ impl TaskStore {
             )
             .map_err(|e| format!("claim conversation tasks (update {id}): {e}"))?;
         }
+        commit_live_write(conn)?;
         Ok(ids)
     }
 
@@ -737,7 +761,9 @@ impl TaskStore {
     /// before the first dispatch. Idempotent: a task already
     /// `done`/`cancelled`/`failed` is left untouched (returns `Ok(false)`).
     pub async fn cancel_task(&self, id: &str, reason: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let now = Utc::now().to_rfc3339();
         let n = conn
             .execute(
@@ -747,6 +773,7 @@ impl TaskStore {
                 params![id, mask_derived_text(reason), now],
             )
             .map_err(|e| format!("cancel task: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 

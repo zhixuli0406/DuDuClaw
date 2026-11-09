@@ -432,6 +432,12 @@ export const navGroups: NavGroup[] = [
       { to: '/me/memory', icon: Brain, label: 'nav.myMemory', desc: 'nav.myMemory.desc', ownScope: true, newIn: '1.81.0' },
       { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
+      { to: '/app/system/migration', icon: Shield, label: 'migrationConfirm.title', desc: 'migrationConfirm.description', minRole: 'admin', newIn: '1.80.0' },
+      // 受保護模式 (v1.81 F5) — protected employees, connector accounts, the
+      // Google tenant source and their records. Enterprise only (protected
+      // mode does not exist on Personal, whose 設定 group is this same list),
+      // and only once `system.status` reports protected-mode readiness.
+      { to: '/app/system/protected', icon: ShieldCheck, label: 'protectedMode.title', desc: 'protectedMode.navDesc', minRole: 'admin', enterprise: true, requiresData: 'protected', newIn: '1.81.0' },
       { to: '/app/system/settings/company', icon: Building2, label: 'companyInfo.title', desc: 'companyInfo.description', minRole: 'admin', newIn: '1.80.0' },
       { to: '/app/system/settings/advanced', icon: Settings, label: 'advancedSettings.title', desc: 'advancedSettings.description', minRole: 'admin', newIn: '1.80.0' },
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.

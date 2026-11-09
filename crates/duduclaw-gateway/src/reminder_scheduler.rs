@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+#[path = "reminder_isolation.rs"]
+mod isolation_authority;
 use crate::claude_runner::call_claude_for_agent_with_type;
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_security::input_guard;
@@ -124,6 +126,9 @@ pub struct Reminder {
     /// Host-carried human origin; absent legacy records remain background work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
+    /// Set only by the host append boundary. No live verifier is serialized.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolation_bound: bool,
 }
 
 fn default_agent() -> String {
@@ -375,7 +380,9 @@ async fn build_reminder_typing_guard(
     if reminder.channel != "telegram" {
         return None;
     }
+    duduclaw_mcp_boundary::io_authority::verify_before_io().ok()?;
     let config = read_config(home_dir).await?;
+    duduclaw_mcp_boundary::io_authority::verify_before_io().ok()?;
     let token = decrypt_channel_token(
         &config,
         "telegram_bot_token_enc",
@@ -428,7 +435,11 @@ fn load_reminders_sync(home_dir: &Path) -> Vec<Reminder> {
 /// Load reminders from disk (async wrapper).
 async fn load_reminders(home_dir: &Path) -> Vec<Reminder> {
     let home = home_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || load_reminders_sync(&home))
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    tokio::task::spawn_blocking(move || authority.run(|| {
+        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return Vec::new(); }
+        load_reminders_sync(&home)
+    }))
         .await
         .unwrap_or_default()
 }
@@ -440,8 +451,6 @@ async fn load_reminders(home_dir: &Path) -> Vec<Reminder> {
 /// to acquire it internally.
 fn save_reminders_sync(home_dir: &Path, reminders: &[Reminder]) -> Result<(), String> {
     let path = home_dir.join("reminders.jsonl");
-    let tmp_name = format!("reminders.{}.tmp", uuid::Uuid::new_v4());
-    let tmp_path = home_dir.join(&tmp_name);
 
     let mut content = String::new();
     for r in reminders {
@@ -451,13 +460,10 @@ fn save_reminders_sync(home_dir: &Path, reminders: &[Reminder]) -> Result<(), St
         }
     }
 
-    std::fs::write(&tmp_path, &content)
-        .map_err(|e| format!("Failed to write temp reminders: {e}"))?;
-    std::fs::rename(&tmp_path, &path).map_err(|e| {
-        // Clean up tmp on rename failure
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("Failed to rename temp reminders: {e}")
-    })?;
+    duduclaw_memory::wiki_path::atomic_write_nofollow_checked(&path, &content, || {
+        duduclaw_mcp_boundary::io_authority::verify_before_io()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+    }).map_err(|e| format!("Failed to publish reminders: {e}"))?;
     Ok(())
 }
 
@@ -468,6 +474,7 @@ fn mutate_reminders_sync(
     mutate: impl FnOnce(&mut Vec<Reminder>),
 ) -> Result<(), String> {
     let _lock = acquire_lock(home_dir)?;
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     let mut reminders = load_reminders_sync(home_dir);
     mutate(&mut reminders);
     save_reminders_sync(home_dir, &reminders)
@@ -479,18 +486,34 @@ async fn mutate_reminders(
     mutate: impl FnOnce(&mut Vec<Reminder>) + Send + 'static,
 ) -> Result<(), String> {
     let home = home_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || mutate_reminders_sync(&home, mutate))
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    tokio::task::spawn_blocking(move || authority.run(|| mutate_reminders_sync(&home, mutate)))
         .await
         .map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
+/// Only scheduler-owned delivery bookkeeping may change while a pending
+/// reminder retains its original execution authority.
+fn isolation_payload(reminder: &Reminder) -> Result<Vec<u8>, String> {
+    let mut value = serde_json::to_value(reminder).map_err(|e| e.to_string())?;
+    let object = value.as_object_mut().ok_or("invalid reminder payload")?;
+    object.remove("status");
+    object.remove("error");
+    serde_json::to_vec(&value).map_err(|e| e.to_string())
+}
+
 /// Append a single reminder to `reminders.jsonl` under lockfile protection.
 pub async fn append_reminder(home_dir: &Path, reminder: &Reminder) -> Result<(), String> {
-    let r = reminder.clone();
-    mutate_reminders(home_dir, move |reminders| {
+    let mut r = reminder.clone();
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    r.isolation_bound = authority.is_scoped();
+    isolation_authority::bind(home_dir, &r.id, &isolation_payload(&r)?, &authority)?;
+    let id = r.id.clone();
+    let result = mutate_reminders(home_dir, move |reminders| {
         reminders.push(r);
-    })
-    .await
+    }).await;
+    if result.is_err() { isolation_authority::forget(home_dir, &id); }
+    result
 }
 
 /// Count pending reminders for a given agent, atomically with append.
@@ -511,13 +534,17 @@ pub async fn append_reminder_checked_admitted(
     max_per_agent: usize,
     admission: Option<duduclaw_core::autonomy_gate::AdmissionGuard>,
 ) -> Result<AppendResult, String> {
-    let r = reminder.clone();
+    let mut r = reminder.clone();
     let agent = reminder.agent_id.clone();
     let home = home_dir.to_path_buf();
 
-    tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let retained_authority = authority.clone();
+    tokio::task::spawn_blocking(move || authority.run(|| {
+        let authority = &retained_authority;
         let _admission = admission;
         let _lock = acquire_lock(&home)?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         let mut reminders = load_reminders_sync(&home);
 
         let pending_count = reminders
@@ -531,10 +558,16 @@ pub async fn append_reminder_checked_admitted(
             return Ok(AppendResult::LimitReached(pending_count));
         }
 
+        r.isolation_bound = authority.is_scoped();
+        isolation_authority::bind(&home, &r.id, &isolation_payload(&r)?, authority)?;
+        let id = r.id.clone();
         reminders.push(r);
-        save_reminders_sync(&home, &reminders)?;
+        if let Err(error) = save_reminders_sync(&home, &reminders) {
+            isolation_authority::forget(&home, &id);
+            return Err(error);
+        }
         Ok(AppendResult::Ok)
-    })
+    }))
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
 }
@@ -611,14 +644,15 @@ impl ReminderScheduler {
 
         // Spawn GC task (reads/writes disk directly under lockfile)
         let gc_home = self.home_dir.clone();
-        tokio::spawn(async move {
+        let authority = duduclaw_mcp_boundary::io_authority::capture();
+        tokio::spawn(async move { authority.scope(async move {
             // Run first GC after 10 minutes to catch stale entries on startup
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             loop {
                 run_gc(&gc_home).await;
                 tokio::time::sleep(std::time::Duration::from_secs(GC_INTERVAL_SECS)).await;
             }
-        });
+        }).await });
 
         // Main delivery loop
         loop {
@@ -701,7 +735,8 @@ impl ReminderScheduler {
             let sem = self.semaphore.clone();
             let http = self.http.clone();
 
-            handles.push(tokio::spawn(async move {
+            let authority = duduclaw_mcp_boundary::io_authority::capture();
+            handles.push(tokio::spawn(async move { authority.scope(async move {
                 // M61 fix: the semaphore permit is acquired INSIDE
                 // `deliver_reminder`, scoped to just the bounded channel-send
                 // step. Previously the permit was held here across the entire
@@ -726,7 +761,7 @@ impl ReminderScheduler {
                         }
                     }
                 }
-            }));
+            }).await }));
         }
 
         // Collect all results
@@ -747,10 +782,12 @@ impl ReminderScheduler {
 
         // Batch-update all statuses in a single locked disk write
         let home = self.home_dir.clone();
+        let authority_home = home.clone();
         let update_ok = mutate_reminders(&home, move |reminders| {
             for result in results {
                 if let Some(r) = reminders.iter_mut().find(|r| r.id == result.id) {
                     r.status = result.status;
+                    if r.status != ReminderStatus::Pending { isolation_authority::forget(&authority_home, &r.id); }
                     r.error = result.error;
                 }
             }
@@ -792,8 +829,10 @@ async fn run_gc(home_dir: &Path) {
     let cutoff = Utc::now() - Duration::hours(24);
     let home = home_dir.to_path_buf();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
         let _lock = acquire_lock(&home)?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         let mut reminders = load_reminders_sync(&home);
         let before = reminders.len();
 
@@ -819,7 +858,7 @@ async fn run_gc(home_dir: &Path) {
             info!(removed, "Reminder GC completed");
         }
         Ok::<(), String>(())
-    })
+    }))
     .await;
 
     if let Err(e) = result {
@@ -858,14 +897,14 @@ async fn deliver_reminder(
     reminder: &Reminder,
 ) -> Result<(), String> {
     deliver_reminder_with(home_dir, http, registry, sem, reminder, |agent_id, prompt| async move {
+        crate::process_group::with_class(duduclaw_core::execution_gate::ExecutionClass::Reminder,
         call_claude_for_agent_with_type(
             home_dir,
             registry,
             &agent_id,
             &prompt,
             crate::cost_telemetry::RequestType::Cron,
-        )
-        .await
+        )).await
     })
     .await
 }
@@ -883,12 +922,16 @@ where
     F: FnOnce(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
+    let authority = if reminder.isolation_bound {
+        isolation_authority::lookup(home_dir, &reminder.id, &isolation_payload(reminder)?)?
+    } else { duduclaw_mcp_boundary::io_authority::capture() };
+    authority.verify().map_err(|e| e.to_string())?;
     let principal = crate::on_behalf_of::from_stored(
         home_dir, reminder.on_behalf_of.as_deref(), &reminder.agent_id, "reminder",
     );
-    crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
+    authority.scope(crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
         home_dir, http, registry, sem, reminder, invoke,
-    )).await
+    ))).await
 }
 
 async fn deliver_reminder_scoped<F, Fut>(
@@ -903,12 +946,34 @@ where
     F: FnOnce(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
+    let material = crate::isolation_background::material::reminder(reminder);
     let mut resolved_reminder = reminder.clone();
     resolved_reminder.agent_id = crate::recipient_guard::scheduled_agent(registry, &reminder.agent_id).await?;
+    if reminder.isolation_bound && resolved_reminder.agent_id != reminder.agent_id {
+        return Err("isolated reminder employee changed".into());
+    }
     let reminder = &resolved_reminder;
     let mut effective_reminder = reminder.clone();
     effective_reminder.agent_id = reminder_autonomy_check(home_dir, registry, reminder).await?;
+    if reminder.isolation_bound && effective_reminder.agent_id != reminder.agent_id {
+        return Err("isolated reminder employee changed".into());
+    }
     let reminder = &effective_reminder;
+    // v1.81 P1g: an agent callback makes the employee run work — re-check
+    // its CURRENT Personal ownership against the stored human origin (rows
+    // created before the upgrade included). A static message runs nothing.
+    if reminder.mode == ReminderMode::AgentCallback && crate::runtime_readiness::is_protected_linux() {
+        let (home, target, principal) =
+            (home_dir.to_path_buf(), reminder.agent_id.clone(), reminder.on_behalf_of.clone());
+        let refusal = tokio::task::spawn_blocking(move || {
+            crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], None, &target)
+        })
+        .await
+        .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE));
+        if let Some(reason) = refusal {
+            return Err(reason.to_string());
+        }
+    }
     let text = match reminder.mode {
         ReminderMode::Direct => reminder
             .message
@@ -961,13 +1026,30 @@ where
             // Read the denial flag inside the scope: runtimes wrap the refusal
             // text, so a pause landing after the check above must still leave
             // the reminder Pending rather than Failed.
-            let (result, denied) = crate::autonomous_runtime::scope(
+            let (result, denied) = crate::isolation_background::scope_record(
+                home_dir, "reminder", &reminder.id, &reminder.agent_id,
+                reminder.on_behalf_of.as_deref(), &material, crate::autonomous_runtime::scope(
                 home_dir, &reminder.agent_id, &[],
                 async {
-                    let result = invoke(reminder.agent_id.clone(), full_prompt).await;
+                    if crate::isolation_background::approval_pending() {
+                        return (Err("背景工作正在等候管理員核准。".into()), true);
+                    }
+                    // A receipt awaiting re-approval stays Pending; a Personal
+                    // employee never runs it, so the reminder fails with the reason.
+                    if let Some(reason) = crate::isolation_background::refusal_reason() {
+                        return (Err(reason.into()), reason == crate::isolation_background::LEGACY_REFUSAL);
+                    }
+                    let result = match duduclaw_mcp_boundary::io_authority::verify_before_io() {
+                        Ok(()) => invoke(reminder.agent_id.clone(), full_prompt).await,
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let result = result.and_then(|text| {
+                        duduclaw_mcp_boundary::io_authority::verify_before_io()
+                            .map(|_| text).map_err(|error| error.to_string())
+                    });
                     (result, crate::autonomous_runtime::was_denied())
                 },
-            )
+            ))
             .await;
             drop(typing_guard);
             if denied {
@@ -1010,12 +1092,14 @@ where
     let sender = reminder.sender_agent.as_deref();
     let result = {
         let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender).await
     };
     if let Err(first_err) = result {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         crate::recipient_guard::admit_scheduled(home_dir, &reminder.agent_id, &recipients, recipient_args).await?;
         let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender)
             .await
             .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
@@ -1057,6 +1141,47 @@ pub async fn list_reminders(
         .collect()
 }
 
+/// Finite reminder reader. Bound the input and select IDs plus owner before
+/// decoding a full reminder; malformed storage refuses rather than appearing
+/// as an empty successful list. Blocking work carries the request authority.
+pub async fn list_reminders_isolated(home: &Path, agent: &str, ids: &[String], status: Option<&str>) -> Result<Vec<Reminder>, String> {
+    let (home, agent, ids, status) = (home.to_owned(), agent.to_owned(), ids.to_owned(), status.map(str::to_owned));
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    tokio::task::spawn_blocking(move || authority.run(|| {
+        use std::io::Read;
+        let verify = || duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string());
+        verify()?;
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let path = home.join("reminders.jsonl");
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("read reminders: {e}")),
+        };
+        const MAX: u64 = 8 * 1024 * 1024;
+        if file.metadata().map_err(|e| e.to_string())?.len() > MAX { return Err("reminder storage exceeds bound".into()); }
+        verify()?;
+        let mut content = String::new();
+        file.take(MAX + 1).read_to_string(&mut content).map_err(|e| e.to_string())?;
+        if content.len() as u64 > MAX { return Err("reminder storage exceeds bound".into()); }
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        for (index, line) in content.lines().enumerate() {
+            verify()?;
+            if index >= 10_000 { return Err("reminder storage exceeds row bound".into()); }
+            if line.trim().is_empty() { continue; }
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+            let id = value.get("id").and_then(|v| v.as_str()).ok_or("invalid reminder ID")?;
+            if !ids.iter().any(|allowed| allowed == id) { continue; }
+            if !seen.insert(id.to_owned()) { return Err("duplicate reminder ID".into()); }
+            if value.get("agent_id").and_then(|v| v.as_str()) != Some(&agent) { continue; }
+            let row: Reminder = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            if status.as_deref().is_none_or(|filter| row.status.matches_str(filter)) { rows.push(row); }
+        }
+        verify()?;
+        Ok(rows)
+    })).await.map_err(|e| format!("reminder reader: {e}"))?
+}
+
 /// Cancel a reminder by ID.  Validates agent ownership.
 /// Returns true if found and cancelled.
 pub async fn cancel_reminder(
@@ -1068,8 +1193,10 @@ pub async fn cancel_reminder(
     let caller_owned = caller_agent.map(|s| s.to_string());
     let home = home_dir.to_path_buf();
 
-    tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    tokio::task::spawn_blocking(move || authority.run(|| {
         let _lock = acquire_lock(&home)?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         let mut reminders = load_reminders_sync(&home);
         let mut found = false;
 
@@ -1090,9 +1217,10 @@ pub async fn cancel_reminder(
 
         if found {
             save_reminders_sync(&home, &reminders)?;
+            isolation_authority::forget(&home, &id_owned);
         }
         Ok(found)
-    })
+    }))
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
 }
@@ -1128,8 +1256,12 @@ pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserCo
         let mut rows = text.lines().filter(|l| !l.trim().is_empty())
             .map(serde_json::from_str::<Reminder>).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
         let principal = format!("user:{}", ctx.user_id);
-        let allowed = |r: &Reminder, level| ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
-            || ctx.has_agent_access(&r.agent_id, level);
+        // v1.81 P1g: another person's Personal employee's reminders are
+        // neither listed nor cancelled through the Admin role or a stored
+        // origin — owner only.
+        let allowed = |r: &Reminder, level| !ctx.owner_only_denied(&r.agent_id)
+            && (ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
+                || ctx.has_agent_access(&r.agent_id, level));
         if let Some(id) = cancel {
             let row = rows.iter_mut().find(|r| r.id == id && r.status == ReminderStatus::Pending
                 && allowed(r, duduclaw_auth::AccessLevel::Operator)).ok_or("permission denied")?;
@@ -1148,9 +1280,8 @@ pub fn start_reminder_scheduler(
     registry: Arc<RwLock<AgentRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
     let scheduler = Arc::new(ReminderScheduler::new(home_dir, registry));
-    tokio::spawn(async move {
-        scheduler.run().await;
-    })
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    tokio::spawn(async move { authority.scope(scheduler.run()).await })
 }
 
 // ── Tests ───────────────────────────────────────────────────
@@ -1158,6 +1289,26 @@ pub fn start_reminder_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_blocking_reminder_mutation_refuses_publication_after_revocation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let home = tempfile::tempdir().unwrap();
+        let original = callback_reminder("worker", None);
+        save_reminders_sync(home.path(), &[original]).unwrap();
+        let before = std::fs::read(home.path().join("reminders.jsonl")).unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let revoke = live.clone();
+        let result = duduclaw_mcp_boundary::io_authority::scope(
+            crate::isolation_io_test_support::context(live),
+            mutate_reminders(home.path(), move |rows| {
+                rows.clear();
+                revoke.store(false, Ordering::SeqCst);
+            }),
+        ).await;
+        assert!(result.unwrap_err().contains("revoked"));
+        assert_eq!(std::fs::read(home.path().join("reminders.jsonl")).unwrap(), before);
+    }
 
     fn tmp_home() -> PathBuf {
         let p = std::env::temp_dir().join(format!("ddc-reminder-{}", uuid::Uuid::new_v4()));
@@ -1580,5 +1731,54 @@ telegram_bot_token = "secret://vault/tg-token"
             .unwrap_err();
         assert!(err.contains("telegram_bot_token"), "got: {err}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod isolation_collection_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use duduclaw_mcp_boundary::io_authority;
+    fn reminder(id: &str, agent: &str) -> Reminder {
+        serde_json::from_value(serde_json::json!({"id": id, "agent_id": agent,
+            "trigger_at":"2026-11-05T00:00:00Z", "channel":"telegram", "chat_id":"chat",
+            "message":"one", "mode":"direct", "status":"pending"})).unwrap()
+    }
+    #[tokio::test]
+    async fn finite_reminders_keep_owner_ids_filters_and_fail_closed_on_bad_storage() {
+        let home = tempfile::tempdir().unwrap();
+        save_reminders_sync(home.path(), &[reminder("allowed", "alice"), reminder("foreign", "bob"), reminder("new", "alice")]).unwrap();
+        let ids = vec!["allowed".into(), "foreign".into()];
+        let rows = list_reminders_isolated(home.path(), "alice", &ids, Some("pending")).await.unwrap();
+        assert_eq!(rows.iter().map(|r|r.id.as_str()).collect::<Vec<_>>(), vec!["allowed"]);
+        assert!(list_reminders_isolated(home.path(), "alice", &ids, Some("done")).await.unwrap().is_empty());
+        std::fs::write(home.path().join("reminders.jsonl"), "{broken").unwrap();
+        assert!(list_reminders_isolated(home.path(), "alice", &ids, None).await.is_err());
+    }
+    #[tokio::test]
+    async fn isolated_reminder_append_stamps_marker_and_cancel_removes_live_authority() {
+        let home = tempfile::tempdir().unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let context = crate::isolation_io_test_support::context(live.clone());
+        io_authority::scope(context.clone(), async {
+            append_reminder_checked(home.path(), &reminder("bound", "alice"), 100).await.unwrap();
+        }).await;
+        let rows = load_reminders_sync(home.path());
+        assert!(rows[0].isolation_bound, "caller-supplied false marker must be overwritten by host");
+        assert!(isolation_authority::lookup(home.path(), "bound", &isolation_payload(&rows[0]).unwrap()).is_ok());
+        let mut paused = rows[0].clone();
+        paused.error = Some("autonomy paused: employee paused".into());
+        assert!(isolation_authority::lookup(home.path(), "bound", &isolation_payload(&paused).unwrap()).is_ok(),
+            "scheduler bookkeeping must not invalidate a paused reminder's immutable execution projection");
+        io_authority::scope(context, async {
+            assert!(cancel_reminder(home.path(), "bound", Some("alice")).await.unwrap());
+        }).await;
+        assert!(isolation_authority::lookup(home.path(), "bound", &isolation_payload(&rows[0]).unwrap()).is_err());
+        live.store(false, Ordering::SeqCst);
+        let empty = tempfile::tempdir().unwrap();
+        io_authority::scope(crate::isolation_io_test_support::context(live), async {
+            assert!(list_reminders_isolated(empty.path(), "alice", &["bound".into()], None).await.is_err());
+        }).await;
+        assert!(!empty.path().join("reminders.jsonl").exists());
     }
 }

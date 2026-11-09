@@ -965,6 +965,25 @@ pub struct ClaudeCliSpawner {
     pub agent_id: String,
 }
 
+fn fork_command(bin: &str, prompt: &str, workspace: &Path, env: &HashMap<String, String>)
+    -> tokio::process::Command
+{
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("-p")
+        .arg(prompt)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .current_dir(workspace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
 #[async_trait]
 impl CliSpawner for ClaudeCliSpawner {
     async fn spawn(
@@ -992,19 +1011,7 @@ impl CliSpawner for ClaudeCliSpawner {
                 };
             }
         };
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.arg("-p")
-            .arg(prompt)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .current_dir(workspace)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+        let mut cmd = fork_command(&bin, prompt, workspace, env);
         let mcp_proxy_guard = match prepare_fork_mcp_proxy(&self.home_dir, &agent_dir, workspace, &mut cmd) {
             Ok(guard) => guard,
             Err(error) => return CliRunOutput {
@@ -1030,7 +1037,10 @@ impl CliSpawner for ClaudeCliSpawner {
                 outcome: SpawnOutcome::Failed,
             },
         };
-        let mut child = match cmd.spawn() {
+        let mut child = match duduclaw_core::execution_gate::with_runtime(
+            duduclaw_core::execution_gate::RuntimeKind::Claude,
+            duduclaw_core::execution_gate::spawn(&mut cmd,
+            duduclaw_core::execution_gate::ExecutionClass::Fork)).await {
             Ok(c) => c,
             Err(e) => {
                 return CliRunOutput {
@@ -2377,5 +2387,22 @@ mod employee_budget_tests {
         assert_eq!(result.outcome, SpawnOutcome::BudgetRefused);
         assert_eq!(result.spent_usd, 0.0);
         assert!(result.output.contains("無法確認預算"));
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    use super::*;
+    #[tokio::test]
+    async fn fork_cli_backend_command_matches_legacy_argv_env_cwd() {
+        let env = HashMap::from([("FORK_VALUE".into(), "literal $HOME;\n繁體中文".into())]);
+        let command = fork_command("claude", "prompt $HOME;\n繁體中文", Path::new("fork workspace"), &env);
+        let mut legacy = tokio::process::Command::new("claude");
+        legacy.arg("-p").arg("prompt $HOME;\n繁體中文").args(["--output-format", "stream-json", "--verbose"])
+            .current_dir("fork workspace").stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).kill_on_drop(true);
+        for (key, value) in &env { legacy.env(key, value); }
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
     }
 }

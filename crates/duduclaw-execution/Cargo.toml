@@ -1,0 +1,34 @@
+[package]
+name = "duduclaw-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duduclaw-isolation.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+url = "2"
+portable-pty = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["socket", "uio", "fs", "user", "poll"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_Security"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# HX6 security fix round (finding 5): the recording root tests stack the real
+# launcher / helper Landlock and F_L ∩ F_H (duduclaw-run) under the browser layer.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+duduclaw-run = { path = "../duduclaw-run" }
+
+[lints]
+workspace = true

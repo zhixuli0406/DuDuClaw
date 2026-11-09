@@ -162,6 +162,9 @@ pub async fn fetch_and_gate(
     skill_name: &str,
     owner: Option<&str>,
 ) -> Result<GatedManifest, String> {
+    if duduclaw_parse_worker::client::required() {
+        return fetch_protected(home_dir, hub_id, skill_name, owner).await;
+    }
     let registry = HubRegistry::from_home(home_dir);
     // Exact-id lookup — an unknown hub is a DENY, never a default.
     let Some(hub) = registry.get(hub_id) else {
@@ -227,10 +230,23 @@ pub async fn install_gated(
     }).await.map_err(|e| format!("hub install worker failed: {e}"))?
 }
 
+/// SR5 round 3 follow-up R3-3: the live employee tree a hub install `scope`
+/// names (`handlers::skills_install_target::live_employee_dir`: valid id, F6h
+/// writer gate, real `agents/<label>/agent.toml`). Never creates the tree.
+/// Public so the MCP `skill_hub_install` handler can refuse a dead target
+/// before fetching or asking for approval; [`install_gated`] re-checks.
+pub fn live_employee_scope_dir(home_dir: &Path, scope: &str) -> Result<std::path::PathBuf, String> {
+    crate::handlers::skills_install_target::live_employee_dir(home_dir, scope)
+        .map_err(|refusal| format!("hub install DENIED: {refusal}"))
+}
+
 /// Caller holds the trust-store lock, then the signature-history lock throughout.
 async fn install_gated_locked(
     home_dir: &Path, gated: &GatedManifest, scope: &str,
 ) -> Result<HubInstallReport, String> {
+    if duduclaw_parse_worker::client::required() {
+        return install_protected_locked(home_dir, gated, scope).await;
+    }
     let installed_name = installed_skill_name(&gated.skill_name, &gated.manifest_name, &gated.content)?;
     // Approval evidence is not install authority: reverify exact bytes with current keys.
     let signature_status = TrustStore::load(home_dir)?.verify_content(
@@ -245,6 +261,14 @@ async fn install_gated_locked(
     let hub_id = gated.hub.as_str();
     let skill_name = gated.skill_name.as_str();
     let content = gated.content.as_str();
+    // SR5 round 3 follow-up R3-3: an employee scope must name a LIVE employee
+    // (F6h writer gate + real `agents/<label>/agent.toml`), the same check the
+    // RPC and install-request paths use, before anything is written.
+    let employee_dir = if scope == "global" || scope.starts_with("department:") {
+        None
+    } else {
+        Some(live_employee_scope_dir(home_dir, scope)?)
+    };
     // Persist the trust commitment before exposing content to a loader. A failed install
     // deliberately retains this conservative pin; disk failures must not permit a downgrade.
     record_verified_signature(home_dir, hub_id, &installed_name, &signature_status)?;
@@ -275,9 +299,15 @@ async fn install_gated_locked(
         )
         .await
     } else {
-        let agent_skills_dir = home_dir.join("agents").join(scope).join("SKILLS");
-        duduclaw_agent::skill_loader::install_skill(&tmp_file, &agent_skills_dir, &quarantine_dir)
-            .await
+        // SR5 round 3 N8: never conjure `agents/<scope>`; only SKILLS/ inside
+        // the live employee tree checked above is created.
+        match employee_dir.as_deref() {
+            Some(employee_dir) => duduclaw_agent::skill_loader::install_skill_into_employee(
+                &tmp_file, employee_dir, &quarantine_dir,
+            )
+            .await,
+            None => Err("hub install DENIED: invalid employee scope".into()),
+        }
     };
     let _ = std::fs::remove_file(&tmp_file);
     let _ = std::fs::remove_dir(&tmp_dir); // best-effort: unique dir, one file
@@ -398,6 +428,29 @@ mod tests {
         std::fs::write(home.join("trusted_publishers.toml"),
             format!("[publishers.fixture]\nkeys = [\"{TEST_KEY}\"]\n")).unwrap();
         home
+    }
+
+    #[test]
+    fn sr5r3f_hub_employee_scope_requires_a_live_employee_tree() {
+        // The lifecycle read applies in every mode; pin the F6h gate off here.
+        crate::isolation_label_stores::TEST_PROTECTED.with(|forced| forced.set(Some(false)));
+        let home = tempfile::tempdir().unwrap();
+        // Invalid id, unknown label and a bare directory without agent.toml are refused.
+        assert!(live_employee_scope_dir(home.path(), "../evil").is_err());
+        assert!(live_employee_scope_dir(home.path(), "alice").is_err());
+        assert!(!home.path().join("agents").exists(), "the check never creates the tree");
+        std::fs::create_dir_all(home.path().join("agents/alice")).unwrap();
+        assert!(live_employee_scope_dir(home.path(), "alice").is_err());
+        std::fs::write(home.path().join("agents/alice/agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
+        assert_eq!(live_employee_scope_dir(home.path(), "alice").unwrap(), home.path().join("agents/alice"));
+        #[cfg(unix)]
+        {
+            // A symlinked employee tree is not live.
+            std::fs::create_dir_all(home.path().join("elsewhere")).unwrap();
+            std::fs::write(home.path().join("elsewhere/agent.toml"), "").unwrap();
+            std::os::unix::fs::symlink(home.path().join("elsewhere"), home.path().join("agents/bob")).unwrap();
+            assert!(live_employee_scope_dir(home.path(), "bob").is_err());
+        }
     }
 
     #[test]
@@ -738,4 +791,67 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
     }
+}
+
+/// Protected first-party subset: bounded host fetch, E manifest/scan, then the
+/// existing caller approval. Community manifests await E JSON adapters.
+async fn fetch_protected(home: &Path, hub: &str, name: &str, owner: Option<&str>) -> Result<GatedManifest, String> {
+    use duduclaw_agent::skill_hub::{HUB_ANTHROPIC, ANTHROPIC_OWNER_REPO, ANTHROPIC_PIN_SHA};
+    if hub != HUB_ANTHROPIC || owner.is_some() || !HubRegistry::from_home(home).ids().contains(&hub)
+        || name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("隔離安裝目前僅支援已設定的官方固定版本技能來源。".into());
+    }
+    if !crate::web_fetch::admit_protected_tool_fetch() { return Err("技能來源請求過於頻繁。".into()); }
+    let url = format!("https://raw.githubusercontent.com/{ANTHROPIC_OWNER_REPO}/{ANTHROPIC_PIN_SHA}/skills/{name}/SKILL.md");
+    let fetched = crate::web_fetch::web_fetch_protected_cached(&url, 0, &home.join("web_cache")).await
+        .map_err(|_| "無法取得官方技能內容。".to_string())?;
+    if !(200..300).contains(&fetched.status_code) { return Err("技能來源未回傳有效內容。".into()); }
+    let content = fetched.body;
+    if content.is_empty() || content.len() > 64 * 1024 { return Err("技能內容超過隔離安裝上限。".into()); }
+    let (bytes, slug) = (content.as_bytes().to_vec(), name.to_owned());
+    let (passed, risk_level, findings) = tokio::task::spawn_blocking(move ||
+        duduclaw_parse_worker::adapters::inspect_skill_manifest(&bytes, &slug)).await
+        .map_err(|_| "隔離技能檢查失敗。")?.map_err(|_| "隔離技能檢查失敗。")?;
+    if !passed { return Err("技能未通過隔離安全檢查。".into()); }
+    let signature_status = TrustStore::load(home)?.verify_content(None, None, content.as_bytes())?;
+    duduclaw_agent::skill_hub::check_signature_history(home, hub, name, &signature_status)?;
+    Ok(GatedManifest { hub: hub.into(), skill_name: name.into(), manifest_name: name.into(), content,
+        publisher: None, signature: None, signature_status, risk_level, findings,
+        trust_floor: duduclaw_agent::trust_tier::TrustTier::Official, source_verdict: None })
+}
+
+async fn install_protected_locked(home: &Path, gated: &GatedManifest, scope: &str) -> Result<HubInstallReport, String> {
+    if gated.hub != duduclaw_agent::skill_hub::HUB_ANTHROPIC || gated.skill_name != gated.manifest_name {
+        return Err("隔離技能來源不受支援。".into());
+    }
+    // Scan again from these exact approved bytes; never trust a previously
+    // passed flag or let the worker select a destination.
+    let (bytes, name) = (gated.content.as_bytes().to_vec(), gated.skill_name.clone());
+    let (passed, risk_level, findings) = tokio::task::spawn_blocking(move ||
+        duduclaw_parse_worker::adapters::inspect_skill_manifest(&bytes, &name)).await
+        .map_err(|_| "隔離技能檢查失敗。")?.map_err(|_| "隔離技能檢查失敗。")?;
+    if !passed { return Err("技能未通過隔離安全檢查。".into()); }
+    let signature = TrustStore::load(home)?.verify_content(gated.publisher.as_deref(), gated.signature.as_deref(), gated.content.as_bytes())?;
+    if signature != gated.signature_status { return Err("技能簽署者信任已變更，請重新送審。".into()); }
+    duduclaw_agent::skill_hub::check_signature_history(home, &gated.hub, &gated.skill_name, &signature)?;
+    record_verified_signature(home, &gated.hub, &gated.skill_name, &signature)?;
+    let directories = if scope == "global" { vec!["skills"] }
+        else if let Some(dept) = scope.strip_prefix("department:") {
+            if !duduclaw_core::is_valid_department(dept) { return Err("技能部門不正確。".into()); }
+            vec!["shared", "skills", "departments", dept]
+        } else {
+            if !duduclaw_core::is_valid_agent_id(scope) || duduclaw_core::is_reserved_agent_id(scope) { return Err("技能員工範圍不正確。".into()); }
+            vec!["agents", scope, "SKILLS"]
+        };
+    crate::isolation_worker_plans::write_host_file(home, &directories, &format!("{}.md", gated.skill_name), gated.content.as_bytes())
+        .map_err(|_| "技能發布尚未確認；既有技能不會覆寫。".to_string())?;
+    let curation_scope = if scope == "global" || scope.strip_prefix("department:").is_some() { scope.to_owned() }
+        else { format!("agent:{scope}") };
+    let store = crate::custom_skills::CustomSkillStore::open(home)?;
+    store.curation_upsert_seen(&gated.skill_name, &curation_scope, &chrono::Utc::now().to_rfc3339()).await?;
+    store.record_hub_signature(&gated.skill_name, &curation_scope, &signature,
+        &duduclaw_agent::skill_hub::sha256_hex(&gated.content)).await?;
+    use sha2::{Digest, Sha256};
+    Ok(HubInstallReport { hub:gated.hub.clone(),skill_name:gated.skill_name.clone(),scope:scope.into(),risk_level,findings,
+        signature_status:signature,content_sha256:hex::encode(Sha256::digest(gated.content.as_bytes())) })
 }

@@ -5,6 +5,15 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 #[path = "protected_linux_install.rs"]
 mod linux;
+#[cfg(any(target_os = "linux", test))]
+#[path = "protected_linux_layout.rs"]
+mod layout;
+#[cfg(any(target_os = "linux", test))]
+#[path = "protected_linux_lifecycle.rs"]
+mod lifecycle;
+#[cfg(target_os = "linux")]
+#[path = "protected_linux_migration.rs"]
+mod native_migration;
 #[cfg(target_os = "linux")]
 #[path = "protected_linux_migrate.rs"]
 mod migrate;
@@ -64,6 +73,14 @@ pub(crate) fn uninstall() -> Result<()> {
     { Err(refused("--protected-linux requires native Linux")) }
 }
 
+pub(crate) fn readiness() -> Result<()> {
+    operator_gate()?;
+    #[cfg(target_os = "linux")]
+    { linux::readiness() }
+    #[cfg(not(target_os = "linux"))]
+    { Err(refused("--protected-linux requires native Linux")) }
+}
+
 fn operator_gate() -> Result<()> {
     if !crate::ai_session_guard::command_markers().is_empty() {
         return Err(refused("AI 員工不能安裝、升級、移除受保護服務或變更其政策，請由管理者在自己的終端機操作。"));
@@ -73,6 +90,7 @@ fn operator_gate() -> Result<()> {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unit_text() -> String {
+    // The canonical text (including the TCB slice spawnd verifies) lives in core.
     duduclaw_core::root_key::recovery::protected_unit_text()
 }
 

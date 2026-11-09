@@ -214,6 +214,17 @@ pub type HostRunNotice = Arc<dyn Fn(&Path, &str, bool) + Send + Sync>;
 /// Gateway-supplied employee budget gate; runs before any proactive model spawn.
 pub type BudgetGate = Arc<dyn Fn(PathBuf, PathBuf, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> + Send + Sync>;
 
+/// The gateway owns protected heartbeat authority and runtime dispatch. Passing
+/// content here never grants permission; the callback verifies the stored owner
+/// approval before the isolated runtime can reserve a run.
+pub type ProtectedProactiveInvoker = Arc<dyn Fn(PathBuf, String, String, serde_json::Value)
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> + Send + Sync>;
+static PROTECTED_PROACTIVE: std::sync::OnceLock<ProtectedProactiveInvoker> = std::sync::OnceLock::new();
+
+pub fn install_protected_proactive_invoker(invoker: ProtectedProactiveInvoker) -> Result<(), String> {
+    PROTECTED_PROACTIVE.set(invoker).map_err(|_| "protected heartbeat invoker already installed".into())
+}
+
 pub struct HeartbeatScheduler {
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
@@ -1080,6 +1091,42 @@ fn ensure_queue_principal_column(qdb: &rusqlite::Connection) {
 }
 
 /// Execute proactive checks for an agent if PROACTIVE.md exists and conditions allow.
+fn proactive_command(
+    claude_path: &str, prompt_path: &std::path::Path, agent_dir: &std::path::Path,
+    max_turns: u32, capabilities: &duduclaw_core::types::CapabilitiesConfig,
+) -> tokio::process::Command {
+    let max_turns_str = max_turns.to_string();
+    let mut cmd = duduclaw_core::platform::async_command_for(claude_path);
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
+    cmd.arg("--print")
+        .args(["--system-prompt-file", &prompt_path.to_string_lossy()])
+        .args(["--max-turns", &max_turns_str])
+        .args(["-p", "Execute the proactive checks now."])
+        .current_dir(agent_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Read-only explore lane (2026-10): a proactive check is
+    // background exploration, so it gets read-only tools only. The
+    // built-in surface is narrowed to `EXPLORE_LANE_BUILTIN_TOOLS`
+    // (minus the employee's own `denied_tools`; an allowlist can only
+    // remove more, never add Write/Edit/Bash back), and
+    // `DUDUCLAW_LANE=explore` reaches the DuDuClaw MCP server through
+    // the CLI's inherited environment (the `.mcp.json` entry does not
+    // set the variable, so nothing overrides it), where `tools/list`
+    // shows only `read` / `draft` tools and every other call is
+    // refused. A notification the check wants to send is still
+    // delivered by this function from the reply, not by a tool.
+    let explore_tools: Vec<String> = capabilities
+        .minimal_builtin_tools(duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS)
+        .into_iter()
+        .filter(|t| duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS.contains(&t.as_str()))
+        .collect();
+    cmd.args(["--tools", &explore_tools.join(",")]);
+    cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
+    cmd
+}
+
 async fn execute_proactive_check(
     home_dir: &Path,
     agent_id: &str,
@@ -1211,9 +1258,21 @@ async fn execute_proactive_check(
         warn!(agent = agent_id, "Proactive check refused: {reason}");
         return;
     }
-    let claude = duduclaw_core::which_claude();
-
-    let result = match claude {
+    let result = if duduclaw_core::execution_gate::isolation_required() {
+        let Some(invoker) = PROTECTED_PROACTIVE.get() else {
+            warn!(agent = agent_id, "Protected heartbeat invoker unavailable");
+            return;
+        };
+        let material = serde_json::json!({"agent_id": agent_id,
+            "proactive": agent_config.proactive, "checks": proactive_md});
+        match invoker(home_dir.to_owned(), agent_id.to_owned(), prompt, material).await {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(agent = agent_id, %error, "Protected heartbeat refused");
+                return;
+            }
+        }
+    } else { match duduclaw_core::which_claude() {
         Some(claude_path) => {
             // Not the task sandbox: the check needs the agent's MCP tools.
             // Report it for a sandbox-enabled employee (the gateway's notice
@@ -1260,36 +1319,8 @@ async fn execute_proactive_check(
             };
             let prompt_path = prompt_file.path().to_path_buf();
 
-            let max_turns_str = agent_config.proactive.max_turns.to_string();
-            let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
-            duduclaw_core::ns_guard::guard_command(&mut cmd);
-            cmd.arg("--print")
-                .args(["--system-prompt-file", &prompt_path.to_string_lossy()])
-                .args(["--max-turns", &max_turns_str])
-                .args(["-p", "Execute the proactive checks now."])
-                .current_dir(&agent_dir)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-
-            // Read-only explore lane (2026-10): a proactive check is
-            // background exploration, so it gets read-only tools only. The
-            // built-in surface is narrowed to `EXPLORE_LANE_BUILTIN_TOOLS`
-            // (minus the employee's own `denied_tools`; an allowlist can only
-            // remove more, never add Write/Edit/Bash back), and
-            // `DUDUCLAW_LANE=explore` reaches the DuDuClaw MCP server through
-            // the CLI's inherited environment (the `.mcp.json` entry does not
-            // set the variable, so nothing overrides it), where `tools/list`
-            // shows only `read` / `draft` tools and every other call is
-            // refused. A notification the check wants to send is still
-            // delivered by this function from the reply, not by a tool.
-            let explore_tools: Vec<String> = agent_config
-                .capabilities
-                .minimal_builtin_tools(duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS)
-                .into_iter()
-                .filter(|t| duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS.contains(&t.as_str()))
-                .collect();
-            cmd.args(["--tools", &explore_tools.join(",")]);
-            cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
+            let mut cmd = proactive_command(&claude_path, &prompt_path, &agent_dir,
+                agent_config.proactive.max_turns, &agent_config.capabilities);
 
             // Attach agent's MCP server definitions so Notion/Gmail/etc tools
             // are available during the proactive run. `--strict-mcp-config`
@@ -1328,7 +1359,10 @@ async fn execute_proactive_check(
                 return;
             };
             cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-            let child = cmd.spawn();
+            let child = duduclaw_core::execution_gate::with_runtime(
+            duduclaw_core::execution_gate::RuntimeKind::Claude,
+            duduclaw_core::execution_gate::spawn(&mut cmd,
+                duduclaw_core::execution_gate::ExecutionClass::Heartbeat)).await;
             drop(admission);
             let output = match child {
                 Ok(child) => child.wait_with_output().await,
@@ -1354,7 +1388,7 @@ async fn execute_proactive_check(
             warn!(agent = agent_id, "Proactive check: claude CLI not found");
             return;
         }
-    };
+    }};
 
     // Parse result — silent or actionable?
     match proactive::parse_proactive_result(&result) {
@@ -2422,5 +2456,30 @@ mod budget_gate_tests {
         execute_proactive_check(home.path(), "evaluator", &tokio::sync::Mutex::new(HashMap::new()),
             &crate::proactive_timing::DeferralLedger::new(), Some(&notice), Some(&gate)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    use super::*;
+    #[tokio::test]
+    async fn heartbeat_backend_command_matches_legacy_argv_env_cwd() {
+        let capabilities = duduclaw_core::types::CapabilitiesConfig::default();
+        let command = proactive_command("claude", std::path::Path::new("prompt file"), std::path::Path::new("agent cwd"), 8, &capabilities);
+        let mut legacy = duduclaw_core::platform::async_command_for("claude");
+        duduclaw_core::ns_guard::guard_command(&mut legacy);
+        legacy.arg("--print").args(["--system-prompt-file", "prompt file"])
+            .args(["--max-turns", "8"]).args(["-p", "Execute the proactive checks now."])
+            .current_dir("agent cwd");
+        let tools: Vec<String> = capabilities.minimal_builtin_tools(duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS)
+            .into_iter().filter(|tool| duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS.contains(&tool.as_str())).collect();
+        legacy.args(["--tools", &tools.join(",")]);
+        legacy.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
+        assert_eq!(command.as_std().get_program(), legacy.as_std().get_program());
+        assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), legacy.as_std().get_args().collect::<Vec<_>>());
+        assert_eq!(command.as_std().get_envs().collect::<Vec<_>>(), legacy.as_std().get_envs().collect::<Vec<_>>());
+        assert_eq!(command.as_std().get_current_dir(), legacy.as_std().get_current_dir());
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
     }
 }

@@ -211,7 +211,18 @@ pub fn prepare_wiki_write_target(wiki_dir: &Path, rel: &str) -> io::Result<PathB
 /// name is never written through. `rename` replaces a link at `full` rather
 /// than following it.
 pub fn atomic_write_nofollow(full: &Path, content: &str) -> io::Result<()> {
+    atomic_write_nofollow_checked(full, content, || Ok(()))
+}
+
+/// Check live authority before staging writes and again after fsync, immediately
+/// before publishing the page. Refusal removes only the staging file.
+pub fn atomic_write_nofollow_checked(
+    full: &Path,
+    content: &str,
+    verify: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write;
+    verify()?;
     let tmp = full.with_extension("md.tmp");
     match std::fs::remove_file(&tmp) {
         Ok(()) => {}
@@ -219,12 +230,15 @@ pub fn atomic_write_nofollow(full: &Path, content: &str) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     let write = (|| -> io::Result<()> {
+        verify()?;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)?;
+        verify()?;
         f.write_all(content.as_bytes())?;
-        f.sync_all()
+        f.sync_all()?;
+        verify()
     })();
     if let Err(e) = write {
         let _ = std::fs::remove_file(&tmp);
@@ -238,6 +252,29 @@ pub fn atomic_write_nofollow(full: &Path, content: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revoked_after_staging_sync_does_not_publish_or_leave_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("page.md");
+        std::fs::write(&page, "original").unwrap();
+        let checks = std::cell::Cell::new(0);
+        let result = atomic_write_nofollow_checked(&page, "replacement", || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            // The fourth check is after writing and syncing the staged bytes.
+            if next == 4 {
+                assert_eq!(std::fs::read_to_string(page.with_extension("md.tmp")).unwrap(), "replacement");
+                Err(denied("authority revoked"))
+            } else { Ok(()) }
+        });
+        assert!(result.is_err());
+        assert_eq!(checks.get(), 4);
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), "original");
+        assert!(!page.with_extension("md.tmp").exists());
+        atomic_write_nofollow(&page, "host write").unwrap();
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), "host write");
+    }
 
     #[test]
     fn relative_paths_pass() {

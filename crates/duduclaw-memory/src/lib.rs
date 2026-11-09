@@ -1,3 +1,7 @@
+mod isolation_io;
+// F6h: namespace write gate installed by the gateway (protected mode).
+pub mod label_gate;
+pub use label_gate::{install_label_write_gate, LabelWriteGate};
 pub mod module_lease;
 pub mod bench;
 pub mod code_map;

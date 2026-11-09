@@ -376,9 +376,19 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+fn verify_io() -> Result<(), String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())
+}
+
 fn open_conn(db_path: &Path) -> Result<Connection, String> {
+    verify_io()?;
     let conn = Connection::open(db_path).map_err(|e| format!("open prediction.db: {e}"))?;
-    ensure_schema(&conn)?;
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    verify_io()?;
+    ensure_schema(&tx)?;
+    verify_io()?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -521,7 +531,10 @@ pub fn submit(db_path: &Path, b: NewBelief) -> Result<String, String> {
     let predicted_at = Utc::now().to_rfc3339();
     let stats_injected = last_stats_injected_within(&conn, agent_id, STATS_INJECTED_WINDOW_HOURS);
 
-    conn.execute(
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    verify_io()?;
+    tx.execute(
         "INSERT INTO belief_log
          (belief_id, agent_id, subject, horizon, direction, prob, rationale,
           ref_value, predicted_at, stats_injected, source_goal_id)
@@ -542,6 +555,8 @@ pub fn submit(db_path: &Path, b: NewBelief) -> Result<String, String> {
     )
     .map_err(|e| format!("insert belief: {e}"))?;
 
+    verify_io()?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(belief_id)
 }
 
@@ -583,8 +598,11 @@ pub fn settle(
         return Err("realized_value must be a positive finite number".to_string());
     }
     let conn = open_conn(db_path)?;
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    verify_io()?;
 
-    let existing = conn
+    let existing = tx
         .query_row(
             &format!(
                 "SELECT {SELECT_COLUMNS} FROM belief_log \
@@ -667,7 +685,8 @@ pub fn settle(
     };
 
     let settled_at = Utc::now().to_rfc3339();
-    conn.execute(
+    verify_io()?;
+    tx.execute(
         "UPDATE belief_log
          SET realized_value = ?1, realized_direction = ?2, outcome = ?3, brier = ?4,
              settled_at = ?5, settle_source = ?6
@@ -684,6 +703,8 @@ pub fn settle(
     )
     .map_err(|e| format!("update belief: {e}"))?;
 
+    verify_io()?;
+    tx.commit().map_err(|e| e.to_string())?;
     conn.query_row(
         &format!("SELECT {SELECT_COLUMNS} FROM belief_log WHERE belief_id = ?1"),
         params![belief_id],
@@ -1103,6 +1124,18 @@ mod tests {
             ref_value: Some(ref_value),
             source_goal_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn isolated_belief_refusal_creates_no_database() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let (db, _dir) = temp_db();
+        let result = duduclaw_mcp_boundary::io_authority::scope(
+            crate::isolation_io_test_support::context(Arc::new(AtomicBool::new(false))), async {
+                submit(&db, belief("worker", "subject", "up", 0.7, 100.0))
+            }).await;
+        assert!(result.is_err());
+        assert!(!db.exists());
     }
 
     // ── submit: validation ──

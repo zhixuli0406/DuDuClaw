@@ -60,6 +60,14 @@ impl MethodHandler {
         // teams' tasks/activity). Mirrors the agent-binding intent of memory.*.
         macro_rules! check_agent_filter {
             ($min_level:expr) => {
+                // v1.81 P1g: an Admin naming another person's Personal
+                // employee is refused too (the ACL no longer lets the role
+                // through); an unscoped Admin listing drops those rows.
+                if ctx.is_admin()
+                    && params.get("agent_id").and_then(|v| v.as_str()).is_some_and(|id| !id.is_empty() && ctx.hides_agent(id))
+                {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 if !ctx.is_admin() {
                     match params.get("agent_id").and_then(|v| v.as_str()) {
                         Some(id) if !id.is_empty() => {
@@ -401,6 +409,14 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_experts_list()).await
             }
+            // SR2 1c: pack installs write new `agents/<id>` directories (or
+            // replace one); in native Linux protected mode employees exist
+            // only through the Employee proposal path.
+            "experts.install" | "experts.install_builtin" | "experts.install_draft"
+                if crate::runtime_readiness::is_protected_linux() => {
+                require_admin!();
+                WsFrame::error_response("", super::isolation_employee_rpc::DIRECT_CREATE_REFUSED)
+            }
             "experts.install" => {
                 require_admin!();
                 boxed_frame(|| self.handle_experts_install(params)).await
@@ -464,7 +480,12 @@ impl MethodHandler {
             }
 
             // ── System (admin only for config changes) ───────
-            "system.status" => boxed_frame(|| self.handle_system_status(ctx)).await,
+            // Every role may read it; per-employee isolation readiness labels
+            // (F3) only for the same Admin check `require_admin!` applies.
+            "system.status" => {
+                let admin = acl::require_role(ctx, UserRole::Admin).is_ok();
+                boxed_frame(|| self.handle_system_status(admin)).await
+            }
             "system.doctor" => {
                 require_admin!();
                 boxed_frame(|| self.handle_system_doctor()).await

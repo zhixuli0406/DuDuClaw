@@ -178,21 +178,22 @@ pub(crate) fn verified_delegation_context(
     worker: &str,
 ) -> Option<duduclaw_core::identity_token::DelegationContext> {
     use duduclaw_core::identity_token::{
-        claim_delegation_context, delegation_run_binding, verify_delegation_context,
+        claim_delegation_context, delegation_run_binding, verify_delegation_context_in,
         ENV_DELEGATION_CONTEXT,
     };
     let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).ok()?;
     let identity = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).ok()?;
     if claimed != worker { return None; }
     let key = zeroize::Zeroizing::new(duduclaw_core::load_identity_key(home)?);
-    if !duduclaw_core::verify_identity_token(&key, worker, &identity) { return None; }
+    // F6m: v2 token and v2 context of the live tuple for a protected worker.
+    if !duduclaw_core::verify_agent_token(home, &key, worker, &identity) { return None; }
     let run = std::env::var(duduclaw_core::ENV_DISPATCH_RUN_ID).ok();
     let task = std::env::var(duduclaw_core::ENV_TASK_ID).ok();
     let turn = std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok();
     let binding = delegation_run_binding(run.as_deref(), task.as_deref(), turn.as_deref());
     let token = std::env::var(ENV_DELEGATION_CONTEXT).ok()?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    let context = verify_delegation_context(&key, worker, binding.as_deref(), &token, now)?;
+    let context = verify_delegation_context_in(home, &key, worker, binding.as_deref(), &token, now)?;
     claim_delegation_context(home, &context).then_some(context)
 }
 
@@ -222,6 +223,8 @@ pub(crate) fn resolve_audit_agent(
     principal: Option<&crate::mcp_auth::Principal>,
     default_agent: &str,
 ) -> String {
+    // A native Linux isolated call is attributed to its connection-bound employee.
+    if let Some(call) = crate::mcp_isolation::current() { return call.agent.clone(); }
     let Some(principal) = principal else { return default_agent.to_string(); };
     if principal.is_external { return principal.client_id.clone(); }
     verified_delegation_context(home, default_agent)

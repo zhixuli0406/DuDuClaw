@@ -129,6 +129,7 @@ impl MethodHandler {
             let (email, display_name, password) =
                 (email.to_string(), display_name.to_string(), password.to_string());
             let (department, manager) = (department.map(str::to_string), manager.clone());
+            let actor = ctx.user_id.clone();
             tokio::task::spawn_blocking(move || {
                 let new = duduclaw_auth::NewUser {
                     email: &email,
@@ -138,8 +139,8 @@ impl MethodHandler {
                     department: department.as_deref(),
                     manager: manager.as_deref(),
                 };
-                if invite { db.create_invited_user_with(&new) }
-                else { db.create_user_with(&new) }
+                // F6 S2: the admin eligibility log records the creator.
+                db.create_user_as(Some(actor.as_str()), &new, invite)
             })
             .await
         };
@@ -240,13 +241,15 @@ impl MethodHandler {
             let display_name = display_name.map(str::to_string);
             let password = password.map(str::to_string);
             let manager_change = manager_change.clone();
+            let actor = ctx.user_id.clone();
             tokio::task::spawn_blocking(move || {
                 let manager = match &manager_change {
                     ManagerChange::Unchanged => None,
                     ManagerChange::Clear => Some(None),
                     ManagerChange::Set(m) => Some(Some(m.as_str())),
                 };
-                db.apply_user_update(
+                db.apply_user_update_as(
+                    Some(actor.as_str()),
                     &user_id,
                     &duduclaw_auth::UserUpdate {
                         display_name: display_name.as_deref(),
@@ -293,7 +296,7 @@ impl MethodHandler {
         };
 
         let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
-        match db.set_user_status(user_id, duduclaw_auth::UserStatus::Suspended) {
+        match db.set_user_status_as(Some(ctx.user_id.as_str()), user_id, duduclaw_auth::UserStatus::Suspended) {
             Ok(()) => {
                 let cleanup_error = crate::google_personal::lifecycle::disconnect(&self.home_dir, &db, user_id, &ctx.user_id, true).await.err();
                 if let Ok(agents) = &google_affected_agents { crate::google_personal::lifecycle::notify_affected(&self.home_dir, &ctx.user_id, agents); }
@@ -333,6 +336,11 @@ impl MethodHandler {
             Ok(l) => l,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        // SR5 round 3 N5: a quarantined / tombstoned label is refused from the
+        // lifecycle index, not only from the users.db mirror auth reads.
+        if let Some(refusal) = crate::isolation_label_stores::bind_refusal(&self.home_dir, agent_name) {
+            return WsFrame::error_response("", refusal);
+        }
 
         // Verify agent exists
         let reg = self.registry.read().await;
@@ -442,6 +450,19 @@ impl MethodHandler {
         // One transaction: status, the leaver's reports (moved to
         // `transfer_to`, else to the leaver's manager, each re-checked and
         // audited as `user.reparent`) and, with `transfer_to`, the bindings.
+        // SR5 round 3 N5: a transfer never re-binds a quarantined / tombstoned
+        // label (checked from the lifecycle index before auth moves bindings).
+        if transfer_to.is_some() {
+            let agents = match db.get_user_agents(user_id) {
+                Ok(bindings) => bindings,
+                Err(_) => return WsFrame::error_response("", crate::isolation_label_stores::LABEL_STATE_UNAVAILABLE),
+            };
+            if let Some(refusal) = agents.iter()
+                .find_map(|binding| crate::isolation_label_stores::bind_refusal(&self.home_dir, &binding.agent_name))
+            {
+                return WsFrame::error_response("", refusal);
+            }
+        }
         let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
         let outcome = match db.offboard_user(user_id, transfer_to, Some(&ctx.user_id)) {
             Ok(outcome) => outcome,
@@ -625,7 +646,8 @@ impl MethodHandler {
         if email == user.email {
             return WsFrame::ok_response("", json!({"status": "unchanged", "email": email}));
         }
-        match db.change_email(&ctx.user_id, email) {
+        // F6d (Q3): the session user is the account; stamped owner-authenticated.
+        match db.change_own_email(&ctx.user_id, email) {
             Ok(()) => {
                 // The audit row keeps both addresses: it is the only record of
                 // which login name the account used before.
@@ -637,6 +659,15 @@ impl MethodHandler {
                     Some(&detail),
                     None,
                 );
+                // SR4 item 2(iv): an address that is now a designated Google
+                // service mailbox or a delegate subject stays refused at use
+                // time; the collision is surfaced to Admins as an audit event.
+                if crate::runtime_readiness::is_protected_linux() {
+                    let (home, user_id, address) = (self.home_dir.clone(), ctx.user_id.clone(), email.to_owned());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::google_identity::tenant_source::audit_email_conflict(&home, &user_id, &address)
+                    }).await;
+                }
                 WsFrame::ok_response("", json!({"status": "changed", "email": email}))
             }
             Err(e) if e == duduclaw_auth::db::EMAIL_IN_USE => WsFrame::error_response("", &e),
@@ -696,7 +727,8 @@ impl MethodHandler {
             return WsFrame::error_response("", "new password must differ from the current one");
         }
 
-        match db.update_user(&ctx.user_id, None, None, Some(new_password)) {
+        // F6d (Q3): the session user is the account; stamped owner-authenticated.
+        match db.change_own_password(&ctx.user_id, new_password) {
             Ok(()) => {
                 let _ = db.log_action(
                     Some(&ctx.user_id),

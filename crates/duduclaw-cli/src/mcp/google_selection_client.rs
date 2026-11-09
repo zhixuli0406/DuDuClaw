@@ -86,7 +86,7 @@ async fn post(
         .next()
         .ok_or(ERROR)?;
     let identity = duduclaw_core::load_identity_key(home).ok_or(ERROR)?;
-    let token = duduclaw_core::mint_identity_token(&identity, agent);
+    let token = duduclaw_core::current_agent_token(home, &identity, agent).ok_or(ERROR)?;
     let now = duduclaw_gateway::google_personal::authority::now();
     let nonce: [u8; 16] = rand::random();
     let headers =

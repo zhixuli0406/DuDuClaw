@@ -200,8 +200,12 @@ fn unexpected_result(method: &'static str, result: &Value) -> String {
     format!("Odoo returned an unexpected response type for {method}")
 }
 
+/// Retained callback checked before DNS, authentication retries and every RPC.
+pub type IoAuthority = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Main Odoo connection handle.
 pub struct OdooConnector {
+    io_authority: IoAuthority,
     pub url: String,
     pub db: String,
     pub uid: Option<i64>,
@@ -307,9 +311,20 @@ impl OdooStatus {
 }
 
 impl OdooConnector {
+    pub fn verify_io(&self) -> Result<(), String> {
+        if (self.io_authority)() { Ok(()) } else { Err("Odoo authority revoked".into()) }
+    }
+
     /// Connect to Odoo, authenticate, and detect edition.
     pub async fn connect(config: &OdooConfig, credential: &str) -> Result<Self, String> {
         Self::connect_cached(config, credential, None, Vec::new()).await
+    }
+
+    /// Connect with a retained I/O authority checked before DNS, every
+    /// authentication attempt and every later RPC. Never uses the on-disk
+    /// connection cache (protected-mode callers always authenticate live).
+    pub async fn connect_checked(config: &OdooConfig, credential: &str, io_authority: IoAuthority) -> Result<Self, String> {
+        Self::connect_cached_checked(config, credential, None, Vec::new(), io_authority).await
     }
 
     /// The RPC client is stateless: execute_kw sends uid AND credential every time.
@@ -317,6 +332,14 @@ impl OdooConnector {
     pub async fn connect_cached(
         config: &OdooConfig, credential: &str, home: Option<&std::path::Path>, company_ids: Vec<i64>,
     ) -> Result<Self, String> {
+        Self::connect_cached_checked(config, credential, home, company_ids, std::sync::Arc::new(|| true)).await
+    }
+
+    async fn connect_cached_checked(
+        config: &OdooConfig, credential: &str, home: Option<&std::path::Path>, company_ids: Vec<i64>,
+        io_authority: IoAuthority,
+    ) -> Result<Self, String> {
+        if !io_authority() { return Err("Odoo authority revoked".into()); }
         if !config.is_configured() {
             return Err("Odoo not configured: url and db are required".to_string());
         }
@@ -342,7 +365,9 @@ impl OdooConnector {
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
 
+        if !io_authority() { return Err("Odoo authority revoked".into()); }
         let mut conn = Self {
+            io_authority,
             url: config.url.clone(),
             db: config.db.clone(),
             uid: None,
@@ -370,6 +395,7 @@ impl OdooConnector {
         }
         let delays = [100, 500, 1000];
         for (attempt, delay) in delays.iter().enumerate() {
+            conn.verify_io()?;
             match rpc::authenticate_classified(&conn.http, &config.url, &config.db, &config.username, credential).await {
                 Ok(uid) => { conn.uid = Some(uid); break; }
                 Err(error) if error.retryable && attempt + 1 < delays.len() => {
@@ -427,6 +453,7 @@ impl OdooConnector {
 
     /// Get Odoo server version.
     pub async fn version(&self) -> Result<Value, String> {
+        self.verify_io()?;
         #[cfg(test)]
         let result = if let Some(mock) = &self.mock_rpc {
             mock.requests.lock().unwrap().push(("common".into(), "version".into(), Vec::new(), json!({})));
@@ -478,6 +505,7 @@ impl OdooConnector {
     }
 
     pub(crate) async fn raw_execute_kw(&self, model: &str, method: &str, args: Vec<Value>, kwargs: Value) -> Result<Value, String> {
+        self.verify_io()?;
         #[cfg(test)]
         if let Some(mock) = &self.mock_rpc {
             mock.requests.lock().unwrap().push((model.into(), method.into(), args, kwargs));
@@ -883,6 +911,7 @@ impl Drop for MockFlight<'_> {
 #[cfg(test)]
 pub(crate) fn mocked_connector(responses: Vec<Result<Value, String>>) -> OdooConnector {
     OdooConnector {
+        io_authority: std::sync::Arc::new(|| true),
         url: "http://mock-odoo".into(), db: "test".into(), uid: Some(1), credential: "test".into(),
         edition_gate: EditionGate::unknown(), http: reqwest::Client::new(), company_ids: Vec::new(),
         field_cache: Mutex::new(BTreeMap::new()), missing_fields: std::sync::Mutex::new(HashSet::new()),
@@ -896,6 +925,32 @@ pub(crate) fn mocked_connector(responses: Vec<Result<Value, String>>) -> OdooCon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retained_authority_stops_version_and_rpc_after_revocation() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let live = Arc::new(AtomicBool::new(true));
+        let flag = live.clone();
+        let mut conn = mocked_connector(vec![Ok(json!({"server_version":"18.0"}))]);
+        conn.io_authority = Arc::new(move || flag.load(Ordering::SeqCst));
+        assert!(conn.version().await.is_ok());
+        live.store(false, Ordering::SeqCst);
+        assert!(conn.version().await.is_err());
+        assert!(conn.raw_execute_kw("res.partner", "search", vec![], json!({})).await.is_err());
+        assert_eq!(conn.mocked_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_authority_rechecks_between_metadata_and_effect() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let mut conn = mocked_connector(vec![Ok(json!({"name":{"type":"char"}}))]);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let count = checks.clone();
+        conn.io_authority = Arc::new(move || count.fetch_add(1, Ordering::SeqCst) == 0);
+        assert!(conn.execute_kw("res.partner", "search_read", vec![], json!({"fields":["name"]})).await.is_err());
+        assert_eq!(conn.mocked_requests().len(), 1);
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn permission_probe_timeouts_stay_unknown_and_release_requests() {

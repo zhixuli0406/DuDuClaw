@@ -40,6 +40,7 @@ pub const MANAGER_HAS_REPORTS: &str = "manager_has_reports";
 pub const MANAGER_NOT_FOUND: &str = "manager_not_found";
 pub const MANAGER_INACTIVE: &str = "manager_inactive";
 pub const TRANSFER_TARGET_INVALID: &str = "transfer_target_invalid";
+pub const PERSONAL_EMPLOYEE_HANDOVER: &str = "personal_employee_handover_required";
 
 /// Why a reporting-line write was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,11 @@ pub enum OrgError {
     TooDeep,
     HasReports,
     TransferTargetInvalid,
+    /// Offboarding with a transfer would move the binding of this Personal
+    /// employee (native Linux isolation) to another user. A Personal
+    /// employee is never transferred: an admin must hand it over (tombstone
+    /// it through the employee lifecycle) first.
+    PersonalEmployee(String),
     Db(String),
 }
 
@@ -68,6 +74,7 @@ impl OrgError {
             Self::TooDeep => MANAGER_TOO_DEEP,
             Self::HasReports => MANAGER_HAS_REPORTS,
             Self::TransferTargetInvalid => TRANSFER_TARGET_INVALID,
+            Self::PersonalEmployee(_) => PERSONAL_EMPLOYEE_HANDOVER,
             Self::Db(_) => "internal_error",
         }
     }
@@ -77,6 +84,9 @@ impl std::fmt::Display for OrgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Db(e) => write!(f, "{e}"),
+            Self::PersonalEmployee(agent) => write!(f,
+                "{agent} is a personal employee and cannot be transferred with the offboarding; \
+                 an admin must hand it over (tombstone the personal employee) first"),
             other => write!(f, "{}", other.code()),
         }
     }
@@ -212,6 +222,13 @@ const TEAM_CTE: &str = "WITH RECURSIVE team(id, depth) AS (
 /// decides whether `manager_id` may have a team at all (Active and role at
 /// least Manager); this function only walks the tree. On `Err` the caller
 /// must narrow.
+///
+/// Native Linux isolation (v1.81 P1): an agent with an
+/// `isolation_personal_agents` mirror row is a Personal employee and relays
+/// nothing to anyone above its owner — a manager gets no derived access to a
+/// subordinate's Personal employee. Only protected installs write mirror rows,
+/// so other installs are unchanged. A missing mirror table is an error (the
+/// caller narrows), never "no Personal employees".
 pub fn team_grants_on(
     conn: &Connection,
     manager_id: &str,
@@ -220,6 +237,8 @@ pub fn team_grants_on(
         "{TEAM_CTE}
          SELECT t.id, MIN(t.depth), b.agent_name, b.access_level
            FROM team t JOIN user_agent_bindings b ON b.user_id = t.id
+          WHERE NOT EXISTS(SELECT 1 FROM isolation_personal_agents p
+                            WHERE p.agent_name = b.agent_name)
           GROUP BY t.id, b.agent_name"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("team query error: {e}"))?;
@@ -268,6 +287,8 @@ fn grant_rank(g: &TeamGrant) -> (std::cmp::Reverse<u8>, u8, String) {
 /// This is a bounded database query, not an authorization decision: callers
 /// must first verify the viewer's live status, role, edition and settings.
 /// A corrupt binding grants no visibility; a database read failure is an error.
+/// A Personal employee (isolation mirror row, v1.81 P1) has no overseen
+/// reports: its owner's manager never reads its history through the team.
 pub fn overseen_reports_on(
     conn: &Connection,
     manager_id: &str,
@@ -279,6 +300,8 @@ pub fn overseen_reports_on(
            FROM team t JOIN users u ON u.id = t.id
            JOIN user_agent_bindings b ON b.user_id = t.id
           WHERE u.status = 'active' AND b.agent_name = ?3
+            AND NOT EXISTS(SELECT 1 FROM isolation_personal_agents p
+                            WHERE p.agent_name = b.agent_name)
           GROUP BY t.id, u.display_name, b.access_level
           ORDER BY MIN(t.depth), t.id"
     );
@@ -329,21 +352,28 @@ pub(crate) fn direct_bindings(conn: &Connection, user_id: &str) -> Result<BTreeM
 /// snapshot. `Ok(None)` when the user does not exist or is not Active.
 fn load_access(conn: &mut Connection, user_id: &str) -> Result<Option<(User, EffectiveAccess)>, String> {
     let tx = conn.transaction().map_err(|e| format!("read error: {e}"))?;
-    let generation = read_acl_generation(&tx)?;
-    let Some(user) = crate::user_row::load_user(&tx, user_id)? else {
+    let access = load_access_on(&tx, user_id)?;
+    tx.finish().map_err(|e| format!("read error: {e}"))?;
+    Ok(access)
+}
+
+/// Caller owns the read transaction, allowing additional authority facts to
+/// be read at exactly the same database snapshot.
+pub(crate) fn load_access_on(conn: &Connection, user_id: &str) -> Result<Option<(User, EffectiveAccess)>, String> {
+    let generation = read_acl_generation(conn)?;
+    let Some(user) = crate::user_row::load_user(conn, user_id)? else {
         return Ok(None);
     };
     if user.status != UserStatus::Active {
         return Ok(None);
     }
-    let direct = direct_bindings(&tx, user_id)?;
+    let direct = direct_bindings(conn, user_id)?;
     // Q2: only someone whose role can manage gets anything from a team.
     let team = if user.role.at_least(UserRole::Manager) {
-        team_grants_on(&tx, user_id)?
+        team_grants_on(conn, user_id)?
     } else {
         BTreeMap::new()
     };
-    tx.finish().map_err(|e| format!("read error: {e}"))?;
     let access = EffectiveAccess {
         user_id: user.id.clone(),
         role: user.role,

@@ -8,8 +8,9 @@ impl TaskStore {
         if !PLAN_STATUSES.contains(&row.status.as_str()) {
             return Err(format!("invalid plan status: {}", row.status));
         }
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = begin_live_write(&mut conn)?;
+        tx.execute(
             "INSERT INTO plans (id, title, description, agent_id, goal_id, status, created_by,
                                 created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -26,11 +27,13 @@ impl TaskStore {
             ],
         )
         .map_err(|e| format!("insert plan: {e}"))?;
+        commit_live_write(tx)?;
         Ok(())
     }
 
     pub async fn get_plan(&self, id: &str) -> Result<Option<PlanRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!("SELECT {PLAN_COLUMNS} FROM plans WHERE id = ?1"),
             params![id],
@@ -47,6 +50,7 @@ impl TaskStore {
         status: Option<&str>,
     ) -> Result<Vec<PlanRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut sql = format!("SELECT {PLAN_COLUMNS} FROM plans WHERE 1=1");
         let mut binds: Vec<String> = Vec::new();
         if let Some(a) = agent_id {
@@ -86,7 +90,8 @@ impl TaskStore {
             }
         }
         {
-            let conn = self.conn.lock().await;
+            let mut conn = self.conn.lock().await;
+            let tx = begin_live_write(&mut conn)?;
             let mut sets = vec!["updated_at = ?1".to_string()];
             let mut binds: Vec<String> = vec![Utc::now().to_rfc3339()];
             for key in ["title", "description", "status"] {
@@ -107,8 +112,9 @@ impl TaskStore {
                 .iter()
                 .map(|s| s as &dyn rusqlite::types::ToSql)
                 .collect();
-            conn.execute(&sql, params_ref.as_slice())
+            tx.execute(&sql, params_ref.as_slice())
                 .map_err(|e| format!("update plan: {e}"))?;
+            commit_live_write(tx)?;
         }
         self.get_plan(id).await
     }
@@ -116,16 +122,13 @@ impl TaskStore {
     /// Delete a plan and all its steps in one transaction.
     pub async fn remove_plan(&self, id: &str) -> Result<bool, String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("remove plan: begin: {e}"))?;
+        let tx = begin_live_write(&mut conn)?;
         tx.execute("DELETE FROM plan_steps WHERE plan_id = ?1", params![id])
             .map_err(|e| format!("remove plan steps: {e}"))?;
         let n = tx
             .execute("DELETE FROM plans WHERE id = ?1", params![id])
             .map_err(|e| format!("remove plan: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("remove plan: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(n > 0)
     }
 
@@ -133,11 +136,13 @@ impl TaskStore {
     /// `created_at, id` so the ordering is total and deterministic.
     pub async fn list_plan_steps(&self, plan_id: &str) -> Result<Vec<PlanStepRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         list_plan_steps_conn(&conn, plan_id)
     }
 
     pub async fn get_plan_step(&self, step_id: &str) -> Result<Option<PlanStepRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!("SELECT {PLAN_STEP_COLUMNS} FROM plan_steps WHERE id = ?1"),
             params![step_id],
@@ -170,9 +175,7 @@ impl TaskStore {
         let now = Utc::now().to_rfc3339();
         let row = {
             let mut conn = self.conn.lock().await;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|e| format!("add step: begin: {e}"))?;
+            let tx = begin_live_write(&mut conn)?;
             // Plan must exist — a step may never dangle.
             let plan_exists: Option<String> = tx
                 .query_row(
@@ -229,7 +232,7 @@ impl TaskStore {
                 params![plan_id, now],
             )
             .map_err(|e| format!("touch plan: {e}"))?;
-            tx.commit().map_err(|e| format!("add step: commit: {e}"))?;
+            commit_live_write(tx)?;
             row
         };
         Ok(row)
@@ -258,7 +261,8 @@ impl TaskStore {
             }
         }
         {
-            let conn = self.conn.lock().await;
+            let mut conn = self.conn.lock().await;
+            let tx = begin_live_write(&mut conn)?;
             let now = Utc::now().to_rfc3339();
             let mut sets = vec!["updated_at = ?1".to_string()];
             let mut binds: Vec<String> = vec![now.clone()];
@@ -285,15 +289,16 @@ impl TaskStore {
                 .iter()
                 .map(|s| s as &dyn rusqlite::types::ToSql)
                 .collect();
-            conn.execute(&sql, params_ref.as_slice())
+            tx.execute(&sql, params_ref.as_slice())
                 .map_err(|e| format!("update step: {e}"))?;
             // Touch the parent plan so `updated_at` reflects the latest co-edit.
-            conn.execute(
+            tx.execute(
                 "UPDATE plans SET updated_at = ?1
                   WHERE id = (SELECT plan_id FROM plan_steps WHERE id = ?2)",
                 params![now, step_id],
             )
             .map_err(|e| format!("touch plan: {e}"))?;
+            commit_live_write(tx)?;
         }
         self.get_plan_step(step_id).await
     }
@@ -309,9 +314,7 @@ impl TaskStore {
     ) -> Result<bool, String> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("move step: begin: {e}"))?;
+        let tx = begin_live_write(&mut conn)?;
         let steps = list_plan_steps_conn(&tx, plan_id)?;
         let Some(cur_idx) = steps.iter().position(|s| s.id == step_id) else {
             return Ok(false);
@@ -350,7 +353,7 @@ impl TaskStore {
             params![plan_id, now],
         )
         .map_err(|e| format!("touch plan: {e}"))?;
-        tx.commit().map_err(|e| format!("move step: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(true)
     }
 
@@ -360,15 +363,17 @@ impl TaskStore {
         let Some(row) = existing else {
             return Ok(None);
         };
-        let conn = self.conn.lock().await;
+        let mut conn = self.conn.lock().await;
+        let tx = begin_live_write(&mut conn)?;
         let now = Utc::now().to_rfc3339();
-        conn.execute("DELETE FROM plan_steps WHERE id = ?1", params![step_id])
+        tx.execute("DELETE FROM plan_steps WHERE id = ?1", params![step_id])
             .map_err(|e| format!("remove step: {e}"))?;
-        conn.execute(
+        tx.execute(
             "UPDATE plans SET updated_at = ?2 WHERE id = ?1",
             params![row.plan_id, now],
         )
         .map_err(|e| format!("touch plan: {e}"))?;
+        commit_live_write(tx)?;
         Ok(Some(row))
     }
 

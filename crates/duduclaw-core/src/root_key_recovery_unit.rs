@@ -16,6 +16,7 @@ StartLimitIntervalSec=3600
 StartLimitBurst=4
 
 [Service]
+Slice=duduclaw-tcb.slice
 Type=simple
 ExecStart={launcher} {binary} run --yes
 # Stop every descendant before a fresh key handoff.

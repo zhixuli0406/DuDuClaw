@@ -154,7 +154,7 @@ class SigningContractTests(unittest.TestCase):
         for script in ('build-gateway-bundle.py', 'sign-gateway.sh', 'verify-gateway-signature.sh'):
             self.assertIn(script, workflow)
         self.assertLess(workflow.index('Check binary is portable (macOS)'), workflow.index('Import macOS gateway'))
-        self.assertLess(workflow.index('verify-gateway-signature.sh'), workflow.index('name: Package (Unix)'))
+        self.assertLess(workflow.index('verify-gateway-signature.sh'), workflow.index('name: Package (macOS)'))
         self.assertIn('matrix.artifact }}.app.zip.sig', workflow)
         self.assertIn('for f in duduclaw-*.tar.gz duduclaw-*.zip', workflow)
         self.assertIn('            duduclaw-*.zip', workflow)

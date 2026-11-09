@@ -886,3 +886,7 @@ async fn google_invalid_grant_marks_reconnect_without_token_deletion() {
     let diagnostics = std::fs::read_to_string(d.path().join("google-setup-status.json")).unwrap();
     assert!(!diagnostics.contains("secret-provider-description"));
 }
+
+/// v1.81 E3: home invalid_grant fences SharedHome google; revoke during refresh.
+#[path = "oauth_material_e3_tests.rs"]
+mod e3;

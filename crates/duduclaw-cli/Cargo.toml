@@ -12,7 +12,12 @@ name = "duduclaw"
 path = "src/bin/duduclaw.rs"
 
 [dependencies]
+semver = "1"
+duduclaw-parse-worker = { workspace = true }
 duduclaw-core = { workspace = true }
+duduclaw-isolation = { workspace = true }
+duduclaw-updated = { workspace = true }
+duduclaw-mcp-boundary = { workspace = true }
 duduclaw-auth = { workspace = true }
 duduclaw-tui = { path = "../duduclaw-tui" }
 zeroize.workspace = true
@@ -99,11 +104,17 @@ duduclaw-knowledge = { workspace = true }
 tempfile = "3"
 unicode-normalization = "0.1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+duduclaw-migration = { path = "../duduclaw-migration" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+duduclaw-gateway = { workspace = true, features = ["test-support"] }
 duduclaw-license = { workspace = true, features = ["test-support"] }
+# H11: `resources::test_broker::TestWorkBroker` (root work broker double).
+duduclaw-mcp-boundary = { workspace = true, features = ["test-support"] }
 duduclaw-core = { workspace = true, features = ["installation-policy-test-hooks"] }
 # P2-B: `Provenance::test_only` exists only with this feature (never in a
 # production build).
@@ -118,6 +129,8 @@ http-body-util = "0.1"
 axum = { workspace = true }
 
 [features]
+# Protected MCP boot must explicitly install the checked E worker.
+isolation-worker-integration = ["duduclaw-gateway/isolation-worker-integration"]
 # Explicit non-shipping subprocess fault-injection build; never enabled by default.
 workflow-test-checkpoints = []
 # Aligned with `duduclaw-gateway/default = ["dashboard", "desktop"]` so that

@@ -160,6 +160,12 @@ impl SessionManager {
     pub fn new(db_path: &Path) -> Result<Self> {
         let first = Connection::open(db_path).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         Self::init_tables(&first)?;
+        // F6fb item 2: every write of every pool connection that carries a
+        // label (directly or through its session) passes the F6 writer gate,
+        // including writers without an explicit check (failure records,
+        // compression, pinned instructions, titles, legacy import).
+        crate::isolation_label_stores::install_store_gate(&first, "sessions")
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         let mut pool = vec![Mutex::new(first)];
         for _ in 1..POOL_SIZE {
@@ -167,9 +173,11 @@ impl SessionManager {
                 Connection::open(db_path).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
             // Enable WAL mode for better concurrent read performance
             conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+                "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            crate::isolation_label_stores::install_store_gate(&conn, "sessions")
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
             pool.push(Mutex::new(conn));
         }
 
@@ -213,8 +221,8 @@ impl SessionManager {
 
     fn init_tables(conn: &Connection) -> Result<()> {
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-            PRAGMA busy_timeout=5000;
+            "PRAGMA busy_timeout=5000;
+            PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -669,6 +677,10 @@ impl SessionManager {
         client_msg_id: Option<&str>, pending: bool, generation: Option<&str>,
     ) -> Result<i64> {
         let mut guard = self.acquire().await;
+        // F6h writer gate (protected mode only): the session's agent must be
+        // live. Checked before anything is written — including RM-173's
+        // stuck-clear repair below, itself a write to this label's store.
+        crate::isolation_label_stores::check_session_writable(&guard, session_id).map_err(DuDuClawError::Gateway)?;
         let now = chrono::Utc::now().to_rfc3339();
         // (Named `conn` so the statements below read as before.)
         let conn = guard
@@ -929,6 +941,7 @@ impl SessionManager {
         let masked = duduclaw_security::credential_detect::mask(text);
         let text = duduclaw_core::truncate_chars(&masked, 2000);
         let conn = self.acquire().await;
+        crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?; // F6fb
         conn.execute(
             "INSERT INTO session_messages
              (session_id, role, content, tokens, timestamp, hidden, notice_kind)
@@ -1049,6 +1062,8 @@ impl SessionManager {
         let masked_summary = duduclaw_security::credential_detect::mask(summary);
         let summary = masked_summary.as_str();
         let conn = self.acquire().await;
+        // F6fb: refused before anything is deleted (the triggers would abort the insert too).
+        crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let tx = conn
@@ -1257,6 +1272,9 @@ impl SessionManager {
     /// Admin or its own WebChat owner).
     pub async fn restore_archived(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.acquire().await;
+        // F6h writer gate (protected mode only): a tombstoned / quarantined
+        // label's conversation is never brought back to life.
+        crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?;
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
@@ -1701,6 +1719,7 @@ impl SessionManager {
     /// Set (or replace) pinned task instructions for a session.
     pub async fn set_pinned(&self, session_id: &str, instructions: &str) -> Result<()> {
         let conn = self.acquire().await;
+        crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?; // F6fb
         conn.execute(
             "UPDATE sessions SET pinned_instructions = ?1 WHERE id = ?2",
             params![duduclaw_security::credential_detect::mask(instructions), session_id],
@@ -1927,6 +1946,7 @@ impl SessionManager {
         let masked = duduclaw_security::credential_detect::mask(title);
         let clean = duduclaw_core::truncate_chars(masked.trim(), SESSION_TITLE_MAX_CHARS);
         let conn = self.acquire().await;
+        crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?; // F6fb
         conn.execute(
             "UPDATE sessions SET title = ?1, titled_through_turn = ?2 WHERE id = ?3",
             params![clean, through_turn as i64, session_id],

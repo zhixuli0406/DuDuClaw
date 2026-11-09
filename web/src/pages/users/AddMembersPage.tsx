@@ -39,6 +39,7 @@ const MEMBER_ERROR_MESSAGES = new Map<string, string>([
   ['member_invite_url_required', 'members.error.invitationUrl'],
   ['member_agent_unavailable', 'members.error.staffUnavailable'],
   ['member_agent_restricted', 'members.error.staffRestricted'],
+  ['member_agent_personal', 'members.error.staffPersonal'],
 ]);
 
 /** One account, its staff access and primary preference are submitted together. */

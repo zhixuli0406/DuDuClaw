@@ -1,0 +1,7 @@
+[Unit]
+Description=DuDuClaw trusted services resource reservation
+
+[Slice]
+MemoryAccounting=yes
+MemoryMin=512M
+TasksAccounting=yes

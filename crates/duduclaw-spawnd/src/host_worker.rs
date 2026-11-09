@@ -1,0 +1,246 @@
+//! Finite mailbox around blocking host operations. The control loop never waits.
+use std::{collections::BTreeMap, os::fd::OwnedFd, sync::mpsc::{self, SyncSender, Receiver}, time::{Duration, Instant}};
+use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize}, ids::{EmployeeId, RunId}, ipc::{CleanupReadback, ErrorCode, HelperCallId, SpawnRequest}};
+use crate::{admission::{BrokerJob, BrokerReply, BrokerStep, Host, HostProgress, LaunchPolicy, Ticket,
+    HelperEvent, HelperSignal, HelperStart, HelperStarted}, Result};
+#[cfg(test)]
+#[path = "host_worker_tests.rs"]
+mod tests;
+
+/// H4: bounded queue of deferred snapshot copies (one copy worker, FIFO, so
+/// the opens of one run are serialized and at most one copy is in memory).
+const COPY_QUEUE: usize = 16;
+type CopyTask = Box<dyn FnOnce() -> Result<BrokerReply> + Send>;
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Key { Ready(EmployeeId), Policy(EmployeeId, String, bool), Cleanup(EmployeeId, Option<RunId>), Start(RunId), Poll(RunId), Revoke(RunId), Kill(RunId), Io(RunId), Resize(RunId, u16, u16), Forget(RunId), Broker(u64),
+    /// HX4: one helper start (ticket) and fire-and-forget per-call signals.
+    Helper(u64), HelperSignal(RunId, HelperCallId, u8) }
+enum Work { Ready(EmployeeId), Policy(EmployeeId, RuntimeKind, bool), Cleanup(EmployeeId, Option<RunHandle>), Start(RunHandle, EmployeeId, SpawnRequest, LaunchPolicy, Vec<OwnedFd>), Poll(RunHandle), Revoke(RunHandle), Kill(RunHandle), Io(RunHandle), Resize(RunHandle, PtySize), Forget(RunHandle), Broker(BrokerJob),
+    Helper(Box<HelperStart<Vec<OwnedFd>>>), HelperSignal(RunHandle, HelperCallId, HelperSignal) }
+enum Value { Unit, Policy(LaunchPolicy), Cleanup(CleanupReadback), Progress(HostProgress), Io(Vec<OwnedFd>), Broker(BrokerReply), Helper(HelperStarted<Vec<OwnedFd>>) }
+struct Completed { key: Key, result: Result<Value>, at: Instant }
+struct Slot { sent: Instant, result: Option<(Result<Value>, Instant)> }
+
+/// The scanner has its own thread and deadline; no account/D-Bus command holds
+/// its lock. A stale scan is a failure, even if the lifecycle worker is healthy.
+pub trait Scan: Send {
+    fn scan(&mut self) -> Result<Vec<EmployeeId>>;
+    fn health(&mut self, employee: EmployeeId) -> Result<()>;
+    fn register(&mut self, run: RunHandle, employee: EmployeeId, startup_ms: u64) -> Result<()>;
+    fn cancel(&mut self, run: RunHandle) -> Result<()>;
+}
+/// One allocation request and its reply slot (schema-2 codes, F6l).
+pub(crate) type AllocationWork = (duduclaw_migration::allocation::Request,
+    SyncSender<std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode>>);
+pub struct WorkerHost {
+    allocation_sender: SyncSender<AllocationWork>,
+    sender: SyncSender<(Key, Work)>, receiver: Receiver<Completed>, slots: BTreeMap<Key, Slot>,
+    scanner: Box<dyn Scan>,
+    /// HX4 root-side helper facts from the lifecycle thread. Unbounded but
+    /// finite: at most one end per started call, one drain and one close per run.
+    helper_events: Receiver<HelperEvent>,
+}
+impl WorkerHost {
+    pub fn spawn<H>(mut host: H, scanner: Box<dyn Scan>) -> std::io::Result<Self>
+    where H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>> + Send + 'static {
+        let (sender, commands) = mpsc::sync_channel::<(Key, Work)>(128);
+        let (completed, receiver) = mpsc::sync_channel::<Completed>(128);
+        let (allocation_sender, allocation_commands) = mpsc::sync_channel::<AllocationWork>(8);
+        // H4: snapshot copies run here, never on the lifecycle thread (which
+        // also polls, fences and cleans up every run) nor on the control loop.
+        let (copy_sender, copy_jobs) = mpsc::sync_channel::<(Key, CopyTask)>(COPY_QUEUE);
+        let copied = completed.clone();
+        let (helper_sender, helper_events) = mpsc::channel::<HelperEvent>();
+        std::thread::Builder::new().name("spawnd-work-broker".into()).spawn(move || {
+            while let Ok((key, task)) = copy_jobs.recv() {
+                let result = task().map(Value::Broker);
+                if copied.send(Completed { key, result, at: Instant::now() }).is_err() { break; }
+            }
+        })?;
+        std::thread::Builder::new().name("spawnd-lifecycle".into()).spawn(move || {
+            loop {
+                let _ = host.maintenance();
+                // HX4: helper ends/drains/closes, decided root-side during maintenance.
+                for event in host.helper_events() { let _ = helper_sender.send(event); }
+                if let Ok((request, reply)) = allocation_commands.try_recv() {
+                    let _ = reply.send(host.allocation(&request));
+                }
+                match commands.recv_timeout(Duration::from_millis(25)) {
+                    Ok((key, Work::Broker(job))) => {
+                        let result = match host.broker(job) {
+                            Ok(BrokerStep::Done(reply)) => Ok(Value::Broker(reply)),
+                            // The copy worker answers on the same completion
+                            // channel and key. A full queue refuses (the task,
+                            // with its root fd and pin, is dropped here).
+                            Ok(BrokerStep::Deferred(task)) => match copy_sender.try_send((key.clone(), task)) {
+                                Ok(()) => continue,
+                                Err(_) => Err(ErrorCode::ResourceLimit),
+                            },
+                            Err(error) => Err(error),
+                        };
+                        if completed.send(Completed { key, result, at: Instant::now() }).is_err() { break; }
+                    }
+                    Ok((key, work)) => {
+                        let result = match work {
+                            Work::Ready(e) => host.ready(e).map(|()| Value::Unit),
+                            Work::Policy(e, r, p) => host.policy(e, &r, p).map(Value::Policy),
+                            Work::Cleanup(e, r) => host.cleanup(e, r).map(Value::Cleanup),
+                            Work::Start(r, e, q, p, f) => host.start(r, e, &q, &p, f).map(|()| Value::Unit),
+                            Work::Poll(r) => host.poll(r).map(Value::Progress),
+                            Work::Revoke(r) => host.revoke(r).map(|()| Value::Unit),
+                            Work::Kill(r) => host.kill(r).map(|()| Value::Unit),
+                            Work::Io(r) => host.take_io(r).map(Value::Io),
+                            Work::Resize(r, s) => host.resize(r, s).map(|()| Value::Unit),
+                            Work::Forget(r) => host.forget(r).map(|()| Value::Unit),
+                            Work::Broker(_) => Err(ErrorCode::Internal),
+                            Work::Helper(job) => host.helper_run(*job).map(Value::Helper),
+                            Work::HelperSignal(r, c, s) => host.helper_signal(r, c, s).map(|()| Value::Unit),
+                        };
+                        // Ends decided by a start/signal (e.g. cancel) reach the coordinator promptly.
+                        for event in host.helper_events() { let _ = helper_sender.send(event); }
+                        if completed.send(Completed { key, result, at: Instant::now() }).is_err() { break; }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {},
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })?;
+        Ok(Self { sender, receiver, slots: BTreeMap::new(), scanner, allocation_sender, helper_events })
+    }
+    pub(crate) fn allocation_sender(&self) -> SyncSender<AllocationWork> { self.allocation_sender.clone() }
+    fn receive(&mut self) {
+        while let Ok(done) = self.receiver.try_recv() {
+            if let Some(slot) = self.slots.get_mut(&done.key) { slot.result = Some((done.result, done.at)); }
+        }
+    }
+    fn request(&mut self, key: Key, work: Work) -> Result<()> {
+        self.receive();
+        if let Some(slot) = self.slots.get(&key) {
+            if slot.result.is_none() && slot.sent.elapsed() > Duration::from_secs(30) { return Err(ErrorCode::IsolationUnavailable); }
+            return Ok(());
+        }
+        if self.slots.len() >= 1024 { return Err(ErrorCode::ResourceLimit); }
+        self.sender.try_send((key.clone(), work)).map_err(|_| ErrorCode::IsolationUnavailable)?;
+        self.slots.insert(key, Slot { sent: Instant::now(), result: None });
+        Ok(())
+    }
+    fn take(&mut self, key: &Key) -> Result<Value> {
+        let slot = self.slots.get_mut(key).ok_or(ErrorCode::NotReady)?;
+        let Some((result, _)) = slot.result.take() else { return Err(ErrorCode::NotReady); };
+        self.slots.remove(key);
+        result
+    }
+    fn unit(&mut self, key: Key, work: Work, retain: bool) -> Result<()> {
+        self.request(key.clone(), work)?;
+        if retain {
+            let slot = self.slots.get(&key).ok_or(ErrorCode::Internal)?;
+            match &slot.result {
+                Some((Ok(Value::Unit), _)) => return Ok(()),
+                Some((Err(error), _)) => { let error = *error; self.slots.remove(&key); return Err(error); },
+                _ => return Err(ErrorCode::NotReady),
+            }
+        }
+        match self.take(&key)? { Value::Unit => Ok(()), _ => Err(ErrorCode::Internal) }
+    }
+}
+impl Host for WorkerHost {
+    type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
+    fn ready(&mut self, e: EmployeeId) -> Result<()> {
+        self.scanner.health(e)?;
+        let key = Key::Ready(e);
+        self.request(key.clone(), Work::Ready(e))?;
+        if self.slots.get(&key).and_then(|s| s.result.as_ref()).is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(2)) {
+            self.slots.remove(&key); return Err(ErrorCode::NotReady);
+        }
+        match self.take(&key)? { Value::Unit => Ok(()), _ => Err(ErrorCode::Internal) }
+    }
+    fn policy(&mut self, e: EmployeeId, r: &RuntimeKind, p: bool) -> Result<LaunchPolicy> {
+        let key = Key::Policy(e, serde_json::to_string(r).map_err(|_| ErrorCode::Internal)?, p);
+        self.request(key.clone(), Work::Policy(e, r.clone(), p))?;
+        match self.take(&key)? { Value::Policy(v) => Ok(v), _ => Err(ErrorCode::Internal) }
+    }
+    fn cleanup(&mut self, e: EmployeeId, r: Option<RunHandle>) -> Result<CleanupReadback> {
+        let key = Key::Cleanup(e, r.map(|r| r.0));
+        self.request(key.clone(), Work::Cleanup(e, r))?;
+        if self.slots.get(&key).and_then(|s| s.result.as_ref()).is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(2)) {
+            self.slots.remove(&key); return Err(ErrorCode::NotReady);
+        }
+        match self.take(&key)? { Value::Cleanup(v) => Ok(v), _ => Err(ErrorCode::Internal) }
+    }
+    fn start(&mut self, r: RunHandle, e: EmployeeId, q: &SpawnRequest, p: &LaunchPolicy, f: Self::Inputs) -> Result<()> {
+        self.slots.remove(&Key::Cleanup(e, None));
+        self.scanner.register(r, e, p.startup_ms)?;
+        self.request(Key::Start(r.0), Work::Start(r, e, q.clone(), p.clone(), f))
+    }
+    fn poll(&mut self, r: RunHandle) -> Result<HostProgress> {
+        self.receive();
+        if self.slots.contains_key(&Key::Start(r.0)) {
+            match self.take(&Key::Start(r.0)) {
+                Err(ErrorCode::NotReady) => return Ok(HostProgress::Starting),
+                Ok(Value::Unit) => {}, Err(e) => return Err(e), _ => return Err(ErrorCode::Internal),
+            }
+        }
+        let key = Key::Poll(r.0);
+        self.request(key.clone(), Work::Poll(r))?;
+        match self.take(&key) { Ok(Value::Progress(v)) => Ok(v), Err(ErrorCode::NotReady) => Err(ErrorCode::NotReady), Err(e) => Err(e), _ => Err(ErrorCode::Internal) }
+    }
+    fn revoke(&mut self, r: RunHandle) -> Result<()> { self.scanner.cancel(r)?; self.unit(Key::Revoke(r.0), Work::Revoke(r), true) }
+    fn kill(&mut self, r: RunHandle) -> Result<()> { self.scanner.cancel(r)?; self.unit(Key::Kill(r.0), Work::Kill(r), true) }
+    fn take_io(&mut self, r: RunHandle) -> Result<Self::Io> {
+        let key = Key::Io(r.0); self.request(key.clone(), Work::Io(r))?;
+        match self.take(&key)? { Value::Io(v) => Ok(v), _ => Err(ErrorCode::Internal) }
+    }
+    fn resize(&mut self, r: RunHandle, s: PtySize) -> Result<()> { self.unit(Key::Resize(r.0, s.columns, s.rows), Work::Resize(r, s), false) }
+    fn detect_intruders(&mut self) -> Result<Vec<EmployeeId>> { self.scanner.scan() }
+    fn broker_submit(&mut self, t: Ticket, job: BrokerJob) -> Result<()> {
+        let key = Key::Broker(t.0);
+        // Tickets are unique; a reused one would read another job's result.
+        if self.slots.contains_key(&key) { return Err(ErrorCode::Internal); }
+        self.request(key, Work::Broker(job))
+    }
+    fn broker_poll(&mut self, t: Ticket) -> Result<Option<BrokerReply>> {
+        let key = Key::Broker(t.0);
+        self.receive();
+        let slot = self.slots.get(&key).ok_or(ErrorCode::Internal)?;
+        if slot.result.is_none() {
+            if slot.sent.elapsed() > Duration::from_secs(30) { self.slots.remove(&key); return Err(ErrorCode::IsolationUnavailable); }
+            return Ok(None);
+        }
+        match self.take(&key)? { Value::Broker(reply) => Ok(Some(reply)), _ => Err(ErrorCode::Internal) }
+    }
+    /// A late completion finds no slot in `receive` and is dropped there,
+    /// closing any snapshot fd it carried.
+    fn broker_abandon(&mut self, t: Ticket) { self.receive(); self.slots.remove(&Key::Broker(t.0)); }
+    fn helper_start(&mut self, t: Ticket, job: HelperStart<Vec<OwnedFd>>) -> Result<()> {
+        let key = Key::Helper(t.0);
+        if self.slots.contains_key(&key) { return Err(ErrorCode::Internal); }
+        // A full mailbox refuses (the memfd is dropped with the job).
+        self.request(key, Work::Helper(Box::new(job))).map_err(|_| ErrorCode::HelperBusy)
+    }
+    fn helper_poll(&mut self, t: Ticket) -> Result<Option<HelperStarted<Vec<OwnedFd>>>> {
+        let key = Key::Helper(t.0);
+        self.receive();
+        let slot = self.slots.get(&key).ok_or(ErrorCode::Internal)?;
+        if slot.result.is_none() {
+            if slot.sent.elapsed() > Duration::from_secs(30) { self.slots.remove(&key); return Err(ErrorCode::HelperUnavailable); }
+            return Ok(None);
+        }
+        match self.take(&key)? { Value::Helper(started) => Ok(Some(started)), _ => Err(ErrorCode::Internal) }
+    }
+    /// Fire-and-forget: no slot is kept, so the completion is dropped in
+    /// `receive`; the effect (a root-side end) arrives as a `HelperEvent`.
+    fn helper_signal(&mut self, r: RunHandle, c: HelperCallId, s: HelperSignal) -> Result<()> {
+        let kind = match s { HelperSignal::Stop => 0, HelperSignal::Cancel => 1 };
+        self.sender.try_send((Key::HelperSignal(r.0, c, kind), Work::HelperSignal(r, c, s))).map_err(|_| ErrorCode::HelperUnavailable)
+    }
+    fn helper_events(&mut self) -> Vec<HelperEvent> { self.helper_events.try_iter().collect() }
+    fn forget(&mut self, r: RunHandle) -> Result<()> {
+        self.unit(Key::Forget(r.0), Work::Forget(r), false)?;
+        self.slots.retain(|key, _| match key {
+            Key::Start(id) | Key::Poll(id) | Key::Revoke(id) | Key::Kill(id) | Key::Io(id) | Key::Resize(id, ..) | Key::Forget(id) => *id != r.0,
+            Key::Cleanup(_, Some(id)) => *id != r.0, _ => true,
+        });
+        Ok(())
+    }
+}

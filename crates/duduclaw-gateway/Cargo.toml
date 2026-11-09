@@ -4,12 +4,19 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+duduclaw-api-worker = { path = "../duduclaw-api-worker" }
+duduclaw-parse-worker = { workspace = true }
+duduclaw-mcp-boundary = { workspace = true, features = ["binding-store", "execution-integration"] }
+duduclaw-migration = { path = "../duduclaw-migration" }
 # H4/H5 (WP-B goal loop hardening): gap-fingerprint path:line extraction +
 # the bail-pattern regex panel. Already a direct dependency elsewhere in the
 # workspace (duduclaw-cli, duduclaw-security, duduclaw-redaction), so no new
 # transitive units.
 regex = "1"
 duduclaw-core = { workspace = true }
+duduclaw-isolation = { workspace = true }
+duduclaw-execution = { workspace = true }
+duduclaw-updated = { workspace = true }
 duduclaw-auth = { workspace = true }
 duduclaw-agent = { workspace = true }
 duduclaw-fork = { workspace = true }
@@ -164,6 +171,7 @@ libc = "0.2"
 nix = { version = "0.29", features = ["signal", "process", "fs", "net", "user"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+duduclaw-spawnd = { path = "../duduclaw-spawnd" }
 # WP-CD4a (CD-4 C-L2 app registry, `codrive/registry.rs`): read-only
 # NetworkManager D-Bus queries (`connectivity`/`state`). Target-gated the
 # same way `duduclaw-shell/Cargo.toml`'s own `zbus` dependency already is —
@@ -195,7 +203,11 @@ zbus = "5"
 atspi = "0.30"
 
 [features]
-default = ["dashboard", "desktop"]
+# Shared lifecycle fixtures for downstream crate tests; never enabled by default.
+test-support = []
+# Integration branch supplies Package E's dependency; Package D alone does not.
+isolation-worker-integration = []
+default = ["dashboard", "desktop", "isolation-worker-integration"]
 # Kept as an empty feature so existing `--features duduclaw-gateway/desktop`
 # invocations (release workflow) still resolve. It used to pull in
 # `duduclaw-desktop` + `enigo` for the computer-use native mode, which was
@@ -233,6 +245,10 @@ url = "2"
 libc = "0.2"
 
 [dev-dependencies]
+duduclaw-import = { path = "../duduclaw-import" }
+# W1: `resources::WorkFileRequest::for_test` for the run-bound work broker tests.
+# H12d: TestWorkBroker / TestRecordingJobs for the protected skill job tests.
+duduclaw-mcp-boundary = { workspace = true, features = ["binding-store", "execution-integration", "test-support"] }
 # Deterministic per-test Home deadline checks; production Tokio features stay unchanged.
 tokio = { workspace = true, features = ["test-util"] }
 # D1 composed CLI HTTP tests: dev-cycle only, no new production dependency.

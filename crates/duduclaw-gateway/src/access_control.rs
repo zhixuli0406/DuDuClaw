@@ -30,6 +30,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+fn live_io_allowed() -> bool {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().is_ok()
+}
+
 /// Result of an access check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessDecision {
@@ -110,22 +114,32 @@ impl AccessController {
 
     /// Reload state from disk (cross-process freshness). No-op without a path.
     async fn reload(&self) {
+        if !live_io_allowed() { return; }
         if let Some(path) = &self.persist_path {
             let fresh = load_state(path);
-            *self.state.write().await = fresh;
+            let mut state = self.state.write().await;
+            if !live_io_allowed() { return; }
+            *state = fresh;
         }
     }
 
     /// Persist the current state to disk atomically under a file lock.
     async fn save(&self) {
+        if !live_io_allowed() { return; }
         if let Some(path) = &self.persist_path {
             let snapshot = self.state.read().await.clone();
             let path = path.clone();
             let res = duduclaw_core::with_file_lock(&path, || {
+                duduclaw_mcp_boundary::io_authority::verify_before_io()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 let json = serde_json::to_string_pretty(&snapshot)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
                 let tmp = path.with_extension("json.tmp");
                 std::fs::write(&tmp, json)?;
+                if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(std::io::Error::other(error.to_string()));
+                }
                 std::fs::rename(&tmp, &path)
             });
             if let Err(e) = res {
@@ -142,6 +156,7 @@ impl AccessController {
         blocked_users: &[String],
         require_pairing: bool,
     ) -> AccessDecision {
+        if !live_io_allowed() { return AccessDecision::Blocked; }
         // 1. Blocked users are always denied
         if blocked_users.iter().any(|b| b == user_id) {
             return AccessDecision::Blocked;
@@ -149,6 +164,7 @@ impl AccessController {
 
         self.reload().await;
         let state = self.state.read().await;
+        if !live_io_allowed() { return AccessDecision::Blocked; }
         let runtime_approved = state.approved.iter().any(|a| a == user_id);
 
         // 2. If allowlist exists, check it (plus runtime-approved users)
@@ -222,6 +238,7 @@ impl AccessController {
         self.reload().await;
         let code = {
             let mut state = self.state.write().await;
+            if !live_io_allowed() { return None; }
 
             // Carry the cumulative failure count across regenerations.
             let prev_cumulative = state
@@ -268,6 +285,7 @@ impl AccessController {
         self.reload().await;
         let verified = {
             let mut state = self.state.write().await;
+            if !live_io_allowed() { return false; }
             let matches = match state.pending.get(user_id) {
                 None => return false,
                 Some(p) if p.failed_attempts >= 5 => {
@@ -312,7 +330,9 @@ impl AccessController {
     /// Get the list of approved subjects.
     pub async fn runtime_approved_users(&self) -> Vec<String> {
         self.reload().await;
-        self.state.read().await.approved.clone()
+        let state = self.state.read().await;
+        if !live_io_allowed() { return Vec::new(); }
+        state.approved.clone()
     }
 
     /// Manually approve a subject (from Dashboard / MCP).
@@ -320,6 +340,7 @@ impl AccessController {
         self.reload().await;
         {
             let mut state = self.state.write().await;
+            if !live_io_allowed() { return (); }
             if state.approved.iter().any(|u| u == user_id) {
                 return;
             }
@@ -334,6 +355,7 @@ impl AccessController {
         self.reload().await;
         {
             let mut state = self.state.write().await;
+            if !live_io_allowed() { return (); }
             state.approved.retain(|u| u != user_id);
         }
         self.save().await;
@@ -351,6 +373,7 @@ impl Default for AccessController {
 /// legacy plain `Vec<String>` approved-list format. Missing/corrupt file ⇒
 /// empty state (open by default; the settings store gates enforcement).
 fn load_state(path: &std::path::Path) -> PersistState {
+    if !live_io_allowed() { return PersistState::default(); }
     let Ok(data) = std::fs::read_to_string(path) else {
         return PersistState::default();
     };
@@ -653,5 +676,32 @@ mod tests {
         // A fresh instance (≈ new process) must see the lockout.
         let b = AccessController::with_persistence(path);
         assert!(!b.verify_pairing_code("victim", "000000").await);
+    }
+}
+
+#[cfg(test)]
+mod isolation_authority_tests {
+    use super::*;
+    use std::{future::Future, sync::{Arc, atomic::{AtomicBool, Ordering}}, task::Poll};
+    use duduclaw_mcp_boundary::io_authority;
+
+    #[tokio::test]
+    async fn revoked_pairing_writer_waiting_on_state_leaves_memory_and_disk_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("access_control.json");
+        let control = AccessController::with_persistence(path.clone());
+        control.approve_user("existing").await;
+        let before = std::fs::read(&path).unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let held = control.state.write().await;
+        let request = io_authority::scope(crate::isolation_io_test_support::context(live.clone()),
+            control.approve_user("unauthorized"));
+        tokio::pin!(request);
+        std::future::poll_fn(|cx| { assert!(request.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
+        live.store(false, Ordering::SeqCst);
+        drop(held);
+        request.await;
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(control.runtime_approved_users().await, vec!["existing"]);
     }
 }

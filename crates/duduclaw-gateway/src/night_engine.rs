@@ -876,7 +876,7 @@ mod tests {
                 Err("discovery must never call a provider".into())
             }
         }
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::discovery::private_test_home();
         let store = crate::discovery::store::DiscoveryStore::open(home.path()).unwrap();
         let limits = crate::discovery::contracts::RunBudget {
             max_agent_calls: 1, max_usd: 1., max_wall_secs: 1, max_rounds: 1,

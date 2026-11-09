@@ -123,6 +123,9 @@ pub(crate) async fn handle_model_unload(home_dir: &Path) -> Value {
 }
 
 pub(crate) async fn handle_hardware_info() -> Value {
+    if crate::mcp_isolation::current().is_some() {
+        return crate::mcp_isolation_inference::handle("hardware_info", &serde_json::json!({}), None).await;
+    }
     let hw = duduclaw_inference::hardware::detect_hardware().await;
     let text = format!(
         "Hardware Detection Results:\n\
@@ -257,6 +260,9 @@ pub(crate) async fn handle_llamafile_list(home_dir: &Path) -> Value {
 // ── Model registry handlers ─────────────────────────────────
 
 pub(crate) async fn handle_model_search(params: &Value, home_dir: &Path) -> Value {
+    if crate::mcp_isolation::current().is_some() {
+        return crate::mcp_isolation_inference::handle("model_search", params, Some(home_dir)).await;
+    }
     let query = params
         .get("query")
         .and_then(|v| v.as_str())
@@ -377,6 +383,9 @@ pub(crate) async fn handle_model_download(params: &Value, home_dir: &Path) -> Va
 }
 
 pub(crate) async fn handle_model_recommend(_home_dir: &Path) -> Value {
+    if crate::mcp_isolation::current().is_some() {
+        return crate::mcp_isolation_inference::handle("model_recommend", &serde_json::json!({}), Some(_home_dir)).await;
+    }
     let hw = duduclaw_inference::hardware::detect_hardware().await;
     let curated = duduclaw_inference::model_registry::curated::builtin_registry();
     let filtered = duduclaw_inference::model_registry::curated::filter_by_hardware(

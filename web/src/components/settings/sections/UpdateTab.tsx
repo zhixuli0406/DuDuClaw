@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
 import { client } from '@/lib/ws-client';
+import { submitProtectedUpdate, newProtectedUpdateId, pendingProtectedUpdate, rememberProtectedUpdate, protectedUpdateFinished, type ProtectedUpdateState } from '@/lib/protected-update';
 import { updateFailure } from '@/lib/update-failure';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -82,6 +83,9 @@ export function UpdateTab() {
   /** Non-null only while the gateway is on a RETRY (attempt ≥ 2). */
   const [retry, setRetry] = useState<RetryState | null>(null);
   const [installed, setInstalled] = useState(false);
+  const [protectedRequest, setProtectedRequest] = useState(pendingProtectedUpdate);
+  const [protectedState, setProtectedState] = useState<ProtectedUpdateState | 'unavailable' | null>(null);
+  const [pollGeneration, setPollGeneration] = useState(0);
   const [autoUpdate, setAutoUpdate] = useState(false);
   const [edition, setEdition] = useState('community');
   const [updateInfo, setUpdateInfo] = useState<{
@@ -95,7 +99,7 @@ export function UpdateTab() {
     brew_formula?: string;
     auto_update?: boolean;
     restart_pending_version?: string | null;
-    update_channel?: 'control_plane' | 'github' | 'none';
+    update_channel?: 'control_plane' | 'github' | 'none' | 'protected';
     containerized?: boolean;
     macos_bundle_migratable?: boolean;
     macos_bundle_notice?: string | null;
@@ -114,6 +118,49 @@ export function UpdateTab() {
 
   // [H1] useRef guard prevents double-click race — declared before handleCheck
   const installingRef = useRef(false);
+
+  // A gateway restart cannot turn an accepted request into a successful update.
+  // Keep the id across reloads and wait for the updater's committed readback.
+  useEffect(() => {
+    if (!protectedRequest) return;
+    let cancelled = false;
+    let polling = false;
+    const deadline = Date.now() + 15 * 60_000;
+    installingRef.current = true;
+    setInstalling(true);
+    const poll = async () => {
+      if (cancelled || polling) return;
+      if (Date.now() >= deadline) {
+        setProtectedState('unavailable');
+        clearInterval(timer);
+        return;
+      }
+      polling = true;
+      try {
+        const result = await api.system.protectedUpdateStatus(protectedRequest);
+        if (cancelled) return;
+        if (result.protected_request_id !== protectedRequest) throw new Error('update response mismatch');
+        setProtectedState(result.protected_state);
+        setError(null);
+        if (protectedUpdateFinished(result.protected_state)) {
+          setInstalled(result.protected_state === 'committed');
+          rememberProtectedUpdate(null);
+          setProtectedRequest(null);
+          if (result.protected_state !== 'committed') takeDesktopResume();
+        }
+      } catch {
+        if (!cancelled) setProtectedState('unavailable');
+      } finally { polling = false; }
+    };
+    const timer = setInterval(() => { void poll(); }, 2000);
+    void poll();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      installingRef.current = false;
+      setInstalling(false);
+    };
+  }, [protectedRequest, pollGeneration]);
 
   // Desktop shell only: the shell's own version, the shell update already
   // downloaded and waiting for a restart, and whether the shell owns its
@@ -201,6 +248,7 @@ export function UpdateTab() {
     setError(null);
     setRetry(null);
     setInstalled(false);
+    setProtectedState(null);
     setUpdateInfo(null); // [R2:NL3] clear stale data immediately
     try {
       const info = await api.system.checkUpdate();
@@ -231,6 +279,24 @@ export function UpdateTab() {
         return;
       }
       if (plan.desktopStep === 'install' && stagedVersion) rememberDesktopResume(stagedVersion);
+      if (updateInfo?.update_channel === 'protected') {
+        const requestId = newProtectedUpdateId();
+        const outcome = await submitProtectedUpdate(requestId, api.system.applyUpdate);
+        if (outcome.kind === 'unknown') {
+          setProtectedRequest(outcome.requestId);
+          setProtectedState('unavailable');
+        } else {
+          const result = outcome.result;
+          setProtectedState(result.protected_state);
+          if (protectedUpdateFinished(result.protected_state)) {
+            setInstalled(result.protected_state === 'committed');
+            if (result.protected_state !== 'committed') takeDesktopResume();
+          } else {
+            setProtectedRequest(result.protected_request_id);
+          }
+        }
+        return;
+      }
       const result =
         plan.gatewayStep === 'restart'
           ? await api.system.restartPendingUpdate()
@@ -271,7 +337,8 @@ export function UpdateTab() {
     }
   };
 
-  const isManual = updateInfo?.install_method === 'manual';
+  const isProtected = updateInfo?.update_channel === 'protected';
+  const isManual = updateInfo?.install_method === 'manual' && !isProtected;
   const isHomebrew = updateInfo?.install_method === 'homebrew';
   const isDesktop = updateInfo?.install_method === 'desktop';
   // Containerized deployment: the image is immutable, so an in-process
@@ -291,7 +358,7 @@ export function UpdateTab() {
   // empty download_url there says nothing about availability. `noBinary` stays
   // a statement about the public release channel only (undefined channel = an
   // older gateway = the public channel).
-  const usesProvider = updateInfo?.update_channel === 'control_plane';
+  const usesProvider = updateInfo?.update_channel === 'control_plane' || isProtected;
   const noBinary =
     updateInfo?.available &&
     !updateInfo.download_url &&
@@ -321,7 +388,7 @@ export function UpdateTab() {
           // Restarting is the gateway's own job; containers and the desktop
           // sidecar restart through their owner instead.
           restartPendingVersion:
-            isContainerized || isDesktop || isManual ? null : (updateInfo.restart_pending_version ?? null),
+            isContainerized || isDesktop || isManual || isProtected ? null : (updateInfo.restart_pending_version ?? null),
         },
         desktop,
       )
@@ -404,13 +471,31 @@ export function UpdateTab() {
       )}
 
       <div className="flex items-center justify-end">
-        <Button variant="brand" size="sm" onClick={handleCheck} disabled={checking}>
+        <Button variant="brand" size="sm" onClick={handleCheck} disabled={checking || installing || !!protectedRequest}>
           <RefreshCw />
           {checking
             ? intl.formatMessage({ id: 'settings.update.checking' })
             : intl.formatMessage({ id: 'settings.update.check' })}
         </Button>
       </div>
+
+      {protectedState && (
+        <div role="status" className="rounded-lg bg-muted/60 p-4 ring-1 ring-inset ring-surface-border">
+          <p className="text-sm text-foreground">
+            {intl.formatMessage({ id: `settings.update.protected.${protectedState}` })}
+          </p>
+          {protectedState === 'committed' && (
+            <Button variant="brand" size="sm" onClick={() => window.location.reload()} className="mt-2">
+              {intl.formatMessage({ id: 'settings.update.protected.reload' })}
+            </Button>
+          )}
+          {protectedState === 'unavailable' && protectedRequest && (
+            <Button variant="brand" size="sm" onClick={() => setPollGeneration((n) => n + 1)} className="mt-2">
+              {intl.formatMessage({ id: 'settings.update.protected.refresh' })}
+            </Button>
+          )}
+        </div>
+      )}
 
       {/* Status display */}
       {!updateInfo && !error && (
@@ -446,7 +531,7 @@ export function UpdateTab() {
         </div>
       )}
 
-      {installed && (
+      {installed && protectedState !== 'committed' && (
         <div className="rounded-lg bg-success/10 p-4 ring-1 ring-inset ring-success/20">
           <div className="flex items-center gap-2">
             <CheckCircle className="h-5 w-5 text-success" />
@@ -462,7 +547,7 @@ export function UpdateTab() {
           {/* Binary already swapped on disk (npm/brew/manual) — the running
               gateway is older than what's installed; a restart is all that's
               missing. Shown regardless of `available`. */}
-          {updateInfo.restart_pending_version && (
+          {updateInfo.restart_pending_version && !isProtected && (
             <div className="flex items-center gap-2 rounded-lg bg-warning/10 p-4 ring-1 ring-inset ring-warning/20">
               <RefreshCw className="h-5 w-5 shrink-0 text-warning" />
               <span className="text-sm text-warning">
@@ -647,7 +732,7 @@ export function UpdateTab() {
             <Button
               variant="brand"
               onClick={handleInstall}
-              disabled={installing || restarting}
+              disabled={installing || restarting || !!protectedRequest}
               className="w-full py-3"
             >
               <Download />

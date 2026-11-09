@@ -62,7 +62,7 @@ impl RelayDb {
             let conn = Connection::open(path)
                 .map_err(|e| RelayError::Internal(format!("open db: {e}")))?;
             conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+                "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
             )
             .map_err(|e| RelayError::Internal(format!("set pragmas: {e}")))?;
             pool.push(Mutex::new(conn));

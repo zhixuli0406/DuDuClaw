@@ -9,6 +9,11 @@
 //! approval side-effect installs it (with its own re-scan). Security scan
 //! (deterministic ruleset incl. the prompt-injection pass) runs BEFORE
 //! submission and is fail-closed: High/Critical risk is refused outright.
+//!
+//! SFR: an isolated (protected) call never reaches this staging path; it is
+//! handled by `mcp_skill_jobs::handle_protected` (own finished recording,
+//! verified artifacts parsed only by E, E-scanned publication into the
+//! caller's own SKILLS). Only [`distill_with_model`] is shared.
 
 use std::path::Path;
 
@@ -555,7 +560,7 @@ pub(crate) fn summarize_desktop_events(jsonl: &str, max: usize) -> Vec<String> {
 
 // ── Distillation prompt ──────────────────────────────────────────────────────
 
-fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     let s: String = name
         .to_lowercase()
         .chars()
@@ -570,7 +575,7 @@ fn slugify(name: &str) -> String {
     }
 }
 
-fn is_valid_skill_slug(slug: &str) -> bool {
+pub(crate) fn is_valid_skill_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug.len() <= 64
         && slug
@@ -657,12 +662,44 @@ pub(crate) fn strip_md_fence(raw: &str) -> String {
 
 // ── skill_from_recording handler ─────────────────────────────────────────────
 
-fn rec_text(text: &str) -> Value {
+pub(crate) fn rec_text(text: &str) -> Value {
     serde_json::json!({ "content": [{"type": "text", "text": text}] })
 }
 
-fn rec_error(msg: &str) -> Value {
+pub(crate) fn rec_error(msg: &str) -> Value {
     serde_json::json!({ "content": [{"type": "text", "text": msg}], "isError": true })
+}
+
+/// The model step shared by every path: the employee's own utility runtime
+/// and model (autonomy-gated), fence stripping, a frontmatter check and the
+/// deterministic `<env:VAR>` backstop. `prompt` already fences all recorded
+/// material as data.
+pub(crate) async fn distill_with_model(home_dir: &Path, agent: &str, prompt: &str, env_placeholders: &[String])
+    -> Result<String, String> {
+    // Caller-derived, so `.ephemeral/` has to be part of the resolution: an
+    // `eph-*` role member's scaffold never sits at `agents/<id>`, and the bare
+    // join therefore handed `run_utility_prompt` a `None` agent dir (no
+    // per-agent runtime/model settings). Ordinary ids are unchanged.
+    let agent_dir = crate::mcp::caller_agent_dir(home_dir, agent);
+    let agent_dir_opt = agent_dir.is_dir().then_some(agent_dir.as_path());
+    let reply = crate::ai_session_guard::with_autonomous_utility_context(home_dir, agent,
+        duduclaw_gateway::runtime_dispatch::run_utility_prompt(home_dir, agent_dir_opt, "recording-distill", "",
+            prompt, duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS))
+        .await.map_err(|e| format!("蒸餾失敗（LLM 呼叫錯誤）：{e}"))?;
+    let mut skill_md = strip_md_fence(&reply);
+    if skill_md.len() < 40 || !skill_md.contains("name:") {
+        return Err("蒸餾結果不是有效的 SKILL.md（缺少 frontmatter），請重試。".into());
+    }
+    // Deterministic backstop: every recorded <env:VAR> must be visible to the
+    // operator even if the model dropped it.
+    let missing: Vec<&String> = env_placeholders.iter().filter(|p| !skill_md.contains(p.as_str())).collect();
+    if !missing.is_empty() {
+        skill_md.push_str("\n\n## 需要的環境變數（自動附註）\n");
+        for p in missing {
+            skill_md.push_str(&format!("- {p}\n"));
+        }
+    }
+    Ok(skill_md)
 }
 
 pub(crate) async fn handle_skill_from_recording(
@@ -671,6 +708,15 @@ pub(crate) async fn handle_skill_from_recording(
     agent: &str,
 ) -> Value {
     let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+    // H12d / SFR: an isolated call distills only its own finished protected
+    // recording (job store + verified brokered artifacts, parsed by E) and
+    // publishes into its own SKILLS; it never touches a host directory.
+    if crate::mcp_isolation::current().is_some() {
+        if !duduclaw_isolation::recording_layout::valid_id(id) {
+            return rec_error("skill_from_recording 需要有效的錄製 `id`。");
+        }
+        return crate::mcp_skill_jobs::handle_protected(args, home_dir, agent).await;
+    }
     if !crate::mcp_recording::is_valid_recording_id(id) {
         return rec_error("skill_from_recording 需要有效的錄製 `id`。");
     }
@@ -678,16 +724,24 @@ pub(crate) async fn handle_skill_from_recording(
     if !dir.is_dir() {
         return rec_error(&format!("找不到錄製「{id}」。"));
     }
-    let meta = match read_meta(&dir) {
-        Ok(m) => m,
-        Err(e) => return rec_error(&e),
+    let protected = duduclaw_parse_worker::client::required();
+    let (meta, protected_input) = if protected {
+        let (home, id, agent) = (home_dir.to_owned(), id.to_owned(), agent.to_owned());
+        let snapshot = tokio::task::spawn_blocking(move ||
+            duduclaw_gateway::isolation_worker_plans::recording_snapshot(&home, &id, &agent)).await;
+        let (meta, bytes) = match snapshot {
+            Ok(Ok(snapshot)) => snapshot,
+            _ => return rec_error("無法確認錄製的擁有者、完成狀態或來源檔案，已停止蒸餾。"),
+        };
+        let meta = match serde_json::from_value::<crate::mcp_recording::RecordingMeta>(meta) {
+            Ok(meta) => meta, Err(_) => return rec_error("錄製資料不完整。"),
+        };
+        (meta, Some(bytes))
+    } else {
+        let meta = match read_meta(&dir) { Ok(meta) => meta, Err(error) => return rec_error(&error) };
+        if meta.agent != agent || !dir.join("done.json").is_file() { return rec_error("無法確認已完成且屬於這位員工的錄製。"); }
+        (meta, None)
     };
-    if !dir.join("done.json").exists() {
-        return rec_error(&format!(
-            "錄製「{id}」尚未停止。請先呼叫 {}_record_stop。",
-            meta.kind
-        ));
-    }
 
     let slug = match args.get("name").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => slugify(n),
@@ -698,107 +752,96 @@ pub(crate) async fn handle_skill_from_recording(
     }
 
     // ── Gather + summarize the recorded material ────────────────────────────
-    let (skill_type, api_calls, action_lines, env_placeholders) = if meta.kind == "desktop" {
-        let events =
-            std::fs::read_to_string(dir.join("desktop").join("events.jsonl")).unwrap_or_default();
-        let lines = summarize_desktop_events(&events, 120);
-        if lines.is_empty() {
-            return rec_error(
-                "此桌面錄製沒有任何視窗切換事件，無法蒸餾（錄製過程可能太短或截圖權限未授予）。",
-            );
-        }
-        ("desktop-sop", Vec::new(), lines, Vec::new())
+    let skill_type = if meta.kind == "desktop" { "desktop-sop" } else { "browser-sop" };
+    let (prompt, env_placeholders, api_count, action_count) = if let Some(bytes) = protected_input {
+        let (slug, desktop) = (slug.clone(), meta.kind == "desktop");
+        let summary = match tokio::task::spawn_blocking(move ||
+            duduclaw_parse_worker::adapters::summarize_recording(&bytes, desktop, &slug)).await {
+            Ok(Ok(summary)) => summary,
+            _ => return rec_error("隔離服務無法整理這份錄製，已停止蒸餾。"),
+        };
+        (summary.prompt.as_str().to_owned(), summary.env.as_slice().iter().map(|s| s.as_str().to_owned()).collect::<Vec<_>>(),
+            usize::from(summary.api_count), usize::from(summary.action_count))
     } else {
-        let har_path = dir.join("session.har");
-        if !har_path.is_file() {
-            return rec_error("此瀏覽器錄製缺少 session.har，無法蒸餾。");
-        }
-        let size = std::fs::metadata(&har_path).map(|m| m.len()).unwrap_or(0);
-        if size > MAX_HAR_BYTES {
-            return rec_error(&format!(
-                "session.har 過大（{size} bytes > {MAX_HAR_BYTES}），無法在本機蒸餾。"
-            ));
-        }
-        let raw = match std::fs::read_to_string(&har_path) {
-            Ok(r) => r,
-            Err(e) => return rec_error(&format!("讀取 session.har 失敗：{e}")),
+        let (skill_type, api_calls, action_lines, env_placeholders) = if meta.kind == "desktop" {
+            let events =
+                std::fs::read_to_string(dir.join("desktop").join("events.jsonl")).unwrap_or_default();
+            let lines = summarize_desktop_events(&events, 120);
+            if lines.is_empty() {
+                return rec_error(
+                    "此桌面錄製沒有任何視窗切換事件，無法蒸餾（錄製過程可能太短或截圖權限未授予）。",
+                );
+            }
+            ("desktop-sop", Vec::new(), lines, Vec::new())
+        } else {
+            let har_path = dir.join("session.har");
+            if !har_path.is_file() {
+                return rec_error("此瀏覽器錄製缺少 session.har，無法蒸餾。");
+            }
+            let size = std::fs::metadata(&har_path).map(|m| m.len()).unwrap_or(0);
+            if size > MAX_HAR_BYTES {
+                return rec_error(&format!(
+                    "session.har 過大（{size} bytes > {MAX_HAR_BYTES}），無法在本機蒸餾。"
+                ));
+            }
+            let raw = match std::fs::read_to_string(&har_path) {
+                Ok(r) => r,
+                Err(e) => return rec_error(&format!("讀取 session.har 失敗：{e}")),
+            };
+            let mut har: Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => return rec_error(&format!("session.har 解析失敗：{e}")),
+            };
+            // Defence-in-depth: stop already redacted; run again before anything
+            // leaves this process (idempotent, zero cost when clean).
+            let _ = redact_har(&mut har);
+            let api_calls = extract_api_calls(&har, 40);
+            let env_placeholders = collect_env_placeholders(&har);
+            let actions_doc = std::fs::read_to_string(dir.join("actions.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or(Value::Null);
+            let action_lines = summarize_actions(&actions_doc, 120);
+            if api_calls.is_empty() && action_lines.is_empty() {
+                return rec_error("此錄製沒有可蒸餾的 API 呼叫或操作事件。");
+            }
+            ("browser-sop", api_calls, action_lines, env_placeholders)
         };
-        let mut har: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => return rec_error(&format!("session.har 解析失敗：{e}")),
-        };
-        // Defence-in-depth: stop already redacted; run again before anything
-        // leaves this process (idempotent, zero cost when clean).
-        let _ = redact_har(&mut har);
-        let api_calls = extract_api_calls(&har, 40);
-        let env_placeholders = collect_env_placeholders(&har);
-        let actions_doc = std::fs::read_to_string(dir.join("actions.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .unwrap_or(Value::Null);
-        let action_lines = summarize_actions(&actions_doc, 120);
-        if api_calls.is_empty() && action_lines.is_empty() {
-            return rec_error("此錄製沒有可蒸餾的 API 呼叫或操作事件。");
-        }
-        ("browser-sop", api_calls, action_lines, env_placeholders)
+
+        let prompt = build_distill_prompt(&slug, skill_type, &api_calls, &action_lines, &env_placeholders);
+        (prompt, env_placeholders, api_calls.len(), action_lines.len())
     };
 
-    // ── LLM distillation via the shared utility choke-point ────────────────
-    let prompt = build_distill_prompt(
-        &slug,
-        skill_type,
-        &api_calls,
-        &action_lines,
-        &env_placeholders,
-    );
-    // Caller-derived, so `.ephemeral/` has to be part of the resolution: an
-    // `eph-*` role member's scaffold never sits at `agents/<id>`, and the bare
-    // join therefore handed `run_utility_prompt` a `None` agent dir (no
-    // per-agent runtime/model settings). Ordinary ids are unchanged.
-    let agent_dir = crate::mcp::caller_agent_dir(home_dir, agent);
-    let agent_dir_opt = agent_dir.is_dir().then_some(agent_dir.as_path());
-    let reply = match crate::ai_session_guard::with_autonomous_utility_context(home_dir, agent, duduclaw_gateway::runtime_dispatch::run_utility_prompt(
-        home_dir,
-        agent_dir_opt,
-        "recording-distill",
-        "",
-        &prompt,
-        duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
-    ))
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return rec_error(&format!("蒸餾失敗（LLM 呼叫錯誤）：{e}")),
+    let skill_md = match distill_with_model(home_dir, agent, &prompt, &env_placeholders).await {
+        Ok(markdown) => markdown,
+        Err(error) => return rec_error(&error),
     };
-    let mut skill_md = strip_md_fence(&reply);
-    if skill_md.len() < 40 || !skill_md.contains("name:") {
-        return rec_error("蒸餾結果不是有效的 SKILL.md（缺少 frontmatter），請重試。");
-    }
-    // Deterministic backstop: every recorded <env:VAR> must be visible to the
-    // operator even if the model dropped it.
-    let missing: Vec<&String> = env_placeholders
-        .iter()
-        .filter(|p| !skill_md.contains(p.as_str()))
-        .collect();
-    if !missing.is_empty() {
-        skill_md.push_str("\n\n## 需要的環境變數（自動附註）\n");
-        for p in missing {
-            skill_md.push_str(&format!("- {p}\n"));
-        }
-    }
 
     // ── Fail-closed security scan (deterministic; incl. injection ruleset) ──
-    let scan = duduclaw_gateway::skill_lifecycle::security_scanner::scan_skill(&skill_md, None);
-    if !duduclaw_gateway::custom_skills::scan_permits_submit(scan.risk_level) {
+    let (scan_passed, scan_risk, scan_findings) = if protected {
+        let bytes = skill_md.as_bytes().to_vec();
+        match tokio::task::spawn_blocking(move || duduclaw_parse_worker::adapters::scan_skill_bytes(&bytes)).await {
+            Ok(Ok((passed, risk, findings))) => (passed, risk, findings.into_iter()
+                .map(|finding| serde_json::json!({"description":finding})).collect::<Vec<_>>()),
+            _ => return rec_error("隔離安全掃描失敗，草稿未送審。"),
+        }
+    } else {
+        let scan = duduclaw_gateway::skill_lifecycle::security_scanner::scan_skill(&skill_md, None);
+        (scan.passed, format!("{:?}", scan.risk_level), scan.findings.iter().map(|f| serde_json::json!({
+            "category":format!("{:?}", f.category), "severity":format!("{:?}", f.severity).to_lowercase(),
+            "description":f.description,"line_number":f.line_number,
+        })).collect::<Vec<_>>())
+    };
+    if !scan_passed || matches!(scan_risk.as_str(), "High" | "Critical") {
         if let Err(reason) = write_rejected_draft(home_dir, agent, &dir, &skill_md).await {
             return rec_error(&reason);
         }
-        warn!(recording = %id, risk = ?scan.risk_level, "distilled skill blocked by security scan");
+        warn!(recording = %id, risk = %scan_risk, "distilled skill blocked by security scan");
         return rec_error(&format!(
             "蒸餾出的 SKILL.md 未通過安全掃描（風險 {:?}，{} 項發現），已擋下不送審。\
              原稿保留在 recordings/{id}/skill.rejected.md 供人工檢視。",
-            scan.risk_level,
-            scan.findings.len()
+            scan_risk,
+            scan_findings.len()
         ));
     }
 
@@ -852,15 +895,7 @@ pub(crate) async fn handle_skill_from_recording(
     set_owner_only(&draft_path, false);
 
     let safety_report = serde_json::json!({
-        "passed": scan.passed,
-        "risk_level": format!("{:?}", scan.risk_level),
-        "findings": scan.findings.iter().map(|f| serde_json::json!({
-            "category": format!("{:?}", f.category),
-            "severity": format!("{:?}", f.severity).to_lowercase(),
-            "description": f.description,
-            "line_number": f.line_number,
-        })).collect::<Vec<_>>(),
-        "source_recording": id,
+        "passed":scan_passed,"risk_level":scan_risk,"findings":scan_findings,"source_recording":id,
     });
     let payload = serde_json::json!({
         "custom_skill_id": cs_id,
@@ -877,7 +912,7 @@ pub(crate) async fn handle_skill_from_recording(
     });
     let summary = format!(
         "錄製蒸餾技能送審：{}（{slug}，{skill_type}，來源錄製 {id}，掃描風險 {:?}）",
-        record.display_name, scan.risk_level
+        record.display_name, scan_risk
     );
     let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home_dir) {
         Ok(b) => b,
@@ -917,15 +952,15 @@ pub(crate) async fn handle_skill_from_recording(
          - 草稿位置：skills-drafts/{cs_id}/SKILL.md（隔離區，未安裝）\n\
          - 審批單：{}（7 天內有效）\n\
          技能不會直接進技能庫：請管理員在 dashboard 的審批中心核准後才會安裝生效。",
-        api_calls.len(),
-        action_lines.len(),
+        api_count,
+        action_count,
         if env_placeholders.is_empty() {
             String::new()
         } else {
             format!("、需要環境變數：{}", env_placeholders.join(", "))
         },
-        scan.risk_level,
-        scan.findings.len(),
+        scan_risk,
+        scan_findings.len(),
         approval_id.as_str(),
     ))
 }

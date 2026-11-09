@@ -35,6 +35,7 @@ impl TaskStore {
         );
         let window = format!("-{} minutes", window_minutes.min(10_080));
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(&sql, params![principal, window], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(|e| format!("count chat assignments: {e}"))
     }
@@ -69,6 +70,7 @@ impl TaskStore {
             limit.clamp(1, 200)
         );
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("prepare principal list: {e}"))?;
@@ -94,6 +96,24 @@ impl TaskStore {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TaskRow>, i64), String> {
+        self.list_principal_page_hiding(principal, status, agent_id, goal_mode, archived, limit, offset,
+            &std::collections::BTreeSet::new()).await
+    }
+
+    /// v1.81 P1c: [`Self::list_principal_page`] without the tasks of
+    /// `hidden` employees, applied before LIMIT and COUNT.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_principal_page_hiding(
+        &self,
+        principal: &str,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        goal_mode: Option<bool>,
+        archived: Option<bool>,
+        limit: i64,
+        offset: i64,
+        hidden: &std::collections::BTreeSet<String>,
+    ) -> Result<(Vec<TaskRow>, i64), String> {
         let mut binds: Vec<String> = vec![principal.to_string()];
         let mut filter = String::from(" WHERE on_behalf_of = ?1 AND (a2a_owner IS NULL OR a2a_owner = ?1)");
         if let Some(s) = status {
@@ -114,7 +134,12 @@ impl TaskStore {
         } else {
             " AND archived = 0"
         });
+        if !hidden.is_empty() {
+            binds.push(serde_json::to_string(&hidden.iter().collect::<Vec<_>>()).map_err(|e| format!("hidden set: {e}"))?);
+            filter.push_str(&format!(" AND assigned_to NOT IN (SELECT value FROM json_each(?{}))", binds.len()));
+        }
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = binds
             .iter()
             .map(|s| s as &dyn rusqlite::types::ToSql)

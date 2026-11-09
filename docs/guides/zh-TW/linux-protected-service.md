@@ -1,50 +1,84 @@
-# 原生 Linux 的個人連線受保護服務
+# 原生 Linux 受保護服務
 
-官方 Linux CLI 執行檔需要 **glibc ≥ 2.31**：Ubuntu 20.04+、Debian 11+、RHEL／Rocky Linux 9+。較舊系統請使用 Docker。此基準適用於 CLI／gateway（含桌面版的 CLI sidecar）；桌面圖形介面另需符合 WebKitGTK 等系統函式庫需求。
+v1.80 架構將 gateway、AI 員工、文件解析與特權更新分開。每位經確認的員工有永久的 Linux 身分；每次執行有獨立的程序、檔案系統與網路命名空間。必要隔離元件不可用時，員工執行會被拒絕。
 
-這個模式讓原生 Linux 的「我的連線」可使用個人 Google 與遠端 MCP OAuth。Gateway 以專用的 `duduclaw` 帳號執行，啟動時接收 root 準備的金鑰。一般使用者服務不會收到這把金鑰。另見[個人 Google 連線](google-personal-connections.md)。
+**開發狀態：** 已實作簽章驗證後的未啟用世代暫存、安裝器遷移轉接、首位管理員設定、唯讀安裝檢查與固定路徑的協調移除。完整新安裝、簽章啟用、遷移平台與 gateway 綜合就緒介面仍未完成；本輪未做 root 實機安裝／移除驗收。服務顯示 `active` 或世代已暫存，都不代表隔離就緒。詳見[實作與驗收紀錄](../../architecture/native-linux-isolation.md)。
 
-## 準備主機
+## 使用者會遇到的變化
 
-需要以 systemd 為 PID 1、採單一 cgroup v2 階層的 Linux，以及 GNU coreutils、GNU tar、curl、minisign、`getent`、`id`、`useradd`、util-linux `setpriv`。請在真人操作的終端機透過 sudo 安裝，不能在 AI 工作階段或容器內執行。必須使用初始 user namespace：`/proc/self/uid_map` 與 `/proc/self/gid_map` 各自只能有一行 `0 0 4294967295`（空白可不同）。Rootless 容器與重新映射身分的 user namespace 都會被拒絕。
+- 要求隔離時，員工不再使用 gateway 帳號執行。同一位員工一次執行一項工作，其餘對話與排程會排隊。
+- 員工仍讀得到自己的 CLI 登入權杖；隔離執行路徑不提供其他員工的 home 或 gateway 憑證。個人連線需要經確認、只有一位擁有者的 Personal 員工；Shared 員工不能使用個人憑證。
+- 對外流量經過獨立代理，封鎖私有網路、主機 loopback 與雲端 metadata。公開目的地沒有網域白名單限制；不支援代理的工具會連線失敗。
+- 不可信文件交給拋棄式低權限工作者解析。工作者沒有網路，只透過檔案描述符接收有大小上限的輸入。
+- 更新改由獨立 root 服務驗證元件簽章清單。下載完封存檔或收到更新要求，都不代表更新成功。
+- 從 v1.79.3 遷移需要新的憑證與管理員確認。舊帳號、綁定、政策、hook、MCP 伺服器及排程不會因匯入而直接生效。
 
-專用帳號的 uid/gid 不得為 0，shell 必須是 `nologin` 或 `false`，不能有任何 sudo 指令權限、不能開啟 linger，也不能屬於 `sudo`、`wheel`、`admin`、`adm`、`docker`、`lxd`、`incus`、`libvirt` 群組；`systemd-journal` 可以保留。不要讓其他服務共用這個帳號：每次啟動交付金鑰前，會終止這個 uid 的所有非殭屍程序。
+保護前提是 kernel、systemd、gateway、啟動代理、trampoline、對外連線代理及更新服務仍可信任。這不提供 VM 等級的敵對多租戶隔離，也不防範主機 root 入侵；同一員工不同執行之間仍共用持久檔案。一般使用者安裝不具備此隔離保證。
 
-## 安裝與啟動
+## 目標主機與已觀察的測試
 
-請將 `X.Y.Z` 改為已發布的版本，並先確認 `/opt` 及所有上層目錄屬於 root、其他帳號無法寫入。以下 sudo 指令在 root 擁有、權限為 0700 的 `/opt` 暫存目錄下載官方封存檔與 `.minisig`，以發布公鑰驗證封存檔的完整位元組，再解壓執行檔。只有驗證通過的執行檔會在該 root shell 內執行。發布的 Linux 檔名為 `duduclaw-linux-x64.tar.gz` 與 `duduclaw-linux-arm64.tar.gz`，各自附有同名 `.minisig`。
+需要原生 Linux、systemd 為 PID 1、單一 cgroup v2 階層與初始 user namespace。容器、重新映射／rootless namespace、cgroup v1 或混合模式會被拒絕。官方 CLI 執行檔需要 glibc 2.31 以上；符合執行檔最低需求不等於支援隔離。
+
+目標發行版是 Ubuntu 22.04、Ubuntu 24.04 與 Debian 12。2026-11-05 的 **套件層級** root 測試紀錄如下：
+
+| 發行版 | 已測 kernel | systemd | Landlock ABI | 結果 |
+| --- | --- | --- | --- | --- |
+| Ubuntu 22.04 | 5.15.0-1120-gcp | 249.11 | 1 | 套件測試 66/66 通過 |
+| Ubuntu 22.04，GCP 預設／HWE | 6.8.0-1070-gcp | 249.11 | 4 | 套件測試 66/66 通過 |
+| Ubuntu 24.04 | 6.8.0-1071-gcp | 255.4 | 4 | 套件測試 66/66 通過 |
+| Ubuntu 24.04，GCP 映像預設 | 7.0.0-1014-gcp | 255.4 | 8 | 不支援：16 項 trampoline 測試全數拒絕，其餘 50 項通過 |
+| Debian 12 | 6.1.0-54-cloud-amd64 | 252.39 | 2 | 套件測試 66/66 通過 |
+
+Kernel 7.0 **目前不接受**：trampoline 會拒絕大於 7 的 Landlock ABI。請確認實際開機使用的 kernel，不能只看發行版或 GCP 映像名稱。驗收請使用已接受的 kernel 組態，不要關閉 Landlock 或自行放寬 ABI 檢查。上表不涵蓋完整安裝、真實廠商 CLI 執行、完整遷移或更新復原。
+
+主機需有可信任的系統工具，包括 `getent`、`id`、`useradd`、util-linux、systemd 工具及 curl。員工 loop 儲存空間需要 ext4 或 XFS、受支援且非 thin provisioning 的底層裝置鏈，並保留員工配額與 TCB 所需空間。未知儲存配置或容量不足會使就緒檢查失敗。使用外部 IAM／NSS 時，必須永久保留員工 UID 範圍。
+
+## 安裝與就緒檢查
+
+由管理員在自己的終端機執行，不能在 AI 工作階段內操作。取得 x86_64 或 aarch64 的完整發行包，放在 root 擁有、上層目錄不可由其他帳號寫入的暫存區，完成驗證後才以 root 執行。Linux 封存檔含分開的元件執行檔；只複製 `duduclaw` 無法安裝這個架構。
+
+完整安裝需要以下身分與資料：
+
+| 項目 | 必要狀態 |
+| --- | --- |
+| 系統身分 | `duduclaw`、`duduclaw-runsup`、`duduclaw-egress`、`duduclaw-dl`、`duduclaw-dns`；靜態 ID 小於 `SYS_UID_MAX`，避開 DynamicUser 與員工範圍 |
+| 員工身分 | 永久登記，預設 70000–99999；只在員工確認後配置 |
+| 可信程式 | Gateway、spawnd、trampoline、egress／forwarder／DNS broker、更新服務／凍結啟動器、解析器、匯入器、遷移命令與 MCP stdio 橋接；由 root 擁有 |
+| 服務 | Gateway、spawnd socket／service、egress socket／service、選用的 DNS broker、更新服務、parse socket／template、TCB 與員工 slice |
+| 解析根目錄 | `/usr/lib/duduclaw/parse-root` 與 `/usr/lib/duduclaw/parse-root-tree`，root:root 0755，初始為空，不能放主機資料 |
+| 簽章狀態 | Bootstrap 信任、相容的元件世代、runtime 登錄表、更新槽與狀態、遷移及就緒檢查接線 |
+
+解析器可能留下[安裝參考](../../../crates/duduclaw-parse-worker/README.md)列出的已知空掛載點目錄。遇到其他內容應先調查，不要遞迴清空解析根目錄。Spawnd 負責員工的 SSH、cron、at 與 user manager 封鎖，並驗證主機上的有效狀態；不要手動放寬這些控制來通過檢查。
+
+安裝器先驗證固定路徑的完整元件，再準備帳號、目錄與 unit。Linux 發行包已加入凍結的更新啟動器；離線工具可將已簽署的資料與元件組成 bootstrap inbox。經獨立驗證的 `duduclaw-updated --bootstrap-stage` 會檢查編譯時固定的根指紋、根金鑰門檻簽章、target 簽章與全部元件雜湊，再發布**尚未啟用的世代**；不選擇 `current`、不建立 trust／state／slots、不驗證舊版過渡雙簽，也不啟動服務。尚無可直接照做的完整新安裝步驟。
+
+可執行 `sudo duduclaw service readiness --protected-linux`（`ops` 為相同入口的別名），唯讀檢查執行檔、系統帳號、目錄權限、unit 內容與 systemd 實際屬性，並分項回報。I1 的綜合就緒介面尚未接上，`MissingComposite` 一律拒絕，不能因此放行員工執行。自訂 DNS drop-in 尚未納入驗證，目前會使 unit 檢查失敗。已由新版管理的安裝再次執行安裝時，只跑唯讀檢查，不改寫世代執行檔或服務單元。
+
+## 從 v1.79.3 遷移
+
+不要原地替換舊執行檔，也不要把舊資料庫複製進新 home。舊環境與員工共用 UID，其權威資料必須視為不可信。安裝器已將 v1.79.3 跨入 v1.80（含無法確認原版本下限）的要求交給 G 遷移流程，固定讀取 root 擁有的 `/var/lib/duduclaw-migrate/plan.json`；計畫缺少或無法驗證時，在停止舊服務前拒絕，不退回原地更新。
+
+管理員流程如下：
+
+1. 從官網及登入後的授權 console，取得 bootstrap 驗證程式、遷移包的 SHA-256 與 root metadata 指紋，兩處必須一致。將下載內容存為檔案，放在 root 擁有的 0700 目錄；執行驗證程式前，先用系統 `sha256sum -c` 比對。舊封存檔簽章不足以建立新信任根，不要把下載內容用管線交給 shell。
+2. 經驗證的安裝器檢查 bootstrap 簽章、準備簽章平台，並產生不可由其他帳號修改的 root 遷移計畫。不要自行修改計畫或製造成功讀回資料。
+3. 遷移程式會在**停止舊服務前**驗證平台，再停用舊啟動來源、隔離舊資料、產生驗證過的加密快照、輪替金鑰，啟動乾淨且只接受匯入的 gateway。低權限匯入器將已知內容轉成有界紀錄；權威資料只成為未生效提案。
+4. 隔離驗證通過後，依安裝器提供的設定流程建立新的管理員。舊 session、密碼、MFA 及 CLI 登入狀態不會恢復；審核高風險項目前先註冊 MFA。
+5. 開啟「**系統 → 遷移確認**」，檢查完整值、核准或拒絕提案、重試套用失敗項目，完成要求的憑證輪替。員工 ID 與儲存空間只在確認後配置；個人帳號由新的擁有者重新連結。
+6. 全部套用經實際讀回、沒有待確認或待輪替項目後，才能完成。`AwaitingAdministrator` 表示仍在等待管理員。Root 專用復原快照須保留到符合保存期限與復原驗證條件。
+
+支援的來源版本：對話紀錄（`sessions.db`）、目標與排程交辦（`tasks.db`）及排程工作（`cron_tasks.db`）可從 v1.79.3 或 v1.80.x 的資料目錄匯入。每個資料庫都必須與一個已知版本完全相符；手動改過、只升級一半或其他版本的資料庫會整份拒絕，匯入紀錄會列出最接近的已知版本及不同的資料表、索引或觸發器（不含內容）。外部 A2A 用戶端擁有的任務一律不匯入，排程工作原本的委託人、建立者與代理人也不會沿用。v1.79.3 的定義是依版本說明重建，並非從 v1.79.3 安裝擷取，仍需在實際的 v1.79.3 資料目錄上驗證。
+
+完整、已驗證的安裝可使用既有 runner 介面：
 
 ```sh
-sudo /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/sh -eu <<'ROOT'
-version=X.Y.Z
-case "$(uname -m)" in
-  x86_64) asset=duduclaw-linux-x64.tar.gz ;;
-  aarch64|arm64) asset=duduclaw-linux-arm64.tar.gz ;;
-  *) echo 'Unsupported architecture' >&2; exit 1 ;;
-esac
-umask 077
-stage=$(mktemp -d /opt/duduclaw-install.XXXXXXXX)
-trap 'rm -f -- "$stage/$asset" "$stage/$asset.minisig" "$stage/duduclaw"; rmdir -- "$stage"' EXIT
-cd "$stage"
-base="https://github.com/zhixuli0406/DuDuClaw/releases/download/v$version"
-curl -q --proto '=https' --tlsv1.2 -fL "$base/$asset" -o "$asset"
-curl -q --proto '=https' --tlsv1.2 -fL "$base/$asset.minisig" -o "$asset.minisig"
-minisign -Vm "$asset" -x "$asset.minisig" \
-  -P 'RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh'
-tar -xzf "$asset" --no-same-owner --no-same-permissions duduclaw
-chown root:root duduclaw
-chmod 0755 duduclaw
-"$stage/duduclaw" service install --protected-linux --enable-now
-ROOT
-sudo systemctl status duduclaw-gateway.service
-sudo journalctl -u duduclaw-gateway.service -n 100 --no-pager
+sudo /usr/lib/duduclaw/current/duduclaw-migrate run --plan /var/lib/duduclaw-migrate/plan.json
+sudo /usr/lib/duduclaw/current/duduclaw-migrate status --plan /var/lib/duduclaw-migrate/plan.json
 ```
 
-不要從使用者可寫入的 npm 安裝目錄或家目錄執行 sudo 安裝；AI 員工可能在核心以 root 啟動前替換程式。若解析後的執行檔或任何上層目錄不屬於 root，或允許非 root 寫入，安裝程式會警告並要求 `--i-verified-this-binary`。這個確認參數不能讓已經以 root 執行的不可信程式變安全，請使用上面的驗證與暫存流程。
+這是介面範例，**不是已完成端到端驗收的部署步驟**。固定計畫及簽章平台須由經驗證的安裝器提供，目前仍無完整可用的安裝產出；缺少 `duduclaw-migration-platform` 時，runner 會在停機前拒絕。首位管理員已接上驗證 root 對端的 Unix socket 與 loopback 設定頁，token 放在網址 fragment，帳號與新密碼以同一交易建立；遠端管理員須先建立該本機連接埠的 SSH 通道。root 擁有的 `/etc/duduclaw/migration-import.json` 持久保存遷移模式，避免重啟後 `/run` 資料消失便退回一般管理員初始化。這些接線不代表完整遷移成功。不要把 `prepare --stop-after-keys` 當作升級捷徑，它會刻意讓安裝停留在離線狀態。
 
-不加 `--enable-now` 只安裝服務，之後用 `sudo systemctl enable --now duduclaw-gateway.service` 啟動。開啟儀表板完成設定，再到「安全 → 憑證保護」啟用。確認顯示「獨立金鑰（AI 員工讀不到）」後，再讓使用者連結個人帳號。CLI 程序不會繼承 gateway 的金鑰，終端機查到的憑證狀態不能代表 gateway。
-
-root 擁有的程式放在 `/opt/duduclaw/bin/duduclaw`，內嵌的啟動腳本安裝到 `/usr/local/libexec/duduclaw/protected-launcher`，服務檔是 `/etc/systemd/system/duduclaw-gateway.service`。資料位於 `/var/lib/duduclaw/.duduclaw`，根金鑰位於 `/var/lib/duduclaw-protected/root.key`（root:root、0400、一個連結、32 位元組）。服務使用 `KillMode=control-group`，系統檔案唯讀，只開放資料與金鑰目錄寫入。
+確認頁需要有效的 Admin session、密碼及已註冊驗證器的新驗證碼；授權有效五分鐘，綁定目前 session。高風險項目須逐項核准，批次核准只限低風險項目。核准與套用成功是不同狀態；不支援的類別繼續封鎖，需由支援的流程重新輸入。舊待核准項目不會變成新授權。
 
 ## 為服務帳號安裝 AI CLI
 
@@ -59,46 +93,56 @@ sudo -u duduclaw -H claude auth login
 
 `-H` 與 `--prefix /usr` 都要保留，否則原使用者的 `~/.npmrc` prefix 設定可能讓 npm 又把 CLI 裝回使用者家目錄。若設定使用 Codex、Grok、AGY 或 Gemini，也要安裝到相同的服務可讀系統 PATH，並依各 CLI 的登入方式替服務帳號登入。
 
-`service install --protected-linux` 與 `service upgrade --protected-linux` 結尾會檢查設定中的主要推論 runtime，以及各員工 `agent.toml` 選用的 runtime；有遷移時讀取遷移後的目的地設定。檢查以服務帳號及服務 PATH 確認執行權限，並排除被隱藏的路徑。只安裝在原使用者家目錄的 CLI 會明確標示為服務無法使用。主要 runtime 缺少時會印出警告，並以非零狀態結束。只有刻意稍後才設定 runtime 時，才在上述任一指令加上 `--allow-missing-runtime`；此旗標不會代為安裝或登入。檢查失敗不會撤回已執行的安裝或升級。
+`service install --protected-linux` 與 `service upgrade --protected-linux` 結尾會檢查設定中的主要推論 runtime，以及各員工 `agent.toml` 選用的 runtime；有遷移時讀取遷移後的目的地設定。檢查以服務帳號及服務 PATH 確認執行權限，並排除被隱藏的路徑。只安裝在原使用者家目錄的 CLI 會明確標示為服務無法使用。主要 runtime 缺少時會印出警告，並以非零狀態結束。只有刻意稍後才設定 runtime 時，才在上述任一指令加上 `--allow-missing-runtime`；此旗標不會代為安裝或登入。檢查失敗不會撤回已執行的安裝或升級。透過下方獨立更新服務升級時，`service upgrade --protected-linux` 會在送出要求前執行此檢查，檢查失敗就不送出。
 
 遷移只複製 `.duduclaw` 資料，**不會搬移 AI CLI 或其登入憑證**。Claude 已安裝但服務帳號尚未登入時，安裝流程會顯示上面的服務帳號登入指令。請另行登入，不要複製原使用者家目錄的憑證。Gateway 啟動時若找不到設定的推論執行檔，會記錄 ERROR 與修復方式；runtime 狀態與 doctor 也會顯示受保護服務專用的指引。
 
-## 從使用者安裝遷移
-
-先備份舊資料並停止舊 gateway。由原本的使用者服務擁有者執行：
-
-```sh
-systemctl --user stop duduclaw.service
-systemctl --user disable duduclaw.service
-sudo /opt/duduclaw/bin/duduclaw service install --protected-linux \
-  --migrate-from "$HOME/.duduclaw" --enable-now
-```
-
-請先完成上面的驗證安裝；若預計在首次啟動前遷移，安裝時省略 `--enable-now`。若新 gateway 已建立資料，請先保留備份，取代時明確加上 `--force-migrate`。再從原使用者自己的終端機執行遷移，不要使用 root 登入 shell。`SUDO_UID` 與 `SUDO_GID` 必須存在、有效且非零。安裝程式透過 `getpwuid` 查詢該 UID 的家目錄，只接受其中的 `.duduclaw`；指定路徑解析後必須完全相同，來源樹的每個目錄與檔案都必須屬於 `SUDO_UID`。`/var/lib/duduclaw-protected`、`/var/lib/duduclaw`、`/etc`、`/root`、`/proc`、`/sys` 以下的來源一律拒絕。逐層固定檔案描述元的 `openat` 檢查也會拒絕符號連結，包括上層目錄的連結。
-
-安裝程式不會代替另一位使用者執行前兩個指令。它會把該目錄複製到 `/var/lib/duduclaw/.duduclaw`，並交給專用帳號。目的地已存在時拒絕，除非明確加上 `--force-migrate`。`--force-migrate` 會把原目的地保留為 `/var/lib/duduclaw/.duduclaw.previous-<UUID>`。符號連結、硬連結與特殊檔案會被拒絕。取代資料前先停止系統服務、另存備份。檢查舊設定的絕對路徑；`ProtectHome=yes` 會讓原本使用者家目錄的路徑無法使用。
-
-請重新啟用憑證保護，並請每位使用者重新連結個人 Google 與遠端 MCP。舊的個人憑證密文綁定另一把金鑰，新安裝無法解開。AI runtime 執行檔應安裝在 root 管理的系統路徑；舊使用者的 CLI 安裝、登入檔與 shell 啟動檔不會自動提供給新帳號。
-
 ## 升級與解除安裝
 
-使用已安裝、由 root 擁有的執行檔升級：
+完成遷移及更新服務佈署後，Admin 可在儀表板要求正式版更新，或使用已安裝的 CLI：
 
 ```sh
-sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux
-# Select a published version instead of latest:
 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
 ```
 
-只有 `/proc/self/exe` 精確指向 `/opt/duduclaw/bin/duduclaw`，且程式與所有上層目錄都屬於 root、禁止非 root 寫入時，才能升級。它從官方 GitHub Release 下載 Linux 封存檔（預設最新版），重用 updater 內嵌的 minisign 公鑰驗證完整下載內容，再解壓至 root 擁有、權限為 0700 的暫存目錄。替換使用同目錄暫存檔、fsync 與 rename；升級期間不會以 root 執行新程式。驗證失敗不會變更已安裝程式；系統服務原本有在執行時才會重新啟動。現有資料與根金鑰保留。儀表板在這個模式顯示手動更新，不會替換程式。
+只有版本與要求 ID 會跨入更新邊界。更新服務驗證簽章中繼資料、雜湊、平台、到期日、版本下限與序號，切換完整世代後讀回實際執行版本及協定，才提交結果。服務重啟後仍以同一要求追蹤，只有 `committed` 才算成功。服務、信任或就緒資料缺失會拒絕更新，不會呼叫舊安裝器。一般更新不能降版，緊急回退需要另外的簽章授權。
+
+移除入口為 `sudo duduclaw service uninstall --protected-linux`。隔離安裝會先把 unit 備份到 `/var/lib/duduclaw-protected/uninstall-units`，建立持久的 `/etc` mask 並讀回，再停止 timer、socket 與服務；只有確認服務停止、已知 cgroup 為空、沒有服務／員工程序、已知儲存根目錄下沒有掛載後，才移除固定路徑的執行檔。不執行強制或 lazy unmount。金鑰、資料、系統帳號、永久 UID 對照、更新狀態／世代及版本下限均保留，mask 也保留以阻止自動重啟。H 的任意自訂儲存根目錄介面仍未接上，不能視為自訂儲存配置的完整移除驗收。本輪未做 root 實機移除；不要用舊 uninstaller 或刪除保留狀態來繞過拒絕。
+
+## 每晚自動更新
+
+Timer 在主機當地時間 03:30 要求獨立更新服務檢查更新，最多隨機延後 20 分鐘。`Persistent=false` 避免夜間未開機時，隔天開機立刻補跑。固定 helper 呼叫 `/usr/libexec/duduclaw-updated-launch --check-latest`；加 `--dry-run` 只查候選版本，不送出 Apply。
+
+候選查詢以 `duduclaw-dl` 執行。未簽章的發行索引只選擇非草稿的正式版候選，root 更新服務仍需驗證簽章清單。要求端不安裝下載的程式，也不退回舊更新流程。完整更新服務與信任狀態安裝、驗證後才啟用排程；不要把開發中 helper 複製到 v1.79.3。使用經審查、固定版本的 [timer 安裝器](../../../scripts/linux-protected/auto-upgrade/README.md)，不要使用持續變動的 `main`。
+
+## 就緒檢查故障排除
+
+以下指令用於檢查已安裝元件，不代表完整安裝驗證：
 
 ```sh
-sudo /opt/duduclaw/bin/duduclaw service uninstall --protected-linux
+sudo duduclaw service readiness --protected-linux
+sudo /usr/lib/duduclaw/duduclaw-spawnd --check
+sudo systemctl status duduclaw-gateway.service duduclaw-spawnd.service duduclaw-egress.service duduclaw-updated.service
+sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duduclaw-egress.service -u duduclaw-updated.service -n 100 --no-pager
 ```
 
-解除安裝會停止並停用服務，移除服務檔、執行檔與啟動腳本，**不會刪除** `/var/lib/duduclaw` 或 `/var/lib/duduclaw-protected`，包括根金鑰；該目錄只移除版本下限及待完成的版本意圖。重新安裝可沿用保留的資料與金鑰。
+| 現象 | 處理 |
+| --- | --- |
+| `UnsupportedKernel` | 檢查實際 kernel 與 Landlock ABI；ABI 8／kernel 7.0 目前會拒絕，保留此檢查。 |
+| 就緒資料缺失、過期或不相容 | 確認完整世代、協定版本、帳號登錄表與全部服務；只有 `active` 不足以放行。 |
+| UID／帳號／SSH／IAM 失敗 | 處理保留範圍衝突、別名、附加群組、登入／cron／at 或 linger；外部 IAM 保留需管理員證明。 |
+| 儲存／配額失敗 | 確認底層裝置鏈、硬性配額、可用容量與主機保留空間；不能用磁碟用量輪詢代替硬性配額。 |
+| DNS／egress 失敗 | 檢查 root 指定的 resolved Varlink 或 DNS broker 路徑；不要替 egress 服務加入私有 resolver IP 例外。 |
+| 解析根目錄失敗 | 檢查兩個根目錄的擁有者、權限與非預期內容；不要複製主機 `/etc` 或資料進去。 |
+| 遷移平台或設定連結不可用 | 保留既有環境，取得完整驗證過的整合；不要搬移舊權威或繞過遷移閘。 |
+| 等待確認／輪替 | 在遷移確認頁完成支援的確認、重試與新憑證設定；核准本身不代表遷移完成。 |
+| 更新已受理但未 committed | 追蹤持久要求狀態與就緒錯誤，不要同時手動替換執行檔。 |
 
-升級只接受比目前執行版本新的穩定 semver `X.Y.Z`。安裝與升級也拒絕低於 `/var/lib/duduclaw-protected/version-floor` 的版本；此檔案由 root:root 擁有、權限為 0600，在執行檔替換成功後原子寫入最高已安裝版本。檔案不存在時以目前版本為下限，內容損壞則拒絕操作。升級沒有回退選項。緊急回退必須由 root 刻意解除安裝（會移除版本下限），再用舊版封存檔執行上方驗簽後首次安裝流程；資料與根金鑰仍保留。 替換中斷時，root-only 的寫入意圖（`version-pending`）也會保留已驗證目標的下限；請以該版本或較新版重做驗簽安裝，或刻意解除安裝後清除。
+受保護員工環境不提供容器引擎與依賴主機硬體的功能。所有必要元件均需通過檢查才能恢復工作；套件測試通過或本指南都不能當作正式環境驗收。
+
+## v1.80.x 已發行的單一執行檔受保護服務
+
+以下各節說明 v1.80.x 發行版的受保護服務：gateway 是 root 安裝的單一執行檔，`service upgrade --protected-linux` 會在程序內驗證並替換執行檔。這些內容仍是上述發行版，以及隔離架構沿用的憑證保護控制（引擎 socket 政策與自動復原）的參考。以本開發分支建置的版本，`service upgrade --protected-linux` 改為向上方的獨立更新服務送出要求，不會自行替換執行檔。
 
 官方 GitHub 更新會精確核對 minisign 簽章註解 `duduclaw v{版本} {封存檔名}`，包含平台與架構；Pro 更新則使用 `duduclaw-pro` 及該管道自己的固定公鑰。封存檔簽章與涵蓋註解的全域簽章都必須通過。所有封存檔安裝路徑都必須提供驗證器產生的 `VerifiedReleaseIdentity`，綁定封存檔摘要、版本、檔名與簽章註解，僅通過完整性檢查不能安裝。換檔前還會確認執行檔版本。Linux 受保護升級只讀取編譯時的固定格式標記，不以 root 執行下載的程式：標記必須恰有一筆，header 為 `NUL + DUDUCLAW_RELEASE_ID:V1:`，接穩定版 `X.Y.Z`，suffix 為 `NUL + DUDUCLAW_RELEASE_END + NUL`。每個 `DUDUCLAW_RELEASE_ID` 都必須構成完整標記，缺少、畸形、重複或衝突一律拒絕；沒有標記的舊版封存檔也不接受。發版流程會在簽章前解析實際封存檔內的執行檔，確認標記與 tag 相同，Pro 打包也適用。一般更新則核對 `version` 輸出。任何不符都會在換檔及寫入受保護版本意圖／下限前中止。這些檢查適用於已包含修補的更新程式；舊更新程式仍需先由管理員審查並手動更新。
 

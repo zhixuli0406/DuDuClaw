@@ -11,6 +11,7 @@ import {
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { toast } from '@/lib/toast';
+import { TenantSubjectNotice } from '@/components/protected/TenantSubjectNotice';
 import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import {
   Badge,
@@ -243,7 +244,9 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
           <span className="font-medium" data-testid="agent-connections-current">{current}</span>
           {stateBadge}
         </div>
-        {view.message && (
+        {view.tenant_subject ? (
+          <TenantSubjectNotice notice={view.tenant_subject} />
+        ) : view.message && (
           <p className="text-sm text-warning">{view.message}</p>
         )}
         {['delegate','owner','user'].includes(view.kind) && (

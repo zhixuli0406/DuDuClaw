@@ -11,6 +11,12 @@ impl MethodHandler {
     /// forced to the final agent name so the directory and config agree.
     pub(crate) async fn handle_templates_create_agent(&self, params: Value, caller: &UserContext) -> WsFrame {
         use crate::premium_templates as pt;
+        // Native Linux protected mode (SR2 1c): before the license/premium
+        // read; `create_template_with_skills` refuses again for every caller.
+        if let Some(refused) = super::isolation_employee_rpc::protected_create_refusal(
+            crate::runtime_readiness::is_protected_linux()) {
+            return refused;
+        }
         let role_id = params.get("role_id").and_then(|v| v.as_str()).unwrap_or("");
         if role_id.is_empty() {
             return WsFrame::error_response("", "role_id is required");
@@ -53,6 +59,13 @@ impl MethodHandler {
         skills: Option<&std::collections::BTreeMap<String, String>>, premium: bool, install_evals: bool, disabled_skills: &[String],
     ) -> WsFrame {
         use crate::premium_templates as pt;
+        // Native Linux protected mode (SR2 1c): a protected employee exists
+        // only through an approved Employee proposal. Every template writer
+        // (role, company, bundled, library) commits here, so refuse first.
+        if let Some(refused) = super::isolation_employee_rpc::protected_create_refusal(
+            crate::runtime_readiness::is_protected_linux()) {
+            return refused;
+        }
         if !caller.is_admin() { return WsFrame::error_response("", "Administrator required"); }
         if let Err(error) = self.validate_template_policy(assembled) {
             return WsFrame::error_response("", &error);

@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// v1.81 P1c: page queries that exclude hidden Personal employees.
+#[path = "personal_hiding.rs"]
+mod personal_hiding;
+use personal_hiding::hidden_json;
+
 enum ActivityAccess<'a> {
     All,
     Principal(&'a str),
@@ -11,8 +16,9 @@ enum ActivityAccess<'a> {
 
 impl TaskStore {
     pub async fn append_activity(&self, row: &ActivityRow) -> Result<(), String> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = begin_live_write(&mut conn)?;
+        tx.execute(
             "INSERT INTO activity (id, event_type, agent_id, task_id, summary, timestamp, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -22,10 +28,20 @@ impl TaskStore {
                 row.task_id,
                 mask_derived_text(&row.summary),
                 row.timestamp,
-                row.metadata.as_deref().map(mask_derived_text),
+                // v1.81 P1g (F7): a goal link (`goal_created` + metadata that
+                // is exactly an id link) is ownership, not text — stored as
+                // is, so the redaction masker can never break the link and
+                // turn a Personal employee's goal into an unowned one.
+                row.metadata.as_deref().map(|raw| {
+                    match crate::personal_visibility::goal_link_metadata(&row.event_type, raw) {
+                        Some(link) => link,
+                        None => mask_derived_text(raw).to_string(),
+                    }
+                }),
             ],
         )
         .map_err(|e| format!("append activity: {e}"))?;
+        commit_live_write(tx)?;
         Ok(())
     }
 
@@ -44,7 +60,19 @@ impl TaskStore {
         offset: i64, principal: Option<&str>,
     ) -> Result<(Vec<ActivityRow>, i64), String> {
         let access = principal.map(ActivityAccess::Principal).unwrap_or(ActivityAccess::All);
-        self.list_activity_with_access(agent_id, event_type, limit, offset, access).await
+        self.list_activity_with_access(agent_id, event_type, limit, offset, access, None).await
+    }
+
+    /// v1.81 P1c: [`Self::list_activity_for_principal`] without the rows of
+    /// `hidden` employees — by the row's employee and by the employee of the
+    /// task it names — applied before LIMIT and COUNT, so `total` counts only
+    /// what the caller can list. An empty set reads exactly as before.
+    pub(crate) async fn list_activity_hiding(
+        &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
+        offset: i64, principal: &str, hidden: &std::collections::BTreeSet<String>,
+    ) -> Result<(Vec<ActivityRow>, i64), String> {
+        self.list_activity_with_access(agent_id, event_type, limit, offset,
+            ActivityAccess::Principal(principal), hidden_json(hidden)).await
     }
 
     /// `worker` must be the caller's verified executor identity. No worker
@@ -54,12 +82,24 @@ impl TaskStore {
         offset: i64, worker: Option<&str>,
     ) -> Result<(Vec<ActivityRow>, i64), String> {
         self.list_activity_with_access(agent_id, event_type, limit, offset,
-            ActivityAccess::Worker(worker)).await
+            ActivityAccess::Worker(worker), None).await
+    }
+
+    /// v1.81 P1d: [`Self::list_activity_for_worker`] without the rows of
+    /// `hidden` employees (by the row's employee and by the employee of the
+    /// task it names), applied before LIMIT and COUNT. An empty set reads
+    /// exactly as before.
+    pub async fn list_activity_for_worker_hiding(
+        &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
+        offset: i64, worker: Option<&str>, hidden: &std::collections::BTreeSet<String>,
+    ) -> Result<(Vec<ActivityRow>, i64), String> {
+        self.list_activity_with_access(agent_id, event_type, limit, offset,
+            ActivityAccess::Worker(worker), hidden_json(hidden)).await
     }
 
     async fn list_activity_with_access(
         &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
-        offset: i64, access: ActivityAccess<'_>,
+        offset: i64, access: ActivityAccess<'_>, hidden: Option<String>,
     ) -> Result<(Vec<ActivityRow>, i64), String> {
         let conn = self.conn.lock().await;
 
@@ -97,6 +137,16 @@ impl TaskStore {
         };
         count_sql.push_str(&access_clause);
         query_sql.push_str(&access_clause);
+        if let Some(hidden) = hidden {
+            binds.push(hidden);
+            let n = binds.len();
+            let clause = format!(
+                " AND activity.agent_id NOT IN (SELECT value FROM json_each(?{n})) AND NOT EXISTS \
+                 (SELECT 1 FROM tasks h WHERE h.id = activity.task_id AND h.assigned_to IN (SELECT value FROM json_each(?{n})))"
+            );
+            count_sql.push_str(&clause);
+            query_sql.push_str(&clause);
+        }
         query_sql.push_str(&format!(
             " ORDER BY timestamp DESC LIMIT {} OFFSET {}",
             limit, offset
@@ -197,7 +247,8 @@ impl TaskStore {
     /// Append a comment. Caller is responsible for verifying the task exists and
     /// that `body` is non-empty and length-capped.
     pub async fn insert_comment(&self, row: &CommentRow) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
         conn.execute(
             "INSERT INTO task_comments (id, task_id, author_user, body, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -210,6 +261,7 @@ impl TaskStore {
             ],
         )
         .map_err(|e| format!("insert comment: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 

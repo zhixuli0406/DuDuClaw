@@ -22,6 +22,7 @@
 //! - `dingtalk_app_secret` (`_enc`) — robot AppSecret (signature key)
 //! - `dingtalk_app_key` — robot AppKey / Client ID (stored for reference)
 
+use crate::isolation_http::LiveRequest;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -598,7 +599,7 @@ async fn post_webhook(http: &reqwest::Client, webhook: &str, body: &serde_json::
         warn!("DingTalk sessionWebhook host not on the dingtalk.com allowlist — refusing send");
         return false;
     }
-    match http.post(webhook).json(body).send().await {
+    match http.post(webhook).json(body).send_authorized().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(v) => {
                 let code = v.get("errcode").and_then(|c| c.as_i64()).unwrap_or(0);
@@ -627,7 +628,7 @@ async fn post_webhook(http: &reqwest::Client, webhook: &str, body: &serde_json::
             // query string and reqwest's Display embeds the full URL.
             warn!(
                 "DingTalk webhook send error: {}",
-                crate::wecom::scrub_reqwest_err(e)
+                e
             );
             false
         }

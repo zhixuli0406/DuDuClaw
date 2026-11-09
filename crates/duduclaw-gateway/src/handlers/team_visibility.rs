@@ -25,7 +25,8 @@ impl MethodHandler {
         {
             return Err(WsFrame::error_response("", PERMISSION_DENIED));
         }
-        Ok(reader)
+        // v1.81 P1b: a scoped `timeline.list` was gated at dispatch.
+        Ok(reader.admit_scope(agent))
     }
 
     pub(super) fn team_run_metadata_response(&self, ctx: &UserContext, agent: &str, id: &str) -> WsFrame {

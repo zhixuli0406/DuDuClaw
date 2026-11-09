@@ -83,11 +83,19 @@ pub(crate) enum DashboardOnlyReader {
     CollectionEditor,
     /// Manager with Viewer on the card's stored `agent_id`.
     EmployeeViewer,
+    /// Nobody through the generic approval surfaces (approvals.list/get and
+    /// live approval events), not even an Admin. SR2 N4: a Personal →
+    /// Shared delegation card binds the owner's full task text; only that
+    /// owner reads it, through `me.isolation.list_personal_delegations`.
+    PersonalOwnerOnly,
 }
 
 /// Read policy for `record`. Dashboard-only delivery is not itself a filter;
 /// the decide gate for that kind is.
 pub(crate) fn dashboard_only_reader(record: &ApprovalRecord) -> DashboardOnlyReader {
+    if record.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND {
+        return DashboardOnlyReader::PersonalOwnerOnly;
+    }
     // Payload-detected activation is Admin even when `action_kind` differs.
     if crate::approval::is_activation_record(record)
         || record.action_kind == crate::approval::cli_egress::KIND
@@ -177,6 +185,7 @@ impl ApprovalVisibility {
             DashboardOnlyReader::EmployeeViewer => {
                 fresh.has_agent_access(&record.agent_id, AccessLevel::Viewer)
             }
+            DashboardOnlyReader::PersonalOwnerOnly => false,
         };
         if !allowed { return false; }
         if let Some(activation) = &self.activation {
@@ -390,6 +399,45 @@ mod tests {
         assert!(snapshot.may_read(&record, &fresh, department.as_deref()));
         let rpc = payload(f.handler.handle_approvals_list(json!({"id": id.as_str()}), &root).await);
         assert_eq!(rpc["count"], 1);
+    }
+
+    /// SR2 N4: a Personal → Shared delegation card (it binds the owner's full
+    /// task text) is never listed, returned or pushed by the generic approval
+    /// surfaces — not to an Admin, not to Managers bound to the employee.
+    /// Only its owner reads it, through `me.isolation.list_personal_delegations`.
+    #[tokio::test]
+    async fn personal_delegation_card_hidden_from_admin_list() {
+        use crate::isolation_background::{personal_delegation_test_support as support, DelegationError,
+            PERSONAL_DELEGATION_KIND};
+        let f = fixture().await;
+        let root = admin(&f);
+        let task = "請把本季報價單整理後交給業務團隊。".repeat(30);
+        // Filed for "sales", which alice and bob are bound to as Operators.
+        assert_eq!(support::file_card(&f.home, &f.alice.user_id, "sales", duduclaw_isolation::ids::EmployeeId([1; 16]),
+            "team", duduclaw_isolation::ids::EmployeeId([2; 16]), &task).await, Err(DelegationError::OwnerApprovalPending));
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let card = broker.list_by_kind(PERSONAL_DELEGATION_KIND).await.unwrap().remove(0);
+        assert!(matches!(dashboard_only_reader(&card), DashboardOnlyReader::PersonalOwnerOnly));
+        // Control: the same readers do see an ordinary card for that employee.
+        let control = broker.request("sales", "dynamic_review_kind", "Review", json!({}), 300).await.unwrap();
+        for ctx in [&root, &f.alice, &f.bob] {
+            let rpc = payload(f.handler.handle_approvals_list(json!({"id": control.as_str()}), ctx).await);
+            assert_eq!(rpc["count"], 1);
+        }
+        let line = serde_json::to_string(&WsFrame::event("approval.created", json!({"id": card.id.as_str()}))).unwrap();
+        for ctx in [&root, &f.alice, &f.bob] {
+            let (fresh, department) = fresh_reader(&f.home, ctx).unwrap();
+            assert!(!ApprovalVisibility::load(&f.home, &card, &fresh).may_read(&card, &fresh, department.as_deref()));
+            // approvals.get / approvals.list by id
+            let by_id = payload(f.handler.handle_approvals_list(json!({"id": card.id.as_str()}), ctx).await);
+            assert_eq!(by_id["count"], 0);
+            // the pending list
+            let all = payload(f.handler.handle_approvals_list(json!({}), ctx).await);
+            assert!(!all.to_string().contains(card.id.as_str()) && !all.to_string().contains("請把本季"), "{all}");
+            // live approval events
+            let mut gate = crate::handlers::push_filter::PushGate::new(&f.home, ctx, false);
+            assert!(gate.filter_live(&line, &f.handler).await.is_none());
+        }
     }
 
     #[tokio::test]

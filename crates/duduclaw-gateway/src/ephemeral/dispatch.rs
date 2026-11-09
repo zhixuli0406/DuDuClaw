@@ -152,9 +152,11 @@ pub async fn dispatch_with(
         )
     })?;
 
-    let mut loaded = duduclaw_agent::registry::AgentRegistry::load_agent(&dir)
+    // Heap-held: the full agent config stays live across the runtime await,
+    // and the dispatcher's stack-bound future sizes include this frame.
+    let mut loaded = Box::new(Box::pin(duduclaw_agent::registry::AgentRegistry::load_agent(&dir))
         .await
-        .map_err(|e| format!("load ephemeral agent '{agent_id}': {e}"))?;
+        .map_err(|e| format!("load ephemeral agent '{agent_id}': {e}"))?);
 
     let model = resolve_tier_model_for_dir(&dir, tier, &loaded.config.model.preferred);
     tracing::info!(

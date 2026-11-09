@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::{generate_password, hash_password, verify_password_hash, UserDb};
-use crate::models::{User, UserRole};
+use crate::models::User;
 use crate::user_row::bump_acl_generation;
 
 /// OTP validity window.
@@ -25,8 +25,8 @@ pub const OTP_MAX_ATTEMPTS: i64 = 5;
 /// within `OTP_RATE_WINDOW_SECS`.
 pub const OTP_RATE_WINDOW_SECS: i64 = 60;
 pub const OTP_RATE_MAX: usize = 3;
-/// Setup-token validity window (1 hour).
-pub const SETUP_TOKEN_TTL_SECS: i64 = 3600;
+/// Setup-token validity window (30 minutes).
+pub const SETUP_TOKEN_TTL_SECS: i64 = 1800;
 
 /// A verified (or pending) channel identity for a user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -450,27 +450,25 @@ impl UserDb {
     /// regardless so a locked-out operator can always recover. Returns the
     /// plaintext token; only its hash is stored.
     pub fn issue_setup_token(&self, force: bool) -> Result<Option<String>, String> {
-        if !force {
-            let count: i64 = self
-                .conn()
-                .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
-                .map_err(|e| format!("count failed: {e}"))?;
-            if count > 0 {
-                return Ok(None);
-            }
-        }
         let token = generate_password(40);
         let token_hash = hash_password(&token)?;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let expires = now + Duration::seconds(SETUP_TOKEN_TTL_SECS);
-        self.conn()
-            .execute(
-                "INSERT INTO setup_tokens (id, token_hash, created_at, expires_at, consumed)
-                 VALUES (?1, ?2, ?3, ?4, 0)",
-                params![id, token_hash, now.to_rfc3339(), expires.to_rfc3339()],
-            )
-            .map_err(|e| format!("setup token insert failed: {e}"))?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("setup transaction failed: {e}"))?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .map_err(|e| format!("count failed: {e}"))?;
+        if !force && count > 0 { return Ok(None); }
+        tx.execute("UPDATE setup_tokens SET consumed = 1", [])
+            .map_err(|e| format!("setup revocation failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO setup_tokens (id, token_hash, created_at, expires_at, consumed, recovery)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            params![id, token_hash, now.to_rfc3339(), expires.to_rfc3339(), force],
+        ).map_err(|e| format!("setup token insert failed: {e}"))?;
+        tx.commit().map_err(|e| format!("setup commit failed: {e}"))?;
         Ok(Some(token))
     }
 
@@ -484,44 +482,86 @@ impl UserDb {
         email: &str,
         display_name: &str,
     ) -> Result<User, String> {
-        // Find a live, unconsumed token whose hash matches.
-        let candidates: Vec<(String, String, String)> = {
-            let conn = self.conn();
-            let mut stmt = conn
-                .prepare("SELECT id, token_hash, expires_at FROM setup_tokens WHERE consumed = 0")
-                .map_err(|e| format!("prepare failed: {e}"))?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .map_err(|e| format!("query failed: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("row map failed: {e}"))?
-        };
+        self.claim_setup_token_inner(token, email, display_name, None)
+    }
 
-        let now = Utc::now();
-        let mut matched_id: Option<String> = None;
-        for (id, hash, expires_at) in candidates {
-            let expired = DateTime::parse_from_rfc3339(&expires_at)
-                .map(|t| now > t.with_timezone(&Utc))
-                .unwrap_or(true);
-            if expired {
-                continue;
-            }
-            if verify_password_hash(token, &hash).is_ok() {
-                matched_id = Some(id);
-                break;
-            }
+    /// Migration bootstrap: create the FIRST administrator and set its chosen
+    /// password in the same token-consumption transaction. Recovery tokens are
+    /// never accepted by this entry point.
+    pub fn claim_first_admin_setup_token(
+        &self, token: &str, email: &str, display_name: &str, password: &str,
+    ) -> Result<User, String> {
+        let email = crate::db::validate_account_email(email).map_err(str::to_owned)?;
+        if password.chars().count() < 12 || password.len() > 1024 {
+            return Err("password must be 12 characters or longer and at most 1024 bytes".into());
         }
-        let token_id = matched_id.ok_or_else(|| "invalid or expired setup token".to_string())?;
+        self.claim_setup_token_inner(token, email, display_name, Some(password))
+    }
 
-        // Create the admin, then consume the token (create first so a failed
-        // create leaves the token usable).
-        let throwaway = generate_password(32);
-        let user = self.create_user(email, display_name, &throwaway, UserRole::Admin)?;
-        self.conn()
-            .execute(
-                "UPDATE setup_tokens SET consumed = 1 WHERE id = ?1",
-                params![token_id],
-            )
-            .map_err(|e| format!("consume token failed: {e}"))?;
+    fn claim_setup_token_inner(
+        &self, token: &str, email: &str, display_name: &str, password: Option<&str>,
+    ) -> Result<User, String> {
+        if token.is_empty() || token.len() > 256 || email.is_empty() || email.len() > 320
+            || display_name.len() > 256 {
+            return Err("invalid setup request".into());
+        }
+        let now = Utc::now();
+        // Account creation, token consumption and revocation share the write lock.
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "setup transaction unavailable".to_owned())?;
+        let (window_start, attempts): (i64, i64) = tx.query_row(
+            "SELECT window_start, attempts FROM setup_claim_rate WHERE id = 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().map_err(|_| "setup rate unavailable")?.unwrap_or((now.timestamp(), 0));
+        let (window_start, attempts) = if now.timestamp() >= window_start.saturating_add(60) {
+            (now.timestamp(), 0)
+        } else { (window_start, attempts) };
+        if attempts >= 5 { return Err("setup attempts limited".into()); }
+        tx.execute("INSERT INTO setup_claim_rate VALUES (1, ?1, ?2)
+            ON CONFLICT(id) DO UPDATE SET window_start = excluded.window_start, attempts = excluded.attempts",
+            params![window_start, attempts + 1]).map_err(|_| "setup rate unavailable")?;
+        let candidate: Option<(String, String, String, bool, i64)> = tx.query_row(
+            "SELECT id, token_hash, expires_at, recovery, attempts FROM setup_tokens
+             WHERE consumed = 0 ORDER BY created_at DESC LIMIT 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).optional().map_err(|_| "setup token unavailable")?;
+        let matched = candidate.as_ref().is_some_and(|(_, hash, expires, _, failures)| {
+            *failures < 20 && DateTime::parse_from_rfc3339(expires)
+                .is_ok_and(|t| t.with_timezone(&Utc) > now)
+                && verify_password_hash(token, hash).is_ok()
+        });
+        if !matched {
+            if let Some((id, _, _, _, _)) = candidate {
+                tx.execute("UPDATE setup_tokens SET attempts = attempts + 1,
+                    consumed = CASE WHEN attempts + 1 >= 20 THEN 1 ELSE consumed END WHERE id = ?1",
+                    [id]).map_err(|_| "setup token unavailable")?;
+            }
+            tx.commit().map_err(|_| "setup commit unavailable")?;
+            return Err("invalid or expired setup token".into());
+        }
+        let (token_id, _, expires, recovery, _) = candidate.ok_or("setup token unavailable")?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .map_err(|_| "setup users unavailable")?;
+        if password.is_some() && recovery { return Err("recovery token refused for first administrator".into()); }
+        if (!recovery || password.is_some()) && count != 0 { return Err("first administrator already exists".into()); }
+        let changed = tx.execute("UPDATE setup_tokens SET consumed = 1
+            WHERE id = ?1 AND consumed = 0 AND expires_at = ?2 AND expires_at > ?3",
+            params![token_id, expires, Utc::now().to_rfc3339()])
+            .map_err(|_| "setup token unavailable")?;
+        if changed != 1 { return Err("invalid or expired setup token".into()); }
+        let id = Uuid::new_v4().to_string();
+        let timestamp = now.to_rfc3339();
+        let password_hash = match password { Some(value) => hash_password(value)?, None => hash_password(&generate_password(32))? };
+        tx.execute("INSERT INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at, bootstrap_owner)
+            VALUES (?1, ?2, ?3, ?4, 'admin', 'active', ?5, ?5, ?6)",
+            params![id, email, display_name, password_hash, timestamp, password.is_some()])
+            .map_err(|_| "setup account creation failed")?;
+        tx.execute("UPDATE setup_tokens SET consumed = 1", [])
+            .map_err(|_| "setup revocation failed")?;
+        bump_acl_generation(&tx).map_err(|_| "setup generation failed")?;
+        let user = crate::user_row::load_user(&tx, &id)?.ok_or("setup account unavailable")?;
+        tx.commit().map_err(|_| "setup commit unavailable")?;
         Ok(user)
     }
 }
@@ -695,10 +735,133 @@ mod tests {
     }
 
     #[test]
+    fn setup_claim_is_atomic_across_connections() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("users.db");
+        let first = UserDb::new(&path).unwrap();
+        let token = first.issue_setup_token(false).unwrap().unwrap();
+        // Independent pools share only the SQLite file, not a process mutex.
+        let second = UserDb::new(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [first, second].into_iter().enumerate().map(|(index, db)| {
+            let (token, barrier) = (token.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.claim_setup_token(&token, &format!("admin{index}@example.com"), "Admin").is_ok()
+            })
+        }).collect();
+        let successes = threads.into_iter().map(|thread| thread.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(successes, 1);
+        let db = UserDb::new(&path).unwrap();
+        let count: i64 = db.conn().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        let live: i64 = db.conn().query_row("SELECT COUNT(*) FROM setup_tokens WHERE consumed = 0", [], |r| r.get(0)).unwrap();
+        assert_eq!(live, 0);
+    }
+
+    #[test]
+    fn setup_legacy_schema_upgrade_revokes_unbound_tokens() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("users.db");
+        let token = generate_password(40);
+        let now = Utc::now();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE setup_tokens (
+                id TEXT PRIMARY KEY, token_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+                consumed INTEGER NOT NULL DEFAULT 0
+            );").unwrap();
+            conn.execute("INSERT INTO setup_tokens VALUES ('legacy', ?1, ?2, ?3, 0)",
+                params![hash_password(&token).unwrap(), now.to_rfc3339(),
+                    (now + Duration::seconds(3600)).to_rfc3339()]).unwrap();
+        }
+        let db = UserDb::new(&path).unwrap();
+        let row: (i64, i64, i64) = db.conn().query_row(
+            "SELECT consumed, recovery, attempts FROM setup_tokens WHERE id = 'legacy'", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(row, (1, 0, 0));
+        assert!(db.claim_setup_token(&token, "legacy@example.com", "Legacy").is_err());
+        let count: i64 = db.conn().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn setup_issued_token_preserves_recovery_purpose_on_reopen() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("users.db");
+        let db = UserDb::new(&path).unwrap();
+        let first = db.issue_setup_token(false).unwrap().unwrap();
+        let purpose: i64 = db.conn().query_row(
+            "SELECT recovery FROM setup_tokens WHERE consumed = 0", [], |r| r.get(0)).unwrap();
+        assert_eq!(purpose, 0);
+        db.claim_setup_token(&first, "first@example.com", "First").unwrap();
+        let recovery = db.issue_setup_token(true).unwrap().unwrap();
+        drop(db);
+        let reopened = UserDb::new(&path).unwrap();
+        let purpose: i64 = reopened.conn().query_row(
+            "SELECT recovery FROM setup_tokens WHERE consumed = 0", [], |r| r.get(0)).unwrap();
+        assert_eq!(purpose, 1);
+        assert_eq!(reopened.claim_setup_token(&recovery, "recovered@example.com", "Recovered").unwrap().role,
+            UserRole::Admin);
+        let count: i64 = reopened.conn().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn setup_new_token_revokes_old_and_failed_insert_rolls_back() {
+        let db = db();
+        let old = db.issue_setup_token(false).unwrap().unwrap();
+        let current = db.issue_setup_token(false).unwrap().unwrap();
+        assert!(db.claim_setup_token(&old, "first@example.com", "First").is_err());
+        db.claim_setup_token(&current, "first@example.com", "First").unwrap();
+        let recovery = db.issue_setup_token(true).unwrap().unwrap();
+        assert!(db.claim_setup_token(&recovery, "first@example.com", "Duplicate").is_err());
+        assert!(db.claim_setup_token(&recovery, "recovery@example.com", "Recovery").is_ok());
+    }
+
+    #[test]
+    fn setup_first_admin_claim_refuses_intervening_user() {
+        let db = db();
+        let token = db.issue_setup_token(false).unwrap().unwrap();
+        make_user(&db);
+        assert!(db.claim_setup_token(&token, "root@example.com", "Root").is_err());
+    }
+
+    #[test]
+    fn setup_expiry_and_attempt_limits_fail_closed() {
+        let db = db();
+        let token = db.issue_setup_token(false).unwrap().unwrap();
+        db.conn().execute("UPDATE setup_tokens SET expires_at = ?1", [Utc::now().to_rfc3339()]).unwrap();
+        assert!(db.claim_setup_token(&token, "root@example.com", "Root").is_err());
+        let token = db.issue_setup_token(false).unwrap().unwrap();
+        db.conn().execute("DELETE FROM setup_claim_rate", []).unwrap();
+        for _ in 0..5 { assert!(db.claim_setup_token("wrong", "root@example.com", "Root").is_err()); }
+        assert_eq!(db.claim_setup_token(&token, "root@example.com", "Root").unwrap_err(), "setup attempts limited");
+        db.conn().execute("DELETE FROM setup_claim_rate", []).unwrap();
+        db.conn().execute("UPDATE setup_tokens SET attempts = 19 WHERE consumed = 0", []).unwrap();
+        assert!(db.claim_setup_token("wrong", "root@example.com", "Root").is_err());
+        assert!(db.claim_setup_token(&token, "root@example.com", "Root").is_err());
+    }
+
+    #[test]
     fn break_glass_force_issues_even_with_users() {
         let db = db();
         make_user(&db);
         assert!(db.issue_setup_token(false).unwrap().is_none());
         assert!(db.issue_setup_token(true).unwrap().is_some());
     }
+    #[test]
+    fn migration_first_admin_claim_sets_password_atomically_and_rejects_replay() {
+        let db = db();
+        let token = db.issue_setup_token(false).unwrap().unwrap();
+        assert!(db.claim_first_admin_setup_token(&token, "first@example.com", "First", "short").is_err());
+        let user = db.claim_first_admin_setup_token(&token, "first@example.com", "First", "new-password-123").unwrap();
+        assert_eq!(user.role, UserRole::Admin);
+        assert!(db.verify_password("first@example.com", "new-password-123").is_ok());
+        assert!(db.claim_first_admin_setup_token(&token, "second@example.com", "Second", "new-password-123").is_err());
+        let recovery = db.issue_setup_token(true).unwrap().unwrap();
+        assert!(db.claim_first_admin_setup_token(&recovery, "second@example.com", "Second", "new-password-123").is_err());
+    }
+
 }

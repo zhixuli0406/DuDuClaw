@@ -161,7 +161,7 @@ pub trait DeviceOps: Send + Sync {
 pub struct SystemDeviceOps;
 
 async fn run(mut cmd: tokio::process::Command) -> OpResult {
-    match cmd.output().await {
+    match duduclaw_core::execution_gate::output(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await {
         Ok(out) => Ok(OpOutput::from_process_output(out)),
         Err(e) => Err(DeviceOpError::Unsupported(e.to_string())),
     }
@@ -248,10 +248,9 @@ impl DeviceOps for SystemDeviceOps {
         // and nothing left to write a new one. Non-fatal: an image without
         // this unit (or a non-appliance test host) should still complete
         // the wipe + reboot rather than abort the whole reset.
-        let enable = tokio::process::Command::new("systemctl")
-            .args(["enable", "duduclaw-firstboot-provision.service"])
-            .output()
-            .await;
+        let mut command = tokio::process::Command::new("systemctl");
+        command.args(["enable", "duduclaw-firstboot-provision.service"]);
+        let enable = duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await;
         let enable_note = match &enable {
             Ok(out) if out.status.success() => String::new(),
             Ok(out) => format!(

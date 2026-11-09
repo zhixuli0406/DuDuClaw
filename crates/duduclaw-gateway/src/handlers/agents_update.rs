@@ -1361,6 +1361,22 @@ impl MethodHandler {
                     os_watch_hot_reloaded,
                     "agents.update completed"
                 );
+                if duduclaw_core::execution_gate::isolation_required() && params.get("proactive").is_some()
+                    && params.get("proactive").and_then(|value| value.get("enabled")).and_then(Value::as_bool) != Some(false) {
+                    // This authenticated settings write identifies the owner of
+                    // the recurring work. It submits a card, never auto-approves.
+                    let requested = async {
+                        let caller = caller.ok_or("背景工作需要可驗證的交辦人。")?;
+                        let owner = duduclaw_core::HumanPrincipal::user(&caller.user_id)
+                            .ok_or("背景工作需要可驗證的交辦人。")?.to_string();
+                        let material = crate::isolation_background::material::heartbeat(&self.home_dir, &agent_id)?;
+                        crate::isolation_background::request_record_from_settings(&self.home_dir, "heartbeat", &agent_id,
+                            &agent_id, &owner, &material).await
+                            .map_err(|error| error.user_message()
+                                .unwrap_or("背景工作設定已儲存，但執行授權尚未送審；請重新儲存設定。").to_string())
+                    }.await;
+                    if let Err(error) = requested { return WsFrame::error_response("", &error); }
+                }
                 WsFrame::ok_response(
                     "",
                     json!({

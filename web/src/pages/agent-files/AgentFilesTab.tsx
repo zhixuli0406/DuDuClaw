@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { Clock, FileText, History, Pencil } from 'lucide-react';
 import { api } from '@/lib/api';
+import { withBreakGlass } from '@/lib/break-glass';
 import type {
   AgentFileDiffResponse,
   AgentFileGetResponse,
@@ -93,7 +94,11 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
 
   const loadList = useCallback(async () => {
     try {
-      const r = await api.agentFiles.list(agentId);
+      // v1.81 P1 break-glass: an Admin reading someone's Personal employee.
+      const r = await withBreakGlass(
+        (token) => (token ? api.agentFiles.list(agentId, token) : api.agentFiles.list(agentId)),
+        { purpose: 'read', scope: agentId },
+      );
       // An older gateway (or an odd answer) must not crash the page.
       setList({ agent_id: agentId, files: Array.isArray(r?.files) ? r.files : [], limits: r?.limits ?? {} });
       setListError(null);
@@ -108,7 +113,10 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
       const n = ++docRequest.current;
       setDocError(null);
       try {
-        const r = await api.agentFiles.get(agentId, file);
+        const r = await withBreakGlass(
+          (token) => (token ? api.agentFiles.get(agentId, file, undefined, token) : api.agentFiles.get(agentId, file)),
+          { purpose: 'read', scope: agentId },
+        );
         const d: AgentFileGetResponse = {
           ...r,
           content: typeof r?.content === 'string' ? r.content : '',

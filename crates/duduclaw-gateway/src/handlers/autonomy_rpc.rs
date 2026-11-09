@@ -25,7 +25,10 @@ fn visible_state(mut state: PauseState, ctx: &UserContext) -> PauseState {
 fn authorize(home: &Path, ctx: &UserContext, agent: Option<&str>) -> Result<UserContext, String> {
     match agent {
         Some(id) => {
-            let live = crate::agent_files::flow::require_live_agent_access(
+            // P1g allowlist: pausing / resuming background autonomy is
+            // operational control; an Admin keeps it for another person's
+            // Personal employee and the handler audits it (F8).
+            let live = crate::agent_files::flow::require_live_management_access(
                 home,
                 ctx,
                 id,
@@ -70,6 +73,13 @@ impl MethodHandler {
             Ok(live) => live,
             Err(_) => return WsFrame::error_response("", "permission denied"),
         };
+        // v1.81 P1g (F8): pause / resume of another person's Personal
+        // employee leaves the same audit row as `agents.pause` (fail closed).
+        if let Some(agent) = agent
+            && let Err(e) = self.personal_control_audit(&live, method, agent).await
+        {
+            return WsFrame::error_response("", e);
+        }
         if method == "autonomy.resume" {
             if let Some(agent) = agent {
                 if let Err(frame) = self.deny_main_for_non_admin(&live, agent).await { return frame; }

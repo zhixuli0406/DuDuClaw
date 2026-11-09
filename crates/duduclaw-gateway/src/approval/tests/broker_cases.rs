@@ -570,3 +570,47 @@ async fn structural_payload_fields_and_context_only_values_keep_exact_authority(
     assert_eq!(rec.payload, payload);
     assert!(!rec.summary.contains("display-secret"));
 }
+
+
+#[tokio::test]
+async fn fresh_and_existing_store_reopen_and_decide() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!dir.path().join("approvals.db").exists());
+    let first = ApprovalBroker::open(dir.path()).unwrap();
+    let second = ApprovalBroker::open(dir.path()).unwrap();
+    let id = first.request("alice", "mcp_tool", "test", json!({}), 60).await.unwrap();
+    second.decide(&id, true, "dashboard:admin").await.unwrap();
+    assert_eq!(first.poll(&id).await.unwrap(), ApprovalStatus::Approved);
+    drop(first);
+    drop(second);
+
+    let first = ApprovalBroker::open(dir.path()).unwrap();
+    let second = ApprovalBroker::open(dir.path()).unwrap();
+    assert_eq!(first.poll(&id).await.unwrap(), ApprovalStatus::Approved);
+    let id = second.request("alice", "mcp_tool", "test", json!({}), 60).await.unwrap();
+    first.decide(&id, false, "dashboard:admin").await.unwrap();
+    assert_eq!(second.poll(&id).await.unwrap(), ApprovalStatus::Denied);
+}
+
+#[tokio::test]
+async fn legacy_store_migrates_and_reopens_with_approval_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = Connection::open(dir.path().join("approvals.db")).unwrap();
+    conn.execute_batch("CREATE TABLE approvals (
+        id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, action_kind TEXT NOT NULL,
+        summary TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+        decided_at TEXT, decided_by TEXT, ttl_seconds INTEGER NOT NULL DEFAULT 3600);").unwrap();
+    conn.execute("INSERT INTO approvals(id,agent_id,action_kind,summary,created_at)
+        VALUES('legacy','alice','mcp_tool','legacy approval',?1)", [Utc::now().to_rfc3339()]).unwrap();
+    drop(conn);
+
+    let first = ApprovalBroker::open(dir.path()).unwrap();
+    let second = ApprovalBroker::open(dir.path()).unwrap();
+    let id = ApprovalId::from("legacy".to_string());
+    second.decide(&id, true, "dashboard:admin").await.unwrap();
+    assert_eq!(first.poll(&id).await.unwrap(), ApprovalStatus::Approved);
+    let id = first.request("alice", "mcp_tool", "test", json!({}), 60).await.unwrap();
+    second.decide(&id, true, "dashboard:admin").await.unwrap();
+    assert_eq!(first.poll(&id).await.unwrap(), ApprovalStatus::Approved);
+}

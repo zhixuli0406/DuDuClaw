@@ -271,8 +271,15 @@ impl KeyDir {
 #[cfg(target_os = "linux")]
 fn rename_noreplace(dirfd: libc::c_int, from: &CString, to: &CString) -> libc::c_int {
     // SAFETY: valid dirfd and NUL-terminated names. tmpfs supports
-    // RENAME_NOREPLACE (Linux 3.17+).
-    unsafe { libc::renameat2(dirfd, from.as_ptr(), dirfd, to.as_ptr(), libc::RENAME_NOREPLACE) }
+    // RENAME_NOREPLACE (Linux 3.17+). Raw syscall: glibc's `renameat2`
+    // wrapper (2.28) is above the release baseline; this crate shares no
+    // dependency with `duduclaw_execution::linux_syscalls`. Returns 0 or -1
+    // with errno set, like the wrapper.
+    let rc = unsafe {
+        libc::syscall(libc::SYS_renameat2, dirfd as libc::c_long, from.as_ptr(), dirfd as libc::c_long,
+                      to.as_ptr(), libc::RENAME_NOREPLACE as libc::c_long)
+    };
+    rc as libc::c_int
 }
 
 #[cfg(target_os = "macos")]

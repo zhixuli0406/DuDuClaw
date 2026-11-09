@@ -109,6 +109,7 @@ pub(super) async fn try_operator_direct_api_tool_loop(
     user_prompt: &str,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Option<String> {
+    crate::isolation_readiness::check_execution().ok()?;
     // Phase A — MCP tool registry (fail-safe: any spawn/handshake/list
     // failure ⇒ None ⇒ caller degrades to the plain tools-less call).
     let registry = crate::claude_runner::build_mcp_tool_registry(agent_id).await?;

@@ -5,6 +5,7 @@ use super::*;
 
 impl TaskStore {
     pub fn open(home_dir: &Path) -> Result<Self, String> {
+        verify_live_io()?;
         let db_path = home_dir.join("tasks.db");
         let conn = Connection::open(&db_path).map_err(|e| format!("open task store: {e}"))?;
         // Inspect the original schema before migrations can hide lost tombstones.
@@ -17,12 +18,15 @@ impl TaskStore {
         })
     }
 
-    fn init_schema(conn: &Connection) -> Result<(), String> {
+    fn init_schema(connection: &Connection) -> Result<(), String> {
+        verify_live_io()?;
+        connection.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
+            .map_err(|e| format!("configure task store: {e}"))?;
+        verify_live_io()?;
+        let tx = connection.unchecked_transaction().map_err(|e| format!("begin task schema: {e}"))?;
+        let conn = &tx;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;
-
-             CREATE TABLE IF NOT EXISTS tasks (
+            "CREATE TABLE IF NOT EXISTS tasks (
                  id              TEXT PRIMARY KEY,
                  title           TEXT NOT NULL,
                  description     TEXT NOT NULL DEFAULT '',
@@ -109,6 +113,10 @@ impl TaskStore {
         // ── Scheduled assignments (new table only) ──
         Self::init_assign_schedule_schema(conn)?;
         Self::init_a2a_schema(conn)?;
+        // ── v1.81 P1e: link legacy goal_created rows once (no title matching) ──
+        Self::backfill_goal_creators(conn)?;
+        verify_live_io()?;
+        tx.commit().map_err(|e| format!("commit task schema: {e}"))?;
         Ok(())
     }
 
@@ -135,10 +143,8 @@ impl TaskStore {
         };
         if !existing.contains("difficulty_dispatches") {
             conn.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE task_survival_evidence ADD COLUMN difficulty_dispatches INTEGER NOT NULL DEFAULT 0 CHECK(difficulty_dispatches >= 0);
-                 UPDATE task_survival_evidence SET difficulty=NULL;
-                 COMMIT;"
+                "ALTER TABLE task_survival_evidence ADD COLUMN difficulty_dispatches INTEGER NOT NULL DEFAULT 0 CHECK(difficulty_dispatches >= 0);
+                 UPDATE task_survival_evidence SET difficulty=NULL;"
             ).map_err(|e| format!("migrate survival difficulty completeness: {e}"))?;
         }
         if !existing.contains("human_approved_iteration_id") {

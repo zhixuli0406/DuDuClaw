@@ -214,6 +214,7 @@ pub(crate) async fn handle_create_reminder(
         // bot / app ⇒ delivered through the same one.
         sender_agent: duduclaw_gateway::claude_runner::reply_sender_for(channel, chat_id),
         on_behalf_of: principal,
+        isolation_bound: false, // The append boundary stamps the verified host scope.
     };
 
     let id = reminder.id.clone();
@@ -268,6 +269,10 @@ pub(crate) async fn handle_list_reminders(params: &Value, home_dir: &Path, defau
 
     let reminders = list_reminders(home_dir, status, agent_id).await;
 
+    render_reminders(&reminders)
+}
+
+pub(crate) fn render_reminders(reminders: &[duduclaw_gateway::reminder_scheduler::Reminder]) -> Value {
     let entries: Vec<serde_json::Value> = reminders
         .iter()
         .map(|r| {

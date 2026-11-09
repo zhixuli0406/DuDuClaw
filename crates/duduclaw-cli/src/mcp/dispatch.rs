@@ -38,6 +38,34 @@ pub(crate) async fn handle_tools_call(
         }
     }
 
+    // ── v1.81 P1/P1b: never act on another person's Personal employee ──────
+    // Protected mode only. Cross-agent management / file / delegation / read
+    // tools naming another employee, `task_status` on a foreign process
+    // store and a memory `namespace` of another employee refuse when it is a
+    // Personal employee (self-targets never read users.db). Runs before any
+    // handler or isolation route, for every principal kind.
+    // P1d: an external key is judged as `external:<client id>`, never as the
+    // employee its client id may spell (`personal_wildcard.rs`).
+    let personal_protected = duduclaw_gateway::runtime_readiness::is_protected_linux();
+    let personal_acting = super::personal_wildcard::personal_acting_id(principal, default_agent);
+    let acting_for_target = personal_acting.as_str();
+    if let Some(refusal) = super::personal_wildcard::external_identity_refusal(home_dir, personal_protected, principal)
+        .or_else(|| super::personal_target::pre_dispatch_refusal(
+            home_dir, personal_protected, tool_name, &arguments,
+            acting_for_target, default_agent, &ns_ctx.write_namespace,
+        ))
+    {
+        duduclaw_security::audit::append_tool_call_denied(
+            home_dir,
+            acting_agent_id(caller_client_id, default_agent),
+            tool_name,
+            "personal_employee_target",
+            refusal,
+            None,
+        );
+        return jsonrpc_response(id, tool_error(refusal));
+    }
+
     info!(tool = %tool_name, "MCP tools/call");
 
     // Record state-changing tool calls for post-action hallucination audit.
@@ -189,12 +217,211 @@ pub(crate) async fn handle_tools_call(
 
     // Per-employee Google identity: decided from the proven employee only
     // (never a tool argument). Only built for the Google tools.
-    let google_caller = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
+    let isolated = crate::mcp_isolation::current().is_some();
+    let google_caller = if !isolated && GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
         super::google_identity_client::GoogleCaller::for_process(home_dir, caller_client_id)
     } else {
         super::google_identity_client::GoogleCaller::default()
     };
-    let result = with_background_caller(record_actor, async { Ok(match tool_name {
+    let result = with_background_caller(record_actor, async {
+        let authorized = if isolated && crate::mcp_isolation::legacy_resource_handler(tool_name) {
+            match crate::mcp_isolation::authorize_gateway_handler(home_dir, tool_name, &arguments).await {
+                Ok(call) => Some(call),
+                Err(_) => return Ok(tool_error("無法確認這次操作的資源授權，已拒絕執行。")),
+            }
+        } else {
+            if let Some(result) = crate::mcp_isolation::dispatch_resource_tool(home_dir, tool_name, &arguments).await {
+                return Ok(result);
+            }
+            None
+        };
+        let handler = GatewayHandler { id, home_dir, http, memory, default_agent, odoo, ns_ctx,
+            daily_quota, caller_client_id, caller_is_admin, wiki_agent, record_actor,
+            google_caller: &google_caller, acting_for_target, personal_protected };
+        match authorized {
+            // Do not embed both copies of the all-tools match future in this
+            // authorization branch (or the background caller's task-local scope).
+            Some(call) => Box::pin(handler.execute(call)).await,
+            None => handler.invoke(tool_name, &arguments).await,
+        }
+    }).await;
+    let result = match result {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let result = if !isolated && GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
+        google_caller.finish(home_dir, default_agent, tool_name, result).await
+    } else {
+        result
+    };
+
+    // ── Tool call audit trail (L1 anti-hallucination) ──────────
+    // External calls retain the authenticated client id. Internal delegation
+    // attribution requires the host proof bound to the verified worker.
+    // Isolated calls are attributed to their connection-bound employee.
+    if isolated && is_state_changing {
+        duduclaw_security::audit::append_tool_call_with_extras(home_dir, default_agent, tool_name,
+            "isolated resource tool", !result.get("isError").and_then(Value::as_bool).unwrap_or(false),
+            &[("transport", serde_json::json!("isolated_mcp"))]);
+    } else if is_state_changing {
+        let success = !result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let actual_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
+        let params_summary = build_params_summary(tool_name, &arguments);
+        // R4 (TraceElephant): capture the tool's INPUT arguments, not just the
+        // outcome summary — masked (secret keys/values), size-capped, and
+        // skipped for read-only tool names inside the helper. Previously
+        // `append_tool_call_with_input` had zero production callers.
+        //
+        // B3b (GroundEval evidence source): also capture the tool's RESULT
+        // text — masked/capped inside the audit helper — so the B3 grounding
+        // pre-check in `dispatch_engine.rs` has evidence to compare an
+        // agent's claim against, instead of observing `ResultTextMissing`
+        // on every row.
+        //
+        // Fix-2 C1a (2026-08 grounding self-echo audit): tools on
+        // `duduclaw_core::grounding::SELF_ECHO_TOOL_NAMES` (tasks_complete,
+        // tasks_update, ...) return a response envelope that is
+        // substantially the caller's OWN input echoed back
+        // (`task_row_to_json`'s `result_summary`/`title`/`blocked_reason`
+        // fields ARE the `summary`/`title`/`reason` arguments just
+        // supplied). Capturing that as `result_text` let the B3 grounding
+        // pre-check compare an agent's claim against its own words and
+        // trivially pass every time — and, worse, a task JSON that happened
+        // to exceed the audit char cap could truncate exactly the echoed
+        // span and flip the verdict to a false reject. Skip `result_text`
+        // capture entirely for these tools; they still get the `input` +
+        // `success` audit fields like every other state-changing tool, only
+        // the grounding-evidence field is suppressed.
+        // P2-C: workspace answers carry file paths and file content; the
+        // audit row keeps only the argument summary (no result text).
+        let result_text_for_grounding = if duduclaw_core::grounding::is_self_echo_tool(tool_name)
+            || tool_name == "credential_declare"
+            || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
+        {
+            None
+        } else {
+            audit_result_text(tool_name, &result)
+        };
+        // `computer_type`'s text never reaches the audit (F5): only its length.
+        let audit_arguments = audit_safe_arguments(tool_name, &arguments);
+        duduclaw_security::audit::append_tool_call_with_input(
+            home_dir,
+            &actual_agent,
+            tool_name,
+            &params_summary,
+            success,
+            Some(&audit_arguments),
+            result_text_for_grounding.as_deref(),
+        );
+    }
+
+    if matches!(tool_name, "google_chat_spaces" | "google_chat_messages") && !google_caller.is_dedicated() {
+        let agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
+        duduclaw_gateway::google_workspace::chat_read::audit(home_dir, &agent, tool_name, &arguments, &result);
+    }
+
+    // Read-only tools need usage evidence too. Do not retain arguments or
+    // results here; state-changing calls already have their canonical audit.
+    let pruning_success = !result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    if pruning_success {
+        let actual_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
+        let pruning_agent = if principal.is_external { caller_client_id }
+            else { acting_agent_id(caller_client_id, default_agent) };
+        if !is_state_changing || actual_agent != pruning_agent {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir, pruning_agent, tool_name, "usage", true,
+                &[("usage_only", Value::Bool(true))],
+            );
+        }
+        // The existing tools/list_changed watcher now observes this restored
+        // name immediately, without waiting for the five-minute cache TTL.
+        duduclaw_core::tool_pruning::note_success(home_dir, pruning_agent, tool_name);
+    }
+
+    // ── WP6: channel-action → dashboard live feedback ──────────
+    // Everything this subprocess persists on behalf of a channel command
+    // (a cron routine, a memory write, a synthesised skill) is invisible to
+    // the dashboard until the operator reloads — and invisible reads as
+    // broken. Raise one whitelisted `events.db` row; the gateway's existing
+    // `spawn_events_db_poll` tail pushes it to every connected dashboard,
+    // which refetches the matching page. Best-effort: never affects `result`.
+    //
+    // Feedback and audit share the same authenticated attribution.
+    let feedback_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
+    duduclaw_gateway::dashboard_feedback::emit_for_tool(
+        home_dir,
+        tool_name,
+        &arguments,
+        &result,
+        &feedback_agent,
+    )
+    .await;
+
+    // RM-130: an empty error is deliberately NOT filled in here. This reply
+    // feeds `McpDispatcher`'s egress / private-read accounting, which treats a
+    // content-less error as payload-free; the reason is added by
+    // `crate::mcp_dispatch::finalize_tool_reply` after that accounting and
+    // after redaction.
+    jsonrpc_response(id, result)
+}
+
+/// Host-owned dependencies; the isolated adapter has exactly one call input.
+struct GatewayHandler<'a> {
+    id: &'a Value,
+    home_dir: &'a Path,
+    http: &'a reqwest::Client,
+    memory: &'a SqliteMemoryEngine,
+    default_agent: &'a str,
+    odoo: &'a OdooState,
+    ns_ctx: &'a crate::mcp_namespace::NamespaceContext,
+    daily_quota: &'a crate::mcp_memory_quota::DailyQuota,
+    caller_client_id: &'a str,
+    caller_is_admin: bool,
+    wiki_agent: &'a str,
+    record_actor: RecordActor<'a>,
+    google_caller: &'a super::google_identity_client::GoogleCaller,
+    /// v1.81 P1d/P1e: who the wildcard Personal filters judge (`external:<id>`
+    /// for an external key) and whether protected mode is on — resolved once
+    /// in `handle_tools_call`, carried here so the match arms can read them.
+    acting_for_target: &'a str,
+    personal_protected: bool,
+}
+impl GatewayHandler<'_> {
+    async fn execute(&self, call: duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall) -> std::result::Result<Value, Value> {
+        let valid = crate::mcp_isolation::current().is_some_and(|current|
+            current.context.record() == call.context().record() && current.agent == self.default_agent
+            && current.home == self.home_dir && crate::mcp_isolation::legacy_resource_handler(call.name()));
+        if !valid || duduclaw_mcp_boundary::authority::now_seconds()
+            .and_then(|now| call.context().verify_live(now)).is_err() {
+            return Ok(tool_error("無法確認這次操作的資源授權，已拒絕執行。"));
+        }
+        duduclaw_mcp_boundary::io_authority::scope(call.context().clone(), async {
+            if let Some(result) = crate::mcp_isolation::collections::execute(&call).await { return Ok(result); }
+            self.invoke(call.name(), call.arguments()).await
+        }).await
+    }
+
+    async fn invoke(&self, tool_name: &str, arguments: &Value) -> std::result::Result<Value, Value> {
+        // Every tool shares the large match below. Box before any caller or
+        // task-local scope embeds it, including the ordinary/background routes.
+        Box::pin(self.invoke_inner(tool_name, arguments)).await
+    }
+
+    async fn invoke_inner(&self, tool_name: &str, arguments: &Value) -> std::result::Result<Value, Value> {
+        // A connector can never reach an ambient credential selector in isolation.
+        if crate::mcp_isolation::current().is_some()
+            && duduclaw_mcp_boundary::tool_policy::policy(tool_name)
+                .is_some_and(|p| p.route == duduclaw_mcp_boundary::tool_policy::Route::Connector) {
+            return Ok(tool_error("隔離連線服務尚未就緒。"));
+        }
+        let Self { id, home_dir, http, memory, default_agent, odoo, ns_ctx, daily_quota,
+            caller_client_id, caller_is_admin, wiki_agent, record_actor, google_caller,
+            acting_for_target, personal_protected } = *self;
+        Ok(match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
         // ── W19-P0 M1: namespace-aware memory endpoints ────────────────────
@@ -255,7 +482,7 @@ pub(crate) async fn handle_tools_call(
             crate::mcp_memory_handlers::handle_memory_get_at(&arguments, memory, ns_ctx).await
         }
         "memory_invalidate_by_origin" => {
-            let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
+            let env_agent = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).ok();
             let client_is_agent = duduclaw_core::is_valid_agent_id(caller_client_id)
                 && home_dir
                     .join("agents")
@@ -334,7 +561,8 @@ pub(crate) async fn handle_tools_call(
             )
             .await
         }
-        "list_agents" => handle_list_agents(&arguments, home_dir, default_agent).await,
+        "list_agents" => super::personal_target::list_agents_hiding(&arguments, home_dir, default_agent,
+            acting_for_target, personal_protected).await,
         "create_task" => handle_create_task(&arguments, home_dir, record_actor.id()).await,
         "check_responses" => handle_check_responses(&arguments, home_dir).await,
         "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
@@ -364,7 +592,12 @@ pub(crate) async fn handle_tools_call(
         "skill_hub_install" => {
             handle_skill_hub_install(&arguments, home_dir, default_agent, caller_is_admin).await
         }
-        "skill_curator_status" => handle_skill_curator_status(&arguments, home_dir).await,
+        // H12a / D-H4: in isolation the curator acts only on the
+        // capability-bound employee's own skills (never an argument).
+        "skill_curator_status" => match crate::mcp_isolation::current() {
+            Some(current) => handle_skill_curator_status_owned(&arguments, home_dir, &current.agent).await,
+            None => handle_skill_curator_status(&arguments, home_dir).await,
+        },
         "skill_pin" => handle_skill_pin(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir, record_actor).await,
@@ -498,7 +731,9 @@ pub(crate) async fn handle_tools_call(
         // Session tools
         "session_restore_context" => handle_session_restore_context(&arguments).await,
         // Task Board tools
-        "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent, record_actor).await,
+        // v1.81 P1d: wildcard listings leave out other Personal employees.
+        "tasks_list" => super::personal_wildcard::tasks_list(&arguments, home_dir, default_agent, record_actor,
+            acting_for_target, personal_protected).await,
         "tasks_create" => handle_tasks_create(&arguments, home_dir, record_actor).await,
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact"
         | "discovery_cancel" => {
@@ -518,14 +753,16 @@ pub(crate) async fn handle_tools_call(
         "responsibility_ask" => handle_responsibility_ask(&arguments, home_dir, record_actor).await,
         // Goal chain tools (G8)
         "goals_create" => handle_goals_create(&arguments, home_dir, record_actor.id()).await,
-        "goals_list" => handle_goals_list(&arguments, home_dir).await,
+        "goals_list" => super::personal_wildcard::goals_list(&arguments, home_dir, acting_for_target,
+            personal_protected).await,
         // Co-edited plan tools (U4)
         "plan_get" => handle_plan_get(&arguments, home_dir, default_agent).await,
         "plan_update_step" => handle_plan_update_step(&arguments, home_dir, default_agent).await,
         // Activity Feed tools
         "activity_post" => handle_activity_post(&arguments, home_dir, record_actor).await,
         "activity_list" => {
-            handle_activity_list(&arguments, home_dir, default_agent, record_actor).await
+            super::personal_wildcard::activity_list(&arguments, home_dir, default_agent, record_actor,
+                acting_for_target, personal_protected).await
         }
         // Autopilot tools
         "autopilot_list" => handle_autopilot_list(&arguments, home_dir).await,
@@ -634,8 +871,16 @@ pub(crate) async fn handle_tools_call(
         "file_read" | "csv_read" | "xlsx_read" => {
             let files_agent = acting_agent_id(caller_client_id, default_agent);
             match tool_name {
+                // H11: protected file_read opens on the blocking pool (root's
+                // work broker for `employee-work`); legacy reader unchanged.
+                "file_read" if crate::mcp_isolation::current().is_some() => {
+                    crate::mcp_files::handle_isolated_file_read(&arguments, home_dir, files_agent).await
+                }
                 "file_read" => {
                     crate::mcp_files::handle_file_read(&arguments, home_dir, files_agent)
+                }
+                "csv_read" | "xlsx_read" if crate::mcp_isolation::current().is_some() => {
+                    crate::mcp_files::handle_isolated_table_read(tool_name, &arguments, home_dir, files_agent).await
                 }
                 "csv_read" => crate::mcp_files::handle_csv_read(&arguments, home_dir, files_agent),
                 _ => crate::mcp_files::handle_xlsx_read(&arguments, home_dir, files_agent),
@@ -760,35 +1005,35 @@ pub(crate) async fn handle_tools_call(
                 .execute_dedicated(home_dir, name, &arguments)
                 .await
         }
-        "google_status" => handle_google_status(home_dir, &google_caller).await,
-        "google_chat_spaces" => handle_google_chat_spaces(&arguments, home_dir, &google_caller).await,
-        "google_chat_messages" => handle_google_chat_messages(&arguments, home_dir, &google_caller).await,
-        "gmail_search" => handle_gmail_search(&arguments, home_dir, &google_caller).await,
-        "gmail_read" => handle_gmail_read(&arguments, home_dir, &google_caller).await,
+        "google_status" => handle_google_status(home_dir, google_caller).await,
+        "google_chat_spaces" => handle_google_chat_spaces(&arguments, home_dir, google_caller).await,
+        "google_chat_messages" => handle_google_chat_messages(&arguments, home_dir, google_caller).await,
+        "gmail_search" => handle_gmail_search(&arguments, home_dir, google_caller).await,
+        "gmail_read" => handle_gmail_read(&arguments, home_dir, google_caller).await,
         "gmail_create_draft" => {
-            handle_gmail_create_draft(&arguments, home_dir, &google_caller).await
+            handle_gmail_create_draft(&arguments, home_dir, google_caller).await
         }
         "calendar_list_events" => {
-            handle_calendar_list_events(&arguments, home_dir, &google_caller).await
+            handle_calendar_list_events(&arguments, home_dir, google_caller).await
         }
         "calendar_create_event" => {
-            handle_calendar_create_event(&arguments, home_dir, &google_caller).await
+            handle_calendar_create_event(&arguments, home_dir, google_caller).await
         }
-        "sheets_read" => handle_sheets_read(&arguments, home_dir, &google_caller).await,
-        "sheets_append" => handle_sheets_append(&arguments, home_dir, &google_caller).await,
-        "forms_get" => handle_forms_get(&arguments, home_dir, &google_caller).await,
+        "sheets_read" => handle_sheets_read(&arguments, home_dir, google_caller).await,
+        "sheets_append" => handle_sheets_append(&arguments, home_dir, google_caller).await,
+        "forms_get" => handle_forms_get(&arguments, home_dir, google_caller).await,
         "forms_list_responses" => {
-            handle_forms_list_responses(&arguments, home_dir, &google_caller).await
+            handle_forms_list_responses(&arguments, home_dir, google_caller).await
         }
-        "gtasks_lists" => handle_gtasks_lists(home_dir, &google_caller).await,
-        "gtasks_list" => handle_gtasks_list(&arguments, home_dir, &google_caller).await,
-        "gtasks_create" => handle_gtasks_create(&arguments, home_dir, &google_caller).await,
-        "gtasks_complete" => handle_gtasks_complete(&arguments, home_dir, &google_caller).await,
-        "drive_search" => handle_drive_search(&arguments, home_dir, &google_caller).await,
-        "drive_read" => handle_drive_read(&arguments, home_dir, &google_caller).await,
-        "docs_read" => handle_docs_read(&arguments, home_dir, &google_caller).await,
-        "docs_append" => handle_docs_append(&arguments, home_dir, &google_caller).await,
-        "slides_read" => handle_slides_read(&arguments, home_dir, &google_caller).await,
+        "gtasks_lists" => handle_gtasks_lists(home_dir, google_caller).await,
+        "gtasks_list" => handle_gtasks_list(&arguments, home_dir, google_caller).await,
+        "gtasks_create" => handle_gtasks_create(&arguments, home_dir, google_caller).await,
+        "gtasks_complete" => handle_gtasks_complete(&arguments, home_dir, google_caller).await,
+        "drive_search" => handle_drive_search(&arguments, home_dir, google_caller).await,
+        "drive_read" => handle_drive_read(&arguments, home_dir, google_caller).await,
+        "docs_read" => handle_docs_read(&arguments, home_dir, google_caller).await,
+        "docs_append" => handle_docs_append(&arguments, home_dir, google_caller).await,
+        "slides_read" => handle_slides_read(&arguments, home_dir, google_caller).await,
         "notion_status" => handle_notion_status(home_dir).await,
         "notion_search" => handle_notion_search(&arguments, home_dir).await,
         "notion_page_read" => handle_notion_page_read(&arguments, home_dir).await,
@@ -823,122 +1068,55 @@ pub(crate) async fn handle_tools_call(
         _ => {
             return Err(jsonrpc_error(id, -32602, &format!("Unknown tool: {tool_name}")));
         }
-    }) }).await;
-    let result = match result {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-
-    let result = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
-        google_caller.finish(home_dir, default_agent, tool_name, result).await
-    } else {
-        result
-    };
-
-    // ── Tool call audit trail (L1 anti-hallucination) ──────────
-    // External calls retain the authenticated client id. Internal delegation
-    // attribution requires the host proof bound to the verified worker.
-    if is_state_changing {
-        let success = !result
-            .get("isError")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let actual_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
-        let params_summary = build_params_summary(tool_name, &arguments);
-        // R4 (TraceElephant): capture the tool's INPUT arguments, not just the
-        // outcome summary — masked (secret keys/values), size-capped, and
-        // skipped for read-only tool names inside the helper. Previously
-        // `append_tool_call_with_input` had zero production callers.
-        //
-        // B3b (GroundEval evidence source): also capture the tool's RESULT
-        // text — masked/capped inside the audit helper — so the B3 grounding
-        // pre-check in `dispatch_engine.rs` has evidence to compare an
-        // agent's claim against, instead of observing `ResultTextMissing`
-        // on every row.
-        //
-        // Fix-2 C1a (2026-08 grounding self-echo audit): tools on
-        // `duduclaw_core::grounding::SELF_ECHO_TOOL_NAMES` (tasks_complete,
-        // tasks_update, ...) return a response envelope that is
-        // substantially the caller's OWN input echoed back
-        // (`task_row_to_json`'s `result_summary`/`title`/`blocked_reason`
-        // fields ARE the `summary`/`title`/`reason` arguments just
-        // supplied). Capturing that as `result_text` let the B3 grounding
-        // pre-check compare an agent's claim against its own words and
-        // trivially pass every time — and, worse, a task JSON that happened
-        // to exceed the audit char cap could truncate exactly the echoed
-        // span and flip the verdict to a false reject. Skip `result_text`
-        // capture entirely for these tools; they still get the `input` +
-        // `success` audit fields like every other state-changing tool, only
-        // the grounding-evidence field is suppressed.
-        // P2-C: workspace answers carry file paths and file content; the
-        // audit row keeps only the argument summary (no result text).
-        let result_text_for_grounding = if duduclaw_core::grounding::is_self_echo_tool(tool_name)
-            || tool_name == "credential_declare"
-            || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
-        {
-            None
-        } else {
-            audit_result_text(tool_name, &result)
-        };
-        // `computer_type`'s text never reaches the audit (F5): only its length.
-        let audit_arguments = audit_safe_arguments(tool_name, &arguments);
-        duduclaw_security::audit::append_tool_call_with_input(
-            home_dir,
-            &actual_agent,
-            tool_name,
-            &params_summary,
-            success,
-            Some(&audit_arguments),
-            result_text_for_grounding.as_deref(),
-        );
+    })
     }
+}
 
-    if matches!(tool_name, "google_chat_spaces" | "google_chat_messages") && !google_caller.is_dedicated() {
-        let agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
-        duduclaw_gateway::google_workspace::chat_read::audit(home_dir, &agent, tool_name, &arguments, &result);
-    }
+#[cfg(test)]
+mod future_size_tests {
+    use super::*;
+    use serde_json::json;
 
-    // Read-only tools need usage evidence too. Do not retain arguments or
-    // results here; state-changing calls already have their canonical audit.
-    let pruning_success = !result.get("isError").and_then(Value::as_bool).unwrap_or(false);
-    if pruning_success {
-        let actual_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
-        let pruning_agent = if principal.is_external { caller_client_id }
-            else { acting_agent_id(caller_client_id, default_agent) };
-        if !is_state_changing || actual_agent != pruning_agent {
-            duduclaw_security::audit::append_tool_call_with_extras(
-                home_dir, pruning_agent, tool_name, "usage", true,
-                &[("usage_only", Value::Bool(true))],
-            );
+    #[test]
+    fn gateway_handler_future_sizes() {
+        let home = tempfile::tempdir().unwrap();
+        let memory = SqliteMemoryEngine::new(&home.path().join("memory.db")).unwrap();
+        let http = reqwest::Client::new();
+        let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let ns = crate::mcp_namespace::NamespaceContext { write_namespace: "main".into(), read_namespaces: vec!["main".into()] };
+        let quota = crate::mcp_memory_quota::DailyQuota::new();
+        let id = json!(1);
+        let arguments = json!({"content":"size probe"});
+        let google_caller = super::super::google_identity_client::GoogleCaller::default();
+        let handler = GatewayHandler { id: &id, home_dir: home.path(), http: &http,
+            memory: &memory, default_agent: "main", odoo: &odoo, ns_ctx: &ns,
+            daily_quota: &quota, caller_client_id: "main", caller_is_admin: false,
+            wiki_agent: "main", record_actor: RecordActor::Agent("main"), google_caller: &google_caller,
+            acting_for_target: "main", personal_protected: false };
+        // The match state machine is shared by memory_*, wiki_* and tasks_*.
+        for name in ["memory_store", "memory_search", "wiki_write", "tasks_create"] {
+            let future = handler.invoke(name, &arguments);
+            let size = std::mem::size_of_val(&future);
+            eprintln!("gateway.invoke({name}): {size} bytes");
+            assert!(size <= 1024, "{name}: {size}; keep the all-tools future boxed");
         }
-        // The existing tools/list_changed watcher now observes this restored
-        // name immediately, without waiting for the five-minute cache TTL.
-        duduclaw_core::tool_pruning::note_success(home_dir, pruning_agent, tool_name);
+        let params = json!({"name":"memory_store", "arguments":arguments});
+        let principal = audit_test_principal("main", false);
+        let sizes = [
+            ("gateway.invoke_inner", std::mem::size_of_val(&handler.invoke_inner("memory_store", &arguments)), 64 * 1024),
+            ("gateway.tools_call", std::mem::size_of_val(&handle_tools_call(&id, &params,
+                home.path(), &http, &memory, "main", &odoo, &ns, &quota, &principal, false)), 8 * 1024),
+            ("wiki.write", std::mem::size_of_val(&handle_wiki_write(&arguments, home.path(), "main")), 16 * 1024),
+            ("tasks.create", std::mem::size_of_val(&handle_tasks_create(&arguments, home.path(), RecordActor::Agent("main"))), 16 * 1024),
+            ("tasks.update", std::mem::size_of_val(&handle_tasks_update(&arguments, home.path(), RecordActor::Agent("main"))), 16 * 1024),
+        ];
+        for (name, size, limit) in sizes {
+            eprintln!("{name}: {size} bytes");
+            assert!(size <= limit, "{name}: {size} > {limit}; keep handler boundaries boxed");
+        }
+        let future = crate::mcp_memory_handlers::handle_memory_store(&arguments, &memory, &ns, &quota);
+        let size = std::mem::size_of_val(&future);
+        eprintln!("memory.store: {size} bytes");
+        assert!(size <= 16 * 1024, "memory.store: {size}; keep leaf futures bounded");
     }
-
-    // ── WP6: channel-action → dashboard live feedback ──────────
-    // Everything this subprocess persists on behalf of a channel command
-    // (a cron routine, a memory write, a synthesised skill) is invisible to
-    // the dashboard until the operator reloads — and invisible reads as
-    // broken. Raise one whitelisted `events.db` row; the gateway's existing
-    // `spawn_events_db_poll` tail pushes it to every connected dashboard,
-    // which refetches the matching page. Best-effort: never affects `result`.
-    //
-    // Feedback and audit share the same authenticated attribution.
-    let feedback_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
-    duduclaw_gateway::dashboard_feedback::emit_for_tool(
-        home_dir,
-        tool_name,
-        &arguments,
-        &result,
-        &feedback_agent,
-    )
-    .await;
-
-    // RM-130: an empty error is deliberately NOT filled in here. This reply
-    // feeds `McpDispatcher`'s egress / private-read accounting, which treats a
-    // content-less error as payload-free; the reason is added by
-    // `crate::mcp_dispatch::finalize_tool_reply` after that accounting and
-    // after redaction.
-    jsonrpc_response(id, result)
 }

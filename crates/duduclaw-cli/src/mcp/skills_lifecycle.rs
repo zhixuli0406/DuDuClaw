@@ -357,15 +357,35 @@ pub(crate) async fn handle_skill_synthesis_run(
         .get("agent_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let target_agent = if agent_id_param.is_empty() {
+    let refusal = |reason: String| serde_json::json!({
+        "content": [{"type": "text", "text": reason}], "isError": true
+    });
+    // H12c: an isolated call synthesizes only for its capability-bound
+    // employee (re-authorized here; `agent_id` may only name itself) and
+    // publishes into that employee's own SKILLS, never the global bank.
+    // H13c: the authorized call is kept; its context is the live authority
+    // every owned publication re-checks (like `install_owned`).
+    let (owned, authority) = match crate::mcp_isolation::current() {
+        Some(current) => {
+            let authorized = crate::mcp_isolation::authorize_gateway_handler(home_dir, "skill_synthesis_run", params).await;
+            let Ok(call) = authorized else {
+                return refusal("無法確認這次技能合成的員工授權，已拒絕執行。".into());
+            };
+            if call.context().record() != current.context.record()
+                || (!agent_id_param.is_empty() && agent_id_param != current.agent) {
+                return refusal("無法確認這次技能合成的員工授權，已拒絕執行。".into());
+            }
+            (Some(current.agent.clone()), Some(call.context().clone()))
+        }
+        None => (None, None),
+    };
+    let target_agent = if let Some(own) = owned.as_deref() {
+        own
+    } else if agent_id_param.is_empty() {
         actor.id()
     } else {
         agent_id_param
     };
-
-    let refusal = |reason: String| serde_json::json!({
-        "content": [{"type": "text", "text": reason}], "isError": true
-    });
     if !is_valid_agent_id(target_agent) {
         return refusal("無效的員工識別碼。".into());
     }
@@ -401,7 +421,7 @@ pub(crate) async fn handle_skill_synthesis_run(
         .unwrap_or(1);
 
     // Resolve API key: env var takes precedence over config file.
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = crate::mcp_isolation_identity::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
         .or_else(|| {
@@ -421,7 +441,7 @@ pub(crate) async fn handle_skill_synthesis_run(
         });
 
     // Point pipeline at real EvolutionEvents location.
-    let events_dir = std::env::var("EVOLUTION_EVENTS_DIR")
+    let events_dir = crate::mcp_isolation_identity::var("EVOLUTION_EVENTS_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| home_dir.join("evolution").join("events"));
 
@@ -432,10 +452,14 @@ pub(crate) async fn handle_skill_synthesis_run(
         api_key,
         home_dir: home_dir.to_path_buf(),
         target_agent_id: target_agent.to_string(),
+        owned_by: owned.clone(),
         ..Default::default()
     };
 
-    let result = run_pipeline(&config, actor.agent()).await;
+    let result = match authority {
+        Some(context) => duduclaw_mcp_boundary::io_authority::scope(context, run_pipeline(&config, actor.agent())).await,
+        None => run_pipeline(&config, actor.agent()).await,
+    };
 
     let mode = if result.dry_run { "DRY RUN" } else { "FULL" };
     let summary = result.summary();

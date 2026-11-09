@@ -1,3 +1,4 @@
+import type { ProtectedUpdateResult } from '@/lib/protected-update';
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
 import type { SkillSignatureStatus } from './api-custom-skills';
@@ -344,7 +345,40 @@ export interface DoctorCheck {
 /** Product form-factor, orthogonal to the license `edition` string. */
 export type EditionProfile = 'personal' | 'enterprise';
 
+export type IsolationComponentState = 'ready' | 'unavailable' | 'pending_integration';
+export type IsolationReasonCode = 'binding_evidence_missing' | 'connector_setup_required' |
+  'personal_binding_conflict' | 'revoked' | 'service_unavailable' |
+  'workspace_broker_unavailable' | 'helper_launcher_unavailable' | 'helper_runtime_missing' |
+  'helper_recording_unsupported';
+export interface IsolationReason {
+  code: IsolationReasonCode;
+  /** Connector provider family (only for `connector_setup_required`). */
+  provider?: string;
+  /** Fixed launcher reason code (only for `helper_launcher_unavailable`). */
+  reason?: string;
+  /** Fixed helper runtime id (only for `helper_runtime_missing`). */
+  runtime?: string;
+}
+export interface IsolationReadiness {
+  required: boolean;
+  /** Admission truth: every required component verified. */
+  ready: boolean;
+  /** Overall status over components and reasons (F3 gateways). */
+  status?: 'ready' | 'action_required' | 'service_unavailable';
+  /** Distinct reasons over all protected employees. */
+  reasons?: IsolationReason[];
+  /** Admins only: per-employee reasons. */
+  employees?: Array<{ label: string; ready: boolean; reasons: IsolationReason[] }>;
+  /** Informational host-wide reasons no protected employee's tools need now. */
+  notices?: IsolationReason[];
+  correlation_id?: string;
+  components: Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
+    'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', IsolationComponentState>;
+}
+
 export interface SystemStatus {
+  /** Protected Linux TEAM evidence; absent/null on other installations. */
+  isolation_readiness?: IsolationReadiness | null;
   mfa_policy?: import('./mfa-api').MfaPolicy;
   version: string;
   uptime_seconds: number;
@@ -6089,6 +6123,45 @@ export interface AgentGoogleIdentity {
   state: 'home' | 'none' | 'ready' | 'blocked' | 'configured' | 'needs_reconnect' | 'not_connected' | 'awaiting_consent' | 'consent_declined' | 'person_inactive' | 'no_owner' | 'ambiguous_owner';
   /** zh-TW reason when blocked. */
   message: string;
+  /** Protected mode only: the D-5 standing of a tenant-source subject (`null` elsewhere). */
+  tenant_subject?: GoogleTenantSubjectNotice | null;
+}
+/** SR4 round 3: the account an Admin attests a delegate subject belongs to. */
+export interface GoogleTenantSubjectHolder {
+  user_id: string;
+  name: string;
+  /** Account creation time (RFC 3339). */
+  created_at: string;
+  /** The account set this address as its own login email itself. */
+  email_self_set: boolean;
+}
+export interface GoogleTenantSubjectNotice {
+  state:
+    | 'service_mailbox'
+    | 'service_mailbox_conflict'
+    | 'attested_person'
+    | 'attestation_required'
+    | 'ambiguous'
+    | 'person_inactive'
+    | 'not_admissible'
+    | 'users_unavailable'
+    | 'unavailable'
+    | 'refused';
+  /** zh-TW explanation. */
+  message: string;
+  subject?: string;
+  kind?: 'delegate' | 'service_account';
+  /** Present for `attestation_required` / `attested_person`. */
+  holder?: GoogleTenantSubjectHolder;
+}
+/** `google.delegation.attest_subject` (Admin + step-up). */
+export interface GoogleAttestSubjectInput {
+  agent_id: string;
+  subject: string;
+  /** The holder shown to the Admin (`tenant_subject.holder.user_id`). */
+  user_id: string;
+  /** Required when `holder.email_self_set`. */
+  acknowledge_self_set: boolean;
 }
 export interface GoogleDelegationKeyInfo {
   client_email: string;
@@ -6115,6 +6188,124 @@ export interface GoogleIdentityTestStep {
   ok: boolean;
   detail: string;
 }
+
+// ── v1.81 F5 part A: protected-mode admin page (`pages/protected/`) ──────────
+// Wire shapes of the gateway-owned isolation RPCs
+// (`handlers/isolation_employee_rpc.rs`, `handlers/isolation_connectors_rpc.rs`).
+// Every mutation needs the five-minute dashboard step-up and the session-bound
+// CSRF token the list RPCs return (`[u8; 32]` → a JSON number array). No
+// response carries a secret, a tenant id or an email.
+export interface ProtectedStepUpState {
+  step_up_valid: boolean;
+  csrf_token: number[] | null;
+  mfa_enrolled: boolean;
+}
+export type ProtectedBinding = { type: 'personal'; owner_user_id: string } | { type: 'shared' };
+export interface ProtectedEmployee {
+  label: string;
+  /** 32 lowercase hex chars; the immutable employee id. */
+  employee_id: string;
+  binding: ProtectedBinding;
+  disabled: boolean;
+}
+export type ProtectedRequestStatus = 'pending' | 'applying' | 'applied' | 'failed' | 'rejected' | 'expired';
+export interface ProtectedEmployeeRequest {
+  request_id: string;
+  label: string;
+  display_name: string;
+  created_at: string;
+  status: ProtectedRequestStatus;
+  /** `requested`: waiting for an admin to prepare it; `proposed`: on the approval card. */
+  stage: 'requested' | 'proposed';
+  owner_user_id: string;
+}
+export interface ProtectedEmployeeList extends ProtectedStepUpState {
+  employees: ProtectedEmployee[];
+  requests: ProtectedEmployeeRequest[];
+}
+export interface ProtectedProposeInput {
+  label: string;
+  display_name?: string;
+  binding_kind: 'personal' | 'shared';
+  owner_id?: string;
+  request_id?: string;
+}
+export interface ProtectedProposeResult {
+  request_id: string;
+  revision: number;
+  label: string;
+  status: ProtectedRequestStatus;
+  approval_required: boolean;
+  agent_created?: boolean;
+}
+export interface ProtectedTombstoneResult {
+  label: string;
+  tombstoned: boolean;
+  readback_required: boolean;
+  /** `sealed` | `oversize` | `invalid` | `absent` | `pending`. */
+  seal: string;
+  routes_revoked: number;
+  pending_fences: string[];
+  runs_stopped: boolean;
+}
+export type ProtectedConnectorKind = 'personal' | 'shared_tenant' | 'shared_home';
+export interface ProtectedConnectorRoute {
+  account: string;
+  label: string;
+  provider: string;
+  kind: ProtectedConnectorKind;
+  binding: ProtectedBinding;
+  generation: number;
+  active: boolean;
+}
+export interface ProtectedConnectorList extends ProtectedStepUpState {
+  routes: ProtectedConnectorRoute[];
+  next: string | null;
+}
+/** Reference-only details: there is no field for a token, password or URL. */
+export interface ProtectedConnectorDetails {
+  employee: string;
+  source?: string;
+  credential?: string;
+  channel?: string;
+  scope?: string;
+  status_label?: string;
+  token_ref?: 'none' | 'home' | 'agent';
+  extra_id?: string;
+}
+export interface ProtectedConnectorProvisionInput {
+  provider: string;
+  kind: ProtectedConnectorKind;
+  binding: 'personal' | 'shared';
+  owner_user_id?: string;
+  label: string;
+  details?: ProtectedConnectorDetails;
+}
+export interface ProtectedImportResult {
+  staged: number;
+  unchanged: number;
+  closed: number;
+  unproven_personal: number;
+  approval_required: boolean;
+}
+/** The tenant-source part of `google.delegation.get` (E4 settings included). */
+export interface ProtectedTenantSourceView {
+  key: GoogleDelegationKeyInfo | null;
+  key_error: string | null;
+  settings: { service_mailboxes?: string[]; tenant_scopes?: string[] } | null;
+  settings_error: string | null;
+  home_subject: string | null;
+  required_scopes: string[];
+  /** Per-employee identity rows (`tenant_subject` names who needs an Admin confirmation). */
+  agents?: AgentGoogleIdentity[];
+}
+/** `website_credentials.list` metadata; the list never carries the password. */
+export interface ProtectedWebsiteCredential {
+  id: string;
+  label: string;
+  allowed_agents: string[];
+}
+// ── end v1.81 F5 part A types ────────────────────────────────────────────────
 export interface GoogleIdentitySetInput {
   agent_id: string;
   /** `home`, `none` or `delegate:<email>`. */
@@ -7137,11 +7328,13 @@ export const api = {
      *  employee's next draft can address why. Sent whenever non-empty
      *  regardless of the decision; the gateway is the authority on whether a
      *  given decision path persists it. */
-    decide: (mail_id: string, approve: boolean, note?: string) =>
+    decide: (mail_id: string, approve: boolean, note?: string, stepUpCsrf?: number[]) =>
       client.call('mail.decide', {
         mail_id,
         approve,
         ...(note && note.trim() ? { note: note.trim() } : {}),
+        // v1.81 P1 break-glass (`lib/break-glass.ts`).
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{
         ok: boolean;
         mail_id: string;
@@ -7436,10 +7629,12 @@ export const api = {
         query,
         limit,
       }) as Promise<{ entries: MemoryEntry[]; signals?: MemoryEntry[] }>,
-    browse: (agentId: string, limit = 20) =>
+    browse: (agentId: string, limit = 20, stepUpCsrf?: number[]) =>
       client.call('memory.browse', {
         agent_id: agentId,
         limit,
+        // v1.81 P1 break-glass (`lib/break-glass.ts`).
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{ entries: MemoryEntry[]; signals?: MemoryEntry[] }>,
     keyFacts: (agentId: string, limit = 50) =>
       client.call('memory.key_facts', {
@@ -7938,7 +8133,7 @@ export const api = {
          *   version is real, but nothing here can install it, so the install
          *   button must not be offered.
          */
-        update_channel?: 'control_plane' | 'github' | 'none';
+        update_channel?: 'control_plane' | 'github' | 'none' | 'protected';
         /**
          * True when this gateway is running inside a container (`/.dockerenv`
          * or `DUDUCLAW_IN_CONTAINER`). The image is immutable — an in-process
@@ -7976,13 +8171,17 @@ export const api = {
      * worked on retry" field report. 10 minutes covers the worst legitimate
      * case; the gateway's own timeouts still bound it from the other side.
      */
-    applyUpdate: () =>
-      client.call('system.apply_update', {}, false, 600000) as Promise<{
+    applyUpdate: (requestId?: string) =>
+      client.call('system.apply_update', requestId ? { request_id: requestId } : {}, false, 600000) as Promise<{
         success: boolean;
         message: string;
         needs_restart: boolean;
         restart_hint?: string | null;
+        protected_request_id?: string;
+        protected_state?: ProtectedUpdateResult['protected_state'];
       }>,
+    protectedUpdateStatus: (requestId: string) =>
+      client.call('system.protected_update_status', { request_id: requestId }) as Promise<ProtectedUpdateResult>,
     /**
      * Restart onto the binary already on disk (`restart_pending_version`).
      * Refused unless that version differs from the running one, and on
@@ -8265,12 +8464,15 @@ export const api = {
         approvals: ApprovalItem[];
         count: number;
       }>,
-    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string) =>
+    /** `stepUpCsrf` (v1.81 P1 break-glass): an Admin deciding a Personal
+     *  employee's card they do not own — see `lib/break-glass.ts`. */
+    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string, stepUpCsrf?: number[]) =>
       client.call('approvals.decide', {
         id,
         approve,
         ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
         ...(reason ? { reason } : {}),
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{
         id: string;
         decided: 'approved' | 'denied';
@@ -9069,13 +9271,18 @@ export const api = {
    *  INSTRUCTIONS / CONTRACT; agent.toml read-only). Wire types live in
    *  `./agent-files-types`. */
   agentFiles: {
-    list: (agentId: string) =>
-      client.call('agent_files.list', { agent_id: agentId }) as Promise<AgentFileListResponse>,
-    get: (agentId: string, file: AgentFileKey, versionId?: string) =>
+    /** `stepUpCsrf` on list / get / save: v1.81 P1 break-glass (`lib/break-glass.ts`). */
+    list: (agentId: string, stepUpCsrf?: number[]) =>
+      client.call('agent_files.list', {
+        agent_id: agentId,
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
+      }) as Promise<AgentFileListResponse>,
+    get: (agentId: string, file: AgentFileKey, versionId?: string, stepUpCsrf?: number[]) =>
       client.call('agent_files.get', {
         agent_id: agentId,
         file,
         ...(versionId ? { version_id: versionId } : {}),
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<AgentFileGetResponse>,
     /** The generated CLI context files (read-only). */
     runtimeFiles: (agentId: string) =>
@@ -9090,8 +9297,11 @@ export const api = {
       client.call('agent_files.diff', { agent_id: agentId, file, ...source }) as Promise<AgentFileDiffResponse>,
     history: (agentId: string, file: AgentFileKey) =>
       client.call('agent_files.history', { agent_id: agentId, file }) as Promise<AgentFileHistoryResponse>,
-    save: (params: AgentFileSaveParams) =>
-      client.call('agent_files.save', { ...params }) as Promise<AgentFileSaveResponse>,
+    save: (params: AgentFileSaveParams, stepUpCsrf?: number[]) =>
+      client.call('agent_files.save', {
+        ...params,
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
+      }) as Promise<AgentFileSaveResponse>,
     rollback: (
       params: { agent_id: string; file: AgentFileKey; version_id: string; base_hash: string } & Omit<
         ContractReviewFollowUp,
@@ -9699,4 +9909,56 @@ export const api = {
         ssid: string;
       }>,
   },
+  // ── v1.81 F5 part A: protected-mode admin page (Admin + current MFA). ──
+  // Mutations take the CSRF token of the step-up proof; the server re-checks
+  // Admin, the five-minute window and the token on every call.
+  protectedMode: {
+    /** Same proof as `migration.confirmations.step_up`; valid on both pages. */
+    stepUp: (password: string, code: string) =>
+      client.call('isolation.connector_step_up', { password, code }) as Promise<{ verified: boolean }>,
+    employeeList: () =>
+      client.call('isolation.employee_list', {}) as Promise<ProtectedEmployeeList>,
+    propose: (input: ProtectedProposeInput, csrf: number[]) =>
+      client.call('isolation.employee_propose', { ...input, csrf_token: csrf }) as Promise<ProtectedProposeResult>,
+    tombstone: (label: string, employeeId: string, csrf: number[]) =>
+      client.call('isolation.employee_tombstone', { label, employee_id: employeeId, csrf_token: csrf }) as Promise<ProtectedTombstoneResult>,
+    purgeRequests: (csrf: number[]) =>
+      client.call('isolation.employee_purge_requests', { csrf_token: csrf }) as Promise<{ purged: number; index_rows_removed: number }>,
+    connectorList: (after?: string) =>
+      client.call('isolation.connector_list', after ? { after } : {}) as Promise<ProtectedConnectorList>,
+    provision: (input: ProtectedConnectorProvisionInput, csrf: number[]) =>
+      client.call('isolation.connector_provision', { ...input, csrf_token: csrf }) as Promise<{
+        account: string;
+        details: boolean;
+        readback_required: boolean;
+      }>,
+    revoke: (account: string, csrf: number[]) =>
+      client.call('isolation.connector_revoke', { account, csrf_token: csrf }) as Promise<{
+        account: string;
+        active: boolean;
+        readback_required: boolean;
+      }>,
+    importLegacy: (csrf: number[]) =>
+      client.call('isolation.connector_import_legacy', { csrf_token: csrf }) as Promise<ProtectedImportResult>,
+    tenantSource: () =>
+      client.call('google.delegation.get') as Promise<ProtectedTenantSourceView>,
+    attestSubject: (input: GoogleAttestSubjectInput, csrf: number[]) =>
+      client.call('google.delegation.attest_subject', { ...input, csrf_token: csrf }) as Promise<{
+        agent_id: string;
+        subject: string;
+        user_id: string;
+        attested_at: string;
+        email_self_set: boolean;
+        acknowledged_self_set: boolean;
+        attestation: string;
+      }>,
+    revokeAttestation: (agentId: string, csrf: number[]) =>
+      client.call('google.delegation.revoke_attestation', { agent_id: agentId, csrf_token: csrf }) as Promise<{
+        agent_id: string;
+        revoked: boolean;
+      }>,
+    websiteCredentials: () =>
+      client.call('website_credentials.list', {}) as Promise<{ credentials: ProtectedWebsiteCredential[] }>,
+  },
+  // ── end v1.81 F5 part A ──
 };

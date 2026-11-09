@@ -344,7 +344,7 @@ impl MistakeNotebook {
 
     fn open_conn(&self) -> Result<Connection, String> {
         let conn = Connection::open(&self.db_path).map_err(|e| format!("SQLite open: {e}"))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("SQLite pragma: {e}"))?;
         Ok(conn)
     }

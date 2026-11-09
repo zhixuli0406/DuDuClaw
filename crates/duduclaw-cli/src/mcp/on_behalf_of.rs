@@ -12,7 +12,7 @@ use super::*;
 /// The principal from the host env, validated. A malformed value is audited
 /// once per process as `on_behalf_of_rejected` and carried as Unknown.
 pub(crate) fn host_on_behalf_of(home_dir: &Path, caller: &str) -> Option<String> {
-    let principal = duduclaw_core::host_principal_checked();
+    let principal = crate::mcp_isolation_identity::host_principal_checked();
     if let Err(rejection) = &principal {
         audit_rejection_once(home_dir, caller, rejection);
     }
@@ -52,7 +52,7 @@ pub(crate) async fn check_human_principal(
     policy: duduclaw_core::DelegationPolicy,
 ) -> std::result::Result<(), String> {
     let mode = duduclaw_core::HumanPrincipalMode::from_home(home_dir);
-    let principal = duduclaw_core::host_principal_checked();
+    let principal = crate::mcp_isolation_identity::host_principal_checked();
     if let Err(rejection) = &principal {
         audit_rejection_once(home_dir, sender, rejection);
     }
@@ -111,7 +111,7 @@ pub(crate) async fn check_human_principal(
 /// Machine operations always require the gateway's live host-context check,
 /// even when delegation permission tracking is configured as record-only.
 pub(crate) async fn check_system_operation_principal(home: &Path, agent: &str) -> bool {
-    let Ok(principal) = duduclaw_core::host_principal_checked() else { return false; };
+    let Ok(principal) = crate::mcp_isolation_identity::host_principal_checked() else { return false; };
     authority_check(home, agent, agent, "system_operation", principal.as_ref()).await
 }
 
@@ -124,7 +124,7 @@ async fn authority_check(
     operation: &str,
     principal: Option<&duduclaw_core::HumanPrincipal>,
 ) -> bool {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let env = |k: &str| crate::mcp_isolation_identity::var(k).ok().filter(|v| !v.is_empty());
     let Some(context) = env(duduclaw_gateway::on_behalf_of::context::ENV_CONTEXT) else {
         return false;
     };

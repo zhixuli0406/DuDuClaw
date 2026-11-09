@@ -50,6 +50,7 @@ pub mod org;
 pub mod org_change;
 pub mod org_field_guard;
 pub mod org_store;
+pub mod isolation_policy;
 pub mod pack;
 pub mod publishers;
 pub mod platform;
@@ -84,6 +85,10 @@ pub mod toml_merge;
 pub mod traits;
 pub mod types;
 pub mod zh_variant;
+/// Raw-syscall helpers for glibc wrappers newer than the Linux release
+/// toolchain's glibc (`memfd_create`, `statx`, `renameat2`, `getrandom`).
+#[cfg(target_os = "linux")]
+pub use duduclaw_execution::linux_syscalls;
 
 pub use agent_guard::{
     check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES, INSTRUCTIONS_FILE,
@@ -132,7 +137,8 @@ pub use grounding::{
     SELF_ECHO_TOOL_NAMES, ToolEvidence,
 };
 pub use identity_token::{
-    agent_identity_env_vars, agent_identity_env_vars_default, ensure_key as ensure_identity_key,
+    agent_identity_env_vars, agent_identity_env_vars_default, current_agent_token,
+    ensure_key as ensure_identity_key, verify_agent_token,
     identity_key_path, internal_request_signature, load_key as load_identity_key,
     mint_token as mint_identity_token, verify_internal_request_signature,
     verify_claim as verify_identity_claim, verify_env_identity, verify_token as verify_identity_token,
@@ -1511,6 +1517,10 @@ pub mod egress_guard;
 
 /// Cancellation-safe ownership of spawned process trees.
 pub mod process_tree;
+pub mod execution_gate;
+pub mod execution_blocking;
+/// SR5 round 3 N3: the one durable native-Linux protected-mode latch.
+pub mod protected_mode;
 
 pub mod mcp_tool_defs;
 

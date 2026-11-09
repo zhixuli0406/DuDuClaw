@@ -159,6 +159,9 @@ pub fn start_agent_dispatcher_with_crypto(
 
             // Poll SQLite message queue (new path)
             if let Some(ref mq) = message_queue {
+                // H13b: protected `spawn_ephemeral` children whose parent run
+                // has exited are enqueued first, so this poll starts them.
+                crate::isolation_ephemeral_start::start_released(&home_dir, mq).await;
                 if let Err(e) = poll_and_dispatch_sqlite(
                     mq,
                     &home_dir,
@@ -287,6 +290,120 @@ async fn park_paused_goal_after_turn(
     Ok(())
 }
 
+/// Waiting for the stored approval must not consume a dispatch retry or poll
+/// the model future. Existing autonomy deferral retains the queued record.
+async fn pending_isolation_approval<F: std::future::Future<Output = Result<String, DispatchError>>>(
+    future: F) -> Result<String, DispatchError> {
+    if crate::isolation_background::approval_pending() {
+        return Err(DispatchError::AutonomyPaused("背景工作正在等候管理員核准。".into()));
+    }
+    // A scope that holds no authority and knows why (a task reassigned to
+    // another employee or deleted, a Personal employee, a pre-v1.81 receipt)
+    // records that reason instead of failing later at the protected launch.
+    if let Some(reason) = crate::isolation_background::refusal_reason() {
+        return Err(DispatchError::Other(reason.into()));
+    }
+    future.await
+}
+
+/// Resolve system wakes to the current task contract; employee markers never
+/// choose a task approval. Delegations stay bound to their exact message.
+async fn isolated_queue_scope<F: std::future::Future<Output = Result<String, DispatchError>>>(home: &Path,
+    message: &crate::message_queue::QueueMessage, future: F) -> Result<String, DispatchError> {
+    if !duduclaw_core::execution_gate::isolation_required() { return future.await; }
+    let task_id = if message.sender == crate::responsibility::GOAL_LOOP_SENDER {
+        extract_goal_loop_task_id(&message.payload)
+    } else if message.sender == "heartbeat-scheduler" {
+        extract_heartbeat_task_id(&message.payload)
+    } else { None };
+    if let Some(task_id) = task_id {
+        let row = match crate::task_store::TaskStore::open(home) {
+            Ok(store) => store.get_task(task_id).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let row = row.filter(|row| row.assigned_to == message.target
+            && row.on_behalf_of == message.on_behalf_of);
+        let material = row.as_ref().map(crate::isolation_background::material::task)
+            .unwrap_or(serde_json::Value::Null);
+        return crate::isolation_background::scope_record(home, "task", task_id,
+            &message.target, row.as_ref().and_then(|row| row.on_behalf_of.as_deref()),
+            &material, pending_isolation_approval(future)).await;
+    }
+    let material = crate::isolation_background::material::delegation(
+        &message.sender, &message.target, &message.payload, message.turn_id.as_deref(),
+        message.session_id.as_deref(), message.lane.as_deref(),
+        u8::try_from(message.delegation_depth).unwrap_or(u8::MAX), message.origin_agent.as_deref(),
+        message.reply_channel.as_deref(), message.sender_agent.as_deref(), message.upstream_unknown, 0, false,
+        message.on_behalf_of.as_deref());
+    crate::isolation_background::scope_record(home, "delegation", &message.id,
+        &message.target, message.on_behalf_of.as_deref(), &material, pending_isolation_approval(future)).await
+}
+
+/// v1.81 P1g: [`crate::personal_visibility::fire_time_refusal`] for one
+/// queue row (principal = `on_behalf_of`; acting = the sending employee).
+/// Protected mode only; the users.db read runs on the blocking pool.
+pub(crate) async fn fire_time_personal_refusal(
+    home: &Path,
+    msg: &crate::message_queue::QueueMessage,
+) -> Option<&'static str> {
+    if !crate::runtime_readiness::is_protected_linux() {
+        return None;
+    }
+    let (home, target) = (home.to_path_buf(), msg.target.clone());
+    let principal = msg.on_behalf_of.clone();
+    let acting = msg.sender_agent.clone().or_else(|| Some(msg.sender.clone()));
+    tokio::task::spawn_blocking(move || {
+        crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], acting.as_deref(), &target)
+    })
+    .await
+    .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+}
+
+/// v1.81 P1g: the JSONL rail's fire-time check (principal `on_behalf_of`,
+/// acting = the sending employee).
+async fn bus_fire_time_refusal(home: &Path, msg: &BusMessage) -> Option<&'static str> {
+    if !crate::runtime_readiness::is_protected_linux() {
+        return None;
+    }
+    let (home, msg) = (home.to_path_buf(), msg.clone());
+    tokio::task::spawn_blocking(move || bus_fire_refusal_in(&home, true, &msg))
+        .await
+        .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+}
+
+/// [`bus_fire_time_refusal`] without the process flag (tests). P1h (N4): the
+/// row's `sender_agent` / `origin_agent` are only consulted when it records
+/// no `on_behalf_of` — a forged line naming the target as its own sender
+/// cannot launder a non-owner principal.
+fn bus_fire_refusal_in(home: &Path, protected: bool, msg: &BusMessage) -> Option<&'static str> {
+    let acting = msg.sender_agent.as_deref().or(msg.origin_agent.as_deref());
+    crate::personal_visibility::fire_time_refusal(home, protected, &[msg.on_behalf_of.as_deref()], acting, &msg.agent_id)
+}
+
+/// v1.81 P1g: the `agent_response` that answers a refused JSONL row.
+fn bus_refusal_response(msg: &BusMessage, notice: String) -> BusMessage {
+    BusMessage {
+        msg_type: "agent_response".to_string(),
+        message_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: msg.agent_id.clone(),
+        payload: notice,
+        timestamp: Utc::now().to_rfc3339(),
+        response: None,
+        in_reply_to: Some(msg.message_id.clone()),
+        delegation_depth: msg.delegation_depth,
+        hop_depth: msg.hop_depth,
+        origin_agent: msg.origin_agent.clone(),
+        sender_agent: Some(msg.agent_id.clone()),
+        coalesced_ids: vec![],
+        turn_id: msg.turn_id.clone(),
+        session_id: msg.session_id.clone(),
+        upstream_unknown: false,
+        spawned: false,
+        lane: None,
+        on_behalf_of: msg.on_behalf_of.clone(),
+    }
+}
+
 /// Poll the SQLite message queue for pending messages and dispatch them.
 pub(crate) async fn poll_and_dispatch_sqlite(
     queue: &Arc<crate::message_queue::MessageQueue>,
@@ -347,6 +464,18 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         }
         // ACK immediately to prevent double-pickup
         if !queue.claim_pending(&msg.id).await? {
+            continue;
+        }
+        // ── v1.81 P1g fire-time check ─────────────────────────────────────
+        // Every queued job (delegation, goal round, heartbeat wake-up,
+        // autopilot / assign-schedule / workflow handoff, task dispatch)
+        // re-checks the CURRENT Personal ownership of its target before it
+        // runs, so rows queued before the upgrade or before an ownership
+        // change cannot make another person's Personal employee work.
+        if let Some(reason) = fire_time_personal_refusal(home_dir, &msg).await {
+            warn!(msg_id = %msg.id, "SQLite queue: Personal employee job refused at fire time");
+            queue.fail(&msg.id, reason).await?;
+            forward_delegation_response(home_dir, &msg.id, reason, &msg.target).await;
             continue;
         }
         // Workflow queue rows are authorized by the server-owned handoff outbox,
@@ -569,6 +698,10 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             "message_queue",
         );
         let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
+        // Boxed: the isolation record scope holds the task-store lookup, the
+        // task row and the record verification frames beside the inner
+        // dispatch future; inline they dominate this poll frame.
+        let dispatch_fut = Box::pin(isolated_queue_scope(home_dir, &msg, dispatch_fut));
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes
@@ -652,6 +785,12 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             continue;
         }
         let dispatch_fut = cancellable_dispatch(downstream.as_ref(), dispatch_fut);
+        let class = if msg.sender == crate::responsibility::HEARTBEAT_SENDER {
+            duduclaw_core::execution_gate::ExecutionClass::Heartbeat
+        } else {
+            duduclaw_core::execution_gate::ExecutionClass::Dispatch
+        };
+        let dispatch_fut = crate::process_group::with_class(class, dispatch_fut);
         let result = match (native_collector.clone().zip(goal_attr), msg.reply_channel.clone()) {
             (Some((collector, attr)), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -1110,6 +1249,14 @@ async fn poll_and_dispatch(
                             "Failed to serialize delegation depth-exceeded error response"
                         ),
                     }
+                } else if let Some(reason) = bus_fire_time_refusal(home_dir, &msg).await {
+                    // v1.81 P1g: fire-time Personal ownership check (same rule
+                    // as the SQLite rail); consumed with a readable refusal.
+                    consumed_without_dispatch += 1;
+                    match serde_json::to_string(&bus_refusal_response(&msg, reason.to_string())) {
+                        Ok(json) => synthetic_responses.push(json),
+                        Err(e) => warn!(id = %msg.message_id, error = %e, "Failed to serialize Personal refusal"),
+                    }
                 } else {
                     // ── WP21 C1: department × rank isolation ──────────────
                     // The real choke point. Anything that can append a line
@@ -1195,7 +1342,10 @@ async fn poll_and_dispatch(
     // and callback identities rather than re-enqueuing a coalesced prompt.
     let mut deferred_messages: std::collections::HashMap<_, _> = to_dispatch.iter()
         .map(|message| (message.message_id.clone(), message.clone())).collect();
-    let to_dispatch = coalesce_messages(to_dispatch);
+    // A protected queue authority binds the exact message, not a merged prompt.
+    let to_dispatch = if duduclaw_core::execution_gate::isolation_required() {
+        to_dispatch
+    } else { coalesce_messages(to_dispatch) };
 
     info!(
         count = to_dispatch.len(),
@@ -1371,6 +1521,14 @@ async fn poll_and_dispatch(
                 "bus_queue",
             );
             let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
+            let material = crate::isolation_background::material::delegation(
+                msg.sender_agent.as_deref().unwrap_or(""), &msg.agent_id, &msg.payload,
+                msg.turn_id.as_deref(), msg.session_id.as_deref(), msg.lane.as_deref(),
+                msg.delegation_depth, msg.origin_agent.as_deref(), None, msg.sender_agent.as_deref(),
+                msg.upstream_unknown, msg.hop_depth, msg.spawned, msg.on_behalf_of.as_deref());
+            let dispatch_fut = crate::isolation_background::scope_record(
+                &home, "delegation", &msg.message_id, &msg.agent_id,
+                msg.on_behalf_of.as_deref(), &material, pending_isolation_approval(dispatch_fut));
             // The delegation's lane (written by a run in the explore lane,
             // `spawn_agent` / `spawn_ephemeral`): the receiving run stays
             // read-only too, or is refused when the employee cannot carry
@@ -1819,11 +1977,13 @@ async fn dispatch_to_agent_outcome(
         // same dispatch flow.
         if crate::ephemeral::is_ephemeral_id(agent_id) {
             let env_map = delegation.to_env_map();
+            // Boxed: the ephemeral loader holds a full LoadedAgent across the
+            // runtime await; inline it would dominate this dispatch frame.
             return crate::claude_runner::DELEGATION_ENV
                 .scope(
                     env_map,
                     crate::credential_ledger::DISPATCH_SCANNED.scope(true,
-                        crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt)),
+                        Box::pin(crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt))),
                 )
                 .await
                 .map_err(DispatchError::from_string);
@@ -1851,7 +2011,7 @@ async fn dispatch_to_agent_outcome(
                 if use_sandbox {
                     info!(agent = agent_id, "Dispatching via task sandbox");
                     // The sandbox start transport owns the admission lease.
-                    let sandbox_result = dispatch_sandboxed(home_dir, registry, agent_id, prompt).await;
+                    let sandbox_result = Box::pin(dispatch_sandboxed(home_dir, registry, agent_id, prompt)).await;
                     match sandbox_result {
                         crate::task_sandbox::SandboxDispatch::Completed(result) => {
                             return result.map_err(DispatchError::from_sandbox);
@@ -2120,6 +2280,26 @@ async fn dispatch_taskspec_inner(
                 return Err(notice);
             }
         }
+        // v1.81 P1g: fire-time Personal ownership check of the step's
+        // employee (owner principal, or the plan's own / same-owner employee).
+        if crate::runtime_readiness::is_protected_linux() {
+            let (home, target, acting) = (home_dir.to_path_buf(), target_agent.clone(), spec.agent_id.clone());
+            let principal = crate::on_behalf_of::current();
+            let refusal = tokio::task::spawn_blocking(move || {
+                crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], Some(&acting), &target)
+            })
+            .await
+            .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE));
+            if let Some(reason) = refusal {
+                warn!(task = %spec.task_id, step = step_index, "TaskSpec step refused: Personal employee");
+                if let Some(s) = spec.steps.get_mut(step_index) {
+                    s.status = StepStatus::Failed;
+                }
+                spec.status = TaskStatus::Failed;
+                spec.save(agent_dir).ok();
+                return Err(reason.to_string());
+            }
+        }
 
         // Build prompt with prior step context
         let prompt = match build_step_prompt(spec, step_index) {
@@ -2142,10 +2322,13 @@ async fn dispatch_taskspec_inner(
             hop_depth: 0,
         };
         crate::responsibility::test_hooks::pause_point("autonomy_taskspec_handoff", &spec.task_id).await;
+        let authority_id = format!("{}:{}:step:{step_index}", spec.agent_id, spec.task_id);
+        let material = crate::isolation_background::material::task_spec(spec, step_index);
         let result = match check_autonomous_dispatch(home_dir, registry, &spec.agent_id).await {
-            Ok(()) => dispatch_to_agent_outcome(
+            Ok(()) => crate::isolation_background::scope_record(home_dir, "task_spec", &authority_id,
+                &target_agent, spec.on_behalf_of.as_deref(), &material, pending_isolation_approval(dispatch_to_agent_outcome(
                 home_dir, registry, &target_agent, &prompt, &delegation, None,
-            ).await,
+            ))).await,
             Err(reason) => Err(DispatchError::AutonomyPaused(reason)),
         };
 
@@ -2528,7 +2711,7 @@ async fn cleanup_stale_delegation_callbacks(home_dir: &Path) {
     let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let result = tokio::task::spawn_blocking(move || {
         let conn = rusqlite::Connection::open(&db_path).ok()?;
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
         conn.execute(
             "DELETE FROM delegation_callbacks WHERE created_at < ?1",
             rusqlite::params![cutoff],
@@ -2911,7 +3094,7 @@ pub(crate) async fn forward_delegation_response(
             Ok(c) => c,
             Err(_) => return None,
         };
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
         // B11 column; a table created by an older writer may lack it, and a
         // RETURNING over a missing column would drop the forward. "Duplicate
         // column" is the expected error once it exists.
@@ -3052,7 +3235,7 @@ pub(crate) async fn forward_delegation_response(
                 let now = chrono::Utc::now().to_rfc3339();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+                        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
                         let _ = conn.execute(
                             "INSERT OR IGNORE INTO delegation_callbacks \
                              (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at, sender_agent) \
@@ -3271,7 +3454,7 @@ async fn append_subagent_reply_to_parent_session_with(
     let result = tokio::task::spawn_blocking(move || -> Result<Option<(String, bool)>, String> {
         let conn =
             rusqlite::Connection::open(&db_path).map_err(|e| format!("open sessions.db: {e}"))?;
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
         let now = chrono::Utc::now().to_rfc3339();
 
         // Try each candidate session_id in order. Accept a session whose
@@ -6369,3 +6552,46 @@ mod dispatch_stack_tests;
 #[cfg(test)]
 #[path = "dispatcher_main_agent_tests.rs"]
 mod main_agent_tests;
+
+#[cfg(all(test, unix))]
+mod p1h_bus_fire_tests {
+    use super::{BusMessage, bus_fire_refusal_in};
+    use crate::personal_visibility::tests::{PERSONAL, SHARED, home};
+    use crate::personal_visibility::PERSONAL_FIRE_REFUSED;
+
+    fn line(on_behalf_of: Option<&str>, sender: Option<&str>, origin: Option<&str>) -> BusMessage {
+        let mut value = serde_json::json!({"type": "agent_message", "message_id": "m-p1h", "agent_id": PERSONAL,
+            "payload": "do the thing", "timestamp": "2026-11-09T00:00:00Z"});
+        for (key, field) in [("on_behalf_of", on_behalf_of), ("sender_agent", sender), ("origin_agent", origin)] {
+            if let Some(field) = field {
+                value[key] = serde_json::json!(field);
+            }
+        }
+        // Round-trip through the JSONL text form, exactly as the rail reads it.
+        serde_json::from_str(&value.to_string()).unwrap()
+    }
+
+    /// N4: a forged `bus_queue.jsonl` line that names the Personal employee as
+    /// its own sender (or origin) must not launder a recorded non-owner
+    /// principal through the "acting employee" exception.
+    #[test]
+    fn p1h_forged_bus_line_with_non_owner_principal_is_refused() {
+        let h = home();
+        let admin = format!("user:{}", h.admin);
+        let owner = format!("user:{}", h.alice);
+        let refusal = |msg: &BusMessage| bus_fire_refusal_in(h.path(), true, msg);
+        for forged in [line(Some(&admin), Some(PERSONAL), None), line(Some(&admin), None, Some(PERSONAL)),
+            line(Some("unmapped:line:abc"), Some(PERSONAL), None), line(Some("system"), Some(PERSONAL), None)] {
+            assert_eq!(refusal(&forged), Some(PERSONAL_FIRE_REFUSED), "{:?}", forged.on_behalf_of);
+        }
+        // The owner's own principal passes, with or without a sender.
+        assert_eq!(refusal(&line(Some(&owner), Some(SHARED), None)), None);
+        assert_eq!(refusal(&line(Some(&owner), None, None)), None);
+        // No principal recorded: the acting employee decides (itself passes,
+        // another employee does not).
+        assert_eq!(refusal(&line(None, Some(PERSONAL), None)), None);
+        assert_eq!(refusal(&line(None, Some(SHARED), None)), Some(PERSONAL_FIRE_REFUSED));
+        // Unprotected installs are unchanged.
+        assert_eq!(bus_fire_refusal_in(h.path(), false, &line(Some(&admin), Some(PERSONAL), None)), None);
+    }
+}

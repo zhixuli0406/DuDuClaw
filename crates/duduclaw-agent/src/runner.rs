@@ -463,20 +463,12 @@ where
     ))
 }
 
-/// Spawn `claude` CLI with `--output-format stream-json` and display progress.
-async fn call_claude_streaming(
-    system_prompt: &str,
-    prompt: &str,
-    model: &str,
+fn streaming_command(
+    claude: &str, system_prompt: &str, prompt: &str, model: &str,
     env_vars: &std::collections::HashMap<String, String>,
     capabilities: &duduclaw_core::types::CapabilitiesConfig,
-) -> std::result::Result<CliResponse, String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let claude = duduclaw_core::which_claude()
-        .ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
-
-    let mut cmd = duduclaw_core::platform::async_command_for(&claude);
+) -> (tokio::process::Command, Option<tempfile::TempPath>) {
+    let mut cmd = duduclaw_core::platform::async_command_for(claude);
     duduclaw_core::ns_guard::guard_command(&mut cmd);
     cmd.args([
         "-p",
@@ -509,7 +501,7 @@ async fn call_claude_streaming(
     // `disallowed_tools()` above.
 
     // System prompt via tempfile (avoids OS arg-length limits)
-    let _prompt_guard = if !system_prompt.is_empty() {
+    let prompt_guard = if !system_prompt.is_empty() {
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
                 use std::io::Write;
@@ -549,8 +541,29 @@ async fn call_claude_streaming(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
+    (cmd, prompt_guard)
+}
+
+/// Spawn `claude` CLI with `--output-format stream-json` and display progress.
+async fn call_claude_streaming(
+    system_prompt: &str,
+    prompt: &str,
+    model: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    capabilities: &duduclaw_core::types::CapabilitiesConfig,
+) -> std::result::Result<CliResponse, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let claude = duduclaw_core::which_claude()
+        .ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
+
+    let (mut cmd, _prompt_guard) = streaming_command(&claude, system_prompt, prompt, model,
+        env_vars, capabilities);
+
+    let mut child = duduclaw_core::execution_gate::with_runtime(
+            duduclaw_core::execution_gate::RuntimeKind::Claude,
+            duduclaw_core::execution_gate::spawn(&mut cmd,
+        duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)).await
         .map_err(|e| format!("claude CLI spawn error: {e}"))?;
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
@@ -870,5 +883,37 @@ mod instructions_slot_tests {
         auto_agent.config.prompt.reply_language = Some("auto".into());
         let auto = super::build_system_prompt(&auto_agent, Some("zh-TW")).unwrap().frozen_prompt;
         assert!(auto.contains("matching the user's input"));
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    use super::*;
+    #[tokio::test]
+    async fn agent_runner_backend_command_keeps_legacy_tokens_and_env_removals() {
+        let env = std::collections::HashMap::from([
+            ("RUNNER_VALUE".into(), "literal $HOME;\n繁體中文".into()),
+            ("ANTHROPIC_API_KEY".into(), String::new()),
+        ]);
+        let capabilities = duduclaw_core::types::CapabilitiesConfig::default();
+        let (command, guard) = streaming_command("claude", "", "prompt $HOME;\n繁體中文", "fixture-model", &env, &capabilities);
+        assert!(guard.is_none());
+        let mut legacy = duduclaw_core::platform::async_command_for("claude");
+        duduclaw_core::ns_guard::guard_command(&mut legacy);
+        legacy.args(["-p", "prompt $HOME;\n繁體中文", "--model", "fixture-model", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--max-turns", "50"]);
+        let allowed = capabilities.allowed_tools();
+        if !allowed.is_empty() { legacy.args(["--allowedTools", &allowed.join(",")]); }
+        let denied = capabilities.disallowed_tools();
+        if !denied.is_empty() { legacy.args(["--disallowedTools", &denied.join(",")]); }
+        for (key, value) in &env {
+            if value.is_empty() { legacy.env_remove(key); } else { legacy.env(key, value); }
+        }
+        legacy.env_remove("CLAUDECODE");
+        assert_eq!(command.as_std().get_program(), legacy.as_std().get_program());
+        assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), legacy.as_std().get_args().collect::<Vec<_>>());
+        assert_eq!(command.as_std().get_envs().collect::<Vec<_>>(), legacy.as_std().get_envs().collect::<Vec<_>>());
+        assert_eq!(command.as_std().get_current_dir(), legacy.as_std().get_current_dir());
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
     }
 }

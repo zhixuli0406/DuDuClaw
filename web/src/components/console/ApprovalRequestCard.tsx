@@ -4,6 +4,7 @@ import { ShieldQuestion, Check, X, Compass } from 'lucide-react';
 import { Badge, Button, Spinner } from '@/components/mds';
 import { api, type ApprovalKind } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
+import { withBreakGlass } from '@/lib/break-glass';
 import { timeRemaining } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import type { ApprovalRequestArtifact } from './artifact-types';
@@ -52,7 +53,12 @@ export function ApprovalRequestCard({ payload }: { payload: ApprovalRequestArtif
     setStatus('busy');
     setError(null);
     try {
-      const res = await api.approvals.decide(payload.id, approve);
+      // v1.81 P1: a Personal employee's card decided by an Admin who is not
+      // its owner asks for 需要再驗證身分 and retries once with the proof.
+      const res = await withBreakGlass(
+        (token) => (token ? api.approvals.decide(payload.id, approve, undefined, undefined, token) : api.approvals.decide(payload.id, approve)),
+        { purpose: 'decide' },
+      );
       const knowledge = parseKnowledgeQuarantine(payload.kind, payload.payload, payload.summary);
       const result = knowledge ? quarantineResultMessage(res, knowledge.variant) : null;
       const text = result

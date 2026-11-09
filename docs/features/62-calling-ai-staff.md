@@ -7,6 +7,7 @@ People talk to one AI employee by default and can hand a single message to anoth
 ## How a message is routed
 
 1. A message that calls nobody goes to the conversation's default employee: the one bound to the channel or thread, else the one whose `allowed_channels` lists the channel, else the main employee. In the dashboard WebChat, the selected employee answers; with nobody selected, the default employee does.
+   On the company-wide shared Telegram bot the default is decided per person, in this order: the employee from the person's bind link (**Employee bind link**); then, in a one-to-one chat only, the **primary AI employee** of the dashboard account their Telegram identity is verified-linked to — as long as it is active and the account may still use it under the same rules as WebChat; then the channel default above. Groups keep the bind link and the channel default; a primary employee is not used there, because everyone in the group shares one conversation. An `@` call or a picked name still wins for that one message.
 2. A message that calls an employee goes to that employee, **for this message only**. The next message without a name goes back to the default employee. Nothing sticks.
 3. An employee can be called by `@id`, `@trigger` (the `[agent] trigger` value) or `@display name`. Matching ignores letter case and works with CJK text glued to the name (`@財務小幫手幫我算帳`). `＠` works too. An e-mail address (`ann@example.com`) is never a mention.
 4. When several names could match, the longest wins (`@財務小幫手` over `@財務`). At equal length an id beats a trigger and a trigger beats a display name. A name that still belongs to several employees never routes on its own, even when you may call only one of them: you get the choice (or a refusal when you may call none). When a message mentions several employees, the first one in the text that you may call wins.
@@ -73,6 +74,8 @@ The waiting state is kept in memory, so a gateway restart forgets it and the nex
 ## Each employee keeps its own conversation history
 
 A called employee answers in its own session inside the conversation (`<conversation>#agent:<id>`), on every channel and in WebChat. Its history, saved secrets and pending goal confirmations never mix with the default employee's. The default employee does not see what the called employee answered, and the other way round.
+
+On the shared Telegram bot, a one-to-one chat routed to the person's primary AI employee is kept the same way: the primary answers in its own session of the chat, separate from the default employee's. Earlier history with the default employee stays where it was; if the primary changes, or the chat falls back to the default employee, each keeps its own history. `/new`, `/reset` and the **New conversation** button clear the session of whoever currently answers in the chat. Access rules and human takeover still apply to the chat itself.
 
 ## Group "mention only"
 

@@ -164,6 +164,29 @@ mod imp {
             self.0.sync_all()
         }
 
+        /// SR5 round 3 follow-up R3-2: atomically move `source_name` over
+        /// `target_name`, both entries of this directory (`renameat`). Neither
+        /// name is followed: a symlink planted at `target_name` is replaced as
+        /// a directory entry, never written through. The directory is synced.
+        pub fn replace(&self, source_name: &str, target_name: &str) -> io::Result<()> {
+            let from = name(source_name)?;
+            let to = name(target_name)?;
+            // SAFETY: a valid directory fd and NUL-terminated single components.
+            let result = unsafe { libc::renameat(self.0.as_raw_fd(), from.as_ptr(), self.0.as_raw_fd(), to.as_ptr()) };
+            if result < 0 { return Err(io::Error::last_os_error()); }
+            self.0.sync_all()
+        }
+
+        /// Unlink one non-directory entry of this directory (never followed).
+        pub fn remove_file(&self, value: &str) -> io::Result<()> {
+            let value = name(value)?;
+            // SAFETY: a valid directory fd and a NUL-terminated single component.
+            if unsafe { libc::unlinkat(self.0.as_raw_fd(), value.as_ptr(), 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
         pub fn list(&self) -> io::Result<Vec<String>> {
             // A separate open file description keeps readdir's offset private.
             let dot = CString::new(".").unwrap();

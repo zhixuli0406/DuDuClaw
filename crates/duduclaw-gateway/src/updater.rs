@@ -211,7 +211,7 @@ pub enum InstallMethod {
     /// deployment honestly reports "no update channel" rather than offering an
     /// install button that is guaranteed to be refused.
     Pro,
-    /// Root-owned native service; upgrades require the operator installer.
+    /// Root-owned native service; upgrades go through the isolated update service.
     Manual,
     Standalone,
     Source,
@@ -226,8 +226,9 @@ pub enum InstallMethod {
 ///   (the Pro build follows the OSS release train, so "a newer version exists"
 ///   is true information), but nothing in this process can install one.
 /// - `"github"` — the public CE release channel.
+/// - `"protected"` — the root update service verifies and installs a generation.
 pub fn update_channel_label(provider_present: bool) -> &'static str {
-    if is_native_protected_install() { return "none"; }
+    if is_native_protected_install() { return "protected"; }
     if provider_present {
         return "control_plane";
     }
@@ -249,20 +250,22 @@ pub fn is_containerized() -> bool {
 
 /// This only narrows update permissions; it does not attest credential protection.
 pub fn is_native_protected_install() -> bool {
+    // SR5 round 3 follow-up: the one protected-mode latch (env flag OR the
+    // root marker / confirmed index), never the bare environment variable.
     cfg!(target_os = "linux") && native_protected_install(
         is_containerized(),
-        std::env::var("DUDUCLAW_PROTECTED_KEY_MODE").ok().as_deref(),
+        duduclaw_core::protected_mode::active(),
         &duduclaw_core::platform::executable_path(),
     )
 }
 
-fn native_protected_install(containerized: bool, mode: Option<&str>, exe: &std::path::Path) -> bool {
-    !containerized && (mode == Some("native-systemd")
+fn native_protected_install(containerized: bool, protected: bool, exe: &std::path::Path) -> bool {
+    !containerized && (protected
         || exe == std::path::Path::new("/opt/duduclaw/bin/duduclaw"))
 }
 
 pub const NATIVE_PROTECTED_UPDATE_HINT: &str =
-    "此服務由 root 管理。請執行 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux";
+    "此服務由獨立更新服務管理，請從儀表板的系統更新頁操作；無法更新時請管理員檢查更新服務。";
 
 /// Result of applying an update.
 #[derive(Debug, Clone, Serialize)]
@@ -2083,10 +2086,12 @@ mod tests {
     fn native_protected_update_is_manual() {
         let native = std::path::Path::new("/opt/duduclaw/bin/duduclaw");
         let other = std::path::Path::new("/usr/bin/duduclaw");
-        assert!(native_protected_install(false, None, native));
-        assert!(native_protected_install(false, Some("native-systemd"), other));
-        assert!(!native_protected_install(true, Some("native-systemd"), native));
-        assert!(!native_protected_install(false, Some("native-systemd-extra"), other));
+        // SR5 round 3 follow-up: `protected` is `protected_mode::active()`
+        // (env flag OR durable fact); the executable path stays a fallback.
+        assert!(native_protected_install(false, false, native));
+        assert!(native_protected_install(false, true, other));
+        assert!(!native_protected_install(true, true, native));
+        assert!(!native_protected_install(false, false, other));
         assert_eq!(serde_json::to_string(&InstallMethod::Manual).unwrap(), "\"manual\"");
     }
 

@@ -1,0 +1,45 @@
+[Unit]
+Description=Verify and activate signed protected DuDuClaw updates
+After=network-online.target
+After=duduclaw-gateway.service duduclaw-spawnd.service duduclaw-egress.service
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Slice=duduclaw-tcb.slice
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/libexec/duduclaw-updated-launch --launch
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=duduclaw-updated
+RuntimeDirectoryMode=0755
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/duduclaw-updated /etc/duduclaw-updated /opt/duduclaw-isolated
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Read loaded non-dumpable executables and connect private service-owned health sockets.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_SYS_PTRACE CAP_DAC_OVERRIDE
+LimitCORE=0
+LimitNOFILE=256
+TasksMax=16
+MemoryMax=256M
+CPUQuota=100%
+TimeoutStopSec=10
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

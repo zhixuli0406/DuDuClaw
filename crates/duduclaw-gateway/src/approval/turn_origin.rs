@@ -84,6 +84,9 @@ fn origin_from_pair(
 }
 
 pub(super) fn current_origin() -> Result<Option<(String, String)>, String> {
+    if let Some(origin) = crate::isolation_egress::approval_origin() {
+        return origin.map(Some);
+    }
     if let Ok((session, turn)) = TURN_ORIGIN.try_with(Clone::clone) {
         return origin_from_pair("gateway", Some(session), Some(turn));
     }

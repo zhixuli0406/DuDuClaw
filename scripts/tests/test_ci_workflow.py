@@ -52,7 +52,8 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(smoke["on"]["pull_request"], {"paths": [
             ".github/workflows/release.yml", ".github/workflows/linux-release-smoke.yml",
             "Cross.toml", ".cargo/**", "Cargo.lock", "Cargo.toml", "crates/*/Cargo.toml",
-            "scripts/check_glibc.py", "crates/duduclaw-cli/assets/native-protected-launcher.sh",
+            "scripts/check_glibc.py", "scripts/package-linux-release.py",
+            "crates/duduclaw-cli/assets/native-protected-launcher.sh",
             "crates/duduclaw-cli/src/service/**", "crates/duduclaw-core/src/root_key*.rs",
         ]})
         self.assertEqual(smoke["permissions"], {"contents": "read"})
@@ -87,15 +88,26 @@ class CiWorkflowTests(unittest.TestCase):
         # Compare full ordered steps: action pins/options, commands, features,
         # conditions, and environment must all follow the shipping Linux path.
         prefixes = ("actions/setup-node@", "dtolnay/rust-toolchain@", "Swatinem/rust-cache@")
-        names = {"Install cross (Linux)", "Build frontend", "Check Linux glibc baseline"}
+        names = {"Install cross (Linux)", "Build frontend",
+                 "Package Linux binaries and check glibc baseline"}
+        commands = ("python3 scripts/package-linux-release.py ", "cross build --release")
         def linux_steps(job):
             return [s for s in job["steps"]
                     if s.get("uses", "").startswith(prefixes)
                     or s.get("name") in names
-                    or s.get("run", "").startswith("cross build --release")]
+                    or s.get("run", "").startswith(commands)]
 
         expected = linux_steps(release)
+        # setup-node, rust-toolchain, rust-cache, install cross, frontend,
+        # packager --build-only, packager --skip-build (glibc baseline check).
         self.assertEqual(len(expected), 7)
+        runs = [s.get("run", "") for s in expected]
+        self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only", runs)
+        self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} "
+                      "--skip-build --output-dir .", runs)
+        # The shared packager step stays unprivileged: no offline signing key
+        # or bootstrap metadata (the packager also refuses keys under CI).
+        self.assertFalse(any("--signing-key" in run or "--bootstrap-root" in run for run in runs))
         self.assertEqual(linux_steps(smoke), expected)
         cache = next(s for s in smoke["steps"]
                      if s.get("uses", "").startswith("Swatinem/rust-cache@"))
@@ -338,10 +350,12 @@ class CiWorkflowTests(unittest.TestCase):
         full = "needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check'"
         active = "needs.settle.outputs.rust_mode != 'skip'"
         setup = {
+            "Add swap (Linux)",
             "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)",
             "Stub dashboard assets for compile",
         }
         platform = {
+            "Add swap (Linux)": "runner.os == 'Linux'",
             "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)": "runner.os == 'Linux'",
             "Run every required Windows case on the native host": "runner.os == 'Windows'",
             "Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)": "matrix.os == 'ubuntu-latest'",
@@ -393,6 +407,23 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertTrue(mode != "skip" and mode != "check")
         for command in self.commands("rust"):
             self.assertIn("--locked", command)
+
+    def test_linux_swap_precedes_builds_and_gateway_caps_jobs(self):
+        steps = self.jobs["rust"]["steps"]
+        names = [s.get("name") for s in steps]
+        swap = steps[names.index("Add swap (Linux)")]
+        self.assertIn("runner.os == 'Linux'", swap["if"])
+        for needle in ("swapoff -a", "16G", "/mnt/duduclaw-swap", "mkswap", "swapon", "free -h"):
+            self.assertIn(needle, swap["run"])
+        index = steps.index(swap)
+        self.assertTrue(steps[index - 1].get("uses", "").startswith("actions/checkout@"))
+        for later in ("Build core crates (no dashboard)", "Build gateway (no dashboard)",
+                      "Test gateway"):
+            self.assertLess(index, names.index(later))
+        for step in steps[:index]:
+            self.assertNotIn("cargo ", step.get("run", ""))
+        gateway = steps[names.index("Test gateway")]
+        self.assertEqual(gateway["env"], {"CARGO_BUILD_JOBS": "2"})
 
     def test_settle_only_delays_pr_runs(self):
         settle = self.jobs["settle"]

@@ -1,0 +1,13 @@
+[Unit]
+Description=DuDuClaw DNS-only broker
+
+[Socket]
+ListenStream=/run/duduclaw-dns-broker/resolve.sock
+SocketUser=root
+SocketGroup=duduclaw-egress
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

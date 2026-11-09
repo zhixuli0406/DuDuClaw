@@ -81,10 +81,19 @@ impl MethodHandler {
             .and_then(|v| v.as_u64())
             .unwrap_or(50)
             .min(500) as usize;
+        // v1.81 P1d: never another person's Personal employee's forks
+        // (`fork.inspect` / `fork.resolve` are gated on the fork's employee).
+        let hidden = match crate::personal_visibility::hidden_from(
+            &self.home_dir, crate::runtime_readiness::is_protected_linux(), &live.user_id,
+        ) {
+            Ok(hidden) => hidden,
+            Err(_) => return WsFrame::error_response("", crate::personal_visibility::OWNERSHIP_UNAVAILABLE),
+        };
         match store.list_forks(limit) {
             Ok(forks) => {
                 let rows: Vec<Value> = forks
                     .iter()
+                    .filter(|f| !hidden.contains(&f.agent_id))
                     .filter(|f| live.has_agent_access(&f.agent_id, AccessLevel::Viewer))
                     .map(|f| {
                         json!({
@@ -379,7 +388,7 @@ impl MethodHandler {
         } else {
             std::time::Duration::from_secs(60)
         };
-        let output = match tokio::time::timeout(dur, cmd.output()).await {
+        let output = match tokio::time::timeout(dur, duduclaw_core::execution_gate::output(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::ImportWorker)).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
                 return WsFrame::error_response("", &format!("spawn migrate from failed: {e}"));

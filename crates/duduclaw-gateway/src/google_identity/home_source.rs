@@ -24,7 +24,7 @@ pub(crate) use home_callback_io::exchange_claimed_google_code_once;
 #[cfg(test)]
 pub(crate) use home_callback_io::testing as callback_testing;
 pub(crate) use native_selection::{
-    NativeHomeSelection, prepare_home_native_selection, resolve_home_native_pinned,
+    NativeHomeSelection, prepare_home_native_selection, read_home_native_selection, resolve_home_native_pinned,
     validate_home_native_material, validate_home_native_selection,
 };
 pub use oauth_material::get_valid_google_token;
@@ -170,6 +170,7 @@ pub(crate) fn commit_google_config_under_guard(
         before.as_ref().map(|b| b.as_slice()),
         next.as_bytes().to_vec(),
     )?;
+    duduclaw_core::isolation_policy::fence_change(&g.home).map_err(|_| Error::Io)?;
     if config_projection(current)? == config_projection(next)? {
         return home_store::publish_unrelated_source(g, write);
     }
@@ -190,6 +191,25 @@ pub(crate) fn commit_google_config_under_guard(
             })
         },
     )
+}
+
+/// Migration may attach an ownership receipt to unrelated configuration only.
+/// Google source changes must still use their full fenced publication protocol.
+pub(crate) fn commit_unrelated_config_observed(
+    g:&SourceGuard,current:&str,next:&str,
+    observer:&mut dyn FnMut(&std::fs::File)->std::result::Result<(),String>,
+)->Result<()> {
+    home_store::ensure_publication_unblocked(g)?;
+    require_unrelated_config(current,next)?;
+    let before=home_store::read_config_snapshot(g)?;
+    if before.as_ref().map_or("",|b|std::str::from_utf8(b).unwrap_or("\0"))!=current {return Err(Error::Stale);}
+    let write=home_store::prepare_config_write(before.as_ref().map(|b|b.as_slice()),next.as_bytes().to_vec())?;
+    duduclaw_core::isolation_policy::fence_change(&g.home).map_err(|_|Error::Io)?;
+    home_store::publish_unrelated_source_observed(g,write,&mut |file|observer(file).map_err(|_|Error::Io))
+}
+pub(crate) fn require_unrelated_config(current:&str,next:&str)->Result<()> {
+    if current==next || config_projection(current)?!=config_projection(next)? {return Err(Error::Invalid);}
+    Ok(())
 }
 
 fn bounded(path: &Path, required: bool) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>> {

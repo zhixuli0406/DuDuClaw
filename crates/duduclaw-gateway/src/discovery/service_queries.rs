@@ -7,6 +7,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 const MAX_DOWNLOAD: u64 = 16 * 1024 * 1024;
 const MAX_QUERY_CELLS: usize = super::super::tree::MAX_PLANNED_CELLS as usize;
 const TREE_QUERY_LIMIT_REASON: &str = "discovery tree exceeds the bounded query size";
+#[path = "service_artifact_isolation.rs"]
+mod isolated_artifact;
 
 pub fn catalog(home: &Path, caller: &TrustedCaller, agent: &str) -> Result<Value, String> {
     caller.authorize_create(home, agent)?;
@@ -25,9 +27,11 @@ pub fn catalog(home: &Path, caller: &TrustedCaller, agent: &str) -> Result<Value
         "can_create":enabled && !roots.is_empty() && !evaluators.is_empty() && !runtimes.is_empty(),
         "requires_approval":!caller.manager_for(agent)}))
 }
+/// FD-SEL: for a protected caller an unknown run and a run it may not see are
+/// the same `DISCOVERY_NOT_FOUND` (`TrustedCaller::authorize_task`).
 async fn authorized_task(home: &Path, store: &TaskStore, caller: &TrustedCaller, run_id: &str) -> Result<TaskRow, String> {
     valid_id(run_id)?;
-    let task = store.discovery_by_run(run_id).await?.ok_or("discovery not found")?;
+    let task = store.discovery_by_run(run_id).await?.ok_or(DISCOVERY_NOT_FOUND)?;
     caller.authorize_task(home,&task)?;
     Ok(task)
 }
@@ -107,7 +111,21 @@ fn cancel_code(task: &TaskRow) -> Option<&'static str> {
         _ => None,
     }
 }
-fn data(home: &Path, task: &TaskRow, approval: &ApprovalView, include_tree: bool) -> Result<(Value, Vec<Value>, Vec<Value>), String> {
+#[cfg(test)]
+thread_local! { static ARTIFACT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn artifact_check_count() -> usize { ARTIFACT_CHECKS.with(std::cell::Cell::get) }
+
+fn artifact_verification(home: &Path, caller: &TrustedCaller, run: &str) -> Option<bool> {
+    // The existing verifier traverses a pathname-based artifact tree. A status
+    // query from an isolated employee must not cross that boundary implicitly.
+    if caller.isolated { return None; }
+    #[cfg(test)]
+    ARTIFACT_CHECKS.with(|count| count.set(count.get() + 1));
+    Some(matches!(load_verified_artifact(home, run), Ok(Some(_))))
+}
+
+fn data(home: &Path, caller: &TrustedCaller, task: &TaskRow, approval: &ApprovalView, include_tree: bool) -> Result<(Value, Vec<Value>, Vec<Value>), String> {
     let frozen = frozen_request(home,task)?;
     let run_id = task.discovery_run_id.as_deref().ok_or("missing run identity")?;
     let store = DiscoveryStore::open(home).map_err(|e| e.to_string())?;
@@ -167,7 +185,7 @@ fn data(home: &Path, task: &TaskRow, approval: &ApprovalView, include_tree: bool
             && run_status.is_some_and(|status|matches!(status,"running"|"queued"|"in_progress"|"pending_approval"))) {
         task.status.as_str()
     } else {run_status.unwrap_or(&task.status)};
-    let verified = matches!(load_verified_artifact(home, run_id), Ok(Some(_)));
+    let verified = artifact_verification(home, caller, run_id);
     let degraded = run.as_ref().is_some_and(|run| run.has_unconfined || run.status == "degraded");
     let report = run.as_ref().and_then(|_| report_outcome(home, run_id)).unwrap_or_default();
     let isolation_degraded = run.as_ref().is_some_and(|run| run.has_unconfined) || report.isolation_warning.is_some();
@@ -185,7 +203,9 @@ fn data(home: &Path, task: &TaskRow, approval: &ApprovalView, include_tree: bool
         "tree_available":tree_available,
         "tree_unavailable_reason":if tree_available {None} else {Some(TREE_QUERY_LIMIT_REASON)},
         "can_cancel":matches!(task.status.as_str(),"pending_approval"|"queued"|"in_progress"),
-        "artifact_verified":verified,"degraded":degraded,"isolation_degraded":isolation_degraded,
+        "artifact_verified":verified,
+        "artifact_verification":if verified.is_none() {"unavailable"} else {"checked"},
+        "degraded":degraded,"isolation_degraded":isolation_degraded,
         "stop_code":stop_code,"cancel_code":cancel_code(task)}), nodes, rounds))
 }
 pub async fn list(home: &Path, caller: &TrustedCaller, agent: Option<&str>, limit: usize) -> Result<Value, String> {
@@ -209,7 +229,7 @@ pub async fn list(home: &Path, caller: &TrustedCaller, agent: Option<&str>, limi
     for task in store.discovery_visible_tasks(&caller.id(),&owned,&managed,all,agent,limit).await? {
         if caller.authorize_task(home,&task).is_err() { continue; }
         let approval = approval_view(home, &store, &mut broker, &task).await?;
-        runs.push(data(home, &task, &approval, false)?.0);
+        runs.push(data(home, caller, &task, &approval, false)?.0);
         if runs.len() == limit { break; }
     }
     Ok(json!({"runs":runs}))
@@ -218,7 +238,7 @@ pub async fn tree(home: &Path, caller: &TrustedCaller, run: &str) -> Result<Valu
     let store = TaskStore::open(home)?;
     let task = authorized_task(home,&store, caller, run).await?;
     let approval = approval_view(home, &store, &mut None, &task).await?;
-    let (run, nodes, rounds) = data(home, &task, &approval, true)?;
+    let (run, nodes, rounds) = data(home, caller, &task, &approval, true)?;
     Ok(json!({"run":run,"nodes":nodes,"rounds":rounds}))
 }
 pub async fn cancel(home: &Path, caller: &TrustedCaller, run: &str) -> Result<Value, String> {
@@ -282,6 +302,7 @@ fn open_regular(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 pub async fn artifact(home: &Path, caller: &TrustedCaller, run: &str, selected: Option<&str>) -> Result<Value, String> {
+    if caller.isolated { return isolated_artifact::deliver(home, caller, run, selected).await; }
     let task = authorized_task(home,&TaskStore::open(home)?, caller, run).await?;
     if let Some(record) = DiscoveryStore::open(home).map_err(|_|"discovery unavailable")?
         .load_run(run).map_err(|_|"discovery unavailable")? {

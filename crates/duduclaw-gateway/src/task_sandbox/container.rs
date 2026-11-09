@@ -584,6 +584,7 @@ pub(super) enum LaunchError {
 /// container of that exact name is listed afterwards.
 struct Cleanup {
     name: String,
+    launch_context: duduclaw_core::execution_gate::CapturedLaunch,
     downstream: Option<crate::downstream_runs::CleanupHold>,
     create_finished: bool,
     result: Option<Result<(), String>>,
@@ -594,6 +595,7 @@ struct Cleanup {
 /// on the caller's thread (the test client is thread-local) and run on a
 /// blocking thread, never on an async worker.
 struct RemoveCommands {
+    launch_context: duduclaw_core::execution_gate::CapturedLaunch,
     remove: Command,
     confirm: Command,
 }
@@ -617,11 +619,15 @@ impl RemoveCommands {
             #[cfg(not(unix))]
             let _ = command;
         }
-        Self { remove, confirm }
+        Self { launch_context: duduclaw_core::execution_gate::CapturedLaunch::capture(), remove, confirm }
     }
 
     /// Blocking: at most ~5 s for the remove plus ~5 s for the confirmation.
-    fn run(mut self) -> Result<(), String> {
+    fn run(self) -> Result<(), String> {
+        self.launch_context.clone().sync_scope(|| self.run_scoped())
+    }
+
+    fn run_scoped(mut self) -> Result<(), String> {
         let removed = bounded_status(&mut self.remove, Duration::from_secs(5));
         match removed {
             Ok(true) => return Ok(()),
@@ -630,7 +636,7 @@ impl RemoveCommands {
         }
         // Not confirmed by the remove itself: an `--rm` container that
         // already vanished is fine, anything still listed is not.
-        let child = self.confirm.spawn().map_err(|_| "sandbox cleanup could not start".to_owned())?;
+        let child = duduclaw_core::execution_blocking::spawn(&mut self.confirm, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).map_err(|_| "sandbox cleanup could not start".to_owned())?;
         let output = bounded_output(child, Duration::from_secs(5))?;
         if output.trim().is_empty() {
             Ok(())
@@ -641,7 +647,7 @@ impl RemoveCommands {
 }
 
 fn bounded_status(command: &mut Command, limit: Duration) -> Result<bool, String> {
-    let mut child = command.spawn().map_err(|_| "sandbox cleanup could not start".to_owned())?;
+    let mut child = duduclaw_core::execution_blocking::spawn(command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).map_err(|_| "sandbox cleanup could not start".to_owned())?;
     let until = Instant::now() + limit;
     let result = loop {
         match child.try_wait() {
@@ -652,7 +658,7 @@ fn bounded_status(command: &mut Command, limit: Duration) -> Result<bool, String
     };
     #[cfg(unix)]
     {
-        let _ = duduclaw_core::platform::kill_process_group(child.id());
+        let _ = child.control().start_kill();
     }
     if result.is_err() {
         let _ = child.kill();
@@ -661,7 +667,7 @@ fn bounded_status(command: &mut Command, limit: Duration) -> Result<bool, String
     result
 }
 
-fn bounded_output(mut child: std::process::Child, limit: Duration) -> Result<String, String> {
+fn bounded_output(mut child: duduclaw_core::execution_blocking::Child, limit: Duration) -> Result<String, String> {
     use std::io::Read;
     let mut stdout = child.stdout.take().ok_or_else(|| "sandbox cleanup output unavailable".to_owned())?;
     let reader = std::thread::spawn(move || {
@@ -679,7 +685,7 @@ fn bounded_output(mut child: std::process::Child, limit: Duration) -> Result<Str
     };
     #[cfg(unix)]
     {
-        let _ = duduclaw_core::platform::kill_process_group(child.id());
+        let _ = child.control().start_kill();
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -695,7 +701,7 @@ impl Cleanup {
         if let Some(result) = &self.result {
             return result.clone();
         }
-        let commands = RemoveCommands::new(&self.name);
+        let commands = self.launch_context.sync_scope(|| RemoveCommands::new(&self.name));
         let result = tokio::task::spawn_blocking(move || commands.run())
             .await
             .unwrap_or_else(|_| Err("sandbox cleanup task failed".into()));
@@ -712,7 +718,7 @@ impl Drop for Cleanup {
         if self.result.is_some() {
             return;
         }
-        let commands = RemoveCommands::new(&self.name);
+        let commands = self.launch_context.sync_scope(|| RemoveCommands::new(&self.name));
         let name = self.name.clone();
         let downstream = self.downstream.take();
         let create_finished = self.create_finished;
@@ -744,7 +750,7 @@ pub(super) async fn launch(
     on_event: impl FnMut(&[u8]) -> bool + Send,
 ) -> Result<ProcessOutput, LaunchError> {
     let started = Instant::now();
-    let mut cleanup = Cleanup { name, result: None, downstream: crate::downstream_runs::cleanup_hold(), create_finished: false };
+    let mut cleanup = Cleanup { name, launch_context: duduclaw_core::execution_gate::CapturedLaunch::capture(), result: None, downstream: crate::downstream_runs::cleanup_hold(), create_finished: false };
     let created = process::run(create, b"", timeout, 1024, |_| true).await;
     cleanup.create_finished = true;
     let created = match created {

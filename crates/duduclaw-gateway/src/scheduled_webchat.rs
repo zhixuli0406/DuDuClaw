@@ -323,7 +323,8 @@ fn stored_owner(home: &Path, session: &str) -> Result<Option<(String, String, St
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| "對話紀錄無法讀取".to_string())?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| "對話紀錄無法讀取".to_string())?;
     let row: Option<(String, Option<String>, Option<String>, String)> = conn
         .query_row(
             "SELECT agent_id, origin_kind, owner_user_id, created_at FROM sessions

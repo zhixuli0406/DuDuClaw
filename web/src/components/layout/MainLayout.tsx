@@ -16,6 +16,7 @@ import { CodexUpdateBanner } from '@/components/CodexUpdateBanner';
 import { FolderAccessBanner } from '@/components/FolderAccessBanner';
 import { IdentityTransitionBanner } from '@/components/IdentityTransitionBanner';
 import { LicenseExpiryBanner } from '@/components/LicenseExpiryBanner';
+import { IsolationReadinessBanner } from '@/components/IsolationReadinessBanner';
 import { CommandPalette } from '@/components/CommandPalette';
 import { DevPanel } from '@/components/devpanel';
 import { GrowthMount } from '@/components/growth/GrowthMount';
@@ -160,6 +161,7 @@ function AppShell() {
         <div className={cn('flex min-h-0 flex-1 flex-col', isInbox ? 'overflow-hidden' : 'overflow-y-auto')}>
           <div className="empty:hidden [&>*+*]:mt-2 [&:not(:empty)]:px-4 [&:not(:empty)]:pt-3 md:[&:not(:empty)]:px-6">
             <ProductPolicyNotice />
+            <IsolationReadinessBanner />
             <SoftLimitBanner />
             <LicenseExpiryBanner />
             <CodexUpdateBanner />

@@ -457,7 +457,7 @@ async fn tar_backup_excluding(
         cmd.arg("--exclude").arg(pattern);
     }
     cmd.arg("-C").arg(source_dir).arg(".");
-    cmd.status().await
+    duduclaw_core::execution_gate::status(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::ParseWorker).await
 }
 
 #[cfg(test)]

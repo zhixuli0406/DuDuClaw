@@ -87,6 +87,12 @@ impl MethodHandler {
         if !authorize(&live, agent, action) {
             return Box::pin(self.handle_computer_team(method, params, ctx)).await;
         }
+        // v1.81 P1g (F2): stopping another person's Personal employee's
+        // session is owner-only, like takeover / hand back / resume (whose
+        // `Control` action already refuses it in `authorize`).
+        if method == "computer_sessions.stop" && live.owner_only_denied(agent) {
+            return WsFrame::error_response("", "permission denied");
+        }
         // Sessions are indexed by this validated employee id; the live
         // operations below use the same key, never a caller-supplied session
         // owner. Refuse before removing a hold or releasing a takeover lease.

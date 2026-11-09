@@ -181,6 +181,8 @@ fn commit_locked_inner(
     let keep = AgentFilesConfig::load(c.home).history_keep;
     let anchor = lock_anchor(c, &path);
     let locked_section = || -> std::io::Result<Locked> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
         // A skill is never created here, and its folder is writable by the
         // employee: bind it again under the lock (same existing regular
         // file, same folders) and check that binding once more right before
@@ -224,6 +226,8 @@ fn commit_locked_inner(
         } else {
             None
         };
+        duduclaw_mcp_boundary::io_authority::verify_before_io()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
         // Recheck authority after a potentially long admission drain.
         if let Err(e) = guard() {
             return Ok(Locked::Err(CommitError::Refused(e)));
@@ -283,7 +287,10 @@ fn commit_locked_inner(
             }
             crate::handlers::config_commit::replace_owner_only(&path, &new)?;
         }
-        update_baseline(c, &before_hash);
+        // The file already landed. Skip derived baseline work if authority was revoked.
+        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_ok() {
+            update_baseline(c, &before_hash);
+        }
         Ok(Locked::Done(Outcome {
             before: current,
             after: new,
@@ -402,9 +409,11 @@ pub(crate) async fn rescan_registry_reliably(registry: &Arc<RwLock<AgentRegistry
 /// closures borrow from the caller, so `spawn_blocking` (which needs
 /// `'static`) is not an option here.
 pub(crate) fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let run = || authority.run(f);
     match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
-        _ => f(),
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(run),
+        _ => run(),
     }
 }
 

@@ -106,7 +106,8 @@ where
         Some(duduclaw_core::autonomy_handoff::admit().await
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?)
     } else { None };
-    let (mut child, group) = crate::process_group::spawn_guarded(&mut cmd)?;
+    let mut child = duduclaw_core::execution_gate::spawn(&mut cmd,
+        duduclaw_core::execution_gate::ExecutionClass::Discovery).await?;
     if let Some(admission) = admission { admission.handed_off(); }
     let mut stdin = child
         .stdin
@@ -177,13 +178,11 @@ where
         Err(_) => true,
     };
     if timed_out || stopped {
-        drop(group);
         let _ = child.start_kill();
     } else {
         // The CLI may close stdout before it exits. Include its exit in the cap.
         let remaining = timeout.saturating_sub(started.elapsed());
         if tokio::time::timeout(remaining, child.wait()).await.is_err() {
-            drop(group);
             let _ = child.start_kill();
             let status = child.wait().await?;
             let (stderr, _) = finish_stderr(err_task, timeout.saturating_sub(started.elapsed())).await?;
@@ -197,7 +196,7 @@ where
                 wall_secs: started.elapsed().as_secs_f64(),
             });
         }
-        drop(group);
+        let _ = child.start_kill();
     }
     let status = child.wait().await?;
     let remaining = timeout.saturating_sub(started.elapsed());
@@ -284,5 +283,35 @@ mod tests {
             .unwrap();
         assert!(out.timed_out);
         assert!(out.wall_secs < 3.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod execution_backend_equivalence_tests {
+    use super::*;
+
+    fn command(cwd: &std::path::Path) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '%s\\n' \"$PWD\" \"$VALUE\" \"$1\"; cat", "fixture", "繁體中文 $HOME;\nargument"])
+            .env_clear().env("VALUE", "literal value\n下一行").env_remove("SSH_AUTH_SOCK")
+            .current_dir(cwd);
+        command
+    }
+
+    #[tokio::test]
+    async fn discovery_local_builder_and_output_match_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = command(dir.path());
+        let command = tokio::process::Command::from(command);
+        let original = duduclaw_core::execution_gate::command_snapshot(&command);
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), original);
+        let mut legacy = self::command(dir.path());
+        legacy.stdin(Stdio::null());
+        let expected = legacy.output().unwrap();
+        let actual = run(self::command(dir.path()), b"", Duration::from_secs(5), 4096, |_| true).await.unwrap();
+        assert_eq!(actual.status, expected.status);
+        assert_eq!(actual.stdout.as_bytes(), expected.stdout);
+        assert_eq!(actual.stderr.as_bytes(), expected.stderr);
+        assert!(!actual.timed_out && !actual.output_truncated);
     }
 }

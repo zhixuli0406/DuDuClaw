@@ -190,6 +190,7 @@ impl ChatProvider for LocalChatProvider {
     }
 
     async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        crate::isolation_readiness::check_execution().map_err(LlmError::InvalidRequest)?;
         match &self.inner {
             Inner::Compat(p) => p.complete(req).await,
             Inner::Engine(engine) => {
@@ -230,6 +231,7 @@ impl ChatProvider for LocalChatProvider {
         &self,
         req: &ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        crate::isolation_readiness::check_execution().map_err(LlmError::InvalidRequest)?;
         match &self.inner {
             // Real SSE for HTTP endpoints.
             Inner::Compat(p) => p.stream(req).await,

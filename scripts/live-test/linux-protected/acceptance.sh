@@ -1,4 +1,6 @@
 #!/bin/sh
+# SUPERSEDED for v1.81: asserts the removed container_root_key backend. Use
+# connectors-acceptance.sh (see README.md in this directory). Kept for the record.
 # Destructive disposable-host acceptance only. Never enable shell tracing.
 set -eu
 umask 077

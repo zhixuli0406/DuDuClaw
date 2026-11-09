@@ -338,6 +338,63 @@ fn employees_get_no_team_and_direct_bindings_win_ties() {
     assert_eq!(m.level("sales").unwrap().1, GrantSource::Direct(AccessLevel::Operator));
 }
 
+/// Record `agent` as `owner`'s Personal employee the way the gateway apply
+/// path does (mirror row + owner binding in one IMMEDIATE transaction).
+fn record_personal(db: &UserDb, agent: &str, owner: &str) {
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(crate::db::insert_personal_agent_in_transaction(&tx, agent, owner).unwrap());
+    assert!(crate::db::bind_personal_owner_in_transaction(&tx, agent, owner).unwrap());
+    tx.commit().unwrap();
+}
+
+/// v1.81 P1: a manager gets no derived access to a subordinate's Personal
+/// employee (team grant, team history oversight, read-only reader), while
+/// the subordinate's Shared employees still relay and the owner keeps
+/// direct access.
+#[test]
+fn p1_manager_has_no_derived_access_to_personal_employee() {
+    let (db, t) = test_db();
+    let o = org(&db);
+    record_personal(&db, "emp1-personal", &o.emp1);
+
+    for manager in [&o.mgr, &o.lead] {
+        let access = db.effective_access(manager).unwrap().unwrap();
+        assert!(access.team.contains_key("sales"), "Shared employees still relay");
+        assert!(!access.team.contains_key("emp1-personal"), "{:?}", access.team);
+        assert_eq!(access.level("emp1-personal"), None);
+        assert!(!access.may_call("emp1-personal") && !access.may_assign("emp1-personal"));
+        let ctx = db.live_user_context(manager).unwrap().unwrap();
+        assert!(!ctx.can_call_agent("emp1-personal"));
+        assert!(!ctx.can_assign_to("emp1-personal"));
+        assert!(!ctx.has_agent_access("emp1-personal", AccessLevel::Viewer));
+        assert!(db.overseen_reports(manager, "emp1-personal").unwrap().is_empty());
+    }
+    // Team history oversight of the Shared employee is unchanged.
+    assert_eq!(db.overseen_reports(&o.lead, "sales").unwrap().len(), 1);
+
+    // The read-only reader (gateway task-content path) agrees.
+    let ro = rusqlite::Connection::open_with_flags(t.path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let grants = team_grants_on(&ro, &o.mgr).unwrap();
+    assert!(grants.contains_key("sales") && !grants.contains_key("emp1-personal"));
+    drop(ro);
+
+    // The owner keeps their direct Owner binding.
+    let owner = db.effective_access(&o.emp1).unwrap().unwrap();
+    assert_eq!(
+        owner.level("emp1-personal"),
+        Some((AccessLevel::Owner, GrantSource::Direct(AccessLevel::Owner)))
+    );
+
+    // An unreadable mirror is an error (callers narrow), never "Shared".
+    db.conn().execute_batch("DROP TABLE isolation_personal_agents").unwrap();
+    assert!(team_grants_on(&db.conn(), &o.mgr).is_err());
+    assert!(db.overseen_reports(&o.lead, "sales").is_err());
+}
+
 #[test]
 fn suspended_people_are_walked_through_and_their_bindings_count() {
     let (db, _t) = test_db();
@@ -443,7 +500,7 @@ fn every_authorization_write_bumps_the_generation() {
     expect_bump("bind_channel_identity", &db);
     db.unbind_channel_identity("line", "U_emp1").unwrap();
     expect_bump("unbind_channel_identity", &db);
-    db.change_email(&o.emp1, "emp1-new@test.invalid").unwrap();
+    db.change_email(&o.lead, &o.emp1, "emp1-new@test.invalid").unwrap();
     expect_bump("change_email", &db);
     db.offboard_user(&o.lead, Some(&heir), None).unwrap();
     expect_bump("offboard_user", &db);

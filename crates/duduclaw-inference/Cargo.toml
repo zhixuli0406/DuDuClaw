@@ -6,6 +6,7 @@ description = "Local LLM inference engine for DuDuClaw — multi-backend support
 
 [dependencies]
 duduclaw-core = { workspace = true }
+duduclaw-parse-worker = { workspace = true }
 duduclaw-security = { workspace = true }
 # O11: the shared OpenAI-compat provider — this crate's `openai_compat.rs` is a
 # thin `InferenceBackend` shell over it rather than a second reqwest client.

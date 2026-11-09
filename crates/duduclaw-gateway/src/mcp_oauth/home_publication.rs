@@ -982,6 +982,9 @@ impl PreparedSourceWrite {
         &self.proof
     }
     pub(super) fn publish(&self, home: &Path) -> Result<()> {
+        self.publish_observed(home,None)
+    }
+    pub(super) fn publish_observed(&self, home:&Path, observer:Option<&mut dyn FnMut(&std::fs::File)->Result<()>>)->Result<()> {
         verify_source_file(home, &self.proof, true)?;
         #[cfg(test)]
         super::test_probe::source_payload(home);
@@ -1007,6 +1010,9 @@ impl PreparedSourceWrite {
         file.write_all(&self.bytes).map_err(|_| Error::Io)?;
         hit(home, Fault::SourceFileSync)?;
         file.sync_all().map_err(|_| Error::Io)?;
+        // Persist producer ownership before the rename. An observer failure
+        // leaves the live source unchanged; normal publication uses no observer.
+        if let Some(observer)=observer {observer(&file)?;}
         hit(home, Fault::SourceRename)?;
         std::fs::rename(&tmp, &target).map_err(|_| Error::Io)?;
         hit(home, Fault::SourceDirSync)?;

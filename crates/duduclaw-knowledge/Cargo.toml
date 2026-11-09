@@ -17,6 +17,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+duduclaw-parse-worker = { workspace = true }
 duduclaw-core = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

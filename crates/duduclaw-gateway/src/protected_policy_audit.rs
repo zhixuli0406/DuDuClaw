@@ -6,9 +6,11 @@ use duduclaw_security::{audit::{AuditEvent, Severity}, credential_protection::sa
 use crate::evolution_events::{query::AuditEventIndex, schema::{AuditEvent as IndexedEvent, AuditEventType, Outcome}};
 
 pub(crate) async fn drain(home: &Path, index: &AuditEventIndex) -> Result<(), String> {
+    // SR5 round 3 follow-up: protected mode is the one latch (env flag OR a
+    // durable host fact), never the bare environment variable.
     if !cfg!(target_os = "linux")
         || duduclaw_core::root_key::state_kind() == duduclaw_core::root_key::StateKind::NotOffered
-        || std::env::var_os(duduclaw_core::root_key::MODE_ENV).as_deref() != Some(std::ffi::OsStr::new("native-systemd")) {
+        || !duduclaw_core::protected_mode::active() {
         index.rebuild_root_policy(&[]).await?;
         return Ok(());
     }

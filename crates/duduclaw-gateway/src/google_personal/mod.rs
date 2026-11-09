@@ -16,6 +16,9 @@ pub mod pending;
 pub mod scopes;
 #[cfg(test)]
 mod tests;
+/// v1.81 E3: refresh / consent-revoke recheck on the legacy Personal path.
+#[cfg(test)]
+mod e3_tests;
 
 tokio::task_local! {
     /// Set exclusively from an already-verified access JWT at WS handshake.

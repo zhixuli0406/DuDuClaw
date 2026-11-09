@@ -128,7 +128,7 @@ impl Wsl2Runtime {
             Some(duduclaw_core::autonomy_handoff::admit().await
                 .map_err(DuDuClawError::Container)?)
         } else { None };
-        let child = command.spawn()
+        let child = duduclaw_core::execution_gate::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await
             .map_err(|e| DuDuClawError::Container(format!("WSL exec failed: {}", e)))?;
         if let Some(admission) = admission { admission.handed_off(); }
         let output = child.wait_with_output().await
@@ -160,13 +160,13 @@ pub(crate) struct Remover {
 
 impl Remover {
     pub(crate) fn remove(&self, id: &str) {
-        let _ = std::process::Command::new(&self.wsl_binary)
-            .args(distro_exec_args(&self.distro))
+        let mut command = std::process::Command::new(&self.wsl_binary);
+        command.args(distro_exec_args(&self.distro))
             .args(["docker", "rm", "-f", id])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+        let _ = duduclaw_core::execution_blocking::status(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool);
     }
 }
 

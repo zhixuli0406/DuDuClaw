@@ -153,6 +153,9 @@ impl SessionManager {
         stamp_existing: bool,
     ) -> Result<Session> {
         let mut guard = self.acquire().await;
+        // F6h writer gate (protected mode only): no session for a tombstoned
+        // label — checked before RM-173's stuck-clear repair writes anything.
+        crate::isolation_label_stores::check_label_writable_at(&guard, agent_id).map_err(DuDuClawError::Gateway)?;
         let now = chrono::Utc::now().to_rfc3339();
         let tx = guard
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

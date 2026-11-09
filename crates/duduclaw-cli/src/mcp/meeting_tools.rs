@@ -63,7 +63,7 @@ pub(crate) async fn handle_meeting_transcribe(args: &Value, home: &Path, namespa
         Ok(path) => path, Err(_) => return handle_meeting_upload_link(&serde_json::json!({}),home,namespace).await,
     };
     let mut body = serde_json::json!({"op":"create","source_path":source,"engine":engine.as_str(),"language_hint":language});
-    if let Ok(turn)=std::env::var("DUDUCLAW_TURN_ID") {body["turn_id"]=turn.into();}
+    if let Ok(turn)=crate::mcp_isolation_identity::var("DUDUCLAW_TURN_ID") {body["turn_id"]=turn.into();}
     meeting_request(home,namespace,&body).await
 
 }
@@ -74,7 +74,7 @@ pub(crate) async fn handle_meeting_upload_link(args:&Value,home:&Path,namespace:
     }
     if args.as_object().is_none_or(|o|!o.is_empty()){return super::egress_gate::pre_dispatch_error("上傳連結不接受額外參數。");}
     let mut body=serde_json::json!({"op":"upload_link"});
-    if let Ok(turn)=std::env::var("DUDUCLAW_TURN_ID"){body["turn_id"]=turn.into();}
+    if let Ok(turn)=crate::mcp_isolation_identity::var("DUDUCLAW_TURN_ID"){body["turn_id"]=turn.into();}
     meeting_request(home,namespace,&body).await
 }
 pub(crate) async fn handle_meeting_job(args: &Value, home: &Path, namespace: &str, cancel: bool) -> Value {
@@ -105,8 +105,8 @@ fn ai_response(value:Value, upload_link:bool)->Value {
     Value::Object(output)
 }
 async fn post_meeting(home:&Path,agent:&str,body:&Value)->std::result::Result<Value,String> {
-    let key=std::env::var(duduclaw_core::ENV_MCP_API_KEY).map_err(|_|"請使用閘道啟動的員工會議工具。")?;
-    let token=std::env::var(duduclaw_core::ENV_AGENT_TOKEN).map_err(|_|"缺少員工驗證資料。")?;
+    let key=crate::mcp_isolation_identity::var(duduclaw_core::ENV_MCP_API_KEY).map_err(|_|"請使用閘道啟動的員工會議工具。")?;
+    let token=crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_TOKEN).map_err(|_|"缺少員工驗證資料。")?;
     let mut body=body.clone();
     body["protocol"]="meeting_jobs_v1".into();
     let bytes=serde_json::to_vec(&body).map_err(|_|"無法建立會議請求。")?;

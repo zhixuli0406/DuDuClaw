@@ -93,6 +93,7 @@ impl EventBusStore {
 
     /// Open (or create) the event bus at `<home>/events.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         let db_path = home_dir.join("events.db");
         let conn = Connection::open(&db_path).map_err(|e| format!("open event bus: {e}"))?;
         Self::init_schema(&conn)?;
@@ -181,8 +182,12 @@ impl EventBusStore {
         ts_rfc3339: &str,
         source: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin event append: {e}"))?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        tx.execute(
             "INSERT INTO events (event, payload, ts, source)
              SELECT ?1, ?2, ?3, ?4
              WHERE NOT EXISTS (
@@ -195,6 +200,8 @@ impl EventBusStore {
             params![event, payload, ts_rfc3339, source],
         )
         .map_err(|e| format!("append event: {e}"))?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| format!("commit event append: {e}"))?;
         Ok(())
     }
 
@@ -358,6 +365,24 @@ impl EventBusStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn isolation_event_append_rechecks_after_mutex_wait() {
+        use std::{future::Future, sync::{Arc, atomic::{AtomicBool, Ordering}}, task::Poll};
+        let home = tempfile::tempdir().unwrap();
+        let store = EventBusStore::open(home.path()).unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        let held = store.conn.lock().await;
+        let request = duduclaw_mcp_boundary::io_authority::scope(
+            crate::isolation_io_test_support::context(active.clone()), store.append("task.updated", "{}"));
+        tokio::pin!(request);
+        std::future::poll_fn(|cx| { assert!(request.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
+        active.store(false, Ordering::SeqCst);
+        drop(held);
+        assert!(request.await.is_err());
+        assert_eq!(store.max_id().await.unwrap(), 0);
+    }
+
 
     fn fresh_home() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("duduclaw-eventbus-{}", uuid::Uuid::new_v4()));

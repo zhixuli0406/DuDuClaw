@@ -1,0 +1,44 @@
+[Unit]
+Description=DuDuClaw root employee launch agent
+Requires=duduclaw-spawnd.socket
+After=duduclaw-spawnd.socket dbus.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/lib/duduclaw/duduclaw-spawnd
+Sockets=duduclaw-spawnd.socket
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+UMask=0077
+LimitCORE=0
+LimitNOFILE=8192
+TasksMax=64
+MemoryMax=512M
+MemoryMin=128M
+CPUQuota=100%
+Slice=duduclaw-tcb.slice
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger
+# /etc is writable only for root account/ACL quarantine after interrupted provisioning.
+# Normal provisioning still requires G's approved installation operation.
+# HX helper slots: spawnd creates rt-init/rt-runtime/hx leaves inside delegated run
+# units only. The rest of /sys/fs/cgroup stays read-only (ProtectControlGroups=yes).
+ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=mnt
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_KILL CAP_CHOWN CAP_FOWNER CAP_AUDIT_WRITE
+StandardOutput=null
+StandardError=null

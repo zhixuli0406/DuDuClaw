@@ -142,6 +142,8 @@ impl MethodHandler {
         &self,
         params: Value,
         reader: crate::google_identity::mailbox::Reader,
+        // v1.81 P1d: Personal employees the caller does not own.
+        hidden: std::collections::BTreeSet<String>,
     ) -> WsFrame {
         let agent = params
             .get("agent_id")
@@ -170,6 +172,7 @@ impl MethodHandler {
                 .inbox
                 .into_iter()
                 .filter(|m| reader.allows(m))
+                .filter(|m| !hidden.contains(&m.agent_id))
                 .filter(|m| include_archived || !m.archived)
                 .filter(|m| agent.as_deref().is_none_or(|a| m.agent_id == a))
                 .take(limit.clamp(1, crate::mail::MAX_QUERY_LIMIT))
@@ -276,7 +279,8 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_mail_outbox(&self, params: Value) -> WsFrame {
+    /// `hidden`: v1.81 P1d — Personal employees the caller does not own.
+    pub(crate) async fn handle_mail_outbox(&self, params: Value, hidden: std::collections::BTreeSet<String>) -> WsFrame {
         let agent = params
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -313,6 +317,7 @@ impl MethodHandler {
             Ok(items) => {
                 let drafts: Vec<Value> = items
                     .iter()
+                    .filter(|m| !hidden.contains(&m.agent_id))
                     .map(|m| {
                         json!({
                             "mail_id": m.mail_id,
@@ -339,7 +344,10 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_mail_decide(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_mail_decide(&self, mut params: Value, ctx: &UserContext) -> WsFrame {
+        // v1.81 P1c: a Personal employee's mail card needs its owner or an
+        // audited Admin step-up (`personal_decide_gate.rs`).
+        let step_up = super::personal_data_gate::take_step_up(&mut params);
         let Some(mail_id) = params
             .get("mail_id")
             .and_then(|v| v.as_str())
@@ -398,7 +406,11 @@ impl MethodHandler {
         // deciding it — otherwise a crafted mail_id could be used to decide an
         // unrelated approval through this narrower gate.
         match broker.get(&approval_id).await {
-            Ok(Some(rec)) if rec.action_kind == crate::mail::OUTBOUND_ACTION_KIND => {}
+            Ok(Some(rec)) if rec.action_kind == crate::mail::OUTBOUND_ACTION_KIND => {
+                if let Err(frame) = self.personal_decide_gate(ctx, &rec, step_up, "mail.decide").await {
+                    return frame;
+                }
+            }
             Ok(Some(_)) => {
                 return WsFrame::error_response("", "審核紀錄與這封信不相符，已拒絕操作。");
             }

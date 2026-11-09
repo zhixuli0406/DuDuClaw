@@ -1,14 +1,18 @@
 //! Dashboard automation access is tied to the stored record and live direct bindings.
 use super::*;
 
+// v1.81 P1g: a routine of another person's Personal employee is never
+// readable or writable through a creator right or the Admin role.
 fn may_read(ctx: &UserContext, row: &CronTaskRow) -> bool {
-    ctx.is_admin() || row.created_by_user_id.as_deref() == Some(ctx.user_id.as_str())
-        || ctx.has_agent_access(&row.agent_id, AccessLevel::Viewer)
+    !ctx.owner_only_denied(&row.agent_id)
+        && (ctx.is_admin() || row.created_by_user_id.as_deref() == Some(ctx.user_id.as_str())
+            || ctx.has_agent_access(&row.agent_id, AccessLevel::Viewer))
 }
 
 fn may_write(ctx: &UserContext, row: &CronTaskRow) -> bool {
-    ctx.is_admin() || row.created_by_user_id.as_deref() == Some(ctx.user_id.as_str())
-        || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator)
+    !ctx.owner_only_denied(&row.agent_id)
+        && (ctx.is_admin() || row.created_by_user_id.as_deref() == Some(ctx.user_id.as_str())
+            || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator))
 }
 
 fn prompt_only(row: &CronTaskRow) -> bool {
@@ -47,6 +51,14 @@ impl MethodHandler {
 
     pub(crate) async fn handle_scoped_cron(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
         if ctx.is_admin() {
+            // v1.81 P1g: a cron routine makes its employee run work, so on
+            // another person's Personal employee it is owner-only — the
+            // Admin path resolves the row's employee (by id or name) and the
+            // named target before any handler. `cron.list` drops those rows
+            // in the dispatch response filter (`personal_p1g_gate`).
+            if let Err(frame) = self.p1g_admin_cron_guard(method, &params, ctx).await {
+                return frame;
+            }
             return match method {
                 "cron.list" => self.handle_cron_list().await,
                 "cron.add" => self.handle_cron_add(params).await,

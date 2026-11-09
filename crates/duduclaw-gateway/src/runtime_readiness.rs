@@ -3,9 +3,12 @@ use std::path::{Path, PathBuf};
 
 pub const PROTECTED_SERVICE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Native Linux protected mode. SR5 round 3 N3: the one durable latch
+/// ([`duduclaw_core::protected_mode::active`]: the environment flag OR the
+/// root-owned mode marker / the service home's confirmed employee index),
+/// never the environment alone.
 pub fn is_protected_linux() -> bool {
-    cfg!(target_os = "linux")
-        && std::env::var("DUDUCLAW_PROTECTED_KEY_MODE").as_deref() == Ok("native-systemd")
+    duduclaw_core::protected_mode::active()
 }
 
 /// Fixed operator guidance. Never copy the operator's CLI credential store.

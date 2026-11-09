@@ -106,6 +106,9 @@ mod skills_list_rpc;
 mod skills_recent_rpc;
 mod skills_manage_rpc;
 mod skills_install_request;
+// SR5 item 1: where a skill / MCP install may write (live employee, Personal
+// owner authorization of an approved request).
+pub(crate) mod skills_install_target;
 mod skills_custom;
 mod cron_rpc;
 mod cron_scoped_rpc;
@@ -123,6 +126,7 @@ mod experts_generate_rpc;
 mod experts_rpc;
 mod experts_import_rpc;
 mod system_config_rpc;
+mod protected_update_rpc;
 mod audit_rpc;
 mod security_rpc;
 mod credential_audit_rpc;
@@ -168,6 +172,10 @@ mod mcp_ecosystem_rpc;
 pub use mcp_ecosystem_rpc::{finish_remote_sign_in, install_remote_entry_for_callback};
 mod google_rpc;
 mod google_identity_rpc;
+// v1.81 F5 UI-RPC: protected-mode Google tenant-source settings (Admin + step-up).
+mod google_tenant_settings_rpc;
+// v1.81 SR4 item 1: Admin attestation of a Google delegate subject (Admin + step-up).
+mod google_delegate_attestation_rpc;
 mod google_personal_rpc;
 mod accounts_util;
 mod tasks_rpc;
@@ -238,6 +246,17 @@ mod system_update_config_v168;
 mod tick_sources_rpc;
 mod channel_ingress_rpc;
 mod computer_workspaces_rpc;
+mod isolation_recording_rpc;
+mod isolation_connectors_rpc;
+mod isolation_employee_rpc;
+// F6g: the v2 employee-dir digest and marker rules for the adoption engine.
+pub(crate) use isolation_employee_rpc::employee_dirs;
+mod personal_data_gate;
+mod personal_decide_gate;
+mod personal_delegation_gate;
+mod personal_p1d_gate;
+mod personal_p1g_gate;
+mod personal_push;
 mod computer_sessions_rpc;
 mod computer_team_rpc;
 mod computer_watch_links_rpc;
@@ -463,7 +482,16 @@ impl MethodHandler {
         // Keep the shared dispatcher off the caller's async state. At -O0
         // its ~21 KiB future is otherwise copied through each outer poll
         // frame and repeated calls can exhaust a default worker stack.
-        Box::pin(self.dispatch(method, params, ctx, conn)).await
+        // v1.81 P1g: one break-glass scope per request — an audited Admin
+        // step-up admits that employee to the ACL for this request only —
+        // and every successful reply drops other people's Personal
+        // employees (unscoped listings hide them).
+        let pre_auth = conn.pre_auth;
+        Box::pin(crate::personal_visibility::with_break_glass_scope(async move {
+            let frame = self.dispatch(method, params, ctx, conn).await;
+            if pre_auth { frame } else { self.personal_hide_rows(method, ctx, frame).await }
+        }))
+        .await
     }
 
     /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).
@@ -555,6 +583,50 @@ impl MethodHandler {
         // RPC path never pays for edition resolution.
         if is_enterprise_only_method(method) && self.resolve_edition_profile().await.is_personal() {
             return enterprise_only_reject_frame();
+        }
+
+        // ── Personal employee private data (v1.81 P1) ───────────────────
+        // Protected mode only: a Personal employee's conversations, memory,
+        // agent files and wiki are readable by its owner; an Admin needs a
+        // fresh step-up and is audited; team grants never reach them. Runs
+        // before any handler or extension sees the call. P1b adds the work
+        // record (tasks, activity, timeline, decisions, canvas), gated on
+        // `agent_id` or on the employee of `task_id`.
+        if let Err(frame) = self.personal_gates_for_params(method, &mut params, ctx).await {
+            return frame;
+        }
+        // v1.81 P1g: default deny — after the gates above (whose audited
+        // step-ups admit their employee for this request), any request that
+        // still names another person's Personal employee is refused unless
+        // the method is on the explicit metadata / management allowlist.
+        if let Err(frame) = self.personal_default_deny(method, &params, ctx).await {
+            return frame;
+        }
+
+        // Migration review is gateway-owned; plugins cannot replace its gates.
+        if method.split('.').take(2).eq(["migration", "confirmations"]) {
+            if let Err(error) = acl::require_role(ctx, UserRole::Admin) {
+                return WsFrame::error_response("", &error);
+            }
+            return self.handle_migration_confirmations(method, params, ctx).await;
+        }
+
+        // Recording lifecycle is host authority and must stay available under
+        // D8. Extensions cannot replace its fresh dashboard-role checks.
+        if matches!(method, "isolation.recording_status" | "isolation.recording_stop") {
+            return self.handle_isolation_recording(method, params, ctx).await;
+        }
+        // Connector routes are isolation authority; no extension sees the namespace.
+        if isolation_connectors_rpc::owns(method) {
+            if let Err(error) = acl::require_role(ctx, UserRole::Admin) {
+                return WsFrame::error_response("", &error);
+            }
+            return boxed_frame(|| self.handle_isolation_connectors(method, params, ctx)).await;
+        }
+        // Protected employee proposals are isolation authority too: the
+        // handler applies the per-method role (self-service or Admin + step-up).
+        if isolation_employee_rpc::owns(method) {
+            return boxed_frame(|| self.handle_isolation_employee(method, params, ctx)).await;
         }
 
         // Session administration cannot be replaced by an extension. The
@@ -701,5 +773,11 @@ impl MethodHandler {
 }
 
 mod mfa_rpc;
+mod migration_confirmations_rpc;
+mod migration_authority;
+pub(crate) use migration_authority::employee::resolve_confirmed_employee;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use migration_authority::employee::{save_confirmed_receipt, save_confirmed_receipt_gated};
+pub(crate) use migration_authority::stage_import_proposals;
 mod session_policy_rpc;
 mod a2a_rpc;

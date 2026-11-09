@@ -37,6 +37,7 @@ import { hasMinRole } from '@/lib/roles';
 import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useIsAppliance } from '@/hooks/useIsAppliance';
+import { useProtectedMode } from '@/hooks/useProtectedMode';
 import { CompanyLogo, useCompanyName } from '@/components/brand/CompanyLogo';
 import {
   SidebarHeader,
@@ -574,12 +575,14 @@ export function AppSidebar() {
   const isAppliance = useIsAppliance(hasMinRole(user?.role, 'admin'));
   // D6: the org chart's progressive-disclosure gate reuses the roster that's
   // already being fetched for the LIVE staff zone — no second RPC.
+  const protectedMode = useProtectedMode();
   const ctx = {
     hasOperatorAccess,
     forksExist,
     isDesktop: isTauri(),
     agentCount: agents.length,
     isAppliance,
+    protectedMode,
   };
 
   const workItems = filterVisible(navGroups[0].items, user?.role, isPersonal, ctx);

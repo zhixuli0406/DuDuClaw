@@ -26,21 +26,32 @@ pub(super) async fn spawn_claude_cli_with_env(
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    let protected = duduclaw_core::execution_gate::isolation_required();
+    if protected {
+        if !env_vars.is_empty() || claude_session_id.is_some() || effort.is_some() {
+            return Err(crate::claude_runner::protected_claude_options_refusal());
+        }
+        work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?;
+    }
+
     // Find claude binary
-    let claude_path =
-        duduclaw_core::which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+    let claude_path = if protected { "root-selected-claude".to_string() } else {
+        duduclaw_core::which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?
+    };
 
     // API key is optional — OAuth users authenticate via OS keychain.
     // Only set ANTHROPIC_API_KEY env var if we have one (as backup/override).
     // Skipped when the caller provides explicit env_vars (rotator path).
-    let api_key = if env_vars.is_empty() {
+    let api_key = if !protected && env_vars.is_empty() {
         get_api_key(home_dir).await
     } else {
         None
     };
 
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
-    let hook_args = crate::agent_hook_installer::claude_hook_args(home_dir, work_dir, false)?;
+    let hook_args = if protected { Vec::new() } else {
+        crate::agent_hook_installer::claude_hook_args(home_dir, work_dir, false)?
+    };
 
     // WP-8B (credentials doctrine P3, 2026-08): stop the child from
     // inheriting the gateway's full environment — that used to leak every
@@ -56,7 +67,9 @@ pub(super) async fn spawn_claude_cli_with_env(
     // `false` ⇒ byte-identical to the call above. Every spawn that actually
     // carries one of those names is audit-logged (names only, never
     // values).
-    let git_env_granted = duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
+    let git_env_granted = if protected { Vec::new() } else {
+        duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities)
+    };
     if !git_env_granted.is_empty() {
         let agent_id = work_dir
             .and_then(|d| d.file_name())
@@ -198,7 +211,7 @@ pub(super) async fn spawn_claude_cli_with_env(
     let _mcp_proxy_guard: Option<tempfile::TempPath>;
     // Set working directory to agent dir so Claude can access agent config
     // (.claude/, CLAUDE.md, .mcp.json) and project files (docs/, etc.)
-    if let Some(dir) = work_dir {
+    if let Some(dir) = work_dir.filter(|_| !protected) {
         // `.mcp.json` platform fix: regenerate the DuDuClaw entry before the
         // CLI starts every server the file lists; a file that cannot be
         // confirmed refuses this spawn (fail closed, audited).
@@ -272,7 +285,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         std::borrow::Cow::Borrowed(system_prompt)
     };
     let system_prompt = system_prompt_cli.as_ref();
-    let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+    let _prompt_guard: Option<tempfile::TempPath> = if !protected && !system_prompt.is_empty() {
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
                 use std::io::Write;
@@ -351,17 +364,42 @@ pub(super) async fn spawn_claude_cli_with_env(
     cmd.kill_on_drop(true);
     // Own process group: an aborted or timed-out turn kills the CLI AND the
     // processes it started (MCP servers, tool subprocesses), not just the CLI.
-    let admission = crate::autonomous_runtime::admit_current().await?;
-    let (mut child, mut group_guard) = crate::process_group::spawn_guarded(&mut cmd)
-        .map_err(|e| format!("claude CLI spawn error: {e}"))?;
-    crate::autonomous_runtime::mark_handoff();
-    drop(admission);
-    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    #[cfg(all(test, unix))]
+    if let Ok(capture) = thinking_tests::COMMAND_CAPTURE.try_with(Arc::clone) {
+        *capture.lock().unwrap() = Some(cmd);
+        return Err("channel command captured before backend execution".into());
+    }
+    #[cfg(target_os = "linux")]
+    let mut prompt_writer = None;
+    let mut child = if protected {
+        #[cfg(target_os = "linux")]
+        {
+            let (child, writer) = crate::isolation_mcp::runtime::spawn_claude(
+                work_dir.ok_or_else(crate::claude_runner::protected_claude_options_refusal)?,
+                user_message, system_prompt, model).await?;
+            prompt_writer = Some(writer);
+            child
+        }
+        #[cfg(not(target_os = "linux"))]
+        { return Err(crate::claude_runner::protected_claude_options_refusal()); }
+    } else {
+        let admission = crate::autonomous_runtime::admit_current().await?;
+        let child = duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Claude,
+        crate::process_group::BackendChild::spawn_class(&mut cmd, crate::process_group::execution_class(
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)),
+    ).await
+        .map_err(|e| crate::process_group::backend_error(e, "claude CLI spawn error"))?;
+        crate::autonomous_runtime::mark_handoff();
+        drop(admission);
+        child
+    };
+    let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
     // Drain stderr concurrently and keep the last ~2 KiB for error diagnostics.
     // Without draining, claude CLI may block if stderr pipe fills up (>64 KiB).
-    let stderr_pipe = child.stderr.take();
+    let stderr_pipe = child.child().stderr.take();
     let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     if let Some(pipe) = stderr_pipe {
         let buf = stderr_buf.clone();
@@ -512,8 +550,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                     Ok(None) => break,
                     // Read error
                     Err(e) => {
-                        group_guard.kill_now();
-                        let _ = child.kill().await;
+                        child.kill_and_reap().await;
                         return Err(format!("claude CLI read error: {e}"));
                     }
                     // Got a line — parse stream-json event
@@ -713,8 +750,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                                             .get("result")
                                             .and_then(|r| r.as_str())
                                             .unwrap_or("Unknown stream-json error");
-                                        group_guard.kill_now();
-                                        let _ = child.kill().await;
+                                        child.kill_and_reap().await;
                                         // Include captured stderr tail in the error so we can
                                         // diagnose cases where Claude CLI sets is_error=true
                                         // without a meaningful `result` text (e.g. --resume
@@ -815,8 +851,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                                     // newer claude-code versions emit alongside the
                                     // synthetic assistant message on auth failure.
                                     if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
-                                        group_guard.kill_now();
-                                        let _ = child.kill().await;
+                                        child.kill_and_reap().await;
                                         return Err(format!(
                                             "claude CLI assistant error: {err}"
                                         ));
@@ -964,8 +999,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                 warn!(
                     "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process"
                 );
-                group_guard.kill_now();
-                let _ = child.kill().await;
+                child.kill_and_reap().await;
                 if result_text.is_empty() && !assistant_text.is_empty() {
                     // No authoritative `result` text (tool-use turn, or the CLI
                     // omitted it) — the accumulated assistant prose IS the reply.
@@ -989,8 +1023,10 @@ pub(super) async fn spawn_claude_cli_with_env(
     thinking.finish();
 
     // Wait for process to exit
-    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
-    group_guard.disarm();
+    #[cfg(target_os = "linux")]
+    if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
+    let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
+    child.disarm();
 
     // Snapshot stderr tail for error diagnostics.
     let stderr_tail: String = stderr_buf

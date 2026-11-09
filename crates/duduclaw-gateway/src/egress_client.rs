@@ -95,6 +95,7 @@ fn cache() -> &'static Mutex<TaintCache> {
 }
 
 fn checked_turn_id() -> Result<String, &'static str> {
+    if let Some(turn) = crate::isolation_egress::turn() { return Ok(turn); }
     checked_identity(
         std::env::var_os(duduclaw_core::ENV_TRUST_TURN_ID),
         std::env::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS),
@@ -107,6 +108,7 @@ fn checked_identity(primary: Option<std::ffi::OsString>, alias: Option<std::ffi:
 }
 
 fn turn_id() -> Option<String> {
+    if let Some(turn) = crate::isolation_egress::turn() { return Some(turn); }
     resolve_turn_id(
         std::env::var_os(duduclaw_core::ENV_TRUST_TURN_ID),
         std::env::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS),
@@ -231,12 +233,21 @@ pub struct PrivateRead {
     agent: String,
     turn: String,
     id: String,
+    direct: bool,
 }
 
 impl PrivateRead {
     pub(crate) fn id(&self) -> &str { &self.id }
 
     pub async fn finish(self, payload: bool) -> Result<(), String> {
+        if self.direct {
+            crate::egress_guard::finish_turn(&self.agent, Some(&self.turn), &self.id, payload)?;
+            if payload {
+                let state = crate::egress_guard::query_turn(&self.agent, Some(&self.turn));
+                merge((self.home, self.agent, self.turn), state);
+            }
+            return Ok(());
+        }
         let state = exchange(&self.home, &self.agent, &self.turn, "finish", None, Some(&self.id), Some(payload)).await?;
         if payload {
             merge((self.home, self.agent, self.turn), state);
@@ -260,7 +271,8 @@ pub async fn reserve(home: &Path, agent: &str, tool: &str) -> Result<(PrivateRea
     let id = uuid::Uuid::new_v4().to_string();
     let state = exchange(home, agent, &turn, "reserve", Some(tool), Some(&id), None).await?;
     let state = merge((home.into(), agent.into(), turn.clone()), state);
-    Ok((PrivateRead { home: home.into(), agent: agent.into(), turn, id }, state))
+    Ok((PrivateRead { home: home.into(), agent: agent.into(), turn, id,
+        direct: crate::isolation_egress::current(home, agent).is_some() }, state))
 }
 
 /// A failed reservation cannot let another process receive untracked private data.
@@ -348,6 +360,10 @@ impl SinkLease {
     }
 
     pub(crate) async fn acquire_id(home: &Path, agent: &str, own_read: Option<&str>) -> Result<(Self, Taint), String> {
+        if let Some(identity) = crate::isolation_egress::current(home, agent) {
+            let identity = identity?;
+            return Self::direct(home, agent, Some(&identity.turn), own_read);
+        }
         let turn = read_turn_id(checked_turn_id())?;
         // Construct the guard before awaiting: cancellation after gateway
         // admission must still attempt release using this exact lease id.
@@ -453,6 +469,14 @@ async fn exchange_connector_value(
     source: Option<&str>, reservation: Option<&str>, payload: Option<bool>, own_read: Option<&str>,
     connector_ref: Option<&str>, remote_server: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    if let Some(identity) = crate::isolation_egress::current(home, agent) {
+        let identity = identity?;
+        if identity.turn != turn { return Err("isolated egress turn mismatch".into()); }
+        return crate::egress_guard::isolated_exchange(home, agent, turn, op,
+            source, reservation, payload, own_read, connector_ref, remote_server);
+    }
+    // The gateway key / employee token identity check now lives in
+    // `exchange_signed_body`, shared with `request_mail_approval`.
     let route = match op {
         "recipients" => crate::egress_guard::RECIPIENTS_ROUTE,
         "mark" => crate::egress_guard::MARK_ROUTE,

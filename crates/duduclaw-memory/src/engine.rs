@@ -573,13 +573,73 @@ fn map_temporal_record(r: &rusqlite::Row) -> rusqlite::Result<TemporalRecord> {
     })
 }
 
+/// Busy handler installed on every file-backed memory connection before any
+/// other statement runs.
+const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Extra attempts for the WAL switch and the schema transaction when SQLite
+/// still reports BUSY (the journal-mode switch never waits; a transaction can
+/// outlast the busy handler on a loaded host).
+const OPEN_BUSY_RETRIES: u32 = 8;
+
+/// SQLITE_BUSY / SQLITE_LOCKED (any extended code).
+fn is_sqlite_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Same check for an error already turned into text by a schema helper.
+fn is_busy_message(msg: &str) -> bool {
+    msg.contains("database is locked") || msg.contains("database is busy")
+        || msg.contains("database table is locked")
+}
+
+/// 20 ms doubling to 640 ms, plus up to 30 ms of jitter so racing openers do
+/// not retry in lockstep.
+fn busy_backoff(attempt: u32) {
+    let base = 20u64 << attempt.min(5);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos() ^ std::process::id()) % 30)
+        .unwrap_or(0);
+    std::thread::sleep(std::time::Duration::from_millis(base + jitter));
+}
+
+/// A failed schema-init attempt, and whether it is worth retrying.
+struct InitError {
+    error: DuDuClawError,
+    busy: bool,
+}
+
+impl InitError {
+    fn sqlite(e: rusqlite::Error) -> Self {
+        Self { busy: is_sqlite_busy(&e), error: DuDuClawError::Memory(e.to_string()) }
+    }
+
+    fn memory(e: DuDuClawError) -> Self {
+        Self { busy: is_busy_message(&e.to_string()), error: e }
+    }
+}
+
 impl SqliteMemoryEngine {
     /// Open (or create) a database at `db_path` and initialise tables.
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn =
             Connection::open(db_path).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        // The busy handler goes on FIRST, as its own call: several processes
+        // (two `duduclaw mcp-server` children, the gateway) open this file at
+        // once. The old `"PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"`
+        // batch stopped at a BUSY journal-mode switch, so the timeout was never
+        // set and every schema statement after it failed at once with
+        // "database is locked".
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT)
+            .map_err(|e| DuDuClawError::Memory(format!("busy_timeout: {e}")))?;
+        Self::enable_wal(&conn, db_path);
         Self::init_tables(&conn)?;
+        // F6fb item 2: every write carrying a label goes through the gate.
+        crate::label_gate::install_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         info!(?db_path, "SQLite memory engine initialised");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -604,6 +664,7 @@ impl SqliteMemoryEngine {
         let conn =
             Connection::open_in_memory().map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         Self::init_tables(&conn)?;
+        crate::label_gate::install_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         info!("SQLite in-memory memory engine initialised");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -808,6 +869,7 @@ impl SqliteMemoryEngine {
             None => return Ok(0),
         };
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let now_rfc = Utc::now().to_rfc3339();
         let mut stmt = conn
             .prepare(
@@ -923,7 +985,7 @@ impl SqliteMemoryEngine {
         // cached (opt-in + embedder attached). Failure-tolerant (warn + skip).
         if self.retrieval_weights.graph_embed_seed {
             if let Some(embedder) = self.embedder.clone() {
-                self.ensure_entity_embeddings(conn, &graph, agent_id, embedder.as_ref());
+                self.ensure_entity_embeddings(conn, &graph, agent_id, embedder.as_ref())?;
             }
         }
 
@@ -996,9 +1058,10 @@ impl SqliteMemoryEngine {
         graph: &crate::graph_rank::TripleGraph,
         agent_id: &str,
         embedder: &dyn crate::vector::EmbeddingProvider,
-    ) {
+    ) -> Result<()> {
         let model = embedder.id();
         for name in graph.entity_names() {
+            crate::isolation_io::verify()?;
             let exists: bool = conn
                 .query_row(
                     "SELECT 1 FROM entity_embedding
@@ -1015,13 +1078,15 @@ impl SqliteMemoryEngine {
             match embedder.embed(name) {
                 Ok(vec) if !vec.iter().all(|x| *x == 0.0) => {
                     let blob = crate::vector::encode_vec(&vec);
-                    if let Err(e) = conn.execute(
-                        "INSERT OR REPLACE INTO entity_embedding
-                            (agent_id, entity, model, vec) VALUES (?1, ?2, ?3, ?4)",
-                        params![agent_id, name, model, blob],
-                    ) {
-                        warn!(agent_id, entity = %name, "entity embed store failed: {e}");
-                    }
+                    crate::isolation_io::verify()?;
+                    Self::in_immediate_txn(conn, || {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO entity_embedding
+                                (agent_id, entity, model, vec) VALUES (?1, ?2, ?3, ?4)",
+                            params![agent_id, name, model, blob],
+                        ).map_err(|e| DuDuClawError::Memory(format!("entity embedding: {e}")))?;
+                        Ok(())
+                    })?;
                 }
                 Ok(_) => {} // empty/zero vector — nothing useful to store
                 Err(e) => {
@@ -1029,6 +1094,7 @@ impl SqliteMemoryEngine {
                 }
             }
         }
+        Ok(())
     }
 
     /// D3.4 — entity node indices whose stored embedding is nearest the query
@@ -1102,6 +1168,7 @@ impl SqliteMemoryEngine {
             ));
         }
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         // Flatten: resolve canonical's own canonical (one level is enough since
         // the table is always kept flat by this same rule).
         if let Some(deeper) = conn
@@ -1121,13 +1188,17 @@ impl SqliteMemoryEngine {
             ));
         }
         let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO entity_alias (agent_id, canonical, alias, created_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(agent_id, alias) DO UPDATE SET canonical = excluded.canonical",
-            params![agent_id, canonical_n, alias_n, now],
-        )
-        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Self::in_immediate_txn(&conn, || {
+            crate::isolation_io::verify()?;
+            conn.execute(
+                "INSERT INTO entity_alias (agent_id, canonical, alias, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(agent_id, alias) DO UPDATE SET canonical = excluded.canonical",
+                params![agent_id, canonical_n, alias_n, now],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            Ok(())
+        })?;
         drop(conn);
         self.bump_graph_generation(agent_id);
         Ok(())
@@ -1141,12 +1212,14 @@ impl SqliteMemoryEngine {
             return Ok(false);
         }
         let conn = self.conn.lock().await;
-        let n = conn
-            .execute(
+        crate::isolation_io::verify()?;
+        let n = Self::in_immediate_txn(&conn, || {
+            conn.execute(
                 "DELETE FROM entity_alias WHERE agent_id = ?1 AND alias = ?2",
                 params![agent_id, alias_n],
             )
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         drop(conn);
         if n > 0 {
             self.bump_graph_generation(agent_id);
@@ -1158,6 +1231,7 @@ impl SqliteMemoryEngine {
     /// canonical then alias for deterministic output (D3.2).
     pub async fn list_entity_aliases(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let mut stmt = conn
             .prepare(
                 "SELECT canonical, alias FROM entity_alias WHERE agent_id = ?1
@@ -1185,6 +1259,7 @@ impl SqliteMemoryEngine {
     pub async fn export_graph(&self, agent_id: &str, limit: usize) -> Result<GraphExport> {
         let limit = limit.max(1);
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let now_rfc = Utc::now().to_rfc3339();
         let aliases = crate::graph_rank::load_alias_map(&conn, agent_id)?;
 
@@ -1306,6 +1381,7 @@ impl SqliteMemoryEngine {
         limit: usize,
     ) -> Result<(Vec<MemoryEntry>, Vec<MemoryEntry>)> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let query = |negate: bool| -> Result<Vec<MemoryEntry>> {
             let sql = format!(
                 "SELECT {cols} FROM memories AS m \
@@ -1336,6 +1412,7 @@ impl SqliteMemoryEngine {
     /// Return up to `limit` most-recent memory entries for `agent_id`, newest first.
     pub async fn list_recent(&self, agent_id: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let sql = format!(
             "SELECT {} FROM memories AS m WHERE m.agent_id = ?1 AND m.quarantined = 0 \
              ORDER BY m.timestamp DESC LIMIT ?2",
@@ -1367,6 +1444,7 @@ impl SqliteMemoryEngine {
         memory_id: &str,
     ) -> Result<Option<MemoryEntry>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let sql = format!(
             "SELECT {} FROM memories AS m WHERE m.id = ?1 AND m.agent_id = ?2 LIMIT 1",
             Self::SELECT_COLS
@@ -1449,6 +1527,7 @@ impl SqliteMemoryEngine {
             ));
         }
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         // Build a "?,?,?" placeholder list for the IN clause (one per id).
         let placeholders = std::iter::repeat("?")
             .take(ids.len())
@@ -1492,6 +1571,7 @@ impl SqliteMemoryEngine {
         memory_id: &str,
     ) -> Result<Option<serde_json::Value>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let mut stmt = conn
             .prepare("SELECT metadata FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1")
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
@@ -1532,6 +1612,7 @@ impl SqliteMemoryEngine {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let mut stmt = conn
             .prepare(
                 "SELECT superseded_by FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
@@ -1575,12 +1656,15 @@ impl SqliteMemoryEngine {
         content: &str,
     ) -> Result<bool> {
         let conn = self.conn.lock().await;
-        let n = conn
+        crate::isolation_io::verify()?;
+        let n = Self::in_immediate_txn(&conn, || {
+            conn
             .execute(
                 "UPDATE memories SET content = ?1 WHERE id = ?2 AND agent_id = ?3",
                 params![duduclaw_security::credential_detect::mask(content), memory_id, agent_id],
             )
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         Ok(n > 0)
     }
 
@@ -1597,12 +1681,15 @@ impl SqliteMemoryEngine {
         let mut metadata = metadata.clone();
         duduclaw_security::credential_detect::mask_json(&mut metadata);
         let conn = self.conn.lock().await;
-        let n = conn
+        crate::isolation_io::verify()?;
+        let n = Self::in_immediate_txn(&conn, || {
+            conn
             .execute(
                 "UPDATE memories SET metadata = ?1 WHERE id = ?2 AND agent_id = ?3",
                 params![metadata.to_string(), memory_id, agent_id],
             )
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         Ok(n > 0)
     }
 
@@ -1618,6 +1705,7 @@ impl SqliteMemoryEngine {
         limit: usize,
     ) -> Result<Vec<(MemoryEntry, serde_json::Value)>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let now_rfc = Utc::now().to_rfc3339();
         let sql = format!(
             "SELECT {cols}, m.metadata FROM memories AS m
@@ -1662,6 +1750,7 @@ impl SqliteMemoryEngine {
         tag: &str,
     ) -> Result<bool> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let existing: Option<String> = {
             let mut stmt = conn
                 .prepare("SELECT tags FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1")
@@ -1683,12 +1772,14 @@ impl SqliteMemoryEngine {
         }
         let new_tags =
             serde_json::to_string(&tags).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-        let n = conn
+        let n = Self::in_immediate_txn(&conn, || {
+            conn
             .execute(
                 "UPDATE memories SET importance = ?1, tags = ?2 WHERE id = ?3 AND agent_id = ?4",
                 params![importance, new_tags, memory_id, agent_id],
             )
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         Ok(n > 0)
     }
 
@@ -1700,6 +1791,7 @@ impl SqliteMemoryEngine {
     /// no-op-is-not-an-error contract; WP2 Janus probation-tag graduation).
     pub async fn remove_tag(&self, agent_id: &str, memory_id: &str, tag: &str) -> Result<bool> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let existing: Option<String> = {
             let mut stmt = conn
                 .prepare("SELECT tags FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1")
@@ -1723,12 +1815,14 @@ impl SqliteMemoryEngine {
         }
         let new_tags =
             serde_json::to_string(&tags).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-        let n = conn
+        let n = Self::in_immediate_txn(&conn, || {
+            conn
             .execute(
                 "UPDATE memories SET tags = ?1 WHERE id = ?2 AND agent_id = ?3",
                 params![new_tags, memory_id, agent_id],
             )
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         Ok(n > 0)
     }
 
@@ -1749,6 +1843,7 @@ impl SqliteMemoryEngine {
     pub async fn forget(&self, agent_id: &str, memory_id: &str) -> Result<bool> {
         let bumped = {
             let conn = self.conn.lock().await;
+            crate::isolation_io::verify()?;
 
             // The archive table is created lazily by `run_decay`; a database
             // that has never decayed does not have it yet. Create it with the
@@ -1769,6 +1864,9 @@ impl SqliteMemoryEngine {
                 )",
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            // F6fb2 item 2: a lazily created archive gets the writer-gate
+            // triggers before its first write.
+            crate::label_gate::refresh_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
             // Ownership check up front so a cross-agent id never reaches the
             // archive INSERT (which would leak another agent's content into
@@ -1792,7 +1890,10 @@ impl SqliteMemoryEngine {
                 .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
             let apply = || -> std::result::Result<bool, String> {
-                conn.execute(
+                crate::isolation_io::verify().map_err(|e| e.to_string())?;
+                // F6fb2: the archive copy of a row deleted below is a move
+                // (narrowing), admitted on a refused label for this label only.
+                crate::label_gate::narrowing_write(crate::label_gate::NarrowingWrite::ArchiveMove, Some(agent_id), || conn.execute(
                     "INSERT OR IGNORE INTO memories_archive
                          (id, agent_id, content, timestamp, tags, layer,
                           importance, access_count, last_accessed, source_event)
@@ -1800,7 +1901,7 @@ impl SqliteMemoryEngine {
                             importance, access_count, last_accessed, source_event
                      FROM memories WHERE id = ?1 AND agent_id = ?2",
                     params![memory_id, agent_id],
-                )
+                ))
                 .map_err(|e| format!("archive INSERT failed: {e}"))?;
 
                 conn.execute(
@@ -1815,6 +1916,7 @@ impl SqliteMemoryEngine {
                         params![memory_id, agent_id],
                     )
                     .map_err(|e| format!("memories DELETE failed: {e}"))?;
+                crate::isolation_io::verify().map_err(|e| e.to_string())?;
                 Ok(n > 0)
             };
 
@@ -1912,10 +2014,30 @@ impl SqliteMemoryEngine {
         meta: TemporalMeta,
         provenance: crate::lineage::Provenance,
     ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
+        self.store_temporal_outcome_checked(agent_id, entry, meta, provenance, crate::isolation_io::verify).await
+    }
+
+    /// Adapter-supplied live authority check after the awaited connection lock,
+    /// after BEGIN, and immediately before COMMIT. A refusal rolls back the
+    /// complete temporal/lineage write. The ordinary API keeps its old behavior.
+    pub async fn store_temporal_outcome_checked(
+        &self,
+        agent_id: &str,
+        entry: MemoryEntry,
+        meta: TemporalMeta,
+        provenance: crate::lineage::Provenance,
+        verify: impl Fn() -> Result<()>,
+    ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
+        verify()?;
         Self::in_immediate_txn(&conn, || {
-            self.store_temporal_locked(&conn, agent_id, entry, meta, &provenance)
+            verify()?;
+            let outcome = self.store_temporal_locked(&conn, agent_id, entry, meta, &provenance)?;
+            verify()?;
+            Ok(outcome)
         })
     }
 
@@ -1972,9 +2094,13 @@ impl SqliteMemoryEngine {
     /// long-lived connection is never left inside an open transaction (which
     /// would make every later `BEGIN` fail).
     fn in_immediate_txn<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::isolation_io::verify()?;
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-        match f() {
+        match crate::isolation_io::verify().and_then(|()| f()).and_then(|value| {
+            crate::isolation_io::verify()?;
+            Ok(value)
+        }) {
             Ok(v) => match conn.execute_batch("COMMIT") {
                 Ok(()) => Ok(v),
                 Err(e) => {
@@ -2459,6 +2585,7 @@ impl SqliteMemoryEngine {
     /// not found for this agent. Used by the approval flow / tests.
     pub async fn is_quarantined(&self, agent_id: &str, memory_id: &str) -> Result<Option<bool>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         conn.query_row(
             "SELECT quarantined FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
             params![memory_id, agent_id],
@@ -2504,6 +2631,7 @@ impl SqliteMemoryEngine {
             ));
         }
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         for id in ids {
             // Per-row transaction: a failure leaves earlier rows applied and
             // this one untouched; a retry skips applied rows and re-reports
@@ -2748,6 +2876,7 @@ impl SqliteMemoryEngine {
         }
         let now_str = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let placeholders = std::iter::repeat("?")
             .take(ids.len())
             .collect::<Vec<_>>()
@@ -2766,9 +2895,11 @@ impl SqliteMemoryEngine {
         for id in ids {
             bind.push(id);
         }
-        let n = conn
+        let n = Self::in_immediate_txn(&conn, || {
+            conn
             .execute(&sql, bind.as_slice())
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         drop(conn);
         if n > 0 {
             // D3.1: rejected rows were expired (dropped from the valid set).
@@ -2846,6 +2977,7 @@ impl SqliteMemoryEngine {
     ) -> Result<Option<crate::supersession_guard::HeldClaim>> {
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         Self::in_immediate_txn(&conn, || {
             self.hold_locked(&conn, agent_id, entry, meta, &provenance, admit)
         })
@@ -2949,6 +3081,7 @@ impl SqliteMemoryEngine {
         object: Option<&str>,
     ) -> Result<Option<String>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         Self::find_pending_held_claim_locked(&conn, agent_id, subject, predicate, object)
     }
 
@@ -2987,6 +3120,7 @@ impl SqliteMemoryEngine {
         id: &str,
     ) -> Result<Option<crate::supersession_guard::HeldClaimView>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let row: Option<(String, Option<String>)> = conn
             .query_row(
                 "SELECT content, metadata FROM memories
@@ -3110,6 +3244,7 @@ impl SqliteMemoryEngine {
     ) -> Result<crate::supersession_guard::PromotionReport> {
         let mut report = crate::supersession_guard::PromotionReport::default();
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         for (held_id, digest) in ids {
             let mut one = crate::supersession_guard::PromotionReport::default();
             Self::in_immediate_txn(&conn, || {
@@ -3278,6 +3413,7 @@ impl SqliteMemoryEngine {
         let cutoff = older_than.to_rfc3339();
         let now_str = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let candidates: Vec<(String, String)> = {
             let mut stmt = conn
                 .prepare(
@@ -3325,6 +3461,7 @@ impl SqliteMemoryEngine {
     /// `None` when the id is not found for this agent.
     pub async fn get_origin_trust(&self, agent_id: &str, memory_id: &str) -> Result<Option<f64>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         conn.query_row(
             "SELECT origin_trust FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
             params![memory_id, agent_id],
@@ -3340,6 +3477,7 @@ impl SqliteMemoryEngine {
     /// stamp at least "unattributed").
     pub async fn get_origin(&self, agent_id: &str, memory_id: &str) -> Result<Option<Option<String>>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         conn.query_row(
             "SELECT origin FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
             params![memory_id, agent_id],
@@ -3358,6 +3496,7 @@ impl SqliteMemoryEngine {
         predicate: &str,
     ) -> Result<Vec<TemporalRecord>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence,
@@ -3389,6 +3528,7 @@ impl SqliteMemoryEngine {
         at: DateTime<Utc>,
     ) -> Result<Option<TemporalRecord>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let at_str = at.to_rfc3339();
         let mut stmt = conn
             .prepare(
@@ -3433,91 +3573,97 @@ impl SqliteMemoryEngine {
         since: Option<DateTime<Utc>>,
     ) -> Result<u64> {
         let conn = self.conn.lock().await;
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
-        let since_str = since.map(|t| t.to_rfc3339());
+        crate::isolation_io::verify()?;
+        let count = Self::in_immediate_txn(&conn, || {
+            let now = Utc::now();
+            let now_str = now.to_rfc3339();
+            let since_str = since.map(|t| t.to_rfc3339());
 
-        // ── 1. Collect the currently-valid rows to expire (exact origin match). ──
-        // `datetime()` normalizes both rfc3339 (ingested_at/timestamp) and the
-        // SQLite "YYYY-MM-DD HH:MM:SS" default of `created_at` so the `since`
-        // comparison is representation-agnostic.
-        let target_ids: Vec<String> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id FROM memories
-                     WHERE agent_id = ?1 AND origin = ?2 AND valid_until IS NULL
-                       AND (?3 IS NULL
-                            OR datetime(COALESCE(ingested_at, created_at, timestamp))
-                               >= datetime(?3))",
-                )
-                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-            let rows = stmt
-                .query_map(params![agent_id, origin, since_str], |r| r.get::<_, String>(0))
-                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-            let mut v = Vec::new();
-            for r in rows {
-                v.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+            // ── 1. Collect the currently-valid rows to expire (exact origin match). ──
+            // `datetime()` normalizes both rfc3339 (ingested_at/timestamp) and the
+            // SQLite "YYYY-MM-DD HH:MM:SS" default of `created_at` so the `since`
+            // comparison is representation-agnostic.
+            let target_ids: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id FROM memories
+                         WHERE agent_id = ?1 AND origin = ?2 AND valid_until IS NULL
+                           AND (?3 IS NULL
+                                OR datetime(COALESCE(ingested_at, created_at, timestamp))
+                                   >= datetime(?3))",
+                    )
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params![agent_id, origin, since_str], |r| r.get::<_, String>(0))
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                let mut v = Vec::new();
+                for r in rows {
+                    v.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+                }
+                v
+            };
+
+            if target_ids.is_empty() {
+                return Ok(0);
             }
-            v
-        };
 
-        if target_ids.is_empty() {
-            return Ok(0);
-        }
+            // ── 2. Expire them (single UPDATE mirroring the SELECT predicate). ──
+            crate::isolation_io::verify()?;
+            conn.execute(
+                "UPDATE memories
+                 SET valid_until = ?1, invalidated_by_event = 'origin_purge', invalidated_at = ?1
+                 WHERE agent_id = ?2 AND origin = ?3 AND valid_until IS NULL
+                   AND (?4 IS NULL
+                        OR datetime(COALESCE(ingested_at, created_at, timestamp))
+                           >= datetime(?4))",
+                params![now_str, agent_id, origin, since_str],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
-        // ── 2. Expire them (single UPDATE mirroring the SELECT predicate). ──
-        conn.execute(
-            "UPDATE memories
-             SET valid_until = ?1, invalidated_by_event = 'origin_purge', invalidated_at = ?1
-             WHERE agent_id = ?2 AND origin = ?3 AND valid_until IS NULL
-               AND (?4 IS NULL
-                    OR datetime(COALESCE(ingested_at, created_at, timestamp))
-                       >= datetime(?4))",
-            params![now_str, agent_id, origin, since_str],
-        )
-        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-
-        // ── 3. Cascade: any row deriving from a purged id gets trust ≤ 0.1. ──
-        let purged: std::collections::HashSet<&str> =
-            target_ids.iter().map(|s| s.as_str()).collect();
-        let candidates: Vec<(String, f64, String)> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, origin_trust, derived_from FROM memories
-                     WHERE agent_id = ?1 AND derived_from IS NOT NULL",
-                )
-                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-            let rows = stmt
-                .query_map(params![agent_id], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<f64>>(1)?.unwrap_or(1.0),
-                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    ))
-                })
-                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-            let mut v = Vec::new();
-            for r in rows {
-                v.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+            // ── 3. Cascade: any row deriving from a purged id gets trust ≤ 0.1. ──
+            let purged: std::collections::HashSet<&str> =
+                target_ids.iter().map(|s| s.as_str()).collect();
+            let candidates: Vec<(String, f64, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, origin_trust, derived_from FROM memories
+                         WHERE agent_id = ?1 AND derived_from IS NOT NULL",
+                    )
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params![agent_id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<f64>>(1)?.unwrap_or(1.0),
+                            r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        ))
+                    })
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                let mut v = Vec::new();
+                for r in rows {
+                    v.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+                }
+                v
+            };
+            for (id, trust, derived_json) in candidates {
+                if trust <= 0.1 {
+                    continue; // already at/below the floor — nothing to lower
+                }
+                let cites_purged = serde_json::from_str::<Vec<String>>(&derived_json)
+                    .map(|ids| ids.iter().any(|s| purged.contains(s.as_str())))
+                    .unwrap_or(false);
+                if cites_purged {
+                    crate::isolation_io::verify()?;
+                    conn.execute(
+                        "UPDATE memories SET origin_trust = ?1 WHERE id = ?2 AND agent_id = ?3",
+                        params![trust.min(0.1), id, agent_id],
+                    )
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                }
             }
-            v
-        };
-        for (id, trust, derived_json) in candidates {
-            if trust <= 0.1 {
-                continue; // already at/below the floor — nothing to lower
-            }
-            let cites_purged = serde_json::from_str::<Vec<String>>(&derived_json)
-                .map(|ids| ids.iter().any(|s| purged.contains(s.as_str())))
-                .unwrap_or(false);
-            if cites_purged {
-                conn.execute(
-                    "UPDATE memories SET origin_trust = ?1 WHERE id = ?2 AND agent_id = ?3",
-                    params![trust.min(0.1), id, agent_id],
-                )
-                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-            }
-        }
 
+            Ok(target_ids.len() as u64)
+        })?;
         drop(conn);
         // D3.1: expired rows + lowered-trust derivatives changed the graph.
         self.bump_graph_generation(agent_id);
@@ -3525,10 +3671,10 @@ impl SqliteMemoryEngine {
         info!(
             agent_id,
             origin,
-            expired = target_ids.len(),
+            expired = count,
             "invalidate_by_origin"
         );
-        Ok(target_ids.len() as u64)
+        Ok(count)
     }
 
     /// Resolve the `(subject, predicate)` triple keys for a single memory id
@@ -3542,6 +3688,7 @@ impl SqliteMemoryEngine {
         memory_id: &str,
     ) -> Result<Option<(String, String)>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         conn.query_row(
             "SELECT subject, predicate FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
             params![memory_id, agent_id],
@@ -3581,15 +3728,18 @@ impl SqliteMemoryEngine {
             return Ok(0);
         }
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let now = Utc::now().to_rfc3339();
-        let n = conn
+        let n = Self::in_immediate_txn(&conn, || {
+            conn
             .execute(
                 "UPDATE memories
                  SET valid_until = ?1, invalidated_by_event = ?2, invalidated_at = ?1
                  WHERE agent_id = ?3 AND subject = ?4 AND valid_until IS NULL",
                 params![now, reason, agent_id, subject],
             )
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         drop(conn);
         if n > 0 {
             // Dropping a valid triple invalidates any cached graph snapshot.
@@ -3602,6 +3752,7 @@ impl SqliteMemoryEngine {
     /// (F2b helper). Matches against the JSON-encoded `tags` column.
     pub async fn count_active_with_tag(&self, agent_id: &str, tag: &str) -> Result<u32> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let like = format!("%\"{}\"%", tag.replace('"', ""));
         let n: u32 = conn
             .query_row(
@@ -3634,6 +3785,7 @@ impl SqliteMemoryEngine {
         limit: usize,
     ) -> Result<Vec<DecisionView>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
 
         // Subjects with a currently-valid status=open row, newest first.
         let subjects: Vec<(String, Option<String>)> = {
@@ -3675,6 +3827,7 @@ impl SqliteMemoryEngine {
         decision_id: &str,
     ) -> Result<Option<DecisionView>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let subject = format!("decision:{decision_id}");
         Self::read_decision_view(&conn, agent_id, &subject, None)
     }
@@ -3687,6 +3840,7 @@ impl SqliteMemoryEngine {
         decision_id: &str,
     ) -> Result<Option<String>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let subject = format!("decision:{decision_id}");
         let status: Option<String> = conn
             .query_row(
@@ -3710,15 +3864,20 @@ impl SqliteMemoryEngine {
         decision_id: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let subject = format!("decision:{decision_id}");
         let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE memories SET valid_until = ?1
-             WHERE agent_id = ?2 AND subject = ?3 AND predicate != 'status'
-               AND valid_until IS NULL",
-            params![now, agent_id, subject],
-        )
-        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Self::in_immediate_txn(&conn, || {
+            crate::isolation_io::verify()?;
+            conn.execute(
+                "UPDATE memories SET valid_until = ?1
+                 WHERE agent_id = ?2 AND subject = ?3 AND predicate != 'status'
+                   AND valid_until IS NULL",
+                params![now, agent_id, subject],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            Ok(())
+        })?;
         drop(conn);
         self.bump_graph_generation(agent_id); // D3.1: decision triples expired
         Ok(())
@@ -3734,10 +3893,12 @@ impl SqliteMemoryEngine {
             return Ok(0);
         }
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::days(ttl_days)).to_rfc3339();
         let now_str = now.to_rfc3339();
-        let n = conn
+        let n = Self::in_immediate_txn(&conn, || {
+            conn
             .execute(
                 "UPDATE memories SET valid_until = ?1
                  WHERE agent_id = ?2 AND valid_until IS NULL AND subject LIKE 'decision:%'
@@ -3749,7 +3910,8 @@ impl SqliteMemoryEngine {
                    )",
                 params![now_str, agent_id, cutoff],
             )
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         drop(conn);
         if n > 0 {
             self.bump_graph_generation(agent_id); // D3.1: stale decisions expired
@@ -3763,15 +3925,17 @@ impl SqliteMemoryEngine {
     /// was closed), `false` if nothing matched.
     pub async fn dismiss_decision(&self, agent_id: &str, decision_id: &str) -> Result<bool> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let subject = format!("decision:{decision_id}");
         let now = Utc::now().to_rfc3339();
-        let n = conn
-            .execute(
+        let n = Self::in_immediate_txn(&conn, || {
+            conn.execute(
                 "UPDATE memories SET valid_until = ?1
                  WHERE agent_id = ?2 AND subject = ?3 AND valid_until IS NULL",
                 params![now, agent_id, subject],
             )
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))
+        })?;
         drop(conn);
         if n > 0 {
             self.bump_graph_generation(agent_id); // D3.1: decision triples closed
@@ -3870,6 +4034,7 @@ impl SqliteMemoryEngine {
     /// Ids of the currently valid, non-quarantined rows of one subject.
     async fn valid_row_ids_for_subject(&self, agent_id: &str, subject: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id FROM memories
@@ -3970,6 +4135,7 @@ impl SqliteMemoryEngine {
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
 
         let cleaned: String = query
             .chars()
@@ -4026,6 +4192,7 @@ impl SqliteMemoryEngine {
         limit: usize,
     ) -> Result<Vec<String>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
 
         let cleaned: String = topic
             .chars()
@@ -4128,7 +4295,66 @@ impl SqliteMemoryEngine {
         }
     }
 
+    /// Switch the file to WAL, retrying while another connection holds a
+    /// lock. SQLite's journal-mode change takes its lock without calling the
+    /// busy handler, so `busy_timeout` alone does not cover it. A file that
+    /// stays in rollback mode still works (with a busy handler set), so a
+    /// final failure is logged and opening continues.
+    fn enable_wal(conn: &Connection, db_path: &Path) {
+        for attempt in 0..=OPEN_BUSY_RETRIES {
+            match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+                Ok(mode) => {
+                    if !mode.eq_ignore_ascii_case("wal") {
+                        warn!(?db_path, %mode, "memory DB did not switch to WAL");
+                    }
+                    return;
+                }
+                Err(e) if is_sqlite_busy(&e) && attempt < OPEN_BUSY_RETRIES => {
+                    busy_backoff(attempt);
+                }
+                Err(e) => {
+                    warn!(?db_path, error = %e, "memory DB: could not enable WAL");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Create / migrate the schema. Runs as one `BEGIN IMMEDIATE`
+    /// transaction so processes opening the same file at once take turns:
+    /// the write lock is taken up front (waiting via the busy handler), the
+    /// "already migrated?" checks inside are read under that lock, and no
+    /// opener sees half a migration. A BUSY result is retried a bounded
+    /// number of times with backoff; any other error fails the open.
     fn init_tables(conn: &Connection) -> Result<()> {
+        let mut attempt = 0;
+        loop {
+            match Self::init_tables_once(conn) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.busy && attempt < OPEN_BUSY_RETRIES => {
+                    warn!(attempt, error = %e.error, "memory schema init busy — retrying");
+                    busy_backoff(attempt);
+                    attempt += 1;
+                }
+                Err(e) => return Err(e.error),
+            }
+        }
+    }
+
+    fn init_tables_once(conn: &Connection) -> std::result::Result<(), InitError> {
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(InitError::sqlite)?;
+        if let Err(e) = Self::create_schema(conn) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(InitError::memory(e));
+        }
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(InitError::sqlite(e));
+        }
+        Ok(())
+    }
+
+    fn create_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS memories (
@@ -4382,6 +4608,8 @@ impl MemoryEngine for SqliteMemoryEngine {
     async fn store(&self, agent_id: &str, entry: MemoryEntry) -> Result<()> {
         let entry = mask_memory_entry(entry);
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
         // M1 moat-gate: reject once the Cloud paid-tier quota is hit. No-op when
         // unlimited (quota 0). Runs before any write so a rejection loses nothing.
         self.enforce_quota(&conn)?;
@@ -4464,6 +4692,7 @@ impl MemoryEngine for SqliteMemoryEngine {
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
 
         // Sanitize FTS5 query: strip ALL special characters and operators (BE-H2).
         // Then wrap as a phrase query to prevent boolean operators (AND/OR/NOT/NEAR).
@@ -4646,11 +4875,17 @@ impl MemoryEngine for SqliteMemoryEngine {
         let result_ids: Vec<String> = results.iter().map(|e| e.id.clone()).collect();
         let now_str = now.to_rfc3339();
         // stmt is already dropped here (it went out of scope after query_map)
-        for id in &result_ids {
-            let _ = conn.execute(
-                "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
-                params![now_str, id],
-            );
+        if !result_ids.is_empty() {
+            Self::in_immediate_txn(&conn, || {
+                for id in &result_ids {
+                    crate::isolation_io::verify()?;
+                    conn.execute(
+                        "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
+                        params![now_str, id],
+                    ).map_err(|e| DuDuClawError::Memory(format!("update memory access: {e}")))?;
+                }
+                Ok(())
+            })?;
         }
 
         Ok(results)
@@ -4660,6 +4895,7 @@ impl MemoryEngine for SqliteMemoryEngine {
         // --- Phase 1: fetch entries while holding the lock ---
         let (raw, header) = {
             let conn = self.conn.lock().await;
+            crate::isolation_io::verify()?;
 
             let start_str = window.start.to_rfc3339();
             let end_str = window.end.to_rfc3339();
@@ -4726,6 +4962,18 @@ impl MemoryEngine for SqliteMemoryEngine {
 
 /// Call the `claude` CLI to produce a narrative summary of raw memory entries.
 /// Returns an empty string on any failure so callers can fall back to raw text.
+fn summary_command(claude: &str, prompt: &str, api_key: &str) -> tokio::process::Command {
+    let mut cmd = duduclaw_core::platform::async_command_for(claude);
+    cmd.args(["-p", prompt, "--model", "claude-haiku-4-5", "--output-format", "text"]);
+    cmd.env("ANTHROPIC_API_KEY", api_key);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+
+    cmd
+}
+
 async fn call_claude_summarize(raw_memories: &str) -> String {
     let api_key = match std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()) {
         Some(k) => k,
@@ -4749,15 +4997,16 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
          <memory_entries>\n{escaped_memories}\n</memory_entries>"
     );
 
-    let mut cmd = duduclaw_core::platform::async_command_for(&claude);
-    cmd.args(["-p", &prompt, "--model", "claude-haiku-4-5", "--output-format", "text"]);
-    cmd.env("ANTHROPIC_API_KEY", &api_key);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
-    cmd.kill_on_drop(true);
+    let mut cmd = summary_command(&claude, &prompt, &api_key);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(60),
+        async {
+            duduclaw_core::execution_gate::with_runtime(
+                duduclaw_core::execution_gate::RuntimeKind::Claude,
+                duduclaw_core::execution_gate::spawn(&mut cmd,
+                duduclaw_core::execution_gate::ExecutionClass::Judge)).await?
+                .wait_with_output().await
+        }).await {
         Ok(Ok(out)) if out.status.success() => {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
@@ -4828,6 +5077,8 @@ impl SqliteMemoryEngine {
         let fact = duduclaw_security::credential_detect::mask(fact);
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
@@ -4863,6 +5114,7 @@ impl SqliteMemoryEngine {
     /// Get the most recent key facts for an agent.
     pub async fn get_recent_facts(&self, agent_id: &str, limit: u32) -> Result<Vec<KeyFact>> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, agent_id, fact, channel, chat_id, source_session, timestamp, access_count
@@ -4911,6 +5163,7 @@ impl SqliteMemoryEngine {
         let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
 
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
 
         // FTS5 search with agent_id filter via JOIN
         let mut stmt = conn
@@ -4959,6 +5212,7 @@ impl SqliteMemoryEngine {
     /// Count total key facts for an agent.
     pub async fn count_facts(&self, agent_id: &str) -> Result<u64> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM key_facts WHERE agent_id = ?1",
@@ -4972,24 +5226,30 @@ impl SqliteMemoryEngine {
     /// Bump access count for a fact (used during deduplication).
     pub async fn bump_fact_access(&self, fact_id: &str) -> Result<()> {
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE key_facts SET access_count = access_count + 1 WHERE id = ?1",
-            params![fact_id],
-        )
-        .map_err(|e| DuDuClawError::Memory(format!("bump_fact_access: {e}")))?;
-        Ok(())
+        crate::isolation_io::verify()?;
+        Self::in_immediate_txn(&conn, || {
+            conn.execute(
+                "UPDATE key_facts SET access_count = access_count + 1 WHERE id = ?1",
+                params![fact_id],
+            )
+            .map_err(|e| DuDuClawError::Memory(format!("bump_fact_access: {e}")))?;
+            Ok(())
+        })
     }
 
     /// Purge stale facts older than `max_age_days` with `access_count < min_access`.
     pub async fn purge_stale_facts(&self, agent_id: &str, max_age_days: u32, min_access: u32) -> Result<u64> {
         let conn = self.conn.lock().await;
+        crate::isolation_io::verify()?;
         let cutoff = (Utc::now() - chrono::Duration::days(max_age_days as i64)).to_rfc3339();
-        let count = conn
+        let count = Self::in_immediate_txn(&conn, || {
+            conn
             .execute(
                 "DELETE FROM key_facts WHERE agent_id = ?1 AND timestamp < ?2 AND access_count < ?3",
                 params![agent_id, cutoff, min_access],
             )
-            .map_err(|e| DuDuClawError::Memory(format!("purge_stale_facts: {e}")))?;
+            .map_err(|e| DuDuClawError::Memory(format!("purge_stale_facts: {e}")))
+        })?;
         Ok(count as u64)
     }
 }
@@ -5019,6 +5279,41 @@ pub use subject_listing::{SubjectFact, SubjectTripleForgetReport};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: two `duduclaw mcp-server` children opening one fresh
+    /// `memory.db` at once — one died with "database is locked" because the
+    /// WAL switch failed BUSY before `busy_timeout` was set. Every concurrent
+    /// opener of a fresh file must now succeed and see one consistent schema.
+    #[test]
+    fn concurrent_open_of_fresh_db_all_succeed() {
+        const OPENERS: usize = 8;
+        for round in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = std::sync::Arc::new(dir.path().join(format!("memory-{round}.db")));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+            let handles: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SqliteMemoryEngine::new(&path).map(|_| ()).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            for (i, h) in handles.into_iter().enumerate() {
+                let res = h.join().expect("opener thread panicked");
+                assert!(res.is_ok(), "round {round} opener {i} failed: {res:?}");
+            }
+            let conn = Connection::open(path.as_path()).unwrap();
+            let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+            let ids: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memory_meta WHERE key = 'db_instance_id'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(ids, 1, "exactly one instance id across racing openers");
+        }
+    }
 
     // Security regression; not run (owner forbids builds).
     #[tokio::test]
@@ -5055,6 +5350,94 @@ mod tests {
             last_accessed: None,
             source_event: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn checked_temporal_write_revoked_while_waiting_for_mutex_writes_nothing() {
+        use std::{future::Future, sync::atomic::{AtomicBool, Ordering}, task::Poll};
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let active = AtomicBool::new(true);
+        let held = engine.conn.lock().await;
+        let write = engine.store_temporal_outcome_checked("isolated", make_entry("isolated", "blocked", vec![]),
+            TemporalMeta::default(), crate::lineage::Provenance::test_only(), || {
+                if active.load(Ordering::SeqCst) { Ok(()) }
+                else { Err(DuDuClawError::Memory("capability revoked".into())) }
+            });
+        tokio::pin!(write);
+        std::future::poll_fn(|cx| {
+            assert!(write.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+        active.store(false, Ordering::SeqCst);
+        drop(held);
+        assert!(write.await.is_err());
+        let conn = engine.conn.lock().await;
+        let count: i64 = conn.query_row("SELECT count(*) FROM memories", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn checked_temporal_write_rolls_back_if_authority_changes_inside_transaction() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        let revoke = active.clone();
+        engine.set_publish_hook(Some(Arc::new(move |point| {
+            if point == crate::lineage::HookPoint::AfterFenceCheck { revoke.store(false, Ordering::SeqCst); }
+        })));
+        let result = engine.store_temporal_outcome_checked("isolated", make_entry("isolated", "must roll back", vec![]),
+            TemporalMeta::default(), crate::lineage::Provenance::test_only(), || {
+                if active.load(Ordering::SeqCst) { Ok(()) }
+                else { Err(DuDuClawError::Memory("capability revoked".into())) }
+            }).await;
+        assert!(result.is_err());
+        let conn = engine.conn.lock().await;
+        for table in ["memories", "memory_origins"] {
+            let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 0, "{table} was committed after revocation");
+        }
+        assert!(conn.is_autocommit(), "refusal must leave the connection usable");
+        drop(conn);
+        engine.set_publish_hook(None);
+        engine.store_temporal_outcome("host", make_entry("host", "ordinary writes still work", vec![]),
+            TemporalMeta::default(), crate::lineage::Provenance::test_only()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoped_profile_write_rolls_back_lineage_on_mid_transaction_revoke() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let revoke = live.clone();
+        engine.set_publish_hook(Some(Arc::new(move |point| {
+            if point == crate::lineage::HookPoint::AfterFenceCheck { revoke.store(false, Ordering::SeqCst); }
+        })));
+        let result = duduclaw_mcp_boundary::io_authority::scope(crate::isolation_io::test_context(live),
+            crate::user_profile::record_trait_outcome(&engine, "isolated", "owner", "likes", "tea",
+                crate::origin::USER_PROFILE.name, 0.6, crate::lineage::Provenance::test_only())).await;
+        assert!(result.is_err());
+        let conn = engine.conn.lock().await;
+        for table in ["memories", "memory_origins"] {
+            let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 0);
+        }
+        assert!(conn.is_autocommit());
+    }
+
+    #[tokio::test]
+    async fn scoped_alias_wait_rechecks_live_authority() {
+        use std::{future::Future, sync::{Arc, atomic::{AtomicBool, Ordering}}, task::Poll};
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let held = engine.conn.lock().await;
+        let write = duduclaw_mcp_boundary::io_authority::scope(crate::isolation_io::test_context(live.clone()),
+            engine.add_entity_alias("isolated", "canonical", "alias"));
+        tokio::pin!(write);
+        std::future::poll_fn(|cx| { assert!(write.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
+        live.store(false, Ordering::SeqCst);
+        drop(held);
+        assert!(write.await.is_err());
+        assert!(engine.list_entity_aliases("isolated").await.unwrap().is_empty());
     }
 
     // ── WP15: user memories vs. system learning signals ──────────────────
@@ -7329,5 +7712,20 @@ mod tests {
 
         // Owner does see it.
         assert_eq!(engine.superseded_fact_ids(owner, &[a.clone()]).await.unwrap(), vec![a]);
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    #[tokio::test]
+    async fn memory_judge_backend_command_matches_legacy_argv_env_cwd() {
+        let command = super::summary_command("claude", "prompt $HOME;\n繁體中文", "fixture-secret");
+        let mut legacy = duduclaw_core::platform::async_command_for("claude");
+        legacy.args(["-p", "prompt $HOME;\n繁體中文", "--model", "claude-haiku-4-5", "--output-format", "text"])
+            .env("ANTHROPIC_API_KEY", "fixture-secret")
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).kill_on_drop(true);
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
     }
 }

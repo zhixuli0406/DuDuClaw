@@ -84,8 +84,18 @@ impl UserDb {
             [member.email.trim()], |row| row.get(0),
         ).map_err(|_| "member_storage_unavailable")?;
         if duplicate { return Err("member_email_exists"); }
+        // A Personal employee (isolation mirror row) belongs to its owner only;
+        // refuse explicitly instead of failing on the mirror trigger.
+        for binding in &member.bindings {
+            match crate::db::personal_agent_owner(&tx, &binding.agent_name) {
+                Ok(None) => {}
+                Ok(Some(_)) => return Err("member_agent_personal"),
+                Err(_) => return Err("member_storage_unavailable"),
+            }
+        }
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
+        let since = crate::admin_eligibility::high_water(&tx).map_err(|_| "member_storage_unavailable")?;
         tx.execute(
             "INSERT INTO users(id,email,display_name,password_hash,role,status,created_at,updated_at,
              department,must_change_password,primary_agent_id)
@@ -115,6 +125,8 @@ impl UserDb {
             "INSERT INTO auth_audit_log(user_id,action,target,detail,timestamp) VALUES(?1,'user.create_member',?2,?3,?4)",
             params![actor, id, detail, now],
         ).map_err(|_| "member_storage_unavailable")?;
+        // F6 S2: an Admin created here records its creator.
+        crate::admin_eligibility::stamp_actor(&tx, since, actor).map_err(|_| "member_storage_unavailable")?;
         bump_acl_generation(&tx).map_err(|_| "member_storage_unavailable")?;
         let user = load_user(&tx, &id).map_err(|_| "member_storage_unavailable")?
             .ok_or("member_storage_unavailable")?;

@@ -170,8 +170,17 @@ fn dedup_trimmed(raw: Vec<String>) -> Vec<String> {
 
 /// `db_sources.grants.list` — the whole grant matrix in one read.
 pub async fn list(home_dir: &Path) -> WsFrame {
+    list_hiding(home_dir, &BTreeSet::new()).await
+}
+
+/// [`list`] without the employees in `hidden` (v1.81 P1h: another person's
+/// Personal employees in protected mode). Their rows carry no `agent_id`
+/// field the generic hidden-row filter could match (`id`), so they are left
+/// out here: no row, no holder entry, no stale entry.
+pub async fn list_hiding(home_dir: &Path, hidden: &BTreeSet<String>) -> WsFrame {
     let loaded = duduclaw_db::load_db_sources(home_dir).await;
-    let rows = scan_agent_grants(home_dir);
+    let mut rows = scan_agent_grants(home_dir);
+    rows.retain(|row| !hidden.contains(&row.id));
     let configured: BTreeSet<&str> = loaded.sources.iter().map(|s| s.name.as_str()).collect();
 
     // Every configured source, including ones nobody holds (`agents: []`) —
@@ -249,6 +258,20 @@ fn holds(row: &AgentGrantRow, source: &str) -> bool {
 /// Agents in `agents` that lack the grant gain it; agents that hold it and are
 /// not listed lose it; every other source in every agent's list is untouched.
 pub async fn set(registry: &Registry, home_dir: &Path, params: Value) -> WsFrame {
+    set_hiding(registry, home_dir, params, &BTreeSet::new()).await
+}
+
+/// Shown when `grants.set` names an employee hidden from the caller.
+const HIDDEN_AGENT_REFUSED: &str = "不允許此操作。";
+
+/// [`set`] for a caller from whom `hidden` is hidden (v1.81 P1h N5: another
+/// person's Personal employees in protected mode). The caller never sees
+/// them in [`list_hiding`], so leaving them out of `agents` must not revoke
+/// their grants: their current grants are merged back (never added, never
+/// removed), and neither the reply nor the activity row names them. Naming
+/// one in `agents` is refused before any write (the dispatch default deny
+/// refuses it first; this is the defence in depth).
+pub async fn set_hiding(registry: &Registry, home_dir: &Path, params: Value, hidden: &BTreeSet<String>) -> WsFrame {
     let name = match required_source_name(&params) {
         Ok(n) => n,
         Err(msg) => return WsFrame::error_response("", &msg),
@@ -265,11 +288,16 @@ pub async fn set(registry: &Registry, home_dir: &Path, params: Value) -> WsFrame
         Ok(v) => v,
         Err(msg) => return WsFrame::error_response("", &msg),
     };
+    if requested.iter().any(|id| hidden.contains(id)) {
+        return WsFrame::error_response("", HIDDEN_AGENT_REFUSED);
+    }
 
     let rows = scan_agent_grants(home_dir);
+    // Hidden holders keep their grant untouched (merged back): they are not
+    // part of the diff at all.
     let holders: Vec<String> = rows
         .iter()
-        .filter(|r| holds(r, &canonical))
+        .filter(|r| holds(r, &canonical) && !hidden.contains(&r.id))
         .map(|r| r.id.clone())
         .collect();
 
@@ -393,6 +421,14 @@ async fn write_grant(
 ) -> Result<(), String> {
     let source = source.to_string();
     crate::channel_reply::update_agent_toml_with(registry, agent_id, move |table| {
+        apply_grant_to_table(table,&source,grant)
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Shared normal grant mutation; callers validate the source before granting.
+pub(crate) fn apply_grant_to_table(table:&mut toml::Table,source:&str,grant:bool)->Result<(),String> {
         let section = table
             .entry("capabilities")
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -400,11 +436,11 @@ async fn write_grant(
             .ok_or_else(|| "agent.toml 的 [capabilities] 不是一個表格".to_string())?;
         let mut list = read_grant_array(section);
         if grant {
-            if !list.iter().any(|g| g == &source) {
-                list.push(source.clone());
+            if !list.iter().any(|g| g == source) {
+                list.push(source.to_string());
             }
         } else {
-            list.retain(|g| g != &source);
+            list.retain(|g| g != source);
         }
         if list.is_empty() {
             section.remove(GRANT_KEY);
@@ -415,9 +451,6 @@ async fn write_grant(
             );
         }
         Ok(())
-    })
-    .await
-    .map(|_| ())
 }
 
 /// Read `[capabilities] db_sources` out of a raw table, tolerating the same
@@ -983,6 +1016,53 @@ skill_security_scan = true
             .await
             .unwrap();
         assert_eq!(total, 1);
+    }
+
+    /// P1h (N5): an Admin who cannot see another person's Personal employee
+    /// replaces a source's grant set without touching that employee's grant,
+    /// and neither the reply nor the activity row names it.
+    #[tokio::test]
+    async fn p1h_grants_set_merges_hidden_grants_back_and_never_names_them() {
+        let home = tempfile::tempdir().unwrap();
+        seed_config(home.path(), &[("crm_pg", "CRM")]);
+        seed_agent(home.path(), "main", &[]);
+        seed_agent(home.path(), "ops", &["crm_pg"]);
+        seed_agent(home.path(), "alice-personal", &["crm_pg"]);
+        let reg = registry_for(home.path()).await;
+        let hidden: BTreeSet<String> = ["alice-personal".to_string()].into();
+
+        // The list the caller sees has no trace of it.
+        let listed = result(&list_hiding(home.path(), &hidden).await);
+        assert!(!listed.to_string().contains("alice-personal"), "{listed}");
+
+        let frame = set_hiding(&reg, home.path(), json!({ "name": "crm_pg", "agents": ["main"] }), &hidden).await;
+        assert!(frame_ok(&frame), "{}", frame_error(&frame));
+        let data = result(&frame);
+        assert_eq!(data["added"], json!(["main"]));
+        assert_eq!(data["removed"], json!(["ops"]));
+        assert_eq!(data["unchanged"], json!([]));
+        assert!(!data.to_string().contains("alice-personal"), "{data}");
+        assert_eq!(grants_on_disk(home.path(), "alice-personal"), vec!["crm_pg"], "its grant is merged back");
+
+        let store = crate::task_store::TaskStore::open(home.path()).unwrap();
+        let (rows, _) = store.list_activity(None, Some(ACTIVITY_EVENT), 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].summary.contains("alice-personal"), "{:?}", rows[0]);
+        assert!(!rows[0].metadata.as_deref().unwrap_or("").contains("alice-personal"));
+
+        // Revoking everything the caller can see still leaves it alone.
+        let data = result(&set_hiding(&reg, home.path(), json!({ "name": "crm_pg", "agents": [] }), &hidden).await);
+        assert_eq!(data["removed"], json!(["main"]));
+        assert_eq!(grants_on_disk(home.path(), "alice-personal"), vec!["crm_pg"]);
+
+        // Naming it is refused before any write.
+        let frame = set_hiding(&reg, home.path(), json!({ "name": "crm_pg", "agents": ["main", "alice-personal"] }),
+            &hidden).await;
+        assert!(!frame_ok(&frame));
+        assert!(grants_on_disk(home.path(), "main").is_empty(), "nothing written");
+        // Its owner (nothing hidden) manages it as before.
+        let data = result(&set(&reg, home.path(), json!({ "name": "crm_pg", "agents": [] })).await);
+        assert_eq!(data["removed"], json!(["alice-personal"]));
     }
 
     #[tokio::test]

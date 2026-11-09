@@ -174,7 +174,8 @@ impl TaskStore {
         // Epoch tombstones outlive task deletion and every task purge. Never GC
         // them while any old authorization can be presented. The whole migration
         // and trigger replacement commit together, including existing-row floors.
-        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        // init_schema owns the checked transaction for all migrations.
+        let tx = conn;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS task_authority_epochs (
             task_id TEXT PRIMARY KEY, revision_floor INTEGER NOT NULL CHECK(revision_floor>=1));
             INSERT INTO task_authority_epochs(task_id,revision_floor)
@@ -214,7 +215,6 @@ impl TaskStore {
             .map_err(|e| format!("init task authority epochs: {e}"))?;
         tx.execute_batch(&ddl)
             .map_err(|e| format!("init task authority schema: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("commit task authority schema: {e}"))
+        verify_live_io()
     }
 }

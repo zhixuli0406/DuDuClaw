@@ -266,11 +266,68 @@ pub struct CommentResult {
 
 // ── Token acquisition ───────────────────────────────────────────────────────
 
+/// SR4 item 3: one refresh at a time per home and provider. GitHub refresh
+/// tokens are single-use (each exchange rotates them), so two concurrent
+/// refreshes would spend the same token and the loser would read a dead grant.
+fn refresh_gate(home_dir: &Path, provider: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Gates = std::collections::HashMap<(std::path::PathBuf, String), std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static GATES: std::sync::LazyLock<std::sync::Mutex<Gates>> = std::sync::LazyLock::new(Default::default);
+    let key = (home_dir.canonicalize().unwrap_or_else(|_| home_dir.to_path_buf()), provider.to_owned());
+    let mut gates = GATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.entry(key).or_default().clone()
+}
+
+/// SR4 round 3 (item 3 residual): the in-process [`refresh_gate`] does not
+/// serialize two PROCESSES (the gateway and a `duduclaw mcp` server both call
+/// [`get_valid_github_token`]). Under the gate an advisory file lock on
+/// `<home>/locks/oauth-github-refresh.lock` is held for the whole refresh, so
+/// only one process at a time can spend the single-use refresh token; the
+/// other re-reads the rotated pair once it gets the lock.
+pub(crate) fn refresh_file_lock_path(home_dir: &Path) -> std::path::PathBuf {
+    // `fs_lock` locks the `<path>.lock` sidecar.
+    home_dir.join("locks").join("oauth-github-refresh")
+}
+/// Upper bound on waiting for another process's refresh (its HTTP exchange is
+/// itself time-bounded).
+const REFRESH_FILE_LOCK_WAIT: Duration = Duration::from_secs(90);
+const REFRESH_LOCK_UNAVAILABLE: &str = "another GitHub token refresh did not finish in time";
+
+async fn refresh_file_lock(home_dir: &Path) -> Result<duduclaw_core::fs_lock::FileLockGuard, GithubAuthError> {
+    let path = refresh_file_lock_path(home_dir);
+    tokio::task::spawn_blocking(move || duduclaw_core::fs_lock::lock_exclusive_within(&path, REFRESH_FILE_LOCK_WAIT))
+        .await
+        .map_err(|_| GithubAuthError::RefreshFailed(REFRESH_LOCK_UNAVAILABLE.into()))?
+        .map_err(|_| GithubAuthError::RefreshFailed(REFRESH_LOCK_UNAVAILABLE.into()))
+}
+
 /// Return a valid GitHub access token, refreshing in place only when the token
 /// actually has an expiry and a stored refresh_token (OAuth App token
 /// expiration enabled). The common no-expiry case returns the stored token.
+///
+/// SR4 item 3 (rotation): refreshes are serialized per home + provider
+/// ([`refresh_gate`]) and the stored token is re-read under that lock, so a
+/// refresh another task just finished is reused instead of spending its
+/// already-rotated refresh token. A successful exchange is ALWAYS persisted
+/// (`upsert_token`): the grant belongs to the home, and the refresh token
+/// that was sent is dead from that moment. Only the CALL is refused when the
+/// isolated selection moved during the exchange. `InvalidGrant` revokes the
+/// home consent only when the stored refresh token, re-read under the lock,
+/// is still the one that was spent.
 pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAuthError> {
     // Fast path: non-expired (or never-expiring) token.
+    if let Some(t) = mcp_oauth::get_token(home_dir, GITHUB_PROVIDER) {
+        return Ok(t.access_token);
+    }
+
+    let gate = refresh_gate(home_dir, GITHUB_PROVIDER);
+    // SR4 round 3 follow-up: the wait for another in-process refresh is bounded
+    // too (its exchange is time-bounded, so a longer wait means it is stuck).
+    let _refreshing = tokio::time::timeout(REFRESH_FILE_LOCK_WAIT, gate.lock())
+        .await
+        .map_err(|_| GithubAuthError::RefreshFailed(REFRESH_LOCK_UNAVAILABLE.into()))?;
+    // SR4 round 3: and across processes (held until this function returns).
+    let _cross_process = refresh_file_lock(home_dir).await?;
+    // Re-read under the lock: another task or process may have refreshed meanwhile.
     if let Some(t) = mcp_oauth::get_token(home_dir, GITHUB_PROVIDER) {
         return Ok(t.access_token);
     }
@@ -302,22 +359,58 @@ pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAut
         redirect_uri: client_cfg.redirect_uri,
     };
 
-    let mut refreshed = mcp_oauth::refresh_token(&oauth_config, &refresh_tok)
-        .await
-        .map_err(GithubAuthError::RefreshFailed)?;
+    // v1.81 E3: an isolated acquisition runs inside its selection's I/O
+    // scope; a route revoked before the grant is sent refuses here.
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|_| GithubAuthError::RefreshFailed(REFRESH_REVOKED.into()))?;
+    let mut refreshed = match mcp_oauth::refresh_token_checked(&oauth_config, &refresh_tok).await {
+        Ok(refreshed) => refreshed,
+        Err(mcp_oauth::RefreshFailure::InvalidGrant(message)) => {
+            // The home grant is dead (app revoked / token rotated away). Fence
+            // the SharedHome github routes first, unless the stored token —
+            // re-read under the refresh lock — is no longer the one spent here
+            // (a reconnect replaced it; the dead grant is not the current
+            // connection). This call fails either way.
+            if current_refresh_token(home_dir).is_none_or(|current| current == refresh_tok) {
+                let _ = mcp_oauth::home_consent_revoked(home_dir, GITHUB_PROVIDER);
+            }
+            return Err(GithubAuthError::RefreshFailed(message));
+        }
+        Err(failure) => return Err(GithubAuthError::RefreshFailed(failure.into_message())),
+    };
     if refreshed.scopes.is_empty() {
         refreshed.scopes = existing.scopes.clone();
     }
-    let access = refreshed.access_token.clone();
+    // SR4 item 3: the exchange rotated the home grant; the refresh token we
+    // sent is dead. Persist the new pair before anything else, whatever the
+    // caller's selection now says — dropping it would kill the home-wide grant.
+    let mut access = zeroize::Zeroizing::new(refreshed.access_token.clone());
     mcp_oauth::upsert_token(home_dir, refreshed).map_err(GithubAuthError::RefreshFailed)?;
-    Ok(access)
+    // v1.81 E3 (matrix 8): re-check the selection (route active + generation
+    // + binding) after the exchange returned and BEFORE the new token is
+    // used. Moved ⇒ this call fails; the stored grant stays the home's.
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() {
+        return Err(GithubAuthError::RefreshFailed(REFRESH_REVOKED.into()));
+    }
+    Ok(std::mem::take(&mut *access))
+}
+
+const REFRESH_REVOKED: &str = "the connector route changed during the refresh";
+
+/// The stored GitHub refresh token right now, or `None` when unreadable/absent.
+fn current_refresh_token(home_dir: &Path) -> Option<String> {
+    mcp_oauth::load_tokens(home_dir)
+        .into_iter()
+        .find(|t| t.provider_id == GITHUB_PROVIDER)
+        .and_then(|t| t.refresh_token)
 }
 
 // ── HTTP plumbing ───────────────────────────────────────────────────────────
 
 fn http_client() -> Result<reqwest::Client, GithubApiError> {
-    reqwest::Client::builder()
+    crate::isolation_connector_clients::client_builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .redirect(crate::isolation_connector_clients::redirects())
         .build()
         .map_err(|e| GithubApiError::Http(format!("client build failed: {e}")))
 }
@@ -348,10 +441,12 @@ async fn github_request(
             req = req.json(b);
         }
 
+        crate::isolation_connector_clients::before_request("github", url)
+            .map_err(|message| GithubApiError::Http(message.to_owned()))?;
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                if attempt < 2 {
+                if attempt < 2 && !crate::isolation_connector_clients::active() {
                     continue;
                 }
                 return Err(GithubApiError::Http(format!("request failed: {e}")));
@@ -368,7 +463,7 @@ async fn github_request(
                 .map_err(|e| GithubApiError::Http(format!("invalid JSON from GitHub: {e}")));
         }
 
-        if (500..=599).contains(&code) && attempt < 2 {
+        if (500..=599).contains(&code) && attempt < 2 && !crate::isolation_connector_clients::active() {
             continue;
         }
 
@@ -739,6 +834,18 @@ fn extract_api_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SR4 round 3 follow-up: a refresh gate that stays held is waited on for
+    /// at most `REFRESH_FILE_LOCK_WAIT`, then the call fails closed.
+    #[tokio::test(start_paused = true)]
+    async fn sr4r3f_refresh_gate_wait_times_out_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let gate = refresh_gate(home.path(), GITHUB_PROVIDER);
+        let _held = gate.lock().await;
+        let result = get_valid_github_token(home.path()).await;
+        assert!(matches!(result, Err(GithubAuthError::RefreshFailed(ref m)) if m == REFRESH_LOCK_UNAVAILABLE),
+            "got {result:?}");
+    }
 
     #[test]
     fn clamp_bounds() {

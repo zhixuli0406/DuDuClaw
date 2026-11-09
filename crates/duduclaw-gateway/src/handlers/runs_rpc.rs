@@ -4,6 +4,12 @@
 use super::*;
 use crate::history_privacy::{self as privacy, Mode, Class, handles, read};
 
+/// v1.81 P1: the Admin break-glass CSRF token (`step_up_csrf`), if any.
+fn run_step_up(params: &Value) -> Option<[u8; 32]> {
+    params.get(super::personal_data_gate::STEP_UP_FIELD)
+        .and_then(|raw| serde_json::from_value(raw.clone()).ok())
+}
+
 impl MethodHandler {
     // ── Run inspector (G12) ─────────────────────────────────
     //
@@ -163,6 +169,16 @@ impl MethodHandler {
                 .unwrap_or("")
                 .cmp(a["started_at"].as_str().unwrap_or(""))
         });
+        // v1.81 P1: an unscoped (Admin) listing hides Personal employees the
+        // caller does not own; a scoped one was gated at dispatch.
+        if agent_filter.is_empty() {
+            match self.personal_hidden_agents(&live).await {
+                Ok(hidden) if !hidden.is_empty() => runs_json
+                    .retain(|r| r["agent_id"].as_str().is_none_or(|agent| !hidden.contains(agent))),
+                Ok(_) => {}
+                Err(e) => return WsFrame::error_response("", e),
+            }
+        }
         runs_json.truncate(limit);
         let valid = if agent_filter.is_empty() { self.bound_history_live(&live).is_ok_and(|c|c.is_admin()) } else { self.bound_history_recheck(&live,&agent_filter,initial).is_ok() };
         if !valid { return WsFrame::error_response("","history authority changed; refresh"); }
@@ -190,6 +206,13 @@ impl MethodHandler {
             };
             if run.task_id.as_deref().is_some_and(|id| !task_privacy::a2a_owner_allows(&self.home_dir, ctx, id)) {
                 return WsFrame::error_response("", PERMISSION_DENIED);
+            }
+            if let Err(e) = self.personal_data_gate(ctx, super::personal_data_gate::Target {
+                method: "runs.get",
+                category: crate::personal_visibility::DataCategory::Sessions,
+                agent: &run.agent_id,
+            }, run_step_up(&params)).await {
+                return WsFrame::error_response("", e);
             }
             if !ctx.has_agent_access(&run.agent_id, AccessLevel::Viewer)
                 && team_visibility::may_monitor(ctx, &run.agent_id)
@@ -280,6 +303,15 @@ impl MethodHandler {
         };
 
         let owner=match conn.query_row("SELECT agent_id FROM sessions WHERE id=?1",[session_id],|r|r.get::<_,String>(0)) {Ok(a)=>a,Err(_)=>return WsFrame::error_response("","Run not found")};
+        // v1.81 P1: a Personal employee's transcript (owner, or audited
+        // Admin break-glass). The head row below re-reads the same session.
+        if let Err(e) = self.personal_data_gate(&live, super::personal_data_gate::Target {
+            method: "runs.get",
+            category: crate::personal_visibility::DataCategory::Sessions,
+            agent: &owner,
+        }, run_step_up(&params)).await {
+            return WsFrame::error_response("", e);
+        }
         if !live.has_agent_access(&owner, AccessLevel::Viewer)
             && team_visibility::may_monitor(&live, &owner)
         {

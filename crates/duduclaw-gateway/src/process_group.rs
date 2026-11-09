@@ -1,7 +1,48 @@
 //! Shared CLI process-tree ownership and bounded output collection.
 //!
 //! Stdio MCP clients use the same core helper, including the Windows Job Object.
-pub use duduclaw_core::process_tree::{GroupKillGuard, ManagedChild, isolate, spawn_guarded};
+pub use duduclaw_core::process_tree::{BackendChild, GroupKillGuard, ManagedChild, isolate, spawn_guarded};
+
+use duduclaw_core::execution_gate::ExecutionClass;
+
+/// The initiating host path chooses the class; nested runtime failover keeps it.
+pub(crate) fn execution_class(default: ExecutionClass) -> ExecutionClass {
+    duduclaw_core::execution_gate::capture_class_or(default)
+}
+
+pub(crate) fn with_class<F: std::future::Future>(class: ExecutionClass, future: F)
+    -> impl std::future::Future<Output = F::Output>
+{
+    duduclaw_core::execution_gate::with_class(class, Box::pin(future))
+}
+
+pub(crate) fn request_class(request: crate::cost_telemetry::RequestType) -> ExecutionClass {
+    use crate::cost_telemetry::RequestType;
+    execution_class(match request {
+        RequestType::Chat => ExecutionClass::EmployeeMain,
+        RequestType::Cron => ExecutionClass::Scheduled,
+        RequestType::Dispatch => ExecutionClass::Dispatch,
+        RequestType::Evolution => ExecutionClass::Judge,
+    })
+}
+
+/// A protected spawn refusal is an installation/capability failure, never an
+/// account failure. Reuse the terminal spawn-gate envelope at runtime boundaries.
+pub(crate) fn backend_error(error: std::io::Error, operation: &str) -> String {
+    render_backend_error(duduclaw_core::execution_gate::isolation_required(), error, operation)
+}
+
+fn render_backend_error(required: bool, error: std::io::Error, operation: &str) -> String {
+    if required {
+        duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+            "受保護模式無法執行此工作，請由管理員檢查隔離服務與執行授權：{error}"
+        ))
+    } else if operation.is_empty() {
+        error.to_string()
+    } else {
+        format!("{operation}: {error}")
+    }
+}
 
 #[derive(Debug)]
 pub enum OutputError {
@@ -14,7 +55,7 @@ const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 /// Always consume EOF, retaining either a bounded prefix (stdout) or bounded
 /// tail (diagnostics). Returning early on overflow would deadlock the writer.
-async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     retained: &mut Vec<u8>,
     limit: usize,
@@ -84,7 +125,9 @@ async fn collect_output(
     } else {
         None
     };
-    let mut managed = ManagedChild::spawn(cmd).map_err(OutputError::Io)?;
+    let class = if admit { execution_class(ExecutionClass::EmployeeMain) }
+        else { duduclaw_core::execution_gate::ExecutionClass::ModelProbe };
+    let mut managed = BackendChild::spawn_class(cmd, class).await.map_err(OutputError::Io)?;
     if admission.is_some() {
         crate::autonomous_runtime::mark_handoff();
     }
@@ -141,6 +184,31 @@ async fn collect_output(
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
+
+    #[test]
+    fn isolation_backend_error_is_terminal_across_runtime_fallbacks() {
+        let error = render_backend_error(true, std::io::Error::other("execution unavailable"), "spawn");
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+        assert!(duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&error).unwrap().contains("隔離服務"));
+        assert_eq!(render_backend_error(false, std::io::Error::other("fixture"), "spawn"), "spawn: fixture");
+    }
+
+    #[tokio::test]
+    async fn execution_classes_follow_host_paths_and_do_not_cross_tasks() {
+        use crate::cost_telemetry::RequestType;
+        assert_eq!(request_class(RequestType::Cron), ExecutionClass::Scheduled);
+        assert_eq!(request_class(RequestType::Dispatch), ExecutionClass::Dispatch);
+        assert_eq!(request_class(RequestType::Evolution), ExecutionClass::Judge);
+        for class in [ExecutionClass::Mail, ExecutionClass::Reminder, ExecutionClass::Heartbeat] {
+            with_class(class, async {
+                assert_eq!(request_class(RequestType::Cron), class);
+                assert_eq!(request_class(RequestType::Dispatch), class);
+                assert_eq!(tokio::spawn(async { request_class(RequestType::Cron) }).await.unwrap(),
+                    ExecutionClass::Scheduled);
+            }).await;
+        }
+    }
+
 
     #[tokio::test]
     async fn bounded_readers_drain_all_bytes_and_keep_prefix_or_tail() {

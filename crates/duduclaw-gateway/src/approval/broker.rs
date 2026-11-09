@@ -151,6 +151,7 @@ impl ApprovalBroker {
     /// landed. Silent no-op for in-memory stores and for kinds that own their
     /// own notification ([`SELF_NOTIFYING_KINDS`]).
     pub(crate) async fn push_new_request(&self, rec: &ApprovalRecord) {
+        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
         if SELF_NOTIFYING_KINDS.contains(&rec.action_kind.as_str()) {
             return;
         }
@@ -203,6 +204,7 @@ impl ApprovalBroker {
         // strictly better than a reminder storm.
         match self.store.claim_reminder(&rec.id, &now.to_rfc3339()).await {
             Ok(true) => {
+                if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
                 // B5: an admin who already has the dashboard open in a
                 // browser tab gets routed straight to the inbox row at the
                 // exact instant the channel nudge fires below — no reason
@@ -535,6 +537,13 @@ impl ApprovalBroker {
         self.store.list_by_kind(kind).await
     }
 
+    /// SR5 item 3: every card of `agent_id` still `pending` or `approved`
+    /// (not yet consumed), any kind — what a tombstone must invalidate.
+    pub async fn list_open_for_agent(&self, agent_id: &str) -> Result<Vec<ApprovalId>, String> {
+        self.expire_stale().await?;
+        self.store.list_open_ids_for_agent(agent_id).await
+    }
+
     /// Withdraw a pending approval as a system DENY (`decided_by` names why).
     /// Returns `false` when it was no longer pending.
     pub async fn withdraw(&self, id: &ApprovalId, decided_by: &str) -> Result<bool, String> {
@@ -581,7 +590,7 @@ impl ApprovalBroker {
                     )
                     .await?;
                 expired += n as u64;
-            } else if rec.reminder_due(now) && self.home_dir().is_some() {
+            } else if rec.reminder_due(now) && self.home_dir().is_some() && !super::no_reminder(&rec.action_kind) {
                 // WP20: piggyback the ⅔-TTL reminder on the sweep that already
                 // walks every pending row — covers approvals nobody is polling.
                 //
@@ -591,7 +600,8 @@ impl ApprovalBroker {
                 // API. The once-only DB claim inside `maybe_remind` still
                 // guarantees a single send per approval.
                 let broker = self.clone();
-                tokio::spawn(async move { broker.maybe_remind(&rec, now).await });
+                let authority = duduclaw_mcp_boundary::io_authority::capture();
+                tokio::spawn(async move { authority.scope(broker.maybe_remind(&rec, now)).await });
             }
         }
         if expired > 0 {
