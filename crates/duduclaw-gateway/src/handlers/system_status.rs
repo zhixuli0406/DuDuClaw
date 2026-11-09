@@ -100,6 +100,10 @@ impl MethodHandler {
         if let Some(folder_access) = crate::macos_folder_access::status_json(&self.home_dir) {
             payload["folder_access"] = folder_access;
         }
+        // RM-166: effective AI-employee identity mode, transition deadline and
+        // recent identity refusals by the agent-file-guard hook. Always
+        // present; the dashboard banner decides when to show (admins only).
+        payload["identity_token"] = crate::identity_transition::status_json(&self.home_dir);
         payload
     }
 

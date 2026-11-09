@@ -2763,7 +2763,9 @@ enum HookCommands {
         /// fix: it is trusted over the env var (see `resolve_hook_caller`)
         /// because it lives inside `.claude/settings.json`, which is itself
         /// a frozen `ProtectedSurface::HookSettings` file the agent cannot
-        /// rewrite to claim a different id.
+        /// rewrite to claim a different id. (RM-166: the gateway's Claude
+        /// spawns now also carry the employee's own identity env, so strict
+        /// mode can verify this claim; the flag still names the claimant.)
         #[arg(long)]
         agent: Option<String>,
         /// The DuDuClaw home this agent belongs to, baked into the installed
@@ -6588,6 +6590,11 @@ async fn cmd_hook_agent_file_guard(
     };
 
     if let Some(msg) = decision.block_message() {
+        // RM-166: record identity refusals (claimed id + tool only) so the
+        // dashboard can warn that an AI employee cannot write its folder.
+        if let duduclaw_core::GuardDecision::BlockedUntrustedCaller { caller, .. } = &decision {
+            duduclaw_security::audit::log_hook_untrusted_caller(&home, caller, tool_name);
+        }
         eprintln!("{msg}");
         // Exit 2 — Claude Code interprets this as a block and surfaces
         // stderr back to the agent so the model learns to retry with
@@ -7051,6 +7058,13 @@ async fn cmd_hook_data_file_guard() -> duduclaw_core::error::Result<()> {
 /// require_identity_token = true`) rejects it into
 /// [`duduclaw_core::HookCaller::Untrusted`].
 ///
+/// RM-166: since then the gateway's Claude spawns
+/// (`duduclaw_gateway::agent_hook_installer::apply_hook_identity_env`) put the
+/// spawned employee's own `DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN` in the
+/// CLI's env, which this hook inherits — so strict mode verifies the
+/// `--agent` claim instead of refusing it. A token minted for any other id
+/// still fails the exact-id HMAC check and the caller stays untrusted.
+///
 /// An absent claim (both `agent_id_arg` and the env var empty) yields
 /// [`duduclaw_core::HookCaller::Absent`], which is deliberately unrestricted:
 /// this hook is registered only inside an agent's own `.claude/settings.json`,
@@ -7219,6 +7233,41 @@ mod resolve_hook_caller_tests {
             duduclaw_core::HookCaller::Untrusted("agent-x".to_string()),
             "strict mode must reject an --agent claim with no verifying token"
         );
+    }
+
+    /// RM-166: with the identity env the gateway's Claude spawn builds, the
+    /// installed `--agent` claim is verified in strict mode; another
+    /// employee's pair under the same claim stays untrusted.
+    #[test]
+    fn rm166_hook_caller_is_agent_with_cli_env_in_strict_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = true\n",
+        )
+        .unwrap();
+        let alice = tmp.path().join("agents/alice");
+        let bob = tmp.path().join("agents/bob");
+        std::fs::create_dir_all(&alice).unwrap();
+        std::fs::create_dir_all(&bob).unwrap();
+
+        let set = |dir: &std::path::Path| {
+            clear_env();
+            for (key, value) in duduclaw_gateway::agent_hook_installer::hook_identity_env(dir) {
+                // SAFETY: serialized via ENV_LOCK.
+                unsafe { std::env::set_var(key, value) };
+            }
+        };
+        set(alice.as_path());
+        let own = resolve_hook_caller(tmp.path(), Some("alice"));
+        set(bob.as_path());
+        let foreign = resolve_hook_caller(tmp.path(), Some("alice"));
+        clear_env();
+
+        assert_eq!(own, duduclaw_core::HookCaller::Agent("alice".to_string()));
+        assert_eq!(foreign, duduclaw_core::HookCaller::Untrusted("alice".to_string()));
     }
 
     #[test]

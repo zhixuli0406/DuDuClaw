@@ -196,6 +196,50 @@ pub(crate) async fn ensure_spawn_hook_settings(
     Ok(())
 }
 
+/// RM-166: the identity pair (`DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN`)
+/// the `agent-file-guard` hook verifies for the employee whose directory is
+/// `agent_dir`.
+///
+/// Claude Code runs its hooks with the CLI's own environment, and every
+/// employee spawn clears that environment down to the allowlist
+/// (`duduclaw_core::spawn_env`), which carries no identity. The hook already
+/// trusts `--agent <id>` from the installed command for *who* is claiming,
+/// but in strict mode (`[delegation] require_identity_token`, default) the
+/// claim must also carry a valid token — without it every write into the
+/// employee's own folder was refused as an untrusted caller.
+///
+/// The id is the directory's own name (the same value
+/// [`build_hook_command`] bakes in as `--agent`) and the token is minted
+/// against the home the hook verifies against (`--home`, the same
+/// [`home_of_agent_dir`] derivation), through the shared
+/// `duduclaw_core::agent_identity_env_vars`. Anything that is not a valid
+/// employee directory under an absolute home yields no pair at all: this can
+/// only ever hand a spawn the identity of the employee it runs for.
+pub fn hook_identity_env(agent_dir: &Path) -> Vec<(String, String)> {
+    if validate_hook_identity(agent_dir).is_err() {
+        return Vec::new();
+    }
+    let (Some(agent_id), Some(home)) = (
+        agent_dir.file_name().and_then(|n| n.to_str()),
+        home_of_agent_dir(agent_dir),
+    ) else {
+        return Vec::new();
+    };
+    duduclaw_core::agent_identity_env_vars(&home, agent_id)
+}
+
+/// Apply [`hook_identity_env`] to an employee's Claude CLI command, after the
+/// spawn-env allowlist. Any identity already on the command is removed first,
+/// so a spawn without a valid employee directory carries none (never a
+/// leftover or ambient one).
+pub fn apply_hook_identity_env(cmd: &mut tokio::process::Command, agent_dir: Option<&Path>) {
+    cmd.env_remove(duduclaw_core::ENV_AGENT_ID);
+    cmd.env_remove(duduclaw_core::ENV_AGENT_TOKEN);
+    for (key, value) in agent_dir.map(hook_identity_env).unwrap_or_default() {
+        cmd.env(key, value);
+    }
+}
+
 fn validate_hook_identity(agent_dir: &Path) -> std::io::Result<()> {
     let valid_agent = agent_dir.file_name().and_then(|s| s.to_str())
         .is_some_and(duduclaw_core::is_valid_agent_id);

@@ -189,6 +189,34 @@ async fn system_status_reports_decision_enabled_true_without_config() {
     );
 }
 
+/// RM-166: `system.status.identity_token` carries the effective identity
+/// mode, transition deadline / days left and the 24 h refusal count.
+#[tokio::test]
+async fn system_status_reports_identity_token_transition() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let data = frame_data(&handler.handle("system.status", json!({}), &admin_ctx()).await);
+    let identity = data.get("identity_token").expect("identity_token present");
+    assert_eq!(identity["mode"], "strict", "{identity}");
+    assert_eq!(identity["explicit_setting"], false);
+    assert!(identity["days_left"].is_null());
+    assert_eq!(identity["untrusted_refusals_24h"], 0);
+
+    let deadline = (chrono::Utc::now() + chrono::Duration::days(10))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = \"{deadline}\"\n"),
+    )
+    .unwrap();
+    let data = frame_data(&handler.handle("system.status", json!({}), &admin_ctx()).await);
+    let identity = &data["identity_token"];
+    assert_eq!(identity["mode"], "grace", "{identity}");
+    assert_eq!(identity["grace_until"], deadline);
+    assert_eq!(identity["days_left"], 10);
+    assert_eq!(identity["upgrade_grace"], false);
+}
+
 /// The `false` branch of the same field: `[decision] enabled = false` in
 /// `config.toml` is what the operator writes to retire the line, and it
 /// must reach the dashboard (the nav row and page hide on it).

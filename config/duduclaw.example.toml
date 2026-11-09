@@ -617,6 +617,7 @@ port = 18889
 # allow = []                   # Explicit cross-team pairs, e.g. [["sales-bot", "ops-bot"]]
 # require_identity_token = true   # Default: require a signed MCP employee identity; false also requires the bounded grace deadline below
 # identity_token_grace_until = "2026-11-06T00:00:00Z" # Only with false: future RFC3339 UTC string, at most 30 days ahead; invalid/expired => strict for this home until process restart
+#   An upgraded install without require_identity_token gets both keys written once at first boot (30-day transition); new installs stay strict.
 # confidence_routing = false      # Route sub-delegations to a cheaper model tier by difficulty
 
 # ── Inter-agent protocol entry (A2A / ACP) ──────────────────

@@ -278,6 +278,54 @@ pub fn log_git_credentials_granted(home_dir: &Path, agent_id: &str, env_names: &
     append_audit_event(home_dir, &event);
 }
 
+/// `event_type` of [`log_hook_untrusted_caller`] (RM-166).
+pub const EVENT_HOOK_UNTRUSTED_CALLER: &str = "hook_untrusted_caller_blocked";
+
+/// RM-166: the `agent-file-guard` hook refused a tool call because the
+/// caller's identity claim could not be verified in strict mode
+/// (`GuardDecision::BlockedUntrustedCaller`). `claimed` is the *unverified*
+/// id (truncated); `tool` is the Claude Code tool name. No path, command or
+/// token is recorded. The dashboard counts these to warn an operator that an
+/// AI employee cannot write its own folder.
+pub fn log_hook_untrusted_caller(home_dir: &Path, claimed: &str, tool: &str) {
+    let claimed: String = claimed.chars().take(64).collect();
+    let tool: String = tool.chars().take(32).collect();
+    let event = AuditEvent::new(
+        EVENT_HOOK_UNTRUSTED_CALLER,
+        claimed,
+        Severity::Warning,
+        serde_json::json!({
+            "tool": tool,
+            "claim_verified": false,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Number of `event_type` events at or after `since` in
+/// `security_audit.jsonl`. Absent or unreadable log ⇒ 0; unparsable lines
+/// are skipped.
+pub fn count_event_type_since(
+    home_dir: &Path,
+    event_type: &str,
+    since: chrono::DateTime<Utc>,
+) -> usize {
+    let Ok(content) = std::fs::read_to_string(home_dir.join("security_audit.jsonl")) else {
+        return 0;
+    };
+    content
+        .lines()
+        // Cheap pre-filter: most lines are other event types.
+        .filter(|line| line.contains(event_type))
+        .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+        .filter(|event| event.event_type == event_type)
+        .filter(|event| {
+            chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+                .is_ok_and(|t| t.with_timezone(&Utc) >= since)
+        })
+        .count()
+}
+
 /// Log an AI caller's refused attempt to create an employee under a name that
 /// is reserved because an employee of that name was removed
 /// (`duduclaw_core::agent_trash`). `requested` must already be a validated
@@ -1911,6 +1959,33 @@ mod credential_sink_tests {
         std::fs::remove_dir_all(home).unwrap();
     }
 
+}
+
+#[cfg(test)]
+mod rm166_untrusted_caller_audit_tests {
+    use super::*;
+
+    #[test]
+    fn rm166_untrusted_caller_refusals_are_counted_by_type_and_window() {
+        let home = super::tests::fresh_home();
+        log_hook_untrusted_caller(&home, "alice", "Write");
+        log_hook_untrusted_caller(&home, "bob", "Bash");
+        log_git_credentials_granted(&home, "alice", &["SSH_AUTH_SOCK"]);
+        // An old refusal outside the window is not counted.
+        let mut old = AuditEvent::new(EVENT_HOOK_UNTRUSTED_CALLER, "carol", Severity::Warning, serde_json::json!({}));
+        old.timestamp = (Utc::now() - chrono::Duration::hours(30)).to_rfc3339();
+        append_audit_event(&home, &old);
+
+        let since = Utc::now() - chrono::Duration::hours(24);
+        assert_eq!(count_event_type_since(&home, EVENT_HOOK_UNTRUSTED_CALLER, since), 2);
+        let raw = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+        assert!(raw.contains(EVENT_HOOK_UNTRUSTED_CALLER) && raw.contains("Write"));
+        // Absent log ⇒ 0.
+        let empty = super::tests::fresh_home();
+        assert_eq!(count_event_type_since(&empty, EVENT_HOOK_UNTRUSTED_CALLER, since), 0);
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(empty).unwrap();
+    }
 }
 
 #[cfg(test)]

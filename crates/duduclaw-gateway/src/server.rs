@@ -201,6 +201,7 @@ fn prepare_identity_key(home: &std::path::Path) -> std::io::Result<()> {
     if !strict {
         tracing::warn!("MCP identity-token grace period is active; unverified employee claims are accepted only until identity_token_grace_until. Re-enable require_identity_token after upgrading agent configs.");
     }
+    crate::identity_transition::log_startup_mode(home, strict);
     duduclaw_core::ensure_identity_key(home)?;
     info!(require_identity_token = strict, "MCP caller-identity signing key ready");
     Ok(())
@@ -719,6 +720,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "Failed to initialize user database: {e}"
         ))
     })?);
+
+    // RM-166 — one-time identity-token transition for installs upgraded
+    // while the strict default was unset: writes a bounded 30-day grace
+    // (never over an explicit key, never for a new install). Must run before
+    // `prepare_identity_key`, whose key creation would make a fresh install
+    // look like an existing one. Failures only log.
+    {
+        let report = crate::identity_transition::run(&home_dir).await;
+        if let Some(e) = &report.error {
+            tracing::warn!("identity-token transition migration: {e}");
+        }
+    }
 
     // WP21 debt ⑧ — mint `<home>/identity.key` if absent, before any MCP env
     // block is assembled, so every `.mcp.json` / runtime config written later

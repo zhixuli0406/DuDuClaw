@@ -4779,6 +4779,13 @@ fn prepare_claude_cmd(
         spawned.and_then(|agent| crate::on_behalf_of::context::register(home_dir, agent));
     crate::on_behalf_of::context::inject(&mut cmd, principal_context.as_ref());
 
+    // RM-166: the spawned employee's own identity pair for the
+    // agent-file-guard hook, which inherits this CLI's (allowlist-cleared)
+    // env. `config_dir` is the directory whose hook settings this spawn loads
+    // (`claude_hook_args` above), i.e. the employee this spawn runs for — a
+    // team role member gets its own scaffold's identity, never its parent's.
+    crate::agent_hook_installer::apply_hook_identity_env(&mut cmd, config_dir);
+
     Ok((
         cmd,
         ClaudeCmdGuards {
@@ -4842,6 +4849,72 @@ mod role_cache_ttl_tests {
         );
         let ordinary = build(None);
         assert_eq!(ttl(&ordinary, "CLAUDE_CODE_PROMPT_CACHE_TTL"), None);
+    }
+}
+
+#[cfg(test)]
+mod rm166_identity_env_tests {
+    //! RM-166: the agent-file-guard hook inherits the Claude CLI's env, so the
+    //! dispatch / cron / heartbeat / goal-loop / team-role spawn must carry
+    //! the spawned employee's own identity pair — and nobody else's.
+    use super::*;
+
+    fn env_of(cmd: &tokio::process::Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    fn build(home: &Path, config_dir: Option<&Path>) -> tokio::process::Command {
+        prepare_claude_cmd(
+            "claude",
+            "PING",
+            "claude-sonnet-4-6",
+            "stable",
+            None,
+            None,
+            home,
+            None,
+            SpawnIdentity { config_dir, mcp_config: None },
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn rm166_claude_spawn_carries_only_the_spawned_employees_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let key = duduclaw_core::ensure_identity_key(home).unwrap();
+        let alice = home.join("agents/alice");
+        std::fs::create_dir_all(&alice).unwrap();
+
+        let cmd = build(home, Some(&alice));
+        assert_eq!(env_of(&cmd, duduclaw_core::ENV_AGENT_ID).as_deref(), Some("alice"));
+        let token = env_of(&cmd, duduclaw_core::ENV_AGENT_TOKEN).expect("strict mode needs the token");
+        assert!(duduclaw_core::verify_identity_token(&key, "alice", &token));
+        assert!(!duduclaw_core::verify_identity_token(&key, "bob", &token));
+
+        // A team role member runs as its own scaffold, never as its parent.
+        let role = home.join("agents/.ephemeral/eph-role");
+        std::fs::create_dir_all(&role).unwrap();
+        std::fs::write(
+            role.join("agent.toml"),
+            "[team_member]\nrole = \"planner\"\ntask_id = \"t1\"\nround = 1\nparent = \"alice\"\n",
+        )
+        .unwrap();
+        let cmd = build(home, Some(&role));
+        assert_eq!(env_of(&cmd, duduclaw_core::ENV_AGENT_ID).as_deref(), Some("eph-role"));
+        let token = env_of(&cmd, duduclaw_core::ENV_AGENT_TOKEN).unwrap();
+        assert!(duduclaw_core::verify_identity_token(&key, "eph-role", &token));
+        assert!(!duduclaw_core::verify_identity_token(&key, "alice", &token));
+
+        // No employee directory ⇒ no identity at all.
+        let none = build(home, None);
+        assert_eq!(env_of(&none, duduclaw_core::ENV_AGENT_ID), None);
+        assert_eq!(env_of(&none, duduclaw_core::ENV_AGENT_TOKEN), None);
     }
 }
 

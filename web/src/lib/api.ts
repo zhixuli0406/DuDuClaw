@@ -388,6 +388,23 @@ export interface SystemStatus {
    * means healthy (or not macOS). Drives `FolderAccessBanner`.
    */
   folder_access?: FolderAccessStatus;
+  /**
+   * RM-166: AI-employee identity verification. `grace` = transition period
+   * (unverified identities still accepted until `grace_until`); `error` =
+   * the setting cannot be read, so identities are refused. Absent on older
+   * gateways. Drives `IdentityTransitionBanner`.
+   */
+  identity_token?: IdentityTokenStatus;
+}
+
+export interface IdentityTokenStatus {
+  mode: 'strict' | 'grace' | 'error';
+  explicit_setting: boolean;
+  grace_until: string | null;
+  days_left: number | null;
+  upgrade_grace: boolean;
+  /** Identity refusals by the file guard in the last 24 hours. */
+  untrusted_refusals_24h: number;
 }
 
 export type FolderAccessState = 'granted' | 'denied' | 'posix_denied' | 'pending_prompt' | 'unavailable';
