@@ -39,11 +39,12 @@ pub fn release_children(jobs: &mut EphemeralJobs, runs: &dyn ParentRuns, identit
 /// released job named by `message_id`, of employee label `agent`, for its
 /// own requester, still the same employee id and incarnation. H13c: a pass
 /// consumes the exception (`released → started`), so it holds once per job;
-/// a refused check changes nothing.
-pub fn self_delegation_check(jobs: &EphemeralJobs, identity: &dyn ParentIdentity, message_id: &str, agent: &str,
-    on_behalf_of: Option<&str>) -> Result<(), VerificationError> {
+/// a refused check changes nothing. H13d: an expired job (`now >=
+/// expires_at`) is dropped, never started.
+pub fn self_delegation_check_at(jobs: &EphemeralJobs, identity: &dyn ParentIdentity, message_id: &str, agent: &str,
+    on_behalf_of: Option<&str>, now: u64) -> Result<(), VerificationError> {
     let id = ephemeral_child::job_id_of(message_id).ok_or(VerificationError::Invalid)?;
-    jobs.begin_start(id, |job| {
+    jobs.begin_start(id, now, |job| {
         if job.parent.agent != agent || on_behalf_of != Some(ephemeral_child::owner_principal(job)?.as_str()) {
             return Err(VerificationError::BindingMismatch);
         }
@@ -67,7 +68,8 @@ pub(crate) async fn self_delegation_allowed(home: &Path, message_id: &str, agent
     duduclaw_mcp_boundary::authority::verify_blocking(move || {
         if !home.join(JOBS_DB).exists() { return Err(VerificationError::Unavailable); }
         let jobs = EphemeralJobs::open(&home)?;
-        self_delegation_check(&jobs, &LiveLifecycle { home: &home }, &message_id, &agent, on_behalf_of.as_deref())
+        self_delegation_check_at(&jobs, &LiveLifecycle { home: &home }, &message_id, &agent, on_behalf_of.as_deref(),
+            duduclaw_mcp_boundary::authority::now_seconds()?)
     }).await.is_ok()
 }
 

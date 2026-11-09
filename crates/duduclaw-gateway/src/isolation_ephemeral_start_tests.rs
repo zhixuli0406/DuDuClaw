@@ -30,6 +30,129 @@ impl ParentIdentity for Identity {
 }
 const SAME: Identity = Identity(Ok((PARENT, 3)));
 
+/// The gate check at a fixed time inside every test job's lifetime.
+fn self_delegation_check(jobs: &EphemeralJobs, identity: &dyn ParentIdentity, message_id: &str, agent: &str,
+    on_behalf_of: Option<&str>) -> Result<(), VerificationError> {
+    self_delegation_check_at(jobs, identity, message_id, agent, on_behalf_of, 1_001)
+}
+fn exited_ledger() -> RunLedger {
+    let mut ledger = RunLedger::new();
+    ledger.bound(RUN, PARENT);
+    ledger.exited(RUN);
+    ledger
+}
+
+#[test]
+fn h13d_expired_released_job_cannot_start_nor_overlap_a_second_child() {
+    let ledger = exited_ledger();
+    let mut jobs = store();
+    let first = job(personal());
+    // The second child outlives the first.
+    let second = EphemeralJob { id: uuid::Uuid::new_v4().to_string(), created_at: 2_000,
+        expires_at: first.expires_at + 1_000, ..first.clone() };
+    jobs.queue(&first).unwrap();
+    jobs.queue(&second).unwrap();
+    let released = release_children(&mut jobs, &ledger, &SAME, 1_001).unwrap();
+    assert_eq!(released.iter().map(|(job, _)| job.id.clone()).collect::<Vec<_>>(), vec![first.id.clone()]);
+    // The first was released but never dequeued; at its expiry the D8 slot
+    // is free again, so the second is released …
+    let expired = first.expires_at;
+    let released = release_children(&mut jobs, &ledger, &SAME, expired).unwrap();
+    assert_eq!(released.iter().map(|(job, _)| job.id.clone()).collect::<Vec<_>>(), vec![second.id.clone()]);
+    // … and the expired first can no longer start (refused, dropped): two
+    // children of one employee never run concurrently.
+    assert_eq!(self_delegation_check_at(&jobs, &SAME, &ephemeral_child::message_id(&first.id), AGENT,
+        Some("user:owner"), expired), Err(VerificationError::Revoked));
+    assert_eq!(jobs.state(&first.id).unwrap(), Some(JobState::Dropped));
+    assert_eq!(jobs.started(&first.id).unwrap(), None);
+    assert_eq!(self_delegation_check_at(&jobs, &SAME, &ephemeral_child::message_id(&second.id), AGENT,
+        Some("user:owner"), expired), Ok(()));
+    assert_eq!(jobs.state(&second.id).unwrap(), Some(JobState::Started));
+    // One tick before expiry the job still starts.
+    let mut fresh = store();
+    let third = job(personal());
+    fresh.queue(&third).unwrap();
+    assert_eq!(release_children(&mut fresh, &ledger, &SAME, 1_001).unwrap().len(), 1);
+    assert_eq!(self_delegation_check_at(&fresh, &SAME, &ephemeral_child::message_id(&third.id), AGENT,
+        Some("user:owner"), third.expires_at - 1), Ok(()));
+}
+
+#[test]
+fn h13d_started_job_holds_the_employee_slot_until_its_run_ends() {
+    let mut ledger = exited_ledger();
+    let mut jobs = store();
+    let (first, second) = (job(personal()), job(personal()));
+    jobs.queue(&first).unwrap();
+    jobs.queue(&second).unwrap();
+    let released = release_children(&mut jobs, &ledger, &SAME, 1_001).unwrap();
+    assert_eq!(released.len(), 1);
+    let (running, waiting) = if released[0].0 == first { (&first, &second) } else { (&second, &first) };
+    assert_eq!(self_delegation_check(&jobs, &SAME, &ephemeral_child::message_id(&running.id), AGENT,
+        Some("user:owner")), Ok(()));
+    // Started, its run not bound yet: the ledger sees nothing, the store still
+    // holds the slot.
+    assert!(release_children(&mut jobs, &ledger, &SAME, 1_002).unwrap().is_empty());
+    assert_eq!(jobs.state(&waiting.id).unwrap(), Some(JobState::Pending));
+    // The child run binds, then ends: the product authority marks the job finished.
+    let child_run = RunHandle(RunId([7; 16]));
+    ledger.bound(child_run, PARENT);
+    ledger.child_bound(child_run, "/home".into(), running.id.clone());
+    ledger.exited(child_run);
+    let (_, job_id) = ledger.take_child(child_run).unwrap();
+    assert_eq!(job_id, running.id);
+    assert_eq!(ledger.take_child(child_run), None);
+    jobs.finish(&job_id).unwrap();
+    assert_eq!(jobs.state(&running.id).unwrap(), Some(JobState::Finished));
+    // The slot is free: the next child is released.
+    let next = release_children(&mut jobs, &ledger, &SAME, 1_003).unwrap();
+    assert_eq!(next.iter().map(|(job, _)| job.id.clone()).collect::<Vec<_>>(), vec![waiting.id.clone()]);
+}
+
+#[test]
+fn h13d_expired_started_job_does_not_hold_the_slot() {
+    let ledger = exited_ledger();
+    let mut jobs = store();
+    let (first, second) = (job(personal()), EphemeralJob { id: uuid::Uuid::new_v4().to_string(), created_at: 2_000,
+        expires_at: job(personal()).expires_at + 1_000, ..job(personal()) });
+    jobs.queue(&first).unwrap();
+    jobs.queue(&second).unwrap();
+    assert_eq!(release_children(&mut jobs, &ledger, &SAME, 1_001).unwrap().len(), 1);
+    assert_eq!(self_delegation_check(&jobs, &SAME, &ephemeral_child::message_id(&first.id), AGENT,
+        Some("user:owner")), Ok(()));
+    assert!(release_children(&mut jobs, &ledger, &SAME, first.expires_at - 1).unwrap().is_empty());
+    assert_eq!(release_children(&mut jobs, &ledger, &SAME, first.expires_at).unwrap().len(), 1);
+}
+
+#[test]
+fn h13d_finished_job_authorizes_no_second_run() {
+    let ledger = exited_ledger();
+    let mut jobs = store();
+    let job = job(personal());
+    jobs.queue(&job).unwrap();
+    assert_eq!(release_children(&mut jobs, &ledger, &SAME, 1_001).unwrap().len(), 1);
+    let id = ephemeral_child::message_id(&job.id);
+    assert_eq!(self_delegation_check(&jobs, &SAME, &id, AGENT, Some("user:owner")), Ok(()));
+    // Started: the stored receipt authorizes the run (`started`)…
+    assert_eq!(jobs.started(&job.id).unwrap(), Some(job.clone()));
+    // … the run ended: terminal. `child_tools` reads `started` only, so the
+    // same receipt is refused (`Revoked`) — and the gate cannot re-admit it.
+    jobs.finish(&job.id).unwrap();
+    assert_eq!(jobs.state(&job.id).unwrap(), Some(JobState::Finished));
+    assert_eq!(jobs.started(&job.id).unwrap(), None);
+    assert_eq!(jobs.released(&job.id).unwrap(), None);
+    assert_eq!(self_delegation_check(&jobs, &SAME, &id, AGENT, Some("user:owner")), Err(VerificationError::Revoked));
+    assert_eq!(jobs.job(&job.id).unwrap(), Some(job.clone()));
+    // Finishing is idempotent and never revives or finishes other states.
+    jobs.finish(&job.id).unwrap();
+    let pending = EphemeralJob { id: uuid::Uuid::new_v4().to_string(), ..job.clone() };
+    jobs.queue(&pending).unwrap();
+    jobs.finish(&pending.id).unwrap();
+    assert_eq!(jobs.state(&pending.id).unwrap(), Some(JobState::Pending));
+    // The finished job holds no slot: the pending one is released.
+    let next = release_children(&mut jobs, &ledger, &SAME, 1_002).unwrap();
+    assert_eq!(next.iter().map(|(job, _)| job.id.clone()).collect::<Vec<_>>(), vec![pending.id.clone()]);
+}
+
 #[test]
 fn h13b_personal_child_runs_after_parent_exit_as_same_identity() {
     let mut ledger = RunLedger::new();

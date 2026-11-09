@@ -115,13 +115,14 @@ impl EphemeralJob {
 /// Lifecycle state of a stored job: `pending → released` (parent exited,
 /// [`EphemeralJobs::take_startable`], one-shot) `→ started` (H13c: the
 /// dispatcher gate admitted its self-delegation, [`EphemeralJobs::begin_start`],
-/// once), or `→ dropped`.
+/// once) `→ finished` (H13d: terminal, the child's run ended; no second run
+/// from the stored receipt), or `→ dropped`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobState { Pending, Released, Started, Dropped }
+pub enum JobState { Pending, Released, Started, Finished, Dropped }
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ephemeral_jobs(
         id TEXT PRIMARY KEY, employee TEXT NOT NULL, run TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('pending','released','started','dropped')),
+        state TEXT NOT NULL CHECK(state IN ('pending','released','started','finished','dropped')),
         job TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);";
 const INDEX: &str = "CREATE INDEX IF NOT EXISTS ephemeral_jobs_state ON ephemeral_jobs(state, created_at);";
 
@@ -187,9 +188,9 @@ impl EphemeralJobs {
         let existing: Option<String> = tx.query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='ephemeral_jobs'", [], |row| row.get(0))
             .optional().map_err(store_error)?;
-        // H13c: a store created before the `started` state keeps its rows
-        // (same columns) under the widened CHECK constraint.
-        if existing.as_deref().is_some_and(|sql| !sql.contains("'started'")) {
+        // H13c/H13d: a store created before the `started`/`finished` states
+        // keeps its rows (same columns) under the widened CHECK constraint.
+        if existing.as_deref().is_some_and(|sql| !sql.contains("'finished'")) {
             tx.execute_batch("ALTER TABLE ephemeral_jobs RENAME TO ephemeral_jobs_h13b;").map_err(store_error)?;
             tx.execute_batch(SCHEMA).map_err(store_error)?;
             tx.execute_batch("INSERT INTO ephemeral_jobs(id,employee,run,state,job,created_at,expires_at)
@@ -228,7 +229,8 @@ impl EphemeralJobs {
             |row| row.get(0)).optional().map_err(store_error)?;
         state.map(|state| match state.as_str() {
             "pending" => Ok(JobState::Pending), "released" => Ok(JobState::Released),
-            "started" => Ok(JobState::Started), "dropped" => Ok(JobState::Dropped),
+            "started" => Ok(JobState::Started), "finished" => Ok(JobState::Finished),
+            "dropped" => Ok(JobState::Dropped),
             _ => Err(VerificationError::Unavailable),
         }).transpose()
     }
@@ -259,10 +261,15 @@ impl EphemeralJobs {
     /// `released → started`, once. `check` sees the released job first and
     /// may refuse (nothing changes then). The transition itself is one
     /// conditional UPDATE, so of two concurrent callers at most one gets the
-    /// job. `None`: the job is not (or no longer) released.
-    pub fn begin_start(&self, id: &str, check: impl FnOnce(&EphemeralJob) -> Result<(), VerificationError>)
+    /// job. `None`: the job is not (or no longer) released. H13d: a job with
+    /// `now >= expires_at` is dropped and never started.
+    pub fn begin_start(&self, id: &str, now: u64, check: impl FnOnce(&EphemeralJob) -> Result<(), VerificationError>)
         -> Result<Option<EphemeralJob>, VerificationError> {
         let Some(job) = self.released(id)? else { return Ok(None) };
+        if now >= job.expires_at {
+            self.drop_released(id)?;
+            return Ok(None);
+        }
         check(&job)?;
         let changed = self.db.execute("UPDATE ephemeral_jobs SET state='started' WHERE id=?1 AND state='released'", [id])
             .map_err(store_error)?;
@@ -276,6 +283,14 @@ impl EphemeralJobs {
             .map(|_| ()).map_err(store_error)
     }
 
+    /// H13d: the child's run ended: `started → finished` (terminal, idempotent;
+    /// any other state is untouched). A finished job authorizes no run and
+    /// no longer holds its employee's slot.
+    pub fn finish(&self, id: &str) -> Result<(), VerificationError> {
+        self.db.execute("UPDATE ephemeral_jobs SET state='finished' WHERE id=?1 AND state='started'", [id])
+            .map(|_| ()).map_err(store_error)
+    }
+
     /// Release (once) pending jobs whose parent run no longer holds the
     /// capability and whose employee is still the same id and incarnation.
     /// Expired, corrupt or re-identified jobs are dropped; unreadable
@@ -283,8 +298,10 @@ impl EphemeralJobs {
     ///
     /// H13c (D8): at most ONE job per employee is released per call, and none
     /// while another job of that employee is still `released` (enqueued, its
-    /// run not admitted yet) and unexpired — such a child counts as holding
-    /// the employee's slot even before its run is reserved/bound. spawnd's
+    /// run not admitted yet) or `started` (admitted, its run not bound or not
+    /// ended yet; H13d: `finish` clears it when the run ends) and unexpired —
+    /// such a child counts as holding the employee's slot even before its run
+    /// is reserved/bound. spawnd's
     /// admission coordinator remains the authoritative D8 enforcement: a
     /// second run of the same employee waits behind the first
     /// (`deferred_until_current_run_ends`), whatever the gateway releases.
@@ -294,7 +311,7 @@ impl EphemeralJobs {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
         let mut busy: std::collections::BTreeSet<String> = {
             let mut statement = tx.prepare("SELECT DISTINCT employee FROM ephemeral_jobs
-                WHERE state='released' AND expires_at > ?1").map_err(store_error)?;
+                WHERE state IN ('released','started') AND expires_at > ?1").map_err(store_error)?;
             let employees = statement.query_map([now_db], |row| row.get::<_, String>(0)).map_err(store_error)?
                 .collect::<Result<std::collections::BTreeSet<String>, _>>().map_err(store_error)?;
             employees
