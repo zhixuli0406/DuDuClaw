@@ -115,8 +115,9 @@ pub fn seals() -> SealFlag {
 
 /// Copy only bytes; filenames and parser-specific paths never cross the socket.
 pub fn snapshot(reader: &mut impl Read) -> Result<File, ParseError> {
-    use nix::sys::memfd::{memfd_create, MFdFlags};
-    let owned = memfd_create("duduclaw-parse", MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING)
+    // Raw syscall: nix's `memfd_create` links glibc's wrapper, which is above
+    // the release baseline.
+    let owned = crate::linux_syscalls::memfd_create(c"duduclaw-parse", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
         .map_err(|_| ParseError::Unavailable)?;
     let mut file = File::from(owned);
     let mut total = 0u64;
@@ -173,8 +174,8 @@ pub fn validate_inputs(request: &duduclaw_isolation::worker::ParseRequest, files
 }
 
 pub fn output_file() -> Result<File, ParseError> {
-    use nix::sys::memfd::{memfd_create, MFdFlags};
-    memfd_create("duduclaw-parse-output", MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING)
+    // Raw syscall (see `snapshot`).
+    crate::linux_syscalls::memfd_create(c"duduclaw-parse-output", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
         .map(File::from).map_err(|_| ParseError::Unavailable)
 }
 

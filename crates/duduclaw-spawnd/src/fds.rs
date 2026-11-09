@@ -1,6 +1,8 @@
 //! Validate the actual gateway descriptors before admission; metadata is not authority.
 use std::{io::{self, Seek, Write}, mem, os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd}};
-use nix::{fcntl::{fcntl, FcntlArg, SealFlag}, sys::{memfd::{memfd_create, MemFdCreateFlag}, stat::fstat, statfs::fstatfs}};
+use nix::{fcntl::{fcntl, FcntlArg, SealFlag}, sys::{stat::fstat, statfs::fstatfs}};
+// Raw-syscall wrappers: glibc's `memfd_create`/`statx` are above the release baseline.
+use duduclaw_core::linux_syscalls;
 use duduclaw_isolation::ipc::{InputFd, SpawnRequest, MAX_FRAME_BYTES};
 
 fn invalid() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "invalid isolation descriptors") }
@@ -84,9 +86,8 @@ fn validate_snapshot(fd: BorrowedFd<'_>, bytes: u64, authority: SnapshotAuthorit
 pub fn mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
     let mut stat: libc::statx = unsafe { mem::zeroed() };
     // Linux statx AT_EMPTY_PATH inspects this fd, never a caller-supplied pathname.
-    let result = unsafe { libc::statx(fd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-        libc::STATX_MNT_ID, &mut stat) };
-    if result != 0 { return Err(io::Error::last_os_error()); }
+    linux_syscalls::statx(fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        libc::STATX_MNT_ID, &mut stat)?;
     if stat.stx_mask & libc::STATX_MNT_ID == 0 || stat.stx_mnt_id == 0 { return Err(invalid()); }
     Ok(stat.stx_mnt_id)
 }
@@ -95,7 +96,7 @@ pub fn mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
 /// schema/nonce validation remains the B2 seam; this function does not bless it.
 pub fn sealed_plan(bytes: &[u8]) -> io::Result<OwnedFd> {
     if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES { return Err(invalid()); }
-    let fd = memfd_create(c"duduclaw-run-plan", MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING)?;
+    let fd = linux_syscalls::memfd_create(c"duduclaw-run-plan", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)?;
     let mut file = std::fs::File::from(fd);
     file.write_all(bytes)?;
     file.rewind()?;
@@ -108,6 +109,7 @@ pub fn sealed_plan(bytes: &[u8]) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
     use duduclaw_isolation::{bounded::List, execution::{RunHandle, RuntimeKind}, ids::{EmployeeId, RunId}};
     fn request() -> SpawnRequest {
         SpawnRequest::StartRun { run: RunHandle(RunId([1;16])), employee_id: EmployeeId([2;16]), runtime_request: RuntimeKind::Codex,

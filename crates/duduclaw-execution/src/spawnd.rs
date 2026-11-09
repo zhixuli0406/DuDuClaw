@@ -603,9 +603,9 @@ async fn prepare_inputs(inputs: RunInputs, budget: u64) -> Result<PreparedInputs
 async fn copy_memfd(mut input: RunInput, cap: u64) -> Result<(OwnedFd, u64), BackendError> {
     use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
-    use nix::{fcntl::{fcntl, FcntlArg, SealFlag}, sys::memfd::{memfd_create, MemFdCreateFlag}};
+    use nix::fcntl::{fcntl, FcntlArg, SealFlag};
     if input.max_bytes > cap { return Err(BackendError::Denied); }
-    let fd = memfd_create(c"duduclaw-input", MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING)
+    let fd = crate::linux_syscalls::memfd_create(c"duduclaw-input", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
         .map_err(|_| BackendError::Io)?;
     let mut file = std::fs::File::from(fd);
     let mut buffer = [0u8; 16 * 1024];

@@ -85,11 +85,10 @@ fn mount_id_at(dir: &OwnedFd, name: &[u8]) -> Result<Option<u64>, TreeError> {
     let flags = libc::AT_SYMLINK_NOFOLLOW | if name.is_empty() { libc::AT_EMPTY_PATH } else { 0 };
     // SAFETY: an all-zero `statx` (plain integers) is a valid value.
     let mut st: libc::statx = unsafe { std::mem::zeroed() };
-    // SAFETY: `path` is NUL-terminated and outlives the call, the descriptor
-    // is held, and `st` is a valid, exclusively borrowed output buffer.
-    if unsafe { libc::statx(dir.as_raw_fd(), path.as_ptr(), flags, libc::STATX_MNT_ID, &mut st) } != 0 {
-        return Err(TreeError::Io);
-    }
+    // Raw syscall: the glibc `statx` wrapper (2.28) is newer than the release
+    // toolchain's glibc. The descriptor is held for the call.
+    duduclaw_core::linux_syscalls::statx(dir.as_raw_fd(), &path, flags, libc::STATX_MNT_ID, &mut st)
+        .map_err(|_| TreeError::Io)?;
     if st.stx_mask & libc::STATX_MNT_ID == 0 { return Err(TreeError::Io); }
     Ok(Some(st.stx_mnt_id))
 }

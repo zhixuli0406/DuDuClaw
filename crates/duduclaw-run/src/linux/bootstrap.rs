@@ -96,7 +96,8 @@ pub fn handshake(fd: RawFd, registry: &mut dyn RootRegistry) -> Result<(super::r
     verify_peer(fd)?;
     deadline(fd)?;
     let mut nonce = [0u8; 32];
-    if unsafe { libc::getrandom(nonce.as_mut_ptr().cast(), nonce.len(), 0) } != nonce.len() as isize { return Err(Error::Bootstrap); }
+    // Raw syscall: glibc's `getrandom` wrapper is above the release baseline.
+    if super::syscalls::getrandom(&mut nonce, 0).ok() != Some(nonce.len()) { return Err(Error::Bootstrap); }
     let challenge = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([0;16]), message: Challenge { nonce } };
     let packet = ipc::encode(&challenge).map_err(|_| Error::Bootstrap)?;
     send_packet(fd, &packet, None)?;

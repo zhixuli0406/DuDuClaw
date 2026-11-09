@@ -52,7 +52,8 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(smoke["on"]["pull_request"], {"paths": [
             ".github/workflows/release.yml", ".github/workflows/linux-release-smoke.yml",
             "Cross.toml", ".cargo/**", "Cargo.lock", "Cargo.toml", "crates/*/Cargo.toml",
-            "scripts/check_glibc.py", "crates/duduclaw-cli/assets/native-protected-launcher.sh",
+            "scripts/check_glibc.py", "scripts/package-linux-release.py",
+            "crates/duduclaw-cli/assets/native-protected-launcher.sh",
             "crates/duduclaw-cli/src/service/**", "crates/duduclaw-core/src/root_key*.rs",
         ]})
         self.assertEqual(smoke["permissions"], {"contents": "read"})
@@ -87,15 +88,26 @@ class CiWorkflowTests(unittest.TestCase):
         # Compare full ordered steps: action pins/options, commands, features,
         # conditions, and environment must all follow the shipping Linux path.
         prefixes = ("actions/setup-node@", "dtolnay/rust-toolchain@", "Swatinem/rust-cache@")
-        names = {"Install cross (Linux)", "Build frontend", "Check Linux glibc baseline"}
+        names = {"Install cross (Linux)", "Build frontend",
+                 "Package Linux binaries and check glibc baseline"}
+        commands = ("python3 scripts/package-linux-release.py ", "cross build --release")
         def linux_steps(job):
             return [s for s in job["steps"]
                     if s.get("uses", "").startswith(prefixes)
                     or s.get("name") in names
-                    or s.get("run", "").startswith("cross build --release")]
+                    or s.get("run", "").startswith(commands)]
 
         expected = linux_steps(release)
+        # setup-node, rust-toolchain, rust-cache, install cross, frontend,
+        # packager --build-only, packager --skip-build (glibc baseline check).
         self.assertEqual(len(expected), 7)
+        runs = [s.get("run", "") for s in expected]
+        self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only", runs)
+        self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} "
+                      "--skip-build --output-dir .", runs)
+        # The shared packager step stays unprivileged: no offline signing key
+        # or bootstrap metadata (the packager also refuses keys under CI).
+        self.assertFalse(any("--signing-key" in run or "--bootstrap-root" in run for run in runs))
         self.assertEqual(linux_steps(smoke), expected)
         cache = next(s for s in smoke["steps"]
                      if s.get("uses", "").startswith("Swatinem/rust-cache@"))

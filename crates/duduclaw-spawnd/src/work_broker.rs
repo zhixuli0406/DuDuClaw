@@ -219,9 +219,8 @@ struct Stat {
 fn stat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     let mut st: libc::statx = unsafe { mem::zeroed() };
     let mask = libc::STATX_BASIC_STATS | libc::STATX_MNT_ID;
-    if unsafe { libc::statx(fd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, mask, &mut st) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // Raw syscall: glibc's `statx` wrapper is above the release baseline.
+    duduclaw_core::linux_syscalls::statx(fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, mask, &mut st)?;
     if st.stx_mask & mask != mask { return Err(io::ErrorKind::Unsupported.into()); }
     Ok(Stat { mode: u32::from(st.stx_mode), nlink: st.stx_nlink, uid: st.stx_uid,
         dev_major: st.stx_dev_major, dev_minor: st.stx_dev_minor, inode: st.stx_ino, size: st.stx_size,
@@ -265,12 +264,14 @@ fn copy_bounded(mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>, si
 
 fn memfd() -> Result<File, WorkRefusal> {
     let name = c"duduclaw-work-file";
-    let mut raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) };
-    if raw < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
-        raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-    }
-    if raw < 0 { return Err(WorkRefusal::Unavailable); }
-    Ok(File::from(unsafe { OwnedFd::from_raw_fd(raw) }))
+    // Raw syscall: glibc's `memfd_create` wrapper is above the release baseline.
+    use duduclaw_core::linux_syscalls::memfd_create;
+    let fd = match memfd_create(name, libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) =>
+            memfd_create(name, libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING),
+        other => other,
+    };
+    Ok(File::from(fd.map_err(|_| WorkRefusal::Unavailable)?))
 }
 
 /// Seal the copy, reopen it read-only through our own procfs fd entry (a new

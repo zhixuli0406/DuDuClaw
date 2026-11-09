@@ -157,7 +157,8 @@ impl Storage for LoopStorage {
             return Err(ErrorCode::InvalidRequest);
         }
         let mut token = [0u8; 16];
-        if unsafe { libc::getrandom(token.as_mut_ptr().cast(), token.len(), 0) } != token.len() as isize {
+        // Raw syscall: glibc's `getrandom` wrapper is above the release baseline.
+        if duduclaw_core::linux_syscalls::getrandom(&mut token, 0).ok() != Some(token.len()) {
             return Err(ErrorCode::IsolationUnavailable);
         }
         let mut candidate = self.journal.clone();

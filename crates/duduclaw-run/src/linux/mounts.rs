@@ -150,8 +150,9 @@ fn file_stat(fd: RawFd) -> Result<libc::statx, MountError> {
     let mask = libc::STATX_BASIC_STATS | libc::STATX_MNT_ID;
     // SAFETY: initialized result, AT_EMPTY_PATH addresses the owned fd itself.
     let mut result: libc::statx = unsafe { zeroed() };
-    unsafe { cvt(libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-        mask, &mut result), MountError::Identity)?; }
+    // Raw syscall: glibc's `statx` wrapper is above the release baseline.
+    super::syscalls::statx(fd, c"", libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        mask, &mut result).map_err(|_| MountError::Identity)?;
     if result.stx_mask & mask != mask { return Err(MountError::Identity); }
     Ok(result)
 }
@@ -636,8 +637,9 @@ fn statx(fd: RawFd) -> Result<libc::statx, MountError> {
     let required = libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_UID | libc::STATX_INO | libc::STATX_MNT_ID;
     // SAFETY: initialized result, AT_EMPTY_PATH addresses the owned fd itself.
     let mut result: libc::statx = unsafe { zeroed() };
-    unsafe { cvt(libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-        required, &mut result), MountError::Identity)?; }
+    // Raw syscall: glibc's `statx` wrapper is above the release baseline.
+    super::syscalls::statx(fd, c"", libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        required, &mut result).map_err(|_| MountError::Identity)?;
     if result.stx_mask & required != required { return Err(MountError::Identity); }
     Ok(result)
 }

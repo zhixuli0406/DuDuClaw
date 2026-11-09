@@ -189,9 +189,10 @@ pub(super) fn publish_checked(home: &Path, agent: &str, name: &str, source_diges
         duduclaw_mcp_boundary::io_authority::verify_before_io()?;
         let from = std::ffi::CString::new(stage.as_str()).map_err(unavailable)?;
         let to = std::ffi::CString::new(filename.as_str()).map_err(unavailable)?;
-        // SAFETY: retained directory FDs and validated single-component names.
-        if unsafe { libc::renameat2(journal.as_raw_fd(), from.as_ptr(), destination.as_raw_fd(),
-            to.as_ptr(), libc::RENAME_NOREPLACE) } != 0 { return Err(VerificationError::Unavailable); }
+        // Retained directory FDs and validated single-component names; raw
+        // syscall because glibc's `renameat2` wrapper is above the baseline.
+        duduclaw_core::linux_syscalls::renameat2(journal.as_raw_fd(), &from, destination.as_raw_fd(),
+            &to, libc::RENAME_NOREPLACE).map_err(|_| VerificationError::Unavailable)?;
         published = true;
         checkpoint("rename")?;
         destination.sync_all().map_err(unavailable)?;

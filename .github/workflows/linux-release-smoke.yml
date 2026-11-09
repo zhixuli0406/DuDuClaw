@@ -11,6 +11,7 @@ on:
       - 'Cargo.toml'
       - 'crates/*/Cargo.toml'
       - 'scripts/check_glibc.py'
+      - 'scripts/package-linux-release.py'
       - 'crates/duduclaw-cli/assets/native-protected-launcher.sh'
       - 'crates/duduclaw-cli/src/service/**'
       - 'crates/duduclaw-core/src/root_key*.rs'
@@ -60,13 +61,16 @@ jobs:
 
       - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
         if: runner.os == 'Linux'
-        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
 
-      - name: Check Linux glibc baseline
+      - name: Package Linux binaries and check glibc baseline
         if: runner.os == 'Linux'
-        run: python3 scripts/check_glibc.py target/${{ matrix.target }}/release/duduclaw
+        # Unprivileged: no signing key is passed (the packager refuses one under
+        # CI), so F metadata signing is skipped; only the unsigned tarball and
+        # the glibc baseline check run.
+        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --skip-build --output-dir .
 
       - name: Start x86_64 binary on Ubuntu 22.04 (glibc 2.35)
         if: matrix.target == 'x86_64-unknown-linux-gnu'

@@ -132,10 +132,10 @@ pub(crate) fn archive(home: &Path, snapshot: &Snapshot, scope: &str, skill: &str
             .map_err(|_| "archive intent publication unconfirmed")?,
     }
     let name = CString::new(snapshot.filename.as_str()).map_err(|e| e.to_string())?;
-    // SAFETY: both directory fds stay alive; the single component is NUL-free.
-    if unsafe { libc::renameat2(source.as_raw_fd(), name.as_ptr(), dest.as_raw_fd(), name.as_ptr(), libc::RENAME_NOREPLACE) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
+    // Both directory fds stay alive; the single component is NUL-free. Raw
+    // syscall: glibc's `renameat2` wrapper is newer than the release baseline.
+    duduclaw_core::linux_syscalls::renameat2(source.as_raw_fd(), &name, dest.as_raw_fd(), &name, libc::RENAME_NOREPLACE)
+        .map_err(|error| error.to_string())?;
     source.sync_all().map_err(|e| e.to_string())?; dest.sync_all().map_err(|e| e.to_string())?;
     let archived = Snapshot { directories: vec!["skills-archive".into(), scope.into()], filename: snapshot.filename.clone(), bytes: snapshot.bytes.clone() };
     archived.verify(home)?;

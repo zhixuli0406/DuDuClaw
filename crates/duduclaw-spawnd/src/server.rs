@@ -25,14 +25,14 @@ pub(crate) fn random_id() -> io::Result<[u8; 16]> {
     let mut id = [0u8; 16];
     let mut done = 0;
     while done < id.len() {
-        let size = unsafe { libc::getrandom(id.as_mut_ptr().add(done).cast(), id.len() - done, 0) };
-        if size < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted { continue; }
-            return Err(error);
-        }
+        // Raw syscall: glibc's `getrandom` wrapper is above the release baseline.
+        let size = match duduclaw_core::linux_syscalls::getrandom(&mut id[done..], 0) {
+            Ok(size) => size,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if size == 0 { return Err(unavailable()); }
-        done += size as usize;
+        done += size;
     }
     Ok(id)
 }

@@ -1,7 +1,9 @@
 //! B1's root-only manifest transport. Not a gateway wire format or disk registry.
 //! The authenticated one-shot handshake is the only entry point; no pathname,
 //! environment override or unsealed employee fd can supply launch authority.
-use std::{io::Write, os::fd::{AsRawFd, FromRawFd, OwnedFd}};
+use std::{io::Write, os::fd::{AsRawFd, OwnedFd}};
+#[cfg(test)]
+use std::os::fd::FromRawFd;
 use duduclaw_isolation::{ids::RunId, ipc::MAX_FRAME_BYTES};
 use serde::{Deserialize, Serialize};
 use crate::{Error, Result, validation::{Access, FileKind, REQUIRED_SEALS, TMPFS_MAGIC}};
@@ -61,9 +63,10 @@ pub fn send(fd: i32, challenge: Challenge, run: RunId, plan: TrustedRun, rights:
     let bytes = serde_json::to_vec(&Manifest { domain: DOMAIN.into(), run, nonce: challenge.nonce, plan })
         .map_err(|_| Error::Bootstrap)?;
     if bytes.len() > MAX_FRAME_BYTES { return Err(Error::Descriptors); }
-    let raw = unsafe { libc::memfd_create(c"duduclaw-root-plan".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-    if raw < 0 { return Err(Error::Descriptors); }
-    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    // Raw syscall: glibc's `memfd_create` wrapper is above the release baseline.
+    let mut file = std::fs::File::from(super::syscalls::memfd_create(c"duduclaw-root-plan",
+        libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING).map_err(|_| Error::Descriptors)?);
+    let raw = file.as_raw_fd();
     file.write_all(&bytes).map_err(|_| Error::Descriptors)?;
     if unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, REQUIRED_SEALS as i32) } != 0 { return Err(Error::Descriptors); }
     let mut descriptors = vec![raw]; descriptors.extend_from_slice(rights);

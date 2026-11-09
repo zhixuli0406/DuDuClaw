@@ -86,9 +86,9 @@ pub struct ExecutableIdentity {
 fn identity(fd: BorrowedFd<'_>) -> io::Result<ExecutableIdentity> {
     let mut stat: libc::statx = unsafe { mem::zeroed() };
     let mask = libc::STATX_BASIC_STATS | libc::STATX_MNT_ID;
-    let result = unsafe { libc::statx(fd.as_raw_fd(), c"".as_ptr(),
-        libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, mask, &mut stat) };
-    if result != 0 { return Err(io::Error::last_os_error()); }
+    // Raw syscall: glibc's `statx` wrapper is above the release baseline.
+    duduclaw_core::linux_syscalls::statx(fd.as_raw_fd(), c"",
+        libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, mask, &mut stat)?;
     if stat.stx_mask & mask != mask { return Err(invalid()); }
     Ok(ExecutableIdentity { inode: stat.stx_ino, mount_id: stat.stx_mnt_id, bytes: stat.stx_size,
         mode: u32::from(stat.stx_mode), uid: stat.stx_uid, device_major: stat.stx_dev_major,

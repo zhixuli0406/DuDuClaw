@@ -6,8 +6,9 @@ pub fn observe(fd: RawFd) -> Result<Observation> {
     // SAFETY: fixed-size kernel output structures and valid NUL-terminated empty path.
     unsafe {
         let mut stat: libc::statx = std::mem::zeroed();
-        if libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID, &mut stat) != 0 { return Err(Error::Descriptors); }
+        // Raw syscall: glibc's `statx` wrapper is above the release baseline.
+        super::syscalls::statx(fd, c"", libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID, &mut stat).map_err(|_| Error::Descriptors)?;
         let mut fs: libc::statfs64 = std::mem::zeroed();
         if libc::fstatfs64(fd, &mut fs) != 0 { return Err(Error::Descriptors); }
         let flags = libc::fcntl(fd, libc::F_GETFL);

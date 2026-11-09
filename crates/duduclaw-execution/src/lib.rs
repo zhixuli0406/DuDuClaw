@@ -23,6 +23,9 @@ pub mod recording_seccomp;
 mod office_io;
 #[cfg(target_os = "linux")]
 pub mod spawnd;
+/// Raw-syscall helpers for glibc wrappers newer than the release baseline.
+#[cfg(target_os = "linux")]
+pub mod linux_syscalls;
 
 pub use duduclaw_isolation::execution;
 pub use local::LocalBackend;

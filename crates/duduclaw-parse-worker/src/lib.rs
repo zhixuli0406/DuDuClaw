@@ -8,6 +8,12 @@ pub mod response;
 pub mod parsers;
 #[cfg(target_os = "linux")]
 pub mod transport;
+/// Raw-syscall wrappers for glibc functions newer than the release baseline;
+/// the same source as `duduclaw_execution::linux_syscalls` (no extra dependency).
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../../duduclaw-execution/src/linux_syscalls.rs"]
+mod linux_syscalls;
 #[cfg(target_os = "linux")]
 pub mod retirement;
 #[cfg(target_os = "linux")]

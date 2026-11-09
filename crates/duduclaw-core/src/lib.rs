@@ -85,6 +85,10 @@ pub mod toml_merge;
 pub mod traits;
 pub mod types;
 pub mod zh_variant;
+/// Raw-syscall helpers for glibc wrappers newer than the Linux release
+/// toolchain's glibc (`memfd_create`, `statx`, `renameat2`, `getrandom`).
+#[cfg(target_os = "linux")]
+pub use duduclaw_execution::linux_syscalls;
 
 pub use agent_guard::{
     check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES, INSTRUCTIONS_FILE,

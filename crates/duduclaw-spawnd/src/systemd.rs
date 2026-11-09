@@ -666,8 +666,8 @@ pub mod linux {
 
         fn test_id() -> RunId {
             let mut bytes = [0u8; 16];
-            let count = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-            assert_eq!(count, bytes.len() as isize);
+            let count = duduclaw_core::linux_syscalls::getrandom(&mut bytes, 0).unwrap();
+            assert_eq!(count, bytes.len());
             RunId(bytes)
         }
         // Test-only fixed helpers exercise PID 1's descriptor transport without

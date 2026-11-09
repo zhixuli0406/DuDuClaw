@@ -146,8 +146,8 @@ async fn helper_rpc(entry: &Arc<Entry>, request: SpawnRequest, fds: Vec<OwnedFd>
 pub(super) fn sealed_input(bytes: &[u8]) -> Result<OwnedFd, BackendError> {
     use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
-    use nix::{fcntl::{fcntl, FcntlArg, SealFlag}, sys::memfd::{memfd_create, MemFdCreateFlag}};
-    let fd = memfd_create(c"duduclaw-helper-input", MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING)
+    use nix::fcntl::{fcntl, FcntlArg, SealFlag};
+    let fd = crate::linux_syscalls::memfd_create(c"duduclaw-helper-input", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
         .map_err(|_| BackendError::Io)?;
     let mut file = std::fs::File::from(fd);
     file.write_all(bytes).map_err(|_| BackendError::Io)?;
