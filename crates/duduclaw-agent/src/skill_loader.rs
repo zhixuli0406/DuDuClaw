@@ -427,6 +427,27 @@ pub async fn install_skill_into_employee(
 
 const SKILLS_NOT_A_DIR: &str = "install DENIED: the employee SKILLS path is not a directory";
 
+/// The trusted home root could not be resolved (missing, unreadable, or a
+/// dangling link). Distinct from [`EMPLOYEE_TREE_GONE`]: the employee tree is
+/// not implicated.
+pub const HOME_UNAVAILABLE: &str =
+    "install DENIED: the DuDuClaw home directory could not be resolved; nothing was installed";
+
+/// Split `<home>/agents/<label>` into `(home, label)`. Any other shape is
+/// refused as `EMPLOYEE_TREE_GONE`.
+fn split_employee_dir(employee_dir: &Path) -> Result<(std::path::PathBuf, String), String> {
+    let gone = || EMPLOYEE_TREE_GONE.to_string();
+    let label = employee_dir.file_name().and_then(|n| n.to_str()).ok_or_else(gone)?.to_string();
+    let agents = employee_dir.parent().ok_or_else(gone)?;
+    if agents.file_name().and_then(|n| n.to_str()) != Some("agents") {
+        return Err(gone());
+    }
+    let home = agents.parent().ok_or_else(gone)?;
+    // `Path::new("agents/x").parent().parent()` is "" — resolve against cwd.
+    let home = if home.as_os_str().is_empty() { Path::new(".") } else { home };
+    Ok((home.to_path_buf(), label))
+}
+
 /// R3-2 (Unix): the no-follow employee write. Returns the destination path
 /// (for logging only; never reused for I/O).
 #[cfg(unix)]
@@ -438,9 +459,18 @@ fn write_into_employee(
 ) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
-    let absolute = std::path::absolute(employee_dir).map_err(|_| EMPLOYEE_TREE_GONE.to_string())?;
-    // Missing, symlinked (at any component) or non-directory: refused.
-    let employee = safe_dir::SafeDir::open(&absolute).map_err(|_| EMPLOYEE_TREE_GONE.to_string())?;
+    let (home, label) = split_employee_dir(employee_dir)?;
+    // The home root is operator-owned and trusted: symlinks at or above it
+    // (`/home -> var/home`, a linked `~/.duduclaw`) are resolved once here.
+    let home = std::fs::canonicalize(&home).map_err(|e| format!("{HOME_UNAVAILABLE} ({e})"))?;
+    let absolute = home.join("agents").join(&label);
+    // No-follow chain only from `agents/` down; missing, symlinked or
+    // non-directory components are refused.
+    let gone = |_: std::io::Error| EMPLOYEE_TREE_GONE.to_string();
+    let employee = safe_dir::SafeDir::open(&home)
+        .and_then(|root| root.child("agents"))
+        .and_then(|agents| agents.child(&label))
+        .map_err(gone)?;
     let identity = employee.metadata().map(|meta| (meta.dev(), meta.ino()))
         .map_err(|_| EMPLOYEE_TREE_GONE.to_string())?;
     let skills = match employee.mkdir_child("SKILLS", 0o755) {
@@ -460,9 +490,17 @@ fn write_into_employee(
     }
     // A tree moved away (tombstoned / replaced) while we wrote: the path no
     // longer names the directory we hold, so do not publish into it.
-    let still_live = safe_dir::SafeDir::open(&absolute).ok()
-        .and_then(|dir| dir.metadata().ok())
-        .is_some_and(|meta| (meta.dev(), meta.ino()) == identity);
+    //
+    // Best-effort only: this is a check-then-act against a concurrent
+    // tombstone, not a lock. The tombstone path renames `agents/<label>`; the
+    // employee cannot, so the window is not attacker-reachable and the write
+    // itself is descriptor-relative either way. The path compared is the one
+    // under the canonical home.
+    let still_live = safe_dir::SafeDir::open(&home)
+        .and_then(|root| root.child("agents"))
+        .and_then(|agents| agents.child(&label))
+        .and_then(|dir| dir.metadata())
+        .is_ok_and(|meta| (meta.dev(), meta.ino()) == identity);
     if !still_live {
         let _ = skills.remove_file(&temp);
         return Err(EMPLOYEE_TREE_GONE.into());
@@ -487,7 +525,12 @@ fn write_into_employee(
     use std::io::Write;
     let real_dir = |path: &Path| std::fs::symlink_metadata(path)
         .is_ok_and(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink());
-    if !real_dir(employee_dir) {
+    let (home, label) = split_employee_dir(employee_dir)?;
+    // Trusted home root: resolved once; symlink checks only from agents/ down.
+    let home = std::fs::canonicalize(&home).map_err(|e| format!("{HOME_UNAVAILABLE} ({e})"))?;
+    let agents = home.join("agents");
+    let employee_dir = agents.join(&label);
+    if !real_dir(&agents) || !real_dir(&employee_dir) {
         return Err(EMPLOYEE_TREE_GONE.into());
     }
     let skills = employee_dir.join("SKILLS");
@@ -910,6 +953,47 @@ mod install_safety_tests {
             EMPLOYEE_TREE_GONE
         );
         assert!(!real_agents.join("carol").join("SKILLS").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sr5r3f_home_reached_through_symlink_still_installs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("notes.md");
+        std::fs::write(&source, "---\nname: notes\n---\nbody").unwrap();
+        let real_home = root.path().join("real-home");
+        std::fs::create_dir_all(real_home.join("agents").join("alice")).unwrap();
+        let linked_home = root.path().join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let employee = linked_home.join("agents").join("alice");
+        let quarantine = root.path().join("quarantine");
+        install_skill_into_employee(&source, &employee, &quarantine).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(real_home.join("agents").join("alice").join("SKILLS").join("notes.md")).unwrap(),
+            "---\nname: notes\n---\nbody"
+        );
+        // A home that cannot be resolved is its own error.
+        let missing = root.path().join("no-such-home").join("agents").join("alice");
+        let error = install_skill_into_employee(&source, &missing, &quarantine).await.unwrap_err();
+        assert!(error.starts_with(HOME_UNAVAILABLE), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sr5r3f_agents_dir_symlink_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("notes.md");
+        std::fs::write(&source, "---\nname: notes\n---\nbody").unwrap();
+        let quarantine = home.path().join("quarantine");
+        let real_agents = home.path().join("real-agents");
+        std::fs::create_dir_all(real_agents.join("alice")).unwrap();
+        std::os::unix::fs::symlink(&real_agents, home.path().join("agents")).unwrap();
+        let employee = home.path().join("agents").join("alice");
+        assert_eq!(
+            install_skill_into_employee(&source, &employee, &quarantine).await.unwrap_err(),
+            EMPLOYEE_TREE_GONE
+        );
+        assert!(!real_agents.join("alice").join("SKILLS").exists());
     }
 
     #[tokio::test]
