@@ -425,6 +425,9 @@ fn check_outside(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, target: &str)
     env.routes.routes_for(&q.binding()?, &q.tenant).map_err(unavailable)
 }
 
+/// Owner-proof factors a Personal adoption request accepts (F6fb2 item 3).
+pub(crate) const ADOPT_OWNER_FACTORS: [&str; 3] = ["passkey", "totp", "email"];
+
 /// Who files an adoption request.
 pub(crate) enum Filer<'a> {
     /// The owner with a Q2 factor proof (verified by the RPC, F6d).
@@ -466,7 +469,10 @@ pub(crate) fn file_adoption(home: &Path, env: &AdoptEnv<'_>, employee: EmployeeI
             let proof = proof.ok_or(Refusal::FactorRequired)?;
             // Personal(same owner) only; a foreign row answers NOT_FOUND.
             if peek.kind != EmployeeKind::Personal || peek.owner.as_deref() != Some(proof.user_id) { return Err(Refusal::NotFound.into()); }
-            if !matches!(proof.factor, "passkey" | "totp" | "email" | "google_reauth") { return Err(Refusal::FactorRequired.into()); }
+            // F6fb2 item 3: only the factors of the strongest-factor rule
+            // (Q2, `owner_factor`: passkey > TOTP > email); a Google re-auth
+            // is not an owner proof for an adoption.
+            if !ADOPT_OWNER_FACTORS.contains(&proof.factor) { return Err(Refusal::FactorRequired.into()); }
             (RequestKind::PersonalAdopt, proof.user_id.to_owned(), None, Some(proof.factor))
         }
         Filer::Shared { requester, members } => {

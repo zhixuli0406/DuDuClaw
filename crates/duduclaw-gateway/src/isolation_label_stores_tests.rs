@@ -48,6 +48,7 @@ fn quarantine_row(home: &Path, label: &str, employee: u8, seal: &'static str) {
 
 fn set_seal(home: &Path, label: &str, seal: &str) {
     apply_db(home).execute("UPDATE employee_quarantine SET seal=?1 WHERE label=?2", params![seal, label]).unwrap();
+    duduclaw_memory::label_gate::invalidate_cached_answers();
 }
 
 /// Create every SQLite store through its real constructor (schemas only).
@@ -803,3 +804,7 @@ async fn f6fb_zero_count_required_for_any_closed_row() {
         assert_eq!(check_label_not_quarantined(home, LABEL, None), Err(GateRefusal::Unavailable), "{closed}");
     }
 }
+
+/// F6fb2: GDPR erasure under the gate, lazily created tables, FTS in step.
+#[path = "isolation_label_stores_f6fb2_tests.rs"]
+mod f6fb2;

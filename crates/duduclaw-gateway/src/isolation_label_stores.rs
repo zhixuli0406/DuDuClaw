@@ -195,11 +195,25 @@ fn hold_allows_write(home: &Path, label: &str) -> Result<(), GateRefusal> {
     Ok(())
 }
 
-/// F6fb item 2: the memory gate of the isolated MCP server process
+/// Set once an isolated MCP dispatcher was created in this process
+/// (F6fb2 item 5): from then on [`memory_write_gate`] is active regardless of
+/// the protected-mode environment flag (dispatchers exist only for protected
+/// runs, so failing closed costs nothing there).
+static ISOLATED_DISPATCHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn mark_isolated_dispatcher() {
+    ISOLATED_DISPATCHER.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn isolated_dispatcher_seen() -> bool { ISOLATED_DISPATCHER.load(std::sync::atomic::Ordering::SeqCst) }
+
+/// F6fb item 2: the memory gate for an isolated MCP dispatcher
 /// (`duduclaw-cli` `mcp_isolation.rs`), which opens the home's memory.db
-/// itself. That process exists only in protected mode (and need not inherit
-/// the protected-mode environment), so the gate is always active there. An
-/// in-memory database is no home store (nothing label-keyed persists): `Ok`.
+/// itself; always active. F6fb2 item 5: that dispatcher runs inside the
+/// gateway process (gateway uid, which reads apply.db), where the boot gate
+/// [`memory_write_gate`] is installed first and stays — this one is used
+/// only by a host without the gateway boot. An in-memory database is no
+/// home store (nothing label-keyed persists): `Ok`.
 pub(crate) fn isolated_process_write_gate(file: Option<&Path>, namespace: &str) -> Result<(), String> {
     let Some(file) = file else { return Ok(()) };
     let home = file.parent().ok_or_else(|| GateRefusal::Unavailable.message().to_owned())?;
@@ -227,9 +241,9 @@ pub(crate) fn check_session_writable(db: &Connection, session: &str) -> Result<(
 
 /// The memory crate's gate ([`duduclaw_memory::install_label_write_gate`]).
 pub(crate) fn memory_write_gate(file: Option<&Path>, namespace: &str) -> Result<(), String> {
-    if !protected_active() { return Ok(()); }
+    if !protected_active() && !isolated_dispatcher_seen() { return Ok(()); }
     let home = file.and_then(Path::parent).ok_or_else(|| GateRefusal::Unavailable.message().to_owned())?;
-    check_label_writable(home, namespace).map_err(|refusal| refusal.message().to_owned())
+    hold_allows_write(home, namespace).map_err(|refusal| refusal.message().to_owned())
 }
 
 /// Install the memory gate once per process (gateway boot).
@@ -586,9 +600,38 @@ pub(crate) mod sqlite {
         Ok(moved)
     }
 
+    /// F6fb2 item 4: full-text tables kept in step with a base table by key,
+    /// `(fts, fts key, base, base key)`; the base table's label column decides.
+    /// `key_facts_fts` has no label column (rowid-linked), so without this a
+    /// purge left the label's fact text searchable; `memories_fts` is also
+    /// keyed by its own `agent_id`, removed by the generic pass below.
+    pub(crate) const FTS_COMPANIONS: [(&str, &str, &str, &str); 2] =
+        [("key_facts_fts", "rowid", "key_facts", "rowid"), ("memories_fts", "memory_id", "memories", "id")];
+
+    /// Delete the FTS rows of the base rows under `label` (before the base
+    /// rows, in the purge transaction).
+    fn purge_fts(tx: &Connection, label: &str) -> Result<u64, StoreError> {
+        let present = |table: &str| tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table], |r| r.get::<_, bool>(0)).map_err(|_| StoreError::Unavailable);
+        let mut removed = 0u64;
+        for (fts, fts_key, base, base_key) in FTS_COMPANIONS {
+            if !present(fts)? || !present(base)? { continue; }
+            let base_columns = columns(tx, base)?;
+            for column in base_columns.iter().filter(|column| AGENT_COLUMNS.contains(&column.as_str())) {
+                let sql = format!("DELETE FROM {} WHERE {} IN (SELECT {} FROM {} WHERE {} = ?1)", quoted(fts), fts_key,
+                    base_key, quoted(base), quoted(column));
+                removed += tx.execute(&sql, [label]).map_err(|_| StoreError::Unavailable)? as u64;
+            }
+        }
+        Ok(removed)
+    }
+
     pub(crate) fn purge(home: &Path, file: &str, parent: Option<&Parent>, label: &str) -> Result<u64, StoreError> {
         let Some(mut db) = open(home, file, Access::ReadWrite)? else { return Ok(0) };
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| StoreError::Unavailable)?;
+        // FTS rows go with their base rows (same transaction). Not counted in
+        // `removed`: they are index rows, not label-keyed state.
+        purge_fts(&tx, label)?;
         let mut removed = 0u64;
         if let Some(parent) = parent {
             for table in tables_with(&tx, parent.child, parent.table)? {

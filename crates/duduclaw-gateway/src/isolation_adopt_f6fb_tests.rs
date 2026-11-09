@@ -302,3 +302,23 @@ fn f6fb_adoption_enforces_agent_cap() {
     let roomy = AdoptEnv { agent_cap: 2, ..env(&ax) };
     assert!(matches!(validate_item(f.home(), &roomy, &item, &plan.adopt, &f.bob), Ok(AdoptPhase::Pending { .. })));
 }
+
+/// F6fb2 item 3: a Personal adoption accepts only the strongest-factor
+/// rule's factors (passkey, TOTP, email); a Google re-auth (or anything else)
+/// is `FACTOR_REQUIRED` and files nothing.
+#[test]
+fn f6fb2_adoption_refuses_google_reauth_factor() {
+    let f = fixture();
+    tombstoned_full(&f, "soul");
+    let ax = ax();
+    assert_eq!(crate::isolation_adopt::ADOPT_OWNER_FACTORS, ["passkey", "totp", "email"]);
+    for factor in ["google_reauth", "sms", ""] {
+        let refused = file_adoption(f.home(), &env(&ax), EMP, 0, None,
+            Filer::Personal(Some(OwnerProof { user_id: &f.alice, factor })));
+        assert_eq!(refused.err(), Some(AdoptError::Restore(Refusal::FactorRequired)), "{factor:?}");
+    }
+    // Nothing was filed by the refusals: the owner's TOTP proof still files.
+    let filed = file_adoption(f.home(), &env(&ax), EMP, 0, None,
+        Filer::Personal(Some(OwnerProof { user_id: &f.alice, factor: "totp" }))).unwrap();
+    assert_eq!(filed.kind, RequestKind::PersonalAdopt);
+}
