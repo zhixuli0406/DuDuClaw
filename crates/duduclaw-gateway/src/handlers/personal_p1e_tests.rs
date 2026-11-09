@@ -596,6 +596,17 @@ fn dispatch_arms(source: &str) -> Vec<Arm> {
             continue;
         }
         let indent = line.len() - text.len();
+        // A guard on its own line (`"a" | "b"\n    if cond => {`) ends the
+        // pattern; without this the scan stays in pattern mode and swallows
+        // every following arm head up to the next `|` continuation.
+        if in_pattern && indent > 12 && text.starts_with("if ") {
+            in_pattern = false;
+            if let Some(arm) = current.as_mut() {
+                arm.body.push_str(text);
+                arm.body.push('\n');
+            }
+            continue;
+        }
         if indent < 12 {
             arms.extend(current.take());
             in_pattern = false;
@@ -822,6 +833,15 @@ fn p1e_dispatch_scan_parser_reads_arm_heads_only() {
     assert_eq!(methods, [vec!["x.a".to_string()], vec!["x.b".to_string(), "x.c".to_string()], vec![]]);
     assert!(arms[0].body.contains("params") && !arms[1].body.contains("params"));
     assert!(!arms.iter().any(|arm| arm.body.contains("agent_id")), "code after the match is no arm");
+    // A guard on its own line must not leave the scan in pattern mode (it
+    // used to swallow every arm up to the next `|` continuation).
+    let guarded = "        match method {\n            \"g.a\" | \"g.b\"\n                if cond() => {\n                one()\n            }\n            \"g.c\" => two(params),\n            \"g.d\" | \"g.e\"\n            | \"g.f\" => three(),\n        }\n";
+    let methods: Vec<Vec<String>> = dispatch_arms(guarded).iter().map(|arm| arm.methods.clone()).collect();
+    assert_eq!(methods, [
+        vec!["g.a".to_string(), "g.b".to_string()],
+        vec!["g.c".to_string()],
+        vec!["g.d".to_string(), "g.e".to_string(), "g.f".to_string()],
+    ]);
     assert_eq!(self_calls("boxed_frame(|| self.handle_a(params, ctx)).await; self.home_dir"), ["handle_a"]);
     let bodies = fn_bodies(&["impl X {\n    pub fn handle_a(&self, params: Value) {\n        params.get(\"agent_id\");\n    }\n    fn other(&self) {}\n}\n".to_string()]);
     assert!(handler_names_employee(&bodies["handle_a"]));
