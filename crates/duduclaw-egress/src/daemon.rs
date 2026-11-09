@@ -99,6 +99,9 @@ pub async fn host_main() -> Result<(), EgressError> {
     let resolver = HostResolver::new();
     for profile in config.profiles.as_slice() { resolver.probe(profile.dns_route).await?; }
     let listener = CheckedSocket::new(activated_listener(EGRESS_CONTROL_SOCKET, libc::SOCK_SEQPACKET)?).map_err(io_error)?;
+    // SR5 item 7: the host's own interface addresses, before seccomp; they
+    // are refreshed on use (`policy::host_addresses`).
+    crate::policy::init_host_addresses()?;
     crate::seccomp::install()?;
     loop {
         let fd = listener.accept().await.map_err(io_error)?;

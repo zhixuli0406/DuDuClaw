@@ -158,6 +158,10 @@ impl ApprovalStore {
             // and other deciders while a decided effect lands).
             ("lease_token", "lease_token TEXT"),
             ("lease_until", "lease_until TEXT"),
+            // SR5 item 3: the confirmed incarnation of the card's employee
+            // at creation (protected mode; NULL for other cards / older rows).
+            // `consume_approved` refuses a card whose employee changed since.
+            ("employee_incarnation", "employee_incarnation INTEGER"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -233,6 +237,8 @@ impl ApprovalStore {
         }
         let payload_text = rec.payload.to_string();
         let simulation_text = rec.simulation.as_ref().map(|v| masked_approval_value(v).to_string());
+        // SR5 item 3: bind the card to its employee's current incarnation.
+        let incarnation = card_incarnation(self.db_path.as_deref().and_then(Path::parent), &rec.agent_id)?;
         let origin = super::turn_origin::current_origin()?;
         // Quarantine creation must not add a post-commit emission window to
         // the existing erase/card race. Attach before starting the transaction;
@@ -333,6 +339,11 @@ impl ApprovalStore {
             )
             .map(|n| n == 1)
             .map_err(|e| format!("insert approval: {e}"))?;
+            if inserted && let Some(incarnation) = incarnation {
+                tx.execute("UPDATE approvals SET employee_incarnation=?2 WHERE id=?1",
+                    params![rec.id.as_str(), i64::from(incarnation)])
+                    .map_err(|e| format!("bind approval incarnation: {e}"))?;
+            }
             if let Some((session, turn)) = &origin {
                 tx.execute(
                     "INSERT OR IGNORE INTO approval_turn_origins(approval_id, session_id, turn_id) VALUES (?1, ?2, ?3)",
@@ -622,6 +633,22 @@ impl ApprovalStore {
         Ok(rows)
     }
 
+    /// SR5 item 3: ids of every card of `agent_id` (exact) that is still open
+    /// or approved-but-unconsumed (`pending` / `approved`), any kind.
+    pub(super) async fn list_open_ids_for_agent(&self, agent_id: &str) -> Result<Vec<ApprovalId>, String> {
+        let conn = self.conn.lock().await;
+        verify_live_io()?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM approvals WHERE agent_id = ?1 AND status IN ('pending','approved') ORDER BY created_at ASC")
+            .map_err(|e| format!("prepare list_open_ids_for_agent: {e}"))?;
+        let rows = stmt
+            .query_map(params![agent_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query list_open_ids_for_agent: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_open_ids_for_agent: {e}"))?;
+        Ok(rows.into_iter().map(ApprovalId::from).collect())
+    }
+
     /// Replace an approval's summary and payload (GDPR scrub). Status,
     /// decision and timestamps are untouched.
     pub(super) async fn replace_text(
@@ -763,6 +790,40 @@ pub(super) fn record_in_connection(conn: &Connection, id: &ApprovalId) -> Result
         params![id.as_str()],
         row_to_record,
     ).optional().map_err(|e| format!("read approval for decision: {e}"))
+}
+
+// ── SR5 item 3: cards bound to an employee incarnation ─────────────────
+
+/// Refusal of a card whose employee was tombstoned (and maybe restored as a
+/// new incarnation) since the card was created.
+pub(crate) const INCARNATION_CHANGED: &str = "employee_incarnation_changed";
+
+/// The confirmed incarnation of `agent` to store on a new card: protected
+/// mode only (the F6h switch), `None` for an in-memory store, an agent
+/// without a confirmed row (system, ephemeral, legacy) or outside protected
+/// mode. A disabled (tombstoned) row still yields its incarnation, so a card
+/// filed against it can never be consumed by a later restore. An unreadable
+/// lifecycle index refuses the card (fail closed).
+pub(crate) fn card_incarnation(home: Option<&Path>, agent: &str) -> Result<Option<u32>, String> {
+    if !crate::isolation_label_stores::protected_active() {
+        return Ok(None);
+    }
+    let Some(home) = home else { return Ok(None) };
+    crate::isolation_label_stores::confirmed_incarnation(home, agent)
+        .map(|row| row.map(|(incarnation, _disabled)| incarnation))
+        .map_err(|_| crate::isolation_label_stores::LABEL_STATE_UNAVAILABLE.to_owned())
+}
+
+/// A card stored with incarnation `stored` may be consumed only while its
+/// employee's confirmed row is live at that same incarnation. Checked
+/// whenever a card carries one (regardless of the current mode).
+pub(crate) fn card_incarnation_current(home: Option<&Path>, agent: &str, stored: i64) -> Result<(), String> {
+    let home = home.ok_or_else(|| INCARNATION_CHANGED.to_owned())?;
+    match crate::isolation_label_stores::confirmed_incarnation(home, agent) {
+        Ok(Some((incarnation, false))) if i64::from(incarnation) == stored => Ok(()),
+        Ok(_) => Err(INCARNATION_CHANGED.to_owned()),
+        Err(_) => Err(crate::isolation_label_stores::LABEL_STATE_UNAVAILABLE.to_owned()),
+    }
 }
 
 #[cfg(test)]

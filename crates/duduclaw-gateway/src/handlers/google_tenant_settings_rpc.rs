@@ -21,7 +21,19 @@
 //!   with the same `normalize_email` the tenant source and the D-5 subject
 //!   rule use; no duplicates after normalization; none may equal (exact
 //!   normalized equality) the email of ANY users.db account, whatever its
-//!   status — a person's mailbox is never a service mailbox.
+//!   status — a person's mailbox is never a service mailbox. SR5 item 4: nor
+//!   any address an account EVER held (`account_email_history`: changed
+//!   emails and removed accounts included).
+//!
+//! SR5 item 4 (authority): Admin re-read from users.db
+//! (`mfa_require_current_admin`) + the migration step-up proof, which is only
+//! issued after password + the second factor (TOTP) of an MFA-enrolled Admin
+//! and is fresh for five minutes; an audit row is written inside the config
+//! lock BEFORE the write (a failed audit refuses) and again after it.
+//! Residual: an address that never belonged to a users.db account (a
+//! colleague without a DuDuClaw account) cannot be recognised; designating it
+//! still needs the Admin + MFA step-up and leaves both audit rows, and the
+//! D-5 rule admits a designated mailbox for any actor by design.
 //! - `tenant_scopes`: at most [`MAX_TENANT_SCOPES`]; each exactly one of the
 //!   scopes the tenant mint requests (`google_workspace::REQUIRED_SCOPES`, the
 //!   set `tenant_source::read` admits); no duplicates. Empty ⇒ the tenant
@@ -51,6 +63,8 @@ const SESSION_EXPIRED: &str = "登入憑證已失效，請重新登入。";
 const REQUEST_INVALID: &str = "設定內容不正確：請提供服務信箱清單、權限範圍清單與驗證權杖。";
 const CONFIG_UNREADABLE: &str = "目前的 config.toml 或 Google 身分設定無法辨識，請先修正後再儲存。";
 const WRITE_FAILED: &str = "無法寫入 config.toml，設定未變更。";
+/// SR5 item 4: the pre-write audit row could not be written; nothing saved.
+const AUDIT_FAILED: &str = "無法寫入稽核紀錄，已拒絕儲存。";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,9 +86,20 @@ fn shown(value: &str) -> String { duduclaw_core::truncate_chars(value, 80).to_st
 /// Every users.db account email, normalized like the subject rule
 /// (`tenant_source::subject_accounts`). An email that does not normalize can
 /// never equal a normalized mailbox, so it is skipped exactly as there.
+///
+/// SR5 item 4: plus every address any account EVER held
+/// (`account_email_history`, trigger-written in the transaction of each
+/// email change, seeded with the current addresses): a colleague's former
+/// login address (changed email, removed account) is never designatable. An
+/// unreadable history refuses.
 pub(crate) fn account_emails(db: &UserDb) -> Result<Vec<String>, &'static str> {
     let users = db.list_users().map_err(|_| USERS_UNAVAILABLE)?;
-    Ok(users.into_iter().filter_map(|user| gi::normalize_email(&user.email).ok()).collect())
+    let history = db.account_email_history().map_err(|_| USERS_UNAVAILABLE)?;
+    let mut emails: Vec<String> = users.into_iter().map(|user| user.email).chain(history)
+        .filter_map(|email| gi::normalize_email(&email).ok()).collect();
+    emails.sort();
+    emails.dedup();
+    Ok(emails)
 }
 
 /// Pure validation of the requested lists against the users.db emails.
@@ -191,6 +216,14 @@ impl MethodHandler {
         let (settings, previous, table, expected_hash) = prepared;
         // Inside the config lock: the proof is still fresh and no account
         // has since taken one of the mailboxes.
+        // SR5 item 4: the audit row is written before the write, inside the
+        // lock (a failed audit refuses), and again after the commit.
+        let intent = json!({
+            "phase": "intent",
+            "before": { "service_mailboxes": previous.service_mailboxes, "tenant_scopes": previous.tenant_scopes },
+            "after": { "service_mailboxes": settings.service_mailboxes, "tenant_scopes": settings.tenant_scopes },
+        })
+        .to_string();
         let guard = {
             let (db, user, session, mailboxes) = (db.clone(), user.clone(), session.clone(), settings.service_mailboxes.clone());
             move || -> Result<(), String> {
@@ -199,6 +232,7 @@ impl MethodHandler {
                 if mailboxes.iter().any(|mailbox| emails.contains(mailbox)) {
                     return Err("服務信箱與同仁的登入帳號相同，已拒絕儲存。".into());
                 }
+                db.log_action(Some(&user), METHOD, None, Some(&intent), None).map_err(|_| AUDIT_FAILED.to_owned())?;
                 Ok(())
             }
         };
@@ -331,6 +365,41 @@ mod tests {
         assert!(emails.contains(&"alice@customer.com".to_owned()));
         // A suspended person is still a person: never a service mailbox.
         assert!(validate(&strings(&["bob@customer.com"]), &[], &emails).is_err());
+    }
+
+    #[test]
+    fn sr5_a_mailbox_any_account_ever_held_is_refused() {
+        use crate::google_identity::tenant_source::{admit_subject, subject_accounts, Actor, TenantSource, TenantSourceKind};
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let alice = db.create_user("alice@customer.com", "Alice", "password1", UserRole::Employee).unwrap();
+        let carol = db.create_user("carol@customer.com", "Carol", "password1", UserRole::Employee).unwrap();
+        // Alice changes her login address; Carol's account is removed.
+        db.change_own_email(&alice.id, "alice.new@customer.com").unwrap();
+        rusqlite::Connection::open(home.path().join("users.db")).unwrap()
+            .execute("DELETE FROM users WHERE id=?1", [&carol.id]).unwrap();
+        let emails = account_emails(&db).unwrap();
+        for former in ["alice@customer.com", "ALICE@customer.com", "carol@customer.com"] {
+            let error = validate(&strings(&[former]), &[], &emails).unwrap_err();
+            assert!(error.contains("同仁的登入帳號"), "{former}: {error}");
+        }
+        assert!(validate(&strings(&["alice.new@customer.com"]), &[], &emails).is_err(), "the current address too");
+        assert!(validate(&strings(&["support@customer.com"]), &[], &emails).is_ok());
+        // Use time: a designated former login address is refused for every actor.
+        for former in ["alice@customer.com", "carol@customer.com"] {
+            let accounts = subject_accounts(&db, former).unwrap();
+            assert_eq!(accounts.len(), 1, "{former}");
+            assert!(!accounts[0].active && accounts[0].user_id.is_empty());
+            let source = TenantSource::fixture(TenantSourceKind::Delegate, former, &[former], &[]);
+            for actor in [Actor::System, Actor::Human(&alice.id)] {
+                assert!(admit_subject(&source, actor, &accounts).is_err(), "{former}");
+            }
+        }
+        assert!(subject_accounts(&db, "support@customer.com").unwrap().is_empty());
+        // Every change of a login address is audited in its own transaction.
+        let changed = db.query_audit_log(None, Some(duduclaw_auth::db::EMAIL_CHANGED_ACTION), 10).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].target.as_deref(), Some(alice.id.as_str()));
     }
 
     #[tokio::test]

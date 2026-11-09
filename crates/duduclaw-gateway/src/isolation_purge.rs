@@ -688,6 +688,8 @@ fn finish(home: &Path, q: &Quarantined, journal: &Journal, now: i64, recovered: 
     };
     // The row is closed now: writer-gate answers cached for the label are stale.
     duduclaw_memory::label_gate::invalidate_cached_answers();
+    // SR5 item 2: a purged Personal row no longer carries an owner.
+    crate::personal_visibility::invalidate_owner_cache(home);
     let purged = Purged {
         employee: q.employee, incarnation: q.incarnation, label: q.label.clone(), request_id: journal.request_id.clone(),
         approver: request.as_ref().and_then(|r| r.approver.clone()), self_approved: request.as_ref().and_then(|r| r.self_approved),

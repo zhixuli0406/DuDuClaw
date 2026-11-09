@@ -106,6 +106,9 @@ mod skills_list_rpc;
 mod skills_recent_rpc;
 mod skills_manage_rpc;
 mod skills_install_request;
+// SR5 item 1: where a skill / MCP install may write (live employee, Personal
+// owner authorization of an approved request).
+pub(crate) mod skills_install_target;
 mod skills_custom;
 mod cron_rpc;
 mod cron_scoped_rpc;

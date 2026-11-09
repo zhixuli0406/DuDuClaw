@@ -274,6 +274,60 @@ async fn p1h_mirror_write_invalidates_the_owner_cache() {
     assert_eq!(lifecycle.matches("crate::personal_visibility::invalidate_owner_cache(home);").count(), 2);
 }
 
+// ── SR5 item 2: open quarantine rows keep the owner ─────────────────────
+
+/// A quarantine row on `label` (employee `byte`, incarnation `incarnation`).
+pub(crate) fn quarantine_row(home: &Path, label: &str, byte: u8, incarnation: u32, owner: Option<&str>, seal: &'static str) {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = home.join("migration-authority");
+    if !dir.exists() { std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap(); }
+    let db = rusqlite::Connection::open(dir.join("apply.db")).unwrap();
+    crate::isolation_quarantine::ensure_employee_schema(&db).unwrap();
+    crate::isolation_quarantine::insert_quarantine(&db, &crate::isolation_quarantine::NewQuarantine {
+        employee: duduclaw_isolation::ids::EmployeeId([byte; 16]), incarnation, label, owner, tenant: "tenant-a",
+        quarantined_at: 1, root: None, seal, principal_snapshot: &serde_json::json!({}), stripped: &serde_json::json!({}),
+    }).unwrap();
+}
+
+#[test]
+fn sr5_open_quarantine_rows_keep_the_personal_owner() {
+    let h = home();
+    const GONE: &str = "alice-gone";
+    // A tombstoned Personal employee: no mirror row, an open quarantine row.
+    quarantine_row(h.path(), GONE, 1, 0, Some(&h.alice), "sealed");
+    invalidate_owner_cache(h.path());
+    assert_eq!(personal_owner(h.path(), GONE), Ok(Some(h.alice.clone())));
+    assert_eq!(classify_reader(h.path(), true, &h.admin, true, GONE), Ok(Reader::BreakGlass { owner: h.alice.clone() }));
+    assert_eq!(classify_reader(h.path(), true, &h.bob, false, GONE), Ok(Reader::Refused));
+    assert!(hidden_from(h.path(), true, &h.admin).unwrap().contains(GONE));
+    assert!(hidden_from_employee(h.path(), true, SHARED).unwrap().contains(GONE));
+    assert_eq!(management_refusal(h.path(), true, SHARED, GONE), Some(PERSONAL_TARGET_REFUSED));
+    // A Shared quarantine row carries no owner.
+    quarantine_row(h.path(), "team-gone", 2, 0, None, "sealed");
+    invalidate_owner_cache(h.path());
+    assert_eq!(personal_owner(h.path(), "team-gone"), Ok(None));
+    // A live mirror row wins over a quarantine row on the same label.
+    quarantine_row(h.path(), PERSONAL, 3, 0, Some(&h.bob), "sealed");
+    invalidate_owner_cache(h.path());
+    assert_eq!(personal_owner(h.path(), PERSONAL), Ok(Some(h.alice.clone())));
+    // Closed rows (purged / adopted / restored) carry no owner any more; a
+    // `purging` row without a journal stays open (fail closed).
+    for (seal, open) in [("purged", false), ("adopted", false), ("restored", false), ("purging", true), ("absent", true)] {
+        rusqlite::Connection::open(h.path().join("migration-authority/apply.db")).unwrap()
+            .execute("UPDATE employee_quarantine SET seal=?1 WHERE label=?2", rusqlite::params![seal, GONE]).unwrap();
+        invalidate_owner_cache(h.path());
+        assert_eq!(personal_owner(h.path(), GONE).unwrap().is_some(), open, "{seal}");
+        assert_eq!(hidden_from(h.path(), true, &h.admin).unwrap().contains(GONE), open, "{seal}");
+    }
+    // An unreadable apply.db refuses (never "not Personal").
+    use std::os::unix::fs::PermissionsExt;
+    let apply = h.path().join("migration-authority/apply.db");
+    std::fs::set_permissions(&apply, std::fs::Permissions::from_mode(0o666)).unwrap();
+    invalidate_owner_cache(h.path());
+    assert_eq!(personal_owner(h.path(), SHARED), Err(Unavailable));
+    std::fs::set_permissions(&apply, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 #[test]
 fn p1b_self_target_decided_before_users_db() {
     // No users.db: the employee itself (and its sub-agent) is still allowed;

@@ -90,6 +90,12 @@
 //! - protected, tombstoned: `Rejected`, and no token is minted;
 //! - index present but unreadable or corrupt: `Rejected`, no token is minted;
 //! - unprotected (no index, or no row for the label): v1, exactly as before.
+//! - SR5 item 6, native Linux protected mode ([`token_binding`] with
+//!   `execution_gate::isolation_required()`): the soft-mode grace never
+//!   applies; a label with no confirmed row is refused (no token minted,
+//!   none verifies), except an `eph-…` child — a v2 token for its label over
+//!   its ROOT employee's live tuple (host-recorded parent chain) — and the
+//!   gateway's signed `doctor-probe` (v1).
 //!
 //! The delegation context ([`mint_delegation_context_in`]) binds its `worker`
 //! to the same tuple, and internal request signatures bind it through the v2
@@ -104,6 +110,8 @@ mod lifecycle;
 mod tests_security;
 #[cfg(test)]
 mod tests_v2;
+#[cfg(test)]
+mod tests_sr5;
 
 pub use lifecycle::{
     protected_employee, AgentIncarnation, LifecycleUnavailable, ProtectedEmployee, APPLY_DB_DIR,
@@ -432,27 +440,95 @@ fn protected_employee_logged(home_dir: &Path, label: &str) -> Result<ProtectedEm
     result
 }
 
+/// SR5 item 6: which token a label may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenBinding {
+    /// The label-only v1 tag (unprotected installs; in protected mode only the
+    /// gateway's signed `doctor-probe`).
+    V1,
+    /// A v2 tag over this tuple: the label's own live row, or — for an
+    /// `eph-…` child in protected mode — its root employee's live row.
+    V2(AgentIncarnation),
+    /// No token is minted and none verifies (tombstoned, or protected mode
+    /// with no confirmed row and no live root).
+    Refused,
+}
+
+/// The cold-start probe the gateway signs for an MCP check; no employee reach.
+const DOCTOR_PROBE: &str = "doctor-probe";
+
+/// SR5 item 6: the token binding of `label`. `required` is protected mode
+/// (`execution_gate::isolation_required()` in production).
+///
+/// - A confirmed row decides as before: live ⇒ v2 of its tuple, tombstoned ⇒
+///   refused.
+/// - No row, unprotected: v1, unchanged.
+/// - No row, protected mode: an `eph-…` child is bound to the ROOT employee
+///   of its host-recorded parent chain (`autonomy_gate::effective_identities`:
+///   every hop's sidecar must equal the host-owned org store) — a v2 token
+///   for the child's label over the root's live tuple, so a tombstone or a
+///   restore of the parent invalidates its children's tokens too; an
+///   unresolvable chain or a non-live root refuses. `doctor-probe` keeps v1.
+///   Every other label (including a blank claim) is refused.
+pub fn token_binding(home_dir: &Path, label: &str, required: bool) -> Result<TokenBinding, LifecycleUnavailable> {
+    match protected_employee_logged(home_dir, label)? {
+        ProtectedEmployee::Live(binding) => return Ok(TokenBinding::V2(binding)),
+        ProtectedEmployee::Tombstoned => return Ok(TokenBinding::Refused),
+        ProtectedEmployee::Unprotected => {}
+    }
+    if !required || label == DOCTOR_PROBE {
+        return Ok(TokenBinding::V1);
+    }
+    if !label.starts_with("eph-") {
+        return Ok(TokenBinding::Refused);
+    }
+    let Ok(chain) = crate::autonomy_gate::effective_identities(home_dir, label, crate::autonomy_gate::AutonomyPath::Background)
+    else {
+        return Ok(TokenBinding::Refused);
+    };
+    let Some(root) = chain.last().filter(|root| !root.starts_with("eph-")) else {
+        return Ok(TokenBinding::Refused);
+    };
+    Ok(match protected_employee_logged(home_dir, root)? {
+        ProtectedEmployee::Live(binding) => TokenBinding::V2(binding),
+        ProtectedEmployee::Tombstoned | ProtectedEmployee::Unprotected => TokenBinding::Refused,
+    })
+}
+
+/// The binding of `label` under this process's protected-mode switch.
+fn current_binding(home_dir: &Path, label: &str) -> Result<TokenBinding, LifecycleUnavailable> {
+    token_binding(home_dir, label, crate::execution_gate::isolation_required())
+}
+
 /// The token DuDuClaw currently issues for `label`: v1 when unprotected, v2
 /// for a live protected employee, `None` (issue nothing, accept nothing) when
-/// the employee is tombstoned or the index cannot be read.
+/// the employee is tombstoned or the index cannot be read. SR5 item 6: in
+/// protected mode see [`token_binding`] (no row ⇒ none, `eph-…` ⇒ v2 over
+/// the root's tuple).
 ///
 /// Every place that recomputes the expected token (spawn env, internal
 /// request receivers and signers) must use this, never [`mint_token`].
 pub fn current_agent_token(home_dir: &Path, key: &[u8], label: &str) -> Option<String> {
-    match protected_employee_logged(home_dir, label).ok()? {
-        ProtectedEmployee::Unprotected => Some(mint_token(key, label)),
-        ProtectedEmployee::Live(binding) => Some(mint_token_v2(key, label, &binding)),
-        ProtectedEmployee::Tombstoned => None,
+    current_agent_token_with(home_dir, key, label, crate::execution_gate::isolation_required())
+}
+
+/// [`current_agent_token`] with an explicit protected-mode flag (tests).
+pub fn current_agent_token_with(home_dir: &Path, key: &[u8], label: &str, required: bool) -> Option<String> {
+    match token_binding(home_dir, label, required).ok()? {
+        TokenBinding::V1 => Some(mint_token(key, label)),
+        TokenBinding::V2(binding) => Some(mint_token_v2(key, label, &binding)),
+        TokenBinding::Refused => None,
     }
 }
 
 /// Lifecycle-aware token check: v1 only for unprotected labels, v2 for the
-/// live tuple of a protected employee, never for a tombstoned or unreadable one.
+/// live tuple of a protected employee, never for a tombstoned or unreadable
+/// one (SR5 item 6: protected mode as [`token_binding`]).
 pub fn verify_agent_token(home_dir: &Path, key: &[u8], label: &str, token: &str) -> bool {
-    match protected_employee_logged(home_dir, label) {
-        Ok(ProtectedEmployee::Unprotected) => verify_token(key, label, token),
-        Ok(ProtectedEmployee::Live(binding)) => verify_token_v2(key, label, &binding, token),
-        Ok(ProtectedEmployee::Tombstoned) | Err(_) => false,
+    match current_binding(home_dir, label) {
+        Ok(TokenBinding::V1) => verify_token(key, label, token),
+        Ok(TokenBinding::V2(binding)) => verify_token_v2(key, label, &binding, token),
+        Ok(TokenBinding::Refused) | Err(_) => false,
     }
 }
 
@@ -604,10 +680,11 @@ pub fn mint_delegation_context_in(
     home_dir: &Path, key: &[u8], worker: &str, sender: &str, origin: &str, depth: u8,
     run_id: Option<&str>, expires_at: u64,
 ) -> Option<String> {
-    let binding = match protected_employee_logged(home_dir, worker).ok()? {
-        ProtectedEmployee::Unprotected => None,
-        ProtectedEmployee::Live(binding) => Some(binding),
-        ProtectedEmployee::Tombstoned => return None,
+    // SR5 item 6: the same binding the worker's token uses.
+    let binding = match current_binding(home_dir, worker).ok()? {
+        TokenBinding::V1 => None,
+        TokenBinding::V2(binding) => Some(binding),
+        TokenBinding::Refused => return None,
     };
     mint_delegation_context_for(key, worker, binding.as_ref(), sender, origin, depth, run_id, expires_at)
 }
@@ -651,10 +728,10 @@ pub fn verify_delegation_context_for(
 pub fn verify_delegation_context_in(
     home_dir: &Path, key: &[u8], worker: &str, expected_run_id: Option<&str>, token: &str, now: u64,
 ) -> Option<DelegationContext> {
-    let binding = match protected_employee_logged(home_dir, worker).ok()? {
-        ProtectedEmployee::Unprotected => None,
-        ProtectedEmployee::Live(binding) => Some(binding),
-        ProtectedEmployee::Tombstoned => return None,
+    let binding = match current_binding(home_dir, worker).ok()? {
+        TokenBinding::V1 => None,
+        TokenBinding::V2(binding) => Some(binding),
+        TokenBinding::Refused => return None,
     };
     verify_delegation_context_for(key, worker, binding.as_ref(), expected_run_id, token, now)
 }
@@ -1073,9 +1150,25 @@ pub fn verify_claim(
     token: &str,
     require: bool,
 ) -> IdentityVerdict {
+    verify_claim_with(home_dir, claimed_id, token, require, crate::execution_gate::isolation_required())
+}
+
+/// [`verify_claim`] with an explicit protected-mode flag. SR5 item 6: when
+/// protected mode is required the soft-mode grace never applies (strict for
+/// every label) and the token binding is [`token_binding`] — a label without
+/// a confirmed row is refused unless it is an `eph-…` child carrying a v2
+/// token over its live root's tuple (or the gateway's `doctor-probe`).
+pub fn verify_claim_with(
+    home_dir: &Path,
+    claimed_id: &str,
+    token: &str,
+    require: bool,
+    protected_mode: bool,
+) -> IdentityVerdict {
     // Recheck even when the caller cached false or passed it directly. Expiry
     // must restore strict verification without waiting for a gateway restart.
-    let require = if require { true } else {
+    // SR5 item 6: protected mode ignores the grace entirely.
+    let require = if require || protected_mode { true } else {
         match crate::require_identity_token_from_home(home_dir) {
             Ok(require) => require,
             Err(_) => return IdentityVerdict::Rejected,
@@ -1093,10 +1186,10 @@ pub fn verify_claim(
     // F6m: read the employee index before anything else can return. An
     // unreadable index or a tombstoned employee refuses in both modes; a live
     // protected employee needs its current v2 token in both modes.
-    let protected = match protected_employee_logged(home_dir, claimed_id) {
-        Ok(ProtectedEmployee::Tombstoned) | Err(_) => return IdentityVerdict::Rejected,
-        Ok(ProtectedEmployee::Live(binding)) => Some(binding),
-        Ok(ProtectedEmployee::Unprotected) => None,
+    let protected = match token_binding(home_dir, claimed_id, protected_mode) {
+        Ok(TokenBinding::Refused) | Err(_) => return IdentityVerdict::Rejected,
+        Ok(TokenBinding::V2(binding)) => Some(binding),
+        Ok(TokenBinding::V1) => None,
     };
     let key = match read_key(home_dir) {
         Ok(Some(key)) => key,

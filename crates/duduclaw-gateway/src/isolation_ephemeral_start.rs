@@ -55,22 +55,47 @@ pub fn self_delegation_check_at(jobs: &EphemeralJobs, identity: &dyn ParentIdent
     })?.map(|_| ()).ok_or(VerificationError::Revoked)
 }
 
+/// SR5 item 8: audit event of a refused ephemeral self-delegation (a queue
+/// row naming an ephemeral job that failed the exception's checks).
+pub const SELF_DELEGATION_REFUSED_EVENT: &str = "isolation_ephemeral_self_delegation_refused";
+
 /// Dispatcher gate entry: `sender == target == agent` was already compared by
 /// the caller. False outside protected mode, for any other message id, and
-/// whenever a store or the lifecycle cannot be read.
+/// whenever a store or the lifecycle cannot be read. SR5 item 8: every
+/// refusal of a row that names an ephemeral job is audited
+/// ([`SELF_DELEGATION_REFUSED_EVENT`]).
 pub(crate) async fn self_delegation_allowed(home: &Path, message_id: &str, agent: &str, on_behalf_of: Option<&str>)
     -> bool {
     if !duduclaw_core::execution_gate::isolation_required() || ephemeral_child::job_id_of(message_id).is_none() {
         return false;
     }
-    let (home, message_id, agent, on_behalf_of) =
+    let (blocking_home, blocking_message, blocking_agent, blocking_principal) =
         (home.to_owned(), message_id.to_owned(), agent.to_owned(), on_behalf_of.map(str::to_owned));
-    duduclaw_mcp_boundary::authority::verify_blocking(move || {
-        if !home.join(JOBS_DB).exists() { return Err(VerificationError::Unavailable); }
-        let jobs = EphemeralJobs::open(&home)?;
-        self_delegation_check_at(&jobs, &LiveLifecycle { home: &home }, &message_id, &agent, on_behalf_of.as_deref(),
-            duduclaw_mcp_boundary::authority::now_seconds()?)
-    }).await.is_ok()
+    let checked = duduclaw_mcp_boundary::authority::verify_blocking(move || {
+        if !blocking_home.join(JOBS_DB).exists() { return Err(VerificationError::Unavailable); }
+        let jobs = EphemeralJobs::open(&blocking_home)?;
+        self_delegation_check_at(&jobs, &LiveLifecycle { home: &blocking_home }, &blocking_message, &blocking_agent,
+            blocking_principal.as_deref(), duduclaw_mcp_boundary::authority::now_seconds()?)
+    }).await;
+    match checked {
+        Ok(()) => true,
+        Err(error) => {
+            audit_refusal(home, message_id, agent, on_behalf_of, error);
+            false
+        }
+    }
+}
+
+/// SR5 item 8: one audit row per refused ephemeral self-delegation. Names
+/// the queue row, the job id it claims, the employee label, whether a
+/// principal was recorded and the refusal code — never message content.
+pub(crate) fn audit_refusal(home: &Path, message_id: &str, agent: &str, on_behalf_of: Option<&str>,
+    error: VerificationError) {
+    tracing::warn!(agent, message = message_id, ?error, "ephemeral self-delegation refused");
+    duduclaw_security::audit::append_audit_event(home, &duduclaw_security::audit::AuditEvent::new(
+        SELF_DELEGATION_REFUSED_EVENT, agent, duduclaw_security::audit::Severity::Warning,
+        serde_json::json!({"message": message_id, "job": ephemeral_child::job_id_of(message_id),
+            "principal_recorded": on_behalf_of.is_some(), "code": format!("{error:?}")})));
 }
 
 fn audit(home: &Path, event: &str, job: &EphemeralJob, stage: &str) {

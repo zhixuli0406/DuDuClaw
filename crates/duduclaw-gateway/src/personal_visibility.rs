@@ -66,6 +66,15 @@
 //!   owner-configured `[channels] public_trigger` opens calling (never
 //!   assigning). **N4:** the fire-time "acting employee" exception applies
 //!   only when no principal is recorded.
+//! - **SR5 item 2:** privacy does not end at the tombstone. The owner map
+//!   also carries the owner of every OPEN Personal quarantine row in apply.db
+//!   (`isolation_label_stores::open_personal_owners`; closed = `purged`,
+//!   `adopted`, `restored`, or `purging` from `adopted`), so for the whole
+//!   retention window a tombstoned Personal employee stays hidden from
+//!   cross-agent listings, needs the audited Admin step-up for its sessions /
+//!   memory / timeline / mail, and is refused to other AI employees. An
+//!   unreadable apply.db is [`Unavailable`]. The cache key includes the
+//!   apply.db / WAL stamps; tombstone, purge and adoption also invalidate.
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -354,8 +363,15 @@ pub type OwnerMap = std::collections::BTreeMap<String, String>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnerKey {
     generation: u64,
-    files: [Option<FileStamp>; 2],
+    /// SR5 item 2: users.db, users.db-wal, apply.db, apply.db-wal (a
+    /// quarantine row opened / closed by tombstone, restore, adoption or
+    /// purge changes the owner map too).
+    files: [Option<FileStamp>; 4],
 }
+
+/// SR5 item 2: the lifecycle index holding the quarantine rows.
+const APPLY_DB_PATH: [&str; 2] = ["migration-authority", "apply.db"];
+const APPLY_WAL_PATH: [&str; 2] = ["migration-authority", "apply.db-wal"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileStamp {
@@ -387,7 +403,13 @@ fn owner_key(home: &Path) -> Option<OwnerKey> {
     // Generation first: its persistent read connection may create the WAL
     // sidecar on first use, which the stamps below then already include.
     let generation = crate::trigger_route::access::read_generation(home)?;
-    let files = [file_stamp(&home.join(USERS_DB)).ok()?, file_stamp(&home.join("users.db-wal")).ok()?];
+    let apply = |parts: [&str; 2]| home.join(parts[0]).join(parts[1]);
+    let files = [
+        file_stamp(&home.join(USERS_DB)).ok()?,
+        file_stamp(&home.join("users.db-wal")).ok()?,
+        file_stamp(&apply(APPLY_DB_PATH)).ok()?,
+        file_stamp(&apply(APPLY_WAL_PATH)).ok()?,
+    ];
     files[0].as_ref()?;
     Some(OwnerKey { generation, files })
 }
@@ -413,6 +435,14 @@ pub fn invalidate_owner_cache(home: &Path) {
 
 /// The full mirror through the hardened authority-store opener. Any read
 /// error is [`Unavailable`] (callers refuse) and is never cached.
+///
+/// SR5 item 2: plus the owner of every OPEN Personal quarantine row in
+/// apply.db (`isolation_label_stores::open_personal_owners`). A tombstone
+/// removes the users.db mirror, but the employee's data is kept sealed for
+/// the retention window, so its privacy rules (hidden rows, break-glass,
+/// AI-side refusals) stay until the row is purged, adopted or restored. A
+/// live mirror row wins over a quarantine row on the same label (a restore
+/// re-records it). An unreadable apply.db is [`Unavailable`].
 fn read_owner_map(home: &Path) -> Result<OwnerMap, Unavailable> {
     let conn = open(home)?;
     let mut statement = conn
@@ -421,7 +451,14 @@ fn read_owner_map(home: &Path) -> Result<OwnerMap, Unavailable> {
     let rows = statement
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
         .map_err(|_| Unavailable)?;
-    rows.collect::<Result<_, _>>().map_err(|_| Unavailable)
+    let mut map: OwnerMap = rows.collect::<Result<_, _>>().map_err(|_| Unavailable)?;
+    // Oldest incarnation first: a later open row on the label wins.
+    let quarantined: OwnerMap =
+        crate::isolation_label_stores::open_personal_owners(home).map_err(|_| Unavailable)?.into_iter().collect();
+    for (label, owner) in quarantined {
+        map.entry(label).or_insert(owner);
+    }
+    Ok(map)
 }
 
 /// P1h (N2): the owner map for one ACL check. The current request's snapshot

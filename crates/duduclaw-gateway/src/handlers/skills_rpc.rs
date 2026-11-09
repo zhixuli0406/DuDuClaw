@@ -414,6 +414,13 @@ impl MethodHandler {
         content: &str,
         skill_name: &str,
     ) -> Result<String, String> {
+        // SR5 item 1: an employee scope must name a live employee (F6h gate +
+        // lifecycle read) BEFORE anything is written; `agents/<label>` is
+        // never created for an unknown, tombstoned or quarantined label.
+        let employee_dir = match super::skills_install_target::scope_employee(scope) {
+            Some(label) => Some(super::skills_install_target::live_employee_dir(&self.home_dir, label)?),
+            None => None,
+        };
         let tmp_dir = std::env::temp_dir().join("duduclaw-skill-install");
         std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
         // `skill_name` may come from user-supplied frontmatter — sanitize so a
@@ -441,11 +448,11 @@ impl MethodHandler {
             )
             .await
         } else {
-            if !is_valid_agent_id(scope) {
+            let Some(employee_dir) = employee_dir else {
                 let _ = std::fs::remove_file(&tmp_file);
-                return Err("Invalid agent_id for scope".into());
-            }
-            let agent_skills_dir = self.home_dir.join("agents").join(scope).join("SKILLS");
+                return Err(super::skills_install_target::INVALID_TARGET.into());
+            };
+            let agent_skills_dir = employee_dir.join("SKILLS");
             duduclaw_agent::skill_loader::install_skill(
                 &tmp_file,
                 &agent_skills_dir,

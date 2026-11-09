@@ -1079,12 +1079,16 @@ fn tombstone_preview_with(home: &Path, employee_id: &str,
 /// card naming the employee's label (its own cards, and Personal-delegation
 /// cards from or to it). A failure is recorded as the `approvals:` pending
 /// fence (H2), which blocks a restore until a retry succeeds.
+///
+/// SR5 item 3: "its own cards" are every `pending` AND `approved`
+/// (unconsumed) card of the label, all kinds (`list_open_for_agent`) — an
+/// approved card used to survive the tombstone. New cards also carry the
+/// employee incarnation and `consume_approved` refuses a mismatch.
 pub(crate) async fn invalidate_employee_approvals(home: &Path, label: &str, employee: EmployeeId) {
     use crate::approval::{ApprovalBroker, ApprovalStatus};
     let result = async {
         let broker = ApprovalBroker::open(home).map_err(|_| ())?;
-        let mut ids = Vec::new();
-        for card in broker.list_pending(Some(label)).await.map_err(|_| ())? { ids.push(card.id); }
+        let mut ids = broker.list_open_for_agent(label).await.map_err(|_| ())?;
         for card in broker.list_by_kind(crate::isolation_background::PERSONAL_DELEGATION_KIND).await.map_err(|_| ())? {
             let names = card.agent_id == label
                 || card.payload.get("target_agent").and_then(Value::as_str) == Some(label)

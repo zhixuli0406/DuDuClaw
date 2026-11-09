@@ -533,9 +533,35 @@ impl ApprovalBroker {
     /// Single-use claim of an approved request: `approved → invalidated`.
     /// `true` only for the one caller whose update changed the row, so two
     /// concurrent appliers can never both act on one approval.
+    ///
+    /// SR5 item 3: a card that carries an employee incarnation is consumed
+    /// only while that employee's confirmed row is live at the same
+    /// incarnation; otherwise (tombstoned, restored as a new incarnation,
+    /// unreadable lifecycle) it is invalidated in the same transaction and
+    /// the claim is refused with an error.
     pub async fn consume_approved(&self, id: &ApprovalId, reason: &str) -> Result<bool, String> {
+        let home = self.store.db_path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
         let mut connection = self.store.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
+        let bound: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT agent_id, employee_incarnation FROM approvals WHERE id=?1 AND status='approved'",
+                params![id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some((agent, Some(stored))) = bound
+            && let Err(refusal) = super::store::card_incarnation_current(home.as_deref(), &agent, stored)
+        {
+            conn.execute(
+                "UPDATE approvals SET status='invalidated',invalidated_reason=?1 WHERE id=?2 AND status='approved'",
+                params![super::store::INCARNATION_CHANGED, id.as_str()],
+            )
+            .map_err(|e| e.to_string())?;
+            commit_live_write(conn)?;
+            return Err(refusal);
+        }
         let n = conn
             .execute(
                 "UPDATE approvals SET status='invalidated',invalidated_reason=?1

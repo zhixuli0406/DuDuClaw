@@ -144,12 +144,24 @@ pub(crate) enum SubjectUse {
 
 /// Every users.db account whose email, normalized with the same normalizer as
 /// the configured subject, is exactly `subject`. Unreadable ⇒ `Unavailable`.
+///
+/// SR5 item 4: when no current account holds `subject` but one EVER did
+/// (`account_email_history`), a former-holder entry (no user id, inactive) is
+/// returned, so a designated service mailbox that was a person's login
+/// address at any time is refused at use time too ([`admit_subject`]).
 pub(crate) fn subject_accounts(db: &UserDb, subject: &str) -> Result<Vec<SubjectAccount>, VerificationError> {
     let users = db.list_users().map_err(|_| VerificationError::Unavailable)?;
-    Ok(users.into_iter()
+    let mut accounts: Vec<SubjectAccount> = users.into_iter()
         .filter(|user| gi::normalize_email(&user.email).is_ok_and(|email| email == subject))
         .map(|user| SubjectAccount { active: user.status == duduclaw_auth::models::UserStatus::Active, user_id: user.id })
-        .collect())
+        .collect();
+    if accounts.is_empty() {
+        let history = db.account_email_history().map_err(|_| VerificationError::Unavailable)?;
+        if history.iter().any(|email| gi::normalize_email(email).is_ok_and(|email| email == subject)) {
+            accounts.push(SubjectAccount { user_id: String::new(), active: false });
+        }
+    }
+    Ok(accounts)
 }
 
 /// The subject rule (D-5). Pure: callers supply the users.db facts.

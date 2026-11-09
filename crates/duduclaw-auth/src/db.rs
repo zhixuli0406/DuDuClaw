@@ -239,7 +239,16 @@ impl UserDb {
         crate::admin_eligibility::migrate(&conn)?;
         // F6c (Q3): owner credential change log, also over users + MFA tables.
         crate::credential_changes::migrate(&conn)?;
+        // SR5 item 4: every address an account ever held (trigger-written).
+        crate::account_email_history::migrate(&conn)?;
         Ok(())
+    }
+
+    /// SR5 item 4: every email address any account ever held, as written
+    /// (`account_email_history`). Unreadable ⇒ `Err` (callers refuse).
+    pub fn account_email_history(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn();
+        crate::account_email_history::all_emails(&conn)
     }
 
     /// Set a personal preference, checking the current binding in the same write.
@@ -465,6 +474,11 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("update error: {e}"))?;
         let since = crate::credential_changes::high_water(&tx)?;
+        // SR5 item 4: the previous address, for the audit row below.
+        let previous: Option<String> = tx
+            .query_row("SELECT email FROM users WHERE id = ?1", params![user_id], |row| row.get(0))
+            .optional()
+            .map_err(|e| format!("update error: {e}"))?;
         let affected = tx
             .execute(
                 "UPDATE users SET email = ?1, updated_at = ?2 WHERE id = ?3",
@@ -482,6 +496,17 @@ impl UserDb {
             return Err("user not found".to_string());
         }
         if by_owner { crate::credential_changes::stamp_owner(&tx, since, user_id)?; }
+        // SR5 item 4: every email change is audited in its own transaction
+        // (the history row is written by the `account_email_history` trigger).
+        let detail = serde_json::json!({
+            "old_email": previous, "new_email": email, "by_owner": by_owner,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO auth_audit_log (user_id, action, target, detail, ip, timestamp) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![by_owner.then_some(user_id), EMAIL_CHANGED_ACTION, user_id, detail, now],
+        )
+        .map_err(|e| format!("update error: {e}"))?;
         // The email is part of the live context.
         bump_acl_generation(&tx).map_err(|e| format!("update error: {e}"))?;
         tx.commit().map_err(|e| format!("update error: {e}"))
@@ -898,6 +923,9 @@ pub const BOOTSTRAP_PLACEHOLDER_EMAIL: &str = "admin@local";
 /// Error returned when an email is already used by another account. Stable
 /// string: the gateway passes it through and the dashboard keys on it.
 pub const EMAIL_IN_USE: &str = "email is already in use";
+/// SR5 item 4: `auth_audit_log` action of every login email change, written
+/// in the change's own transaction (detail: old / new address, `by_owner`).
+pub const EMAIL_CHANGED_ACTION: &str = "account.email_changed";
 
 /// Maximum length of an email address (RFC 5321 path limit).
 const MAX_EMAIL_LEN: usize = 254;
