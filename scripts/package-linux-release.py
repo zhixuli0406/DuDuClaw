@@ -6,6 +6,7 @@ tarball and SHA-256 only. Offline operators may supply a reviewed F release
 template and their external target key; no key is copied and CI cannot sign.
 """
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -93,6 +94,35 @@ def validate_binary(path):
         raise ValueError(f"expected executable regular file with one link: {path.name}")
     if not 0 < metadata.st_size < LEGACY_BINARY_LIMIT:
         raise ValueError(f"binary must be nonempty and smaller than 200 MiB: {path.name}")
+
+
+def stage_cargo_binary(source, destination):
+    """Byte-copy a Cargo output into private staging, then validate the copy.
+
+    Cargo hard-links target/<triple>/release/<bin> to release/deps/<bin>-<hash>,
+    so the source legitimately has st_nlink == 2. The one-link rule is enforced
+    on the private copy, which no other path can modify. Symlinks and non-regular
+    files are still refused at the source (opened O_NOFOLLOW, no TOCTOU follow).
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.EMLINK):
+            raise ValueError(f"expected executable regular file with one link: {source.name}") from error
+        raise
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
+            raise ValueError(f"expected executable regular file with one link: {source.name}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with os.fdopen(descriptor, "rb") as reader:
+        with destination.open("xb") as writer:
+            shutil.copyfileobj(reader, writer)
+    destination.chmod(0o755)
+    validate_binary(destination)
 
 
 def sha256(path):
@@ -351,11 +381,9 @@ def main():
     # assets; a concurrent build must not make these two outputs disagree.
     with tempfile.TemporaryDirectory(prefix="linux-release-inputs-") as temporary:
         snapshot = Path(temporary)
+        snapshot.chmod(0o700)  # mkdtemp already creates 0700; keep it explicit
         for name in BIN_PACKAGES:
-            validate_binary(binary_dir / name)
-            shutil.copyfile(binary_dir / name, snapshot / name)
-            (snapshot / name).chmod(0o755)
-            validate_binary(snapshot / name)
+            stage_cargo_binary(binary_dir / name, snapshot / name)
             subprocess.run([sys.executable, str(ROOT / "scripts/check_glibc.py"),
                             str(snapshot / name)], check=True)
         signed = sign_release(snapshot, args.target, args.output_dir,

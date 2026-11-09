@@ -95,6 +95,88 @@ class LinuxReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PACKAGE.validate_binary(source)
 
+    def cargo_layout(self):
+        """Mimic Cargo: release/<bin> is a hard link to release/deps/<bin>-<hash>."""
+        release = self.root / "cargo" / TARGET / "release"
+        (release / "deps").mkdir(parents=True)
+        for name in PACKAGE.BIN_PACKAGES:
+            os.link(self.binaries / name, release / "deps" / (name + "-0123abcd"))
+            os.link(release / "deps" / (name + "-0123abcd"), release / name)
+            # Drop the original so only the Cargo pair of links remains.
+        for name in PACKAGE.BIN_PACKAGES:
+            (self.binaries / name).unlink()
+        return release
+
+    def run_main(self, release, calls):
+        def fake_run(command, **kwargs):
+            calls.append([str(part) for part in command])
+            return subprocess.CompletedProcess(command, 0)
+        argv = ["package-linux-release.py", "--target", TARGET, "--skip-build",
+                "--output-dir", str(self.output)]
+        with patch.object(PACKAGE, "release_binary_dir", return_value=release), \
+                patch.object(PACKAGE.subprocess, "run", fake_run), \
+                patch.object(sys, "argv", argv), \
+                patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            PACKAGE.main()
+
+    def test_hardlinked_cargo_output_packages_via_private_staging_copy(self):
+        release = self.cargo_layout()
+        self.assertEqual((release / "duduclaw").stat().st_nlink, 2)
+        with self.assertRaises(ValueError):
+            PACKAGE.validate_binary(release / "duduclaw")  # direct check is still strict
+        calls = []
+        self.run_main(release, calls)
+        archive = self.output / "duduclaw-linux-x64.tar.gz"
+        self.assertTrue(archive.is_file())
+        checked = [Path(call[-1]) for call in calls if call[1:2] and call[1].endswith("check_glibc.py")]
+        self.assertEqual(len(checked), len(PACKAGE.BIN_PACKAGES))
+        for path in checked:
+            self.assertNotEqual(path.parent, release)
+            self.assertEqual(path.parent.name[:len("linux-release-inputs-")], "linux-release-inputs-")
+        with tarfile.open(archive) as bundle:
+            for name in PACKAGE.BIN_PACKAGES:
+                self.assertEqual(bundle.extractfile(name).read(), (release / name).read_bytes())
+
+    def test_staged_copy_is_independent_private_nlink_one(self):
+        release = self.cargo_layout()
+        staging = Path(tempfile.mkdtemp(dir=self.root))
+        staging.chmod(0o700)
+        staged = staging / "duduclaw"
+        PACKAGE.stage_cargo_binary(release / "duduclaw", staged)
+        metadata = staged.lstat()
+        self.assertEqual(metadata.st_nlink, 1)
+        self.assertEqual(metadata.st_mode & 0o7777, 0o755)
+        self.assertNotEqual(metadata.st_ino, (release / "duduclaw").stat().st_ino)
+        before = staged.read_bytes()
+        (release / "duduclaw").write_bytes(b"\x7fELFmutated")  # writes through the Cargo links
+        self.assertEqual(staged.read_bytes(), before)
+
+    def test_staging_refuses_symlinked_and_nonregular_inputs(self):
+        source = self.binaries / "duduclaw"
+        linked = self.root / "link"
+        linked.symlink_to(source)
+        staging = Path(tempfile.mkdtemp(dir=self.root))
+        with self.assertRaises(ValueError):
+            PACKAGE.stage_cargo_binary(linked, staging / "duduclaw")
+        self.assertFalse((staging / "duduclaw").exists())
+        with self.assertRaises(ValueError):
+            PACKAGE.stage_cargo_binary(self.binaries, staging / "dir")
+        source.chmod(0o644)
+        with self.assertRaises(ValueError):
+            PACKAGE.stage_cargo_binary(source, staging / "duduclaw")
+
+    def test_symlinked_cargo_output_refused_by_main(self):
+        release = self.cargo_layout()
+        target = self.root / "elsewhere"
+        shutil.copyfile(release / "duduclaw", target)
+        target.chmod(0o755)
+        (release / "duduclaw").unlink()
+        (release / "duduclaw").symlink_to(target)
+        with self.assertRaises(ValueError):
+            self.run_main(release, [])
+        self.assertFalse(self.output.exists())
+
     def test_output_is_not_overwritten(self):
         archive = self.package()
         before = archive.read_bytes()
