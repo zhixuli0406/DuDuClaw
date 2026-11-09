@@ -60,9 +60,7 @@ impl WebChatState {
             .await.map_err(|_| "unavailable")?.map_err(|_| "unavailable")?;
         let reg = self.ctx.registry.read().await;
         let candidates: Vec<String> = reg.list().into_iter().filter_map(|a| {
-            let id = &a.config.agent.name;
-            (a.config.agent.status.is_operational() && snapshot.access.may_assign(id)
-                && sender.webchat_allows(a) && sender.may_call(a, None)).then(|| id.clone())
+            primary_candidate(&sender, a).then(|| a.config.agent.name.clone())
         }).collect();
         if let Some(primary) = primary.filter(|id| candidates.iter().any(|a| a == id)) {
             return Ok(Some(primary));
@@ -206,6 +204,45 @@ pub(crate) fn assignment_text_allowed(
     }
     let targets = assignment_mention_targets_under(reg, sender, "webchat", None, restriction);
     matches!(trigger_match::scan_mentions(text, &targets, &|_| true), MentionScan::Hit(_) | MentionScan::Partial { .. })
+}
+
+/// Whether `agent` may be what a dashboard account talks to by default: the
+/// filter WebChat applies to a non-admin account's candidates (and so to its
+/// 主要 AI 員工) — live, the account may hand it work (Operator or above, or
+/// Admin), and the WebChat target rules allow it (no main-role or gateway
+/// default employee for non-admins; `sender` should carry
+/// [`SenderAccess::for_webchat`] so those rules apply). The Telegram shared
+/// bot's primary-employee route (RM-172) uses the same check, so an employee
+/// the account may no longer use is skipped there exactly as in WebChat.
+///
+/// v1.81 P1h (N1): another person's Personal employee is never a primary
+/// candidate (owner only, whatever the role; unreadable ownership refuses).
+/// Checked explicitly because `may_assign` ignores the Personal restriction
+/// and `may_call` lets an owner-set `public_trigger` through — that opens
+/// calling, never routing the sender's work to it. This keeps the Telegram
+/// primary route under the same rule WebChat's `authorize_target` enforces.
+pub(crate) fn primary_candidate(sender: &SenderAccess, agent: &duduclaw_agent::registry::LoadedAgent) -> bool {
+    primary_candidate_under(sender, agent, duduclaw_auth::acl::personal_restriction())
+}
+
+/// [`primary_candidate`] under an explicit Personal restriction (tests; the
+/// production path uses the restriction installed at gateway boot).
+pub(crate) fn primary_candidate_under(
+    sender: &SenderAccess,
+    agent: &duduclaw_agent::registry::LoadedAgent,
+    restriction: Option<&dyn duduclaw_auth::acl::PersonalRestriction>,
+) -> bool {
+    let name = agent.config.agent.name.as_str();
+    let may_assign = match &sender.sender {
+        crate::trigger_route::Sender::Admin { .. } => true,
+        crate::trigger_route::Sender::Account { access, .. } => access.may_assign(name),
+        crate::trigger_route::Sender::Unmapped => false,
+    };
+    agent.config.agent.status.is_operational()
+        && may_assign
+        && !sender.personal_denied_under(name, restriction)
+        && sender.webchat_allows(agent)
+        && sender.may_call_under(agent, None, restriction)
 }
 
 /// Shared by async admission and the synchronous final-write policy fence.
