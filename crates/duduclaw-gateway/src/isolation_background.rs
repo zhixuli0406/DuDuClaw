@@ -119,6 +119,9 @@ pub struct RecordAuthority {
 fn is_zero(value: &u32) -> bool { *value == 0 }
 
 impl RecordAuthority {
+    /// The Duduclaw home this receipt was captured under.
+    pub(crate) fn home(&self) -> &Path { &self.home }
+
     /// Stored before v1.81: approved without the employee binding and
     /// allocation. Readable only so a new request can replace it.
     fn is_legacy(&self) -> bool { self.binding.is_none() && self.allocation.is_none() }
