@@ -70,6 +70,23 @@ fn enterprise_surfaces_are_listed() {
         // SR2: Personal → Shared delegation owner cards
         "me.isolation.list_personal_delegations",
         "me.isolation.decide_personal_delegation",
+        // F6d restore RPCs
+        "me.isolation.list_restorable",
+        "me.isolation.restore_challenge",
+        "me.isolation.request_restore",
+        "me.isolation.cancel_restore",
+        "isolation.employee_restore_decide",
+        "isolation.employee_restore_cancel",
+        "isolation.employee_restore_regrant",
+        "isolation.employee_retire_propose",
+        // F6g adoption request RPCs (F6d surface)
+        "me.isolation.request_adoption",
+        "isolation.shared_adoption_request",
+        // F6fa2 Admin filing for an owner without a second factor
+        "isolation.employee_restore_request_for_owner",
+        "isolation.adoption_request_for_owner",
+        // F6i quarantine cleanup
+        "isolation.quarantine_purge",
     ] {
         assert!(
             is_enterprise_only_method(method),

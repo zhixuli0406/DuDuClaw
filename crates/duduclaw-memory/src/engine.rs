@@ -638,6 +638,8 @@ impl SqliteMemoryEngine {
             .map_err(|e| DuDuClawError::Memory(format!("busy_timeout: {e}")))?;
         Self::enable_wal(&conn, db_path);
         Self::init_tables(&conn)?;
+        // F6fb item 2: every write carrying a label goes through the gate.
+        crate::label_gate::install_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         info!(?db_path, "SQLite memory engine initialised");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -662,6 +664,7 @@ impl SqliteMemoryEngine {
         let conn =
             Connection::open_in_memory().map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         Self::init_tables(&conn)?;
+        crate::label_gate::install_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         info!("SQLite in-memory memory engine initialised");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1861,6 +1864,9 @@ impl SqliteMemoryEngine {
                 )",
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            // F6fb2 item 2: a lazily created archive gets the writer-gate
+            // triggers before its first write.
+            crate::label_gate::refresh_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
             // Ownership check up front so a cross-agent id never reaches the
             // archive INSERT (which would leak another agent's content into
@@ -1885,7 +1891,9 @@ impl SqliteMemoryEngine {
 
             let apply = || -> std::result::Result<bool, String> {
                 crate::isolation_io::verify().map_err(|e| e.to_string())?;
-                conn.execute(
+                // F6fb2: the archive copy of a row deleted below is a move
+                // (narrowing), admitted on a refused label for this label only.
+                crate::label_gate::narrowing_write(crate::label_gate::NarrowingWrite::ArchiveMove, Some(agent_id), || conn.execute(
                     "INSERT OR IGNORE INTO memories_archive
                          (id, agent_id, content, timestamp, tags, layer,
                           importance, access_count, last_accessed, source_event)
@@ -1893,7 +1901,7 @@ impl SqliteMemoryEngine {
                             importance, access_count, last_accessed, source_event
                      FROM memories WHERE id = ?1 AND agent_id = ?2",
                     params![memory_id, agent_id],
-                )
+                ))
                 .map_err(|e| format!("archive INSERT failed: {e}"))?;
 
                 conn.execute(
@@ -2023,6 +2031,7 @@ impl SqliteMemoryEngine {
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
         verify()?;
         Self::in_immediate_txn(&conn, || {
             verify()?;
@@ -4600,6 +4609,7 @@ impl MemoryEngine for SqliteMemoryEngine {
         let entry = mask_memory_entry(entry);
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
         // M1 moat-gate: reject once the Cloud paid-tier quota is hit. No-op when
         // unlimited (quota 0). Runs before any write so a rejection loses nothing.
         self.enforce_quota(&conn)?;
@@ -5068,6 +5078,7 @@ impl SqliteMemoryEngine {
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
         crate::isolation_io::verify()?;
+        crate::label_gate::check(&conn, agent_id)?; // F6h writer gate
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 

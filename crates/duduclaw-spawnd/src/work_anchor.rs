@@ -170,6 +170,7 @@ impl Storage for AnchoredStorage {
     }
     fn usage(&mut self, employee: EmployeeId) -> Result<StorageUsage> { self.inner.usage(employee) }
     fn attachments(&mut self) -> Result<Vec<Attachment>> { self.inner.attachments() }
+    fn traces(&mut self) -> Result<Vec<EmployeeId>> { self.inner.traces() }
     fn work_anchor(&mut self, employee: EmployeeId) -> Result<WorkAnchorIdentity> { self.anchors.read(employee) }
     fn backfill_work_anchor(&mut self, employee: EmployeeId) -> Result<bool> {
         match self.anchors.read(employee) {

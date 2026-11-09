@@ -302,6 +302,11 @@ fn connector_with(stores: &Stores<'_>, connectors: &ConnectorStores, agent: &str
     let route = connectors.catalog.route(&account)?.ok_or(VerificationError::Revoked)?;
     if route.account != account { return Err(VerificationError::Unavailable); }
     route_use(&route, &identity.lifecycle.binding, &identity.tenant_id, home, generation)?;
+    // F6k (§3.7): after a Shared restore only the tenant routes its approval ticked (detail routes: own pins).
+    if !needs_details(route.provider) {
+        crate::isolation_restore_shared::tenant_route_gate(stores.home, identity.lifecycle.employee, identity.lifecycle.incarnation,
+            &identity.lifecycle.binding, route.account.as_str(), route.kind)?;
+    }
     if route.kind == ConnectorKind::SharedHome && !connectors.product.connected(route.provider)? {
         return Err(VerificationError::Revoked);
     }

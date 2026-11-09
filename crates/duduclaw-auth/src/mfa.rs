@@ -546,6 +546,8 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        // F6d (Q3): the account holder's own enrolment, stamped in this tx.
+        let since = crate::credential_changes::high_water(&tx)?;
         active_user(&tx, user)?;
         if policy_enforced(&tx)? && !any_factor(&tx, user)? {
             enrollment::require_independent_proof(&tx, enrollment.ok_or(DENIED)?, now)?;
@@ -594,6 +596,7 @@ impl UserDb {
             .map_err(|e| e.to_string())?;
         bump_epoch(&tx, user)?;
         audit(&tx, user, "mfa.enrolled", None)?;
+        stamp_self(&tx, since, user)?;
         let result = issue_mfa_result(&tx, user, codes, issue)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(result)
@@ -660,6 +663,7 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        let since = crate::credential_changes::high_water(&tx)?;
         active_user(&tx, user)?;
         if disable && policy_enforced(&tx)? && factor_count(&tx, user)? <= 1 {
             return Err("管理員已要求雙因素驗證，無法停用。".into());
@@ -691,6 +695,7 @@ impl UserDb {
             },
             None,
         )?;
+        stamp_self(&tx, since, user)?;
         let result = issue_mfa_result(&tx, user, codes, issue)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(result)
@@ -791,6 +796,14 @@ pub(super) fn factor_count(conn: &Connection, user: &str) -> Result<i64> {
 pub(crate) fn any_factor(conn: &Connection, user: &str) -> Result<bool> {
     Ok(factor_count(conn, user)? > 0)
 }
+/// F6d (Q3): a self-service factor writer (the account holder proved a
+/// factor, a reauth or an enrolment token of their own in this call) stamps
+/// its `credential_changes` rows as owner-authenticated, inside its own
+/// transaction. Only rows of `user` after `since` are touched; an Admin reset
+/// never goes through here and stays unattributed (refuses a restore).
+pub(super) fn stamp_self(conn: &Connection, since: i64, user: &str) -> Result<()> {
+    crate::credential_changes::stamp_owner(conn, since, user)
+}
 pub(super) fn set_last_factor(conn: &Connection, user: &str, factor: &str) -> Result<()> {
     conn.execute("INSERT INTO mfa_factor_preferences(user_id,last_used) VALUES(?1,?2)
         ON CONFLICT(user_id) DO UPDATE SET last_used=excluded.last_used", params![user,factor])
@@ -827,11 +840,31 @@ fn clear(tx: &Connection, user: &str) -> Result<()> {
     Ok(())
 }
 
+/// Test support for other modules (F6c2 eligibility writer tests): start a
+/// TOTP enrolment through the real API at `now = 3000` and return the
+/// enrolment token and secret; finish with `mfa_confirm(user, Some(&token),
+/// &test_totp_code(&secret, 100), cipher, 3000)`.
+#[cfg(test)]
+pub(crate) fn test_totp_prepare(db: &UserDb, user: &str, password: &str, cipher: &dyn MfaCipher) -> (String, String) {
+    let token = db.mfa_password_challenge(user, password, "test-session", 3000).expect("enrolment challenge");
+    db.mfa_prepare_enrollment(&token, false, 3000).expect("enrolment proof");
+    let secret = db.mfa_begin(user, Some(&token), cipher, 3000).expect("enrolment begin");
+    (token, secret)
+}
+
+/// TOTP code of `secret` at `step` (test support, see [`test_totp_prepare`]).
+#[cfg(test)]
+pub(crate) fn test_totp_code(secret: &str, step: i64) -> String {
+    hotp(&decode_secret(secret).expect("valid secret"), step, 6)
+}
+
 mod enrollment;
 mod migration;
 pub use migration::MigrationConfirmationSession;
 pub mod email;
 pub mod passkey;
+pub mod owner_factor;
+pub use owner_factor::{OwnerFactor, OwnerFactorError};
 use enrollment::proof_verified;
 
 #[cfg(test)]

@@ -30,7 +30,9 @@ pub trait Scan: Send {
     fn register(&mut self, run: RunHandle, employee: EmployeeId, startup_ms: u64) -> Result<()>;
     fn cancel(&mut self, run: RunHandle) -> Result<()>;
 }
-pub(crate) type AllocationWork = (duduclaw_migration::allocation::Request, SyncSender<Result<duduclaw_migration::allocation::Receipt>>);
+/// One allocation request and its reply slot (schema-2 codes, F6l).
+pub(crate) type AllocationWork = (duduclaw_migration::allocation::Request,
+    SyncSender<std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode>>);
 pub struct WorkerHost {
     allocation_sender: SyncSender<AllocationWork>,
     sender: SyncSender<(Key, Work)>, receiver: Receiver<Completed>, slots: BTreeMap<Key, Slot>,

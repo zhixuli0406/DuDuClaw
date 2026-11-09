@@ -14,6 +14,10 @@ pub enum ConfirmationError {
     #[error("confirmation storage unavailable")] Storage,
     #[error("proposal application failed")] Apply,
     #[error("proposal compensation incomplete")] Compensation,
+    /// F6 §3.12 (R14): an `EmployeeRetire` item whose root operation already
+    /// started cannot be rejected; it stays where it was and `retry`
+    /// resumes the same retire operation (UI: `RETIRE_FORWARD_ONLY`).
+    #[error("retire is forward only")] ForwardOnly,
 }
 type Result<T> = std::result::Result<T, ConfirmationError>;
 const MAX_CONFIRMATIONS: u64 = 2048;
@@ -98,8 +102,11 @@ fn fields_for(category: ConfirmationCategory) -> &'static [&'static str] {
         Department => &["name", "display_name"],
         // binding_kind/owner_id/tenant_id: immutable principal binding, parsed
         // and strictly validated by allocation::specification (v1.81).
+        // adopt_quarantine: F6 §3.10 (F6g) digest-covered adoption reference
+        // `<hex>:<incarnation>:<digest>`, strictly parsed and bound to its
+        // quarantine row by the gateway's EmployeeAuthority.
         Employee => &["employee_id", "runtime", "model", "capabilities", "permissions", "account_pool", "disk_bytes", "settings",
-            "binding_kind", "owner_id", "tenant_id"],
+            "binding_kind", "owner_id", "tenant_id", "adopt_quarantine"],
         EmployeeInstructions => &["employee_id", "instruction_kind", "text"],
         UserAgentBinding => &["employee_id", "owner_id", "binding_kind"],
         ChannelBinding => &["employee_id", "channel", "binding"],
@@ -113,6 +120,9 @@ fn fields_for(category: ConfirmationCategory) -> &'static [&'static str] {
         Budget => &["name", "amount_cents", "period"],
         ConfigurationSection => &["section", "settings", "credential"],
         Schedule => &["settings", "name", "schedule", "objective", "employee_id"],
+        // F6 §3.12 (R12): every field digest-covered; strictly parsed by
+        // allocation::retire_specification (all required, exact values).
+        EmployeeRetire => crate::allocation::RETIRE_FIELDS,
     }
 }
 
@@ -378,7 +388,13 @@ impl ConfirmationStore {
         if item.status != ConfirmationStatus::Failed { return Err(ConfirmationError::Denied); }
         let intent = effects::intent(&tx, &item, 3)?;
         tx.commit()?;
-        adapter.disable_and_read_back(&item).map_err(|_| ConfirmationError::Compensation)?;
+        // F6 §3.12 (R14): a retire is forward only. Its compensation is a
+        // read-back that succeeds only while the root never started, so a
+        // retry never depends on it: the same retire operation resumes
+        // (spawnd replays it idempotently from the recorded phase).
+        if item.category != ConfirmationCategory::EmployeeRetire {
+            adapter.disable_and_read_back(&item).map_err(|_| ConfirmationError::Compensation)?;
+        }
         // Disable before absence validation. Both calls are outside the writer.
         // A validation failure leaves Failed and can safely repeat compensation.
         validator.validate_fresh(&item)?;
@@ -399,6 +415,12 @@ impl ConfirmationStore {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status == ConfirmationStatus::Rejected { return Ok(()); }
+        // Forward only (F6 §3.12, R14): past Pending, an EmployeeRetire item
+        // is rejected only when its compensation read-back says the root
+        // entry is still Ready (no root effect yet); otherwise nothing moves.
+        let forward_only = item.category == ConfirmationCategory::EmployeeRetire
+            && item.status != ConfirmationStatus::Pending;
+        let before = item.clone();
         if item.status == ConfirmationStatus::Pending {
             item.transition(ConfirmationStatus::Rejected).map_err(|_| ConfirmationError::Denied)?;
         } else if item.status != ConfirmationStatus::Rejecting {
@@ -412,7 +434,21 @@ impl ConfirmationStore {
         if item.status == ConfirmationStatus::Rejected { tx.commit()?; return Ok(()); }
         let intent = effects::intent(&tx, &item, 3)?;
         tx.commit()?;
-        adapter.disable_and_read_back(&item).map_err(|_| ConfirmationError::Compensation)?;
+        if let Err(error) = adapter.disable_and_read_back(&item) {
+            if !forward_only { return Err(ConfirmationError::Compensation); }
+            let _ = error;
+            // Nothing sticks in Rejecting: restore the prior state. A crash
+            // left a retire in Rejecting earlier; its resumable state is Failed
+            // (`retry` continues the same operation).
+            let mut restored = before;
+            if restored.status == ConfirmationStatus::Rejecting { restored.status = ConfirmationStatus::Failed; }
+            let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            effects::consume(&tx, &item, 3, &intent)?;
+            save(&tx, &restored)?;
+            audit(&tx, &restored, "reject_refused_forward_only", Some(session.actor))?;
+            tx.commit()?;
+            return Err(ConfirmationError::ForwardOnly);
+        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         effects::consume(&tx, &item, 3, &intent)?;
         receipt(&tx, &item, 3)?;
@@ -536,6 +572,27 @@ impl ConfirmationStore {
         Ok(false)
     }
 
+    /// The approval record of this exact binding (F6 §3.12: the retire
+    /// approver sent with `Action::Retire`): the actor of its latest
+    /// `approved` audit event. `None` before approval; a stored actor that is
+    /// not 16 bytes is `Invalid` (never treated as absent).
+    pub fn approver(&self, binding: &ProposalBinding) -> Result<Option<RequestId>> {
+        required(&self.conn, binding)?;
+        let actor: Option<Option<Vec<u8>>> = self.conn.query_row(
+            "SELECT actor FROM migration_confirmation_audit WHERE proposal_id=?1 AND revision=?2 AND digest=?3
+             AND event='approved' ORDER BY sequence DESC LIMIT 1",
+            params![binding.operation_id.proposal_id.0.as_slice(), binding.operation_id.revision,
+                binding.proposal_digest.0.as_slice()], |r| r.get(0)).optional()?;
+        match actor {
+            None => Ok(None),
+            Some(actor) => {
+                let bytes: [u8; 16] = actor.ok_or(ConfirmationError::Invalid)?.try_into()
+                    .map_err(|_| ConfirmationError::Invalid)?;
+                Ok(Some(RequestId(bytes)))
+            }
+        }
+    }
+
     pub fn apply_receipt(&self, binding: &ProposalBinding) -> Result<Option<ProposalApplyReceipt>> {
         let item = required(&self.conn, binding)?;
         let Some(value) = step(&self.conn, binding)? else { return Ok(None); };
@@ -602,3 +659,6 @@ fn receipt(conn: &Connection, item: &ConfirmationItem, step: i64) -> Result<()> 
 #[cfg(test)]
 #[path = "confirmation_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "confirmation_retire_tests.rs"]
+mod retire_tests;

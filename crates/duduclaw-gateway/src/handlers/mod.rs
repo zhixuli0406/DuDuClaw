@@ -240,6 +240,8 @@ mod computer_workspaces_rpc;
 mod isolation_recording_rpc;
 mod isolation_connectors_rpc;
 mod isolation_employee_rpc;
+// F6g: the v2 employee-dir digest and marker rules for the adoption engine.
+pub(crate) use isolation_employee_rpc::employee_dirs;
 mod personal_data_gate;
 mod personal_decide_gate;
 mod personal_delegation_gate;
@@ -748,7 +750,7 @@ mod migration_confirmations_rpc;
 mod migration_authority;
 pub(crate) use migration_authority::employee::resolve_confirmed_employee;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use migration_authority::employee::save_confirmed_receipt;
+pub(crate) use migration_authority::employee::{save_confirmed_receipt, save_confirmed_receipt_gated};
 pub(crate) use migration_authority::stage_import_proposals;
 mod session_policy_rpc;
 mod a2a_rpc;

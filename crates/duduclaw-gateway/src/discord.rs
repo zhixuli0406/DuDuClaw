@@ -464,6 +464,15 @@ async fn spawn_discord_bot(
     home_dir: &Path,
     quiet_on_auth_failure: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // F6h (H5, A11): in protected mode an employee's own bot needs a live
+    // lifecycle and an active channel route; unchanged otherwise.
+    if let Some(agent) = &agent_name {
+        if !crate::isolation_label_stores::channel_bot_allowed(home_dir, agent, "discord").await {
+            warn!(agent = %agent, "per-agent Discord bot not started: no live protected lifecycle or channel route");
+            crate::isolation_label_bots::refused(home_dir, "discord", agent);
+            return None;
+        }
+    }
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -567,7 +576,11 @@ async fn spawn_discord_bot(
     let gateway_url = format!("{gateway_url}/?v=10&encoding=json");
     info!("   Discord [{label}] Gateway: {gateway_url}");
 
-    let handle = tokio::spawn(async move {
+    let agent = agent_name.clone();
+    // F6fb item 9: message handlers and their helper tasks are tracked in the
+    // bot's scope and stop with it.
+    let scope = crate::isolation_label_bots::BotScope::new();
+    let handle = tokio::spawn(crate::isolation_label_bots::scoped(scope.clone(), async move {
         gateway_loop(
             token,
             bot_id,
@@ -579,7 +592,14 @@ async fn spawn_discord_bot(
             agent_name,
         )
         .await;
-    });
+    }));
+    // F6h (H5): a per-agent bot is registered so a tombstone can stop it.
+    if let Some(agent) = agent {
+        if !crate::isolation_label_bots::admit(home_dir, "discord", &agent, handle.abort_handle(), scope).await {
+            warn!(agent = %agent, "per-agent Discord bot stopped: the employee is no longer live");
+            return None;
+        }
+    }
 
     Some(handle)
 }
@@ -971,7 +991,8 @@ async fn gateway_loop(
 
                             let interval = std::time::Duration::from_millis(heartbeat_interval_ms);
                             let tx = heartbeat_tx.clone();
-                            let hb_handle = tokio::spawn(async move {
+                            // F6fb item 9: every task of the bot stops with it.
+                            let hb_handle = crate::isolation_label_bots::spawn_scoped(async move {
                                 loop {
                                     tokio::time::sleep(interval).await;
                                     // try_send: drop ticks rather than block when receiver is slow.
@@ -1049,7 +1070,8 @@ async fn gateway_loop(
                                             // The handler takes its own permit: a
                                             // decision-shaped message only after the
                                             // sender passed the access check (F5-C).
-                                            tokio::spawn(async move {
+                                            // F6fb item 9: tracked in the bot's scope.
+                                            crate::isolation_label_bots::spawn_scoped(async move {
                                                 handle_message_create(
                                                     &d, &bot_id, &http, &token, &ctx,
                                                     agent.as_deref(), &message_app_id
@@ -1066,7 +1088,7 @@ async fn gateway_loop(
                                             let app_id = app_id.clone();
                                             let ctx = ctx.clone();
                                             let agent = agent_name.clone();
-                                            tokio::spawn(async move {
+                                            crate::isolation_label_bots::spawn_scoped(async move {
                                                 // Decision lane only for a decision
                                                 // button whose presser passed the access
                                                 // check (F5-C, review F4-M1).
@@ -1110,7 +1132,7 @@ async fn gateway_loop(
                                             info!("Discord: joined guild '{guild_name}' ({guild_id})");
                                             if !guild_id.is_empty() {
                                                 let ctx = ctx.clone();
-                                                tokio::spawn(async move {
+                                                crate::isolation_label_bots::spawn_scoped(async move {
                                                     let settings = &ctx.channel_settings;
                                                     // Record the guild name for status reporting
                                                     // (upsert keeps renames fresh).
@@ -1139,7 +1161,7 @@ async fn gateway_loop(
                                             if archived && !thread_id.is_empty() {
                                                 let ctx = ctx.clone();
                                                 let reason = if event == "THREAD_DELETE" { "deleted" } else { "archived" };
-                                                tokio::spawn(async move {
+                                                crate::isolation_label_bots::spawn_scoped(async move {
                                                     let session_id = format!("discord:thread:{thread_id}");
                                                     match ctx.session_manager.delete_session(&session_id).await {
                                                         Ok(()) => info!("Discord: thread {thread_id} {reason} — session closed"),
@@ -1849,7 +1871,8 @@ async fn handle_message_create(
         let typing_home = ctx.home_dir.clone();
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let flag_clone = flag.clone();
-        let handle = tokio::spawn(async move {
+        // F6fb item 9: helper tasks of a handler stop with the bot.
+        let handle = crate::isolation_label_bots::spawn_scoped(async move {
             let mut consecutive_failures = 0u32;
             while flag_clone.load(Ordering::Relaxed) {
                 let url = format!("{DISCORD_API}/channels/{typing_channel}/typing");
@@ -1923,7 +1946,7 @@ async fn handle_message_create(
         let mid = progress_msg_id_cb.clone();
         #[cfg(test)]
         let home = progress_home.clone();
-        tokio::spawn(async move {
+        crate::isolation_label_bots::spawn_scoped(async move {
             let existing_id = match mid.lock() {
                 Ok(g) => g.clone(),
                 Err(e) => e.into_inner().clone(),
@@ -2136,7 +2159,7 @@ async fn handle_message_create(
         let c = cleanup_http;
         let t = cleanup_token;
         let ch = cleanup_channel;
-        tokio::spawn(async move {
+        crate::isolation_label_bots::spawn_scoped(async move {
             let url = format!("{DISCORD_API}/channels/{ch}/messages/{pmid}");
             #[cfg(test)]
             let url = routing_test_transport::url(&cleanup_home, &t, &url);
@@ -2188,7 +2211,7 @@ async fn handle_message_create(
         let guide_msg_id = message_id.to_string();
         #[cfg(test)]
         let guide_home = ctx.home_dir.clone();
-        tokio::spawn(async move {
+        crate::isolation_label_bots::spawn_scoped(async move {
             let guide = json!({
                 "content": "💬 已在對話串中回覆 ↓",
                 "message_reference": {

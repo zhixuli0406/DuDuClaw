@@ -136,6 +136,19 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "isolation.employee_purge_requests"
         | "me.isolation.request_personal_employee" | "me.isolation.list_personal_employee_requests"
         | "me.isolation.list_personal_delegations" | "me.isolation.decide_personal_delegation"
+        // F6d 已註銷員工的還原、核准、重新授權與主機資源釋放
+        | "me.isolation.list_restorable" | "me.isolation.restore_challenge"
+        | "me.isolation.request_restore" | "me.isolation.cancel_restore"
+        | "isolation.employee_restore_decide" | "isolation.employee_restore_cancel"
+        | "isolation.employee_restore_regrant" | "isolation.employee_retire_propose"
+        // F6g 由新員工接手（申請）
+        | "me.isolation.request_adoption" | "isolation.shared_adoption_request"
+        // F6fa2 管理員代未設定兩步驟驗證的主人申請還原／接手
+        | "isolation.employee_restore_request_for_owner" | "isolation.adoption_request_for_owner"
+        // F6k 共用員工還原（申請與選項）
+        | "isolation.shared_restore_request" | "isolation.shared_restore_options"
+        // F6i 清除隔離區（滿 90 天直接清除；未滿 90 天申請提前清除）
+        | "isolation.quarantine_purge"
     )
 }
 

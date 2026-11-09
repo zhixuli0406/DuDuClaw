@@ -44,6 +44,11 @@ impl MethodHandler {
         let method = method.to_owned();
         let runtime = tokio::runtime::Handle::current();
         let live=Arc::new(LiveAuthority {registry:self.registry.clone(),context:ctx.clone(),handle:runtime.clone(),scheduler:self.cron_scheduler.read().await.clone()});
+        // F6fb item 8: an adoption card enforces the licence cap at approval and apply.
+        let agent_cap = self.effective_agent_cap().await;
+        // F6g: set when an apply committed an adoption (its tree is now under agents/).
+        let adopted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adopted_flag = adopted.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<Value, &'static str> {
             let now = chrono::Utc::now().timestamp();
             if now < 0 { return Err("無法確認目前時間。"); }
@@ -72,7 +77,13 @@ impl MethodHandler {
             if method == "migration.confirmations.list" {
                 let store = ConfirmationStore::open_read_only(&path).map_err(|_| "無法讀取遷移狀態。")?;
                 let items = store.list().map_err(|_| "無法讀取遷移狀態。")?;
-                let employee_backend = EmployeeAuthority::new(home.clone(), live.clone());
+                // F6d: Employee and EmployeeRetire items behind one backend.
+                // F6fa: the listing's step-up freshness is the real one (an
+                // early-purged retire card without a fresh proof lists as not
+                // applicable until the Admin steps up).
+                let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
+                    Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
+                        .with_step_up(proof.as_ref().map(|p| p.verified_at))), &user, proof.as_ref().map(|p| p.verified_at));
                 let items: Vec<Value> = items.into_iter().map(|item| {
                     let supported = employee_backend.validate(&item).is_ok() || GatewayAuthority::built_in_item_supported(&item)
                         || GatewayAccountReadback::available(&home, &item)
@@ -127,7 +138,8 @@ impl MethodHandler {
                     .find(|item| item.binding == input.binding && item.status == ConfirmationStatus::Applied)
                     .ok_or("請先完成此項目的核准與套用。")?;
                 let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
-                let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()));
+                let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
+                    .with_step_up(Some(proof.verified_at)));
                 let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
                 let fingerprint = authority.rotate_secret(&item, &input.new_value).map_err(|_| "憑證更新尚未確認，請重新載入後用相同新值重試。")?;
                 store.record_rotation(&input.binding, "credential", fingerprint, &authority)
@@ -145,8 +157,12 @@ impl MethodHandler {
             // Separate handles share the durable binding ledger. No cloned payload
             // can bypass the normal fresh-input validator at approval or staging.
             let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
-            let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()));
+            // F6d: one slot, two backends (Employee + EmployeeRetire).
+            let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
+                Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
+                    .with_step_up(Some(proof.verified_at))), &user, Some(proof.verified_at));
             let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
+            let adopt_home = home.clone();
             let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
             let error = "項目已變更、尚未支援或套用失敗，請重新載入確認目前狀態。";
             match method.as_str() {
@@ -192,7 +208,13 @@ impl MethodHandler {
                     if db.migration_confirmation_session(&user, &session, epoch, chrono::Utc::now().timestamp())
                         .ok().flatten().is_none() { return Err("身分驗證已失效，請重新驗證後繼續。"); }
                     match store.apply_next(binding, &mut applier) {
-                        Ok(item) if item.status == ConfirmationStatus::Applied => break,
+                        Ok(item) if item.status == ConfirmationStatus::Applied => {
+                            // F6g: an adoption committed inside this call — notice now, rescan below.
+                            if crate::isolation_restore_rpc::adoption_committed(&adopt_home, &item, &user, chrono::Utc::now().timestamp()) {
+                                adopted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            break
+                        }
                         Ok(_) => {},
                         Err(_) => { failed += 1; break; },
                     }
@@ -200,6 +222,12 @@ impl MethodHandler {
             }
             Ok(json!({ "readback_required": true, "failed": failed }))
         }).await;
+        if adopted.load(std::sync::atomic::Ordering::SeqCst) {
+            // Same as a restore: the adopted tree is back under agents/ (F6d).
+            if let Err(error) = self.registry.write().await.scan().await {
+                warn!(error = %error, "employee adoption: registry rescan failed");
+            }
+        }
         match result {
             Ok(Ok(value)) => WsFrame::ok_response("", value),
             Ok(Err(message)) => WsFrame::error_response("", message),

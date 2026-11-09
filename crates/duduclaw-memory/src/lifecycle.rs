@@ -199,10 +199,17 @@ pub async fn reassign_agent(
         // memories_fts is a standalone fts5 table with an UNINDEXED agent_id
         // column that search filters on — it MUST be re-keyed too or the moved
         // rows become unfindable under the new agent.
+        //
+        // F6fb2 item 4: the FTS table carries no writer-gate trigger, so it
+        // follows the base rows that actually moved — a row the gate skipped
+        // (tombstoned / quarantined label, `RAISE(IGNORE)`) keeps its FTS row
+        // under `from_agent`, and search under either label never sees the
+        // other's content.
         verify_live_io()?;
         conn.execute(
             &format!(
-                "UPDATE memories_fts SET agent_id = ?1 WHERE agent_id = ?2{}",
+                "UPDATE memories_fts SET agent_id = ?1 WHERE agent_id = ?2{}
+                   AND memory_id IN (SELECT id FROM main.memories WHERE agent_id = ?1)",
                 not_fenced("memory_id", "memories")
             ),
             params![to_agent, from_agent],

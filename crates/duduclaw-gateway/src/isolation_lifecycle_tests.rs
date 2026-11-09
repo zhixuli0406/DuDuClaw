@@ -684,3 +684,20 @@ mod readiness_reasons;
 /// F6a/F6b: incarnation, schema and the sealing tombstone.
 #[path = "isolation_lifecycle_f6_tests.rs"]
 mod f6;
+
+/// F6c: the same-id restore engine (`crate::isolation_restore`), over this
+/// module's real-store fixture.
+#[cfg(unix)]
+#[path = "isolation_restore_tests.rs"]
+mod restore;
+/// F6d: the restore RPC bodies (`crate::isolation_restore_rpc`) over the F6c fixture.
+#[cfg(unix)]
+#[path = "isolation_restore_rpc_tests.rs"]
+mod f6d;
+/// F6h: channel bot gate and the tombstone label-store hook.
+#[path = "isolation_label_stores_lifecycle_tests.rs"]
+mod f6h;
+/// F6k: Shared restore filing, approval, route re-approval (`crate::isolation_restore_shared`).
+#[cfg(unix)]
+#[path = "isolation_restore_shared_tests.rs"]
+mod f6k;

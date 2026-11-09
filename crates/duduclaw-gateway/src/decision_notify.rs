@@ -1537,7 +1537,9 @@ impl BoundedChannelExecutor {
         self.sender
             .try_send(ChannelWork {
                 key,
-                future: Box::pin(future),
+                // F6fb item 9: a job of a per-employee bot carries the bot's
+                // scope, so the tasks it starts stop with the bot.
+                future: crate::isolation_label_bots::inherit(future),
                 _slot: slot,
             })
             .map_err(|_| "channel work queue unavailable".into())

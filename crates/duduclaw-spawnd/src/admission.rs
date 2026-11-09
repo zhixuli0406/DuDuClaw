@@ -124,8 +124,11 @@ pub trait Host {
     fn forget(&mut self, run: RunHandle) -> Result<()>;
     /// Adapter background work; never called on the control socket thread.
     fn maintenance(&mut self) -> Result<()> { Ok(()) }
-    fn allocation(&mut self, _: &duduclaw_migration::allocation::Request) -> Result<duduclaw_migration::allocation::Receipt> {
-        Err(ErrorCode::IsolationUnavailable)
+    /// Confirmed allocation, compensation, read-back and retire (F6l). The
+    /// answer uses the allocation wire codes (schema 2).
+    fn allocation(&mut self, _: &duduclaw_migration::allocation::Request)
+        -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
+        Err(duduclaw_migration::allocation::ErrorCode::IsolationUnavailable)
     }
     /// H4 synchronous broker step. Called only on an adapter's own lifecycle
     /// thread, never on the control socket thread. Missing broker ⇒ refuse.

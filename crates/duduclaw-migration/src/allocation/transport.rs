@@ -45,10 +45,16 @@ pub fn receive<T:DeserializeOwned>(fd:&OwnedFd)->Result<T,Error>{
     if n<=0 || msg.msg_flags&(libc::MSG_TRUNC|libc::MSG_CTRUNC)!=0{return Err(Error::Invalid)}
     Ok(serde_json::from_slice(&bytes[..n as usize])?)
 }
-pub fn request(request:&Request)->Result<Receipt,Error>{
-    request.validate()?;directory()?;let fd=socket()?;let addr=address();
+fn connect()->Result<OwnedFd,Error>{
+    directory()?;let fd=socket()?;let addr=address();
     if unsafe{libc::connect(fd.as_raw_fd(),(&addr as *const libc::sockaddr_un).cast(),std::mem::size_of_val(&addr) as _)}!=0{return Err(Error::Unavailable)}
     if peer(&fd)?!=(0,0){return invalid()}
+    Ok(fd)
+}
+/// Schema-1 exchange (v1.80 semantics): a receipt or `Unavailable`.
+pub fn request(request:&Request)->Result<Receipt,Error>{
+    if request.schema!=1{return Err(Error::Invalid)}
+    request.validate()?;let fd=connect()?;
     send(&fd,request)?;let response:Response=receive(&fd)?;
     if response.schema!=1 || response.nonce!=request.nonce{return invalid()}
     let receipt=response.receipt.ok_or(Error::Unavailable)?;
@@ -58,6 +64,15 @@ pub fn request(request:&Request)->Result<Receipt,Error>{
         || (receipt.uid<1000 && !(receipt.disabled && receipt.uid==0))
         || receipt.disabled!=(request.action==Action::Disable){return invalid()}
     Ok(receipt)
+}
+/// Schema-2 exchange (F6l): the checked answer, a refusal code included.
+/// Any transport failure or missing/garbled reply is an `Err` (the caller
+/// reports `ROOT_UNAVAILABLE`, never `NotFound`, S5d).
+pub fn exchange(request:&Request)->Result<Answer,Error>{
+    if request.schema!=SCHEMA_V2{return Err(Error::Invalid)}
+    request.check()?;let fd=connect()?;
+    send(&fd,request)?;let response:Response=receive(&fd)?;
+    check_response(request,response)
 }
 /// Caller is the root daemon holding the registry lock. This function never
 /// accepts a socket path from a request or an environment variable.

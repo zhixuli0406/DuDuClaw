@@ -20,8 +20,16 @@
 //!   product configuration through the normal create path (inert until
 //!   allocated) and stages the approvable proposal, either as the next
 //!   revision of a staff request or as a new Personal/Shared proposal.
-//! - `isolation.employee_tombstone` (Admin + step-up): admin handover of a
-//!   Personal employee (`isolation_lifecycle::tombstone_personal_employee`).
+//! - `isolation.employee_tombstone` (Admin + step-up): tombstone of a
+//!   Personal or Shared employee (`isolation_lifecycle::tombstone_employee`, F6d).
+//! - F6d restore RPCs (`isolation_employee_restore.rs`): `me.isolation.list_restorable`,
+//!   `restore_challenge`, `request_restore`, `cancel_restore`; `isolation.employee_restore_decide`,
+//!   `employee_restore_cancel`, `employee_restore_regrant`, `employee_retire_propose`;
+//!   F6g adoption requests `me.isolation.request_adoption` (owner, strongest
+//!   factor) and `isolation.shared_adoption_request` (Admin + step-up);
+//!   F6fa2 (owner decision 2026-11-09) `isolation.employee_restore_request_for_owner`
+//!   / `isolation.adoption_request_for_owner` (Admin + fresh step-up, owner
+//!   without a second factor at the tombstone, a different Admin approves).
 //! - `isolation.employee_list` (Admin): confirmed employees and requests,
 //!   plus the step-up state for the dashboard.
 //! - `isolation.employee_purge_requests` (Admin + step-up, SR2): removes
@@ -64,9 +72,15 @@ pub(super) const METHODS: [&str; 8] = [REQUEST, MY_REQUESTS, LIST, PROPOSE, TOMB
     delegation::DELEGATIONS, delegation::DECIDE_DELEGATION];
 
 #[path = "isolation_employee_dirs.rs"]
-mod employee_dirs;
+pub(crate) mod employee_dirs;
 #[path = "isolation_employee_delegation.rs"]
 mod delegation;
+/// F6d: restore, decide, cancel, regrant and retire RPCs (`restore::METHODS`).
+#[path = "isolation_employee_restore.rs"]
+mod restore;
+/// F6i: `isolation.quarantine_purge` (`purge::METHODS`).
+#[path = "isolation_employee_purge.rs"]
+mod purge;
 
 /// `agents.create` in protected mode points here.
 pub(super) const DIRECT_CREATE_REFUSED: &str = "受保護模式下不能直接建立 AI 員工。請改用員工配置提案：\
@@ -120,12 +134,19 @@ const REQUEST_MISMATCH: &str = "這筆申請已處理，或內容與提案不一
 const CREATE_FAILED: &str = "無法建立員工設定，請確認名稱後重試。";
 const SETTINGS_INVALID: &str = "員工設定無法放入提案，已拒絕操作。";
 const EMPLOYEE_NOT_FOUND: &str = "找不到這位員工，請重新載入。";
-const NOT_PERSONAL: &str = "這不是個人專屬員工，或找不到這位員工。";
 
 /// Namespace owned by this handler; unknown members are refused here.
 pub(super) fn owns(method: &str) -> bool {
     method.strip_prefix("isolation.").is_some_and(|rest| rest.starts_with("employee_"))
         || method.starts_with("me.isolation.")
+        // F6g adoption: the Admin's Shared request (F6d surface, `restore::METHODS`).
+        || method == restore::SHARED_ADOPTION_REQUEST
+        // F6fa2: the Admin's Personal adoption filed for an owner without a second factor.
+        || method == restore::ADOPTION_FOR_OWNER
+        // F6k: the Admin's Shared restore request and its options (`restore::shared::METHODS`).
+        || restore::shared::METHODS.contains(&method)
+        // F6i: the Admin's quarantine cleanup.
+        || purge::METHODS.contains(&method)
 }
 
 #[derive(serde::Deserialize)]
@@ -148,6 +169,10 @@ struct ProposeRequest {
     /// A staff request to prepare instead of a new proposal.
     #[serde(default)]
     request_id: Option<String>,
+    /// F6g (§3.10 step 2): an adoption request (`employee_restores`) to turn
+    /// into the adoption proposal; its row names the principal.
+    #[serde(default)]
+    adoption_request_id: Option<String>,
     csrf_token: [u8; 32],
 }
 #[derive(serde::Deserialize)]
@@ -169,10 +194,14 @@ struct Prepared {
     /// Personal proposals (SR2 1b): the agents directory whose `<label>`
     /// entry must still carry this flow's creation marker at staging.
     adopt: Option<std::path::PathBuf>,
+    /// F6g: the adoption this proposal stages (no directory is created).
+    adoption: Option<crate::isolation_adopt::AdoptionPlan>,
 }
 
 impl MethodHandler {
     pub(crate) async fn handle_isolation_employee(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        if restore::handles(method) { return self.handle_isolation_restore(method, params, ctx).await; }
+        if purge::METHODS.contains(&method) { return self.handle_quarantine_purge(method, params, ctx).await; }
         match self.isolation_employee(method, params, ctx).await {
             Ok(value) => WsFrame::ok_response("", value),
             Err(message) => WsFrame::error_response("", message),
@@ -213,6 +242,8 @@ impl MethodHandler {
                     let now = now()?;
                     let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
                     let mut value = admin_list(&home)?;
+                    // F6d: tombstoned rows, open requests, root state (已註銷).
+                    value["restores"] = admin_restores(&home, now);
                     value["step_up_valid"] = json!(proof.is_some());
                     value["csrf_token"] = json!(proof.as_ref().map(|proof| proof.csrf));
                     value["mfa_enrolled"] = json!(db.mfa_active(&user).map_err(|_| USERS_UNAVAILABLE)?);
@@ -232,6 +263,11 @@ impl MethodHandler {
                 // The directory is now in quarantine (SR2 finding 4).
                 if let Err(error) = self.registry.write().await.scan().await {
                     warn!(error = %error, "employee tombstone: registry rescan failed");
+                }
+                // F6h (H5): the tombstone aborted the employee's running bots;
+                // drop their handles and status here (exact `<channel>:<label>`).
+                for channel in crate::isolation_label_bots::BOT_CHANNELS {
+                    self.hot_stop_channel(&format!("{channel}:{label}")).await;
                 }
                 // F6a (A8): approvals naming the employee die with it.
                 if let Some(employee) = employee {
@@ -277,14 +313,28 @@ impl MethodHandler {
     async fn employee_propose(&self, input: ProposeRequest, ctx: &UserContext, db: Arc<UserDb>, session: String)
         -> Result<Value, &'static str> {
         let (home, user, epoch) = (self.home_dir.clone(), ctx.user_id.clone(), ctx.credential_epoch);
+        // F6fb item 8: an adoption adds a live employee, so the licence cap
+        // (read as `agents.create` and the restore RPCs read it) applies.
+        let cap = self.effective_agent_cap().await;
         let mut prepared = {
             let (home, db, user, session) = (home.clone(), db.clone(), user.clone(), session.clone());
             blocking(move || {
                 let now = now()?;
                 let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
-                prepare_propose(&home, &db, proof.as_ref(), &user, input, now)
+                prepare_propose_capped(&home, &db, proof.as_ref(), &user, input, now, cap)
             }).await?
         };
+        // F6g: the tree comes from the sealed quarantine row at apply; the
+        // settings were parsed from its transformed agent.toml.
+        if let Some(settings) = prepared.adoption.as_ref().map(|plan| plan.settings.clone()) {
+            let mut staged = blocking(move || {
+                let now = now()?;
+                let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
+                stage_prepared(&home, proof.as_ref(), &user, &prepared, &settings, now)
+            }).await?;
+            staged["agent_created"] = json!(false);
+            return Ok(staged);
+        }
         // The product configuration comes from the normal writer and stays
         // inert until the approved proposal is allocated by the root. An
         // existing, unallocated Shared configuration (a retry, or an imported
@@ -442,7 +492,7 @@ impl ProposalValidator for StagingCheck<'_> {
         item.validate().map_err(|_| ConfirmationError::Invalid)?;
         let spec = allocation::specification(item).map_err(|_| ConfirmationError::Invalid)?;
         if item.fields.iter().any(|f| !matches!(f.name.as_str(),
-            "employee_id" | "disk_bytes" | "settings" | "binding_kind" | "owner_id" | "tenant_id")) {
+            "employee_id" | "disk_bytes" | "settings" | "binding_kind" | "owner_id" | "tenant_id" | "adopt_quarantine")) {
             return Err(ConfirmationError::Denied);
         }
         // A fresh product proposal always names its principal.
@@ -550,7 +600,7 @@ fn open_requests(home: &Path) -> Result<Connection, &'static str> {
         CREATE INDEX IF NOT EXISTS idx_personal_employee_request_log_owner
             ON personal_employee_request_log(owner_user_id, created_at);")
         .map_err(|_| STORE_UNAVAILABLE)?;
-    db.execute_batch(employee_dirs::MARKER_SCHEMA).map_err(|_| STORE_UNAVAILABLE)?;
+    crate::isolation_adopt::ensure_marker_schema(&db).map_err(|_| STORE_UNAVAILABLE)?;
     Ok(db)
 }
 
@@ -703,11 +753,20 @@ fn confirmed_employees(home: &Path) -> Result<Vec<Value>, &'static str> {
     }).collect()
 }
 
-/// First admin step: step-up, principal, request match, label checks.
+/// [`prepare_propose_capped`] without a licence cap (tests only).
+#[cfg(test)]
 fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmationSession>, user: &str,
     input: ProposeRequest, now: i64) -> Result<Prepared, &'static str> {
+    prepare_propose_capped(home, db, proof, user, input, now, 0)
+}
+
+/// First admin step: step-up, principal, request match, label checks.
+/// `agent_cap` (0 = unlimited) is the licence cap; an adoption enforces it.
+fn prepare_propose_capped(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmationSession>, user: &str,
+    input: ProposeRequest, now: i64, agent_cap: usize) -> Result<Prepared, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
     if !valid_label(&input.label) { return Err(LABEL_INVALID); }
+    if input.adoption_request_id.is_some() { return prepare_adoption(home, user, input, now, agent_cap); }
     // SR2 finding 6: the request path's apply.db writer lock, held across
     // the open-label check (and taken again by `stage_prepared`).
     let mut requests = open_requests(home)?;
@@ -730,14 +789,55 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
     };
     // One open Employee proposal per label; the request itself is superseded.
     if label_pending(&items, &input.label, request) { return Err(LABEL_PENDING); }
+    crate::isolation_label_stores::proposal_refusal(home, &input.label)?; // F6h R7: LABEL_QUARANTINED
     lifecycle::validate_proposed_binding(home, &input.label, Some(&binding)).map_err(binding_error)?;
+    crate::isolation_restore_rpc::refuse_while_restoring(&lock, &input.label)?; // F6d §3.5: RESTORE_IN_PROGRESS
     let display_name = match (input.display_name.as_deref(), request) {
         (Some(name), _) => checked_display(name)?,
         (None, Some(op)) => request_display_name(home, op.proposal_id)?.unwrap_or_else(|| input.label.clone()),
         (None, None) => input.label.clone(),
     };
     lock.finish().map_err(|_| STORE_UNAVAILABLE)?;
-    Ok(Prepared { label: input.label, display_name, binding, request, csrf: input.csrf_token, adopt: None })
+    Ok(Prepared { label: input.label, display_name, binding, request, csrf: input.csrf_token, adopt: None, adoption: None })
+}
+
+/// F6g: an adoption request → proposal. The engine re-runs every check
+/// (before this step takes the apply.db writer lock); the principal is the
+/// quarantine row's, never a request field.
+fn prepare_adoption(home: &Path, user: &str, input: ProposeRequest, now: i64, agent_cap: usize) -> Result<Prepared, &'static str> {
+    use crate::isolation_adopt::{prepare_proposal, with_production_env_capped, AdoptError};
+    let id = input.adoption_request_id.as_deref().ok_or(PROPOSAL_INVALID)?;
+    if input.request_id.is_some() { return Err(PROPOSAL_INVALID); }
+    let plan = with_production_env_capped(home, user, agent_cap, now, |env| prepare_proposal(home, env, id))
+        .map_err(AdoptError::message)?;
+    let principal = match &plan.binding {
+        EmployeeBinding::Personal(owner) => input.binding_kind == "personal" && input.owner_id.as_deref().is_none_or(|o| o == owner.as_str()),
+        EmployeeBinding::Shared(_) => input.binding_kind == "shared" && input.owner_id.is_none(),
+    };
+    if !principal || plan.target != input.label { return Err(REQUEST_MISMATCH); }
+    let mut requests = open_requests(home)?;
+    let lock = requests.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORE_UNAVAILABLE)?;
+    if label_pending(&read_items(home)?, &input.label, None) { return Err(LABEL_PENDING); }
+    crate::isolation_label_stores::check_label_not_quarantined(home, &input.label, Some((plan.adopt.employee, plan.adopt.incarnation)))
+        .map_err(crate::isolation_label_stores::GateRefusal::message)?;
+    lifecycle::validate_proposed_binding(home, &input.label, Some(&plan.binding)).map_err(binding_error)?;
+    // F6d §3.5: an adoption is refused while a restore of either label is in progress.
+    refuse_while_restoring_for(&lock, &input.label, Some(&plan))?;
+    let display_name = match input.display_name.as_deref() { Some(name) => checked_display(name)?, None => input.label.clone() };
+    lock.finish().map_err(|_| STORE_UNAVAILABLE)?;
+    Ok(Prepared { label: input.label, display_name, binding: plan.binding.clone(), request: None, csrf: input.csrf_token,
+        adopt: None, adoption: Some(plan) })
+}
+
+/// F6d §3.5 `RESTORE_IN_PROGRESS` on the proposal's label and, for an
+/// adoption whose target differs, on the adopted row's own label too.
+fn refuse_while_restoring_for(lock: &rusqlite::Connection, label: &str, adoption: Option<&crate::isolation_adopt::AdoptionPlan>)
+    -> Result<(), &'static str> {
+    crate::isolation_restore_rpc::refuse_while_restoring(lock, label)?;
+    match adoption {
+        Some(plan) if plan.request.label != label => crate::isolation_restore_rpc::refuse_while_restoring(lock, &plan.request.label),
+        _ => Ok(()),
+    }
 }
 
 /// Another open Employee proposal holds `label` (the staff request that
@@ -771,6 +871,7 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     let mut fields = vec![text_field("employee_id", &prepared.label), text_field("disk_bytes", &DISK_BYTES.to_string()),
         text_field("settings", settings)];
     fields.extend(principal_fields(&prepared.binding));
+    if let Some(plan) = &prepared.adoption { fields.push(text_field(crate::isolation_adopt::ADOPT_FIELD, &plan.adopt.encode())); }
     // SR2 finding 6: the same apply.db writer lock as the request path,
     // across the open-label recheck and the staging, so a concurrent request
     // or proposal for this label cannot slip in between.
@@ -779,6 +880,13 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     let mut store = open_confirmations(home)?;
     let items = store.list().map_err(|_| STORE_UNAVAILABLE)?;
     if label_pending(&items, &prepared.label, prepared.request) { return Err(LABEL_PENDING); }
+    // F6h R7: LABEL_QUARANTINED, except the row an adoption proposal names
+    // (F6g; `None` for every other proposal, i.e. `proposal_refusal`).
+    let adopting = prepared.adoption.as_ref().map(|plan| (plan.adopt.employee, plan.adopt.incarnation));
+    crate::isolation_label_stores::check_label_not_quarantined(home, &prepared.label, adopting)
+        .map_err(crate::isolation_label_stores::GateRefusal::message)?;
+    // F6d §3.5: RESTORE_IN_PROGRESS, for an adoption too (target and adopted row's label).
+    refuse_while_restoring_for(&lock, &prepared.label, prepared.adoption.as_ref())?;
     // SR2 finding 1b: the adopted directory still carries this flow's marker,
     // holds nothing outside the allowlist, and the staged settings are
     // exactly those parsed from the agent.toml bytes inside that digest.
@@ -788,7 +896,13 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     }
     let item = store.stage_proposal(operation, ConfirmationCategory::Employee, fields, &StagingCheck { home })
         .map_err(stage_error)?;
+    let proposal = hex::encode(item.binding.operation_id.proposal_id.0);
+    // F6g: in this same apply.db transaction, the row goes `adopting` bound to the proposal.
+    if let Some(plan) = &prepared.adoption {
+        crate::isolation_adopt::bind_proposal(&lock, plan, &proposal, now).map_err(crate::isolation_adopt::AdoptError::message)?;
+    }
     lock.commit().map_err(|_| STORE_UNAVAILABLE)?;
+    if let Some(plan) = &prepared.adoption { crate::isolation_adopt::audit_proposed(home, plan, &proposal, user); }
     Ok(json!({
         "request_id": hex::encode(item.binding.operation_id.proposal_id.0),
         "revision": item.binding.operation_id.revision,
@@ -843,13 +957,23 @@ fn purge_requests(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     Ok(json!({ "purged": purged, "index_rows_removed": removed }))
 }
 
-/// `isolation.employee_tombstone`: admin handover of a Personal employee.
+/// F6d: the admin `已註銷` view inside `isolation.employee_list`; an
+/// unreadable or absent store is reported, never an empty "nothing tombstoned".
+fn admin_restores(home: &Path, now: i64) -> Value {
+    if matches!(std::fs::symlink_metadata(home.join(APPLY_DB)), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+        return json!({"quarantine": [], "requests": []});
+    }
+    crate::isolation_restore_rpc::admin_view(home, now)
+        .unwrap_or_else(|error| json!({"unavailable": true, "code": error.code()}))
+}
+
+/// `isolation.employee_tombstone`: tombstone of a Personal or Shared employee.
 ///
 /// F6a: runs the sealing tombstone (`lifecycle::tombstone_employee`, §3.2)
 /// and returns the seal state (Q6), the revoked detail routes and the
-/// pending fences. Still Personal-only at this RPC: accepting a Shared row
-/// (and dropping `NOT_PERSONAL`) is F6d (`tombstone_accepts_shared`); the
-/// lifecycle function itself handles both kinds.
+/// pending fences. F6d (§3.9): Shared rows are accepted too (the lifecycle
+/// function snapshots the tenant pin and members and removes the bindings);
+/// refused `RESTORE_IN_PROGRESS` while a restore of the label is applying.
 fn tombstone(home: &Path, proof: Option<&MigrationConfirmationSession>, user: &str, input: TombstoneRequest, now: i64)
     -> Result<Value, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
@@ -857,15 +981,14 @@ fn tombstone(home: &Path, proof: Option<&MigrationConfirmationSession>, user: &s
     let employee = EmployeeId(parse_hex16(&input.employee_id).ok_or(EMPLOYEE_NOT_FOUND)?);
     let refusal = |error| match error {
         LifecycleError::Unavailable => STORE_UNAVAILABLE,
-        LifecycleError::Denied | LifecycleError::Tombstoned => NOT_PERSONAL,
+        LifecycleError::Denied | LifecycleError::Tombstoned => EMPLOYEE_NOT_FOUND,
         LifecycleError::Stale => STALE,
     };
-    // Personal only here (F6d widens the RPC); the principal is read from
-    // the stored receipt, never from the request.
-    let personal = lifecycle::confirmed_receipt(home, &input.label).map_err(refusal)?
-        .is_some_and(|receipt| receipt.employee != employee
-            || matches!(receipt.principal_binding, Some(duduclaw_isolation::capability::EmployeeBinding::Personal(_))));
-    if !personal { return Err(NOT_PERSONAL); }
+    // Personal or Shared; the principal is read from the stored receipt,
+    // never from the request. An unknown label is not found.
+    if lifecycle::confirmed_receipt(home, &input.label).map_err(refusal)?.is_none() { return Err(EMPLOYEE_NOT_FOUND); }
+    // §3.5 mutual exclusion, read on the private apply.db (exists: a receipt was read).
+    crate::isolation_restore_rpc::refuse_while_restoring(&open_apply(home, Access::ReadOnly)?, &input.label)?;
     let env = lifecycle::TombstoneEnv { actor: user, runs: &crate::isolation_quarantine::SpawndRunStopper, now };
     let outcome = lifecycle::tombstone_employee(home, &input.label, employee, &env).map_err(refusal)?;
     Ok(json!({ "label": input.label, "tombstoned": true, "readback_required": true,

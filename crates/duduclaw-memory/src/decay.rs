@@ -102,6 +102,12 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
         warn!("Failed to create archive table: {e}");
         return report;
     }
+    // F6fb2 item 2: a lazily created archive gets the writer-gate triggers
+    // before its first write (rolled back with the decay transaction).
+    if let Err(e) = crate::label_gate::refresh_on_engine(conn) {
+        warn!("Failed to gate the archive table: {e}");
+        return report;
+    }
 
     // Compute cutoff timestamps upfront for parameterized queries (no SQL string interpolation).
     let now = Utc::now();
@@ -180,7 +186,10 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
                 // INSERT OR IGNORE: tolerate re-runs if a previous attempt
                 // archived but failed to delete (PRIMARY KEY conflict prevention).
                 crate::isolation_io::verify().map_err(|e| e.to_string())?;
-                let archived = conn
+                // F6fb2: the archive copy of rows deleted below in this
+                // transaction is a move (narrowing): admitted on any label,
+                // so the all-agent sweep never aborts on a quarantined one.
+                let archived = crate::label_gate::narrowing_write(crate::label_gate::NarrowingWrite::ArchiveMove, None, || conn
                     .execute(
                         &format!(
                             "INSERT OR IGNORE INTO memories_archive
@@ -191,7 +200,7 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
                              FROM memories WHERE id IN ({in_list})"
                         ),
                         bind.as_slice(),
-                    )
+                    ))
                     .map_err(|e| format!("Archive INSERT failed: {e}"))?;
 
                 crate::isolation_io::verify().map_err(|e| e.to_string())?;

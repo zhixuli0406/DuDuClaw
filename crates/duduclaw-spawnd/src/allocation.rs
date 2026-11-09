@@ -1,42 +1,112 @@
 //! Confirmed employee allocation owned by the same lifecycle worker as B1/H.
+//!
+//! Journal schema 3 (F6l, F6 design r5 §3.12): `Phase` adds `Retiring` and
+//! `Retired`, `Entry` adds `retire` (the retire proposal binding) and
+//! `retired_at` (both omitted when `None`). Schemas 1 and 2 are still read
+//! (they can never carry the new phases or fields); only 3 is written.
+//!
+//! Retire (`Action::Retire`, schema 2 only) frees a purged employee's root
+//! allocation: the registry account goes to `Tombstone` (the UID stays
+//! burned: never recycled, §7 N4), the loop image is destroyed and the entry
+//! becomes `Retired`, which no longer holds the label. It never creates an
+//! entry, is idempotent, and is resumed by the gateway after any failure.
 use std::{fs::{self,File,OpenOptions},io::{self,Read,Write},path::{Path,PathBuf},os::unix::fs::{OpenOptionsExt,MetadataExt}};
 use serde::{Serialize,Deserialize};
-use duduclaw_migration::allocation::{Action,Request,Receipt,Specification,operation,validate_principal_binding};
-use duduclaw_isolation::{ids::EmployeeId,execution::DiskQuota,ipc::ErrorCode,migration::ProposalBinding};
-use crate::{Result,registry::{RegistryStore,AccountHost,AccountState,root_path,REGISTRY_DIRECTORY},storage::{Storage,ProvisionRequest}};
+use duduclaw_migration::allocation::{self as wire,Action,Request,Receipt,Reply,Phase,RetireSpec,Specification,OperationKind,operation,validate_principal_binding};
+use duduclaw_isolation::{ids::EmployeeId,execution::DiskQuota,ipc::{ErrorCode,EmployeeIdleReport},migration::ProposalBinding};
+use crate::{Result,audit::Detail,registry::{Registry,RegistryStore,AccountHost,AccountState,EmployeeAccount,root_path,REGISTRY_DIRECTORY},storage::{Storage,ProvisionRequest}};
 fn unavailable()->ErrorCode{ErrorCode::IsolationUnavailable}
+/// Allocation answers (schema-2 codes; a schema-1 reply drops them).
+type Answer<T>=std::result::Result<T,wire::ErrorCode>;
+/// An internal (root component) failure as an allocation answer. A root
+/// `NotFound` is never an authoritative absence: only [`absence`] says that.
+fn code(error:ErrorCode)->wire::ErrorCode{
+    match error{ErrorCode::NotReady=>wire::ErrorCode::NotReady,ErrorCode::InvalidRequest=>wire::ErrorCode::InvalidRequest,_=>wire::ErrorCode::IsolationUnavailable}
+}
 /// Schema 1 (v1.80) predates principal bindings; schema 2 adds the optional
-/// immutable `principal_binding` per receipt. Both are read; only 2 is written.
-const JOURNAL_SCHEMA:u16=2;
+/// immutable `principal_binding` per receipt; schema 3 adds the retire phases.
+const JOURNAL_SCHEMA:u16=3;
+/// The per-host lifetime cap (entries are never removed; §7 N4 follow-up:
+/// compaction of Retired entries).
+const MAX_ENTRIES:usize=4096;
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Entry { receipt:Receipt, phase:Phase }
-#[derive(Clone,Copy,PartialEq,Eq,Serialize,Deserialize)]
-#[serde(rename_all="snake_case")]
-enum Phase{Planned,Ready,Disabling,Disabled}
+struct Entry {
+    receipt:Receipt, phase:Phase,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    retire:Option<ProposalBinding>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    retired_at:Option<u64>,
+}
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal{schema:u16,entries:Vec<Entry>}
-pub struct Allocator{directory:PathBuf,journal:Journal,poisoned:bool}
+/// The registry operations the allocator uses (the root `RegistryStore` in
+/// production; tests may inject an in-memory registry).
+pub trait RegistryOps {
+    fn registry(&self)->&Registry;
+    fn allocate(&mut self,employee:EmployeeId,host:&mut dyn AccountHost)->io::Result<EmployeeAccount>;
+    fn retire(&mut self,employee:EmployeeId)->io::Result<()>;
+}
+impl RegistryOps for RegistryStore {
+    fn registry(&self)->&Registry{RegistryStore::registry(self)}
+    fn allocate(&mut self,employee:EmployeeId,host:&mut dyn AccountHost)->io::Result<EmployeeAccount>{RegistryStore::allocate(self,employee,host)}
+    fn retire(&mut self,employee:EmployeeId)->io::Result<()>{RegistryStore::retire(self,employee)}
+}
+/// Everything one request may touch, read by the host right before the call.
+pub struct Env<'a> {
+    pub registry:&'a mut dyn RegistryOps,
+    pub accounts:&'a mut dyn AccountHost,
+    pub storage:&'a mut dyn Storage,
+    /// Some run is live on the host (`host.rs` lifecycle gate, §3.12 step 3).
+    pub host_busy:bool,
+    /// The fresh `EmployeeIdle` readback of [`Allocator::subject`]; any
+    /// unreadable source is an `Err`, never a zero.
+    pub idle:Option<Result<EmployeeIdleReport>>,
+    pub now_unix:u64,
+}
+/// Root audit facts produced by one request (the host emits them).
+pub enum AllocationEvent {
+    Retired{employee:EmployeeId,detail:Detail},
+    /// A process of the employee with no run behind it (S14).
+    Intruder{employee:EmployeeId},
+}
+/// `traces_verified` (F6fb item 7, S5a): `false` only after a missing journal
+/// was opened empty while storage could not be read; no entry is created
+/// until a later `storage.traces()` read succeeds and shows no image the
+/// journal does not know.
+pub struct Allocator{directory:PathBuf,journal:Journal,poisoned:bool,events:Vec<AllocationEvent>,traces_verified:bool}
 impl Allocator {
-    pub fn open()->io::Result<Self>{Self::open_at(Path::new(REGISTRY_DIRECTORY))}
-    fn open_at(directory:&Path)->io::Result<Self>{
+    pub fn open(registry:&Registry,storage:&mut dyn Storage)->io::Result<Self>{Self::open_at(Path::new(REGISTRY_DIRECTORY),registry,storage)}
+    fn open_at(directory:&Path,registry:&Registry,storage:&mut dyn Storage)->io::Result<Self>{
         root_path(directory,true)?;let path=directory.join("allocations.json");
-        let journal=match fs::symlink_metadata(&path){
+        let (journal,traces_verified)=match fs::symlink_metadata(&path){
             Ok(m)=>{
                 root_path(&path,false)?;if m.mode()&0o077!=0{return Err(io::Error::other("allocation journal unavailable"))}
                 let mut bytes=vec![];File::open(&path)?.take(4*1024*1024+1).read_to_end(&mut bytes)?;
                 if bytes.len()>4*1024*1024{return Err(io::Error::other("allocation journal unavailable"))}
-                decode_journal(&bytes)?
+                (decode_journal(&bytes)?,true)
             },
-            Err(e) if e.kind()==io::ErrorKind::NotFound=>Journal{schema:JOURNAL_SCHEMA,entries:vec![]},Err(e)=>return Err(e),
+            Err(e) if e.kind()==io::ErrorKind::NotFound=>{let verified=missing_journal(registry,storage)?;(Journal{schema:JOURNAL_SCHEMA,entries:vec![]},verified)},
+            Err(e)=>return Err(e),
         };
-        Ok(Self{directory:directory.into(),journal,poisoned:false})
+        Ok(Self{directory:directory.into(),journal,poisoned:false,events:vec![],traces_verified})
+    }
+    /// F6fb item 7: before the first entry after an empty open with
+    /// unreadable storage, storage must be read once and show nothing the
+    /// journal does not know (an old image whose label a new entry could
+    /// take). Unreadable or unknown traces: `IsolationUnavailable`, and the
+    /// check runs again on the next request.
+    fn require_traces_read(&mut self,storage:&mut dyn Storage)->Answer<()>{
+        if self.traces_verified{return Ok(())}
+        let traces=storage.traces().map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+        if traces.iter().any(|e|!self.journal.entries.iter().any(|x|x.receipt.employee==*e)){return Err(wire::ErrorCode::IsolationUnavailable)}
+        self.traces_verified=true;Ok(())
     }
     fn save(&mut self)->Result<()>{
         if self.poisoned{return Err(unavailable())}
-        // A loaded schema-1 journal is rewritten as schema 2; its unbound
-        // legacy entries keep `principal_binding: None` and are never upgraded.
+        // An older journal is rewritten as schema 3; its unbound legacy
+        // entries keep `principal_binding: None` and are never upgraded.
         self.journal.schema=JOURNAL_SCHEMA;
         let result=(||->io::Result<()>{
             let tmp=self.directory.join("allocations.next");
@@ -52,67 +122,238 @@ impl Allocator {
     pub fn ready_employees(&self)->Vec<EmployeeId>{
         self.journal.entries.iter().filter(|e|e.phase==Phase::Ready && !e.receipt.disabled).map(|e|e.receipt.employee).collect()
     }
-    pub fn handle(&mut self,request:&Request,registry:&mut RegistryStore,accounts:&mut dyn AccountHost,storage:&mut dyn Storage)->Result<Receipt>{
-        if self.poisoned{return Err(unavailable())}
-        let spec=request.validate().map_err(|_|ErrorCode::InvalidRequest)?;
+    /// The employee whose idle readback this request needs: a schema-2
+    /// ReadBack (S17) or a Retire (§3.12 step 4) of a `Ready` entry.
+    pub fn subject(&self,request:&Request)->Option<EmployeeId>{
+        let target=match request.action{
+            Action::ReadBack if request.schema==wire::SCHEMA_V2=>request.item.binding.operation_id,
+            Action::Retire=>wire::retire_specification(&request.item).ok()?.target.operation_id,
+            _=>return None,
+        };
+        self.journal.entries.iter().find(|e|e.receipt.binding.operation_id==target && e.phase==Phase::Ready).map(|e|e.receipt.employee)
+    }
+    /// Root audit facts of the last requests, oldest first.
+    pub fn take_events(&mut self)->Vec<AllocationEvent>{std::mem::take(&mut self.events)}
+    pub fn handle(&mut self,request:&Request,mut env:Env<'_>)->Answer<Reply>{
+        if self.poisoned{return Err(wire::ErrorCode::IsolationUnavailable)}
+        if request.action==Action::Retire{return self.retire(request,env)}
+        let spec=request.validate().map_err(|_|wire::ErrorCode::InvalidRequest)?;
+        let v2=request.schema==wire::SCHEMA_V2;
+        // Allocation never races an active run or the lifecycle's H journal.
+        // F6fb item 10 (deliberately fail closed): `Disable` (compensation of a
+        // failed apply) is gated too, so while *any* run is live on the host the
+        // gateway gets `NotReady`: the item stays Failed (`compensation_failed`)
+        // and the operator's retry compensates once the host is idle; the entry
+        // stays Ready meanwhile (a gateway-side failed item never goes live).
+        // Scoping the gate to the entry's UID needs a per-employee busy readback
+        // from the host (`host_busy` is a host-wide bool); not done here.
+        if request.action!=Action::ReadBack && env.host_busy{return Err(wire::ErrorCode::NotReady)}
         let binding=request.item.binding;
-        let index=match replay_index(&self.journal,&binding,&spec)?{
-            Some(i)=>i,
-            None=>{
-                if request.action==Action::ReadBack || self.journal.entries.len()>=4096 || self.journal.entries.iter().any(|e|e.receipt.label==spec.label && e.phase!=Phase::Disabled){return Err(ErrorCode::InvalidRequest)}
-                let employee=EmployeeId(crate::server::random_id().map_err(|_|unavailable())?);
-                if employee.0==[0;16] || self.journal.entries.iter().any(|e|e.receipt.employee==employee){return Err(unavailable())}
+        let index=match replay_index(&self.journal,&binding,&spec){
+            Ok(Some(i))=>i,
+            // S4: a ReadBack that disagrees with the entry is Inconsistent.
+            Err(e)=>return Err(if v2 && request.action==Action::ReadBack{wire::ErrorCode::Inconsistent}else{code(e)}),
+            Ok(None)=>{
+                if request.action==Action::ReadBack{
+                    return Err(if v2{absence(&self.journal,env.registry.registry(),env.storage.traces(),None)}else{wire::ErrorCode::InvalidRequest});
+                }
+                self.require_traces_read(env.storage)?;
+                if self.journal.entries.len()>=MAX_ENTRIES || self.journal.entries.iter().any(|e|e.receipt.label==spec.label && e.phase.holds_label()){return Err(wire::ErrorCode::InvalidRequest)}
+                let employee=EmployeeId(crate::server::random_id().map_err(|_|wire::ErrorCode::IsolationUnavailable)?);
+                if employee.0==[0;16] || self.journal.entries.iter().any(|e|e.receipt.employee==employee){return Err(wire::ErrorCode::IsolationUnavailable)}
                 // The principal comes only from this confirmed proposal, never
                 // from an earlier (possibly disabled) entry with the same label.
-                self.journal.entries.push(Entry{receipt:Receipt{binding,label:spec.label.clone(),employee,uid:0,bytes:spec.bytes,inodes:spec.inodes,disabled:false,principal_binding:spec.binding.clone()},phase:Phase::Planned});
+                self.journal.entries.push(Entry{receipt:Receipt{binding,label:spec.label.clone(),employee,uid:0,bytes:spec.bytes,inodes:spec.inodes,disabled:false,principal_binding:spec.binding.clone()},phase:Phase::Planned,retire:None,retired_at:None});
                 // The complete binding and random principal survive before UID or disk side effects.
-                self.save()?;self.journal.entries.len()-1
+                self.save().map_err(code)?;self.journal.entries.len()-1
             }
         };
         let employee=self.journal.entries[index].receipt.employee;
         let quota=DiskQuota::LoopFilesystem{bytes:spec.bytes,inodes:spec.inodes};
         match request.action{
             Action::Allocate=>{
-                if matches!(self.journal.entries[index].phase,Phase::Disabling|Phase::Disabled){return Err(ErrorCode::InvalidRequest)}
-                storage.readiness()?;
-                let account=registry.allocate(employee,accounts).map_err(|_|unavailable())?;
-                self.journal.entries[index].receipt.uid=account.uid;self.save()?;
-                storage.provision(&ProvisionRequest{employee,uid:account.uid,operation_id:operation(binding,false),proposal_digest:binding.proposal_digest,quota:quota.clone()})?.check(employee,&quota)?;
-                accounts.verify_locked(&account).map_err(|_|unavailable())?;
-                storage.usage(employee)?.check(employee,&quota)?;
-                self.journal.entries[index].phase=Phase::Ready;self.save()?;
+                // Never revives a compensated or retired entry (S6).
+                if !matches!(self.journal.entries[index].phase,Phase::Planned|Phase::Ready){return Err(wire::ErrorCode::InvalidRequest)}
+                env.storage.readiness().map_err(code)?;
+                let account=env.registry.allocate(employee,env.accounts).map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+                self.journal.entries[index].receipt.uid=account.uid;self.save().map_err(code)?;
+                env.storage.provision(&ProvisionRequest{employee,uid:account.uid,operation_id:operation(binding,OperationKind::Allocate),proposal_digest:binding.proposal_digest,quota:quota.clone()})
+                    .and_then(|usage|usage.check(employee,&quota)).map_err(code)?;
+                env.accounts.verify_locked(&account).map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+                env.storage.usage(employee).and_then(|usage|usage.check(employee,&quota)).map_err(code)?;
+                self.journal.entries[index].phase=Phase::Ready;self.save().map_err(code)?;
             },
             Action::ReadBack=>{
-                if self.journal.entries[index].phase!=Phase::Ready{return Err(unavailable())}
-                let account=registry.registry().lookup(employee).map_err(|_|unavailable())?;
-                if account.uid!=self.journal.entries[index].receipt.uid{return Err(unavailable())}
-                accounts.verify_locked(account).map_err(|_|unavailable())?;
-                storage.usage(employee)?.check(employee,&quota)?;
+                let entry=&self.journal.entries[index];
+                if entry.phase!=Phase::Ready{
+                    // S5c: schema 2 answers every phase with the stored receipt.
+                    return if v2{Ok(stored(entry))}else{Err(wire::ErrorCode::IsolationUnavailable)};
+                }
+                let account=env.registry.registry().lookup(employee).map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+                if account.uid!=entry.receipt.uid{return Err(if v2{wire::ErrorCode::Inconsistent}else{wire::ErrorCode::IsolationUnavailable})}
+                env.accounts.verify_locked(account).map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+                env.storage.usage(employee).and_then(|usage|usage.check(employee,&quota)).map_err(code)?;
+                // S17: idle only from a complete readback; unknown is not idle.
+                let idle=if v2{match env.idle{Some(Ok(report))=>Some(report.idle()),_=>None}}else{None};
+                return Ok(Reply{receipt:self.journal.entries[index].receipt.clone(),phase:Phase::Ready,idle});
             },
             Action::Disable=>{
-                self.journal.entries[index].phase=Phase::Disabling;self.save()?;
-                let account=registry.registry().employees.iter().find(|a|a.employee==employee).cloned();
+                if !disable_allowed(self.journal.entries[index].phase){return Err(wire::ErrorCode::InvalidRequest)}
+                self.journal.entries[index].phase=Phase::Disabling;self.save().map_err(code)?;
+                let account=env.registry.registry().employees.iter().find(|a|a.employee==employee).cloned();
                 if let Some(account)=account{
-                    registry.retire(employee).map_err(|_|unavailable())?;
-                    accounts.recover_locked(&account).map_err(|_|unavailable())?;
-                    if registry.registry().employees.iter().any(|a|a.employee==employee && a.state!=AccountState::Tombstone){return Err(unavailable())}
-                    storage.destroy(employee,operation(binding,true),binding.proposal_digest)?;
-                    if storage.attachments()?.iter().any(|a|a.employee==employee){return Err(unavailable())}
+                    env.registry.retire(employee).map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+                    env.accounts.recover_locked(&account).map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+                    if env.registry.registry().employees.iter().any(|a|a.employee==employee && a.state!=AccountState::Tombstone){return Err(wire::ErrorCode::IsolationUnavailable)}
+                    env.storage.destroy(employee,operation(binding,OperationKind::Compensate),binding.proposal_digest).map_err(code)?;
+                    if env.storage.attachments().map_err(code)?.iter().any(|a|a.employee==employee){return Err(wire::ErrorCode::IsolationUnavailable)}
                 }
                 self.journal.entries[index].receipt.disabled=true;
-                self.journal.entries[index].phase=Phase::Disabled;self.save()?;
+                self.journal.entries[index].phase=Phase::Disabled;self.save().map_err(code)?;
             },
+            Action::Retire=>return Err(wire::ErrorCode::InvalidRequest),
         }
-        Ok(self.journal.entries[index].receipt.clone())
+        Ok(stored(&self.journal.entries[index]))
+    }
+    /// F6 §3.12 root operation, steps 1–8. Every failure after step 5 leaves
+    /// the entry `Retiring` (the label stays held) and the same request
+    /// resumes it; a `Retired` replay is answered before the host gate (S15).
+    fn retire(&mut self,request:&Request,mut env:Env<'_>)->Answer<Reply>{
+        use wire::ErrorCode::*;
+        // 1. Retire-only validation (S6): never the entry-creating path.
+        let spec=request.validate_retire().map_err(|_|InvalidRequest)?;
+        let approver=request.approver.clone().ok_or(InvalidRequest)?;
+        let retire=request.item.binding;
+        // 2. The target entry.
+        let (index,fresh)=match retire_lookup(&self.journal,&spec,&retire)?{
+            Lookup::Missing=>return Err(absence(&self.journal,env.registry.registry(),env.storage.traces(),Some(spec.employee))),
+            Lookup::Replay(i)=>return Ok(stored(&self.journal.entries[i])),
+            Lookup::Resume(i)=>(i,false),
+            Lookup::Fresh(i)=>(i,true),
+        };
+        // 3. Host gate.
+        if env.host_busy{return Err(NotReady)}
+        let account=env.registry.registry().employees.iter().find(|a|a.employee==spec.employee).cloned().ok_or(Inconsistent)?;
+        if account.uid!=spec.uid || account.gid!=spec.uid{return Err(Inconsistent)}
+        let mut used=None;
+        if fresh{
+            // 4. Liveness before any change; the entry stays Ready.
+            if account.state!=AccountState::Ready{return Err(Inconsistent)}
+            let report=match env.idle{Some(Ok(report))=>report,_=>return Err(IsolationUnavailable)};
+            if !report.idle(){
+                if report.processes>0 && report.runs==0{self.events.push(AllocationEvent::Intruder{employee:spec.employee});}
+                return Err(NotReady);
+            }
+            // Audit only (the last observed usage); unreadable is not a refusal.
+            used=env.storage.usage(spec.employee).ok().map(|usage|(usage.bytes,usage.inodes));
+            // 5. Retiring, saved before any side effect.
+            let entry=&mut self.journal.entries[index];
+            entry.phase=Phase::Retiring;entry.retire=Some(retire);
+            self.save().map_err(code)?;
+        }
+        // 6. Account → Tombstone (runs resolve Ready accounts only), then kill
+        // anything that appeared after step 4 with a no-process readback.
+        if account.state!=AccountState::Tombstone{env.registry.retire(spec.employee).map_err(|_|IsolationUnavailable)?;}
+        env.accounts.recover_locked(&account).map_err(|_|IsolationUnavailable)?;
+        if env.registry.registry().employees.iter().any(|a|a.employee==spec.employee && a.state!=AccountState::Tombstone){return Err(IsolationUnavailable)}
+        // 7. Wipe (journaled, resumable, refuses a lease); then no trace.
+        env.storage.destroy(spec.employee,operation(retire,OperationKind::Retire),retire.proposal_digest).map_err(code)?;
+        if env.storage.traces().map_err(code)?.contains(&spec.employee)
+            || env.storage.attachments().map_err(code)?.iter().any(|a|a.employee==spec.employee){return Err(IsolationUnavailable)}
+        // 8. Retired.
+        let entry=&mut self.journal.entries[index];
+        entry.receipt.disabled=true;entry.phase=Phase::Retired;entry.retired_at=Some(env.now_unix);
+        let reply=stored(entry);
+        self.save().map_err(code)?;
+        let (quota_bytes,quota_inodes)=(reply.receipt.bytes,reply.receipt.inodes);
+        self.events.push(AllocationEvent::Retired{employee:spec.employee,detail:Detail::Retired{uid:spec.uid,label:spec.label.clone(),
+            used_bytes:used.map(|(bytes,_)|bytes),used_inodes:used.map(|(_,inodes)|inodes),quota_bytes,quota_inodes,
+            quarantine_digest_prefix:spec.quarantine_digest_prefix.clone(),requested_by:spec.requested_by.clone(),approved_by:approver,early:spec.early}});
+        Ok(reply)
+    }
+}
+/// The stored receipt and phase (S5c). `idle` is only ever reported by a
+/// live ReadBack of a Ready entry.
+fn stored(entry:&Entry)->Reply{Reply{receipt:entry.receipt.clone(),phase:entry.phase,idle:None}}
+/// `Disable` (compensation) refuses a retiring or retired entry (S6).
+fn disable_allowed(phase:Phase)->bool{!matches!(phase,Phase::Retiring|Phase::Retired)}
+enum Lookup{Missing,Replay(usize),Resume(usize),Fresh(usize)}
+/// §3.12 step 2: the entry by the target operation id. Binding, label,
+/// employee and UID must all match; only `Ready` (fresh) or the same retire
+/// binding (`Retiring` resume, `Retired` replay) proceed.
+fn retire_lookup(journal:&Journal,spec:&RetireSpec,retire:&ProposalBinding)->Answer<Lookup>{
+    let Some(i)=journal.entries.iter().position(|e|e.receipt.binding.operation_id==spec.target.operation_id) else{return Ok(Lookup::Missing)};
+    let entry=&journal.entries[i];
+    let receipt=&entry.receipt;
+    if receipt.binding!=spec.target || receipt.label!=spec.label || receipt.employee!=spec.employee || receipt.uid!=spec.uid{
+        return Err(wire::ErrorCode::Inconsistent);
+    }
+    let same=entry.retire.as_ref()==Some(retire);
+    match entry.phase{
+        Phase::Retired if same=>Ok(Lookup::Replay(i)),
+        Phase::Retiring if same=>Ok(Lookup::Resume(i)),
+        Phase::Ready=>{
+            // S6: a retire binding never equals an allocation or another retire.
+            if journal.entries.iter().any(|e|e.receipt.binding.operation_id==retire.operation_id
+                || e.retire.is_some_and(|r|r.operation_id==retire.operation_id)){return Err(wire::ErrorCode::InvalidRequest)}
+            Ok(Lookup::Fresh(i))
+        },
+        _=>Err(wire::ErrorCode::InvalidRequest),
+    }
+}
+/// S5b: `NotFound` only when nothing anywhere shows a trace — of the expected
+/// employee (journal, registry in any state, storage), and of any live account
+/// or image the journal does not know (the journal itself is then not
+/// authoritative, e.g. restored from an older backup). Unreadable storage is
+/// `IsolationUnavailable`, never `NotFound`.
+fn absence(journal:&Journal,registry:&Registry,traces:Result<Vec<EmployeeId>>,expected:Option<EmployeeId>)->wire::ErrorCode{
+    let Ok(traces)=traces else{return wire::ErrorCode::IsolationUnavailable};
+    let known=|employee:&EmployeeId|journal.entries.iter().any(|e|e.receipt.employee==*employee);
+    if let Some(expected)=expected{
+        if known(&expected) || registry.employees.iter().any(|a|a.employee==expected) || traces.contains(&expected){return wire::ErrorCode::Inconsistent}
+    }
+    if registry.employees.iter().any(|a|a.state!=AccountState::Tombstone && !known(&a.employee)) || traces.iter().any(|e|!known(e)){
+        return wire::ErrorCode::Inconsistent;
+    }
+    wire::ErrorCode::NotFound
+}
+/// S5a: a missing journal is opened (empty) only while the registry holds no
+/// non-Tombstone account and storage reports no image or live ledger entry.
+/// Unreadable storage does not block the open: `Ok(false)`, and no entry is
+/// created until a traces read succeeds ([`Allocator::require_traces_read`],
+/// F6fb item 7); ReadBack and Retire re-check the traces in [`absence`]
+/// before any `NotFound`. `Ok(true)`: storage was read and holds nothing.
+fn missing_journal(registry:&Registry,storage:&mut dyn Storage)->io::Result<bool>{
+    if registry.employees.iter().any(|a|a.state!=AccountState::Tombstone){return Err(io::Error::other("allocation journal missing while employee accounts exist"))}
+    match storage.traces(){
+        Ok(traces) if !traces.is_empty()=>Err(io::Error::other("allocation journal missing while employee storage exists")),
+        Ok(_)=>Ok(true),
+        Err(_)=>Ok(false),
     }
 }
 
 fn decode_journal(bytes:&[u8])->io::Result<Journal>{
     let bad=||io::Error::other("allocation journal unavailable");
     let journal=serde_json::from_slice::<Journal>(bytes).map_err(io::Error::other)?;
-    if !matches!(journal.schema,1|JOURNAL_SCHEMA) || journal.entries.len()>4096{return Err(bad())}
+    if !matches!(journal.schema,1|2|JOURNAL_SCHEMA) || journal.entries.len()>MAX_ENTRIES{return Err(bad())}
     for (i,e) in journal.entries.iter().enumerate(){
-        if e.receipt.employee.0==[0;16] || journal.entries[..i].iter().any(|p|p.receipt.employee==e.receipt.employee || (p.receipt.label==e.receipt.label && p.phase!=Phase::Disabled && e.phase!=Phase::Disabled) || p.receipt.binding.operation_id==e.receipt.binding.operation_id){return Err(bad())}
+        if e.receipt.employee.0==[0;16]{return Err(bad())}
+        for p in journal.entries.iter().take(i){
+            if p.receipt.employee==e.receipt.employee || (p.receipt.label==e.receipt.label && p.phase.holds_label() && e.phase.holds_label())
+                || p.receipt.binding.operation_id==e.receipt.binding.operation_id{return Err(bad())}
+        }
+        // S6: a retire binding is unique: never any receipt's binding, never another entry's retire.
+        if let Some(retire)=&e.retire{
+            if journal.entries.iter().any(|p|p.receipt.binding.operation_id==retire.operation_id)
+                || journal.entries.iter().enumerate().any(|(j,p)|j!=i && p.retire.is_some_and(|r|r.operation_id==retire.operation_id)){return Err(bad())}
+        }
+        let shape=match e.phase{
+            Phase::Retiring=>e.retire.is_some() && e.retired_at.is_none() && !e.receipt.disabled,
+            Phase::Retired=>e.retire.is_some() && e.retired_at.is_some() && e.receipt.disabled,
+            _=>e.retire.is_none() && e.retired_at.is_none(),
+        };
+        // Schemas 1–2 were never written with the retire phases or fields.
+        if !shape || (journal.schema<JOURNAL_SCHEMA && matches!(e.phase,Phase::Retiring|Phase::Retired)){return Err(bad())}
         match &e.receipt.principal_binding{
             // Schema 1 was never written with bindings: one there is forged.
             Some(_) if journal.schema==1=>return Err(bad()),
@@ -137,180 +378,21 @@ pub(crate) fn serve(gateway:(u32,u32),sender:std::sync::mpsc::SyncSender<crate::
     std::thread::Builder::new().name("spawnd-allocation".into()).spawn(move||loop{
         let fd=match transport::accept(&listener,gateway){Ok(fd)=>fd,Err(_)=>continue};
         let request:Request=match transport::receive(&fd){Ok(r)=>r,Err(_)=>continue};
-        if request.validate().is_err(){continue;}
-        let nonce=request.nonce;
+        if request.check().is_err(){continue;}
         let (reply,receive)=std::sync::mpsc::sync_channel(1);
-        let receipt=if sender.try_send((request,reply)).is_ok(){
-            receive.recv_timeout(std::time::Duration::from_secs(4)).ok().and_then(Result::ok)
-        }else{None};
-        let _=transport::send(&fd,&Response{schema:1,nonce,receipt});
+        // A full mailbox or the 4 s worker timeout is IsolationUnavailable
+        // (S5d): the gateway retries; it is never a NotFound.
+        let result=if sender.try_send((request.clone(),reply)).is_ok(){
+            receive.recv_timeout(std::time::Duration::from_secs(4)).unwrap_or(Err(wire::ErrorCode::IsolationUnavailable))
+        }else{Err(wire::ErrorCode::IsolationUnavailable)};
+        let _=transport::send(&fd,&Response::for_request(&request,result));
     })?;
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use duduclaw_isolation::{ids::{RequestId,Sha256Digest,UidRange},migration::*,execution::{RunHandle},bounded::Text,capability::EmployeeBinding};
-    use crate::{registry::{Registry,HostUidPolicy,EmployeeAccount},storage::{StorageUsage,AttachedStorage,Attachment}};
-    use sha2::{Digest,Sha256};
-    struct Accounts{create_fail:bool,created:usize,recovered:usize}
-    impl AccountHost for Accounts{
-        fn policy(&mut self)->io::Result<HostUidPolicy>{Ok(HostUidPolicy{system:UidRange{first:100,last:999},login:UidRange{first:1000,last:60000},subuids:vec![],subgids:vec![],systemd:vec![]})}
-        fn verify_namespace(&mut self,_:&Registry)->io::Result<()>{Ok(())}
-        fn uid_available(&mut self,_:u32)->io::Result<bool>{Ok(true)}
-        fn create_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{self.created+=1;if self.create_fail{Err(io::Error::other("injected useradd failure"))}else{Ok(())}}
-        fn verify_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{Ok(())}
-        fn recover_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{self.recovered+=1;Ok(())}
-    }
-    struct Disk{fail_ready:bool,present:bool,provisions:usize,destroys:usize,quota:Option<(EmployeeId,DiskQuota)>}
-    impl Storage for Disk{
-        fn readiness(&mut self)->Result<()>{if self.fail_ready{Err(unavailable())}else{Ok(())}}
-        fn provision(&mut self,r:&ProvisionRequest)->Result<StorageUsage>{self.present=true;self.provisions+=1;self.quota=Some((r.employee,r.quota.clone()));self.usage(r.employee)}
-        fn usage(&mut self,e:EmployeeId)->Result<StorageUsage>{let (_,q)=self.quota.as_ref().ok_or_else(unavailable)?;let (bytes,inodes)=crate::storage::quota_limits(q);Ok(StorageUsage{employee:e,bytes:0,inodes:0,limit_bytes:bytes,limit_inodes:inodes,hard_quota_verified:true,device_graph_verified:true,host_reserve_verified:true})}
-        fn destroy(&mut self,_:EmployeeId,_:RequestId,_:Sha256Digest)->Result<()>{self.present=false;self.destroys+=1;Ok(())}
-        fn attachments(&mut self)->Result<Vec<Attachment>>{Ok(vec![])}
-        fn attach(&mut self,_:EmployeeId,_:u32,_:RunHandle,_:&DiskQuota)->Result<AttachedStorage>{Err(unavailable())}
-        fn detach(&mut self,_:&Attachment)->Result<()>{Err(unavailable())}
-    }
-    const ALICE:&[(&str,&str)]=&[("binding_kind","personal"),("owner_id","alice-uuid")];
-    const BOB:&[(&str,&str)]=&[("binding_kind","personal"),("owner_id","bob-uuid")];
-    const TEAM:&[(&str,&str)]=&[("binding_kind","shared"),("tenant_id","tenant-a")];
-    fn personal(owner:&str)->EmployeeBinding{EmployeeBinding::Personal(Text::new(owner.into()).unwrap())}
-    fn request_with(status:ConfirmationStatus,extra:&[(&str,&str)])->Request{
-        let mut fields:Vec<ProposalField>=[("disk_bytes","67108864"),("employee_id","sales")].iter().chain(extra)
-            .map(|(n,v)|ProposalField{name:(*n).into(),value:ProposalValue::Text{value:(*v).into()}}).collect();
-        fields.sort_by(|a,b|a.name.cmp(&b.name));
-        let mut hash=Sha256::new();hash.update(b"duduclaw-migration-proposal-v1\0");hash.update(serde_json::to_vec(&(ConfirmationCategory::Employee,&fields)).unwrap());
-        Request{schema:1,nonce:RequestId([2;16]),action:Action::Allocate,item:ConfirmationItem{binding:ProposalBinding{operation_id:ProposalOperationId{proposal_id:RequestId([1;16]),revision:1},proposal_digest:Sha256Digest(hash.finalize().into())},category:ConfirmationCategory::Employee,status,high_risk:true,fields}}
-    }
-    fn entry(request:&Request,phase:Phase)->Entry{
-        let spec=request.validate().unwrap();
-        Entry{receipt:Receipt{binding:request.item.binding,label:spec.label,employee:EmployeeId([7;16]),uid:70001,bytes:spec.bytes,inodes:spec.inodes,disabled:phase==Phase::Disabled,principal_binding:spec.binding},phase}
-    }
-    fn saved(journal:Journal)->Journal{
-        let dir=tempfile::tempdir().unwrap();
-        let mut allocator=Allocator{directory:dir.path().into(),journal,poisoned:false};
-        allocator.save().unwrap();
-        decode_journal(&fs::read(dir.path().join("allocations.json")).unwrap()).unwrap()
-    }
-    #[test]
-    fn allocation_receipt_schema2_pins_personal_owner(){
-        let req=request_with(ConfirmationStatus::Applying,ALICE);
-        assert_eq!(req.validate().unwrap().binding,Some(personal("alice-uuid")));
-        let journal=saved(Journal{schema:JOURNAL_SCHEMA,entries:vec![entry(&req,Phase::Ready)]});
-        assert_eq!(journal.schema,2);
-        assert_eq!(journal.entries[0].receipt.principal_binding,Some(personal("alice-uuid")));
-        let bytes=serde_json::to_vec(&journal).unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains(r#""principal_binding":{"kind":"personal","id":"alice-uuid"}"#));
-        // ReadBack/Allocate replay after restart resolves to the same pinned entry.
-        let mut readback=req.clone();readback.action=Action::ReadBack;
-        assert_eq!(replay_index(&journal,&readback.item.binding,&readback.validate().unwrap()).unwrap(),Some(0));
-        // A stored binding that fails validation makes the journal unavailable.
-        let forged=String::from_utf8(bytes).unwrap().replace(r#""id":"alice-uuid""#,r#""id":"""#);
-        assert!(decode_journal(forged.as_bytes()).is_err());
-    }
-    #[test]
-    fn allocation_schema1_journal_reads_as_unbound_legacy(){
-        let legacy=request_with(ConfirmationStatus::Applying,&[]);
-        let v180=Journal{schema:1,entries:vec![entry(&legacy,Phase::Ready)]};
-        let encoded=serde_json::to_string(&v180).unwrap();
-        assert!(!encoded.contains("principal_binding"),"byte-compatible with the v1.80 journal: {encoded}");
-        let journal=decode_journal(encoded.as_bytes()).unwrap();
-        assert_eq!(journal.schema,1);assert_eq!(journal.entries[0].receipt.principal_binding,None);
-        assert_eq!(replay_index(&journal,&legacy.item.binding,&legacy.validate().unwrap()).unwrap(),Some(0));
-        // Rewritten as schema 2 without inventing a binding for the legacy entry.
-        let rewritten=saved(journal);
-        assert_eq!(rewritten.schema,2);assert_eq!(rewritten.entries[0].receipt.principal_binding,None);
-        // A schema-1 file can never carry a binding, and unknown schemas fail closed.
-        let mut forged=v180.clone();forged.entries[0].receipt.principal_binding=Some(personal("alice-uuid"));
-        assert!(decode_journal(&serde_json::to_vec(&forged).unwrap()).is_err());
-        for schema in [0u16,3,u16::MAX]{
-            let mut other=v180.clone();other.schema=schema;
-            assert!(decode_journal(&serde_json::to_vec(&other).unwrap()).is_err(),"schema {schema}");
-        }
-        assert!(decode_journal(encoded.replace(r#""disabled":false"#,r#""disabled":false,"owner":"alice""#).as_bytes()).is_err());
-    }
-    #[test]
-    fn allocation_same_operation_binding_change_rejected(){
-        let alice=request_with(ConfirmationStatus::Applying,ALICE);
-        let journal=Journal{schema:JOURNAL_SCHEMA,entries:vec![entry(&alice,Phase::Ready)]};
-        // A re-digested proposal with another principal under the same operation.
-        for extra in [BOB,TEAM,&[][..]]{
-            let changed=request_with(ConfirmationStatus::Applying,extra);
-            assert!(matches!(replay_index(&journal,&changed.item.binding,&changed.validate().unwrap()),Err(ErrorCode::InvalidRequest)));
-        }
-        // Even with an identical proposal binding, a differing recorded principal is refused.
-        let spec=alice.validate().unwrap();
-        for other in [Some(personal("bob-uuid")),Some(EmployeeBinding::Shared(Text::new("alice-uuid".into()).unwrap())),None]{
-            let mut tampered=journal.clone();tampered.entries[0].receipt.principal_binding=other;
-            assert!(matches!(replay_index(&tampered,&alice.item.binding,&spec),Err(ErrorCode::InvalidRequest)));
-        }
-        // A legacy unbound entry is never upgraded by a later bound proposal.
-        let legacy=request_with(ConfirmationStatus::Applying,&[]);
-        let unbound=Journal{schema:1,entries:vec![entry(&legacy,Phase::Ready)]};
-        let mut upgrade=alice.clone();upgrade.item.binding.proposal_digest=legacy.item.binding.proposal_digest;
-        assert!(matches!(replay_index(&unbound,&upgrade.item.binding,&spec),Err(ErrorCode::InvalidRequest)));
-        // Disabled entries keep their principal; the same operation still matches it only.
-        let disabled=Journal{schema:JOURNAL_SCHEMA,entries:vec![entry(&alice,Phase::Disabled)]};
-        let bob=request_with(ConfirmationStatus::Applying,BOB);
-        assert!(matches!(replay_index(&disabled,&bob.item.binding,&bob.validate().unwrap()),Err(ErrorCode::InvalidRequest)));
-        assert_eq!(saved(disabled).entries[0].receipt.principal_binding,Some(personal("alice-uuid")));
-    }
-    #[test]
-    #[ignore="root Linux /run filesystem fixture; account and storage effects are injected, not live deployment acceptance"]
-    fn iso_root_e2e_confirmed_allocation_binding_restart_and_compensation(){
-        use std::os::unix::fs::DirBuilderExt;
-        assert_eq!(unsafe{libc::geteuid()},0);
-        for failure in [0,1,2]{
-            let path=PathBuf::from(format!("/run/iso-allocation-test-{}-{failure}",std::process::id()));
-            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
-            let mut registry=RegistryStore::open_at(&path).unwrap();let mut allocator=Allocator::open_at(&path).unwrap();
-            let mut accounts=Accounts{create_fail:failure==2,created:0,recovered:0};
-            let mut disk=Disk{fail_ready:failure==1,present:false,provisions:0,destroys:0,quota:None};
-            let mut req=request_with(ConfirmationStatus::Pending,ALICE);
-            assert!(allocator.handle(&req,&mut registry,&mut accounts,&mut disk).is_err());
-            assert_eq!(accounts.created,0);assert_eq!(disk.provisions,0);assert!(!path.join("allocations.json").exists());
-            req.item.status=ConfirmationStatus::Applying;
-            let first=allocator.handle(&req,&mut registry,&mut accounts,&mut disk);
-            if failure==0{
-                let first=first.unwrap();assert_eq!(first.principal_binding,Some(personal("alice-uuid")));
-                drop(allocator);allocator=Allocator::open_at(&path).unwrap();
-                assert_eq!(allocator.journal.schema,2,"journal is written as schema 2");
-                let second=allocator.handle(&req,&mut registry,&mut accounts,&mut disk).unwrap();
-                assert_eq!(first.employee,second.employee);assert_eq!(first.uid,second.uid);assert_eq!(accounts.created,1);
-                assert_eq!(second.principal_binding,Some(personal("alice-uuid")),"Personal owner survives restart");
-                let mut readback=req.clone();readback.action=Action::ReadBack;readback.item.status=ConfirmationStatus::Applied;
-                let read=allocator.handle(&readback,&mut registry,&mut accounts,&mut disk).unwrap();
-                assert_eq!(read.employee,first.employee);assert_eq!(read.principal_binding,Some(personal("alice-uuid")),"ReadBack returns the pinned owner");
-                let mut changed=req.clone();changed.item.binding.proposal_digest.0[0]^=1;
-                assert!(allocator.handle(&changed,&mut registry,&mut accounts,&mut disk).is_err());
-                // Same operation re-proposed for another owner (re-digested) is refused.
-                let mut rebound=request_with(ConfirmationStatus::Applying,BOB);rebound.item.binding.operation_id=req.item.binding.operation_id;
-                assert!(matches!(allocator.handle(&rebound,&mut registry,&mut accounts,&mut disk),Err(ErrorCode::InvalidRequest)));
-                assert_eq!(accounts.created,1);
-            }else{assert!(first.is_err());assert_eq!(disk.provisions,0);}
-            req.action=Action::Disable;req.item.status=ConfirmationStatus::Failed;
-            let disabled=allocator.handle(&req,&mut registry,&mut accounts,&mut disk).unwrap();assert!(disabled.disabled);assert!(!disk.present);
-            assert_eq!(disabled.principal_binding,Some(personal("alice-uuid")),"compensation never rewrites the principal");
-            if failure==1{assert_eq!(disabled.uid,0);assert_eq!(accounts.created,0);}
-            if failure==2{assert!(accounts.recovered>0);assert_eq!(registry.registry().employees[0].state,AccountState::Tombstone);}
-            req.action=Action::Allocate;req.item.status=ConfirmationStatus::Applying;
-            assert!(allocator.handle(&req,&mut registry,&mut accounts,&mut disk).is_err(),"same operation never revives tombstone");
-            // A new proposal for the same label carries its own principal only.
-            req=request_with(ConfirmationStatus::Applying,TEAM);
-            req.item.binding.operation_id.proposal_id=RequestId([3;16]);
-            accounts.create_fail=false;disk.fail_ready=false;
-            let replacement=allocator.handle(&req,&mut registry,&mut accounts,&mut disk).unwrap();
-            assert_ne!(replacement.employee,disabled.employee);
-            assert_eq!(replacement.principal_binding,Some(EmployeeBinding::Shared(Text::new("tenant-a".into()).unwrap())),"old Personal binding is never revived");
-            if failure!=1{assert_eq!(replacement.uid,70001,"prior UID is never recycled");}
-            drop(allocator);allocator=Allocator::open_at(&path).unwrap();
-            assert!(allocator.journal.entries.iter().any(|e|e.receipt.employee==disabled.employee && e.phase==Phase::Disabled && e.receipt.principal_binding==Some(personal("alice-uuid"))));
-            req.action=Action::Disable;req.item.status=ConfirmationStatus::Failed;
-            allocator.handle(&req,&mut registry,&mut accounts,&mut disk).unwrap();
-            drop(allocator);drop(registry);
-            for name in ["registry.json","registry.lock","allocations.json"]{fs::remove_file(path.join(name)).unwrap();}fs::remove_dir(path).unwrap();
-        }
-    }
-}
+#[path = "allocation_tests.rs"]
+mod tests;
+#[cfg(test)]
+#[path = "allocation_retire_tests.rs"]
+mod retire_tests;

@@ -404,6 +404,15 @@ async fn spawn_telegram_bot(
     ctx: Arc<ReplyContext>,
     _home_dir: &Path,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // F6h (H5, A11): in protected mode an employee's own bot needs a live
+    // lifecycle and an active channel route; unchanged otherwise.
+    if let Some(agent) = &agent_name {
+        if !crate::isolation_label_stores::channel_bot_allowed(_home_dir, agent, "telegram").await {
+            warn!(agent = %agent, "per-agent Telegram bot not started: no live protected lifecycle or channel route");
+            crate::isolation_label_bots::refused(_home_dir, "telegram", agent);
+            return None;
+        }
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
         .build()
@@ -496,9 +505,20 @@ async fn spawn_telegram_bot(
     // every polling cycle instead of holding it fixed for the task's entire
     // lifetime, so a token change lands within one `getUpdates` cycle instead
     // of requiring this task (or the gateway) to be restarted.
-    let handle = tokio::spawn(async move {
+    let agent = agent_name.clone();
+    // F6fb item 9: the bot's per-update tasks are tracked in its scope and
+    // stop with it.
+    let scope = crate::isolation_label_bots::BotScope::new();
+    let handle = tokio::spawn(crate::isolation_label_bots::scoped(scope.clone(), async move {
         poll_loop(client, token, ctx, label, agent_name).await;
-    });
+    }));
+    // F6h (H5): a per-agent bot is registered so a tombstone can stop it.
+    if let Some(agent) = agent {
+        if !crate::isolation_label_bots::admit(_home_dir, "telegram", &agent, handle.abort_handle(), scope).await {
+            warn!(agent = %agent, "per-agent Telegram bot stopped: the employee is no longer live");
+            return None;
+        }
+    }
 
     Some(handle)
 }
@@ -1279,7 +1299,8 @@ async fn process_telegram_message(
         let c = progress_client.clone();
         let api = progress_api.clone();
         let msg_id = progress_msg_id.clone();
-        tokio::spawn(async move {
+        // F6fb item 9: tracked in the bot's scope (stops with the bot).
+        crate::isolation_label_bots::spawn_scoped(async move {
             let mut id_guard = msg_id.lock().await;
             match *id_guard {
                 Some(mid) => {
@@ -1899,7 +1920,8 @@ async fn handle_callback_query(
         let api_base = api_base.to_string();
         let sender = cb.from.as_ref().filter(|user| !user.is_bot)
             .map(|user| user.id.to_string()).unwrap_or_default();
-        tokio::spawn(async move {
+        // F6fb item 9: tracked in the bot's scope (stops with the bot).
+        crate::isolation_label_bots::spawn_scoped(async move {
             let outcome = crate::goal_intent::handle_gintent_button_for_sender(&ctx, choice, &nonce, "telegram", &sender).await;
             send_reply_markdown(
                 &client,

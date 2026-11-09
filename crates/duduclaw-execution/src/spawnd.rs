@@ -6,6 +6,8 @@ mod transport;
 mod fd_io;
 mod work_file;
 mod helper_call;
+/// F6d: `StopEmployeeRuns` / `EmployeeIdle` (employee-level H4 ops).
+pub mod employee_control;
 pub use work_file::{features_from_advertised, FeatureSource, RunTransport, SpawndFeatures, WorkFileError,
     WorkFileSnapshot, WORK_BROKER_FEATURE};
 

@@ -197,6 +197,10 @@ pub enum ConfirmationCategory {
     Budget,
     ConfigurationSection,
     Schedule,
+    /// F6 §3.12 (N2, F6l): frees a tombstoned, purged employee's root
+    /// allocation (journal entry and label, loop image, run eligibility).
+    /// Forward only once the root started (R14); the UID is never reused.
+    EmployeeRetire,
 }
 
 /// Persisted confirmation/apply lifecycle (design §10.3, R7-M3).

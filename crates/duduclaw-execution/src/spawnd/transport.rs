@@ -252,7 +252,8 @@ impl Connection {
     /// reply is returned as a packet (not mapped) so the caller can give a
     /// typed file-tool refusal; any transport/protocol failure closes control.
     pub(super) fn work_request(&self, request: SpawnRequest, timeout: Duration) -> Result<Packet, BackendError> {
-        if !matches!(request, SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }) {
+        if !matches!(request, SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }
+            | SpawnRequest::StopEmployeeRuns { .. } | SpawnRequest::EmployeeIdle { .. }) {
             return Err(BackendError::Denied);
         }
         if !request.fd_plan().map_err(|_| BackendError::Denied)?.is_empty() { return Err(BackendError::Denied); }
@@ -388,7 +389,10 @@ fn is_helper_request(request: &SpawnRequest) -> bool {
 fn validate_response(request: &SpawnRequest, response: &SpawnResponse, received_fds: usize) -> Result<(), BackendError> {
     // Package H (H1/H5): the contract's own pairing, incl. the exact fd count
     // (`WorkFile` = one `WorkFileRead`, `Error`/`WorkAnchor` = none).
-    if matches!(request, SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }) {
+    // F6d: the two employee-level H4 ops (`StopEmployeeRuns`, `EmployeeIdle`)
+    // are paired by the same contract function (no fd either way).
+    if matches!(request, SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }
+        | SpawnRequest::StopEmployeeRuns { .. } | SpawnRequest::EmployeeIdle { .. }) {
         return ipc::check_work_reply(request, response, received_fds).map_err(|_| BackendError::Protocol);
     }
     // HX5: helper ops pair through the contract (`HelperStarted` = exactly

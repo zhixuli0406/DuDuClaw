@@ -628,7 +628,8 @@ impl MethodHandler {
         if email == user.email {
             return WsFrame::ok_response("", json!({"status": "unchanged", "email": email}));
         }
-        match db.change_email(&ctx.user_id, email) {
+        // F6d (Q3): the session user is the account; stamped owner-authenticated.
+        match db.change_own_email(&ctx.user_id, email) {
             Ok(()) => {
                 // The audit row keeps both addresses: it is the only record of
                 // which login name the account used before.
@@ -699,7 +700,8 @@ impl MethodHandler {
             return WsFrame::error_response("", "new password must differ from the current one");
         }
 
-        match db.update_user(&ctx.user_id, None, None, Some(new_password)) {
+        // F6d (Q3): the session user is the account; stamped owner-authenticated.
+        match db.change_own_password(&ctx.user_id, new_password) {
             Ok(()) => {
                 let _ = db.log_action(
                     Some(&ctx.user_id),

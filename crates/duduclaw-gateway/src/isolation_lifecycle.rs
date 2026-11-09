@@ -39,9 +39,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::fs_safe::sqlite::Access;
 
-const APPLY_DB: &str = "migration-authority/apply.db";
-const CONFIRMATIONS_DB: &str = "migration-confirmations.db";
-const USERS_DB: &str = "users.db";
+pub(crate) const APPLY_DB: &str = "migration-authority/apply.db";
+pub(crate) const CONFIRMATIONS_DB: &str = "migration-confirmations.db";
+pub(crate) const USERS_DB: &str = "users.db";
 
 /// Why a lifecycle read or write was refused. Every variant is a refusal;
 /// none is a hint that a weaker check may be used instead.
@@ -117,7 +117,7 @@ impl RootAllocation for RootAllocator {
         {
             use duduclaw_migration::allocation::{Action, Request};
             let nonce = duduclaw_migration::ids::RequestId(*uuid::Uuid::new_v4().as_bytes());
-            allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone() })
+            allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone(), approver: None })
                 .map_err(|_| LifecycleError::Unavailable)
         }
         #[cfg(not(target_os = "linux"))]
@@ -267,8 +267,27 @@ pub(crate) fn connector_route_binding(home: &Path, owner: Option<&str>) -> Resul
 /// employee has exactly one member. `Ok(false)` is an idempotent re-apply of
 /// the mirror. Any refusal must refuse the apply step.
 pub(crate) fn record_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
+    record_personal_mirror_gated(home, label, owner, None)
+}
+
+/// Security round 3 N1: a check run inside the users.db write transaction of
+/// a confirmed allocation's save, before anything is written (the adoption
+/// commit re-runs its owner and approval checks there,
+/// `isolation_adopt::recheck_commit`). `Err` refuses the save (`Denied`) and
+/// nothing is written.
+pub(crate) type UsersGate<'a> = dyn Fn(&Connection) -> Result<(), ()> + 'a;
+
+/// [`record_personal_mirror`] with `gate` run first in the same users.db
+/// IMMEDIATE transaction (no users.db writer can commit between the check and
+/// the mirror).
+pub(crate) fn record_personal_mirror_gated(home: &Path, label: &str, owner: &str, gate: Option<&UsersGate<'_>>)
+    -> Result<bool, LifecycleError> {
     let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
+    if let Some(gate) = gate {
+        let conn: &Connection = &tx;
+        gate(conn).map_err(|()| LifecycleError::Denied)?;
+    }
     if !owner_eligible(&tx, owner)? { return Err(LifecycleError::Denied); }
     let inserted = duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     duduclaw_auth::db::bind_personal_owner_in_transaction(&tx, label, owner).map_err(mirror_error)?;
@@ -276,7 +295,19 @@ pub(crate) fn record_personal_mirror(home: &Path, label: &str, owner: &str) -> R
     Ok(inserted)
 }
 
-/// Apply/compensation and tombstone path only: remove the Personal mirror
+/// A [`UsersGate`] alone, in its own users.db IMMEDIATE transaction (a save
+/// that writes no Personal mirror: Shared, or a disabled receipt).
+pub(crate) fn run_users_gate(home: &Path, gate: &UsersGate<'_>) -> Result<(), LifecycleError> {
+    let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
+    let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
+    let conn: &Connection = &tx;
+    gate(conn).map_err(|()| LifecycleError::Denied)?;
+    tx.finish().map_err(|_| LifecycleError::Unavailable)
+}
+
+/// Apply/compensation, tombstone and F6 restore crash-recovery paths only
+/// (`isolation_restore`, §3.6: undo the mirror an interrupted restore wrote
+/// while its confirmed row is still disabled): remove the Personal mirror
 /// (and, per A3, every binding of the agent). `Ok(false)` when absent;
 /// `Stale` when another owner is recorded (left untouched).
 pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
@@ -338,8 +369,9 @@ pub(crate) struct TombstoneEnv<'a> {
 ///
 /// 0. Read (no lock): the confirmed row (receipt, tenant pin, incarnation),
 ///    the Applied allocation item, and the principal snapshot — Personal
-///    (H3): owner `credential_epoch`, email, Google `sub`, MFA/passkey-set
-///    digest, notice address; Shared (R4): the pinned tenant and every member
+///    (H3): owner `credential_epoch` (recorded, not compared by Q3 since
+///    F6fa2: a session revocation is not a credential change), email, Google
+///    `sub`, MFA/passkey-set digest, notice address; Shared (R4): the pinned tenant and every member
 ///    binding `(user_id, access_level, is_primary)`. A legacy unpinned row
 ///    is refused (`Denied`), as `resolve` refuses it.
 /// 1. One apply.db `BEGIN IMMEDIATE` transaction: re-read the row (same
@@ -369,9 +401,12 @@ pub(crate) struct TombstoneEnv<'a> {
 /// quarantine row and principal snapshot are kept, a still-`pending` seal is
 /// re-run through the quarantined directory, fences are recomputed.
 ///
+/// F6h: right after step 1 the employee's running per-agent channel bots are
+/// stopped (`isolation_label_bots::stop_label`); after step 3 the label-keyed
+/// stores are marked, held or paused (`isolation_label_stores::tombstone_effects`).
+///
 /// Not done here (later tasks): approval invalidation runs in the RPC after
-/// this call (async broker); store marks and the label-keyed writer gate /
-/// global route pause (F6h); provider cache eviction beyond the registry
+/// this call (async broker); provider cache eviction beyond the registry
 /// rescan (F6c); root retire (F6l).
 pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId, env: &TombstoneEnv<'_>)
     -> Result<TombstoneOutcome, LifecycleError> {
@@ -449,9 +484,16 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
         }
         quarantine::insert_root_allocation(&tx, employee, &root_item).map_err(|_| Unavailable)?;
         tx.commit().map_err(|_| Unavailable)?;
+        // F6fb2: the label is refused from this commit on; no connection may
+        // reuse a writer-gate answer cached before it.
+        duduclaw_memory::label_gate::invalidate_cached_answers();
         (held, stripped, seal_state)
     };
     let _ = seal_state;
+    // F6h (H5, A11): the row is disabled and the quarantine row open, so a
+    // new bot start is refused; stop the employee's running channel bots now
+    // (also on a retry), before anything that can fail.
+    let bots_stopped = crate::isolation_label_bots::stop_label(home, label);
 
     // 2. Seal outside the lock, through the held descriptor.
     #[cfg(unix)]
@@ -485,6 +527,9 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
             quarantine::replace_fence_group(&mut db, employee, incarnation, group, &members).map_err(|_| Unavailable)?;
         }
     }
+    // F6h (§3.2 step 4, S9): strip global routes to the label, pause its
+    // work, record store marks; failures become `stores:` fences.
+    let label_stores = crate::isolation_label_stores::tombstone_effects(home, label, employee, incarnation);
     let row = {
         let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
         quarantine::read_quarantine(&db, employee, incarnation).map_err(|_| Unavailable)?.ok_or(Unavailable)?
@@ -507,7 +552,8 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
         "label": label, "employee": hex::encode(employee.0), "incarnation": incarnation,
         "seal": outcome.seal, "digest_prefix": outcome.digest_prefix, "routes_revoked": outcome.routes_revoked,
         "pending_fences": outcome.pending_fences, "runs_stopped": outcome.runs_stopped,
-        "stripped": stripped.to_value(), "users_removed": users.is_ok(),
+        "stripped": stripped.to_value(), "users_removed": users.is_ok(), "label_stores": label_stores,
+        "channel_bots_stopped": bots_stopped,
     });
     let severity = if users.is_ok() && outcome.pending_fences.is_empty() {
         duduclaw_security::audit::Severity::Info
@@ -543,12 +589,29 @@ pub(crate) fn record_fence_group(home: &Path, label: &str, employee: EmployeeId,
 /// The Personal (H3) or Shared (R4) principal snapshot of §3.2 step 3, from
 /// one users.db read transaction. Never holds a credential value: the
 /// MFA/passkey set is a digest, the Google link is the `sub` only.
-fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinned: &str)
+///
+/// F6fa (Personal): `owner_factors` = the owner's factor baseline
+/// (`duduclaw_auth::mfa::owner_factor::FactorBaseline`: strongest kind,
+/// passkey credential ids, TOTP-secret and email-factor-address digests; the
+/// restore proof must use a credential recorded here) and `credential_seq` =
+/// the `credential_changes` high-water `seq` of the same read (Q3 counts only
+/// rows after it, never by wall clock).
+pub(crate) fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinned: &str)
+    -> Result<serde_json::Value, LifecycleError> {
+    use LifecycleError::Unavailable;
+    let mut users = open_store(home, USERS_DB, Access::ReadOnly)?;
+    let tx = users.transaction().map_err(|_| Unavailable)?;
+    let value = principal_snapshot_in(&tx, home, label, binding, pinned)?;
+    tx.finish().map_err(|_| Unavailable)?;
+    Ok(value)
+}
+
+/// [`principal_snapshot`] on the caller's users.db connection (the restore
+/// apply reads it inside its users.db write transaction, F6fa item 2).
+pub(crate) fn principal_snapshot_in(tx: &Connection, home: &Path, label: &str, binding: &EmployeeBinding, pinned: &str)
     -> Result<serde_json::Value, LifecycleError> {
     use LifecycleError::Unavailable;
     use sha2::{Digest, Sha256};
-    let mut users = open_store(home, USERS_DB, Access::ReadOnly)?;
-    let tx = users.transaction().map_err(|_| Unavailable)?;
     let strings = |sql: &str, key: &str| -> Result<Vec<String>, LifecycleError> {
         let mut statement = tx.prepare(sql).map_err(|_| Unavailable)?;
         let rows = statement.query_map([key], |r| r.get::<_, String>(0)).map_err(|_| Unavailable)?
@@ -580,6 +643,11 @@ fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinne
                 Ok(None) => serde_json::Value::Null,
                 Err(_) => serde_json::json!("unreadable"),
             };
+            // Security round 3 N4: the TOTP identity is the decrypted secret's
+            // digest (survives a re-encryption / machine-key rotation).
+            let baseline = duduclaw_auth::mfa::owner_factor::FactorBaseline::read(tx, owner, &crate::mfa::Cipher(home))
+                .map_err(|_| Unavailable)?;
+            let seq = duduclaw_auth::credential_changes::high_water(tx).map_err(|_| Unavailable)?;
             serde_json::json!({
                 "kind": "personal", "owner_user_id": owner,
                 "credential_epoch": account.as_ref().map(|(epoch, _)| *epoch),
@@ -587,6 +655,8 @@ fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinne
                 "google_sub": google,
                 "factors_digest": hex::encode(factors.finalize()),
                 "notice_address": account.as_ref().map(|(_, email)| email.clone()),
+                "owner_factors": baseline.to_value(),
+                "credential_seq": seq,
             })
         }
         EmployeeBinding::Shared(_) => {
@@ -600,7 +670,6 @@ fn principal_snapshot(home: &Path, label: &str, binding: &EmployeeBinding, pinne
             serde_json::json!({"kind": "shared", "tenant_id": pinned, "members": members})
         }
     };
-    tx.finish().map_err(|_| Unavailable)?;
     Ok(value)
 }
 
@@ -692,7 +761,7 @@ pub(crate) fn quarantine_path(home: &Path, label: &str, employee: EmployeeId, in
 
 /// A quarantined directory, by descriptor (retry of a pending seal). The
 /// quarantine root must be private as at the move; `Ok(None)` when absent.
-fn reopen_quarantined(home: &Path, label: &str, employee: EmployeeId, incarnation: u32)
+pub(crate) fn reopen_quarantined(home: &Path, label: &str, employee: EmployeeId, incarnation: u32)
     -> Result<Option<crate::fs_safe::SafeDir>, LifecycleError> {
     use LifecycleError::Unavailable;
     #[cfg(unix)]
@@ -773,12 +842,12 @@ fn quarantine_agent_dir(home: &Path, label: &str, employee: EmployeeId, incarnat
     { let _ = (home, label, employee, incarnation); Err(Unavailable) }
 }
 
-fn valid_label(label: &str) -> bool {
+pub(crate) fn valid_label(label: &str) -> bool {
     duduclaw_core::is_valid_agent_id(label) && !duduclaw_core::is_reserved_agent_id(label)
         && label != duduclaw_core::UNTRUSTED_AGENT_ID
 }
 
-fn principal(prior: &Receipt, pinned: &str) -> Result<EmployeeBinding, LifecycleError> {
+pub(crate) fn principal(prior: &Receipt, pinned: &str) -> Result<EmployeeBinding, LifecycleError> {
     match &prior.principal_binding {
         // Legacy: Shared in the pinned tenant only, never Personal.
         None => Text::new(pinned.to_owned()).map(EmployeeBinding::Shared).map_err(|_| LifecycleError::Denied),
@@ -793,7 +862,7 @@ fn principal(prior: &Receipt, pinned: &str) -> Result<EmployeeBinding, Lifecycle
 /// The incarnation comes from the same row read (0 before F6a added the
 /// column); a NULL, negative or out-of-range value, or an employee schema
 /// newer than this build, is `Unavailable`.
-fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<String>, u32)>, LifecycleError> {
+pub(crate) fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<String>, u32)>, LifecycleError> {
     let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
     let table: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
@@ -816,7 +885,7 @@ fn confirmed_row(home: &Path, label: &str) -> Result<Option<(Receipt, Option<Str
     Ok(Some((receipt, tenant, incarnation)))
 }
 
-fn applied_item(home: &Path, binding: &ProposalBinding) -> Result<ConfirmationItem, LifecycleError> {
+pub(crate) fn applied_item(home: &Path, binding: &ProposalBinding) -> Result<ConfirmationItem, LifecycleError> {
     let store = duduclaw_migration::confirmation::ConfirmationStore::from_read_only_connection(
         open_store(home, CONFIRMATIONS_DB, Access::ReadOnly)?).map_err(|_| LifecycleError::Unavailable)?;
     store.list().map_err(|_| LifecycleError::Unavailable)?.into_iter()
@@ -868,7 +937,7 @@ thread_local! {
 /// Same rule as the Shared binding restoration
 /// (`migration_authority_bindings.rs`): Active, logged in, no forced
 /// password change.
-fn owner_eligible(conn: &Connection, owner: &str) -> Result<bool, LifecycleError> {
+pub(crate) fn owner_eligible(conn: &Connection, owner: &str) -> Result<bool, LifecycleError> {
     let row: Option<(String, bool, Option<String>)> = conn.query_row(
         "SELECT status,must_change_password,last_login FROM users WHERE id=?1", [owner],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(|_| LifecycleError::Unavailable)?;
@@ -876,7 +945,7 @@ fn owner_eligible(conn: &Connection, owner: &str) -> Result<bool, LifecycleError
         status == "active" && !must_change && last_login.is_some_and(|login| !login.is_empty())))
 }
 
-fn mirror_error(error: duduclaw_auth::db::PersonalAgentError) -> LifecycleError {
+pub(crate) fn mirror_error(error: duduclaw_auth::db::PersonalAgentError) -> LifecycleError {
     use duduclaw_auth::db::PersonalAgentError as E;
     match error {
         E::Store(_) => LifecycleError::Unavailable,
@@ -891,7 +960,7 @@ fn mirror_error(error: duduclaw_auth::db::PersonalAgentError) -> LifecycleError 
 /// the store's directory, owner/mode/link-count/dev+inode checks on the
 /// store and its -journal/-wal/-shm sidecars before and after the open,
 /// `SQLITE_OPEN_NOFOLLOW`, never created. Any violation is `Unavailable`.
-fn open_store(home: &Path, store: &str, access: Access) -> Result<Connection, LifecycleError> {
+pub(crate) fn open_store(home: &Path, store: &str, access: Access) -> Result<Connection, LifecycleError> {
     let (directory, name) = match store.rsplit_once('/') {
         Some((subdirectory, name)) => (home.join(subdirectory), name),
         None => (home.to_path_buf(), store),

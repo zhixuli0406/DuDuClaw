@@ -40,15 +40,18 @@ const HOOK_SETTINGS: &str = "settings.json";
 /// .claude/settings.json) plus CONTRACT.toml. Anything else refuses.
 pub(super) const ALLOWED_TOP: [&str; 5] = ["SOUL.md", "CONTRACT.toml", AGENT_TOML, "SKILLS", HOOK_DIR];
 
-/// Marker table in apply.db; created with the request index.
-pub(super) const MARKER_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS employee_dir_markers (
+/// Marker table in apply.db; created with the request index. F6g (R8):
+/// `origin ∈ {created, adopted}` and `quarantine_ref` are added by
+/// [`crate::isolation_adopt::ensure_marker_schema`]; only the adoption apply
+/// step writes an `adopted` marker and [`check_marker`] refuses one.
+pub(crate) const MARKER_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS employee_dir_markers (
     label TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, digest TEXT NOT NULL, created_at TEXT NOT NULL);";
 
 /// One read of what a Personal proposal adopts: the digest and the exact
 /// agent.toml bytes that went into it.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Snapshot {
-    pub(super) digest: String,
+pub(crate) struct Snapshot {
+    pub(crate) digest: String,
     agent_toml: Vec<u8>,
 }
 
@@ -57,7 +60,7 @@ impl Snapshot {
     /// bytes the way the registry loads an unbound employee (parse, then the
     /// same post-deserialize clamps), and encoded as the approval validator
     /// compares them.
-    pub(super) fn settings(&self) -> Result<String, &'static str> {
+    pub(crate) fn settings(&self) -> Result<String, &'static str> {
         let text = std::str::from_utf8(&self.agent_toml).map_err(|_| SETTINGS_INVALID)?;
         let mut config: duduclaw_core::types::AgentConfig = toml::from_str(text).map_err(|_| SETTINGS_INVALID)?;
         config.proactive.sanitize();
@@ -133,7 +136,7 @@ fn entry(hash: &mut Sha256, path: &Path, relative: &str, depth: usize, count: &m
 /// Digest over everything a Personal proposal adopts from `agents/<label>`,
 /// plus the agent.toml bytes it covers. An entry outside [`ALLOWED_TOP`], a
 /// missing agent.toml or any link/special file refuses.
-pub(super) fn snapshot(home: &Path, agents_dir: &Path, label: &str) -> Result<Snapshot, &'static str> {
+pub(crate) fn snapshot(home: &Path, agents_dir: &Path, label: &str) -> Result<Snapshot, &'static str> {
     let dir = agents_dir.join(label);
     let metadata = std::fs::symlink_metadata(&dir).map_err(|_| FOREIGN_DIR)?;
     if !metadata.file_type().is_dir() { return Err(FOREIGN_DIR); }
@@ -181,8 +184,10 @@ pub(super) fn agent_dir_digest(home: &Path, agents_dir: &Path, label: &str) -> R
 pub(super) fn record_marker(home: &Path, agents_dir: &Path, label: &str, owner: &str) -> Result<(), &'static str> {
     let digest = agent_dir_digest(home, agents_dir, label)?;
     let db = open_requests(home)?;
-    db.execute("INSERT INTO employee_dir_markers(label,owner_user_id,digest,created_at) VALUES(?1,?2,?3,?4)
-        ON CONFLICT(label) DO UPDATE SET owner_user_id=excluded.owner_user_id,digest=excluded.digest,created_at=excluded.created_at",
+    // F6g (R8): an `adopted` marker is never replaced by this flow.
+    db.execute("INSERT INTO employee_dir_markers(label,owner_user_id,digest,created_at,origin) VALUES(?1,?2,?3,?4,'created')
+        ON CONFLICT(label) DO UPDATE SET owner_user_id=excluded.owner_user_id,digest=excluded.digest,created_at=excluded.created_at
+        WHERE employee_dir_markers.origin='created'",
         params![label, owner, digest, chrono::Utc::now().to_rfc3339()]).map_err(|_| STORE_UNAVAILABLE)?;
     Ok(())
 }
@@ -191,7 +196,7 @@ pub(super) fn record_marker(home: &Path, agents_dir: &Path, label: &str, owner: 
 /// marker of this flow for the same owner whose digest still matches, and
 /// never while a live (not tombstoned) employee holds the label. Returns the
 /// matching snapshot (its agent.toml bytes are the proposal's settings).
-pub(super) fn check_marker(db: &Connection, home: &Path, agents_dir: &Path, label: &str, owner: &str)
+pub(crate) fn check_marker(db: &Connection, home: &Path, agents_dir: &Path, label: &str, owner: &str)
     -> Result<Snapshot, &'static str> {
     let has_confirmed: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
@@ -205,10 +210,13 @@ pub(super) fn check_marker(db: &Connection, home: &Path, agents_dir: &Path, labe
             if !receipt.disabled { return Err(LABEL_TAKEN); }
         }
     }
-    let marker: Option<(String, String)> = db.query_row(
-        "SELECT owner_user_id,digest FROM employee_dir_markers WHERE label=?1", [label],
-        |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|_| STORE_UNAVAILABLE)?;
-    let Some((marked_owner, digest)) = marker else { return Err(FOREIGN_DIR) };
+    let marker: Option<(String, String, String)> = db.query_row(
+        "SELECT owner_user_id,digest,origin FROM employee_dir_markers WHERE label=?1", [label],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(|_| STORE_UNAVAILABLE)?;
+    let Some((marked_owner, digest, origin)) = marker else { return Err(FOREIGN_DIR) };
+    // F6g (R8): the normal proposal flow never adopts an `adopted` marker;
+    // only the adoption apply step creates one, from its own quarantine row.
+    if origin != "created" { return Err(FOREIGN_DIR); }
     if marked_owner != owner { return Err(FOREIGN_DIR); }
     let current = snapshot(home, agents_dir, label)?;
     if current.digest != digest { return Err(FOREIGN_DIR); }

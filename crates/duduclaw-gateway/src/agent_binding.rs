@@ -672,3 +672,46 @@ fn write_durable_state(path:&std::path::Path,state:&BindState)->std::io::Result<
     crate::handlers::config_commit::replace_owner_only(path,&encoded)?;
     std::fs::File::open(path.parent().ok_or_else(||std::io::Error::other("binding path"))?).and_then(|f|f.sync_all())
 }
+
+// ── F6h (isolation_label_stores, S9): global channel routes to one label ──
+
+/// Routes to `agent` (exact label): durable channel-user bindings plus
+/// unexpired bind tokens. Missing file ⇒ 0; unreadable or corrupt ⇒ `Err`
+/// (never read as zero).
+pub(crate) fn label_route_count(path:&std::path::Path,agent:&str)->std::io::Result<u64> {
+    let mut state=read_durable_state(path)?;
+    prune_expired(&mut state);
+    let bound=state.bindings.values().flat_map(|users|users.values()).filter(|bound|bound.as_str()==agent).count();
+    let tokens=state.tokens.values().filter(|token|token.agent_id==agent).count();
+    Ok((bound+tokens) as u64)
+}
+
+/// Strip every route to `agent` (exact label) under the store lock: bindings
+/// and bind tokens. Returns the stripped names (`binding:<channel>:<user>`,
+/// `token:<channel>`; never a token digest). A missing file is never created.
+pub(crate) fn strip_label_routes(path:&std::path::Path,agent:&str)->std::io::Result<Vec<String>> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(Vec::new()),
+        _=>{}
+    }
+    duduclaw_core::with_file_lock(path,|| {
+        let mut state=read_durable_state(path)?;
+        let mut names=Vec::new();
+        for (channel,users) in state.bindings.iter_mut() {
+            users.retain(|user,bound| {
+                let keep=bound.as_str()!=agent;
+                if !keep { names.push(format!("binding:{channel}:{user}")); }
+                keep
+            });
+        }
+        state.bindings.retain(|_,users|!users.is_empty());
+        state.tokens.retain(|_,token| {
+            let keep=token.agent_id!=agent;
+            if !keep { names.push(format!("token:{}",token.channel)); }
+            keep
+        });
+        if !names.is_empty() { write_durable_state(path,&state)?; }
+        names.sort();
+        Ok(names)
+    })
+}

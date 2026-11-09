@@ -92,6 +92,67 @@ fn save_ceremony(conn: &Connection, user: &str, purpose: &str, token: &str, sess
     Ok(id)
 }
 
+/// The one assertion verifier (login and the F6d restore proof): webauthn-rs
+/// over the server-held ceremony state, user verification required, the
+/// signature counter compared with the LIVE row and persisted on `tx`.
+/// `allowed` (restore proof, F6fa): the credential must be one of these
+/// `mfa_passkeys.id` values (the ids recorded at the tombstone), checked
+/// before the counter is touched.
+fn verify_assertion(tx: &Connection, rp: &Webauthn, user: &str, state: &str, credential: Value, allowed: Option<&[String]>)
+    -> Result<()> {
+    let state: PasskeyAuthentication = serde_json::from_str(state).map_err(|_|DENIED)?;
+    let response: PublicKeyCredential = serde_json::from_value(credential).map_err(|_|DENIED)?;
+    let result = rp.finish_passkey_authentication(&response,&state).map_err(|_|DENIED)?;
+    if !result.user_verified() { return Err(DENIED.to_string()); }
+    // Compare with the live row, not the snapshot captured by begin.
+    let mut key = keys(tx,user)?.into_iter().find(|k|k.cred_id()==result.cred_id()).ok_or(DENIED)?;
+    if let Some(allowed) = allowed {
+        if !allowed.contains(&credential_id(&key)?) { return Err(DENIED.into()); }
+    }
+    if !counter_valid(counter(&key),result.counter()) { return Err(DENIED.into()); }
+    key.update_credential(&result).ok_or(DENIED)?;
+    tx.execute("UPDATE mfa_passkeys SET credential=?2 WHERE id=?1 AND user_id=?3",
+        params![credential_id(&key)?,serde_json::to_string(&key).map_err(|_|DENIED)?,user]).map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+/// F6d restore proof: an assertion challenge bound to `user` and `purpose`
+/// (`restore:<employee_id>:<incarnation>`): the ceremony row carries the
+/// purpose and binding = hash(purpose), no session, the operator-configured
+/// origin and the credential epoch; [`TTL`] seconds; a new one for the same
+/// purpose replaces the old. Returns the WebAuthn request options with
+/// `challenge_id`. Only the credentials whose `mfa_passkeys.id` is in
+/// `allowed` (the tombstone's, F6fa) are offered and accepted; none ⇒ refused.
+pub(super) fn purpose_begin(tx: &Connection, origin: &str, user: &str, purpose: &str, allowed: &[String], now: i64) -> Result<Value> {
+    let rp = relying_party(origin)?;
+    let keys: Vec<Passkey> = keys(tx,user)?.into_iter()
+        .filter(|key| credential_id(key).is_ok_and(|id| allowed.contains(&id))).collect();
+    if keys.is_empty() { return Err(DENIED.into()); }
+    let (challenge,state) = rp.start_passkey_authentication(&keys).map_err(|_|DENIED)?;
+    let id = save_ceremony(tx,user,purpose,purpose,None,origin,"",serde_json::to_string(&state).map_err(|_|DENIED)?,now)?;
+    let mut response = serde_json::to_value(challenge).map_err(|_|DENIED)?;
+    response["challenge_id"] = json!(id);
+    Ok(response)
+}
+
+/// Consume the `purpose` ceremony `id` of `user` (single use: deleted before
+/// the assertion is checked, so a failed proof cannot be retried) and verify
+/// the assertion with [`verify_assertion`]. A ceremony of another purpose,
+/// user, origin or epoch, or an expired one, is never found; a credential
+/// outside `allowed` is refused.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn purpose_finish(tx: &Connection, origin: &str, user: &str, purpose: &str, id: &str, credential: Value,
+    allowed: &[String], now: i64) -> Result<()> {
+    let rp = relying_party(origin)?;
+    // Another account's attempt must not consume the owner's ceremony.
+    let owner: Option<String> = tx.query_row("SELECT user_id FROM mfa_passkey_ceremonies WHERE token_hash=?1 AND purpose=?2",
+        params![token_hash(id),purpose], |r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    if owner.as_deref() != Some(user) { return Err(DENIED.into()); }
+    let ceremony = take_ceremony(tx,id,purpose,purpose,None,origin,now)?;
+    if ceremony.user != user { return Err(DENIED.into()); }
+    verify_assertion(tx,&rp,user,&ceremony.state,credential,Some(allowed))
+}
+
 impl UserDb {
     pub fn mfa_passkeys(&self, user: &str) -> Result<Vec<Value>> {
         let conn = self.conn();
@@ -129,6 +190,7 @@ impl UserDb {
         let rp = relying_party(origin)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let since = crate::credential_changes::high_water(&tx)?;
         let ceremony = take_ceremony(&tx,id,"register",token,session,origin,now)?;
         let verified = (|| {
             authorize_registration(&tx,&ceremony.user,token,session,now,exempt)?;
@@ -158,6 +220,7 @@ impl UserDb {
         tx.execute("DELETE FROM mfa_passkey_ceremonies WHERE user_id=?1", [&ceremony.user]).map_err(|e|e.to_string())?;
         bump_epoch(&tx,&ceremony.user)?;
         audit(&tx,&ceremony.user,"mfa.passkey_added",None)?;
+        stamp_self(&tx,since,&ceremony.user)?;
         let result = issue_mfa_result(&tx,&ceremony.user,codes,issue)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(result)
@@ -186,24 +249,11 @@ impl UserDb {
         let ceremony = take_ceremony(&tx,id,"login",token,None,origin,now)?;
         if ceremony.user != user { return Err(DENIED.into()); }
         tx.execute("UPDATE mfa_challenges SET attempts=attempts+1 WHERE token_hash=?1", [token_hash(token)]).map_err(|e|e.to_string())?;
-        let verified = (|| {
-            let state: PasskeyAuthentication = serde_json::from_str(&ceremony.state).map_err(|_|DENIED)?;
-            let response: PublicKeyCredential = serde_json::from_value(credential).map_err(|_|DENIED)?;
-            let result = rp.finish_passkey_authentication(&response,&state).map_err(|_|DENIED)?;
-            if !result.user_verified() { return Err(DENIED.to_string()); }
-            // Compare with the live row, not the snapshot captured by begin.
-            let mut key = keys(&tx,&user)?.into_iter().find(|k|k.cred_id()==result.cred_id()).ok_or(DENIED)?;
-            if !counter_valid(counter(&key),result.counter()) { return Err(DENIED.into()); }
-            key.update_credential(&result).ok_or(DENIED)?;
-            Ok(key)
-        })();
-        let key = match verified { Ok(key)=>key, Err(error)=>{
+        if let Err(error) = verify_assertion(&tx,&rp,&user,&ceremony.state,credential,None) {
             audit(&tx,&user,"mfa.verification_failed",None)?;
             tx.commit().map_err(|e|e.to_string())?;
             return Err(error);
-        }};
-        tx.execute("UPDATE mfa_passkeys SET credential=?2 WHERE id=?1 AND user_id=?3",
-            params![credential_id(&key)?,serde_json::to_string(&key).map_err(|_|DENIED)?,user]).map_err(|e|e.to_string())?;
+        }
         tx.execute("UPDATE mfa_challenges SET consumed=1 WHERE token_hash=?1", [token_hash(token)]).map_err(|e|e.to_string())?;
         tx.execute("INSERT INTO mfa_factor_preferences(user_id,last_used) VALUES(?1,'passkey') ON CONFLICT(user_id) DO UPDATE SET last_used='passkey'", [&user]).map_err(|e|e.to_string())?;
         audit(&tx,&user,"mfa.passkey_login",None)?;
@@ -217,6 +267,7 @@ impl UserDb {
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>) -> Result<T> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let since = crate::credential_changes::high_water(&tx)?;
         active_user(&tx,user)?;
         check_reauth(&tx,user,reauth,session,now)?;
         let count: i64 = tx.query_row("SELECT count(*) FROM mfa_passkeys WHERE user_id=?1 AND id=?2",params![user,id],|r|r.get(0)).map_err(|e|e.to_string())?;
@@ -228,6 +279,7 @@ impl UserDb {
         if !any_factor(&tx,user)? { tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id=?1",[user]).map_err(|e|e.to_string())?; }
         bump_epoch(&tx,user)?;
         audit(&tx,user,"mfa.passkey_removed",None)?;
+        stamp_self(&tx,since,user)?;
         let result = issue_mfa_result(&tx,user,Vec::new(),issue)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(result)
@@ -288,7 +340,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod ceremony_tests {
+pub(crate) mod ceremony_tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
@@ -302,14 +354,16 @@ mod ceremony_tests {
         encoded.extend_from_slice(value);
         encoded
     }
-    const ORIGIN: &str = "https://dashboard.example.com";
-    struct Authenticator { key: EcdsaKeyPair, id: Vec<u8> }
+    pub(crate) const ORIGIN: &str = "https://dashboard.example.com";
+    pub(crate) struct Authenticator { key: EcdsaKeyPair, id: Vec<u8> }
     impl Authenticator {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let rng=SystemRandom::new();
             let document=EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING,&rng).unwrap();
             Self {key:EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING,document.as_ref(),&rng).unwrap(),id:vec![42;32]}
         }
+        /// A second authenticator with its own credential id (`byte` ≠ 42).
+        pub(crate) fn with_id(byte: u8) -> Self { let mut key=Self::new(); key.id=vec![byte;32]; key }
         fn data(&self, counter:u32, flags:u8)->Vec<u8> {
             let mut value=ring::digest::digest(&ring::digest::SHA256,b"dashboard.example.com").as_ref().to_vec();
             value.push(flags);value.extend_from_slice(&counter.to_be_bytes());value
@@ -317,7 +371,7 @@ mod ceremony_tests {
         fn client(challenge:&Value,kind:&str)->Vec<u8> {
             serde_json::to_vec(&json!({"type":kind,"challenge":challenge["publicKey"]["challenge"],"origin":ORIGIN,"crossOrigin":false})).unwrap()
         }
-        fn registration(&self,challenge:&Value)->Value {
+        pub(crate) fn registration(&self,challenge:&Value)->Value {
             let mut data=self.data(0,0x45);
             data.extend_from_slice(&[0;16]);data.extend_from_slice(&(self.id.len() as u16).to_be_bytes());data.extend_from_slice(&self.id);
             let public=self.key.public_key().as_ref();
@@ -329,7 +383,7 @@ mod ceremony_tests {
             json!({"id":URL_SAFE_NO_PAD.encode(&self.id),"rawId":URL_SAFE_NO_PAD.encode(&self.id),"type":"public-key","extensions":{},
                 "response":{"attestationObject":URL_SAFE_NO_PAD.encode(attestation),"clientDataJSON":URL_SAFE_NO_PAD.encode(Self::client(challenge,"webauthn.create")),"transports":["internal"]}})
         }
-        fn assertion(&self,challenge:&Value,counter:u32,verified:bool)->Value {
+        pub(crate) fn assertion(&self,challenge:&Value,counter:u32,verified:bool)->Value {
             let data=self.data(counter,if verified {0x05}else{0x01});
             let client=Self::client(challenge,"webauthn.get");
             let mut signed=data.clone();signed.extend_from_slice(ring::digest::digest(&ring::digest::SHA256,&client).as_ref());
@@ -338,6 +392,19 @@ mod ceremony_tests {
                 "response":{"authenticatorData":URL_SAFE_NO_PAD.encode(data),"clientDataJSON":URL_SAFE_NO_PAD.encode(client),"signature":URL_SAFE_NO_PAD.encode(signature.as_ref()),"userHandle":null}})
         }
     }
+    /// Register one passkey for `user` (password `password`) through the
+    /// real API at `now`; returns the authenticator that holds its key.
+    pub(crate) fn register(db: &UserDb, user: &str, password: &str, now: i64) -> Authenticator {
+        register_key(db, user, password, now, Authenticator::new())
+    }
+    /// [`register`] with a given authenticator (e.g. [`Authenticator::with_id`]).
+    pub(crate) fn register_key(db: &UserDb, user: &str, password: &str, now: i64, key: Authenticator) -> Authenticator {
+        let token=db.mfa_factor_password_challenge(user,password,"session",now).unwrap();
+        let start=db.mfa_passkey_register_begin(user,&token,Some("session"),ORIGIN,"Laptop",now,false).unwrap();
+        db.mfa_passkey_register_finish(start["ceremony_id"].as_str().unwrap(),&token,Some("session"),ORIGIN,key.registration(&start),now,false,|_,_,_|Ok(())).unwrap();
+        key
+    }
+
     #[test]
     fn passkey_signed_ceremony_uv_replay_counter_and_revocation() {
         let dir=tempfile::tempdir().unwrap();
