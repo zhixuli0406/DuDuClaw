@@ -11,64 +11,49 @@ use duduclaw_db::{
     DbError, DbSource, DbSourceConfig, Driver, Filter, FilterOp, SelectRequest,
 };
 use serde_json::json;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 
 /// Create the fixture database and return its path.
+///
+/// Built with a read-write rusqlite connection (sqlx no longer carries a
+/// SQLite driver — RUSTSEC-2026-0459); the source under test then opens it
+/// read-only.
 async fn fixture(dir: &Path) -> String {
     let path = dir.join("demo.sqlite");
-    let opts = SqliteConnectOptions::new()
-        .filename(&path)
-        .create_if_missing(true);
-    let pool = SqlitePool::connect_with(opts).await.expect("create db");
+    let conn = rusqlite::Connection::open(&path).expect("create db");
 
-    sqlx::query(
+    conn.execute_batch(
         "CREATE TABLE customers (\
             id INTEGER PRIMARY KEY, \
             name TEXT, \
             email TEXT, \
             phone TEXT, \
             balance REAL, \
-            photo BLOB)",
+            photo BLOB);\n\
+         CREATE TABLE secrets (id INTEGER PRIMARY KEY, token TEXT);",
     )
-    .execute(&pool)
-    .await
     .unwrap();
-    // A second table deliberately left OUT of allowed_tables.
-    sqlx::query("CREATE TABLE secrets (id INTEGER PRIMARY KEY, token TEXT)")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // `secrets` is deliberately left OUT of allowed_tables.
 
     for (id, name, email, phone, balance) in [
-        (1, "王小明", "ming@example.com", "0912-345-678", 12.5_f64),
+        (1_i64, "王小明", "ming@example.com", "0912-345-678", 12.5_f64),
         (2, "Amy Chen", "amy@example.com", "0922-111-222", 0.0),
         (3, "Bob Lin", "bob@example.com", "0933-999-888", -7.25),
     ] {
-        sqlx::query(
+        conn.execute(
             "INSERT INTO customers (id, name, email, phone, balance, photo) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, name, email, phone, balance, b"\x01\x02".to_vec()],
         )
-        .bind(id)
-        .bind(name)
-        .bind(email)
-        .bind(phone)
-        .bind(balance)
-        .bind(b"\x01\x02".to_vec())
-        .execute(&pool)
-        .await
         .unwrap();
     }
     // One row with NULLs to exercise the null mapping.
-    sqlx::query("INSERT INTO customers (id, name) VALUES (4, 'Null Person')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO secrets (id, token) VALUES (1, 'super-secret')")
-        .execute(&pool)
-        .await
-        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO customers (id, name) VALUES (4, 'Null Person');\n\
+         INSERT INTO secrets (id, token) VALUES (1, 'super-secret');",
+    )
+    .unwrap();
 
-    pool.close().await;
+    drop(conn);
     path.to_string_lossy().to_string()
 }
 

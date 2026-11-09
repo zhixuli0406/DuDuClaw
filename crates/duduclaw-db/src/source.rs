@@ -2,15 +2,15 @@
 //! read-only query.
 
 use std::collections::{BTreeMap, HashSet};
-use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
+use rusqlite::OpenFlags;
 use sqlx::{Executor, Row};
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 
 use crate::value::{JsonRow, mysql_row_to_json, pg_row_to_json, sqlite_row_to_json};
 use crate::{
@@ -48,7 +48,64 @@ pub(crate) struct BuiltSelect {
 enum Pool {
     Postgres(PgPool),
     MySql(MySqlPool),
-    Sqlite(SqlitePool),
+    Sqlite(Arc<SqliteEngine>),
+}
+
+/// Failure inside one driver call, before it is turned into a [`DbError`].
+///
+/// The SQLite arm carries pre-rendered text (in sqlx's
+/// `error returned from database: (code: N) message` shape, so operators see
+/// the same wording as before the move to rusqlite) plus whether the statement
+/// was stopped by the deadline.
+#[derive(Debug)]
+pub(crate) enum EngineError {
+    Sqlx(sqlx::Error),
+    Sqlite(String),
+    /// The SQLite progress handler stopped a statement at `timeout_ms`.
+    SqliteInterrupted(String),
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineError::Sqlx(e) => std::fmt::Display::fmt(e, f),
+            EngineError::Sqlite(m) | EngineError::SqliteInterrupted(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<sqlx::Error> for EngineError {
+    fn from(e: sqlx::Error) -> Self {
+        EngineError::Sqlx(e)
+    }
+}
+
+impl From<rusqlite::Error> for EngineError {
+    fn from(e: rusqlite::Error) -> Self {
+        let text = sqlite_error_text(&e);
+        if e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
+            EngineError::SqliteInterrupted(text)
+        } else {
+            EngineError::Sqlite(text)
+        }
+    }
+}
+
+/// rusqlite error → the text sqlx used to produce for the same failure.
+fn sqlite_error_text(e: &rusqlite::Error) -> String {
+    match e.sqlite_error() {
+        Some(ffi) => {
+            let message = match e {
+                rusqlite::Error::SqliteFailure(_, Some(m)) => m.clone(),
+                other => other.to_string(),
+            };
+            format!(
+                "error returned from database: (code: {}) {message}",
+                ffi.extended_code
+            )
+        }
+        None => e.to_string(),
+    }
 }
 
 /// A live, read-only handle on one configured data source.
@@ -56,6 +113,14 @@ pub type IoAuthority = Arc<dyn Fn() -> bool + Send + Sync>;
 
 fn check_io(authority: &IoAuthority) -> Result<(), sqlx::Error> {
     if authority() { Ok(()) } else { Err(sqlx::Error::Protocol("database authority revoked".into())) }
+}
+
+/// Allowlist test shared by [`DbSource::table_allowed`] and the SQLite
+/// blocking worker (which cannot borrow the `DbSource`). In exact mode the
+/// name must match an allowed entry byte for byte.
+fn table_allowed_in(cfg: &DbSourceConfig, exact: bool, table: &str) -> bool {
+    if exact { cfg.allowed_tables.iter().any(|name| name == table) }
+    else { cfg.table_allowed(table) }
 }
 
 pub struct DbSource {
@@ -81,9 +146,10 @@ fn wildcard_warned() -> &'static Mutex<HashSet<String>> {
 impl DbSource {
     /// Open a pool for `cfg`.
     ///
-    /// SQLite is opened with a read-only file handle. PostgreSQL and MySQL
-    /// get their read-only guarantee per statement instead, from the explicit
-    /// `READ ONLY` transaction [`DbSource::fetch`] opens.
+    /// SQLite is opened with a read-only file handle (rusqlite, see
+    /// [`SqliteEngine`]). PostgreSQL and MySQL get their read-only guarantee
+    /// per statement instead, from the explicit `READ ONLY` transaction
+    /// [`DbSource::fetch`] opens.
     ///
     /// A pool-level `after_connect` hook setting the *session* default
     /// transaction characteristics was tried and removed: sqlx 0.8's
@@ -120,7 +186,7 @@ impl DbSource {
                     .acquire_timeout(acquire)
                     .connect(&cfg.url)
                     .await
-                    .map_err(|e| connect_err(&e, &cfg))?;
+                    .map_err(|e| connect_err(&e.to_string(), &cfg))?;
                 Pool::Postgres(p)
             }
             Driver::Mysql => {
@@ -129,18 +195,19 @@ impl DbSource {
                     .acquire_timeout(acquire)
                     .connect(&cfg.url)
                     .await
-                    .map_err(|e| connect_err(&e, &cfg))?;
+                    .map_err(|e| connect_err(&e.to_string(), &cfg))?;
                 Pool::MySql(p)
             }
             Driver::Sqlite => {
                 let opts = sqlite_options(&cfg.url)?;
-                let p = SqlitePoolOptions::new()
-                    .max_connections(POOL_MAX_CONNECTIONS)
-                    .acquire_timeout(acquire)
-                    .connect_with(opts)
+                let engine = Arc::new(SqliteEngine::new(opts, acquire));
+                // Like sqlx's `connect_with`, open one connection eagerly so a
+                // missing / unreadable file fails here, not on first use.
+                engine
+                    .warm_up()
                     .await
-                    .map_err(|e| connect_err(&e, &cfg))?;
-                Pool::Sqlite(p)
+                    .map_err(|e| connect_err(&e.to_string(), &cfg))?;
+                Pool::Sqlite(engine)
             }
         };
         check_io(&authority).map_err(|_| DbError::Config("database authority revoked".into()))?;
@@ -151,10 +218,7 @@ impl DbSource {
     /// PostgreSQL can contain distinct quoted tables `customers`/`CUSTOMERS`.
     pub fn with_exact_table_names(mut self) -> Self { self.exact_table_names=true;self }
 
-    fn table_allowed(&self,table:&str)->bool {
-        if self.exact_table_names { self.cfg.allowed_tables.iter().any(|name|name==table) }
-        else { self.cfg.table_allowed(table) }
-    }
+    fn table_allowed(&self,table:&str)->bool { table_allowed_in(&self.cfg,self.exact_table_names,table) }
 
     pub fn config(&self) -> &DbSourceConfig {
         &self.cfg
@@ -162,8 +226,12 @@ impl DbSource {
 
     /// Cheapest possible liveness probe — used by `db_sources.test`.
     pub async fn ping(&self) -> Result<(), DbError> {
-        self.run(self.fetch("SELECT 1", &[], 1)).await?
-            .map(|_| ()).map_err(|e| DbError::Query(self.scrub(&e.to_string())))
+        // Routed through `fetch` so the probe gets the same live-authority
+        // checks (before/after acquire, before the statement) as any query.
+        self.run(self.fetch("SELECT 1", &[], 1))
+            .await?
+            .map(|_| ())
+            .map_err(|e| self.engine_err(e))
     }
 
     /// Tables (and views) in the default schema, filtered by `allowed_tables`.
@@ -171,11 +239,11 @@ impl DbSource {
         let tables = self
             .run(self.list_tables_inner())
             .await?
-            .map_err(|e| DbError::Query(self.scrub(&e.to_string())))?;
+            .map_err(|e| self.engine_err(e))?;
         Ok(tables)
     }
 
-    async fn list_tables_inner(&self) -> Result<Vec<TableInfo>, sqlx::Error> {
+    async fn list_tables_inner(&self) -> Result<Vec<TableInfo>, EngineError> {
         let (schema_sql, table_names) = schema_query_scoped(&self.cfg,self.exact_table_names);
         check_io(&self.authority)?;
         match &self.pool {
@@ -211,39 +279,14 @@ impl DbSource {
                 }
                 Ok(self.group_schema_rows(triples.into_iter()))
             }
-            Pool::Sqlite(p) => {
-                // SQLite has no information_schema. Names come from
-                // sqlite_master; columns from the pragma table-valued
-                // function, queried only for tables the allowlist admits.
-                let mut connection = p.acquire().await?;
-                check_io(&self.authority)?;
-                let mut query = sqlx::query(&schema_sql);
-                for table in &table_names { query = query.bind(table); }
-                let rows = query.fetch_all(&mut *connection).await?;
-                let mut out = Vec::new();
-                for row in rows {
-                    let name = sqlite_schema_text(&row, "name")?;
-                    if name.is_empty() || !self.table_allowed(&name) {
-                        continue;
-                    }
-                    if out.len() >= MAX_TABLES {
-                        break;
-                    }
-                    check_io(&self.authority)?;
-                    let cols = sqlx::query("SELECT name, type FROM pragma_table_info(?)")
-                        .bind(name.clone())
-                        .fetch_all(&mut *connection)
-                        .await?;
-                    let mut columns = Vec::with_capacity(cols.len());
-                    for c in &cols {
-                        columns.push(ColumnInfo {
-                            name: sqlite_schema_text(c, "name")?,
-                            data_type: sqlite_schema_text(c, "type")?,
-                        });
-                    }
-                    out.push(TableInfo { name, columns });
-                }
-                Ok(out)
+            Pool::Sqlite(e) => {
+                let cfg = self.cfg.clone();
+                let exact = self.exact_table_names;
+                let authority = Arc::clone(&self.authority);
+                e.with_conn(move |conn| {
+                    sqlite_list_tables(conn, &cfg, exact, &schema_sql, &table_names, &authority)
+                })
+                .await
             }
         }
     }
@@ -279,7 +322,7 @@ impl DbSource {
         let built = build_select(&self.cfg, req, cap)?;
         self.run(self.fetch(&built.sql, &built.binds, cap))
             .await?
-            .map_err(|e| DbError::Query(self.scrub(&e.to_string())))
+            .map_err(|e| self.engine_err(e))
     }
 
     /// Free-form read-only SQL.
@@ -300,7 +343,7 @@ impl DbSource {
         let cap = self.effective_limit(limit);
         self.run(self.fetch(sql, &[], cap))
             .await?
-            .map_err(|e| DbError::Query(self.scrub(&e.to_string())))
+            .map_err(|e| self.engine_err(e))
     }
 
     /// Close the underlying pool. Idempotent.
@@ -308,7 +351,18 @@ impl DbSource {
         match &self.pool {
             Pool::Postgres(p) => p.close().await,
             Pool::MySql(p) => p.close().await,
-            Pool::Sqlite(p) => p.close().await,
+            Pool::Sqlite(e) => e.close(),
+        }
+    }
+
+    /// Driver failure → [`DbError`]. A SQLite statement stopped by the
+    /// progress-handler deadline is the same event as the `run` deadline
+    /// firing, so it gets the same [`DbError::Timeout`] shape whichever of the
+    /// two wins the race.
+    fn engine_err(&self, e: EngineError) -> DbError {
+        match e {
+            EngineError::SqliteInterrupted(_) => DbError::Timeout(self.cfg.timeout_ms),
+            other => DbError::Query(self.scrub(&other.to_string())),
         }
     }
 
@@ -341,11 +395,11 @@ impl DbSource {
         sql: &str,
         binds: &[Bind],
         cap: usize,
-    ) -> Result<QueryResult, sqlx::Error> {
+    ) -> Result<QueryResult, EngineError> {
         match &self.pool {
-            Pool::Postgres(pool) => pg_fetch(pool, sql, binds, cap, &self.authority).await,
-            Pool::MySql(pool) => mysql_fetch(pool, sql, binds, cap, &self.authority).await,
-            Pool::Sqlite(pool) => sqlite_fetch(pool, sql, binds, cap, &self.authority).await,
+            Pool::Postgres(pool) => Ok(pg_fetch(pool, sql, binds, cap, &self.authority).await?),
+            Pool::MySql(pool) => Ok(mysql_fetch(pool, sql, binds, cap, &self.authority).await?),
+            Pool::Sqlite(engine) => engine.fetch(sql, binds, cap, &self.authority).await,
         }
     }
 }
@@ -379,7 +433,26 @@ macro_rules! schema_text_fn {
 
 schema_text_fn!(pg_schema_text, PgRow);
 schema_text_fn!(mysql_schema_text, MySqlRow);
-schema_text_fn!(sqlite_schema_text, SqliteRow);
+
+/// SQLite twin of the above: text first, bytes second, and a value that is
+/// neither is an error rather than an empty string. NULL reads as `""`, which
+/// is what sqlx's `String` decode of a NULL SQLite value produced.
+fn sqlite_schema_text(
+    row: &rusqlite::Row<'_>,
+    idx: usize,
+    column: &str,
+) -> rusqlite::Result<String> {
+    use rusqlite::types::ValueRef as V;
+    match row.get_ref(idx)? {
+        V::Text(b) | V::Blob(b) => Ok(String::from_utf8_lossy(b).into_owned()),
+        V::Null => Ok(String::new()),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            idx,
+            column.to_string(),
+            other.data_type(),
+        )),
+    }
+}
 
 // ── Per-driver fetch ────────────────────────────────────────────────────────
 //
@@ -454,25 +527,250 @@ async fn mysql_fetch(
     out
 }
 
-/// SQLite needs no transaction: the read-only file handle opened in
-/// [`sqlite_options`] means a write cannot reach the file at all.
-async fn sqlite_fetch(
-    pool: &SqlitePool,
+// ── SQLite engine (rusqlite) ────────────────────────────────────────────────
+//
+// sqlx's SQLite driver was dropped (RUSTSEC-2026-0459: it pins a
+// libsqlite3-sys whose bundled SQLite is vulnerable, and only one crate in the
+// graph may link `sqlite3`). This is the smallest replacement that keeps the
+// sqlx pool's observable behaviour:
+//
+// * at most `POOL_MAX_CONNECTIONS` connections in use at once, waited for up
+//   to the acquire timeout (`timeout_ms`), idle ones reused;
+// * every connection opened `READ_ONLY | NO_MUTEX | URI`, never created, with
+//   sqlx's default `busy_timeout` (5 s) and `foreign_keys = ON`;
+// * one eager connection at `connect`, so a bad path fails there;
+// * after `close`, every call fails and no connection is kept.
+//
+// rusqlite is blocking, so each call runs on `spawn_blocking`. A runaway
+// statement is stopped by a progress handler at the source's deadline — the
+// blocking thread cannot be cancelled by dropping the future the way sqlx's
+// worker channel could.
+
+/// sqlx's default `SqliteConnectOptions::busy_timeout`.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many SQLite VM instructions run between deadline checks. Small enough
+/// that the interrupt lands within a few milliseconds of the deadline.
+const SQLITE_PROGRESS_OPS: i32 = 1_000;
+
+/// Parsed SQLite connection target (what `SqliteConnectOptions` held).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SqliteOptions {
+    /// Filename handed to `sqlite3_open_v2` — a plain path, `:memory:`, or a
+    /// `file:` URI when a URI-only parameter (`immutable`, `vfs`) is set.
+    target: String,
+    flags: OpenFlags,
+}
+
+pub(crate) struct SqliteEngine {
+    opts: SqliteOptions,
+    /// Acquire timeout *and* per-statement deadline (both are `timeout_ms`).
+    timeout: Duration,
+    slots: Arc<tokio::sync::Semaphore>,
+    idle: Mutex<Vec<rusqlite::Connection>>,
+    closed: AtomicBool,
+}
+
+impl SqliteEngine {
+    fn new(opts: SqliteOptions, timeout: Duration) -> Self {
+        SqliteEngine {
+            opts,
+            timeout,
+            slots: Arc::new(tokio::sync::Semaphore::new(POOL_MAX_CONNECTIONS as usize)),
+            idle: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn open(&self) -> rusqlite::Result<rusqlite::Connection> {
+        let conn = rusqlite::Connection::open_with_flags(&self.opts.target, self.opts.flags)?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        Ok(conn)
+    }
+
+    fn take_idle(&self) -> Option<rusqlite::Connection> {
+        self.idle.lock().ok().and_then(|mut v| v.pop())
+    }
+
+    fn put_idle(&self, conn: rusqlite::Connection) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut v) = self.idle.lock() {
+            v.push(conn);
+        }
+    }
+
+    /// Open the first connection (see `DbSource::connect`).
+    async fn warm_up(self: &Arc<Self>) -> Result<(), EngineError> {
+        self.with_conn(|_| Ok(())).await
+    }
+
+    /// Run `f` on a pooled connection on the blocking pool, with the
+    /// statement deadline armed.
+    async fn with_conn<T, F>(self: &Arc<Self>, f: F) -> Result<T, EngineError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T, EngineError> + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(EngineError::Sqlite(
+                "attempted to acquire a connection on a closed pool".into(),
+            ));
+        }
+        let permit = match tokio::time::timeout(
+            self.timeout,
+            Arc::clone(&self.slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => {
+                return Err(EngineError::Sqlite(
+                    "attempted to acquire a connection on a closed pool".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(EngineError::Sqlite(
+                    "pool timed out while waiting for an open connection".into(),
+                ));
+            }
+        };
+        let engine = Arc::clone(self);
+        let joined = tokio::task::spawn_blocking(move || -> Result<T, EngineError> {
+            // Held for the whole blocking call: a statement that outlived the
+            // caller's deadline keeps its slot until it is interrupted.
+            let _permit = permit;
+            let mut conn = match engine.take_idle() {
+                Some(c) => c,
+                None => engine.open()?,
+            };
+            let deadline = Instant::now() + engine.timeout;
+            conn.progress_handler(
+                SQLITE_PROGRESS_OPS,
+                Some(move || Instant::now() >= deadline),
+            );
+            let out = f(&conn);
+            conn.progress_handler(0, None::<fn() -> bool>);
+            engine.put_idle(conn);
+            out
+        })
+        .await;
+        match joined {
+            Ok(r) => r,
+            Err(e) => Err(EngineError::Sqlite(format!("SQLite worker failed: {e}"))),
+        }
+    }
+
+    /// SQLite needs no transaction: the read-only file handle opened in
+    /// [`SqliteEngine::open`] means a write cannot reach the file at all.
+    ///
+    /// Live authority is checked before waiting for a slot, again once the
+    /// connection is in hand, and once more right before the statement runs
+    /// (the same three points the sqlx path checked).
+    async fn fetch(
+        self: &Arc<Self>,
+        sql: &str,
+        binds: &[Bind],
+        cap: usize,
+        authority: &IoAuthority,
+    ) -> Result<QueryResult, EngineError> {
+        check_io(authority)?;
+        let sql = sql.to_string();
+        let binds = binds.to_vec();
+        let authority = Arc::clone(authority);
+        self.with_conn(move |conn| {
+            check_io(&authority)?;
+            sqlite_fetch_blocking(conn, &sql, &binds, cap, &authority)
+        })
+        .await
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.slots.close();
+        if let Ok(mut v) = self.idle.lock() {
+            v.clear();
+        }
+    }
+}
+
+/// Step at most `cap + 1` rows (see [`collect_rows`] for the contract).
+fn sqlite_fetch_blocking(
+    conn: &rusqlite::Connection,
     sql: &str,
     binds: &[Bind],
     cap: usize,
     authority: &IoAuthority,
-) -> Result<QueryResult, sqlx::Error> {
+) -> Result<QueryResult, EngineError> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let names: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let params: Vec<rusqlite::types::Value> = binds.iter().map(bind_sqlite).collect();
     check_io(authority)?;
-    let mut conn = pool.acquire().await?;
-    check_io(authority)?;
-    let c: &mut sqlx::sqlite::SqliteConnection = &mut conn;
-    let mut q = sqlx::query(sql);
-    for b in binds {
-        q = bind_sqlite(q, b);
+    let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+    let mut out: Vec<JsonRow> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        if out.len() >= cap {
+            truncated = true;
+            break;
+        }
+        out.push(sqlite_row_to_json(row, &names));
     }
+    Ok(QueryResult {
+        row_count: out.len(),
+        rows: out,
+        truncated,
+    })
+}
+
+/// SQLite has no information_schema. Names come from sqlite_master (already
+/// narrowed at the database by the scoped `schema_sql` / bound `table_names`
+/// from [`schema_query_scoped`]); columns from the pragma table-valued
+/// function, queried only for tables the allowlist admits.
+fn sqlite_list_tables(
+    conn: &rusqlite::Connection,
+    cfg: &DbSourceConfig,
+    exact: bool,
+    schema_sql: &str,
+    table_names: &[String],
+    authority: &IoAuthority,
+) -> Result<Vec<TableInfo>, EngineError> {
     check_io(authority)?;
-    collect_rows(q.fetch(c), cap, |r: SqliteRow| sqlite_row_to_json(&r)).await
+    let mut names = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(schema_sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(table_names.iter()))?;
+        while let Some(row) = rows.next()? {
+            names.push(sqlite_schema_text(row, 0, "name")?);
+        }
+    }
+    let mut out = Vec::new();
+    let mut cols_stmt = conn.prepare_cached("SELECT name, type FROM pragma_table_info(?)")?;
+    for name in names {
+        if name.is_empty() || !table_allowed_in(cfg, exact, &name) {
+            continue;
+        }
+        if out.len() >= MAX_TABLES {
+            break;
+        }
+        check_io(authority)?;
+        let mut columns = Vec::new();
+        let mut rows = cols_stmt.query([name.clone()])?;
+        while let Some(c) = rows.next()? {
+            columns.push(ColumnInfo {
+                name: sqlite_schema_text(c, 0, "name")?,
+                data_type: sqlite_schema_text(c, 1, "type")?,
+            });
+        }
+        out.push(TableInfo { name, columns });
+    }
+    Ok(out)
 }
 
 // ── Row collection ──────────────────────────────────────────────────────────
@@ -509,7 +807,6 @@ where
 
 type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
 type MySqlQuery<'q> = sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>;
-type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
 
 fn bind_pg<'q>(q: PgQuery<'q>, b: &Bind) -> PgQuery<'q> {
     match b {
@@ -529,12 +826,14 @@ fn bind_mysql<'q>(q: MySqlQuery<'q>, b: &Bind) -> MySqlQuery<'q> {
     }
 }
 
-fn bind_sqlite<'q>(q: SqliteQuery<'q>, b: &Bind) -> SqliteQuery<'q> {
+/// sqlx bound a SQLite `bool` as the integer 0 / 1; so does this.
+fn bind_sqlite(b: &Bind) -> rusqlite::types::Value {
+    use rusqlite::types::Value as V;
     match b {
-        Bind::Str(s) => q.bind(s.clone()),
-        Bind::Int(i) => q.bind(*i),
-        Bind::Float(f) => q.bind(*f),
-        Bind::Bool(v) => q.bind(*v),
+        Bind::Str(s) => V::Text(s.clone()),
+        Bind::Int(i) => V::Integer(*i),
+        Bind::Float(f) => V::Real(*f),
+        Bind::Bool(v) => V::Integer(i64::from(*v)),
     }
 }
 
@@ -754,18 +1053,185 @@ fn json_to_bind(column: &str, v: &serde_json::Value) -> Result<Bind, DbError> {
 
 // ── SQLite connect options ──────────────────────────────────────────────────
 
-fn sqlite_options(url: &str) -> Result<SqliteConnectOptions, DbError> {
+/// Parse a SQLite source `url` the way sqlx's `SqliteConnectOptions` did,
+/// then force read-only / never-create.
+///
+/// * A bare value is a filesystem path, used verbatim.
+/// * `sqlite:` / `sqlite://` URLs: the path part is percent-decoded,
+///   `:memory:` is an in-memory database, and the query parameters `mode`
+///   (`ro` / `rw` / `rwc` / `memory`), `cache` (`private` / `shared`),
+///   `immutable` (`true` / `1` / `false` / `0`) and `vfs` are honoured;
+///   anything else is refused. `mode=rw` / `rwc` parse but cannot lift the
+///   read-only flag.
+/// * `immutable` / `vfs` are URI-only, so they turn the target into a
+///   `file:<encoded path>?…` URI (the connection is always opened with
+///   `SQLITE_OPEN_URI`, as sqlx did).
+fn sqlite_options(url: &str) -> Result<SqliteOptions, DbError> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err(DbError::Config("SQLite 資料來源缺少檔案路徑".into()));
     }
-    let opts = if trimmed.starts_with("sqlite:") {
-        SqliteConnectOptions::from_str(trimmed)
-            .map_err(|e| DbError::Config(format!("SQLite 連線字串無效：{e}")))?
+    let base_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_URI;
+    if !trimmed.starts_with("sqlite:") {
+        return Ok(SqliteOptions {
+            target: trimmed.to_string(),
+            flags: base_flags | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+        });
+    }
+
+    let invalid =
+        |m: String| DbError::Config(format!("SQLite 連線字串無效：error with configuration: {m}"));
+
+    let rest = trimmed
+        .trim_start_matches("sqlite://")
+        .trim_start_matches("sqlite:");
+    let mut parts = rest.splitn(2, '?');
+    let database = parts.next().unwrap_or_default();
+    let params = parts.next();
+
+    let mut in_memory = false;
+    let mut shared_cache = false;
+    let mut immutable = false;
+    let mut vfs: Option<String> = None;
+    let mut path = String::new();
+    if database == ":memory:" {
+        in_memory = true;
+        shared_cache = true;
     } else {
-        SqliteConnectOptions::new().filename(trimmed)
+        path = percent_decode(database, false).map_err(invalid)?;
+    }
+
+    if let Some(params) = params {
+        for pair in params.split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = percent_decode(k, true).map_err(invalid)?;
+            let value = percent_decode(v, true).map_err(invalid)?;
+            match key.as_str() {
+                "mode" => match value.as_str() {
+                    "ro" | "rw" | "rwc" => {}
+                    "memory" => {
+                        in_memory = true;
+                        shared_cache = true;
+                    }
+                    _ => return Err(invalid(format!("unknown value {value:?} for `mode`"))),
+                },
+                "cache" => match value.as_str() {
+                    "private" => shared_cache = false,
+                    "shared" => shared_cache = true,
+                    _ => return Err(invalid(format!("unknown value {value:?} for `cache`"))),
+                },
+                "immutable" => match value.as_str() {
+                    "true" | "1" => immutable = true,
+                    "false" | "0" => immutable = false,
+                    _ => {
+                        return Err(invalid(format!(
+                            "unknown value {value:?} for `immutable`"
+                        )));
+                    }
+                },
+                "vfs" => vfs = Some(value),
+                _ => {
+                    return Err(invalid(format!(
+                        "unknown query parameter `{key}` while parsing connection URL"
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut flags = base_flags;
+    flags |= if shared_cache {
+        OpenFlags::SQLITE_OPEN_SHARED_CACHE
+    } else {
+        OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
     };
-    Ok(opts.read_only(true).create_if_missing(false))
+
+    let target = if in_memory {
+        // sqlx named each in-memory database uniquely; same here, so two
+        // sources never share one by accident.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        flags |= OpenFlags::SQLITE_OPEN_MEMORY;
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        format!("file:duduclaw-db-in-memory-{n}")
+    } else {
+        path
+    };
+
+    let mut query: Vec<String> = Vec::new();
+    if immutable {
+        query.push("immutable=true".into());
+    }
+    if let Some(v) = vfs {
+        query.push(format!("vfs={}", percent_encode(&v, false)));
+    }
+    let target = if query.is_empty() {
+        target
+    } else if in_memory {
+        format!("{target}?{}", query.join("&"))
+    } else {
+        format!("file:{}?{}", percent_encode(&target, true), query.join("&"))
+    };
+    Ok(SqliteOptions { target, flags })
+}
+
+/// `%HH` decoding (and `+` → space for query components, as
+/// `application/x-www-form-urlencoded` does). Byte-wise, then UTF-8 checked.
+fn percent_decode(s: &str, plus_is_space: bool) -> Result<String, String> {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push(h * 16 + l);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
+}
+
+/// Percent-encode everything but RFC 3986 unreserved characters (and `/` when
+/// `keep_slash`), for building a SQLite `file:` URI.
+fn percent_encode(s: &str, keep_slash: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'.' | b'_' | b'~')
+            || (keep_slash && b == b'/');
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Connect-failure text with the credential stripped.
@@ -773,8 +1239,8 @@ fn sqlite_options(url: &str) -> Result<SqliteConnectOptions, DbError> {
 /// For SQLite the "url" is a path, so the file's *base name* is kept: it is
 /// not a credential and without it the operator cannot tell which of several
 /// sources is broken.
-fn connect_err(e: &sqlx::Error, cfg: &DbSourceConfig) -> DbError {
-    let base = scrub_connection_details(&e.to_string(), Some(&cfg.url));
+fn connect_err(message: &str, cfg: &DbSourceConfig) -> DbError {
+    let base = scrub_connection_details(message, Some(&cfg.url));
     if cfg.driver == Driver::Sqlite {
         let name = std::path::Path::new(cfg.url.trim_start_matches("sqlite://"))
             .file_name()
@@ -809,21 +1275,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn metadata_query_only_fetches_granted_tables() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        pool.execute("CREATE TABLE customers(id INTEGER)").await.unwrap();
-        pool.execute("CREATE TABLE unrelated_secret(id INTEGER)").await.unwrap();
+    #[test]
+    fn metadata_query_only_fetches_granted_tables() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE customers(id INTEGER);\n\
+             CREATE TABLE unrelated_secret(id INTEGER);",
+        )
+        .unwrap();
+        let names_for = |sql: &str, binds: &[String]| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, String>("name")
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+        };
         let mut config = cfg(Driver::Sqlite);
         config.allowed_tables = vec![" CUSTOMERS ".into()];
         let (sql, names) = schema_query(&config);
-        let rows = sqlx::query(&sql).bind(&names[0]).fetch_all(&pool).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<String, _>("name"), "customers");
+        assert_eq!(names_for(&sql, &names), ["customers"]);
         config.allowed_tables.clear();
         let (sql, names) = schema_query(&config);
         assert!(names.is_empty());
-        assert!(sqlx::query(&sql).fetch_all(&pool).await.unwrap().is_empty());
+        assert!(names_for(&sql, &names).is_empty());
         for driver in [Driver::Postgres, Driver::Mysql] {
             let (sql, names) = schema_query(&cfg(driver));
             assert_eq!(names, ["customers", "orders"]);
@@ -1016,9 +1492,10 @@ mod tests {
         if let Some(p) = my {
             assert_send(mysql_fetch(p, "SELECT 1", &[], 1, &(Arc::new(|| true) as IoAuthority)));
         }
-        let lite: Option<&SqlitePool> = None;
-        if let Some(p) = lite {
-            assert_send(sqlite_fetch(p, "SELECT 1", &[], 1, &(Arc::new(|| true) as IoAuthority)));
+        let lite: Option<&Arc<SqliteEngine>> = None;
+        if let Some(e) = lite {
+            assert_send(e.fetch("SELECT 1", &[], 1, &(Arc::new(|| true) as IoAuthority)));
+            assert_send(e.warm_up());
         }
         let dummy: Option<&DbSource> = None;
         if let Some(src) = dummy {
@@ -1037,34 +1514,253 @@ mod tests {
         assert!(matches!(sqlite_options("   "), Err(DbError::Config(_))));
     }
 
+    #[test]
+    fn sqlite_options_parse_like_sqlx_and_stay_read_only() {
+        let ro = OpenFlags::SQLITE_OPEN_READ_ONLY;
+        let rw = OpenFlags::SQLITE_OPEN_READ_WRITE;
+        let create = OpenFlags::SQLITE_OPEN_CREATE;
+
+        let o = sqlite_options("/tmp/x.sqlite").unwrap();
+        assert_eq!(o.target, "/tmp/x.sqlite");
+        assert!(o.flags.contains(ro | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI));
+        assert!(!o.flags.intersects(rw | create));
+
+        let o = sqlite_options("sqlite:///tmp/x.sqlite").unwrap();
+        assert_eq!(o.target, "/tmp/x.sqlite");
+        let o = sqlite_options("sqlite://rel%20dir/x.sqlite").unwrap();
+        assert_eq!(o.target, "rel dir/x.sqlite");
+
+        // `mode=rwc` parses but cannot lift read-only.
+        let o = sqlite_options("sqlite:///tmp/x.sqlite?mode=rwc").unwrap();
+        assert!(o.flags.contains(ro));
+        assert!(!o.flags.intersects(rw | create));
+
+        let o = sqlite_options("sqlite:///tmp/x.sqlite?immutable=1").unwrap();
+        assert_eq!(o.target, "file:/tmp/x.sqlite?immutable=true");
+
+        let o = sqlite_options("sqlite:///tmp/x.sqlite?cache=shared").unwrap();
+        assert!(o.flags.contains(OpenFlags::SQLITE_OPEN_SHARED_CACHE));
+
+        for bad in [
+            "sqlite:///tmp/x.sqlite?mode=bogus",
+            "sqlite:///tmp/x.sqlite?immutable=maybe",
+            "sqlite:///tmp/x.sqlite?journal_mode=wal",
+        ] {
+            assert!(matches!(sqlite_options(bad), Err(DbError::Config(_))), "{bad}");
+        }
+    }
+
     // ── Live-database unit tests ────────────────────────────────────────
     // These need `DbSource`'s *private* surface (`run`, `fetch`), which is why
     // they live here rather than in tests/sqlite.rs.
 
-    async fn live_sqlite(dir: &std::path::Path, timeout_ms: u64) -> DbSource {
-        let path = dir.join("unit.sqlite");
-        let opts = SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(opts).await.unwrap();
-        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO t (id, v) VALUES (1, 'a')")
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
+    /// Create `<dir>/<file>` read-write, run `setup`, close it.
+    fn make_db(dir: &std::path::Path, file: &str, setup: &str) -> String {
+        let path = dir.join(file);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(setup).unwrap();
+        drop(conn);
+        path.to_string_lossy().to_string()
+    }
 
-        let cfg = DbSourceConfig::new(
-            "unit",
-            Driver::Sqlite,
-            path.to_string_lossy().to_string(),
-            vec!["t".into()],
-        )
-        .with_timeout_ms(timeout_ms);
+    async fn live_sqlite(dir: &std::path::Path, timeout_ms: u64) -> DbSource {
+        let path = make_db(
+            dir,
+            "unit.sqlite",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\n\
+             INSERT INTO t (id, v) VALUES (1, 'a');",
+        );
+        let cfg = DbSourceConfig::new("unit", Driver::Sqlite, path, vec!["t".into()])
+            .with_timeout_ms(timeout_ms);
         DbSource::connect(cfg).await.unwrap()
+    }
+
+    /// The rusqlite engine itself refuses writes — through `fetch` (no
+    /// statement guard), with the same `readonly` wording sqlx surfaced, and
+    /// as a `DbError::Query` on the public path.
+    #[tokio::test]
+    async fn rusqlite_engine_refuses_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = live_sqlite(dir.path(), 5_000).await;
+        let err = src
+            .fetch("INSERT INTO t (id, v) VALUES (9, 'x')", &[], 10)
+            .await
+            .expect_err("read-only handle must refuse the insert");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("error returned from database: (code: 8)"),
+            "sqlx-shaped error text expected, got {msg}"
+        );
+        assert!(msg.contains("readonly"), "{msg}");
+        // Bound parameters do not change that.
+        let err = src
+            .fetch(
+                "UPDATE t SET v = ? WHERE id = ?",
+                &[Bind::Str("z".into()), Bind::Int(1)],
+                10,
+            )
+            .await
+            .expect_err("read-only handle must refuse the update");
+        assert!(err.to_string().contains("readonly"), "{err}");
+        // A schema change through a pragma is refused too.
+        assert!(src.fetch("PRAGMA user_version = 7", &[], 10).await.is_err());
+
+        // On the public path the statement guard still fires first, so a
+        // write via free SQL keeps reporting StatementRejected.
+        let cfg = DbSourceConfig::new("w", Driver::Sqlite, src.cfg.url.clone(), vec!["*".into()]);
+        let wild = DbSource::connect(cfg).await.unwrap();
+        assert!(matches!(
+            wild.query("DELETE FROM t", None).await,
+            Err(DbError::StatementRejected(_))
+        ));
+
+        let out = src.fetch("SELECT v FROM t WHERE id = 1", &[], 10).await.unwrap();
+        assert_eq!(out.rows[0]["v"], serde_json::json!("a"));
+    }
+
+    /// Storage-class-driven mapping, value by value, exactly as the sqlx path
+    /// produced it.
+    #[tokio::test]
+    async fn rusqlite_engine_maps_values_like_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_db(
+            dir.path(),
+            "values.sqlite",
+            "CREATE TABLE v (\
+                 i INTEGER, r REAL, t TEXT, b BLOB, n TEXT, flag BOOLEAN, \
+                 ts DATETIME, money NUMERIC, big INTEGER, bad TEXT, untyped);\n\
+             INSERT INTO v VALUES (\
+                 42, 12.5, '王小明', x'0102', NULL, 1, \
+                 '2026-11-09 10:20:30', '12.50', 9223372036854775807, \
+                 CAST(x'ff' AS TEXT), 'free');",
+        );
+        let cfg = DbSourceConfig::new("vals", Driver::Sqlite, path, vec!["*".into()]);
+        let src = DbSource::connect(cfg).await.unwrap();
+        let out = src.query("SELECT * FROM v", None).await.unwrap();
+        assert_eq!(out.row_count, 1);
+        let row = &out.rows[0];
+        let keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        assert_eq!(keys.len(), 11, "{keys:?}");
+        assert_eq!(row["i"], serde_json::json!(42));
+        assert_eq!(row["r"], serde_json::json!(12.5));
+        assert_eq!(row["t"], serde_json::json!("王小明"));
+        assert_eq!(row["b"], serde_json::json!("AQI="));
+        assert_eq!(row["n"], serde_json::Value::Null);
+        // BOOLEAN is a hint; the stored INTEGER is the truth.
+        assert_eq!(row["flag"], serde_json::json!(1));
+        // DATETIME holds TEXT: passed through as stored.
+        assert_eq!(row["ts"], serde_json::json!("2026-11-09 10:20:30"));
+        // NUMERIC affinity turned '12.50' into REAL 12.5.
+        assert_eq!(row["money"], serde_json::json!(12.5));
+        assert_eq!(row["big"], serde_json::json!(i64::MAX));
+        // Non-UTF-8 TEXT decodes to null, as sqlx's String decode failure did.
+        assert_eq!(row["bad"], serde_json::Value::Null);
+        assert_eq!(row["untyped"], serde_json::json!("free"));
+
+        // Computed values: integer division, float, NULL, and bound params.
+        let out = src
+            .fetch(
+                "SELECT 7 / 2 AS q, 1.0 / 4 AS f, NULL AS z, ? AS s, ? AS yes, ? AS x",
+                &[Bind::Str("é".into()), Bind::Bool(true), Bind::Float(0.5)],
+                10,
+            )
+            .await
+            .unwrap();
+        let row = &out.rows[0];
+        assert_eq!(row["q"], serde_json::json!(3));
+        assert_eq!(row["f"], serde_json::json!(0.25));
+        assert_eq!(row["z"], serde_json::Value::Null);
+        assert_eq!(row["s"], serde_json::json!("é"));
+        assert_eq!(row["yes"], serde_json::json!(1));
+        assert_eq!(row["x"], serde_json::json!(0.5));
+    }
+
+    /// `cap + 1` rows are stepped, never more, and `truncated` says so.
+    #[tokio::test]
+    async fn rusqlite_engine_honours_row_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_db(
+            dir.path(),
+            "cap.sqlite",
+            "CREATE TABLE n (x INTEGER);\n\
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 50) \
+             INSERT INTO n SELECT x FROM c;",
+        );
+        let cfg = DbSourceConfig::new("cap", Driver::Sqlite, path, vec!["*".into()])
+            .with_max_rows(5);
+        let src = DbSource::connect(cfg).await.unwrap();
+
+        let out = src.fetch("SELECT x FROM n ORDER BY x", &[], 3).await.unwrap();
+        assert_eq!(out.row_count, 3);
+        assert!(out.truncated);
+        assert_eq!(out.rows[2]["x"], serde_json::json!(3));
+
+        // Exactly `cap` rows is not truncation.
+        let out = src.fetch("SELECT x FROM n WHERE x <= 3", &[], 3).await.unwrap();
+        assert_eq!(out.row_count, 3);
+        assert!(!out.truncated);
+
+        // Public paths apply max_rows as the ceiling.
+        let out = src.query("SELECT x FROM n", Some(100)).await.unwrap();
+        assert_eq!(out.row_count, 5);
+        assert!(out.truncated);
+        let out = src
+            .select(&SelectRequest {
+                table: "n".into(),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.row_count, 2);
+        assert!(out.truncated);
+
+        // An unbounded generator stops at cap + 1 rather than running forever.
+        let out = src
+            .fetch(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c",
+                &[],
+                4,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.row_count, 4);
+        assert!(out.truncated);
+    }
+
+    /// A statement that never finishes is interrupted at `timeout_ms`, answers
+    /// `Timeout`, and frees its connection for the next call.
+    #[tokio::test]
+    async fn rusqlite_engine_interrupts_runaway_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_db(dir.path(), "slow.sqlite", "CREATE TABLE t (x INTEGER);");
+        let cfg = DbSourceConfig::new("slow", Driver::Sqlite, path, vec!["*".into()])
+            .with_timeout_ms(100);
+        let src = DbSource::connect(cfg).await.unwrap();
+        let started = std::time::Instant::now();
+        let err = src
+            .query(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+                 SELECT count(*) FROM c",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::Timeout(100)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Both slots are usable again once the interrupted statement unwinds.
+        for _ in 0..3 {
+            src.ping().await.expect("engine recovers after an interrupt");
+        }
+    }
+
+    #[tokio::test]
+    async fn rusqlite_engine_close_refuses_further_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = live_sqlite(dir.path(), 5_000).await;
+        src.close().await;
+        src.close().await; // idempotent
+        assert!(matches!(src.ping().await, Err(DbError::Query(_))));
     }
 
     /// Layer (c): work that outlives `timeout_ms` comes back as `Timeout`,

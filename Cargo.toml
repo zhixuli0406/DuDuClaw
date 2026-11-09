@@ -105,7 +105,10 @@ zeroize = { version = "1", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+# "fallible_uint": rusqlite 0.41 moved u64/usize ToSql/FromSql behind this
+# feature. Enabling it keeps 0.32 behaviour: out-of-range values error instead
+# of silently converting.
+rusqlite = { version = "0.41", features = ["bundled", "vtab", "fallible_uint"] }
 
 # Docker
 bollard = "0.18"
@@ -200,3 +203,7 @@ opt-level = 3
 # workspace's maintained rustls 0.23 stack. The vendored SDK retains its version.
 [patch.crates-io]
 serenity = { path = "vendor/serenity" }
+# CVE-2026-119375 / RUSTSEC-2026-0459: rusqlite 0.41 (libsqlite3-sys 0.39) serves
+# SQLite; sqlx's SQLite driver is unused and its libsqlite3-sys ^0.30 would
+# conflict on `links = "sqlite3"`. Replace it with a dependency-free stub.
+sqlx-sqlite = { path = "third_party/sqlx-sqlite-stub" }
