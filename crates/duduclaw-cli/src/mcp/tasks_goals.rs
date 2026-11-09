@@ -208,19 +208,34 @@ pub(crate) async fn handle_goals_create(args: &Value, home_dir: &Path, default_a
     if let Err(e) = store.insert_goal(&row).await {
         return tool_error(&format!("create goal: {e}"));
     }
+    // v1.81 P1d: the goal's creating employee (`WorkItem::Goal`); P1e: the
+    // event type is reserved for this call and read from metadata only.
     append_activity(
         &store,
-        "goal_created",
+        duduclaw_gateway::personal_visibility::GOAL_CREATED_EVENT,
         default_agent,
         None,
         &format!("Created goal: {}", row.title),
-        None,
+        Some(serde_json::json!({ "goal_id": row.id }).to_string()),
     )
     .await;
     tool_text(&serde_json::json!({ "goal": goal_row_to_json(&row) }).to_string())
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // dispatch calls `personal_wildcard::goals_list`
 pub(crate) async fn handle_goals_list(args: &Value, home_dir: &Path) -> Value {
+    handle_goals_list_hiding(args, home_dir, &Default::default()).await
+}
+
+/// [`handle_goals_list`] without the goals whose creating employee is in
+/// `hidden_creators` (v1.81 P1d, `personal_wildcard.rs`, resolved through
+/// `personal_visibility::goal_creators`); `total` counts only what is
+/// returned. An unreadable creator record refuses (fail closed).
+pub(crate) async fn handle_goals_list_hiding(
+    args: &Value,
+    home_dir: &Path,
+    hidden_creators: &std::collections::BTreeSet<String>,
+) -> Value {
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
@@ -229,10 +244,20 @@ pub(crate) async fn handle_goals_list(args: &Value, home_dir: &Path) -> Value {
         .get("status")
         .and_then(|v| v.as_str())
         .filter(|s| matches!(*s, "active" | "done" | "archived"));
-    let rows = match store.list_goals(status).await {
+    let mut rows = match store.list_goals(status).await {
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list goals: {e}")),
     };
+    if !hidden_creators.is_empty() {
+        let creators = match duduclaw_gateway::personal_visibility::goal_creators(home_dir) {
+            Ok(creators) => creators,
+            Err(_) => return tool_error(duduclaw_gateway::personal_visibility::OWNERSHIP_UNAVAILABLE),
+        };
+        // P1e: hidden when ANY candidate creator is hidden (fail closed).
+        rows.retain(|goal| {
+            !duduclaw_gateway::personal_visibility::goal_hidden(creators.get(&goal.id), hidden_creators)
+        });
+    }
     let limit = clamp_limit(args, 50, 200) as usize;
     let goals: Vec<Value> = rows.iter().take(limit).map(goal_row_to_json).collect();
     tool_text(
@@ -286,6 +311,9 @@ pub(crate) async fn handle_activity_post(
         .iter()
         .any(|p| event_type.to_ascii_lowercase().starts_with(p))
         || event_type.to_ascii_lowercase().starts_with("computer_session.")
+        // v1.81 P1e: `goal_created` records a goal's creating employee
+        // (Personal visibility); only `goals_create` writes it.
+        || duduclaw_gateway::personal_visibility::is_reserved_activity_event(&event_type)
     {
         return tool_error(&format!(
             "activity_post 遭拒：「{}」是系統保留的事件類型。",
@@ -352,11 +380,26 @@ pub(crate) async fn handle_activity_post(
 /// List Activity Feed rows. An AI employee caller (`actor` = `Agent`) does not
 /// get rows tied to a task whose audience it may not read (see
 /// `agent_may_read_task`); operators are unrestricted.
+#[cfg_attr(not(test), allow(dead_code))] // dispatch calls `personal_wildcard::activity_list`
 pub(crate) async fn handle_activity_list(
     args: &Value,
     home_dir: &Path,
     default_agent: &str,
     actor: RecordActor<'_>,
+) -> Value {
+    handle_activity_list_hiding(args, home_dir, default_agent, actor, &Default::default()).await
+}
+
+/// [`handle_activity_list`] without the rows of `hidden` employees, by the
+/// row's employee and by its task's (v1.81 P1d, `personal_wildcard.rs`);
+/// the store applies it before LIMIT and COUNT, so `total` never counts a
+/// hidden row.
+pub(crate) async fn handle_activity_list_hiding(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    actor: RecordActor<'_>,
+    hidden: &std::collections::BTreeSet<String>,
 ) -> Value {
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
@@ -373,7 +416,7 @@ pub(crate) async fn handle_activity_list(
     let limit = clamp_limit(args, 20, 100);
 
     let worker = verified_a2a_worker(home_dir, actor);
-    let query = store.list_activity_for_worker(agent_id, event_type, limit, 0, worker).await;
+    let query = store.list_activity_for_worker_hiding(agent_id, event_type, limit, 0, worker, hidden).await;
     let (rows, total) = match query {
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list activity: {e}")),

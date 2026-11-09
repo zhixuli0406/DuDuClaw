@@ -44,14 +44,20 @@ pub(crate) async fn handle_tools_call(
     // store and a memory `namespace` of another employee refuse when it is a
     // Personal employee (self-targets never read users.db). Runs before any
     // handler or isolation route, for every principal kind.
-    let acting_for_target = acting_agent_id(caller_client_id, default_agent);
-    if let Some(refusal) = super::personal_target::pre_dispatch_refusal(
-        home_dir, duduclaw_gateway::runtime_readiness::is_protected_linux(), tool_name, &arguments,
-        acting_for_target, default_agent, &ns_ctx.write_namespace,
-    ) {
+    // P1d: an external key is judged as `external:<client id>`, never as the
+    // employee its client id may spell (`personal_wildcard.rs`).
+    let personal_protected = duduclaw_gateway::runtime_readiness::is_protected_linux();
+    let personal_acting = super::personal_wildcard::personal_acting_id(principal, default_agent);
+    let acting_for_target = personal_acting.as_str();
+    if let Some(refusal) = super::personal_wildcard::external_identity_refusal(home_dir, personal_protected, principal)
+        .or_else(|| super::personal_target::pre_dispatch_refusal(
+            home_dir, personal_protected, tool_name, &arguments,
+            acting_for_target, default_agent, &ns_ctx.write_namespace,
+        ))
+    {
         duduclaw_security::audit::append_tool_call_denied(
             home_dir,
-            acting_for_target,
+            acting_agent_id(caller_client_id, default_agent),
             tool_name,
             "personal_employee_target",
             refusal,
@@ -231,7 +237,7 @@ pub(crate) async fn handle_tools_call(
         };
         let handler = GatewayHandler { id, home_dir, http, memory, default_agent, odoo, ns_ctx,
             daily_quota, caller_client_id, caller_is_admin, wiki_agent, record_actor,
-            google_caller: &google_caller };
+            google_caller: &google_caller, acting_for_target, personal_protected };
         match authorized {
             // Do not embed both copies of the all-tools match future in this
             // authorization branch (or the background caller's task-local scope).
@@ -378,6 +384,11 @@ struct GatewayHandler<'a> {
     wiki_agent: &'a str,
     record_actor: RecordActor<'a>,
     google_caller: &'a super::google_identity_client::GoogleCaller,
+    /// v1.81 P1d/P1e: who the wildcard Personal filters judge (`external:<id>`
+    /// for an external key) and whether protected mode is on — resolved once
+    /// in `handle_tools_call`, carried here so the match arms can read them.
+    acting_for_target: &'a str,
+    personal_protected: bool,
 }
 impl GatewayHandler<'_> {
     async fn execute(&self, call: duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall) -> std::result::Result<Value, Value> {
@@ -408,7 +419,8 @@ impl GatewayHandler<'_> {
             return Ok(tool_error("隔離連線服務尚未就緒。"));
         }
         let Self { id, home_dir, http, memory, default_agent, odoo, ns_ctx, daily_quota,
-            caller_client_id, caller_is_admin, wiki_agent, record_actor, google_caller } = *self;
+            caller_client_id, caller_is_admin, wiki_agent, record_actor, google_caller,
+            acting_for_target, personal_protected } = *self;
         Ok(match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
@@ -550,7 +562,7 @@ impl GatewayHandler<'_> {
             .await
         }
         "list_agents" => super::personal_target::list_agents_hiding(&arguments, home_dir, default_agent,
-            acting_agent_id(caller_client_id, default_agent), duduclaw_gateway::runtime_readiness::is_protected_linux()).await,
+            acting_for_target, personal_protected).await,
         "create_task" => handle_create_task(&arguments, home_dir, record_actor.id()).await,
         "check_responses" => handle_check_responses(&arguments, home_dir).await,
         "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
@@ -719,7 +731,9 @@ impl GatewayHandler<'_> {
         // Session tools
         "session_restore_context" => handle_session_restore_context(&arguments).await,
         // Task Board tools
-        "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent, record_actor).await,
+        // v1.81 P1d: wildcard listings leave out other Personal employees.
+        "tasks_list" => super::personal_wildcard::tasks_list(&arguments, home_dir, default_agent, record_actor,
+            acting_for_target, personal_protected).await,
         "tasks_create" => handle_tasks_create(&arguments, home_dir, record_actor).await,
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact"
         | "discovery_cancel" => {
@@ -739,14 +753,16 @@ impl GatewayHandler<'_> {
         "responsibility_ask" => handle_responsibility_ask(&arguments, home_dir, record_actor).await,
         // Goal chain tools (G8)
         "goals_create" => handle_goals_create(&arguments, home_dir, record_actor.id()).await,
-        "goals_list" => handle_goals_list(&arguments, home_dir).await,
+        "goals_list" => super::personal_wildcard::goals_list(&arguments, home_dir, acting_for_target,
+            personal_protected).await,
         // Co-edited plan tools (U4)
         "plan_get" => handle_plan_get(&arguments, home_dir, default_agent).await,
         "plan_update_step" => handle_plan_update_step(&arguments, home_dir, default_agent).await,
         // Activity Feed tools
         "activity_post" => handle_activity_post(&arguments, home_dir, record_actor).await,
         "activity_list" => {
-            handle_activity_list(&arguments, home_dir, default_agent, record_actor).await
+            super::personal_wildcard::activity_list(&arguments, home_dir, default_agent, record_actor,
+                acting_for_target, personal_protected).await
         }
         // Autopilot tools
         "autopilot_list" => handle_autopilot_list(&arguments, home_dir).await,
@@ -1075,7 +1091,8 @@ mod future_size_tests {
         let handler = GatewayHandler { id: &id, home_dir: home.path(), http: &http,
             memory: &memory, default_agent: "main", odoo: &odoo, ns_ctx: &ns,
             daily_quota: &quota, caller_client_id: "main", caller_is_admin: false,
-            wiki_agent: "main", record_actor: RecordActor::Agent("main"), google_caller: &google_caller };
+            wiki_agent: "main", record_actor: RecordActor::Agent("main"), google_caller: &google_caller,
+            acting_for_target: "main", personal_protected: false };
         // The match state machine is shared by memory_*, wiki_* and tasks_*.
         for name in ["memory_store", "memory_search", "wiki_write", "tasks_create"] {
             let future = handler.invoke(name, &arguments);

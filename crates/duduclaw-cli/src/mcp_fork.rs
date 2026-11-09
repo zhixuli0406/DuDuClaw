@@ -257,6 +257,12 @@ fn err(text: impl Into<String>) -> Value {
     json!({ "content": [{ "type": "text", "text": format!("Error: {}", text.into()) }], "isError": true })
 }
 
+/// v1.81 P1g (F9): the one answer for an unknown fork AND for another
+/// employee's fork, so the fork tools never confirm that one exists.
+pub(crate) fn fork_not_found(fork_id: &str) -> String {
+    format!("fork not found: {fork_id}")
+}
+
 /// Fail-closed gate: returns an error envelope when forking is disabled for the agent.
 fn require_enabled(settings: &ForkSettings) -> Option<Value> {
     if settings.enabled {
@@ -535,10 +541,11 @@ pub async fn handle_inspect_branches(args: &Value, home_dir: &Path, agent_id: &s
         Some(f) => f,
         None => return err("fork_id is required"),
     };
+    // v1.81 P1g (F9): another employee's fork answers exactly like an
+    // unknown one, so the reply never reveals that it exists.
     let fork = match store.get_fork(fork_id) {
         Ok(Some(f)) if f.agent_id == agent_id => f,
-        Ok(Some(_)) => return err("fork is unavailable to this agent"),
-        Ok(None) => return err(format!("fork not found: {fork_id}")),
+        Ok(_) => return err(fork_not_found(fork_id)),
         Err(e) => return err(format!("store error: {e}")),
     };
     let branches = match store.list_branches(fork_id) {
@@ -584,7 +591,7 @@ pub async fn handle_diff_branches(args: &Value, home_dir: &Path, agent_id: &str)
     // data, never caller identity or authority to inspect another employee.
     match store.get_fork(fork_id) {
         Ok(Some(fork)) if fork.agent_id == agent_id => {},
-        Ok(_) => return err("fork is unavailable to this agent"),
+        Ok(_) => return err(fork_not_found(fork_id)),
         Err(e) => return err(format!("store error: {e}")),
     }
     let (a, b) = match (
@@ -655,13 +662,13 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
 
             let fork = match store.get_fork(&fork_id) {
                 Ok(Some(f)) => f,
-                Ok(None) => return err(format!("fork not found: {fork_id}")),
+                Ok(None) => return err(fork_not_found(&fork_id)),
                 Err(e) => return err(format!("store error: {e}")),
             };
             // Promotion now writes files into the fork's parent workspace: only the
-            // agent that owns the fork may do that.
+            // agent that owns the fork may do that. P1g (F9): same text as unknown.
             if fork.agent_id != agent_id {
-                return err(format!("fork {fork_id} belongs to another agent"));
+                return err(fork_not_found(&fork_id));
             }
             // A reused employee id must not inherit authority to publish work
             // whose automatic admission was refused. Keep the decision check
@@ -765,8 +772,8 @@ pub async fn handle_terminate_branch(args: &Value, home_dir: &Path, agent_id: &s
             }
             match store.get_fork(&fork_id) {
                 Ok(Some(fork)) if fork.agent_id == agent_id => {}
-                Ok(Some(_)) => return err("fork belongs to another agent"),
-                Ok(None) => return err(format!("fork not found: {fork_id}")),
+                // P1g (F9): another agent's fork reads like an unknown one.
+                Ok(_) => return err(fork_not_found(&fork_id)),
                 Err(error) => return err(format!("store error: {error}")),
             }
             let branches = store.list_branches(&fork_id).unwrap_or_default();
@@ -820,9 +827,9 @@ pub async fn handle_fork_cost(args: &Value, home_dir: &Path, agent_id: &str) -> 
         None => return err("fork_id is required"),
     };
     match store.get_fork(fork_id) {
-        Ok(None) => err(format!("fork not found: {fork_id}")),
+        Ok(None) => err(fork_not_found(fork_id)),
         Err(e) => err(format!("store error: {e}")),
-        Ok(Some(fork)) if fork.agent_id != agent_id => err("fork is unavailable to this agent"),
+        Ok(Some(fork)) if fork.agent_id != agent_id => err(fork_not_found(fork_id)),
         Ok(Some(_)) => {
             let branches = match store.list_branches(fork_id) {
                 Ok(branches) => branches,
@@ -1424,7 +1431,12 @@ test_timeout_s = 60
             &json!({"fork_id": fork_id, "branch_id": bid}), home.path(), "a2",
         ).await;
         assert!(is_error(&denied));
-        assert!(text(&denied).contains("another agent"));
+        // P1g (F9): a foreign fork reads exactly like an unknown one.
+        assert!(text(&denied).contains(&fork_not_found(&fork_id)), "{}", text(&denied));
+        let unknown = handle_terminate_branch(
+            &json!({"fork_id": "no-such-fork", "branch_id": bid}), home.path(), "a2",
+        ).await;
+        assert_eq!(text(&denied).replace(&fork_id, "X"), text(&unknown).replace("no-such-fork", "X"));
         assert_eq!(std::fs::read_to_string(ws.join("owner-output.txt")).unwrap(), "preserved");
         assert_eq!(open_store(home.path()).unwrap().branch_workspace(&bid).unwrap(),
             Some(ws.to_string_lossy().into_owned()));

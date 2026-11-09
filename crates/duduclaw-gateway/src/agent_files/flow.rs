@@ -106,6 +106,23 @@ pub(crate) fn require_live_agent_access(
     Ok(fresh)
 }
 
+/// P1g: [`require_live_agent_access`] for the Admin management allowlist
+/// (`agents.pause` / `agents.resume`): `has_management_access`, so an Admin
+/// still reaches another person's Personal employee; the caller audits it.
+pub(crate) fn require_live_management_access(
+    home: &Path,
+    ctx: &UserContext,
+    agent_id: &str,
+    min: AccessLevel,
+) -> Result<UserContext, String> {
+    let fresh = crate::review_evidence::audience::fresh_dashboard_context(home, ctx)
+        .map_err(|_| "permission denied".to_string())?;
+    if !fresh.has_management_access(agent_id, min) {
+        return Err("permission denied".into());
+    }
+    Ok(fresh)
+}
+
 fn base(input: &SaveInput, status: &str) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("status".into(), json!(status));

@@ -799,7 +799,9 @@ mod tests {
 }
 
 /// HX6 Admin recording control and the recording audit sink (security fix
-/// round, finding 6); split out to keep this file below 800 lines.
+/// round, finding 6); split out to keep this file below 800 lines. Merge
+/// P1h × HX6: P1h's withholding of a non-owned Personal recording result
+/// lives in `boot_recording.rs` on the HX6 recording store.
 #[path = "boot_recording.rs"]
 mod recording;
 pub(crate) use recording::control_recording;

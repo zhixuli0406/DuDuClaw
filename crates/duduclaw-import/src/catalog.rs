@@ -17,6 +17,7 @@ pub(crate) const SESSION_V1793: &str = include_str!("session-v1793.sql");
 pub(crate) const SESSION_V180: &str = include_str!("session-v180.sql");
 pub(crate) const TASKS_V1793: &str = include_str!("tasks-v1793.sql");
 pub(crate) const TASKS_V180: &str = include_str!("tasks-v180.sql");
+pub(crate) const TASKS_V181: &str = include_str!("tasks-v181.sql");
 pub(crate) const CRON_V1793: &str = include_str!("cron-v1793.sql");
 pub(crate) const CRON_V180: &str = include_str!("cron-v180.sql");
 pub(crate) const MEMORY_V1793: &str = include_str!("memory-v1793.sql");
@@ -45,16 +46,25 @@ impl SchemaVersion {
     pub fn label(self) -> &'static str { match self { Self::V1793 => "v1.79.3", Self::V180 => "v1.80.x" } }
 }
 
-struct Catalog { version: SchemaVersion, sql: &'static str }
+struct Catalog { version: SchemaVersion, sql: &'static str, label: &'static str }
+impl Catalog {
+    const fn new(version: SchemaVersion, sql: &'static str) -> Self {
+        Catalog { version, sql, label: match version { SchemaVersion::V1793 => "v1.79.3", SchemaVersion::V180 => "v1.80.x" } }
+    }
+}
 // Ordered oldest first; adding a release means a new catalog file, a new
 // variant and its own mapping in every reader (the matches are exhaustive).
-static SESSIONS: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: SESSION_V1793 }, Catalog { version: SchemaVersion::V180, sql: SESSION_V180 }];
-static TASKS: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: TASKS_V1793 }, Catalog { version: SchemaVersion::V180, sql: TASKS_V180 }];
-static CRON: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: CRON_V1793 }, Catalog { version: SchemaVersion::V180, sql: CRON_V180 }];
+static SESSIONS: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, SESSION_V1793), Catalog::new(SchemaVersion::V180, SESSION_V180)];
+// Tasks: the v1.81 catalog is the v1.80.x one plus the `task_store_markers`
+// table of the goal-creator backfill. It has no readable content for the
+// importer (the authorizer denies that table), so it maps as V180.
+static TASKS: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, TASKS_V1793), Catalog::new(SchemaVersion::V180, TASKS_V180),
+    Catalog { version: SchemaVersion::V180, sql: TASKS_V181, label: "v1.81" }];
+static CRON: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, CRON_V1793), Catalog::new(SchemaVersion::V180, CRON_V180)];
 // Memory and approvals: the newest catalog adds only an index (memory) and two
 // decision-lease columns (approvals) that neither reader is authorized to read.
-static MEMORY: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: MEMORY_V1793 }, Catalog { version: SchemaVersion::V180, sql: MEMORY_V180 }];
-static APPROVALS: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: APPROVALS_V1793 }, Catalog { version: SchemaVersion::V180, sql: APPROVALS_V180 }];
+static MEMORY: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, MEMORY_V1793), Catalog::new(SchemaVersion::V180, MEMORY_V180)];
+static APPROVALS: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V1793), Catalog::new(SchemaVersion::V180, APPROVALS_V180)];
 fn catalogs(store: Store) -> &'static [Catalog] {
     match store {
         Store::Sessions => &SESSIONS, Store::Tasks => &TASKS, Store::Cron => &CRON,
@@ -103,7 +113,7 @@ pub struct SchemaRefusal {
 }
 impl fmt::Display for SchemaRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let known = catalogs(self.store).iter().map(|c| c.version.label()).collect::<Vec<_>>().join(", ");
+        let known = catalogs(self.store).iter().map(|c| c.label).collect::<Vec<_>>().join(", ");
         write!(f, "unsupported {} schema: it matches none of the known catalogs ({known}); differences from the closest ({}{}): ",
             self.store.file_name(), self.closest.label(), if self.closest_extension { " with channel settings" } else { "" })?;
         if self.differences.is_empty() { write!(f, "catalog rows differ")?; }

@@ -34,6 +34,26 @@
 //!   [`MethodHandler::personal_gates_for_params`]); list totals and flow
 //!   metrics are computed over the hidden-filtered set; push events are
 //!   filtered per subscriber (`personal_push.rs`).
+//! - **P1d.** More `agent_id` reads are in [`agent_scoped`] (profile export,
+//!   playbook, wiki trust, skill content/share); methods naming a plan, plan
+//!   step, mail, pending agent-file change or fork by id resolve its employee
+//!   first (`personal_p1d_gate.rs`); optional-scope lists (`plans.list`,
+//!   `mail.list`, `mail.outbox`, `fork.list`) hide Personal employees the
+//!   caller does not own. `tasks.assign` is delegation (owner only), not a
+//!   read. A non-Admin naming an unknown task gets the same `permission
+//!   denied` as for another person's Personal task.
+//! - **P1e (config / identity writes).** The methods in [`write_scoped`]
+//!   (`agents.update`, `agents.google_identity_set`, avatar / outfit,
+//!   tool-pruning restore, archive / unarchive / remove, the `from_agent` of
+//!   `agents.handoff`) go through the same gate as categories
+//!   [`DataCategory::Config`] / [`DataCategory::Identity`]: the owner passes;
+//!   an Admin who is not the owner needs the fresh step-up and an audit row
+//!   (action [`WRITE_ACTION`]); everybody else gets `permission denied` (the
+//!   text of an unknown employee). The named id must be canonical.
+//!   `digest.feedback` is gated on its task (`task_id`) or its delivered
+//!   file's employee (`artifact.agent_id`); `digest.latest` drops hidden
+//!   employees in its handler. `agents.pause` / `agents.resume` of another
+//!   person's Personal employee leave an audit row ([`CONTROL_ACTION`]).
 use super::*;
 use super::isolation_connectors_rpc::authorize_step_up;
 use crate::personal_visibility::{self as visibility, DataCategory, Reader};
@@ -47,13 +67,29 @@ pub(super) const STEP_UP_FIELD: &str = "step_up_csrf";
 pub(crate) const READ_ACTION: &str = "isolation.personal_data_read";
 /// `auth_audit_log` action of a refused Admin read (best effort).
 pub(crate) const REFUSED_ACTION: &str = "isolation.personal_data_read_refused";
+/// P1e: `auth_audit_log` action of an audited Admin config / identity write.
+pub(crate) const WRITE_ACTION: &str = "isolation.personal_config_write";
+/// P1e: `auth_audit_log` action of a refused Admin config / identity write.
+pub(crate) const WRITE_REFUSED_ACTION: &str = "isolation.personal_config_write_refused";
+/// P1e: `auth_audit_log` action of a pause / resume of another person's
+/// Personal employee.
+pub(crate) const CONTROL_ACTION: &str = "isolation.personal_agent_control";
+/// P1g: `auth_audit_log` action of an allowlisted metadata read (status,
+/// preset name, avatar) of another person's Personal employee.
+pub(crate) const METADATA_ACTION: &str = "isolation.personal_metadata_read";
 
 pub(super) const STEP_UP_REQUIRED: &str = "這是個人專屬員工的私人資料（對話、記憶、設定檔或 Wiki）。管理員需先以密碼與雙因素驗證確認身分\
     （有效 5 分鐘），並在請求中帶入驗證後的 step_up_csrf；每次讀取都會寫入稽核紀錄。 / This is a Personal employee's private \
     data. An Admin needs a fresh password + TOTP step-up and its step_up_csrf token; every read is audited.";
+/// P1e: the step-up text of a config / identity write.
+pub(super) const STEP_UP_REQUIRED_WRITE: &str = "這是個人專屬員工的設定或身分。管理員需先以密碼與雙因素驗證確認身分\
+    （有效 5 分鐘），並在請求中帶入驗證後的 step_up_csrf；每次變更都會寫入稽核紀錄。 / This is a Personal employee's \
+    configuration or identity. An Admin needs a fresh password + TOTP step-up and its step_up_csrf token; every change \
+    is audited.";
 pub(super) const NOT_ALLOWED: &str = "permission denied";
 const UNAVAILABLE: &str = "無法確認這位員工的歸屬，已拒絕讀取。";
 const AUDIT_FAILED: &str = "無法寫入稽核紀錄，已拒絕讀取。";
+const AUDIT_FAILED_WRITE: &str = "無法寫入稽核紀錄，已拒絕變更。";
 
 /// Agent-scoped dashboard methods whose `agent_id` names the employee whose
 /// private data is read (or, for the few writes, changed).
@@ -61,17 +97,91 @@ pub(super) fn agent_scoped(method: &str) -> Option<DataCategory> {
     Some(match method {
         "memory.search" | "memory.browse" | "memory.key_facts" | "memory.decay_overview"
         | "memory.history" | "memory.at" | "memory.get_at" | "memory.graph"
-        | "memory.invalidate_origin" | "memory.forget" => DataCategory::Memory,
+        | "memory.invalidate_origin" | "memory.forget"
+        // P1d: learned playbook entries are distilled from its memory.
+        | "playbook.list" | "playbook.export" | "playbook.retire" => DataCategory::Memory,
         "wiki.pages" | "wiki.read" | "wiki.auto_pages" | "wiki.search" | "wiki.lint" | "wiki.stats"
-        | "wiki.promote" | "wiki.archive" | "wiki.share" => DataCategory::Wiki,
+        | "wiki.promote" | "wiki.archive" | "wiki.share"
+        // P1d: per-page trust state and its citation history.
+        | "wiki.trust_audit" | "wiki.trust_history" | "wiki.trust_override" => DataCategory::Wiki,
         "agent_files.list" | "agent_files.get" | "agent_files.runtime_files" | "agent_files.diff"
         | "agent_files.history" | "agent_files.save" | "agent_files.rollback" | "agents.inspect"
-        | "contract.get" | "contract.update" => DataCategory::AgentFiles,
-        "chat.sessions.list" | "search.query" | "runs.list" => DataCategory::Sessions,
+        | "contract.get" | "contract.update"
+        // P1d: the full profile export (SOUL, contract, …) and the
+        // employee's own skill files (read, or copied to the shared pool).
+        // P1g (F4): `skills.share` is owner-only (delegation gate).
+        | "agents.export_profile" | "skills.content"
+        // P1e: its archived skills (names and archived content).
+        | "skills.archived" => DataCategory::AgentFiles,
+        "chat.sessions.list" | "search.query" | "runs.list"
+        // P1g (F2): watching its live computer-use session / a masked
+        // snapshot of it (take over / hand back / resume / stop: owner only).
+        | "computer_sessions.view" | "computer_sessions.snapshot" => DataCategory::Sessions,
+        // `tasks.assign` is delegation (personal_delegation_gate.rs), not a read.
         "activity.list" | "timeline.list" | "decisions.list" | "decisions.dismiss" | "canvas.get"
-        | "tasks.list" | "tasks.list_page" | "tasks.flow_metrics" | "tasks.assign" => DataCategory::Work,
+        | "tasks.list" | "tasks.list_page" | "tasks.flow_metrics"
+        // P1e: discovery runs listed for one employee.
+        | "discovery.list" => DataCategory::Work,
         _ => return None,
     })
+}
+
+/// P1e: dashboard methods that WRITE one employee's configuration or
+/// identity, with the parameter naming it. Gated like a read (owner, or an
+/// audited Admin step-up), audited as a write.
+pub(super) fn write_scoped(method: &str) -> Option<(&'static str, DataCategory)> {
+    Some(match method {
+        "agents.update" | "agents.set_avatar" | "agents.set_outfit" | "agents.clear_avatar"
+        | "agents.tool_pruning_restore" | "agents.archive" | "agents.unarchive" | "agents.remove" => {
+            ("agent_id", DataCategory::Config)
+        }
+        // P1g (F4): `agents.handoff` left this table — moving a Personal
+        // employee's work away is owner-only (delegation gate, both ends).
+        // P1g (F10): binding a person to it is an access write (owner, or
+        // an audited Admin step-up).
+        "users.bind_agent" | "users.unbind_agent" => ("agent_name", DataCategory::Config),
+        // Its skill layer: restore an archived skill, adopt a shared one.
+        "skills.restore" => ("agent_id", DataCategory::Config),
+        "skills.adopt" => ("target_agent_id", DataCategory::Config),
+        "agents.google_identity_set"
+        // Its own channel identities (bot / app it acts as).
+        | "agents.channels.telegram.set" | "agents.channels.telegram.remove"
+        | "agents.channels.googlechat.set" | "agents.channels.googlechat.remove" => {
+            ("agent_id", DataCategory::Identity)
+        }
+        _ => return None,
+    })
+}
+
+/// P1e: config writes naming one employee per item of an array
+/// (`items[].agent_id`): every named employee goes through the gate.
+pub(super) fn items_write_scoped(method: &str) -> Option<(&'static str, &'static str)> {
+    match method {
+        "skills.set_enabled" | "skills.remove" => Some(("items", "agent_id")),
+        _ => None,
+    }
+}
+
+/// P1e: the distinct canonical employees of `params[array][*][key]`.
+/// `Err` = one of them carries surrounding whitespace.
+pub(super) fn item_agents(params: &Value, array: &str, key: &str) -> Result<std::collections::BTreeSet<String>, &'static str> {
+    let mut agents = std::collections::BTreeSet::new();
+    for item in params.get(array).and_then(Value::as_array).into_iter().flatten() {
+        if let Some(agent) = scoped_agent(item, None, key)? {
+            agents.insert(agent);
+        }
+    }
+    Ok(agents)
+}
+
+/// P1e: methods naming their employee in a nested parameter
+/// (`outer.inner`), category [`DataCategory::Work`].
+pub(super) fn nested_agent_scoped(method: &str) -> Option<(&'static str, &'static str)> {
+    match method {
+        // A rating on a delivered file of that employee.
+        "digest.feedback" => Some(("artifact", "agent_id")),
+        _ => None,
+    }
 }
 
 /// Single-task dashboard RPCs (reads and writes) keyed by `task_id`: the
@@ -84,7 +194,93 @@ pub(super) fn task_scoped(method: &str) -> bool {
             | "tasks.pin" | "tasks.unpin" | "tasks.rename" | "tasks.comment" | "tasks.comments"
             | "tasks.iterations" | "tasks.timeline" | "tasks.changes" | "tasks.artifacts"
             | "tasks.role_turns" | "tasks.goal_decide" | "activity.list"
+            // P1e: feedback on a finished task; steering / stop records
+            // and the goal review snapshot / acceptance of one task.
+            | "digest.feedback" | "tasks.steer" | "tasks.steering" | "tasks.stop" | "tasks.stop_status"
+            | "tasks.review_snapshot" | "tasks.review_accept"
     )
+}
+
+/// P1e: the employee a [`write_scoped`] / [`nested_agent_scoped`] request
+/// names. `Ok(None)` = absent / blank (the handler refuses a missing id);
+/// `Err` = surrounding whitespace (refused, never trimmed).
+pub(super) fn scoped_agent(params: &Value, outer: Option<&str>, key: &str) -> Result<Option<String>, &'static str> {
+    let holder = match outer {
+        Some(outer) => params.get(outer),
+        None => Some(params),
+    };
+    match holder.and_then(|holder| holder.get(key)).and_then(Value::as_str) {
+        Some(raw) => visibility::canonical_agent(raw).map(|agent| (!agent.is_empty()).then(|| agent.to_owned())),
+        None => Ok(None),
+    }
+}
+
+/// P1e: audit row for `agents.pause` / `agents.resume` by `user` of
+/// `agent` when it is another person's Personal employee. No-op outside
+/// protected mode, for Shared employees and for the owner. An unreadable
+/// mirror or a failed audit write refuses (fail closed).
+pub(super) fn audit_personal_control(
+    home: &Path,
+    db: Option<&UserDb>,
+    protected: bool,
+    user: &str,
+    method: &str,
+    agent: &str,
+) -> Result<(), &'static str> {
+    if !protected {
+        return Ok(());
+    }
+    let owner = match visibility::personal_owner(home, agent) {
+        Ok(None) => return Ok(()),
+        Ok(Some(owner)) if !user.is_empty() && owner == user => return Ok(()),
+        Ok(Some(owner)) => owner,
+        Err(_) => return Err(visibility::OWNERSHIP_UNAVAILABLE),
+    };
+    let detail = json!({
+        "user_id": user,
+        "employee": agent,
+        "owner_user_id": owner,
+        "category": DataCategory::Config.as_str(),
+        "method": method,
+    })
+    .to_string();
+    db.ok_or(AUDIT_FAILED_WRITE)?
+        .log_action(Some(user), CONTROL_ACTION, Some(agent), Some(detail.as_str()), None)
+        .map_err(|_| AUDIT_FAILED_WRITE)
+}
+
+/// P1g: audit row for an allowlisted metadata read by `user` of another
+/// person's Personal employee `agent`. `Ok(false)` = nothing to audit
+/// (unprotected, Shared, owner); `Err` = unreadable mirror or failed write.
+pub(super) fn audit_personal_metadata(
+    home: &Path,
+    db: Option<&UserDb>,
+    protected: bool,
+    user: &str,
+    method: &str,
+    agent: &str,
+) -> Result<bool, &'static str> {
+    if !protected {
+        return Ok(false);
+    }
+    let owner = match visibility::personal_owner(home, agent) {
+        Ok(None) => return Ok(false),
+        Ok(Some(owner)) if !user.is_empty() && owner == user => return Ok(false),
+        Ok(Some(owner)) => owner,
+        Err(_) => return Err(visibility::OWNERSHIP_UNAVAILABLE),
+    };
+    let detail = json!({
+        "user_id": user,
+        "employee": agent,
+        "owner_user_id": owner,
+        "category": "metadata",
+        "method": method,
+    })
+    .to_string();
+    db.ok_or(AUDIT_FAILED)?
+        .log_action(Some(user), METADATA_ACTION, Some(agent), Some(detail.as_str()), None)
+        .map(|_| true)
+        .map_err(|_| AUDIT_FAILED)
 }
 
 /// The employee a task is assigned to, read from `tasks.db` without
@@ -98,7 +294,7 @@ pub(super) fn task_employee(home: &Path, task_id: &str) -> Result<Option<String>
 }
 
 /// A non-blank string parameter.
-fn param_text(params: &Value, key: &str) -> Option<String> {
+pub(super) fn param_text(params: &Value, key: &str) -> Option<String> {
     params.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned)
 }
 
@@ -138,6 +334,13 @@ pub(super) fn take_step_up(params: &mut Value) -> Option<[u8; 32]> {
     serde_json::from_value(raw).ok()
 }
 
+/// P1e: the step-up token of `params` without removing it, decoded exactly
+/// as [`take_step_up`] (for handler-gated listings that the dispatch gate
+/// does not see, `personal_p1d_gate::list_break_glass`).
+pub(super) fn peek_step_up(params: &Value) -> Option<[u8; 32]> {
+    serde_json::from_value(params.get(STEP_UP_FIELD)?.clone()).ok()
+}
+
 /// The read being authorized.
 pub(super) struct Target<'a> {
     pub method: &'a str,
@@ -166,13 +369,19 @@ pub(super) fn authorize_break_glass(
         "method": target.method,
     })
     .to_string();
+    // P1e: a config / identity write is audited as a write, never a read.
+    let (granted, refused, step_up, audit_failed) = if target.category.is_write() {
+        (WRITE_ACTION, WRITE_REFUSED_ACTION, STEP_UP_REQUIRED_WRITE, AUDIT_FAILED_WRITE)
+    } else {
+        (READ_ACTION, REFUSED_ACTION, STEP_UP_REQUIRED, AUDIT_FAILED)
+    };
     let authorized = csrf.is_some_and(|csrf| authorize_step_up(proof, admin, csrf, now).is_ok());
     if !authorized {
-        let _ = db.log_action(Some(admin), REFUSED_ACTION, Some(target.agent), Some(detail.as_str()), None);
-        return Err(STEP_UP_REQUIRED);
+        let _ = db.log_action(Some(admin), refused, Some(target.agent), Some(detail.as_str()), None);
+        return Err(step_up);
     }
-    db.log_action(Some(admin), READ_ACTION, Some(target.agent), Some(detail.as_str()), None)
-        .map_err(|_| AUDIT_FAILED)
+    db.log_action(Some(admin), granted, Some(target.agent), Some(detail.as_str()), None)
+        .map_err(|_| audit_failed)
 }
 
 impl MethodHandler {
@@ -216,7 +425,11 @@ impl MethodHandler {
             authorize_break_glass(&db, proof.as_ref(), &admin_id, csrf.as_ref(), now, &target, &owner)
         })
         .await
-        .map_err(|_| UNAVAILABLE)?
+        .map_err(|_| UNAVAILABLE)??;
+        // P1g: the audited step-up admits this employee to the ACL for the
+        // rest of THIS request only (never for delegation).
+        visibility::record_break_glass(&ctx.user_id, target.agent);
+        Ok(())
     }
 
     /// Dispatch-level wrapper for [`agent_scoped`] methods (on `agent_id`)
@@ -232,7 +445,14 @@ impl MethodHandler {
         self.personal_delegation_gate(method, params, ctx).await?;
         let category = agent_scoped(method);
         let by_task = task_scoped(method);
-        if (category.is_none() && !by_task) || !crate::runtime_readiness::is_protected_linux() {
+        let by_id = super::personal_p1d_gate::id_scoped(method);
+        let by_write = write_scoped(method);
+        let by_nested = nested_agent_scoped(method);
+        let by_items = items_write_scoped(method);
+        if (category.is_none() && !by_task && by_id.is_none() && by_write.is_none() && by_nested.is_none()
+            && by_items.is_none())
+            || !crate::runtime_readiness::is_protected_linux()
+        {
             return Ok(());
         }
         let refuse = |message: &str| WsFrame::error_response("", message);
@@ -241,6 +461,29 @@ impl MethodHandler {
             self.personal_data_gate(ctx, Target { method, category, agent: &agent }, csrf)
                 .await
                 .map_err(refuse)?;
+        }
+        // P1e: config / identity writes and nested employee parameters.
+        let scoped = match (by_write, by_nested) {
+            (Some((key, category)), _) => Some((None, key, category)),
+            (None, Some((outer, key))) => Some((Some(outer), key, DataCategory::Work)),
+            (None, None) => None,
+        };
+        if let Some((outer, key, category)) = scoped
+            && let Some(agent) = scoped_agent(params, outer, key).map_err(refuse)?
+        {
+            self.personal_data_gate(ctx, Target { method, category, agent: &agent }, csrf)
+                .await
+                .map_err(refuse)?;
+        }
+        if let Some((array, key)) = by_items {
+            for agent in item_agents(params, array, key).map_err(refuse)? {
+                self.personal_data_gate(ctx, Target { method, category: DataCategory::Config, agent: &agent }, csrf)
+                    .await
+                    .map_err(refuse)?;
+            }
+        }
+        if let Some(scope) = by_id {
+            self.personal_id_gate(ctx, method, scope, params, csrf).await?;
         }
         let Some(task_id) = param_text(params, "task_id").filter(|_| by_task) else {
             return Ok(());
@@ -255,6 +498,9 @@ impl MethodHandler {
                 .personal_data_gate(ctx, Target { method, category: DataCategory::Work, agent: &agent }, csrf)
                 .await
                 .map_err(refuse),
+            // P1d: a non-Admin cannot tell an unknown task from another
+            // person's Personal task (both `permission denied`).
+            None if !ctx.is_admin() => Err(refuse(NOT_ALLOWED)),
             None => Ok(()),
         }
     }
@@ -292,6 +538,40 @@ impl MethodHandler {
         Ok(hidden)
     }
 
+    /// P1e: [`audit_personal_control`] for one `agents.pause` /
+    /// `agents.resume` call (protected mode only).
+    pub(super) async fn personal_control_audit(&self, ctx: &UserContext, method: &str, agent: &str)
+        -> Result<(), &'static str> {
+        if !crate::runtime_readiness::is_protected_linux() {
+            return Ok(());
+        }
+        let db = self.user_db.read().await.clone();
+        let (home, user, method, agent) =
+            (self.home_dir.clone(), ctx.user_id.clone(), method.to_owned(), agent.to_owned());
+        tokio::task::spawn_blocking(move || {
+            audit_personal_control(&home, db.as_deref(), true, &user, &method, &agent)
+        })
+        .await
+        .map_err(|_| UNAVAILABLE)?
+    }
+
+    /// P1g: best-effort audit row ([`METADATA_ACTION`]) for an allowlisted
+    /// metadata read (`agents.status`, `presets.status`, `agents.avatar`) of
+    /// another person's Personal employee. Metadata only, so a failed write
+    /// never blocks the read; no row for the owner or a Shared employee.
+    pub(super) async fn personal_metadata_audit(&self, ctx: &UserContext, method: &str, agent: &str) {
+        if !crate::runtime_readiness::is_protected_linux() {
+            return;
+        }
+        let db = self.user_db.read().await.clone();
+        let (home, user, method, agent) =
+            (self.home_dir.clone(), ctx.user_id.clone(), method.to_owned(), agent.to_owned());
+        let _ = tokio::task::spawn_blocking(move || {
+            audit_personal_metadata(&home, db.as_deref(), true, &user, &method, &agent)
+        })
+        .await;
+    }
+
     /// Personal employees hidden from `ctx` in cross-agent listings. Empty
     /// outside protected mode; unreadable ⇒ `Err` (the caller refuses).
     pub(super) async fn personal_hidden_agents(&self, ctx: &UserContext)
@@ -310,3 +590,7 @@ impl MethodHandler {
 #[cfg(all(test, unix))]
 #[path = "personal_data_gate_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "personal_p1e_tests.rs"]
+mod p1e_tests;

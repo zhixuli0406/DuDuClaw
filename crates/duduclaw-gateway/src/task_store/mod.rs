@@ -50,6 +50,7 @@ mod claim;
 mod discovery;
 pub(crate) use discovery::DiscoveryDecisionReceipt;
 mod goals;
+pub(crate) mod goal_creator_backfill;
 mod iterations;
 mod isolation_queries;
 mod live_io;

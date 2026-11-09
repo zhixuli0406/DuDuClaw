@@ -82,6 +82,16 @@ mod restore;
 #[path = "isolation_employee_purge.rs"]
 mod purge;
 
+/// Every method [`MethodHandler::handle_isolation_employee`] serves: this
+/// handler's [`METHODS`], F6d/F6g/F6fa2 `restore::METHODS`, F6k
+/// `restore::shared::METHODS` and F6i `purge::METHODS` (merge P1h × F6: the
+/// P1h frozen lifecycle allowlist scan reads this).
+#[cfg(test)]
+pub(super) fn routed_methods() -> Vec<&'static str> {
+    METHODS.iter().chain(restore::METHODS.iter()).chain(restore::shared::METHODS.iter())
+        .chain(purge::METHODS.iter()).copied().collect()
+}
+
 /// `agents.create` in protected mode points here.
 pub(super) const DIRECT_CREATE_REFUSED: &str = "受保護模式下不能直接建立 AI 員工。請改用員工配置提案：\
     管理員提出提案並通過密碼與雙因素驗證後，在核准卡片上確認；同仁可在自己的帳號頁申請個人專屬員工，由管理員核准。";

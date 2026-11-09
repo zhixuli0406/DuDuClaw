@@ -28,7 +28,16 @@ impl TaskStore {
                 row.task_id,
                 mask_derived_text(&row.summary),
                 row.timestamp,
-                row.metadata.as_deref().map(mask_derived_text),
+                // v1.81 P1g (F7): a goal link (`goal_created` + metadata that
+                // is exactly an id link) is ownership, not text — stored as
+                // is, so the redaction masker can never break the link and
+                // turn a Personal employee's goal into an unowned one.
+                row.metadata.as_deref().map(|raw| {
+                    match crate::personal_visibility::goal_link_metadata(&row.event_type, raw) {
+                        Some(link) => link,
+                        None => mask_derived_text(raw).to_string(),
+                    }
+                }),
             ],
         )
         .map_err(|e| format!("append activity: {e}"))?;
@@ -74,6 +83,18 @@ impl TaskStore {
     ) -> Result<(Vec<ActivityRow>, i64), String> {
         self.list_activity_with_access(agent_id, event_type, limit, offset,
             ActivityAccess::Worker(worker), None).await
+    }
+
+    /// v1.81 P1d: [`Self::list_activity_for_worker`] without the rows of
+    /// `hidden` employees (by the row's employee and by the employee of the
+    /// task it names), applied before LIMIT and COUNT. An empty set reads
+    /// exactly as before.
+    pub async fn list_activity_for_worker_hiding(
+        &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
+        offset: i64, worker: Option<&str>, hidden: &std::collections::BTreeSet<String>,
+    ) -> Result<(Vec<ActivityRow>, i64), String> {
+        self.list_activity_with_access(agent_id, event_type, limit, offset,
+            ActivityAccess::Worker(worker), hidden_json(hidden)).await
     }
 
     async fn list_activity_with_access(

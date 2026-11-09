@@ -27,8 +27,11 @@ fn reason(error: &VerificationError) -> &'static str {
 }
 
 /// What the Admin call learned about the recording (for the audit record).
+/// `stored_reason` is the stored result's reason code, read before a
+/// Personal result is withheld (P1h); `withheld` records that it was.
 #[derive(Default)]
-struct Facts { key: Option<RecordingKey>, employee: Option<duduclaw_isolation::ids::EmployeeId>, stop_by: Option<&'static str> }
+struct Facts { key: Option<RecordingKey>, employee: Option<duduclaw_isolation::ids::EmployeeId>, stop_by: Option<&'static str>,
+    stored_reason: Option<String>, withheld: bool }
 
 /// Dashboard control of an in-run recording (HX6, D8 revision §4). Live run:
 /// `HelperStop` for exactly that `(run, call)` through spawnd; ended: the
@@ -41,7 +44,7 @@ pub(crate) fn control_recording(home: &Path, ctx: &duduclaw_auth::UserContext, i
     let (severity, outcome) = match &result { Ok(_) => (Severity::Info, "ok"), Err(_) => (Severity::Warning, "failed") };
     let event = if stop { "isolation_recording_admin_stop" } else { "isolation_recording_admin_status" };
     let status = result.as_ref().ok().and_then(|value| value["status"].as_str()).map(str::to_owned);
-    let stored_reason = result.as_ref().ok().and_then(|value| value["result"]["reason"].as_str()).map(str::to_owned);
+    let stored_reason = facts.stored_reason.take();
     append_audit_event(home, &AuditEvent::new(event, "gateway", severity, serde_json::json!({
         "actor": ctx.user_id,
         "employee": facts.employee.map(|employee| hex(&employee.0)),
@@ -51,6 +54,7 @@ pub(crate) fn control_recording(home: &Path, ctx: &duduclaw_auth::UserContext, i
         "stop_by": facts.stop_by,
         "outcome": outcome,
         "status": status,
+        "withheld": facts.withheld,
         "reason": match &result { Ok(_) => stored_reason, Err(error) => Some(reason(error).to_owned()) },
     })));
     result
@@ -62,6 +66,12 @@ fn control(home: &Path, ctx: &duduclaw_auth::UserContext, id: &str, stop: bool, 
         .map_err(|_| VerificationError::Invalid)?;
     let call = duduclaw_mcp_boundary::recording_jobs::parse_id(id)?;
     let owner = OWNER.get().filter(|owner| owner.home == home).ok_or(VerificationError::Unavailable)?;
+    // v1.81 P1h (N3): stopping stays a host control for every Admin (D8,
+    // audited above), but a Personal employee's recording result is its
+    // owner's private work: withheld from anyone else (status only). The
+    // owner is the Personal binding the recording row was started under; an
+    // unknown call refuses here (audited as failed) before any control.
+    let personal_owner = owner.recording_jobs.admin_recording_owner(call)?;
     // Trusted host read, for the audit's employee/run only (control re-reads).
     if let Ok(row) = owner.recording_jobs.admin_read(call) { facts.key = Some(row.key); facts.employee = Some(row.employee); }
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| VerificationError::Unavailable)?;
@@ -70,7 +80,23 @@ fn control(home: &Path, ctx: &duduclaw_auth::UserContext, id: &str, stop: bool, 
     if let Some(key) = facts.key {
         facts.stop_by = owner.recording_jobs.stop_by(key).ok().flatten().map(|by| by.as_str());
     }
-    result
+    let mut result = result?;
+    // The reason code (never content) stays in the audit even when withheld.
+    facts.stored_reason = result["result"]["reason"].as_str().map(str::to_owned);
+    if withhold(personal_owner.as_deref(), &ctx.user_id) {
+        if let Some(fields) = result.as_object_mut() {
+            fields.insert("result".to_owned(), serde_json::Value::Null);
+            fields.insert("withheld".to_owned(), serde_json::Value::Bool(true));
+        }
+        facts.withheld = true;
+    }
+    Ok(result)
+}
+
+/// P1h: a Personal recording's result is shown only to its owner; a Shared
+/// employee's (`None`) to every Admin.
+fn withhold(personal_owner: Option<&str>, actor: &str) -> bool {
+    personal_owner.is_some_and(|recorded| recorded != actor)
 }
 
 /// The boundary's recording facts, appended to `security_audit.jsonl` off
@@ -117,10 +143,18 @@ mod tests {
             assert_eq!(details["outcome"].as_str(), Some("failed"));
             // Role refused (no users.db), or no booted owner: either way a named code.
             assert!(matches!(details["reason"].as_str(), Some("invalid" | "unavailable")), "{details}");
-            for key in ["employee", "run", "call", "stop_by", "status"] { assert!(details.get(key).is_some(), "{key}"); }
+            for key in ["employee", "run", "call", "stop_by", "status", "withheld"] { assert!(details.get(key).is_some(), "{key}"); }
+            assert_eq!(details["withheld"], serde_json::json!(false));
         }
         assert_eq!(reason(&VerificationError::Unavailable), "unavailable");
         assert_eq!(reason(&VerificationError::Revoked), "revoked");
+    }
+    /// P1h (N3): only another user's Personal recording result is withheld.
+    #[test]
+    fn p1h_recording_result_withheld_from_non_owner_only() {
+        assert!(withhold(Some("u-owner"), "u-admin"));
+        assert!(!withhold(Some("u-owner"), "u-owner"));
+        assert!(!withhold(None, "u-admin"), "Shared employee: every Admin sees it");
     }
     /// N3: a flood of identical start refusals reaches `security_audit.jsonl`
     /// as one record; a different reason is its own record.

@@ -319,7 +319,7 @@ innocent='SECRET-CANARY'
         }
     }
     #[test] fn authority_users_and_tasks_refuse_version_views_and_triggers() {
-        for (kind,title,schema) in [(SourceKind::AuthorityUsersSqlite,"users.db",include_str!("users-v1793.sql")),(SourceKind::AuthorityTasksSqlite,"tasks.db",crate::catalog::TASKS_V1793),(SourceKind::AuthorityTasksSqlite,"tasks.db",crate::catalog::TASKS_V180)] {
+        for (kind,title,schema) in [(SourceKind::AuthorityUsersSqlite,"users.db",include_str!("users-v1793.sql")),(SourceKind::AuthorityTasksSqlite,"tasks.db",crate::catalog::TASKS_V1793),(SourceKind::AuthorityTasksSqlite,"tasks.db",crate::catalog::TASKS_V180),(SourceKind::AuthorityTasksSqlite,"tasks.db",crate::catalog::TASKS_V181)] {
             for mutation in ["PRAGMA user_version=1", "CREATE VIEW planted AS SELECT 1", "CREATE TABLE planted_authority(token TEXT)"] {
                 let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();conn.execute_batch(schema).unwrap();conn.execute_batch(mutation).unwrap();conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();drop(conn);
                 assert!(extract(&request(kind,title),std::fs::File::open(file.path()).unwrap(),None).is_err());

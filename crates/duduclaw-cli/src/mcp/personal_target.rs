@@ -29,6 +29,15 @@
 //! delegation tools ([`DELEGATION_TOOLS`]) also let another Personal employee
 //! of the same owner hand work over (the owner's own work).
 //!
+//! P1d: every task-id keyed tool and the `tasks_create` link fields are in
+//! [`PERSONAL_ID_TARGETS`]; wildcard listings and external callers are in
+//! `personal_wildcard.rs`.
+//!
+//! P1e: an id may resolve to several candidate employees (a goal with more
+//! than one recorded creator); the call is refused when ANY of them refuses
+//! (`personal_visibility::work_item_employees`). Discovery runs named by
+//! `run_id` resolve their task's employee.
+//!
 //! A self-target (target == acting employee, own namespace, own store) is
 //! decided before any `users.db` read, so it keeps working inside an
 //! isolated run whose MCP process cannot open `users.db`; every
@@ -114,15 +123,48 @@ pub(crate) const DELEGATION_TOOLS: &[&str] =
     &["spawn_agent", "send_to_agent", "tasks_create", "tasks_update", "discovery_catalog"];
 
 /// P1c: tools naming a work item by id whose employee is read from
-/// `tasks.db` (`personal_visibility::work_item_employee`). `goals_create`,
-/// `plan_start`, `plan_update_step` (holder rule: own steps only) and
-/// `team_handoff` (role to role inside the member's own host-pinned task)
-/// name no other employee and are not listed.
+/// `tasks.db` (`personal_visibility::work_item_employee`). P1d: every tool
+/// that names a task by id (claim / renew / complete / block, activity,
+/// capability grants) and the link fields of `tasks_create` / `tasks_update`
+/// (`parent_task_id`, `goal_id`, `depends_on` — a string or an array of ids)
+/// and `goals_create` (`parent_goal_id`). `plan_start`, `plan_update_step`
+/// (holder rule: own steps only) and `team_handoff` (role to role inside the
+/// member's own host-pinned task) name no other employee and are not listed;
+/// the scan in `personal_target_tests.rs` keeps this table complete.
 pub(crate) const PERSONAL_ID_TARGETS: &[(&str, &str, visibility::WorkItem)] = &[
     ("tasks_update", "task_id", visibility::WorkItem::Task),
+    ("tasks_update", "depends_on", visibility::WorkItem::Task),
+    ("tasks_create", "parent_task_id", visibility::WorkItem::Task),
+    ("tasks_create", "depends_on", visibility::WorkItem::Task),
+    ("tasks_create", "goal_id", visibility::WorkItem::Goal),
+    ("tasks_claim", "task_id", visibility::WorkItem::Task),
+    ("tasks_renew", "task_id", visibility::WorkItem::Task),
+    ("tasks_complete", "task_id", visibility::WorkItem::Task),
+    ("tasks_block", "task_id", visibility::WorkItem::Task),
+    ("activity_post", "task_id", visibility::WorkItem::Task),
     ("activity_list", "task_id", visibility::WorkItem::Task),
+    ("capability_request", "task_id", visibility::WorkItem::Task),
+    ("goals_create", "parent_goal_id", visibility::WorkItem::Goal),
     ("plan_get", "plan_id", visibility::WorkItem::Plan),
+    // P1e: a discovery run is its task's employee's work.
+    ("discovery_tree", "run_id", visibility::WorkItem::DiscoveryRun),
+    ("discovery_artifact", "run_id", visibility::WorkItem::DiscoveryRun),
+    ("discovery_cancel", "run_id", visibility::WorkItem::DiscoveryRun),
 ];
+
+/// The ids an argument names: a string, an array of strings, or a string
+/// holding a JSON array (the stored `depends_on` form). Blank ids dropped.
+fn argument_ids(value: Option<&Value>) -> Vec<String> {
+    let ids: Vec<String> = match value {
+        Some(Value::String(raw)) => match serde_json::from_str::<Vec<String>>(raw) {
+            Ok(list) if raw.trim_start().starts_with('[') => list,
+            _ => vec![raw.clone()],
+        },
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        _ => Vec::new(),
+    };
+    ids.into_iter().map(|id| id.trim().to_owned()).filter(|id| !id.is_empty()).collect()
+}
 
 /// The rule for `tool` on `target`: delegation tools allow the same owner's
 /// Personal employees, the rest only the employee itself.
@@ -151,14 +193,14 @@ pub(crate) fn id_target_refusal(
     PERSONAL_ID_TARGETS
         .iter()
         .filter(|(name, _, _)| *name == tool)
-        .filter_map(|(_, key, item)| {
-            let id = arguments.get(*key).and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty())?;
-            Some((id, *item))
-        })
-        .find_map(|(id, item)| match visibility::work_item_employee(home_dir, item, id) {
-            Ok(Some(employee)) if employee == acting_agent => None,
-            Ok(Some(employee)) => target_refusal(home_dir, tool, acting_agent, &employee),
-            Ok(None) => None,
+        .flat_map(|(_, key, item)| argument_ids(arguments.get(*key)).into_iter().map(move |id| (id, *item)))
+        // P1e: every candidate employee (a goal may have several creators)
+        // must pass; an unassigned task / an uncredited goal has none.
+        .find_map(|(id, item)| match visibility::work_item_employees(home_dir, item, &id) {
+            Ok(employees) => employees
+                .iter()
+                .filter(|employee| employee.as_str() != acting_agent && !employee.trim().is_empty())
+                .find_map(|employee| target_refusal(home_dir, tool, acting_agent, employee)),
             Err(visibility::Unavailable) => Some(visibility::OWNERSHIP_UNAVAILABLE),
         })
 }

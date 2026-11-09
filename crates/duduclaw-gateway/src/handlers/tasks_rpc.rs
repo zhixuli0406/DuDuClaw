@@ -218,7 +218,10 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_tasks_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let target = params.get("assigned_to").and_then(Value::as_str).unwrap_or("").trim();
+        // v1.81 P1d: canonical target only; owner-only for a Personal one.
+        let raw_target = params.get("assigned_to").and_then(Value::as_str).unwrap_or("");
+        if let Err(frame) = self.delegation_check(ctx, raw_target).await { return frame; }
+        let target = raw_target.trim();
         if let Err(frame) = self.deny_main_for_non_admin(ctx, target).await { return frame; }
         if !ctx.is_admin() {
             let target = params.get("assigned_to").and_then(Value::as_str).unwrap_or("").trim();
@@ -410,6 +413,9 @@ impl MethodHandler {
         // allowed to hand that agent work: Operator on it, or a team grant
         // that derived Operator (`can_assign_to`, on the live identity).
         if let Some(dest) = params.get("assigned_to").and_then(|v| v.as_str()) {
+            // v1.81 P1d: canonical destination; owner-only for a Personal one
+            // (also reached in-process from `tasks.assign`).
+            if let Err(frame) = self.delegation_check(ctx, dest).await { return frame; }
             if !dest.is_empty() && !ctx.can_assign_to(dest) {
                 return WsFrame::error_response("", PERMISSION_DENIED);
             }

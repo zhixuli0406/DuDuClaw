@@ -209,6 +209,23 @@ impl SqliteRecordingJobs {
         Ok(Arc::new(Self { connection: Mutex::new(connection) }))
     }
 
+    /// v1.81 P1h (N3), ported onto the HX6 store: the Personal owner recorded
+    /// on recording `call`'s employee binding (`None` = a Shared employee).
+    /// Trusted host read for the Admin recording RPC, so the gateway can
+    /// withhold a Personal employee's recording result from anyone but its
+    /// owner. An unknown call or an unparsable binding is `Invalid` (callers
+    /// refuse; never "no owner").
+    pub fn admin_recording_owner(&self, call: HelperCallId) -> Result<Option<String>, VerificationError> {
+        use duduclaw_isolation::capability::EmployeeBinding;
+        let connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
+        let binding: String = connection.query_row("SELECT binding FROM recording_jobs WHERE call=?1",
+            [call.hex()], |row| row.get(0)).map_err(|_| VerificationError::Invalid)?;
+        match serde_json::from_str::<EmployeeBinding>(&binding).map_err(|_| VerificationError::Invalid)? {
+            EmployeeBinding::Personal(owner) => Ok(Some(owner.as_str().to_owned())),
+            EmployeeBinding::Shared(_) => Ok(None),
+        }
+    }
+
     fn row(connection: &rusqlite::Connection, call: HelperCallId, owner: Option<(&RequestContext, &str, &str)>)
         -> Result<RecordingRow, VerificationError> {
         let mapped = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, Vec<u8>, String, Option<String>)> {

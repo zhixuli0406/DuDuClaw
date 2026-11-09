@@ -42,6 +42,12 @@ impl MethodHandler {
         // board cards (`TaskReader`).
         macro_rules! check_task_board_filter {
             () => {
+                // v1.81 P1g: see `check_agent_filter!`.
+                if ctx.is_admin()
+                    && params.get("agent_id").and_then(|v| v.as_str()).is_some_and(|id| !id.is_empty() && ctx.hides_agent(id))
+                {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 if !ctx.is_admin() {
                     match params.get("agent_id").and_then(|v| v.as_str()) {
                         Some(id) if !id.is_empty() => {
@@ -64,6 +70,15 @@ impl MethodHandler {
         // teams' tasks/activity). Mirrors the agent-binding intent of memory.*.
         macro_rules! check_agent_filter {
             ($min_level:expr) => {
+                // v1.81 P1g: an Admin naming another person's Personal
+                // employee is refused too, unless this request's audited
+                // step-up admitted it (dispatch gate); unscoped Admin
+                // listings drop those rows in their handlers.
+                if ctx.is_admin()
+                    && params.get("agent_id").and_then(|v| v.as_str()).is_some_and(|id| !id.is_empty() && ctx.hides_agent(id))
+                {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 if !ctx.is_admin() {
                     match params.get("agent_id").and_then(|v| v.as_str()) {
                         Some(id) if !id.is_empty() => {
@@ -376,6 +391,8 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_agents_google_identity_get(&agent_id)).await
             }
             "agents.google_identity_set" => {
+                // v1.81 P1e: gated first as an Identity write
+                // (`personal_data_gate::write_scoped`): owner, or Admin + step-up + audit.
                 let agent_id = params.get("agent_id").and_then(Value::as_str).unwrap_or("");
                 check_agent_named!(agent_id, AccessLevel::Owner);
                 boxed_frame(|| self.handle_agents_google_identity_set(params, ctx)).await
@@ -575,7 +592,12 @@ impl MethodHandler {
             // owning agent inside the handler and fail closed (HS4).
             "plans.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                boxed_frame(|| self.handle_plans_list(params)).await
+                // v1.81 P1d: other people's Personal employees are left out.
+                let hidden = match self.p1d_list_hidden(ctx, method, crate::personal_visibility::DataCategory::Work, &params).await {
+                    Ok(hidden) => hidden,
+                    Err(frame) => return frame,
+                };
+                boxed_frame(|| self.handle_plans_list(params, hidden)).await
             }
             "plans.get" => boxed_frame(|| self.handle_plans_get(params, ctx)).await,
             "plans.create" => {
@@ -743,10 +765,18 @@ impl MethodHandler {
                 require_manager!();
                 boxed_frame(|| self.handle_mail_status()).await
             }
-            "mail.list" => match boxed_frame(|| self.mailbox_reader_gate(ctx)).await {
-                Ok(reader) => boxed_frame(|| self.handle_mail_list(params, reader)).await,
-                Err(e) => WsFrame::error_response("", &e),
-            },
+            "mail.list" => {
+                let reader = match boxed_frame(|| self.mailbox_reader_gate(ctx)).await {
+                    Ok(reader) => reader,
+                    Err(e) => return WsFrame::error_response("", &e),
+                };
+                // v1.81 P1d: other people's Personal employees are left out.
+                let hidden = match self.p1d_list_hidden(ctx, method, crate::personal_visibility::DataCategory::Mail, &params).await {
+                    Ok(hidden) => hidden,
+                    Err(frame) => return frame,
+                };
+                boxed_frame(|| self.handle_mail_list(params, reader, hidden)).await
+            }
             "mail.read" => {
                 if let Err(e) = boxed_frame(|| self.mailbox_reader_gate(ctx)).await {
                     return WsFrame::error_response("", &e);
@@ -765,7 +795,11 @@ impl MethodHandler {
                 if let Err(e) = boxed_frame(|| self.mailbox_viewer_gate(ctx)).await {
                     return WsFrame::error_response("", &e);
                 }
-                boxed_frame(|| self.handle_mail_outbox(params)).await
+                let hidden = match self.p1d_list_hidden(ctx, method, crate::personal_visibility::DataCategory::Mail, &params).await {
+                    Ok(hidden) => hidden,
+                    Err(frame) => return frame,
+                };
+                boxed_frame(|| self.handle_mail_outbox(params, hidden)).await
             }
             "mail.decide" => {
                 require_manager!();

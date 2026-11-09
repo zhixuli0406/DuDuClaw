@@ -45,6 +45,9 @@ pub(super) fn agent_unavailable() -> ChatMessage {
 
 impl WebChatState {
     /// None preserves the existing admin/widget default path byte for byte.
+    /// P1h (N1): `None` picks no target by itself — the caller
+    /// (`route::decide_webchat_route`) still runs `authorize_target` on the default
+    /// it falls back to, whose Personal check precedes the Admin shortcut.
     pub(super) async fn resolve_new_agent(&self, user: &str) -> Result<Option<String>, &'static str> {
         if is_widget_visitor(user) { return Ok(None); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| "unavailable")?;
@@ -81,24 +84,26 @@ impl WebChatState {
         )) { return Ok(()); }
         if is_widget_visitor(user) { return Ok(()); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| agent_unavailable())?;
-        if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }
+        // P1h (N1): no Admin shortcut for assignment targets. An Admin's
+        // targets differ from everyone's only by another person's Personal
+        // employees (`assignment_text_allowed`), and resuming a schedule goes
+        // through `authorize_target`, whose Personal check runs before its own
+        // Admin shortcut. Pausing or removing one of the Admin's OWN schedules
+        // only stops work, so it stays possible (a legacy schedule on someone
+        // else's Personal employee can still be cleaned up).
+        let admin = snapshot.role() == duduclaw_auth::UserRole::Admin;
         if let AssignCommand::Text(text) = command {
-            use duduclaw_agent::trigger_match::{self, MentionScan};
             let sender = SenderAccess::from_effective(snapshot.access)
                 .for_webchat(gateway_default_id(&self.ctx.home_dir).await);
             let reg = self.ctx.registry.read().await;
-            let targets = crate::trigger_route::assign::assignment_mention_targets(
-                &reg, &sender, "webchat", None,
-            );
-            if trigger_match::has_named_mention(text)
-                && !matches!(trigger_match::scan_mentions(text, &targets, &|_| true),
-                    MentionScan::Hit(_) | MentionScan::Partial { .. })
-            {
+            if !assignment_text_allowed(&reg, &sender, text, duduclaw_auth::acl::personal_restriction()) {
                 tracing::warn!(user, "WebChat assignment target unavailable");
                 return Err(agent_unavailable());
             }
             return Ok(());
         }
+        let stops_work = matches!(command,
+            AssignCommand::Schedules(ScheduleCommand::Pause(_) | ScheduleCommand::Remove(_)));
         let AssignCommand::Schedules(
             ScheduleCommand::Pause(arg) | ScheduleCommand::Resume(arg) | ScheduleCommand::Remove(arg),
         ) = command else { return Ok(()); };
@@ -110,7 +115,9 @@ impl WebChatState {
         let mut matches = rows.iter().filter(|r| r.id == *arg || duduclaw_core::truncate_chars(&r.id, 8) == *arg);
         let row = matches.next().ok_or_else(not_found)?;
         if matches.next().is_some() { return Err(not_found()); }
-        self.authorize_target(user, &row.agent_id, false).await?;
+        if !(admin && stops_work) {
+            self.authorize_target(user, &row.agent_id, false).await?;
+        }
         // Bind subsequent command execution to the checked row, never resolve
         // the short display number against a second potentially changed list.
         *arg = row.id.clone();
@@ -148,6 +155,20 @@ impl WebChatState {
         };
         if is_widget_visitor(user) { return Ok(()); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| denied("identity_unavailable"))?;
+        // v1.81 P1g: talking to a Personal employee makes it run work for the
+        // caller — its owner only, whatever the role (read fresh; unreadable
+        // ownership refuses). Checked before the Admin shortcut.
+        if crate::runtime_readiness::is_protected_linux() {
+            let (home, who, target) = (self.ctx.home_dir.clone(), user.to_owned(), agent.to_owned());
+            let refused = tokio::task::spawn_blocking(move || {
+                crate::personal_visibility::acl_denies(&home, true, &who, &target)
+            })
+            .await
+            .unwrap_or(true);
+            if refused {
+                return Err(denied("personal_employee"));
+            }
+        }
         if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }
         let default = gateway_default_id(&self.ctx.home_dir).await.map_err(|_| denied("config_unavailable"))?;
         let sender = SenderAccess::from_effective(snapshot.access.clone()).for_webchat(Ok(default));
@@ -158,6 +179,33 @@ impl WebChatState {
         }
         Ok(())
     }
+}
+
+/// `/交辦 <text>` on WebChat: a named mention must hit (or partially match)
+/// an employee this sender may assign to; otherwise the same
+/// non-enumerating "unavailable" frame as an unknown name. P1h (N1): applies
+/// to Admins too — another person's Personal employee is not a target.
+pub(crate) fn assignment_text_allowed(
+    reg: &duduclaw_agent::registry::AgentRegistry,
+    sender: &SenderAccess,
+    text: &str,
+    restriction: Option<&dyn duduclaw_auth::acl::PersonalRestriction>,
+) -> bool {
+    use crate::trigger_route::assign::{AssignRight, assign_right_under, assignment_mention_targets_under};
+    use duduclaw_agent::trigger_match::{self, MentionScan};
+    if !trigger_match::has_named_mention(text) {
+        return true;
+    }
+    if matches!(sender.sender, crate::trigger_route::Sender::Admin { .. }) {
+        // Admins keep the legacy detail for unknown names (usage reply); only
+        // a mention that resolves to nothing but a refused employee — another
+        // person's Personal one — is stopped here.
+        let all = crate::trigger_route::mention_targets(reg);
+        let allowed = |id: &str| matches!(assign_right_under(reg, sender, id, None, restriction), AssignRight::Allowed(_));
+        return !matches!(trigger_match::scan_mentions(text, &all, &allowed), MentionScan::Forbidden(_));
+    }
+    let targets = assignment_mention_targets_under(reg, sender, "webchat", None, restriction);
+    matches!(trigger_match::scan_mentions(text, &targets, &|_| true), MentionScan::Hit(_) | MentionScan::Partial { .. })
 }
 
 /// Shared by async admission and the synchronous final-write policy fence.

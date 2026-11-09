@@ -198,7 +198,7 @@ impl ProfilePlan {
     fn migration_authority_task_schema_matches_fresh_store() {
         let home=tempfile::tempdir().unwrap();let _store=crate::task_store::TaskStore::open(home.path()).unwrap();
         let actual=rusqlite::Connection::open(home.path().join("tasks.db")).unwrap();let expected=rusqlite::Connection::open_in_memory().unwrap();
-        expected.execute_batch(include_str!("../../../duduclaw-import/src/tasks-v180.sql")).unwrap();
+        expected.execute_batch(include_str!("../../../duduclaw-import/src/tasks-v181.sql")).unwrap();
         fn schema(c:&rusqlite::Connection)->Vec<(String,String,String,Option<String>)> {c.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect()}
         assert_eq!(schema(&actual),schema(&expected));
     }

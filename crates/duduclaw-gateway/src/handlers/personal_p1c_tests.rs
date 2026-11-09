@@ -105,8 +105,10 @@ async fn p1c_approval_decide_owner_or_audited_step_up() {
     for decider in [Some(h.admin.clone()), Some(h.bob.clone()), Some("system".to_string()), Some(String::new()), None] {
         assert_eq!(decider_refusal(h.path(), true, PERSONAL, || decider.clone()), Some(PERSONAL_DECISION_REFUSED));
     }
-    // A sender with no verified dashboard account is not the owner.
-    assert_eq!(channel_card_refusal_with(h.path(), true, &rec, "telegram", "424242"), Some(PERSONAL_DECISION_REFUSED));
+    // A sender with no verified dashboard account is not the owner (P1d:
+    // told what an unknown card says, never whose card it is).
+    assert_eq!(channel_card_refusal_with(h.path(), true, &rec, "telegram", "424242"),
+        Some(crate::personal_decision::CHANNEL_CARD_NOT_FOUND));
     // Shared cards: unchanged, the decider is never looked up.
     assert_eq!(decider_refusal(h.path(), true, SHARED, no_lookup), None);
     let shared = broker.request(SHARED, "dynamic_review_kind", "shared", json!({}), 300).await.unwrap();
@@ -120,7 +122,8 @@ async fn p1c_approval_decide_owner_or_audited_step_up() {
     legacy.agent_id = String::new();
     legacy.payload = json!({"task_id": "personal-task"});
     assert_eq!(card_employee(h.path(), &legacy), Ok(Some(PERSONAL.to_string())));
-    assert_eq!(channel_card_refusal_with(h.path(), true, &legacy, "telegram", "424242"), Some(PERSONAL_DECISION_REFUSED));
+    assert_eq!(channel_card_refusal_with(h.path(), true, &legacy, "telegram", "424242"),
+        Some(crate::personal_decision::CHANNEL_CARD_NOT_FOUND));
 
     // Fail closed: no readable ownership mirror / task store.
     let empty = crate::fs_safe::private_test_home().unwrap();
@@ -134,11 +137,12 @@ async fn p1c_approval_decide_owner_or_audited_step_up() {
 #[test]
 fn p1c_delegation_to_personal_employee_owner_only() {
     let h = home();
+    // P1d: `tasks.assign` (destination `agent_id`) is delegation too.
     for (method, key) in [("tasks.create", "assigned_to"), ("tasks.update", "assigned_to"),
-        ("tasks.goal_create", "agent_id"), ("plans.create", "agent_id")] {
+        ("tasks.goal_create", "agent_id"), ("plans.create", "agent_id"), ("tasks.assign", "agent_id")] {
         assert_eq!(delegation_target_key(method), Some(key), "{method}");
     }
-    for method in ["tasks.list", "tasks.assign", "approvals.decide"] {
+    for method in ["tasks.list", "approvals.decide"] {
         assert_eq!(delegation_target_key(method), None, "{method}");
     }
     let ctx = |id: &str| h.db.live_user_context(id).unwrap().unwrap();

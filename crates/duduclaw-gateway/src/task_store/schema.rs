@@ -113,6 +113,8 @@ impl TaskStore {
         // ── Scheduled assignments (new table only) ──
         Self::init_assign_schedule_schema(conn)?;
         Self::init_a2a_schema(conn)?;
+        // ── v1.81 P1e: link legacy goal_created rows once (no title matching) ──
+        Self::backfill_goal_creators(conn)?;
         verify_live_io()?;
         tx.commit().map_err(|e| format!("commit task schema: {e}"))?;
         Ok(())

@@ -245,6 +245,8 @@ pub(crate) use isolation_employee_rpc::employee_dirs;
 mod personal_data_gate;
 mod personal_decide_gate;
 mod personal_delegation_gate;
+mod personal_p1d_gate;
+mod personal_p1g_gate;
 mod personal_push;
 mod computer_sessions_rpc;
 mod computer_team_rpc;
@@ -471,7 +473,16 @@ impl MethodHandler {
         // Keep the shared dispatcher off the caller's async state. At -O0
         // its ~21 KiB future is otherwise copied through each outer poll
         // frame and repeated calls can exhaust a default worker stack.
-        Box::pin(self.dispatch(method, params, ctx, conn)).await
+        // v1.81 P1g: one break-glass scope per request — an audited Admin
+        // step-up admits that employee to the ACL for this request only —
+        // and every successful reply drops other people's Personal
+        // employees (unscoped listings hide them).
+        let pre_auth = conn.pre_auth;
+        Box::pin(crate::personal_visibility::with_break_glass_scope(async move {
+            let frame = self.dispatch(method, params, ctx, conn).await;
+            if pre_auth { frame } else { self.personal_hide_rows(method, ctx, frame).await }
+        }))
+        .await
     }
 
     /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).
@@ -573,6 +584,13 @@ impl MethodHandler {
         // record (tasks, activity, timeline, decisions, canvas), gated on
         // `agent_id` or on the employee of `task_id`.
         if let Err(frame) = self.personal_gates_for_params(method, &mut params, ctx).await {
+            return frame;
+        }
+        // v1.81 P1g: default deny — after the gates above (whose audited
+        // step-ups admit their employee for this request), any request that
+        // still names another person's Personal employee is refused unless
+        // the method is on the explicit metadata / management allowlist.
+        if let Err(frame) = self.personal_default_deny(method, &params, ctx).await {
             return frame;
         }
 

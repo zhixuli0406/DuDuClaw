@@ -36,7 +36,7 @@ pub(crate) fn home() -> Home {
 }
 
 /// The hardened opener refuses group/other-writable stores and sidecars.
-fn private_store(home: &Path) {
+pub(crate) fn private_store(home: &Path) {
     use std::os::unix::fs::PermissionsExt;
     for name in ["users.db", "users.db-wal", "users.db-shm", "users.db-journal"] {
         let path = home.join(name);
@@ -189,6 +189,89 @@ fn p1b_hidden_from_employee_hides_every_other_personal_employee() {
     assert_eq!(hidden_from_employee(empty.path(), true, SHARED), Err(Unavailable));
     assert_eq!(hidden_from_employee(Path::new("/nonexistent/duduclaw-home"), false, SHARED), Ok(BTreeSet::new()));
     assert_eq!(DataCategory::Work.as_str(), "work");
+}
+
+// ── v1.81 P1h (N2): owner-map caches ────────────────────────────────────
+
+#[tokio::test]
+async fn p1h_owner_map_opens_users_db_at_most_once_per_request() {
+    let h = home();
+    let before = open_count(h.path());
+    // One request checking N rows (the shape of a list handler running the
+    // ACL per row, plus the hidden set of the reply filter).
+    with_break_glass_scope(async {
+        for _ in 0..100 {
+            for agent in [PERSONAL, SHARED, "unknown-employee"] {
+                let _ = acl_denies(h.path(), true, &h.admin, agent);
+                let _ = acl_denies(h.path(), true, &h.alice, agent);
+            }
+        }
+        assert!(acl_denies(h.path(), true, &h.admin, PERSONAL));
+        assert!(!acl_denies(h.path(), true, &h.alice, PERSONAL));
+        assert_eq!(hidden_from(h.path(), true, &h.admin), Ok([PERSONAL.to_string()].into()));
+    })
+    .await;
+    assert!(open_count(h.path()) - before <= 1, "{} opens in one request", open_count(h.path()) - before);
+    // Another request under the same ACL generation: at most one open too.
+    let second = open_count(h.path());
+    with_break_glass_scope(async {
+        for _ in 0..100 {
+            let _ = acl_denies(h.path(), true, &h.bob, PERSONAL);
+        }
+    })
+    .await;
+    assert!(open_count(h.path()) - second <= 1);
+    // Outside any request (blocking-pool closures, background jobs) the
+    // process cache serves a current entry without opening the store.
+    let _ = personal_owner(h.path(), PERSONAL);
+    let warm = open_count(h.path());
+    for _ in 0..100 {
+        assert_eq!(personal_owner(h.path(), PERSONAL), Ok(Some(h.alice.clone())));
+    }
+    assert_eq!(open_count(h.path()), warm, "a current process entry needs no open");
+}
+
+#[tokio::test]
+async fn p1h_mirror_write_invalidates_the_owner_cache() {
+    let h = home();
+    assert_eq!(personal_owner(h.path(), "alice-second"), Ok(None));
+    let _ = personal_owner(h.path(), "alice-second");
+    // The lifecycle apply path's users.db write (mirror row + owner binding;
+    // it bumps the ACL generation): the next check sees it, no stale entry.
+    record_personal(h.path(), "alice-second", &h.alice);
+    private_store(h.path());
+    let warm = open_count(h.path());
+    assert_eq!(personal_owner(h.path(), "alice-second"), Ok(Some(h.alice.clone())));
+    assert!(acl_denies(h.path(), true, &h.admin, "alice-second"));
+    assert!(open_count(h.path()) > warm, "the write made the entry miss");
+    // The explicit invalidation (called by the lifecycle after each mirror
+    // write) drops the entry too: the next check reads the store again.
+    let _ = personal_owner(h.path(), PERSONAL);
+    let cached = open_count(h.path());
+    invalidate_owner_cache(h.path());
+    assert_eq!(personal_owner(h.path(), PERSONAL), Ok(Some(h.alice.clone())));
+    assert_eq!(open_count(h.path()), cached + 1);
+    // Inside a request: one snapshot, dropped by the invalidation.
+    with_break_glass_scope(async {
+        assert_eq!(personal_owner(h.path(), "alice-third"), Ok(None));
+        record_personal(h.path(), "alice-third", &h.alice);
+        private_store(h.path());
+        assert_eq!(personal_owner(h.path(), "alice-third"), Ok(None), "one ownership snapshot per request");
+        invalidate_owner_cache(h.path());
+        assert_eq!(personal_owner(h.path(), "alice-third"), Ok(Some(h.alice.clone())));
+    })
+    .await;
+    // A read error is never served from (or stored in) the cache: a store the
+    // hardened opener refuses denies at once, warm cache or not.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(h.path().join(USERS_DB), std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(personal_owner(h.path(), PERSONAL), Err(Unavailable));
+    assert!(acl_denies(h.path(), true, &h.alice, SHARED), "unreadable ⇒ every employee refused");
+    private_store(h.path());
+    assert_eq!(personal_owner(h.path(), PERSONAL), Ok(Some(h.alice.clone())));
+    // The lifecycle writers call the invalidation.
+    let lifecycle = include_str!("isolation_lifecycle.rs");
+    assert_eq!(lifecycle.matches("crate::personal_visibility::invalidate_owner_cache(home);").count(), 2);
 }
 
 #[test]

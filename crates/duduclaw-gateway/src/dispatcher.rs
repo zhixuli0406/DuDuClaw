@@ -339,6 +339,71 @@ async fn isolated_queue_scope<F: std::future::Future<Output = Result<String, Dis
         &message.target, message.on_behalf_of.as_deref(), &material, pending_isolation_approval(future)).await
 }
 
+/// v1.81 P1g: [`crate::personal_visibility::fire_time_refusal`] for one
+/// queue row (principal = `on_behalf_of`; acting = the sending employee).
+/// Protected mode only; the users.db read runs on the blocking pool.
+pub(crate) async fn fire_time_personal_refusal(
+    home: &Path,
+    msg: &crate::message_queue::QueueMessage,
+) -> Option<&'static str> {
+    if !crate::runtime_readiness::is_protected_linux() {
+        return None;
+    }
+    let (home, target) = (home.to_path_buf(), msg.target.clone());
+    let principal = msg.on_behalf_of.clone();
+    let acting = msg.sender_agent.clone().or_else(|| Some(msg.sender.clone()));
+    tokio::task::spawn_blocking(move || {
+        crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], acting.as_deref(), &target)
+    })
+    .await
+    .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+}
+
+/// v1.81 P1g: the JSONL rail's fire-time check (principal `on_behalf_of`,
+/// acting = the sending employee).
+async fn bus_fire_time_refusal(home: &Path, msg: &BusMessage) -> Option<&'static str> {
+    if !crate::runtime_readiness::is_protected_linux() {
+        return None;
+    }
+    let (home, msg) = (home.to_path_buf(), msg.clone());
+    tokio::task::spawn_blocking(move || bus_fire_refusal_in(&home, true, &msg))
+        .await
+        .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+}
+
+/// [`bus_fire_time_refusal`] without the process flag (tests). P1h (N4): the
+/// row's `sender_agent` / `origin_agent` are only consulted when it records
+/// no `on_behalf_of` — a forged line naming the target as its own sender
+/// cannot launder a non-owner principal.
+fn bus_fire_refusal_in(home: &Path, protected: bool, msg: &BusMessage) -> Option<&'static str> {
+    let acting = msg.sender_agent.as_deref().or(msg.origin_agent.as_deref());
+    crate::personal_visibility::fire_time_refusal(home, protected, &[msg.on_behalf_of.as_deref()], acting, &msg.agent_id)
+}
+
+/// v1.81 P1g: the `agent_response` that answers a refused JSONL row.
+fn bus_refusal_response(msg: &BusMessage, notice: String) -> BusMessage {
+    BusMessage {
+        msg_type: "agent_response".to_string(),
+        message_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: msg.agent_id.clone(),
+        payload: notice,
+        timestamp: Utc::now().to_rfc3339(),
+        response: None,
+        in_reply_to: Some(msg.message_id.clone()),
+        delegation_depth: msg.delegation_depth,
+        hop_depth: msg.hop_depth,
+        origin_agent: msg.origin_agent.clone(),
+        sender_agent: Some(msg.agent_id.clone()),
+        coalesced_ids: vec![],
+        turn_id: msg.turn_id.clone(),
+        session_id: msg.session_id.clone(),
+        upstream_unknown: false,
+        spawned: false,
+        lane: None,
+        on_behalf_of: msg.on_behalf_of.clone(),
+    }
+}
+
 /// Poll the SQLite message queue for pending messages and dispatch them.
 pub(crate) async fn poll_and_dispatch_sqlite(
     queue: &Arc<crate::message_queue::MessageQueue>,
@@ -399,6 +464,18 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         }
         // ACK immediately to prevent double-pickup
         if !queue.claim_pending(&msg.id).await? {
+            continue;
+        }
+        // ── v1.81 P1g fire-time check ─────────────────────────────────────
+        // Every queued job (delegation, goal round, heartbeat wake-up,
+        // autopilot / assign-schedule / workflow handoff, task dispatch)
+        // re-checks the CURRENT Personal ownership of its target before it
+        // runs, so rows queued before the upgrade or before an ownership
+        // change cannot make another person's Personal employee work.
+        if let Some(reason) = fire_time_personal_refusal(home_dir, &msg).await {
+            warn!(msg_id = %msg.id, "SQLite queue: Personal employee job refused at fire time");
+            queue.fail(&msg.id, reason).await?;
+            forward_delegation_response(home_dir, &msg.id, reason, &msg.target).await;
             continue;
         }
         // Workflow queue rows are authorized by the server-owned handoff outbox,
@@ -1171,6 +1248,14 @@ async fn poll_and_dispatch(
                             error = %e,
                             "Failed to serialize delegation depth-exceeded error response"
                         ),
+                    }
+                } else if let Some(reason) = bus_fire_time_refusal(home_dir, &msg).await {
+                    // v1.81 P1g: fire-time Personal ownership check (same rule
+                    // as the SQLite rail); consumed with a readable refusal.
+                    consumed_without_dispatch += 1;
+                    match serde_json::to_string(&bus_refusal_response(&msg, reason.to_string())) {
+                        Ok(json) => synthetic_responses.push(json),
+                        Err(e) => warn!(id = %msg.message_id, error = %e, "Failed to serialize Personal refusal"),
                     }
                 } else {
                     // ── WP21 C1: department × rank isolation ──────────────
@@ -2193,6 +2278,26 @@ async fn dispatch_taskspec_inner(
                 spec.status = TaskStatus::Failed;
                 spec.save(agent_dir).ok();
                 return Err(notice);
+            }
+        }
+        // v1.81 P1g: fire-time Personal ownership check of the step's
+        // employee (owner principal, or the plan's own / same-owner employee).
+        if crate::runtime_readiness::is_protected_linux() {
+            let (home, target, acting) = (home_dir.to_path_buf(), target_agent.clone(), spec.agent_id.clone());
+            let principal = crate::on_behalf_of::current();
+            let refusal = tokio::task::spawn_blocking(move || {
+                crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], Some(&acting), &target)
+            })
+            .await
+            .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE));
+            if let Some(reason) = refusal {
+                warn!(task = %spec.task_id, step = step_index, "TaskSpec step refused: Personal employee");
+                if let Some(s) = spec.steps.get_mut(step_index) {
+                    s.status = StepStatus::Failed;
+                }
+                spec.status = TaskStatus::Failed;
+                spec.save(agent_dir).ok();
+                return Err(reason.to_string());
             }
         }
 
@@ -6437,3 +6542,46 @@ mod dispatch_stack_tests;
 #[cfg(test)]
 #[path = "dispatcher_main_agent_tests.rs"]
 mod main_agent_tests;
+
+#[cfg(all(test, unix))]
+mod p1h_bus_fire_tests {
+    use super::{BusMessage, bus_fire_refusal_in};
+    use crate::personal_visibility::tests::{PERSONAL, SHARED, home};
+    use crate::personal_visibility::PERSONAL_FIRE_REFUSED;
+
+    fn line(on_behalf_of: Option<&str>, sender: Option<&str>, origin: Option<&str>) -> BusMessage {
+        let mut value = serde_json::json!({"type": "agent_message", "message_id": "m-p1h", "agent_id": PERSONAL,
+            "payload": "do the thing", "timestamp": "2026-11-09T00:00:00Z"});
+        for (key, field) in [("on_behalf_of", on_behalf_of), ("sender_agent", sender), ("origin_agent", origin)] {
+            if let Some(field) = field {
+                value[key] = serde_json::json!(field);
+            }
+        }
+        // Round-trip through the JSONL text form, exactly as the rail reads it.
+        serde_json::from_str(&value.to_string()).unwrap()
+    }
+
+    /// N4: a forged `bus_queue.jsonl` line that names the Personal employee as
+    /// its own sender (or origin) must not launder a recorded non-owner
+    /// principal through the "acting employee" exception.
+    #[test]
+    fn p1h_forged_bus_line_with_non_owner_principal_is_refused() {
+        let h = home();
+        let admin = format!("user:{}", h.admin);
+        let owner = format!("user:{}", h.alice);
+        let refusal = |msg: &BusMessage| bus_fire_refusal_in(h.path(), true, msg);
+        for forged in [line(Some(&admin), Some(PERSONAL), None), line(Some(&admin), None, Some(PERSONAL)),
+            line(Some("unmapped:line:abc"), Some(PERSONAL), None), line(Some("system"), Some(PERSONAL), None)] {
+            assert_eq!(refusal(&forged), Some(PERSONAL_FIRE_REFUSED), "{:?}", forged.on_behalf_of);
+        }
+        // The owner's own principal passes, with or without a sender.
+        assert_eq!(refusal(&line(Some(&owner), Some(SHARED), None)), None);
+        assert_eq!(refusal(&line(Some(&owner), None, None)), None);
+        // No principal recorded: the acting employee decides (itself passes,
+        // another employee does not).
+        assert_eq!(refusal(&line(None, Some(PERSONAL), None)), None);
+        assert_eq!(refusal(&line(None, Some(SHARED), None)), Some(PERSONAL_FIRE_REFUSED));
+        // Unprotected installs are unchanged.
+        assert_eq!(bus_fire_refusal_in(h.path(), false, &line(Some(&admin), Some(PERSONAL), None)), None);
+    }
+}

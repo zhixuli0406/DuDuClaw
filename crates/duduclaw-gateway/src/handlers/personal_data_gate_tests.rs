@@ -111,9 +111,12 @@ fn p1b_work_methods_gated_by_agent_or_task() {
     // Lists and agent-scoped reads: gated on `agent_id` (scoped) and hidden
     // through TaskReader (unscoped).
     for method in ["activity.list", "timeline.list", "decisions.list", "decisions.dismiss", "canvas.get",
-        "tasks.list", "tasks.list_page", "tasks.flow_metrics", "tasks.assign"] {
+        "tasks.list", "tasks.list_page", "tasks.flow_metrics"] {
         assert_eq!(agent_scoped(method), Some(DataCategory::Work), "{method}");
     }
+    // P1d: `tasks.assign`'s destination is delegation (owner only, no
+    // break-glass), not a Work read; its source task stays task-scoped.
+    assert_eq!(agent_scoped("tasks.assign"), None);
     // Single-task gets and writes: gated on the task's employee.
     for method in ["tasks.update", "tasks.remove", "tasks.assign", "tasks.archive", "tasks.unarchive", "tasks.pin",
         "tasks.unpin", "tasks.rename", "tasks.comment", "tasks.comments", "tasks.iterations", "tasks.timeline",

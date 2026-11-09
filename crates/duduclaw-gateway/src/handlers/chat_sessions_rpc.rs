@@ -94,11 +94,14 @@ impl MethodHandler {
         let rc = self.reply_ctx.read().await.clone().ok_or("session store unavailable")?;
         let owner = rc.session_manager.session_agent(&id).await
             .map_err(|_| "session not found")?.ok_or("session not found")?;
+        // v1.81 P1d: a non-Admin cannot tell another person's Personal
+        // employee's session from an unknown one.
+        let admin = live.is_admin();
         self.personal_data_gate(&live, super::personal_data_gate::Target {
             method: "chat.sessions.history",
             category: crate::personal_visibility::DataCategory::Sessions,
             agent: &owner,
-        }, step_up).await?;
+        }, step_up).await.map_err(|e| if admin { e.to_string() } else { "session not found".to_string() })?;
         let mode = privacy::mode(&self.home_dir, &live, &owner)?;
         let class = if mode == Mode::Filtered {
             let home = self.home_dir.clone();

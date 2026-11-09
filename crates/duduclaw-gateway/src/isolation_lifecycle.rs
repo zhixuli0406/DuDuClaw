@@ -292,6 +292,9 @@ pub(crate) fn record_personal_mirror_gated(home: &Path, label: &str, owner: &str
     let inserted = duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     duduclaw_auth::db::bind_personal_owner_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     tx.commit().map_err(|_| LifecycleError::Unavailable)?;
+    // P1h (N2): the ACL generation bump already makes cached owner maps miss;
+    // drop them explicitly too (and this request's snapshot, if any).
+    crate::personal_visibility::invalidate_owner_cache(home);
     Ok(inserted)
 }
 
@@ -315,6 +318,7 @@ pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> R
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     let removed = duduclaw_auth::db::remove_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     tx.commit().map_err(|_| LifecycleError::Unavailable)?;
+    crate::personal_visibility::invalidate_owner_cache(home);
     Ok(removed)
 }
 

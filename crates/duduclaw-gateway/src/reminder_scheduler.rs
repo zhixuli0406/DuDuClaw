@@ -959,6 +959,21 @@ where
         return Err("isolated reminder employee changed".into());
     }
     let reminder = &effective_reminder;
+    // v1.81 P1g: an agent callback makes the employee run work — re-check
+    // its CURRENT Personal ownership against the stored human origin (rows
+    // created before the upgrade included). A static message runs nothing.
+    if reminder.mode == ReminderMode::AgentCallback && crate::runtime_readiness::is_protected_linux() {
+        let (home, target, principal) =
+            (home_dir.to_path_buf(), reminder.agent_id.clone(), reminder.on_behalf_of.clone());
+        let refusal = tokio::task::spawn_blocking(move || {
+            crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], None, &target)
+        })
+        .await
+        .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE));
+        if let Some(reason) = refusal {
+            return Err(reason.to_string());
+        }
+    }
     let text = match reminder.mode {
         ReminderMode::Direct => reminder
             .message
@@ -1241,8 +1256,12 @@ pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserCo
         let mut rows = text.lines().filter(|l| !l.trim().is_empty())
             .map(serde_json::from_str::<Reminder>).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
         let principal = format!("user:{}", ctx.user_id);
-        let allowed = |r: &Reminder, level| ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
-            || ctx.has_agent_access(&r.agent_id, level);
+        // v1.81 P1g: another person's Personal employee's reminders are
+        // neither listed nor cancelled through the Admin role or a stored
+        // origin — owner only.
+        let allowed = |r: &Reminder, level| !ctx.owner_only_denied(&r.agent_id)
+            && (ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
+                || ctx.has_agent_access(&r.agent_id, level));
         if let Some(id) = cancel {
             let row = rows.iter_mut().find(|r| r.id == id && r.status == ReminderStatus::Pending
                 && allowed(r, duduclaw_auth::AccessLevel::Operator)).ok_or("permission denied")?;
