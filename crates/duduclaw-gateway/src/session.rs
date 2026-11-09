@@ -1339,41 +1339,42 @@ impl SessionManager {
     /// Hard delete — irreversibly removes the session and its messages. This is
     /// the pre-WP5 `delete_session` behaviour, now behind an explicit name.
     pub async fn purge_session(&self, session_id: &str) -> Result<()> {
-        let conn = self.acquire().await;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        {
+            let conn = self.acquire().await;
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
 
-        tx.execute(
-            "DELETE FROM webchat_turn_cancellations WHERE session_id = ?1",
-            params![session_id],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        tx.execute(
-            "DELETE FROM session_ccr_references WHERE session_id = ?1",
-            params![session_id],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        tx.execute(
-            "DELETE FROM session_messages WHERE session_id = ?1",
-            params![session_id],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-
-        tx.execute(
-            "DELETE FROM message_session_map WHERE session_id = ?1",
-            params![session_id],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-
-        tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+            tx.execute(
+                "DELETE FROM webchat_turn_cancellations WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM session_ccr_references WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM session_messages WHERE session_id = ?1",
+                params![session_id],
+            )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
-        tx.commit()
-            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+            tx.execute(
+                "DELETE FROM message_session_map WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+            tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+            tx.commit()
+                .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+        }
 
         info!(session_id, "Session purged (hard delete)");
-        drop(conn);
         // RM-124: schedules / reminders that report into this WebChat
         // conversation die with it (delivery is independently refused for a
         // recreated conversation with the same id).
@@ -1455,51 +1456,53 @@ impl SessionManager {
     /// messages_deleted)`. Messages are deleted first via a subquery that still
     /// sees the `sessions` rows.
     pub async fn erase_sessions_for_contact(&self, contact: &str) -> Result<(u64, u64)> {
-        let conn = self.acquire().await;
         let like = format!("{}:%", gdpr_like_escape(contact));
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
-        // RM-124: exact WebChat ids, captured inside the tx before the delete.
-        let webchat_ids = Self::webchat_ids(
-            &tx,
-            "SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'",
-            params![contact, like],
-        )?;
-        tx.execute(
-            "DELETE FROM webchat_turn_cancellations WHERE session_id IN (
-                 SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'
-             )",
-            params![contact, like],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        tx.execute(
-            "DELETE FROM session_ccr_references WHERE session_id IN (
-                 SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'
-             )",
-            params![contact, like],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        let messages = tx
-            .execute(
-                "DELETE FROM session_messages WHERE session_id IN (
+        let (webchat_ids, messages, sessions) = {
+            let conn = self.acquire().await;
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+            // RM-124: exact WebChat ids, captured inside the tx before the delete.
+            let webchat_ids = Self::webchat_ids(
+                &tx,
+                "SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'",
+                params![contact, like],
+            )?;
+            tx.execute(
+                "DELETE FROM webchat_turn_cancellations WHERE session_id IN (
                      SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'
                  )",
                 params![contact, like],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        let sessions = tx
-            .execute(
-                "DELETE FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'",
+            tx.execute(
+                "DELETE FROM session_ccr_references WHERE session_id IN (
+                     SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'
+                 )",
                 params![contact, like],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        tx.commit()
-            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+            let messages = tx
+                .execute(
+                    "DELETE FROM session_messages WHERE session_id IN (
+                         SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'
+                     )",
+                    params![contact, like],
+                )
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            let sessions = tx
+                .execute(
+                    "DELETE FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'",
+                    params![contact, like],
+                )
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+            (webchat_ids, messages, sessions)
+        };
         if sessions > 0 {
             info!(contact, sessions, messages, "GDPR: erased contact sessions");
         }
-        drop(conn);
         self.cancel_webchat_schedules(&webchat_ids).await;
         Ok((sessions as u64, messages as u64))
     }
@@ -1596,34 +1599,39 @@ impl SessionManager {
         let purgeable = "archived_at IS NOT NULL AND archived_at < ?1 \
              AND NOT COALESCE(julianday(last_active) > julianday(archived_at), 0)";
         // One transaction, so every statement below sees the same rows.
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
-        // RM-124: remember the exact WebChat ids before they disappear.
-        let purge_webchat_ids = Self::webchat_ids(
-            &tx,
-            &format!("SELECT id FROM sessions WHERE {purgeable}"),
-            params![purge_cutoff],
-        )?;
-        for child in ["webchat_turn_cancellations", "session_ccr_references", "session_messages"] {
-            tx.execute(
-                &format!(
-                    "DELETE FROM {child} WHERE session_id IN (
-                        SELECT id FROM sessions WHERE {purgeable}
-                    )"
-                ),
+        // The transaction lives only inside this block so it is dropped
+        // before the `.await` below (it is not `Send`).
+        let (purge_webchat_ids, purged) = {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+            // RM-124: remember the exact WebChat ids before they disappear.
+            let ids = Self::webchat_ids(
+                &tx,
+                &format!("SELECT id FROM sessions WHERE {purgeable}"),
                 params![purge_cutoff],
-            )
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        }
-        let purged = tx
-            .execute(
-                &format!("DELETE FROM sessions WHERE {purgeable}"),
-                params![purge_cutoff],
-            )
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        tx.commit()
-            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+            )?;
+            for child in ["webchat_turn_cancellations", "session_ccr_references", "session_messages"] {
+                tx.execute(
+                    &format!(
+                        "DELETE FROM {child} WHERE session_id IN (
+                            SELECT id FROM sessions WHERE {purgeable}
+                        )"
+                    ),
+                    params![purge_cutoff],
+                )
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            }
+            let purged = tx
+                .execute(
+                    &format!("DELETE FROM sessions WHERE {purgeable}"),
+                    params![purge_cutoff],
+                )
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+            (ids, purged)
+        };
 
         if archived > 0 || purged > 0 {
             info!(
