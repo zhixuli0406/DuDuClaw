@@ -350,10 +350,12 @@ class CiWorkflowTests(unittest.TestCase):
         full = "needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check'"
         active = "needs.settle.outputs.rust_mode != 'skip'"
         setup = {
+            "Add swap (Linux)",
             "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)",
             "Stub dashboard assets for compile",
         }
         platform = {
+            "Add swap (Linux)": "runner.os == 'Linux'",
             "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)": "runner.os == 'Linux'",
             "Run every required Windows case on the native host": "runner.os == 'Windows'",
             "Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)": "matrix.os == 'ubuntu-latest'",
@@ -405,6 +407,23 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertTrue(mode != "skip" and mode != "check")
         for command in self.commands("rust"):
             self.assertIn("--locked", command)
+
+    def test_linux_swap_precedes_builds_and_gateway_caps_jobs(self):
+        steps = self.jobs["rust"]["steps"]
+        names = [s.get("name") for s in steps]
+        swap = steps[names.index("Add swap (Linux)")]
+        self.assertIn("runner.os == 'Linux'", swap["if"])
+        for needle in ("swapoff -a", "16G", "/mnt/duduclaw-swap", "mkswap", "swapon", "free -h"):
+            self.assertIn(needle, swap["run"])
+        index = steps.index(swap)
+        self.assertTrue(steps[index - 1].get("uses", "").startswith("actions/checkout@"))
+        for later in ("Build core crates (no dashboard)", "Build gateway (no dashboard)",
+                      "Test gateway"):
+            self.assertLess(index, names.index(later))
+        for step in steps[:index]:
+            self.assertNotIn("cargo ", step.get("run", ""))
+        gateway = steps[names.index("Test gateway")]
+        self.assertEqual(gateway["env"], {"CARGO_BUILD_JOBS": "2"})
 
     def test_settle_only_delays_pr_runs(self):
         settle = self.jobs["settle"]
