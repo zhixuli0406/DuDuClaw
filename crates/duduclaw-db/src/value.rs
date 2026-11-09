@@ -300,51 +300,39 @@ fn mysql_value(row: &sqlx::mysql::MySqlRow, i: usize, type_name: &str) -> Value 
 
 // ── SQLite ──────────────────────────────────────────────────────────────────
 
-/// Map one `SqliteRow` to a JSON object.
+/// Map one rusqlite row to a JSON object. `names` are the statement's column
+/// names, captured once before stepping.
 ///
 /// SQLite is dynamically typed: the declared column type is a hint, the
-/// *stored* value's storage class is the truth. The storage class from the
-/// value ref is therefore what drives the mapping (so a `BOOLEAN` column
-/// holding `1` comes back as the number `1`, which is what is actually there).
-pub fn sqlite_row_to_json(row: &sqlx::sqlite::SqliteRow) -> JsonRow {
+/// *stored* value's storage class is the truth. The storage class of the value
+/// ref is therefore what drives the mapping (so a `BOOLEAN` column holding `1`
+/// comes back as the number `1`, which is what is actually there). This is the
+/// same mapping the former sqlx-based SQLite path produced: sqlx reported the
+/// value's storage class too, which only ever took the five shapes below.
+pub fn sqlite_row_to_json(row: &rusqlite::Row<'_>, names: &[String]) -> JsonRow {
     let mut out = Map::new();
-    for (i, col) in row.columns().iter().enumerate() {
-        let value = match row.try_get_raw(i) {
-            Ok(raw) => {
-                if raw.is_null() {
-                    Value::Null
-                } else {
-                    let storage = raw.type_info().name().to_ascii_uppercase();
-                    sqlite_value(row, i, &storage)
-                }
-            }
+    for (i, name) in names.iter().enumerate() {
+        let value = match row.get_ref(i) {
+            Ok(v) => sqlite_value(v),
             Err(_) => Value::Null,
         };
-        out.insert(col.name().to_string(), value);
+        out.insert(name.clone(), value);
     }
     out
 }
 
-fn sqlite_value(row: &sqlx::sqlite::SqliteRow, i: usize, storage: &str) -> Value {
-    match storage {
-        "NULL" => Value::Null,
-        "INTEGER" | "INT" | "BIGINT" | "BOOLEAN" => {
-            row.try_get::<i64, _>(i).map(Value::from).unwrap_or(Value::Null)
-        }
-        "REAL" | "FLOAT" | "DOUBLE" | "NUMERIC" => {
-            row.try_get::<f64, _>(i).map(f64_to_json).unwrap_or(Value::Null)
-        }
-        "TEXT" | "VARCHAR" | "DATETIME" | "DATE" | "TIME" => {
-            row.try_get::<String, _>(i).map(Value::String).unwrap_or(Value::Null)
-        }
-        "BLOB" => row
-            .try_get::<Vec<u8>, _>(i)
-            .map(|v| b64(&v))
+fn sqlite_value(v: rusqlite::types::ValueRef<'_>) -> Value {
+    use rusqlite::types::ValueRef as V;
+    match v {
+        V::Null => Value::Null,
+        V::Integer(i) => Value::from(i),
+        V::Real(f) => f64_to_json(f),
+        // Text that is not valid UTF-8 decodes to null, exactly as sqlx's
+        // `String` decode failure did.
+        V::Text(bytes) => std::str::from_utf8(bytes)
+            .map(|s| Value::String(s.to_string()))
             .unwrap_or(Value::Null),
-        other => row
-            .try_get::<String, _>(i)
-            .map(Value::String)
-            .unwrap_or_else(|_| unsupported(other)),
+        V::Blob(bytes) => b64(bytes),
     }
 }
 
