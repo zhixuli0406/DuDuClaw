@@ -240,7 +240,7 @@ fn i1c_real_skill_files_produce_bound_scan_transform_and_knowledge_results() {
 #[test]
 fn sfr_protected_recording_bundle_parses_only_as_archive_input() {
     use duduclaw_isolation::{recording_layout, worker::ParseOptions};
-    let events = br#"{"type":"before","method":"click","params":{"selector":"#save"}}"#;
+    let events = br##"{"type":"before","method":"click","params":{"selector":"#save"}}"##;
     let run = |trace: &[u8], format: ContentFormat| {
         let bundle = recording_layout::bundle([trace, br#"{"actions":[]}"#, br#"{"responses":[]}"#]).unwrap();
         let mut req = request(&bundle, ParseOperation::SummarizeRecording, format, 128 * 1024);
