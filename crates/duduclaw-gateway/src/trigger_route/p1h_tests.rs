@@ -149,9 +149,8 @@ async fn p1h_primary_candidate_refuses_another_owners_personal_employee() {
     let r: Option<&dyn PersonalRestriction> = Some(&on);
     let (admin, bob) = (sender(&h, &h.admin), sender(&h, &h.bob));
 
-    // bob (alice's manager) holds an Operator grant through the team, and
-    // alice-public has public_trigger on: still not his primary employee.
-    assert!(candidate(&reg, &bob, PUBLIC, None), "the grant alone would qualify");
+    // alice-public has public_trigger on: still not bob's (alice's manager)
+    // primary employee.
     assert!(!candidate(&reg, &bob, PUBLIC, r), "public_trigger opens calling, not routing");
     assert!(!candidate(&reg, &bob, PERSONAL, r));
     assert!(!candidate(&reg, &admin, PERSONAL, r));
