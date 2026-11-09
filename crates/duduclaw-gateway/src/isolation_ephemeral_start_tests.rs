@@ -282,9 +282,15 @@ fn h13c_d8_one_child_per_employee_at_a_time() {
     let child_run = RunHandle(RunId([7; 16]));
     ledger.bound(child_run, PARENT);
     assert!(release_children(&mut jobs, &ledger, &SAME, 1_003).unwrap().is_empty());
-    // … and only after it exited is the next child released.
+    // … and a STARTED child holds the slot even after the ledger saw its run exit …
+    assert_eq!(jobs.state(&released.id).unwrap(), Some(JobState::Started));
     ledger.exited(child_run);
-    let next = release_children(&mut jobs, &ledger, &SAME, 1_004).unwrap();
+    assert!(release_children(&mut jobs, &ledger, &SAME, 1_004).unwrap().is_empty());
+    assert_eq!(jobs.state(&other.id).unwrap(), Some(JobState::Pending));
+    // … only once the job is finished (terminal) is the next child released.
+    jobs.finish(&released.id).unwrap();
+    assert_eq!(jobs.state(&released.id).unwrap(), Some(JobState::Finished));
+    let next = release_children(&mut jobs, &ledger, &SAME, 1_005).unwrap();
     assert_eq!(next.iter().map(|(job, _)| job.id.clone()).collect::<Vec<_>>(), vec![other.id.clone()]);
     // A released child whose start failed gives the slot back (dropped).
     jobs.drop_released(&other.id).unwrap();
