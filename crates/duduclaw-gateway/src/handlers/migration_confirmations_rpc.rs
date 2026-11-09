@@ -82,7 +82,8 @@ impl MethodHandler {
                 // early-purged retire card without a fresh proof lists as not
                 // applicable until the Admin steps up).
                 let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
-                    Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)), &user, proof.as_ref().map(|p| p.verified_at));
+                    Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
+                        .with_step_up(proof.as_ref().map(|p| p.verified_at))), &user, proof.as_ref().map(|p| p.verified_at));
                 let items: Vec<Value> = items.into_iter().map(|item| {
                     let supported = employee_backend.validate(&item).is_ok() || GatewayAuthority::built_in_item_supported(&item)
                         || GatewayAccountReadback::available(&home, &item)
@@ -137,7 +138,8 @@ impl MethodHandler {
                     .find(|item| item.binding == input.binding && item.status == ConfirmationStatus::Applied)
                     .ok_or("請先完成此項目的核准與套用。")?;
                 let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
-                let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap));
+                let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
+                    .with_step_up(Some(proof.verified_at)));
                 let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
                 let fingerprint = authority.rotate_secret(&item, &input.new_value).map_err(|_| "憑證更新尚未確認，請重新載入後用相同新值重試。")?;
                 store.record_rotation(&input.binding, "credential", fingerprint, &authority)
@@ -157,7 +159,8 @@ impl MethodHandler {
             let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
             // F6d: one slot, two backends (Employee + EmployeeRetire).
             let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
-                Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)), &user, Some(proof.verified_at));
+                Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
+                    .with_step_up(Some(proof.verified_at))), &user, Some(proof.verified_at));
             let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
             let adopt_home = home.clone();
             let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);

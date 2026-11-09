@@ -267,13 +267,42 @@ pub(crate) fn connector_route_binding(home: &Path, owner: Option<&str>) -> Resul
 /// employee has exactly one member. `Ok(false)` is an idempotent re-apply of
 /// the mirror. Any refusal must refuse the apply step.
 pub(crate) fn record_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
+    record_personal_mirror_gated(home, label, owner, None)
+}
+
+/// Security round 3 N1: a check run inside the users.db write transaction of
+/// a confirmed allocation's save, before anything is written (the adoption
+/// commit re-runs its owner and approval checks there,
+/// `isolation_adopt::recheck_commit`). `Err` refuses the save (`Denied`) and
+/// nothing is written.
+pub(crate) type UsersGate<'a> = dyn Fn(&Connection) -> Result<(), ()> + 'a;
+
+/// [`record_personal_mirror`] with `gate` run first in the same users.db
+/// IMMEDIATE transaction (no users.db writer can commit between the check and
+/// the mirror).
+pub(crate) fn record_personal_mirror_gated(home: &Path, label: &str, owner: &str, gate: Option<&UsersGate<'_>>)
+    -> Result<bool, LifecycleError> {
     let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
+    if let Some(gate) = gate {
+        let conn: &Connection = &tx;
+        gate(conn).map_err(|()| LifecycleError::Denied)?;
+    }
     if !owner_eligible(&tx, owner)? { return Err(LifecycleError::Denied); }
     let inserted = duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     duduclaw_auth::db::bind_personal_owner_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     tx.commit().map_err(|_| LifecycleError::Unavailable)?;
     Ok(inserted)
+}
+
+/// A [`UsersGate`] alone, in its own users.db IMMEDIATE transaction (a save
+/// that writes no Personal mirror: Shared, or a disabled receipt).
+pub(crate) fn run_users_gate(home: &Path, gate: &UsersGate<'_>) -> Result<(), LifecycleError> {
+    let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
+    let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
+    let conn: &Connection = &tx;
+    gate(conn).map_err(|()| LifecycleError::Denied)?;
+    tx.finish().map_err(|_| LifecycleError::Unavailable)
 }
 
 /// Apply/compensation, tombstone and F6 restore crash-recovery paths only
@@ -614,7 +643,10 @@ pub(crate) fn principal_snapshot_in(tx: &Connection, home: &Path, label: &str, b
                 Ok(None) => serde_json::Value::Null,
                 Err(_) => serde_json::json!("unreadable"),
             };
-            let baseline = duduclaw_auth::mfa::owner_factor::FactorBaseline::read(tx, owner).map_err(|_| Unavailable)?;
+            // Security round 3 N4: the TOTP identity is the decrypted secret's
+            // digest (survives a re-encryption / machine-key rotation).
+            let baseline = duduclaw_auth::mfa::owner_factor::FactorBaseline::read(tx, owner, &crate::mfa::Cipher(home))
+                .map_err(|_| Unavailable)?;
             let seq = duduclaw_auth::credential_changes::high_water(tx).map_err(|_| Unavailable)?;
             serde_json::json!({
                 "kind": "personal", "owner_user_id": owner,

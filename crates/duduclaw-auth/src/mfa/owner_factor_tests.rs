@@ -40,12 +40,12 @@ fn email_owner(db: &UserDb) -> String {
 fn epoch(db: &UserDb, id: &str) -> u64 { db.get_user(id).unwrap().unwrap().credential_epoch }
 
 /// The factor baseline a tombstone taken now would record.
-fn base(db: &UserDb, id: &str) -> FactorBaseline { FactorBaseline::read(&db.conn(), id).unwrap() }
+fn base(db: &UserDb, id: &str) -> FactorBaseline { FactorBaseline::read(&db.conn(), id, &Cipher).unwrap() }
 
 fn count(db: &UserDb, sql: &str, id: &str) -> i64 { db.conn().query_row(sql, [id], |r| r.get(0)).unwrap() }
 
 fn email_challenge(db: &UserDb, id: &str, purpose: &str, baseline: &FactorBaseline, now: i64) -> (String, String) {
-    match db.restore_challenge(id, epoch(db, id), purpose, baseline, None, true, now).unwrap() {
+    match db.restore_challenge(id, epoch(db, id), purpose, baseline, &Cipher, None, true, now).unwrap() {
         RestoreChallenge::Email { challenge_id, email, code } => {
             assert_eq!(email, "mail@example.test");
             (challenge_id, code)
@@ -55,7 +55,7 @@ fn email_challenge(db: &UserDb, id: &str, purpose: &str, baseline: &FactorBaseli
 }
 
 fn passkey_challenge(db: &UserDb, id: &str, purpose: &str, baseline: &FactorBaseline, now: i64) -> Value {
-    match db.restore_challenge(id, epoch(db, id), purpose, baseline, Some(ORIGIN), true, now).unwrap() {
+    match db.restore_challenge(id, epoch(db, id), purpose, baseline, &Cipher, Some(ORIGIN), true, now).unwrap() {
         RestoreChallenge::Passkey(options) => options,
         other => panic!("expected a passkey challenge, got {other:?}"),
     }
@@ -105,7 +105,7 @@ fn request_requires_strongest_factor() {
     assert_eq!(none.strongest, None);
     assert_eq!(db.restore_owner_factor(&bare, epoch(&db, &bare), Totp, &none, &code(&p, "123456"), &Cipher, None, 3060),
         Err(NotPreexisting));
-    assert_eq!(db.restore_challenge(&bare, epoch(&db, &bare), &p, &none, Some(ORIGIN), true, 3060), Err(NotPreexisting));
+    assert_eq!(db.restore_challenge(&bare, epoch(&db, &bare), &p, &none, &Cipher, Some(ORIGIN), true, 3060), Err(NotPreexisting));
     assert_eq!(db.restore_owner_factor(&id, e + 1, Totp, &b, &code(&p, "123456"), &Cipher, None, 3060), Err(OwnerFactorError::Denied));
 }
 
@@ -171,13 +171,13 @@ fn restore_request_accepts_email_code_bound_to_purpose() {
     let bl = base(&db, &id);
     let (a, b) = (purpose(0), purpose(1));
     // No sender: refused before a code or the send budget is spent.
-    assert_eq!(db.restore_challenge(&id, e, &a, &bl, None, false, 3000), Err(OwnerFactorError::Unavailable));
+    assert_eq!(db.restore_challenge(&id, e, &a, &bl, &Cipher, None, false, 3000), Err(OwnerFactorError::Unavailable));
     assert_eq!(count(&db, "SELECT count(*) FROM mfa_email_sends WHERE user_id=?1", &id), 0);
     let (c1, k1) = email_challenge(&db, &id, &a, &bl, 3000);
     // The code is never stored in clear; the login email budget applies.
     assert_eq!(db.conn().query_row("SELECT count(*) FROM mfa_restore_email_codes WHERE code_hash=?1 OR token_hash=?2",
         params![k1, c1], |r| r.get::<_, i64>(0)).unwrap(), 0);
-    assert_eq!(db.restore_challenge(&id, e, &a, &bl, None, true, 3010), Err(OwnerFactorError::RateLimited));
+    assert_eq!(db.restore_challenge(&id, e, &a, &bl, &Cipher, None, true, 3010), Err(OwnerFactorError::RateLimited));
     // Bound to the purpose: the right code for another purpose fails and consumes it.
     assert_eq!(db.restore_owner_factor(&id, e, Email, &bl, &with_challenge(&b, &c1, &k1), &Cipher, None, 3005), Err(Failed));
     assert_eq!(db.restore_owner_factor(&id, e, Email, &bl, &with_challenge(&a, &c1, &k1), &Cipher, None, 3006), Err(Failed));
@@ -193,7 +193,7 @@ fn restore_request_accepts_email_code_bound_to_purpose() {
         assert_eq!(db.restore_owner_factor(&id, e, Email, &bl, &with_challenge(&a, &unknown, "123456"), &Cipher, None, now), Err(Failed));
     }
     assert_eq!(count(&db, "SELECT attempts FROM mfa_factor_failures WHERE user_id=?1", &id), 5);
-    assert_eq!(db.restore_challenge(&id, e, &a, &bl, None, true, 3200), Err(Failed), "locked out");
+    assert_eq!(db.restore_challenge(&id, e, &a, &bl, &Cipher, None, true, 3200), Err(Failed), "locked out");
     assert_eq!(count(&db, "SELECT count(*) FROM auth_audit_log WHERE user_id=?1 AND action='isolation.restore_factor_verified'", &id), 1);
 }
 
@@ -258,7 +258,7 @@ fn restore_never_accepts_weaker_factor() {
     let e = epoch(&db, &id);
     let bl = base(&db, &id);
     // TOTP outranks email: the challenge is TOTP's (none), no code is sent.
-    assert_eq!(db.restore_challenge(&id, e, &a, &bl, Some(ORIGIN), true, 3010), Ok(RestoreChallenge::Totp));
+    assert_eq!(db.restore_challenge(&id, e, &a, &bl, &Cipher, Some(ORIGIN), true, 3010), Ok(RestoreChallenge::Totp));
     assert_eq!(count(&db, "SELECT count(*) FROM mfa_email_sends WHERE user_id=?1", &id), 0);
     assert_eq!(count(&db, "SELECT count(*) FROM mfa_restore_email_codes WHERE user_id=?1", &id), 0);
     assert_eq!(db.restore_owner_factor(&id, e, Email, &bl, &with_challenge(&a, &"a".repeat(64), "123456"), &Cipher, None, 3011),
@@ -282,7 +282,7 @@ fn restore_never_accepts_weaker_factor() {
     let signed = key.assertion(&begin, 1, true);
     assert_eq!(db.restore_owner_factor(&id, e, Passkey, &bl, &assertion(&a, &challenge, &signed), &Cipher, Some(ORIGIN), 3032), Ok(Passkey));
     // Without a configured origin a passkey owner is refused, never downgraded.
-    assert_eq!(db.restore_challenge(&id, e, &a, &bl, None, true, 3040), Err(OwnerFactorError::Unavailable));
+    assert_eq!(db.restore_challenge(&id, e, &a, &bl, &Cipher, None, true, 3040), Err(OwnerFactorError::Unavailable));
 }
 
 /// Q3 (F6d): the owner's own self-service changes are stamped
@@ -350,7 +350,7 @@ fn f6fa_newly_enrolled_passkey_refused_for_restore() {
     assert_eq!(strongest_factor(&db.conn(), &id).unwrap(), Some(Passkey), "the live account now has a passkey");
     let e = epoch(&db, &id);
     // The challenge is the tombstone's factor (TOTP: none), never a passkey ceremony.
-    assert_eq!(db.restore_challenge(&id, e, &p, &tombstone, Some(ORIGIN), true, 3020), Ok(RestoreChallenge::Totp));
+    assert_eq!(db.restore_challenge(&id, e, &p, &tombstone, &Cipher, Some(ORIGIN), true, 3020), Ok(RestoreChallenge::Totp));
     assert_eq!(count(&db, "SELECT count(*) FROM mfa_passkey_ceremonies WHERE user_id=?1", &id), 0);
     let forged = planted.assertion(&json!({"publicKey": {"challenge": "x"}}), 1, true);
     assert_eq!(db.restore_owner_factor(&id, e, Passkey, &tombstone, &assertion(&p, &"c".repeat(64), &forged), &Cipher,
@@ -385,7 +385,7 @@ fn f6fa_newly_enrolled_passkey_refused_for_restore() {
         Ok(Passkey));
     // With the tombstone's passkey removed, nothing remains to prove with.
     db.conn().execute("DELETE FROM mfa_passkeys WHERE id=?1", [&tombstone.passkeys[0]]).unwrap();
-    assert_eq!(db.restore_challenge(&id, epoch(&db, &id), &p, &tombstone, Some(ORIGIN), true, 3030), Err(NotPreexisting));
+    assert_eq!(db.restore_challenge(&id, epoch(&db, &id), &p, &tombstone, &Cipher, Some(ORIGIN), true, 3030), Err(NotPreexisting));
 }
 
 /// A TOTP re-enrolled after the tombstone (another secret under the same
@@ -407,7 +407,7 @@ fn f6fa_reenrolled_totp_refused() {
     assert_ne!(base(&db, &id).totp, tombstone.totp);
     let e = epoch(&db, &id);
     let p = purpose(0);
-    assert_eq!(db.restore_challenge(&id, e, &p, &tombstone, Some(ORIGIN), true, 3020), Err(NotPreexisting));
+    assert_eq!(db.restore_challenge(&id, e, &p, &tombstone, &Cipher, Some(ORIGIN), true, 3020), Err(NotPreexisting));
     let code_of_new = super::super::test_totp_code(&planted, 101);
     assert_eq!(db.restore_owner_factor(&id, e, Totp, &tombstone, &code(&p, &code_of_new), &Cipher, None, 3030), Err(NotPreexisting));
     let (failed, last_step): (i64, i64) = db.conn().query_row("SELECT failed_attempts,last_step FROM mfa_credentials WHERE user_id=?1",
@@ -429,7 +429,7 @@ fn f6fa_preexisting_factor_accepted() {
     db.change_own_password(&id, "owner-new-password").unwrap();
     db.conn().execute("INSERT INTO mfa_email_credentials(user_id,email,verified_at) VALUES(?1,'owner@example.test',1)", [&id]).unwrap();
     let e = epoch(&db, &id);
-    assert_eq!(db.restore_challenge(&id, e, &p, &tombstone, Some(ORIGIN), true, 3020), Ok(RestoreChallenge::Totp));
+    assert_eq!(db.restore_challenge(&id, e, &p, &tombstone, &Cipher, Some(ORIGIN), true, 3020), Ok(RestoreChallenge::Totp));
     let right = super::super::test_totp_code(&secret, 101);
     assert_eq!(db.restore_owner_factor(&id, e, Totp, &tombstone, &code(&p, &right), &Cipher, None, 3030), Ok(Totp));
     // Email (the address recorded at the tombstone).
@@ -445,7 +445,7 @@ fn f6fa_preexisting_factor_accepted() {
     // tombstone's email factor.
     db.conn().execute("UPDATE users SET email='elsewhere@example.test' WHERE id=?1", [&id]).unwrap();
     db.conn().execute("INSERT INTO mfa_email_credentials(user_id,email,verified_at) VALUES(?1,'elsewhere@example.test',2)", [&id]).unwrap();
-    assert_eq!(db.restore_challenge(&id, epoch(&db, &id), &p, &tombstone, None, true, 3100), Err(NotPreexisting));
+    assert_eq!(db.restore_challenge(&id, epoch(&db, &id), &p, &tombstone, &Cipher, None, true, 3100), Err(NotPreexisting));
     // Passkey, with a second one added later by the owner.
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
@@ -481,7 +481,7 @@ fn f6fa2_session_revoke_keeps_factor_baseline() {
     let keys: Vec<&str> = recorded.as_object().unwrap().keys().map(String::as_str).collect();
     assert!(!keys.iter().any(|key| key.contains("epoch")), "{keys:?}");
     let p = purpose(0);
-    assert_eq!(db.restore_challenge(&id, new, &p, &tombstone, Some(ORIGIN), true, 3020), Ok(RestoreChallenge::Totp));
+    assert_eq!(db.restore_challenge(&id, new, &p, &tombstone, &Cipher, Some(ORIGIN), true, 3020), Ok(RestoreChallenge::Totp));
     let right = super::super::test_totp_code(&secret, 101);
     assert_eq!(db.restore_owner_factor(&id, old, Totp, &tombstone, &code(&p, &right), &Cipher, None, 3030),
         Err(OwnerFactorError::Denied), "the revoked session itself");
@@ -504,7 +504,7 @@ fn f6fa_legacy_snapshot_without_factor_ids_refused() {
     snapshot["owner_factors"] = good.to_value();
     assert_eq!(FactorBaseline::from_snapshot(&snapshot), Some(good.clone()), "round trip");
     let mutations: [fn(&mut Value); 7] = [
-        |v| v["owner_factors"]["version"] = json!(2),
+        |v| v["owner_factors"]["version"] = json!(3),
         |v| v["owner_factors"]["strongest"] = json!("passkey"),
         |v| v["owner_factors"]["strongest"] = json!(null),
         |v| v["owner_factors"]["totp"] = json!("not-a-digest"),
@@ -519,4 +519,53 @@ fn f6fa_legacy_snapshot_without_factor_ids_refused() {
     }
     assert_eq!(OwnerFactorError::BaselineMissing.code(), "FACTOR_BASELINE_MISSING");
     assert_eq!(OwnerFactorError::NotPreexisting.code(), "FACTOR_NOT_PREEXISTING");
+}
+
+/// A machine cipher after a key rotation: only its own ciphertexts decrypt.
+struct Rotated;
+impl MfaCipher for Rotated {
+    fn encrypt(&self, s: &str) -> std::result::Result<String, String> { Ok(format!("rotated:{s}")) }
+    fn decrypt(&self, s: &str) -> std::result::Result<String, String> {
+        s.strip_prefix("rotated:").map(str::to_owned).ok_or_else(|| "rotated".to_owned())
+    }
+}
+
+/// Security round 3 N4: the version-2 TOTP baseline digests the decrypted
+/// secret (domain-separated), so re-encrypting the same secret under a new
+/// machine key keeps a genuine owner's proof; a version-1 baseline (digest of
+/// the ciphertext) still parses and is compared the old way (and is the one a
+/// rotation breaks). An undecryptable secret still counts as TOTP-enrolled.
+#[test]
+fn f6r3_totp_baseline_survives_reencryption() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let (id, secret) = member(&db);
+    let tombstone = base(&db, &id);
+    assert_eq!(tombstone.to_value()["version"], json!(2));
+    assert_eq!(FactorBaseline::from_snapshot(&json!({"owner_factors": tombstone.to_value()})), Some(tombstone.clone()));
+    // The version-1 baseline of the same moment (digest over the ciphertext).
+    let enc: String = db.conn().query_row("SELECT secret_enc FROM mfa_credentials WHERE user_id=?1", [&id], |r| r.get(0)).unwrap();
+    let mut v1 = tombstone.to_value();
+    v1["version"] = json!(1);
+    v1["totp"] = json!(credential_digest("totp", &id, &enc));
+    let legacy = FactorBaseline::from_snapshot(&json!({"owner_factors": v1})).unwrap();
+    assert_eq!(legacy.to_value()["version"], json!(1), "a version-1 baseline stays version 1");
+    assert_ne!(legacy.totp, tombstone.totp, "domain-separated from the version-1 digest");
+    assert!(!tombstone.totp.as_deref().unwrap().contains(secret.as_str()), "a digest, never the secret");
+    // The machine key rotates: the same secret is re-encrypted under the new key.
+    let plain = Cipher.decrypt(&enc).unwrap();
+    db.conn().execute("UPDATE mfa_credentials SET secret_enc=?2 WHERE user_id=?1", params![id, Rotated.encrypt(&plain).unwrap()]).unwrap();
+    assert_eq!(FactorBaseline::read(&db.conn(), &id, &Rotated).unwrap().totp, tombstone.totp, "same secret, same digest");
+    let (e, p) = (epoch(&db, &id), purpose(0));
+    assert_eq!(db.restore_challenge(&id, e, &p, &tombstone, &Rotated, Some(ORIGIN), true, 3020), Ok(RestoreChallenge::Totp));
+    let right = super::super::test_totp_code(&secret, 101);
+    assert_eq!(db.restore_owner_factor(&id, e, Totp, &tombstone, &code(&p, &right), &Rotated, None, 3030), Ok(Totp));
+    // The version-1 baseline compared the ciphertext: the rotation breaks it.
+    assert_eq!(db.restore_challenge(&id, e, &p, &legacy, &Rotated, Some(ORIGIN), true, 3040), Err(NotPreexisting));
+    // With the old key only, the new ciphertext does not decrypt: still TOTP,
+    // never factor-less, and never the decrypted secret's digest.
+    let undecryptable = FactorBaseline::read(&db.conn(), &id, &Cipher).unwrap();
+    assert_eq!(undecryptable.strongest, Some(Totp));
+    assert_ne!(undecryptable.totp, tombstone.totp);
+    assert_eq!(db.restore_challenge(&id, e, &p, &tombstone, &Cipher, Some(ORIGIN), true, 3050), Err(NotPreexisting));
 }

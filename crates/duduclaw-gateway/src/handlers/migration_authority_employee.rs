@@ -7,12 +7,17 @@ use duduclaw_isolation::capability::EmployeeBinding;
 use crate::isolation_lifecycle::{self as lifecycle, LifecycleError};
 use std::sync::Arc;
 
-pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority>, agent_cap:usize }
+pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority>, agent_cap:usize, step_up_verified_at:Option<u64> }
 impl EmployeeAuthority {
-    pub(crate) fn new(home:PathBuf,live:Arc<LiveAuthority>)->Self{Self{home,live,agent_cap:0}}
+    pub(crate) fn new(home:PathBuf,live:Arc<LiveAuthority>)->Self{Self{home,live,agent_cap:0,step_up_verified_at:None}}
     /// F6fb item 8: the licence agent cap (`MethodHandler::effective_agent_cap`,
     /// 0 = unlimited) that an adoption's approval and apply enforce.
     pub(crate) fn with_agent_cap(mut self,agent_cap:usize)->Self{self.agent_cap=agent_cap;self}
+    /// Security round 3 N2: `verified_at` of the migration step-up proof the
+    /// confirmation RPC read for this call (`None`: none). An adoption card's
+    /// F6c2 decision computes `fresh_step_up` from it (`step_up_fresh`), as
+    /// the restore decide and the retire card do.
+    pub(crate) fn with_step_up(mut self,verified_at:Option<u64>)->Self{self.step_up_verified_at=verified_at;self}
     fn validate_current(&self,item:&ConfirmationItem)->Result<()> {
         if item.status==ConfirmationStatus::Failed { return Err(Error::Denied); }
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
@@ -68,7 +73,8 @@ impl EmployeeAuthority {
         };
         let env=crate::isolation_adopt::AdoptEnv { root:&crate::isolation_retire::SpawndRetireRoot, routes:&routes,
             runs:&crate::isolation_quarantine::SpawndRunStopper, rule:&duduclaw_auth::admin_approval_rule::EligibilityLogRule,
-            hooks:&hooks, agent_cap:self.agent_cap, actor, now:chrono::Utc::now().timestamp() };
+            hooks:&hooks, agent_cap:self.agent_cap, actor, step_up_verified_at:self.step_up_verified_at,
+            now:chrono::Utc::now().timestamp() };
         run(&env)
     }
 }
@@ -88,6 +94,15 @@ fn adopt_error(e:crate::isolation_adopt::AdoptError)->Error {
 /// failure refuses the step and leaves no confirmed row. Compensation
 /// removes the mirror only after the disabled row is durable.
 pub(crate) fn save_confirmed_receipt(home:&Path,item:&ConfirmationItem,receipt:&Receipt)->Result<()> {
+    save_confirmed_receipt_gated(home,item,receipt,None)
+}
+/// [`save_confirmed_receipt`]; security round 3 N1: `gate` runs inside the
+/// users.db write transaction that writes the Personal mirror, before it (or,
+/// with no mirror to write, in its own users.db IMMEDIATE transaction), while
+/// the apply.db writer lock is held (M6). A refusal writes neither the mirror
+/// nor the confirmed row.
+pub(crate) fn save_confirmed_receipt_gated(home:&Path,item:&ConfirmationItem,receipt:&Receipt,
+    gate:Option<&lifecycle::UsersGate<'_>>)->Result<()> {
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
         // The root copies the principal from this confirmed proposal only.
         if receipt.binding!=item.binding || receipt.label!=spec.label || receipt.principal_binding!=spec.binding {return Err(Error::Stale);}
@@ -109,7 +124,9 @@ pub(crate) fn save_confirmed_receipt(home:&Path,item:&ConfirmationItem,receipt:&
             _ => None,
         };
         if let (Some(owner),false)=(personal_owner,receipt.disabled) {
-            lifecycle::record_personal_mirror(home,&receipt.label,owner).map_err(lifecycle_error)?;
+            lifecycle::record_personal_mirror_gated(home,&receipt.label,owner,gate).map_err(lifecycle_error)?;
+        } else if let Some(gate)=gate {
+            lifecycle::run_users_gate(home,gate).map_err(lifecycle_error)?;
         }
         // F6 §3.1: only restore writes `incarnation` (+1). A re-save of the
         // same employee id preserves it; a new id on the label starts at 0
@@ -157,7 +174,10 @@ impl MigrationAuthorityBackend for EmployeeAuthority {
         if crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Invalid)?.is_some() {
             // F6g §3.10 steps 4–5: transform, re-key, marker, confirmed row, commit.
             let approver=self.approver(item)?;
-            let mut save=||self.save(item,&receipt).map_err(|_|());
+            // Security round 3 N1: the commit's owner/approval re-check runs in
+            // the users.db write transaction of the Personal mirror.
+            let mut save=|gate:&dyn Fn(&Connection)->std::result::Result<(),()>|
+                save_confirmed_receipt_gated(&self.home,item,&receipt,Some(gate)).map_err(|_|());
             return self.with_adopt_env(&approver,|env| crate::isolation_adopt::apply_item(&self.home,env,item,&receipt,&approver,&mut save))
                 .map(|_|()).map_err(adopt_error);
         }

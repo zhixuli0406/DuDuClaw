@@ -576,9 +576,18 @@ fn committed_tree_unchanged(home: &Path, target: Option<&str>, adopt: &AdoptRef)
     Ok(())
 }
 
+/// The commit's owner/approval re-check ([`recheck_commit`]) on a users.db transaction.
+type CommitGate<'a> = dyn Fn(&Connection) -> Result<(), AdoptError> + 'a;
+
 /// The adoption commit (§3.10 step 5, R12): row `adopted` by the new id,
-/// request `done`, the old id `root_absent`.
-fn finish(home: &Path, q: &Quarantined, request: &RestoreRequest, employee: EmployeeId, target: &str) -> Result<(), AdoptError> {
+/// request `done`, the old id `root_absent`. `gate` (security round 3 N1):
+/// run under this apply.db writer lock in a users.db IMMEDIATE transaction
+/// held until the apply.db commit (M6 order), so no users.db writer — e.g. a
+/// password reset of the owner — lands between the re-check and the commit;
+/// a refusal commits nothing. `None` only for recovery's roll forward of a
+/// proposal the store already applied.
+fn finish(home: &Path, q: &Quarantined, request: &RestoreRequest, employee: EmployeeId, target: &str,
+    gate: Option<&CommitGate<'_>>) -> Result<(), AdoptError> {
     let mut db = restore::open_apply(home)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
     restore::set_seal(&tx, q.employee, q.incarnation, &["adopting"], "adopted")?;
@@ -588,7 +597,17 @@ fn finish(home: &Path, q: &Quarantined, request: &RestoreRequest, employee: Empl
     let changed = tx.execute("UPDATE root_allocations SET root_state='root_absent' WHERE employee_hex=?1
         AND root_state IN ('allocated','root_absent')", [hex::encode(q.employee.0)]).map_err(unavailable)?;
     if changed != 1 { return Err(AdoptError::Inconsistent); }
-    tx.commit().map_err(unavailable)?;
+    match gate {
+        Some(gate) => {
+            let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(unavailable)?;
+            let held = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
+            let conn: &Connection = &held;
+            gate(conn)?;
+            tx.commit().map_err(unavailable)?;
+            held.finish().map_err(unavailable)?;
+        }
+        None => tx.commit().map_err(unavailable)?,
+    }
     let details = restore::audit_details(request, json!({"new_employee": hex::encode(employee.0), "target_label": target}));
     restore::audit(home, "isolation.employee_adopted", &q.label, Severity::Info, details.clone());
     if request.self_approved == Some(true) {
@@ -654,7 +673,7 @@ pub(crate) fn roll_forward(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, ado
     // The crash may have come between `save()` and the member bindings.
     if let Some(members) = &request.member_selection { bind_members(home, q, target, members)?; }
     let _ = env;
-    finish(home, q, request, receipt.employee, target)
+    finish(home, q, request, receipt.employee, target, None)
 }
 
 // ── Apply step and compensation ─────────────────────────────────────────
@@ -674,8 +693,18 @@ fn failed(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, request: &RestoreReq
 /// zero count, marker, `save` (the confirmed row + Personal mirror), Shared
 /// bindings, commit. Any failure rolls the tree back and returns `Err`; the
 /// confirmation store then compensates the new allocation (`Disable`).
+///
+/// Security round 3 N1: `save` receives a gate it must run inside the
+/// users.db write transaction that writes the Personal mirror, before the
+/// mirror (`save_confirmed_receipt_gated`; with no mirror, in its own users.db
+/// IMMEDIATE transaction): [`recheck_commit`] — owner eligibility, the Q3
+/// credential check and the admin-filed / standard F6c2 decision. The commit
+/// ([`finish`]) runs it once more under its apply.db lock; a resumed stage
+/// (`applying`, before or after `save`) runs the same checks. A refusal rolls
+/// back with `failed: <code>` and commits nothing; a `save` that never ran the
+/// gate is refused `Inconsistent`.
 pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationItem, receipt: &allocation::Receipt, approver: &str,
-    save: &mut dyn FnMut() -> Result<(), ()>) -> Result<Adopted, AdoptError> {
+    save: &mut dyn FnMut(&dyn Fn(&Connection) -> Result<(), ()>) -> Result<(), ()>) -> Result<Adopted, AdoptError> {
     let adopt = proposal_ref(item).map_err(|_| AdoptError::Inconsistent)?.ok_or(AdoptError::Inconsistent)?;
     let settings = text_field(item, "settings").ok_or(AdoptError::SettingsInvalid)?.to_owned();
     let (request, q, target, self_approved) = match validate_item(home, env, item, &adopt, approver)? {
@@ -688,7 +717,7 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
             return Ok(Adopted { request_id: String::new(), employee: receipt.employee, target: spec.label, self_approved: false });
         }
         Phase::Saved { request, row, target, employee, self_approved } =>
-            return resume_after_save(home, env, item, receipt, &adopt, (request, row, target, employee, self_approved)),
+            return resume_after_save(home, env, item, receipt, &adopt, approver, (request, row, target, employee, self_approved)),
         Phase::Pending { request, row, target, self_approved } => (request, row, target, self_approved),
     };
     // A new employee id only: old-id authorities stay dead (A1–A13).
@@ -741,10 +770,21 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     require_zero(home, &[&q.label, &target], Zero::BeforeSave).map_err(fail)?;
     // 5. Marker (R8), confirmed row + mirror, Shared bindings, commit.
     write_marker(home, &target, q.owner.as_deref().unwrap_or(""), &snapshot.digest, &adopt).map_err(fail)?;
-    save().map_err(|()| fail(AdoptError::Unavailable))?;
+    // N1: the owner and approval checks again, inside the mirror's users.db
+    // write transaction (the refusal's code is kept for the failure record).
+    let (ran, refused) = (std::cell::Cell::new(false), std::cell::Cell::new(None::<AdoptError>));
+    let gate = |users: &Connection| -> Result<(), ()> {
+        ran.set(true);
+        recheck_commit(home, env, &q, &request, approver, self_approved, users).map_err(|error| refused.set(Some(error)))
+    };
+    let saved = save(&gate);
+    if let Some(error) = refused.take() { return Err(fail(error)); }
+    saved.map_err(|()| fail(AdoptError::Unavailable))?;
+    if !ran.get() { return Err(fail(AdoptError::Inconsistent)); }
     if let Some(members) = &request.member_selection { bind_members(home, &q, &target, members).map_err(fail)?; }
     if crash_at(AdoptHook::AfterSave) { return Err(AdoptError::Unavailable); }
-    finish(home, &q, &request, receipt.employee, &target).map_err(fail)?;
+    let commit_gate = |users: &Connection| recheck_commit(home, env, &q, &request, approver, self_approved, users);
+    finish(home, &q, &request, receipt.employee, &target, Some(&commit_gate)).map_err(fail)?;
     Ok(Adopted { request_id: request.request_id, employee: receipt.employee, target, self_approved })
 }
 
@@ -752,9 +792,13 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
 /// `save()` (store status `Applying`, process death or a lost reply). The
 /// live tree and the confirmed row stay; the re-key is finished (idempotent),
 /// the zero count re-read, the member bindings written unless already exact,
-/// then the commit. Never the transform again.
+/// then the commit, gated by [`recheck_commit`] (security round 3 N1: a
+/// credential change after the interrupted stage refuses it). Never the
+/// transform again.
+#[allow(clippy::too_many_arguments)]
 fn resume_after_save(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationItem, receipt: &allocation::Receipt, adopt: &AdoptRef,
-    (request, q, target, employee, self_approved): (RestoreRequest, Quarantined, String, EmployeeId, bool)) -> Result<Adopted, AdoptError> {
+    approver: &str, (request, q, target, employee, self_approved): (RestoreRequest, Quarantined, String, EmployeeId, bool))
+    -> Result<Adopted, AdoptError> {
     // The root's answer for this allocation must be the id that was saved.
     if receipt.employee != employee || receipt.binding != item.binding || receipt.label != target || receipt.disabled {
         return Err(AdoptError::Inconsistent);
@@ -766,7 +810,8 @@ fn resume_after_save(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationItem, r
     require_zero(home, &[&q.label, &target], Zero::AfterSave).map_err(fail)?;
     if let Some(members) = &request.member_selection { bind_members(home, &q, &target, members).map_err(fail)?; }
     if crash_at(AdoptHook::AfterSave) { return Err(AdoptError::Unavailable); }
-    finish(home, &q, &request, employee, &target).map_err(fail)?;
+    let commit_gate = |users: &Connection| recheck_commit(home, env, &q, &request, approver, self_approved, users);
+    finish(home, &q, &request, employee, &target, Some(&commit_gate)).map_err(fail)?;
     Ok(Adopted { request_id: request.request_id, employee, target, self_approved })
 }
 

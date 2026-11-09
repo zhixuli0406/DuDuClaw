@@ -269,3 +269,33 @@ fn owner_request_schema_has_no_owner_field() {
     let failure = failure_frame(Failure::Rpc(RpcError::Restore(crate::isolation_restore::Refusal::NotFound)));
     assert_eq!(refusal(&failure), "NOT_FOUND");
 }
+
+/// Security round 3 N3: `me.isolation.cancel_restore` takes `password` (the
+/// owner of an Admin-filed request, who has no factor) instead of the factor
+/// fields; still no owner/purpose field. The re-auth needs the current
+/// session (account active at the session's credential epoch) and the
+/// account's password; anything else refuses.
+#[test]
+fn f6r3_owner_cancel_password_reauth() {
+    let cancel = json!({"request_id": "0".repeat(32), "password": "owner-password-1"});
+    let parsed: OwnerCancel = serde_json::from_value(cancel.clone()).unwrap();
+    assert_eq!((parsed.password.as_deref(), parsed.factor.as_str()), (Some("owner-password-1"), ""));
+    for extra in ["purpose", "owner_id", "user_id"] {
+        let mut forged = cancel.clone();
+        forged[extra] = json!("x");
+        assert!(serde_json::from_value::<OwnerCancel>(forged).is_err(), "{extra}");
+    }
+    let dir = crate::fs_safe::private_test_home().unwrap();
+    let db = UserDb::new(&dir.path().join("users.db")).unwrap();
+    let owner = db.create_user("owner@example.test", "Owner", "owner-password-1", UserRole::Employee).unwrap();
+    let epoch = db.get_user(&owner.id).unwrap().unwrap().credential_epoch;
+    assert_eq!(owner_password_reauth(&db, &owner.id, epoch, "owner-password-1"), Ok(()));
+    assert_eq!(owner_password_reauth(&db, &owner.id, epoch, "wrong-password-1"), Err(OwnerFactorError::Failed));
+    assert_eq!(owner_password_reauth(&db, &owner.id, epoch, ""), Err(OwnerFactorError::Failed));
+    assert_eq!(owner_password_reauth(&db, &owner.id, epoch + 1, "owner-password-1"), Err(OwnerFactorError::Denied),
+        "a revoked / stale session");
+    assert_eq!(owner_password_reauth(&db, "no-such-user", epoch, "owner-password-1"), Err(OwnerFactorError::Denied));
+    // Another account's password never re-authenticates the owner.
+    db.create_user("other@example.test", "Other", "other-password-1", UserRole::Employee).unwrap();
+    assert_eq!(owner_password_reauth(&db, &owner.id, epoch, "other-password-1"), Err(OwnerFactorError::Failed));
+}

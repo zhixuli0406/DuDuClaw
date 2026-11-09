@@ -29,7 +29,7 @@ struct Dies<'a> { f: &'a Fixture, ax: &'a Ax }
 impl ProposalApplier for Dies<'_> {
     fn stage(&mut self, item: &ConfirmationItem) -> Result<(), ConfirmationError> {
         let (home, new) = (self.f.home(), receipt(item, 9, false));
-        let mut persist = || save(home, item, &new).map_err(|_| ());
+        let mut persist = |gate: &dyn Fn(&Connection) -> Result<(), ()>| save_gated(home, item, &new, gate);
         ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::AfterSave)));
         let result = apply_item(home, &env(self.ax), item, &new, &self.f.bob, &mut persist);
         ADOPT_HOOK.with(|h| *h.borrow_mut() = None);
@@ -199,7 +199,7 @@ fn f6fb_adopted_replay_bound_to_allocation() {
     tombstoned_full(&f, "soul");
     let ax = ax();
     let (plan, item, new) = adopted(&f, &ax, None);
-    let mut noop = || -> Result<(), ()> { Ok(()) };
+    let mut noop = |_: &dyn Fn(&Connection) -> Result<(), ()>| -> Result<(), ()> { Ok(()) };
     let other = Receipt { employee: EmployeeId([8; 16]), ..new.clone() };
     assert_eq!(apply_item(f.home(), &env(&ax), &item, &other, &f.bob, &mut noop).err(), Some(AdoptError::Inconsistent));
     let mut moved = new.clone();
@@ -293,7 +293,7 @@ fn f6fb_adoption_enforces_agent_cap() {
     let capped = AdoptEnv { agent_cap: 1, ..env(&ax) };
     assert_eq!(validate_item(f.home(), &capped, &item, &plan.adopt, &f.bob).err(),
         Some(AdoptError::Restore(Refusal::QuotaExceeded)));
-    let mut persist = || -> Result<(), ()> { panic!("never saved over the cap") };
+    let mut persist = |_: &dyn Fn(&Connection) -> Result<(), ()>| -> Result<(), ()> { panic!("never saved over the cap") };
     let new = receipt(&item, 9, false);
     assert_eq!(apply_item(f.home(), &capped, &item, &new, &f.bob, &mut persist).err(),
         Some(AdoptError::Restore(Refusal::QuotaExceeded)));

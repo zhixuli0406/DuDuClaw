@@ -355,7 +355,8 @@ pub(crate) fn request_restore(home: &Path, env: &RestoreEnv<'_>, caller: &str, e
 }
 
 /// `me.isolation.cancel_restore`: the requester (the owner) cancels, with
-/// a factor proof.
+/// a factor proof. An Admin-filed request (requester = the Admin) is the
+/// owner's to cancel through [`cancel_own_unverified`] (N3).
 pub(crate) fn cancel_own(home: &Path, caller: &str, id: &str, factor: &str, code: &str, check: FactorCheck<'_>, now: i64)
     -> Result<Value, RpcError> {
     let id = request_id(id)?;
@@ -365,6 +366,42 @@ pub(crate) fn cancel_own(home: &Path, caller: &str, id: &str, factor: &str, code
     engine::close_request(home, id, caller, Close::Cancelled, now)?;
     if let Some(q) = row_of(home, request.employee, request.incarnation)? {
         notify(home, &q, "isolation.employee_restore_cancelled", json!({"request_id": id, "actor_user_id": caller}), true, now);
+    }
+    Ok(json!({"request_id": id, "state": "cancelled"}))
+}
+
+/// The owner's re-authentication for [`cancel_own_unverified`]: the session
+/// is current (active account at the session's credential epoch, no forced
+/// password change) and the presented password verifies. Production: the
+/// handler's `UserDb` check.
+pub(crate) type PasswordCheck<'a> = &'a dyn Fn() -> Result<(), OwnerFactorError>;
+
+/// `me.isolation.cancel_restore` with `password` (security round 3 N3): the
+/// **owner** cancels a request an Admin filed for them (`filed_by_admin`,
+/// `owner_unverified` — the owner had no second factor at the tombstone, so
+/// [`cancel_own`]'s factor proof is impossible). Only that owner, only such a
+/// request (any other request answers `NOT_FOUND`, no oracle), with a current
+/// session and a password re-auth; a failed re-auth is audited and refuses.
+/// The cancel is audited (Warning) and the owner + Admins are told (uncapped).
+pub(crate) fn cancel_own_unverified(home: &Path, caller: &str, id: &str, reauth: PasswordCheck<'_>, now: i64)
+    -> Result<Value, RpcError> {
+    let id = request_id(id)?;
+    let request = { let db = engine::open_apply(home)?; engine::read_request(&db, id)? }.ok_or(Refusal::NotFound)?;
+    if caller.is_empty() || !request.owner_unverified() || request.owner.as_deref() != Some(caller) || request.requester == caller {
+        return Err(Refusal::NotFound.into());
+    }
+    if let Err(error) = reauth() {
+        engine::audit(home, "isolation.employee_restore_owner_cancel_reauth_failed", &request.label, Severity::Warning,
+            engine::audit_details(&request, json!({"actor_user_id": caller, "reauth": "password", "reason": error.code()})));
+        return Err(RpcError::Factor(error));
+    }
+    engine::close_request(home, id, caller, Close::Cancelled, now)?;
+    engine::audit(home, "isolation.employee_restore_owner_cancelled_unverified", &request.label, Severity::Warning,
+        engine::audit_details(&request, json!({"actor_user_id": caller, "reauth": "password",
+            "filed_by_admin": request.filed_by_admin, "owner_unverified": true})));
+    if let Some(q) = row_of(home, request.employee, request.incarnation)? {
+        notify(home, &q, "isolation.employee_restore_cancelled", json!({"request_id": id, "actor_user_id": caller,
+            "filed_by_admin": request.filed_by_admin, "owner_unverified": true}), false, now);
     }
     Ok(json!({"request_id": id, "state": "cancelled"}))
 }

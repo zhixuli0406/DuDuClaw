@@ -60,8 +60,15 @@ fn ax() -> Ax {
         routes: Routes(Rc::new(RefCell::new(Vec::new()))), now: now() }
 }
 fn env(ax: &Ax) -> AdoptEnv<'_> {
+    // The card's step-up proof, verified at this call (N2: freshness from it).
     AdoptEnv { root: &ax.root, routes: &ax.routes, runs: &NoLiveRuns, rule: &AnyAdmin, hooks: &ok_hooks, agent_cap: 0,
-        actor: "admin-user", now: ax.now }
+        actor: "admin-user", step_up_verified_at: u64::try_from(ax.now).ok(), now: ax.now }
+}
+
+/// The production save with the adoption commit's users.db gate (N1).
+fn save_gated(home: &Path, item: &ConfirmationItem, receipt: &Receipt, gate: &dyn Fn(&Connection) -> Result<(), ()>)
+    -> Result<(), ()> {
+    crate::handlers::save_confirmed_receipt_gated(home, item, receipt, Some(gate)).map_err(|_| ())
 }
 
 fn agent_toml(label: &str) -> String {
@@ -138,7 +145,7 @@ fn propose(f: &Fixture, ax: &Ax, request: &RestoreRequest) -> (AdoptionPlan, Con
 fn apply(f: &Fixture, ax: &Ax, item: &ConfirmationItem) -> (Result<Adopted, AdoptError>, Receipt) {
     let home = f.home();
     let new = receipt(item, 9, false);
-    let mut persist = || save(home, item, &new).map_err(|_| ());
+    let mut persist = |gate: &dyn Fn(&Connection) -> Result<(), ()>| save_gated(home, item, &new, gate);
     (apply_item(home, &env(ax), item, &new, &f.bob, &mut persist), new)
 }
 
@@ -520,7 +527,7 @@ impl ProposalApplier for Applier<'_> {
     fn stage(&mut self, item: &ConfirmationItem) -> Result<(), ConfirmationError> {
         let new = receipt(item, 9, false);
         let (home, fail) = (self.f.home(), self.fail_save);
-        let mut persist = || if fail { Err(()) } else { save(home, item, &new).map_err(|_| ()) };
+        let mut persist = |gate: &dyn Fn(&Connection) -> Result<(), ()>| if fail { Err(()) } else { save_gated(home, item, &new, gate) };
         apply_item(home, &env(self.ax), item, &new, &self.f.bob, &mut persist).map(|_| ()).map_err(|_| ConfirmationError::Apply)
     }
     fn publish(&mut self, _: &ConfirmationItem) -> Result<(), ConfirmationError> { Ok(()) }
@@ -615,6 +622,11 @@ mod f6d;
 /// compensation after commit, path check, licence cap.
 #[path = "isolation_adopt_f6fb_tests.rs"]
 mod f6fb;
+
+/// Security round 3 (F6 part a): N1 commit re-check, N2 step-up freshness,
+/// N3 owner cancel of an Admin-filed request.
+#[path = "isolation_adopt_f6r3_tests.rs"]
+mod f6r3;
 
 /// F6i quarantine purge (§3.8): reuses this fixture and the adoption flow.
 #[path = "isolation_purge_tests.rs"]

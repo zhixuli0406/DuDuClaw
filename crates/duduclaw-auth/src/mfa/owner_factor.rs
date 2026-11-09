@@ -114,13 +114,39 @@ fn rank(factor: OwnerFactor) -> u8 {
     match factor { OwnerFactor::Passkey => 3, OwnerFactor::Totp => 2, OwnerFactor::Email => 1 }
 }
 
-/// Version of [`FactorBaseline::to_value`].
-const BASELINE_VERSION: u64 = 1;
+/// Version of [`FactorBaseline::to_value`]. Security round 3 N4: version 2
+/// digests the **decrypted** TOTP secret ([`totp_digest`]), so a
+/// re-encryption or a machine-key rotation keeps a genuine owner's baseline.
+/// Version 1 (recorded before) digested the stored ciphertext `secret_enc`;
+/// such a baseline is still read and compared the version-1 way.
+const BASELINE_VERSION: u64 = 2;
+const LEGACY_BASELINE_VERSION: u64 = 1;
 /// More passkeys than registration allows (20) is malformed.
 const MAX_BASELINE_PASSKEYS: usize = 64;
 
 fn credential_digest(kind: &str, user: &str, value: &str) -> String {
     token_hash(&format!("duduclaw-owner-factor-v1:{kind}:{}:{user}:{value}", user.len()))
+}
+
+/// N4: the TOTP identity of a version-2 baseline — a domain-separated digest
+/// of the decrypted secret (bound to its user by `decrypt`). A secret that
+/// does not decrypt (machine key lost) is digested from its ciphertext under
+/// another domain: the owner still counts as TOTP-enrolled (never as
+/// factor-less), and that digest can never equal a decrypted secret's (the
+/// TOTP check itself fails on such a secret anyway).
+fn totp_digest(cipher: &dyn MfaCipher, user: &str, secret_enc: &str) -> String {
+    match super::decrypt(cipher, user, secret_enc) {
+        Ok(secret) => token_hash(&format!("duduclaw-owner-factor-v2:totp-secret:{}:{user}:{}:{secret}", user.len(), secret.len())),
+        Err(_) => token_hash(&format!("duduclaw-owner-factor-v2:totp-undecryptable:{}:{user}:{secret_enc}", user.len())),
+    }
+}
+
+/// Constant-time equality of two recorded digests (both present).
+fn same_digest(recorded: &Option<String>, live: &Option<String>) -> bool {
+    match (recorded, live) {
+        (Some(recorded), Some(live)) => bool::from(recorded.as_bytes().ct_eq(live.as_bytes())),
+        _ => false,
+    }
 }
 
 fn is_digest(value: &str) -> bool {
@@ -130,8 +156,9 @@ fn is_digest(value: &str) -> bool {
 /// The identities of an account's second-factor credentials at one moment —
 /// recorded at the tombstone (§3.2 step 3) in
 /// `principal_snapshot.owner_factors`. Never a secret: passkey ids are public
-/// WebAuthn credential ids, the TOTP is a digest of its stored (encrypted)
-/// secret, the email factor a digest of its address.
+/// WebAuthn credential ids, the TOTP is a domain-separated digest of its
+/// decrypted secret (N4; version-1 baselines: of the stored ciphertext), the
+/// email factor a digest of its address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FactorBaseline {
     /// The strongest factor then (`None`: no second factor enrolled).
@@ -143,6 +170,8 @@ pub struct FactorBaseline {
     /// Digest of the email-factor address (only a factor for the account's
     /// current address counts, as at login).
     pub email: Option<String>,
+    /// A version-1 baseline (TOTP digest over `secret_enc`), compared the same way.
+    legacy: bool,
 }
 
 impl FactorBaseline {
@@ -154,8 +183,14 @@ impl FactorBaseline {
     }
 
     /// The factor set of `user` now, read on the caller's connection (the
-    /// tombstone reads it inside its users.db snapshot transaction).
-    pub fn read(conn: &Connection, user: &str) -> Result<Self> {
+    /// tombstone reads it inside its users.db snapshot transaction); `cipher`
+    /// decrypts the TOTP secret for its digest (N4).
+    pub fn read(conn: &Connection, user: &str, cipher: &dyn MfaCipher) -> Result<Self> {
+        Self::read_as(conn, user, cipher, false)
+    }
+
+    /// [`Self::read`]; `legacy`: digest the TOTP as a version-1 baseline does.
+    fn read_as(conn: &Connection, user: &str, cipher: &dyn MfaCipher, legacy: bool) -> Result<Self> {
         let passkeys = {
             let mut statement = conn.prepare("SELECT id FROM mfa_passkeys WHERE user_id=?1 ORDER BY id").map_err(|e| e.to_string())?;
             let ids = statement.query_map([user], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
@@ -168,8 +203,10 @@ impl FactorBaseline {
             WHERE c.user_id=?1 AND c.email=u.email", [user], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
         let mut baseline = Self {
             strongest: None, passkeys,
-            totp: totp.map(|secret| credential_digest("totp", user, &secret)),
+            totp: totp.map(|secret_enc| if legacy { credential_digest("totp", user, &secret_enc) }
+                else { totp_digest(cipher, user, &secret_enc) }),
             email: email.map(|address| credential_digest("email", user, &address)),
+            legacy,
         };
         baseline.strongest = baseline.implied();
         Ok(baseline)
@@ -177,7 +214,8 @@ impl FactorBaseline {
 
     /// The `principal_snapshot.owner_factors` value.
     pub fn to_value(&self) -> Value {
-        serde_json::json!({"version": BASELINE_VERSION, "strongest": self.strongest.map(OwnerFactor::as_str),
+        let version = if self.legacy { LEGACY_BASELINE_VERSION } else { BASELINE_VERSION };
+        serde_json::json!({"version": version, "strongest": self.strongest.map(OwnerFactor::as_str),
             "passkeys": self.passkeys, "totp": self.totp, "email": self.email})
     }
 
@@ -186,7 +224,8 @@ impl FactorBaseline {
     /// unknown version or keys, a `strongest` the identities do not imply.
     pub fn from_snapshot(snapshot: &Value) -> Option<Self> {
         let value = snapshot.get("owner_factors")?.as_object()?;
-        if value.len() != 5 || value.get("version")?.as_u64()? != BASELINE_VERSION { return None; }
+        let version = value.get("version")?.as_u64()?;
+        if value.len() != 5 || !matches!(version, LEGACY_BASELINE_VERSION | BASELINE_VERSION) { return None; }
         let digest = |key: &str| -> Option<Option<String>> {
             match value.get(key)? {
                 Value::Null => Some(None),
@@ -203,7 +242,8 @@ impl FactorBaseline {
             Value::String(name) => Some(OwnerFactor::parse(name)?),
             _ => return None,
         };
-        let parsed = Self { strongest, passkeys, totp: digest("totp")?, email: digest("email")? };
+        let parsed = Self { strongest, passkeys, totp: digest("totp")?, email: digest("email")?,
+            legacy: version == LEGACY_BASELINE_VERSION };
         (parsed.implied() == parsed.strongest).then_some(parsed)
     }
 
@@ -213,18 +253,20 @@ impl FactorBaseline {
     /// TOTP: the same secret; email: the same address. Anything else (no
     /// factor then, removed, re-enrolled, changed) is
     /// [`OwnerFactorError::NotPreexisting`] — never a newer or weaker one.
-    fn usable(&self, conn: &Connection, user: &str) -> Proof<(OwnerFactor, Vec<String>)> {
+    fn usable(&self, conn: &Connection, user: &str, cipher: &dyn MfaCipher) -> Proof<(OwnerFactor, Vec<String>)> {
         use OwnerFactorError::NotPreexisting;
         let required = self.strongest.ok_or(NotPreexisting)?;
-        let live = Self::read(conn, user).map_err(unavailable)?;
+        // The live set digested the way this baseline was (N4: version 2 over
+        // the decrypted secret, version 1 over the ciphertext).
+        let live = Self::read_as(conn, user, cipher, self.legacy).map_err(unavailable)?;
         let same = match required {
             OwnerFactor::Passkey => {
                 let kept: Vec<String> = self.passkeys.iter().filter(|id| live.passkeys.contains(id)).cloned().collect();
                 if kept.is_empty() { return Err(NotPreexisting); }
                 return Ok((required, kept));
             }
-            OwnerFactor::Totp => self.totp.is_some() && self.totp == live.totp,
-            OwnerFactor::Email => self.email.is_some() && self.email == live.email,
+            OwnerFactor::Totp => same_digest(&self.totp, &live.totp),
+            OwnerFactor::Email => same_digest(&self.email, &live.email),
         };
         if same { Ok((required, Vec::new())) } else { Err(NotPreexisting) }
     }
@@ -395,16 +437,17 @@ impl UserDb {
     /// `origin` is the operator-configured dashboard origin (passkey relying
     /// party; `None` ⇒ a passkey owner is refused unavailable);
     /// `email_available` is the email-factor sender's availability (checked
-    /// before any code or send budget is spent).
+    /// before any code or send budget is spent). `cipher`: the machine cipher
+    /// (the TOTP baseline digests the decrypted secret, N4).
     #[allow(clippy::too_many_arguments)]
-    pub fn restore_challenge(&self, user: &str, epoch: u64, purpose: &str, baseline: &FactorBaseline, origin: Option<&str>,
-        email_available: bool, now: i64) -> Proof<RestoreChallenge> {
+    pub fn restore_challenge(&self, user: &str, epoch: u64, purpose: &str, baseline: &FactorBaseline, cipher: &dyn MfaCipher,
+        origin: Option<&str>, email_available: bool, now: i64) -> Proof<RestoreChallenge> {
         use OwnerFactorError::*;
         if user.is_empty() || now <= 0 || !valid_purpose(purpose) { return Err(Denied); }
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
         let account = owner_account(&tx, user, epoch)?;
-        let (strongest, allowed) = baseline.usable(&tx, user)?;
+        let (strongest, allowed) = baseline.usable(&tx, user, cipher)?;
         if locked(lockout(&tx, user)?, now) { return Err(Failed); }
         let issued = match strongest {
             OwnerFactor::Totp => RestoreChallenge::Totp,
@@ -462,7 +505,7 @@ impl UserDb {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
         owner_account(&tx, user, epoch)?;
-        let (strongest, allowed) = baseline.usable(&tx, user)?;
+        let (strongest, allowed) = baseline.usable(&tx, user, cipher)?;
         if rank(presented) > rank(strongest) { return Err(NotPreexisting); }
         if presented != strongest { return Err(NotStrongest(strongest)); }
         let verified = match strongest {

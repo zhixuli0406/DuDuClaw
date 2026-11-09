@@ -6,7 +6,7 @@
 //! |---|---|
 //! | `me.isolation.list_restorable` | owner (own Personal rows only) |
 //! | `me.isolation.restore_challenge` | owner (own row): the strongest factor's purpose-bound challenge |
-//! | `me.isolation.request_restore` / `cancel_restore` | owner + strongest factor (Q2) |
+//! | `me.isolation.request_restore` / `cancel_restore` | owner + strongest factor (Q2); `cancel_restore` with `password` instead: the owner of an Admin-filed (`owner_unverified`) request, current session + password (security round 3 N3) |
 //! | `isolation.employee_restore_decide` / `employee_restore_cancel` | Admin + MFA + step-up |
 //! | `isolation.employee_restore_regrant` | Admin + MFA + step-up (one listed item, audited) |
 //! | `isolation.employee_retire_propose` | Admin + MFA + step-up (F6l) |
@@ -103,13 +103,18 @@ pub(super) struct OwnerRequest {
     #[serde(default)] pub(super) challenge_id: Option<String>,
     #[serde(default)] pub(super) credential: Option<Value>,
 }
+/// `me.isolation.cancel_restore`: the strongest-factor proof fields, or
+/// (security round 3 N3) `password` alone — the owner cancelling a request an
+/// Admin filed for them (`owner_unverified`: no factor to prove).
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OwnerCancel {
-    pub(super) request_id: String, pub(super) factor: String,
+    pub(super) request_id: String,
+    #[serde(default)] pub(super) factor: String,
     #[serde(default)] pub(super) code: String,
     #[serde(default)] pub(super) challenge_id: Option<String>,
     #[serde(default)] pub(super) credential: Option<Value>,
+    #[serde(default)] pub(super) password: Option<String>,
 }
 
 /// The operator-configured passkey origin (`None`: a passkey owner is
@@ -148,6 +153,24 @@ async fn run<T: Send + 'static>(work: impl FnOnce() -> Result<T, Failure> + Send
     tokio::task::spawn_blocking(work).await.map_err(|_| Failure::Gate(SERVICE_UNAVAILABLE))?
 }
 
+/// Security round 3 N3: the owner's re-auth for cancelling an Admin-filed
+/// request — the session is current (active account at the session's
+/// credential epoch, no forced password change) and the password verifies
+/// (`UserDb::verify_password`, timing-safe). Never a factor fallback: it only
+/// unlocks `cancel_own_unverified`.
+pub(super) fn owner_password_reauth(db: &UserDb, user: &str, epoch: u64, password: &str) -> Result<(), OwnerFactorError> {
+    let account = db.get_user(user).map_err(|_| OwnerFactorError::Unavailable)?.ok_or(OwnerFactorError::Denied)?;
+    if account.id != user || account.status != duduclaw_auth::UserStatus::Active || account.must_change_password
+        || !duduclaw_auth::mfa::credential_epoch_matches(epoch, account.credential_epoch) {
+        return Err(OwnerFactorError::Denied);
+    }
+    if password.is_empty() { return Err(OwnerFactorError::Failed); }
+    match db.verify_password(&account.email, password) {
+        Ok(verified) if verified.id == account.id => Ok(()),
+        _ => Err(OwnerFactorError::Failed),
+    }
+}
+
 /// The production collaborators of one restore step.
 pub(super) fn with_env<T>(home: &Path, actor: &str, rule: &LogRule, cap: usize, now: i64, f: impl FnOnce(&RestoreEnv<'_>) -> T) -> T {
     let routes = CatalogRoutes(home);
@@ -164,7 +187,9 @@ pub(super) fn with_adopt_env<T>(home: &Path, actor: &str, cap: usize, now: i64,
     let routes = CatalogRoutes(home);
     let env = crate::isolation_adopt::AdoptEnv { root: &crate::isolation_retire::SpawndRetireRoot, routes: &routes,
         runs: &crate::isolation_quarantine::SpawndRunStopper, rule: &duduclaw_auth::admin_approval_rule::EligibilityLogRule,
-        hooks: &crate::isolation_adopt::no_hooks, agent_cap: cap, actor, now };
+        hooks: &crate::isolation_adopt::no_hooks, agent_cap: cap, actor,
+        // Filing never approves: no step-up for the rule (N2).
+        step_up_verified_at: None, now };
     f(&env)
 }
 
@@ -211,10 +236,11 @@ impl MethodHandler {
                     let now = now()?;
                     let origin = passkey_origin(&home);
                     let mail = crate::mfa_email::available(&home);
+                    let cipher = crate::mfa::Cipher(&home);
                     // F6fa: the tombstone's factor baseline of the row the purpose names.
                     let issue = |purpose: &str| -> Result<RestoreChallenge, OwnerFactorError> {
                         let baseline = rpc::factor_baseline(&home, &user, purpose)?;
-                        db.restore_challenge(&user, epoch, purpose, &baseline, origin.as_deref(), mail, now)
+                        db.restore_challenge(&user, epoch, purpose, &baseline, &cipher, origin.as_deref(), mail, now)
                     };
                     if input.for_adoption {
                         return Ok(rpc::adoption_challenge(&home, &user, &input.employee_id, input.incarnation, &issue)?);
@@ -262,6 +288,17 @@ impl MethodHandler {
             }
             CANCEL_RESTORE => {
                 let input: OwnerCancel = serde_json::from_value(params).map_err(invalid)?;
+                if let Some(password) = input.password {
+                    // N3: a factor proof and a password never mix.
+                    if !input.factor.is_empty() || !input.code.is_empty() || input.challenge_id.is_some() || input.credential.is_some() {
+                        return Err(RpcError::Invalid.into());
+                    }
+                    return run(move || {
+                        let now = now()?;
+                        let reauth = || -> Result<(), OwnerFactorError> { owner_password_reauth(&db, &user, epoch, &password) };
+                        Ok(rpc::cancel_own_unverified(&home, &user, &input.request_id, &reauth, now)?)
+                    }).await;
+                }
                 run(move || {
                     let now = now()?;
                     let cipher = crate::mfa::Cipher(&home);

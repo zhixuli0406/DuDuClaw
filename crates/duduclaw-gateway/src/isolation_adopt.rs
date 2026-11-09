@@ -20,7 +20,9 @@
 //!   agent.toml after the transform; the row goes `adopting`.
 //! - Approval and apply ([`validate_item`], [`apply_item`],
 //!   [`compensate_item`], `isolation_adopt_apply.rs`): the F6c2 rule on the
-//!   card, the allowlist transform ([`ADOPT_SETTINGS_KEYS`]), the label-store
+//!   card (step-up freshness from the call's proof), the owner and approval
+//!   checks again inside the commit's users.db write transactions
+//!   ([`recheck_commit`]), the allowlist transform ([`ADOPT_SETTINGS_KEYS`]), the label-store
 //!   re-key with a positive zero count (S10), the `adopted` marker with the
 //!   `duduclaw-employee-dir-v2` digest (R8), `root_absent` (R12).
 //! - Recovery ([`recover_adoptions`], §3.6): finish the re-key, then roll
@@ -196,6 +198,12 @@ pub(crate) struct AdoptEnv<'a> {
     pub(crate) agent_cap: usize,
     /// The verified actor (fence retries, audit).
     pub(crate) actor: &'a str,
+    /// Security round 3 N2: `verified_at` of the migration step-up proof the
+    /// confirmation RPC read for this call (`None`: none — request filing,
+    /// boot recovery, a listing without a proof). The F6c2 rule's
+    /// `fresh_step_up` is computed from it at each decision
+    /// (`isolation_restore_wiring::step_up_fresh`), never assumed.
+    pub(crate) step_up_verified_at: Option<u64>,
     pub(crate) now: i64,
 }
 
@@ -225,7 +233,8 @@ pub(crate) fn with_production_env_capped<T>(home: &Path, actor: &str, agent_cap:
     run: impl FnOnce(&AdoptEnv<'_>) -> T) -> T {
     let routes = restore::CatalogRoutes(home);
     let env = AdoptEnv { root: &retire::SpawndRetireRoot, routes: &routes, runs: &quarantine::SpawndRunStopper,
-        rule: &duduclaw_auth::admin_approval_rule::EligibilityLogRule, hooks: &no_hooks, agent_cap, actor, now };
+        rule: &duduclaw_auth::admin_approval_rule::EligibilityLogRule, hooks: &no_hooks, agent_cap, actor,
+        step_up_verified_at: None, now };
     run(&env)
 }
 
@@ -675,12 +684,23 @@ fn text_field<'a>(item: &'a ConfirmationItem, name: &str) -> Option<&'a str> {
 fn decide(home: &Path, env: &AdoptEnv<'_>, request: &RestoreRequest, approver: &str) -> Result<bool, AdoptError> {
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadOnly).map_err(unavailable)?;
     let tx = users.transaction().map_err(unavailable)?;
+    let self_approved = decide_in(env, &tx, request, approver)?;
+    tx.finish().map_err(unavailable)?;
+    Ok(self_approved)
+}
+
+/// Owner eligibility and the F6c2 decision (admin-filed or standard) on the
+/// caller's users.db transaction `users`; `Ok(self_approved)`.
+fn decide_in(env: &AdoptEnv<'_>, users: &Connection, request: &RestoreRequest, approver: &str) -> Result<bool, AdoptError> {
     if let Some(owner) = &request.owner {
-        if !lifecycle::owner_eligible(&tx, owner).map_err(unavailable)? { return Err(Refusal::OwnerIneligible.into()); }
+        if !lifecycle::owner_eligible(users, owner).map_err(unavailable)? { return Err(Refusal::OwnerIneligible.into()); }
     }
     let kind = if request.kind == RequestKind::PersonalAdopt { ApprovalKind::PersonalAdopt } else { ApprovalKind::SharedAdopt };
+    // Security round 3 N2: the freshness of this call's step-up proof, as for
+    // restore and retire (never a hard-coded `true`).
+    let fresh_step_up = crate::isolation_restore_wiring::step_up_fresh(env.step_up_verified_at, env.now);
     let approval = ApprovalRequest { kind, requester_user_id: &request.requester,
-        owner_user_id: request.owner.as_deref(), approver_user_id: approver, fresh_step_up: true, now: env.now };
+        owner_user_id: request.owner.as_deref(), approver_user_id: approver, fresh_step_up, now: env.now };
     // F6fa2: an Admin-filed Personal adoption needs a third qualifying Admin
     // (filer and owner are parties; no sole-Admin path).
     let admin_filed = match request.filed_by_admin.as_deref() {
@@ -689,8 +709,7 @@ fn decide(home: &Path, env: &AdoptEnv<'_>, request: &RestoreRequest, approver: &
             && request.owner.as_deref().is_some_and(|owner| owner != filer) => true,
         Some(_) => return Err(AdoptError::Inconsistent),
     };
-    let decision = if admin_filed { env.rule.decide_admin_filed(&tx, &approval) } else { env.rule.decide(&tx, &approval) };
-    tx.finish().map_err(unavailable)?;
+    let decision = if admin_filed { env.rule.decide_admin_filed(users, &approval) } else { env.rule.decide(users, &approval) };
     match decision {
         ApprovalDecision::Allowed { self_approved, .. } => {
             let party = approver == request.requester || request.owner.as_deref() == Some(approver);
@@ -701,6 +720,31 @@ fn decide(home: &Path, env: &AdoptEnv<'_>, request: &RestoreRequest, approver: &
         }
         ApprovalDecision::Refused(refusal) => Err(AdoptError::Approval(refusal.code())),
     }
+}
+
+/// Security round 3 N1: the owner and approval checks of the adoption
+/// commit, on the caller's users.db **write** transaction `users` (the one
+/// that writes the Personal mirror in `save`, or the commit's own, taken
+/// after apply.db — M6): tenant, `owner_eligible`, the Q3 credential check
+/// against the tombstone snapshot (`check_credentials`) and the
+/// admin-filed / standard F6c2 decision, which must still give the
+/// `self_approved` the approval recorded. Run for a fresh (`requested`) and
+/// a resumed (`applying`, before or after `save`) stage alike, so a password,
+/// email or factor change by anyone but the owner after the approval (e.g.
+/// the filing Admin resetting the owner's password during the transform)
+/// refuses the commit.
+pub(crate) fn recheck_commit(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, request: &RestoreRequest, approver: &str,
+    self_approved: bool, users: &Connection) -> Result<(), AdoptError> {
+    if duduclaw_auth::isolation::read_isolation_tenant(users).map_err(unavailable)? != q.tenant {
+        return Err(Refusal::TenantMismatch.into());
+    }
+    if request.owner != q.owner { return Err(AdoptError::Inconsistent); }
+    if let Some(owner) = &q.owner {
+        if !lifecycle::owner_eligible(users, owner).map_err(unavailable)? { return Err(Refusal::OwnerIneligible.into()); }
+        restore::check_credentials(home, users, q, owner)?;
+    }
+    if decide_in(env, users, request, approver)? != self_approved { return Err(AdoptError::Approval("APPROVAL_RULE_INCONSISTENT")); }
+    Ok(())
 }
 
 /// Approval and every apply step of an Employee proposal carrying
@@ -752,13 +796,17 @@ pub(crate) fn validate_item(home: &Path, env: &AdoptEnv<'_>, item: &Confirmation
     // F6fa2: Admin-filed only for an owner without a second factor at the tombstone.
     if request.owner_unverified() && !restore::admin_may_file_for_owner(&q) { return Err(AdoptError::Inconsistent); }
     drop(db);
+    // Security round 3 N1: the owner side (tenant, eligibility, Q3 credential
+    // check) for every open state — a resumed `applying` stage included, before
+    // or after `save` — not only while `requested`. The commit re-runs it in
+    // its users.db write transaction (`recheck_commit`).
+    restore::check_users(home, &q)?;
     if let Some((employee, digest)) = saved {
         tree_matches(home, &target, &digest, settings)?;
         let self_approved = decide(home, env, &request, approver)?;
         return Ok(Phase::Saved { request, row: q, target, employee, self_approved });
     }
     if request.state == "requested" {
-        restore::check_users(home, &q)?;
         // F6fb item 8: the new id is one more live employee (licence cap).
         restore::check_quota(home, env.agent_cap)?;
         require_root_gone(home, env, &q)?;
