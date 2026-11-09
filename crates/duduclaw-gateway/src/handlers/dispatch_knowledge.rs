@@ -464,7 +464,7 @@ impl MethodHandler {
             }
 
             // ── System (admin only for config changes) ───────
-            "system.status" => boxed_frame(|| self.handle_system_status()).await,
+            "system.status" => boxed_frame(|| self.handle_system_status(ctx)).await,
             "system.doctor" => {
                 require_admin!();
                 boxed_frame(|| self.handle_system_doctor()).await

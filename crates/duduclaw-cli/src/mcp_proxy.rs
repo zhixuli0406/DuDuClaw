@@ -107,6 +107,8 @@ pub const PROXY_PRIVATE_ENV: &[&str] = &[
     "DUDUCLAW_INSTANCE",
     "DUDUCLAW_AGENT_ID",
     "DUDUCLAW_AGENT_TOKEN",
+    // RM-166 round 2: inherited from the Claude CLI env; hook-only proof.
+    duduclaw_core::identity_token::ENV_HOOK_TOKEN,
     "DUDUCLAW_MCP_API_KEY",
     "DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED",
     "DUDUCLAW_REDACTION_SCOPES",

@@ -669,6 +669,16 @@ impl AgentRuntime for GrokRuntime {
         for (k, v) in duduclaw_core::agent_identity_env_vars(&context.home_dir, &context.agent_id) {
             cmd.env(k, v);
         }
+        // RM-166 round 2: Grok runs DuDuClaw's guard hooks (written above as
+        // project hooks, `--agent <agent dir>`), so it also gets that
+        // employee's hook-only token. The identity export above is unchanged
+        // (Grok's MCP child may depend on it — residual #2).
+        cmd.env_remove(duduclaw_core::ENV_HOOK_TOKEN);
+        if work_root.is_some() {
+            if let Some(agent_dir) = context.agent_dir.as_deref() {
+                cmd.envs(crate::agent_hook_installer::hook_token_env(agent_dir));
+            }
+        }
         for (k, v) in duduclaw_core::mcp_forward_env_vars() {
             cmd.env(k, v);
         }
@@ -929,6 +939,13 @@ impl GrokRuntime {
         env.extend(duduclaw_core::agent_identity_env_vars_default(
             &context.agent_id,
         ));
+        // RM-166 round 2: same hook-only token as the primary spawn.
+        env.remove(duduclaw_core::ENV_HOOK_TOKEN);
+        if work_root.is_some() {
+            if let Some(agent_dir) = context.agent_dir.as_deref() {
+                env.extend(crate::agent_hook_installer::hook_token_env(agent_dir));
+            }
+        }
         for name in [duduclaw_core::ENV_DISPATCH_RUN_ID, duduclaw_core::ENV_TASK_ID,
             duduclaw_core::ENV_TRUST_TURN_ID] {
             env.remove(name);

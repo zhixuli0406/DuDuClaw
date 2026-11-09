@@ -123,6 +123,8 @@ impl MethodHandler {
                     { "name": "delegation.set", "description": "Update the delegation policy / cross-department pairs (admin)" },
                     { "name": "system.autostart.status", "description": "Login/boot autostart registration status (admin)" },
                     { "name": "system.autostart.set", "description": "Enable/disable gateway autostart at login/boot (admin)" },
+                    { "name": "system.identity_grace_start", "description": "Accept unverified AI-employee identities for at most 30 days (admin + current password; audited)" },
+                    { "name": "system.identity_grace_end", "description": "End the identity-token grace now and return to strict mode (admin; audited)" },
                     { "name": "accounts.add", "description": "Add a new account (provider defaults to anthropic). Since v1.74.0, type=oauth needs accept_subscription_risk: true (else error code subscription_risk_not_accepted); the same parameter is required by auth.cli_login.start and accounts.setup_token_start" },
                     { "name": "accounts.update_budget", "description": "Update account monthly budget" },
                     { "name": "accounts.remove", "description": "Remove one configured account and its stored credential (Admin)" },

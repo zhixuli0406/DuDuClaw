@@ -201,6 +201,7 @@ fn prepare_identity_key(home: &std::path::Path) -> std::io::Result<()> {
     if !strict {
         tracing::warn!("MCP identity-token grace period is active; unverified employee claims are accepted only until identity_token_grace_until. Re-enable require_identity_token after upgrading agent configs.");
     }
+    crate::identity_transition::log_startup_mode(home, strict);
     duduclaw_core::ensure_identity_key(home)?;
     info!(require_identity_token = strict, "MCP caller-identity signing key ready");
     Ok(())
@@ -719,6 +720,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "Failed to initialize user database: {e}"
         ))
     })?);
+
+    // RM-166 (round 2, owner decision 2026-11-09) — record once when this
+    // release first started on this home, for the dashboard's 30-day
+    // "strict mode is on" notice. Never writes config.toml and never weakens
+    // strict mode (no automatic grace). Must run before
+    // `prepare_identity_key`, whose key creation would make a fresh install
+    // look like an existing one. Failures only log.
+    crate::identity_transition::record_first_start(&home_dir);
 
     // WP21 debt ⑧ — mint `<home>/identity.key` if absent, before any MCP env
     // block is assembled, so every `.mcp.json` / runtime config written later

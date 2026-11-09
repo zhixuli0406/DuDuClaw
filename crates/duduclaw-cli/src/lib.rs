@@ -2763,7 +2763,9 @@ enum HookCommands {
         /// fix: it is trusted over the env var (see `resolve_hook_caller`)
         /// because it lives inside `.claude/settings.json`, which is itself
         /// a frozen `ProtectedSurface::HookSettings` file the agent cannot
-        /// rewrite to claim a different id.
+        /// rewrite to claim a different id. (RM-166: the gateway's Claude
+        /// spawns now also carry the employee's own identity env, so strict
+        /// mode can verify this claim; the flag still names the claimant.)
         #[arg(long)]
         agent: Option<String>,
         /// The DuDuClaw home this agent belongs to, baked into the installed
@@ -6588,6 +6590,11 @@ async fn cmd_hook_agent_file_guard(
     };
 
     if let Some(msg) = decision.block_message() {
+        // RM-166: record identity refusals (claimed id + tool only) so the
+        // dashboard can warn that an AI employee cannot write its folder.
+        if let duduclaw_core::GuardDecision::BlockedUntrustedCaller { caller, .. } = &decision {
+            duduclaw_security::audit::log_hook_untrusted_caller(&home, caller, tool_name);
+        }
         eprintln!("{msg}");
         // Exit 2 — Claude Code interprets this as a block and surfaces
         // stderr back to the agent so the model learns to retry with
@@ -7051,6 +7058,21 @@ async fn cmd_hook_data_file_guard() -> duduclaw_core::error::Result<()> {
 /// require_identity_token = true`) rejects it into
 /// [`duduclaw_core::HookCaller::Untrusted`].
 ///
+/// RM-166: since then the gateway's Claude spawns
+/// (`duduclaw_gateway::agent_hook_installer::apply_hook_identity_env`) put the
+/// spawned employee's own `DUDUCLAW_AGENT_ID` in the CLI's env, which this
+/// hook inherits — so strict mode verifies the `--agent` claim instead of
+/// refusing it. A token minted for any other id still fails the exact-id HMAC
+/// check and the caller stays untrusted.
+///
+/// RM-166 round 2 (finding 5): the proof that env carries is the hook-only
+/// `DUDUCLAW_HOOK_TOKEN` (`duduclaw_core::verify_hook_claim`), never the full
+/// `DUDUCLAW_AGENT_TOKEN`, so an employee's Bash cannot lift a token that the
+/// MCP server, delegation or internal routes would accept. This is the only
+/// place a hook token is accepted. A runtime that still exports the full
+/// identity token (Grok/Codex children) keeps working: a valid
+/// `DUDUCLAW_AGENT_TOKEN` is the stronger proof and is checked second.
+///
 /// An absent claim (both `agent_id_arg` and the env var empty) yields
 /// [`duduclaw_core::HookCaller::Absent`], which is deliberately unrestricted:
 /// this hook is registered only inside an agent's own `.claude/settings.json`,
@@ -7069,15 +7091,37 @@ fn resolve_hook_caller(
         );
         return duduclaw_core::HookCaller::Absent;
     }
+    let hook_token = std::env::var(duduclaw_core::ENV_HOOK_TOKEN).unwrap_or_default();
     let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
     let require = match duduclaw_core::require_identity_token_from_home(home) {
         Ok(require) => require,
         Err(_) => return duduclaw_core::HookCaller::Untrusted(claimed.to_string()),
     };
-    match duduclaw_core::verify_identity_claim(home, claimed, token.trim(), require) {
-        duduclaw_core::IdentityVerdict::Rejected => {
-            duduclaw_core::HookCaller::Untrusted(claimed.to_string())
-        }
+    hook_caller_from_tokens(home, claimed, hook_token.trim(), token.trim(), require)
+}
+
+/// [`resolve_hook_caller`]'s verdict with the env reads hoisted out: the hook
+/// token first, then the full identity token.
+fn hook_caller_from_tokens(
+    home: &std::path::Path,
+    claimed: &str,
+    hook_token: &str,
+    token: &str,
+    require: bool,
+) -> duduclaw_core::HookCaller {
+    use duduclaw_core::IdentityVerdict::{Rejected, Verified};
+    let hook_verified = !hook_token.is_empty()
+        && duduclaw_core::verify_hook_claim(home, claimed, hook_token, require) == Verified;
+    // No (or a non-verifying) hook token: the identity token decides,
+    // including the soft-mode / disabled outcomes it always had. Strict mode
+    // therefore still refuses a forged or foreign hook token.
+    let verdict = if hook_verified {
+        Verified
+    } else {
+        duduclaw_core::verify_identity_claim(home, claimed, token, require)
+    };
+    match verdict {
+        Rejected => duduclaw_core::HookCaller::Untrusted(claimed.to_string()),
         _ => duduclaw_core::HookCaller::Agent(claimed.to_string()),
     }
 }
@@ -7104,6 +7148,38 @@ mod resolve_hook_caller_tests {
         unsafe {
             std::env::remove_var(duduclaw_core::ENV_AGENT_ID);
             std::env::remove_var(duduclaw_core::ENV_AGENT_TOKEN);
+            std::env::remove_var(duduclaw_core::ENV_HOOK_TOKEN);
+        }
+    }
+
+    /// RM-166 round 2: the hook accepts its own hook token (and, for
+    /// runtimes that still export it, the full identity token) — but a hook
+    /// token presented as an identity token, or one minted for another id,
+    /// stays untrusted in strict mode.
+    #[test]
+    fn rm166b_hook_accepts_the_hook_token_and_refuses_misplaced_or_foreign_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let key = duduclaw_core::ensure_identity_key(home).unwrap();
+        std::fs::write(home.join("config.toml"), "[delegation]\nrequire_identity_token = true\n").unwrap();
+        let hook = duduclaw_core::mint_hook_token(&key, "alice");
+        let full = duduclaw_core::mint_identity_token(&key, "alice");
+        let bob_hook = duduclaw_core::mint_hook_token(&key, "bob");
+        let agent = duduclaw_core::HookCaller::Agent("alice".to_string());
+        let untrusted = duduclaw_core::HookCaller::Untrusted("alice".to_string());
+        for (hook_token, token, expected) in [
+            (hook.as_str(), "", &agent),
+            ("", full.as_str(), &agent),
+            (bob_hook.as_str(), "", &untrusted),
+            ("", hook.as_str(), &untrusted),
+            (full.as_str(), "", &untrusted),
+            ("", "", &untrusted),
+        ] {
+            assert_eq!(
+                &super::hook_caller_from_tokens(home, "alice", hook_token, token, true),
+                expected,
+                "hook={hook_token:?} token={token:?}"
+            );
         }
     }
 
@@ -7219,6 +7295,41 @@ mod resolve_hook_caller_tests {
             duduclaw_core::HookCaller::Untrusted("agent-x".to_string()),
             "strict mode must reject an --agent claim with no verifying token"
         );
+    }
+
+    /// RM-166: with the identity env the gateway's Claude spawn builds, the
+    /// installed `--agent` claim is verified in strict mode; another
+    /// employee's pair under the same claim stays untrusted.
+    #[test]
+    fn rm166_hook_caller_is_agent_with_cli_env_in_strict_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = true\n",
+        )
+        .unwrap();
+        let alice = tmp.path().join("agents/alice");
+        let bob = tmp.path().join("agents/bob");
+        std::fs::create_dir_all(&alice).unwrap();
+        std::fs::create_dir_all(&bob).unwrap();
+
+        let set = |dir: &std::path::Path| {
+            clear_env();
+            for (key, value) in duduclaw_gateway::agent_hook_installer::hook_identity_env(dir) {
+                // SAFETY: serialized via ENV_LOCK.
+                unsafe { std::env::set_var(key, value) };
+            }
+        };
+        set(alice.as_path());
+        let own = resolve_hook_caller(tmp.path(), Some("alice"));
+        set(bob.as_path());
+        let foreign = resolve_hook_caller(tmp.path(), Some("alice"));
+        clear_env();
+
+        assert_eq!(own, duduclaw_core::HookCaller::Agent("alice".to_string()));
+        assert_eq!(foreign, duduclaw_core::HookCaller::Untrusted("alice".to_string()));
     }
 
     #[test]
@@ -10255,7 +10366,9 @@ fn agent_session_identity() -> Option<String> {
         return Some(id.to_string());
     }
     let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
-    (!token.trim().is_empty()).then(|| "（未具名）".to_string())
+    // RM-166 round 2: a Claude employee's process env carries the hook token.
+    let hook_token = std::env::var(duduclaw_core::ENV_HOOK_TOKEN).unwrap_or_default();
+    (!token.trim().is_empty() || !hook_token.trim().is_empty()).then(|| "（未具名）".to_string())
 }
 
 /// The zh-TW refusal shown when an org-authority write is attempted from

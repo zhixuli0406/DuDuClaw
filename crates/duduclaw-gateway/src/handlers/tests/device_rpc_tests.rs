@@ -189,6 +189,52 @@ async fn system_status_reports_decision_enabled_true_without_config() {
     );
 }
 
+/// RM-166: `system.status.identity_token` carries the effective identity
+/// mode, transition deadline / days left and the 24 h refusal count.
+#[tokio::test]
+async fn system_status_reports_identity_token_transition() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let data = frame_data(&handler.handle("system.status", json!({}), &admin_ctx()).await);
+    let identity = data.get("identity_token").expect("identity_token present");
+    assert_eq!(identity["mode"], "strict", "{identity}");
+    assert_eq!(identity["explicit_setting"], false);
+    assert!(identity["days_left"].is_null());
+    assert_eq!(identity["untrusted_refusals_24h"], 0);
+
+    let deadline = (chrono::Utc::now() + chrono::Duration::days(10))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = \"{deadline}\"\n"),
+    )
+    .unwrap();
+    let data = frame_data(&handler.handle("system.status", json!({}), &admin_ctx()).await);
+    let identity = &data["identity_token"];
+    assert_eq!(identity["mode"], "grace", "{identity}");
+    assert_eq!(identity["grace_until"], deadline);
+    assert_eq!(identity["days_left"], 10);
+    assert_eq!(identity["notice_active"], false, "no first-start record in this home");
+    assert_eq!(identity["manual_grace_max_days"], 30);
+}
+
+/// RM-166 round 2 (finding 3): `system.status.identity_token` is Admin-only;
+/// every other role gets the rest of the status without it.
+#[tokio::test]
+async fn rm166b_system_status_identity_field_is_hidden_for_non_admins() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let admin = frame_data(&handler.handle("system.status", json!({}), &admin_ctx()).await);
+    assert!(admin.get("identity_token").is_some());
+    let mut manager = employee_ctx();
+    manager.role = UserRole::Manager;
+    for ctx in [employee_ctx(), manager] {
+        let data = frame_data(&handler.handle("system.status", json!({}), &ctx).await);
+        assert!(data.get("identity_token").is_none(), "{data:?}");
+        assert!(data.get("version").is_some(), "the rest of the status stays");
+    }
+}
+
 /// The `false` branch of the same field: `[decision] enabled = false` in
 /// `config.toml` is what the operator writes to retire the line, and it
 /// must reach the dashboard (the nav row and page hide on it).
