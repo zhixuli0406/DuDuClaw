@@ -79,6 +79,12 @@ their v1.80 stores differ has not been reviewed (for example, the v1.80.0
 `users-v1793.sql`). Extra tables,
 columns, indexes, views or triggers reject the whole source; other historical
 variants are deliberately rejected until exact catalogs are reviewed.
+`tasks.db` additionally has a third catalog, `tasks-v181.sql`: the v1.80.x store plus the
+P1e `task_store_markers` table that every fresh v1.81 `tasks.db` creates, so a home made
+by this release is accepted as a source. Both the v1.80 and v1.81 catalogs are accepted
+(exact match only, `tasks-v180.sql` is unchanged), share the v1.80 mapping, and the
+marker table is never authorized for reading. `scripts/capture_tasks_schema.py`
+regenerates both files; the gateway test compares `tasks-v181.sql` with a fresh `TaskStore`.
 `memory-v180.sql` is reproducible from the reviewed fresh engine SQL with
 `scripts/capture_memory_schema.py` (and `approvals-v180.sql` with
 `scripts/capture_approval_schema.py`); the gateway regression tests compare these

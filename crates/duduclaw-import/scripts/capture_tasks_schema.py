@@ -1,6 +1,7 @@
 """Generate the reviewed task catalog without loading a legacy database.
 
-Writes tasks-v180.sql: the current source is the v1.80.x store. tasks-v1793.sql is
+Writes tasks-v180.sql (the v1.80.x store) and tasks-v181.sql (v1.80.x plus the P1e
+task_store_markers table = what a fresh store creates now). tasks-v1793.sql is
 a separate pinned catalog of the older release and is never regenerated from
 current source (see its header for how it was derived)."""
 import pathlib,re,sqlite3
@@ -43,5 +44,12 @@ for sql in literals(resp.split('pub(super) fn init_responsibility_schema')[1]):
     if sql.startswith(('CREATE ','ALTER ')) and '{' not in sql:run(sql)
 assign=(root/'assign_schedules.rs').read_text();run(next(s for s in literals(assign) if s.lstrip().startswith('CREATE TABLE IF NOT EXISTS assign_schedules')))
 a2a=(root/'a2a.rs').read_text();run(next(s for s in literals(a2a) if s.startswith('CREATE TABLE IF NOT EXISTS a2a_requests')))
+v180_statements=list(statements)
 pathlib.Path('crates/duduclaw-import/src/tasks-v180.sql').write_text('-- Generated from reviewed task-store DDL (v1.80.x tasks.db; scripts/capture_tasks_schema.py).\n'+'\n'.join(s.strip()+';' if not s.rstrip().endswith(';') else s.strip() for s in statements)+'\n')
+# v1.81 (P1e): the same store plus the goal-backfill marker table, created by
+# goal_creator_backfill.rs. Whitespace inside the statement is kept verbatim
+# because sqlite_schema stores it and the importer compares it exactly.
+markers=next(s for s in literals((root/'goal_creator_backfill.rs').read_text().split('fn backfill_goal_creators')[1]) if s.startswith('CREATE TABLE IF NOT EXISTS task_store_markers'))
+run(markers)
+pathlib.Path('crates/duduclaw-import/src/tasks-v181.sql').write_text('-- Generated from reviewed task-store DDL (v1.81 tasks.db = v1.80.x plus the P1e task_store_markers table; scripts/capture_tasks_schema.py).\n'+'\n'.join(s.strip()+';' if not s.rstrip().endswith(';') else s.strip() for s in statements)+'\n')
 print('schema objects:',conn.execute('SELECT count(*) FROM sqlite_schema').fetchone()[0])

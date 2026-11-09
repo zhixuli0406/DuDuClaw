@@ -198,13 +198,7 @@ impl ProfilePlan {
     fn migration_authority_task_schema_matches_fresh_store() {
         let home=tempfile::tempdir().unwrap();let _store=crate::task_store::TaskStore::open(home.path()).unwrap();
         let actual=rusqlite::Connection::open(home.path().join("tasks.db")).unwrap();let expected=rusqlite::Connection::open_in_memory().unwrap();
-        expected.execute_batch(include_str!("../../../duduclaw-import/src/tasks-v180.sql")).unwrap();
-        // v1.81 P1e: the one-time goal-creator backfill marker table (task_store/goal_creator_backfill.rs).
-        // The importer's v1.80 catalog stays as is: it fingerprints older source stores.
-        expected.execute_batch(concat!("CREATE TABLE IF NOT EXISTS task_store_markers (\n",
-            "                 name       TEXT PRIMARY KEY,\n",
-            "                 applied_at TEXT NOT NULL\n",
-            "             );")).unwrap();
+        expected.execute_batch(include_str!("../../../duduclaw-import/src/tasks-v181.sql")).unwrap();
         fn schema(c:&rusqlite::Connection)->Vec<(String,String,String,Option<String>)> {c.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect()}
         assert_eq!(schema(&actual),schema(&expected));
     }

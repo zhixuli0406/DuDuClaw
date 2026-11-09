@@ -88,6 +88,43 @@ fn import_accepts_v180_session_tasks_cron() {
 }
 
 #[test]
+fn import_accepts_v181_tasks_and_never_reads_markers() {
+    // A store made by this release (v1.80.x plus task_store_markers) is accepted;
+    // the v1.80 catalog is still accepted on its own.
+    assert_eq!(detected(TASKS_V181, Store::Tasks, None).version, SchemaVersion::V180);
+    assert_eq!(detected(TASKS_V180, Store::Tasks, None).version, SchemaVersion::V180);
+    assert!(take_schema_refusal().is_none());
+    let goal = "INSERT INTO tasks(id,title,description,assigned_to,created_at,updated_at,kind,goal_mode) VALUES ('goal','Quarterly goal','Do work','sales','now','now','goal',1);";
+    for (schema, rows) in [(TASKS_V180, goal.to_string()),
+        (TASKS_V181, format!("{goal} INSERT INTO task_store_markers(name,applied_at) VALUES ('MARKER-CANARY','now');"))] {
+        let file = store(schema, &rows);
+        let p = extract(&request(SourceKind::AuthorityTasksSqlite, "tasks.db"), source(&file), None).unwrap();
+        assert_eq!(p.len(), 1);
+        let encoded = serde_json::to_string(&p).unwrap();
+        assert!(encoded.contains("Quarterly goal") && !encoded.contains("MARKER-CANARY"));
+    }
+    // The importer's authorizer denies every read of the marker table.
+    let file = store(TASKS_V181, "INSERT INTO task_store_markers(name,applied_at) VALUES ('MARKER-CANARY','now');");
+    let conn = Connection::open(file.path()).unwrap();
+    conn.authorizer(Some(|c: rusqlite::hooks::AuthContext<'_>| match c.action {
+        rusqlite::hooks::AuthAction::Read { table_name: "task_store_markers", .. } => rusqlite::hooks::Authorization::Deny,
+        _ => rusqlite::hooks::Authorization::Allow,
+    }));
+    assert!(conn.prepare("SELECT name FROM task_store_markers").is_err());
+}
+
+#[test]
+fn import_refuses_tasks_store_with_extra_unknown_table() {
+    for schema in [TASKS_V180, TASKS_V181] {
+        let file = store(schema, "CREATE TABLE planted_markers(name TEXT);");
+        assert_eq!(extract(&request(SourceKind::AuthorityTasksSqlite, "tasks.db"), source(&file), None).err(), Some(Error::Schema));
+        let message = take_schema_refusal().expect("refusal report").to_string();
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81)"), "{message}");
+        assert!(message.contains("unexpected table planted_markers"), "{message}");
+    }
+}
+
+#[test]
 fn import_refuses_unknown_schema_with_diff() {
     // Neither version: a v1.80 cron store missing one scoped column and its index.
     let file = store(CRON_V180, "DROP INDEX idx_cron_scoped_actor; ALTER TABLE cron_tasks DROP COLUMN scoped_by_user_id;");
