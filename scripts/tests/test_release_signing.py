@@ -37,7 +37,7 @@ class ReleaseSigningTests(unittest.TestCase):
         # Packaging is the last work on either OS before saving the build outputs.
         self.assertEqual(build['steps'][-1], upload)
         self.assertEqual([s['name'] for s in build['steps'][-3:-1]],
-                         ['Package (Unix)', 'Package (Windows)'])
+                         ['Package (macOS)', 'Package (Windows)'])
 
     def test_sign_matrix_keeps_artifact_contract_and_publish_dependencies(self):
         sign = self.jobs['sign']
