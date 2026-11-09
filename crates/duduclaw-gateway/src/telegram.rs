@@ -1333,6 +1333,10 @@ async fn process_telegram_message(
     // validation uses the right sandbox root (None → resolver falls
     // back to default/main agent).
     let mut effective_agent: Option<String> = agent_name.clone();
+    // The session this turn's reply is stored under (goal-intent buttons,
+    // voice-failure notice): the employee's own bucket for an own bot or a
+    // primary-routed shared-bot turn (RM-172), else the conversation.
+    let mut reply_session = own_bot_session(&session_id, agent_name.as_deref());
     // Anonymous admins / "send as channel" share one placeholder `from.id`;
     // their turns get no trusted reply target, so no confirmation can be
     // bound to them (F4, review L1).
@@ -1376,10 +1380,14 @@ async fn process_telegram_message(
     // keyboard; the binding guidance (`Guide`) keeps priority.
     let shared_route = match agent_name {
         Some(_) => None,
-        None => Some(resolve_shared_route(&ctx, &user_id).await),
+        None => {
+            let private_chat = msg.chat.chat_type.as_deref() == Some("private")
+                && is_private_chat_with(chat_id, &user_id);
+            Some(resolve_shared_route(&ctx, &user_id, private_chat).await)
+        }
     };
     let bound_for_route: Option<Option<String>> = match &shared_route {
-        Some(SharedRoute::Bound(bound)) => Some(Some(bound.clone())),
+        Some(SharedRoute::Bound(bound) | SharedRoute::Primary(bound)) => Some(Some(bound.clone())),
         Some(SharedRoute::Unbound) => Some(None),
         _ => None,
     };
@@ -1461,6 +1469,12 @@ async fn process_telegram_message(
         }
         _ => None,
     };
+    // RM-172: `@` naming the sender's primary itself (the conversation
+    // default, so not a call) still answers in the primary's own bucket.
+    let primary_default = match (&called, &shared_route) {
+        (Some((id, false)), Some(SharedRoute::Primary(primary))) => id == primary,
+        _ => false,
+    };
 
     // A bot sender keeps the reply breaker's strict frequency trip (B10).
     let sender_kind = if msg.from.as_ref().is_some_and(|u| u.is_bot) {
@@ -1473,18 +1487,20 @@ async fn process_telegram_message(
             // Called by `@` (or the one message a tapped employee was
             // waiting for): this message only, in that employee's own
             // session bucket.
-            let guard = crate::trigger_route::as_called_turn(
-                via_trigger,
-                build_guarded_reply_for_agent(
-                    &input_text,
-                    &ctx,
-                    called_agent,
-                    &session_id,
-                    &user_id,
-                    Some(on_progress),
-                ),
-            )
-            .await;
+            let work = build_guarded_reply_for_agent(
+                &input_text,
+                &ctx,
+                called_agent,
+                &session_id,
+                &user_id,
+                Some(on_progress),
+            );
+            let guard = if primary_default {
+                reply_session = crate::trigger_route::called_session(&session_id, called_agent);
+                crate::trigger_route::as_own_bot_turn(work).await
+            } else {
+                crate::trigger_route::as_called_turn(via_trigger, work).await
+            };
             effective_agent = Some(called_agent.clone());
             (guard.text.clone(), Some(guard))
         } else if let Some(ref agent) = agent_name {
@@ -1502,34 +1518,23 @@ async fn process_telegram_message(
             .await;
             (guard.text.clone(), Some(guard))
         } else {
-            // Global/shared bot: route by the user→agent binding (WP9).
-            match shared_route.unwrap_or(SharedRoute::Unbound) {
-                SharedRoute::Bound(bound_agent) => {
-                    let guard = build_guarded_reply_for_agent(
-                        &input_text,
-                        &ctx,
-                        &bound_agent,
-                        &session_id,
-                        &user_id,
-                        Some(on_progress),
-                    )
-                    .await;
-                    effective_agent = Some(bound_agent);
-                    (guard.text.clone(), Some(guard))
-                }
-                SharedRoute::Unbound => {
-                    let guard = build_guarded_reply_with_session(
-                        &input_text,
-                        &ctx,
-                        &session_id,
-                        &user_id,
-                        Some(on_progress),
-                    )
-                    .await;
-                    (guard.text.clone(), Some(guard))
-                }
-                SharedRoute::Guide(msg) => (msg, None),
+            // Global/shared bot: route by the user→agent binding (WP9), or
+            // (RM-172) to the sender's primary employee in its own bucket.
+            let route = shared_route.unwrap_or(SharedRoute::Unbound);
+            reply_session = shared_route_session(&session_id, &route);
+            let (text, guard, agent) = shared_route_reply(
+                &ctx,
+                route,
+                &input_text,
+                &session_id,
+                &user_id,
+                Some(on_progress),
+            )
+            .await;
+            if agent.is_some() {
+                effective_agent = agent;
             }
+            (text, guard)
         }
     })))))
     .await;
@@ -1612,7 +1617,7 @@ async fn process_telegram_message(
     let voice_enabled = ctx.voice_sessions.lock().await.contains(&session_key);
     let tts_router = crate::tts::TtsRouter::for_home(&ctx.home_dir);
     let markup = conversation_markup(
-        &own_bot_session(&session_id, agent_name.as_deref()),
+        &reply_session,
         &reply,
         tts_router.is_available(),
     );
@@ -1671,7 +1676,7 @@ async fn process_telegram_message(
             Err(e) => {
                 warn!("TTS synthesis failed, falling back to text: {e}");
                 let first_failure = ctx.voice_failure_notices.lock().await
-                    .insert(own_bot_session(&session_id, agent_name.as_deref()));
+                    .insert(reply_session.clone());
                 let fallback_reply = if first_failure {
                     format!("{reply}\n\n語音暫時無法使用，先以文字回覆")
                 } else {
@@ -1932,7 +1937,14 @@ async fn handle_callback_query(
         {
             return;
         }
-        let text = telegram_pick(ctx, &session_id, &presser, picked).await;
+        let text = telegram_pick(
+            ctx,
+            &session_id,
+            &presser,
+            picked,
+            is_private_chat_with(chat_id, &presser),
+        )
+        .await;
         send_reply(client, api_base, chat_id, &text, thread_id, None, None).await;
         return;
     }
@@ -1944,7 +1956,9 @@ async fn handle_callback_query(
             } else {
                 format!("telegram:{chat_id}")
             };
-            let session_id = own_bot_session(&conversation, agent_name);
+            let presser = cb.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
+            let session_id =
+                reset_target_session(ctx, &conversation, agent_name, chat_id, &presser).await;
             match ctx.session_manager.delete_session(&session_id).await {
                 Ok(()) => {
                     ctx.voice_failure_notices.lock().await.remove(&session_id);
@@ -2146,6 +2160,7 @@ async fn handle_command(
             // shares, so two members would derive the same `source_acl` and
             // could retrieve each other's tool originals.
             let reply_user_id = reply_principal_for_sender(from_user_id);
+            let mut reply_session = own_bot_session(&session_id, agent_name);
             let (reply, guarded) = if let Some(agent) = agent_name {
                 let guard = crate::trigger_route::as_own_bot_turn(build_guarded_reply_for_agent(
                     args,
@@ -2163,32 +2178,13 @@ async fn handle_command(
                 let bind_key = from_user_id
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| scope_id.to_string());
-                match resolve_shared_route(ctx, &bind_key).await {
-                    SharedRoute::Bound(bound_agent) => {
-                        let guard = build_guarded_reply_for_agent(
-                            args,
-                            ctx,
-                            &bound_agent,
-                            &session_id,
-                            &reply_user_id,
-                            None,
-                        )
-                        .await;
-                        (guard.text.clone(), Some(guard))
-                    }
-                    SharedRoute::Unbound => {
-                        let guard = build_guarded_reply_with_session(
-                            args,
-                            ctx,
-                            &session_id,
-                            &reply_user_id,
-                            None,
-                        )
-                        .await;
-                        (guard.text.clone(), Some(guard))
-                    }
-                    SharedRoute::Guide(msg) => (msg, None),
-                }
+                // Primary routing needs the real sender, never the chat id.
+                let private_chat = from_user_id.is_some_and(|id| id == chat_id);
+                let route = resolve_shared_route(ctx, &bind_key, private_chat).await;
+                reply_session = shared_route_session(&session_id, &route);
+                let (text, guard, _) =
+                    shared_route_reply(ctx, route, args, &session_id, &reply_user_id, None).await;
+                (text, guard)
             };
             drop(typing_guard);
             send_reply_markdown(
@@ -2199,7 +2195,7 @@ async fn handle_command(
                 thread_id,
                 None,
                 Some(conversation_markup(
-                    &own_bot_session(&session_id, agent_name),
+                    &reply_session,
                     &reply,
                     crate::tts::TtsRouter::for_home(&ctx.home_dir).is_available(),
                 )),
@@ -2243,7 +2239,9 @@ async fn handle_command(
             } else {
                 format!("telegram:{chat_id}")
             };
-            let session_id = own_bot_session(&conversation, agent_name);
+            let sender = from_user_id.map(|id| id.to_string()).unwrap_or_default();
+            let session_id =
+                reset_target_session(ctx, &conversation, agent_name, chat_id, &sender).await;
             let msg = match ctx.session_manager.delete_session(&session_id).await {
                 Ok(()) => {
                     ctx.voice_failure_notices.lock().await.remove(&session_id);
@@ -2345,10 +2343,19 @@ async fn handle_command(
                     from_id_str.as_deref().unwrap_or(scope_id),
                 )
                 .with_event(event.as_deref());
+                // `/new` clears the session the sender's messages here are
+                // answered in (RM-172: their primary's bucket in a DM); every
+                // other command keys off the conversation as before.
+                let command_session = if matches!(parsed, crate::chat_commands::ChatCommand::New) {
+                    let sender = from_id_str.clone().unwrap_or_default();
+                    reset_target_session(ctx, &session_id, agent_name, chat_id, &sender).await
+                } else {
+                    own_bot_session(&session_id, agent_name)
+                };
                 let reply = crate::chat_commands::handle_command_with_caller(
                     &parsed,
                     ctx,
-                    &own_bot_session(&session_id, agent_name),
+                    &command_session,
                     &agent_id,
                     is_admin,
                     &caller,
@@ -2452,9 +2459,15 @@ async fn telegram_trigger_decision(
 }
 
 /// A tap on the shared bot's `@` list.
-async fn telegram_pick(ctx: &Arc<ReplyContext>, session_id: &str, presser: &str, agent: &str) -> String {
-    let bound = match resolve_shared_route(ctx, presser).await {
-        SharedRoute::Bound(b) => Some(b),
+async fn telegram_pick(
+    ctx: &Arc<ReplyContext>,
+    session_id: &str,
+    presser: &str,
+    agent: &str,
+    private_chat: bool,
+) -> String {
+    let bound = match resolve_shared_route(ctx, presser, private_chat).await {
+        SharedRoute::Bound(b) | SharedRoute::Primary(b) => Some(b),
         _ => None,
     };
     let reg = ctx.registry.read().await;
@@ -2485,8 +2498,19 @@ async fn telegram_pick(ctx: &Arc<ReplyContext>, session_id: &str, presser: &str,
 
 /// How the shared (global) Telegram bot should route one user's message.
 enum SharedRoute {
-    /// Route to a specific bound agent (user has scanned a bind link).
+    /// Route to the employee the user's bind link names, in the
+    /// conversation's own session; the conversation default for `@` routing.
     Bound(String),
+    /// (1:1 chats only, RM-172) the 主要 AI 員工 of the dashboard account the
+    /// user's Telegram identity is verified-bound to. The conversation
+    /// default for `@` routing like [`SharedRoute::Bound`], but answered in
+    /// that employee's own bucket of the chat
+    /// ([`crate::trigger_route::called_session`]), so a DM that already
+    /// holds the default employee's session (or an earlier primary's) never
+    /// trips the session-ownership check, and each employee keeps its own
+    /// history. The access gate, takeover/human handoff and `@` decisions
+    /// still run on the chat itself.
+    Primary(String),
     /// No binding — fall back to the existing default-agent reply path.
     Unbound,
     /// No binding and shared-bot mode is on — reply with bind-first guidance
@@ -2494,10 +2518,26 @@ enum SharedRoute {
     Guide(String),
 }
 
+/// A 1:1 chat between the bot and `user_id`: Telegram gives a private chat
+/// the id of the user on the other end, so a group (negative id) or another
+/// person's chat never matches.
+fn is_private_chat_with(chat_id: i64, user_id: &str) -> bool {
+    !user_id.is_empty() && chat_id.to_string() == user_id
+}
+
 /// Decide how the global bot routes a message from `user_id` (fail-closed —
 /// a message is only routed to a bound agent when a durable binding exists AND
 /// that agent is still present in the registry).
-async fn resolve_shared_route(ctx: &Arc<ReplyContext>, user_id: &str) -> SharedRoute {
+///
+/// Order: bind link → (1:1 chats only) the sender's dashboard primary
+/// employee → bind-first guidance when `shared_bot_binding` is on, else the
+/// channel default. An `@` call is decided by the caller before any of this
+/// takes effect (the result is only the conversation default it calls from).
+async fn resolve_shared_route(
+    ctx: &Arc<ReplyContext>,
+    user_id: &str,
+    private_chat: bool,
+) -> SharedRoute {
     if let Some(agent) = ctx
         .agent_binding
         .resolve_bound_agent("telegram", user_id)
@@ -2522,6 +2562,18 @@ async fn resolve_shared_route(ctx: &Arc<ReplyContext>, user_id: &str) -> SharedR
             user_id, "Telegram: bound agent no longer operational — falling back"
         );
     }
+    // RM-172: a staff member whose Telegram identity is verified-bound to their
+    // dashboard account reaches their 主要 AI 員工 in a 1:1 chat. Groups keep
+    // the channel default: the group's session is shared by every member, so
+    // per-sender personal employees would interleave in one history and a
+    // personal employee would answer in front of the whole group.
+    // Under `shared_bot_binding` such a user is identified, not "unbound", so
+    // they are routed instead of being told to find a bind link.
+    if private_chat {
+        if let Some(primary) = primary_agent_route(ctx, user_id).await {
+            return SharedRoute::Primary(primary);
+        }
+    }
     // Unbound: guide the user only when the operator has enabled shared-bot
     // binding for telegram; otherwise keep the legacy default-agent behavior.
     let shared_mode = ctx
@@ -2535,6 +2587,130 @@ async fn resolve_shared_route(ctx: &Arc<ReplyContext>, user_id: &str) -> SharedR
         )
     } else {
         SharedRoute::Unbound
+    }
+}
+
+/// RM-172: the dashboard 主要 AI 員工 (`users.primary_agent_id`) of the account
+/// `user_id` is bound to through a **verified** Telegram `channel_identities`
+/// row, when that employee may still answer this account. `None` (route as
+/// before) for an unverified or missing identity, an inactive account, no or a
+/// stale primary (no longer bound at Owner/Operator), an employee that is gone
+/// or not active (archived, deleted, paused), one WebChat would not give this
+/// account (a main-role or gateway-default employee for a non-admin), or any
+/// lookup failure — never a refusal.
+async fn primary_agent_route(ctx: &Arc<ReplyContext>, user_id: &str) -> Option<String> {
+    if user_id.is_empty() {
+        return None;
+    }
+    let home = ctx.home_dir.clone();
+    let sender_id = user_id.to_string();
+    let (sender, primary) = tokio::task::spawn_blocking(move || {
+        // Verified identity → active account, the same resolution `@` routing
+        // and the "who is asking" checks use; unverified rows stay unmapped.
+        let sender =
+            crate::trigger_route::access::for_channel_sender(&home, "telegram", &sender_id);
+        let account = match &sender.sender {
+            crate::trigger_route::Sender::Admin { user_id: Some(id) }
+            | crate::trigger_route::Sender::Account { user_id: id, .. } => id.clone(),
+            _ => return None,
+        };
+        let db = crate::decision_notify::open_user_db(&home).ok().flatten()?;
+        let primary = db.bound_primary_agent(&account).ok().flatten()?;
+        Some((sender, primary))
+    })
+    .await
+    .ok()
+    .flatten()?;
+    // Never the raw Telegram id in logs: a mapped sender is labelled by
+    // dashboard account (an unmapped one would be a per-home keyed digest).
+    let who = sender.audit_label(&ctx.home_dir, "telegram", user_id);
+    let sender =
+        sender.for_webchat(crate::webchat::access::gateway_default_id(&ctx.home_dir).await);
+    let usable = {
+        let reg = ctx.registry.read().await;
+        reg.get(&primary)
+            .is_some_and(|agent| crate::webchat::access::primary_candidate(&sender, agent))
+    };
+    if usable {
+        tracing::debug!(
+            agent = primary.as_str(),
+            sender = %who,
+            route = "primary_agent",
+            "Telegram: shared bot routed to the sender's primary employee"
+        );
+    }
+    usable.then_some(primary)
+}
+
+/// The session the shared bot's reply for `route` is stored under: the
+/// primary employee's own bucket of `conversation` for
+/// [`SharedRoute::Primary`], the conversation itself otherwise.
+fn shared_route_session(conversation: &str, route: &SharedRoute) -> String {
+    match route {
+        SharedRoute::Primary(agent) => crate::trigger_route::called_session(conversation, agent),
+        _ => conversation.to_string(),
+    }
+}
+
+/// The session `/reset`, `/new` and the 新對話 button clear for `sender` in
+/// `conversation`: the employee's own bucket on its own bot; on the shared
+/// bot, the primary employee's bucket when this sender's messages in this
+/// 1:1 chat route to their primary (RM-172), else the conversation itself.
+/// The default employee's history in the chat is left alone in the first case.
+async fn reset_target_session(
+    ctx: &Arc<ReplyContext>,
+    conversation: &str,
+    agent_name: Option<&str>,
+    chat_id: i64,
+    sender: &str,
+) -> String {
+    if agent_name.is_some() || !is_private_chat_with(chat_id, sender) {
+        return own_bot_session(conversation, agent_name);
+    }
+    let route = resolve_shared_route(ctx, sender, true).await;
+    shared_route_session(conversation, &route)
+}
+
+/// Build the shared (global) bot's reply for a message that no `@` call
+/// claimed, following `route`. Returns the reply text, its guard (`None` for
+/// bind-first guidance) and the employee that answered when the route named
+/// one. The access gate and takeover checks run on `session_id` (the chat
+/// itself) in every case; only a [`SharedRoute::Primary`] turn then answers
+/// in the primary's own bucket (`trigger_route::as_own_bot_turn`: same
+/// bucket rule as an employee's own bot, no `@` semantics, no name prefix).
+async fn shared_route_reply(
+    ctx: &ReplyContext,
+    route: SharedRoute,
+    text: &str,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<crate::channel_reply::ProgressCallback>,
+) -> (String, Option<crate::channel_reply::GuardedReply>, Option<String>) {
+    match route {
+        SharedRoute::Bound(agent) => {
+            let guard =
+                build_guarded_reply_for_agent(text, ctx, &agent, session_id, user_id, on_progress)
+                    .await;
+            (guard.text.clone(), Some(guard), Some(agent))
+        }
+        SharedRoute::Primary(agent) => {
+            let guard = crate::trigger_route::as_own_bot_turn(build_guarded_reply_for_agent(
+                text,
+                ctx,
+                &agent,
+                session_id,
+                user_id,
+                on_progress,
+            ))
+            .await;
+            (guard.text.clone(), Some(guard), Some(agent))
+        }
+        SharedRoute::Unbound => {
+            let guard =
+                build_guarded_reply_with_session(text, ctx, session_id, user_id, on_progress).await;
+            (guard.text.clone(), Some(guard), None)
+        }
+        SharedRoute::Guide(msg) => (msg, None, None),
     }
 }
 
@@ -4388,6 +4564,10 @@ mod transformed_decision_acl_tests {
 #[cfg(test)]
 #[path = "channel_decision_route/adapter_tests/telegram.rs"]
 mod f4_decision_route_tests;
+
+#[cfg(test)]
+#[path = "telegram_rm172_tests.rs"]
+mod rm172_primary_route_tests;
 
 #[cfg(test)]
 mod routing_text_tests {
