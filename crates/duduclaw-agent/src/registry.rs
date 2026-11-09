@@ -229,7 +229,16 @@ impl AgentRegistry {
                         if let Some(parent) = resolved_path.parent() {
                             let _ = fs::create_dir_all(parent).await;
                         }
-                        if let Err(e) = fs::write(&resolved_path, text).await {
+                        let changed = match fs::read_to_string(&resolved_path).await {
+                            Ok(previous) => previous != text,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                            Err(error) => return Err(DuDuClawError::Agent(format!("resolved policy unreadable: {error}"))),
+                        };
+                        if changed {
+                            duduclaw_core::isolation_policy::fence_change(&home)
+                                .map_err(|error| DuDuClawError::Agent(format!("policy revocation unavailable: {error}")))?;
+                        }
+                        if changed && let Err(e) = fs::write(&resolved_path, text).await {
                             warn!(
                                 path = %resolved_path.display(), error = %e,
                                 "failed to write agent.resolved.toml (shadow readers will \
@@ -245,7 +254,16 @@ impl AgentRegistry {
                 // from a PRIOR successful binding keep feeding shadow readers
                 // preset-tainted values (R1.5 — must not silently reuse the
                 // last good resolution).
-                let _ = fs::remove_file(&resolved_path).await;
+                match fs::symlink_metadata(&resolved_path).await {
+                    Ok(_) => {
+                        duduclaw_core::isolation_policy::fence_change(&home)
+                            .map_err(|error| DuDuClawError::Agent(format!("policy revocation unavailable: {error}")))?;
+                        fs::remove_file(&resolved_path).await.map_err(|error|
+                            DuDuClawError::Agent(format!("resolved policy removal failed: {error}")))?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(error) => return Err(DuDuClawError::Agent(format!("resolved policy unreadable: {error}"))),
+                }
             }
         }
 

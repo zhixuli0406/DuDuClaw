@@ -135,7 +135,10 @@ pub(super) async fn office_preview(state: &AppState, ctx: &UserContext, agent: O
         .arg("--convert-to").arg("pdf").arg("--outdir").arg(staging.path())
         .arg(staging.path().join(input_name))
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let result = tokio::time::timeout(std::time::Duration::from_secs(60), command.status()).await;
+    // The converter runs as a parse worker through the execution gate, so a
+    // protected install never spawns it directly from the gateway.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60),
+        duduclaw_core::execution_gate::status(&mut command, duduclaw_core::execution_gate::ExecutionClass::ParseWorker)).await;
     if !matches!(result, Ok(Ok(status)) if status.success()) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "預覽轉檔失敗，請下載檔案開啟");
     }

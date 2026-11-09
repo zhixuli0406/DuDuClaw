@@ -78,7 +78,7 @@ const KV_KEY_RE = /^[a-z0-9_]+$/;
  *  dedicated controls, are protected, or have no reader). */
 export const KV_REFUSED_SECTIONS: ReadonlySet<string> = new Set([
   'ptc', 'cultural_context', 'sticker', 'agent', 'capabilities', 'container', 'permissions', 'channels', 'odoo', 'mcp', 'runtime',
-  'prompt', 'os_watch', 'budget',
+  'prompt', 'os_watch', 'budget', 'isolation',
 ]);
 
 export type KvRowError = 'section' | 'key' | 'value';

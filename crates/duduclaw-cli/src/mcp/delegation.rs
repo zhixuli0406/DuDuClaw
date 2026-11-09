@@ -97,7 +97,7 @@ pub(crate) async fn send_to_agent_with_ctx(
         let prompt_cl = prompt.to_string();
         let origin_cl = origin.to_string();
         let ts_now = chrono::Utc::now().to_rfc3339();
-        let reply_channel = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL)
+        let reply_channel = crate::mcp_isolation_identity::var(duduclaw_core::ENV_REPLY_CHANNEL)
             .ok()
             .map(|s| duduclaw_core::session_conversation(&s).to_string())
             .filter(|s| !s.is_empty());
@@ -108,8 +108,8 @@ pub(crate) async fn send_to_agent_with_ctx(
         // receiving run's memory sources depend on it.
         let (trust_turn_id, trust_session_id, missing) =
             duduclaw_gateway::memory_provenance::complete_upstream_pair(
-                std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
-                std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok(),
+                crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
+                crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok(),
             );
         // Tell the receiver the upstream is unknown rather than absent.
         let upstream_dropped = missing.is_some();
@@ -124,7 +124,7 @@ pub(crate) async fn send_to_agent_with_ctx(
         }
         // A run in the explore lane hands read-only work on (`lane`); the
         // legacy-schema fallback below cannot carry it, so it is not used.
-        let lane = duduclaw_core::ProcessLane::current().delegation_stamp();
+        let lane = crate::mcp_isolation::process_lane().delegation_stamp();
         // The person this run works for, from the host env only. When there
         // is one it must reach the row: the legacy-schema fallback cannot
         // carry it, so it is not used (losing it would lose the person's
@@ -139,14 +139,31 @@ pub(crate) async fn send_to_agent_with_ctx(
             Ok(guard) => guard.map(std::sync::Arc::new),
             Err(reason) => return tool_error(&reason),
         };
+        if duduclaw_core::execution_gate::isolation_required() {
+            let Some(call) = crate::mcp_isolation::current() else {
+                return tool_error("無法確認這次委派的原始執行授權。");
+            };
+            let material = duduclaw_gateway::isolation_background::material::delegation(
+                caller, target, prompt, trust_turn_id.as_deref(), trust_session_id.as_deref(),
+                lane.as_deref(), outgoing_depth, Some(origin), reply_channel.as_deref(),
+                Some(caller), upstream_dropped, 0, false, on_behalf_of.as_deref());
+            if let Err(error) = duduclaw_gateway::isolation_background::record_delegation(home_dir, caller,
+                &call.context, target, &msg_id, &material).await {
+                // A Personal source waits for its owner's approval card (SR2).
+                return tool_error(error.user_message().unwrap_or("這次委派的授權已失效，請由原交辦人重新交辦。"));
+            }
+        }
         let writer_admission = admission.clone();
-        let queued = tokio::task::spawn_blocking(move || -> bool {
+        let authority = duduclaw_mcp_boundary::io_authority::capture();
+        let queued = tokio::task::spawn_blocking(move || authority.run(|| -> bool {
             // The blocking writer owns the lease even if the request is cancelled.
             let _admission = writer_admission;
-            let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+            if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return false; }
+            let Ok(mut conn) = rusqlite::Connection::open(&db_path) else {
                 return false;
             };
-            let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+            let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
+            with_live_delegation_write(&mut conn, |conn| {
             if lane.is_some() {
                 // Same column the gateway adds; ignore "duplicate column".
                 let _ = conn.execute("ALTER TABLE message_queue ADD COLUMN lane TEXT", []);
@@ -251,7 +268,8 @@ pub(crate) async fn send_to_agent_with_ctx(
             )
             .map(|rows| rows > 0)
             .unwrap_or(false)
-        })
+            })
+        }))
         .await
         .unwrap_or(false);
         (queued, admission)
@@ -260,22 +278,25 @@ pub(crate) async fn send_to_agent_with_ctx(
     // Register delegation callback if running inside a channel context.
     // The dispatcher will use this to forward the sub-agent's response
     // back to the originating channel (Telegram/LINE/Discord/etc.).
-    if let Ok(reply_channel) = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL) {
+    if let Ok(reply_channel) = crate::mcp_isolation_identity::var(duduclaw_core::ENV_REPLY_CHANNEL) {
         let db_path = home_dir.join("message_queue.db");
         let msg_id_cb = msg_id.clone();
         let caller_cb = caller.to_string();
         let channel_str = reply_channel;
         // B11: the employee whose own bot / app this conversation came in
         // through, so the forwarded answer goes out through the same one.
-        let sender_cb: Option<String> = std::env::var(duduclaw_core::ENV_REPLY_SENDER)
+        let sender_cb: Option<String> = crate::mcp_isolation_identity::var(duduclaw_core::ENV_REPLY_SENDER)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| duduclaw_core::is_valid_agent_id(s));
         let writer_admission = admission.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let authority = duduclaw_mcp_boundary::io_authority::capture();
+        let _ = tokio::task::spawn_blocking(move || authority.run(|| {
             let _admission = writer_admission;
-            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+            if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
+            if let Ok(mut conn) = rusqlite::Connection::open(&db_path) {
+                let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
+                with_live_delegation_write(&mut conn, |conn| {
                 // Ensure table exists (MCP process may open DB before gateway).
                 // Schema must match message_queue.rs init_schema — keep in sync.
                 let _ = conn.execute_batch(
@@ -340,8 +361,10 @@ pub(crate) async fn send_to_agent_with_ctx(
                     );
                     }
                 }
+                true
+                });
             }
-        }).await;
+        })).await;
     }
 
     drop(admission);
@@ -378,7 +401,7 @@ pub(crate) async fn send_to_agent_with_ctx(
 /// re-spawn boundary so a re-generating feedback loop inherits (never resets)
 /// its depth.
 pub(crate) fn incoming_hop_depth() -> u8 {
-    std::env::var(duduclaw_core::ENV_HOP_DEPTH)
+    crate::mcp_isolation_identity::var(duduclaw_core::ENV_HOP_DEPTH)
         .ok()
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(0)
@@ -821,4 +844,16 @@ mod autonomy_commit_tests {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM message_queue", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
     }
+}
+
+
+fn with_live_delegation_write(
+    conn: &mut rusqlite::Connection,
+    write: impl FnOnce(&rusqlite::Connection) -> bool,
+) -> bool {
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return false; }
+    let Ok(tx) = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) else { return false; };
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() || !write(&tx) { return false; }
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return false; }
+    tx.commit().is_ok()
 }

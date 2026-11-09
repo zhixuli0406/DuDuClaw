@@ -201,6 +201,13 @@ mod imp {
             std::fs::File::from(self.fd.try_clone()?).metadata()
         }
 
+        /// A duplicate of the pinned descriptor (same open directory), for a
+        /// descriptor-relative walk that must not reopen anything by path
+        /// (F6 quarantine seal).
+        pub(crate) fn duplicate_fd(&self) -> io::Result<OwnedFd> {
+            self.fd.try_clone()
+        }
+
         fn stat(&self, name: &str) -> io::Result<Option<FileStat>> {
             match fstatat(
                 Some(self.fd.as_raw_fd()),
@@ -461,6 +468,49 @@ mod imp {
         pub(crate) fn remove_file(&self, name: &str) -> io::Result<()> {
             check_name(name)?;
             unlinkat(Some(self.fd.as_raw_fd()), name, UnlinkatFlags::NoRemoveDir).map_err(to_io)
+        }
+
+        /// Move entry `name` of this directory (whatever it is; a symlink is
+        /// moved, never followed) to `target_name` in `target`, both relative
+        /// to the pinned descriptors, and never replace an existing entry:
+        /// Linux `renameat2(RENAME_NOREPLACE)`, macOS
+        /// `renameatx_np(RENAME_EXCL)`. An existing target (even an empty
+        /// directory, which plain `rename(2)` would replace) is `AlreadyExists`;
+        /// a cross-filesystem move is `EXDEV`. Other Unix platforms refuse
+        /// (fail closed). Both directories are synced after the move.
+        pub(crate) fn rename_noreplace(&self, name: &str, target: &SafeDir, target_name: &str) -> io::Result<()> {
+            check_name(name)?;
+            check_name(target_name)?;
+            let from = std::ffi::CString::new(name).map_err(|_| refused("invalid path component"))?;
+            let to = std::ffi::CString::new(target_name).map_err(|_| refused("invalid path component"))?;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            // SAFETY: both descriptors are open for the lifetime of `self` /
+            // `target`; both names are NUL-terminated and outlive the call.
+            // RENAME_NOREPLACE == 1 (linux/fs.h).
+            let status = unsafe {
+                libc::syscall(libc::SYS_renameat2, self.fd.as_raw_fd(), from.as_ptr(),
+                    target.fd.as_raw_fd(), to.as_ptr(), 1 as libc::c_uint)
+            } as i64;
+            #[cfg(target_os = "macos")]
+            // SAFETY: as above. RENAME_EXCL == 0x4 (sys/stdio.h).
+            let status = i64::from(unsafe {
+                libc::renameatx_np(self.fd.as_raw_fd(), from.as_ptr(), target.fd.as_raw_fd(), to.as_ptr(), 0x4)
+            });
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+            let status: i64 = {
+                let _ = (&from, &to, target);
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "no-replace rename unavailable"));
+            };
+            if status != 0 { return Err(io::Error::last_os_error()); }
+            target.sync_dir();
+            self.sync_dir();
+            Ok(())
+        }
+
+        /// `fchmod` this directory through its descriptor (never by name).
+        pub(crate) fn set_mode(&self, mode: u32) -> io::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::File::from(self.fd.try_clone()?).set_permissions(std::fs::Permissions::from_mode(mode))
         }
 
         /// Every entry of this directory except `.` and `..`, never followed.

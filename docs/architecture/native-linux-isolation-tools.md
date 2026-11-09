@@ -1,0 +1,504 @@
+# Native Linux MCP resource routes (security revision, 2026-11-05)
+# Native Linux tool dispositions — I1b round 6 (v1.80.0)
+
+**Status 2026-11-09 (v1.81 integration branch): every tool in this inventory is routed, refused with a stated reason, or gated off by default.** Employee permissions remain the product contract; missing adapters are startup failures, not newly acceptable product restrictions. The endpoint invokes `require_complete_services()` before admitting MCP traffic, and production boot now installs the connector stack (F1), the work broker and spawnd feature source (W1) and the recording job store (SFR). What is still open is acceptance on a real Linux host (Ubuntu 22.04/24.04, Debian 12 as root) and with real provider accounts; the inventory tests use discovery doubles and do not prove provider execution.
+
+Disposition summary:
+
+- **Routed**: every row below without a `Refused:` prefix. This covers the 66 connector tools, the own-skill tools, spawn tools, `create_task`, the in-run helpers, the file tools, discovery job tools and fork reads, and every employee-handler tool.
+- **Refused with a reason**: `HostAuthority` (host desktop, devices, power, network, local model services), `ProposalRequired` (`create_agent`) and `ForkNextRelease` (`fork_run`, `merge_or_select`, `terminate_branch`). These three categories are the complete exception set.
+- **Gated off by default**: `browser_record_start`, `browser_record_stop` and `skill_from_recording` stay hidden until the host's recording probe passes (`RECORDING_BUILD_ENABLED`, spawnd `helper_recording`; readiness names `helper_recording_unsupported`) and the employee's admin-only `[isolation] public_web` is on. `web_fetch_cached`, `web_extract` and `skill_hub_install` also need `public_web = true` (default `false`). The file tools and in-run helpers stay hidden while spawnd's readiness report lacks `work_broker` (helpers: also `helper_calls`).
+
+**CONTRACT CHANGE: capability canonical encoding v2.** `EmployeeScope { id }` is an explicit MAC-covered resource variant (tag 9), bound to the verified employee. Service/Connector calls use either exact resource grants or current live employee authority. A scope cannot be combined with task/table/wiki/mailbox/recipient/connector grants or a task-limited run. Workspace and URL-origin entries may accompany scope as explicit File/A/E inputs. Tag 10, `Confined { resource }`, carries other exact File/A/E input/output grants (for example a wiki namespace or a worker connector account); it requires EmployeeScope and forbids nesting. Neither form narrows or expands employee-scope Service/Connector authority. Older capability MACs are not reused.
+
+The production human/background issuer now emits canonical EmployeeScope and
+Confined mailbox/table/wiki grants from its own host roots. Task-limited
+background work removes EmployeeScope (and any PublicOrigins or NewTask grant)
+and unwraps those exact grants. Inventory tests consume this issuer output.
+
+v1.81 Package H (H9 selectors in `isolation_mcp/selectors.rs`, H10 issuer hook in
+`isolation_mcp/boot.rs`) adds four issuer-selected, MAC-covered grants, each read
+at issuance from its authoritative store and fail-closed when that store is
+unsafe or unreadable, then re-read after the issuer's lifecycle/users.db
+rechecks (a change refuses the run):
+
+- `Workspace { employee-work }` with the brokered root (H6) for `file_read`,
+  `csv_read` and `xlsx_read`: only when boot installed a root work broker, the
+  run's tool snapshot lists a file tool and the employee's current `agent.toml`
+  allowed/denied tools still allow it. W1: production boot installs run-bound
+  brokers (`isolation_mcp/run_broker.rs`) over the protected backend, which has
+  spawnd's checked readiness report as its feature source; "installed" then
+  also requires that report to advertise `work_broker` at issuance. Each
+  capability gets its own broker (H5 `SpawndWorkspaceBridge` underneath), bound
+  to the employee id and incarnation the issuer pinned and, at its first open,
+  to that run and its control connection; every open needs exact equality of
+  all of them plus the `work_broker` bit in that run's own `Reserved.features`.
+  `BootSources.work_broker` remains an optional host override.
+  HX5: the same grant is also selected for the in-run helper tools
+  `execute_program`, `code_map` and `office_script` (an employee without file
+  tools still sees and can call them): only when a root work broker is
+  installed, spawnd's readiness view advertises `helper_calls` at issuance
+  (`SpawndBackend::features`), the snapshot lists a helper tool and the profile
+  still allows it. No broker, no `helper_calls` bit or an unreadable view
+  withholds it (fail closed); losing the bit during issuance refuses the run.
+  Each call still requires the run's own `Reserved.features` bit.
+- `PublicOrigins { * }` (H7) for `web_fetch_cached` and `web_extract`: only for
+  an employee-scope run and only when the admin set `agent.toml [isolation]
+  public_web = true` for that employee (owner decision 2026-11-08: its own
+  admin-only switch, default `false` = no web authority; `[container]
+  network_access` keeps controlling only the task sandbox). `[isolation]` is
+  frozen against the employee's own writes and refused by the dashboard
+  key/value editor; it is changed in the configuration file (or the admin raw
+  configuration editor). Never derived from tool arguments.
+- `NewTask { requester }` (CONTRACT CHANGE, capability tag 12, H9 owner
+  decision 3) for `create_task` in an interactive (chat) run: only when the run
+  is not record-backed, lists `create_task` and the profile still allows it.
+  `requester` is the run's authenticated human; the capability decoder and
+  signer refuse the grant unless the record principal is `Human` with that
+  user id, the record has its own EmployeeScope and no task, and it is a plain
+  (not Confined) single grant, so a Background principal never holds it. A
+  Personal employee's requester is its owner (B1 at issuance; the resolver
+  rechecks it). At call time the boundary accepts only `goal` and `steps`
+  (every step with the existing step keys), so no parent task, goal,
+  dependency, assignee or creator can be selected; the gateway resolver
+  requires every step to target this employee (or none) and returns exactly
+  the own Employee grant plus the signed NewTask grant; the handler files the
+  TaskSpec as this employee on behalf of that requester.
+- the record `Task` grant (H8) for `create_task`: only for a task/schedule run
+  whose record task is assigned to the employee in `tasks.db` at issuance.
+  Owner decision 2026-11-08: a run whose task was reassigned or deleted is
+  refused outright, both before any approval card (`isolation_background`
+  `scope_record`, reason shown to the scheduler) and in the issuer (`Revoked`);
+  each refusal writes an `isolation_task_run_refused` security-audit row
+  (`reason: task_not_owned`, `stage: schedule` or `issuance`).
+
+HX6: browser recording (`browser_record_start` / `browser_record_stop`) is an
+in-run helper in the caller's recording slot. The issuer selects
+`Workspace{employee-work}` for it only when spawnd advertises `helper_calls`
+and `helper_recording` (Chromium proven to start under the helper sandbox on
+this host; until then readiness names `helper_recording_unsupported`), the
+employee's admin-only `[isolation] public_web` switch is on (enabling recording
+grants that employee's runtime public-web egress, owner decision Q3) and the run
+is interactive (`workspace_selection::drops_from_signed_with`). With the same
+conditions it signs the D-H2 `PublicOrigins { * }` grant, the authority for
+`browser_record_start`'s navigation URL (the URL is unknown at issuance, so no
+`UrlOrigin` can be signed); a grant signed only for the recording never makes
+`web_fetch_cached`/`web_extract` eligible (`Selection::signed_tools` drops them
+unless their own `public_web` selection holds). The same applies to the grant
+signed for `skill_hub_install` alone (owner decision 2026-11-09); recording,
+hub install and the web tools share at most one `PublicOrigins { * }` grant.
+An offline parent
+answers `helper_parent_offline`. Results are stored per `(run, call)` with each
+artifact's sha256 (`recording_jobs`); a later read must match them
+(`artifact_modified`).
+
+Every File/A/E tool now has its own issuer selector. `employee-work` is also the
+A execution workspace handle, so when the issuer selects it (for the file tools
+or the HX5 helpers) it leaves every other listed tool whose eligibility would
+rest on that grant out of the signed tool snapshot (`Selection::signed_tools`,
+`mcp-boundary` `workspace_selection::drops_from_signed`). The in-run helpers
+are signed only when the grant was selected for them. The parity test checks
+`workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS`, which is empty; no
+tool may be added back. Since W1 production boot installs the work broker and the
+spawnd feature source, so the file tools and the HX5 in-run helpers can be
+listed in production; they stay hidden (fail closed) while spawnd's readiness
+report lacks `work_broker` (helpers: also `helper_calls`) or the backend has no
+feature source, and the readiness report then names
+`workspace_broker_unavailable`, `helper_launcher_unavailable{reason}` and
+`helper_runtime_missing{runtime}`. The own-skill tools below (H12a) never receive a Workspace (or
+Recipient) grant from these selectors; of the H12b/c/d job tools only
+`skill_from_recording` uses the brokered Workspace (its artifacts live there).
+SFR: it left `PENDING_WORKSPACE_SELECTOR_TOOLS`; the issuer signs it with its
+own selector (`workspace_selection::RECORDING_DISTILL_TOOLS`) under exactly the
+recording gate's conditions, without PublicOrigins. `skill_hub_install`,
+`skill_synthesis_run` (H12b/c), `spawn_agent`/`spawn_ephemeral` (H13),
+`browser_record_start`/`stop` (HX6), `skill_from_recording` (SFR) and the
+FD-SEL discovery job tools and fork reads are no longer on that list; the list
+is now empty (no pending selector gap is left, and none may be added back).
+
+FD-SEL (v1.81, Package H tools 22–29): the discovery job tools
+(`discovery_catalog`, `discovery_list`, `discovery_tree`, `discovery_artifact`,
+`discovery_cancel`) and the fork reads (`inspect_branches`, `diff_branches`,
+`fork_cost`) need only the record's own `Employee` grant
+(`tool_policy::own_reads`; no Workspace, Task or resolver output) and accept an
+exact protected schema. Discovery is not refused: running discovery stays
+operator-only (disposable containers, dedicated account pool, a manager decision
+receipt before any run), but a protected employee already files requests through
+`tasks_create` (kind `discovery`), and these tools only let it see, download the
+published checkpoint of, or withdraw a request it filed itself. Each protected
+request stores its creator's exact employee id and incarnation
+(`discovery_isolated_creators` in `discovery.db`, written before the task row);
+a protected caller is the capability's employee id at the label's live confirmed
+incarnation and sees only requests bound to exactly that. Foreign, unknown,
+another incarnation's, a recreated label's, an ordinary caller's and pre-FD-SEL
+requests all answer `discovery not found`. Fork reads are views of the caller's
+own protected forks (exact actor: employee id, principal and binding) without a
+workspace grant; a foreign and an unknown fork both answer `fork_not_found`. The
+fork mutations stay `ForkNextRelease`. Unprotected installations are unchanged.
+
+H12a (v1.81): the own-skill tools `skill_extract`, `shared_skill_adopt`,
+`skill_security_scan`, `skill_graduate` and `skill_curator_status` no longer
+require a workspace grant. They are eligible only under EmployeeScope with the
+record's own `Employee` grant (plus exactly one own `agent:` Confined wiki for
+`skill_extract`), take no subject selector (a legacy `agent_id` must equal the
+bound employee; `target_agent` refuses), parse skill bytes only in the E worker,
+and publish only into the caller's own wiki or own `SKILLS/`. Global graduation
+needs the dashboard admin card; the curator (D-H4) reports and runs only over the
+caller's own skills.
+
+H13 (v1.81): `spawn_agent` and `spawn_ephemeral` require no workspace grant and no
+new capability grant. They are eligible with the record's own `Employee` grant
+(a task/schedule run also needs the signed `Task` grant of its record task) and
+accept only their exact schemas (`agent_id`/`task`/`session_key`;
+`instruction`/`context`/`tools`/`tier`); delegation metadata and identity keys
+refuse. Every call re-reads the record task's live ownership (a reassigned or
+deleted task refuses and writes `isolation_task_run_refused`). `spawn_agent`:
+the target must pass the live delegation policy and be a confirmed, enabled
+protected employee: a Shared target in the source's tenant, or (H13b, owner
+decision 2026-11-09) a Personal target whose lifecycle owner is exactly the
+owner of a Personal source whose run that owner started — it then runs as the
+target's background work without a card. Another owner's Personal employee,
+and any Personal target of a Shared source, is refused; a Personal source's
+delegation to a Shared target still waits for its owner's approval card
+(`isolation_personal_delegation`).
+`spawn_ephemeral` (D-H3): never scaffolds a new agent in protected mode; the
+child is a pending job (`isolation-ephemeral-jobs.db`) under the parent run's
+own employee id, incarnation and binding, with the requested tools intersected
+with the parent run's signed tool snapshot; a Personal parent spawns only when
+its lifecycle owner personally started the parent run (fresh lifecycle and
+users.db read when the child's receipt is captured). D8: the job is never
+awaited. H13b: the dispatcher tick releases it once the parent run's
+capability was revoked in this gateway epoch and no other run of the employee
+holds one (an unknown run waits and expires after 24 hours) and the employee is
+still the same id and incarnation, then starts it as a self-delegation of the
+parent employee (the dispatcher's only self-delegation exception); the child
+holds only the job's tools, uses the parent's model routing (`tier` is
+recorded only) and cannot spawn another child.
+
+H12b/H12c/H12d (v1.81): the own-skill job tools take the exact protected schema
+(`tool_policy::check_own_skill_job_arguments`; no `scope`, `owner`, `target_agent`,
+path or identity key) and publish only into the caller's own `agents/<label>/SKILLS`.
+`skill_hub_install` needs the record's own `Employee` and its signed `PublicOrigins`
+grant; the archive URL is host-selected (`clawhub` only today), re-checked against
+the grant, fetched through the protected public path (DNS pin, public addresses,
+no redirects, 5 MiB) and expanded only in the E worker (traversal, absolute,
+symlink/special entries, case collisions, ratio > 100 and size refuse); the host
+re-checks the worker manifest, takes the single `SKILL.md`, E scans it before the
+existing install approval and again under the install locks. `skill_synthesis_run`
+needs only the own `Employee`: the existing provider plumbing runs under the
+employee's own utility runtime, budget and autonomy gates, only its own events are
+scored, E prepares and scans the model output, and the skill lands in its own
+SKILLS (no global bank, no Workspace grant). `skill_from_recording` needs the own
+`Employee`, the plain brokered `Workspace{employee-work}` and an installed recording
+job store. SFR: gateway boot installs HX6's `SqliteRecordingJobs` as that store
+(`isolation_skill_jobs::install_recording_source`); a call reads only the caller's
+own finished recording (owner read by employee, principal incl. generation and
+binding; the exact `(run, call)` id; `complete`; the helper's strict result). The
+artifacts are read through root's broker at the helper's layout
+(`recordings/<id>/{trace.zip,actions.json,network.json}`, shared
+`duduclaw_isolation::recording_layout`) and come back only as `VerifiedArtifact`s
+(`recording_jobs::verify_artifact`; a rewrite refuses with `artifact_modified`).
+A matching digest does not make them trusted: the distill step takes only a
+`VerifiedRecording` and hands the framed artifacts to E, which checks the trace
+archive (entry count, sizes, ratio, no traversal/absolute/symlink/special or
+duplicate entries) and reduces, redacts and fences every page-derived string. The
+skill is E-scanned and published no-clobber into the caller's own SKILLS (no
+draft/approval card, as H12c). It is signed only behind the HX6 recording gate, so
+while recording is gated off (`RECORDING_BUILD_ENABLED`, per-host probe) it stays
+hidden in production.
+
+Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host handler is selected by `boundary_route` (including the Linux bundled model catalog). Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
+
+A/Execution requires a backend that explicitly supports retained workspace authority. `SpawndBackend::with_workspace_bridge` installs the trusted root-receipt hookup and verifies the held directory, exact reservation/runtime/workspace/cwd and live authority. Production boot installs the receipt producer through the run-bound work brokers (W1); a backend without it still refuses workspace plans. Worker/file plans retain authorized tokens through queued work and checked transport. These are implementation readiness requirements, not Linux acceptance.
+
+Calls routed to a connector require an installed per-tool live selection policy, active catalog account, binding verification and bound executor. Executor source coverage is 66/66: native Google/Notion/GitHub (30), Odoo (20, including RM-120 `odoo_create` / `odoo_write`), DB (4), channels (8), models (2), computer login (1), search (1). The typed boot registry requires complete selection/execution support before dispatcher construction, and production boot installs it (F1, per-employee registry in the CLI). Google uses its sealed gateway owner for personal/home OAuth and consent/refresh with the authenticated requester (E1, E3); domain-wide delegation and service-account tenant sources are served as SharedTenant sources under the D-5 rule (E4). Credentials are not copied into the run. Source coverage and fixture tests do not establish provider parity: that needs real provider test accounts on a Linux host. See the [round 3 report](native-linux-isolation-security-fixes-2026-11-05.md).
+
+RM-103 S3 holds in protected mode: Codex, Grok and registered generic CLIs check `CapabilitiesConfig::native_tool_constraints` before the isolated route (`runtime::protected_coarse_native_gate`, repeated in `isolation_mcp::runtime::execute_native` / `execute_registered_cli` before the one-shot authority is consumed). The isolated native profile is root-derived and has no per-run read-only mode, so a native shell **or** write constraint (including the fail-closed config of a malformed `[capabilities]`) refuses the spawn. Protected Claude runs with `--tools ""` (no native tools).
+
+Existing scope, allowed/denied tools, permissions, approvals, record/audience, egress and input guards remain in force. Service I/O after-await checks are tracked in the security-fix report, not here. The typed handler carries authority through awaits; core TaskStore mutations recheck after locks and before writes/commits. Child tasks need explicit scope propagation. The entry check and revocation watch alone do not close that review item. The complete status and verification boundaries are in [the security-fix report](native-linux-isolation-security-fixes-2026-11-05.md).
+
+| Refusal category | Reason |
+| --- | --- |
+| Existing Admin/operator gate | The original employee policy decides access. |
+| HostAuthority | A run cannot control or observe the host desktop, devices, power, network configuration or local model services. |
+| Missing adapter | Boot fails; this is unfinished parity, not an intentional tool restriction. |
+| ProposalRequired | v1.81 protected mode: `create_agent` is refused; a protected employee exists only through an approved Employee proposal and its root allocation. |
+| ForkNextRelease | v1.80.0 protected TEAM only: `fork_run`, `merge_or_select`, `terminate_branch` are deferred until fresh child capability/account/budget authority and immutable result apply are complete. Non-protected installations retain their existing behavior. |
+
+`Refused: HostAuthority`, `Refused: ProposalRequired` and `Refused: ForkNextRelease` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
+
+A readiness excludes exactly the three deferred mutations and requires all five signed helper/control producers plus the three host fork readers. An absent or changed signed helper publication still blocks readiness. This does not enable the other composite components, claim native/provider acceptance, or remove any of the original 22 A tools from the inventory.
+
+Operator/user messages follow `[general] default_language`:
+
+- zh-TW: 受保護模式下的分支試算將於下一版開放。
+- en: Branch trials in protected mode will be available in the next release.
+- ja: 保護モードでの分岐試行は次のバージョンで利用可能になります。
+
+The matrix is checked for unique tool names, complete policy inventory, and exact refusal categories by `python3 scripts/ci/check_isolation_tool_matrix.py`.
+
+| Tool | Disposition |
+| --- | --- |
+| `google_status` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gmail_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gmail_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gmail_create_draft` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `google_chat_spaces` | Resource → Native account-bound executor (mailbox grant, admin Chat opt-in, Direct OAuth only); installed at production boot (F1); real provider acceptance needs a Linux host |
+| `google_chat_messages` | Resource → Native account-bound executor (mailbox grant, admin Chat opt-in, Direct OAuth only); installed at production boot (F1); real provider acceptance needs a Linux host |
+| `calendar_list_events` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `calendar_create_event` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `sheets_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `sheets_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `forms_get` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `forms_list_responses` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gtasks_lists` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gtasks_list` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gtasks_create` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gtasks_complete` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `drive_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `drive_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `docs_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `docs_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `slides_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `os_notify` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_watch_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_open` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_frontmost` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_spotlight_search` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_calendar_today` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_device_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_system_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_check_update` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_backup_list` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_network_info` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_wifi_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_wifi_scan` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_wifi_connect` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_apply_update` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_boot_assessment` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_update_rollback` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_backup_create` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_power` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_factory_reset` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_doctor_repair` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_display_get` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_display_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_audio_get` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `os_audio_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `create_agent` | Refused: ProposalRequired — protected employees are created only through an approved Employee proposal. |
+| `list_agents` | Resource → AuthorizedToolCall → original live employee handler |
+| `create_task` | Host authenticated target queue admission; fresh target run authority required; each call is authorized against the capability before the TaskSpec is written; a task/schedule run plans under its record Task grant (H8 selector, issued only while the employee owns the task, otherwise the run is refused); an interactive run uses the NewTask grant (tag 12) for new top-level plans only, assigned to the calling employee and filed for the signed human requester |
+| `check_responses` | Resource → AuthorizedToolCall → original live employee handler |
+| `task_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `agent_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `spawn_agent` | Host authenticated target queue admission; fresh target run authority required; H13: each call is authorized against the own Employee grant (and the live record task) before any queue write; the target must pass the live delegation policy and be a confirmed Shared employee of the same tenant, or (H13b) a Personal employee of the same owner as a Personal source started by that owner (other owners' Personal targets refused); a Personal source waits for its owner's delegation card for a Shared target |
+| `spawn_ephemeral` | Host pending job under the parent run's own employee id, incarnation and binding (D-H3), never a new scaffold; tools = requested ∩ parent run snapshot; Personal parent only when its owner started the run; refused for a foreign record task; released only after the parent run exits (D8), then started by the dispatcher as a self-delegation of the same employee id + incarnation with only the job's tools (H13b) |
+| `agent_update` | Resource → AuthorizedToolCall → original live employee handler |
+| `agent_remove` | Resource → AuthorizedToolCall → original live employee handler |
+| `agent_update_soul` | Resource → AuthorizedToolCall → original live employee handler |
+| `odoo_connect` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_status` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_crm_leads` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_crm_create_lead` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_crm_update_stage` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_sale_orders` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_sale_create_quotation` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_sale_confirm` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_inventory_products` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_inventory_check` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_invoice_list` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_payment_status` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_execute` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_report` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_partner_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_create` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; installed at production boot (F1) |
+| `odoo_write` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; installed at production boot (F1) |
+| `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee + exactly one own Wiki output grant (Confined Wiki), rechecked at publication; own SKILLS bytes parsed by E as data; publishes only into the caller's own wiki, body pages read back before the completion marker (H12a) |
+| `execute_program` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` (H9 selects it for the helpers, no file tool needed) and spawnd `helper_calls`; signed only when that selection ran |
+| `office_script` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` (H9 selects it for the helpers, no file tool needed) and spawnd `helper_calls`; signed only when that selection ran |
+| `skill_bank_feedback` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_screenshot` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_click` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_type` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_login` | Resource → selected exact credential metadata/label → original computer session/origin/threat gates |
+| `computer_key` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_scroll` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_session_start` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_navigate` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_session_stop` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_workspace_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_workspace_read` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_workspace_write` | Resource → AuthorizedToolCall → original live employee handler |
+| `session_restore_context` | Resource → AuthorizedToolCall → original live employee handler |
+| `fork_run` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `inspect_branches` | Host fork store; own forks only (FD-SEL: own Employee grant, exact actor = employee id/principal/binding, no workspace grant); foreign and unknown forks both `fork_not_found`; no legacy-row import. |
+| `diff_branches` | Host recorded-manifest comparison of two branches of an own fork (FD-SEL: own Employee grant, exact actor); foreign and unknown both `fork_not_found`; not live or immutable byte verification. |
+| `merge_or_select` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `terminate_branch` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `fork_cost` | Host owner-checked query of an own fork (FD-SEL: own Employee grant, exact actor; foreign and unknown both `fork_not_found`); measurement_status=unavailable and null spend until measured usage is implemented; never fabricated zero. |
+| `credential_declare` | Resource → AuthorizedToolCall → original live employee handler |
+| `discovery_catalog` | Host discovery catalog handler; FD-SEL: own Employee grant, exact protected schema; original employee and delegation gates; no job data |
+| `discovery_list` | Host discovery list handler; FD-SEL: only requests this employee filed as its exact employee id + incarnation |
+| `discovery_tree` | Host discovery tree handler; FD-SEL: own bound requests only; foreign and unknown runs both `discovery not found` |
+| `discovery_artifact` | Host bounded discovery artifact handler on Linux; checked recorded-artifact access; FD-SEL: own bound requests only; foreign and unknown runs both `discovery not found` |
+| `discovery_cancel` | Host discovery job control; FD-SEL: withdraws/cancels only own bound requests; foreign and unknown runs both `discovery not found` |
+| `tasks_list` | Resource → finite SQL adapter for explicit grants; original live handler for EmployeeScope |
+| `tasks_create` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_update` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_claim` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_renew` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_complete` | Resource → AuthorizedToolCall → original live employee handler |
+| `responsibility_get` | Resource → EmployeeScope original handler / finite owner + responsibility IDs |
+| `responsibility_followup` | Resource → AuthorizedToolCall → original live employee handler |
+| `responsibility_ask` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_block` | Resource → AuthorizedToolCall → original live employee handler |
+| `capability_request` | Resource → AuthorizedToolCall → original live employee handler |
+| `goals_create` | Resource → AuthorizedToolCall → original live employee handler |
+| `goals_list` | Resource → EmployeeScope original handler / finite signed task IDs + employee SQL |
+| `plan_get` | Resource → AuthorizedToolCall → original live employee handler |
+| `plan_update_step` | Resource → AuthorizedToolCall → original live employee handler |
+| `activity_post` | Resource → AuthorizedToolCall → original live employee handler |
+| `activity_list` | Resource → finite SQL adapter for explicit grants; original live handler for EmployeeScope |
+| `autopilot_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `shared_skill_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `shared_skill_share` | Resource → AuthorizedToolCall → original live employee handler |
+| `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; shared skill scanned and prepared by E as data; scanned body copied only into the caller's own SKILLS (no clobber, read back); no target argument (H12a) |
+| `plan_start` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_improve` | Resource → AuthorizedToolCall → original live employee handler |
+| `browser_record_start` | HX6 `Route::InRunHelper`, recording slot of the caller's own run (`ExecutionToolBridge::execute_recording`, `prepare_in_run` → `AuthorizedHelperPlan::recording`, spawnd `HelperCall{slot: recording}`); returns `{status: recording, id}` (spawnd call id); gateway collector stores the decoded result + artifact sha256 per `(run, call)` (`recording_jobs`); flushed at run end (`ended_by: run_end`), hard kill ⇒ `uncertain/run_killed`; offline parent ⇒ `helper_parent_offline`; needs `Workspace{employee-work}`, spawnd `helper_calls` + `helper_recording` and `[isolation] public_web`; the navigation `url` is authorized by the record's signed EmployeeScope + `PublicOrigins` grant (D-H2, tag 11; signed with the recording selection), never a per-URL `UrlOrigin` (`tool_policy::RECORDING_URL_TOOLS`): it must pass `resources::permitted_public_origin` (https, default port, no userinfo, public DNS name, no IP literal or private name; http refused), no grant ⇒ refused, and egress stays public-address-only through the run's forwarder. Gated off by default: hidden until the host's recording probe passes (`helper_recording_unsupported` until then) |
+| `browser_record_stop` | HX6 `Route::InRunHelper`: same run ⇒ `HelperStop` for that `(run, call)` and the stored result (the old `:180` refusal inverted, never `parse_handle`); later run or terminal row ⇒ stored result, no helper interaction; revocation ⇒ `HelperStop`, `ended_by: revoked`; same selector as `browser_record_start`; names no URL, so needs no `PublicOrigins`/`UrlOrigin`; gated off by default with `browser_record_start` |
+| `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `skill_from_recording` | Resource → protected host orchestration (`mcp_skill_jobs::handle_protected`); checked E parser required; EmployeeScope + own Employee + brokered Workspace{employee-work}, signed only behind the HX6 recording gate (spawnd `helper_calls` + `helper_recording`, `[isolation] public_web`, interactive run, profile allows; no PublicOrigins), so hidden while recording is gated off; only the caller's own finished recording from HX6's job store (installed at boot as H12d's `RecordingJobs` seam: owner read by employee + principal + binding, exact `(run, call)` id, `complete`, strict helper result); every artifact read through root's broker at the shared `recording_layout` and returned only as a `VerifiedArtifact` (`recording_jobs::verify_artifact`, else `artifact_modified`); artifacts stay untrusted and are parsed only by E (`RecordingArtifacts`: framed bundle, trace archive entry/size/ratio caps, no traversal or symlink entries); E scan before a no-clobber publication into the caller's own `agents/<label>/SKILLS` |
+| `memory_search` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_store` | Resource → AuthorizedToolCall → original live employee handler |
+| `working_state_set` | Resource → AuthorizedToolCall → original live employee handler |
+| `working_state_clear` | Resource → AuthorizedToolCall → original live employee handler |
+| `working_state_handoff` | Resource → AuthorizedToolCall → original live employee handler |
+| `working_state_get` | Resource → AuthorizedToolCall → original live employee handler |
+| `team_handoff` | Resource → AuthorizedToolCall → original live employee handler |
+| `belief_submit` | Resource → AuthorizedToolCall → original live employee handler |
+| `belief_settle` | Resource → AuthorizedToolCall → original live employee handler |
+| `belief_stats` | Resource → AuthorizedToolCall → original live employee handler |
+| `mail_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `mail_read` | Resource → AuthorizedToolCall → original live employee handler |
+| `mail_send` | Resource → AuthorizedToolCall → original live employee handler |
+| `codrive_run` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `codrive_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `memory_read` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_fetch_batch` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_alias_add` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_alias_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_get_history` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_get_at` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_invalidate_by_origin` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_search_by_layer` | Resource → AuthorizedToolCall → original live employee handler |
+| `code_map` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` (H9 selects it for the helpers, no file tool needed) and spawnd `helper_calls`; signed only when that selection ran |
+| `user_profile_record` | Resource → AuthorizedToolCall → original live employee handler |
+| `user_profile_get` | Resource → AuthorizedToolCall → original live employee handler |
+| `user_code_profile` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_successful_conversations` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_episodic_pressure` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_consolidation_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `decision_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `decision_resolve` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_search` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_gaps` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_security_scan` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; own (else global) skill bytes scanned by E as data with own CONTRACT patterns; report only, findings rendered as one-line data (H12a) |
+| `skill_graduate` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; own skill scanned and prepared by E; global publication needs the dashboard admin card bound to the scanned source, then the journaled atomic publication (H12a) |
+| `skill_synthesis_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_synthesis_run` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee, no Workspace; own events only, host provider call under the employee's own runtime/budget, E prepares and scans, published no-clobber into the caller's own SKILLS (H12c) |
+| `skill_hub_install` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + signed PublicOrigins; host-selected hub archive via the protected public fetch, expanded only by E, single SKILL.md scanned by E before approval and at install, published no-clobber into the caller's own SKILLS (H12b) |
+| `skill_curator_status` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee; status and `run=true` limited to the caller's own skills (D-H4), run admin-approved, report returned and not published to the shared wiki (H12a) |
+| `skill_pin` | Resource → AuthorizedToolCall → original live employee handler |
+| `notion_status` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `notion_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `notion_page_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `notion_page_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_status` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_search_issues` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_issue_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_pr_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_issue_comment` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `cost_summary` | Resource → AuthorizedToolCall → original live employee handler |
+| `cost_agents` | Resource → AuthorizedToolCall → original live employee handler |
+| `cost_users` | Resource → AuthorizedToolCall → original live employee handler |
+| `cost_recent` | Resource → AuthorizedToolCall → original live employee handler |
+| `cost_multi_vs_single` | Resource → AuthorizedToolCall → original live employee handler |
+| `transcribe_audio` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
+| `meeting_transcribe` | Resource → original authenticated host orchestration; checked E parser required |
+| `meeting_upload_link` | Resource → original authenticated meeting job control; no media parsing |
+| `meeting_transcribe_status` | Resource → original authenticated meeting job control; no media parsing |
+| `meeting_transcribe_cancel` | Resource → original authenticated meeting job control; no media parsing |
+| `synthesize_speech` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
+| `knowledge_search` | Resource → AuthorizedToolCall → original live employee handler |
+| `knowledge_get_passage` | Resource → AuthorizedToolCall → original live employee handler |
+| `knowledge_list_collections` | Resource → AuthorizedToolCall → original live employee handler |
+| `knowledge_add_source` | Resource → AuthorizedToolCall → original live employee proposal handler; own Wiki grant required (Confined Wiki under EmployeeScope); text/URL only, local paths refused |
+| `wiki_ls` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_read` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_write` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_search` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_lint` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_stats` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_export` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_dedup` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_graph` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_rebuild_fts` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_trust_audit` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_trust_history` | Resource → AuthorizedToolCall → original live employee handler |
+| `shared_wiki_delete` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_namespace_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `canvas_push` | Resource → AuthorizedToolCall → original live employee handler |
+| `canvas_clear` | Resource → AuthorizedToolCall → original live employee handler |
+| `identity_resolve` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_share` | Resource → AuthorizedToolCall → original live employee handler |
+| `db_sources` | Resource → bounded account collection; each member repeats owner/catalog/binding/product checks |
+| `db_tables` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; installed at production boot (F1) |
+| `db_select` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; installed at production boot (F1) |
+| `db_query` | Resource → selected DB; finite strict single-table SQL lowers to parameterized SelectRequest; EmployeeScope retains product SQL policy |
+| `file_read` | AuthorizedFile (workspace dirfd, or `employee-work` root broker sealed read-only snapshot, never reopened by path); 512 KiB cap; live authority on each read; root refusals show fixed zh-TW reasons without paths; H10 issues Workspace employee-work (brokered root, H6) when a root work broker is installed and the employee profile allows the tool |
+| `csv_read` | AuthorizedFile (dirfd or `employee-work` root broker sealed snapshot) → checked E table parser, ReadTable op; root refusals show fixed zh-TW reasons without paths; same H10 brokered Workspace grant as file_read |
+| `xlsx_read` | AuthorizedFile (dirfd or `employee-work` root broker sealed snapshot) → checked E table parser, ReadTable op; root refusals show fixed zh-TW reasons without paths; same H10 brokered Workspace grant as file_read |
+| `group_history_read` | Resource → selected exact channel/group → original live retained-history gates |
+| `send_message` | Resource → selected exact bot/channel/chat → checked sender; late failure is uncertain |
+| `send_photo` | Resource → selected exact channel/chat → checked media send; unsupported subtype/input refuses |
+| `send_sticker` | Resource → selected exact channel/chat → checked sticker send; unsupported subtype/input refuses |
+| `web_search` | Resource → bound search provider; checked E parser required; installed at production boot (F1) |
+| `send_to_agent` | Resource → AuthorizedToolCall → original live employee handler |
+| `list_cron_tasks` | Resource → finite owner-and-grant SQL adapter; original live handler for EmployeeScope |
+| `update_cron_task` | Resource → AuthorizedToolCall → original live employee handler |
+| `delete_cron_task` | Resource → AuthorizedToolCall → original live employee handler |
+| `pause_cron_task` | Resource → AuthorizedToolCall → original live employee handler |
+| `run_cron_task` | Resource → AuthorizedToolCall → original live employee handler |
+| `create_reminder` | Resource → AuthorizedToolCall → original live employee handler |
+| `list_reminders` | Resource → EmployeeScope original handler / finite immutable reminder IDs + bounded reader |
+| `cancel_reminder` | Resource → AuthorizedToolCall → original live employee handler |
+| `web_fetch_cached` | Resource → original authenticated cache/fetch handler; existing egress and cache policy; H10 issues PublicOrigins * (H7) only to an employee-scope run of an employee whose admin set agent.toml isolation public_web = true (default none; independent of the task sandbox network_access) |
+| `web_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; same H10 PublicOrigins grant as web_fetch_cached |
+| `inference_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `model_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `model_load` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `model_unload` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `hardware_info` | Host bounded Linux RAM/CPU/PCI snapshot; no external probe or fabricated VRAM |
+| `route_query` | Resource → original authenticated inference router; existing employee policy |
+| `inference_mode` | Resource → AuthorizedToolCall → original live employee handler |
+| `llamafile_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `llamafile_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `llamafile_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `model_search` | Host bundled model catalog on Linux; live RAM filter; no provider search or ambient credentials |
+| `model_download` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `model_recommend` | Host bundled model recommendations on Linux; live RAM filter; unknown GPU memory stays unknown |
+| `submit_feedback` | Resource → AuthorizedToolCall → original live employee handler |
+| `evolution_toggle` | Resource → AuthorizedToolCall → original live employee handler |
+| `evolution_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `audit_trail_query` | Resource → AuthorizedToolCall → original live employee handler |
+| `reliability_summary` | Resource → AuthorizedToolCall → original live employee handler |
+| `channel_config` | Resource → selected exact settings scope → validated key/value and checked transaction |
+| `channel_config_list` | Resource → selected exact settings scope → CONFIG_KEYS ∪ MCP_ACCESS_KEYS projection |
+| `channel_status` | Resource → selected exact channel/scope → scoped status/session read; MCP_STATUS_KEYS guild projection |
+| `pairing_manage` | Resource → selected exact subject → checked pairing state; finite list |

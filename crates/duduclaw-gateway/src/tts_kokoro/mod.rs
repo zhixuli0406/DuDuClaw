@@ -20,6 +20,7 @@ impl KokoroTtsProvider {
 impl TtsProvider for KokoroTtsProvider {
     fn name(&self) -> &str { "kokoro" }
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
+        refuse_in_process_inference(duduclaw_parse_worker::client::required())?;
         duduclaw_onnx::refuse_in_process_models()?;
         let text = duduclaw_core::truncate_chars(text, 2000).to_string();
         let selected_voice = select_voice(&text, voice);
@@ -57,6 +58,7 @@ fn pad_short_tokens(mut tokens: Vec<i64>, pause_id: i64) -> Vec<i64> {
     tokens
 }
 fn synthesize_local(dir: &Path, lib: &Path, text: &str, voice: &str) -> Result<Vec<u8>, String> {
+    refuse_in_process_inference(duduclaw_parse_worker::client::required())?;
     duduclaw_onnx::refuse_in_process_models()?;
     let chunks = g2p::chunks(text, dir)?;
     if chunks.is_empty() { return Err("沒有可合成的文字".into()); }
@@ -174,5 +176,21 @@ mod tests {
         let peak = wav[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs() as f32 / 32768.0).fold(0.0f32, f32::max);
         assert!(peak > 0.01);
         if let Ok(out) = std::env::var("KOKORO_TEST_OUT") { std::fs::write(out, wav).unwrap(); }
+    }
+}
+
+// Package A's isolated local-inference implementation plugs into TtsProvider.
+fn refuse_in_process_inference(isolation_required: bool) -> Result<(), String> {
+    if isolation_required {
+        Err("隔離模式下本機語音模型尚未就緒，已停止解析。".into())
+    } else { Ok(()) }
+}
+
+#[cfg(test)]
+mod parse_isolation_tests {
+    #[test]
+    fn parse_isolation_kokoro_refuses_before_model_load() {
+        assert!(super::refuse_in_process_inference(true).is_err());
+        assert!(super::refuse_in_process_inference(false).is_ok());
     }
 }

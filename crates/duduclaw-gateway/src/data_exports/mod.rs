@@ -128,7 +128,11 @@ pub(super) fn authorize(
         if !valid_agent(id) {
             return Err("EXPORT_INVALID_REQUEST".into());
         }
-        if !live.has_agent_access(id, AccessLevel::Viewer) {
+        // v1.81 P1g (F1): another person's Personal employee is never
+        // exported — create, status, cancel and the HTTP download all pass
+        // here (`owned`), and bulk export accepts no break-glass (the export
+        // is built and re-verified outside the audited request).
+        if live.hides_agent(id) || !live.has_agent_access(id, AccessLevel::Viewer) {
             return Err("EXPORT_PERMISSION_DENIED".into());
         }
     }

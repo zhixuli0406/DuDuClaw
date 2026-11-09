@@ -12,6 +12,11 @@ impl MethodHandler {
             .get("agent_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        // v1.81 P1d: delegation (its answer runs under the employee's SOUL):
+        // canonical id, owner-only for a Personal employee, no break-glass.
+        if let Err(frame) = self.delegation_check(ctx, agent_id).await {
+            return frame;
+        }
         let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         let wait = params
             .get("wait_for_response")
@@ -257,7 +262,9 @@ impl MethodHandler {
             source,
             user_id: &ctx.user_id,
             guard: || {
-                let live = crate::agent_files::flow::require_live_agent_access(
+                // P1g allowlist: pause / resume stay open for an Admin on
+                // another person's Personal employee (audited at dispatch).
+                let live = crate::agent_files::flow::require_live_management_access(
                     &self.home_dir, ctx, agent_id, AccessLevel::Operator,
                 )?;
                 acl::require_role(&live, UserRole::Manager)?;

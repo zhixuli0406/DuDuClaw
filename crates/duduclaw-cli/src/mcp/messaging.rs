@@ -51,16 +51,35 @@ pub(crate) async fn handle_web_search(params: &Value, http: &reqwest::Client) ->
 
     // Enforce 10s timeout so web_search doesn't block the MCP server (CLI-H5)
     let search_future = async {
-        let resp = http
+        let mut resp = http
             .get(&url)
             .header("User-Agent", "DuDuClaw/0.6")
             .send()
-            .await?;
-        resp.text().await
+            .await.map_err(|error| error.to_string())?;
+        if duduclaw_parse_worker::client::required() {
+            let limit = duduclaw_parse_worker::policy::MAX_FILE_BYTES as usize;
+            if resp.content_length().is_some_and(|length| length > limit as u64) {
+                return Err("搜尋網頁超過處理上限。".to_string());
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|error| error.to_string())? {
+                if chunk.len() > limit.saturating_sub(bytes.len()) {
+                    return Err("搜尋網頁超過處理上限。".to_string());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return String::from_utf8(bytes).map_err(|_| "搜尋網頁文字格式無法辨識。".to_string());
+        }
+        resp.text().await.map_err(|error| error.to_string())
     };
 
     let result = match tokio::time::timeout(std::time::Duration::from_secs(10), search_future).await
     {
+        Ok(Ok(body)) if duduclaw_parse_worker::client::required() => {
+            tokio::task::spawn_blocking(move || duduclaw_parse_worker::media_adapters::search_html(body.as_bytes()))
+                .await.map_err(|_| "搜尋網頁無法在隔離環境中完成解析。".to_string())
+                .and_then(|result| result.map_err(|_| "搜尋網頁無法在隔離環境中完成解析。".to_string()))
+        },
         Ok(Ok(body)) => Ok(extract_search_results(&body)),
         Ok(Err(e)) => Err(format!("Error performing search: {e}")),
         Err(_) => Err("Error: web search timed out after 10 seconds".to_string()),
@@ -72,6 +91,11 @@ pub(crate) async fn handle_web_search(params: &Value, http: &reqwest::Client) ->
 /// Extract text results from DuckDuckGo HTML response using `scraper` (CLI-M5).
 pub(crate) fn extract_search_results(html: &str) -> String {
     use scraper::{Html, Selector};
+
+    if duduclaw_parse_worker::client::required() {
+        return duduclaw_parse_worker::media_adapters::search_html(html.as_bytes())
+            .unwrap_or_else(|_| "搜尋網頁無法在隔離環境中完成解析。".into());
+    }
 
     let document = Html::parse_document(html);
     let mut results = Vec::new();

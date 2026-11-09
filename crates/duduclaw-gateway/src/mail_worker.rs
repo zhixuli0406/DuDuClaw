@@ -409,14 +409,14 @@ async fn trigger_for_mail(
     mail_id: &str,
 ) -> bool {
     trigger_for_mail_with(home_dir, registry, mail_id, |agent_id, prompt| async move {
+        crate::process_group::with_class(duduclaw_core::execution_gate::ExecutionClass::Mail,
         crate::claude_runner::call_claude_for_agent_with_type(
             home_dir,
             registry,
             &agent_id,
             &prompt,
             crate::cost_telemetry::RequestType::Cron,
-        )
-        .await
+        )).await
     })
     .await
 }

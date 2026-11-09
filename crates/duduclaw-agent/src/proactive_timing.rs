@@ -306,7 +306,13 @@ pub fn load_interaction_history(
             return InteractionHistory::empty();
         }
     };
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+    if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(2)) {
+        debug!(
+            agent = agent_id,
+            "Natural-timing: busy_timeout failed ({e}); cold start"
+        );
+        return InteractionHistory::empty();
+    }
 
     // RFC3339 strings from `Utc::now().to_rfc3339()` compare lexicographically
     // — the same convention `heartbeat::poll_assigned_tasks` already relies on.

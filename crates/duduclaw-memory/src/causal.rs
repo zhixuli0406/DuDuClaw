@@ -286,13 +286,16 @@ impl Drop for CausalCcrDeliveryLease {
             &self.store.path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         ) {
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-            removed = conn
-                .execute(
-                    "DELETE FROM causal_ccr_delivery_leases WHERE lease_id=?1",
-                    [&self.lease_id],
-                )
-                .is_ok();
+            // If the timeout cannot be installed, skip the deletion: the durable
+            // row stays and a revoker reclaims it after the OS lock is released.
+            if conn.busy_timeout(std::time::Duration::from_secs(5)).is_ok() {
+                removed = conn
+                    .execute(
+                        "DELETE FROM causal_ccr_delivery_leases WHERE lease_id=?1",
+                        [&self.lease_id],
+                    )
+                    .is_ok();
+            }
         }
         let _ = self.lock_file.unlock();
         if removed {

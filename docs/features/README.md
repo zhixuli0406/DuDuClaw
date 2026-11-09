@@ -78,6 +78,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 72 | [Group context](72-group-context.md) | Opt-in retention, explicit employee reads and Discord choices |
 | 73 | [Meeting transcripts](73-meeting-transcripts.md) | Recordings to Taiwan Traditional Chinese with timestamps and optional speaker labels |
 | 76 | [Org chart editing](76-org-chart-editing.md) | Change reporting lines and departments: Admins apply after a before/after check, Managers propose for Admin approval; shared loop/existence/department rules; `org.*` RPCs (UI pending) |
+| 77 | [Native Linux protected mode](77-protected-mode.md) | Per-employee accounts and execution environments on native Linux: Personal vs Shared, connectors, retire/restore/adopt/purge, recording gate, host acceptance status |
 
 ---
 

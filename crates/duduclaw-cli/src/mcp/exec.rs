@@ -156,6 +156,8 @@ pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_
 }
 
 /// Execute through the shared bounded runner; publication remains in Rust.
+/// The runner's `ManagedChild::spawn` passes `execution_gate::check_local`, so a
+/// protected Linux install refuses this local spawn (fail-closed).
 pub(crate) async fn run_office_script(prepared: &duduclaw_agent::office_execution::PreparedOffice) -> Value {
     const MAX_OUT: usize = duduclaw_agent::office_execution::process::MAX_PIPE_BYTES;
     let result = match duduclaw_agent::office_execution::process::run(prepared).await {

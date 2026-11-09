@@ -283,3 +283,27 @@ fn effective_for_reads_files() {
         Effective::Disabled
     );
 }
+
+#[test]
+fn e4_tenant_source_keys_parse_strictly() {
+    let cfg = parse_home_config(
+        "[integrations.google_identity]\nservice_mailboxes=[' Support@C.com ']\n\
+         tenant_scopes=['https://www.googleapis.com/auth/gmail.readonly']\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.service_mailboxes, vec!["support@c.com".to_string()]);
+    assert_eq!(
+        cfg.tenant_scopes,
+        vec!["https://www.googleapis.com/auth/gmail.readonly".to_string()]
+    );
+    let defaults = parse_home_config("").unwrap();
+    assert!(defaults.service_mailboxes.is_empty() && defaults.tenant_scopes.is_empty());
+    for bad in [
+        "[integrations.google_identity]\nservice_mailboxes='a@c.com'\n",
+        "[integrations.google_identity]\nservice_mailboxes=['not-an-email']\n",
+        "[integrations.google_identity]\ntenant_scopes=['has space']\n",
+        "[integrations.google_identity]\ntenant_scopes=[1]\n",
+    ] {
+        assert!(parse_home_config(bad).is_err(), "{bad}");
+    }
+}

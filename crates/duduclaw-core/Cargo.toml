@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+duduclaw-isolation.workspace = true
+duduclaw-execution.workspace = true
+portable-pty = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
 # Agent File frontmatter reuses the importer's already locked YAML parser.
 serde_yaml = "0.9"
 toml = { workspace = true }

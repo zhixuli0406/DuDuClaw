@@ -37,6 +37,10 @@ pub(super) fn minimum_role(method: &str) -> Option<UserRole> {
         return Some(UserRole::Manager);
     }
     let namespace = method.split('.').next().unwrap_or("");
+    // Isolation connector lifecycle: Admin, plus step-up in its handler.
+    if method.strip_prefix("isolation.").is_some_and(|rest| rest.starts_with("connector_")) {
+        return Some(UserRole::Admin);
+    }
     if namespace == "org" {
         return Some(UserRole::Admin);
     }
@@ -60,10 +64,11 @@ mod tests {
             assert_eq!(minimum_role(method), Some(UserRole::Employee), "{method}");
         }
         for method in ["cron", "cron.future", "cron.add.future", "reminders.future",
-            "assign_schedules.future", "agents.org_chart.future", "skills.recent.future"] {
+            "assign_schedules.future", "agents.org_chart.future", "skills.recent.future",
+            "isolation.connector_list", "isolation.connector_provision", "isolation.connector_future"] {
             assert_eq!(minimum_role(method), Some(UserRole::Admin), "{method}");
         }
-        for method in ["ping", "agents.list", "skills.list", "cronish.list", "organization.list"] {
+        for method in ["ping", "agents.list", "skills.list", "cronish.list", "isolation.recording_status", "organization.list"] {
             assert_eq!(minimum_role(method), None, "{method}");
         }
     }

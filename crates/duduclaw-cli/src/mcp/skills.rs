@@ -319,6 +319,9 @@ pub(crate) async fn handle_skill_hub_install(
     default_agent: &str,
     caller_is_admin: bool,
 ) -> Value {
+    if crate::mcp_isolation::current().is_some() {
+        return handle_skill_hub_install_owned(params, home_dir, caller_is_admin).await;
+    }
     let hub = params.get("hub").and_then(|v| v.as_str()).unwrap_or("");
     let skill_name = params
         .get("skill_name")
@@ -365,6 +368,16 @@ pub(crate) async fn handle_skill_hub_install(
 
     use duduclaw_gateway::skill_lifecycle::hub_install;
 
+    // SR5 round 3 follow-up R3-3: an employee scope must name a LIVE employee
+    // (same `live_employee_dir` check as the RPC / install-request paths),
+    // refused before any fetch or approval; `install_gated` re-checks at the
+    // write and passes the checked tree to the loader.
+    if scope != "global" && !scope.starts_with("department:") {
+        if let Err(e) = hub_install::live_employee_scope_dir(home_dir, scope) {
+            return mcp_error(&e);
+        }
+    }
+
     // ── Phase 1: fetch + security scan (fail-closed) ────────────────────────
     // High-risk / unknown hub / absent content DENY here and never reach the
     // approval queue — approval is only for scanned-and-passed skills.
@@ -401,11 +414,63 @@ pub(crate) async fn handle_skill_hub_install(
     }
 }
 
+/// H12b: protected (isolated) hub install. The subject is the capability-bound
+/// employee of this call (never `scope`/`owner`, which the protected schema
+/// refuses); the host fetches the hub archive, E expands and scans it, the
+/// existing install approval gate runs, and the skill lands only in the
+/// employee's own SKILLS.
+async fn handle_skill_hub_install_owned(params: &Value, home_dir: &Path, caller_is_admin: bool) -> Value {
+    use duduclaw_gateway::skill_lifecycle::hub_install_owned;
+    let refused = || mcp_error("無法確認這次技能安裝的資源授權，已拒絕執行。");
+    let Some(current) = crate::mcp_isolation::current() else { return refused(); };
+    let Ok(call) = crate::mcp_isolation::authorize_gateway_handler(home_dir, "skill_hub_install", params).await else {
+        return refused();
+    };
+    if call.context().record() != current.context.record() { return refused(); }
+    let agent = current.agent.as_str();
+    let gated = match hub_install_owned::fetch_owned(home_dir, &call, agent).await {
+        Ok(gated) => gated,
+        Err(e) => return mcp_error(&e),
+    };
+    let (summary, payload) = hub_install_approval_details(&gated, &gated.hub, &gated.skill_name, None, agent);
+    match gate_install_approval(home_dir, agent, "skill_hub_install", &summary, payload, caller_is_admin).await {
+        InstallApprovalOutcome::Proceed => {}
+        InstallApprovalOutcome::Denied(msg) => return mcp_error(&msg),
+    }
+    match hub_install_owned::install_owned(home_dir, &call, agent, &gated).await {
+        Ok(report) => mcp_text(&format!(
+            "Skill '{}' installed from hub '{}' into your own skills (scan: risk {}, {} finding(s); signature: {:?}; content SHA-256: {}).",
+            report.skill_name, report.hub, report.risk_level, report.findings, report.signature_status.state,
+            report.content_sha256
+        )),
+        Err(e) => mcp_error(&e),
+    }
+}
+
 /// Report curator lifecycle state; optionally force a pass.
 pub(crate) async fn handle_skill_curator_status(params: &Value, home_dir: &Path) -> Value {
+    curator_status(params, home_dir, None).await
+}
+
+/// H12a / D-H4: the protected (isolated) curator. `owner` is the
+/// capability-bound employee of the isolated call — never an argument — and
+/// both the report and a `run=true` pass are limited to its own skills.
+pub(crate) async fn handle_skill_curator_status_owned(params: &Value, home_dir: &Path, owner: &str) -> Value {
+    curator_status(params, home_dir, Some(owner)).await
+}
+
+async fn curator_status(params: &Value, home_dir: &Path, owner: Option<&str>) -> Value {
     use duduclaw_gateway::custom_skills::{CurationStatus, CustomSkillStore};
     use duduclaw_gateway::skill_lifecycle::curator;
 
+    let owned_scope = match owner.map(curator::owned_scope).transpose() {
+        Ok(scope) => scope,
+        Err(e) => return mcp_error(&e),
+    };
+    if owner.is_some() && params.as_object().is_none_or(|fields| fields.keys().any(|key| key != "run")
+        || fields.get("run").is_some_and(|value| !value.is_boolean())) {
+        return mcp_error("技能維護只接受 run 參數。");
+    }
     let store = match CustomSkillStore::open(home_dir) {
         Ok(s) => s,
         Err(e) => return mcp_error(&format!("curation store: {e}")),
@@ -415,7 +480,11 @@ pub(crate) async fn handle_skill_curator_status(params: &Value, home_dir: &Path)
     let cfg = curator::CuratorConfig::load_from_home(home_dir);
     let mut pass_summary = String::new();
     if force_run {
-        match curator::run_pass(home_dir, &store, &cfg, chrono::Utc::now()).await {
+        let pass = match owner {
+            Some(agent) => curator::run_owned_pass(home_dir, &store, &cfg, chrono::Utc::now(), agent).await,
+            None => curator::run_pass(home_dir, &store, &cfg, chrono::Utc::now()).await,
+        };
+        match pass {
             Ok(report) => {
                 pass_summary = format!(
                     "Pass executed: {} newly stale, {} archived, {} reactivated, {} error(s).\n\n",
@@ -429,10 +498,14 @@ pub(crate) async fn handle_skill_curator_status(params: &Value, home_dir: &Path)
         }
     }
 
-    let rows = match store.curation_list().await {
+    let mut rows = match store.curation_list().await {
         Ok(r) => r,
         Err(e) => return mcp_error(&e),
     };
+    // An owned report never lists another employee's (or the global) skills.
+    if let Some(scope) = owned_scope.as_deref() {
+        rows.retain(|row| row.scope == scope);
+    }
 
     let mut stale = Vec::new();
     let mut archived = Vec::new();
@@ -466,9 +539,10 @@ pub(crate) async fn handle_skill_curator_status(params: &Value, home_dir: &Path)
     }
 
     let text = format!(
-        "{}Curator status — {} tracked skill(s) (enabled: {}, stale ≥ {}d, archive ≥ {}d)\n\n{}{}{}{}",
+        "{}Curator status — {} tracked skill(s){} (enabled: {}, stale ≥ {}d, archive ≥ {}d)\n\n{}{}{}{}",
         pass_summary,
         rows.len(),
+        owned_scope.as_deref().map(|scope| format!(" in [{scope}]")).unwrap_or_default(),
         cfg.enabled,
         cfg.stale_days,
         cfg.archive_days,

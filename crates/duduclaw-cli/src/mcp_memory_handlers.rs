@@ -46,7 +46,7 @@ fn client_id_from_ns(ns_ctx: &NamespaceContext) -> &str {
 pub(crate) fn mcp_write_provenance(
     namespace: &str,
 ) -> Result<duduclaw_memory::lineage::Provenance, String> {
-    let env = |k: &str| std::env::var(k).ok();
+    let env = |k: &str| crate::mcp_isolation_identity::var(k).ok();
     mcp_write_sources_with(
         namespace,
         &McpTurnEnv {
@@ -68,7 +68,7 @@ pub(crate) async fn mcp_stamped_provenance(
 ) -> Result<duduclaw_memory::lineage::Provenance, String> {
     let provenance = mcp_write_provenance(namespace)?;
     let snapshot = duduclaw_gateway::egress_client::connector_snapshot(
-        &duduclaw_core::duduclaw_home(), namespace,
+        &crate::mcp_isolation_identity::home(), namespace,
     ).await;
     Ok(snapshot.stamp(provenance))
 }
@@ -331,7 +331,7 @@ pub(crate) fn mcp_fenced_error(
     refusal: &duduclaw_memory::FenceRefusal,
 ) -> Value {
     duduclaw_gateway::memory_provenance::record_fenced(
-        &duduclaw_core::duduclaw_home(),
+        &crate::mcp_isolation_identity::home(),
         namespace,
         producer,
         refusal,
@@ -490,7 +490,10 @@ pub async fn handle_memory_store(
         }
     };
     match memory
-        .store_temporal_outcome(&namespace, entry, store_meta, provenance)
+        .store_temporal_outcome_checked(&namespace, entry, store_meta, provenance, || {
+            duduclaw_mcp_boundary::io_authority::verify_before_io()
+                .map_err(|error| duduclaw_core::error::DuDuClawError::Memory(error.to_string()))
+        })
         .await
     {
         Ok(duduclaw_memory::TemporalWriteOutcome::Fenced(r)) => {
@@ -1203,13 +1206,18 @@ pub async fn handle_code_map(params: &Value, home_dir: &Path, acting: Option<&st
 
     let cfg = CodeMapConfig::new(root.path().to_path_buf());
     // CPU-bound directory walk + parse: keep it off the async reactor.
+    // The isolation I/O authority is task-local; carry it onto the blocking
+    // thread so every contained read re-verifies it.
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
     let built = tokio::task::spawn_blocking(move || -> Result<CodeMap, String> {
-        let tree = crate::mcp_files::ContainedTree::open(&root)
-            .map_err(|e| format!("code_map root could not be opened safely: {e}"))?;
-        CodeMap::build_with_reader(&cfg, |_walked, rel, max_bytes| {
-            tree.read_to_string(rel, max_bytes as u64).ok()
+        authority.run(|| {
+            let tree = crate::mcp_files::ContainedTree::open(&root)
+                .map_err(|e| format!("code_map root could not be opened safely: {e}"))?;
+            CodeMap::build_with_reader(&cfg, |_walked, rel, max_bytes| {
+                tree.read_to_string(rel, max_bytes as u64).ok()
+            })
+            .map_err(|e| e.to_string())
         })
-        .map_err(|e| e.to_string())
     })
     .await;
 

@@ -48,6 +48,7 @@ import { isTauri } from '@/lib/gateway-picker';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useIsAppliance } from '@/hooks/useIsAppliance';
 import { useDecisionEnabled } from '@/hooks/useDecisionEnabled';
+import { useProtectedMode } from '@/hooks/useProtectedMode';
 import { CharacterAvatar } from '@/components/character';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSystemStore } from '@/stores/system-store';
@@ -255,6 +256,8 @@ export function CommandPalette() {
   const isAppliance = useIsAppliance(hasMinRole(user?.role, 'admin'));
   // Operator kill switch for the Decision Lab row — same signal the rail uses.
   const decisionEnabled = useDecisionEnabled();
+  // v1.81 F5: the 受保護模式 row only exists on protected installs.
+  const protectedMode = useProtectedMode();
   const setTheme = useThemeStore((s) => s.setTheme);
   const setLocale = useLocaleStore((s) => s.setLocale);
 
@@ -367,6 +370,7 @@ export function CommandPalette() {
       // X1 (2026-09-29): ⌘K must not offer a page whose whole HTTP surface the
       // operator turned off — the palette is the one way into `/manage/*` rows.
       decisionEnabled,
+      protectedMode,
     };
     const navCommands: Command[] = navSources
       .filter(({ item }, index, entries) => entries.findIndex(entry => entry.item.to === item.to) === index)
@@ -484,7 +488,7 @@ export function CommandPalette() {
         }];
 
     return [...navCommands, ...manageCommands, ...agentCommands, ...agentFileCommands, ...taskCommands, ...themeActions, ...localeActions, ...logoutAction];
-  }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, decisionEnabled, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout, visibleAgentsForSearch]);
+  }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, decisionEnabled, protectedMode, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout, visibleAgentsForSearch]);
 
   // Empty query → recent routes first, then all commands in natural order.
   const results = useMemo<ScoredCommand[]>(() => {

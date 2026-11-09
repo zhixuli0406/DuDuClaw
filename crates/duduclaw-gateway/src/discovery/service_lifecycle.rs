@@ -148,8 +148,9 @@ async fn execute(home: PathBuf, store: Arc<TaskStore>, task: TaskRow, worker: St
     let quota = super::super::attempt_container::QuotaLimits {
         max_run_bytes: config.max_run_bytes, max_total_bytes: config.max_total_bytes,
     };
-    let policy_runtime = tokio::task::spawn_blocking(move ||
-        PythonPolicyRuntime::detect_scoped_with_quota(&policy_home, &run_id, policy_budget, quota))
+    let launch_context = duduclaw_core::execution_gate::CapturedLaunch::capture();
+    let policy_runtime = tokio::task::spawn_blocking(move || launch_context.sync_scope(||
+        PythonPolicyRuntime::detect_scoped_with_quota(&policy_home, &run_id, policy_budget, quota)))
         .await.map_err(|_| "policy isolation detection failed")?;
     let policy = Arc::new(ManagedPolicySource::new(policy_runtime));
     if let Some(source) = frozen.defaults.bundle.source.as_deref() {

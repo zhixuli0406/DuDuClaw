@@ -18,6 +18,12 @@ mod text;
 mod xlsx;
 mod xml;
 
+// Kept behind the extraction module boundary so the disposable worker can
+// reuse the parsers without linking the gateway/core dependency graph.
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
+    duduclaw_core::truncate_chars(text, max)
+}
+
 /// Supported input formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -250,6 +256,27 @@ pub fn extract(
     bytes: &[u8],
     max_chars: usize,
 ) -> Result<ExtractOutput, ExtractError> {
+    extract_with_isolation(format, bytes, max_chars, duduclaw_parse_worker::client::required())
+}
+
+fn extract_with_isolation(
+    format: Format,
+    bytes: &[u8],
+    max_chars: usize,
+    isolation_required: bool,
+) -> Result<ExtractOutput, ExtractError> {
+    if isolation_required {
+        let max_chars = u32::try_from(max_chars).map_err(|_| ExtractError::too_many_chars(max_chars))?;
+        let limits = duduclaw_parse_worker::client::request(
+            duduclaw_parse_worker::worker::ParseOperation::ExtractDocument,
+            duduclaw_parse_worker::worker::ContentFormat::Text, bytes.len() as u64,
+        ).limits;
+        let output = duduclaw_parse_worker::adapters::extract_knowledge_bytes(
+            bytes, worker_format(format), max_chars, limits,
+        ).map_err(|_| ExtractError::new("isolation_unavailable",
+            "隔離解析服務無法處理這份文件，已停止解析。"))?;
+        return from_worker_output(output);
+    }
     if format.is_ooxml() && is_cfb(bytes) {
         // An OOXML file stored as a compound file is an encrypted package.
         return Err(ExtractError::encrypted());
@@ -287,7 +314,33 @@ pub(crate) mod fixtures;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_isolation_preserves_segment_metadata() {
+        let worker = serde_json::from_value(serde_json::json!({
+            "segments": [{"kind":"sheet", "label":"Sales", "page":null,
+                "sheet":"Sales", "line_rows":[1,4], "text":"title\nvalue"}],
+            "warnings": [{"code":"empty_pages", "pages":[2], "count":1}],
+            "extractor_version":"worker"
+        })).unwrap();
+        let output = super::from_worker_output(worker).unwrap();
+        assert_eq!(output.segments[0].kind, super::SegmentKind::Sheet);
+        assert_eq!(output.segments[0].sheet.as_deref(), Some("Sales"));
+        assert_eq!(output.segments[0].line_rows.as_deref(), Some([1,4].as_slice()));
+        assert_eq!(output.warnings[0].pages, [2]);
+    }
+
     use super::*;
+
+    #[test]
+    fn parse_isolation_invalid_budget_never_falls_back() {
+        for format in [Format::Pdf, Format::Docx, Format::Pptx, Format::Xlsx,
+            Format::Xls, Format::Csv, Format::Txt, Format::Md, Format::Html] {
+            let error = extract_with_isolation(format, b"invalid", 0, true).unwrap_err();
+            assert_eq!(error.code, "isolation_unavailable");
+        }
+        let output = extract_with_isolation(Format::Txt, b"ordinary text", 100, false).unwrap();
+        assert_eq!(output.segments[0].text, "ordinary text");
+    }
 
     #[test]
     fn file_names_map_to_formats() {
@@ -334,5 +387,22 @@ mod tests {
             extract(Format::Txt, b"   \n\n ", 1000).unwrap_err().code,
             "empty_text"
         );
+    }
+}
+
+/// Shared gateway adapter preserves the worker's page, sheet, row and warning
+/// metadata. Wire output has already passed bounded contract validation.
+pub fn from_worker_output(output: duduclaw_parse_worker::worker::KnowledgeOutput) -> Result<ExtractOutput, ExtractError> {
+    serde_json::to_value(output).ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(|| ExtractError::new("extract_crashed", "隔離解析服務回傳的資料格式不正確。"))
+}
+
+pub fn worker_format(format: Format) -> duduclaw_parse_worker::worker::KnowledgeFormat {
+    use duduclaw_parse_worker::worker::KnowledgeFormat as W;
+    match format {
+        Format::Pdf => W::Pdf, Format::Docx => W::Docx, Format::Pptx => W::Pptx,
+        Format::Xlsx => W::Xlsx, Format::Xls => W::Xls, Format::Csv => W::Csv,
+        Format::Txt => W::Txt, Format::Md => W::Md, Format::Html => W::Html,
     }
 }

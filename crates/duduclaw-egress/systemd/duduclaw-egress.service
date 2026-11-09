@@ -1,0 +1,52 @@
+[Unit]
+Description=DuDuClaw public IP egress
+Requires=duduclaw-egress.socket
+After=duduclaw-egress.socket
+
+[Service]
+Slice=duduclaw-tcb.slice
+ExecStart=/opt/duduclaw/bin/duduclaw-egress
+User=duduclaw-egress
+Group=duduclaw-egress
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/tmp /var/tmp
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+# Fixed expansion; do not replace with the version-dependent @system-service set.
+SystemCallFilter=accept accept4 access arch_prctl bind brk capget chdir clock_gettime clock_nanosleep close close_range connect dup dup2 dup3 epoll_create1 epoll_ctl epoll_pwait epoll_wait eventfd2 execve exit exit_group fcntl fstat futex getcwd getdents64 getegid geteuid getgid getgroups getpeername getpid getrandom getresgid getresuid getrlimit getsockname getsockopt gettid getuid ioctl listen lseek madvise mmap mprotect mremap munmap nanosleep newfstatat openat poll ppoll prctl pread64 prlimit64 pselect6 read readlink readlinkat readv recvfrom recvmmsg recvmsg restart_syscall rseq rt_sigaction rt_sigprocmask rt_sigreturn sched_getaffinity sched_yield seccomp sendmsg sendto set_robust_list set_tid_address setsockopt shutdown sigaltstack socket socketpair statx uname write writev
+SystemCallErrorNumber=EPERM
+UMask=0077
+LimitCORE=0
+LimitNOFILE=65536
+TasksMax=8
+MemoryMax=256M
+CPUQuota=100%
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=100
+IPAddressDeny=0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4
+IPAddressDeny=::/3 4000::/2 8000::/1 2001::/23 2001:db8::/32 2002::/16 3fff::/20
+IPAddressAllow=192.0.0.9/32 192.0.0.10/32 2001:1::1/128 2001:1::2/128 2001:1::3/128 2001:3::/32 2001:4:112::/48 2001:20::/28 2001:30::/28
+# Default route is resolved. Broker deployments replace the DNS bind in a
+# root-owned drop-in; never add a resolver IP exception to this service.
+TemporaryFileSystem=/run:ro
+BindReadOnlyPaths=/run/duduclaw-egress /run/systemd/resolve/io.systemd.Resolve

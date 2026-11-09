@@ -1,0 +1,15 @@
+# Signed installer validates the instance id and plan, then installs this unit.
+[Unit]
+Description=Expire DuDuClaw migration recovery data
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/lib/duduclaw/current/duduclaw-migrate expire --plan /var/lib/duduclaw-migrate/%i/plan.json
+UMask=0077
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+NoNewPrivileges=yes
+LimitCORE=0
+StandardOutput=null
+StandardError=journal

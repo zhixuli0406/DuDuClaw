@@ -302,3 +302,34 @@ async fn save_cache(query: &str, results: &[RegistryEntry], home_dir: &Path) {
         let _ = tokio::fs::write(cache_dir.join("hf-search-cache.json"), json).await;
     }
 }
+
+/// Public-registry search for gateway-owned isolation adapters. This path never
+/// reads HF_TOKEN, writes the shared cache, follows redirects or uses a proxy.
+/// The exact selected account authority is checked at each network boundary.
+pub async fn search_models_checked(
+    query: &str, available_ram_mb: u64, check: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Vec<RegistryEntry>, String> {
+    if !check() { return Err("model registry authority unavailable".into()); }
+    let query: String = query.chars().take(200).collect();
+    let query = if query.to_lowercase().contains("gguf") { query } else { format!("{query} gguf") };
+    let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never()).timeout(Duration::from_secs(10)).build().map_err(|_| "model registry unavailable")?;
+    let request = client.get(format!("{HF_API_BASE}/models")).query(&[
+        ("search",query.as_str()),("filter","gguf"),("sort","downloads"),("direction","-1"),("limit","20")]);
+    if !check() { return Err("model registry authority unavailable".into()); }
+    let mut response = request.send().await.map_err(|_| "model registry unavailable")?;
+    if !response.status().is_success() || response.content_length().is_some_and(|n| n > 1024 * 1024) {
+        return Err("model registry unavailable".into());
+    }
+    let mut bytes = Vec::new();
+    loop {
+        if !check() { return Err("model registry authority unavailable".into()); }
+        let Some(chunk) = response.chunk().await.map_err(|_| "model registry unavailable")? else { break };
+        if chunk.len() > (1024usize * 1024).saturating_sub(bytes.len()) { return Err("model registry response too large".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !check() { return Err("model registry authority unavailable".into()); }
+    let models: Vec<HfModel> = serde_json::from_slice(&bytes).map_err(|_| "model registry response invalid")?;
+    if models.len() > 20 { return Err("model registry response too large".into()); }
+    Ok(filter_and_sort(convert_hf_models(models), available_ram_mb))
+}

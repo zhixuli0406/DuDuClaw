@@ -611,12 +611,102 @@ pub(super) fn deny(home_dir: &Path, caller_agent: &str, tool: &str, model: &str,
     );
 }
 
+/// `(verb, model)` of a generic write call for the isolation provider's
+/// pre-credential `check_operation`; `None` for other tools or a missing /
+/// malformed model (which [`generic_write_local_gate`] refuses).
+pub(crate) fn classify_generic_write_call(tool: &str, params: &Value) -> Option<(&'static str, String)> {
+    Some((generic_write_verb(tool)?, parse_generic_write_model(params).ok()?))
+}
+
+/// Protected mode (owner decision C): gate steps 1–5 — all local, no
+/// credential, no connection — read from the employee's own settings files,
+/// exactly as [`generic_write_listed`] reads them. The isolation-bound Odoo
+/// executor runs this before it resolves the connector credential or
+/// authenticates, so a call RM-120 refuses never dials Odoo. The bound
+/// handler ([`handle_bound_odoo_generic_write`]) repeats every step, then
+/// steps 6–9. `Err` is the tool result to return (already audited).
+pub(crate) fn generic_write_local_gate(
+    tool: &str,
+    params: &Value,
+    home_dir: &Path,
+    caller_agent: &str,
+) -> std::result::Result<(), Value> {
+    let Some(verb) = generic_write_verb(tool) else {
+        return Err(super::egress_gate::pre_dispatch_error(&format!("Odoo: '{tool}' is not offered. {UNAVAILABLE_SUFFIX}")));
+    };
+    let model = match parse_generic_write_model(params) {
+        Ok(model) => model,
+        Err(error) => {
+            let hint = params.get("model").and_then(Value::as_str).unwrap_or("");
+            deny(home_dir, caller_agent, tool, duduclaw_core::truncate_bytes(hint, 128), verb, &error);
+            return Err(super::egress_gate::pre_dispatch_error(&format!("Odoo {tool}: {error}")));
+        }
+    };
+    let model = model.as_str();
+    if never_generically_writable(model) {
+        deny(home_dir, caller_agent, tool, model, verb, "never generically writable");
+        return Err(super::egress_gate::pre_dispatch_error(&GenericWriteDenial::NeverWritable.message(tool, model)));
+    }
+    let cfg = match load_generic_write_override(home_dir, caller_agent) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            deny(home_dir, caller_agent, tool, model, verb, &error);
+            return Err(super::egress_gate::pre_dispatch_error(&error));
+        }
+    };
+    if let Err(reason) = generic_write_grant(cfg.as_ref(), verb, model) {
+        deny(home_dir, caller_agent, tool, model, verb, &reason);
+        return Err(super::egress_gate::pre_dispatch_error(&GenericWriteDenial::Grant(reason).message(tool, model)));
+    }
+    let Some(global) = load_global_odoo(home_dir) else {
+        return Err(super::egress_gate::pre_dispatch_error("Odoo not connected. Call odoo_connect first."));
+    };
+    let unblock = cfg.as_ref().and_then(|c| c.unblock_models.clone())
+        .unwrap_or_else(|| global.unblock_models.clone());
+    if let Err(denial) = generic_write_model_gate(cfg.as_ref(), &global, &unblock, verb, model) {
+        let message = denial.message(tool, model);
+        deny(home_dir, caller_agent, tool, model, verb, &message);
+        return Err(super::egress_gate::pre_dispatch_error(&message));
+    }
+    if let Err(error) = parse_generic_write_args(tool, params) {
+        deny(home_dir, caller_agent, tool, model, verb, &error);
+        return Err(super::egress_gate::pre_dispatch_error(&format!("Odoo {tool}: {error}")));
+    }
+    Ok(())
+}
+
 pub(crate) async fn handle_odoo_generic_write(
     tool: &str,
     params: &Value,
     home_dir: &Path,
     odoo: &OdooState,
     caller_agent: &str,
+) -> Value {
+    generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, None).await
+}
+
+/// Protected mode: the same gate chain on the employee's own isolation
+/// connector (already selected, bound and authenticated by the provider).
+/// Step 6 uses that connector — no pool lookup, account resolution or
+/// auto-connect — and every other step is unchanged.
+pub(crate) async fn handle_bound_odoo_generic_write(
+    tool: &str,
+    params: &Value,
+    home_dir: &Path,
+    odoo: &OdooState,
+    caller_agent: &str,
+    connector: std::sync::Arc<duduclaw_odoo::OdooConnector>,
+) -> Value {
+    generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, Some(connector)).await
+}
+
+async fn generic_write_with_connection(
+    tool: &str,
+    params: &Value,
+    home_dir: &Path,
+    odoo: &OdooState,
+    caller_agent: &str,
+    bound: Option<std::sync::Arc<duduclaw_odoo::OdooConnector>>,
 ) -> Value {
     let Some(verb) = generic_write_verb(tool) else {
         return super::egress_gate::pre_dispatch_error(&format!("Odoo: '{tool}' is not offered. {UNAVAILABLE_SUFFIX}"));
@@ -678,17 +768,26 @@ pub(crate) async fn handle_odoo_generic_write(
     };
 
     // ── 6. connection (first credential use) ─────────────────────────────
-    if let Err(error) = odoo.connect_precheck(caller_agent).await {
-        return super::egress_gate::pre_dispatch_error(&format!(
-            "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first. {error}"
-        ));
-    }
-    let conn = match connect_odoo_pool(home_dir, odoo, caller_agent).await {
-        Ok(conn) => conn,
-        Err(error) => {
-            return mcp_error(&format!("Odoo not connected for agent '{caller_agent}'. Call odoo_connect first. {error}"));
+    // Protected mode: the isolation connector the provider bound to this
+    // employee, used as-is (no pool lookup / account resolution).
+    let conn = if let Some(connector) = bound {
+        connector
+    } else {
+        if let Err(error) = odoo.connect_precheck(caller_agent).await {
+            return super::egress_gate::pre_dispatch_error(&format!(
+                "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first. {error}"
+            ));
+        }
+        match connect_odoo_pool(home_dir, odoo, caller_agent).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                return mcp_error(&format!("Odoo not connected for agent '{caller_agent}'. Call odoo_connect first. {error}"));
+            }
         }
     };
+    if conn.verify_io().is_err() {
+        return mcp_error("Odoo authority revoked");
+    }
     let profile = odoo.pool_key(caller_agent).await.1;
 
     // ── 7. account ACL from this identity's snapshot ─────────────────────
@@ -753,6 +852,10 @@ pub(crate) async fn handle_odoo_generic_write(
     }
 
     // ── RPC ──────────────────────────────────────────────────────────────
+    // A revoked binding (isolation) stops here, before the create / write.
+    if conn.verify_io().is_err() {
+        return mcp_error("Odoo authority revoked");
+    }
     let values = Value::Object(args.values.clone());
     let result: std::result::Result<String, String> = match verb {
         "create" => conn

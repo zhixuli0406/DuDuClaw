@@ -79,9 +79,9 @@ pub(crate) fn classify(event: &str) -> PushRule {
 /// A snapshot belongs to exactly one broadcast frame, never to an entity TTL.
 /// The fan-out worker constructs it once, before any connection sees it.
 pub(crate) struct PreparedPush {
-    line: String,
-    task: Option<(String, Option<String>, TaskAudience)>,
-    approval: Option<(crate::approval::ApprovalRecord, super::approval_visibility::ApprovalVisibility)>,
+    pub(super) line: String,
+    pub(super) task: Option<(String, Option<String>, TaskAudience)>,
+    pub(super) approval: Option<(crate::approval::ApprovalRecord, super::approval_visibility::ApprovalVisibility)>,
 }
 
 /// Bound both queued blocking work and concurrent disk reads across sockets.
@@ -390,6 +390,8 @@ impl PushGate {
                 }
             } else { gate.filter(&frame.line) };
             gate.task_snapshot = None;
+            // v1.81 P1c: never about another person's Personal employee (personal_push.rs).
+            let result = result.filter(|_| !super::personal_push::withheld(&gate.home, crate::runtime_readiness::is_protected_linux(), &gate.ctx.user_id, &frame));
             (gate, result)
         }).await?;
         *self = next;

@@ -62,6 +62,28 @@ impl DelegationContext {
     /// An unsigned/expired context has no delegation headroom. Ordinary tools
     /// still run as the verified worker, but cannot start a new delegation.
     fn from_env(home: &Path, worker: &str) -> Self {
+        // MERGE-NOTE: origin/main requires a signed DUDUCLAW_DELEGATION_CONTEXT
+        // from the process env; native Linux isolated calls have no process
+        // env and instead carry host-registered run metadata (the ISO side
+        // read depth/origin through `mcp_isolation_identity::var`). Inside an
+        // isolated call the connection-bound host mapping is authoritative; a
+        // home/worker mismatch or missing mapping leaves no headroom.
+        if let Some(call) = crate::mcp_isolation::current() {
+            if call.home.as_path() != home || call.agent != worker {
+                return Self { depth: duduclaw_core::MAX_DELEGATION_DEPTH, origin: None };
+            }
+            let depth = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_DEPTH)
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(duduclaw_core::MAX_DELEGATION_DEPTH);
+            let origin = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|origin| if duduclaw_core::identity_token::is_system_delegation_origin(&origin) {
+                    worker.to_string()
+                } else { origin });
+            return Self { depth, origin };
+        }
         match verified_delegation_context(home, worker) {
             Some(context) => Self {
                 depth: context.depth,
@@ -170,6 +192,11 @@ mod decision_tools;
 mod delegation;
 mod discovery;
 mod group_history;
+
+pub(crate) async fn handle_bound_group_history(args: &serde_json::Value, home: &std::path::Path, employee: &str) -> serde_json::Value {
+    group_history::handle_for_employee(args, home, employee).await
+}
+
 mod dispatch;
 mod evolution;
 mod exec;
@@ -192,6 +219,8 @@ mod odoo;
 mod odoo_generic_write;
 mod on_behalf_of;
 mod os_tools;
+mod personal_target;
+mod personal_wildcard;
 mod record_authz;
 mod reminders;
 mod responsibilities;

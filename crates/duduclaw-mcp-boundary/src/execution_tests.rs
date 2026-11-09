@@ -1,0 +1,607 @@
+use super::*;
+use std::{collections::BTreeMap, sync::atomic::{AtomicUsize, Ordering}};
+use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
+    EmployeeBinding, Lane, Principal, ResourceGrant}, execution::*, ids::{EmployeeId, RunId, Sha256Digest}};
+
+struct TestLive;
+impl duduclaw_isolation::capability::LiveRequestVerifier for TestLive {
+    fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+}
+fn context(tool: &str) -> RequestContext {
+    RequestContext::with_live_verifier(CapabilityRecord {
+        id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
+        task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
+        employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
+        tools: List::new(vec![Text::new(tool.into()).unwrap()]).unwrap(),
+        resources: List::new(vec![ResourceGrant::Employee { id: EmployeeId([2; 16]) },
+            ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
+            ResourceGrant::Workspace { handle: Text::new("other".into()).unwrap() }]).unwrap(),
+        policy_revision: 1, gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX - 1,
+        nonce: [5; 32], jti: [6; 16],
+    }, Arc::new(TestLive))
+}
+
+struct Resolver;
+impl ResourceResolver for Resolver {
+    fn resolve(&self, context: &RequestContext, _: &tool_policy::ToolPolicy, _: &Value)
+        -> Result<Vec<ResourceGrant>, VerificationError> {
+        Ok(vec![ResourceGrant::Employee { id: context.record().employee },
+            ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() }])
+    }
+}
+fn authorized_call(context: &RequestContext) -> AuthorizedToolCall {
+    tool_policy::authorize(context, "codrive_run", &json!({}), &Resolver).unwrap()
+}
+fn bind_plan(call: &AuthorizedToolCall, policy: SpawnPolicy) -> AuthorizedExecutionPlan {
+    let directory = test_workspace();
+    let mut roots = crate::resources::ResourceRoots::default();
+    roots.insert("work".into(), call.context().record().employee, directory).unwrap();
+    AuthorizedExecutionPlan::new(roots.authorize_workspace(call, "work").unwrap(), policy).unwrap()
+}
+
+fn test_workspace() -> std::fs::File {
+    static DIRECTORY: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    std::fs::File::open(DIRECTORY.get_or_init(|| tempfile::tempdir().unwrap()).path()).unwrap()
+}
+
+#[derive(Default)]
+struct Backend {
+    reserved: AtomicUsize,
+    spawned: AtomicUsize,
+    killed: AtomicUsize,
+    waited: AtomicUsize,
+    fail_spawn: bool,
+    return_caller: bool,
+    wrong_workspace: bool,
+    legacy_only: bool,
+    collecting: bool,
+    io_attempts: AtomicUsize,
+    stop_bytes: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+    cancel_wait: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+impl ExecutionBackend for Backend {
+    fn supports_authorized_workspace(&self) -> bool { !self.legacy_only }
+    fn spawn_authorized(&self, policy: SpawnPolicy, authority: Arc<dyn ExecutionAuthority>) -> BackendFuture<'_, RunHandle> {
+        Box::pin(async move {
+            let wrong = tempfile::tempdir().unwrap();
+            let directory = if self.wrong_workspace { std::fs::File::open(wrong.path()).unwrap() } else { test_workspace() };
+            authority.verify_workspace(policy.workspace.workspace.as_str(), &directory)?;
+            authority.verify_live()?;
+            self.spawn(policy).await
+        })
+    }
+    fn reserve(&self, employee: EmployeeId) -> BackendFuture<'_, RunHandle> {
+        Box::pin(async move {
+            assert_eq!(employee, EmployeeId([2; 16]));
+            self.reserved.fetch_add(1, Ordering::SeqCst);
+            Ok(RunHandle(RunId([if self.return_caller { 3 } else { 9 }; 16])))
+        })
+    }
+    fn spawn(&self, policy: SpawnPolicy) -> BackendFuture<'_, RunHandle> {
+        Box::pin(async move {
+            self.spawned.fetch_add(1, Ordering::SeqCst);
+            if self.fail_spawn { Err(BackendError::Unavailable) } else { Ok(policy.run) }
+        })
+    }
+    fn wait(&self, _: RunHandle, _: WaitOrigin) -> BackendFuture<'_, RunOutcome> {
+        Box::pin(async move {
+            self.waited.fetch_add(1, Ordering::SeqCst);
+            if self.collecting { tokio::time::sleep(Duration::from_millis(300)).await; Ok(RunOutcome::Exited(0)) }
+            else { Err(BackendError::WouldDeadlock) }
+        })
+    }
+    fn kill(&self, run: RunHandle) -> BackendFuture<'_, ()> {
+        Box::pin(async move {
+            assert_eq!(run, RunHandle(RunId([9; 16])));
+            self.killed.fetch_add(1, Ordering::SeqCst); Ok(())
+        })
+    }
+    fn kill_authorized(&self, run: RunHandle, authority: Arc<dyn CancelAuthority>) -> BackendFuture<'_, ()> {
+        Box::pin(async move {
+            authority.verify_cancel(EmployeeId([2; 16]), run)?;
+            if let Some((started, release)) = &self.cancel_wait {
+                started.notify_one();
+                release.notified().await;
+            }
+            authority.verify_cancel(EmployeeId([2; 16]), run)?;
+            self.kill(run).await
+        })
+    }
+    fn take_stdio(&self, _: RunHandle) -> BackendFuture<'_, RunStdio> {
+        Box::pin(async move {
+            if !self.collecting { return Err(BackendError::Denied); }
+            if self.io_attempts.fetch_add(1, Ordering::SeqCst) < 2 { return Err(BackendError::Unavailable); }
+            let stdin: Box<dyn RunWriter> = match &self.stop_bytes {
+                Some(bytes) => Box::new(RecordingWriter(bytes.clone())), None => Box::new(EmptyWriter),
+            };
+            Ok(RunStdio { stdin, stdout: Box::new(EmptyInput), stderr: Box::new(EmptyInput) })
+        })
+    }
+    fn take_pty(&self, _: RunHandle) -> BackendFuture<'_, RunPty> {
+        Box::pin(async { Err(BackendError::Denied) })
+    }
+    fn resize(&self, _: RunHandle, _: PtySize) -> BackendFuture<'_, ()> {
+        Box::pin(async { Err(BackendError::Denied) })
+    }
+}
+
+struct EmptyInput;
+impl RunReader for EmptyInput {
+    fn read<'a>(&'a mut self, _: &'a mut [u8]) -> BackendFuture<'a, usize> { Box::pin(async { Ok(0) }) }
+}
+struct EmptyWriter;
+impl RunWriter for EmptyWriter {
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> BackendFuture<'a, usize> { Box::pin(async move { Ok(bytes.len()) }) }
+    fn close(&mut self) -> BackendFuture<'_, ()> { Box::pin(async { Ok(()) }) }
+}
+
+#[derive(Default)]
+struct Factory { refuse: bool, bad_employee: bool, collects: bool }
+impl ExecutionPlanFactory for Factory {
+    fn supports(&self, name: &str) -> bool { matches!(name, "codrive_run" | "skill_extract") }
+    fn collects_results(&self, _: &str) -> bool { self.collects }
+    fn decode_result(&self, _: &str, stdout: &[u8], stderr: &[u8], outcome: &RunOutcome) -> Result<Value, VerificationError> {
+        if !stdout.is_empty() || !stderr.is_empty() || *outcome != RunOutcome::Exited(0) { return Err(VerificationError::Invalid); }
+        Ok(json!({"status":"finished"}))
+    }
+    fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+        Box::pin(async move { if self.refuse { Err(VerificationError::Invalid) } else { Ok(()) } })
+    }
+    fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall,
+        reservation: RunHandle) -> PolicyFuture<'a, AuthorizedExecutionPlan> {
+        Box::pin(async move {
+            let mut plan = plan(call.context(), call.name(), reservation);
+            if self.bad_employee { plan.employee = EmployeeId([8; 16]); }
+            Ok(bind_plan(call, plan))
+        })
+    }
+}
+
+pub(crate) fn plan(context: &RequestContext, name: &str, run: RunHandle) -> SpawnPolicy {
+    SpawnPolicy {
+        workspace_delivery: None, run, class: if name == "skill_extract" { ExecutionClass::ParseWorker } else { ExecutionClass::EmployeeTool },
+        employee: context.record().employee, runtime: RuntimeKind::Registered(Text::new("tool-worker".into()).unwrap()),
+        argv_allowlist: vec![], environment_allowlist: BTreeMap::new(),
+        workspace: WorkspacePolicy { workspace: Text::new("work".into()).unwrap(), relative_cwd: Text::new(".".into()).unwrap() },
+        resources: ResourceLimits { memory_bytes: 1024, cpu_quota_percent: 100, tasks: 2, open_files: 32, ptys: 0,
+            disk: DiskQuota::LoopFilesystem { bytes: 1024, inodes: 32 }, io_read_bytes_per_sec: 1024,
+            io_write_bytes_per_sec: 1024, io_read_ops_per_sec: 10, io_write_ops_per_sec: 10,
+            output_buffer_bytes: 1024, output_total_bytes: 1024, memfd_total_bytes: 1024 },
+        network: NetworkPolicy::Offline, pty: false,
+        capabilities: CapabilityHandover { mcp_bridge: false, egress_forwarder: false },
+        timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 1000, pty_idle_ms: None, termination_grace_ms: 100 },
+        inputs: RunInputs { prompt: RunInput { reader: Box::new(EmptyInput), max_bytes: 1024 }, attachments: vec![] },
+    }
+}
+
+#[tokio::test]
+async fn isolated_execution_handler_refusal_precedes_reservation() {
+    let backend = Arc::new(Backend::default());
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory { refuse: true, ..Default::default() }), Arc::new(Resolver));
+    let result = bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await;
+    assert_eq!(result["isError"], true);
+    assert_eq!(backend.reserved.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn isolated_execution_bad_plan_cancels_without_spawn() {
+    let backend = Arc::new(Backend::default());
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory { bad_employee: true, ..Default::default() }), Arc::new(Resolver));
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn isolated_execution_spawn_failure_is_uncertain_and_cancelled() {
+    let backend = Arc::new(Backend { fail_spawn: true, ..Default::default() });
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
+    let result = bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await;
+    assert_eq!(result["execution_status"], "uncertain");
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn isolated_execution_returns_queued_handle_without_waiting() {
+    for tool in ["codrive_run"] {
+        let backend = Arc::new(Backend::default());
+        let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
+        let result = bridge.execute(&context(tool), tool, &json!({})).await;
+        assert_eq!(result["isError"], false);
+        let body: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["completion"], "pending");
+        assert_eq!(backend.spawned.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.waited.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn isolated_execution_never_cancels_a_forged_caller_reservation() {
+    let backend = Arc::new(Backend { return_caller: true, ..Default::default() });
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn isolated_execution_plan_requires_registered_runtime_workspace_and_class() {
+    let context = context("codrive_run");
+    let call = authorized_call(&context);
+    let run = RunHandle(RunId([9; 16]));
+    let mut authorized = bind_plan(&call, plan(&context, "codrive_run", run));
+    assert!(valid_plan(&call, Route::Execution, run, &authorized));
+    authorized.policy.runtime = RuntimeKind::Claude;
+    assert!(!valid_plan(&call, Route::Execution, run, &authorized));
+    authorized.policy = plan(&context, "codrive_run", run);
+    // Both workspaces are capability grants: only THIS call's work is valid.
+    authorized.policy.workspace.workspace = Text::new("other".into()).unwrap();
+    assert!(!valid_plan(&call, Route::Execution, run, &authorized));
+    authorized.policy = plan(&context, "codrive_run", run);
+    authorized.policy.workspace.relative_cwd = Text::new("../other".into()).unwrap();
+    assert!(!valid_plan(&call, Route::Execution, run, &authorized));
+    authorized.policy = plan(&context, "codrive_run", run);
+    assert!(!valid_plan(&call, Route::Worker, run, &authorized));
+    authorized.policy = plan(&context, "skill_extract", run);
+    authorized.policy.network = NetworkPolicy::Egress(duduclaw_isolation::egress::ProfileId(Sha256Digest([0; 32])));
+    assert!(!valid_plan(&call, Route::Worker, run, &authorized));
+    let bridge = ExecutionToolBridge::new(Arc::new(Backend::default()), Arc::new(Factory::default()), Arc::new(Resolver));
+    for name in ["memory_search", "unknown", "codrive_run_extra", "skill_extract"] { assert!(!bridge.supports(name)); }
+}
+
+#[test]
+fn isolated_execution_plan_cannot_be_built_from_another_selected_workspace() {
+    let context = context("codrive_run");
+    let call = authorized_call(&context);
+    let directory = tempfile::tempdir().unwrap();
+    let mut roots = crate::resources::ResourceRoots::default();
+    roots.insert("other".into(), context.record().employee, std::fs::File::open(directory.path()).unwrap()).unwrap();
+    assert!(roots.authorize_workspace(&call, "other").is_err());
+    let mut policy = plan(&context, "codrive_run", RunHandle(RunId([9; 16])));
+    policy.workspace.workspace = Text::new("other".into()).unwrap();
+    roots.insert("work".into(), context.record().employee, std::fs::File::open(directory.path()).unwrap()).unwrap();
+    assert!(AuthorizedExecutionPlan::new(roots.authorize_workspace(&call, "work").unwrap(), policy).is_err());
+}
+
+struct PendingFactory { preparing: tokio::sync::Notify }
+impl ExecutionPlanFactory for PendingFactory {
+    fn supports(&self, name: &str) -> bool { name == "codrive_run" }
+    fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall,
+        _: RunHandle) -> PolicyFuture<'a, AuthorizedExecutionPlan> {
+        Box::pin(async move { self.preparing.notify_one(); std::future::pending().await })
+    }
+}
+
+#[tokio::test]
+async fn isolated_execution_aborted_preparation_cancels_reserved_run() {
+    let backend = Arc::new(Backend::default());
+    let factory = Arc::new(PendingFactory { preparing: tokio::sync::Notify::new() });
+    let bridge = ExecutionToolBridge::new(backend.clone(), factory.clone(), Arc::new(Resolver));
+    let task = tokio::spawn(async move { bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await });
+    factory.preparing.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while backend.killed.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+}
+
+struct ChangingResolver { calls: AtomicUsize, refuse: bool }
+impl ResourceResolver for ChangingResolver {
+    fn resolve(&self, context: &RequestContext, _: &tool_policy::ToolPolicy, _: &Value)
+        -> Result<Vec<ResourceGrant>, VerificationError> {
+        if self.refuse { return Err(VerificationError::Unavailable); }
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![ResourceGrant::Employee { id: context.record().employee },
+            ResourceGrant::Workspace { handle: Text::new(if call == 0 { "work" } else { "other" }.into()).unwrap() }])
+    }
+}
+
+#[tokio::test]
+async fn isolated_execution_resource_refusal_precedes_reservation() {
+    let backend = Arc::new(Backend::default());
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()),
+        Arc::new(ChangingResolver { calls: AtomicUsize::new(0), refuse: true }));
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
+    assert_eq!(backend.reserved.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn isolated_execution_resource_change_after_prepare_cancels_before_spawn() {
+    let backend = Arc::new(Backend::default());
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()),
+        Arc::new(ChangingResolver { calls: AtomicUsize::new(0), refuse: false }));
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
+    assert_eq!(backend.reserved.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn legacy_backend_is_not_ready_and_never_receives_a_protected_spawn() {
+    let backend = Arc::new(Backend { legacy_only: true, ..Default::default() });
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
+    assert!(!bridge.supports("codrive_run"));
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
+    assert_eq!(backend.reserved.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn backend_cannot_substitute_a_same_named_different_workspace_root() {
+    let backend = Arc::new(Backend { wrong_workspace: true, ..Default::default() });
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn execution_resource_rechecks_run_off_reactor_and_refuse_revocation() {
+    struct ThreadCheckedResolver {
+        reactor: std::thread::ThreadId,
+        calls: AtomicUsize,
+        revoke_on_recheck: bool,
+    }
+    impl ResourceResolver for ThreadCheckedResolver {
+        fn resolve(&self, context: &RequestContext, policy: &tool_policy::ToolPolicy, arguments: &Value)
+            -> Result<Vec<ResourceGrant>, VerificationError> {
+            assert_ne!(std::thread::current().id(), self.reactor);
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.revoke_on_recheck && count > 0 { return Err(VerificationError::Revoked); }
+            Resolver.resolve(context, policy, arguments)
+        }
+    }
+    for revoke_on_recheck in [false, true] {
+        let backend = Arc::new(Backend::default());
+        let resolver = Arc::new(ThreadCheckedResolver { reactor: std::thread::current().id(),
+            calls: AtomicUsize::new(0), revoke_on_recheck });
+        let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), resolver.clone());
+        let result = bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), if revoke_on_recheck { 2 } else { 3 });
+        assert_eq!(result["isError"], revoke_on_recheck);
+        assert_eq!(backend.spawned.load(Ordering::SeqCst), usize::from(!revoke_on_recheck));
+        assert_eq!(backend.killed.load(Ordering::SeqCst), usize::from(revoke_on_recheck));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn execution_resource_change_during_final_handler_check_cancels_before_spawn() {
+    use std::sync::atomic::AtomicBool;
+    struct FinalCheckFactory { checks: AtomicUsize, changed: Arc<AtomicBool> }
+    impl ExecutionPlanFactory for FinalCheckFactory {
+        fn supports(&self, name: &str) -> bool { name == "codrive_run" }
+        fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+            Box::pin(async move {
+                if self.checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                    tokio::task::yield_now().await;
+                    self.changed.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            })
+        }
+        fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall, reservation: RunHandle)
+            -> PolicyFuture<'a, AuthorizedExecutionPlan> {
+            Box::pin(async move { Ok(bind_plan(call, plan(call.context(), call.name(), reservation))) })
+        }
+    }
+    struct FinalCheckResolver { changed: Arc<AtomicBool>, calls: AtomicUsize }
+    impl ResourceResolver for FinalCheckResolver {
+        fn resolve(&self, context: &RequestContext, policy: &tool_policy::ToolPolicy, arguments: &Value)
+            -> Result<Vec<ResourceGrant>, VerificationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut resources = Resolver.resolve(context, policy, arguments)?;
+            if self.changed.load(Ordering::SeqCst) {
+                // The selected workspace is still present; changing any part of
+                // the call's authorized resource set must invalidate its token.
+                resources.push(ResourceGrant::Workspace { handle: Text::new("other".into()).unwrap() });
+            }
+            Ok(resources)
+        }
+    }
+    let changed = Arc::new(AtomicBool::new(false));
+    let backend = Arc::new(Backend::default());
+    let factory = Arc::new(FinalCheckFactory { checks: AtomicUsize::new(0), changed: changed.clone() });
+    let resolver = Arc::new(FinalCheckResolver { changed, calls: AtomicUsize::new(0) });
+    let bridge = ExecutionToolBridge::new(backend.clone(), factory.clone(), resolver.clone());
+    let result = bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await;
+    assert_eq!(result["isError"], true);
+    assert_eq!(factory.checks.load(Ordering::SeqCst), 2);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(backend.reserved.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "binding-store")]
+#[tokio::test]
+async fn isolated_execution_collector_retries_queued_io_without_cancelling() {
+    use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
+    let home = tempfile::tempdir().unwrap();
+    let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
+    let backend = Arc::new(Backend { collecting: true, ..Default::default() });
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver))
+        .with_jobs(jobs.clone());
+    let owner = context("codrive_run");
+    let result = bridge.execute(&owner, "codrive_run", &json!({})).await;
+    assert_eq!(result["isError"], false);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let state = jobs.read(&owner, "codrive_run", RunHandle(RunId([9; 16]))).unwrap();
+            if state["status"] == "complete" { assert_eq!(state["result"]["status"], "finished"); break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(backend.io_attempts.load(Ordering::SeqCst) >= 3);
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "binding-store")]
+#[tokio::test]
+async fn isolated_execution_failed_spawn_persists_uncertainty_and_job_selector() {
+    use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
+    let home = tempfile::tempdir().unwrap();
+    let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
+    let backend = Arc::new(Backend { fail_spawn: true, ..Default::default() });
+    let bridge = ExecutionToolBridge::new(backend, Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver))
+        .with_jobs(jobs.clone());
+    let owner = context("codrive_run");
+    let result = bridge.execute(&owner, "codrive_run", &json!({})).await;
+    assert_eq!(result["execution_status"], "uncertain");
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("09090909"));
+    assert_eq!(jobs.read(&owner, "codrive_run", RunHandle(RunId([9; 16]))).unwrap()["status"], "uncertain");
+}
+
+#[cfg(feature = "binding-store")]
+#[tokio::test]
+async fn isolated_execution_aborted_insert_cannot_leave_a_pending_record() {
+    use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
+    struct BlockingJobs {
+        store: Arc<SqliteExecutionJobs>, started: tokio::sync::Notify,
+        release: (std::sync::Mutex<bool>, std::sync::Condvar),
+    }
+    impl ExecutionJobs for BlockingJobs {
+        fn insert(&self, context: &RequestContext, tool: &str, run: RunHandle) -> Result<(), VerificationError> {
+            self.started.notify_one();
+            let (lock, ready) = &self.release;
+            let mut release = lock.lock().unwrap();
+            while !*release { release = ready.wait(release).unwrap(); }
+            self.store.insert(context, tool, run)
+        }
+        fn read(&self, context: &RequestContext, tool: &str, run: RunHandle) -> Result<Value, VerificationError> {
+            self.store.read(context, tool, run)
+        }
+        fn finish(&self, run: RunHandle, result: Value) -> Result<(), VerificationError> { self.store.finish(run, result) }
+        fn cancel_requested(&self, context: &RequestContext, tool: &str, run: RunHandle) -> Result<(), VerificationError> {
+            self.store.cancel_requested(context, tool, run)
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let jobs = Arc::new(BlockingJobs { store: SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap(),
+        started: tokio::sync::Notify::new(), release: (std::sync::Mutex::new(false), std::sync::Condvar::new()) });
+    let backend = Arc::new(Backend::default());
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver))
+        .with_jobs(jobs.clone());
+    let request = tokio::spawn(async move { bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await });
+    jobs.started.notified().await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    *jobs.release.0.lock().unwrap() = true;
+    jobs.release.1.notify_all();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if jobs.read(&context("codrive_run"), "codrive_run", RunHandle(RunId([9; 16])))
+                .is_ok_and(|result| result["status"] == "uncertain") { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
+}
+
+/// HX6: the browser recording left the child-run path. Even a factory that
+/// would plan it as a child run never gets a reservation, spawn or kill: the
+/// tools are `Route::InRunHelper` and need the `(run, call)` recording store.
+struct LegacyRecordingFactory;
+impl ExecutionPlanFactory for LegacyRecordingFactory {
+    fn supports(&self, name: &str) -> bool { matches!(name, "browser_record_start" | "browser_record_stop") }
+    fn collects_results(&self, _: &str) -> bool { true }
+    fn cooperative_stop(&self, name: &str) -> bool { name == "browser_record_start" }
+    fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall, run: RunHandle) -> PolicyFuture<'a, AuthorizedExecutionPlan> {
+        Box::pin(async move { Ok(bind_plan(call, plan(call.context(), call.name(), run))) })
+    }
+}
+
+#[cfg(feature = "binding-store")]
+#[tokio::test]
+async fn hx6_recording_never_uses_the_child_run_path() {
+    use crate::execution_jobs::SqliteExecutionJobs;
+    let home = tempfile::tempdir().unwrap();
+    let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
+    let backend = Arc::new(Backend { collecting: true, ..Default::default() });
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(LegacyRecordingFactory), Arc::new(Resolver)).with_jobs(jobs);
+    for (tool, args) in [("browser_record_start", json!({})), ("browser_record_stop", json!({"id":"09".repeat(16)})),
+        ("browser_record_start", json!({"action":"cancel","job":"09".repeat(16)}))] {
+        assert_eq!(bridge.execute(&context(tool), tool, &args).await["isError"], true, "{tool}");
+    }
+    assert!(execution_route("browser_record_start").is_none() && execution_route("browser_record_stop").is_none());
+    assert_eq!((backend.reserved.load(Ordering::SeqCst), backend.spawned.load(Ordering::SeqCst),
+        backend.killed.load(Ordering::SeqCst)), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn isolated_recording_stop_writer_handles_partial_writes_and_refuses_zero_progress() {
+    struct Writer { bytes: Vec<u8>, zero: bool, closed: bool }
+    impl RunWriter for Writer {
+        fn write<'a>(&'a mut self, bytes: &'a [u8]) -> BackendFuture<'a, usize> {
+            Box::pin(async move { if self.zero { return Ok(0); } self.bytes.push(bytes[0]); Ok(1) })
+        }
+        fn close(&mut self) -> BackendFuture<'_, ()> { Box::pin(async move { self.closed = true; Ok(()) }) }
+    }
+    let mut good = Writer { bytes: vec![], zero: false, closed: false };
+    write_stop(&mut good).await.unwrap();
+    assert_eq!(good.bytes, b"stop\n"); assert!(good.closed);
+    let mut stalled = Writer { bytes: vec![], zero: true, closed: false };
+    assert!(write_stop(&mut stalled).await.is_err()); assert!(!stalled.closed);
+}
+
+struct RecordingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+impl RunWriter for RecordingWriter {
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> BackendFuture<'a, usize> {
+        Box::pin(async move { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) })
+    }
+    fn close(&mut self) -> BackendFuture<'_, ()> { Box::pin(async { Ok(()) }) }
+}
+
+
+#[cfg(feature = "binding-store")]
+#[tokio::test]
+async fn isolated_execution_cancel_rechecks_live_authority_after_backend_wait() {
+    use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
+    struct Live(Arc<AtomicBool>);
+    impl duduclaw_isolation::capability::LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
+            if self.0.load(Ordering::SeqCst) { Ok(()) } else { Err(VerificationError::Revoked) }
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let backend = Arc::new(Backend { cancel_wait: Some((started.clone(), release.clone())), ..Default::default() });
+    let bridge = Arc::new(ExecutionToolBridge::new(backend.clone(),
+        Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver)).with_jobs(jobs.clone()));
+    let live = Arc::new(AtomicBool::new(true));
+    let owner = RequestContext::with_live_verifier(context("codrive_run").record().clone(), Arc::new(Live(live.clone())));
+    let run = RunHandle(RunId([9; 16]));
+    jobs.insert(&owner, "codrive_run", run).unwrap();
+    let caller = owner.clone();
+    let request = tokio::spawn(async move {
+        bridge.execute(&caller, "codrive_run", &json!({"action":"cancel", "job":"09".repeat(16)})).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified()).await.unwrap();
+    live.store(false, Ordering::SeqCst);
+    release.notify_one();
+    assert_eq!(request.await.unwrap()["isError"], true);
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
+    assert_eq!(jobs.read(&owner, "codrive_run", run).unwrap()["status"], "pending");
+}
+
+#[test]
+fn isolated_execution_cancel_authority_binds_target_and_employee() {
+    let run = RunHandle(RunId([9; 16]));
+    let authority = JobCancelAuthority { context: context("codrive_run"), run };
+    assert!(authority.verify_cancel(EmployeeId([2; 16]), run).is_ok());
+    assert!(authority.verify_cancel(EmployeeId([8; 16]), run).is_err());
+    assert!(authority.verify_cancel(EmployeeId([2; 16]), RunHandle(RunId([8; 16]))).is_err());
+}

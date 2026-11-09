@@ -117,6 +117,8 @@ pub static OPERATOR_CLI_KINDS: &[&KindSpec] = &[
     &crate::memory_forget_approval::SPEC,
     &crate::computer_workspaces::cli_approval::SPEC,
     &PUBLISHERS_SPEC,
+    &crate::isolation_background::APPROVAL_SPEC,
+    &crate::skill_lifecycle::isolated::SPEC,
 ];
 
 /// Trust-store changes can only be decided by a current dashboard Admin.

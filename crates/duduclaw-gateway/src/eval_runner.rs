@@ -127,7 +127,7 @@ impl EvalRunner {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let output = tokio::time::timeout(self.timeout, cmd.output())
+        let output = tokio::time::timeout(self.timeout, duduclaw_core::execution_gate::output(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::Judge))
             .await
             .map_err(|_| {
                 anyhow::anyhow!(

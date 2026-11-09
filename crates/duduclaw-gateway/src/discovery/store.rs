@@ -132,6 +132,8 @@ fn validate_private_files(path: &Path) -> Result<(), StoreError> {
 pub(crate) mod budget_ledger;
 #[path = "store_requests.rs"]
 mod requests;
+#[path = "store_isolated_creators.rs"]
+mod isolated_creators;
 
 const SCHEMA: &str = "PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=5000;
@@ -231,6 +233,15 @@ CREATE TABLE IF NOT EXISTS discovery_requests (
     frozen_json TEXT NOT NULL
 );
 
+-- FD-SEL: the exact (employee id, incarnation) a protected employee filed a
+-- request as. Written once before the task row; never rebound.
+CREATE TABLE IF NOT EXISTS discovery_isolated_creators (
+    task_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE,
+    employee TEXT NOT NULL,
+    incarnation INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS discovery_run_budget (
     run_id TEXT PRIMARY KEY REFERENCES discovery_runs(run_id),
     sequence INTEGER NOT NULL,
@@ -251,6 +262,7 @@ CREATE TABLE IF NOT EXISTS discovery_artifacts (
 /// the online orchestrator) lives here rather than in the CREATE so the
 /// migration path is exercised from the first release; later packages append.
 const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("discovery_artifacts", "manifest_json", "manifest_json TEXT"),
     ("discovery_nodes", "isolation_backend", "isolation_backend TEXT"),
     ("discovery_nodes", "usd_source", "usd_source TEXT NOT NULL DEFAULT 'unknown'"),
     ("discovery_nodes", "unknown_calls", "unknown_calls INTEGER NOT NULL DEFAULT 0"),

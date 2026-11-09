@@ -427,7 +427,7 @@ async fn remove_legacy_data_file_guard_script(agent_dir: &Path) {
 /// own [`DATA_FILE_HOOK_ID`], so the two entries coexist and each upgrades
 /// independently. Since H10 both point at the same `duduclaw` binary — the
 /// difference is only which subcommand runs.
-fn merge_data_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
+pub(crate) fn merge_data_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
     let Some(arr) = pre_tool_use_array(root) else {
         return false;
     };
@@ -455,7 +455,7 @@ fn merge_data_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
     true
 }
 
-fn merge_egress_guard_hook(root: &mut Value, bin: &Path, agent: &str, home: Option<&Path>) -> bool {
+pub(crate) fn merge_egress_guard_hook(root: &mut Value, bin: &Path, agent: &str, home: Option<&Path>) -> bool {
     let command = build_named_hook_command(bin, EGRESS_HOOK_ID, agent, home);
     let desired = json!({
         HOOK_TAG: EGRESS_HOOK_ID,
@@ -508,7 +508,7 @@ fn pre_tool_use_array(root: &mut Value) -> Option<&mut Vec<Value>> {
 /// it against `desired_entry` for byte-for-byte equality. An old-format
 /// command never equals the new `--agent`-suffixed one, so the existing
 /// "found but different → overwrite in place" branch upgrades it for free.
-fn merge_agent_file_guard_hook(
+pub(crate) fn merge_agent_file_guard_hook(
     root: &mut Value,
     duduclaw_bin: &Path,
     agent_id: &str,

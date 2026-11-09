@@ -425,7 +425,7 @@ fn scripted_policy_with_illegal_batch_fails_evaluation() {
 #[test]
 #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn store_open_is_idempotent_and_round_trips_a_world() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::discovery::private_test_home();
     drop(DiscoveryStore::open(dir.path()).unwrap());
     let store = DiscoveryStore::open(dir.path()).unwrap();
     assert!(store.db_path().ends_with("discovery.db"));

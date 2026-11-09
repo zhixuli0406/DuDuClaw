@@ -14,6 +14,7 @@ import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
 import { AppRouteRedirect, LegacyRouteRedirect } from './apps/AppRouteRedirect';
 import { useIsAppliance } from './hooks/useIsAppliance';
+import { BreakGlassPromptHost } from './components/step-up/BreakGlassPromptHost';
 
 // Code-splitting: every authenticated page is lazy-loaded so heavy, page-only
 // dependencies (d3 for WikiGraph/OrgChart, large forms) land in their own route
@@ -116,8 +117,14 @@ const DevicePage = lazyPage(() => import('./pages/DevicePage'), 'DevicePage');
 // WP9 (2026-08-04 IA rework): full conversation history + the two management
 // surfaces lifted out of billing / settings + the 進階設定 index.
 const ConversationsPage = lazyPage(() => import('./pages/ConversationsPage'), 'ConversationsPage');
+const MigrationConfirmationsPage = lazyPage(() => import('./pages/MigrationConfirmationsPage'), 'MigrationConfirmationsPage');
+// v1.81 F5 part A: 設定 › 受保護模式 (admin page; part B adds the 我的帳號 tab).
+const ProtectedModePage = lazyPage(() => import('./pages/protected/ProtectedModePage'), 'ProtectedModePage');
 const SystemUpdatePage = lazyPage(() => import('./pages/SystemUpdatePage'), 'SystemUpdatePage');
 const ManageAdvancedPage = lazyPage(() => import('./pages/ManageAdvancedPage'), 'ManageAdvancedPage');
+// v1.81 F5/F6e-UI (part B): Admin restore / adoption / purge of tombstoned
+// protected employees. Linked from the protected-mode admin page.
+const AdminRestorePage = lazyPage(() => import('./pages/protected/restore/AdminRestorePage'), 'AdminRestorePage');
 
 /** Lightweight route-transition fallback while a lazy page chunk loads. */
 function PageFallback() {
@@ -200,6 +207,8 @@ export function App() {
           approve/deny called `browser.respond_approval`, which no gateway
           ever served, and nothing emits `browser.approval_request` either.
           Approvals live in the inbox (ApprovalBroker → approvals.decide). */}
+      {/* v1.81 P1 break-glass: one shared 需要再驗證身分 prompt (lib/break-glass). */}
+      {isAuthenticated && <BreakGlassPromptHost />}
       <Suspense fallback={<PageFallback />}>
         <Routes>
           <Route path="login" element={<LoginPage />} />
@@ -334,6 +343,8 @@ export function App() {
                   <Route index element={<SystemHomePage />} />
                   <Route path="device" element={<DevicePage />} />
                   <Route path="updates" element={<SystemUpdatePage />} />
+                  <Route path="migration" element={<MigrationConfirmationsPage />} />
+                  <Route path="protected" element={<ProtectedModePage />} />
                   <Route path="accounts" element={<AccountsPage />} />
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="causal" element={<CausalCurationPage />} />
@@ -342,6 +353,8 @@ export function App() {
                   <Route path="settings" element={<SettingsPage />} />
                   <Route path="settings/advanced" element={<SettingsPage />} />
                   <Route path="settings/company" element={<SettingsPage />} />
+                  {/* v1.81 F5/F6e-UI (part B) */}
+                  <Route path="protected/restore" element={<AdminRestorePage />} />
                 </Route>
                 <Route element={<RoleGuard minRole="manager" />}>
                   <Route path="license" element={<LicenseShell />} />

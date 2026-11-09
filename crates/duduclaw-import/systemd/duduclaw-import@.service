@@ -1,0 +1,44 @@
+# Reference profile for import_launcher.rs, which creates a transient service
+# per source and verifies these properties before SCM_RIGHTS source delivery.
+# This template is not installed; the launcher adds --handoff with its private
+# random /run socket and collects bounded output through that socket.
+[Unit]
+Description=DuDuClaw legacy content import worker
+[Service]
+Type=exec
+DynamicUser=yes
+User=duduclaw-import
+ExecStart=/usr/lib/duduclaw/current/duduclaw-import
+PrivateNetwork=yes
+IPAddressDeny=any
+PrivateTmp=yes
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=600M,nr_inodes=128
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=/var/lib/duduclaw /var/lib/duduclaw-migrate
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=read write readv writev pread64 pwrite64 ftruncate getcwd readlink readlinkat access faccessat faccessat2 close close_range fstat newfstatat statx lseek mmap mprotect munmap mremap brk madvise rt_sigaction rt_sigprocmask rt_sigreturn sigaltstack ioctl fcntl flock fsync fdatasync openat unlinkat unlink mkdir mkdirat rmdir getdents64 fchmod getrandom clock_gettime futex getpid gettid getuid geteuid getgid getegid prctl prlimit64 sched_getaffinity set_robust_list rseq arch_prctl set_tid_address execve exit exit_group socket connect getsockopt setsockopt recvmsg sendmsg recvfrom sendto shutdown poll ppoll
+SystemCallErrorNumber=EPERM
+# tmpfs main+WAL copies count against this cgroup, in addition to the parser heap.
+MemoryMax=1G
+TasksMax=1
+RuntimeMaxSec=60
+LimitFSIZE=268435456
+LimitNOFILE=32
+LimitCORE=0
+UMask=0077
+# Output travels over the authenticated root handoff socket, never the journal.
+StandardOutput=null
+StandardError=null

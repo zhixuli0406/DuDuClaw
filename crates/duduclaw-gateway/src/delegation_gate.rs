@@ -360,11 +360,20 @@ pub(crate) async fn gate_bus_dispatch(
     if acp_trusted_from_table(&config_table) {
         extra_senders.push(duduclaw_core::ACP_CLIENT_SENDER);
     }
+    // H13b: the only self-delegation that is not refused — a protected
+    // `spawn_ephemeral` child, released from `isolation-ephemeral-jobs.db`,
+    // whose employee id + incarnation equal the live ones. It replaces only
+    // the org-tree predicate; the person check below still applies. Boxed:
+    // the queue poll futures have a stack budget (`dispatcher_stack_tests`).
+    let ephemeral_child = !background_system && sender.trim() == target.trim()
+        && Box::pin(crate::isolation_ephemeral_start::self_delegation_allowed(
+            home_dir, task_id, target.trim(), on_behalf_of)).await;
     let guard = registry.read().await;
     let view = DispatchOrgView::new(home_dir, Some(&guard));
     let sender_id = view.canonical_id(sender);
     let target_id = view.canonical_id(target);
-    let decision = can_delegate_rules_ext(&rules, &view, &sender_id, &target_id, &extra_senders)
+    let decision = (if ephemeral_child && sender_id == target_id { Ok(()) }
+        else { can_delegate_rules_ext(&rules, &view, &sender_id, &target_id, &extra_senders) })
         .and_then(|()| {
             // The employee tree allowed it; in enforce mode the person the
             // work is for must be allowed too. System and gateway-internal

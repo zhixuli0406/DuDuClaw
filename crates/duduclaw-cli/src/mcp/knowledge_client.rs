@@ -74,7 +74,7 @@ pub(crate) fn available_for(home: &Path, agent_id: &str) -> bool {
 }
 
 fn turn_id() -> Option<String> {
-    std::env::var(duduclaw_core::ENV_TRUST_TURN_ID)
+    crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_TURN_ID)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control))
@@ -83,7 +83,7 @@ fn turn_id() -> Option<String> {
 /// The `DUDUCLAW_DISPATCH_RUN_ID` of this MCP process (cron and dispatched
 /// runs), sent so the gateway can treat the call as a system turn.
 fn run_id() -> Option<String> {
-    std::env::var(duduclaw_core::ENV_DISPATCH_RUN_ID)
+    crate::mcp_isolation_identity::var(duduclaw_core::ENV_DISPATCH_RUN_ID)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control))
@@ -209,7 +209,7 @@ fn interpret(status: u16, body: &[u8]) -> Result<Value, String> {
 
 async fn post(home: &Path, agent_id: &str, body: &Value) -> Result<Value, String> {
     let env = |name: &str| {
-        std::env::var(name)
+        crate::mcp_isolation_identity::var(name)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
@@ -463,6 +463,10 @@ pub(crate) async fn handle_knowledge_tool(
     home: &Path,
     agent_id: &str,
 ) -> Value {
+    if crate::mcp_isolation::current().is_some() && tool == "knowledge_add_source"
+        && args.get("path").is_some_and(|v| !v.is_null()) {
+        return error("隔離執行目前僅接受文字或網址提案，請改以其中一種方式提交。");
+    }
     if !available_for(home, agent_id) {
         return error(
             "這位 AI 員工目前沒有可用的文件知識庫：還沒有集合授權給它或它的部門，或知識庫已由管理員關閉。",

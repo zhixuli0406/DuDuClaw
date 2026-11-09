@@ -37,6 +37,50 @@ pub(super) fn enroll(db: &UserDb, id: &str) -> (String, Vec<String>) {
     (secret, codes)
 }
 #[test]
+fn migration_step_up_binds_session_epoch_and_expires() {
+    let (dir, db, id) = setup();
+    let (secret, _) = enroll(&db, &id);
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    let code = hotp(&decode_secret(&secret).unwrap(), 101, 6);
+    assert!(db.migration_step_up(&id, "session-a", epoch, "wrong", &code, &Cipher, 3030).is_err());
+    let proof = db.migration_step_up(&id, "session-a", epoch, "password-test", &code, &Cipher, 3030).unwrap();
+    let reopened = UserDb::new(&dir.path().join("users.db")).unwrap();
+    assert_eq!(reopened.migration_confirmation_session(&id, "session-a", epoch, 3031).unwrap().unwrap().csrf, proof.csrf);
+    assert!(db.migration_confirmation_session(&id, "session-b", epoch, 3031).unwrap().is_none());
+    assert!(db.migration_confirmation_session(&id, "session-a", epoch, 3331).unwrap().is_none());
+    assert!(db.migration_confirmation_session(&id, "session-a", epoch, 3029).unwrap().is_none());
+    assert!(db.migration_step_up(&id, "session-b", epoch, "password-test", &code, &Cipher, 3030).is_err());
+    db.mfa_operator_reset("mfa@example.com").unwrap();
+    assert!(db.migration_confirmation_session(&id, "session-a", epoch, 3031).is_err());
+}
+
+#[test]
+fn migration_step_up_denies_unenrolled_and_demoted_admin() {
+    let (_dir, db, id) = setup();
+    assert!(db.migration_step_up(&id, "session", 0, "password-test", "000000", &Cipher, 3030).is_err());
+    let (secret, _) = enroll(&db, &id);
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    let code = hotp(&decode_secret(&secret).unwrap(), 101, 6);
+    db.migration_step_up(&id, "session", epoch, "password-test", &code, &Cipher, 3030).unwrap();
+    db.conn().execute("UPDATE users SET role='employee' WHERE id=?1", [&id]).unwrap();
+    assert!(db.migration_confirmation_session(&id, "session", epoch, 3031).is_err());
+}
+
+#[test]
+fn migration_step_up_password_attempt_limit_survives_reopen() {
+    let (dir, db, id) = setup();
+    let (secret, _) = enroll(&db, &id);
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    let code = hotp(&decode_secret(&secret).unwrap(), 101, 6);
+    for _ in 0..5 {
+        assert!(db.migration_step_up(&id, "session", epoch, "wrong", &code, &Cipher, 3030).is_err());
+    }
+    let reopened = UserDb::new(&dir.path().join("users.db")).unwrap();
+    assert!(reopened.migration_step_up(&id, "session", epoch, "password-test", &code, &Cipher, 3031).is_err());
+    let next = hotp(&decode_secret(&secret).unwrap(), 103, 6);
+    assert!(reopened.migration_step_up(&id, "session", epoch, "password-test", &next, &Cipher, 3091).is_ok());
+}
+#[test]
 fn rfc6238_sha1_vectors_and_six_digit_truncation() {
     for (time, expected) in [
         (59, "94287082"),

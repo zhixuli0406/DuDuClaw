@@ -6,6 +6,8 @@
 //! | `google.delegation.import_key {key_json}` | Admin | validate + seal a service-account key with the protected key |
 //! | `google.delegation.remove_key {confirm}` | Admin | delete the sealed key |
 //! | `google.delegation.settings_set {allowed_subject_domains?, default_identity?}` | Admin | `[integrations.google_identity]` |
+//! | `google.delegation.tenant_settings_set {service_mailboxes, tenant_scopes, csrf_token}` | Admin + step-up | protected-mode tenant-source subjects/scopes (`google_tenant_settings_rpc.rs`) |
+//! | `google.delegation.attest_subject {agent_id, subject, user_id, acknowledge_self_set?, csrf_token}` / `google.delegation.revoke_attestation {agent_id, csrf_token}` | Admin + step-up | SR4: protected-mode attestation that a Shared employee's delegate subject is the listed person (`google_delegate_attestation_rpc.rs`) |
 //! | `agents.google_identity_get {agent_id}` | Viewer of the employee | the identity in effect and whether it can be used now |
 //! | `agents.google_identity_set {agent_id, identity, fallback?, requesters?}` | Admin | write `[google]` (B2a: `home`, `none`, `delegate:<email>`) |
 //! | `google.identity.test {agent_id}` | Admin | mint for the subject and read one profile; sends nothing |
@@ -37,7 +39,10 @@ fn sec_audit(home: &Path, event: &str, severity: Severity, ctx: &UserContext, de
 
 /// The identity of one employee as the dashboard shows it, plus whether it
 /// can be used right now (local checks only — no network, no unsealing).
-fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People) -> Value {
+///
+/// `include_holder`: attach the tenant-subject holder (another account's name
+/// and creation time) — Admin path only (`google.delegation.get`).
+fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People, include_holder: bool) -> Value {
     let section = gi::read_agent_section(home, agent);
     let eff = gi::combine(&section, &gi::read_home_config(home));
     let (state, message) = match &eff.effective {
@@ -105,6 +110,14 @@ fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People) 
         "requesters": eff.requesters.as_str(),
         "state": state,
         "message": message,
+        // SR4 items 1 / 2(iv): in protected mode, where the D-5 subject rule
+        // applies, the subject's standing (attestation required, a staff
+        // account claiming a service mailbox, …). `null` elsewhere.
+        "tenant_subject": if crate::runtime_readiness::is_protected_linux() {
+            crate::google_identity::tenant_source::subject_notice(home, agent, people.user_db(), include_holder)
+        } else {
+            Value::Null
+        },
     })
 }
 
@@ -151,7 +164,7 @@ impl MethodHandler {
             names.sort();
             names
                 .iter()
-                .map(|n| identity_view(&home, n, people.as_ref()))
+                .map(|n| identity_view(&home, n, people.as_ref(), true))
                 .collect()
         };
         WsFrame::ok_response(
@@ -165,10 +178,21 @@ impl MethodHandler {
                         "default_identity": c.default_identity.to_config_value(),
                         "allowed_subject_domains": c.allowed_subject_domains,
                         "allowed_domains": c.allowed_domains,
+                        "service_mailboxes": c.service_mailboxes,
+                        "tenant_scopes": c.tenant_scopes,
                     }),
                     Err(_) => Value::Null,
                 },
                 "settings_error": home_cfg.err(),
+                // v1.81 F5 (UI-RPC): the protected-mode tenant sources — state
+                // and key fingerprint only, never key material. The editable
+                // `service_mailboxes` / `tenant_scopes` are under `settings`;
+                // `tenant_settings_limits` bounds `google.delegation.tenant_settings_set`.
+                "tenant_source": crate::google_identity::tenant_source::dashboard_view(&home),
+                "tenant_settings_limits": {
+                    "max_service_mailboxes": super::google_tenant_settings_rpc::MAX_SERVICE_MAILBOXES,
+                    "max_tenant_scopes": super::google_tenant_settings_rpc::MAX_TENANT_SCOPES,
+                },
                 "home_subject": crate::google_identity::home_subject(&home),
                 "required_scopes": crate::google_workspace::REQUIRED_SCOPES,
                 "admin_console_path": ADMIN_CONSOLE_PATH,
@@ -316,6 +340,13 @@ impl MethodHandler {
             Some(_) => return WsFrame::error_response("", "allowed_domains 必須是字串陣列"),
         };
         if !personal_domains.is_empty() { section.insert("allowed_domains".into(), toml::Value::Array(personal_domains.iter().cloned().map(toml::Value::String).collect())); }
+        // v1.81 E4: protected-mode tenant-source settings are not edited here;
+        // keep them exactly as they are instead of dropping them on rewrite.
+        for (key, values) in [("service_mailboxes", &current.service_mailboxes), ("tenant_scopes", &current.tenant_scopes)] {
+            if !values.is_empty() {
+                section.insert(key.into(), toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect()));
+            }
+        }
         let config_path = self.home_dir.join("config.toml");
         let original=match super::config_commit::read_text_or_empty(&config_path) {Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("無法寫入 config.toml：{e}"))};
         let config_expected_hash=super::config_commit::content_hash(&original);
@@ -353,7 +384,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
         let people = self.people().await;
-        WsFrame::ok_response("", identity_view(&self.home_dir, agent_id, people.as_ref()))
+        WsFrame::ok_response("", identity_view(&self.home_dir, agent_id, people.as_ref(), false))
     }
 
     /// `agents.google_identity_set {agent_id, identity, fallback?, requesters?}`.
@@ -483,6 +514,22 @@ impl MethodHandler {
             if let Err(e) = db.set_google_consent(&ctx.user_id, &agent_id, true, &ctx.user_id) { return WsFrame::error_response("", &e); }
         }
         let after = gi::read_agent_section(&self.home_dir, &agent_id);
+        // SR4 item 1: an Admin attestation names one delegate subject. Moving
+        // the employee off exactly that subject retires it (audited by the
+        // store), so returning to the subject later needs a new attestation.
+        // Best effort: the use-time rule also requires the same subject.
+        let delegate_subject = |s: &gi::SectionRead| match s {
+            gi::SectionRead::Present(p) => match &p.identity {
+                Some(Selector::Delegate(email)) => Some(email.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if delegate_subject(&before) != delegate_subject(&after)
+            && let Some(db) = &db
+        {
+            let _ = db.revoke_google_delegate_attestation(&agent_id, &ctx.user_id);
+        }
         let describe = |s: &gi::SectionRead| match s {
             gi::SectionRead::Absent => json!(null),
             gi::SectionRead::Invalid(_) => json!("invalid"),
@@ -513,7 +560,7 @@ impl MethodHandler {
         let people = self.people().await;
         WsFrame::ok_response(
             "",
-            identity_view(&self.home_dir, &agent_id, people.as_ref()),
+            identity_view(&self.home_dir, &agent_id, people.as_ref(), false),
         )
     }
 

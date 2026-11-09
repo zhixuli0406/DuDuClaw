@@ -64,7 +64,7 @@ fn raw_digest(bytes: &[u8]) -> String {
     format!("unparseable:{}", hex::encode(Sha256::digest(bytes)))
 }
 
-fn read_doc(path: &Path) -> Result<Doc, String> {
+fn read_doc_mode(path: &Path, strict: bool) -> Result<Doc, String> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(
             match std::str::from_utf8(&bytes)
@@ -72,6 +72,7 @@ fn read_doc(path: &Path) -> Result<Doc, String> {
                 .and_then(|s| s.parse::<toml::Table>().ok())
             {
                 Some(table) => Doc::Parsed(table),
+                None if strict => return Err("policy snapshot malformed".into()),
                 None => Doc::Unparseable(raw_digest(&bytes)),
             },
         ),
@@ -103,13 +104,13 @@ fn whole_digest(doc: &Doc) -> String {
 
 /// The employee's effective `agent.toml`: the preset resolution when one
 /// exists (the same redirect `agent_toml::load` applies), else its own file.
-fn effective_agent_doc(home: &Path, actor: &str) -> Result<(Doc, bool), String> {
+fn effective_agent_doc(home: &Path, actor: &str, strict: bool) -> Result<(Doc, bool), String> {
     let resolved = duduclaw_core::preset::agent_resolved_path(home, actor);
-    match read_doc(&resolved)? {
+    match read_doc_mode(&resolved, strict)? {
         Doc::Missing => {}
         doc => return Ok((doc, true)),
     }
-    match read_doc(&home.join("agents").join(actor).join("agent.toml"))? {
+    match read_doc_mode(&home.join("agents").join(actor).join("agent.toml"), strict)? {
         Doc::Missing => Err("policy snapshot unreadable".into()),
         doc => Ok((doc, false)),
     }
@@ -135,7 +136,7 @@ fn agent_authority_digest(doc: &Doc) -> String {
     }
 }
 
-fn preset_digest(home: &Path, actor: &str, resolved: bool) -> Result<String, String> {
+fn preset_digest(home: &Path, actor: &str, resolved: bool, strict: bool) -> Result<String, String> {
     let entry = match std::fs::read_to_string(duduclaw_core::preset::bindings_path(home)) {
         Ok(raw) => match raw.parse::<toml::Table>() {
             Ok(table) => table
@@ -146,6 +147,7 @@ fn preset_digest(home: &Path, actor: &str, resolved: bool) -> Result<String, Str
                 .unwrap_or(Value::Null),
             // An uninterpretable store resolves every employee as unbound at
             // runtime; any later edit to it must still read as drift.
+            Err(_) if strict => return Err("policy snapshot malformed".into()),
             Err(_) => return Ok(raw_digest(raw.as_bytes())),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
@@ -157,8 +159,8 @@ fn preset_digest(home: &Path, actor: &str, resolved: bool) -> Result<String, Str
 }
 
 /// `org.toml` records of the employee and its ancestors (by `reports_to`).
-fn org_chain_digest(home: &Path, actor: &str) -> Result<String, String> {
-    let table = match read_doc(&duduclaw_core::org_store::org_store_path(home))? {
+fn org_chain_digest(home: &Path, actor: &str, strict: bool) -> Result<String, String> {
+    let table = match read_doc_mode(&duduclaw_core::org_store::org_store_path(home), strict)? {
         Doc::Missing => return Ok(digest(&Value::Null)),
         Doc::Unparseable(d) => return Ok(d),
         Doc::Parsed(table) => table,
@@ -191,11 +193,27 @@ fn org_chain_digest(home: &Path, actor: &str) -> Result<String, String> {
 
 /// Per-category digests of the authority that decides what `actor` may do.
 pub fn policy_digests(home: &Path, actor: &str) -> Result<PolicyDigests, String> {
+    policy_digests_mode(home, actor, false)
+}
+
+/// Isolation admits only parsed authority, including nested redaction sources.
+pub fn strict_revision(home: &Path, actor: &str) -> Result<String, String> {
+    Ok(revision_of(&policy_digests_mode(home, actor, true)?))
+}
+
+fn policy_digests_mode(home: &Path, actor: &str, strict: bool) -> Result<PolicyDigests, String> {
     if !duduclaw_core::is_valid_agent_id(actor) {
         return Err("invalid actor".into());
     }
-    let (agent, resolved) = effective_agent_doc(home, actor)?;
-    let config = read_doc(&home.join("config.toml"))?;
+    let (agent, resolved) = effective_agent_doc(home, actor, strict)?;
+    if strict {
+        let Doc::Parsed(table) = &agent else { return Err("policy snapshot malformed".into()); };
+        let status = table.get("agent").and_then(toml::Value::as_table)
+            .and_then(|agent| agent.get("status")).and_then(toml::Value::as_str);
+        if status != Some("active") { return Err("isolation employee is not active".into()); }
+    }
+    let config = read_doc_mode(&home.join("config.toml"), strict)?;
+    if strict && matches!(config, Doc::Missing) { return Err("policy snapshot missing".into()); }
     let mut out = PolicyDigests::new();
     out.insert(
         "capabilities".into(),
@@ -205,12 +223,12 @@ pub fn policy_digests(home: &Path, actor: &str) -> Result<PolicyDigests, String>
     out.insert("agent_authority".into(), agent_authority_digest(&agent));
     out.insert(
         "contract".into(),
-        whole_digest(&read_doc(
-            &home.join("agents").join(actor).join("CONTRACT.toml"),
+        whole_digest(&read_doc_mode(
+            &home.join("agents").join(actor).join("CONTRACT.toml"), strict,
         )?),
     );
-    out.insert("preset".into(), preset_digest(home, actor, resolved)?);
-    out.insert("org_chain".into(), org_chain_digest(home, actor)?);
+    out.insert("preset".into(), preset_digest(home, actor, resolved, strict)?);
+    out.insert("org_chain".into(), org_chain_digest(home, actor, strict)?);
     for section in CONFIG_SECTIONS {
         out.insert((*section).into(), section_digest(&config, section));
     }
@@ -219,14 +237,14 @@ pub fn policy_digests(home: &Path, actor: &str) -> Result<PolicyDigests, String>
         "redaction".into(),
         digest(&serde_json::json!({
             "config": section_digest(&config, "redaction"),
-            "custom_profile": whole_digest(&read_doc(
-                &crate::redaction_custom_rules::profiles_dir(home).join("custom.toml")
+            "custom_profile": whole_digest(&read_doc_mode(
+                &crate::redaction_custom_rules::profiles_dir(home).join("custom.toml"), strict,
             )?),
         })),
     );
     out.insert(
         "killswitch".into(),
-        whole_digest(&read_doc(&home.join("KILLSWITCH.toml"))?),
+        whole_digest(&read_doc_mode(&home.join("KILLSWITCH.toml"), strict)?),
     );
     debug_assert!(POLICY_CATEGORIES.iter().all(|c| out.contains_key(*c)));
     Ok(out)
@@ -270,7 +288,7 @@ pub fn changed_categories(before: &PolicyDigests, after: &PolicyDigests) -> Vec<
 mod tests {
     use super::*;
 
-    const AGENT: &str = "[agent]\nname='alice'\nreports_to='boss'\ndepartment='ops'\nrole='specialist'\ndisplay_name='A'\n\
+    const AGENT: &str = "[agent]\nname='alice'\nstatus='active'\nreports_to='boss'\ndepartment='ops'\nrole='specialist'\ndisplay_name='A'\n\
         [channels.telegram]\nbot_token='t-1'\n[heartbeat]\ninterval_seconds=60\n\
         [capabilities]\nallowed_tools=['tasks_update']\n[permissions]\ncan_schedule_tasks=true\n";
     const CONFIG: &str = "[channels.telegram]\nbot_token='g-1'\n[logging]\nlevel='info'\n\
@@ -292,6 +310,52 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(from), "{rel} lacks {from}");
         std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+    }
+
+    #[test]
+    fn strict_revision_rejects_malformed_authority_including_nested_redaction() {
+        for source in ["agent", "config", "contract", "preset", "org", "redaction", "killswitch"] {
+            let dir = home();
+            let h = dir.path();
+            let path = match source {
+                "agent" => h.join("agents/alice/agent.toml"),
+                "config" => h.join("config.toml"),
+                "contract" => h.join("agents/alice/CONTRACT.toml"),
+                "preset" => duduclaw_core::preset::bindings_path(h),
+                "org" => duduclaw_core::org_store::org_store_path(h),
+                "redaction" => crate::redaction_custom_rules::profiles_dir(h).join("custom.toml"),
+                "killswitch" => h.join("KILLSWITCH.toml"),
+                _ => unreachable!(),
+            };
+            assert!(strict_revision(h, "alice").is_ok());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "[malformed").unwrap();
+            assert!(strict_revision(h, "alice").is_err(), "{source}");
+            // Approval drift fingerprinting deliberately retains its old behavior.
+            assert!(policy_digests(h, "alice").is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn strict_revision_requires_installed_policy_config() {
+        let dir = home();
+        std::fs::remove_file(dir.path().join("config.toml")).unwrap();
+        assert!(strict_revision(dir.path(), "alice").is_err());
+        assert!(policy_digests(dir.path(), "alice").is_ok());
+    }
+
+    #[test]
+    fn strict_revision_refuses_non_operational_or_missing_employee_status() {
+        let home = home();
+        for status in ["paused", "terminated", "archived", "deleted", "unknown"] {
+            std::fs::write(home.path().join("agents/alice/agent.toml"),
+                AGENT.replace("status='active'", &format!("status='{status}'"))).unwrap();
+            assert!(strict_revision(home.path(), "alice").is_err());
+        }
+        std::fs::write(home.path().join("agents/alice/agent.toml"), AGENT.replace("status='active'\n", "")).unwrap();
+        assert!(strict_revision(home.path(), "alice").is_err());
+        std::fs::write(home.path().join("agents/alice/agent.toml"), AGENT).unwrap();
+        assert!(strict_revision(home.path(), "alice").is_ok());
     }
 
     #[test]

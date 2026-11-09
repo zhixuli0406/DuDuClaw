@@ -2,6 +2,7 @@
 //! Moved verbatim out of `task_store.rs`.
 
 use super::*;
+use duduclaw_mcp_boundary::io_authority::verify_before_io;
 
 impl TaskStore {
     /// Atomically claim a `pending` task. Compare-and-set: only the caller
@@ -22,9 +23,9 @@ impl TaskStore {
         lease_expires_at: &str,
     ) -> Result<ClaimOutcome, String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("atomic claim: begin: {e}"))?;
+        verify_live_io()?;
+        verify_before_io().map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
 
         // Load the claim-relevant state under the write lock.
         let row: Option<(String, Option<String>, String)> = tx
@@ -80,6 +81,7 @@ impl TaskStore {
             }
         }
 
+        verify_before_io().map_err(|e| e.to_string())?;
         let n = tx
             .execute(
                 "UPDATE tasks
@@ -90,8 +92,8 @@ impl TaskStore {
                 params![id, agent_id, now, lease_expires_at],
             )
             .map_err(|e| format!("atomic claim: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("atomic claim: commit: {e}"))?;
+        verify_before_io().map_err(|e| e.to_string())?;
+        commit_live_write(tx)?;
         Ok(if n == 1 {
             ClaimOutcome::Claimed
         } else {
@@ -110,7 +112,9 @@ impl TaskStore {
         new_expiry: &str,
         now: &str,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_before_io().map_err(|e| e.to_string())?;
         let n = conn
             .execute(
                 "UPDATE tasks SET lease_expires_at = ?3, lease_renewed_at = ?4, updated_at = ?4
@@ -118,12 +122,14 @@ impl TaskStore {
                 params![id, agent_id, new_expiry, now],
             )
             .map_err(|e| format!("renew lease: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
     /// The set of task ids currently `done` — used for dependency gating.
     pub async fn done_task_ids(&self) -> Result<HashSet<String>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare("SELECT id FROM tasks WHERE status = 'done'")
             .map_err(|e| format!("prepare done ids: {e}"))?;
@@ -138,6 +144,7 @@ impl TaskStore {
     /// All tasks in a given status (helper for the dispatcher's review pass).
     pub async fn tasks_in_status(&self, status: &str) -> Result<Vec<TaskRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS} FROM tasks WHERE status = ?1 ORDER BY created_at ASC"
@@ -162,6 +169,7 @@ impl TaskStore {
         let done = self.done_task_ids().await?;
         let pending = {
             let conn = self.conn.lock().await;
+            verify_live_io()?;
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {TASK_COLUMNS} FROM tasks
@@ -189,6 +197,7 @@ impl TaskStore {
         // then apply guarded updates.
         let candidates: Vec<TaskRow> = {
             let conn = self.conn.lock().await;
+            verify_live_io()?;
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {TASK_COLUMNS} FROM tasks
@@ -256,7 +265,10 @@ impl TaskStore {
         new_retry: i64,
         now: &str,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
+        verify_before_io().map_err(|e| e.to_string())?;
         let n = conn
             .execute(
                 "UPDATE tasks
@@ -267,6 +279,7 @@ impl TaskStore {
                 params![id, new_retry, now, claimer, scanned_lease],
             )
             .map_err(|e| format!("requeue zombie: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
@@ -279,7 +292,10 @@ impl TaskStore {
         scanned_lease: &str,
         now: &str,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
+        verify_before_io().map_err(|e| e.to_string())?;
         let n = conn
             .execute(
                 "UPDATE tasks
@@ -296,6 +312,7 @@ impl TaskStore {
                 ],
             )
             .map_err(|e| format!("fail zombie: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 }

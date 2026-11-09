@@ -140,17 +140,17 @@ pub(super) async fn call_claude_cli_lightweight(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let output = crate::process_group::output_for_model(&mut cmd, None,
-        std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS)).await
+    let output = duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Claude,
+        crate::process_group::output_for_model(&mut cmd, None,
+            std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS)),
+    ).await
         .map_err(|e| match e {
             crate::process_group::OutputError::Timeout => "Claude utility hard timeout".to_owned(),
             crate::process_group::OutputError::Io(e) => {
                 let message = e.to_string();
-                if message.starts_with("AUTONOMY_") {
-                    message
-                } else {
-                    format!("Claude utility process error: {message}")
-                }
+                if message.starts_with("AUTONOMY_") { message }
+                else { crate::process_group::backend_error(e, "Claude utility process error") }
             }
         })?;
     let mut result_text = String::new();

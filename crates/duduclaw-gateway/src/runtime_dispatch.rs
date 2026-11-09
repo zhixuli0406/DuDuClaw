@@ -153,6 +153,7 @@ pub async fn run_agent_prompt_detailed(
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
+    crate::process_group::with_class(crate::process_group::request_class(req.request_type),
     crate::autonomous_runtime::request_scope(
         req.home_dir,
         &owner,
@@ -167,8 +168,7 @@ pub async fn run_agent_prompt_detailed(
                 crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req)),
             ),
         ),
-    )
-    .await
+    )).await
 }
 
 /// Backward-compatible String view; execution/usage happens only in detailed.
@@ -181,6 +181,8 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
 async fn run_agent_prompt_inner(
     req: AgentPrompt<'_>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+    crate::isolation_readiness::check_execution().map_err(|error|
+        RuntimeDispatchFailure::preflight(req.provider_override, req.model, RuntimePreflightKind::Config, error))?;
     if let Some(dir) = req.agent_dir {
         crate::runtime_config::ensure_active_agent_provider(dir).map_err(|error| {
             RuntimeDispatchFailure::preflight(
@@ -850,6 +852,20 @@ pub async fn run_utility_prompt_with_hint(
             model = %spec.model,
             "output_schema requested but this runtime has no structured-output flag — ignored"
         );
+    }
+    if crate::isolation_egress::resolved_identity().is_some() {
+        // Keep original provider, model, autonomy and budget gates before the
+        // host execution handoff. CLI utilities can retain read-capable tools.
+        if spec.provider != RuntimeType::Claude {
+            crate::runtime_config::ensure_model_provider(&spec.model, spec.provider)?;
+        }
+        let budget_kind = if spec.provider == RuntimeType::Claude { "claude_utility" } else { "runtime_dispatch" };
+        crate::budget::gate_before_spawn(home_dir, agent_dir, agent_id, budget_kind)
+            .await.map_err(|e| e.legacy_message())?;
+        return crate::isolation_egress::run_utility(crate::isolation_egress::UtilityRequest {
+            home: home_dir, agent_dir, agent: agent_id, system_prompt, prompt, max_tokens, hint,
+            provider: spec.provider, model: &spec.model,
+        }).await.unwrap_or_else(|| Err("isolated utility context unavailable".into()));
     }
     if spec.provider == RuntimeType::Claude {
         crate::budget::gate_before_spawn(home_dir, agent_dir, agent_id, "claude_utility")

@@ -387,6 +387,7 @@ impl WikiStore {
     /// Create the wiki directory scaffold (subdirs + reserved files) if missing.
     pub fn ensure_scaffold(&self) -> Result<()> {
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         // create_dir_all is idempotent — safe for concurrent callers
         for sub in WIKI_SUBDIRS {
             let p = self.wiki_dir.join(sub);
@@ -564,6 +565,7 @@ impl WikiStore {
             )));
         }
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         self.write_page_under_fence(path, content)
     }
 
@@ -593,7 +595,9 @@ impl WikiStore {
 
         let is_new = std::fs::symlink_metadata(&full).is_err();
 
-        crate::wiki_path::atomic_write_nofollow(&full, content)
+        crate::wiki_path::atomic_write_nofollow_checked(&full, content, || {
+            crate::isolation_io::verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+        })
             .map_err(|e| DuDuClawError::Memory(format!("write page: {e}")))?;
 
         // Update index
@@ -644,6 +648,7 @@ impl WikiStore {
     pub fn archive_page(&self, path: &str) -> Result<bool> {
         self.validate_page_path(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         let src = self.wiki_dir.join(path);
         if !src.exists() {
             return Ok(false);
@@ -675,6 +680,7 @@ impl WikiStore {
                 .map_err(|e| DuDuClawError::Memory(format!("create archive dir: {e}")))?;
             confine(parent)?;
         }
+        crate::isolation_io::verify()?;
         std::fs::rename(&src, &dest)
             .map_err(|e| DuDuClawError::Memory(format!("archive {path}: {e}")))?;
 
@@ -694,6 +700,7 @@ impl WikiStore {
     pub fn restore_archived(&self, path: &str) -> Result<bool> {
         self.validate_page_path(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         let archive_root = self.wiki_dir.join("_archive");
         let archived = archive_root.join(path);
         match std::fs::symlink_metadata(&archived) {
@@ -718,6 +725,7 @@ impl WikiStore {
             std::fs::create_dir_all(parent)
                 .map_err(|e| DuDuClawError::Memory(format!("create restore dir: {e}")))?;
         }
+        crate::isolation_io::verify()?;
         std::fs::rename(&archived, &dest)
             .map_err(|e| DuDuClawError::Memory(format!("restore {path}: {e}")))?;
 
@@ -746,6 +754,7 @@ impl WikiStore {
     ) -> Result<()> {
         self.validate_page_path(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         let mut page = self.read_page(path)?;
         page.trust = new_trust;
         page.do_not_inject = new_do_not_inject;
@@ -758,8 +767,10 @@ impl WikiStore {
     pub fn delete_page(&self, path: &str) -> Result<()> {
         self.validate_page_path(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         let full = self.wiki_dir.join(path);
         if full.exists() {
+            crate::isolation_io::verify()?;
             std::fs::remove_file(&full)
                 .map_err(|e| DuDuClawError::Memory(format!("delete {path}: {e}")))?;
             if let Err(e) = self.remove_from_index(path) {
@@ -782,9 +793,11 @@ impl WikiStore {
     pub fn delete_page_checked(&self, path: &str) -> Result<()> {
         self.validate_page_path(path)?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         let full = self.wiki_dir.join(path);
         let existed = full.exists();
         if existed {
+            crate::isolation_io::verify()?;
             std::fs::remove_file(&full)
                 .map_err(|e| DuDuClawError::Memory(format!("delete {path}: {e}")))?;
         }
@@ -1061,6 +1074,7 @@ impl WikiStore {
     /// Rebuild `_index.md` from scratch by scanning all pages.
     pub fn rebuild_index(&self) -> Result<usize> {
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
         let pages = self.list_pages()?;
         let mut lines = vec!["# Wiki Index".to_string(), String::new()];
         lines.push("<!-- Auto-maintained by WikiStore. One entry per page. -->".to_string());
@@ -1095,8 +1109,9 @@ impl WikiStore {
         // symlink must not copy an outside file into the export.
         for reserved in &["_schema.md", "_index.md", "_log.md"] {
             match crate::wiki_path::read_wiki_file_nofollow(&self.wiki_dir, reserved) {
-                Ok(content) => std::fs::write(output_dir.join(reserved), content)
-                    .map_err(|e| DuDuClawError::Memory(format!("copy {reserved}: {e}")))?,
+                Ok(content) => crate::wiki_path::atomic_write_nofollow_checked(&output_dir.join(reserved), &content, || {
+                    crate::isolation_io::verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+                }).map_err(|e| DuDuClawError::Memory(format!("copy {reserved}: {e}")))?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(DuDuClawError::Memory(format!("copy {reserved}: {e}"))),
             }
@@ -1119,7 +1134,9 @@ impl WikiStore {
             let related = extract_string_list(&content, "related");
             let _body = extract_body(&content);
             if related.is_empty() {
-                std::fs::write(&dst, &content)
+                crate::wiki_path::atomic_write_nofollow_checked(&dst, &content, || {
+                    crate::isolation_io::verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+                })
                     .map_err(|e| DuDuClawError::Memory(format!("write export: {e}")))?;
             } else {
                 let wikilinks: Vec<String> = related.iter().map(|r| {
@@ -1134,7 +1151,9 @@ impl WikiStore {
                     content.trim_end(),
                     wikilinks.join(", ")
                 );
-                std::fs::write(&dst, augmented)
+                crate::wiki_path::atomic_write_nofollow_checked(&dst, &augmented, || {
+                    crate::isolation_io::verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+                })
                     .map_err(|e| DuDuClawError::Memory(format!("write export: {e}")))?;
             }
 
@@ -1644,10 +1663,17 @@ impl WikiStore {
     }
 
     fn update_index(&self, page_path: &str, title: &str) -> std::result::Result<(), String> {
+        self.update_index_checked(page_path, title, || crate::isolation_io::verify().map_err(|e| e.to_string()))
+    }
+
+    fn update_index_checked(
+        &self, page_path: &str, title: &str, verify: impl Fn() -> std::result::Result<(), String>,
+    ) -> std::result::Result<(), String> {
         let index_path = self.wiki_dir.join("_index.md");
 
         // Use flock for atomicity across concurrent callers
         let lock_path = self.wiki_dir.join("_index.lock");
+        verify()?;
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1656,6 +1682,7 @@ impl WikiStore {
             .map_err(|e| format!("open lock: {e}"))?;
         // Advisory lock — blocks until acquired
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
+        verify()?;
 
         let existing = self.read_index_nofollow()?;
         let now = Utc::now().format("%Y-%m-%d").to_string();
@@ -1679,7 +1706,9 @@ impl WikiStore {
 
         // Atomic write: temp + rename under lock
         let content = lines.join("\n") + "\n";
-        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
+        crate::wiki_path::atomic_write_nofollow_checked(&index_path, &content, || {
+            verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+        })
             .map_err(|e| format!("write index: {e}"))?;
 
         // Lock released when lock_file is dropped
@@ -1690,6 +1719,7 @@ impl WikiStore {
         let index_path = self.wiki_dir.join("_index.md");
 
         let lock_path = self.wiki_dir.join("_index.lock");
+        crate::isolation_io::verify().map_err(|e| e.to_string())?;
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1698,6 +1728,7 @@ impl WikiStore {
             .map_err(|e| format!("open lock: {e}"))?;
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
 
+        crate::isolation_io::verify().map_err(|e| e.to_string())?;
         let existing = self.read_index_nofollow()?;
         let link_pattern = format!("]({})", page_path);
 
@@ -1707,7 +1738,9 @@ impl WikiStore {
             .collect();
 
         let content = lines.join("\n") + "\n";
-        crate::wiki_path::atomic_write_nofollow(&index_path, &content)
+        crate::wiki_path::atomic_write_nofollow_checked(&index_path, &content, || {
+            crate::isolation_io::verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+        })
             .map_err(|e| format!("write index: {e}"))
     }
 
@@ -1727,6 +1760,13 @@ impl WikiStore {
     }
 
     fn append_log_with_author(&self, action: &str, page_path: &str, author: Option<&str>) -> std::result::Result<(), String> {
+        self.append_log_with_author_checked(action, page_path, author, || crate::isolation_io::verify().map_err(|e| e.to_string()))
+    }
+
+    fn append_log_with_author_checked(
+        &self, action: &str, page_path: &str, author: Option<&str>,
+        verify: impl Fn() -> std::result::Result<(), String>,
+    ) -> std::result::Result<(), String> {
         let log_path = self.wiki_dir.join("_log.md");
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         let entry = match author {
@@ -1750,15 +1790,25 @@ impl WikiStore {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW);
         }
+        verify()?;
         let mut f = options
             .open(&log_path)
             .map_err(|e| format!("open log: {e}"))?;
-        f.write_all(duduclaw_security::credential_detect::mask(&entry).as_bytes())
+        let masked = duduclaw_security::credential_detect::mask(&entry);
+        verify()?;
+        f.write_all(masked.as_bytes())
             .map_err(|e| format!("write log: {e}"))
     }
 
     /// Write a page with author attribution (used by shared wiki).
     pub fn write_page_with_author(&self, path: &str, content: &str, author: &str) -> Result<()> {
+        self.write_page_with_author_checked(path, content, author, crate::isolation_io::verify)
+    }
+
+    /// Recheck authority after the delivery fence wait and before publication.
+    pub fn write_page_with_author_checked(
+        &self, path: &str, content: &str, author: &str, verify: impl Fn() -> Result<()>,
+    ) -> Result<()> {
         if duduclaw_security::credential_detect::mask(path) != path {
             return Err(DuDuClawError::Memory("credentials are not accepted in wiki paths".into()));
         }
@@ -1772,7 +1822,10 @@ impl WikiStore {
             )));
         }
 
+        verify()?;
         let _fence = self.delivery_fence().exclusive_for_write()?;
+        crate::isolation_io::verify()?;
+        verify()?;
 
         // Mask the complete bounded page before deriving the title or FTS index.
         let masked_content = duduclaw_security::credential_detect::mask_document(content)
@@ -1781,27 +1834,33 @@ impl WikiStore {
 
         // Validate and confine before creating any directory, then write
         // through an O_EXCL temp file (never through a planted link).
+        verify()?;
         let full = crate::wiki_path::prepare_wiki_write_target(&self.wiki_dir, path)
             .map_err(|e| DuDuClawError::Memory(format!("page path refused: {e}")))?;
 
         let is_new = std::fs::symlink_metadata(&full).is_err();
 
-        crate::wiki_path::atomic_write_nofollow(&full, content)
+        crate::wiki_path::atomic_write_nofollow_checked(&full, content, || {
+            verify().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+        })
             .map_err(|e| DuDuClawError::Memory(format!("write page: {e}")))?;
 
         // Update index
         let title = extract_title(content).unwrap_or_else(|| path.to_string());
-        if let Err(e) = self.update_index(path, &title) {
+        verify()?;
+        if let Err(e) = self.update_index_checked(path, &title, || verify().map_err(|e| e.to_string())) {
             warn!("Failed to update index for {path}: {e}");
         }
 
         // Append log with author
         let action = if is_new { "create" } else { "update" };
-        if let Err(e) = self.append_log_with_author(action, path, Some(author)) {
+        verify()?;
+        if let Err(e) = self.append_log_with_author_checked(action, path, Some(author), || verify().map_err(|e| e.to_string())) {
             warn!("Failed to log {action} {path}: {e}");
         }
 
         // Best-effort FTS sync
+        verify()?;
         self.fts_sync_upsert(path, content);
 
         info!(page = path, author, action, "Wiki page written (shared)");
@@ -1820,7 +1879,7 @@ impl WikiStore {
 // ---------------------------------------------------------------------------
 
 /// Parse a wiki page from raw content.
-fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
+pub fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
     let title = extract_title(content).unwrap_or_else(|| path.to_string());
     let created = extract_datetime_field(content, "created").unwrap_or_else(Utc::now);
     let updated = extract_datetime_field(content, "updated").unwrap_or_else(Utc::now);
@@ -2368,11 +2427,16 @@ pub struct WikiFts {
 impl WikiFts {
     /// Open or create the FTS5 index database at `wiki_dir/_wiki.db`.
     pub fn open(wiki_dir: &Path) -> Result<Self> {
+        crate::isolation_io::verify()?;
         let db_path = wiki_dir.join("_wiki.db");
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| DuDuClawError::Memory(format!("open FTS DB: {e}")))?;
 
-        conn.execute_batch(
+        crate::isolation_io::verify()?;
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Memory(format!("FTS schema transaction: {e}")))?;
+        crate::isolation_io::verify()?;
+        tx.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
                 path,
                 title,
@@ -2391,28 +2455,46 @@ impl WikiFts {
             );"
         ).map_err(|e| DuDuClawError::Memory(format!("init FTS schema: {e}")))?;
 
+        crate::isolation_io::verify()?;
+        tx.commit().map_err(|e| DuDuClawError::Memory(format!("FTS schema commit: {e}")))?;
         Ok(Self { conn })
+    }
+
+    fn checked_transaction<T>(&self, work: impl FnOnce(&rusqlite::Connection) -> Result<T>) -> Result<T> {
+        crate::isolation_io::verify()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Memory(format!("FTS transaction: {e}")))?;
+        crate::isolation_io::verify()?;
+        let result = work(&tx)?;
+        crate::isolation_io::verify()?;
+        tx.commit().map_err(|e| DuDuClawError::Memory(format!("FTS commit: {e}")))?;
+        Ok(result)
     }
 
     /// Insert or update a page in the FTS index.
     pub fn upsert(&self, path: &str, title: &str, body: &str, tags: &[String], layer: WikiLayer, trust: f32) -> Result<()> {
+        self.checked_transaction(|conn| Self::upsert_rows(conn, path, title, body, tags, layer, trust))
+    }
+
+    fn upsert_rows(conn: &rusqlite::Connection, path: &str, title: &str, body: &str, tags: &[String], layer: WikiLayer, trust: f32) -> Result<()> {
+        crate::isolation_io::verify()?;
         let tags_str = tags.join(", ");
         let layer_str = layer.to_string();
         let now = Utc::now().to_rfc3339();
 
         // Delete old entry if exists (FTS5 content table requires delete+insert for updates)
-        self.conn.execute(
+        conn.execute(
             "DELETE FROM wiki_fts WHERE path = ?1",
             rusqlite::params![path],
         ).map_err(|e| DuDuClawError::Memory(format!("fts delete: {e}")))?;
 
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO wiki_fts (path, title, body, tags, layer, trust) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![path, title, body, &tags_str, &layer_str, trust],
         ).map_err(|e| DuDuClawError::Memory(format!("fts insert: {e}")))?;
 
         // Upsert metadata
-        self.conn.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO wiki_meta (path, title, layer, trust, updated) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![path, title, &layer_str, trust, &now],
         ).map_err(|e| DuDuClawError::Memory(format!("meta upsert: {e}")))?;
@@ -2422,15 +2504,18 @@ impl WikiFts {
 
     /// Remove a page from the FTS index.
     pub fn remove(&self, path: &str) -> Result<()> {
-        self.conn.execute(
+        self.checked_transaction(|conn| {
+        conn.execute(
             "DELETE FROM wiki_fts WHERE path = ?1",
             rusqlite::params![path],
         ).map_err(|e| DuDuClawError::Memory(format!("fts delete: {e}")))?;
-        self.conn.execute(
+        crate::isolation_io::verify()?;
+        conn.execute(
             "DELETE FROM wiki_meta WHERE path = ?1",
             rusqlite::params![path],
         ).map_err(|e| DuDuClawError::Memory(format!("meta delete: {e}")))?;
         Ok(())
+        })
     }
 
     /// Full-text search using FTS5. Returns (path, title, rank, trust, layer) tuples.
@@ -2488,8 +2573,9 @@ impl WikiFts {
 
     /// Rebuild the FTS index from all pages in the wiki directory.
     pub fn rebuild(&self, wiki_dir: &Path) -> Result<usize> {
+        self.checked_transaction(|conn| {
         // Clear existing data
-        self.conn.execute_batch(
+        conn.execute_batch(
             "DELETE FROM wiki_fts; DELETE FROM wiki_meta;"
         ).map_err(|e| DuDuClawError::Memory(format!("fts clear: {e}")))?;
 
@@ -2497,6 +2583,7 @@ impl WikiFts {
         let mut count = 0;
 
         for rel in &md_files {
+            crate::isolation_io::verify()?;
             let full = wiki_dir.join(rel);
             let content = match std::fs::read_to_string(&full) {
                 Ok(c) => c,
@@ -2513,12 +2600,13 @@ impl WikiFts {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(default_trust());
 
-            self.upsert(&rel_str, &title, &body, &tags, layer, trust)?;
+            Self::upsert_rows(conn, &rel_str, &title, &body, &tags, layer, trust)?;
             count += 1;
         }
 
         info!(count, "FTS index rebuilt");
         Ok(count)
+        })
     }
 
     /// Number of indexed pages.
@@ -2787,6 +2875,72 @@ impl WikiStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn shared_index_waiting_on_real_file_lock_refuses_revoked_write() {
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
+        let home = tempfile::tempdir().unwrap();
+        let store = WikiStore::new_shared(home.path());
+        store.ensure_scaffold().unwrap();
+        let index = store.wiki_dir().join("_index.md");
+        let before = std::fs::read(&index).unwrap();
+        let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
+            .open(store.wiki_dir().join("_index.lock")).unwrap();
+        fs_lock(&held).unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let checked_live = live.clone();
+        let (admitted, wait) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let admitted = Mutex::new(Some(admitted));
+            let result = store.update_index_checked("concepts/refused.md", "refused", || {
+                let allowed = checked_live.load(Ordering::SeqCst);
+                if let Some(sender) = admitted.lock().unwrap().take() { sender.send(()).unwrap(); }
+                if allowed { Ok(()) } else { Err("authority revoked".into()) }
+            });
+            finished.send(result).unwrap();
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(matches!(completion.recv_timeout(std::time::Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)));
+        live.store(false, Ordering::SeqCst);
+        drop(held);
+        assert!(completion.recv_timeout(std::time::Duration::from_secs(2)).unwrap().is_err());
+        worker.join().unwrap();
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+        assert!(!index.with_extension("md.tmp").exists());
+    }
+
+    #[test]
+    fn shared_write_rechecks_after_delivery_fence_and_preserves_page_on_revoke() {
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
+        let home = tempfile::tempdir().unwrap();
+        let store = WikiStore::new_shared(home.path());
+        store.ensure_scaffold().unwrap();
+        store.write_page_with_author("concepts/test.md", "---\ntitle: Original\n---\noriginal", "alice").unwrap();
+        let paths = ["concepts/test.md", "_index.md", "_log.md"];
+        let before: Vec<_> = paths.iter().map(|path| std::fs::read(store.wiki_dir().join(path)).unwrap()).collect();
+        let lease = store.delivery_fence().try_shared().unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let revoked = live.clone();
+        let (admitted, wait) = mpsc::channel();
+        let admitted = Mutex::new(Some(admitted));
+        let releaser = std::thread::spawn(move || {
+            wait.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            revoked.store(false, Ordering::SeqCst);
+            drop(lease);
+        });
+        let result = store.write_page_with_author_checked("concepts/test.md", "replacement", "alice", || {
+            let allowed = live.load(Ordering::SeqCst);
+            if let Some(sender) = admitted.lock().unwrap().take() { sender.send(()).unwrap(); }
+            if allowed { Ok(()) } else { Err(DuDuClawError::Memory("authority revoked".into())) }
+        });
+        releaser.join().unwrap();
+        assert!(result.is_err());
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(store.wiki_dir().join(path)).unwrap(), bytes);
+        }
+    }
 
     // F1 sink regression; written but not run (owner forbids builds).
     #[test]
@@ -3447,6 +3601,29 @@ This is the body of the page.
         assert_eq!(hits[0].path, "concepts/rust.md");
         assert!((hits[0].trust - 0.9).abs() < 0.01);
         assert_eq!(hits[0].layer, WikiLayer::Core);
+    }
+
+    #[tokio::test]
+    async fn scoped_fts_revoke_before_commit_restores_previous_index() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let dir = tempfile::tempdir().unwrap();
+        let fts = WikiFts::open(dir.path()).unwrap();
+        fts.upsert("before.md", "Before", "old body", &[], WikiLayer::Deep, 0.5).unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let result = duduclaw_mcp_boundary::io_authority::scope(crate::isolation_io::test_context(live.clone()), async {
+            fts.checked_transaction(|conn| {
+                conn.execute("DELETE FROM wiki_fts", []).unwrap();
+                conn.execute("DELETE FROM wiki_meta", []).unwrap();
+                WikiFts::upsert_rows(conn, "after.md", "After", "new body", &[], WikiLayer::Deep, 0.5)?;
+                live.store(false, Ordering::SeqCst);
+                Ok(())
+            })
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(fts.count().unwrap(), 1);
+        assert_eq!(fts.search("old", 5).unwrap().len(), 1);
+        assert!(fts.search("new", 5).unwrap().is_empty());
+        assert!(fts.conn.is_autocommit());
     }
 
     #[test]

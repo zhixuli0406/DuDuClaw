@@ -20,6 +20,7 @@
 //! The user can be on their phone — all interaction happens in-channel,
 //! not via a Dashboard.
 
+use crate::isolation_http::LiveRequest;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -49,7 +50,7 @@ impl std::error::Error for ChannelSendError {}
 /// `Result<Response, reqwest::Error>` transport check would miss — a revoked
 /// token, an unknown chat id, or a bot that was kicked from a channel still
 /// completes the HTTP round-trip (status 4xx/5xx), so callers that only
-/// `map_err` the `.send()` future and ignore the response report every one of
+/// `map_err` the `.send_authorized()` future and ignore the response report every one of
 /// these as a successful delivery (the exact false-positive `channels.test`
 /// exists to close — W0-2). Returns the response body text on success (some
 /// callers need it for further platform-specific validation, e.g. Slack/
@@ -452,12 +453,12 @@ pub fn create_sender_for_home(home_dir: &Path, target: &ChannelTarget, http: req
         // / `create_teams_sender` directly — this arm closes it for every
         // other caller of the generic factory, e.g. cron_scheduler.rs).
         "googlechat" => create_googlechat_sender(
-            duduclaw_core::platform::duduclaw_home(),
+            home_dir.to_path_buf(),
             target.chat_id.clone(),
             target.extra_id.clone().unwrap_or_default(),
         ),
         "teams" => create_teams_sender(
-            duduclaw_core::platform::duduclaw_home(),
+            home_dir.to_path_buf(),
             target.chat_id.clone(),
             target.extra_id.clone().unwrap_or_default(),
         ),
@@ -531,7 +532,7 @@ pub(crate) async fn send_with_markup(
             let resp = http
                 .post(&url)
                 .json(&body)
-                .send()
+                .send_authorized()
                 .await
                 // WP12: reqwest's Display embeds the URL, which carries the bot token.
                 .map_err(|e| crate::secret_redact::redact_secrets(&e.to_string()).into_owned())?;
@@ -561,7 +562,7 @@ pub(crate) async fn send_with_markup(
                 .post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(token)
                 .json(&body)
-                .send()
+                .send_authorized()
                 .await
                 .map_err(|e| e.to_string())?;
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -586,7 +587,7 @@ pub(crate) async fn send_with_markup(
                 .post("https://discord.com/api/v10/users/@me/channels")
                 .header("Authorization", format!("Bot {token}"))
                 .json(&json!({ "recipient_id": chat_id }))
-                .send()
+                .send_authorized()
                 .await
             {
                 Ok(resp) if resp.status().is_success() => resp
@@ -613,7 +614,7 @@ pub(crate) async fn send_with_markup(
                 .post(&url)
                 .header("Authorization", format!("Bot {token}"))
                 .json(&body)
-                .send()
+                .send_authorized()
                 .await
                 .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
@@ -635,7 +636,7 @@ pub(crate) async fn send_with_markup(
                 .post(crate::line::line_api_url("/message/push"))
                 .bearer_auth(token)
                 .json(&body)
-                .send()
+                .send_authorized()
                 .await
                 .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
@@ -842,7 +843,7 @@ pub async fn resolve_channel_target(
         let resp = http
             .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
             .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| format!("feishu token: {e}"))?;
         let body: serde_json::Value = resp
@@ -908,7 +909,7 @@ impl ChannelSender for TelegramSender {
                 "text": text,
                 "parse_mode": "Markdown"
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| {
                 ChannelSendError(format!(
@@ -933,7 +934,7 @@ impl ChannelSender for TelegramSender {
         self.http
             .post(&url)
             .multipart(form)
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| {
                 ChannelSendError(format!(
@@ -964,7 +965,7 @@ impl ChannelSender for TelegramSender {
         self.http
             .post(&url)
             .multipart(form)
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| {
                 ChannelSendError(format!(
@@ -1016,7 +1017,7 @@ impl ChannelSender for LineSender {
                 "to": self.user_id,
                 "messages": [{"type": "text", "text": text}]
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("LINE push: {e}")))?;
         require_api_success("LINE", resp).await?;
@@ -1032,7 +1033,7 @@ impl ChannelSender for LineSender {
             .bearer_auth(&self.access_token)
             .header("Content-Type", "image/png")
             .body(png_data.to_vec())
-            .send()
+            .send_authorized()
             .await;
 
         match req_resp {
@@ -1056,7 +1057,7 @@ impl ChannelSender for LineSender {
                                 "previewImageUrl": content_url,
                             }]
                         }))
-                        .send()
+                        .send_authorized()
                         .await
                         .map_err(|e| ChannelSendError(format!("LINE sendImage: {e}")))?;
 
@@ -1107,7 +1108,7 @@ impl ChannelSender for LineSender {
                 "to": self.user_id,
                 "messages": [confirm_msg]
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("LINE confirm: {e}")))?;
 
@@ -1151,7 +1152,7 @@ impl ChannelSender for DiscordSender {
             .post(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .json(&serde_json::json!({"content": text}))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Discord send: {e}")))?;
         require_api_success("Discord", resp).await?;
@@ -1178,7 +1179,7 @@ impl ChannelSender for DiscordSender {
             .post(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .multipart(form)
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Discord sendPhoto: {e}")))?;
         Ok(())
@@ -1211,7 +1212,7 @@ impl ChannelSender for DiscordSender {
             .post(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .multipart(form)
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Discord sendDocument: {e}")))?;
         Ok(())
@@ -1266,7 +1267,7 @@ impl ChannelSender for SlackSender {
                 "channel": self.channel_id,
                 "text": text
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Slack postMessage: {e}")))?;
         let body = require_api_success("Slack", resp).await?;
@@ -1285,7 +1286,7 @@ impl ChannelSender for SlackSender {
                 "filename": "screenshot.png",
                 "length": png_data.len(),
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Slack getUploadURL: {e}")))?;
 
@@ -1312,7 +1313,7 @@ impl ChannelSender for SlackSender {
         self.http
             .put(upload_url)
             .body(png_data.to_vec())
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Slack file upload: {e}")))?;
 
@@ -1325,7 +1326,7 @@ impl ChannelSender for SlackSender {
                 "channel_id": self.channel_id,
                 "initial_comment": caption,
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Slack completeUpload: {e}")))?;
 
@@ -1344,7 +1345,7 @@ impl ChannelSender for SlackSender {
             .post("https://slack.com/api/files.getUploadURLExternal")
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .json(&serde_json::json!({ "filename": filename, "length": data.len() }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Slack getUploadURL: {e}")))?;
         let resp_json: serde_json::Value = get_url_resp
@@ -1366,7 +1367,7 @@ impl ChannelSender for SlackSender {
         self.http
             .put(upload_url)
             .body(data.to_vec())
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Slack file upload: {e}")))?;
         self.http
@@ -1376,7 +1377,7 @@ impl ChannelSender for SlackSender {
                 "files": [{"id": file_id, "title": filename}],
                 "channel_id": self.channel_id,
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Slack completeUpload: {e}")))?;
         Ok(())
@@ -1436,7 +1437,7 @@ impl ChannelSender for WhatsAppSender {
                 "type": "text",
                 "text": {"body": text}
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("WhatsApp send: {e}")))?;
         require_api_success("WhatsApp", resp).await?;
@@ -1463,7 +1464,7 @@ impl ChannelSender for WhatsAppSender {
             .post(&upload_url)
             .bearer_auth(&self.access_token)
             .multipart(form)
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("WhatsApp media upload: {e}")))?;
 
@@ -1493,7 +1494,7 @@ impl ChannelSender for WhatsAppSender {
                     "caption": caption,
                 }
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("WhatsApp sendImage: {e}")))?;
 
@@ -1524,7 +1525,7 @@ impl ChannelSender for WhatsAppSender {
             .post(&upload_url)
             .bearer_auth(&self.access_token)
             .multipart(form)
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("WhatsApp media upload: {e}")))?;
         let resp_json: serde_json::Value = upload_resp
@@ -1548,7 +1549,7 @@ impl ChannelSender for WhatsAppSender {
                 "type": "document",
                 "document": { "id": media_id, "filename": filename }
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("WhatsApp sendDocument: {e}")))?;
         Ok(())
@@ -1599,7 +1600,7 @@ impl ChannelSender for FeishuSender {
                 "msg_type": "text",
                 "content": serde_json::json!({"text": text}).to_string(),
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Feishu send: {e}")))?;
         let body = require_api_success("Feishu", resp).await?;
@@ -1623,7 +1624,7 @@ impl ChannelSender for FeishuSender {
             .post("https://open.feishu.cn/open-apis/im/v1/images")
             .bearer_auth(&self.access_token)
             .multipart(form)
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Feishu image upload: {e}")))?;
 
@@ -1646,7 +1647,7 @@ impl ChannelSender for FeishuSender {
                 "msg_type": "image",
                 "content": serde_json::json!({"image_key": image_key}).to_string(),
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Feishu sendImage: {e}")))?;
 
@@ -1693,7 +1694,7 @@ impl ChannelSender for FeishuSender {
             .post("https://open.feishu.cn/open-apis/im/v1/files")
             .bearer_auth(&self.access_token)
             .multipart(form)
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Feishu file upload: {e}")))?;
         let resp_json: serde_json::Value = upload_resp
@@ -1713,7 +1714,7 @@ impl ChannelSender for FeishuSender {
                 "msg_type": "file",
                 "content": serde_json::json!({"file_key": file_key}).to_string(),
             }))
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| ChannelSendError(format!("Feishu sendFile: {e}")))?;
         Ok(())

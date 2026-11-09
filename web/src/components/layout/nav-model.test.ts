@@ -393,6 +393,7 @@ const previousNavigation = {
         "/me/memory",
         "/my/history-views",
         "/manage",
+        "/app/system/migration",
         "/app/system/settings/company",
         "/app/system/settings/advanced",
         "/about"
@@ -428,6 +429,7 @@ const previousNavigation = {
         "/me/external-access",
         "/me/memory",
         "/manage",
+        "/app/system/migration",
         "/app/system/settings/company",
         "/app/system/settings/advanced",
         "/about"
@@ -612,6 +614,19 @@ describe('task navigation hidden for all roles and editions', () => {
     }
     expect(navGroups.flatMap(group => group.items).some(item => item.to === '/responsibilities')).toBe(true);
     expect(navGroups.flatMap(group => group.items).some(item => item.to === '/foresight')).toBe(true);
+  });
+});
+
+
+describe('migration confirmation navigation', () => {
+  it('appears once for each edition, Admin only and tagged 1.80.0', () => {
+    for (const personal of [false, true]) {
+      const items = navGroupsForEdition(personal).flatMap(group => group.items)
+        .filter(item => item.to === '/app/system/migration');
+      expect(items).toHaveLength(1);
+      expect(items[0].minRole).toBe('admin');
+      expect(items[0].newIn).toBe('1.80.0');
+    }
   });
 });
 

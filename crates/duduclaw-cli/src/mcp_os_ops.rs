@@ -651,7 +651,7 @@ async fn record_pending_update_report(
     target: &str,
     expected_version: Option<&str>,
 ) {
-    let reply_channel_raw = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL)
+    let reply_channel_raw = crate::mcp_isolation_identity::var(duduclaw_core::ENV_REPLY_CHANNEL)
         .ok()
         .filter(|s| !s.is_empty());
     let value = json!({

@@ -243,7 +243,7 @@ impl MethodHandler {
         }
         let mut command = tokio::process::Command::new(bin);
         duduclaw_core::ns_guard::guard_command(&mut command);
-        let spawned = command.arg(group)
+        command.arg(group)
             .args(args)
             .env("DUDUCLAW_HOME", &self.home_dir)
             .env(IMPORT_MARKER_NONCE_ENV, &nonce)
@@ -253,8 +253,8 @@ impl MethodHandler {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
+            .kill_on_drop(true);
+        let spawned = duduclaw_core::execution_gate::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::ImportWorker).await;
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
@@ -322,7 +322,7 @@ impl MethodHandler {
 /// from its journal), wait up to `grace_secs`, then kill it. On Windows the
 /// stop is forceful right away; the journal is recovered by the next
 /// import or gateway start.
-pub(crate) async fn stop_gracefully(child: &mut tokio::process::Child, grace_secs: u64) {
+pub(crate) async fn stop_gracefully(child: &mut duduclaw_core::execution_gate::Child, grace_secs: u64) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         let _ = duduclaw_core::platform::terminate_process(pid);

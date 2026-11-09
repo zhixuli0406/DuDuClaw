@@ -76,7 +76,13 @@ struct BindState {
     /// Pending bind tokens keyed by SHA-256 digest of the plaintext.
     #[serde(default)]
     tokens: HashMap<String, PendingBind>,
+    #[serde(default)]
+    migration_receipts: HashMap<String, MigrationBindingReceipt>,
 }
+
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+struct MigrationBindingReceipt {digest:String,channel:String,user:String,agent:String}
 
 /// Why a bind-token redemption failed (kept distinct for logging; the channel
 /// surface collapses all of these to one friendly zh-TW rejection).
@@ -127,20 +133,21 @@ impl AgentBindingStore {
         }
     }
 
-    async fn save(&self) {
-        if let Some(path) = &self.persist_path {
-            let snapshot = self.state.read().await.clone();
-            let path = path.clone();
-            let res = duduclaw_core::with_file_lock(&path, || {
-                let json = serde_json::to_string_pretty(&snapshot)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                let tmp = path.with_extension("json.tmp");
-                std::fs::write(&tmp, json)?;
-                std::fs::rename(&tmp, &path)
-            });
-            if let Err(e) = res {
-                warn!(%e, "agent_binding state persist failed");
-            }
+    /// Every ordinary mutation reloads and commits under the same lock as
+    /// migration. No stale in-memory snapshot may replace another writer.
+    async fn mutate<T>(&self, action:impl FnOnce(&mut BindState)->T)->std::io::Result<T> {
+        if let Some(path)=&self.persist_path {
+            let (value,state)=duduclaw_core::with_file_lock(path,|| {
+                let mut state=read_durable_state(path)?;
+                let value=action(&mut state);
+                write_durable_state(path,&state)?;
+                Ok((value,state))
+            })?;
+            *self.state.write().await=state;
+            Ok(value)
+        } else {
+            let mut state=self.state.write().await;
+            Ok(action(&mut state))
         }
     }
 
@@ -165,14 +172,12 @@ impl AgentBindingStore {
             max_uses.min(MAX_USES_LIMIT)
         };
 
-        self.reload().await;
         // 128-bit random token, hex-encoded → matches Telegram's deep-link
         // start-payload charset ([A-Za-z0-9_-], ≤64 chars).
         let token = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
         let digest = sha256_hex(&token);
-        {
-            let mut state = self.state.write().await;
-            prune_expired(&mut state);
+        let saved=self.mutate(|state| {
+            prune_expired(state);
             state.tokens.insert(
                 digest.clone(),
                 PendingBind {
@@ -184,8 +189,8 @@ impl AgentBindingStore {
                     used: 0,
                 },
             );
-        }
-        self.save().await;
+        }).await;
+        if let Err(error)=saved {warn!(%error,"bind token persistence failed");return String::new();}
         info!(
             channel,
             agent_id,
@@ -209,12 +214,10 @@ impl AgentBindingStore {
         if token.is_empty() || user_id.is_empty() {
             return Err(BindRedeemError::Invalid);
         }
-        self.reload().await;
         let digest = sha256_hex(token);
         let now = Utc::now();
 
-        let outcome = {
-            let mut state = self.state.write().await;
+        let outcome = self.mutate(|state| {
             let Some(pending) = state.tokens.get(&digest).cloned() else {
                 return Err(BindRedeemError::Invalid);
             };
@@ -236,6 +239,9 @@ impl AgentBindingStore {
                         state.tokens.remove(&digest);
                     }
                 }
+                // A fresh external redemption replaces migration provenance,
+                // even when it requests the same employee.
+                state.migration_receipts.retain(|_,r|r.channel!=channel||r.user!=user_id);
                 state
                     .bindings
                     .entry(channel.to_string())
@@ -243,10 +249,7 @@ impl AgentBindingStore {
                     .insert(user_id.to_string(), pending.agent_id.clone());
                 Ok(pending.agent_id)
             }
-        };
-        // Persist on every branch: a consumed use, a binding, or a pruned
-        // expired/exhausted token all mutate durable state.
-        self.save().await;
+        }).await.unwrap_or(Err(BindRedeemError::Invalid));
         if let Ok(agent) = &outcome {
             info!(channel, user_id, agent, "channel user bound to agent");
         }
@@ -267,19 +270,62 @@ impl AgentBindingStore {
     /// Remove a binding (operator revoke / employee handoff). Returns true when
     /// a binding was actually removed.
     pub async fn unbind(&self, channel: &str, user_id: &str) -> bool {
-        self.reload().await;
-        let removed = {
-            let mut state = self.state.write().await;
-            state
-                .bindings
-                .get_mut(channel)
-                .is_some_and(|m| m.remove(user_id).is_some())
-        };
-        if removed {
-            self.save().await;
-            info!(channel, user_id, "channel user unbound");
-        }
+        let removed=self.mutate(|state| {
+            state.migration_receipts.retain(|_,r|r.channel!=channel||r.user!=user_id);
+            state.bindings.get_mut(channel).is_some_and(|m|m.remove(user_id).is_some())
+        }).await.unwrap_or(false);
+        if removed {info!(channel,user_id,"channel user unbound");}
         removed
+    }
+}
+
+impl AgentBindingStore {
+    /// Same durable binding map as token redemption, with its operation receipt
+    /// in the same atomic file replacement. Caller must hold a live Admin decision.
+    pub(crate) fn migration_bind(&self,operation:&str,digest:&str,channel:&str,user:&str,agent:&str)->Result<(),String> {
+        let receipt=MigrationBindingReceipt {digest:digest.into(),channel:channel.into(),user:user.into(),agent:agent.into()};
+        self.migration_transaction(|state| {
+            if let Some(old)=state.migration_receipts.get(operation) {
+                if old==&receipt {
+                    match state.bindings.get(channel).and_then(|m|m.get(user)) {
+                        Some(a) if a==agent=>return Ok(()),
+                        None=>{state.bindings.entry(channel.into()).or_default().insert(user.into(),agent.into());return Ok(());},
+                        _=>{},
+                    }
+                }
+                return Err("migration binding conflict".into());
+            }
+            if state.bindings.get(channel).is_some_and(|m|m.contains_key(user)) {return Err("migration binding already exists".into());}
+            state.bindings.entry(channel.into()).or_default().insert(user.into(),agent.into());
+            state.migration_receipts.insert(operation.into(),receipt);Ok(())
+        })
+    }
+    pub(crate) fn migration_readback(&self,operation:&str,digest:&str,channel:&str,user:&str,agent:&str)->Result<(),String> {
+        self.migration_transaction(|state| {
+            let receipt=state.migration_receipts.get(operation).ok_or("migration binding receipt missing")?;
+            if receipt.digest!=digest || receipt.channel!=channel || receipt.user!=user || receipt.agent!=agent
+                || state.bindings.get(channel).and_then(|m|m.get(user)).map(String::as_str)!=Some(agent) {return Err("migration binding changed".into());}Ok(())
+        })
+    }
+    pub(crate) fn migration_unbind(&self,operation:&str,digest:&str)->Result<(),String> {
+        self.migration_transaction(|state| {
+            let Some(receipt)=state.migration_receipts.get(operation).cloned() else {return Err("migration binding receipt unavailable".into());};
+            if receipt.digest!=digest {return Err("migration binding digest changed".into());}
+            let map=state.bindings.get_mut(&receipt.channel).ok_or("migration binding changed")?;
+            if map.get(&receipt.user).is_some_and(|a|a!=&receipt.agent) {return Err("migration binding changed".into());}
+            map.remove(&receipt.user);
+            // Retain a receipt tombstone for idempotent disable/retry; a new
+            // external redemption explicitly removes it before granting access.
+            Ok(())
+        })
+    }
+    fn migration_transaction(&self,action:impl FnOnce(&mut BindState)->Result<(),String>)->Result<(),String> {
+        let path=self.persist_path.as_ref().ok_or("migration requires durable bindings")?;
+        duduclaw_core::with_file_lock(path,|| {
+            let mut state=read_durable_state(path)?;
+            action(&mut state).map_err(|_|std::io::Error::other("migration binding refused"))?;
+            write_durable_state(path,&state)
+        }).map_err(|_|"migration binding transaction failed".into())
     }
 }
 
@@ -582,4 +628,90 @@ mod tests {
         let state = store.state.read().await;
         assert_eq!(state.tokens.get(&digest).unwrap().max_uses, MAX_USES_LIMIT);
     }
+}
+
+#[cfg(test)] mod migration_tests {
+    use super::*;
+    #[tokio::test] async fn migration_authority_channel_normal_mutation_reloads_under_shared_lock() {
+        let temp=tempfile::tempdir().unwrap();let path=temp.path().join("agent_bindings.json");
+        let ordinary=AgentBindingStore::with_persistence(path.clone());
+        let migration=AgentBindingStore::with_persistence(path);
+        // The ordinary store cached empty state before migration committed.
+        migration.migration_bind("op","digest","telegram","123","sales").unwrap();
+        let token=ordinary.generate_bind_token("telegram","support",15,1).await;
+        assert!(!token.is_empty());
+        migration.migration_readback("op","digest","telegram","123","sales").unwrap();
+        ordinary.redeem_bind_token("telegram",&token,"456").await.unwrap();
+        migration.migration_readback("op","digest","telegram","123","sales").unwrap();
+        assert_eq!(migration.resolve_bound_agent("telegram","456").await.as_deref(),Some("support"));
+        assert!(ordinary.unbind("telegram","456").await);
+        migration.migration_readback("op","digest","telegram","123","sales").unwrap();
+    }
+    #[tokio::test] async fn migration_authority_channel_binding_receipt_retry_and_fresh_redemption_fence() {
+        let temp=tempfile::tempdir().unwrap();let store=AgentBindingStore::with_persistence(temp.path().join("agent_bindings.json"));
+        assert_eq!(store.resolve_bound_agent("telegram","123").await,None);
+        store.migration_bind("operation","digest","telegram","123","sales").unwrap();store.migration_bind("operation","digest","telegram","123","sales").unwrap();
+        store.migration_readback("operation","digest","telegram","123","sales").unwrap();assert_eq!(store.resolve_bound_agent("telegram","123").await.as_deref(),Some("sales"));
+        store.migration_unbind("operation","digest").unwrap();store.migration_unbind("operation","digest").unwrap();assert_eq!(store.resolve_bound_agent("telegram","123").await,None);
+        store.migration_bind("operation","digest","telegram","123","sales").unwrap();
+        let token=store.generate_bind_token("telegram","sales",15,1).await;
+        store.redeem_bind_token("telegram",&token,"123").await.unwrap();
+        assert!(store.migration_unbind("operation","digest").is_err());assert_eq!(store.resolve_bound_agent("telegram","123").await.as_deref(),Some("sales"));
+    }
+}
+
+fn read_durable_state(path:&std::path::Path)->std::io::Result<BindState> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file()&&m.len()<=1024*1024=>serde_json::from_str(&crate::handlers::config_commit::read_regular_config(path)?).map_err(|_|std::io::Error::other("binding state invalid")),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(BindState::default()),
+        _=>Err(std::io::Error::other("binding state unavailable")),
+    }
+}
+fn write_durable_state(path:&std::path::Path,state:&BindState)->std::io::Result<()> {
+    let encoded=serde_json::to_string_pretty(state).map_err(|_|std::io::Error::other("binding encoding failed"))?;
+    crate::handlers::config_commit::replace_owner_only(path,&encoded)?;
+    std::fs::File::open(path.parent().ok_or_else(||std::io::Error::other("binding path"))?).and_then(|f|f.sync_all())
+}
+
+// ── F6h (isolation_label_stores, S9): global channel routes to one label ──
+
+/// Routes to `agent` (exact label): durable channel-user bindings plus
+/// unexpired bind tokens. Missing file ⇒ 0; unreadable or corrupt ⇒ `Err`
+/// (never read as zero).
+pub(crate) fn label_route_count(path:&std::path::Path,agent:&str)->std::io::Result<u64> {
+    let mut state=read_durable_state(path)?;
+    prune_expired(&mut state);
+    let bound=state.bindings.values().flat_map(|users|users.values()).filter(|bound|bound.as_str()==agent).count();
+    let tokens=state.tokens.values().filter(|token|token.agent_id==agent).count();
+    Ok((bound+tokens) as u64)
+}
+
+/// Strip every route to `agent` (exact label) under the store lock: bindings
+/// and bind tokens. Returns the stripped names (`binding:<channel>:<user>`,
+/// `token:<channel>`; never a token digest). A missing file is never created.
+pub(crate) fn strip_label_routes(path:&std::path::Path,agent:&str)->std::io::Result<Vec<String>> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(Vec::new()),
+        _=>{}
+    }
+    duduclaw_core::with_file_lock(path,|| {
+        let mut state=read_durable_state(path)?;
+        let mut names=Vec::new();
+        for (channel,users) in state.bindings.iter_mut() {
+            users.retain(|user,bound| {
+                let keep=bound.as_str()!=agent;
+                if !keep { names.push(format!("binding:{channel}:{user}")); }
+                keep
+            });
+        }
+        state.bindings.retain(|_,users|!users.is_empty());
+        state.tokens.retain(|_,token| {
+            let keep=token.agent_id!=agent;
+            if !keep { names.push(format!("token:{}",token.channel)); }
+            keep
+        });
+        if !names.is_empty() { write_durable_state(path,&state)?; }
+        names.sort();
+        Ok(names)
+    })
 }

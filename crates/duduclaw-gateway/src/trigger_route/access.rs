@@ -14,12 +14,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use duduclaw_agent::registry::LoadedAgent;
+use duduclaw_auth::acl::PersonalRestriction;
 use duduclaw_auth::{EffectiveAccess, GrantSource, UserDb, UserRole};
 
 /// The human behind a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sender {
-    /// An active dashboard Admin: may call everyone. `user_id` is `None`
+    /// An active dashboard Admin: may call everyone — except, in protected
+    /// mode, another person's Personal employee (P1h N1). `user_id` is `None`
     /// only for a synthetic "everyone" sender (no real account).
     Admin { user_id: Option<String> },
     /// An active dashboard account and what it may call (read live).
@@ -108,10 +110,65 @@ impl SenderAccess {
         })
     }
 
+    /// v1.81 P1h (N1): the person this sender is, for the Personal check — a
+    /// mapped account (Admin or not), `""` for an unmapped sender (no person:
+    /// never an owner), `None` only for the synthetic "everyone" sender of
+    /// [`crate::trigger_route::turn::calls_anyone`] (no real account; used to
+    /// ask "is the bot addressed", never to route).
+    fn person(&self) -> Option<&str> {
+        match &self.sender {
+            Sender::Admin { user_id: Some(id) } | Sender::Account { user_id: id, .. } => Some(id.as_str()),
+            Sender::Admin { user_id: None } => None,
+            Sender::Unmapped => Some(""),
+        }
+    }
+
+    /// P1h (N1): `agent` is a Personal employee this sender does not own (or
+    /// its ownership is unreadable) under `restriction`. Calling or assigning
+    /// an employee makes it run work for the sender, so this is the
+    /// delegation denial: owner only, an Admin's audited break-glass read
+    /// never counts.
+    pub(crate) fn personal_denied_under(
+        &self,
+        agent: &str,
+        restriction: Option<&dyn PersonalRestriction>,
+    ) -> bool {
+        match (self.person(), restriction) {
+            (Some(person), Some(restriction)) => restriction.denies_delegation(person, agent),
+            _ => false,
+        }
+    }
+
     /// Why this sender may call `agent` in a conversation whose default
     /// employee is `fallback`, or `None` when they may not. A binding or a
     /// team grant is reported before the "open to everyone" sources.
+    ///
+    /// P1h (N1): in protected mode a Personal employee answers only its
+    /// owner — not an Admin, not a binding, not the conversation default.
+    /// The one exception is an owner-configured `[channels] public_trigger`
+    /// on the employee itself (written only through `agents.update`, a P1e
+    /// Config write: owner, or an audited Admin step-up), which opens
+    /// calling — never assigning — to everyone.
     pub fn grant(&self, agent: &LoadedAgent, fallback: Option<&str>) -> Option<GrantSource> {
+        self.grant_under(agent, fallback, duduclaw_auth::acl::personal_restriction())
+    }
+
+    /// [`Self::grant`] under an explicit Personal restriction (tests; the
+    /// production path uses the restriction installed at gateway boot).
+    pub(crate) fn grant_under(
+        &self,
+        agent: &LoadedAgent,
+        fallback: Option<&str>,
+        restriction: Option<&dyn PersonalRestriction>,
+    ) -> Option<GrantSource> {
+        let grant = self.grant_unrestricted(agent, fallback)?;
+        if self.personal_denied_under(&agent.config.agent.name, restriction) {
+            return is_public_trigger(agent).then_some(GrantSource::Public);
+        }
+        Some(grant)
+    }
+
+    fn grant_unrestricted(&self, agent: &LoadedAgent, fallback: Option<&str>) -> Option<GrantSource> {
         if !self.webchat_allows(agent) {
             return None;
         }
@@ -144,6 +201,16 @@ impl SenderAccess {
     /// is `fallback`?
     pub fn may_call(&self, agent: &LoadedAgent, fallback: Option<&str>) -> bool {
         self.grant(agent, fallback).is_some()
+    }
+
+    /// [`Self::may_call`] under an explicit Personal restriction (tests).
+    pub(crate) fn may_call_under(
+        &self,
+        agent: &LoadedAgent,
+        fallback: Option<&str>,
+        restriction: Option<&dyn PersonalRestriction>,
+    ) -> bool {
+        self.grant_under(agent, fallback, restriction).is_some()
     }
 
     /// Stable, non-identifying label for logs and the audit trail. An

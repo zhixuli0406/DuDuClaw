@@ -212,6 +212,30 @@ async fn approved_human_step_is_still_fenced_by_activation_revocation_after_reop
     assert!(reopened.inspect_revision_grant(&grant).await.is_err());
 }
 
+/// SR5 round 3 N1: the workflow `bound_human_approval` validity checks the
+/// card's employee incarnation in the operation's own transaction.
+#[tokio::test]
+async fn sr5r3_bound_human_operation_refuses_a_card_of_another_incarnation() {
+    let (_home, broker, store, accepted, run) = fixture().await;
+    let (_grant, id, binding) = human_operation(&broker, &store, &accepted, run).await;
+    let approval: String = broker.store.conn.lock().await
+        .query_row("SELECT approval_id FROM approval_operations WHERE operation_id=?1", params![id], |r| r.get(0))
+        .unwrap();
+    // The card names an incarnation the confirmed index does not hold.
+    broker.store.conn.lock().await
+        .execute("UPDATE approvals SET employee_incarnation=3 WHERE id=?1", params![approval]).unwrap();
+    let error = broker.claim_operation(&id, &binding, "human-worker", 60).await.err().expect("refused");
+    assert!(error.contains("employee_incarnation_changed"), "{error}");
+    // The refusal is deterministic (re-checked on every claim) ...
+    assert!(broker.claim_operation(&id, &binding, "human-worker", 60).await.is_err());
+    // ... and a card without an incarnation of a label with no confirmed row
+    // is unaffected.
+    broker.store.conn.lock().await
+        .execute("UPDATE approvals SET employee_incarnation=NULL WHERE id=?1", params![approval]).unwrap();
+    let claimed = broker.claim_operation(&id, &binding, "human-worker", 60).await;
+    assert!(claimed.is_ok(), "{:?}", claimed.err());
+}
+
 #[tokio::test]
 async fn human_begin_winner_retains_receipt_and_is_reported_by_revoke() {
     let (_home, broker, store, accepted, run) = fixture().await;

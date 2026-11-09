@@ -28,6 +28,7 @@
 //! - `googlechat_project_number` — Cloud project number (JWT audience)
 //! - `googlechat_service_account_json` (`_enc`) — service-account JSON key
 
+use crate::isolation_http::LiveRequest;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -297,7 +298,7 @@ impl GoogleChatCreds {
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion.as_str()),
             ])
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| format!("token request: {e}"))?;
         if !resp.status().is_success() {
@@ -1054,7 +1055,7 @@ async fn post_message(
         .post(&url)
         .bearer_auth(&token)
         .json(&body)
-        .send()
+        .send_authorized()
         .await
     {
         Ok(resp) if resp.status().is_success() => Ok(resp
@@ -1213,7 +1214,7 @@ async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str)
         .patch(&url)
         .bearer_auth(&token)
         .json(&body)
-        .send()
+        .send_authorized()
         .await
     {
         Ok(resp) if !resp.status().is_success() => {

@@ -1,10 +1,8 @@
 use super::*;
 
 impl ApprovalStore {
-    pub(in crate::approval) fn migrate_workflow_authority(conn: &Connection) -> Result<(), String> {
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| e.to_string())?;
+    // The caller owns the schema transaction, including rollback on any failure.
+    pub(in crate::approval) fn migrate_workflow_authority(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS approval_authority_schema(version INTEGER NOT NULL);" ,)
             .map_err(|e| e.to_string())?;
         let versions: Vec<i64> = {
@@ -135,6 +133,6 @@ impl ApprovalStore {
             tx.execute("INSERT INTO approval_authority_schema VALUES(1)", [])
                 .map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        Ok(())
     }
 }

@@ -38,9 +38,8 @@ impl TaskStore {
     ) -> Result<StopTreeOutcome, String> {
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("stop tree: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         if let Some(existing) = tx
             .query_row(
                 &format!("SELECT {STOP_COLUMNS} FROM task_stop_requests WHERE root_task_id = ?1"),
@@ -145,12 +144,13 @@ impl TaskStore {
             ],
         )
         .map_err(|e| format!("stop tree: record: {e}"))?;
-        tx.commit().map_err(|e| format!("stop tree: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(StopTreeOutcome::Requested(row))
     }
 
     pub async fn get_stop_request(&self, root: &str) -> Result<Option<StopRequestRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!("SELECT {STOP_COLUMNS} FROM task_stop_requests WHERE root_task_id = ?1"),
             params![root],
@@ -163,6 +163,7 @@ impl TaskStore {
     /// Stop requests still waiting for a running turn / external action.
     pub async fn pending_stop_requests(&self) -> Result<Vec<StopRequestRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {STOP_COLUMNS} FROM task_stop_requests WHERE state = 'cancel_pending'
@@ -187,7 +188,9 @@ impl TaskStore {
         if !matches!(state, "cancel_pending" | "stopped" | "stopped_uncertain") {
             return Err(format!("invalid stop state: {state}"));
         }
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let n = conn
             .execute(
                 "UPDATE task_stop_requests SET state=?2, detail_json=?3, updated_at=?4
@@ -195,12 +198,14 @@ impl TaskStore {
                 params![root, state, detail_json, resp_ts(now)],
             )
             .map_err(|e| format!("update stop request: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
     /// Whether a task id is inside any stop request's tree.
     pub async fn in_stop_tree(&self, task_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!("SELECT {}", in_stop_tree_sql("?1")),
             params![task_id],
@@ -220,6 +225,7 @@ impl TaskStore {
         }
         let ids_json = serde_json::to_string(ids).map_err(|e| e.to_string())?;
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT COALESCE(MAX(team_spec_json IS NOT NULL), 0), MAX(lease_expires_at)
                FROM tasks WHERE id IN (SELECT value FROM json_each(?1))",
@@ -234,6 +240,7 @@ impl TaskStore {
     /// is not locked out by children it already finished.
     pub async fn child_count(&self, parent: &str) -> Result<i64, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE parent_task_id = ?1 \
                AND status NOT IN ('done','cancelled','failed')",
@@ -247,6 +254,7 @@ impl TaskStore {
     /// (parent chain, up to [`STOP_ANCESTRY_DEPTH`] levels).
     pub async fn is_descendant_of(&self, task_id: &str, ancestor: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!(
                 "SELECT EXISTS (WITH RECURSIVE anc(id, depth) AS ( \
@@ -264,6 +272,7 @@ impl TaskStore {
     /// occurrence, i.e. the task belongs to a responsibility run's tree.
     pub async fn in_occurrence_tree(&self, task_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM responsibility_occurrences o WHERE o.task_id IN ( \
@@ -282,6 +291,7 @@ impl TaskStore {
     /// an ended occurrence as unsuccessful.
     pub async fn stop_counts_as_failure(&self, task_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM task_stop_requests sr WHERE sr.counts_as_failure = 1 \
@@ -299,6 +309,7 @@ impl TaskStore {
     /// Up to `limit` ids of the tree under `root` (root first).
     pub async fn stop_tree_ids(&self, root: &str, limit: usize) -> Result<Vec<String>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(
                 "WITH RECURSIVE tree(id) AS (
@@ -320,7 +331,9 @@ impl TaskStore {
         now: DateTime<Utc>,
     ) -> Result<(usize, usize), String> {
         let ids = self.stop_tree_ids(root, STOP_TREE_SCAN_LIMIT).await?;
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let open: Vec<String> = {
             let ids_json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
             let mut stmt = conn
@@ -345,6 +358,7 @@ impl TaskStore {
                 params![batch_json, resp_ts(now)],
             )
             .map_err(|e| format!("stop batch: cancel: {e}"))?;
+        commit_live_write(conn)?;
         Ok((n, open.len().saturating_sub(n)))
     }
 
@@ -360,6 +374,7 @@ impl TaskStore {
         let ids_json = serde_json::to_string(ids).map_err(|e| e.to_string())?;
         let now_s = resp_ts(now);
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, COALESCE(lease_expires_at, '') FROM tasks

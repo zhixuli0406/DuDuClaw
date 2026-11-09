@@ -269,6 +269,9 @@ mod decrypt_channel_token_tests {
 /// identity can carry one, and it would inherit the system senders'
 /// unconditional delegation reach, so it resolves to the untrusted sentinel.
 pub async fn get_default_agent(home_dir: &Path) -> String {
+    if let Some(employee) = crate::mcp_isolation_identity::verified_employee(home_dir) {
+        return employee.unwrap_or_else(|_| duduclaw_core::UNTRUSTED_AGENT_ID.to_owned());
+    }
     if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
         if let Ok(claimed) = std::env::var(duduclaw_core::ENV_AGENT_ID) {
             let claimed = claimed.trim();
@@ -348,6 +351,12 @@ fn audit_system_sender_identity_once(home_dir: &Path, claimed: &str, source: &st
 /// site; both are cheap file reads and `get_default_agent` runs a handful of
 /// times per process, not per tool call.
 pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdict {
+    // A native Linux isolated call carries its connection-bound employee; no
+    // process environment participates.
+    if let Some(employee) = crate::mcp_isolation_identity::verified_employee(home_dir) {
+        return if employee.is_ok() { duduclaw_core::IdentityVerdict::Verified }
+            else { duduclaw_core::IdentityVerdict::Rejected };
+    }
     // Authenticate before interpreting the untrusted claim. External clients
     // must never inherit an employee identity through the grace-period path.
     let principal = crate::mcp_auth::authenticate_from_env(home_dir);
@@ -376,7 +385,7 @@ pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdic
         let signed = duduclaw_core::is_valid_agent_id(claimed)
             && duduclaw_core::load_identity_key(home_dir)
                 .map(zeroize::Zeroizing::new)
-                .is_some_and(|key| duduclaw_core::verify_identity_token(&key, claimed, &token));
+                .is_some_and(|key| duduclaw_core::verify_agent_token(home_dir, &key, claimed, &token));
         return if signed {
             duduclaw_core::IdentityVerdict::Verified
         } else {

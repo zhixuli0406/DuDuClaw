@@ -124,12 +124,12 @@ fn rec_error(msg: &str) -> Value {
 
 // ── Detached child registry (reap opportunistically on stop) ────────────────
 
-fn child_registry() -> &'static Mutex<HashMap<String, std::process::Child>> {
-    static REG: OnceLock<Mutex<HashMap<String, std::process::Child>>> = OnceLock::new();
+fn child_registry() -> &'static Mutex<HashMap<String, duduclaw_core::execution_blocking::Child>> {
+    static REG: OnceLock<Mutex<HashMap<String, duduclaw_core::execution_blocking::Child>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn register_child(id: &str, child: std::process::Child) {
+fn register_child(id: &str, child: duduclaw_core::execution_blocking::Child) {
     if let Ok(mut reg) = child_registry().lock() {
         reg.insert(id.to_string(), child);
     }
@@ -184,10 +184,9 @@ async fn resolve_playwright_module_root() -> Option<PathBuf> {
         warn!(path = %p.display(), "DUDUCLAW_PLAYWRIGHT_NODE_PATH set but contains no playwright/ — ignoring");
     }
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(out) = tokio::process::Command::new("npm")
-        .args(["root", "-g"])
-        .output()
-        .await
+    let mut command = tokio::process::Command::new("npm");
+    command.args(["root", "-g"]);
+    if let Ok(out) = duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await
     {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -330,6 +329,9 @@ pub(crate) async fn handle_browser_record_start(
     home_dir: &Path,
     agent: &str,
 ) -> Value {
+    if crate::mcp_isolation::current().is_some() || duduclaw_core::execution_gate::isolation_required() {
+        return rec_error("受保護錄製須使用隔離執行服務，已拒絕主機錄製。");
+    }
     let url = args
         .get("url")
         .and_then(|v| v.as_str())
@@ -415,7 +417,7 @@ pub(crate) async fn handle_browser_record_start(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = match cmd.spawn() {
+    let child = match duduclaw_core::execution_blocking::spawn(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool) {
         Ok(c) => c,
         Err(e) => return rec_error(&format!("啟動錄製 driver 失敗：{e}")),
     };
@@ -428,7 +430,7 @@ pub(crate) async fn handle_browser_record_start(
         name: name.to_string(),
         url: Some(url.to_string()),
         agent: agent.to_string(),
-        pid: Some(pid),
+        pid,
         started_at: chrono::Utc::now().to_rfc3339(),
     };
     let meta_path = dir.join("meta.json");
@@ -463,15 +465,11 @@ async fn request_stop_and_wait(dir: &Path, meta: &RecordingMeta) -> Result<Value
             tokio::time::sleep(STOP_POLL).await;
         }
         if !done_path.exists() {
-            // Hung recorder: terminate the process group leader.
-            #[cfg(unix)]
-            if let Some(pid) = meta.pid {
-                let _ = tokio::process::Command::new("kill")
-                    .arg("-TERM")
-                    .arg(pid.to_string())
-                    .output()
-                    .await;
-            }
+            // A saved PID is diagnostic only: the backend may already have
+            // reaped that leader while output is draining. Cancel its live run.
+            let control = child_registry().lock().ok()
+                .and_then(|children| children.get(&meta.id).map(|child| child.control()));
+            if let Some(control) = control { let _ = control.start_kill(); }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
@@ -506,6 +504,9 @@ fn resolve_existing_recording(args: &Value, home_dir: &Path) -> Result<(String, 
 // ── browser_record_stop ──────────────────────────────────────────────────────
 
 pub(crate) async fn handle_browser_record_stop(args: &Value, home_dir: &Path) -> Value {
+    if crate::mcp_isolation::current().is_some() || duduclaw_core::execution_gate::isolation_required() {
+        return rec_error("受保護錄製須使用隔離工作控制，已拒絕主機錄製。");
+    }
     let (id, dir) = match resolve_existing_recording(args, home_dir) {
         Ok(v) => v,
         Err(e) => return e,
@@ -648,7 +649,7 @@ pub(crate) async fn handle_desktop_record_start(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = match cmd.spawn() {
+    let child = match duduclaw_core::execution_blocking::spawn(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool) {
         Ok(c) => c,
         Err(e) => return rec_error(&format!("啟動桌面錄製 worker 失敗：{e}")),
     };
@@ -661,7 +662,7 @@ pub(crate) async fn handle_desktop_record_start(
         name: name.to_string(),
         url: None,
         agent: agent.to_string(),
-        pid: Some(pid),
+        pid,
         started_at: chrono::Utc::now().to_rfc3339(),
     };
     if let Err(e) = std::fs::write(
@@ -776,11 +777,9 @@ pub async fn run_desktop_record_worker(dir: PathBuf, interval_ms: u64, max_secon
         // Screenshot (macOS only — the start handler already gated the OS).
         let frame_rel = format!("frames/{seq:06}.jpg");
         let frame_path = desktop_dir.join(&frame_rel);
-        let shot_ok = tokio::process::Command::new("screencapture")
-            .args(["-x", "-t", "jpg"])
-            .arg(&frame_path)
-            .output()
-            .await
+        let mut command = tokio::process::Command::new("screencapture");
+        command.args(["-x", "-t", "jpg"]).arg(&frame_path);
+        let shot_ok = duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await
             .map(|o| o.status.success() && frame_path.is_file())
             .unwrap_or(false);
         if shot_ok {

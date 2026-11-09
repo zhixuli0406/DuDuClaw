@@ -125,9 +125,8 @@ impl TaskStore {
             require_safe_contract(schedule)?;
         }
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("insert responsibility: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         tx.execute(
             &format!("INSERT INTO responsibilities ({RESP_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)"),
             params![
@@ -154,12 +153,12 @@ impl TaskStore {
             )
             .map_err(|e| format!("init event cursor: {e}"))?;
         }
-        tx.commit()
-            .map_err(|e| format!("insert responsibility: commit: {e}"))
+        commit_live_write(tx)
     }
 
     pub async fn get_responsibility(&self, id: &str) -> Result<Option<ResponsibilityRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         get_resp_conn(&conn, id)
     }
 
@@ -169,6 +168,7 @@ impl TaskStore {
         owner: Option<&str>,
     ) -> Result<Vec<ResponsibilityRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {RESP_COLUMNS} FROM responsibilities
@@ -181,6 +181,22 @@ impl TaskStore {
             .map_err(|e| format!("list responsibilities: {e}"))
     }
 
+    /// Finite collection variant: both live ownership and immutable IDs are
+    /// SQL predicates, rather than filtering an employee-wide list afterwards.
+    pub async fn list_responsibilities_isolated(&self, owner: &str, ids: &[String]) -> Result<Vec<ResponsibilityRow>, String> {
+        let conn = self.conn.lock().await;
+        verify_live_io()?;
+        super::isolation_queries::validate_scope(owner, ids)?;
+        let ids = serde_json::to_string(ids).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&format!("SELECT {RESP_COLUMNS} FROM responsibilities
+            WHERE owner_agent_id=?1 AND responsibility_id IN (SELECT value FROM json_each(?2))
+            ORDER BY created_at DESC")).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![owner, ids], row_to_responsibility)
+            .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        verify_live_io()?;
+        Ok(rows)
+    }
+
     /// Generic single-statement CAS used by pause / resume / clear-failures.
     async fn resp_state_cas(
         &self,
@@ -189,15 +205,13 @@ impl TaskStore {
         binds: &[&(dyn rusqlite::types::ToSql + Sync)],
     ) -> Result<RespCas, String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("responsibility cas: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let n = tx
             .execute(sql, rusqlite::params_from_iter(binds.iter()))
             .map_err(|e| format!("responsibility cas: {e}"))?;
         let row = get_resp_conn(&tx, id)?;
-        tx.commit()
-            .map_err(|e| format!("responsibility cas: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(match (n, row) {
             (1, Some(r)) => RespCas::Applied(r),
             (_, r) => RespCas::Conflict(r),
@@ -275,9 +289,8 @@ impl TaskStore {
     ) -> Result<RespCas, String> {
         let now = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("disable responsibility: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let n = tx
             .execute(
                 "UPDATE responsibilities SET state='disabled', control_epoch=control_epoch+1,
@@ -291,8 +304,7 @@ impl TaskStore {
             retire_subscriptions_conn(&tx, id, "cancelled", "disabled", &now)?;
         }
         let row = get_resp_conn(&tx, id)?;
-        tx.commit()
-            .map_err(|e| format!("disable responsibility: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(match (n, row) {
             (1, Some(r)) => RespCas::Applied(r),
             (_, r) => RespCas::Conflict(r),
@@ -311,9 +323,8 @@ impl TaskStore {
     ) -> Result<RespCas, String> {
         let now = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("enable responsibility: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let n = tx
             .execute(
                 // Third review LOW: re-enabling keeps the failure streak; only
@@ -338,8 +349,7 @@ impl TaskStore {
                 insert_wakeup_conn(&tx, &w)?;
             }
         }
-        tx.commit()
-            .map_err(|e| format!("enable responsibility: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(match (n, row) {
             (1, Some(r)) => RespCas::Applied(r),
             (_, r) => RespCas::Conflict(r),
@@ -370,9 +380,8 @@ impl TaskStore {
         let now = resp_ts(now);
         let epoch_bump: i64 = resubscribe.is_some() as i64;
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("update contract: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let c = contract;
         let n = tx
             .execute(
@@ -427,8 +436,7 @@ impl TaskStore {
                 }
             }
         }
-        tx.commit()
-            .map_err(|e| format!("update contract: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(match (n, row) {
             (1, Some(r)) => RespCas::Applied(r),
             (_, r) => RespCas::Conflict(r),
@@ -444,9 +452,8 @@ impl TaskStore {
     ) -> Result<Vec<ResponsibilityRow>, String> {
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("expire responsibilities: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let due: Vec<ResponsibilityRow> = {
             let mut stmt = tx
                 .prepare(&format!(
@@ -478,8 +485,7 @@ impl TaskStore {
                 expired.push(r);
             }
         }
-        tx.commit()
-            .map_err(|e| format!("expire responsibilities: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(expired)
     }
 
@@ -491,7 +497,9 @@ impl TaskStore {
         period_key: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let n = conn
             .execute(
                 "UPDATE responsibilities SET state='budget_paused', state_reason=?2,
@@ -500,6 +508,7 @@ impl TaskStore {
                 params![id, format!("budget:{period_key}"), resp_ts(now)],
             )
             .map_err(|e| format!("budget pause: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
@@ -511,7 +520,9 @@ impl TaskStore {
         current_period_key: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let n = conn
             .execute(
                 "UPDATE responsibilities SET state='active', state_reason=NULL,
@@ -521,6 +532,7 @@ impl TaskStore {
                 params![id, format!("budget:{current_period_key}"), resp_ts(now)],
             )
             .map_err(|e| format!("budget resume: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
@@ -528,6 +540,7 @@ impl TaskStore {
     /// (not expired) and still on the subscription's epoch.
     pub async fn armed_wakeups(&self, kind: &str) -> Result<Vec<WakeupRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let cols = WAKEUP_COLUMNS
             .split(", ")
             .map(|c| format!("w.{}", c.trim()))
@@ -550,6 +563,7 @@ impl TaskStore {
 
     pub async fn list_wakeups(&self, responsibility_id: &str) -> Result<Vec<WakeupRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {WAKEUP_COLUMNS} FROM task_wakeups WHERE responsibility_id = ?1
@@ -576,9 +590,8 @@ impl TaskStore {
     ) -> Result<bool, String> {
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("record fire: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         // S-L6: settled facts older than the retention are pruned; past the
         // pending cap a new fact is kept only as a dropped row without data.
         let resp_id: Option<String> = tx
@@ -651,8 +664,7 @@ impl TaskStore {
             )
             .map_err(|e| format!("advance wakeup: {e}"))?;
         }
-        tx.commit()
-            .map_err(|e| format!("record fire: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(n == 1)
     }
 
@@ -665,7 +677,9 @@ impl TaskStore {
         new_due: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let n = conn
             .execute(
                 "UPDATE task_wakeups SET due_at = ?3, updated_at = ?4
@@ -673,12 +687,14 @@ impl TaskStore {
                 params![wakeup_id, old_due, new_due, resp_ts(now)],
             )
             .map_err(|e| format!("advance wakeup: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
     /// Whether any fact (any state) has been recorded for a subscription.
     pub async fn wakeup_has_fire(&self, wakeup_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM wakeup_fires WHERE wakeup_id = ?1)",
             params![wakeup_id],
@@ -696,9 +712,9 @@ impl TaskStore {
         agent_limit: Option<i64>,
     ) -> Result<(), String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("arm wakeup: begin: {e}"))?;
+        verify_live_io()?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
         let resp =
             get_resp_conn(&tx, &wakeup.responsibility_id)?.ok_or("responsibility_not_found")?;
         if resp.control_epoch != wakeup.control_epoch || resp.state == "expired" {
@@ -717,8 +733,10 @@ impl TaskStore {
                 return Err("agent_followup_limit".into());
             }
         }
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         insert_wakeup_conn(&tx, wakeup)?;
-        tx.commit().map_err(|e| format!("arm wakeup: commit: {e}"))
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        commit_live_write(tx)
     }
 
     /// Facts of one responsibility, newest first (debug / dashboard).
@@ -728,6 +746,7 @@ impl TaskStore {
         limit: usize,
     ) -> Result<Vec<FireRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {FIRE_COLUMNS} FROM wakeup_fires WHERE responsibility_id = ?1
@@ -746,12 +765,14 @@ impl TaskStore {
     /// Pending facts of one responsibility, oldest first.
     pub async fn pending_fires(&self, responsibility_id: &str) -> Result<Vec<FireRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         pending_fires_conn(&conn, responsibility_id)
     }
 
     /// Responsibility ids that currently have at least one pending fact.
     pub async fn responsibilities_with_pending_fires(&self) -> Result<Vec<String>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT responsibility_id FROM wakeup_fires WHERE state = 'pending'

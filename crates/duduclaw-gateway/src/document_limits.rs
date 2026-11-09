@@ -187,6 +187,8 @@ impl DocumentLimits {
 /// Why a document was refused. Every variant is a hard DENY.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LimitViolation {
+    /// The isolated worker refused the document or could not complete its check.
+    IsolationUnavailable,
     /// The file could not be opened or read at all.
     Unreadable,
     /// The bytes start like a zip but do not parse as one.
@@ -222,6 +224,7 @@ impl LimitViolation {
     /// Stable machine tag for logs / metrics.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::IsolationUnavailable => "isolation_unavailable",
             Self::Unreadable => "unreadable",
             Self::Malformed => "malformed",
             Self::TooManyEntries { .. } => "too_many_entries",
@@ -239,6 +242,7 @@ impl LimitViolation {
     pub fn user_message(&self, display_name: &str) -> String {
         let name = duduclaw_core::truncate_bytes(display_name, MAX_ENTRY_NAME_BYTES);
         match self {
+            Self::IsolationUnavailable => "隔離模式目前無法完成這項文件安全檢查，已拒絕解析。".into(),
             Self::Unreadable => format!("無法讀取「{name}」，檔案可能已被移除或損毀。"),
             Self::Malformed => {
                 format!("「{name}」不是可解析的 Office 檔（壓縮結構損毀），已拒絕開啟。")
@@ -297,7 +301,19 @@ pub fn looks_like_zip(bytes: &[u8]) -> bool {
 /// do not fall back, do not truncate, do not hand the bytes to LibreOffice or
 /// a Python skill anyway.
 pub fn guard_document_path(path: &Path, limits: &DocumentLimits) -> Result<(), LimitViolation> {
-    let mut file = std::fs::File::open(path).map_err(|_| LimitViolation::Unreadable)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    if duduclaw_parse_worker::client::required() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+    }
+    let mut file = options.open(path).map_err(|_| LimitViolation::Unreadable)?;
+    if !file.metadata().map_err(|_| LimitViolation::Unreadable)?.is_file() {
+        return Err(LimitViolation::Unreadable);
+    }
     let mut magic = [0u8; 4];
     match file.read(&mut magic) {
         Ok(n) if looks_like_zip(&magic[..n]) => {}
@@ -314,7 +330,7 @@ pub fn guard_document_bytes(bytes: &[u8], limits: &DocumentLimits) -> Result<(),
     if !looks_like_zip(bytes) {
         return Ok(());
     }
-    inspect_container(Cursor::new(bytes.to_vec()), limits)
+    inspect_container(Cursor::new(bytes), limits)
 }
 
 // ── Scanner ─────────────────────────────────────────────────────
@@ -350,6 +366,30 @@ pub fn inspect_container<R: Read + Seek>(
     reader: R,
     limits: &DocumentLimits,
 ) -> Result<(), LimitViolation> {
+    inspect_container_with_isolation(reader, limits, duduclaw_parse_worker::client::required())
+}
+
+fn inspect_container_with_isolation<R: Read + Seek>(
+    reader: R,
+    limits: &DocumentLimits,
+    isolation_required: bool,
+) -> Result<(), LimitViolation> {
+    if isolation_required {
+        // Copy bytes without parsing in the gateway; actual decompression and
+        // the complete configured policy run in the disposable worker.
+        let mut reader = reader;
+        let limits = limits.clone().sanitized();
+        let policy = duduclaw_parse_worker::worker::DocumentPolicy {
+            max_uncompressed_bytes: limits.max_uncompressed_bytes,
+            max_entries: limits.max_entries,
+            max_compression_ratio: limits.max_compression_ratio,
+            max_xml_depth: limits.max_xml_depth,
+            xml_scan_part_bytes: limits.xml_scan_part_bytes,
+            xml_scan_total_bytes: limits.xml_scan_total_bytes,
+        };
+        return duduclaw_parse_worker::adapters::inspect_document_reader(&mut reader, policy)
+            .map_err(|_| LimitViolation::IsolationUnavailable);
+    }
     let mut state = ScanState::default();
     // (bytes, depth) for archives found nested inside the one being scanned.
     let mut pending: Vec<(Vec<u8>, u32)> = Vec::new();
@@ -575,9 +615,50 @@ fn skip_past_cdata(buf: &[u8], from: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_isolation_public_document_guards_route_by_container() {
+        const CHILD: &str = "DUDUCLAW_PARSE_DOCUMENT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "document_limits::tests::parse_isolation_public_document_guards_route_by_container", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        duduclaw_parse_worker::client::require_isolation();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document");
+        std::fs::write(&path, b"plain text").unwrap();
+        let limits = DocumentLimits::default();
+        assert!(guard_document_path(&path, &limits).is_ok());
+        assert!(guard_document_bytes(b"plain text", &limits).is_ok());
+        assert_eq!(guard_document_path(&dir.path().join("missing"), &limits), Err(LimitViolation::Unreadable));
+        assert!(guard_document_bytes(b"PK\x03\x04broken", &limits).is_err());
+    }
+
     use super::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn parse_isolation_container_copy_failure_never_reaches_parser() {
+        struct Unreadable;
+        impl Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("unreadable input"))
+            }
+        }
+        impl Seek for Unreadable {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                panic!("isolated request must not seek archive content in the gateway");
+            }
+        }
+        let result = inspect_container_with_isolation(Unreadable, &DocumentLimits::default(), true);
+        assert!(matches!(result, Err(LimitViolation::IsolationUnavailable)));
+        let bytes = normal_docx();
+        assert!(inspect_container_with_isolation(Cursor::new(bytes), &DocumentLimits::default(), false).is_ok());
+    }
 
     /// Build a zip in memory. `entries` are `(name, contents)`.
     fn build_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {

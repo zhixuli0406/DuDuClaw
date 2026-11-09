@@ -16,7 +16,9 @@ fn denied() -> axum::response::Response {
 fn limited() -> axum::response::Response {
     (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"嘗試次數過多，請稍後再試。"}))).into_response()
 }
-fn configured_origin(home: &std::path::Path) -> Result<String, String> {
+/// The operator-configured dashboard origin (passkey relying party). Also
+/// the origin of the F6d restore passkey proof, which has no request header.
+pub(crate) fn configured_origin(home: &std::path::Path) -> Result<String, String> {
     let text = crate::handlers::config_commit::read_regular_config(&home.join("config.toml")).map_err(|_|"無法讀取登入設定。")?;
     let table: toml::Table = text.parse().map_err(|_|"登入設定格式不正確。")?;
     let base = if let Some(value) = table.get("dashboard").and_then(|d|d.get("public_url")) {

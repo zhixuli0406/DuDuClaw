@@ -113,20 +113,35 @@ pub(crate) fn restricted_activity_json(full: &Value) -> Value {
 
 /// Per-call reader for list RPCs: one live identity, one audience lookup per
 /// task (cached for the call).
+///
+/// v1.81 P1b: in protected mode it also carries the Personal employees the
+/// reader does not own (`personal_visibility::hidden_from`, read once per
+/// call; unreadable ⇒ refused). Their rows are content-restricted here and
+/// list RPCs drop them ([`Self::hides`]) — listing ⇔ access. A listing's own
+/// `agent_id` was authorized by the dispatch gate ([`Self::admit_scope`]).
 pub(crate) struct TaskReader<'a> {
     home: &'a Path,
     live: UserContext,
     visible: std::sync::Mutex<HashMap<String, bool>>,
+    hidden: std::collections::BTreeSet<String>,
 }
 
 impl<'a> TaskReader<'a> {
     pub(crate) fn new(home: &'a Path, ctx: &UserContext) -> Result<Self, WsFrame> {
-        let live = live_reader_context(home, ctx)
-            .map_err(|_| WsFrame::error_response("", PERMISSION_DENIED))?;
+        Self::build(home, ctx, crate::runtime_readiness::is_protected_linux())
+    }
+
+    /// [`Self::new`] with the protected-mode flag passed in (tests).
+    pub(crate) fn build(home: &'a Path, ctx: &UserContext, protected: bool) -> Result<Self, WsFrame> {
+        let denied = || WsFrame::error_response("", PERMISSION_DENIED);
+        let live = live_reader_context(home, ctx).map_err(|_| denied())?;
+        let hidden = crate::personal_visibility::hidden_from(home, protected, &live.user_id)
+            .map_err(|_| denied())?;
         Ok(Self {
             home,
             live,
             visible: std::sync::Mutex::new(HashMap::new()),
+            hidden,
         })
     }
 
@@ -134,7 +149,33 @@ impl<'a> TaskReader<'a> {
         &self.live
     }
 
+    /// `agent` is a Personal employee this reader does not own: lists drop
+    /// its rows. Always `false` outside protected mode.
+    pub(crate) fn hides(&self, agent: &str) -> bool {
+        self.hidden.contains(agent)
+    }
+
+    /// The employees [`Self::hides`] (P1c): store page queries exclude them
+    /// before LIMIT and COUNT so totals match the listing. Empty outside
+    /// protected mode.
+    pub(crate) fn hidden(&self) -> &std::collections::BTreeSet<String> {
+        &self.hidden
+    }
+
+    /// The listing is scoped to `agent`, which the dispatch gate
+    /// (`personal_gates_for_params`) already admitted (owner, or an audited
+    /// Admin step-up). Only call with the request's own `agent_id`.
+    pub(crate) fn admit_scope(mut self, agent: Option<&str>) -> Self {
+        if let Some(agent) = agent {
+            self.hidden.remove(agent);
+        }
+        self
+    }
+
     pub(crate) fn can_read(&self, task_id: &str, owner: &str) -> bool {
+        if self.hides(owner) {
+            return false;
+        }
         let cached = self
             .visible
             .lock()
@@ -166,7 +207,8 @@ impl<'a> TaskReader<'a> {
     /// work to a report's employee can follow what they asked for without
     /// gaining that employee's other tasks.
     pub(crate) fn can_read_row(&self, row: &TaskRow) -> bool {
-        a2a_owner_allows(self.home, &self.live, &row.id)
+        !self.hides(&row.assigned_to)
+            && a2a_owner_allows(self.home, &self.live, &row.id)
             && (self.can_read(&row.id, &row.assigned_to) || self.assigned_by_reader(row))
     }
 
@@ -194,6 +236,9 @@ impl<'a> TaskReader<'a> {
     /// only).
     pub(crate) fn activity_json(&self, row: &ActivityRow, owner: Option<&str>) -> Value {
         let full = activity_row_to_json(row);
+        if self.hides(&row.agent_id) {
+            return restricted_activity_json(&full);
+        }
         match row.task_id.as_deref().filter(|t| !t.is_empty()) {
             Some(task_id) if !self.can_read_owned(task_id, owner) => {
                 restricted_activity_json(&full)

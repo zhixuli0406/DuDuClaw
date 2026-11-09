@@ -9,6 +9,7 @@ pub mod codex_sandbox;
 pub mod generic_cli;
 pub mod grok;
 pub mod openai_compat;
+mod isolation_gate;
 pub(crate) mod third_party_mcp;
 
 use std::collections::HashMap;
@@ -929,6 +930,32 @@ pub(crate) fn coarse_native_caps(
         "native write constraints ⇒ forcing the read-only sandbox for this spawn"
     );
     Ok(Some(caps.read_only_native_view()))
+}
+
+/// RM-103 S3 in protected mode: the same refusal as [`coarse_native_caps`],
+/// run by every coarse runtime (Codex, Grok, a registered generic CLI) before
+/// it routes to the isolated launch (`isolation_mcp::runtime`).
+///
+/// The isolated run's native profile is derived from the root publication
+/// (`duduclaw-spawnd` `gateway_plan::other_runtime_plan`); the gateway cannot
+/// select a read-only workspace for one run. So the fail-closed choice is
+/// taken: a native **write** constraint refuses the spawn exactly like a
+/// native **shell** constraint (`read_only_enforceable = false`), and a
+/// malformed `[capabilities]` ([`fail_closed_capabilities`]) carries both.
+/// Never narrowed, never just a warning.
+pub(crate) fn protected_coarse_native_gate(
+    caps: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    runtime_name: &str,
+    agent_id: &str,
+) -> Result<(), String> {
+    match coarse_native_caps(caps, runtime_name, agent_id, false)? {
+        None => Ok(()),
+        // Unreachable with `read_only_enforceable = false`; kept fail-closed.
+        Some(_) => Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+            "「{agent_id}」的設定限制了原生檔案寫入，但受保護模式下的 {runtime_name} 無法切換為唯讀，所以這次不執行。\
+             ({runtime_name} cannot enforce these native-tool restrictions in protected mode; refusing to run.)"
+        ))),
+    }
 }
 
 /// Apply the opt-in native OS sandbox (`duduclaw-sandbox`) to a to-be-spawned

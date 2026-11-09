@@ -146,6 +146,8 @@ impl SessionManager {
         stamp_existing: bool,
     ) -> Result<Session> {
         let conn = self.acquire().await;
+        // F6h writer gate (protected mode only): no session for a tombstoned label.
+        crate::isolation_label_stores::check_label_writable_at(&conn, agent_id).map_err(DuDuClawError::Gateway)?;
         let now = chrono::Utc::now().to_rfc3339();
         insert_or_stamp(&conn, session_id, agent_id, origin, stamp_existing, &now)
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;

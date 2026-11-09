@@ -216,6 +216,8 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
         || kind == crate::expert_skills::SKILLS_ACTION_KIND
         || kind == crate::agent_files::approval::ACTION_KIND
+        // SR2: decided only by the Personal employee's owner on the dashboard.
+        || kind == crate::isolation_background::PERSONAL_DELEGATION_KIND
         // RM-027: moving an employee in the org chart is decided by a current
         // Admin, which a channel press cannot establish.
         || kind == crate::org_change_approval::ACTION_KIND
@@ -452,6 +454,7 @@ async fn push_dashboard_only(
         else {
             continue;
         };
+        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return None; }
         if crate::channel_sender::send_plain_text(
             home_dir, &http, &channel, &token, &chat_id, &text,
         )
@@ -464,6 +467,10 @@ async fn push_dashboard_only(
 }
 
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {
+    // SR2 round 4 (N4): the owner-only Personal delegation card is never
+    // pushed or reminded through the generic chain (defence in depth behind
+    // `SELF_NOTIFYING_KINDS` and `approval::no_reminder`).
+    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND { return None; }
     if is_dashboard_only_record(Some(home_dir), rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
     }
@@ -608,6 +615,8 @@ pub(crate) async fn apply_decision(
     if is_dashboard_only_record(Some(home_dir), &rec) {
         return Err(dashboard_only_refusal(&rec.action_kind).into());
     }
+    // v1.81 P1c: a Personal employee's card is decided on a channel by its owner only (no step-up here).
+    if let Some(refusal) = crate::personal_decision::channel_card_refusal(home_dir, &rec, channel, channel_user_id) { return Err(refusal.into()); }
     if rec.status.is_terminal() {
         return Ok(match rec.status {
             ApprovalStatus::Approved => "這項要求先前已同意。".into(),

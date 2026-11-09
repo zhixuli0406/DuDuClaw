@@ -257,6 +257,12 @@ fn err(text: impl Into<String>) -> Value {
     json!({ "content": [{ "type": "text", "text": format!("Error: {}", text.into()) }], "isError": true })
 }
 
+/// v1.81 P1g (F9): the one answer for an unknown fork AND for another
+/// employee's fork, so the fork tools never confirm that one exists.
+pub(crate) fn fork_not_found(fork_id: &str) -> String {
+    format!("fork not found: {fork_id}")
+}
+
 /// Fail-closed gate: returns an error envelope when forking is disabled for the agent.
 fn require_enabled(settings: &ForkSettings) -> Option<Value> {
     if settings.enabled {
@@ -296,10 +302,64 @@ impl duduclaw_fork::judge::LlmCaller for UtilityJudgeCaller {
     }
 }
 
+/// Closed inventory shared by routing and readiness; never narrow it to hide a missing producer.
+pub(crate) fn is_fork_tool(name: &str) -> bool {
+    matches!(name, "fork_run" | "inspect_branches" | "diff_branches" | "merge_or_select" | "terminate_branch" | "fork_cost")
+}
+
+/// Keep the original per-employee opt-in and authenticated scope gates before
+/// entering the host-owned store. Protected reads never import legacy rows.
+async fn protected_fork(name: &str, args: &Value, home: &Path, agent: &str) -> Option<Value> {
+    // A host-injected service cannot enable the deferred v1.80 mutations.
+    // Check before opt-in reads, legacy stores, account lookup or publication.
+    if duduclaw_mcp_boundary::fork_policy::deferred(name)
+        && (crate::mcp_isolation::current().is_some()
+            || duduclaw_gateway::isolation_readiness::status().is_some()) {
+        return Some(err(crate::mcp_isolation::refusal_message(home,
+            crate::mcp_isolation_disposition::Refusal::ForkNextRelease).await));
+    }
+    let Some(call) = crate::mcp_isolation::current() else {
+        return duduclaw_core::execution_gate::isolation_required().then(||
+            err("受保護的分支執行服務尚未就緒，已拒絕操作。"));
+    };
+    let settings = load_fork_settings(home, agent);
+    if let Some(error) = require_enabled(&settings) { return Some(error); }
+    if call.home != home || call.agent != agent
+        || !duduclaw_mcp_boundary::tool_policy::eligible(&call.context, name) {
+        return Some(err("無法確認這次操作的員工身分與授權。"));
+    }
+    let Some(service) = call.forks.as_ref().filter(|service| service.supports(name)) else {
+        return Some(err("受保護的分支執行服務尚未就緒，已拒絕操作。"));
+    };
+    // Scope, approval and irreversible-action checks already ran in the common
+    // dispatcher. The service independently validates current policy and actor.
+    Some(match service.execute(&call.context, name, args).await {
+        Ok(value) => ok_json(value),
+        Err(error) => protected_fork_error(name, error),
+    })
+}
+
+/// FD-SEL: a protected fork read of a foreign fork (another employee id,
+/// principal or binding) answers exactly like an unknown fork. Only a host
+/// store failure is reported separately; it never depends on the fork owner.
+pub(crate) const FORK_NOT_FOUND: &str = "fork_not_found：找不到這個分支試算，或它不屬於目前的員工。";
+
+fn protected_fork_error(name: &str, error: duduclaw_mcp_boundary::VerificationError) -> Value {
+    use duduclaw_mcp_boundary::VerificationError;
+    if duduclaw_mcp_boundary::fork_policy::READ_TOOLS.contains(&name) {
+        return match error {
+            VerificationError::Unavailable => err("受保護的分支紀錄暫時無法讀取，已拒絕操作。"),
+            _ => err(FORK_NOT_FOUND),
+        };
+    }
+    err("分支操作未通過授權、狀態或版本檢查。")
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 /// `fork_run` — split the current task into N competing branches.
 pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("fork_run", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -484,6 +544,7 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
 
 /// `inspect_branches` — list a fork's branches + state + spend.
 pub async fn handle_inspect_branches(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("inspect_branches", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -496,12 +557,17 @@ pub async fn handle_inspect_branches(args: &Value, home_dir: &Path, agent_id: &s
         Some(f) => f,
         None => return err("fork_id is required"),
     };
+    // v1.81 P1g (F9): another employee's fork answers exactly like an
+    // unknown one, so the reply never reveals that it exists.
     let fork = match store.get_fork(fork_id) {
-        Ok(Some(f)) => f,
-        Ok(None) => return err(format!("fork not found: {fork_id}")),
+        Ok(Some(f)) if f.agent_id == agent_id => f,
+        Ok(_) => return err(fork_not_found(fork_id)),
         Err(e) => return err(format!("store error: {e}")),
     };
-    let branches = store.list_branches(fork_id).unwrap_or_default();
+    let branches = match store.list_branches(fork_id) {
+        Ok(branches) => branches,
+        Err(e) => return err(format!("store error: {e}")),
+    };
     let decision = match store.resolution_decision(fork_id) {
         Ok(decision) => decision,
         Err(error) => return err(format!("store error: {error}")),
@@ -524,6 +590,7 @@ pub async fn handle_inspect_branches(args: &Value, home_dir: &Path, agent_id: &s
 
 /// `diff_branches` — show outputs of two branches side by side.
 pub async fn handle_diff_branches(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("diff_branches", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -536,6 +603,13 @@ pub async fn handle_diff_branches(args: &Value, home_dir: &Path, agent_id: &str)
         Some(f) => f,
         None => return err("fork_id is required"),
     };
+    // Authorize the parent before reading branch output. A branch selector is
+    // data, never caller identity or authority to inspect another employee.
+    match store.get_fork(fork_id) {
+        Ok(Some(fork)) if fork.agent_id == agent_id => {},
+        Ok(_) => return err(fork_not_found(fork_id)),
+        Err(e) => return err(format!("store error: {e}")),
+    }
     let (a, b) = match (
         args.get("branch_a").and_then(|v| v.as_str()),
         args.get("branch_b").and_then(|v| v.as_str()),
@@ -569,6 +643,7 @@ pub async fn handle_diff_branches(args: &Value, home_dir: &Path, agent_id: &str)
 /// the parent is gone, the call errors and the fork stays unresolved — it never
 /// reports a promotion that did not happen.
 pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("merge_or_select", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -603,13 +678,13 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
 
             let fork = match store.get_fork(&fork_id) {
                 Ok(Some(f)) => f,
-                Ok(None) => return err(format!("fork not found: {fork_id}")),
+                Ok(None) => return err(fork_not_found(&fork_id)),
                 Err(e) => return err(format!("store error: {e}")),
             };
             // Promotion now writes files into the fork's parent workspace: only the
-            // agent that owns the fork may do that.
+            // agent that owns the fork may do that. P1g (F9): same text as unknown.
             if fork.agent_id != agent_id {
-                return err(format!("fork {fork_id} belongs to another agent"));
+                return err(fork_not_found(&fork_id));
             }
             // A reused employee id must not inherit authority to publish work
             // whose automatic admission was refused. Keep the decision check
@@ -687,6 +762,7 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
 
 /// `terminate_branch` — mark a branch terminated (kills its subprocess in P4 follow-up).
 pub async fn handle_terminate_branch(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("terminate_branch", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -712,8 +788,8 @@ pub async fn handle_terminate_branch(args: &Value, home_dir: &Path, agent_id: &s
             }
             match store.get_fork(&fork_id) {
                 Ok(Some(fork)) if fork.agent_id == agent_id => {}
-                Ok(Some(_)) => return err("fork belongs to another agent"),
-                Ok(None) => return err(format!("fork not found: {fork_id}")),
+                // P1g (F9): another agent's fork reads like an unknown one.
+                Ok(_) => return err(fork_not_found(&fork_id)),
                 Err(error) => return err(format!("store error: {error}")),
             }
             let branches = store.list_branches(&fork_id).unwrap_or_default();
@@ -753,6 +829,7 @@ pub async fn handle_terminate_branch(args: &Value, home_dir: &Path, agent_id: &s
 
 /// `fork_cost` — aggregate + per-branch spend.
 pub async fn handle_fork_cost(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("fork_cost", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -766,10 +843,14 @@ pub async fn handle_fork_cost(args: &Value, home_dir: &Path, agent_id: &str) -> 
         None => return err("fork_id is required"),
     };
     match store.get_fork(fork_id) {
-        Ok(None) => err(format!("fork not found: {fork_id}")),
+        Ok(None) => err(fork_not_found(fork_id)),
         Err(e) => err(format!("store error: {e}")),
+        Ok(Some(fork)) if fork.agent_id != agent_id => err(fork_not_found(fork_id)),
         Ok(Some(_)) => {
-            let branches = store.list_branches(fork_id).unwrap_or_default();
+            let branches = match store.list_branches(fork_id) {
+                Ok(branches) => branches,
+                Err(e) => return err(format!("store error: {e}")),
+            };
             let aggregate: f64 = branches.iter().map(|b| b.spent_usd).sum();
             ok_json(json!({
                 "fork_id": fork_id,
@@ -1307,6 +1388,33 @@ test_timeout_s = 60
     }
 
     #[tokio::test]
+    async fn isolated_fork_reads_require_owner_before_returning_records() {
+        let home = enabled_home();
+        std::fs::create_dir_all(home.path().join("agents/a2")).unwrap();
+        std::fs::write(home.path().join("agents/a2/agent.toml"),
+            "[agent]\nstatus = \"active\"\n[fork]\nenabled = true\n").unwrap();
+        let (fork_id, first) = fork_two(home.path()).await;
+        let store = open_store(home.path()).unwrap();
+        let branches = store.list_branches(&fork_id).unwrap();
+        let second = branches.iter().find(|branch| branch.branch_id != first).unwrap().branch_id.clone();
+        store.update_branch(&first, "finished", 0.42, "OWNER_ONLY_OUTPUT", Some(0)).unwrap();
+        let args = json!({"fork_id":fork_id,"branch_a":first,"branch_b":second,"agent_id":"a1"});
+        let denied = [handle_inspect_branches(&args, home.path(), "a2").await,
+            handle_diff_branches(&args, home.path(), "a2").await,
+            handle_fork_cost(&args, home.path(), "a2").await];
+        for value in denied {
+            assert!(is_error(&value), "{value}");
+            assert!(!text(&value).contains("OWNER_ONLY_OUTPUT"));
+            assert!(!text(&value).contains("0.42"));
+        }
+        for value in [handle_inspect_branches(&args, home.path(), "a1").await,
+            handle_diff_branches(&args, home.path(), "a1").await,
+            handle_fork_cost(&args, home.path(), "a1").await] {
+            assert!(!is_error(&value), "{value}");
+        }
+    }
+
+    #[tokio::test]
     async fn merge_by_other_agent_is_refused() {
         let home = enabled_home();
         let other = home.path().join("agents").join("a2");
@@ -1339,7 +1447,12 @@ test_timeout_s = 60
             &json!({"fork_id": fork_id, "branch_id": bid}), home.path(), "a2",
         ).await;
         assert!(is_error(&denied));
-        assert!(text(&denied).contains("another agent"));
+        // P1g (F9): a foreign fork reads exactly like an unknown one.
+        assert!(text(&denied).contains(&fork_not_found(&fork_id)), "{}", text(&denied));
+        let unknown = handle_terminate_branch(
+            &json!({"fork_id": "no-such-fork", "branch_id": bid}), home.path(), "a2",
+        ).await;
+        assert_eq!(text(&denied).replace(&fork_id, "X"), text(&unknown).replace("no-such-fork", "X"));
         assert_eq!(std::fs::read_to_string(ws.join("owner-output.txt")).unwrap(), "preserved");
         assert_eq!(open_store(home.path()).unwrap().branch_workspace(&bid).unwrap(),
             Some(ws.to_string_lossy().into_owned()));
@@ -1455,5 +1568,26 @@ test_timeout_s = 60
         )
         .await;
         assert!(is_error(&v)); // branch_b missing
+    }
+
+    /// FD-SEL: every non-availability refusal of a protected fork read is the
+    /// same `fork_not_found` answer (foreign actor, unknown id, wrong schema),
+    /// so a caller cannot probe which fork ids exist for other employees. The
+    /// deferred mutations keep their generic refusal.
+    #[test]
+    fn fdsel_protected_fork_read_errors_have_not_found_parity() {
+        use duduclaw_mcp_boundary::VerificationError;
+        for name in duduclaw_mcp_boundary::fork_policy::READ_TOOLS {
+            let expected = protected_fork_error(name, VerificationError::Invalid);
+            assert!(is_error(&expected) && text(&expected).contains("fork_not_found"), "{name}");
+            for error in [VerificationError::BindingMismatch, VerificationError::Revoked] {
+                assert_eq!(protected_fork_error(name, error), expected, "{name}");
+            }
+            let unavailable = protected_fork_error(name, VerificationError::Unavailable);
+            assert!(is_error(&unavailable) && !text(&unavailable).contains("fork_not_found"), "{name}");
+        }
+        for name in duduclaw_mcp_boundary::fork_policy::DEFERRED_TOOLS {
+            assert!(!text(&protected_fork_error(name, VerificationError::Invalid)).contains("fork_not_found"), "{name}");
+        }
     }
 }

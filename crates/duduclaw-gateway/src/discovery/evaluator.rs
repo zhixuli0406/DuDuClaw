@@ -450,6 +450,7 @@ impl Evaluator for RegisteredEvaluator {
 // No background cleanup thread outlives the snapshot owner. A failed cleanup
 // is recorded explicitly and prevents an otherwise valid score from passing.
 struct ContainerCleanup {
+    launch_context: duduclaw_core::execution_gate::CapturedLaunch,
     program: std::ffi::OsString,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     name: String,
@@ -465,6 +466,7 @@ impl ContainerCleanup {
             .map(|pair| pair[1].to_string_lossy().into_owned())
             .ok_or_else(|| io::Error::other("container create has no trusted name"))?;
         Ok(Self {
+            launch_context: duduclaw_core::execution_gate::CapturedLaunch::capture(),
             program: command.get_program().to_owned(),
             environment: command.get_envs().filter_map(|(key, value)|
                 value.map(|value| (key.to_owned(), value.to_owned()))).collect(),
@@ -480,7 +482,7 @@ impl ContainerCleanup {
         if let Some(result) = &self.result { return result.clone(); }
         let mut command = self.command();
         command.args(["rm", "-f", &self.name]);
-        let result = bounded_remove(command, CONTAINER_CLEANUP_TIMEOUT);
+        let result = self.launch_context.sync_scope(|| bounded_remove(command, CONTAINER_CLEANUP_TIMEOUT));
         if let Err(reason) = &result {
             let _ = super::maintenance::record_cleanup_failure(&self.home, &self.run_id, "evaluator", reason);
         }
@@ -508,7 +510,7 @@ fn bounded_remove(mut command: Command, timeout: Duration) -> Result<(), String>
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().map_err(|_| "container cleanup unavailable".to_string())?;
+    let mut child = duduclaw_core::execution_blocking::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::Discovery).map_err(|_| "container cleanup unavailable".to_string())?;
     let deadline = Instant::now() + timeout;
     let result = loop {
         match child.try_wait() {
@@ -519,7 +521,7 @@ fn bounded_remove(mut command: Command, timeout: Duration) -> Result<(), String>
         }
     };
     #[cfg(unix)]
-    { let _ = duduclaw_core::platform::kill_process_group(child.id()); }
+    { let _ = child.control().start_kill(); }
     if result.is_err() { let _ = child.kill(); }
     let _ = child.wait();
     result
@@ -1221,11 +1223,12 @@ mod container_lifecycle_tests {
 mod sealed_execution_tests {
     use super::*;
     fn fixture(cheating_valid: bool) -> (tempfile::TempDir, RegisteredEvaluator) {
-        let temp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::discovery::private_test_home();
         let home = temp.path().canonicalize().unwrap();
         let root = home.join("discovery/evaluators/test");
-        fs::create_dir_all(root.join("good")).unwrap();
-        fs::create_dir(root.join("bad")).unwrap();
+        super::super::workspace::create_private_directory(&root.join("good")).unwrap();
+        super::super::workspace::create_private_directory(&root.join("bad")).unwrap();
         let good =
             json!({"pass":true,"valid":true,"score":2.5,"fail_class":"ok","feedback":"verified"});
         let bad = if cheating_valid {
@@ -1235,6 +1238,9 @@ mod sealed_execution_tests {
         };
         fs::write(root.join("good/verdict.json"), good.to_string()).unwrap();
         fs::write(root.join("bad/verdict.json"), bad.to_string()).unwrap();
+        for path in ["good/verdict.json", "bad/verdict.json"] {
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o600)).unwrap();
+        }
         crate::test_exec::write_executable(&root.join("judge"), "#!/bin/sh\ncat \"$1/verdict.json\"\n", 0o755);
         let entry = EvaluatorConfig {
             command: vec![root.join("judge").to_string_lossy().into_owned()],

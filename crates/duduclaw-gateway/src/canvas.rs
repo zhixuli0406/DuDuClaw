@@ -363,6 +363,7 @@ pub struct CanvasStore {
 impl CanvasStore {
     /// Open (or create) the canvas store at `<home>/canvas.db` (0600).
     pub fn open(home_dir: &Path) -> Result<Self, String> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         let db_path = home_dir.join("canvas.db");
         let existed = db_path.exists();
         let conn = Connection::open(&db_path).map_err(|e| format!("open canvas.db: {e}"))?;
@@ -435,15 +436,19 @@ impl CanvasStore {
         html: &str,
     ) -> Result<CanvasRow, String> {
         let updated_at = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin canvas write: {e}"))?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        tx.execute(
             "INSERT INTO canvas (agent_id, title, html, updated_at) VALUES (?1, ?2, ?3, ?4)",
             params![agent_id, title, html, updated_at],
         )
         .map_err(|e| format!("insert canvas: {e}"))?;
-        let seq = conn.last_insert_rowid();
+        let seq = tx.last_insert_rowid();
         // Trim: keep only the newest HISTORY_KEEP versions for this agent.
-        conn.execute(
+        tx.execute(
             "DELETE FROM canvas WHERE agent_id = ?1 AND seq NOT IN (
                  SELECT seq FROM canvas WHERE agent_id = ?1
                  ORDER BY seq DESC LIMIT ?2
@@ -451,6 +456,8 @@ impl CanvasStore {
             params![agent_id, HISTORY_KEEP as i64],
         )
         .map_err(|e| format!("trim canvas history: {e}"))?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| format!("commit canvas write: {e}"))?;
         debug!(agent_id, seq, bytes = html.len(), "canvas version stored");
         Ok(CanvasRow {
             seq,
@@ -619,6 +626,26 @@ pub fn ensure_broadcast_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_revocation_while_waiting_canvas_lock_keeps_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(CanvasStore::open(dir.path()).unwrap());
+        store.push("alice", "first", "<p>first</p>").await.unwrap();
+        let lock = store.conn.lock().await;
+        let live = std::sync::Arc::new(AtomicBool::new(true));
+        let context = crate::isolation_io_test_support::context(live.clone());
+        let worker_store = store.clone();
+        let worker = tokio::spawn(duduclaw_mcp_boundary::io_authority::scope(context, async move {
+            worker_store.clear("alice").await
+        }));
+        tokio::task::yield_now().await;
+        live.store(false, Ordering::Release);
+        drop(lock);
+        assert!(worker.await.unwrap().is_err());
+        assert_eq!(store.current("alice").await.unwrap().unwrap().title, "first");
+    }
+
 
     fn tmp_home() -> tempfile::TempDir {
         tempfile::TempDir::new().unwrap()

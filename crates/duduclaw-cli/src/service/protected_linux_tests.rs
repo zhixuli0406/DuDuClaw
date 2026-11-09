@@ -4,7 +4,7 @@ use super::*;
 fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
     let unit = unit_text();
     let lines: Vec<_> = unit.lines().collect();
-    for required in ["Type=simple", "ExecStart=/usr/local/libexec/duduclaw/protected-launcher /opt/duduclaw/bin/duduclaw run --yes",
+    for required in ["Slice=duduclaw-tcb.slice", "Type=simple", "ExecStart=/usr/local/libexec/duduclaw/protected-launcher /opt/duduclaw/bin/duduclaw run --yes",
         "StartLimitIntervalSec=3600", "StartLimitBurst=4",
         "KillMode=control-group", "Restart=on-failure", "ProtectSystem=strict",
         "ReadWritePaths=/var/lib/duduclaw /var/lib/duduclaw-protected", "ProtectHome=yes", "PrivateTmp=yes", "UMask=0077",
@@ -48,6 +48,7 @@ fn service_protected_operator_gate_precedes_platform_or_filesystem_work() {
         let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
         assert!(install(InstallOptions { enable_now: false, migrate_from: None, force_migrate: false, i_verified_this_binary: false, allow_missing_runtime: false }).is_err());
         assert!(uninstall().is_err());
+        assert!(readiness().is_err());
     }
 }
 
@@ -62,6 +63,8 @@ fn service_protected_cli_options_require_protected_mode() {
     }
     assert!(crate::Cli::try_parse_from(["duduclaw", "service", "install", "--protected-linux", "--enable-now", "--migrate-from", "/tmp/home", "--force-migrate"]).is_ok());
     assert!(crate::Cli::try_parse_from(["duduclaw", "service", "uninstall", "--protected-linux"]).is_ok());
+    assert!(crate::Cli::try_parse_from(["duduclaw", "service", "readiness"]).is_err());
+    assert!(crate::Cli::try_parse_from(["duduclaw", "service", "readiness", "--protected-linux"]).is_ok());
     });
 }
 
@@ -83,6 +86,16 @@ async fn service_protected_upgrade_operator_gate_precedes_download() {
         let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
         let error = upgrade(Some("1.79.3"), false).await.unwrap_err();
         assert!(error.to_string().contains("AI 員工不能"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn service_protected_upgrade_requires_stable_version_before_ipc() {
+    let _session = crate::ai_session_guard::test_session(&[]);
+    assert!(upgrade(None, false).await.unwrap_err().to_string().contains("--version"));
+    for version in ["1.80.0-beta", "1.80.0+build", "../update", "https://example.com/update"] {
+        assert!(upgrade(Some(version), false).await.unwrap_err().to_string().contains("正式版"));
     }
 }
 

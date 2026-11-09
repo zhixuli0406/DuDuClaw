@@ -1,5 +1,11 @@
 use super::*;
 
+/// The protected-mode refusal of MCP `create_agent`, pointing to the
+/// Employee proposal path. `None` outside native Linux protected mode.
+pub(crate) fn protected_create_refusal(protected: bool) -> Option<Value> {
+    protected.then(|| tool_error(crate::mcp_isolation_disposition::PROPOSAL_REQUIRED))
+}
+
 /// v1.81 (S2): may `caller` create a `role = main` employee through MCP?
 /// Only an existing employee whose own `[agent] role` is `main` and whose
 /// effective `can_create_agents` is on (an explicit `false` withdraws it).
@@ -27,6 +33,20 @@ pub(crate) async fn handle_create_agent(
     home_dir: &Path,
     caller_agent: &str,
 ) -> Value {
+    // Native Linux protected mode (v1.81, SR2): refused before any parsing
+    // or filesystem effect, on every MCP transport (the isolated adapter
+    // also hides and refuses it through `mcp_isolation_disposition`).
+    // SR2 1a-i / SR5 round 3 N3: this check is the durable protected-mode
+    // latch (`duduclaw_core::protected_mode`: the env flag OR the root-owned
+    // mode marker / confirmed employee index), so an employee process started
+    // without the variable still sees protected mode. It remains defence in
+    // depth; the real gate is the isolated adapter's disposition table
+    // (`crate::mcp_isolation_disposition::intentional_refusal`:
+    // `create_agent` => `ProposalRequired`), which refuses the tool for an
+    // employee whatever its environment says.
+    if let Some(refused) = protected_create_refusal(duduclaw_gateway::runtime_readiness::is_protected_linux()) {
+        return refused;
+    }
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let display_name = params
         .get("display_name")
@@ -399,6 +419,13 @@ pub(crate) async fn handle_create_agent(
 
 /// List all registered agents with role, status, and hierarchy.
 pub(crate) async fn handle_list_agents(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    list_agents_filtered(params, home_dir, caller, &std::collections::BTreeSet::new()).await
+}
+
+/// [`handle_list_agents`] without the agents in `hidden` (v1.81 P1b: other
+/// people's Personal employees, `personal_target::list_agents_hiding`).
+pub(crate) async fn list_agents_filtered(params: &Value, home_dir: &Path, caller: &str,
+    hidden: &std::collections::BTreeSet<String>) -> Value {
     // F2: accept both a bool and the string "true" (MCP args often arrive as
     // strings); default false so soft-deleted stay hidden and archived only
     // surface on explicit request.
@@ -495,7 +522,7 @@ pub(crate) async fn handle_list_agents(params: &Value, home_dir: &Path, caller: 
     // keyed by directory name, which is the agent id `org_visible` expects.
     let agents: Vec<Value> = candidates
         .into_iter()
-        .filter(|(name, _)| unrestricted || org_visible(&rules, &org, caller, name))
+        .filter(|(name, _)| !hidden.contains(name) && (unrestricted || org_visible(&rules, &org, caller, name)))
         .map(|(_, v)| v)
         .collect();
 
@@ -707,6 +734,30 @@ mod product_policy_creation_tests {
             "model": model,
             "soul": "Keep this valid employee's instructions."
         })
+    }
+
+    /// SR2 finding 1a: MCP `create_agent` is refused in protected mode on
+    /// every transport, with a message naming the proposal path.
+    #[tokio::test]
+    async fn protected_mode_refuses_mcp_create_agent() {
+        use crate::mcp_isolation_disposition::{intentional_refusal, Refusal, PROPOSAL_REQUIRED};
+        // Isolated adapter: hidden and refused by the disposition table.
+        assert_eq!(intentional_refusal("create_agent"), Some(Refusal::ProposalRequired));
+        assert_eq!(Refusal::ProposalRequired.message(), PROPOSAL_REQUIRED);
+        assert!(PROPOSAL_REQUIRED.contains("員工配置提案") && PROPOSAL_REQUIRED.contains("核准"));
+        // Every other transport: refused before any parsing or file effect.
+        let refused = protected_create_refusal(true).expect("refused in protected mode");
+        assert_eq!(refused["isError"], true);
+        assert_eq!(refused["content"][0]["text"], PROPOSAL_REQUIRED);
+        assert!(protected_create_refusal(false).is_none());
+        let home = fixture();
+        let response = handle_create_agent(&params("openai/gpt-4o"), home.path(), "dashboard").await;
+        if duduclaw_gateway::runtime_readiness::is_protected_linux() {
+            assert_eq!(response["content"][0]["text"], PROPOSAL_REQUIRED, "{response}");
+            assert!(!home.path().join("agents").exists());
+        } else {
+            assert_ne!(response["content"][0]["text"], PROPOSAL_REQUIRED, "{response}");
+        }
     }
 
     #[tokio::test]

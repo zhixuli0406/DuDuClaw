@@ -254,6 +254,7 @@ impl CodeMap {
     /// containment guarantee (every directory component, mount crossings)
     /// pass their own reader to [`Self::build_with_reader`].
     pub fn build(config: &CodeMapConfig) -> Result<CodeMap> {
+        crate::isolation_io::verify()?;
         Self::build_with_reader(config, |walked, _rel, max_bytes| {
             read_source_nofollow(walked, max_bytes)
         })
@@ -271,6 +272,7 @@ impl CodeMap {
     where
         F: FnMut(&Path, &Path, usize) -> Option<String>,
     {
+        crate::isolation_io::verify()?;
         if !config.root.exists() {
             return Err(DuDuClawError::Memory(format!(
                 "code_map root does not exist: {}",
@@ -289,6 +291,7 @@ impl CodeMap {
             .build();
 
         for entry in walker.flatten() {
+            crate::isolation_io::verify()?;
             // The entry's own type: with `follow_links(false)` a symlink
             // reports as a symlink, never as the file it points to.
             if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -310,6 +313,7 @@ impl CodeMap {
                 Ok(r) => r,
                 Err(_) => continue,
             };
+            crate::isolation_io::verify()?;
             let source = match read(path, rel, config.max_file_bytes) {
                 Some(s) if s.len() <= config.max_file_bytes => s,
                 _ => continue, // refused / binary / non-UTF8 / too large: skip

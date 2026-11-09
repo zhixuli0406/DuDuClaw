@@ -28,7 +28,8 @@ pub(crate) async fn handle_working_state_set(args: &Value, home_dir: &Path, defa
         .map(str::to_string);
     let home = home_dir.to_path_buf();
     let agent = default_agent.to_string();
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
         duduclaw_gateway::working_state::set_entry(
             &home,
             &agent,
@@ -38,7 +39,7 @@ pub(crate) async fn handle_working_state_set(args: &Value, home_dir: &Path, defa
             ttl_hours,
             expected_value.as_deref(),
         )
-    })
+    }))
     .await
     .unwrap_or_else(|e| Err(format!("working_state_set join error: {e}")));
     match result {
@@ -64,9 +65,10 @@ pub(crate) async fn handle_working_state_clear(args: &Value, home_dir: &Path, de
         .to_string();
     let home = home_dir.to_path_buf();
     let agent = default_agent.to_string();
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
         duduclaw_gateway::working_state::clear_entry(&home, &agent, &key, &reason)
-    })
+    }))
     .await
     .unwrap_or_else(|e| Err(format!("working_state_clear join error: {e}")));
     match result {
@@ -113,7 +115,8 @@ pub(crate) async fn handle_working_state_handoff(args: &Value, home_dir: &Path, 
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
         let _admission = admission;
         duduclaw_gateway::working_state::set_handoff(
             &home,
@@ -124,7 +127,7 @@ pub(crate) async fn handle_working_state_handoff(args: &Value, home_dir: &Path, 
             evidence.as_deref(),
             blocker.as_deref(),
         )
-    })
+    }))
     .await
     .unwrap_or_else(|e| Err(format!("working_state_handoff join error: {e}")));
     match result {
@@ -147,9 +150,10 @@ pub(crate) async fn handle_working_state_get(args: &Value, home_dir: &Path, defa
         .unwrap_or(20);
     let home = home_dir.to_path_buf();
     let agent = default_agent.to_string();
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
         duduclaw_gateway::working_state::read_full(&home, &agent, limit)
-    })
+    }))
     .await
     .unwrap_or_else(|e| Err(format!("working_state_get join error: {e}")));
     match result {

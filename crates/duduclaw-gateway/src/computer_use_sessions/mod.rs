@@ -600,6 +600,13 @@ impl Drop for StartingGuard<'_> {
     }
 }
 
+/// Every request-side effect rechecks the carried isolation authority. Host
+/// lifecycle cleanup deliberately does not depend on an expired request.
+fn verify_service_authority() -> Result<(), OpError> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|_| OpError::new(ErrorCode::Forbidden, "本次操作權限已失效，已拒絕執行。"))
+}
+
 /// The production registry, for the chat emergency stop.
 fn active_registry() -> &'static std::sync::Mutex<Weak<ComputerUseSessions>> {
     static ACTIVE: OnceLock<std::sync::Mutex<Weak<ComputerUseSessions>>> = OnceLock::new();
@@ -908,6 +915,7 @@ impl ComputerUseSessions {
     /// this employee's, and is still alive (stop flag, threat RED, deadline,
     /// idle, capability). Ends it when it is not.
     async fn check_alive(&self, session: &mut ManagedSession) -> Result<(), OpError> {
+        verify_service_authority()?;
         if session.ended {
             self.remove_entry(&session.agent_id, &session.session_id);
             return Err(not_found());
@@ -1005,6 +1013,7 @@ impl ComputerUseSessions {
         {
             return Err(not_found());
         }
+        verify_service_authority()?;
         self.check_alive(&mut guard).await?;
         Ok(guard)
     }
@@ -1227,7 +1236,11 @@ impl ComputerUseSessions {
             }
             return Err(capacity());
         }
-        if let Err(e) = backend.start().await {
+        let started = match verify_service_authority() {
+            Ok(()) => backend.start().await,
+            Err(_) => Err(ComputerUseError::Unavailable("isolation authority revoked".into())),
+        };
+        if let Err(e) = started {
             Self::stop_detached(backend).await;
             if let Some(lease) = release_on_failure(&attached) {
                 workspace::release_lease(self.home.clone(), lease, EndReason::Requested).await;
@@ -1333,7 +1346,9 @@ impl ComputerUseSessions {
     /// Shared masking pipeline; callers establish authority and session liveness.
     async fn capture_masked(&self, session: &mut ManagedSession) -> Result<Value, OpError> {
         let agent_id = session.agent_id.clone();
+        verify_service_authority()?;
         let shot = session.backend.screenshot().await;
+        self.check_alive(session).await?;
         let now = Instant::now();
         session.last_activity = now;
         let shot = shot.map_err(|e| {
@@ -1354,12 +1369,14 @@ impl ComputerUseSessions {
             PageScan::Unscanned | PageScan::Clean => None,
         }};
         if let Some(reason) = extra_mask {
-            b64 = crate::computer_use::mask_screenshot_regions(
-                &b64,
-                &[[0, 0, session.config.display_width, session.config.display_height]],
+            b64 = crate::computer_use::mask_screenshot_regions_async(
+                b64,
+                vec![[0, 0, session.config.display_width, session.config.display_height]],
                 crate::computer_use::MaskingConfig::default().fill_color,
             )
+            .await
             .map_err(|_| OpError::new(ErrorCode::ScreenshotFailed, "截圖失敗，請稍後再試。"))?;
+            self.check_alive(session).await?;
             fully_masked = true;
             mask_reason = Some(reason);
         }
@@ -1784,7 +1801,10 @@ impl ComputerUseSessions {
                 Ok(status) => { login_status = Some(status); Ok(()) }
                 Err(_) => Err(ComputerUseError::ApiError("login credential changed or unavailable".into())),
             }
-        } else { session.backend.execute(&action).await };
+        } else {
+            verify_service_authority()?;
+            session.backend.execute(&action).await
+        };
         session.last_activity = Instant::now();
         if let Some((broker, claim, _)) = &execution_claim {
             let (state, receipt, error) = match &result {
@@ -1889,6 +1909,7 @@ impl ComputerUseSessions {
     /// Local flags/policy are checked without another authorization or audit await.
     /// This narrows the host-controlled wait window; it cannot atomically freeze the OS.
     fn final_control_gate(&self, session: &ManagedSession, policy: &str) -> Result<(), OpError> {
+        verify_service_authority()?;
         let control = session.backend.control();
         // Absent ⇒ GREEN; unreadable or unrecognised ⇒ RED (F4, review L6).
         let level = crate::computer_use_orchestrator::read_threat_level_sync(&self.home);
@@ -2006,6 +2027,7 @@ impl ComputerUseSessions {
             .live
             .actions_used
             .store(session.actions_used, Ordering::Release);
+        verify_service_authority()?;
         let result = session.backend.navigate(&checked.url).await;
         session.last_activity = Instant::now();
         let outcome = match result {

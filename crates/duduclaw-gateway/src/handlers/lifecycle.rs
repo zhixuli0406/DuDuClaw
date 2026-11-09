@@ -161,6 +161,8 @@ impl MethodHandler {
 
     /// Resolve the edition for UI and management RPC gates through the shared
     /// resolver. The verified license always caps both env and explicit overrides.
+    /// Protected Linux TEAM also latches the isolation requirement; other
+    /// installations do not gain an execution gate here.
     pub(crate) async fn resolve_edition_profile(&self) -> duduclaw_core::EditionProfile {
         let runtime = crate::license_runtime::global().cloned();
         #[cfg(test)]
@@ -176,6 +178,9 @@ impl MethodHandler {
             override_ed.map(|e| e.as_str()),
             tier_key.as_deref(),
         );
+        // License activation and the background watcher can promote a running
+        // Personal gateway to TEAM after boot. Never clear an existing latch.
+        crate::isolation_readiness::initialize(!edition.is_personal());
         // Team grants follow the edition (`team_edition.rs`); the channel
         // and WebChat paths read what was last resolved here.
         crate::team_edition::record(&self.home_dir, edition);

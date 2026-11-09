@@ -6,7 +6,7 @@
 //!   (zip-bomb guard), and never follows symlinks.
 //! - **Packing** ([`pack_dir`]) deflates a directory tree into a `.zip`.
 //!
-//! No external `walkdir`/`tempfile` deps — plain `std::fs` recursion.
+//! Legacy extraction uses std::fs; protected publication uses a private tempfile staging directory.
 
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -44,6 +44,9 @@ pub struct ExtractSummary {
 /// Big5); an archive whose names cannot be decoded is refused rather than
 /// written as mojibake.
 pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<ExtractSummary> {
+    if duduclaw_parse_worker::client::required() {
+        return extract_isolated(zip_path, dest_root);
+    }
     let file_len = std::fs::metadata(zip_path)
         .map_err(|e| io_err(format!("讀取 {} 失敗: {e}", zip_path.display())))?
         .len();
@@ -166,6 +169,114 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<ExtractSummary> {
     }
 
     Ok(plan.summary)
+}
+
+fn extract_isolated(zip_path: &Path, dest_root: &Path) -> Result<ExtractSummary> {
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = open.open(zip_path).map_err(|e| io_err(format!("讀取組合包失敗：{e}")))?;
+    let metadata = file.metadata().map_err(|e| io_err(format!("讀取組合包失敗：{e}")))?;
+    if !metadata.is_file() || metadata.len() > MAX_UNPACK_BYTES {
+        return Err(too_large("組合包不是一般檔案或超過大小上限。".into()));
+    }
+    let pack = duduclaw_parse_worker::archive_adapter::extract_pack(&mut file)
+        .map_err(|_| import_err(super::import_error::UNKNOWN, json!({}),
+            "隔離解析服務無法解開這份組合包，請確認格式及大小後重試。"))?;
+    publish_isolated_pack(pack, dest_root)
+}
+
+/// Validate every worker-supplied name/range before creating any directory.
+/// Package D owns authorization of dest_root's parent; the fresh private staging
+/// directory prevents archive-created links or existing files from being followed.
+fn publish_isolated_pack(pack: duduclaw_parse_worker::archive_adapter::ExpandedPack,
+    dest_root: &Path) -> Result<ExtractSummary>
+{
+    if pack.bytes.len() as u64 > MAX_UNPACK_BYTES || pack.entries.len() > 1000 {
+        return Err(too_large("組合包展開後超過大小或項目數上限。".into()));
+    }
+    let legacy_encoding = match pack.legacy_encoding.as_deref() {
+        None => None,
+        Some("gbk") => Some(super::zip_names::LegacyEncoding::Gbk),
+        Some("big5") => Some(super::zip_names::LegacyEncoding::Big5),
+        _ => return Err(cfg_err("隔離解析回傳未知的檔名編碼。".into())),
+    };
+    let mut seen = std::collections::BTreeMap::new();
+    let mut plan = Vec::new();
+    let mut offset = 0u64;
+    for entry in pack.entries {
+        let rel = decoded_rel_path(entry.name.as_str())?;
+        let key = rel.to_string_lossy().to_lowercase();
+        if seen.insert(key, entry.directory).is_some() {
+            return Err(cfg_err("組合包內含重複路徑，已拒絕匯入。".into()));
+        }
+        if entry.offset != offset || (entry.directory && entry.length != 0) {
+            return Err(cfg_err("隔離解析回傳無效的檔案範圍。".into()));
+        }
+        let end = offset.checked_add(entry.length)
+            .filter(|end| *end <= pack.bytes.len() as u64)
+            .ok_or_else(|| cfg_err("隔離解析回傳無效的檔案範圍。".into()))?;
+        plan.push((rel, entry.directory, offset as usize..end as usize));
+        offset = end;
+    }
+    if offset != pack.bytes.len() as u64 {
+        return Err(cfg_err("隔離解析回傳不完整的檔案範圍。".into()));
+    }
+    for (rel, _, _) in &plan {
+        for ancestor in rel.ancestors().skip(1) {
+            if seen.get(&ancestor.to_string_lossy().to_lowercase()) == Some(&false) {
+                return Err(cfg_err("組合包內有檔案與目錄路徑衝突。".into()));
+            }
+        }
+    }
+    match std::fs::symlink_metadata(dest_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(cfg_err("組合包解壓目的地已存在或無法確認，已停止匯入。".into())),
+    }
+    let parent = dest_root.parent().ok_or_else(|| cfg_err("組合包解壓目的地無效。".into()))?;
+    let staging = tempfile::Builder::new().prefix(".isolated-pack-").tempdir_in(parent)
+        .map_err(|e| io_err(format!("建立解壓暫存區失敗：{e}")))?;
+    for (rel, directory, range) in plan {
+        let path = staging.path().join(rel);
+        if directory {
+            std::fs::create_dir_all(&path).map_err(|e| io_err(format!("建立目錄失敗：{e}")))?;
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| io_err(format!("建立目錄失敗：{e}")))?;
+            }
+            let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+                .map_err(|e| io_err(format!("寫入組合包失敗：{e}")))?;
+            output.write_all(pack.bytes.get(range).ok_or_else(|| cfg_err("無效的檔案範圍。".into()))?)
+                .map_err(|e| io_err(format!("寫入組合包失敗：{e}")))?;
+        }
+    }
+    publish_pack_no_replace(staging.path(), dest_root)
+        .map_err(|e| io_err(format!("發布組合包失敗：{e}")))?;
+    Ok(ExtractSummary { junk_skipped: pack.junk_skipped as usize, links_skipped: Vec::new(), legacy_encoding })
+}
+
+fn publish_pack_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::other("invalid staging path"))?;
+        let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::other("invalid destination path"))?;
+        // SAFETY: both C strings remain alive; RENAME_NOREPLACE never overwrites
+        // a concurrent target. The source is this call's private staging tree.
+        #[allow(unsafe_code)]
+        let result = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD,
+            source.as_ptr(), libc::AT_FDCWD, destination.as_ptr(), libc::RENAME_NOREPLACE) };
+        if result != 0 { return Err(std::io::Error::last_os_error()); }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (source, destination); Err(std::io::Error::other("isolated publication requires Linux")) }
 }
 
 /// The entries to extract (index + decoded, validated relative path) and what
@@ -635,5 +746,40 @@ mod tests {
         let (tmp, res) = extract_bytes(&zip_with_raw_names(&entries));
         res.unwrap();
         assert!(tmp.path().join("out").join("許功蓋").join("說明.md").is_file());
+    }
+}
+
+#[cfg(test)]
+mod parse_isolation_tests {
+    fn entry(name: &str, directory: bool, offset: u64, length: u64) -> duduclaw_parse_worker::worker::ArchiveEntry {
+        duduclaw_parse_worker::worker::ArchiveEntry {
+            name: duduclaw_parse_worker::bounded::Text::new(name.into()).unwrap(), directory, offset, length,
+        }
+    }
+    fn pack(entries: Vec<duduclaw_parse_worker::worker::ArchiveEntry>) -> duduclaw_parse_worker::archive_adapter::ExpandedPack {
+        duduclaw_parse_worker::archive_adapter::ExpandedPack {
+            entries, bytes: b"ok".to_vec(), junk_skipped: 0, legacy_encoding: None,
+        }
+    }
+    #[test]
+    fn parse_isolation_pack_rejects_untrusted_manifest_before_writing() {
+        for entries in [vec![entry("../escape", false, 0, 2)],
+            vec![entry("a", false, 0, 1), entry("a/b", false, 1, 1)],
+            vec![entry("A", false, 0, 1), entry("a", false, 1, 1)],
+            vec![entry("a", false, 1, 1)]] {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(super::publish_isolated_pack(pack(entries), &dir.path().join("dest")).is_err());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_isolation_pack_publishes_once_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        super::publish_isolated_pack(pack(vec![entry("sub/file", false, 0, 2)]), &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"ok");
+        assert!(super::publish_isolated_pack(pack(vec![entry("other", false, 0, 2)]), &dest).is_err());
+        assert!(!dest.join("other").exists());
     }
 }

@@ -180,9 +180,22 @@ async fn spawn_slack_bot(
     agent_name: Option<String>,
     ctx: Arc<ReplyContext>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // F6h (H5, A11): in protected mode an employee's own bot needs a live
+    // lifecycle and an active channel route; unchanged otherwise.
+    if let Some(agent) = &agent_name {
+        if !crate::isolation_label_stores::channel_bot_allowed(&ctx.home_dir, agent, "slack").await {
+            warn!(agent = %agent, "per-agent Slack bot not started: no live protected lifecycle or channel route");
+            crate::isolation_label_bots::refused(&ctx.home_dir, "slack", agent);
+            return None;
+        }
+    }
     info!("Slack Socket Mode starting (label: {label})...");
 
-    let handle = tokio::spawn(async move {
+    let (home, agent) = (ctx.home_dir.clone(), agent_name.clone());
+    // F6fb item 9: the bot's per-event tasks are tracked in its scope and
+    // stop with it.
+    let scope = crate::isolation_label_bots::BotScope::new();
+    let handle = tokio::spawn(crate::isolation_label_bots::scoped(scope.clone(), async move {
         loop {
             match run_socket_mode(&app_token, &bot_token, &ctx, &label, agent_name.as_deref()).await
             {
@@ -192,7 +205,14 @@ async fn spawn_slack_bot(
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             info!("Slack Socket Mode reconnecting ({label})...");
         }
-    });
+    }));
+    // F6h (H5): a per-agent bot is registered so a tombstone can stop it.
+    if let Some(agent) = agent {
+        if !crate::isolation_label_bots::admit(&home, "slack", &agent, handle.abort_handle(), scope).await {
+            warn!(agent = %agent, "per-agent Slack bot stopped: the employee is no longer live");
+            return None;
+        }
+    }
 
     Some(handle)
 }
@@ -850,7 +870,8 @@ async fn handle_event(
         let ch = progress_channel.clone();
         let th = progress_thread.clone();
         let msg_ts = progress_msg_ts.clone();
-        tokio::spawn(async move {
+        // F6fb item 9: tracked in the bot's scope (stops with the bot).
+        crate::isolation_label_bots::spawn_scoped(async move {
             let mut guard = msg_ts.lock().await;
             match guard.as_deref() {
                 Some(existing_ts) => {

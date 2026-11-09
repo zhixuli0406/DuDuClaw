@@ -207,6 +207,10 @@ pub(crate) async fn resolve_public_addrs(
     host: &str,
     port: u16,
 ) -> Result<Vec<std::net::SocketAddr>, FetchError> {
+    #[cfg(test)]
+    if let Some((addrs, unvetted)) = test_dns::lookup(host) {
+        return if unvetted { Ok(addrs) } else { vet_resolved_addrs(host, addrs) };
+    }
     let target = format!("{host}:{port}");
     // `to_socket_addrs` blocks; keep it off the async executor exactly as the
     // original inline implementation here did.
@@ -224,6 +228,25 @@ pub(crate) async fn resolve_public_addrs(
         warn!(host = %host, error = %e, "DNS re-pin refused the resolved address set");
     }
     vetted
+}
+
+/// Test-only DNS answers for [`resolve_public_addrs`] (compiled out of
+/// production). Use a unique host per test: tests share the process.
+#[cfg(test)]
+pub(crate) mod test_dns {
+    use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
+    static ANSWERS: Mutex<Option<HashMap<String, (Vec<SocketAddr>, bool)>>> = Mutex::new(None);
+    fn set(host: &str, addrs: Vec<SocketAddr>, unvetted: bool) {
+        ANSWERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(host.to_owned(), (addrs, unvetted));
+    }
+    /// Answer `host` with `addrs`; the public-address screen still applies.
+    pub(crate) fn answer(host: &str, addrs: Vec<SocketAddr>) { set(host, addrs, false) }
+    /// Answer `host` with `addrs` and skip the screen, so a loopback fixture
+    /// server can stand in for a public origin in redirect tests.
+    pub(crate) fn answer_unvetted(host: &str, addrs: Vec<SocketAddr>) { set(host, addrs, true) }
+    pub(super) fn lookup(host: &str) -> Option<(Vec<SocketAddr>, bool)> {
+        ANSWERS.lock().unwrap().as_ref().and_then(|answers| answers.get(host).cloned())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,8 +325,30 @@ fn load_cache(url: &str, ttl_seconds: u64, cache_dir: &Path) -> Option<FetchResu
     })
 }
 
+/// Protected reads are bounded before allocation and bind metadata to the
+/// exact requested URL, even when legacy key normalization merges two URLs.
+fn load_protected_cache(url: &str, ttl_seconds: u64, cache_dir: &Path) -> Option<FetchResult> {
+    use std::io::Read;
+    let body_path = cache_path(url, cache_dir);
+    let mut metadata = Vec::new();
+    std::fs::File::open(body_path.with_extension("meta.json")).ok()?
+        .take(16 * 1024 + 1).read_to_end(&mut metadata).ok()?;
+    if metadata.len() > 16 * 1024 { return None; }
+    let meta: CacheMeta = serde_json::from_slice(&metadata).ok()?;
+    let age = Utc::now().signed_duration_since(meta.fetched_at).num_seconds();
+    if meta.url != url || !(200..300).contains(&meta.status_code) || age < 0 || age as u64 > ttl_seconds {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(body_path).ok()?.take(MAX_RESPONSE_SIZE + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_RESPONSE_SIZE { return None; }
+    Some(FetchResult { url: meta.url, status_code: meta.status_code, content_type: meta.content_type,
+        body: String::from_utf8(bytes).ok()?, cached: true, fetched_at: meta.fetched_at })
+}
+
 /// Persist a fetch result to the cache directory.
 fn save_cache(result: &FetchResult, cache_dir: &Path) -> Result<(), FetchError> {
+    verify_fetch_authority()?;
     std::fs::create_dir_all(cache_dir).map_err(|e| FetchError::IoError(e.to_string()))?;
 
     let body_path = cache_path(&result.url, cache_dir);
@@ -319,7 +364,9 @@ fn save_cache(result: &FetchResult, cache_dir: &Path) -> Result<(), FetchError> 
     let meta_json =
         serde_json::to_vec_pretty(&meta).map_err(|e| FetchError::IoError(e.to_string()))?;
 
+    verify_fetch_authority()?;
     std::fs::write(&body_path, &result.body).map_err(|e| FetchError::IoError(e.to_string()))?;
+    verify_fetch_authority()?;
     std::fs::write(&meta_path, &meta_json).map_err(|e| FetchError::IoError(e.to_string()))?;
 
     Ok(())
@@ -396,7 +443,22 @@ pub async fn web_fetch_cached(
     ttl_seconds: u64,
     cache_dir: &Path,
 ) -> Result<FetchResult, FetchError> {
-    web_fetch_inner(url, ttl_seconds, cache_dir, false).await
+    web_fetch_inner(url, ttl_seconds, cache_dir, false, false).await
+}
+
+/// Protected MCP fetches may only contact the granted origin. Do not follow
+/// redirects or reuse a cache populated by the legacy redirecting client.
+pub async fn web_fetch_protected_cached(url: &str, ttl_seconds: u64, cache_dir: &Path)
+    -> Result<FetchResult, FetchError> {
+    validate_workflow_public_url(url)?;
+    web_fetch_inner(url, ttl_seconds, &cache_dir.join("protected-no-redirect-v1"), false, true).await
+}
+
+/// One gateway-wide 10/minute budget shared by protected fetch and extraction,
+/// including cache hits. Recreating a per-run factory cannot reset this limit.
+pub fn admit_protected_tool_fetch() -> bool {
+    static LIMITER: std::sync::LazyLock<RateLimiter> = std::sync::LazyLock::new(RateLimiter::new);
+    LIMITER.check("protected-mcp")
 }
 
 /// Workflow-only public-page read: same URL/DNS/SSRF limits, no redirects,
@@ -418,7 +480,7 @@ pub fn validate_workflow_public_url(url: &str) -> Result<reqwest::Url, FetchErro
 }
 pub async fn web_fetch_workflow(url: &str) -> Result<FetchResult, FetchError> {
     validate_workflow_public_url(url)?;
-    web_fetch_inner(url, 0, Path::new(""), true).await
+    web_fetch_inner(url, 0, Path::new(""), true, false).await
 }
 
 async fn web_fetch_inner(
@@ -426,7 +488,9 @@ async fn web_fetch_inner(
     ttl_seconds: u64,
     cache_dir: &Path,
     workflow: bool,
+    protected: bool,
 ) -> Result<FetchResult, FetchError> {
+    verify_fetch_authority()?;
     // 1. SSRF check.
     let validated = validate_url(url)?;
 
@@ -438,14 +502,20 @@ async fn web_fetch_inner(
     };
 
     if !workflow {
-        if let Some(hit) = load_cache(url, ttl, cache_dir) {
+        let cached = if protected { load_protected_cache(url, ttl, cache_dir) }
+            else { load_cache(url, ttl, cache_dir) };
+        if let Some(hit) = cached {
             info!(url, "web_fetch cache hit");
             return Ok(hit);
         }
     }
 
     // 3. Live fetch.
-    let (status, content_type, bytes) = fetch_live(url, validated, workflow).await?;
+    // Isolated/protected fetches never use an ambient proxy. An ordinary
+    // workflow read keeps the product's staging-proxy contract (the workflow
+    // executor only injects an explicit 127.0.0.1 proxy for a staging home).
+    let direct = protected || duduclaw_mcp_boundary::io_authority::is_scoped();
+    let (status, content_type, bytes) = fetch_live(url, validated, workflow || protected, direct).await?;
 
     let body = if workflow {
         String::from_utf8(bytes)
@@ -463,6 +533,7 @@ async fn web_fetch_inner(
         fetched_at: Utc::now(),
     };
 
+    verify_fetch_authority()?;
     // 4. Persist to cache (best-effort).
     if !workflow {
         if let Err(e) = save_cache(&result, cache_dir) {
@@ -474,12 +545,18 @@ async fn web_fetch_inner(
 }
 
 
+fn verify_fetch_authority() -> Result<(), FetchError> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|_| FetchError::IoError("isolated fetch authority unavailable".into()))
+}
+
 /// Live GET of a validated URL: DNS-pinned, redirect-checked, size-capped.
 /// Returns `(status, content type, body bytes)`; non-2xx is an error.
 async fn fetch_live(
     url: &str,
     validated: reqwest::Url,
     workflow: bool,
+    direct: bool,
 ) -> Result<(u16, String, Vec<u8>), FetchError> {
     info!(url, "web_fetch cache miss — fetching");
 
@@ -546,13 +623,18 @@ async fn fetch_live(
         }
     });
 
-    let pinned_client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder();
+    // Proxy environment variables must not bypass the pinned destination of a
+    // protected or isolation-scoped request.
+    if direct { client_builder = client_builder.no_proxy(); }
+    let pinned_client = client_builder
         .timeout(std::time::Duration::from_secs(CLIENT_TIMEOUT_SECONDS))
         .redirect(redirect_policy)
         .resolve_to_addrs(&host, &resolved_addrs)
         .build()
         .map_err(|e| FetchError::IoError(format!("failed to build pinned client: {e}")))?;
 
+    verify_fetch_authority()?;
     let mut response = pinned_client
         .get(validated.as_str())
         .header("User-Agent", "DuDuClaw/1.0")
@@ -631,7 +713,7 @@ async fn fetch_live(
 /// redirects, no cache, internal addresses refused, DNS pinned, 5 MB.
 pub async fn web_fetch_public_bytes(url: &str) -> Result<(String, Vec<u8>), FetchError> {
     let validated = validate_workflow_public_url(url)?;
-    let (_, content_type, bytes) = fetch_live(url, validated, true).await?;
+    let (_, content_type, bytes) = fetch_live(url, validated, true, true).await?;
     Ok((content_type, bytes))
 }
 
@@ -924,5 +1006,175 @@ mod tests {
             assert!(limiter.check("agent-x"));
         }
         assert!(!limiter.check("agent-x"));
+    }
+}
+
+#[cfg(test)]
+mod i1c_protected_tests {
+    use super::*;
+
+    fn result(url: &str) -> FetchResult {
+        FetchResult { url: url.into(), status_code: 200, content_type: "text/html".into(),
+            body: "<p>safe cached bytes</p>".into(), cached: false, fetched_at: Utc::now() }
+    }
+    #[tokio::test]
+    async fn i1c_protected_cache_is_separate_and_userinfo_is_refused_before_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://example.com/page";
+        save_cache(&result(url), dir.path()).unwrap();
+        let protected = dir.path().join("protected-no-redirect-v1");
+        assert!(load_protected_cache(url, 60, &protected).is_none());
+        save_cache(&result(url), &protected).unwrap();
+        let fetched = web_fetch_protected_cached(url, 60, dir.path()).await.unwrap();
+        assert!(fetched.cached);
+        assert_eq!(fetched.body, "<p>safe cached bytes</p>");
+        let credential_url = "https://user:password@example.com/page";
+        save_cache(&result(credential_url), &protected).unwrap();
+        assert!(matches!(web_fetch_protected_cached(credential_url, 60, dir.path()).await,
+            Err(FetchError::SsrfBlocked(_))));
+    }
+    #[tokio::test]
+    async fn i1c_product_factory_passes_cached_html_fd_to_worker_and_preserves_result() {
+        use std::io::Read;
+        use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
+            EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest},
+            worker::{ParseResponse, ParseResult, ParsedItem}};
+        use duduclaw_mcp_boundary::{RequestContext, VerificationError,
+            tool_policy::{ResourceResolver, ToolPolicy}, worker_execution::{WorkerToolBridge, WorkerReply}};
+        struct Resolver(Vec<ResourceGrant>);
+        impl ResourceResolver for Resolver {
+            fn resolve(&self, _: &RequestContext, _: &ToolPolicy, _: &serde_json::Value)
+                -> Result<Vec<ResourceGrant>, VerificationError> { Ok(self.0.clone()) }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let url = "https://example.com/page";
+        let cache = home.path().join("web_cache/protected-no-redirect-v1");
+        save_cache(&result(url), &cache).unwrap();
+        let resources = vec![ResourceGrant::Employee { id: EmployeeId([2; 16]) },
+            ResourceGrant::UrlOrigin { origin: Text::new("https://example.com".into()).unwrap() }];
+        struct Live;
+        impl duduclaw_isolation::capability::LiveRequestVerifier for Live {
+            fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+        }
+        let context = RequestContext::with_live_verifier(CapabilityRecord {
+            id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
+            task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
+            employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
+            tools: List::new(vec![Text::new("web_extract".into()).unwrap()]).unwrap(),
+            resources: List::new(resources.clone()).unwrap(), policy_revision: 1, gateway_epoch: [4; 16],
+            issued_at: 1, not_before: 1, expires_at: u64::MAX, nonce: [5; 32], jti: [6; 16],
+        }, Arc::new(Live));
+        let bridge = WorkerToolBridge::new(Arc::new(crate::isolation_worker_plans::GatewayWorkerPlans::new(
+            home.path().into()).unwrap()), Arc::new(Resolver(resources)), Arc::new(|plan| {
+            let (request, mut file) = plan.into_parts()?;
+            let mut input = String::new();
+            file.read_to_string(&mut input).unwrap();
+            assert_eq!(input, "<p>safe cached bytes</p>");
+            // Fixture transport only: this test proves production plan/result
+            // wiring, not parser execution, systemd confinement or retirement.
+            Ok(WorkerReply { response: ParseResponse { version: request.version,
+                request_id: request.request_id, result: ParseResult::Complete { items: List::new(vec![
+                    ParsedItem::Html { input_slot: 0, query: Text::new("result".into()).unwrap(),
+                        value: Text::new("\"safe cached bytes\"".into()).unwrap() },
+                ]).unwrap() } }, outputs: vec![] })
+        }));
+        let response = bridge.execute(&context, "web_extract", &serde_json::json!({"url":url,"selector":"p"})).await;
+        assert_ne!(response["isError"], true, "{response}");
+        let report: serde_json::Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(report["cached"], true);
+        assert_eq!(report["results"], serde_json::json!(["safe cached bytes"]));
+    }
+
+    #[test]
+    fn i1c_protected_cache_rejects_url_aliases_bad_status_and_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://example.com/page";
+        save_cache(&result(url), dir.path()).unwrap();
+        assert!(load_protected_cache("https://example.com/page/", 60, dir.path()).is_none());
+        let mut bad = result(url);
+        bad.status_code = 302;
+        save_cache(&bad, dir.path()).unwrap();
+        assert!(load_protected_cache(url, 60, dir.path()).is_none());
+        bad.status_code = 200;
+        bad.body = "x".repeat(MAX_RESPONSE_SIZE as usize + 1);
+        save_cache(&bad, dir.path()).unwrap();
+        assert!(load_protected_cache(url, 60, dir.path()).is_none());
+        bad.body = "ok".into();
+        bad.fetched_at = Utc::now() + chrono::Duration::hours(1);
+        save_cache(&bad, dir.path()).unwrap();
+        assert!(load_protected_cache(url, 60, dir.path()).is_none());
+    }
+}
+
+/// H7 (D-H2): the host fetch behind a `PublicOrigins` grant. The grant only
+/// selects the origin; these properties keep it from reaching anything else.
+#[cfg(test)]
+mod h7_protected_fetch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn addr(value: &str) -> std::net::SocketAddr { value.parse().unwrap() }
+
+    #[tokio::test]
+    async fn web_fetch_refuses_private_address_after_dns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("h7-dns-private.example.net", vec![addr("10.0.0.5:443")]),
+            ("h7-dns-metadata.example.net", vec![addr("169.254.169.254:443")]),
+            ("h7-dns-loopback.example.net", vec![addr("127.0.0.1:443")]),
+            ("h7-dns-mapped.example.net", vec![addr("[::ffff:127.0.0.1]:443")]),
+            ("h7-dns-linklocal.example.net", vec![addr("[fe80::1]:443")]),
+            ("h7-dns-cgnat.example.net", vec![addr("100.64.0.1:443")]),
+            // A half-rebound answer refuses the whole set.
+            ("h7-dns-mixed.example.net", vec![addr("93.184.216.34:443"), addr("192.168.1.10:443")]),
+        ];
+        for (host, answer) in cases {
+            test_dns::answer(host, answer);
+            let url = format!("https://{host}/page");
+            assert!(validate_workflow_public_url(&url).is_ok(), "the name alone passes the pattern gate");
+            let err = web_fetch_protected_cached(&url, 60, dir.path()).await.expect_err(host);
+            assert!(matches!(err, FetchError::SsrfBlocked(_)), "{host} → {err}");
+        }
+        // Nothing reached the cache.
+        let protected = dir.path().join("protected-no-redirect-v1");
+        assert!(!protected.exists() || std::fs::read_dir(&protected).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn web_fetch_refuses_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let host = "h7-redirect.example.net";
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        // Same pinned origin: if the client followed the Location, the second
+        // request would land here too and return 200.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return; };
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await { Ok(0) | Err(_) => break, Ok(n) => request.extend_from_slice(&buffer[..n]) }
+                }
+                let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+                let response = if first {
+                    format!("HTTP/1.1 302 Found\r\nLocation: http://{host}:{}/followed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", local.port())
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfollowed".to_owned()
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        test_dns::answer_unvetted(host, vec![local]);
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{host}:{}/start", local.port());
+        let err = web_fetch_protected_cached(&url, 60, dir.path()).await.expect_err("redirect must not be followed");
+        assert!(matches!(err, FetchError::HttpError(302, _)), "{err}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "exactly one request; the Location was not fetched");
+        assert!(load_protected_cache(&url, 60, &dir.path().join("protected-no-redirect-v1")).is_none());
+        server.abort();
     }
 }

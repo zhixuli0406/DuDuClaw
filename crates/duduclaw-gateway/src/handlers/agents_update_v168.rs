@@ -169,6 +169,8 @@ pub(crate) fn apply_agent_v168_keys(table: &mut toml::Table, params: &Value, is_
 pub(crate) const KV_DENIED_SECTIONS: &[&str] = &[
     "agent", "capabilities", "container", "permissions", "channels", "odoo", "mcp", "runtime", "prompt",
     "os_watch", "budget",
+    // Protected-mode switches (`public_web`): admin-only, config file only.
+    "isolation",
 ];
 
 /// Sections with no reader (v1.68 audit): writing them changes nothing.

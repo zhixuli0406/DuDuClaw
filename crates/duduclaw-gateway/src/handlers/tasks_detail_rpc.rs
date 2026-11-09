@@ -351,11 +351,10 @@ impl MethodHandler {
     /// not a machine-parsed DAG — and the two are independent. Operator
     /// access on the target agent.
     pub(crate) async fn handle_tasks_goal_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let agent_id = params
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("");
+        // v1.81 P1d: also reached from `tasks.create kind:"goal"`; the id is
+        // used exactly as given (canonical), owner-only for a Personal one.
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if let Err(frame) = self.delegation_check(ctx, agent_id).await { return frame; }
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "valid agent_id is required");
         }
@@ -766,12 +765,11 @@ impl MethodHandler {
         {
             return WsFrame::error_response("", PERMISSION_DENIED);
         }
-        let store = match self.task_store().await {
-            Ok(s) => s,
-            Err(f) => return f,
-        };
+        let store = match self.task_store().await { Ok(s) => s, Err(f) => return f };
+        // v1.81 P1c: hidden Personal employees are neither counted nor broken out.
+        let hidden = match self.flow_metrics_hidden(&live, params.get("agent_id").and_then(Value::as_str)).await { Ok(h) => h, Err(f) => return f };
         let now = Utc::now().to_rfc3339();
-        let metrics = match store.flow_metrics(&now, &format!("user:{}", live.user_id)).await {
+        let metrics = match store.flow_metrics_hiding(&now, &format!("user:{}", live.user_id), &hidden).await {
             Ok(m) => m,
             Err(e) => return WsFrame::error_response("", &format!("flow metrics: {e}")),
         };

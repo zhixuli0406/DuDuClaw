@@ -1232,6 +1232,7 @@ async fn apply_bound_request(
     if &binding.decision_context != context {
         return Err(DECISION_REFUSED.into());
     }
+    if let Some(refusal) = crate::personal_decision::channel_card_refusal(home, &rec, &context.channel, &context.principal_id) { return Err(refusal.into()); }
     let (role, identity_active) =
         bound_decision_authority(home, &context.channel, &context.principal_id)?;
     if rec.request_kind == crate::approval::RequestKind::Question {
@@ -1536,7 +1537,9 @@ impl BoundedChannelExecutor {
         self.sender
             .try_send(ChannelWork {
                 key,
-                future: Box::pin(future),
+                // F6fb item 9: a job of a per-employee bot carries the bot's
+                // scope, so the tasks it starts stop with the bot.
+                future: crate::isolation_label_bots::inherit(future),
                 _slot: slot,
             })
             .map_err(|_| "channel work queue unavailable".into())

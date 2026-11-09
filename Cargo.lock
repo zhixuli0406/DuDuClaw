@@ -18,6 +18,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aead"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
+dependencies = [
+ "crypto-common",
+ "generic-array",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -844,6 +854,17 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "chacha20"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
@@ -851,6 +872,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20 0.9.1",
+ "cipher",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -885,6 +919,7 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -1251,6 +1286,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -1682,6 +1718,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-api-worker"
+version = "1.80.1"
+dependencies = [
+ "libc",
+ "reqwest",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "duduclaw-auth"
 version = "1.80.1"
 dependencies = [
@@ -1733,15 +1781,20 @@ dependencies = [
  "duduclaw-gateway",
  "duduclaw-identity",
  "duduclaw-inference",
+ "duduclaw-isolation",
  "duduclaw-knowledge",
  "duduclaw-license",
  "duduclaw-llm",
+ "duduclaw-mcp-boundary",
  "duduclaw-memory",
+ "duduclaw-migration",
  "duduclaw-odoo",
  "duduclaw-os",
+ "duduclaw-parse-worker",
  "duduclaw-redaction",
  "duduclaw-security",
  "duduclaw-tui",
+ "duduclaw-updated",
  "encoding_rs",
  "flate2",
  "futures-util",
@@ -1758,6 +1811,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "scraper",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1818,6 +1872,8 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "cron",
+ "duduclaw-execution",
+ "duduclaw-isolation",
  "fs2",
  "getrandom 0.3.4",
  "hmac",
@@ -1825,6 +1881,8 @@ dependencies = [
  "libc",
  "minisign-verify",
  "percent-encoding",
+ "portable-pty",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",
@@ -1882,6 +1940,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-egress"
+version = "1.80.1"
+dependencies = [
+ "duduclaw-isolation",
+ "libc",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "duduclaw-execution"
+version = "1.80.1"
+dependencies = [
+ "duduclaw-isolation",
+ "duduclaw-run",
+ "libc",
+ "nix 0.29.0",
+ "portable-pty",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "duduclaw-fork"
 version = "1.80.1"
 dependencies = [
@@ -1921,6 +2009,7 @@ dependencies = [
  "csv",
  "dirs 5.0.1",
  "duduclaw-agent",
+ "duduclaw-api-worker",
  "duduclaw-auth",
  "duduclaw-cli",
  "duduclaw-cli-runtime",
@@ -1928,21 +2017,29 @@ dependencies = [
  "duduclaw-core",
  "duduclaw-dashboard",
  "duduclaw-db",
+ "duduclaw-execution",
  "duduclaw-fork",
  "duduclaw-identity",
+ "duduclaw-import",
  "duduclaw-inference",
+ "duduclaw-isolation",
  "duduclaw-knowledge",
  "duduclaw-license",
  "duduclaw-llm",
+ "duduclaw-mcp-boundary",
  "duduclaw-memory",
+ "duduclaw-migration",
  "duduclaw-odoo",
  "duduclaw-onnx",
  "duduclaw-os",
+ "duduclaw-parse-worker",
  "duduclaw-redaction",
  "duduclaw-relay",
  "duduclaw-sandbox",
  "duduclaw-security",
+ "duduclaw-spawnd",
  "duduclaw-sysd",
+ "duduclaw-updated",
  "ed25519-dalek",
  "flate2",
  "fs2",
@@ -2019,6 +2116,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-import"
+version = "1.80.1"
+dependencies = [
+ "duduclaw-isolation",
+ "libc",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
 name = "duduclaw-inference"
 version = "1.80.1"
 dependencies = [
@@ -2027,6 +2140,7 @@ dependencies = [
  "chrono",
  "duduclaw-core",
  "duduclaw-llm",
+ "duduclaw-parse-worker",
  "duduclaw-security",
  "ferrous-opencc",
  "fs2",
@@ -2056,6 +2170,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-isolation"
+version = "1.80.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "duduclaw-isolation-storage"
+version = "1.80.1"
+dependencies = [
+ "duduclaw-isolation",
+ "nix 0.29.0",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "duduclaw-knowledge"
 version = "1.80.1"
 dependencies = [
@@ -2064,6 +2199,7 @@ dependencies = [
  "csv",
  "duduclaw-core",
  "duduclaw-onnx",
+ "duduclaw-parse-worker",
  "ego-tree",
  "encoding_rs",
  "hex",
@@ -2147,6 +2283,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-mcp-boundary"
+version = "1.80.1"
+dependencies = [
+ "duduclaw-execution",
+ "duduclaw-isolation",
+ "hmac",
+ "libc",
+ "rand 0.8.6",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "duduclaw-memory"
 version = "1.80.1"
 dependencies = [
@@ -2154,6 +2311,8 @@ dependencies = [
  "chrono",
  "csv",
  "duduclaw-core",
+ "duduclaw-isolation",
+ "duduclaw-mcp-boundary",
  "duduclaw-memory",
  "duduclaw-security",
  "fs2",
@@ -2174,6 +2333,26 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "uuid",
+]
+
+[[package]]
+name = "duduclaw-migration"
+version = "1.80.1"
+dependencies = [
+ "chacha20poly1305",
+ "chrono",
+ "duduclaw-import",
+ "duduclaw-isolation",
+ "hmac",
+ "libc",
+ "rand 0.8.6",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2227,6 +2406,34 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "duduclaw-parse-worker"
+version = "1.80.1"
+dependencies = [
+ "calamine",
+ "chrono",
+ "csv",
+ "duduclaw-isolation",
+ "ego-tree",
+ "encoding_rs",
+ "image",
+ "libc",
+ "nix 0.31.3",
+ "pdf-extract",
+ "quick-xml 0.41.0",
+ "scraper",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "url",
+ "uuid",
+ "zbus",
+ "zip",
 ]
 
 [[package]]
@@ -2305,6 +2512,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-run"
+version = "1.80.1"
+dependencies = [
+ "duduclaw-isolation",
+ "landlock",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "duduclaw-sandbox"
 version = "1.80.1"
 dependencies = [
@@ -2341,6 +2561,31 @@ dependencies = [
  "unicode-script",
  "unicode-segmentation",
  "zeroize",
+]
+
+[[package]]
+name = "duduclaw-spawnd"
+version = "1.80.1"
+dependencies = [
+ "duduclaw-core",
+ "duduclaw-execution",
+ "duduclaw-isolation",
+ "duduclaw-isolation-storage",
+ "duduclaw-mcp-boundary",
+ "duduclaw-migration",
+ "duduclaw-run",
+ "duduclaw-updated",
+ "fs2",
+ "libc",
+ "nix 0.29.0",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "zbus",
 ]
 
 [[package]]
@@ -2398,6 +2643,23 @@ dependencies = [
  "vt100",
  "vte",
  "zeroize",
+]
+
+[[package]]
+name = "duduclaw-updated"
+version = "1.80.1"
+dependencies = [
+ "base64 0.22.1",
+ "duduclaw-isolation",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4397,6 +4659,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases 0.2.1",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -4665,6 +4928,12 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "opaque-debug"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openssl"
@@ -5201,6 +5470,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "poly1305"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "pom"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5452,7 +5732,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20",
+ "chacha20 0.10.1",
  "getrandom 0.4.2",
  "rand_core 0.10.1",
 ]
@@ -7680,6 +7960,16 @@ name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
+
+[[package]]
+name = "universal-hash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
+dependencies = [
+ "crypto-common",
+ "subtle",
+]
 
 [[package]]
 name = "unsafe-libyaml"

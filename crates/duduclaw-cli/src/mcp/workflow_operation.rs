@@ -39,20 +39,28 @@ impl WorkflowSession {
         actor: &str,
         principal: &Principal,
     ) -> Result<Option<Arc<Self>>, String> {
-        let id = std::env::var(ENV_SESSION).ok();
-        let secret = std::env::var(ENV_SECRET).ok();
+        let id = crate::mcp_isolation_identity::var(ENV_SESSION).ok();
+        let secret = crate::mcp_isolation_identity::var(ENV_SECRET).ok();
         if id.is_none() && secret.is_none() {
             return Ok(None);
         }
         let id = id.ok_or("incomplete workflow session")?;
         let secret = secret.ok_or("incomplete workflow session")?;
-        if id.is_empty()
-            || id.len() > 128
+        if crate::mcp_namespace::verified_employee_from_env(home).as_deref() != Some(actor) {
+            return Err("workflow requires a verified employee service stdio session".into());
+        }
+        Self::from_verified_host(home, actor, principal, id, secret).map(Some)
+    }
+
+    /// Gateway-only material injection. The isolation dispatcher binds this
+    /// session to one verified employee/run; neither secret nor caller is wire data.
+    pub(crate) fn from_verified_host(home: &Path, actor: &str, principal: &Principal,
+        id: String, secret: String) -> Result<Arc<Self>, String> {
+        if id.is_empty() || id.len() > 128
             || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
             || principal.is_external
             || principal.client_id != duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
-            || crate::mcp_namespace::verified_employee_from_env(home).as_deref() != Some(actor)
-        {
+            {
             return Err("workflow requires a verified employee service stdio session".into());
         }
         if secret.len() != 64 || !secret.is_ascii() {
@@ -62,13 +70,13 @@ impl WorkflowSession {
             .step_by(2)
             .map(|i| u8::from_str_radix(&secret[i..i + 2], 16))
             .collect();
-        Ok(Some(Arc::new(Self {
+        Ok(Arc::new(Self {
             id,
             actor: actor.into(),
             secret: secret.map_err(|_| "invalid workflow session secret")?,
             home: std::fs::canonicalize(home).map_err(|e| e.to_string())?,
             prepared: Mutex::new(HashMap::new()),
-        })))
+        }))
     }
     fn verify<T: serde::Serialize>(
         &self,

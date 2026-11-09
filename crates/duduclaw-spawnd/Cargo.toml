@@ -1,0 +1,51 @@
+[package]
+name = "duduclaw-spawnd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duduclaw-isolation.workspace = true
+duduclaw-mcp-boundary = { path = "../duduclaw-mcp-boundary", default-features = false }
+duduclaw-run = { path = "../duduclaw-run" }
+duduclaw-migration = { path = "../duduclaw-migration" }
+duduclaw-isolation-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+fs2 = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+duduclaw-updated = { path = "../duduclaw-updated" }
+sha2 = "0.10"
+libc = "0.2"
+rustix = { version = "=1.1.4", features = ["process"] }
+nix = { version = "0.29", features = ["socket", "uio", "fs", "time", "signal"] }
+zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# SR5 round 3 follow-up R3-1: tests pin the /etc marker path to the latch's.
+duduclaw-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+duduclaw-execution.workspace = true
+duduclaw-mcp-boundary = { path = "../duduclaw-mcp-boundary", features = ["execution-integration"] }
+tokio.workspace = true
+
+[features]
+root-test-fixture = []
+
+[[bin]]
+name = "duduclaw-spawnd-d8-fixture"
+path = "src/bin/d8-fixture.rs"
+required-features = ["root-test-fixture"]
+
+[[bin]]
+name = "duduclaw-spawnd-pty-fixture"
+path = "src/bin/pty-fixture.rs"
+required-features = ["root-test-fixture"]
+[target.'cfg(target_os = "linux")'.dev-dependencies.tempfile]
+version = "3"

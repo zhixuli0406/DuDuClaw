@@ -250,7 +250,7 @@ struct Caller {
 }
 
 fn caller(agent_id: &str) -> Result<Caller, String> {
-    let env = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let env = |name: &str| crate::mcp_isolation_identity::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let key = env(duduclaw_core::ENV_MCP_API_KEY).ok_or_else(|| {
         "電腦操作工具無法使用：這個 MCP 程序沒有 gateway 內部金鑰，只有由 DuDuClaw gateway 啟動的 AI 員工能使用。".to_string()
     })?;
@@ -312,7 +312,7 @@ async fn post(home: &Path, agent_id: &str, body: &Value, timeout: Duration) -> R
     let mut body=body.clone();
     // Host-issued per-runtime reference is part of the signed body. Never
     // accept this field from model arguments or infer it from a turn id.
-    if let Ok(reference)=std::env::var("DUDUCLAW_PRINCIPAL_CONTEXT") {
+    if let Ok(reference)=crate::mcp_isolation_identity::var("DUDUCLAW_PRINCIPAL_CONTEXT") {
         body["principal_context"]=json!(reference);
     }
     let bytes = serde_json::to_vec(&body).map_err(|_| transport_message(TransportFailure::Other, port, timeout))?;
@@ -503,7 +503,7 @@ pub(crate) fn render(tool: &str, v: &Value) -> Value {
 /// the employee is answering, if any. The gateway maps it (under the
 /// verified employee id) to the chat a confirmation may be asked in.
 fn turn_id() -> Option<String> {
-    std::env::var(duduclaw_core::ENV_TRUST_TURN_ID)
+    crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_TURN_ID)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control))
@@ -530,7 +530,7 @@ pub(crate) async fn handle_computer_use_tool(
         Ok(body) => body,
         Err(msg) => return error(&msg),
     };
-    attach_egress_turn(&mut body, std::env::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS));
+    attach_egress_turn(&mut body, crate::mcp_isolation_identity::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS));
     match post(home, agent_id, &body, timeout_for(tool)).await {
         Ok(v) if workspace_missing(&body, &v) => error(WORKSPACE_NOT_ATTACHED),
         Ok(v) => render(tool, &v),

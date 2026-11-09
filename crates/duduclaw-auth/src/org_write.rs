@@ -205,6 +205,7 @@ impl UserDb {
                 return Err(OrgError::TransferTargetInvalid);
             }
         }
+        let since = crate::admin_eligibility::high_water(&tx).map_err(OrgError::Db)?;
         tx.execute(
             "UPDATE users SET status = 'offboarded', manager_user_id = NULL, updated_at = ?1
               WHERE id = ?2",
@@ -224,6 +225,7 @@ impl UserDb {
         if let Some(t) = transfer_to {
             outcome.transferred_agents = move_bindings(&tx, user_id, t)?;
         }
+        if let Some(actor) = actor { crate::admin_eligibility::stamp_actor(&tx, since, actor).map_err(OrgError::Db)?; }
         bump_acl_generation(&tx).map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(outcome)
@@ -263,6 +265,16 @@ fn move_bindings(conn: &Connection, from: &str, to: &str) -> Result<Vec<String>,
             .map_err(db_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_err)?
     };
+    // A Personal employee (isolation mirror row) is never transferred; the
+    // mirror triggers would refuse the write anyway, so refuse explicitly
+    // (the caller's transaction rolls back) with a handover error.
+    for (agent, _) in &bindings {
+        match crate::db::personal_agent_owner(conn, agent) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err(OrgError::PersonalEmployee(agent.clone())),
+            Err(e) => return Err(OrgError::Db(format!("org write error: {e}"))),
+        }
+    }
     let now = Utc::now().to_rfc3339();
     let mut moved = Vec::with_capacity(bindings.len());
     for (agent, level) in bindings {

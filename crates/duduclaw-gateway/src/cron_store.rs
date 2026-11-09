@@ -151,7 +151,8 @@ impl CronStore {
         activation_id: &str,
         material_hash: &str
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut conn = self.conn.lock().await;
+        verify_io()?;
         let existing: Option<(String, String)> = conn
             .query_row(
                 "SELECT activation_id,material_hash FROM cron_workflow_bindings WHERE cron_id=?1",
@@ -176,7 +177,7 @@ impl CronStore {
         if !disabled {
             return Err("workflow cron must start disabled".into());
         }
-        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let tx = begin_write(&mut conn)?;
         tx.execute(
             "INSERT INTO cron_workflow_bindings VALUES(?1,?2,?3)",
             params![id, activation_id, material_hash]
@@ -187,13 +188,12 @@ impl CronStore {
             params![id, material_hash, Utc::now().timestamp()]
         )
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        commit_write(tx)
     }
     pub async fn workflow_binding(&self, id: &str) -> Result<Option<(String, String)>, String> {
-        self.conn
-            .lock()
-            .await
-            .query_row(
+        let conn = self.conn.lock().await;
+        verify_io()?;
+        conn.query_row(
                 "SELECT activation_id,material_hash FROM cron_workflow_bindings WHERE cron_id=?1",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?))
@@ -204,19 +204,22 @@ impl CronStore {
     /// Cursor belongs to the immutable accepted routine, never to manual runs.
     /// Initial observation starts at binding time; old pre-acceptance slots are not replayed.
     pub async fn routine_cursor(&self, id: &str, material_hash: &str) -> Result<i64, String> {
-        let conn = self.conn.lock().await;
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
         conn.execute(
             "INSERT INTO cron_routine_cursors(cron_id,material_hash,cursor_unix) VALUES(?1,?2,?3) ON CONFLICT(cron_id,
                 material_hash) DO NOTHING",
             params![id, material_hash, Utc::now().timestamp()]
         )
         .map_err(|e| e.to_string())?;
-        conn.query_row(
+        let value = conn.query_row(
             "SELECT cursor_unix FROM cron_routine_cursors WHERE cron_id=?1 AND material_hash=?2",
             params![id, material_hash],
             |r| r.get(0)
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        commit_write(conn)?;
+        Ok(value)
     }
     /// Advance only after the workflow run and its queue outbox are durable.
     /// MAX makes competing schedulers and late acknowledgements monotonic.
@@ -226,14 +229,14 @@ impl CronStore {
         material_hash: &str,
         slot: i64
     ) -> Result<(), String> {
-        self.conn
-            .lock()
-            .await
-            .execute(
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
+        conn.execute(
                 "UPDATE cron_routine_cursors SET cursor_unix=MAX(cursor_unix,?3) WHERE cron_id=?1 AND material_hash=?2",
                 params![id, material_hash, slot]
             )
             .map_err(|e| e.to_string())?;
+        commit_write(conn)?;
         Ok(())
     }
     /// Record occurrences in `(from, to]` as given up on and move the cursor
@@ -248,7 +251,8 @@ impl CronStore {
         slots: u64,
     ) -> Result<(), String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        verify_io()?;
+        let tx = begin_write(&mut conn)?;
         tx.execute(
             "INSERT INTO cron_routine_skips VALUES(?1,?2,?3,?4,?5,?6)
                 ON CONFLICT(cron_id,material_hash,from_unix) DO NOTHING",
@@ -275,11 +279,12 @@ impl CronStore {
             ],
         )
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        commit_write(tx)
     }
 
     /// Open (or create) the cron store at `<home>/cron_tasks.db` and initialize the schema.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
+        verify_io()?;
         let db_path = home_dir.join("cron_tasks.db");
         let conn = Connection::open(&db_path).map_err(|e| format!("open cron store: {e}"))?;
         Self::init_schema(&conn)?;
@@ -291,6 +296,7 @@ impl CronStore {
     }
 
     fn init_schema(conn: &Connection) -> Result<(), String> {
+        verify_io()?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;
@@ -373,8 +379,35 @@ impl CronStore {
 
     // ── Reads ─────────────────────────────────────────────────────────
 
+    /// The owner and finite grant set are SQL predicates, never post-read filters.
+    pub async fn list_isolated(&self, agent: &str, ids: &[String], enabled_only: bool)
+        -> Result<Vec<CronTaskRow>, String> {
+        verify_io()?;
+        if ids.len() > 128 || ids.iter().any(|id| id.is_empty()) {
+            return Err("invalid finite cron selection".into());
+        }
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let conn = self.conn.lock().await;
+        verify_io()?;
+        let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, name, agent_id, cron, task, enabled,
+            created_at, updated_at, last_run_at, last_status, last_error, run_count, failure_count,
+            notify_channel, notify_chat_id, notify_thread_id, cron_timezone, trigger_kind,
+            condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id FROM cron_tasks
+            WHERE agent_id=? AND (?=0 OR enabled=1) AND id IN ({placeholders}) ORDER BY created_at ASC");
+        let mut values = vec![rusqlite::types::Value::Text(agent.to_owned()),
+            rusqlite::types::Value::Integer(i64::from(enabled_only))];
+        values.extend(ids.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), row_to_cron_task)
+            .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        verify_io()?;
+        Ok(rows)
+    }
+
     pub async fn list_all(&self) -> Result<Vec<CronTaskRow>, String> {
         let conn = self.conn.lock().await;
+        verify_io()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, agent_id, cron, task, enabled,
@@ -397,6 +430,7 @@ impl CronStore {
 
     pub async fn list_enabled(&self) -> Result<Vec<CronTaskRow>, String> {
         let conn = self.conn.lock().await;
+        verify_io()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, agent_id, cron, task, enabled,
@@ -420,6 +454,7 @@ impl CronStore {
 
     pub async fn get(&self, id: &str) -> Result<Option<CronTaskRow>, String> {
         let conn = self.conn.lock().await;
+        verify_io()?;
         let row = conn
             .query_row(
                 "SELECT id, name, agent_id, cron, task, enabled,
@@ -439,6 +474,7 @@ impl CronStore {
 
     pub async fn get_by_name(&self, name: &str) -> Result<Option<CronTaskRow>, String> {
         let conn = self.conn.lock().await;
+        verify_io()?;
         let row = conn
             .query_row(
                 "SELECT id, name, agent_id, cron, task, enabled,
@@ -460,13 +496,14 @@ impl CronStore {
 
     /// Insert a new row. Fails if `id` already exists.
     pub async fn insert(&self, row: &CronTaskRow) -> Result<(), String> {
-        let mut conn = self.conn.lock().await;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let mut guard = self.conn.lock().await;
+        let tx = begin_write(&mut guard)?;
+        // F6h writer gate (protected mode only): no schedule for a tombstoned label.
+        crate::isolation_label_stores::check_label_writable_at(&tx, &row.agent_id)?;
         scoped::check_write(&tx, row)?;
         scoped::record_creation(&tx, row, None)?;
-        Self::insert_row(&tx, row)?;
-        tx.commit().map_err(|e| e.to_string())
+        insert_cron_row(&tx, row)?;
+        commit_write(tx)
     }
 
     pub(crate) async fn insert_scoped(&self, row: &CronTaskRow) -> Result<(), String> {
@@ -474,53 +511,11 @@ impl CronStore {
         self.insert(row).await
     }
 
-    fn insert_row(conn: &Connection, row: &CronTaskRow) -> Result<(), String> {
-        conn.execute(
-            "INSERT INTO cron_tasks
-                (id, name, agent_id, cron, task, enabled,
-                 created_at, updated_at, last_run_at, last_status, last_error,
-                 run_count, failure_count,
-                 notify_channel, notify_chat_id, notify_thread_id,
-                 cron_timezone,
-                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
-            params![
-                row.id,
-                row.name,
-                row.agent_id,
-                row.cron,
-                row.task,
-                if row.enabled { 1 } else { 0 },
-                row.created_at,
-                row.updated_at,
-                row.last_run_at,
-                row.last_status,
-                row.last_error,
-                row.run_count,
-                row.failure_count,
-                row.notify_channel,
-                row.notify_chat_id,
-                row.notify_thread_id,
-                row.cron_timezone,
-                row.trigger_kind,
-                row.condition_script,
-                row.condition_state,
-                row.watch_command,
-                row.on_behalf_of,
-                row.created_by_user_id,
-                row.scoped_by_user_id,
-            ],
-        )
-        .map_err(|e| format!("insert cron task: {e}"))?;
-        Ok(())
-    }
-
     /// Employee edits compare the whole authorized snapshot in one write transaction.
     /// This also refuses a concurrent workflow binding or owner reassignment.
     pub(crate) async fn edit_scoped(&self, expected: &CronTaskRow, changed: Option<&CronTaskRow>) -> Result<bool, String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let tx = begin_write(&mut conn)?;
         let current = tx.query_row(
             "SELECT id,name,agent_id,cron,task,enabled,created_at,updated_at,last_run_at,last_status,last_error,
              run_count,failure_count,notify_channel,notify_chat_id,notify_thread_id,cron_timezone,
@@ -537,6 +532,8 @@ impl CronStore {
             if row.id != current.id || row.agent_id != current.agent_id || row.created_by_user_id != current.created_by_user_id {
                 return Err("Automation identity cannot change".into());
             }
+            // F6h writer gate: a tombstoned label's schedule stays as paused.
+            crate::isolation_label_stores::check_label_writable_at(&tx, &row.agent_id)?;
             scoped::check_transition(&tx, &current, row)?;
             tx.execute("UPDATE cron_tasks SET name=?2,cron=?3,task=?4,enabled=?5,on_behalf_of=?6,updated_at=?7,scoped_by_user_id=?8 WHERE id=?1",
                 params![expected.id,row.name,row.cron,row.task,row.enabled,row.on_behalf_of,Utc::now().to_rfc3339(),row.scoped_by_user_id])
@@ -544,7 +541,7 @@ impl CronStore {
         } else {
             tx.execute("DELETE FROM cron_tasks WHERE id=?1", params![expected.id]).map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        commit_write(tx)?;
         Ok(true)
     }
 
@@ -574,12 +571,12 @@ impl CronStore {
     /// same RESERVED lock. A rejected mutation rolls back its quota receipt too.
     async fn edit_row(&self, id: &str, change: impl FnOnce(&mut CronTaskRow)) -> Result<bool, String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let tx = begin_write(&mut conn)?;
         let Some(before) = Self::row_in_transaction(&tx, id)? else { return Ok(false) };
         let mut row = before.clone();
         change(&mut row);
         Self::persist_edit(&tx, &before, &row)?;
-        tx.commit().map_err(|e| e.to_string())?;
+        commit_write(tx)?;
         Ok(true)
     }
 
@@ -623,6 +620,8 @@ impl CronStore {
         }).await
     }
 
+    /// Update just the `cron_timezone` column. Pass `None` to clear it
+    /// (which reverts the row to UTC / legacy semantics).
     pub async fn update_cron_timezone(&self, id: &str, cron_timezone: Option<&str>) -> Result<bool, String> {
         self.edit_row(id, |row| row.cron_timezone = cron_timezone.map(str::to_owned)).await
     }
@@ -655,7 +654,8 @@ impl CronStore {
             }
         }
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
         let changed = conn
             .execute(
                 "UPDATE cron_tasks
@@ -664,6 +664,7 @@ impl CronStore {
                 params![id, condition_state, now],
             )
             .map_err(|e| format!("update_condition_state: {e}"))?;
+        commit_write(conn)?;
         Ok(changed > 0)
     }
 
@@ -688,7 +689,7 @@ impl CronStore {
 
     pub async fn set_enabled_by_name(&self, name: &str, enabled: bool) -> Result<bool, String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let tx = begin_write(&mut conn)?;
         let ids = tx.prepare("SELECT id FROM cron_tasks WHERE name=?1").map_err(|e| e.to_string())?
             .query_map(params![name], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
@@ -698,32 +699,39 @@ impl CronStore {
             row.enabled = enabled;
             Self::persist_edit(&tx, &before, &row)?;
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        commit_write(tx)?;
         Ok(!ids.is_empty())
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
         let changed = conn
             .execute("DELETE FROM cron_tasks WHERE id = ?1", params![id])
             .map_err(|e| format!("delete cron task: {e}"))?;
+        commit_write(conn)?;
         Ok(changed > 0)
     }
 
     pub async fn delete_by_name(&self, name: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
         let changed = conn
             .execute("DELETE FROM cron_tasks WHERE name = ?1", params![name])
             .map_err(|e| format!("delete_by_name: {e}"))?;
+        commit_write(conn)?;
         Ok(changed > 0)
     }
 
     /// A due occurrence deliberately skipped by the operator is not a failed run.
     pub async fn record_autonomy_skip(&self, id: &str, reason: &str) -> Result<(), String> {
-        self.conn.lock().await.execute(
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
+        conn.execute(
             "UPDATE cron_tasks SET last_run_at=?2,last_status='skipped',last_error=?3,updated_at=?2 WHERE id=?1",
             params![id, Utc::now().to_rfc3339(), reason],
         ).map_err(|e| format!("record_autonomy_skip: {e}"))?;
+        commit_write(conn)?;
         Ok(())
     }
 
@@ -736,7 +744,8 @@ impl CronStore {
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let status = if success { "success" } else { "failure" };
-        let conn = self.conn.lock().await;
+        let mut guard = self.conn.lock().await;
+        let conn = begin_write(&mut guard)?;
         conn.execute(
             "UPDATE cron_tasks
              SET last_run_at = ?2,
@@ -748,6 +757,7 @@ impl CronStore {
             params![id, now, status, error, if success { 1 } else { 0 }],
         )
         .map_err(|e| format!("record_run: {e}"))?;
+        commit_write(conn)?;
         Ok(())
     }
 
@@ -759,6 +769,7 @@ impl CronStore {
     ///
     /// Returns the number of rows inserted.
     pub async fn migrate_from_jsonl(&self, home_dir: &Path) -> Result<usize, String> {
+        verify_io()?;
         let jsonl_path = home_dir.join("cron_tasks.jsonl");
         if !jsonl_path.exists() {
             return Ok(0);
@@ -903,6 +914,7 @@ impl CronStore {
 
         // Rename the file so we don't re-migrate on next startup.
         let archive = home_dir.join("cron_tasks.jsonl.migrated");
+        verify_io()?;
         if let Err(e) = tokio::fs::rename(&jsonl_path, &archive).await {
             warn!("failed to archive legacy cron_tasks.jsonl: {e}");
         } else {
@@ -916,7 +928,25 @@ impl CronStore {
     }
 }
 
-fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
+fn begin_write(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>, String> {
+    verify_io()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    verify_io()?;
+    Ok(tx)
+}
+
+fn commit_write(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
+    verify_io()?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn verify_io() -> Result<(), String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|_| "cron authority unavailable".to_owned())
+}
+
+pub(crate) fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
     let enabled_int: i64 = row.get(5)?;
     Ok(CronTaskRow {
         id: row.get(0)?,
@@ -1281,4 +1311,133 @@ mod tests {
         assert!(!store.get(&row.id).await.unwrap().unwrap().has_notify_target());
     }
 
+}
+
+// Shared writer used by ordinary creation and migration transactions.
+fn insert_cron_row(conn:&Connection,row:&CronTaskRow)->Result<(),String> {
+        conn.execute(
+            "INSERT INTO cron_tasks
+                (id, name, agent_id, cron, task, enabled,
+                 created_at, updated_at, last_run_at, last_status, last_error,
+                 run_count, failure_count,
+                 notify_channel, notify_chat_id, notify_thread_id,
+                 cron_timezone,
+                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+            params![
+                row.id,
+                row.name,
+                row.agent_id,
+                row.cron,
+                row.task,
+                if row.enabled { 1 } else { 0 },
+                row.created_at,
+                row.updated_at,
+                row.last_run_at,
+                row.last_status,
+                row.last_error,
+                row.run_count,
+                row.failure_count,
+                row.notify_channel,
+                row.notify_chat_id,
+                row.notify_thread_id,
+                row.cron_timezone,
+                row.trigger_kind,
+                row.condition_script,
+                row.condition_state,
+                row.watch_command,
+                row.on_behalf_of,
+                row.created_by_user_id,
+                row.scoped_by_user_id,
+            ],
+        )
+        .map_err(|e| format!("insert cron task: {e}"))?;
+        Ok(())
+}
+
+#[path="cron_store_migration.rs"]
+mod migration;
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use std::{future::Future, sync::{Arc, atomic::{AtomicBool, Ordering}}, task::Poll};
+
+    #[tokio::test]
+    async fn finite_cron_query_intersects_owner_grants_and_enabled_state() {
+        let home = tempfile::tempdir().unwrap();
+        let store = CronStore::open(home.path()).unwrap();
+        for (id, owner) in [("a", "alice"), ("b", "alice"), ("secret", "bob"), ("new", "alice")] {
+            store.insert(&CronTaskRow::new(id.into(), id.into(), owner.into(), "0 * * * * *".into(), id.into())).await.unwrap();
+        }
+        store.set_enabled("b", false).await.unwrap();
+        let ids = vec!["a".into(), "b".into(), "secret".into()];
+        let rows = store.list_isolated("alice", &ids, false).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.agent_id == "alice" && row.id != "new"));
+        assert_eq!(store.list_isolated("alice", &ids, true).await.unwrap()[0].id, "a");
+        assert!(store.list_isolated("alice", &[], false).await.unwrap().is_empty());
+        store.conn.lock().await.execute("UPDATE cron_tasks SET agent_id='bob' WHERE id='a'", []).unwrap();
+        assert!(store.list_isolated("alice", &ids, true).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoked_during_sqlite_busy_wait_does_not_publish_cron_update() {
+        static SAW_BUSY: AtomicBool = AtomicBool::new(false);
+        SAW_BUSY.store(false, Ordering::SeqCst);
+        let home = tempfile::tempdir().unwrap();
+        let store = CronStore::open(home.path()).unwrap();
+        store.insert(&CronTaskRow::new("busy".into(), "busy".into(), "alice".into(),
+            "0 * * * * *".into(), "x".into())).await.unwrap();
+        store.conn.lock().await.busy_handler(Some(|_| {
+            SAW_BUSY.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            true
+        })).unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let other_live = live.clone();
+        let path = home.path().join("cron_tasks.db");
+        let (ready, wait_ready) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let mut other = Connection::open(path).unwrap();
+            let tx = other.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            ready.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !SAW_BUSY.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            other_live.store(false, Ordering::SeqCst);
+            drop(tx);
+        });
+        wait_ready.recv().unwrap();
+        let result = duduclaw_mcp_boundary::io_authority::scope(
+            crate::isolation_io_test_support::context(live), store.set_enabled("busy", false)).await;
+        holder.join().unwrap();
+        assert!(SAW_BUSY.load(Ordering::SeqCst));
+        assert!(result.is_err());
+        assert!(store.get("busy").await.unwrap().unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn revoked_during_cron_lock_wait_refuses_write_and_collection() {
+        let home = tempfile::tempdir().unwrap();
+        let store = CronStore::open(home.path()).unwrap();
+        let row = CronTaskRow::new("task".into(), "task".into(), "alice".into(), "0 * * * * *".into(), "x".into());
+        store.insert(&row).await.unwrap();
+        let held = store.conn.lock().await;
+        let live = Arc::new(AtomicBool::new(true));
+        let request = duduclaw_mcp_boundary::io_authority::scope(
+            crate::isolation_io_test_support::context(live.clone()), store.set_enabled("task", false));
+        tokio::pin!(request);
+        std::future::poll_fn(|cx| { assert!(request.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
+        live.store(false, Ordering::SeqCst);
+        drop(held);
+        assert!(request.await.is_err());
+        assert!(store.get("task").await.unwrap().unwrap().enabled);
+        duduclaw_mcp_boundary::io_authority::scope(crate::isolation_io_test_support::context(live), async {
+            assert!(store.list_isolated("alice", &["task".into()], false).await.is_err());
+            assert!(CronStore::open(home.path()).is_err());
+        }).await;
+    }
 }

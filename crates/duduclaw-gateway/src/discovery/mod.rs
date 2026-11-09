@@ -39,6 +39,7 @@
 
 pub mod agent_spawn;
 pub mod artifact;
+pub mod artifact_manifest;
 pub mod attempt_adapter;
 pub mod attempt_container;
 pub mod attempt_guard;
@@ -73,6 +74,18 @@ pub use replay::{CellMeta, Observation, ProbeError, Replay, ReplayTrace};
 pub use score::{BETA_GRID, PointScore, WorldScore, round9};
 pub use store::DiscoveryStore;
 pub use tree::{Direction, FailClass, Node, TreeError, World, WorldTree};
+
+#[cfg(test)]
+pub(crate) fn private_test_home() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Fixtures must satisfy the same private-home contract under any umask.
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().unwrap()
+}
 
 #[cfg(test)]
 mod tests;

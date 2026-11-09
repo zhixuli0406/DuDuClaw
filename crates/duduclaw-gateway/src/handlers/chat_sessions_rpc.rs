@@ -49,6 +49,14 @@ impl MethodHandler {
             None => return WsFrame::ok_response("", json!({ "sessions": [] })),
         };
 
+        // v1.81 P1: an unscoped (Admin) listing hides Personal employees the
+        // caller does not own; a scoped one was gated at dispatch.
+        let hidden = if agent_filter.is_none() {
+            match self.personal_hidden_agents(&live).await {
+                Ok(hidden) => hidden,
+                Err(e) => return WsFrame::error_response("", e),
+            }
+        } else { Default::default() };
         match rc.session_manager.list_sessions(agent_filter, limit).await {
             Ok(list) => {
                 let valid = if let Some(agent) = agent_filter {
@@ -57,6 +65,7 @@ impl MethodHandler {
                 if !valid { return WsFrame::error_response("", "history authority changed; refresh"); }
                 let sessions: Vec<Value> = list
                     .iter()
+                    .filter(|s| !hidden.contains(&s.agent_id))
                     .map(|s| {
                         json!({
                             "session_id": s.id,
@@ -76,12 +85,23 @@ impl MethodHandler {
     }
 
     /// Shared conversation read gate for history JSON and attachment bytes.
-    async fn history_session_access(&self, ctx: &UserContext, requested: &str) -> Result<(UserContext, String, String, Mode, Class), String> {
+    /// `step_up` is the Admin break-glass CSRF token for a Personal employee
+    /// (v1.81 P1); attachment downloads carry none, so an Admin who is not
+    /// the owner cannot fetch a Personal employee's attachments.
+    async fn history_session_access(&self, ctx: &UserContext, requested: &str, step_up: Option<[u8; 32]>) -> Result<(UserContext, String, String, Mode, Class), String> {
         let live = self.bound_history_live(ctx)?;
         let id = handles::resolve(&self.home_dir, &live.user_id, requested).await?;
         let rc = self.reply_ctx.read().await.clone().ok_or("session store unavailable")?;
         let owner = rc.session_manager.session_agent(&id).await
             .map_err(|_| "session not found")?.ok_or("session not found")?;
+        // v1.81 P1d: a non-Admin cannot tell another person's Personal
+        // employee's session from an unknown one.
+        let admin = live.is_admin();
+        self.personal_data_gate(&live, super::personal_data_gate::Target {
+            method: "chat.sessions.history",
+            category: crate::personal_visibility::DataCategory::Sessions,
+            agent: &owner,
+        }, step_up).await.map_err(|e| if admin { e.to_string() } else { "session not found".to_string() })?;
         let mode = privacy::mode(&self.home_dir, &live, &owner)?;
         let class = if mode == Mode::Filtered {
             let home = self.home_dir.clone();
@@ -117,7 +137,9 @@ impl MethodHandler {
 
         if self.reply_ctx.read().await.is_none() { return WsFrame::error_response("", "session store unavailable"); }
 
-        let (live, session_id, owner, initial, class) = match self.history_session_access(ctx, &session_id).await {
+        let step_up = params.get(super::personal_data_gate::STEP_UP_FIELD)
+            .and_then(|raw| serde_json::from_value::<[u8; 32]>(raw.clone()).ok());
+        let (live, session_id, owner, initial, class) = match self.history_session_access(ctx, &session_id, step_up).await {
             Ok(access) => access, Err(e) => return WsFrame::error_response("", &e),
         };
         if let Class::External { channel } = class {
@@ -188,7 +210,7 @@ impl MethodHandler {
     /// Membership is checked independently of cached routing data. No handles
     /// are issued here and no per-reference ledger scans are performed.
     async fn history_contains_attachment(&self, ctx: &UserContext, reference: &crate::chat_attachments::Reference, index: std::sync::Arc<crate::artifacts::HistoryIndex>) -> Result<(), String> {
-        let (live, session, agent, mode, class) = self.history_session_access(ctx, &reference.session).await?;
+        let (live, session, agent, mode, class) = self.history_session_access(ctx, &reference.session, None).await?;
         if matches!(class, Class::External { .. } | Class::Hidden) || agent != reference.agent { return Err("attachment unavailable".into()); }
         let home = self.home_dir.clone();
         let message = reference.message;
@@ -217,7 +239,7 @@ impl MethodHandler {
         let raw = handles::resolve_attachment(&self.home_dir, &live.user_id, id).await?;
         let reference: crate::chat_attachments::Reference = serde_json::from_str(&raw).map_err(|_| "attachment unavailable")?;
         // Check conversation authority before any attachment disk I/O.
-        let (_, _, agent, _, class) = self.history_session_access(&live, &reference.session).await?;
+        let (_, _, agent, _, class) = self.history_session_access(&live, &reference.session, None).await?;
         if agent != reference.agent || matches!(class, Class::External { .. } | Class::Hidden) { return Err("attachment unavailable".into()); }
         let home = self.home_dir.clone();
         let path = reference.path.clone();

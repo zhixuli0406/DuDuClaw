@@ -4561,6 +4561,37 @@ pub struct AgentConfig {
     /// uses (narrowing only); see [`crate::knowledge_agent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<crate::knowledge_agent::KnowledgeAgentConfig>,
+    /// `[isolation]` — native Linux protected-mode switches; see
+    /// [`IsolationSection`]. Admin-only (frozen against the employee's own
+    /// writes by `org_field_guard`).
+    #[serde(default, skip_serializing_if = "IsolationSection::is_default")]
+    pub isolation: IsolationSection,
+}
+
+/// `agent.toml [isolation]` — per-employee switches that only native Linux
+/// protected mode reads. Every key defaults to "no extra authority".
+///
+/// ```toml
+/// [isolation]
+/// public_web = false
+/// ```
+///
+/// `public_web` (owner decision 2026-11-08): whether this employee's
+/// protected runs may use the public-web tools (`web_fetch_cached`,
+/// `web_extract`) through the signed "any public HTTPS site" grant. It is
+/// separate from `[container] network_access`, which only controls the task
+/// sandbox's network. Only an admin sets it (the employee's own Write/Edit of
+/// `agent.toml` is refused for the whole `[isolation]` section).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct IsolationSection {
+    pub public_web: bool,
+}
+
+impl IsolationSection {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// How the system prompt is assembled.

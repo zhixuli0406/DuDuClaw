@@ -802,3 +802,120 @@ async fn existing_tools_behaviour_unchanged_without_override() {
         }
     }
 }
+
+// ── protected mode: the employee's own isolation connector (decision C) ─────
+
+fn write_agnes_odoo(home: &std::path::Path, body: &str) {
+    std::fs::write(home.join("agents/agnes/agent.toml"),
+        format!("[agent]\nname = \"agnes\"\nstatus = \"active\"\n[odoo]\n{body}\n")).unwrap();
+}
+
+/// The isolation-bound path (`handle_bound_odoo_tool`, what the Odoo
+/// isolation connector calls with the connector it selected and bound) now
+/// serves `odoo_create` / `odoo_write` — with every RM-120 gate, and without
+/// touching the pool (no account resolution, no auto-connect).
+#[tokio::test(flavor = "current_thread")]
+async fn bound_generic_write_runs_every_rm120_gate_on_the_isolation_connector() {
+    let (url, methods, server) = mock_odoo().await;
+    let granted = "allowed_models = ['crm.lead', 'crm.lead.line']\nallowed_actions = ['read', 'search', 'create', 'write:crm.lead', \
+                   'generic_create:crm.lead', 'generic_write:crm.lead', 'generic_create:crm.lead.line']";
+    let home = home_with(&mock_global(&url), Some(granted));
+    // Stand-in for the provider's bound connector: authenticated against the
+    // mock, with a snapshot of its connection identity.
+    let setup = pool();
+    connect_and_snapshot(home.path(), &setup, Some(full_access(serde_json::json!(true), serde_json::json!(true)))).await;
+    let connector = setup.cached_connector("agnes").await.unwrap();
+    let bound = |tool: &'static str, params: Value| {
+        let connector = connector.clone();
+        let home = home.path().to_path_buf();
+        async move {
+            // A fresh pool per call, as the isolation executor builds one.
+            let isolated = pool();
+            let result = handle_bound_odoo_tool(tool, &params, &home, &isolated, "agnes", connector).await;
+            assert!(isolated.slots().await.is_empty(), "the bound path never connects through the pool");
+            result
+        }
+    };
+    let creates = || methods.lock().unwrap().iter().filter(|m| *m == "create" || *m == "write").count();
+
+    // Granted: the create and write run on the bound connector.
+    let result = bound("odoo_create", serde_json::json!({"model": "crm.lead", "values": {
+        "name": "Deal", "tag_ids": [[4, 1]], "line_ids": [[0, 0, {"name": "Line"}]]}})).await;
+    assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&result)).unwrap()["id"], 42);
+    let result = bound("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [5], "values": {"name": "R"}})).await;
+    assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+    assert_eq!(creates(), 2);
+
+    // Every gate still refuses on the bound path, before any create / write RPC.
+    for (tool, params, expected) in [
+        // Never-writable list.
+        ("odoo_create", serde_json::json!({"model": "res.users", "values": {"name": "x"}}), "never created or changed by the generic tools"),
+        // x2many command rules.
+        ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"tag_ids": [[3, 5]]}}), "x2many command"),
+        ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"tag_ids": false}}), "false / null"),
+        // Related-model authorization (no write grant on crm.lead.line).
+        ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"line_ids": [[1, 4, {"name": "l"}]]}}), "related table 'crm.lead.line'"),
+        // Field checks against the snapshot.
+        ("odoo_create", serde_json::json!({"model": "crm.lead", "values": {"nope": 1}}), "is not a field of 'crm.lead'"),
+        ("odoo_create", serde_json::json!({"model": "crm.lead", "values": {"kanban_state": "done"}}), "read-only field"),
+        ("odoo_create", serde_json::json!({"model": "crm.lead", "values": {"partner_email": "a@b.c"}}), "related field"),
+        // Archiving.
+        ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"active": false}}), "archives the record"),
+    ] {
+        let result = bound(tool, params.clone()).await;
+        let text = text_of(&result);
+        assert!(result["isError"].as_bool().unwrap(), "{tool} {params}: {text}");
+        assert!(text.contains(expected), "{tool} {params}: {text}");
+    }
+    // Explicit grant and the per-table opt-in, read from the employee's own file.
+    write_agnes_odoo(home.path(), "allowed_models = ['crm.lead']\nallowed_actions = ['read', 'search', 'create', 'write']");
+    for tool in ["odoo_create", "odoo_write"] {
+        let text = text_of(&bound(tool, serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"name": "x"}})).await);
+        assert!(text.contains("generic write opt-in gate"), "{tool}: {text}");
+    }
+    write_agnes_odoo(home.path(), "allowed_models = ['crm.lead']\nallowed_actions = ['generic_create:crm.lead']");
+    let text = text_of(&bound("odoo_create", serde_json::json!({"model": "crm.lead", "values": {"name": "x"}})).await);
+    assert!(text.contains("explicit grant gate"), "{text}");
+    assert_eq!(creates(), 2, "no refused call reached a create / write RPC");
+    server.abort();
+}
+
+/// The isolation executor's pre-credential gate: steps 1–5 refuse locally
+/// (no credential, no connection) and pass exactly the calls the full chain
+/// would let through to the connection step.
+#[test]
+fn generic_write_local_gate_refuses_before_credentials() {
+    let home = home_with(NEVER_RESOLVE, Some(LEAD_FULL));
+    let ok = serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"name": "x", "tag_ids": [[4, 1]]}});
+    for tool in ["odoo_create", "odoo_write"] {
+        assert!(generic_write_local_gate(tool, &ok, home.path(), "agnes").is_ok(), "{tool}");
+    }
+    assert_eq!(classify_generic_write_call("odoo_create", &ok), Some(("create", "crm.lead".to_string())));
+    assert_eq!(classify_generic_write_call("odoo_write", &ok), Some(("write", "crm.lead".to_string())));
+    assert_eq!(classify_generic_write_call("odoo_search", &ok), None);
+    assert_eq!(classify_generic_write_call("odoo_create", &serde_json::json!({"model": "Bad Model"})), None);
+    for (tool, params, expected) in [
+        ("odoo_create", serde_json::json!({"values": {"name": "x"}}), "model is required"),
+        ("odoo_create", serde_json::json!({"model": "res.users", "values": {"name": "x"}}), "never created or changed"),
+        ("odoo_create", serde_json::json!({"model": "sale.order", "values": {"name": "x"}}), "explicit grant gate"),
+        ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"tag_ids": [[5]]}}), "x2many command"),
+        ("odoo_write", serde_json::json!({"model": "crm.lead", "values": {"name": "x"}}), "ids is required"),
+        ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"active": false}}), "archives the record"),
+        ("odoo_search", serde_json::json!({"model": "crm.lead"}), "is not offered"),
+    ] {
+        let refused = generic_write_local_gate(tool, &params, home.path(), "agnes").unwrap_err();
+        assert!(refused["isError"].as_bool().unwrap(), "{tool} {params}");
+        assert!(text_of(&refused).contains(expected), "{tool} {params}: {}", text_of(&refused));
+    }
+    // The opt-in, the module switch and the block list are read from the files too.
+    write_agnes_odoo(home.path(), "allowed_models = ['crm.lead']\nallowed_actions = ['create', 'write']");
+    assert!(text_of(&generic_write_local_gate("odoo_create", &ok, home.path(), "agnes").unwrap_err())
+        .contains("generic write opt-in gate"));
+    write_agnes_odoo(home.path(), LEAD_FULL);
+    std::fs::write(home.path().join("config.toml"), format!("{NEVER_RESOLVE}features_crm = false\n")).unwrap();
+    assert!(text_of(&generic_write_local_gate("odoo_create", &ok, home.path(), "agnes").unwrap_err())
+        .contains("switched off"));
+    std::fs::write(home.path().join("config.toml"), "not toml [[[").unwrap();
+    assert!(generic_write_local_gate("odoo_create", &ok, home.path(), "agnes").is_err(), "unreadable global fails closed");
+}

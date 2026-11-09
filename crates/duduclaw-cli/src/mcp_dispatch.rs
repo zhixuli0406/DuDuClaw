@@ -640,9 +640,9 @@ impl McpDispatcher {
     ) {
         let agent_id = crate::mcp::resolve_audit_agent(&self.home_dir, Some(principal), &self.default_agent);
         // `computer_type`'s text is reduced to its length here too (F5).
-        let arguments = params
-            .get("arguments")
-            .map(|args| crate::mcp::audit_safe_arguments(tool_name, args));
+        let arguments = if crate::mcp_isolation::current().is_some() { None } else {
+            params.get("arguments").map(|args| crate::mcp::audit_safe_arguments(tool_name, args))
+        };
         duduclaw_security::audit::append_tool_call_denied(
             &self.home_dir,
             &agent_id,
@@ -694,6 +694,10 @@ impl McpDispatcher {
         }
         let params = &clean_params;
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let isolation_denied = crate::mcp_isolation::current().is_some()
+            && (!crate::mcp_isolation::tool_allowed(tool_name, principal)
+                || crate::mcp_isolation::check_tool_arguments(tool_name,
+                    params.get("arguments").unwrap_or(&serde_json::json!({}))).is_err());
         tracing::Span::current().record(duduclaw_gateway::otel::attrs::TOOL_NAME, tool_name);
 
         // The AGENT this call acts for (whose agent.toml / approval rows /
@@ -837,6 +841,13 @@ impl McpDispatcher {
         // Their specific response still wins, but background admission must run
         // before any denial audit or injection scanner can persist caller input.
         let denial: Option<(Value, &str, String, Option<String>)> = async {
+            if isolation_denied {
+                let message = match crate::mcp_isolation_disposition::intentional_refusal(tool_name) {
+                    Some(reason) => crate::mcp_isolation::refusal_message(&self.home_dir, reason).await,
+                    None => "隔離執行不允許此工具或參數，或所需服務尚未就緒。",
+                }.to_owned();
+                return Some((jsonrpc_error(id, -32003, &message), "isolation_boundary", message, None));
+            }
             // ── 0b. Read-only explore lane (2026-10) ─────────────────────────────
             // A process the gateway spawned with `DUDUCLAW_LANE=explore` (the
             // heartbeat proactive check) may call only `read` / `draft` tools; a
@@ -844,7 +855,7 @@ impl McpDispatcher {
             // closed). `tools/list` hides the same tools through the same
             // predicate (`mcp::tools_list::lane_permits`).
             if let Some(msg) =
-                crate::mcp::lane_refusal(&duduclaw_core::ProcessLane::current(), tool_name)
+                crate::mcp::lane_refusal(&crate::mcp_isolation::process_lane(), tool_name)
             {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 return Some((jsonrpc_error(id, -32003, &msg), "explore_lane", msg, None));
@@ -1920,7 +1931,9 @@ impl McpDispatcher {
         } else { None };
         let handler = crate::mcp_auth::with_accepted_google_call(
             accepted_google,
-            crate::mcp::handle_tools_call(
+            // Keep the all-tools handler out of the observation/task-local
+            // state machines: these run on 2 MiB production worker stacks.
+            Box::pin(crate::mcp::handle_tools_call(
                 id,
                 &params_owned,
                 &self.home_dir,
@@ -1932,7 +1945,7 @@ impl McpDispatcher {
                 &self.daily_quota,
                 principal,
                 caller_is_admin,
-            ),
+            )),
         );
         if let Some(lease) = &sink_lease { lease.dispatched(); }
         let execution = async {

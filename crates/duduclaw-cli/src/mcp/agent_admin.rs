@@ -35,7 +35,8 @@ pub(crate) async fn handle_agent_remove(params: &Value, home_dir: &Path, caller:
     let agent = agent_id.to_string();
     let caller = caller.to_string();
     // The worker owns the lease through rename even if the MCP call is cancelled.
-    match tokio::task::spawn_blocking(move || remove_agent_locked(&home, &agent, &caller)).await {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    match tokio::task::spawn_blocking(move || authority.run(|| remove_agent_locked(&home, &agent, &caller))).await {
         Ok(value) => value,
         Err(error) => tool_error(&format!("移除員工工作失敗：{error}")),
     }
@@ -53,6 +54,9 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
         Err(error) => return tool_error(&error.to_string()),
     };
 
+    if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
+        return tool_error(&error.to_string());
+    }
     let agent_dir = home_dir.join("agents").join(agent_id);
     let toml_path = agent_dir.join("agent.toml");
 
@@ -101,6 +105,9 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
     let trash_name = format!("{agent_id}_{timestamp}");
     let trash_path = trash_dir.join(&trash_name);
 
+    if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
+        return tool_error(&error.to_string());
+    }
     if let Err(e) = std::fs::rename(&agent_dir, &trash_path) {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error moving agent to trash: {e}")}],
@@ -193,7 +200,7 @@ pub(crate) async fn can_modify_own_soul(home_dir: &Path, agent_id: &str) -> bool
 /// and is therefore always denied, matching every other WP21 gate's
 /// fail-closed contract.
 pub(crate) async fn soul_write_denial(home_dir: &Path, agent_id: &str) -> Option<String> {
-    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let claimed = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
     let claimed = claimed.trim();
     if claimed.is_empty() {
         // Operator / dashboard convention — unrestricted.

@@ -106,7 +106,7 @@ pub(crate) async fn handle_channel_config_list(args: &Value, home_dir: &Path) ->
             Err(e) => return tool_error(&format!("Failed to open settings DB: {e}")),
         };
 
-    let all = mgr.get_all(channel, scope_id).await;
+    let all = mgr.get_mcp_config(channel, scope_id).await;
     if all.is_empty() {
         tool_text(&format!(
             "No settings configured for {channel}/{scope_id}. Using defaults."
@@ -198,7 +198,7 @@ pub(crate) async fn handle_channel_status(args: &Value, home_dir: &Path) -> Valu
                         continue;
                     }
                     let settings: serde_json::Map<String, Value> = mgr
-                        .get_all("discord", &scope)
+                        .get_mcp_status("discord", &scope)
                         .await
                         .into_iter()
                         .map(|(k, v)| (k, Value::String(v)))

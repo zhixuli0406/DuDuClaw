@@ -1,6 +1,7 @@
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useCallback, useRef, useState } from 'react';
 import { api } from '@/lib/api';
+import { withBreakGlass } from '@/lib/break-glass';
 import type { AgentFileKey, AgentFileSaveAction, AgentFileSaveResponse } from '@/lib/agent-files-types';
 import type { ChangeReviewState } from '@/components/agent-files/ChangeReviewDialog';
 
@@ -38,9 +39,15 @@ export function useAgentFileSave(agentId: string, cb: SaveCallbacks, describe: (
   const call = useCallback(
     async (sent: SentChange, follow?: { action: AgentFileSaveAction; analysis_id: string; reason: string; acknowledge_risk: boolean }) => {
       if (!canSelectAgent(agentId)) throw new Error('This AI employee is no longer available. Please select again.');
-      return sent.kind === 'save'
-        ? api.agentFiles.save({ agent_id: agentId, file: sent.file, content: sent.content, base_hash: sent.baseHash, ...follow })
-        : api.agentFiles.rollback({ agent_id: agentId, file: sent.file, version_id: sent.versionId, base_hash: sent.baseHash, ...follow });
+      if (sent.kind === 'save') {
+        const params = { agent_id: agentId, file: sent.file, content: sent.content, base_hash: sent.baseHash, ...follow };
+        // v1.81 P1 break-glass: an Admin changing someone's Personal employee.
+        return withBreakGlass(
+          (token) => (token ? api.agentFiles.save(params, token) : api.agentFiles.save(params)),
+          { purpose: 'write', scope: agentId },
+        );
+      }
+      return api.agentFiles.rollback({ agent_id: agentId, file: sent.file, version_id: sent.versionId, base_hash: sent.baseHash, ...follow });
     },
     [agentId],
   );

@@ -122,6 +122,9 @@ pub async fn cmd_preset_bind(agent: &str, preset_ref: &str, reason: &str) -> Res
     let home = crate::duduclaw_home();
     let dir = agent_dir_or_err(&home, agent)?;
 
+    preset::load_preset(&home, preset_ref)
+        .map_err(|e| DuDuClawError::Agent(preset_error_zh(&e)))?;
+    crate::isolation_policy_init::prepare_existing_authority(&home)?;
     let outcome = preset::bind(&home, agent, &dir, preset_ref, &actor(), reason)
         .map_err(|e| DuDuClawError::Agent(preset_error_zh(&e)))?;
 
@@ -182,6 +185,7 @@ pub async fn cmd_preset_unbind(agent: &str, reason: &str) -> Result<()> {
     let home = crate::duduclaw_home();
     agent_dir_or_err(&home, agent)?;
 
+    crate::isolation_policy_init::prepare_existing_authority(&home)?;
     let removed = preset::unbind(&home, agent, &actor(), reason)
         .map_err(|e| DuDuClawError::Agent(format!("解除綁定失敗：{e}")))?;
     let Some(prev) = removed else {
@@ -267,7 +271,11 @@ pub fn cmd_preset_status(agent: &str) -> Result<()> {
 ///    change; a license-less caller now still gets item 1 instead of a hard
 ///    error.
 pub fn cmd_preset_install_builtin(force: bool) -> Result<()> {
+    if let Some(claimed) = crate::agent_session_identity() {
+        return Err(DuDuClawError::Agent(refuse_preset_write_in_agent_session(&claimed)));
+    }
     let home = crate::duduclaw_home();
+    crate::isolation_policy_init::prepare_existing_authority(&home)?;
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
 

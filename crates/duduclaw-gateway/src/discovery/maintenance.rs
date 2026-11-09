@@ -227,8 +227,8 @@ impl SweepClient {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = command.spawn().map_err(|_| "Docker cleanup launch failed")?;
-        let child_pid = child.id();
+        let mut child = duduclaw_core::execution_blocking::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::Discovery).map_err(|_| "Docker cleanup launch failed")?;
+        let control = child.control();
         let until = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
         let status = loop {
             if lease.state.lost.load(Ordering::Acquire) { break Err("operator lease lost during cleanup"); }
@@ -244,7 +244,7 @@ impl SweepClient {
             }
         };
         // Reap the client and its descendants on success and every failure.
-        #[cfg(unix)] unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL); }
+        let _ = control.start_kill();
         let _ = child.kill();
         let _ = child.wait();
         status.map_err(str::to_owned)?;
@@ -615,7 +615,7 @@ esac
     #[cfg(unix)]
     #[test]
     fn boot_marks_crashed_runs_but_leaves_an_active_operator_alone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::discovery::private_test_home();
         std::fs::write(dir.path().join("config.toml"), "").unwrap();
         let store = DiscoveryStore::open(dir.path()).unwrap();
         let budget = super::super::contracts::RunBudget { max_agent_calls: 1, max_usd: 1., max_wall_secs: 1, max_rounds: 1 };

@@ -21,6 +21,33 @@ pub(crate) async fn fetch_for_tool(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    if let Some(call) = crate::mcp_isolation::current() {
+        // Fetching bytes has no parser input. Keep it on the host, but enforce
+        // the signed origin independently of the original egress/approval gate.
+        let result = async {
+            use duduclaw_mcp_boundary::{VerificationError, tool_policy};
+            let resolver = call.record_resolver.clone().ok_or(VerificationError::Unavailable)?;
+            let before = tool_policy::authorize_async(&call.context, "web_fetch_cached", args, resolver.clone()).await?;
+            // D-H2: a PublicOrigins call re-resolves its URL through the signed grant.
+            if before.resources().iter().any(|grant| matches!(grant,
+                duduclaw_isolation::capability::ResourceGrant::PublicOrigins { .. })) {
+                duduclaw_mcp_boundary::resources::authorize_public_url(&before)?;
+            }
+            if !duduclaw_gateway::web_fetch::admit_protected_tool_fetch() {
+                return Err(VerificationError::Unavailable);
+            }
+            let fetched = if super::workflow_operation::is_workflow_read() {
+                duduclaw_gateway::web_fetch::web_fetch_workflow(url).await
+            } else {
+                duduclaw_gateway::web_fetch::web_fetch_protected_cached(url, ttl, &home_dir.join("web_cache")).await
+            }.map_err(|_| VerificationError::Unavailable)?;
+            let after = tool_policy::authorize_async(&call.context, "web_fetch_cached", args, resolver).await?;
+            if before.resources() != after.resources() { return Err(VerificationError::BindingMismatch); }
+            Ok(fetched)
+        }.await;
+        return result.map_err(|_| tool_error("無法在授權範圍內取得這個網頁，已停止。"));
+    }
+
     if !WEB_FETCH_LIMITER.check("mcp-server") {
         return Err(super::egress_gate::pre_dispatch_error(
             "Rate limit exceeded (10 requests/min) — try again shortly",
@@ -118,8 +145,12 @@ pub(crate) async fn handle_web_extract(args: &Value, home_dir: &Path) -> Value {
         selector: selector.clone(),
         format,
     }];
-    match duduclaw_gateway::web_extract::extract_multiple(&fetched.body, &queries) {
-        Ok(extraction) => {
+    let body = fetched.body;
+    let extraction = tokio::task::spawn_blocking(move || {
+        duduclaw_gateway::web_extract::extract_multiple(&body, &queries)
+    }).await;
+    match extraction {
+        Ok(Ok(extraction)) => {
             let values = extraction
                 .results
                 .get("result")
@@ -138,7 +169,8 @@ pub(crate) async fn handle_web_extract(args: &Value, home_dir: &Path) -> Value {
             }
             tool_text(&text)
         }
-        Err(e) => tool_error(&format!("Extraction failed: {e}")),
+        Ok(Err(e)) => tool_error(&format!("Extraction failed: {e}")),
+        Err(_) => tool_error("網頁解析未完成，請稍後再試。"),
     }
 }
 

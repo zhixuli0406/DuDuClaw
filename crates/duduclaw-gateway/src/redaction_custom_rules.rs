@@ -304,6 +304,7 @@ pub fn save_profile(home: &Path, name: &str, profile: &Profile) -> Result<(), St
     std::fs::create_dir_all(&dir).map_err(|e| format!("無法建立 {}：{e}", dir.display()))?;
     let path = profile_path(home, name);
     duduclaw_core::with_file_lock(&path, || {
+        duduclaw_core::isolation_policy::fence_change(home)?;
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, body.as_bytes())?;
         match std::fs::rename(&tmp, &path) {
@@ -324,10 +325,13 @@ pub fn delete_profile(home: &Path, name: &str) -> Result<bool, String> {
         return Err(format!("規則集名稱 '{name}' 不合法"));
     }
     let path = profile_path(home, name);
-    duduclaw_core::with_file_lock(&path, || match std::fs::remove_file(&path) {
+    duduclaw_core::with_file_lock(&path, || {
+        duduclaw_core::isolation_policy::fence_change(home)?;
+        match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
+        }
     })
     .map_err(|e| format!("規則集 '{name}' 刪除失敗（{}）：{e}", path.display()))
 }

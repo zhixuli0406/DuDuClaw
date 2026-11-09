@@ -1,3 +1,4 @@
+// ExecutionBackend async futures need a deeper Send proof than the default recursion limit.
 #![recursion_limit = "512"]
 #![allow(clippy::empty_line_after_doc_comments)]
 #![allow(clippy::format_in_format_args)]
@@ -55,6 +56,17 @@ pub mod mcp_auth;
 pub mod mcp_capability; // W22-P0 ADR-002: inject_capability_headers + negotiate_capabilities
 pub mod mcp_db; // §13.7 WP-D: read-only SQL data-source MCP tools
 pub mod mcp_dispatch; // W20-P1 Phase 2A: transport-agnostic dispatcher
+mod mcp_isolation_identity;
+mod mcp_isolation_a_routes;
+mod mcp_isolation_inference;
+pub mod mcp_isolation; // Native Linux connection-bound adapter, sharing the existing gates.
+pub mod mcp_isolation_execution;
+pub mod mcp_isolation_disposition;
+pub mod mcp_isolation_resources;
+pub mod mcp_isolation_connector_odoo;
+pub mod mcp_isolation_connector_channel;
+pub mod mcp_isolation_connector_factory;
+pub mod mcp_isolation_boot;
 pub mod mcp_files; // §14.2 WP-F2: local data-file MCP tools (file/csv/xlsx read)
 pub mod mcp_fork; // RFC-26 P3: Live Run Forking tool surface
 pub mod mcp_fork_exec; // RFC-26 P4: real branch execution + background driver
@@ -72,6 +84,7 @@ pub mod mcp_proxy_spawn_env; // per-spawn upstream env for `mcp-proxy --spawn-sc
 pub mod mcp_rate_limit;
 pub mod mcp_recording; // WP3.3 R1/R3: browser + desktop recording capture
 pub(crate) mod mcp_recording_distill; // WP3.3 R2: HAR redaction/parsing + skill_from_recording
+pub(crate) mod mcp_skill_jobs; // H12d: protected skill_from_recording input (job store + brokered /work)
 pub mod mcp_redact;
 pub mod mcp_redaction; // RFC-23 redaction pipeline integration
 pub mod mcp_refresh; // v1.16.0: refresh-token credential type
@@ -91,6 +104,7 @@ mod premium_templates; // Licensed industry templates (commercial/templates-prem
 #[cfg(test)]
 mod profile_edit_test_hook;
 mod preset_cmd; // WP-6F: `duduclaw preset` — agent preset ("職務組合") CLI surface
+mod isolation_policy_init;
 mod ptc;
 pub mod redaction_verify; // WP2: `duduclaw redaction verify` evidence report
 mod secaudit; // Code security audit MVP: intake + OSS scanner orchestration (`duduclaw secaudit`)
@@ -3649,6 +3663,11 @@ mod compat_feature_gate_tests {
 
 #[derive(Subcommand)]
 enum ServiceCommands {
+    /// Check protected Linux installation and isolation readiness without starting services
+    Readiness {
+        #[arg(long, required = true)]
+        protected_linux: bool,
+    },
     /// Read or change root-managed native Linux protection policies
     ProtectedLinux {
         #[command(subcommand)]
@@ -4186,17 +4205,37 @@ pub fn entry_point_blocking() {
 
 pub async fn entry_point() {
     let cli = Cli::parse();
+    // Import must precede even CLI logging/OTLP and redaction initialization.
+    // An explicit import environment never falls through to another command.
+    let import_requested = std::env::var_os(duduclaw_gateway::migration_startup::IMPORT_ONLY_ENV).is_some();
+    if import_requested && (!matches!(&cli.command, Commands::Run { .. }) || cli.force_disable_redaction) {
+        eprintln!("Error: migration import startup refused");
+        std::process::exit(1);
+    }
+    if matches!(&cli.command, Commands::Run { .. }) {
+        match duduclaw_gateway::migration_startup::maybe_run(&duduclaw_home()).await {
+            Ok(true) => return,
+            Ok(false) => {},
+            Err(_) => {
+                eprintln!("Error: migration import startup refused");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Commands::Tooling(ToolingCommands::NsGuardExec { command }) = &cli.command {
         // Must run before logging, banners or any other stdout initialization.
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
             if let Err(error) = duduclaw_core::ns_guard::install_current_process_forced() {
                 eprintln!("Error: namespace guard installation failed; refusing execution: {error}");
                 std::process::exit(1);
             }
-            let error = std::process::Command::new(&command[0]).args(&command[1..]).exec();
-            eprintln!("Error: namespace guard exec failed for {:?}: {error}", command[0]);
+            let mut cmd = tokio::process::Command::new(&command[0]);
+            cmd.args(&command[1..]);
+            match duduclaw_core::execution_gate::status(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(error) => eprintln!("Error: namespace guard execution failed: {error}"),
+            }
         }
         #[cfg(not(unix))]
         {
@@ -5600,6 +5639,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
+            ServiceCommands::Readiness { protected_linux: _ } => service::protected_linux::readiness(),
             ServiceCommands::ProtectedLinux { command } => {
                 service::protected_linux::policy::handle(command)
             }
@@ -7109,7 +7149,7 @@ fn hook_caller_from_tokens(
     token: &str,
     require: bool,
 ) -> duduclaw_core::HookCaller {
-    use duduclaw_core::IdentityVerdict::{Rejected, Verified};
+    use duduclaw_core::IdentityVerdict::{Rejected, Unverified, Verified};
     let hook_verified = !hook_token.is_empty()
         && duduclaw_core::verify_hook_claim(home, claimed, hook_token, require) == Verified;
     // No (or a non-verifying) hook token: the identity token decides,
@@ -7122,6 +7162,10 @@ fn hook_caller_from_tokens(
     };
     match verdict {
         Rejected => duduclaw_core::HookCaller::Untrusted(claimed.to_string()),
+        // An ephemeral child never gets soft-mode trust from a bare claim.
+        Unverified if claimed.starts_with("eph-") => {
+            duduclaw_core::HookCaller::Untrusted(claimed.to_string())
+        }
         _ => duduclaw_core::HookCaller::Agent(claimed.to_string()),
     }
 }
@@ -7250,6 +7294,26 @@ mod resolve_hook_caller_tests {
         assert_eq!(
             caller,
             duduclaw_core::HookCaller::Agent("env-only-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn hook_unverified_ephemeral_claim_is_untrusted() {
+        // Soft mode with a live grace: a bare `agent-x` claim is Unverified and
+        // trusted, but an `eph-` claim must not inherit that trust.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
+        duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+
+        assert_eq!(
+            super::hook_caller_from_tokens(tmp.path(), "agent-x", "", "", false),
+            duduclaw_core::HookCaller::Agent("agent-x".to_string()),
+            "control: a non-ephemeral unverified claim stays trusted in soft mode"
+        );
+        assert_eq!(
+            super::hook_caller_from_tokens(tmp.path(), "eph-child", "", "", false),
+            duduclaw_core::HookCaller::Untrusted("eph-child".to_string()),
         );
     }
 
@@ -9122,6 +9186,7 @@ mod admin_auth_token_tests {
 }
 
 async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
+    if duduclaw_gateway::migration_startup::maybe_run(&duduclaw_home()).await? { return Ok(()); }
     if let Err(error) = duduclaw_core::ns_guard::harden_gateway_process() {
         eprintln!("ERROR: 無法啟用容器 gateway 行程保護，拒絕啟動：{error}");
         std::process::exit(1);
@@ -9291,6 +9356,12 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         edition: None,
     };
 
+    #[cfg(target_os = "linux")]
+    mcp_isolation_connector_factory::install().map_err(|_| duduclaw_core::error::DuDuClawError::Gateway(
+        "隔離連接器初始化失敗，請重新啟動服務。".into()))?;
+    #[cfg(target_os = "linux")]
+    mcp_isolation_boot::install().map_err(|_| duduclaw_core::error::DuDuClawError::Gateway(
+        "隔離工具介面初始化失敗，請重新啟動服務。".into()))?;
     duduclaw_gateway::start_gateway(config).await
 }
 
@@ -10413,6 +10484,7 @@ fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Res
         }
     }
 
+    if !dry_run { isolation_policy_init::prepare_existing_authority(&home)?; }
     let changes = duduclaw_core::org_store::sync_from_mirrors(&home, agent, dry_run)
         .map_err(|e| DuDuClawError::Agent(format!("寫入 org.toml 失敗:{e}")))?;
 

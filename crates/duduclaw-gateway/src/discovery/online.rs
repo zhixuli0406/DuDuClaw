@@ -254,9 +254,9 @@ fn checkpoint(home: &Path, world_dir: &Path, config: &DiscoveryConfig, direction
     }
     if let Some(candidate) = &candidate {
         candidate.guard.verify().map_err(|e|e.to_string())?;
-        let hash = super::workspace::directory_sha256(&candidate.artifact).map_err(|e|e.to_string())?;
+        let manifest = candidate.guard.checkpoint_manifest()?;
         candidate.guard.verify().map_err(|e|e.to_string())?;
-        store.record_verified_artifact(&node.run_id, &node.cell_id, &hash).map_err(|e|e.to_string())?;
+        store.record_artifact_manifest(&node.run_id, &node.cell_id, &manifest).map_err(|e|e.to_string())?;
     }
     append_node(&world_dir.join("tree.jsonl"), node, isolation)?;
     if let Some(candidate) = candidate { *current = Some(candidate); }
@@ -764,10 +764,11 @@ pub async fn run_with_lease_and_identity(
             trace_refine_count: None,
         };
         let context = ctx.clone();
-        let planning = tokio::task::spawn_blocking(move || {
+        let launch_context = duduclaw_core::execution_gate::CapturedLaunch::capture();
+        let planning = tokio::task::spawn_blocking(move || launch_context.sync_scope(|| {
             let plan = policy.plan_grid(&context);
             (policy, plan)
-        });
+        }));
         let planned = tokio::select! {
             result = tokio::time::timeout(budget.remaining_wall(), planning) => Some(result),
             _ = budget.cancelled() => None,
@@ -844,7 +845,8 @@ pub async fn run_with_lease_and_identity(
         let baseline_dir = prepared.workspace.clone();
         let round_guards = guards.clone();
         let round_progress = progress.clone();
-        let solving = tokio::task::spawn_blocking(move || {
+        let launch_context = duduclaw_core::execution_gate::CapturedLaunch::capture();
+        let solving = tokio::task::spawn_blocking(move || launch_context.sync_scope(|| {
             let mut question = OnlineQuestion {
                 home: q_home.clone(),
                 run_dir: q_run,
@@ -868,7 +870,7 @@ pub async fn run_with_lease_and_identity(
             };
             let result = policy.solve(&mut question);
             Ok::<_, String>((question, result))
-        });
+        }));
         let solved = tokio::select! {
             result = tokio::time::timeout(budget.remaining_wall(), solving) => Some(result),
             _ = budget.cancelled() => None,

@@ -1,0 +1,27 @@
+[package]
+name = "duduclaw-run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duduclaw-isolation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2 = "0.10"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+landlock = "0.4.5"
+
+[lints]
+workspace = true
+
+[features]
+root-test-fixture = []
+
+[[bin]]
+name = "duduclaw-run-root-fixture"
+path = "src/bin/root-fixture.rs"
+required-features = ["root-test-fixture"]

@@ -1,4 +1,6 @@
 //! Real database and authenticated-caller fixtures; no provider or Docker calls.
+#[path = "tests_service_isolation.rs"]
+mod isolation_tests;
 use super::*;
 use crate::approval::ApprovalStore;
 use std::collections::HashMap;
@@ -25,7 +27,7 @@ fn register_accounts(home: &Path) {
     }
 }
 fn fixture() -> (tempfile::TempDir, PublicDiscoverySpec, ApprovalBroker) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::discovery::private_test_home();
     let home = dir.path().canonicalize().unwrap();
     register_accounts(&home);
     crate::trigger_route::tests::write_agent(

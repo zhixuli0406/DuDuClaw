@@ -321,7 +321,7 @@ pub(crate) async fn append_bus_event(home_dir: &Path, event: &str, payload: &Val
     let mut payload = payload.clone();
     if let (Some(obj), Ok(agent)) = (
         payload.as_object_mut(),
-        std::env::var(duduclaw_core::ENV_AGENT_ID),
+        crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID),
     ) {
         let agent = agent.trim();
         if !agent.is_empty() {

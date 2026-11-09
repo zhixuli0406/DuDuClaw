@@ -162,6 +162,14 @@ async fn fire_one(
     // The creator remains the authority even though the cron tick is a
     // system sender. Recheck role/default changes before creating any work.
     let principal = format!("user:{}", row.creator_user_id);
+    // v1.81 P1g: fire-time Personal ownership check — a schedule whose
+    // creator is not the employee's CURRENT owner (an Admin's schedule made
+    // before the upgrade included) pauses instead of running.
+    if crate::personal_visibility::fire_time_refusal(
+        home, crate::runtime_readiness::is_protected_linux(), &[Some(principal.as_str())], None, &row.agent_id,
+    ).is_some() {
+        return auto_pause(home, store, row, &slot_s, "access_lost").await;
+    }
     let main_access = {
         let registry = registry.read().await;
         match registry.get(&row.agent_id) {

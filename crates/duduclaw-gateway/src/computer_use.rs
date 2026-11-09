@@ -78,6 +78,16 @@ impl Default for MaskingConfig {
     }
 }
 
+/// Keep local decoding and worker IPC off the asynchronous executor.
+pub async fn mask_screenshot_regions_async(
+    screenshot_base64: String,
+    regions: Vec<[u32; 4]>,
+    fill_color: [u8; 3],
+) -> Result<String, ComputerUseError> {
+    tokio::task::spawn_blocking(move || mask_screenshot_regions(&screenshot_base64, &regions, fill_color))
+        .await.map_err(|_| ComputerUseError::Unavailable("螢幕截圖無法完成遮罩。".into()))?
+}
+
 /// Mask sensitive regions in a base64-encoded PNG screenshot.
 ///
 /// This applies black rectangles over regions identified by the masking config.
@@ -100,10 +110,21 @@ pub fn mask_screenshot_regions(
         return Ok(screenshot_base64.to_string());
     }
 
+    if duduclaw_parse_worker::client::required()
+        && screenshot_base64.len() as u64 > duduclaw_parse_worker::policy::MAX_FILE_BYTES.saturating_mul(4) / 3 + 4 {
+        return Err(ComputerUseError::ParseError("螢幕截圖超過處理上限。".into()));
+    }
+
     // Decode base64 to PNG bytes
     let png_bytes = base64::engine::general_purpose::STANDARD
         .decode(screenshot_base64)
         .map_err(|e| ComputerUseError::ParseError(format!("invalid base64: {e}")))?;
+
+    if duduclaw_parse_worker::client::required() {
+        let masked = duduclaw_parse_worker::media_adapters::mask_image(&png_bytes, regions, fill_color)
+            .map_err(|_| ComputerUseError::Unavailable("螢幕截圖無法在隔離環境中完成遮罩。".into()))?;
+        return Ok(base64::engine::general_purpose::STANDARD.encode(masked));
+    }
 
     // Load image
     let mut img = image::load_from_memory(&png_bytes)
@@ -266,10 +287,9 @@ pub async fn detect_sensitive_regions(
     // screenshot loop. On timeout we return `Err`, which makes
     // `capture_masked_screenshot` mask the whole screenshot (fail closed);
     // `kill_on_drop` kills the `docker exec` client when the future is dropped.
-    let exec = tokio::process::Command::new("docker")
-        .args(["exec", container_name, "duduclaw-eval-dom", &js])
-        .kill_on_drop(true)
-        .output();
+    let mut command = tokio::process::Command::new("docker");
+    command.args(["exec", container_name, "duduclaw-eval-dom", &js]).kill_on_drop(true);
+    let exec = duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool);
     let output = match tokio::time::timeout(DOM_DETECT_TIMEOUT, exec).await {
         Ok(result) => result
             .map_err(|e| RegionDetectFailure::Failed(format!("container exec failed: {e}")))?,

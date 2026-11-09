@@ -92,6 +92,7 @@ impl ComputerUseSessions {
         let ActionRequest::Login { credential } = req else {
             return self.action_with_egress_inner(agent, session, turn, egress_turn, req, None).await;
         };
+        verify_service_authority()?;
         let metadata = website_credentials::list(&self.home).ok()
             .and_then(|records| records.into_iter().find(|m| m.label == *credential));
         let mut audit = LoginAudit { home: &self.home, agent, credential: metadata, status: "cancelled" };
@@ -133,6 +134,7 @@ impl ComputerUseSessions {
         self.ensure_not_paused(session).await?;
         gates::tool_gates(&self.home, &session.agent_id, gates::TOOL_LOGIN).await?;
         // Re-read both the secret and its grants AFTER all approval waits.
+        verify_service_authority()?;
         let record = website_credentials::for_agent(&self.home, &session.agent_id, &expected.label)
             .map_err(|_| login_unavailable())?.ok_or_else(login_unavailable)?;
         if record.metadata != *expected {
@@ -157,6 +159,7 @@ impl ComputerUseSessions {
         shared.login_masked.store(true, Ordering::Release);
         *shared.snapshot.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let mut flight = LoginFlight { shared: Arc::clone(&shared), control: session.backend.control(), finished: false };
+        verify_service_authority()?;
         let status = session.backend.fill_login(&input).await;
         flight.finished = true;
         shared.login_masked.store(status == LoginStatus::FailedUncleared, Ordering::Release);

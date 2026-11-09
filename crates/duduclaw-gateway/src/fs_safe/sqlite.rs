@@ -34,6 +34,36 @@ pub(crate) fn open(home: &Path, name: &str) -> Result<Connection, String> {
     { let _ = (home, name); Err("secure database open unavailable".into()) }
 }
 
+/// SQLite access for [`open_existing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access { ReadOnly, ReadWrite }
+
+/// Open an authority database that must already exist, e.g. `users.db` or
+/// `migration-confirmations.db` in the DuDuClaw home, or `apply.db` in
+/// `<home>/migration-authority`. Same checks as [`open`] (no-follow
+/// descriptor walk from `/` through `directory`, every ancestor owned by the
+/// effective uid or root and not group/other writable, `directory` itself
+/// owned by the effective uid; the database and any present `-journal`,
+/// `-wal`, `-shm` sidecar a regular, single-link file owned by the effective
+/// uid without group/other write; dev/inode of the directory and database
+/// identical before and after the open; `SQLITE_OPEN_NOFOLLOW`), but it never
+/// creates the file and SQLite never gets `CREATE`: a missing or replaced
+/// store fails closed. Unix only; every other platform refuses.
+pub(crate) fn open_existing(directory: &Path, name: &str, access: Access) -> Result<rusqlite::Connection, String> {
+    #[cfg(unix)]
+    { open_unix(directory, name, Some(access), || {}) }
+    #[cfg(not(unix))]
+    { let _ = (directory, name, access); Err("secure database open unavailable".into()) }
+}
+
+/// [`open_existing`] with a hook between the last pre-open check and the
+/// SQLite open, for race tests (e.g. swapping the database inode).
+#[cfg(all(test, unix))]
+pub(crate) fn open_existing_with(directory: &Path, name: &str, access: Access, before_sqlite: impl FnOnce())
+    -> Result<rusqlite::Connection, String> {
+    open_unix(directory, name, Some(access), before_sqlite)
+}
+
 #[cfg(unix)]
 fn canonical_home(home: &Path) -> Result<std::path::PathBuf, String> {
     use std::path::Component;
@@ -109,6 +139,13 @@ fn trusted_directory(home: &Path) -> Result<super::SafeDir, String> {
 
 #[cfg(unix)]
 fn open_with(home: &Path, name: &str, before_sqlite: impl FnOnce()) -> Result<Connection, String> {
+    open_unix(home, name, None, before_sqlite)
+}
+
+/// `existing == None`: create-if-missing private database, read-write.
+/// `Some(access)`: the database must already exist; never created.
+#[cfg(unix)]
+fn open_unix(home: &Path, name: &str, existing: Option<Access>, before_sqlite: impl FnOnce()) -> Result<Connection, String> {
     use std::os::unix::fs::MetadataExt;
     use rusqlite::OpenFlags;
     let denied = || "secure database open unavailable".to_owned();
@@ -123,7 +160,10 @@ fn open_with(home: &Path, name: &str, before_sqlite: impl FnOnce()) -> Result<Co
     }
     // Exclusive creation establishes mode 0600 before SQLite opens anything.
     // Do not give SQLite CREATE: a disappeared main file must fail closed.
-    directory.create_file_new(name, &[]).map_err(|_| denied())?;
+    // An existing-only open never creates: a missing store is refused below.
+    if existing.is_none() {
+        directory.create_file_new(name, &[]).map_err(|_| denied())?;
+    }
     let path = home.join(name);
     // Do not open/close an extra descriptor on an existing database: POSIX
     // close() drops all of this process's record locks on the inode, including
@@ -157,8 +197,14 @@ fn open_with(home: &Path, name: &str, before_sqlite: impl FnOnce()) -> Result<Co
     before_sqlite();
     // NOFOLLOW also rejects symlinks in SQLite's full-path resolution. The
     // bundled Unix VFS opens main/journal/WAL/SHM with O_NOFOLLOW as well.
+    // SQLite owns its descriptors (no fd to fstat, see above), so the
+    // dev/inode identity is re-checked by lstat right after the open.
+    let access = match existing {
+        Some(Access::ReadOnly) => OpenFlags::SQLITE_OPEN_READ_ONLY,
+        None | Some(Access::ReadWrite) => OpenFlags::SQLITE_OPEN_READ_WRITE,
+    };
     let connection = Connection::open_with_flags(&path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        access | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)
         .map_err(|_| denied())?;
     verify()?;
     Ok(connection)
@@ -365,6 +411,79 @@ mod tests {
             nix::unistd::chown(&path, Some(nix::unistd::Uid::from_raw(65534)), None).unwrap();
             assert!(open(home.path(), "state.db").is_err());
         }
+    }
+
+    #[test]
+    fn existing_open_never_creates_and_honours_read_only() {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        assert!(open_existing(home.path(), "state.db", Access::ReadOnly).is_err());
+        assert!(open_existing(home.path(), "state.db", Access::ReadWrite).is_err());
+        assert!(!home.path().join("state.db").exists());
+        open(home.path(), "state.db").unwrap().execute_batch("CREATE TABLE example(value)").unwrap();
+        let read = open_existing(home.path(), "state.db", Access::ReadOnly).unwrap();
+        assert!(read.is_readonly("main").unwrap());
+        assert!(read.execute("INSERT INTO example VALUES (1)", []).is_err());
+        open_existing(home.path(), "state.db", Access::ReadWrite).unwrap().execute("INSERT INTO example VALUES (1)", []).unwrap();
+        // A subdirectory store (e.g. migration-authority/apply.db) is walked the same way.
+        let nested = home.path().join("nested");
+        std::fs::DirBuilder::new().mode(0o700).create(&nested).unwrap();
+        open(&nested, "state.db").unwrap();
+        assert!(open_existing(&nested, "state.db", Access::ReadOnly).is_ok());
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(open_existing(&nested, "state.db", Access::ReadOnly).is_err());
+    }
+
+    #[test]
+    fn existing_open_rejects_inode_swap_between_check_and_open() {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let path = home.path().join("state.db");
+        open(home.path(), "state.db").unwrap().execute_batch("CREATE TABLE current(value)").unwrap();
+        // An older, otherwise valid copy (same owner, 0600, single link).
+        let older = home.path().join("older.db");
+        open(home.path(), "older.db").unwrap().execute_batch("CREATE TABLE stale(value)").unwrap();
+        for access in [Access::ReadOnly, Access::ReadWrite] {
+            let result = open_existing_with(home.path(), "state.db", access, || {
+                std::fs::rename(&path, home.path().join("current.db")).unwrap();
+                std::fs::rename(&older, &path).unwrap();
+            });
+            assert!(result.is_err(), "{access:?}");
+            // Restore for the next round.
+            std::fs::rename(&path, &older).unwrap();
+            std::fs::rename(home.path().join("current.db"), &path).unwrap();
+        }
+        assert!(open_existing(home.path(), "state.db", Access::ReadOnly).is_ok());
+    }
+
+    #[test]
+    fn existing_open_rejects_links_modes_and_sidecars() {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let path = home.path().join("state.db");
+        open(home.path(), "state.db").unwrap().execute_batch("CREATE TABLE example(value)").unwrap();
+        for mode in [0o620, 0o602, 0o666] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(open_existing(home.path(), "state.db", Access::ReadOnly).is_err(), "{mode:o}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_existing(home.path(), "state.db", Access::ReadOnly).is_ok(), "read bits alone are fine");
+        std::fs::hard_link(&path, home.path().join("alias")).unwrap();
+        assert!(open_existing(home.path(), "state.db", Access::ReadOnly).is_err());
+        std::fs::remove_file(home.path().join("alias")).unwrap();
+        let outside = home.path().join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let sidecar = home.path().join(format!("state.db{suffix}"));
+            symlink(&outside, &sidecar).unwrap();
+            assert!(open_existing(home.path(), "state.db", Access::ReadOnly).is_err(), "{suffix}");
+            std::fs::remove_file(&sidecar).unwrap();
+            std::fs::write(&sidecar, b"").unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(open_existing(home.path(), "state.db", Access::ReadOnly).is_err(), "{suffix} mode");
+            std::fs::remove_file(&sidecar).unwrap();
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+        std::fs::rename(&path, home.path().join("real.db")).unwrap();
+        symlink(home.path().join("real.db"), &path).unwrap();
+        assert!(open_existing(home.path(), "state.db", Access::ReadOnly).is_err());
     }
 }
 

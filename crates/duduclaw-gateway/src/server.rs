@@ -1,6 +1,8 @@
 #[path = "server_company.rs"]
 mod server_company;
 mod data_exports_http;
+#[path = "server_migration_bootstrap.rs"]
+mod migration_bootstrap;
 mod a2a_http;
 #[path = "server_invites.rs"]
 mod server_invites;
@@ -442,8 +444,24 @@ mod backup_restore_boot_tests {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn start_gateway_future_is_send() {
+    fn assert_send<T: Send>(_: T) {}
+    // Only construct and drop the future; this never starts a gateway.
+    assert_send(start_gateway(GatewayConfig {
+        bind: "127.0.0.1".into(), port: 0, auth_token: None,
+        home_dir: std::path::PathBuf::new(), allowed_origins: vec![],
+        extension: Arc::new(crate::extension::NullExtension), edition: None,
+    }));
+}
+
 /// Start the WebSocket RPC gateway and block until it shuts down.
 pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Result<()> {
+    if crate::migration_startup::maybe_run(&config.home_dir).await? { return Ok(()); }
+    // v1.81 P1g: every ACL predicate refuses another person's Personal
+    // employee in protected mode — installed before any RPC can arrive.
+    crate::personal_visibility::install_acl_restriction(&config.home_dir);
     // Initialise the log broadcast channel (must happen before subscribers connect).
     let log_tx = crate::log::init_log_broadcaster();
     let tx = log_tx;
@@ -580,6 +598,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Validate the installation policy after a possible restore and before runtime startup.
     crate::product_policy::load(&home_dir).map_err(duduclaw_core::error::DuDuClawError::Config)?;
     crate::runtime_readiness::log_startup_missing(&home_dir);
+    // F6h: memory namespace writer gate (a no-op outside protected mode).
+    crate::isolation_label_stores::install_memory_gate();
     crate::data_exports::initialize(&home_dir)
         .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
     {
@@ -686,6 +706,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         home_dir.clone(), edition_override,
     ).await;
     info!("edition_profile={}", boot_edition.as_str());
+    crate::isolation_readiness::initialize(!boot_edition.is_personal());
+    crate::isolation_readiness::connect_backend().await;
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
     // unreadable policy before schema initialization can hide the failure.
     precheck_identity_policy(&home_dir, boot_edition.is_personal())
@@ -843,6 +865,61 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let handler = MethodHandler::with_extension(config.home_dir, extension.clone()).await;
     handler.set_edition_override(edition_override).await;
+    let isolation_agents = handler.registry().clone();
+    crate::isolation_mcp::boot_protected(&home_dir, user_db.clone(), Arc::new(move |agent| {
+        use crate::isolation_mcp::VerificationError;
+        let registry = isolation_agents.try_read().map_err(|_| VerificationError::Unavailable)?;
+        let employee = registry.get(agent).ok_or(VerificationError::Revoked)?;
+        if !employee.config.agent.status.is_operational() {
+            return Err(VerificationError::Revoked);
+        }
+        Ok(())
+    })).await;
+
+    // F6g §3.6 (F6d boot wiring): finish, roll forward or roll back every
+    // interrupted adoption (`adopting` quarantine row). Protected mode only;
+    // spawnd IPC on the blocking pool, never delays boot. A roll-forward puts
+    // the adopted tree under agents/, so the registry is rescanned after.
+    if crate::runtime_readiness::is_protected_linux() {
+        let (recover_home, recover_registry) = (home_dir.clone(), handler.registry().clone());
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            let home = recover_home.clone();
+            match tokio::task::spawn_blocking(move || crate::isolation_restore_rpc::recover_adoptions_on_boot(&home, now)).await {
+                Ok(Ok(report)) => {
+                    for (label, code) in &report.failed {
+                        warn!(label = %label, code, "employee adoption recovery at boot refused; retried on the next request");
+                    }
+                    if !report.done.is_empty() {
+                        info!(count = report.done.len(), "employee adoptions recovered at boot");
+                        if report.done.iter().any(|(_, _, action)| *action == "rolled_forward") {
+                            if let Err(error) = recover_registry.write().await.scan().await {
+                                warn!(error = %error, "employee adoption recovery: registry rescan failed");
+                            }
+                        }
+                    }
+                }
+                Ok(Err(error)) => warn!(code = error.code(), "employee adoption recovery at boot unavailable"),
+                Err(_) => warn!("employee adoption recovery at boot panicked"),
+            }
+        });
+        // F6i (§3.6): finish every quarantine purge a crash interrupted
+        // (`purging` row) before anything else runs for its label.
+        let purge_home = home_dir.clone();
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            match tokio::task::spawn_blocking(move || crate::isolation_purge::recover_purges_on_boot(&purge_home, now)).await {
+                Ok(Ok((finished, failed))) => {
+                    for (label, code) in &failed {
+                        warn!(label = %label, code, "quarantine purge recovery at boot refused; retried on the next purge");
+                    }
+                    if !finished.is_empty() { info!(count = finished.len(), "quarantine purges finished at boot"); }
+                }
+                Ok(Err(error)) => warn!(code = error.code(), "quarantine purge recovery at boot unavailable"),
+                Err(_) => warn!("quarantine purge recovery at boot panicked"),
+            }
+        });
+    }
 
     // Initialize cost telemetry (must happen before any Claude CLI calls)
     if let Err(e) = crate::cost_telemetry::init_telemetry(&home_dir) {
@@ -1096,8 +1173,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // gateway operation must not depend on a new history audit writer.
         warn!(error=%e,"team history activation sync failed; team history remains unavailable");
     }
-    // Ensure a default admin exists on first run
-    let bootstrap_password = match user_db.ensure_default_admin() {
+    // A completed root-authenticated migration has an empty, fresh users DB.
+    // Its first Admin is established only through the root-issued setup token.
+    let migration_bootstrap = migration_bootstrap::start(&home_dir, user_db.clone(), listener_addr).await?;
+    let bootstrap_password = if migration_bootstrap.is_some() { None } else { match user_db.ensure_default_admin() {
         Ok(password) => password, // Some(..) on first run, None if an admin already existed
         Err(e) => {
             // C2 fix: fail hard if we can't create admin — don't silently continue
@@ -1105,7 +1184,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 "Failed to initialize user database: {e}"
             )));
         }
-    };
+    } };
+
+    // Keep the root-only bootstrap listener alive for this gateway lifetime.
+    let _migration_bootstrap = migration_bootstrap;
 
     // WP3 (DESIGN-installer-settings-integration-2026-08.md §4): land an
     // installer-written pending-account.json, if the graphical installer ran
@@ -1114,7 +1196,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // one-time password `ensure_default_admin` just generated no longer
     // matches the now-claimed row), so printing has to check the
     // POST-landing claim state, not just whether this was a first run.
-    crate::pending_account::land_pending_account(&user_db, &home_dir);
+    if _migration_bootstrap.is_none() {
+        crate::pending_account::land_pending_account(&user_db, &home_dir);
+    }
 
     // Stage 2 (design doc §5 plan (b)): land an installer-written
     // pending-network.json the same way — the live installer only
@@ -1567,6 +1651,28 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             );
         },
     );
+    let proactive_registry = handler.registry().clone();
+    if duduclaw_agent::heartbeat::install_protected_proactive_invoker(Arc::new(
+        move |home, agent, prompt, material| {
+            let registry = proactive_registry.clone();
+            Box::pin(async move {
+                // A shared employee is not a person. Only the stored approval
+                // can identify who authorized this recurring heartbeat.
+                let owner = crate::isolation_background::record_owner(&home, "heartbeat", &agent);
+                let principal = owner.clone();
+                crate::on_behalf_of::scope_first(principal,
+                    crate::explore_lane::EXPLORE.scope(true,
+                    crate::isolation_background::scope_record(&home, "heartbeat", &agent, &agent,
+                        owner.as_deref(), &material,
+                        crate::autonomous_runtime::scope(&home, &agent, &[],
+                        crate::process_group::with_class(duduclaw_core::execution_gate::ExecutionClass::Heartbeat,
+                        crate::claude_runner::call_claude_for_agent_with_type(&home, &registry, &agent,
+                            &prompt, crate::cost_telemetry::RequestType::Cron)))))).await
+            })
+        },
+    )).is_err() {
+        tracing::error!("受保護排程的執行介面無法註冊，相關工作維持暫停。");
+    }
     let heartbeat = duduclaw_agent::heartbeat::start_heartbeat_scheduler_with(
         home_dir.clone(),
         handler.registry().clone(),
@@ -2744,6 +2850,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
         .route("/api/brand", get(handle_public_brand))
+        .route("/api/migration/setup", get(migration_bootstrap::page))
+        .route("/api/migration/setup/claim", post(migration_bootstrap::claim).layer(DefaultBodyLimit::max(8192)))
         .route("/api/company", get(server_company::company))
         .route("/api/company/logo", server_company::upload_route())
         .route("/api/company/logo/{filename}", get(server_company::logo))
@@ -5224,6 +5332,17 @@ fn authorize_causal_admin(
             .into_response());
     }
     Ok(ctx)
+}
+
+/// v1.81 P1g: the HTTP answer for a route naming another person's Personal
+/// employee (no step-up path over plain HTTP: owner only). Same text as an
+/// unknown / inaccessible employee.
+fn personal_http_refusal() -> axum::response::Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": "access denied" })),
+    )
+        .into_response()
 }
 
 fn causal_store_response(
@@ -8819,8 +8938,14 @@ async fn handle_causal_import_memory(
     headers: axum::http::HeaderMap,
     Json(request): Json<CausalImportMemoryRequest>,
 ) -> axum::response::Response {
-    if let Err(response) = authorize_causal_admin(&state, &headers) {
-        return response;
+    let ctx = match authorize_causal_admin(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    // v1.81 P1g: another person's Personal employee's memory is never
+    // imported over this route (no step-up path here: owner only).
+    if ctx.hides_agent(&request.agent_id) {
+        return personal_http_refusal();
     }
     let db = state.home_dir.join("memory.db");
     causal_store_response(
@@ -8838,8 +8963,13 @@ async fn handle_causal_import_wiki(
     headers: axum::http::HeaderMap,
     Json(request): Json<CausalImportWikiRequest>,
 ) -> axum::response::Response {
-    if let Err(response) = authorize_causal_admin(&state, &headers) {
-        return response;
+    let ctx = match authorize_causal_admin(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    // v1.81 P1g: see `handle_causal_import_memory`.
+    if ctx.hides_agent(&request.agent_id) {
+        return personal_http_refusal();
     }
     let db = state.home_dir.join("memory.db");
     causal_store_response(
@@ -15009,6 +15139,13 @@ async fn handle_files_preview(
         return files_snapshot::error(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "此檔案類型不支援預覽，請下載後開啟");
     }
+
+    // Package A must replace the legacy soffice spawn with an isolated service.
+    // Successful ZIP preflight does not make executing this parser as gateway safe.
+    if duduclaw_parse_worker::client::required() {
+        return files_snapshot::error(axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "隔離預覽服務尚未就緒，請下載檔案開啟。");
+    }
     files_snapshot::office_preview(&state, &ctx, agent, &q.name, snapshot).await
 }
 
@@ -17183,13 +17320,13 @@ async fn handle_reliability_summary_http(
                 .into_response();
         }
     };
-    if authenticate_jwt(&state, token).is_err() {
+    let Ok(caller) = authenticate_jwt(&state, token) else {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid or expired token"})),
         )
             .into_response();
-    }
+    };
 
     let agent_id = match params.agent_id.as_deref() {
         Some(id) if !id.is_empty() => id.to_owned(),
@@ -17200,6 +17337,11 @@ async fn handle_reliability_summary_http(
             .into_response();
         }
     };
+    // v1.81 P1g: another person's Personal employee's reliability record is
+    // its owner's (HTTP has no step-up path).
+    if caller.hides_agent(&agent_id) {
+        return personal_http_refusal();
+    }
 
     let window_days = params.window_days.unwrap_or(7).clamp(1, 365);
 
@@ -19265,7 +19407,7 @@ mod remembered_sessions;
 #[path = "server_mfa_email.rs"]
 mod server_mfa_email;
 #[path = "server_mfa_passkey.rs"]
-mod server_mfa_passkey;
+pub(crate) mod server_mfa_passkey;
 
 #[cfg(test)]
 mod identity_key_startup_tests {

@@ -1,0 +1,16 @@
+[Unit]
+Description=DuDuClaw employee launch control socket
+
+[Socket]
+ListenSequentialPacket=/run/duduclaw-spawnd/control.sock
+SocketUser=root
+SocketGroup=duduclaw
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+Accept=no
+Service=duduclaw-spawnd.service
+Backlog=32
+
+[Install]
+WantedBy=sockets.target

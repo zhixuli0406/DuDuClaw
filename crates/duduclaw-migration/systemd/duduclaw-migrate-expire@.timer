@@ -1,0 +1,8 @@
+[Unit]
+Description=Check DuDuClaw migration recovery retention
+[Timer]
+OnCalendar=daily
+Persistent=yes
+RandomizedDelaySec=300
+[Install]
+WantedBy=timers.target

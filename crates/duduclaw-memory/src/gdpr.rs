@@ -383,21 +383,27 @@ pub async fn gdpr_erase(
             let content = format!(
                 "[gdpr-erasure] contact_sha256={contact_hash} removed memories={mem_deleted} key_facts={kf_deleted} archived={arch_deleted} at={now}"
             );
-            conn.execute(
-                "INSERT INTO memories
-                    (id, agent_id, content, timestamp, tags, layer, importance,
-                     source_event, subject, predicate, valid_from)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'semantic', 3.0,
-                         'gdpr_erasure', ?6, 'erasure_event', ?4)",
-                rusqlite::params![
-                    tid,
-                    agent_id,
-                    content,
-                    now,
-                    "[\"gdpr-erasure\"]",
-                    "gdpr:erasure",
-                ],
-            )
+            // F6fb2 item 1: the erasure record must be written even when the
+            // label is tombstoned or quarantined (a right-to-erasure request
+            // is never refused). Only this statement, only this label, passes
+            // the F6 writer gate (`label_gate::narrowing_write`, logged).
+            crate::label_gate::narrowing_write(crate::label_gate::NarrowingWrite::ErasureRecord, Some(agent_id), || {
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, agent_id, content, timestamp, tags, layer, importance,
+                         source_event, subject, predicate, valid_from)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'semantic', 3.0,
+                             'gdpr_erasure', ?6, 'erasure_event', ?4)",
+                    rusqlite::params![
+                        tid,
+                        agent_id,
+                        content,
+                        now,
+                        "[\"gdpr-erasure\"]",
+                        "gdpr:erasure",
+                    ],
+                )
+            })
             .map_err(|e| format!("tombstone insert failed: {e}"))?;
             conn.execute(
                 "INSERT INTO memories_fts (content, agent_id, memory_id) VALUES (?1, ?2, ?3)",

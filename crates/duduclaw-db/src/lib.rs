@@ -23,6 +23,13 @@
 //! 3. **Caps** — `max_rows` (default 200, hard cap 1000) and `timeout_ms`
 //!    (default 10s) bound how much a single call can cost.
 //!
+//! # Task-limited SQL
+//!
+//! [`parse_finite_select`] accepts a strict single-table SELECT subset and
+//! returns [`SelectRequest`]. Call [`DbSource::select`] with exact table grants
+//! (`with_exact_table_names`); never forward the original statement to `query`.
+//! Employee-wide free SQL keeps the existing wildcard/read-only requirements.
+//!
 //! # Credentials
 //!
 //! [`DbSourceConfig::url`] is an **already-resolved plaintext** connection
@@ -35,6 +42,7 @@
 
 pub mod config;
 pub mod guard;
+pub mod finite_select;
 pub mod ident;
 mod source;
 mod value;
@@ -43,9 +51,10 @@ pub use config::{
     DbSourceEntry, DbSourceLoadError, LoadedDbSources, load_db_sources, open_source,
     parse_db_sources, resolve_source_url,
 };
+pub use finite_select::{FiniteSelectError, parse_finite_select};
 pub use guard::{StatementGuardError, ensure_read_only_statement};
 pub use ident::{is_valid_identifier, parse_order_by, placeholder, quote_ident};
-pub use source::DbSource;
+pub use source::{DbSource, IoAuthority};
 pub use value::JsonRow;
 
 use serde::{Deserialize, Serialize};

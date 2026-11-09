@@ -94,8 +94,9 @@ pub fn verified_employee(home_dir: &std::path::Path, claimed: &str, token: &str)
 
 /// [`verified_employee`] over this process's environment.
 pub fn verified_employee_from_env(home_dir: &std::path::Path) -> Option<String> {
-    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
-    let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+    if let Some(employee) = crate::mcp_isolation_identity::verified_employee(home_dir) { return employee.ok(); }
+    let claimed = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let token = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
     verified_employee(home_dir, &claimed, &token)
 }
 

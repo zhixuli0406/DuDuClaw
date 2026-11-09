@@ -22,6 +22,22 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+fn verify_live_io() -> Result<(), String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())
+}
+
+fn begin_live_write(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>, String> {
+    verify_live_io()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+    verify_live_io()?;
+    Ok(tx)
+}
+
+fn commit_live_write(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
+    verify_live_io()?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
 // ── Constants ───────────────────────────────────────────────
 
 /// Default TTL when a caller does not specify one. 1 hour.
@@ -55,8 +71,13 @@ pub const REMIND_MIN_TTL_SECONDS: i64 = 120;
 /// responsibility change (per-target hourly cap). They still expire.
 /// Operator-CLI kinds come from `operator_cli_gate::OPERATOR_CLI_KINDS`
 /// (`KindSpec::reminders`).
+/// SR2 round 4 (N4): a Personal employee's delegation card is never
+/// reminded either — the reminder would push the owner-only card through
+/// the generic channel chain that [`SELF_NOTIFYING_KINDS`] keeps it out of.
 pub(crate) fn no_reminder(kind: &str) -> bool {
-    kind == crate::responsibility::DECISION_KIND || operator_cli_gate::no_reminder(kind)
+    kind == crate::responsibility::DECISION_KIND
+        || kind == crate::isolation_background::PERSONAL_DELEGATION_KIND
+        || operator_cli_gate::no_reminder(kind)
 }
 
 const SELF_NOTIFYING_KINDS: &[&str] = &[
@@ -64,6 +85,10 @@ const SELF_NOTIFYING_KINDS: &[&str] = &[
     // P2-A S-M7: pushed as a responsibility notice (policy, proactive gate,
     // durable per-window cap), never by the generic approval push.
     crate::responsibility::DECISION_KIND,
+    // SR2: a Personal employee's delegation card shows its owner's task text
+    // and is decided by that owner only (own account page); never pushed to
+    // the deciders of the generic approval push.
+    crate::isolation_background::PERSONAL_DELEGATION_KIND,
 ];
 
 /// Hard cap on the generic push so a hung channel API can never stall the
@@ -119,7 +144,7 @@ pub use workflow_grants::{
 };
 pub use binding::{
     CURRENT_DECISION_CONTEXT, ConversationAudience, DecisionContext, ExecutionBinding, RequestKind, payload_hash,
-    policy_revision, WORKFLOW_ACTIVATION_KIND,
+    policy_revision, strict_policy_revision, WORKFLOW_ACTIVATION_KIND,
 };
 pub use operations::{OPERATION_LEASE_HELD, OperationClaim, OperationRecord, OperationState};
 mod gates;

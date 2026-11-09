@@ -126,6 +126,7 @@ fn purpose(receipt: &HomeSourceReceipt, scopes: &[&str]) -> Result<Vec<String>> 
     Ok(scopes)
 }
 fn barrier(home: &Path) -> Result<()> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| Error::PublicationBlocked)?;
     crate::google_personal::grants::check_metadata_barrier(home)
         .map_err(|_| Error::PublicationBlocked)
 }
@@ -258,6 +259,7 @@ impl<'a> ResolveBudget<'a> {
         }
     }
     fn check(self) -> Result<()> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| Error::PublicationBlocked)?;
         match self {
             Self::Legacy => Ok(()),
             Self::Remote(deadline, ..) => {

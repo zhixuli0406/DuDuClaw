@@ -95,11 +95,24 @@ pub(crate) fn clamp_limit(args: &Value, default: i64, max: i64) -> i64 {
 /// employee caller (`actor` = `Agent`) only sees tasks the task audience lets
 /// it read (`agent_may_read_task_row`: open tasks, its own, or a list naming
 /// it); operators are unrestricted.
+#[cfg_attr(not(test), allow(dead_code))] // dispatch calls `personal_wildcard::tasks_list`
 pub(crate) async fn handle_tasks_list(
     args: &Value,
     home_dir: &Path,
     default_agent: &str,
     actor: RecordActor<'_>,
+) -> Value {
+    handle_tasks_list_hiding(args, home_dir, default_agent, actor, &Default::default()).await
+}
+
+/// [`handle_tasks_list`] without the rows of `hidden` employees (v1.81 P1d,
+/// `personal_wildcard.rs`); `total` counts only what is returned.
+pub(crate) async fn handle_tasks_list_hiding(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    actor: RecordActor<'_>,
+    hidden: &std::collections::BTreeSet<String>,
 ) -> Value {
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
@@ -115,10 +128,12 @@ pub(crate) async fn handle_tasks_list(
         _ => Some(default_agent),
     };
 
-    let mut rows = match store.list_tasks(status, assigned_to, priority).await {
+    let query = store.list_tasks(status, assigned_to, priority).await;
+    let mut rows = match query {
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list tasks: {e}")),
     };
+    rows.retain(|row| !hidden.contains(&row.assigned_to));
     rows.retain(|row| a2a_task_access_allowed(home_dir, actor, &row.id, Some(row)));
     if let Some(viewer) = actor.agent() {
         rows.retain(|row| {
@@ -1134,7 +1149,7 @@ mod criteria_tag_tests {
 /// [`resolve_parent`] refuses (H3-1: present-but-damaged is never read as
 /// "no round"; `duduclaw_core::host_task_id` would read it as absent).
 fn round_env_from_process() -> Option<String> {
-    std::env::var_os(duduclaw_core::ENV_TASK_ID).map(|v| v.into_string().unwrap_or_default())
+    crate::mcp_isolation_identity::var_os(duduclaw_core::ENV_TASK_ID).map(|v| v.into_string().unwrap_or_default())
 }
 
 /// A round value the host could have written: the same rule the gateway
@@ -1484,3 +1499,8 @@ mod autonomy_commit_tests {
         assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
     }
 }
+
+/// Finite, immutable grant ids; a missing task grant never means all tasks.
+#[cfg(test)]
+#[path = "../mcp_collection_isolation_tests.rs"]
+mod isolation_collection_tests;

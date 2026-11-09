@@ -32,7 +32,7 @@ impl MethodHandler {
 
     async fn handle_approvals_decide_inner(
         &self,
-        params: Value,
+        mut params: Value,
         ctx: &UserContext,
     ) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
@@ -59,6 +59,14 @@ impl MethodHandler {
             Ok(rec) => Some(rec),
             Err(response) => return response,
         };
+        // SR2: a Personal → Shared delegation card is decided only by the
+        // Personal employee's owner (`me.isolation.decide_personal_delegation`),
+        // never here — not even by an Admin.
+        if record.as_ref().is_some_and(|r| r.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND) {
+            return WsFrame::error_response("", crate::isolation_background::PERSONAL_DELEGATION_DECIDE_ELSEWHERE);
+        }
+        // v1.81 P1c: a Personal employee's card — its owner, or an audited Admin step-up (personal_decide_gate.rs).
+        if let Some(r) = &record && let Err(frame) = Box::pin(self.personal_decide_gate(ctx, r, super::personal_data_gate::take_step_up(&mut params), "approvals.decide")).await { return frame; }
         if let Some(r) = &record {
             // Both approval and denial can wake work. Gate every kind before
             // specialized paths, expiry polling, or any broker decision.
@@ -885,8 +893,8 @@ mod tests {
 
     #[test]
     fn approvals_decide_keeps_scoped_inner_future_on_heap() {
-        // Inspect future types without constructing a handler or polling a future.
-        fn future_size<F: std::future::Future>(
+        // Check Send and size without constructing a handler or polling a future.
+        fn future_size<F: std::future::Future + Send>(
             _: impl FnOnce(&'static MethodHandler, &'static UserContext) -> F,
         ) -> usize {
             std::mem::size_of::<F>()

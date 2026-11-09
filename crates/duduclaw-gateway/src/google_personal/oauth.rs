@@ -81,6 +81,7 @@ enum ScopedRefreshPolicy<'a> {
 }
 impl ScopedRefreshPolicy<'_> {
     fn check(&self) -> Result<(), Error> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| Error::Unavailable)?;
         if let Self::Closed { deadline, .. } = self {
             if tokio::time::Instant::now() >= *deadline {
                 return Err(Error::Unavailable);
@@ -127,6 +128,7 @@ impl ScopedRefreshPolicy<'_> {
 }
 fn scoped_refresh_client(policy: &ScopedRefreshPolicy<'_>) -> Result<reqwest::Client, Error> {
     let builder = match policy {
+        ScopedRefreshPolicy::Legacy if duduclaw_mcp_boundary::io_authority::is_scoped() => reqwest::Client::builder().no_proxy(),
         ScopedRefreshPolicy::Legacy => reqwest::Client::builder(),
         ScopedRefreshPolicy::Meeting | ScopedRefreshPolicy::Closed { .. } => reqwest::Client::builder().no_proxy(),
     };
@@ -140,6 +142,12 @@ fn scoped_refresh_client(policy: &ScopedRefreshPolicy<'_>) -> Result<reqwest::Cl
 
 async fn response_json(mut response: reqwest::Response) -> Result<Value, Error> {
     let status = response.status();
+    // v1.81 E3: redirects are never followed (Policy::none) and a 3xx is a
+    // failure that is never parsed, so a redirect body can never be read as
+    // tokens or as an `invalid_grant` consent-revoke signal.
+    if status.is_redirection() {
+        return Err(Error::Rejected);
+    }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
         if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE {

@@ -94,6 +94,7 @@ pub(crate) fn record(
     meta: &VersionMeta,
     keep: usize,
 ) -> Result<String, String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     let dir = file_dir(home, agent_id, key);
     ensure_private_dir(&dir)?;
     let sha = super::hash_of(content);
@@ -121,6 +122,8 @@ pub(crate) fn record(
     let index = dir.join("index.jsonl");
     let line = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
     duduclaw_core::with_file_lock(&index, || {
+        duduclaw_mcp_boundary::io_authority::verify_before_io()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
         let mut rows = read_index(&dir);
         rows.push(entry.clone());
         let keep = keep.max(1);
@@ -133,11 +136,15 @@ pub(crate) fn record(
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o600));
             }
+            duduclaw_mcp_boundary::io_authority::verify_before_io()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
             return writeln!(f, "{line}");
         }
         let text: String = rows.iter().filter_map(|r| serde_json::to_string(r).ok()).map(|l| l + "\n").collect();
         crate::handlers::config_commit::replace_owner_only(&index, &text)?;
         for old in dropped {
+            duduclaw_mcp_boundary::io_authority::verify_before_io()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
             if !rows.iter().any(|r| r.version_id == old.version_id) {
                 let _ = std::fs::remove_file(dir.join(format!("{}.{}", old.version_id, key.ext())));
             }

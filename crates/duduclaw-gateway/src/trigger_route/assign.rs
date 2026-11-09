@@ -4,7 +4,7 @@
 //!
 //! | sender | may assign to |
 //! |---|---|
-//! | dashboard Admin | every operational employee |
+//! | dashboard Admin | every operational employee (P1h: except, in protected mode, another person's Personal employee) |
 //! | a mapped account | employees it holds at Operator or above: a direct Owner/Operator binding, or a team grant that derived Operator |
 //! | the default employee, `public_trigger` employees, a Viewer binding | nobody (they may only talk: "call only") |
 //! | an unmapped sender | nobody ("link your account first"; nothing about which employees exist) |
@@ -159,11 +159,28 @@ pub fn dashboard_grant_via(ctx: &UserContext, agent: &str) -> Option<String> {
 /// May this sender hand `agent` a task? Unmapped senders are answered
 /// before the employee is even looked up, so the reply says nothing about
 /// which employees exist.
+///
+/// P1h (N1): in protected mode a Personal employee takes work only from its
+/// owner — an Admin, a binding or a team grant of anyone else is
+/// [`AssignRight::Denied`] ([`AssignRight::CallOnly`] when its own
+/// owner-configured `public_trigger` lets everyone talk to it).
 pub fn assign_right(
     reg: &AgentRegistry,
     access: &SenderAccess,
     agent: &str,
     fallback: Option<&str>,
+) -> AssignRight {
+    assign_right_under(reg, access, agent, fallback, duduclaw_auth::acl::personal_restriction())
+}
+
+/// [`assign_right`] under an explicit Personal restriction (tests; the
+/// production path uses the restriction installed at gateway boot).
+pub(crate) fn assign_right_under(
+    reg: &AgentRegistry,
+    access: &SenderAccess,
+    agent: &str,
+    fallback: Option<&str>,
+    restriction: Option<&dyn duduclaw_auth::acl::PersonalRestriction>,
 ) -> AssignRight {
     if matches!(access.sender, Sender::Unmapped) {
         return AssignRight::NeedsIdentity;
@@ -182,13 +199,20 @@ pub fn assign_right(
     {
         return AssignRight::Denied;
     }
+    if access.personal_denied_under(agent, restriction) {
+        return if access.may_call_under(loaded, fallback, restriction) {
+            AssignRight::CallOnly
+        } else {
+            AssignRight::Denied
+        };
+    }
     match &access.sender {
         Sender::Admin { .. } => AssignRight::Allowed(GrantSource::Admin),
         Sender::Account { access: ea, .. } => match ea.level(agent) {
             Some((level, source)) if level.at_least(AccessLevel::Operator) => {
                 AssignRight::Allowed(source)
             }
-            _ if access.may_call(loaded, fallback) => AssignRight::CallOnly,
+            _ if access.may_call_under(loaded, fallback, restriction) => AssignRight::CallOnly,
             _ => AssignRight::Denied,
         },
         Sender::Unmapped => AssignRight::NeedsIdentity,
@@ -208,14 +232,26 @@ pub fn assignable_ids(
         .collect()
 }
 
-/// For non-admin WebChat accounts, invisible names must not influence exact,
-/// partial or ambiguous assignment matching. Other channels keep their policy.
+/// For WebChat accounts, invisible names must not influence exact, partial
+/// or ambiguous assignment matching. Other channels keep their policy.
+/// P1h (N1): an Admin's WebChat targets drop another person's Personal
+/// employees too (the only employees an Admin cannot assign to there).
 pub(crate) fn assignment_mention_targets(
     reg: &AgentRegistry, access: &SenderAccess, channel: &str, fallback: Option<&str>,
 ) -> Vec<duduclaw_agent::trigger_match::MentionTarget> {
+    assignment_mention_targets_under(reg, access, channel, fallback, duduclaw_auth::acl::personal_restriction())
+}
+
+/// [`assignment_mention_targets`] under an explicit Personal restriction.
+pub(crate) fn assignment_mention_targets_under(
+    reg: &AgentRegistry, access: &SenderAccess, channel: &str, fallback: Option<&str>,
+    restriction: Option<&dyn duduclaw_auth::acl::PersonalRestriction>,
+) -> Vec<duduclaw_agent::trigger_match::MentionTarget> {
     let mut targets = super::mention_targets(reg);
-    if channel == "webchat" && matches!(access.sender, Sender::Account { .. }) {
-        targets.retain(|target| matches!(assign_right(reg, access, &target.id, fallback), AssignRight::Allowed(_)));
+    if channel == "webchat" && matches!(access.sender, Sender::Account { .. } | Sender::Admin { user_id: Some(_) }) {
+        targets.retain(|target| {
+            matches!(assign_right_under(reg, access, &target.id, fallback, restriction), AssignRight::Allowed(_))
+        });
     }
     targets
 }

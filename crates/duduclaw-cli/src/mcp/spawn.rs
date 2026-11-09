@@ -14,8 +14,8 @@ pub(crate) async fn spawn_agent_with_ctx(
 ) -> Value {
     spawn_agent_with_ctx_and_upstream(
         params, home_dir, caller, ctx,
-        (std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
-         std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
+        (crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
+         crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
     ).await
 }
 
@@ -105,6 +105,16 @@ pub(crate) async fn spawn_agent_with_ctx_and_upstream(
         });
     }
 
+    // H13: protected mode — the signed capability and the live host resolver
+    // decide per call, before any queue side effect: exact schema, own live
+    // record task, target allowed by the delegation policy AND the isolation
+    // bindings. The gates above keep their messages; `persist_spawn_authority`
+    // below still files the owner approval card for a Personal source.
+    if crate::mcp_isolation::current().is_some() && authorize_isolated_spawn("spawn_agent", params).await.is_err() {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
+        return tool_error(ISOLATED_SPAWN_REFUSAL);
+    }
+
     let origin = ctx.origin.as_deref().unwrap_or(caller);
 
     // ── P3 runaway guard (cascade hop-depth + dispatch circuit breaker) ──
@@ -134,7 +144,7 @@ pub(crate) async fn spawn_agent_with_ctx_and_upstream(
     stamp_spawn_upstream(&mut entry, home_dir, caller, &task_id, upstream);
     // A run in the explore lane hands read-only work on: the dispatcher
     // reads this like `message_queue.lane`.
-    if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+    if let Some(lane) = crate::mcp_isolation::process_lane().delegation_stamp() {
         entry["lane"] = serde_json::json!(lane);
     }
     // The person this run works for (host env only); the dispatcher scopes
@@ -155,6 +165,9 @@ pub(crate) async fn spawn_agent_with_ctx_and_upstream(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
+    if let Err(reason) = persist_spawn_authority(home_dir, caller, &entry).await {
+        return tool_error(&reason);
+    }
     let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let entry_str = entry.to_string();
@@ -247,8 +260,8 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
 ) -> Value {
     spawn_ephemeral_with_ctx_and_upstream(
         params, home_dir, caller, ctx,
-        (std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
-         std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
+        (crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
+         crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
     ).await
 }
 
@@ -327,6 +340,11 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
             )}],
             "isError": true
         });
+    }
+    // H13 (D-H3, D8): protected mode never scaffolds a new agent; the child is
+    // a pending job under this run's own employee identity.
+    if crate::mcp_isolation::current().is_some() {
+        return spawn_ephemeral_isolated(params, home_dir, caller, instruction, context, tier).await;
     }
     let origin = ctx.origin.as_deref().unwrap_or(caller).to_string();
 
@@ -409,7 +427,7 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
             if let Some(principal) = host_on_behalf_of(home_dir, caller) {
                 payload["on_behalf_of"] = serde_json::json!(principal);
             }
-            if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+            if let Some(lane) = crate::mcp_isolation::process_lane().delegation_stamp() {
                 payload["lane"] = serde_json::json!(lane);
             }
             let _admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {
@@ -513,13 +531,19 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
     if let Some(principal) = host_on_behalf_of(home_dir, caller) {
         entry["on_behalf_of"] = serde_json::json!(principal);
     }
-    if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+    if let Some(lane) = crate::mcp_isolation::process_lane().delegation_stamp() {
         entry["lane"] = serde_json::json!(lane);
     }
     let admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
+    if let Err(reason) = persist_spawn_authority(home_dir, caller, &entry).await {
+        // This scaffold was created by this call and has not been enqueued.
+        // Confirmation/provisioning belongs to the operator, never this tool.
+        let _ = std::fs::remove_dir_all(&scaffolded.dir);
+        return tool_error(&reason);
+    }
     let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let entry_str = entry.to_string();
@@ -588,6 +612,103 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
     }
 }
 
+/// Shown for every protected spawn refusal (no oracle on which check failed).
+const ISOLATED_SPAWN_REFUSAL: &str = "無法確認這次操作的資源授權，已拒絕執行。";
+
+/// Protected mode: authorize this spawn call against the verified capability
+/// through the gateway resolver (H13 selectors), then recheck the run is live.
+async fn authorize_isolated_spawn(name: &str, params: &Value)
+    -> std::result::Result<duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall, duduclaw_mcp_boundary::VerificationError> {
+    use duduclaw_mcp_boundary::{VerificationError, authority, tool_policy};
+    let call = crate::mcp_isolation::current().ok_or(VerificationError::Invalid)?;
+    let resolver = call.record_resolver.clone().ok_or(VerificationError::Unavailable)?;
+    let authorized = tool_policy::authorize_async(&call.context, name, params, resolver).await?;
+    let live = authorized.context().clone();
+    authority::verify_blocking(move || live.verify_live(authority::now_seconds()?)).await?;
+    Ok(authorized)
+}
+
+/// H13 protected `spawn_ephemeral` (D-H3, D8): no scaffold, no new agent. The
+/// child is filed as a pending job under the calling run's own employee id,
+/// incarnation and binding, with the tools it requested that this run also
+/// holds (`tool_policy::ephemeral_tools`). It never runs while this run holds
+/// the employee's capability, so the caller must not wait for it.
+async fn spawn_ephemeral_isolated(params: &Value, home_dir: &Path, caller: &str,
+    instruction: &str, context: &str, tier: &str) -> Value {
+    let Ok(authorized) = authorize_isolated_spawn("spawn_ephemeral", params).await else {
+        return tool_error(ISOLATED_SPAWN_REFUSAL);
+    };
+    let Ok(tools) = duduclaw_mcp_boundary::tool_policy::ephemeral_tools(authorized.context(), params) else {
+        return tool_error(ISOLATED_SPAWN_REFUSAL);
+    };
+    let request = duduclaw_gateway::isolation_ephemeral::EphemeralRequest {
+        instruction: instruction.to_owned(), context: context.to_owned(), tier: tier.to_owned(), tools };
+    match duduclaw_gateway::isolation_ephemeral::queue_for_parent(home_dir, caller, authorized.context(), request).await {
+        Ok(job) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "臨時助手的工作已受理並排入等待。\n工作編號：{}\n\
+                 它會以你的員工身分執行，只能使用你這次執行也有的工具：{}。\n\
+                 它要等你目前這次執行結束後才會開始，所以請不要在這次對話中等待它的回覆，\
+                 也不要代替它編造結果。",
+                job.id, job.tools.join("、"))}]
+        }),
+        Err(_) => tool_error(ISOLATED_SPAWN_REFUSAL),
+    }
+}
+
+/// Persist authority before publishing the exact host-built bus message. A
+/// failed append may leave an unused receipt, never an executable queue entry.
+async fn persist_spawn_authority(home: &Path, caller: &str, entry: &Value)
+    -> std::result::Result<(), String> {
+    if !duduclaw_core::execution_gate::isolation_required() { return Ok(()); }
+    let call = crate::mcp_isolation::current()
+        .ok_or_else(|| "無法確認這次委派的原始執行授權。".to_string())?;
+    if call.home.as_path() != home || call.agent != caller {
+        return Err("這次委派的原始執行身分不一致。".into());
+    }
+    let (id, target, material) = spawn_authority_material(caller, entry)?;
+    duduclaw_gateway::isolation_background::record_bus_delegation(home, caller,
+        &call.context, &target, &id, &material).await
+        // A Personal source waits for its owner's approval card (SR2).
+        .map_err(|error| error.user_message().unwrap_or("這次委派的授權已失效，或目標員工尚未完成隔離確認。").into())
+}
+
+/// Keep this shape identical to the legacy dispatcher's BusMessage projection.
+/// It receives only the entry constructed above, never the tool's raw params.
+fn spawn_authority_material(caller: &str, entry: &Value)
+    -> std::result::Result<(String, String, Value), String> {
+    let invalid = || "無法確認這次委派的工作內容。".to_string();
+    let required = |key| entry.get(key).and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or_else(invalid);
+    if entry.get("type").and_then(Value::as_str) != Some("agent_message")
+        || required("sender_agent")? != caller || entry.get("spawned").and_then(Value::as_bool) != Some(true) {
+        return Err(invalid());
+    }
+    let id = required("message_id")?;
+    let target = required("agent_id")?;
+    if !duduclaw_core::is_valid_agent_id(target) { return Err(invalid()); }
+    let depth = entry.get("delegation_depth").and_then(Value::as_u64)
+        .and_then(|depth| u8::try_from(depth).ok()).ok_or_else(invalid)?;
+    let hop = entry.get("hop_depth").and_then(Value::as_u64)
+        .and_then(|depth| u8::try_from(depth).ok()).ok_or_else(invalid)?;
+    let unknown = match entry.get("upstream_unknown") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(invalid)?,
+    };
+    let optional = |key| -> std::result::Result<Option<&str>, String> {
+        match entry.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value)),
+            _ => Err(invalid()),
+        }
+    };
+    let material = duduclaw_gateway::isolation_background::material::delegation(
+        caller, target, required("payload")?, optional("turn_id")?, optional("session_id")?,
+        optional("lane")?, depth, optional("origin_agent")?, None, Some(caller),
+        unknown, hop, true, optional("on_behalf_of")?);
+    Ok((id.into(), target.into(), material))
+}
+
 /// Bus lineage is host-owned and all-or-nothing, matching send_to_agent.
 fn stamp_spawn_upstream(
     entry: &mut Value,
@@ -612,5 +733,44 @@ fn stamp_spawn_upstream(
             message_id,
             missing,
         );
+    }
+}
+
+#[cfg(test)]
+mod isolation_authority_tests {
+    use super::*;
+
+    fn entry() -> Value {
+        serde_json::json!({"type":"agent_message", "message_id":"message", "agent_id":"bob",
+            "payload":"work", "sender_agent":"alice", "origin_agent":"alice",
+            "delegation_depth":1, "hop_depth":2, "spawned":true, "turn_id":"turn",
+            "session_id":"session", "lane":"explore", "on_behalf_of":"user:owner"})
+    }
+
+    #[test]
+    fn isolated_spawn_material_matches_dispatcher_projection() {
+        let (id, target, actual) = spawn_authority_material("alice", &entry()).unwrap();
+        assert_eq!(id, "message");
+        assert_eq!(target, "bob");
+        let expected = duduclaw_gateway::isolation_background::material::delegation(
+            "alice", "bob", "work", Some("turn"), Some("session"), Some("explore"), 1,
+            Some("alice"), None, Some("alice"), false, 2, true, Some("user:owner"));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn isolated_spawn_material_refuses_missing_identity_and_malformed_metadata() {
+        let original = entry();
+        for (field, bad) in [("sender_agent", serde_json::json!("mallory")),
+            ("agent_id", serde_json::json!("../bob")), ("spawned", serde_json::json!(false)),
+            ("delegation_depth", serde_json::json!(256)), ("hop_depth", serde_json::json!(-1)),
+            ("upstream_unknown", serde_json::json!("false")), ("turn_id", serde_json::json!(3))] {
+            let mut value = original.clone();
+            value[field] = bad;
+            assert!(spawn_authority_material("alice", &value).is_err(), "{field}");
+        }
+        let mut value = original;
+        value.as_object_mut().unwrap().remove("message_id");
+        assert!(spawn_authority_material("alice", &value).is_err());
     }
 }

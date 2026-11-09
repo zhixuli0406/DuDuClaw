@@ -42,7 +42,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn frozen_request_survives_reopen_and_cannot_be_rebound_or_loaded_with_a_foreign_digest() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::discovery::private_test_home();
         let store = DiscoveryStore::open(home.path()).unwrap();
         let source = r#"{"source":"private-policy-canary","budget":{"calls":1}}"#;
         let digest = store.save_frozen_request("task-1", "run-1", source).unwrap();

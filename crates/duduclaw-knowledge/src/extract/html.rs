@@ -136,7 +136,7 @@ pub fn extract(bytes: &[u8], budget: &mut Budget) -> Result<Vec<RawSegment>, Ext
                     {
                         b.path.retain(|(l, _)| *l < level);
                         b.path
-                            .push((level, duduclaw_core::truncate_chars(title.trim(), 80)));
+                            .push((level, super::truncate_chars(title.trim(), 80)));
                     }
                     if BLOCK.contains(&name) {
                         b.newline();

@@ -323,7 +323,7 @@ mod tests {
             let (_temp, db, admin, user) = setup();
             let issued = db.issue_user_invite(&user, &admin).unwrap();
             match change {
-                "email" => db.change_email(&user, "changed@example.com").unwrap(),
+                "email" => db.change_email(&admin, &user, "changed@example.com").unwrap(),
                 "password" => db.update_user(&user, None, None, Some("changed-password")).unwrap(),
                 "status" => {
                     db.set_user_status(&user, UserStatus::Suspended).unwrap();

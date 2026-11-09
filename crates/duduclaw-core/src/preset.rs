@@ -199,6 +199,7 @@ pub fn install_system_operator_preset(home: &Path, force: bool) -> io::Result<bo
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    crate::isolation_policy::fence_change(home)?;
     std::fs::write(&dest, SYSTEM_OPERATOR_PRESET_TOML)?;
     Ok(true)
 }
@@ -634,6 +635,7 @@ fn mutate_bindings<T>(home: &Path, f: impl FnOnce(&mut PresetBindingStore) -> T)
             Err(e) => return Err(e),
         };
         let out = f(&mut store);
+        crate::isolation_policy::fence_change(home)?;
         write_atomic(&path, &serialize_bindings(&store))?;
         Ok(out)
     })

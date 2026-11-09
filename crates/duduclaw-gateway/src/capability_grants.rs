@@ -538,8 +538,9 @@ fn active_grant_tools_sync(home_dir: &Path, agent_id: &str) -> Result<HashSet<St
     let db_path = home_dir.join("approvals.db");
     let conn = Connection::open(&db_path)
         .map_err(|e| format!("open capability grant store (sync): {e}"))?;
-    // busy_timeout for the WAL-shared file; ignore PRAGMA errors (best-effort).
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
+    // busy_timeout for the WAL-shared file; fail closed if it cannot be set.
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|e| format!("set capability grant store busy timeout (sync): {e}"))?;
     init_schema(&conn)?;
     let now = Utc::now();
     let rows = select_nonrevoked_for_agent(&conn, agent_id)?;

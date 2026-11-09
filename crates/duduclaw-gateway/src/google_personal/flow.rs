@@ -243,7 +243,11 @@ pub async fn finish(
     if !access::domain_allowed(home, &metadata)? {
         return Err("管理員已變更允許的 Google 網域，請重新開始。".into());
     }
-    vault::connect_with_previous(home, &key, metadata.clone(), &tokens.secret, pending.epoch, pending.expected_connection.as_ref())?;
+    // v1.81 C4: the isolated connector catalog is fenced around publication
+    // (same account: new generation / relink; another account: revoke).
+    super::lifecycle::publish_connection(home, user, &metadata, || {
+        vault::connect_with_previous(home, &key, metadata.clone(), &tokens.secret, pending.epoch, pending.expected_connection.as_ref())
+    })?;
     let detail = json!({
         "google_email": metadata.account_email,
         "scope_count": metadata.granted_scopes.len(),

@@ -249,6 +249,8 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
             }),
         ),
     );
+    #[cfg(target_os = "linux")]
+    let work = crate::isolation_mcp::ingress::webchat_scope(credential.clone(), work);
     let work = crate::computer_watch_links::delivery::webchat_scope(
         &state.ctx.home_dir,
         effective_agent_id,

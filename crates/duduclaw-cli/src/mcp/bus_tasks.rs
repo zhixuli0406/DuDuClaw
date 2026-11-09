@@ -167,6 +167,11 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
             {
                 return mcp_error(&format!("step {i}: {reason}"));
             }
+            // v1.81 P1b: a step is work handed to that employee, like spawn_agent.
+            if let Some(refusal) = duduclaw_gateway::personal_visibility::management_refusal(home_dir,
+                duduclaw_gateway::runtime_readiness::is_protected_linux(), caller, &agent) {
+                return mcp_error(&format!("step {i}: {refusal}"));
+            }
         }
 
         let target = if agent.is_empty() { caller } else { &agent };
@@ -227,6 +232,23 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
+    // Native Linux protected mode: the signed capability decides per call,
+    // right before the write, which kind of plan this run may file (H8 record
+    // task, or the interactive NewTask grant of H9 decision 3). A NewTask plan
+    // is filed for the signed requester only: the creator/audience is never
+    // taken from arguments or the environment.
+    if crate::mcp_isolation::current().is_some() {
+        match authorize_isolated_create_task(params).await {
+            Ok(Some(requester)) => match duduclaw_core::HumanPrincipal::user(&requester) {
+                Some(owner) if spec.on_behalf_of.as_deref() == Some(owner.to_string().as_str()) => {
+                    spec.on_behalf_of = Some(owner.to_string());
+                }
+                _ => return tool_error("無法確認這次操作的資源授權，已拒絕執行。"),
+            },
+            Ok(None) => {}
+            Err(_) => return tool_error("無法確認這次操作的資源授權，已拒絕執行。"),
+        }
+    }
     if let Err(e) = spec.save(&agent_dir) {
         return mcp_error(&format!("failed to save task: {e}"));
     }
@@ -252,6 +274,24 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
         "Task created: id={task_id}, steps={step_count}, status=planned. \
          The gateway dispatcher will execute steps automatically."
     ))
+}
+
+/// Protected mode: authorize this `create_task` call against the verified
+/// capability through the gateway resolver (H8 live record-task ownership, or
+/// the H9 interactive NewTask path with its fixed assignee/requester), then
+/// recheck the run is still live. `Some(requester)` for a NewTask plan.
+async fn authorize_isolated_create_task(params: &Value)
+    -> std::result::Result<Option<String>, duduclaw_mcp_boundary::VerificationError> {
+    use duduclaw_mcp_boundary::{VerificationError, authority, tool_policy};
+    let call = crate::mcp_isolation::current().ok_or(VerificationError::Invalid)?;
+    let resolver = call.record_resolver.clone().ok_or(VerificationError::Unavailable)?;
+    let authorized = tool_policy::authorize_async(&call.context, "create_task", params, resolver).await?;
+    let live = authorized.context().clone();
+    authority::verify_blocking(move || live.verify_live(authority::now_seconds()?)).await?;
+    Ok(authorized.resources().iter().find_map(|grant| match grant {
+        duduclaw_isolation::capability::ResourceGrant::NewTask { requester } => Some(requester.as_str().to_owned()),
+        _ => None,
+    }))
 }
 
 /// Check the status of a previously created task.
@@ -293,13 +333,20 @@ pub(crate) async fn handle_task_status(params: &Value, home_dir: &Path, caller: 
                 pending
             );
 
+            // v1.81 P1b: a step run by another person's Personal employee
+            // keeps its status; its output is not shown.
+            let hidden = super::personal_target::hidden_step_agents(home_dir,
+                duduclaw_gateway::runtime_readiness::is_protected_linux(), caller,
+                spec.steps.iter().map(|s| s.agent.as_str()));
             for step in &spec.steps {
                 report.push_str(&format!(
                     "\n  [{}] {:?} — {}{}",
                     step.id,
                     step.status,
                     step.description,
-                    if let Some(ref result) = step.result {
+                    if hidden.contains(step.agent.trim()) {
+                        "\n      Output: [hidden: another person's Personal employee]".to_string()
+                    } else if let Some(ref result) = step.result {
                         // HC3: byte-slice would panic on a multi-byte UTF-8
                         // boundary (CJK). truncate_bytes walks back to a char
                         // boundary ≤ 200 bytes.

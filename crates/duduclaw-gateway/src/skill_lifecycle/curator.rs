@@ -32,6 +32,8 @@
 //! (the same `reports/skill-pipeline/` convention the repo wiki uses).
 
 use std::path::{Path, PathBuf};
+#[path = "curator_protected.rs"]
+mod protected;
 
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
@@ -394,6 +396,9 @@ pub async fn run_pass(
     cfg: &CuratorConfig,
     now: DateTime<Utc>,
 ) -> Result<CuratorReport, String> {
+    if duduclaw_parse_worker::client::required() {
+        return protected::run(home_dir, store, cfg, now).await;
+    }
     let now_str = now.to_rfc3339();
     let mut report = CuratorReport {
         ran_at: now_str.clone(),
@@ -563,6 +568,26 @@ pub async fn run_pass(
         "skill curator pass complete"
     );
     Ok(report)
+}
+
+/// H12a / D-H4: a protected employee's own curator pass. Discovery, the
+/// approval binding, every mutation and the totals are limited to
+/// `agent:<agent>`; the report is returned, not published to the shared wiki.
+/// `agent` must come from the capability-bound caller, never tool arguments.
+/// Always the isolated implementation (fails closed off Linux).
+pub async fn run_owned_pass(
+    home_dir: &Path,
+    store: &CustomSkillStore,
+    cfg: &CuratorConfig,
+    now: DateTime<Utc>,
+    agent: &str,
+) -> Result<CuratorReport, String> {
+    protected::run_owned(home_dir, store, cfg, now, agent).await
+}
+
+/// `agent:<id>` curation scope of a valid employee id (refuses anything else).
+pub fn owned_scope(agent: &str) -> Result<String, String> {
+    protected::owned_scope(agent)
 }
 
 /// Scheduler entry point: run at most once per [`RUN_INTERVAL_SECS`], only

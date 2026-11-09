@@ -1,4 +1,5 @@
 use super::*;
+use duduclaw_mcp_boundary::io_authority::verify_before_io;
 
 /// Resolve the shared wiki directory.
 pub(crate) fn resolve_shared_wiki_dir(home_dir: &Path) -> std::path::PathBuf {
@@ -10,6 +11,7 @@ pub(crate) fn ensure_shared_wiki_dir(wiki_dir: &Path) -> std::result::Result<(),
     let subdirs = ["entities", "concepts", "sources", "synthesis"];
     for sub in &subdirs {
         let p = wiki_dir.join(sub);
+        verify_before_io().map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&p).map_err(|e| format!("create dir {}: {e}", p.display()))?;
     }
     // Scaffold reserved files
@@ -29,6 +31,7 @@ pub(crate) fn ensure_shared_wiki_dir(wiki_dir: &Path) -> std::result::Result<(),
     ];
     for (name, content) in scaffold {
         let path = wiki_dir.join(name);
+        verify_before_io().map_err(|e| e.to_string())?;
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -36,6 +39,7 @@ pub(crate) fn ensure_shared_wiki_dir(wiki_dir: &Path) -> std::result::Result<(),
         {
             Ok(mut f) => {
                 use std::io::Write;
+                verify_before_io().map_err(|e| e.to_string())?;
                 f.write_all(content.as_bytes())
                     .map_err(|e| format!("write {name}: {e}"))?;
             }
@@ -263,7 +267,9 @@ pub(crate) async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, call
     };
     let content = stamped.as_str();
     let store = duduclaw_memory::WikiStore::new_shared(home_dir);
-    let write_result = store.write_page_with_author(page_path, content, caller_agent);
+    let write_result = store.write_page_with_author_checked(page_path, content, caller_agent, || {
+        verify_before_io().map_err(|e| duduclaw_core::error::DuDuClawError::Memory(e.to_string()))
+    });
 
     // RFC-22 Decision 4-D (Phase 3 W2): record an authorship audit alongside
     // the standard tool_call entry so post-hoc analysis can detect cases

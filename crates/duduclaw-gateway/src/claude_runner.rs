@@ -478,6 +478,7 @@ where
     F: std::future::Future<Output = Result<String, String>> + Send,
 {
     use crate::cost_telemetry::RequestType as RT;
+    let fut = crate::process_group::with_class(crate::process_group::request_class(request_type), fut);
     let connector_snapshot = std::sync::Arc::new(std::sync::Mutex::new(crate::egress_guard::ConnectorSnapshot::unknown()));
     let snapshot_after_run = connector_snapshot.clone();
     let fut = crate::runtime_turn::scope(agent_id, async move {
@@ -802,6 +803,7 @@ async fn call_claude_for_agent_impl(
     // every other caller passes and is behaviourally a no-op.
     overrides: DispatchOverrides,
 ) -> Result<String, String> {
+    crate::isolation_readiness::check_execution()?;
     #[cfg(test)]
     crate::model_call_probe::record("claude_runner");
     // Cron and direct task calls do not pass through the bus dispatcher.
@@ -1118,7 +1120,8 @@ async fn call_claude_for_agent_impl(
             Some(s) => std::borrow::Cow::Owned(format!("{system_prompt}\n\n---\n\n{s}")),
             None => std::borrow::Cow::Borrowed(system_prompt.as_str()),
         };
-        return crate::runtime_dispatch::run_agent_prompt_text(
+        // Keep the multi-runtime dispatch state off the caller future.
+        return Box::pin(crate::runtime_dispatch::run_agent_prompt_text(
             crate::runtime_dispatch::AgentPrompt {
                 agent_dir: Some(&agent_dir),
                 home_dir,
@@ -1146,11 +1149,11 @@ async fn call_claude_for_agent_impl(
                 // codex; the round degrades explicitly instead.
                 allow_cross_family_failover: overrides.allow_cross_family_failover,
             },
-        )
+        ))
         .await;
     }
 
-    if agent_dir.exists() {
+    if agent_dir.exists() && !duduclaw_core::execution_gate::isolation_required() {
         // `.mcp.json` platform fix: regenerate the DuDuClaw entry before the
         // CLI starts every server the file lists; a file that cannot be
         // confirmed refuses this spawn (fail closed, audited).
@@ -1524,7 +1527,8 @@ async fn call_claude_for_agent_impl(
 
 /// Admission refusals never trigger account, model, or provider retries.
 fn is_admission_refusal(error: &str) -> bool {
-    crate::budget::budget_refusal_message(error).is_some()
+    duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
+        || crate::budget::budget_refusal_message(error).is_some()
         || crate::autonomous_runtime::was_denied()
         || error.starts_with("AUTONOMY_PAUSED:")
 }
@@ -1719,6 +1723,8 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
         &self,
         req: &duduclaw_llm::ChatRequest,
     ) -> Result<duduclaw_llm::ChatResponse, duduclaw_llm::LlmError> {
+        crate::isolation_readiness::check_execution()
+            .map_err(duduclaw_llm::LlmError::InvalidRequest)?;
         // Each provider transport admits immediately before sending, including
         // every tool-loop iteration. Billing must not retain its lease.
         let resp = self.inner.complete(req).await?;
@@ -1752,6 +1758,8 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
         >,
         duduclaw_llm::LlmError,
     > {
+        crate::isolation_readiness::check_execution()
+            .map_err(duduclaw_llm::LlmError::InvalidRequest)?;
         self.inner.stream(req).await
     }
 }
@@ -1769,7 +1777,7 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
 /// calls are signed at depth zero; inherited process env never grants headroom.
 pub fn delegation_context_env(home: &Path, worker: &str, timeout_secs: u64) -> Vec<(String, String)> {
     use duduclaw_core::identity_token::{ENV_DELEGATION_CONTEXT, ENV_DELEGATION_AUDIT_TOKEN,
-        delegation_run_binding, mint_delegation_context};
+        delegation_run_binding, mint_delegation_context_in};
     let scoped = DELEGATION_ENV.try_with(Clone::clone).ok();
     let employee = |id: &str| duduclaw_core::is_valid_agent_id(id)
         && !duduclaw_core::is_system_sender(id)
@@ -1806,7 +1814,10 @@ pub fn delegation_context_env(home: &Path, worker: &str, timeout_secs: u64) -> V
     let expiry = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|now| now.as_secs().saturating_add(timeout_secs).saturating_add(60)).unwrap_or(0);
     let token = duduclaw_core::load_identity_key(home).map(zeroize::Zeroizing::new)
-        .and_then(|key| mint_delegation_context(&key, worker, &sender, &origin, depth, binding.as_deref(), expiry))
+        // F6m: a protected worker's context is bound to its live employee id
+        // and incarnation; tombstoned or unreadable ⇒ no context (fail closed).
+        .and_then(|key| mint_delegation_context_in(home, &key, worker, &sender, &origin, depth,
+            binding.as_deref(), expiry))
         .unwrap_or_default();
     let mut envs = vec![(ENV_DELEGATION_CONTEXT.to_string(), token),
          (ENV_DELEGATION_AUDIT_TOKEN.to_string(), String::new()),
@@ -3933,6 +3944,7 @@ fn claude_tool_result_content_text(content: &serde_json::Value) -> Option<String
 async fn call_claude_streaming(
     cmd: &mut tokio::process::Command,
     on_progress: Option<&crate::channel_reply::ProgressCallback>,
+    protected_input: Option<(&Path, &str, &str, &str)>,
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -3941,11 +3953,32 @@ async fn call_claude_streaming(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let admission = crate::autonomous_runtime::admit_current().await?;
-    let mut child = crate::process_group::ManagedChild::spawn(cmd)
-        .map_err(|e| format!("claude CLI spawn error: {e}"))?;
-    crate::autonomous_runtime::mark_handoff();
-    drop(admission);
+    #[cfg(target_os = "linux")]
+    let mut prompt_writer = None;
+    let mut child = if let Some((agent_dir, prompt, system_prompt, model)) = protected_input {
+        #[cfg(target_os = "linux")]
+        {
+            let (child, writer) = Box::pin(crate::isolation_mcp::runtime::spawn_claude(agent_dir, prompt, system_prompt, model)).await?;
+            prompt_writer = Some(writer);
+            child
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (agent_dir, prompt, system_prompt, model);
+            return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error("此平台尚未提供原生隔離執行。"));
+        }
+    } else {
+        let admission = crate::autonomous_runtime::admit_current().await?;
+        let child = duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Claude,
+        crate::process_group::BackendChild::spawn_class(cmd, crate::process_group::execution_class(
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)),
+    ).await
+        .map_err(|e| crate::process_group::backend_error(e, "claude CLI spawn error"))?;
+        crate::autonomous_runtime::mark_handoff();
+        drop(admission);
+        child
+    };
     let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
@@ -4161,6 +4194,8 @@ async fn call_claude_streaming(
     }
 
     thinking.finish();
+    #[cfg(target_os = "linux")]
+    if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
     let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
     // Preserve successful completion semantics; cancellation before this point
     // drops the managed owner and terminates all descendants.
@@ -4810,6 +4845,40 @@ mod role_cache_ttl_tests {
             .map(|value| value.to_string_lossy().into_owned())
     }
 
+    #[tokio::test]
+    async fn local_backend_equivalence_claude_runner() {
+        let home = tempfile::tempdir().unwrap();
+        let (mut command, _guards) = prepare_claude_cmd(
+            "claude-fixture", "繁體中文 $HOME; next\nline", "fixture-model", "stable",
+            None, None, home.path(), None, SpawnIdentity::default(),
+        ).unwrap();
+        command.env("CLAUDE_CONFIG_DIR", "fixture account").env_remove("ANTHROPIC_API_KEY");
+        let before = duduclaw_core::execution_gate::command_snapshot(&command);
+        // Independent legacy argv/env/cwd oracle; only the generated prompt path varies.
+        let mut expected = duduclaw_core::platform::async_command_for("claude-fixture");
+        duduclaw_core::apply_agent_cli_env_allowlist(&mut expected);
+        expected.args(["-p", "繁體中文 $HOME; next\nline", "--output-format", "stream-json",
+            "--verbose", "--permission-mode", "auto", "--max-turns", "50",
+            "--model", "fixture-model", "--allowedTools",
+            "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite",
+            "--disallowedTools", "computer"]);
+        if duduclaw_core::agent_toml::resolve_minimal_context(None) {
+            expected.args(["--setting-sources", "project,local", "--tools",
+                "Bash,Edit,Glob,Grep,Read,TodoWrite,WebFetch,WebSearch,Write"]);
+        }
+        let prompt_file = _guards.prompt.as_ref().expect("system prompt fixture file");
+        assert_eq!(std::fs::read_to_string(prompt_file).unwrap(), "stable");
+        expected.arg("--system-prompt-file").arg(prompt_file);
+        expected.env_remove("CLAUDECODE")
+            .env_remove(duduclaw_core::egress_guard::ENV_TURN_ALIAS)
+            .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
+            .env_remove(crate::on_behalf_of::context::ENV_CONTEXT)
+            .env("CLAUDE_CONFIG_DIR", "fixture account")
+            .env_remove("ANTHROPIC_API_KEY");
+        assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
+    }
+
     #[test]
     fn one_hour_cache_ttl_is_scoped_to_valid_role_members() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4988,6 +5057,15 @@ async fn call_claude_with_env(
     // Team-as-Agent: identity-scoped config dir + explicit `--mcp-config`.
     identity: SpawnIdentity<'_>,
 ) -> Result<ClaudeResponse, String> {
+    if duduclaw_core::execution_gate::isolation_required() {
+        if !env_vars.is_empty() || effort.is_some() || identity.mcp_config.is_some() {
+            return Err(protected_claude_options_refusal());
+        }
+        let agent_dir = identity.config_dir.or(work_dir).ok_or_else(protected_claude_options_refusal)?;
+        let system_prompt = system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
+        let mut marker = tokio::process::Command::new("root-selected-claude");
+        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model))).await;
+    }
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
     // `_cmd_guards` holds the `--system-prompt-file` and (RFC-23 §13.6)
     // `--mcp-config` temp files; both must outlive the child below.
@@ -5019,7 +5097,12 @@ async fn call_claude_with_env(
     // outside its workspace (e.g. `~/.claude`).
     crate::runtime::apply_native_sandbox(&mut cmd, capabilities, work_dir, "claude")?;
 
-    call_claude_streaming(&mut cmd, None).await
+    call_claude_streaming(&mut cmd, None, None).await
+}
+
+pub(crate) fn protected_claude_options_refusal() -> String {
+    duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        "受保護模式尚不支援這次要求的執行選項或登入來源；已停止執行，請由管理員檢查設定。")
 }
 
 // ---------------------------------------------------------------------------
@@ -6495,7 +6578,7 @@ mod process_tree_cancellation_tests {
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.current_dir(dir.path())
             .args(["-c", "/bin/sleep 300 & echo $! > grandchild.pid; wait"]);
-        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None).await });
+        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None, None).await });
         let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(pid) = std::fs::read_to_string(dir.path().join("grandchild.pid"))

@@ -33,6 +33,9 @@ pub(in crate::google_identity) use host_claim::{MAX_SELECTIONS_PER_AGENT, MAX_TO
 #[cfg(test)]
 #[path = "effect_authority_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "effect_authority_sr4_tests.rs"]
+mod sr4_tests;
 
 fn changed() -> Refusal {
     Refusal::hard(
@@ -70,6 +73,23 @@ impl GooglePurpose {
     }
 }
 
+/// SR4 items 4/5: the protected-mode tenant source (delegation key / service
+/// account) the isolation bridge decided on and pinned for this call. The
+/// host lane re-reads the source at every validation and refuses unless its
+/// digest is exactly this one, and a tenant assertion requests exactly
+/// `scopes` (the configured `tenant_scopes`), never the full minted set.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TenantPin {
+    digest: String,
+    scopes: Vec<String>,
+}
+impl TenantPin {
+    pub(crate) fn of(source: &crate::google_identity::tenant_source::TenantSource) -> Self {
+        Self { digest: source.digest(), scopes: source.scopes().to_vec() }
+    }
+    pub(crate) fn digest(&self) -> &str { &self.digest }
+}
+
 /// Only live host code supplies requester and directory. No environment,
 /// serialized input, or model-selected account can construct this context.
 pub(crate) struct GoogleCallContext {
@@ -79,6 +99,8 @@ pub(crate) struct GoogleCallContext {
     requester: RequesterIdentity,
     people: Box<dyn People>,
     purpose: GooglePurpose,
+    /// SR4 item 4: `Some` only on the protected-mode bridge lane.
+    tenant: Option<TenantPin>,
 }
 impl GoogleCallContext {
     fn canonical(home: &Path, agent_dir: &Path) -> Result<(PathBuf, PathBuf, String), Refusal> {
@@ -131,7 +153,38 @@ impl GoogleCallContext {
                 final_arguments_digest,
                 credential_ref,
             },
+            tenant: None,
         })
+    }
+
+    /// SR4 item 4: bind this dedicated context to the tenant source the
+    /// bridge pinned. Checked at once and at every later validation.
+    fn pin_tenant(mut self, tenant: Option<TenantPin>) -> Result<Self, Refusal> {
+        self.tenant = tenant;
+        self.check_tenant()?;
+        Ok(self)
+    }
+
+    /// The live tenant source must still be exactly the pinned one (config,
+    /// subject, mailboxes, scopes and key material: its digest). No pin ⇒
+    /// nothing to check (non-isolated lanes).
+    fn check_tenant(&self) -> Result<(), Refusal> {
+        let Some(pin) = &self.tenant else { return Ok(()) };
+        match crate::google_identity::tenant_source::read(&self.home, &self.agent) {
+            Ok(Some(source)) if source.digest() == pin.digest() => Ok(()),
+            _ => Err(changed()),
+        }
+    }
+
+    /// SR4 item 5: the `scope` claim of a minted service-account assertion:
+    /// the pinned tenant scopes on the tenant lane (none ⇒ refused, nothing
+    /// to mint for), otherwise the full minted set (unchanged legacy lanes).
+    pub(crate) fn assertion_scope(&self) -> Result<String, Refusal> {
+        match &self.tenant {
+            None => Ok(crate::google_workspace::REQUIRED_SCOPES.join(" ")),
+            Some(pin) if pin.scopes.is_empty() => Err(changed()),
+            Some(pin) => Ok(pin.scopes.join(" ")),
+        }
     }
 
     /// M1 must capture the actual task-local requester before offloading and
@@ -159,14 +212,18 @@ impl GoogleCallContext {
                 mount_binding,
                 operation_binding,
             },
+            tenant: None,
         })
     }
 
     fn validate(&self) -> Result<(), Refusal> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| changed())?;
         let (home, dir, agent) = Self::canonical(&self.home, &self.agent_dir)?;
         if home != self.home || dir != self.agent_dir || agent != self.agent {
             return Err(changed());
         }
+        // SR4 item 4: the bridge's decision, not a host re-read, is authority.
+        self.check_tenant()?;
         if !crate::google_workspace::integration_enabled(&self.home) {
             return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
         }
@@ -509,6 +566,21 @@ pub(in crate::google_identity) async fn execute_immediate_native(
     tool: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, Refusal> {
+    execute_immediate_native_pinned(home, users, agent, reference, tool, args, None).await
+}
+
+/// [`execute_immediate_native`] bound to the tenant source the isolation
+/// bridge pinned (SR4 item 4): the host lane never decides on a config it
+/// re-read after the bridge decided; a different source digest refuses.
+pub(in crate::google_identity) async fn execute_immediate_native_pinned(
+    home: &Path,
+    users: Option<&std::sync::Arc<duduclaw_auth::UserDb>>,
+    agent: &str,
+    reference: &CredentialRef,
+    tool: &str,
+    args: serde_json::Value,
+    tenant: Option<TenantPin>,
+) -> Result<serde_json::Value, Refusal> {
     // Initial admission keeps the public credential-refusal taxonomy. Once
     // captured, every later wait still rechecks the original source context.
     host_claim::live_key(home, agent, reference, tool)?;
@@ -519,7 +591,8 @@ pub(in crate::google_identity) async fn execute_immediate_native(
         tool,
         gi::google_arguments_digest(&args),
         reference.clone(),
-    )?;
+    )?
+    .pin_tenant(tenant)?;
     context.validate()?;
     if tool != "google_status" {
         let template =
@@ -594,6 +667,11 @@ impl GooglePreflightPermit<'_> {
     pub(crate) fn validate(&self) -> Result<(), Refusal> {
         self.source.validate()?;
         self.validate_original()
+    }
+    /// SR4 item 5: the `scope` claim a service-account assertion may request
+    /// under this permit (the pinned tenant scopes on the tenant lane).
+    pub(crate) fn assertion_scope(&self) -> Result<String, Refusal> {
+        self.context.assertion_scope()
     }
 }
 

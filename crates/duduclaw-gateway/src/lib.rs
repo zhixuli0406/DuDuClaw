@@ -30,6 +30,99 @@
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
 
+pub mod isolation_mcp;
+pub mod isolation_background;
+/// H13: protected `spawn_ephemeral` children as pending jobs (D-H3, D8).
+pub mod isolation_ephemeral;
+/// H13b: "parent run has exited" for ephemeral jobs (this epoch's run ledger).
+pub mod isolation_ephemeral_runs;
+/// H13b: start released ephemeral children; the dispatcher's self-delegation exception.
+pub mod isolation_ephemeral_start;
+mod isolation_http;
+#[cfg(test)]
+pub(crate) mod isolation_io_test_support;
+pub mod isolation_egress;
+pub mod isolation_resources;
+pub mod isolation_connectors;
+pub mod isolation_connector_clients;
+pub mod isolation_connector_lifecycle;
+pub(crate) mod isolation_connector_events;
+pub mod isolation_connector_boot;
+pub mod isolation_connector_stack;
+pub mod isolation_connector_details;
+pub mod isolation_connector_channel;
+pub mod isolation_connector_model;
+pub mod isolation_connector_native_home;
+pub mod isolation_connector_computer;
+pub mod isolation_connector_database;
+pub mod isolation_connector_odoo;
+pub mod isolation_connector_registry;
+pub mod isolation_connector_search;
+pub mod isolation_execution;
+pub mod isolation_worker_plans;
+pub mod isolation_skill_jobs;
+#[cfg(target_os = "linux")]
+pub mod isolation_forks;
+pub mod isolation_readiness;
+// Read model and handover path; B1–B3 and the A4 admin RPC consume the parts
+// not yet called from production code.
+#[allow(dead_code)]
+pub(crate) mod isolation_lifecycle;
+/// v1.81 P1: Personal employee data visibility (team grants, Admin reads,
+/// cross-agent management tools). Also used by the CLI MCP server.
+pub mod personal_visibility;
+/// v1.81 P1c: who may decide a Personal employee's approval card.
+pub(crate) mod personal_decision;
+pub(crate) mod isolation_quarantine;
+// F6c same-id restore engine; the F6d RPCs are its production callers.
+#[allow(dead_code)]
+pub(crate) mod isolation_restore;
+// F6h: label-keyed stores registry, writer gate, route pause, bot gate.
+// Purge / re-key entry points are consumed by F6i / F6g (not yet merged).
+#[allow(dead_code)]
+pub(crate) mod isolation_label_stores;
+
+/// F6fb item 2: install the F6 label writer gate for an isolated MCP
+/// dispatcher before it opens the home's memory.db, and keep it active for
+/// the rest of this process.
+///
+/// F6fb2 item 5 (verified): the dispatcher is not a separate process. The
+/// CLI installs its `DispatcherFactory` into the gateway (`cmd_run_server`),
+/// the gateway's protected boot calls `create` (`isolation_mcp/boot.rs`) and
+/// `McpBoundaryService::attach` serves it on a gateway task; the employee's
+/// runtime only holds the socket end (fd from spawnd's `TakeIo`). So the
+/// writer gate runs as the gateway uid, which owns
+/// `migration-authority/apply.db` (0600) and reads it like every other gate.
+/// In the gateway the boot gate (`memory_write_gate`, `server.rs`) is
+/// already installed, so this returns `false`; it then marks the process so
+/// that gate is active even if the protected-mode environment flag were
+/// absent. `true` only where no gate was installed yet (e.g. a host embedding
+/// the dispatcher without the gateway boot): the always-active gate.
+pub fn install_isolated_process_writer_gate() -> bool {
+    isolation_label_stores::mark_isolated_dispatcher();
+    duduclaw_memory::install_label_write_gate(isolation_label_stores::isolated_process_write_gate)
+}
+// F6h: running per-employee channel bots (tombstone stop hook).
+pub(crate) mod isolation_label_bots;
+// F6h: restore / purge of the label-keyed state the tombstone held (F6c, F6i).
+#[allow(dead_code)]
+pub(crate) mod isolation_label_restore;
+// F6l root retire (F6 design r5 §3.12); the RPC/UI wiring is F6d/F6e.
+#[allow(dead_code)]
+pub(crate) mod isolation_retire;
+// F6d: production seams of the restore/retire engines and the RPC bodies.
+pub(crate) mod isolation_restore_wiring;
+pub(crate) mod isolation_restore_rpc;
+// F6k: Shared restore filing, member/route selection, use-time tenant route gate (§3.9).
+pub(crate) mod isolation_restore_shared;
+// F6g adoption under a new employee id (§3.10); the request RPCs are F6d's.
+#[allow(dead_code)]
+pub(crate) mod isolation_adopt;
+// F6i quarantine cleanup (§3.8): purge after 90 days, early purge on request (S12).
+pub(crate) mod isolation_purge;
+pub mod migration_import;
+pub mod migration_startup;
+
 // The live-test seams (in-memory credential protection, Google REST base
 // override) must never reach a shipped binary.
 #[cfg(all(feature = "live-test-mocks", not(debug_assertions)))]

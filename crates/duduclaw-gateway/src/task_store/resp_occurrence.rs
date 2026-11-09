@@ -69,9 +69,8 @@ impl TaskStore {
     ) -> Result<MaterializeOutcome, String> {
         let now_s = resp_ts(req.now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("materialize: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let Some(resp) = get_responsibility_conn(&tx, &req.responsibility_id)? else {
             return Ok(MaterializeOutcome::NotActive);
         };
@@ -89,8 +88,7 @@ impl TaskStore {
                 params![resp.responsibility_id, now_s, resp.control_epoch],
             )
             .map_err(|e| format!("materialize: drop stale fires: {e}"))?;
-            tx.commit()
-                .map_err(|e| format!("materialize: commit: {e}"))?;
+            commit_live_write(tx)?;
             return Ok(MaterializeOutcome::EpochChanged);
         }
         if first.fire_id != req.expected_fire_id {
@@ -128,8 +126,7 @@ impl TaskStore {
                 ],
             )
             .map_err(|e| format!("materialize: budget pause: {e}"))?;
-            tx.commit()
-                .map_err(|e| format!("materialize: commit: {e}"))?;
+            commit_live_write(tx)?;
             return Ok(MaterializeOutcome::BudgetExhausted);
         }
 
@@ -190,8 +187,7 @@ impl TaskStore {
             params![resp.responsibility_id, now_s],
         )
         .map_err(|e| format!("materialize: stamp: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("materialize: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(MaterializeOutcome::Created {
             task_id: req.task.id.clone(),
             coalesced,
@@ -205,6 +201,7 @@ impl TaskStore {
         period_key: &str,
     ) -> Result<PeriodUsage, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         period_usage_conn(&conn, responsibility_id, period_key)
     }
 
@@ -214,6 +211,7 @@ impl TaskStore {
         task_id: &str,
     ) -> Result<Option<(OccurrenceRow, ResponsibilityRow)>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let occ = conn
             .query_row(
                 &format!("SELECT {OCC_COLUMNS} FROM responsibility_occurrences WHERE task_id = ?1"),
@@ -236,6 +234,7 @@ impl TaskStore {
         task_id: &str,
     ) -> Result<Vec<ResponsibilityRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let ids: Vec<String> = {
             let mut stmt = conn
                 .prepare(&format!(
@@ -266,6 +265,7 @@ impl TaskStore {
         responsibility_id: &str,
     ) -> Result<Vec<OccurrenceRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {OCC_COLUMNS} FROM responsibility_occurrences WHERE responsibility_id = ?1
@@ -282,6 +282,7 @@ impl TaskStore {
     /// the task row is gone).
     pub async fn open_occurrences(&self) -> Result<Vec<(OccurrenceRow, Option<String>)>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let cols = OCC_COLUMNS
             .split(", ")
             .map(|c| format!("o.{}", c.trim()))
@@ -323,9 +324,8 @@ impl TaskStore {
         }
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("settle occurrence: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let resp_id: Option<String> = tx
             .query_row(
                 "SELECT responsibility_id FROM responsibility_occurrences
@@ -376,8 +376,7 @@ impl TaskStore {
             _ => {}
         }
         let row = get_responsibility_conn(&tx, &resp_id)?;
-        tx.commit()
-            .map_err(|e| format!("settle occurrence: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(row)
     }
 
@@ -387,6 +386,7 @@ impl TaskStore {
         responsibility_id: &str,
     ) -> Result<Option<String>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT task_id FROM responsibility_occurrences WHERE responsibility_id = ?1
               ORDER BY created_at DESC, task_id DESC LIMIT 1",

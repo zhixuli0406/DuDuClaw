@@ -80,6 +80,12 @@ pub struct PipelineConfig {
     ///
     /// Defaults to `"duduclaw-eng-agent"`.
     pub target_agent_id: String,
+
+    /// H12c: a protected (isolated) `skill_synthesis_run` of this employee.
+    /// Must equal `target_agent_id`; only its own events are scored, and
+    /// skills are published into its own SKILLS (see `super::owned`), never
+    /// the global bank. `None` (default) keeps the existing behaviour.
+    pub owned_by: Option<String>,
 }
 
 impl Default for PipelineConfig {
@@ -99,6 +105,7 @@ impl Default for PipelineConfig {
             api_key: None,
             home_dir,
             target_agent_id: "duduclaw-eng-agent".to_string(),
+            owned_by: None,
         }
     }
 }
@@ -112,8 +119,11 @@ impl PipelineConfig {
         if self.lookback_days == 0 {
             return Err("lookback_days must be >= 1".to_string());
         }
-        if self.target_agent_id.is_empty() {
+        if !duduclaw_core::is_valid_agent_id(&self.target_agent_id) {
             return Err("target_agent_id must not be empty".to_string());
+        }
+        if self.owned_by.as_ref().is_some_and(|owner| *owner != self.target_agent_id) {
+            return Err("owned synthesis must target its own employee".to_string());
         }
         Ok(())
     }
@@ -201,7 +211,13 @@ async fn run_scoped(config: &PipelineConfig) -> PipelineRun {
 
     // ── Phase 0: Config validation ──────────────────────────────────────────
 
-    if let Err(e) = config.validate() {
+    // H13c: an owned run publishes only under the isolated call's own live
+    // authority (`io_authority::scope(call.context())` by its handler), never
+    // with none at all.
+    let unscoped_owned = config.owned_by.is_some() && !duduclaw_mcp_boundary::io_authority::is_scoped();
+    if let Err(e) = config.validate().and_then(|()| if unscoped_owned {
+        Err("owned synthesis has no isolated call authority".to_string())
+    } else { Ok(()) }) {
         errors.push(format!("Config validation failed: {e}"));
         return PipelineRun {
             started_at,
@@ -217,7 +233,19 @@ async fn run_scoped(config: &PipelineConfig) -> PipelineRun {
 
     // ── Phase 1: Parse JSONL events ─────────────────────────────────────────
 
-    let events = parse_events_from_dir(&config.events_dir, config.lookback_days);
+    let protected = duduclaw_parse_worker::client::required();
+    let events = if protected {
+        match parse_events_protected(&config.events_dir, config.lookback_days).await {
+            Ok(events) => events,
+            Err(error) => return PipelineRun { started_at, completed_at: Utc::now(), dry_run: config.dry_run,
+                total_events_parsed: 0, total_trajectories: 0, top_trajectories: vec![], skills_graduated: 0, errors: vec![error] },
+        }
+    } else { parse_events_from_dir(&config.events_dir, config.lookback_days) };
+    // H12c: an owned run never scores (or reads memory of) another employee.
+    let events = match config.owned_by.as_deref() {
+        Some(owner) => super::owned::own_events(events, owner),
+        None => events,
+    };
     let total_events_parsed = events.len();
 
     info!(
@@ -338,7 +366,7 @@ async fn graduate_trajectories(
     let global_skills_dir = config.home_dir.join("skills");
 
     // Collect existing skill names to prevent naming conflicts.
-    let existing_skill_names: Vec<String> = std::fs::read_dir(&agent_skills_dir)
+    let mut existing_skill_names: Vec<String> = std::fs::read_dir(&agent_skills_dir)
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
@@ -352,15 +380,29 @@ async fn graduate_trajectories(
         })
         .unwrap_or_default();
 
+    existing_skill_names.sort();
+
     // Load agent SOUL.md for context (prevents duplicate content).
-    let agent_soul = std::fs::read_to_string(
+    let protected = duduclaw_parse_worker::client::required();
+    // H12c: owned synthesis parses and scans only through E (fail closed).
+    let owned = config.owned_by.clone();
+    if owned.is_some() && !protected {
+        return (0, vec!["owned synthesis requires the isolated parse worker".into()]);
+    }
+    let agent_soul = if protected {
+        let path = config.home_dir.join("agents").join(&config.target_agent_id).join("SOUL.md");
+        match crate::isolation_worker_plans::absolute_snapshot(&path, 64 * 1024) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes.unwrap_or_default()).into_owned(),
+            Err(_) => return (0, vec!["agent context snapshot refused".into()]),
+        }
+    } else { std::fs::read_to_string(
         config
             .home_dir
             .join("agents")
             .join(&config.target_agent_id)
             .join("SOUL.md"),
     )
-    .unwrap_or_default();
+    .unwrap_or_default() };
 
     let emitter = EvolutionEventEmitter::global();
     let mut graduated = 0usize;
@@ -378,6 +420,10 @@ async fn graduate_trajectories(
             traj.agent_id,
             traj.quality_score
         );
+        if owned.as_deref().is_some_and(|owner| owner != traj.agent_id) {
+            errors.push(format!("{span_prefix} trajectory of another employee skipped"));
+            continue;
+        }
 
         // ── Step 1: Build SynthesisInput ─────────────────────────────────────
 
@@ -447,62 +493,98 @@ async fn graduate_trajectories(
             reusable SKILL.md files based on task execution patterns. \
             Output ONLY valid SKILL.md with YAML frontmatter.";
 
-        // Utility dispatch (RFC-25 N2): resolve the target agent's provider +
-        // utility model. Claude keeps the Direct API path (cache_control on the
-        // system prompt); any other provider routes through the registry
-        // choke-point. Falls back to global config / Claude when unconfigured.
-        let agent_dir = config.home_dir.join("agents").join(&config.target_agent_id);
-        if let Err(refusal) = crate::budget::gate_before_spawn(
-            &config.home_dir, Some(&agent_dir), &config.target_agent_id, "skill_synthesis",
-        ).await {
-            errors.push(format!("{span_prefix} {refusal}"));
-            break;
+        let proposal_key = crate::skill_lifecycle::isolated::digest(&serde_json::to_vec(&serde_json::json!({
+            "agent":config.target_agent_id,"events":traj.events,"model_prompt":prompt,"system":system,
+        })).unwrap_or_default());
+        if protected {
+            match crate::skill_lifecycle::isolated::published(&config.home_dir, &proposal_key) {
+                Ok(true) => continue,
+                Ok(false) => {},
+                Err(error) => { errors.push(error); continue; }
+            }
         }
-        let spec = crate::runtime_config::resolve_utility(&config.home_dir, Some(&agent_dir));
-        match duduclaw_core::autonomy_gate::check(
-            &config.home_dir, &config.target_agent_id,
-            duduclaw_core::autonomy_gate::AutonomyPath::Background,
-        ) {
-            Ok(()) => (),
-            Err(pause) => {
-                errors.push(format!("{span_prefix} {pause}"));
+        let cached = if protected {
+            match crate::skill_lifecycle::isolated::cached(&config.home_dir, &proposal_key) {
+                Ok(value) => value,
+                Err(error) => { errors.push(error); continue; }
+            }
+        } else { None };
+        let (llm_response, generated_at) = if let Some((bytes, at)) = cached {
+            match String::from_utf8(bytes) { Ok(text) => (text, at), Err(_) => { errors.push("invalid staged skill".into()); continue; } }
+        } else {
+            // Utility dispatch (RFC-25 N2): resolve the target agent's provider +
+            // utility model. Claude keeps the Direct API path (cache_control on the
+            // system prompt); any other provider routes through the registry
+            // choke-point. Falls back to global config / Claude when unconfigured.
+            let agent_dir = config.home_dir.join("agents").join(&config.target_agent_id);
+            if let Err(refusal) = crate::budget::gate_before_spawn(
+                &config.home_dir, Some(&agent_dir), &config.target_agent_id, "skill_synthesis",
+            ).await {
+                errors.push(format!("{span_prefix} {refusal}"));
                 break;
             }
-        };
-        let llm_result: Result<String, String> =
-            if spec.provider == duduclaw_core::types::RuntimeType::Claude {
-                call_direct_api(&api_key, &spec.model, system, &prompt, &[])
+            let spec = crate::runtime_config::resolve_utility(&config.home_dir, Some(&agent_dir));
+            match duduclaw_core::autonomy_gate::check(
+                &config.home_dir, &config.target_agent_id,
+                duduclaw_core::autonomy_gate::AutonomyPath::Background,
+            ) {
+                Ok(()) => (),
+                Err(pause) => {
+                    errors.push(format!("{span_prefix} {pause}"));
+                    break;
+                }
+            };
+            let llm_result: Result<String, String> =
+                if spec.provider == duduclaw_core::types::RuntimeType::Claude {
+                    call_direct_api(&api_key, &spec.model, system, &prompt, &[])
+                        .await
+                        .map(|resp| resp.text)
+                } else {
+                    crate::runtime_dispatch::run_utility_prompt(
+                        &config.home_dir,
+                        Some(&agent_dir),
+                        &config.target_agent_id,
+                        system,
+                        &prompt,
+                        4096,
+                    )
                     .await
-                    .map(|resp| resp.text)
-            } else {
-                crate::runtime_dispatch::run_utility_prompt(
-                    &config.home_dir,
-                    Some(&agent_dir),
-                    &config.target_agent_id,
-                    system,
-                    &prompt,
-                    4096,
-                )
-                .await
+                };
+
+            let llm_response = match llm_result {
+                Ok(text) => text,
+                Err(e) => {
+                    let msg = format!("{span_prefix} LLM call failed: {e}");
+                    warn!("{}", msg);
+                    errors.push(msg);
+                    continue;
+                }
             };
 
-        let llm_response = match llm_result {
-            Ok(text) => text,
-            Err(e) => {
-                let msg = format!("{span_prefix} LLM call failed: {e}");
-                warn!("{}", msg);
-                errors.push(msg);
-                continue;
-            }
+            let at = if protected {
+                match crate::skill_lifecycle::isolated::cache(&config.home_dir, &proposal_key, llm_response.as_bytes()) {
+                    Ok(at) => at, Err(error) => { errors.push(error); continue; }
+                }
+            } else { Utc::now().to_rfc3339() };
+            (llm_response, at)
         };
 
         // ── Step 3: Parse and validate synthesized skill ─────────────────────
 
-        let synthesized = match synthesizer::parse_synthesis_response(
-            &llm_response,
-            &synthesis_input.trigger,
-            &used_names,
-        ) {
+        let parsed = if protected {
+            let bytes = llm_response.as_bytes().to_vec();
+            let agent = config.target_agent_id.clone();
+            let at = generated_at.clone();
+            tokio::task::spawn_blocking(move || {
+                let markdown = duduclaw_parse_worker::adapters::prepare_synthesized_skill(&bytes, &agent, &at)
+                    .map_err(|e| format!("isolated synthesis refused: {e:?}"))?;
+                let name = duduclaw_parse_worker::adapters::read_skill_identity(markdown.as_bytes())
+                    .map_err(|e| format!("isolated skill identity refused: {e:?}"))?;
+                Ok::<_, String>(synthesizer::SynthesizedSkill { name, full_markdown: markdown,
+                    description: String::new(), tags: vec![], content: String::new(), frontmatter: String::new(), rationale: String::new() })
+            }).await.unwrap_or_else(|e| Err(e.to_string()))
+        } else { synthesizer::parse_synthesis_response(&llm_response, &synthesis_input.trigger, &used_names) };
+        let synthesized = match parsed {
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("{span_prefix} Synthesis parse failed: {e}");
@@ -514,23 +596,46 @@ async fn graduate_trajectories(
 
         // ── Step 4: Security scan (gate — must pass) ──────────────────────────
 
-        let scan = security_scanner::scan_skill(&synthesized.full_markdown, None);
-        if !scan.passed {
-            let msg = format!(
-                "{span_prefix} Security scan FAILED for '{}' (risk={:?}, {} findings)",
-                synthesized.name,
-                scan.risk_level,
-                scan.findings.len()
-            );
-            warn!("{}", msg);
-            errors.push(msg);
-            continue;
-        }
+        if !protected {
+            let scan = security_scanner::scan_skill(&synthesized.full_markdown, None);
+            if !scan.passed {
+                let msg = format!(
+                    "{span_prefix} Security scan FAILED for '{}' (risk={:?}, {} findings)",
+                    synthesized.name,
+                    scan.risk_level,
+                    scan.findings.len()
+                );
+                warn!("{}", msg);
+                errors.push(msg);
+                continue;
+            }
 
-        info!(
-            "{span_prefix} Security scan passed for '{}'",
-            synthesized.name
-        );
+            info!(
+                "{span_prefix} Security scan passed for '{}'",
+                synthesized.name
+            );
+
+        }
+        if protected {
+            if synthesized.name.is_empty() || synthesized.name.len() > 50
+                || !synthesized.name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                errors.push("isolated skill returned an invalid publication name".into()); continue;
+            }
+            if used_names.contains(&synthesized.name) {
+                errors.push(format!("{span_prefix} skill destination already exists")); continue;
+            }
+        }
+        // H12c: own-SKILLS publication is own-namespace (like H12a adopt); the
+        // admin card below guards only the global bank.
+        if protected && owned.is_none() {
+            let state = serde_json::json!({"agent":config.target_agent_id,"key":proposal_key,
+                "name":synthesized.name,"sha256":crate::skill_lifecycle::isolated::digest(synthesized.full_markdown.as_bytes())});
+            if let Err(error) = crate::skill_lifecycle::isolated::approve(&config.home_dir, &config.target_agent_id,
+                "synthesize", &format!("{}:{}", config.target_agent_id, synthesized.name), &state,
+                serde_json::json!({"skill":synthesized.name,"scope":"global","markdown":synthesized.full_markdown})).await {
+                errors.push(error); continue;
+            }
+        }
 
         // ── Step 5: Write skill to agent SKILLS directory ─────────────────────
 
@@ -571,8 +676,26 @@ async fn graduate_trajectories(
         let publish_global_dir = global_skills_dir.clone();
         let publish_home = config.home_dir.clone();
         let markdown = synthesized.full_markdown.clone();
+        let publish_owner = owned.clone();
+        // The isolated call's live authority, re-checked before every write.
+        let authority = duduclaw_mcp_boundary::io_authority::capture();
         let publication = tokio::task::spawn_blocking(move || {
             let _leases = (_publication, caller_publication);
+            if let Some(owner) = publish_owner {
+                // H13c: refuse rather than publish without the call's authority.
+                if !authority.is_scoped() { return Err("owned synthesis has no isolated call authority".to_string()); }
+                return authority.run(|| super::owned::publish(&publish_home, &owner, &candidate.skill_name,
+                    &markdown, &proposal_key));
+            }
+            if protected {
+                let filename = format!("{}.md", candidate.skill_name);
+                crate::isolation_worker_plans::write_host_file(&publish_home, &["skills"], &filename, markdown.as_bytes())
+                    .map_err(|_| "approved skill publication unconfirmed".to_string())?;
+                let receipt = serde_json::to_vec(&candidate).map_err(|e| e.to_string())?;
+                crate::isolation_worker_plans::write_host_file(&publish_home, &["skill-proposals"], &format!("{proposal_key}.published"), &receipt)
+                    .map_err(|_| "skill published; receipt unconfirmed".to_string())?;
+                return Ok(());
+            }
             std::fs::create_dir_all(&publish_agent_dir)
                 .map_err(|e| format!("Failed to create SKILLS dir: {e}"))?;
             let skill_path = publish_agent_dir.join(format!("{}.md", candidate.skill_name));
@@ -1052,4 +1175,24 @@ mod tests {
         assert!(!home.path().join("skills").exists());
     }
 
+}
+
+async fn parse_events_protected(dir: &Path, days: u32) -> Result<Vec<super::quality_scorer::TrajectoryEvent>, String> {
+    let dir = dir.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if !dir.is_absolute() || days > 30 { return Err("技能合成來源設定不正確。".into()); }
+        let now = Utc::now(); let mut events = Vec::new();
+        for back in 0..=days {
+            let path = dir.join(format!("{}.jsonl", (now - chrono::Duration::days(i64::from(back))).format("%Y-%m-%d")));
+            let Some(bytes) = crate::isolation_worker_plans::absolute_snapshot(&path, 8 * 1024 * 1024)
+                .map_err(|_| "無法安全讀取合成事件。")? else { continue; };
+            let normalized = duduclaw_parse_worker::adapters::read_evolution_events(&bytes)
+                .map_err(|_| "隔離服務無法解析合成事件。")?;
+            let batch: Vec<super::quality_scorer::TrajectoryEvent> = serde_json::from_str(&normalized)
+                .map_err(|_| "隔離合成事件格式錯誤。")?;
+            if batch.len() > 1000 || events.len() + batch.len() > 5000 { return Err("合成事件超過預覽上限。".into()); }
+            events.extend(batch);
+        }
+        Ok(events)
+    }).await.map_err(|_| "隔離技能預覽失敗。".to_string())?
 }
