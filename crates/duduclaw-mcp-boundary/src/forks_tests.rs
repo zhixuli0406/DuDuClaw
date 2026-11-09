@@ -85,7 +85,8 @@ fn fork_controls_require_exact_branch_and_parent_grants_after_actor_match() {
     assert!(crate::tool_policy::eligible(&unrelated,"terminate_branch"));
     assert!(store.branch(&unrelated,&fork,&branches[0]).is_err());
     assert!(store.request_cancel(&unrelated,&fork,&branches[1]).is_err());
-    assert!(store.diff(&unrelated,&fork,&branches[0],&branches[1]).is_err());
+    // FD-SEL: the read needs only the actor; branch 1 has no recorded manifest yet.
+    assert_eq!(store.diff(&unrelated,&fork,&branches[0],&branches[1]), Err(VerificationError::Unavailable));
     assert!(store.select(&unrelated,&fork,&branches[0],0,&manifest('a').digest()).is_err());
     let mut record = context().record().clone();
     record.resources = List::new(vec![ResourceGrant::Workspace { handle: Text::new("branch-a".into()).unwrap() }]).unwrap();
@@ -173,7 +174,7 @@ async fn fork_v180_deferred_mutations_cannot_publish_or_launch_even_with_valid_a
 }
 
 #[tokio::test]
-async fn fork_cost_read_checks_actor_and_grants_and_never_invents_zero_usage() {
+async fn fork_cost_read_checks_actor_and_never_invents_zero_usage() {
     use serde_json::json;
     let home = tempfile::tempdir().unwrap();
     let store = ForkStore::open(&home.path().join("forks.db")).unwrap();
@@ -195,7 +196,9 @@ async fn fork_cost_read_checks_actor_and_grants_and_never_invents_zero_usage() {
                 ResourceGrant::Workspace { handle: Text::new("unrelated".into()).unwrap() }]).unwrap(),
             _ => record.tools = List::new(vec![]).unwrap(),
         }
-        assert!(service.execute(&RequestContext::from_verified_record(record), "fork_cost", &args).await.is_err());
+        let result = service.execute(&RequestContext::from_verified_record(record), "fork_cost", &args).await;
+        // FD-SEL: workspace grants do not matter for a read of the own fork.
+        if mutation == 2 { assert_eq!(result.unwrap(), value); } else { assert!(result.is_err(), "{mutation}"); }
     }
     assert!(service.execute(&context(), "fork_cost", &json!({"fork_id":"f".repeat(32)})).await.is_err());
 }
@@ -390,17 +393,116 @@ fn fork_queue_state_is_atomic_cancellable_and_uncertain_after_restart() {
 }
 
 #[test]
-fn fork_inspect_exposes_cas_baseline_only_after_all_grants() {
+fn fork_inspect_exposes_cas_baseline_to_the_exact_actor_only() {
     let home=tempfile::tempdir().unwrap(); let store=ForkStore::open(&home.path().join("forks.db")).unwrap();
     let (fork,_)=create(&store); let inspected=store.inspect(&context(),&fork).unwrap();
     assert_eq!(inspected["expected_revision"],0);
     assert_eq!(inspected["expected_parent_digest"],manifest('a').digest());
     assert_eq!(inspected["branches"].as_array().unwrap().len(),2);
-    for denied in ["parent","branch-a","branch-b"] {
+    // FD-SEL: a read of the own fork does not depend on workspace grants.
+    for dropped in ["parent","branch-a","branch-b"] {
         let mut record=context().record().clone();
         record.resources=List::new(record.resources.as_slice().iter().filter(|grant| !matches!(grant,
-            ResourceGrant::Workspace{handle} if handle.as_str()==denied)).cloned().collect()).unwrap();
-        assert!(store.inspect(&RequestContext::from_verified_record(record),&fork).is_err());
+            ResourceGrant::Workspace{handle} if handle.as_str()==dropped)).cloned().collect()).unwrap();
+        assert_eq!(store.inspect(&RequestContext::from_verified_record(record),&fork).unwrap(), inspected);
+    }
+    for record in foreign_actors() {
+        assert_eq!(store.inspect(&RequestContext::from_verified_record(record),&fork), Err(VerificationError::Invalid));
+    }
+}
+
+/// The same employee's record narrowed to the FD-SEL selection: only the own
+/// Employee grant and the three read tools.
+fn employee_only() -> RequestContext {
+    let mut record = context().record().clone();
+    record.tools = List::new(crate::fork_policy::READ_TOOLS.into_iter().map(|name| Text::new(name.into()).unwrap())
+        .collect()).unwrap();
+    record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
+    RequestContext::from_verified_record(record)
+}
+
+/// Another employee id, another principal (or principal generation), and
+/// another binding: each is a different fork actor.
+fn foreign_actors() -> Vec<CapabilityRecord> {
+    let mut actors = Vec::new();
+    let mut record = context().record().clone(); record.employee = EmployeeId([9; 16]);
+    record.resources = List::new(vec![ResourceGrant::Employee { id: EmployeeId([9; 16]) }]).unwrap();
+    actors.push(record);
+    let mut record = context().record().clone();
+    record.principal = Principal::Human { user_id: Text::new("other".into()).unwrap(), generation: 1 };
+    actors.push(record);
+    let mut record = context().record().clone();
+    record.principal = Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 2 };
+    actors.push(record);
+    let mut record = context().record().clone();
+    record.employee_binding = EmployeeBinding::Shared(Text::new("tenant".into()).unwrap());
+    actors.push(record);
+    actors
+}
+
+#[tokio::test]
+async fn fdsel_fork_reads_need_only_the_own_employee_grant() {
+    use serde_json::json;
+    let home = tempfile::tempdir().unwrap();
+    let store = ForkStore::open(&home.path().join("forks.db")).unwrap();
+    let (fork, branches) = create(&store);
+    complete(&store, &fork, &branches[0], run(10), "branch-a", 'b');
+    complete(&store, &fork, &branches[1], run(11), "branch-b", 'c');
+    let backend = Arc::new(Backend::default());
+    let service = ForkHostControl { store: store.clone(), backend: backend.clone() };
+    let reader = employee_only();
+    for name in crate::fork_policy::READ_TOOLS {
+        assert!(crate::tool_policy::eligible(&reader, name), "{name}");
+    }
+    let inspected = service.execute(&reader, "inspect_branches", &json!({"fork_id":fork})).await.unwrap();
+    assert_eq!(inspected, store.inspect(&context(), &fork).unwrap());
+    assert_eq!(inspected["branches"].as_array().unwrap().len(), 2);
+    let cost = service.execute(&reader, "fork_cost", &json!({"fork_id":fork})).await.unwrap();
+    assert_eq!(cost["measurement_status"], "unavailable");
+    let diff = service.execute(&reader, "diff_branches", &json!({"fork_id":fork,
+        "left_branch_id":branches[0], "right_branch_id":branches[1]})).await.unwrap();
+    assert_eq!(diff["changed_paths"], json!(["中文.txt"]));
+    // The reads never launch, kill or publish anything.
+    assert_eq!((backend.reserved.load(Ordering::SeqCst), backend.killed.load(Ordering::SeqCst)), (0, 0));
+    assert!(store.select(&reader, &fork, &branches[0], 0, &manifest('a').digest()).is_err(),
+        "publication still needs the parent and branch workspace grants");
+    assert!(store.request_cancel(&reader, &fork, &branches[0]).is_err(), "cancellation still needs the branch grant");
+    // The deferred mutations stay unavailable even beside the read selection.
+    for name in crate::fork_policy::DEFERRED_TOOLS {
+        assert_eq!(service.execute(&reader, name, &json!({"fork_id":fork})).await, Err(VerificationError::Unavailable));
+    }
+}
+
+#[tokio::test]
+async fn fdsel_foreign_and_unknown_forks_fail_identically() {
+    use serde_json::json;
+    let home = tempfile::tempdir().unwrap();
+    let store = ForkStore::open(&home.path().join("forks.db")).unwrap();
+    let (fork, branches) = create(&store);
+    complete(&store, &fork, &branches[0], run(10), "branch-a", 'b');
+    let service = ForkHostControl { store: store.clone(), backend: Arc::new(Backend::default()) };
+    let unknown = "f".repeat(32);
+    let arguments = |fork: &str, name: &str| if name == "diff_branches" {
+        json!({"fork_id":fork, "left_branch_id":branches[0], "right_branch_id":branches[1]})
+    } else { json!({"fork_id":fork}) };
+    for name in crate::fork_policy::READ_TOOLS {
+        let missing = service.execute(&employee_only(), name, &arguments(&unknown, name)).await;
+        assert_eq!(missing, Err(VerificationError::Invalid), "{name}");
+        for mut record in foreign_actors() {
+            record.tools = List::new(vec![Text::new(name.into()).unwrap()]).unwrap();
+            let foreign = service.execute(&RequestContext::from_verified_record(record), name, &arguments(&fork, name)).await;
+            assert_eq!(foreign, missing, "{name}: a foreign fork must look exactly like an unknown one");
+        }
+    }
+    // A branch of another fork is not a branch of this one.
+    let (other, other_branches) = store.create(&context(), "parent", &manifest('a'),
+        &[workspace("branch-c"), workspace("branch-d")]).unwrap();
+    assert_eq!(store.diff(&employee_only(), &fork, &branches[0], &other_branches[0]), Err(VerificationError::Invalid));
+    assert!(store.inspect(&employee_only(), &other).is_ok());
+    // Exact protected schema: the legacy names and extra selectors refuse.
+    for forged in [json!({"fork_id":fork,"branch_a":branches[0],"branch_b":branches[1]}),
+        json!({"fork_id":fork,"workspace":"branch-a"}), json!({"fork_id":fork,"run_id":"x"})] {
+        assert_eq!(service.execute(&employee_only(), "diff_branches", &forged).await, Err(VerificationError::Invalid), "{forged}");
     }
 }
 

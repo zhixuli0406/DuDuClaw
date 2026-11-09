@@ -27,9 +27,11 @@ pub fn catalog(home: &Path, caller: &TrustedCaller, agent: &str) -> Result<Value
         "can_create":enabled && !roots.is_empty() && !evaluators.is_empty() && !runtimes.is_empty(),
         "requires_approval":!caller.manager_for(agent)}))
 }
+/// FD-SEL: for a protected caller an unknown run and a run it may not see are
+/// the same `DISCOVERY_NOT_FOUND` (`TrustedCaller::authorize_task`).
 async fn authorized_task(home: &Path, store: &TaskStore, caller: &TrustedCaller, run_id: &str) -> Result<TaskRow, String> {
     valid_id(run_id)?;
-    let task = store.discovery_by_run(run_id).await?.ok_or("discovery not found")?;
+    let task = store.discovery_by_run(run_id).await?.ok_or(DISCOVERY_NOT_FOUND)?;
     caller.authorize_task(home,&task)?;
     Ok(task)
 }

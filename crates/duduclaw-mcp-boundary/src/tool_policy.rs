@@ -202,19 +202,23 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "computer_workspace_write", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "session_restore_context", route: Route::Service, required: &[ResourceKind::Employee] },
     // fork
+    // FD-SEL: the three reads are host fork-store views of the own forks
+    // (`own_reads::own_read_selector`); the mutations stay deferred.
     ToolPolicy { name: "fork_run", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "inspect_branches", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "diff_branches", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "inspect_branches", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "diff_branches", route: Route::Execution, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "merge_or_select", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "terminate_branch", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "fork_cost", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "fork_cost", route: Route::Execution, required: &[ResourceKind::Employee] },
     // tasks
     ToolPolicy { name: "credential_declare", route: Route::Service, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "discovery_catalog", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "discovery_list", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "discovery_tree", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "discovery_artifact", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "discovery_cancel", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    // FD-SEL: host discovery service, the caller's own (employee + incarnation
+    // bound) discovery requests only; never a workspace operation.
+    ToolPolicy { name: "discovery_catalog", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "discovery_list", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "discovery_tree", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "discovery_artifact", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "discovery_cancel", route: Route::Execution, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "tasks_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
     ToolPolicy { name: "tasks_create", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "tasks_update", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
@@ -460,6 +464,10 @@ pub use selectors::{check_own_skill_arguments, create_task_selector, new_task_gr
 #[path = "tool_policy_spawn.rs"]
 pub mod spawn;
 pub use spawn::{check_spawn_arguments, ephemeral_tools, spawn_selector, SPAWN_TOOLS};
+// FD-SEL (Package H 22–29): own discovery jobs and own fork-store reads.
+#[path = "tool_policy_own_reads.rs"]
+pub mod own_reads;
+pub use own_reads::{check_own_read_arguments, own_read_selector, OWN_DISCOVERY_TOOLS, OWN_FORK_READ_TOOLS, OWN_READ_TOOLS};
 
 /// Discovery shares the exact tool and mandatory resource policy with calls.
 /// The transport additionally checks that the corresponding host service exists.
@@ -480,6 +488,8 @@ pub fn eligible(context: &RequestContext, name: &str) -> bool {
     }
     // H13: own Employee (+ the record task's grant), Personal parent owner-only.
     if SPAWN_TOOLS.contains(&name) { return spawn_selector(context, name).is_ok(); }
+    // FD-SEL: exactly the own Employee grant; ownership is live host state.
+    if OWN_READ_TOOLS.contains(&name) { return own_read_selector(context, name).is_ok(); }
     // D-H2: the URL itself is matched against the grant by `authorize`.
     // H12a: own-skill tools additionally need their record-side selector
     // (applies to the whole disjunction, not only the required-kind branch).
@@ -791,6 +801,8 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
         check_own_skill_arguments(name, arguments)?;
     } else if OWN_SKILL_JOB_TOOLS.contains(&name) {
         check_own_skill_job_arguments(name, arguments)?;
+    } else if OWN_READ_TOOLS.contains(&name) {
+        check_own_read_arguments(name, arguments)?;
     } else if context.record().employee_scope() && matches!(policy.route, Route::Service | Route::Connector) {
         let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
         if ["principal", "root", "cwd", "run", "run_id", "employee_id"].iter().any(|k| fields.contains_key(*k)) {
@@ -799,6 +811,7 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
     } else { crate::check_arguments(arguments)?; }
     if !eligible(context, name) { return Err(VerificationError::Invalid); }
     if SPAWN_TOOLS.contains(&name) { return spawn::authorize_spawn(context, policy, arguments, resolver); }
+    if OWN_READ_TOOLS.contains(&name) { return own_reads::authorize(context, policy, arguments); }
     // H12b/c/d: exactly the record's own selection (see `skill_jobs`).
     if OWN_SKILL_JOB_TOOLS.contains(&name) { return skill_jobs::authorize(context, policy, arguments, resolver); }
     if PUBLIC_ORIGIN_TOOLS.contains(&name) {

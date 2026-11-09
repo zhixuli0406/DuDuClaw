@@ -5,8 +5,9 @@
 //! (`IN_RUN_HELPER_TOOLS`) when spawnd advertises `helper_calls` and a work
 //! broker is installed. The same handle is also the A execution workspace, so
 //! the grant alone would make every listed tool that needs a Workspace
-//! eligible: other execution tools (discovery, forks) and the
-//! workspace-scoped E services. HX6: the browser recording tools are signed
+//! eligible: other execution tools (e.g. the deferred fork mutations) and the
+//! workspace-scoped E services. (FD-SEL: the discovery job tools and the fork
+//! reads need only the own Employee grant and are not affected.) HX6: the browser recording tools are signed
 //! only with their own recording selector (`drops_from_signed_with`). (H13
 //! `spawn_agent` / `spawn_ephemeral` need only the Employee grant and are not
 //! affected.) No selector chose a
@@ -24,11 +25,13 @@ use crate::tool_policy::{employee_service_scope, policy, ResourceKind, Route, IN
 /// on the run's own Employee grant, no Workspace); H12b/H12c removed
 /// `skill_hub_install` (own Employee + PublicOrigins) and `skill_synthesis_run`
 /// (own Employee only); HX6 removed `browser_record_start` /
-/// `browser_record_stop` (own recording selector). None of them may be added
-/// back here. `skill_from_recording` stays until H12d's `RecordingJobs` seam
-/// is wired to HX6's `recording_jobs` (N4 / VerifiedArtifact tripwire).
-pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &["inspect_branches", "diff_branches", "fork_cost", "discovery_catalog", "discovery_list", "discovery_tree", "discovery_artifact",
-    "discovery_cancel", "skill_from_recording"];
+/// `browser_record_stop` (own recording selector); FD-SEL removed the five
+/// discovery job tools and the three fork reads (own Employee grant only,
+/// `tool_policy::own_reads`). None of them may be added back here.
+/// `skill_from_recording` is the only entry left: it stays until H12d's
+/// `RecordingJobs` seam is wired to HX6's `recording_jobs` (N4 /
+/// VerifiedArtifact tripwire). It is a pending selector, not a refusal.
+pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &["skill_from_recording"];
 
 /// Whether a signed `Workspace` grant is what would make `name` eligible on a
 /// non-File route. `employee_scope` is true when the record keeps its
@@ -159,5 +162,23 @@ mod tests {
         newly.sort_unstable();
         assert_eq!(newly, vec!["browser_record_start", "browser_record_stop"]);
         assert!(drops_from_signed_with("skill_from_recording", true, true, true), "still pending (H12d)");
+    }
+
+    /// FD-SEL final state: only the H12d tool is still a tracked gap; the
+    /// discovery job tools and fork reads ride the own Employee grant.
+    #[test]
+    fn fdsel_pending_list_final_state() {
+        assert_eq!(PENDING_WORKSPACE_SELECTOR_TOOLS, &["skill_from_recording"]);
+        for tool in crate::tool_policy::OWN_READ_TOOLS {
+            assert_eq!(policy(tool).expect(tool).required, &[ResourceKind::Employee], "{tool}");
+            for (scoped, helpers) in [(true, false), (true, true), (false, false), (false, true)] {
+                assert!(!drops_from_signed(tool, scoped, helpers), "{tool}");
+            }
+        }
+        // The deferred fork mutations still rest on a Workspace and stay out
+        // of any workspace-carrying snapshot (and are refused by disposition).
+        for tool in crate::fork_policy::DEFERRED_TOOLS {
+            assert!(needs_execution_workspace(tool, true) && drops_from_signed(tool, true, true), "{tool}");
+        }
     }
 }

@@ -52,15 +52,37 @@ async fn withdraw_approval(broker: &ApprovalBroker, approval_id: &str, task_id: 
 }
 
 #[derive(Debug, Clone)]
-pub struct TrustedCaller { principal: Principal, isolated: bool }
+pub struct TrustedCaller { principal: Principal, isolated: bool, creator: Option<IsolatedCreator> }
 #[derive(Debug, Clone)]
 enum Principal { User(UserContext), Agent(String) }
+
+/// FD-SEL: the exact identity a protected employee acts as — the verified
+/// capability's employee id and the label's current confirmed incarnation.
+/// A protected caller sees and cancels only requests bound to exactly this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsolatedCreator { pub employee: [u8; 16], pub incarnation: u32 }
+
+/// FD-SEL: what a protected caller is told for a run it may not see — the
+/// same answer as for an id that does not exist.
+pub const DISCOVERY_NOT_FOUND: &str = "discovery not found";
+const ISOLATED_CALLER_REQUIRED: &str = "discovery requires a verified isolated caller";
+
+/// The label's current confirmed incarnation, only while its live receipt is
+/// the verified capability's employee (`confirmed_employees`, F6 §3.1).
+/// Disabled, recreated (another employee id) or unreadable ⇒ refused.
+fn live_incarnation(home: &Path, label: &str, employee: duduclaw_isolation::ids::EmployeeId) -> Result<u32, String> {
+    match crate::isolation_lifecycle::confirmed_row(home, label) {
+        Ok(Some((receipt, _, incarnation))) if !receipt.disabled && receipt.employee == employee
+            && receipt.label == label => Ok(incarnation),
+        _ => Err(ISOLATED_CALLER_REQUIRED.into()),
+    }
+}
 impl TrustedCaller {
     pub fn from_user(context: &UserContext) -> Result<Self, String> {
         if context.user_id.trim().is_empty() || context.requires_password_change() {
             return Err("permission denied".into());
         }
-        Ok(Self { principal: Principal::User(context.clone()), isolated: false })
+        Ok(Self { principal: Principal::User(context.clone()), isolated: false, creator: None })
     }
     pub fn from_signed_agent(home: &Path, id: &str, token: Option<&str>) -> Result<Self, String> {
         valid_id(id)?;
@@ -68,18 +90,37 @@ impl TrustedCaller {
             duduclaw_core::IdentityVerdict::Verified) {
             return Err("discovery requires a verified agent identity".into());
         }
-        Ok(Self { principal: Principal::Agent(id.into()), isolated: false })
+        Ok(Self { principal: Principal::Agent(id.into()), isolated: false, creator: None })
     }
     /// The connection-bound MCP dispatcher has already authenticated this
     /// request. Keep the employee role: a human principal behind the run does
     /// not turn its discovery operations into manager operations.
+    /// FD-SEL: the caller also carries its exact `(employee id, incarnation)`;
+    /// the employee id comes from the verified capability, the incarnation
+    /// from the label's live confirmed receipt for that same employee.
     pub fn from_isolated_agent(home: &Path, id: &str) -> Result<Self, String> {
-        valid_id(id)?;
-        match crate::isolation_egress::current(home, id) {
-            Some(Ok(_)) => Ok(Self { principal: Principal::Agent(id.into()), isolated: true }),
-            _ => Err("discovery requires a verified isolated caller".into()),
-        }
+        Self::from_isolated_agent_with(home, id, &live_incarnation)
     }
+    fn from_isolated_agent_with(home: &Path, id: &str,
+        incarnation: &dyn Fn(&Path, &str, duduclaw_isolation::ids::EmployeeId) -> Result<u32, String>)
+        -> Result<Self, String> {
+        valid_id(id)?;
+        let Some(Ok(call)) = crate::isolation_egress::current(home, id) else {
+            return Err(ISOLATED_CALLER_REQUIRED.into());
+        };
+        let employee = call.employee();
+        let incarnation = incarnation(home, id, employee).map_err(|_| ISOLATED_CALLER_REQUIRED.to_owned())?;
+        Ok(Self { principal: Principal::Agent(id.into()), isolated: true,
+            creator: Some(IsolatedCreator { employee: employee.0, incarnation }) })
+    }
+    /// Test seam: an isolated caller whose incarnation is given instead of read
+    /// from the confirmed lifecycle (the gateway-scope check still applies).
+    #[cfg(test)]
+    pub(crate) fn from_isolated_agent_at(home: &Path, id: &str, incarnation: u32) -> Result<Self, String> {
+        Self::from_isolated_agent_with(home, id, &move |_, _, _| Ok(incarnation))
+    }
+    /// The protected creator identity, `None` for RPC/signed callers.
+    pub fn isolated_creator(&self) -> Option<IsolatedCreator> { self.creator }
     fn id(&self) -> String {
         match &self.principal { Principal::User(user) => format!("user:{}", user.user_id),
             Principal::Agent(agent) => format!("agent:{agent}") }
@@ -110,14 +151,40 @@ impl TrustedCaller {
         }
     }
     fn authorize_task(&self, home: &Path, task: &TaskRow) -> Result<(), String> {
-        if task.kind != TaskKind::Discovery { return Err("discovery not found".into()); }
+        if task.kind != TaskKind::Discovery { return Err(DISCOVERY_NOT_FOUND.into()); }
         let visible = self.manager_for(&task.assigned_to) || match &self.principal {
             Principal::User(user) => task.created_by == self.id()
                 && user.has_agent_access(&task.assigned_to, AccessLevel::Operator),
             Principal::Agent(_) => task.created_by == self.id()
                 && self.authorize_create(home, &task.assigned_to).is_ok(),
         };
-        if visible { Ok(()) } else { Err("permission denied".into()) }
+        // FD-SEL: a protected caller additionally needs the request's creator
+        // binding to be exactly its own (employee id, incarnation); a request
+        // filed by another incarnation, a recreated label or an ordinary
+        // (signed/RPC) caller is not its own. Every refusal reads like an
+        // unknown run. RPC and signed callers keep their original answers.
+        let visible = visible && self.creator.is_none_or(|creator| own_isolated_request(home, task, creator));
+        if visible { Ok(()) }
+        else if self.isolated { Err(DISCOVERY_NOT_FOUND.into()) }
+        else { Err("permission denied".into()) }
+    }
+}
+
+/// Whether `task` was filed by exactly `creator` (any store error ⇒ no).
+fn own_isolated_request(home: &Path, task: &TaskRow, creator: IsolatedCreator) -> bool {
+    let Some(run) = task.discovery_run_id.as_deref() else { return false; };
+    DiscoveryStore::open(home).ok().is_some_and(|store| store
+        .isolated_creator_matches(&task.id, run, &creator.employee, creator.incarnation).unwrap_or(false))
+}
+
+impl TrustedCaller {
+    /// FD-SEL: persist the protected creator binding before the task row
+    /// exists, so a request is never visible to a protected caller unbound.
+    fn bind_isolated_creator(&self, home: &Path, task: &TaskRow) -> Result<(), String> {
+        let Some(creator) = self.creator else { return Ok(()); };
+        let run = task.discovery_run_id.as_deref().ok_or("missing run identity")?;
+        DiscoveryStore::open(home).map_err(|e| e.to_string())?
+            .save_isolated_creator(&task.id, run, &creator.employee, creator.incarnation).map_err(|e| e.to_string())
     }
 }
 
@@ -281,7 +348,9 @@ async fn create_inner(home: &Path, store: &TaskStore, broker: &ApprovalBroker,
     let digest=DiscoveryStore::open(home).map_err(|e|e.to_string())?
         .save_frozen_request(&task.id,task.discovery_run_id.as_deref().unwrap(),&raw).map_err(|e|e.to_string())?;
     task.discovery_spec_json = Some(serde_json::to_string(&public_request(&frozen,&digest)).map_err(|e|e.to_string())?);
-    task.status = if caller.manager_for(agent) { "queued" } else { "pending_approval" }.into();
+    // FD-SEL: before the approval card and the task row exist.
+    caller.bind_isolated_creator(home, &task)?;
+    task.status =if caller.manager_for(agent) { "queued" } else { "pending_approval" }.into();
     if task.status == "pending_approval" {
         let id = broker.request(agent, "discovery", title, approval_payload(&task)?, 86_400).await?;
         task.discovery_approval_id = Some(id.as_str().into());

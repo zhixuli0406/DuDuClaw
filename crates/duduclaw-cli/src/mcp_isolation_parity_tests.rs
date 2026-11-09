@@ -137,10 +137,18 @@ fn pending_production_selectors() -> BTreeSet<String> {
     // Employee grant (live delegation/binding/task checks per call).
     // H12b/H12c removed skill_hub_install (own Employee + the issuer's
     // PublicOrigins) and skill_synthesis_run (own Employee). HX6 removed
-    // browser_record_start/stop (own recording selector). skill_from_recording
-    // stays: H12d's `RecordingJobs` seam is not yet wired to HX6's job store.
+    // browser_record_start/stop (own recording selector). FD-SEL removed the
+    // discovery job tools and the fork reads (own Employee grant only; the
+    // host checks the exact creator binding / fork actor per call).
+    // skill_from_recording stays: H12d's `RecordingJobs` seam is not yet
+    // wired to HX6's job store. It is the only remaining entry and it is a
+    // pending selector, not a refusal (no `Refused:` row in the matrix).
     let pending: BTreeSet<String> = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS
         .iter().map(|tool| (*tool).to_owned()).collect();
+    for tool in duduclaw_mcp_boundary::tool_policy::OWN_READ_TOOLS {
+        assert!(!pending.contains(tool), "{tool}: FD-SEL own discovery/fork reads have their selector");
+    }
+    assert_eq!(pending, BTreeSet::from(["skill_from_recording".to_owned()]), "FD-SEL final pending inventory");
     for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS {
         assert!(!pending.contains(tool), "{tool}: HX5 in-run helpers have their selector");
     }
@@ -571,6 +579,15 @@ async fn employee_tool_parity(home: &std::path::Path) {
     for tool in duduclaw_mcp_boundary::tool_policy::SPAWN_TOOLS {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: H13 spawn selector missing");
         assert!(!pending.contains(tool), "{tool}");
+    }
+    // FD-SEL: own discovery jobs and own fork-store reads come from the
+    // issuer's own Employee grant alone (no Workspace, no Task); the issuer
+    // signs them beside the selected `employee-work` grant.
+    for tool in duduclaw_mcp_boundary::tool_policy::OWN_READ_TOOLS {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: FD-SEL selector missing");
+        assert!(!pending.contains(tool), "{tool}");
+        assert_eq!(duduclaw_mcp_boundary::tool_policy::own_read_selector(&context, tool).unwrap(),
+            vec![ResourceGrant::Employee { id: context.record().employee }], "{tool}: own Employee only");
     }
     // HX6: the recording rides the same grant, signed by its own selector
     // (fixture: spawnd helper_calls + helper_recording, `public_web`, interactive).
