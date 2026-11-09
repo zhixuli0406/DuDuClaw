@@ -15,11 +15,17 @@
 //!    SQLite message queue: sender = target = the parent's label, on behalf of
 //!    the parent's verified requester.
 //! 3. The dispatcher gate admits that self-delegation only for a released job
-//!    whose employee id and incarnation equal the live ones
-//!    (`isolation_ephemeral_start::self_delegation_allowed`); `scope_record` /
+//!    whose employee id and incarnation equal the live ones, and only once:
+//!    it moves the job `released → started` atomically (H13c,
+//!    `isolation_ephemeral_start::self_delegation_allowed`); `scope_record` /
 //!    `recheck` then authorize it like any delegation (B1 admits a Personal
 //!    parent only through `same_owner`), and `authorize_current` narrows the
-//!    child's tool snapshot to the job's tools ([`child_tools`]).
+//!    child's tool snapshot to the started job's tools ([`child_tools`]).
+//!
+//! H13c: the receipt material also binds a digest of the job's tools
+//! ([`JOB_TOOLS_FIELD`], [`bind_job_tools`]), so a job row edited after the
+//! capture never authorizes the child; a job never grants a spawn tool
+//! ([`narrowed_tools`]).
 //!
 //! The child itself never files another child (depth 1, [`is_ephemeral_child`]).
 //! Its `tier` is recorded on the job only: the child uses the parent's model
@@ -65,16 +71,54 @@ pub fn child_prompt(job: &EphemeralJob) -> Result<String, VerificationError> {
     Ok(prompt)
 }
 
-/// The delegation material the receipt binds, equal to what the dispatcher
+/// Material key of the job's tool digest ([`tools_digest`]).
+pub const JOB_TOOLS_FIELD: &str = "ephemeral_job_tools";
+
+/// H13c: digest of the job's tool list (order-preserving), bound into the
+/// child's receipt material so a job row edited after capture never runs.
+pub fn tools_digest(tools: &[String]) -> Result<String, VerificationError> {
+    super::store::material_digest(&serde_json::json!({ "tools": tools }))
+}
+
+/// `material` (a delegation material object) plus the job's tool digest.
+pub fn with_job_tools(mut material: Value, job: &EphemeralJob) -> Result<Value, VerificationError> {
+    let digest = tools_digest(&job.tools)?;
+    material.as_object_mut().ok_or(VerificationError::Invalid)?.insert(JOB_TOOLS_FIELD.into(), Value::String(digest));
+    Ok(material)
+}
+
+/// The delegation material the receipt binds: what the dispatcher
 /// (`isolated_queue_scope`) and `material::read_current` derive from the
-/// stored queue row: the queue masks credentials on insert, so the bound
-/// payload is the masked prompt.
+/// stored queue row (the queue masks credentials on insert, so the bound
+/// payload is the masked prompt), plus the job's tool digest that
+/// [`bind_job_tools`] adds on every later derivation (H13c).
 pub fn child_material(job: &EphemeralJob) -> Result<Value, VerificationError> {
     let agent = job.parent.agent.as_str();
     let payload = duduclaw_security::credential_detect::mask(&child_prompt(job)?);
     let owner = owner_principal(job)?;
-    Ok(super::material::delegation(agent, agent, &payload, None, None, lane(job), CHILD_DEPTH, Some(agent),
-        None, Some(agent), false, 0, false, Some(&owner)))
+    with_job_tools(super::material::delegation(agent, agent, &payload, None, None, lane(job), CHILD_DEPTH, Some(agent),
+        None, Some(agent), false, 0, false, Some(&owner)), job)
+}
+
+/// H13c: the material of a `delegation` record as `scope_record` / recheck
+/// compare it. For a child message id ([`job_id_of`]) the stored job (any
+/// state, keys checked by `lookup`) must exist and its tool digest is added;
+/// a missing or unreadable job refuses. Any other record is unchanged.
+pub(crate) fn bind_job_tools_with(kind: &str, id: &str, material: Value,
+    lookup: impl FnOnce(&str) -> Result<Option<EphemeralJob>, VerificationError>) -> Result<Value, VerificationError> {
+    if kind != "delegation" { return Ok(material); }
+    let Some(job_id) = job_id_of(id) else { return Ok(material) };
+    let job = lookup(job_id)?.ok_or(VerificationError::Revoked)?;
+    if job.id != job_id { return Err(VerificationError::Revoked); }
+    with_job_tools(material, &job)
+}
+
+/// [`bind_job_tools_with`] over `isolation-ephemeral-jobs.db` (never created here).
+pub(crate) fn bind_job_tools(home: &Path, kind: &str, id: &str, material: Value) -> Result<Value, VerificationError> {
+    bind_job_tools_with(kind, id, material, |job_id| {
+        if !home.join(crate::isolation_ephemeral::JOBS_DB).exists() { return Err(VerificationError::Unavailable); }
+        crate::isolation_ephemeral::EphemeralJobs::open(home)?.job(job_id)
+    })
 }
 
 /// The SQLite queue row that starts the child (fields mirror [`child_material`]).
@@ -115,27 +159,30 @@ pub(crate) fn job_matches_receipt(job: &EphemeralJob, receipt: &RecordAuthority)
 
 /// The granted tools that the job also names, in grant order: never more
 /// than the job (requested ∩ parent snapshot) nor than the child's own live
-/// tool snapshot. Empty refuses.
+/// tool snapshot. H13c: never a spawn tool (`spawn_agent`, `spawn_ephemeral`),
+/// whatever the job names. Empty refuses.
 pub fn narrowed_tools(granted: &[Text<128>], job_tools: &[String])
     -> Result<List<Text<128>, 256>, VerificationError> {
     let tools: Vec<Text<128>> = granted.iter()
+        .filter(|tool| !super::same_owner::SPAWN_TOOLS.contains(&tool.as_str()))
         .filter(|tool| job_tools.iter().any(|name| name == tool.as_str())).cloned().collect();
     if tools.is_empty() { return Err(VerificationError::Invalid); }
     List::new(tools).map_err(|_| VerificationError::Invalid)
 }
 
 /// `authorize_current`'s narrowing. `None`: not a self-delegation, nothing to
-/// narrow. A self-delegation must be the receipt of a released job that
-/// matches it exactly (`released` reads `isolation-ephemeral-jobs.db`);
-/// anything else refuses the run.
+/// narrow. A self-delegation must be the receipt of a started job (H13c: the
+/// dispatcher gate moved it `released → started`, once) that matches it
+/// exactly (`started` reads `isolation-ephemeral-jobs.db`); anything else
+/// refuses the run.
 pub fn child_tools(receipt: &RecordAuthority, granted: &[Text<128>],
-    released: impl FnOnce(&str) -> Result<Option<EphemeralJob>, VerificationError>)
+    started: impl FnOnce(&str) -> Result<Option<EphemeralJob>, VerificationError>)
     -> Result<Option<List<Text<128>, 256>>, VerificationError> {
     if receipt.kind != "delegation" || receipt.parent_agent.as_deref() != Some(receipt.agent.as_str()) {
         return Ok(None);
     }
     let id = ephemeral_job_of(receipt).ok_or(VerificationError::BindingMismatch)?;
-    let job = released(id)?.ok_or(VerificationError::Revoked)?;
+    let job = started(id)?.ok_or(VerificationError::Revoked)?;
     job_matches_receipt(&job, receipt)?;
     narrowed_tools(granted, &job.tools).map(Some)
 }

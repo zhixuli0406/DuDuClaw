@@ -24,6 +24,14 @@
 //! as a background self-delegation of the parent employee
 //! (`isolation_ephemeral_start`, `isolation_background::ephemeral_child`),
 //! whose receipt is captured here while the parent run is still live.
+//!
+//! H13c: the dispatcher's self-delegation exception consumes the job
+//! (`released → started`, once; [`EphemeralJobs::begin_start`]) and the child
+//! run is authorized only from a started job. A Personal parent files a child
+//! only from a live run its owner started, never from a run that itself came
+//! from a background receipt (`same_owner::ephemeral_parent_live`). D8: at
+//! most one job per employee is released at a time (see `take_startable`);
+//! spawnd's admission coordinator stays the authoritative per-employee slot.
 use std::path::Path;
 use duduclaw_isolation::{capability::{EmployeeBinding, Lane}, execution::RunHandle, ids::EmployeeId};
 use duduclaw_mcp_boundary::{RequestContext, VerificationError};
@@ -104,9 +112,19 @@ impl EphemeralJob {
     }
 }
 
-/// Lifecycle state of a stored job.
+/// Lifecycle state of a stored job: `pending → released` (parent exited,
+/// [`EphemeralJobs::take_startable`], one-shot) `→ started` (H13c: the
+/// dispatcher gate admitted its self-delegation, [`EphemeralJobs::begin_start`],
+/// once) `→ finished` (H13d: terminal, the child's run ended; no second run
+/// from the stored receipt), or `→ dropped`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobState { Pending, Released, Dropped }
+pub enum JobState { Pending, Released, Started, Finished, Dropped }
+
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ephemeral_jobs(
+        id TEXT PRIMARY KEY, employee TEXT NOT NULL, run TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending','released','started','finished','dropped')),
+        job TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);";
+const INDEX: &str = "CREATE INDEX IF NOT EXISTS ephemeral_jobs_state ON ephemeral_jobs(state, created_at);";
 
 /// Does the parent run still hold the employee's one capability-holding run
 /// (D8)? An error is treated as "still holds" (the job keeps waiting).
@@ -136,6 +154,21 @@ impl ParentIdentity for LiveLifecycle<'_> {
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
 fn store_error<E>(_: E) -> VerificationError { VerificationError::Unavailable }
 
+/// The stored job `id` if its row is in `state` (`None`: any state). A row
+/// whose stored job disagrees with its keys is `Revoked`.
+fn read_job(db: &Connection, id: &str, state: Option<&str>) -> Result<Option<EphemeralJob>, VerificationError> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, String, String)> = db.query_row(
+        "SELECT employee,run,job FROM ephemeral_jobs WHERE id=?1 AND (?2 IS NULL OR state=?2)",
+        params![id, state], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional().map_err(store_error)?;
+    let Some((employee, run, encoded)) = row else { return Ok(None) };
+    let job: EphemeralJob = serde_json::from_str(&encoded).map_err(|_| VerificationError::Revoked)?;
+    if job.id != id || hex(&job.parent.employee.0) != employee || hex(&(job.parent.run.0).0) != run {
+        return Err(VerificationError::Revoked);
+    }
+    Ok(Some(job))
+}
+
 /// The job store. Blocking SQLite: call from the blocking pool.
 pub struct EphemeralJobs { db: Connection }
 
@@ -148,14 +181,25 @@ impl EphemeralJobs {
         { let _ = home; Err(VerificationError::Unavailable) }
     }
 
-    pub fn from_connection(db: Connection) -> Result<Self, VerificationError> {
+    pub fn from_connection(mut db: Connection) -> Result<Self, VerificationError> {
+        use rusqlite::OptionalExtension;
         db.busy_timeout(std::time::Duration::from_millis(500)).map_err(store_error)?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS ephemeral_jobs(
-                id TEXT PRIMARY KEY, employee TEXT NOT NULL, run TEXT NOT NULL,
-                state TEXT NOT NULL CHECK(state IN ('pending','released','dropped')),
-                job TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS ephemeral_jobs_state ON ephemeral_jobs(state, created_at);")
-            .map_err(store_error)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
+        let existing: Option<String> = tx.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='ephemeral_jobs'", [], |row| row.get(0))
+            .optional().map_err(store_error)?;
+        // H13c/H13d: a store created before the `started`/`finished` states
+        // keeps its rows (same columns) under the widened CHECK constraint.
+        if existing.as_deref().is_some_and(|sql| !sql.contains("'finished'")) {
+            tx.execute_batch("ALTER TABLE ephemeral_jobs RENAME TO ephemeral_jobs_h13b;").map_err(store_error)?;
+            tx.execute_batch(SCHEMA).map_err(store_error)?;
+            tx.execute_batch("INSERT INTO ephemeral_jobs(id,employee,run,state,job,created_at,expires_at)
+                SELECT id,employee,run,state,job,created_at,expires_at FROM ephemeral_jobs_h13b;
+                DROP TABLE ephemeral_jobs_h13b;").map_err(store_error)?;
+        }
+        tx.execute_batch(SCHEMA).map_err(store_error)?;
+        tx.execute_batch(INDEX).map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
         Ok(Self { db })
     }
 
@@ -185,32 +229,93 @@ impl EphemeralJobs {
             |row| row.get(0)).optional().map_err(store_error)?;
         state.map(|state| match state.as_str() {
             "pending" => Ok(JobState::Pending), "released" => Ok(JobState::Released),
-            "dropped" => Ok(JobState::Dropped), _ => Err(VerificationError::Unavailable),
+            "started" => Ok(JobState::Started), "finished" => Ok(JobState::Finished),
+            "dropped" => Ok(JobState::Dropped),
+            _ => Err(VerificationError::Unavailable),
         }).transpose()
     }
 
-    /// H13b: the job `id` if it was released (the only state a child may run
-    /// from). A row whose stored job disagrees with its keys is `Revoked`.
-    pub fn released(&self, id: &str) -> Result<Option<EphemeralJob>, VerificationError> {
-        use rusqlite::OptionalExtension;
-        let row: Option<(String, String, String)> = self.db.query_row(
-            "SELECT employee,run,job FROM ephemeral_jobs WHERE id=?1 AND state='released'", [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional().map_err(store_error)?;
-        let Some((employee, run, encoded)) = row else { return Ok(None) };
-        let job: EphemeralJob = serde_json::from_str(&encoded).map_err(|_| VerificationError::Revoked)?;
-        if job.id != id || hex(&job.parent.employee.0) != employee || hex(&(job.parent.run.0).0) != run {
-            return Err(VerificationError::Revoked);
-        }
-        Ok(Some(job))
+    fn job_in(&self, id: &str, state: Option<&str>) -> Result<Option<EphemeralJob>, VerificationError> {
+        read_job(&self.db, id, state)
     }
 
-    /// Release (once) every pending job whose parent run no longer holds the
+    /// H13b: the job `id` if it was released and its self-delegation has not
+    /// been admitted yet.
+    pub fn released(&self, id: &str) -> Result<Option<EphemeralJob>, VerificationError> {
+        self.job_in(id, Some("released"))
+    }
+
+    /// H13c: the job `id` if the dispatcher gate admitted it (the only state a
+    /// child run is authorized from, `authorize_current`).
+    pub fn started(&self, id: &str) -> Result<Option<EphemeralJob>, VerificationError> {
+        self.job_in(id, Some("started"))
+    }
+
+    /// H13c: the job `id` in any state (its tool digest is bound into the
+    /// child's receipt material, `ephemeral_child::bind_job_tools`).
+    pub fn job(&self, id: &str) -> Result<Option<EphemeralJob>, VerificationError> {
+        self.job_in(id, None)
+    }
+
+    /// H13c: consume the dispatcher's self-delegation exception of job `id`:
+    /// `released → started`, once. `check` sees the released job first and
+    /// may refuse (nothing changes then). The transition itself is one
+    /// conditional UPDATE, so of two concurrent callers at most one gets the
+    /// job. `None`: the job is not (or no longer) released. H13d: a job with
+    /// `now >= expires_at` is dropped and never started.
+    pub fn begin_start(&self, id: &str, now: u64, check: impl FnOnce(&EphemeralJob) -> Result<(), VerificationError>)
+        -> Result<Option<EphemeralJob>, VerificationError> {
+        let Some(job) = self.released(id)? else { return Ok(None) };
+        if now >= job.expires_at {
+            self.drop_released(id)?;
+            return Ok(None);
+        }
+        check(&job)?;
+        let changed = self.db.execute("UPDATE ephemeral_jobs SET state='started' WHERE id=?1 AND state='released'", [id])
+            .map_err(store_error)?;
+        Ok((changed == 1).then_some(job))
+    }
+
+    /// A released job whose start failed (its queue row could not be
+    /// written): dropped, so it never holds its employee's slot (D8).
+    pub fn drop_released(&self, id: &str) -> Result<(), VerificationError> {
+        self.db.execute("UPDATE ephemeral_jobs SET state='dropped' WHERE id=?1 AND state='released'", [id])
+            .map(|_| ()).map_err(store_error)
+    }
+
+    /// H13d: the child's run ended: `started → finished` (terminal, idempotent;
+    /// any other state is untouched). A finished job authorizes no run and
+    /// no longer holds its employee's slot.
+    pub fn finish(&self, id: &str) -> Result<(), VerificationError> {
+        self.db.execute("UPDATE ephemeral_jobs SET state='finished' WHERE id=?1 AND state='started'", [id])
+            .map(|_| ()).map_err(store_error)
+    }
+
+    /// Release (once) pending jobs whose parent run no longer holds the
     /// capability and whose employee is still the same id and incarnation.
     /// Expired, corrupt or re-identified jobs are dropped; unreadable
     /// liveness/identity keeps a job pending.
+    ///
+    /// H13c (D8): at most ONE job per employee is released per call, and none
+    /// while another job of that employee is still `released` (enqueued, its
+    /// run not admitted yet) or `started` (admitted, its run not bound or not
+    /// ended yet; H13d: `finish` clears it when the run ends) and unexpired —
+    /// such a child counts as holding the employee's slot even before its run
+    /// is reserved/bound. spawnd's
+    /// admission coordinator remains the authoritative D8 enforcement: a
+    /// second run of the same employee waits behind the first
+    /// (`deferred_until_current_run_ends`), whatever the gateway releases.
     pub fn take_startable(&mut self, runs: &dyn ParentRuns, identity: &dyn ParentIdentity, now: u64)
         -> Result<Vec<EphemeralJob>, VerificationError> {
+        let now_db = i64::try_from(now).map_err(|_| VerificationError::InvalidTime)?;
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
+        let mut busy: std::collections::BTreeSet<String> = {
+            let mut statement = tx.prepare("SELECT DISTINCT employee FROM ephemeral_jobs
+                WHERE state IN ('released','started') AND expires_at > ?1").map_err(store_error)?;
+            let employees = statement.query_map([now_db], |row| row.get::<_, String>(0)).map_err(store_error)?
+                .collect::<Result<std::collections::BTreeSet<String>, _>>().map_err(store_error)?;
+            employees
+        };
         let mut statement = tx.prepare("SELECT id,employee,run,job FROM ephemeral_jobs WHERE state='pending'
             ORDER BY created_at, id LIMIT ?1").map_err(store_error)?;
         let rows: Vec<(String, String, String, String)> = statement
@@ -223,9 +328,12 @@ impl EphemeralJobs {
                 Err(_) => Some(JobState::Dropped),
                 Ok(job) if job.id != id || hex(&job.parent.employee.0) != employee
                     || hex(&(job.parent.run.0).0) != run || now >= job.expires_at => Some(JobState::Dropped),
+                // D8: one child of this employee is already on its way.
+                Ok(_) if busy.contains(&employee) => None,
                 Ok(job) => match runs.holds_capability(job.parent.employee, job.parent.run) {
                     Ok(false) => match identity.current(&job.parent.agent) {
                         Ok(current) if current == (job.parent.employee, job.parent.incarnation) => {
+                            busy.insert(employee.clone());
                             released.push(job);
                             Some(JobState::Released)
                         }
@@ -277,6 +385,9 @@ pub async fn queue_for_parent(home: &Path, sender: &str, context: &RequestContex
             if source.parent.as_ref().is_some_and(crate::isolation_background::is_ephemeral_child) {
                 return Err(VerificationError::Invalid);
             }
+            // H13c: a Personal parent only from a live run its owner started —
+            // never from a run that itself came from a background receipt.
+            crate::isolation_background::same_owner::ephemeral_parent_live(&source.binding, source.parent.as_ref())?;
             let Principal::Human { user_id, .. } = &record.principal else { return Err(VerificationError::Invalid); };
             let parent = ParentRun { agent: source.agent, employee: source.employee, incarnation: source.incarnation,
                 binding: source.binding, run: source.run, lane: source.lane, requester: user_id.as_str().to_owned(),

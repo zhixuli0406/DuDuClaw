@@ -13,7 +13,15 @@
 //! after its TTL rather than starting on a guess. A known exited run still
 //! counts as holding while ANOTHER run of the same employee is bound (D8:
 //! one capability-holding run per employee; a released child waits for it).
-use std::{collections::{BTreeMap, VecDeque}, sync::Mutex};
+//!
+//! H13c: the ledger only sees runs from `bind_run` on, so a run that A has
+//! reserved but D has not bound yet is invisible here. The job store covers
+//! the child's own window (a `released`, not yet admitted job holds its
+//! employee; one release per employee per tick: `take_startable`), and
+//! spawnd's admission coordinator is the authoritative per-employee slot: a
+//! second run of the same employee is queued behind the first
+//! (`deferred_until_current_run_ends`) whatever the gateway releases.
+use std::{collections::{BTreeMap, VecDeque}, path::PathBuf, sync::Mutex};
 use duduclaw_isolation::{execution::RunHandle, ids::{EmployeeId, RunId}};
 use duduclaw_mcp_boundary::VerificationError;
 use crate::isolation_ephemeral::ParentRuns;
@@ -27,10 +35,20 @@ pub const MAX_EXITED: usize = 4096;
 pub struct RunLedger {
     live: BTreeMap<RunId, EmployeeId>,
     exited: VecDeque<(RunId, EmployeeId)>,
+    /// H13d: bound runs that are ephemeral children: run → (home, job id).
+    children: BTreeMap<RunId, (PathBuf, String)>,
 }
 
 impl RunLedger {
-    pub const fn new() -> Self { Self { live: BTreeMap::new(), exited: VecDeque::new() } }
+    pub const fn new() -> Self { Self { live: BTreeMap::new(), exited: VecDeque::new(), children: BTreeMap::new() } }
+
+    /// The bound `run` is the child of job `job` (store under `home`).
+    pub fn child_bound(&mut self, run: RunHandle, home: PathBuf, job: String) {
+        self.children.insert(run.0, (home, job));
+    }
+
+    /// The (home, job) of a child run, once: forgotten when taken.
+    pub fn take_child(&mut self, run: RunHandle) -> Option<(PathBuf, String)> { self.children.remove(&run.0) }
 
     /// The run now holds `employee`'s capability.
     pub fn bound(&mut self, run: RunHandle, employee: EmployeeId) {
@@ -79,7 +97,25 @@ pub(crate) fn record_bound(run: RunHandle, employee: EmployeeId) {
 /// Called by the product authority whenever it revokes `run`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn record_exited(run: RunHandle) {
-    LEDGER.lock().unwrap_or_else(|error| error.into_inner()).exited(run);
+    let child = {
+        let mut ledger = LEDGER.lock().unwrap_or_else(|error| error.into_inner());
+        ledger.exited(run);
+        ledger.take_child(run)
+    };
+    // H13d: the child's run ended: its job is terminal (best effort; a job
+    // that cannot be marked stops holding its slot at its TTL).
+    if let Some((home, job)) = child {
+        if crate::isolation_ephemeral::EphemeralJobs::open(&home).and_then(|jobs| jobs.finish(&job)).is_err() {
+            tracing::warn!(job = job.as_str(), "ephemeral job: finish not recorded; it expires with its TTL");
+        }
+    }
+}
+
+/// Called by the product authority after it bound `run` of an ephemeral
+/// child of job `job` (H13d).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn record_child_bound(run: RunHandle, home: PathBuf, job: String) {
+    LEDGER.lock().unwrap_or_else(|error| error.into_inner()).child_bound(run, home, job);
 }
 
 /// The production [`ParentRuns`] over this epoch's ledger. A poisoned ledger

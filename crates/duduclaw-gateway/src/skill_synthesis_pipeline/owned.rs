@@ -75,6 +75,23 @@ mod tests {
         assert!(!home.path().join("agents").exists() && !home.path().join("skills").exists());
     }
 
+    #[tokio::test]
+    async fn h13c_owned_run_refused_without_call_authority() {
+        use super::super::pipeline::{run, PipelineConfig};
+        let home = tempfile::tempdir().unwrap();
+        // Its own employee, but no isolated call authority scoped around it
+        // (the handler must keep the AuthorizedToolCall and scope its context).
+        let config = PipelineConfig { home_dir: home.path().to_path_buf(), events_dir: home.path().join("events"),
+            target_agent_id: "main".into(), owned_by: Some("main".into()), dry_run: false,
+            api_key: Some("must-not-be-used".into()), ..Default::default() };
+        assert!(!duduclaw_mcp_boundary::io_authority::is_scoped());
+        let result = run(&config).await;
+        assert!(result.errors.iter().any(|error| error.contains("authority")), "{:?}", result.errors);
+        assert_eq!((result.skills_graduated, result.total_events_parsed), (0, 0));
+        assert!(!home.path().join("agents").exists() && !home.path().join("skills").exists());
+        assert!(!home.path().join("skill-proposals").exists());
+    }
+
     #[test]
     fn h12c_owned_publication_refuses_bad_subject_before_any_write() {
         let home = tempfile::tempdir().unwrap();

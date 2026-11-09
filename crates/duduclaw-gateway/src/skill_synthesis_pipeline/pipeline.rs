@@ -211,7 +211,13 @@ async fn run_scoped(config: &PipelineConfig) -> PipelineRun {
 
     // ── Phase 0: Config validation ──────────────────────────────────────────
 
-    if let Err(e) = config.validate() {
+    // H13c: an owned run publishes only under the isolated call's own live
+    // authority (`io_authority::scope(call.context())` by its handler), never
+    // with none at all.
+    let unscoped_owned = config.owned_by.is_some() && !duduclaw_mcp_boundary::io_authority::is_scoped();
+    if let Err(e) = config.validate().and_then(|()| if unscoped_owned {
+        Err("owned synthesis has no isolated call authority".to_string())
+    } else { Ok(()) }) {
         errors.push(format!("Config validation failed: {e}"));
         return PipelineRun {
             started_at,
@@ -676,6 +682,8 @@ async fn graduate_trajectories(
         let publication = tokio::task::spawn_blocking(move || {
             let _leases = (_publication, caller_publication);
             if let Some(owner) = publish_owner {
+                // H13c: refuse rather than publish without the call's authority.
+                if !authority.is_scoped() { return Err("owned synthesis has no isolated call authority".to_string()); }
                 return authority.run(|| super::owned::publish(&publish_home, &owner, &candidate.skill_name,
                     &markdown, &proposal_key));
             }

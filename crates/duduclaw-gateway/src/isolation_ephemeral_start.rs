@@ -10,7 +10,9 @@
 //!   "self-delegation is refused under every policy": the queue row must name
 //!   a job of `isolation-ephemeral-jobs.db` that was released, belongs to this
 //!   employee label, works for the job's requester, and whose employee id +
-//!   incarnation equal the live lifecycle's.
+//!   incarnation equal the live lifecycle's. H13c: passing it moves the job
+//!   to `started` — the exception holds once per job (a retried or duplicated
+//!   queue row is refused), and only a started job authorizes the child run.
 //!
 //! Nothing here creates the job store: without it there is nothing to start
 //! and no exception.
@@ -35,18 +37,22 @@ pub fn release_children(jobs: &mut EphemeralJobs, runs: &dyn ParentRuns, identit
 
 /// The exception itself (store and identity injected). `Ok` only for the
 /// released job named by `message_id`, of employee label `agent`, for its
-/// own requester, still the same employee id and incarnation.
-pub fn self_delegation_check(jobs: &EphemeralJobs, identity: &dyn ParentIdentity, message_id: &str, agent: &str,
-    on_behalf_of: Option<&str>) -> Result<(), VerificationError> {
+/// own requester, still the same employee id and incarnation. H13c: a pass
+/// consumes the exception (`released → started`), so it holds once per job;
+/// a refused check changes nothing. H13d: an expired job (`now >=
+/// expires_at`) is dropped, never started.
+pub fn self_delegation_check_at(jobs: &EphemeralJobs, identity: &dyn ParentIdentity, message_id: &str, agent: &str,
+    on_behalf_of: Option<&str>, now: u64) -> Result<(), VerificationError> {
     let id = ephemeral_child::job_id_of(message_id).ok_or(VerificationError::Invalid)?;
-    let job = jobs.released(id)?.ok_or(VerificationError::Revoked)?;
-    if job.parent.agent != agent || on_behalf_of != Some(ephemeral_child::owner_principal(&job)?.as_str()) {
-        return Err(VerificationError::BindingMismatch);
-    }
-    if identity.current(agent)? != (job.parent.employee, job.parent.incarnation) {
-        return Err(VerificationError::Revoked);
-    }
-    Ok(())
+    jobs.begin_start(id, now, |job| {
+        if job.parent.agent != agent || on_behalf_of != Some(ephemeral_child::owner_principal(job)?.as_str()) {
+            return Err(VerificationError::BindingMismatch);
+        }
+        if identity.current(agent)? != (job.parent.employee, job.parent.incarnation) {
+            return Err(VerificationError::Revoked);
+        }
+        Ok(())
+    })?.map(|_| ()).ok_or(VerificationError::Revoked)
 }
 
 /// Dispatcher gate entry: `sender == target == agent` was already compared by
@@ -62,7 +68,8 @@ pub(crate) async fn self_delegation_allowed(home: &Path, message_id: &str, agent
     duduclaw_mcp_boundary::authority::verify_blocking(move || {
         if !home.join(JOBS_DB).exists() { return Err(VerificationError::Unavailable); }
         let jobs = EphemeralJobs::open(&home)?;
-        self_delegation_check(&jobs, &LiveLifecycle { home: &home }, &message_id, &agent, on_behalf_of.as_deref())
+        self_delegation_check_at(&jobs, &LiveLifecycle { home: &home }, &message_id, &agent, on_behalf_of.as_deref(),
+            duduclaw_mcp_boundary::authority::now_seconds()?)
     }).await.is_ok()
 }
 
@@ -105,6 +112,13 @@ pub(crate) async fn start_released(home: &Path, queue: &MessageQueue) {
             Err(error) => {
                 tracing::warn!(agent = job.parent.agent.as_str(), job = job.id.as_str(), ?error, "ephemeral child not started");
                 audit(home, START_FAILED_EVENT, &job, "enqueue");
+                // H13c (D8): a child that never got a queue row must not keep
+                // its employee's slot; it is dropped (release is one-shot).
+                let (blocking_home, id) = (home.to_owned(), job.id.clone());
+                if duduclaw_mcp_boundary::authority::verify_blocking(move ||
+                    EphemeralJobs::open(&blocking_home)?.drop_released(&id)).await.is_err() {
+                    tracing::warn!(job = job.id.as_str(), "ephemeral job: failed start not recorded; it expires with its TTL");
+                }
             }
         }
     }

@@ -48,6 +48,75 @@ fn h12b_archive_url_is_host_selected_for_reviewed_hubs_only() {
 }
 
 #[test]
+fn h13c_detail_url_same_origin_as_archive() {
+    assert_eq!(detail_url("clawhub", "notes").as_deref(), Some("https://clawhub.ai/api/v1/skills/notes"));
+    for (hub, name) in [("clawhub", "notes"), ("clawhub", "../x"), ("clawhub", "a&owner=evil"), ("github", "notes"), ("", "notes")] {
+        assert_eq!(detail_url(hub, name).is_some(), archive_url(hub, name).is_some(), "{hub} {name}");
+        if let (Some(detail), Some(archive)) = (detail_url(hub, name), archive_url(hub, name)) {
+            let origin = |url: &str| reqwest::Url::parse(url).unwrap().origin();
+            assert_eq!(origin(&detail), origin(&archive));
+        }
+    }
+}
+
+/// Captured-shape ClawHub `/api/v1/skills/<slug>` responses.
+fn detail(skill: Value, moderation: Option<Value>) -> Vec<u8> {
+    let mut body = json!({"skill": skill});
+    if let Some(moderation) = moderation { body["moderation"] = moderation; }
+    serde_json::to_vec(&body).unwrap()
+}
+
+#[test]
+fn h13c_hub_source_verdict_from_fixture_responses() {
+    let clean = detail(json!({"slug":"notes","displayName":"Notes","isSuspicious":false,"description":"---\nname: notes\n---\n"}),
+        Some(json!({"status":"clean"})));
+    assert_eq!(source_verdict(Ok(clean.as_slice()), "notes"), Ok(Some("clean".into())));
+    // No moderation data: advisory (None), like the unprotected path.
+    assert_eq!(source_verdict(Ok(detail(json!({"slug":"notes"}), None).as_slice()), "notes"), Ok(None));
+    assert_eq!(source_verdict(Ok(detail(json!({"slug":"notes"}), Some(json!({"verdict":"pending-review"}))).as_slice()),
+        "notes"), Ok(Some("unknown".into())));
+    // The hub's own suspicious / moderation flags refuse (layer 1, fail closed).
+    for blocked in [detail(json!({"slug":"notes","isSuspicious":true}), Some(json!({"status":"clean"}))),
+        detail(json!({"slug":"notes","isSuspicious":"yes"}), None),
+        detail(json!({"slug":"notes"}), Some(json!({"status":"flagged"}))),
+        detail(json!({"slug":"notes"}), Some(json!({"verdict":"malicious"}))),
+        detail(json!({"slug":"notes","isSuspicious":false}), Some(json!({"status":"blocked"})))] {
+        let error = source_verdict(Ok(blocked.as_slice()), "notes").unwrap_err();
+        assert!(error.contains("可疑或惡意"), "{error}");
+    }
+    // Ambiguous slug (409 AMBIGUOUS_SKILL_SLUG): refused, never resolved.
+    assert!(source_verdict(Err(409), "notes").unwrap_err().contains("多位發布者"));
+    // Not found, other statuses, no reply: refused.
+    for status in [404, 403, 500, 0] { assert!(source_verdict(Err(status), "notes").is_err(), "{status}"); }
+    // Unreadable, unexpected or foreign bodies: refused.
+    let oversized = vec![b' '; MAX_DETAIL_BYTES + 1];
+    for body in [b"not json".to_vec(), b"{}".to_vec(), serde_json::to_vec(&json!({"skill":"notes"})).unwrap(),
+        detail(json!({"slug":"other"}), Some(json!({"status":"clean"}))), detail(json!({"slug":7}), None), oversized] {
+        assert!(source_verdict(Ok(body.as_slice()), "notes").is_err());
+    }
+}
+
+#[test]
+fn h13c_owned_scan_refuses_high_and_critical() {
+    assert_eq!(scan_admits(true, "Low"), Ok(()));
+    assert_eq!(scan_admits(true, "Medium"), Ok(()));
+    for (passed, risk) in [(true, "High"), (true, "Critical"), (false, "Low")] {
+        assert!(scan_admits(passed, risk).is_err(), "{passed} {risk}");
+    }
+}
+
+#[tokio::test]
+async fn h13c_install_refuses_blocking_source_verdict() {
+    let home = tempfile::tempdir().unwrap();
+    let gated = GatedManifest { hub: "clawhub".into(), skill_name: "notes".into(), manifest_name: "notes".into(),
+        content: "---\nname: notes\n---\nx".into(), publisher: None, signature: None,
+        signature_status: duduclaw_core::publishers::SignatureStatus::unsigned(None), risk_level: "Low".into(),
+        findings: 0, trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: Some("suspicious".into()) };
+    assert!(install_owned(home.path(), &call(&["*"]), "main", &gated).await.is_err());
+    assert!(!home.path().join("agents").exists(), "nothing written");
+}
+
+#[test]
 fn h12b_archive_hostile_entries_refused_on_host() {
     let skill = b"---\nname: notes\n---\n# Notes";
     let len = skill.len() as u64;

@@ -506,6 +506,12 @@ impl GatewayAuthority {
         if runs.len() >= MAX_ASSOCIATIONS || runs.contains_key(&run.0) { return Err(VerificationError::Unavailable); }
         // H13b: the ephemeral-job start reads this as "the parent holds its capability".
         crate::isolation_ephemeral_runs::record_bound(run, prepared.employee);
+        // H13d: an ephemeral child's run ends its job (`revoke_run`).
+        if let Some(receipt) = prepared.turn.as_ref().and_then(|turn| turn.background.as_ref()) {
+            if let Some(job) = crate::isolation_background::ephemeral_child::ephemeral_job_of(receipt) {
+                crate::isolation_ephemeral_runs::record_child_bound(run, receipt.home().to_path_buf(), job.to_owned());
+            }
+        }
         runs.insert(run.0, prepared);
         Ok(())
     }

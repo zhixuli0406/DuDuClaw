@@ -524,6 +524,8 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
         .map_err(|error| lifecycle::recheck_with(&home, lifecycle, root).err().map_or(error, lifecycle_refusal));
     let selection = select()?;
     let signed_tools = selection.signed_tools(&tools)?; // Workspace signs File (+ HX5 helpers), never pending A/E
+    // H13c: a background run of a Personal employee never lists spawn tools.
+    let signed_tools = crate::isolation_background::same_owner::record_run_tools(&lifecycle.binding, record, signed_tools)?;
     let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
     let namespace = format!("agent:{agent}");
     let confined = |resource| ResourceGrant::Confined { resource: Box::new(resource) };

@@ -5,6 +5,11 @@
 //!   permitted by the call's signed `PublicOrigins` grant (D-H2).
 //! - The host fetch is the protected public path (`web_fetch_public_bytes`:
 //!   DNS pinned, public addresses only, no redirects, no proxy, 5 MiB).
+//! - H13c, layer 1 before any download: the hub's detail JSON
+//!   ([`detail_url`], same origin and grant) must name exactly this slug, not
+//!   be ambiguous (409: several owners) and carry no suspicious / malicious
+//!   moderation verdict ([`source_verdict`]); the verdict is kept in the
+//!   approved manifest. E's scan refuses High / Critical risk ([`scan_admits`]).
 //! - Archive extraction happens only in the disposable parse worker
 //!   (`archive_adapter::extract_pack`: traversal, absolute, symlink and
 //!   special entries, case collisions, compression ratio and size refuse).
@@ -104,13 +109,82 @@ fn live(call: &AuthorizedToolCall) -> Result<(), String> {
         .map_err(|_| "這次執行的授權已失效，已停止安裝。".to_string())
 }
 
+/// H13c: E's verdict on the exact bytes, refused like the owned synthesis
+/// path (`skill_synthesis_pipeline::owned::publish`): not passed, or a High /
+/// Critical risk, never installs.
+pub fn scan_admits(passed: bool, risk: &str) -> Result<(), String> {
+    if !passed || matches!(risk, "High" | "Critical") { return Err("技能未通過隔離安全檢查。".into()); }
+    Ok(())
+}
+
 async fn inspect(content: &str, name: &str) -> Result<(String, usize), String> {
     let (bytes, slug) = (content.as_bytes().to_vec(), name.to_owned());
     let (passed, risk, findings) = tokio::task::spawn_blocking(move ||
         duduclaw_parse_worker::adapters::inspect_skill_manifest(&bytes, &slug)).await
         .map_err(|_| "隔離技能檢查失敗。".to_string())?.map_err(|_| "隔離技能檢查失敗。".to_string())?;
-    if !passed { return Err("技能未通過隔離安全檢查。".into()); }
+    scan_admits(passed, &risk)?;
     Ok((risk, findings))
+}
+
+/// Largest hub detail response the protected path reads (it carries the
+/// skill text; the protected fetch itself caps at 5 MiB).
+pub const MAX_DETAIL_BYTES: usize = 1024 * 1024;
+
+/// H13c: the hub's detail (moderation) endpoint of `name`, on the same
+/// host-selected origin as [`archive_url`]; `None` exactly when that is `None`.
+pub fn detail_url(hub: &str, name: &str) -> Option<String> {
+    if !slug(name) { return None; }
+    match hub {
+        duduclaw_agent::skill_hub::HUB_CLAWHUB => Some(format!("https://clawhub.ai/api/v1/skills/{name}")),
+        _ => None,
+    }
+}
+
+/// H13c: the layer-1 source verdict from the hub detail response, with the
+/// unprotected path's rules (`skill_hub::ClawHubHub::fetch_manifest`,
+/// `hub_install::gate_hub_manifest`). `response` is the body of a 2xx reply
+/// or the HTTP status of any other (0: no reply). Fail closed: an ambiguous
+/// slug (409, several owners), a missing skill, an unreadable or unexpected
+/// body, a detail for another slug, or a suspicious / malicious verdict
+/// refuses. Returns the normalized verdict (`clean`, `unknown` or `None`).
+pub fn source_verdict(response: Result<&[u8], u16>, name: &str) -> Result<Option<String>, String> {
+    let body = match response {
+        Ok(body) => body,
+        Err(409) => return Err("技能來源有多位發布者使用這個技能名稱，隔離安裝無法確認來源，已拒絕安裝。".into()),
+        Err(404) => return Err("技能來源找不到這個技能。".into()),
+        Err(_) => return Err("無法取得技能來源的審核資訊，已拒絕安裝。".into()),
+    };
+    let unreadable = || "技能來源的審核資訊無法辨識，已拒絕安裝。".to_string();
+    if body.len() > MAX_DETAIL_BYTES { return Err(unreadable()); }
+    let body: serde_json::Value = serde_json::from_slice(body).map_err(|_| unreadable())?;
+    let skill = body.get("skill").filter(|skill| skill.is_object()).ok_or_else(unreadable)?;
+    if skill.get("slug").is_some_and(|slug| slug.as_str() != Some(name)) { return Err(unreadable()); }
+    // Detail-level verdict: the isSuspicious flag (anything but an explicit
+    // `false` counts as suspicious), else the moderation status / verdict.
+    let raw = match skill.get("isSuspicious") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => body["moderation"]["status"]
+            .as_str().or_else(|| body["moderation"]["verdict"].as_str()).map(str::to_owned),
+        Some(_) => Some("suspicious".to_owned()),
+    };
+    let verdict = duduclaw_agent::skill_hub::normalize_verdict(raw.as_deref());
+    if duduclaw_agent::skill_hub::verdict_is_blocking(verdict.as_deref()) {
+        return Err("技能來源將這個技能標記為可疑或惡意，已拒絕安裝。".into());
+    }
+    Ok(verdict)
+}
+
+/// One protected public fetch of a host-selected `url` under the call's
+/// `PublicOrigins` grant (DNS pinned, public addresses only, no redirects).
+async fn fetch_public(call: &AuthorizedToolCall, grant: &ResourceGrant, url: &str) -> Result<Result<Vec<u8>, u16>, String> {
+    duduclaw_mcp_boundary::resources::permitted_public_origin(grant, url)
+        .map_err(|_| "受保護的公開網路授權不包含這個技能來源。".to_string())?;
+    if !crate::web_fetch::admit_protected_tool_fetch() { return Err("技能來源請求過於頻繁。".into()); }
+    live(call)?;
+    Ok(match crate::web_fetch::web_fetch_public_bytes(url).await {
+        Ok((_, bytes)) => Ok(bytes),
+        Err(crate::web_fetch::FetchError::HttpError(status, _)) => Err(status),
+        Err(_) => Err(0),
+    })
 }
 
 /// Phase 1 (no writes): fetch the hub archive on the host, expand it in E,
@@ -120,15 +194,16 @@ pub async fn fetch_owned(home: &Path, call: &AuthorizedToolCall, agent: &str) ->
     if !duduclaw_agent::skill_hub::HubRegistry::from_home(home).ids().contains(&hub) {
         return Err("未設定的技能來源，已拒絕安裝。".into());
     }
-    let url = archive_url(hub, name).ok_or_else(|| "隔離安裝不支援這個技能來源的封存檔。".to_string())?;
+    let unsupported = || "隔離安裝不支援這個技能來源的封存檔。".to_string();
+    let (url, detail) = (archive_url(hub, name).ok_or_else(unsupported)?, detail_url(hub, name).ok_or_else(unsupported)?);
     let grant = call.resources().iter().find(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. }))
         .ok_or_else(|| "這次執行沒有受保護的公開網路授權。".to_string())?;
-    duduclaw_mcp_boundary::resources::permitted_public_origin(grant, &url)
-        .map_err(|_| "受保護的公開網路授權不包含這個技能來源。".to_string())?;
-    if !crate::web_fetch::admit_protected_tool_fetch() { return Err("技能來源請求過於頻繁。".into()); }
-    live(call)?;
-    let (_, archive) = crate::web_fetch::web_fetch_public_bytes(&url).await
-        .map_err(|_| "無法取得技能封存檔。".to_string())?;
+    // H13c: layer 1 first — the hub's own moderation verdict and the
+    // ambiguous-slug refusal, from the same host-selected origin and grant,
+    // before any archive is downloaded.
+    let response = fetch_public(call, grant, &detail).await?;
+    let verdict = source_verdict(response.as_deref().map_err(|status| *status), name)?;
+    let archive = fetch_public(call, grant, &url).await?.map_err(|_| "無法取得技能封存檔。".to_string())?;
     if archive.is_empty() || archive.len() > MAX_ARCHIVE_BYTES { return Err("技能封存檔超過隔離安裝上限。".into()); }
     let pack = tokio::task::spawn_blocking(move ||
         duduclaw_parse_worker::archive_adapter::extract_pack(&mut std::io::Cursor::new(archive))).await
@@ -141,7 +216,7 @@ pub async fn fetch_owned(home: &Path, call: &AuthorizedToolCall, agent: &str) ->
     duduclaw_agent::skill_hub::check_signature_history(home, hub, name, &signature_status)?;
     Ok(GatedManifest { hub: hub.into(), skill_name: name.into(), manifest_name: name.into(), content,
         publisher: None, signature: None, signature_status, risk_level, findings,
-        trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: None })
+        trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: verdict })
 }
 
 /// Phase 2 (after the existing caller approval): rescan the exact approved
@@ -151,7 +226,8 @@ pub async fn install_owned(home: &Path, call: &AuthorizedToolCall, agent: &str, 
     -> Result<HubInstallReport, String> {
     let (hub, name) = subject(call, agent)?;
     if gated.hub != hub || gated.skill_name != name || gated.manifest_name != name
-        || gated.publisher.is_some() || gated.signature.is_some() {
+        || gated.publisher.is_some() || gated.signature.is_some()
+        || duduclaw_agent::skill_hub::verdict_is_blocking(gated.source_verdict.as_deref()) {
         return Err("隔離技能來源不受支援。".into());
     }
     let (risk_level, findings) = inspect(&gated.content, name).await?;

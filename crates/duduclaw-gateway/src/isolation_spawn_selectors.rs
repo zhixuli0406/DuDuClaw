@@ -23,6 +23,14 @@
 //! - `spawn_ephemeral`: the tool intersection must be non-empty and the
 //!   Personal-parent owner rule hold (`spawn_selector`).
 //!
+//! H13c: the record principal of a run started from a background receipt is
+//! also the receipt owner's `Human`, so the record cannot tell a live owner
+//! session from a delegated background run or an ephemeral child. The issuer
+//! therefore never lists either spawn tool in a record-backed run of a
+//! Personal employee (`same_owner::record_run_tools`: not discovered, not
+//! eligible), and the queue captures refuse such a source for a Personal
+//! target (`same_owner::personal_target_from_run`, `ephemeral_parent_live`).
+//!
 //! The confirmed-row read is a refusal source only; the authority for the
 //! queued delegation remains the full lifecycle read of `record_bus_delegation`.
 use duduclaw_isolation::capability::{EmployeeBinding, ResourceGrant};

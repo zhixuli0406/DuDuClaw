@@ -11,7 +11,13 @@
 //! - the target's lifecycle binding is `Personal(owner)` and the source's
 //!   lifecycle binding is the very same `Personal(owner)` (exact equality);
 //! - the receipt owner (the parent run's verified human principal) is
-//!   exactly `user:<owner>`.
+//!   exactly `user:<owner>`;
+//! - H13c: the source run is the owner's LIVE interactive run, not itself a
+//!   run started from a background receipt (`DelegationSource.parent` is
+//!   `None`): a delegated background run or an ephemeral child never fans
+//!   out to the owner's Personal employees ([`personal_target_from_run`],
+//!   [`ephemeral_parent_live`]), and its tool snapshot never lists the spawn
+//!   tools ([`record_run_tools`]).
 //!
 //! The target may be the source itself: that is a protected `spawn_ephemeral`
 //! child (decision A, `ephemeral_child`). A Personal source delegating to a
@@ -35,6 +41,50 @@ pub(crate) fn personal_target_allowed(source: &EmployeeBinding, target: &Employe
                 && principal_user == target_owner.as_str() => Ok(()),
         _ => Err(VerificationError::BindingMismatch),
     }
+}
+
+/// H13c (owner decision 2026-11-09, "no card: the owner started the source
+/// run"): "the owner started this run" means a LIVE interactive run of the
+/// owner. A run started from a background receipt — a same-owner delegated
+/// background run, or an ephemeral child — is also issued for
+/// `Principal::Human { receipt owner }`, but no owner is present; its
+/// `DelegationSource.parent` is that receipt. So a Personal target (the
+/// same-owner exception, which files no card) additionally requires the
+/// source run to have no parent receipt. A Shared target is unchanged.
+pub(crate) fn personal_target_from_run(source: &EmployeeBinding, target: &EmployeeBinding, principal_user: &str,
+    source_parent: Option<&RecordAuthority>) -> Result<(), VerificationError> {
+    personal_target_allowed(source, target, principal_user)?;
+    if matches!(target, EmployeeBinding::Personal(_)) && source_parent.is_some() {
+        return Err(VerificationError::BindingMismatch);
+    }
+    Ok(())
+}
+
+/// H13c: a Personal parent files a `spawn_ephemeral` child only from a live
+/// run its owner started (no parent receipt). A Shared parent is unchanged.
+pub(crate) fn ephemeral_parent_live(binding: &EmployeeBinding, source_parent: Option<&RecordAuthority>)
+    -> Result<(), VerificationError> {
+    match binding {
+        EmployeeBinding::Personal(_) if source_parent.is_some() => Err(VerificationError::BindingMismatch),
+        _ => Ok(()),
+    }
+}
+
+/// The tools a spawn creates host-queue work with: never offered to a
+/// record-backed (background) run of a Personal employee (H13c mirror of
+/// [`personal_target_from_run`] / [`ephemeral_parent_live`]).
+pub(crate) const SPAWN_TOOLS: [&str; 2] = duduclaw_mcp_boundary::tool_policy::spawn::SPAWN_TOOLS;
+
+/// H13c: the issuer's tool snapshot of a run. A record-backed run of a
+/// Personal employee never lists [`SPAWN_TOOLS`] (so they are neither
+/// discovered nor eligible); every other run keeps its snapshot unchanged.
+pub(crate) fn record_run_tools(binding: &EmployeeBinding, record_backed: bool,
+    tools: duduclaw_isolation::bounded::List<duduclaw_isolation::bounded::Text<128>, 256>)
+    -> Result<duduclaw_isolation::bounded::List<duduclaw_isolation::bounded::Text<128>, 256>, VerificationError> {
+    if !record_backed || !matches!(binding, EmployeeBinding::Personal(_)) { return Ok(tools); }
+    duduclaw_isolation::bounded::List::new(tools.as_slice().iter()
+        .filter(|tool| !SPAWN_TOOLS.contains(&tool.as_str())).cloned().collect())
+        .map_err(|_| VerificationError::Invalid)
 }
 
 /// The users.db facts a background receipt's binding needs, on one fresh
