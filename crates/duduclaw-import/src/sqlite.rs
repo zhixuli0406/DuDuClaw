@@ -76,6 +76,12 @@ pub(crate) fn harden(conn: &mut Connection) -> Result<()> {
             // SQLite quick_check invokes FTS5's built-in integrity path, which
             // counts its fixed shadow rows. No application query gets this grant.
             AuthAction::Function { function_name: "count" } => Authorization::Allow,
+            // SQLite 3.54 also authorizes functions in schema DEFAULT expressions
+            // (legacy `DEFAULT (datetime('now'))`). Only the deterministic-by-input
+            // built-in date/time functions are granted; nothing else.
+            AuthAction::Function { function_name }
+                if ["date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"]
+                    .iter().any(|allowed| function_name.eq_ignore_ascii_case(allowed)) => Authorization::Allow,
             _ => Authorization::Deny,
         }
     }))?;
