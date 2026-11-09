@@ -123,12 +123,20 @@ pub(crate) fn ensure_tombstone_finished(home: &Path, q: &Quarantined) -> Result<
 /// Q3 (F6fa): each compared snapshot field and the `credential_changes`
 /// fields whose (owner-stamped) rows may explain a difference in it. The
 /// password has no snapshot field: any password row not by the owner refuses
-/// through the log; `credential_epoch` moves with every credential write.
+/// through the log (the log is written by triggers on every writer).
 /// `google_sub` is not logged in users.db, so any change refuses.
-pub(crate) const SNAPSHOT_LOG_FIELDS: [(&str, &[&str]); 3] = [
+///
+/// **Owner decision 2026-11-09 (F6fa2, decision 1):** `credential_epoch` is
+/// **not** compared. It also moves on a session revocation ("log out all
+/// devices", by the owner or an Admin, `remember_revoke` /
+/// `remember_admin_revoke_all`), which changes no password, email or factor
+/// and writes no `credential_changes` row; such a revocation never blocks a
+/// restore. Only password, email and factor (TOTP / passkey / email-factor)
+/// changes by someone other than the owner refuse. The snapshot still records
+/// the epoch (informational only).
+pub(crate) const SNAPSHOT_LOG_FIELDS: [(&str, &[&str]); 2] = [
     ("email", &["email"]),
     ("factors_digest", &["totp", "passkey", "email_factor"]),
-    ("credential_epoch", &["password", "email", "totp", "passkey", "email_factor"]),
 ];
 
 /// Q3: the owner's identity facts compared with the tombstone snapshot, on
@@ -138,8 +146,9 @@ pub(crate) const SNAPSHOT_LOG_FIELDS: [(&str, &[&str]); 3] = [
 /// clock). Any such row not by the owner (owner-authenticated) refuses; each
 /// differing snapshot field needs at least one owner row of a field that can
 /// change it ([`SNAPSHOT_LOG_FIELDS`]); a changed Google `sub` refuses. A
-/// snapshot without `credential_seq` (tombstoned before F6fa) refuses
-/// `SNAPSHOT_INCOMPLETE` (no wall-clock fallback).
+/// changed `credential_epoch` alone (a session revocation) is ignored
+/// (F6fa2). A snapshot without `credential_seq` (tombstoned before F6fa)
+/// refuses `SNAPSHOT_INCOMPLETE` (no wall-clock fallback).
 pub(crate) fn check_credentials(home: &Path, users: &Connection, q: &Quarantined, owner: &str) -> Result<(), Refusal> {
     let since = q.principal_snapshot["credential_seq"].as_i64().filter(|seq| *seq >= 0).ok_or(Refusal::SnapshotIncomplete)?;
     let changes = duduclaw_auth::credential_changes::changes_after(users, owner, since, MAX_CREDENTIAL_CHANGES)
@@ -153,6 +162,47 @@ pub(crate) fn check_credentials(home: &Path, users: &Connection, q: &Quarantined
         if !changes.iter().any(|change| logged.contains(&change.field.as_str())) { return Err(Refusal::CredentialChanged); }
     }
     Ok(())
+}
+
+/// Owner decision 2026-11-09 (F6fa2, decision 2): may `admin` file a
+/// Personal request (restore or adoption) for the owner of `q`?
+/// - the filing Admin presented a fresh step-up in this call (else
+///   `STEP_UP_REQUIRED`) and is not the owner (`FILER_IS_OWNER`);
+/// - the tombstone snapshot records the owner's factor baseline (else
+///   `SNAPSHOT_INCOMPLETE`: nothing proves the owner had no factor) and it
+///   shows **no** second factor then (else `OWNER_HAD_SECOND_FACTOR`: owners
+///   who had one keep the `FACTOR_*` path only, never this as a fallback);
+/// - in one users.db read transaction, `filing` (the F6c2 rule's
+///   `check_admin_filing`): the filer is an eligible Admin now and another
+///   qualifying Admin — neither filer nor owner — exists to approve it
+///   (`FILER_NOT_ELIGIBLE` / `NO_SECOND_ADMIN`).
+///
+/// Every other check (owner eligibility, Q3 credential changes, 90 days, …)
+/// is the owner-filed request's, unchanged.
+pub(crate) fn check_admin_filing(home: &Path, q: &Quarantined, admin: &str, fresh_step_up: bool,
+    filing: &dyn Fn(&Connection, &str, &str) -> Result<(), &'static str>) -> Result<(), Refusal> {
+    let owner = match (&q.kind, &q.owner) {
+        (EmployeeKind::Personal, Some(owner)) => owner.as_str(),
+        _ => return Err(Refusal::NotFound),
+    };
+    if !fresh_step_up { return Err(Refusal::Approval("STEP_UP_REQUIRED")); }
+    if admin.is_empty() || admin == owner { return Err(Refusal::FilerIsOwner); }
+    let baseline = duduclaw_auth::mfa::owner_factor::FactorBaseline::from_snapshot(&q.principal_snapshot)
+        .ok_or(Refusal::SnapshotIncomplete)?;
+    if baseline.strongest.is_some() { return Err(Refusal::OwnerHadSecondFactor); }
+    let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadOnly).map_err(from_lifecycle)?;
+    let tx = users.transaction().map_err(unavailable)?;
+    let read: &Connection = &tx;
+    filing(read, admin, owner).map_err(Refusal::Approval)?;
+    tx.finish().map_err(unavailable)
+}
+
+/// Whether the tombstone snapshot of a Personal row allows an Admin to file
+/// for its owner (no second factor recorded then), for the listing views.
+pub(crate) fn admin_may_file_for_owner(q: &Quarantined) -> bool {
+    q.kind == EmployeeKind::Personal && q.owner.is_some()
+        && duduclaw_auth::mfa::owner_factor::FactorBaseline::from_snapshot(&q.principal_snapshot)
+            .is_some_and(|baseline| baseline.strongest.is_none())
 }
 
 /// The owner side (Personal) and tenant, in one users.db read transaction.

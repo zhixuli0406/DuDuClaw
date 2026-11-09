@@ -12,6 +12,7 @@
 //! | `isolation.employee_retire_propose` | Admin + MFA + step-up (F6l) |
 //! | `me.isolation.request_adoption` | owner + strongest factor (Q2), purpose `adopt:<employee_id>:<incarnation>` (F6g) |
 //! | `isolation.shared_adoption_request` | Admin + MFA + step-up (F6g, member selection ⊆ snapshot) |
+//! | `isolation.employee_restore_request_for_owner` / `isolation.adoption_request_for_owner` | Admin + MFA + fresh step-up; only for an owner with no second factor at the tombstone (F6fa2, owner decision 2026-11-09) |
 //!
 //! The adoption challenge is `me.isolation.restore_challenge` with
 //! `for_adoption: true` (same issuer; the server builds the `adopt:` purpose).
@@ -36,8 +37,12 @@ pub(super) const RETIRE_PROPOSE: &str = "isolation.employee_retire_propose";
 /// F6g adoption requests (engine `isolation_adopt::file_adoption`).
 pub(super) const REQUEST_ADOPTION: &str = "me.isolation.request_adoption";
 pub(super) const SHARED_ADOPTION_REQUEST: &str = "isolation.shared_adoption_request";
-pub(super) const METHODS: [&str; 10] = [LIST_RESTORABLE, RESTORE_CHALLENGE, REQUEST_RESTORE, CANCEL_RESTORE, DECIDE, CANCEL, REGRANT,
-    RETIRE_PROPOSE, REQUEST_ADOPTION, SHARED_ADOPTION_REQUEST];
+/// F6fa2 (owner decision 2026-11-09): an Admin files a Personal restore /
+/// adoption for an owner who had no second factor at the tombstone.
+pub(super) const RESTORE_FOR_OWNER: &str = "isolation.employee_restore_request_for_owner";
+pub(super) const ADOPTION_FOR_OWNER: &str = "isolation.adoption_request_for_owner";
+pub(super) const METHODS: [&str; 12] = [LIST_RESTORABLE, RESTORE_CHALLENGE, REQUEST_RESTORE, CANCEL_RESTORE, DECIDE, CANCEL, REGRANT,
+    RETIRE_PROPOSE, REQUEST_ADOPTION, SHARED_ADOPTION_REQUEST, RESTORE_FOR_OWNER, ADOPTION_FOR_OWNER];
 
 /// `me.isolation.restore_challenge`: the row the proof will be bound to (a
 /// cancel names the row of its request). `for_adoption`: the challenge of a
@@ -67,6 +72,20 @@ pub(super) struct SharedAdoption {
     pub(super) employee_id: String, pub(super) incarnation: u32,
     #[serde(default)] pub(super) target_label: Option<String>,
     pub(super) members: Value, pub(super) csrf_token: [u8; 32],
+}
+/// `isolation.employee_restore_request_for_owner` (F6fa2): the row only; the
+/// owner is the row's receipt principal, never a request field.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ForOwner { pub(super) employee_id: String, pub(super) incarnation: u32, pub(super) csrf_token: [u8; 32] }
+/// `isolation.adoption_request_for_owner` (F6fa2): [`ForOwner`] plus the
+/// optional target label (default: the original label).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdoptionForOwner {
+    pub(super) employee_id: String, pub(super) incarnation: u32,
+    #[serde(default)] pub(super) target_label: Option<String>,
+    pub(super) csrf_token: [u8; 32],
 }
 /// `code`: TOTP or email code; `challenge_id`: passkey / email (from
 /// `restore_challenge`); `credential`: the passkey assertion.
@@ -326,6 +345,31 @@ impl MethodHandler {
                     step_up(db.as_ref(), &user, &session, &input.csrf_token, now)?;
                     Ok(with_adopt_env(&home, &user, cap, now, |env| rpc::shared_adoption_request(&home, env, &user,
                         &input.employee_id, input.incarnation, input.target_label.as_deref(), input.members))?)
+                }).await
+            }
+            RESTORE_FOR_OWNER => {
+                let input: ForOwner = serde_json::from_value(params).map_err(invalid)?;
+                let (session, cap) = (session.ok_or(ADMIN_REQUIRED)?, self.effective_agent_cap().await);
+                run(move || {
+                    let now = now()?;
+                    let verified_at = step_up(db.as_ref(), &user, &session, &input.csrf_token, now)?;
+                    // F6fa2: the filer's step-up freshness, computed from the proof.
+                    let fresh = crate::isolation_restore_wiring::step_up_fresh(Some(verified_at), now);
+                    // Filing never approves: the rule gets no step-up.
+                    let rule = LogRule::new(false, now);
+                    Ok(with_env(&home, &user, &rule, cap, now, |env| rpc::request_restore_for_owner(&home, env, &user,
+                        &input.employee_id, input.incarnation, fresh))?)
+                }).await
+            }
+            ADOPTION_FOR_OWNER => {
+                let input: AdoptionForOwner = serde_json::from_value(params).map_err(invalid)?;
+                let (session, cap) = (session.ok_or(ADMIN_REQUIRED)?, self.effective_agent_cap().await);
+                run(move || {
+                    let now = now()?;
+                    let verified_at = step_up(db.as_ref(), &user, &session, &input.csrf_token, now)?;
+                    let fresh = crate::isolation_restore_wiring::step_up_fresh(Some(verified_at), now);
+                    Ok(with_adopt_env(&home, &user, cap, now, |env| rpc::adoption_request_for_owner(&home, env, &user,
+                        &input.employee_id, input.incarnation, input.target_label.as_deref(), fresh))?)
                 }).await
             }
             _ => Err(NOT_ALLOWED.into()),

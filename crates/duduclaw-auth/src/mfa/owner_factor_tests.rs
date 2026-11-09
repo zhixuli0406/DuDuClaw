@@ -460,6 +460,34 @@ fn f6fa_preexisting_factor_accepted() {
         Some(ORIGIN), 3011), Ok(Passkey));
 }
 
+/// F6fa2 (owner decision 2026-11-09, decision 1): "log out all devices"
+/// after the tombstone bumps only the credential epoch. The factor baseline
+/// compares factor identities only (passkey ids, TOTP-secret digest,
+/// email-factor digest) and never records the epoch, so the tombstone's
+/// factor still proves the owner from the new session; only the revoked
+/// session's own epoch is refused (session validity, not the baseline).
+#[test]
+fn f6fa2_session_revoke_keeps_factor_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let (id, secret) = member(&db);
+    let tombstone = base(&db, &id);
+    let old = epoch(&db, &id);
+    db.remember_revoke(&id, None).unwrap();
+    let new = epoch(&db, &id);
+    assert_ne!(old, new, "the revocation moved the epoch");
+    assert_eq!(base(&db, &id), tombstone, "the factor identities are unchanged");
+    let recorded = tombstone.to_value();
+    let keys: Vec<&str> = recorded.as_object().unwrap().keys().map(String::as_str).collect();
+    assert!(!keys.iter().any(|key| key.contains("epoch")), "{keys:?}");
+    let p = purpose(0);
+    assert_eq!(db.restore_challenge(&id, new, &p, &tombstone, Some(ORIGIN), true, 3020), Ok(RestoreChallenge::Totp));
+    let right = super::super::test_totp_code(&secret, 101);
+    assert_eq!(db.restore_owner_factor(&id, old, Totp, &tombstone, &code(&p, &right), &Cipher, None, 3030),
+        Err(OwnerFactorError::Denied), "the revoked session itself");
+    assert_eq!(db.restore_owner_factor(&id, new, Totp, &tombstone, &code(&p, &right), &Cipher, None, 3030), Ok(Totp));
+}
+
 /// A snapshot recorded before F6fa carries no factor identities: there is
 /// no baseline, and nothing falls back to the live account. Malformed or
 /// self-inconsistent baselines are refused the same way.

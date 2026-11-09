@@ -42,6 +42,16 @@
 //! ([`OwnerFactorError::NotPreexisting`]). A row tombstoned before the
 //! baseline was recorded is refused ([`OwnerFactorError::BaselineMissing`]);
 //! there is no weaker fallback.
+//!
+//! **Session revocation (F6fa2, owner decision 2026-11-09).** The baseline
+//! holds factor identities only — never the credential epoch — so "log out
+//! all devices" (an epoch bump without a password, email or factor change)
+//! leaves it valid; the proof's own session must be current
+//! (`owner_account`), which is session validity, not a credential change.
+//! An owner whose baseline shows **no** second factor cannot prove anything
+//! here; for such an owner an Admin may file the request instead (gateway
+//! `isolation.employee_restore_request_for_owner` /
+//! `isolation.adoption_request_for_owner`), never for one who had a factor.
 use super::*;
 use serde_json::Value;
 

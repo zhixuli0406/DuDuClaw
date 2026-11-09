@@ -430,3 +430,94 @@ fn malformed_requests_refused_before_any_read() {
     let fine = ApprovalRequest { owner_user_id: Some(a.as_str()), ..request(EarlyPurgedRetire, &a, &b) };
     assert!(!allowed(&db, &fine).0);
 }
+
+// ── Owner decision 2026-11-09: Admin-filed Personal requests ────────────
+
+/// An Admin-filed Personal request (`requester` = the filing Admin, `owner` =
+/// the receipt owner, who had no second factor at the tombstone).
+fn admin_filed<'a>(kind: ApprovalKind, filer: &'a str, owner: &'a str, approver: &'a str) -> ApprovalRequest<'a> {
+    ApprovalRequest { owner_user_id: Some(owner), ..request(kind, filer, approver) }
+}
+
+fn decide_filed(db: &UserDb, request: &ApprovalRequest<'_>) -> ApprovalDecision {
+    let mut conn = db.conn();
+    let tx = conn.transaction().unwrap();
+    let decision = decide_admin_filed(&tx, request);
+    drop(tx);
+    decision
+}
+
+fn filing(db: &UserDb, filer: &str, owner: &str) -> Result<(), ApprovalRefusal> {
+    let mut conn = db.conn();
+    let tx = conn.transaction().unwrap();
+    let checked = check_admin_filing(&tx, filer, owner, now_secs());
+    drop(tx);
+    checked
+}
+
+/// F6fa2: the filing Admin is a party; a *different* qualifying Admin must
+/// approve; the sole-Admin path never exists for such a request (refused
+/// `NO_SECOND_ADMIN`, at filing and at approval); the owner never approves.
+#[test]
+fn f6fa2_admin_filed_request_needs_different_admin() {
+    let (_dir, db, a, b) = two_admins();
+    let owner = employee(&db, "owner@example.test");
+    for kind in [PersonalRestore, PersonalAdopt] {
+        // The filer cannot approve while b qualifies.
+        assert_eq!(decide_filed(&db, &admin_filed(kind, &a, &owner, &a)).refusal(), Some(ApprovalRefusal::SecondAdminRequired), "{kind:?}");
+        // Neither can the owner.
+        assert_eq!(decide_filed(&db, &admin_filed(kind, &a, &owner, &owner)).refusal(), Some(ApprovalRefusal::SecondAdminRequired),
+            "{kind:?}");
+        // b approves; never self-approved.
+        match decide_filed(&db, &admin_filed(kind, &a, &owner, &b)) {
+            ApprovalDecision::Allowed { self_approved, notice_addresses } => {
+                assert!(!self_approved, "{kind:?}");
+                assert_eq!(notice_addresses, vec!["a@example.test", "b@example.test"], "{kind:?}");
+            }
+            other => panic!("{kind:?}: {other:?}"),
+        }
+        // Fresh step-up and a transaction, as for every decision.
+        let stale = ApprovalRequest { fresh_step_up: false, ..admin_filed(kind, &a, &owner, &b) };
+        assert_eq!(decide_filed(&db, &stale).refusal(), Some(ApprovalRefusal::StepUpRequired));
+        assert_eq!(decide_admin_filed(&db.conn(), &admin_filed(kind, &a, &owner, &b)).refusal(),
+            Some(ApprovalRefusal::NotInTransaction));
+    }
+    // The owner must be named and differ from the filer; Shared kinds are not admin-filed.
+    for case in [ApprovalRequest { owner_user_id: None, ..request(PersonalRestore, &a, &b) },
+        admin_filed(PersonalRestore, &a, &a, &b), admin_filed(SharedRestore, &a, &owner, &b)] {
+        assert_eq!(decide_filed(&db, &case).refusal(), Some(ApprovalRefusal::InvalidRequest), "{case:?}");
+    }
+    assert_eq!(filing(&db, &a, &owner), Ok(()));
+    assert_eq!(filing(&db, &a, &a), Err(ApprovalRefusal::InvalidRequest));
+    // A non-Admin cannot file.
+    assert_eq!(filing(&db, &owner, &a), Err(ApprovalRefusal::FilerNotEligible));
+    assert_eq!(ApprovalRefusal::FilerNotEligible.code(), "FILER_NOT_ELIGIBLE");
+    // An Admin the filer promoted inside the window does not qualify (S2).
+    let c = employee(&db, "c@example.test");
+    enroll_raw(&db, &c);
+    set_role(&db, Some(&a), &c, UserRole::Admin);
+    assert_eq!(decide_filed(&db, &admin_filed(PersonalRestore, &a, &owner, &c)).refusal(),
+        Some(ApprovalRefusal::ApproverNotQualified(NotQualified::PromotedByParty)));
+}
+
+/// F6fa2: with the filer as the only qualifying Admin there is nobody to
+/// approve: filing and approval both refuse `NO_SECOND_ADMIN` — the sole-Admin
+/// self-approval of `decide` is not available here.
+#[test]
+fn f6fa2_admin_filed_request_has_no_sole_admin_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let a = eligible_admin(&db, "a@example.test");
+    let owner = employee(&db, "owner@example.test");
+    age_log(&db, 30 * DAY);
+    assert_eq!(filing(&db, &a, &owner), Err(ApprovalRefusal::NoSecondAdmin));
+    assert_eq!(decide_filed(&db, &admin_filed(PersonalRestore, &a, &owner, &a)).refusal(), Some(ApprovalRefusal::NoSecondAdmin));
+    assert_eq!(ApprovalRefusal::NoSecondAdmin.code(), "NO_SECOND_ADMIN");
+    // The ordinary owner-filed rule would have allowed the sole Admin.
+    assert!(allowed(&db, &request(SharedRestore, &a, &a)).0);
+    // A second Admin, eligible for the whole window, makes it approvable.
+    let b = eligible_admin(&db, "b@example.test");
+    age_log(&db, 8 * DAY);
+    assert_eq!(filing(&db, &a, &owner), Ok(()));
+    assert!(!decide_filed(&db, &admin_filed(PersonalAdopt, &a, &owner, &b)).self_approved());
+}

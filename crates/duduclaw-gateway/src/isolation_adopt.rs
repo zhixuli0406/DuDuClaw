@@ -6,7 +6,10 @@
 //! unavailable, inconsistent or retired never qualifies (R5, S4, S5).
 //!
 //! - Request ([`file_adoption`]): Personal by the owner (Q2 factor,
-//!   `Personal(same owner)` only), Shared by an Admin (`Shared(pinned
+//!   `Personal(same owner)` only) or — owner decision 2026-11-09, F6fa2 —
+//!   by an Admin for an owner who had no second factor at the tombstone
+//!   ([`Filer::AdminForOwner`]; `filed_by_admin`, `owner_unverified`, a third
+//!   qualifying Admin approves the card), Shared by an Admin (`Shared(pinned
 //!   tenant)` only, member selection ⊆ the tombstone snapshot at ≤ its
 //!   level). Journal: `employee_restores` kinds `personal_adopt` /
 //!   `shared_adopt` with `target_label` (original label if free).
@@ -432,6 +435,10 @@ pub(crate) enum Filer<'a> {
     /// An Admin (step-up verified by the RPC) with the member selection
     /// `[{user_id, access_level}]` ⊆ the snapshot at ≤ its level (§3.9, S11).
     Shared { requester: &'a str, members: Value },
+    /// Owner decision 2026-11-09 (F6fa2): an Admin files the Personal
+    /// adoption on behalf of an owner who had no second factor at the
+    /// tombstone (`restore::check_admin_filing`). `Personal(same owner)` only.
+    AdminForOwner(restore::AdminFiler<'a>),
 }
 
 fn rank(level: &str) -> Option<u8> {
@@ -461,24 +468,34 @@ pub(crate) fn check_members(q: &Quarantined, members: &Value) -> Result<(), Adop
 pub(crate) fn file_adoption(home: &Path, env: &AdoptEnv<'_>, employee: EmployeeId, incarnation: u32, target: Option<&str>,
     filer: Filer<'_>) -> Result<RestoreRequest, AdoptError> {
     let peek = { let db = restore::open_apply(home)?; restore::read_row(&db, employee, incarnation)?.ok_or(Refusal::NotFound)? };
-    let (kind, requester, members, factor) = match &filer {
+    // F6fa2: the users.db half of an Admin filing for an owner (F6c2 rule).
+    let filing = |users: &Connection, admin: &str, owner: &str|
+        env.rule.check_admin_filing(users, admin, owner, env.now).map_err(|refusal| refusal.code());
+    let (kind, requester, members, factor, filed_by_admin) = match &filer {
         Filer::Personal(proof) => {
             let proof = proof.ok_or(Refusal::FactorRequired)?;
             // Personal(same owner) only; a foreign row answers NOT_FOUND.
             if peek.kind != EmployeeKind::Personal || peek.owner.as_deref() != Some(proof.user_id) { return Err(Refusal::NotFound.into()); }
             if !matches!(proof.factor, "passkey" | "totp" | "email" | "google_reauth") { return Err(Refusal::FactorRequired.into()); }
-            (RequestKind::PersonalAdopt, proof.user_id.to_owned(), None, Some(proof.factor))
+            (RequestKind::PersonalAdopt, proof.user_id.to_owned(), None, Some(proof.factor), None)
         }
         Filer::Shared { requester, members } => {
             if peek.kind != EmployeeKind::Shared || peek.owner.is_some() { return Err(Refusal::NotFound.into()); }
             check_members(&peek, members)?;
-            (RequestKind::SharedAdopt, (*requester).to_owned(), Some(members.clone()), None)
+            (RequestKind::SharedAdopt, (*requester).to_owned(), Some(members.clone()), None, None)
+        }
+        Filer::AdminForOwner(admin) => {
+            restore::check_admin_filing(home, &peek, admin.admin_user_id, admin.fresh_step_up, &filing)?;
+            (RequestKind::PersonalAdopt, admin.admin_user_id.to_owned(), None, None, Some(admin.admin_user_id.to_owned()))
         }
     };
     let target = target.unwrap_or(&peek.label).to_owned();
     restore::recover_label(home, &env.restore(), &peek.label)?;
     recover_adoptions(home, env, &peek.label)?;
     let q = restore::load_fenced(home, &env.restore(), employee, incarnation)?;
+    if let Filer::AdminForOwner(admin) = &filer {
+        restore::check_admin_filing(home, &q, admin.admin_user_id, admin.fresh_step_up, &filing)?;
+    }
     let routes = check_outside(home, env, &q, &target)?;
     let mut db = restore::open_apply(home)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
@@ -492,20 +509,27 @@ pub(crate) fn file_adoption(home: &Path, env: &AdoptEnv<'_>, employee: EmployeeI
         owner: q.owner.clone(), tenant: q.tenant.clone(), requester, digest: String::new(),
         route_digest: restore::route_digest(&routes), member_selection: members, created_at: env.now,
         expires_at: env.now.saturating_add(restore::REQUEST_TTL_SECS).min(q.quarantined_at.saturating_add(restore::RESTORE_WINDOW_SECS)),
-        state: "requested".into(), approver: None, self_approved: None, failure: None,
+        state: "requested".into(), approver: None, self_approved: None, failure: None, filed_by_admin,
     };
     let digest = adopt_request_digest(&unsigned, q.digest.as_deref().ok_or(Refusal::NotSealed)?, &target);
     let request = RestoreRequest { digest, ..unsigned };
     tx.execute("INSERT INTO employee_restores(request_id,kind,employee_hex,incarnation,label,target_label,owner_user_id,tenant_id,
-            requester_user_id,digest,route_digest,member_selection,created_at,expires_at,state)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'requested')",
+            requester_user_id,digest,route_digest,member_selection,created_at,expires_at,state,filed_by_admin,owner_unverified)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'requested',?15,?16)",
         params![request.request_id, request.kind.as_str(), hex::encode(employee.0), incarnation, request.label, target,
             request.owner, request.tenant, request.requester, request.digest, request.route_digest,
-            request.member_selection.as_ref().map(Value::to_string), request.created_at, request.expires_at])
+            request.member_selection.as_ref().map(Value::to_string), request.created_at, request.expires_at,
+            request.filed_by_admin, request.owner_unverified()])
         .map_err(unavailable)?;
     tx.commit().map_err(unavailable)?;
-    restore::audit(home, "isolation.employee_adoption_requested", &request.label, Severity::Info,
-        restore::audit_details(&request, json!({"factor": factor, "target_label": target, "routes": routes.len()})));
+    let (event, severity) = if request.owner_unverified() {
+        ("isolation.employee_adoption_requested_for_owner", Severity::Warning)
+    } else {
+        ("isolation.employee_adoption_requested", Severity::Info)
+    };
+    restore::audit(home, event, &request.label, severity, restore::audit_details(&request, json!({"factor": factor,
+        "target_label": target, "routes": routes.len(), "filed_by_admin": request.filed_by_admin,
+        "owner_unverified": request.owner_unverified()})));
     Ok(request)
 }
 
@@ -649,12 +673,22 @@ fn decide(home: &Path, env: &AdoptEnv<'_>, request: &RestoreRequest, approver: &
         if !lifecycle::owner_eligible(&tx, owner).map_err(unavailable)? { return Err(Refusal::OwnerIneligible.into()); }
     }
     let kind = if request.kind == RequestKind::PersonalAdopt { ApprovalKind::PersonalAdopt } else { ApprovalKind::SharedAdopt };
-    let decision = env.rule.decide(&tx, &ApprovalRequest { kind, requester_user_id: &request.requester,
-        owner_user_id: request.owner.as_deref(), approver_user_id: approver, fresh_step_up: true, now: env.now });
+    let approval = ApprovalRequest { kind, requester_user_id: &request.requester,
+        owner_user_id: request.owner.as_deref(), approver_user_id: approver, fresh_step_up: true, now: env.now };
+    // F6fa2: an Admin-filed Personal adoption needs a third qualifying Admin
+    // (filer and owner are parties; no sole-Admin path).
+    let admin_filed = match request.filed_by_admin.as_deref() {
+        None => false,
+        Some(filer) if filer == request.requester && request.kind == RequestKind::PersonalAdopt
+            && request.owner.as_deref().is_some_and(|owner| owner != filer) => true,
+        Some(_) => return Err(AdoptError::Inconsistent),
+    };
+    let decision = if admin_filed { env.rule.decide_admin_filed(&tx, &approval) } else { env.rule.decide(&tx, &approval) };
     tx.finish().map_err(unavailable)?;
     match decision {
         ApprovalDecision::Allowed { self_approved, .. } => {
-            if self_approved != (approver == request.requester || request.owner.as_deref() == Some(approver)) {
+            let party = approver == request.requester || request.owner.as_deref() == Some(approver);
+            if self_approved != party || (admin_filed && (self_approved || party)) {
                 return Err(AdoptError::Approval("APPROVAL_RULE_INCONSISTENT"));
             }
             Ok(self_approved)
@@ -709,6 +743,8 @@ pub(crate) fn validate_item(home: &Path, env: &AdoptEnv<'_>, item: &Confirmation
     if let Some(members) = &request.member_selection { check_members(&q, members)?; }
     let sealed = q.digest.clone().ok_or(Refusal::NotSealed)?;
     if adopt_request_digest(&request, &sealed, &target) != request.digest { return Err(AdoptError::DigestMismatch); }
+    // F6fa2: Admin-filed only for an owner without a second factor at the tombstone.
+    if request.owner_unverified() && !restore::admin_may_file_for_owner(&q) { return Err(AdoptError::Inconsistent); }
     drop(db);
     if let Some((employee, digest)) = saved {
         tree_matches(home, &target, &digest, settings)?;

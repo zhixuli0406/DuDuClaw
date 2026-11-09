@@ -128,3 +128,54 @@ fn boot_recovers_adoptions() {
     let normal = stage(f.home(), 0x77, &[("employee_id", "other"), ("disk_bytes", "67108864"), ("settings", "{}")]);
     assert!(!rpc::adoption_committed(f.home(), &normal, &f.bob, now()));
 }
+
+/// F6fa2 (owner decision 2026-11-09): an Admin files the Personal adoption
+/// (`isolation.adoption_request_for_owner`) for an owner who had no second
+/// factor at the tombstone; the row is `Personal(same owner)`, flagged
+/// `filed_by_admin` + `owner_unverified`, the owner's tombstone-time address
+/// is told (uncapped). On the proposal card the filer and the owner are
+/// refused `SECOND_ADMIN_REQUIRED`; a third Admin approves, never
+/// self-approved. An owner who had a factor is refused `OWNER_HAD_SECOND_FACTOR`.
+#[test]
+fn f6fa2_admin_files_adoption_for_owner_without_second_factor() {
+    let f = fixture();
+    let home = f.home();
+    tombstoned_full(&f, "soul");
+    let ax = ax();
+    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax), &f.bob, &employee(), 0, None, false).err(),
+        Some(RpcError::Restore(Refusal::Approval("STEP_UP_REQUIRED"))));
+    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax), &f.alice, &employee(), 0, None, true).err(),
+        Some(RpcError::Restore(Refusal::FilerIsOwner)));
+    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax), &f.bob, &employee(), 0, Some("../x"), true).err(),
+        Some(RpcError::Invalid));
+    assert_eq!(filed_count(home), 0);
+    let filed = rpc::adoption_request_for_owner(home, &env(&ax), &f.bob, &employee(), 0, None, true).unwrap();
+    assert_eq!((filed["kind"].as_str(), filed["target_label"].as_str(), filed["owner_user_id"].as_str()),
+        (Some("personal_adopt"), Some(LABEL), Some(f.alice.as_str())));
+    assert_eq!((filed["filed_by_admin"].as_str(), filed["owner_unverified"].as_bool()), (Some(f.bob.as_str()), Some(true)));
+    let request = stored(home, filed["request_id"].as_str().unwrap());
+    assert_eq!((request.kind, request.requester.as_str(), request.owner.as_deref(), request.filed_by_admin.as_deref()),
+        (RequestKind::PersonalAdopt, f.bob.as_str(), Some(f.alice.as_str()), Some(f.bob.as_str())));
+    let (recipients, capped): (String, bool) = Connection::open(home.join(APPLY_DB)).unwrap().query_row(
+        "SELECT recipients,capped FROM employee_restore_notices WHERE event='isolation.employee_adoption_requested_for_owner'",
+        [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert!(recipients.contains("alice@example.test") && !capped, "{recipients}");
+    // The card: a third qualifying Admin, never a party, never self-approved.
+    let (plan, item) = propose(&f, &ax, &request);
+    for party in [f.bob.as_str(), f.alice.as_str()] {
+        assert_eq!(validate_item(home, &env(&ax), &item, &plan.adopt, party).err(), Some(AdoptError::Approval("SECOND_ADMIN_REQUIRED")),
+            "{party}");
+    }
+    match validate_item(home, &env(&ax), &item, &plan.adopt, "carol-admin").unwrap() {
+        AdoptPhase::Pending { self_approved, .. } => assert!(!self_approved),
+        other => panic!("{other:?}"),
+    }
+    // An owner with a second factor at the tombstone keeps the owner path only.
+    let g = fixture();
+    sql(g.home(), USERS_DB, "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'TOTP-ENC',0)", &[&g.alice]);
+    tombstoned_full(&g, "soul");
+    let gx = ax();
+    assert_eq!(rpc::adoption_request_for_owner(g.home(), &env(&gx), &g.bob, &employee(), 0, None, true).err(),
+        Some(RpcError::Restore(Refusal::OwnerHadSecondFactor)));
+    assert_eq!(filed_count(g.home()), 0);
+}

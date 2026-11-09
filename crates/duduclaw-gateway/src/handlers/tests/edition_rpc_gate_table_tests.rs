@@ -82,6 +82,9 @@ fn enterprise_surfaces_are_listed() {
         // F6g adoption request RPCs (F6d surface)
         "me.isolation.request_adoption",
         "isolation.shared_adoption_request",
+        // F6fa2 Admin filing for an owner without a second factor
+        "isolation.employee_restore_request_for_owner",
+        "isolation.adoption_request_for_owner",
     ] {
         assert!(
             is_enterprise_only_method(method),
