@@ -4,6 +4,8 @@ import '@/test/mocks';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import type { IsolationReadiness, ProtectedEmployeeRequest, SystemStatus } from '@/lib/api';
+import type { QuarantineRow, RestoreRequestRow } from '@/lib/isolation-restore-api';
+import { ADMIN_RESTORE_PATH } from './restore/AdminRestorePage';
 import { EmployeesTab } from './EmployeesTab';
 import { CSRF, NOT_VERIFIED, calledWith, employeeList, renderTab, routeCalls } from './test-helpers';
 
@@ -81,11 +83,70 @@ describe('protected mode — AI employees tab', () => {
     renderTab(<EmployeesTab />, { goTo });
     expect(await screen.findByText('1 AI employees need attention')).toBeInTheDocument();
     expect(screen.getByText(/The Google connector is not set up yet\./)).toBeInTheDocument();
-    expect(screen.getByText(/has not signed in on this computer yet/)).toBeInTheDocument();
+    expect(screen.getByText(/have not signed in on this computer yet/)).toBeInTheDocument();
     // The banner comes from readiness at once; the row badge waits for the list.
     expect(await screen.findByText('Needs attention')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Finish setup' }));
     expect(goTo).toHaveBeenCalledWith('connectors', { employee: 'alice-helper', provider: 'google' });
+  });
+
+  it('lists archived employees with restore actions and hides ones that are live again', async () => {
+    const archived = (over: Partial<QuarantineRow>): QuarantineRow => ({
+      employee_id: 'c'.repeat(32), incarnation: 1, label: 'old-sales', kind: 'shared', seal: 'sealed',
+      restorable: true, purge: { purgeable: false }, ...over,
+    });
+    routeCalls({
+      'isolation.employee_list': () => ({
+        ...employeeList(),
+        restores: { quarantine: [
+          archived({}),
+          archived({ employee_id: 'd'.repeat(32), label: 'old-bob', kind: 'personal', owner_user_id: 'u-bob',
+            root_flag: 'ROOT_GONE' }),
+          // Same id as a live employee: the live row wins, no archived duplicate.
+          archived({ employee_id: 'b'.repeat(32), label: 'sales-team' }),
+        ] },
+      }),
+    });
+    renderTab(<EmployeesTab />);
+    const employees = await screen.findByRole('region', { name: 'Protected AI employees' });
+    expect(within(employees).getByText('old-sales')).toBeInTheDocument();
+    expect(within(employees).getByText('old-bob')).toBeInTheDocument();
+    expect(within(employees).getAllByText('sales-team')).toHaveLength(1);
+    expect(within(employees).getByText('Retired')).toBeInTheDocument();
+    expect(within(employees).getByText('Retired · a new employee can take over')).toBeInTheDocument();
+    expect(within(employees).getByRole('button', { name: 'Prepare restore: old-sales' })).toBeInTheDocument();
+    expect(within(employees).getByRole('link', { name: 'View old-sales' })).toHaveAttribute('href', ADMIN_RESTORE_PATH);
+    expect(within(employees).getByRole('link', { name: 'View old-bob' })).toHaveAttribute('href', ADMIN_RESTORE_PATH);
+    expect(screen.getByRole('link', { name: 'Restore, hand over and remove' })).toHaveAttribute('href', ADMIN_RESTORE_PATH);
+    // Retired rows never offer the live-employee retire button.
+    expect(screen.queryByRole('button', { name: 'Retire old-sales' })).not.toBeInTheDocument();
+  });
+
+  it('lists restore and take-over requests with links to decide them', async () => {
+    const restoreRequest = (over: Partial<RestoreRequestRow>): RestoreRequestRow => ({
+      request_id: '5'.repeat(32), employee_id: 'c'.repeat(32), incarnation: 1, label: 'old-sales',
+      employee_kind: 'personal', kind: 'restore', owner_user_id: 'u-alice', ...over,
+    });
+    routeCalls({
+      'isolation.employee_list': () => ({
+        ...employeeList(),
+        restores: { requests: [
+          restoreRequest({}),
+          restoreRequest({ request_id: '6'.repeat(32), label: 'old-bob', kind: 'adoption', owner_user_id: 'u-bob',
+            owner_unverified: true }),
+        ] },
+      }),
+    });
+    renderTab(<EmployeesTab />);
+    expect(await screen.findByText('Restore “old-sales”')).toBeInTheDocument();
+    expect(screen.getByText('Hand “old-bob” over to a new employee')).toBeInTheDocument();
+    expect(screen.getByText('Needs another admin')).toBeInTheDocument();
+    expect(screen.getByText('Owner did not confirm with two-step verification')).toBeInTheDocument();
+    expect(screen.getByText('· 2 waiting')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Approve restore' })).toHaveAttribute('href', ADMIN_RESTORE_PATH);
+    expect(screen.getByRole('link', { name: 'Approve hand-over' })).toHaveAttribute('href', ADMIN_RESTORE_PATH);
+    // Restore requests are not an empty list.
+    expect(screen.queryByText('No requests from colleagues')).not.toBeInTheDocument();
   });
 
   it('shows empty states and disables clearing when nothing is closed', async () => {
