@@ -119,7 +119,7 @@ fn check_io(authority: &IoAuthority) -> Result<(), sqlx::Error> {
 /// blocking worker (which cannot borrow the `DbSource`). In exact mode the
 /// name must match an allowed entry byte for byte.
 fn table_allowed_in(cfg: &DbSourceConfig, exact: bool, table: &str) -> bool {
-    if exact { cfg.allowed_tables.iter().any(|name| name == table) }
+    if exact { cfg.allowed_tables.iter().any(|name| name.trim() != "*" && name == table) }
     else { cfg.table_allowed(table) }
 }
 
@@ -334,7 +334,7 @@ impl DbSource {
     /// first, before the statement guard and before any connection is used.
     /// `allowed_tables = ["*"]` is the operator saying free SQL is fine here.
     pub async fn query(&self, sql: &str, limit: Option<usize>) -> Result<QueryResult, DbError> {
-        if !self.cfg.allows_all_tables() {
+        if self.exact_table_names || !self.cfg.allows_all_tables() {
             return Err(DbError::FreeSqlNotAllowed {
                 source_name: self.cfg.name.clone(),
             });
@@ -873,7 +873,9 @@ fn schema_query_scoped(cfg: &DbSourceConfig,exact:bool) -> (String, Vec<String>)
         Driver::Sqlite => (SQLITE_TABLES_SQL, "name"),
     };
     if cfg.allows_all_tables() && !exact { return (base.to_owned(), Vec::new()); }
-    let names: Vec<String> = cfg.allowed_tables.iter().map(|name| if exact {name.clone()} else {name.trim().to_ascii_lowercase()}).collect();
+    let names: Vec<String> = cfg.allowed_tables.iter()
+        .filter(|name| !(exact && name.trim() == "*"))
+        .map(|name| if exact {name.clone()} else {name.trim().to_ascii_lowercase()}).collect();
     let (prefix, order) = base.split_once("ORDER BY").expect("constant schema query has ordering");
     let predicate = if names.is_empty() {
         "1 = 0".to_owned()
@@ -1763,8 +1765,6 @@ mod tests {
         assert!(matches!(src.ping().await, Err(DbError::Query(_))));
     }
 
-    /// Layer (c): work that outlives `timeout_ms` comes back as `Timeout`,
-    /// not as a hung call.
     #[tokio::test]
     async fn live_authority_revokes_queries_and_schema_after_pool_creation() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1785,6 +1785,8 @@ mod tests {
         assert!(DbSource::connect_checked(config, Arc::new(|| false)).await.is_err());
     }
 
+    /// Layer (c): work that outlives `timeout_ms` comes back as `Timeout`,
+    /// not as a hung call.
     #[tokio::test]
     async fn run_enforces_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1850,6 +1852,30 @@ mod tests {
             assert!(!sql.contains("LOWER("));assert_eq!(names,["customers","orders"]);
             assert!(sql.contains(match driver {Driver::Postgres=>"COLLATE \"C\"",Driver::Mysql=>"BINARY",Driver::Sqlite=>"COLLATE BINARY"}));
         }
+        source.close().await;
+    }
+
+    #[tokio::test]
+    async fn exact_mode_refuses_free_sql_even_with_wildcard() {
+        let home=tempfile::tempdir().unwrap();
+        let mut source=live_sqlite(home.path(),1000).await;
+        source.cfg.allowed_tables=vec!["*".into()];
+        let source=source.with_exact_table_names();
+        assert!(matches!(source.query("SELECT 1",None).await,Err(DbError::FreeSqlNotAllowed{..})));
+        source.close().await;
+    }
+
+    #[tokio::test]
+    async fn exact_mode_wildcard_grants_no_table() {
+        let home=tempfile::tempdir().unwrap();
+        let mut source=live_sqlite(home.path(),1000).await;
+        source.cfg.allowed_tables=vec![" * ".into()];
+        let source=source.with_exact_table_names();
+        assert!(!source.table_allowed("t"));
+        assert!(!source.table_allowed("*"));
+        assert!(source.select(&req("t")).await.is_err());
+        let (_sql,names)=schema_query_scoped(&source.cfg,true);
+        assert!(names.is_empty());
         source.close().await;
     }
 
