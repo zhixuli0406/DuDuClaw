@@ -566,13 +566,15 @@ fn notify_members(home: &Path, request: &RestoreRequest, members: &Value, incarn
 /// Called by the connector authority for every tenant-wide (non-detail)
 /// route use. A Shared employee at incarnation `N > 0` came back through a
 /// Shared restore of its row `N − 1`; it may use only the tenant routes that
-/// restore's approval ticked. Personal employees, incarnation 0 and other
-/// route kinds pass (their own checks apply). Every unreadable or missing
-/// record refuses.
+/// restore's approval ticked. Personal employees and other route kinds pass
+/// (their own checks apply). Incarnation 0 passes unless the employee
+/// adopted a Shared row ([`adoption_route_gate`], F6 b3 N4). Every
+/// unreadable or missing record refuses.
 pub(crate) fn tenant_route_gate(home: &Path, employee: EmployeeId, incarnation: u32, binding: &EmployeeBinding, account: &str,
     kind: ConnectorKind) -> Result<(), VerificationError> {
-    if !matches!(binding, EmployeeBinding::Shared(_)) || incarnation == 0 { return Ok(()); }
+    if !matches!(binding, EmployeeBinding::Shared(_)) { return Ok(()); }
     if !matches!(kind, ConnectorKind::SharedTenant | ConnectorKind::SharedHome) { return Ok(()); }
+    if incarnation == 0 { return adoption_route_gate(home, employee); }
     fn fail<E>(_: E) -> VerificationError { VerificationError::Unavailable }
     let db = lifecycle::open_store(home, APPLY_DB, Access::ReadOnly).map_err(fail)?;
     let hex = hex::encode(employee.0);
@@ -589,6 +591,32 @@ pub(crate) fn tenant_route_gate(home: &Path, employee: EmployeeId, incarnation: 
         params![request, hex, prior], |r| r.get(0)).optional().map_err(fail)?;
     let routes = decode_routes(&routes.ok_or(VerificationError::Revoked)?).map_err(|_| VerificationError::Unavailable)?;
     if routes.iter().any(|route| route.account == account) { Ok(()) } else { Err(VerificationError::Revoked) }
+}
+
+/// F6 b3 N4, fail closed: a Shared adoption (§3.10) files no route ticks
+/// yet, so the new employee that adopted a Shared row
+/// (`employee_quarantine.adopted_by_employee` = its id, kept through the
+/// row's purge) uses **no** tenant-wide route (`Revoked`) — "re-approved,
+/// not reactivated" with nothing re-approved. Carrying §3.9 ticks through
+/// the adoption request is a follow-up (work breakdown, F6 part b). An
+/// employee never adopted passes; no apply.db (nothing was ever adopted) or
+/// no quarantine table passes; an unreadable store refuses (`Unavailable`).
+/// Before the adoption commits the row is `adopting`, which holds the
+/// label for every writer and bot (S7).
+fn adoption_route_gate(home: &Path, employee: EmployeeId) -> Result<(), VerificationError> {
+    fn fail<E>(_: E) -> VerificationError { VerificationError::Unavailable }
+    match std::fs::symlink_metadata(home.join(APPLY_DB)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(VerificationError::Unavailable),
+        Ok(_) => {}
+    }
+    let db = lifecycle::open_store(home, APPLY_DB, Access::ReadOnly).map_err(fail)?;
+    let table: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='employee_quarantine')",
+        [], |r| r.get(0)).map_err(fail)?;
+    if !table { return Ok(()); }
+    let adopted: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM employee_quarantine WHERE adopted_by_employee=?1 AND kind='shared')",
+        [hex::encode(employee.0)], |r| r.get(0)).map_err(fail)?;
+    if adopted { Err(VerificationError::Revoked) } else { Ok(()) }
 }
 
 // ── RPC bodies (`isolation.shared_restore_*`, Admin; gates in the handler) ─

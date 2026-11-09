@@ -30,8 +30,12 @@
 //!
 //! Nothing label-keyed is carried (N1): every non-digest store is re-keyed
 //! under `quarantine:<hex>-<inc>` and purged with the row. The old root
-//! workspace is never read or copied (the new allocation is empty). Lock
-//! order apply.db before users.db (M6). Everything here is blocking.
+//! workspace is never read or copied (the new allocation is empty). Routes
+//! are never carried either: the card lists them for re-provisioning, and a
+//! new employee that adopted a **Shared** row uses no tenant-wide route at
+//! all (`isolation_restore_shared::tenant_route_gate`, F6 b3 N4, fail closed)
+//! until §3.9 route ticks for adoptions land. Lock order apply.db before
+//! users.db (M6). Everything here is blocking.
 use std::path::Path;
 
 use duduclaw_auth::admin_approval_rule::{AdminApprovalRule, ApprovalDecision, ApprovalKind, ApprovalRequest};

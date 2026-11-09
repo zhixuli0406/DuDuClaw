@@ -628,6 +628,11 @@ mod f6fb;
 #[path = "isolation_adopt_f6r3_tests.rs"]
 mod f6r3;
 
+/// F6 part (b) re-review follow-ups: N4 adopted Shared routes, N5 path
+/// normalisation, the `Zero::AfterSave` nit.
+#[path = "isolation_adopt_f6b3_tests.rs"]
+mod f6b3;
+
 /// F6i quarantine purge (§3.8): reuses this fixture and the adoption flow.
 #[path = "isolation_purge_tests.rs"]
 mod purge;

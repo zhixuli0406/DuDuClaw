@@ -23,8 +23,11 @@
 //! live row holds the label and no other row on it is open — everything
 //! still under the label in a registered store (`purge_all`); both must then
 //! report a positive zero (S10); then `purged`, `purged_at`. An `adopted` row
-//! keeps only its sealed remainder and sealed stores, so that is what goes.
-//! A crash leaves the row `purging`: [`recover_purges`] finishes it before
+//! keeps only its sealed remainder and sealed stores, so that is what goes;
+//! its `purging` state (journal `prior_seal = adopted`) stays closed for the
+//! label (`isolation_label_stores::label_hold`, F6 b3 N1), so the live
+//! employee that adopted the label keeps writing while the purge runs and
+//! after a refused or incomplete one. A crash leaves the row `purging`: [`recover_purges`] finishes it before
 //! anything else runs for the label (every purge entry point and boot), as it
 //! does for a `purged` row whose tree or row stores are still present.
 //! Purge never touches the root allocation; the RPC stages F6l's retire

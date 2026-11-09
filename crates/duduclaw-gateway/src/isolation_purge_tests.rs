@@ -411,6 +411,68 @@ fn purge_adopted_row_removes_remainder_and_sealed_stores() {
     assert_eq!(adopted_by, Some(hex::encode(NEW.0)), "the adoption record stays");
 }
 
+/// F6 b3 N1: purging an `adopted` row never freezes the live employee that
+/// adopted its label — while the purge runs (`purging`, journal
+/// `prior_seal = adopted`), after a refused one (`PURGE_TREE_REFUSED`, row
+/// left `purging`) and after it finishes. A `purging` row from any other
+/// state still holds the label (covered by `purge_crash_finishes_first`).
+#[test]
+fn f6b3_purge_adopted_row_keeps_live_adopter_writable() {
+    use crate::isolation_label_stores::{check_label_writable, label_hold, TEST_PROTECTED};
+    struct Protected;
+    impl Drop for Protected { fn drop(&mut self) { TEST_PROTECTED.with(|cell| cell.set(None)); } }
+    let f = fixture();
+    let home = f.home();
+    let (_, old) = tombstoned_full(&f, "soul");
+    let ax = ax();
+    let (_, item, _) = adopted(&f, &ax, None);
+    mark_applied(home, &item);
+    age(home, 91);
+    let fx = fakes(&old);
+    let env = RestoreEnv { actor: f.bob.as_str(), ..fx.env() };
+    // Protected mode only around the writer-gate checks (the purge runs as in production).
+    let writable = || {
+        TEST_PROTECTED.with(|cell| cell.set(Some(true)));
+        let _protected = Protected;
+        check_label_writable(home, LABEL)
+    };
+    let live = |when: &str| {
+        assert_eq!(writable(), Ok(()), "{when}: the adopter writes");
+        assert_eq!(check_label_not_quarantined(home, LABEL, None), Ok(()), "{when}: its proposals pass");
+        assert!(label_hold(home, LABEL).unwrap().open_rows.is_empty(), "{when}");
+    };
+    live("adopted");
+    // Interrupted right after the start: `purging`, the adopter still writes.
+    PURGE_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(|point| point == PurgeHook::AfterStart)));
+    assert!(purge_row(home, &env, EMP, 0, opts(false, false)).is_err());
+    PURGE_HOOK.with(|hook| *hook.borrow_mut() = None);
+    assert_eq!(seal_of(home), "purging");
+    assert_eq!(journal_of(home, EMP, 0).unwrap().prior_seal, "adopted");
+    live("purging");
+    task(home, "t-live", LABEL);
+    // The remainder swapped for a symlink: the purge refuses and the row stays `purging`.
+    let tree = quarantine_path(home, LABEL, EMP, 0);
+    let moved = home.join("moved-remainder");
+    std::fs::rename(&tree, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &tree).unwrap();
+    assert_eq!(purge_row(home, &env, EMP, 0, opts(false, false)).err(), Some(PurgeError::TreeRefused));
+    assert_eq!(seal_of(home), "purging");
+    live("refused purge");
+    // Put back: recovery finishes it; the adopter's state is untouched.
+    std::fs::remove_file(&tree).unwrap();
+    std::fs::rename(&moved, &tree).unwrap();
+    purged(home, &env);
+    assert_eq!(seal_of(home), "purged");
+    live("purged");
+    assert_eq!(tasks_under(home, LABEL), 1, "the live employee's rows stay");
+    // A `purging` row without a journal (or from any other state) still holds the label.
+    sql(home, APPLY_DB, "UPDATE employee_quarantine SET seal='purging' WHERE incarnation=0", &[]);
+    sql(home, APPLY_DB, "UPDATE employee_purge_journal SET prior_seal='sealed'", &[]);
+    assert_eq!(writable(), Err(GateRefusal::Quarantined));
+    sql(home, APPLY_DB, "DELETE FROM employee_purge_journal", &[]);
+    assert_eq!(writable(), Err(GateRefusal::Quarantined));
+}
+
 /// §3.6: a purge interrupted after it started leaves the row `purging`
 /// (the label stays held, requests refused); the next purge step on the
 /// label — or boot — finishes it before anything else (an interrupted early

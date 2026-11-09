@@ -176,3 +176,38 @@ async fn f6fb2_purge_removes_fts_rows_with_base_rows() {
     assert_eq!(count(&format!("SELECT COUNT(*) FROM memories_fts WHERE agent_id = '{OTHER}'")), 1);
     assert_eq!(store("memory").count_under(home, LABEL), Ok(0));
 }
+
+/// F6 b3 N6: the GDPR erasure record (the one insert the gate admits on a
+/// quarantined label) is not part of the store marks, so an erasure that
+/// removed nothing leaves a same-id restore's mark re-check equal; the S10
+/// zero count still counts the record, and rows an erasure deleted still
+/// change the marks.
+#[tokio::test]
+async fn f6b3_gdpr_erasure_record_keeps_store_marks() {
+    use crate::isolation_restore_wiring::current_marks;
+    use duduclaw_core::traits::MemoryEngine;
+    install_memory_gate();
+    let dir = private_home();
+    let home = dir.path();
+    let memory = duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db")).unwrap();
+    memory.store(LABEL, memory_entry(LABEL)).await.unwrap();
+    memory.store(OTHER, memory_entry(OTHER)).await.unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    let recorded = tombstone_effects(home, LABEL, EmployeeId([1; 16]), 0)["store_marks"].clone();
+    assert!(recorded["memory"].as_u64().unwrap() >= 1, "{recorded}");
+    assert_eq!(current_marks(home, LABEL).unwrap(), recorded);
+    let _mode = Mode::protected(true);
+    let summary = duduclaw_memory::gdpr_erase(&memory, LABEL, "nobody@example.com", true).await.unwrap();
+    assert_eq!(summary.memories_deleted, 0);
+    assert!(summary.tombstone_id.is_some(), "the erasure record was written");
+    assert_eq!(current_marks(home, LABEL).unwrap(), recorded, "the record alone does not change the marks");
+    let memory_store = store("memory");
+    assert_eq!(memory_store.count_under(home, LABEL).unwrap(), memory_store.mark_under(home, LABEL).unwrap() + 2,
+        "S10 still counts the record (base row and FTS row)");
+    // A label without an erasure record: its marks are its plain count.
+    assert_eq!(memory_store.mark_under(home, OTHER), memory_store.count_under(home, OTHER));
+    // Rows the erasure deleted do change the marks.
+    let summary = duduclaw_memory::gdpr_erase(&memory, LABEL, "remembers", true).await.unwrap();
+    assert_eq!(summary.memories_deleted, 1);
+    assert_ne!(current_marks(home, LABEL).unwrap(), recorded);
+}

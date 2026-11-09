@@ -169,10 +169,75 @@ fn replace_where(bytes: &[u8], token: &[u8], with: &[u8], at: impl Fn(&[u8], usi
     out
 }
 
-/// JSON-escaped `\/` → `/`; `${HOME}`, `$HOME` and a leading `~/` → the
-/// process home; runs of `/` → one; `/./` → `/`.
+/// F6 b3 N5: JSON `\uXXXX` escapes (a surrogate pair as one code point)
+/// decoded to UTF-8, so `/` is a `/` and `a` an `a` before
+/// matching. Over-decoding (a `\\u…` that JSON reads as a backslash) only
+/// makes the check stricter. A malformed or lone-surrogate escape stays.
+fn decode_json_escapes(bytes: &[u8]) -> Vec<u8> {
+    let hex4 = |at: usize| -> Option<u32> {
+        let digits = bytes.get(at..at + 4)?;
+        if !digits.iter().all(u8::is_ascii_hexdigit) { return None; }
+        u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'u') {
+            if let Some(unit) = hex4(i + 2) {
+                let pair = (0xD800..0xDC00).contains(&unit) && bytes.get(i + 6) == Some(&b'\\') && bytes.get(i + 7) == Some(&b'u');
+                let (code, used) = match pair.then(|| hex4(i + 8)).flatten() {
+                    Some(low) if (0xDC00..0xE000).contains(&low) => (0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00), 12),
+                    _ => (unit, 6),
+                };
+                if let Some(ch) = char::from_u32(code) {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    i += used;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// A byte that may sit inside one path segment a `..` collapses (no
+/// separator, quote, backslash, whitespace or control byte).
+fn segment_byte(byte: u8) -> bool {
+    !matches!(byte, b'/' | b'"' | b'\'' | b'\\' | b'`') && !byte.is_ascii_whitespace() && !byte.is_ascii_control()
+}
+
+/// F6 b3 N5: `/<seg>/..` → `` (followed by `/`, the end or a non-path byte),
+/// left to right with the output as a stack, so `/a/b/../../c` is `/c`. A
+/// `.` or `..` segment is never collapsed (no climbing above what is named).
+fn collapse_parent_segments(bytes: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"/..") && bytes.get(i + 3).is_none_or(|next| !path_char(*next)) {
+            if let Some(slash) = out.iter().rposition(|byte| *byte == b'/') {
+                let segment = &out[slash + 1..];
+                if !segment.is_empty() && segment != b"." && segment != b".." && segment.iter().all(|byte| segment_byte(*byte)) {
+                    out.truncate(slash);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// JSON `\uXXXX` decoded (N5); JSON-escaped `\/` → `/`; `${HOME}`, `$HOME`
+/// and a leading `~/` → the process home; runs of `/` → one; `/./` → `/`;
+/// `/<seg>/..` collapsed (N5).
 fn normalize_paths(bytes: &[u8], home_env: Option<&[u8]>) -> Vec<u8> {
-    let mut out = replace_where(bytes, b"\\/", b"/", |_, _| true);
+    let decoded = decode_json_escapes(bytes);
+    let mut out = replace_where(&decoded, b"\\/", b"/", |_, _| true);
     if let Some(home) = home_env {
         out = replace_where(&out, b"${HOME}", home, |_, _| true);
         out = replace_where(&out, b"$HOME", home,
@@ -191,7 +256,7 @@ fn normalize_paths(bytes: &[u8], home_env: Option<&[u8]>) -> Vec<u8> {
         if next == collapsed { break; }
         collapsed = next;
     }
-    collapsed
+    collapse_parent_segments(&collapsed)
 }
 
 fn needles(home: &Path, q: &Quarantined) -> Needles {
@@ -468,17 +533,22 @@ enum Zero {
     /// (a binding left on the label would be inherited by the new id).
     BeforeSave,
     /// After `save()` (resume, roll forward): the new id's own mirror and
-    /// bindings are on the target by then; every other store still counts
-    /// (writes stay gated while the row is `adopting`).
+    /// bindings are on the target by then, so the principal side is not
+    /// counted **on the target**; on an old label other than the target it
+    /// still counts (nothing of the new id is there). Every other store
+    /// still counts (writes stay gated while the row is `adopting`).
     AfterSave,
 }
 
-/// A positive zero count under every label (an unreadable store is not zero).
-fn require_zero(home: &Path, labels: &[&str], zero: Zero) -> Result<(), AdoptError> {
+/// A positive zero count under the old label and the target (an unreadable
+/// store is not zero).
+fn require_zero(home: &Path, old: &str, target: &str, zero: Zero) -> Result<(), AdoptError> {
     use crate::isolation_label_stores::{TombstoneAction, LABEL_KEYED_STORES};
+    let labels: &[&str] = if old == target { &[old] } else { &[old, target] };
     for store in LABEL_KEYED_STORES.iter().filter(|store| store.action != TombstoneAction::Digest) {
-        if zero == Zero::AfterSave && store.action == TombstoneAction::Principal { continue; }
         for label in labels {
+            // F6 b3 nit: only the target carries the new id's own principal rows.
+            if zero == Zero::AfterSave && store.action == TombstoneAction::Principal && *label == target { continue; }
             if store.count_under(home, label).map_err(unavailable)? != 0 { return Err(AdoptError::StoresNotEmpty); }
         }
     }
@@ -669,7 +739,7 @@ pub(crate) fn roll_forward(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, ado
     let (_, _, origin, reference) = marker(&db, target)?.ok_or(AdoptError::Inconsistent)?;
     if origin != "adopted" || reference.as_deref() != Some(adopt.encode().as_str()) { return Err(AdoptError::Inconsistent); }
     drop(db);
-    require_zero(home, &[&q.label, target], Zero::AfterSave)?;
+    require_zero(home, &q.label, target, Zero::AfterSave)?;
     // The crash may have come between `save()` and the member bindings.
     if let Some(members) = &request.member_selection { bind_members(home, q, target, members)?; }
     let _ = env;
@@ -767,7 +837,7 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     // 4. Nothing label-keyed is carried (N1, S10).
     // A crash point ends the call without `fail` (no cleanup, as on process death).
     if rekey_stores(home, &q, &adopt, true).map_err(fail)? { return Err(AdoptError::Unavailable); }
-    require_zero(home, &[&q.label, &target], Zero::BeforeSave).map_err(fail)?;
+    require_zero(home, &q.label, &target, Zero::BeforeSave).map_err(fail)?;
     // 5. Marker (R8), confirmed row + mirror, Shared bindings, commit.
     write_marker(home, &target, q.owner.as_deref().unwrap_or(""), &snapshot.digest, &adopt).map_err(fail)?;
     // N1: the owner and approval checks again, inside the mirror's users.db
@@ -807,7 +877,7 @@ fn resume_after_save(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationItem, r
         restore::audit_details(&request, json!({"target_label": target, "new_employee": hex::encode(employee.0)})));
     let fail = |error: AdoptError| failed(home, env, &q, &request, &target, error);
     rekey_stores(home, &q, adopt, false).map_err(fail)?;
-    require_zero(home, &[&q.label, &target], Zero::AfterSave).map_err(fail)?;
+    require_zero(home, &q.label, &target, Zero::AfterSave).map_err(fail)?;
     if let Some(members) = &request.member_selection { bind_members(home, &q, &target, members).map_err(fail)?; }
     if crash_at(AdoptHook::AfterSave) { return Err(AdoptError::Unavailable); }
     let commit_gate = |users: &Connection| recheck_commit(home, env, &q, &request, approver, self_approved, users);

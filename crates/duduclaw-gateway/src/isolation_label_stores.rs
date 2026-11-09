@@ -42,7 +42,8 @@ pub(crate) const LABEL_QUARANTINED: &str = "此員工代號仍保留給已註銷
 pub(crate) const LABEL_STATE_UNAVAILABLE: &str = "無法確認這個員工代號目前的狀態，已拒絕操作。";
 const NOT_LIVE: &str = "這位員工已停用，不能再寫入資料。";
 
-/// Quarantine states that no longer hold the label (S7).
+/// Quarantine states that no longer hold the label (S7). A `purging` row
+/// purged from `adopted` is closed too ([`label_hold`], F6 b3 N1).
 pub(crate) const CLOSED_STATES: [&str; 3] = ["purged", "adopted", "restored"];
 /// Label-keyed grants inside the tree, stripped by the F6a tombstone (H5).
 pub(crate) const IN_TREE_STRIPPED: [&str; 2] = ["agent.toml [channels.*]", "agent.toml [capabilities] db_sources"];
@@ -116,7 +117,7 @@ pub(crate) struct LabelHold {
     /// Quarantine rows on the label in state `purged`.
     pub(crate) purged: usize,
     /// Quarantine rows on the label in any closed state (S7: `purged`,
-    /// `adopted`, `restored`).
+    /// `adopted`, `restored`; and `purging` from `adopted`, N1).
     pub(crate) closed: usize,
 }
 
@@ -155,6 +156,7 @@ pub(crate) fn label_hold(home: &Path, label: &str) -> Result<LabelHold, StoreErr
         }
     }
     if table_exists(&db, "employee_quarantine")? {
+        let journal = table_exists(&db, "employee_purge_journal")?;
         let mut query = db.prepare(
             "SELECT employee_hex,incarnation,seal FROM employee_quarantine WHERE label=?1 ORDER BY employee_hex,incarnation")
             .map_err(|_| StoreError::Unavailable)?;
@@ -163,10 +165,28 @@ pub(crate) fn label_hold(home: &Path, label: &str) -> Result<LabelHold, StoreErr
         for (hex, incarnation, seal) in rows {
             let incarnation = u32::try_from(incarnation).map_err(|_| StoreError::Unavailable)?;
             if seal == "purged" { hold.purged += 1; }
-            if CLOSED_STATES.contains(&seal.as_str()) { hold.closed += 1; } else { hold.open_rows.push((hex, incarnation, seal)); }
+            let closed = CLOSED_STATES.contains(&seal.as_str())
+                || (seal == "purging" && journal && purging_adopted(&db, &hex, incarnation)?);
+            if closed { hold.closed += 1; } else { hold.open_rows.push((hex, incarnation, seal)); }
         }
     }
     Ok(hold)
+}
+
+/// F6 b3 N1: a `purging` row whose purge journal records `prior_seal =
+/// 'adopted'` stays closed. Its label already belongs to the live employee
+/// that adopted it (the purge removes only the row's sealed remainder and
+/// row-keyed stores, never the label's), so that employee keeps writing
+/// while the purge runs and after a refused or incomplete one. The journal
+/// is written in the same transaction that marks the row `purging`
+/// (`isolation_purge::mark_started`); a `purging` row without a journal
+/// stays open (fail closed). Purge and recovery still see the seal
+/// `purging` (`check_purgeable`, `recover_purges` read the seal, not this).
+fn purging_adopted(db: &Connection, hex: &str, incarnation: u32) -> Result<bool, StoreError> {
+    let prior: Option<String> = db.query_row(
+        "SELECT prior_seal FROM employee_purge_journal WHERE employee_hex=?1 AND incarnation=?2",
+        params![hex, incarnation], |r| r.get(0)).optional().map_err(|_| StoreError::Unavailable)?;
+    Ok(prior.as_deref() == Some("adopted"))
 }
 
 /// The key a label's rows are re-keyed under at adoption (§3.3, N1).
@@ -356,6 +376,16 @@ impl LabelStore {
     pub(crate) fn count_under(&self, home: &Path, label: &str) -> Result<u64, StoreError> {
         match &self.backend {
             Backend::Sqlite { .. } => sqlite::count(home, self.source, label),
+            Backend::Config { count, .. } => count(home, label),
+        }
+    }
+
+    /// The store mark under `label` (tombstone record, restore re-check):
+    /// [`Self::count_under`] without the GDPR erasure record (F6 b3 N6,
+    /// [`sqlite::count_marks`]).
+    pub(crate) fn mark_under(&self, home: &Path, label: &str) -> Result<u64, StoreError> {
+        match &self.backend {
+            Backend::Sqlite { .. } => sqlite::count_marks(home, self.source, label),
             Backend::Config { count, .. } => count(home, label),
         }
     }
@@ -577,10 +607,38 @@ pub(crate) mod sqlite {
     }
 
     pub(crate) fn count(home: &Path, file: &str, label: &str) -> Result<u64, StoreError> {
+        count_where(home, file, label, false)
+    }
+
+    /// `memories.source_event` of the GDPR erasure record (`duduclaw_memory::gdpr_erase`).
+    pub(crate) const ERASURE_SOURCE: &str = "gdpr_erasure";
+
+    /// F6 b3 N6: [`count`] for **store marks** only: the GDPR erasure record
+    /// (a `memories` row with `source_event = 'gdpr_erasure'`, and its
+    /// `memories_fts` row) is not counted, so writing it — the one insert the
+    /// writer gate admits on a quarantined label (`label_gate::narrowing_write`)
+    /// — does not turn a same-id restore into `STORES_CHANGED`. Rows the
+    /// erasure deleted still change the marks (by design: the restored
+    /// employee would not get back what it had). The S10 zero count
+    /// ([`count`]) still counts the record: it is label-keyed state.
+    pub(crate) fn count_marks(home: &Path, file: &str, label: &str) -> Result<u64, StoreError> {
+        count_where(home, file, label, true)
+    }
+
+    fn count_where(home: &Path, file: &str, label: &str, marks: bool) -> Result<u64, StoreError> {
         let Some(db) = open(home, file, Access::ReadOnly)? else { return Ok(0) };
+        let erasure = marks && columns(&db, "memories")?.iter().any(|column| column == "source_event")
+            && columns(&db, "memories")?.iter().any(|column| column == "id");
+        let fts_linked = erasure && columns(&db, "memories_fts")?.iter().any(|column| column == "memory_id");
         let mut total = 0u64;
         for (table, column) in keyed_columns(&db)? {
-            let rows: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {} WHERE {} = ?1", quoted(&table), quoted(&column)),
+            let filter = match table.as_str() {
+                "memories" if erasure => format!(" AND source_event IS NOT '{ERASURE_SOURCE}'"),
+                "memories_fts" if fts_linked =>
+                    format!(" AND memory_id NOT IN (SELECT id FROM memories WHERE source_event = '{ERASURE_SOURCE}')"),
+                _ => String::new(),
+            };
+            let rows: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {} WHERE {} = ?1{filter}", quoted(&table), quoted(&column)),
                 [label], |r| r.get(0)).map_err(|_| StoreError::Unavailable)?;
             total = total.saturating_add(u64::try_from(rows).map_err(|_| StoreError::Unavailable)?);
         }
@@ -712,7 +770,7 @@ pub(crate) fn tombstone_effects(home: &Path, label: &str, employee: EmployeeId, 
                         Err(_) => fences.push(format!("{STORE_FENCE_GROUP}{}:pause_unavailable", store.name)),
                     }
                 }
-                match store.count_under(home, label) {
+                match store.mark_under(home, label) {
                     Ok(count) => { marks.insert(store.name.into(), json!(count)); }
                     Err(_) => fences.push(format!("{STORE_FENCE_GROUP}{}:unreadable", store.name)),
                 }

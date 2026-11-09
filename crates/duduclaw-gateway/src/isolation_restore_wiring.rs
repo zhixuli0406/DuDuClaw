@@ -80,11 +80,12 @@ pub(crate) fn spawnd_employee_idle(employee: EmployeeId) -> Result<bool, RootErr
 
 // ── Label-keyed stores (§3.3, S10) ──────────────────────────────────────
 
-/// The marks `tombstone_effects` records: one count per `Gate`/`Pause` store.
+/// The marks `tombstone_effects` records: one count per `Gate`/`Pause` store
+/// (the GDPR erasure record excluded, F6 b3 N6: `LabelStore::mark_under`).
 pub(crate) fn current_marks(home: &Path, label: &str) -> Result<Value, ()> {
     let mut marks = serde_json::Map::new();
     for store in LABEL_KEYED_STORES.iter().filter(|s| matches!(s.action, TombstoneAction::Gate | TombstoneAction::Pause)) {
-        marks.insert(store.name.into(), json!(store.count_under(home, label).map_err(|_| ())?));
+        marks.insert(store.name.into(), json!(store.mark_under(home, label).map_err(|_| ())?));
     }
     Ok(Value::Object(marks))
 }
