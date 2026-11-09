@@ -28,6 +28,13 @@
 //!   default is no web authority. Never from tool arguments. HX6: the same
 //!   grant is also signed for a run whose recording is selected (`recording`,
 //!   below), as the authority for `browser_record_start`'s navigation URL.
+//! * SFR: `Workspace { employee-work }` for `skill_from_recording` (`distill`)
+//!   — the recordings live there — with exactly the recording gate's
+//!   conditions (spawnd `helper_calls` + `helper_recording`, `[isolation]
+//!   public_web`, interactive run) and the profile allowing the tool. It
+//!   signs no PublicOrigins (distilling reads stored artifacts, no web). While
+//!   the recording gate is closed (production default: `RECORDING_BUILD_ENABLED`
+//!   off, no per-host probe), it is never signed and stays hidden.
 //! * `NewTask { requester }` (H9 decision 3) — only for an interactive run (not
 //!   record-backed, no task) that lists `create_task` while the profile still
 //!   allows it. The requester is the run's authenticated human (B1 has already
@@ -52,7 +59,8 @@ use std::{io::Read, path::Path, sync::Arc};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{PublicOrigin, ResourceGrant}, ids::EmployeeId,
     ipc::SpawndFeatures};
 use duduclaw_mcp_boundary::{resources::{ResourceRoots, WorkBroker, EMPLOYEE_WORK_ROOT},
-    tool_policy::{IN_RUN_HELPER_TOOLS, IN_RUN_RECORDING_TOOLS, PUBLIC_ORIGIN_TOOLS}};
+    tool_policy::{IN_RUN_HELPER_TOOLS, IN_RUN_RECORDING_TOOLS, PUBLIC_ORIGIN_TOOLS},
+    workspace_selection::{WorkspaceSelectors, RECORDING_DISTILL_TOOLS}};
 use super::VerificationError;
 
 /// File tools served from the brokered `employee-work` root (H6/H11).
@@ -165,6 +173,9 @@ pub(super) struct Selection {
     /// HX6: `workspace` was (also) selected for the in-run browser recording
     /// (`IN_RUN_RECORDING_TOOLS`), which is signed alongside it.
     pub recording: bool,
+    /// SFR: `workspace` was (also) selected for `skill_from_recording`
+    /// (`RECORDING_DISTILL_TOOLS`) behind the same recording gate.
+    pub distill: bool,
     /// The web tools (`PUBLIC_ORIGIN_TOOLS`) were selected: the only case in
     /// which they are signed alongside a PublicOrigins grant.
     pub public_web: bool,
@@ -188,6 +199,9 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     // egress is the employee's public-web authority, D-H2 / Q3 = A).
     let wants_recording = input.task.is_none() && IN_RUN_RECORDING_TOOLS.iter().any(|name| listed(*name))
         && sources.recording_ready();
+    // SFR: distilling is offered exactly where recording is available.
+    let wants_distill = input.task.is_none() && RECORDING_DISTILL_TOOLS.iter().any(|name| listed(*name))
+        && sources.recording_ready();
     // D-H2: PublicOrigins exists only alongside EmployeeScope; a task-limited
     // run never carries it, so it is not even considered there.
     // Owner decision 2026-11-09: protected `skill_hub_install` rests on the
@@ -197,7 +211,7 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     // NewTask: interactive runs only (a record-backed run plans under its own
     // record task, H8, and has no human requester of its own).
     let wants_new_task = !input.record && input.task.is_none() && NEW_TASK_TOOLS.iter().any(|name| listed(*name));
-    let profile = if wants_files || wants_helpers || wants_recording || wants_web || wants_new_task {
+    let profile = if wants_files || wants_helpers || wants_recording || wants_distill || wants_web || wants_new_task {
         Some(read_profile(input.home, input.agent)?)
     } else { None };
     let allows = |names: &[&str]| profile.as_ref().is_some_and(|profile| {
@@ -211,7 +225,10 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     // (`[isolation] public_web`) gates it. No switch ⇒ no recording.
     let recording = wants_recording && profile.as_ref().is_some_and(|profile| profile.isolation.public_web)
         && allows(&IN_RUN_RECORDING_TOOLS[..]);
-    let workspace = (wants_files && allows(FILE_TOOLS)) || helpers || recording;
+    // SFR: the same admin switch; recordings exist only where it is on.
+    let distill = wants_distill && profile.as_ref().is_some_and(|profile| profile.isolation.public_web)
+        && allows(RECORDING_DISTILL_TOOLS);
+    let workspace = (wants_files && allows(FILE_TOOLS)) || helpers || recording || distill;
     // Owner decision 2026-11-08: its own admin-only switch, independent of
     // `[container] network_access` (task sandbox only).
     let web_switch = wants_web && profile.as_ref().is_some_and(|profile| profile.isolation.public_web);
@@ -233,7 +250,7 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
             Some(SelectedTask { id: id.to_owned() })
         }
     };
-    Ok(Selection { workspace, helpers, recording, public_web, hub_install, new_task, task })
+    Ok(Selection { workspace, helpers, recording, distill, public_web, hub_install, new_task, task })
 }
 
 impl Selection {
@@ -277,9 +294,9 @@ impl Selection {
     /// The tool snapshot to sign. The `Workspace { employee-work }` grant is
     /// selected for the file tools and — only with `helpers` — the HX5 in-run
     /// helper tools. Every other listed tool whose eligibility would rest on
-    /// that grant (the shared pending list, e.g. `skill_from_recording`, the
-    /// HX6 recording tools unless `recording`, and any other A/E tool) is
-    /// left out of the capability, so it stays
+    /// that grant (the shared pending list, the HX6 recording tools unless
+    /// `recording`, `skill_from_recording` unless `distill`, and any other
+    /// A/E tool) is left out of the capability, so it stays
     /// hidden and refused. Only ever narrows.
     pub(super) fn signed_tools(&self, tools: &List<Text<128>, 256>)
         -> Result<List<Text<128>, 256>, VerificationError> {
@@ -292,8 +309,8 @@ impl Selection {
         let scoped = self.task.is_none();
         List::new(tools.as_slice().iter().filter(|tool|
             !(foreign_grant_web && PUBLIC_ORIGIN_TOOLS.contains(&tool.as_str()))
-            && !(self.workspace && duduclaw_mcp_boundary::workspace_selection::drops_from_signed_with(tool.as_str(),
-                scoped, self.helpers, self.recording)))
+            && !(self.workspace && duduclaw_mcp_boundary::workspace_selection::drops_from_signed_selected(tool.as_str(),
+                scoped, WorkspaceSelectors { helpers: self.helpers, recording: self.recording, distill: self.distill })))
             .cloned().collect()).map_err(|_| VerificationError::Invalid)
     }
 }

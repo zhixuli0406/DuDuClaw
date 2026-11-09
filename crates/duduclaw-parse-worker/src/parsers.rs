@@ -14,6 +14,7 @@ pub(crate) mod archive;
 mod document;
 mod audio;
 mod recording;
+mod recording_artifacts;
 mod evolution;
 mod skill_text;
 mod skill_knowledge;
@@ -89,6 +90,13 @@ fn parse_inner(request: &ParseRequest, inputs: &mut [File])
             continue;
         }
 
+        // SFR: a protected recording's framed artifacts (trace archive + JSON).
+        if let Some(duduclaw_isolation::worker::ParseOptions::RecordingArtifacts { name }) = &request.options {
+            if declared.format != ContentFormat::Archive { return Err(ParseError::InvalidContent); }
+            output.item(ParsedItem::Recording { input_slot: slot,
+                summary: recording_artifacts::summarize(&bytes, name.as_str())? })?;
+            continue;
+        }
         if let Some(duduclaw_isolation::worker::ParseOptions::Recording { desktop, name }) = &request.options {
             if declared.format != ContentFormat::Text { return Err(ParseError::InvalidContent); }
             output.item(ParsedItem::Recording { input_slot: slot, summary: recording::summarize(&bytes, *desktop, name.as_str())? })?;

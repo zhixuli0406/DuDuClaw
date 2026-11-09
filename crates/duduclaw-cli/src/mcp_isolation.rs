@@ -536,6 +536,7 @@ fn project_tool_schema(tool: &mut Value) {
             for key in removed { properties.remove(*key); }
         }
         if name == "skill_from_recording" {
+            tool["description"] = json!("Distill one of your own finished protected browser recordings (the id returned by browser_record_start) into a skill in your own SKILLS. The recorded files must still match the digests stored when the recording finished; they are parsed only in the isolated parse service, and the skill is security-scanned before it is published. An existing skill with the same name is never overwritten.");
             tool["inputSchema"]["properties"]["id"] = json!({"type":"string","pattern":"^[0-9a-f]{32}$",
                 "description":"受保護錄製回傳的 id（必須是你自己已完成的錄製）"});
         }

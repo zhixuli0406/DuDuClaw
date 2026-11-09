@@ -16,7 +16,7 @@ Status: plan, 2026-11-08 (owner decision D-4: in scope for v1.81.0). Base `feat/
 4–5 web_fetch_cached / web_extract: `PublicOrigins` grant + host `web_fetch_protected_cached` (DNS pin, no redirects) → parse-worker ExtractHtml.
 6–8 execute_program / code_map / office_script: spawnd ExecutionBackend child run (offline), pending job after parent exits.
 9–10 browser_record_start/stop: child run via duduclaw-egress; job store stop.
-11 skill_from_recording: job store + brokered /work artifacts (fix snapshot path mismatch `isolation_worker_plans.rs:616-642` vs `recording_helper.rs:110`).
+11 skill_from_recording: job store + brokered /work artifacts (fix snapshot path mismatch `isolation_worker_plans.rs:616-642` vs `recording_helper.rs:110`). SFR (2026-11-09): HX6's `SqliteRecordingJobs` installed at boot as the H12d seam (own finished job only: employee + principal + binding, exact `(run, call)`); artifacts only as `VerifiedArtifact` and still untrusted, parsed only by E (trace archive caps, no traversal/symlinks); E-scanned publication into own SKILLS; signed only behind the HX6 recording gate (hidden while it is off); off the pending list.
 12–15 skill_extract / shared_skill_adopt / skill_security_scan / skill_graduate: parse-worker E ops + skill publication into own wiki.
 16–18 skill_synthesis_run / skill_hub_install / skill_curator_status: host provider/fetch + E ops; curator own skills only.
 19–21 create_task / spawn_agent / spawn_ephemeral: host queue; live task-ownership; ephemeral under parent identity.

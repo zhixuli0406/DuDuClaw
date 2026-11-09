@@ -105,12 +105,13 @@ feature source, and the readiness report then names
 `workspace_broker_unavailable`, `helper_launcher_unavailable{reason}` and
 `helper_runtime_missing{runtime}`. The own-skill tools below (H12a) never receive a Workspace (or
 Recipient) grant from these selectors; of the H12b/c/d job tools only
-`skill_from_recording` uses the brokered Workspace (its artifacts live there),
-and it stays in `PENDING_WORKSPACE_SELECTOR_TOOLS` until H12d's `RecordingJobs`
-seam is implemented over HX6's `recording_jobs` store with `verify_artifact`
-(CLI tripwire). `skill_hub_install`, `skill_synthesis_run` (H12b/c),
-`spawn_agent`/`spawn_ephemeral` (H13) and `browser_record_start`/`stop` (HX6)
-are no longer on that list.
+`skill_from_recording` uses the brokered Workspace (its artifacts live there).
+SFR: it left `PENDING_WORKSPACE_SELECTOR_TOOLS`; the issuer signs it with its
+own selector (`workspace_selection::RECORDING_DISTILL_TOOLS`) under exactly the
+recording gate's conditions, without PublicOrigins. `skill_hub_install`,
+`skill_synthesis_run` (H12b/c), `spawn_agent`/`spawn_ephemeral` (H13),
+`browser_record_start`/`stop` (HX6) and `skill_from_recording` (SFR) are no
+longer on that list; it now holds only the fork/discovery readers.
 
 H12a (v1.81): the own-skill tools `skill_extract`, `shared_skill_adopt`,
 `skill_security_scan`, `skill_graduate` and `skill_curator_status` no longer
@@ -166,11 +167,22 @@ employee's own utility runtime, budget and autonomy gates, only its own events a
 scored, E prepares and scans the model output, and the skill lands in its own
 SKILLS (no global bank, no Workspace grant). `skill_from_recording` needs the own
 `Employee`, the plain brokered `Workspace{employee-work}` and an installed recording
-job store; the artifacts are read through root's broker at the helper's layout
+job store. SFR: gateway boot installs HX6's `SqliteRecordingJobs` as that store
+(`isolation_skill_jobs::install_recording_source`); a call reads only the caller's
+own finished recording (owner read by employee, principal incl. generation and
+binding; the exact `(run, call)` id; `complete`; the helper's strict result). The
+artifacts are read through root's broker at the helper's layout
 (`recordings/<id>/{trace.zip,actions.json,network.json}`, shared
-`duduclaw_isolation::recording_layout`) and must match the job manifest. HX6's
-recording store exists, but the H12d `RecordingJobs` seam is not yet installed
-over it, so it is not eligible (hidden) in production.
+`duduclaw_isolation::recording_layout`) and come back only as `VerifiedArtifact`s
+(`recording_jobs::verify_artifact`; a rewrite refuses with `artifact_modified`).
+A matching digest does not make them trusted: the distill step takes only a
+`VerifiedRecording` and hands the framed artifacts to E, which checks the trace
+archive (entry count, sizes, ratio, no traversal/absolute/symlink/special or
+duplicate entries) and reduces, redacts and fences every page-derived string. The
+skill is E-scanned and published no-clobber into the caller's own SKILLS (no
+draft/approval card, as H12c). It is signed only behind the HX6 recording gate, so
+while recording is gated off (`RECORDING_BUILD_ENABLED`, per-host probe) it stays
+hidden in production.
 
 Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host handler is selected by `boundary_route` (including the Linux bundled model catalog). Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
 
@@ -337,7 +349,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `browser_record_stop` | HX6 `Route::InRunHelper`: same run ⇒ `HelperStop` for that `(run, call)` and the stored result (the old `:180` refusal inverted, never `parse_handle`); later run or terminal row ⇒ stored result, no helper interaction; revocation ⇒ `HelperStop`, `ended_by: revoked`; same selector as `browser_record_start`; names no URL, so needs no `PublicOrigins`/`UrlOrigin` |
 | `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
-| `skill_from_recording` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + brokered Workspace{employee-work}; own finished recording from the job store (HX6 seam), artifacts read through root's broker at the helper layout and matched to the job manifest, summarized by E, staged for approval; not eligible until the H12d `RecordingJobs` seam is installed over HX6's recording store with `verify_artifact` |
+| `skill_from_recording` | Resource → protected host orchestration (`mcp_skill_jobs::handle_protected`); checked E parser required; EmployeeScope + own Employee + brokered Workspace{employee-work}, signed only behind the HX6 recording gate (spawnd `helper_calls` + `helper_recording`, `[isolation] public_web`, interactive run, profile allows; no PublicOrigins), so hidden while recording is gated off; only the caller's own finished recording from HX6's job store (installed at boot as H12d's `RecordingJobs` seam: owner read by employee + principal + binding, exact `(run, call)` id, `complete`, strict helper result); every artifact read through root's broker at the shared `recording_layout` and returned only as a `VerifiedArtifact` (`recording_jobs::verify_artifact`, else `artifact_modified`); artifacts stay untrusted and are parsed only by E (`RecordingArtifacts`: framed bundle, trace archive entry/size/ratio caps, no traversal or symlink entries); E scan before a no-clobber publication into the caller's own `agents/<label>/SKILLS` |
 | `memory_search` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_store` | Resource → AuthorizedToolCall → original live employee handler |
 | `working_state_set` | Resource → AuthorizedToolCall → original live employee handler |

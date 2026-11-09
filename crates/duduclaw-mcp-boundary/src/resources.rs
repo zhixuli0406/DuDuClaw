@@ -218,18 +218,31 @@ impl WorkBrokerError {
 pub enum FileRefusal {
     Verification(VerificationError),
     Broker(WorkBrokerError),
+    /// SFR: a recording artifact did not match the digest stored by the job
+    /// store (`recording_jobs::verify_artifact`): `artifact_modified` /
+    /// `artifact_unknown`.
+    Artifact(crate::recording_jobs::ArtifactError),
 }
 impl From<VerificationError> for FileRefusal {
     fn from(error: VerificationError) -> Self { Self::Verification(error) }
 }
 impl FileRefusal {
-    /// The boundary error: every broker refusal is `Unavailable`.
+    /// The boundary error: every broker refusal is `Unavailable`; an artifact
+    /// that is not the recorded one is a binding mismatch.
     pub fn verification(self) -> VerificationError {
-        match self { Self::Verification(error) => error, Self::Broker(_) => VerificationError::Unavailable }
+        match self {
+            Self::Verification(error) => error,
+            Self::Broker(_) => VerificationError::Unavailable,
+            Self::Artifact(_) => VerificationError::BindingMismatch,
+        }
     }
     /// The root broker's refusal, if this came from root.
     pub fn broker(self) -> Option<WorkBrokerError> {
-        match self { Self::Broker(error) => Some(error), Self::Verification(_) => None }
+        match self { Self::Broker(error) => Some(error), Self::Verification(_) | Self::Artifact(_) => None }
+    }
+    /// The recording artifact check's refusal, if this came from it.
+    pub fn artifact(self) -> Option<crate::recording_jobs::ArtifactError> {
+        match self { Self::Artifact(error) => Some(error), _ => None }
     }
 }
 

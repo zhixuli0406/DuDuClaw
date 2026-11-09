@@ -103,6 +103,23 @@ pub fn summarize_recording(bytes: &[u8], desktop: bool, name: &str) -> Result<Re
         ParseResult::Failed { code } => Err(code),
     }
 }
+/// SFR: summarize a protected recording from its framed, verified artifacts
+/// (`recording_layout::bundle`). Every byte is parsed only in the worker:
+/// the frame, the trace archive and the JSON artifacts.
+pub fn summarize_recording_artifacts(bundle: &[u8], name: &str) -> Result<RecordingSummary, ParseError> {
+    if bundle.len() as u64 > duduclaw_isolation::recording_layout::MAX_BUNDLE_BYTES { return Err(ParseError::LimitExceeded); }
+    let options = ParseOptions::RecordingArtifacts {
+        name: duduclaw_isolation::bounded::Text::new(name.to_owned()).map_err(|_| ParseError::InvalidContent)? };
+    match invoke(&mut std::io::Cursor::new(bundle), ParseOperation::SummarizeRecording,
+        ContentFormat::Archive, options, None)?.result {
+        ParseResult::Complete { items } => match items.as_slice() {
+            [ParsedItem::Recording { input_slot: 0, summary }] => Ok(summary.clone()),
+            _ => Err(ParseError::InvalidContent),
+        },
+        ParseResult::Failed { code } => Err(code),
+    }
+}
+
 /// Scan model output as a real bounded file before approval/publication.
 pub fn scan_skill_bytes(bytes: &[u8]) -> Result<(bool, String, Vec<String>), ParseError> {
     let options = ParseOptions::SkillScan { must_not: duduclaw_isolation::bounded::List::new(vec![])

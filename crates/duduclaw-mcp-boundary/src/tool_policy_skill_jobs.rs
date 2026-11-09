@@ -75,8 +75,8 @@ pub fn own_skill_job_selector(context: &RequestContext, name: &str) -> Result<Ve
     match name {
         "skill_hub_install" => selection.push(public_origins_grant(context).ok_or(VerificationError::Invalid)?.clone()),
         "skill_from_recording" => {
-            // Fail closed until the recording job store exists (HX6): without
-            // it no artifact manifest can bind the recording to this employee.
+            // Fail closed without the recording job store (installed at gateway
+            // boot): no artifact manifest could bind the recording to this employee.
             if recording_jobs().is_none() { return Err(VerificationError::Unavailable); }
             let workspace = ResourceGrant::Workspace { handle: Text::new(crate::resources::EMPLOYEE_WORK_ROOT.to_owned())
                 .map_err(|_| VerificationError::Invalid)? };
@@ -157,12 +157,21 @@ impl RecordingManifest {
     pub fn artifact(&self, name: &str) -> Option<&RecordingArtifact> {
         self.artifacts.iter().find(|artifact| artifact.name == name)
     }
+
+    /// SFR: the same digests in HX6's form, the input of
+    /// `recording_jobs::verify_artifact` (the only way to a `VerifiedArtifact`).
+    pub fn digests(&self) -> Vec<crate::recording_jobs::ArtifactDigest> {
+        self.artifacts.iter().map(|artifact| crate::recording_jobs::ArtifactDigest { name: artifact.name,
+            bytes: artifact.bytes, sha256: artifact.sha256.iter().map(|b| format!("{b:02x}")).collect() }).collect()
+    }
 }
 
 /// HX6 seam: the recording job store. `recorded` returns the manifest only for
 /// a finished recording owned by the record's employee, principal and binding
 /// (the job handle is a selector, never bearer authority); anything else is a
-/// refusal. Until HX6 installs one, `skill_from_recording` is not eligible.
+/// refusal. Without one `skill_from_recording` is not eligible. SFR: gateway
+/// boot installs `isolation_skill_jobs::StoredRecordings` over HX6's
+/// `SqliteRecordingJobs` (`install_recording_source`).
 pub trait RecordingJobs: Send + Sync {
     fn recorded(&self, context: &RequestContext, id: &str) -> Result<RecordingManifest, VerificationError>;
 }

@@ -235,6 +235,28 @@ fn i1c_real_skill_files_produce_bound_scan_transform_and_knowledge_results() {
     assert!(matches!(items.as_slice(), [ParsedItem::SkillScan { passed: false, .. }]));
 }
 
+/// SFR: the framed protected recording goes through the real fd parser as an
+/// Archive input; a Text hint, or a hostile trace inside, fails closed.
+#[test]
+fn sfr_protected_recording_bundle_parses_only_as_archive_input() {
+    use duduclaw_isolation::{recording_layout, worker::ParseOptions};
+    let events = br#"{"type":"before","method":"click","params":{"selector":"#save"}}"#;
+    let run = |trace: &[u8], format: ContentFormat| {
+        let bundle = recording_layout::bundle([trace, br#"{"actions":[]}"#, br#"{"responses":[]}"#]).unwrap();
+        let mut req = request(&bundle, ParseOperation::SummarizeRecording, format, 128 * 1024);
+        req.options = Some(ParseOptions::RecordingArtifacts { name: Text::new("save-form".into()).unwrap() });
+        let mut file = tempfile::tempfile().unwrap(); file.write_all(&bundle).unwrap();
+        let response = parse(&req, &mut [file]); response.validate_for(&req).unwrap();
+        response.result
+    };
+    let ParseResult::Complete { items } = run(&zip(&[("trace.trace", events)]), ContentFormat::Archive)
+        else { panic!("protected recording") };
+    assert!(matches!(items.as_slice(), [ParsedItem::Recording { summary, .. }] if summary.action_count == 1));
+    assert!(matches!(run(&zip(&[("trace.trace", events)]), ContentFormat::Text), ParseResult::Failed { .. }));
+    assert!(matches!(run(&zip(&[("trace.trace", events), ("../escape", b"x")]), ContentFormat::Archive),
+        ParseResult::Failed { .. }));
+}
+
 #[test]
 fn i1c_recording_manifest_and_evolution_operations_parse_actual_files() {
     use duduclaw_isolation::worker::ParseOptions;
