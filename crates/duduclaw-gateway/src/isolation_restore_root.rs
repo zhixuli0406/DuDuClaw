@@ -268,7 +268,24 @@ pub(crate) trait ApprovalRule {
     /// the apply (fail closed).
     fn record_self_approval(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind, subject: &str)
         -> Result<(), &'static str>;
+    /// Owner decision 2026-11-09 (F6fa2): the approval of a Personal request
+    /// an Admin (`filer`, also the requester) filed for `owner`. A third
+    /// qualifying Admin only; never `self_approved`, no sole-Admin path
+    /// (`NO_SECOND_ADMIN`). Same transaction contract as [`Self::decide`].
+    /// Default: refused (a rule that does not implement it never approves one).
+    fn decide_admin_filed(&self, _users: &Connection, _filer: &str, _owner: &str, _approver: &str, _kind: RequestKind)
+        -> Result<Approval, &'static str> {
+        Err(ADMIN_FILED_RULE_UNAVAILABLE)
+    }
+    /// At filing (F6fa2): `filer` is an eligible Admin and another qualifying
+    /// Admin (neither filer nor owner) exists. Default: refused.
+    fn check_admin_filing(&self, _users: &Connection, _filer: &str, _owner: &str) -> Result<(), &'static str> {
+        Err(ADMIN_FILED_RULE_UNAVAILABLE)
+    }
 }
+
+/// Refusal of a rule without the F6fa2 admin-filed decision.
+pub(crate) const ADMIN_FILED_RULE_UNAVAILABLE: &str = "APPROVAL_RULE_UNAVAILABLE";
 
 /// Production rule until F6c2 lands: refuses every approval.
 pub(crate) struct ApprovalRuleUnavailable;
@@ -287,6 +304,27 @@ pub(crate) fn decide(rule: &dyn ApprovalRule, users: &Connection, requester: &st
     -> Result<Approval, Refusal> {
     let approval = rule.decide(users, requester, approver, kind).map_err(Refusal::Approval)?;
     if approval.self_approved != (approver == requester) { return Err(Refusal::Approval("APPROVAL_RULE_INCONSISTENT")); }
+    Ok(approval)
+}
+
+/// [`decide`] for one journal row: an Admin-filed Personal request (F6fa2)
+/// goes through [`ApprovalRule::decide_admin_filed`] with the filer as
+/// requester and the owner as a second party; its answer must never be
+/// `self_approved` and never name a party as approver.
+pub(crate) fn decide_request(rule: &dyn ApprovalRule, users: &Connection, request: &RestoreRequest, approver: &str)
+    -> Result<Approval, Refusal> {
+    let Some(filer) = request.filed_by_admin.as_deref() else {
+        return decide(rule, users, &request.requester, approver, request.kind);
+    };
+    let owner = request.owner.as_deref().ok_or(Refusal::Inconsistent)?;
+    if filer != request.requester || filer == owner
+        || !matches!(request.kind, RequestKind::PersonalRestore | RequestKind::PersonalAdopt) {
+        return Err(Refusal::Inconsistent);
+    }
+    let approval = rule.decide_admin_filed(users, filer, owner, approver, request.kind).map_err(Refusal::Approval)?;
+    if approval.self_approved || approver == filer || approver == owner {
+        return Err(Refusal::Approval("APPROVAL_RULE_INCONSISTENT"));
+    }
     Ok(approval)
 }
 

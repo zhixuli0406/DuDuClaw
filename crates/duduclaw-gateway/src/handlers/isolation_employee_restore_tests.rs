@@ -34,7 +34,7 @@ async fn restore_rpcs_not_listed_to_ai() {
         assert_eq!(refusal(&frame), NOT_ALLOWED, "{method}");
     }
     // Admin methods refuse non-Admins before reading anything.
-    for method in [DECIDE, CANCEL, REGRANT, RETIRE_PROPOSE, SHARED_ADOPTION_REQUEST] {
+    for method in [DECIDE, CANCEL, REGRANT, RETIRE_PROPOSE, SHARED_ADOPTION_REQUEST, RESTORE_FOR_OWNER, ADOPTION_FOR_OWNER] {
         let frame = handler.handle_isolation_employee(method, json!({}), &ctx("u-1", UserRole::Employee)).await;
         assert_eq!(refusal(&frame), ADMIN_REQUIRED, "{method}");
     }
@@ -164,6 +164,55 @@ async fn shared_adoption_request_admin_step_up() {
     assert!(authorize_step_up(None, "admin-1", &[7; 32], now).is_err());
     assert!(authorize_step_up(Some(&proof(now - 301)), "admin-1", &[7; 32], now).is_err());
     assert!(authorize_step_up(Some(&proof(now)), "00000000-0000-4000-8000-000000000001", &[8; 32], now).is_err());
+}
+
+/// F6fa2 (owner decision 2026-11-09): the Admin filing RPCs are
+/// dashboard-only, Admin + current MFA at the gate (non-Admins and `system`
+/// refused before anything is read), then the step-up with its CSRF token in
+/// the call; no field names an owner, a requester, an approver or a flag.
+#[tokio::test]
+async fn f6fa2_admin_filing_rpcs_gated() {
+    let dir = crate::fs_safe::private_test_home().unwrap();
+    let handler = MethodHandler::new(dir.path().to_path_buf()).await;
+    let csrf = vec![7u8; 32];
+    let params = json!({"employee_id": "0".repeat(32), "incarnation": 0, "csrf_token": csrf});
+    for method in [RESTORE_FOR_OWNER, ADOPTION_FOR_OWNER] {
+        assert!(super::super::owns(method), "{method}");
+        assert!(crate::handlers::is_enterprise_only_method(method), "{method}");
+        for role in [UserRole::Employee, UserRole::Manager] {
+            assert_eq!(refusal(&handler.handle_isolation_employee(method, params.clone(), &ctx("staff", role)).await), ADMIN_REQUIRED,
+                "{method}");
+        }
+        assert_eq!(refusal(&handler.handle_isolation_employee(method, params.clone(), &ctx("admin-1", UserRole::Admin)).await),
+            ADMIN_REQUIRED, "{method}: no current MFA");
+        assert_eq!(refusal(&handler.handle_isolation_employee(method, params.clone(), &ctx("system", UserRole::Admin)).await),
+            NOT_ALLOWED, "{method}");
+    }
+    assert!(serde_json::from_value::<ForOwner>(params.clone()).is_ok());
+    let mut with_target = params.clone();
+    with_target["target_label"] = json!("alice-next");
+    assert!(serde_json::from_value::<AdoptionForOwner>(with_target.clone()).is_ok());
+    assert!(serde_json::from_value::<ForOwner>(with_target).is_err(), "a restore keeps its label");
+    for extra in ["owner_id", "owner_user_id", "requester_user_id", "approver_user_id", "filed_by_admin", "owner_unverified",
+        "self_approved", "factor", "step_up"] {
+        let mut forged = params.clone();
+        forged[extra] = json!("x");
+        assert!(serde_json::from_value::<ForOwner>(forged.clone()).is_err(), "{extra}");
+        assert!(serde_json::from_value::<AdoptionForOwner>(forged).is_err(), "{extra}");
+    }
+    let mut partial = params.clone();
+    partial.as_object_mut().unwrap().remove("csrf_token");
+    assert!(serde_json::from_value::<ForOwner>(partial.clone()).is_err(), "csrf required");
+    assert!(serde_json::from_value::<AdoptionForOwner>(partial).is_err(), "csrf required");
+    // The production rule fails closed: no step-up, or no readable eligibility log.
+    use crate::isolation_restore::{ApprovalRule as _, RequestKind};
+    let users = rusqlite::Connection::open_in_memory().unwrap();
+    users.execute_batch("BEGIN").unwrap();
+    assert_eq!(LogRule::new(false, 10).decide_admin_filed(&users, "a", "o", "b", RequestKind::PersonalRestore),
+        Err("STEP_UP_REQUIRED"));
+    assert_eq!(LogRule::new(true, 10).decide_admin_filed(&users, "a", "o", "b", RequestKind::PersonalAdopt),
+        Err("ADMIN_LOG_UNAVAILABLE"));
+    assert_eq!(LogRule::new(false, 10).check_admin_filing(&users, "a", "o"), Err("ADMIN_LOG_UNAVAILABLE"));
 }
 
 /// `me.isolation.request_adoption`: the owner's proof fields only; the

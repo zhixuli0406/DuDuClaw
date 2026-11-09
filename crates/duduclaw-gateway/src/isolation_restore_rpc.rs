@@ -11,7 +11,13 @@
 //!   (Q2: passkey assertion / TOTP / email code), bound to the row's purpose
 //!   `restore:<employee_id>:<incarnation>` and verified before anything is
 //!   filed; a failed proof counts toward the login lockout.
-//!   There is no admin RPC that files a Personal request.
+//!   The only Admin RPCs that file a Personal request are
+//!   [`request_restore_for_owner`] / [`adoption_request_for_owner`] (owner
+//!   decision 2026-11-09, F6fa2): only for an owner whose tombstone snapshot
+//!   shows no second factor, Admin + fresh step-up, a different qualifying
+//!   Admin approves (no sole-Admin path), uncapped notice to the
+//!   tombstone-time address at filing and at approval, the row marked
+//!   `filed_by_admin` + `owner_unverified`.
 //! - Admin (`isolation.*`): [`decide`] (approve runs the F6c engine with the
 //!   F6c2 rule inside the users.db transaction; `self_approved` is recorded
 //!   on the request), [`admin_cancel`], [`regrant`] (one listed label-keyed
@@ -111,6 +117,12 @@ impl RpcError {
                 Refusal::Approval("SELF_APPROVAL_COOLING") => "7 天內有管理員失去權限，暫時不能自行核准",
                 Refusal::Approval("ADMIN_LOG_UNAVAILABLE") => "管理員權限紀錄無法讀取，暫時不能自行核准",
                 Refusal::Approval("STEP_UP_REQUIRED") => "請先以密碼與雙因素驗證確認身分。",
+                Refusal::Approval("NO_SECOND_ADMIN") =>
+                    "代主人申請需由另一位管理員核准，目前沒有其他可核准的管理員（擔任管理員滿 7 天且不是由申請人設定），因此無法代為申請或核准。",
+                Refusal::Approval("FILER_NOT_ELIGIBLE") => "只有目前已啟用、設定兩步驟驗證的管理員可以代主人申請。",
+                Refusal::OwnerHadSecondFactor =>
+                    "主人在註銷時已設定兩步驟驗證，必須由主人本人以該驗證方式申請，管理員不能代為申請。",
+                Refusal::FilerIsOwner => "你是這位員工的主人，請在「我的帳號」以兩步驟驗證自行申請。",
                 Refusal::Approval(_) => "無法核准這筆申請，請重新載入後再試。",
                 Refusal::TombstoneIncomplete | Refusal::FencePending => "註銷尚未完成，系統會重試，請稍後再試。",
                 Refusal::TenantMismatch => "租戶與註銷時不一致，無法還原。",
@@ -247,8 +259,11 @@ fn row_value(db: &rusqlite::Connection, q: &engine::Quarantined, now: i64) -> Re
         "owner_user_id": q.owner, "seal": q.seal, "tombstoned_at": q.quarantined_at, "restore_deadline": deadline,
         "restorable": q.seal == "sealed" && now <= deadline && open.is_none() && allocated,
         "root_state": state, "root_flag": flag,
-        "open_request": open.map(|r| json!({"request_id": r.request_id, "state": r.state, "requester_user_id": r.requester,
-            "created_at": r.created_at, "expires_at": r.expires_at})),
+        // F6fa2: an Admin may file for this owner (no second factor at the tombstone).
+        "admin_may_file_for_owner": engine::admin_may_file_for_owner(q),
+        "open_request": open.map(|r| json!({"request_id": r.request_id, "kind": r.kind.as_str(), "state": r.state,
+            "requester_user_id": r.requester, "created_at": r.created_at, "expires_at": r.expires_at,
+            "filed_by_admin": r.filed_by_admin, "owner_unverified": r.owner_unverified()})),
     }))
 }
 
@@ -299,7 +314,8 @@ pub(crate) fn admin_view(home: &Path, now: i64) -> Result<Value, RpcError> {
         let r = engine::read_request(&db, id)?.ok_or(Refusal::Unavailable)?;
         Ok(json!({"request_id": r.request_id, "kind": r.kind.as_str(), "label": r.label, "employee_id": hex::encode(r.employee.0),
             "incarnation": r.incarnation, "requester_user_id": r.requester, "state": r.state, "created_at": r.created_at,
-            "expires_at": r.expires_at, "approver_user_id": r.approver, "self_approved": r.self_approved, "failure": r.failure}))
+            "expires_at": r.expires_at, "approver_user_id": r.approver, "self_approved": r.self_approved, "failure": r.failure,
+            "owner_user_id": r.owner, "filed_by_admin": r.filed_by_admin, "owner_unverified": r.owner_unverified()}))
     }).collect::<Result<_, Refusal>>()?;
     Ok(json!({"quarantine": rows, "requests": requests}))
 }
@@ -371,8 +387,11 @@ pub(crate) fn decide(home: &Path, env: &RestoreEnv<'_>, approver: &str, id: &str
         .map(|report| report.to_value())
         .unwrap_or_else(|_| json!({"regrant": [], "skipped": [], "listed": [], "unavailable": true}));
     if let Some(q) = row_of(home, request.employee, request.incarnation)? {
+        // Never dropped; reaches the tombstone-time address (F6fa2: also the
+        // approval notice of an Admin-filed request).
         notify(home, &q, "isolation.employee_restored", json!({"request_id": id, "approver_user_id": approver,
-            "self_approved": restored.self_approved, "incarnation": restored.incarnation}), false, env.now);
+            "self_approved": restored.self_approved, "incarnation": restored.incarnation,
+            "filed_by_admin": request.filed_by_admin, "owner_unverified": request.owner_unverified()}), false, env.now);
         if restored.self_approved {
             // S16: the addresses the rule read from the log in the apply tx,
             // plus (Personal, §3.4) the tombstone-time notice address.
@@ -512,6 +531,60 @@ pub(crate) fn shared_adoption_request(home: &Path, env: &AdoptEnv<'_>, actor: &s
     adoption_filed(home, &request, env.now)
 }
 
+// ── F6fa2: an Admin files for an owner without a second factor ─────────
+
+/// The filing notice of an Admin-filed request (owner decision 2026-11-09):
+/// **uncapped** (a security notice, never dropped by the L1 cap), to the
+/// log-eligible Admins and the owner's tombstone-time notice address.
+fn notify_filed_for_owner(home: &Path, request: &engine::RestoreRequest, event: &str, extra: Value, now: i64) -> Result<bool, RpcError> {
+    let Some(q) = row_of(home, request.employee, request.incarnation)? else { return Ok(false) };
+    let mut details = json!({"request_id": request.request_id, "kind": request.kind.as_str(), "expires_at": request.expires_at,
+        "owner_user_id": request.owner, "filed_by_admin": request.filed_by_admin, "owner_unverified": request.owner_unverified()});
+    if let (Some(target), Value::Object(more)) = (details.as_object_mut(), extra) { target.extend(more); }
+    Ok(notify(home, &q, event, details, false, now))
+}
+
+/// The reply of an Admin-filed request (UI: 主人未用兩步驟驗證確認).
+fn filed_for_owner_reply(request: &engine::RestoreRequest, target: Option<&str>, notified: bool) -> Value {
+    let mut reply = json!({"request_id": request.request_id, "kind": request.kind.as_str(), "state": request.state,
+        "label": request.label, "owner_user_id": request.owner, "expires_at": request.expires_at, "approval_required": true,
+        "second_admin_required": true, "filed_by_admin": request.filed_by_admin, "owner_unverified": request.owner_unverified(),
+        "notified": notified});
+    if let Some(target) = target { reply["target_label"] = json!(target); }
+    reply
+}
+
+/// `isolation.employee_restore_request_for_owner` (Admin + MFA + migration
+/// step-up, checked by the caller; `fresh_step_up` = that proof's
+/// freshness): the Admin files a Personal restore for the owner of a row
+/// whose tombstone snapshot shows no second factor (F6c
+/// `file_personal_request_for_owner`). The owner is named by the row, never
+/// by a request field.
+pub(crate) fn request_restore_for_owner(home: &Path, env: &RestoreEnv<'_>, actor: &str, employee: &str, incarnation: u32,
+    fresh_step_up: bool) -> Result<Value, RpcError> {
+    let employee = hex16(employee)?;
+    let filed = engine::file_personal_request_for_owner(home, env, employee, incarnation,
+        engine::AdminFiler { admin_user_id: actor, fresh_step_up })?;
+    let request = filed.request;
+    let notified = notify_filed_for_owner(home, &request, "isolation.employee_restore_requested_for_owner", json!({}), env.now)?;
+    Ok(filed_for_owner_reply(&request, None, notified))
+}
+
+/// `isolation.adoption_request_for_owner` (Admin + MFA + migration step-up):
+/// the Admin files a Personal adoption (F6g, `Personal(same owner)`) for an
+/// owner without a second factor at the tombstone (`Filer::AdminForOwner`).
+pub(crate) fn adoption_request_for_owner(home: &Path, env: &AdoptEnv<'_>, actor: &str, employee: &str, incarnation: u32,
+    target: Option<&str>, fresh_step_up: bool) -> Result<Value, RpcError> {
+    let employee = hex16(employee)?;
+    let target = target_label(target)?;
+    let request = adopt::file_adoption(home, env, employee, incarnation, target,
+        Filer::AdminForOwner(engine::AdminFiler { admin_user_id: actor, fresh_step_up }))?;
+    let (target, _) = { let db = engine::open_apply(home)?; adopt::adoption_columns(&db, &request.request_id)? };
+    let notified = notify_filed_for_owner(home, &request, "isolation.employee_adoption_requested_for_owner",
+        json!({"target_label": target}), env.now)?;
+    Ok(filed_for_owner_reply(&request, target.as_deref(), notified))
+}
+
 /// After the confirmation store applied `item` (the Employee backend commits
 /// an adoption inside that call): `true` when it was an adoption, so the
 /// caller rescans the registry; the approval notice (never dropped) goes to
@@ -526,7 +599,8 @@ pub(crate) fn adoption_committed(home: &Path, item: &duduclaw_migration::contrac
     });
     if let (Some((request, target)), Ok(Some(q))) = (found, row_of(home, reference.employee, reference.incarnation)) {
         notify(home, &q, "isolation.employee_adopted", json!({"request_id": request.request_id, "approver_user_id": approver,
-            "self_approved": request.self_approved, "target_label": target}), false, now);
+            "self_approved": request.self_approved, "target_label": target,
+            "filed_by_admin": request.filed_by_admin, "owner_unverified": request.owner_unverified()}), false, now);
     }
     true
 }

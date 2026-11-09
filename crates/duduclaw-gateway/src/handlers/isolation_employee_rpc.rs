@@ -26,7 +26,10 @@
 //!   `restore_challenge`, `request_restore`, `cancel_restore`; `isolation.employee_restore_decide`,
 //!   `employee_restore_cancel`, `employee_restore_regrant`, `employee_retire_propose`;
 //!   F6g adoption requests `me.isolation.request_adoption` (owner, strongest
-//!   factor) and `isolation.shared_adoption_request` (Admin + step-up).
+//!   factor) and `isolation.shared_adoption_request` (Admin + step-up);
+//!   F6fa2 (owner decision 2026-11-09) `isolation.employee_restore_request_for_owner`
+//!   / `isolation.adoption_request_for_owner` (Admin + fresh step-up, owner
+//!   without a second factor at the tombstone, a different Admin approves).
 //! - `isolation.employee_list` (Admin): confirmed employees and requests,
 //!   plus the step-up state for the dashboard.
 //! - `isolation.employee_purge_requests` (Admin + step-up, SR2): removes
@@ -135,6 +138,8 @@ pub(super) fn owns(method: &str) -> bool {
         || method.starts_with("me.isolation.")
         // F6g adoption: the Admin's Shared request (F6d surface, `restore::METHODS`).
         || method == restore::SHARED_ADOPTION_REQUEST
+        // F6fa2: the Admin's Personal adoption filed for an owner without a second factor.
+        || method == restore::ADOPTION_FOR_OWNER
 }
 
 #[derive(serde::Deserialize)]

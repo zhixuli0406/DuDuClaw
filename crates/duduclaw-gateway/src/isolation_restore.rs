@@ -131,6 +131,12 @@ pub(crate) enum Refusal {
     Approval(&'static str),
     /// Records disagree in a way only an operator may resolve (alerted).
     Inconsistent,
+    /// Admin filing for an owner (owner decision 2026-11-09): the tombstone
+    /// snapshot shows the owner had a second factor then, so only the owner
+    /// may file (with that factor); never a fallback.
+    OwnerHadSecondFactor,
+    /// Admin filing for an owner: the filing Admin is the owner.
+    FilerIsOwner,
 }
 
 impl Refusal {
@@ -163,6 +169,8 @@ impl Refusal {
             Self::Root(class) => class.code(),
             Self::Approval(code) => code,
             Self::Inconsistent => "RESTORE_INCONSISTENT",
+            Self::OwnerHadSecondFactor => "OWNER_HAD_SECOND_FACTOR",
+            Self::FilerIsOwner => "FILER_IS_OWNER",
         }
     }
 }
@@ -179,9 +187,29 @@ fn from_lifecycle(error: LifecycleError) -> Refusal {
 
 // ── Journal ─────────────────────────────────────────────────────────────
 
+/// F6fa2 (owner decision 2026-11-09) columns of `employee_restores`:
+/// `filed_by_admin` = the Admin who filed a Personal request on behalf of an
+/// owner without a second factor at the tombstone (NULL: owner-filed), and
+/// `owner_unverified` = 1 exactly for such a request (the owner never proved a
+/// factor; the UI marks 主人未用兩步驟驗證確認). Added in place, idempotent.
+const ADMIN_FILED_COLUMNS: [(&str, &str); 2] = [
+    ("filed_by_admin", "ALTER TABLE employee_restores ADD COLUMN filed_by_admin TEXT"),
+    ("owner_unverified", "ALTER TABLE employee_restores ADD COLUMN owner_unverified INTEGER NOT NULL DEFAULT 0
+        CHECK (owner_unverified IN (0, 1))"),
+];
+
 pub(crate) fn ensure_restore_schema(db: &Connection) -> Result<(), Refusal> {
     quarantine::ensure_employee_schema(db).map_err(unavailable)?;
-    db.execute_batch(RESTORE_SCHEMA).map_err(unavailable)
+    db.execute_batch(RESTORE_SCHEMA).map_err(unavailable)?;
+    let present = |column: &str| -> Result<bool, Refusal> {
+        db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('employee_restores') WHERE name=?1)",
+            [column], |r| r.get(0)).map_err(unavailable)
+    };
+    for (column, ddl) in ADMIN_FILED_COLUMNS {
+        // A concurrent opener may add it first: only a still-missing column is an error.
+        if !present(column)? && db.execute_batch(ddl).is_err() && !present(column)? { return Err(Refusal::Unavailable); }
+    }
+    Ok(())
 }
 
 pub(crate) fn open_apply(home: &Path) -> Result<Connection, Refusal> {
@@ -294,23 +322,43 @@ pub(crate) struct RestoreRequest {
     pub(crate) approver: Option<String>,
     pub(crate) self_approved: Option<bool>,
     pub(crate) failure: Option<String>,
+    /// F6fa2 (owner decision 2026-11-09): the Admin who filed this Personal
+    /// request on behalf of an owner who had no second factor at the
+    /// tombstone (then also `requester`); `None` for an owner-filed request.
+    /// Stored with `owner_unverified = 1` and covered by the request digest.
+    pub(crate) filed_by_admin: Option<String>,
+}
+
+impl RestoreRequest {
+    /// The owner never proved a factor for this request (Admin-filed).
+    pub(crate) fn owner_unverified(&self) -> bool { self.filed_by_admin.is_some() }
 }
 
 const REQUEST_COLUMNS: &str = "request_id,kind,employee_hex,incarnation,label,owner_user_id,tenant_id,requester_user_id,
-    digest,route_digest,member_selection,created_at,expires_at,state,approver_user_id,self_approved,failure";
+    digest,route_digest,member_selection,created_at,expires_at,state,approver_user_id,self_approved,failure,
+    filed_by_admin,owner_unverified";
 
-type RawRequest = (Vec<Option<String>>, [i64; 4]);
+type RawRequest = (Vec<Option<String>>, [i64; 5]);
 
 fn request_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequest> {
-    let texts = [0usize, 1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 14, 16].iter()
+    let texts = [0usize, 1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 14, 16, 17].iter()
         .map(|index| r.get::<_, Option<String>>(*index)).collect::<rusqlite::Result<Vec<_>>>()?;
-    let numbers: [i64; 4] = [r.get(3)?, r.get(11)?, r.get(12)?, r.get::<_, Option<i64>>(15)?.unwrap_or(-1)];
+    let numbers: [i64; 5] = [r.get(3)?, r.get(11)?, r.get(12)?, r.get::<_, Option<i64>>(15)?.unwrap_or(-1), r.get(18)?];
     Ok((texts, numbers))
 }
 
 fn decode_request((texts, numbers): RawRequest) -> Result<RestoreRequest, Refusal> {
     let text = |index: usize| texts.get(index).cloned().flatten().ok_or(Refusal::Unavailable);
     let optional = |index: usize| texts.get(index).cloned().flatten();
+    let filed_by_admin = optional(13);
+    // Admin-filed ⇔ owner_unverified; a filer is the requester of a Personal row.
+    let personal = matches!(text(1)?.as_str(), "personal_restore" | "personal_adopt");
+    let consistent = match (&filed_by_admin, numbers[4]) {
+        (None, 0) => true,
+        (Some(admin), 1) => personal && Some(admin) == texts.get(6).and_then(Option::as_ref),
+        _ => false,
+    };
+    if !consistent { return Err(Refusal::Unavailable); }
     Ok(RestoreRequest {
         request_id: text(0)?, kind: RequestKind::parse(&text(1)?).ok_or(Refusal::Unavailable)?,
         employee: parse_employee(&text(2)?)?, incarnation: u32::try_from(numbers[0]).map_err(unavailable)?,
@@ -320,6 +368,7 @@ fn decode_request((texts, numbers): RawRequest) -> Result<RestoreRequest, Refusa
         created_at: numbers[1], expires_at: numbers[2], state: text(10)?, approver: optional(11),
         self_approved: match numbers[3] { -1 => None, 0 => Some(false), 1 => Some(true), _ => return Err(Refusal::Unavailable) },
         failure: optional(12),
+        filed_by_admin,
     })
 }
 
@@ -409,6 +458,13 @@ pub(crate) fn request_digest(request: &RestoreRequest, quarantine_digest: &str) 
     put(&mut hash, "owner", request.owner.as_deref().unwrap_or("").as_bytes());
     put(&mut hash, "members", request.member_selection.as_ref().map(Value::to_string).unwrap_or_default().as_bytes());
     put(&mut hash, "routes", request.route_digest.as_bytes());
+    // F6fa2: an Admin-filed request binds its filer and the unverified-owner
+    // flag (absent for owner-filed requests, whose digests are unchanged).
+    if let Some(admin) = &request.filed_by_admin {
+        put(&mut hash, "filed_by_admin", admin.as_bytes());
+        put(&mut hash, "requester", request.requester.as_bytes());
+        put(&mut hash, "owner_unverified", b"1");
+    }
     hex::encode(hash.finalize())
 }
 
@@ -444,30 +500,78 @@ pub(crate) fn file_personal_request(home: &Path, env: &RestoreEnv<'_>, employee:
     recover_label(home, env, &peek.label)?;
     let q = load_fenced(home, env, employee, incarnation)?;
     let routes = check_outside(home, env, &q)?;
+    let request = insert_personal_request(home, env, &q, &routes, proof.user_id, None)?;
+    audit(home, "isolation.employee_restore_requested", &request.label, Severity::Info,
+        audit_details(&request, json!({"factor": proof.factor, "routes": routes.len()})));
+    Ok(Filed { request })
+}
+
+/// The filing Admin of [`file_personal_request_for_owner`]: the RPC verified
+/// Admin + current MFA and the migration step-up of this call;
+/// `fresh_step_up` is that proof's freshness (never assumed).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdminFiler<'a> {
+    pub(crate) admin_user_id: &'a str,
+    pub(crate) fresh_step_up: bool,
+}
+
+/// `isolation.employee_restore_request_for_owner` engine (owner decision
+/// 2026-11-09, F6fa2 decision 2): an Admin files a Personal restore on behalf
+/// of an owner whose tombstone snapshot shows **no** second factor (an owner
+/// who had one is refused `OWNER_HAD_SECOND_FACTOR`, never offered this as a
+/// fallback). The filer needs a fresh step-up, must not be the owner, must be
+/// an eligible Admin, and some other qualifying Admin must exist to approve
+/// ([`check_admin_filing`]; the sole-Admin path is not available for these
+/// requests). Every owner-filed check runs unchanged: owner eligibility,
+/// Q3 credential changes (password/email/factor changed by others refuse),
+/// 90 days, root, routes, stores, quota. The row records `filed_by_admin` and
+/// `owner_unverified = 1`; the owner is notified at the tombstone-time address
+/// by the RPC.
+pub(crate) fn file_personal_request_for_owner(home: &Path, env: &RestoreEnv<'_>, employee: EmployeeId, incarnation: u32,
+    filer: AdminFiler<'_>) -> Result<Filed, Refusal> {
+    let peek = { let db = open_apply(home)?; read_row(&db, employee, incarnation)?.ok_or(Refusal::NotFound)? };
+    let filing = |users: &Connection, admin: &str, owner: &str| env.rule.check_admin_filing(users, admin, owner);
+    check_admin_filing(home, &peek, filer.admin_user_id, filer.fresh_step_up, &filing)?;
+    recover_label(home, env, &peek.label)?;
+    let q = load_fenced(home, env, employee, incarnation)?;
+    check_admin_filing(home, &q, filer.admin_user_id, filer.fresh_step_up, &filing)?;
+    let routes = check_outside(home, env, &q)?;
+    let request = insert_personal_request(home, env, &q, &routes, filer.admin_user_id, Some(filer.admin_user_id))?;
+    audit(home, "isolation.employee_restore_requested_for_owner", &request.label, Severity::Warning,
+        audit_details(&request, json!({"filed_by_admin": filer.admin_user_id, "owner_unverified": true, "routes": routes.len()})));
+    Ok(Filed { request })
+}
+
+/// The apply.db half of filing a Personal restore (both filers): common
+/// checks in the writer transaction, the L1 rate limit, the digest-bound row.
+fn insert_personal_request(home: &Path, env: &RestoreEnv<'_>, q: &Quarantined, routes: &[(String, u64)], requester: &str,
+    filed_by_admin: Option<&str>) -> Result<RestoreRequest, Refusal> {
     let mut db = open_apply(home)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
-    check_apply_db(&tx, &q, Stage::Request, env.now)?;
+    check_apply_db(&tx, q, Stage::Request, env.now)?;
     let recent: i64 = tx.query_row("SELECT count(*) FROM employee_restores WHERE employee_hex=?1 AND incarnation=?2 AND created_at>?3",
-        params![hex::encode(employee.0), incarnation, env.now - RATE_WINDOW_SECS], |r| r.get(0)).map_err(unavailable)?;
+        params![hex::encode(q.employee.0), q.incarnation, env.now - RATE_WINDOW_SECS], |r| r.get(0)).map_err(unavailable)?;
     if recent >= MAX_REQUESTS_PER_ROW { return Err(Refusal::RateLimited); }
     let unsigned = RestoreRequest {
-        request_id: hex::encode(uuid::Uuid::new_v4().as_bytes()), kind: RequestKind::PersonalRestore, employee, incarnation,
-        label: q.label.clone(), owner: q.owner.clone(), tenant: q.tenant.clone(), requester: proof.user_id.to_owned(),
-        digest: String::new(), route_digest: route_digest(&routes), member_selection: None, created_at: env.now,
+        request_id: hex::encode(uuid::Uuid::new_v4().as_bytes()), kind: RequestKind::PersonalRestore, employee: q.employee,
+        incarnation: q.incarnation, label: q.label.clone(), owner: q.owner.clone(), tenant: q.tenant.clone(),
+        requester: requester.to_owned(), digest: String::new(), route_digest: route_digest(routes), member_selection: None,
+        created_at: env.now,
         expires_at: env.now.saturating_add(REQUEST_TTL_SECS).min(q.quarantined_at.saturating_add(RESTORE_WINDOW_SECS)),
         state: "requested".into(), approver: None, self_approved: None, failure: None,
+        filed_by_admin: filed_by_admin.map(str::to_owned),
     };
     let digest = request_digest(&unsigned, q.digest.as_deref().ok_or(Refusal::NotSealed)?);
     let request = RestoreRequest { digest, ..unsigned };
     tx.execute("INSERT INTO employee_restores(request_id,kind,employee_hex,incarnation,label,owner_user_id,tenant_id,
-            requester_user_id,digest,route_digest,created_at,expires_at,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'requested')",
-        params![request.request_id, request.kind.as_str(), hex::encode(employee.0), incarnation, request.label, request.owner,
-            request.tenant, request.requester, request.digest, request.route_digest, request.created_at, request.expires_at])
+            requester_user_id,digest,route_digest,created_at,expires_at,state,filed_by_admin,owner_unverified)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'requested',?13,?14)",
+        params![request.request_id, request.kind.as_str(), hex::encode(q.employee.0), q.incarnation, request.label, request.owner,
+            request.tenant, request.requester, request.digest, request.route_digest, request.created_at, request.expires_at,
+            request.filed_by_admin, request.owner_unverified()])
         .map_err(unavailable)?;
     tx.commit().map_err(unavailable)?;
-    audit(home, "isolation.employee_restore_requested", &request.label, Severity::Info,
-        audit_details(&request, json!({"factor": proof.factor, "routes": routes.len()})));
-    Ok(Filed { request })
+    Ok(request)
 }
 
 /// How a request is closed without applying.

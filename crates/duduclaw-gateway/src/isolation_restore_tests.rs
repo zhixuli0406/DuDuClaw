@@ -70,6 +70,32 @@ impl ApprovalRule for AllowSelf {
             owner_user_id: kind.is_personal().then_some(requester), approver_user_id: approver, fresh_step_up: true, now: now() };
         duduclaw_auth::admin_approval_rule::record_self_approval(users, &request, subject).map_err(|_| "SELF_APPROVAL_AUDIT_UNAVAILABLE")
     }
+    /// F6fa2 stand-in: any third account approves; a party never does.
+    fn decide_admin_filed(&self, _: &Connection, filer: &str, owner: &str, approver: &str, _: RequestKind)
+        -> Result<Approval, &'static str> {
+        if approver == filer || approver == owner { Err("SECOND_ADMIN_REQUIRED") } else { Ok(Approval { self_approved: false }) }
+    }
+    fn check_admin_filing(&self, _: &Connection, filer: &str, owner: &str) -> Result<(), &'static str> {
+        if filer == owner { Err("INVALID_REQUEST") } else { Ok(()) }
+    }
+}
+
+/// F6fa2 stand-in for a home whose only qualifying Admin is the filer: the
+/// rule's answer for Admin-filed requests (no sole-Admin path); owner-filed
+/// requests as [`AllowSelf`].
+pub(super) struct SoleAdmin;
+impl ApprovalRule for SoleAdmin {
+    fn decide(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind) -> Result<Approval, &'static str> {
+        AllowSelf.decide(users, requester, approver, kind)
+    }
+    fn record_self_approval(&self, users: &Connection, requester: &str, approver: &str, kind: RequestKind, subject: &str)
+        -> Result<(), &'static str> {
+        AllowSelf.record_self_approval(users, requester, approver, kind, subject)
+    }
+    fn decide_admin_filed(&self, _: &Connection, _: &str, _: &str, _: &str, _: RequestKind) -> Result<Approval, &'static str> {
+        Err("NO_SECOND_ADMIN")
+    }
+    fn check_admin_filing(&self, _: &Connection, _: &str, _: &str) -> Result<(), &'static str> { Err("NO_SECOND_ADMIN") }
 }
 
 /// [`AllowSelf`] that logs every call: `("decide" | "record", in_transaction)`.
@@ -765,7 +791,7 @@ fn f6fa_q3_maps_each_snapshot_field_to_its_log_fields() {
     let since = duduclaw_auth::credential_changes::high_water(&conn).unwrap();
     conn.execute("UPDATE users SET password_hash='owner-changed' WHERE id=?1", [&f.alice]).unwrap();
     duduclaw_auth::credential_changes::stamp_owner(&conn, since, &f.alice).unwrap();
-    // The owner's own password change alone passes (it explains the epoch).
+    // The owner's own password change alone passes (owner-stamped; the epoch is not compared, F6fa2).
     let first = file(&f, &fx).unwrap();
     close_request(home, &first.request_id, &f.bob, Close::Cancelled, now()).unwrap();
     // An email change with no log row (trigger removed): not explained.
@@ -854,6 +880,119 @@ fn f6fa_restored_label_protected_without_marker() {
     }
     let refused = crate::handlers::employee_dirs::check_marker(&db, home, &home.join("agents"), LABEL, &f.alice).err();
     assert!(refused.is_some_and(|message| message.contains("已被使用")), "{refused:?}");
+}
+
+// ── F6fa2 (owner decisions 2026-11-09) ──────────────────────────────────
+
+fn credential_epoch(home: &Path, user: &str) -> i64 {
+    Connection::open(home.join(USERS_DB)).unwrap()
+        .query_row("SELECT credential_epoch FROM users WHERE id=?1", [user], |r| r.get(0)).unwrap()
+}
+
+/// Decision 1: "log out all devices" (the owner's `remember_revoke`, and an
+/// Admin's revoke-all, which bumps the epoch the same way) after the
+/// tombstone changes only `credential_epoch`: no password, email or factor,
+/// no `credential_changes` row. It never blocks a restore (request, approval
+/// and the apply transaction's re-check all pass).
+#[test]
+fn f6fa2_session_revoke_after_tombstone_allows_restore() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let snapshot = row(home, 0).principal_snapshot;
+    let recorded = snapshot["credential_epoch"].as_i64().unwrap();
+    let seq = snapshot["credential_seq"].as_i64().unwrap();
+    // The owner logs out all devices; an Admin then revokes all of the owner's sessions.
+    f.users.remember_revoke(&f.alice, None).unwrap();
+    sql(home, USERS_DB, "UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", &[&f.alice]);
+    assert!(credential_epoch(home, &f.alice) >= recorded + 2, "the epoch moved");
+    let users = Connection::open(home.join(USERS_DB)).unwrap();
+    assert!(duduclaw_auth::credential_changes::changes_after(&users, &f.alice, seq, 10).unwrap().is_empty(),
+        "a session revocation is not a credential change");
+    assert!(!SNAPSHOT_LOG_FIELDS.iter().any(|(field, _)| *field == "credential_epoch"), "the epoch is not compared");
+    let request = file(&f, &fx).unwrap();
+    // And once more between the approval call's checks and the apply transaction.
+    let (path, alice) = (home.to_path_buf(), f.alice.clone());
+    hook(move |point| {
+        if point == HookPoint::AfterMove {
+            sql(&path, USERS_DB, "UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", &[&alice]);
+        }
+        false
+    });
+    let restored = approve(home, &fx.env(), &request.request_id, &f.bob);
+    unhook();
+    assert_eq!(restored.unwrap().incarnation, 1);
+    assert_eq!(mirror(home, LABEL).as_deref(), Some(f.alice.as_str()));
+}
+
+/// Decision 1, the other side: a session revocation does not excuse a real
+/// credential change. An Admin's password reset of the owner (with or
+/// without a revoke-all) still refuses `CREDENTIAL_CHANGED`, as does a
+/// second factor enrolled for the owner by someone else.
+#[test]
+fn f6fa2_admin_password_reset_still_refuses() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    f.users.remember_revoke(&f.alice, None).unwrap();
+    // The Admin-side password writer (unattributed: not the owner's own session).
+    f.users.update_user(&f.alice, None, None, Some("admin-set-password")).unwrap();
+    assert_eq!(file(&f, &fx).err(), Some(Refusal::CredentialChanged));
+    let users = Connection::open(home.join(USERS_DB)).unwrap();
+    let since = row(home, 0).principal_snapshot["credential_seq"].as_i64().unwrap();
+    duduclaw_auth::credential_changes::stamp_actor(&users, since, &f.bob).unwrap();
+    assert_eq!(file(&f, &fx).err(), Some(Refusal::CredentialChanged), "attributed to the Admin");
+    // A factor enrolled for the owner by someone else refuses too.
+    let g = fixture();
+    let (_, root) = tombstoned(&g);
+    sql(g.home(), USERS_DB, "UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", &[&g.alice]);
+    sql(g.home(), USERS_DB, "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'TOTP-ENC',0)", &[&g.alice]);
+    assert_eq!(file(&g, &fakes(&root)).err(), Some(Refusal::CredentialChanged));
+}
+
+/// Decision 2 (engine): the Admin-filed request for an owner without a
+/// second factor is digest-bound to its filer and flag, and its approval
+/// goes through the admin-filed rule (a party approver is refused; with no
+/// other qualifying Admin, `NO_SECOND_ADMIN` — never self-approval).
+#[test]
+fn f6fa2_admin_filed_request_engine_rule() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let filer = AdminFiler { admin_user_id: &f.bob, fresh_step_up: true };
+    let filed = file_personal_request_for_owner(home, &fx.env(), EMP, 0, filer).unwrap().request;
+    assert_eq!((filed.requester.as_str(), filed.filed_by_admin.as_deref(), filed.owner.as_deref(), filed.owner_unverified()),
+        (f.bob.as_str(), Some(f.bob.as_str()), Some(f.alice.as_str()), true));
+    assert_eq!(stored(home, &filed.request_id), filed);
+    // The digest binds the filer: an owner-filed twin of the row digests differently.
+    let twin = RestoreRequest { filed_by_admin: None, ..filed.clone() };
+    let sealed = row(home, 0).digest.unwrap();
+    assert_ne!(request_digest(&twin, &sealed), filed.digest);
+    // Flipping the flag in the store makes the row unreadable (never a silent owner-filed request).
+    sql(home, APPLY_DB, "UPDATE employee_restores SET owner_unverified=0 WHERE request_id=?1", &[&filed.request_id]);
+    assert_eq!(read_request(&Connection::open(home.join(APPLY_DB)).unwrap(), &filed.request_id).err(), Some(Refusal::Unavailable));
+    sql(home, APPLY_DB, "UPDATE employee_restores SET owner_unverified=1 WHERE request_id=?1", &[&filed.request_id]);
+    // The filer and the owner never approve; a third Admin does, not self-approved.
+    assert_eq!(approve(home, &fx.env(), &filed.request_id, &f.bob).err(), Some(Refusal::Approval("SECOND_ADMIN_REQUIRED")));
+    assert_eq!(approve(home, &fx.env(), &filed.request_id, &f.alice).err(), Some(Refusal::Approval("SECOND_ADMIN_REQUIRED")));
+    assert_eq!(stored(home, &filed.request_id).state, "requested", "a refused approver leaves it open");
+    let restored = approve(home, &fx.env(), &filed.request_id, "carol-admin").unwrap();
+    assert_eq!((restored.incarnation, restored.self_approved), (1, false));
+    let done = stored(home, &filed.request_id);
+    assert_eq!((done.state.as_str(), done.approver.as_deref(), done.self_approved), ("done", Some("carol-admin"), Some(false)));
+    // A sole-Admin home: filing refuses NO_SECOND_ADMIN.
+    let g = fixture();
+    let (_, root) = tombstoned(&g);
+    let sole = Fakes { rule: Box::new(SoleAdmin), ..fakes(&root) };
+    let filer = AdminFiler { admin_user_id: &g.bob, fresh_step_up: true };
+    assert_eq!(file_personal_request_for_owner(g.home(), &sole.env(), EMP, 0, filer).err(), Some(Refusal::Approval("NO_SECOND_ADMIN")));
+    // The production rule without the admin-filed decision refuses (fail closed).
+    let unavailable = Fakes { rule: Box::new(ApprovalRuleUnavailable), ..fakes(&root) };
+    assert_eq!(file_personal_request_for_owner(g.home(), &unavailable.env(), EMP, 0, filer).err(),
+        Some(Refusal::Approval(ADMIN_FILED_RULE_UNAVAILABLE)));
 }
 
 #[path = "isolation_restore_recovery_tests.rs"]

@@ -327,6 +327,238 @@ fn f6fa_notice_failures_audited_critical() {
     assert_eq!(critical_events(home, "isolation.employee_restore_notice_unqueued"), 1);
 }
 
+// ── F6fa2: an Admin files for an owner without a second factor ─────────
+
+fn file_for_owner(f: &Fixture, fx: &super::restore::Fakes) -> Result<serde_json::Value, RpcError> {
+    rpc::request_restore_for_owner(f.home(), &fx.env(), &f.bob, &employee(), 0, true)
+}
+
+fn restores_filed(home: &Path) -> i64 {
+    Connection::open(home.join(APPLY_DB)).unwrap().query_row("SELECT count(*) FROM employee_restores", [], |r| r.get(0)).unwrap()
+}
+
+/// `(recipients, capped)` of every queued notice of `event`.
+fn notices_of(home: &Path, event: &str) -> Vec<(Vec<String>, bool)> {
+    let db = Connection::open(home.join(APPLY_DB)).unwrap();
+    let mut statement = db.prepare("SELECT recipients,capped FROM employee_restore_notices WHERE event=?1 ORDER BY seq").unwrap();
+    let rows = statement.query_map([event], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))).unwrap()
+        .map(|row| row.unwrap()).map(|(to, capped)| (serde_json::from_str(&to).unwrap(), capped)).collect();
+    rows
+}
+
+/// Decision 2: alice had no second factor at the tombstone, so an Admin (bob,
+/// fresh step-up) files her restore. The row records `filed_by_admin` +
+/// `owner_unverified`; the requester is the Admin, the owner the receipt's.
+/// Every owner-filed check still applies: an Admin password reset, an
+/// ineligible owner and the 90-day window refuse.
+#[test]
+fn f6fa2_admin_files_for_owner_without_second_factor() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let baseline = duduclaw_auth::mfa::owner_factor::FactorBaseline::from_snapshot(&super::restore::row(home, 0).principal_snapshot)
+        .expect("baseline recorded");
+    assert_eq!(baseline.strongest, None, "alice had no second factor at the tombstone");
+    // A stale step-up, the owner herself and malformed ids file nothing.
+    assert_eq!(rpc::request_restore_for_owner(home, &fx.env(), &f.bob, &employee(), 0, false).err(),
+        Some(RpcError::Restore(Refusal::Approval("STEP_UP_REQUIRED"))));
+    let own = rpc::request_restore_for_owner(home, &fx.env(), &f.alice, &employee(), 0, true).unwrap_err();
+    assert_eq!((own, own.code()), (RpcError::Restore(Refusal::FilerIsOwner), "FILER_IS_OWNER"));
+    for id in malformed_ids() {
+        assert_eq!(rpc::request_restore_for_owner(home, &fx.env(), &f.bob, &id, 0, true).err(), Some(RpcError::Invalid), "{id}");
+    }
+    assert_eq!(rpc::request_restore_for_owner(home, &fx.env(), &f.bob, &employee(), 1, true).err(),
+        Some(RpcError::Restore(Refusal::NotFound)), "no row at that incarnation");
+    assert_eq!(restores_filed(home), 0);
+    let filed = file_for_owner(&f, &fx).unwrap();
+    assert_eq!((filed["state"].as_str(), filed["kind"].as_str(), filed["label"].as_str(), filed["owner_user_id"].as_str()),
+        (Some("requested"), Some("personal_restore"), Some(LABEL), Some(f.alice.as_str())));
+    assert_eq!((filed["filed_by_admin"].as_str(), filed["owner_unverified"].as_bool(), filed["second_admin_required"].as_bool()),
+        (Some(f.bob.as_str()), Some(true), Some(true)));
+    let request = stored(home, filed["request_id"].as_str().unwrap());
+    assert_eq!((request.requester.as_str(), request.owner.as_deref(), request.filed_by_admin.as_deref()),
+        (f.bob.as_str(), Some(f.alice.as_str()), Some(f.bob.as_str())));
+    let flag: i64 = Connection::open(home.join(APPLY_DB)).unwrap().query_row(
+        "SELECT owner_unverified FROM employee_restores WHERE request_id=?1", [&request.request_id], |r| r.get(0)).unwrap();
+    assert_eq!(flag, 1);
+    assert!(audit_log(home).contains("isolation.employee_restore_requested_for_owner"));
+    // One open request per row, as for the owner's own.
+    assert_eq!(file_for_owner(&f, &fx).err(), Some(RpcError::Restore(Refusal::RestoreInProgress)));
+
+    // Credential change by someone else (an Admin password reset) still refuses.
+    let g = fixture();
+    let (_, root) = tombstoned(&g);
+    g.users.update_user(&g.alice, None, None, Some("admin-set-password")).unwrap();
+    assert_eq!(file_for_owner(&g, &fakes(&root)).err(), Some(RpcError::Restore(Refusal::CredentialChanged)));
+    // So does an owner who cannot use the account now.
+    let g = fixture();
+    let (_, root) = tombstoned(&g);
+    sql(g.home(), USERS_DB, "UPDATE users SET must_change_password=1 WHERE id=?1", &[&g.alice]);
+    assert_eq!(file_for_owner(&g, &fakes(&root)).err(), Some(RpcError::Restore(Refusal::OwnerIneligible)));
+    // And the 90-day window.
+    let g = fixture();
+    let (_, root) = tombstoned(&g);
+    let mut late = fakes(&root);
+    late.now = super::restore::row(g.home(), 0).quarantined_at + crate::isolation_restore::RESTORE_WINDOW_SECS + 1;
+    assert_eq!(file_for_owner(&g, &late).err(), Some(RpcError::Restore(Refusal::Expired)));
+}
+
+/// Decision 2 is never a fallback: an owner who had **any** second factor at
+/// the tombstone (TOTP, passkey or email factor) is refused
+/// `OWNER_HAD_SECOND_FACTOR` (still true after that factor is removed), and
+/// keeps only the owner path with that factor. A snapshot without the factor
+/// baseline cannot prove "no factor": `SNAPSHOT_INCOMPLETE`.
+#[test]
+fn f6fa2_admin_cannot_file_when_owner_had_second_factor() {
+    for (factor, enrol, remove) in [
+        ("totp", "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'TOTP-ENC',0)",
+            "DELETE FROM mfa_credentials WHERE user_id=?1"),
+        ("passkey", "INSERT INTO mfa_passkeys(id,user_id,name,credential,created_at) VALUES('alice-key',?1,'k','{}',1)",
+            "DELETE FROM mfa_passkeys WHERE user_id=?1"),
+        ("email", "INSERT INTO mfa_email_credentials(user_id,email,verified_at) VALUES(?1,'alice@example.test',1)",
+            "DELETE FROM mfa_email_credentials WHERE user_id=?1"),
+    ] {
+        let f = fixture();
+        let home = f.home();
+        sql(home, USERS_DB, enrol, &[&f.alice]);
+        let (_, root) = tombstoned(&f);
+        let fx = fakes(&root);
+        let refused = file_for_owner(&f, &fx).unwrap_err();
+        assert_eq!((refused, refused.code()), (RpcError::Restore(Refusal::OwnerHadSecondFactor), "OWNER_HAD_SECOND_FACTOR"), "{factor}");
+        assert!(!refused.message().is_empty());
+        // Removing the factor afterwards changes nothing: the tombstone's baseline decides.
+        sql(home, USERS_DB, remove, &[&f.alice]);
+        assert_eq!(file_for_owner(&f, &fx).err(), Some(RpcError::Restore(Refusal::OwnerHadSecondFactor)), "{factor}");
+        assert_eq!(restores_filed(home), 0, "{factor}");
+        assert_eq!(rpc::admin_view(home, now()).unwrap()["quarantine"][0]["admin_may_file_for_owner"], false, "{factor}");
+    }
+    // The owner path is unchanged for such an owner.
+    let f = fixture();
+    sql(f.home(), USERS_DB, "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'TOTP-ENC',0)", &[&f.alice]);
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    assert!(file(&f, &fx).is_ok(), "the owner files with the tombstone's factor");
+    // A legacy snapshot (no factor baseline) cannot show "no second factor".
+    let g = fixture();
+    let (_, root) = tombstoned(&g);
+    let mut snapshot = super::restore::row(g.home(), 0).principal_snapshot;
+    snapshot.as_object_mut().unwrap().remove("owner_factors");
+    sql(g.home(), APPLY_DB, "UPDATE employee_quarantine SET principal_snapshot=?1", &[&snapshot.to_string()]);
+    assert_eq!(file_for_owner(&g, &fakes(&root)).err(), Some(RpcError::Restore(Refusal::SnapshotIncomplete)));
+}
+
+/// Decision 2: a *different* qualifying Admin approves an Admin-filed
+/// request. The filer and the owner are refused `SECOND_ADMIN_REQUIRED`
+/// (the request stays open); a third Admin approves, never `self_approved`.
+/// With no other qualifying Admin the filing itself is refused
+/// `NO_SECOND_ADMIN` — the sole-Admin self-approval path is not available.
+#[test]
+fn f6fa2_admin_filed_request_needs_different_admin() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let filed = file_for_owner(&f, &fx).unwrap();
+    let id = filed["request_id"].as_str().unwrap().to_owned();
+    let notices = Vec::<String>::new;
+    for party in [f.bob.as_str(), f.alice.as_str()] {
+        let refused = rpc::decide(home, &fx.env(), party, &id, true, &notices).unwrap_err();
+        assert_eq!((refused, refused.code()), (RpcError::Restore(Refusal::Approval("SECOND_ADMIN_REQUIRED")), "SECOND_ADMIN_REQUIRED"));
+        assert_eq!(refused.message(), "需由另一位管理員核准");
+        assert_eq!(stored(home, &id).state, "requested");
+    }
+    let done = rpc::decide(home, &fx.env(), "carol-admin", &id, true, &notices).unwrap();
+    assert_eq!((done["state"].as_str(), done["self_approved"].as_bool()), (Some("done"), Some(false)));
+    assert_eq!(stored(home, &id).approver.as_deref(), Some("carol-admin"));
+    assert_eq!(notices_of(home, "isolation.employee_restore_self_approved"), vec![], "never a self-approval");
+    // Sole qualifying Admin: nobody else could approve, so nothing is filed.
+    let g = fixture();
+    let (_, root) = tombstoned(&g);
+    let sole = super::restore::Fakes { rule: Box::new(super::restore::SoleAdmin), ..fakes(&root) };
+    let refused = file_for_owner(&g, &sole).unwrap_err();
+    assert_eq!((refused, refused.code()), (RpcError::Restore(Refusal::Approval("NO_SECOND_ADMIN")), "NO_SECOND_ADMIN"));
+    assert!(refused.message().contains("另一位管理員"), "{}", refused.message());
+    assert_eq!(restores_filed(g.home()), 0);
+    // An owner-filed request in the same home still has the sole-Admin path.
+    let owner_filed = file(&g, &sole).unwrap();
+    let done = rpc::decide(g.home(), &sole.env(), &g.alice, owner_filed["request_id"].as_str().unwrap(), true, &notices).unwrap();
+    assert_eq!(done["self_approved"], true);
+}
+
+/// Decision 2: the owner's tombstone-time notice address is told at filing
+/// and at approval, uncapped (never dropped by the L1 cap) — even after the
+/// owner moved to another address (an owner-stamped change Q3 allows).
+#[test]
+fn f6fa2_admin_filed_request_notifies_tombstone_address() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let address = super::restore::row(home, 0).principal_snapshot["notice_address"].as_str().unwrap().to_owned();
+    assert_eq!(address, "alice@example.test");
+    // The owner changes her own address afterwards (owner-authenticated).
+    let users = Connection::open(home.join(USERS_DB)).unwrap();
+    let since = duduclaw_auth::credential_changes::high_water(&users).unwrap();
+    users.execute("UPDATE users SET email='alice-new@example.test' WHERE id=?1", [&f.alice]).unwrap();
+    duduclaw_auth::credential_changes::stamp_owner(&users, since, &f.alice).unwrap();
+    // The L1 cap is spent for alice today: the filing notice is not capped.
+    for _ in 0..MAX_NOTICES_PER_DAY {
+        queue_notice(home, &NoticeScope::Owner(f.alice.clone()), "x", &[], &json!({"label": LABEL}), true, now()).unwrap();
+    }
+    let filed = file_for_owner(&f, &fx).unwrap();
+    assert_eq!(filed["notified"], true);
+    let at_filing = notices_of(home, "isolation.employee_restore_requested_for_owner");
+    assert_eq!(at_filing.len(), 1);
+    assert!(at_filing[0].0.contains(&address), "{at_filing:?}");
+    assert!(!at_filing[0].0.contains(&"alice-new@example.test".to_owned()), "the tombstone-time address, not the live one");
+    assert!(!at_filing[0].1, "uncapped");
+    let notices = Vec::<String>::new;
+    rpc::decide(home, &fx.env(), "carol-admin", filed["request_id"].as_str().unwrap(), true, &notices).unwrap();
+    let at_approval = notices_of(home, "isolation.employee_restored");
+    assert_eq!(at_approval.len(), 1);
+    assert!(at_approval[0].0.contains(&address) && !at_approval[0].1, "{at_approval:?}");
+    let details: String = Connection::open(home.join(APPLY_DB)).unwrap().query_row(
+        "SELECT details FROM employee_restore_notices WHERE event='isolation.employee_restored'", [], |r| r.get(0)).unwrap();
+    let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+    assert_eq!((details["owner_unverified"].as_bool(), details["filed_by_admin"].as_str()), (Some(true), Some(f.bob.as_str())));
+}
+
+/// Decision 2: the flag is in every view the UI reads — the owner's
+/// `me.isolation.list_restorable` and the Admin `restores` view (quarantine
+/// row `admin_may_file_for_owner`, open request and request list
+/// `filed_by_admin` / `owner_unverified`), so the UI can mark
+/// 主人未用兩步驟驗證確認. An owner-filed request reads `null` / `false`.
+#[test]
+fn f6fa2_admin_filed_flag_in_views() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = tombstoned(&f);
+    let fx = fakes(&root);
+    let view = rpc::admin_view(home, now()).unwrap();
+    assert_eq!(view["quarantine"][0]["admin_may_file_for_owner"], true);
+    // Owner-filed first: not flagged.
+    let own = file(&f, &fx).unwrap();
+    let view = rpc::admin_view(home, now()).unwrap();
+    assert_eq!((&view["requests"][0]["filed_by_admin"], &view["requests"][0]["owner_unverified"]), (&json!(null), &json!(false)));
+    assert_eq!(view["quarantine"][0]["open_request"]["owner_unverified"], false);
+    rpc::admin_cancel(home, &f.bob, own["request_id"].as_str().unwrap(), now()).unwrap();
+    // Admin-filed: flagged everywhere.
+    let filed = file_for_owner(&f, &fx).unwrap();
+    let id = filed["request_id"].as_str().unwrap();
+    let view = rpc::admin_view(home, now()).unwrap();
+    let listed = view["requests"].as_array().unwrap().iter().find(|r| r["request_id"] == id).unwrap().clone();
+    assert_eq!((listed["filed_by_admin"].as_str(), listed["owner_unverified"].as_bool(), listed["owner_user_id"].as_str(),
+        listed["requester_user_id"].as_str()), (Some(f.bob.as_str()), Some(true), Some(f.alice.as_str()), Some(f.bob.as_str())));
+    let open = &view["quarantine"][0]["open_request"];
+    assert_eq!((open["request_id"].as_str(), open["filed_by_admin"].as_str(), open["owner_unverified"].as_bool()),
+        (Some(id), Some(f.bob.as_str()), Some(true)));
+    let mine = rpc::list_restorable(home, &f.alice, now()).unwrap();
+    let open = &mine["restorable"][0]["open_request"];
+    assert_eq!((open["filed_by_admin"].as_str(), open["owner_unverified"].as_bool(), open["kind"].as_str()),
+        (Some(f.bob.as_str()), Some(true), Some("personal_restore")));
+}
+
 /// M6/S17: every path that takes both stores takes apply.db before
 /// users.db. While another connection holds apply.db's writer lock, the
 /// restore request and approval paths block on apply.db without holding a

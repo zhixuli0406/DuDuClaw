@@ -340,8 +340,9 @@ pub(crate) struct TombstoneEnv<'a> {
 ///
 /// 0. Read (no lock): the confirmed row (receipt, tenant pin, incarnation),
 ///    the Applied allocation item, and the principal snapshot — Personal
-///    (H3): owner `credential_epoch`, email, Google `sub`, MFA/passkey-set
-///    digest, notice address; Shared (R4): the pinned tenant and every member
+///    (H3): owner `credential_epoch` (recorded, not compared by Q3 since
+///    F6fa2: a session revocation is not a credential change), email, Google
+///    `sub`, MFA/passkey-set digest, notice address; Shared (R4): the pinned tenant and every member
 ///    binding `(user_id, access_level, is_primary)`. A legacy unpinned row
 ///    is refused (`Denied`), as `resolve` refuses it.
 /// 1. One apply.db `BEGIN IMMEDIATE` transaction: re-read the row (same

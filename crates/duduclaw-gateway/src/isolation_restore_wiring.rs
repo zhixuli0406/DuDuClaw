@@ -164,6 +164,23 @@ impl ApprovalRule for LogRule {
         rule::record_self_approval(users, &self.request(requester, approver, kind), subject)
             .map_err(|_| SELF_APPROVAL_AUDIT_UNAVAILABLE)
     }
+    /// F6fa2 (owner decision 2026-11-09): F6c2's `decide_admin_filed` with the
+    /// filing Admin as requester and the owner as the second party.
+    fn decide_admin_filed(&self, users: &Connection, filer: &str, owner: &str, approver: &str, kind: RequestKind)
+        -> Result<Approval, &'static str> {
+        let request = ApprovalRequest { kind: approval_kind(kind), requester_user_id: filer, owner_user_id: Some(owner),
+            approver_user_id: approver, fresh_step_up: self.fresh_step_up, now: self.now };
+        match EligibilityLogRule.decide_admin_filed(users, &request) {
+            ApprovalDecision::Allowed { self_approved, notice_addresses } => {
+                if let Ok(mut kept) = self.notices.lock() { *kept = notice_addresses; }
+                Ok(Approval { self_approved })
+            }
+            ApprovalDecision::Refused(refusal) => Err(refusal.code()),
+        }
+    }
+    fn check_admin_filing(&self, users: &Connection, filer: &str, owner: &str) -> Result<(), &'static str> {
+        EligibilityLogRule.check_admin_filing(users, filer, owner, self.now).map_err(|refusal| refusal.code())
+    }
 }
 
 /// F6l's retire-card rule for an early-purged row (S12), requester = proposer.

@@ -38,6 +38,18 @@ impl AdminApprovalRule for AnyAdmin {
     fn decide(&self, _: &Connection, request: &ApprovalRequest<'_>) -> ApprovalDecision {
         ApprovalDecision::Allowed { self_approved: request.approver_user_id == request.requester_user_id, notice_addresses: Vec::new() }
     }
+    /// F6fa2 stand-in: any third account approves an Admin-filed request; a
+    /// party (filer or owner) never does.
+    fn decide_admin_filed(&self, _: &Connection, request: &ApprovalRequest<'_>) -> ApprovalDecision {
+        use duduclaw_auth::admin_approval_rule::ApprovalRefusal;
+        let party = request.approver_user_id == request.requester_user_id || request.owner_user_id == Some(request.approver_user_id);
+        if party { ApprovalDecision::Refused(ApprovalRefusal::SecondAdminRequired) }
+        else { ApprovalDecision::Allowed { self_approved: false, notice_addresses: Vec::new() } }
+    }
+    fn check_admin_filing(&self, _: &Connection, filer: &str, owner: &str, _: i64)
+        -> Result<(), duduclaw_auth::admin_approval_rule::ApprovalRefusal> {
+        if filer == owner { Err(duduclaw_auth::admin_approval_rule::ApprovalRefusal::InvalidRequest) } else { Ok(()) }
+    }
 }
 
 fn ok_hooks(_: &Path) -> Result<(), ()> { Ok(()) }

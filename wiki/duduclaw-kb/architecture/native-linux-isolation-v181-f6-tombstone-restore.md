@@ -10,7 +10,9 @@ r4 (baton run `20261108-202144-claude-18045-183`, GO with changes), rows tagged 
 decision on S12 (§2). S1–S3 are in the design before F6c2 and F6g start; the other S rows land with
 their tasks, each with its §6 test. Review ids stay next to each rule: H1–H5 before F6a–F6d; M/L items
 with their §6 tests. Rules: r3 R1–R9, r4 R10–R15. [SEC] = Daybreak review before merge. Inferences are
-marked "(inferred, verify)".
+marked "(inferred, verify)". **r5.1 (2026-11-09):** owner decisions D1 (session revocation is not a
+credential change) and D2 (Admin files for an owner with no second factor at the tombstone), §2, §3.4,
+§3.11, §5; implemented on `fix/iso181-f6fa-20261109` (F6fa2).
 
 ## 1. What exists today
 
@@ -53,12 +55,15 @@ the disk is never returned; §3.12 adds the root retire.
 ## 2. Decisions (owner, 2026-11-08)
 
 - **Q1 Who starts it.** Personal: the **owner** files in 我的帳號 → 我的個人 AI 員工; no request field
-  names an owner (always the immutable receipt principal). Shared: an **Admin** files (Q7).
+  names an owner (always the immutable receipt principal). Shared: an **Admin** files (Q7). (2026-11-09,
+  D2 below: an Admin may also file a Personal request for an owner with no second factor at the tombstone.)
 - **Q2 Owner authentication.** Strongest enrolled factor: passkey, then TOTP, then email code; SSO-only
   users without MFA: fresh Google re-auth with `auth_time` ≤ 5 min. Never the session or password alone;
-  a password-only user enrolls MFA first.
+  a password-only user enrolls MFA first. (Amended 2026-11-09, D2 below: for an owner with no second factor
+  at the tombstone an Admin files instead, with a second Admin approving.)
 - **Q3 Credential changes.** Refuse if the owner's password, email, Google link or MFA/passkey set
   changed since the tombstone by anyone other than the owner (tombstone snapshot, §3.2). No override.
+  (2026-11-09, D1 below: a session revocation alone is not a change.)
 - **Q4 Routes.** Every route the employee would use again is listed on the card; the request digest covers
   the full list and is re-checked at apply. Per-employee detail routes always need fresh provisioning.
 - **Q5 Retention.** 90 days after the tombstone, checked at request, approval and apply; cleanup ships (F6i).
@@ -87,6 +92,25 @@ Third round (owner, 2026-11-08, r5):
   that was early-purged, follow R1/R2 with S1/S2 exactly like a restore: approved by another qualifying
   Admin; a sole Admin may self-approve with step-up, the 7-day cooling check and the `self_approved`
   audit. A purge after 90 days and the retire of a normally purged row stay Admin + step-up.
+
+Fourth round (owner, 2026-11-09, F6fa2):
+- **D1 Session revocation does not block restore.** "Log out all devices" (the owner's own, or an Admin's
+  revoke-all) only bumps `credential_epoch`; without a password, email or factor change it is **not** a
+  credential change. Q3 refuses only password, email and factor (TOTP / passkey / email factor) changes made
+  by someone other than the owner (and a changed Google `sub`, unchanged). `credential_epoch` stays in the
+  snapshot but is not compared; the factor baseline compares factor identities only (passkey ids, TOTP and
+  email-factor digests), never the epoch.
+- **D2 Admin files for an owner without a second factor.** When the tombstone snapshot's factor baseline
+  shows the owner had **no** second factor (strongest = none: password or SSO only), an Admin may file the
+  Personal restore and the Personal adoption request on the owner's behalf. Never a fallback for an owner who
+  had one (`OWNER_HAD_SECOND_FACTOR`; those keep the `FACTOR_*` path only); a snapshot without the baseline
+  cannot show "no factor" (`SNAPSHOT_INCOMPLETE`). The filing Admin needs Admin + fresh step-up and is not
+  the owner; a **different** qualifying Admin must approve (the R1/S2 rule with the filing Admin as
+  requester and the owner as a second party); the sole-Admin self-approval path does **not** exist for these
+  requests (`NO_SECOND_ADMIN`, refused already at filing). The owner's tombstone-time notice address is told
+  at filing and at approval (uncapped). The request row records `filed_by_admin` + `owner_unverified = 1`,
+  shown in the owner and Admin views (UI: 主人未用兩步驟驗證確認). Owner eligibility, Q3, 90 days and every
+  other check are unchanged.
 
 Derived rules: restore keeps the label and the employee id (the label is digest-covered and copied
 into `Receipt.label`). A different label or id is only possible through adoption (§3.10), which is a new
@@ -227,9 +251,26 @@ inc0 row `restored`, which no longer blocks the label (R6/R7) or the retire.
 `pending_fences` empty and no active route has a detail row naming the employee hex (retry first, H2); no
 `employee_dir_markers` row, no open proposal (`label_pending`), `agents/<target>` absent; tenant ==
 apply.db pin == users.db tenant; quota and seats (L2). **Personal adds:** caller == receipt owner with a
-Q2 factor proof; `owner_eligible`; snapshot match (Q3: any difference refuses unless each change has a
+Q2 factor proof — or (D2, 2026-11-09) an Admin-filed request for an owner whose tombstone baseline shows no
+second factor (below); `owner_eligible`; snapshot match (Q3: any difference refuses unless each change has a
 log entry with actor == owner and an owner-authenticated session; F6d adds `credential_changes(user_id,
-field, actor_user_id, owner_authenticated, at)` if users.db lacks it). **Shared adds:** §3.9.
+field, actor_user_id, owner_authenticated, at)` if users.db lacks it; compared fields `email` and
+`factors_digest` plus every log row after `credential_seq`; `credential_epoch` is not compared, D1).
+**Shared adds:** §3.9.
+
+**Admin-filed Personal requests (D2, F6fa2).** `employee_restores` gains `filed_by_admin TEXT NULL` and
+`owner_unverified INTEGER NOT NULL DEFAULT 0` (added in place; `owner_unverified = 1` exactly when
+`filed_by_admin` is set, which then equals `requester_user_id`; a row breaking that reads unavailable); the
+request digest binds `filed_by_admin`, the requester and the flag (owner-filed digests unchanged). Filing
+(`isolation.employee_restore_request_for_owner`, `isolation.adoption_request_for_owner`): Admin + current MFA
++ fresh migration step-up (`STEP_UP_REQUIRED`), filer ≠ owner (`FILER_IS_OWNER`), baseline present
+(`SNAPSHOT_INCOMPLETE`) with `strongest = none` (`OWNER_HAD_SECOND_FACTOR`), and in one users.db read the
+F6c2 `check_admin_filing`: filer eligible now (`FILER_NOT_ELIGIBLE`) and another qualifying Admin, neither
+filer nor owner, exists (`NO_SECOND_ADMIN`); then every owner-filed check. Approval (restore decide, the
+adoption proposal card, both at tx1 and in the apply transaction): F6c2 `decide_admin_filed` — filer and
+owner are parties, a party approver gets `SECOND_ADMIN_REQUIRED` while a third qualifying Admin exists and
+`NO_SECOND_ADMIN` otherwise; never `self_approved`; the engine re-checks that the row's baseline still allows
+admin filing.
 
 **Admin eligibility log (S1, S16).** users.db `admin_eligibility_log(seq PK, user_id, eligible,
 reason, actor_user_id, notice_address, at)`, appended **in the same tx** as every change to role, status,
@@ -445,6 +486,7 @@ and `ROOT_INCONSISTENT` (S4, incl. any ReadBack mismatch) never qualify. Token v
 | `me.isolation.request_restore` / `request_adoption` / `cancel_restore` | owner, Q2 factor | Personal restore / adoption request, cancel |
 | `isolation.employee_tombstone` | Admin + step-up | now Personal and Shared; stops live runs (S13) |
 | `isolation.shared_restore_request` / `shared_adoption_request` | Admin + step-up | Shared requests (§3.9, §3.10) |
+| `isolation.employee_restore_request_for_owner` / `isolation.adoption_request_for_owner` | Admin + MFA + fresh step-up (D2) | Personal restore / adoption filed for an owner with no second factor at the tombstone; a different qualifying Admin approves, no sole-Admin path; `filed_by_admin` + `owner_unverified` |
 | `isolation.employee_restore_decide` / `employee_restore_cancel` | Admin + step-up (decide: §3.4 rule, S1/S2) | approve / deny any open request (restore, `early_purge`); cancel any open request |
 | `isolation.employee_propose` (extended) | Admin + step-up | adoption request → proposal |
 | `isolation.quarantine_purge` | Admin + step-up | ≥ 90 days: purge in the call; < 90 days (`confirm_early`): files an `early_purge` request (S12); optional `retire: true` stages §3.12 after the purge commits |
@@ -562,6 +604,11 @@ the label until operator recovery. The UI calls it 主機資源狀態不明, nev
   or, inside the cooling window, is disabled with 「7 天內有管理員失去權限，暫時不能自行核准」.
   Adoption cards list 會帶過去的檔案 and 留在隔離區的檔案 (S3). 紀錄 tab lists every §3.8 event with 自行核准
   and 提前清除 tags. No new nav page, no `newIn`.
+- **D2 (2026-11-09) 代主人申請**: Personal rows with `admin_may_file_for_owner = true` show 代主人申請還原 /
+  代主人申請由新員工接手 (step-up). Requests with `owner_unverified = true` carry the tag
+  主人未用兩步驟驗證確認 (owner and Admin views); their approve button is disabled for the filing Admin and the
+  owner with 「需由另一位管理員核准」, and there is no 自行核准 state (`NO_SECOND_ADMIN`:
+  「代主人申請需由另一位管理員核准，目前沒有其他可核准的管理員…」).
 - **清除隔離區** (rows not being restored or adopted): 「清除後無法還原，也不能再由新員工接手。這位員工的記憶、
   對話紀錄、排程與任務會一併刪除，並通知員工主人與所有管理員。」 Before 90 days the button reads 申請提前清除
   and the request waits for 需由另一位管理員核准 (S12). The checked 同時釋放主機資源 box adds 「主機上這位員工
@@ -584,8 +631,8 @@ the label until operator recovery. The UI calls it 主機資源狀態不明, nev
 |---|---|---|
 | Former owner (offboarded, suspended) | Requests the data back | `owner_eligible` at request, tx1 and the mirror tx; lifecycle re-checks on use |
 | Other staff | Requests for someone else | caller == receipt owner; listings filtered; not-owned ids answer `NOT_FOUND` |
-| Admin hands Personal data to someone else | Picks another owner, label or id | No owner input; restore keeps label and id; adoption is `Personal(same owner)` only, owner-filed with factor |
-| Admin restores or adopts without the owner | Files or applies alone | No admin request RPC for Personal; approval acts only on an owner-filed request bound to a factor proof |
+| Admin hands Personal data to someone else | Picks another owner, label or id | No owner input; restore keeps label and id; adoption is `Personal(same owner)` only, owner-filed with factor (or Admin-filed for a no-factor owner, D2: still the same owner, second Admin approves) |
+| Admin restores or adopts without the owner | Files or applies alone | Owner-filed requests bind a factor proof. D2 (2026-11-09): an Admin may file only for an owner with **no** second factor at the tombstone (snapshot baseline, never a fallback), with fresh step-up; a different qualifying Admin must approve (no sole-Admin path, `NO_SECOND_ADMIN`); uncapped notices to the tombstone-time address at filing and approval; Q3 still refuses credentials changed by others; the request is flagged `owner_unverified`. Residual: two colluding qualifying Admins can restore a no-factor owner's employee to that owner (never to anyone else; owner notified) |
 | Admin acts as the owner | Resets password/email/Google/MFA, files, approves | Q3 snapshot refusal (H3); Q2 factor; notice to the tombstone-time address; R1 approver ≠ owner. Residual: a Workspace super-admin who can re-auth at Google is trusted |
 | Owner who is an Admin (self-approval) | Approves own restore or adoption | R1: another qualifying Admin must approve; sole-Admin path needs step-up, cooling, `self_approved` audit, notices from the eligibility log |
 | Admin manufacturing "sole Admin" (S1) | Demotes, disables, forces a password change on, resets MFA/passkeys of, or deletes the other Admins; or locks them out with failed logins | Cooling counts every loss of eligibility in 7 days from `admin_eligibility_log`, written in the same tx as each change; lockout never reduces the count; unreadable log refuses self-approval; notices go to log addresses (S16), so deleting accounts does not silence them |

@@ -30,6 +30,13 @@
 //!   [`ApprovalRefusal::CoolingWindow`]). Lockout is never a loss.
 //! - Every approval needs a fresh step-up ([`ApprovalRefusal::StepUpRequired`]);
 //!   the caller verifies it and passes the result.
+//! - **Admin-filed Personal requests** (owner decision 2026-11-09: an Admin
+//!   files for an owner who had no second factor at the tombstone):
+//!   [`decide_admin_filed`] — the filing Admin and the owner are both
+//!   parties, a third qualifying Admin must approve, and the sole-Admin path
+//!   does not exist ([`ApprovalRefusal::NoSecondAdmin`]);
+//!   [`check_admin_filing`] refuses the filing itself when no such Admin
+//!   exists or the filer is not an eligible Admin.
 //!
 //! **Fail closed.** Any read error, a missing creation marker, a schema
 //! version other than this build's, a missing log trigger, or a log whose
@@ -148,6 +155,13 @@ pub enum ApprovalRefusal {
     /// The eligibility log is missing, unreadable, inconsistent or covers less
     /// than the cooling window (S1).
     AdminLogUnavailable,
+    /// Admin-filed Personal request (owner decision 2026-11-09): no qualifying
+    /// Admin other than the filing Admin and the owner exists, and the
+    /// sole-Admin self-approval path is never available for such a request.
+    NoSecondAdmin,
+    /// Admin-filed Personal request: the filing Admin is not an eligible
+    /// Admin now.
+    FilerNotEligible,
 }
 
 impl ApprovalRefusal {
@@ -160,6 +174,8 @@ impl ApprovalRefusal {
             Self::SecondAdminRequired => "SECOND_ADMIN_REQUIRED",
             Self::ApproverNotQualified(_) => "APPROVER_NOT_QUALIFIED",
             Self::CoolingWindow => "SELF_APPROVAL_COOLING",
+            Self::NoSecondAdmin => "NO_SECOND_ADMIN",
+            Self::FilerNotEligible => "FILER_NOT_ELIGIBLE",
         }
     }
 }
@@ -189,6 +205,14 @@ pub trait AdminApprovalRule: Send + Sync {
     /// See [`decide`]. `users_tx` is the users.db connection of the open
     /// transaction the decision is applied in.
     fn decide(&self, users_tx: &Connection, request: &ApprovalRequest<'_>) -> ApprovalDecision;
+    /// See [`decide_admin_filed`] (owner decision 2026-11-09).
+    fn decide_admin_filed(&self, users_tx: &Connection, request: &ApprovalRequest<'_>) -> ApprovalDecision {
+        decide_admin_filed(users_tx, request)
+    }
+    /// See [`check_admin_filing`] (owner decision 2026-11-09).
+    fn check_admin_filing(&self, users_tx: &Connection, filer: &str, owner: &str, now: i64) -> Result<(), ApprovalRefusal> {
+        check_admin_filing(users_tx, filer, owner, now)
+    }
 }
 
 /// The production rule: [`decide`] over `admin_eligibility_log`.
@@ -210,6 +234,61 @@ pub fn decide(conn: &Connection, request: &ApprovalRequest<'_>) -> ApprovalDecis
         Ok(snapshot) => snapshot.decide(request),
         Err(_) => ApprovalDecision::Refused(ApprovalRefusal::AdminLogUnavailable),
     }
+}
+
+/// Owner decision 2026-11-09: a Personal request (restore or adoption) that an
+/// Admin filed on behalf of an owner who had no second factor at the
+/// tombstone. `requester_user_id` is the **filing Admin**, `owner_user_id`
+/// the receipt owner (required, different from the filer). Both are parties:
+/// the approver must be a third, qualifying Admin (S2, the same
+/// qualification as [`decide`] with both parties), and there is **no**
+/// sole-Admin self-approval path — a party approver is refused
+/// [`ApprovalRefusal::SecondAdminRequired`] while another qualifying Admin
+/// exists and [`ApprovalRefusal::NoSecondAdmin`] otherwise. Never allows
+/// `self_approved`. Same transaction, step-up and fail-closed rules as
+/// [`decide`].
+pub fn decide_admin_filed(conn: &Connection, request: &ApprovalRequest<'_>) -> ApprovalDecision {
+    let owner_ok = request.owner_user_id.is_some_and(|owner| !owner.is_empty() && owner != request.requester_user_id);
+    if !request.kind.is_personal() || !owner_ok || request.requester_user_id.is_empty()
+        || request.approver_user_id.is_empty() || request.now <= 0
+    {
+        return ApprovalDecision::Refused(ApprovalRefusal::InvalidRequest);
+    }
+    if !request.fresh_step_up {
+        return ApprovalDecision::Refused(ApprovalRefusal::StepUpRequired);
+    }
+    if conn.is_autocommit() {
+        return ApprovalDecision::Refused(ApprovalRefusal::NotInTransaction);
+    }
+    match Snapshot::read(conn, request.now) {
+        Ok(snapshot) => snapshot.decide_without_self_approval(request),
+        Err(_) => ApprovalDecision::Refused(ApprovalRefusal::AdminLogUnavailable),
+    }
+}
+
+/// Owner decision 2026-11-09, at filing: `filer` (the Admin filing a Personal
+/// request on behalf of `owner`) is an eligible Admin now, and some other
+/// Admin — neither the filer nor the owner — qualifies to approve it (S2).
+/// Refuses [`ApprovalRefusal::FilerNotEligible`] / [`ApprovalRefusal::NoSecondAdmin`];
+/// an unreadable log is [`ApprovalRefusal::AdminLogUnavailable`]. Read inside
+/// the caller's transaction, like [`decide`]. The binding decision is
+/// [`decide_admin_filed`] at approval; this only refuses a request no one
+/// could ever approve.
+pub fn check_admin_filing(conn: &Connection, filer: &str, owner: &str, now: i64) -> Result<(), ApprovalRefusal> {
+    if filer.is_empty() || owner.is_empty() || filer == owner || now <= 0 {
+        return Err(ApprovalRefusal::InvalidRequest);
+    }
+    if conn.is_autocommit() {
+        return Err(ApprovalRefusal::NotInTransaction);
+    }
+    let snapshot = Snapshot::read(conn, now).map_err(|_| ApprovalRefusal::AdminLogUnavailable)?;
+    if !snapshot.eligible_now.contains(filer) {
+        return Err(ApprovalRefusal::FilerNotEligible);
+    }
+    if !snapshot.another_qualifies(&[filer, owner]) {
+        return Err(ApprovalRefusal::NoSecondAdmin);
+    }
+    Ok(())
 }
 
 fn precheck(conn: &Connection, request: &ApprovalRequest<'_>) -> Option<ApprovalRefusal> {
@@ -279,10 +358,7 @@ impl Snapshot {
                 Err(why) => ApprovalDecision::Refused(ApprovalRefusal::ApproverNotQualified(why)),
             };
         }
-        let another_qualifies = self.eligible_now.iter()
-            .filter(|user| !parties.contains(&user.as_str()))
-            .any(|user| self.qualification(user, &parties).is_ok());
-        let refusal = if another_qualifies {
+        let refusal = if self.another_qualifies(&parties) {
             Some(ApprovalRefusal::SecondAdminRequired)
         } else if !self.eligible_now.contains(approver) {
             Some(ApprovalRefusal::ApproverNotQualified(NotQualified::NotEligibleNow))
@@ -296,6 +372,32 @@ impl Snapshot {
         match refusal {
             Some(refusal) => ApprovalDecision::Refused(refusal),
             None => ApprovalDecision::Allowed { self_approved: true, notice_addresses: self.notice_addresses },
+        }
+    }
+
+    /// Some eligible account other than the parties qualifies (S2).
+    fn another_qualifies(&self, parties: &[&str]) -> bool {
+        self.eligible_now.iter()
+            .filter(|user| !parties.contains(&user.as_str()))
+            .any(|user| self.qualification(user, parties).is_ok())
+    }
+
+    /// [`decide_admin_filed`]: parties are the filing Admin and the owner; a
+    /// party never approves (no sole-Admin path), a third Admin must qualify.
+    fn decide_without_self_approval(self, request: &ApprovalRequest<'_>) -> ApprovalDecision {
+        let parties: Vec<&str> = std::iter::once(request.requester_user_id).chain(request.owner_user_id).collect();
+        let approver = request.approver_user_id;
+        if parties.contains(&approver) {
+            let refusal = if self.another_qualifies(&parties) {
+                ApprovalRefusal::SecondAdminRequired
+            } else {
+                ApprovalRefusal::NoSecondAdmin
+            };
+            return ApprovalDecision::Refused(refusal);
+        }
+        match self.qualification(approver, &parties) {
+            Ok(()) => ApprovalDecision::Allowed { self_approved: false, notice_addresses: self.notice_addresses },
+            Err(why) => ApprovalDecision::Refused(ApprovalRefusal::ApproverNotQualified(why)),
         }
     }
 

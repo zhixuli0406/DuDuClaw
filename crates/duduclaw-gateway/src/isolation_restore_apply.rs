@@ -15,7 +15,10 @@
 //!    again; users.db in one transaction (tenant, eligibility, the Q3
 //!    credential check against the snapshot, approval rule, mirror or
 //!    bindings, ACL + policy epoch bump); the confirmed row live with
-//!    `incarnation + 1`; quarantine `restored`; request `done`.
+//!    `incarnation + 1`; quarantine `restored`; request `done`. An
+//!    Admin-filed Personal request (F6fa2, owner decision 2026-11-09) is
+//!    decided by `decide_request`: a third qualifying Admin, never
+//!    self-approved.
 //! 4. After commit the lifecycle must read the new incarnation (else alert).
 //!
 //! The registry rescan, provider cache eviction (L3) and owner/approver
@@ -123,6 +126,11 @@ pub(crate) fn approve(home: &Path, env: &RestoreEnv<'_>, request_id: &str, appro
         _ => return Err(Refusal::NotFound),
     }
     let q = load_fenced(home, env, request.employee, request.incarnation).map_err(|r| settle(home, &request, r, None, env.now))?;
+    // F6fa2: an Admin-filed request exists only for an owner without a
+    // second factor at the tombstone (the snapshot never changes).
+    if request.owner_unverified() && !admin_may_file_for_owner(&q) {
+        return Err(settle(home, &request, Refusal::Inconsistent, None, env.now));
+    }
     let routes = check_outside(home, env, &q).map_err(|r| settle(home, &request, r, None, env.now))?;
     if route_digest(&routes) != request.route_digest {
         return Err(settle(home, &request, Refusal::RoutesChanged, None, env.now));
@@ -171,7 +179,8 @@ fn precheck_rule(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, ap
     if let Some(owner) = &request.owner {
         if !lifecycle::owner_eligible(&tx, owner).map_err(from_lifecycle)? { return Err(Refusal::OwnerIneligible); }
     }
-    decide(env.rule, &tx, &request.requester, approver, request.kind)?;
+    // F6fa2: an Admin-filed request needs a third Admin (no sole-Admin path).
+    decide_request(env.rule, &tx, request, approver)?;
     tx.finish().map_err(unavailable)
 }
 
@@ -355,7 +364,7 @@ fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q:
         if !lifecycle::owner_eligible(&tx, owner).map_err(from_lifecycle)? { return Err(Refusal::OwnerIneligible); }
         check_credentials(home, &tx, q, owner)?;
     }
-    let approval = decide(env.rule, &tx, &request.requester, approver, request.kind)?;
+    let approval = decide_request(env.rule, &tx, request, approver)?;
     // F6c2: the sole-Admin users.db audit row, written once, here — in the
     // write transaction of the decision (tx1's read-only check never writes).
     if approval.self_approved {

@@ -143,6 +143,8 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "isolation.employee_restore_regrant" | "isolation.employee_retire_propose"
         // F6g 由新員工接手（申請）
         | "me.isolation.request_adoption" | "isolation.shared_adoption_request"
+        // F6fa2 管理員代未設定兩步驟驗證的主人申請還原／接手
+        | "isolation.employee_restore_request_for_owner" | "isolation.adoption_request_for_owner"
     )
 }
 
