@@ -707,7 +707,7 @@ fn p1e_dispatch_scan_parser_reads_arm_heads_only() {
         Some((vec!["digest.feedback".into()], true)));
     // JSON keys and string arguments are not arm heads.
     assert_eq!(arm_head(r#""collection": outcome.collection,"#, false), None);
-    assert_eq!(arm_head(r#""",", false), None);
+    assert_eq!(arm_head(r#""","#, false), None);
     let source = "        match method {\n            \"x.a\" => self.handle_a(params),\n            \"x.b\"\n            | \"x.c\" => {\n                self.handle_b()\n            }\n            _ => none(params),\n        }\n    fn helper() { params.get(\"agent_id\") }\n";
     let arms = dispatch_arms(source);
     let methods: Vec<Vec<String>> = arms.iter().map(|arm| arm.methods.clone()).collect();
