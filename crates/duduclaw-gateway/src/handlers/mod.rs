@@ -117,6 +117,8 @@ mod distributor_rpc;
 mod cli_login_rpc;
 mod setup_token_rpc;
 mod system_status;
+// RM-166 round 2: manual identity-token grace (Admin + step-up + audit).
+mod identity_grace_rpc;
 mod experts_generate_rpc;
 mod experts_rpc;
 mod experts_import_rpc;

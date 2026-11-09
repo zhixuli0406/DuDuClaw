@@ -1035,6 +1035,49 @@ fn own_instructions_write_is_blocked_on_both_lanes() {
     assert!(crate::AGENT_STRUCTURE_FILES.contains(&"INSTRUCTIONS.md"));
 }
 
+// ── RM-166 round 2: the identity-transition record ─────────────
+
+#[test]
+fn rm166b_identity_transition_record_is_refused_on_both_lanes() {
+    let h = home();
+    let name = crate::identity_token::IDENTITY_TRANSITION_FILE;
+    let p = h.join(name);
+    assert_eq!(classify_identity_surface(&p, &h), Some(ProtectedSurface::IdentityKey));
+    let untrusted = HookCaller::Untrusted("sales-rep".to_string());
+    for caller in [HookCaller::Absent, agent("sales-rep"), untrusted.clone()] {
+        assert!(matches!(
+            check_identity_surface_write_as(&p, &h, &caller, None, Some("{}")),
+            GuardDecision::BlockedIdentitySurface { .. }
+        ));
+    }
+    // Write/Edit by an employee is also refused by the `<home>` state rule.
+    assert_ne!(check_caller_scope(&p, &h, &agent("sales-rep")), GuardDecision::NotAgentFile);
+    // Bash: rewrite or delete, any caller.
+    for cmd in [
+        format!("echo '{{}}' > /Users/alice/.duduclaw/{name}"),
+        format!("rm ~/.duduclaw/{name}"),
+    ] {
+        assert!(
+            matches!(
+                check_bash_protected_write(&cmd, &h, &HookCaller::Absent),
+                GuardDecision::BlockedBashProtectedWrite { .. }
+            ),
+            "not blocked: {cmd}"
+        );
+        for caller in [agent("sales-rep"), untrusted.clone()] {
+            assert_ne!(check_bash_protected_write(&cmd, &h, &caller), GuardDecision::NotAgentFile, "{cmd}");
+        }
+    }
+    // Reading it, or a same-named file elsewhere, is not this rule's business.
+    assert_eq!(
+        check_bash_protected_write(&format!("cat ~/.duduclaw/{name}"), &h, &HookCaller::Absent),
+        GuardDecision::NotAgentFile
+    );
+    for other in [h.join("agents").join(name), PathBuf::from("/Users/alice/Project/app").join(name)] {
+        assert_eq!(classify_identity_surface(&other, &h), None, "{}", other.display());
+    }
+}
+
 #[test]
 fn user_and_identity_are_operator_owned_even_in_own_directory() {
     for name in ["USER.md", "IDENTITY.md", "user.md", "identity.md"] {

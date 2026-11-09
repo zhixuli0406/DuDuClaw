@@ -700,6 +700,22 @@ impl UserDb {
         tx.commit().map_err(|e| e.to_string())?;
         Ok(result)
     }
+    /// Verify-only second-factor step-up (RM-166 N1): the same factor check,
+    /// throttle and replay/recovery-code consumption as `mfa.disable`, but
+    /// nothing is disabled, regenerated or re-issued.
+    pub fn mfa_step_up_verify(&self, user: &str, code: &str, cipher: &dyn MfaCipher, now: i64) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        active_user(&tx, user)?;
+        if check_factor(&tx, user, code, code.len() != 6, cipher, now).is_err() {
+            audit(&tx, user, "mfa.verification_failed", None)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Err(DENIED.into());
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
     /// Host break-glass recovery for any account.
     /// The CLI must enforce its AI-session and Bash-lane guards before calling.
     pub fn mfa_operator_reset(&self, email: &str) -> Result<()> {

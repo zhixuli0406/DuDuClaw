@@ -132,6 +132,16 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
     // project's own `settings.json` is untouched.
     let mentions_mcp_json = normalized.contains(".mcp.json");
     let mentions_identity_key = normalized.contains(crate::identity_token::IDENTITY_KEY_FILE);
+    // RM-166 round 2: the gateway-owned identity-transition record. The
+    // basename is DuDuClaw-specific, like `identity.key`.
+    // NOTE (RM-166 N4): this record is NOTICE-ONLY. It only drives the
+    // dashboard banner's "first started" / notice window; deleting or editing
+    // it can at most reopen or close that notice and never weakens strict
+    // identity verification (the enforced setting lives in config.toml). This
+    // substring match is a courtesy against accidental edits, NOT an
+    // enforcement boundary — do not rely on it for security.
+    let mentions_identity_state =
+        normalized.contains(crate::identity_token::IDENTITY_TRANSITION_FILE);
     let mentions_hook_settings = HOOK_SETTINGS_FILES
         .iter()
         .any(|f| normalized.contains(&format!(".claude/{f}")));
@@ -143,6 +153,7 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         && !mentions_org_journal
         && !mentions_mcp_json
         && !mentions_identity_key
+        && !mentions_identity_state
         && !mentions_hook_settings
     {
         return GuardDecision::NotAgentFile;
@@ -164,6 +175,8 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         "config.toml"
     } else if mentions_identity_key {
         crate::identity_token::IDENTITY_KEY_FILE
+    } else if mentions_identity_state {
+        crate::identity_token::IDENTITY_TRANSITION_FILE
     } else if mentions_mcp_json {
         ".mcp.json"
     } else {

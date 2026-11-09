@@ -216,6 +216,16 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_system_autostart_status()).await
             }
+            // RM-166 round 2: bounded manual identity-token grace. Start also
+            // needs a fresh password step-up (in the handler); both audited.
+            "system.identity_grace_start" => {
+                require_admin!();
+                boxed_frame(|| self.handle_identity_grace_start(params, ctx)).await
+            }
+            "system.identity_grace_end" => {
+                require_admin!();
+                boxed_frame(|| self.handle_identity_grace_end(ctx)).await
+            }
             "system.autostart.set" => {
                 require_admin!();
                 boxed_frame(|| self.handle_system_autostart_set(params)).await

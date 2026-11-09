@@ -28,9 +28,9 @@ jobs:
     env:
       # MSVC symbols live in separate PDBs; retain the existing Windows output.
       CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
-      # Windows only: <=1.79.2 updaters reject an extracted binary >= 200 MiB, and the
-      # 1.80.0 MSVC exe was 210,997,248 bytes at opt-level 3. Optimise for size there.
-      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ startsWith(matrix.os, 'windows') && 's' || '3' }}
+      # opt-level / codegen-units come from [profile.release] ("s" / 16) on every
+      # platform; do not override via CARGO_PROFILE_RELEASE_* (<=1.79.2 updaters reject
+      # a binary >= 200 MiB; Linux opt-level 3 measured ~226 MB).
     permissions:
       contents: write
     strategy:

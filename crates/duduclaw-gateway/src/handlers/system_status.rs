@@ -116,11 +116,21 @@ impl MethodHandler {
         if let Some(folder_access) = crate::macos_folder_access::status_json(&self.home_dir) {
             payload["folder_access"] = folder_access;
         }
+        // RM-166: effective AI-employee identity mode, grace deadline, the
+        // post-upgrade notice window and recent identity refusals by the
+        // agent-file-guard hook. Admin-only (round 2, finding 3): the RPC
+        // strips it for other callers ([`strip_admin_only_status`]) and so
+        // does the push filter for `system.status_changed`.
+        payload["identity_token"] = crate::identity_transition::status_json(&self.home_dir);
         payload
     }
 
     pub(crate) async fn handle_system_status(&self, admin: bool) -> WsFrame {
-        WsFrame::ok_response("", self.system_status_payload_for(admin).await)
+        let mut payload = self.system_status_payload_for(admin).await;
+        if !admin {
+            strip_admin_only_status(&mut payload);
+        }
+        WsFrame::ok_response("", payload)
     }
 
     /// Push a fresh `system.status` to every connected dashboard so live
@@ -151,6 +161,21 @@ impl MethodHandler {
             }),
         )
     }
+}
+
+/// `system.status` fields only an Admin may read (RM-166 round 2). Shared
+/// by the RPC and the `system.status_changed` push filter.
+pub(crate) const ADMIN_ONLY_STATUS_FIELDS: &[&str] = &["identity_token"];
+
+/// Remove [`ADMIN_ONLY_STATUS_FIELDS`] from a `system.status` payload.
+/// Returns whether anything was removed.
+pub(crate) fn strip_admin_only_status(payload: &mut Value) -> bool {
+    let Some(map) = payload.as_object_mut() else { return false };
+    let mut removed = false;
+    for field in ADMIN_ONLY_STATUS_FIELDS {
+        removed |= map.remove(*field).is_some();
+    }
+    removed
 }
 
 #[cfg(test)]

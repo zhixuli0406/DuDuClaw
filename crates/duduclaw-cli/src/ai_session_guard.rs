@@ -18,6 +18,8 @@
 pub(crate) const AI_SESSION_ENV_VARS: &[&str] = &[
     duduclaw_core::ENV_AGENT_ID,
     duduclaw_core::ENV_AGENT_TOKEN,
+    // RM-166 round 2: the hook-only proof a Claude employee's CLI env carries.
+    duduclaw_core::ENV_HOOK_TOKEN,
     duduclaw_core::ENV_TRUST_TURN_ID,
     duduclaw_core::ENV_TRUST_SESSION_ID,
     duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ,

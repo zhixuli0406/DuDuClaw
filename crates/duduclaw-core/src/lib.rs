@@ -139,6 +139,9 @@ pub use identity_token::{
     mint_token as mint_identity_token, verify_internal_request_signature,
     verify_claim as verify_identity_claim, verify_env_identity, verify_token as verify_identity_token,
     IdentityVerdict, ENV_AGENT_TOKEN, IDENTITY_KEY_FILE, UNTRUSTED_AGENT_ID,
+    // RM-166 round 2: hook-only identity proof.
+    hook_identity_env_vars, mint_hook_token, verify_hook_claim, verify_hook_token, ENV_HOOK_TOKEN,
+    IDENTITY_TRANSITION_FILE,
 };
 pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
 pub use match_utils::{is_valid_discord_snowflake, is_valid_egress_host, origin_host_matches, word_contains_ci};

@@ -269,6 +269,11 @@ pub(super) async fn spawn_claude_cli_with_env(
             cmd.env(key, value);
         }
     }
+    // RM-166: the employee's own identity pair for the agent-file-guard hook
+    // (hooks inherit this CLI's env, which the allowlist above cleared). Set
+    // last so nothing above can replace it; `work_dir` is the directory whose
+    // hook was installed above, i.e. the employee this reply runs for.
+    crate::agent_hook_installer::apply_hook_identity_env(&mut cmd, work_dir);
 
     // Pass system prompt via temp file to avoid exposure in /proc/PID/cmdline (BE-C1)
     // CACHE_SPLIT_MARKER is a Direct-API-only layering hint — strip it here.
