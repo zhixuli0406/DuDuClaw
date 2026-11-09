@@ -101,6 +101,8 @@ pub(crate) mod isolation_retire;
 // F6d: production seams of the restore/retire engines and the RPC bodies.
 pub(crate) mod isolation_restore_wiring;
 pub(crate) mod isolation_restore_rpc;
+// F6k: Shared restore filing, member/route selection, use-time tenant route gate (§3.9).
+pub(crate) mod isolation_restore_shared;
 // F6g adoption under a new employee id (§3.10); the request RPCs are F6d's.
 #[allow(dead_code)]
 pub(crate) mod isolation_adopt;

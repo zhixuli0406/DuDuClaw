@@ -58,10 +58,17 @@ pub(crate) enum RpcError {
     Retire(crate::isolation_retire::RetireError),
     /// F6g adoption engine (`isolation_adopt::AdoptError`).
     Adopt(AdoptError),
+    /// F6k Shared restore (`isolation_restore_shared::SharedError`).
+    Shared(crate::isolation_restore_shared::SharedError),
     Invalid,
 }
 
 impl From<Refusal> for RpcError { fn from(r: Refusal) -> Self { Self::Restore(r) } }
+impl From<crate::isolation_restore_shared::SharedError> for RpcError {
+    fn from(e: crate::isolation_restore_shared::SharedError) -> Self {
+        match e { crate::isolation_restore_shared::SharedError::Restore(r) => Self::Restore(r), other => Self::Shared(other) }
+    }
+}
 impl From<AdoptError> for RpcError {
     fn from(e: AdoptError) -> Self { match e { AdoptError::Restore(r) => Self::Restore(r), other => Self::Adopt(other) } }
 }
@@ -73,6 +80,7 @@ impl RpcError {
             Self::Factor(f) => f.code(),
             Self::Retire(r) => r.code(),
             Self::Adopt(a) => a.code(),
+            Self::Shared(s) => s.code(),
             Self::Invalid => "INVALID_REQUEST",
         }
     }
@@ -81,6 +89,7 @@ impl RpcError {
         match self {
             Self::Retire(r) => r.message(),
             Self::Adopt(a) => a.message(),
+            Self::Shared(s) => s.message(),
             Self::Invalid => "申請內容不正確，請重新載入後再試。",
             Self::Factor(OwnerFactorError::NoFactor) => "請先設定兩步驟驗證",
             Self::Factor(OwnerFactorError::NotStrongest(_)) =>
@@ -378,7 +387,9 @@ pub(crate) fn decide(home: &Path, env: &RestoreEnv<'_>, approver: &str, id: &str
         }
         return Ok(json!({"request_id": id, "state": "denied"}));
     }
-    let restored = engine::approve(home, env, id, approver)?;
+    // F6k: a Shared request is re-checked (members, ticks) and approved with
+    // only its ticked tenant routes; every other kind goes to the engine as is.
+    let restored = crate::isolation_restore_shared::approve(home, env, &request, approver)?;
     let sealed = {
         let db = engine::open_apply(home)?;
         crate::isolation_quarantine::read_quarantine(&db, request.employee, request.incarnation).map_err(|_| Refusal::Unavailable)?
@@ -402,9 +413,12 @@ pub(crate) fn decide(home: &Path, env: &RestoreEnv<'_>, approver: &str, id: &str
             wiring::queue_or_alert(home, &scope_of(&q), "isolation.employee_restore_self_approved", &recipients, &details, false, env.now);
         }
     }
-    Ok(json!({"request_id": id, "state": "done", "label": request.label, "incarnation": restored.incarnation,
+    let mut reply = json!({"request_id": id, "state": "done", "label": request.label, "incarnation": restored.incarnation,
         "self_approved": restored.self_approved, "label_state": label_state,
-        "work_paused": true, "routes_need_provisioning": true}))
+        "work_paused": true, "routes_need_provisioning": true});
+    // F6k (§3.7, §3.9): Shared re-bound members, re-approved tenant routes, member notices.
+    crate::isolation_restore_shared::after_restore(home, &request, restored.incarnation, &mut reply, env.now);
+    Ok(reply)
 }
 
 /// `isolation.employee_restore_regrant` (Admin + step-up, audited): re-apply

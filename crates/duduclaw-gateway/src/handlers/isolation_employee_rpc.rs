@@ -140,6 +140,8 @@ pub(super) fn owns(method: &str) -> bool {
         || method == restore::SHARED_ADOPTION_REQUEST
         // F6fa2: the Admin's Personal adoption filed for an owner without a second factor.
         || method == restore::ADOPTION_FOR_OWNER
+        // F6k: the Admin's Shared restore request and its options (`restore::shared::METHODS`).
+        || restore::shared::METHODS.contains(&method)
 }
 
 #[derive(serde::Deserialize)]
@@ -193,7 +195,7 @@ struct Prepared {
 
 impl MethodHandler {
     pub(crate) async fn handle_isolation_employee(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
-        if restore::METHODS.contains(&method) { return self.handle_isolation_restore(method, params, ctx).await; }
+        if restore::handles(method) { return self.handle_isolation_restore(method, params, ctx).await; }
         match self.isolation_employee(method, params, ctx).await {
             Ok(value) => WsFrame::ok_response("", value),
             Err(message) => WsFrame::error_response("", message),
