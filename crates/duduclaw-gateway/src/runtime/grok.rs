@@ -1324,6 +1324,7 @@ mod tests {
             .env("HOME", "fixture home").env("GROK_HOME", "fixture config")
             .env("XAI_API_KEY", "fixture-key")
             .env(duduclaw_core::ENV_AGENT_ID, "test")
+            .env_remove(duduclaw_core::ENV_HOOK_TOKEN)
             .envs(duduclaw_core::mcp_forward_env_vars())
             .env_remove(duduclaw_core::ENV_DISPATCH_RUN_ID)
             .env_remove(duduclaw_core::ENV_TASK_ID)
