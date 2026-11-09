@@ -62,7 +62,19 @@ pub const IN_RUN_RECORDING_TOOLS: [&str; 2] = ["browser_record_start", "browser_
 /// (https, default port, no userinfo, a public DNS name, never an IP literal),
 /// and the run's egress forwarder still allows public addresses only. This
 /// does not add the tool to [`PUBLIC_ORIGIN_TOOLS`]: it is not a web fetch.
+///
+/// Only the all-public grant (`PublicOrigins` = `["*"]`) authorizes a
+/// recording. A narrow grant would limit just the START URL: the recorded
+/// page can then navigate or load subresources from any public host the egress
+/// forwarder allows, so an origin list would promise a confinement it cannot
+/// give. A non-`*` grant is therefore refused for `browser_record_start`.
 pub const RECORDING_URL_TOOLS: &[&str] = &["browser_record_start"];
+
+/// Whether `grant` is the all-public `PublicOrigins` grant (exactly `["*"]`).
+fn all_public_grant(grant: &ResourceGrant) -> bool {
+    matches!(grant, ResourceGrant::PublicOrigins { origins }
+        if matches!(origins.as_slice(), [only] if only.is_any()))
+}
 #[derive(Debug)]
 pub struct ToolPolicy {
     pub name: &'static str,
@@ -712,7 +724,7 @@ fn check_selected_resources(policy: &ToolPolicy, arguments: &Value, resources: &
             if key == "url_or_path" && !matches!(value.split_once("://"), Some(("https" | "http", _))) { continue; }
             if RECORDING_URL_TOOLS.contains(&policy.name) {
                 // HX6: the same public-URL checks as the D-H2 web tools.
-                if !resources.iter().any(|resource| matches!(resource, ResourceGrant::PublicOrigins { .. })
+                if !resources.iter().any(|resource| all_public_grant(resource)
                     && crate::resources::permitted_public_origin(resource, value).is_ok()) {
                     return Err(VerificationError::Invalid);
                 }
@@ -810,6 +822,9 @@ fn recording_url_grants(context: &RequestContext, policy: &ToolPolicy, arguments
         .is_some_and(|value| key == "url" || matches!(value.split_once("://"), Some(("https" | "http", _))));
     if !(named("url") || named("url_or_path")) { return Ok(Vec::new()); }
     let grant = public_origins_grant(context).ok_or(VerificationError::Invalid)?.clone();
+    // N1: a narrow grant would bound only the start URL, not the page's later
+    // requests; only the all-public grant is meaningful for a recording.
+    if !all_public_grant(&grant) { return Err(VerificationError::Invalid); }
     let scope = ResourceGrant::EmployeeScope { id: context.record().employee };
     crate::resources::require_resource(context, &scope)?;
     crate::resources::require_resource(context, &grant)?;

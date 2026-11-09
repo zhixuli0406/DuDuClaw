@@ -612,13 +612,16 @@ fn hx6url_recording_start_is_authorized_by_public_origins_without_url_origin() {
         widened.push(extra.clone());
         assert!(authorize(&ctx, "browser_record_start", &record_start("https://news.example.org/"), &Fixed(widened)).is_err(), "{extra:?}");
     }
-    // A narrow grant permits exactly its origin.
-    let narrow = public_origins(&["https://news.example.org"]);
-    let ctx = context("browser_record_start", vec![scope(), employee(), work(), narrow.clone()]);
-    let call = authorize(&ctx, "browser_record_start", &record_start("https://news.example.org/p"), &Fixed(resolved.clone())).unwrap();
-    assert_eq!(call.resources(), &[employee(), work(), scope(), narrow]);
-    for url in ["https://other.example.net/", "https://sub.news.example.org/", "https://news.example.org.evil.net/"] {
-        assert!(authorize(&ctx, "browser_record_start", &record_start(url), &Fixed(resolved.clone())).is_err(), "{url}");
+    // N1: a narrow grant bounds only the start URL, so it is refused for a
+    // recording, even for its own origin; the same grant still serves web fetches.
+    for narrow in [public_origins(&["https://news.example.org"]),
+        public_origins(&["https://news.example.org", "https://other.example.net"])] {
+        let ctx = context("browser_record_start", vec![scope(), employee(), work(), narrow.clone()]);
+        for url in ["https://news.example.org/p", "https://other.example.net/", "https://sub.news.example.org/"] {
+            assert!(authorize(&ctx, "browser_record_start", &record_start(url), &Fixed(resolved.clone())).is_err(), "{url}");
+        }
+        let fetch = context("web_fetch_cached", vec![scope(), narrow]);
+        assert!(authorize(&fetch, "web_fetch_cached", &json!({"url":"https://news.example.org/p"}), &UnusedResolver).is_ok());
     }
     // The stop names no URL and needs no public-web grant.
     let ctx = context("browser_record_stop", vec![employee(), work()]);

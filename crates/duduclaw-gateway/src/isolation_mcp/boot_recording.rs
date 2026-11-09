@@ -11,7 +11,7 @@
 //! survived, exit 78, timeout, OOM) reach `security_audit.jsonl` through
 //! [`GatewayRecordingAudit`]. No URL, page content or artifact is logged.
 use super::*;
-use duduclaw_mcp_boundary::{recording_audit::{RecordingAudit, RecordingAuditEvent},
+use duduclaw_mcp_boundary::{recording_audit::{RecordingAudit, RecordingAuditEvent, StartRefusedLimiter},
     recording_jobs::{RecordingJobs, RecordingKey}};
 use duduclaw_security::audit::{append_audit_event, AuditEvent, Severity};
 
@@ -75,18 +75,21 @@ fn control(home: &Path, ctx: &duduclaw_auth::UserContext, id: &str, stop: bool, 
 
 /// The boundary's recording facts, appended to `security_audit.jsonl` off
 /// the async worker threads.
-pub(super) struct GatewayRecordingAudit { home: PathBuf }
+pub(super) struct GatewayRecordingAudit { home: PathBuf, refused: StartRefusedLimiter }
 impl GatewayRecordingAudit {
-    pub(super) fn new(home: PathBuf) -> Self { Self { home } }
+    pub(super) fn new(home: PathBuf) -> Self { Self { home, refused: StartRefusedLimiter::default() } }
 }
 impl RecordingAudit for GatewayRecordingAudit {
     fn record(&self, event: RecordingAuditEvent) {
-        let severity = if event.kind.warning() { Severity::Warning } else { Severity::Info };
-        let record = AuditEvent::new(event.kind.event(), "gateway", severity, event.fields());
-        let home = self.home.clone();
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => { runtime.spawn_blocking(move || append_audit_event(&home, &record)); }
-            Err(_) => append_audit_event(&home, &record),
+        // N3: start refusals are merged per (employee, run, reason).
+        for event in self.refused.admit(event, std::time::Instant::now()) {
+            let severity = if event.kind.warning() { Severity::Warning } else { Severity::Info };
+            let record = AuditEvent::new(event.kind.event(), "gateway", severity, event.fields());
+            let home = self.home.clone();
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => { runtime.spawn_blocking(move || append_audit_event(&home, &record)); }
+                Err(_) => append_audit_event(&home, &record),
+            }
         }
     }
 }
@@ -118,5 +121,20 @@ mod tests {
         }
         assert_eq!(reason(&VerificationError::Unavailable), "unavailable");
         assert_eq!(reason(&VerificationError::Revoked), "revoked");
+    }
+    /// N3: a flood of identical start refusals reaches `security_audit.jsonl`
+    /// as one record; a different reason is its own record.
+    #[test]
+    fn hx6c_gateway_sink_merges_start_refused_records() {
+        use duduclaw_isolation::{execution::RunHandle, ids::{EmployeeId, RunId}};
+        let home = tempfile::tempdir().unwrap();
+        let sink = GatewayRecordingAudit::new(home.path().to_path_buf());
+        let refused = |reason: &'static str| RecordingAuditEvent::refused(EmployeeId([1; 16]), RunHandle(RunId([2; 16])), reason);
+        for _ in 0..20 { sink.record(refused("helper_recording_unsupported")); }
+        sink.record(refused("helper_unavailable"));
+        let log = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(events.len(), 2, "{log}");
+        assert!(events.iter().all(|event| event["event_type"] == "isolation_recording_start_refused"));
     }
 }

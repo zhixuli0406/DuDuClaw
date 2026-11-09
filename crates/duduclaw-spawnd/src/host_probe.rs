@@ -24,9 +24,11 @@
 //! Fail closed: no binding, no Landlock evidence, too little run time left, a
 //! start refusal or a run that ends under the probe leave the probe unrun
 //! (another run may try; each run at most once). A timeout, OOM kill or
-//! signal is inconclusive (host load, not necessarily Chromium): it is retried
-//! with backoff in another employee's run, at most `MAX_INCONCLUSIVE` attempts
-//! in all, then the probe fails. A clean exit with the wrong or oversized
+//! signal other than SIGSYS is inconclusive (host load, not necessarily
+//! Chromium): it is retried with backoff in another employee's run (the same
+//! employee again, after the backoff, only when no other is eligible), at most
+//! `MAX_INCONCLUSIVE` attempts in all, then the probe fails. SIGSYS (the
+//! seccomp kill) is deterministic and fails the probe at once. A clean exit with the wrong or oversized
 //! output or any stderr, exit 78 (`helper_recording_unsupported`), any other
 //! exit or a start failure is a failed probe for this spawnd process. Nothing
 //! here is reachable from IPC: the gateway can neither start nor answer the probe.
@@ -36,6 +38,8 @@ use duduclaw_isolation::ipc::HelperOutcome;
 use crate::audit::ProbeVerdict;
 use crate::host_state::{RecordingProbeEvidence, RECORDING_BUILD_ENABLED};
 
+/// Linux SIGSYS (x86_64 and aarch64): the seccomp kill signal.
+const SIGSYS: u32 = 31;
 const PROBE_RUNTIME: &str = "duduclaw-browser-record-v1";
 /// Tool bound for the probe call (spawnd clamps it to the binding and the run).
 const PROBE_TIMEOUT_MS: u64 = 60_000;
@@ -78,7 +82,7 @@ impl RecordingProbe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Verdict {
     Passed,
-    /// Hard failure: exit 78 or any other exit, wrong output, stderr, start failure.
+    /// Hard failure: exit 78 or any other exit, SIGSYS, wrong output, stderr, start failure.
     Failed,
     /// Timeout, OOM kill or signal: retried (bounded) in another employee's run.
     Inconclusive,
@@ -89,6 +93,9 @@ pub(super) enum Verdict {
 pub(super) fn verdict(outcome: HelperOutcome, stdout: &[u8], tainted: bool, call: HelperCallId) -> Verdict {
     match outcome {
         HelperOutcome::RunEnded => Verdict::RunEnded,
+        // N2: SIGSYS is the browser seccomp filter killing a denied syscall: a
+        // deterministic property of this host/Chromium build, not host load.
+        HelperOutcome::Signalled(SIGSYS) => Verdict::Failed,
         HelperOutcome::TimedOut | HelperOutcome::OomKilled | HelperOutcome::Signalled(_) => Verdict::Inconclusive,
         HelperOutcome::Exited(0) if !tainted && stdout == duduclaw_isolation::ipc::recording_probe_reply(&call.hex()).as_bytes() => Verdict::Passed,
         HelperOutcome::Exited(_) | HelperOutcome::StartFailed => Verdict::Failed,
@@ -110,12 +117,26 @@ impl ProbeSchedule {
     /// Remaining run time the probe needs so its timeout is never clamped by
     /// the run deadline and the slot can be drained within the grace.
     pub(super) fn required_ms(termination_grace_ms: u64) -> u64 { PROBE_TIMEOUT_MS.saturating_add(termination_grace_ms) }
+    /// Preferred candidates: a run of an employee that has not yet given an
+    /// inconclusive result.
     pub(super) fn eligible(&self, run: RunId, employee: EmployeeId, remaining_ms: u64, termination_grace_ms: u64, now: Instant) -> bool {
-        !self.tried_runs.contains(&run) && !self.inconclusive_employees.contains(&employee)
+        !self.inconclusive_employees.contains(&employee) && self.eligible_any(run, remaining_ms, termination_grace_ms, now)
+    }
+    /// N2 fallback: like [`Self::eligible`] but a retry may use an employee that
+    /// already gave an inconclusive result (single-employee hosts). Only
+    /// meaningful once an inconclusive result exists, only after its backoff,
+    /// and still bounded by `MAX_INCONCLUSIVE`.
+    pub(super) fn eligible_retry(&self, run: RunId, remaining_ms: u64, termination_grace_ms: u64, now: Instant) -> bool {
+        self.inconclusive > 0 && self.eligible_any(run, remaining_ms, termination_grace_ms, now)
+    }
+    fn eligible_any(&self, run: RunId, remaining_ms: u64, termination_grace_ms: u64, now: Instant) -> bool {
+        !self.tried_runs.contains(&run)
             && self.not_before.is_none_or(|not_before| now >= not_before)
             && remaining_ms >= Self::required_ms(termination_grace_ms)
     }
     pub(super) fn tried(&mut self, run: RunId) { self.tried_runs.insert(run); }
+    /// An inconclusive run may be retried (after the backoff) while it lasts.
+    pub(super) fn untry(&mut self, run: RunId) { self.tried_runs.remove(&run); }
     /// Drop runs that no longer exist (the set stays bounded by live runs).
     pub(super) fn retain_runs(&mut self, live: impl Fn(&RunId) -> bool) { self.tried_runs.retain(|run| live(run)); }
     /// This attempt's number for the audit (counted inconclusive attempts + 1).
@@ -208,12 +229,18 @@ impl Core {
                 let runs = &self.runs;
                 self.probe_schedule.retain_runs(|run| runs.contains_key(run));
                 let now = Instant::now();
-                let candidates: Vec<RunId> = self.runs.iter()
+                let pick = |fallback: bool| -> Vec<RunId> { self.runs.iter()
                     .filter(|(run, entry)| !entry.closed && entry.started_event
                         && matches!(entry.helper, Some(RunHelper::Engine(_)))
-                        && entry.helper_parent.as_ref().is_some_and(|parent| self.probe_schedule.eligible(**run, entry.employee,
-                            remaining_ms(entry.runtime_deadline), parent.timeouts.termination_grace_ms, now)))
-                    .map(|(run, _)| *run).collect();
+                        && entry.helper_parent.as_ref().is_some_and(|parent| {
+                            let (remaining, grace) = (remaining_ms(entry.runtime_deadline), parent.timeouts.termination_grace_ms);
+                            if fallback { self.probe_schedule.eligible_retry(**run, remaining, grace, now) }
+                            else { self.probe_schedule.eligible(**run, entry.employee, remaining, grace, now) }
+                        }))
+                    .map(|(run, _)| *run).collect() };
+                // N2: another employee first; the same employee again only when none is eligible.
+                let mut candidates = pick(false);
+                if candidates.is_empty() { candidates = pick(true); }
                 for run in candidates {
                     // Each run is tried at most once (its table may lack the binding).
                     self.probe_schedule.tried(run);
@@ -277,6 +304,7 @@ impl Core {
         let (audited, decided) = self.probe_schedule.record(verdict(outcome, &probe.out, probe.tainted, probe.call),
             probe.employee, Instant::now());
         self.audit_probe(Event::RecordingProbeVerdict, &probe, Some(outcome), Some(audited));
+        if audited == ProbeVerdict::Inconclusive { self.probe_schedule.untry(probe.run); }
         self.recording_probe = match decided {
             None => RecordingProbe::Idle,
             Some(passed) => RecordingProbe::Done(RecordingProbeEvidence { boot_id: probe.boot_id.clone(), landlock_abi: probe.landlock_abi, passed }),
@@ -315,13 +343,56 @@ mod tests {
     fn hx6r3_probe_timeout_oom_signal_are_inconclusive() {
         let call = HelperCallId::new([7; 16]).unwrap();
         let reply = duduclaw_isolation::ipc::recording_probe_reply(&call.hex());
-        for outcome in [HelperOutcome::TimedOut, HelperOutcome::OomKilled, HelperOutcome::Signalled(9), HelperOutcome::Signalled(31)] {
+        for outcome in [HelperOutcome::TimedOut, HelperOutcome::OomKilled, HelperOutcome::Signalled(9), HelperOutcome::Signalled(15)] {
             for (bytes, tainted) in [(reply.as_bytes(), false), (b"".as_slice(), true)] {
                 assert_eq!(verdict(outcome, bytes, tainted, call), Verdict::Inconclusive, "{outcome:?}");
             }
         }
         assert_eq!(verdict(HelperOutcome::Exited(78), b"", false, call), Verdict::Failed);
         assert_eq!(verdict(HelperOutcome::Exited(0), b"{}", false, call), Verdict::Failed);
+    }
+    /// N2: SIGSYS (31, the seccomp kill) is deterministic: a hard failure
+    /// whatever the output, never retried.
+    #[test]
+    fn hx6c_probe_sigsys_is_a_hard_failure() {
+        let call = HelperCallId::new([7; 16]).unwrap();
+        let reply = duduclaw_isolation::ipc::recording_probe_reply(&call.hex());
+        for (bytes, tainted) in [(reply.as_bytes(), false), (b"".as_slice(), true)] {
+            assert_eq!(verdict(HelperOutcome::Signalled(31), bytes, tainted, call), Verdict::Failed);
+        }
+        let mut schedule = ProbeSchedule::default();
+        assert_eq!(schedule.record(Verdict::Failed, EmployeeId([1; 16]), Instant::now()), (ProbeVerdict::Failed, Some(false)));
+    }
+    /// N2: a single-employee host retries the same employee once the backoff
+    /// has passed (and only then), still bounded by `MAX_INCONCLUSIVE`.
+    #[test]
+    fn hx6c_probe_single_employee_retries_after_backoff() {
+        let grace = 12_000;
+        let enough = PROBE_TIMEOUT_MS + grace;
+        let (employee, run) = (EmployeeId([1; 16]), RunId([11; 16]));
+        let mut schedule = ProbeSchedule::default();
+        let start = Instant::now();
+        // Before any inconclusive result there is no retry fallback.
+        assert!(!schedule.eligible_retry(run, enough, grace, start));
+        schedule.tried(run);
+        assert_eq!(schedule.record(Verdict::Inconclusive, employee, start), (ProbeVerdict::Inconclusive, None));
+        schedule.untry(run);
+        // Preferred path still excludes the employee; the fallback waits for the backoff.
+        assert!(!schedule.eligible(run, employee, enough, grace, start + RETRY_BACKOFF[0]));
+        assert!(!schedule.eligible_retry(run, enough, grace, start + RETRY_BACKOFF[0] - Duration::from_millis(1)));
+        assert!(schedule.eligible_retry(run, enough, grace, start + RETRY_BACKOFF[0]));
+        assert!(!schedule.eligible_retry(run, PROBE_TIMEOUT_MS, grace, start + RETRY_BACKOFF[0]), "still needs the run time");
+        let later = start + RETRY_BACKOFF[0];
+        schedule.tried(run);
+        assert_eq!(schedule.record(Verdict::Inconclusive, employee, later), (ProbeVerdict::Inconclusive, None));
+        schedule.untry(run);
+        assert!(!schedule.eligible_retry(run, enough, grace, later + RETRY_BACKOFF[0]));
+        let last = later + RETRY_BACKOFF[1];
+        assert!(schedule.eligible_retry(run, enough, grace, last));
+        // The bound holds: the 3rd inconclusive result ends the probe and clears the state.
+        schedule.tried(run);
+        assert_eq!(schedule.record(Verdict::Inconclusive, employee, last), (ProbeVerdict::Exhausted, Some(false)));
+        assert!(!schedule.eligible_retry(run, enough, grace, last + RETRY_BACKOFF[1]));
     }
     /// Round 3 (N1): only runs with the probe timeout + termination grace
     /// left; a tried run is never reused.

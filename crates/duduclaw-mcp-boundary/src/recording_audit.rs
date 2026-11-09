@@ -82,6 +82,67 @@ impl RecordingAuditEvent {
     }
 }
 
+/// N3: window of [`StartRefusedLimiter`]: one record per key, then at most one
+/// counter summary per window.
+pub const START_REFUSED_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bound on distinct `(employee, run, reason)` keys held at once.
+const START_REFUSED_KEYS: usize = 1024;
+
+struct RefusedState { window_start: std::time::Instant, suppressed: u64, first: RecordingAuditEvent }
+/// N3: merges `StartRefused` audit records per `(employee, run, reason)` so a
+/// looping caller cannot flood the audit log (like spawnd's audit budget): the
+/// first refusal is recorded at once; further ones in the window only count,
+/// and the count is written as one summary (`suppressed`, `window_secs`) when
+/// the next refusal of that key arrives after the window, or when any later
+/// refusal sweeps the expired key. Memory is bounded; at the bound a new key's
+/// record is dropped (the log already holds the flood's older records).
+/// Other event kinds pass through untouched.
+#[derive(Default)]
+pub struct StartRefusedLimiter { keys: std::sync::Mutex<std::collections::HashMap<([u8; 16], [u8; 16], String), RefusedState>> }
+impl StartRefusedLimiter {
+    /// The records to write now for `event` (possibly none).
+    pub fn admit(&self, event: RecordingAuditEvent, now: std::time::Instant) -> Vec<RecordingAuditEvent> {
+        if event.kind != RecordingAuditKind::StartRefused { return vec![event]; }
+        let reason = event.detail.get("reason").and_then(Value::as_str).unwrap_or_default().chars().take(64).collect::<String>();
+        let key = (event.employee.0, event.run.0 .0, reason);
+        let mut keys = self.keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expired = |state: &RefusedState| now.saturating_duration_since(state.window_start) >= START_REFUSED_WINDOW;
+        let mut out = Vec::new();
+        if keys.len() >= START_REFUSED_KEYS {
+            // Sweep expired keys, writing their pending summaries.
+            keys.retain(|other, state| {
+                if !expired(state) || *other == key { return true; }
+                if state.suppressed > 0 { out.push(Self::summary(state)); }
+                false
+            });
+        }
+        match keys.get_mut(&key) {
+            Some(state) if !expired(state) => state.suppressed = state.suppressed.saturating_add(1),
+            Some(state) => {
+                // This refusal opens the next window: it is written as the
+                // first record when nothing was suppressed, else it is counted
+                // into the next summary after this window's summary.
+                if state.suppressed > 0 {
+                    out.push(Self::summary(state));
+                    *state = RefusedState { window_start: now, suppressed: 1, first: event };
+                } else {
+                    out.push(event.clone());
+                    *state = RefusedState { window_start: now, suppressed: 0, first: event };
+                }
+            }
+            None if keys.len() >= START_REFUSED_KEYS => {}
+            None => {
+                out.push(event.clone());
+                keys.insert(key, RefusedState { window_start: now, suppressed: 0, first: event });
+            }
+        }
+        out
+    }
+    fn summary(state: &RefusedState) -> RecordingAuditEvent {
+        state.first.clone().with("suppressed", json!(state.suppressed)).with("window_secs", json!(START_REFUSED_WINDOW.as_secs()))
+    }
+}
+
 /// Installed by the gateway; must not block for long (it is called from the
 /// boundary's tasks) and must never fail the recording.
 pub trait RecordingAudit: Send + Sync {
@@ -106,6 +167,57 @@ mod tests {
             RecordingAuditKind::InvalidResult, RecordingAuditKind::CollectorTimeout].map(RecordingAuditKind::event);
         assert_eq!(names, ["isolation_recording_started", "isolation_recording_stop_requested", "isolation_recording_revoked_stop",
             "isolation_recording_invalid_result", "isolation_recording_collector_timeout"]);
+    }
+    /// N3: refusals merge per (employee, run, reason): first record, then one
+    /// summary per window; other keys and kinds are independent.
+    #[test]
+    fn hx6c_start_refused_audit_is_rate_limited_per_employee_run_reason() {
+        use std::time::{Duration, Instant};
+        let run = |n: u8| RunHandle(duduclaw_isolation::ids::RunId([n; 16]));
+        let refused = |employee: u8, run_n: u8, reason: &'static str| RecordingAuditEvent::refused(EmployeeId([employee; 16]), run(run_n), reason);
+        let limiter = StartRefusedLimiter::default();
+        let t0 = Instant::now();
+        let first = limiter.admit(refused(1, 2, "helper_recording_unsupported").with("gate", json!("spawnd")), t0);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].fields().get("suppressed").is_none());
+        for step in 1..=50u64 {
+            assert!(limiter.admit(refused(1, 2, "helper_recording_unsupported"), t0 + Duration::from_millis(step)).is_empty());
+        }
+        // A different reason, run or employee is its own key.
+        for other in [refused(1, 2, "helper_unavailable"), refused(1, 3, "helper_recording_unsupported"), refused(9, 2, "helper_recording_unsupported")] {
+            assert_eq!(limiter.admit(other, t0 + Duration::from_secs(1)).len(), 1);
+        }
+        // Other kinds are never limited.
+        let call = HelperCallId::new([1; 16]).unwrap();
+        for _ in 0..3 {
+            assert_eq!(limiter.admit(RecordingAuditEvent::new(RecordingAuditKind::Failed, EmployeeId([1; 16]), run(2), call), t0).len(), 1);
+        }
+        // After the window: one summary with the count (and the original gate); the new refusal is counted.
+        let later = t0 + START_REFUSED_WINDOW;
+        let summary = limiter.admit(refused(1, 2, "helper_recording_unsupported"), later);
+        assert_eq!(summary.len(), 1);
+        let fields = summary[0].fields();
+        assert_eq!((fields["suppressed"].as_u64(), fields["gate"].as_str(), fields["call"].clone()), (Some(50), Some("spawnd"), Value::Null));
+        assert_eq!(fields["reason"], "helper_recording_unsupported");
+        assert!(limiter.admit(refused(1, 2, "helper_recording_unsupported"), later + Duration::from_secs(1)).is_empty());
+        let next = limiter.admit(refused(1, 2, "helper_recording_unsupported"), later + START_REFUSED_WINDOW);
+        assert_eq!(next[0].fields()["suppressed"].as_u64(), Some(2));
+        // A quiet key's next refusal after a window with nothing suppressed is a plain record.
+        let plain = limiter.admit(refused(9, 2, "helper_recording_unsupported"), t0 + START_REFUSED_WINDOW * 3);
+        assert!(plain.len() == 1 && plain[0].fields().get("suppressed").is_none());
+    }
+    /// N3: the key table is bounded; a flood of distinct keys cannot grow it.
+    #[test]
+    fn hx6c_start_refused_limiter_is_bounded() {
+        let limiter = StartRefusedLimiter::default();
+        let now = std::time::Instant::now();
+        let mut written = 0;
+        for n in 0..(START_REFUSED_KEYS + 50) {
+            let run = RunHandle(duduclaw_isolation::ids::RunId([(n % 251) as u8, (n / 251) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+            written += limiter.admit(RecordingAuditEvent::refused(EmployeeId([1; 16]), run, "x"), now).len();
+        }
+        assert_eq!(written, START_REFUSED_KEYS);
+        assert_eq!(limiter.keys.lock().unwrap().len(), START_REFUSED_KEYS);
     }
     /// HX6 round 3: start refusals carry no call (and a forged `call` extra
     /// cannot invent one); refusals and failures are warnings.
