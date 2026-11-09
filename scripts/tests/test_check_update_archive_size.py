@@ -189,6 +189,17 @@ class UpdateArchiveSizeTests(unittest.TestCase):
             import tomllib
             manifest = tomllib.loads((ROOT / path).read_text())
             self.assertEqual(manifest["profile"]["release"]["strip"], "symbols")
+            self.assertEqual(manifest["profile"]["release"]["opt-level"], "s")
+            self.assertEqual(manifest["profile"]["release"]["codegen-units"], 16)
+        for path in ("release.yml", "desktop-release.yml", "release-cache-warm.yml"):
+            workflow = (ROOT / ".github/workflows" / path).read_text()
+            for var in ("CARGO_PROFILE_RELEASE_OPT_LEVEL",
+                        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS"):
+                self.assertNotIn(var, workflow, f"{path} overrides {var}")
+        self.assertNotIn("CARGO_PROFILE_RELEASE_OPT_LEVEL",
+                         (ROOT / "scripts/release.sh").read_text())
+        self.assertNotIn("CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+                         (ROOT / "scripts/release.sh").read_text())
         for path in ("release.yml", "desktop-release.yml", "release-cache-warm.yml"):
             workflow = (ROOT / ".github/workflows" / path).read_text()
             self.assertIn("startsWith(matrix.os, 'windows') && 'none' || 'symbols'", workflow)

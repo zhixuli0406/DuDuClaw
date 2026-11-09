@@ -50,8 +50,8 @@ jobs:
     env:
       # MSVC symbols live in separate PDBs; retain the existing Windows output.
       CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
-      # Keep in sync with release.yml (CARGO_* env is part of the rust-cache key).
-      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ startsWith(matrix.os, 'windows') && 's' || '3' }}
+      # Keep in sync with release.yml (CARGO_* env is part of the rust-cache key):
+      # opt-level / codegen-units come from [profile.release], no env override.
     strategy:
       fail-fast: false
       matrix:

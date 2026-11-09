@@ -158,10 +158,16 @@ duduclaw-onnx = { path = "crates/duduclaw-onnx", default-features = false }
 # Published CE binaries and desktop gateway sidecars share this profile.
 # Keep panic messages and source locations; only symbol tables are removed.
 # Windows release jobs override this to "none" to preserve separate PDBs.
+# Size/build-time trade-off (RM-100 smaller update package, RM-163 shorter build;
+# owner decision 2026-11-09). Measured on a 32-vCPU Linux builder (16 jobs) with
+# the full dashboard: ~160 MB binary (must stay < 200 MB for updaters <= v1.79.2),
+# release build ~353 s vs ~1186 s with codegen-units = 1; the memory test suite
+# runs ~2-4% slower. Commit fc0b652f7 introduced codegen-units = 1.
 [profile.release]
 strip = "symbols"
 lto = "thin"
-codegen-units = 1
+codegen-units = 16
+opt-level = "s"
 
 # Debug builds only. The workflow MCP path
 # hashes the whole running CLI binary (~336 MB in a debug build) with SHA-256

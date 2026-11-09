@@ -86,4 +86,6 @@ glib = { path = "vendor/glib" }
 [profile.release]
 strip = "symbols"
 lto = "thin"
-codegen-units = 1
+# Keep in sync with the root workspace [profile.release] (RM-100 / RM-163).
+codegen-units = 16
+opt-level = "s"
