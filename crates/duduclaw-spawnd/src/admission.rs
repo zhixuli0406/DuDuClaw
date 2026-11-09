@@ -145,8 +145,16 @@ pub trait Host {
     /// Package H ops; `helper_calls` only when [`Self::helpers_ready`].
     fn features(&mut self) -> SpawndFeatures {
         let features = SpawndFeatures::WORK_BROKER;
-        if self.helpers_ready().is_ok() { features.with(SpawndFeatures::HELPER_CALLS) } else { features }
+        if self.helpers_ready().is_err() { return features; }
+        let features = features.with(SpawndFeatures::HELPER_CALLS);
+        if self.recording_ready() { features.with(SpawndFeatures::HELPER_RECORDING) } else { features }
     }
+    /// HX6 gate (D8 revision §4): Chromium was proven to launch under the
+    /// helper sandbox on this host (security fix round, finding 4: this
+    /// host's own probe AND the build kill switch). Default `false`: the
+    /// recording bit is not advertised and `helper_call` refuses every
+    /// recording-slot call (`helper_recording_unsupported`).
+    fn recording_ready(&mut self) -> bool { false }
     /// HX4 synchronous start, on an adapter's lifecycle thread only: re-derive
     /// the helper from the run's own employee, revalidate the memfd, write the
     /// slot limits, create the pipes and send `Start`.

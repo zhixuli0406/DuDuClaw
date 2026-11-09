@@ -1,7 +1,21 @@
 'use strict';
-// Embedded in the signed helper; dependencies resolve only from /runtime.
+// Embedded in the signed helper. HX6: the Rust parent sets the in-run layout
+// (scratch under /helper-tmp/<call>, signed files under /helpers) and starts
+// this process under the nested browser Landlock (no /work, TCP connect only
+// to the forwarder port on Landlock ABI >= 4). Chromium's own sandbox cannot
+// start under the common filter (no user namespaces, NNP), so in that
+// contained mode the helper sandbox is the containment.
 const fs = require('node:fs');
-const cfg = JSON.parse(fs.readFileSync('/tmp/recording/request.json', 'utf8'));
+const dir = process.env.DUDUCLAW_RECORD_DIR || '/tmp/recording';
+const root = process.env.DUDUCLAW_RECORD_ROOT || '/runtime';
+const contained = process.env.DUDUCLAW_RECORD_CONTAINED === '1';
+// HX6 security fix round (finding 4): spawnd's per-host probe. Same launch
+// path and flags, but a fixed local page (no request, no network, no
+// artifacts); passes only if Chromium starts, renders and closes cleanly.
+const probe = process.env.DUDUCLAW_RECORD_PROBE === '1';
+const PROBE_PAGE = '<!doctype html><title>duduclaw-probe</title>'
+  + '<div id="p" style="width:64px;height:64px;background:#08f"></div>';
+const cfg = probe ? { max_seconds: 60 } : JSON.parse(fs.readFileSync(`${dir}/request.json`, 'utf8'));
 const actions = [];
 const network = [];
 let finish;
@@ -30,10 +44,33 @@ async function main() {
     process.stdout.write(JSON.stringify({ reason: stopReason, actions: 0, started: false, navigation: 'not_attempted' }), () => process.exit(0));
     return;
   }
-  const { chromium } = require('/runtime/playwright.cjs');
-  const browser = await chromium.launch({ headless: true, chromiumSandbox: true,
-    executablePath: '/runtime/chromium', proxy: { server: process.env.DUDUCLAW_RECORD_PROXY, bypass: '' },
-    args: ['--proxy-bypass-list=<-loopback>', '--disable-quic', '--disable-background-networking'] });
+  const { chromium } = require(`${root}/playwright.cjs`);
+  // Playwright talks to Chromium over its default pipe transport; no DevTools
+  // TCP port is ever opened. Shared memory goes to TMPDIR (the call scratch),
+  // never /dev/shm. Contained mode also runs V8 without JIT (less exploit
+  // surface for page script; cost: slower page JavaScript, acceptable here).
+  // WebRTC may not use UDP outside the proxy (loopback/LAN UDP is not covered
+  // by the TCP pin; the nested seccomp filter refuses UDP sockets as well).
+  const args = ['--proxy-bypass-list=<-loopback>', '--disable-quic', '--disable-background-networking',
+    '--disable-dev-shm-usage', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-breakpad'];
+  if (contained) args.push('--js-flags=--jitless');
+  const browser = await chromium.launch({ headless: true, chromiumSandbox: !contained,
+    executablePath: `${root}/chromium`, proxy: { server: process.env.DUDUCLAW_RECORD_PROXY, bypass: '' }, args });
+  if (probe) {
+    const context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: false });
+    const page = await context.newPage();
+    await page.setContent(PROBE_PAGE, { waitUntil: 'load', timeout: 30000 });
+    const seen = await page.evaluate(() => ({ title: document.title,
+      width: document.getElementById('p').getBoundingClientRect().width }));
+    const shot = await page.screenshot({ type: 'png' });
+    await context.close();
+    await browser.close();
+    clearTimeout(deadline);
+    const rendered = seen.title === 'duduclaw-probe' && seen.width === 64 && shot.length > 0;
+    if (!rendered) { process.exit(70); return; }
+    process.stdout.write(JSON.stringify({ probe: 'rendered' }), () => process.exit(0));
+    return;
+  }
   const context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: false });
   await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
   await context.exposeBinding('__ddcRecord', (_source, action) => {
@@ -61,11 +98,11 @@ async function main() {
     stopped.then(() => 'interrupted')
   ]);
   const reason = await stopped;
-  await context.tracing.stop({ path: '/tmp/recording/trace.zip' });
+  await context.tracing.stop({ path: `${dir}/trace.zip` });
   await context.close();
   await browser.close();
-  fs.writeFileSync('/tmp/recording/actions.json', JSON.stringify({ actions }), { flag: 'wx', mode: 0o600 });
-  fs.writeFileSync('/tmp/recording/network.json', JSON.stringify({ responses: network }), { flag: 'wx', mode: 0o600 });
+  fs.writeFileSync(`${dir}/actions.json`, JSON.stringify({ actions }), { flag: 'wx', mode: 0o600 });
+  fs.writeFileSync(`${dir}/network.json`, JSON.stringify({ responses: network }), { flag: 'wx', mode: 0o600 });
   clearTimeout(deadline);
   process.stdout.write(JSON.stringify({ reason, actions: actions.length, started: true, navigation }), () => process.exit(0));
 }

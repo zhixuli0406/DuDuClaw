@@ -27,14 +27,19 @@ fn unlink(root: &File, name: &str, directory: bool) {
         unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), if directory { libc::AT_REMOVEDIR } else { 0 }); }
     }
 }
-pub(crate) fn publish(workspace: &Path, temporary: &Path, id: &str) -> Result<Vec<Value>, ()> {
+/// HX6 security fix round (finding 5): `recordings` is `/work/recordings`
+/// itself, opened `O_NOFOLLOW|O_DIRECTORY` (a symlink planted there by the
+/// runtime is refused). The recording's Landlock grant is exactly that
+/// directory (`HelperFs::WorkRecordings`, created by the launcher); `/work`
+/// is never opened, so no READ_DIR (or any right) on `/work` is needed.
+pub(crate) fn publish(recordings: &Path, temporary: &Path, id: &str) -> Result<Vec<Value>, ()> {
     if !crate::recording_helper::valid_id(id) { return Err(()); }
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // H12d: the layout `skill_from_recording` reads through root's broker.
-    use duduclaw_isolation::recording_layout::{ARTIFACTS, RECORDINGS_DIR};
-    let root = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(workspace).map_err(|_| ())?;
-    mkdir(&root, RECORDINGS_DIR, true)?;
-    let parent = open(&root, RECORDINGS_DIR, flags, 0)?;
+    // H12d: the layout `skill_from_recording` reads through root's broker
+    // (`recordings` is `<work>/{RECORDINGS_DIR}`, see
+    // `helper_layout::RECORDINGS`); the artifact names come from that layout.
+    use duduclaw_isolation::recording_layout::ARTIFACTS;
+    let parent = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(recordings).map_err(|_| ())?;
     let staging = format!(".record-{}", uuid::Uuid::new_v4().simple());
     mkdir(&parent, &staging, false)?;
     let destination = open(&parent, &staging, flags, 0)?;
@@ -78,19 +83,44 @@ mod tests {
         let work = home.path().join("work"); let temporary = home.path().join("tmp");
         std::fs::create_dir(&work).unwrap(); std::fs::create_dir(&temporary).unwrap();
         let id = "ab".repeat(16);
+        let recordings = work.join("recordings");
         for name in ["trace.zip", "actions.json", "network.json"] { std::fs::write(temporary.join(name), name).unwrap(); }
-        symlink(&temporary, work.join("recordings")).unwrap();
-        assert!(publish(&work, &temporary, &id).is_err());
-        std::fs::remove_file(work.join("recordings")).unwrap();
-        let artifacts = publish(&work, &temporary, &id).unwrap();
+        symlink(&temporary, &recordings).unwrap();
+        assert!(publish(&recordings, &temporary, &id).is_err());
+        std::fs::remove_file(&recordings).unwrap();
+        // The launcher creates `/work/recordings`; publication never does.
+        assert!(publish(&recordings, &temporary, &id).is_err());
+        std::fs::create_dir(&recordings).unwrap();
+        let artifacts = publish(&recordings, &temporary, &id).unwrap();
         assert_eq!(artifacts.len(), 3);
-        assert!(publish(&work, &temporary, &id).is_err());
-        assert_eq!(std::fs::read(work.join("recordings").join(&id).join("trace.zip")).unwrap(), b"trace.zip");
+        assert!(publish(&recordings, &temporary, &id).is_err());
+        assert_eq!(std::fs::read(recordings.join(&id).join("trace.zip")).unwrap(), b"trace.zip");
         std::fs::remove_file(temporary.join("trace.zip")).unwrap();
         symlink("/etc/passwd", temporary.join("trace.zip")).unwrap();
-        assert!(publish(&work, &temporary, &"cd".repeat(16)).is_err());
-        assert!(!work.join("recordings").join("cd".repeat(16)).exists());
-        assert_eq!(std::fs::read_dir(work.join("recordings")).unwrap().count(), 1);
+        assert!(publish(&recordings, &temporary, &"cd".repeat(16)).is_err());
+        assert!(!recordings.join("cd".repeat(16)).exists());
+        assert_eq!(std::fs::read_dir(&recordings).unwrap().count(), 1);
+    }
+    /// Finding 5: publication works when `/work` itself cannot be opened for
+    /// reading (the recording's Landlock has no READ_DIR on `/work`; here an
+    /// unreadable but searchable directory stands in for it, as non-root).
+    #[test]
+    fn hx6fix_publish_needs_only_the_recordings_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let work = home.path().join("work"); let temporary = home.path().join("tmp");
+        std::fs::create_dir(&work).unwrap(); std::fs::create_dir(&temporary).unwrap();
+        let recordings = work.join("recordings");
+        std::fs::create_dir(&recordings).unwrap();
+        for name in ["trace.zip", "actions.json", "network.json"] { std::fs::write(temporary.join(name), name).unwrap(); }
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let id = "ef".repeat(16);
+        let published = publish(&recordings, &temporary, &id);
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(published.unwrap().len(), 3);
+        assert!(recordings.join(&id).join("network.json").is_file());
+        // Nothing is ever created next to `recordings`.
+        assert_eq!(std::fs::read_dir(&work).unwrap().count(), 1);
     }
 
     /// H12d regression (writer half): the helper publishes exactly at the
@@ -99,13 +129,17 @@ mod tests {
     /// host-side `<home>/recordings/<id>/{meta.json,done.json,session.har}`.
     #[test]
     fn h12d_recording_publication_matches_reader_layout() {
-        use duduclaw_isolation::recording_layout::{artifact_path, ARTIFACTS};
+        use duduclaw_isolation::recording_layout::{artifact_path, ARTIFACTS, RECORDINGS_DIR};
         let home = tempfile::tempdir().unwrap();
         let work = home.path().join("work"); let temporary = home.path().join("tmp");
         std::fs::create_dir(&work).unwrap(); std::fs::create_dir(&temporary).unwrap();
+        // HX6: the launcher creates `/work/recordings`; publish opens it directly.
+        let recordings = work.join(RECORDINGS_DIR);
+        std::fs::create_dir(&recordings).unwrap();
+        assert_eq!(crate::helper_layout::RECORDINGS, format!("{}/{RECORDINGS_DIR}", crate::helper_layout::WORKSPACE));
         for name in ARTIFACTS { std::fs::write(temporary.join(name), format!("{name}-bytes")).unwrap(); }
         let id = "0f".repeat(16);
-        let artifacts = publish(&work, &temporary, &id).unwrap();
+        let artifacts = publish(&recordings, &temporary, &id).unwrap();
         for (artifact, name) in artifacts.iter().zip(ARTIFACTS) {
             assert_eq!(artifact["name"], name);
             let relative = artifact_path(&id, name).unwrap();

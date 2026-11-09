@@ -180,8 +180,9 @@ fn signed(auth: &Authorization) -> Vec<&str> { auth.grant.tools.as_slice().iter(
 fn h10_file_workspace_never_signs_execution_tools() {
     // `employee-work` is also the A workspace handle. A grant selected for
     // the file tools alone never signs the A/E tools it would enable: the
-    // pending ones (browser recording and skill_from_recording until HX6) and
-    // — without spawnd's `helper_calls` — the HX5 in-run helpers too. (H12b
+    // pending `skill_from_recording`, the HX6 recording tools (no recording
+    // gate here) and — without spawnd's `helper_calls` — the HX5 in-run
+    // helpers too. (H12b
     // hub install is no longer pending: it rests on PublicOrigins, see h9.)
     let names = ["file_read", "browser_record_start", "browser_record_stop", "execute_program", "code_map",
         "skill_from_recording", "tasks_update"];
@@ -272,8 +273,9 @@ fn hx5_pending_tools_still_never_signed() {
                 assert!(!signed(&auth).contains(tool), "{tool} signed ({with_files} {task:?})");
                 assert!(!eligible(&ctx, tool), "{tool} ({with_files} {task:?})");
             }
+            // HX6: routed (own selector), so no longer on the pending list.
             for tool in ["browser_record_start", "browser_record_stop"] {
-                assert!(PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool} stays pending until HX6");
+                assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
             }
             for tool in IN_RUN_HELPER_TOOLS {
                 assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
@@ -281,6 +283,103 @@ fn hx5_pending_tools_still_never_signed() {
             }
         }
     }
+}
+
+/// HX6: the recording is signed only with spawnd's `helper_calls` AND
+/// `helper_recording` (Chromium proven under the helper sandbox), the
+/// admin-only public-web egress switch (Q3 = A) and an interactive run.
+#[test]
+fn hx6_recording_selector_requires_host_gate_and_public_web() {
+    let names = ["browser_record_start", "browser_record_stop", "tasks_update"];
+    let recording = SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING);
+    let (f, view) = helper_fixture(recording);
+    // No public-web switch: no workspace, nothing signed for recording.
+    let auth = f.issue(&names).unwrap();
+    assert!(!has(&auth, &workspace()));
+    for tool in &names[..2] { assert!(!eligible(&context(&auth), tool), "{tool}"); }
+    f.profile(true, "");
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &workspace()) && auth.roots.is_brokered(EMPLOYEE_WORK_ROOT));
+    assert_eq!(signed(&auth), names);
+    for tool in &names[..2] { assert!(eligible(&context(&auth), tool), "{tool}"); }
+    // Fail closed: helper calls without the recording gate, no bits, or a task run.
+    for bits in [SpawndFeatures::HELPER_CALLS, SpawndFeatures::HELPER_RECORDING, SpawndFeatures::NONE] {
+        view.store(bits.0, Ordering::SeqCst);
+        let auth = f.issue(&names).unwrap();
+        for tool in &names[..2] { assert!(!eligible(&context(&auth), tool), "{bits:?} {tool}"); }
+    }
+    view.store(recording.0, Ordering::SeqCst);
+    f.tasks(&[("task-a", LABEL)]);
+    let auth = f.issue_task(&names, "task-a").unwrap();
+    assert!(!has(&auth, &workspace()));
+    for tool in &names[..2] { assert!(!eligible(&context(&auth), tool), "task runs never record: {tool}"); }
+    // The foreground helper bit alone never signs the recording.
+    let auth = f.issue(&["browser_record_start", "execute_program"]).unwrap();
+    assert_eq!(signed(&auth), ["browser_record_start", "execute_program"]);
+    f.profile(false, "");
+    let auth = f.issue(&["browser_record_start", "execute_program"]).unwrap();
+    assert_eq!(signed(&auth), ["execute_program"]);
+}
+
+/// HX6: the boundary-side resolver answer for a recording call (Employee +
+/// Workspace; the URL authority is the record's own PublicOrigins).
+struct RecordingResolver;
+impl duduclaw_mcp_boundary::tool_policy::ResourceResolver for RecordingResolver {
+    fn resolve(&self, context: &RequestContext, _: &duduclaw_mcp_boundary::tool_policy::ToolPolicy, _: &serde_json::Value)
+        -> Result<Vec<ResourceGrant>, VerificationError> {
+        Ok(vec![ResourceGrant::Employee { id: context.record().employee }, workspace()])
+    }
+}
+
+/// HX6 url authority: a selected recording signs `PublicOrigins { * }` (never
+/// a UrlOrigin), so a public start is authorized; without `[isolation]
+/// public_web` nothing is signed and the start is refused. A grant signed for
+/// the recording alone never makes the web tools eligible.
+#[test]
+fn hx6url_recording_signs_public_origins_only_with_public_web() {
+    use duduclaw_mcp_boundary::tool_policy::authorize;
+    let names = ["browser_record_start", "browser_record_stop", "tasks_update"];
+    let start = serde_json::json!({"url":"https://news.example.org/a","headless":true});
+    let recording = SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING);
+    let (f, view) = helper_fixture(recording);
+    // public_web off: no PublicOrigins, and the start is refused.
+    let auth = f.issue(&names).unwrap();
+    assert!(!any_public(&auth));
+    assert!(authorize(&context(&auth), "browser_record_start", &start, &RecordingResolver).is_err());
+
+    f.profile(true, "");
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &public_any()) && has(&auth, &ResourceGrant::EmployeeScope { id: EMPLOYEE }));
+    assert!(!auth.grant.resources.as_slice().iter().any(|grant| matches!(grant, ResourceGrant::UrlOrigin { .. })));
+    capability(&auth).canonical_bytes().expect("recording record stays signable");
+    let ctx = context(&auth);
+    let call = authorize(&ctx, "browser_record_start", &start, &RecordingResolver).unwrap();
+    assert!(call.resources().contains(&public_any()));
+    assert!(!call.resources().iter().any(|grant| matches!(grant, ResourceGrant::UrlOrigin { .. })));
+    for url in ["https://127.0.0.1/", "https://localhost/", "https://user:pw@news.example.org/"] {
+        let args = serde_json::json!({"url":url,"headless":true});
+        assert!(authorize(&ctx, "browser_record_start", &args, &RecordingResolver).is_err(), "{url}");
+    }
+
+    // Recording selected, web tools denied by the profile: the grant is signed
+    // for the recording only and the web tools leave the snapshot.
+    let with_web = ["browser_record_start", "browser_record_stop", "web_fetch_cached", "web_extract"];
+    f.profile(true, r#"denied_tools = ["web_fetch_cached", "web_extract"]"#);
+    let auth = f.issue(&with_web).unwrap();
+    assert!(has(&auth, &public_any()));
+    assert_eq!(signed(&auth), ["browser_record_start", "browser_record_stop"]);
+    for tool in ["web_fetch_cached", "web_extract"] { assert!(!eligible(&context(&auth), tool), "{tool}"); }
+    // Both selected: one grant, the web tools stay signed.
+    f.profile(true, "");
+    let auth = f.issue(&with_web).unwrap();
+    assert_eq!(auth.grant.resources.as_slice().iter().filter(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. })).count(), 1);
+    assert_eq!(signed(&auth), with_web);
+
+    // The recording gate closed: no recording, so no PublicOrigins for it.
+    view.store(SpawndFeatures::HELPER_CALLS.0, Ordering::SeqCst);
+    let auth = f.issue(&names).unwrap();
+    assert!(!any_public(&auth));
+    assert!(authorize(&context(&auth), "browser_record_start", &start, &RecordingResolver).is_err());
 }
 
 #[test]
@@ -348,6 +447,25 @@ fn hub_install_alone_gets_public_origins_when_public_web_on() {
     f.profile(true, "");
     f.tasks(&[("task-a", LABEL)]);
     assert!(!any_public(&f.issue_task(&["skill_hub_install"], "task-a").unwrap()));
+}
+
+/// Merge HX6 × H12b: a PublicOrigins grant signed only for the hub install
+/// (web tools denied by the profile) never signs the web tools; with both
+/// selected there is still exactly one grant.
+#[test]
+fn hub_install_grant_never_signs_denied_web_tools() {
+    let f = fixture(false);
+    let names = ["skill_hub_install", "web_fetch_cached", "web_extract"];
+    f.profile(true, r#"denied_tools = ["web_fetch_cached", "web_extract"]"#);
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &public_any()));
+    assert_eq!(signed(&auth), ["skill_hub_install"]);
+    for tool in ["web_fetch_cached", "web_extract"] { assert!(!eligible(&context(&auth), tool), "{tool}"); }
+    assert!(eligible(&context(&auth), "skill_hub_install"));
+    f.profile(true, "");
+    let auth = f.issue(&names).unwrap();
+    assert_eq!(auth.grant.resources.as_slice().iter().filter(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. })).count(), 1);
+    assert_eq!(signed(&auth), names);
 }
 
 #[test]

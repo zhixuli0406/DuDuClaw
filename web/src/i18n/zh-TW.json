@@ -14,6 +14,8 @@
   "isolationReadiness.feature.program": "執行程式",
   "isolationReadiness.feature.codeMap": "程式碼分析",
   "isolationReadiness.feature.office": "Office 文件處理",
+  "isolationReadiness.reason.recording": "這台主機已停用受保護的瀏覽器錄製：尚未證實瀏覽器能在輔助程式沙箱內啟動。",
+  "isolationReadiness.recordingEgress": "為 AI 員工啟用瀏覽器錄製（[isolation] public_web = true）即授予該員工受保護執行環境的公開網路對外連線；錄製只能到達這個對外連線允許的範圍。",
   "isolationReadiness.hint.binding": "前往遷移確認完成員工設定",
   "isolationReadiness.hint.connector": "前往連接器設定",
   "isolationReadiness.hint.personal": "前往使用者管理檢查成員",

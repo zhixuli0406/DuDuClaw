@@ -40,7 +40,12 @@ pub(super) fn refusal(code: ErrorCode) -> HelperError {
         ErrorCode::HelperCgroupUnavailable => HelperError::CgroupUnavailable,
         // Unknown run, or no longer Running (draining, stopping, ended).
         ErrorCode::NotFound | ErrorCode::NotReady => HelperError::NotLive,
-        ErrorCode::Unauthorized | ErrorCode::RuntimeDenied => HelperError::Denied,
+        ErrorCode::Unauthorized => HelperError::Denied,
+        // HX6: no such helper in the run's signed table (for the recording:
+        // an offline parent, whose launcher carries no egress binding).
+        ErrorCode::RuntimeDenied => HelperError::Absent,
+        // HX6 security fix round (finding 4): spawnd's own recording gate.
+        ErrorCode::HelperRecordingUnsupported => HelperError::RecordingUnsupported,
         _ => HelperError::Unavailable,
     }
 }
@@ -124,11 +129,6 @@ impl SpawndBackend {
         }
     }
 
-    /// HX6: ask a recording helper to flush and exit (`HelperStop`). `Ok` is
-    /// acceptance only; poll `helper_wait` for the recording's end.
-    pub async fn stop_helper(&self, run: RunHandle, call: HelperCallId) -> Result<(), HelperError> {
-        self.helper_control(Control::Stop, run, call).await
-    }
 }
 
 /// Detached RPC. The transport closes a run's control connection when an

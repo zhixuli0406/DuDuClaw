@@ -506,14 +506,14 @@ fn project_tool_schema(tool: &mut Value) {
     }
 
     if tool["name"] == "browser_record_start" {
-        tool["description"] = json!("Queue a protected headless browser recording (headless=true required, 1–300 seconds, default 30). Starts after this employee run exits. Returns id/job; trace stays in the authorized workspace.");
+        tool["description"] = json!("Start a protected headless browser recording inside this run (headless=true required, 1–300 seconds, default 30). Returns {status: recording, id}; it never outlives this run and is flushed at run end. Artifacts go to recordings/<id>/ in the authorized workspace. Reaches only this employee's public-web egress.");
         tool["inputSchema"]["properties"]["headless"] = json!({"type":"boolean","const":true,"description":"受保護錄製須明確指定 true；不開啟主機桌面視窗"});
         tool["inputSchema"]["properties"]["max_seconds"] = json!({"type":"integer","minimum":1,"maximum":300,"default":30});
         if let Some(required) = tool["inputSchema"]["required"].as_array_mut() { required.push(json!("headless")); }
         else { tool["inputSchema"]["required"] = json!(["headless"]); }
     }
     if tool["name"] == "browser_record_stop" {
-        tool["description"] = json!("Request a cooperative stop of your protected browser recording by its returned id. Returns stop_requested while flushing; repeat to read the terminal result. A request is not confirmed completion.");
+        tool["description"] = json!("Stop your protected browser recording by its returned id and return its result with artifact sha256 digests. In the same run this flushes the recording; returns stop_requested if the flush is still running (repeat to read the result). In a later run it returns the stored result.");
         tool["inputSchema"]["properties"]["id"] = json!({"type":"string","pattern":"^[0-9a-f]{32}$"});
     }
     let name = tool["name"].as_str().unwrap_or("").to_owned();
@@ -567,16 +567,9 @@ fn project_tool_schema(tool: &mut Value) {
             properties.insert("path".into(), json!({"type":"string", "description":"工作區內的相對目錄路徑；省略表示整個工作區"}));
         }
     }
-    // HX5: execute_program / office_script / code_map answer synchronously
-    // inside the caller's run; they have no job to query or cancel.
-    if name == "browser_record_start" {
-        schema["properties"]["action"] = json!({"type":"string","enum":["status","cancel"],"description":"查詢或取消先前交付的工作；省略即建立新工作"});
-        schema["properties"]["job"] = json!({"type":"string","pattern":"^[0-9a-f]{32}$","description":"先前回傳的工作識別碼"});
-        let required = schema.get("required").cloned().unwrap_or(json!([]));
-        schema["anyOf"] = json!([{"required":required,"not":{"required":["action"]}},
-            {"required":["action","job"]}]);
-        schema["required"] = json!([]);
-    }
+    // HX5/HX6: execute_program / office_script / code_map and the browser
+    // recording run inside the caller's run; none has a pending child-run job
+    // to query or cancel (`browser_record_stop {id}` reads the recording).
     if target_required {
         schema["required"].as_array_mut().expect("required array checked above").push(json!("target_employee"));
     }

@@ -43,6 +43,9 @@ pub struct HelperRun {
     pub runtime: crate::policy::PublishedRuntime,
     pub executable: crate::bootstrap_mounts::VerifiedExecutable,
     pub script: Option<crate::bootstrap_mounts::VerifiedExecutable>,
+    /// HX6 security fix round (finding 5): further signed files bound at
+    /// `/helpers/<name>` for this helper only (the recording's browser).
+    pub files: Vec<(&'static str, crate::bootstrap_mounts::VerifiedExecutable)>,
 }
 /// Helper availability of one run; HX4 answers `HelperCall` from this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,15 +149,19 @@ fn launcher_plan(profile: LauncherProfile, control: OwnedFd)
         indices.push(crate::helper_host::LinkedHelper { index: helper.index, slot: binding.slot,
             limits: crate::helper_cgroup::SlotLimits::from_binding(&binding), timeout_ms: binding.timeout_ms,
             runtime: helper.runtime.runtime.clone(), profile: binding.profile, binding_digest });
+        let files = helper.files.iter().map(|(name, file)| Ok((checked(fd::observe(file.fd.as_raw_fd()))?.identity,
+            checked(CString::new(*name))?))).collect::<Result<Vec<_>>>()?;
         helpers.push(HelperProgram {
             program: Program { identity: checked(fd::observe(helper.executable.fd.as_raw_fd()))?.identity, script,
                 argv: argv.into_iter().map(|arg| checked(CString::new(arg))).collect::<Result<_>>()?,
                 environment: vec![], seccomp: binding.seccomp, seccomp_digest: binding.seccomp_digest },
             self_only: binding.self_only, mount: 0, slot: binding.slot, filesystem: binding.filesystem,
             open_files: binding.open_files, file_size_bytes: binding.file_size_bytes, timeout_ms: binding.timeout_ms,
-            egress: binding.egress });
+            egress: binding.egress, files });
+        // Same order as `runner::take_launcher`: executable, script, files.
         rights.push(helper.executable.fd);
         if let Some(script) = helper.script { rights.push(script.fd); }
+        rights.extend(helper.files.into_iter().map(|(_, file)| file.fd));
     }
     Ok((LauncherPlan { helpers, mounts, tmpfs_bytes: profile.tmpfs_bytes, drain_ms: profile.drain_ms }, rights, indices))
 }

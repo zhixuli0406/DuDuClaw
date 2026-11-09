@@ -49,6 +49,9 @@ impl Core {
                 }
             }
         }
+        // HX6 finding 4: start / read this host's recording probe (no-op while
+        // the build kill switch is closed).
+        self.service_recording_probe();
     }
     pub(super) fn run_helper(&mut self, job: HelperStart<Vec<OwnedFd>>) -> Result<HelperStarted<Vec<OwnedFd>>> {
         if self.poisoned { return Err(ErrorCode::HelperUnavailable); }
@@ -97,6 +100,8 @@ impl Core {
         for entry in self.runs.values_mut() {
             if let Some(RunHelper::Engine(engine)) = entry.helper.as_mut() { events.extend(engine.take_events()); }
         }
+        // The probe's end also reaches the coordinator, which ignores a call it never started.
+        self.observe_recording_probe(&events);
         events
     }
 }

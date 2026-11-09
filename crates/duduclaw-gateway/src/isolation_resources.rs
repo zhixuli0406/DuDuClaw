@@ -333,7 +333,12 @@ impl ResourceResolver for GatewayResourceResolver {
                 }
             }
         }
+        // HX6: the recording's navigation URL is authorized by the record's
+        // signed PublicOrigins grant, which the boundary itself selects
+        // (`tool_policy::RECORDING_URL_TOOLS`); no per-URL UrlOrigin here.
+        let recording = duduclaw_mcp_boundary::tool_policy::RECORDING_URL_TOOLS.contains(&policy.name);
         for key in ["url", "url_or_path"] {
+            if recording { break; }
             if let Some(value) = string(args, key)? {
                 if key == "url_or_path" && !matches!(value.split_once("://"), Some(("https" | "http", _))) { continue; }
                 let parsed = url::Url::parse(value).map_err(|_| VerificationError::Invalid)?;

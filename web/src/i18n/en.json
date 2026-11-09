@@ -14,6 +14,8 @@
   "isolationReadiness.feature.program": "running programs",
   "isolationReadiness.feature.codeMap": "code analysis",
   "isolationReadiness.feature.office": "Office document work",
+  "isolationReadiness.reason.recording": "Protected browser recording is disabled on this host: the browser has not been proven to start inside the helper sandbox.",
+  "isolationReadiness.recordingEgress": "Enabling browser recording for an AI employee ([isolation] public_web = true) grants that employee’s protected runtime public-web egress; recordings reach only what that egress allows.",
   "isolationReadiness.hint.binding": "Finish employee setup in migration confirmations",
   "isolationReadiness.hint.connector": "Go to connector settings",
   "isolationReadiness.hint.personal": "Check members in user management",

@@ -23,8 +23,11 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound on collecting `HelperEnded` after an accepted cancel (background).
 const END_AFTER_CANCEL: Duration = Duration::from_secs(30);
 
+/// The foreground in-run tools. The HX6 recording tools share
+/// `Route::InRunHelper` but use the recording slot (`execution_recording.rs`).
 pub(super) fn is_in_run(name: &str) -> bool {
     tool_policy::policy(name).is_some_and(|policy| policy.route == Route::InRunHelper)
+        && tool_policy::IN_RUN_HELPER_TOOLS.contains(&name)
 }
 
 /// Same-run helper plan from the trusted plan factory (§3 step 2). The bridge
@@ -37,21 +40,35 @@ pub struct AuthorizedHelperPlan {
     timeout_ms: u64,
     input: Vec<u8>,
     output_limit: u64,
+    slot: HelperSlot,
 }
 impl AuthorizedHelperPlan {
+    /// A foreground-slot plan (`execute_program`, `code_map`, `office_script`).
     pub fn new(run: RunHandle, employee: EmployeeId, helper: RuntimeKind, timeout_ms: u64,
         input: Vec<u8>, output_limit: u64) -> Result<Self, VerificationError> {
+        Self::with_slot(run, employee, helper, timeout_ms, input, output_limit, HelperSlot::Foreground)
+    }
+    /// HX6: a recording-slot plan (`browser_record_start`).
+    pub fn recording(run: RunHandle, employee: EmployeeId, helper: RuntimeKind, timeout_ms: u64,
+        input: Vec<u8>, output_limit: u64) -> Result<Self, VerificationError> {
+        Self::with_slot(run, employee, helper, timeout_ms, input, output_limit, HelperSlot::Recording)
+    }
+    fn with_slot(run: RunHandle, employee: EmployeeId, helper: RuntimeKind, timeout_ms: u64,
+        input: Vec<u8>, output_limit: u64, slot: HelperSlot) -> Result<Self, VerificationError> {
         if !matches!(helper, RuntimeKind::Registered(_)) || timeout_ms == 0
             || timeout_ms > ipc::MAX_HELPER_TIMEOUT_MS || input.is_empty()
             || input.len() as u64 > ipc::MAX_HELPER_INPUT_BYTES || output_limit == 0 {
             return Err(VerificationError::Invalid);
         }
-        Ok(Self { run, employee, helper, timeout_ms, input, output_limit })
+        Ok(Self { run, employee, helper, timeout_ms, input, output_limit, slot })
     }
     pub fn run(&self) -> RunHandle { self.run }
     pub fn timeout_ms(&self) -> u64 { self.timeout_ms }
-    fn into_plan(self) -> HelperPlan {
-        HelperPlan { run: self.run, employee: self.employee, helper: self.helper, slot: HelperSlot::Foreground,
+    pub fn slot(&self) -> HelperSlot { self.slot }
+    pub(super) fn employee(&self) -> EmployeeId { self.employee }
+    pub(super) fn output_limit(&self) -> u64 { self.output_limit }
+    pub(super) fn into_plan(self) -> HelperPlan {
+        HelperPlan { run: self.run, employee: self.employee, helper: self.helper, slot: self.slot,
             timeout_ms: self.timeout_ms, input: self.input, output_limit: self.output_limit }
     }
 }
@@ -124,7 +141,8 @@ impl ExecutionToolBridge {
         // The target must EQUAL the caller's capability run (the inverse of
         // the child-run rule) and its employee.
         let plan = match self.factory.prepare_in_run(&call).await {
-            Ok(plan) if plan.run == run && plan.employee == context.record().employee => plan,
+            Ok(plan) if plan.run == run && plan.employee == context.record().employee
+                && plan.slot == HelperSlot::Foreground => plan,
             _ => return refused(),
         };
         // Re-authorize after preparation; verify_live immediately before send.
@@ -174,7 +192,7 @@ impl ExecutionToolBridge {
         }
     }
 
-    fn helper_calls(&self, run: RunHandle) -> bool {
+    pub(super) fn helper_calls(&self, run: RunHandle) -> bool {
         self.backend.helper_features(run).contains(SpawndFeatures::HELPER_CALLS)
     }
 
@@ -201,7 +219,7 @@ impl ExecutionToolBridge {
 
 /// Resolves once the request's live authority fails (revocation, principal
 /// generation, run end). Unreadable authority counts as revoked (fail closed).
-async fn revoked(context: RequestContext) {
+pub(super) async fn revoked(context: RequestContext) {
     loop {
         tokio::time::sleep(LIVE_POLL).await;
         let live = context.clone();
@@ -211,7 +229,7 @@ async fn revoked(context: RequestContext) {
     }
 }
 
-fn helper_refusal(error: HelperError) -> Value {
+pub(super) fn helper_refusal(error: HelperError) -> Value {
     match error {
         HelperError::Denied => refused(),
         HelperError::Uncertain => uncertain(),
@@ -226,13 +244,16 @@ fn helper_refusal(error: HelperError) -> Value {
 }
 
 /// A typed per-call result (§5). Text is fixed; no path, id or content.
-fn typed(status: &'static str) -> Value {
+pub(super) fn typed(status: &'static str) -> Value {
     json!({"content":[{"type":"text","text":json!({"status":status, "message":message(status)}).to_string()}],
         "isError":true, "helper_status":status})
 }
 
 fn message(status: &str) -> &'static str {
     match status {
+        "helper_parent_offline" => "此員工的執行環境沒有對外網路，無法錄製瀏覽器。",
+        "helper_recording_unsupported" => "這台主機無法在隔離環境內啟動瀏覽器，錄製已停用。",
+        "artifact_modified" => "錄製檔案已被修改，與保存的雜湊不符，已拒絕使用。",
         "helper_busy" => "此執行的輔助程式忙碌中，請稍後再試。",
         "run_time_exhausted" => "本次執行剩餘時間不足，這次操作未執行。",
         "helper_cgroup_unavailable" => "主機無法限制輔助程式資源，這次操作未執行。",

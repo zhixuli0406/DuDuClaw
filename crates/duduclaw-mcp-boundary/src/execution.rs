@@ -15,6 +15,9 @@ pub type PolicyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Verificatio
 #[path = "execution_in_run.rs"]
 mod in_run;
 pub use in_run::{AuthorizedHelperPlan, InRunJob};
+#[path = "execution_recording.rs"]
+mod recording;
+pub use recording::control_recording;
 
 /// Trusted Package A / handler integration, never constructed from MCP input.
 /// Implementations must reuse the tool handler's ownership, record, audience,
@@ -75,23 +78,43 @@ pub struct ExecutionToolBridge {
     backend: Arc<dyn ExecutionBackend>,
     factory: Arc<dyn ExecutionPlanFactory>,
     jobs: Option<Arc<dyn crate::execution_jobs::ExecutionJobs>>,
+    /// HX6: the `(run, call)` store of in-run recordings (never run handles).
+    recordings: Option<Arc<dyn crate::recording_jobs::RecordingJobs>>,
+    /// HX6 security fix round (finding 6): the gateway's recording audit sink.
+    recording_audit: Option<Arc<dyn crate::recording_audit::RecordingAudit>>,
     resolver: Arc<dyn ResourceResolver>,
 }
 
 impl ExecutionToolBridge {
     pub fn new(backend: Arc<dyn ExecutionBackend>, factory: Arc<dyn ExecutionPlanFactory>,
         resolver: Arc<dyn ResourceResolver>) -> Self {
-        Self { backend, factory, resolver, jobs: None }
+        Self { backend, factory, resolver, jobs: None, recordings: None, recording_audit: None }
     }
 
     pub fn with_jobs(&self, jobs: Arc<dyn crate::execution_jobs::ExecutionJobs>) -> Self {
-        Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(), jobs: Some(jobs) }
+        Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(),
+            jobs: Some(jobs), recordings: self.recordings.clone(), recording_audit: self.recording_audit.clone() }
+    }
+
+    /// HX6: install the gateway's in-run recording store.
+    pub fn with_recordings(&self, recordings: Arc<dyn crate::recording_jobs::RecordingJobs>) -> Self {
+        Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(),
+            jobs: self.jobs.clone(), recordings: Some(recordings), recording_audit: self.recording_audit.clone() }
+    }
+
+    /// HX6 security fix round (finding 6): install the recording audit sink.
+    pub fn with_recording_audit(&self, audit: Arc<dyn crate::recording_audit::RecordingAudit>) -> Self {
+        Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(),
+            jobs: self.jobs.clone(), recordings: self.recordings.clone(), recording_audit: Some(audit) }
     }
 
     /// Use this same predicate for tools/list and tools/call. In-run helper
     /// tools need a backend with helper calls; spawnd's per-run `helper_calls`
     /// feature bit is checked per call (a missing bit is a named refusal).
     pub fn supports(&self, name: &str) -> bool {
+        if recording::is_recording(name) {
+            return self.factory.supports(name) && self.backend.supports_helper_calls() && self.recordings.is_some();
+        }
         if in_run::is_in_run(name) {
             return self.factory.supports(name) && self.backend.supports_helper_calls();
         }
@@ -107,9 +130,10 @@ impl ExecutionToolBridge {
     /// the caller's own run and return synchronously (`execute_in_run`); they
     /// never reach the reserve/spawn path below (`execution_route` is `None`).
     pub async fn execute(&self, context: &RequestContext, name: &str, arguments: &Value) -> Value {
+        // HX6: the recording runs in the caller's run (recording slot).
+        if recording::is_recording(name) { return self.execute_recording(context, name, arguments).await; }
         if in_run::is_in_run(name) { return self.execute_in_run(context, name, arguments).await; }
         let Some(route) = execution_route(name) else { return refused(); };
-        if name == "browser_record_stop" { return self.stop_recording(context, arguments).await; }
         if self.factory.collects_results(name) && arguments.get("action").is_some() {
             return self.control(context, name, arguments).await;
         }
@@ -180,35 +204,6 @@ impl ExecutionToolBridge {
             // returning, and do not claim a confirmed pre-execution rejection.
             _ => { let _ = guard.cancel().await;
                 if self.factory.collects_results(name) { uncertain_job(reservation) } else { uncertain() } }
-        }
-    }
-
-    /// Exact operation alias: a stop capability can stop this actor's recording,
-    /// never a program or a run selected solely by handle possession.
-    async fn stop_recording(&self, context: &RequestContext, arguments: &Value) -> Value {
-        let name = "browser_record_stop";
-        if !self.supports(name) || !tool_policy::eligible(context, name)
-            || crate::check_arguments(arguments).is_err() { return refused(); }
-        let before = match tool_policy::authorize_async(context, name, arguments, self.resolver.clone()).await {
-            Ok(call) => call, Err(_) => return refused(),
-        };
-        if self.factory.authorize_control(context, name, arguments).await.is_err() { return refused(); }
-        let after = match tool_policy::authorize_async(context, name, arguments, self.resolver.clone()).await {
-            Ok(call) => call, Err(_) => return refused(),
-        };
-        if before.resources() != after.resources() { return refused(); }
-        let Some(fields) = arguments.as_object() else { return refused(); };
-        if fields.keys().any(|key| !matches!(key.as_str(), "id" | "workspace")) { return refused(); }
-        let Some(run) = arguments["id"].as_str().and_then(|id| crate::execution_jobs::parse_handle(id).ok()) else { return refused(); };
-        if run.0 == context.record().run { return refused(); }
-        let Some(jobs) = &self.jobs else { return refused(); };
-        let (jobs, context) = (jobs.clone(), context.clone());
-        match crate::authority::verify_blocking(move || {
-            let current = jobs.read(&context, "browser_record_start", run)?;
-            if current["status"] == "pending" { jobs.request_stop(&context, "browser_record_start", run)?; }
-            jobs.read(&context, "browser_record_start", run)
-        }).await {
-            Ok(result) => result_envelope(result), Err(_) => refused(),
         }
     }
 

@@ -12,6 +12,8 @@ use duduclaw_run::{helper_policy::{HelperFs, SelfOnlyCall, PR_SET_DUMPABLE},
 use std::time::{Duration, Instant};
 
 const HELPER_INPUT: &[u8] = b"helper-input-fixture";
+/// The parent's forwarder as root puts it in the runtime environment (`policy::runtime_environment`).
+pub(super) const FIXTURE_PROXY: &str = "http://127.0.0.1:18080";
 const OPEN_FILES: u64 = 64;
 const FILE_SIZE: u64 = 1 << 20;
 
@@ -108,6 +110,8 @@ impl Session {
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
         mounts::enter_namespaces().expect("coordinator private mount namespace");
         let (mut plan, mut descriptors, mcp, _) = prepare(root, scenario);
+        // The egress (recording-slot) helper's forwarder comes from the runtime's own environment.
+        plan.program.environment.push(CString::new(format!("HTTPS_PROXY={FIXTURE_PROXY}")).unwrap());
         // A distinct registry file for the helper, so /runtime must mask it.
         let mut source = File::open("/proc/self/exe").unwrap();
         let mut copy = File::create(root.join("runtime/helper")).unwrap();
@@ -124,7 +128,8 @@ impl Session {
             self_only: vec![SelfOnlyCall::Prlimit64SelfOnly, SelfOnlyCall::Prctl { options: vec![PR_SET_DUMPABLE] }],
             mount: 0, slot, filesystem: if slot == HelperSlot::Recording { vec![HelperFs::SystemRo, HelperFs::WorkRecordings] }
                 else { vec![HelperFs::SystemRo, HelperFs::Work] },
-            open_files: OPEN_FILES as u32, file_size_bytes: FILE_SIZE, timeout_ms: 30_000, egress: slot == HelperSlot::Recording };
+            open_files: OPEN_FILES as u32, file_size_bytes: FILE_SIZE, timeout_ms: 30_000, egress: slot == HelperSlot::Recording,
+            files: vec![] };
         plan.launcher = Some(LauncherPlan { helpers: vec![binding(foreground, HelperSlot::Foreground),
             binding(recording, HelperSlot::Recording)], mounts: vec![MountIdentity { mount: registry.expected_mount_id,
             fs_type: registry.expected_fs_type }], tmpfs_bytes: 1 << 20, drain_ms });
@@ -452,9 +457,13 @@ fn helper_checks(mode: &str) {
     let expected = if mode == "slow-stop" { "/hx/rec" } else { "/hx/" };
     assert!((cgroup.trim_end().ends_with("/hx/fg") || cgroup.trim_end().ends_with("/hx/rec")) && cgroup.contains(expected),
         "slot cgroup: {cgroup}");
-    // [F9] HOME and TMPDIR are the private call directory, which is the cwd.
+    // [F9] HOME and TMPDIR are the private call directory, which is the cwd;
+    // an egress (recording-slot) helper also gets exactly the parent's
+    // forwarder (HX6 security fix round, finding 5).
+    let recording = cgroup.trim_end().ends_with("/hx/rec");
     let vars: Vec<_> = std::env::vars().collect();
-    assert_eq!(vars.len(), 2, "{vars:?}");
+    assert_eq!(vars.len(), if recording { 3 } else { 2 }, "{vars:?}");
+    if recording { assert_eq!(std::env::var("HTTPS_PROXY").unwrap(), FIXTURE_PROXY); }
     let home = std::env::var("HOME").unwrap();
     assert_eq!(std::env::var("TMPDIR").unwrap(), home);
     let name = home.strip_prefix("/helper-tmp/").unwrap();

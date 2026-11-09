@@ -184,7 +184,8 @@ impl PreparedRoot {
     /// Build `/helpers`, `/helper-tmp` and the `/runtime` masks. Before `pivot`, while root.
     pub fn attach_helpers(&self, view: HelperView, config: &RootConfig) -> Result<HelperReadback, MountError> {
         config.validate()?;
-        if view.files.is_empty() || view.files.len() > 32 || view.tmpfs_bytes == 0
+        // ≤ 16 helpers × (executable + script) + the recording's 3 browser files (HX6 fix round).
+        if view.files.is_empty() || view.files.len() > 40 || view.tmpfs_bytes == 0
             || view.tmpfs_bytes > 1024 * 1024 * 1024 { return Err(MountError::InvalidPolicy); }
         let root = self.root.as_raw_fd();
         let mut names: Vec<(CString, RawFd, FileKey, u32)> = Vec::new();

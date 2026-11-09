@@ -14,6 +14,8 @@
   "isolationReadiness.feature.program": "プログラムの実行",
   "isolationReadiness.feature.codeMap": "コード分析",
   "isolationReadiness.feature.office": "Office 文書の処理",
+  "isolationReadiness.reason.recording": "このホストでは保護されたブラウザ録画が無効です。ブラウザがヘルパーのサンドボックス内で起動できることがまだ確認されていません。",
+  "isolationReadiness.recordingEgress": "AI 従業員のブラウザ録画を有効にする（[isolation] public_web = true）と、その従業員の保護された実行環境に公開 Web への外部通信を許可することになります。録画はその外部通信で許可された範囲にしか到達しません。",
   "isolationReadiness.hint.binding": "移行の確認で従業員の設定を完了する",
   "isolationReadiness.hint.connector": "コネクタ設定へ移動",
   "isolationReadiness.hint.personal": "ユーザー管理でメンバーを確認",

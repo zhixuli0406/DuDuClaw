@@ -66,9 +66,28 @@ rechecks (a change refuses the run):
   each refusal writes an `isolation_task_run_refused` security-audit row
   (`reason: task_not_owned`, `stage: schedule` or `issuance`).
 
+HX6: browser recording (`browser_record_start` / `browser_record_stop`) is an
+in-run helper in the caller's recording slot. The issuer selects
+`Workspace{employee-work}` for it only when spawnd advertises `helper_calls`
+and `helper_recording` (Chromium proven to start under the helper sandbox on
+this host; until then readiness names `helper_recording_unsupported`), the
+employee's admin-only `[isolation] public_web` switch is on (enabling recording
+grants that employee's runtime public-web egress, owner decision Q3) and the run
+is interactive (`workspace_selection::drops_from_signed_with`). With the same
+conditions it signs the D-H2 `PublicOrigins { * }` grant, the authority for
+`browser_record_start`'s navigation URL (the URL is unknown at issuance, so no
+`UrlOrigin` can be signed); a grant signed only for the recording never makes
+`web_fetch_cached`/`web_extract` eligible (`Selection::signed_tools` drops them
+unless their own `public_web` selection holds). The same applies to the grant
+signed for `skill_hub_install` alone (owner decision 2026-11-09); recording,
+hub install and the web tools share at most one `PublicOrigins { * }` grant.
+An offline parent
+answers `helper_parent_offline`. Results are stored per `(run, call)` with each
+artifact's sha256 (`recording_jobs`); a later read must match them
+(`artifact_modified`).
+
 Workspace and URL-origin selection for the other File/A/E tools is still
-missing, including browser recording (`browser_record_start` /
-`browser_record_stop`, task HX6). `employee-work` is also the A execution
+missing. `employee-work` is also the A execution
 workspace handle, so when the issuer selects it (for the file tools or the HX5
 helpers) it leaves every other listed tool whose eligibility would rest on that
 grant out of the signed tool snapshot (`Selection::signed_tools`, `mcp-boundary`
@@ -87,9 +106,11 @@ feature source, and the readiness report then names
 `helper_runtime_missing{runtime}`. The own-skill tools below (H12a) never receive a Workspace (or
 Recipient) grant from these selectors; of the H12b/c/d job tools only
 `skill_from_recording` uses the brokered Workspace (its artifacts live there),
-and it stays in `PENDING_WORKSPACE_SELECTOR_TOOLS` until HX6 installs the
-recording job store. `skill_hub_install` and `skill_synthesis_run` are no
-longer on that list.
+and it stays in `PENDING_WORKSPACE_SELECTOR_TOOLS` until H12d's `RecordingJobs`
+seam is implemented over HX6's `recording_jobs` store with `verify_artifact`
+(CLI tripwire). `skill_hub_install`, `skill_synthesis_run` (H12b/c),
+`spawn_agent`/`spawn_ephemeral` (H13) and `browser_record_start`/`stop` (HX6)
+are no longer on that list.
 
 H12a (v1.81): the own-skill tools `skill_extract`, `shared_skill_adopt`,
 `skill_security_scan`, `skill_graduate` and `skill_curator_status` no longer
@@ -147,8 +168,9 @@ SKILLS (no global bank, no Workspace grant). `skill_from_recording` needs the ow
 `Employee`, the plain brokered `Workspace{employee-work}` and an installed recording
 job store; the artifacts are read through root's broker at the helper's layout
 (`recordings/<id>/{trace.zip,actions.json,network.json}`, shared
-`duduclaw_isolation::recording_layout`) and must match the job manifest. No job
-store is installed until HX6, so it is not eligible (hidden) in production.
+`duduclaw_isolation::recording_layout`) and must match the job manifest. HX6's
+recording store exists, but the H12d `RecordingJobs` seam is not yet installed
+over it, so it is not eligible (hidden) in production.
 
 Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host handler is selected by `boundary_route` (including the Linux bundled model catalog). Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
 
@@ -311,11 +333,11 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; shared skill scanned and prepared by E as data; scanned body copied only into the caller's own SKILLS (no clobber, read back); no target argument (H12a) |
 | `plan_start` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_improve` | Resource → AuthorizedToolCall → original live employee handler |
-| `browser_record_start` | A ExecutionBackend + ExecutionPlanFactory; protected route pending (HX6): never signed with `employee-work` (`PENDING_WORKSPACE_SELECTOR_TOOLS`) |
-| `browser_record_stop` | A ExecutionBackend + ExecutionPlanFactory; protected route pending (HX6): never signed with `employee-work` (`PENDING_WORKSPACE_SELECTOR_TOOLS`) |
+| `browser_record_start` | HX6 `Route::InRunHelper`, recording slot of the caller's own run (`ExecutionToolBridge::execute_recording`, `prepare_in_run` → `AuthorizedHelperPlan::recording`, spawnd `HelperCall{slot: recording}`); returns `{status: recording, id}` (spawnd call id); gateway collector stores the decoded result + artifact sha256 per `(run, call)` (`recording_jobs`); flushed at run end (`ended_by: run_end`), hard kill ⇒ `uncertain/run_killed`; offline parent ⇒ `helper_parent_offline`; needs `Workspace{employee-work}`, spawnd `helper_calls` + `helper_recording` and `[isolation] public_web`; the navigation `url` is authorized by the record's signed EmployeeScope + `PublicOrigins` grant (D-H2, tag 11; signed with the recording selection), never a per-URL `UrlOrigin` (`tool_policy::RECORDING_URL_TOOLS`): it must pass `resources::permitted_public_origin` (https, default port, no userinfo, public DNS name, no IP literal or private name; http refused), no grant ⇒ refused, and egress stays public-address-only through the run's forwarder |
+| `browser_record_stop` | HX6 `Route::InRunHelper`: same run ⇒ `HelperStop` for that `(run, call)` and the stored result (the old `:180` refusal inverted, never `parse_handle`); later run or terminal row ⇒ stored result, no helper interaction; revocation ⇒ `HelperStop`, `ended_by: revoked`; same selector as `browser_record_start`; names no URL, so needs no `PublicOrigins`/`UrlOrigin` |
 | `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
-| `skill_from_recording` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + brokered Workspace{employee-work}; own finished recording from the job store (HX6 seam), artifacts read through root's broker at the helper layout and matched to the job manifest, summarized by E, staged for approval; not eligible until HX6 installs the recording job store (H12d) |
+| `skill_from_recording` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + brokered Workspace{employee-work}; own finished recording from the job store (HX6 seam), artifacts read through root's broker at the helper layout and matched to the job manifest, summarized by E, staged for approval; not eligible until the H12d `RecordingJobs` seam is installed over HX6's recording store with `verify_artifact` |
 | `memory_search` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_store` | Resource → AuthorizedToolCall → original live employee handler |
 | `working_state_set` | Resource → AuthorizedToolCall → original live employee handler |

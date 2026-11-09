@@ -1955,6 +1955,7 @@ name = "duduclaw-execution"
 version = "1.80.1"
 dependencies = [
  "duduclaw-isolation",
+ "duduclaw-run",
  "libc",
  "nix 0.29.0",
  "portable-pty",

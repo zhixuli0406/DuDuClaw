@@ -5,13 +5,15 @@
 //! (`IN_RUN_HELPER_TOOLS`) when spawnd advertises `helper_calls` and a work
 //! broker is installed. The same handle is also the A execution workspace, so
 //! the grant alone would make every listed tool that needs a Workspace
-//! eligible: other execution tools (browser recording — HX6, discovery,
-//! forks) and the workspace-scoped E services. (H13 `spawn_agent` /
-//! `spawn_ephemeral` need only the Employee grant and are not affected.) No selector chose a
+//! eligible: other execution tools (discovery, forks) and the
+//! workspace-scoped E services. HX6: the browser recording tools are signed
+//! only with their own recording selector (`drops_from_signed_with`). (H13
+//! `spawn_agent` / `spawn_ephemeral` need only the Employee grant and are not
+//! affected.) No selector chose a
 //! workspace for them, so the issuer must not sign them: they stay hidden and
 //! refused (fail closed) until their own selector exists. This only narrows
 //! the snapshot.
-use crate::tool_policy::{employee_service_scope, policy, ResourceKind, Route, IN_RUN_HELPER_TOOLS};
+use crate::tool_policy::{employee_service_scope, policy, ResourceKind, Route, IN_RUN_HELPER_TOOLS, IN_RUN_RECORDING_TOOLS};
 
 /// The reviewed production selector gap: tools that rest on the
 /// `employee-work` grant but have no workspace selector yet. The issuer never
@@ -21,11 +23,12 @@ use crate::tool_policy::{employee_service_scope, policy, ResourceKind, Route, IN
 /// `office_script`; H13 removed `spawn_agent` and `spawn_ephemeral` (routed
 /// on the run's own Employee grant, no Workspace); H12b/H12c removed
 /// `skill_hub_install` (own Employee + PublicOrigins) and `skill_synthesis_run`
-/// (own Employee only). None of them may be added back here.
-/// `skill_from_recording` stays until HX6 installs the H12d `RecordingJobs`
-/// seam.
+/// (own Employee only); HX6 removed `browser_record_start` /
+/// `browser_record_stop` (own recording selector). None of them may be added
+/// back here. `skill_from_recording` stays until H12d's `RecordingJobs` seam
+/// is wired to HX6's `recording_jobs` (N4 / VerifiedArtifact tripwire).
 pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &["inspect_branches", "diff_branches", "fork_cost", "discovery_catalog", "discovery_list", "discovery_tree", "discovery_artifact",
-    "discovery_cancel", "browser_record_start", "browser_record_stop", "skill_from_recording"];
+    "discovery_cancel", "skill_from_recording"];
 
 /// Whether a signed `Workspace` grant is what would make `name` eligible on a
 /// non-File route. `employee_scope` is true when the record keeps its
@@ -45,8 +48,18 @@ pub fn needs_execution_workspace(name: &str, employee_scope: bool) -> bool {
 /// `IN_RUN_HELPER_TOOLS` are signed. Every pending tool, and every other tool
 /// whose eligibility would rest on the grant, is dropped (fail closed).
 pub fn drops_from_signed(name: &str, employee_scope: bool, helpers: bool) -> bool {
+    drops_from_signed_with(name, employee_scope, helpers, false)
+}
+
+/// [`drops_from_signed`] plus the HX6 recording selector: `recording` is true
+/// only when the issuer chose the workspace for the recording tools (spawnd
+/// `helper_calls` + `helper_recording`, the employee's admin-only public-web
+/// egress switch, an interactive run). Then exactly `IN_RUN_RECORDING_TOOLS`
+/// are signed as well.
+pub fn drops_from_signed_with(name: &str, employee_scope: bool, helpers: bool, recording: bool) -> bool {
     if PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&name) { return true; }
     if helpers && IN_RUN_HELPER_TOOLS.contains(&name) { return false; }
+    if recording && IN_RUN_RECORDING_TOOLS.contains(&name) { return false; }
     needs_execution_workspace(name, employee_scope)
 }
 
@@ -125,5 +138,26 @@ mod tests {
         helpers.sort_unstable();
         newly.sort_unstable();
         assert_eq!(newly, helpers);
+    }
+
+    /// HX6: the recording tools left the pending list; they are signed only
+    /// with the recording selector, never by the foreground helper bit.
+    #[test]
+    fn recording_tools_signed_only_with_recording_selector() {
+        for tool in IN_RUN_RECORDING_TOOLS {
+            assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
+            assert!(needs_execution_workspace(tool, true), "{tool}");
+            for scoped in [true, false] {
+                assert!(drops_from_signed(tool, scoped, true), "{tool}");
+                assert!(drops_from_signed_with(tool, scoped, false, false), "{tool}");
+                assert!(!drops_from_signed_with(tool, scoped, false, true), "{tool}");
+            }
+        }
+        let mut newly: Vec<_> = crate::tool_policy::POLICIES.iter().map(|policy| policy.name)
+            .filter(|name| drops_from_signed_with(name, true, false, false) && !drops_from_signed_with(name, true, false, true))
+            .collect();
+        newly.sort_unstable();
+        assert_eq!(newly, vec!["browser_record_start", "browser_record_stop"]);
+        assert!(drops_from_signed_with("skill_from_recording", true, true, true), "still pending (H12d)");
     }
 }

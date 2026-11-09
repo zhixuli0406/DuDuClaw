@@ -4,6 +4,9 @@ pub mod io_authority;
 pub mod config;
 pub mod execution;
 pub mod execution_jobs;
+pub mod recording_jobs;
+/// HX6 security fix round (finding 6): recording audit facts and the gateway's sink seam.
+pub mod recording_audit;
 pub mod fork_policy;
 #[cfg(all(target_os = "linux", feature = "execution-integration"))]
 pub mod protected_launch;

@@ -73,6 +73,8 @@ function describeReason(intl: IntlShape, reason: IsolationReason): ReasonView {
         : { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRuntimeGeneric' }) };
     }
     case 'helper_recording_unsupported':
+      // W1 plain-language text; HX6's technical `reason.recording` stays in
+      // the catalogs (admin egress statement: `recordingEgress` below).
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRecording' }) };
     default:
       return { key: 'unknown', message: intl.formatMessage({ id: 'isolationReadiness.reason.setup' }) };
@@ -144,6 +146,10 @@ export function IsolationReadinessBanner() {
                 ))}
               </ul>
             </div>
+          )}
+          {admin && reasons.some(reason => reason.key === 'helper_recording_unsupported') && (
+            // D8 revision §4 / Q3 = A: recording egress is the employee's public-web egress.
+            <p className="text-muted-foreground">{intl.formatMessage({ id: 'isolationReadiness.recordingEgress' })}</p>
           )}
           {admin && (
             <div className="space-y-1">

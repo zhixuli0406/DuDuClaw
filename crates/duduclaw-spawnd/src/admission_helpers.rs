@@ -206,6 +206,10 @@ impl<H: Host> Coordinator<H> {
         if entry.state != AdmissionState::Running || self.stopping.contains_key(&employee_id) { return Err(ErrorCode::NotReady); }
         if self.run_remaining(run, now)? < MIN_HELPER_RUN_REMAINDER_MS { return Err(ErrorCode::RunTimeExhausted); }
         self.host.helpers_ready()?;
+        // HX6 security fix round (finding 4): root's own recording gate. The
+        // gateway's feature check is not the only gate: without this host's
+        // passed probe (and the build kill switch) no recording-slot call is queued.
+        if slot == HelperSlot::Recording && !self.host.recording_ready() { return Err(ErrorCode::HelperRecordingUnsupported); }
         if let Some(helpers) = self.helpers.get(&run.0) {
             if helpers.draining { return Err(ErrorCode::NotReady); }
             if let Some(code) = helpers.closed { return Err(code); }

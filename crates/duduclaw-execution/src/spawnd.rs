@@ -500,6 +500,10 @@ impl ExecutionBackend for SpawndBackend {
     fn cancel_helper(&self, run: RunHandle, call: ipc::HelperCallId) -> HelperFuture<'_, ()> {
         Box::pin(self.helper_control(helper_call::Control::Cancel, run, call))
     }
+    // HX6: recording flush (`HelperStop`); acceptance only, end via wait.
+    fn stop_helper(&self, run: RunHandle, call: ipc::HelperCallId) -> HelperFuture<'_, ()> {
+        Box::pin(self.helper_control(helper_call::Control::Stop, run, call))
+    }
 }
 
 // A is part of the TCB. Root owns the idle clock, and only successful byte

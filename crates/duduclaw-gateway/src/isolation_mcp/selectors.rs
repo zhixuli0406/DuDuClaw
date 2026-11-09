@@ -25,7 +25,9 @@
 //!   from `[container] network_access`, which keeps controlling only the task
 //!   sandbox's network. `[isolation]` is admin-only (`org_field_guard` freezes
 //!   it against the employee's own writes) and defaults to `false`, so the
-//!   default is no web authority. Never from tool arguments.
+//!   default is no web authority. Never from tool arguments. HX6: the same
+//!   grant is also signed for a run whose recording is selected (`recording`,
+//!   below), as the authority for `browser_record_start`'s navigation URL.
 //! * `NewTask { requester }` (H9 decision 3) — only for an interactive run (not
 //!   record-backed, no task) that lists `create_task` while the profile still
 //!   allows it. The requester is the run's authenticated human (B1 has already
@@ -50,7 +52,7 @@ use std::{io::Read, path::Path, sync::Arc};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{PublicOrigin, ResourceGrant}, ids::EmployeeId,
     ipc::SpawndFeatures};
 use duduclaw_mcp_boundary::{resources::{ResourceRoots, WorkBroker, EMPLOYEE_WORK_ROOT},
-    tool_policy::{IN_RUN_HELPER_TOOLS, PUBLIC_ORIGIN_TOOLS}};
+    tool_policy::{IN_RUN_HELPER_TOOLS, IN_RUN_RECORDING_TOOLS, PUBLIC_ORIGIN_TOOLS}};
 use super::VerificationError;
 
 /// File tools served from the brokered `employee-work` root (H6/H11).
@@ -126,6 +128,12 @@ impl SelectorSources {
         self.broker_available()
             && self.spawnd_features.as_ref().is_some_and(|view| view().contains(SpawndFeatures::HELPER_CALLS))
     }
+    /// HX6 gate: helper calls AND spawnd's `helper_recording` (Chromium proven
+    /// to launch under the helper sandbox on this host). Anything else ⇒ false.
+    fn recording_ready(&self) -> bool {
+        self.helper_calls() && self.spawnd_features.as_ref().is_some_and(|view|
+            view().contains(SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING)))
+    }
 }
 
 /// Facts the issuer passes in; all host-pinned, none from the employee.
@@ -154,7 +162,15 @@ pub(super) struct Selection {
     /// HX5: `workspace` was (also) selected for the in-run helper tools, so
     /// exactly those are signed alongside it (`workspace_selection`).
     pub helpers: bool,
+    /// HX6: `workspace` was (also) selected for the in-run browser recording
+    /// (`IN_RUN_RECORDING_TOOLS`), which is signed alongside it.
+    pub recording: bool,
+    /// The web tools (`PUBLIC_ORIGIN_TOOLS`) were selected: the only case in
+    /// which they are signed alongside a PublicOrigins grant.
     pub public_web: bool,
+    /// H12b (owner decision 2026-11-09): `skill_hub_install` was selected on
+    /// the same `public_web` switch; it signs the grant but never the web tools.
+    pub hub_install: bool,
     /// The requester of an interactive run's `NewTask` grant.
     pub new_task: Option<String>,
     pub task: Option<SelectedTask>,
@@ -168,6 +184,10 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     let wants_files = FILE_TOOLS.iter().any(|name| listed(*name)) && sources.broker_available();
     // HX5: checked only when a helper tool is listed (no view read otherwise).
     let wants_helpers = IN_RUN_HELPER_TOOLS.iter().any(|name| listed(*name)) && sources.helper_calls();
+    // HX6: the recording needs the host gate and an interactive run (its
+    // egress is the employee's public-web authority, D-H2 / Q3 = A).
+    let wants_recording = input.task.is_none() && IN_RUN_RECORDING_TOOLS.iter().any(|name| listed(*name))
+        && sources.recording_ready();
     // D-H2: PublicOrigins exists only alongside EmployeeScope; a task-limited
     // run never carries it, so it is not even considered there.
     // Owner decision 2026-11-09: protected `skill_hub_install` rests on the
@@ -177,7 +197,7 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     // NewTask: interactive runs only (a record-backed run plans under its own
     // record task, H8, and has no human requester of its own).
     let wants_new_task = !input.record && input.task.is_none() && NEW_TASK_TOOLS.iter().any(|name| listed(*name));
-    let profile = if wants_files || wants_helpers || wants_web || wants_new_task {
+    let profile = if wants_files || wants_helpers || wants_recording || wants_web || wants_new_task {
         Some(read_profile(input.home, input.agent)?)
     } else { None };
     let allows = |names: &[&str]| profile.as_ref().is_some_and(|profile| {
@@ -186,11 +206,17 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
             *name, &caps.denied_tools, &caps.allowed_tools) == duduclaw_core::tool_catalog::ToolListVerdict::Allowed)
     });
     let helpers = wants_helpers && allows(&IN_RUN_HELPER_TOOLS[..]);
-    let workspace = (wants_files && allows(FILE_TOOLS)) || helpers;
+    // Owner decision Q3 = A: enabling recording means granting this
+    // employee's runtime public-web egress, so the same admin-only switch
+    // (`[isolation] public_web`) gates it. No switch ⇒ no recording.
+    let recording = wants_recording && profile.as_ref().is_some_and(|profile| profile.isolation.public_web)
+        && allows(&IN_RUN_RECORDING_TOOLS[..]);
+    let workspace = (wants_files && allows(FILE_TOOLS)) || helpers || recording;
     // Owner decision 2026-11-08: its own admin-only switch, independent of
     // `[container] network_access` (task sandbox only).
-    let public_web = wants_web && profile.as_ref().is_some_and(|profile| profile.isolation.public_web)
-        && (allows(PUBLIC_ORIGIN_TOOLS) || allows(HUB_INSTALL_TOOLS));
+    let web_switch = wants_web && profile.as_ref().is_some_and(|profile| profile.isolation.public_web);
+    let public_web = web_switch && allows(PUBLIC_ORIGIN_TOOLS);
+    let hub_install = web_switch && allows(HUB_INSTALL_TOOLS);
     let new_task = (wants_new_task && allows(NEW_TASK_TOOLS)).then(|| input.user.to_owned());
     if new_task.as_deref().is_some_and(|user| user.is_empty() || user.len() > 128 || user.chars().any(char::is_control)) {
         return Err(VerificationError::Invalid);
@@ -207,7 +233,7 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
             Some(SelectedTask { id: id.to_owned() })
         }
     };
-    Ok(Selection { workspace, helpers, public_web, new_task, task })
+    Ok(Selection { workspace, helpers, recording, public_web, hub_install, new_task, task })
 }
 
 impl Selection {
@@ -230,7 +256,14 @@ impl Selection {
             resources.push(ResourceGrant::Workspace {
                 handle: Text::new(EMPLOYEE_WORK_ROOT.to_owned()).map_err(|_| VerificationError::Invalid)? });
         }
-        if self.public_web {
+        // HX6: the recording's navigation URL is authorized by this same grant
+        // (`tool_policy::RECORDING_URL_TOOLS`), never a per-URL UrlOrigin. It
+        // is signed only when `recording` holds (helper_calls +
+        // helper_recording, `[isolation] public_web`, interactive run, profile
+        // allows); it does not make the recording a web tool
+        // (`PUBLIC_ORIGIN_TOOLS` is unchanged). H12b: a selected hub install
+        // signs the same generic grant. At most one grant in every case.
+        if self.public_web || self.recording || self.hub_install {
             resources.push(ResourceGrant::PublicOrigins {
                 origins: List::new(vec![PublicOrigin::any()]).map_err(|_| VerificationError::Invalid)? });
         }
@@ -244,16 +277,23 @@ impl Selection {
     /// The tool snapshot to sign. The `Workspace { employee-work }` grant is
     /// selected for the file tools and — only with `helpers` — the HX5 in-run
     /// helper tools. Every other listed tool whose eligibility would rest on
-    /// that grant (the shared pending list, e.g. browser recording until HX6,
-    /// and any other A/E tool) is left out of the capability, so it stays
+    /// that grant (the shared pending list, e.g. `skill_from_recording`, the
+    /// HX6 recording tools unless `recording`, and any other A/E tool) is
+    /// left out of the capability, so it stays
     /// hidden and refused. Only ever narrows.
     pub(super) fn signed_tools(&self, tools: &List<Text<128>, 256>)
         -> Result<List<Text<128>, 256>, VerificationError> {
-        if !self.workspace { return Ok(tools.clone()); }
+        // HX6 / H12b: a PublicOrigins grant signed only for the recording or
+        // the hub install is never authority for the web tools, so they leave
+        // the snapshot unless their own `public_web` selection holds.
+        let foreign_grant_web = (self.recording || self.hub_install) && !self.public_web;
+        if !self.workspace && !foreign_grant_web { return Ok(tools.clone()); }
         // A task run is limited to its task and loses EmployeeScope.
         let scoped = self.task.is_none();
         List::new(tools.as_slice().iter().filter(|tool|
-            !duduclaw_mcp_boundary::workspace_selection::drops_from_signed(tool.as_str(), scoped, self.helpers))
+            !(foreign_grant_web && PUBLIC_ORIGIN_TOOLS.contains(&tool.as_str()))
+            && !(self.workspace && duduclaw_mcp_boundary::workspace_selection::drops_from_signed_with(tool.as_str(),
+                scoped, self.helpers, self.recording)))
             .cloned().collect()).map_err(|_| VerificationError::Invalid)
     }
 }

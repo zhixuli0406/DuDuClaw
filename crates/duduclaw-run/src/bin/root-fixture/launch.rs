@@ -435,7 +435,9 @@ pub(super) fn runtime_mode() {
         assert_eq!(unsafe {libc::getgid()},EMPLOYEE);
         assert_eq!(unsafe {libc::getsid(0)},unsafe {libc::getpid()});
         assert_eq!(unsafe {libc::prctl(libc::PR_GET_NO_NEW_PRIVS,0,0,0,0)},1);
-        let allowed=["DUDUCLAW_FIXTURE_PAYLOAD","HOME","XDG_RUNTIME_DIR"];
+        // Helper scenarios add the parent's forwarder (HX6 security fix round, finding 5).
+        let allowed: &[&str]=if mode=="helpers" {&["DUDUCLAW_FIXTURE_PAYLOAD","HOME","XDG_RUNTIME_DIR","HTTPS_PROXY"]}
+            else {&["DUDUCLAW_FIXTURE_PAYLOAD","HOME","XDG_RUNTIME_DIR"]};
         assert_eq!(std::env::vars().count(),allowed.len());
         assert!(std::env::vars().all(|(name,_)|allowed.iter().any(|allowed|*allowed==name)),
             "environment constructed from scratch");

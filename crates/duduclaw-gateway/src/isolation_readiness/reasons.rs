@@ -75,6 +75,10 @@ pub enum Reason {
     /// the same Workspace grant) are hidden because spawnd's live readiness
     /// view lacks `work_broker`, or boot installed no work broker.
     WorkspaceBrokerUnavailable,
+    /// HX6 gate (D8 revision §4): the recording helper is published but this
+    /// host has not proven that Chromium launches under the helper sandbox
+    /// (spawnd's `helper_recording` bit is absent); recording stays refused.
+    HelperRecordingUnsupported,
 }
 
 /// W1: host-wide reasons of the brokered work root and the in-run helpers.
@@ -92,6 +96,11 @@ pub fn feature_reasons(features: Option<duduclaw_isolation::ipc::SpawndFeatures>
     }
     reasons.extend(helper_reasons(features.contains(SpawndFeatures::HELPER_CALLS),
         published.unwrap_or_default().iter().copied()));
+    // HX6: only where the recording is offered at all (its runtime is published).
+    let recording_published = published.unwrap_or_default().contains(&duduclaw_execution::recording_helper::RUNTIME);
+    if recording_published && !features.contains(SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING)) {
+        reasons.push(Reason::HelperRecordingUnsupported);
+    }
     reasons
 }
 
@@ -431,5 +440,24 @@ mod hx5_tests {
         // A bare prefix is not an office runtime.
         assert!(helper_reasons(true, ["duduclaw-program-v1", "duduclaw-code-map-v1", "duduclaw-office--v1"])
             .contains(&Reason::HelperRuntimeMissing { runtime: "duduclaw-office-*-v1" }));
+    }
+
+    /// HX6 gate: a published recording helper without spawnd's
+    /// `helper_recording` (Chromium not proven under the helper sandbox) is a
+    /// named reason; unpublished recording reports nothing.
+    #[test]
+    fn hx6_recording_unsupported_until_host_gate() {
+        use duduclaw_isolation::ipc::SpawndFeatures;
+        let published = ["duduclaw-program-v1", "duduclaw-code-map-v1", "duduclaw-office-docx-render-v1",
+            "duduclaw-browser-record-v1"];
+        let base = SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_CALLS);
+        let reasons = feature_reasons(Some(base), true, Some(&published));
+        assert_eq!(reasons, vec![Reason::HelperRecordingUnsupported]);
+        assert_eq!(serde_json::to_value(reasons[0]).unwrap(), serde_json::json!({"code":"helper_recording_unsupported"}));
+        assert!(feature_reasons(Some(base.with(SpawndFeatures::HELPER_RECORDING)), true, Some(&published)).is_empty());
+        // The recording bit without helper calls is not enough.
+        assert!(feature_reasons(Some(SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_RECORDING)), true, Some(&published))
+            .contains(&Reason::HelperRecordingUnsupported));
+        assert!(!feature_reasons(Some(base), true, Some(&published[..3])).contains(&Reason::HelperRecordingUnsupported));
     }
 }

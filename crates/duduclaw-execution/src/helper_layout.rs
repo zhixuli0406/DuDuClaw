@@ -16,6 +16,10 @@ pub const IN_RUN_ROOT: &str = "/helpers";
 pub const LEGACY_ROOT: &str = "/runtime";
 pub const SCRATCH_ROOT: &str = "/helper-tmp";
 pub const WORKSPACE: &str = "/work";
+/// HX6 security fix round (finding 5): the recording's only workspace grant
+/// (`HelperFs::WorkRecordings`, created by the launcher before its Landlock).
+/// The recording opens it directly (`O_NOFOLLOW|O_DIRECTORY`), never `/work`.
+pub const RECORDINGS: &str = "/work/recordings";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperLayout {

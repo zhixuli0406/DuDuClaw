@@ -97,7 +97,35 @@ fn helper_id(runtime: &RuntimeKind) -> Option<&str> {
     (matches!(name, "duduclaw-program-v1" | "duduclaw-code-map-v1" | RECORDING_RUNTIME) || office).then_some(name)
 }
 pub fn executable_fds(runtime: &PublishedRuntime) -> usize {
-    match runtime.executable { Executable::Elf { .. } => 1, Executable::Script { .. } => 2 }
+    let files = recording_files(runtime).map_or(0, |files| files.len());
+    files + match runtime.executable { Executable::Elf { .. } => 1, Executable::Script { .. } => 2 }
+}
+/// The recording helper's fixed protocol argument (`recording_helper::ARGUMENT`).
+const RECORDING_ARGUMENT: &str = "--browser-record-fd-v1";
+fn digest_hex(text: &str) -> Option<Sha256Digest> {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return None; }
+    let mut digest = [0u8; 32];
+    let pairs = text.as_bytes().chunks_exact(2);
+    if pairs.len() != digest.len() { return None; }
+    for (byte, pair) in digest.iter_mut().zip(pairs) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(Sha256Digest(digest))
+}
+/// HX6 security fix round (finding 5): the recording helper's signed browser
+/// files, `(flat registry name, sha256)` in `RECORDING_BROWSER_FILES` order,
+/// taken from its signed fixed argv `[--browser-record-fd-v1, d_node,
+/// d_playwright, d_chromium]` (the digests the helper re-verifies). `None`
+/// for every other runtime; `Some(empty)` never (a malformed recording record
+/// is refused at publication).
+pub fn recording_files(runtime: &PublishedRuntime) -> Option<Vec<(&'static str, Sha256Digest)>> {
+    let RuntimeKind::Registered(name) = &runtime.runtime else { return None; };
+    if name.as_str() != RECORDING_RUNTIME { return None; }
+    let mut args = runtime.fixed_args.iter().map(|arg| arg.as_str());
+    if args.next() != Some(RECORDING_ARGUMENT) { return None; }
+    let digests = args.map(digest_hex).collect::<Option<Vec<_>>>()?;
+    if digests.len() != duduclaw_run::helper_policy::RECORDING_BROWSER_FILES.len() { return None; }
+    Some(duduclaw_run::helper_policy::RECORDING_BROWSER_FILES.into_iter().zip(digests).collect())
 }
 /// Every helper runtime is published in the same signed generation registry, so
 /// the launcher needs one read-only helper registry mount (check 5 dedup).
@@ -142,6 +170,13 @@ pub fn validate_launcher(arch: Architecture, parent: &PublishedRuntime, parent_s
         profiles.push(binding.profile); kinds.push(&helper.runtime);
         let recording = id == RECORDING_RUNTIME;
         if recording != (binding.slot == HelperSlot::Recording) { return Err(Invalid); }
+        // HX6 security fix round (findings 1, 2, 5): the recording's fixed argv
+        // names exactly its three signed browser files, and only the recording
+        // may hold the nested-sandbox exception.
+        if recording && recording_files(helper).is_none() { return Err(Invalid); }
+        // Round 3 (N3): so may the subreaper prctl options (in the global
+        // `PRCTL_SELF_ONLY`); `recording` equals the recording slot (above).
+        if duduclaw_run::helper_policy::recording_only_violation(binding.slot, &binding.self_only) { return Err(NotNarrowing); }
         // Check 2 [F3].
         if seccomp::runtime(arch, &binding.seccomp, binding.seccomp_digest).is_err()
             || !seccomp_within_parent(arch, parent_seccomp, &binding.seccomp, &binding.self_only) { return Err(NotNarrowing); }
@@ -246,9 +281,12 @@ mod tests {
     fn fixture(parent_network: NetworkPolicy) -> Fixture {
         let parent = runtime(RuntimeKind::Claude, 1, parent_network);
         let program = runtime(registered("duduclaw-program-v1"), 2, NetworkPolicy::Offline);
-        let recording = runtime(registered("duduclaw-browser-record-v1"), 3, egress());
+        let mut recording = runtime(registered("duduclaw-browser-record-v1"), 3, egress());
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        recording.fixed_args = recording_args(&["--browser-record-fd-v1", a.as_str(), b.as_str(), c.as_str()]);
         Fixture { runtimes: vec![parent.clone(), program, recording], parent }
     }
+    fn recording_args(args: &[&str]) -> Vec<Text<4096>> { args.iter().map(|arg| Text::new((*arg).into()).unwrap()).collect() }
     fn check(f: &Fixture, launcher: &LauncherRecord) -> Result<(), HelperPolicyError> {
         validate_launcher(ARCH, &f.parent, &parent_profile(), launcher, &f.runtimes)
     }
@@ -464,5 +502,59 @@ mod tests {
         assert_eq!(check(&f, &launcher(vec![binding(2, HelperSlot::Foreground)])), Err(HelperPolicyError::RuntimeMissing));
         // A parent cannot bind itself.
         assert_eq!(check(&f, &launcher(vec![binding(1, HelperSlot::Foreground)])), Err(HelperPolicyError::RuntimeMissing));
+    }
+    /// HX6 security fix round (findings 1, 2, 5): the recording's browser
+    /// files come only from its signed fixed argv; a malformed one is refused;
+    /// only the recording may hold the nested-sandbox exception; the files
+    /// count against the descriptor budget.
+    #[test]
+    fn hx6fix_recording_browser_files_and_nested_sandbox_publication() {
+        let f = fixture(egress());
+        let recording = &f.runtimes[2];
+        let files = recording_files(recording).unwrap();
+        assert_eq!(files, vec![("node", Sha256Digest([0xaa; 32])), ("playwright.cjs", Sha256Digest([0xbb; 32])),
+            ("chromium", Sha256Digest([0xcc; 32]))]);
+        assert_eq!(recording_files(&f.runtimes[1]), None, "not the recording runtime");
+        assert_eq!(executable_fds(recording), 4);
+        assert_eq!(launcher_fd_cost(&[recording]), 1 + 1 + 4 + 4);
+        let digest = "d".repeat(64);
+        let d = digest.as_str();
+        for args in [vec!["--browser-record-fd-v1", d, d], vec!["--other", d, d, d],
+            vec!["--browser-record-fd-v1", d, d, d, d], vec!["--browser-record-fd-v1", d, d, "D"], vec![]] {
+            let mut bad = fixture(egress());
+            bad.runtimes[2].fixed_args = recording_args(&args);
+            assert_eq!(recording_files(&bad.runtimes[2]), None, "{args:?}");
+            assert_eq!(check(&bad, &launcher(vec![binding(3, HelperSlot::Recording)])), Err(HelperPolicyError::Invalid), "{args:?}");
+        }
+        let mut upper = fixture(egress());
+        let upper_digest = "A".repeat(64);
+        upper.runtimes[2].fixed_args = recording_args(&["--browser-record-fd-v1", upper_digest.as_str(), d, d]);
+        assert_eq!(recording_files(&upper.runtimes[2]), None);
+        // NestedSandbox (+ the subreaper prctl option) for the recording only.
+        let sandbox = vec![SelfOnlyCall::NestedSandbox,
+            SelfOnlyCall::Prctl { options: vec![duduclaw_run::helper_policy::PR_SET_CHILD_SUBREAPER] }];
+        let mut record = binding(3, HelperSlot::Recording); record.self_only = sandbox.clone();
+        check(&f, &launcher(vec![record])).unwrap();
+        let mut foreground = binding(2, HelperSlot::Foreground); foreground.self_only = vec![SelfOnlyCall::NestedSandbox];
+        assert_eq!(check(&f, &launcher(vec![foreground])), Err(HelperPolicyError::NotNarrowing));
+    }
+    /// HX6 security round 3 (N3): PR_SET/GET_CHILD_SUBREAPER sit in the
+    /// global `PRCTL_SELF_ONLY`, but publication grants them to the recording
+    /// binding only; a slot-neutral prctl option stays publishable anywhere.
+    #[test]
+    fn hx6r3_subreaper_prctl_refused_for_non_recording_bindings() {
+        use duduclaw_run::helper_policy::{PR_GET_CHILD_SUBREAPER, PR_SET_CHILD_SUBREAPER, PR_SET_NO_NEW_PRIVS};
+        let f = fixture(egress());
+        let mut neutral = binding(2, HelperSlot::Foreground);
+        neutral.self_only = vec![SelfOnlyCall::Prctl { options: vec![PR_SET_NO_NEW_PRIVS] }];
+        check(&f, &launcher(vec![neutral])).unwrap();
+        for options in [vec![PR_SET_CHILD_SUBREAPER], vec![PR_GET_CHILD_SUBREAPER], vec![PR_SET_NO_NEW_PRIVS, PR_SET_CHILD_SUBREAPER]] {
+            let mut foreground = binding(2, HelperSlot::Foreground);
+            foreground.self_only = vec![SelfOnlyCall::Prctl { options: options.clone() }];
+            assert_eq!(check(&f, &launcher(vec![foreground])), Err(HelperPolicyError::NotNarrowing), "{options:?}");
+            let mut record = binding(3, HelperSlot::Recording);
+            record.self_only = vec![SelfOnlyCall::NestedSandbox, SelfOnlyCall::Prctl { options: options.clone() }];
+            check(&f, &launcher(vec![record])).unwrap();
+        }
     }
 }

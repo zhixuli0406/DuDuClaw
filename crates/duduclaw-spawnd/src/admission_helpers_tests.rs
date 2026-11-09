@@ -23,6 +23,8 @@ struct Fake {
     not_ready: Option<ErrorCode>,
     /// The worker mailbox is full: every `helper_signal` is refused (finding 6).
     refuse_signals: bool,
+    /// HX6 finding 4: this host's recording probe has not passed.
+    recording_closed: bool,
 }
 const CLEAN: CleanupReadback = CleanupReadback { unit_inactive: true, cgroup_empty: true, employee_uid_absent: true };
 impl Host for Fake {
@@ -46,6 +48,11 @@ impl Host for Fake {
     fn detect_intruders(&mut self) -> Result<Vec<EmployeeId>> { Ok(vec![]) }
     fn forget(&mut self, _: RunHandle) -> Result<()> { Ok(()) }
     fn helpers_ready(&mut self) -> Result<()> { self.not_ready.map_or(Ok(()), Err) }
+    fn recording_ready(&mut self) -> bool { !self.recording_closed }
+    /// The HX4 set (the recording bit is the coordinator's separate gate here).
+    fn features(&mut self) -> SpawndFeatures {
+        if self.helpers_ready().is_err() { SpawndFeatures::WORK_BROKER } else { SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_CALLS) }
+    }
     fn helper_start(&mut self, ticket: Ticket, job: HelperStart<Input>) -> Result<()> {
         if let Some(code) = self.fail_start { return Err(code); }
         self.started.push(job.call);
@@ -469,5 +476,22 @@ fn hxfix_dropped_cancel_is_retried_until_delivered() {
     c.host.refuse_signals = false;
     c.tick(112).unwrap();
     assert!(!c.host.signals.iter().any(|(_, call, _)| *call == rec), "nothing left to signal");
+    assert!(c.host.killed.is_empty() && c.host.revoked.is_empty(), "never the run");
+}
+
+#[test]
+fn hx6fix_recording_slot_refused_until_host_probe_passed() {
+    // Finding 4: root's own gate, whatever the gateway believes about the bit.
+    let mut c = running(Limits::default());
+    c.host.recording_closed = true;
+    assert_eq!(submit(&mut c, HelperSlot::Recording, 1, 102).unwrap_err(), ErrorCode::HelperRecordingUnsupported);
+    assert!(c.host.started.is_empty() && c.host.starts.is_empty(), "nothing queued or started");
+    assert_eq!(c.helper_held(), (0, 0), "no input budget held");
+    // The foreground slot is unaffected, and the refusal does not close the run's helpers.
+    let fg = started(&mut c, HelperSlot::Foreground, 2, 102);
+    end(&mut c, fg, HelperOutcome::Exited(0), 103);
+    c.host.recording_closed = false;
+    let rec = started(&mut c, HelperSlot::Recording, 3, 104);
+    assert_eq!(rec, id(3));
     assert!(c.host.killed.is_empty() && c.host.revoked.is_empty(), "never the run");
 }

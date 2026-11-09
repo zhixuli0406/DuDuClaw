@@ -124,6 +124,7 @@ fn personal_and_shared_credential_rules_and_argument_authority() {
         arguments[key] = "other".into();
         assert!(crate::check_arguments(&arguments).is_err());
     }
+    assert_eq!(crate::tool_policy::policy("codrive_run").unwrap().route, crate::tool_policy::Route::Execution);
     // HX5: these three are in-run helpers, not child-run execution tools.
     for tool in ["code_map", "office_script", "execute_program"] {
         assert_eq!(crate::tool_policy::policy(tool).unwrap().route, crate::tool_policy::Route::InRunHelper);

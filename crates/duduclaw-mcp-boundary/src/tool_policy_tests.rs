@@ -275,9 +275,9 @@ fn high_risk_tools_are_never_classified_as_plain_gateway_services() {
     for name in ["codrive_run", "fork_run", "spawn_agent", "os_open"] {
         assert_eq!(policy(name).unwrap().route, Route::Execution);
     }
-    // HX5: in-run helpers run inside the employee's run, never as plain gateway services.
-    for name in ["code_map", "execute_program", "office_script"] {
-        assert_eq!(policy(name).unwrap().route, Route::InRunHelper, "{name}");
+    // HX5/HX6: in-run helpers (foreground and recording slot), never Service.
+    for name in ["code_map", "execute_program", "office_script", "browser_record_start", "browser_record_stop"] {
+        assert_eq!(policy(name).unwrap().route, Route::InRunHelper);
     }
     for name in ["transcribe_audio", "model_load", "llamafile_start"] {
         assert_eq!(policy(name).unwrap().route, Route::Worker);
@@ -585,6 +585,101 @@ fn public_origins_wildcard_still_refuses_ip_literal_userinfo_and_private_names()
         "http://example.org/", "https://example.org:444/", " https://example.org/", "https://example.org/\n"] {
         assert!(authorize(&ctx, "web_fetch_cached", &json!({"url":url}), &UnusedResolver).is_err(), "{url:?}");
     }
+}
+
+// ── HX6 recording URL authority (D-H2 PublicOrigins, not UrlOrigin) ────────
+fn work() -> ResourceGrant { ResourceGrant::Workspace { handle: text("employee-work") } }
+fn url_origin_grant(origin: &str) -> ResourceGrant { ResourceGrant::UrlOrigin { origin: text(origin) } }
+fn record_start(url: &str) -> Value { json!({"url":url,"headless":true}) }
+
+#[test]
+fn hx6url_recording_start_is_authorized_by_public_origins_without_url_origin() {
+    let grant = public_origins(&["*"]);
+    let resolved = vec![employee(), work()];
+    let ctx = context("browser_record_start", vec![scope(), employee(), work(), grant.clone()]);
+    ctx.record().canonical_bytes().unwrap();
+    assert!(eligible(&ctx, "browser_record_start"));
+    for url in ["https://news.example.org/a?b=1", "https://EXAMPLE.com/x#y"] {
+        let call = authorize(&ctx, "browser_record_start", &record_start(url), &Fixed(resolved.clone()))
+            .unwrap_or_else(|error| panic!("{url}: {error:?}"));
+        // The URL authority is exactly the record's own signed scope + grant.
+        assert_eq!(call.resources(), &[employee(), work(), scope(), grant.clone()], "{url}");
+        assert!(!call.resources().iter().any(|r| ResourceKind::of(r) == ResourceKind::UrlOrigin));
+    }
+    // The resolver can neither supply nor substitute the URL authority.
+    for extra in [url_origin_grant("https://news.example.org"), grant.clone(), scope(), public_origins(&["https://news.example.org"])] {
+        let mut widened = resolved.clone();
+        widened.push(extra.clone());
+        assert!(authorize(&ctx, "browser_record_start", &record_start("https://news.example.org/"), &Fixed(widened)).is_err(), "{extra:?}");
+    }
+    // N1: a narrow grant bounds only the start URL, so it is refused for a
+    // recording, even for its own origin; the same grant still serves web fetches.
+    for narrow in [public_origins(&["https://news.example.org"]),
+        public_origins(&["https://news.example.org", "https://other.example.net"])] {
+        let ctx = context("browser_record_start", vec![scope(), employee(), work(), narrow.clone()]);
+        for url in ["https://news.example.org/p", "https://other.example.net/", "https://sub.news.example.org/"] {
+            assert!(authorize(&ctx, "browser_record_start", &record_start(url), &Fixed(resolved.clone())).is_err(), "{url}");
+        }
+        let fetch = context("web_fetch_cached", vec![scope(), narrow]);
+        assert!(authorize(&fetch, "web_fetch_cached", &json!({"url":"https://news.example.org/p"}), &UnusedResolver).is_ok());
+    }
+    // The stop names no URL and needs no public-web grant.
+    let ctx = context("browser_record_stop", vec![employee(), work()]);
+    assert!(authorize(&ctx, "browser_record_stop", &json!({"id":"0".repeat(32)}), &Fixed(resolved)).is_ok());
+}
+
+#[test]
+fn hx6url_recording_start_refused_without_public_origins() {
+    // `[isolation] public_web` off ⇒ the selector signs no PublicOrigins.
+    let resolved = vec![employee(), work()];
+    let url = record_start("https://news.example.org/");
+    for resources in [vec![scope(), employee(), work()], vec![employee(), work()]] {
+        let ctx = context("browser_record_start", resources.clone());
+        assert!(authorize(&ctx, "browser_record_start", &url, &Fixed(resolved.clone())).is_err(), "{resources:?}");
+    }
+    // A signed UrlOrigin is no longer recording authority, even an exact one.
+    let exact = url_origin_grant("https://news.example.org");
+    let ctx = context("browser_record_start", vec![employee(), work(), exact.clone()]);
+    for resolved in [resolved.clone(), vec![employee(), work(), exact]] {
+        assert!(authorize(&ctx, "browser_record_start", &url, &Fixed(resolved)).is_err());
+    }
+}
+
+#[test]
+fn hx6url_recording_start_refuses_private_loopback_and_credentialed_urls() {
+    let ctx = context("browser_record_start", vec![scope(), employee(), work(), public_origins(&["*"])]);
+    let resolved = Fixed(vec![employee(), work()]);
+    for url in ["https://127.0.0.1/", "https://10.0.0.8/", "https://192.168.1.1/", "https://169.254.169.254/latest",
+        "https://[::1]/", "https://[fd00::1]/", "https://0x7f.1/", "https://2130706433/", "https://localhost/",
+        "https://printer.local/", "https://metadata.google.internal/", "https://user@news.example.org/",
+        "https://user:pw@news.example.org/", "https://:pw@news.example.org/", "https://news.example.org:8443/",
+        "http://news.example.org/", "file:///etc/passwd", "javascript:alert(1)", "", " https://news.example.org/",
+        "https://news.example.org/\n"] {
+        assert!(authorize(&ctx, "browser_record_start", &record_start(url), &resolved).is_err(), "{url:?}");
+    }
+    // A URL smuggled through `url_or_path` is held to the same authority.
+    assert!(authorize(&ctx, "browser_record_start", &json!({"url_or_path":"https://127.0.0.1/"}), &resolved).is_err());
+}
+
+#[test]
+fn hx6url_other_tools_keep_url_origin_semantics() {
+    // web_extract (non-scope record) still needs the exact UrlOrigin.
+    let exact = url_origin_grant("https://example.com");
+    let ctx = context("web_extract", vec![employee(), exact.clone()]);
+    assert!(authorize(&ctx, "web_extract", &json!({"url":"https://example.com/a"}), &Fixed(vec![employee(), exact.clone()])).is_ok());
+    assert!(authorize(&ctx, "web_extract", &json!({"url":"https://example.com/a"}), &Fixed(vec![employee()])).is_err());
+    assert!(authorize(&ctx, "web_extract", &json!({"url":"https://other.example.net/"}), &Fixed(vec![employee(), exact.clone()])).is_err());
+    // computer_navigate: the URL still requires its exact signed origin; a
+    // PublicOrigins-shaped resolver answer is not accepted in its place.
+    let ctx = context("computer_navigate", vec![employee(), work(), exact.clone()]);
+    let args = json!({"url":"https://example.com/login"});
+    assert!(authorize(&ctx, "computer_navigate", &args, &Fixed(vec![employee(), work(), exact])).is_ok());
+    assert!(authorize(&ctx, "computer_navigate", &args, &Fixed(vec![employee(), work()])).is_err());
+    let required = required_for_call(policy("computer_navigate").unwrap(), &args).unwrap();
+    assert!(required.contains(&ResourceKind::UrlOrigin) && !required.contains(&ResourceKind::PublicOrigins));
+    let required = required_for_call(policy("browser_record_start").unwrap(), &record_start("https://a.example.org/")).unwrap();
+    assert!(required.contains(&ResourceKind::PublicOrigins) && required.contains(&ResourceKind::EmployeeScope)
+        && !required.contains(&ResourceKind::UrlOrigin));
 }
 
 #[test]
