@@ -218,11 +218,11 @@ fn f6fb_adopted_replay_bound_to_allocation() {
 fn f6fb_no_compensation_after_commit_once_tree_changed() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
-    let (_, item, _) = adopted(&f, &ax, None);
+    let fx = ax();
+    let (_, item, _) = adopted(&f, &fx, None);
     let soul = f.home().join("agents").join(LABEL).join("SOUL.md");
     std::fs::write(&soul, "written by the new employee").unwrap();
-    assert_eq!(compensate_item(f.home(), &env(&ax), &item).err(), Some(AdoptError::Inconsistent));
+    assert_eq!(compensate_item(f.home(), &env(&fx), &item).err(), Some(AdoptError::Inconsistent));
     assert_eq!(std::fs::read_to_string(&soul).unwrap(), "written by the new employee");
     assert!(!quarantined(f.home(), "SOUL.md"));
     assert_eq!(seal_of(f.home()), "adopted");

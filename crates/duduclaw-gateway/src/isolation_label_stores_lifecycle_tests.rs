@@ -75,7 +75,7 @@ fn tombstone_stops_running_label_bot() {
     // re-runs the gate (protected mode) and stops it.
     let late = runtime.spawn(std::future::pending::<()>());
     stores::TEST_PROTECTED.with(|cell| cell.set(Some(true)));
-    let admitted = runtime.block_on(bots::admit(home, "discord", LABEL, late.abort_handle()));
+    let admitted = runtime.block_on(bots::admit(home, "discord", LABEL, late.abort_handle(), bots::BotScope::new()));
     stores::TEST_PROTECTED.with(|cell| cell.set(None));
     assert!(!admitted);
     assert!(runtime.block_on(late).unwrap_err().is_cancelled());
