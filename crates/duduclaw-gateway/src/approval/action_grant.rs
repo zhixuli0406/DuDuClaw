@@ -281,6 +281,24 @@ pub async fn verify_and_consume(
     if !rec.expires_at().is_some_and(|expiry| chrono::Utc::now() < expiry) {
         return Err(GrantRefusal::NotApproved);
     }
+    // SR5 round 3 N1/N2: the card's employee incarnation, inside this
+    // IMMEDIATE transaction (same rule as `consume_approved`). A card of
+    // another incarnation, or a NULL card of a protected employee, is
+    // invalidated and refused.
+    let stored: Option<Option<i64>> = rusqlite::OptionalExtension::optional(tx.query_row(
+        "SELECT employee_incarnation FROM approvals WHERE id=?1 AND status='approved'",
+        rusqlite::params![id.as_str()], |row| row.get(0),
+    )).map_err(|e| GrantRefusal::Store(e.to_string()))?;
+    let Some(stored) = stored else { return Err(GrantRefusal::AlreadyUsed) };
+    let home = broker.store.db_path.as_deref().and_then(std::path::Path::parent);
+    if let Err((reason, refusal)) = super::store::card_consumable(home, &rec.agent_id, stored) {
+        tx.execute(
+            "UPDATE approvals SET status='invalidated', invalidated_reason=?1 WHERE id=?2 AND status='approved'",
+            rusqlite::params![reason, id.as_str()],
+        ).map_err(|e| GrantRefusal::Store(e.to_string()))?;
+        super::commit_live_write(tx).map_err(GrantRefusal::Store)?;
+        return Err(GrantRefusal::Store(refusal));
+    }
     // Bind consumption to the row just verified, including its deadline.
     // Check the deadline in the UPDATE too, after any SQLite lock wait.
     let consumed = tx.execute(

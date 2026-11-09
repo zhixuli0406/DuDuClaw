@@ -320,6 +320,51 @@ fn f1_rebuild_on_route_revoke_and_relink() {
     assert!(stack.cached(AGENT, EMPLOYEE).is_none());
 }
 
+/// SR4 item 7: a Shared employee's build follows its Google tenant source
+/// (key re-import, tenant settings edit) without a restart; unchanged ⇒ reused.
+#[test]
+fn sr4_rebuild_on_tenant_source_change() {
+    let home = home();
+    let sealed = crate::google_identity::delegation_key::path(home.path());
+    std::fs::create_dir_all(sealed.parent().unwrap()).unwrap();
+    let record = |body: &str| format!(r#"{{"version":1,"client_email":"dwd@project.iam.gserviceaccount.com","imported_at":"2026-11-08T00:00:00Z","sealed":"pk:v1:kid-1:{body}"}}"#);
+    std::fs::write(&sealed, record("body")).unwrap();
+    std::fs::write(home.path().join("agents").join(AGENT).join("agent.toml"),
+        "[capabilities]\ndb_sources=['demo']\n\n[google]\nidentity = \"delegate:alice@customer.com\"\n").unwrap();
+    let config = |scopes: &str| std::fs::write(home.path().join("config.toml"), format!(
+        "{ODOO_CONFIG}\n[integrations.google_identity]\nallowed_subject_domains = [\"customer.com\"]\ntenant_scopes = [{scopes}]\n"))
+        .unwrap();
+    config("\"https://www.googleapis.com/auth/gmail.readonly\"");
+    let first_key = tenant_source_key(home.path(), AGENT, &company());
+    assert_eq!(first_key.len(), 64, "a readable tenant source keys by its digest");
+    assert_eq!(tenant_source_key(home.path(), AGENT, &alice()), "", "Personal employees never read one");
+
+    let catalog = memory_catalog();
+    let reports = Arc::new(Reports::default());
+    let stack = stack(home.path(), &catalog, bindings(), Lifecycle::with(EMPLOYEE, company()), &reports);
+    let counting = Arc::new(Counting { inner: factory(home.path(), &catalog).factory, builds: AtomicUsize::new(0) });
+    stack.install_factory(counting.clone()).unwrap();
+    let builds = || counting.builds.load(Ordering::SeqCst);
+    stack.current(AGENT, EMPLOYEE).unwrap();
+    stack.current(AGENT, EMPLOYEE).unwrap();
+    assert_eq!(builds(), 1, "an unchanged tenant source reuses the build");
+    // An Admin edits tenant_scopes: a new build (and so a new Google bridge).
+    config("\"https://www.googleapis.com/auth/gmail.readonly\", \"https://www.googleapis.com/auth/drive.readonly\"");
+    stack.current(AGENT, EMPLOYEE).unwrap();
+    assert_eq!(builds(), 2);
+    stack.current(AGENT, EMPLOYEE).unwrap();
+    assert_eq!(builds(), 2);
+    // The delegation key is re-imported: rebuilt again.
+    std::fs::write(&sealed, record("reimported")).unwrap();
+    stack.current(AGENT, EMPLOYEE).unwrap();
+    assert_eq!(builds(), 3);
+    // Damaged material is a state too; restoring it rebuilds once more.
+    std::fs::write(&sealed, "damaged").unwrap();
+    assert_eq!(tenant_source_key(home.path(), AGENT, &company()), "unavailable");
+    let _ = stack.current(AGENT, EMPLOYEE);
+    assert_eq!(builds(), 4);
+}
+
 /// Live credential source standing in for the home OAuth provider.
 struct Source { account: AccountId, provider: &'static str, calls: AtomicUsize,
     revoke_during: Option<Arc<ConnectorCatalog>> }

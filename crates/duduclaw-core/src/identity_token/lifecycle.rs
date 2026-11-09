@@ -108,6 +108,40 @@ pub fn protected_employee(home: &Path, label: &str) -> Result<ProtectedEmployee,
     read_row(&connection, label)
 }
 
+/// SR5 round 3 N3: whether the confirmed employee index of `home` holds any
+/// row (live or tombstoned) — the host-owned durable fact behind
+/// [`crate::protected_mode`]. No directory / no store / no table: `Ok(false)`.
+/// A store that exists but cannot be read safely (foreign-owned for this
+/// uid, symlinked, unreadable, …): `Err` (the latch treats it as protected).
+pub fn any_confirmed_employee(home: &Path) -> Result<bool, LifecycleUnavailable> {
+    let directory = home.join(APPLY_DB_DIR);
+    match std::fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(LifecycleUnavailable),
+        Ok(metadata) if !metadata.is_dir() || is_reparse_point(&metadata) => return Err(LifecycleUnavailable),
+        Ok(_) => {}
+    }
+    let path = directory.join(APPLY_DB_FILE);
+    let before = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(LifecycleUnavailable),
+        Ok(metadata) => metadata,
+    };
+    check_store(&before)?;
+    let connection = open_read_only(&path)?;
+    let after = std::fs::symlink_metadata(&path).map_err(|_| LifecycleUnavailable)?;
+    check_store(&after)?;
+    same_file(&before, &after)?;
+    let table: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
+        [], |r| r.get(0)).map_err(|_| LifecycleUnavailable)?;
+    if !table {
+        return Ok(false);
+    }
+    connection.query_row("SELECT EXISTS(SELECT 1 FROM confirmed_employees)", [], |r| r.get(0))
+        .map_err(|_| LifecycleUnavailable)
+}
+
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {

@@ -26,6 +26,10 @@ zbus = { version = "5.19.0", default-features = false, features = ["blocking-api
 [lints]
 workspace = true
 
+[dev-dependencies]
+# SR5 round 3 follow-up R3-1: tests pin the /etc marker path to the latch's.
+duduclaw-core.workspace = true
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 duduclaw-execution.workspace = true
 duduclaw-mcp-boundary = { path = "../duduclaw-mcp-boundary", features = ["execution-integration"] }

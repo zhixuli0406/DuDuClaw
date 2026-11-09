@@ -1,16 +1,16 @@
 //! Gateway-only Google account bridge. The existing sealed Google host owns
 //! selection, refresh, effect leases and output scrubbing; no bearer is exposed
 //! through this adapter, the capability record, environment or run filesystem.
-use std::{collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::{Arc, Mutex}};
+use std::{collections::{BTreeMap, BTreeSet}, future::Future, path::PathBuf, pin::Pin, sync::{Arc, Mutex}};
 use duduclaw_auth::UserDb;
 use duduclaw_core::google_identity::{self as gi, CredentialRef, Effective};
 use duduclaw_isolation::{capability::{EmployeeBinding, Principal}, ids::EmployeeId};
 use duduclaw_knowledge::requester::RequesterIdentity;
 use duduclaw_mcp_boundary::{RequestContext, VerificationError, tool_policy::AuthorizedToolCall};
 use serde_json::{Value, json};
-use super::{effect_authority::{Clock, SelectionStore}, home_source,
+use super::{effect_authority::{Clock, SelectionStore, TenantPin}, home_source,
     isolation_routes::{GoogleAccountRoutes, GoogleRoute, GoogleRoutesError},
-    tenant_source::{self, Actor, SubjectAccount, TenantSource, TenantSourceKind}};
+    tenant_source::{self, Actor, SubjectAccount, SubjectState, TenantSource, TenantSourceKind}};
 use crate::{google_personal::authority::PersonalSelection,
     isolation_egress::{IngressRequester, RunTurnResolver},
     isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog, ConnectorKind, LiveConnectorSelectionPolicy,
@@ -54,7 +54,11 @@ pub struct GoogleIsolationBridge {
     // Host-owned run association (the same resolver the isolation runtime
     // uses for per-run metadata). Never employee arguments or process env.
     turns: Arc<dyn RunTurnResolver>,
+    // SR4 item 2(iv): refused subject states already audited by this build.
+    noticed: Mutex<BTreeSet<String>>,
 }
+/// Bound on [`GoogleIsolationBridge::noticed`] (one build per source digest).
+const MAX_NOTICED: usize = 64;
 impl GoogleIsolationBridge {
     pub fn new(home: PathBuf, agent: String, employee: EmployeeId, users: Option<Arc<UserDb>>,
         reference: CredentialRef, catalog: Arc<ConnectorCatalog>, turns: Arc<dyn RunTurnResolver>)
@@ -66,7 +70,8 @@ impl GoogleIsolationBridge {
         }
         let home = home.canonicalize().map_err(|_| VerificationError::Unavailable)?;
         Ok(Self { home, agent, employee, users, reference, catalog,
-            sources: Mutex::new(BTreeMap::new()), selections: SelectionStore::default(), turns })
+            sources: Mutex::new(BTreeMap::new()), selections: SelectionStore::default(), turns,
+            noticed: Mutex::new(BTreeSet::new()) })
     }
 
     /// Build the requester from the capability principal plus the live run
@@ -157,7 +162,11 @@ impl GoogleIsolationBridge {
         // Without a readable users.db nobody can prove the subject is (or is
         // not) a person: refuse rather than guess.
         let db = people.user_db().ok_or(VerificationError::Unavailable)?;
-        let accounts = tenant_source::subject_accounts(db, source.subject())?;
+        // SR4 item 1: carries this employee's Admin attestation of the subject.
+        // SR4 round 3 (N2): only an attestation of the employee id and
+        // incarnation these routes were read (and pinned) for counts.
+        let accounts = tenant_source::subject_accounts(db, &self.agent, Some(routes.pinned), source.subject())?;
+        self.notice_refused_subject(source, &accounts);
         let route = Self::tenant_route(routes, &context.record().employee_binding, requester, source, &accounts, tool)?;
         // Use-time recheck: the source (config + key material) and the catalog
         // row must be exactly what was decided on.
@@ -168,7 +177,31 @@ impl GoogleIsolationBridge {
         Ok((route, source.digest()))
     }
 
+    /// SR4 items 1 / 2(iv): a subject refused because a staff account claims
+    /// a designated mailbox, or because no Admin attested the delegate person,
+    /// is audited for Admins once per build, source and state (the call stays
+    /// refused; the dashboard shows the same state, `subject_notice`).
+    fn notice_refused_subject(&self, source: &TenantSource, accounts: &[SubjectAccount]) {
+        let state = tenant_source::subject_state(source, accounts);
+        if !matches!(state, SubjectState::MailboxHeldByAccount | SubjectState::AttestationRequired) { return; }
+        let key = format!("{}:{}", state.code(), source.digest());
+        {
+            let Ok(mut noticed) = self.noticed.lock() else { return };
+            if noticed.len() >= MAX_NOTICED || !noticed.insert(key) { return; }
+        }
+        crate::security_autopilot::audit_and_emit(&self.home, &duduclaw_security::audit::AuditEvent::new(
+            "google_tenant_subject_refused", self.agent.as_str(), duduclaw_security::audit::Severity::Warning,
+            json!({ "agent_id": self.agent, "state": state.code(), "subject": source.subject() })));
+    }
+
     fn source(&self, context: &RequestContext, tool: &str) -> Result<(GoogleRoute, String), VerificationError> {
+        self.decide(context, tool).map(|(route, digest, _)| (route, digest))
+    }
+
+    /// The route, its source proof and (on the tenant lane) the tenant source
+    /// decided on — the proof the host lane is bound to (SR4 item 4).
+    fn decide(&self, context: &RequestContext, tool: &str)
+        -> Result<(GoogleRoute, String, Option<TenantSource>), VerificationError> {
         // Resolve first: a failed requester lookup refuses before any source is read.
         let requester = self.requester(context)?;
         // Unreadable config/key material refuses before any route is read.
@@ -197,20 +230,24 @@ impl GoogleIsolationBridge {
                 let route = Self::personal_route(&routes, &requester, original.user_id())?;
                 route.recheck(&self.catalog)?;
                 let digest = serde_json::to_value(&original).map_err(|_| VerificationError::Invalid)?;
-                return Ok((route, gi::google_arguments_digest(&digest)));
+                return Ok((route, gi::google_arguments_digest(&digest), None));
             }
             // v1.81 E4: domain-wide delegation is a tenant source. The subject
             // is the admin-written selector, never an argument.
             Effective::Delegate { email } => {
                 let source = tenant.as_ref().filter(|source| source.kind() == TenantSourceKind::Delegate
                     && source.subject() == email.as_str()).ok_or(VerificationError::BindingMismatch)?;
-                return self.tenant_selection(context, &routes, &requester, source, people.as_ref(), tool);
+                let (route, digest) = self.tenant_selection(context, &routes, &requester, source, people.as_ref(), tool)?;
+                return Ok((route, digest, Some(source.clone())));
             }
             // A configured service account replaces home OAuth on the home
             // path; in protected mode it is a tenant source, never SharedHome.
             Effective::Home => match tenant.as_ref() {
-                Some(source) if source.kind() == TenantSourceKind::ServiceAccount =>
-                    return self.tenant_selection(context, &routes, &requester, source, people.as_ref(), tool),
+                Some(source) if source.kind() == TenantSourceKind::ServiceAccount => {
+                    let (route, digest) =
+                        self.tenant_selection(context, &routes, &requester, source, people.as_ref(), tool)?;
+                    return Ok((route, digest, Some(source.clone())));
+                }
                 Some(_) => return Err(VerificationError::BindingMismatch),
                 None => routes.home.ok_or(GoogleRoutesError::SetupRequired)?,
             },
@@ -221,7 +258,7 @@ impl GoogleIsolationBridge {
             .map_err(|_| VerificationError::Unavailable)?;
         let digest = source.binding_digest().map_err(|_| VerificationError::Unavailable)?;
         route.recheck(&self.catalog)?;
-        Ok((route, gi::google_arguments_digest(&json!({"source":digest}))))
+        Ok((route, gi::google_arguments_digest(&json!({"source":digest})), None))
     }
 
     fn pin_source(&self, tool: &str, route: GoogleRoute, digest: String)
@@ -240,11 +277,16 @@ impl GoogleIsolationBridge {
         let tool = call.name();
         let args = call.arguments();
         Self::refuse_identity_arguments(args)?;
-        let (route, _) = self.source(call.context(), tool)?;
+        let (route, digest, tenant) = self.decide(call.context(), tool)?;
         if route.product.account() != selected.account() || route.generation() != selected.generation()
             || route.kind() != selected.kind() {
             return Err(VerificationError::BindingMismatch);
         }
+        // SR4 item 4: the call runs on exactly the source proof pinned at
+        // selection, and the host lane is bound to that pinned tenant source
+        // (it refuses a config it re-reads that differs from this decision).
+        self.pin_source(tool, route.clone(), digest)?;
+        let tenant = tenant.as_ref().map(TenantPin::of);
         let stamp = self.selections.select_dedicated_async(&self.home, self.users.as_ref(), &self.agent,
             &self.reference, tool, args, Clock::now()).await.map_err(|_| VerificationError::Unavailable)?;
         selected.recheck()?;
@@ -276,8 +318,8 @@ impl GoogleIsolationBridge {
             pending.execute_native(args.clone()).await.map_err(|_| VerificationError::Unavailable)
         } else {
             selected.recheck()?;
-            super::effect_authority::execute_immediate_native(&self.home, self.users.as_ref(), &self.agent,
-                &self.reference, tool, args.clone()).await.map_err(|_| VerificationError::Unavailable)
+            super::effect_authority::execute_immediate_native_pinned(&self.home, self.users.as_ref(), &self.agent,
+                &self.reference, tool, args.clone(), tenant).await.map_err(|_| VerificationError::Unavailable)
         }
     }
 }

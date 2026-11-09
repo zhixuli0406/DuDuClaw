@@ -26,6 +26,56 @@ use crate::isolation_connector_details::{CatalogAccountDetails, needs_details};
 
 const MAX_ASSOCIATIONS: usize = 4096;
 
+/// SR5 item 5: the epoch-local employee id → label associations.
+pub(super) type Associations = BTreeMap<EmployeeId, String>;
+
+/// Record `employee → agent`. The same pair is a no-op. A different label
+/// for the id, or a full map, first asks `dead` (outside the lock: it reads
+/// apply.db) which of the candidate associations are no longer live and
+/// drops those (only if unchanged meanwhile); then a still-live different
+/// label is `BindingMismatch` and a still-full map is `Unavailable`.
+pub(super) fn associate(map: &Mutex<Associations>, employee: EmployeeId, agent: &str, cap: usize,
+    dead: impl FnOnce(&[(EmployeeId, String)]) -> Vec<EmployeeId>) -> Result<(), VerificationError> {
+    let candidates: Vec<(EmployeeId, String)> = {
+        let mut employees = map.lock().map_err(|_| VerificationError::Unavailable)?;
+        match employees.get(&employee) {
+            Some(prior) if prior == agent => return Ok(()),
+            Some(prior) => vec![(employee, prior.clone())],
+            None if employees.len() < cap => {
+                employees.insert(employee, agent.to_owned());
+                return Ok(());
+            }
+            None => employees.iter().map(|(id, label)| (*id, label.clone())).collect(),
+        }
+    };
+    let gone = dead(&candidates);
+    let mut employees = map.lock().map_err(|_| VerificationError::Unavailable)?;
+    for (id, label) in candidates.iter().filter(|(id, _)| gone.contains(id)) {
+        if employees.get(id) == Some(label) { employees.remove(id); }
+    }
+    match employees.get(&employee) {
+        Some(prior) if prior == agent => Ok(()),
+        Some(_) => Err(VerificationError::BindingMismatch),
+        None if employees.len() < cap => {
+            employees.insert(employee, agent.to_owned());
+            Ok(())
+        }
+        None => Err(VerificationError::Unavailable),
+    }
+}
+
+/// The candidates whose label's confirmed row is not live for that id any
+/// more (disabled, another employee id, or gone). An unreadable index evicts
+/// nothing (fail closed: the caller then refuses).
+fn dead_associations(home: &Path, candidates: &[(EmployeeId, String)]) -> Vec<EmployeeId> {
+    const MAX_CONFIRMED: usize = 100_000;
+    let Ok(rows) = lifecycle::confirmed_principals(home, MAX_CONFIRMED) else { return Vec::new() };
+    candidates.iter()
+        .filter(|(id, label)| !rows.iter().any(|row| row.employee == *id && row.label == *label && !row.disabled))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Root allocator ReadBack used by the lifecycle read model (tests inject a fixture).
 type RootSource = dyn lifecycle::RootAllocation + Send + Sync;
 
@@ -395,7 +445,7 @@ pub struct GatewayAuthority {
     /// then Unavailable (never a fallback store).
     connectors: Option<ConnectorStores>,
     next_revision: AtomicU64,
-    employees: Mutex<BTreeMap<EmployeeId, String>>,
+    employees: Mutex<Associations>,
     runs: Mutex<BTreeMap<RunId, PreparedAuthority>>,
 }
 impl GatewayAuthority {
@@ -461,13 +511,12 @@ impl GatewayAuthority {
         // verification compares the complete original digest before returning it.
         let revision = self.next_revision.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |value| value.checked_add(1)).map_err(|_| VerificationError::Unavailable)?;
-        let mut employees = self.employees.lock().map_err(|_| VerificationError::Unavailable)?;
-        if let Some(prior) = employees.get(&lifecycle.employee) {
-            if prior != agent { return Err(VerificationError::BindingMismatch); }
-        } else {
-            if employees.len() >= MAX_ASSOCIATIONS { return Err(VerificationError::Unavailable); }
-            employees.insert(lifecycle.employee, agent.to_owned());
-        }
+        // SR5 item 5: an association whose label is no longer live for its
+        // employee id (tombstoned, adopted, relabelled) is dropped instead of
+        // pinning the id forever or filling the map up to a refusal.
+        let home = self.home.clone();
+        associate(&self.employees, lifecycle.employee, agent, MAX_ASSOCIATIONS,
+            |candidates| dead_associations(&home, candidates))?;
         grant.policy_revision = revision;
         Ok(PreparedAuthority { agent: agent.to_owned(), employee: lifecycle.employee,
             principal: grant.principal.clone(), binding: grant.binding.clone(), revision,
@@ -639,6 +688,64 @@ impl RunTurnResolver for GatewayAuthority {
 #[cfg(test)]
 #[path = "authority_personal_tests.rs"]
 mod personal_tests;
+
+/// SR5 item 5: the employee id → label associations.
+#[cfg(test)]
+mod sr5_association_tests {
+    use super::*;
+
+    fn id(byte: u8) -> EmployeeId { EmployeeId([byte; 16]) }
+
+    #[test]
+    fn sr5_non_live_associations_are_evicted_instead_of_refusing() {
+        let map = Mutex::new(Associations::new());
+        let never = |_: &[(EmployeeId, String)]| -> Vec<EmployeeId> { panic!("no liveness read needed") };
+        associate(&map, id(1), "alice", 2, never).unwrap();
+        associate(&map, id(1), "alice", 2, never).unwrap();
+        associate(&map, id(2), "bob", 2, never).unwrap();
+        // Full map, every entry still live: refused, nothing evicted.
+        assert_eq!(associate(&map, id(3), "carol", 2, |_| Vec::new()), Err(VerificationError::Unavailable));
+        assert_eq!(map.lock().unwrap().len(), 2);
+        // Full map, bob is no longer live: evicted, carol associated.
+        let mut asked = Vec::new();
+        associate(&map, id(3), "carol", 2, |candidates| {
+            asked = candidates.to_vec();
+            vec![id(2)]
+        }).unwrap();
+        assert_eq!(asked.len(), 2, "every association is a candidate at the cap");
+        let now = map.lock().unwrap().clone();
+        assert_eq!(now.get(&id(3)).map(String::as_str), Some("carol"));
+        assert!(!now.contains_key(&id(2)));
+        // A different label for a live association is still a mismatch.
+        assert_eq!(associate(&map, id(1), "alice-renamed", 2, |_| Vec::new()), Err(VerificationError::BindingMismatch));
+        // ... and replaced once the old label is no longer live for the id.
+        associate(&map, id(1), "alice-renamed", 2, |candidates| {
+            assert_eq!(candidates, &[(id(1), "alice".to_string())]);
+            vec![id(1)]
+        }).unwrap();
+        assert_eq!(map.lock().unwrap().get(&id(1)).map(String::as_str), Some("alice-renamed"));
+    }
+
+    #[test]
+    fn sr5_dead_associations_read_the_confirmed_index() {
+        // No apply.db: no confirmed row is live, every candidate is dead.
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let candidates = vec![(id(1), "alice".to_string())];
+        assert_eq!(dead_associations(home.path(), &candidates), vec![id(1)]);
+        // An unreadable index evicts nothing (fail closed).
+        let broken = crate::fs_safe::private_test_home().unwrap();
+        let dir = broken.path().join("migration-authority");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("apply.db"), b"not a database").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(dir.join("apply.db"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(dead_associations(broken.path(), &candidates).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {

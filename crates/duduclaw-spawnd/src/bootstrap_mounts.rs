@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, ffi::{CString, OsStr}, fs::{self, File}, io::{s
     path::{Component, Path, PathBuf}, time::{Duration, Instant}};
 use sha2::{Digest, Sha256};
 use duduclaw_isolation::{execution::RunHandle, ids::{EmployeeId, Sha256Digest}};
-use crate::{bootstrap::{BootstrapPlan, ExecutablePlan, minimal_etc}, storage::AttachedStorage};
+use crate::{bootstrap::{BootstrapPlan, ExecutablePlan, minimal_etc, ETC_MARKER_CONTENT, ETC_MARKER_DIR, ETC_MARKER_FILE},
+    storage::AttachedStorage};
 
 const OPEN_TREE_CLONE: u32 = 1;
 const AT_RECURSIVE: u32 = 0x8000;
@@ -16,6 +17,12 @@ const MOUNT_ATTR_NOEXEC: u64 = 8;
 const MOUNT_ATTR_NOSYMFOLLOW: u64 = 0x0020_0000;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PROJECTION_FILES: usize = 5;
+/// The /etc projection: the five identity files plus the R3-1 marker directory.
+const MAX_ETC_ENTRIES: usize = MAX_PROJECTION_FILES + 1;
+/// Attributes of the detached /etc clone handed to the runtime (R3-1: the
+/// marker is read-only and its path is never followed through a symlink).
+pub(crate) const ETC_MOUNT_ATTRIBUTES: u64 =
+    MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOSYMFOLLOW | MOUNT_ATTR_NOEXEC;
 #[repr(C)]
 struct MountAttr { attr_set: u64, attr_clr: u64, propagation: u64, userns_fd: u64 }
 #[repr(C)]
@@ -121,7 +128,7 @@ pub fn prepare(plan: &BootstrapPlan, storage: &AttachedStorage, anchors: &RootPu
     let projection = employee_projection(anchors, plan.employee)?;
     let home = super::native_home::prepare(persistent_home, work.as_fd(), projection.as_fd(), plan.uid, plan.gid)?;
     let etc_anchor = publish_projection(anchors, plan)?;
-    let etc = detached_clone(etc_anchor.as_fd(), readonly | MOUNT_ATTR_NOEXEC)?;
+    let etc = detached_clone(etc_anchor.as_fd(), ETC_MOUNT_ATTRIBUTES)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let (executable, script) = match &plan.executable {
         ExecutablePlan::Elf { entry, digest } => (open_verified(runtime.as_fd(), entry, *digest, true, deadline)?, None),
@@ -298,10 +305,33 @@ fn publish_projection(anchors: &RootPublicationAnchors, plan: &BootstrapPlan) ->
     if stat.uid() != 0 || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
     let content = minimal_etc(plan.uid, plan.gid).map_err(|_| invalid())?;
     for (name, value) in &content { publish_file(directory.as_fd(), name, value.as_bytes())?; }
-    verify_projection_entries(directory.as_fd(), &content)?;
+    // SR5 round 3 follow-up R3-1: `/etc/duduclaw/protected-mode` inside the
+    // runtime (see `bootstrap::ETC_MARKER_DIR`), root-owned and read-only.
+    publish_marker(directory.as_fd())?;
+    let mut top_level = content.clone();
+    top_level.insert(ETC_MARKER_DIR, String::new());
+    verify_projection_entries(directory.as_fd(), &top_level, MAX_ETC_ENTRIES)?;
     File::from(directory.try_clone()?).sync_all()?;
     File::from(parent).sync_all()?;
     Ok(directory)
+}
+/// R3-1: `<projection>/duduclaw/protected-mode` (root 0755 dir, root 0444
+/// single-link file with exactly [`ETC_MARKER_CONTENT`], nothing else).
+fn publish_marker(directory: BorrowedFd<'_>) -> io::Result<()> {
+    let name = CString::new(ETC_MARKER_DIR).map_err(|_| invalid())?;
+    let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) };
+    if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err(io::Error::last_os_error()); }
+    let marker_dir = owned(unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    if metadata(&marker_dir)?.uid() != 0 { return Err(invalid()); }
+    // The unit's UMask narrows mkdirat; the runtime uid must be able to traverse.
+    if result == 0 && unsafe { libc::fchmod(marker_dir.as_raw_fd(), 0o755) } != 0 { return Err(io::Error::last_os_error()); }
+    let stat = metadata(&marker_dir)?;
+    if stat.uid() != 0 || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
+    publish_file(marker_dir.as_fd(), ETC_MARKER_FILE, ETC_MARKER_CONTENT.as_bytes())?;
+    verify_projection_entries(marker_dir.as_fd(),
+        &BTreeMap::from([(ETC_MARKER_FILE, ETC_MARKER_CONTENT.to_owned())]), 1)?;
+    File::from(marker_dir).sync_all()
 }
 fn publish_file(directory: BorrowedFd<'_>, name: &str, value: &[u8]) -> io::Result<()> {
     use std::io::Write;
@@ -321,12 +351,12 @@ fn publish_file(directory: BorrowedFd<'_>, name: &str, value: &[u8]) -> io::Resu
     if actual != value { return Err(invalid()); }
     Ok(())
 }
-fn verify_projection_entries(directory: BorrowedFd<'_>, expected: &BTreeMap<&str, String>) -> io::Result<()> {
+fn verify_projection_entries(directory: BorrowedFd<'_>, expected: &BTreeMap<&str, String>, limit: usize) -> io::Result<()> {
     // /proc/self/fd is used only for this owned root dirfd, never caller paths.
     let mut count = 0usize;
     for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
         let entry = entry?; count += 1;
-        if count > MAX_PROJECTION_FILES || !entry.file_name().to_str().is_some_and(|name| expected.contains_key(name)) { return Err(invalid()); }
+        if count > limit || !entry.file_name().to_str().is_some_and(|name| expected.contains_key(name)) { return Err(invalid()); }
     }
     if count != expected.len() { return Err(invalid()); }
     Ok(())
@@ -343,7 +373,7 @@ pub(crate) fn verify_mcp_projection(mounts: &PreparedMounts,
         if expected.insert(name, entry.contents.clone()).is_some() { return Err(invalid()); }
     }
     if expected.is_empty() { return Err(invalid()); }
-    verify_projection_entries(mounts.projection.as_fd(), &expected)?;
+    verify_projection_entries(mounts.projection.as_fd(), &expected, MAX_PROJECTION_FILES)?;
     super::native_home::verify(mounts.home.as_fd(), mounts.projection.as_fd())?;
     let mut flags: libc::statvfs = unsafe { mem::zeroed() };
     if unsafe { libc::fstatvfs(mounts.projection.as_raw_fd(), &mut flags) } != 0
@@ -388,13 +418,22 @@ pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> i
     // Interrupted creation can leave a subset. Enumerate and validate before
     // unlinking anything; no unknown path is removed during recovery.
     let mut entries = Vec::new();
+    let mut marker_dir = false;
     for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
         let entry = entry?;
+        // R3-1: the marker directory (possibly partial: empty or just the marker).
+        if entry.file_name().to_str() == Some(ETC_MARKER_DIR) && !marker_dir {
+            let stat = fs::symlink_metadata(entry.path())?;
+            if !stat.is_dir() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o700 | 0o755) { return Err(invalid()); }
+            marker_dir = true;
+            continue;
+        }
         if entries.len() >= MAX_PROJECTION_FILES || !entry.file_name().to_str().is_some_and(|name| expected.contains_key(name)) { return Err(invalid()); }
         let stat = fs::symlink_metadata(entry.path())?;
         if !stat.is_file() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o400 | 0o444) || stat.nlink() != 1 { return Err(invalid()); }
         entries.push(c_name(&entry.file_name())?);
     }
+    if marker_dir { cleanup_marker(directory.as_fd())?; }
     for entry in entries {
         if unsafe { libc::unlinkat(directory.as_raw_fd(), entry.as_ptr(), 0) } != 0 { return Err(io::Error::last_os_error()); }
     }
@@ -403,9 +442,143 @@ pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> i
     File::from(parent).sync_all()
 }
 
+/// R3-1 cleanup: remove `<projection>/duduclaw/{protected-mode}` and the
+/// directory. Only the one known root-owned file is accepted; anything else
+/// keeps the residue (and readiness fails), as for the flat files.
+fn cleanup_marker(directory: BorrowedFd<'_>) -> io::Result<()> {
+    let name = CString::new(ETC_MARKER_DIR).map_err(|_| invalid())?;
+    let marker_dir = owned(unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    if metadata(&marker_dir)?.uid() != 0 { return Err(invalid()); }
+    let mut present = false;
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", marker_dir.as_raw_fd()))? {
+        let entry = entry?;
+        if present || entry.file_name().to_str() != Some(ETC_MARKER_FILE) { return Err(invalid()); }
+        let stat = fs::symlink_metadata(entry.path())?;
+        if !stat.is_file() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o400 | 0o444) || stat.nlink() != 1 { return Err(invalid()); }
+        present = true;
+    }
+    if present {
+        let file = CString::new(ETC_MARKER_FILE).map_err(|_| invalid())?;
+        if unsafe { libc::unlinkat(marker_dir.as_raw_fd(), file.as_ptr(), 0) } != 0 { return Err(io::Error::last_os_error()); }
+    }
+    File::from(marker_dir).sync_all()?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 { return Err(io::Error::last_os_error()); }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sr5r3f_etc_mount_is_read_only_and_never_follows_the_marker_path() {
+        for flag in [MOUNT_ATTR_RDONLY, MOUNT_ATTR_NOSUID, MOUNT_ATTR_NODEV, MOUNT_ATTR_NOEXEC, MOUNT_ATTR_NOSYMFOLLOW] {
+            assert_eq!(ETC_MOUNT_ATTRIBUTES & flag, flag);
+        }
+        assert!(MAX_ETC_ENTRIES > minimal_etc(70000, 70000).unwrap().len());
+        assert!(!minimal_etc(70000, 70000).unwrap().contains_key(ETC_MARKER_DIR));
+    }
+    /// R3-1 end-to-end: publish the real /etc projection, clone it exactly as
+    /// `prepare` does (read-only/nosymfollow), and read the marker through the
+    /// clone at `duduclaw/protected-mode`; then clean it up.
+    #[test]
+    #[ignore = "run on Linux acceptance host: requires root and CAP_SYS_ADMIN on a disposable VM"]
+    fn sr5r3f_etc_projection_publishes_and_cleans_the_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let root = PathBuf::from(format!("/run/duduclaw-sr5r3f-etc-{}", std::process::id()));
+        fs::create_dir(&root).unwrap(); fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let anchors = RootPublicationAnchors::new(root.clone(), root.clone(), root.clone()).unwrap();
+        let run = RunHandle(duduclaw_isolation::ids::RunId([0x93; 16]));
+        let directory = root.join(run_name(run));
+        // Publish via the same helpers `publish_projection` uses.
+        fs::create_dir(&directory).unwrap(); fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let dir: OwnedFd = File::open(&directory).unwrap().into();
+        for (name, value) in &minimal_etc(70000, 70000).unwrap() { publish_file(dir.as_fd(), name, value.as_bytes()).unwrap(); }
+        publish_marker(dir.as_fd()).unwrap();
+        let mut top_level = minimal_etc(70000, 70000).unwrap();
+        top_level.insert(ETC_MARKER_DIR, String::new());
+        verify_projection_entries(dir.as_fd(), &top_level, MAX_ETC_ENTRIES).unwrap();
+        let clone = detached_clone(dir.as_fd(), ETC_MOUNT_ATTRIBUTES).unwrap();
+        let path = CString::new(format!("{ETC_MARKER_DIR}/{ETC_MARKER_FILE}")).unwrap();
+        let fd = owned(unsafe { libc::openat(clone.as_raw_fd(), path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) } as _).unwrap();
+        let mut marker = String::new();
+        File::from(fd).read_to_string(&mut marker).unwrap();
+        assert_eq!(marker, ETC_MARKER_CONTENT);
+        // Read-only: the runtime cannot remove or rewrite it.
+        let write = unsafe { libc::openat(clone.as_raw_fd(), path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        assert!(write < 0);
+        drop(clone); drop(dir);
+        cleanup_projection(&anchors, run).unwrap();
+        assert!(!directory.exists());
+        fs::remove_dir(root).unwrap();
+    }
+    /// R3-1 end-to-end on a real mount namespace: with the runtime's /etc
+    /// projection attached at /etc (as duduclaw-run does), `/var/lib` hidden
+    /// and no `DUDUCLAW_PROTECTED_KEY_MODE`, the latch's system sources — what
+    /// a sandboxed `duduclaw mcp-server` evaluates — say "protected". Control:
+    /// an empty /etc in the same setup says "unprotected". Forks: run with
+    /// `--test-threads=1`.
+    #[test]
+    #[ignore = "run on Linux acceptance host: requires root and CAP_SYS_ADMIN; run with --test-threads=1"]
+    fn sr5r3f_mcp_server_in_sandbox_sees_protected_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let root = PathBuf::from(format!("/run/duduclaw-sr5r3f-mcp-{}", std::process::id()));
+        fs::create_dir(&root).unwrap(); fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = root.join("etc");
+        fs::create_dir(&directory).unwrap(); fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let dir: OwnedFd = File::open(&directory).unwrap().into();
+        for (name, value) in &minimal_etc(70000, 70000).unwrap() { publish_file(dir.as_fd(), name, value.as_bytes()).unwrap(); }
+        publish_marker(dir.as_fd()).unwrap();
+        let projection = detached_clone(dir.as_fd(), ETC_MOUNT_ATTRIBUTES).unwrap();
+        let projection_fd = projection.as_raw_fd();
+        // What `Sources::system()` is inside the sandbox when the env flag is
+        // absent or stripped by an MCP `env` block.
+        let sandboxed = || duduclaw_core::protected_mode::Sources {
+            env: None,
+            marker: PathBuf::from(duduclaw_core::protected_mode::MODE_MARKER),
+            service_home: PathBuf::from(duduclaw_core::protected_mode::SERVICE_HOME),
+        }.decide();
+        let child = |with_projection: bool| -> i32 {
+            match unsafe { libc::fork() } {
+                0 => {
+                    let outcome = (|| -> Option<bool> {
+                        unsafe {
+                            if libc::unshare(libc::CLONE_NEWNS) != 0 { return None; }
+                            if libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
+                                libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) != 0 { return None; }
+                            // The runtime never sees the protected service home.
+                            if libc::mount(c"tmpfs".as_ptr(), c"/var/lib".as_ptr(), c"tmpfs".as_ptr(),
+                                0, std::ptr::null()) != 0 { return None; }
+                            if with_projection {
+                                if libc::syscall(libc::SYS_move_mount, projection_fd, c"".as_ptr(),
+                                    libc::AT_FDCWD, c"/etc".as_ptr(), 4u32) != 0 { return None; }
+                            } else if libc::mount(c"tmpfs".as_ptr(), c"/etc".as_ptr(), c"tmpfs".as_ptr(),
+                                0, std::ptr::null()) != 0 { return None; }
+                        }
+                        Some(sandboxed())
+                    })();
+                    unsafe { libc::_exit(match outcome { Some(true) => 0, Some(false) => 1, None => 2 }) }
+                }
+                pid if pid > 0 => {
+                    let mut status = 0;
+                    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                    assert!(libc::WIFEXITED(status));
+                    libc::WEXITSTATUS(status)
+                }
+                _ => panic!("fork failed"),
+            }
+        };
+        assert_eq!(child(false), 1, "control: without the projection marker the sandbox is unprotected");
+        assert_eq!(child(true), 0, "the runtime's /etc projection keeps protected mode on");
+        drop(projection); drop(dir);
+        fs::remove_file(directory.join(ETC_MARKER_DIR).join(ETC_MARKER_FILE)).ok();
+        fs::remove_dir(directory.join(ETC_MARKER_DIR)).ok();
+        for name in minimal_etc(70000, 70000).unwrap().keys() { fs::remove_file(directory.join(name)).ok(); }
+        fs::remove_dir(&directory).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
     #[test]
     fn workspace_selection_reopens_only_the_exact_h_directory() {
         use duduclaw_isolation::{bounded::Text, ids::{RunId, RequestId}, ipc::WorkspaceSelection};

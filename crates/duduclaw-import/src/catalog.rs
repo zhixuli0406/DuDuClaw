@@ -24,6 +24,7 @@ pub(crate) const MEMORY_V1793: &str = include_str!("memory-v1793.sql");
 pub(crate) const MEMORY_V180: &str = include_str!("memory-v180.sql");
 pub(crate) const APPROVALS_V1793: &str = include_str!("approvals-v1793.sql");
 pub(crate) const APPROVALS_V180: &str = include_str!("approvals-v180.sql");
+pub(crate) const APPROVALS_V181: &str = include_str!("approvals-v181.sql");
 const MAX_REPORTED: usize = 16;
 
 /// A legacy store with more than one accepted schema version.
@@ -64,7 +65,10 @@ static CRON: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, CRON_V1793), Cat
 // Memory and approvals: the newest catalog adds only an index (memory) and two
 // decision-lease columns (approvals) that neither reader is authorized to read.
 static MEMORY: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, MEMORY_V1793), Catalog::new(SchemaVersion::V180, MEMORY_V180)];
-static APPROVALS: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V1793), Catalog::new(SchemaVersion::V180, APPROVALS_V180)];
+// Approvals v1.81 = v1.80.x plus the SR5 `approvals.employee_incarnation`
+// column; the reader never authorizes it, so it maps as V180.
+static APPROVALS: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V1793), Catalog::new(SchemaVersion::V180, APPROVALS_V180),
+    Catalog { version: SchemaVersion::V180, sql: APPROVALS_V181, label: "v1.81" }];
 fn catalogs(store: Store) -> &'static [Catalog] {
     match store {
         Store::Sessions => &SESSIONS, Store::Tasks => &TASKS, Store::Cron => &CRON,

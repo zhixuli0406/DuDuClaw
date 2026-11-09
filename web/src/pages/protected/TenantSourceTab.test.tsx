@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, screen } from '@testing-library/react';
+import { fireEvent, screen, waitFor } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
 import { useConnectionStore } from '@/stores/connection-store';
-import type { ProtectedTenantSourceView } from '@/lib/api';
+import type { AgentGoogleIdentity, ProtectedTenantSourceView } from '@/lib/api';
 import { TenantSourceTab, TENANT_SOURCE_SAVE_AVAILABLE } from './TenantSourceTab';
-import { renderTab, routeCalls } from './test-helpers';
+import { CSRF, calledWith, employeeList, renderTab, routeCalls } from './test-helpers';
 
 const GMAIL_READ = 'https://www.googleapis.com/auth/gmail.readonly';
 const GMAIL_COMPOSE = 'https://www.googleapis.com/auth/gmail.compose';
@@ -102,5 +102,50 @@ describe('protected mode — Google tenant source tab', () => {
     routeCalls({ 'google.delegation.get': () => Promise.reject('請以管理員帳號重新登入後再操作。') });
     renderTab(<TenantSourceTab />);
     expect(await screen.findByRole('alert')).toHaveTextContent('請以管理員帳號重新登入後再操作。');
+  });
+
+  // SR4 round 3 (N1): the Admin confirms the listed holder; a self-set
+  // address needs a second, explicit checkbox; the request names the holder.
+  it('sr4r3 confirms the listed holder and requires the self-set acknowledgement', async () => {
+    const agents: AgentGoogleIdentity[] = [{
+      agent_id: 'ceo-assistant', kind: 'delegate', email: 'ceo@example.com', explicit: true, fallback: 'none',
+      requesters: 'bound_people', state: 'ready', message: '',
+      tenant_subject: {
+        state: 'attestation_required', message: '需要管理員確認', subject: 'ceo@example.com', kind: 'delegate',
+        holder: { user_id: 'u-mallory', name: 'Mallory Wu', created_at: '2026-10-01T08:00:00Z', email_self_set: true },
+      },
+    }];
+    routeCalls({
+      'google.delegation.get': () => view({ agents }),
+      'isolation.connector_step_up': () => ({ verified: true }),
+      'isolation.employee_list': () => employeeList(),
+      'google.delegation.attest_subject': () => ({ agent_id: 'ceo-assistant', subject: 'ceo@example.com',
+        user_id: 'u-mallory', attested_at: '2026-11-09T00:00:00Z', email_self_set: true,
+        acknowledged_self_set: true, attestation: 'ok' }),
+    });
+    renderTab(<TenantSourceTab />);
+    const row = await screen.findByTestId('attest-row-ceo-assistant');
+    expect(row).toHaveTextContent('Mallory Wu');
+    expect(row).toHaveTextContent('u-mallory');
+    expect(row).toHaveTextContent('changed their own sign-in email');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    const person = await screen.findByRole('checkbox', { name: /is the personal mailbox of Mallory Wu/ });
+    const selfSet = screen.getByRole('checkbox', { name: /set this address themselves/ });
+    fireEvent.change(screen.getByLabelText('Current password'), { target: { value: 'pw' } });
+    fireEvent.change(screen.getByLabelText('Six-digit authenticator code'), { target: { value: '123456' } });
+    const submit = screen.getByRole('button', { name: 'Verify identity and confirm' });
+    expect(submit).toBeDisabled();
+    fireEvent.click(person);
+    expect(submit).toBeDisabled();
+    fireEvent.click(selfSet);
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(calledWith('google.delegation.attest_subject')).toHaveLength(1));
+    expect(calledWith('google.delegation.attest_subject')[0]).toEqual({
+      agent_id: 'ceo-assistant', subject: 'ceo@example.com', user_id: 'u-mallory', acknowledge_self_set: true,
+      csrf_token: CSRF,
+    });
   });
 });

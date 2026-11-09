@@ -396,7 +396,7 @@ fn notices_use_log_addresses_after_account_delete() {
     let a = eligible_admin(&db, "a@example.test");
     let b = eligible_admin(&db, "b@example.test");
     age_log(&db, 40 * DAY);
-    db.change_email(&b, "b-new@example.test").unwrap();
+    db.change_email(&a, &b, "b-new@example.test").unwrap();
     exec(&db, "DELETE FROM users WHERE id=?1", &b);
     age_log(&db, 10 * DAY);
     assert!(db.get_user(&b).unwrap().is_none());

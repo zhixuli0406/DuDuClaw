@@ -1,9 +1,11 @@
+pub mod account_email_history;
 pub mod acl;
 pub mod admin_approval_rule;
 pub mod admin_eligibility;
 pub mod credential_changes;
 pub mod db;
 pub mod jwt;
+pub mod google_delegate_attestation;
 pub mod google_identity;
 pub mod models;
 pub mod org;

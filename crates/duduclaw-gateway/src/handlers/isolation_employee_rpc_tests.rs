@@ -960,6 +960,18 @@ fn tombstone_quarantine_rename_noreplace() {
 #[path = "isolation_employee_rpc_f6h_tests.rs"]
 mod f6h;
 
+/// SR5 items 1–3 over a real tombstone: skill installs into a tombstoned
+/// label, Personal privacy during the retention window, approval cards.
+#[cfg(unix)]
+#[path = "isolation_employee_rpc_sr5_tests.rs"]
+mod sr5;
+
+/// SR5 round 3: incarnation at every card consumer (N1/N2), the durable
+/// protected-mode latch (N3), quarantine-aware Personal binds (N5).
+#[cfg(unix)]
+#[path = "isolation_employee_rpc_sr5r3_tests.rs"]
+mod sr5r3;
+
 /// Regular-file bytes under `dir`, counted independently of the seal walk.
 #[cfg(unix)]
 fn tree_bytes(dir: &Path) -> u64 {

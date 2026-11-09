@@ -40,6 +40,11 @@ pub(crate) const EMPLOYEE_PARAM_KEYS: &[&str] = &[
 ];
 /// Top-level request parameters that name several employees.
 pub(crate) const EMPLOYEE_ARRAY_KEYS: &[&str] = &["agent_ids", "agents"];
+/// SR5 item 1: top-level parameters that name an employee unless they name
+/// an org-wide layer (`global`, `department:*` —
+/// `skills_install_target::scope_employee`). `skills.install` /
+/// `skills.install_request` write `agents/<scope>/SKILLS`.
+pub(crate) const EMPLOYEE_SCOPE_KEYS: &[&str] = &["scope"];
 /// Fields of a response row that name its employee.
 pub(crate) const ROW_EMPLOYEE_FIELDS: &[&str] = &[
     "agent_id", "agent", "agent_name", "from_agent", "to_agent", "assigned_to", "target_agent",
@@ -172,6 +177,13 @@ pub(crate) fn named_employees(params: &Value) -> BTreeSet<String> {
     for key in EMPLOYEE_ARRAY_KEYS {
         for raw in params.get(*key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
             push(raw);
+        }
+    }
+    for key in EMPLOYEE_SCOPE_KEYS {
+        if let Some(agent) =
+            params.get(*key).and_then(Value::as_str).and_then(|raw| super::skills_install_target::scope_employee(raw.trim()))
+        {
+            push(agent);
         }
     }
     named

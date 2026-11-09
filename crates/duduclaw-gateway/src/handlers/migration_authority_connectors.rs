@@ -27,9 +27,12 @@
 //!   Wildcard grants are not accounts and are not proposed.
 //! - website credential (`secrets/website_credentials.enc`, metadata only)
 //!   allowed for a confirmed protected employee → computer, details
-//!   `{employee, credential}` (`computer:<id>:<agent>`); `Personal(owner)`
-//!   only when the credential was created by user `owner` AND the employee
-//!   is that owner's Personal employee, otherwise SharedHome.
+//!   `{employee, credential, created_by}` (`computer:<id>:<agent>`);
+//!   `Personal(owner)` only when the credential was created by user `owner`
+//!   AND the employee is that owner's Personal employee; SharedHome for a
+//!   Shared employee. SR4 item 6: a credential created by anyone else than
+//!   the Personal employee's owner is not proposed (`unproven_personal`),
+//!   and the card shows `created_by` (the creator's user id).
 //! - `agent_bindings.json` channel user bound to a confirmed protected
 //!   employee → channel, details `{employee, channel, scope = bound user,
 //!   status_label = channel, token_ref}` (`channel:<ch>:<agent>:<user>`):
@@ -125,16 +128,27 @@ pub(crate) struct DetailsPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")] scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] status_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] token_ref: Option<String>,
+    /// SR4 item 6: the users.db id of the person who created the website
+    /// credential (`computer` only), shown on the card and re-proven with the
+    /// rest of the plan at approval and apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")] created_by: Option<String>,
 }
 impl DetailsPlan {
     fn empty(employee: &str) -> Self {
         Self { employee: employee.to_owned(), source: None, credential: None, channel: None, scope: None,
-            status_label: None, token_ref: None }
+            status_label: None, token_ref: None, created_by: None }
     }
     /// Exactly the provider's references; anything else is invalid.
     fn reference(&self, provider: &str) -> Result<DetailReference> {
-        let Self { employee: _, source, credential, channel, scope, status_label, token_ref } = self;
+        let Self { employee: _, source, credential, channel, scope, status_label, token_ref, created_by } = self;
         let channel_fields = channel.is_some() || scope.is_some() || status_label.is_some() || token_ref.is_some();
+        // The creator is part of a computer plan only, and always there.
+        let creator_ok = match (provider, created_by) {
+            ("computer", Some(creator)) => plain(creator, 128),
+            ("computer", None) => false,
+            (_, created_by) => created_by.is_none(),
+        };
+        if !creator_ok { return Err(Error::Invalid); }
         match (provider, source, credential) {
             ("database", Some(source), None) if !channel_fields => Ok(DetailReference::Database { source: source.clone() }),
             ("computer", None, Some(credential)) if !channel_fields =>
@@ -291,12 +305,18 @@ pub(crate) fn item_supported(item: &ConfirmationItem) -> bool { parse(item).is_o
 
 /// Admin card summary: provider, label, proposed binding/owner and the
 /// detail references. No secret exists in a proposal to show.
+///
+/// SR4 item 6: `created_by` is the users.db id of the website credential's
+/// creator (`computer` proposals; `null` otherwise), so the Admin sees whose
+/// login a shared route would expose.
 pub(crate) fn card(item: &ConfirmationItem) -> Option<Value> {
     let plan = parse(item).ok()?;
+    let created_by = plan.details.as_ref().and_then(|details| details.created_by.clone());
     Some(json!({
         "provider": plan.provider, "label": plan.label, "kind": plan.route_kind,
         "binding": if plan.owner.is_some() { "personal" } else { "shared" },
         "owner_user_id": plan.owner, "details": plan.details, "legacy_source": plan.source,
+        "created_by": created_by,
     }))
 }
 
@@ -497,19 +517,37 @@ fn computers(home: &Path, only_agent: Option<&str>, staff: &mut Employees<'_>, o
         for agent in allowed {
             if only_agent.is_some_and(|only| only != agent) { continue; }
             let Some(employee) = staff.get(agent)? else { continue };
-            // Personal only when the creator is the employee's own Personal owner.
-            let creator_owns = record.created_by.owner_kind == "user" && matches!(&employee.binding,
-                EmployeeBinding::Personal(owner) if owner.as_str() == record.created_by.owner_id);
-            let (route_kind, owner) = if creator_owns { ("personal", Some(record.created_by.owner_id.clone())) }
-                else { ("shared_home", None) };
+            let Some((route_kind, owner)) = computer_route(&record.created_by, &employee.binding) else {
+                // SR4 item 6: another person's login on someone's Personal
+                // employee is never proposed (not even as a shared route).
+                out.unproven += 1;
+                continue;
+            };
             let mut details = DetailsPlan::empty(&employee.agent);
             details.credential = Some(record.id.clone());
+            details.created_by = Some(record.created_by.owner_id.clone());
             out.candidates.push(ConnectorPlan { source: format!("computer:{}:{agent}", record.id),
                 provider: "computer".into(), route_kind: route_kind.into(), label: bounded_label("網站登入 ", &record.label),
                 owner, details: Some(details) });
         }
     }
     Ok(())
+}
+
+/// SR4 item 6: the route a website credential allowed for an employee with
+/// `binding` becomes. `None` ⇒ not proposed (counted `unproven_personal`):
+/// a creator that is not a plain users.db user id, or a Personal employee
+/// whose owner is not the credential's creator — another person's login is
+/// never placed on someone's Personal employee, not even as a shared route.
+fn computer_route(created_by: &crate::website_credentials::Owner, binding: &EmployeeBinding)
+    -> Option<(&'static str, Option<String>)> {
+    if created_by.owner_kind != "user" || !plain(&created_by.owner_id, 128) { return None; }
+    match binding {
+        EmployeeBinding::Personal(owner) if owner.as_str() == created_by.owner_id =>
+            Some(("personal", Some(created_by.owner_id.clone()))),
+        EmployeeBinding::Personal(_) => None,
+        EmployeeBinding::Shared(_) => Some(("shared_home", None)),
+    }
 }
 
 fn channels(home: &Path, config: &toml::Table, agents: &BTreeMap<String, toml::Table>, only_agent: Option<&str>,

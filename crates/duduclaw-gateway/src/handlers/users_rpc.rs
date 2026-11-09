@@ -336,6 +336,11 @@ impl MethodHandler {
             Ok(l) => l,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        // SR5 round 3 N5: a quarantined / tombstoned label is refused from the
+        // lifecycle index, not only from the users.db mirror auth reads.
+        if let Some(refusal) = crate::isolation_label_stores::bind_refusal(&self.home_dir, agent_name) {
+            return WsFrame::error_response("", refusal);
+        }
 
         // Verify agent exists
         let reg = self.registry.read().await;
@@ -445,6 +450,19 @@ impl MethodHandler {
         // One transaction: status, the leaver's reports (moved to
         // `transfer_to`, else to the leaver's manager, each re-checked and
         // audited as `user.reparent`) and, with `transfer_to`, the bindings.
+        // SR5 round 3 N5: a transfer never re-binds a quarantined / tombstoned
+        // label (checked from the lifecycle index before auth moves bindings).
+        if transfer_to.is_some() {
+            let agents = match db.get_user_agents(user_id) {
+                Ok(bindings) => bindings,
+                Err(_) => return WsFrame::error_response("", crate::isolation_label_stores::LABEL_STATE_UNAVAILABLE),
+            };
+            if let Some(refusal) = agents.iter()
+                .find_map(|binding| crate::isolation_label_stores::bind_refusal(&self.home_dir, &binding.agent_name))
+            {
+                return WsFrame::error_response("", refusal);
+            }
+        }
         let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
         let outcome = match db.offboard_user(user_id, transfer_to, Some(&ctx.user_id)) {
             Ok(outcome) => outcome,
@@ -641,6 +659,15 @@ impl MethodHandler {
                     Some(&detail),
                     None,
                 );
+                // SR4 item 2(iv): an address that is now a designated Google
+                // service mailbox or a delegate subject stays refused at use
+                // time; the collision is surfaced to Admins as an audit event.
+                if crate::runtime_readiness::is_protected_linux() {
+                    let (home, user_id, address) = (self.home_dir.clone(), ctx.user_id.clone(), email.to_owned());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::google_identity::tenant_source::audit_email_conflict(&home, &user_id, &address)
+                    }).await;
+                }
                 WsFrame::ok_response("", json!({"status": "changed", "email": email}))
             }
             Err(e) if e == duduclaw_auth::db::EMAIL_IN_USE => WsFrame::error_response("", &e),

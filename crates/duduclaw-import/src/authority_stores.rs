@@ -145,8 +145,9 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
     if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
     let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     crate::sqlite::harden(&conn)?;check_sqlite(&conn)?;
-    // Exact v1.79.3 or v1.80.x catalog. The v1.80 decision-lease columns are
-    // never authorized below; only ids and the authority schema version are read.
+    // Exact v1.79.3, v1.80.x or v1.81 catalog. The v1.80 decision-lease columns
+    // and the v1.81 `employee_incarnation` column are never authorized below;
+    // only ids and the authority schema version are read.
     match crate::catalog::detect(&conn,crate::catalog::Store::Approvals,None)?.version {
         crate::catalog::SchemaVersion::V1793|crate::catalog::SchemaVersion::V180=>{}
     }
@@ -184,9 +185,9 @@ mod tests {
     }
     #[test]
     fn authority_approvals_db_all_statuses_become_inert_expired_candidates() {
-        for catalog_sql in [crate::catalog::APPROVALS_V1793,crate::catalog::APPROVALS_V180] {
+        for catalog_sql in [crate::catalog::APPROVALS_V1793,crate::catalog::APPROVALS_V180,crate::catalog::APPROVALS_V181] {
             let file=approval_db_with(catalog_sql);
-            if catalog_sql==crate::catalog::APPROVALS_V180 {
+            if catalog_sql!=crate::catalog::APPROVALS_V1793 {
                 let conn=rusqlite::Connection::open(file.path()).unwrap();
                 conn.execute_batch("UPDATE approvals SET lease_token='SECRET-LEASE',lease_until='later' WHERE id='a'; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
             }
@@ -199,7 +200,7 @@ mod tests {
     }
     #[test]
     fn authority_approvals_db_rejects_added_trigger_and_version_drift() {
-        for catalog_sql in [crate::catalog::APPROVALS_V1793,crate::catalog::APPROVALS_V180] {
+        for catalog_sql in [crate::catalog::APPROVALS_V1793,crate::catalog::APPROVALS_V180,crate::catalog::APPROVALS_V181] {
             for extra in ["CREATE TRIGGER malicious AFTER INSERT ON approvals BEGIN SELECT 1; END;","UPDATE approval_authority_schema SET version=2;"] {
                 let file=approval_db_with(catalog_sql);let conn=rusqlite::Connection::open(file.path()).unwrap();conn.execute_batch(extra).unwrap();drop(conn);
                 assert!(extract(&request(SourceKind::AuthorityApprovalsSqlite,"approvals.db"),std::fs::File::open(file.path()).unwrap(),None).is_err());

@@ -143,6 +143,9 @@ pub(super) fn write_scoped(method: &str) -> Option<(&'static str, DataCategory)>
         // Its skill layer: restore an archived skill, adopt a shared one.
         "skills.restore" => ("agent_id", DataCategory::Config),
         "skills.adopt" => ("target_agent_id", DataCategory::Config),
+        // SR5 item 1: a dashboard install into its `agents/<scope>/SKILLS`
+        // (`scope` other than `global` / `department:*`, [`scoped_agent`]).
+        "skills.install" => ("scope", DataCategory::Config),
         "agents.google_identity_set"
         // Its own channel identities (bot / app it acts as).
         | "agents.channels.telegram.set" | "agents.channels.telegram.remove"
@@ -209,10 +212,15 @@ pub(super) fn scoped_agent(params: &Value, outer: Option<&str>, key: &str) -> Re
         Some(outer) => params.get(outer),
         None => Some(params),
     };
-    match holder.and_then(|holder| holder.get(key)).and_then(Value::as_str) {
-        Some(raw) => visibility::canonical_agent(raw).map(|agent| (!agent.is_empty()).then(|| agent.to_owned())),
-        None => Ok(None),
+    let agent = match holder.and_then(|holder| holder.get(key)).and_then(Value::as_str) {
+        Some(raw) => visibility::canonical_agent(raw).map(|agent| (!agent.is_empty()).then(|| agent.to_owned()))?,
+        None => None,
+    };
+    // SR5 item 1: an org-wide `scope` (`global`, `department:*`) names no employee.
+    if super::personal_p1g_gate::EMPLOYEE_SCOPE_KEYS.contains(&key) {
+        return Ok(agent.filter(|scope| super::skills_install_target::scope_employee(scope).is_some()));
     }
+    Ok(agent)
 }
 
 /// P1e: audit row for `agents.pause` / `agents.resume` by `user` of

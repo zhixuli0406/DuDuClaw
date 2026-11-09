@@ -97,8 +97,8 @@ fn latch_requirement(latch: &AtomicBool, required: bool) -> bool {
 /// only narrows the existing native-systemd fence; Personal/local installs gain
 /// no new gate and this function never clears another component's latch.
 pub fn initialize(team: bool) {
-    let protected = std::env::var_os(duduclaw_core::root_key::MODE_ENV).as_deref()
-        == Some(std::ffi::OsStr::new("native-systemd"));
+    // SR5 round 3 N3: the durable latch (env flag OR host-owned fact).
+    let protected = duduclaw_core::protected_mode::active();
     if !applies(cfg!(target_os = "linux"), protected, team) { return; }
     duduclaw_core::execution_gate::require_isolation();
     duduclaw_parse_worker::client::require_isolation();

@@ -85,8 +85,13 @@ by this release is accepted as a source. Both the v1.80 and v1.81 catalogs are a
 (exact match only, `tasks-v180.sql` is unchanged), share the v1.80 mapping, and the
 marker table is never authorized for reading. `scripts/capture_tasks_schema.py`
 regenerates both files; the gateway test compares `tasks-v181.sql` with a fresh `TaskStore`.
+`approvals.db` likewise has a third catalog, `approvals-v181.sql`: the v1.80.x store plus
+the SR5 `approvals.employee_incarnation` column (a card bound to its employee's
+incarnation). v1.79.3, v1.80.x and v1.81 are accepted (exact match only;
+`approvals-v1793.sql` / `approvals-v180.sql` are unchanged and no longer regenerated),
+v1.81 shares the v1.80 mapping and the new column is never authorized for reading.
 `memory-v180.sql` is reproducible from the reviewed fresh engine SQL with
-`scripts/capture_memory_schema.py` (and `approvals-v180.sql` with
+`scripts/capture_memory_schema.py` (and `approvals-v181.sql` with
 `scripts/capture_approval_schema.py`); the gateway regression tests compare these
 fixtures against an actual fresh `SqliteMemoryEngine` / `ApprovalStore`. Memory emits only live,
 non-quarantined memory text and key-fact text, never old trust or provenance. No best-effort schema guessing is performed.

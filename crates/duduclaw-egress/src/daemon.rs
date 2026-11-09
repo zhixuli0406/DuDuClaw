@@ -14,10 +14,19 @@ pub struct Config {
     pub profiles: List<EgressProfile, 128>,
     pub run_caps: RunCaps,
     pub max_runs: u16,
+    /// SR5 round 3 N7b: this host's public addresses that are on no
+    /// interface (cloud 1:1 NAT, elastic / floating IPs). Answers equal to
+    /// one are denied like the interface addresses. Optional, at most
+    /// `policy::MAX_CONFIGURED_HOST_ADDRESSES`.
+    #[serde(default)]
+    pub host_public_addresses: Vec<std::net::IpAddr>,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), EgressError> {
         self.run_caps.validate()?;
+        if self.host_public_addresses.len() > crate::policy::MAX_CONFIGURED_HOST_ADDRESSES {
+            return Err(EgressError::ResourceLimit);
+        }
         if self.max_runs == 0 || self.max_runs > 128 || self.profiles.as_slice().is_empty() { return Err(EgressError::ResourceLimit); }
         for (index, profile) in self.profiles.as_slice().iter().enumerate() {
             profile.validate().map_err(|_| EgressError::InvalidRequest)?;
@@ -99,6 +108,11 @@ pub async fn host_main() -> Result<(), EgressError> {
     let resolver = HostResolver::new();
     for profile in config.profiles.as_slice() { resolver.probe(profile.dns_route).await?; }
     let listener = CheckedSocket::new(activated_listener(EGRESS_CONTROL_SOCKET, libc::SOCK_SEQPACKET)?).map_err(io_error)?;
+    // SR5 item 7: the host's own interface addresses, before seccomp; they
+    // are refreshed on use (`policy::host_addresses`). SR5 round 3 N7b: plus
+    // the configured NAT public addresses.
+    crate::policy::configure_host_public_addresses(&config.host_public_addresses)?;
+    crate::policy::init_host_addresses()?;
     crate::seccomp::install()?;
     loop {
         let fd = listener.accept().await.map_err(io_error)?;

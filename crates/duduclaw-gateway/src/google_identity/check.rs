@@ -151,6 +151,15 @@ async fn resource_probe(
     Ok("可讀取這項服務的檔案識別資料（未讀取內容）。".into())
 }
 
+/// SR4 round 3 (item 5 residual): the protected-mode gate of the identity
+/// test — the same D-5 standing the bridge requires (an attested person of
+/// the live employee incarnation, or a designated service mailbox). Blocking
+/// reads (users.db, lifecycle).
+fn protected_subject_gate(home: &Path, agent: &str, people: &dyn People) -> Result<(), String> {
+    super::tenant_source::admit_for_identity_test(home, agent, people.user_db(),
+        super::tenant_source::current_incarnation(home, agent))
+}
+
 /// Run the checks for `agent`. Stops at the first check later ones depend on.
 pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<String>, Vec<Step>) {
     let mut out = Vec::new();
@@ -185,6 +194,17 @@ pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<Strin
             out.push(step("domain", "網域與帳號狀態", false, r.message_zh));
             return (Some(email), out);
         }
+    }
+
+    // SR4 round 3 (item 5 residual): in protected mode the D-5 subject rule
+    // applies before anything is minted. A delegate person no Admin attested
+    // for this employee is never tested (minting would act as that person).
+    if crate::runtime_readiness::is_protected_linux() {
+        if let Err(message) = protected_subject_gate(home, agent, people) {
+            out.push(step("attestation", "管理員確認", false, message));
+            return (Some(email), out);
+        }
+        out.push(step("attestation", "管理員確認", true, "已符合受保護模式的代表規則"));
     }
 
     let full = match mint_delegate(home, &email, REQUIRED_SCOPES, CacheMode::Bypass).await {

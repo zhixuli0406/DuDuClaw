@@ -260,9 +260,9 @@ fn eligibility_log_written_in_same_tx_claim_default_admin() {
 
 #[test]
 fn eligibility_log_written_in_same_tx_change_email() {
-    let (_dir, db, _) = fixture();
+    let (_dir, db, actor) = fixture();
     let other = eligible_admin(&db, "other@example.test");
-    assert_same_tx(&db, || db.change_email(&other, "renamed@example.test"),
+    assert_same_tx(&db, || db.change_email(&actor, &other, "renamed@example.test"),
         || user_email(&db, &other) == "other@example.test");
     let row = last(&db, &other);
     assert_eq!((row.eligible, row.notice_address.as_deref()), (true, Some("renamed@example.test")));

@@ -678,6 +678,8 @@ fn finish(home: &Path, q: &Quarantined, request: &RestoreRequest, employee: Empl
         }
         None => tx.commit().map_err(unavailable)?,
     }
+    // SR5 item 2: the adopted row's owner leaves the Personal owner map.
+    crate::personal_visibility::invalidate_owner_cache(home);
     let details = restore::audit_details(request, json!({"new_employee": hex::encode(employee.0), "target_label": target}));
     restore::audit(home, "isolation.employee_adopted", &q.label, Severity::Info, details.clone());
     if request.self_approved == Some(true) {

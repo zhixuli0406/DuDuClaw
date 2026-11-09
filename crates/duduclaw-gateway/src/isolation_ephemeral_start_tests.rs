@@ -373,3 +373,23 @@ fn h13b_stale_incarnation_job_never_starts() {
     assert_eq!(self_delegation_check(&jobs, &Identity(Ok((PARENT, 4))), &id, AGENT, Some("user:owner")),
         Err(VerificationError::Revoked));
 }
+
+#[test]
+fn sr5_refused_ephemeral_self_delegation_is_audited() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    let job = job(personal());
+    let id = ephemeral_child::message_id(&job.id);
+    audit_refusal(home.path(), &id, AGENT, Some("user:owner"), VerificationError::Revoked);
+    audit_refusal(home.path(), &id, AGENT, None, VerificationError::BindingMismatch);
+    let events: Vec<_> = duduclaw_security::audit::read_recent_events(home.path(), 10).into_iter()
+        .filter(|event| event.event_type == SELF_DELEGATION_REFUSED_EVENT).collect();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| event.agent_id == AGENT && event.details["message"] == id.as_str()
+        && event.details["job"] == job.id.as_str()));
+    assert_eq!(events[0].details["code"], "Revoked");
+    assert_eq!(events[0].details["principal_recorded"], true);
+    assert_eq!(events[1].details["code"], "BindingMismatch");
+    // Content of the job (instruction, context) never reaches the audit row.
+    let raw = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+    assert!(!raw.contains("invoices") && !raw.contains("March"));
+}

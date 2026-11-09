@@ -505,7 +505,7 @@ impl MethodHandler {
                         );
                     }
                 };
-                let exec = self.execute_approved_install(&req).await;
+                let exec = self.execute_approved_install(&req, &ctx.user_id).await;
                 let ok = exec.is_ok();
                 let _ = store
                     .mark_executed(&id, ok, exec.as_ref().err().map(|s| s.as_str()))
@@ -549,7 +549,31 @@ impl MethodHandler {
     pub(crate) async fn execute_approved_install(
         &self,
         req: &crate::install_requests::InstallRequest,
+        decider: &str,
     ) -> Result<Value, String> {
+        // SR5 item 1: a Personal employee's install runs only for its owner's
+        // request, audited as a config write (protected mode; fail closed).
+        if let Some(employee) = super::skills_install_target::request_employee(req) {
+            let db = self.user_db.read().await.clone();
+            let (home, req_for_check, decider, employee) =
+                (self.home_dir.clone(), req.clone(), decider.to_owned(), employee.to_owned());
+            tokio::task::spawn_blocking(move || {
+                super::skills_install_target::authorize_requested_write(
+                    &home,
+                    db.as_deref(),
+                    crate::runtime_readiness::is_protected_linux(),
+                    &super::skills_install_target::RequestedWrite {
+                        method: super::skills_install_target::request_method(&req_for_check),
+                        request_id: &req_for_check.id,
+                        requester: &req_for_check.requester_id,
+                        decider: &decider,
+                        employee: &employee,
+                    },
+                )
+            })
+            .await
+            .map_err(|e| format!("join: {e}"))??;
+        }
         match req.kind.as_str() {
             "skill" => {
                 let scope = req
@@ -616,10 +640,9 @@ impl MethodHandler {
                         scan.risk_level
                     ));
                 }
-                let agent_dir = self.home_dir.join("agents").join(agent_id);
-                if !agent_dir.is_dir() {
-                    return Err(format!("agent '{agent_id}' not found"));
-                }
+                // SR5 item 1: live employee only (F6h gate + lifecycle read).
+                let agent_dir = super::skills_install_target::live_employee_dir(&self.home_dir, agent_id)
+                    .map_err(|e| format!("agent '{agent_id}': {e}"))?;
                 let ad = agent_dir.clone();
                 let sn = server_name.to_string();
                 let d = def.clone();

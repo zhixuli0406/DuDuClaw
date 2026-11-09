@@ -35,6 +35,13 @@ impl MethodHandler {
             if let Err(code) = member.validate() {
                 results.push(json!({"index":index,"error":code})); continue;
             }
+            // SR5 round 3 N5: quarantined / tombstoned labels are refused from
+            // the lifecycle index (the auth guard reads only the mirror).
+            if member.bindings.iter().any(|binding|
+                crate::isolation_label_stores::bind_refusal(&self.home_dir, &binding.agent_name).is_some())
+            {
+                results.push(json!({"index":index,"error":"member_agent_quarantined"})); continue;
+            }
             // The public base is checked before creating any invitation-bearing row.
             let base = if member.invite {
                 let content_valid = db.invitation_content(locale)

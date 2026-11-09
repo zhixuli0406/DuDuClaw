@@ -16,7 +16,8 @@ fn human(user: &str) -> Requester {
 fn system() -> Requester {
     Requester::System(RequesterIdentity::System { kind: "isolation_background".into(), on_behalf_of: None })
 }
-fn account(user: &str) -> SubjectAccount { SubjectAccount { user_id: user.into(), active: true } }
+/// An Active account the Admin attested as the delegate subject (SR4 item 1).
+fn account(user: &str) -> SubjectAccount { SubjectAccount { user_id: user.into(), active: true, attested: true } }
 fn delegate(subject: &str, mailboxes: &[&str]) -> TenantSource {
     TenantSource::fixture(TenantSourceKind::Delegate, subject, mailboxes, &[GMAIL_READ])
 }
@@ -49,10 +50,12 @@ fn e4_delegate_impersonates_requesting_user_only() {
             Some(VerificationError::BindingMismatch));
     }
     // The person must be exactly one Active users.db account.
-    let inactive = [SubjectAccount { user_id: "alice-id".into(), active: false }];
+    let inactive = [SubjectAccount { user_id: "alice-id".into(), active: false, attested: true }];
     let ambiguous = [account_of("alice-id"), account_of("alice-2")];
     let nobody: [SubjectAccount; 0] = [];
-    for accounts in [&inactive[..], &ambiguous[..], &nobody[..]] {
+    // SR4 item 1: an email match without an Admin attestation never admits.
+    let unattested = [SubjectAccount { user_id: "alice-id".into(), active: true, attested: false }];
+    for accounts in [&inactive[..], &ambiguous[..], &nobody[..], &unattested[..]] {
         assert_eq!(GoogleIsolationBridge::tenant_route(&routes, &company, &human("alice-id"), &source, accounts,
             "gmail_read").err(), Some(VerificationError::BindingMismatch));
     }
@@ -166,6 +169,25 @@ fn e4_unreadable_key_unavailable_at_bridge() {
     let bridge = bridge(home.path());
     let context = context(Principal::Human { user_id: Text::new("alice-id".into()).unwrap(), generation: 1 });
     assert_eq!(bridge.source(&context, "gmail_read").err(), Some(VerificationError::Unavailable));
+}
+
+/// SR4 items 1 / 2(iv): a subject refused for a missing attestation or for a
+/// staff account claiming a designated mailbox is audited for Admins, once
+/// per build, source and state; an admitted subject is not.
+#[test]
+fn sr4_refused_subject_is_audited_once_per_state() {
+    let home = tempfile::tempdir().unwrap();
+    let bridge = bridge(home.path());
+    let unattested = [SubjectAccount { user_id: "mallory-id".into(), active: true, attested: false }];
+    let person = delegate("ceo@customer.com", &[]);
+    for _ in 0..3 { bridge.notice_refused_subject(&person, &unattested); }
+    let mailbox = delegate("support@customer.com", &["support@customer.com"]);
+    bridge.notice_refused_subject(&mailbox, &[account_of("staff-id")]);
+    bridge.notice_refused_subject(&mailbox, &[]);
+    bridge.notice_refused_subject(&person, &[account_of("ceo-id")]);
+    let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();
+    assert_eq!(audit.matches("google_tenant_subject_refused").count(), 2, "{audit}");
+    assert!(audit.contains("attestation_required") && audit.contains("service_mailbox_conflict"), "{audit}");
 }
 
 struct Turns;

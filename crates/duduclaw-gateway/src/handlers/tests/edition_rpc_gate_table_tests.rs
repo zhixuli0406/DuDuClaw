@@ -68,6 +68,9 @@ fn enterprise_surfaces_are_listed() {
         // v1.81 F5 UI-RPC
         "isolation.employee_tombstone_preview",
         "google.delegation.tenant_settings_set",
+        // SR4 item 1
+        "google.delegation.attest_subject",
+        "google.delegation.revoke_attestation",
         "me.isolation.request_personal_employee",
         "me.isolation.list_personal_employee_requests",
         // SR2: Personal → Shared delegation owner cards

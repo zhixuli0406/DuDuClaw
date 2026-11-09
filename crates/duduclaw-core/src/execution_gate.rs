@@ -37,15 +37,11 @@ pub const REFUSAL: &str = "受保護模式無法啟動員工：隔離執行服�
 /// narrow execution for the rest of the process lifetime.
 pub fn require_isolation() { REQUIRED.store(true, Ordering::Release); }
 
+/// SR5 round 3 N3: the environment flag OR a host-owned durable fact
+/// ([`crate::protected_mode::active`], which latches itself); an
+/// employee-editable environment cannot turn it off.
 pub fn isolation_required() -> bool {
-    if REQUIRED.load(Ordering::Acquire) { return true; }
-    #[cfg(target_os = "linux")]
-    if std::env::var_os(crate::root_key::MODE_ENV).as_deref()
-        == Some(std::ffi::OsStr::new("native-systemd")) {
-        require_isolation();
-        return true;
-    }
-    false
+    REQUIRED.load(Ordering::Acquire) || crate::protected_mode::active()
 }
 
 pub fn local_allowed(required: bool, class: ExecutionClass) -> bool {

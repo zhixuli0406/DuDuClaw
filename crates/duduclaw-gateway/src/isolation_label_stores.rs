@@ -91,9 +91,11 @@ impl GateRefusal {
 
 // ── Protected mode ──────────────────────────────────────────────────────
 
-/// Protected mode as the neighbouring isolation code detects it
-/// (`DUDUCLAW_PROTECTED_KEY_MODE=native-systemd` on Linux). Tests force it
-/// per thread through [`TEST_PROTECTED`].
+/// Protected mode as the neighbouring isolation code detects it: SR5 round 3
+/// N3, the durable latch ([`duduclaw_core::protected_mode::active`] through
+/// `runtime_readiness::is_protected_linux`) — the environment flag OR a
+/// host-owned durable fact. Tests force it per thread through
+/// [`TEST_PROTECTED`].
 pub(crate) fn protected_active() -> bool {
     #[cfg(test)]
     if let Some(forced) = TEST_PROTECTED.with(std::cell::Cell::get) { return forced; }
@@ -173,6 +175,78 @@ pub(crate) fn label_hold(home: &Path, label: &str) -> Result<LabelHold, StoreErr
     Ok(hold)
 }
 
+/// SR5 item 3: the confirmed row of `label` as `(incarnation, disabled)`.
+/// `None` = no apply.db / no confirmed row. A store without the
+/// `incarnation` column reads 0 (F6m rule). Unsafe / unreadable store or a
+/// corrupt receipt: `Unavailable`.
+pub(crate) fn confirmed_incarnation(home: &Path, label: &str) -> Result<Option<(u32, bool)>, StoreError> {
+    match std::fs::symlink_metadata(home.join(APPLY_DIR).join(APPLY_DB)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(StoreError::Unavailable),
+        Ok(_) => {}
+    }
+    let db = open_apply(home, Access::ReadOnly)?;
+    crate::isolation_quarantine::check_readable(&db).map_err(|_| StoreError::Unavailable)?;
+    if !table_exists(&db, "confirmed_employees")? {
+        return Ok(None);
+    }
+    let with_incarnation = crate::isolation_quarantine::has_incarnation(&db).map_err(|_| StoreError::Unavailable)?;
+    let sql = if with_incarnation {
+        "SELECT receipt,incarnation FROM confirmed_employees WHERE label=?1"
+    } else {
+        "SELECT receipt,0 FROM confirmed_employees WHERE label=?1"
+    };
+    let row: Option<(String, i64)> = db.query_row(sql, [label], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional().map_err(|_| StoreError::Unavailable)?;
+    let Some((encoded, incarnation)) = row else { return Ok(None) };
+    let receipt: duduclaw_migration::allocation::Receipt =
+        serde_json::from_str(&encoded).map_err(|_| StoreError::Unavailable)?;
+    if receipt.label != label { return Err(StoreError::Unavailable); }
+    let incarnation = u32::try_from(incarnation).map_err(|_| StoreError::Unavailable)?;
+    Ok(Some((incarnation, receipt.disabled)))
+}
+
+/// SR5 item 2: `(label, owner)` of every OPEN Personal quarantine row (not
+/// `purged` / `adopted` / `restored`, nor `purging` from `adopted` — the same
+/// closed rule as [`label_hold`]), oldest incarnation first so a later row
+/// wins. The tombstone removes the users.db owner mirror while the sealed
+/// data is kept for the retention window; `personal_visibility` adds these
+/// owners so the Personal privacy rules hold until purge or adoption. No
+/// apply.db: empty. Unsafe / unreadable / future-schema store or corrupt row:
+/// `Unavailable` (callers refuse).
+pub(crate) fn open_personal_owners(home: &Path) -> Result<Vec<(String, String)>, StoreError> {
+    match std::fs::symlink_metadata(home.join(APPLY_DIR).join(APPLY_DB)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(StoreError::Unavailable),
+        Ok(_) => {}
+    }
+    let db = open_apply(home, Access::ReadOnly)?;
+    crate::isolation_quarantine::check_readable(&db).map_err(|_| StoreError::Unavailable)?;
+    if !table_exists(&db, "employee_quarantine")? {
+        return Ok(Vec::new());
+    }
+    let journal = table_exists(&db, "employee_purge_journal")?;
+    let mut query = db.prepare(
+        "SELECT employee_hex,incarnation,label,owner_user_id,seal FROM employee_quarantine
+         WHERE kind='personal' ORDER BY incarnation,employee_hex")
+        .map_err(|_| StoreError::Unavailable)?;
+    let rows = query.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?)))
+        .map_err(|_| StoreError::Unavailable)?.collect::<Result<Vec<_>, _>>().map_err(|_| StoreError::Unavailable)?;
+    let mut owners = Vec::new();
+    for (hex, incarnation, label, owner, seal) in rows {
+        let incarnation = u32::try_from(incarnation).map_err(|_| StoreError::Unavailable)?;
+        let closed = CLOSED_STATES.contains(&seal.as_str())
+            || (seal == "purging" && journal && purging_adopted(&db, &hex, incarnation)?);
+        if closed { continue; }
+        // The schema CHECK ties `personal` to a non-NULL owner; a blank one
+        // is a corrupt row (fail closed).
+        let owner = owner.filter(|owner| !owner.trim().is_empty()).ok_or(StoreError::Unavailable)?;
+        owners.push((label, owner));
+    }
+    Ok(owners)
+}
+
 /// F6 b3 N1: a `purging` row whose purge journal records `prior_seal =
 /// 'adopted'` stays closed. Its label already belongs to the live employee
 /// that adopted it (the purge removes only the row's sealed remainder and
@@ -205,6 +279,17 @@ fn subject_label(key: &str) -> &str { key.strip_prefix("agent:").unwrap_or(key) 
 pub(crate) fn check_label_writable(home: &Path, label: &str) -> Result<(), GateRefusal> {
     if !protected_active() { return Ok(()); }
     hold_allows_write(home, label)
+}
+
+/// SR5 round 3 N5: the refusal of a write-side member binding to `label`
+/// (`users.bind_agent`, `users.create_members`, the offboarding transfer).
+/// The auth crate's Personal guards read only the users.db owner mirror,
+/// which the tombstone removes while the sealed data is retained; this reads
+/// the lifecycle index: a quarantined label (open quarantine row), a
+/// tombstoned one, or an unreadable index is refused before auth is called.
+/// Protected mode only (`None` elsewhere, without I/O).
+pub(crate) fn bind_refusal(home: &Path, label: &str) -> Option<&'static str> {
+    check_label_writable(home, label).err().map(GateRefusal::message)
 }
 
 /// The writer gate's decision, without the protected-mode switch.

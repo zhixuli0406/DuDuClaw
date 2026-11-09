@@ -767,6 +767,10 @@ pub async fn exchange_code(
 fn token_endpoint_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // SR4 round 3 follow-up: a stalled token endpoint must not hold the
+        // refresh gate / cross-process lock forever.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
 }
 

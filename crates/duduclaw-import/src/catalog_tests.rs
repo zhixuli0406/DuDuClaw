@@ -125,6 +125,37 @@ fn import_refuses_tasks_store_with_extra_unknown_table() {
 }
 
 #[test]
+fn sr5r3_import_accepts_v181_approvals_and_never_reads_incarnation() {
+    // Every known approvals catalog is accepted exactly; v1.81 maps as V180.
+    assert_eq!(detected(APPROVALS_V1793, Store::Approvals, None).version, SchemaVersion::V1793);
+    assert_eq!(detected(APPROVALS_V180, Store::Approvals, None).version, SchemaVersion::V180);
+    assert_eq!(detected(APPROVALS_V181, Store::Approvals, None).version, SchemaVersion::V180);
+    assert!(take_schema_refusal().is_none());
+    let rows = "INSERT INTO approvals(id,agent_id,action_kind,summary,payload,status,created_at,employee_incarnation)
+        VALUES ('a','sales','SECRET-KIND','SECRET-SUMMARY','{}','approved','now',7);";
+    let file = store(APPROVALS_V181, rows);
+    let p = extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).unwrap();
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].category, C::LegacyApproval);
+    assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));
+}
+
+#[test]
+fn sr5r3_import_refuses_approvals_with_an_extra_column() {
+    for schema in [APPROVALS_V180, APPROVALS_V181] {
+        let file = store(schema, "ALTER TABLE approvals ADD COLUMN planted_column TEXT;");
+        assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).err(), Some(Error::Schema));
+        let message = take_schema_refusal().expect("refusal report").to_string();
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81)"), "{message}");
+        assert!(message.contains("changed table approvals"), "{message}");
+    }
+    // Half-upgraded: v1.80.x plus the incarnation column with a different type.
+    let file = store(APPROVALS_V180, "ALTER TABLE approvals ADD COLUMN employee_incarnation TEXT;");
+    assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).err(), Some(Error::Schema));
+    let _ = take_schema_refusal();
+}
+
+#[test]
 fn import_refuses_unknown_schema_with_diff() {
     // Neither version: a v1.80 cron store missing one scoped column and its index.
     let file = store(CRON_V180, "DROP INDEX idx_cron_scoped_actor; ALTER TABLE cron_tasks DROP COLUMN scoped_by_user_id;");

@@ -125,6 +125,41 @@ fn clear_claim() {
     }
 }
 
+/// SR5 round 3 N3: the MCP child's identity rules follow the durable
+/// protected-mode latch. With `DUDUCLAW_PROTECTED_KEY_MODE` absent from the
+/// environment (as an employee-edited `.mcp.json` env block could arrange)
+/// but a host-owned durable fact present, the soft-mode grace is gone and a
+/// label without a confirmed row is refused; `create_agent` is refused too.
+#[test]
+fn sr5r3_mcp_child_identity_rules_follow_the_durable_latch() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let tmp = TempDir::new();
+    // Soft mode with a live grace: unprotected, a v1 claim verifies.
+    write_default_agent_config(tmp.path(), "agnes");
+    let key = duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+    let facts = TempDir::new();
+    let marker = facts.path().join("protected-mode");
+    fs::write(&marker, b"native-systemd\n").unwrap();
+    let sources = duduclaw_core::protected_mode::Sources {
+        env: None, marker, service_home: facts.path().join("no-service-home"),
+    };
+    // SAFETY: env mutation serialized via ENV_LOCK.
+    unsafe { std::env::remove_var(duduclaw_core::root_key::MODE_ENV); }
+    set_claim("sales-rep", &duduclaw_core::mint_identity_token(&key, "sales-rep"));
+    let unprotected = super::caller_identity_verdict(tmp.path());
+    let (protected, create_refused) = duduclaw_core::protected_mode::with_thread_sources(sources, || (
+        super::caller_identity_verdict(tmp.path()),
+        super::agents::protected_create_refusal(duduclaw_gateway::runtime_readiness::is_protected_linux()).is_some(),
+    ));
+    clear_claim();
+    if !duduclaw_core::protected_mode::active() {
+        assert_eq!(unprotected, duduclaw_core::IdentityVerdict::Verified);
+    }
+    assert_eq!(protected, duduclaw_core::IdentityVerdict::Rejected,
+        "env absent + durable fact: a label without a confirmed row is refused");
+    assert!(create_refused, "create_agent stays refused through the latch");
+}
+
 /// No `identity.key` in soft mode ⇒ zero impact, even for a forged token.
 #[tokio::test(flavor = "current_thread")]
 async fn no_identity_key_means_zero_behaviour_change() {

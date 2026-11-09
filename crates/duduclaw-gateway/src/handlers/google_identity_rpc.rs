@@ -7,6 +7,7 @@
 //! | `google.delegation.remove_key {confirm}` | Admin | delete the sealed key |
 //! | `google.delegation.settings_set {allowed_subject_domains?, default_identity?}` | Admin | `[integrations.google_identity]` |
 //! | `google.delegation.tenant_settings_set {service_mailboxes, tenant_scopes, csrf_token}` | Admin + step-up | protected-mode tenant-source subjects/scopes (`google_tenant_settings_rpc.rs`) |
+//! | `google.delegation.attest_subject {agent_id, subject, user_id, acknowledge_self_set?, csrf_token}` / `google.delegation.revoke_attestation {agent_id, csrf_token}` | Admin + step-up | SR4: protected-mode attestation that a Shared employee's delegate subject is the listed person (`google_delegate_attestation_rpc.rs`) |
 //! | `agents.google_identity_get {agent_id}` | Viewer of the employee | the identity in effect and whether it can be used now |
 //! | `agents.google_identity_set {agent_id, identity, fallback?, requesters?}` | Admin | write `[google]` (B2a: `home`, `none`, `delegate:<email>`) |
 //! | `google.identity.test {agent_id}` | Admin | mint for the subject and read one profile; sends nothing |
@@ -38,7 +39,10 @@ fn sec_audit(home: &Path, event: &str, severity: Severity, ctx: &UserContext, de
 
 /// The identity of one employee as the dashboard shows it, plus whether it
 /// can be used right now (local checks only — no network, no unsealing).
-fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People) -> Value {
+///
+/// `include_holder`: attach the tenant-subject holder (another account's name
+/// and creation time) — Admin path only (`google.delegation.get`).
+fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People, include_holder: bool) -> Value {
     let section = gi::read_agent_section(home, agent);
     let eff = gi::combine(&section, &gi::read_home_config(home));
     let (state, message) = match &eff.effective {
@@ -106,6 +110,14 @@ fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People) 
         "requesters": eff.requesters.as_str(),
         "state": state,
         "message": message,
+        // SR4 items 1 / 2(iv): in protected mode, where the D-5 subject rule
+        // applies, the subject's standing (attestation required, a staff
+        // account claiming a service mailbox, …). `null` elsewhere.
+        "tenant_subject": if crate::runtime_readiness::is_protected_linux() {
+            crate::google_identity::tenant_source::subject_notice(home, agent, people.user_db(), include_holder)
+        } else {
+            Value::Null
+        },
     })
 }
 
@@ -152,7 +164,7 @@ impl MethodHandler {
             names.sort();
             names
                 .iter()
-                .map(|n| identity_view(&home, n, people.as_ref()))
+                .map(|n| identity_view(&home, n, people.as_ref(), true))
                 .collect()
         };
         WsFrame::ok_response(
@@ -372,7 +384,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
         let people = self.people().await;
-        WsFrame::ok_response("", identity_view(&self.home_dir, agent_id, people.as_ref()))
+        WsFrame::ok_response("", identity_view(&self.home_dir, agent_id, people.as_ref(), false))
     }
 
     /// `agents.google_identity_set {agent_id, identity, fallback?, requesters?}`.
@@ -502,6 +514,22 @@ impl MethodHandler {
             if let Err(e) = db.set_google_consent(&ctx.user_id, &agent_id, true, &ctx.user_id) { return WsFrame::error_response("", &e); }
         }
         let after = gi::read_agent_section(&self.home_dir, &agent_id);
+        // SR4 item 1: an Admin attestation names one delegate subject. Moving
+        // the employee off exactly that subject retires it (audited by the
+        // store), so returning to the subject later needs a new attestation.
+        // Best effort: the use-time rule also requires the same subject.
+        let delegate_subject = |s: &gi::SectionRead| match s {
+            gi::SectionRead::Present(p) => match &p.identity {
+                Some(Selector::Delegate(email)) => Some(email.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if delegate_subject(&before) != delegate_subject(&after)
+            && let Some(db) = &db
+        {
+            let _ = db.revoke_google_delegate_attestation(&agent_id, &ctx.user_id);
+        }
         let describe = |s: &gi::SectionRead| match s {
             gi::SectionRead::Absent => json!(null),
             gi::SectionRead::Invalid(_) => json!("invalid"),
@@ -532,7 +560,7 @@ impl MethodHandler {
         let people = self.people().await;
         WsFrame::ok_response(
             "",
-            identity_view(&self.home_dir, &agent_id, people.as_ref()),
+            identity_view(&self.home_dir, &agent_id, people.as_ref(), false),
         )
     }
 

@@ -17,7 +17,11 @@
 //!   Personal employees) the SharedHome routes of the installed home binding,
 //!   with their generations. Provision, revoke, `advance` and a C4 relink
 //!   all change it, so a recreated route gets new providers without a
-//!   gateway restart.
+//!   gateway restart, or
+//! - (Shared employees, SR4 item 7) its Google tenant-source digest changed:
+//!   a delegation-key re-import or a `service_mailboxes` / `tenant_scopes` /
+//!   identity edit gets a new Google bridge instead of one stuck refusing on
+//!   its pinned source.
 //!
 //! Every build, failed or not, is reported through `record_connector_build`
 //! (F3). Fail closed: no factory ⇒ every connector tool is a refusing adapter
@@ -100,10 +104,30 @@ fn route_set(catalog: &ConnectorCatalog, binding: &EmployeeBinding, home: Option
     Ok(routes)
 }
 
+/// SR4 item 7: the employee's Google tenant-source state as one comparable
+/// key — its pinned digest (subject, service mailboxes, tenant scopes, key
+/// material), or the reason there is none. The Google bridge pins the source
+/// per tool for its lifetime, so a key re-import or a `service_mailboxes` /
+/// `tenant_scopes` edit must replace the build, else the bridge stays refused
+/// until a restart. Tenant sources are Shared-only: a Personal employee's key
+/// is constant (no read). Blocking file reads.
+fn tenant_source_key(home: &Path, agent: &str, binding: &EmployeeBinding) -> String {
+    use crate::google_identity::tenant_source::{self, TenantSourceError};
+    if !matches!(binding, EmployeeBinding::Shared(_)) { return String::new(); }
+    match tenant_source::read(home, agent) {
+        Ok(Some(source)) => source.digest(),
+        Ok(None) => "none".into(),
+        Err(TenantSourceError::Unavailable) => "unavailable".into(),
+        Err(TenantSourceError::Refused) => "refused".into(),
+    }
+}
+
 struct Installed {
     employee: EmployeeId,
     binding: EmployeeBinding,
     routes: RouteSet,
+    /// SR4 item 7: [`tenant_source_key`] the build was made for.
+    tenant_source: String,
     providers: Arc<InstalledConnectorProviders>,
 }
 
@@ -161,9 +185,11 @@ impl EmployeeConnectorProviders {
         let factory = self.factory.get().ok_or(VerificationError::Unavailable)?.clone();
         let cached = self.installed.lock().map_err(|_| VerificationError::Unavailable)?.get(agent)
             .filter(|installed| installed.employee == employee)
-            .map(|installed| (installed.binding.clone(), installed.routes.clone(), installed.providers.clone()));
-        if let Some((binding, routes, providers)) = cached {
-            if route_set(&self.catalog, &binding, self.home_binding.as_ref()).ok().as_ref() == Some(&routes) {
+            .map(|installed| (installed.binding.clone(), installed.routes.clone(), installed.tenant_source.clone(),
+                installed.providers.clone()));
+        if let Some((binding, routes, tenant_source, providers)) = cached {
+            if route_set(&self.catalog, &binding, self.home_binding.as_ref()).ok().as_ref() == Some(&routes)
+                && tenant_source_key(&self.home, agent, &binding) == tenant_source {
                 return Ok(providers);
             }
         }
@@ -197,13 +223,16 @@ impl EmployeeConnectorProviders {
             // A recreated label is another employee: never serve it here.
             if current != employee { return Err(VerificationError::Revoked); }
             let routes = route_set(&self.catalog, &binding, self.home_binding.as_ref())?;
+            let tenant_source = tenant_source_key(&self.home, agent, &binding);
             let providers = factory.build(&self.home, agent, employee, &binding, self.catalog.clone(), self.bindings.clone())?;
             // A change while building: refuse rather than cache a set for a
-            // route state that no longer exists (the next use rebuilds).
-            if route_set(&self.catalog, &binding, self.home_binding.as_ref())? != routes {
+            // route or tenant-source state that no longer exists (the next
+            // use rebuilds).
+            if route_set(&self.catalog, &binding, self.home_binding.as_ref())? != routes
+                || tenant_source_key(&self.home, agent, &binding) != tenant_source {
                 return Err(VerificationError::Unavailable);
             }
-            Ok(Installed { employee, binding, routes, providers: Arc::new(providers) })
+            Ok(Installed { employee, binding, routes, tenant_source, providers: Arc::new(providers) })
         })();
         (self.report)(&self.home, agent, employee, outcome.as_ref().map(|installed| installed.providers.as_ref()).map_err(|error| *error));
         let mut slot = self.installed.lock().map_err(|_| VerificationError::Unavailable)?;

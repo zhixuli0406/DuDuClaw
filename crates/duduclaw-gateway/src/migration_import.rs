@@ -547,8 +547,9 @@ mod tests {
         drop(crate::approval::ApprovalStore::open(home.path()).unwrap());
         let actual=Connection::open(home.path().join("approvals.db")).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        // Fresh stores are the newest known catalog; approvals-v1793.sql pins the older release.
-        expected.execute_batch(include_str!("../../duduclaw-import/src/approvals-v180.sql")).unwrap();
+        // Fresh stores are the newest known catalog (v1.81: v1.80.x plus the SR5
+        // employee_incarnation column); approvals-v1793/-v180.sql pin older releases.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/approvals-v181.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
 
         let path=home.path().join("sessions.db");

@@ -537,6 +537,13 @@ impl ApprovalBroker {
         self.store.list_by_kind(kind).await
     }
 
+    /// SR5 item 3: every card of `agent_id` still `pending` or `approved`
+    /// (not yet consumed), any kind — what a tombstone must invalidate.
+    pub async fn list_open_for_agent(&self, agent_id: &str) -> Result<Vec<ApprovalId>, String> {
+        self.expire_stale().await?;
+        self.store.list_open_ids_for_agent(agent_id).await
+    }
+
     /// Withdraw a pending approval as a system DENY (`decided_by` names why).
     /// Returns `false` when it was no longer pending.
     pub async fn withdraw(&self, id: &ApprovalId, decided_by: &str) -> Result<bool, String> {

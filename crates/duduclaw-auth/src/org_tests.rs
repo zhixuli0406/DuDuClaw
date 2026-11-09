@@ -500,7 +500,7 @@ fn every_authorization_write_bumps_the_generation() {
     expect_bump("bind_channel_identity", &db);
     db.unbind_channel_identity("line", "U_emp1").unwrap();
     expect_bump("unbind_channel_identity", &db);
-    db.change_email(&o.emp1, "emp1-new@test.invalid").unwrap();
+    db.change_email(&o.lead, &o.emp1, "emp1-new@test.invalid").unwrap();
     expect_bump("change_email", &db);
     db.offboard_user(&o.lead, Some(&heir), None).unwrap();
     expect_bump("offboard_user", &db);

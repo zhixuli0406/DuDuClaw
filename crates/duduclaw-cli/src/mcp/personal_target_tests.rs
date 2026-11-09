@@ -75,6 +75,42 @@ fn p1_cross_agent_tools_refuse_personal_target() {
     );
 }
 
+/// SR5 item 2: a tombstoned Personal employee (users.db mirror removed, the
+/// apply.db quarantine row still open) stays refused to other AI employees
+/// until the row is purged or adopted.
+#[test]
+fn sr5_tombstoned_personal_target_is_still_refused() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    const GONE: &str = "alice-gone";
+    let dir = home();
+    let home = dir.path();
+    let alice: String = rusqlite::Connection::open(home.join("users.db")).unwrap()
+        .query_row("SELECT id FROM users WHERE email='alice@example.test'", [], |row| row.get(0)).unwrap();
+    let authority = home.join("migration-authority");
+    std::fs::DirBuilder::new().mode(0o700).create(&authority).unwrap();
+    let apply = authority.join("apply.db");
+    let db = rusqlite::Connection::open(&apply).unwrap();
+    db.execute_batch("CREATE TABLE employee_quarantine (employee_hex TEXT NOT NULL, incarnation INTEGER NOT NULL,
+        label TEXT NOT NULL, kind TEXT NOT NULL, owner_user_id TEXT, seal TEXT NOT NULL,
+        PRIMARY KEY (employee_hex, incarnation));").unwrap();
+    db.execute("INSERT INTO employee_quarantine VALUES(?1,0,?2,'personal',?3,'sealed')",
+        rusqlite::params!["ab".repeat(16), GONE, alice]).unwrap();
+    drop(db);
+    std::fs::set_permissions(&apply, std::fs::Permissions::from_mode(0o600)).unwrap();
+    duduclaw_gateway::personal_visibility::invalidate_owner_cache(home);
+    let refused = duduclaw_gateway::personal_visibility::PERSONAL_TARGET_REFUSED;
+    for (tool, key) in [("agent_update", "agent_id"), ("wiki_read", "agent_id"), ("send_to_agent", "agent_id"),
+        ("mail_read", "agent_id")] {
+        assert_eq!(personal_target_refusal(home, true, tool, &args(key, GONE), SHARED), Some(refused), "{tool}");
+    }
+    assert_eq!(namespace_refusal(home, true, SHARED, GONE, SHARED), Some(refused));
+    // Purged: the label is no longer anyone's Personal employee.
+    rusqlite::Connection::open(&apply).unwrap()
+        .execute("UPDATE employee_quarantine SET seal='purged'", []).unwrap();
+    duduclaw_gateway::personal_visibility::invalidate_owner_cache(home);
+    assert_eq!(personal_target_refusal(home, true, "agent_update", &args("agent_id", GONE), SHARED), None);
+}
+
 #[test]
 fn p1_cross_agent_tools_unchanged_outside_protected_mode() {
     let dir = home();

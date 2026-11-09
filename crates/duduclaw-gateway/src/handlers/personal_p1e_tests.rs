@@ -335,8 +335,15 @@ const DISPATCH_SOURCES: &[(&str, &str)] = &[
 
 /// Parameter keys that name an employee.
 /// P1g: + `owner_agent_id`, `built_by_agent`, `slug`, `agent_ids`.
+/// SR5 item 1: + `scope` (`skills.install` / `skills.install_request` write
+/// `agents/<scope>/SKILLS`). Reviewed (SR5 grep of the non-standard names
+/// `scope` / `target` / `name` / `agent` / `slug` / `owner` that reach an
+/// `agents/<x>/` write): only `scope` was missing — `agent` is already a
+/// runtime key, `slug` names expert packs / custom skills, `name` /
+/// `target` / `owner` reach no `agents/<x>/` write from a request.
 const EMPLOYEE_KEYS: &[&str] = &["agent_id", "agent", "agent_name", "from_agent", "to_agent", "assigned_to",
-    "target_agent", "target_agent_id", "employee", "assignee", "owner_agent_id", "built_by_agent", "slug", "agent_ids"];
+    "target_agent", "target_agent_id", "employee", "assignee", "owner_agent_id", "built_by_agent", "slug", "agent_ids",
+    "scope"];
 
 /// Ungated arms that take request parameters naming (or possibly naming)
 /// an employee, method by method, each with its reason. Required for every
@@ -388,8 +395,9 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("skills.list", "installed skill names and switches (metadata); content is gated (skills.content)"),
     ("skills.search", "skill hub search; no employee data"),
     ("skills.vet", "security vet of a skill package; no employee data"),
-    ("skills.install", "P1g default deny: an install naming another person's Personal employee is refused (owner only)"),
-    ("skills.install_request", "files a request for an Admin decision; installs nothing"),
+    // SR5 item 1: `skills.install` is gated now (P1e write_scoped on `scope`).
+    ("skills.install_request", "files a request for an Admin decision; installs nothing; P1g default deny on \
+        `scope` + require_agent_access; the approved execution re-checks owner + live employee (SR5)"),
     ("skills.leaderboard", "usage counts per skill (metadata); P1g hidden rows"),
     ("skills.custom_update", "the caller's own draft (creator / Admin); running work on its builder is owner-only (F3)"),
     ("skills.custom_submit", "the caller's own draft (creator / Admin); files an Admin card, runs nothing"),
@@ -474,7 +482,9 @@ const EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
     // rows (`agent_id`) go through the hidden-row filter.
     ("google", "Admin Google Workspace integration, delegation keys and tenant-wide tenant-source settings \
         (delegation.get / tenant_settings_set name no employee); per-employee identity is agents.google_identity_*, \
-        delegation.get's agents rows pass the P1g hidden-row filter"),
+        delegation.get's agents rows pass the P1g hidden-row filter; SR4 delegation.attest_subject / \
+        revoke_attestation name a Shared employee (Admin + step-up, refused for Personal ones in the handler, \
+        P1g default deny on agent_id)"),
     ("workflow_drafts", "P1g default deny on the named actor; runs re-checked at fire time (dispatcher)"),
     ("workflow_runs", "P1g default deny + hidden rows; queued runs re-checked at fire time (dispatcher)"),
     ("assign_schedules", "P1g: manage is owner-only for a Personal employee (owner_only_denied); fire-time check pauses others"),
@@ -819,9 +829,10 @@ fn p1e_every_dashboard_arm_is_gated_or_allowlisted() {
     // The runtime default deny reads every request key the scan treats as
     // naming an employee (`slug` names skills / templates in the arms the
     // scan finds — reviewed: experts, skills — and is scan-only).
-    use super::super::personal_p1g_gate::{EMPLOYEE_ARRAY_KEYS, EMPLOYEE_PARAM_KEYS};
+    use super::super::personal_p1g_gate::{EMPLOYEE_ARRAY_KEYS, EMPLOYEE_PARAM_KEYS, EMPLOYEE_SCOPE_KEYS};
     for key in EMPLOYEE_KEYS.iter().filter(|key| **key != "slug") {
-        assert!(EMPLOYEE_PARAM_KEYS.contains(key) || EMPLOYEE_ARRAY_KEYS.contains(key), "{key} not checked at runtime");
+        assert!(EMPLOYEE_PARAM_KEYS.contains(key) || EMPLOYEE_ARRAY_KEYS.contains(key) || EMPLOYEE_SCOPE_KEYS.contains(key),
+            "{key} not checked at runtime");
     }
 }
 

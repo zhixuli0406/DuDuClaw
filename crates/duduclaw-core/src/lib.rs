@@ -1515,6 +1515,8 @@ pub mod egress_guard;
 pub mod process_tree;
 pub mod execution_gate;
 pub mod execution_blocking;
+/// SR5 round 3 N3: the one durable native-Linux protected-mode latch.
+pub mod protected_mode;
 
 pub mod mcp_tool_defs;
 

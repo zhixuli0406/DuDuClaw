@@ -24,14 +24,35 @@
 //!   mailbox): a Shared action, for any requester the Shared employee's
 //!   authority admitted; or
 //! - (Delegate only) it matches exactly ONE users.db account, that account is
-//!   Active, and the authenticated requester is that account (exact user id):
-//!   a Personal-like action, on behalf of the requesting human only.
+//!   Active, an Admin ATTESTED that the subject belongs to exactly that
+//!   account (SR4 item 1: `google.delegation.attest_subject`, users.db
+//!   `google_delegate_attestations`, revoked by any later email change of the
+//!   account), and the authenticated requester is that account (exact user
+//!   id): a Personal-like action, on behalf of the requesting human only. An
+//!   email match alone never admits (b): staff can set their own login email
+//!   to any unused address. No attestation ⇒ refused (existing delegate
+//!   configurations stay refused until an Admin attests; the dashboard shows
+//!   `attestation_required`, [`subject_notice`]).
 //!
 //! Anything else (an undesignated non-person subject, a person mailbox that
 //! is not the requester, an ambiguous email, a System requester for a person
 //! mailbox, a service account acting as a person) is refused. Tools are
 //! further limited to `[integrations.google_identity] tenant_scopes` (each
-//! entry must be one of the minted scopes; empty serves no data tool).
+//! entry must be one of the minted scopes; empty serves no data tool), and
+//! the minted assertion asks Google for exactly those scopes (SR4 item 5).
+//!
+//! SR4 item 2: a stored users.db (or history) email the normalizer rejects is
+//! `Unavailable`, never skipped — unless it provably names no mailbox at all
+//! (no `@`, or a domain without a dot such as the bootstrap `admin@local`).
+//! A staff member who sets their own email to a designated mailbox or a
+//! delegate subject still refuses it (fail closed), but the conflict is shown
+//! to Admins ([`subject_notice`]) and audited by the bridge.
+//!
+//! SR4 round 3: only a pure-ASCII value can be inert (N3); an attestation
+//! binds the live employee id and incarnation of the label, not the label
+//! alone (N2, [`Incarnation`]); the Admin notice names the holder an
+//! attestation would bind (N1); and an Admin identity test is admitted only
+//! for a subject the rule could admit ([`admit_for_identity_test`]).
 //!
 //! Every read fails closed: unreadable or malformed config or key material is
 //! `Unavailable`; a configuration that would let a failure fall back to a
@@ -41,6 +62,7 @@ use std::{io::Read as _, path::Path};
 
 use duduclaw_auth::UserDb;
 use duduclaw_core::google_identity::{self as gi, Effective, Fallback};
+use duduclaw_isolation::ids::EmployeeId;
 use duduclaw_mcp_boundary::VerificationError;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -101,6 +123,8 @@ impl std::fmt::Debug for TenantSource {
 impl TenantSource {
     pub(crate) fn kind(&self) -> TenantSourceKind { self.kind }
     pub(crate) fn subject(&self) -> &str { &self.subject }
+    /// SR4 item 5: the configured `tenant_scopes` (each a minted scope).
+    pub(crate) fn scopes(&self) -> &[String] { &self.scopes }
     /// `google_status` is metadata only; every data tool needs a configured scope.
     pub(crate) fn serves(&self, tool: &str) -> bool {
         tool == "google_status" || crate::google_personal::scopes::permitted(tool, &self.scopes)
@@ -133,6 +157,9 @@ pub(crate) enum Actor<'a> {
 pub(crate) struct SubjectAccount {
     pub(crate) user_id: String,
     pub(crate) active: bool,
+    /// SR4 item 1: an Admin attested that this employee's delegate subject
+    /// belongs to exactly this account, and its email has not changed since.
+    pub(crate) attested: bool,
 }
 
 /// Which branch of the subject rule admitted the call.
@@ -142,30 +169,270 @@ pub(crate) enum SubjectUse {
     RequestingUser,
 }
 
+/// SR4 item 2(iii): a stored login (or history) email, normalized like the
+/// subject. `Ok(None)`: it provably names no mailbox (no `@`, or a domain
+/// without a dot — e.g. the bootstrap `admin@local`), so it can never be the
+/// subject under any normalizer. Anything else the normalizer rejects is
+/// `Unavailable`: an address we cannot compare is never assumed to differ.
+///
+/// SR4 round 3 (N3): only a pure-ASCII value can be inert. A non-ASCII
+/// address the normalizer rejects (a full-width `＠`, an ideographic full stop
+/// `。`, an IDN domain) may well name a mailbox under another normalizer, so
+/// it is `Unavailable`.
+pub(crate) fn stored_email(raw: &str) -> Result<Option<String>, VerificationError> {
+    if let Ok(email) = gi::normalize_email(raw) { return Ok(Some(email)); }
+    if !raw.is_ascii() { return Err(VerificationError::Unavailable); }
+    let lowered = raw.trim().to_ascii_lowercase();
+    let inert = match lowered.rsplit_once('@') {
+        None => true,
+        Some((_, domain)) => {
+            let domain = domain.trim_end_matches('.');
+            !domain.is_empty() && !domain.contains('.')
+        }
+    };
+    if inert { Ok(None) } else { Err(VerificationError::Unavailable) }
+}
+
 /// Every users.db account whose email, normalized with the same normalizer as
-/// the configured subject, is exactly `subject`. Unreadable ⇒ `Unavailable`.
-pub(crate) fn subject_accounts(db: &UserDb, subject: &str) -> Result<Vec<SubjectAccount>, VerificationError> {
+/// the configured subject, is exactly `subject`. Unreadable, or a stored email
+/// that cannot be compared ([`stored_email`]) ⇒ `Unavailable`.
+///
+/// SR5 item 4: when no current account holds `subject` but one EVER did
+/// (`account_email_history`), a former-holder entry (no user id, inactive) is
+/// returned, so a designated service mailbox that was a person's login
+/// address at any time is refused at use time too ([`admit_subject`]).
+///
+/// SR4 item 1: a single current holder carries whether `agent`'s Admin
+/// attestation binds exactly `subject` to that account (unreadable ⇒
+/// `Unavailable`). SR4 round 3 (N2): and to exactly `employee`, the live
+/// employee id and incarnation holding the label; `None` (not known) never
+/// counts as attested.
+pub(crate) fn subject_accounts(db: &UserDb, agent: &str, employee: Option<Incarnation>, subject: &str)
+    -> Result<Vec<SubjectAccount>, VerificationError> {
     let users = db.list_users().map_err(|_| VerificationError::Unavailable)?;
-    Ok(users.into_iter()
-        .filter(|user| gi::normalize_email(&user.email).is_ok_and(|email| email == subject))
-        .map(|user| SubjectAccount { active: user.status == duduclaw_auth::models::UserStatus::Active, user_id: user.id })
-        .collect())
+    let mut accounts = Vec::new();
+    for user in users {
+        if stored_email(&user.email)?.as_deref() == Some(subject) {
+            accounts.push(SubjectAccount { active: user.status == duduclaw_auth::models::UserStatus::Active,
+                user_id: user.id, attested: false });
+        }
+    }
+    if accounts.is_empty() {
+        let history = db.account_email_history().map_err(|_| VerificationError::Unavailable)?;
+        let mut held = false;
+        for email in &history {
+            held |= stored_email(email)?.as_deref() == Some(subject);
+        }
+        if held { accounts.push(SubjectAccount { user_id: String::new(), active: false, attested: false }); }
+    }
+    if let [account] = accounts.as_mut_slice()
+        && !account.user_id.is_empty()
+    {
+        let state = db.google_delegate_attestation(agent).map_err(|_| VerificationError::Unavailable)?;
+        account.attested = match (state, employee) {
+            (Some(state), Some((id, incarnation))) =>
+                state.binds(subject, &account.user_id, &hex::encode(id.0), incarnation),
+            _ => false,
+        };
+    }
+    Ok(accounts)
+}
+
+/// SR4 round 3 (N2): an employee's immutable registry id and incarnation.
+/// An attestation binds both; a recreated label (new id) or a restore (next
+/// incarnation) needs a fresh attestation.
+pub(crate) type Incarnation = (EmployeeId, u32);
+
+/// The live employee id and incarnation holding `agent`, `None` when the
+/// lifecycle cannot be read (then nothing is attested). Blocking (SQLite +
+/// root IPC).
+pub(crate) fn current_incarnation(home: &Path, agent: &str) -> Option<Incarnation> {
+    crate::isolation_lifecycle::read_lifecycle(home, agent).ok()
+        .map(|lifecycle| (lifecycle.employee, lifecycle.incarnation))
+}
+
+/// Where a configured subject stands under D-5, independent of the requester
+/// (the requester check is [`admit_subject`]'s). Also the Admin notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubjectState {
+    /// (a) designated, and no account holds or ever held it.
+    ServiceMailbox,
+    /// Designated, but a users.db account holds or held the address (a person's
+    /// mailbox, or a staff member who set their own email to it). Refused.
+    MailboxHeldByAccount,
+    /// (b) one Active account, attested by an Admin: that person only.
+    AttestedPerson,
+    /// One Active account, but no binding Admin attestation. Refused.
+    AttestationRequired,
+    /// More than one account has the address. Refused.
+    Ambiguous,
+    /// The one holder is not Active, or only held it formerly. Refused.
+    PersonInactive,
+    /// Neither a designated mailbox nor a delegate person (incl. a service
+    /// account naming a person). Refused.
+    NotAdmissible,
+}
+impl SubjectState {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::ServiceMailbox => "service_mailbox",
+            Self::MailboxHeldByAccount => "service_mailbox_conflict",
+            Self::AttestedPerson => "attested_person",
+            Self::AttestationRequired => "attestation_required",
+            Self::Ambiguous => "ambiguous",
+            Self::PersonInactive => "person_inactive",
+            Self::NotAdmissible => "not_admissible",
+        }
+    }
+    fn message(self) -> &'static str {
+        match self {
+            Self::ServiceMailbox => "服務信箱：經授權的請求者都可透過這位員工使用。",
+            Self::MailboxHeldByAccount => "這個服務信箱是（或曾是）某位同仁的登入帳號，已停止使用。若是同仁自行改成此信箱，請他改回；否則請改用其他服務信箱。",
+            Self::AttestedPerson => "已由管理員確認此信箱屬於該同仁；只在該同仁本人提出請求時代表本人使用。",
+            Self::AttestationRequired => "需要管理員確認這個信箱屬於哪位同仁，確認前不會代表任何人使用。",
+            Self::Ambiguous => "有多個帳號使用這個信箱，無法判斷屬於誰，已停止使用。",
+            Self::PersonInactive => "這個信箱的同仁目前不是有效帳號，已停止使用。",
+            Self::NotAdmissible => "這個信箱既不是指定的服務信箱，也不是經管理員確認的同仁信箱，已停止使用。",
+        }
+    }
+}
+
+/// The subject's standing under D-5. Pure: callers supply the users.db facts.
+pub(crate) fn subject_state(source: &TenantSource, accounts: &[SubjectAccount]) -> SubjectState {
+    let designated = source.service_mailboxes.iter().any(|mailbox| mailbox == &source.subject);
+    match (designated, accounts) {
+        (true, []) => SubjectState::ServiceMailbox,
+        // A person's account can never be designated as a service mailbox.
+        (true, _) => SubjectState::MailboxHeldByAccount,
+        // A service account never acts as a person.
+        (false, _) if source.kind != TenantSourceKind::Delegate => SubjectState::NotAdmissible,
+        (false, []) => SubjectState::NotAdmissible,
+        (false, [account]) if account.user_id.is_empty() || !account.active => SubjectState::PersonInactive,
+        (false, [account]) if account.attested => SubjectState::AttestedPerson,
+        (false, [_]) => SubjectState::AttestationRequired,
+        (false, _) => SubjectState::Ambiguous,
+    }
 }
 
 /// The subject rule (D-5). Pure: callers supply the users.db facts.
 pub(crate) fn admit_subject(source: &TenantSource, actor: Actor<'_>, accounts: &[SubjectAccount])
     -> Result<SubjectUse, VerificationError> {
-    let designated = source.service_mailboxes.iter().any(|mailbox| mailbox == &source.subject);
-    match (designated, accounts) {
-        (true, []) => Ok(SubjectUse::ServiceMailbox),
-        // A person's account can never be designated as a service mailbox.
-        (true, _) => Err(VerificationError::BindingMismatch),
-        (false, [account]) if source.kind == TenantSourceKind::Delegate => match actor {
-            Actor::Human(user_id) if account.active && account.user_id == user_id => Ok(SubjectUse::RequestingUser),
-            _ => Err(VerificationError::BindingMismatch),
-        },
+    match (subject_state(source, accounts), actor, accounts) {
+        (SubjectState::ServiceMailbox, _, _) => Ok(SubjectUse::ServiceMailbox),
+        (SubjectState::AttestedPerson, Actor::Human(user_id), [account]) if account.user_id == user_id =>
+            Ok(SubjectUse::RequestingUser),
         _ => Err(VerificationError::BindingMismatch),
     }
+}
+
+/// SR4 round 3 (item 5 residual): an Admin's `google.identity.test` mints
+/// tokens for the configured subject without any requester, so in protected
+/// mode it is admitted only where the D-5 rule could admit SOME requester:
+/// a designated service mailbox, or a person an Admin attested for exactly
+/// this employee incarnation ([`admit_subject`]'s states). Anything else —
+/// notably an unattested delegate person — is refused with the Admin notice
+/// text, before anything is minted. Blocking reads.
+pub(crate) fn admit_for_identity_test(home: &Path, agent: &str, db: Option<&UserDb>, employee: Option<Incarnation>)
+    -> Result<(), String> {
+    let source = match read(home, agent) {
+        Ok(Some(source)) => source,
+        Ok(None) => return Err(SubjectState::NotAdmissible.message().to_owned()),
+        Err(TenantSourceError::Unavailable) => return Err(SOURCE_UNAVAILABLE.to_owned()),
+        Err(TenantSourceError::Refused) => return Err(SOURCE_REFUSED.to_owned()),
+    };
+    let db = db.ok_or_else(|| USERS_UNAVAILABLE.to_owned())?;
+    let accounts = subject_accounts(db, agent, employee, source.subject()).map_err(|_| USERS_UNAVAILABLE.to_owned())?;
+    match subject_state(&source, &accounts) {
+        SubjectState::ServiceMailbox | SubjectState::AttestedPerson => Ok(()),
+        refused => Err(refused.message().to_owned()),
+    }
+}
+
+const SOURCE_UNAVAILABLE: &str = "Google 租戶來源設定或金鑰無法讀取，已停止使用。";
+const SOURCE_REFUSED: &str = "這個 Google 設定在受保護模式下不允許（例如失敗時改用全公司帳號）。";
+const USERS_UNAVAILABLE: &str = "帳號資料無法讀取，或有無法辨識的登入 email，無法確認信箱歸屬，已停止使用。";
+
+/// SR4 items 1 / 2(iv): the Admin notice of `agent`'s tenant-source subject
+/// (`null` when its Google identity is no tenant source). Blocking reads.
+///
+/// SR4 round 3 (N1 (2)): for `attestation_required` and `attested_person`
+/// the notice names the single current holder the Admin attests (or
+/// attested): `holder {user_id, name, created_at, email_self_set}` —
+/// `email_self_set` when the account itself set the current address. (N2) An
+/// attestation counts only for the live employee incarnation of the label.
+///
+/// SR4 round 3 follow-up: the `holder` block (another account's name and
+/// creation time) is attached only when `include_holder` — the Admin path
+/// (`google.delegation.get`). `agents.google_identity_get` (Viewer) never
+/// receives it.
+pub(crate) fn subject_notice(home: &Path, agent: &str, db: Option<&UserDb>, include_holder: bool) -> serde_json::Value {
+    subject_notice_with(home, agent, db, include_holder, || current_incarnation(home, agent))
+}
+
+/// [`subject_notice`] with the live employee incarnation supplied (read only
+/// when the employee has a tenant source).
+pub(crate) fn subject_notice_with(home: &Path, agent: &str, db: Option<&UserDb>, include_holder: bool,
+    employee: impl FnOnce() -> Option<Incarnation>) -> serde_json::Value {
+    let notice = |state: &str, message: &str| json!({ "state": state, "message": message });
+    let source = match read(home, agent) {
+        Ok(None) => return serde_json::Value::Null,
+        Ok(Some(source)) => source,
+        Err(TenantSourceError::Unavailable) => return notice("unavailable", SOURCE_UNAVAILABLE),
+        Err(TenantSourceError::Refused) => return notice("refused", SOURCE_REFUSED),
+    };
+    let users_unavailable = || notice("users_unavailable", USERS_UNAVAILABLE);
+    let Some(db) = db else { return users_unavailable() };
+    let Ok(accounts) = subject_accounts(db, agent, employee(), source.subject()) else { return users_unavailable() };
+    let state = subject_state(&source, &accounts);
+    let mut value = json!({ "state": state.code(), "message": state.message(), "subject": source.subject(),
+        "kind": source.kind().as_str() });
+    if include_holder
+        && let (SubjectState::AttestationRequired | SubjectState::AttestedPerson, [account]) = (state, accounts.as_slice())
+    {
+        // The person an Admin attests is exactly this holder; unreadable ⇒
+        // nothing to attest against.
+        let Ok(Some(holder)) = db.google_delegate_holder(&account.user_id) else { return users_unavailable() };
+        value["holder"] = json!({ "user_id": holder.user_id, "name": holder.display_name,
+            "created_at": holder.created_at, "email_self_set": holder.email_self_set });
+    }
+    value
+}
+
+/// Upper bound of employee directories scanned for a delegate subject.
+const MAX_AGENT_SCAN: usize = 4096;
+
+/// SR4 item 2(iv): what a login address `email` now collides with — a
+/// designated service mailbox, or an employee's `delegate:<S>` subject. The
+/// collision itself stays fail closed at use time; this only names it for the
+/// Admin audit. Best effort: unreadable entries are skipped. Blocking reads.
+pub(crate) fn email_conflicts(home: &Path, email: &str) -> Vec<serde_json::Value> {
+    let Ok(Some(email)) = stored_email(email) else { return Vec::new() };
+    let mut conflicts = Vec::new();
+    if gi::read_home_config(home).is_ok_and(|config| config.service_mailboxes.contains(&email)) {
+        conflicts.push(json!({ "kind": "service_mailbox" }));
+    }
+    let Ok(entries) = std::fs::read_dir(home.join("agents")) else { return conflicts };
+    for entry in entries.flatten().take(MAX_AGENT_SCAN) {
+        let Some(agent) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if !duduclaw_core::is_valid_agent_id(&agent) { continue; }
+        if let gi::SectionRead::Present(section) = gi::read_agent_section(home, &agent)
+            && matches!(&section.identity, Some(gi::Selector::Delegate(subject)) if *subject == email)
+        {
+            conflicts.push(json!({ "kind": "delegate_subject", "agent_id": agent }));
+        }
+    }
+    conflicts
+}
+
+/// SR4 item 2(iv): audit a login email change that collides with a tenant
+/// subject (`google_tenant_subject_conflict`, Warning). No conflict ⇒ nothing.
+pub(crate) fn audit_email_conflict(home: &Path, user_id: &str, email: &str) {
+    let conflicts = email_conflicts(home, email);
+    if conflicts.is_empty() { return; }
+    crate::security_autopilot::audit_and_emit(home, &duduclaw_security::audit::AuditEvent::new(
+        "google_tenant_subject_conflict", "dashboard", duduclaw_security::audit::Severity::Warning,
+        json!({ "user_id": user_id, "address": stored_email(email).ok().flatten(), "conflicts": conflicts,
+            "effect": "refused_until_resolved" })));
 }
 
 /// The tenant source configured for `agent` now, if any. Blocking file
