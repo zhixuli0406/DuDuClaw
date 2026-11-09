@@ -336,7 +336,10 @@ tokio::task_local! {
     /// but it is not a call (no name prefix, no `@` semantics). Without it two
     /// employees' bots in one chat (and every Telegram DM: a person has the
     /// same private-chat id with every bot) shared one session, and the second
-    /// employee's turn failed on the session-ownership check.
+    /// employee's turn failed on the session-ownership check. The shared
+    /// Telegram bot also sets it around a turn routed to the sender's 主要 AI
+    /// 員工 (RM-172), for the same reason: the DM may already hold the
+    /// default employee's session.
     pub static OWN_BOT_TURN: ();
 }
 

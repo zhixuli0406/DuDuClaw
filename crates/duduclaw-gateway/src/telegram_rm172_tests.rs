@@ -75,7 +75,7 @@ async fn fixture(verified: bool) -> Fixture {
 
 fn routed_to(route: SharedRoute) -> Option<String> {
     match route {
-        SharedRoute::Bound(agent) => Some(agent),
+        SharedRoute::Bound(agent) | SharedRoute::Primary(agent) => Some(agent),
         SharedRoute::Unbound => None,
         SharedRoute::Guide(_) => Some("<guide>".into()),
     }
@@ -257,6 +257,118 @@ async fn rm172_shared_bot_binding_mode_routes_a_verified_primary() {
     // Without a usable primary the guidance is unchanged too.
     f.db.set_primary_agent(&f.user_id, None).unwrap();
     assert_eq!(route(&f, true).await.as_deref(), Some("<guide>"));
+}
+
+/// The DM conversation the reply-path tests below use (each fixture has its
+/// own sessions database, so the plain id is not shared between tests).
+fn dm_conversation() -> String {
+    format!("telegram:{TG_DM}")
+}
+
+/// Run one shared-bot turn for the staff member in their DM the way the
+/// message loop does (route → session → reply), with the model replaced by
+/// the e2e seam: it claims the session for the answering employee like the
+/// real turn and answers `OWN_BOT_REPLY agent=<id> session=<sid>`, or
+/// `SESSION_CLASH …` when the session belongs to another employee.
+async fn dm_turn(f: &Fixture, text: &str) -> (String, String) {
+    let conversation = dm_conversation();
+    let route = resolve_shared_route(&f.ctx, TG_USER, true).await;
+    let session = shared_route_session(&conversation, &route);
+    let (reply, _guard, _agent) =
+        shared_route_reply(&f.ctx, route, text, &conversation, TG_USER, None).await;
+    (session, reply)
+}
+
+/// The employee that owns `session` must be `owner`: claiming it for
+/// `other` fails the ownership check.
+async fn assert_owned_by(f: &Fixture, session: &str, owner: &str, other: &str) {
+    assert!(
+        f.ctx.session_manager.get_or_create(session, owner).await.is_ok(),
+        "{session} belongs to {owner}"
+    );
+    assert!(
+        f.ctx.session_manager.get_or_create(session, other).await.is_err(),
+        "{session} is not {other}'s"
+    );
+}
+
+#[tokio::test]
+async fn rm172_existing_default_session_does_not_block_primary() {
+    let f = fixture(true).await;
+    crate::agent_channels::e2e_seam::arm(f._dir.path());
+    let conversation = dm_conversation();
+    // The staff member chatted with the default employee in this DM before
+    // their identity was verified / their primary was set.
+    f.ctx
+        .session_manager
+        .get_or_create(&conversation, "dudu")
+        .await
+        .unwrap();
+    // Control: answering as the primary in the plain DM session is exactly
+    // the ownership clash this guards against.
+    let clash = build_guarded_reply_for_agent("幫我算帳", &f.ctx, "finance", &conversation, TG_USER, None)
+        .await;
+    assert!(clash.text.contains("SESSION_CLASH"), "{}", clash.text);
+
+    let (session, reply) = dm_turn(&f, "幫我算帳").await;
+    let bucket = crate::trigger_route::called_session(&conversation, "finance");
+    assert_eq!(session, bucket, "the primary answers in its own bucket");
+    assert!(!reply.contains("SESSION_CLASH"), "{reply}");
+    assert!(
+        reply.contains(&format!("agent=finance session={bucket}")),
+        "{reply}"
+    );
+    // The default employee's conversation is untouched and still its own.
+    assert_owned_by(&f, &conversation, "dudu", "finance").await;
+    assert_owned_by(&f, &bucket, "finance", "dudu").await;
+}
+
+#[tokio::test]
+async fn rm172_primary_change_uses_new_bucket() {
+    let f = fixture(true).await;
+    crate::agent_channels::e2e_seam::arm(f._dir.path());
+    let conversation = dm_conversation();
+    let finance = crate::trigger_route::called_session(&conversation, "finance");
+    let sales = crate::trigger_route::called_session(&conversation, "sales-rep");
+
+    let (session, reply) = dm_turn(&f, "幫我算帳").await;
+    assert_eq!(session, finance);
+    assert!(reply.contains(&format!("agent=finance session={finance}")), "{reply}");
+
+    // The primary changes to another employee they own.
+    f.db.bind_agent(&f.user_id, "sales-rep", AccessLevel::Owner).unwrap();
+    f.db.set_primary_agent(&f.user_id, Some("sales-rep")).unwrap();
+    let (session, reply) = dm_turn(&f, "這個月的報價").await;
+    assert_eq!(session, sales, "the new primary has its own bucket");
+    assert!(!reply.contains("SESSION_CLASH"), "{reply}");
+    assert!(reply.contains(&format!("agent=sales-rep session={sales}")), "{reply}");
+    // The earlier primary's history stays in its bucket.
+    assert_owned_by(&f, &finance, "finance", "sales-rep").await;
+}
+
+#[tokio::test]
+async fn rm172_fallback_after_revocation_uses_plain_session() {
+    let f = fixture(true).await;
+    crate::agent_channels::e2e_seam::arm(f._dir.path());
+    let conversation = dm_conversation();
+    let finance = crate::trigger_route::called_session(&conversation, "finance");
+
+    let (session, reply) = dm_turn(&f, "幫我算帳").await;
+    assert_eq!(session, finance);
+    assert!(reply.contains(&format!("agent=finance session={finance}")), "{reply}");
+
+    // Access to the primary is revoked: the DM falls back to the default
+    // employee, in the plain conversation session as before RM-172.
+    f.db.unbind_agent(&f.user_id, "finance").unwrap();
+    let (session, reply) = dm_turn(&f, "你好").await;
+    assert_eq!(session, conversation);
+    assert!(!reply.contains("SESSION_CLASH"), "{reply}");
+    assert!(
+        reply.contains(&format!("agent=dudu session={conversation}")),
+        "{reply}"
+    );
+    // The primary's bucket is left as it was.
+    assert_owned_by(&f, &finance, "finance", "dudu").await;
 }
 
 #[tokio::test]

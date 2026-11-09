@@ -75,6 +75,8 @@ The waiting state is kept in memory, so a gateway restart forgets it and the nex
 
 A called employee answers in its own session inside the conversation (`<conversation>#agent:<id>`), on every channel and in WebChat. Its history, saved secrets and pending goal confirmations never mix with the default employee's. The default employee does not see what the called employee answered, and the other way round.
 
+On the shared Telegram bot, a one-to-one chat routed to the person's primary AI employee is kept the same way: the primary answers in its own session of the chat, separate from the default employee's. Earlier history with the default employee stays where it was; if the primary changes, or the chat falls back to the default employee, each keeps its own history. `/new`, `/reset` and the **New conversation** button clear the session of whoever currently answers in the chat. Access rules and human takeover still apply to the chat itself.
+
 ## Group "mention only"
 
 - **LINE**: with **mention only** on, the bot answers only a mention of the bot itself, messages that call an employee by `@` (or ask for the `@` list), and the one message a called employee is waiting for. Before v1.76.0 this setting silenced the whole group. LINE does not tell a bot which of its own messages was quoted, so quoting the bot does not count.
