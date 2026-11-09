@@ -320,7 +320,11 @@ pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAut
     }
 
     let gate = refresh_gate(home_dir, GITHUB_PROVIDER);
-    let _refreshing = gate.lock().await;
+    // SR4 round 3 follow-up: the wait for another in-process refresh is bounded
+    // too (its exchange is time-bounded, so a longer wait means it is stuck).
+    let _refreshing = tokio::time::timeout(REFRESH_FILE_LOCK_WAIT, gate.lock())
+        .await
+        .map_err(|_| GithubAuthError::RefreshFailed(REFRESH_LOCK_UNAVAILABLE.into()))?;
     // SR4 round 3: and across processes (held until this function returns).
     let _cross_process = refresh_file_lock(home_dir).await?;
     // Re-read under the lock: another task or process may have refreshed meanwhile.
@@ -830,6 +834,18 @@ fn extract_api_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SR4 round 3 follow-up: a refresh gate that stays held is waited on for
+    /// at most `REFRESH_FILE_LOCK_WAIT`, then the call fails closed.
+    #[tokio::test(start_paused = true)]
+    async fn sr4r3f_refresh_gate_wait_times_out_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let gate = refresh_gate(home.path(), GITHUB_PROVIDER);
+        let _held = gate.lock().await;
+        let result = get_valid_github_token(home.path()).await;
+        assert!(matches!(result, Err(GithubAuthError::RefreshFailed(ref m)) if m == REFRESH_LOCK_UNAVAILABLE),
+            "got {result:?}");
+    }
 
     #[test]
     fn clamp_bounds() {

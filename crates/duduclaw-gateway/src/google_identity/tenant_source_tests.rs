@@ -264,31 +264,31 @@ fn sr4_subject_notice_surfaces_conflicts_and_missing_attestation() {
     home.config("");
     let db = UserDb::new(&home.path().join("users.db")).unwrap();
     home.agent("identity = \"owner\"");
-    assert_eq!(subject_notice(home.path(), "bot", Some(&db)), serde_json::Value::Null);
+    assert_eq!(subject_notice(home.path(), "bot", Some(&db), true), serde_json::Value::Null);
     // A delegate person without an attestation.
     home.agent("identity = \"delegate:alice@customer.com\"");
     let alice = person(&db, "alice@customer.com");
-    assert_eq!(subject_notice(home.path(), "bot", Some(&db))["state"], "attestation_required");
-    assert_eq!(subject_notice(home.path(), "bot", None)["state"], "users_unavailable");
+    assert_eq!(subject_notice(home.path(), "bot", Some(&db), true)["state"], "attestation_required");
+    assert_eq!(subject_notice(home.path(), "bot", None, true)["state"], "users_unavailable");
     attest(&db, "bot", "alice@customer.com", &alice).unwrap();
-    let notice = subject_notice_with(home.path(), "bot", Some(&db), || Some(EMP));
+    let notice = subject_notice_with(home.path(), "bot", Some(&db), true, || Some(EMP));
     assert_eq!((notice["state"].as_str(), notice["subject"].as_str()), (Some("attested_person"), Some("alice@customer.com")));
     // Without a readable live employee lifecycle nothing is attested.
-    assert_eq!(subject_notice(home.path(), "bot", Some(&db))["state"], "attestation_required");
+    assert_eq!(subject_notice(home.path(), "bot", Some(&db), true)["state"], "attestation_required");
     // Alice gives the address up: only a former holder is left.
     db.change_own_email(&alice, "alice2@customer.com").unwrap();
-    assert_eq!(subject_notice(home.path(), "bot", Some(&db))["state"], "person_inactive");
+    assert_eq!(subject_notice(home.path(), "bot", Some(&db), true)["state"], "person_inactive");
     // A staff member blocks a designated service mailbox: shown, still refused.
     home.agent("identity = \"delegate:support@customer.com\"");
-    assert_eq!(subject_notice(home.path(), "bot", Some(&db))["state"], "service_mailbox");
+    assert_eq!(subject_notice(home.path(), "bot", Some(&db), true)["state"], "service_mailbox");
     let staff = person(&db, "staff@customer.com");
     db.change_own_email(&staff, "Support@customer.com").unwrap();
-    let notice = subject_notice(home.path(), "bot", Some(&db));
+    let notice = subject_notice(home.path(), "bot", Some(&db), true);
     assert_eq!(notice["state"], "service_mailbox_conflict");
     assert!(notice["message"].as_str().unwrap().contains("服務信箱"));
     // An unreadable configuration is unavailable, never "no tenant source".
     std::fs::write(home.path().join("config.toml"), "not = [toml").unwrap();
-    assert_eq!(subject_notice(home.path(), "bot", Some(&db))["state"], "unavailable");
+    assert_eq!(subject_notice(home.path(), "bot", Some(&db), true)["state"], "unavailable");
 }
 
 /// SR4 item 2(iv): a login address colliding with a tenant subject is named
@@ -357,7 +357,7 @@ fn sr4r3_subject_notice_names_the_holder() {
     let mallory = db.create_user("mallory@customer.com", "Mallory", "correct-horse-battery-staple",
         duduclaw_auth::UserRole::Employee).unwrap();
     db.change_own_email(&mallory.id, "CEO@customer.com").unwrap();
-    let notice = subject_notice_with(home.path(), "bot", Some(&db), || Some(EMP));
+    let notice = subject_notice_with(home.path(), "bot", Some(&db), true, || Some(EMP));
     assert_eq!(notice["state"], "attestation_required");
     let holder = &notice["holder"];
     assert_eq!((holder["user_id"].as_str(), holder["name"].as_str()), (Some(mallory.id.as_str()), Some("Mallory")));
@@ -366,12 +366,33 @@ fn sr4r3_subject_notice_names_the_holder() {
     // An address set by an Admin (or at account creation) is not self-set.
     home.agent("identity = \"delegate:alice@customer.com\"");
     let alice = person(&db, "alice@customer.com");
-    let notice = subject_notice_with(home.path(), "bot", Some(&db), || Some(EMP));
+    let notice = subject_notice_with(home.path(), "bot", Some(&db), true, || Some(EMP));
     assert_eq!((notice["holder"]["user_id"].as_str(), notice["holder"]["email_self_set"].as_bool()),
         (Some(alice.as_str()), Some(false)));
     // Other states carry no holder.
     home.agent("identity = \"delegate:support@customer.com\"");
-    assert!(subject_notice_with(home.path(), "bot", Some(&db), || Some(EMP)).get("holder").is_none());
+    assert!(subject_notice_with(home.path(), "bot", Some(&db), true, || Some(EMP)).get("holder").is_none());
+}
+
+/// SR4 round 3 follow-up: the holder (another account's name / creation time)
+/// is Admin-only; the Viewer path (`agents.google_identity_get`) passes
+/// `include_holder = false` and never gets it, whatever the state.
+#[test]
+fn sr4r3f_identity_get_never_returns_holder_to_viewer() {
+    let home = Home::new();
+    home.sealed(SEALED);
+    home.config("");
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    home.agent("identity = \"delegate:ceo@customer.com\"");
+    let mallory = db.create_user("mallory@customer.com", "Mallory", "correct-horse-battery-staple",
+        duduclaw_auth::UserRole::Employee).unwrap();
+    db.change_own_email(&mallory.id, "CEO@customer.com").unwrap();
+    let viewer = subject_notice_with(home.path(), "bot", Some(&db), false, || Some(EMP));
+    assert_eq!(viewer["state"], "attestation_required", "the state itself is still shown");
+    assert!(viewer.get("holder").is_none(), "{viewer}");
+    assert!(!viewer.to_string().contains("Mallory") && !viewer.to_string().contains(&mallory.id));
+    let admin = subject_notice_with(home.path(), "bot", Some(&db), true, || Some(EMP));
+    assert_eq!(admin["holder"]["name"], "Mallory");
 }
 
 /// SR4 round 3 (item 5 residual): `google.identity.test` mints only for a

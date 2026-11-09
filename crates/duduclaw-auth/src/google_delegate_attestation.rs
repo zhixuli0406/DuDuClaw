@@ -56,6 +56,10 @@ pub const REFUSED_ACTION: &str = "google.delegate_subject_attest_refused";
 pub const SELF_SET_ACKNOWLEDGED_ACTION: &str = "google.delegate_subject_self_set_acknowledged";
 /// Refusal reason code of [`HOLDER_MISMATCH`] (audit detail `reason`).
 pub const HOLDER_MISMATCH_CODE: &str = "attest_holder_mismatch";
+/// Refusal reason code of [`NOT_ONE_PERSON`] (audit detail `reason`).
+pub const NOT_ONE_PERSON_CODE: &str = "attest_not_one_person";
+/// Refusal reason code of [`SELF_SET_UNACKNOWLEDGED`] (audit detail `reason`).
+pub const SELF_SET_UNACKNOWLEDGED_CODE: &str = "attest_self_set_unacknowledged";
 
 /// Refusal texts (end-user zh-TW; never an email of another account).
 pub const NOT_ONE_PERSON: &str = "這個信箱目前不是恰好一位有效同仁的登入帳號，無法證明屬於誰。";
@@ -200,7 +204,10 @@ pub fn email_self_set(conn: &Connection, user_id: &str) -> Result<bool, String> 
         )
         .optional()
         .map_err(|e| format!("attestation: {e}"))?;
-    Ok(latest.is_some_and(|(actor, owner)| owner == 1 && actor.as_deref() == Some(user_id)))
+    // An unattributed row (`actor_user_id IS NULL`: a raw write, origin
+    // unknown) cannot be shown to be someone else's, so it needs the same
+    // acknowledgement as a self-set address.
+    Ok(latest.is_some_and(|(actor, owner)| (owner == 1 && actor.as_deref() == Some(user_id)) || actor.is_none()))
 }
 
 /// SR4 round 3 (N2): remove `agent`'s attestation inside a caller-owned
@@ -265,8 +272,23 @@ impl UserDb {
                 .filter(|row: &(String, String, String, String)| email_matches(&row.1))
                 .collect()
         };
-        let [(user_id, email, status, display_name)] = holders.as_slice() else { return Err(NOT_ONE_PERSON.into()) };
-        if status != "active" { return Err(NOT_ONE_PERSON.into()); }
+        let [(user_id, email, status, display_name)] = holders.as_slice() else {
+            let count = holders.len();
+            audit(&tx, Some(attested_by), REFUSED_ACTION, agent_id, &serde_json::json!({
+                "agent_id": agent_id, "subject": subject, "reason": NOT_ONE_PERSON_CODE,
+                "requested_user_id": shown, "matching_accounts": count,
+            }), &now)?;
+            tx.commit().map_err(|e| format!("attestation: {e}"))?;
+            return Err(NOT_ONE_PERSON.into());
+        };
+        if status != "active" {
+            audit(&tx, Some(attested_by), REFUSED_ACTION, agent_id, &serde_json::json!({
+                "agent_id": agent_id, "subject": subject, "reason": NOT_ONE_PERSON_CODE,
+                "requested_user_id": shown, "holder_user_id": user_id, "holder_status": status,
+            }), &now)?;
+            tx.commit().map_err(|e| format!("attestation: {e}"))?;
+            return Err(NOT_ONE_PERSON.into());
+        }
         if user_id != shown {
             // N1 (1): the address is held by someone other than the person the
             // Admin was shown. Refused and audited; nothing else changes.
@@ -278,7 +300,14 @@ impl UserDb {
             return Err(HOLDER_MISMATCH.into());
         }
         let self_set = email_self_set(&tx, user_id)?;
-        if self_set && !acknowledge_self_set { return Err(SELF_SET_UNACKNOWLEDGED.into()); }
+        if self_set && !acknowledge_self_set {
+            audit(&tx, Some(attested_by), REFUSED_ACTION, agent_id, &serde_json::json!({
+                "agent_id": agent_id, "subject": subject, "reason": SELF_SET_UNACKNOWLEDGED_CODE,
+                "requested_user_id": shown, "holder_user_id": user_id,
+            }), &now)?;
+            tx.commit().map_err(|e| format!("attestation: {e}"))?;
+            return Err(SELF_SET_UNACKNOWLEDGED.into());
+        }
         let seq = crate::credential_changes::high_water(&tx)?;
         tx.execute(
             "INSERT INTO google_delegate_attestations
@@ -459,9 +488,10 @@ mod tests {
         db.conn().execute("UPDATE users SET email='raw@customer.com' WHERE id=?1", [&alice.id]).unwrap();
         assert!(db.google_delegate_attestation("bot").unwrap().unwrap().email_changed_since);
         // Another account's change never revokes Alice's attestation. The raw
-        // write is unattributed, so the address is no longer self-set.
+        // write is unattributed (origin unknown), so it needs the acknowledgement too.
         db.conn().execute("UPDATE users SET email='alice@customer.com' WHERE id=?1", [&alice.id]).unwrap();
-        attest(&db, "bot", "alice@customer.com", &alice.id).unwrap();
+        assert_eq!(attest(&db, "bot", "alice@customer.com", &alice.id).unwrap_err(), super::SELF_SET_UNACKNOWLEDGED);
+        db.attest_google_delegate(&acknowledged, &lower("alice@customer.com"), "admin-id").unwrap();
         let carol = db.create_user("carol@customer.com", "Carol", "password1", UserRole::Employee).unwrap();
         db.change_own_email(&carol.id, "carol2@customer.com").unwrap();
         assert!(db.google_delegate_attestation("bot").unwrap().unwrap().binds("alice@customer.com", &alice.id, EMPLOYEE, 0));
@@ -509,6 +539,32 @@ mod tests {
         let bob = db.create_user("bob@customer.com", "Bob", "password1", UserRole::Employee).unwrap();
         db.change_email("admin-id", &bob.id, "bob2@customer.com").unwrap();
         assert!(!db.google_delegate_holder(&bob.id).unwrap().unwrap().email_self_set);
+    }
+
+    /// SR4 round 3 follow-up: an email change of unknown origin (raw write,
+    /// `actor_user_id IS NULL`) needs the acknowledgement; an Admin change is
+    /// positively attributed and does not; the refusals are audited.
+    #[test]
+    fn sr4r3f_unattributed_email_change_requires_acknowledgement() {
+        let (db, _dir) = db();
+        let dave = db.create_user("dave@customer.com", "Dave", "password1", UserRole::Employee).unwrap();
+        db.conn().execute("UPDATE users SET email='dave2@customer.com' WHERE id=?1", [&dave.id]).unwrap();
+        assert!(db.google_delegate_holder(&dave.id).unwrap().unwrap().email_self_set);
+        assert_eq!(attest(&db, "bot", "dave2@customer.com", &dave.id).unwrap_err(), super::SELF_SET_UNACKNOWLEDGED);
+        let refused = db.query_audit_log(None, Some(super::REFUSED_ACTION), 10).unwrap();
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].detail.as_deref().unwrap_or_default().contains(super::SELF_SET_UNACKNOWLEDGED_CODE));
+        let acknowledged = AttestationRequest { acknowledge_self_set: true, ..request("bot", "dave2@customer.com", &dave.id) };
+        assert!(db.attest_google_delegate(&acknowledged, &lower("dave2@customer.com"), "admin-id").is_ok());
+        // An Admin change is attributed to the Admin, so it is not "unknown".
+        let erin = db.create_user("erin@customer.com", "Erin", "password1", UserRole::Employee).unwrap();
+        db.change_email("admin-id", &erin.id, "erin2@customer.com").unwrap();
+        assert!(!db.google_delegate_holder(&erin.id).unwrap().unwrap().email_self_set);
+        assert!(attest(&db, "bot2", "erin2@customer.com", &erin.id).is_ok());
+        // Not-one-person refusals are audited too.
+        assert_eq!(attest(&db, "bot3", "ghost@customer.com", &erin.id).unwrap_err(), super::NOT_ONE_PERSON);
+        let refused = db.query_audit_log(None, Some(super::REFUSED_ACTION), 10).unwrap();
+        assert!(refused.iter().any(|row| row.detail.as_deref().unwrap_or_default().contains(super::NOT_ONE_PERSON_CODE)));
     }
 
     /// SR4 round 3 (N2): an attestation binds the employee id and

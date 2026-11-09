@@ -39,7 +39,10 @@ fn sec_audit(home: &Path, event: &str, severity: Severity, ctx: &UserContext, de
 
 /// The identity of one employee as the dashboard shows it, plus whether it
 /// can be used right now (local checks only — no network, no unsealing).
-fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People) -> Value {
+///
+/// `include_holder`: attach the tenant-subject holder (another account's name
+/// and creation time) — Admin path only (`google.delegation.get`).
+fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People, include_holder: bool) -> Value {
     let section = gi::read_agent_section(home, agent);
     let eff = gi::combine(&section, &gi::read_home_config(home));
     let (state, message) = match &eff.effective {
@@ -111,7 +114,7 @@ fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People) 
         // applies, the subject's standing (attestation required, a staff
         // account claiming a service mailbox, …). `null` elsewhere.
         "tenant_subject": if crate::runtime_readiness::is_protected_linux() {
-            crate::google_identity::tenant_source::subject_notice(home, agent, people.user_db())
+            crate::google_identity::tenant_source::subject_notice(home, agent, people.user_db(), include_holder)
         } else {
             Value::Null
         },
@@ -161,7 +164,7 @@ impl MethodHandler {
             names.sort();
             names
                 .iter()
-                .map(|n| identity_view(&home, n, people.as_ref()))
+                .map(|n| identity_view(&home, n, people.as_ref(), true))
                 .collect()
         };
         WsFrame::ok_response(
@@ -381,7 +384,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
         let people = self.people().await;
-        WsFrame::ok_response("", identity_view(&self.home_dir, agent_id, people.as_ref()))
+        WsFrame::ok_response("", identity_view(&self.home_dir, agent_id, people.as_ref(), false))
     }
 
     /// `agents.google_identity_set {agent_id, identity, fallback?, requesters?}`.
@@ -557,7 +560,7 @@ impl MethodHandler {
         let people = self.people().await;
         WsFrame::ok_response(
             "",
-            identity_view(&self.home_dir, &agent_id, people.as_ref()),
+            identity_view(&self.home_dir, &agent_id, people.as_ref(), false),
         )
     }
 

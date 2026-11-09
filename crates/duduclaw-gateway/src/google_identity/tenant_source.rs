@@ -360,13 +360,18 @@ const USERS_UNAVAILABLE: &str = "帳號資料無法讀取，或有無法辨識�
 /// attested): `holder {user_id, name, created_at, email_self_set}` —
 /// `email_self_set` when the account itself set the current address. (N2) An
 /// attestation counts only for the live employee incarnation of the label.
-pub(crate) fn subject_notice(home: &Path, agent: &str, db: Option<&UserDb>) -> serde_json::Value {
-    subject_notice_with(home, agent, db, || current_incarnation(home, agent))
+///
+/// SR4 round 3 follow-up: the `holder` block (another account's name and
+/// creation time) is attached only when `include_holder` — the Admin path
+/// (`google.delegation.get`). `agents.google_identity_get` (Viewer) never
+/// receives it.
+pub(crate) fn subject_notice(home: &Path, agent: &str, db: Option<&UserDb>, include_holder: bool) -> serde_json::Value {
+    subject_notice_with(home, agent, db, include_holder, || current_incarnation(home, agent))
 }
 
 /// [`subject_notice`] with the live employee incarnation supplied (read only
 /// when the employee has a tenant source).
-pub(crate) fn subject_notice_with(home: &Path, agent: &str, db: Option<&UserDb>,
+pub(crate) fn subject_notice_with(home: &Path, agent: &str, db: Option<&UserDb>, include_holder: bool,
     employee: impl FnOnce() -> Option<Incarnation>) -> serde_json::Value {
     let notice = |state: &str, message: &str| json!({ "state": state, "message": message });
     let source = match read(home, agent) {
@@ -381,7 +386,9 @@ pub(crate) fn subject_notice_with(home: &Path, agent: &str, db: Option<&UserDb>,
     let state = subject_state(&source, &accounts);
     let mut value = json!({ "state": state.code(), "message": state.message(), "subject": source.subject(),
         "kind": source.kind().as_str() });
-    if let (SubjectState::AttestationRequired | SubjectState::AttestedPerson, [account]) = (state, accounts.as_slice()) {
+    if include_holder
+        && let (SubjectState::AttestationRequired | SubjectState::AttestedPerson, [account]) = (state, accounts.as_slice())
+    {
         // The person an Admin attests is exactly this holder; unreadable ⇒
         // nothing to attest against.
         let Ok(Some(holder)) = db.google_delegate_holder(&account.user_id) else { return users_unavailable() };

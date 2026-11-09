@@ -504,7 +504,13 @@ impl UserDb {
         if affected == 0 {
             return Err("user not found".to_string());
         }
-        if by_owner { crate::credential_changes::stamp_owner(&tx, since, user_id)?; }
+        if by_owner {
+            crate::credential_changes::stamp_owner(&tx, since, user_id)?;
+        } else {
+            // SR4 round 3 follow-up: an Admin / system change is positively
+            // attributed to its actor (never left "origin unknown").
+            crate::credential_changes::stamp_actor(&tx, since, actor)?;
+        }
         // SR5 item 4: every email change is audited in its own transaction
         // (the history row is written by the `account_email_history` trigger).
         let detail = serde_json::json!({
