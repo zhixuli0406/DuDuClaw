@@ -1806,6 +1806,9 @@ impl SqliteMemoryEngine {
                 )",
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            // F6fb2 item 2: a lazily created archive gets the writer-gate
+            // triggers before its first write.
+            crate::label_gate::refresh_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
             // Ownership check up front so a cross-agent id never reaches the
             // archive INSERT (which would leak another agent's content into
@@ -1830,7 +1833,9 @@ impl SqliteMemoryEngine {
 
             let apply = || -> std::result::Result<bool, String> {
                 crate::isolation_io::verify().map_err(|e| e.to_string())?;
-                conn.execute(
+                // F6fb2: the archive copy of a row deleted below is a move
+                // (narrowing), admitted on a refused label for this label only.
+                crate::label_gate::narrowing_write(crate::label_gate::NarrowingWrite::ArchiveMove, Some(agent_id), || conn.execute(
                     "INSERT OR IGNORE INTO memories_archive
                          (id, agent_id, content, timestamp, tags, layer,
                           importance, access_count, last_accessed, source_event)
@@ -1838,7 +1843,7 @@ impl SqliteMemoryEngine {
                             importance, access_count, last_accessed, source_event
                      FROM memories WHERE id = ?1 AND agent_id = ?2",
                     params![memory_id, agent_id],
-                )
+                ))
                 .map_err(|e| format!("archive INSERT failed: {e}"))?;
 
                 conn.execute(

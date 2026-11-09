@@ -455,6 +455,9 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
         }
         quarantine::insert_root_allocation(&tx, employee, &root_item).map_err(|_| Unavailable)?;
         tx.commit().map_err(|_| Unavailable)?;
+        // F6fb2: the label is refused from this commit on; no connection may
+        // reuse a writer-gate answer cached before it.
+        duduclaw_memory::label_gate::invalidate_cached_answers();
         (held, stripped, seal_state)
     };
     let _ = seal_state;

@@ -179,6 +179,9 @@ pub(crate) fn insert_quarantine(tx: &Connection, row: &NewQuarantine<'_>) -> Res
         params![hex::encode(row.employee.0), row.incarnation, row.label,
             if row.owner.is_some() { "personal" } else { "shared" }, row.owner, row.tenant, row.quarantined_at,
             dev, ino, row.seal, row.principal_snapshot.to_string(), row.stripped.to_string()])?;
+    // F6fb2: cached writer-gate answers for the label are stale now (the
+    // tombstone invalidates again after its commit).
+    duduclaw_memory::label_gate::invalidate_cached_answers();
     Ok(changed == 1)
 }
 

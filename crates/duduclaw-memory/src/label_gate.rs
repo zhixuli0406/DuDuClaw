@@ -34,6 +34,24 @@
 //! tombstones, revocation and fence records, [`MEMORY_NARROWING_TABLES`]),
 //! whose inserts revoke rather than plant. The gateway's own re-key / purge /
 //! tombstone connections are opened separately and carry no triggers.
+//!
+//! F6fb2 (follow-up round):
+//! - **Narrowing writes on a refused label** that land in a gated table — the
+//!   GDPR erasure record ([`NarrowingWrite::ErasureRecord`], written by
+//!   `gdpr_erase` after its deletes) and the archive copy of a row being
+//!   forgotten or decayed ([`NarrowingWrite::ArchiveMove`]) — run inside
+//!   [`narrowing_write`]: a scope on the calling thread around exactly that
+//!   one statement (the SQL function runs synchronously on the thread that
+//!   steps the statement), optionally limited to one label. Only then does a
+//!   refused label pass; every admission is counted and logged once per scope
+//!   (`tracing` target `duduclaw_memory::label_gate`, kind, label, rows). The
+//!   scope is crate-private, so no other writer can enter it; outside it the
+//!   gate is unchanged (an ordinary INSERT of the label still aborts).
+//! - **Tables created lazily** after the connection opened (memory.db
+//!   `memories_archive`, created by the first `forget` / decay) get their
+//!   triggers from [`refresh_on_engine`], called right after the lazy
+//!   `CREATE TABLE` on the same connection, before the first write.
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -61,6 +79,20 @@ pub const REFUSED: &str = "label write refused: this employee is tombstoned or q
 /// lifecycle reads of a sweep over many rows).
 const CACHE_TTL: Duration = Duration::from_millis(250);
 const CACHE_MAX: usize = 256;
+
+/// Bumped by [`invalidate_cached_answers`]: every connection's cached gate
+/// answers from an older epoch are re-read (F6fb2).
+static CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drop every connection's cached gate answers (F6fb2). The gateway calls it
+/// right after it changes a label's lifecycle (quarantine row written,
+/// tombstone committed), so a write in the next 250 ms cannot reuse a
+/// "writable" answer read before the change.
+pub fn invalidate_cached_answers() {
+    CACHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn cache_epoch() -> u64 { CACHE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) }
 
 /// Install the gate (once per process). `false` when one is already installed
 /// (the first one stays; a gate is never replaced or removed).
@@ -131,17 +163,96 @@ pub(crate) fn install_on_engine(conn: &Connection) -> rusqlite::Result<usize> {
     install_write_triggers(conn, installed_gate, &LABEL_COLUMNS, None, MEMORY_RULES)
 }
 
+/// F6fb2 item 2: after a table was created lazily on an engine connection
+/// (e.g. `memories_archive`), create the gate triggers for it (and any other
+/// table without them) on that connection. The gate function already
+/// registered on the connection is kept (whatever gate it calls); a
+/// connection without one gets the full [`install_on_engine`]. Idempotent.
+pub(crate) fn refresh_on_engine(conn: &Connection) -> rusqlite::Result<usize> {
+    let registered = conn.query_row(&format!("SELECT {GATE_FUNCTION}(NULL)"), [], |r| r.get::<_, i64>(0)).is_ok();
+    if registered { create_triggers(conn, &LABEL_COLUMNS, None, MEMORY_RULES) } else { install_on_engine(conn) }
+}
+
+/// A narrowing write that may land on a refused label inside
+/// [`narrowing_write`] (F6fb2 item 1). Each kind is one statement of this
+/// crate that records or moves, never plants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrowingWrite {
+    /// `gdpr_erase`'s erasure record (the retained legal-basis record of a
+    /// right-to-erasure delete; content-free, pseudonymised contact).
+    ErasureRecord,
+    /// `forget` / decay copy of a row into `memories_archive` in the same
+    /// transaction that deletes it from `memories` (a move, not a plant).
+    ArchiveMove,
+}
+
+impl NarrowingWrite {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ErasureRecord => "gdpr_erasure_record",
+            Self::ArchiveMove => "archive_move",
+        }
+    }
+}
+
+struct NarrowingScope {
+    kind: NarrowingWrite,
+    /// `Some(label)`: only this label passes; `None`: any (the rows are
+    /// copied from already-gated rows by the scoped statement itself).
+    label: Option<String>,
+    admitted: u64,
+}
+
+thread_local! {
+    static NARROWING: RefCell<Option<NarrowingScope>> = const { RefCell::new(None) };
+}
+
+/// Run `write` (one synchronous statement) with refused labels admitted for
+/// `kind` — limited to `label` when given. The scope is this thread's and
+/// ends with `write` (also on panic); scopes do not nest (an inner scope
+/// replaces the outer one and restores it after). Admissions are logged once
+/// at the end of the scope with their row count.
+pub(crate) fn narrowing_write<T>(kind: NarrowingWrite, label: Option<&str>, write: impl FnOnce() -> T) -> T {
+    struct Restore(Option<NarrowingScope>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let ended = NARROWING.with(|scope| std::mem::replace(&mut *scope.borrow_mut(), self.0.take()));
+            if let Some(ended) = ended.filter(|scope| scope.admitted > 0) {
+                tracing::warn!(target: "duduclaw_memory::label_gate", kind = ended.kind.as_str(),
+                    label = ended.label.as_deref().unwrap_or("*"), rows = ended.admitted,
+                    "narrowing write admitted on a tombstoned or quarantined label (F6 H4 writer gate)");
+            }
+        }
+    }
+    let scope = NarrowingScope { kind, label: label.map(str::to_owned), admitted: 0 };
+    let _restore = Restore(NARROWING.with(|current| current.borrow_mut().replace(scope)));
+    write()
+}
+
+/// Whether the current thread's narrowing scope admits a refused `label`
+/// (counted).
+fn narrowing_admits(label: &str) -> bool {
+    NARROWING.with(|scope| match scope.borrow_mut().as_mut() {
+        Some(scope) if scope.label.as_deref().is_none_or(|only| only == label) => {
+            scope.admitted += 1;
+            true
+        }
+        _ => false,
+    })
+}
+
 /// Register [`GATE_FUNCTION`] on `conn` (calling `gate` with the
 /// connection's database file) and create the TEMP gate triggers on every
 /// table of the main schema that has one of `columns` (and, with `parent`,
 /// on every other table that has the parent's child column), except
 /// `rules.exempt_tables`. Virtual tables and their shadow tables are skipped.
 /// Idempotent; returns the number of triggers for the gated tables. Call
-/// after the schema exists.
+/// after the schema exists, and again after a table is created lazily
+/// (F6fb2: [`refresh_on_engine`] for the memory engine).
 pub fn install_write_triggers(conn: &Connection, gate: LabelWriteGate, columns: &[&str], parent: Option<ParentKey>,
     rules: GateRules<'_>) -> rusqlite::Result<usize> {
     let file: Option<PathBuf> = conn.path().filter(|path| !path.is_empty()).map(PathBuf::from);
-    let mut cache: HashMap<String, (Instant, bool)> = HashMap::new();
+    let mut cache: HashMap<String, (Instant, u64, bool)> = HashMap::new();
     conn.create_scalar_function(GATE_FUNCTION, 1, FunctionFlags::SQLITE_UTF8, move |ctx| {
         let label = match ctx.get_raw(0) {
             ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
@@ -151,14 +262,27 @@ pub fn install_write_triggers(conn: &Connection, gate: LabelWriteGate, columns: 
             // No label on the row (NULL, a number): nothing to gate.
             _ => return Ok(1i64),
         };
-        if let Some((at, writable)) = cache.get(&label) {
-            if at.elapsed() < CACHE_TTL { return Ok(i64::from(*writable)); }
-        }
-        let writable = gate(file.as_deref(), &label).is_ok();
-        if cache.len() >= CACHE_MAX { cache.clear(); }
-        cache.insert(label, (Instant::now(), writable));
-        Ok(i64::from(writable))
+        let epoch = cache_epoch();
+        let writable = match cache.get(&label) {
+            Some((at, seen, writable)) if *seen == epoch && at.elapsed() < CACHE_TTL => *writable,
+            _ => {
+                let writable = gate(file.as_deref(), &label).is_ok();
+                if cache.len() >= CACHE_MAX { cache.clear(); }
+                cache.insert(label.clone(), (Instant::now(), epoch, writable));
+                writable
+            }
+        };
+        // F6fb2 item 1: a refused label passes only inside a narrowing scope
+        // (never cached as writable).
+        Ok(i64::from(writable || narrowing_admits(&label)))
     })?;
+    create_triggers(conn, columns, parent, rules)
+}
+
+/// The trigger half of [`install_write_triggers`] (the gate function must
+/// already be registered on `conn`).
+fn create_triggers(conn: &Connection, columns: &[&str], parent: Option<ParentKey>, rules: GateRules<'_>)
+    -> rusqlite::Result<usize> {
     let tables: Vec<(String, Option<String>)> = {
         let mut query = conn.prepare("SELECT name, sql FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?;
         let rows = query.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -233,3 +357,7 @@ pub fn gated_tables(conn: &Connection) -> rusqlite::Result<Vec<(String, Vec<Stri
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "label_gate_tests.rs"]
+mod tests;

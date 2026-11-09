@@ -218,11 +218,11 @@ fn f6fb_adopted_replay_bound_to_allocation() {
 fn f6fb_no_compensation_after_commit_once_tree_changed() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
-    let (_, item, _) = adopted(&f, &ax, None);
+    let fx = ax();
+    let (_, item, _) = adopted(&f, &fx, None);
     let soul = f.home().join("agents").join(LABEL).join("SOUL.md");
     std::fs::write(&soul, "written by the new employee").unwrap();
-    assert_eq!(compensate_item(f.home(), &env(&ax), &item).err(), Some(AdoptError::Inconsistent));
+    assert_eq!(compensate_item(f.home(), &env(&fx), &item).err(), Some(AdoptError::Inconsistent));
     assert_eq!(std::fs::read_to_string(&soul).unwrap(), "written by the new employee");
     assert!(!quarantined(f.home(), "SOUL.md"));
     assert_eq!(seal_of(f.home()), "adopted");
@@ -301,4 +301,24 @@ fn f6fb_adoption_enforces_agent_cap() {
     assert_eq!(AdoptError::Restore(Refusal::QuotaExceeded).message(), "已達授權的 AI 員工數量上限，無法由新員工接手。");
     let roomy = AdoptEnv { agent_cap: 2, ..env(&ax) };
     assert!(matches!(validate_item(f.home(), &roomy, &item, &plan.adopt, &f.bob), Ok(AdoptPhase::Pending { .. })));
+}
+
+/// F6fb2 item 3: a Personal adoption accepts only the strongest-factor
+/// rule's factors (passkey, TOTP, email); a Google re-auth (or anything else)
+/// is `FACTOR_REQUIRED` and files nothing.
+#[test]
+fn f6fb2_adoption_refuses_google_reauth_factor() {
+    let f = fixture();
+    tombstoned_full(&f, "soul");
+    let ax = ax();
+    assert_eq!(crate::isolation_adopt::ADOPT_OWNER_FACTORS, ["passkey", "totp", "email"]);
+    for factor in ["google_reauth", "sms", ""] {
+        let refused = file_adoption(f.home(), &env(&ax), EMP, 0, None,
+            Filer::Personal(Some(OwnerProof { user_id: &f.alice, factor })));
+        assert_eq!(refused.err(), Some(AdoptError::Restore(Refusal::FactorRequired)), "{factor:?}");
+    }
+    // Nothing was filed by the refusals: the owner's TOTP proof still files.
+    let filed = file_adoption(f.home(), &env(&ax), EMP, 0, None,
+        Filer::Personal(Some(OwnerProof { user_id: &f.alice, factor: "totp" }))).unwrap();
+    assert_eq!(filed.kind, RequestKind::PersonalAdopt);
 }

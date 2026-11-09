@@ -70,11 +70,24 @@ pub(crate) mod isolation_restore;
 #[allow(dead_code)]
 pub(crate) mod isolation_label_stores;
 
-/// F6fb item 2: install the F6 label writer gate in the isolated MCP server
-/// process before it opens the home's memory.db (always active there; that
-/// process exists only in protected mode). `false` when a gate was already
-/// installed in this process (the first one stays).
+/// F6fb item 2: install the F6 label writer gate for an isolated MCP
+/// dispatcher before it opens the home's memory.db, and keep it active for
+/// the rest of this process.
+///
+/// F6fb2 item 5 (verified): the dispatcher is not a separate process. The
+/// CLI installs its `DispatcherFactory` into the gateway (`cmd_run_server`),
+/// the gateway's protected boot calls `create` (`isolation_mcp/boot.rs`) and
+/// `McpBoundaryService::attach` serves it on a gateway task; the employee's
+/// runtime only holds the socket end (fd from spawnd's `TakeIo`). So the
+/// writer gate runs as the gateway uid, which owns
+/// `migration-authority/apply.db` (0600) and reads it like every other gate.
+/// In the gateway the boot gate (`memory_write_gate`, `server.rs`) is
+/// already installed, so this returns `false`; it then marks the process so
+/// that gate is active even if the protected-mode environment flag were
+/// absent. `true` only where no gate was installed yet (e.g. a host embedding
+/// the dispatcher without the gateway boot): the always-active gate.
 pub fn install_isolated_process_writer_gate() -> bool {
+    isolation_label_stores::mark_isolated_dispatcher();
     duduclaw_memory::install_label_write_gate(isolation_label_stores::isolated_process_write_gate)
 }
 // F6h: running per-employee channel bots (tombstone stop hook).
