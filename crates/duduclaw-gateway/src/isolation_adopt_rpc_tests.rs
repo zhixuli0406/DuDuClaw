@@ -141,15 +141,15 @@ fn f6fa2_admin_files_adoption_for_owner_without_second_factor() {
     let f = fixture();
     let home = f.home();
     tombstoned_full(&f, "soul");
-    let ax = ax();
-    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax), &f.bob, &employee(), 0, None, false).err(),
+    let ax0 = ax();
+    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax0), &f.bob, &employee(), 0, None, false).err(),
         Some(RpcError::Restore(Refusal::Approval("STEP_UP_REQUIRED"))));
-    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax), &f.alice, &employee(), 0, None, true).err(),
+    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax0), &f.alice, &employee(), 0, None, true).err(),
         Some(RpcError::Restore(Refusal::FilerIsOwner)));
-    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax), &f.bob, &employee(), 0, Some("../x"), true).err(),
+    assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax0), &f.bob, &employee(), 0, Some("../x"), true).err(),
         Some(RpcError::Invalid));
     assert_eq!(filed_count(home), 0);
-    let filed = rpc::adoption_request_for_owner(home, &env(&ax), &f.bob, &employee(), 0, None, true).unwrap();
+    let filed = rpc::adoption_request_for_owner(home, &env(&ax0), &f.bob, &employee(), 0, None, true).unwrap();
     assert_eq!((filed["kind"].as_str(), filed["target_label"].as_str(), filed["owner_user_id"].as_str()),
         (Some("personal_adopt"), Some(LABEL), Some(f.alice.as_str())));
     assert_eq!((filed["filed_by_admin"].as_str(), filed["owner_unverified"].as_bool()), (Some(f.bob.as_str()), Some(true)));
@@ -161,12 +161,12 @@ fn f6fa2_admin_files_adoption_for_owner_without_second_factor() {
         [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     assert!(recipients.contains("alice@example.test") && !capped, "{recipients}");
     // The card: a third qualifying Admin, never a party, never self-approved.
-    let (plan, item) = propose(&f, &ax, &request);
+    let (plan, item) = propose(&f, &ax0, &request);
     for party in [f.bob.as_str(), f.alice.as_str()] {
-        assert_eq!(validate_item(home, &env(&ax), &item, &plan.adopt, party).err(), Some(AdoptError::Approval("SECOND_ADMIN_REQUIRED")),
+        assert_eq!(validate_item(home, &env(&ax0),&item, &plan.adopt, party).err(), Some(AdoptError::Approval("SECOND_ADMIN_REQUIRED")),
             "{party}");
     }
-    match validate_item(home, &env(&ax), &item, &plan.adopt, "carol-admin").unwrap() {
+    match validate_item(home, &env(&ax0), &item, &plan.adopt, "carol-admin").unwrap() {
         AdoptPhase::Pending { self_approved, .. } => assert!(!self_approved),
         other => panic!("{other:?}"),
     }
