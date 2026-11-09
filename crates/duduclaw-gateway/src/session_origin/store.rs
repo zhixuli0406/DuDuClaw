@@ -79,7 +79,7 @@ pub(crate) fn insert_or_stamp(
 fn select_session(conn: &Connection, session_id: &str) -> Result<Session> {
     conn.query_row(
         "SELECT id, agent_id, summary, total_tokens, last_active, model,
-                COALESCE(lineage, 1)
+                COALESCE(lineage, 1), created_at
          FROM sessions WHERE id = ?1",
         params![session_id],
         |row| {
@@ -91,6 +91,7 @@ fn select_session(conn: &Connection, session_id: &str) -> Result<Session> {
                 last_active: row.get(4)?,
                 model: row.get(5)?,
                 lineage: row.get::<_, i64>(6)?.max(1) as u32,
+                created_at: row.get(7)?,
             })
         },
     )
@@ -138,6 +139,12 @@ impl SessionManager {
     /// Shared body of `get_or_create` (origin `unknown` on insert only, never
     /// stamping a legacy row so the backfill can still classify it) and
     /// [`Self::get_or_create_with_origin`].
+    ///
+    /// One IMMEDIATE transaction: the returned [`Session::created_at`] is the
+    /// identity of exactly the row this call created or loaded (the turn
+    /// generation — no clear can slip in between). RM-173: a user clear left
+    /// at this id ([`crate::session::STUCK_USER_CLEAR`]) is moved away first,
+    /// so the turn starts a fresh conversation without the cleared context.
     pub(crate) async fn create_inner(
         &self,
         session_id: &str,
@@ -145,11 +152,20 @@ impl SessionManager {
         origin: &SessionOrigin,
         stamp_existing: bool,
     ) -> Result<Session> {
-        let conn = self.acquire().await;
+        let mut guard = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
-        insert_or_stamp(&conn, session_id, agent_id, origin, stamp_existing, &now)
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        if let Some(moved) = SessionManager::repair_stuck_clear(&tx, session_id)? {
+            tracing::info!(
+                session_id, cleared_to = %moved,
+                "user clear left at its original id moved before a new turn"
+            );
+        }
+        insert_or_stamp(&tx, session_id, agent_id, origin, stamp_existing, &now)
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        let session = select_session(&conn, session_id)?;
+        let session = select_session(&tx, session_id)?;
         // Verify the session belongs to the expected agent to prevent session
         // hijacking across agents (e.g. two agents racing with the same session_id).
         if session.agent_id != agent_id {
@@ -158,6 +174,8 @@ impl SessionManager {
                 session.agent_id
             )));
         }
+        tx.commit()
+            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
         Ok(session)
     }
 

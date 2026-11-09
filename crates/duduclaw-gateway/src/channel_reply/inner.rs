@@ -873,19 +873,31 @@ pub(super) async fn build_reply_with_session_inner(
 
     // ── All pre-filters passed — now create/load session ──
     // Records where this conversation comes from (first stamp wins).
-    let _ = crate::session_origin::ensure_turn_session(session_mgr, session_id, &agent_id).await;
-    // RM-173 race guard: bind this turn's writes to the row it starts in. A
-    // `/new` while the turn runs moves that row away; the reply must then be
-    // dropped, not written into (or recreate) the fresh conversation.
-    // `Some("")` (row already gone) never matches; a read error (`None`)
-    // falls back to the unbound write rather than losing the reply.
-    let turn_generation: Option<String> = match session_mgr.turn_generation(session_id).await {
-        Ok(generation) => Some(generation.unwrap_or_default()),
-        Err(e) => {
-            warn!(session_id, error = %e, "turn generation unavailable; reply persist is unbound");
-            None
-        }
-    };
+    // RM-173 race guard: bind this turn's writes to the row it starts in —
+    // its `created_at`, returned by the same transaction that created or
+    // loaded the row, so no `/new` can slip in between. A `/new` while the
+    // turn runs moves that row away; the reply must then be dropped, not
+    // written into (or recreate) the fresh conversation.
+    let turn_generation: Option<String> =
+        match crate::session_origin::ensure_turn_session(session_mgr, session_id, &agent_id).await {
+            Ok(session) => Some(session.created_at),
+            Err(e) => {
+                warn!(session_id, error = %e, "turn session not ensured");
+                // Previous fallback: read the row's identity separately.
+                // `Some("")` (no row) never matches; a read error (`None`)
+                // falls back to the unbound write rather than losing the reply.
+                match session_mgr.turn_generation(session_id).await {
+                    Ok(generation) => Some(generation.unwrap_or_default()),
+                    Err(e) => {
+                        warn!(session_id, error = %e, "turn generation unavailable; reply persist is unbound");
+                        None
+                    }
+                }
+            }
+        };
+    // The WebChat staged-reply fallback (`GuardedReply::persist_webchat`)
+    // binds its write to the same generation.
+    super::record_turn_generation(turn_generation.as_deref());
 
     // ── Phase 3: Check if previous trajectory should get feedback ──
     // The current user message may contain feedback (positive/negative) for

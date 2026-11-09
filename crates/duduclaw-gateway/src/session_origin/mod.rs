@@ -189,6 +189,10 @@ pub fn origin_for_current_turn(session_id: &str) -> SessionOrigin {
 /// Create or load the session a live turn writes into, stamping the turn's
 /// origin (first stamp wins). Every production creation point calls this
 /// instead of [`SessionManager::get_or_create`].
+///
+/// The returned [`Session::created_at`] is the turn generation (RM-173),
+/// read in the same transaction that created/loaded the row; bind the turn's
+/// writes to it (`SessionManager::append_delivery_message_in`).
 pub async fn ensure_turn_session(
     sessions: &SessionManager,
     session_id: &str,

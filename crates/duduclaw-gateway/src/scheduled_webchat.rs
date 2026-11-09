@@ -521,10 +521,16 @@ async fn deliver_with_hook(
         .map_err(|_| "對話紀錄無法開啟".to_string())?;
     let mut conn = manager.acquire().await;
     let tx = conn.transaction().map_err(|_| "對話紀錄無法寫入".to_string())?;
+    // RM-173: never into a user clear left at its original id
+    // (`STUCK_USER_CLEAR`) — its cleared content would be the context.
     let still: bool = tx
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND agent_id=?2
-               AND origin_kind='webchat_user' AND owner_user_id=?3 AND created_at=?4)",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND agent_id=?2
+                   AND origin_kind='webchat_user' AND owner_user_id=?3 AND created_at=?4
+                   AND NOT {})",
+                crate::session::STUCK_USER_CLEAR
+            ),
             params![session, agent, owner, origin_at],
             |row| row.get(0),
         )

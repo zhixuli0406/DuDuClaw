@@ -60,8 +60,10 @@ async fn persist_webchat(home: &Path, job: &Job, text: &str) -> Result<(), Strin
         .map_err(|_| "無法讀取原對話。")?;
     let mut conn = manager.acquire().await;
     let tx = conn.transaction().map_err(|_| "無法儲存完成通知。")?;
+    // RM-173: never into a user clear left at its original id.
     let allowed: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND agent_id=?2 AND origin_kind='webchat_user' AND owner_user_id=?3)",
+        &format!("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND agent_id=?2 AND origin_kind='webchat_user' AND owner_user_id=?3 AND NOT {})",
+            crate::session::STUCK_USER_CLEAR),
         rusqlite::params![session, job.agent, requester], |row| row.get(0),
     ).map_err(|_| "無法確認原對話的使用者。")?;
     if !allowed { return Err("原對話已不存在或無法存取。".into()); }
