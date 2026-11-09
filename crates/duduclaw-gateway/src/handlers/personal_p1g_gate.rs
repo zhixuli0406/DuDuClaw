@@ -25,9 +25,10 @@
 //!   `presets.status`, `agents.avatar` (best-effort metadata audit),
 //!   `agents.pause` / `agents.resume` / `autonomy.pause` / `autonomy.resume`
 //!   (control audit, fail closed), `agents.list` (label / owner / status
-//!   rows), `topology.list`, `users.list` / `users.me` (binding metadata),
-//!   approval cards (metadata cards), and the lifecycle authorities
-//!   (`isolation.*`, `migration.*`, `me.isolation.*`) with their own F6 rules.
+//!   rows), `users.list` / `users.me` (binding metadata), approval cards
+//!   (metadata cards), and the lifecycle authorities with their own F6 rules
+//!   — P1h: an explicit frozen list ([`LIFECYCLE_ALLOWLIST`]), no prefix
+//!   match; `topology.list` left the allowlist (its rows are filtered).
 use super::*;
 use crate::personal_visibility as visibility;
 use std::collections::BTreeSet;
@@ -58,18 +59,50 @@ pub(crate) const LOG_TAIL_REFUSED: &str = "受保護模式下，有其他同仁�
     protected mode the live log tail cannot be filtered per row, so it is not available while another person's \
     Personal employees exist.";
 
+/// P1h (N3): the lifecycle authority methods exempt from the default deny
+/// and the hidden-row filter — an explicit, frozen list (no prefix match), so
+/// a new `isolation.*` / `migration.*` / `me.isolation.*` method is NOT
+/// exempt until it is reviewed and added here. Each entry: why its answer may
+/// name another person's Personal employee, or how it hides that data.
+/// `p1h_lifecycle_allowlist_equals_the_dispatch_table` keeps this equal to
+/// the methods the dispatch table really routes in those namespaces.
+pub(crate) const LIFECYCLE_ALLOWLIST: &[(&str, &str)] = &[
+    ("isolation.connector_list", "connector routes name an owner user id (Personal) or nothing (Shared), never an \
+        employee; no per-employee rows"),
+    ("isolation.connector_step_up", "Admin step-up proof; returns `verified` only"),
+    ("isolation.connector_provision", "Admin + step-up connector authority; returns the new account id only"),
+    ("isolation.connector_revoke", "Admin + step-up connector authority; returns account / active only"),
+    ("isolation.connector_import_legacy", "stages migration proposals; returns counts only"),
+    ("isolation.recording_status", "D8 host control; `control_recording` withholds a non-owned Personal \
+        employee's recording result (status only)"),
+    ("isolation.recording_stop", "D8 host stop, audited; the result is withheld as for recording_status"),
+    ("isolation.employee_list", "lifecycle read model by design: label / owner / status, no private data"),
+    ("isolation.employee_propose", "Admin + step-up proposal; creates a confirmation card"),
+    ("isolation.employee_tombstone", "Admin + step-up lifecycle removal (F6 rules)"),
+    ("isolation.employee_purge_requests", "Admin + step-up purge of request records; counts only"),
+    ("me.isolation.request_personal_employee", "self-service: files the caller's own request"),
+    ("me.isolation.list_personal_employee_requests", "the caller's own requests only"),
+    ("me.isolation.list_personal_delegations", "the caller's own delegation receipts only (owner)"),
+    ("me.isolation.decide_personal_delegation", "the owner decides its own delegation receipts"),
+    ("migration.confirmations.list", "Admin migration review cards (F6 rules)"),
+    ("migration.confirmations.step_up", "Admin step-up proof; returns `verified` only"),
+    ("migration.confirmations.approve", "Admin + step-up decision on a migration card (F6 rules)"),
+    ("migration.confirmations.retry", "Admin + step-up retry of a migration card (F6 rules)"),
+    ("migration.confirmations.reject", "Admin + step-up rejection of a migration card"),
+    ("migration.confirmations.rotate_secret", "Admin + step-up secret rotation of a migration card"),
+];
+
 /// The explicit Admin management / metadata allowlist (P1g §2). Methods
 /// here keep reaching another person's Personal employee; each audits it in
-/// its handler or is metadata by design.
+/// its handler or is metadata by design. P1h (N6): `topology.list` is no
+/// longer on it — its from / to rows go through the hidden-row filter.
 pub(crate) fn metadata_allowlisted(method: &str) -> bool {
     matches!(
         method,
         "agents.status" | "presets.status" | "agents.avatar" | "agents.pause" | "agents.resume"
-            | "autonomy.pause" | "autonomy.resume" | "autonomy.status" | "agents.list" | "topology.list"
+            | "autonomy.pause" | "autonomy.resume" | "autonomy.status" | "agents.list"
             | "users.list" | "users.me" | "approvals.list" | "approvals.get"
-    ) || method.starts_with("isolation.")
-        || method.starts_with("migration.")
-        || method.starts_with("me.isolation.")
+    ) || LIFECYCLE_ALLOWLIST.iter().any(|(listed, _)| *listed == method)
 }
 
 /// Every employee the request's top-level parameters name (trimmed, so a

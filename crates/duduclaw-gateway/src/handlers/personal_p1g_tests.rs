@@ -91,12 +91,16 @@ async fn p1g_break_glass_is_request_scoped_and_never_delegation() {
 #[test]
 fn p1g_allowlisted_management_actions_pass_with_audit() {
     for method in ["agents.status", "presets.status", "agents.avatar", "agents.pause", "agents.resume",
-        "autonomy.pause", "autonomy.resume", "agents.list", "topology.list", "isolation.employee_tombstone",
-        "isolation.employee_restore", "migration.confirmations.list"] {
+        "autonomy.pause", "autonomy.resume", "agents.list", "isolation.employee_tombstone",
+        "migration.confirmations.list"] {
         assert!(metadata_allowlisted(method), "{method}");
     }
+    // P1h: no prefix match (an unreviewed lifecycle-looking name is not
+    // exempt) and `topology.list` left the allowlist (N6).
     for method in ["agents.update", "cron.update", "heartbeat.trigger", "memory.search", "odoo.agent_config_set",
-        "mcp.update", "experts.remove", "org.apply_change", "finetune.datasets.preview", "belief.recent"] {
+        "mcp.update", "experts.remove", "org.apply_change", "finetune.datasets.preview", "belief.recent",
+        "topology.list", "isolation.employee_restore", "isolation.anything_new", "migration.other",
+        "me.isolation.anything_new"] {
         assert!(!metadata_allowlisted(method), "{method}");
     }
     let h = home();
@@ -174,6 +178,113 @@ fn p1g_default_deny_and_hidden_rows() {
     assert!(gates < deny, "the default deny runs after the gates (their step-ups admit their employee)");
     assert!(dispatch.contains("self.personal_hide_rows(method, ctx, frame)"));
     assert!(dispatch.contains("with_break_glass_scope"));
+}
+
+// ── P1h ──────────────────────────────────────────────────────────────────
+
+/// Every `"isolation.…"` / `"migration.…"` / `"me.isolation.…"` string
+/// literal of `source` that ends a method name (a quoted name followed by
+/// `"`), for the dispatch-table scan below.
+fn prefixed_literals(source: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for prefix in ["\"isolation.", "\"migration.", "\"me.isolation."] {
+        let mut rest = source;
+        while let Some(at) = rest.find(prefix) {
+            let tail = &rest[at + 1..];
+            let end = tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_')).unwrap_or(tail.len());
+            if tail[end..].starts_with('"') {
+                found.insert(tail[..end].to_owned());
+            }
+            rest = &rest[at + prefix.len()..];
+        }
+    }
+    found
+}
+
+/// N3: the lifecycle allowlist is a frozen list equal to the methods the
+/// dispatch table really routes in those namespaces — a new one is not
+/// exempt until reviewed here.
+#[test]
+fn p1h_lifecycle_allowlist_equals_the_dispatch_table() {
+    let frozen: BTreeSet<String> = LIFECYCLE_ALLOWLIST.iter().map(|(method, _)| (*method).to_owned()).collect();
+    assert_eq!(frozen.len(), LIFECYCLE_ALLOWLIST.len(), "duplicate entry");
+    for (method, reason) in LIFECYCLE_ALLOWLIST {
+        assert!(!reason.trim().is_empty(), "{method}: every entry is reviewed");
+    }
+    // What dispatch routes (`handlers/mod.rs`): the connector and employee
+    // handlers' method tables, the migration-confirmation methods and the
+    // two recording methods.
+    let mut routed: BTreeSet<String> = BTreeSet::new();
+    routed.extend(super::super::isolation_connectors_rpc::METHODS.iter().map(|m| m.to_string()));
+    routed.extend(super::super::isolation_employee_rpc::METHODS.iter().map(|m| m.to_string()));
+    let confirmations = include_str!("migration_confirmations_rpc.rs");
+    let known = confirmations.find("pub(super) fn known_method(").unwrap();
+    let known_end = known + confirmations[known..].find("\n}").unwrap();
+    routed.extend(prefixed_literals(&confirmations[known..known_end]));
+    let dispatch = include_str!("mod.rs");
+    let recording = dispatch.find("if matches!(method, \"isolation.recording_status\"").unwrap();
+    routed.extend(prefixed_literals(&dispatch[recording..recording + 120]));
+    assert_eq!(frozen, routed, "LIFECYCLE_ALLOWLIST must equal the dispatched lifecycle methods");
+    for method in &routed {
+        assert!(super::super::isolation_connectors_rpc::owns(method) || super::super::isolation_employee_rpc::owns(method)
+            || super::super::migration_confirmations_rpc::known_method(method)
+            || matches!(method.as_str(), "isolation.recording_status" | "isolation.recording_stop"), "{method}");
+    }
+    // The namespaces dispatch hands to those handlers are exactly these.
+    for needle in ["method.split('.').take(2).eq([\"migration\", \"confirmations\"])",
+        "if isolation_connectors_rpc::owns(method)", "if isolation_employee_rpc::owns(method)"] {
+        assert!(dispatch.contains(needle), "{needle}");
+    }
+    // No dispatch arm elsewhere names another lifecycle-looking method.
+    for (file, source) in [("dispatch_system.rs", include_str!("dispatch_system.rs")),
+        ("dispatch_org.rs", include_str!("dispatch_org.rs")), ("dispatch_core.rs", include_str!("dispatch_core.rs"))] {
+        let arms: Vec<String> = prefixed_literals(source).into_iter()
+            .filter(|m| source.contains(&format!("\"{m}\" =>")) || source.contains(&format!("\"{m}\" |"))).collect();
+        assert!(arms.iter().all(|m| frozen.contains(m)), "{file}: unreviewed lifecycle arm {arms:?}");
+    }
+    // No prefix match any more.
+    for method in ["isolation.connector_purge", "isolation.employee_approve", "migration.confirmations.approve_all",
+        "me.isolation.approve_personal_employee", "isolation.recording_list"] {
+        assert!(!metadata_allowlisted(method), "{method}");
+    }
+    // recording_status / recording_stop hide a non-owned Personal result.
+    let boot = include_str!("../isolation_mcp/boot.rs");
+    let at = boot.find("pub(crate) fn control_recording(").unwrap();
+    let body = window(boot, at, 2400);
+    assert!(body.contains("admin_recording_owner(run)?") && body.contains("recorded != ctx.user_id")
+        && body.contains("\"withheld\""), "{body}");
+}
+
+/// N6: `topology.list` left the allowlist, so its override / proposal rows
+/// naming another person's Personal employee (from / to) are dropped.
+#[test]
+fn p1h_topology_rows_are_filtered_and_org_chart_hides() {
+    let h = home();
+    let hidden = hidden_of(&h, &h.admin);
+    assert!(!metadata_allowlisted("topology.list"));
+    let mut topology = json!({
+        "overrides": [{"task_class": "report", "from_agent": SHARED, "to_agent": PERSONAL, "status": "active"},
+            {"task_class": "mail", "from_agent": PERSONAL, "to_agent": SHARED, "status": "active"},
+            {"task_class": "ops", "from_agent": SHARED, "to_agent": "other", "status": "active"}],
+        "pending_proposals": [{"id": "p1", "from_agent": PERSONAL, "to_agent": SHARED}],
+    });
+    drop_hidden_rows(&mut topology, &hidden);
+    assert_eq!(topology["overrides"].as_array().unwrap().len(), 1);
+    assert_eq!(topology["overrides"][0]["task_class"], json!("ops"));
+    assert_eq!(topology["pending_proposals"], json!([]));
+    // agents.org_chart: hidden employees are never full rows (Admin or
+    // department); an ancestor of a visible employee stays a stub.
+    let listable: std::collections::HashMap<&str, &str> = [(PERSONAL, "ops"), (SHARED, "ops"), ("lead", "ops")].into();
+    let full = super::super::agents_list_rpc::org_chart_full(&listable, &hidden, |_, _| true);
+    assert_eq!(full, [SHARED, "lead"].into());
+    let owner_full = super::super::agents_list_rpc::org_chart_full(&listable, &hidden_of(&h, &h.alice), |_, _| true);
+    assert!(owner_full.contains(PERSONAL), "its owner sees it in full");
+    let source = include_str!("agents_list_rpc.rs");
+    let at = source.find("pub(crate) async fn handle_agents_org_chart(").unwrap();
+    let body = window(source, at, 7000);
+    assert!(body.contains("self.personal_hidden_agents(ctx).await"));
+    assert!(body.contains("org_chart_full(&listable, &hidden,"));
+    assert!(body.contains("if !full.contains(cfg.name.as_str())"), "ancestors outside the scope stay name + role stubs");
 }
 
 // ── 3. fire-time check ───────────────────────────────────────────────────

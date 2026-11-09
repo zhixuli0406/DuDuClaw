@@ -51,9 +51,21 @@
 //!
 //! Every check here runs only in protected mode (`protected = true`, from
 //! `runtime_readiness::is_protected_linux()`); otherwise nothing is read and
-//! the existing behaviour is unchanged. The mirror is read fresh from
-//! `users.db` on every call through the hardened authority-store opener; an
-//! unreadable store is [`Unavailable`] and every caller refuses.
+//! the existing behaviour is unchanged. The mirror is read through the
+//! hardened authority-store opener; an unreadable store is [`Unavailable`]
+//! and every caller refuses.
+//!
+//! - **P1h (N2):** the mirror is no longer opened per check. [`owner_map`]
+//!   keeps one snapshot per dashboard request (in the request scope) and a
+//!   process cache keyed on the ACL generation plus the users.db / WAL file
+//!   stamps; every mirror write bumps the generation and the lifecycle also
+//!   calls [`invalidate_owner_cache`]. A read error is never cached.
+//! - **P1h (N1):** calling or assigning a Personal employee from a channel
+//!   (`trigger_route`) is delegation: the mapped person must be its owner,
+//!   Admins included; an unmapped sender is no person — only an
+//!   owner-configured `[channels] public_trigger` opens calling (never
+//!   assigning). **N4:** the fire-time "acting employee" exception applies
+//!   only when no principal is recorded.
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -75,30 +87,42 @@ pub fn acl_denies(home: &Path, protected: bool, user_id: &str, agent: &str) -> b
     !matches!(classify_reader(home, true, user_id, false, agent), Ok(Reader::Unrestricted | Reader::Owner))
 }
 
-tokio::task_local! {
+/// One dashboard request's Personal state (P1g break-glass, P1h owner map).
+#[derive(Default)]
+struct RequestScope {
     /// P1g: `(user, employee)` pairs an audited Admin step-up admitted during
-    /// THIS dashboard request (`MethodHandler::handle_conn` opens the scope,
-    /// `personal_data_gate` records each successful break-glass). Only the
-    /// request's own task sees it: a spawned task, a blocking-pool closure,
-    /// an HTTP route or a background job has no scope and stays refused.
-    static BREAK_GLASS: std::cell::RefCell<BTreeSet<(String, String)>>;
+    /// THIS request (`personal_data_gate` records each successful break-glass).
+    break_glass: std::cell::RefCell<BTreeSet<(String, String)>>,
+    /// P1h (N2): the owner map read once for this request, per home. A
+    /// request answers from one ownership snapshot; [`invalidate_owner_cache`]
+    /// drops it (a lifecycle write inside the request).
+    owners: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<OwnerMap>>>,
 }
 
-/// P1g: run `future` (one dashboard request) with an empty break-glass set.
+tokio::task_local! {
+    /// `MethodHandler::handle_conn` opens the scope around each request. Only
+    /// the request's own task sees it: a spawned task, a blocking-pool
+    /// closure, an HTTP route or a background job has no scope — break-glass
+    /// stays refused there and the owner map comes from the process cache.
+    static REQUEST: RequestScope;
+}
+
+/// P1g: run `future` (one dashboard request) with an empty break-glass set
+/// (P1h: and an empty per-request owner map).
 pub async fn with_break_glass_scope<F: std::future::Future>(future: F) -> F::Output {
-    BREAK_GLASS.scope(std::cell::RefCell::new(BTreeSet::new()), future).await
+    REQUEST.scope(RequestScope::default(), future).await
 }
 
 /// P1g: record that `user` passed the audited step-up for `agent` in the
 /// current request. No-op outside a request scope.
 pub fn record_break_glass(user: &str, agent: &str) {
-    let _ = BREAK_GLASS.try_with(|set| set.borrow_mut().insert((user.to_owned(), agent.to_owned())));
+    let _ = REQUEST.try_with(|scope| scope.break_glass.borrow_mut().insert((user.to_owned(), agent.to_owned())));
 }
 
 /// P1g: `user` passed the audited step-up for `agent` in the current request.
 pub fn break_glass_granted(user: &str, agent: &str) -> bool {
-    BREAK_GLASS
-        .try_with(|set| set.borrow().contains(&(user.to_owned(), agent.to_owned())))
+    REQUEST
+        .try_with(|scope| scope.break_glass.borrow().contains(&(user.to_owned(), agent.to_owned())))
         .unwrap_or(false)
 }
 
@@ -313,19 +337,83 @@ pub const PERSONAL_DECISION_REFUSED: &str = "這張審核卡屬於某位同仁�
     belongs to a person's Personal employee; only its owner can decide it.";
 
 fn open(home: &Path) -> Result<rusqlite::Connection, Unavailable> {
+    #[cfg(test)]
+    count_open(home);
     open_existing(home, USERS_DB, Access::ReadOnly).map_err(|_| Unavailable)
 }
 
-/// The recorded Personal owner of `agent`, read fresh from `users.db`.
-/// `Ok(None)` = Shared or unknown employee. Evidence only; the run-time
-/// authority still checks the full lifecycle.
-pub fn personal_owner(home: &Path, agent: &str) -> Result<Option<String>, Unavailable> {
-    let conn = open(home)?;
-    duduclaw_auth::db::personal_agent_owner(&conn, agent).map_err(|_| Unavailable)
+/// P1h (N2): every Personal employee → its recorded owner, one snapshot.
+pub type OwnerMap = std::collections::BTreeMap<String, String>;
+
+/// P1h (N2): what a process-cache entry was read under. Reused only while
+/// BOTH the ACL generation (bumped by every mirror write in the auth crate:
+/// insert, owner bind, lifecycle removal) and the users.db / WAL file stamps
+/// (size, mtime, inode, mode, owner — also catches a raw write that bypassed
+/// the generation, and a permission change the hardened opener would refuse)
+/// are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerKey {
+    generation: u64,
+    files: [Option<FileStamp>; 2],
 }
 
-/// P1g: every Personal employee → its recorded owner (list metadata).
-pub fn personal_owners(home: &Path) -> Result<std::collections::BTreeMap<String, String>, Unavailable> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    unix: (u64, u64, u32, u32),
+}
+
+fn file_stamp(path: &Path) -> Result<Option<FileStamp>, Unavailable> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(FileStamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            unix: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino(), meta.mode(), meta.uid())
+            },
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(Unavailable),
+    }
+}
+
+/// The key observed NOW (before any fresh read, so an entry is never older
+/// than its key). `None` = no usable generation: the cache is bypassed.
+fn owner_key(home: &Path) -> Option<OwnerKey> {
+    // Generation first: its persistent read connection may create the WAL
+    // sidecar on first use, which the stamps below then already include.
+    let generation = crate::trigger_route::access::read_generation(home)?;
+    let files = [file_stamp(&home.join(USERS_DB)).ok()?, file_stamp(&home.join("users.db-wal")).ok()?];
+    files[0].as_ref()?;
+    Some(OwnerKey { generation, files })
+}
+
+type OwnerCache = std::collections::HashMap<std::path::PathBuf, (OwnerKey, std::sync::Arc<OwnerMap>)>;
+
+fn owner_cache() -> std::sync::MutexGuard<'static, OwnerCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<OwnerCache>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| std::sync::Mutex::new(OwnerCache::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// P1h (N2): drop every cached owner map of `home` (the process cache and
+/// the current request's snapshot). Called after each Personal mirror
+/// write of the lifecycle (`isolation_lifecycle::record_personal_mirror` /
+/// `remove_personal_mirror`); the generation key would also miss.
+pub fn invalidate_owner_cache(home: &Path) {
+    owner_cache().remove(home);
+    let _ = REQUEST.try_with(|scope| scope.owners.borrow_mut().remove(home));
+}
+
+/// The full mirror through the hardened authority-store opener. Any read
+/// error is [`Unavailable`] (callers refuse) and is never cached.
+fn read_owner_map(home: &Path) -> Result<OwnerMap, Unavailable> {
     let conn = open(home)?;
     let mut statement = conn
         .prepare("SELECT agent_name, owner_user_id FROM isolation_personal_agents")
@@ -336,20 +424,76 @@ pub fn personal_owners(home: &Path) -> Result<std::collections::BTreeMap<String,
     rows.collect::<Result<_, _>>().map_err(|_| Unavailable)
 }
 
+/// P1h (N2): the owner map for one ACL check. The current request's snapshot
+/// if it has one; else the process cache when its key is still current; else
+/// one fresh read (cached under the key observed BEFORE the read). So a
+/// request with N rows opens users.db at most once, and a request served from
+/// a current process entry not at all.
+pub fn owner_map(home: &Path) -> Result<std::sync::Arc<OwnerMap>, Unavailable> {
+    if let Ok(Some(map)) = REQUEST.try_with(|scope| scope.owners.borrow().get(home).cloned()) {
+        return Ok(map);
+    }
+    let key = owner_key(home);
+    let cached = key.as_ref().and_then(|key| {
+        owner_cache().get(home).filter(|(at, _)| at == key).map(|(_, map)| map.clone())
+    });
+    let map = match cached {
+        Some(map) => map,
+        None => {
+            let map = std::sync::Arc::new(read_owner_map(home)?);
+            if let Some(key) = key {
+                // One entry per gateway home (a process serves one); the
+                // bound only stops unbounded growth.
+                let mut cache = owner_cache();
+                if cache.len() >= 4_096 {
+                    cache.clear();
+                }
+                cache.insert(home.to_path_buf(), (key, map.clone()));
+            }
+            map
+        }
+    };
+    let _ = REQUEST.try_with(|scope| scope.owners.borrow_mut().insert(home.to_path_buf(), map.clone()));
+    Ok(map)
+}
+
+#[cfg(test)]
+fn opens() -> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, usize>> {
+    static OPENS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>> =
+        std::sync::OnceLock::new();
+    OPENS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+fn count_open(home: &Path) {
+    *opens().entry(home.to_path_buf()).or_default() += 1;
+}
+
+/// Test probe: how many times the mirror was opened for `home`.
+#[cfg(test)]
+pub(crate) fn open_count(home: &Path) -> usize {
+    opens().get(home).copied().unwrap_or(0)
+}
+
+/// The recorded Personal owner of `agent` ([`owner_map`]: current as of the
+/// last mirror write). `Ok(None)` = Shared or unknown employee. Evidence
+/// only; the run-time authority still checks the full lifecycle.
+pub fn personal_owner(home: &Path, agent: &str) -> Result<Option<String>, Unavailable> {
+    Ok(owner_map(home)?.get(agent).cloned())
+}
+
+/// P1g: every Personal employee → its recorded owner (list metadata).
+pub fn personal_owners(home: &Path) -> Result<OwnerMap, Unavailable> {
+    Ok(owner_map(home)?.as_ref().clone())
+}
+
 /// Personal employees whose private data `user_id` does not own, for hiding
 /// them from cross-agent listings. Empty outside protected mode.
 pub fn hidden_from(home: &Path, protected: bool, user_id: &str) -> Result<BTreeSet<String>, Unavailable> {
     if !protected {
         return Ok(BTreeSet::new());
     }
-    let conn = open(home)?;
-    let mut statement = conn
-        .prepare("SELECT agent_name FROM isolation_personal_agents WHERE owner_user_id <> ?1")
-        .map_err(|_| Unavailable)?;
-    let rows = statement
-        .query_map([user_id], |row| row.get::<_, String>(0))
-        .map_err(|_| Unavailable)?;
-    rows.collect::<Result<BTreeSet<_>, _>>().map_err(|_| Unavailable)
+    Ok(owner_map(home)?.iter().filter(|(_, owner)| owner.as_str() != user_id).map(|(agent, _)| agent.clone()).collect())
 }
 
 /// Decide how a dashboard caller may read `agent`'s private data.
@@ -419,14 +563,7 @@ pub fn hidden_from_employee(home: &Path, protected: bool, acting: &str)
         return Ok(BTreeSet::new());
     }
     let me = acting_employee(home, acting);
-    let conn = open(home)?;
-    let mut statement = conn
-        .prepare("SELECT agent_name FROM isolation_personal_agents")
-        .map_err(|_| Unavailable)?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|_| Unavailable)?;
-    let mut hidden = rows.collect::<Result<BTreeSet<_>, _>>().map_err(|_| Unavailable)?;
+    let mut hidden: BTreeSet<String> = owner_map(home)?.keys().cloned().collect();
     if let Some(me) = me {
         hidden.remove(&me);
     }
@@ -519,6 +656,13 @@ pub fn principal_user(raw: &str) -> Option<String> {
 /// Ownership is read NOW, so rules created before the upgrade (or before an
 /// adoption changed the owner) are covered. Unreadable store ⇒ refused.
 /// `None` = allowed (outside protected mode always).
+///
+/// P1h (N4, as B1 in `isolation_background::personal_delegation::gate`): the
+/// `acting` exception applies only when NO principal is recorded (every
+/// value absent or blank). A recorded principal that is not the owner — an
+/// Admin, an unmapped sender, `system`, a malformed value — always refuses,
+/// whatever employee the row claims sent it (a forged JSONL bus line naming
+/// the target as its own sender cannot launder it).
 pub fn fire_time_refusal(home: &Path, protected: bool, principals: &[Option<&str>], acting: Option<&str>, target: &str)
     -> Option<&'static str> {
     if !protected {
@@ -529,9 +673,15 @@ pub fn fire_time_refusal(home: &Path, protected: bool, principals: &[Option<&str
         Ok(Some(owner)) => owner,
         Err(Unavailable) => return Some(OWNERSHIP_UNAVAILABLE),
     };
-    let named: Vec<Option<String>> = principals.iter().flatten().map(|raw| principal_user(raw)).collect();
-    if !named.is_empty() && named.iter().all(|user| user.as_deref() == Some(owner.as_str())) && !owner.is_empty() {
-        return None;
+    let named: Vec<Option<String>> = principals
+        .iter()
+        .flatten()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| principal_user(raw))
+        .collect();
+    if !named.is_empty() {
+        let all_owner = !owner.is_empty() && named.iter().all(|user| user.as_deref() == Some(owner.as_str()));
+        return if all_owner { None } else { Some(PERSONAL_FIRE_REFUSED) };
     }
     if let Some(acting) = acting.filter(|acting| !acting.is_empty())
         && delegation_refusal(home, true, acting, target).is_none()

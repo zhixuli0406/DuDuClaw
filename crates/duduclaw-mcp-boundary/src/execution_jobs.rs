@@ -42,6 +42,23 @@ pub fn parse_handle(value: &str) -> Result<RunHandle, VerificationError> {
 pub struct SqliteExecutionJobs { connection: Mutex<rusqlite::Connection> }
 #[cfg(feature = "binding-store")]
 impl SqliteExecutionJobs {
+    /// v1.81 P1h (N3): the Personal owner recorded on a recording job's
+    /// employee binding (`None` = a Shared employee). Read before
+    /// [`Self::admin_recording_control`] so the gateway can withhold a
+    /// Personal employee's recording result from anyone but its owner. An
+    /// unknown job or an unparsable binding is `Invalid` (callers refuse).
+    pub fn admin_recording_owner(&self, run: RunHandle) -> Result<Option<String>, VerificationError> {
+        use duduclaw_isolation::capability::EmployeeBinding;
+        let connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
+        let binding: String = connection.query_row(
+            "SELECT binding FROM execution_jobs WHERE run=?1 AND tool='browser_record_start'",
+            [handle_text(run)], |row| row.get(0)).map_err(|_| VerificationError::Invalid)?;
+        match serde_json::from_str::<EmployeeBinding>(&binding).map_err(|_| VerificationError::Invalid)? {
+            EmployeeBinding::Personal(owner) => Ok(Some(owner.as_str().to_owned())),
+            EmployeeBinding::Shared(_) => Ok(None),
+        }
+    }
+
     /// Trusted host control only. The gateway must re-read the authenticated
     /// dashboard Admin role at use time; no MCP/capability impersonation.
     pub fn admin_recording_control(&self, run: RunHandle, stop: bool) -> Result<Value, VerificationError> {

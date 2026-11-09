@@ -22,6 +22,15 @@ impl MethodHandler {
                 _ => return WsFrame::error_response("", PERMISSION_DENIED),
             }
         };
+        // v1.81 P1h (N6): another person's Personal employees (protected
+        // mode) are never full rows — not for an Admin, not by department.
+        // One that is the ancestor of a visible employee stays a name + role
+        // stub (the chain must not break); otherwise it is dropped. Read
+        // before the registry lock; unreadable ownership refuses.
+        let hidden = match self.personal_hidden_agents(ctx).await {
+            Ok(hidden) => hidden,
+            Err(e) => return WsFrame::error_response("", e),
+        };
         let mut reg = match tokio::time::timeout(
             std::time::Duration::from_millis(500), self.registry.write(),
         ).await {
@@ -38,11 +47,9 @@ impl MethodHandler {
                 &self.home_dir, &a.config.agent.name,
             ))
             .map(|a| (a.config.agent.name.as_str(), a)).collect();
-        let full: std::collections::HashSet<&str> = listable.iter()
-            .filter(|(name, a)| ctx.is_admin()
-                || ctx.has_agent_access(name, AccessLevel::Viewer)
-                || department.as_deref().is_some_and(|d| d == a.config.agent.department))
-            .map(|(name, _)| *name).collect();
+        let full: std::collections::HashSet<&str> = org_chart_full(&listable, &hidden, |name, a| ctx.is_admin()
+            || ctx.has_agent_access(name, AccessLevel::Viewer)
+            || department.as_deref().is_some_and(|d| d == a.config.agent.department));
         let mut visible = full.clone();
         // Bound the walk by visited names; malformed cycles cannot loop or
         // pull in descendants/siblings. Hidden ancestors stop the chain.
@@ -236,6 +243,20 @@ impl MethodHandler {
         );
         WsFrame::ok_response("", json!({ "agents": agents }))
     }
+}
+
+/// The org-chart rows shown in full: `in_scope` (Admin, binding, own
+/// department) minus `hidden` (P1h N6: another person's Personal employees
+/// are at most an ancestor stub, never a full row).
+pub(super) fn org_chart_full<'a, A>(
+    listable: &std::collections::HashMap<&'a str, A>,
+    hidden: &std::collections::BTreeSet<String>,
+    in_scope: impl Fn(&str, &A) -> bool,
+) -> std::collections::HashSet<&'a str> {
+    listable.iter()
+        .filter(|(name, a)| !hidden.contains(**name) && in_scope(name, a))
+        .map(|(name, _)| *name)
+        .collect()
 }
 
 /// v1.81 P1g: the `agents.list` row of another person's Personal employee —

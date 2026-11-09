@@ -354,7 +354,6 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("autonomy.pause", "(a) background-autonomy pause; management access + control audit (F8)"),
     ("autonomy.resume", "(a) background-autonomy resume; management access + control audit (F8)"),
     ("autonomy.status", "(a) pause state, filtered through the ACL (another person's Personal employee is dropped)"),
-    ("topology.list", "(a) approval topology metadata (roles / routes, no content)"),
     ("approvals.list", "(a) another person's Personal cards are metadata-only cards (personal_metadata_card)"),
     ("approvals.get", "(a) metadata card; the full card only after the audited step-up (personal_approval_hidden)"),
     ("users.list", "(a) people and their binding metadata (label, owner); no employee data"),
@@ -362,6 +361,8 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     // Everything below is covered by the P1g default deny (a named
     // Personal employee is refused unless an audited step-up of this
     // request admitted it) and the hidden-row filter, plus the reason.
+    ("topology.list", "P1h (N6): off the allowlist; the hidden-row filter drops override / proposal rows whose \
+        from_agent / to_agent is another person's Personal employee"),
     ("agents.callable", "who the caller may call (names only); can_call_agent refuses another person's Personal employee"),
     ("agents.health", "health counters filtered through has_agent_access (P1g: fails closed for a non-owned Personal one)"),
     ("agents.create", "creates a new employee; names no existing one"),
@@ -494,7 +495,8 @@ const EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
     ("forward", DD),
     ("belief", DD),
     ("cost", "cost and token metadata per employee; P1g default deny + hidden rows"),
-    ("db_sources", "P1g default deny: data-source grants of another person's Personal employee are refused"),
+    ("db_sources", "P1g default deny: data-source grants of another person's Personal employee are refused; P1h \
+        (N5): grants.list leaves hidden employees out and grants.set merges their grants back unnamed"),
     ("odoo", "P1g default deny: per-employee Odoo configuration of another person's Personal employee is refused"),
     ("ticks", DD),
     ("tick", DD),
@@ -545,7 +547,8 @@ const NO_EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
 const P1F_CEILING: usize = 0;
 /// Ratchet (P1g): the explicit metadata / management allowlist ("(a)"
 /// entries, method by method). Growing it is an owner decision.
-const METADATA_CEILING: usize = 14;
+/// P1h (N6): 13 — `topology.list` left the allowlist.
+const METADATA_CEILING: usize = 13;
 
 struct Arm {
     methods: Vec<String>,

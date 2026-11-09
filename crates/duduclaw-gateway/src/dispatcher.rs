@@ -365,14 +365,19 @@ async fn bus_fire_time_refusal(home: &Path, msg: &BusMessage) -> Option<&'static
     if !crate::runtime_readiness::is_protected_linux() {
         return None;
     }
-    let (home, target) = (home.to_path_buf(), msg.agent_id.clone());
-    let principal = msg.on_behalf_of.clone();
-    let acting = msg.sender_agent.clone().or_else(|| msg.origin_agent.clone());
-    tokio::task::spawn_blocking(move || {
-        crate::personal_visibility::fire_time_refusal(&home, true, &[principal.as_deref()], acting.as_deref(), &target)
-    })
-    .await
-    .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+    let (home, msg) = (home.to_path_buf(), msg.clone());
+    tokio::task::spawn_blocking(move || bus_fire_refusal_in(&home, true, &msg))
+        .await
+        .unwrap_or(Some(crate::personal_visibility::OWNERSHIP_UNAVAILABLE))
+}
+
+/// [`bus_fire_time_refusal`] without the process flag (tests). P1h (N4): the
+/// row's `sender_agent` / `origin_agent` are only consulted when it records
+/// no `on_behalf_of` — a forged line naming the target as its own sender
+/// cannot launder a non-owner principal.
+fn bus_fire_refusal_in(home: &Path, protected: bool, msg: &BusMessage) -> Option<&'static str> {
+    let acting = msg.sender_agent.as_deref().or(msg.origin_agent.as_deref());
+    crate::personal_visibility::fire_time_refusal(home, protected, &[msg.on_behalf_of.as_deref()], acting, &msg.agent_id)
 }
 
 /// v1.81 P1g: the `agent_response` that answers a refused JSONL row.
@@ -6537,3 +6542,46 @@ mod dispatch_stack_tests;
 #[cfg(test)]
 #[path = "dispatcher_main_agent_tests.rs"]
 mod main_agent_tests;
+
+#[cfg(all(test, unix))]
+mod p1h_bus_fire_tests {
+    use super::{BusMessage, bus_fire_refusal_in};
+    use crate::personal_visibility::tests::{PERSONAL, SHARED, home};
+    use crate::personal_visibility::PERSONAL_FIRE_REFUSED;
+
+    fn line(on_behalf_of: Option<&str>, sender: Option<&str>, origin: Option<&str>) -> BusMessage {
+        let mut value = serde_json::json!({"type": "agent_message", "message_id": "m-p1h", "agent_id": PERSONAL,
+            "payload": "do the thing", "timestamp": "2026-11-09T00:00:00Z"});
+        for (key, field) in [("on_behalf_of", on_behalf_of), ("sender_agent", sender), ("origin_agent", origin)] {
+            if let Some(field) = field {
+                value[key] = serde_json::json!(field);
+            }
+        }
+        // Round-trip through the JSONL text form, exactly as the rail reads it.
+        serde_json::from_str(&value.to_string()).unwrap()
+    }
+
+    /// N4: a forged `bus_queue.jsonl` line that names the Personal employee as
+    /// its own sender (or origin) must not launder a recorded non-owner
+    /// principal through the "acting employee" exception.
+    #[test]
+    fn p1h_forged_bus_line_with_non_owner_principal_is_refused() {
+        let h = home();
+        let admin = format!("user:{}", h.admin);
+        let owner = format!("user:{}", h.alice);
+        let refusal = |msg: &BusMessage| bus_fire_refusal_in(h.path(), true, msg);
+        for forged in [line(Some(&admin), Some(PERSONAL), None), line(Some(&admin), None, Some(PERSONAL)),
+            line(Some("unmapped:line:abc"), Some(PERSONAL), None), line(Some("system"), Some(PERSONAL), None)] {
+            assert_eq!(refusal(&forged), Some(PERSONAL_FIRE_REFUSED), "{:?}", forged.on_behalf_of);
+        }
+        // The owner's own principal passes, with or without a sender.
+        assert_eq!(refusal(&line(Some(&owner), Some(SHARED), None)), None);
+        assert_eq!(refusal(&line(Some(&owner), None, None)), None);
+        // No principal recorded: the acting employee decides (itself passes,
+        // another employee does not).
+        assert_eq!(refusal(&line(None, Some(PERSONAL), None)), None);
+        assert_eq!(refusal(&line(None, Some(SHARED), None)), Some(PERSONAL_FIRE_REFUSED));
+        // Unprotected installs are unchanged.
+        assert_eq!(bus_fire_refusal_in(h.path(), false, &line(Some(&admin), Some(PERSONAL), None)), None);
+    }
+}

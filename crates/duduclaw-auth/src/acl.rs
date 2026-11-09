@@ -234,14 +234,17 @@ impl UserContext {
     /// May talk to `agent_name`: Admin, any direct binding, or a team grant.
     /// Wider than [`Self::has_agent_access`] on purpose; use it only for
     /// "who can I call", never for memory, history or settings. P1g: never a
-    /// Personal employee the caller does not own.
+    /// Personal employee the caller does not own. P1h: calling an employee
+    /// makes it run work for the caller — delegation — so this uses the
+    /// delegation denial: an audited break-glass read of this request does
+    /// not open calling.
     pub fn can_call_agent(&self, agent_name: &str) -> bool {
         self.can_call_agent_under(agent_name, personal_restriction())
     }
 
     /// [`Self::can_call_agent`] under an explicit restriction (tests).
     pub fn can_call_agent_under(&self, agent_name: &str, restriction: Option<&dyn PersonalRestriction>) -> bool {
-        if self.personal_denied_under(agent_name, restriction) {
+        if restriction.is_some_and(|r| r.denies_delegation(&self.user_id, agent_name)) {
             return false;
         }
         self.is_admin()
@@ -503,6 +506,32 @@ mod tests {
         // No restriction (unprotected install): unchanged.
         assert!(admin.has_agent_access_under("alice-personal", AccessLevel::Owner, None));
         assert!(bob.has_agent_access_under("alice-personal", AccessLevel::Owner, None));
+    }
+
+    /// A request in which an audited break-glass admitted `alice-personal`
+    /// for reading: `denies` is lifted, `denies_delegation` is not.
+    struct BreakGlassRead;
+    impl PersonalRestriction for BreakGlassRead {
+        fn denies(&self, _user_id: &str, _agent: &str) -> bool {
+            false
+        }
+        fn denies_delegation(&self, user_id: &str, agent: &str) -> bool {
+            agent == "alice-personal" && user_id != "alice"
+        }
+    }
+
+    #[test]
+    fn p1h_can_call_agent_uses_the_delegation_denial_not_break_glass() {
+        let r: Option<&dyn PersonalRestriction> = Some(&BreakGlassRead);
+        let admin = admin_ctx();
+        assert!(admin.has_agent_access_under("alice-personal", AccessLevel::Viewer, r), "the read is admitted");
+        assert!(!admin.can_call_agent_under("alice-personal", r), "calling is delegation: owner only");
+        assert!(!admin.can_assign_to_under("alice-personal", r));
+        assert!(admin.can_call_agent_under("shared", r));
+        let mut alice = employee_ctx();
+        alice.user_id = "alice".into();
+        alice.agent_access.insert("alice-personal".into(), AccessLevel::Owner);
+        assert!(alice.can_call_agent_under("alice-personal", r), "the owner calls it");
     }
 
     #[test]

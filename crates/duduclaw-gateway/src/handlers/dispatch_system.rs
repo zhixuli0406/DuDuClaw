@@ -473,14 +473,28 @@ impl MethodHandler {
             | "db_sources.test"
             | "db_sources.upsert"
             | "db_sources.remove"
-            | "db_sources.tables"
-            // WP-A: per-agent `[capabilities] db_sources` grants. Same family,
-            // same admin gate — implemented in `db_source_grants`.
-            | "db_sources.grants.list"
-            | "db_sources.grants.set" => {
+            | "db_sources.tables" => {
                 require_admin!();
                 boxed_frame(|| crate::db_sources_rpc::dispatch(&self.registry, &self.home_dir, method, params))
                     .await
+            }
+            // WP-A: per-agent `[capabilities] db_sources` grants. Same family,
+            // same admin gate — implemented in `db_source_grants`. v1.81 P1h
+            // (N5): another person's Personal employees are left out of the
+            // list and kept out of the `set` diff (their grants merged back,
+            // never named in the reply or the activity row).
+            "db_sources.grants.list" | "db_sources.grants.set" => {
+                require_admin!();
+                let hidden = match self.personal_hidden_agents(ctx).await {
+                    Ok(hidden) => hidden,
+                    Err(message) => return WsFrame::error_response("", message),
+                };
+                if method == "db_sources.grants.list" {
+                    boxed_frame(|| crate::db_source_grants::list_hiding(&self.home_dir, &hidden)).await
+                } else {
+                    boxed_frame(|| crate::db_source_grants::set_hiding(&self.registry, &self.home_dir, params, &hidden))
+                        .await
+                }
             }
 
             // ── Odoo (admin only) ────────────────────────────

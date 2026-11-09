@@ -799,7 +799,17 @@ pub(crate) fn control_recording(home: &Path, ctx: &duduclaw_auth::UserContext, i
         .map_err(|_| VerificationError::Invalid)?;
     let run = duduclaw_mcp_boundary::execution_jobs::parse_handle(id)?;
     let owner = OWNER.get().filter(|owner| owner.home == home).ok_or(VerificationError::Unavailable)?;
-    let result = owner.execution_jobs.admin_recording_control(run, stop)?;
+    // v1.81 P1h (N3): stopping stays a host control for every Admin (D8,
+    // audited below), but a Personal employee's recording result is its
+    // owner's private work: withheld from anyone else (status only).
+    let personal_owner = owner.execution_jobs.admin_recording_owner(run)?;
+    let mut result = owner.execution_jobs.admin_recording_control(run, stop)?;
+    if personal_owner.as_deref().is_some_and(|recorded| recorded != ctx.user_id) {
+        if let Some(fields) = result.as_object_mut() {
+            fields.insert("result".to_owned(), serde_json::Value::Null);
+            fields.insert("withheld".to_owned(), serde_json::Value::Bool(true));
+        }
+    }
     if stop {
         duduclaw_security::audit::append_audit_event(home, &duduclaw_security::audit::AuditEvent::new(
             "isolation_recording_stop_requested", "gateway", duduclaw_security::audit::Severity::Info,

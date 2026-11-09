@@ -13,6 +13,15 @@
 //! | dashboard user (WebChat), or a messaging-app sender mapped to one (verified `channel_identities`) | employees bound to the account (any level); for a Manager also the employees bound to anyone below them (`users.manager_user_id`, at most Operator); plus the default employee and `[channels] public_trigger` employees |
 //! | anyone else (LINE friend, Telegram user, web-widget visitor) | the default employee and `public_trigger` employees |
 //!
+//! v1.81 P1h (N1), protected mode only: a Personal employee is called and
+//! assigned only by its owner (the mapped account), whatever the row above
+//! says — an Admin, a binding, a team grant or the conversation default do
+//! not reach someone else's. Its own owner-configured `public_trigger` still
+//! opens calling (not assigning) to everyone (`SenderAccess::grant`,
+//! `assign::assign_right`). A default-routed turn (no `@`) on a Personal
+//! employee is refused by the isolated runtime for anyone but the owner
+//! (`isolation_mcp::authority::personal_facts` via `ingress::authorize_current`).
+//!
 //! The account part is read live from `users.db` ([`access::load_account`]):
 //! a binding, role or manager change reaches the next message (the caches
 //! are keyed by `auth_meta.acl_generation`).
@@ -46,6 +55,8 @@ pub mod turn;
 pub(crate) mod tests;
 #[cfg(test)]
 mod team_tests;
+#[cfg(all(test, unix))]
+mod p1h_tests;
 
 use duduclaw_agent::registry::{AgentRegistry, LoadedAgent};
 use duduclaw_agent::trigger_match::{self, MentionScan, MentionTarget};
