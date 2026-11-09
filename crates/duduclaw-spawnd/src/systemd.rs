@@ -666,7 +666,7 @@ pub mod linux {
 
         fn test_id() -> RunId {
             let mut bytes = [0u8; 16];
-            let count = duduclaw_core::linux_syscalls::getrandom(&mut bytes, 0).unwrap();
+            let count = duduclaw_run::linux::syscalls::getrandom(&mut bytes, 0).unwrap();
             assert_eq!(count, bytes.len());
             RunId(bytes)
         }

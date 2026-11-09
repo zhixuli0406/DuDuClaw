@@ -158,7 +158,7 @@ impl Storage for LoopStorage {
         }
         let mut token = [0u8; 16];
         // Raw syscall: glibc's `getrandom` wrapper is above the release baseline.
-        if duduclaw_core::linux_syscalls::getrandom(&mut token, 0).ok() != Some(token.len()) {
+        if duduclaw_run::linux::syscalls::getrandom(&mut token, 0).ok() != Some(token.len()) {
             return Err(ErrorCode::IsolationUnavailable);
         }
         let mut candidate = self.journal.clone();

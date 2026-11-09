@@ -26,7 +26,7 @@ pub(crate) fn random_id() -> io::Result<[u8; 16]> {
     let mut done = 0;
     while done < id.len() {
         // Raw syscall: glibc's `getrandom` wrapper is above the release baseline.
-        let size = match duduclaw_core::linux_syscalls::getrandom(&mut id[done..], 0) {
+        let size = match duduclaw_run::linux::syscalls::getrandom(&mut id[done..], 0) {
             Ok(size) => size,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),

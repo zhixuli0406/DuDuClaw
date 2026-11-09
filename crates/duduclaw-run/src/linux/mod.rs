@@ -13,7 +13,7 @@ pub mod runner;
 /// the same source as `duduclaw_execution::linux_syscalls` (no extra dependency).
 #[allow(dead_code)]
 #[path = "../../../duduclaw-execution/src/linux_syscalls.rs"]
-pub(crate) mod syscalls;
+pub mod syscalls;
 
 pub(crate) fn checked(value: libc::c_int, error: crate::Error) -> crate::Result<()> {
     if value == -1 { Err(error) } else { Ok(()) }

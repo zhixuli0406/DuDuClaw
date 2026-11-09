@@ -220,7 +220,7 @@ fn stat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     let mut st: libc::statx = unsafe { mem::zeroed() };
     let mask = libc::STATX_BASIC_STATS | libc::STATX_MNT_ID;
     // Raw syscall: glibc's `statx` wrapper is above the release baseline.
-    duduclaw_core::linux_syscalls::statx(fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, mask, &mut st)?;
+    duduclaw_run::linux::syscalls::statx(fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, mask, &mut st)?;
     if st.stx_mask & mask != mask { return Err(io::ErrorKind::Unsupported.into()); }
     Ok(Stat { mode: u32::from(st.stx_mode), nlink: st.stx_nlink, uid: st.stx_uid,
         dev_major: st.stx_dev_major, dev_minor: st.stx_dev_minor, inode: st.stx_ino, size: st.stx_size,
@@ -265,7 +265,7 @@ fn copy_bounded(mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>, si
 fn memfd() -> Result<File, WorkRefusal> {
     let name = c"duduclaw-work-file";
     // Raw syscall: glibc's `memfd_create` wrapper is above the release baseline.
-    use duduclaw_core::linux_syscalls::memfd_create;
+    use duduclaw_run::linux::syscalls::memfd_create;
     let fd = match memfd_create(name, libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) {
         Err(error) if error.raw_os_error() == Some(libc::EINVAL) =>
             memfd_create(name, libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING),

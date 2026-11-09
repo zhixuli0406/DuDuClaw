@@ -2,7 +2,7 @@
 use std::{io::{self, Seek, Write}, mem, os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd}};
 use nix::{fcntl::{fcntl, FcntlArg, SealFlag}, sys::{stat::fstat, statfs::fstatfs}};
 // Raw-syscall wrappers: glibc's `memfd_create`/`statx` are above the release baseline.
-use duduclaw_core::linux_syscalls;
+use duduclaw_run::linux::syscalls as linux_syscalls;
 use duduclaw_isolation::ipc::{InputFd, SpawnRequest, MAX_FRAME_BYTES};
 
 fn invalid() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "invalid isolation descriptors") }
