@@ -7111,11 +7111,13 @@ export const api = {
      *  employee's next draft can address why. Sent whenever non-empty
      *  regardless of the decision; the gateway is the authority on whether a
      *  given decision path persists it. */
-    decide: (mail_id: string, approve: boolean, note?: string) =>
+    decide: (mail_id: string, approve: boolean, note?: string, stepUpCsrf?: number[]) =>
       client.call('mail.decide', {
         mail_id,
         approve,
         ...(note && note.trim() ? { note: note.trim() } : {}),
+        // v1.81 P1 break-glass (`lib/break-glass.ts`).
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{
         ok: boolean;
         mail_id: string;
@@ -7410,10 +7412,12 @@ export const api = {
         query,
         limit,
       }) as Promise<{ entries: MemoryEntry[]; signals?: MemoryEntry[] }>,
-    browse: (agentId: string, limit = 20) =>
+    browse: (agentId: string, limit = 20, stepUpCsrf?: number[]) =>
       client.call('memory.browse', {
         agent_id: agentId,
         limit,
+        // v1.81 P1 break-glass (`lib/break-glass.ts`).
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{ entries: MemoryEntry[]; signals?: MemoryEntry[] }>,
     keyFacts: (agentId: string, limit = 50) =>
       client.call('memory.key_facts', {
@@ -8232,12 +8236,15 @@ export const api = {
         approvals: ApprovalItem[];
         count: number;
       }>,
-    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string) =>
+    /** `stepUpCsrf` (v1.81 P1 break-glass): an Admin deciding a Personal
+     *  employee's card they do not own — see `lib/break-glass.ts`. */
+    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string, stepUpCsrf?: number[]) =>
       client.call('approvals.decide', {
         id,
         approve,
         ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
         ...(reason ? { reason } : {}),
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{
         id: string;
         decided: 'approved' | 'denied';
@@ -9036,13 +9043,18 @@ export const api = {
    *  INSTRUCTIONS / CONTRACT; agent.toml read-only). Wire types live in
    *  `./agent-files-types`. */
   agentFiles: {
-    list: (agentId: string) =>
-      client.call('agent_files.list', { agent_id: agentId }) as Promise<AgentFileListResponse>,
-    get: (agentId: string, file: AgentFileKey, versionId?: string) =>
+    /** `stepUpCsrf` on list / get / save: v1.81 P1 break-glass (`lib/break-glass.ts`). */
+    list: (agentId: string, stepUpCsrf?: number[]) =>
+      client.call('agent_files.list', {
+        agent_id: agentId,
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
+      }) as Promise<AgentFileListResponse>,
+    get: (agentId: string, file: AgentFileKey, versionId?: string, stepUpCsrf?: number[]) =>
       client.call('agent_files.get', {
         agent_id: agentId,
         file,
         ...(versionId ? { version_id: versionId } : {}),
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<AgentFileGetResponse>,
     /** The generated CLI context files (read-only). */
     runtimeFiles: (agentId: string) =>
@@ -9057,8 +9069,11 @@ export const api = {
       client.call('agent_files.diff', { agent_id: agentId, file, ...source }) as Promise<AgentFileDiffResponse>,
     history: (agentId: string, file: AgentFileKey) =>
       client.call('agent_files.history', { agent_id: agentId, file }) as Promise<AgentFileHistoryResponse>,
-    save: (params: AgentFileSaveParams) =>
-      client.call('agent_files.save', { ...params }) as Promise<AgentFileSaveResponse>,
+    save: (params: AgentFileSaveParams, stepUpCsrf?: number[]) =>
+      client.call('agent_files.save', {
+        ...params,
+        ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
+      }) as Promise<AgentFileSaveResponse>,
     rollback: (
       params: { agent_id: string; file: AgentFileKey; version_id: string; base_hash: string } & Omit<
         ContractReviewFollowUp,

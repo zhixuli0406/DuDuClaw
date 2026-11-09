@@ -31,6 +31,7 @@ import {
   Clock,
 } from 'lucide-react';
 import { api, type MailMessage, type MailMessageFull, type MailDraft, type MailStatus } from '@/lib/api';
+import { withBreakGlass } from '@/lib/break-glass';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAuthStore } from '@/stores/auth-store';
 
@@ -124,7 +125,11 @@ export function MailPage() {
     setBusy(mailId);
     setActionError(null);
     try {
-      await api.mail.decide(mailId, approve, note);
+      // v1.81 P1 break-glass: see lib/break-glass.ts.
+      await withBreakGlass(
+        (token) => (token ? api.mail.decide(mailId, approve, note, token) : api.mail.decide(mailId, approve, note)),
+        { purpose: 'decide' },
+      );
       setRejectingId((cur) => (cur === mailId ? null : cur));
       setRejectNotes((prev) => {
         if (!(mailId in prev)) return prev;
