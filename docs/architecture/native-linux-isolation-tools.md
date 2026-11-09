@@ -1,7 +1,13 @@
 # Native Linux MCP resource routes (security revision, 2026-11-05)
 # Native Linux tool dispositions — I1b round 6 (v1.80.0)
 
-**PARTIAL: full product parity is not ready.** Employee permissions remain the product contract; missing adapters are startup failures, not newly acceptable product restrictions. The endpoint now invokes `require_complete_services()` before admitting MCP traffic. The inventory tests use explicit discovery doubles for missing connectors and do not prove provider execution or production boot readiness.
+**Status 2026-11-09 (v1.81 integration branch): every tool in this inventory is routed, refused with a stated reason, or gated off by default.** Employee permissions remain the product contract; missing adapters are startup failures, not newly acceptable product restrictions. The endpoint invokes `require_complete_services()` before admitting MCP traffic, and production boot now installs the connector stack (F1), the work broker and spawnd feature source (W1) and the recording job store (SFR). What is still open is acceptance on a real Linux host (Ubuntu 22.04/24.04, Debian 12 as root) and with real provider accounts; the inventory tests use discovery doubles and do not prove provider execution.
+
+Disposition summary:
+
+- **Routed**: every row below without a `Refused:` prefix. This covers the 66 connector tools, the own-skill tools, spawn tools, `create_task`, the in-run helpers, the file tools, discovery job tools and fork reads, and every employee-handler tool.
+- **Refused with a reason**: `HostAuthority` (host desktop, devices, power, network, local model services), `ProposalRequired` (`create_agent`) and `ForkNextRelease` (`fork_run`, `merge_or_select`, `terminate_branch`). These three categories are the complete exception set.
+- **Gated off by default**: `browser_record_start`, `browser_record_stop` and `skill_from_recording` stay hidden until the host's recording probe passes (`RECORDING_BUILD_ENABLED`, spawnd `helper_recording`; readiness names `helper_recording_unsupported`) and the employee's admin-only `[isolation] public_web` is on. `web_fetch_cached`, `web_extract` and `skill_hub_install` also need `public_web = true` (default `false`). The file tools and in-run helpers stay hidden while spawnd's readiness report lacks `work_broker` (helpers: also `helper_calls`).
 
 **CONTRACT CHANGE: capability canonical encoding v2.** `EmployeeScope { id }` is an explicit MAC-covered resource variant (tag 9), bound to the verified employee. Service/Connector calls use either exact resource grants or current live employee authority. A scope cannot be combined with task/table/wiki/mailbox/recipient/connector grants or a task-limited run. Workspace and URL-origin entries may accompany scope as explicit File/A/E inputs. Tag 10, `Confined { resource }`, carries other exact File/A/E input/output grants (for example a wiki namespace or a worker connector account); it requires EmployeeScope and forbids nesting. Neither form narrows or expands employee-scope Service/Connector authority. Older capability MACs are not reused.
 
@@ -86,18 +92,14 @@ answers `helper_parent_offline`. Results are stored per `(run, call)` with each
 artifact's sha256 (`recording_jobs`); a later read must match them
 (`artifact_modified`).
 
-Workspace and URL-origin selection for the other File/A/E tools is still
-missing. `employee-work` is also the A execution
-workspace handle, so when the issuer selects it (for the file tools or the HX5
-helpers) it leaves every other listed tool whose eligibility would rest on that
-grant out of the signed tool snapshot (`Selection::signed_tools`, `mcp-boundary`
-`workspace_selection::drops_from_signed`): every tool in
-`workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS`, plus any other
-non-File tool that needs a Workspace. The in-run helpers are signed only when
-the grant was selected for them. Those dropped tools stay hidden and refused.
-The parity test tracks this gap explicitly, using that same list; it is
-unfinished wiring, not another intentional isolation refusal or evidence of
-full employee parity. Since W1 production boot installs the work broker and the
+Every File/A/E tool now has its own issuer selector. `employee-work` is also the
+A execution workspace handle, so when the issuer selects it (for the file tools
+or the HX5 helpers) it leaves every other listed tool whose eligibility would
+rest on that grant out of the signed tool snapshot (`Selection::signed_tools`,
+`mcp-boundary` `workspace_selection::drops_from_signed`). The in-run helpers
+are signed only when the grant was selected for them. The parity test checks
+`workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS`, which is empty; no
+tool may be added back. Since W1 production boot installs the work broker and the
 spawnd feature source, so the file tools and the HX5 in-run helpers can be
 listed in production; they stay hidden (fail closed) while spawnd's readiness
 report lacks `work_broker` (helpers: also `helper_calls`) or the backend has no
@@ -207,13 +209,13 @@ hidden in production.
 
 Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host handler is selected by `boundary_route` (including the Linux bundled model catalog). Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
 
-A/Execution requires a backend that explicitly supports retained workspace authority. `SpawndBackend::with_workspace_bridge` installs the trusted root-receipt hookup and verifies the held directory, exact reservation/runtime/workspace/cwd and live authority. The production B/H receipt producer is still external; default connect refuses workspace plans. Worker/file plans retain authorized tokens through queued work and checked transport. These are implementation readiness requirements, not Linux acceptance.
+A/Execution requires a backend that explicitly supports retained workspace authority. `SpawndBackend::with_workspace_bridge` installs the trusted root-receipt hookup and verifies the held directory, exact reservation/runtime/workspace/cwd and live authority. Production boot installs the receipt producer through the run-bound work brokers (W1); a backend without it still refuses workspace plans. Worker/file plans retain authorized tokens through queued work and checked transport. These are implementation readiness requirements, not Linux acceptance.
 
-Calls routed to a connector require an installed per-tool live selection policy, active catalog account, binding verification and bound executor. Executor source coverage is 66/66: native Google/Notion/GitHub (30), Odoo (20, including RM-120 `odoo_create` / `odoo_write`), DB (4), channels (8), models (2), computer login (1), search (1). The typed boot registry requires complete selection/execution support before dispatcher construction; the production integration host has not adopted that entry point. Google uses its sealed gateway owner for personal/home OAuth and consent/refresh; actual requester and non-OAuth variants remain pending. Credentials are not copied into the run. Source coverage does not establish complete product/provider parity. See the [round 3 report](native-linux-isolation-security-fixes-2026-11-05.md).
+Calls routed to a connector require an installed per-tool live selection policy, active catalog account, binding verification and bound executor. Executor source coverage is 66/66: native Google/Notion/GitHub (30), Odoo (20, including RM-120 `odoo_create` / `odoo_write`), DB (4), channels (8), models (2), computer login (1), search (1). The typed boot registry requires complete selection/execution support before dispatcher construction, and production boot installs it (F1, per-employee registry in the CLI). Google uses its sealed gateway owner for personal/home OAuth and consent/refresh with the authenticated requester (E1, E3); domain-wide delegation and service-account tenant sources are served as SharedTenant sources under the D-5 rule (E4). Credentials are not copied into the run. Source coverage and fixture tests do not establish provider parity: that needs real provider test accounts on a Linux host. See the [round 3 report](native-linux-isolation-security-fixes-2026-11-05.md).
 
 RM-103 S3 holds in protected mode: Codex, Grok and registered generic CLIs check `CapabilitiesConfig::native_tool_constraints` before the isolated route (`runtime::protected_coarse_native_gate`, repeated in `isolation_mcp::runtime::execute_native` / `execute_registered_cli` before the one-shot authority is consumed). The isolated native profile is root-derived and has no per-run read-only mode, so a native shell **or** write constraint (including the fail-closed config of a malformed `[capabilities]`) refuses the spawn. Protected Claude runs with `--tools ""` (no native tools).
 
-Existing scope, allowed/denied tools, permissions, approvals, record/audience, egress and input guards remain in force. Legacy Service I/O checks after every await are not yet fully instrumented. The typed handler carries authority through awaits; core TaskStore mutations recheck after locks and before writes/commits. Child tasks need explicit scope propagation. The entry check and revocation watch alone do not close that review item. The complete status and verification boundaries are in [the security-fix report](native-linux-isolation-security-fixes-2026-11-05.md).
+Existing scope, allowed/denied tools, permissions, approvals, record/audience, egress and input guards remain in force. Service I/O after-await checks are tracked in the security-fix report, not here. The typed handler carries authority through awaits; core TaskStore mutations recheck after locks and before writes/commits. Child tasks need explicit scope propagation. The entry check and revocation watch alone do not close that review item. The complete status and verification boundaries are in [the security-fix report](native-linux-isolation-security-fixes-2026-11-05.md).
 
 | Refusal category | Reason |
 | --- | --- |
@@ -237,27 +239,27 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 
 | Tool | Disposition |
 | --- | --- |
-| `google_status` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `gmail_search` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `gmail_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `gmail_create_draft` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `google_chat_spaces` | Resource → Native account-bound executor (mailbox grant, admin Chat opt-in, Direct OAuth only); product-policy/boot adapter pending |
-| `google_chat_messages` | Resource → Native account-bound executor (mailbox grant, admin Chat opt-in, Direct OAuth only); product-policy/boot adapter pending |
-| `calendar_list_events` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `calendar_create_event` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `sheets_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `sheets_append` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `forms_get` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `forms_list_responses` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `gtasks_lists` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `gtasks_list` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `gtasks_create` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `gtasks_complete` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `drive_search` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `drive_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `docs_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `docs_append` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `slides_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `google_status` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gmail_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gmail_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gmail_create_draft` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `google_chat_spaces` | Resource → Native account-bound executor (mailbox grant, admin Chat opt-in, Direct OAuth only); installed at production boot (F1); real provider acceptance needs a Linux host |
+| `google_chat_messages` | Resource → Native account-bound executor (mailbox grant, admin Chat opt-in, Direct OAuth only); installed at production boot (F1); real provider acceptance needs a Linux host |
+| `calendar_list_events` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `calendar_create_event` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `sheets_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `sheets_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `forms_get` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `forms_list_responses` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gtasks_lists` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gtasks_list` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gtasks_create` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `gtasks_complete` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `drive_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `drive_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `docs_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `docs_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `slides_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `os_notify` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_watch_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_open` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
@@ -294,26 +296,26 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `agent_update` | Resource → AuthorizedToolCall → original live employee handler |
 | `agent_remove` | Resource → AuthorizedToolCall → original live employee handler |
 | `agent_update_soul` | Resource → AuthorizedToolCall → original live employee handler |
-| `odoo_connect` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_status` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_crm_leads` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_crm_create_lead` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_crm_update_stage` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_sale_orders` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_sale_create_quotation` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_sale_confirm` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_inventory_products` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_inventory_check` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_invoice_list` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_payment_status` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_execute` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_report` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_partner_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `odoo_create` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; production boot pending |
-| `odoo_write` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; production boot pending |
+| `odoo_connect` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_status` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_crm_leads` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_crm_create_lead` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_crm_update_stage` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_sale_orders` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_sale_create_quotation` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_sale_confirm` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_inventory_products` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_inventory_check` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_invoice_list` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_payment_status` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_execute` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_report` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_partner_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_create` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; installed at production boot (F1) |
+| `odoo_write` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; installed at production boot (F1) |
 | `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee + exactly one own Wiki output grant (Confined Wiki), rechecked at publication; own SKILLS bytes parsed by E as data; publishes only into the caller's own wiki, body pages read back before the completion marker (H12a) |
 | `execute_program` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` (H9 selects it for the helpers, no file tool needed) and spawnd `helper_calls`; signed only when that selection ran |
 | `office_script` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` (H9 selects it for the helpers, no file tool needed) and spawnd `helper_calls`; signed only when that selection ran |
@@ -366,8 +368,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; shared skill scanned and prepared by E as data; scanned body copied only into the caller's own SKILLS (no clobber, read back); no target argument (H12a) |
 | `plan_start` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_improve` | Resource → AuthorizedToolCall → original live employee handler |
-| `browser_record_start` | HX6 `Route::InRunHelper`, recording slot of the caller's own run (`ExecutionToolBridge::execute_recording`, `prepare_in_run` → `AuthorizedHelperPlan::recording`, spawnd `HelperCall{slot: recording}`); returns `{status: recording, id}` (spawnd call id); gateway collector stores the decoded result + artifact sha256 per `(run, call)` (`recording_jobs`); flushed at run end (`ended_by: run_end`), hard kill ⇒ `uncertain/run_killed`; offline parent ⇒ `helper_parent_offline`; needs `Workspace{employee-work}`, spawnd `helper_calls` + `helper_recording` and `[isolation] public_web`; the navigation `url` is authorized by the record's signed EmployeeScope + `PublicOrigins` grant (D-H2, tag 11; signed with the recording selection), never a per-URL `UrlOrigin` (`tool_policy::RECORDING_URL_TOOLS`): it must pass `resources::permitted_public_origin` (https, default port, no userinfo, public DNS name, no IP literal or private name; http refused), no grant ⇒ refused, and egress stays public-address-only through the run's forwarder |
-| `browser_record_stop` | HX6 `Route::InRunHelper`: same run ⇒ `HelperStop` for that `(run, call)` and the stored result (the old `:180` refusal inverted, never `parse_handle`); later run or terminal row ⇒ stored result, no helper interaction; revocation ⇒ `HelperStop`, `ended_by: revoked`; same selector as `browser_record_start`; names no URL, so needs no `PublicOrigins`/`UrlOrigin` |
+| `browser_record_start` | HX6 `Route::InRunHelper`, recording slot of the caller's own run (`ExecutionToolBridge::execute_recording`, `prepare_in_run` → `AuthorizedHelperPlan::recording`, spawnd `HelperCall{slot: recording}`); returns `{status: recording, id}` (spawnd call id); gateway collector stores the decoded result + artifact sha256 per `(run, call)` (`recording_jobs`); flushed at run end (`ended_by: run_end`), hard kill ⇒ `uncertain/run_killed`; offline parent ⇒ `helper_parent_offline`; needs `Workspace{employee-work}`, spawnd `helper_calls` + `helper_recording` and `[isolation] public_web`; the navigation `url` is authorized by the record's signed EmployeeScope + `PublicOrigins` grant (D-H2, tag 11; signed with the recording selection), never a per-URL `UrlOrigin` (`tool_policy::RECORDING_URL_TOOLS`): it must pass `resources::permitted_public_origin` (https, default port, no userinfo, public DNS name, no IP literal or private name; http refused), no grant ⇒ refused, and egress stays public-address-only through the run's forwarder. Gated off by default: hidden until the host's recording probe passes (`helper_recording_unsupported` until then) |
+| `browser_record_stop` | HX6 `Route::InRunHelper`: same run ⇒ `HelperStop` for that `(run, call)` and the stored result (the old `:180` refusal inverted, never `parse_handle`); later run or terminal row ⇒ stored result, no helper interaction; revocation ⇒ `HelperStop`, `ended_by: revoked`; same selector as `browser_record_start`; names no URL, so needs no `PublicOrigins`/`UrlOrigin`; gated off by default with `browser_record_start` |
 | `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `skill_from_recording` | Resource → protected host orchestration (`mcp_skill_jobs::handle_protected`); checked E parser required; EmployeeScope + own Employee + brokered Workspace{employee-work}, signed only behind the HX6 recording gate (spawnd `helper_calls` + `helper_recording`, `[isolation] public_web`, interactive run, profile allows; no PublicOrigins), so hidden while recording is gated off; only the caller's own finished recording from HX6's job store (installed at boot as H12d's `RecordingJobs` seam: owner read by employee + principal + binding, exact `(run, call)` id, `complete`, strict helper result); every artifact read through root's broker at the shared `recording_layout` and returned only as a `VerifiedArtifact` (`recording_jobs::verify_artifact`, else `artifact_modified`); artifacts stay untrusted and are parsed only by E (`RecordingArtifacts`: framed bundle, trace archive entry/size/ratio caps, no traversal or symlink entries); E scan before a no-clobber publication into the caller's own `agents/<label>/SKILLS` |
@@ -413,15 +415,15 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `skill_hub_install` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + signed PublicOrigins; host-selected hub archive via the protected public fetch, expanded only by E, single SKILL.md scanned by E before approval and at install, published no-clobber into the caller's own SKILLS (H12b) |
 | `skill_curator_status` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee; status and `run=true` limited to the caller's own skills (D-H4), run admin-approved, report returned and not published to the shared wiki (H12a) |
 | `skill_pin` | Resource → AuthorizedToolCall → original live employee handler |
-| `notion_status` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `notion_search` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `notion_page_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `notion_page_append` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `github_status` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `github_search_issues` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `github_issue_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `github_pr_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
-| `github_issue_comment` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `notion_status` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `notion_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `notion_page_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `notion_page_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_status` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_search_issues` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_issue_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_pr_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `github_issue_comment` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `cost_summary` | Resource → AuthorizedToolCall → original live employee handler |
 | `cost_agents` | Resource → AuthorizedToolCall → original live employee handler |
 | `cost_users` | Resource → AuthorizedToolCall → original live employee handler |
@@ -456,8 +458,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `identity_resolve` | Resource → AuthorizedToolCall → original live employee handler |
 | `wiki_share` | Resource → AuthorizedToolCall → original live employee handler |
 | `db_sources` | Resource → bounded account collection; each member repeats owner/catalog/binding/product checks |
-| `db_tables` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; production boot pending |
-| `db_select` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; production boot pending |
+| `db_tables` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; installed at production boot (F1) |
+| `db_select` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; installed at production boot (F1) |
 | `db_query` | Resource → selected DB; finite strict single-table SQL lowers to parameterized SelectRequest; EmployeeScope retains product SQL policy |
 | `file_read` | AuthorizedFile (workspace dirfd, or `employee-work` root broker sealed read-only snapshot, never reopened by path); 512 KiB cap; live authority on each read; root refusals show fixed zh-TW reasons without paths; H10 issues Workspace employee-work (brokered root, H6) when a root work broker is installed and the employee profile allows the tool |
 | `csv_read` | AuthorizedFile (dirfd or `employee-work` root broker sealed snapshot) → checked E table parser, ReadTable op; root refusals show fixed zh-TW reasons without paths; same H10 brokered Workspace grant as file_read |
@@ -466,7 +468,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `send_message` | Resource → selected exact bot/channel/chat → checked sender; late failure is uncertain |
 | `send_photo` | Resource → selected exact channel/chat → checked media send; unsupported subtype/input refuses |
 | `send_sticker` | Resource → selected exact channel/chat → checked sticker send; unsupported subtype/input refuses |
-| `web_search` | Resource → bound search provider; checked E parser required; production boot pending |
+| `web_search` | Resource → bound search provider; checked E parser required; installed at production boot (F1) |
 | `send_to_agent` | Resource → AuthorizedToolCall → original live employee handler |
 | `list_cron_tasks` | Resource → finite owner-and-grant SQL adapter; original live handler for EmployeeScope |
 | `update_cron_task` | Resource → AuthorizedToolCall → original live employee handler |

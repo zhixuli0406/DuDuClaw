@@ -1,8 +1,21 @@
 # Protected isolation: Personal bindings and production connectors
 
-Status: implementation plan only, 2026-11-05. This document does not enable a
-connector or change binding authorization. Source coverage, fixture tests,
-production boot, native execution, and real provider acceptance are separate gates.
+Status 2026-11-09: the plan below was written on 2026-11-05 and is now
+implemented on the v1.81 integration branch (packages A–G, see the table).
+"Existing implementation" and "Missing production authority" describe the
+starting point, not today's code. Native execution on Ubuntu 22.04/24.04 and
+Debian 12 as root and real provider acceptance (Google Workspace test tenant,
+Notion, GitHub, Odoo) remain separate gates and have not run for this branch.
+
+| Package | State on the integration branch |
+| --- | --- |
+| A: lifecycle read model | Done (A1–A4; Personal exclusivity in users.db, root receipt records the binding). A1–A3 passed security review SR1, with its two High findings fixed. |
+| B: production binding authority | Done (B1–B3; Personal owner and Shared tenant come from the lifecycle read model, background receipts keep original authority). Reviewed in SR2/SR3 (gate passed after fixes). |
+| C: account lifecycle bridge | Done (C1–C6; catalog is the single store, product credential events and migration update it). C1, C3 reviewed in SR1–SR3; the SR4 outcome for C2, C4, C5 is not recorded in the wiki. |
+| D: non-Google providers | Done (D1–D4), reviewed in SR2/SR3; needs real provider accounts for acceptance. |
+| E: Google owner paths | Done (E1–E4); delegate and service-account sources are SharedTenant sources (rule D-5). SR4 outcome not recorded in the wiki. Needs a real test tenant. |
+| F: boot and user experience | Done (F1–F4, F6 lifecycle, F5 protected-mode page and my-account tab). Readiness reasons and the banner are wired; the connector stack installs at boot. |
+| G: end-to-end acceptance | Tests and live-test scripts written (G1–G3); not run on a real host. G4 is this documentation pass. |
 
 ## Existing implementation
 
@@ -92,8 +105,8 @@ connector request has been sent.” A Personal-specific refusal should say:
 “This employee's personal account binding is not supported in protected mode
 yet. Ask an administrator to check isolation readiness.” Distinguish unsupported
 setup, revoked access and temporary service unavailability, with an administrator
-status link and a sanitized correlation ID. These messages and notice are planned
-work in package F, not UI changes delivered by this document.
+status link and a sanitized correlation ID. These messages and the readiness banner
+were delivered by package F (F3, F4); this document itself changes no UI.
 
 Completion requires both positive and negative evidence: correct owner's calls
 succeed, other owners/tenants fail, stale generations and revoked consent fail at

@@ -4,7 +4,17 @@ This note records implementation boundaries for native Linux employee isolation.
 Source migration, compilation, protocol fixtures, native acceptance and deployment
 are separate gates. Nothing in this note is production isolation acceptance.
 
-**Current security revision (2026-11-05): PARTIAL / NO-GO.** Capability signing
+**Status 2026-11-09 (v1.81 integration branch).** Everything below is a dated
+per-round handoff log. Its "pending", "not yet" and "still required" wording
+describes the state at the time of that round. Current per-tool state is in
+[the tool matrix](native-linux-isolation-tools.md) (every tool is routed,
+refused with a reason, or gated off by default), and per-task state is in the
+work-breakdown wiki page. Production boot now installs the connector stack, work
+broker and recording job store. Still open: acceptance on real Linux hosts as
+root (Ubuntu 22.04/24.04, Debian 12), real provider accounts, and the
+host probe that enables browser recording (off by default).
+
+**Security revision (2026-11-05): PARTIAL / NO-GO, superseded by the status above for wiring.** Capability signing
 uses contract v2; missing adapters and unsupported finite grant modes fail
 startup. See the [per-item security-fix report](native-linux-isolation-security-fixes-2026-11-05.md)
 for current changes, test evidence and remaining integration work. Earlier
@@ -3648,7 +3658,7 @@ Round 2 file responsibilities (in addition to the historical round 1 list):
 
 獨立 code-reviewer 看過實際變更；指出的缺 version-floor 放行、proposal 總量上限及 inherited fd 的 unsafe precondition 已修正並複查。archive I/O 錯誤後禁止再次加密以避免 nonce 重用，另有回歸測試。沒有正式 `gpt-daybreak-blue-latest` 安全審查，不能視為 Daybreak GO。
 
-##### 精確未完成項目
+##### 精確未完成項目（該輪當時；2026-11-09 現況：遷移 root 命令、匯入、確認頁與產品 adapters 已在 v1.81 整合分支接上，實機與真實供應商驗收仍待執行）
 
 1. 尚無可操作的 `duduclaw-migrate` root 命令及 installer 遷移接線。`HostAdapter` 沒有 production implementation：root flock、停止舊 gateway、mask/timer/socket/cron/at/user-manager 封鎖、清空舊 uid 程序與讀回待做。舊 installer 目前只會拒絕跨入 v1.80。
 2. 快照走訪／AEAD 元件已有，但 fsync＋原子發布＋解密驗證整合、人工安全還原、期限清理及跨檔案系統複製待做。quarantine helper 只有同檔案系統 `RENAME_NOREPLACE`，呼叫端須先停止舊環境並封存父目錄權限。
@@ -7496,9 +7506,9 @@ no `cargo fmt`, installation, provider call or commit was performed.
 | `shared_skill_adopt` | Actual shared skill file → E scan and frontmatter removal → host atomic **new** own skill and fd-anchored readback. Cross-agent targets and overwrite refuse. **Partial compatibility:** shared `usage_count`/`adopted_by` are deliberately not updated; result says `shared_metadata_updated:false`. The worker has no shared-source overwrite field or authority. |
 | `skill_security_scan` | Actual own flat skill file, with global fallback only on absence; bound employee only; bounded strict host CONTRACT restrictions → E's existing deterministic scanner → typed verdict/findings and original audit emission. Unsafe/unreadable local files cannot trigger global fallback. |
 | `skill_graduate` | Actual own flat skill file → same E scan plus metadata preparation → host new global skill, fsync/atomic no-clobber/readback and locked/fsynced original-format graduation log. Manual graduation retains the original zero-lift/no-load-count semantics and upstream Admin/approval gates; no new automatic eligibility or approval bypass. Existing global skill refuses overwrite. |
-| `skill_from_recording` | **MISSING**. Recording ownership/finalization, HAR redaction/action parsing, bounded distillation, original pending-approval draft pipeline still need a real producer. |
-| `skill_synthesis_run` | **MISSING**. The existing pipeline reads event/trajectory files and model output; all parser stages still need E, while caller/autonomy/provider/approval/publication remain host-owned. |
-| `skill_hub_install` | **MISSING**. Separate bounded host hub fetch and current signature/source trust, E scan/manifest parsing, original install approval and locked publication/readback. Do not call `fetch_and_gate` unchanged on protected TEAM: its scan/manifest parsing still runs on the host. |
+| `skill_from_recording` | Round 2 state was missing. Now routed (SFR, H12d): own finished recording only, parsed in E, gated off by default until the host recording probe passes. See the tool matrix. |
+| `skill_synthesis_run` | Round 2 state was missing. Now routed (H12c): E prepares and scans the model output, caller/autonomy/provider/approval/publication stay host-owned. See the tool matrix. |
+| `skill_hub_install` | Round 2 state was missing. Now routed (H12b): bounded host hub fetch through the protected public path, E scan and manifest parsing, original install approval, locked publication and readback; needs `public_web`. Do not call `fetch_and_gate` unchanged on protected TEAM. |
 | `skill_curator_status` | **MISSING**, retained Worker route. Status-only has no file and should become a conditional authenticated control path; `run=true` recursively loads global/other employee skills and archives them, so forwarding the whole handler remains unsafe. |
 | `transcribe_audio` | Bounded decoded real audio → E `InspectAudio` → existing host Whisper API, with no provider credentials or network inside E. Provider responses now stream under a 256 KiB ceiling before JSON decoding. **Compatibility limit:** structurally checked WAV/MP3 only; OGG/FLAC and other formats refuse. This is container/frame inspection, not decoding or a promise of codec safety. |
 | `synthesize_speech` | Host configured TtsRouter, filtered to existing official cloud providers only → real returned audio file → E WAV/MP3 structure inspection → bounded base64 result. Local/command providers stay unavailable until A producers exist. Generated audio over **128 KiB refuses after the provider may already have billed**; provider errors, invalid media, revocation and uncertain completion never claim success. |

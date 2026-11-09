@@ -1,6 +1,8 @@
 # Native Linux isolation security fixes — rounds 1–3, 2026-11-05
 
-**狀態：PARTIAL／NO-GO。** Round 3 接續本 worktree 未提交的 rounds 1–2，保留在 `feat/iso-secfix-20261105`，沒有 commit。Connector 具體 executor 原始碼已覆蓋 **62／62**；四個先前缺少的 finite adapters 已有受限實作；Spawnd 已有 authorized-workspace hookup。正式 boot caller、Google 完整 requester／非 OAuth 路徑、所有 Service／背景入口及原生整合驗收仍未完成。缺件拒絕不是功能驗收。依交辦未在本機建置 gateway／CLI，不能宣稱整棵 workspace 編譯通過。
+**2026-11-09 補註：**本文是 2026-11-05 當時的紀錄，其中「仍未完成」的 boot caller、Google requester／非 OAuth 來源、背景入口等項目已在 v1.81 整合分支接上（見工具矩陣與工作分解頁）；原生實機與真實供應商驗收仍未執行。
+
+**狀態（2026-11-05 當時）：PARTIAL／NO-GO。** Round 3 接續本 worktree 未提交的 rounds 1–2，保留在 `feat/iso-secfix-20261105`，沒有 commit。Connector 具體 executor 原始碼已覆蓋 **62／62**；四個先前缺少的 finite adapters 已有受限實作；Spawnd 已有 authorized-workspace hookup。正式 boot caller、Google 完整 requester／非 OAuth 路徑、所有 Service／背景入口及原生整合驗收仍未完成。缺件拒絕不是功能驗收。依交辦未在本機建置 gateway／CLI，不能宣稱整棵 workspace 編譯通過。
 
 依據為 round-1 MCP boundary 與 egress/parse reviews（`20261105-131141-codex-75237-219.md`、`20261105-130643-codex-75237-217.md`）及 design §6。本文件保留於 docs，僅記錄安全邊界、修補狀態與驗證，不收錄操作性攻擊重現。逐工具狀態見 [tool matrix](native-linux-isolation-tools.md)。
 
@@ -103,7 +105,7 @@ CronStore 的日常寫入、routine 與 migration publish／disable 使用共同
 
 排隊的 blocking 工作保留本次 invocation guard；原呼叫被丟棄，即使 connection 仍有效，該工作的後續讀取／傳輸仍會拒絕。Worker launcher／session 必須明確支援 live authority；checked transport 在等待與 FD 傳送／接收邊界重查，沒有 legacy exchange fallback。
 
-Execution backend 新增 authorized-workspace 介面，須檢查實際 backend root 與 token 綁定並保留 live authority；預設拒絕。**`SpawndBackend` 尚未完成 root-derived workspace receipt 的正式接線，所以 protected A lane 目前不可用。** IPC v1 未改，不能以測試 backend 成功取代 production 實作。取消或丟棄 worker session 也不代表已取得 root teardown receipt。
+Execution backend 新增 authorized-workspace 介面，須檢查實際 backend root 與 token 綁定並保留 live authority；預設拒絕。**（Round 3 當時）`SpawndBackend` 尚未完成 root-derived workspace receipt 的正式接線，protected A lane 當時不可用；W1 已在 production boot 接上 run-bound work broker，現況見工具矩陣。** IPC v1 未改，不能以測試 backend 成功取代 production 實作。取消或丟棄 worker session 也不代表已取得 root teardown receipt。
 
 ### Parse runtime tree 安裝
 
@@ -111,9 +113,21 @@ Execution backend 新增 authorized-workspace 介面，須檢查實際 backend r
 
 **初次 bootstrap 尚缺 recorded-state 前的正式接點；升級至不同 closure 尚缺與 service stop／替換的協調。** 空目錄不算 readiness，內容不符會拒絕。這不等於 systemd／root sentinel 實機驗收。
 
-## 必須完成的剩餘項目
+## 剩餘項目（2026-11-05 當時）與 2026-11-09 現況
 
-| 項目 | 精確剩餘 |
+| 項目 | 2026-11-09 現況 |
+| --- | --- |
+| 正式 boot caller／帳號 lifecycle | 已接上（F1 production boot 安裝 connector stack，A–C 套件提供 lifecycle） |
+| Google 完整產品 parity | 已接上 requester 與 SharedTenant 來源（E1–E4）；需真實測試租戶驗收 |
+| Service 全量覆蓋 | 已路由，逐工具狀態見工具矩陣；外部已發出的 I/O 仍無法撤回 |
+| Background durable authority | 已改為管理員核准、綁定歸屬與配置的授權（P 套件）；個人專屬員工不執行背景工作 |
+| Execution production receipt | 已接上（W1 run-bound work broker） |
+| Installer bootstrap／upgrade | 已接上（獨立更新服務）；Linux root 實機驗收待執行 |
+| 整合與安全驗收 | 需在真實 Linux 主機（Ubuntu 22.04／24.04、Debian 12）與真實供應商帳號執行，尚未完成 |
+
+下表保留 2026-11-05 當時的精確剩餘項目，僅供歷史對照。
+
+| 項目 | 精確剩餘（當時） |
 | --- | --- |
 | 正式 boot caller／帳號 lifecycle | 新 typed assembly／dispatcher entry 尚未被 production binary／integration host 呼叫。必須接入既有 registry lifetime、account provisioning／revoke 及完整 A/E factories，再檢查 admission。Notion／GitHub 仍需 host 提供真正的 live selection policy／credential material；generic vault 本身不是產品選帳證據。 |
 | Google 完整產品 parity | 可信 requester 來源及 requester 綁定的 sealed claim；delegate／SA／Apps Script source-owner adapters；真 OAuth refresh、consent／owner 撤銷及 provider output tests。現在 Unknown／不支援 source 的拒絕不能算 parity。 |
