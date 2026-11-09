@@ -1961,7 +1961,12 @@ mod tests {
     async fn cron_webchat_delivery_restores_an_archived_conversation() {
         let f = crate::scheduled_webchat::tests::fixture("agnes").await;
         let manager = crate::session::SessionManager::new(&f.home.path().join("sessions.db")).unwrap();
-        manager.delete_session(&f.session).await.unwrap();
+        // RM-173: archived by the inactivity task (a user clear moves the
+        // conversation away instead — see the next test).
+        manager.acquire().await.execute(
+            "UPDATE sessions SET archived_at=?2, archive_reason='retention' WHERE id=?1",
+            rusqlite::params![f.session, chrono::Utc::now().to_rfc3339()],
+        ).unwrap();
         deliver_cron_result(f.home.path(), &webchat_task("agnes", &f.target), "今天沒有待辦")
             .await.unwrap();
         assert_eq!(
@@ -1974,6 +1979,20 @@ mod tests {
             rusqlite::params![f.session], |row| row.get(0),
         ).unwrap();
         assert_eq!(archived_at, None);
+    }
+
+    #[tokio::test]
+    async fn cron_webchat_delivery_never_lands_in_a_user_cleared_conversation() {
+        let f = crate::scheduled_webchat::tests::fixture("agnes").await;
+        let manager = crate::session::SessionManager::new(&f.home.path().join("sessions.db")).unwrap();
+        manager.delete_session(&f.session).await.unwrap();
+        // The target id no longer has a row (moved to `#cleared:`): refused.
+        assert!(
+            deliver_cron_result(f.home.path(), &webchat_task("agnes", &f.target), "今天沒有待辦")
+                .await
+                .is_err()
+        );
+        assert!(manager.session_agent(&f.session).await.unwrap().is_none());
     }
     #[tokio::test]
     async fn autonomy_pause_cron_records_skip_then_resume_invokes() {

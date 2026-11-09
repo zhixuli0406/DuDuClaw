@@ -65,7 +65,7 @@ impl MethodHandler {
                 let sessions: Vec<Value> = list
                     .iter()
                     .map(|s| {
-                        json!({
+                        let mut row = json!({
                             "session_id": s.id,
                             "agent_id": s.agent_id,
                             "title": s.title,
@@ -74,7 +74,16 @@ impl MethodHandler {
                             "tokens": s.total_tokens,
                             "lineage": s.lineage,
                             "archived": archived,
-                        })
+                        });
+                        if archived {
+                            // RM-173: `user` (cleared by its user: `/new`, a
+                            // channel reset) or `retention` (inactivity).
+                            row["archive_reason"] = json!(s
+                                .archive_reason
+                                .as_deref()
+                                .unwrap_or(crate::session::ARCHIVE_REASON_RETENTION));
+                        }
+                        row
                     })
                     .collect();
                 WsFrame::ok_response("", json!({ "sessions": sessions }))
@@ -230,11 +239,11 @@ impl MethodHandler {
         if class != Class::Own {
             return WsFrame::error_response("", "permission denied");
         }
-        let archived_at = match rc.session_manager.archived_at(&id).await {
+        let state = match rc.session_manager.archive_state(&id).await {
             Ok(a) => a,
             Err(_) => return WsFrame::error_response("", "session not found"),
         };
-        let Some(archived_at) = archived_at else {
+        let Some((archived_at, archive_reason)) = state else {
             // Already live (e.g. a new message restored it): nothing to do.
             return WsFrame::ok_response("", json!({"session_id": requested, "restored": false}));
         };
@@ -251,7 +260,7 @@ impl MethodHandler {
             &live.user_id,
             &owner,
             json!({"actor_user_id": live.user_id, "agent": owner, "session": digest,
-                   "archived_at": archived_at, "privacy_mode": if mode == Mode::Full { "full" } else { "own" }}),
+                   "archived_at": archived_at, "archive_reason": archive_reason, "privacy_mode": if mode == Mode::Full { "full" } else { "own" }}),
             None,
         )
         .is_err()

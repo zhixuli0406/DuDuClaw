@@ -148,6 +148,23 @@ async fn rm173_list_includes_archived_but_keeps_since_and_scope() {
 }
 
 #[tokio::test]
+async fn rm173_user_cleared_conversations_are_never_listed_or_released() {
+    let (_home, sm, scope) = seeded().await;
+    // A report's own WebChat and a customer conversation, both cleared by the user.
+    let report = sm.clear_for_user("report").await.unwrap().unwrap();
+    let customer = sm.clear_for_user("line:Ccustomer").await.unwrap().unwrap();
+    let page = list(&sm, &scope, &ListFilter::default(), 20, None).await.unwrap();
+    let ids: Vec<_> = page.sessions.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["own"]);
+    for id in [report.as_str(), customer.as_str(), "report", "line:Ccustomer"] {
+        assert!(get(&sm, &scope, id).await.unwrap().is_none(), "{id}");
+    }
+    // Once an Admin restores the cleared row it is ordinary history again.
+    sm.restore_archived(&report).await.unwrap();
+    assert!(get(&sm, &scope, &report).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn initial_rfc3339_cursor_preserves_microsecond_order() {
     let (_home, sm, scope) = seeded().await;
     sm.acquire()

@@ -548,11 +548,13 @@ impl MethodHandler {
     }
 
     /// RM-173 `users.team_history.restore {session_id}` — clear `archived_at`
-    /// of a conversation. Allowed for a live Admin (any existing session), or
-    /// for a manager exactly when `users.team_history.get` would release that
+    /// of a conversation. Allowed for a live Admin (any existing session,
+    /// including one the user cleared — `archive_reason` is audited), or for a
+    /// manager exactly when `users.team_history.get` would release that
     /// session to them right now ([`Self::team_history_session_access`],
-    /// including its rate limit, activation window and denial audit). Audited
-    /// as `team_history_session_restored` (fail closed) before the write.
+    /// including its rate limit, activation window and denial audit) — never
+    /// a user-cleared one, refused like a missing session. Audited as
+    /// `team_history_session_restored` (fail closed) before the write.
     pub(crate) async fn handle_team_history_restore(
         &self,
         params: Value,
@@ -591,15 +593,21 @@ impl MethodHandler {
                 Err(frame) => return frame,
             }
         };
-        let archived_at = match rc.session_manager.archived_at(&id).await {
+        let state = match rc.session_manager.archive_state(&id).await {
             Ok(a) => a,
             Err(_) => return error("read_error", "history unavailable", None),
         };
-        let Some(archived_at) = archived_at else {
+        let Some((archived_at, reason)) = state else {
             return WsFrame::ok_response("", json!({"session_id":requested,"restored":false}));
         };
         if let Some(scope) = &scope {
-            if self.history_recheck(&db, ctx, scope).is_err() {
+            // A conversation the user cleared is theirs alone: never restorable
+            // through team history (the reader already hides it; this keeps
+            // the refusal even if a clear races the read). Same shape as a
+            // missing session.
+            if reason == crate::session::ARCHIVE_REASON_USER
+                || self.history_recheck(&db, ctx, scope).is_err()
+            {
                 return self.history_denied(ctx, &agent, "hidden", "not_found", "session not found", None);
             }
         }
@@ -612,7 +620,7 @@ impl MethodHandler {
             "team_history_session_restored",
             &ctx.user_id,
             &agent,
-            json!({"actor":ctx.user_id,"actor_role":ctx.role,"agent":agent,"session":digest,"archived_at":archived_at,"via":via,"since":scope.as_ref().map(|s|s.since),"generation":scope.as_ref().map(|s|s.generation)}),
+            json!({"actor":ctx.user_id,"actor_role":ctx.role,"agent":agent,"session":digest,"archived_at":archived_at,"archive_reason":reason,"via":via,"since":scope.as_ref().map(|s|s.since),"generation":scope.as_ref().map(|s|s.generation)}),
             None,
         )
         .is_err()
@@ -688,6 +696,20 @@ impl MethodHandler {
                     "change team_history_since separately from manager_team_history",
                     None,
                 );
+            }
+            if (archive.is_some() || purge.is_some()) && since.is_some() {
+                // F4: retention lives in config.toml, the boundary in the user
+                // DB — two commits. Refuse the combination outright so a
+                // failure of the second step can never leave a partial update.
+                return error(
+                    "invalid_params",
+                    "change team_history_since separately from conversation retention",
+                    None,
+                );
+            }
+            if ctx.user_id == "system" && since.is_some() {
+                // F3: the shared-token context never moves the boundary.
+                return error("permission_denied", "permission denied", None);
             }
 
             // Verify a backdating step-up BEFORE anything is written, so a
@@ -781,12 +803,18 @@ impl MethodHandler {
                 let home = self.home_dir.clone();
                 let actor = ctx.user_id.clone();
                 let step_up = since_step_up;
-                let moved = db.set_team_history_since(new_since, move |old, new| {
+                // F3: the auth layer re-checks, inside its write transaction,
+                // that `actor` is a live Admin (never the shared-token
+                // `system` context) for either direction.
+                let moved = db.set_team_history_since(&ctx.user_id, new_since, move |old, new| {
                     // A concurrent change may have moved the boundary since the
                     // step-up decision: never backdate without one.
                     if new < old && step_up.is_none() {
                         return Err("step-up required".into());
                     }
+                    // This JSONL line is written before the user-DB commit. If
+                    // the commit then fails, the log records a change that did
+                    // not happen — the safe direction (never a silent change).
                     duduclaw_security::audit::try_append_audit_event(
                         &home,
                         &duduclaw_security::audit::AuditEvent::new(
@@ -814,6 +842,9 @@ impl MethodHandler {
                     }
                     Err(e) if e == "step-up required" => {
                         return error("step_up_required", HISTORY_SINCE_STEP_UP_REQUIRED, None);
+                    }
+                    Err(e) if e == "permission denied" => {
+                        return error("permission_denied", "permission denied", None);
                     }
                     Err(_) => return error("audit_unavailable", "audit unavailable", None),
                 }
@@ -881,6 +912,14 @@ impl MethodHandler {
             Err((message, failed_step)) => {
                 if let Some(step) = failed_step {
                     // Best-effort: a failed attempt is evidence, never a gate.
+                    // Same two sinks as the identity-grace step-up flow.
+                    let _ = db.log_action(
+                        Some(&ctx.user_id),
+                        "team_history.since_step_up_failed",
+                        None,
+                        Some(step),
+                        None,
+                    );
                     duduclaw_security::audit::append_audit_event(
                         &self.home_dir,
                         &duduclaw_security::audit::AuditEvent::new(

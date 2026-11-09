@@ -124,17 +124,38 @@ impl UserDb {
     /// change back. Unchanged ⇒ `Ok(old)` without auditing. Returns the old
     /// boundary. Refuses an off window or a pending reset (a later re-enable
     /// starts a fresh window at "now" anyway).
-    pub fn set_team_history_since<F>(&self, since_micros: i64, audit: F) -> Result<i64, String>
+    ///
+    /// `actor_user_id` must be, inside this same transaction, an Active Admin
+    /// without a pending forced password change — for ANY direction. The
+    /// shared-token `system` context (no user row) is always refused, so a
+    /// cached role or a demotion racing the request can never move it.
+    pub fn set_team_history_since<F>(
+        &self,
+        actor_user_id: &str,
+        since_micros: i64,
+        audit: F,
+    ) -> Result<i64, String>
     where
         F: FnOnce(i64, i64) -> Result<(), String>,
     {
         if since_micros <= 0 {
             return Err("invalid team history boundary".to_string());
         }
+        if actor_user_id.is_empty() || actor_user_id == "system" {
+            return Err("permission denied".to_string());
+        }
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        let live_admin = crate::user_row::load_user(&tx, actor_user_id)?.is_some_and(|u| {
+            u.status == crate::models::UserStatus::Active
+                && u.role == crate::models::UserRole::Admin
+                && !u.must_change_password
+        });
+        if !live_admin {
+            return Err("permission denied".to_string());
+        }
         if matches!(meta(&tx, "team_history_reset_required")?, Some(n) if n != 0) {
             return Err("team history is off".to_string());
         }
@@ -226,24 +247,54 @@ mod tests {
         assert_eq!(kept.since_micros, Some(200));
     }
 
+    fn admin(db: &UserDb) -> String {
+        db.create_user("boss@test.invalid", "boss", "isolated-test-password", crate::UserRole::Admin)
+            .unwrap()
+            .id
+    }
+
     #[test]
     fn rm173_boundary_moves_only_on_an_enabled_window_and_rolls_back_with_audit() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = UserDb::new(file.path()).unwrap();
-        assert!(db.set_team_history_since(50, |_, _| Ok(())).is_err(), "off window");
+        let a = admin(&db);
+        assert!(db.set_team_history_since(&a, 50, |_, _| Ok(())).is_err(), "off window");
         db.observe_team_history(true, 100, |_, _, _| Ok(())).unwrap();
-        assert!(db.set_team_history_since(0, |_, _| Ok(())).is_err());
-        assert!(db.set_team_history_since(40, |_, _| Err("audit unavailable".into())).is_err());
+        assert!(db.set_team_history_since(&a, 0, |_, _| Ok(())).is_err());
+        assert!(db.set_team_history_since(&a, 40, |_, _| Err("audit unavailable".into())).is_err());
         let kept = db.observe_team_history(true, 500, |_, _, _| panic!("no transition")).unwrap();
         assert_eq!(kept.since_micros, Some(100), "failed audit rolls the change back");
         let mut seen = None;
-        assert_eq!(db.set_team_history_since(40, |old, new| { seen = Some((old, new)); Ok(()) }).unwrap(), 100);
+        assert_eq!(db.set_team_history_since(&a, 40, |old, new| { seen = Some((old, new)); Ok(()) }).unwrap(), 100);
         assert_eq!(seen, Some((100, 40)));
-        assert_eq!(db.set_team_history_since(40, |_, _| panic!("unchanged must not audit")).unwrap(), 40);
+        assert_eq!(db.set_team_history_since(&a, 40, |_, _| panic!("unchanged must not audit")).unwrap(), 40);
         let now = db.observe_team_history(true, 600, |_, _, _| panic!("no transition")).unwrap();
         assert_eq!(now.since_micros, Some(40));
         db.require_team_history_reset().unwrap();
-        assert!(db.set_team_history_since(30, |_, _| Ok(())).is_err(), "pending reset");
+        assert!(db.set_team_history_since(&a, 30, |_, _| Ok(())).is_err(), "pending reset");
+    }
+
+    #[test]
+    fn rm173_boundary_move_requires_a_live_admin_in_the_transaction() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = UserDb::new(file.path()).unwrap();
+        db.observe_team_history(true, 100, |_, _, _| Ok(())).unwrap();
+        let mgr = db
+            .create_user("m@test.invalid", "m", "isolated-test-password", crate::UserRole::Manager)
+            .unwrap()
+            .id;
+        for actor in ["system", "", "no-such-user", mgr.as_str()] {
+            // Either direction, and the audit never runs.
+            for since in [200, 50] {
+                assert_eq!(
+                    db.set_team_history_since(actor, since, |_, _| panic!("refused before audit")),
+                    Err("permission denied".to_string()),
+                    "{actor:?}"
+                );
+            }
+        }
+        let kept = db.observe_team_history(true, 500, |_, _, _| panic!("no transition")).unwrap();
+        assert_eq!(kept.since_micros, Some(100));
     }
 
     #[test]

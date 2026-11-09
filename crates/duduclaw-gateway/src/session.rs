@@ -79,7 +79,32 @@ pub struct SessionSummary {
     pub turn_count: u32,
     pub total_tokens: u32,
     pub lineage: u32,
+    /// RM-173: why an archived row is archived (`user` / `retention`);
+    /// `None` for a live row. See [`ARCHIVE_REASON_USER`].
+    pub archive_reason: Option<String>,
 }
+
+/// RM-173: `sessions.archive_reason` of a conversation the user cleared
+/// (`/new`, a channel reset, a deleted Discord thread). Such a row is the
+/// user's own: team history never lists or releases it, a manager can never
+/// restore it, and new activity never un-archives it.
+pub const ARCHIVE_REASON_USER: &str = "user";
+/// RM-173: `sessions.archive_reason` of a conversation archived by the
+/// inactivity maintenance task (also every row archived before the column
+/// existed — the two cases could not be told apart then).
+pub const ARCHIVE_REASON_RETENTION: &str = "retention";
+
+/// RM-173: the `SET` fragment every "new activity" write uses. It lifts an
+/// archive caused by retention only; a user-cleared row (normally already
+/// re-keyed away by [`SessionManager::delete_session`]) stays archived. Both
+/// `CASE`s read the pre-update row, as SQLite evaluates all `SET`
+/// expressions against the old values.
+pub(crate) const UNARCHIVE_ON_ACTIVITY: &str =
+    "archived_at = CASE WHEN archive_reason = 'user' THEN archived_at ELSE NULL END, \
+     archive_reason = CASE WHEN archive_reason = 'user' THEN archive_reason ELSE NULL END";
+
+/// RM-173: suffix marking a user-cleared conversation's moved id.
+const CLEARED_ID_MARKER: &str = "#cleared:";
 
 /// RM-173: what one retention run did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +279,19 @@ impl SessionManager {
         // (hidden from normal listings, still replayable / searchable). Real
         // deletion is `purge_session`.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT", []);
+        // RM-173: WHY a row is archived — `user` (a user cleared it: never
+        // shown to managers, never un-archived by activity) or `retention`
+        // (maintenance task). NULL while live. Rows archived before this
+        // column existed cannot be told apart, so they count as `retention`
+        // (WP5 `/new` archives of reused channel ids were un-archived by the
+        // next message anyway). Idempotent; matches nothing after the first run.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN archive_reason TEXT", []);
+        conn.execute(
+            "UPDATE sessions SET archive_reason = 'retention'
+             WHERE archived_at IS NOT NULL AND archive_reason IS NULL",
+            [],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         // G4 session portability (2026-07-11):
         // - `undone_at` on messages: /undo //rollback tombstone (NULL = live).
@@ -407,10 +445,13 @@ impl SessionManager {
         // conversation comes back in the same statement that bumps
         // `last_active` — otherwise it stays hidden from every listing while
         // it is in use, and a purge setting could delete a live conversation.
+        // Only a retention archive is lifted ([`UNARCHIVE_ON_ACTIVITY`]).
         conn.execute(
-            "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2,
-                                 archived_at = NULL
-             WHERE id = ?3",
+            &format!(
+                "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2,
+                                     {UNARCHIVE_ON_ACTIVITY}
+                 WHERE id = ?3"
+            ),
             params![tokens, now, session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -808,24 +849,120 @@ impl SessionManager {
         }
     }
 
-    /// Remove sessions that have been inactive for longer than `max_age_hours`.
-    /// Returns the number of sessions removed.
-    /// Delete a session and all its messages. Used by /reset commands.
-    /// Uses a transaction to ensure atomicity (consistent with compress()).
-    /// WP5 T5.3: "delete" now ARCHIVES (soft delete). Messages are retained and
-    /// the session stays replayable/searchable; it just drops out of normal
-    /// listings. Use [`Self::purge_session`] for a real, irreversible delete.
-    /// Idempotent — archiving an already-archived session is a no-op.
+    /// A user cleared this conversation (`/new`, a channel reset, a deleted
+    /// Discord thread). Used by every reset command.
+    ///
+    /// WP5 T5.3 made this a soft delete (archive). RM-173: channel session ids
+    /// are reused (`line:{sender}`, `telegram:{chat}`, …), so archiving in
+    /// place let the next message un-archive the same row and the whole old
+    /// conversation came back — in listings, search and the agent's context.
+    /// A clear therefore MOVES the conversation, in one transaction, to a new
+    /// id `{id}#cleared:{unix_ms}` with `archive_reason = 'user'`:
+    ///
+    /// | data keyed by the session id (sessions.db) | on clear |
+    /// |---|---|
+    /// | `sessions` row (summary, pinned instructions, title, lineage, origin columns, created_at …) | moved |
+    /// | `session_messages` | moved |
+    /// | `webchat_turn_cancellations` | moved |
+    /// | `meeting_completion_notices` (when the table exists) | moved |
+    /// | `session_ccr_references` | deleted (expiring tool-output pointers whose stored scope names the OLD id; moving them would hand a restored conversation handles scoped to the fresh one) |
+    /// | `message_session_map` | deleted (a reply to an old bot message must not resume the cleared context; same as `purge_session`) |
+    ///
+    /// The original id then has no row: the next message creates a genuinely
+    /// fresh session with normal origin stamping. Messages are kept on the
+    /// moved row (still restorable by its owner / an Admin, never by a
+    /// manager). Data in other databases (run steps, CCR store, approvals,
+    /// AG-UI run state) stays on the old id; none of it is conversation
+    /// content that the model context or history listings read by session id.
+    ///
+    /// Idempotent — no row, or a row already cleared by a user, is a no-op.
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.clear_for_user(session_id).await.map(|_| ())
+    }
+
+    /// [`Self::delete_session`], returning the id the conversation moved to
+    /// (`None`: nothing to clear).
+    pub async fn clear_for_user(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.acquire().await;
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE sessions SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
-            params![session_id, now],
+        let now = chrono::Utc::now();
+        let now_str = now.to_rfc3339();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        let already_cleared: Option<bool> = tx
+            .query_row(
+                "SELECT archived_at IS NOT NULL AND archive_reason = 'user'
+                 FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<bool>>(0).map(|v| v.unwrap_or(false)),
+            )
+            .optional()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if already_cleared != Some(false) {
+            tx.commit()
+                .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+            return Ok(None);
+        }
+        // A fresh id: `{id}#cleared:{unix_ms}`, bumped past any collision.
+        let mut stamp = now.timestamp_millis();
+        let new_id = loop {
+            let candidate = format!("{session_id}{CLEARED_ID_MARKER}{stamp}");
+            let taken: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                    params![candidate],
+                    |row| row.get(0),
+                )
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            if !taken {
+                break candidate;
+            }
+            stamp += 1;
+        };
+        // `session_messages` / `webchat_turn_cancellations` reference
+        // `sessions(id)` without ON UPDATE; checking the foreign keys at
+        // commit (this pragma resets when the transaction ends) lets parent
+        // and children move in any order within this one transaction.
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON;")
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        tx.execute(
+            "UPDATE sessions SET id = ?2, archived_at = ?3, archive_reason = 'user' WHERE id = ?1",
+            params![session_id, new_id, now_str],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        info!(session_id, "Session archived (soft delete)");
-        Ok(())
+        for sql in [
+            "UPDATE session_messages SET session_id = ?2 WHERE session_id = ?1",
+            "UPDATE webchat_turn_cancellations SET session_id = ?2 WHERE session_id = ?1",
+        ] {
+            tx.execute(sql, params![session_id, new_id])
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        }
+        let notices: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'meeting_completion_notices')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if notices {
+            tx.execute(
+                "UPDATE meeting_completion_notices SET session_id = ?2 WHERE session_id = ?1",
+                params![session_id, new_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        }
+        for sql in [
+            "DELETE FROM session_ccr_references WHERE session_id = ?1",
+            "DELETE FROM message_session_map WHERE session_id = ?1",
+        ] {
+            tx.execute(sql, params![session_id])
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+        info!(session_id, cleared_to = %new_id, "Session cleared by user (moved + archived)");
+        Ok(Some(new_id))
     }
 
     /// Un-archive a session so it reappears in normal listings.
@@ -833,10 +970,11 @@ impl SessionManager {
         self.restore_archived(session_id).await.map(|_| ())
     }
 
-    /// RM-173: restore an archived (收起) conversation. Returns the
-    /// `archived_at` it had, or `None` when the row does not exist or was not
-    /// archived (idempotent; nothing is written then). Authorization is the
-    /// caller's job — this never decides who may restore.
+    /// RM-173: restore an archived (收起) conversation, whatever its reason.
+    /// Returns the `archived_at` it had, or `None` when the row does not exist
+    /// or was not archived (idempotent; nothing is written then).
+    /// Authorization — including who may restore a user-cleared row (see
+    /// [`Self::archive_state`]) — is the caller's job.
     pub async fn restore_archived(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.acquire().await;
         let tx = conn
@@ -852,7 +990,7 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         if archived.is_some() {
             tx.execute(
-                "UPDATE sessions SET archived_at = NULL WHERE id = ?1",
+                "UPDATE sessions SET archived_at = NULL, archive_reason = NULL WHERE id = ?1",
                 params![session_id],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -872,6 +1010,20 @@ impl SessionManager {
         )
         .optional()
         .map(Option::flatten)
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
+    /// RM-173: `(archived_at, archive_reason)` of an archived session
+    /// (`Ok(None)`: live or no row). A NULL reason reads as `retention`.
+    pub async fn archive_state(&self, session_id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.acquire().await;
+        conn.query_row(
+            "SELECT archived_at, COALESCE(archive_reason, 'retention')
+             FROM sessions WHERE id = ?1 AND archived_at IS NOT NULL",
+            params![session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))
     }
 
@@ -968,14 +1120,16 @@ impl SessionManager {
 
     /// GDPR: session ids belonging to a contact. A "contact" here is the
     /// `"<channel>:<chat_id>"` session-id prefix (sessions are keyed by that
-    /// string; threads add a `:<tid>` suffix). Matches the exact id and any
-    /// `<contact>:*`. LIKE wildcards in the contact are escaped so a literal
-    /// `%`/`_` cannot widen the match.
+    /// string; threads add a `:<tid>` suffix). Matches the exact id, any
+    /// `<contact>:*` and any `<contact>#*` (RM-173 user-cleared
+    /// `#cleared:` rows, `#agent:` buckets; an exact-prefix compare, no LIKE).
+    /// LIKE wildcards in the contact are escaped so a literal `%`/`_` cannot
+    /// widen the match.
     pub async fn sessions_for_contact(&self, contact: &str) -> Result<Vec<String>> {
         let conn = self.acquire().await;
         let like = format!("{}:%", gdpr_like_escape(contact));
         let mut stmt = conn
-            .prepare("SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'")
+            .prepare("SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'")
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         let rows = stmt
             .query_map(params![contact, like], |r| r.get::<_, String>(0))
@@ -1000,19 +1154,19 @@ impl SessionManager {
         // RM-124: exact WebChat ids, captured inside the tx before the delete.
         let webchat_ids = Self::webchat_ids(
             &tx,
-            "SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'",
+            "SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'",
             params![contact, like],
         )?;
         tx.execute(
             "DELETE FROM webchat_turn_cancellations WHERE session_id IN (
-                 SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'
+                 SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'
              )",
             params![contact, like],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         tx.execute(
             "DELETE FROM session_ccr_references WHERE session_id IN (
-                 SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'
+                 SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'
              )",
             params![contact, like],
         )
@@ -1020,14 +1174,14 @@ impl SessionManager {
         let messages = tx
             .execute(
                 "DELETE FROM session_messages WHERE session_id IN (
-                     SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'
+                     SELECT id FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'
                  )",
                 params![contact, like],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         let sessions = tx
             .execute(
-                "DELETE FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'",
+                "DELETE FROM sessions WHERE id = ?1 OR substr(id, 1, length(?1) + 1) = ?1 || '#' OR id LIKE ?2 ESCAPE '\\'",
                 params![contact, like],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -1107,7 +1261,7 @@ impl SessionManager {
         let archived = match archive_after {
             Some(age) => conn
                 .execute(
-                    "UPDATE sessions SET archived_at = ?2
+                    "UPDATE sessions SET archived_at = ?2, archive_reason = 'retention'
                      WHERE last_active < ?1 AND archived_at IS NULL",
                     params![(now - age).to_rfc3339(), now_str],
                 )
@@ -1655,7 +1809,8 @@ impl SessionManager {
                     (SELECT m2.content FROM session_messages m2
                        WHERE m2.session_id = s.id AND m2.role = 'user'
                          AND m2.hidden = 0 AND m2.undone_at IS NULL
-                       ORDER BY m2.id ASC LIMIT 1) AS first_user
+                       ORDER BY m2.id ASC LIMIT 1) AS first_user,
+                    s.archive_reason
              FROM (";
         let outer_tail = ") s ORDER BY s.last_active DESC";
 
@@ -1688,6 +1843,7 @@ impl SessionManager {
                 lineage: row.get::<_, i64>(4)?.max(1) as u32,
                 turn_count: row.get::<_, i64>(6)?.max(0) as u32,
                 title,
+                archive_reason: row.get(8)?,
             })
         };
 
@@ -1695,7 +1851,8 @@ impl SessionManager {
         match agent_id {
             Some(a) => {
                 let sql = format!(
-                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage, title \
+                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage, title, \
+                     archive_reason \
                      FROM sessions \
                      WHERE {archive_filter} AND agent_id = ?1 \
                      ORDER BY last_active DESC LIMIT ?2{outer_tail}"
@@ -1712,7 +1869,8 @@ impl SessionManager {
             }
             None => {
                 let sql = format!(
-                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage, title \
+                    "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage, title, \
+                     archive_reason \
                      FROM sessions \
                      WHERE {archive_filter} \
                      ORDER BY last_active DESC LIMIT ?1{outer_tail}"
@@ -2000,21 +2158,26 @@ mod tests {
         mgr.get_or_create("s1", "a").await.unwrap();
         mgr.append_message("s1", "user", "hi", 2).await.unwrap();
 
-        // delete = archive: messages survive, replayable.
+        // delete = archive under a moved id (RM-173): messages survive,
+        // replayable there; the original id starts fresh.
         mgr.delete_session("s1").await.unwrap();
+        let moved = mgr.list_sessions_in(Some("a"), 10, true).await.unwrap()[0].id.clone();
+        assert!(moved.starts_with("s1#cleared:"), "{moved}");
         assert_eq!(
-            mgr.get_messages("s1").await.unwrap().len(),
+            mgr.get_messages(&moved).await.unwrap().len(),
             1,
             "archived session keeps messages"
         );
+        assert!(mgr.get_messages("s1").await.unwrap().is_empty());
 
         // unarchive brings it back to live.
-        mgr.unarchive_session("s1").await.unwrap();
+        mgr.unarchive_session(&moved).await.unwrap();
+        assert!(mgr.archived_at(&moved).await.unwrap().is_none());
 
         // purge = hard delete: messages gone.
-        mgr.purge_session("s1").await.unwrap();
+        mgr.purge_session(&moved).await.unwrap();
         assert_eq!(
-            mgr.get_messages("s1").await.unwrap().len(),
+            mgr.get_messages(&moved).await.unwrap().len(),
             0,
             "purge removes messages"
         );
@@ -2583,6 +2746,17 @@ mod rm173_retention_tests {
         assert_eq!(mgr.get_messages("recently-archived").await.unwrap().len(), 1);
     }
 
+    /// Archive like the inactivity task does (reason `retention`).
+    async fn retention_archive(mgr: &SessionManager, id: &str) {
+        mgr.acquire()
+            .await
+            .execute(
+                "UPDATE sessions SET archived_at=?2, archive_reason='retention' WHERE id=?1",
+                params![id, chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn rm173_new_message_unarchives_in_the_same_statement() {
         let tmp = NamedTempFile::new().unwrap();
@@ -2590,19 +2764,154 @@ mod rm173_retention_tests {
         for (id, role) in [("webchat:u", "user"), ("line:c", "assistant")] {
             mgr.get_or_create(id, "agent").await.unwrap();
             mgr.append_message(id, "user", "first", 1).await.unwrap();
-            mgr.delete_session(id).await.unwrap();
+            retention_archive(&mgr, id).await;
             assert!(mgr.archived_at(id).await.unwrap().is_some());
             assert!(mgr.list_sessions(Some("agent"), 10).await.unwrap().iter().all(|s| s.id != id));
             mgr.append_message(id, role, "back again", 1).await.unwrap();
             assert!(mgr.archived_at(id).await.unwrap().is_none(), "{id}");
+            assert!(mgr.archive_state(id).await.unwrap().is_none());
             assert!(mgr.list_sessions(Some("agent"), 10).await.unwrap().iter().any(|s| s.id == id));
         }
         // The WebChat delivery path (client message id / pending reply) too.
-        mgr.delete_session("webchat:u").await.unwrap();
+        retention_archive(&mgr, "webchat:u").await;
         mgr.append_delivery_message("webchat:u", "user", "again", 1, Some("c-1"), false)
             .await
             .unwrap();
         assert!(mgr.archived_at("webchat:u").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rm173_activity_never_unarchives_a_user_cleared_row() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("line:U1", "agent").await.unwrap();
+        mgr.append_message("line:U1", "user", "first", 1).await.unwrap();
+        let moved = mgr.clear_for_user("line:U1").await.unwrap().unwrap();
+        // Something addressing the moved id directly still cannot lift it.
+        mgr.append_message(&moved, "assistant", "late", 1).await.unwrap();
+        let (_, reason) = mgr.archive_state(&moved).await.unwrap().unwrap();
+        assert_eq!(reason, ARCHIVE_REASON_USER);
+        // A retention run never relabels it either.
+        mgr.apply_retention(Retention { archive_after_days: 1, purge_after_days: 0 })
+            .await
+            .unwrap();
+        assert_eq!(mgr.archive_state(&moved).await.unwrap().unwrap().1, ARCHIVE_REASON_USER);
+        // Clearing an already-cleared row is a no-op; a missing row too.
+        assert!(mgr.clear_for_user(&moved).await.unwrap().is_none());
+        assert!(mgr.clear_for_user("line:never").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rm173_new_on_a_reused_channel_id_starts_a_genuinely_fresh_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let mgr = SessionManager::new(&db).unwrap();
+        let id = "line:Ureused";
+        let channel = crate::session_origin::SessionOrigin::of_kind(
+            crate::session_origin::OriginKind::Channel,
+        );
+        mgr.get_or_create_with_origin(id, "agent", &channel).await.unwrap();
+        mgr.append_message(id, "user", "PRE-CLEAR-SECRET question", 3).await.unwrap();
+        mgr.append_message(id, "assistant", "PRE-CLEAR-SECRET answer", 3).await.unwrap();
+        mgr.record_message_session("line", "bot-msg-1", id).await.unwrap();
+        mgr.record_webchat_cancel(id, "agent", "turn-1", "msg-1").await.unwrap();
+        let user_turn = mgr.get_message_ids(id).await.unwrap()[0];
+        mgr.acquire()
+            .await
+            .execute(
+                "INSERT INTO session_ccr_references
+                 (session_id,user_message_id,ccr_id,record_json,expires_at,created_at)
+                 VALUES (?1,?2,'ccr-1','{}',?3,'now')",
+                params![id, user_turn, chrono::Utc::now().timestamp() + 3600],
+            )
+            .unwrap();
+
+        // `/new`.
+        let moved = mgr.clear_for_user(id).await.unwrap().expect("cleared");
+        assert!(moved.starts_with("line:Ureused#cleared:"), "{moved}");
+        assert!(mgr.session_agent(id).await.unwrap().is_none(), "no row at the old id");
+        assert_eq!(
+            mgr.archive_state(&moved).await.unwrap().map(|(_, r)| r).as_deref(),
+            Some(ARCHIVE_REASON_USER)
+        );
+        // Everything that must follow it moved, in the same transaction.
+        assert_eq!(mgr.get_messages(&moved).await.unwrap().len(), 2);
+        let conn = mgr.acquire().await;
+        let count = |sql: &str, sid: &str| -> i64 {
+            conn.query_row(sql, params![sid], |r| r.get(0)).unwrap()
+        };
+        let cancels = "SELECT COUNT(*) FROM webchat_turn_cancellations WHERE session_id=?1";
+        assert_eq!((count(cancels, id), count(cancels, &moved)), (0, 1));
+        let ccr = "SELECT COUNT(*) FROM session_ccr_references WHERE session_id=?1";
+        assert_eq!((count(ccr, id), count(ccr, &moved)), (0, 0), "dropped, not moved");
+        let origin: Option<String> = conn
+            .query_row("SELECT origin_kind FROM sessions WHERE id=?1", params![moved], |r| r.get(0))
+            .unwrap();
+        assert_eq!(origin.as_deref(), Some("channel"), "the row's own columns moved with it");
+        let mut fk = conn.prepare("PRAGMA foreign_key_check").unwrap();
+        assert!(fk.query([]).unwrap().next().unwrap().is_none(), "no dangling children");
+        drop(fk);
+        drop(conn);
+        // A reply to an old bot message must not resume the cleared context.
+        assert_eq!(mgr.session_for_reply("line", "bot-msg-1").await.unwrap(), None);
+
+        // The next message creates a fresh session (normal origin stamping).
+        mgr.get_or_create_with_origin(id, "agent", &channel).await.unwrap();
+        mgr.append_message(id, "user", "brand new topic", 3).await.unwrap();
+        let context = mgr.get_messages(id).await.unwrap();
+        assert_eq!(context.len(), 1);
+        assert!(context.iter().all(|m| !m.content.contains("PRE-CLEAR-SECRET")));
+        assert_eq!(mgr.compression_summary(id).await.unwrap(), "");
+        assert_eq!(
+            mgr.session_origin(id).await.unwrap().map(|o| o.kind()),
+            Some(crate::session_origin::OriginKind::Channel)
+        );
+        // The cleared row stays archived despite the activity on the old id.
+        assert!(mgr.archive_state(&moved).await.unwrap().is_some());
+
+        // Lists and search never show the old content on the live side.
+        let live = mgr.list_sessions(Some("agent"), 10).await.unwrap();
+        assert_eq!(live.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), [id]);
+        assert_eq!(live[0].title, "brand new topic");
+        assert_eq!(live[0].turn_count, 1);
+        assert!(crate::search_index::search_conversations(&db, None, "PRE-CLEAR-SECRET", 10).is_empty());
+        assert_eq!(crate::search_index::search_conversations(&db, None, "brand new", 10).len(), 1);
+        // The user's own 「已收起」 list shows it, labelled.
+        let archived = mgr.list_sessions_in(Some("agent"), 10, true).await.unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, moved);
+        assert_eq!(archived[0].archive_reason.as_deref(), Some(ARCHIVE_REASON_USER));
+
+        // GDPR erase of the contact reaches the cleared row too.
+        let ids = mgr.sessions_for_contact(id).await.unwrap();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_eq!(mgr.erase_sessions_for_contact(id).await.unwrap(), (2, 3));
+    }
+
+    #[tokio::test]
+    async fn rm173_migration_labels_legacy_archives_as_retention() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let c = Connection::open(tmp.path()).unwrap();
+            c.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                   summary TEXT DEFAULT '', total_tokens INTEGER DEFAULT 0,
+                   last_active TEXT NOT NULL, model TEXT DEFAULT 'auto',
+                   created_at TEXT NOT NULL, archived_at TEXT);
+                 INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at)
+                   VALUES ('old','a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-02-01T00:00:00Z'),
+                          ('live','a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);",
+            )
+            .unwrap();
+        }
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        assert_eq!(mgr.archive_state("old").await.unwrap().unwrap().1, ARCHIVE_REASON_RETENTION);
+        let raw: Option<String> = mgr
+            .acquire()
+            .await
+            .query_row("SELECT archive_reason FROM sessions WHERE id='live'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None);
     }
 
     #[tokio::test]
@@ -2611,10 +2920,12 @@ mod rm173_retention_tests {
         let mgr = SessionManager::new(tmp.path()).unwrap();
         aged(&mgr, "live", 1).await;
         aged(&mgr, "gone", 1).await;
-        mgr.delete_session("gone").await.unwrap();
+        retention_archive(&mgr, "gone").await;
         let archived = mgr.list_sessions_in(Some("agent"), 10, true).await.unwrap();
         assert_eq!(archived.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["gone"]);
+        assert_eq!(archived[0].archive_reason.as_deref(), Some(ARCHIVE_REASON_RETENTION));
         assert!(mgr.restore_archived("gone").await.unwrap().is_some());
+        assert!(mgr.archive_state("gone").await.unwrap().is_none(), "reason cleared too");
         assert!(mgr.restore_archived("gone").await.unwrap().is_none(), "idempotent");
         assert!(mgr.restore_archived("missing").await.unwrap().is_none());
         assert!(mgr.list_sessions_in(Some("agent"), 10, true).await.unwrap().is_empty());

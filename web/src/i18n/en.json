@@ -2644,6 +2644,7 @@
   "webchat.history.archivedTitle": "Archived conversations",
   "webchat.history.archivedEmpty": "No archived conversations",
   "webchat.history.archivedHint": "Restored conversations return to your history.",
+  "webchat.history.clearedByUser": "Cleared",
   "webchat.history.restore": "Restore",
   "webchat.history.restoreFailed": "Couldn't restore this conversation",
   "wikiTrust.title": "Wiki Trust",

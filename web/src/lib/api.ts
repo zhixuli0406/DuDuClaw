@@ -6219,6 +6219,9 @@ export interface ChatSessionSummary {
   lineage?: unknown;
   /** RM-173: present (true) on rows of an `archived: true` listing. */
   archived?: boolean;
+  /** RM-173: why an archived row is archived — `user` (cleared by its user:
+   *  `/new`, a channel reset) or `retention` (inactivity). Archived rows only. */
+  archive_reason?: 'user' | 'retention';
 }
 
 export interface ChatSessionMessage {
@@ -9407,7 +9410,9 @@ export const api = {
       get: () => client.call('users.org_settings.get') as Promise<TeamHistorySettings>,
       update: (enabled: boolean) => client.call('users.org_settings.update', { manager_team_history: enabled }) as Promise<TeamHistorySettings>,
       /** RM-173: retention days and the team-history start date. */
-      save: (change: OrgSettingsUpdate) => client.call('users.org_settings.update', change) as Promise<TeamHistorySettings>,
+      // Spread into a fresh object literal: an interface has no implicit
+      // index signature, so it is not assignable to `Record<string, unknown>`.
+      save: (change: OrgSettingsUpdate) => client.call('users.org_settings.update', { ...change }) as Promise<TeamHistorySettings>,
     },
     remove: (userId: string) =>
       client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,

@@ -60,7 +60,13 @@ impl MethodHandler {
                 let title = if external { Some("External conversation".to_owned()) } else { m.title };
                 let id = if external { handles::issue(&home, &user, &m.id)? } else { m.id.clone() };
                 let turns: i64 = c.query_row("SELECT COUNT(*) FROM session_messages WHERE session_id=?1 AND hidden=0 AND undone_at IS NULL AND role IN ('user','assistant')",[&m.id],|r|r.get(0)).map_err(|_|"history unavailable")?;
-                out.push(json!({"session_id":id,"agent_id":m.agent,"title":title,"last_active":m.last_active,"turns":turns,"tokens":0,"lineage":null,"channel":channel,"read_only":external,"title_masked":external,"archived":archived}));
+                let mut row = json!({"session_id":id,"agent_id":m.agent,"title":title,"last_active":m.last_active,"turns":turns,"tokens":0,"lineage":null,"channel":channel,"read_only":external,"title_masked":external,"archived":archived});
+                if archived {
+                    // RM-173: label why (`user` = they cleared it, `retention`).
+                    let reason: String = c.query_row("SELECT COALESCE(archive_reason,'retention') FROM sessions WHERE id=?1",[&m.id],|r|r.get(0)).map_err(|_|"history unavailable")?;
+                    row["archive_reason"] = json!(reason);
+                }
+                out.push(row);
             }
             Ok::<_,String>(out)
         }).await.map_err(|_|"history unavailable")??;

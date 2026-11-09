@@ -4074,13 +4074,44 @@ mod ordinary_current_channel_acl_tests {
                 .unwrap();
         }
     }
+    /// RM-173: `/new` moves the conversation to `{id}#cleared:{ms}` (archived,
+    /// reason `user`) and leaves no row at `id`. Asserts exactly one of the
+    /// two states and reports whether the conversation was cleared.
     fn archived(fixture: &NativeCuFixture, session: &str) -> bool {
+        match cleared_id(fixture, session) {
+            Some(_) => {
+                let db =
+                    rusqlite::Connection::open(fixture.home.path().join("sessions.db")).unwrap();
+                let live: bool = db
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                        [session],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(!live, "a cleared id has no row until the next message");
+                true
+            }
+            None => {
+                let db =
+                    rusqlite::Connection::open(fixture.home.path().join("sessions.db")).unwrap();
+                db.query_row(
+                    "SELECT archived_at IS NOT NULL FROM sessions WHERE id=?1",
+                    [session],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            }
+        }
+    }
+    fn cleared_id(fixture: &NativeCuFixture, session: &str) -> Option<String> {
         let db = rusqlite::Connection::open(fixture.home.path().join("sessions.db")).unwrap();
-        db.query_row(
-            "SELECT archived_at IS NOT NULL FROM sessions WHERE id=?1",
+        rusqlite::OptionalExtension::optional(db.query_row(
+            "SELECT id FROM sessions WHERE substr(id,1,length(?1)+9)=?1||'#cleared:'
+               AND archived_at IS NOT NULL AND archive_reason='user'",
             [session],
             |row| row.get(0),
-        )
+        ))
         .unwrap()
     }
     fn message(content: &str) -> Value {
@@ -4184,16 +4215,29 @@ mod ordinary_current_channel_acl_tests {
                             .get_messages("discord:C1")
                             .await
                             .unwrap();
+                        // RM-173: a cleared thread's history moves with it
+                        // (kept, restorable) and the thread id starts fresh.
+                        let thread_id = cleared_id(&fixture, "discord:thread:C1")
+                            .unwrap_or_else(|| "discord:thread:C1".to_owned());
                         let thread = fixture
                             .ctx
                             .session_manager
-                            .get_messages("discord:thread:C1")
+                            .get_messages(&thread_id)
                             .await
                             .unwrap();
                         assert_eq!(base.len(), 1);
                         assert_eq!(base[0].content, "base-history");
                         assert_eq!(thread.len(), 1, "archiving retains replayable history");
                         assert_eq!(thread[0].content, "thread-history");
+                        if allowed && content == "/new" {
+                            assert!(fixture
+                                .ctx
+                                .session_manager
+                                .get_messages("discord:thread:C1")
+                                .await
+                                .unwrap()
+                                .is_empty());
+                        }
                         assert!(!archived(&fixture, "discord:C1"));
                         assert_eq!(
                             archived(&fixture, "discord:thread:C1"),

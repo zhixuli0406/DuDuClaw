@@ -1381,5 +1381,106 @@ async fn rm173_sidebar_lists_own_archived_and_restores_only_own() {
     // Full-history readers (Admin) list and restore with the same gate.
     let admin = payload(f.handler.handle("chat.sessions.list", json!({"agent_id":"sales","archived":true}), &f.admin).await);
     assert_eq!(admin["sessions"].as_array().unwrap().len(), 3);
+    assert!(admin["sessions"].as_array().unwrap().iter().all(|r| r["archive_reason"] == "retention"));
     assert_eq!(payload(f.handler.handle("chat.sessions.restore", json!({"session_id":"hidden"}), &f.admin).await)["restored"], true);
+}
+
+/// F1/F2: a conversation its user cleared (`/new`, channel reset) is never
+/// team history — not listed, not readable, not restorable by a manager —
+/// and the reused channel id starts a genuinely fresh conversation.
+#[tokio::test]
+async fn rm173_user_cleared_conversations_never_reach_managers() {
+    let f = fixture().await;
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    let sm = &rc.session_manager;
+    // Baseline: the manager sees the report's WebChat and the customer chat.
+    let before = payload(f.handler.handle("users.team_history.list", json!({"agent_id":"sales"}), &f.manager).await);
+    assert_eq!(before["sessions"].as_array().unwrap().len(), 2);
+    // The employee clears their WebChat; the customer sends `/new` on LINE.
+    let report = sm.clear_for_user("report").await.unwrap().unwrap();
+    let external = sm.clear_for_user(&f.external).await.unwrap().unwrap();
+
+    let list = payload(f.handler.handle("users.team_history.list", json!({"agent_id":"sales"}), &f.manager).await);
+    assert!(list["sessions"].as_array().unwrap().is_empty(), "{list}");
+    let missing = denied(f.handler.handle("users.team_history.get", json!({"session_id":"missing"}), &f.manager).await);
+    for id in [report.as_str(), external.as_str(), "report", f.external.as_str()] {
+        let refused = denied(f.handler.handle("users.team_history.get", json!({"session_id":id}), &f.manager).await);
+        assert_eq!(refused, missing, "{id}: same shape as a missing session");
+        let refused = denied(f.handler.handle("users.team_history.restore", json!({"session_id":id}), &f.manager).await);
+        assert_eq!(refused["code"], "not_found", "{id}");
+    }
+    assert!(rm173_is_archived(&f, &report).await && rm173_is_archived(&f, &external).await);
+
+    // The customer's next message starts a fresh conversation on the same id:
+    // the manager sees only that, never the pre-clear content.
+    sm.get_or_create_with_origin(
+        &f.external,
+        "sales",
+        &crate::session_origin::SessionOrigin::of_kind(crate::session_origin::OriginKind::Channel),
+    )
+    .await
+    .unwrap();
+    sm.append_message(&f.external, "user", "NEW-TOPIC-AFTER-CLEAR", 1).await.unwrap();
+    let context = sm.get_messages(&f.external).await.unwrap();
+    assert_eq!(context.len(), 1, "the agent context holds no pre-clear message");
+    let list = payload(f.handler.handle("users.team_history.list", json!({"agent_id":"sales"}), &f.manager).await);
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
+    let fresh = payload(f.handler.handle("users.team_history.get", json!({"session_id":list["sessions"][0]["session_id"]}), &f.manager).await);
+    assert_eq!(fresh["messages"].as_array().unwrap().len(), 1, "{fresh}");
+    assert!(!fresh.to_string().contains("收到"), "{fresh}");
+
+    // The employee's own sidebar shows their cleared WebChat, labelled — but
+    // not the customer's clear.
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let mine = payload(f.handler.handle("chat.sessions.list", json!({"agent_id":"sales","archived":true}), &employee).await);
+    let rows = mine["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{mine}");
+    assert_eq!(rows[0]["session_id"], report.as_str());
+    assert_eq!(rows[0]["archive_reason"], "user");
+
+    // An Admin may restore it (audited with the reason).
+    let restored = payload(f.handler.handle("users.team_history.restore", json!({"session_id":report}), &f.admin).await);
+    assert_eq!(restored["restored"], true);
+    assert!(!rm173_is_archived(&f, &report).await);
+    let audit = rm173_audit(&f);
+    let line = audit.lines().find(|l| l.contains("team_history_session_restored")).unwrap();
+    assert!(line.contains("\"archive_reason\":\"user\"") && line.contains("\"via\":\"admin\""), "{line}");
+}
+
+/// F3/F4: the boundary never moves for the shared-token context; it is never
+/// combined with retention in one request; a failed step-up is also logged
+/// in the user DB.
+#[tokio::test]
+async fn rm173_org_settings_refuses_partial_and_system_boundary_changes() {
+    let f = fixture().await;
+    let since = DateTime::from_timestamp_micros(f.since_micros).unwrap();
+    // A valid (not future) boundary, so only the new refusals can trigger.
+    let later = since.to_rfc3339();
+    let earlier = (since - chrono::Duration::days(1)).to_rfc3339();
+    let before = payload(f.handler.handle("users.org_settings.get", json!({}), &f.admin).await);
+    for combined in [
+        json!({"team_history_since":later,"archive_after_days":7}),
+        json!({"team_history_since":later,"purge_after_days":90}),
+    ] {
+        let refused = denied(f.handler.handle("users.org_settings.update", combined.clone(), &f.admin).await);
+        assert_eq!(refused["code"], "invalid_params", "{combined}");
+        assert!(refused["message"].as_str().unwrap().contains("retention"), "{refused}");
+    }
+    assert_eq!(payload(f.handler.handle("users.org_settings.get", json!({}), &f.admin).await), before, "nothing written");
+    let system = UserContext::admin_fallback();
+    denied(f.handler.handle("users.org_settings.update", json!({"team_history_since":later}), &system).await);
+    assert_eq!(payload(f.handler.handle("users.org_settings.get", json!({}), &f.admin).await), before);
+    // A failed step-up reaches the user-DB audit log as well as the JSONL.
+    assert_eq!(denied(f.handler.handle("users.org_settings.update", json!({"team_history_since":earlier,"password":"wrong-password"}), &f.admin).await)["code"], "step_up_failed");
+    let logged: i64 = rusqlite::Connection::open(f.home.path().join("users.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM auth_audit_log WHERE action='team_history.since_step_up_failed' AND user_id=?1",
+            [&f.admin.user_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(logged, 1);
+    // The ordinary later move still works for a live Admin.
+    payload(f.handler.handle("users.org_settings.update", json!({"team_history_since":later}), &f.admin).await);
 }

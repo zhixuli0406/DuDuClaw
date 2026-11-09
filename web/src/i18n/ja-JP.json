@@ -2644,6 +2644,7 @@
   "webchat.history.archivedTitle": "しまった会話",
   "webchat.history.archivedEmpty": "しまった会話はありません",
   "webchat.history.archivedHint": "元に戻すと過去の会話一覧に戻ります。",
+  "webchat.history.clearedByUser": "消去済み",
   "webchat.history.restore": "元に戻す",
   "webchat.history.restoreFailed": "この会話を元に戻せませんでした",
   "wikiTrust.title": "Wiki 信頼度",

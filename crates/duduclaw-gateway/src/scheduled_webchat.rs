@@ -440,7 +440,11 @@ async fn deliver_with_hook(
         params![session, body, now],
     )
     .map_err(|_| "對話紀錄無法寫入".to_string())?;
-    tx.execute("UPDATE sessions SET last_active=?2, archived_at=NULL WHERE id=?1", params![session, now])
+    // RM-173: lifts a retention archive only, never a user clear.
+    tx.execute(
+        &format!("UPDATE sessions SET last_active=?2, {} WHERE id=?1", crate::session::UNARCHIVE_ON_ACTIVITY),
+        params![session, now],
+    )
         .map_err(|_| "對話紀錄無法寫入".to_string())?;
     after_append();
     // Commit while holding the users.db ACL lease (BEGIN IMMEDIATE blocks every

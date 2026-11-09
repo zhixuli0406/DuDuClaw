@@ -1,7 +1,7 @@
 use super::*;
 fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    c.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT);CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,tokens INTEGER,timestamp TEXT,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
+    c.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT,archive_reason TEXT);CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,tokens INTEGER,timestamp TEXT,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
     c
 }
 fn session(c: &Connection, id: &str, kind: &str, owner: &str, time: &str) {
@@ -73,6 +73,28 @@ fn bound_history_sql_hides_internal_unknown_archived_and_inconsistent_external_r
     .unwrap();
     assert!(list(&c, "me", "sales", 50).unwrap().is_empty());
     assert!(metadata(&c, "me", "webchat:archived").unwrap().is_none());
+}
+#[test]
+fn rm173_archived_reader_shows_own_clears_but_never_someone_elses() {
+    let c = db();
+    session(&c, "webchat:mine#cleared:1", "webchat_user", "me", "2026-10-24T12:00:00Z");
+    session(&c, "line:Ucustomer#cleared:2", "channel", "", "2026-10-24T12:00:01Z");
+    session(&c, "line:Uidle", "channel", "", "2026-10-24T12:00:02Z");
+    c.execute(
+        "UPDATE sessions SET archived_at='2026-10-25', archive_reason=CASE WHEN id LIKE '%#cleared:%' THEN 'user' ELSE 'retention' END",
+        [],
+    )
+    .unwrap();
+    let ids: Vec<_> = list_in(&c, "me", "sales", 50, true)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(ids, ["line:Uidle", "webchat:mine#cleared:1"]);
+    assert!(metadata_in(&c, "me", "line:Ucustomer#cleared:2", true).unwrap().is_none());
+    assert!(metadata_in(&c, "me", "webchat:mine#cleared:1", true).unwrap().is_some());
+    // Another account never sees my cleared conversation.
+    assert!(list_in(&c, "you", "sales", 50, true).unwrap().iter().all(|m| m.id == "line:Uidle"));
 }
 #[test]
 fn bound_history_rows_are_bounded_visible_text_and_keep_message_ids_for_masked_runs() {

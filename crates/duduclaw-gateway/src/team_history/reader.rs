@@ -106,7 +106,9 @@ pub async fn get(
     let conn = sm.acquire().await;
     // RM-173: archived conversations are history too. The activation window
     // (`since`), origin classification and the caller's live scope still apply.
-    let row:Option<(String,Option<String>,Option<String>,String,bool)>=conn.query_row("SELECT agent_id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
+    // A conversation the USER cleared (`archive_reason = 'user'`) is theirs
+    // alone: it reads exactly like a missing row here.
+    let row:Option<(String,Option<String>,Option<String>,String,bool)>=conn.query_row("SELECT agent_id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions WHERE id=?1 AND NOT (archived_at IS NOT NULL AND archive_reason IS 'user')",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
     let Some((agent, kind, owner, last_active, archived)) = row else {
         return Ok(None);
     };
@@ -193,8 +195,10 @@ pub async fn list(
     let broad_before = exact_before.map(|t| (t + chrono::Duration::seconds(1)).to_rfc3339());
     // Scope precedes pagination. The cursor is (last_active,id), so equal
     // activity times neither duplicate nor hide a permitted conversation.
+    // RM-173: user-cleared conversations are never listed.
     let mut stmt=conn.prepare("SELECT id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions
       WHERE agent_id=?1 AND julianday(last_active)>=julianday(?2)
+        AND NOT (archived_at IS NOT NULL AND archive_reason IS 'user')
         AND ((origin_kind='webchat_user' AND (owner_user_id=?3 OR owner_user_id IN (SELECT value FROM json_each(?4))))
              OR origin_kind IN ('channel','webchat_visitor','public_visitor'))
         AND (?5 IS NULL OR (origin_kind='webchat_user' AND owner_user_id=?5))

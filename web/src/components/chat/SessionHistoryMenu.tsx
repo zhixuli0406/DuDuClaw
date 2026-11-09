@@ -212,7 +212,16 @@ export function SessionHistoryMenu({
                   >
                     <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                       <span className="truncate text-sm text-foreground">{label}</span>
-                      <span className="text-xs tabular-nums text-muted-foreground">{timeAgo(s.last_active)}</span>
+                      <span className="flex items-center gap-1.5 text-xs tabular-nums text-muted-foreground">
+                        <span>{timeAgo(s.last_active)}</span>
+                        {/* RM-173: the caller cleared it (`/new`), not the inactivity rule. */}
+                        {s.archive_reason === 'user' && (
+                          <>
+                            <span aria-hidden>·</span>
+                            <span>{intl.formatMessage({ id: 'webchat.history.clearedByUser', defaultMessage: '已清除' })}</span>
+                          </>
+                        )}
+                      </span>
                     </span>
                     {/* Read-only (masked external) conversations are not the caller's to restore. */}
                     {!s.read_only && (

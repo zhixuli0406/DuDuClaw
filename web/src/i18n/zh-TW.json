@@ -2644,6 +2644,7 @@
   "webchat.history.archivedTitle": "已收起的對話",
   "webchat.history.archivedEmpty": "沒有已收起的對話",
   "webchat.history.archivedHint": "還原後會回到歷史對話清單。",
+  "webchat.history.clearedByUser": "已清除",
   "webchat.history.restore": "還原",
   "webchat.history.restoreFailed": "無法還原這段對話",
   "wikiTrust.title": "知識庫信任度",
