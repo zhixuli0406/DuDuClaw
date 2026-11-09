@@ -354,7 +354,8 @@ pub mod decision_task_board_shadow;
 pub mod defensive_prompt;
 /// One-time upgrade migration for `[odoo] allow_private_network`.
 pub mod odoo_private_network_migration;
-/// RM-166: identity-token transition (upgrade grace migration + dashboard status).
+/// RM-166: identity-token transition (first-start notice record, dashboard
+/// status, bounded manual grace). Never weakens strict mode on its own.
 pub mod identity_transition;
 // Three failover layers under one tree: `failover::model` (model-level
 // timeout/overload fallback, formerly the top-level `llm_fallback` module)

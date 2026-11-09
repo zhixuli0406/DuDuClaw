@@ -132,6 +132,10 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
     // project's own `settings.json` is untouched.
     let mentions_mcp_json = normalized.contains(".mcp.json");
     let mentions_identity_key = normalized.contains(crate::identity_token::IDENTITY_KEY_FILE);
+    // RM-166 round 2: the gateway-owned identity-transition record. The
+    // basename is DuDuClaw-specific, like `identity.key`.
+    let mentions_identity_state =
+        normalized.contains(crate::identity_token::IDENTITY_TRANSITION_FILE);
     let mentions_hook_settings = HOOK_SETTINGS_FILES
         .iter()
         .any(|f| normalized.contains(&format!(".claude/{f}")));
@@ -143,6 +147,7 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         && !mentions_org_journal
         && !mentions_mcp_json
         && !mentions_identity_key
+        && !mentions_identity_state
         && !mentions_hook_settings
     {
         return GuardDecision::NotAgentFile;
@@ -164,6 +169,8 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         "config.toml"
     } else if mentions_identity_key {
         crate::identity_token::IDENTITY_KEY_FILE
+    } else if mentions_identity_state {
+        crate::identity_token::IDENTITY_TRANSITION_FILE
     } else if mentions_mcp_json {
         ".mcp.json"
     } else {

@@ -1,7 +1,8 @@
 //! RM-166: the `agent-file-guard` hook inherits the Claude CLI's env. These
 //! tests run the real hook binary with exactly the env the gateway builds for
 //! an employee's Claude spawn (spawn-env allowlist, then
-//! `agent_hook_installer::apply_hook_identity_env`), in strict mode.
+//! `agent_hook_installer::apply_hook_identity_env`), in strict mode. Since
+//! round 2 that env carries `DUDUCLAW_HOOK_TOKEN`, not `DUDUCLAW_AGENT_TOKEN`.
 use std::path::Path;
 use std::process::Stdio;
 
@@ -78,11 +79,18 @@ async fn rm166_hook_gets_identity_from_cli_env() {
     let env = duduclaw_gateway::agent_hook_installer::hook_identity_env(&alice);
     let id = env.iter().find(|(k, _)| k == duduclaw_core::ENV_AGENT_ID).map(|(_, v)| v.as_str());
     assert_eq!(id, Some("alice"));
-    let token = env.iter().find(|(k, _)| k == duduclaw_core::ENV_AGENT_TOKEN).map(|(_, v)| v.clone()).unwrap();
+    // RM-166 round 2: the hook-only token, never the full identity token.
+    assert!(env.iter().all(|(k, _)| k != duduclaw_core::ENV_AGENT_TOKEN), "{env:?}");
+    let token = env.iter().find(|(k, _)| k == duduclaw_core::ENV_HOOK_TOKEN).map(|(_, v)| v.clone()).unwrap();
     assert_eq!(
-        duduclaw_core::verify_identity_claim(h, "alice", &token, true),
+        duduclaw_core::verify_hook_claim(h, "alice", &token, true),
         duduclaw_core::IdentityVerdict::Verified,
         "strict mode must resolve the hook caller as HookCaller::Agent"
+    );
+    assert_eq!(
+        duduclaw_core::verify_identity_claim(h, "alice", &token, true),
+        duduclaw_core::IdentityVerdict::Rejected,
+        "the hook token is not an MCP identity"
     );
 
     // Own folder: memory, wiki page, deliverable (native Write and Bash).

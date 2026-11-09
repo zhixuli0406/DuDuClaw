@@ -389,10 +389,11 @@ export interface SystemStatus {
    */
   folder_access?: FolderAccessStatus;
   /**
-   * RM-166: AI-employee identity verification. `grace` = transition period
-   * (unverified identities still accepted until `grace_until`); `error` =
-   * the setting cannot be read, so identities are refused. Absent on older
-   * gateways. Drives `IdentityTransitionBanner`.
+   * RM-166: AI-employee identity verification. `grace` = an Admin turned on
+   * a manual grace (unverified identities accepted until `grace_until`);
+   * `error` = the setting cannot be read, so identities are refused. Sent to
+   * admins only (absent for other roles and on older gateways). Drives
+   * `IdentityTransitionBanner`.
    */
   identity_token?: IdentityTokenStatus;
 }
@@ -402,9 +403,22 @@ export interface IdentityTokenStatus {
   explicit_setting: boolean;
   grace_until: string | null;
   days_left: number | null;
-  upgrade_grace: boolean;
+  /** RM-166 round 2: the 30-day "strict mode is on" notice after this
+   *  release first started on an existing install. Absent on older gateways. */
+  notice_active?: boolean;
+  notice_until?: string | null;
   /** Identity refusals by the file guard in the last 24 hours. */
   untrusted_refusals_24h: number;
+  /** Longest manual grace `system.identity_grace_start` accepts (30). */
+  manual_grace_max_days?: number;
+}
+
+/** Result of `system.identity_grace_start` / `system.identity_grace_end`. */
+export interface IdentityGraceResult {
+  grace_until?: string;
+  changed?: boolean;
+  restart_required?: boolean;
+  identity_token: IdentityTokenStatus;
 }
 
 export type FolderAccessState = 'granted' | 'denied' | 'posix_denied' | 'pending_prompt' | 'unavailable';
@@ -7809,6 +7823,16 @@ export const api = {
      *  Registration only — never starts or stops the running gateway. */
     autostartSet: (enabled: boolean) =>
       client.call('system.autostart.set', { enabled }) as Promise<AutostartStatus>,
+    /** RM-166: accept unverified AI-employee identities for at most 30 days
+     *  (admin). Needs the caller's own current password (step-up); audited. */
+    identityGraceStart: (password: string, days?: number) =>
+      client.call('system.identity_grace_start', {
+        password,
+        ...(days !== undefined ? { days } : {}),
+      }) as Promise<IdentityGraceResult>,
+    /** RM-166: end the identity grace now — strict mode again (admin). */
+    identityGraceEnd: () =>
+      client.call('system.identity_grace_end', {}) as Promise<IdentityGraceResult>,
     doctor: () =>
       // Extended timeout: the gateway runs live probes concurrently (MCP
       // server cold-start ~10s, grok -p ping ~15s+version 5s) — worst case

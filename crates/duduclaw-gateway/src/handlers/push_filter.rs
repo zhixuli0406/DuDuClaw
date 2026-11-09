@@ -241,6 +241,24 @@ impl PushGate {
             .to_string();
         let rule = classify(&event);
         if rule == PushRule::System {
+            // RM-166 round 2 (finding 3): `system.status_changed` carries
+            // the Admin-only `identity_token`; everyone else (the lock
+            // screen included) receives the status without it.
+            if event == "system.status_changed"
+                && frame.get("payload").and_then(Value::as_object).is_some_and(|p| {
+                    super::system_status::ADMIN_ONLY_STATUS_FIELDS
+                        .iter()
+                        .any(|f| p.contains_key(*f))
+                })
+            {
+                let admin = !self.pre_auth && self.live().is_some_and(|live| live.is_admin());
+                if !admin {
+                    if let Some(payload) = frame.get_mut("payload") {
+                        super::system_status::strip_admin_only_status(payload);
+                    }
+                    return serde_json::to_string(&Value::Object(frame)).ok();
+                }
+            }
             return Some(line.to_string());
         }
         if self.pre_auth {
@@ -728,6 +746,32 @@ mod live_event_tests {
         assert!(alice.filter_prepared(frame.clone()).await.is_some());
         f.db.unbind_agent(&f.alice.user_id, "sales").unwrap();
         assert!(alice.filter_prepared(frame).await.is_none());
+    }
+
+    /// RM-166 round 2 (finding 3): the identity field of a pushed
+    /// `system.status_changed` reaches live admins only.
+    #[tokio::test]
+    async fn rm166b_status_push_hides_identity_token_from_non_admins() {
+        let f = crate::handlers::task_privacy_tests::fixture().await;
+        let root = crate::handlers::task_privacy_tests::admin(&f);
+        let line = serde_json::to_string(&WsFrame::event("system.status_changed", json!({
+            "version": "1.81.0",
+            "identity_token": {"mode": "strict", "untrusted_refusals_24h": 3},
+        }))).unwrap();
+        let admin_view = PushGate::new(&f.home, &root, false).filter(&line).unwrap();
+        assert!(admin_view.contains("identity_token"));
+        for (ctx, pre_auth) in [(&f.bob, false), (&f.alice, false), (&root, true)] {
+            let shown = PushGate::new(&f.home, ctx, pre_auth).filter(&line).expect("status still delivered");
+            let frame: Value = serde_json::from_str(&shown).unwrap();
+            assert_eq!(frame["event"], "system.status_changed");
+            assert_eq!(frame["payload"]["version"], "1.81.0");
+            assert!(frame["payload"].get("identity_token").is_none(), "{shown}");
+            assert!(!shown.contains("untrusted_refusals_24h"));
+        }
+        // Through the shared-frame path too.
+        let mut bob = PushGate::new(&f.home, &f.bob, false);
+        let shown = bob.filter_live(&line, &f.handler).await.unwrap();
+        assert!(!shown.contains("identity_token"));
     }
 
     #[test]

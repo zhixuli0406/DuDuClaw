@@ -281,36 +281,111 @@ pub fn log_git_credentials_granted(home_dir: &Path, agent_id: &str, env_names: &
 /// `event_type` of [`log_hook_untrusted_caller`] (RM-166).
 pub const EVENT_HOOK_UNTRUSTED_CALLER: &str = "hook_untrusted_caller_blocked";
 
+/// How much of the end of `security_audit.jsonl` a refusal write searches for
+/// an existing row of the same (claimed id, minute) (RM-166 round 2).
+pub const HOOK_REFUSAL_DEDUPE_TAIL_BYTES: u64 = 256 * 1024;
+
+/// How much of the end of `security_audit.jsonl` [`count_event_type_since`]
+/// reads (RM-166 round 2, finding 4): the dashboard asks for a 24-hour
+/// window on every status read, and the log is never rotated.
+pub const COUNT_EVENT_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+
 /// RM-166: the `agent-file-guard` hook refused a tool call because the
 /// caller's identity claim could not be verified in strict mode
 /// (`GuardDecision::BlockedUntrustedCaller`). `claimed` is the *unverified*
 /// id (truncated); `tool` is the Claude Code tool name. No path, command or
 /// token is recorded. The dashboard counts these to warn an operator that an
 /// AI employee cannot write its own folder.
+///
+/// Round 2 (finding 4): at most one row per (claimed id, UTC minute). A row
+/// for the same pair in the last [`HOOK_REFUSAL_DEDUPE_TAIL_BYTES`] of the
+/// log suppresses the write, so a looping or hostile caller cannot grow the
+/// log by one row per tool call. Two hook processes racing in the same
+/// minute may each write once; the bound is per process, not exact.
 pub fn log_hook_untrusted_caller(home_dir: &Path, claimed: &str, tool: &str) {
+    log_hook_untrusted_caller_at(home_dir, claimed, tool, Utc::now());
+}
+
+fn log_hook_untrusted_caller_at(
+    home_dir: &Path,
+    claimed: &str,
+    tool: &str,
+    now: chrono::DateTime<Utc>,
+) {
     let claimed: String = claimed.chars().take(64).collect();
     let tool: String = tool.chars().take(32).collect();
-    let event = AuditEvent::new(
+    let minute = now.format("%Y-%m-%dT%H:%MZ").to_string();
+    if hook_refusal_recorded(home_dir, &claimed, &minute) {
+        return;
+    }
+    let mut event = AuditEvent::new(
         EVENT_HOOK_UNTRUSTED_CALLER,
         claimed,
         Severity::Warning,
         serde_json::json!({
             "tool": tool,
             "claim_verified": false,
+            "minute": minute,
         }),
     );
+    event.timestamp = now.to_rfc3339();
     append_audit_event(home_dir, &event);
 }
 
-/// Number of `event_type` events at or after `since` in
-/// `security_audit.jsonl`. Absent or unreadable log ⇒ 0; unparsable lines
-/// are skipped.
+/// A refusal row for (`claimed`, `minute`) is already in the log's tail.
+fn hook_refusal_recorded(home_dir: &Path, claimed: &str, minute: &str) -> bool {
+    let Some(tail) = read_audit_tail(home_dir, HOOK_REFUSAL_DEDUPE_TAIL_BYTES) else {
+        return false;
+    };
+    tail.lines()
+        .rev()
+        .filter(|line| line.contains(EVENT_HOOK_UNTRUSTED_CALLER) && line.contains(minute))
+        .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+        .any(|event| {
+            event.event_type == EVENT_HOOK_UNTRUSTED_CALLER
+                && event.agent_id == claimed
+                && event.details.get("minute").and_then(|m| m.as_str()) == Some(minute)
+        })
+}
+
+/// The last `max_bytes` of `security_audit.jsonl`, starting at a line
+/// boundary (a partial first line is dropped). `None` when absent or
+/// unreadable.
+fn read_audit_tail(home_dir: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(home_dir.join("security_audit.jsonl")).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    file.take(max_bytes).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    Some(if start > 0 {
+        text.split_once('\n').map_or(String::new(), |(_, rest)| rest.to_string())
+    } else {
+        text.into_owned()
+    })
+}
+
+/// Number of `event_type` events at or after `since` in the last
+/// [`COUNT_EVENT_TAIL_BYTES`] of `security_audit.jsonl` (older rows are not
+/// read: the log is append-only, so the window's rows are at its end).
+/// Absent or unreadable log ⇒ 0; unparsable lines are skipped.
 pub fn count_event_type_since(
     home_dir: &Path,
     event_type: &str,
     since: chrono::DateTime<Utc>,
 ) -> usize {
-    let Ok(content) = std::fs::read_to_string(home_dir.join("security_audit.jsonl")) else {
+    count_event_type_since_in_tail(home_dir, event_type, since, COUNT_EVENT_TAIL_BYTES)
+}
+
+fn count_event_type_since_in_tail(
+    home_dir: &Path,
+    event_type: &str,
+    since: chrono::DateTime<Utc>,
+    max_bytes: u64,
+) -> usize {
+    let Some(content) = read_audit_tail(home_dir, max_bytes) else {
         return 0;
     };
     content
@@ -1985,6 +2060,65 @@ mod rm166_untrusted_caller_audit_tests {
         assert_eq!(count_event_type_since(&empty, EVENT_HOOK_UNTRUSTED_CALLER, since), 0);
         std::fs::remove_dir_all(home).unwrap();
         std::fs::remove_dir_all(empty).unwrap();
+    }
+
+    fn rows(home: &Path) -> Vec<AuditEvent> {
+        std::fs::read_to_string(home.join("security_audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// RM-166 round 2 (finding 4): one refusal row per (claimed id, minute).
+    #[test]
+    fn rm166b_refusals_are_deduped_per_claimed_id_and_minute() {
+        let home = super::tests::fresh_home();
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-11-09T10:15:05Z").unwrap().with_timezone(&Utc);
+        for i in 0..50 {
+            log_hook_untrusted_caller_at(&home, "alice", "Write", t0 + chrono::Duration::seconds(i % 50));
+        }
+        log_hook_untrusted_caller_at(&home, "bob", "Bash", t0);
+        // Next minute: a new row for alice.
+        log_hook_untrusted_caller_at(&home, "alice", "Edit", t0 + chrono::Duration::seconds(60));
+        let refusals: Vec<_> = rows(&home)
+            .into_iter()
+            .filter(|e| e.event_type == EVENT_HOOK_UNTRUSTED_CALLER)
+            .collect();
+        assert_eq!(refusals.len(), 3, "{refusals:?}");
+        assert_eq!(refusals.iter().filter(|e| e.agent_id == "alice").count(), 2);
+        assert_eq!(refusals[0].details["minute"], "2026-11-09T10:15Z");
+        // Bounded fields stay: long ids and tool names are truncated, and
+        // the dedupe key uses the truncated id.
+        let long = "x".repeat(500);
+        log_hook_untrusted_caller_at(&home, &long, &"T".repeat(100), t0);
+        log_hook_untrusted_caller_at(&home, &long, "Write", t0);
+        let long_rows: Vec<_> = rows(&home).into_iter().filter(|e| e.agent_id.starts_with("xxx")).collect();
+        assert_eq!(long_rows.len(), 1);
+        assert_eq!(long_rows[0].agent_id.chars().count(), 64);
+        assert_eq!(long_rows[0].details["tool"].as_str().unwrap().chars().count(), 32);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// RM-166 round 2 (finding 4): the 24 h count reads only the log's tail.
+    #[test]
+    fn rm166b_count_reads_only_the_tail_of_the_log() {
+        let home = super::tests::fresh_home();
+        let now = Utc::now();
+        // A recent refusal at the very start of the file, then filler.
+        log_hook_untrusted_caller_at(&home, "early", "Write", now);
+        let filler = AuditEvent::new("filler", "x", Severity::Info, serde_json::json!({"pad": "p".repeat(900)}));
+        for _ in 0..40 {
+            append_audit_event(&home, &filler);
+        }
+        log_hook_untrusted_caller_at(&home, "late", "Write", now);
+        let since = now - chrono::Duration::hours(24);
+        // Whole file in range: both.
+        assert_eq!(count_event_type_since(&home, EVENT_HOOK_UNTRUSTED_CALLER, since), 2);
+        // A small tail sees only the last one; the cut first line is dropped.
+        assert_eq!(count_event_type_since_in_tail(&home, EVENT_HOOK_UNTRUSTED_CALLER, since, 4096), 1);
+        assert!(COUNT_EVENT_TAIL_BYTES <= 8 * 1024 * 1024);
+        std::fs::remove_dir_all(home).unwrap();
     }
 }
 

@@ -283,9 +283,12 @@ pub fn classify_identity_surface(file_path: &Path, home: &Path) -> Option<Protec
     let file_name = file_path.file_name()?.to_str()?;
     let normalized = lexical_normalize(file_path);
 
+    // RM-166 round 2: the gateway-owned identity-transition record rides
+    // along (`<home>` exactly): only the gateway writes it.
     if [crate::identity_token::IDENTITY_KEY_FILE,
         crate::identity_token::IDENTITY_INITIALIZED_FILE,
-        crate::identity_token::IDENTITY_LOCK_FILE]
+        crate::identity_token::IDENTITY_LOCK_FILE,
+        crate::identity_token::IDENTITY_TRANSITION_FILE]
         .iter().any(|name| file_name.eq_ignore_ascii_case(name))
     {
         let expected = lexical_normalize(&home.join(file_name));

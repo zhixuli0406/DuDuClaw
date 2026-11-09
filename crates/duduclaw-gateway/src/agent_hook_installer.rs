@@ -196,9 +196,17 @@ pub(crate) async fn ensure_spawn_hook_settings(
     Ok(())
 }
 
-/// RM-166: the identity pair (`DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN`)
+/// RM-166: the identity pair (`DUDUCLAW_AGENT_ID` + `DUDUCLAW_HOOK_TOKEN`)
 /// the `agent-file-guard` hook verifies for the employee whose directory is
 /// `agent_dir`.
+///
+/// Round 2 (review finding 5): the proof is the hook-only token
+/// (`duduclaw_core::hook_identity_env_vars`), not `DUDUCLAW_AGENT_TOKEN`.
+/// Everything the employee runs inherits the CLI's env — Bash included — and
+/// the full identity token would let it start its own `duduclaw mcp-server`
+/// as itself outside the gateway's `.mcp.json`. The hook token is accepted by
+/// the hook's caller resolution only. The MCP server keeps getting the full
+/// token from its own `.mcp.json` env block.
 ///
 /// Claude Code runs its hooks with the CLI's own environment, and every
 /// employee spawn clears that environment down to the allowlist
@@ -212,7 +220,7 @@ pub(crate) async fn ensure_spawn_hook_settings(
 /// [`build_hook_command`] bakes in as `--agent`) and the token is minted
 /// against the home the hook verifies against (`--home`, the same
 /// [`home_of_agent_dir`] derivation), through the shared
-/// `duduclaw_core::agent_identity_env_vars`. Anything that is not a valid
+/// `duduclaw_core::hook_identity_env_vars`. Anything that is not a valid
 /// employee directory under an absolute home yields no pair at all: this can
 /// only ever hand a spawn the identity of the employee it runs for.
 pub fn hook_identity_env(agent_dir: &Path) -> Vec<(String, String)> {
@@ -225,19 +233,31 @@ pub fn hook_identity_env(agent_dir: &Path) -> Vec<(String, String)> {
     ) else {
         return Vec::new();
     };
-    duduclaw_core::agent_identity_env_vars(&home, agent_id)
+    duduclaw_core::hook_identity_env_vars(&home, agent_id)
 }
 
 /// Apply [`hook_identity_env`] to an employee's Claude CLI command, after the
-/// spawn-env allowlist. Any identity already on the command is removed first,
-/// so a spawn without a valid employee directory carries none (never a
-/// leftover or ambient one).
+/// spawn-env allowlist. Any identity already on the command is removed first
+/// — `DUDUCLAW_AGENT_TOKEN` always (round 2: never in the CLI's env, even if
+/// inherited), so a spawn without a valid employee directory carries none
+/// (never a leftover or ambient one).
 pub fn apply_hook_identity_env(cmd: &mut tokio::process::Command, agent_dir: Option<&Path>) {
     cmd.env_remove(duduclaw_core::ENV_AGENT_ID);
     cmd.env_remove(duduclaw_core::ENV_AGENT_TOKEN);
+    cmd.env_remove(duduclaw_core::ENV_HOOK_TOKEN);
     for (key, value) in agent_dir.map(hook_identity_env).unwrap_or_default() {
         cmd.env(key, value);
     }
+}
+
+/// RM-166 round 2: only the `DUDUCLAW_HOOK_TOKEN` pair of
+/// [`hook_identity_env`], for runtimes that install the guard hook but keep
+/// their own id/identity-token export (Grok).
+pub fn hook_token_env(agent_dir: &Path) -> Vec<(String, String)> {
+    hook_identity_env(agent_dir)
+        .into_iter()
+        .filter(|(key, _)| key == duduclaw_core::ENV_HOOK_TOKEN)
+        .collect()
 }
 
 fn validate_hook_identity(agent_dir: &Path) -> std::io::Result<()> {

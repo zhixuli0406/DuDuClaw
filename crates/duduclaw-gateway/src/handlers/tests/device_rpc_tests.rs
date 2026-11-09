@@ -214,7 +214,25 @@ async fn system_status_reports_identity_token_transition() {
     assert_eq!(identity["mode"], "grace", "{identity}");
     assert_eq!(identity["grace_until"], deadline);
     assert_eq!(identity["days_left"], 10);
-    assert_eq!(identity["upgrade_grace"], false);
+    assert_eq!(identity["notice_active"], false, "no first-start record in this home");
+    assert_eq!(identity["manual_grace_max_days"], 30);
+}
+
+/// RM-166 round 2 (finding 3): `system.status.identity_token` is Admin-only;
+/// every other role gets the rest of the status without it.
+#[tokio::test]
+async fn rm166b_system_status_identity_field_is_hidden_for_non_admins() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let admin = frame_data(&handler.handle("system.status", json!({}), &admin_ctx()).await);
+    assert!(admin.get("identity_token").is_some());
+    let mut manager = employee_ctx();
+    manager.role = UserRole::Manager;
+    for ctx in [employee_ctx(), manager] {
+        let data = frame_data(&handler.handle("system.status", json!({}), &ctx).await);
+        assert!(data.get("identity_token").is_none(), "{data:?}");
+        assert!(data.get("version").is_some(), "the rest of the status stays");
+    }
 }
 
 /// The `false` branch of the same field: `[decision] enabled = false` in

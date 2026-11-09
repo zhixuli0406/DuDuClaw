@@ -4893,9 +4893,9 @@ mod rm166_identity_env_tests {
 
         let cmd = build(home, Some(&alice));
         assert_eq!(env_of(&cmd, duduclaw_core::ENV_AGENT_ID).as_deref(), Some("alice"));
-        let token = env_of(&cmd, duduclaw_core::ENV_AGENT_TOKEN).expect("strict mode needs the token");
-        assert!(duduclaw_core::verify_identity_token(&key, "alice", &token));
-        assert!(!duduclaw_core::verify_identity_token(&key, "bob", &token));
+        let token = env_of(&cmd, duduclaw_core::ENV_HOOK_TOKEN).expect("strict mode needs the hook token");
+        assert!(duduclaw_core::verify_hook_token(&key, "alice", &token));
+        assert!(!duduclaw_core::verify_hook_token(&key, "bob", &token));
 
         // A team role member runs as its own scaffold, never as its parent.
         let role = home.join("agents/.ephemeral/eph-role");
@@ -4907,14 +4907,49 @@ mod rm166_identity_env_tests {
         .unwrap();
         let cmd = build(home, Some(&role));
         assert_eq!(env_of(&cmd, duduclaw_core::ENV_AGENT_ID).as_deref(), Some("eph-role"));
-        let token = env_of(&cmd, duduclaw_core::ENV_AGENT_TOKEN).unwrap();
-        assert!(duduclaw_core::verify_identity_token(&key, "eph-role", &token));
-        assert!(!duduclaw_core::verify_identity_token(&key, "alice", &token));
+        let token = env_of(&cmd, duduclaw_core::ENV_HOOK_TOKEN).unwrap();
+        assert!(duduclaw_core::verify_hook_token(&key, "eph-role", &token));
+        assert!(!duduclaw_core::verify_hook_token(&key, "alice", &token));
 
         // No employee directory ⇒ no identity at all.
         let none = build(home, None);
         assert_eq!(env_of(&none, duduclaw_core::ENV_AGENT_ID), None);
+        assert_eq!(env_of(&none, duduclaw_core::ENV_HOOK_TOKEN), None);
         assert_eq!(env_of(&none, duduclaw_core::ENV_AGENT_TOKEN), None);
+    }
+
+    /// RM-166 round 2 (finding 5): the Claude CLI env carries the hook-only
+    /// token and never the full identity token — an inherited one is
+    /// removed — and the hook token does not pass the MCP identity check.
+    #[test]
+    fn rm166b_claude_cli_env_lacks_the_agent_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(home.join("config.toml"), "[delegation]\nrequire_identity_token = true\n").unwrap();
+        duduclaw_core::ensure_identity_key(home).unwrap();
+        let alice = home.join("agents/alice");
+        std::fs::create_dir_all(&alice).unwrap();
+
+        let mut cmd = build(home, Some(&alice));
+        // An identity token that reached the command some other way (an
+        // ambient gateway env, a future allowlist entry) is removed again.
+        cmd.env(duduclaw_core::ENV_AGENT_TOKEN, "inherited");
+        crate::agent_hook_installer::apply_hook_identity_env(&mut cmd, Some(&alice));
+        let is_removed = |key: &str| {
+            cmd.as_std().get_envs().any(|(name, value)| name == std::ffi::OsStr::new(key) && value.is_none())
+        };
+        assert_eq!(env_of(&cmd, duduclaw_core::ENV_AGENT_TOKEN), None);
+        assert!(is_removed(duduclaw_core::ENV_AGENT_TOKEN), "explicitly removed, not inherited");
+        let hook = env_of(&cmd, duduclaw_core::ENV_HOOK_TOKEN).unwrap();
+        assert_eq!(
+            duduclaw_core::verify_identity_claim(home, "alice", &hook, true),
+            duduclaw_core::IdentityVerdict::Rejected,
+            "a hook token is not an MCP identity"
+        );
+        assert_eq!(
+            duduclaw_core::verify_hook_claim(home, "alice", &hook, true),
+            duduclaw_core::IdentityVerdict::Verified
+        );
     }
 }
 

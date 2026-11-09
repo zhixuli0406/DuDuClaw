@@ -721,17 +721,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         ))
     })?);
 
-    // RM-166 — one-time identity-token transition for installs upgraded
-    // while the strict default was unset: writes a bounded 30-day grace
-    // (never over an explicit key, never for a new install). Must run before
+    // RM-166 (round 2, owner decision 2026-11-09) — record once when this
+    // release first started on this home, for the dashboard's 30-day
+    // "strict mode is on" notice. Never writes config.toml and never weakens
+    // strict mode (no automatic grace). Must run before
     // `prepare_identity_key`, whose key creation would make a fresh install
     // look like an existing one. Failures only log.
-    {
-        let report = crate::identity_transition::run(&home_dir).await;
-        if let Some(e) = &report.error {
-            tracing::warn!("identity-token transition migration: {e}");
-        }
-    }
+    crate::identity_transition::record_first_start(&home_dir);
 
     // WP21 debt ⑧ — mint `<home>/identity.key` if absent, before any MCP env
     // block is assembled, so every `.mcp.json` / runtime config written later

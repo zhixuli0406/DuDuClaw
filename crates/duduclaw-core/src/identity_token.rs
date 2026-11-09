@@ -93,6 +93,31 @@ pub const IDENTITY_KEY_FILE: &str = "identity.key";
 /// Durable evidence that this installation must never silently mint a new key.
 pub const IDENTITY_INITIALIZED_FILE: &str = "identity.key.initialized";
 pub const IDENTITY_LOCK_FILE: &str = "identity.key.lock";
+/// RM-166 round 2: gateway-owned record of when this release first started on
+/// this home (`<home>/identity-transition.json`). It only drives the
+/// dashboard's "strict mode is on" notice; it never weakens verification, so
+/// deleting it at worst shows that notice again. Refused for every caller by
+/// the file guard like the identity key (`classify_identity_surface`).
+pub const IDENTITY_TRANSITION_FILE: &str = "identity-transition.json";
+
+/// RM-166 round 2 (review finding 5): proof for the `agent-file-guard` hook
+/// **only** — `hex(HMAC-SHA256(identity.key, "agent-file-guard\0" + agent_id))`.
+///
+/// The Claude CLI's own environment is inherited by everything the employee
+/// runs (hooks, Bash, every MCP child), so it must not carry the full
+/// [`ENV_AGENT_TOKEN`]: that token authenticates the MCP server, delegation
+/// and the gateway's internal routes. The hook token is accepted only by the
+/// hook's caller resolution; every other check reads [`ENV_AGENT_TOKEN`] and
+/// verifies `HMAC(key, agent_id)`, which a hook token never equals (agent ids
+/// cannot contain NUL, so the two message spaces are disjoint).
+///
+/// Bound to the agent id only, exactly like [`agent_identity_env_vars`]
+/// (which carries no incarnation or token version either): rotating
+/// `identity.key` invalidates both together.
+pub const ENV_HOOK_TOKEN: &str = "DUDUCLAW_HOOK_TOKEN";
+
+/// Domain prefix of [`ENV_HOOK_TOKEN`]'s MAC input.
+const HOOK_TOKEN_DOMAIN: &str = "agent-file-guard\0";
 
 /// Key length in bytes. 32 = the HMAC-SHA256 block-optimal size (no hashing of
 /// the key on use) and 256 bits of entropy.
@@ -338,6 +363,17 @@ pub fn verify_token(key: &[u8], agent_id: &str, token: &str) -> bool {
     };
     mac.update(agent_id.as_bytes());
     mac.verify_slice(&bytes).is_ok()
+}
+
+/// [`ENV_HOOK_TOKEN`] for `agent_id`: `hex(HMAC(key, "agent-file-guard\0" + id))`.
+pub fn mint_hook_token(key: &[u8], agent_id: &str) -> String {
+    mint_token(key, &format!("{HOOK_TOKEN_DOMAIN}{agent_id}"))
+}
+
+/// Constant-time check of a [`mint_hook_token`] tag. An identity token
+/// ([`mint_token`]) for the same id never passes, and vice versa.
+pub fn verify_hook_token(key: &[u8], agent_id: &str, token: &str) -> bool {
+    !agent_id.contains('\0') && verify_token(key, &format!("{HOOK_TOKEN_DOMAIN}{agent_id}"), token)
 }
 
 /// Legacy proof name, retained only so process boundaries can scrub it.
@@ -780,6 +816,18 @@ pub fn agent_identity_env_vars_default(agent_id: &str) -> Vec<(String, String)> 
     agent_identity_env_vars(&crate::duduclaw_home(), agent_id)
 }
 
+/// RM-166 round 2: the `(DUDUCLAW_AGENT_ID, id)` pair plus, when
+/// `identity.key` exists, `(DUDUCLAW_HOOK_TOKEN, tag)` — what an employee's
+/// Claude CLI process env carries for its `agent-file-guard` hook. Never the
+/// full [`ENV_AGENT_TOKEN`] (see [`ENV_HOOK_TOKEN`]).
+pub fn hook_identity_env_vars(home_dir: &Path, agent_id: &str) -> Vec<(String, String)> {
+    let mut out = vec![(crate::ENV_AGENT_ID.to_string(), agent_id.to_string())];
+    if let Some(key) = load_key(home_dir) {
+        out.push((ENV_HOOK_TOKEN.to_string(), mint_hook_token(&key, agent_id)));
+    }
+    out
+}
+
 // ── Verification (MCP server side) ───────────────────────────────────────────
 
 /// Outcome of checking the ambient `DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN`
@@ -851,11 +899,37 @@ fn verify_bridge_claim(home_dir: &Path, agent_id: &str, claimed: &str, token: &s
 }
 
 /// Testable core of [`verify_env_identity`] with the env reads hoisted out.
+///
+/// Accepts only an identity token (`HMAC(key, agent_id)`); a hook token
+/// ([`mint_hook_token`]) is refused like any other wrong tag.
 pub fn verify_claim(
     home_dir: &Path,
     claimed_id: &str,
     token: &str,
     require: bool,
+) -> IdentityVerdict {
+    verify_claim_with(home_dir, claimed_id, token, require, verify_token)
+}
+
+/// RM-166 round 2: [`verify_claim`] for the `agent-file-guard` hook's
+/// [`ENV_HOOK_TOKEN`]. Same rollout table, reserved-id refusals and grace
+/// recheck; only the MAC domain differs. Call sites other than the hook's
+/// caller resolution must not use this.
+pub fn verify_hook_claim(
+    home_dir: &Path,
+    claimed_id: &str,
+    hook_token: &str,
+    require: bool,
+) -> IdentityVerdict {
+    verify_claim_with(home_dir, claimed_id, hook_token, require, verify_hook_token)
+}
+
+fn verify_claim_with(
+    home_dir: &Path,
+    claimed_id: &str,
+    token: &str,
+    require: bool,
+    check: fn(&[u8], &str, &str) -> bool,
 ) -> IdentityVerdict {
     // Recheck even when the caller cached false or passed it directly. Expiry
     // must restore strict verification without waiting for a gateway restart.
@@ -892,7 +966,7 @@ pub fn verify_claim(
     // `config.toml [general] default_agent`. In strict mode that fallback is
     // itself an escalation route (unset the env var, inherit the default
     // agent's authority), so it is refused there too.
-    if !claimed_id.is_empty() && !token.is_empty() && verify_token(&key, claimed_id, token) {
+    if !claimed_id.is_empty() && !token.is_empty() && check(key.as_slice(), claimed_id, token) {
         return IdentityVerdict::Verified;
     }
     if require {
@@ -1464,5 +1538,76 @@ mod tests {
     fn untrusted_sentinel_is_reserved_and_not_a_system_sender() {
         assert!(crate::is_reserved_agent_id(UNTRUSTED_AGENT_ID));
         assert!(!crate::is_system_sender(UNTRUSTED_AGENT_ID));
+    }
+}
+
+#[cfg(test)]
+mod rm166b_hook_token_tests {
+    //! RM-166 round 2 (finding 5): the hook-only token is accepted by the
+    //! hook's verification and by nothing else — not the MCP identity check,
+    //! not the remote bridge, not a delegation-context signature.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn strict_home() -> (TempDir, Vec<u8>) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[delegation]\nrequire_identity_token = true\n").unwrap();
+        let key = ensure_key(tmp.path()).unwrap();
+        (tmp, key)
+    }
+
+    #[test]
+    fn rm166b_hook_token_is_accepted_by_the_hook_verifier_only() {
+        let (tmp, key) = strict_home();
+        let home = tmp.path();
+        let hook = mint_hook_token(&key, "alice");
+        let full = mint_token(&key, "alice");
+        assert_ne!(hook, full, "domain-separated tags");
+
+        // The hook verifier: own hook token yes; another id's, a forged or
+        // empty one no.
+        assert_eq!(verify_hook_claim(home, "alice", &hook, true), IdentityVerdict::Verified);
+        assert_eq!(verify_hook_claim(home, "bob", &hook, true), IdentityVerdict::Rejected);
+        assert_eq!(verify_hook_claim(home, "alice", "00", true), IdentityVerdict::Rejected);
+        assert_eq!(verify_hook_claim(home, "alice", "", true), IdentityVerdict::Rejected);
+        // The full identity token is not a hook token either (the hook keeps
+        // its own explicit fallback for runtimes that still export it).
+        assert_eq!(verify_hook_claim(home, "alice", &full, true), IdentityVerdict::Rejected);
+
+        // MCP server identity (`verify_env_identity` → `verify_claim`).
+        assert_eq!(verify_claim(home, "alice", &hook, true), IdentityVerdict::Rejected);
+        assert_eq!(verify_claim(home, "alice", &full, true), IdentityVerdict::Verified);
+        // Credential-bearing bridge.
+        assert!(verify_bridge_claim(home, "alice", "alice", &hook).is_err());
+        assert!(verify_bridge_claim(home, "alice", "alice", &full).is_ok());
+        // Raw tag checks used by the gateway's internal routes.
+        assert!(!verify_token(&key, "alice", &hook));
+        assert!(!verify_hook_token(&key, "alice", &full));
+        // A NUL-carrying id cannot alias another message.
+        assert!(!verify_hook_token(&key, "alice\0x", &mint_token(&key, "agent-file-guard\0alice\0x")));
+    }
+
+    #[test]
+    fn rm166b_hook_token_cannot_sign_a_delegation_context() {
+        let (_tmp, key) = strict_home();
+        let signed = mint_delegation_context(&key, "alice", "bob", "bob", 1, None, u64::MAX - 1).unwrap();
+        let mut forged: serde_json::Value = serde_json::from_str(&signed).unwrap();
+        forged["signature"] = serde_json::json!(mint_hook_token(&key, "alice"));
+        let forged = forged.to_string();
+        assert!(verify_delegation_context(&key, "alice", None, &signed, 1).is_some());
+        assert!(verify_delegation_context(&key, "alice", None, &forged, 1).is_none());
+    }
+
+    #[test]
+    fn rm166b_hook_env_carries_the_hook_token_never_the_identity_token() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        assert_eq!(hook_identity_env_vars(home, "alice").len(), 1, "no key ⇒ id only");
+        let key = ensure_key(home).unwrap();
+        let env = hook_identity_env_vars(home, "alice");
+        assert_eq!(env[0], (crate::ENV_AGENT_ID.to_string(), "alice".to_string()));
+        assert_eq!(env[1].0, ENV_HOOK_TOKEN);
+        assert!(verify_hook_token(&key, "alice", &env[1].1));
+        assert!(env.iter().all(|(k, _)| k != ENV_AGENT_TOKEN));
     }
 }
