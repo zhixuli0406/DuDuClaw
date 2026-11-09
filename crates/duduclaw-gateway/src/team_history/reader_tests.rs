@@ -159,9 +159,9 @@ async fn rm173_user_cleared_conversations_are_never_listed_or_released() {
     for id in [report.as_str(), customer.as_str(), "report", "line:Ccustomer"] {
         assert!(get(&sm, &scope, id).await.unwrap().is_none(), "{id}");
     }
-    // Once an Admin restores the cleared row it is ordinary history again.
+    // Even after an Admin restores it, a user clear never enters team history.
     sm.restore_archived(&report).await.unwrap();
-    assert!(get(&sm, &scope, &report).await.unwrap().is_some());
+    assert!(get(&sm, &scope, &report).await.unwrap().is_none());
 }
 
 #[tokio::test]

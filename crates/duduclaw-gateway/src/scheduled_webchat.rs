@@ -745,7 +745,12 @@ pub(crate) mod tests {
         let old = (chrono::Utc::now() - chrono::Duration::days(100)).to_rfc3339();
         {
             let conn = manager.acquire().await;
-            conn.execute("UPDATE sessions SET archived_at=?2 WHERE id=?1", params![f.session, old]).unwrap();
+            let older = (chrono::Utc::now() - chrono::Duration::days(101)).to_rfc3339();
+        conn.execute(
+            "UPDATE sessions SET archived_at=?2, last_active=?3, archive_reason='retention' WHERE id=?1",
+            params![f.session, old, older],
+        )
+        .unwrap();
         }
         manager.cleanup_inactive_with_retention(24, 90).await.unwrap();
         let left: Vec<String> = store.list_all().await.unwrap().into_iter().map(|r| r.id).collect();
