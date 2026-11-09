@@ -384,6 +384,48 @@ pub async fn install_skill(
     agent_skills_dir: &Path,
     quarantine_dir: &Path,
 ) -> Result<ParsedSkill, String> {
+    install_skill_at(skill_path, agent_skills_dir, quarantine_dir, SkillsDir::CreateAll).await
+}
+
+/// How the destination skills directory may be created.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkillsDir {
+    /// Org-wide layers (global / department): every missing ancestor.
+    CreateAll,
+    /// SR5 round 3 N8: only the final `SKILLS/` component, inside an
+    /// already-existing real directory; never an ancestor.
+    LeafOnly,
+}
+
+/// Refusal when the checked employee tree is gone (tombstoned, moved or
+/// replaced) between the live check and the write.
+pub const EMPLOYEE_TREE_GONE: &str =
+    "install DENIED: the employee directory is no longer present; nothing was installed";
+
+/// SR5 round 3 N8: install into a live employee tree the caller has ALREADY
+/// checked (`agents/<label>`, e.g. the gateway's `live_employee_dir`). Only
+/// `<employee_dir>/SKILLS` is created; `employee_dir` itself is never
+/// created, so a tree moved away by a concurrent tombstone stays gone (the
+/// install fails instead of conjuring `agents/<label>`). A symlinked or
+/// non-directory `employee_dir` / `SKILLS` refuses.
+pub async fn install_skill_into_employee(
+    skill_path: &Path,
+    employee_dir: &Path,
+    quarantine_dir: &Path,
+) -> Result<ParsedSkill, String> {
+    install_skill_at(skill_path, &employee_dir.join("SKILLS"), quarantine_dir, SkillsDir::LeafOnly).await
+}
+
+fn real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+async fn install_skill_at(
+    skill_path: &Path,
+    agent_skills_dir: &Path,
+    quarantine_dir: &Path,
+    mode: SkillsDir,
+) -> Result<ParsedSkill, String> {
     let content = tokio::fs::read_to_string(skill_path)
         .await
         .map_err(|e| format!("Failed to read skill: {e}"))?;
@@ -404,9 +446,27 @@ pub async fn install_skill(
     }
 
     // Create directories
-    tokio::fs::create_dir_all(agent_skills_dir)
-        .await
-        .map_err(|e| format!("Failed to create skills dir: {e}"))?;
+    match mode {
+        SkillsDir::CreateAll => tokio::fs::create_dir_all(agent_skills_dir)
+            .await
+            .map_err(|e| format!("Failed to create skills dir: {e}"))?,
+        SkillsDir::LeafOnly => {
+            let parent = agent_skills_dir.parent().ok_or_else(|| EMPLOYEE_TREE_GONE.to_string())?;
+            if !real_dir(parent) {
+                return Err(EMPLOYEE_TREE_GONE.into());
+            }
+            match tokio::fs::create_dir(agent_skills_dir).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // The parent vanished after the check: never recreate it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(EMPLOYEE_TREE_GONE.into()),
+                Err(e) => return Err(format!("Failed to create skills dir: {e}")),
+            }
+            if !real_dir(agent_skills_dir) {
+                return Err("install DENIED: the employee SKILLS path is not a directory".into());
+            }
+        }
+    }
     tokio::fs::create_dir_all(quarantine_dir)
         .await
         .map_err(|e| format!("Failed to create quarantine dir: {e}"))?;
@@ -649,6 +709,52 @@ mod install_safety_tests {
         let error = install_skill(&source, &skills, &home.path().join("quarantine")).await.unwrap_err();
         assert!(error.contains("DENIED"), "{error}");
         assert_eq!(std::fs::read_to_string(skills.join("notes.md")).unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn sr5r3_employee_install_creates_only_skills_and_never_the_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("notes.md");
+        std::fs::write(&source, "---\nname: notes\n---\nbody").unwrap();
+        let quarantine = home.path().join("quarantine");
+        let employee = home.path().join("agents").join("alice");
+        // The checked tree vanished (tombstone moved it) before the install:
+        // refused, and neither agents/alice nor agents/ is conjured.
+        let error = install_skill_into_employee(&source, &employee, &quarantine).await.unwrap_err();
+        assert_eq!(error, EMPLOYEE_TREE_GONE);
+        assert!(!home.path().join("agents").exists());
+        // A live tree: only SKILLS/ is created inside it.
+        std::fs::create_dir_all(&employee).unwrap();
+        let parsed = install_skill_into_employee(&source, &employee, &quarantine).await.unwrap();
+        assert_eq!(parsed.meta.name, "notes");
+        assert!(employee.join("SKILLS").join("notes.md").is_file());
+        // An existing SKILLS/ is reused.
+        assert!(install_skill_into_employee(&source, &employee, &quarantine).await.is_ok());
+        // The tree is gone again (SKILLS included): never recreated.
+        std::fs::remove_dir_all(&employee).unwrap();
+        assert_eq!(install_skill_into_employee(&source, &employee, &quarantine).await.unwrap_err(), EMPLOYEE_TREE_GONE);
+        assert!(!employee.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sr5r3_employee_install_refuses_a_symlinked_tree_or_skills_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("notes.md");
+        std::fs::write(&source, "---\nname: notes\n---\nbody").unwrap();
+        let quarantine = home.path().join("quarantine");
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(home.path().join("agents")).unwrap();
+        let employee = home.path().join("agents").join("alice");
+        std::os::unix::fs::symlink(&elsewhere, &employee).unwrap();
+        assert_eq!(install_skill_into_employee(&source, &employee, &quarantine).await.unwrap_err(), EMPLOYEE_TREE_GONE);
+        assert!(!elsewhere.join("SKILLS").exists());
+        let real = home.path().join("agents").join("bob");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, real.join("SKILLS")).unwrap();
+        assert!(install_skill_into_employee(&source, &real, &quarantine).await.is_err());
+        assert!(!elsewhere.join("notes.md").exists());
     }
 
     #[tokio::test]

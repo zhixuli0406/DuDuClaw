@@ -452,10 +452,10 @@ impl MethodHandler {
                 let _ = std::fs::remove_file(&tmp_file);
                 return Err(super::skills_install_target::INVALID_TARGET.into());
             };
-            let agent_skills_dir = employee_dir.join("SKILLS");
-            duduclaw_agent::skill_loader::install_skill(
+            // SR5 round 3 N8: only SKILLS/ inside the checked tree is created.
+            duduclaw_agent::skill_loader::install_skill_into_employee(
                 &tmp_file,
-                &agent_skills_dir,
+                &employee_dir,
                 &quarantine_dir,
             )
             .await

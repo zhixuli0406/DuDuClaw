@@ -336,6 +336,11 @@ impl MethodHandler {
             Ok(l) => l,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        // SR5 round 3 N5: a quarantined / tombstoned label is refused from the
+        // lifecycle index, not only from the users.db mirror auth reads.
+        if let Some(refusal) = crate::isolation_label_stores::bind_refusal(&self.home_dir, agent_name) {
+            return WsFrame::error_response("", refusal);
+        }
 
         // Verify agent exists
         let reg = self.registry.read().await;
@@ -445,6 +450,19 @@ impl MethodHandler {
         // One transaction: status, the leaver's reports (moved to
         // `transfer_to`, else to the leaver's manager, each re-checked and
         // audited as `user.reparent`) and, with `transfer_to`, the bindings.
+        // SR5 round 3 N5: a transfer never re-binds a quarantined / tombstoned
+        // label (checked from the lifecycle index before auth moves bindings).
+        if transfer_to.is_some() {
+            let agents = match db.get_user_agents(user_id) {
+                Ok(bindings) => bindings,
+                Err(_) => return WsFrame::error_response("", crate::isolation_label_stores::LABEL_STATE_UNAVAILABLE),
+            };
+            if let Some(refusal) = agents.iter()
+                .find_map(|binding| crate::isolation_label_stores::bind_refusal(&self.home_dir, &binding.agent_name))
+            {
+                return WsFrame::error_response("", refusal);
+            }
+        }
         let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
         let outcome = match db.offboard_user(user_id, transfer_to, Some(&ctx.user_id)) {
             Ok(outcome) => outcome,

@@ -81,7 +81,56 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
 pub fn authorize_answers(target: &ConnectTarget, profile: &EgressProfile, answers: Vec<IpAddr>)
     -> Result<Vec<SocketAddr>, EgressError> {
     let own = host_addresses().current(std::time::Instant::now())?;
-    authorize_answers_with(target, profile, answers, &own)
+    match CONFIGURED_HOST_ADDRESSES.get().filter(|configured| !configured.is_empty()) {
+        Some(configured) => authorize_answers_with(target, profile, answers, &with_configured(&own, configured)),
+        None => authorize_answers_with(target, profile, answers, &own),
+    }
+}
+
+// ── SR5 round 3 N7b: host public addresses that are on no interface ─────
+//
+// A cloud host behind 1:1 NAT (elastic / floating IP) has a public address
+// that never appears on an interface, so interface enumeration cannot see
+// it. The root-owned egress config may list such addresses
+// (`host_public_addresses`, optional, at most
+// [`MAX_CONFIGURED_HOST_ADDRESSES`]); answers equal to one are denied like
+// the interface addresses. Operators of NAT'd hosts must list them; without
+// the list such an address is not recognised as the host's own.
+
+/// Bound of the configured list.
+pub const MAX_CONFIGURED_HOST_ADDRESSES: usize = 64;
+
+static CONFIGURED_HOST_ADDRESSES: OnceLock<BTreeSet<IpAddr>> = OnceLock::new();
+
+/// Record the configured list once at daemon start (before seccomp). A
+/// second call or an oversized list refuses.
+pub fn configure_host_public_addresses(addresses: &[IpAddr]) -> Result<(), EgressError> {
+    if addresses.len() > MAX_CONFIGURED_HOST_ADDRESSES { return Err(EgressError::ResourceLimit); }
+    CONFIGURED_HOST_ADDRESSES.set(addresses.iter().copied().map(canonical).collect())
+        .map_err(|_| EgressError::Unavailable)
+}
+
+/// The enumerated set plus the configured addresses (canonical form).
+pub fn with_configured(own: &BTreeSet<IpAddr>, configured: &BTreeSet<IpAddr>) -> BTreeSet<IpAddr> {
+    own.iter().copied().chain(configured.iter().copied().map(canonical)).collect()
+}
+
+// ── SR5 round 3 N7a: SIOCGIFCONF truncation ─────────────────────────────
+
+/// The largest interface table read through `SIOCGIFCONF` (entries). A host
+/// with more interfaces refuses (fail closed) instead of a partial set.
+pub const MAX_IFCONF_ENTRIES: usize = 16 * 1024;
+/// The first buffer size (entries).
+pub const INITIAL_IFCONF_ENTRIES: usize = 256;
+
+/// `SIOCGIFCONF` writes whole entries and reports the bytes used; a buffer
+/// that came back full may have been truncated. `Ok(None)`: complete;
+/// `Ok(Some(entries))`: retry with that many entries; `Err`: still full at
+/// [`MAX_IFCONF_ENTRIES`].
+pub fn ifconf_next_entries(used: usize, buffer_len: usize, entries: usize) -> Result<Option<usize>, EgressError> {
+    if used < buffer_len { return Ok(None); }
+    if entries >= MAX_IFCONF_ENTRIES { return Err(EgressError::Unavailable); }
+    Ok(Some(entries.saturating_mul(4).min(MAX_IFCONF_ENTRIES)))
 }
 
 /// [`authorize_answers`] against an explicit set of the host's own addresses.
@@ -218,15 +267,23 @@ mod interfaces {
         // SAFETY: `raw` is a fresh descriptor we own.
         let socket = unsafe { OwnedFd::from_raw_fd(raw) };
         let size = ifreq_size();
-        let mut buffer = vec![0u8; size * 256];
-        let mut conf = IfConf { len: libc::c_int::try_from(buffer.len()).map_err(|_| EgressError::Unavailable)?,
-            buf: buffer.as_mut_ptr() };
-        // SAFETY: `conf` points at `buffer`, which outlives the call; the
-        // kernel writes at most `conf.len` bytes and updates `len`.
-        if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFCONF as _, &mut conf as *mut IfConf) } < 0 {
-            return Err(EgressError::Unavailable);
-        }
-        let used = usize::try_from(conf.len).map_err(|_| EgressError::Unavailable)?.min(buffer.len());
+        // SR5 round 3 N7a: grow (bounded) while the kernel fills the buffer.
+        let mut entries = INITIAL_IFCONF_ENTRIES;
+        let (buffer, used) = loop {
+            let mut buffer = vec![0u8; size * entries];
+            let mut conf = IfConf { len: libc::c_int::try_from(buffer.len()).map_err(|_| EgressError::Unavailable)?,
+                buf: buffer.as_mut_ptr() };
+            // SAFETY: `conf` points at `buffer`, which outlives the call; the
+            // kernel writes at most `conf.len` bytes and updates `len`.
+            if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFCONF as _, &mut conf as *mut IfConf) } < 0 {
+                return Err(EgressError::Unavailable);
+            }
+            let used = usize::try_from(conf.len).map_err(|_| EgressError::Unavailable)?;
+            match ifconf_next_entries(used, buffer.len(), entries)? {
+                None => break (buffer, used),
+                Some(next) => entries = next,
+            }
+        };
         let mut out = Vec::new();
         for entry in buffer[..used].chunks_exact(size) {
             // sockaddr at offset 16: family (native u16), port, then sin_addr.
@@ -337,9 +394,41 @@ mod tests {
     fn sr5_if_inet6_parsing_is_strict() {
         let text = "20010db8000000000000000000000001 02 40 00 80 eth0\nfe800000000000000000000000000001 02 40 20 80 eth0\n";
         assert_eq!(parse_if_inet6(text).unwrap(), vec![ip("2001:db8::1"), ip("fe80::1")]);
-        assert_eq!(parse_if_inet6("").unwrap(), vec![]);
+        assert_eq!(parse_if_inet6("").unwrap(), Vec::<IpAddr>::new());
         assert!(parse_if_inet6("zz 02 40 00 80 eth0").is_err());
         assert!(parse_if_inet6("2001 02").is_err());
+    }
+
+    #[test]
+    fn sr5r3_ifconf_grows_when_full_and_refuses_past_the_bound() {
+        let entry = 40;
+        // Room left: complete.
+        assert_eq!(ifconf_next_entries(3 * entry, 256 * entry, 256), Ok(None));
+        // Exactly full: possibly truncated, grow.
+        assert_eq!(ifconf_next_entries(256 * entry, 256 * entry, 256), Ok(Some(1024)));
+        // Growth is bounded and a still-full maximal buffer refuses.
+        assert_eq!(ifconf_next_entries(8192 * entry, 8192 * entry, 8192), Ok(Some(MAX_IFCONF_ENTRIES)));
+        assert_eq!(ifconf_next_entries(MAX_IFCONF_ENTRIES * entry, MAX_IFCONF_ENTRIES * entry, MAX_IFCONF_ENTRIES),
+            Err(EgressError::Unavailable));
+        // A kernel answer larger than the buffer is treated as truncated too.
+        assert_eq!(ifconf_next_entries(300 * entry, 256 * entry, 256), Ok(Some(1024)));
+    }
+
+    #[test]
+    fn sr5r3_configured_nat_public_addresses_are_denied() {
+        let interfaces: BTreeSet<IpAddr> = [ip("10.0.0.5")].into();
+        let configured: BTreeSet<IpAddr> = [ip("::ffff:203.0.114.50"), ip("2606:4700::50")].into();
+        let own = with_configured(&interfaces, &configured);
+        assert!(own.contains(&ip("203.0.114.50")), "mapped form compares as IPv4");
+        for answer in ["203.0.114.50", "::ffff:203.0.114.50", "2606:4700::50"] {
+            assert_eq!(authorize_answers_with(&target(), &profile(), vec![ip(answer)], &own),
+                Err(EgressError::DestinationDenied), "{answer}");
+        }
+        assert!(authorize_answers_with(&target(), &profile(), vec![ip("8.8.8.8")], &own).is_ok());
+        // Without the list the NAT address is not recognised (documented N7b).
+        assert!(authorize_answers_with(&target(), &profile(), vec![ip("203.0.114.50")], &interfaces).is_ok());
+        assert_eq!(configure_host_public_addresses(&vec![ip("8.8.8.8"); MAX_CONFIGURED_HOST_ADDRESSES + 1]),
+            Err(EgressError::ResourceLimit));
     }
 
     #[test]

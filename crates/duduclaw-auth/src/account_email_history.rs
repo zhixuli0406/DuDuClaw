@@ -91,7 +91,7 @@ mod tests {
         let alice = db.create_user("alice@customer.com", "Alice", "password1", UserRole::Employee).unwrap();
         assert_eq!(db.account_email_history().unwrap(), vec!["alice@customer.com".to_string()]);
         // A changed address keeps the old one.
-        db.change_email(&alice.id, "alice.new@customer.com").unwrap();
+        db.change_email("admin-actor", &alice.id, "alice.new@customer.com").unwrap();
         let history = db.account_email_history().unwrap();
         assert!(history.contains(&"alice@customer.com".to_string()) && history.contains(&"alice.new@customer.com".to_string()));
         // A raw writer that bypasses UserDb is recorded by the trigger too.
@@ -109,7 +109,7 @@ mod tests {
         let (db, _dir) = db();
         let alice = db.create_user("alice@customer.com", "Alice", "password1", UserRole::Employee).unwrap();
         db.change_own_email(&alice.id, "alice2@customer.com").unwrap();
-        db.change_email(&alice.id, "alice3@customer.com").unwrap();
+        db.change_email("admin-actor", &alice.id, "alice3@customer.com").unwrap();
         let rows = db.query_audit_log(None, Some(crate::db::EMAIL_CHANGED_ACTION), 10).unwrap();
         assert_eq!(rows.len(), 2);
         let details: Vec<serde_json::Value> =

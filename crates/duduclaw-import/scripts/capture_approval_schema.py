@@ -1,18 +1,19 @@
 """Capture only reviewed ApprovalStore initializer SQL; never opens legacy data.
 
-Writes approvals-v180.sql: the current source is the v1.80.x store.
-approvals-v1793.sql is a separate pinned catalog of the older release and is
-never regenerated from current source."""
+Writes approvals-v181.sql: the current source is the v1.81 store (v1.80.x plus
+the SR5 approvals.employee_incarnation column). approvals-v1793.sql and
+approvals-v180.sql are separate pinned catalogs of older releases and are never
+regenerated from current source."""
 from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[3]
 GATEWAY = ROOT / "crates/duduclaw-gateway/src/approval"
-OUTPUT = ROOT / "crates/duduclaw-import/src/approvals-v180.sql"
+OUTPUT = ROOT / "crates/duduclaw-import/src/approvals-v181.sql"
 HEADER = (
-    "-- Fresh current (v1.80.x line) ApprovalStore schema; generated from reviewed initializers by\n"
-    "-- scripts/capture_approval_schema.py. approvals-v1793.sql is the pinned older catalog and is never\n"
-    "-- regenerated. Difference: RM-027 decision lease columns approvals.lease_token / lease_until.\n"
+    "-- Fresh current (v1.81 line) ApprovalStore schema; generated from reviewed initializers by\n"
+    "-- scripts/capture_approval_schema.py. approvals-v1793.sql / approvals-v180.sql are pinned older catalogs\n"
+    "-- and are never regenerated. Difference from v1.80.x: SR5 column approvals.employee_incarnation.\n"
 )
 
 
@@ -39,7 +40,7 @@ columns = [
     "notify_channel TEXT", "notify_chat_id TEXT", "reminded_at TEXT", "simulation TEXT",
     "request_kind TEXT NOT NULL DEFAULT 'approval'", "binding_json TEXT", "answer_json TEXT",
     "invalidated_reason TEXT", "on_behalf_of TEXT", "origin_session_id TEXT", "origin_turn_id TEXT",
-    "lease_token TEXT", "lease_until TEXT",
+    "lease_token TEXT", "lease_until TEXT", "employee_incarnation INTEGER",
 ]
 initializer = (GATEWAY / "store.rs").read_text()
 for ddl in columns:

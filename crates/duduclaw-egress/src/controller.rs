@@ -177,7 +177,7 @@ mod tests {
         let (mut client,server)=pair();
         let profile=EgressProfile{id:ProfileId(Sha256Digest([1;32])),allowed_connect_ports:List::new(vec![443.try_into().unwrap()]).unwrap(),dns_route:DnsRoute::ResolvedVarlink,limits:default_limits()};
         let id=profile.id;
-        let config=Config{profiles:List::new(vec![profile]).unwrap(),run_caps:RunCaps{total_bytes:1024,total_connections:2},max_runs:2};
+        let config=Config{profiles:List::new(vec![profile]).unwrap(),run_caps:RunCaps{total_bytes:1024,total_connections:2},max_runs:2,host_public_addresses:Vec::new()};
         let task=tokio::spawn(async move {serve_control(server,&config).await});
         let a=CheckedSocket::new(client.register(RunId([1;16]),id).await.unwrap()).unwrap();
         let b=CheckedSocket::new(client.register(RunId([2;16]),id).await.unwrap()).unwrap();

@@ -538,6 +538,23 @@ impl ApprovalBroker {
                 if !valid {
                     return Err("human operation authority revoked or expired".into());
                 }
+                // SR5 round 3 N1/N2: the approval's employee incarnation, in
+                // this same transaction (rule shared with `consume_approved`).
+                // Refused deterministically on every check; the operation
+                // never runs on a card of another incarnation or on a NULL
+                // card of a protected employee.
+                let (agent, stored): (String, Option<i64>) = tx
+                    .query_row(
+                        "SELECT agent_id,employee_incarnation FROM main.approvals WHERE id=?1",
+                        params![approval],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let home = tx.path().filter(|path| !path.is_empty())
+                    .and_then(|path| std::path::Path::new(path).parent());
+                if let Err((_, refusal)) = super::store::card_consumable(home, &agent, stored) {
+                    return Err(refusal);
+                }
                 if binding.run_origin_kind == "workflow" && binding.resume_handler == "workflow_v1"
                 {
                     let raw: String = tx

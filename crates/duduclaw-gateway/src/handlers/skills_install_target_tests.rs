@@ -177,6 +177,13 @@ fn sr5_approved_request_into_a_personal_employee_needs_its_owner() {
     };
     let alice: &'static str = Box::leak(h.alice.clone().into_boxed_str());
     let bob: &'static str = Box::leak(h.bob.clone().into_boxed_str());
+    // SR5 round 3 (nit): without a live tree the owner's request is refused
+    // and NO config-write row is written ahead of the refusal.
+    if !h.path().join("agents").join(PERSONAL).join("agent.toml").exists() {
+        assert_eq!(authorize_requested_write(h.path(), Some(&h.db), true, &write(alice)), Err(NOT_LIVE_TARGET));
+        assert!(h.db.query_audit_log(Some(alice), Some(WRITE_ACTION), 10).unwrap().is_empty());
+        live_tree(h.path(), PERSONAL);
+    }
     // The owner's request: allowed, audited as a config write naming the decider.
     assert_eq!(authorize_requested_write(h.path(), Some(&h.db), true, &write(alice)), Ok(()));
     let rows = h.db.query_audit_log(Some(alice), Some(WRITE_ACTION), 10).unwrap();
@@ -184,9 +191,10 @@ fn sr5_approved_request_into_a_personal_employee_needs_its_owner() {
     let detail: serde_json::Value = serde_json::from_str(rows[0].detail.as_deref().unwrap()).unwrap();
     assert_eq!((detail["decider_user_id"].as_str(), detail["owner_user_id"].as_str()), (Some("decider"), Some(alice)));
     // Anyone else's request (an Admin's included): refused, audited best effort.
+    let refused_before = h.db.query_audit_log(Some("decider"), Some(WRITE_REFUSED_ACTION), 10).unwrap().len();
     assert_eq!(authorize_requested_write(h.path(), Some(&h.db), true, &write(bob)), Err(REQUEST_NOT_OWNER));
     assert_eq!(authorize_requested_write(h.path(), Some(&h.db), true, &write("system")), Err(REQUEST_NOT_OWNER));
-    assert_eq!(h.db.query_audit_log(Some("decider"), Some(WRITE_REFUSED_ACTION), 10).unwrap().len(), 2);
+    assert_eq!(h.db.query_audit_log(Some("decider"), Some(WRITE_REFUSED_ACTION), 10).unwrap().len(), refused_before + 2);
     // No audit store: refused for the owner too (fail closed).
     assert!(authorize_requested_write(h.path(), None, true, &write(alice)).is_err());
     // Shared employee / unprotected: no ownership rule.

@@ -183,7 +183,7 @@ async fn iso_root_unregister_ack_follows_data_socket_eof() {
     let (a,b)=socketpair(AddressFamily::Unix,SockType::SeqPacket,None,SockFlag::SOCK_CLOEXEC).unwrap();
     let control=CheckedSocket::new(a).unwrap();
     let server=CheckedSocket::new(b).unwrap();
-    let config=duduclaw_egress::daemon::Config{profiles:List::new(vec![profile()]).unwrap(),run_caps:RunCaps{total_bytes:1024,total_connections:2},max_runs:1};
+    let config=duduclaw_egress::daemon::Config{profiles:List::new(vec![profile()]).unwrap(),run_caps:RunCaps{total_bytes:1024,total_connections:2},max_runs:1,host_public_addresses:Vec::new()};
     let task=tokio::spawn(async move { duduclaw_egress::daemon::serve_control(server,&config).await });
     let (data,endpoint)=sockets();
     let packet=ipc::encode(&Envelope{version:1,request_id:RequestId([1;16]),message:EgressControl::Register{run_id:RunId([1;16]),profile_id:profile().id}}).unwrap();
@@ -208,8 +208,15 @@ fn config_bounds_aggregate_tunnel_reservations() {
     let mut config = duduclaw_egress::daemon::Config {
         profiles: List::new(vec![profile()]).unwrap(),
         run_caps: RunCaps { total_bytes: 1024, total_connections: 2 }, max_runs: 64,
+        host_public_addresses: Vec::new(),
     };
     assert!(config.validate().is_ok()); // 64 * 16 = 1024
+    // SR5 round 3 N7b: the configured NAT address list is bounded.
+    config.host_public_addresses = vec!["203.0.114.50".parse().unwrap(); 65];
+    assert_eq!(config.validate(), Err(EgressError::ResourceLimit));
+    config.host_public_addresses.truncate(64);
+    assert!(config.validate().is_ok());
+    config.host_public_addresses.clear();
     config.max_runs = 65;
     assert_eq!(config.validate(), Err(EgressError::ResourceLimit));
     let mut large = profile();

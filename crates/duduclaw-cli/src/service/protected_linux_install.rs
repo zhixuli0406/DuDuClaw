@@ -489,9 +489,26 @@ fn managed_install() -> Result<bool> {
     }
 }
 
+/// SR5 round 3 N3: the root-owned durable fact of protected mode
+/// (`duduclaw_core::protected_mode::MODE_MARKER`). Written first on every
+/// protected install path and kept on uninstall: from then on the gateway and
+/// every MCP child are protected even when their environment lacks the flag.
+/// Only narrows; removing it is a deliberate root action.
+fn write_mode_marker() -> Result<()> {
+    // An existing /etc/duduclaw (egress / DNS broker config) keeps its mode.
+    match fs::symlink_metadata("/etc/duduclaw") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => mkdir("/etc/duduclaw", 0o755)?,
+        Ok(_) => { parents(Path::new("/etc/duduclaw"))?; trusted(Path::new("/etc/duduclaw"), true)? }
+        Err(error) => return Err(error.into()),
+    }
+    atomic_install(duduclaw_core::protected_mode::MODE_MARKER, 0o644,
+        |file| { file.write_all(b"native-systemd\n")?; Ok(()) })
+}
+
 pub(super) fn install(options: InstallOptions) -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
+    write_mode_marker()?;
     let version = duduclaw_gateway::updater::current_version();
     if managed_install()? {
         // The invoking CLI's templates may be older than F's committed

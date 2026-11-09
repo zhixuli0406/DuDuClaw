@@ -551,12 +551,14 @@ impl ApprovalBroker {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if let Some((agent, Some(stored))) = bound
-            && let Err(refusal) = super::store::card_incarnation_current(home.as_deref(), &agent, stored)
+        // SR5 round 3 N2: a card without an incarnation is checked too (a
+        // protected employee's NULL card is refused, never fail-open).
+        if let Some((agent, stored)) = bound
+            && let Err((reason, refusal)) = super::store::card_consumable(home.as_deref(), &agent, stored)
         {
             conn.execute(
                 "UPDATE approvals SET status='invalidated',invalidated_reason=?1 WHERE id=?2 AND status='approved'",
-                params![super::store::INCARNATION_CHANGED, id.as_str()],
+                params![reason, id.as_str()],
             )
             .map_err(|e| e.to_string())?;
             commit_live_write(conn)?;

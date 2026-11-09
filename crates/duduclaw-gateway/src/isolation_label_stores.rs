@@ -91,9 +91,11 @@ impl GateRefusal {
 
 // ── Protected mode ──────────────────────────────────────────────────────
 
-/// Protected mode as the neighbouring isolation code detects it
-/// (`DUDUCLAW_PROTECTED_KEY_MODE=native-systemd` on Linux). Tests force it
-/// per thread through [`TEST_PROTECTED`].
+/// Protected mode as the neighbouring isolation code detects it: SR5 round 3
+/// N3, the durable latch ([`duduclaw_core::protected_mode::active`] through
+/// `runtime_readiness::is_protected_linux`) — the environment flag OR a
+/// host-owned durable fact. Tests force it per thread through
+/// [`TEST_PROTECTED`].
 pub(crate) fn protected_active() -> bool {
     #[cfg(test)]
     if let Some(forced) = TEST_PROTECTED.with(std::cell::Cell::get) { return forced; }
@@ -277,6 +279,17 @@ fn subject_label(key: &str) -> &str { key.strip_prefix("agent:").unwrap_or(key) 
 pub(crate) fn check_label_writable(home: &Path, label: &str) -> Result<(), GateRefusal> {
     if !protected_active() { return Ok(()); }
     hold_allows_write(home, label)
+}
+
+/// SR5 round 3 N5: the refusal of a write-side member binding to `label`
+/// (`users.bind_agent`, `users.create_members`, the offboarding transfer).
+/// The auth crate's Personal guards read only the users.db owner mirror,
+/// which the tombstone removes while the sealed data is retained; this reads
+/// the lifecycle index: a quarantined label (open quarantine row), a
+/// tombstoned one, or an unreadable index is refused before auth is called.
+/// Protected mode only (`None` elsewhere, without I/O).
+pub(crate) fn bind_refusal(home: &Path, label: &str) -> Option<&'static str> {
+    check_label_writable(home, label).err().map(GateRefusal::message)
 }
 
 /// The writer gate's decision, without the protected-mode switch.

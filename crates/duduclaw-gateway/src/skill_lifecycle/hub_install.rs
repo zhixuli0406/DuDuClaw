@@ -281,8 +281,15 @@ async fn install_gated_locked(
         )
         .await
     } else {
-        let agent_skills_dir = home_dir.join("agents").join(scope).join("SKILLS");
-        duduclaw_agent::skill_loader::install_skill(&tmp_file, &agent_skills_dir, &quarantine_dir)
+        // SR5 round 3 N8: never conjure `agents/<scope>`; only SKILLS/ inside
+        // an existing employee tree is created.
+        if !duduclaw_core::is_valid_agent_id(scope) {
+            let _ = std::fs::remove_file(&tmp_file);
+            let _ = std::fs::remove_dir(&tmp_dir);
+            return Err("hub install DENIED: invalid employee scope".into());
+        }
+        let employee_dir = home_dir.join("agents").join(scope);
+        duduclaw_agent::skill_loader::install_skill_into_employee(&tmp_file, &employee_dir, &quarantine_dir)
             .await
     };
     let _ = std::fs::remove_file(&tmp_file);

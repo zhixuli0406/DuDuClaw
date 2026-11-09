@@ -670,13 +670,14 @@ pub async fn apply_install_request(
             } else {
                 // SR5 item 1: live employee only; `agents/<label>` is never created.
                 let dir = match target::live_employee_dir(home_dir, scope) {
-                    Ok(dir) => dir.join("SKILLS"),
+                    Ok(dir) => dir,
                     Err(e) => {
                         let _ = std::fs::remove_file(&tmp_file);
                         return Err(e.into());
                     }
                 };
-                duduclaw_agent::skill_loader::install_skill(&tmp_file, &dir, &quarantine).await
+                // SR5 round 3 N8: only SKILLS/ inside the checked tree is created.
+                duduclaw_agent::skill_loader::install_skill_into_employee(&tmp_file, &dir, &quarantine).await
             };
             let _ = std::fs::remove_file(&tmp_file);
             let parsed = result?;

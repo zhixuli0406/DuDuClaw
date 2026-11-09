@@ -120,6 +120,15 @@ impl ApprovalStore {
         Self::migrate(conn)?;
         Self::init_operations(conn)?;
         Self::migrate_workflow_authority(conn)?;
+        // SR5 round 3 N2: pre-SR5 cards of tombstoned / restored employees.
+        // Best effort at open (an unreadable lifecycle index must not keep
+        // the store closed); consumption refuses those cards regardless.
+        let home = conn.path().filter(|path| !path.is_empty()).map(Path::new).and_then(Path::parent);
+        match invalidate_unbound_cards(conn, home) {
+            Ok(0) => {}
+            Ok(count) => tracing::warn!(count, "invalidated approval cards without an employee incarnation"),
+            Err(error) => tracing::warn!(%error, "could not check approval cards without an employee incarnation"),
+        }
         commit_live_write(tx)
     }
 
@@ -824,6 +833,82 @@ pub(crate) fn card_incarnation_current(home: Option<&Path>, agent: &str, stored:
         Ok(_) => Err(INCARNATION_CHANGED.to_owned()),
         Err(_) => Err(crate::isolation_label_stores::LABEL_STATE_UNAVAILABLE.to_owned()),
     }
+}
+
+/// SR5 round 3 N2: refusal of a card without an incarnation (created before
+/// SR5 or outside protected mode) for an employee that now has a confirmed
+/// row while protected mode is on.
+pub(crate) const INCARNATION_MISSING: &str = "employee_incarnation_missing";
+
+/// SR5 round 3 N1/N2: the one consumption-time incarnation rule, used by all
+/// three consumers of an approved card (`consume_approved`,
+/// `action_grant::verify_and_consume`, the workflow `bound_human_approval`
+/// operation authority).
+///
+/// - a stored incarnation: [`card_incarnation_current`];
+/// - NULL, protected mode on and the employee has a confirmed row (live or
+///   disabled): refused ([`INCARNATION_MISSING`]) — never fail-open;
+/// - NULL otherwise (unprotected install, system / ephemeral / legacy agent,
+///   in-memory store): allowed as before. An unreadable lifecycle index in
+///   protected mode refuses.
+///
+/// `Err((reason, message))`: `reason` is what the card is invalidated with.
+pub(crate) fn card_consumable(home: Option<&Path>, agent: &str, stored: Option<i64>)
+    -> Result<(), (&'static str, String)> {
+    if let Some(stored) = stored {
+        return card_incarnation_current(home, agent, stored).map_err(|message| (INCARNATION_CHANGED, message));
+    }
+    if !crate::isolation_label_stores::protected_active() {
+        return Ok(());
+    }
+    let Some(home) = home else { return Ok(()) };
+    match crate::isolation_label_stores::confirmed_incarnation(home, agent) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err((INCARNATION_MISSING, INCARNATION_MISSING.to_owned())),
+        Err(_) => Err((INCARNATION_MISSING, crate::isolation_label_stores::LABEL_STATE_UNAVAILABLE.to_owned())),
+    }
+}
+
+/// SR5 round 3 N2: one-shot, idempotent invalidation of pre-SR5 cards. In
+/// protected mode, every `pending` / `approved` card WITHOUT an incarnation
+/// whose employee's confirmed row is disabled or has incarnation > 0 (the
+/// card may predate a tombstone or restore it can no longer be tied to) is
+/// invalidated with [`INCARNATION_MISSING`]. Re-running finds nothing more
+/// (new cards of confirmed employees always carry an incarnation), so it is
+/// safe at every store open; consumption-time [`card_consumable`] covers the
+/// remaining (live, incarnation 0) NULL cards. Runs inside the caller's
+/// schema transaction; touches no schema (the importer catalog is exact).
+/// Returns the number of cards invalidated.
+pub(crate) fn invalidate_unbound_cards(conn: &Connection, home: Option<&Path>) -> Result<usize, String> {
+    if !crate::isolation_label_stores::protected_active() {
+        return Ok(0);
+    }
+    let Some(home) = home else { return Ok(0) };
+    let agents: Vec<String> = {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT agent_id FROM approvals
+              WHERE employee_incarnation IS NULL AND status IN ('pending','approved') ORDER BY agent_id")
+            .map_err(|e| format!("read unbound approvals: {e}"))?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("read unbound approvals: {e}"))?;
+        rows.collect::<Result<_, _>>().map_err(|e| format!("read unbound approvals: {e}"))?
+    };
+    let mut invalidated = 0;
+    for agent in agents {
+        let stale = match crate::isolation_label_stores::confirmed_incarnation(home, &agent) {
+            Ok(Some((incarnation, disabled))) => disabled || incarnation > 0,
+            Ok(None) => false,
+            Err(_) => return Err(crate::isolation_label_stores::LABEL_STATE_UNAVAILABLE.to_owned()),
+        };
+        if stale {
+            invalidated += conn.execute(
+                "UPDATE approvals SET status='invalidated', invalidated_reason=?1
+                  WHERE agent_id=?2 AND employee_incarnation IS NULL AND status IN ('pending','approved')",
+                params![INCARNATION_MISSING, agent],
+            ).map_err(|e| format!("invalidate unbound approvals: {e}"))?;
+        }
+    }
+    Ok(invalidated)
 }
 
 #[cfg(test)]

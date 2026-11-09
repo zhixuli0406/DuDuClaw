@@ -158,12 +158,16 @@ fn sr5_approved_request_into_a_tombstoned_personal_employee_needs_its_owner() {
         decider: &f.bob, employee: LABEL };
     assert_eq!(authorize_requested_write(home, Some(&f.users), true, &foreign), Err(REQUEST_NOT_OWNER));
     assert_eq!(f.users.query_audit_log(Some(&f.bob), Some(WRITE_REFUSED_ACTION), 10).unwrap().len(), 1);
-    // The owner's own request passes the ownership check (audited as a
-    // config write); the live-employee check then refuses the tombstoned label.
+    // The owner's own request passes the ownership check, but the
+    // live-employee check refuses the tombstoned label. SR5 round 3 (nit):
+    // the config-write row is written only after that check succeeds, so no
+    // WRITE_ACTION row precedes this refusal (it is audited as refused).
     let own = RequestedWrite { method: "skills.install_request", request_id: "r2", requester: &f.alice,
         decider: &f.bob, employee: LABEL };
-    assert_eq!(authorize_requested_write(home, Some(&f.users), true, &own), Ok(()));
-    assert_eq!(f.users.query_audit_log(Some(&f.alice), Some(WRITE_ACTION), 10).unwrap().len(), 1);
+    assert_eq!(authorize_requested_write(home, Some(&f.users), true, &own),
+        Err(crate::handlers::skills_install_target::NOT_LIVE_TARGET));
+    assert!(f.users.query_audit_log(Some(&f.alice), Some(WRITE_ACTION), 10).unwrap().is_empty());
+    assert_eq!(f.users.query_audit_log(Some(&f.bob), Some(WRITE_REFUSED_ACTION), 10).unwrap().len(), 2);
 }
 
 // ── Item 3: approval cards ──────────────────────────────────────────────
@@ -231,9 +235,23 @@ async fn sr5_consume_refuses_a_card_of_another_incarnation() {
     approve(home, &fresh);
     assert_eq!(broker.consume_approved(&fresh, "apply").await, Ok(true));
     assert_eq!(broker.consume_approved(&fresh, "apply").await, Ok(false));
-    // Cards created outside protected mode carry none and behave as before.
+    // Cards created outside protected mode carry none. SR5 round 3 N2: such
+    // a legacy card is refused (and invalidated) for a protected employee
+    // once protected mode is on — NULL is never fail-open.
     let legacy = broker.request(LABEL, "mail_send", "s", json!({}), 3600).await.unwrap();
     assert_eq!(stored_incarnation(home, &legacy), None);
     approve(home, &legacy);
-    assert_eq!(broker.consume_approved(&legacy, "apply").await, Ok(true));
+    {
+        let _protected = Protected::on();
+        assert_eq!(broker.consume_approved(&legacy, "apply").await,
+            Err("employee_incarnation_missing".to_owned()));
+    }
+    let record = broker.get(&legacy).await.unwrap().unwrap();
+    assert_eq!(record.status, ApprovalStatus::Invalidated);
+    assert_eq!(record.invalidated_reason.as_deref(), Some("employee_incarnation_missing"));
+    // Outside protected mode a NULL card of a label without a confirmed row
+    // behaves as before.
+    let other = broker.request("team", "mail_send", "s", json!({}), 3600).await.unwrap();
+    approve(home, &other);
+    assert_eq!(broker.consume_approved(&other, "apply").await, Ok(true));
 }

@@ -457,8 +457,12 @@ impl UserDb {
     /// Change a user's login email. `email` must already have passed
     /// [`validate_account_email`]. An address another account already uses
     /// returns [`EMAIL_IN_USE`] and changes nothing.
-    pub fn change_email(&self, user_id: &str, email: &str) -> Result<(), String> {
-        self.change_email_stamped(user_id, email, false)
+    ///
+    /// SR5 round 3 N6: `actor` (the acting Admin, or the system component)
+    /// is recorded as the audit row's `user_id` and in its detail — never
+    /// NULL.
+    pub fn change_email(&self, actor: &str, user_id: &str, email: &str) -> Result<(), String> {
+        self.change_email_stamped(actor, user_id, email, false)
     }
 
     /// [`Self::change_email`] by the account holder in their own
@@ -466,10 +470,13 @@ impl UserDb {
     /// user_id`): the `credential_changes` row is stamped owner-authenticated
     /// in the same transaction (F6 Q3, F6d).
     pub fn change_own_email(&self, user_id: &str, email: &str) -> Result<(), String> {
-        self.change_email_stamped(user_id, email, true)
+        self.change_email_stamped(user_id, user_id, email, true)
     }
 
-    fn change_email_stamped(&self, user_id: &str, email: &str, by_owner: bool) -> Result<(), String> {
+    fn change_email_stamped(&self, actor: &str, user_id: &str, email: &str, by_owner: bool) -> Result<(), String> {
+        if actor.trim().is_empty() {
+            return Err("update error: email change requires an actor".to_string());
+        }
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn
@@ -501,12 +508,12 @@ impl UserDb {
         // SR5 item 4: every email change is audited in its own transaction
         // (the history row is written by the `account_email_history` trigger).
         let detail = serde_json::json!({
-            "old_email": previous, "new_email": email, "by_owner": by_owner,
+            "old_email": previous, "new_email": email, "by_owner": by_owner, "actor": actor,
         })
         .to_string();
         tx.execute(
             "INSERT INTO auth_audit_log (user_id, action, target, detail, ip, timestamp) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-            params![by_owner.then_some(user_id), EMAIL_CHANGED_ACTION, user_id, detail, now],
+            params![actor, EMAIL_CHANGED_ACTION, user_id, detail, now],
         )
         .map_err(|e| format!("update error: {e}"))?;
         // The email is part of the live context.
@@ -1319,16 +1326,37 @@ mod tests {
         db.create_user("b@example.com", "B", "password-b", UserRole::Employee)
             .unwrap();
 
-        db.change_email(&a.id, "a-new@example.com").unwrap();
+        db.change_email(&a.id, &a.id, "a-new@example.com").unwrap();
         assert!(db.verify_password("a-new@example.com", "password-a").is_ok());
         assert!(db.verify_password("a@example.com", "password-a").is_err());
 
         assert_eq!(
-            db.change_email(&a.id, "b@example.com").unwrap_err(),
+            db.change_email(&a.id, &a.id, "b@example.com").unwrap_err(),
             EMAIL_IN_USE
         );
         assert_eq!(db.get_user(&a.id).unwrap().unwrap().email, "a-new@example.com");
-        assert!(db.change_email("no-such-id", "c@example.com").is_err());
+        assert!(db.change_email(&a.id, "no-such-id", "c@example.com").is_err());
+    }
+
+    #[test]
+    fn sr5r3_admin_email_change_records_its_actor() {
+        let (db, _tmp) = test_db();
+        let admin = db.create_user("admin@example.com", "Admin", "password-a", UserRole::Admin).unwrap();
+        let user = db.create_user("u@example.com", "U", "password-u", UserRole::Employee).unwrap();
+        db.change_email(&admin.id, &user.id, "u-new@example.com").unwrap();
+        let rows = db.query_audit_log(Some(&admin.id), Some(EMAIL_CHANGED_ACTION), 10).unwrap();
+        assert_eq!(rows.len(), 1, "audited under the acting admin, not NULL");
+        assert_eq!(rows[0].target.as_deref(), Some(user.id.as_str()));
+        let detail: serde_json::Value = serde_json::from_str(rows[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!((detail["actor"].as_str(), detail["by_owner"].as_bool()), (Some(admin.id.as_str()), Some(false)));
+        // No row is left without an actor.
+        let unattributed: i64 = db.conn().query_row(
+            "SELECT count(*) FROM auth_audit_log WHERE action=?1 AND user_id IS NULL",
+            [EMAIL_CHANGED_ACTION], |row| row.get(0)).unwrap();
+        assert_eq!(unattributed, 0);
+        // A blank actor is refused before anything changes.
+        assert!(db.change_email(" ", &user.id, "u-other@example.com").is_err());
+        assert_eq!(db.get_user(&user.id).unwrap().unwrap().email, "u-new@example.com");
     }
 
     #[test]

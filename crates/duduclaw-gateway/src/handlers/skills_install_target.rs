@@ -135,6 +135,16 @@ pub(crate) fn authorize_requested_write(
         }
         return Err(REQUEST_NOT_OWNER);
     }
+    // SR5 round 3 (nit): the config-write audit row is written only once the
+    // target is a live employee tree, never ahead of a refusal (a tombstoned,
+    // quarantined or missing tree is refused and audited as refused).
+    if let Err(refusal) = live_employee_dir(home, write.employee) {
+        if let Some(db) = db {
+            let _ = db.log_action(Some(write.decider), WRITE_REFUSED_ACTION, Some(write.employee),
+                Some(detail.as_str()), None);
+        }
+        return Err(refusal);
+    }
     db.ok_or(AUDIT_FAILED_WRITE)?
         .log_action(Some(write.requester), WRITE_ACTION, Some(write.employee), Some(detail.as_str()), None)
         .map_err(|_| AUDIT_FAILED_WRITE)

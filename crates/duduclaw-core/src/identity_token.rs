@@ -114,7 +114,7 @@ mod tests_v2;
 mod tests_sr5;
 
 pub use lifecycle::{
-    protected_employee, AgentIncarnation, LifecycleUnavailable, ProtectedEmployee, APPLY_DB_DIR,
+    any_confirmed_employee, protected_employee, AgentIncarnation, LifecycleUnavailable, ProtectedEmployee, APPLY_DB_DIR,
     APPLY_DB_FILE,
 };
 
