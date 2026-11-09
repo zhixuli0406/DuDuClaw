@@ -29,6 +29,7 @@ import {
 import { timeAgo } from '@/lib/format';
 import { withParam, parseEnumParam } from '@/lib/url-params';
 import { toast } from '@/lib/toast';
+import { withBreakGlass } from '@/lib/break-glass';
 import {
   CollectionPageState,
   ErrorState,
@@ -163,7 +164,11 @@ export function MemoryBrowser({ agentId, query }: { agentId: string; query: stri
       if (!agentId) return;
       if (showSpinner) setLoading(true);
       try {
-        const res = await api.memory.browse(agentId, 200);
+        // v1.81 P1 break-glass; background refreshes never prompt.
+        const res = await withBreakGlass(
+          (token) => (token ? api.memory.browse(agentId, 200, token) : api.memory.browse(agentId, 200)),
+          { purpose: 'read', scope: agentId, interactive: showSpinner },
+        );
         setEntries([...(res?.entries ?? [])].sort(byRecency));
         setSignals([...(res?.signals ?? [])].sort(byRecency));
         setLoadError(null);
