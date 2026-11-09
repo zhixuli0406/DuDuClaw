@@ -9,6 +9,11 @@
 //! approval side-effect installs it (with its own re-scan). Security scan
 //! (deterministic ruleset incl. the prompt-injection pass) runs BEFORE
 //! submission and is fail-closed: High/Critical risk is refused outright.
+//!
+//! SFR: an isolated (protected) call never reaches this staging path; it is
+//! handled by `mcp_skill_jobs::handle_protected` (own finished recording,
+//! verified artifacts parsed only by E, E-scanned publication into the
+//! caller's own SKILLS). Only [`distill_with_model`] is shared.
 
 use std::path::Path;
 
@@ -555,7 +560,7 @@ pub(crate) fn summarize_desktop_events(jsonl: &str, max: usize) -> Vec<String> {
 
 // ── Distillation prompt ──────────────────────────────────────────────────────
 
-fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     let s: String = name
         .to_lowercase()
         .chars()
@@ -570,7 +575,7 @@ fn slugify(name: &str) -> String {
     }
 }
 
-fn is_valid_skill_slug(slug: &str) -> bool {
+pub(crate) fn is_valid_skill_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug.len() <= 64
         && slug
@@ -657,12 +662,44 @@ pub(crate) fn strip_md_fence(raw: &str) -> String {
 
 // ── skill_from_recording handler ─────────────────────────────────────────────
 
-fn rec_text(text: &str) -> Value {
+pub(crate) fn rec_text(text: &str) -> Value {
     serde_json::json!({ "content": [{"type": "text", "text": text}] })
 }
 
-fn rec_error(msg: &str) -> Value {
+pub(crate) fn rec_error(msg: &str) -> Value {
     serde_json::json!({ "content": [{"type": "text", "text": msg}], "isError": true })
+}
+
+/// The model step shared by every path: the employee's own utility runtime
+/// and model (autonomy-gated), fence stripping, a frontmatter check and the
+/// deterministic `<env:VAR>` backstop. `prompt` already fences all recorded
+/// material as data.
+pub(crate) async fn distill_with_model(home_dir: &Path, agent: &str, prompt: &str, env_placeholders: &[String])
+    -> Result<String, String> {
+    // Caller-derived, so `.ephemeral/` has to be part of the resolution: an
+    // `eph-*` role member's scaffold never sits at `agents/<id>`, and the bare
+    // join therefore handed `run_utility_prompt` a `None` agent dir (no
+    // per-agent runtime/model settings). Ordinary ids are unchanged.
+    let agent_dir = crate::mcp::caller_agent_dir(home_dir, agent);
+    let agent_dir_opt = agent_dir.is_dir().then_some(agent_dir.as_path());
+    let reply = crate::ai_session_guard::with_autonomous_utility_context(home_dir, agent,
+        duduclaw_gateway::runtime_dispatch::run_utility_prompt(home_dir, agent_dir_opt, "recording-distill", "",
+            prompt, duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS))
+        .await.map_err(|e| format!("蒸餾失敗（LLM 呼叫錯誤）：{e}"))?;
+    let mut skill_md = strip_md_fence(&reply);
+    if skill_md.len() < 40 || !skill_md.contains("name:") {
+        return Err("蒸餾結果不是有效的 SKILL.md（缺少 frontmatter），請重試。".into());
+    }
+    // Deterministic backstop: every recorded <env:VAR> must be visible to the
+    // operator even if the model dropped it.
+    let missing: Vec<&String> = env_placeholders.iter().filter(|p| !skill_md.contains(p.as_str())).collect();
+    if !missing.is_empty() {
+        skill_md.push_str("\n\n## 需要的環境變數（自動附註）\n");
+        for p in missing {
+            skill_md.push_str(&format!("- {p}\n"));
+        }
+    }
+    Ok(skill_md)
 }
 
 pub(crate) async fn handle_skill_from_recording(
@@ -671,24 +708,24 @@ pub(crate) async fn handle_skill_from_recording(
     agent: &str,
 ) -> Value {
     let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
-    // H12d: an isolated call distills its own finished protected recording
-    // (job store + brokered `employee-work` artifacts), never a host directory.
-    let isolated = crate::mcp_isolation::current().is_some();
-    if !(if isolated { duduclaw_isolation::recording_layout::valid_id(id) }
-        else { crate::mcp_recording::is_valid_recording_id(id) }) {
+    // H12d / SFR: an isolated call distills only its own finished protected
+    // recording (job store + verified brokered artifacts, parsed by E) and
+    // publishes into its own SKILLS; it never touches a host directory.
+    if crate::mcp_isolation::current().is_some() {
+        if !duduclaw_isolation::recording_layout::valid_id(id) {
+            return rec_error("skill_from_recording 需要有效的錄製 `id`。");
+        }
+        return crate::mcp_skill_jobs::handle_protected(args, home_dir, agent).await;
+    }
+    if !crate::mcp_recording::is_valid_recording_id(id) {
         return rec_error("skill_from_recording 需要有效的錄製 `id`。");
     }
     let dir = recording_dir(home_dir, id);
-    if !isolated && !dir.is_dir() {
+    if !dir.is_dir() {
         return rec_error(&format!("找不到錄製「{id}」。"));
     }
-    let protected = isolated || duduclaw_parse_worker::client::required();
-    let (meta, protected_input) = if isolated {
-        match crate::mcp_skill_jobs::recording_input(home_dir, args, agent).await {
-            Ok((meta, bytes)) => (meta, Some(bytes)),
-            Err(message) => return rec_error(message),
-        }
-    } else if protected {
+    let protected = duduclaw_parse_worker::client::required();
+    let (meta, protected_input) = if protected {
         let (home, id, agent) = (home_dir.to_owned(), id.to_owned(), agent.to_owned());
         let snapshot = tokio::task::spawn_blocking(move ||
             duduclaw_gateway::isolation_worker_plans::recording_snapshot(&home, &id, &agent)).await;
@@ -775,41 +812,10 @@ pub(crate) async fn handle_skill_from_recording(
         (prompt, env_placeholders, api_calls.len(), action_lines.len())
     };
 
-    // Caller-derived, so `.ephemeral/` has to be part of the resolution: an
-    // `eph-*` role member's scaffold never sits at `agents/<id>`, and the bare
-    // join therefore handed `run_utility_prompt` a `None` agent dir (no
-    // per-agent runtime/model settings). Ordinary ids are unchanged.
-    let agent_dir = crate::mcp::caller_agent_dir(home_dir, agent);
-    let agent_dir_opt = agent_dir.is_dir().then_some(agent_dir.as_path());
-    let reply = match crate::ai_session_guard::with_autonomous_utility_context(home_dir, agent, duduclaw_gateway::runtime_dispatch::run_utility_prompt(
-        home_dir,
-        agent_dir_opt,
-        "recording-distill",
-        "",
-        &prompt,
-        duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
-    ))
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return rec_error(&format!("蒸餾失敗（LLM 呼叫錯誤）：{e}")),
+    let skill_md = match distill_with_model(home_dir, agent, &prompt, &env_placeholders).await {
+        Ok(markdown) => markdown,
+        Err(error) => return rec_error(&error),
     };
-    let mut skill_md = strip_md_fence(&reply);
-    if skill_md.len() < 40 || !skill_md.contains("name:") {
-        return rec_error("蒸餾結果不是有效的 SKILL.md（缺少 frontmatter），請重試。");
-    }
-    // Deterministic backstop: every recorded <env:VAR> must be visible to the
-    // operator even if the model dropped it.
-    let missing: Vec<&String> = env_placeholders
-        .iter()
-        .filter(|p| !skill_md.contains(p.as_str()))
-        .collect();
-    if !missing.is_empty() {
-        skill_md.push_str("\n\n## 需要的環境變數（自動附註）\n");
-        for p in missing {
-            skill_md.push_str(&format!("- {p}\n"));
-        }
-    }
 
     // ── Fail-closed security scan (deterministic; incl. injection ruleset) ──
     let (scan_passed, scan_risk, scan_findings) = if protected {
@@ -827,10 +833,6 @@ pub(crate) async fn handle_skill_from_recording(
         })).collect::<Vec<_>>())
     };
     if !scan_passed || matches!(scan_risk.as_str(), "High" | "Critical") {
-        if isolated {
-            // H12d: no host recording directory exists; never create one.
-            return rec_error(&format!("蒸餾出的 SKILL.md 未通過隔離安全掃描（風險 {scan_risk}），已擋下不送審。"));
-        }
         if let Err(reason) = write_rejected_draft(home_dir, agent, &dir, &skill_md).await {
             return rec_error(&reason);
         }

@@ -179,9 +179,9 @@ fn signed(auth: &Authorization) -> Vec<&str> { auth.grant.tools.as_slice().iter(
 #[test]
 fn h10_file_workspace_never_signs_execution_tools() {
     // `employee-work` is also the A workspace handle. A grant selected for
-    // the file tools alone never signs the A/E tools it would enable: the
-    // pending `skill_from_recording`, the HX6 recording tools (no recording
-    // gate here) and — without spawnd's `helper_calls` — the HX5 in-run
+    // the file tools alone never signs the A/E tools it would enable:
+    // `skill_from_recording` and the HX6 recording tools (no recording gate
+    // here) and — without spawnd's `helper_calls` — the HX5 in-run
     // helpers too. (H12b
     // hub install is no longer pending: it rests on PublicOrigins, see h9.)
     let names = ["file_read", "browser_record_start", "browser_record_stop", "execute_program", "code_map",
@@ -319,6 +319,63 @@ fn hx6_recording_selector_requires_host_gate_and_public_web() {
     f.profile(false, "");
     let auth = f.issue(&["browser_record_start", "execute_program"]).unwrap();
     assert_eq!(signed(&auth), ["execute_program"]);
+}
+
+/// SFR: `skill_from_recording` is signed (and eligible) only with the
+/// recording gate's conditions — spawnd `helper_calls` + `helper_recording`,
+/// `[isolation] public_web`, an interactive run — and the profile allowing
+/// it; it never carries PublicOrigins. Production spawnd advertises no
+/// `helper_recording` (`RECORDING_BUILD_ENABLED` is off), so there it stays
+/// hidden even though boot installs the job store.
+#[test]
+fn sfr_skill_from_recording_hidden_when_recording_gate_off() {
+    use duduclaw_mcp_boundary::{recording_jobs::SqliteRecordingJobs, tool_policy::TestRecordingJobs};
+    let jobs = tempfile::tempdir().unwrap();
+    let store = SqliteRecordingJobs::open(&jobs.path().join("isolation-execution-jobs.db")).unwrap();
+    let _source = TestRecordingJobs::install(Some(Arc::new(crate::isolation_skill_jobs::StoredRecordings::new(store))));
+    let names = ["skill_from_recording", "tasks_update"];
+    let recording = SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING);
+    let (f, view) = helper_fixture(recording);
+    let hidden = |auth: &Authorization, why: &str| assert!(!eligible(&context(auth), "skill_from_recording"), "{why}");
+    // Gate open, admin switch off: no workspace, hidden.
+    let auth = f.issue(&names).unwrap();
+    assert!(!has(&auth, &workspace()));
+    hidden(&auth, "public_web off");
+    // Gate open, switch on: the brokered workspace, signed and eligible, no web grant.
+    f.profile(true, "");
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &workspace()) && auth.roots.is_brokered(EMPLOYEE_WORK_ROOT));
+    assert!(!any_public(&auth), "distilling reads stored artifacts; it needs no web authority");
+    assert_eq!(signed(&auth), names);
+    assert!(eligible(&context(&auth), "skill_from_recording"));
+    capability(&auth).canonical_bytes().unwrap();
+    // The gate closed (the production default) — helper calls without
+    // `helper_recording`, the bit without helper calls, nothing — also when
+    // another tool selects the same workspace: hidden, and not even signed.
+    for bits in [SpawndFeatures::HELPER_CALLS, SpawndFeatures::HELPER_RECORDING, SpawndFeatures::WORK_BROKER, SpawndFeatures::NONE] {
+        view.store(bits.0, Ordering::SeqCst);
+        hidden(&f.issue(&names).unwrap(), &format!("{bits:?}"));
+        let with_files = f.issue(&["skill_from_recording", "file_read", "tasks_update"]).unwrap();
+        assert!(has(&with_files, &workspace()));
+        assert_eq!(signed(&with_files), ["file_read", "tasks_update"], "{bits:?}");
+        hidden(&with_files, &format!("{bits:?} + file tools"));
+    }
+    view.store(recording.0, Ordering::SeqCst);
+    // The employee's own profile denial, or a task run: hidden.
+    f.profile(true, r#"denied_tools = ["skill_from_recording"]"#);
+    hidden(&f.issue(&names).unwrap(), "profile denies it");
+    f.profile(true, "");
+    f.tasks(&[("task-a", LABEL)]);
+    let auth = f.issue_task(&names, "task-a").unwrap();
+    assert!(!eligible(&context(&auth), "skill_from_recording"), "task runs never distill");
+    // Without the job store the signed tool is still not eligible.
+    let auth = f.issue(&names).unwrap();
+    let _none = TestRecordingJobs::install(None);
+    assert!(!eligible(&context(&auth), "skill_from_recording"), "no job store");
+    // The admin turning the switch off mid-issuance is a changed selector input.
+    drop(_none);
+    let off = during(&f, Box::new(|| f.profile(false, "")));
+    assert_eq!(f.issue_with(&off, &names, None).err(), Some(VerificationError::Revoked));
 }
 
 /// HX6: the boundary-side resolver answer for a recording call (Employee +

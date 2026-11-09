@@ -3,7 +3,9 @@ use crate::{resources::{test_broker::TestWorkBroker, WorkBrokerError}, tool_poli
     TestRecordingJobs, ToolPolicy, RecordingArtifact, RecordingJobs}, RequestContext};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord, EmployeeBinding, Lane,
     LiveRequestVerifier, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest}};
+use crate::recording_jobs::ArtifactError;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 const RUN: RunId = RunId([3; 16]);
@@ -74,8 +76,9 @@ fn h12d_recording_reader_uses_published_layout() {
     let (context, _) = live(EMPLOYEE);
     let call = call(&context, &id);
     for name in ["actions.json", "network.json"] {
-        let bytes = roots.read_recording_artifact(&call, &manifest, name).unwrap();
-        assert_eq!(bytes, format!("{{\"{name}\":[]}}").into_bytes());
+        let verified = roots.read_recording_artifact(&call, &manifest, name).unwrap();
+        assert_eq!(verified.name(), name);
+        assert_eq!(verified.into_bytes(), format!("{{\"{name}\":[]}}").into_bytes());
     }
     assert_eq!(broker.calls(), vec![(RUN, EMPLOYEE, format!("recordings/{id}/actions.json")),
         (RUN, EMPLOYEE, format!("recordings/{id}/network.json"))]);
@@ -105,10 +108,18 @@ fn h12d_recording_reader_refuses_tampered_foreign_or_ended() {
     roots.insert_brokered(EMPLOYEE_WORK_ROOT.into(), EMPLOYEE, broker.clone()).unwrap();
     let (context, flag) = live(EMPLOYEE);
     let call = call(&context, &id);
-    // The same-run employee rewrote the artifact after the helper finished.
-    std::fs::write(dir.path().join(recording_layout::artifact_path(&id, "actions.json").unwrap()), b"{\"actions\":[1]}").unwrap();
+    // The same-run employee rewrote the artifact after the helper finished:
+    // a different size, and (SFR) the same size with other bytes. Both are
+    // `artifact_modified` from `recording_jobs::verify_artifact`.
+    let actions = dir.path().join(recording_layout::artifact_path(&id, "actions.json").unwrap());
+    std::fs::write(&actions, b"{\"actions\":[1]}").unwrap();
     assert_eq!(roots.read_recording_artifact(&call, &manifest, "actions.json").err(),
-        Some(FileRefusal::Verification(VerificationError::BindingMismatch)));
+        Some(FileRefusal::Artifact(ArtifactError::Modified)));
+    std::fs::write(&actions, b"{\"actions.jsoX\":[]}").unwrap();
+    let refusal = roots.read_recording_artifact(&call, &manifest, "actions.json").err().unwrap();
+    assert_eq!(refusal, FileRefusal::Artifact(ArtifactError::Modified));
+    assert_eq!((refusal.artifact().map(ArtifactError::code), refusal.verification()),
+        (Some("artifact_modified"), VerificationError::BindingMismatch));
     // A manifest of another recording cannot be paired with this call.
     let other = RecordingManifest { id: "7c".repeat(16), ..manifest.clone() };
     assert!(roots.read_recording_artifact(&call, &other, "network.json").is_err());

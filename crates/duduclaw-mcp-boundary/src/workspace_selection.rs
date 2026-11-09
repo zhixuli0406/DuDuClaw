@@ -7,7 +7,9 @@
 //! the grant alone would make every listed tool that needs a Workspace
 //! eligible: other execution tools (discovery, forks) and the
 //! workspace-scoped E services. HX6: the browser recording tools are signed
-//! only with their own recording selector (`drops_from_signed_with`). (H13
+//! only with their own recording selector (`drops_from_signed_with`); SFR:
+//! `skill_from_recording` only with its own (`RECORDING_DISTILL_TOOLS`, the
+//! same host gate). (H13
 //! `spawn_agent` / `spawn_ephemeral` need only the Employee grant and are not
 //! affected.) No selector chose a
 //! workspace for them, so the issuer must not sign them: they stay hidden and
@@ -24,11 +26,31 @@ use crate::tool_policy::{employee_service_scope, policy, ResourceKind, Route, IN
 /// on the run's own Employee grant, no Workspace); H12b/H12c removed
 /// `skill_hub_install` (own Employee + PublicOrigins) and `skill_synthesis_run`
 /// (own Employee only); HX6 removed `browser_record_start` /
-/// `browser_record_stop` (own recording selector). None of them may be added
-/// back here. `skill_from_recording` stays until H12d's `RecordingJobs` seam
-/// is wired to HX6's `recording_jobs` (N4 / VerifiedArtifact tripwire).
+/// `browser_record_stop` (own recording selector); SFR removed
+/// `skill_from_recording` (H12d's `RecordingJobs` seam is installed over HX6's
+/// store at boot, every artifact goes through `verify_artifact`, and its own
+/// selector [`RECORDING_DISTILL_TOOLS`] signs it only behind the recording
+/// gate). None of them may be added back here.
 pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &["inspect_branches", "diff_branches", "fork_cost", "discovery_catalog", "discovery_list", "discovery_tree", "discovery_artifact",
-    "discovery_cancel", "skill_from_recording"];
+    "discovery_cancel"];
+
+/// SFR: distilling a recording needs the brokered workspace that holds the
+/// recordings, and is offered only where recording is available (the HX6
+/// gate: spawnd `helper_calls` + `helper_recording`, the employee's
+/// `[isolation] public_web`, an interactive run) and the profile allows it.
+pub const RECORDING_DISTILL_TOOLS: &[&str] = &["skill_from_recording"];
+
+/// Which issuer selectors chose the `Workspace { employee-work }` grant for
+/// non-File tools. Each one signs exactly its own tool set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkspaceSelectors {
+    /// HX5: `IN_RUN_HELPER_TOOLS`.
+    pub helpers: bool,
+    /// HX6: `IN_RUN_RECORDING_TOOLS`.
+    pub recording: bool,
+    /// SFR: [`RECORDING_DISTILL_TOOLS`].
+    pub distill: bool,
+}
 
 /// Whether a signed `Workspace` grant is what would make `name` eligible on a
 /// non-File route. `employee_scope` is true when the record keeps its
@@ -57,9 +79,16 @@ pub fn drops_from_signed(name: &str, employee_scope: bool, helpers: bool) -> boo
 /// egress switch, an interactive run). Then exactly `IN_RUN_RECORDING_TOOLS`
 /// are signed as well.
 pub fn drops_from_signed_with(name: &str, employee_scope: bool, helpers: bool, recording: bool) -> bool {
+    drops_from_signed_selected(name, employee_scope, WorkspaceSelectors { helpers, recording, distill: false })
+}
+
+/// [`drops_from_signed_with`] plus the SFR distill selector: with `distill`
+/// exactly [`RECORDING_DISTILL_TOOLS`] are signed as well.
+pub fn drops_from_signed_selected(name: &str, employee_scope: bool, selected: WorkspaceSelectors) -> bool {
     if PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&name) { return true; }
-    if helpers && IN_RUN_HELPER_TOOLS.contains(&name) { return false; }
-    if recording && IN_RUN_RECORDING_TOOLS.contains(&name) { return false; }
+    if selected.helpers && IN_RUN_HELPER_TOOLS.contains(&name) { return false; }
+    if selected.recording && IN_RUN_RECORDING_TOOLS.contains(&name) { return false; }
+    if selected.distill && RECORDING_DISTILL_TOOLS.contains(&name) { return false; }
     needs_execution_workspace(name, employee_scope)
 }
 
@@ -85,7 +114,8 @@ mod tests {
             }
         }
         // H12b/H12c: routed on the own Employee grant (+ PublicOrigins for the
-        // hub), never on a Workspace; H12d's recording tool stays pending.
+        // hub), never on a Workspace; H12d's recording tool has its own
+        // selector (SFR, `sfr_skill_from_recording_signed_only_with_distill_selector`).
         for tool in ["skill_hub_install", "skill_synthesis_run"] {
             assert!(!policy(tool).expect(tool).required.contains(&ResourceKind::Workspace), "{tool}");
             assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
@@ -93,7 +123,7 @@ mod tests {
                 assert!(!drops_from_signed(tool, scoped, helpers), "{tool}");
             }
         }
-        assert!(PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording"));
+        assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording"));
         for tool in ["file_read", "csv_read", "xlsx_read", "tasks_update", "computer_session_start",
             "computer_login", "skill_curator_status", "unknown_tool"] {
             assert!(!needs_execution_workspace(tool, true), "{tool}");
@@ -158,6 +188,33 @@ mod tests {
             .collect();
         newly.sort_unstable();
         assert_eq!(newly, vec!["browser_record_start", "browser_record_stop"]);
-        assert!(drops_from_signed_with("skill_from_recording", true, true, true), "still pending (H12d)");
+        assert!(drops_from_signed_with("skill_from_recording", true, true, true), "only its own selector signs it");
+    }
+
+    /// SFR: `skill_from_recording` left the pending list (the list is now the
+    /// fork/discovery readers only) and is signed exactly with its own distill
+    /// selector, never by the helper or recording bits.
+    #[test]
+    fn sfr_skill_from_recording_signed_only_with_distill_selector() {
+        assert_eq!(RECORDING_DISTILL_TOOLS, ["skill_from_recording"]);
+        let mut pending = PENDING_WORKSPACE_SELECTOR_TOOLS.to_vec();
+        pending.sort_unstable();
+        assert_eq!(pending, ["diff_branches", "discovery_artifact", "discovery_cancel", "discovery_catalog",
+            "discovery_list", "discovery_tree", "fork_cost", "inspect_branches"], "fork/discovery readers only");
+        let tool = "skill_from_recording";
+        assert!(needs_execution_workspace(tool, true) && needs_execution_workspace(tool, false));
+        for scoped in [true, false] {
+            for (helpers, recording) in [(false, false), (true, false), (false, true), (true, true)] {
+                let without = WorkspaceSelectors { helpers, recording, distill: false };
+                assert!(drops_from_signed_selected(tool, scoped, without), "{scoped} {without:?}");
+                assert!(!drops_from_signed_selected(tool, scoped, WorkspaceSelectors { distill: true, ..without }));
+            }
+        }
+        // The distill bit signs nothing else.
+        let distill = WorkspaceSelectors { distill: true, ..WorkspaceSelectors::default() };
+        let newly: Vec<_> = crate::tool_policy::POLICIES.iter().map(|policy| policy.name)
+            .filter(|name| drops_from_signed_selected(name, true, WorkspaceSelectors::default())
+                && !drops_from_signed_selected(name, true, distill)).collect();
+        assert_eq!(newly, vec![tool]);
     }
 }

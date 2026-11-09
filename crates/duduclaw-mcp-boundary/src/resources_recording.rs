@@ -3,23 +3,26 @@
 //! The artifacts live in the employee's own `employee-work` root, at the one
 //! layout the recording helper publishes (`recording_layout::artifact_path`).
 //! They are opened only through root's work broker for the call's live run and
-//! employee (never a host path), and must match the job store's manifest
-//! (size and SHA-256) before any byte reaches a parser.
+//! employee (never a host path). SFR: the bytes come back only as a
+//! `recording_jobs::VerifiedArtifact`, produced by `recording_jobs::verify_artifact`
+//! against the job store's digests (size and SHA-256). A verified artifact is
+//! still untrusted content (the recorded page chose it); it is only ever
+//! parsed by E (`isolation_skill_jobs::summarize_recording`).
 use std::io::Read;
-use sha2::{Digest, Sha256};
 use duduclaw_isolation::recording_layout;
 use super::{selected_workspace_grant, verify_brokered, AuthorizedFile, CallBinding, FileRefusal, ResourceRoots,
     VerificationError, WorkFileRequest, WorkRelativePath, BROKERED_FILE_MAX_BYTES, EMPLOYEE_WORK_ROOT};
-use crate::tool_policy::{AuthorizedToolCall, RecordingManifest};
+use crate::{recording_jobs::{verify_artifact, VerifiedArtifact}, tool_policy::{AuthorizedToolCall, RecordingManifest}};
 
 impl ResourceRoots {
     /// Read `artifact` of the recording named by this `skill_from_recording`
     /// call. `manifest` must be the job store's evidence for that same id.
     /// Refuses another tool, another id, an artifact outside the manifest, a
     /// call without exactly its own brokered workspace, and any size/digest
-    /// mismatch. Root's refusals keep their typed `WorkBrokerError`.
+    /// mismatch (`FileRefusal::Artifact`). Root's refusals keep their typed
+    /// `WorkBrokerError`.
     pub fn read_recording_artifact(&self, call: &AuthorizedToolCall, manifest: &RecordingManifest, artifact: &str)
-        -> Result<Vec<u8>, FileRefusal> {
+        -> Result<VerifiedArtifact, FileRefusal> {
         if call.name() != "skill_from_recording" { return Err(VerificationError::BindingMismatch.into()); }
         let id = call.arguments().get("id").and_then(serde_json::Value::as_str).ok_or(VerificationError::Invalid)?;
         if manifest.id != id { return Err(VerificationError::BindingMismatch.into()); }
@@ -41,15 +44,13 @@ impl ResourceRoots {
         // The run may have ended while root was opening the file.
         context.verify_live(crate::authority::now_seconds()?)?;
         let mut input = AuthorizedFile::from_opened(CallBinding::new(call), grant, file)?;
-        if input.metadata()?.len() != expected.bytes { return Err(VerificationError::BindingMismatch.into()); }
+        let modified = || FileRefusal::Artifact(crate::recording_jobs::ArtifactError::Modified);
+        if input.metadata()?.len() != expected.bytes { return Err(modified()); }
         let mut bytes = Vec::new();
         // Every read re-checks live authority (AuthorizedFile's Read).
         (&mut input).take(expected.bytes + 1).read_to_end(&mut bytes).map_err(|_| VerificationError::Unavailable)?;
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        if bytes.len() as u64 != expected.bytes || digest != expected.sha256 {
-            return Err(VerificationError::BindingMismatch.into());
-        }
-        Ok(bytes)
+        // [F11] The one digest check; the bytes exist after it only verified.
+        verify_artifact(&manifest.digests(), artifact, bytes).map_err(FileRefusal::Artifact)
     }
 }
 

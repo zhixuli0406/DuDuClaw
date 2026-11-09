@@ -627,7 +627,7 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
     };
     #[cfg(any(test, feature = "test-support"))]
     let host_broker = sources.work_broker.take();
-    Ok(BootOwner { generation: sources.installed_generation.ok_or(VerificationError::Unavailable)?, fork_tools, execution_jobs, recording_jobs, product_authority: sources.product_authority, home: home.to_owned(), backend: backend.clone(), boundary, bindings, worker,
+    let owner = BootOwner { generation: sources.installed_generation.ok_or(VerificationError::Unavailable)?, fork_tools, execution_jobs, recording_jobs, product_authority: sources.product_authority, home: home.to_owned(), backend: backend.clone(), boundary, bindings, worker,
         registry: sources.runtime_registry.take().ok_or(VerificationError::Unavailable)?,
         main_plans: sources.main_plans.take().ok_or(VerificationError::Unavailable)?,
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,
@@ -642,7 +642,12 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
             selectors
         },
         catalog: sources.connector_catalog, connectors: sources.connectors,
-        connector_selection: sources.connector_selection, connector_stack: sources.connector_stack })
+        connector_selection: sources.connector_selection, connector_stack: sources.connector_stack };
+    // SFR: HX6's recording store becomes H12d's `skill_from_recording` source
+    // (owner-keyed reads, verified artifacts), after every fallible producer.
+    // The tool is still signed only behind the recording gate (selectors).
+    crate::isolation_skill_jobs::install_recording_source(owner.recording_jobs.clone())?;
+    Ok(owner)
 }
 
 pub(super) async fn claude_plan(home: PathBuf, agent: String, class: duduclaw_isolation::execution::ExecutionClass,

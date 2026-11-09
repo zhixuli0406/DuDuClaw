@@ -229,6 +229,11 @@ pub enum ParseOptions {
     SkillIdentity { name: Text<64> },
     SynthesizedSkill { agent: Text<64>, at: Text<64> },
     Recording { desktop: bool, name: Text<64> },
+    /// SFR: a protected recording's three verified artifacts, framed by
+    /// `recording_layout::bundle` (one Archive input). The worker parses the
+    /// frame, the trace archive (caps, no traversal, no symlinks) and the
+    /// JSON artifacts; the host never does.
+    RecordingArtifacts { name: Text<64> },
     SkillScan { must_not: List<Text<1024>, 128> },
     SkillPrepare { action: SkillAction, agent: Text<64>, at: Text<64>, must_not: List<Text<1024>, 128> },
 }
@@ -319,7 +324,7 @@ impl ParseRequest {
                     && !at.as_str().is_empty() => {},
             (ParseOperation::InspectSkillManifest, Some(ParseOptions::SkillManifest { name }))
                 if !name.as_str().is_empty() && name.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => {},
-            (ParseOperation::SummarizeRecording, Some(ParseOptions::Recording { name, .. }))
+            (ParseOperation::SummarizeRecording, Some(ParseOptions::Recording { name, .. } | ParseOptions::RecordingArtifacts { name }))
                 if !name.as_str().is_empty() && name.as_str().bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') => {},
             (ParseOperation::ExtractSkill, Some(ParseOptions::SkillKnowledge { name, agent, at }))
                 if !name.as_str().is_empty() && !agent.as_str().is_empty() && !at.as_str().is_empty() => {},
@@ -775,6 +780,21 @@ mod adapter_tests {
         rich.options = Some(ParseOptions::Knowledge { format: KnowledgeFormat::Csv, max_chars: 0 });
         rich.operation = ParseOperation::ExtractKnowledge;
         assert!(rich.validate().is_err());
+    }
+    #[test]
+    fn sfr_recording_artifacts_options_bind_the_summarize_operation() {
+        let options = || Some(ParseOptions::RecordingArtifacts { name: Text::new("form-notes".into()).unwrap() });
+        let mut request = request(ParseOperation::SummarizeRecording, options());
+        assert!(request.validate().is_ok());
+        request.options = Some(ParseOptions::RecordingArtifacts { name: Text::new("../x".into()).unwrap() });
+        assert!(request.validate().is_err(), "the skill name is a slug, never a path");
+        for operation in [ParseOperation::ExtractPackArchive, ParseOperation::ScanSkill, ParseOperation::ExtractDocument] {
+            assert!(self::request(operation, options()).validate().is_err(), "{operation:?}");
+        }
+        // A recording summary is the only result kind for it.
+        let request = self::request(ParseOperation::SummarizeRecording, options());
+        let text = response(&request, ParsedItem::Text { input_slot: 0, page: None, text: Text::new("x".into()).unwrap() });
+        assert!(text.validate_for(&request).is_err());
     }
     #[test]
     fn rich_result_text_and_character_limits_include_metadata() {

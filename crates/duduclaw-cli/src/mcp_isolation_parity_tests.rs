@@ -137,8 +137,10 @@ fn pending_production_selectors() -> BTreeSet<String> {
     // Employee grant (live delegation/binding/task checks per call).
     // H12b/H12c removed skill_hub_install (own Employee + the issuer's
     // PublicOrigins) and skill_synthesis_run (own Employee). HX6 removed
-    // browser_record_start/stop (own recording selector). skill_from_recording
-    // stays: H12d's `RecordingJobs` seam is not yet wired to HX6's job store.
+    // browser_record_start/stop (own recording selector). SFR removed
+    // skill_from_recording (own distill selector behind the recording gate,
+    // H12d's seam installed over HX6's store, verified artifacts only), the
+    // last own-skill/recording tool on the list.
     let pending: BTreeSet<String> = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS
         .iter().map(|tool| (*tool).to_owned()).collect();
     for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS {
@@ -153,130 +155,52 @@ fn pending_production_selectors() -> BTreeSet<String> {
     for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_RECORDING_TOOLS {
         assert!(!pending.contains(tool), "{tool}: HX6 in-run recording has its selector");
     }
-    // HX6 N4: stays until H12d's RecordingJobs seam is wired with verified
-    // artifacts (`hx6fix_skill_from_recording_leaves_pending_only_with_verify_artifact`).
-    assert!(pending.contains("skill_from_recording"), "skill_from_recording: no protected route yet");
+    // SFR: no own-skill, recording or helper tool is left. What remains are
+    // the fork/discovery readers (their own selector work, outside SFR).
+    assert!(!pending.contains("skill_from_recording"), "skill_from_recording has its own distill selector");
+    for tool in &pending {
+        assert!(FORK_DISCOVERY_READERS.contains(&tool.as_str()), "{tool}: unexpected pending selector gap");
+    }
     pending
 }
 
-/// HX6 security fix round (finding 7): `skill_from_recording` may leave the
-/// pending selector list only together with H12d's verification seam — its
-/// production handler must compare every artifact it reads with the stored
-/// sha256 (`recording_jobs::verify_artifact` ⇒ `artifact_modified`), because
-/// the runtime can rewrite `/work/recordings/<id>/*` at any time [F11]. This
-/// tripwire fails as soon as the tool leaves the list while the handler's
-/// production code (outside its `#[cfg(test)]` module) never calls it.
-///
-/// Round 3: the scan runs on the code with every comment and string literal
-/// removed (a comment or message mentioning the call no longer satisfies
-/// it), and the call itself is a type seam: `verify_artifact` takes the bytes
-/// by value and returns them only inside a `VerifiedArtifact`, which nothing
-/// else can construct, so the distill step's input can only be verified bytes.
+/// The pending list's remaining entries (fork/discovery readers). When their
+/// selectors land this set and `PENDING_WORKSPACE_SELECTOR_TOOLS` are empty.
+const FORK_DISCOVERY_READERS: [&str; 8] = ["inspect_branches", "diff_branches", "fork_cost", "discovery_catalog",
+    "discovery_list", "discovery_tree", "discovery_artifact", "discovery_cancel"];
+
+/// HX6 security fix round (finding 7), SFR form: `skill_from_recording` left
+/// the pending list, so its distill step must be fed only artifacts that
+/// matched the job store's digests [F11] (the runtime can rewrite
+/// `/work/recordings/<id>/*` at any time). This is enforced by types, which
+/// the compiler checks here (no source-text scan):
+/// 1. `recording_jobs::verify_artifact` is the only constructor of
+///    `VerifiedArtifact` (bytes in by value, verified bytes out);
+/// 2. the brokered reader returns only `VerifiedArtifact`s;
+/// 3. a `VerifiedRecording` is built only from three `VerifiedArtifact`s;
+/// 4. the gateway reader yields a `VerifiedRecording`, and the distill step
+///    (E summarizer) takes a `VerifiedRecording` — in the gateway and in the
+///    CLI's protected handler — so unverified bytes cannot reach it.
 #[test]
 fn hx6fix_skill_from_recording_leaves_pending_only_with_verify_artifact() {
-    let pending = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording");
-    let code = strip_comments_and_strings(include_str!("mcp_recording_distill.rs"));
-    let production = code.split("#[cfg(test)]").next().unwrap_or_default();
-    assert!(production.contains("fn handle_skill_from_recording"), "the scanned file holds the production handler");
-    let verifies = production.contains("recording_jobs::verify_artifact(");
-    // The seam's shape is checked by the compiler: bytes in by value, verified bytes out.
-    let _seam: fn(&[duduclaw_mcp_boundary::recording_jobs::ArtifactDigest], &str, Vec<u8>)
-        -> Result<duduclaw_mcp_boundary::recording_jobs::VerifiedArtifact, duduclaw_mcp_boundary::recording_jobs::ArtifactError>
+    use duduclaw_gateway::isolation_skill_jobs::{self as jobs, VerifiedRecording};
+    use duduclaw_mcp_boundary::{recording_jobs::{ArtifactDigest, ArtifactError, VerifiedArtifact},
+        resources::{FileRefusal, ResourceRoots}, tool_policy::RecordingManifest};
+    use duduclaw_parse_worker::worker::{ParseError, RecordingSummary};
+    let _verify: fn(&[ArtifactDigest], &str, Vec<u8>) -> Result<VerifiedArtifact, ArtifactError>
         = duduclaw_mcp_boundary::recording_jobs::verify_artifact;
-    assert!(pending || verifies,
-        "skill_from_recording was signed (left PENDING_WORKSPACE_SELECTOR_TOOLS) but its production handler never calls \
-         duduclaw_mcp_boundary::recording_jobs::verify_artifact on the artifacts it reads");
-    // The protected listing agrees with the list: pending ⇒ never eligible in the fixture.
-    assert_eq!(pending, pending_production_selectors().contains("skill_from_recording"));
-}
-
-/// Rust source with comments (line, doc, nested block) and string/char
-/// literals (incl. raw and byte strings) replaced by nothing / `""`, for
-/// tripwires that must only see code. Lifetimes are kept.
-fn strip_comments_and_strings(source: &str) -> String {
-    let chars: Vec<char> = source.chars().collect();
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0;
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
-    // `r"`, `r#"`, `br##"` … at `at`: (index after the opening quote, hash count).
-    let raw_start = |at: usize| -> Option<(usize, usize)> {
-        if at > 0 && ident(chars[at - 1]) { return None; }
-        let mut j = match (chars.get(at), chars.get(at + 1)) {
-            (Some('r'), _) => at + 1,
-            (Some('b'), Some('r')) => at + 2,
-            _ => return None,
-        };
-        let mut hashes = 0;
-        while chars.get(j) == Some(&'#') { hashes += 1; j += 1; }
-        (chars.get(j) == Some(&'"')).then_some((j + 1, hashes))
-    };
-    while i < chars.len() {
-        let (c, next) = (chars[i], chars.get(i + 1).copied());
-        if let Some((start, hashes)) = raw_start(i) {
-            let mut j = start;
-            while j < chars.len() && !(chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#'))) { j += 1; }
-            i = j + 1 + hashes;
-            out.push_str("\"\"");
-        } else if c == '/' && next == Some('/') {
-            while i < chars.len() && chars[i] != '\n' { i += 1; }
-        } else if c == '/' && next == Some('*') {
-            let mut depth = 0usize;
-            while i < chars.len() {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') { depth += 1; i += 2; }
-                else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') { depth -= 1; i += 2; if depth == 0 { break; } }
-                else { i += 1; }
-            }
-            out.push(' ');
-        } else if c == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != '"' { if chars[i] == '\\' { i += 1; } i += 1; }
-            i += 1;
-            out.push_str("\"\"");
-        } else if c == '\'' && next == Some('\\') {
-            // Escaped char literal: '\n', '\'', '\u{..}' (skip the quote, backslash and escaped char).
-            i += 3;
-            while i < chars.len() && chars[i] != '\'' { i += 1; }
-            i += 1;
-            out.push_str("' '");
-        } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
-            i += 3;
-            out.push_str("' '");
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    out
-}
-
-/// HX6 round 3: the tripwire's scanner sees code only — a mention of the
-/// call in a comment, doc comment, block comment or string does not count,
-/// a real call does, and test modules stay excluded.
-#[test]
-fn hx6r3_tripwire_scan_ignores_comments_and_strings() {
-    let call = "recording_jobs::verify_artifact(";
-    let fake = r####"
-        // recording_jobs::verify_artifact(&digests, name, bytes)
-        /// recording_jobs::verify_artifact(
-        /* outer /* recording_jobs::verify_artifact( */ still comment */
-        fn handle_skill_from_recording() {
-            let message = "recording_jobs::verify_artifact(";
-            let raw = r#"recording_jobs::verify_artifact("#;
-            let quote = '"'; let escaped = '\''; let s = "a \" recording_jobs::verify_artifact(";
-            fn lifetime<'a>(x: &'a str) -> &'a str { x }
-        }
-    "####;
-    let stripped = strip_comments_and_strings(fake);
-    assert!(!stripped.contains(call), "{stripped}");
-    assert!(stripped.contains("fn handle_skill_from_recording") && stripped.contains("fn lifetime<'a>(x: &'a str)"), "{stripped}");
-    let real = "fn handle_skill_from_recording() { let ok = duduclaw_mcp_boundary::recording_jobs::verify_artifact(&d, \"trace.zip\", b); }";
-    assert!(strip_comments_and_strings(real).contains(call));
-    let in_test = "fn handle_skill_from_recording() {}\n#[cfg(test)]\nmod tests { fn t() { recording_jobs::verify_artifact(&d, n, b); } }";
-    let production = strip_comments_and_strings(in_test);
-    assert!(!production.split("#[cfg(test)]").next().unwrap().contains(call));
-    // A `#[cfg(test)]` inside a comment does not cut the scan short.
-    let commented = "// #[cfg(test)]\nfn handle_skill_from_recording() { recording_jobs::verify_artifact(&d, n, b); }";
-    assert!(strip_comments_and_strings(commented).split("#[cfg(test)]").next().unwrap().contains(call));
+    let _read: fn(&ResourceRoots, &AuthorizedToolCall, &RecordingManifest, &str) -> Result<VerifiedArtifact, FileRefusal>
+        = ResourceRoots::read_recording_artifact;
+    let _assemble: fn(&str, [VerifiedArtifact; 3]) -> Result<VerifiedRecording, ArtifactError> = VerifiedRecording::new;
+    let _input: fn(&AuthorizedToolCall, &ResourceRoots) -> Result<(RecordingManifest, VerifiedRecording), FileRefusal>
+        = jobs::recording_artifacts;
+    let _distill: fn(VerifiedRecording, &str) -> Result<RecordingSummary, ParseError> = jobs::summarize_recording;
+    // The CLI's protected handler: its input is the verified recording, and
+    // its distill step accepts nothing else.
+    fn _protected_input(input: crate::mcp_skill_jobs::ProtectedRecording) -> VerifiedRecording { input.recording }
+    let _cli_distill = |recording: VerifiedRecording| crate::mcp_skill_jobs::summarize(recording, String::new());
+    assert!(!duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording"));
+    assert!(!pending_production_selectors().contains("skill_from_recording"));
 }
 
 /// H12a tools the production issuer must make eligible without new selectors.
@@ -520,6 +444,12 @@ fn isolated_round6_production_inventory_tracks_selector_gaps() {
 }
 
 async fn employee_tool_parity(home: &std::path::Path) {
+    // SFR: production boot (`isolation_mcp::boot::assemble`) installs HX6's
+    // recording store as H12d's source; this dedicated child process does the
+    // same with the same production function (process-wide, one-shot).
+    duduclaw_gateway::isolation_skill_jobs::install_recording_source(
+        duduclaw_mcp_boundary::recording_jobs::SqliteRecordingJobs::open(&home.join("isolation-execution-jobs.db")).unwrap())
+        .unwrap();
     let (dispatcher, context) = fixture(home);
     assert_eq!(crate::mcp_namespace::verified_employee_from_env(home).as_deref(), Some("main"));
     dispatcher.require_complete_services().unwrap();
@@ -552,10 +482,15 @@ async fn employee_tool_parity(home: &std::path::Path) {
             assert_eq!(selection.len(), 1, "{tool}: own Employee only");
         }
     }
-    // H12d: routed only once HX6 installs the recording job store.
-    assert!(duduclaw_mcp_boundary::tool_policy::recording_jobs().is_none());
-    assert_eq!(duduclaw_mcp_boundary::tool_policy::own_skill_job_selector(&context, "skill_from_recording"),
-        Err(VerificationError::Unavailable));
+    // SFR: the job store is installed and the issuer signed the tool behind the
+    // recording gate (fixture: helper_calls + helper_recording, `public_web`,
+    // interactive): own Employee + the plain brokered workspace, no web grant.
+    assert!(duduclaw_mcp_boundary::tool_policy::recording_jobs().is_some());
+    assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, "skill_from_recording"), "SFR selector missing");
+    assert!(!pending.contains("skill_from_recording"));
+    assert_eq!(duduclaw_mcp_boundary::tool_policy::own_skill_job_selector(&context, "skill_from_recording").unwrap(),
+        vec![ResourceGrant::Employee { id: context.record().employee }, ResourceGrant::Workspace {
+            handle: Text::new(duduclaw_mcp_boundary::resources::EMPLOYEE_WORK_ROOT.into()).unwrap() }]);
     // H9/H10: the production issuer selected the brokered Workspace, the
     // PublicOrigins grant and the interactive NewTask grant for this employee;
     // nothing was appended by the test.
@@ -619,7 +554,8 @@ async fn employee_tool_parity(home: &std::path::Path) {
                 "group_history_read", "knowledge_search", "knowledge_get_passage", "knowledge_list_collections", "knowledge_add_source",
                 "meeting_transcribe", "meeting_upload_link", "file_read", "csv_read", "xlsx_read", "code_map", "execute_program",
                 "skill_extract", "web_fetch_cached", "web_extract", "model_search", "model_recommend",
-                "shared_skill_adopt", "skill_security_scan", "skill_graduate", "skill_curator_status"] {
+                "shared_skill_adopt", "skill_security_scan", "skill_graduate", "skill_curator_status",
+                "skill_from_recording"] {
                 assert!(ordinary.contains(tool), "production fixture did not enable {tool}");
                 assert_eq!(isolated.contains(tool), !pending.contains(tool),
                     "production inventory disagrees with tracked selector gap: {tool}");
