@@ -304,7 +304,7 @@ impl Core {
         let (audited, decided) = self.probe_schedule.record(verdict(outcome, &probe.out, probe.tainted, probe.call),
             probe.employee, Instant::now());
         self.audit_probe(Event::RecordingProbeVerdict, &probe, Some(outcome), Some(audited));
-        if audited == ProbeVerdict::Inconclusive { self.probe_schedule.untry(probe.run); }
+        if audited == ProbeVerdict::Inconclusive { self.probe_schedule.untry(probe.run.0); }
         self.recording_probe = match decided {
             None => RecordingProbe::Idle,
             Some(passed) => RecordingProbe::Done(RecordingProbeEvidence { boot_id: probe.boot_id.clone(), landlock_abi: probe.landlock_abi, passed }),
