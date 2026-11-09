@@ -250,15 +250,17 @@ pub fn is_containerized() -> bool {
 
 /// This only narrows update permissions; it does not attest credential protection.
 pub fn is_native_protected_install() -> bool {
+    // SR5 round 3 follow-up: the one protected-mode latch (env flag OR the
+    // root marker / confirmed index), never the bare environment variable.
     cfg!(target_os = "linux") && native_protected_install(
         is_containerized(),
-        std::env::var("DUDUCLAW_PROTECTED_KEY_MODE").ok().as_deref(),
+        duduclaw_core::protected_mode::active(),
         &duduclaw_core::platform::executable_path(),
     )
 }
 
-fn native_protected_install(containerized: bool, mode: Option<&str>, exe: &std::path::Path) -> bool {
-    !containerized && (mode == Some("native-systemd")
+fn native_protected_install(containerized: bool, protected: bool, exe: &std::path::Path) -> bool {
+    !containerized && (protected
         || exe == std::path::Path::new("/opt/duduclaw/bin/duduclaw"))
 }
 
@@ -2084,10 +2086,12 @@ mod tests {
     fn native_protected_update_is_manual() {
         let native = std::path::Path::new("/opt/duduclaw/bin/duduclaw");
         let other = std::path::Path::new("/usr/bin/duduclaw");
-        assert!(native_protected_install(false, None, native));
-        assert!(native_protected_install(false, Some("native-systemd"), other));
-        assert!(!native_protected_install(true, Some("native-systemd"), native));
-        assert!(!native_protected_install(false, Some("native-systemd-extra"), other));
+        // SR5 round 3 follow-up: `protected` is `protected_mode::active()`
+        // (env flag OR durable fact); the executable path stays a fallback.
+        assert!(native_protected_install(false, false, native));
+        assert!(native_protected_install(false, true, other));
+        assert!(!native_protected_install(true, true, native));
+        assert!(!native_protected_install(false, false, other));
         assert_eq!(serde_json::to_string(&InstallMethod::Manual).unwrap(), "\"manual\"");
     }
 

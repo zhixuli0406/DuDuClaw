@@ -28,6 +28,8 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Root-owned marker written at protected install (0644, root:root).
 pub const MODE_MARKER: &str = "/etc/duduclaw/protected-mode";
@@ -103,8 +105,44 @@ fn system_decides() -> bool {
     { false }
 }
 
+/// SR5 round 3 follow-up R3-4: how long an "off" answer from the system
+/// sources is reused before the marker / index are probed again. Only the
+/// negative answer is cached; "on" latches forever (see [`active`]).
+pub const OFF_CACHE_WINDOW: Duration = Duration::from_secs(5);
+
+/// A short negative cache keyed on the monotonic clock: while a recent probe
+/// said "off" (younger than [`OFF_CACHE_WINDOW`]), the answer is reused
+/// without re-statting the marker or re-opening SQLite. A positive probe
+/// clears it. The lock is held across the probe so concurrent callers do not
+/// stampede the probe.
+struct OffCache(Mutex<Option<Instant>>);
+
+impl OffCache {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn decide(&self, now: Instant, probe: impl FnOnce() -> bool) -> bool {
+        let mut off_until = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if (*off_until).is_some_and(|until| now < until) {
+            return false;
+        }
+        let on = probe();
+        // `checked_add` failing (absurd clock) simply disables the cache.
+        *off_until = if on { None } else { now.checked_add(OFF_CACHE_WINDOW) };
+        on
+    }
+}
+
+static SYSTEM_OFF: OffCache = OffCache::new();
+
 /// The protected-mode switch. Every protected-mode decision in the product
 /// must use this (directly or through `execution_gate::isolation_required`).
+///
+/// "On" (from the system sources) latches for the life of the process; an
+/// "off" answer is reused for at most [`OFF_CACHE_WINDOW`] (R3-4), so a
+/// source that appears later is seen within that window. Thread sources are
+/// never cached and never latch.
 pub fn active() -> bool {
     if LATCHED.load(Ordering::Acquire) {
         return true;
@@ -112,7 +150,7 @@ pub fn active() -> bool {
     if THREAD_SOURCES.with(|stack| stack.borrow().iter().any(Sources::decide)) {
         return true;
     }
-    if system_decides() {
+    if SYSTEM_OFF.decide(Instant::now(), system_decides) {
         LATCHED.store(true, Ordering::Release);
         return true;
     }
@@ -206,5 +244,40 @@ mod tests {
         assert!(with_thread_sources(s, crate::execution_gate::isolation_required));
         // Popped again; the process-wide answer did not change.
         assert_eq!(active(), before);
+    }
+
+    #[test]
+    fn sr5r3f_off_answer_is_cached_briefly_and_a_later_source_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sources(dir.path());
+        let cache = OffCache::new();
+        let start = Instant::now();
+        let probes = std::cell::Cell::new(0);
+        let probe = || { probes.set(probes.get() + 1); s.decide() };
+        assert!(!cache.decide(start, probe));
+        assert_eq!(probes.get(), 1);
+        // The marker appears; inside the window the cached "off" is reused
+        // (no re-stat / SQLite open).
+        std::fs::create_dir_all(s.marker.parent().unwrap()).unwrap();
+        std::fs::write(&s.marker, b"").unwrap();
+        assert!(!cache.decide(start + Duration::from_secs(1), probe));
+        assert_eq!(probes.get(), 1, "a fresh off answer is not re-probed");
+        // After the window the new source is seen.
+        assert!(cache.decide(start + OFF_CACHE_WINDOW, probe));
+        assert_eq!(probes.get(), 2);
+        // A positive answer is never cached as "off".
+        assert!(cache.decide(start + OFF_CACHE_WINDOW + Duration::from_millis(1), probe));
+    }
+
+    #[test]
+    fn sr5r3f_confirmed_index_appearing_after_window_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sources(dir.path());
+        let cache = OffCache::new();
+        let start = Instant::now();
+        assert!(!cache.decide(start, || s.decide()));
+        confirmed_index(&s.service_home, 1);
+        assert!(!cache.decide(start + OFF_CACHE_WINDOW - Duration::from_millis(1), || s.decide()));
+        assert!(cache.decide(start + OFF_CACHE_WINDOW + Duration::from_millis(1), || s.decide()));
     }
 }

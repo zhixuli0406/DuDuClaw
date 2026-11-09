@@ -2566,6 +2566,7 @@ dependencies = [
 name = "duduclaw-spawnd"
 version = "1.80.1"
 dependencies = [
+ "duduclaw-core",
  "duduclaw-execution",
  "duduclaw-isolation",
  "duduclaw-isolation-storage",

@@ -368,6 +368,16 @@ pub(crate) async fn handle_skill_hub_install(
 
     use duduclaw_gateway::skill_lifecycle::hub_install;
 
+    // SR5 round 3 follow-up R3-3: an employee scope must name a LIVE employee
+    // (same `live_employee_dir` check as the RPC / install-request paths),
+    // refused before any fetch or approval; `install_gated` re-checks at the
+    // write and passes the checked tree to the loader.
+    if scope != "global" && !scope.starts_with("department:") {
+        if let Err(e) = hub_install::live_employee_scope_dir(home_dir, scope) {
+            return mcp_error(&e);
+        }
+    }
+
     // ── Phase 1: fetch + security scan (fail-closed) ────────────────────────
     // High-risk / unknown hub / absent content DENY here and never reach the
     // approval queue — approval is only for scanned-and-passed skills.

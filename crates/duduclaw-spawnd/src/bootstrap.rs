@@ -180,6 +180,35 @@ pub fn minimal_etc(uid: u32, gid: u32) -> Result<BTreeMap<&'static str, String>>
     ]))
 }
 
+/// SR5 round 3 follow-up R3-1: the protected-mode marker inside every
+/// employee runtime. The runtime's `/etc` is the minimal projection above
+/// (never host `/etc`) and `/var/lib/duduclaw` is not mounted, so without this
+/// entry `duduclaw_core::protected_mode::active()` running inside the sandbox
+/// (e.g. an employee-launched `duduclaw mcp-server` whose environment lacks
+/// `DUDUCLAW_PROTECTED_KEY_MODE`) would see neither durable fact and run
+/// unprotected. An environment flag is no fix: the sandboxed runtime and any
+/// MCP `env` block can strip it. Instead the launcher publishes its own
+/// root-owned (0444, in a root 0755 directory) marker at the exact path the
+/// latch reads, inside the read-only / nosuid / nodev / noexec / nosymfollow
+/// etc mount. spawnd only runs under the protected install, so every runtime
+/// it launches is a protected-mode runtime and the marker is always present;
+/// it can only turn protected mode on. `/etc/{ETC_MARKER_DIR}/{ETC_MARKER_FILE}`
+/// must equal `duduclaw_core::protected_mode::MODE_MARKER` (tested).
+pub const ETC_MARKER_DIR: &str = "duduclaw";
+pub const ETC_MARKER_FILE: &str = "protected-mode";
+/// Same bytes as the host marker written by `service install --protected-linux`.
+pub const ETC_MARKER_CONTENT: &str = "native-systemd\n";
+
+/// Every regular file of an employee runtime's read-only `/etc`, as
+/// `(path relative to /etc, contents)`: [`minimal_etc`] plus the R3-1
+/// protected-mode marker. The single source for publication and tests.
+pub fn etc_projection(uid: u32, gid: u32) -> Result<Vec<(String, String)>> {
+    let mut entries: Vec<(String, String)> = minimal_etc(uid, gid)?.into_iter()
+        .map(|(name, contents)| (name.to_owned(), contents)).collect();
+    entries.push((format!("{ETC_MARKER_DIR}/{ETC_MARKER_FILE}"), ETC_MARKER_CONTENT.to_owned()));
+    Ok(entries)
+}
+
 /// Readback from a compatible B2 adapter's actual probes, never config booleans.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrampolineReadiness {
@@ -313,6 +342,26 @@ mod tests {
         assert!(files["passwd"].lines().any(|line| line == "duduclaw-emp-70000:x:70000:70000:employee:/home/employee:/usr/sbin/nologin"));
         assert!(!files.contains_key("shadow"));
         assert!(minimal_etc(0, 0).is_err());
+    }
+    #[test]
+    fn sr5r3f_employee_etc_projection_carries_the_protected_mode_marker() {
+        let entries = etc_projection(70000, 70000).unwrap();
+        let markers: Vec<_> = entries.iter()
+            .filter(|(path, _)| format!("/etc/{path}") == duduclaw_core::protected_mode::MODE_MARKER).collect();
+        assert_eq!(markers.len(), 1, "every employee runtime's /etc carries exactly one marker");
+        assert_eq!(markers[0].1, ETC_MARKER_CONTENT);
+        assert_eq!(ETC_MARKER_CONTENT, "native-systemd\n");
+        // The flat identity files are unchanged; the marker is the only nested entry.
+        assert_eq!(entries.len(), minimal_etc(70000, 70000).unwrap().len() + 1);
+        assert_eq!(entries.iter().filter(|(path, _)| path.contains('/')).count(), 1);
+        assert!(etc_projection(0, 0).is_err());
+        // The latch itself reads the marker as a durable fact (env absent).
+        let dir = std::env::temp_dir().join(format!("sr5r3f-etc-{}", std::process::id()));
+        let marker = dir.join("etc").join(&markers[0].0);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, &markers[0].1).unwrap();
+        assert!(duduclaw_core::protected_mode::durable_fact(&marker, &dir.join("no-service-home")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[cfg(target_os = "linux")]
     #[test]

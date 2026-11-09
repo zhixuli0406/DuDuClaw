@@ -230,6 +230,16 @@ pub async fn install_gated(
     }).await.map_err(|e| format!("hub install worker failed: {e}"))?
 }
 
+/// SR5 round 3 follow-up R3-3: the live employee tree a hub install `scope`
+/// names (`handlers::skills_install_target::live_employee_dir`: valid id, F6h
+/// writer gate, real `agents/<label>/agent.toml`). Never creates the tree.
+/// Public so the MCP `skill_hub_install` handler can refuse a dead target
+/// before fetching or asking for approval; [`install_gated`] re-checks.
+pub fn live_employee_scope_dir(home_dir: &Path, scope: &str) -> Result<std::path::PathBuf, String> {
+    crate::handlers::skills_install_target::live_employee_dir(home_dir, scope)
+        .map_err(|refusal| format!("hub install DENIED: {refusal}"))
+}
+
 /// Caller holds the trust-store lock, then the signature-history lock throughout.
 async fn install_gated_locked(
     home_dir: &Path, gated: &GatedManifest, scope: &str,
@@ -251,6 +261,14 @@ async fn install_gated_locked(
     let hub_id = gated.hub.as_str();
     let skill_name = gated.skill_name.as_str();
     let content = gated.content.as_str();
+    // SR5 round 3 follow-up R3-3: an employee scope must name a LIVE employee
+    // (F6h writer gate + real `agents/<label>/agent.toml`), the same check the
+    // RPC and install-request paths use, before anything is written.
+    let employee_dir = if scope == "global" || scope.starts_with("department:") {
+        None
+    } else {
+        Some(live_employee_scope_dir(home_dir, scope)?)
+    };
     // Persist the trust commitment before exposing content to a loader. A failed install
     // deliberately retains this conservative pin; disk failures must not permit a downgrade.
     record_verified_signature(home_dir, hub_id, &installed_name, &signature_status)?;
@@ -282,15 +300,14 @@ async fn install_gated_locked(
         .await
     } else {
         // SR5 round 3 N8: never conjure `agents/<scope>`; only SKILLS/ inside
-        // an existing employee tree is created.
-        if !duduclaw_core::is_valid_agent_id(scope) {
-            let _ = std::fs::remove_file(&tmp_file);
-            let _ = std::fs::remove_dir(&tmp_dir);
-            return Err("hub install DENIED: invalid employee scope".into());
+        // the live employee tree checked above is created.
+        match employee_dir.as_deref() {
+            Some(employee_dir) => duduclaw_agent::skill_loader::install_skill_into_employee(
+                &tmp_file, employee_dir, &quarantine_dir,
+            )
+            .await,
+            None => Err("hub install DENIED: invalid employee scope".into()),
         }
-        let employee_dir = home_dir.join("agents").join(scope);
-        duduclaw_agent::skill_loader::install_skill_into_employee(&tmp_file, &employee_dir, &quarantine_dir)
-            .await
     };
     let _ = std::fs::remove_file(&tmp_file);
     let _ = std::fs::remove_dir(&tmp_dir); // best-effort: unique dir, one file
@@ -411,6 +428,29 @@ mod tests {
         std::fs::write(home.join("trusted_publishers.toml"),
             format!("[publishers.fixture]\nkeys = [\"{TEST_KEY}\"]\n")).unwrap();
         home
+    }
+
+    #[test]
+    fn sr5r3f_hub_employee_scope_requires_a_live_employee_tree() {
+        // The lifecycle read applies in every mode; pin the F6h gate off here.
+        crate::isolation_label_stores::TEST_PROTECTED.with(|forced| forced.set(Some(false)));
+        let home = tempfile::tempdir().unwrap();
+        // Invalid id, unknown label and a bare directory without agent.toml are refused.
+        assert!(live_employee_scope_dir(home.path(), "../evil").is_err());
+        assert!(live_employee_scope_dir(home.path(), "alice").is_err());
+        assert!(!home.path().join("agents").exists(), "the check never creates the tree");
+        std::fs::create_dir_all(home.path().join("agents/alice")).unwrap();
+        assert!(live_employee_scope_dir(home.path(), "alice").is_err());
+        std::fs::write(home.path().join("agents/alice/agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
+        assert_eq!(live_employee_scope_dir(home.path(), "alice").unwrap(), home.path().join("agents/alice"));
+        #[cfg(unix)]
+        {
+            // A symlinked employee tree is not live.
+            std::fs::create_dir_all(home.path().join("elsewhere")).unwrap();
+            std::fs::write(home.path().join("elsewhere/agent.toml"), "").unwrap();
+            std::os::unix::fs::symlink(home.path().join("elsewhere"), home.path().join("agents/bob")).unwrap();
+            assert!(live_employee_scope_dir(home.path(), "bob").is_err());
+        }
     }
 
     #[test]
