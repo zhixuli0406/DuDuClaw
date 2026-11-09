@@ -6,6 +6,11 @@
 use super::*;
 use std::{collections::BTreeSet, sync::Mutex};
 use duduclaw_isolation::execution::*;
+
+/// G1 [SEC]: every catalog tool through the real issuer and the real
+/// connector factory, for one Personal and one Shared employee.
+#[path = "mcp_isolation_parity_g1_tests.rs"]
+mod g1;
 use duduclaw_mcp_boundary::{execution::{AuthorizedExecutionPlan, ExecutionPlanFactory, PolicyFuture},
     factories::{GatewayFactories, GatewayTableParser},
     tool_policy::{AuthorizedToolCall, Route},
