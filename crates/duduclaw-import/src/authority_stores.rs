@@ -118,8 +118,8 @@ pub(super) fn channel_settings(input:impl Read,wal:Option<&mut dyn Read>,builder
     let temp=tempfile::tempdir()?;let path=temp.path().join("source.db");
     crate::sqlite::copy_bounded(input,&path)?;
     if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
-    let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    crate::sqlite::harden(&conn)?;check_sqlite(&conn)?;
+    let mut conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    crate::sqlite::harden(&mut conn)?;check_sqlite(&conn)?;
     // Any known sessions.db version; only the shared channel_settings table is read.
     if !crate::sqlite::session_schema_variant(&conn)?.extension {return Ok(());}
     conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
@@ -127,7 +127,7 @@ pub(super) fn channel_settings(input:impl Read,wal:Option<&mut dyn Read>,builder
         AuthAction::Read {table_name:"channel_settings",column_name:"channel_type"}
             if c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
         _=>Authorization::Deny,
-    }));
+    }))?;
     let mut query=conn.prepare("SELECT DISTINCT channel_type FROM main.channel_settings ORDER BY channel_type")?;
     let mut rows=query.query([])?;
     while let Some(row)=rows.next()? {
@@ -143,8 +143,8 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
     let temp=tempfile::tempdir()?;let path=temp.path().join("source.db");
     crate::sqlite::copy_bounded(input,&path)?;
     if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
-    let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    crate::sqlite::harden(&conn)?;check_sqlite(&conn)?;
+    let mut conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    crate::sqlite::harden(&mut conn)?;check_sqlite(&conn)?;
     // Exact v1.79.3, v1.80.x or v1.81 catalog. The v1.80 decision-lease columns
     // and the v1.81 `employee_incarnation` column are never authorized below;
     // only ids and the authority schema version are read.
@@ -157,7 +157,7 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
         |AuthAction::Read {table_name:"approval_authority_schema",column_name:"version"}
             if c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
         _=>Authorization::Deny,
-    }));
+    }))?;
     let versions:Vec<i64>=conn.prepare("SELECT version FROM main.approval_authority_schema")?.query_map([],|r|r.get(0))?.collect::<std::result::Result<_,_>>()?;
     if versions!=[1] {return Err(Error::Schema);}
     let mut query=conn.prepare("SELECT id FROM main.approvals ORDER BY id")?;

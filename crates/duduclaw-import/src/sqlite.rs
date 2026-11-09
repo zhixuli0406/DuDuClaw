@@ -28,7 +28,7 @@ pub(crate) fn schema(conn: &Connection) -> Result<Vec<SchemaRow>> {
     Ok(result)
 }
 
-pub(crate) fn harden(conn: &Connection) -> Result<()> {
+pub(crate) fn harden(conn: &mut Connection) -> Result<()> {
     // SAFETY: importer is a dedicated process; the SQLite process-wide ceiling
     // is only narrowed. -1 queries the current ceiling without changing it.
     unsafe {
@@ -55,10 +55,10 @@ pub(crate) fn harden(conn: &Connection) -> Result<()> {
         (Limit::SQLITE_LIMIT_COLUMN, 128), (Limit::SQLITE_LIMIT_EXPR_DEPTH, 32),
         (Limit::SQLITE_LIMIT_COMPOUND_SELECT, 4), (Limit::SQLITE_LIMIT_ATTACHED, 0),
         (Limit::SQLITE_LIMIT_VDBE_OP, 100_000),
-    ] { conn.set_limit(limit, value); }
+    ] { conn.set_limit(limit, value)?; }
     conn.execute_batch("PRAGMA cell_size_check=ON; PRAGMA mmap_size=0; PRAGMA query_only=ON;")?;
     let deadline = Instant::now() + Duration::from_secs(MAX_QUERY_SECONDS);
-    conn.progress_handler(1000, Some(move || Instant::now() >= deadline));
+    conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
     conn.authorizer(Some(|context: AuthContext<'_>| {
         if context.accessor.is_some() { return Authorization::Deny; }
         match context.action {
@@ -78,7 +78,7 @@ pub(crate) fn harden(conn: &Connection) -> Result<()> {
             AuthAction::Function { function_name: "count" } => Authorization::Allow,
             _ => Authorization::Deny,
         }
-    }));
+    }))?;
     Ok(())
 }
 
@@ -106,8 +106,8 @@ pub(crate) fn sessions<R: Read, W: Write>(input: R, wal: Option<&mut dyn Read>, 
     copy_bounded(input, &main)?;
     if let Some(wal) = wal { copy_bounded(wal, &temp.path().join("source.db-wal"))?; }
     // Opening only the worker-private copy permits WAL recovery without touching legacy data.
-    let conn = Connection::open_with_flags(&main, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    harden(&conn)?;
+    let mut conn = Connection::open_with_flags(&main, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    harden(&mut conn)?;
     let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != 0 { return Err(Error::Schema); }
     let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
@@ -124,7 +124,7 @@ pub(crate) fn sessions<R: Read, W: Write>(input: R, wal: Option<&mut dyn Read>, 
                 if version == SchemaVersion::V180 && context.database_name == Some("main") => Authorization::Allow,
             _ => Authorization::Deny,
         }
-    }));
+    }))?;
     let mut stmt = conn.prepare(session_message_query(version))?;
     let mut rows = stmt.query([emitter.request.legacy_agent.as_deref().ok_or(Error::InvalidRequest)?])?;
     while let Some(row) = rows.next()? {
@@ -211,8 +211,8 @@ mod tests {
 pub(crate) fn memories<R: Read,W: Write>(input:R,wal:Option<&mut dyn Read>,emitter:&mut Emitter<'_,W>)->Result<()> {
     let temp=tempfile::tempdir()?;let main=temp.path().join("source.db");copy_bounded(input,&main)?;
     if let Some(wal)=wal {copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
-    let conn=Connection::open_with_flags(&main,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    harden(&conn)?;
+    let mut conn=Connection::open_with_flags(&main,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    harden(&mut conn)?;
     if conn.query_row("PRAGMA user_version",[],|r|r.get::<_,u32>(0))? != 0 {return Err(Error::Schema);}
     if conn.query_row("PRAGMA quick_check",[],|r|r.get::<_,String>(0))? != "ok" {return Err(Error::Content);}
     // Both versions share the column mapping below: v1.80 only adds an index.
@@ -226,7 +226,7 @@ pub(crate) fn memories<R: Read,W: Write>(input:R,wal:Option<&mut dyn Read>,emitt
                 if context.database_name==Some("main")=>Authorization::Allow,
             _=>Authorization::Deny,
         }
-    }));
+    }))?;
     let agent=emitter.request.legacy_agent.as_deref().ok_or(Error::InvalidRequest)?.to_owned();
     // Tags, roles, trust, provenance, embeddings and executable metadata are never imported.
     for (query,label) in [("SELECT id,content FROM main.memories WHERE agent_id=?1 AND valid_until IS NULL AND quarantined=0 ORDER BY id","memory"),

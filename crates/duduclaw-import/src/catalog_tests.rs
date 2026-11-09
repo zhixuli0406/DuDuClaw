@@ -105,11 +105,11 @@ fn import_accepts_v181_tasks_and_never_reads_markers() {
     }
     // The importer's authorizer denies every read of the marker table.
     let file = store(TASKS_V181, "INSERT INTO task_store_markers(name,applied_at) VALUES ('MARKER-CANARY','now');");
-    let conn = Connection::open(file.path()).unwrap();
+    let mut conn = Connection::open(file.path()).unwrap();
     conn.authorizer(Some(|c: rusqlite::hooks::AuthContext<'_>| match c.action {
         rusqlite::hooks::AuthAction::Read { table_name: "task_store_markers", .. } => rusqlite::hooks::Authorization::Deny,
         _ => rusqlite::hooks::Authorization::Allow,
-    }));
+    })).unwrap();
     assert!(conn.prepare("SELECT name FROM task_store_markers").is_err());
 }
 

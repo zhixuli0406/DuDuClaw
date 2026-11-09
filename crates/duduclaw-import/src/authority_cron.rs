@@ -48,10 +48,10 @@ pub(super) fn sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Buil
     let temp=tempfile::tempdir()?;let path=temp.path().join("source.db");
     crate::sqlite::copy_bounded(input,&path)?;
     if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
-    let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    crate::sqlite::harden(&conn)?;check_sqlite(&conn)?;
+    let mut conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    crate::sqlite::harden(&mut conn)?;check_sqlite(&conn)?;
     let version=crate::catalog::detect(&conn,crate::catalog::Store::Cron,None)?.version;
-    conn.authorizer(Some(cron_columns));
+    conn.authorizer(Some(cron_columns))?;
     let mut query=conn.prepare(cron_query(version))?;
     let mut rows=query.query([])?;
     while let Some(row)=rows.next()? {
@@ -173,8 +173,8 @@ mod tests {
             // The mapping never names an actor column, and the authorizer it
             // runs under refuses any statement that would read one.
             let query=cron_query(version);
-            let probe=rusqlite::Connection::open_in_memory().unwrap();probe.execute_batch(schema).unwrap();
-            probe.authorizer(Some(cron_columns));
+            let mut probe=rusqlite::Connection::open_in_memory().unwrap();probe.execute_batch(schema).unwrap();
+            probe.authorizer(Some(cron_columns)).unwrap();
             assert!(probe.prepare(query).is_ok());
             for actor in actors {
                 assert!(!query.contains(actor));

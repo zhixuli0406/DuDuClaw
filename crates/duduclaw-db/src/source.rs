@@ -647,13 +647,23 @@ impl SqliteEngine {
                 None => engine.open()?,
             };
             let deadline = Instant::now() + engine.timeout;
-            conn.progress_handler(
+            // Fail closed: without the deadline handler the statement could run
+            // unbounded. On failure the connection is dropped, never pooled.
+            if let Err(e) = conn.progress_handler(
                 SQLITE_PROGRESS_OPS,
                 Some(move || Instant::now() >= deadline),
-            );
+            ) {
+                drop(conn);
+                return Err(e.into());
+            }
             let out = f(&conn);
-            conn.progress_handler(0, None::<fn() -> bool>);
-            engine.put_idle(conn);
+            // If the handler cannot be cleared, the connection still carries a
+            // stale deadline: drop it instead of returning it to the idle pool.
+            if conn.progress_handler(0, None::<fn() -> bool>).is_ok() {
+                engine.put_idle(conn);
+            } else {
+                drop(conn);
+            }
             out
         })
         .await;

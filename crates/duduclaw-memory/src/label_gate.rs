@@ -252,7 +252,8 @@ fn narrowing_admits(label: &str) -> bool {
 pub fn install_write_triggers(conn: &Connection, gate: LabelWriteGate, columns: &[&str], parent: Option<ParentKey>,
     rules: GateRules<'_>) -> rusqlite::Result<usize> {
     let file: Option<PathBuf> = conn.path().filter(|path| !path.is_empty()).map(PathBuf::from);
-    let mut cache: HashMap<String, (Instant, u64, bool)> = HashMap::new();
+    // rusqlite 0.41 scalar-function callbacks are `Fn`: the cache needs interior mutability.
+    let cache: std::sync::Mutex<HashMap<String, (Instant, u64, bool)>> = std::sync::Mutex::new(HashMap::new());
     conn.create_scalar_function(GATE_FUNCTION, 1, FunctionFlags::SQLITE_UTF8, move |ctx| {
         let label = match ctx.get_raw(0) {
             ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
@@ -263,10 +264,19 @@ pub fn install_write_triggers(conn: &Connection, gate: LabelWriteGate, columns: 
             _ => return Ok(1i64),
         };
         let epoch = cache_epoch();
-        let writable = match cache.get(&label) {
-            Some((at, seen, writable)) if *seen == epoch && at.elapsed() < CACHE_TTL => *writable,
-            _ => {
+        let cached = {
+            let cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match cache.get(&label) {
+                Some((at, seen, writable)) if *seen == epoch && at.elapsed() < CACHE_TTL => Some(*writable),
+                _ => None,
+            }
+        };
+        let writable = match cached {
+            Some(writable) => writable,
+            None => {
+                // The gate runs without the cache lock held.
                 let writable = gate(file.as_deref(), &label).is_ok();
+                let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if cache.len() >= CACHE_MAX { cache.clear(); }
                 cache.insert(label.clone(), (Instant::now(), epoch, writable));
                 writable

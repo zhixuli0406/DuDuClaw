@@ -421,7 +421,7 @@ mod tests {
         assert!(!home.path().join("state.db").exists());
         open(home.path(), "state.db").unwrap().execute_batch("CREATE TABLE example(value)").unwrap();
         let read = open_existing(home.path(), "state.db", Access::ReadOnly).unwrap();
-        assert!(read.is_readonly(rusqlite::DatabaseName::Main).unwrap());
+        assert!(read.is_readonly("main").unwrap());
         assert!(read.execute("INSERT INTO example VALUES (1)", []).is_err());
         open_existing(home.path(), "state.db", Access::ReadWrite).unwrap().execute("INSERT INTO example VALUES (1)", []).unwrap();
         // A subdirectory store (e.g. migration-authority/apply.db) is walked the same way.

@@ -187,8 +187,8 @@ fn users_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     let temp=tempfile::tempdir()?;let path=temp.path().join("source.db");
     crate::sqlite::copy_bounded(input,&path)?;
     if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
-    let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    crate::sqlite::harden(&conn)?;
+    let mut conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    crate::sqlite::harden(&mut conn)?;
     check_sqlite(&conn)?;
     let expected=Connection::open_in_memory()?;expected.execute_batch(include_str!("users-v1793.sql"))?;
     if crate::sqlite::schema(&conn)?!=crate::sqlite::schema(&expected)? {return Err(Error::Schema);}
@@ -199,7 +199,7 @@ fn users_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
         |AuthAction::Read {table_name:"channel_identities",column_name:"user_id"|"channel"}
             if c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
         _=>Authorization::Deny,
-    }));
+    }))?;
     let mut query=conn.prepare("SELECT email,display_name,role FROM users ORDER BY id")?;
     let mut rows=query.query([])?;
     while let Some(row)=rows.next()? {builder.push(C::User,vec![field("name",row.get::<_,String>(0)?),field("display_name",row.get::<_,String>(1)?),field("role",row.get::<_,String>(2)?)],None)?;}
@@ -337,11 +337,11 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     let temp=tempfile::tempdir()?;let path=temp.path().join("source.db");
     crate::sqlite::copy_bounded(input,&path)?;
     if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
-    let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    crate::sqlite::harden(&conn)?;
+    let mut conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    crate::sqlite::harden(&mut conn)?;
     // The reviewed task authority trigger covers more than 32 fields. This
     // fixed bound admits that catalog while retaining a small parser ceiling.
-    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH,128);
+    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH,128)?;
     check_sqlite(&conn)?;
     let version=crate::catalog::detect(&conn,crate::catalog::Store::Tasks,None)?.version;
     conn.authorizer(Some(move |c:AuthContext<'_>| {
@@ -368,7 +368,7 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
             if version==crate::catalog::SchemaVersion::V180 && c.database_name==Some("main") && (top||a2a_cte)=>Authorization::Allow,
         _=>Authorization::Deny,
         }
-    }));
+    }))?;
     // A2A-owned work is private to its external principal; republishing it as
     // ordinary employee goals would drop that owner restriction. It stays quarantined.
     let mut query=conn.prepare(task_goal_query(version))?;

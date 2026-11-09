@@ -18,10 +18,10 @@ pub(super) fn sqlite(input: impl Read, wal: Option<&mut dyn Read>, builder: &mut
     let path = temp.path().join("source.db");
     crate::sqlite::copy_bounded(input, &path)?;
     if let Some(wal) = wal { crate::sqlite::copy_bounded(wal, &temp.path().join("source.db-wal"))?; }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    crate::sqlite::harden(&conn)?;
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    crate::sqlite::harden(&mut conn)?;
     // The reviewed workflow authority trigger has more than 32 comparisons.
-    if workflow { conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128); }
+    if workflow { conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128)?; }
     check_sqlite(&conn)?;
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(if workflow { include_str!("workflow-v1793.sql") } else { include_str!("autopilot-v1793.sql") })?;
@@ -33,7 +33,7 @@ pub(super) fn sqlite(input: impl Read, wal: Option<&mut dyn Read>, builder: &mut
         | AuthAction::Read { table_name: "workflow_schema_meta", column_name: "owner" | "version" }
             if c.database_name == Some("main") && c.accessor.is_none() => Authorization::Allow,
         _ => Authorization::Deny,
-    }));
+    }))?;
     if workflow {
         let versions: Vec<(String, i64)> = conn.prepare("SELECT owner,version FROM main.workflow_schema_meta ORDER BY owner")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;

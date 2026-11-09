@@ -192,7 +192,7 @@ impl ConfirmationStore {
     /// checked) opener. Never creates or writes; a writable connection is
     /// refused so this cannot become a schema-creating side door.
     pub fn from_read_only_connection(conn: Connection) -> Result<Self> {
-        if !conn.is_readonly(rusqlite::DatabaseName::Main)? { return Err(ConfirmationError::Storage); }
+        if !conn.is_readonly("main")? { return Err(ConfirmationError::Storage); }
         conn.query_row("SELECT COUNT(*) FROM migration_proposals", [], |r| r.get::<_, u64>(0))?;
         Ok(Self { conn })
     }
