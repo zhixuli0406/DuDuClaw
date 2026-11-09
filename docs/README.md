@@ -6,6 +6,8 @@
 
 Native Linux personal accounts: [Protected system service](guides/linux-protected-service.md) · [繁體中文](guides/zh-TW/linux-protected-service.md) · [日本語](guides/ja-JP/linux-protected-service.md)
 
+Release maintainers, native Linux protected mode: [Acceptance runbook (v1.81: G1, G2, G3, H15)](guides/linux-protected-acceptance.md) · [繁體中文](guides/zh-TW/linux-protected-acceptance.md) · [日本語](guides/ja-JP/linux-protected-acceptance.md)
+
 Developer implementation status: [Native Linux isolation — Package B1](architecture/native-linux-isolation.md) (not enabled).
 Developer handoff: [Native Linux isolation packages](architecture/native-linux-isolation.md) (development status and remaining acceptance gates).
 Internal engineering: [Native Linux isolation implementation](architecture/native-linux-isolation.md) (not active product behavior).

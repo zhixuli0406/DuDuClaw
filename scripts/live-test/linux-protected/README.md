@@ -3,6 +3,7 @@
 | Tool | Status |
 |---|---|
 | `connectors-acceptance.sh` (+ `connectors_rpc.py`, `fixtures/`) | **Current.** v1.81 Personal-binding / connector acceptance, matrix items 1-15 (see below). |
+| `package-h-acceptance.sh` (+ `fixtures/public_origin.py`) | **Current.** v1.81 Package H acceptance (H15, matrix additions 16-27) and the G2 lifecycle chain: installs the service, records host facts, runs the prebuilt `iso_package_h_chain` / `iso_personal_chain` test binaries (`crates/duduclaw-gateway/tests/`), prints a PASS/FAIL/SKIP table. Runbook: `docs/guides/linux-protected-acceptance.md`. |
 | `acceptance.sh` + `rpc_probe.py` | **Superseded for v1.81.** `acceptance.sh` asserts the removed `container_root_key` backend (`security.credential_protection` ⇒ `backend=container_root_key`), so it cannot pass on a v1.81 build. It is kept unchanged for the historical record (see "Legacy" at the end). `rpc_probe.py` is still used: `connectors_rpc.py` imports its WebSocket client. |
 
 ## Connector acceptance (`connectors-acceptance.sh`)
@@ -90,6 +91,8 @@ A protected employee's MCP calls are authorised per live run by the gateway and 
 | `driver replay <handle> <tool> <json-args>` | call with the previously captured capability | as `call` |
 | `driver race <scenario> <label> <json>` | `revoke_before_send`, `revoke_during_refresh`, `revoke_between_pages`: perform the race, revoking through the admin RPC | `{"outcome":"uncertain\|refused\|ok\|error","requests_sent":N,"next_call":"refused","next_page":"refused"}` |
 | `driver smoke <family> <label>` | one read-only smoke call for `google\|notion\|github\|odoo\|discord\|line\|telegram\|search` (the driver configures the provider from its env) | `{"outcome":"ok\|refused\|error"}` |
+| `driver seed <label>` (H15, optional) | write the H15 work files `h15/note.txt`, `h15/table.csv`, `h15/book.xlsx` and the symlink `h15/link.txt → /etc/passwd` into the employee's `/work` (for example through the employee's own runtime). Without it, H15 seeds them with one `execute_program` call | `{"outcome":"ok","seeded":true}` |
+| `driver cancel <label> <tool> <json-args> <after-ms>` (H15) | start the call, send MCP `notifications/cancelled` for its request id after `<after-ms>`, then make one more `execute_program` call (`print(1)`) in the same run | `{"outcome":"cancelled","run_alive_after":true,"next_call":"ok"}` |
 
 Environment given to the driver: `DUDUCLAW_ISO_DATA` (service home), `DUDUCLAW_ISO_OUT`, `DUDUCLAW_ISO_RPC` (path of `connectors_rpc.py`), `DUDUCLAW_ISO_STATE_DIR` (private state with the admin and user sessions, usable with `connectors_rpc.py --state <dir>/admin.json call ... --stepup`), `DUDUCLAW_ISO_CANARY_URL`. Expected results the harness enforces: item 7 `uncertain` with `requests_sent=0`; item 8 `uncertain` with `next_call=refused`; item 9 `next_page=refused`; refusals in 14 must not report `credential_used=true`.
 
