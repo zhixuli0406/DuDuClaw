@@ -444,7 +444,7 @@ fn p1g_http_routes_naming_an_employee_are_reviewed() {
     let paths = route_paths(source);
     assert!(paths.len() >= 120, "only {} routes found", paths.len());
     let flagged: BTreeSet<&String> = paths.iter().filter(|p| HTTP_KEYWORDS.iter().any(|k| p.contains(k))).collect();
-    let missing: Vec<&&String> = flagged.iter().filter(|p| !HTTP_ROUTES.iter().any(|(r, _)| r == p.as_str())).collect();
+    let missing: Vec<&&String> = flagged.iter().filter(|p| !HTTP_ROUTES.iter().any(|(r, _)| *r == p.as_str())).collect();
     assert!(missing.is_empty(), "HTTP routes not reviewed for Personal employees: {missing:?}");
     for (route, reason) in HTTP_ROUTES {
         assert!(!reason.is_empty() && paths.contains(*route), "stale HTTP_ROUTES entry {route}");

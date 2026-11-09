@@ -740,7 +740,7 @@ fn p1e_every_dashboard_arm_is_gated_or_allowlisted() {
     let in_table = |table: &[(&str, &str)], ns: &str| table.iter().any(|(name, _)| *name == ns);
     let mut missing = Vec::new();
     for (method, (takes, names)) in &found {
-        if gated(method) || !takes || EMPLOYEE_ARMS.iter().any(|(name, _)| name == method) {
+        if gated(method) || !takes || EMPLOYEE_ARMS.iter().any(|(name, _)| *name == method.as_str()) {
             continue;
         }
         let ns = namespace(method);
