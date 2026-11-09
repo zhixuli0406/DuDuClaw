@@ -39,8 +39,12 @@ const HELPER_FEATURES: Record<string, string> = {
 
 interface ReasonView { key: string; message: string; step?: { hint: string; to: string } }
 
-function describeReason(intl: IntlShape, reason: IsolationReason): ReasonView {
-  const step = Object.hasOwn(NEXT_STEPS, reason.code) ? NEXT_STEPS[reason.code] : undefined;
+/** Per-reason next-step overrides (v1.81 F5: the 受保護模式 page links to its own tabs). */
+export type IsolationNextSteps = Partial<Record<IsolationReasonCode, { hint: string; to: string }>>;
+
+function describeReason(intl: IntlShape, reason: IsolationReason, overrides?: IsolationNextSteps): ReasonView {
+  const step = overrides && Object.hasOwn(overrides, reason.code) ? overrides[reason.code]
+    : Object.hasOwn(NEXT_STEPS, reason.code) ? NEXT_STEPS[reason.code] : undefined;
   switch (reason.code) {
     case 'binding_evidence_missing':
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.binding' }) };
@@ -73,8 +77,7 @@ function describeReason(intl: IntlShape, reason: IsolationReason): ReasonView {
         : { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRuntimeGeneric' }) };
     }
     case 'helper_recording_unsupported':
-      // W1 plain-language text; HX6's technical `reason.recording` stays in
-      // the catalogs (admin egress statement: `recordingEgress` below).
+      // W1 plain-language text (admin egress statement: `recordingEgress` below).
       return { key: reason.code, step, message: intl.formatMessage({ id: 'isolationReadiness.reason.helperRecording' }) };
     default:
       return { key: 'unknown', message: intl.formatMessage({ id: 'isolationReadiness.reason.setup' }) };
@@ -88,7 +91,7 @@ function unique(views: ReasonView[]): ReasonView[] {
 }
 
 /** Readiness diagnosis only; this component does not authorize execution. */
-export function IsolationReadinessBanner() {
+export function IsolationReadinessBanner({ nextSteps }: { nextSteps?: IsolationNextSteps } = {}) {
   const intl = useIntl();
   const readiness = useSystemStore(s => s.status?.isolation_readiness);
   const loading = useSystemStore(s => s.loading);
@@ -96,7 +99,7 @@ export function IsolationReadinessBanner() {
   const personal = useSystemStore(s => s.status?.edition_profile === 'personal');
   const admin = useAuthStore(s => s.user?.role === 'admin');
   if (!readiness?.required) return null;
-  const reasons = unique((readiness.reasons ?? []).map(reason => describeReason(intl, reason)));
+  const reasons = unique((readiness.reasons ?? []).map(reason => describeReason(intl, reason, nextSteps)));
   // Admission is open but some employees still need an administrator.
   const attention = readiness.ready && reasons.length > 0;
   if (readiness.ready && !attention) return null;
@@ -139,7 +142,7 @@ export function IsolationReadinessBanner() {
                   <li key={employee.label}>
                     {intl.formatMessage({ id: 'isolationReadiness.employeeReasons' }, {
                       label: employee.label,
-                      reasons: unique(employee.reasons.map(reason => describeReason(intl, reason)))
+                      reasons: unique(employee.reasons.map(reason => describeReason(intl, reason, nextSteps)))
                         .map(reason => reason.message).join(' '),
                     })}
                   </li>
