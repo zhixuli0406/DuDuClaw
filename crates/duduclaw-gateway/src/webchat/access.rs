@@ -57,9 +57,7 @@ impl WebChatState {
             .await.map_err(|_| "unavailable")?.map_err(|_| "unavailable")?;
         let reg = self.ctx.registry.read().await;
         let candidates: Vec<String> = reg.list().into_iter().filter_map(|a| {
-            let id = &a.config.agent.name;
-            (a.config.agent.status.is_operational() && snapshot.access.may_assign(id)
-                && sender.webchat_allows(a) && sender.may_call(a, None)).then(|| id.clone())
+            primary_candidate(&sender, a).then(|| a.config.agent.name.clone())
         }).collect();
         if let Some(primary) = primary.filter(|id| candidates.iter().any(|a| a == id)) {
             return Ok(Some(primary));
@@ -158,6 +156,26 @@ impl WebChatState {
         }
         Ok(())
     }
+}
+
+/// Whether `agent` may be what a dashboard account talks to by default: the
+/// filter WebChat applies to a non-admin account's candidates (and so to its
+/// 主要 AI 員工) — live, the account may hand it work (Operator or above, or
+/// Admin), and the WebChat target rules allow it (no main-role or gateway
+/// default employee for non-admins; `sender` should carry
+/// [`SenderAccess::for_webchat`] so those rules apply). The Telegram shared
+/// bot's primary-employee route (RM-172) uses the same check, so an employee
+/// the account may no longer use is skipped there exactly as in WebChat.
+pub(crate) fn primary_candidate(sender: &SenderAccess, agent: &duduclaw_agent::registry::LoadedAgent) -> bool {
+    let may_assign = match &sender.sender {
+        crate::trigger_route::Sender::Admin { .. } => true,
+        crate::trigger_route::Sender::Account { access, .. } => access.may_assign(&agent.config.agent.name),
+        crate::trigger_route::Sender::Unmapped => false,
+    };
+    agent.config.agent.status.is_operational()
+        && may_assign
+        && sender.webchat_allows(agent)
+        && sender.may_call(agent, None)
 }
 
 /// Shared by async admission and the synchronous final-write policy fence.
