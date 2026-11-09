@@ -407,7 +407,7 @@ mod tests {
         assert!(validate(&strings(&["support@customer.com"]), &[], &emails).is_ok());
         // Use time: a designated former login address is refused for every actor.
         for former in ["alice@customer.com", "carol@customer.com"] {
-            let accounts = subject_accounts(&db, "bot", former).unwrap();
+            let accounts = subject_accounts(&db, "bot", None, former).unwrap();
             assert_eq!(accounts.len(), 1, "{former}");
             assert!(!accounts[0].active && accounts[0].user_id.is_empty());
             let source = TenantSource::fixture(TenantSourceKind::Delegate, former, &[former], &[]);
@@ -415,7 +415,7 @@ mod tests {
                 assert!(admit_subject(&source, actor, &accounts).is_err(), "{former}");
             }
         }
-        assert!(subject_accounts(&db, "bot", "support@customer.com").unwrap().is_empty());
+        assert!(subject_accounts(&db, "bot", None, "support@customer.com").unwrap().is_empty());
         // Every change of a login address is audited in its own transaction.
         let changed = db.query_audit_log(None, Some(duduclaw_auth::db::EMAIL_CHANGED_ACTION), 10).unwrap();
         assert_eq!(changed.len(), 1);

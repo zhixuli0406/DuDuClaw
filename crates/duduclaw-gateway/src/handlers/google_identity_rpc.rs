@@ -7,7 +7,7 @@
 //! | `google.delegation.remove_key {confirm}` | Admin | delete the sealed key |
 //! | `google.delegation.settings_set {allowed_subject_domains?, default_identity?}` | Admin | `[integrations.google_identity]` |
 //! | `google.delegation.tenant_settings_set {service_mailboxes, tenant_scopes, csrf_token}` | Admin + step-up | protected-mode tenant-source subjects/scopes (`google_tenant_settings_rpc.rs`) |
-//! | `google.delegation.attest_subject {agent_id, subject, csrf_token}` / `google.delegation.revoke_attestation {agent_id, csrf_token}` | Admin + step-up | SR4: protected-mode attestation that a Shared employee's delegate subject is one person (`google_delegate_attestation_rpc.rs`) |
+//! | `google.delegation.attest_subject {agent_id, subject, user_id, acknowledge_self_set?, csrf_token}` / `google.delegation.revoke_attestation {agent_id, csrf_token}` | Admin + step-up | SR4: protected-mode attestation that a Shared employee's delegate subject is the listed person (`google_delegate_attestation_rpc.rs`) |
 //! | `agents.google_identity_get {agent_id}` | Viewer of the employee | the identity in effect and whether it can be used now |
 //! | `agents.google_identity_set {agent_id, identity, fallback?, requesters?}` | Admin | write `[google]` (B2a: `home`, `none`, `delegate:<email>`) |
 //! | `google.identity.test {agent_id}` | Admin | mint for the subject and read one profile; sends nothing |

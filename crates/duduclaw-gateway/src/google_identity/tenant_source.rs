@@ -48,6 +48,12 @@
 //! delegate subject still refuses it (fail closed), but the conflict is shown
 //! to Admins ([`subject_notice`]) and audited by the bridge.
 //!
+//! SR4 round 3: only a pure-ASCII value can be inert (N3); an attestation
+//! binds the live employee id and incarnation of the label, not the label
+//! alone (N2, [`Incarnation`]); the Admin notice names the holder an
+//! attestation would bind (N1); and an Admin identity test is admitted only
+//! for a subject the rule could admit ([`admit_for_identity_test`]).
+//!
 //! Every read fails closed: unreadable or malformed config or key material is
 //! `Unavailable`; a configuration that would let a failure fall back to a
 //! home source (`fallback = "home"`, an Apps Script bridge beside the
@@ -56,6 +62,7 @@ use std::{io::Read as _, path::Path};
 
 use duduclaw_auth::UserDb;
 use duduclaw_core::google_identity::{self as gi, Effective, Fallback};
+use duduclaw_isolation::ids::EmployeeId;
 use duduclaw_mcp_boundary::VerificationError;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -167,8 +174,14 @@ pub(crate) enum SubjectUse {
 /// without a dot — e.g. the bootstrap `admin@local`), so it can never be the
 /// subject under any normalizer. Anything else the normalizer rejects is
 /// `Unavailable`: an address we cannot compare is never assumed to differ.
+///
+/// SR4 round 3 (N3): only a pure-ASCII value can be inert. A non-ASCII
+/// address the normalizer rejects (a full-width `＠`, an ideographic full stop
+/// `。`, an IDN domain) may well name a mailbox under another normalizer, so
+/// it is `Unavailable`.
 pub(crate) fn stored_email(raw: &str) -> Result<Option<String>, VerificationError> {
     if let Ok(email) = gi::normalize_email(raw) { return Ok(Some(email)); }
+    if !raw.is_ascii() { return Err(VerificationError::Unavailable); }
     let lowered = raw.trim().to_ascii_lowercase();
     let inert = match lowered.rsplit_once('@') {
         None => true,
@@ -191,8 +204,10 @@ pub(crate) fn stored_email(raw: &str) -> Result<Option<String>, VerificationErro
 ///
 /// SR4 item 1: a single current holder carries whether `agent`'s Admin
 /// attestation binds exactly `subject` to that account (unreadable ⇒
-/// `Unavailable`).
-pub(crate) fn subject_accounts(db: &UserDb, agent: &str, subject: &str)
+/// `Unavailable`). SR4 round 3 (N2): and to exactly `employee`, the live
+/// employee id and incarnation holding the label; `None` (not known) never
+/// counts as attested.
+pub(crate) fn subject_accounts(db: &UserDb, agent: &str, employee: Option<Incarnation>, subject: &str)
     -> Result<Vec<SubjectAccount>, VerificationError> {
     let users = db.list_users().map_err(|_| VerificationError::Unavailable)?;
     let mut accounts = Vec::new();
@@ -214,9 +229,26 @@ pub(crate) fn subject_accounts(db: &UserDb, agent: &str, subject: &str)
         && !account.user_id.is_empty()
     {
         let state = db.google_delegate_attestation(agent).map_err(|_| VerificationError::Unavailable)?;
-        account.attested = state.is_some_and(|state| state.binds(subject, &account.user_id));
+        account.attested = match (state, employee) {
+            (Some(state), Some((id, incarnation))) =>
+                state.binds(subject, &account.user_id, &hex::encode(id.0), incarnation),
+            _ => false,
+        };
     }
     Ok(accounts)
+}
+
+/// SR4 round 3 (N2): an employee's immutable registry id and incarnation.
+/// An attestation binds both; a recreated label (new id) or a restore (next
+/// incarnation) needs a fresh attestation.
+pub(crate) type Incarnation = (EmployeeId, u32);
+
+/// The live employee id and incarnation holding `agent`, `None` when the
+/// lifecycle cannot be read (then nothing is attested). Blocking (SQLite +
+/// root IPC).
+pub(crate) fn current_incarnation(home: &Path, agent: &str) -> Option<Incarnation> {
+    crate::isolation_lifecycle::read_lifecycle(home, agent).ok()
+        .map(|lifecycle| (lifecycle.employee, lifecycle.incarnation))
 }
 
 /// Where a configured subject stands under D-5, independent of the requester
@@ -293,25 +325,70 @@ pub(crate) fn admit_subject(source: &TenantSource, actor: Actor<'_>, accounts: &
     }
 }
 
+/// SR4 round 3 (item 5 residual): an Admin's `google.identity.test` mints
+/// tokens for the configured subject without any requester, so in protected
+/// mode it is admitted only where the D-5 rule could admit SOME requester:
+/// a designated service mailbox, or a person an Admin attested for exactly
+/// this employee incarnation ([`admit_subject`]'s states). Anything else —
+/// notably an unattested delegate person — is refused with the Admin notice
+/// text, before anything is minted. Blocking reads.
+pub(crate) fn admit_for_identity_test(home: &Path, agent: &str, db: Option<&UserDb>, employee: Option<Incarnation>)
+    -> Result<(), String> {
+    let source = match read(home, agent) {
+        Ok(Some(source)) => source,
+        Ok(None) => return Err(SubjectState::NotAdmissible.message().to_owned()),
+        Err(TenantSourceError::Unavailable) => return Err(SOURCE_UNAVAILABLE.to_owned()),
+        Err(TenantSourceError::Refused) => return Err(SOURCE_REFUSED.to_owned()),
+    };
+    let db = db.ok_or_else(|| USERS_UNAVAILABLE.to_owned())?;
+    let accounts = subject_accounts(db, agent, employee, source.subject()).map_err(|_| USERS_UNAVAILABLE.to_owned())?;
+    match subject_state(&source, &accounts) {
+        SubjectState::ServiceMailbox | SubjectState::AttestedPerson => Ok(()),
+        refused => Err(refused.message().to_owned()),
+    }
+}
+
+const SOURCE_UNAVAILABLE: &str = "Google 租戶來源設定或金鑰無法讀取，已停止使用。";
+const SOURCE_REFUSED: &str = "這個 Google 設定在受保護模式下不允許（例如失敗時改用全公司帳號）。";
+const USERS_UNAVAILABLE: &str = "帳號資料無法讀取，或有無法辨識的登入 email，無法確認信箱歸屬，已停止使用。";
+
 /// SR4 items 1 / 2(iv): the Admin notice of `agent`'s tenant-source subject
 /// (`null` when its Google identity is no tenant source). Blocking reads.
+///
+/// SR4 round 3 (N1 (2)): for `attestation_required` and `attested_person`
+/// the notice names the single current holder the Admin attests (or
+/// attested): `holder {user_id, name, created_at, email_self_set}` —
+/// `email_self_set` when the account itself set the current address. (N2) An
+/// attestation counts only for the live employee incarnation of the label.
 pub(crate) fn subject_notice(home: &Path, agent: &str, db: Option<&UserDb>) -> serde_json::Value {
+    subject_notice_with(home, agent, db, || current_incarnation(home, agent))
+}
+
+/// [`subject_notice`] with the live employee incarnation supplied (read only
+/// when the employee has a tenant source).
+pub(crate) fn subject_notice_with(home: &Path, agent: &str, db: Option<&UserDb>,
+    employee: impl FnOnce() -> Option<Incarnation>) -> serde_json::Value {
     let notice = |state: &str, message: &str| json!({ "state": state, "message": message });
     let source = match read(home, agent) {
         Ok(None) => return serde_json::Value::Null,
         Ok(Some(source)) => source,
-        Err(TenantSourceError::Unavailable) =>
-            return notice("unavailable", "Google 租戶來源設定或金鑰無法讀取，已停止使用。"),
-        Err(TenantSourceError::Refused) =>
-            return notice("refused", "這個 Google 設定在受保護模式下不允許（例如失敗時改用全公司帳號）。"),
+        Err(TenantSourceError::Unavailable) => return notice("unavailable", SOURCE_UNAVAILABLE),
+        Err(TenantSourceError::Refused) => return notice("refused", SOURCE_REFUSED),
     };
-    let users_unavailable = || notice("users_unavailable",
-        "帳號資料無法讀取，或有無法辨識的登入 email，無法確認信箱歸屬，已停止使用。");
+    let users_unavailable = || notice("users_unavailable", USERS_UNAVAILABLE);
     let Some(db) = db else { return users_unavailable() };
-    let Ok(accounts) = subject_accounts(db, agent, source.subject()) else { return users_unavailable() };
+    let Ok(accounts) = subject_accounts(db, agent, employee(), source.subject()) else { return users_unavailable() };
     let state = subject_state(&source, &accounts);
-    json!({ "state": state.code(), "message": state.message(), "subject": source.subject(),
-        "kind": source.kind().as_str() })
+    let mut value = json!({ "state": state.code(), "message": state.message(), "subject": source.subject(),
+        "kind": source.kind().as_str() });
+    if let (SubjectState::AttestationRequired | SubjectState::AttestedPerson, [account]) = (state, accounts.as_slice()) {
+        // The person an Admin attests is exactly this holder; unreadable ⇒
+        // nothing to attest against.
+        let Ok(Some(holder)) = db.google_delegate_holder(&account.user_id) else { return users_unavailable() };
+        value["holder"] = json!({ "user_id": holder.user_id, "name": holder.display_name,
+            "created_at": holder.created_at, "email_self_set": holder.email_self_set });
+    }
+    value
 }
 
 /// Upper bound of employee directories scanned for a delegate subject.

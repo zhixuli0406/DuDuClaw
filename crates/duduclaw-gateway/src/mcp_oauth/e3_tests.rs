@@ -215,6 +215,42 @@ async fn sr4_concurrent_github_refreshes_spend_the_refresh_token_once() {
     assert_eq!(stored_github(home.path()), ("fixture-new-access".into(), Some("fixture-new-refresh".into())));
 }
 
+/// SR4 round 3 (item 3 residual): a refresh another PROCESS is running (it
+/// holds the advisory file lock) is waited for; its rotated pair is reused
+/// and the spent refresh token is never sent a second time.
+#[cfg(unix)]
+#[tokio::test]
+async fn sr4r3_github_refresh_waits_for_another_process() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    // Any connection to the token endpoint would spend the old refresh token.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let endpoint = tokio::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await { counted.fetch_add(1, Ordering::SeqCst); }
+    });
+    expired_github_home(home.path(), format!("http://127.0.0.1:{port}/login/oauth/access_token"));
+    // Another process is refreshing: it holds the cross-process lock.
+    let held = duduclaw_core::fs_lock::lock_exclusive(
+        &crate::github_workspace::refresh_file_lock_path(home.path())).unwrap();
+    let refresh = crate::github_workspace::get_valid_github_token(home.path());
+    tokio::pin!(refresh);
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(300), &mut refresh).await.is_err(),
+        "the refresh waits for the other process");
+    // The other process stores the rotated pair and releases the lock.
+    upsert_token(home.path(), McpOAuthToken { provider_id: "github".into(), access_token: "fixture-other-process".into(),
+        refresh_token: Some("fixture-other-refresh".into()),
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(8)), scopes: vec!["repo".into()] }).unwrap();
+    drop(held);
+    let token = tokio::time::timeout(std::time::Duration::from_secs(10), &mut refresh).await
+        .expect("finished once the lock was released").unwrap();
+    assert_eq!(token, "fixture-other-process");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "the spent refresh token is never sent again");
+    assert_eq!(stored_github(home.path()), ("fixture-other-process".into(), Some("fixture-other-refresh".into())));
+    endpoint.abort();
+}
+
 /// SR4 item 3: a dead-grant answer revokes the home consent only when the
 /// stored refresh token (re-read under the lock) is still the one spent.
 #[cfg(unix)]

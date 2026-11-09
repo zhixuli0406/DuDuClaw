@@ -1927,11 +1927,18 @@ pub fn remove_personal_agent_in_transaction(
 /// ACL generation even when no binding was left (a retry of a half-finished
 /// tombstone still invalidates every cached live ACL). Returns the number of
 /// bindings removed.
+///
+/// SR4 round 3 (N2): also removes the label's Google delegate-subject
+/// attestation (audited, `reason = employee_retired`); a recreated employee
+/// under the label needs a fresh one (it is also bound to the employee id and
+/// incarnation, so a missed removal never binds the new employee).
 pub fn remove_shared_bindings_in_transaction(
     tx: &rusqlite::Transaction<'_>, agent: &str,
 ) -> Result<usize, PersonalAgentError> {
     if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
     if personal_agent_owner(tx, agent)?.is_some() { return Err(PersonalAgentError::OwnerConflict); }
+    crate::google_delegate_attestation::revoke_in_transaction(tx, agent, "employee_retired")
+        .map_err(PersonalAgentError::Store)?;
     let removed = tx.execute("DELETE FROM user_agent_bindings WHERE agent_name = ?1", [agent])
         .map_err(PersonalAgentError::store)?;
     tx.execute(

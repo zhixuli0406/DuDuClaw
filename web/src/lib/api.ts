@@ -6072,6 +6072,45 @@ export interface AgentGoogleIdentity {
   state: 'home' | 'none' | 'ready' | 'blocked' | 'configured' | 'needs_reconnect' | 'not_connected' | 'awaiting_consent' | 'consent_declined' | 'person_inactive' | 'no_owner' | 'ambiguous_owner';
   /** zh-TW reason when blocked. */
   message: string;
+  /** Protected mode only: the D-5 standing of a tenant-source subject (`null` elsewhere). */
+  tenant_subject?: GoogleTenantSubjectNotice | null;
+}
+/** SR4 round 3: the account an Admin attests a delegate subject belongs to. */
+export interface GoogleTenantSubjectHolder {
+  user_id: string;
+  name: string;
+  /** Account creation time (RFC 3339). */
+  created_at: string;
+  /** The account set this address as its own login email itself. */
+  email_self_set: boolean;
+}
+export interface GoogleTenantSubjectNotice {
+  state:
+    | 'service_mailbox'
+    | 'service_mailbox_conflict'
+    | 'attested_person'
+    | 'attestation_required'
+    | 'ambiguous'
+    | 'person_inactive'
+    | 'not_admissible'
+    | 'users_unavailable'
+    | 'unavailable'
+    | 'refused';
+  /** zh-TW explanation. */
+  message: string;
+  subject?: string;
+  kind?: 'delegate' | 'service_account';
+  /** Present for `attestation_required` / `attested_person`. */
+  holder?: GoogleTenantSubjectHolder;
+}
+/** `google.delegation.attest_subject` (Admin + step-up). */
+export interface GoogleAttestSubjectInput {
+  agent_id: string;
+  subject: string;
+  /** The holder shown to the Admin (`tenant_subject.holder.user_id`). */
+  user_id: string;
+  /** Required when `holder.email_self_set`. */
+  acknowledge_self_set: boolean;
 }
 export interface GoogleDelegationKeyInfo {
   client_email: string;
@@ -6206,6 +6245,8 @@ export interface ProtectedTenantSourceView {
   settings_error: string | null;
   home_subject: string | null;
   required_scopes: string[];
+  /** Per-employee identity rows (`tenant_subject` names who needs an Admin confirmation). */
+  agents?: AgentGoogleIdentity[];
 }
 /** `website_credentials.list` metadata; the list never carries the password. */
 export interface ProtectedWebsiteCredential {
@@ -9823,6 +9864,21 @@ export const api = {
       client.call('isolation.connector_import_legacy', { csrf_token: csrf }) as Promise<ProtectedImportResult>,
     tenantSource: () =>
       client.call('google.delegation.get') as Promise<ProtectedTenantSourceView>,
+    attestSubject: (input: GoogleAttestSubjectInput, csrf: number[]) =>
+      client.call('google.delegation.attest_subject', { ...input, csrf_token: csrf }) as Promise<{
+        agent_id: string;
+        subject: string;
+        user_id: string;
+        attested_at: string;
+        email_self_set: boolean;
+        acknowledged_self_set: boolean;
+        attestation: string;
+      }>,
+    revokeAttestation: (agentId: string, csrf: number[]) =>
+      client.call('google.delegation.revoke_attestation', { agent_id: agentId, csrf_token: csrf }) as Promise<{
+        agent_id: string;
+        revoked: boolean;
+      }>,
     websiteCredentials: () =>
       client.call('website_credentials.list', {}) as Promise<{ credentials: ProtectedWebsiteCredential[] }>,
   },

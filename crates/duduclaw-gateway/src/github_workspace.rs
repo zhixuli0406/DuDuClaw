@@ -277,6 +277,29 @@ fn refresh_gate(home_dir: &Path, provider: &str) -> std::sync::Arc<tokio::sync::
     gates.entry(key).or_default().clone()
 }
 
+/// SR4 round 3 (item 3 residual): the in-process [`refresh_gate`] does not
+/// serialize two PROCESSES (the gateway and a `duduclaw mcp` server both call
+/// [`get_valid_github_token`]). Under the gate an advisory file lock on
+/// `<home>/locks/oauth-github-refresh.lock` is held for the whole refresh, so
+/// only one process at a time can spend the single-use refresh token; the
+/// other re-reads the rotated pair once it gets the lock.
+pub(crate) fn refresh_file_lock_path(home_dir: &Path) -> std::path::PathBuf {
+    // `fs_lock` locks the `<path>.lock` sidecar.
+    home_dir.join("locks").join("oauth-github-refresh")
+}
+/// Upper bound on waiting for another process's refresh (its HTTP exchange is
+/// itself time-bounded).
+const REFRESH_FILE_LOCK_WAIT: Duration = Duration::from_secs(90);
+const REFRESH_LOCK_UNAVAILABLE: &str = "another GitHub token refresh did not finish in time";
+
+async fn refresh_file_lock(home_dir: &Path) -> Result<duduclaw_core::fs_lock::FileLockGuard, GithubAuthError> {
+    let path = refresh_file_lock_path(home_dir);
+    tokio::task::spawn_blocking(move || duduclaw_core::fs_lock::lock_exclusive_within(&path, REFRESH_FILE_LOCK_WAIT))
+        .await
+        .map_err(|_| GithubAuthError::RefreshFailed(REFRESH_LOCK_UNAVAILABLE.into()))?
+        .map_err(|_| GithubAuthError::RefreshFailed(REFRESH_LOCK_UNAVAILABLE.into()))
+}
+
 /// Return a valid GitHub access token, refreshing in place only when the token
 /// actually has an expiry and a stored refresh_token (OAuth App token
 /// expiration enabled). The common no-expiry case returns the stored token.
@@ -298,7 +321,9 @@ pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAut
 
     let gate = refresh_gate(home_dir, GITHUB_PROVIDER);
     let _refreshing = gate.lock().await;
-    // Re-read under the lock: another task may have refreshed meanwhile.
+    // SR4 round 3: and across processes (held until this function returns).
+    let _cross_process = refresh_file_lock(home_dir).await?;
+    // Re-read under the lock: another task or process may have refreshed meanwhile.
     if let Some(t) = mcp_oauth::get_token(home_dir, GITHUB_PROVIDER) {
         return Ok(t.access_token);
     }

@@ -15,6 +15,7 @@ import {
   Input,
 } from '@/components/mds';
 import { StepUpFields, useStepUpAction } from './step-up';
+import { DelegateAttestationCard } from './DelegateAttestationCard';
 import { Refusal, formatWhen, refusalMessage, useOptionalT, useProtectedPage, useT } from './shared';
 
 /**
@@ -152,6 +153,8 @@ export function TenantSourceTab() {
               {data.settings_error && <p role="alert" className="mt-2 text-sm text-destructive">{data.settings_error}</p>}
             </CardContent>
           </Card>
+
+          <DelegateAttestationCard agents={data.agents} onChanged={load} />
 
           <form onSubmit={(e) => void save(e)} className="space-y-6">
             <Card>

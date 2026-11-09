@@ -163,7 +163,9 @@ impl GoogleIsolationBridge {
         // not) a person: refuse rather than guess.
         let db = people.user_db().ok_or(VerificationError::Unavailable)?;
         // SR4 item 1: carries this employee's Admin attestation of the subject.
-        let accounts = tenant_source::subject_accounts(db, &self.agent, source.subject())?;
+        // SR4 round 3 (N2): only an attestation of the employee id and
+        // incarnation these routes were read (and pinned) for counts.
+        let accounts = tenant_source::subject_accounts(db, &self.agent, Some(routes.pinned), source.subject())?;
         self.notice_refused_subject(source, &accounts);
         let route = Self::tenant_route(routes, &context.record().employee_binding, requester, source, &accounts, tool)?;
         // Use-time recheck: the source (config + key material) and the catalog
