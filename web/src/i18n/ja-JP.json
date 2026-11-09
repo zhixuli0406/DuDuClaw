@@ -9711,6 +9711,7 @@
   "identityTransition.offerGrace": "一時的に緩和する（最大 {days} 日）",
   "identityTransition.graceExplain": "緩和すると AI スタッフの本人確認がオフになります。DuDuClaw は本人確認できない操作も受け付けるため、ある AI スタッフが別のスタッフになりすませる状態になります。{until}（{days} 日後）に自動的に終了し、いつでも早めに終了できます。この変更は config.toml に書き込まれ、セキュリティ監査ログに記録されます。",
   "identityTransition.passwordLabel": "確認のため、現在のログインパスワードを入力してください",
+  "identityTransition.mfaCodeLabel": "アカウントで二段階認証が有効です。認証アプリのコード（またはリカバリーコード）を入力してください",
   "identityTransition.confirmGrace": "{days} 日間緩和する",
   "identityTransition.cancel": "キャンセル",
   "identityTransition.endGrace": "猶予期間をすぐに終了する",

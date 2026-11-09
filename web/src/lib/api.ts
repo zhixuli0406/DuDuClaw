@@ -7825,9 +7825,10 @@ export const api = {
       client.call('system.autostart.set', { enabled }) as Promise<AutostartStatus>,
     /** RM-166: accept unverified AI-employee identities for at most 30 days
      *  (admin). Needs the caller's own current password (step-up); audited. */
-    identityGraceStart: (password: string, days?: number) =>
+    identityGraceStart: (password: string, days?: number, code?: string) =>
       client.call('system.identity_grace_start', {
         password,
+        ...(code ? { code } : {}),
         ...(days !== undefined ? { days } : {}),
       }) as Promise<IdentityGraceResult>,
     /** RM-166: end the identity grace now — strict mode again (admin). */

@@ -29,6 +29,8 @@ export function IdentityTransitionBanner() {
   const identity = useSystemStore((s) => s.status?.identity_token);
   const [confirming, setConfirming] = useState(false);
   const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [needCode, setNeedCode] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [restartRequired, setRestartRequired] = useState(false);
@@ -61,13 +63,21 @@ export function IdentityTransitionBanner() {
     setBusy(true);
     setError(null);
     try {
-      const result = await api.system.identityGraceStart(password, maxDays);
+      const result = await api.system.identityGraceStart(password, maxDays, needCode ? code.trim() : undefined);
       apply(result);
       setRestartRequired(result.restart_required === true);
       setConfirming(false);
       setPassword('');
+      setCode('');
+      setNeedCode(false);
     } catch (e) {
-      fail(e);
+      // The gateway refuses with MFA_CODE_REQUIRED when the admin has MFA on:
+      // ask for the authenticator / recovery code, keep the password.
+      if ((e instanceof Error ? e.message : String(e)).includes('MFA_CODE_REQUIRED')) {
+        setNeedCode(true);
+      } else {
+        fail(e);
+      }
     } finally {
       setBusy(false);
     }
@@ -152,8 +162,26 @@ export function IdentityTransitionBanner() {
                   autoComplete="current-password"
                 />
               </div>
+              {needCode && (
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-muted-foreground" htmlFor="identity-grace-code">
+                    {intl.formatMessage({ id: 'identityTransition.mfaCodeLabel' })}
+                  </label>
+                  <Input
+                    id="identity-grace-code"
+                    value={code}
+                    onChange={(e) => setCode(e.target.value)}
+                    autoComplete="one-time-code"
+                    inputMode="text"
+                  />
+                </div>
+              )}
               <div className="flex flex-wrap gap-2">
-                <Button size="sm" onClick={() => void startGrace()} disabled={busy || password.length === 0}>
+                <Button
+                  size="sm"
+                  onClick={() => void startGrace()}
+                  disabled={busy || password.length === 0 || (needCode && code.trim().length === 0)}
+                >
                   {intl.formatMessage({ id: 'identityTransition.confirmGrace' }, { days: maxDays })}
                 </Button>
                 <Button
@@ -162,6 +190,8 @@ export function IdentityTransitionBanner() {
                   onClick={() => {
                     setConfirming(false);
                     setPassword('');
+                    setCode('');
+                    setNeedCode(false);
                     setError(null);
                   }}
                   disabled={busy}

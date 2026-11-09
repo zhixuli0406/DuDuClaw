@@ -134,6 +134,12 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
     let mentions_identity_key = normalized.contains(crate::identity_token::IDENTITY_KEY_FILE);
     // RM-166 round 2: the gateway-owned identity-transition record. The
     // basename is DuDuClaw-specific, like `identity.key`.
+    // NOTE (RM-166 N4): this record is NOTICE-ONLY. It only drives the
+    // dashboard banner's "first started" / notice window; deleting or editing
+    // it can at most reopen or close that notice and never weakens strict
+    // identity verification (the enforced setting lives in config.toml). This
+    // substring match is a courtesy against accidental edits, NOT an
+    // enforcement boundary — do not rely on it for security.
     let mentions_identity_state =
         normalized.contains(crate::identity_token::IDENTITY_TRANSITION_FILE);
     let mentions_hook_settings = HOOK_SETTINGS_FILES

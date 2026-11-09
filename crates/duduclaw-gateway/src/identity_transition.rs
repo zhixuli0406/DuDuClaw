@@ -279,6 +279,19 @@ pub(crate) async fn commit_grace_edit(
         .ok_or("config.toml 的 [delegation] 格式不正確，無法變更。")?;
     match edit {
         GraceEdit::Start { grace_until } => {
+            // Atomic "no silent extension" (RM-166 N2): decided on the very
+            // snapshot whose content hash the locked commit below compares, so
+            // of two concurrent starts exactly one can win — the other either
+            // sees the active grace here or fails the hash compare.
+            let weakened = section.get("require_identity_token") == Some(&toml::Value::Boolean(false));
+            let active = section
+                .get("identity_token_grace_until")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .is_some_and(|d| d.with_timezone(&Utc) > Utc::now());
+            if weakened && active {
+                return Err("目前已在寬限期內；如需重新設定，請先結束寬限期。".into());
+            }
             section.insert("require_identity_token".into(), toml::Value::Boolean(false));
             section.insert("identity_token_grace_until".into(), toml::Value::String(grace_until));
         }
@@ -444,6 +457,43 @@ mod tests {
         assert!(std::fs::read_to_string(h.path().join("config.toml")).unwrap().contains("# operator note"));
         // Nothing left to end.
         assert!(!commit_grace_edit(h.path(), GraceEdit::End, || Ok(())).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rm166c_concurrent_grace_starts_cannot_extend_an_active_grace() {
+        let h = existing_install("[gateway]\nport = 18789\n");
+        let home = h.path().to_path_buf();
+        let mut tasks = Vec::new();
+        for days in [3, 7, 11, 17, 23, 30] {
+            let home = home.clone();
+            tasks.push(tokio::spawn(async move {
+                let until = manual_grace_deadline(Utc::now(), days).unwrap();
+                commit_grace_edit(&home, GraceEdit::Start { grace_until: until.clone() }, || Ok(()))
+                    .await
+                    .map(|_| until)
+            }));
+        }
+        let mut winners = Vec::new();
+        for t in tasks {
+            if let Ok(until) = t.await.unwrap() {
+                winners.push(until);
+            }
+        }
+        assert_eq!(winners.len(), 1, "{winners:?}");
+        assert_eq!(
+            delegation(&home).get("identity_token_grace_until").and_then(|v| v.as_str()),
+            Some(winners[0].as_str())
+        );
+
+        // Sequentially, too: an active grace refuses; an expired one does not.
+        let again = manual_grace_deadline(Utc::now(), 30).unwrap();
+        assert!(commit_grace_edit(&home, GraceEdit::Start { grace_until: again.clone() }, || Ok(())).await.is_err());
+        std::fs::write(
+            home.join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = \"2020-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+        assert!(commit_grace_edit(&home, GraceEdit::Start { grace_until: again }, || Ok(())).await.unwrap());
     }
 
     #[test]

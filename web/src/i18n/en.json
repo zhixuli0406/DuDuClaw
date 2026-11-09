@@ -9711,6 +9711,7 @@
   "identityTransition.offerGrace": "Relax temporarily (up to {days, plural, one {# day} other {# days}})",
   "identityTransition.graceExplain": "Relaxing turns identity verification off for AI employees: DuDuClaw will also accept actions whose identity cannot be confirmed, so one AI employee could act as another. It ends automatically on {until} ({days, plural, one {# day} other {# days}}), and you can end it earlier at any time. The change is written to config.toml and recorded in the security audit log.",
   "identityTransition.passwordLabel": "Enter your current sign-in password to confirm",
+  "identityTransition.mfaCodeLabel": "Two-step verification is on for your account: enter your authenticator code (or a recovery code)",
   "identityTransition.confirmGrace": "Relax for {days, plural, one {# day} other {# days}}",
   "identityTransition.cancel": "Cancel",
   "identityTransition.endGrace": "End the grace period now",

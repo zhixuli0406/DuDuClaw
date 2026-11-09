@@ -7,10 +7,13 @@
 //! `identity_token_grace_until` at most 30 days ahead, the existing
 //! mechanism the reader enforces — and end it at any time:
 //!
-//! - `system.identity_grace_start { password, days? }` — Admin (dispatch),
-//!   re-checked live, plus a **fresh step-up**: the caller's own current
-//!   password in this request, against the same credential epoch as the
-//!   session (the `mfa.disable` pattern), rate-limited like a login. The
+//! - `system.identity_grace_start { password, code?, days? }` — Admin
+//!   (dispatch), re-checked live, plus a **fresh step-up**: the caller's own
+//!   current password in this request, against the same credential epoch as
+//!   the session (the `mfa.disable` pattern), rate-limited like a login; an
+//!   admin with MFA active must also send `code` (TOTP or recovery code),
+//!   else the refusal is exactly `MFA_CODE_REQUIRED`. Failed password/MFA
+//!   step-ups are audited (`identity_token_grace_step_up_failed`). The
 //!   audit row is written (fail closed) before `config.toml` changes.
 //! - `system.identity_grace_end {}` — Admin; the safe direction, so no
 //!   step-up (like `maintenance.disable`). Audited.
@@ -27,6 +30,12 @@ pub(crate) const EVENT_GRACE_MANUAL_ENABLED: &str = "identity_token_grace_manual
 pub(crate) const EVENT_GRACE_MANUAL_FAILED: &str = "identity_token_grace_manual_failed";
 pub(crate) const EVENT_GRACE_ENDED: &str = "identity_token_grace_ended";
 
+pub(crate) const EVENT_GRACE_STEP_UP_FAILED: &str = "identity_token_grace_step_up_failed";
+
+/// Refusal code (the whole error string) the dashboard keys on to ask for the
+/// authenticator / recovery code; not a failed attempt.
+pub(crate) const MFA_CODE_REQUIRED: &str = "MFA_CODE_REQUIRED";
+const STEP_UP_FAILED_MFA: &str = "驗證碼不正確，未變更身分驗證設定。";
 const STEP_UP_REQUIRED: &str = "請輸入您目前的登入密碼以確認這項變更。";
 const STEP_UP_FAILED: &str = "密碼不正確，未變更身分驗證設定。";
 
@@ -82,24 +91,57 @@ impl MethodHandler {
 
         // Fresh step-up: live Admin + the caller's own current password, for
         // the credential epoch this session was issued under.
-        let (id, epoch, step_db) = (ctx.user_id.clone(), ctx.credential_epoch, db.clone());
-        let step_up = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            crate::mfa::require_admin(&step_db, &id)?;
-            let user = step_db.get_user(&id)?.ok_or("無法讀取帳號資料。")?;
+        // An admin with MFA active must also present a TOTP / recovery code
+        // (RM-166 N1), verified like `mfa.disable` does; no MFA: password only.
+        let code = params
+            .get("code")
+            .and_then(Value::as_str)
+            .map(|c| c.trim().to_owned())
+            .filter(|c| !c.is_empty() && c.len() <= 64);
+        let (id, epoch, step_db, home) =
+            (ctx.user_id.clone(), ctx.credential_epoch, db.clone(), self.home_dir.clone());
+        // Err((message, failed_step)): `failed_step` is Some for a failed
+        // credential check (audited), None for a refusal that is not a failure.
+        let step_up = tokio::task::spawn_blocking(move || -> Result<&'static str, (String, Option<&'static str>)> {
+            crate::mfa::require_admin(&step_db, &id).map_err(|e| (e, None))?;
+            let user = step_db
+                .get_user(&id)
+                .map_err(|e| (e, None))?
+                .ok_or(("無法讀取帳號資料。".to_string(), None))?;
             let verified = step_db
                 .verify_password(&user.email, &password)
-                .map_err(|_| STEP_UP_FAILED.to_string())?;
+                .map_err(|_| (STEP_UP_FAILED.to_string(), Some("password")))?;
             if verified.id != id || verified.credential_epoch != epoch {
-                return Err("登入憑證已失效，請重新登入。".into());
+                return Err(("登入憑證已失效，請重新登入。".into(), None));
             }
-            Ok(())
+            if !step_db.mfa_active(&id).map_err(|e| (e, None))? {
+                return Ok("password");
+            }
+            let Some(code) = code else {
+                return Err((MFA_CODE_REQUIRED.to_string(), None));
+            };
+            let now = chrono::Utc::now().timestamp();
+            step_db
+                .mfa_step_up_verify(&id, &code, &crate::mfa::Cipher(&home), now)
+                .map_err(|_| (STEP_UP_FAILED_MFA.to_string(), Some("mfa")))?;
+            Ok("password+mfa")
         })
         .await
         .map_err(|_| "身分確認暫時無法進行，請稍後再試。".to_string())?;
-        if let Err(e) = step_up {
-            let _ = db.log_action(Some(&ctx.user_id), "identity.grace_step_up_failed", None, None, None);
-            return Err(e);
-        }
+        let step_up = match step_up {
+            Ok(kind) => kind,
+            Err((message, failed_step)) => {
+                if let Some(step) = failed_step {
+                    let _ = db.log_action(Some(&ctx.user_id), "identity.grace_step_up_failed", None, None, None);
+                    // Best-effort: a failed attempt is evidence, never a gate.
+                    duduclaw_security::audit::append_audit_event(
+                        &self.home_dir,
+                        &grace_event(EVENT_GRACE_STEP_UP_FAILED, ctx, json!({"failed_step": step})),
+                    );
+                }
+                return Err(message);
+            }
+        };
 
         // Audit first, fail closed: no weakening without a record of who,
         // until when and why.
@@ -112,7 +154,7 @@ impl MethodHandler {
                 "days": days,
                 "untrusted_refusals_24h": refusals,
                 "weakens": "unverified AI-employee identity claims are accepted until grace_until",
-                "step_up": "password",
+                "step_up": step_up,
             }),
         );
         duduclaw_security::audit::try_append_audit_event(&self.home_dir, &event)
@@ -274,10 +316,77 @@ mod tests {
         let raw = std::fs::read_to_string(h.join("security_audit.jsonl")).unwrap();
         assert!(raw.contains(&ctx.user_id) && raw.contains(&until));
         assert!(!raw.contains(PASSWORD), "the password is never audited");
+        assert!(raw.contains(r#""step_up":"password""#), "no MFA: password-only step-up: {raw}");
+        assert!(types.iter().any(|t| t == EVENT_GRACE_STEP_UP_FAILED), "wrong password is audited: {types:?}");
 
         // Already in grace: no silent extension.
         assert!(is_err(&handler.handle_identity_grace_start(json!({"password": PASSWORD}), &ctx).await));
         assert_eq!(delegation(h).get("identity_token_grace_until").and_then(|v| v.as_str()), Some(until.as_str()));
+    }
+
+    fn totp(secret: &str) -> String {
+        use hmac::{Hmac, Mac};
+        let mut bytes = Vec::new();
+        let (mut acc, mut bits) = (0u32, 0);
+        for c in secret.bytes() {
+            let v = if c.is_ascii_uppercase() { c - b'A' } else { c - b'2' + 26 };
+            acc = (acc << 5) | v as u32;
+            bits += 5;
+            if bits >= 8 {
+                bits -= 8;
+                bytes.push((acc >> bits) as u8);
+            }
+        }
+        let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&bytes).unwrap();
+        mac.update(&((chrono::Utc::now().timestamp() / 30) as u64).to_be_bytes());
+        let hash = mac.finalize().into_bytes();
+        let offset = (hash[19] & 15) as usize;
+        let value = u32::from_be_bytes(hash[offset..offset + 4].try_into().unwrap()) & 0x7fff_ffff;
+        format!("{:06}", value % 1_000_000)
+    }
+
+    #[tokio::test]
+    async fn rm166c_mfa_admin_needs_the_second_factor_and_failures_are_audited() {
+        let (home, handler, db, ctx) = fixture("grace-admin-mfa@test.invalid").await;
+        let h = home.path();
+        let now = chrono::Utc::now().timestamp();
+        let cipher = crate::mfa::Cipher(h);
+        let token = db.mfa_password_challenge(&ctx.user_id, PASSWORD, "test-session", now).unwrap();
+        db.mfa_prepare_enrollment(&token, false, now).unwrap();
+        let secret = db.mfa_begin(&ctx.user_id, Some(&token), &cipher, now).unwrap();
+        let recovery = db
+            .mfa_confirm(&ctx.user_id, Some(&token), &totp(&secret), &cipher, now)
+            .unwrap();
+        // Enrollment bumps the credential epoch: a fresh session context.
+        let ctx = db.live_user_context(&ctx.user_id).unwrap().unwrap();
+        let before = std::fs::read(h.join("config.toml")).unwrap();
+
+        // Password alone: a refusal code the UI keys on, not a failed attempt.
+        let frame = handler.handle_identity_grace_start(json!({"password": PASSWORD}), &ctx).await;
+        match &frame {
+            WsFrame::Response { ok: false, error: Some(e), .. } => assert_eq!(e, MFA_CODE_REQUIRED),
+            other => panic!("{}", serde_json::to_string(other).unwrap_or_default()),
+        }
+        assert!(!audit_types(h).iter().any(|t| t == EVENT_GRACE_STEP_UP_FAILED));
+
+        // Wrong code, wrong password: refused, written nothing, audited (N3).
+        assert!(is_err(&handler.handle_identity_grace_start(json!({"password": PASSWORD, "code": "000000"}), &ctx).await));
+        assert_eq!(audit_types(h).iter().filter(|t| *t == EVENT_GRACE_STEP_UP_FAILED).count(), 1);
+        assert!(is_err(&handler.handle_identity_grace_start(json!({"password": "nope", "code": "000000"}), &ctx).await));
+        assert_eq!(audit_types(h).iter().filter(|t| *t == EVENT_GRACE_STEP_UP_FAILED).count(), 2);
+        assert_eq!(std::fs::read(h.join("config.toml")).unwrap(), before);
+        assert!(!audit_types(h).iter().any(|t| t == EVENT_GRACE_MANUAL_ENABLED));
+        let raw = std::fs::read_to_string(h.join("security_audit.jsonl")).unwrap();
+        assert!(!raw.contains("000000") && !raw.contains(PASSWORD));
+
+        // Password + a recovery code: allowed, and the audit names the step-up.
+        ok(&handler
+            .handle_identity_grace_start(json!({"password": PASSWORD, "code": recovery[0]}), &ctx)
+            .await);
+        let raw = std::fs::read_to_string(h.join("security_audit.jsonl")).unwrap();
+        assert!(raw.contains("password+mfa"), "{raw}");
+        assert!(!raw.contains(&recovery[0]));
+        assert_eq!(identity_transition::effective_mode(h), "grace");
     }
 
     #[tokio::test]

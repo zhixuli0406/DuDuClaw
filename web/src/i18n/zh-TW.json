@@ -9711,6 +9711,7 @@
   "identityTransition.offerGrace": "暫時放寬（最多 {days} 天）",
   "identityTransition.graceExplain": "暫時放寬等於對 AI 員工關閉身分驗證：DuDuClaw 也會接受無法確認身分的操作，因此一位 AI 員工可能冒用另一位的身分。寬限期會在 {until}（{days} 天後）自動結束，您也可以隨時提前結束。這項變更會寫入 config.toml，並記錄在安全稽核紀錄中。",
   "identityTransition.passwordLabel": "請輸入您目前的登入密碼以確認",
+  "identityTransition.mfaCodeLabel": "您的帳號已啟用兩步驟驗證：請輸入驗證器上的驗證碼（或復原碼）",
   "identityTransition.confirmGrace": "確認放寬 {days} 天",
   "identityTransition.cancel": "取消",
   "identityTransition.endGrace": "立即結束寬限期",

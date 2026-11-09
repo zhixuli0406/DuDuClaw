@@ -111,6 +111,33 @@ describe('IdentityTransitionBanner', () => {
     expect(useSystemStore.getState().status?.identity_token?.mode).toBe('strict');
   });
 
+  it('asks for the authenticator code when the gateway requires MFA, then sends it', async () => {
+    setIdentity({ notice_active: true, untrusted_refusals_24h: 2 });
+    const graced = status({ mode: 'grace', days_left: 30, grace_until: '2026-12-09T00:00:00Z', explicit_setting: true });
+    mockWsClient.call
+      .mockRejectedValueOnce(new Error('MFA_CODE_REQUIRED'))
+      .mockResolvedValueOnce({ grace_until: '2026-12-09T00:00:00Z', restart_required: false, identity_token: graced });
+    renderWithProviders(<IdentityTransitionBanner />);
+    fireEvent.click(screen.getByRole('button', { name: /Relax temporarily/ }));
+    expect(screen.queryByLabelText(/authenticator code/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/current sign-in password/), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Relax for 30 days' }));
+
+    const codeInput = await screen.findByLabelText(/authenticator code/);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Relax for 30 days' })).toBeDisabled();
+    fireEvent.change(codeInput, { target: { value: '123456' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Relax for 30 days' }));
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenLastCalledWith('system.identity_grace_start', {
+        password: 'pw',
+        code: '123456',
+        days: 30,
+      }),
+    );
+    await waitFor(() => expect(useSystemStore.getState().status?.identity_token?.mode).toBe('grace'));
+  });
+
   it('shows days left during a grace and ends it in one click', async () => {
     setIdentity({ mode: 'grace', days_left: 12, grace_until: '2026-12-09T00:00:00Z', explicit_setting: true });
     mockWsClient.call.mockResolvedValue({ changed: true, identity_token: status({ mode: 'strict', explicit_setting: true }) });
