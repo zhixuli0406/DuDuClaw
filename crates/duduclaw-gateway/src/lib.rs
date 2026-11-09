@@ -106,6 +106,8 @@ pub(crate) mod isolation_restore_shared;
 // F6g adoption under a new employee id (§3.10); the request RPCs are F6d's.
 #[allow(dead_code)]
 pub(crate) mod isolation_adopt;
+// F6i quarantine cleanup (§3.8): purge after 90 days, early purge on request (S12).
+pub(crate) mod isolation_purge;
 pub mod migration_import;
 pub mod migration_startup;
 

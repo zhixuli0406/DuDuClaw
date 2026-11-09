@@ -147,6 +147,8 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "isolation.employee_restore_request_for_owner" | "isolation.adoption_request_for_owner"
         // F6k 共用員工還原（申請與選項）
         | "isolation.shared_restore_request" | "isolation.shared_restore_options"
+        // F6i 清除隔離區（滿 90 天直接清除；未滿 90 天申請提前清除）
+        | "isolation.quarantine_purge"
     )
 }
 

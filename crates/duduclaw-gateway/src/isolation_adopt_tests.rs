@@ -615,3 +615,7 @@ mod f6d;
 /// compensation after commit, path check, licence cap.
 #[path = "isolation_adopt_f6fb_tests.rs"]
 mod f6fb;
+
+/// F6i quarantine purge (§3.8): reuses this fixture and the adoption flow.
+#[path = "isolation_purge_tests.rs"]
+mod purge;

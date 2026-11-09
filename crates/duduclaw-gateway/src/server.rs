@@ -891,6 +891,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 Err(_) => warn!("employee adoption recovery at boot panicked"),
             }
         });
+        // F6i (§3.6): finish every quarantine purge a crash interrupted
+        // (`purging` row) before anything else runs for its label.
+        let purge_home = home_dir.clone();
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            match tokio::task::spawn_blocking(move || crate::isolation_purge::recover_purges_on_boot(&purge_home, now)).await {
+                Ok(Ok((finished, failed))) => {
+                    for (label, code) in &failed {
+                        warn!(label = %label, code, "quarantine purge recovery at boot refused; retried on the next purge");
+                    }
+                    if !finished.is_empty() { info!(count = finished.len(), "quarantine purges finished at boot"); }
+                }
+                Ok(Err(error)) => warn!(code = error.code(), "quarantine purge recovery at boot unavailable"),
+                Err(_) => warn!("quarantine purge recovery at boot panicked"),
+            }
+        });
     }
 
     // Initialize cost telemetry (must happen before any Claude CLI calls)

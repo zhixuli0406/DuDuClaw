@@ -60,6 +60,8 @@ pub(crate) enum RpcError {
     Adopt(AdoptError),
     /// F6k Shared restore (`isolation_restore_shared::SharedError`).
     Shared(crate::isolation_restore_shared::SharedError),
+    /// F6i quarantine purge (`isolation_purge::PurgeError`, never its `Restore` variant).
+    Purge(crate::isolation_purge::PurgeError),
     Invalid,
 }
 
@@ -81,6 +83,7 @@ impl RpcError {
             Self::Retire(r) => r.code(),
             Self::Adopt(a) => a.code(),
             Self::Shared(s) => s.code(),
+            Self::Purge(p) => p.code(),
             Self::Invalid => "INVALID_REQUEST",
         }
     }
@@ -90,6 +93,8 @@ impl RpcError {
             Self::Retire(r) => r.message(),
             Self::Adopt(a) => a.message(),
             Self::Shared(s) => s.message(),
+            Self::Purge(crate::isolation_purge::PurgeError::Restore(r)) => Self::Restore(r).message(),
+            Self::Purge(p) => p.message(),
             Self::Invalid => "申請內容不正確，請重新載入後再試。",
             Self::Factor(OwnerFactorError::NoFactor) => "請先設定兩步驟驗證",
             Self::Factor(OwnerFactorError::NotStrongest(_)) =>
@@ -314,7 +319,10 @@ pub(crate) fn list_restorable(home: &Path, caller: &str, now: i64) -> Result<Val
 pub(crate) fn admin_view(home: &Path, now: i64) -> Result<Value, RpcError> {
     engine::expire_requests(home, now)?;
     let db = engine::open_apply(home)?;
-    let rows: Vec<Value> = rows_where(home, None)?.iter().map(|q| row_value(&db, q, now)).collect::<Result<_, _>>()?;
+    let rows: Vec<Value> = rows_where(home, None)?.iter()
+        // F6i: each row's `purge` block (state, 90-day date, early_purge, purged_at).
+        .map(|q| row_value(&db, q, now).and_then(|value| crate::isolation_purge::extend_view(&db, q, value, now)))
+        .collect::<Result<_, _>>()?;
     let mut statement = db.prepare("SELECT request_id FROM employee_restores ORDER BY created_at DESC LIMIT ?1")
         .map_err(|_| Refusal::Unavailable)?;
     let ids: Vec<String> = statement.query_map([MAX_ROWS], |r| r.get(0)).map_err(|_| Refusal::Unavailable)?
