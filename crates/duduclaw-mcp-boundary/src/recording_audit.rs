@@ -116,6 +116,7 @@ impl StartRefusedLimiter {
                 false
             });
         }
+        let full = keys.len() >= START_REFUSED_KEYS;
         match keys.get_mut(&key) {
             Some(state) if !expired(state) => state.suppressed = state.suppressed.saturating_add(1),
             Some(state) => {
@@ -130,7 +131,7 @@ impl StartRefusedLimiter {
                     *state = RefusedState { window_start: now, suppressed: 0, first: event };
                 }
             }
-            None if keys.len() >= START_REFUSED_KEYS => {}
+            None if full => {}
             None => {
                 out.push(event.clone());
                 keys.insert(key, RefusedState { window_start: now, suppressed: 0, first: event });
