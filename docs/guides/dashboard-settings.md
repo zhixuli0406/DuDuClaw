@@ -443,6 +443,7 @@ Admin only, both editions.
 | Remove | deletes the sealed key (`google.delegation.remove_key`, confirmation) | Every employee acting as a colleague stops using Google (or falls back, where allowed). |
 | Allowed domains | `config.toml [integrations.google_identity] allowed_subject_domains` (`google.delegation.settings_set`) | Next call. Exact domain match. Empty: only the domain of `[integrations.google_service_account] subject`, or nobody. |
 | (no control) `default_identity` | `[integrations.google_identity] default_identity` = `home` (default) / `none` | What employees without `[google]` use. |
+| Protected mode → Google tenant source: Service mailboxes, Allowed scopes (v1.81.0, Team edition on native Linux protected mode; UI on the protected-mode page) | `config.toml [integrations.google_identity] service_mailboxes` and `tenant_scopes` (`google.delegation.tenant_settings_set`, Admin + password/two-step re-verification, audited) | Next tenant-source call; employees already running refuse until their tools are rebuilt. A service mailbox may not be any member's login email. Scopes must come from the scope list shown on the panel; empty = status only. The panel shows the source (domain delegation / service account) with a key fingerprint, never the key. |
 
 The list at the bottom shows each employee acting as a colleague and why it is blocked, if it is.
 

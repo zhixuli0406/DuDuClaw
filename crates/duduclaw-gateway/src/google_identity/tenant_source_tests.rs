@@ -141,3 +141,52 @@ fn e4_subject_rule_is_exact() {
     // …unless it is in fact a person's account.
     assert_eq!(admit_subject(&mailbox, Actor::Human("alice-id"), &alice), Err(VerificationError::BindingMismatch));
 }
+
+/// F5 UI-RPC: the dashboard view shows state and a fingerprint, never key
+/// material; unreadable material is `unavailable`, never a fingerprint.
+#[test]
+fn f5_dashboard_view_fingerprints_without_key_material() {
+    let home = Home::new();
+    let view = dashboard_view(home.path());
+    assert_eq!(view, json!({"delegate": {"state": "not_configured"}, "service_account": {"state": "not_configured"}}));
+
+    // Delegate: fingerprint of the sealed record; a re-import changes it.
+    home.sealed(SEALED);
+    let first = dashboard_view(home.path());
+    assert_eq!(first["delegate"]["state"], "installed");
+    assert_eq!(first["delegate"]["client_email"], "dwd@project.iam.gserviceaccount.com");
+    let fingerprint = first["delegate"]["fingerprint"].as_str().unwrap().to_owned();
+    assert_eq!(fingerprint.len(), 64);
+    assert!(!first.to_string().contains("body"), "{first}");
+    home.sealed(&SEALED.replace("body", "other"));
+    assert_ne!(dashboard_view(home.path())["delegate"]["fingerprint"].as_str(), Some(fingerprint.as_str()));
+    home.sealed("not json");
+    assert_eq!(dashboard_view(home.path())["delegate"], json!({"state": "unavailable"}));
+
+    // Service account: fingerprint of the Google key id, never the key.
+    let home = Home::new();
+    home.config(SA_SECTION);
+    assert_eq!(dashboard_view(home.path())["service_account"],
+        json!({"state": "unavailable", "subject": "support@customer.com"}), "missing key file");
+    std::fs::write(home.path().join("sa.json"), SA_KEY).unwrap();
+    let no_id = dashboard_view(home.path());
+    assert_eq!(no_id["service_account"]["state"], "installed");
+    assert_eq!(no_id["service_account"]["fingerprint"], serde_json::Value::Null, "no key id ⇒ no fingerprint");
+    let with_id = SA_KEY.replacen('{', r#"{"private_key_id":"abc123def456","#, 1);
+    std::fs::write(home.path().join("sa.json"), &with_id).unwrap();
+    let view = dashboard_view(home.path());
+    let sa = &view["service_account"];
+    assert_eq!((sa["state"].as_str(), sa["client_email"].as_str(), sa["subject"].as_str()),
+        (Some("installed"), Some("sa@project.iam.gserviceaccount.com"), Some("support@customer.com")));
+    let fingerprint = sa["fingerprint"].as_str().unwrap();
+    assert_eq!(fingerprint.len(), 64);
+    let text = view.to_string();
+    for secret in ["PRIVATE KEY", "fixture", "abc123def456"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    // The displayed fingerprint is not the bridge's pinned material digest.
+    assert_ne!(fingerprint, material_digest("service_account", with_id.as_bytes()));
+    std::fs::write(home.path().join("config.toml"), "not = [toml").unwrap();
+    assert_eq!(dashboard_view(home.path())["service_account"], json!({"state": "unavailable"}),
+        "an unparsable config is unavailable, never \"not configured\"");
+}

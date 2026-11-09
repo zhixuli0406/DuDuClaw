@@ -6,6 +6,7 @@
 //! | `google.delegation.import_key {key_json}` | Admin | validate + seal a service-account key with the protected key |
 //! | `google.delegation.remove_key {confirm}` | Admin | delete the sealed key |
 //! | `google.delegation.settings_set {allowed_subject_domains?, default_identity?}` | Admin | `[integrations.google_identity]` |
+//! | `google.delegation.tenant_settings_set {service_mailboxes, tenant_scopes, csrf_token}` | Admin + step-up | protected-mode tenant-source subjects/scopes (`google_tenant_settings_rpc.rs`) |
 //! | `agents.google_identity_get {agent_id}` | Viewer of the employee | the identity in effect and whether it can be used now |
 //! | `agents.google_identity_set {agent_id, identity, fallback?, requesters?}` | Admin | write `[google]` (B2a: `home`, `none`, `delegate:<email>`) |
 //! | `google.identity.test {agent_id}` | Admin | mint for the subject and read one profile; sends nothing |
@@ -171,6 +172,15 @@ impl MethodHandler {
                     Err(_) => Value::Null,
                 },
                 "settings_error": home_cfg.err(),
+                // v1.81 F5 (UI-RPC): the protected-mode tenant sources — state
+                // and key fingerprint only, never key material. The editable
+                // `service_mailboxes` / `tenant_scopes` are under `settings`;
+                // `tenant_settings_limits` bounds `google.delegation.tenant_settings_set`.
+                "tenant_source": crate::google_identity::tenant_source::dashboard_view(&home),
+                "tenant_settings_limits": {
+                    "max_service_mailboxes": super::google_tenant_settings_rpc::MAX_SERVICE_MAILBOXES,
+                    "max_tenant_scopes": super::google_tenant_settings_rpc::MAX_TENANT_SCOPES,
+                },
                 "home_subject": crate::google_identity::home_subject(&home),
                 "required_scopes": crate::google_workspace::REQUIRED_SCOPES,
                 "admin_console_path": ADMIN_CONSOLE_PATH,

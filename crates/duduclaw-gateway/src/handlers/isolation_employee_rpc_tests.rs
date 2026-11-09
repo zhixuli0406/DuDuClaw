@@ -907,3 +907,87 @@ fn tombstone_quarantine_rename_noreplace() {
     assert!(real.join(LABEL).join("SOUL.md").exists());
     assert!(!lifecycle::quarantine_path(f.home(), LABEL, receipt.employee, 0).exists());
 }
+
+/// Regular-file bytes under `dir`, counted independently of the seal walk.
+#[cfg(unix)]
+fn tree_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).unwrap().map(|entry| {
+        let entry = entry.unwrap();
+        let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+        if meta.is_dir() { tree_bytes(&entry.path()) } else if meta.is_file() { meta.len() } else { 0 }
+    }).sum()
+}
+
+/// F5 UI-RPC: the tombstone preview walks the live tree with the seal's walk
+/// and bounds, and has no side effect at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn f5_tombstone_preview_reports_size_and_has_no_side_effects() {
+    use crate::isolation_quarantine::{preview_live_tree_with, MAX_BYTES, MAX_DEPTH, MAX_ENTRIES};
+    let f = fixture();
+    let (_, receipt) = applied_personal(&f, 0xab, LABEL, &f.alice);
+    let employee = hex::encode(receipt.employee.0);
+    let agents = f.home().join("agents");
+
+    // Admin only; the request names the employee by id and nothing else.
+    let handler = MethodHandler::new(f.home().to_path_buf()).await;
+    let staff = handler.handle_isolation_employee(TOMBSTONE_PREVIEW, json!({"employee_id": employee}),
+        &caller(&f.alice, UserRole::Employee)).await;
+    assert_eq!(error_of(&staff), ADMIN_REQUIRED);
+    let system = handler.handle_isolation_employee(TOMBSTONE_PREVIEW, json!({"employee_id": employee}),
+        &UserContext::admin_fallback()).await;
+    assert_eq!(error_of(&system), NOT_ALLOWED);
+    for forged in [json!({"employee_id": employee, "label": LABEL}), json!({"label": LABEL}), json!({})] {
+        assert!(serde_json::from_value::<TombstonePreviewRequest>(forged).is_err());
+    }
+    let apply_before = std::fs::read(f.home().join(APPLY_DB)).unwrap();
+
+    // No tree: the tombstone would record `absent` (nothing to restore).
+    let absent = tombstone_preview(f.home(), &employee).unwrap();
+    assert_eq!((absent["predicted_seal"].as_str(), absent["restorable_after"].as_bool(), absent["estimated_bytes"].as_u64()),
+        (Some("absent"), Some(false), Some(0)));
+
+    write_agent_dir(&agents, LABEL);
+    let expected = tree_bytes(&agents.join(LABEL));
+    let value = tombstone_preview(f.home(), &employee).unwrap();
+    assert_eq!(value, json!({
+        "label": LABEL, "employee_id": employee, "kind": "personal",
+        "estimated_bytes": expected, "estimate_complete": true, "seal_limit_bytes": MAX_BYTES,
+        "within_limit": true, "predicted_seal": "sealed", "restorable_after": true,
+        "label_reserved_days": 90, "tombstone_available": true,
+    }));
+
+    // Over the byte or entry bound: oversize, not restorable.
+    let small = |max_entries: usize, max_bytes: u64| tombstone_preview_with(f.home(), &employee,
+        |label| preview_live_tree_with(f.home(), label, max_entries, max_bytes, MAX_DEPTH)).unwrap();
+    let oversize = small(MAX_ENTRIES, expected - 1);
+    assert_eq!((oversize["predicted_seal"].as_str(), oversize["within_limit"].as_bool(),
+        oversize["restorable_after"].as_bool(), oversize["estimate_complete"].as_bool()),
+        (Some("oversize"), Some(false), Some(false), Some(false)));
+    assert!(oversize["estimated_bytes"].as_u64().unwrap() > expected - 1);
+    assert_eq!(small(2, MAX_BYTES)["predicted_seal"], "oversize");
+    // A hard link (or special file) makes the seal `invalid`: never restorable.
+    std::fs::hard_link(agents.join(LABEL).join("SOUL.md"), f.home().join("soul-link")).unwrap();
+    let invalid = tombstone_preview(f.home(), &employee).unwrap();
+    assert_eq!((invalid["predicted_seal"].as_str(), invalid["restorable_after"].as_bool()), (Some("invalid"), Some(false)));
+    std::fs::remove_file(f.home().join("soul-link")).unwrap();
+
+    // Unknown, malformed or uppercase ids are refused.
+    for id in [hex::encode([9u8; 16]), employee.to_uppercase(), "nope".into()] {
+        assert_eq!(tombstone_preview(f.home(), &id).err(), Some(EMPLOYEE_NOT_FOUND), "{id}");
+    }
+
+    // Nothing changed: tree in place, no quarantine, apply.db byte-identical,
+    // the employee still live.
+    assert_eq!(tree_bytes(&agents.join(LABEL)), expected);
+    assert!(!f.home().join(lifecycle::QUARANTINE_DIR).exists());
+    assert_eq!(std::fs::read(f.home().join(APPLY_DB)).unwrap(), apply_before);
+    assert_eq!((mirror(f.home(), LABEL).as_deref(), members(&f, LABEL)), (Some(f.alice.as_str()), 1));
+
+    // After the tombstone the preview refuses.
+    let now = 10_000;
+    let input: TombstoneRequest = serde_json::from_value(json!({"label": LABEL, "employee_id": employee,
+        "csrf_token": CSRF})).unwrap();
+    tombstone(f.home(), Some(&proof(now)), &f.bob, input, now).unwrap();
+    assert_eq!(tombstone_preview(f.home(), &employee).err(), Some(ALREADY_TOMBSTONED));
+}

@@ -561,6 +561,63 @@ pub(crate) fn seal(home: &Path, label: &str, root: &crate::fs_safe::SafeDir, exp
     }
 }
 
+/// F6 Q5 / N3: a tombstoned label stays reserved (and restorable) this many
+/// days after the tombstone.
+pub(crate) const LABEL_RESERVED_DAYS: u32 = 90;
+
+/// What a tombstone of the live `agents/<label>` tree would seal now (F5
+/// UI-RPC tombstone preview). `bytes` is the regular-file total the walk
+/// counted; `complete = false` when the walk stopped early (oversize,
+/// invalid), so `bytes` is then a lower bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SealPreview {
+    pub(crate) state: SealState,
+    pub(crate) bytes: u64,
+    pub(crate) complete: bool,
+}
+
+/// Read-only preview of [`seal`] on the live tree with the seal's bounds.
+#[cfg(unix)]
+pub(crate) fn preview_live_tree(home: &Path, label: &str) -> Result<SealPreview, ()> {
+    preview_live_tree_with(home, label, MAX_ENTRIES, MAX_BYTES, MAX_DEPTH)
+}
+
+/// [`preview_live_tree`] with explicit bounds (tests). Mirrors what the
+/// tombstone would record: no `agents/<label>` ⇒ `absent`; a symlink or file
+/// there (moved as-is, never sealed) ⇒ `invalid`; otherwise the seal's
+/// descriptor walk (no-follow, same filesystem, owner, hardlinks, special
+/// files, xattrs; entries/bytes/depth bounds) without hashing. Opens nothing
+/// for writing and creates nothing (no quarantine directory, no row). The
+/// pre-move `agent.toml` strip is not applied, so the estimate is a slight
+/// over-estimate. `Err` = the home or `agents/` could not be read safely.
+#[cfg(unix)]
+pub(crate) fn preview_live_tree_with(home: &Path, label: &str, max_entries: usize, max_bytes: u64, max_depth: usize)
+    -> Result<SealPreview, ()> {
+    use crate::fs_safe::{EntryKind, SafeDir};
+    let bare = |state| SealPreview { state, bytes: 0, complete: true };
+    let home_dir = SafeDir::open_nofollow(home, false).map_err(|_| ())?;
+    let Some(agents) = home_dir.child_dir("agents", false).map_err(|_| ())? else { return Ok(bare(SealState::Absent)) };
+    match agents.entry(label).map_err(|_| ())? {
+        None => return Ok(bare(SealState::Absent)),
+        Some(entry) if entry.kind != EntryKind::Dir => return Ok(SealPreview { complete: false, ..bare(SealState::Invalid) }),
+        Some(_) => {}
+    }
+    let root = agents.child_dir(label, false).map_err(|_| ())?.ok_or(())?;
+    let fd = root.duplicate_fd().map_err(|_| ())?;
+    let euid = nix::unistd::geteuid().as_raw();
+    match walk::measure(fd, euid, max_entries, max_bytes, max_depth) {
+        Ok((Walked::Tree(_), bytes)) => Ok(SealPreview { state: SealState::Sealed, bytes, complete: true }),
+        Ok((Walked::Oversize, bytes)) => Ok(SealPreview { state: SealState::Oversize, bytes, complete: false }),
+        Ok((Walked::Invalid(_), bytes)) => Ok(SealPreview { state: SealState::Invalid, bytes, complete: false }),
+        // The seal would record `invalid` (io_error); the preview cannot
+        // tell the size, so it refuses instead of guessing.
+        Err(_) => Err(()),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn preview_live_tree(_: &Path, _: &str) -> Result<SealPreview, ()> { Err(()) }
+
 /// Test-only pause point at the start of [`seal`] (proves no lock is held).
 #[cfg(test)]
 thread_local! {
@@ -585,7 +642,10 @@ pub(crate) mod walk {
 
     fn to_io(error: Errno) -> io::Error { io::Error::from_raw_os_error(error as i32) }
 
-    struct State { euid: u32, dev: u64, entries: Vec<Entry>, bytes: u64, max_entries: usize, max_bytes: u64, max_depth: usize }
+    /// `hash = false` (F5 tombstone preview): the same walk, checks and
+    /// bounds, without reading file contents.
+    struct State { euid: u32, dev: u64, entries: Vec<Entry>, bytes: u64, max_entries: usize, max_bytes: u64, max_depth: usize,
+        hash: bool }
 
     #[allow(clippy::unnecessary_cast)]
     fn ctime_ns(st: &FileStat) -> i128 { (st.st_ctime as i128) * 1_000_000_000 + st.st_ctime_nsec as i128 }
@@ -694,9 +754,11 @@ pub(crate) mod walk {
                     return Ok(Some(Walked::Invalid("raced")));
                 }
                 if has_xattr(&fd)? { return Ok(Some(Walked::Invalid("xattr"))); }
-                let Some(sha) = hash_file(fd, entry.size)? else { return Ok(Some(Walked::Invalid("raced"))) };
+                if state.hash {
+                    let Some(sha) = hash_file(fd, entry.size)? else { return Ok(Some(Walked::Invalid("raced"))) };
+                    entry.content = sha.to_vec();
+                }
                 entry.kind = b'f';
-                entry.content = sha.to_vec();
                 state.entries.push(entry);
             } else if kind == SFlag::S_IFDIR {
                 if depth + 1 > state.max_depth { return Ok(Some(Walked::Oversize)); }
@@ -722,15 +784,31 @@ pub(crate) mod walk {
     /// Walk the tree under `root` (bounds: entries, regular-file bytes,
     /// depth). The root itself must be a directory owned by `euid`.
     pub(crate) fn walk(root: OwnedFd, euid: u32, max_entries: usize, max_bytes: u64, max_depth: usize) -> io::Result<Walked> {
+        walk_with(root, euid, max_entries, max_bytes, max_depth, true).map(|(walked, _)| walked)
+    }
+
+    /// F5 tombstone preview: [`walk`] without hashing (no file content is
+    /// read), plus the regular-file bytes counted when the walk ended — the
+    /// whole tree's for a `Tree`, the running total at the stop otherwise
+    /// (for `Oversize` by bytes it already exceeds `max_bytes`). Entries of a
+    /// `Tree` carry an empty `content`, so its digest is meaningless.
+    pub(crate) fn measure(root: OwnedFd, euid: u32, max_entries: usize, max_bytes: u64, max_depth: usize)
+        -> io::Result<(Walked, u64)> {
+        walk_with(root, euid, max_entries, max_bytes, max_depth, false)
+    }
+
+    fn walk_with(root: OwnedFd, euid: u32, max_entries: usize, max_bytes: u64, max_depth: usize, hash: bool)
+        -> io::Result<(Walked, u64)> {
         let meta = std::fs::File::from(root.try_clone()?).metadata()?;
-        if !meta.is_dir() { return Ok(Walked::Invalid("root_not_directory")); }
-        if meta.uid() != euid { return Ok(Walked::Invalid("foreign_uid")); }
-        if has_xattr(&root)? { return Ok(Walked::Invalid("xattr")); }
-        let mut state = State { euid, dev: meta.dev(), entries: Vec::new(), bytes: 0, max_entries, max_bytes, max_depth };
-        if let Some(stop) = walk_dir(&root, b"", 0, &mut state)? { return Ok(stop); }
+        if !meta.is_dir() { return Ok((Walked::Invalid("root_not_directory"), 0)); }
+        if meta.uid() != euid { return Ok((Walked::Invalid("foreign_uid"), 0)); }
+        if has_xattr(&root)? { return Ok((Walked::Invalid("xattr"), 0)); }
+        let mut state = State { euid, dev: meta.dev(), entries: Vec::new(), bytes: 0, max_entries, max_bytes, max_depth, hash };
+        if let Some(stop) = walk_dir(&root, b"", 0, &mut state)? { return Ok((stop, state.bytes)); }
         let mut entries = state.entries;
         entries.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(Walked::Tree(Manifest { root_dev: meta.dev(), root_ino: meta.ino(), root_mode: meta.mode() & 0o7777, entries }))
+        Ok((Walked::Tree(Manifest { root_dev: meta.dev(), root_ino: meta.ino(), root_mode: meta.mode() & 0o7777, entries }),
+            state.bytes))
     }
 }
 

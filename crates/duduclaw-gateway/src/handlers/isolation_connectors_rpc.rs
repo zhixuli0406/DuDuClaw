@@ -8,13 +8,25 @@
 //! `UserDb::migration_step_up`) and that proof's CSRF token. The step-up
 //! method here is the same proof, so a session verified on either page is
 //! valid on both. No request field can claim Admin, MFA or step-up state.
+//!
+//! F5 UI-RPC: `isolation.connector_list` rows also carry the employees that
+//! may use each route (`employees`, plus `employee_id`/`employee_label`/
+//! `employee_kind` for a detail route pinned to one employee) and a derived
+//! `status` (`active` / `needs_setup` / `revoked` / `unavailable`, from F3
+//! readiness). P1: rows of another person's Personal routes are hidden
+//! (`hidden_personal` counts them) unless the request carries the step-up
+//! CSRF token (`step_up_csrf`), which reveals them and is audited.
 use super::*;
 use duduclaw_auth::mfa::MigrationConfirmationSession;
-use duduclaw_isolation::{bounded::Text, capability::EmployeeBinding};
+use duduclaw_isolation::{bounded::Text, capability::EmployeeBinding, ids::EmployeeId};
 use duduclaw_migration::confirmation::ApprovalSession;
-use crate::isolation_connector_details::{ChannelTokenRef, DetailEmployee, DetailError, DetailReference};
+use crate::isolation_connector_details::{needs_details, AccountDetailRecord, ChannelTokenRef, DetailEmployee, DetailError,
+    DetailReference};
 use crate::isolation_connector_lifecycle::{self as lifecycle, AdminActor, LifecycleError};
 use crate::isolation_connectors::{AccountId, CatalogError, ConnectorCatalog, ConnectorKind, Route, MAX_LIST_PAGE};
+use crate::isolation_lifecycle::ConfirmedPrincipal;
+use crate::isolation_readiness::Reason;
+use std::collections::{BTreeMap, BTreeSet};
 
 const LIST: &str = "isolation.connector_list";
 const STEP_UP: &str = "isolation.connector_step_up";
@@ -33,7 +45,13 @@ pub(super) fn owns(method: &str) -> bool {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ListRequest { #[serde(default)] after: Option<String> }
+struct ListRequest {
+    #[serde(default)] after: Option<String>,
+    /// F5 UI-RPC, P1 break-glass: the step-up CSRF token. With a fresh
+    /// step-up, rows of other people's Personal routes are shown too (and the
+    /// reveal is audited); without it they are hidden and only counted.
+    #[serde(default)] step_up_csrf: Option<[u8; 32]>,
+}
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StepUpRequest { password: String, code: String }
@@ -148,8 +166,20 @@ fn serve(home: &Path, db: &UserDb, user: &str, session: &str, epoch: u64, method
         LIST => {
             let input: ListRequest = serde_json::from_value(params).map_err(|_| "查詢條件不正確。")?;
             let after = input.after.as_deref().map(AccountId::parse).transpose().map_err(|_| "查詢條件不正確。")?;
+            // P1 break-glass is opt-in and needs the same fresh step-up as a mutation.
+            let reveal = match input.step_up_csrf.as_ref() {
+                None => false,
+                Some(csrf) => { authorize_step_up(proof.as_ref(), user, csrf, now)?; true }
+            };
             let catalog = ConnectorCatalog::open(home).map_err(catalog_message)?;
-            let mut value = list_value(&catalog, after.as_ref()).map_err(catalog_message)?;
+            let view = EmployeeView::read(home, user, reveal)?;
+            let (mut value, revealed) = list_value(&catalog, after.as_ref(), &view).map_err(catalog_message)?;
+            if revealed > 0 {
+                // Audited before anything is returned; a failed write refuses (P1).
+                db.log_action(Some(user), PERSONAL_REVEAL_ACTION, None,
+                    Some(&json!({ "rows": revealed, "after": input.after }).to_string()), None)
+                    .map_err(|_| "無法寫入稽核紀錄，已拒絕列出。")?;
+            }
             value["step_up_valid"] = json!(proof.is_some());
             value["csrf_token"] = json!(proof.as_ref().map(|proof| proof.csrf));
             value["mfa_enrolled"] = json!(db.mfa_active(user).map_err(|_| "無法讀取帳號資料。")?);
@@ -254,20 +284,160 @@ fn resolve_employee(home: &Path, agent: &str) -> Result<DetailEmployee, &'static
     Ok(DetailEmployee { employee: lifecycle.employee, agent: lifecycle.label, binding: lifecycle.binding })
 }
 
-/// One page for the admin list. Contains no secret (the catalog holds none),
-/// no tenant id and no email: a Personal route names only its owner's user id.
-fn list_value(catalog: &ConnectorCatalog, after: Option<&AccountId>) -> Result<Value, CatalogError> {
+/// `auth_audit_log` action of an Admin's step-up reveal of other people's
+/// Personal connector rows (F5 UI-RPC, P1 break-glass).
+const PERSONAL_REVEAL_ACTION: &str = "isolation.connector_list_personal_revealed";
+/// Upper bound of confirmed employees read for the route → employee map.
+const MAX_MAPPED_EMPLOYEES: usize = 4096;
+
+/// F5 UI-RPC: who may use the routes of one list page and how ready each
+/// employee is, so the dashboard can group rows by employee. Display only:
+/// every selection is still decided by the lifecycle and the D1 plan.
+pub(super) struct EmployeeView {
+    /// Live confirmed employees whose principal is known (apply.db);
+    /// `None` = unreadable (rows then read `unavailable`, never `active`).
+    employees: Option<Vec<ConfirmedPrincipal>>,
+    /// F3 readiness reasons by label (`isolation_readiness`); `None` = unreadable.
+    readiness: Option<BTreeMap<String, Vec<Reason>>>,
+    /// P1 (`personal_visibility::hidden_from`): Personal employees the caller
+    /// does not own.
+    hidden: BTreeSet<String>,
+    caller: String,
+    /// P1 break-glass: an Admin with a fresh step-up sees every row, audited.
+    reveal: bool,
+}
+
+impl EmployeeView {
+    /// Blocking (SQLite + the readiness assessment's root ReadBack).
+    fn read(home: &Path, caller: &str, reveal: bool) -> Result<Self, &'static str> {
+        // An unreadable Personal mirror refuses the listing (P1, fail closed).
+        let hidden = crate::personal_visibility::hidden_from(home, true, caller)
+            .map_err(|_| "無法確認員工歸屬，已拒絕列出。")?;
+        let employees = crate::isolation_lifecycle::confirmed_principals(home, MAX_MAPPED_EMPLOYEES).ok()
+            .map(|rows| rows.into_iter().filter(|row| !row.disabled && row.binding.is_some()).collect());
+        let assessment = crate::isolation_readiness::reasons::assess_installed(home);
+        let unreadable = assessment.employees.is_empty() && assessment.reasons.contains(&Reason::ServiceUnavailable);
+        let readiness = (!unreadable).then(|| assessment.employees.into_iter()
+            .map(|employee| (employee.label, employee.reasons)).collect());
+        Ok(Self { employees, readiness, hidden, caller: caller.to_owned(), reveal })
+    }
+
+    fn visible(&self, label: &str) -> bool { self.reveal || !self.hidden.contains(label) }
+
+    /// Connector status of one employee for a route of `provider`, from its
+    /// F3 reasons: `unavailable` (not assessed / service unavailable),
+    /// `needs_setup` (`connector_setup_required` for this provider, or without
+    /// provider = no connector build at all), else `active`.
+    fn status(&self, label: &str, provider: &str) -> &'static str {
+        let Some(reasons) = self.readiness.as_ref().and_then(|readiness| readiness.get(label)) else { return "unavailable" };
+        if reasons.contains(&Reason::ServiceUnavailable) { return "unavailable"; }
+        let setup = reasons.iter().any(|reason| match reason {
+            Reason::ConnectorSetupRequired { provider: None } => true,
+            Reason::ConnectorSetupRequired { provider: Some(named) } => *named == provider,
+            _ => false,
+        });
+        if setup { "needs_setup" } else { "active" }
+    }
+}
+
+fn binding_kind(binding: &EmployeeBinding) -> &'static str {
+    match binding { EmployeeBinding::Personal(_) => "personal", EmployeeBinding::Shared(_) => "shared" }
+}
+
+/// The employees that may use `route`, by the D1 plan's admission
+/// (`isolation_connector_boot::plan_connector_accounts`): a detail route
+/// (database / computer / channel) only the employee its C6 row pins; a
+/// Personal route the owner's Personal employees; a SharedTenant route the
+/// tenant's Shared employees; a SharedHome route the tenant's Shared
+/// employees and, through the home binding, Personal employees
+/// (`via_home: true`; the product-home check still decides per call).
+/// Personal employees the caller does not own are left out (P1) unless
+/// revealed. Each entry: `{employee_id, label, kind, status, via_home}`.
+fn route_employees(route: &Route, details: Option<&AccountDetailRecord>, view: &EmployeeView) -> Vec<Value> {
+    let status = |label: &str| if route.active { view.status(label, route.provider) } else { "revoked" };
+    let entry = |employee: &EmployeeId, label: &str, kind: &str, via_home: bool| json!({
+        "employee_id": hex::encode(employee.0), "label": label, "kind": kind, "status": status(label), "via_home": via_home });
+    let employees = view.employees.as_deref().unwrap_or_default();
+    if needs_details(route.provider) {
+        let Some(record) = details else { return Vec::new() };
+        if !view.visible(&record.agent) { return Vec::new(); }
+        let live = employees.iter().find(|row| row.employee == record.employee && row.label == record.agent);
+        return vec![match live {
+            Some(row) => entry(&row.employee, &row.label, row.binding.as_ref().map_or("shared", binding_kind), false),
+            // Pinned to an employee that is no longer live: never `active`.
+            None => {
+                let mut value = entry(&record.employee, &record.agent, binding_kind(&route.binding), false);
+                if route.active { value["status"] = json!("unavailable"); }
+                value
+            }
+        }];
+    }
+    employees.iter().filter(|row| view.visible(&row.label)).filter_map(|row| {
+        let binding = row.binding.as_ref()?;
+        let via_home = match (route.kind, binding) {
+            (ConnectorKind::Personal, EmployeeBinding::Personal(_)) | (ConnectorKind::SharedTenant, EmployeeBinding::Shared(_))
+                | (ConnectorKind::SharedHome, EmployeeBinding::Shared(_)) if *binding == route.binding => false,
+            (ConnectorKind::SharedHome, EmployeeBinding::Personal(_)) => true,
+            _ => return None,
+        };
+        Some(entry(&row.employee, &row.label, binding_kind(binding), via_home))
+    }).collect()
+}
+
+/// Row status: `revoked` (route revoked), `unavailable` (the employee map or
+/// readiness could not be read, or a mapped employee's readiness), `needs_setup`
+/// (a detail route without its details, or a mapped employee's
+/// `connector_setup_required` for this provider), else `active`.
+fn route_status(route: &Route, details: Option<&AccountDetailRecord>, employees: &[Value], view: &EmployeeView) -> &'static str {
+    let any = |status: &str| employees.iter().any(|employee| employee["status"] == status);
+    if !route.active { "revoked" }
+    else if view.employees.is_none() || view.readiness.is_none() || any("unavailable") { "unavailable" }
+    else if (needs_details(route.provider) && details.is_none()) || any("needs_setup") { "needs_setup" }
+    else { "active" }
+}
+
+/// One page for the admin list, plus the number of other people's Personal
+/// rows revealed (P1 break-glass; the caller audits a non-zero count).
+/// Contains no secret (the catalog holds none), no tenant id and no email: a
+/// Personal route names only its owner's user id; employees appear by label
+/// and id. Rows of another person's Personal route are hidden (counted in
+/// `hidden_personal`) unless `view.reveal`.
+fn list_value(catalog: &ConnectorCatalog, after: Option<&AccountId>, view: &EmployeeView)
+    -> Result<(Value, usize), CatalogError> {
     let routes = catalog.list(after, MAX_LIST_PAGE)?;
     let next = (routes.len() == MAX_LIST_PAGE).then(|| routes.last().map(|route| route.account.to_string())).flatten();
-    Ok(json!({ "routes": routes.iter().map(route_summary).collect::<Vec<_>>(), "next": next }))
+    let (mut rows, mut hidden, mut revealed) = (Vec::new(), 0usize, 0usize);
+    for route in &routes {
+        let foreign = matches!(&route.binding, EmployeeBinding::Personal(owner) if owner.as_str() != view.caller);
+        if foreign && !view.reveal { hidden += 1; continue; }
+        if foreign { revealed += 1; }
+        // Details resolve only for an active route at its current generation.
+        let details = if needs_details(route.provider) {
+            catalog.route_details(&route.account)?.and_then(|(_, details)| details)
+        } else { None };
+        rows.push(route_summary(route, details.as_ref(), view));
+    }
+    Ok((json!({ "routes": rows, "next": next, "hidden_personal": hidden, "personal_revealed": view.reveal,
+        "employees_available": view.employees.is_some(), "readiness_available": view.readiness.is_some() }), revealed))
 }
-fn route_summary(route: &Route) -> Value {
+fn route_summary(route: &Route, details: Option<&AccountDetailRecord>, view: &EmployeeView) -> Value {
     let binding = match &route.binding {
         EmployeeBinding::Personal(owner) => json!({ "type": "personal", "owner_user_id": owner.as_str() }),
         EmployeeBinding::Shared(_) => json!({ "type": "shared" }),
     };
-    json!({ "account": route.account.as_str(), "label": route.label, "provider": route.provider,
-        "kind": route.kind.as_str(), "binding": binding, "generation": route.generation, "active": route.active })
+    let employees = route_employees(route, details, view);
+    let status = route_status(route, details, &employees, view);
+    let mut row = json!({ "account": route.account.as_str(), "label": route.label, "provider": route.provider,
+        "kind": route.kind.as_str(), "binding": binding, "generation": route.generation, "active": route.active,
+        "status": status });
+    // A detail route is bound to exactly one employee.
+    if let Some(pinned) = employees.first().filter(|_| details.is_some()) {
+        row["employee_id"] = pinned["employee_id"].clone();
+        row["employee_label"] = pinned["label"].clone();
+        row["employee_kind"] = pinned["kind"].clone();
+    }
+    row["employees"] = Value::Array(employees);
+    row
 }
 
 fn catalog_message(error: CatalogError) -> &'static str {
@@ -412,7 +582,8 @@ mod tests {
         let catalog = ConnectorCatalog::open(home.path()).unwrap();
         catalog.revoke(&team).unwrap();
 
-        let value = list_value(&catalog, None).unwrap();
+        let (value, revealed) = list_value(&catalog, None, &view(ADMIN, vec![], false)).unwrap();
+        assert_eq!(revealed, 0);
         let encoded = value.to_string();
         for forbidden in [tenant, "secret-material", "token", "tenant", "email", "@", "shared:", "personal:"] {
             assert!(!encoded.contains(forbidden), "{forbidden}");
@@ -430,7 +601,134 @@ mod tests {
         assert_eq!(team_row["active"], json!(false));
         let mut keys: Vec<_> = alice.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["account", "active", "binding", "generation", "kind", "label", "provider"]);
+        assert_eq!(keys, ["account", "active", "binding", "employees", "generation", "kind", "label", "provider", "status"]);
+        assert_eq!((alice["status"].as_str(), team_row["status"].as_str()), (Some("active"), Some("revoked")));
         assert_eq!(value["next"], Value::Null);
+    }
+
+    const BOB: &str = "5a0c1e2d-3b4f-4a6e-8d7c-9b1a2c3d4e5f";
+    const TENANT: &str = "6f1c2f4e-3b7a-4d0e-9a8b-1c2d3e4f5a6b";
+
+    fn principal(label: &str, id: u8, binding: EmployeeBinding) -> ConfirmedPrincipal {
+        ConfirmedPrincipal { label: label.into(), employee: EmployeeId([id; 16]), binding: Some(binding), disabled: false }
+    }
+    fn personal(owner: &str) -> EmployeeBinding { EmployeeBinding::Personal(Text::new(owner.into()).unwrap()) }
+    fn shared() -> EmployeeBinding { EmployeeBinding::Shared(Text::new(TENANT.into()).unwrap()) }
+
+    /// A view with every listed employee ready, `alice-helper` owned by
+    /// ADMIN and `bob-helper` by BOB (hidden from ADMIN unless revealed).
+    fn view(caller: &str, employees: Vec<ConfirmedPrincipal>, reveal: bool) -> EmployeeView {
+        let readiness = employees.iter().map(|row| (row.label.clone(), Vec::new())).collect();
+        let hidden = employees.iter().filter_map(|row| match &row.binding {
+            Some(EmployeeBinding::Personal(owner)) if owner.as_str() != caller => Some(row.label.clone()),
+            _ => None,
+        }).collect();
+        EmployeeView { employees: Some(employees), readiness: Some(readiness), hidden, caller: caller.into(), reveal }
+    }
+
+    fn staff() -> Vec<ConfirmedPrincipal> {
+        vec![principal("alice-helper", 1, personal(ADMIN)), principal("bob-helper", 2, personal(BOB)),
+            principal("team-bot", 3, shared())]
+    }
+
+    fn labels(row: &Value) -> Vec<String> {
+        row["employees"].as_array().unwrap().iter().map(|e| e["label"].as_str().unwrap().to_owned()).collect()
+    }
+
+    /// F5 UI-RPC: rows name the employees that may use them, hide another
+    /// person's Personal rows and employees (P1) unless revealed, and derive
+    /// a status from readiness.
+    #[cfg(unix)]
+    #[test]
+    fn f5_connector_list_maps_routes_to_employees() {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let actor = AdminActor::verified(ADMIN).unwrap();
+        let mine = lifecycle::provision(home.path(), "google", ConnectorKind::Personal, &personal(ADMIN), "Mine", None, &actor).unwrap();
+        let bobs = lifecycle::provision(home.path(), "google", ConnectorKind::Personal, &personal(BOB), "Bob mail", None, &actor).unwrap();
+        let tenant = lifecycle::provision(home.path(), "odoo", ConnectorKind::SharedTenant, &shared(), "Team ERP", None, &actor).unwrap();
+        let home_wide = lifecycle::provision(home.path(), "notion", ConnectorKind::SharedHome, &shared(), "Wiki", None, &actor).unwrap();
+        let catalog = ConnectorCatalog::open(home.path()).unwrap();
+        let row = |value: &Value, id: &AccountId| value["routes"].as_array().unwrap().iter()
+            .find(|row| row["account"] == id.as_str()).cloned();
+
+        let (value, revealed) = list_value(&catalog, None, &view(ADMIN, staff(), false)).unwrap();
+        assert_eq!((revealed, value["hidden_personal"].as_u64()), (0, Some(1)));
+        assert!(row(&value, &bobs).is_none(), "another person's Personal route is hidden");
+        assert!(!value.to_string().contains("bob-helper") && !value.to_string().contains(BOB));
+        let mine_row = row(&value, &mine).unwrap();
+        assert_eq!(labels(&mine_row), ["alice-helper"]);
+        assert_eq!(mine_row["employees"][0], json!({"employee_id": hex::encode([1u8; 16]), "label": "alice-helper",
+            "kind": "personal", "status": "active", "via_home": false}));
+        assert!(mine_row.get("employee_id").is_none(), "only a detail route is bound to one employee");
+        assert_eq!(labels(&row(&value, &tenant).unwrap()), ["team-bot"]);
+        let wiki = row(&value, &home_wide).unwrap();
+        assert_eq!(labels(&wiki), ["alice-helper", "team-bot"], "SharedHome: Shared + (via home) own Personal");
+        assert_eq!(wiki["employees"][0]["via_home"], true);
+        assert_eq!(wiki["status"], "active");
+
+        // Break-glass reveal: every row and employee, counted for the audit.
+        let (value, revealed) = list_value(&catalog, None, &view(ADMIN, staff(), true)).unwrap();
+        assert_eq!((revealed, value["hidden_personal"].as_u64(), value["personal_revealed"].as_bool()), (1, Some(0), Some(true)));
+        assert_eq!(labels(&row(&value, &bobs).unwrap()), ["bob-helper"]);
+        assert_eq!(labels(&row(&value, &home_wide).unwrap()), ["alice-helper", "bob-helper", "team-bot"]);
+
+        // Status from readiness: setup required for this provider (or no build).
+        let mut needs = view(ADMIN, staff(), false);
+        needs.readiness.as_mut().unwrap().insert("team-bot".into(),
+            vec![Reason::ConnectorSetupRequired { provider: Some("odoo") }]);
+        let (value, _) = list_value(&catalog, None, &needs).unwrap();
+        assert_eq!(row(&value, &tenant).unwrap()["status"], "needs_setup");
+        assert_eq!(row(&value, &home_wide).unwrap()["status"], "active", "another provider's setup does not apply");
+        needs.readiness.as_mut().unwrap().insert("team-bot".into(), vec![Reason::ConnectorSetupRequired { provider: None }]);
+        let (value, _) = list_value(&catalog, None, &needs).unwrap();
+        assert_eq!(row(&value, &home_wide).unwrap()["status"], "needs_setup");
+        // Fail closed: unreadable readiness or employee map is never `active`.
+        for broken in [EmployeeView { readiness: None, ..view(ADMIN, staff(), false) },
+            EmployeeView { employees: None, ..view(ADMIN, staff(), false) }] {
+            let (value, _) = list_value(&catalog, None, &broken).unwrap();
+            assert!(value["routes"].as_array().unwrap().iter().all(|row| row["status"] == "unavailable"), "{value}");
+        }
+        let mut missing = view(ADMIN, staff(), false);
+        missing.readiness.as_mut().unwrap().remove("team-bot");
+        let (value, _) = list_value(&catalog, None, &missing).unwrap();
+        assert_eq!(row(&value, &tenant).unwrap()["status"], "unavailable");
+        // Revoked routes read `revoked`, their employees too.
+        catalog.revoke(&tenant).unwrap();
+        let (value, _) = list_value(&catalog, None, &view(ADMIN, staff(), false)).unwrap();
+        let revoked = row(&value, &tenant).unwrap();
+        assert_eq!((revoked["status"].as_str(), revoked["employees"][0]["status"].as_str()), (Some("revoked"), Some("revoked")));
+    }
+
+    /// A detail route is bound to the one employee its C6 row pins; one with
+    /// no resolvable details needs setup.
+    #[test]
+    fn f5_detail_route_is_bound_to_its_pinned_employee() {
+        let route = |active: bool| Route { account: AccountId::parse(&"a".repeat(32)).unwrap(), label: "DB".into(),
+            provider: "database", kind: ConnectorKind::SharedTenant, binding: shared(), generation: 7, active };
+        let record = AccountDetailRecord { employee: EmployeeId([3; 16]), agent: "team-bot".into(),
+            reference: DetailReference::Database { source: "demo".into() } };
+        let all = view(ADMIN, staff(), false);
+        let row = route_summary(&route(true), Some(&record), &all);
+        assert_eq!((row["employee_id"].as_str(), row["employee_label"].as_str(), row["employee_kind"].as_str()),
+            (Some(hex::encode([3u8; 16]).as_str()), Some("team-bot"), Some("shared")));
+        assert_eq!((labels(&row), row["status"].as_str()), (vec!["team-bot".to_owned()], Some("active")));
+        // Other Shared employees of the tenant never see a pinned route.
+        assert_eq!(labels(&row).len(), 1);
+        // Pinned to an employee that is no longer live: not `active`.
+        let gone = AccountDetailRecord { employee: EmployeeId([9; 16]), ..record.clone() };
+        assert_eq!(route_summary(&route(true), Some(&gone), &all)["status"], "unavailable");
+        // No details (pre-C6 or older generation): needs setup, no employee.
+        let bare = route_summary(&route(true), None, &all);
+        assert_eq!((bare["status"].as_str(), bare["employees"].as_array().map(Vec::len)), (Some("needs_setup"), Some(0)));
+        assert!(bare.get("employee_id").is_none());
+        assert_eq!(route_summary(&route(false), None, &all)["status"], "revoked");
+    }
+
+    #[test]
+    fn f5_list_request_reveal_is_only_a_step_up_token() {
+        assert!(serde_json::from_value::<ListRequest>(json!({"step_up_csrf": vec![7u8; 32]})).is_ok());
+        for forged in [json!({"reveal": true}), json!({"step_up_csrf": true}), json!({"owner_user_id": ADMIN})] {
+            assert!(serde_json::from_value::<ListRequest>(forged).is_err());
+        }
     }
 }

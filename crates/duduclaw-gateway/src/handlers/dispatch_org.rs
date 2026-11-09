@@ -362,6 +362,13 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_google_delegation_settings_set(params, ctx))
                     .await
             }
+            // v1.81 F5 UI-RPC: protected-mode tenant-source subjects and
+            // scopes (D-5). Admin here; the handler re-reads Admin, refuses
+            // `system` and needs the isolation step-up + CSRF token.
+            "google.delegation.tenant_settings_set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_google_tenant_settings_set(params, ctx)).await
+            }
             "google.identity.test" => {
                 require_admin!();
                 boxed_frame(|| self.handle_google_identity_test(params)).await

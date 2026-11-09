@@ -665,6 +665,61 @@ pub(crate) fn confirmed_entries(home: &Path, limit: usize) -> Result<Vec<Confirm
     }).collect()
 }
 
+/// One confirmed row as the dashboard shows it (F5 UI-RPC: tombstone
+/// preview, connector → employee mapping). Never authority: callers that act
+/// still go through [`read_lifecycle_with`] / [`tombstone_employee`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfirmedPrincipal {
+    pub(crate) label: String,
+    pub(crate) employee: EmployeeId,
+    /// The principal the lifecycle would derive ([`principal`] on the stored
+    /// receipt and tenant pin). `None` for a row that can never be live
+    /// (legacy row without a tenant pin, or a Shared row of another tenant).
+    pub(crate) binding: Option<EmployeeBinding>,
+    pub(crate) disabled: bool,
+}
+
+/// Every confirmed row (live and disabled), through the hardened opener, in
+/// label order. No apply.db or no table is an empty list; an unsafe or
+/// unreadable store, a corrupt row, a newer schema or more than `limit` rows
+/// is `Unavailable` (never a shortened list).
+pub(crate) fn confirmed_principals(home: &Path, limit: usize) -> Result<Vec<ConfirmedPrincipal>, LifecycleError> {
+    use LifecycleError::Unavailable;
+    match std::fs::symlink_metadata(home.join(APPLY_DB)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(Unavailable),
+        Ok(_) => {}
+    }
+    let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
+    let table: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
+        [], |r| r.get(0)).map_err(|_| Unavailable)?;
+    if !table { return Ok(Vec::new()); }
+    crate::isolation_quarantine::check_readable(&db).map_err(|_| Unavailable)?;
+    let bound = i64::try_from(limit.saturating_add(1)).map_err(|_| Unavailable)?;
+    let mut query = db.prepare("SELECT label,receipt,tenant_id FROM confirmed_employees ORDER BY label LIMIT ?1")
+        .map_err(|_| Unavailable)?;
+    let rows = query.query_map([bound], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))
+        .map_err(|_| Unavailable)?.collect::<Result<Vec<_>, _>>().map_err(|_| Unavailable)?;
+    if rows.len() > limit { return Err(Unavailable); }
+    let mut seen = std::collections::BTreeSet::new();
+    rows.into_iter().map(|(label, encoded, pinned)| {
+        let receipt: Receipt = serde_json::from_str(&encoded).map_err(|_| Unavailable)?;
+        if receipt.label != label || !valid_label(&label) || !seen.insert(receipt.employee) { return Err(Unavailable); }
+        if let Some(binding) = &receipt.principal_binding {
+            allocation::validate_principal_binding(binding).map_err(|_| Unavailable)?;
+        }
+        let binding = pinned.as_deref().and_then(|pinned| principal(&receipt, pinned).ok());
+        Ok(ConfirmedPrincipal { employee: receipt.employee, disabled: receipt.disabled, binding, label })
+    }).collect()
+}
+
+/// The confirmed row of `employee` (live or disabled), by exact id.
+pub(crate) fn confirmed_by_employee(home: &Path, employee: EmployeeId, limit: usize)
+    -> Result<Option<ConfirmedPrincipal>, LifecycleError> {
+    Ok(confirmed_principals(home, limit)?.into_iter().find(|row| row.employee == employee))
+}
+
 /// Readiness (F3): one users.db read snapshot of `label` with `owner` as the
 /// human, through the hardened opener, for the B1 `personal_facts` rule. The
 /// owner-less read runs first in the same transaction so an unreadable store
