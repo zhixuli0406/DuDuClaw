@@ -133,6 +133,70 @@ async fn p1h_webchat_admin_assignment_of_another_owners_personal_employee_is_ref
     assert!(source[start..end].contains("assignment_text_allowed(&reg, &sender, text, duduclaw_auth::acl::personal_restriction())"));
 }
 
+fn candidate(
+    reg: &AgentRegistry,
+    s: &SenderAccess,
+    id: &str,
+    r: Option<&dyn PersonalRestriction>,
+) -> bool {
+    crate::webchat::access::primary_candidate_under(s, reg.get(id).unwrap(), r)
+}
+
+#[tokio::test]
+async fn p1h_primary_candidate_refuses_another_owners_personal_employee() {
+    let (h, reg) = fixture().await;
+    let on = AclRestriction::with_flag(h.path(), true);
+    let r: Option<&dyn PersonalRestriction> = Some(&on);
+    let (admin, bob) = (sender(&h, &h.admin), sender(&h, &h.bob));
+
+    // bob (alice's manager) holds an Operator grant through the team, and
+    // alice-public has public_trigger on: still not his primary employee.
+    assert!(candidate(&reg, &bob, PUBLIC, None), "the grant alone would qualify");
+    assert!(!candidate(&reg, &bob, PUBLIC, r), "public_trigger opens calling, not routing");
+    assert!(!candidate(&reg, &bob, PERSONAL, r));
+    assert!(!candidate(&reg, &admin, PERSONAL, r));
+    assert!(!candidate(&reg, &admin, PUBLIC, r));
+    assert!(!candidate(&reg, &SenderAccess::unmapped(), PUBLIC, r));
+    assert!(candidate(&reg, &admin, SHARED, r), "Shared employees are unchanged");
+}
+
+#[tokio::test]
+async fn p1h_primary_candidate_allows_own_personal_employee() {
+    let (h, reg) = fixture().await;
+    let on = AclRestriction::with_flag(h.path(), true);
+    let r: Option<&dyn PersonalRestriction> = Some(&on);
+    let alice = sender(&h, &h.alice);
+    assert!(candidate(&reg, &alice, PERSONAL, r));
+    assert!(candidate(&reg, &alice, PUBLIC, r));
+    assert!(candidate(&reg, &alice, SHARED, r));
+}
+
+#[tokio::test]
+async fn p1h_primary_candidate_refuses_when_ownership_unreadable() {
+    let (h, reg) = fixture().await;
+    let empty = crate::fs_safe::private_test_home().unwrap();
+    let broken = AclRestriction::with_flag(empty.path(), true);
+    let r: Option<&dyn PersonalRestriction> = Some(&broken);
+    let alice = sender(&h, &h.alice);
+    assert!(!candidate(&reg, &alice, PERSONAL, r), "the owner is refused too");
+    assert!(!candidate(&reg, &alice, PUBLIC, r));
+}
+
+#[tokio::test]
+async fn p1h_primary_candidate_unrestricted_matches_previous_rules() {
+    let (h, reg) = fixture().await;
+    let (admin, alice, bob) = (sender(&h, &h.admin), sender(&h, &h.alice), sender(&h, &h.bob));
+    // No restriction installed: the pre-P1 rules for a Shared employee.
+    assert!(candidate(&reg, &admin, SHARED, None));
+    assert!(candidate(&reg, &alice, SHARED, None));
+    assert!(candidate(&reg, &bob, SHARED, None), "team-derived Operator may assign");
+    assert!(!candidate(&reg, &SenderAccess::unmapped(), SHARED, None));
+    // An unprotected install (flag off) is the same.
+    let off = AclRestriction::with_flag(h.path(), false);
+    assert!(candidate(&reg, &admin, SHARED, Some(&off)));
+    assert!(candidate(&reg, &admin, PERSONAL, Some(&off)));
+}
+
 /// N1 trace: a default-routed channel turn (no `@`) on a Personal employee
 /// is authorized by the isolated runtime only for its owner. The channel
 /// ingress identity is the verified mapped account (`ingress::reply_scope`;
