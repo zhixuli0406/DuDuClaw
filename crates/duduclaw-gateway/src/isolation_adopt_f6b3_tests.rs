@@ -56,7 +56,7 @@ fn f6b3_adopted_shared_employee_has_no_tenant_routes() {
     let f = fixture();
     let home = f.home();
     tombstoned_shared(&f);
-    let ax = ax();
+    let ax = new_ax();
     let (_, item) = shared_card(&f, &ax, TEAM_NEXT);
     let (adopted, new) = apply(&f, &ax, &item);
     assert_eq!(adopted.unwrap().employee, NEW);
@@ -121,7 +121,7 @@ fn f6b3_after_save_counts_principal_on_old_label() {
         let f = fixture();
         let home = f.home();
         tombstoned_shared(&f);
-        let ax = ax();
+        let ax = new_ax();
         let (request, item) = shared_card(&f, &ax, TEAM_NEXT);
         ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::AfterSave)));
         let (crashed, _) = apply(&f, &ax, &item);

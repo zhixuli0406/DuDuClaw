@@ -64,7 +64,7 @@ fn assert_nothing_committed(f: &Fixture, request: &RestoreRequest, code: &str) {
 fn f6r3_admin_filed_password_reset_during_transform_refused() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (request, plan, item) = admin_filed(&f, &ax);
     // The card validates for the third Admin before the reset.
     assert!(matches!(validate_item(f.home(), &env(&ax), &item, &plan.adopt, CAROL),
@@ -85,7 +85,7 @@ fn f6r3_admin_filed_password_reset_during_transform_refused() {
 fn f6r3_resumed_applying_rechecks_owner() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (request, _, item) = admin_filed(&f, &ax);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::AfterMove)));
     let (crashed, _) = apply_as(&f, &env(&ax), &item, CAROL);
@@ -100,7 +100,7 @@ fn f6r3_resumed_applying_rechecks_owner() {
 
     let g = fixture();
     tombstoned_full(&g, "soul");
-    let gx = ax();
+    let gx = new_ax();
     let (request, plan, item) = admin_filed(&g, &gx);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::AfterMove)));
     let (crashed, _) = apply_as(&g, &env(&gx), &item, CAROL);
@@ -131,7 +131,7 @@ fn f6r3_resumed_applying_rechecks_owner() {
 fn f6r3_credential_change_before_commit_refused() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (request, _, item) = admin_filed(&f, &ax);
     let (home, alice) = (f.home().to_path_buf(), f.alice.clone());
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(move |point| {
@@ -160,7 +160,7 @@ fn f6r3_credential_change_before_commit_refused() {
 fn f6r3_save_without_gate_refused() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, None).unwrap();
     let (_, item) = propose(&f, &ax, &request);
     let home = f.home();
@@ -196,7 +196,7 @@ impl AdminApprovalRule for StepUpRule {
 fn f6r3_adoption_card_uses_real_step_up() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, None).unwrap();
     let (plan, item) = propose(&f, &ax, &request);
     let now = u64::try_from(ax.now).unwrap();
@@ -228,7 +228,7 @@ fn f6r3_adoption_card_uses_real_step_up() {
 fn f6r3_owner_cancels_admin_filed_request_with_password() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let filed = rpc::adoption_request_for_owner(f.home(), &env(&ax), &f.bob, &employee(), 0, None, true).unwrap();
     let id = filed["request_id"].as_str().unwrap().to_owned();
     let any_factor = |factor: OwnerFactor, _: &str, _: &str| -> Result<OwnerFactor, OwnerFactorError> { Ok(factor) };

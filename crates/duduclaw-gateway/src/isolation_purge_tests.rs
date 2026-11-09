@@ -385,7 +385,7 @@ fn purge_adopted_row_removes_remainder_and_sealed_stores() {
     let home = f.home();
     let (_, old) = tombstoned_full(&f, "soul");
     tasks_db(home, LABEL);
-    let ax = ax();
+    let ax = new_ax();
     let (plan, item, _) = adopted(&f, &ax, None);
     assert_eq!(seal_of(home), "adopted");
     let key = plan.adopt.store_key();
@@ -424,7 +424,7 @@ fn f6b3_purge_adopted_row_keeps_live_adopter_writable() {
     let f = fixture();
     let home = f.home();
     let (_, old) = tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (_, item, _) = adopted(&f, &ax, None);
     mark_applied(home, &item);
     age(home, 91);

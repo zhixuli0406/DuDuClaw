@@ -96,7 +96,7 @@ fn f6fb_resume_after_save_personal_completes() {
     let f = fixture();
     tombstoned_full(&f, "soul");
     tasks_db(f.home(), LABEL);
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, None).unwrap();
     let (plan, item) = propose(&f, &ax, &request);
     let mut store = die_after_save(&f, &ax, &item);
@@ -126,7 +126,7 @@ fn f6fb_resume_after_save_personal_completes() {
 fn f6fb_resume_after_save_shared_new_label_completes() {
     let f = fixture();
     tombstoned_shared(&f);
-    let ax = ax();
+    let ax = new_ax();
     let (request, item) = shared_card(&f, &ax, TEAM_NEXT);
     let mut store = die_after_save(&f, &ax, &item);
     assert_eq!(bindings(f.home(), TEAM_NEXT), 1, "bound before the crash");
@@ -149,7 +149,7 @@ fn f6fb_resume_after_save_shared_new_label_completes() {
 fn f6fb_shared_rollback_removes_member_bindings() {
     let f = fixture();
     tombstoned_shared(&f);
-    let ax = ax();
+    let ax = new_ax();
     let (request, item) = shared_card(&f, &ax, TEAM_NEXT);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::AfterSave)));
     let (crashed, new) = apply(&f, &ax, &item);
@@ -174,7 +174,7 @@ fn f6fb_shared_rollback_removes_member_bindings() {
 fn f6fb_target_binding_blocks_adoption() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     f.users.bind_agent(&f.bob, "alice-next", AccessLevel::Viewer).unwrap();
     let request = file_personal(&f, &ax, Some("alice-next")).unwrap();
     let plan = prepare_proposal(f.home(), &env(&ax), &request.request_id).unwrap();
@@ -197,7 +197,7 @@ fn f6fb_target_binding_blocks_adoption() {
 fn f6fb_adopted_replay_bound_to_allocation() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (plan, item, new) = adopted(&f, &ax, None);
     let mut noop = |_: &dyn Fn(&Connection) -> Result<(), ()>| -> Result<(), ()> { Ok(()) };
     let other = Receipt { employee: EmployeeId([8; 16]), ..new.clone() };
@@ -218,7 +218,7 @@ fn f6fb_adopted_replay_bound_to_allocation() {
 fn f6fb_no_compensation_after_commit_once_tree_changed() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let fx = ax();
+    let fx = new_ax();
     let (_, item, _) = adopted(&f, &fx, None);
     let soul = f.home().join("agents").join(LABEL).join("SOUL.md");
     std::fs::write(&soul, "written by the new employee").unwrap();
@@ -230,7 +230,7 @@ fn f6fb_no_compensation_after_commit_once_tree_changed() {
 
     let g = fixture();
     tombstoned_full(&g, "soul");
-    let bx = ax();
+    let bx = new_ax();
     let (_, item, new) = adopted(&g, &bx, None);
     save(g.home(), &item, &Receipt { disabled: true, ..new }).unwrap();
     compensate_item(g.home(), &env(&bx), &item).unwrap();
@@ -273,7 +273,7 @@ fn f6fb_path_check_normalises_and_anchors() {
     let g = fixture();
     let doubled = g.home().join("agents").join(LABEL).display().to_string().replace("/agents/", "//agents/");
     tombstoned_full(&g, &format!("see {doubled}/notes.md"));
-    let gx = ax();
+    let gx = new_ax();
     let request = file_personal(&g, &gx, Some("alice-next")).unwrap();
     assert_eq!(prepare_proposal(g.home(), &env(&gx), &request.request_id).err(), Some(AdoptError::PathRejected));
 }
@@ -284,7 +284,7 @@ fn f6fb_path_check_normalises_and_anchors() {
 fn f6fb_adoption_enforces_agent_cap() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, None).unwrap();
     let (plan, item) = propose(&f, &ax, &request);
     // Another live employee takes the only seat.
@@ -310,7 +310,7 @@ fn f6fb_adoption_enforces_agent_cap() {
 fn f6fb2_adoption_refuses_google_reauth_factor() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     assert_eq!(crate::isolation_adopt::ADOPT_OWNER_FACTORS, ["passkey", "totp", "email"]);
     for factor in ["google_reauth", "sms", ""] {
         let refused = file_adoption(f.home(), &env(&ax), EMP, 0, None,

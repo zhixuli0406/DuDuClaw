@@ -22,7 +22,7 @@ fn filed_count(home: &Path) -> i64 {
 fn adoption_request_owner_strongest_factor() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let asked = RefCell::new(Vec::new());
     let check = |factor: OwnerFactor, purpose: &str, _: &str| -> Result<OwnerFactor, OwnerFactorError> {
         asked.borrow_mut().push(purpose.to_owned());
@@ -82,7 +82,7 @@ fn shared_adoption_request_files_shared_rows_only() {
     save(home, &item, &root).unwrap();
     write_tree(home, "team-x");
     tombstone_employee(home, "team-x", root.employee, &TombstoneEnv { actor: "admin-user", runs: &NoLiveRuns, now: now() }).unwrap();
-    let ax = ax();
+    let ax = new_ax();
     let shared = hex::encode(EmployeeId([2; 16]).0);
     // A Personal row is never adopted through the Shared request.
     assert_eq!(rpc::shared_adoption_request(home, &env(&ax), &f.bob, &employee(), 0, None, json!([])).err(),
@@ -105,7 +105,7 @@ fn shared_adoption_request_files_shared_rows_only() {
 fn boot_recovers_adoptions() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     assert_eq!(rpc::recover_adoptions_at_boot(f.home(), &env(&ax)).unwrap(), BootAdoptions::default(), "nothing adopting");
     let request = file_personal(&f, &ax, None).unwrap();
     let (_, item) = propose(&f, &ax, &request);
@@ -141,7 +141,7 @@ fn f6fa2_admin_files_adoption_for_owner_without_second_factor() {
     let f = fixture();
     let home = f.home();
     tombstoned_full(&f, "soul");
-    let ax0 = ax();
+    let ax0 = new_ax();
     assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax0), &f.bob, &employee(), 0, None, false).err(),
         Some(RpcError::Restore(Refusal::Approval("STEP_UP_REQUIRED"))));
     assert_eq!(rpc::adoption_request_for_owner(home, &env(&ax0), &f.alice, &employee(), 0, None, true).err(),
@@ -174,7 +174,7 @@ fn f6fa2_admin_files_adoption_for_owner_without_second_factor() {
     let g = fixture();
     sql(g.home(), USERS_DB, "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'TOTP-ENC',0)", &[&g.alice]);
     tombstoned_full(&g, "soul");
-    let gx = ax();
+    let gx = new_ax();
     assert_eq!(rpc::adoption_request_for_owner(g.home(), &env(&gx), &g.bob, &employee(), 0, None, true).err(),
         Some(RpcError::Restore(Refusal::OwnerHadSecondFactor)));
     assert_eq!(filed_count(g.home()), 0);

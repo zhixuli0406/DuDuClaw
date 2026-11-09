@@ -55,7 +55,7 @@ impl AdminApprovalRule for AnyAdmin {
 fn ok_hooks(_: &Path) -> Result<(), ()> { Ok(()) }
 
 struct Ax { root: FakeRoot, routes: Routes, now: i64 }
-fn ax() -> Ax {
+fn new_ax() -> Ax {
     Ax { root: FakeRoot { answer: Mutex::new(RootAnswer::NotFound), actions: Mutex::new(Vec::new()) },
         routes: Routes(Rc::new(RefCell::new(Vec::new()))), now: now() }
 }
@@ -186,7 +186,7 @@ fn tasks_under(home: &Path, label: &str) -> u64 {
 fn adopt_requires_authoritative_not_found() {
     let f = fixture();
     let (_, root) = tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     *ax.root.answer.lock().unwrap() = RootAnswer::Unavailable;
     assert_eq!(file_personal(&f, &ax, None).err(), Some(AdoptError::Root(crate::isolation_retire::RootClass::Unavailable)));
     *ax.root.answer.lock().unwrap() = RootAnswer::Ready(root);
@@ -199,7 +199,7 @@ fn adopt_requires_authoritative_not_found() {
 fn adopt_refused_on_inconsistent() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     *ax.root.answer.lock().unwrap() = RootAnswer::Inconsistent;
     assert_eq!(file_personal(&f, &ax, None).err(), Some(AdoptError::Root(crate::isolation_retire::RootClass::Inconsistent)));
     let log = std::fs::read_to_string(f.home().join("security_audit.jsonl")).unwrap_or_default();
@@ -211,7 +211,7 @@ fn adopt_refused_on_inconsistent() {
 fn adopt_original_label_when_free() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (plan, _, new) = adopted(&f, &ax, None);
     assert_eq!(plan.target, LABEL);
     let (live, _, incarnation) = confirmed_row(f.home(), LABEL).unwrap().unwrap();
@@ -225,7 +225,7 @@ fn adopt_original_label_when_free() {
 fn adopt_new_label_rewrites_agent_name_only() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (plan, _, _) = adopted(&f, &ax, Some("alice-next"));
     assert_eq!(plan.target, "alice-next");
     let written = std::fs::read_to_string(f.home().join("agents/alice-next/agent.toml")).unwrap();
@@ -241,7 +241,7 @@ fn adopt_new_label_rewrites_agent_name_only() {
 fn adopt_keeps_only_allowed_top() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     adopted(&f, &ax, None);
     let dir = f.home().join("agents").join(LABEL);
     let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
@@ -265,7 +265,7 @@ fn adopt_strips_command_keys_from_settings() {
     assert!(rename_agent(b"[model]\nname = \"m\"\n", "x").is_err(), "no [agent] name");
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     adopted(&f, &ax, None);
     let written: Value = serde_json::from_str(&std::fs::read_to_string(f.home().join("agents").join(LABEL).join(".claude/settings.json")).unwrap()).unwrap();
     for dropped in ["env", "apiKeyHelper", "statusLine", "hooks", "mcpServers"] { assert!(written.get(dropped).is_none(), "{dropped}"); }
@@ -279,7 +279,7 @@ fn adopt_rejects_absolute_old_label_paths() {
     let f = fixture();
     let old = f.home().join("agents").join(LABEL);
     tombstoned_full(&f, &format!("see {}/notes.md", old.display()));
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, Some("alice-next")).unwrap();
     assert_eq!(prepare_proposal(f.home(), &env(&ax), &request.request_id).err(), Some(AdoptError::PathRejected));
     assert_eq!(AdoptError::PathRejected.code(), "ADOPT_PATH_REJECTED");
@@ -291,7 +291,7 @@ fn adopt_remainder_stays_sealed_and_purged_with_row() {
     let f = fixture();
     tombstoned_full(&f, "soul");
     tasks_db(f.home(), LABEL);
-    let ax = ax();
+    let ax = new_ax();
     let (plan, _, _) = adopted(&f, &ax, None);
     assert_eq!(seal_of(f.home()), "adopted");
     for name in ["CLAUDE.md", ".env", "agent.toml", ".claude"] { assert!(quarantined(f.home(), name), "{name}"); }
@@ -307,7 +307,7 @@ fn adopt_remainder_stays_sealed_and_purged_with_row() {
 fn adopt_post_transform_passes_v2_digest() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (plan, item, _) = adopted(&f, &ax, None);
     let db = Connection::open(f.home().join(APPLY_DB)).unwrap();
     let (_, digest, origin, reference) = marker(&db, LABEL).unwrap().unwrap();
@@ -325,7 +325,7 @@ fn adopt_post_transform_passes_v2_digest() {
 fn adopt_never_copies_root_workspace() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     adopted(&f, &ax, None);
     // The engine only ever asked the root for a ReadBack of the old id; the
     // new allocation (Allocate) is the normal Employee apply, empty.
@@ -340,7 +340,7 @@ fn adopt_never_copies_root_workspace() {
 fn adopt_old_id_authorities_dead() {
     let f = fixture();
     let (_, old) = tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (_, item, new) = adopted(&f, &ax, None);
     mark_applied(f.home(), &item);
     let old_token = duduclaw_core::identity_token::mint_token_v2(&KEY, LABEL,
@@ -361,7 +361,7 @@ fn adopt_label_stores_sealed_not_carried() {
     let f = fixture();
     tombstoned_full(&f, "soul");
     tasks_db(f.home(), LABEL);
-    let ax = ax();
+    let ax = new_ax();
     let (plan, _, _) = adopted(&f, &ax, None);
     assert_eq!(tasks_under(f.home(), LABEL), 0, "the new id never sees old rows");
     assert_eq!(tasks_under(f.home(), &plan.adopt.store_key()), 1);
@@ -372,7 +372,7 @@ fn adopt_crash_mid_rekey_never_goes_live_with_old_rows() {
     let f = fixture();
     tombstoned_full(&f, "soul");
     tasks_db(f.home(), LABEL);
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, None).unwrap();
     let (plan, item) = propose(&f, &ax, &request);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::MidRekey)));
@@ -403,7 +403,7 @@ fn adopt_mid_rekey_crash_leaves_row_adopting_for_recovery() {
     let f = fixture();
     tombstoned_full(&f, "soul");
     tasks_db(f.home(), LABEL);
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, None).unwrap();
     let (plan, item) = propose(&f, &ax, &request);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::MidRekey)));
@@ -430,7 +430,7 @@ fn adopt_mid_rekey_crash_leaves_row_adopting_for_recovery() {
 fn adopt_records_root_absent() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     assert_eq!(root_state(f.home()), "allocated");
     adopted(&f, &ax, None);
     assert_eq!(root_state(f.home()), "root_absent");
@@ -442,7 +442,7 @@ fn adopt_records_root_absent() {
 fn adopt_personal_same_owner_only() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     // Another user (an Admin) cannot file for alice's row: NOT_FOUND.
     let bob = file_adoption(f.home(), &env(&ax), EMP, 0, None, Filer::Personal(Some(OwnerProof { user_id: &f.bob, factor: "totp" })));
     assert_eq!(bob.err(), Some(AdoptError::Restore(Refusal::NotFound)));
@@ -465,7 +465,7 @@ fn adopt_shared_same_tenant_only() {
     save(home, &item, &root).unwrap();
     write_tree(home, "team-x");
     tombstone_employee(home, "team-x", root.employee, &TombstoneEnv { actor: "admin-user", runs: &NoLiveRuns, now: now() }).unwrap();
-    let ax = ax();
+    let ax = new_ax();
     let shared = EmployeeId([2; 16]);
     // Personal filing on a Shared row: NOT_FOUND; a member outside the snapshot refuses.
     assert_eq!(file_adoption(home, &env(&ax), shared, 0, None, Filer::Personal(Some(OwnerProof { user_id: &f.alice, factor: "totp" }))).err(),
@@ -492,7 +492,7 @@ fn row_digest(home: &Path, employee: EmployeeId) -> String {
 fn adopt_normal_proposal_refuses_adopted_marker() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (_, _, new) = adopted(&f, &ax, None);
     // Even with the row disabled (no live owner of the directory), the
     // normal Personal flow never adopts a directory with an `adopted` marker.
@@ -507,7 +507,7 @@ fn adopt_digest_mismatch_refused() {
     assert!(AdoptRef::parse(&format!("{}:01:{}", "a".repeat(32), "b".repeat(64))).is_none(), "no leading zeros");
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, None).unwrap();
     let (plan, item) = propose(&f, &ax, &request);
     let wrong = AdoptRef { digest: "0".repeat(64), ..plan.adopt.clone() };
@@ -542,7 +542,7 @@ impl ProposalApplier for Applier<'_> {
 fn adopt_failure_compensates_new_allocation() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let request = file_personal(&f, &ax, None).unwrap();
     let (_, item) = propose(&f, &ax, &request);
     let mut store = store(f.home());
@@ -564,7 +564,7 @@ fn adopt_crash_rolls_back_or_forward() {
     // Forward: crash after the confirmed row, proposal then Applied.
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax0 = ax();
+    let ax0 = new_ax();
     let request = file_personal(&f, &ax0, None).unwrap();
     let (_, item) = propose(&f, &ax0, &request);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::AfterSave)));
@@ -581,7 +581,7 @@ fn adopt_crash_rolls_back_or_forward() {
     // Back: crash right after the move; the proposal is gone (never Applied).
     let g = fixture();
     tombstoned_full(&g, "soul");
-    let bx = ax();
+    let bx = new_ax();
     let request = file_personal(&g, &bx, None).unwrap();
     let (_, item) = propose(&g, &bx, &request);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::AfterMove)));
@@ -601,7 +601,7 @@ fn adopt_crash_rolls_back_or_forward() {
 fn adopt_single_use_per_row() {
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
+    let ax = new_ax();
     let (plan, _, _) = adopted(&f, &ax, Some("alice-next"));
     // The row is closed: no second request, no second proposal.
     assert!(file_personal(&f, &ax, Some("alice-third")).is_err());
