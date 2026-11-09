@@ -554,7 +554,9 @@ impl MethodHandler {
     /// session to them right now ([`Self::team_history_session_access`],
     /// including its rate limit, activation window and denial audit) — never
     /// a user-cleared one, refused like a missing session. Audited as
-    /// `team_history_session_restored` (fail closed) before the write.
+    /// `team_history_session_restored` (fail closed) before the write. An
+    /// Admin restore keeps the sticky `user_cleared_at`, so a restored user
+    /// clear still never appears in team history.
     pub(crate) async fn handle_team_history_restore(
         &self,
         params: Value,
@@ -600,14 +602,18 @@ impl MethodHandler {
         let Some((archived_at, reason)) = state else {
             return WsFrame::ok_response("", json!({"session_id":requested,"restored":false}));
         };
+        // RM-173: the sticky mark — survives a restore, so a once-cleared
+        // conversation that was restored and re-archived still counts.
+        let user_cleared = match rc.session_manager.user_cleared_at(&id).await {
+            Ok(mark) => mark.is_some() || reason == crate::session::ARCHIVE_REASON_USER,
+            Err(_) => return error("read_error", "history unavailable", None),
+        };
         if let Some(scope) = &scope {
             // A conversation the user cleared is theirs alone: never restorable
             // through team history (the reader already hides it; this keeps
             // the refusal even if a clear races the read). Same shape as a
             // missing session.
-            if reason == crate::session::ARCHIVE_REASON_USER
-                || self.history_recheck(&db, ctx, scope).is_err()
-            {
+            if user_cleared || self.history_recheck(&db, ctx, scope).is_err() {
                 return self.history_denied(ctx, &agent, "hidden", "not_found", "session not found", None);
             }
         }
@@ -620,7 +626,7 @@ impl MethodHandler {
             "team_history_session_restored",
             &ctx.user_id,
             &agent,
-            json!({"actor":ctx.user_id,"actor_role":ctx.role,"agent":agent,"session":digest,"archived_at":archived_at,"archive_reason":reason,"via":via,"since":scope.as_ref().map(|s|s.since),"generation":scope.as_ref().map(|s|s.generation)}),
+            json!({"actor":ctx.user_id,"actor_role":ctx.role,"agent":agent,"session":digest,"archived_at":archived_at,"archive_reason":reason,"user_cleared":user_cleared,"via":via,"since":scope.as_ref().map(|s|s.since),"generation":scope.as_ref().map(|s|s.generation)}),
             None,
         )
         .is_err()

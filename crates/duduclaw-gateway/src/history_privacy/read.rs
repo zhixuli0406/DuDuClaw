@@ -65,19 +65,19 @@ fn meta(row: &rusqlite::Row<'_>, user: &str) -> rusqlite::Result<Metadata> {
         last_active: row.get(5)?,
     })
 }
-/// RM-173: in the restricted reader, an archived conversation that SOMEONE
-/// ELSE cleared (`archive_reason = 'user'`, e.g. a messaging-app customer's
-/// `/new`) reads as missing; the viewer's own cleared WebChat stays visible
-/// (and restorable) to them. `?2` is the viewer. Live rows never carry a
-/// reason, so only the archived queries add this clause.
-const NOT_SOMEONE_ELSES_CLEAR: &str = " AND NOT (archive_reason IS 'user' AND NOT (origin_kind IS 'webchat_user' AND owner_user_id IS ?2))";
+/// RM-173: in the restricted reader, a conversation that SOMEONE ELSE
+/// cleared (`archive_reason = 'user'`, or the sticky `user_cleared_at` that
+/// survives an Admin restore — e.g. a messaging-app customer's `/new`) reads
+/// as missing, archived or restored; the viewer's own cleared WebChat stays
+/// visible (and restorable) to them. `?2` is the viewer.
+const NOT_SOMEONE_ELSES_CLEAR: &str = " AND NOT ((archive_reason IS 'user' OR user_cleared_at IS NOT NULL) AND NOT (origin_kind IS 'webchat_user' AND owner_user_id IS ?2))";
 pub fn metadata(c: &Connection, user: &str, id: &str) -> Result<Option<Metadata>, String> {
     metadata_in(c, user, id, false)
 }
 /// RM-173: [`metadata`] of a live (`archived = false`) or an archived
 /// (`archived = true`) conversation; the other state reads as missing.
 pub fn metadata_in(c: &Connection, user: &str, id: &str, archived: bool) -> Result<Option<Metadata>, String> {
-    let sql = format!("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE id=?1 AND (archived_at IS NOT NULL)=?3{}", if archived { NOT_SOMEONE_ELSES_CLEAR } else { "" });
+    let sql = format!("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE id=?1 AND (archived_at IS NOT NULL)=?3{NOT_SOMEONE_ELSES_CLEAR}");
     let m=c.query_row(&sql,params![id,user,archived],|r|meta(r,user)).optional().map_err(|_|"history unavailable")?;
     m.map(|mut m| {
         if m.class != Class::Hidden {
@@ -107,7 +107,7 @@ pub fn list_in(
     if !(1..=MAX_SESSIONS).contains(&limit) {
         return Err("invalid limit".into());
     }
-    let sql = format!("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE agent_id=?1 AND (archived_at IS NOT NULL)=?4{} AND ((origin_kind='webchat_user' AND owner_user_id=?2) OR origin_kind IN ('channel','webchat_visitor','public_visitor')) ORDER BY last_active DESC,id DESC LIMIT ?3", if archived { NOT_SOMEONE_ELSES_CLEAR } else { "" });
+    let sql = format!("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE agent_id=?1 AND (archived_at IS NOT NULL)=?4{NOT_SOMEONE_ELSES_CLEAR} AND ((origin_kind='webchat_user' AND owner_user_id=?2) OR origin_kind IN ('channel','webchat_visitor','public_visitor')) ORDER BY last_active DESC,id DESC LIMIT ?3");
     let mut s=c.prepare(&sql).map_err(|_|"history unavailable")?;
     let entries = s
         .query_map(params![agent, user, (MAX_SESSIONS + 1) as i64, archived], |r| {

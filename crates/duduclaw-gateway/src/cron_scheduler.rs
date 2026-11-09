@@ -1298,17 +1298,19 @@ async fn deliver_cron_result_webchat(
     response: &str,
 ) -> Result<(), String> {
     let body = crate::scheduled_webchat::format_body(&task.name, response);
-    if let Err(reason) =
-        crate::recipient_guard::admit_scheduled_session(home_dir, &task.agent_id, session).await
-    {
-        crate::scheduled_webchat::audit_drop(home_dir, &task.agent_id, "cron", &task.id, &reason);
-        return Err(reason);
+    let result = match crate::recipient_guard::admit_scheduled_session(home_dir, &task.agent_id, session).await {
+        Err(reason) => Err(reason),
+        Ok(()) => crate::scheduled_webchat::deliver(home_dir, &task.agent_id, session, &body).await,
+    };
+    if let Err(reason) = &result {
+        crate::scheduled_webchat::audit_drop(home_dir, &task.agent_id, "cron", &task.id, reason);
+        // RM-173 (e): a conversation that is gone (cleared by its user,
+        // purged, recreated) can never receive this schedule again — pause
+        // it instead of failing on every run. Other refusals (account
+        // suspended, binding revoked) may be temporary and only drop.
+        crate::scheduled_webchat::pause_if_target_gone(home_dir, &task.id, session).await;
     }
-    crate::scheduled_webchat::deliver(home_dir, &task.agent_id, session, &body)
-        .await
-        .inspect_err(|reason| {
-            crate::scheduled_webchat::audit_drop(home_dir, &task.agent_id, "cron", &task.id, reason);
-        })
+    result
 }
 
 /// Resolve a channel bot token for cron delivery with `reports_to` cascade.
@@ -1993,6 +1995,39 @@ mod tests {
                 .is_err()
         );
         assert!(manager.session_agent(&f.session).await.unwrap().is_none());
+    }
+
+    /// RM-173 (e): a schedule whose conversation is gone is paused on the
+    /// refused run instead of failing forever; a refusal that may be
+    /// temporary (binding revoked) only drops.
+    #[tokio::test]
+    async fn cron_webchat_delivery_pauses_the_schedule_when_its_conversation_is_gone() {
+        let f = crate::scheduled_webchat::tests::fixture("agnes").await;
+        let h = f.home.path();
+        let store = CronStore::open(h).unwrap();
+        let task = webchat_task("agnes", &f.target);
+        store.insert(&task).await.unwrap();
+        // Temporary refusal: dropped, schedule stays enabled.
+        let db = duduclaw_auth::UserDb::new(&h.join("users.db")).unwrap();
+        db.unbind_agent(&f.user, "agnes").unwrap();
+        assert!(deliver_cron_result(h, &task, "x").await.is_err());
+        assert!(store.get(&task.id).await.unwrap().unwrap().enabled);
+        db.bind_agent(&f.user, "agnes", duduclaw_auth::AccessLevel::Operator).unwrap();
+        // The conversation was replaced (different row at the same id): paused.
+        let manager = crate::session::SessionManager::new(&h.join("sessions.db")).unwrap();
+        manager
+            .acquire()
+            .await
+            .execute(
+                "UPDATE sessions SET created_at='2000-01-01T00:00:00Z' WHERE id=?1",
+                rusqlite::params![f.session],
+            )
+            .unwrap();
+        assert!(deliver_cron_result(h, &task, "x").await.is_err());
+        let row = store.get(&task.id).await.unwrap().unwrap();
+        assert!(!row.enabled, "paused");
+        assert_eq!(row.last_status.as_deref(), Some("skipped"));
+        assert!(crate::scheduled_webchat::tests::messages(&f).await.is_empty());
     }
     #[tokio::test]
     async fn autonomy_pause_cron_records_skip_then_resume_invokes() {

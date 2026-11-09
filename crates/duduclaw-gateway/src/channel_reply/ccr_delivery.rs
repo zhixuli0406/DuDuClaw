@@ -66,11 +66,26 @@ pub(super) async fn webchat_commit_allowed(agent: &str) -> bool {
     true
 }
 
+/// Persist the turn's assistant reply, bound to the session row the turn
+/// started in (`generation`, see `SessionManager::turn_generation`). When a
+/// user cleared that conversation during the turn the write is dropped
+/// (`session::is_cleared_during_turn`); a WebChat turn is then refused as a
+/// whole, so the staged-row fallback (`GuardedReply::persist_webchat`) cannot
+/// write the reply into the fresh conversation either.
 pub(super) async fn append_turn_assistant(
-    sessions: &SessionManager, sid: &str, text: &str, tokens: u32,
+    sessions: &SessionManager, sid: &str, text: &str, tokens: u32, generation: Option<&str>,
 ) -> duduclaw_core::error::Result<i64> {
     let pending = WEBCHAT_TURN_DELIVERY.try_with(|_| ()).is_ok();
-    sessions.append_delivery_message(sid, "assistant", text, tokens, None, pending).await
+    let result = sessions
+        .append_delivery_message_in(sid, "assistant", text, tokens, None, pending, generation)
+        .await;
+    if let Err(e) = &result {
+        if crate::session::is_cleared_during_turn(e) {
+            let _ = WEBCHAT_TURN_DELIVERY
+                .try_with(|turn| turn.refused.store(true, std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+    result
 }
 
 /// Per-turn record of everything that must not outlive a refused CCR delivery.

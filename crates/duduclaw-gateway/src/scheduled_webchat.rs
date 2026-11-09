@@ -136,6 +136,105 @@ pub async fn cancel_for_session(home: &Path, session: &str) {
     }
 }
 
+/// RM-173 (e): PAUSE (never delete) every enabled schedule aimed at `session`
+/// (any generation), recording `reason` on the row (`last_status = skipped`,
+/// `last_error`) so its owner sees why it stopped. Called when a user clears
+/// the conversation: the id then has no row, so every run would be refused.
+/// The owner can edit the schedule or delete it; resuming it unchanged is
+/// refused again and re-paused at its next run. Pending one-shot reminders
+/// are left alone: they fire once, are refused with an audit row, and stop.
+/// Best effort, logged.
+pub async fn pause_for_session(home: &Path, session: &str, reason: &str) {
+    if !home.join("cron_tasks.db").is_file() {
+        return;
+    }
+    let prefix = format!("{session}{ORIGIN_SEP}");
+    let store = match crate::cron_store::CronStore::open(home) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::warn!(error = %e, "open cron store to pause schedules of a cleared WebChat conversation failed");
+            return;
+        }
+    };
+    let rows = match store.list_all().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "list schedules of a cleared WebChat conversation failed");
+            return;
+        }
+    };
+    for row in rows.iter().filter(|r| {
+        r.enabled
+            && r.notify_channel.as_deref() == Some(CHANNEL)
+            && r.notify_chat_id.as_deref().is_some_and(|c| c.starts_with(&prefix))
+    }) {
+        pause_task(&store, &row.id, reason).await;
+    }
+}
+
+/// Disable one schedule and record why. Logged; never deletes.
+async fn pause_task(store: &crate::cron_store::CronStore, id: &str, reason: &str) {
+    match store.set_enabled(id, false).await {
+        Ok(_) => tracing::info!(id, reason, "WebChat schedule paused: its conversation is gone"),
+        Err(e) => {
+            tracing::warn!(id, error = %e, "pause schedule of a gone WebChat conversation failed");
+            return;
+        }
+    }
+    if let Err(e) = store.record_autonomy_skip(id, reason).await {
+        tracing::warn!(id, error = %e, "record pause reason of a WebChat schedule failed");
+    }
+}
+
+/// RM-173 (e): `true` when a stored `target` can never be delivered again
+/// because its conversation is gone — no stamp (never accepted), no row at
+/// the id (cleared by its user, purged), or a different row (recreated).
+/// `false` on any read failure: a transient error never pauses a schedule.
+pub fn target_gone(home: &Path, target: &str) -> bool {
+    let (session, origin_at) = split_target(target);
+    let Some(origin_at) = origin_at else { return true; };
+    let path = home.join("sessions.db");
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    match conn
+        .query_row("SELECT created_at FROM sessions WHERE id = ?1", params![session], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+    {
+        Ok(Some(created_at)) => created_at != origin_at,
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// RM-173 (e): after a refused cron delivery whose target is
+/// [`target_gone`], pause the schedule so it stops failing on every run.
+pub async fn pause_if_target_gone(home: &Path, task_id: &str, target: &str) {
+    if !target_gone(home, target) || !home.join("cron_tasks.db").is_file() {
+        return;
+    }
+    match crate::cron_store::CronStore::open(home) {
+        Ok(store) => {
+            pause_task(
+                &store,
+                task_id,
+                "排程的 WebChat 對話已不存在（已清除或刪除），排程已暫停 (the WebChat conversation is gone; schedule paused)",
+            )
+            .await
+        }
+        Err(e) => tracing::warn!(error = %e, "open cron store to pause a WebChat schedule failed"),
+    }
+}
+
 /// The value `channel_reply` scopes as [`ORIGIN_SESSION`] for a turn: the
 /// session id for a signed-in dashboard account's WebChat turn answered by
 /// `agent_id` (`#agent:` segment absent or equal), empty otherwise. Empty is
@@ -664,6 +763,25 @@ pub(crate) mod tests {
         let fresh = bind_origin(h, Some(&f.session), "sales").unwrap();
         assert_ne!(fresh, f.target);
         deliver(h, "sales", &fresh, "fresh").await.unwrap();
+    }
+
+    /// RM-173 (e): a user clear (`/new`) pauses — never deletes — the
+    /// schedules aimed at the cleared conversation.
+    #[tokio::test]
+    async fn user_clear_pauses_schedules_aimed_at_the_conversation() {
+        let f = fixture("sales").await;
+        let h = f.home.path();
+        let store = aimed_cron(&f).await;
+        assert!(!target_gone(h, &f.target));
+        let manager = crate::session::SessionManager::new(&h.join("sessions.db")).unwrap();
+        manager.delete_session(&f.session).await.unwrap();
+        let rows = store.list_all().await.unwrap();
+        let aimed = rows.iter().find(|r| r.id == "c1").expect("kept, not deleted");
+        assert!(!aimed.enabled, "paused");
+        assert_eq!(aimed.last_status.as_deref(), Some("skipped"));
+        assert!(rows.iter().find(|r| r.id == "c2").unwrap().enabled, "others untouched");
+        assert!(target_gone(h, &f.target));
+        assert!(target_gone(h, &f.session), "a bare id is never deliverable");
     }
 
     #[tokio::test]

@@ -217,7 +217,10 @@ impl MethodHandler {
     /// agent binding, privacy mode, stored-origin classification), restricted
     /// further to conversations the caller may write to: in the privacy-
     /// filtered mode only their own WebChat (`Class::Own`) — a masked,
-    /// read-only external conversation cannot be restored. Audited
+    /// read-only external conversation cannot be restored. A conversation a
+    /// user cleared (`archive_reason = 'user'` or the sticky
+    /// `user_cleared_at`) is restorable only by a live Admin or its own
+    /// WebChat owner, whatever the privacy mode. Audited
     /// (`chat_session_restored`, fail closed) before the write.
     pub(crate) async fn handle_chat_sessions_restore(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let requested = params
@@ -247,6 +250,26 @@ impl MethodHandler {
             // Already live (e.g. a new message restored it): nothing to do.
             return WsFrame::ok_response("", json!({"session_id": requested, "restored": false}));
         };
+        // RM-173: a conversation a USER cleared is theirs. Full mode grants
+        // `Class::Own` to every Full-mode viewer (Admin, the agent's Owner, a
+        // Viewer when bound_history_privacy is off), so that is not enough
+        // here: only a live Admin or the conversation's own WebChat owner may
+        // restore it. The sticky `user_cleared_at` keeps this true after an
+        // earlier restore and re-archive. Refused like a missing session.
+        let user_cleared = match rc.session_manager.user_cleared_at(&id).await {
+            Ok(mark) => mark.is_some() || archive_reason == crate::session::ARCHIVE_REASON_USER,
+            Err(_) => return WsFrame::error_response("", "session not found"),
+        };
+        if user_cleared && !live.is_admin() {
+            let own_webchat = matches!(
+                rc.session_manager.session_origin(&id).await,
+                Ok(Some(origin)) if origin.kind() == crate::session_origin::OriginKind::WebchatUser
+                    && origin.owner_user_id() == Some(live.user_id.as_str())
+            );
+            if !own_webchat {
+                return WsFrame::error_response("", "session not found");
+            }
+        }
         if let Err(e) = self.bound_history_recheck(&live, &owner, mode) {
             return WsFrame::error_response("", &e);
         }
@@ -260,7 +283,7 @@ impl MethodHandler {
             &live.user_id,
             &owner,
             json!({"actor_user_id": live.user_id, "agent": owner, "session": digest,
-                   "archived_at": archived_at, "archive_reason": archive_reason, "privacy_mode": if mode == Mode::Full { "full" } else { "own" }}),
+                   "archived_at": archived_at, "archive_reason": archive_reason, "user_cleared": user_cleared, "privacy_mode": if mode == Mode::Full { "full" } else { "own" }}),
             None,
         )
         .is_err()

@@ -31,6 +31,12 @@ pub struct Page {
     pub next_before: Option<String>,
 }
 
+/// RM-173: team history never shows a conversation a user cleared — neither
+/// while it is archived as a user clear nor after an Admin (or its owner)
+/// restored it (`user_cleared_at` is sticky).
+const NOT_USER_CLEARED: &str =
+    "user_cleared_at IS NULL AND NOT (archived_at IS NOT NULL AND archive_reason IS 'user')";
+
 fn origin(kind: Option<String>, owner: Option<String>) -> Option<SessionOrigin> {
     kind.map(|k| match (OriginKind::parse(&k), owner) {
         (OriginKind::WebchatUser, Some(o)) => SessionOrigin::webchat_user(&o),
@@ -106,9 +112,10 @@ pub async fn get(
     let conn = sm.acquire().await;
     // RM-173: archived conversations are history too. The activation window
     // (`since`), origin classification and the caller's live scope still apply.
-    // A conversation the USER cleared (`archive_reason = 'user'`) is theirs
-    // alone: it reads exactly like a missing row here.
-    let row:Option<(String,Option<String>,Option<String>,String,bool)>=conn.query_row("SELECT agent_id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions WHERE id=?1 AND NOT (archived_at IS NOT NULL AND archive_reason IS 'user')",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
+    // A conversation the USER cleared (`archive_reason = 'user'`, or the
+    // sticky `user_cleared_at` that survives a restore) is theirs alone: it
+    // reads exactly like a missing row here.
+    let row:Option<(String,Option<String>,Option<String>,String,bool)>=conn.query_row(&format!("SELECT agent_id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions WHERE id=?1 AND {NOT_USER_CLEARED}"),[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
     let Some((agent, kind, owner, last_active, archived)) = row else {
         return Ok(None);
     };
@@ -195,10 +202,10 @@ pub async fn list(
     let broad_before = exact_before.map(|t| (t + chrono::Duration::seconds(1)).to_rfc3339());
     // Scope precedes pagination. The cursor is (last_active,id), so equal
     // activity times neither duplicate nor hide a permitted conversation.
-    // RM-173: user-cleared conversations are never listed.
-    let mut stmt=conn.prepare("SELECT id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions
+    // RM-173: user-cleared conversations are never listed, even restored.
+    let mut stmt=conn.prepare(&format!("SELECT id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions
       WHERE agent_id=?1 AND julianday(last_active)>=julianday(?2)
-        AND NOT (archived_at IS NOT NULL AND archive_reason IS 'user')
+        AND {NOT_USER_CLEARED}
         AND ((origin_kind='webchat_user' AND (owner_user_id=?3 OR owner_user_id IN (SELECT value FROM json_each(?4))))
              OR origin_kind IN ('channel','webchat_visitor','public_visitor'))
         AND (?5 IS NULL OR (origin_kind='webchat_user' AND owner_user_id=?5))
@@ -207,7 +214,7 @@ pub async fn list(
              OR (?6='external' AND origin_kind IN ('channel','webchat_visitor','public_visitor')))
         AND (?7 IS NULL OR (?8 IS NULL AND julianday(last_active)<julianday(?9))
              OR (?8 IS NOT NULL AND (last_active<?7 OR (last_active=?7 AND id<?8))))
-      ORDER BY last_active DESC,id DESC LIMIT 10001").map_err(|e|e.to_string())?;
+      ORDER BY last_active DESC,id DESC LIMIT 10001")).map_err(|e|e.to_string())?;
     let rows = stmt
         .query_map(
             params![

@@ -1,7 +1,7 @@
 use super::*;
 fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    c.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT,archive_reason TEXT);CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,tokens INTEGER,timestamp TEXT,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
+    c.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT,archive_reason TEXT,user_cleared_at TEXT);CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,tokens INTEGER,timestamp TEXT,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
     c
 }
 fn session(c: &Connection, id: &str, kind: &str, owner: &str, time: &str) {
@@ -95,6 +95,23 @@ fn rm173_archived_reader_shows_own_clears_but_never_someone_elses() {
     assert!(metadata_in(&c, "me", "webchat:mine#cleared:1", true).unwrap().is_some());
     // Another account never sees my cleared conversation.
     assert!(list_in(&c, "you", "sales", 50, true).unwrap().iter().all(|m| m.id == "line:Uidle"));
+}
+#[test]
+fn rm173_restored_clears_stay_out_of_the_restricted_reader_except_for_their_owner() {
+    let c = db();
+    session(&c, "webchat:mine#cleared:1", "webchat_user", "me", "2026-10-24T12:00:00Z");
+    session(&c, "line:Ucustomer#cleared:2", "channel", "", "2026-10-24T12:00:01Z");
+    session(&c, "line:Ulive", "channel", "", "2026-10-24T12:00:02Z");
+    // Both clears were restored (live again) — the sticky mark stays.
+    c.execute(
+        "UPDATE sessions SET user_cleared_at='2026-10-25' WHERE id LIKE '%#cleared:%'",
+        [],
+    )
+    .unwrap();
+    let ids: Vec<_> = list(&c, "me", "sales", 50).unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(ids, ["line:Ulive", "webchat:mine#cleared:1"]);
+    assert!(metadata(&c, "me", "line:Ucustomer#cleared:2").unwrap().is_none());
+    assert!(metadata(&c, "me", "webchat:mine#cleared:1").unwrap().is_some());
 }
 #[test]
 fn bound_history_rows_are_bounded_visible_text_and_keep_message_ids_for_masked_runs() {

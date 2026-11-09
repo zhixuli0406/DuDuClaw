@@ -1447,6 +1447,61 @@ async fn rm173_user_cleared_conversations_never_reach_managers() {
     assert!(line.contains("\"archive_reason\":\"user\"") && line.contains("\"via\":\"admin\""), "{line}");
 }
 
+/// N2: a restore never launders a user clear. Full mode gives every Full-mode
+/// viewer `Class::Own`, so the sidebar restore of a user clear is limited to a
+/// live Admin or the conversation's own WebChat owner, and the sticky
+/// `user_cleared_at` keeps a restored clear out of team history for good.
+#[tokio::test]
+async fn rm173_restore_never_launders_a_user_clear() {
+    let f = fixture().await;
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    let sm = &rc.session_manager;
+    let owner_id = f
+        .db
+        .create_user("owner@test.invalid", "店長", "isolated-password", UserRole::Employee)
+        .unwrap()
+        .id;
+    f.db.bind_agent(&owner_id, "sales", AccessLevel::Owner).unwrap();
+    let owner = f.db.live_user_context(&owner_id).unwrap().unwrap();
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let customer = sm.clear_for_user(&f.external).await.unwrap().unwrap();
+    let report = sm.clear_for_user("report").await.unwrap().unwrap();
+
+    // The agent's Owner reads in Full mode (it lists both clears) …
+    let listed = payload(f.handler.handle("chat.sessions.list", json!({"agent_id":"sales","archived":true}), &owner).await);
+    assert!(listed.to_string().contains(&customer), "{listed}");
+    // … but can restore neither the customer's clear nor the employee's.
+    for id in [customer.as_str(), report.as_str()] {
+        denied(f.handler.handle("chat.sessions.restore", json!({"session_id":id}), &owner).await);
+        assert!(rm173_is_archived(&f, id).await, "{id}");
+    }
+    // The employee restores their own cleared WebChat.
+    let mine = payload(f.handler.handle("chat.sessions.restore", json!({"session_id":report}), &employee).await);
+    assert_eq!(mine["restored"], true);
+    assert!(!rm173_is_archived(&f, &report).await);
+    // An Admin restores the customer's (audited as a user clear).
+    let admin = payload(f.handler.handle("users.team_history.restore", json!({"session_id":customer}), &f.admin).await);
+    assert_eq!(admin["restored"], true);
+    assert!(rm173_audit(&f).contains("\"user_cleared\":true"));
+
+    // Restored — live again — yet never team history, and the mark stays.
+    let list = payload(f.handler.handle("users.team_history.list", json!({"agent_id":"sales"}), &f.manager).await);
+    assert!(list["sessions"].as_array().unwrap().is_empty(), "{list}");
+    let missing = denied(f.handler.handle("users.team_history.get", json!({"session_id":"missing"}), &f.manager).await);
+    for id in [customer.as_str(), report.as_str()] {
+        assert!(sm.user_cleared_at(id).await.unwrap().is_some(), "{id}");
+        let refused = denied(f.handler.handle("users.team_history.get", json!({"session_id":id}), &f.manager).await);
+        assert_eq!(refused, missing, "{id}");
+    }
+
+    // Re-archived later (retention, no `user` reason): still the user's own.
+    rm173_archive(&f, &customer).await;
+    denied(f.handler.handle("chat.sessions.restore", json!({"session_id":customer}), &owner).await);
+    let refused = denied(f.handler.handle("users.team_history.restore", json!({"session_id":customer}), &f.manager).await);
+    assert_eq!(refused["code"], "not_found");
+    assert!(rm173_is_archived(&f, &customer).await);
+}
+
 /// F3/F4: the boundary never moves for the shared-token context; it is never
 /// combined with retention in one request; a failed step-up is also logged
 /// in the user DB.

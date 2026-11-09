@@ -90,9 +90,24 @@ pub struct SessionSummary {
 /// restore it, and new activity never un-archives it.
 pub const ARCHIVE_REASON_USER: &str = "user";
 /// RM-173: `sessions.archive_reason` of a conversation archived by the
-/// inactivity maintenance task (also every row archived before the column
-/// existed — the two cases could not be told apart then).
+/// inactivity maintenance task. (Rows archived before the column existed were
+/// all user clears — `delete_session` was the only writer of `archived_at` —
+/// and are migrated to [`ARCHIVE_REASON_USER`], see
+/// `SessionManager::migrate_legacy_user_clears`.)
 pub const ARCHIVE_REASON_RETENTION: &str = "retention";
+
+/// RM-173: error text of a write refused because the conversation the turn
+/// started in was cleared (or purged and recreated) while the turn ran. See
+/// [`SessionManager::append_delivery_message_in`].
+pub(crate) const CLEARED_DURING_TURN: &str = "conversation cleared during the turn";
+
+/// RM-173: `true` for the [`CLEARED_DURING_TURN`] refusal.
+pub(crate) fn is_cleared_during_turn(e: &DuDuClawError) -> bool {
+    matches!(e, DuDuClawError::Gateway(m) if m == CLEARED_DURING_TURN)
+}
+
+/// RM-173: one-time migration marker (table `session_migrations`).
+const MIGRATION_LEGACY_USER_CLEARS: &str = "rm173_legacy_user_clears";
 
 /// RM-173: the `SET` fragment every "new activity" write uses. It lifts an
 /// archive caused by retention only; a user-cleared row (normally already
@@ -281,17 +296,16 @@ impl SessionManager {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT", []);
         // RM-173: WHY a row is archived — `user` (a user cleared it: never
         // shown to managers, never un-archived by activity) or `retention`
-        // (maintenance task). NULL while live. Rows archived before this
-        // column existed cannot be told apart, so they count as `retention`
-        // (WP5 `/new` archives of reused channel ids were un-archived by the
-        // next message anyway). Idempotent; matches nothing after the first run.
+        // (maintenance task). NULL while live (a NULL on an archived row
+        // reads as `retention`).
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN archive_reason TEXT", []);
-        conn.execute(
-            "UPDATE sessions SET archive_reason = 'retention'
-             WHERE archived_at IS NOT NULL AND archive_reason IS NULL",
-            [],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        // RM-173: when a user cleared this conversation. Sticky — set on
+        // clear, NEVER reset by a restore — so a restored user clear stays out
+        // of team history and stays restorable only by an Admin or its own
+        // WebChat owner.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN user_cleared_at TEXT", []);
+        // (Legacy archived rows are migrated at the end, once every table a
+        // clear touches exists — see `migrate_legacy_user_clears`.)
 
         // G4 session portability (2026-07-11):
         // - `undone_at` on messages: /undo //rollback tombstone (NULL = live).
@@ -358,9 +372,190 @@ impl SessionManager {
         // for a signed-in WebChat account, who owns it. NULL on rows written
         // before this migration (see `session_origin::backfill`).
         crate::session_origin::store::migrate(conn);
+        Self::migrate_legacy_user_clears(conn)?;
         Self::sweep_webchat_cancellations(conn, WEBCHAT_CANCEL_RETENTION_DAYS)?;
 
         Ok(())
+    }
+
+    /// RM-173 one-time migration (marker `rm173_legacy_user_clears` in
+    /// `session_migrations`). Before RM-173 the ONLY writer of
+    /// `sessions.archived_at` was `delete_session` — a user's `/new`, a
+    /// channel reset, a deleted Discord thread — so every row archived before
+    /// `archive_reason` existed is a user clear. Each one is:
+    ///
+    /// 1. labelled `archive_reason = 'user'` with `user_cleared_at` set (one
+    ///    statement in its own committed transaction, before anything else —
+    ///    the privacy-relevant part cannot be lost to a later failure);
+    /// 2. moved to `{id}#cleared:{archived_at ms}` exactly like
+    ///    [`Self::clear_for_user`], so the next message on the original id
+    ///    starts a genuinely fresh conversation. Every move runs in its own
+    ///    savepoint inside one transaction that also writes the marker; a move
+    ///    that fails is rolled back alone and logged, leaving that row
+    ///    labelled `user` and archived (fail toward privacy: it is still
+    ///    hidden from team history and never un-archived by activity).
+    ///
+    /// Runs once: afterwards the marker short-circuits it, so rows archived
+    /// later with a NULL reason (only direct SQL does that) are not relabelled.
+    fn migrate_legacy_user_clears(conn: &Connection) -> Result<()> {
+        let gw = |e: rusqlite::Error| DuDuClawError::Gateway(e.to_string());
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )
+        .map_err(gw)?;
+        let done: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_migrations WHERE name = ?1)",
+                params![MIGRATION_LEGACY_USER_CLEARS],
+                |row| row.get(0),
+            )
+            .map_err(gw)?;
+        if done {
+            return Ok(());
+        }
+
+        // Step 1: label (privacy first, committed on its own).
+        let legacy: Vec<(String, String)> = {
+            let tx = conn.unchecked_transaction().map_err(gw)?;
+            let rows = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id, archived_at FROM sessions
+                         WHERE archived_at IS NOT NULL AND archive_reason IS NULL",
+                    )
+                    .map_err(gw)?;
+                let mapped = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(gw)?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>().map_err(gw)?
+            };
+            tx.execute(
+                "UPDATE sessions
+                 SET archive_reason = 'user', user_cleared_at = COALESCE(user_cleared_at, archived_at)
+                 WHERE archived_at IS NOT NULL AND archive_reason IS NULL",
+                [],
+            )
+            .map_err(gw)?;
+            tx.commit().map_err(gw)?;
+            rows
+        };
+
+        // Step 2: move each row away from its (reusable) id, then the marker.
+        let mut tx = conn.unchecked_transaction().map_err(gw)?;
+        let (mut moved, mut failed) = (0u64, 0u64);
+        for (id, archived_at) in &legacy {
+            if id.contains(CLEARED_ID_MARKER) {
+                continue;
+            }
+            let stamp = chrono::DateTime::parse_from_rfc3339(archived_at)
+                .map(|t| t.timestamp_millis())
+                .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+            let sp = tx.savepoint().map_err(gw)?;
+            match Self::move_to_cleared(&sp, id, stamp, archived_at) {
+                Ok(new_id) => {
+                    sp.commit().map_err(gw)?;
+                    moved += 1;
+                    tracing::debug!(session_id = %id, cleared_to = %new_id, "legacy user clear moved");
+                }
+                Err(e) => {
+                    // Dropping the savepoint rolls back this row's move only.
+                    drop(sp);
+                    failed += 1;
+                    tracing::warn!(
+                        session_id = %id, error = %e,
+                        "legacy user clear could not be moved; left archived as a user clear"
+                    );
+                }
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO session_migrations (name, applied_at) VALUES (?1, ?2)",
+            params![MIGRATION_LEGACY_USER_CLEARS, chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(gw)?;
+        tx.commit().map_err(gw)?;
+        if !legacy.is_empty() {
+            info!(
+                labelled = legacy.len(),
+                moved, failed, "RM-173: legacy cleared conversations marked as user clears"
+            );
+        }
+        Ok(())
+    }
+
+    /// The data move shared by [`Self::clear_for_user`] and
+    /// [`Self::migrate_legacy_user_clears`]: re-key `session_id` (and
+    /// everything keyed by it) to a fresh `{id}#cleared:{stamp}` id, labelled a
+    /// user clear (`archived_at` = `cleared_at`; `user_cleared_at` =
+    /// `cleared_at` unless already set). Must run inside a transaction (or savepoint) — the
+    /// foreign keys are deferred to its commit. Returns the new id.
+    fn move_to_cleared(
+        tx: &Connection,
+        session_id: &str,
+        mut stamp: i64,
+        cleared_at: &str,
+    ) -> Result<String> {
+        let gw = |e: rusqlite::Error| DuDuClawError::Gateway(e.to_string());
+        // A fresh id: `{id}#cleared:{unix_ms}`, bumped past any collision.
+        let new_id = loop {
+            let candidate = format!("{session_id}{CLEARED_ID_MARKER}{stamp}");
+            let taken: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                    params![candidate],
+                    |row| row.get(0),
+                )
+                .map_err(gw)?;
+            if !taken {
+                break candidate;
+            }
+            stamp += 1;
+        };
+        // `session_messages` / `webchat_turn_cancellations` reference
+        // `sessions(id)` without ON UPDATE; checking the foreign keys at
+        // commit (this pragma resets when the transaction ends) lets parent
+        // and children move in any order within this one transaction.
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON;").map_err(gw)?;
+        tx.execute(
+            "UPDATE sessions SET id = ?2,
+                    archived_at = ?3,
+                    archive_reason = 'user',
+                    user_cleared_at = COALESCE(user_cleared_at, ?3)
+             WHERE id = ?1",
+            params![session_id, new_id, cleared_at],
+        )
+        .map_err(gw)?;
+        for sql in [
+            "UPDATE session_messages SET session_id = ?2 WHERE session_id = ?1",
+            "UPDATE webchat_turn_cancellations SET session_id = ?2 WHERE session_id = ?1",
+        ] {
+            tx.execute(sql, params![session_id, new_id]).map_err(gw)?;
+        }
+        let notices: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'meeting_completion_notices')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(gw)?;
+        if notices {
+            tx.execute(
+                "UPDATE meeting_completion_notices SET session_id = ?2 WHERE session_id = ?1",
+                params![session_id, new_id],
+            )
+            .map_err(gw)?;
+        }
+        for sql in [
+            "DELETE FROM session_ccr_references WHERE session_id = ?1",
+            "DELETE FROM message_session_map WHERE session_id = ?1",
+        ] {
+            tx.execute(sql, params![session_id]).map_err(gw)?;
+        }
+        Ok(new_id)
     }
 
     /// Get an existing session or create a new one.
@@ -412,8 +607,49 @@ impl SessionManager {
         &self, session_id: &str, role: &str, content: &str, tokens: u32,
         client_msg_id: Option<&str>, pending: bool,
     ) -> Result<i64> {
-        let conn = self.acquire().await;
+        self.append_delivery_message_in(session_id, role, content, tokens, client_msg_id, pending, None)
+            .await
+    }
+
+    /// [`Self::append_delivery_message`] bound to one incarnation of the
+    /// session row. With `generation = Some(g)` (the [`Self::turn_generation`]
+    /// captured when the turn started) the row's identity is re-read in the
+    /// same IMMEDIATE transaction as the insert; if the row is gone (a user
+    /// cleared it — `/new` moves it away) or is a different one (cleared and
+    /// recreated by a newer message, or purged and recreated), nothing is
+    /// written and the call fails with [`CLEARED_DURING_TURN`]. A late reply
+    /// therefore never lands in — or recreates — the fresh conversation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn append_delivery_message_in(
+        &self, session_id: &str, role: &str, content: &str, tokens: u32,
+        client_msg_id: Option<&str>, pending: bool, generation: Option<&str>,
+    ) -> Result<i64> {
+        let mut guard = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
+        // (Named `conn` so the statements below read as before.)
+        let conn = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+
+        if let Some(expected) = generation {
+            let current: Option<String> = conn
+                .query_row(
+                    "SELECT created_at FROM sessions WHERE id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            if current.as_deref() != Some(expected) {
+                // Dropping the transaction rolls back (nothing was written).
+                info!(
+                    session_id, role,
+                    recreated = current.is_some(),
+                    "message dropped: the conversation was cleared while the turn ran"
+                );
+                return Err(DuDuClawError::Gateway(CLEARED_DURING_TURN.into()));
+            }
+        }
 
         // G4 checkpoint: every user turn starts a (potentially file-writing)
         // agent run, so record the turn-id watermark just before it. We
@@ -456,6 +692,8 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
+        conn.commit()
+            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
         Ok(message_id)
     }
 
@@ -857,7 +1095,8 @@ impl SessionManager {
     /// place let the next message un-archive the same row and the whole old
     /// conversation came back — in listings, search and the agent's context.
     /// A clear therefore MOVES the conversation, in one transaction, to a new
-    /// id `{id}#cleared:{unix_ms}` with `archive_reason = 'user'`:
+    /// id `{id}#cleared:{unix_ms}` with `archive_reason = 'user'` and the
+    /// sticky `user_cleared_at` mark (kept even if the row is later restored):
     ///
     /// | data keyed by the session id (sessions.db) | on clear |
     /// |---|---|
@@ -876,6 +1115,11 @@ impl SessionManager {
     /// content that the model context or history listings read by session id.
     ///
     /// Idempotent — no row, or a row already cleared by a user, is a no-op.
+    ///
+    /// A turn still running in the cleared conversation cannot write its
+    /// reply into the fresh one: its writes are bound to the row it started
+    /// in ([`Self::turn_generation`] / `append_delivery_message_in`).
+    /// WebChat schedules aimed at the cleared id are paused.
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         self.clear_for_user(session_id).await.map(|_| ())
     }
@@ -903,65 +1147,24 @@ impl SessionManager {
                 .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
             return Ok(None);
         }
-        // A fresh id: `{id}#cleared:{unix_ms}`, bumped past any collision.
-        let mut stamp = now.timestamp_millis();
-        let new_id = loop {
-            let candidate = format!("{session_id}{CLEARED_ID_MARKER}{stamp}");
-            let taken: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-                    params![candidate],
-                    |row| row.get(0),
-                )
-                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-            if !taken {
-                break candidate;
-            }
-            stamp += 1;
-        };
-        // `session_messages` / `webchat_turn_cancellations` reference
-        // `sessions(id)` without ON UPDATE; checking the foreign keys at
-        // commit (this pragma resets when the transaction ends) lets parent
-        // and children move in any order within this one transaction.
-        tx.execute_batch("PRAGMA defer_foreign_keys = ON;")
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        tx.execute(
-            "UPDATE sessions SET id = ?2, archived_at = ?3, archive_reason = 'user' WHERE id = ?1",
-            params![session_id, new_id, now_str],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        for sql in [
-            "UPDATE session_messages SET session_id = ?2 WHERE session_id = ?1",
-            "UPDATE webchat_turn_cancellations SET session_id = ?2 WHERE session_id = ?1",
-        ] {
-            tx.execute(sql, params![session_id, new_id])
-                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        }
-        let notices: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master
-                 WHERE type = 'table' AND name = 'meeting_completion_notices')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        if notices {
-            tx.execute(
-                "UPDATE meeting_completion_notices SET session_id = ?2 WHERE session_id = ?1",
-                params![session_id, new_id],
-            )
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        }
-        for sql in [
-            "DELETE FROM session_ccr_references WHERE session_id = ?1",
-            "DELETE FROM message_session_map WHERE session_id = ?1",
-        ] {
-            tx.execute(sql, params![session_id])
-                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        }
+        let new_id = Self::move_to_cleared(&tx, session_id, now.timestamp_millis(), &now_str)?;
         tx.commit()
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
         info!(session_id, cleared_to = %new_id, "Session cleared by user (moved + archived)");
+        drop(conn);
+        // RM-173 (e): schedules / reminders created in this WebChat
+        // conversation report into its id, which now has no row — every run
+        // would be refused. Pause (never delete) the schedules aimed at it.
+        if session_id.starts_with("webchat:") {
+            if let Some(home) = self.db_path.parent() {
+                crate::scheduled_webchat::pause_for_session(
+                    home,
+                    session_id,
+                    "WebChat 對話已被使用者清除（/new），排程已暫停 (the WebChat conversation was cleared; schedule paused)",
+                )
+                .await;
+            }
+        }
         Ok(Some(new_id))
     }
 
@@ -974,7 +1177,10 @@ impl SessionManager {
     /// Returns the `archived_at` it had, or `None` when the row does not exist
     /// or was not archived (idempotent; nothing is written then).
     /// Authorization — including who may restore a user-cleared row (see
-    /// [`Self::archive_state`]) — is the caller's job.
+    /// [`Self::archive_state`] / [`Self::user_cleared_at`]) — is the caller's
+    /// job. `user_cleared_at` is deliberately NOT reset: a restored user clear
+    /// stays the user's own (out of team history; restorable again only by an
+    /// Admin or its own WebChat owner).
     pub async fn restore_archived(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.acquire().await;
         let tx = conn
@@ -998,6 +1204,35 @@ impl SessionManager {
         tx.commit()
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
         Ok(archived)
+    }
+
+    /// RM-173: the sticky `user_cleared_at` mark (`Ok(None)`: never cleared
+    /// by a user, or no row). Survives a restore.
+    pub async fn user_cleared_at(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire().await;
+        conn.query_row(
+            "SELECT user_cleared_at FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
+    /// RM-173 race guard: the identity of the row `session_id` names right
+    /// now — its `created_at`, which a clear moves away with the row and a
+    /// recreated row never repeats (the same stamp `scheduled_webchat` binds
+    /// schedules to). Captured at turn start; `Ok(None)`: no row.
+    pub async fn turn_generation(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire().await;
+        conn.query_row(
+            "SELECT created_at FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))
     }
 
     /// RM-173: `archived_at` of an existing session (`Ok(None)`: live or no row).
@@ -2888,30 +3123,136 @@ mod rm173_retention_tests {
         assert_eq!(mgr.erase_sessions_for_contact(id).await.unwrap(), (2, 3));
     }
 
+    /// N1: before RM-173 the only writer of `archived_at` was `delete_session`
+    /// (a user's `/new`), so every legacy archived row is a user clear: it is
+    /// labelled `user`, moved off its reusable id, hidden from team history,
+    /// and the next message on the original id starts a fresh conversation.
     #[tokio::test]
-    async fn rm173_migration_labels_legacy_archives_as_retention() {
-        let tmp = NamedTempFile::new().unwrap();
+    async fn rm173_migration_moves_legacy_archives_as_user_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
         {
-            let c = Connection::open(tmp.path()).unwrap();
+            let c = Connection::open(&db).unwrap();
             c.execute_batch(
                 "CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
                    summary TEXT DEFAULT '', total_tokens INTEGER DEFAULT 0,
                    last_active TEXT NOT NULL, model TEXT DEFAULT 'auto',
                    created_at TEXT NOT NULL, archived_at TEXT);
+                 CREATE TABLE session_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id TEXT NOT NULL REFERENCES sessions(id), role TEXT NOT NULL,
+                   content TEXT NOT NULL, tokens INTEGER DEFAULT 0, timestamp TEXT NOT NULL);
                  INSERT INTO sessions(id,agent_id,last_active,created_at,archived_at)
-                   VALUES ('old','a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-02-01T00:00:00Z'),
-                          ('live','a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);",
+                   VALUES ('line:Uold','sales','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-02-01T00:00:00Z'),
+                          ('line:Ulive','sales','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);
+                 INSERT INTO session_messages(session_id,role,content,timestamp)
+                   VALUES ('line:Uold','user','LEGACY-CLEARED-SECRET','2026-01-01T00:00:00Z'),
+                          ('line:Ulive','user','still here','2026-01-01T00:00:00Z');",
             )
             .unwrap();
         }
-        let mgr = SessionManager::new(tmp.path()).unwrap();
-        assert_eq!(mgr.archive_state("old").await.unwrap().unwrap().1, ARCHIVE_REASON_RETENTION);
-        let raw: Option<String> = mgr
-            .acquire()
-            .await
-            .query_row("SELECT archive_reason FROM sessions WHERE id='live'", [], |r| r.get(0))
+        let mgr = SessionManager::new(&db).unwrap();
+        // Moved: no row at the reusable id any more.
+        assert!(mgr.session_agent("line:Uold").await.unwrap().is_none());
+        let moved = mgr.sessions_for_contact("line:Uold").await.unwrap();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        let moved = &moved[0];
+        assert!(moved.starts_with("line:Uold#cleared:"), "{moved}");
+        let (archived_at, reason) = mgr.archive_state(moved).await.unwrap().unwrap();
+        assert_eq!(reason, ARCHIVE_REASON_USER);
+        assert_eq!(archived_at, "2026-02-01T00:00:00Z", "original archive time kept");
+        assert_eq!(mgr.user_cleared_at(moved).await.unwrap().as_deref(), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(mgr.get_messages(moved).await.unwrap().len(), 1, "messages moved with it");
+        // A live row is untouched.
+        assert!(mgr.archive_state("line:Ulive").await.unwrap().is_none());
+        assert!(mgr.user_cleared_at("line:Ulive").await.unwrap().is_none());
+
+        // Hidden from team history (the reader's own SQL filter).
+        let conn = mgr.acquire().await;
+        let visible: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE user_cleared_at IS NULL
+                 AND NOT (archived_at IS NOT NULL AND archive_reason IS 'user')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(raw, None);
+        assert_eq!(visible, 1, "only the live row is team-history eligible");
+        drop(conn);
+
+        // The next message on the original id is a genuinely fresh session.
+        mgr.get_or_create("line:Uold", "sales").await.unwrap();
+        mgr.append_message("line:Uold", "user", "new topic", 1).await.unwrap();
+        let context = mgr.get_messages("line:Uold").await.unwrap();
+        assert_eq!(context.len(), 1);
+        assert!(context.iter().all(|m| !m.content.contains("LEGACY-CLEARED-SECRET")));
+        assert!(mgr.archive_state(moved).await.unwrap().is_some(), "the clear stays archived");
+
+        // One-time: rows archived later with a NULL reason are not relabelled.
+        mgr.acquire()
+            .await
+            .execute("UPDATE sessions SET archived_at='2026-03-01T00:00:00Z' WHERE id='line:Ulive'", [])
+            .unwrap();
+        drop(mgr);
+        let mgr = SessionManager::new(&db).unwrap();
+        assert_eq!(
+            mgr.archive_state("line:Ulive").await.unwrap().unwrap().1,
+            ARCHIVE_REASON_RETENTION
+        );
+        assert!(mgr.session_agent("line:Ulive").await.unwrap().is_some(), "not moved");
+    }
+
+    /// N2: a restore keeps the sticky `user_cleared_at`.
+    #[tokio::test]
+    async fn rm173_restore_keeps_the_user_cleared_mark() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("line:U1", "agent").await.unwrap();
+        mgr.append_message("line:U1", "user", "first", 1).await.unwrap();
+        let moved = mgr.clear_for_user("line:U1").await.unwrap().unwrap();
+        let mark = mgr.user_cleared_at(&moved).await.unwrap();
+        assert!(mark.is_some());
+        assert!(mgr.restore_archived(&moved).await.unwrap().is_some());
+        assert!(mgr.archive_state(&moved).await.unwrap().is_none(), "live again");
+        assert_eq!(mgr.user_cleared_at(&moved).await.unwrap(), mark, "sticky");
+    }
+
+    /// Race: a reply finishing after `/new` is dropped — it neither hits the
+    /// moved row's foreign key nor lands in (or recreates) the fresh row.
+    #[tokio::test]
+    async fn rm173_reply_after_clear_is_dropped_not_written_into_the_fresh_conversation() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let id = "telegram:42";
+        mgr.get_or_create(id, "agent").await.unwrap();
+        let generation = mgr.turn_generation(id).await.unwrap().unwrap();
+        mgr.append_delivery_message_in(id, "user", "question", 1, None, false, Some(&generation))
+            .await
+            .unwrap();
+        // `/new` while the agent is still answering.
+        let moved = mgr.clear_for_user(id).await.unwrap().unwrap();
+        let late = mgr
+            .append_delivery_message_in(id, "assistant", "LATE-REPLY", 1, None, false, Some(&generation))
+            .await
+            .unwrap_err();
+        assert!(is_cleared_during_turn(&late));
+        assert!(mgr.session_agent(id).await.unwrap().is_none(), "not recreated");
+        // The user already wrote again: a fresh row exists at the same id.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        mgr.get_or_create(id, "agent").await.unwrap();
+        let late = mgr
+            .append_delivery_message_in(id, "assistant", "LATE-REPLY", 1, None, false, Some(&generation))
+            .await
+            .unwrap_err();
+        assert!(is_cleared_during_turn(&late));
+        assert!(mgr.get_messages(id).await.unwrap().is_empty(), "fresh conversation untouched");
+        assert!(mgr.get_messages(&moved).await.unwrap().iter().all(|m| m.content != "LATE-REPLY"));
+        // The fresh turn's own generation writes normally.
+        let fresh = mgr.turn_generation(id).await.unwrap().unwrap();
+        assert_ne!(fresh, generation);
+        mgr.append_delivery_message_in(id, "assistant", "ok", 1, None, false, Some(&fresh))
+            .await
+            .unwrap();
+        assert_eq!(mgr.get_messages(id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

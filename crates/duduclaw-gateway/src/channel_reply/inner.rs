@@ -874,6 +874,18 @@ pub(super) async fn build_reply_with_session_inner(
     // ── All pre-filters passed — now create/load session ──
     // Records where this conversation comes from (first stamp wins).
     let _ = crate::session_origin::ensure_turn_session(session_mgr, session_id, &agent_id).await;
+    // RM-173 race guard: bind this turn's writes to the row it starts in. A
+    // `/new` while the turn runs moves that row away; the reply must then be
+    // dropped, not written into (or recreate) the fresh conversation.
+    // `Some("")` (row already gone) never matches; a read error (`None`)
+    // falls back to the unbound write rather than losing the reply.
+    let turn_generation: Option<String> = match session_mgr.turn_generation(session_id).await {
+        Ok(generation) => Some(generation.unwrap_or_default()),
+        Err(e) => {
+            warn!(session_id, error = %e, "turn generation unavailable; reply persist is unbound");
+            None
+        }
+    };
 
     // ── Phase 3: Check if previous trajectory should get feedback ──
     // The current user message may contain feedback (positive/negative) for
@@ -967,7 +979,10 @@ pub(super) async fn build_reply_with_session_inner(
     let user_tokens = estimate_tokens(&sanitized_text);
     let client_msg_id = super::WEBCHAT_TURN_DELIVERY.try_with(|turn| turn.client_msg_id.clone()).ok();
     let user_message_id = match session_mgr
-        .append_delivery_message(session_id, "user", &sanitized_text, user_tokens, client_msg_id.as_deref(), false)
+        .append_delivery_message_in(
+            session_id, "user", &sanitized_text, user_tokens, client_msg_id.as_deref(), false,
+            turn_generation.as_deref(),
+        )
         .await
     {
         Ok(id) => Some(id),
@@ -1544,8 +1559,10 @@ pub(super) async fn build_reply_with_session_inner(
     };
     if let Some(direct) = turn_knowledge.direct_reply.clone() {
         if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
-        match super::append_turn_assistant(session_mgr, session_id, &direct, estimate_tokens(&direct))
-            .await
+        match super::append_turn_assistant(
+            session_mgr, session_id, &direct, estimate_tokens(&direct), turn_generation.as_deref(),
+        )
+        .await
         {
             Ok(id) => super::record_turn_assistant_message(session_id, id),
             Err(e) => warn!("Failed to save assistant message to session: {e}"),
@@ -2220,8 +2237,10 @@ pub(super) async fn build_reply_with_session_inner(
         // row id is registered with the turn's delivery gate. WebChat inserts
         // it tombstoned until final publication; refusal scrubs its content,
         // and even a failed scrub cannot expose it in history.
-        match super::append_turn_assistant(session_mgr, session_id, &reply, reply_tokens)
-            .await
+        match super::append_turn_assistant(
+            session_mgr, session_id, &reply, reply_tokens, turn_generation.as_deref(),
+        )
+        .await
         {
             Ok(message_id) => {
                 record_turn_assistant_message(session_id, message_id);
