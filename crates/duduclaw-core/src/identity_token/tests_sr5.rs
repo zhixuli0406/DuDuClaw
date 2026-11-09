@@ -182,5 +182,6 @@ fn merge_agent_token_is_not_a_hook_token() {
     assert_eq!(verify_claim_with(h.path(), DOCTOR_PROBE, &doctor, true, true), IdentityVerdict::Verified);
     assert_eq!(verify_hook_claim_with(h.path(), DOCTOR_PROBE, &doctor, true, true), IdentityVerdict::Rejected);
     assert_eq!(verify_hook_claim_with(h.path(), DOCTOR_PROBE, &mint_hook_token(&k, DOCTOR_PROBE), true, true),
-        IdentityVerdict::Verified);
+        IdentityVerdict::Rejected);
+    assert!(hook_identity_env_vars_with(h.path(), DOCTOR_PROBE, true).iter().all(|(k, _)| k != ENV_HOOK_TOKEN));
 }

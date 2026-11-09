@@ -1129,6 +1129,10 @@ pub(crate) fn hook_identity_env_vars_with(
     protected_mode: bool,
 ) -> Vec<(String, String)> {
     let mut out = vec![(crate::ENV_AGENT_ID.to_string(), agent_id.to_string())];
+    // The doctor probe never holds a hook credential.
+    if agent_id == DOCTOR_PROBE {
+        return out;
+    }
     if let Some(key) = load_key(home_dir) {
         match token_binding(home_dir, agent_id, protected_mode) {
             Ok(TokenBinding::V1) => {
@@ -1291,6 +1295,10 @@ fn verify_claim_inner(
             Err(_) => return IdentityVerdict::Rejected,
         }
     };
+    // The doctor probe never holds a hook credential.
+    if !domain_prefix.is_empty() && claimed_id == DOCTOR_PROBE {
+        return IdentityVerdict::Rejected;
+    }
     // The doctor probe is reserved only against employee creation; the gateway
     // deliberately signs it for an MCP cold-start check, without system reach.
     if crate::is_system_sender(claimed_id)
@@ -1941,17 +1949,17 @@ mod rm166b_hook_token_tests {
 
         // The hook verifier: own hook token yes; another id's, a forged or
         // empty one no.
-        assert_eq!(verify_hook_claim(home, "alice", &hook, true), IdentityVerdict::Verified);
-        assert_eq!(verify_hook_claim(home, "bob", &hook, true), IdentityVerdict::Rejected);
-        assert_eq!(verify_hook_claim(home, "alice", "00", true), IdentityVerdict::Rejected);
-        assert_eq!(verify_hook_claim(home, "alice", "", true), IdentityVerdict::Rejected);
+        assert_eq!(verify_hook_claim_with(home, "alice", &hook, true, false), IdentityVerdict::Verified);
+        assert_eq!(verify_hook_claim_with(home, "bob", &hook, true, false), IdentityVerdict::Rejected);
+        assert_eq!(verify_hook_claim_with(home, "alice", "00", true, false), IdentityVerdict::Rejected);
+        assert_eq!(verify_hook_claim_with(home, "alice", "", true, false), IdentityVerdict::Rejected);
         // The full identity token is not a hook token either (the hook keeps
         // its own explicit fallback for runtimes that still export it).
-        assert_eq!(verify_hook_claim(home, "alice", &full, true), IdentityVerdict::Rejected);
+        assert_eq!(verify_hook_claim_with(home, "alice", &full, true, false), IdentityVerdict::Rejected);
 
         // MCP server identity (`verify_env_identity` → `verify_claim`).
-        assert_eq!(verify_claim(home, "alice", &hook, true), IdentityVerdict::Rejected);
-        assert_eq!(verify_claim(home, "alice", &full, true), IdentityVerdict::Verified);
+        assert_eq!(verify_claim_with(home, "alice", &hook, true, false), IdentityVerdict::Rejected);
+        assert_eq!(verify_claim_with(home, "alice", &full, true, false), IdentityVerdict::Verified);
         // Credential-bearing bridge.
         assert!(verify_bridge_claim(home, "alice", "alice", &hook).is_err());
         assert!(verify_bridge_claim(home, "alice", "alice", &full).is_ok());
@@ -1977,9 +1985,9 @@ mod rm166b_hook_token_tests {
     fn rm166b_hook_env_carries_the_hook_token_never_the_identity_token() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
-        assert_eq!(hook_identity_env_vars(home, "alice").len(), 1, "no key ⇒ id only");
+        assert_eq!(hook_identity_env_vars_with(home, "alice", false).len(), 1, "no key ⇒ id only");
         let key = ensure_key(home).unwrap();
-        let env = hook_identity_env_vars(home, "alice");
+        let env = hook_identity_env_vars_with(home, "alice", false);
         assert_eq!(env[0], (crate::ENV_AGENT_ID.to_string(), "alice".to_string()));
         assert_eq!(env[1].0, ENV_HOOK_TOKEN);
         assert!(verify_hook_token(&key, "alice", &env[1].1));

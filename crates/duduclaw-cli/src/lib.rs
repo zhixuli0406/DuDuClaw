@@ -7149,7 +7149,7 @@ fn hook_caller_from_tokens(
     token: &str,
     require: bool,
 ) -> duduclaw_core::HookCaller {
-    use duduclaw_core::IdentityVerdict::{Rejected, Verified};
+    use duduclaw_core::IdentityVerdict::{Rejected, Unverified, Verified};
     let hook_verified = !hook_token.is_empty()
         && duduclaw_core::verify_hook_claim(home, claimed, hook_token, require) == Verified;
     // No (or a non-verifying) hook token: the identity token decides,
@@ -7162,6 +7162,10 @@ fn hook_caller_from_tokens(
     };
     match verdict {
         Rejected => duduclaw_core::HookCaller::Untrusted(claimed.to_string()),
+        // An ephemeral child never gets soft-mode trust from a bare claim.
+        Unverified if claimed.starts_with("eph-") => {
+            duduclaw_core::HookCaller::Untrusted(claimed.to_string())
+        }
         _ => duduclaw_core::HookCaller::Agent(claimed.to_string()),
     }
 }
@@ -7290,6 +7294,26 @@ mod resolve_hook_caller_tests {
         assert_eq!(
             caller,
             duduclaw_core::HookCaller::Agent("env-only-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn hook_unverified_ephemeral_claim_is_untrusted() {
+        // Soft mode with a live grace: a bare `agent-x` claim is Unverified and
+        // trusted, but an `eph-` claim must not inherit that trust.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
+        duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+
+        assert_eq!(
+            super::hook_caller_from_tokens(tmp.path(), "agent-x", "", "", false),
+            duduclaw_core::HookCaller::Agent("agent-x".to_string()),
+            "control: a non-ephemeral unverified claim stays trusted in soft mode"
+        );
+        assert_eq!(
+            super::hook_caller_from_tokens(tmp.path(), "eph-child", "", "", false),
+            duduclaw_core::HookCaller::Untrusted("eph-child".to_string()),
         );
     }
 
