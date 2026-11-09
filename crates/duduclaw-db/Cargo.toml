@@ -6,12 +6,13 @@ edition.workspace = true
 # WP-D (DESIGN-redaction-field-rules-2026-09 §13.7) — read-only SQL data
 # sources.
 #
-# A thin, deliberately small connector layer over sqlx (PostgreSQL / MySQL /
-# SQLite) that gives DuDuClaw its own first-party database tool surface, so a
-# customer without an existing MCP server can still expose business tables to
-# an agent *through* the redaction pipeline's single MCP choke point.
+# A thin, deliberately small connector layer over sqlx (PostgreSQL / MySQL)
+# and rusqlite (SQLite) that gives DuDuClaw its own first-party database tool
+# surface, so a customer without an existing MCP server can still expose
+# business tables to an agent *through* the redaction pipeline's single MCP
+# choke point.
 #
-# Everything here is read-only by construction: the SQLite pool is opened
+# Everything here is read-only by construction: SQLite connections are opened
 # read-only, the PostgreSQL / MySQL pools run every statement inside an
 # explicit READ ONLY transaction, and free-form SQL additionally passes a
 # statement guard (single statement, must start with SELECT / WITH).
@@ -47,17 +48,24 @@ base64 = { workspace = true }
 # `migrate`. `chrono` / `json` / `uuid` / `bigdecimal` are decode-side only and
 # are what make the §13.7 value mapping (timestamps → ISO, JSON → parsed,
 # decimal → string) possible at all.
+#
+# No `sqlite` feature: sqlx's SQLite driver pins libsqlite3-sys < 0.38, which
+# bundles a SQLite affected by RUSTSEC-2026-0459, and two crates cannot both
+# link `sqlite3`. SQLite is served through the workspace `rusqlite` instead.
 sqlx = { version = "0.8.6", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
     "mysql",
-    "sqlite",
     "chrono",
     "json",
     "uuid",
     "bigdecimal",
 ] }
+
+# SQLite driver. `hooks` provides `Connection::progress_handler`, which is how
+# a runaway statement is stopped at the source's `timeout_ms`.
+rusqlite = { workspace = true, features = ["hooks"] }
 
 [dev-dependencies]
 tempfile = "3"

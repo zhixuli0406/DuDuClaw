@@ -1,0 +1,35 @@
+[package]
+name = "sqlx-sqlite"
+version = "0.8.6"
+edition = "2021"
+publish = false
+description = "Local stub replacing sqlx-sqlite (CVE-2026-119375 / RUSTSEC-2026-0459); see src/lib.rs"
+
+# Intentionally NO dependencies: the point is to keep libsqlite3-sys ^0.30 out
+# of dependency resolution so it cannot conflict with rusqlite's libsqlite3-sys
+# (both declare `links = "sqlite3"`).
+
+[lib]
+path = "src/lib.rs"
+
+# Every feature that sqlx 0.8.6 / sqlx-macros-core 0.8.6 may reference on
+# sqlx-sqlite (`sqlx-sqlite?/<feature>`), declared empty so manifest
+# resolution succeeds. A superset is deliberate: unused entries are harmless,
+# a missing one fails resolution. Enabling the sqlx `sqlite` feature compiles
+# this crate and trips the compile_error! in src/lib.rs.
+[features]
+default = []
+any = []
+json = []
+migrate = []
+offline = []
+chrono = []
+time = []
+uuid = []
+regexp = []
+bundled = []
+unbundled = []
+preupdate-hook = []
+load-extension = []
+deserialize = []
+_unstable-docs = []
