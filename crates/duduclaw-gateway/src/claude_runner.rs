@@ -4935,11 +4935,33 @@ mod rm166_identity_env_tests {
         // ambient gateway env, a future allowlist entry) is removed again.
         cmd.env(duduclaw_core::ENV_AGENT_TOKEN, "inherited");
         crate::agent_hook_installer::apply_hook_identity_env(&mut cmd, Some(&alice));
-        let is_removed = |key: &str| {
-            cmd.as_std().get_envs().any(|(name, value)| name == std::ffi::OsStr::new(key) && value.is_none())
-        };
+        // Effective environment: no value for the full identity token.
         assert_eq!(env_of(&cmd, duduclaw_core::ENV_AGENT_TOKEN), None);
-        assert!(is_removed(duduclaw_core::ENV_AGENT_TOKEN), "explicitly removed, not inherited");
+        // Not inherited either. Under `env_clear()` (the spawn allowlist) std
+        // drops a removed key from its map instead of recording `None`, so
+        // probe which mode the command is in: a removed probe key stays
+        // listed as `None` when inheriting, and vanishes when cleared.
+        let listed = |cmd: &tokio::process::Command, key: &str| {
+            cmd.as_std().get_envs().find(|(name, _)| *name == std::ffi::OsStr::new(key)).map(|(_, v)| v.is_none())
+        };
+        let mut probe = tokio::process::Command::new("true");
+        probe.env_clear();
+        probe.env_remove("RM166_PROBE");
+        let clear_drops_entries = listed(&probe, "RM166_PROBE").is_none();
+        assert!(clear_drops_entries, "std semantics: env_clear drops removed keys");
+        let cleared = {
+            // The spawn command is cleared iff an ambient-style removal leaves no entry.
+            let mut c = cmd;
+            c.env_remove("RM166_PROBE");
+            let cleared = listed(&c, "RM166_PROBE").is_none();
+            cmd = c;
+            cleared
+        };
+        assert!(
+            cleared || listed(&cmd, duduclaw_core::ENV_AGENT_TOKEN) == Some(true),
+            "inherit mode must carry an explicit removal; clear mode must not list the token"
+        );
+        assert_ne!(listed(&cmd, duduclaw_core::ENV_AGENT_TOKEN), Some(false), "token has no value");
         let hook = env_of(&cmd, duduclaw_core::ENV_HOOK_TOKEN).unwrap();
         assert_eq!(
             duduclaw_core::verify_identity_claim(home, "alice", &hook, true),

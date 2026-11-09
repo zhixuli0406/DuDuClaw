@@ -345,6 +345,9 @@ mod tests {
         format!("{:06}", value % 1_000_000)
     }
 
+    /// Distinctive wrong code: "000000" can collide with timestamps/ids in the log.
+    const WRONG_CODE: &str = "913572";
+
     #[tokio::test]
     async fn rm166c_mfa_admin_needs_the_second_factor_and_failures_are_audited() {
         let (home, handler, db, ctx) = fixture("grace-admin-mfa@test.invalid").await;
@@ -370,14 +373,14 @@ mod tests {
         assert!(!audit_types(h).iter().any(|t| t == EVENT_GRACE_STEP_UP_FAILED));
 
         // Wrong code, wrong password: refused, written nothing, audited (N3).
-        assert!(is_err(&handler.handle_identity_grace_start(json!({"password": PASSWORD, "code": "000000"}), &ctx).await));
+        assert!(is_err(&handler.handle_identity_grace_start(json!({"password": PASSWORD, "code": WRONG_CODE}), &ctx).await));
         assert_eq!(audit_types(h).iter().filter(|t| *t == EVENT_GRACE_STEP_UP_FAILED).count(), 1);
-        assert!(is_err(&handler.handle_identity_grace_start(json!({"password": "nope", "code": "000000"}), &ctx).await));
+        assert!(is_err(&handler.handle_identity_grace_start(json!({"password": "nope", "code": WRONG_CODE}), &ctx).await));
         assert_eq!(audit_types(h).iter().filter(|t| *t == EVENT_GRACE_STEP_UP_FAILED).count(), 2);
         assert_eq!(std::fs::read(h.join("config.toml")).unwrap(), before);
         assert!(!audit_types(h).iter().any(|t| t == EVENT_GRACE_MANUAL_ENABLED));
         let raw = std::fs::read_to_string(h.join("security_audit.jsonl")).unwrap();
-        assert!(!raw.contains("000000") && !raw.contains(PASSWORD));
+        assert!(!raw.contains(WRONG_CODE) && !raw.contains(PASSWORD));
 
         // Password + a recovery code: allowed, and the audit names the step-up.
         ok(&handler
