@@ -132,6 +132,8 @@ fn validate_private_files(path: &Path) -> Result<(), StoreError> {
 pub(crate) mod budget_ledger;
 #[path = "store_requests.rs"]
 mod requests;
+#[path = "store_isolated_creators.rs"]
+mod isolated_creators;
 
 const SCHEMA: &str = "PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=5000;
@@ -229,6 +231,15 @@ CREATE TABLE IF NOT EXISTS discovery_requests (
     run_id TEXT NOT NULL UNIQUE,
     sha256 TEXT NOT NULL,
     frozen_json TEXT NOT NULL
+);
+
+-- FD-SEL: the exact (employee id, incarnation) a protected employee filed a
+-- request as. Written once before the task row; never rebound.
+CREATE TABLE IF NOT EXISTS discovery_isolated_creators (
+    task_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE,
+    employee TEXT NOT NULL,
+    incarnation INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS discovery_run_budget (

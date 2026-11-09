@@ -335,8 +335,24 @@ async fn protected_fork(name: &str, args: &Value, home: &Path, agent: &str) -> O
     // dispatcher. The service independently validates current policy and actor.
     Some(match service.execute(&call.context, name, args).await {
         Ok(value) => ok_json(value),
-        Err(_) => err("分支操作未通過授權、狀態或版本檢查。"),
+        Err(error) => protected_fork_error(name, error),
     })
+}
+
+/// FD-SEL: a protected fork read of a foreign fork (another employee id,
+/// principal or binding) answers exactly like an unknown fork. Only a host
+/// store failure is reported separately; it never depends on the fork owner.
+pub(crate) const FORK_NOT_FOUND: &str = "fork_not_found：找不到這個分支試算，或它不屬於目前的員工。";
+
+fn protected_fork_error(name: &str, error: duduclaw_mcp_boundary::VerificationError) -> Value {
+    use duduclaw_mcp_boundary::VerificationError;
+    if duduclaw_mcp_boundary::fork_policy::READ_TOOLS.contains(&name) {
+        return match error {
+            VerificationError::Unavailable => err("受保護的分支紀錄暫時無法讀取，已拒絕操作。"),
+            _ => err(FORK_NOT_FOUND),
+        };
+    }
+    err("分支操作未通過授權、狀態或版本檢查。")
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -1552,5 +1568,26 @@ test_timeout_s = 60
         )
         .await;
         assert!(is_error(&v)); // branch_b missing
+    }
+
+    /// FD-SEL: every non-availability refusal of a protected fork read is the
+    /// same `fork_not_found` answer (foreign actor, unknown id, wrong schema),
+    /// so a caller cannot probe which fork ids exist for other employees. The
+    /// deferred mutations keep their generic refusal.
+    #[test]
+    fn fdsel_protected_fork_read_errors_have_not_found_parity() {
+        use duduclaw_mcp_boundary::VerificationError;
+        for name in duduclaw_mcp_boundary::fork_policy::READ_TOOLS {
+            let expected = protected_fork_error(name, VerificationError::Invalid);
+            assert!(is_error(&expected) && text(&expected).contains("fork_not_found"), "{name}");
+            for error in [VerificationError::BindingMismatch, VerificationError::Revoked] {
+                assert_eq!(protected_fork_error(name, error), expected, "{name}");
+            }
+            let unavailable = protected_fork_error(name, VerificationError::Unavailable);
+            assert!(is_error(&unavailable) && !text(&unavailable).contains("fork_not_found"), "{name}");
+        }
+        for name in duduclaw_mcp_boundary::fork_policy::DEFERRED_TOOLS {
+            assert!(!text(&protected_fork_error(name, VerificationError::Invalid)).contains("fork_not_found"), "{name}");
+        }
     }
 }

@@ -144,7 +144,19 @@ impl ForkStore {
         Ok((fork, branches))
     }
 
+    /// A branch the launch/cancel/publication paths act on: the exact actor
+    /// AND the record's grant for the branch workspace.
     pub fn branch(&self, context: &RequestContext, fork: &str, branch: &str) -> Result<Branch, VerificationError> {
+        let owned = self.owned_branch(context, fork, branch)?;
+        require_workspace(context, owned.workspace.workspace.as_str())?;
+        Ok(owned)
+    }
+
+    /// FD-SEL read path: a branch of the caller's own fork (exact actor =
+    /// employee id, principal and binding), without a workspace grant. Reads
+    /// disclose recorded metadata only; nothing is opened, launched or
+    /// published. A foreign or unknown fork/branch is the same `Invalid`.
+    fn owned_branch(&self, context: &RequestContext, fork: &str, branch: &str) -> Result<Branch, VerificationError> {
         key(fork)?; key(branch)?;
         let connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
         let (workspace, cwd, run, state): (String, String, Option<String>, String) = connection.query_row(
@@ -152,7 +164,6 @@ impl ForkStore {
              JOIN protected_forks f ON f.id=b.fork WHERE f.id=?1 AND b.id=?2 AND f.actor=?3",
             params![fork, branch, identity(context)?], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
             .optional().map_err(unavailable)?.ok_or(VerificationError::Invalid)?;
-        require_workspace(context, &workspace)?;
         Ok(Branch { id: branch.into(), workspace: WorkspacePolicy {
             workspace: duduclaw_isolation::bounded::Text::new(workspace).map_err(|_| VerificationError::Invalid)?,
             relative_cwd: duduclaw_isolation::bounded::Text::new(cwd).map_err(|_| VerificationError::Invalid)? },
@@ -177,7 +188,10 @@ impl ForkStore {
         Ok(())
     }
 
-    /// Exact actor and every returned branch grant are checked before disclosure.
+    /// FD-SEL: a read of the caller's own fork. The exact actor (employee id,
+    /// principal, binding) is the authority; the record needs no workspace
+    /// grant (the issuer signs only `employee-work`, never branch handles).
+    /// A foreign or unknown fork is the same `Invalid` (no existence oracle).
     pub fn inspect(&self, context: &RequestContext, fork: &str) -> Result<serde_json::Value, VerificationError> {
         key(fork)?;
         let (revision,parent_digest,parent) = {
@@ -185,7 +199,6 @@ impl ForkStore {
             let (revision,manifest,parent):(u64,String,String)=connection.query_row("SELECT f.revision,f.baseline,f.parent_workspace FROM protected_forks f WHERE f.id=?1 AND f.actor=?2",params![fork,identity(context)?],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(unavailable)?.ok_or(VerificationError::Invalid)?;
             (revision,Manifest::decode(&manifest)?.digest(),parent)
         };
-        require_workspace(context,&parent)?;
         let ids = {
             let connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
             let mut query = connection.prepare("SELECT b.id FROM protected_fork_branches b JOIN protected_forks f ON f.id=b.fork WHERE f.id=?1 AND f.actor=?2 ORDER BY b.id").map_err(unavailable)?;
@@ -195,7 +208,7 @@ impl ForkStore {
         if ids.is_empty() { return Err(VerificationError::Invalid); }
         let mut branches = vec![];
         for id in ids {
-            let branch = self.branch(context,fork,&id)?;
+            let branch = self.owned_branch(context,fork,&id)?;
             branches.push(serde_json::json!({"branch_id":branch.id,"workspace":branch.workspace.workspace.as_str(),
                 "state":branch.state,"run":branch.run.map(crate::execution_jobs::handle_text)}));
         }
@@ -259,8 +272,11 @@ impl ForkStore {
         Ok(result)
     }
 
+    /// FD-SEL read: both branches must belong to the caller's own fork (exact
+    /// actor); no workspace grant. An incomplete branch has no recorded
+    /// manifest (`Unavailable`), never a partial comparison.
     pub fn diff(&self, context: &RequestContext, fork: &str, left: &str, right: &str) -> Result<Vec<String>, VerificationError> {
-        self.branch(context, fork, left)?; self.branch(context, fork, right)?;
+        self.owned_branch(context, fork, left)?; self.owned_branch(context, fork, right)?;
         let connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
         let load = |id| -> Result<Manifest, VerificationError> {
             let text: String = connection.query_row("SELECT manifest FROM protected_fork_branches WHERE id=?1 AND state='complete'",
@@ -420,6 +436,10 @@ impl ForkHostControl {
         if crate::fork_policy::deferred(name) { return Err(VerificationError::Unavailable); }
         if !crate::tool_policy::eligible(context, name) { return Err(VerificationError::Invalid); }
         crate::check_arguments(arguments)?;
+        // FD-SEL: the reads accept exactly their protected schema.
+        if crate::fork_policy::READ_TOOLS.contains(&name) {
+            crate::tool_policy::check_own_read_arguments(name, arguments)?;
+        }
         let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
         let allowed: &[&str] = match name {
             "inspect_branches" | "fork_cost" => &["fork_id"],

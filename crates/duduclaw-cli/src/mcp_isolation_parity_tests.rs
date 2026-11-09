@@ -144,10 +144,16 @@ fn pending_production_selectors() -> BTreeSet<String> {
     // PublicOrigins) and skill_synthesis_run (own Employee). HX6 removed
     // browser_record_start/stop (own recording selector). SFR removed
     // skill_from_recording (own distill selector behind the recording gate,
-    // H12d's seam installed over HX6's store, verified artifacts only), the
-    // last own-skill/recording tool on the list.
+    // H12d's seam installed over HX6's store, verified artifacts only).
+    // FD-SEL removed the discovery job tools and the fork reads (own Employee
+    // grant only; the host checks the exact creator binding / fork actor per
+    // call). The list is now empty.
     let pending: BTreeSet<String> = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS
         .iter().map(|tool| (*tool).to_owned()).collect();
+    for tool in duduclaw_mcp_boundary::tool_policy::OWN_READ_TOOLS {
+        assert!(!pending.contains(tool), "{tool}: FD-SEL own discovery/fork reads have their selector");
+    }
+    assert!(pending.is_empty(), "SFR + FD-SEL: no pending selector gap is left: {pending:?}");
     for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS {
         assert!(!pending.contains(tool), "{tool}: HX5 in-run helpers have their selector");
     }
@@ -160,19 +166,10 @@ fn pending_production_selectors() -> BTreeSet<String> {
     for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_RECORDING_TOOLS {
         assert!(!pending.contains(tool), "{tool}: HX6 in-run recording has its selector");
     }
-    // SFR: no own-skill, recording or helper tool is left. What remains are
-    // the fork/discovery readers (their own selector work, outside SFR).
+    // SFR: skill_from_recording has its own distill selector.
     assert!(!pending.contains("skill_from_recording"), "skill_from_recording has its own distill selector");
-    for tool in &pending {
-        assert!(FORK_DISCOVERY_READERS.contains(&tool.as_str()), "{tool}: unexpected pending selector gap");
-    }
     pending
 }
-
-/// The pending list's remaining entries (fork/discovery readers). When their
-/// selectors land this set and `PENDING_WORKSPACE_SELECTOR_TOOLS` are empty.
-const FORK_DISCOVERY_READERS: [&str; 8] = ["inspect_branches", "diff_branches", "fork_cost", "discovery_catalog",
-    "discovery_list", "discovery_tree", "discovery_artifact", "discovery_cancel"];
 
 /// HX6 security fix round (finding 7), SFR form: `skill_from_recording` left
 /// the pending list, so its distill step must be fed only artifacts that
@@ -511,6 +508,15 @@ async fn employee_tool_parity(home: &std::path::Path) {
     for tool in duduclaw_mcp_boundary::tool_policy::SPAWN_TOOLS {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: H13 spawn selector missing");
         assert!(!pending.contains(tool), "{tool}");
+    }
+    // FD-SEL: own discovery jobs and own fork-store reads come from the
+    // issuer's own Employee grant alone (no Workspace, no Task); the issuer
+    // signs them beside the selected `employee-work` grant.
+    for tool in duduclaw_mcp_boundary::tool_policy::OWN_READ_TOOLS {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: FD-SEL selector missing");
+        assert!(!pending.contains(tool), "{tool}");
+        assert_eq!(duduclaw_mcp_boundary::tool_policy::own_read_selector(&context, tool).unwrap(),
+            vec![ResourceGrant::Employee { id: context.record().employee }], "{tool}: own Employee only");
     }
     // HX6: the recording rides the same grant, signed by its own selector
     // (fixture: spawnd helper_calls + helper_recording, `public_web`, interactive).

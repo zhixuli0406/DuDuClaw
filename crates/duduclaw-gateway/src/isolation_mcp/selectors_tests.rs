@@ -6,7 +6,7 @@ use std::{cell::Cell, os::unix::fs::PermissionsExt, sync::atomic::{AtomicU32, Or
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord, Lane, PublicOrigin,
     ResourceGrant}, ids::{RunId, Sha256Digest}, ipc::SpawndFeatures};
 use duduclaw_mcp_boundary::{resources::{BrokeredWorkFile, WorkBroker, WorkBrokerError, WorkFileRequest,
-    EMPLOYEE_WORK_ROOT}, tool_policy::{eligible, IN_RUN_HELPER_TOOLS},
+    EMPLOYEE_WORK_ROOT}, tool_policy::{eligible, IN_RUN_HELPER_TOOLS, OWN_READ_TOOLS},
     workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS, RequestContext};
 use duduclaw_migration::{allocation::Receipt, contract::ConfirmationItem};
 use crate::isolation_lifecycle::LifecycleError;
@@ -259,6 +259,17 @@ fn hx5_helper_tools_get_workspace_without_file_tools() {
 
 #[test]
 fn hx5_pending_tools_still_never_signed() {
+    // SFR + FD-SEL emptied the list. It must stay empty, and the former
+    // entries are each covered by a named selector test (not by this loop):
+    // skill_from_recording -> `sfr_skill_from_recording_hidden_when_recording_gate_off`
+    // (+ boundary `sfr_skill_from_recording_signed_only_with_distill_selector`);
+    // the 8 discovery/fork readers -> boundary `fdsel_policies_need_only_the_own_employee_grant`,
+    // `fdsel_tools_left_the_pending_selector_list` and the CLI parity test.
+    assert!(PENDING_WORKSPACE_SELECTOR_TOOLS.is_empty(), "pending selector list must stay empty");
+    for tool in OWN_READ_TOOLS {
+        assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
+    }
+    assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording"));
     let (f, _) = helper_fixture(SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::WORK_BROKER));
     f.tasks(&[("task-a", LABEL)]);
     for with_files in [false, true] {

@@ -20,8 +20,10 @@ Status: plan, 2026-11-08 (owner decision D-4: in scope for v1.81.0). Base `feat/
 12–15 skill_extract / shared_skill_adopt / skill_security_scan / skill_graduate: parse-worker E ops + skill publication into own wiki.
 16–18 skill_synthesis_run / skill_hub_install / skill_curator_status: host provider/fetch + E ops; curator own skills only.
 19–21 create_task / spawn_agent / spawn_ephemeral: host queue; live task-ownership; ephemeral under parent identity.
-22–26 discovery_catalog/list/tree/artifact/cancel: host discovery service, own jobs.
-27–29 inspect_branches / diff_branches / fork_cost: host fork-store reads.
+22–26 discovery_catalog/list/tree/artifact/cancel: host discovery service, own jobs. (FD-SEL: selector, not a refusal —
+  own Employee grant; own requests bound to the creator's exact employee id + incarnation; foreign = `discovery not found`.)
+27–29 inspect_branches / diff_branches / fork_cost: host fork-store reads. (FD-SEL: own Employee grant, exact fork actor,
+  no workspace grant; foreign = `fork_not_found`.)
 
 ## Decisions (H0)
 - D-H1 workspace authority: root work broker (opens a file under the live run's attached mount, passes the fd) + per-employee

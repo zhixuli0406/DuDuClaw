@@ -260,6 +260,12 @@ pub(crate) fn approval_origin() -> Option<Result<(String, String), String>> {
         .ok_or_else(|| "isolated approval turn origin unavailable".into())).ok()
 }
 
+impl CallIdentity {
+    /// FD-SEL: the verified capability's employee id (immutable registry id,
+    /// never reused for a recreated label). Never taken from tool arguments.
+    pub(crate) fn employee(&self) -> duduclaw_isolation::ids::EmployeeId { self.context.record().employee }
+}
+
 pub(crate) fn current(home: &Path, agent: &str) -> Option<Result<CallIdentity, String>> {
     CALL.try_with(|call| {
         if call.home == home && call.agent == agent { Ok(call.clone()) }

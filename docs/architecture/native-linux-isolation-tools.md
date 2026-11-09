@@ -110,8 +110,29 @@ SFR: it left `PENDING_WORKSPACE_SELECTOR_TOOLS`; the issuer signs it with its
 own selector (`workspace_selection::RECORDING_DISTILL_TOOLS`) under exactly the
 recording gate's conditions, without PublicOrigins. `skill_hub_install`,
 `skill_synthesis_run` (H12b/c), `spawn_agent`/`spawn_ephemeral` (H13),
-`browser_record_start`/`stop` (HX6) and `skill_from_recording` (SFR) are no
-longer on that list; it now holds only the fork/discovery readers.
+`browser_record_start`/`stop` (HX6), `skill_from_recording` (SFR) and the
+FD-SEL discovery job tools and fork reads are no longer on that list; the list
+is now empty (no pending selector gap is left, and none may be added back).
+
+FD-SEL (v1.81, Package H tools 22–29): the discovery job tools
+(`discovery_catalog`, `discovery_list`, `discovery_tree`, `discovery_artifact`,
+`discovery_cancel`) and the fork reads (`inspect_branches`, `diff_branches`,
+`fork_cost`) need only the record's own `Employee` grant
+(`tool_policy::own_reads`; no Workspace, Task or resolver output) and accept an
+exact protected schema. Discovery is not refused: running discovery stays
+operator-only (disposable containers, dedicated account pool, a manager decision
+receipt before any run), but a protected employee already files requests through
+`tasks_create` (kind `discovery`), and these tools only let it see, download the
+published checkpoint of, or withdraw a request it filed itself. Each protected
+request stores its creator's exact employee id and incarnation
+(`discovery_isolated_creators` in `discovery.db`, written before the task row);
+a protected caller is the capability's employee id at the label's live confirmed
+incarnation and sees only requests bound to exactly that. Foreign, unknown,
+another incarnation's, a recreated label's, an ordinary caller's and pre-FD-SEL
+requests all answer `discovery not found`. Fork reads are views of the caller's
+own protected forks (exact actor: employee id, principal and binding) without a
+workspace grant; a foreign and an unknown fork both answer `fork_not_found`. The
+fork mutations stay `ForkNextRelease`. Unprotected installations are unchanged.
 
 H12a (v1.81): the own-skill tools `skill_extract`, `shared_skill_adopt`,
 `skill_security_scan`, `skill_graduate` and `skill_curator_status` no longer
@@ -311,17 +332,17 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `computer_workspace_write` | Resource → AuthorizedToolCall → original live employee handler |
 | `session_restore_context` | Resource → AuthorizedToolCall → original live employee handler |
 | `fork_run` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
-| `inspect_branches` | Host fork store; exact actor/generation and workspace grants; no legacy-row import. |
-| `diff_branches` | Host recorded-manifest comparison; exact actor/grants; not live or immutable byte verification. |
+| `inspect_branches` | Host fork store; own forks only (FD-SEL: own Employee grant, exact actor = employee id/principal/binding, no workspace grant); foreign and unknown forks both `fork_not_found`; no legacy-row import. |
+| `diff_branches` | Host recorded-manifest comparison of two branches of an own fork (FD-SEL: own Employee grant, exact actor); foreign and unknown both `fork_not_found`; not live or immutable byte verification. |
 | `merge_or_select` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
 | `terminate_branch` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
-| `fork_cost` | Host owner-checked query; measurement_status=unavailable and null spend until measured usage is implemented; never fabricated zero. |
+| `fork_cost` | Host owner-checked query of an own fork (FD-SEL: own Employee grant, exact actor; foreign and unknown both `fork_not_found`); measurement_status=unavailable and null spend until measured usage is implemented; never fabricated zero. |
 | `credential_declare` | Resource → AuthorizedToolCall → original live employee handler |
-| `discovery_catalog` | Host discovery catalog handler; original employee gates |
-| `discovery_list` | Host discovery list handler; original employee gates |
-| `discovery_tree` | Host discovery tree handler; original employee gates |
-| `discovery_artifact` | Host bounded discovery artifact handler on Linux; checked recorded-artifact access |
-| `discovery_cancel` | Host discovery job control; original employee gates |
+| `discovery_catalog` | Host discovery catalog handler; FD-SEL: own Employee grant, exact protected schema; original employee and delegation gates; no job data |
+| `discovery_list` | Host discovery list handler; FD-SEL: only requests this employee filed as its exact employee id + incarnation |
+| `discovery_tree` | Host discovery tree handler; FD-SEL: own bound requests only; foreign and unknown runs both `discovery not found` |
+| `discovery_artifact` | Host bounded discovery artifact handler on Linux; checked recorded-artifact access; FD-SEL: own bound requests only; foreign and unknown runs both `discovery not found` |
+| `discovery_cancel` | Host discovery job control; FD-SEL: withdraws/cancels only own bound requests; foreign and unknown runs both `discovery not found` |
 | `tasks_list` | Resource → finite SQL adapter for explicit grants; original live handler for EmployeeScope |
 | `tasks_create` | Resource → AuthorizedToolCall → original live employee handler |
 | `tasks_update` | Resource → AuthorizedToolCall → original live employee handler |

@@ -5,11 +5,12 @@
 //! (`IN_RUN_HELPER_TOOLS`) when spawnd advertises `helper_calls` and a work
 //! broker is installed. The same handle is also the A execution workspace, so
 //! the grant alone would make every listed tool that needs a Workspace
-//! eligible: other execution tools (discovery, forks) and the
-//! workspace-scoped E services. HX6: the browser recording tools are signed
-//! only with their own recording selector (`drops_from_signed_with`); SFR:
-//! `skill_from_recording` only with its own (`RECORDING_DISTILL_TOOLS`, the
-//! same host gate). (H13
+//! eligible: other execution tools (e.g. the deferred fork mutations) and the
+//! workspace-scoped E services. (FD-SEL: the discovery job tools and the fork
+//! reads need only the own Employee grant and are not affected.) HX6: the
+//! browser recording tools are signed only with their own recording selector
+//! (`drops_from_signed_with`); SFR: `skill_from_recording` only with its own
+//! (`RECORDING_DISTILL_TOOLS`, the same host gate). (H13
 //! `spawn_agent` / `spawn_ephemeral` need only the Employee grant and are not
 //! affected.) No selector chose a
 //! workspace for them, so the issuer must not sign them: they stay hidden and
@@ -30,9 +31,10 @@ use crate::tool_policy::{employee_service_scope, policy, ResourceKind, Route, IN
 /// `skill_from_recording` (H12d's `RecordingJobs` seam is installed over HX6's
 /// store at boot, every artifact goes through `verify_artifact`, and its own
 /// selector [`RECORDING_DISTILL_TOOLS`] signs it only behind the recording
-/// gate). None of them may be added back here.
-pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &["inspect_branches", "diff_branches", "fork_cost", "discovery_catalog", "discovery_list", "discovery_tree", "discovery_artifact",
-    "discovery_cancel"];
+/// gate); FD-SEL removed the five discovery job tools and the three fork
+/// reads (own Employee grant only, `tool_policy::own_reads`). The list is now
+/// empty: None of them may be added back here.
+pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &[];
 
 /// SFR: distilling a recording needs the brokered workspace that holds the
 /// recordings, and is offered only where recording is available (the HX6
@@ -149,6 +151,9 @@ mod tests {
     /// helper, and the helper bit never signs one.
     #[test]
     fn pending_list_is_policy_backed_and_excludes_helpers() {
+        // The list is empty after SFR + FD-SEL; the loop below is kept so any
+        // entry added back is still checked (the emptiness itself is pinned
+        // by `pending_list_is_empty_and_former_entries_have_selectors`).
         for tool in PENDING_WORKSPACE_SELECTOR_TOOLS {
             assert!(needs_execution_workspace(tool, true) && needs_execution_workspace(tool, false), "{tool}");
             assert!(!IN_RUN_HELPER_TOOLS.contains(tool), "{tool}");
@@ -191,16 +196,12 @@ mod tests {
         assert!(drops_from_signed_with("skill_from_recording", true, true, true), "only its own selector signs it");
     }
 
-    /// SFR: `skill_from_recording` left the pending list (the list is now the
-    /// fork/discovery readers only) and is signed exactly with its own distill
-    /// selector, never by the helper or recording bits.
+    /// SFR: `skill_from_recording` left the pending list and is signed exactly
+    /// with its own distill selector, never by the helper or recording bits.
     #[test]
     fn sfr_skill_from_recording_signed_only_with_distill_selector() {
         assert_eq!(RECORDING_DISTILL_TOOLS, ["skill_from_recording"]);
-        let mut pending = PENDING_WORKSPACE_SELECTOR_TOOLS.to_vec();
-        pending.sort_unstable();
-        assert_eq!(pending, ["diff_branches", "discovery_artifact", "discovery_cancel", "discovery_catalog",
-            "discovery_list", "discovery_tree", "fork_cost", "inspect_branches"], "fork/discovery readers only");
+        assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording"));
         let tool = "skill_from_recording";
         assert!(needs_execution_workspace(tool, true) && needs_execution_workspace(tool, false));
         for scoped in [true, false] {
@@ -216,5 +217,35 @@ mod tests {
             .filter(|name| drops_from_signed_selected(name, true, WorkspaceSelectors::default())
                 && !drops_from_signed_selected(name, true, distill)).collect();
         assert_eq!(newly, vec![tool]);
+    }
+
+    /// Merged final state (SFR + FD-SEL): no tracked gap is left. Never
+    /// vacuous: each former entry is pinned to its own selector below.
+    #[test]
+    fn pending_list_is_empty_and_former_entries_have_selectors() {
+        assert!(PENDING_WORKSPACE_SELECTOR_TOOLS.is_empty(), "pending selector gap must stay empty");
+        // SFR: skill_from_recording is signed only with the distill selector.
+        assert_eq!(RECORDING_DISTILL_TOOLS, ["skill_from_recording"]);
+        for scoped in [true, false] {
+            assert!(drops_from_signed_with("skill_from_recording", scoped, true, true));
+            assert!(!drops_from_signed_selected("skill_from_recording", scoped,
+                WorkspaceSelectors { distill: true, ..WorkspaceSelectors::default() }));
+        }
+        // FD-SEL: the 8 former entries are eligible with only the own Employee grant.
+        let mut former = crate::tool_policy::OWN_READ_TOOLS.to_vec();
+        former.sort_unstable();
+        assert_eq!(former, ["diff_branches", "discovery_artifact", "discovery_cancel", "discovery_catalog",
+            "discovery_list", "discovery_tree", "fork_cost", "inspect_branches"]);
+        for tool in crate::tool_policy::OWN_READ_TOOLS {
+            assert_eq!(policy(tool).expect(tool).required, &[ResourceKind::Employee], "{tool}");
+            for (scoped, helpers) in [(true, false), (true, true), (false, false), (false, true)] {
+                assert!(!drops_from_signed(tool, scoped, helpers), "{tool}");
+            }
+        }
+        // The deferred fork mutations still rest on a Workspace and stay out
+        // of any workspace-carrying snapshot (and are refused by disposition).
+        for tool in crate::fork_policy::DEFERRED_TOOLS {
+            assert!(needs_execution_workspace(tool, true) && drops_from_signed(tool, true, true), "{tool}");
+        }
     }
 }
