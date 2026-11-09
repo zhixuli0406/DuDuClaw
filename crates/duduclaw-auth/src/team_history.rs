@@ -115,6 +115,49 @@ impl UserDb {
             since_micros: since,
         })
     }
+
+    /// RM-173: an Admin moves the activation boundary of an ENABLED window.
+    /// Moving it earlier exposes older conversations, so the gateway requires
+    /// a fresh step-up for that direction before calling this; this layer only
+    /// guarantees the transition is atomic with its audit: `audit(old, new)`
+    /// runs inside the same IMMEDIATE transaction and a failure rolls the
+    /// change back. Unchanged ⇒ `Ok(old)` without auditing. Returns the old
+    /// boundary. Refuses an off window or a pending reset (a later re-enable
+    /// starts a fresh window at "now" anyway).
+    pub fn set_team_history_since<F>(&self, since_micros: i64, audit: F) -> Result<i64, String>
+    where
+        F: FnOnce(i64, i64) -> Result<(), String>,
+    {
+        if since_micros <= 0 {
+            return Err("invalid team history boundary".to_string());
+        }
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if matches!(meta(&tx, "team_history_reset_required")?, Some(n) if n != 0) {
+            return Err("team history is off".to_string());
+        }
+        if meta(&tx, "team_history_enabled")? != Some(1) {
+            return Err("team history is off".to_string());
+        }
+        let old = match meta(&tx, "team_history_since")? {
+            Some(n) if n > 0 => n,
+            _ => return Err("invalid team history activation boundary".to_string()),
+        };
+        if old == since_micros {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(old);
+        }
+        tx.execute(
+            "UPDATE auth_meta SET value = ?1 WHERE key = 'team_history_since'",
+            [since_micros],
+        )
+        .map_err(|e| e.to_string())?;
+        audit(old, since_micros)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(old)
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +224,26 @@ mod tests {
             .observe_team_history(true, 400, |_, _, _| panic!("failed disable must roll back"))
             .unwrap();
         assert_eq!(kept.since_micros, Some(200));
+    }
+
+    #[test]
+    fn rm173_boundary_moves_only_on_an_enabled_window_and_rolls_back_with_audit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = UserDb::new(file.path()).unwrap();
+        assert!(db.set_team_history_since(50, |_, _| Ok(())).is_err(), "off window");
+        db.observe_team_history(true, 100, |_, _, _| Ok(())).unwrap();
+        assert!(db.set_team_history_since(0, |_, _| Ok(())).is_err());
+        assert!(db.set_team_history_since(40, |_, _| Err("audit unavailable".into())).is_err());
+        let kept = db.observe_team_history(true, 500, |_, _, _| panic!("no transition")).unwrap();
+        assert_eq!(kept.since_micros, Some(100), "failed audit rolls the change back");
+        let mut seen = None;
+        assert_eq!(db.set_team_history_since(40, |old, new| { seen = Some((old, new)); Ok(()) }).unwrap(), 100);
+        assert_eq!(seen, Some((100, 40)));
+        assert_eq!(db.set_team_history_since(40, |_, _| panic!("unchanged must not audit")).unwrap(), 40);
+        let now = db.observe_team_history(true, 600, |_, _, _| panic!("no transition")).unwrap();
+        assert_eq!(now.since_micros, Some(40));
+        db.require_team_history_reset().unwrap();
+        assert!(db.set_team_history_since(30, |_, _| Ok(())).is_err(), "pending reset");
     }
 
     #[test]

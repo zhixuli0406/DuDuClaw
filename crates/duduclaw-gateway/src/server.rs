@@ -1171,17 +1171,24 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         })?,
     );
 
-    // Start periodic session cleanup (every 6 hours, remove sessions older than 72 hours)
+    // Periodic conversation retention (every 6 hours). RM-173: the admin
+    // `[sessions] archive_after_days` / `purge_after_days` settings are re-read
+    // on every run; an unreadable config archives with the default and never
+    // purges (see `session_retention`).
     {
         let sm = session_manager.clone();
+        let home = home_dir.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
             loop {
                 interval.tick().await;
-                match sm.cleanup_inactive(72).await {
-                    Ok(n) if n > 0 => info!("Cleaned up {} inactive sessions", n),
-                    Ok(_) => {}
-                    Err(e) => warn!("Session cleanup error: {}", e),
+                let outcome = crate::session_retention::run(&home, &sm).await;
+                if outcome.archived > 0 || outcome.purged > 0 {
+                    info!(
+                        archived = outcome.archived,
+                        purged = outcome.purged,
+                        "Session retention: archived inactive / purged expired conversations"
+                    );
                 }
             }
         });

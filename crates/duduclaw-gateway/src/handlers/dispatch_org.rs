@@ -109,6 +109,9 @@ impl MethodHandler {
             "users.my_history_views" => boxed_frame(|| self.handle_my_history_views(params, ctx)).await,
             "users.team_history.list" => boxed_frame(|| self.handle_team_history_list(params, ctx)).await,
             "users.team_history.get" => boxed_frame(|| self.handle_team_history_get(params, ctx)).await,
+            // RM-173: Admin, or a manager who can read the session through
+            // `users.team_history.get` right now (same authorization).
+            "users.team_history.restore" => boxed_frame(|| self.handle_team_history_restore(params, ctx)).await,
             "users.org_settings.get" | "users.org_settings.update" => {
                 require_admin!();
                 boxed_frame(|| self.handle_org_history_settings(params, ctx, method.ends_with(".update")))
@@ -649,6 +652,10 @@ impl MethodHandler {
             // the agent id is resolved from the session; an unknown session id
             // fails closed ("session not found") before any turns are exposed.
             "chat.sessions.history" => boxed_frame(|| self.handle_chat_sessions_history(params, ctx)).await,
+            // RM-173: restore one of the caller's own archived conversations.
+            // Same session-resolved gate as `chat.sessions.history`, plus
+            // write-scope (own conversation only in the filtered mode).
+            "chat.sessions.restore" => boxed_frame(|| self.handle_chat_sessions_restore(params, ctx)).await,
 
             // ── Decision Continuity (RFC-24, agent-scoped) ──
             "decisions.list" => {

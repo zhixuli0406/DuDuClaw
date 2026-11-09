@@ -23,6 +23,8 @@ pub struct ReadSession {
     pub last_active: String,
     pub rows: Vec<SessionMessage>,
     pub turns: usize,
+    /// RM-173: archived (收起) conversations stay readable here, flagged.
+    pub archived: bool,
 }
 pub struct Page {
     pub sessions: Vec<ReadSession>,
@@ -102,8 +104,10 @@ pub async fn get(
     id: &str,
 ) -> Result<Option<ReadSession>, String> {
     let conn = sm.acquire().await;
-    let row:Option<(String,Option<String>,Option<String>,String)>=conn.query_row("SELECT agent_id,origin_kind,owner_user_id,last_active FROM sessions WHERE id=?1 AND archived_at IS NULL",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())?;
-    let Some((agent, kind, owner, last_active)) = row else {
+    // RM-173: archived conversations are history too. The activation window
+    // (`since`), origin classification and the caller's live scope still apply.
+    let row:Option<(String,Option<String>,Option<String>,String,bool)>=conn.query_row("SELECT agent_id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
+    let Some((agent, kind, owner, last_active, archived)) = row else {
         return Ok(None);
     };
     if agent != scope.agent {
@@ -126,6 +130,7 @@ pub async fn get(
         last_active,
         rows,
         turns,
+        archived,
     }))
 }
 
@@ -188,8 +193,8 @@ pub async fn list(
     let broad_before = exact_before.map(|t| (t + chrono::Duration::seconds(1)).to_rfc3339());
     // Scope precedes pagination. The cursor is (last_active,id), so equal
     // activity times neither duplicate nor hide a permitted conversation.
-    let mut stmt=conn.prepare("SELECT id,origin_kind,owner_user_id,last_active FROM sessions
-      WHERE agent_id=?1 AND archived_at IS NULL AND julianday(last_active)>=julianday(?2)
+    let mut stmt=conn.prepare("SELECT id,origin_kind,owner_user_id,last_active,archived_at IS NOT NULL FROM sessions
+      WHERE agent_id=?1 AND julianday(last_active)>=julianday(?2)
         AND ((origin_kind='webchat_user' AND (owner_user_id=?3 OR owner_user_id IN (SELECT value FROM json_each(?4))))
              OR origin_kind IN ('channel','webchat_visitor','public_visitor'))
         AND (?5 IS NULL OR (origin_kind='webchat_user' AND owner_user_id=?5))
@@ -218,6 +223,7 @@ pub async fn list(
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, bool>(4)?,
                 ))
             },
         )
@@ -229,7 +235,7 @@ pub async fn list(
         if scanned >= 10_000 {
             return Err("history page scan limit".into());
         }
-        let (id, kind, owner, last_active) = row.map_err(|e| e.to_string())?;
+        let (id, kind, owner, last_active, archived) = row.map_err(|e| e.to_string())?;
         if let Some(before) = exact_before {
             let Ok(active) = DateTime::parse_from_rfc3339(&last_active) else {
                 continue;
@@ -267,6 +273,7 @@ pub async fn list(
             last_active,
             rows: title,
             turns,
+            archived,
         });
         if sessions.len() == limit {
             break;

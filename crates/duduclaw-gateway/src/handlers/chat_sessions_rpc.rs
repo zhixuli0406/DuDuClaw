@@ -30,13 +30,20 @@ impl MethodHandler {
             .and_then(|v| v.as_u64())
             .unwrap_or(CHAT_SESSIONS_LIST_DEFAULT_LIMIT as u64)
             .min(CHAT_SESSIONS_LIST_MAX_LIMIT as u64) as usize;
+        // RM-173: `archived: true` lists only archived (「已收起」) conversations,
+        // with exactly the same authority and privacy filters as the live list.
+        let archived = match params.get("archived") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return WsFrame::error_response("", "archived must be a boolean"),
+        };
 
         let live = match self.bound_history_live(ctx) { Ok(c) => c, Err(e) => return WsFrame::error_response("", &e) };
         let initial = if let Some(agent) = agent_filter {
             match privacy::mode(&self.home_dir, &live, agent) { Ok(m) => m, Err(_) => return WsFrame::error_response("", "session not found") }
         } else if live.is_admin() { Mode::Full } else { return WsFrame::error_response("", "agent_id required"); };
         if initial == Mode::Filtered {
-            return match self.bound_history_list(&live, agent_filter.unwrap(), limit).await {
+            return match self.bound_history_list(&live, agent_filter.unwrap(), limit, archived).await {
                 Ok(sessions) => WsFrame::ok_response("",json!({"sessions":sessions})),
                 Err(e) => WsFrame::error_response("",&e),
             };
@@ -49,7 +56,7 @@ impl MethodHandler {
             None => return WsFrame::ok_response("", json!({ "sessions": [] })),
         };
 
-        match rc.session_manager.list_sessions(agent_filter, limit).await {
+        match rc.session_manager.list_sessions_in(agent_filter, limit, archived).await {
             Ok(list) => {
                 let valid = if let Some(agent) = agent_filter {
                     self.bound_history_recheck(&live, agent, initial).is_ok()
@@ -66,6 +73,7 @@ impl MethodHandler {
                             "turns": s.turn_count,
                             "tokens": s.total_tokens,
                             "lineage": s.lineage,
+                            "archived": archived,
                         })
                     })
                     .collect();
@@ -77,6 +85,13 @@ impl MethodHandler {
 
     /// Shared conversation read gate for history JSON and attachment bytes.
     async fn history_session_access(&self, ctx: &UserContext, requested: &str) -> Result<(UserContext, String, String, Mode, Class), String> {
+        self.history_session_access_in(ctx, requested, false).await
+    }
+
+    /// [`Self::history_session_access`] for a live (`archived = false`) or an
+    /// archived (`archived = true`, RM-173) conversation. In Filtered mode the
+    /// other archive state reads as "session not found".
+    async fn history_session_access_in(&self, ctx: &UserContext, requested: &str, archived: bool) -> Result<(UserContext, String, String, Mode, Class), String> {
         let live = self.bound_history_live(ctx)?;
         let id = handles::resolve(&self.home_dir, &live.user_id, requested).await?;
         let rc = self.reply_ctx.read().await.clone().ok_or("session store unavailable")?;
@@ -90,7 +105,7 @@ impl MethodHandler {
             let permit = read::permit()?;
             let metadata = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                read::metadata(&read::open(&home)?, &user, &raw)
+                read::metadata_in(&read::open(&home)?, &user, &raw, archived)
             }).await.map_err(|_| "session not found")??.ok_or("session not found")?;
             if metadata.agent != owner || metadata.class == Class::Hidden { return Err("session not found".into()); }
             metadata.class
@@ -185,6 +200,70 @@ impl MethodHandler {
             Err(e) => WsFrame::error_response("", &format!("session history: {e}")),
         }
     }
+    /// RM-173 `chat.sessions.restore {session_id}` — bring back one of the
+    /// caller's own archived (「已收起」) conversations.
+    ///
+    /// Authority is exactly the read gate used to open a conversation
+    /// ([`Self::history_session_access_in`]: live account, handle resolution,
+    /// agent binding, privacy mode, stored-origin classification), restricted
+    /// further to conversations the caller may write to: in the privacy-
+    /// filtered mode only their own WebChat (`Class::Own`) — a masked,
+    /// read-only external conversation cannot be restored. Audited
+    /// (`chat_session_restored`, fail closed) before the write.
+    pub(crate) async fn handle_chat_sessions_restore(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let requested = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if requested.is_empty() || requested.len() > 1024 {
+            return WsFrame::error_response("", "session_id is required");
+        }
+        let Some(rc) = self.reply_ctx.read().await.clone() else {
+            return WsFrame::error_response("", "session store unavailable");
+        };
+        let (live, id, owner, mode, class) = match self.history_session_access_in(ctx, &requested, true).await {
+            Ok(access) => access,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if class != Class::Own {
+            return WsFrame::error_response("", "permission denied");
+        }
+        let archived_at = match rc.session_manager.archived_at(&id).await {
+            Ok(a) => a,
+            Err(_) => return WsFrame::error_response("", "session not found"),
+        };
+        let Some(archived_at) = archived_at else {
+            // Already live (e.g. a new message restored it): nothing to do.
+            return WsFrame::ok_response("", json!({"session_id": requested, "restored": false}));
+        };
+        if let Err(e) = self.bound_history_recheck(&live, &owner, mode) {
+            return WsFrame::error_response("", &e);
+        }
+        let digest = match crate::team_history::audit::session_digest(&self.home_dir, &id) {
+            Ok(d) => d,
+            Err(_) => return WsFrame::error_response("", "audit unavailable"),
+        };
+        if crate::team_history::audit::write(
+            &self.home_dir,
+            "chat_session_restored",
+            &live.user_id,
+            &owner,
+            json!({"actor_user_id": live.user_id, "agent": owner, "session": digest,
+                   "archived_at": archived_at, "privacy_mode": if mode == Mode::Full { "full" } else { "own" }}),
+            None,
+        )
+        .is_err()
+        {
+            return WsFrame::error_response("", "audit unavailable");
+        }
+        match rc.session_manager.restore_archived(&id).await {
+            Ok(_) => WsFrame::ok_response("", json!({"session_id": requested, "restored": true})),
+            Err(_) => WsFrame::error_response("", "restore failed"),
+        }
+    }
+
     /// Membership is checked independently of cached routing data. No handles
     /// are issued here and no per-reference ledger scans are performed.
     async fn history_contains_attachment(&self, ctx: &UserContext, reference: &crate::chat_attachments::Reference, index: std::sync::Arc<crate::artifacts::HistoryIndex>) -> Result<(), String> {

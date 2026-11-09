@@ -30,6 +30,12 @@ fn enterprise_surfaces_are_listed() {
         "users.my_team",
         "users.my_history_views",
         "users.audit_log",
+        // 主管唯讀團隊對話 + RM-173 還原 / 保存設定
+        "users.team_history.list",
+        "users.team_history.get",
+        "users.team_history.restore",
+        "users.org_settings.get",
+        "users.org_settings.update",
         // 部門
         "departments.list",
         "departments.create",
@@ -141,6 +147,10 @@ fn personal_surfaces_are_untouched() {
         "agents.permission_history",
         "tasks.list",
         "plans.list",
+        // 自己的對話紀錄：列出 / 已收起 / 還原 (RM-173)
+        "chat.sessions.list",
+        "chat.sessions.history",
+        "chat.sessions.restore",
         "evolution.status",
         "autopilot.list",
         "autopilot.breakers",

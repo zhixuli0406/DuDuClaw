@@ -3322,8 +3322,9 @@ async fn append_subagent_reply_to_parent_session_with(
             .map_err(|e| format!("insert session_messages: {e}"))?;
 
             conn.execute(
-                "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2 \
-                 WHERE id = ?3",
+                // RM-173: a new message lifts an archive.
+                "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2, \
+                 archived_at = NULL WHERE id = ?3",
                 rusqlite::params![tokens, now, sid],
             )
             .map_err(|e| format!("update sessions: {e}"))?;

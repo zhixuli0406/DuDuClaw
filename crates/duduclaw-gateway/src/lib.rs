@@ -433,6 +433,7 @@ pub mod installation_identity;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;
+pub mod session_retention;
 pub mod session_summarizer;
 pub mod session_summarizer_task;
 pub mod session_titler_task;

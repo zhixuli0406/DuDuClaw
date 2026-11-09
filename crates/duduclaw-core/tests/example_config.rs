@@ -171,6 +171,8 @@ fn example_config_covers_the_sections_the_audit_named() {
         "causal_extraction",
         "evolution",
         "team",
+        // RM-173: conversation archive / purge settings.
+        "sessions",
     ] {
         assert!(
             seen.iter().any(|s| s == required),

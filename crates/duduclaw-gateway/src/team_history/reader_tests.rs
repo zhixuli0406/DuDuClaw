@@ -74,7 +74,7 @@ async fn query_authorizes_before_paging_and_uses_visible_titles_only() {
 }
 
 #[tokio::test]
-async fn report_filter_is_a_sql_scope_and_archive_hidden_undone_are_excluded() {
+async fn report_filter_is_a_sql_scope_and_hidden_undone_are_excluded() {
     let (_home, sm, scope) = seeded().await;
     sm.acquire()
         .await
@@ -83,7 +83,9 @@ async fn report_filter_is_a_sql_scope_and_archive_hidden_undone_are_excluded() {
             [],
         )
         .unwrap();
-    assert!(get(&sm, &scope, "own").await.unwrap().is_none());
+    // RM-173: an archived conversation stays readable, flagged.
+    assert!(get(&sm, &scope, "own").await.unwrap().unwrap().archived);
+    assert!(!get(&sm, &scope, "report").await.unwrap().unwrap().archived);
     let filtered = list(
         &sm,
         &scope,
@@ -124,6 +126,25 @@ async fn report_filter_is_a_sql_scope_and_archive_hidden_undone_are_excluded() {
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn rm173_list_includes_archived_but_keeps_since_and_scope() {
+    let (_home, sm, scope) = seeded().await;
+    {
+        let conn = sm.acquire().await;
+        conn.execute("UPDATE sessions SET archived_at='1970-01-01T00:03:30Z'", []).unwrap();
+        // An archived conversation whose last activity predates the window stays out.
+        conn.execute("INSERT INTO sessions(id,agent_id,last_active,created_at,origin_kind,owner_user_id) VALUES ('old-report','sales','1970-01-01T00:01:00Z','1970-01-01T00:01:00Z','webchat_user','employee')", []).unwrap();
+        conn.execute("INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('old-report','user','OLD','1970-01-01T00:01:00Z')", []).unwrap();
+        conn.execute("UPDATE sessions SET archived_at='1970-01-01T00:03:30Z' WHERE id='old-report'", []).unwrap();
+    }
+    let page = list(&sm, &scope, &ListFilter::default(), 20, None).await.unwrap();
+    let ids: Vec<_> = page.sessions.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["report", "own", "line:Ccustomer"]);
+    assert!(page.sessions.iter().all(|s| s.archived));
+    assert!(get(&sm, &scope, "hidden").await.unwrap().is_none());
+    assert!(get(&sm, &scope, "old-report").await.unwrap().is_none());
 }
 
 #[tokio::test]

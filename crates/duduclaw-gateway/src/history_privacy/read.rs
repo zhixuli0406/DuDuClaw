@@ -66,7 +66,12 @@ fn meta(row: &rusqlite::Row<'_>, user: &str) -> rusqlite::Result<Metadata> {
     })
 }
 pub fn metadata(c: &Connection, user: &str, id: &str) -> Result<Option<Metadata>, String> {
-    let m=c.query_row("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE id=?1 AND archived_at IS NULL",params![id,user],|r|meta(r,user)).optional().map_err(|_|"history unavailable")?;
+    metadata_in(c, user, id, false)
+}
+/// RM-173: [`metadata`] of a live (`archived = false`) or an archived
+/// (`archived = true`) conversation; the other state reads as missing.
+pub fn metadata_in(c: &Connection, user: &str, id: &str, archived: bool) -> Result<Option<Metadata>, String> {
+    let m=c.query_row("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE id=?1 AND (archived_at IS NOT NULL)=?3",params![id,user,archived],|r|meta(r,user)).optional().map_err(|_|"history unavailable")?;
     m.map(|mut m| {
         if m.class != Class::Hidden {
             m.last_active = time(&m.last_active)?;
@@ -81,12 +86,23 @@ pub fn list(
     agent: &str,
     limit: usize,
 ) -> Result<Vec<Metadata>, String> {
+    list_in(c, user, agent, limit, false)
+}
+/// RM-173: [`list`] over live (`archived = false`) or only archived
+/// (`archived = true`) conversations, with the same origin scope.
+pub fn list_in(
+    c: &Connection,
+    user: &str,
+    agent: &str,
+    limit: usize,
+    archived: bool,
+) -> Result<Vec<Metadata>, String> {
     if !(1..=MAX_SESSIONS).contains(&limit) {
         return Err("invalid limit".into());
     }
-    let mut s=c.prepare("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE agent_id=?1 AND archived_at IS NULL AND ((origin_kind='webchat_user' AND owner_user_id=?2) OR origin_kind IN ('channel','webchat_visitor','public_visitor')) ORDER BY last_active DESC,id DESC LIMIT ?3").map_err(|_|"history unavailable")?;
+    let mut s=c.prepare("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE agent_id=?1 AND (archived_at IS NOT NULL)=?4 AND ((origin_kind='webchat_user' AND owner_user_id=?2) OR origin_kind IN ('channel','webchat_visitor','public_visitor')) ORDER BY last_active DESC,id DESC LIMIT ?3").map_err(|_|"history unavailable")?;
     let entries = s
-        .query_map(params![agent, user, (MAX_SESSIONS + 1) as i64], |r| {
+        .query_map(params![agent, user, (MAX_SESSIONS + 1) as i64, archived], |r| {
             meta(r, user)
         })
         .map_err(|_| "history unavailable")?;

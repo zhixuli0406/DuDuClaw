@@ -206,7 +206,10 @@ async fn resolve_kind(home: &Path, user: &str, value: &str, kind: Kind) -> Resul
         .map_err(|_| "session not found")?;
         let sql=match kind {
             Kind::Cursor | Kind::Attachment=>return Err("cursor expired".into()),
-            Kind::Session=>"SELECT id FROM sessions WHERE archived_at IS NULL ORDER BY rowid DESC LIMIT ?1",
+            // RM-173: archived conversations are listed (team history, 「已收起的對話」)
+            // and restorable, so their handles must keep resolving after the
+            // cache expires. Resolution is routing only; callers still authorize.
+            Kind::Session=>"SELECT id FROM sessions ORDER BY rowid DESC LIMIT ?1",
             Kind::Run=>"SELECT s.id || '#' || CAST(m.id AS TEXT) FROM session_messages m JOIN sessions s ON s.id=m.session_id WHERE s.archived_at IS NULL AND m.hidden=0 AND m.undone_at IS NULL AND m.role='user' ORDER BY m.id DESC LIMIT ?1",
         };
         let mut stmt = conn.prepare(sql).map_err(|_| "history unavailable")?;

@@ -2,7 +2,7 @@ import { useSelectableAgents, useVisibleAgents, useAgentVisibilityUnrestricted }
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
 import { useSearchParams } from 'react-router';
-import { Eye, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
+import { ArchiveRestore, Eye, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
 import { api, type MyTeam, type TeamHistoryClass, type TeamHistoryList, type TeamHistoryTranscript } from '@/lib/api';
 import { Button } from '@/components/mds';
 import { HistoryPart, historyCategoryLabel as categoryLabel } from '@/components/chat/HistoryPart';
@@ -27,6 +27,7 @@ export function TeamHistoryPage() {
   const [listLoading, setListLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [moreLoading, setMoreLoading] = useState(false);
+  const [restoring, setRestoring] = useState<string | null>(null);
   const epoch = useRef(0);
   const msg = (id: string) => intl.formatMessage({ id: `teamHistory.${id}` });
   const classifyError = (e: unknown) => {
@@ -116,6 +117,21 @@ export function TeamHistoryPage() {
       if (ticket === epoch.current) { setPage(null); setDetail(null); setSelected(''); setError(classifyError(e)); }
     } finally { if (ticket === epoch.current) setMoreLoading(false); }
   }
+  /** RM-173: un-archive; the server re-checks the same authority as reading. */
+  async function restore(sessionId: string) {
+    if (restoring) return;
+    const ticket = epoch.current;
+    setRestoring(sessionId);
+    try {
+      await api.users.teamHistory.restore(sessionId);
+      if (ticket !== epoch.current) return;
+      setPage(current => current && current.key === scope
+        ? { ...current, data: { ...current.data, sessions: current.data.sessions.map(s => s.session_id === sessionId ? { ...s, archived: false } : s) } }
+        : current);
+    } catch {
+      if (ticket === epoch.current) setError(msg('restoreFailed'));
+    } finally { setRestoring(null); }
+  }
   const selectClass = 'w-full rounded-lg border border-input bg-background px-3 py-2 text-sm';
 
   return <div className="mx-auto w-full max-w-7xl space-y-4">
@@ -145,13 +161,19 @@ export function TeamHistoryPage() {
           <section aria-label={msg('list')} className="min-w-0 space-y-2">
             {listLoading && <Loader2 aria-label={msg('loading')} className="mx-auto my-6 size-5 animate-spin" />}
             {currentPage?.sessions.length === 0 && <p className="py-8 text-sm text-muted-foreground">{msg('empty')}</p>}
-            {currentPage?.sessions.map(s => <button type="button" key={s.session_id} onClick={() => { setError(null); setSelected(s.session_id); }} aria-pressed={selected === s.session_id}
-              className={cn('w-full min-w-0 rounded-xl border border-surface-border p-3 text-left hover:bg-muted', selected === s.session_id && 'bg-surface-selected ring-1 ring-brand/40')}>
-              <span className="block break-words text-sm font-medium">{localizedTitle(s.title, s.title_masked, intl) || msg('untitled')}</span>
-              <span className="mt-1 block text-xs text-muted-foreground">{s.report?.display_name ?? (s.class === 'own' ? msg('you') : msg('external'))} · {s.channel ?? 'WebChat'} · {s.turns}</span>
-              <time className="text-xs text-muted-foreground" dateTime={s.last_active}>{formatDate(s.last_active, intl.locale)}</time>
-              {s.title_masked && <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-xs">{msg('masked')}</span>}
-            </button>)}
+            {currentPage?.sessions.map(s => <div key={s.session_id} className="flex min-w-0 items-stretch gap-2">
+              <button type="button" onClick={() => { setError(null); setSelected(s.session_id); }} aria-pressed={selected === s.session_id}
+                className={cn('w-full min-w-0 rounded-xl border border-surface-border p-3 text-left hover:bg-muted', selected === s.session_id && 'bg-surface-selected ring-1 ring-brand/40')}>
+                <span className="block break-words text-sm font-medium">{localizedTitle(s.title, s.title_masked, intl) || msg('untitled')}</span>
+                <span className="mt-1 block text-xs text-muted-foreground">{s.report?.display_name ?? (s.class === 'own' ? msg('you') : msg('external'))} · {s.channel ?? 'WebChat'} · {s.turns}</span>
+                <time className="text-xs text-muted-foreground" dateTime={s.last_active}>{formatDate(s.last_active, intl.locale)}</time>
+                {s.title_masked && <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-xs">{msg('masked')}</span>}
+                {s.archived === true && <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-xs">{msg('archived')}</span>}
+              </button>
+              {s.archived === true && <Button variant="outline" size="sm" className="self-center" disabled={restoring === s.session_id}
+                aria-label={`${msg('restore')} ${localizedTitle(s.title, s.title_masked, intl) || msg('untitled')}`}
+                onClick={() => void restore(s.session_id)}><ArchiveRestore />{msg('restore')}</Button>}
+            </div>)}
             {currentPage?.next_before && <Button variant="outline" disabled={moreLoading} onClick={() => void more()}>{msg('more')}</Button>}
           </section>
           <section aria-label={msg('conversation')} className="min-w-0 space-y-3 rounded-xl border border-surface-border bg-card p-4">

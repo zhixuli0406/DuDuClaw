@@ -81,6 +81,13 @@ pub struct SessionSummary {
     pub lineage: u32,
 }
 
+/// RM-173: what one retention run did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionOutcome {
+    pub archived: u64,
+    pub purged: u64,
+}
+
 /// Max characters kept for a session title (first user message). CJK-safe.
 const SESSION_TITLE_MAX_CHARS: usize = 80;
 
@@ -396,8 +403,14 @@ impl SessionManager {
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         let message_id = conn.last_insert_rowid();
 
+        // RM-173: a new message is new activity, so an archived (收起)
+        // conversation comes back in the same statement that bumps
+        // `last_active` — otherwise it stays hidden from every listing while
+        // it is in use, and a purge setting could delete a live conversation.
         conn.execute(
-            "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2 WHERE id = ?3",
+            "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2,
+                                 archived_at = NULL
+             WHERE id = ?3",
             params![tokens, now, session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -817,13 +830,49 @@ impl SessionManager {
 
     /// Un-archive a session so it reappears in normal listings.
     pub async fn unarchive_session(&self, session_id: &str) -> Result<()> {
+        self.restore_archived(session_id).await.map(|_| ())
+    }
+
+    /// RM-173: restore an archived (收起) conversation. Returns the
+    /// `archived_at` it had, or `None` when the row does not exist or was not
+    /// archived (idempotent; nothing is written then). Authorization is the
+    /// caller's job — this never decides who may restore.
+    pub async fn restore_archived(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.acquire().await;
-        conn.execute(
-            "UPDATE sessions SET archived_at = NULL WHERE id = ?1",
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        let archived: Option<String> = tx
+            .query_row(
+                "SELECT archived_at FROM sessions WHERE id = ?1 AND archived_at IS NOT NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if archived.is_some() {
+            tx.execute(
+                "UPDATE sessions SET archived_at = NULL WHERE id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+        Ok(archived)
+    }
+
+    /// RM-173: `archived_at` of an existing session (`Ok(None)`: live or no row).
+    pub async fn archived_at(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire().await;
+        conn.query_row(
+            "SELECT archived_at FROM sessions WHERE id = ?1",
             params![session_id],
+            |row| row.get::<_, Option<String>>(0),
         )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        Ok(())
+        .optional()
+        .map(Option::flatten)
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))
     }
 
     /// Hard delete — irreversibly removes the session and its messages. This is
@@ -992,26 +1041,55 @@ impl SessionManager {
         Ok((sessions as u64, messages as u64))
     }
 
-    /// WP5 T5.3: inactive sessions are now ARCHIVED (not hard-deleted), and only
-    /// purged after a retention period. Archives sessions whose `last_active` is
-    /// older than `max_age_hours`; then hard-purges sessions that have been
-    /// archived longer than `purge_after_days` (default 90). Returns the number
-    /// newly archived (messages are preserved until purge).
+    /// WP5 T5.3: inactive sessions are ARCHIVED (not hard-deleted). Archives
+    /// sessions whose `last_active` is older than `max_age_hours` and NEVER
+    /// purges (RM-173: purging is an explicit admin setting, see
+    /// [`Self::apply_retention`]). Returns the number newly archived.
     pub async fn cleanup_inactive(&self, max_age_hours: u64) -> Result<u64> {
-        self.cleanup_inactive_with_retention(max_age_hours, 90)
+        self.cleanup_with_policy(Some(chrono::Duration::hours(max_age_hours as i64)), None)
             .await
+            .map(|o| o.archived)
     }
 
-    /// Retention-aware variant of [`Self::cleanup_inactive`].
+    /// Archive after `max_age_hours`, then purge sessions archived longer than
+    /// `purge_after_days` (an explicit purge; tests and tools only — the
+    /// gateway maintenance task uses [`Self::apply_retention`]).
     pub async fn cleanup_inactive_with_retention(
         &self,
         max_age_hours: u64,
         purge_after_days: u64,
     ) -> Result<u64> {
+        self.cleanup_with_policy(
+            Some(chrono::Duration::hours(max_age_hours as i64)),
+            Some(purge_after_days),
+        )
+        .await
+        .map(|o| o.archived)
+    }
+
+    /// RM-173: the admin `[sessions]` settings. `0` disables a step:
+    /// `archive_after_days = 0` never archives, `purge_after_days = 0` (the
+    /// default) never deletes anything.
+    pub async fn apply_retention(
+        &self,
+        settings: crate::session_retention::Retention,
+    ) -> Result<RetentionOutcome> {
+        self.cleanup_with_policy(
+            settings
+                .archive_after()
+                .map(|days| chrono::Duration::days(days as i64)),
+            settings.purge_after(),
+        )
+        .await
+    }
+
+    async fn cleanup_with_policy(
+        &self,
+        archive_after: Option<chrono::Duration>,
+        purge_after_days: Option<u64>,
+    ) -> Result<RetentionOutcome> {
         let conn = self.acquire().await;
         let now = chrono::Utc::now();
-        let archive_cutoff = (now - chrono::Duration::hours(max_age_hours as i64)).to_rfc3339();
-        let purge_cutoff = (now - chrono::Duration::days(purge_after_days as i64)).to_rfc3339();
         let now_str = now.to_rfc3339();
 
         conn.execute(
@@ -1020,18 +1098,33 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
-        Self::sweep_webchat_cancellations(&conn, purge_after_days)?;
+        Self::sweep_webchat_cancellations(
+            &conn,
+            purge_after_days.unwrap_or(WEBCHAT_CANCEL_RETENTION_DAYS),
+        )?;
 
         // Step 1: archive inactive live sessions (soft).
-        let archived = conn
-            .execute(
-                "UPDATE sessions SET archived_at = ?2
-                 WHERE last_active < ?1 AND archived_at IS NULL",
-                params![archive_cutoff, now_str],
-            )
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let archived = match archive_after {
+            Some(age) => conn
+                .execute(
+                    "UPDATE sessions SET archived_at = ?2
+                     WHERE last_active < ?1 AND archived_at IS NULL",
+                    params![(now - age).to_rfc3339(), now_str],
+                )
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?,
+            None => 0,
+        };
 
-        // Step 2: purge sessions archived beyond the retention window.
+        // Step 2: purge sessions archived beyond the retention window — only
+        // when a purge period is explicitly configured.
+        let Some(purge_after_days) = purge_after_days else {
+            if archived > 0 {
+                info!(archived, "Session cleanup: archived (purge disabled)");
+            }
+            return Ok(RetentionOutcome { archived: archived as u64, purged: 0 });
+        };
+        let purge_cutoff = (now - chrono::Duration::days(purge_after_days as i64)).to_rfc3339();
+        let max_age_hours = archive_after.map(|a| a.num_hours());
         // RM-124: remember the exact WebChat ids before they disappear.
         let purge_webchat_ids = Self::webchat_ids(
             &conn,
@@ -1069,12 +1162,12 @@ impl SessionManager {
         if archived > 0 || purged > 0 {
             info!(
                 archived,
-                purged, max_age_hours, purge_after_days, "Session cleanup: archived + purged"
+                purged, ?max_age_hours, purge_after_days, "Session cleanup: archived + purged"
             );
         }
         drop(conn);
         self.cancel_webchat_schedules(&purge_webchat_ids).await;
-        Ok(archived as u64)
+        Ok(RetentionOutcome { archived: archived as u64, purged: purged as u64 })
     }
 
     /// Ids (only `webchat:` ones) returned by `sql`, captured before a hard delete.
@@ -1528,6 +1621,22 @@ impl SessionManager {
         agent_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionSummary>> {
+        self.list_sessions_in(agent_id, limit, false).await
+    }
+
+    /// [`Self::list_sessions`] over either live (`archived = false`) or only
+    /// archived (`archived = true`, RM-173 「已收起的對話」) sessions.
+    pub async fn list_sessions_in(
+        &self,
+        agent_id: Option<&str>,
+        limit: usize,
+        archived: bool,
+    ) -> Result<Vec<SessionSummary>> {
+        let archive_filter = if archived {
+            "archived_at IS NOT NULL"
+        } else {
+            "archived_at IS NULL"
+        };
         let conn = self.acquire().await;
         let capped = limit.min(SESSION_LIST_MAX_LIMIT) as i64;
 
@@ -1588,7 +1697,7 @@ impl SessionManager {
                 let sql = format!(
                     "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage, title \
                      FROM sessions \
-                     WHERE archived_at IS NULL AND agent_id = ?1 \
+                     WHERE {archive_filter} AND agent_id = ?1 \
                      ORDER BY last_active DESC LIMIT ?2{outer_tail}"
                 );
                 let mut stmt = conn
@@ -1605,7 +1714,7 @@ impl SessionManager {
                 let sql = format!(
                     "{outer_head}SELECT id, agent_id, last_active, total_tokens, lineage, title \
                      FROM sessions \
-                     WHERE archived_at IS NULL \
+                     WHERE {archive_filter} \
                      ORDER BY last_active DESC LIMIT ?1{outer_tail}"
                 );
                 let mut stmt = conn
@@ -2393,6 +2502,123 @@ mod tests {
         assert_eq!(old_msgs.len(), 2);
         assert_eq!(old_msgs[1].content, "resumed turn");
         assert_eq!(mgr.get_messages("webchat:new").await.unwrap().len(), 0);
+    }
+}
+
+/// RM-173: retention settings, purge-off default and un-archive on activity.
+#[cfg(test)]
+mod rm173_retention_tests {
+    use super::*;
+    use crate::session_retention::Retention;
+    use tempfile::NamedTempFile;
+
+    async fn aged(mgr: &SessionManager, id: &str, active_days_ago: i64) {
+        mgr.get_or_create(id, "agent").await.unwrap();
+        mgr.append_message(id, "user", "hello", 1).await.unwrap();
+        let at = (chrono::Utc::now() - chrono::Duration::days(active_days_ago)).to_rfc3339();
+        mgr.acquire()
+            .await
+            .execute("UPDATE sessions SET last_active=?2 WHERE id=?1", params![id, at])
+            .unwrap();
+    }
+
+    async fn archived_days_ago(mgr: &SessionManager, id: &str, days: i64) {
+        let at = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        mgr.acquire()
+            .await
+            .execute("UPDATE sessions SET archived_at=?2 WHERE id=?1", params![id, at])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rm173_archive_uses_the_configured_days() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        aged(&mgr, "four-days", 4).await;
+        aged(&mgr, "forty-days", 40).await;
+        // Default 30 days: the old 72-hour rule no longer archives a 4-day lull.
+        let out = mgr.apply_retention(Retention::default()).await.unwrap();
+        assert_eq!(out, RetentionOutcome { archived: 1, purged: 0 });
+        assert!(mgr.archived_at("forty-days").await.unwrap().is_some());
+        assert!(mgr.archived_at("four-days").await.unwrap().is_none());
+        // A shorter setting archives the other one too.
+        let three = Retention { archive_after_days: 3, purge_after_days: 0 };
+        assert_eq!(mgr.apply_retention(three).await.unwrap().archived, 1);
+        assert!(mgr.archived_at("four-days").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn rm173_archive_zero_never_archives() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        aged(&mgr, "ancient", 3000).await;
+        let never = Retention { archive_after_days: 0, purge_after_days: 0 };
+        assert_eq!(mgr.apply_retention(never).await.unwrap(), RetentionOutcome::default());
+        assert!(mgr.archived_at("ancient").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rm173_purge_is_disabled_by_default_and_enabled_by_setting() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        aged(&mgr, "long-archived", 900).await;
+        aged(&mgr, "recently-archived", 900).await;
+        mgr.apply_retention(Retention::default()).await.unwrap();
+        archived_days_ago(&mgr, "long-archived", 800).await;
+        archived_days_ago(&mgr, "recently-archived", 5).await;
+
+        // Default: nothing is ever deleted, however old the archive.
+        let out = mgr.apply_retention(Retention::default()).await.unwrap();
+        assert_eq!(out.purged, 0);
+        assert_eq!(mgr.get_messages("long-archived").await.unwrap().len(), 1);
+        // archive-only helper never purges either.
+        mgr.cleanup_inactive(24).await.unwrap();
+        assert_eq!(mgr.get_messages("long-archived").await.unwrap().len(), 1);
+
+        // Explicit purge setting: counted from archived_at.
+        let purge = Retention { archive_after_days: 30, purge_after_days: 365 };
+        assert_eq!(mgr.apply_retention(purge).await.unwrap().purged, 1);
+        assert!(mgr.session_agent("long-archived").await.unwrap().is_none());
+        assert!(mgr.get_messages("long-archived").await.unwrap().is_empty());
+        assert_eq!(mgr.get_messages("recently-archived").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rm173_new_message_unarchives_in_the_same_statement() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        for (id, role) in [("webchat:u", "user"), ("line:c", "assistant")] {
+            mgr.get_or_create(id, "agent").await.unwrap();
+            mgr.append_message(id, "user", "first", 1).await.unwrap();
+            mgr.delete_session(id).await.unwrap();
+            assert!(mgr.archived_at(id).await.unwrap().is_some());
+            assert!(mgr.list_sessions(Some("agent"), 10).await.unwrap().iter().all(|s| s.id != id));
+            mgr.append_message(id, role, "back again", 1).await.unwrap();
+            assert!(mgr.archived_at(id).await.unwrap().is_none(), "{id}");
+            assert!(mgr.list_sessions(Some("agent"), 10).await.unwrap().iter().any(|s| s.id == id));
+        }
+        // The WebChat delivery path (client message id / pending reply) too.
+        mgr.delete_session("webchat:u").await.unwrap();
+        mgr.append_delivery_message("webchat:u", "user", "again", 1, Some("c-1"), false)
+            .await
+            .unwrap();
+        assert!(mgr.archived_at("webchat:u").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rm173_archived_listing_and_restore_are_exact() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        aged(&mgr, "live", 1).await;
+        aged(&mgr, "gone", 1).await;
+        mgr.delete_session("gone").await.unwrap();
+        let archived = mgr.list_sessions_in(Some("agent"), 10, true).await.unwrap();
+        assert_eq!(archived.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["gone"]);
+        assert!(mgr.restore_archived("gone").await.unwrap().is_some());
+        assert!(mgr.restore_archived("gone").await.unwrap().is_none(), "idempotent");
+        assert!(mgr.restore_archived("missing").await.unwrap().is_none());
+        assert!(mgr.list_sessions_in(Some("agent"), 10, true).await.unwrap().is_empty());
+        assert_eq!(mgr.list_sessions(Some("agent"), 10).await.unwrap().len(), 2);
     }
 }
 

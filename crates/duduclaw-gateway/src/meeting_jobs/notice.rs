@@ -73,7 +73,8 @@ async fn persist_webchat(home: &Path, job: &Job, text: &str) -> Result<(), Strin
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute("INSERT INTO session_messages(session_id,role,content,tokens,timestamp) VALUES (?1,'assistant',?2,0,?3)",
             rusqlite::params![session, text, now]).map_err(|_| "無法儲存完成通知。")?;
-        tx.execute("UPDATE sessions SET last_active=?2 WHERE id=?1", rusqlite::params![session, now])
+        // RM-173: a new message lifts an archive in the same transaction.
+        tx.execute("UPDATE sessions SET last_active=?2, archived_at=NULL WHERE id=?1", rusqlite::params![session, now])
             .map_err(|_| "無法儲存完成通知。")?;
     }
     tx.commit().map_err(|_| "無法儲存完成通知。".into())

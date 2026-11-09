@@ -1215,3 +1215,171 @@ async fn chat_attachment_unattributed_legacy_file_is_admin_only_not_a_typed_path
     assert!(!row.to_string().contains(f.home.path().to_str().unwrap()));
     assert!(f.handler.open_history_attachment(&employee, &id).await.is_err());
 }
+
+// ── RM-173: retention settings, archived history and restore ──────────────
+
+async fn rm173_archive(f: &Fx, id: &str) {
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    rc.session_manager
+        .acquire()
+        .await
+        .execute(
+            "UPDATE sessions SET archived_at=?2 WHERE id=?1",
+            params![id, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+}
+
+async fn rm173_is_archived(f: &Fx, id: &str) -> bool {
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    rc.session_manager.archived_at(id).await.unwrap().is_some()
+}
+
+fn rm173_audit(f: &Fx) -> String {
+    std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn rm173_team_history_includes_archived_sessions_flagged() {
+    let f = fixture().await;
+    rm173_archive(&f, "report").await;
+    let list = payload(f.handler.handle("users.team_history.list", json!({"agent_id":"sales"}), &f.manager).await);
+    let sessions = list["sessions"].as_array().unwrap();
+    let report = sessions.iter().find(|s| s["class"] == "report_webchat").unwrap();
+    assert_eq!(report["archived"], true);
+    let external = sessions.iter().find(|s| s["class"] == "external").unwrap();
+    assert_eq!(external["archived"], false);
+    let get = payload(f.handler.handle("users.team_history.get", json!({"session_id":report["session_id"]}), &f.manager).await);
+    assert_eq!(get["archived"], true);
+    assert!(get.to_string().contains("0912-345-678"));
+    // The activation window and origin scope still apply to archived rows.
+    assert!(!get.to_string().contains("OLD-CONTENT"));
+    rm173_archive(&f, "hidden").await;
+    denied(f.handler.handle("users.team_history.get", json!({"session_id":"hidden"}), &f.manager).await);
+}
+
+#[tokio::test]
+async fn rm173_team_history_restore_authorization() {
+    let f = fixture().await;
+    for id in ["report", "hidden", f.external.as_str()] {
+        rm173_archive(&f, id).await;
+    }
+    // Staff (not a manager) is refused like an unreadable session.
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    denied(f.handler.handle("users.team_history.restore", json!({"session_id":"report"}), &employee).await);
+    assert!(rm173_is_archived(&f, "report").await);
+    // A manager without team-history access to the session is refused.
+    assert_eq!(denied(f.handler.handle("users.team_history.restore", json!({"session_id":"hidden"}), &f.manager).await)["code"], "not_found");
+    assert!(rm173_is_archived(&f, "hidden").await);
+    // A manager who can read it through team history may restore it.
+    let handle = payload(f.handler.handle("users.team_history.list", json!({"agent_id":"sales","class":"report_webchat"}), &f.manager).await)["sessions"][0]["session_id"].clone();
+    let restored = payload(f.handler.handle("users.team_history.restore", json!({"session_id":handle}), &f.manager).await);
+    assert_eq!(restored["restored"], true);
+    assert!(!rm173_is_archived(&f, "report").await);
+    let again = payload(f.handler.handle("users.team_history.restore", json!({"session_id":handle}), &f.manager).await);
+    assert_eq!(again["restored"], false, "idempotent");
+    // Admin may restore any existing session.
+    assert_eq!(payload(f.handler.handle("users.team_history.restore", json!({"session_id":f.external}), &f.admin).await)["restored"], true);
+    assert!(!rm173_is_archived(&f, &f.external).await);
+    assert_eq!(denied(f.handler.handle("users.team_history.restore", json!({"session_id":"missing"}), &f.admin).await)["code"], "not_found");
+    let audit = rm173_audit(&f);
+    assert_eq!(audit.matches("team_history_session_restored").count(), 2);
+    assert!(!audit.contains(&f.external), "audit carries a digest, not the raw id");
+}
+
+#[tokio::test]
+async fn rm173_org_settings_read_and_write_retention() {
+    let f = fixture().await;
+    let initial = payload(f.handler.handle("users.org_settings.get", json!({}), &f.admin).await);
+    assert_eq!(initial["archive_after_days"], 30);
+    assert_eq!(initial["purge_after_days"], 0);
+    denied(f.handler.handle("users.org_settings.update", json!({"purge_after_days":30}), &f.manager).await);
+    for bad in [json!({"purge_after_days":3651}), json!({"archive_after_days":-1}), json!({"archive_after_days":"7"}), json!({})] {
+        assert_eq!(denied(f.handler.handle("users.org_settings.update", bad.clone(), &f.admin).await)["code"], "invalid_params", "{bad}");
+    }
+    let updated = payload(f.handler.handle("users.org_settings.update", json!({"archive_after_days":7,"purge_after_days":90}), &f.admin).await);
+    assert_eq!((updated["archive_after_days"].clone(), updated["purge_after_days"].clone()), (json!(7), json!(90)));
+    assert_eq!(updated["manager_team_history"], true, "other settings untouched");
+    let retention = crate::session_retention::load(f.home.path());
+    assert_eq!((retention.archive_after_days, retention.purge_after_days), (7, 90));
+    let audit = rm173_audit(&f);
+    assert!(audit.contains("sessions.purge_after_days") && audit.contains("config_protected_key_changed"));
+}
+
+#[tokio::test]
+async fn rm173_backdating_team_history_since_requires_step_up_and_is_audited() {
+    let f = fixture().await;
+    let since = DateTime::from_timestamp_micros(f.since_micros).unwrap();
+    let earlier = (since - chrono::Duration::days(3)).to_rfc3339();
+    async fn current(f: &Fx) -> Value {
+        payload(f.handler.handle("users.org_settings.get", json!({}), &f.admin).await)["team_history_since"].clone()
+    }
+    let before = current(&f).await;
+    // Earlier without / with a wrong password: refused, nothing changes.
+    assert_eq!(denied(f.handler.handle("users.org_settings.update", json!({"team_history_since":earlier}), &f.admin).await)["code"], "step_up_required");
+    assert_eq!(denied(f.handler.handle("users.org_settings.update", json!({"team_history_since":earlier,"password":"wrong-password"}), &f.admin).await)["code"], "step_up_failed");
+    assert_eq!(current(&f).await, before);
+    assert!(rm173_audit(&f).contains("team_history_since_step_up_failed"));
+    assert!(!rm173_audit(&f).contains("team_history_since_changed"));
+    // Not with a manager, never in the future or before the floor.
+    denied(f.handler.handle("users.org_settings.update", json!({"team_history_since":earlier,"password":"isolated-password"}), &f.manager).await);
+    for bad in ["2019-12-31", "2999-01-01T00:00:00Z", "yesterday"] {
+        assert_eq!(denied(f.handler.handle("users.org_settings.update", json!({"team_history_since":bad}), &f.admin).await)["code"], "invalid_params", "{bad}");
+    }
+    // With the admin's own current password: moved earlier, audited old/new.
+    let moved = payload(f.handler.handle("users.org_settings.update", json!({"team_history_since":earlier,"password":"isolated-password"}), &f.admin).await);
+    let moved_since = DateTime::parse_from_rfc3339(moved["team_history_since"].as_str().unwrap()).unwrap();
+    assert_eq!(moved_since, DateTime::parse_from_rfc3339(&earlier).unwrap());
+    let audit = rm173_audit(&f);
+    let line = audit.lines().find(|l| l.contains("team_history_since_changed")).unwrap();
+    assert!(line.contains("\"direction\":\"earlier\"") && line.contains(&f.since_micros.to_string()), "{line}");
+    assert!(!audit.contains("isolated-password"), "the password is never audited");
+    // Managers now see messages from the new, earlier window.
+    let report = payload(f.handler.handle("users.team_history.get", json!({"session_id":"report"}), &f.manager).await);
+    assert!(report.to_string().contains("OLD-CONTENT-SECRET"));
+    // Moving it later again needs no step-up.
+    let later = since.to_rfc3339();
+    payload(f.handler.handle("users.org_settings.update", json!({"team_history_since":later}), &f.admin).await);
+    assert_eq!(rm173_audit(&f).matches("team_history_since_changed").count(), 2);
+    // Cannot be combined with the on/off switch.
+    assert_eq!(denied(f.handler.handle("users.org_settings.update", json!({"team_history_since":later,"manager_team_history":true}), &f.admin).await)["code"], "invalid_params");
+}
+
+#[tokio::test]
+async fn rm173_sidebar_lists_own_archived_and_restores_only_own() {
+    let f = fixture().await;
+    for id in ["report", "hidden", f.external.as_str()] {
+        rm173_archive(&f, id).await;
+    }
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    // Default listing is unchanged: archived conversations are not in it.
+    let live = payload(f.handler.handle("chat.sessions.list", json!({"agent_id":"sales"}), &employee).await);
+    assert!(live["sessions"].as_array().unwrap().is_empty());
+    // `archived: true`: same privacy filter (own WebChat + masked external), never others'.
+    let archived = payload(f.handler.handle("chat.sessions.list", json!({"agent_id":"sales","archived":true}), &employee).await);
+    let rows = archived["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r["archived"] == true));
+    assert!(!archived.to_string().contains("hidden") && !archived.to_string().contains(&f.external));
+    let external = rows.iter().find(|r| r["read_only"] == true).unwrap()["session_id"].clone();
+    denied(f.handler.handle("chat.sessions.list", json!({"agent_id":"sales","archived":"yes"}), &employee).await);
+    // A masked read-only conversation and someone else's conversation cannot be restored.
+    denied(f.handler.handle("chat.sessions.restore", json!({"session_id":external}), &employee).await);
+    denied(f.handler.handle("chat.sessions.restore", json!({"session_id":"hidden"}), &employee).await);
+    assert!(rm173_is_archived(&f, &f.external).await && rm173_is_archived(&f, "hidden").await);
+    // Their own conversation can.
+    let restored = payload(f.handler.handle("chat.sessions.restore", json!({"session_id":"report"}), &employee).await);
+    assert_eq!(restored["restored"], true);
+    assert!(!rm173_is_archived(&f, "report").await);
+    let live = payload(f.handler.handle("chat.sessions.list", json!({"agent_id":"sales"}), &employee).await);
+    assert_eq!(live["sessions"][0]["session_id"], "report");
+    assert!(rm173_audit(&f).contains("chat_session_restored"));
+    // A manager with no binding to the agent cannot restore through the sidebar.
+    rm173_archive(&f, "report").await;
+    denied(f.handler.handle("chat.sessions.restore", json!({"session_id":"report"}), &f.manager).await);
+    assert!(rm173_is_archived(&f, "report").await);
+    // Full-history readers (Admin) list and restore with the same gate.
+    let admin = payload(f.handler.handle("chat.sessions.list", json!({"agent_id":"sales","archived":true}), &f.admin).await);
+    assert_eq!(admin["sessions"].as_array().unwrap().len(), 3);
+    assert_eq!(payload(f.handler.handle("chat.sessions.restore", json!({"session_id":"hidden"}), &f.admin).await)["restored"], true);
+}
