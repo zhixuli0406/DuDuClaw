@@ -63,7 +63,7 @@ export interface Gated {
    * reachable by URL — this is presentation, not access control (the real
    * gate is the gateway's own `require_appliance!()`, fail-closed).
    */
-  readonly requiresData?: 'forks' | 'org' | 'appliance';
+  readonly requiresData?: 'forks' | 'org' | 'appliance' | 'protected';
   /**
    * Hidden while the operator has switched the named feature OFF in
    * `config.toml`. `'decision'` = `[decision] enabled = false`, which already
@@ -105,6 +105,9 @@ export interface VisibilityContext {
    *  gateway, or status not loaded yet) keeps it visible — see
    *  `Gated.requiresFeature`, the one deliberately fail-open gate here. */
   readonly decisionEnabled?: boolean;
+  /** v1.81 F5: `system.status` reports protected-mode readiness evidence
+   *  (`isolation_readiness.required`). Fail-closed: absent counts as false. */
+  readonly protectedMode?: boolean;
 }
 
 export function isVisible(
@@ -125,6 +128,7 @@ export function isVisible(
   if (item.requiresData === 'forks' && !ctx?.forksExist) return false;
   if (item.requiresData === 'org' && (ctx?.agentCount ?? 0) < ORG_CHART_MIN_AGENTS) return false;
   if (item.requiresData === 'appliance' && !ctx?.isAppliance) return false;
+  if (item.requiresData === 'protected' && !ctx?.protectedMode) return false;
   // Operator kill switch — fail OPEN: only an explicit `false` hides the row.
   if (item.requiresFeature === 'decision' && ctx?.decisionEnabled === false) return false;
   return true;

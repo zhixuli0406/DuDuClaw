@@ -117,6 +117,8 @@ const DevicePage = lazyPage(() => import('./pages/DevicePage'), 'DevicePage');
 // surfaces lifted out of billing / settings + the 進階設定 index.
 const ConversationsPage = lazyPage(() => import('./pages/ConversationsPage'), 'ConversationsPage');
 const MigrationConfirmationsPage = lazyPage(() => import('./pages/MigrationConfirmationsPage'), 'MigrationConfirmationsPage');
+// v1.81 F5 part A: 設定 › 受保護模式 (admin page; part B adds the 我的帳號 tab).
+const ProtectedModePage = lazyPage(() => import('./pages/protected/ProtectedModePage'), 'ProtectedModePage');
 const SystemUpdatePage = lazyPage(() => import('./pages/SystemUpdatePage'), 'SystemUpdatePage');
 const ManageAdvancedPage = lazyPage(() => import('./pages/ManageAdvancedPage'), 'ManageAdvancedPage');
 
@@ -336,6 +338,7 @@ export function App() {
                   <Route path="device" element={<DevicePage />} />
                   <Route path="updates" element={<SystemUpdatePage />} />
                   <Route path="migration" element={<MigrationConfirmationsPage />} />
+                  <Route path="protected" element={<ProtectedModePage />} />
                   <Route path="accounts" element={<AccountsPage />} />
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="causal" element={<CausalCurationPage />} />
