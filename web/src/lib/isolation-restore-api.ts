@@ -19,8 +19,8 @@
  * The runtime state comes from `root_flag` (`rootStateOf`), never from
  * invented `root_state` strings. Every field the reports do not name is
  * marked `NOT IN CONTRACT` below: it is read only when present and the
- * screens work without it. `RestoreChallenge` is the one shape the reports
- * describe only in prose — keep it here (one file) when the handler lands.
+ * screens work without it. `RestoreChallenge` follows the handler
+ * (`handlers/isolation_employee_restore.rs`).
  */
 import { client } from './ws-client';
 import type { StepUpToken } from './step-up';
@@ -128,20 +128,24 @@ export interface RestoreFiled {
 }
 
 /**
- * ASSUMED SHAPE (handler not in this tree): the challenge for the owner's
- * strongest factor at tombstone time — passkey WebAuthn options, an email
- * code sent, or the authenticator app.
+ * `me.isolation.restore_challenge` reply (`handlers/isolation_employee_restore.rs`):
+ * the challenge for the owner's strongest factor at tombstone time.
+ *   - `totp`: `{ factor, challenge_id: null }`
+ *   - `passkey`: the WebAuthn options plus `factor` and `expires_in`
+ *   - `email`: `{ factor, challenge_id, sent: true, expires_in }`
+ * The gateway never answers a "no factor" / "factor changed" factor: those
+ * are errors (`FACTOR_NOT_ENROLLED`, `FACTOR_NOT_PREEXISTING`,
+ * `FACTOR_BASELINE_MISSING`, …) — see `needsAdminHelp` in `restore-errors.ts`.
  */
 export interface RestoreChallenge {
-  /** The strongest factor the owner had before the tombstone. `none`: no
-   *  second factor existed; `changed`: it was changed after the tombstone. */
-  factor: ProofFactor | 'none' | 'changed';
-  challenge_id?: string;
+  factor: ProofFactor;
+  challenge_id?: string | null;
   /** WebAuthn request options (base64url fields) for `passkey`. */
   publicKey?: RequestOptionsJSON;
-  /** `email`: the masked address the code went to. */
-  email_hint?: string;
-  expires_at?: WireTime;
+  /** `email`: the code was sent (the address is never returned). */
+  sent?: boolean;
+  /** Seconds the challenge stays valid. */
+  expires_in?: number;
 }
 
 export interface RestoreProof {

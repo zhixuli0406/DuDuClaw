@@ -16,6 +16,7 @@
  */
 import type { StepUpToken } from './step-up';
 import { lookupMessage } from './toast';
+import { setStepUpRetryHandler } from './step-up-retry-registry';
 
 export type BreakGlassPurpose = 'read' | 'write' | 'decide';
 
@@ -85,7 +86,56 @@ export interface BreakGlassOptions {
   interactive?: boolean;
 }
 
+/** Number of explicit `withBreakGlass` calls in flight. While > 0 the generic
+ *  RPC-layer retry stays out of the way, so a call site that opted in never
+ *  prompts twice (a concurrent unrelated call merely falls back to the old
+ *  behaviour: its refusal is shown). */
+let explicitDepth = 0;
+
+const READ_METHOD = /(^|[._])(list|get|read|history|status|search|view|show|info|tail|export)([._]|$)/;
+
+/** Generic layer (installed on the RPC client below): prompt once, retry once
+ *  with the token. Cancelled / no host / not a refusal → the ORIGINAL error. */
+async function genericStepUpRetry(
+  err: unknown,
+  method: string,
+  retry: (token: StepUpToken) => Promise<unknown>,
+): Promise<unknown> {
+  if (explicitDepth > 0 || !isBreakGlassRefusal(err) || !prompt) throw err;
+  const quiet = quietUntil.get(GENERIC_SCOPE) ?? 0;
+  if (quiet > Date.now()) throw err;
+  const token = await prompt({ purpose: READ_METHOD.test(method) ? 'read' : 'write' });
+  if (!token) {
+    quietUntil.set(GENERIC_SCOPE, Date.now() + CANCEL_QUIET_MS);
+    throw err;
+  }
+  quietUntil.delete(GENERIC_SCOPE);
+  return retry(token);
+}
+
+const GENERIC_SCOPE = '\u0000generic';
+
+/** Install the generic RPC-layer retry. Called by the prompt host on mount (no
+ *  host mounted → no generic retry, the original error surfaces). Returns the
+ *  uninstall function. */
+export function installStepUpRetry(): () => void {
+  setStepUpRetryHandler(genericStepUpRetry);
+  return () => setStepUpRetryHandler(null);
+}
+
 export async function withBreakGlass<T>(
+  run: (token?: StepUpToken) => Promise<T>,
+  options: BreakGlassOptions,
+): Promise<T> {
+  explicitDepth++;
+  try {
+    return await withBreakGlassInner(run, options);
+  } finally {
+    explicitDepth--;
+  }
+}
+
+async function withBreakGlassInner<T>(
   run: (token?: StepUpToken) => Promise<T>,
   { purpose, scope, interactive = true }: BreakGlassOptions,
 ): Promise<T> {

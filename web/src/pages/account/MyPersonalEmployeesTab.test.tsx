@@ -138,11 +138,11 @@ describe('我的個人 AI 員工 tab', () => {
   });
 
   it('restore request: email code when that is the strongest factor', async () => {
-    world.challenge = { factor: 'email', challenge_id: 'c3', email_hint: 'a***@corp.example' };
+    world.challenge = { factor: 'email', challenge_id: 'c3', sent: true, expires_in: 300 };
     const user = userEvent.setup();
     renderWithProviders(<MyPersonalEmployeesTab />);
     await openRestore(user);
-    expect(await screen.findByText('We sent a 6-digit code to a***@corp.example.')).toBeInTheDocument();
+    expect(await screen.findByText('We sent a 6-digit code to the email you had registered before the removal. It is valid for 5 minutes.')).toBeInTheDocument();
     await user.type(screen.getByLabelText('Email code'), '654321');
     await user.click(screen.getByRole('button', { name: 'Send restore request' }));
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('me.isolation.request_restore', {
@@ -151,7 +151,7 @@ describe('我的個人 AI 員工 tab', () => {
   });
 
   it('no second factor before the tombstone: tells the owner to contact an admin', async () => {
-    world.challenge = { factor: 'none' };
+    world.challenge = () => { throw { code: 'FACTOR_NOT_ENROLLED', message: '沒有設定兩步驟驗證。' }; };
     const user = userEvent.setup();
     renderWithProviders(<MyPersonalEmployeesTab />);
     await openRestore(user);

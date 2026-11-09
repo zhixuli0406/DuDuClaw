@@ -33,7 +33,12 @@ describe('restore error mapping', () => {
   it('sends the owner to an Admin for factor / credential changes', () => {
     expect(needsAdminHelp('FACTOR_NOT_PREEXISTING')).toBe(true);
     expect(needsAdminHelp('CREDENTIAL_CHANGED')).toBe(true);
-    expect(needsAdminHelp('FACTOR_NOT_STRONGEST')).toBe(false);
+    for (const code of ['FACTOR_NOT_ENROLLED', 'FACTOR_BASELINE_MISSING', 'FACTOR_DENIED']) {
+      expect(needsAdminHelp(code)).toBe(true);
+    }
+    for (const code of ['FACTOR_NOT_STRONGEST', 'FACTOR_RATE_LIMITED', 'FACTOR_FAILED', 'FACTOR_UNAVAILABLE']) {
+      expect(needsAdminHelp(code)).toBe(false);
+    }
   });
 
   it('has a friendly sentence for every known code in all three languages', () => {

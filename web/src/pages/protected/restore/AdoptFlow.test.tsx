@@ -15,7 +15,7 @@ const GONE: RestorableEmployee = {
 let challenge: () => unknown;
 beforeEach(() => {
   vi.clearAllMocks();
-  challenge = () => ({ factor: 'email', challenge_id: 'c3', email_hint: 'a***@corp.example' });
+  challenge = () => ({ factor: 'email', challenge_id: 'c3', sent: true, expires_in: 300 });
   mockWsClient.call.mockImplementation(async (method: string) => {
     if (method === 'me.isolation.restore_challenge') return challenge();
     if (method === 'me.isolation.request_adoption') return { request_id: 'ad1', state: 'pending' };
@@ -81,8 +81,21 @@ describe('<AdoptFlow> — 由新員工接手 (ROOT_GONE)', () => {
     expect(screen.queryByRole('button', { name: 'Send hand-over request' })).toBeNull();
   });
 
+  it.each(['FACTOR_NOT_ENROLLED', 'FACTOR_BASELINE_MISSING', 'FACTOR_DENIED'])('%s sends the owner to an admin', async (code) => {
+    challenge = () => { throw { code, message: '請聯絡管理員。' }; };
+    renderWithProviders(<AdoptFlow employee={GONE} onFiled={vi.fn()} />);
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send hand-over request' })).toBeNull();
+  });
+
+  it.each(['FACTOR_RATE_LIMITED', 'FACTOR_UNAVAILABLE'])('%s is retryable, not an admin matter', async (code) => {
+    challenge = () => { throw { code, message: '請稍後再試。' }; };
+    renderWithProviders(<AdoptFlow employee={GONE} onFiled={vi.fn()} />);
+    expect(await screen.findByRole('button', { name: 'Try again' })).toBeInTheDocument();
+  });
+
   it('authenticator-app factor', async () => {
-    challenge = () => ({ factor: 'totp', challenge_id: 'c4' });
+    challenge = () => ({ factor: 'totp', challenge_id: null });
     renderWithProviders(<AdoptFlow employee={GONE} onFiled={vi.fn()} />);
     expect(await screen.findByText('Confirm with your authenticator app')).toBeInTheDocument();
     expect(screen.getByLabelText('Verification code')).toBeInTheDocument();

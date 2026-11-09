@@ -7,7 +7,7 @@ import {
   type RestoreChallenge,
   type RestoreProof,
 } from '@/lib/isolation-restore-api';
-import { errorCode, needsAdminHelp } from '@/lib/restore-errors';
+import { adminHelpReason, errorCode, needsAdminHelp } from '@/lib/restore-errors';
 import { RestoreErrorNotice, useRestoreT } from './restore-ui';
 
 type Phase =
@@ -56,15 +56,12 @@ export function FactorProof({
       .restoreChallenge(employeeId, incarnation, forAdoption)
       .then((challenge) => {
         if (current !== generation.current) return;
-        if (challenge.factor === 'none' || challenge.factor === 'changed') {
-          setPhase({ kind: 'contact_admin', reason: challenge.factor });
-        } else setPhase({ kind: 'ready', challenge });
+        setPhase({ kind: 'ready', challenge });
       })
       .catch((e) => {
         if (current !== generation.current) return;
         const c = errorCode(e);
-        if (c === 'FACTOR_NOT_PREEXISTING') setPhase({ kind: 'contact_admin', reason: 'changed' });
-        else if (c === 'CREDENTIAL_CHANGED') setPhase({ kind: 'contact_admin', reason: 'credential' });
+        if (needsAdminHelp(c)) setPhase({ kind: 'contact_admin', reason: adminHelpReason(c) });
         else setPhase({ kind: 'failed', error: e });
       });
   };
@@ -83,7 +80,7 @@ export function FactorProof({
       await onSubmit(proof);
     } catch (e) {
       const c = errorCode(e);
-      if (needsAdminHelp(c)) setPhase({ kind: 'contact_admin', reason: c === 'CREDENTIAL_CHANGED' ? 'credential' : 'changed' });
+      if (needsAdminHelp(c)) setPhase({ kind: 'contact_admin', reason: adminHelpReason(c) });
       else setError(e);
       // A used or expired challenge is never retried silently.
       if (c === 'CHALLENGE_EXPIRED' || c === 'FACTOR_INVALID') setCode('');
@@ -108,7 +105,7 @@ export function FactorProof({
       return;
     }
     setBusy(false);
-    await send({ factor: 'passkey', challenge_id: challenge.challenge_id, credential });
+    await send({ factor: 'passkey', challenge_id: challenge.challenge_id ?? undefined, credential });
   };
 
   if (phase.kind === 'loading') {
@@ -141,7 +138,10 @@ export function FactorProof({
   }
 
   const { challenge } = phase;
-  const factor = challenge.factor as RestoreProof['factor'];
+  const factor = challenge.factor;
+  const challengeId = challenge.challenge_id ?? undefined;
+  // Validity shown in whole minutes, from the server's seconds (5 when absent).
+  const minutes = Math.max(1, Math.ceil((challenge.expires_in ?? 300) / 60));
   const codeReady = /^\d{6}$/.test(code);
   const Icon = factor === 'passkey' ? KeyRound : factor === 'email' ? Mail : Smartphone;
 
@@ -153,7 +153,7 @@ export function FactorProof({
           <p className="font-medium">{t(`restoreFlow.factor.${factor}.title`)}</p>
           <p id={hintId} className="text-muted-foreground">
             {factor === 'email'
-              ? t('restoreFlow.factor.email.body', { email: challenge.email_hint ?? t('restoreFlow.factor.email.yourEmail') })
+              ? t('restoreFlow.factor.email.body', { minutes })
               : t(`restoreFlow.factor.${factor}.body`)}
           </p>
         </div>
@@ -171,7 +171,7 @@ export function FactorProof({
           className="flex flex-wrap items-end gap-3"
           onSubmit={(e) => {
             e.preventDefault();
-            if (!busy && canSubmit && codeReady) void send({ factor, code, challenge_id: challenge.challenge_id });
+            if (!busy && canSubmit && codeReady) void send({ factor, code, challenge_id: challengeId });
           }}
         >
           <div className="grid gap-1.5">

@@ -1,4 +1,5 @@
 import { withAgentRequestAllowed } from './agent-request-guard';
+import { getStepUpRetryHandler } from './step-up-retry-registry';
 
 // WebSocket client matching the Rust WsFrame protocol
 // (crates/duduclaw-gateway/src/protocol.rs)
@@ -321,6 +322,25 @@ export class DuDuClawClient {
     // `migrate.apply`, which may run up to 300s server-side) pass a larger value
     // so the dashboard doesn't reject a request the gateway is still working on.
     timeoutMs = 30000,
+  ): Promise<unknown> {
+    const first = this.callOnce(method, params, skipAuthWait, timeoutMs);
+    const handler = getStepUpRetryHandler();
+    if (!handler || skipAuthWait) return first;
+    // Generic break-glass: a refusal that asks for `step_up_csrf` is retried
+    // ONCE with the Admin's proof (never when this call already carried one).
+    return first.catch((err) => {
+      if ('step_up_csrf' in params) throw err;
+      return handler(err, method, (token) =>
+        this.callOnce(method, { ...params, step_up_csrf: token }, skipAuthWait, timeoutMs),
+      );
+    });
+  }
+
+  private callOnce(
+    method: string,
+    params: Record<string, unknown>,
+    skipAuthWait: boolean,
+    timeoutMs: number,
   ): Promise<unknown> {
     const waitForReady = (): Promise<void> => {
       // For handshake calls, only need WS to be open

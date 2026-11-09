@@ -12,6 +12,12 @@ import { sanitizeErrorDetail } from './error-message';
 export const KNOWN_RESTORE_ERRORS = [
   'FACTOR_NOT_STRONGEST',
   'FACTOR_NOT_PREEXISTING',
+  'FACTOR_NOT_ENROLLED',
+  'FACTOR_BASELINE_MISSING',
+  'FACTOR_DENIED',
+  'FACTOR_RATE_LIMITED',
+  'FACTOR_FAILED',
+  'FACTOR_UNAVAILABLE',
   'FACTOR_INVALID',
   'CHALLENGE_EXPIRED',
   'CREDENTIAL_CHANGED',
@@ -81,5 +87,20 @@ export function describeRestoreError(err: unknown): DescribedError {
 
 /** The owner must ask an Admin: their factor cannot prove this request. */
 export function needsAdminHelp(code: string | null): boolean {
-  return code === 'FACTOR_NOT_PREEXISTING' || code === 'CREDENTIAL_CHANGED';
+  return (
+    code === 'FACTOR_NOT_ENROLLED' ||
+    code === 'FACTOR_NOT_PREEXISTING' ||
+    code === 'FACTOR_BASELINE_MISSING' ||
+    code === 'FACTOR_DENIED' ||
+    code === 'CREDENTIAL_CHANGED'
+  );
+}
+
+/** Which "contact an Admin" wording an error code gets: no second factor was
+ *  ever set up (`none`), someone else changed the sign-in data (`credential`),
+ *  or the factor cannot prove this request (`changed`). */
+export function adminHelpReason(code: string | null): 'none' | 'changed' | 'credential' {
+  if (code === 'FACTOR_NOT_ENROLLED') return 'none';
+  if (code === 'CREDENTIAL_CHANGED') return 'credential';
+  return 'changed';
 }

@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle } from 'lucide-react';
-import { api, type AgentGoogleIdentity, type GoogleTenantSubjectHolder } from '@/lib/api';
+import { api, type AgentGoogleIdentity, type GoogleTenantSubjectHolder, type GoogleTenantSubjectNotice } from '@/lib/api';
+import { TenantSubjectNotice } from '@/components/protected/TenantSubjectNotice';
 import {
   Badge,
   Button,
@@ -26,16 +27,27 @@ import { formatWhen, useT } from './shared';
 interface Row {
   agent: string;
   subject: string;
-  holder: GoogleTenantSubjectHolder;
+  /** Absent when no single account holds the address (none / more than one):
+   *  the row only explains the state; nothing can be confirmed from here. */
+  holder: GoogleTenantSubjectHolder | null;
   attested: boolean;
+  state: GoogleTenantSubjectNotice['state'];
 }
+type HeldRow = Row & { holder: GoogleTenantSubjectHolder };
+const hasHolder = (row: Row): row is HeldRow => row.holder !== null;
 
 function attestationRows(agents: AgentGoogleIdentity[] | undefined): Row[] {
   return (agents ?? []).flatMap((agent) => {
     const notice = agent.tenant_subject;
-    if (!notice || !notice.subject || !notice.holder) return [];
-    if (notice.state !== 'attestation_required' && notice.state !== 'attested_person') return [];
-    return [{ agent: agent.agent_id, subject: notice.subject, holder: notice.holder, attested: notice.state === 'attested_person' }];
+    if (!notice || !notice.subject) return [];
+    if (notice.state !== 'attestation_required' && notice.state !== 'attested_person' && notice.state !== 'ambiguous') return [];
+    return [{
+      agent: agent.agent_id,
+      subject: notice.subject,
+      holder: notice.holder ?? null,
+      attested: notice.state === 'attested_person',
+      state: notice.state,
+    }];
   });
 }
 
@@ -49,8 +61,8 @@ export function DelegateAttestationCard({
   const t = useT();
   const intl = useIntl();
   const rows = attestationRows(agents);
-  const [confirming, setConfirming] = useState<Row | null>(null);
-  const [revoking, setRevoking] = useState<Row | null>(null);
+  const [confirming, setConfirming] = useState<HeldRow | null>(null);
+  const [revoking, setRevoking] = useState<HeldRow | null>(null);
   const [personChecked, setPersonChecked] = useState(false);
   const [selfSetChecked, setSelfSetChecked] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -86,30 +98,37 @@ export function DelegateAttestationCard({
               <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1">
                 <dt className="text-muted-foreground">{t('tenant.attest.mailbox')}</dt>
                 <dd className="break-all">{row.subject}</dd>
-                <dt className="text-muted-foreground">{t('tenant.attest.holder')}</dt>
-                <dd>{row.holder.name}</dd>
-                <dt className="text-muted-foreground">{t('tenant.attest.holderId')}</dt>
-                <dd className="break-all font-mono text-xs">{row.holder.user_id}</dd>
-                <dt className="text-muted-foreground">{t('tenant.attest.createdAt')}</dt>
-                <dd>{created(row.holder)}</dd>
+                {hasHolder(row) && (
+                  <>
+                    <dt className="text-muted-foreground">{t('tenant.attest.holder')}</dt>
+                    <dd>{row.holder.name}</dd>
+                    <dt className="text-muted-foreground">{t('tenant.attest.holderId')}</dt>
+                    <dd className="break-all font-mono text-xs">{row.holder.user_id}</dd>
+                    <dt className="text-muted-foreground">{t('tenant.attest.createdAt')}</dt>
+                    <dd>{created(row.holder)}</dd>
+                  </>
+                )}
               </dl>
-              {row.holder.email_self_set && (
+              {!hasHolder(row) && <TenantSubjectNotice notice={{ state: row.state }} />}
+              {hasHolder(row) && row.holder.email_self_set && (
                 <p role="note" className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2">
                   <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
                   <span>{t('tenant.attest.selfSetWarning', { name: row.holder.name })}</span>
                 </p>
               )}
-              <div className="flex justify-end">
-                {row.attested ? (
-                  <Button variant="outline" size="sm" onClick={() => { setNotice(null); setRevoking(row); }}>
-                    {t('tenant.attest.revoke')}
-                  </Button>
-                ) : (
-                  <Button variant="brand" size="sm" onClick={() => { setNotice(null); setConfirming(row); }}>
-                    {t('tenant.attest.confirm')}
-                  </Button>
-                )}
-              </div>
+              {hasHolder(row) && (
+                <div className="flex justify-end">
+                  {row.attested ? (
+                    <Button variant="outline" size="sm" onClick={() => { setNotice(null); setRevoking(row); }}>
+                      {t('tenant.attest.revoke')}
+                    </Button>
+                  ) : (
+                    <Button variant="brand" size="sm" onClick={() => { setNotice(null); setConfirming(row); }}>
+                      {t('tenant.attest.confirm')}
+                    </Button>
+                  )}
+                </div>
+              )}
             </li>
           ))}
         </ul>

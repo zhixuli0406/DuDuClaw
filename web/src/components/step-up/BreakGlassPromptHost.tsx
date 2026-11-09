@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { registerBreakGlassPrompt, type BreakGlassRequest } from '@/lib/break-glass';
+import { installStepUpRetry, registerBreakGlassPrompt, type BreakGlassRequest } from '@/lib/break-glass';
 import type { StepUpToken } from '@/lib/step-up';
 import { StepUpDialog } from './StepUpDialog';
 
@@ -23,6 +23,9 @@ export function BreakGlassPromptHost() {
       ),
     [],
   );
+
+  // The generic RPC-layer step-up retry exists only while a prompt host is mounted.
+  useEffect(() => installStepUpRetry(), []);
 
   // Unmounting answers every waiter with "cancelled".
   useEffect(() => () => {
