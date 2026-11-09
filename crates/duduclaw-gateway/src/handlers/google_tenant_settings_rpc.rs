@@ -300,7 +300,7 @@ mod tests {
         assert!(rendered.contains("# operator note") && rendered.contains("# keep"), "{rendered}");
         let parsed = gi::parse_home_config(&rendered).unwrap();
         assert_eq!(parsed.allowed_subject_domains, strings(&["customer.com"]));
-        assert_eq!((parsed.service_mailboxes, parsed.tenant_scopes), (settings.service_mailboxes, settings.tenant_scopes));
+        assert_eq!((&parsed.service_mailboxes, &parsed.tenant_scopes), (&settings.service_mailboxes, &settings.tenant_scopes));
         assert_eq!(rendered.parse::<toml::Table>().unwrap()["gateway"]["port"].as_integer(), Some(1));
 
         // Clearing both keys removes them; the rest of the section stays.
