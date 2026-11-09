@@ -404,6 +404,11 @@ async fn p1d_wildcard_listings_hide_other_personal_rows_and_totals() {
         }
     }
     drop(store);
+    // P1e: a row without metadata predates the upgrade; the store's one-time
+    // backfill links it (title matching at read time is gone).
+    rusqlite::Connection::open(home.join("tasks.db")).unwrap()
+        .execute("DELETE FROM task_store_markers WHERE name = 'p1e_goal_creator_backfill'", []).unwrap();
+    drop(TaskStore::open(home).unwrap());
     let all_tasks = json!({"assigned_to": "*"});
     let all_activity = json!({"agent_id": "*"});
     let ids = |value: &Value, list: &str, key: &str| -> Vec<String> {
@@ -503,13 +508,33 @@ async fn p1d_task_id_tools_and_link_fields_resolve_their_employee() {
         None);
 }
 
-/// Keys under which a tool schema names a work item by id.
-const ID_KEYS: &[&str] = &["task_id", "plan_id", "parent_task_id", "goal_id", "depends_on", "parent_goal_id"];
+/// Keys under which a tool schema names a work item by id. P1e: also the
+/// step / approval / session-style ids.
+const ID_KEYS: &[&str] = &["task_id", "plan_id", "parent_task_id", "goal_id", "depends_on", "parent_goal_id",
+    "step_id", "approval_id", "session_id", "run_id", "fork_id", "branch_id", "mail_id", "decision_id", "job_id",
+    "workspace_id", "message_id"];
 
 /// Id parameters that do not name a DuDuClaw work item of another employee.
 const ID_ALLOWLIST: &[(&str, &str, &str)] = &[
     ("task_status", "task_id", "a create_task bus task in the process's own store (PROCESS_STORE_TOOLS)"),
     ("gtasks_complete", "task_id", "a Google Tasks id in the employee's own Google account"),
+    // P1e: ids the tool resolves inside the caller's own scope.
+    ("plan_update_step", "step_id", "holder rule: only an agent step assigned to the caller itself"),
+    ("mail_read", "mail_id", "re-checked against the gated mailbox (`agent_id` is in PERSONAL_TARGET_TOOLS)"),
+    ("decision_resolve", "decision_id", "the caller's own open decisions (memory store of the process employee)"),
+    ("gmail_read", "message_id", "a Gmail message id in the employee's own Google account"),
+    ("inspect_branches", "fork_id", "own forks only: the handler requires fork.agent_id == the process employee"),
+    ("diff_branches", "fork_id", "own forks only: the handler requires fork.agent_id == the process employee"),
+    ("merge_or_select", "fork_id", "own forks only: the handler requires fork.agent_id == the process employee"),
+    ("merge_or_select", "branch_id", "a branch of that own fork"),
+    ("terminate_branch", "fork_id", "own forks only: the handler requires fork.agent_id == the process employee"),
+    ("terminate_branch", "branch_id", "a branch of that own fork"),
+    ("fork_cost", "fork_id", "own forks only: the handler requires fork.agent_id == the process employee"),
+    ("computer_session_stop", "session_id", "the gateway re-checks session ownership for the calling employee"),
+    ("computer_workspace_read", "workspace_id", "the gateway re-checks workspace ownership for the calling employee"),
+    ("computer_workspace_write", "workspace_id", "the gateway re-checks workspace ownership for the calling employee"),
+    ("meeting_transcribe_status", "job_id", "jobs of the caller's own write namespace"),
+    ("meeting_transcribe_cancel", "job_id", "jobs of the caller's own write namespace"),
 ];
 
 #[test]
@@ -562,6 +587,80 @@ fn p1d_external_client_id_is_never_an_employee() {
     assert_eq!(personal_acting_id(&principal(internal_id, false), PERSONAL), PERSONAL);
     assert_eq!(personal_acting_id(&principal(PERSONAL, false), SHARED), PERSONAL);
     assert_eq!(external_identity_refusal(home, true, &principal(PERSONAL, false)), None);
+}
+
+#[tokio::test]
+async fn p1e_activity_post_cannot_forge_goal_ownership() {
+    use super::super::RecordActor;
+    let dir = home();
+    let home = dir.path();
+    for event_type in ["goal_created", "GOAL_CREATED", " goal_created "] {
+        let refused = super::super::handle_activity_post(
+            &json!({"summary": "Created goal: Company goal", "event_type": event_type}), home, RecordActor::Agent(SHARED),
+        ).await;
+        assert_eq!(refused["isError"], json!(true), "{event_type}: {refused}");
+    }
+    // Other event types still post.
+    let posted = super::super::handle_activity_post(&json!({"summary": "hello", "event_type": "agent_comment"}), home,
+        RecordActor::Agent(SHARED)).await;
+    assert_ne!(posted["isError"], json!(true), "{posted}");
+}
+
+#[tokio::test]
+async fn p1e_goal_with_several_creators_fails_closed() {
+    use super::super::personal_wildcard as wildcard;
+    use duduclaw_gateway::task_store::{GoalRow, TaskStore};
+    let dir = home();
+    let home = dir.path();
+    let store = TaskStore::open(home).unwrap();
+    store.insert_goal(&GoalRow::new("g-claimed".into(), "Claimed".into(), String::new())).await.unwrap();
+    store.insert_goal(&GoalRow::new("g-shared".into(), "Shared".into(), String::new())).await.unwrap();
+    for (id, agent, goal) in [("c1", SHARED, "g-claimed"), ("c2", PERSONAL, "g-claimed"), ("c3", SHARED, "g-shared")] {
+        store.append_activity(&activity_row(id, "goal_created", agent, "Created goal: x",
+            Some(json!({"goal_id": goal}).to_string()))).await.unwrap();
+    }
+    drop(store);
+    // Listed for another employee only when NO creator is hidden from it.
+    let listed = data(&wildcard::goals_list(&json!({}), home, SHARED, true).await);
+    let ids: Vec<&str> = listed["goals"].as_array().unwrap().iter().map(|g| g["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["g-shared"], "{listed}");
+    assert_eq!(listed["total"], json!(1));
+    // Named by id: refused if ANY creator refuses.
+    let link = json!({"title": "x", "goal_id": "g-claimed"});
+    assert_eq!(id_target_refusal(home, true, "tasks_create", &link, SHARED), Some(REFUSED));
+    assert_eq!(id_target_refusal(home, true, "tasks_create", &link, PERSONAL), None, "the other creator is Shared");
+    assert_eq!(id_target_refusal(home, true, "tasks_create", &json!({"goal_id": "g-shared"}), SHARED), None);
+}
+
+#[test]
+fn p1e_discovery_runs_resolve_their_employee() {
+    for tool in ["discovery_tree", "discovery_artifact", "discovery_cancel"] {
+        assert!(PERSONAL_ID_TARGETS.iter().any(|(name, key, item)| *name == tool && *key == "run_id"
+            && *item == duduclaw_gateway::personal_visibility::WorkItem::DiscoveryRun), "{tool}");
+    }
+    let dir = home();
+    drop(duduclaw_gateway::task_store::TaskStore::open(dir.path()).unwrap());
+    assert_eq!(id_target_refusal(dir.path(), true, "discovery_tree", &json!({"run_id": "missing"}), SHARED), None);
+    // No readable tasks.db: refused (fail closed).
+    let missing = tempfile::tempdir().unwrap();
+    assert_eq!(id_target_refusal(missing.path(), true, "discovery_tree", &json!({"run_id": "r"}), SHARED), Some(UNAVAILABLE));
+}
+
+#[test]
+fn p1e_external_ephemeral_client_id_is_refused() {
+    use super::super::personal_wildcard::{EXTERNAL_ID_IS_EMPLOYEE, external_identity_refusal};
+    let dir = home();
+    let principal = |id: &str, external: bool| crate::mcp_auth::Principal {
+        client_id: id.into(),
+        scopes: Default::default(),
+        is_external: external,
+        created_at: chrono::Utc::now(),
+    };
+    for id in ["eph-0123456789ab", "EPH-0123456789ab"] {
+        assert_eq!(external_identity_refusal(dir.path(), true, &principal(id, true)), Some(EXTERNAL_ID_IS_EMPLOYEE), "{id}");
+        assert_eq!(external_identity_refusal(dir.path(), false, &principal(id, true)), None);
+        assert_eq!(external_identity_refusal(dir.path(), true, &principal(id, false)), None, "not an external key");
+    }
 }
 
 #[test]

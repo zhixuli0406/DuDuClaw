@@ -12,6 +12,11 @@
 //!   one tied to a task needs what that task needs (minus the `done` rule),
 //!   one without a task needs Operator on the employee. An unknown file and
 //!   a refusal read the same.
+//! * v1.81 P1e (protected mode): `digest.latest` leaves out another person's
+//!   Personal employees for every caller but the owner (Admins too);
+//!   `digest.feedback` is gated before the handler on its task's employee
+//!   (`task_id`) or the file's employee (`artifact.agent_id`) — owner, or an
+//!   audited Admin step-up (`personal_data_gate.rs`).
 
 #[allow(unused_imports)]
 use super::*;
@@ -29,6 +34,14 @@ impl MethodHandler {
         };
         match method {
             "digest.latest" => {
+                // v1.81 P1e: another person's Personal employees are left out
+                // for everyone but their owner — Admins included (no
+                // per-item filter would apply to them below). Unreadable
+                // ownership refuses (fail closed); empty outside protected mode.
+                let hidden = match self.personal_hidden_agents(&live).await {
+                    Ok(hidden) => hidden,
+                    Err(message) => return WsFrame::error_response("", message),
+                };
                 let cfg = crate::digest::DigestConfig::from_home(&self.home_dir);
                 let home = self.home_dir.clone();
                 let (latest, verdicts) = tokio::task::spawn_blocking(move || {
@@ -44,6 +57,7 @@ impl MethodHandler {
                     None => None,
                     Some(mut d) => {
                         let mut agents = Vec::new();
+                        super::personal_p1d_gate::retain_visible(&mut d.agents, &hidden, |a| a.agent_id.as_str());
                         for mut a in d.agents.into_iter() {
                             if acl::require_agent_access(&live, &a.agent_id, AccessLevel::Viewer)
                                 .is_err()

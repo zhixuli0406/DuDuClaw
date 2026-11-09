@@ -43,10 +43,14 @@ pub(crate) fn personal_acting_id(principal: &crate::mcp_auth::Principal, default
 
 /// Protected mode: refuse an external key whose client id is an existing
 /// employee (`agents/<id>/agent.toml`), so no record or namespace gate can
-/// resolve it to that employee.
+/// resolve it to that employee. P1e: also an `eph-…` client id (case-
+/// insensitive) — other gates resolve an ephemeral id to its parent
+/// employee, and the dashboard no longer issues such external keys.
 pub(crate) fn external_identity_refusal(home_dir: &Path, protected: bool, principal: &crate::mcp_auth::Principal)
     -> Option<&'static str> {
-    (protected && principal.is_external && crate::mcp_namespace::client_is_agent(home_dir, &principal.client_id))
+    let ephemeral = principal.client_id.trim().to_ascii_lowercase().starts_with("eph-");
+    (protected && principal.is_external
+        && (ephemeral || crate::mcp_namespace::client_is_agent(home_dir, &principal.client_id)))
         .then_some(EXTERNAL_ID_IS_EMPLOYEE)
 }
 

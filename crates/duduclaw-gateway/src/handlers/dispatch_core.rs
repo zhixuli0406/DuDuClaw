@@ -110,6 +110,10 @@ impl MethodHandler {
                     }
                     Err(e) => return WsFrame::error_response("", &e),
                 }
+                // v1.81 P1e: pausing another person's Personal employee is audited.
+                if let Err(e) = self.personal_control_audit(ctx, method, &agent_id).await {
+                    return WsFrame::error_response("", e);
+                }
                 boxed_frame(|| self.handle_agents_pause(params, ctx)).await
             }
             "agents.resume" => {
@@ -123,11 +127,18 @@ impl MethodHandler {
                     }
                     Err(e) => return WsFrame::error_response("", &e),
                 }
+                // v1.81 P1e: resuming another person's Personal employee is audited.
+                if let Err(e) = self.personal_control_audit(ctx, method, &agent_id).await {
+                    return WsFrame::error_response("", e);
+                }
                 boxed_frame(|| self.handle_agents_resume(params, ctx)).await
             }
             "agents.update" => {
                 // First a quick check against the session; then (D7) the
                 // binding is re-read from users.db for the write itself.
+                // v1.81 P1e: on another person's Personal employee the
+                // dispatch gate (`personal_data_gate::write_scoped`) already
+                // required the owner or an audited Admin step-up.
                 let agent_id = check_agent!(AccessLevel::Owner);
                 match crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, &agent_id, AccessLevel::Owner) {
                     Ok(live) => boxed_frame(|| self.handle_agents_update_live(params, &live, ctx)).await,

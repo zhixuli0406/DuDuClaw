@@ -33,6 +33,11 @@
 //! [`PERSONAL_ID_TARGETS`]; wildcard listings and external callers are in
 //! `personal_wildcard.rs`.
 //!
+//! P1e: an id may resolve to several candidate employees (a goal with more
+//! than one recorded creator); the call is refused when ANY of them refuses
+//! (`personal_visibility::work_item_employees`). Discovery runs named by
+//! `run_id` resolve their task's employee.
+//!
 //! A self-target (target == acting employee, own namespace, own store) is
 //! decided before any `users.db` read, so it keeps working inside an
 //! isolated run whose MCP process cannot open `users.db`; every
@@ -141,6 +146,10 @@ pub(crate) const PERSONAL_ID_TARGETS: &[(&str, &str, visibility::WorkItem)] = &[
     ("capability_request", "task_id", visibility::WorkItem::Task),
     ("goals_create", "parent_goal_id", visibility::WorkItem::Goal),
     ("plan_get", "plan_id", visibility::WorkItem::Plan),
+    // P1e: a discovery run is its task's employee's work.
+    ("discovery_tree", "run_id", visibility::WorkItem::DiscoveryRun),
+    ("discovery_artifact", "run_id", visibility::WorkItem::DiscoveryRun),
+    ("discovery_cancel", "run_id", visibility::WorkItem::DiscoveryRun),
 ];
 
 /// The ids an argument names: a string, an array of strings, or a string
@@ -185,11 +194,13 @@ pub(crate) fn id_target_refusal(
         .iter()
         .filter(|(name, _, _)| *name == tool)
         .flat_map(|(_, key, item)| argument_ids(arguments.get(*key)).into_iter().map(move |id| (id, *item)))
-        .find_map(|(id, item)| match visibility::work_item_employee(home_dir, item, &id) {
-            // An unassigned task / an uncredited goal belongs to nobody.
-            Ok(Some(employee)) if employee == acting_agent || employee.trim().is_empty() => None,
-            Ok(Some(employee)) => target_refusal(home_dir, tool, acting_agent, &employee),
-            Ok(None) => None,
+        // P1e: every candidate employee (a goal may have several creators)
+        // must pass; an unassigned task / an uncredited goal has none.
+        .find_map(|(id, item)| match visibility::work_item_employees(home_dir, item, &id) {
+            Ok(employees) => employees
+                .iter()
+                .filter(|employee| employee.as_str() != acting_agent && !employee.trim().is_empty())
+                .find_map(|employee| target_refusal(home_dir, tool, acting_agent, employee)),
             Err(visibility::Unavailable) => Some(visibility::OWNERSHIP_UNAVAILABLE),
         })
 }

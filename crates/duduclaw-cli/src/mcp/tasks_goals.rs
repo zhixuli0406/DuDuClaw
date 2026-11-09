@@ -208,10 +208,11 @@ pub(crate) async fn handle_goals_create(args: &Value, home_dir: &Path, default_a
     if let Err(e) = store.insert_goal(&row).await {
         return tool_error(&format!("create goal: {e}"));
     }
-    // v1.81 P1d: the goal's creating employee (`WorkItem::Goal`).
+    // v1.81 P1d: the goal's creating employee (`WorkItem::Goal`); P1e: the
+    // event type is reserved for this call and read from metadata only.
     append_activity(
         &store,
-        "goal_created",
+        duduclaw_gateway::personal_visibility::GOAL_CREATED_EVENT,
         default_agent,
         None,
         &format!("Created goal: {}", row.title),
@@ -252,7 +253,10 @@ pub(crate) async fn handle_goals_list_hiding(
             Ok(creators) => creators,
             Err(_) => return tool_error(duduclaw_gateway::personal_visibility::OWNERSHIP_UNAVAILABLE),
         };
-        rows.retain(|goal| creators.get(&goal.id).is_none_or(|agent| !hidden_creators.contains(agent)));
+        // P1e: hidden when ANY candidate creator is hidden (fail closed).
+        rows.retain(|goal| {
+            !duduclaw_gateway::personal_visibility::goal_hidden(creators.get(&goal.id), hidden_creators)
+        });
     }
     let limit = clamp_limit(args, 50, 200) as usize;
     let goals: Vec<Value> = rows.iter().take(limit).map(goal_row_to_json).collect();
@@ -307,6 +311,9 @@ pub(crate) async fn handle_activity_post(
         .iter()
         .any(|p| event_type.to_ascii_lowercase().starts_with(p))
         || event_type.to_ascii_lowercase().starts_with("computer_session.")
+        // v1.81 P1e: `goal_created` records a goal's creating employee
+        // (Personal visibility); only `goals_create` writes it.
+        || duduclaw_gateway::personal_visibility::is_reserved_activity_event(&event_type)
     {
         return tool_error(&format!(
             "activity_post 遭拒：「{}」是系統保留的事件類型。",

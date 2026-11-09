@@ -145,6 +145,12 @@ impl MethodHandler {
             .get("is_external")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // v1.81 P1e: an external key's client id is never an ephemeral
+        // sub-agent id (`eph-…`), which other gates resolve to its parent
+        // employee (`personal_visibility::acting_employee`).
+        if let Some(refusal) = external_client_id_refusal(is_external, &client_id) {
+            return WsFrame::error_response("", refusal);
+        }
 
         // Validate scopes against the known scope list (MK.4).
         let scopes_arr = match params.get("scopes").and_then(|v| v.as_array()) {
@@ -266,4 +272,16 @@ impl MethodHandler {
             json!({ "success": true, "revoked": mask_mcp_key(&key) }),
         )
     }
+}
+
+/// Shown when an external key would be issued under an ephemeral sub-agent id.
+pub(crate) const EXTERNAL_EPHEMERAL_ID: &str = "外部 MCP 金鑰的用戶端代號不能以 eph- 開頭（那是臨時子代理的代號）。 / An \
+    external MCP key's client id must not be an ephemeral sub-agent id (eph-…).";
+
+/// v1.81 P1e: an external key may not carry an ephemeral sub-agent id: any
+/// client id starting `eph-` (case-insensitive, the prefix of
+/// `crate::ephemeral::is_ephemeral_id`) is refused. Every mode.
+pub(crate) fn external_client_id_refusal(is_external: bool, client_id: &str) -> Option<&'static str> {
+    let lowered = client_id.trim().to_ascii_lowercase();
+    (is_external && lowered.starts_with("eph-")).then_some(EXTERNAL_EPHEMERAL_ID)
 }

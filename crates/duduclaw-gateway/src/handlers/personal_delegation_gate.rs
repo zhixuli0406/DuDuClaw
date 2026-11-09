@@ -39,6 +39,9 @@ pub(super) fn delegation_target_keys(method: &str) -> &'static [&'static str] {
         "tasks.update" => &["assigned_to"],
         "tasks.assign" | "tasks.goal_create" | "plans.create" | "agents.delegate" => &["agent_id"],
         "plans.add_step" | "plans.update_step" => &["assignee"],
+        // P1e: the work handed over lands on `to_agent` (owner only); the
+        // source `from_agent` is a config write (`personal_data_gate::write_scoped`).
+        "agents.handoff" => &["to_agent"],
         _ => &[],
     }
 }

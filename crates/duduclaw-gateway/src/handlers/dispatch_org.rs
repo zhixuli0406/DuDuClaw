@@ -376,6 +376,8 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_agents_google_identity_get(&agent_id)).await
             }
             "agents.google_identity_set" => {
+                // v1.81 P1e: gated first as an Identity write
+                // (`personal_data_gate::write_scoped`): owner, or Admin + step-up + audit.
                 let agent_id = params.get("agent_id").and_then(Value::as_str).unwrap_or("");
                 check_agent_named!(agent_id, AccessLevel::Owner);
                 boxed_frame(|| self.handle_agents_google_identity_set(params, ctx)).await

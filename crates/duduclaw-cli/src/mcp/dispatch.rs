@@ -237,7 +237,7 @@ pub(crate) async fn handle_tools_call(
         };
         let handler = GatewayHandler { id, home_dir, http, memory, default_agent, odoo, ns_ctx,
             daily_quota, caller_client_id, caller_is_admin, wiki_agent, record_actor,
-            google_caller: &google_caller };
+            google_caller: &google_caller, acting_for_target, personal_protected };
         match authorized {
             // Do not embed both copies of the all-tools match future in this
             // authorization branch (or the background caller's task-local scope).
@@ -384,6 +384,11 @@ struct GatewayHandler<'a> {
     wiki_agent: &'a str,
     record_actor: RecordActor<'a>,
     google_caller: &'a super::google_identity_client::GoogleCaller,
+    /// v1.81 P1d/P1e: who the wildcard Personal filters judge (`external:<id>`
+    /// for an external key) and whether protected mode is on — resolved once
+    /// in `handle_tools_call`, carried here so the match arms can read them.
+    acting_for_target: &'a str,
+    personal_protected: bool,
 }
 impl GatewayHandler<'_> {
     async fn execute(&self, call: duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall) -> std::result::Result<Value, Value> {
@@ -414,7 +419,8 @@ impl GatewayHandler<'_> {
             return Ok(tool_error("隔離連線服務尚未就緒。"));
         }
         let Self { id, home_dir, http, memory, default_agent, odoo, ns_ctx, daily_quota,
-            caller_client_id, caller_is_admin, wiki_agent, record_actor, google_caller } = *self;
+            caller_client_id, caller_is_admin, wiki_agent, record_actor, google_caller,
+            acting_for_target, personal_protected } = *self;
         Ok(match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
@@ -1085,7 +1091,8 @@ mod future_size_tests {
         let handler = GatewayHandler { id: &id, home_dir: home.path(), http: &http,
             memory: &memory, default_agent: "main", odoo: &odoo, ns_ctx: &ns,
             daily_quota: &quota, caller_client_id: "main", caller_is_admin: false,
-            wiki_agent: "main", record_actor: RecordActor::Agent("main"), google_caller: &google_caller };
+            wiki_agent: "main", record_actor: RecordActor::Agent("main"), google_caller: &google_caller,
+            acting_for_target: "main", personal_protected: false };
         // The match state machine is shared by memory_*, wiki_* and tasks_*.
         for name in ["memory_store", "memory_search", "wiki_write", "tasks_create"] {
             let future = handler.invoke(name, &arguments);

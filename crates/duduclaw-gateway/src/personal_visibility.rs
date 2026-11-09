@@ -40,6 +40,14 @@
 //!   the handlers always name the same employee; mail is category
 //!   [`DataCategory::Mail`]; a goal of the goal hierarchy belongs to the
 //!   employee that created it ([`WorkItem::Goal`], [`goal_creators`]).
+//! - **P1e:** config / identity writes are categories [`DataCategory::Config`]
+//!   / [`DataCategory::Identity`] (owner, or an audited Admin step-up); goal
+//!   ownership is metadata only — `goal_created` is reserved
+//!   ([`is_reserved_activity_event`]), legacy rows were linked once by a
+//!   store migration and title matching is gone — and a goal with several
+//!   candidate creators is hidden when any of them is ([`goal_hidden`],
+//!   [`work_item_employees`]); discovery runs resolve their employee
+//!   ([`WorkItem::DiscoveryRun`]).
 //!
 //! Every check here runs only in protected mode (`protected = true`, from
 //! `runtime_readiness::is_protected_linux()`); otherwise nothing is read and
@@ -73,6 +81,13 @@ pub enum DataCategory {
     /// Its received and drafted mail (P1d): `mail.list`, `mail.read`,
     /// `mail.archive`, `mail.outbox`.
     Mail,
+    /// A WRITE of its configuration (P1e): `agents.update` (agent.toml,
+    /// display name into SOUL/IDENTITY, model, tools, sources, supervisor,
+    /// heartbeat), avatar / outfit, tool-pruning restore, archive, removal
+    /// and handing its work over.
+    Config,
+    /// A WRITE of its acting Google identity (P1e): `agents.google_identity_set`.
+    Identity,
 }
 
 impl DataCategory {
@@ -85,7 +100,15 @@ impl DataCategory {
             Self::Work => "work",
             Self::Approval => "approval",
             Self::Mail => "mail",
+            Self::Config => "config",
+            Self::Identity => "identity",
         }
+    }
+
+    /// P1e: a configuration / identity write (audited under its own action,
+    /// never as a read).
+    pub fn is_write(self) -> bool {
+        matches!(self, Self::Config | Self::Identity)
     }
 }
 
@@ -96,10 +119,42 @@ pub enum WorkItem {
     Task,
     /// `tasks.db` `plans.id` → `agent_id`.
     Plan,
-    /// `tasks.db` `goals.id` → the employee whose `goal_created` activity
-    /// row records it (P1d). A goal no employee created (dashboard / legacy
-    /// company goal) has none.
+    /// `tasks.db` `goals.id` → the employees whose `goal_created` activity
+    /// rows link it (P1d/P1e, [`goal_creators`]). A goal no employee created
+    /// (dashboard / company goal) has none.
     Goal,
+    /// P1e: a discovery run id (`discovery_tree` / `discovery_artifact` /
+    /// `discovery_cancel`) → `tasks.db` `tasks.assigned_to` of its task.
+    DiscoveryRun,
+}
+
+/// The activity event type that records a goal's creating employee (P1d).
+/// P1e: reserved — only `goals_create` writes it (MCP `activity_post`
+/// refuses it, [`is_reserved_activity_event`]).
+pub const GOAL_CREATED_EVENT: &str = "goal_created";
+
+/// P1e: an activity `event_type` an employee may not post because it carries
+/// ownership: [`GOAL_CREATED_EVENT`] in any case / surrounding whitespace.
+pub fn is_reserved_activity_event(event_type: &str) -> bool {
+    event_type.trim().eq_ignore_ascii_case(GOAL_CREATED_EVENT)
+}
+
+/// P1e: the goal ids one `goal_created` row links: `metadata.goal_id` and
+/// `metadata.goal_ids` (written by the legacy backfill for a row whose title
+/// matched several goals). Malformed metadata links nothing. There is no
+/// title matching any more: legacy rows were linked once by the store
+/// migration (`task_store::goal_creator_backfill`).
+pub fn linked_goals(metadata: Option<&str>) -> Vec<String> {
+    let Some(value) = metadata.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()) else {
+        return Vec::new();
+    };
+    let mut goals: Vec<String> = value.get("goal_id").and_then(serde_json::Value::as_str).map(str::to_owned)
+        .into_iter().collect();
+    if let Some(list) = value.get("goal_ids").and_then(serde_json::Value::as_array) {
+        goals.extend(list.iter().filter_map(serde_json::Value::as_str).map(str::to_owned));
+    }
+    goals.retain(|goal| !goal.is_empty());
+    goals
 }
 
 /// Shown when an employee id carries surrounding whitespace (P1d).
@@ -113,12 +168,6 @@ pub const NON_CANONICAL_AGENT: &str = "AI 員工代號前後不能有空白。 /
 pub fn canonical_agent(raw: &str) -> Result<&str, &'static str> {
     if raw.trim() == raw { Ok(raw) } else { Err(NON_CANONICAL_AGENT) }
 }
-
-/// The creating employee of every goal, from its `goal_created` activity row
-/// (`metadata.goal_id`; a legacy row without metadata matches by title).
-const GOAL_CREATOR: &str = "(SELECT a.agent_id FROM activity a WHERE a.event_type = 'goal_created' AND \
-    (CASE WHEN json_valid(a.metadata) THEN json_extract(a.metadata, '$.goal_id') END = g.id \
-    OR (a.metadata IS NULL AND a.summary = 'Created goal: ' || g.title)) ORDER BY a.timestamp ASC LIMIT 1)";
 
 /// What a dashboard caller may do with one employee's private data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,41 +374,65 @@ pub fn delegation_refusal_for_user(home: &Path, protected: bool, user_id: &str, 
 /// P1c: the employee a task or plan named by `id` belongs to, read from
 /// `tasks.db` without opening a writable store. `Ok(None)` = no such item
 /// (the tool answers); `Err` = the store could not be read (callers refuse).
+/// P1e: a goal can have several candidate creators; this returns the first
+/// (sorted) — a gate must use [`work_item_employees`], which returns all.
 pub fn work_item_employee(home: &Path, item: WorkItem, id: &str) -> Result<Option<String>, Unavailable> {
+    work_item_employees(home, item, id).map(|employees| employees.into_iter().next())
+}
+
+/// P1e: every employee the item `id` could belong to. A task, plan or
+/// discovery run has at most one; a goal has every employee a
+/// `goal_created` row links it to ([`goal_creators`]), so a gate that
+/// refuses when ANY of them is refused fails closed when ownership is
+/// ambiguous. Blank employee ids are dropped (the item belongs to nobody).
+pub fn work_item_employees(home: &Path, item: WorkItem, id: &str) -> Result<BTreeSet<String>, Unavailable> {
     use rusqlite::OptionalExtension;
-    let goal_sql;
     let sql = match item {
         WorkItem::Task => "SELECT assigned_to FROM tasks WHERE id=?1",
         WorkItem::Plan => "SELECT agent_id FROM plans WHERE id=?1",
-        WorkItem::Goal => {
-            goal_sql = format!("SELECT {GOAL_CREATOR} FROM goals g WHERE g.id=?1");
-            goal_sql.as_str()
-        }
+        WorkItem::DiscoveryRun => "SELECT assigned_to FROM tasks WHERE discovery_run_id=?1",
+        WorkItem::Goal => return goal_creators(home).map(|mut creators| creators.remove(id).unwrap_or_default()),
     };
     let conn = crate::review_evidence::audience::readonly_db(&home.join("tasks.db")).map_err(|_| Unavailable)?;
-    conn.query_row(sql, [id], |row| row.get::<_, Option<String>>(0))
+    let employee = conn
+        .query_row(sql, [id], |row| row.get::<_, Option<String>>(0))
         .optional()
         .map(Option::flatten)
-        .map_err(|_| Unavailable)
+        .map_err(|_| Unavailable)?;
+    Ok(employee.into_iter().filter(|agent| !agent.is_empty()).collect())
 }
 
-/// P1d: goal id → creating employee, for every goal that has one
-/// ([`WorkItem::Goal`]). `Err` = `tasks.db` could not be read.
-pub fn goal_creators(home: &Path) -> Result<std::collections::BTreeMap<String, String>, Unavailable> {
+/// P1d/P1e: goal id → every employee a [`GOAL_CREATED_EVENT`] row links it
+/// to ([`linked_goals`]: metadata only, never the title). Several distinct
+/// creators can only come from rows forged before P1e reserved the event
+/// type, or from an ambiguous legacy backfill; callers hide the goal when
+/// ANY of them is hidden (fail closed). `Err` = `tasks.db` could not be read.
+pub fn goal_creators(home: &Path)
+    -> Result<std::collections::BTreeMap<String, BTreeSet<String>>, Unavailable> {
     let conn = crate::review_evidence::audience::readonly_db(&home.join("tasks.db")).map_err(|_| Unavailable)?;
     let mut statement = conn
-        .prepare(&format!("SELECT g.id, {GOAL_CREATOR} FROM goals g"))
+        .prepare("SELECT agent_id, metadata FROM activity WHERE event_type = ?1")
         .map_err(|_| Unavailable)?;
     let rows = statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
+        .query_map([GOAL_CREATED_EVENT], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
         .map_err(|_| Unavailable)?;
-    let mut creators = std::collections::BTreeMap::new();
+    let mut creators: std::collections::BTreeMap<String, BTreeSet<String>> = std::collections::BTreeMap::new();
     for row in rows {
-        if let (goal, Some(agent)) = row.map_err(|_| Unavailable)? {
-            creators.insert(goal, agent);
+        let (agent, metadata) = row.map_err(|_| Unavailable)?;
+        if agent.is_empty() {
+            continue;
+        }
+        for goal in linked_goals(metadata.as_deref()) {
+            creators.entry(goal).or_default().insert(agent.clone());
         }
     }
     Ok(creators)
+}
+
+/// P1e: `true` when a goal with these creators must be left out of a
+/// listing for a caller from whom `hidden` is hidden: ANY creator hidden.
+pub fn goal_hidden(creators: Option<&BTreeSet<String>>, hidden: &BTreeSet<String>) -> bool {
+    creators.is_some_and(|creators| !creators.is_disjoint(hidden))
 }
 
 /// Shared with the dashboard gate tests (`handlers/personal_data_gate_tests.rs`).

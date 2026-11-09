@@ -179,19 +179,21 @@ async fn p1d_dashboard_reads_resolve_their_employee() {
     let broker = crate::approval::ApprovalBroker::open(h.path()).unwrap();
     let card = broker.request(PERSONAL, "dynamic_review_kind", "secret", json!({}), 300).await.unwrap();
     assert_eq!(id_employee(h.path(), IdKind::Approval, card.as_str()), Ok(Some(PERSONAL.to_string())));
-    // Goals belong to their creating employee (metadata, or a legacy title match).
+    // Goals belong to their creating employee (metadata). P1e: a row without
+    // metadata written after the store's one-time backfill links nothing —
+    // title matching is gone (`personal_p1e_tests.rs` covers the backfill).
     store.insert_goal(&GoalRow::new("g-personal".into(), "Personal goal".into(), String::new())).await.unwrap();
     store.insert_goal(&GoalRow::new("g-legacy".into(), "Legacy goal".into(), String::new())).await.unwrap();
     store.insert_goal(&GoalRow::new("g-company".into(), "Company goal".into(), String::new())).await.unwrap();
     store.append_activity(&goal_created("a1", PERSONAL, "Personal goal", Some("g-personal"))).await.unwrap();
     store.append_activity(&goal_created("a2", PERSONAL, "Legacy goal", None)).await.unwrap();
-    for goal in ["g-personal", "g-legacy"] {
-        assert_eq!(visibility::work_item_employee(h.path(), WorkItem::Goal, goal), Ok(Some(PERSONAL.to_string())));
+    assert_eq!(visibility::work_item_employee(h.path(), WorkItem::Goal, "g-personal"), Ok(Some(PERSONAL.to_string())));
+    for goal in ["g-legacy", "g-company"] {
+        assert_eq!(visibility::work_item_employee(h.path(), WorkItem::Goal, goal), Ok(None), "{goal}");
     }
-    assert_eq!(visibility::work_item_employee(h.path(), WorkItem::Goal, "g-company"), Ok(None));
     let creators = visibility::goal_creators(h.path()).unwrap();
-    assert_eq!(creators.get("g-personal").map(String::as_str), Some(PERSONAL));
-    assert!(!creators.contains_key("g-company"));
+    assert!(creators.get("g-personal").is_some_and(|agents| agents.contains(PERSONAL)));
+    assert!(!creators.contains_key("g-company") && !creators.contains_key("g-legacy"));
 
     // A non-Admin refused sees the handler's own unknown-id text.
     let mail = id_scoped("mail.read").unwrap();
@@ -274,95 +276,7 @@ async fn p1d_refusals_never_reveal_personal_ownership() {
 }
 
 // ── 10. dashboard dispatch coverage ──────────────────────────────────────
-
-/// Dispatch arms that read `agent_id` but are deliberately not gated as a
-/// Personal employee's private data, each with its reason.
-const AGENT_ID_ALLOWLIST: &[(&str, &str)] = &[
-    ("agents.status", "runtime status metadata only (state, model, activity counters); Admins get metadata"),
-    ("presets.status", "the name of the bound preset only"),
-    ("agents.avatar", "the avatar image only (also shown in every listing)"),
-    ("agents.pause", "operational control under Manager + Operator binding; reads no private data"),
-    ("agents.resume", "operational control under Manager + Operator binding; reads no private data"),
-    ("agents.update", "configuration write under the Owner binding; SOUL / CONTRACT / files are gated separately"),
-    ("agents.google_identity_get", "binding metadata (address, status); mailbox content is gated by mail.*"),
-    ("agents.google_identity_set", "configuration write under the Owner binding"),
-    ("plans.list", "optional scope: gated and filtered in the arm (`p1d_list_hidden`)"),
-];
-
-const DISPATCH_SOURCES: &[(&str, &str)] = &[
-    ("dispatch_core.rs", include_str!("dispatch_core.rs")),
-    ("dispatch_org.rs", include_str!("dispatch_org.rs")),
-    ("dispatch_knowledge.rs", include_str!("dispatch_knowledge.rs")),
-    ("dispatch_system.rs", include_str!("dispatch_system.rs")),
-    ("dispatch_ops.rs", include_str!("dispatch_ops.rs")),
-];
-
-fn reads_agent_id(code: &str) -> bool {
-    ["check_agent!(", "check_agent_filter!(", "check_agent_named!(", "check_task_board_filter!(", "\"agent_id\""]
-        .iter()
-        .any(|needle| code.contains(needle))
-}
-
-/// Every method of a top-level `match method` arm (12-space indent) whose
-/// pattern or body reads `agent_id`.
-fn agent_id_arms(source: &str) -> std::collections::BTreeSet<String> {
-    let mut found = std::collections::BTreeSet::new();
-    let mut current: Vec<String> = Vec::new();
-    let mut in_pattern = false;
-    for line in source.lines() {
-        let text = line.trim_start();
-        if text.starts_with("//") {
-            continue;
-        }
-        let indent = line.len() - text.len();
-        let starts_arm = indent == 12 && (text.starts_with('"') || text.starts_with('_'));
-        let continues = in_pattern && indent == 12 && text.starts_with('|');
-        if starts_arm || continues {
-            if starts_arm && !in_pattern {
-                current.clear();
-            }
-            let (head, body) = text.split_once("=>").unwrap_or((text, ""));
-            let head = head.split(" if ").next().unwrap_or(head);
-            current.extend(head.split('"').skip(1).step_by(2).map(str::to_owned));
-            in_pattern = !text.contains("=>");
-            if reads_agent_id(body) {
-                found.extend(current.iter().cloned());
-            }
-            continue;
-        }
-        if reads_agent_id(text) {
-            found.extend(current.iter().cloned());
-        }
-    }
-    found
-}
-
-#[test]
-fn p1d_every_dashboard_agent_id_arm_is_gated_or_allowlisted() {
-    use super::super::personal_delegation_gate::delegation_target_key;
-    let mut found = std::collections::BTreeSet::new();
-    for (_, source) in DISPATCH_SOURCES {
-        found.extend(agent_id_arms(source));
-    }
-    // The scan itself works (a broken parser would find nothing).
-    assert!(found.len() >= 50, "only {} arms found: {found:?}", found.len());
-    for method in ["memory.search", "agent_files.get", "plans.create", "agents.delegate", "playbook.list", "tasks.list"] {
-        assert!(found.contains(method), "{method} not found by the scan");
-    }
-    let missing: Vec<_> = found
-        .iter()
-        .filter(|method| {
-            let method = method.as_str();
-            agent_scoped(method).is_none()
-                && delegation_target_key(method).is_none()
-                && !AGENT_ID_ALLOWLIST.iter().any(|(name, _)| *name == method)
-        })
-        .collect();
-    assert!(missing.is_empty(), "dispatch arms reading agent_id that are neither gated nor allowlisted: {missing:?}");
-    // The allowlist stays honest: every entry is a real, ungated arm.
-    for (method, reason) in AGENT_ID_ALLOWLIST {
-        assert!(!reason.is_empty());
-        assert!(found.contains(*method), "stale allowlist entry {method}");
-        assert!(agent_scoped(method).is_none() && delegation_target_key(method).is_none(), "{method} is gated");
-    }
-}
+// P1e: replaced by `p1e_every_dashboard_arm_is_gated_or_allowlisted`
+// (`personal_p1e_tests.rs`), which classifies EVERY dispatch arm — including
+// arms whose handler reads the employee id inside — and no longer allowlists
+// the config / identity writes (`agents.update`, `agents.google_identity_set`).

@@ -196,9 +196,18 @@ impl MethodHandler {
                 Ok(f) => f,
                 Err(_) => return WsFrame::error_response("", "permission denied"),
             };
-        let (holdings, usage_error) = self.skill_holdings(&fresh, skill_name).await;
+        let (mut holdings, usage_error) = self.skill_holdings(&fresh, skill_name).await;
         if let Some(e) = usage_error {
             warn!(skill = skill_name, error = %e, "skill_assign: usage unavailable, runner falls back to the first holder");
+        }
+        // v1.81 P1d: the server never picks another person's Personal
+        // employee as the runner (delegation is owner-only, no break-glass).
+        // P1e: dropped BEFORE any refusal, so a skill held only by such an
+        // employee reads exactly like a skill nobody has (no hidden holder
+        // is revealed by a different error).
+        match self.personal_hidden_agents(&fresh).await {
+            Ok(hidden) => super::personal_p1d_gate::retain_visible(&mut holdings, &hidden, |h| h.agent_id.as_str()),
+            Err(e) => return WsFrame::error_response("", e),
         }
         if holdings.is_empty() {
             return WsFrame::error_response(
@@ -206,7 +215,6 @@ impl MethodHandler {
                 "skill_not_found: no AI employee you can see has this skill",
             );
         }
-        let mut holdings = holdings;
         if !fresh.is_admin() {
             let mut eligible = Vec::new();
             for holding in holdings {
@@ -223,15 +231,6 @@ impl MethodHandler {
             return WsFrame::error_response("", "permission denied");
         }
         holdings.retain(|h| fresh.can_assign_to(&h.agent_id));
-        // v1.81 P1d: the server never picks another person's Personal
-        // employee as the runner (delegation is owner-only, no break-glass).
-        match self.personal_hidden_agents(&fresh).await {
-            Ok(hidden) => super::personal_p1d_gate::retain_visible(&mut holdings, &hidden, |h| h.agent_id.as_str()),
-            Err(e) => return WsFrame::error_response("", e),
-        }
-        if holdings.is_empty() {
-            return WsFrame::error_response("", "permission denied");
-        }
         // Multiple chips must all be executable by the same authorized runner.
         // Inline every selected skill: goal rounds do not always load skills.
         for name in requested.iter().skip(1) {
