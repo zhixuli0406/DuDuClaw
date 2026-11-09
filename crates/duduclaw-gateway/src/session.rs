@@ -1128,30 +1128,40 @@ impl SessionManager {
     /// (`None`: nothing to clear).
     pub async fn clear_for_user(&self, session_id: &str) -> Result<Option<String>> {
         let conn = self.acquire().await;
-        let now = chrono::Utc::now();
-        let now_str = now.to_rfc3339();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
-        let already_cleared: Option<bool> = tx
-            .query_row(
-                "SELECT archived_at IS NOT NULL AND archive_reason = 'user'
-                 FROM sessions WHERE id = ?1",
-                params![session_id],
-                |row| row.get::<_, Option<bool>>(0).map(|v| v.unwrap_or(false)),
-            )
-            .optional()
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        if already_cleared != Some(false) {
-            tx.commit()
-                .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
-            return Ok(None);
-        }
-        let new_id = Self::move_to_cleared(&tx, session_id, now.timestamp_millis(), &now_str)?;
-        tx.commit()
-            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
-        info!(session_id, cleared_to = %new_id, "Session cleared by user (moved + archived)");
+        // Scope the connection guard + transaction so neither is held
+        // across the `.await` below (keeps the future `Send`).
+        let new_id = {
+            let now = chrono::Utc::now();
+            let now_str = now.to_rfc3339();
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+            let already_cleared: Option<bool> = tx
+                .query_row(
+                    "SELECT archived_at IS NOT NULL AND archive_reason = 'user'
+                     FROM sessions WHERE id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, Option<bool>>(0).map(|v| v.unwrap_or(false)),
+                )
+                .optional()
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            if already_cleared != Some(false) {
+                tx.commit()
+                    .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+                None
+            } else {
+                let new_id =
+                    Self::move_to_cleared(&tx, session_id, now.timestamp_millis(), &now_str)?;
+                tx.commit()
+                    .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+                info!(session_id, cleared_to = %new_id, "Session cleared by user (moved + archived)");
+                Some(new_id)
+            }
+        };
         drop(conn);
+        let Some(new_id) = new_id else {
+            return Ok(None);
+        };
         // RM-173 (e): schedules / reminders created in this WebChat
         // conversation report into its id, which now has no row — every run
         // would be refused. Pause (never delete) the schedules aimed at it.
