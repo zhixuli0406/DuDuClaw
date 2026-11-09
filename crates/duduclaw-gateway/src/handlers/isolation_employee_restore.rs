@@ -44,6 +44,12 @@ pub(super) const ADOPTION_FOR_OWNER: &str = "isolation.adoption_request_for_owne
 pub(super) const METHODS: [&str; 12] = [LIST_RESTORABLE, RESTORE_CHALLENGE, REQUEST_RESTORE, CANCEL_RESTORE, DECIDE, CANCEL, REGRANT,
     RETIRE_PROPOSE, REQUEST_ADOPTION, SHARED_ADOPTION_REQUEST, RESTORE_FOR_OWNER, ADOPTION_FOR_OWNER];
 
+/// F6k: `isolation.shared_restore_request` / `isolation.shared_restore_options` (`shared::METHODS`).
+#[path = "isolation_shared_restore.rs"]
+pub(super) mod shared;
+/// Every method this handler serves (F6d [`METHODS`] and F6k `shared::METHODS`).
+pub(super) fn handles(method: &str) -> bool { METHODS.contains(&method) || shared::METHODS.contains(&method) }
+
 /// `me.isolation.restore_challenge`: the row the proof will be bound to (a
 /// cancel names the row of its request). `for_adoption`: the challenge of a
 /// `request_adoption` (purpose `adopt:…`, built by the server).
@@ -172,7 +178,7 @@ impl MethodHandler {
 
     async fn isolation_restore(&self, method: &str, params: Value, ctx: &UserContext) -> Result<Value, Failure> {
         // Same gates as every other method of this handler.
-        if !METHODS.contains(&method) || ctx.user_id == "system" { return Err(NOT_ALLOWED.into()); }
+        if !handles(method) || ctx.user_id == "system" { return Err(NOT_ALLOWED.into()); }
         if ctx.requires_password_change() { return Err(REQUESTER_INELIGIBLE.into()); }
         let admin = method.starts_with("isolation.");
         if admin && (acl::require_role(ctx, UserRole::Admin).is_err() || self.mfa_require_current_admin(ctx).await.is_err()) {
@@ -372,6 +378,8 @@ impl MethodHandler {
                         &input.employee_id, input.incarnation, input.target_label.as_deref(), fresh))?)
                 }).await
             }
+            // F6k Shared restore (`isolation_shared_restore.rs`).
+            m if shared::METHODS.contains(&m) => self.shared_restore(m, params, ctx, db, session).await,
             _ => Err(NOT_ALLOWED.into()),
         }
     }

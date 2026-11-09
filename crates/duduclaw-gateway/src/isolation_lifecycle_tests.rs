@@ -697,3 +697,7 @@ mod f6d;
 /// F6h: channel bot gate and the tombstone label-store hook.
 #[path = "isolation_label_stores_lifecycle_tests.rs"]
 mod f6h;
+/// F6k: Shared restore filing, approval, route re-approval (`crate::isolation_restore_shared`).
+#[cfg(unix)]
+#[path = "isolation_restore_shared_tests.rs"]
+mod f6k;
