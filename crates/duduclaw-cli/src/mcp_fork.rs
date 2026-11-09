@@ -1431,7 +1431,12 @@ test_timeout_s = 60
             &json!({"fork_id": fork_id, "branch_id": bid}), home.path(), "a2",
         ).await;
         assert!(is_error(&denied));
-        assert!(text(&denied).contains("another agent"));
+        // P1g (F9): a foreign fork reads exactly like an unknown one.
+        assert!(text(&denied).contains(&fork_not_found(&fork_id)), "{}", text(&denied));
+        let unknown = handle_terminate_branch(
+            &json!({"fork_id": "no-such-fork", "branch_id": bid}), home.path(), "a2",
+        ).await;
+        assert_eq!(text(&denied).replace(&fork_id, "X"), text(&unknown).replace("no-such-fork", "X"));
         assert_eq!(std::fs::read_to_string(ws.join("owner-output.txt")).unwrap(), "preserved");
         assert_eq!(open_store(home.path()).unwrap().branch_workspace(&bid).unwrap(),
             Some(ws.to_string_lossy().into_owned()));

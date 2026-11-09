@@ -189,12 +189,17 @@ async fn p1d_dashboard_reads_resolve_their_employee() {
     store.append_activity(&goal_created("a1", PERSONAL, "Personal goal", Some("g-personal"))).await.unwrap();
     store.append_activity(&goal_created("a2", PERSONAL, "Legacy goal", None)).await.unwrap();
     assert_eq!(visibility::work_item_employee(h.path(), WorkItem::Goal, "g-personal"), Ok(Some(PERSONAL.to_string())));
+    // P1g (F7): PERSONAL has an unreviewed `goal_created` row (a2 links no
+    // goal), so every goal no row links is held by PERSONAL — hidden from
+    // others (fail closed) until the row is reviewed.
     for goal in ["g-legacy", "g-company"] {
-        assert_eq!(visibility::work_item_employee(h.path(), WorkItem::Goal, goal), Ok(None), "{goal}");
+        assert_eq!(visibility::work_item_employee(h.path(), WorkItem::Goal, goal), Ok(Some(PERSONAL.to_string())), "{goal}");
     }
     let creators = visibility::goal_creators(h.path()).unwrap();
     assert!(creators.get("g-personal").is_some_and(|agents| agents.contains(PERSONAL)));
-    assert!(!creators.contains_key("g-company") && !creators.contains_key("g-legacy"));
+    for goal in ["g-company", "g-legacy"] {
+        assert!(creators.get(goal).is_some_and(|agents| agents.contains(PERSONAL)), "{goal}");
+    }
 
     // A non-Admin refused sees the handler's own unknown-id text.
     let mail = id_scoped("mail.read").unwrap();

@@ -276,7 +276,7 @@ fn p1h_topology_rows_are_filtered_and_org_chart_hides() {
     // department); an ancestor of a visible employee stays a stub.
     let listable: std::collections::HashMap<&str, &str> = [(PERSONAL, "ops"), (SHARED, "ops"), ("lead", "ops")].into();
     let full = super::super::agents_list_rpc::org_chart_full(&listable, &hidden, |_, _| true);
-    assert_eq!(full, [SHARED, "lead"].into());
+    assert_eq!(full, std::collections::HashSet::<&str>::from([SHARED, "lead"]));
     let owner_full = super::super::agents_list_rpc::org_chart_full(&listable, &hidden_of(&h, &h.alice), |_, _| true);
     assert!(owner_full.contains(PERSONAL), "its owner sees it in full");
     let source = include_str!("agents_list_rpc.rs");
