@@ -71,13 +71,13 @@ class LinuxReleaseTests(unittest.TestCase):
 
     def test_legacy_exact_size_boundary_and_empty_files(self):
         binary = self.binaries / "duduclaw"
-        for size in (0, PACKAGE.LEGACY_BINARY_LIMIT, PACKAGE.LEGACY_BINARY_LIMIT + 1):
+        for size in (0, PACKAGE.MAX_BINARY_BYTES, PACKAGE.MAX_BINARY_BYTES + 1):
             with binary.open("wb") as output:
                 output.truncate(size)
             with self.assertRaises(ValueError):
                 PACKAGE.validate_binary(binary)
         with binary.open("wb") as output:
-            output.truncate(PACKAGE.LEGACY_BINARY_LIMIT - 1)
+            output.truncate(PACKAGE.MAX_BINARY_BYTES - 1)
         PACKAGE.validate_binary(binary)
 
     def test_symlink_hardlink_and_nonexecutable_refused(self):

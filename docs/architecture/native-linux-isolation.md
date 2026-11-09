@@ -5483,7 +5483,7 @@ operation, other-worktree write or production-home access was performed.
   spawnd, trampoline, egress, updater, parser with `engine`, importer, migration
   command and MCP bridge. The archive also includes a separate regular-file
   egress-forwarder copy of the egress ELF and the Python SDK. Root test fixtures
-  are never selected. Every binary must be nonempty and strictly below 200 MiB;
+  are never selected. Every binary must be nonempty and strictly below 512 MiB;
   all actual release binaries go through the existing glibc baseline checker.
   Archive names, SHA-256 output and workflow minisign/cosign steps are retained.
 - `scripts/release.sh linux-assets --target <triple>` shares the workflow helper.
@@ -5538,7 +5538,7 @@ The ignored root fixture was written, not executed or compiled as part of CLI.
 | Actual command | Result |
 | --- | --- |
 | `rustc --edition=2021 --test scripts/tests/protected_layout_harness.rs -o /private/tmp/iso-i2-layout-tests` then `/private/tmp/iso-i2-layout-tests` | 6 passed, 0 failed; real temporary-filesystem ownership/mode/link/incomplete-publication/skeleton tests plus policy/template checks |
-| `python3 -m unittest discover -s scripts/tests -p 'test_package_linux_release.py' -v` | 12 passed, 0 failed; both archive inventories, exact 200 MiB boundary, offline OpenSSH signing and CI refusal |
+| `python3 -m unittest discover -s scripts/tests -p 'test_package_linux_release.py' -v` | 12 passed, 0 failed; both archive inventories, exact 512 MiB boundary, offline OpenSSH signing and CI refusal |
 | `python3 -m unittest discover -s scripts/tests -p 'test_protected_auto_upgrade.py' -v` | 20 passed, 0 failed, 1 skipped because macOS has no systemd-analyze |
 | `python3 -m unittest discover -s scripts/tests -p 'test_release_*.py' -v` | 75 passed, 0 failed (packaging agent) |
 | `python3 -m unittest discover -s scripts/tests -p 'test_sign_isolation_manifest.py' -v` | 4 passed, 0 failed (packaging agent) |

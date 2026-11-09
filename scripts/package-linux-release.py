@@ -52,7 +52,8 @@ ARCHIVE_ALIASES = {
     "duduclaw-egress-forwarder": "duduclaw-egress",
     "duduclaw-updated-launch": "duduclaw-updated",
 }
-LEGACY_BINARY_LIMIT = 200 * 1024 * 1024
+# Kept below the generic updater's 768 MiB cap (duduclaw-gateway updater.rs).
+MAX_BINARY_BYTES = 512 * 1024 * 1024
 
 
 def workspace_version():
@@ -92,8 +93,10 @@ def validate_binary(path):
     if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
             or not metadata.st_mode & 0o111):
         raise ValueError(f"expected executable regular file with one link: {path.name}")
-    if not 0 < metadata.st_size < LEGACY_BINARY_LIMIT:
-        raise ValueError(f"binary must be nonempty and smaller than 200 MiB: {path.name}")
+    if not 0 < metadata.st_size < MAX_BINARY_BYTES:
+        raise ValueError(
+            f"binary {path.name} is {metadata.st_size} bytes; must be nonempty and "
+            f"smaller than {MAX_BINARY_BYTES // (1024 * 1024)} MiB ({MAX_BINARY_BYTES} bytes)")
 
 
 def stage_cargo_binary(source, destination):

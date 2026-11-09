@@ -4,6 +4,9 @@ use duduclaw_isolation::{ids::Sha256Digest, update::*};
 use sha2::{Digest, Sha256};
 use crate::{Error, Result};
 
+/// Kept below the generic updater's 768 MiB cap; bounds a staged artifact.
+const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
 pub fn artifact_name(target: &InstallTarget) -> Result<String> {
     Ok(match target {
         InstallTarget::Gateway => "duduclaw".into(),
@@ -39,13 +42,13 @@ pub fn validate_bootstrap_manifest(manifest: &ReleaseManifest, arch: Architectur
         if let InstallTarget::RuntimeEntry { registry_id } = &artifact.install_target {
             artifact_name(&artifact.install_target)?;
             let mode = if registry_id == "isolation-policy-v1" { 0o444 } else { 0o755 };
-            if artifact.mode != mode || artifact.size_bytes == 0 || artifact.size_bytes >= 200 * 1024 * 1024
+            if artifact.mode != mode || artifact.size_bytes == 0 || artifact.size_bytes >= MAX_ARTIFACT_BYTES
                 || registry_id == "isolation-policy-v1" && artifact.size_bytes > 1024 * 1024 { return Err(Error::Incompatible); }
         }
     }
     for target in required {
         if !manifest.artifacts.iter().any(|artifact| artifact.install_target == target
-            && artifact.mode == 0o755 && artifact.size_bytes > 0 && artifact.size_bytes < 200 * 1024 * 1024) {
+            && artifact.mode == 0o755 && artifact.size_bytes > 0 && artifact.size_bytes < MAX_ARTIFACT_BYTES) {
             return Err(Error::Incompatible);
         }
     }
@@ -98,7 +101,7 @@ pub(crate) mod tests {
                 let mut bad = good.clone(); bad.artifacts[index].mode = mode;
                 assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
             }
-            let mut bad = good.clone(); bad.artifacts[index].size_bytes = 200 * 1024 * 1024;
+            let mut bad = good.clone(); bad.artifacts[index].size_bytes = MAX_ARTIFACT_BYTES;
             assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
         }
         let mut bad = good; bad.protocols.importer = 2;
