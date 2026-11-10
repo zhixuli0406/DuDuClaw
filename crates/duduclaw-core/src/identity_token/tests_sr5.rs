@@ -22,7 +22,8 @@ fn private(path: &Path, mode: u32) {
 /// A home with the employee index holding `ROOT` (live unless `disabled`)
 /// and the identity key, and an ephemeral child `CHILD` of `ROOT`.
 fn home(disabled: bool) -> tempfile::TempDir {
-    let home = tempfile::tempdir().unwrap();
+    // Symlink-free root: the NOFOLLOW open refuses macOS's `/var` symlink.
+    let home = real_tempdir();
     let dir = home.path().join(APPLY_DB_DIR);
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join(APPLY_DB_FILE);

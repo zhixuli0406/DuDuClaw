@@ -18,7 +18,15 @@ const LOGIN_SESSION_ENV: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO",
 ];
 const TERMINAL_RETENTION: Duration = Duration::from_secs(300);
-type Master = Arc<Mutex<Box<dyn MasterPty + Send>>>;
+/// The PTY master. `None` once the Windows supervisor has closed the
+/// pseudoconsole after the child exited (see `start_pty`); Unix never clears it.
+type Master = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
+/// Windows only: how long the supervisor waits for the ConPTY output pipe to
+/// reach EOF after it closed the pseudoconsole, before it reports the outcome
+/// anyway. Closing should complete promptly because the reader thread keeps
+/// draining; this bound only guarantees `wait`/`kill` can never hang on it.
+#[cfg(windows)]
+const CONPTY_CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 struct Entry {
     employee: EmployeeId,
@@ -340,7 +348,9 @@ impl ExecutionBackend for LocalBackend {
             let master = self.runs.lock().map_err(|_| BackendError::Unavailable)?
                 .get(&run.0).ok_or(BackendError::NotFound)?.master.clone()
                 .ok_or(BackendError::Denied)?;
-            master.lock().map_err(|_| BackendError::Unavailable)?.resize(pty_size(size))
+            let guard = master.lock().map_err(|_| BackendError::Unavailable)?;
+            // `None`: the Windows pseudoconsole was already closed after exit.
+            guard.as_ref().ok_or(BackendError::Denied)?.resize(pty_size(size))
                 .map_err(|_| BackendError::Io)
         })
     }
@@ -547,7 +557,11 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
     let pid = child.process_id();
     entry.pid = pid;
     let mut killer = child.clone_killer();
-    let master = Arc::new(Mutex::new(pair.master));
+    let master = Arc::new(Mutex::new(Some(pair.master)));
+    // Windows: the supervisor closes the pseudoconsole once the child is gone
+    // (see below), so it keeps its own handle to the shared master slot.
+    #[cfg(windows)]
+    let console = master.clone();
     entry.master = Some(master);
     let (cancel, mut cancelled) = mpsc::channel(1);
     entry.cancel = Some(cancel.clone());
@@ -571,11 +585,24 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
                     // Unix PTYs commonly report EIO when the last slave closes.
                     #[cfg(unix)]
                     if _error.raw_os_error() == Some(libc::EIO) { break; }
+                    // ConPTY's equivalent: the output pipe reports a broken
+                    // pipe once the pseudoconsole has been closed.
+                    #[cfg(windows)]
+                    if _error.kind() == std::io::ErrorKind::BrokenPipe { break; }
                     let _ = read_tx.try_send(Err(BackendError::Io));
                     break;
                 },
             }
         }
+        // Windows: ClosePseudoConsole may block until conhost has written its
+        // final output, and the master still holds its own read handle, so the
+        // output pipe must keep being drained while the supervisor closes it.
+        // When forwarding stopped early (cancel, output budget, receiver gone)
+        // keep reading and discard until the pipe reports EOF / an error,
+        // which happens once the pseudoconsole is closed. After a real EOF or
+        // error the next read returns immediately, so this is a no-op there.
+        #[cfg(windows)]
+        while matches!(reader.read(&mut buffer), Ok(count) if count > 0) {}
         let _ = read_done.send(());
     });
     let (write_tx, mut write_rx) = mpsc::channel::<PtyWrite>(16);
@@ -632,6 +659,31 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
         };
         group.disarm();
         teardown.disarm();
+        // Windows ConPTY: unlike a Unix PTY (EIO once the last slave closes),
+        // the output pipe never reaches EOF while the pseudoconsole exists,
+        // even after the child has exited. The master lives in the backend
+        // entry, so without closing it here the wait below never finishes —
+        // and after a cancel (already consumed by the select above) with no
+        // runtime deadline, `kill`/`wait` hung forever. The child is reaped at
+        // this point, so close the pseudoconsole now: off the async runtime,
+        // because ClosePseudoConsole can block while conhost flushes, and
+        // outside the master lock so a concurrent `resize` is not held up.
+        // The reader thread keeps draining the pipe meanwhile (and, after a
+        // natural exit, still forwards the final output to the consumer).
+        #[cfg(windows)]
+        {
+            drop(tokio::task::spawn_blocking(move || {
+                let closing = console.lock().ok().and_then(|mut slot| slot.take());
+                drop(closing);
+            }));
+        }
+        // Defense in depth: bound the Windows wait for the output EOF so a
+        // stalled close can never wedge `kill`/`wait`. Unix is unchanged.
+        #[cfg(windows)]
+        let close_grace = tokio::time::sleep(CONPTY_CLOSE_GRACE);
+        #[cfg(not(windows))]
+        let close_grace = std::future::pending::<()>();
+        tokio::pin!(close_grace);
         tokio::select! {
             _ = read_completion => {},
             reason = cancelled.recv() => {
@@ -642,6 +694,7 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
                 budget.stopping.store(true, Ordering::Release);
                 outcome = RunOutcome::RuntimeTimeout;
             },
+            _ = &mut close_grace => {},
         }
         let outcome = if budget.exceeded.load(Ordering::Acquire) { RunOutcome::Rejected } else { outcome };
         completion.send_replace(Some(outcome));

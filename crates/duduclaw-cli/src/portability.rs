@@ -1476,6 +1476,24 @@ mod protected_import_tests {
         rusqlite::Connection::open(path).unwrap().execute_batch(sql).unwrap();
     }
 
+    /// A temp root with no symlinked path component. The isolation inspection
+    /// (`backup_restore_isolation::open`) opens the extracted databases with
+    /// `SQLITE_OPEN_NOFOLLOW`, which SQLite applies to EVERY component of the
+    /// path; on macOS the system temp dir sits under `/var -> /private/var`, so
+    /// a plain `tempfile::tempdir()` made every database read "unknown". In
+    /// production the inspection directory is created inside the real home
+    /// (`tempdir_in(home)`), never under the system temp dir.
+    fn real_tempdir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        {
+            tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            tempfile::tempdir().unwrap()
+        }
+    }
+
     /// `source` exported to an archive; returns the archive path.
     fn archive_of(root: &Path, source: &Path) -> PathBuf {
         let archive = root.join("input.tar.gz");
@@ -1560,7 +1578,7 @@ mod protected_import_tests {
                 "CREATE TABLE migration_proposals(id TEXT); INSERT INTO migration_proposals VALUES('p');")),
         ];
         for (name, plant) in plants {
-            let root = tempfile::tempdir().unwrap();
+            let root = real_tempdir();
             let source = root.path().join("source");
             write(&source.join("agents/dudu/SOUL.md"), b"soul");
             plant(&source);
@@ -1574,7 +1592,7 @@ mod protected_import_tests {
 
     #[test]
     fn protected_import_single_binary_unreadable_state_fails_closed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = real_tempdir();
         let source = root.path().join("source");
         write(&source.join("migration-confirmations.db"), b"not a SQLite database");
         let archive = archive_of(root.path(), &source);
@@ -1586,7 +1604,7 @@ mod protected_import_tests {
 
     #[test]
     fn protected_import_single_binary_accepts_ordinary_home() {
-        let root = tempfile::tempdir().unwrap();
+        let root = real_tempdir();
         let source = root.path().join("source");
         write(&source.join("agents/dudu/SOUL.md"), b"soul");
         db(&source.join("users.db"), "CREATE TABLE users(id TEXT); INSERT INTO users VALUES('u1');
@@ -1601,7 +1619,7 @@ mod protected_import_tests {
 
     #[test]
     fn protected_import_single_binary_end_to_end_refuses_before_publishing() {
-        let root = tempfile::tempdir().unwrap();
+        let root = real_tempdir();
         let source = root.path().join("source");
         write(&source.join("agents/new/SOUL.md"), b"new");
         write(&source.join("isolation-connectors.db"), b"");
