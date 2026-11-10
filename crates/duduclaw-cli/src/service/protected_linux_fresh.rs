@@ -106,7 +106,7 @@ fn marker_state(root: &Path, owner: (u32, u32)) -> Marker {
         return Marker::Invalid;
     }
     let mut bytes = Vec::new();
-    if file.by_ref().take(129).read_to_end(&mut bytes).is_err() || bytes != FRESH_PENDING_TEXT {
+    if std::io::Read::by_ref(&mut file).take(129).read_to_end(&mut bytes).is_err() || bytes != FRESH_PENDING_TEXT {
         return Marker::Invalid;
     }
     Marker::Valid
