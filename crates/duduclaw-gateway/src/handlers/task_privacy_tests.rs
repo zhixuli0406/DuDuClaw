@@ -571,6 +571,96 @@ async fn machine_preset_revokes_old_owner_reads_without_deleting_bindings() {
     assert_eq!(stored.agent_access.get("sales"), Some(&AccessLevel::Owner));
 }
 
+/// RM-173: `chat.sessions.restore` (a write) is never reachable by a
+/// connection-scoped or shared-token context in a state where
+/// `chat.sessions.list` for the same agent is refused: revoked binding,
+/// suspended account, machine-employee preset. The shared-token `system`
+/// context gets exactly what it gets for the list.
+#[tokio::test]
+async fn rm173_scoped_contexts_cannot_restore_beyond_what_they_can_list() {
+    let f = fixture().await;
+    let sm = std::sync::Arc::new(
+        crate::session::SessionManager::new(&f.home.join("sessions.db")).unwrap(),
+    );
+    let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
+        duduclaw_agent::AgentRegistry::new(f.home.join("agents")),
+    ));
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    f.handler
+        .set_reply_ctx(std::sync::Arc::new(crate::channel_reply::ReplyContext::new(
+            registry,
+            f.home.clone(),
+            sm.clone(),
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            tx,
+        )))
+        .await;
+    let id = "webchat:webchat:alice:c1";
+    sm.get_or_create_with_origin(
+        id,
+        "sales",
+        &crate::session_origin::SessionOrigin::webchat_user(&f.alice.user_id),
+    )
+    .await
+    .unwrap();
+    sm.append_message(id, "user", "hello", 1).await.unwrap();
+    async fn archive(sm: &crate::session::SessionManager, id: &str) {
+        sm.acquire()
+            .await
+            .execute(
+                "UPDATE sessions SET archived_at=?2, archive_reason='retention' WHERE id=?1",
+                rusqlite::params![id, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+    }
+    let handler = &f.handler;
+    let list = |ctx: UserContext| async move {
+        ok(&handler.handle("chat.sessions.list", json!({"agent_id":"sales","archived":true}), &ctx).await)
+    };
+    let restore = |ctx: UserContext| async move {
+        ok(&handler.handle("chat.sessions.restore", json!({"session_id": id}), &ctx).await)
+    };
+    archive(&sm, id).await;
+    // The connection-scoped context, captured while it was fully authorized.
+    let connection = f.db.live_user_context(&f.alice.user_id).unwrap().unwrap();
+
+    // Binding revoked after the connection authenticated.
+    f.db.unbind_agent(&f.alice.user_id, "sales").unwrap();
+    assert!(!list(connection.clone()).await);
+    assert!(!restore(connection.clone()).await);
+    assert!(sm.archived_at(id).await.unwrap().is_some());
+    // Re-granted: both are allowed again (the same gate, not a blanket refusal).
+    f.db.bind_agent(&f.alice.user_id, "sales", AccessLevel::Operator).unwrap();
+    assert!(list(connection.clone()).await);
+    assert!(restore(connection.clone()).await);
+    assert!(sm.archived_at(id).await.unwrap().is_none());
+    archive(&sm, id).await;
+
+    // Suspended account.
+    f.db.set_user_status(&f.alice.user_id, UserStatus::Suspended).unwrap();
+    assert!(!list(connection.clone()).await);
+    assert!(!restore(connection.clone()).await);
+    assert!(sm.archived_at(id).await.unwrap().is_some());
+    f.db.set_user_status(&f.alice.user_id, UserStatus::Active).unwrap();
+
+    // Machine-employee preset: the old owner loses history reads.
+    f.db.bind_agent(&f.alice.user_id, "sales", AccessLevel::Owner).unwrap();
+    duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+    duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+        "system-operator", "test", "test").unwrap();
+    let owner = f.db.live_user_context(&f.alice.user_id).unwrap().unwrap();
+    for ctx in [connection.clone(), owner] {
+        assert!(!list(ctx.clone()).await);
+        assert!(!restore(ctx).await);
+    }
+    assert!(sm.archived_at(id).await.unwrap().is_some());
+
+    // Shared-token `system` context: restore iff list.
+    let system = UserContext::admin_fallback();
+    let may_list = list(system.clone()).await;
+    assert_eq!(restore(system).await, may_list);
+}
+
 #[tokio::test]
 async fn machine_preset_removes_manager_monitoring_grants() {
     let f = fixture().await;

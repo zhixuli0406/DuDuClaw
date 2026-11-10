@@ -209,6 +209,23 @@ impl SessionManager {
             .unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
 
+        // RM-173: a user clear left at its original id
+        // (`STUCK_USER_CLEAR`) is neither content to carry over (it was
+        // cleared) nor a conversation to write into.
+        let stuck: bool = tx
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id IN (?1, ?2) AND {})",
+                    crate::session::STUCK_USER_CLEAR
+                ),
+                params![source_id, target_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| DuDuClawError::Gateway(format!("handoff read: {e}")))?;
+        if stuck {
+            return Ok(HandoffDecision::NothingToHandoff);
+        }
+
         // Source conversation state (visible = not hidden, not undone).
         let rows: Vec<(String, String, i64, String)> = {
             let mut stmt = tx

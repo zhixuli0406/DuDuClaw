@@ -2119,6 +2119,7 @@ dependencies = [
 name = "duduclaw-import"
 version = "1.80.1"
 dependencies = [
+ "duduclaw-core",
  "duduclaw-isolation",
  "libc",
  "rusqlite",

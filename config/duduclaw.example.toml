@@ -78,6 +78,18 @@ port = 18889
 # inference_mode = "hybrid"    # local | claude | hybrid — whether local models run at all
 # name = "DuDuClaw"            # Device name broadcast over mDNS on the LAN
 
+# ── Conversation retention (v1.81.0, RM-173) ─────────────────
+# Dashboard: User Management → Organisation settings (Admin). Both keys are
+# protected: changing them from the raw editor is audited. Re-read every 6 h.
+# Archived (收起) conversations disappear from the normal list but stay
+# searchable/restorable; any new message in one brings it back automatically.
+# Purge deletes the messages, summary, title and pinned notes for good.
+# Any doubt (unreadable config, invalid value) keeps data: archive with the
+# default and never purge.
+# [sessions]
+# archive_after_days = 30   # Days with no activity before archiving; 0 = never archive (max 3650)
+# purge_after_days = 0      # Days after archiving before deletion; 0 = never delete (max 3650)
+
 # ── Dashboard navigation ────────────────────────────────────
 # Employee task navigation is hidden by default on non-Personal editions.
 # This affects dashboard navigation only; routes and RPC permissions stay unchanged.

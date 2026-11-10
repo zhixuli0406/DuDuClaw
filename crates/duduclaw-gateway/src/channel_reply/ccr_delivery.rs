@@ -66,11 +66,26 @@ pub(super) async fn webchat_commit_allowed(agent: &str) -> bool {
     true
 }
 
+/// Persist the turn's assistant reply, bound to the session row the turn
+/// started in (`generation`, see `SessionManager::turn_generation`). When a
+/// user cleared that conversation during the turn the write is dropped
+/// (`session::is_cleared_during_turn`); a WebChat turn is then refused as a
+/// whole, so the staged-row fallback (`GuardedReply::persist_webchat`) cannot
+/// write the reply into the fresh conversation either.
 pub(super) async fn append_turn_assistant(
-    sessions: &SessionManager, sid: &str, text: &str, tokens: u32,
+    sessions: &SessionManager, sid: &str, text: &str, tokens: u32, generation: Option<&str>,
 ) -> duduclaw_core::error::Result<i64> {
     let pending = WEBCHAT_TURN_DELIVERY.try_with(|_| ()).is_ok();
-    sessions.append_delivery_message(sid, "assistant", text, tokens, None, pending).await
+    let result = sessions
+        .append_delivery_message_in(sid, "assistant", text, tokens, None, pending, generation)
+        .await;
+    if let Err(e) = &result {
+        if crate::session::is_cleared_during_turn(e) {
+            let _ = WEBCHAT_TURN_DELIVERY
+                .try_with(|turn| turn.refused.store(true, std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+    result
 }
 
 /// Per-turn record of everything that must not outlive a refused CCR delivery.
@@ -85,6 +100,10 @@ pub(crate) struct CcrTurnDelivery {
     /// (send finished) or as soon as a recheck loses the lease, whichever
     /// comes first — never twice.
     pub(super) settled: std::sync::atomic::AtomicBool,
+    /// RM-173: the turn generation (`created_at` of the session row the turn
+    /// started in), recorded once the turn ensured its session. `None`: not
+    /// recorded (an early reply path) — writes are then unbound as before.
+    pub(super) turn_generation: std::sync::Mutex<Option<String>>,
     cleanup: Option<DeliveryCleanup>,
     published: std::sync::atomic::AtomicBool,
 }
@@ -101,6 +120,7 @@ impl Default for CcrTurnDelivery {
             assistant_message: Default::default(),
             waiters: Default::default(),
             settled: Default::default(),
+            turn_generation: Default::default(),
             cleanup: DELIVERY_CLEANUP.try_with(Clone::clone).ok(),
             published: Default::default(),
         }
@@ -230,6 +250,18 @@ pub(super) fn record_turn_assistant_message(session_id: &str, message_id: i64) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((session_id.to_owned(), message_id));
+    });
+}
+
+/// RM-173: remember the turn generation so a later staged-reply write
+/// (`GuardedReply::persist_webchat`) is bound to the row the turn started
+/// in. No-op outside a guarded reply.
+pub(super) fn record_turn_generation(generation: Option<&str>) {
+    let _ = CCR_TURN_DELIVERY.try_with(|delivery| {
+        *delivery
+            .turn_generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = generation.map(str::to_owned);
     });
 }
 
@@ -498,7 +530,14 @@ impl GuardedReply {
             Some((stored_sid, _)) if stored_sid == sid => {}
             Some(_) => { self.refuse_delivery(); return Err(()); }
             None => {
-                let id = sessions.append_delivery_message(sid, "assistant", text, 0, None, true).await
+                // RM-173: bound to the row the turn started in, like the
+                // pipeline's own append — a `/new` during the turn drops
+                // this write instead of landing it in the fresh conversation.
+                let generation = rollback.delivery.turn_generation.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                let id = sessions
+                    .append_delivery_message_in(sid, "assistant", text, 0, None, true, generation.as_deref())
+                    .await
                     .map_err(|error| {
                         warn!(session_id = sid, %error, "WebChat durable reply commit failed");
                         self.refuse_delivery();

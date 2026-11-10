@@ -3461,9 +3461,14 @@ async fn append_subagent_reply_to_parent_session_with(
         // owner matches either the direct parent OR the chain root.
         // Direct match wins if both are available for the same session.
         for sid in &candidates {
+            // RM-173: a user clear left at its original id
+            // (`STUCK_USER_CLEAR`) is not a live conversation — skip it.
             let existing: Option<String> = conn
                 .query_row(
-                    "SELECT agent_id FROM sessions WHERE id = ?1",
+                    &format!(
+                        "SELECT agent_id FROM sessions WHERE id = ?1 AND NOT {}",
+                        crate::session::STUCK_USER_CLEAR
+                    ),
                     rusqlite::params![sid],
                     |row| row.get(0),
                 )
@@ -3505,8 +3510,13 @@ async fn append_subagent_reply_to_parent_session_with(
             .map_err(|e| format!("insert session_messages: {e}"))?;
 
             conn.execute(
-                "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2 \
-                 WHERE id = ?3",
+                // RM-173: a new message lifts a retention archive (never a
+                // user clear).
+                &format!(
+                    "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2, \
+                     {} WHERE id = ?3",
+                    crate::session::UNARCHIVE_ON_ACTIVITY
+                ),
                 rusqlite::params![tokens, now, sid],
             )
             .map_err(|e| format!("update sessions: {e}"))?;

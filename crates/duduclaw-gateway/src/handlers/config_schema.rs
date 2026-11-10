@@ -264,6 +264,9 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("account_loading", "inherit_host_credentials", Bool),
     ("goal_defaults", "baseline_boundary", Str),
     ("task_board", "review_wip_limit", UInt),
+    // RM-173 — range (0..=3650) checked by `session_retention::validate_table`.
+    ("sessions", "archive_after_days", UInt),
+    ("sessions", "purge_after_days", UInt),
 ];
 
 /// Check every listed key that is present. `text` is the file the table was

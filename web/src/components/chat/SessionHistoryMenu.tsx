@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { History, RefreshCw } from 'lucide-react';
+import { Archive, History, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/mds';
 import { timeAgo } from '@/lib/format';
 import { api, type ChatSessionSummary } from '@/lib/api';
@@ -35,9 +35,13 @@ export function SessionHistoryMenu({
 }) {
   const intl = useIntl();
   const [open, setOpen] = useState(false);
+  // RM-173: 「已收起的對話」 — the caller's archived conversations, restorable.
+  const [archived, setArchived] = useState(false);
+  const [restoring, setRestoring] = useState<string | null>(null);
+  const [restoreError, setRestoreError] = useState(false);
   const subject = useAuthStore(conversationIdentityKey);
   const userStatus = useAuthStore((s) => s.user?.status);
-  const key = JSON.stringify([subject, agentId, open]);
+  const key = JSON.stringify([subject, agentId, open, archived]);
   const currentKey = useRef(key);
   currentKey.current = key;
   const epoch = useRef(0);
@@ -57,21 +61,41 @@ export function SessionHistoryMenu({
       return;
     }
     setListing({ key, state: 'loading', sessions: [] });
+    setRestoreError(false);
     try {
       const res = await api.chatSessions.list({
         ...(agentId ? { agent_id: agentId } : {}), limit: 50,
+        ...(archived ? { archived: true } : {}),
       });
       if (isCurrent()) setListing({ key, state: 'ready', sessions: res?.sessions ?? [] });
     } catch {
       if (isCurrent()) setListing({ key, state: 'error', sessions: [] });
     }
-  }, [agentId, key, open, userStatus]);
+  }, [agentId, archived, key, open, userStatus]);
 
   useEffect(() => {
     if (open) void load();
-    else setListing(null);
+    else { setListing(null); setArchived(false); }
     return () => { ++epoch.current; };
   }, [open, load]);
+
+  const restore = async (s: ChatSessionSummary) => {
+    if (restoring) return;
+    const restoringKey = key;
+    setRestoring(s.session_id);
+    setRestoreError(false);
+    try {
+      await api.chatSessions.restore(s.session_id);
+      if (restoringKey !== currentKey.current) return;
+      setListing((current) => current && current.key === restoringKey
+        ? { ...current, sessions: current.sessions.filter((row) => row.session_id !== s.session_id) }
+        : current);
+    } catch {
+      if (restoringKey === currentKey.current) setRestoreError(true);
+    } finally {
+      setRestoring(null);
+    }
+  };
 
   // Dismiss on outside click / Escape.
   useDismissable(rootRef, open, () => setOpen(false));
@@ -104,18 +128,41 @@ export function SessionHistoryMenu({
         >
           <div className="flex items-center justify-between border-b border-surface-border px-3 py-2">
             <span className="text-sm font-semibold text-foreground">
-              {intl.formatMessage({ id: 'webchat.history.title', defaultMessage: '歷史對話' })}
+              {archived
+                ? intl.formatMessage({ id: 'webchat.history.archivedTitle', defaultMessage: '已收起的對話' })
+                : intl.formatMessage({ id: 'webchat.history.title', defaultMessage: '歷史對話' })}
             </span>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={() => void load()}
-              disabled={state === 'loading'}
-              title={intl.formatMessage({ id: 'webchat.history.reload', defaultMessage: '重新整理' })}
-            >
-              <RefreshCw />
-            </Button>
+            <div className="flex items-center gap-1">
+              <Button
+                variant={archived ? 'secondary' : 'ghost'}
+                size="sm"
+                aria-pressed={archived}
+                onClick={() => setArchived((v) => !v)}
+              >
+                <Archive />
+                {intl.formatMessage({ id: 'webchat.history.archivedToggle', defaultMessage: '已收起的對話' })}
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => void load()}
+                disabled={state === 'loading'}
+                title={intl.formatMessage({ id: 'webchat.history.reload', defaultMessage: '重新整理' })}
+              >
+                <RefreshCw />
+              </Button>
+            </div>
           </div>
+          {archived && (
+            <p className="border-b border-surface-border px-3 py-1.5 text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'webchat.history.archivedHint', defaultMessage: '還原後會回到歷史對話清單。' })}
+            </p>
+          )}
+          {restoreError && (
+            <p role="alert" className="px-3 pt-2 text-xs text-destructive">
+              {intl.formatMessage({ id: 'webchat.history.restoreFailed', defaultMessage: '無法還原這段對話' })}
+            </p>
+          )}
 
           <div className="max-h-80 overflow-y-auto p-1.5">
             {state === 'loading' && (
@@ -145,14 +192,54 @@ export function SessionHistoryMenu({
 
             {state === 'ready' && sessions.length === 0 && (
               <div className="px-3 py-6 text-center text-sm text-muted-foreground">
-                {intl.formatMessage({
-                  id: 'webchat.history.empty',
-                  defaultMessage: '尚無歷史對話',
-                })}
+                {archived
+                  ? intl.formatMessage({ id: 'webchat.history.archivedEmpty', defaultMessage: '沒有已收起的對話' })
+                  : intl.formatMessage({
+                    id: 'webchat.history.empty',
+                    defaultMessage: '尚無歷史對話',
+                  })}
               </div>
             )}
 
-            {state === 'ready' &&
+            {state === 'ready' && archived &&
+              sessions.map((s) => {
+                const label = (s.read_only ? intl.formatMessage({ id: 'boundHistory.label' }) : s.title?.trim()) ||
+                  intl.formatMessage({ id: 'webchat.history.untitled', defaultMessage: '（無標題）' });
+                return (
+                  <div
+                    key={s.session_id}
+                    className="flex items-center gap-2 rounded-lg px-2.5 py-2"
+                  >
+                    <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="truncate text-sm text-foreground">{label}</span>
+                      <span className="flex items-center gap-1.5 text-xs tabular-nums text-muted-foreground">
+                        <span>{timeAgo(s.last_active)}</span>
+                        {/* RM-173: the caller cleared it (`/new`), not the inactivity rule. */}
+                        {s.archive_reason === 'user' && (
+                          <>
+                            <span aria-hidden>·</span>
+                            <span>{intl.formatMessage({ id: 'webchat.history.clearedByUser', defaultMessage: '已清除' })}</span>
+                          </>
+                        )}
+                      </span>
+                    </span>
+                    {/* Read-only (masked external) conversations are not the caller's to restore. */}
+                    {!s.read_only && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={restoring !== null}
+                        aria-label={`${intl.formatMessage({ id: 'webchat.history.restore', defaultMessage: '還原' })} ${label}`}
+                        onClick={() => void restore(s)}
+                      >
+                        {intl.formatMessage({ id: 'webchat.history.restore', defaultMessage: '還原' })}
+                      </Button>
+                    )}
+                  </div>
+                );
+              })}
+
+            {state === 'ready' && !archived &&
               sessions.map((s) => {
                 const active = s.session_id === activeSessionId;
                 return (

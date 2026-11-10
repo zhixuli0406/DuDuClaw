@@ -89,45 +89,22 @@ impl MethodHandler {
             return Err("嘗試次數過多，請稍後再試。".into());
         }
 
-        // Fresh step-up: live Admin + the caller's own current password, for
-        // the credential epoch this session was issued under.
-        // An admin with MFA active must also present a TOTP / recovery code
-        // (RM-166 N1), verified like `mfa.disable` does; no MFA: password only.
+        // Fresh step-up: live Admin + the caller's own current password (and
+        // the second factor when MFA is active) — see `admin_step_up`.
         let code = params
             .get("code")
             .and_then(Value::as_str)
             .map(|c| c.trim().to_owned())
             .filter(|c| !c.is_empty() && c.len() <= 64);
-        let (id, epoch, step_db, home) =
-            (ctx.user_id.clone(), ctx.credential_epoch, db.clone(), self.home_dir.clone());
-        // Err((message, failed_step)): `failed_step` is Some for a failed
-        // credential check (audited), None for a refusal that is not a failure.
-        let step_up = tokio::task::spawn_blocking(move || -> Result<&'static str, (String, Option<&'static str>)> {
-            crate::mfa::require_admin(&step_db, &id).map_err(|e| (e, None))?;
-            let user = step_db
-                .get_user(&id)
-                .map_err(|e| (e, None))?
-                .ok_or(("無法讀取帳號資料。".to_string(), None))?;
-            let verified = step_db
-                .verify_password(&user.email, &password)
-                .map_err(|_| (STEP_UP_FAILED.to_string(), Some("password")))?;
-            if verified.id != id || verified.credential_epoch != epoch {
-                return Err(("登入憑證已失效，請重新登入。".into(), None));
-            }
-            if !step_db.mfa_active(&id).map_err(|e| (e, None))? {
-                return Ok("password");
-            }
-            let Some(code) = code else {
-                return Err((MFA_CODE_REQUIRED.to_string(), None));
-            };
-            let now = chrono::Utc::now().timestamp();
-            step_db
-                .mfa_step_up_verify(&id, &code, &crate::mfa::Cipher(&home), now)
-                .map_err(|_| (STEP_UP_FAILED_MFA.to_string(), Some("mfa")))?;
-            Ok("password+mfa")
-        })
-        .await
-        .map_err(|_| "身分確認暫時無法進行，請稍後再試。".to_string())?;
+        let step_up = admin_step_up(
+            &self.home_dir,
+            &db,
+            ctx,
+            password,
+            code,
+            StepUpCopy { failed_password: STEP_UP_FAILED, failed_mfa: STEP_UP_FAILED_MFA },
+        )
+        .await;
         let step_up = match step_up {
             Ok(kind) => kind,
             Err((message, failed_step)) => {
@@ -220,6 +197,63 @@ impl MethodHandler {
             "identity_token": identity_transition::status_json(&self.home_dir),
         }))
     }
+}
+
+/// User-facing refusal copy for a failed step-up factor (the caller names
+/// what was NOT changed).
+pub(crate) struct StepUpCopy {
+    pub failed_password: &'static str,
+    pub failed_mfa: &'static str,
+}
+
+/// Fresh admin step-up shared by sensitive admin actions (RM-166 grace,
+/// RM-173 team-history backdating): the caller must be a live Admin (no
+/// pending password change) and present their OWN current password for the
+/// credential epoch this session was issued under; an admin with MFA active
+/// must also present a TOTP / recovery code (verified like `mfa.disable`),
+/// else the refusal is exactly [`MFA_CODE_REQUIRED`].
+///
+/// `Ok(kind)` names the verified factors (`"password"` / `"password+mfa"`).
+/// `Err((message, failed_step))`: `failed_step` is `Some` for a failed
+/// credential check (callers audit it), `None` for a refusal that is not a
+/// failed attempt. Callers apply their own login-style rate limit first and
+/// refuse the shared-token `system` context (it has no password).
+pub(crate) async fn admin_step_up(
+    home: &std::path::Path,
+    db: &Arc<UserDb>,
+    ctx: &UserContext,
+    password: String,
+    code: Option<String>,
+    copy: StepUpCopy,
+) -> Result<&'static str, (String, Option<&'static str>)> {
+    let (id, epoch, step_db, home) =
+        (ctx.user_id.clone(), ctx.credential_epoch, db.clone(), home.to_path_buf());
+    tokio::task::spawn_blocking(move || -> Result<&'static str, (String, Option<&'static str>)> {
+        crate::mfa::require_admin(&step_db, &id).map_err(|e| (e, None))?;
+        let user = step_db
+            .get_user(&id)
+            .map_err(|e| (e, None))?
+            .ok_or(("無法讀取帳號資料。".to_string(), None))?;
+        let verified = step_db
+            .verify_password(&user.email, &password)
+            .map_err(|_| (copy.failed_password.to_string(), Some("password")))?;
+        if verified.id != id || verified.credential_epoch != epoch {
+            return Err(("登入憑證已失效，請重新登入。".into(), None));
+        }
+        if !step_db.mfa_active(&id).map_err(|e| (e, None))? {
+            return Ok("password");
+        }
+        let Some(code) = code else {
+            return Err((MFA_CODE_REQUIRED.to_string(), None));
+        };
+        let now = chrono::Utc::now().timestamp();
+        step_db
+            .mfa_step_up_verify(&id, &code, &crate::mfa::Cipher(&home), now)
+            .map_err(|_| (copy.failed_mfa.to_string(), Some("mfa")))?;
+        Ok("password+mfa")
+    })
+    .await
+    .unwrap_or_else(|_| Err(("身分確認暫時無法進行，請稍後再試。".to_string(), None)))
 }
 
 fn grace_event(event_type: &str, ctx: &UserContext, mut details: Value) -> AuditEvent {

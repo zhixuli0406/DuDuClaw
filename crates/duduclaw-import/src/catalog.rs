@@ -15,6 +15,8 @@ use crate::{Error, Result, sqlite::{schema, SchemaRow}};
 
 pub(crate) const SESSION_V1793: &str = include_str!("session-v1793.sql");
 pub(crate) const SESSION_V180: &str = include_str!("session-v180.sql");
+pub(crate) const SESSION_V181: &str = include_str!("session-v181.sql");
+pub(crate) const SESSION_V181_UPGRADED: &str = include_str!("session-v181-upgraded.sql");
 pub(crate) const TASKS_V1793: &str = include_str!("tasks-v1793.sql");
 pub(crate) const TASKS_V180: &str = include_str!("tasks-v180.sql");
 pub(crate) const TASKS_V181: &str = include_str!("tasks-v181.sql");
@@ -40,22 +42,35 @@ impl Store {
 }
 
 /// Known source releases. v1.80.0 and v1.80.1 share one catalog (1.80.1 had
-/// no store change).
+/// no store change). `V181` is a distinct mapping only for sessions.db (the
+/// RM-173 user-clear exclusion); the v1.81 tasks and approvals catalogs add
+/// nothing their readers read, so they still map as `V180`, and no other
+/// store ever yields `V181` (their readers refuse it: fail closed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SchemaVersion { V1793, V180 }
+pub enum SchemaVersion { V1793, V180, V181 }
 impl SchemaVersion {
-    pub fn label(self) -> &'static str { match self { Self::V1793 => "v1.79.3", Self::V180 => "v1.80.x" } }
+    pub fn label(self) -> &'static str { match self { Self::V1793 => "v1.79.3", Self::V180 => "v1.80.x", Self::V181 => "v1.81" } }
 }
 
 struct Catalog { version: SchemaVersion, sql: &'static str, label: &'static str }
 impl Catalog {
     const fn new(version: SchemaVersion, sql: &'static str) -> Self {
-        Catalog { version, sql, label: match version { SchemaVersion::V1793 => "v1.79.3", SchemaVersion::V180 => "v1.80.x" } }
+        Catalog { version, sql, label: match version { SchemaVersion::V1793 => "v1.79.3", SchemaVersion::V180 => "v1.80.x", SchemaVersion::V181 => "v1.81" } }
     }
 }
 // Ordered oldest first; adding a release means a new catalog file, a new
 // variant and its own mapping in every reader (the matches are exhaustive).
-static SESSIONS: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, SESSION_V1793), Catalog::new(SchemaVersion::V180, SESSION_V180)];
+// Sessions v1.81 = v1.80.x plus the RM-173 `sessions.archive_reason` and
+// `sessions.user_cleared_at` columns and the `session_migrations` marker
+// table, in two pinned shapes: a fresh store (the columns after
+// `archived_at`) and a store upgraded from v1.80.x or v1.79.3 (ALTER TABLE
+// appends them after `origin_at`). Both map as V181: the reader excludes
+// user-cleared conversations and never reads the marker table. Before v1.81
+// both a user clear and the inactivity task set `archived_at`, so the
+// V1793/V180 readers import an archived conversation only when the shared
+// legacy rule classifies it as an inactivity archive.
+static SESSIONS: [Catalog; 4] = [Catalog::new(SchemaVersion::V1793, SESSION_V1793), Catalog::new(SchemaVersion::V180, SESSION_V180),
+    Catalog::new(SchemaVersion::V181, SESSION_V181), Catalog::new(SchemaVersion::V181, SESSION_V181_UPGRADED)];
 // Tasks: the v1.81 catalog is the v1.80.x one plus the `task_store_markers`
 // table of the goal-creator backfill. It has no readable content for the
 // importer (the authorizer denies that table), so it maps as V180.
@@ -117,7 +132,10 @@ pub struct SchemaRefusal {
 }
 impl fmt::Display for SchemaRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let known = catalogs(self.store).iter().map(|c| c.label).collect::<Vec<_>>().join(", ");
+        // One label per release, although a release may pin several shapes.
+        let mut known = catalogs(self.store).iter().map(|c| c.label).collect::<Vec<_>>();
+        known.dedup();
+        let known = known.join(", ");
         write!(f, "unsupported {} schema: it matches none of the known catalogs ({known}); differences from the closest ({}{}): ",
             self.store.file_name(), self.closest.label(), if self.closest_extension { " with channel settings" } else { "" })?;
         if self.differences.is_empty() { write!(f, "catalog rows differ")?; }

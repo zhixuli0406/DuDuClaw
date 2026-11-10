@@ -283,7 +283,7 @@ fn binding_and_admin_role_are_refreshed_and_unknown_usage_stays_unknown() {
     // Live revocation of a reader's own history needs a real host origin;
     // a legacy/unknown fixture correctly has no restricted-reader access.
     let c=rusqlite::Connection::open(dir.path().join("sessions.db")).unwrap();
-    c.execute_batch("ALTER TABLE sessions ADD COLUMN origin_kind TEXT;ALTER TABLE sessions ADD COLUMN owner_user_id TEXT;ALTER TABLE sessions ADD COLUMN title TEXT;ALTER TABLE sessions ADD COLUMN last_active TEXT;ALTER TABLE sessions ADD COLUMN archived_at TEXT;ALTER TABLE session_messages ADD COLUMN tokens INTEGER DEFAULT 0;").unwrap();
+    c.execute_batch("ALTER TABLE sessions ADD COLUMN origin_kind TEXT;ALTER TABLE sessions ADD COLUMN owner_user_id TEXT;ALTER TABLE sessions ADD COLUMN title TEXT;ALTER TABLE sessions ADD COLUMN last_active TEXT;ALTER TABLE sessions ADD COLUMN archived_at TEXT;ALTER TABLE sessions ADD COLUMN archive_reason TEXT;ALTER TABLE sessions ADD COLUMN user_cleared_at TEXT;ALTER TABLE session_messages ADD COLUMN tokens INTEGER DEFAULT 0;").unwrap();
     c.execute("UPDATE sessions SET origin_kind='webchat_user',owner_user_id=?1,last_active='2026-10-10T02:00:00Z'",[&ctx.user_id]).unwrap();
     let req = request(Dataset::Conversations, ExportFormat::Csv);
     let id = build_now(dir.path(), &ctx, &req);
@@ -711,9 +711,9 @@ fn bound_conversation_exports_scope_mask_and_recollect_on_privilege_downgrade() 
     let (db,user)=user(dir.path(),"bound-export@test.invalid",UserRole::Employee);
     std::fs::write(dir.path().join("config.toml"),"[people]\nbound_history_privacy=true").unwrap();
     let conn=rusqlite::Connection::open(dir.path().join("sessions.db")).unwrap();
-    conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT); CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,timestamp TEXT,tokens INTEGER DEFAULT 0,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
+    conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT,archive_reason TEXT,user_cleared_at TEXT); CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,timestamp TEXT,tokens INTEGER DEFAULT 0,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
     for (sid,kind,owner) in [("mine","webchat_user",user.user_id.as_str()),("theirs","webchat_user","stranger"),("whatsapp:+886912345678","channel","")] {
-        conn.execute("INSERT INTO sessions VALUES (?1,'sales',?2,?3,'PRIVATE TITLE','2026-10-10T02:00:00Z',NULL)",params![sid,kind,owner]).unwrap();
+        conn.execute("INSERT INTO sessions(id,agent_id,origin_kind,owner_user_id,title,last_active,archived_at) VALUES (?1,'sales',?2,?3,'PRIVATE TITLE','2026-10-10T02:00:00Z',NULL)",params![sid,kind,owner]).unwrap();
         conn.execute("INSERT INTO session_messages(session_id,role,content,timestamp) VALUES (?1,'user','phone 0912-345-678 email a@example.com','2026-10-10T02:00:00Z')",[sid]).unwrap();
     }
     let req=request(Dataset::Conversations,ExportFormat::Csv);

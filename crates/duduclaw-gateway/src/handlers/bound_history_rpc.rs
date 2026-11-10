@@ -39,6 +39,7 @@ impl MethodHandler {
         ctx: &UserContext,
         agent: &str,
         limit: usize,
+        archived: bool,
     ) -> Result<Vec<Value>, String> {
         limits::take(&self.home_dir, &format!("bound:{}", ctx.user_id), false)
             .map_err(|_| "history rate limited")?;
@@ -49,7 +50,7 @@ impl MethodHandler {
         let list = tokio::task::spawn_blocking(move || {
             let _permit=permit;
             let c = read::open(&home)?;
-            let entries = read::list(&c, &user, &agent_owned, limit.max(1))?;
+            let entries = read::list_in(&c, &user, &agent_owned, limit.max(1), archived)?;
             let mut out = Vec::new();
             for m in entries {
                 let external = matches!(m.class, Class::External {..});
@@ -59,7 +60,13 @@ impl MethodHandler {
                 let title = if external { Some("External conversation".to_owned()) } else { m.title };
                 let id = if external { handles::issue(&home, &user, &m.id)? } else { m.id.clone() };
                 let turns: i64 = c.query_row("SELECT COUNT(*) FROM session_messages WHERE session_id=?1 AND hidden=0 AND undone_at IS NULL AND role IN ('user','assistant')",[&m.id],|r|r.get(0)).map_err(|_|"history unavailable")?;
-                out.push(json!({"session_id":id,"agent_id":m.agent,"title":title,"last_active":m.last_active,"turns":turns,"tokens":0,"lineage":null,"channel":channel,"read_only":external,"title_masked":external}));
+                let mut row = json!({"session_id":id,"agent_id":m.agent,"title":title,"last_active":m.last_active,"turns":turns,"tokens":0,"lineage":null,"channel":channel,"read_only":external,"title_masked":external,"archived":archived});
+                if archived {
+                    // RM-173: label why (`user` = they cleared it, `retention`).
+                    let reason: String = c.query_row("SELECT COALESCE(archive_reason,'retention') FROM sessions WHERE id=?1",[&m.id],|r|r.get(0)).map_err(|_|"history unavailable")?;
+                    row["archive_reason"] = json!(reason);
+                }
+                out.push(row);
             }
             Ok::<_,String>(out)
         }).await.map_err(|_|"history unavailable")??;

@@ -546,6 +546,9 @@ pub(crate) fn validate_config_table(table: &toml::Table) -> Result<(), String> {
         if people.get("manager_team_history").is_some_and(|v|!v.is_bool()) {return Err("people.manager_team_history must be a boolean".into());}
         if people.get("bound_history_privacy").is_some_and(|v|!v.is_bool()) {return Err("people.bound_history_privacy must be a boolean".into());}
     }
+    // RM-173: conversation retention. The reader treats an invalid purge value
+    // as "never purge"; refuse it here so the editor never saves a silent no-op.
+    crate::session_retention::validate_table(table)?;
     crate::task_sandbox::settings::parse(table).map_err(|e| format!("[container.sandbox]: {e}"))?;
     if table.contains_key("computer_use") {
         crate::computer_use_image::parse(table).map_err(|e| format!("[computer_use]: {e}"))?;
@@ -679,6 +682,9 @@ const RAW_REFUSED_KEYS: &[&str] = &["dispatch.judge_command", "evolution.eval_bi
 const RAW_CONFIG_SENSITIVE_KEYS: &[&str] = &[
     "people.manager_team_history",
     "people.bound_history_privacy",
+    // RM-173: conversation retention (purge deletes content irreversibly).
+    "sessions.archive_after_days",
+    "sessions.purge_after_days",
     "container.sandbox.when_unavailable",
     "container.sandbox.script_when_unavailable",
     "tick.allow_command_sources",
@@ -1483,6 +1489,26 @@ mod tests {
         let bad="[people]\nbound_history_privacy='false'".parse::<toml::Table>().unwrap();
         assert!(validate_config_table(&bad).is_err());
         assert!(RAW_CONFIG_SENSITIVE_KEYS.contains(&"people.bound_history_privacy"));
+    }
+
+    #[test]
+    fn rm173_retention_keys_are_range_checked_and_security_audited() {
+        let ok = "[sessions]\narchive_after_days = 0\npurge_after_days = 3650\n".parse::<toml::Table>().unwrap();
+        assert!(validate_config_table(&ok).is_ok());
+        for bad in [
+            "[sessions]\npurge_after_days = 3651\n",
+            "[sessions]\narchive_after_days = -1\n",
+            "[sessions]\npurge_after_days = '30'\n",
+        ] {
+            assert!(validate_config_table(&bad.parse::<toml::Table>().unwrap()).is_err(), "{bad}");
+        }
+        for key in ["sessions.archive_after_days", "sessions.purge_after_days"] {
+            assert!(RAW_CONFIG_SENSITIVE_KEYS.contains(&key));
+        }
+        let before = "[sessions]\npurge_after_days = 0\n".parse::<toml::Table>().unwrap();
+        let after = "[sessions]\npurge_after_days = 30\n".parse::<toml::Table>().unwrap();
+        let changes = sensitive_key_changes(&RawFile::Config, &before, &after).unwrap();
+        assert!(changes.iter().any(|(k, _, a)| k == "sessions.purge_after_days" && *a == json!(30)));
     }
 
     #[test]

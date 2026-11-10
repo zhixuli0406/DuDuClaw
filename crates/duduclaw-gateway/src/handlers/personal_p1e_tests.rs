@@ -383,6 +383,7 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("memory.forget_receipts_get", "P1g: a receipt naming another person's Personal employee is withheld (names_hidden)"),
     ("agent_files.withdraw", "the requester (or an Admin) withdraws a pending change; reads no file"),
     ("chat.sessions.history", "gated in the handler on the session's employee (personal_data_gate)"),
+    ("chat.sessions.restore", "RM-173: same handler gate as chat.sessions.history on the session's employee (personal_data_gate)"),
     ("runs.get", "gated in the handler on the run's employee (personal_data_gate)"),
     ("runs.subscribe", "metadata-only run authorization; one refusal text for unknown and refused runs"),
     ("runs.unsubscribe", "metadata-only run authorization; one refusal text for unknown and refused runs"),
@@ -436,6 +437,8 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.my_history_views", "the caller's own history views"),
     ("users.team_history.list", "team oversight skips Personal employees in SQL (P1)"),
     ("users.team_history.get", "team oversight skips Personal employees in SQL (P1)"),
+    ("users.team_history.restore", "RM-173: manager path = users.team_history.get's access (skips Personal employees); \
+        Admin path gated in the handler on the session's employee (personal_data_gate)"),
     ("users.org_settings.get", "org history settings; names no employee"),
     ("users.org_settings.update", "org history settings; names no employee"),
     ("users.subordinates", "reporting lines (people); names no employee"),

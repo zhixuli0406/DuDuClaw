@@ -2613,6 +2613,8 @@ export interface TeamHistorySession {
   title_masked: boolean;
   last_active: string;
   turns: number;
+  /** RM-173: archived (「已收起」) conversations stay listed, flagged. */
+  archived?: boolean;
 }
 export interface TeamHistoryList {
   sessions: TeamHistorySession[];
@@ -2629,10 +2631,28 @@ export interface TeamHistoryTranscript {
   since: string;
   messages: Array<{ role: string; sender_label: string; parts: TeamHistoryPart[]; timestamp: string }>;
   masked_counts: Record<string, number>;
+  archived?: boolean;
 }
 export interface TeamHistorySettings {
   manager_team_history: boolean;
   since: string | null;
+  /** RM-173 (absent on older gateways). Same value as `since`. */
+  team_history_since?: string | null;
+  team_history_since_floor?: string;
+  /** Days without activity before archiving; 0 = never. */
+  archive_after_days?: number;
+  /** Days after archiving before deletion; 0 = never. */
+  purge_after_days?: number;
+}
+/** RM-173: partial `users.org_settings.update`. Moving `team_history_since`
+ *  earlier needs the admin's own `password` (+ `code` when MFA is on). */
+export interface OrgSettingsUpdate {
+  manager_team_history?: boolean;
+  archive_after_days?: number;
+  purge_after_days?: number;
+  team_history_since?: string;
+  password?: string;
+  code?: string;
 }
 
 export interface AuditEntry {
@@ -6388,6 +6408,11 @@ export interface ChatSessionSummary {
   tokens: number;
   /** Session lineage marker — opaque, not rendered by the dashboard. */
   lineage?: unknown;
+  /** RM-173: present (true) on rows of an `archived: true` listing. */
+  archived?: boolean;
+  /** RM-173: why an archived row is archived — `user` (cleared by its user:
+   *  `/new`, a channel reset) or `retention` (inactivity). Archived rows only. */
+  archive_reason?: 'user' | 'retention';
 }
 
 export interface ChatSessionMessage {
@@ -6816,8 +6841,12 @@ export const api = {
    *  dashboard RPC (authz enforced server-side — a non-admin caller must pass a
    *  visible `agent_id`; other agents' sessions are never returned). */
   chatSessions: {
-    list: (params: { agent_id?: string; limit?: number }) =>
+    /** `archived: true` (RM-173) lists only the caller's archived conversations. */
+    list: (params: { agent_id?: string; limit?: number; archived?: boolean }) =>
       client.call('chat.sessions.list', params) as Promise<{ sessions: ChatSessionSummary[] }>,
+    /** RM-173: restore one of the caller's own archived conversations. */
+    restore: (sessionId: string) =>
+      client.call('chat.sessions.restore', { session_id: sessionId }) as Promise<{ session_id: string; restored: boolean }>,
     history: (sessionId: string, limit?: number) =>
       client.call('chat.sessions.history', {
         session_id: sessionId,
@@ -9583,10 +9612,17 @@ export const api = {
         client.call('users.team_history.list', params) as Promise<TeamHistoryList>,
       get: (sessionId: string, limit = 200) =>
         client.call('users.team_history.get', { session_id: sessionId, limit }) as Promise<TeamHistoryTranscript>,
+      /** RM-173: un-archive (Admin, or a manager who can read it here). */
+      restore: (sessionId: string) =>
+        client.call('users.team_history.restore', { session_id: sessionId }) as Promise<{ session_id: string; restored: boolean }>,
     },
     orgSettings: {
       get: () => client.call('users.org_settings.get') as Promise<TeamHistorySettings>,
       update: (enabled: boolean) => client.call('users.org_settings.update', { manager_team_history: enabled }) as Promise<TeamHistorySettings>,
+      /** RM-173: retention days and the team-history start date. */
+      // Spread into a fresh object literal: an interface has no implicit
+      // index signature, so it is not assignable to `Record<string, unknown>`.
+      save: (change: OrgSettingsUpdate) => client.call('users.org_settings.update', { ...change }) as Promise<TeamHistorySettings>,
     },
     remove: (userId: string) =>
       client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,

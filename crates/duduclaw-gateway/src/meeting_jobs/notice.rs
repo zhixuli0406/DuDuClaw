@@ -60,8 +60,10 @@ async fn persist_webchat(home: &Path, job: &Job, text: &str) -> Result<(), Strin
         .map_err(|_| "無法讀取原對話。")?;
     let mut conn = manager.acquire().await;
     let tx = conn.transaction().map_err(|_| "無法儲存完成通知。")?;
+    // RM-173: never into a user clear left at its original id.
     let allowed: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND agent_id=?2 AND origin_kind='webchat_user' AND owner_user_id=?3)",
+        &format!("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND agent_id=?2 AND origin_kind='webchat_user' AND owner_user_id=?3 AND NOT {})",
+            crate::session::STUCK_USER_CLEAR),
         rusqlite::params![session, job.agent, requester], |row| row.get(0),
     ).map_err(|_| "無法確認原對話的使用者。")?;
     if !allowed { return Err("原對話已不存在或無法存取。".into()); }
@@ -73,7 +75,9 @@ async fn persist_webchat(home: &Path, job: &Job, text: &str) -> Result<(), Strin
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute("INSERT INTO session_messages(session_id,role,content,tokens,timestamp) VALUES (?1,'assistant',?2,0,?3)",
             rusqlite::params![session, text, now]).map_err(|_| "無法儲存完成通知。")?;
-        tx.execute("UPDATE sessions SET last_active=?2 WHERE id=?1", rusqlite::params![session, now])
+        // RM-173: a new message lifts a retention archive (never a user
+        // clear) in the same transaction.
+        tx.execute(&format!("UPDATE sessions SET last_active=?2, {} WHERE id=?1", crate::session::UNARCHIVE_ON_ACTIVITY), rusqlite::params![session, now])
             .map_err(|_| "無法儲存完成通知。")?;
     }
     tx.commit().map_err(|_| "無法儲存完成通知。".into())

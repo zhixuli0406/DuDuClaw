@@ -64,6 +64,42 @@ it('does not land an old Owner response after a status transition and fresh scop
   expect(screen.queryByText(privateRow.title)).not.toBeInTheDocument();
   expect(screen.getByText(en['boundHistory.label'])).toBeInTheDocument();
 });
+it('RM-173: lists archived conversations on demand and restores only the caller\'s own', async () => {
+  const user = userEvent.setup();
+  const own = { ...privateRow, session_id: 'webchat:mine', channel: 'webchat', title: 'MY OLD CHAT', archived: true };
+  const list = vi.spyOn(api.chatSessions, 'list').mockImplementation(((params: { archived?: boolean }) =>
+    Promise.resolve({ sessions: params.archived ? [own, { ...masked, archived: true }] : [privateRow] })) as never);
+  const restore = vi.spyOn(api.chatSessions, 'restore').mockResolvedValue({ session_id: own.session_id, restored: true });
+  renderWithProviders(<SessionHistoryMenu agentId="sales" activeSessionId={null} onResume={vi.fn()} />);
+  await openMenu();
+  await screen.findByText(privateRow.title);
+  expect(list).toHaveBeenLastCalledWith({ agent_id: 'sales', limit: 50 });
+  await user.click(screen.getByRole('button', { name: en['webchat.history.archivedToggle'] }));
+  expect(await screen.findByText(own.title)).toBeInTheDocument();
+  expect(list).toHaveBeenLastCalledWith({ agent_id: 'sales', limit: 50, archived: true });
+  expect(screen.queryByText(privateRow.title)).not.toBeInTheDocument();
+  // Archived rows are not resumable menu items; a masked read-only row has no restore.
+  expect(screen.queryByRole('menuitem')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('button', { name: new RegExp(`^${en['webchat.history.restore']} `) })).toHaveLength(1);
+  await user.click(screen.getByRole('button', { name: `${en['webchat.history.restore']} ${own.title}` }));
+  expect(restore).toHaveBeenCalledWith(own.session_id);
+  await waitFor(() => expect(screen.queryByText(own.title)).not.toBeInTheDocument());
+  // Back to the normal list.
+  await user.click(screen.getByRole('button', { name: en['webchat.history.archivedToggle'] }));
+  expect(await screen.findByText(privateRow.title)).toBeInTheDocument();
+});
+it('RM-173: a refused restore keeps the row and says so', async () => {
+  const user = userEvent.setup();
+  const own = { ...privateRow, session_id: 'webchat:mine', channel: 'webchat', title: 'MY OLD CHAT', archived: true };
+  vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: [own] } as never);
+  vi.spyOn(api.chatSessions, 'restore').mockRejectedValue(new Error('permission denied'));
+  renderWithProviders(<SessionHistoryMenu agentId="sales" activeSessionId={null} onResume={vi.fn()} />);
+  await openMenu();
+  await user.click(screen.getByRole('button', { name: en['webchat.history.archivedToggle'] }));
+  await user.click(await screen.findByRole('button', { name: `${en['webchat.history.restore']} ${own.title}` }));
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['webchat.history.restoreFailed']);
+  expect(screen.getByText(own.title)).toBeInTheDocument();
+});
 it('clears cached rows on refresh refusal, then accepts an untitled own row on retry', async () => {
   vi.spyOn(api.chatSessions, 'list')
     .mockResolvedValueOnce({ sessions: [privateRow] } as never)

@@ -4,6 +4,7 @@ import { Link } from 'react-router';
 import { api, type TeamHistorySettings } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { Button, Switch } from '@/components/mds';
+import { HistorySinceSetting, RetentionSettings } from './OrgRetentionSettings';
 
 export function OrgHistorySettings() {
   const intl = useIntl();
@@ -43,6 +44,8 @@ export function OrgHistorySettings() {
     </div>
     <p className="text-xs text-muted-foreground">{text('settings.notice')}</p>
     <Link className="text-sm text-brand underline underline-offset-2" to="/app/system/settings/advanced#redaction">{text('settings.detection')}</Link>
-    {error && <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">{text('unavailable')}<Button variant="outline" size="sm" onClick={() => setRevision(n => n + 1)}>{text('refresh')}</Button></div>}
+    {settings && <HistorySinceSetting settings={settings} onSaved={setSettings} />}
+    {settings && <RetentionSettings settings={settings} onSaved={setSettings} />}
+    {error &&<div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">{text('unavailable')}<Button variant="outline" size="sm" onClick={() => setRevision(n => n + 1)}>{text('refresh')}</Button></div>}
   </section>;
 }

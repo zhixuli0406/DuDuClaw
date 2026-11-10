@@ -25,6 +25,8 @@
 
 企業版設定（v1.76.0，成員管理 → 組織設定）：`users.org_settings.get/update` 管理 `[people] manager_team_history`，有效設定檔預設開，變更立即生效；重新開啟會重設時間窗，進階編輯器也列為受保護稽核鍵。開啟前請先告知職員。見[主管唯讀團隊對話](../../features/zh-TW/68-manager-team-history.md)。
 
+對話保存（v1.81.0，RM-173，成員管理 → 組織設定，管理員）：同一組 RPC 也讀寫 `[sessions] archive_after_days`（「對話多久沒有動靜就收起」，預設 30 天，0＝不收起，最多 3650）與 `[sessions] purge_after_days`（「收起後多久清除內容」，預設 0＝永不清除，從收起當下起算，最多 3650）。不用重啟：每 6 小時的整理工作每次都重新讀取；設定檔讀不到或數值不正確時照預設收起、絕不清除。兩個鍵在進階編輯器也是受保護稽核鍵，超出 0–3650 會被擋下。收起的對話不在一般清單，但有新訊息就會自動回來；同仁可在 WebChat 歷史對話選單的「已收起的對話」還原自己的對話（`chat.sessions.restore`），主管在「團隊對話」還原（`users.team_history.restore`）。「團隊紀錄起算時間」（`team_history_since`，2020-01-01 到現在）決定主管從何時起看得到；往前調會讓主管看到更早的對話，需要再輸入管理員自己的登入密碼（啟用兩步驟驗證時另需驗證碼），每次變更都記錄稽核事件 `team_history_since_changed`。升級提醒：舊版固定為 3 天收起、收起 90 天後刪除。
+
 這份文件列出 v1.68.0 起可以在儀表板設定的項目：在哪一頁、寫到哪個設定鍵、存檔後是否要重啟 gateway。最後一節說明「設定檔進階編輯」，用來修改沒有專屬控制項的鍵。
 
 英文版：[../dashboard-settings.md](../dashboard-settings.md)　日文版：[../ja-JP/dashboard-settings.md](../ja-JP/dashboard-settings.md)

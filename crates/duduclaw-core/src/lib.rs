@@ -67,6 +67,9 @@ pub mod sandbox_image;
 // (moved from duduclaw-gateway, 2026-10 maintenance SSH P-2).
 pub mod secret_redact;
 pub mod sensitivity;
+// RM-173: legacy archived-conversation classification shared by the gateway
+// migration and the migration importer.
+pub mod session_legacy;
 pub mod spawn_admission;
 pub mod ns_guard;
 pub mod root_key;

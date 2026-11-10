@@ -162,5 +162,41 @@ describe('TeamHistoryPage', () => {
   });
 });
 
+describe('TeamHistoryPage archived conversations (RM-173)', () => {
+  function withArchived(restore: () => Promise<unknown>) {
+    const normal = mockWsClient.call.getMockImplementation()!;
+    mockWsClient.call.mockImplementation((method: string, params?: Record<string, unknown>) => {
+      if (method === 'users.team_history.list') return Promise.resolve({ sessions: [{ ...row('a'), archived: true }, { ...row('b'), archived: false }], ner: false, since: '2026-10-23T00:00:00Z' });
+      if (method === 'users.team_history.restore') return restore();
+      return normal(method, params);
+    });
+  }
+
+  it('flags archived conversations and restores one in place', async () => {
+    const user = userEvent.setup();
+    withArchived(() => Promise.resolve({ session_id: 'a', restored: true }));
+    renderWithProviders(<TeamHistoryPage />);
+    const restore = await screen.findByRole('button', { name: 'Restore Conversation a' });
+    expect(screen.getAllByText('Archived')).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Restore Conversation b' })).not.toBeInTheDocument();
+    await user.click(restore);
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.team_history.restore', { session_id: 'a' });
+    await waitFor(() => expect(screen.queryByText('Archived')).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Restore Conversation a' })).not.toBeInTheDocument();
+    // Archived conversations remain readable.
+    await user.click(screen.getByRole('button', { name: /^Conversation a/ }));
+    expect(await screen.findByText('Hello <img src=x onerror=alert(1)>')).toBeInTheDocument();
+  });
+
+  it('reports a refused restore and keeps the archived flag', async () => {
+    const user = userEvent.setup();
+    withArchived(() => Promise.reject({ code: 'not_found', message: 'session not found' }));
+    renderWithProviders(<TeamHistoryPage />);
+    await user.click(await screen.findByRole('button', { name: 'Restore Conversation a' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't restore this conversation");
+    expect(screen.getByText('Archived')).toBeInTheDocument();
+  });
+});
+
 import { api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';

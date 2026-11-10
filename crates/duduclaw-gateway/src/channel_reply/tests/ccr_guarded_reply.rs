@@ -5,6 +5,7 @@ mod ccr_guarded_reply_tests {
     use super::{
         CCR_DELIVERY_REFUSED_TEXT, CCR_LEASE_UNSUPPORTED_TEXT, CCR_TURN_DELIVERY, CcrTurnDelivery,
         GuardedReply, SessionManager, ccr_delivery_verdict, record_turn_assistant_message,
+        record_turn_generation,
     };
     use duduclaw_llm::{CcrDeliveryGuards, CcrDeliveryLease};
     use std::sync::Arc;
@@ -584,6 +585,38 @@ mod ccr_guarded_reply_tests {
         assert_eq!(verdict.await, Ok(true));
         assert_eq!(mgr.get_messages("telegram:-100123").await.unwrap().iter()
             .filter(|m| m.content == "early response").count(), 1);
+    }
+
+    /// RM-173 (L1): the staged-row fallback is bound to the turn generation —
+    /// after a `/new` during the turn it never lands in the fresh conversation.
+    #[tokio::test]
+    async fn webchat_staged_reply_after_clear_is_not_written_into_the_fresh_conversation() {
+        let sid = "telegram:-100123";
+        let ((_dir, mgr), cleanup) = super::with_delivery_cleanup(async {
+            let (dir, mgr, _, _) = session_with_pending_assistant_turn().await;
+            let delivery = Arc::new(CcrTurnDelivery::default());
+            let generation = mgr.turn_generation(sid).await.unwrap();
+            assert!(generation.is_some());
+            CCR_TURN_DELIVERY
+                .scope(delivery.clone(), async { record_turn_generation(generation.as_deref()) })
+                .await;
+            // `/new` while the turn runs; the user already wrote again.
+            mgr.clear_for_user(sid).await.unwrap().expect("cleared");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            mgr.get_or_create(sid, "agent-a").await.unwrap();
+            let reply = GuardedReply::new("LATE-STAGED".into(), None, Vec::new(),
+                Some(super::TurnRollback { delivery, session_mgr: mgr.clone() })).await;
+            assert!(reply.persist_webchat(&mgr, sid, "LATE-STAGED").await.is_err());
+            drop(reply);
+            (dir, mgr)
+        }).await;
+        cleanup.unwrap();
+        // Pending rows are hidden from `get_messages`, so count raw rows.
+        let rows: i64 = mgr.acquire().await
+            .query_row("SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+                rusqlite::params![sid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the fresh conversation stays empty");
     }
 
     #[tokio::test]
