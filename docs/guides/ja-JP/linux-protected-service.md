@@ -43,6 +43,8 @@ Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大
 
 `--migrate-from` を指定すると、インストーラーはアカウント作成などの変更を行う前に移行元ディレクトリを検査します。読み取り中に変化した移行元は拒否されるため、ユーザーモードの gateway を先に停止してください。アカウントを作成する前に、root だけがアクセスできるマーカー `/var/lib/duduclaw-protected/fresh-install-pending` を書き込みます。その後インストールが失敗しても、マーカーが改変されておらず、バージョン下限、ルート鍵、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json`、`/opt/duduclaw-isolated/current` がまだ存在しなければ、同じコマンドを再実行するとインストールを続行します。前回すでにデータをコピーしていた場合は `--force-migrate` を追加してください（前回のコピーはバックアップとして保持されます）。マーカーは下限の記録後、または `uninstall` で削除されます。
 
+このマーカーは、このホストで新規インストールを開始したことをインストーラーが記録するファイルです。root 所有、権限 0600 の通常ファイルで、内容がインストーラーの書き込んだものと完全に一致している必要があります。マーカーが存在してもこの検査に通らない場合、インストーラーはホストを新しいホストとして扱わず、インストールを拒否します。root は `sudo ls -l /var/lib/duduclaw-protected/fresh-install-pending` で確認できます。ホストにバージョン下限もルート鍵もなく、新規インストールを行うつもりの場合に限り、root で削除してください（`sudo rm /var/lib/duduclaw-protected/fresh-install-pending`）。削除後も、インストーラーは上記の新しいホストの条件を適用します。
+
 ```sh
 # 検証済みのプログラムを root 所有の場所から実行します（「インストールと準備完了の確認」を参照）。
 sudo ./duduclaw service install --protected-linux --enable-now

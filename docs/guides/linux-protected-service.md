@@ -43,6 +43,8 @@ Until the isolation components can be installed (planned v1.82.0), `service inst
 
 `--migrate-from` checks the source tree first, before the installer creates the account or anything else: stop the user-mode gateway, because a source that changes while it is read is refused. Before creating the account the installer writes the root-only marker `/var/lib/duduclaw-protected/fresh-install-pending`. If the install then fails, rerunning the same command continues it, as long as the marker is intact and the version floor, root key, `/etc/duduclaw/migration-import.json`, `/var/lib/duduclaw-migrate`, `/var/lib/duduclaw-updated/state.json` and `/opt/duduclaw-isolated/current` are still absent. If the earlier run had already copied the data, add `--force-migrate` (the earlier copy is kept as a backup). The marker is removed once the floor is recorded, and by `uninstall`.
 
+The marker is the installer's record that a fresh install was started on this host; it must be a root-owned regular file with mode 0600 and the exact content the installer wrote. If it exists but does not pass that check, the installer does not treat the host as new and refuses. Root can inspect it with `sudo ls -l /var/lib/duduclaw-protected/fresh-install-pending`; remove it as root (`sudo rm /var/lib/duduclaw-protected/fresh-install-pending`) only when the host has no version floor and no root key and you intend a fresh install. After removal the installer still applies the new-host conditions above.
+
 ```sh
 # Run the verified binary from a root-owned location (see "Installation and readiness").
 sudo ./duduclaw service install --protected-linux --enable-now

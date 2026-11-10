@@ -477,12 +477,16 @@ fn prepare_version(version: &str) -> Result<()> {
 }
 
 fn record_floor(version: &str) -> Result<()> {
+    // atomic_install fsyncs the floor file and its parent before returning,
+    // so the floor is durable before the marker below is touched.
     atomic_install(VERSION_FLOOR, 0o600, |file| { file.write_all(version.as_bytes())?; Ok(()) })?;
     fs::remove_file(VERSION_PENDING)?;
-    // The floor exists now, so an interrupted fresh install is complete. A
-    // crash before this removal is harmless: a marker beside a floor never
-    // continues a fresh install, and the next record_floor removes it.
+    // The floor exists durably now, so an interrupted fresh install is
+    // complete. A crash before this removal is harmless: a marker beside a
+    // floor never continues a fresh install, and the next record_floor (or
+    // uninstall) removes it. clear_pending syncs the parent after removing.
     fresh::clear_pending(Path::new("/"))?;
+    // Persists the VERSION_PENDING removal.
     fs::File::open("/var/lib/duduclaw-protected")?.sync_all()?;
     Ok(())
 }
@@ -564,8 +568,9 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
             return Err(refused("請先驗證執行檔；確認後才可使用 --i-verified-this-binary"));
         }
     }
-    // The common migration refusals (a still-running source gateway, links,
-    // foreign owners, an existing target) happen here, before any side effect.
+    // The common migration refusals (a source that changes while it is being
+    // read, links, foreign owners, an existing target) happen here, before any
+    // side effect. Preflight does not detect a running source gateway as such.
     // copy() repeats every check against the live tree.
     if let Some(source) = options.migrate_from.as_deref() {
         super::migrate::preflight(source, options.force_migrate)?;
@@ -613,6 +618,12 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
 pub(super) fn uninstall() -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
+    // The fresh-install marker goes first, on both the coordinated-removal and
+    // the plain path: once a floor or key may be removed, a later install must
+    // not continue an earlier fresh install over retained data. Removing it
+    // only narrows (no marker means "not fresh"), so a later refusal is safe.
+    parents(Path::new(fresh::FRESH_PENDING))?;
+    fresh::clear_pending(Path::new("/"))?;
     for path in layout::BINARIES.iter().copied().chain([
         "/var/lib/duduclaw-updated/state.json", "/opt/duduclaw-isolated/current",
         "/var/lib/duduclaw-protected/uninstall-units",
@@ -624,9 +635,9 @@ pub(super) fn uninstall() -> Result<()> {
         }
     }
     // Validate every removal before stopping anything; never follow a replaced path.
-    // The fresh-install marker goes too: once the floor is removed, a later
-    // install must not continue an earlier fresh install over retained data.
-    let removed = [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND, fresh::FRESH_PENDING];
+    // The fresh-install marker is already gone, so no step below can leave a
+    // marker without the floor that blocks it.
+    let removed = [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND];
     for file in removed {
         let path = Path::new(file);
         parents(path)?;

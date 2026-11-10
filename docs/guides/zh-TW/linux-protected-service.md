@@ -43,6 +43,8 @@ Kernel 7.0 **目前不接受**：trampoline 會拒絕大於 7 的 Landlock ABI�
 
 使用 `--migrate-from` 時，安裝器會在建立帳號或其他任何變更之前先檢查來源目錄；讀取期間有變動的來源會被拒絕，請先停止使用者模式的 gateway。建立帳號前，安裝器會寫入只有 root 可存取的標記 `/var/lib/duduclaw-protected/fresh-install-pending`。之後若安裝失敗，只要標記完好，且版本下限、根金鑰、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json` 與 `/opt/duduclaw-isolated/current` 仍不存在，重新執行同一指令即可接續安裝。若前一次已複製資料，請加上 `--force-migrate`（前一份複本會保留為備份）。記錄版本下限後或執行 `uninstall` 時會移除標記。
 
+這個標記是安裝器記錄「此主機已開始全新安裝」的檔案，必須是 root 擁有、權限 0600 的一般檔案，內容與安裝器寫入的完全相同。標記存在但未通過這項檢查時，安裝器不會把主機視為新主機，並會拒絕安裝。root 可以用 `sudo ls -l /var/lib/duduclaw-protected/fresh-install-pending` 查看；只有在主機沒有版本下限、也沒有根金鑰，而且確定要全新安裝時，才以 root 移除（`sudo rm /var/lib/duduclaw-protected/fresh-install-pending`）。移除後，安裝器仍會套用上述新主機條件。
+
 ```sh
 # 從 root 擁有的位置執行已驗證的程式（見「安裝與就緒檢查」）。
 sudo ./duduclaw service install --protected-linux --enable-now

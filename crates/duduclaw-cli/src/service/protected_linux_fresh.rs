@@ -132,14 +132,21 @@ pub(super) fn mark_pending() -> Result<()> {
     atomic_install(FRESH_PENDING, 0o600, |file| { std::io::Write::write_all(file, FRESH_PENDING_TEXT)?; Ok(()) })
 }
 
-/// Called once the version floor exists (and by uninstall). The parent is
-/// the root-only protected state directory; the caller syncs it.
+/// Called by `record_floor` once the floor is durable, and by `uninstall`
+/// before anything else is removed, so a marker never outlives the floor or
+/// key that blocks it. NotFound is success; any other error refuses. After a
+/// removal the parent (the root-only protected state directory) is synced.
+/// `remove_file` never follows a final symlink.
 pub(super) fn clear_pending(root: &Path) -> Result<()> {
-    match fs::remove_file(under(root, FRESH_PENDING)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+    let path = under(root, FRESH_PENDING);
+    match fs::remove_file(&path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
+    let parent = path.parent().ok_or_else(|| refused("missing parent"))?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -295,5 +302,51 @@ mod tests {
         // After uninstall removes the floor, the host is an unknown-floor host.
         fs::remove_file(under(&root, VERSION_FLOOR)).unwrap();
         assert!(!fresh_for_install(&root, owner(), || Account::Present));
+    }
+
+    // uninstall clears the marker before either removal path runs, while the
+    // floor still exists, so no later step leaves a marker without its blocker.
+    #[test]
+    fn service_protected_fresh_uninstall_clears_marker_before_floor() {
+        let (_dir, root) = scratch();
+        for partial in PARTIAL { place(&root, partial); }
+        place(&root, VERSION_FLOOR);
+        let marker = place_marker(&root);
+        clear_pending(&root).unwrap();
+        assert!(absent(&marker));
+        // A failure right after (floor still present, or later removed) never
+        // revives the earlier fresh install.
+        assert!(!fresh_for_install(&root, owner(), || Account::Present));
+        fs::remove_file(under(&root, VERSION_FLOOR)).unwrap();
+        assert!(!fresh_for_install(&root, owner(), || Account::Present));
+    }
+
+    #[test]
+    fn service_protected_fresh_clear_pending_absent_is_ok() {
+        let (_dir, root) = scratch();
+        // Neither the marker nor its directory exists.
+        clear_pending(&root).unwrap();
+        place_marker(&root);
+        clear_pending(&root).unwrap();
+        clear_pending(&root).unwrap();
+    }
+
+    #[test]
+    fn service_protected_fresh_clear_pending_refuses_other_errors() {
+        let (_dir, root) = scratch();
+        let marker = place_marker(&root);
+        // A directory in the marker's place cannot be unlinked: refuse, keep it.
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&marker).unwrap();
+        assert!(clear_pending(&root).is_err());
+        assert!(fs::symlink_metadata(&marker).unwrap().is_dir());
+        // A symlink in its place is removed without touching the target.
+        fs::remove_dir(&marker).unwrap();
+        let target = root.join("elsewhere");
+        fs::write(&target, FRESH_PENDING_TEXT).unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        clear_pending(&root).unwrap();
+        assert!(absent(&marker));
+        assert!(target.exists());
     }
 }
