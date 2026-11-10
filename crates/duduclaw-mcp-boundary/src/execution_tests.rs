@@ -473,7 +473,7 @@ async fn isolated_execution_failed_spawn_persists_uncertainty_and_job_selector()
     assert_eq!(jobs.read(&owner, "codrive_run", RunHandle(RunId([9; 16]))).unwrap()["status"], "uncertain");
 }
 
-#[cfg(feature = "binding-store")]
+#[cfg(all(unix, feature = "binding-store"))]
 #[tokio::test]
 async fn isolated_execution_aborted_insert_cannot_leave_a_pending_record() {
     use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
