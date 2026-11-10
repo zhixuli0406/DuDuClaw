@@ -12,15 +12,17 @@
 use std::{fs::File, io::{self, Read, Write}, path::{Component, Path, PathBuf, Prefix}, ptr::{null, null_mut}};
 use std::os::windows::{ffi::OsStrExt, io::{AsRawHandle, FromRawHandle}};
 use crate::identity_token::windows as acl;
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+use windows_sys::Wdk::Storage::FileSystem::{NtSetInformationFile, FILE_RENAME_INFORMATION, FileRenameInformation};
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-    FILE_RENAME_INFO, FILE_DISPOSITION_INFO, FileRenameInfo, FileDispositionInfo,
+    FILE_DISPOSITION_INFO, FileDispositionInfo,
     GetDriveTypeW, GetFileInformationByHandle, GetFileType, OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const MAX_BYTES: usize = 4096;
 
@@ -200,6 +202,53 @@ impl SecureDirectory {
         result
     }
 
+    /// Rename the open `file` handle to `filename` inside the pinned state
+    /// directory, replacing an existing entry.
+    ///
+    /// This deliberately uses the native `NtSetInformationFile` with
+    /// `FileRenameInformation`, `RootDirectory` = the pinned, ACL-validated
+    /// directory handle and a single-component relative name. The Win32
+    /// `SetFileInformationByHandle(FileRenameInfo)` wrapper rejects a non-NULL
+    /// `RootDirectory` with a relative name (ERROR_INVALID_PARAMETER, os error
+    /// 87), and the Win32 alternative (a full path with NULL `RootDirectory`)
+    /// would be resolved by path again at rename time. The native call resolves
+    /// the target relative to the handle we already hold, so the replacement
+    /// can only land in the pinned directory; no path lookup is raced. The
+    /// I/O manager opens the target parent with write access, which the pins
+    /// permit (FILE_SHARE_WRITE, never FILE_SHARE_DELETE).
+    fn rename_into_pinned(&self, file: &File, filename: &str) -> io::Result<()> {
+        name(filename)?;
+        let directory = self.directories.last().ok_or_else(|| invalid("missing pinned state directory"))?;
+        let target: Vec<u16> = filename.encode_utf16().collect();
+        let name_bytes = u32::try_from(target.len() * 2).map_err(|_| invalid("private state filename too long"))?;
+        // At least the full struct, and always the header plus the whole name.
+        let size = std::mem::size_of::<FILE_RENAME_INFORMATION>()
+            .max(std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + name_bytes as usize);
+        let length = u32::try_from(size).map_err(|_| invalid("private state filename too long"))?;
+        // u64 storage gives native (pointer) alignment for the HANDLE member.
+        let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut status_block = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
+        // SAFETY: aligned, zeroed storage covers the header and the complete
+        // variable-length name; the source handle, the pinned root handle and
+        // all buffers stay alive for this synchronous call.
+        let status = unsafe {
+            (*info).Anonymous.ReplaceIfExists = 1;
+            (*info).RootDirectory = directory.as_raw_handle();
+            (*info).FileNameLength = name_bytes;
+            let destination = buffer.as_mut_ptr().cast::<u8>()
+                .add(std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)).cast::<u16>();
+            std::ptr::copy_nonoverlapping(target.as_ptr(), destination, target.len());
+            NtSetInformationFile(file.as_raw_handle(), status_block.as_mut_ptr(),
+                info.cast(), length, FileRenameInformation)
+        };
+        if status < 0 {
+            // SAFETY: pure status-code translation.
+            return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
+        }
+        Ok(())
+    }
+
     /// Write, flush and replace using the source handle and pinned directory.
     pub fn write_atomic(&self, filename: &str, bytes: &[u8]) -> io::Result<()> {
         name(filename)?;
@@ -215,21 +264,7 @@ impl SecureDirectory {
         let result = (|| {
             file.write_all(bytes)?;
             file.sync_all()?;
-            let target: Vec<u16> = filename.encode_utf16().collect();
-            let size = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + target.len() * 2;
-            let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
-            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-            // SAFETY: pointer-aligned zeroed storage includes the complete variable
-            // filename; pointers and the pinned root handle remain alive for the call.
-            unsafe {
-                (*info).Anonymous.ReplaceIfExists = 1;
-                (*info).RootDirectory = self.directories.last().expect("pinned state directory").as_raw_handle();
-                (*info).FileNameLength = (target.len() * 2) as u32;
-                std::ptr::copy_nonoverlapping(target.as_ptr(), std::ptr::addr_of_mut!((*info).FileName).cast(), target.len());
-                if SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfo, info.cast(), size as u32) == 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
+            self.rename_into_pinned(&file, filename)?;
             renamed = true;
             file.sync_all()
         })();

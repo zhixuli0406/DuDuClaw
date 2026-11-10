@@ -170,7 +170,7 @@ pub(crate) fn validate_acl(file: &File, user: &[usize], private: bool) -> io::Re
             && unsafe { IsWellKnownSid(owner, WinBuiltinAdministratorsSid) } == 0
             && unsafe { IsWellKnownSid(owner, WinLocalSystemSid) } == 0)
     {
-        return Err(denied("identity key must be owned by the current account"));
+        return Err(denied("identity key owner must be the current account, SYSTEM or Administrators"));
     }
     if dacl.is_null() || unsafe { IsValidAcl(dacl) } == 0 {
         return Err(denied("identity key must have a restrictive DACL"));
@@ -205,7 +205,7 @@ pub(crate) fn validate_acl(file: &File, user: &[usize], private: bool) -> io::Re
         let mutation_rights = GENERIC_ALL | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER
             | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD;
         if !trusted && (private || unsafe { (*allowed).Mask } & mutation_rights != 0) {
-            return Err(denied("file grants unsafe access outside its owner, SYSTEM and Administrators"));
+            return Err(denied("file grants unsafe access outside the current account, SYSTEM and Administrators"));
         }
     }
     Ok(())
@@ -221,11 +221,16 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 
     fn set_dacl(path: &Path, sddl: Option<&str>) {
+        let sd = sddl.map(|text| descriptor(text).unwrap());
+        apply_dacl(path, sd.as_ref());
+    }
+
+    /// Replace only the DACL; the owner stays whatever object creation chose.
+    fn apply_dacl(path: &Path, sd: Option<&LocalAllocation>) {
         let file = std::fs::OpenOptions::new().read(true)
             .access_mode(GENERIC_READ | READ_CONTROL | WRITE_DAC).open(path).unwrap();
-        let sd = sddl.map(|text| descriptor(text).unwrap());
         let mut dacl = null_mut();
-        if let Some(sd) = &sd {
+        if let Some(sd) = sd {
             let mut present = 0;
             let mut defaulted = 0;
             assert_ne!(unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) }, 0);
@@ -261,6 +266,49 @@ mod tests {
         assert!(open(&path, false, false).is_err());
         set_dacl(&path, None);
         assert!(open(&path, false, false).is_err());
+    }
+
+    #[test]
+    fn windows_default_owner_is_accepted_and_foreign_owner_is_rejected() {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned");
+        // std::fs uses the token's default owner: the user SID when not
+        // elevated, BUILTIN\Administrators on elevated runners. Both must pass.
+        std::fs::write(&path, b"x").unwrap();
+        let user = current_user().unwrap();
+        // Replace the inherited DACL so only the owner rule is under test.
+        apply_dacl(&path, Some(&private_descriptor(&user).unwrap()));
+        let checked = || std::fs::OpenOptions::new().access_mode(READ_CONTROL).open(&path).unwrap();
+        validate_acl(&checked(), &user, true).unwrap();
+        validate_acl(&checked(), &user, false).unwrap();
+
+        // Everyone (S-1-1-0) can only become the owner with SeRestorePrivilege
+        // enabled; without it SetSecurityInfo fails (ERROR_INVALID_OWNER) and
+        // the rejection half is skipped.
+        let text: Vec<u16> = "S-1-1-0".encode_utf16().chain(Some(0)).collect();
+        let mut raw = null_mut();
+        assert_ne!(unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut raw) }, 0);
+        let everyone = LocalAllocation(raw);
+        let writer = match std::fs::OpenOptions::new().access_mode(READ_CONTROL | WRITE_OWNER).open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("SKIP: foreign-owner rejection needs WRITE_OWNER: {error}");
+                return;
+            }
+        };
+        let status = unsafe {
+            SetSecurityInfo(writer.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                everyone.0, null_mut(), null(), null())
+        };
+        drop(writer);
+        if status != 0 {
+            eprintln!("SKIP: cannot assign a foreign owner without privilege (error {status})");
+            return;
+        }
+        assert!(validate_acl(&checked(), &user, true).is_err());
+        assert!(validate_acl(&checked(), &user, false).is_err());
     }
 
     #[test]

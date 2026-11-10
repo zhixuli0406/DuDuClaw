@@ -86,6 +86,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
     "Win32_System_SystemServices",
     "Win32_System_Console",
+    # windows_private_state::write_atomic: NtSetInformationFile(FileRenameInformation)
+    # renames relative to the pinned directory handle (Win32 FileRenameInfo rejects it).
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
 ] }
 
 [dev-dependencies]
