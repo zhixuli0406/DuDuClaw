@@ -1,8 +1,10 @@
-# Linux 保護模式：驗收手冊（v1.81）
+# Linux 保護模式：驗收手冊（預計 v1.82.0 提供）
 
 [English](../linux-protected-acceptance.md) · [日本語](../ja-JP/linux-protected-acceptance.md)
 
-這份手冊給發行維護者使用，說明 v1.81 原生 Linux 保護模式驗收要準備什麼、要執行哪些指令，以及怎麼看結果。範圍包含個人與共用 AI 員工、外部連線，以及 Package H 工具。
+> **狀態：預計 v1.82.0 提供。v1.81.0 無法使用。** 這份手冊驗收的每位員工獨立執行環境，在 v1.81.0 還無法安裝到客戶主機。v1.81.0 的受保護服務照 v1.80 的方式安裝、更新與執行員工。
+
+這份手冊給發行維護者使用，說明預計 v1.82.0 提供的原生 Linux 隔離架構驗收要準備什麼、要執行哪些指令，以及怎麼看結果。範圍包含個人與共用 AI 員工、外部連線，以及 Package H 工具。
 
 > **這些驗收工具目前無法通過準備階段。** `connectors-acceptance.sh`、`package-h-acceptance.sh` 以及 `iso_personal_chain`／`iso_package_h_chain` 測試，都需要已安裝並執行中的隔離元件（spawnd、egress、獨立更新服務）。`duduclaw service install --protected-linux` 不會安裝這些元件，只會安裝單一執行檔的受保護 gateway（見[受保護服務指南的「單一執行檔受保護服務（目前版本）」](linux-protected-service.md)）。在隔離架構的新安裝流程完成前（預計 v1.82.0），每次執行都會在準備階段停止；這個結果不代表 AI 員工、外部連線或 Package H 功能的驗收結果。
 

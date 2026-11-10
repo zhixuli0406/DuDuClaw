@@ -26,7 +26,7 @@ English: [External systems: query AI employee status](../external-status.md) · 
 enabled = true
 ```
 
-または管理者が `system.update_config` を `{"external_status_enabled": true}` で呼び出します。設定は照会のたびに読み直すため、gateway の再起動は不要です。
+または管理者が `system.update_config` を `{"external_status_enabled": true}` で呼び出します。gateway の再起動は不要です。ダッシュボードで変更した場合は次の照会から、`config.toml` を直接編集した場合は 2 秒以内に反映されます（設定は最大 2 秒キャッシュされます）。
 
 ## 2. 各自が自分の読み取り専用資格情報を作成する
 

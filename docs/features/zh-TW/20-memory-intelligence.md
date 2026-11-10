@@ -176,7 +176,7 @@ legal_dispute = ["訴訟", "lawsuit"]  # 新類別；要列入 excluded_categori
 - **審核核准。** 核准被隔離的一批資料或待審的主張時，也會跑同一套檢查（包含當事人在「我的記憶」刪除過的事實）；被擋下的資料維持未啟用，並記下原因（`invalidated_by_event = privacy_excluded:<類別>` 或 `privacy_forgotten`，稽核事件 `memory_privacy_approval_blocked`）。
 - **不在範圍內。** 這項功能上線前已存下的記憶不會被刪除。
 
-**「我的記憶」（目前只有 RPC，Dashboard 頁面之後再做）。** 任何已登入的 Dashboard 使用者都能呼叫 `me.memory.list` 與 `me.memory.forget`。兩者都只看得到主詞是呼叫者本人的事實，橫跨所有 AI 員工：
+**「我的記憶」（v1.81.0 起提供 Dashboard 頁面）。** 同仁可從側欄「設定」群組開啟「我的記憶」（`/me/memory`），依來源或 AI 員工篩選，並刪除不想被記住的項目。頁面使用 `me.memory.list` 與 `me.memory.forget`，任何已登入的 Dashboard 使用者都能呼叫。兩者都只看得到主詞是呼叫者本人的事實，橫跨所有 AI 員工：
 
 - `user:<Dashboard 使用者 id>`
 - 呼叫者的 WebChat 身分

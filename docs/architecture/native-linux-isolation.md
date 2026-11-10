@@ -1,15 +1,23 @@
 # Native Linux isolation implementation
 
-This note records implementation boundaries for native Linux employee isolation.
-Source migration, compilation, protocol fixtures, native acceptance and deployment
-are separate gates. Nothing in this note is production isolation acceptance.
+> **Release status:** the per-employee Linux isolation architecture described in this
+> note is planned for v1.82.0. Its code is included in v1.81.0 but cannot be
+> installed or enabled on a customer host. In v1.81.0 the protected service
+> installs, updates and runs employees as in v1.80
+> (`sudo duduclaw service install --protected-linux`,
+> `sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`).
 
-**Status 2026-11-09 (v1.81 integration branch).** Everything below is a dated
-per-round handoff log. Its "pending", "not yet" and "still required" wording
-describes the state at the time of that round. Current per-tool state is in
-[the tool matrix](native-linux-isolation-tools.md) (every tool is routed,
-refused with a reason, or gated off by default), and per-task state is in the
-work-breakdown wiki page. Production boot now installs the connector stack, work
+This note records implementation boundaries for the native Linux per-employee
+isolation. Source migration, compilation, protocol fixtures, native acceptance
+and deployment are separate gates. Nothing in this note is production isolation
+acceptance.
+
+**Status 2026-11-09 (code included in v1.81.0, not enabled).** Everything below
+is a dated per-round development log. Its "pending", "not yet" and "still
+required" wording describes the state at the time of that round. Current
+per-tool state is in [the tool matrix](native-linux-isolation-tools.md) (every
+tool is routed, refused with a reason, or gated off by default). Production boot
+now installs the connector stack, work
 broker and recording job store. Still open: acceptance on real Linux hosts as
 root (Ubuntu 22.04/24.04, Debian 12), real provider accounts, and the
 host probe that enables browser recording (off by default).
@@ -137,8 +145,8 @@ being complete. In particular:
   queues are bounded, but output_buffer_bytes is not a general local kernel limit.
 - Attachments exceeding the existing 16 MiB memfd threshold still require the
   read-only snapshot provider. Until it is supplied, they are refused.
-- Daybreak security review has not been performed. Ordinary independent code
-  review is not that signoff.
+- The designated security review has not been performed. Ordinary independent
+  code review is not that signoff.
 
 ### Validation record
 
@@ -163,7 +171,7 @@ version was introduced.
 | `cargo check --target x86_64-pc-windows-gnu -p duduclaw-execution --tests --offline` | Passed; type check only |
 | `python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v` | 16 passed, 0 failed |
 | `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | Passed: 455 symbols, 0 pending |
-| Temporary `/private/tmp/iso-a-syntax/target/debug/iso-a-syntax` over changed Rust paths | 72 files parsed, 0 syntax errors; not compilation |
+| Temporary syn-based syntax checker over changed Rust paths | 72 files parsed, 0 syntax errors; not compilation |
 | `git diff --check` | Passed |
 
 The 455 classifications are 113 backend, 66 gateway exceptions, 45 non-process,
@@ -183,10 +191,11 @@ PTY class propagation, synchronous context propagation, same-employee deadlock,
 local BrokenPipe preservation and write-cancellation acknowledgement issues.
 A cancelled write with unacknowledged bytes rejects a different retry buffer.
 
-### Remote builder commands
+### Build host commands
 
 Prefix Cargo commands with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` as appropriate.
-These tests are written but caller-crate results have not been observed locally.
+These tests are written but caller-crate results have not been observed on the
+development machine.
 
 ```sh
 cargo check -p duduclaw-gateway -p duduclaw-cli -p duduclaw-agent -p duduclaw-cli-runtime -p duduclaw-fork -p duduclaw-llm -p duduclaw-memory -p duduclaw-inference -p duduclaw-container --tests
@@ -353,7 +362,7 @@ is not native Linux acceptance or independent security approval.
 | Publication and provisioning | Typed root-only `Publication`; `RegistryStore::allocate/reconcile`; account creation/quarantine/readback; H provision/destroy request binds operation id and full proposal digest. | Signature verification/publication belongs to F; approved proposal authority belongs to G. Normal provisioning runs before activation or while the registry owner is stopped, not through gateway StartRun. |
 | Readiness evidence | Atomic root-owned, gateway-readable evidence; boot/time expiry; registry/account/SSH/IAM, B2, C/DNS, H, resource and scanner checks. `--check` returns the same evidence plus failure status. | Actual SSH login/forwarding negatives, IAM reservation/owner scan, B2 self-tests and C DNS route proof cannot be replaced with booleans in config. |
 | Live I/O and lifecycle | Revocable MCP/egress pairs; acknowledged C registration; stdin/output pipes; bounded relay pumping and truncation audit; PTY ownership retained before terminal cleanup; cancelled preparation fenced before B2 release. | B2 supplies actual validated per-run PTY and status. D must not activate a revoked terminal-run MCP endpoint. A must retry bounded `NotReady` TakeIo/Resize responses. |
-| Installer and acceptance | Installer stages root registry/log/projection directories, fixed binaries/units and locked supervisor; service permits account quarantine; ignored root tests added. | F/G publish the signed compatible generation and activate it; A/F/C join the TCB slice; three-distro root execution and Daybreak review remain required. |
+| Installer and acceptance | Installer stages root registry/log/projection directories, fixed binaries/units and locked supervisor; service permits account quarantine; ignored root tests added. | F/G publish the signed compatible generation and activate it; A/F/C join the TCB slice; three-distro root execution and the designated security review remain required. |
 
 ### Authority, ownership and fail-closed lifecycle
 
@@ -505,12 +514,11 @@ not an extra per-request slow-probe RPC. Start performs fresh host/UID/storage
 checks before effects. A must not equate service active or a file's existence with
 readiness, nor treat a failed check as permission to use the legacy executor.
 
-### Validation and remote handoff
+### Validation and build host follow-up
 
-This round ran only the small contract/spawnd crates in this worktree. No commit,
-worktree creation/removal, gateway/CLI/workspace build, cargo fmt, deployment,
-real account mutation or remote root test was performed. This session did not
-create this worktree; it remains intact with the requested uncommitted handoff.
+This round ran only the small contract/spawnd crates on the development machine.
+No gateway/CLI/workspace build, cargo fmt, deployment, real account mutation or
+root test on a Linux host was performed.
 
 | Command | Observed result |
 | --- | --- |
@@ -526,8 +534,8 @@ Unsafe-block lint notices and the pre-existing fetch_update deprecation remain.
 Independent code review found and drove fixes for cgroup membership formatting,
 partial-start cleanup, H lost receipts, scan generations/cancellation, evidence
 freshness, durability poisoning, short-lived PTY retention and shutdown draining.
-This is **not** the required `gpt-daybreak-blue-latest` security review; that review
-and live acceptance remain outstanding.
+This is **not** the required designated security review; that review and live
+acceptance remain outstanding.
 
 On each disposable Ubuntu 22.04/systemd 249, Debian 12/systemd 252 and Ubuntu
 24.04/systemd 255 VM, run as root with the compatible package fixtures installed.
@@ -580,7 +588,7 @@ PID 1 fd delivery/recovery, not a real B2 isolated employee run.
 | crate README, this note, `docs/README.md`, `CHANGELOG.md` | Current development status, compatibility seams and exact acceptance filters. |
 
 No shared contract change and no new dependency version. The three public security
-feature pages remain unchanged because employee isolation is not enabled. B1 uses
+feature pages remain unchanged because per-employee Linux isolation is not enabled. B1 uses
 [systemd v249's fd setter](https://raw.githubusercontent.com/systemd/systemd/v249/src/core/dbus-service.c)
 and [execution properties](https://raw.githubusercontent.com/systemd/systemd/v249/src/core/dbus-execute.c);
 source inspection does not substitute for the native tests above.
@@ -815,16 +823,16 @@ Remaining work is assigned explicitly:
 | --- | --- | --- |
 | B1/integrator | Wire `RootRegistry::take_run` and the sender into verified registry/transient units; verify root manifests, account registry, CAP_CHOWN/CAP_SETPCAP, NOFILE, device policy, cgroup cleanup and admission. | B1 owns host policy, registry, units and admission; this package provides both sides of its private bootstrap interface. |
 | A/C/D/integrator | Exercise real CLI profiles, inherited bridge fd, forwarder and capability lifecycle with signed runtime manifests. | Test payloads and a test syscall envelope cannot certify real runtime compatibility or those packages' services. |
-| Linux acceptance runner | Run the complete ignored suite and actual transient-unit launch on the three target distributions. | This session has macOS execution and cross-check evidence only. |
-| Implementation reviewer | Daybreak security review of the integrated implementation. | Independent code review here is not a Daybreak or protected-mode release acceptance. |
+| Linux acceptance runner | Run the complete ignored suite and actual transient-unit launch on the three target distributions. | This round has macOS execution and cross-check evidence only. |
+| Implementation reviewer | Designated security review of the integrated implementation. | Independent code review here is not the designated security review or a protected-mode release acceptance. |
 
 No live-provider, protected-mode, release or customer acceptance is claimed.
 No commit, merge, deployment, cargo fmt, gateway build or CLI build was performed.
 
 ### Round 2 observed checks
 
-All commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` in the assigned
-worktree. These are current-session observations, separate from the archive.
+All commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` on the development
+machine. These are round-2 observations, separate from the archive.
 
 | Command after that prefix | Observed result |
 | --- | --- |
@@ -848,7 +856,7 @@ No dependency or shared-contract change was needed in round 2.
 Independent code review covered the actual source. Fixed findings included the
 credential-change parent-death handling, an unread status queue on POLLHUP and
 negative F_GETFD handling; the runtime polling requirement is now explicit.
-This review does not substitute for the requested Daybreak implementation review.
+This review does not substitute for the designated security review.
 
 ### Round 1 evidence archive
 
@@ -859,13 +867,12 @@ section above will supersede that status. No earlier Linux execution is implied.
 ### Package B2 handoff — 2026-11-05
 
 Status: **PARTIAL — compiling implementation, B1 integration and native acceptance pending.**
-Branch: `feat/iso-b2-20261105`. No commit, merge, release or deployment was made.
-Only the assigned worktree was changed. No cargo fmt, gateway/CLI/workspace build,
-production data access or host configuration change was performed.
+No merge, release or deployment was made. No cargo fmt, gateway/CLI/workspace
+build, production data access or host configuration change was performed.
 
 #### Files
 
-Paths below are relative to the worktree.
+Paths below are relative to the repository root.
 
 | File | Change |
 | --- | --- |
@@ -919,7 +926,7 @@ All cargo commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`. No formatter w
 `git diff --check` passed. A whitespace/conflict-marker scan included the new,
 untracked files. Independent code review and follow-up static review found and
 closed the signal race, late exec-error reporting, forwarder-exit handling and
-supervisor initialization race. This was not a Daybreak security acceptance.
+supervisor initialization race. This was not the designated security review.
 
 #### Commands for the Linux builder
 
@@ -970,8 +977,8 @@ PIDs visible to test the seccomp rejection directly.
    PTY, capability fd handoff, supervisor-failure injection, exec failure,
    cancellation races, forwarder failure and namespace/cgroup teardown. Unit
    tests for the shared barrier do not substitute for this process-level evidence.
-5. Complete signed runtime allowlist compatibility tests and the implementation
-   Daybreak security review. No live-provider, protected-mode, release or customer
+5. Complete signed runtime allowlist compatibility tests and the designated
+   security review of the implementation. No live-provider, protected-mode, release or customer
    acceptance is asserted.
 
 #### CONTRACT CHANGE and deviations
@@ -1177,7 +1184,7 @@ The macOS session executed 9 egress portable tests and 29 unchanged contract
 tests: all passed. Linux x86_64 and Windows checks compile all test targets;
 they do not execute Linux code. No gateway/CLI/workspace build was run. No
 new third-party package/version or shared contract change was made in either round.
-The general independent code review is not the required Daybreak security review.
+The general independent code review is not the required designated security review.
 
 Final round 2 checks: macOS tests **38 passed, 0 failed**; Linux x86_64 and
 Windows GNU `--all-targets` checks **passed**; tracked and all 23 new-file
@@ -1234,7 +1241,7 @@ The all-tests command requires **both** DNS routes to be installed; otherwise
 select the individual applicable test filters. Install/test the unit templates
 on Ubuntu 22.04, Ubuntu 24.04 and Debian 12, including private `/run` projections
 and real cgroup BPF attachment readback (B1). The root tests have been written
-and Linux-cross-compiled, **not executed in this macOS worktree**. Aarch64 Linux
+and Linux-cross-compiled, **not executed on the macOS development machine**. Aarch64 Linux
 has not been cross-compiled here. Real DNS CNAME behavior, sustained traffic,
 runtime proxy compatibility and multi-package lifecycle remain acceptance gates.
 
@@ -1254,7 +1261,7 @@ Remaining integration ownership is explicit:
 - B1 installs accounts/units, selects the DNS bind and broker upstream IP rule,
   and reads back unit and cgroup BPF enforcement. C never grants the resolver
   an exception in the egress service itself.
-- The coordinator executes the Linux/root matrix, obtains Daybreak review and
+- The integrator executes the Linux/root matrix, obtains the security review and
   completes multi-package/provider/product acceptance. No deployment, merge,
   release or customer acceptance is claimed by this implementation.
 
@@ -1266,8 +1273,7 @@ its public control entry), `lib.rs` (Linux controller export), `resolver.rs`
 README, this note and the existing Unreleased entry were synchronized. The old
 wiki handoff was moved here; no security-gap note remains in `wiki/`.
 
-**CONTRACT CHANGE: none.** No commit was made. The existing worktree/branch belongs
-to the coordinating session; this session did not create or remove a worktree.
+**CONTRACT CHANGE: none.**
 
 ### Round 1 evidence (historical, moved from wiki)
 
@@ -1276,7 +1282,7 @@ x86_64 Linux and Windows all-target checks passing, and whitespace checks passin
 It listed 20 Linux library tests, 8 ordinary host integration tests and 2 ignored
 root tests as compiled only. Those are historical counts, superseded by the
 round 2 tests above. Its remaining gates (Linux execution, installed systemd/DNS,
-A/B1/B2 wiring, Daybreak and multi-package acceptance) remain explicitly assigned
+A/B1/B2 wiring, security review and multi-package acceptance) remain explicitly assigned
 above; none is inferred from the earlier compile results.
 
 The original package added `Cargo.toml` membership and only a package entry in
@@ -1288,10 +1294,9 @@ left unchanged because the assignment limits them to behavior actually enabled.
 ## Package E: disposable parse worker
 
 Round 2 implementation, 2026-11-05. This section contains the former
-`wiki/impl/native-linux-isolation-package-e-20261105.md` handoff and supersedes its
-remaining-work list. No commit, installation, migration, deployment or live
-protected-readiness acceptance was performed. The supplied worktree already
-existed; this session did not create a worktree.
+Package E development notes and supersedes their remaining-work list. No
+installation, migration, deployment or live protected-readiness acceptance was
+performed.
 
 ### Process and resource boundary
 
@@ -1423,14 +1428,14 @@ Compatibility review of these additions is still required at integration.
   service fds. Parse operations LoadModel/LocalInference/TranscribeAudio/
   SynthesizeSpeech are explicitly unsupported by this document/media worker.
 - Ubuntu 22.04, Ubuntu 24.04 and Debian 12 runtime acceptance, aarch64 runtime,
-  gateway/CLI remote compilation, and Daybreak review remain unverified. The
-  engineering subagent review is not a Daybreak approval. No full-product
+  gateway/CLI compilation on the build host, and the designated security review
+  remain unverified. The internal engineering review is not that approval. No full-product
   readiness, gateway load-test, cgroup OOM-killer or customer acceptance claim is
   made by passing small-crate tests or cross-compilation.
 
-### Validation and remote commands
+### Validation and build host commands
 
-Normal developer checks (no gateway/CLI build on the shared Mac):
+Normal developer checks (no gateway/CLI build on the development machine):
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-parse-worker --features engine --offline
@@ -1440,7 +1445,7 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check --target x86_64-pc-windows-gn
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check -p duduclaw-parse-worker --no-default-features --offline
 ```
 
-Remote builder (explicitly not run locally):
+Build host (explicitly not run on the development machine):
 
 ```sh
 cargo check -p duduclaw-gateway -p duduclaw-cli
@@ -1508,7 +1513,7 @@ consumer tests are written but not run locally under the delegated build limit.
 
 Engineering review found and fixed the leftover public Office refusal and async
 worker waits in screenshot/web callers. A subsequent review found no new
-HIGH/CRITICAL in the reviewed diff. This is not a Daybreak security signoff.
+HIGH/CRITICAL in the reviewed diff. This is not the designated security signoff.
 
 ### Full uncommitted package file inventory
 
@@ -1572,12 +1577,12 @@ The shared contract changes are explicitly listed above.
 | `crates/duduclaw-parse-worker/tests/systemd.rs` | Six ignored real-systemd tests; one further ignored resource test is in sandbox.rs. |
 | `docs/README.md` | Architecture note index. |
 | `docs/architecture/native-linux-isolation.md` | Internal Package E implementation, seams, tests and handoff. |
-| `docs/features/05-security-defense.md` | English unreleased behavior and acceptance boundaries. |
+| `docs/features/05-security-defense.md` | English behavior (planned for v1.82.0) and acceptance boundaries. |
 | `docs/features/ja-JP/05-security-defense.md` | Japanese behavior and acceptance boundaries. |
 | `docs/features/zh-TW/05-security-defense.md` | Traditional Chinese behavior and acceptance boundaries. |
 | `wiki/impl/native-linux-isolation-package-e-20261105.md` | Removed; relevant historical evidence and handoff moved into this Package E section. |
-This is an implementation handoff, not evidence that protected employee isolation
-or a production update is ready. Each implementation package owns its section.
+This is an implementation record, not evidence that per-employee Linux isolation in
+protected installations or a production update is ready. Each implementation package owns its section.
 
 ## Package F
 
@@ -1585,8 +1590,8 @@ Status: **Round 2 implementation present; integration and native acceptance pend
 The production Linux activator now switches `current`, stops/restarts fixed units,
 checks genuine live readbacks, and advances the floor only after health. It uses
 real socket/systemd adapters, not `UnavailableActivator`. Missing A/B/C/G seam
-endpoints fail closed before publication. No customer service was enabled, no
-commit was made, and no gateway/CLI/workspace build ran in this worktree.
+endpoints fail closed before publication. No customer service was enabled, and
+no gateway/CLI/workspace build ran on the development machine.
 Provisioning and cross-package wiring remain integration work; this source must
 not replace an existing v1.79.3 installation by itself.
 
@@ -1865,9 +1870,9 @@ high floor **and** satisfy minimum-version against the actual running version.
 - Run the ignored native Linux/systemd tests on Ubuntu 22.04/24.04 and Debian 12,
   then the integrated full update, reboot/power-cut, bootstrap and dashboard
   roundtrip. macOS tests and Linux cross-checks do not establish those outcomes.
-- Remote gateway/CLI builds, web checks with dependencies installed, and the
-  independent `gpt-daybreak-blue-latest` review remain required. Ordinary code
-  review was performed; no Daybreak model was callable in this session.
+- Gateway/CLI builds on the build host, web checks with dependencies installed,
+  and the independent designated security review remain required. Ordinary code
+  review was performed; the designated review was not available in this round.
 
 ### Validation commands
 
@@ -1879,7 +1884,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_sign_isolation_manifest.p
 python3 -m unittest discover -s scripts/tests -p 'test_protected_auto_upgrade.py' -v
 # Root VM, systemd as PID 1, python3 and provisioned duduclaw-dl account:
 CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 cargo test -p duduclaw-updated -- --ignored iso_root_ --test-threads=1
-# Assigned remote builder only:
+# Build host only:
 cargo test -p duduclaw-gateway protected_update_
 cargo test -p duduclaw-gateway restart_pending_tests
 cargo test -p duduclaw-cli service_protected_
@@ -1903,13 +1908,11 @@ npx vitest run src/lib/protected-update.test.ts src/components/settings/sections
 | `git diff --check` | Passed |
 | Web dependency check | `web/node_modules` absent; tsc/vitest not run |
 | Native Linux / systemd / real FIDO2 / physical power cut | Not run on this macOS host |
-| Independent ordinary code review | Identified startup/readback capability, cold-boot race, premature public success and emergency recovery issues; corrected and re-reviewed without remaining identified high/critical correctness blockers. This is not Daybreak acceptance. |
+| Independent ordinary code review | Identified startup/readback capability, cold-boot race, premature public success and emergency recovery issues; corrected and re-reviewed without remaining identified high/critical correctness blockers. This is not the designated security review. |
 
 No external dependency, shared contract, gateway/CLI/web source or Cargo manifest
-was changed in round 2. Their round 1 edits remain uncommitted. No `cargo fmt`,
-commit, release, deployment or customer-machine operation was performed. This
-session did not create a worktree, so the assigned worktree is retained for the
-integrator.
+was changed in round 2. No `cargo fmt`, release, deployment or customer-machine
+operation was performed.
 
 | Round 2 file | Change |
 | --- | --- |
@@ -1948,9 +1951,8 @@ The following original evidence was moved out of the published wiki. Its remaini
 
 ### Package F implementation handoff — 2026-11-05
 
-Status: **PARTIAL**. Work is confined to the assigned existing worktree and branch
-`feat/iso-f-20261105`. No commit, branch switch, merge, release, deployment or
-customer-machine action was performed. The new small crate compiles; the full
+Status: **PARTIAL**. No merge, release, deployment or customer-machine action
+was performed. The new small crate compiles; the full
 package is not ready to enable. Gateway/CLI/web compilation remains unverified.
 
 #### Implemented
@@ -1993,9 +1995,10 @@ package is not ready to enable. Gateway/CLI/web compilation remains unverified.
    GoTrust. SK Ed25519 currently has synthetic crypto vectors only.
 7. Linux root/systemd acceptance, all three supported distributions, actual
    downloader IDs and descriptor lifetime, reboot/power-cut A/B and update lifecycle.
-8. Remote gateway/CLI/web builds and tests, then independent Daybreak review.
-   Ordinary independent code review was performed, but no Daybreak model is
-   available in this session; it is not claimed as security acceptance.
+8. Gateway/CLI/web builds and tests on the build host, then the independent
+   designated security review. Ordinary independent code review was performed,
+   but the designated review was not available in this round; it is not claimed
+   as security acceptance.
 
 The exact interfaces, root filesystem layout and limits are recorded in
 [the Package F architecture note](#package-f).
@@ -2313,7 +2316,7 @@ These native tests are cross-compiled, NOT executed on Linux. Their interruption
 hooks are software fault injection, not physical power-loss tests. Ubuntu 22.04 /
 5.15, Debian 12 / 6.1 and Ubuntu 24.04 / 6.8 execution is the upstream VM gate.
 Real thin-LV-under-crypt fixtures, live topology replacement, non-cooperating loop
-races, physical power-loss and Daybreak security review remain acceptance work.
+races, physical power-loss and the designated security review remain acceptance work.
 Pure fixtures cover recursive thin-under-crypt rejection, canonical topology /
 target change detection and bounded graph refusal. B1 runtime wiring and monitoring
 remain with its integrator against `EmployeeStorage`; H's side is implemented.
@@ -2322,7 +2325,7 @@ No release, live-provider, customer acceptance or active isolation is claimed.
 Independent code review of round 2 found no confirmed critical/high blocker; it
 caught an alias test initially masked by inventory rejection. The test now calls
 the identity check directly with exact errors. The reviewer did not execute Linux
-tests or perform the separate formal Daybreak security review. No shared wire
+tests or perform the separate formal security review. No shared wire
 schema, canonical bytes, hard limits or dependencies changed in round 2.
 No Package H handoff/security-gap notes were found under wiki/impl or wiki/reports;
 all H handoff notes remain in this internal document.
@@ -2399,7 +2402,7 @@ ABIs above 7 (`UnsupportedKernel`). I1 changes that policy to use the ABI-7
 ruleset on newer kernels. The ABI-8 row above remains the observed historical
 result; the changed code still needs a new native acceptance run.
 
-Daybreak security review of these fixes: three rounds; the reported MEDIUM and
+Designated security review of these fixes: three rounds; the reported MEDIUM and
 LOW findings in the userdb client were fixed and the final pass reported no
 finding. Not covered by any root test yet: live SSH/su/cron/at login attempts
 against employee accounts, spawnd-to-B2 end-to-end launch through a real
@@ -2411,7 +2414,7 @@ refusal, A/B update power-cut, migration (G) and MCP boundary (D).
 Status: **partial integration, not enabled**. This change adds the gateway-owned
 MCP boundary component and an adapter into the existing CLI dispatcher. It does
 not activate the protected execution backend, alter existing employee MCP
-configuration, or establish production employee isolation. The contract crate's
+configuration, or establish production per-employee Linux isolation. The contract crate's
 wire formats, signing bytes and hard limits are unchanged.
 
 ### Capability and connection lifecycle
@@ -2598,7 +2601,7 @@ paths, unavailable platform behavior, bounds and SQLite constraints.
 Linux-only tests add socketpair notification/EOF/revocation/concurrency, pathname
 socket rejection, symlink-swap, hardlink/FIFO refusal and real bridge byte pump.
 They need no root; filesystem fixtures use `/dev/shm` for a nodev mount. They
-have been cross-checked for compilation, not run on Linux in this session.
+have been cross-checked for compilation, not run on Linux in this round.
 
 Upstream commands:
 
@@ -2618,14 +2621,14 @@ production `LiveAuthority` backed by durable policy/principal/binding state;
 administration/migration/connector/credential-lease integration; live acceptance of the in-process egress
 ledger; all remaining handler resource/openat2 migrations and
 execution/parser routing to A/E; native Linux tests, gateway/CLI builds and
-designated Daybreak security review. No contract change and no new external
+the designated security review. No contract change and no new external
 dependency versions were introduced; round 2 adds a direct dependency on the
 already-locked url 2.5.8 for canonical origin parsing; the component reuses locked crypto,
 Tokio, rustix/libc and optional SQLite dependencies.
 
 ### Round 1 evidence (2026-11-05)
 
-Executed on macOS in the supplied worktree, with no commit and no cargo fmt:
+Executed on macOS on the development machine, with no cargo fmt:
 
 | Command | Result |
 | --- | --- |
@@ -2637,7 +2640,7 @@ Executed on macOS in the supplied worktree, with no commit and no cargo fmt:
 
 An independent read-only code review found fd ownership, notification ordering,
 nodev, lock ordering, Linux fixture and denial-rate-limit issues; these were
-corrected and re-reviewed. This is not the designated Daybreak security review.
+corrected and re-reviewed. This is not the designated security review.
 There are eight new CLI tests under `mcp_isolation::tests`, not executed locally.
 Public security feature pages are unchanged because this component is not
 startup-enabled and adds no deployed isolation guarantee.
@@ -2688,7 +2691,7 @@ not complete the 256 non-file tool implementations or their handler-local gates.
 Those are outstanding implementation work, not merely unrun tests. The defaults
 refuse them. The gateway startup and every real runtime remain unintegrated.
 
-Executed locally on macOS, only within the supplied worktree:
+Executed on the macOS development machine:
 
 | Command | Result |
 | --- | --- |
@@ -2728,14 +2731,14 @@ server definition. The shell/uid fixture cannot issue those receipts.
 Independent static review found schema/identity mismatch, process-env approval
 attribution, skipped completion audit/feedback, and connector I/O inside the
 ledger mutex. These were fixed and re-reviewed. The review still identifies the
-missing production service/record-policy implementations. This was not a
-`gpt-daybreak-blue-latest` security review; that remains unperformed.
+missing production service/record-policy implementations. This was not the
+designated security review; that remains unperformed.
 
 No changes to isolation wire formats, canonical signing bytes or hard limits.
 No new external dependency versions; `url = "2"` resolves to the already-locked
 2.5.8. No wiki notes were added; scanning `wiki/impl` and `wiki/reports` found no
-Package D handoff notes to move. No commit, release, deployment, remote execution,
-worktree creation/removal, or cargo fmt was performed.
+Package D development notes to move. No release, deployment, build host
+execution or cargo fmt was performed.
 
 Round 2 file changes (in addition to the retained round 1 working tree):
 
@@ -2763,7 +2766,7 @@ Round 2 file changes (in addition to the retained round 1 working tree):
 | `crates/duduclaw-cli/src/mcp/dispatch.rs` | Route isolated handlers through the common completion path. |
 | `crates/duduclaw-cli/src/mcp/approval.rs` | Task audience correlation from immutable context, no env fallback. |
 | `crates/duduclaw-gateway/src/isolation_mcp.rs` | Expose runtime preparation seam. |
-| `crates/duduclaw-gateway/src/isolation_egress.rs` | Trusted run-to-turn/session scope and two remote-only tests. |
+| `crates/duduclaw-gateway/src/isolation_egress.rs` | Trusted run-to-turn/session scope and two build-host-only tests. |
 | `crates/duduclaw-gateway/src/egress_client.rs` | In-process ledger routing and captured direct read/sink lifecycle. |
 | `crates/duduclaw-gateway/src/egress_guard.rs` | Direct ledger operations retaining existing policy/connector checks. |
 | `crates/duduclaw-gateway/src/approval/turn_origin.rs` | Isolated approval origin precedes legacy feedback/env lookup. |
@@ -2813,7 +2816,7 @@ registry rather than counting source strings.
   Preparation failures cancel the reservation; cancellation of the request
   also attempts cleanup. Spawn failures remain uncertain. A still owns
   authoritative lifecycle cancellation. Worker plans must be offline.
-  **No production `ExecutionPlanFactory` exists in this worktree**; it must
+  **No production `ExecutionPlanFactory` existed in this round**; it must
   reuse actual handler policy and provide trusted registered operations.
 - `hardware_info`, `model_search`, and `model_recommend` use Execution despite
   their read effect: `detect_hardware` can start `nvidia-smi` / `rocm-smi`.
@@ -2851,7 +2854,7 @@ Remaining implementation, not merely unrun tests:
    cross-employee target mapping, and background provenance. No executable path
    or host argv is accepted from an employee to fill these gaps.
 4. Existing startup, live authority, runtime fd receipts, native Linux tests,
-   and designated Daybreak security review remain outstanding.
+   and the designated security review remain outstanding.
 
 Round-3 local verification (no gateway/CLI build, no cargo fmt):
 
@@ -2921,13 +2924,13 @@ Round-3 file changes (rounds 1–2 are retained):
 | `crates/duduclaw-mcp-boundary/src/execution.rs` | Concrete A backend handoff and reservation cancellation. |
 | `crates/duduclaw-mcp-boundary/src/execution_tests.rs` | Seven backend/plan/cancellation tests. |
 | `CHANGELOG.md` | Keep the feature explicitly unfinished and disabled. |
-| `docs/architecture/native-linux-isolation.md` | This handoff, evidence, remote filters and unresolved production work. |
+| `docs/architecture/native-linux-isolation.md` | This record, evidence, build host filters and unresolved production work. |
 
 An independent code review found the initial record-route resource bypass,
 global telemetry exposure, and collection snapshot problem. Signed-resource
 checks were restored, global/collection handlers remain on Resource, and the
 service test was corrected. This was a general code review, not the required
-Daybreak security review. No contract schema, signing bytes, hard limits or
+designated security review. No contract schema, signing bytes, hard limits or
 new dependency version changed in round 3.
 
 ## Package D round 5 — employee feature parity
@@ -2991,7 +2994,7 @@ The A boot integration must install its real live resolver and populate this
 metadata when it admits a run, plus a `UtilityRunner` for policy judges.
 Optional workflow sessions are supplied with `with_workflow_session(run, id, secret)`
 and only attached to that verified run; secrets stay gateway-side.
-This worktree contains the consumer contract and
+This round contains the consumer contract and
 regression fixtures, not A's production admission wiring. Without that wiring,
 readiness of the tool inventory alone is not a runnable-install acceptance.
 
@@ -3059,7 +3062,7 @@ compensation after async calls return.
 
 This is component implementation, not native deployment acceptance. The signed
 `duduclaw-migration-platform` executable and production Employee allocation backend
-are still absent from this worktree; the new materialization path requires their
+were still absent in this round; the new materialization path requires their
 live stopped-process, UID, mount and quota proof. Gateway/CLI were not built in
 this security task, and real Linux root materialization remains unverified.
 The prior round notes below are historical evidence, not this patch's test results.
@@ -3099,8 +3102,8 @@ Round 3b changes and evidence:
 | `crates/duduclaw-import/scripts/capture_schedule_schemas.py`; `src/autopilot-v1793.sql`; `src/workflow-v1793.sql`; gateway `src/migration_import.rs` | Reproducible schema catalogs and remote gateway catalog-drift assertions against the normal store constructors. Catalog generation succeeded; gateway assertions are written but not run locally. |
 | `crates/duduclaw-import/src/authority_config.rs`; `src/authority.rs` | Employee action rules/trusted-read hints become separate inactive Policy proposals requiring re-entry; malformed shapes are withheld. MCP URL fragments join userinfo/query redaction. Focused canary tests pass. |
 | `crates/duduclaw-migration/src/import_profile.rs`; `src/import_launcher.rs`; `src/lib.rs`; importer `systemd/duduclaw-import@.service` | Portable sandbox readback checks; add arm64 `mkdirat`; test reference-unit parity and reject widened/missing properties. Accept only the explicit syscall list plus the reviewed fixed systemd v249/v252/v255 implicit defaults, never arbitrary groups. Actual DynamicUser launch is still unverified. |
-| `crates/duduclaw-migration/src/import_manifest.rs`; gateway `src/migration_startup.rs` | Shared pure boot decision with portable tests: explicit import requests cannot fall back to normal startup, and an unfinished manifest for this home blocks ordinary boot. Gateway/CLI startup process tests still require the remote builder. |
-| `CHANGELOG.md`; importer `README.md`; security-defense feature docs in all three languages; this document | Updated unreleased behavior and evidence boundaries. |
+| `crates/duduclaw-migration/src/import_manifest.rs`; gateway `src/migration_startup.rs` | Shared pure boot decision with portable tests: explicit import requests cannot fall back to normal startup, and an unfinished manifest for this home blocks ordinary boot. Gateway/CLI startup process tests still require the build host. |
+| `CHANGELOG.md`; importer `README.md`; security-defense feature docs in all three languages; this document | Updated planned (not yet enabled) behavior and evidence boundaries. |
 
 The scheduling readers deliberately do not restore executable workflows or
 reminder delivery. Full category **extraction coverage** is tested; full category
@@ -3118,7 +3121,7 @@ The default expansion was checked against official [v249 transient-unit
 code](https://github.com/systemd/systemd/blob/v249/src/core/dbus-execute.c) and
 [v255 syscall definitions](https://github.com/systemd/systemd/blob/v255/src/shared/seccomp-util.c).
 The final reviewer reported no remaining finding in that correction. This is not
-formal Daybreak review or native systemd acceptance. During development the new
+the formal security review or native systemd acceptance. During development the new
 users fixture omitted a required `bound_at` column; the fixture was fixed before
 the final passing run. Shared isolation wire formats/hard limits are unchanged.
 
@@ -3128,14 +3131,14 @@ gateway Admin/MCP test is distinct from the new portable integration test above.
 
 Status: **PARTIAL — round 3 adds runnable G components, but the requested full
 migration and all authority apply categories are NOT complete.** No commit,
-release, deployment or production migration was performed. This worktree still
+release, deployment or production migration was performed. This round still
 lacks the F/B/H platform adapter and several normal product apply/readback paths;
 `run` therefore still refuses before taking the old service offline on an install
 without that adapter. This is not end-to-end migration acceptance.
 
 ### Round 3 implementation and remaining gates (2026-11-05)
 
-Implemented in this worktree:
+Implemented in this round:
 
 - A real `systemd-run` DynamicUser importer launcher. Root verifies systemd
   properties, MainPID, actual UID, capabilities, NoNewPrivileges, seccomp and a
@@ -3233,7 +3236,7 @@ not an available production migration path.
 
 1. `InstalledPlatform` is a fixed, bounded, root-owned adapter protocol, but its
    expected `duduclaw-migration-platform` executable is **not implemented or
-   installed in this worktree**. F/B/H must supply signed preflight, live final
+   installed in this round**. F/B/H must supply signed preflight, live final
    ownership/quota/protocol checks and fresh service activation. Thus the normal
    CLI `run` remains unavailable without that integration; substituting this seam
    did not by itself satisfy the requested end-to-end flow.
@@ -3249,8 +3252,8 @@ not an available production migration path.
    require re-entry; a notice is not a restored provider connection.
 4. First-admin bootstrap issuer/claim-route integration, final completion report,
    installed expiry timers, cross-filesystem quarantine and file-tree recovery.
-5. Remote gateway/CLI compile/tests, actual v1.79.3 root migration on the three
-   Linux distributions and formal Daybreak review.
+5. Gateway/CLI compile/tests on the build host, actual v1.79.3 root migration on
+   the three Linux distributions and the formal security review.
 
 Shared `duduclaw-isolation` wire formats and hard limits are unchanged. Package G
 has a private manifest/handshake protocol and additive private proposal fields.
@@ -3288,8 +3291,8 @@ test transcript (the earlier `/tmp/iso-g-round3-import-final.log` predates the
 additional sources). During development an importer fixture INSERT and the new
 retry test's error-comparison assertion failed; both were fixed and their suites
 then passed. Independent static reviews closed the import-boot, secret/schema,
-Shared proof, normal-write ownership and retry findings. This is not a formal
-Daybreak review and does not replace gateway compilation.
+Shared proof, normal-write ownership and retry findings. This is not the formal
+security review and does not replace gateway compilation.
 
 Run on the remote Linux builder (not on the shared 16 GB Mac):
 
@@ -3352,7 +3355,7 @@ npx tsc -b
 npx vitest run src/pages/MigrationConfirmationsPage.test.tsx src/components/layout/nav-model.test.ts src/components/FirstRunGate.test.tsx
 ```
 
-Round 3 file responsibilities (rounds 1–2 remain uncommitted in this worktree):
+Round 3 file responsibilities (including the rounds 1–2 changes):
 
 | Files | Change |
 | --- | --- |
@@ -3405,7 +3408,7 @@ and host-credential inheritance and requires MFA.
 
 `status`, `export-records` and `expire` are implemented. `new-setup-token` has a
 root-terminal/stage-gated `RootBootstrapIssuer` seam, not a working issuer: this
-worktree has no setup-token claim route. The adapter must use the gateway's
+round has no setup-token claim route. The adapter must use the gateway's
 already-open fresh UserDb and return the actual product URL; root never opens
 gateway-owned SQLite/WAL and never prints a fabricated link. Recovery exports inert
 JSONL into a new root-owned directory, not a restored runnable installation.
@@ -3527,7 +3530,7 @@ but await the remote gateway builder.
   final isolation/protocol/ownership/quota readback and completion reporting.
 - Cross-filesystem quarantine, file-tree recovery and installed expiry timer.
 - Three-distribution root acceptance, actual v1.79.3 upgrade, gateway/CLI build,
-  web TypeScript/Vitest/browser checks and formal Daybreak security review.
+  web TypeScript/Vitest/browser checks and the formal security review.
 
 Dependencies added to these small crates already existed in Cargo.lock (including
 chrono/tempfile/libc/sha2); no heavy new dependency or shared contract change.
@@ -3556,10 +3559,10 @@ SQLite heap limits and escaped unit names. Final static re-review confirmed that
 credential rotation preserves later budget/priority/label/tag edits, partial-write
 errors are described accurately, and zero-quota blob replay only accepts a verified
 existing artifact. Gateway tests cover same-value retry after a committed secret
-write with failed runtime readback; they are still remote-only, not executed here.
-This is not a formal Daybreak review.
+write with failed runtime readback; they run on the build host only and were not
+executed in this round. This is not the formal security review.
 
-Remote builder commands (not run locally):
+Build host commands (not run on the development machine):
 
 ```sh
 cargo test -p duduclaw-cli legacy_protected_upgrade_cannot_bypass_migration
@@ -3635,7 +3638,7 @@ Round 2 file responsibilities (in addition to the historical round 1 list):
 
 #### Package G 交付紀錄（2026-11-05）
 
-狀態：**PARTIAL**。只修改交辦 worktree，沒有 commit、沒有建立或移除 worktree、沒有操作既有安裝或客戶資料。共用 contract 無變更。
+狀態：**PARTIAL**。沒有操作既有安裝或客戶資料。共用 contract 無變更。
 
 本輪交付可測試的遷移元件、內容匯入器、首位管理員原子領取、唯讀確認頁與舊安裝器的跨版本拒絕。這不等於完成 Package G，也不能執行完整 v1.79.3 遷移。詳細介面與限制見 [實作說明](../../docs/architecture/native-linux-isolation.md)。
 
@@ -3652,13 +3655,13 @@ Round 2 file responsibilities (in addition to the historical round 1 list):
 
 合計實際執行 79 個不重複測試通過。早期 migration 測試因 journal 測試使用 enum 不支援的 struct update 語法失敗，修正後已由上述完整指令重跑通過。Importer 保留有說明的 unsafe syscall/SQLite FFI，workspace `unsafe_code=warn` 會印警告。
 
-未跑 gateway／CLI／workspace build（依交辦資源限制）；未跑 web TypeScript／Vitest（`web/node_modules` 不存在，未安裝依賴）；未跑 Linux 原生、Windows、設計畫布或瀏覽器驗收。Linux 交叉型別檢查不能替代上述驗證。
+未跑 gateway／CLI／workspace build（開發機資源限制）；未跑 web TypeScript／Vitest（`web/node_modules` 不存在，未安裝依賴）；未跑 Linux 原生、Windows、設計畫布或瀏覽器驗收。Linux 交叉型別檢查不能替代上述驗證。
 
 ##### 審查
 
-獨立 code-reviewer 看過實際變更；指出的缺 version-floor 放行、proposal 總量上限及 inherited fd 的 unsafe precondition 已修正並複查。archive I/O 錯誤後禁止再次加密以避免 nonce 重用，另有回歸測試。沒有正式 `gpt-daybreak-blue-latest` 安全審查，不能視為 Daybreak GO。
+獨立 code-reviewer 看過實際變更；指出的缺 version-floor 放行、proposal 總量上限及 inherited fd 的 unsafe precondition 已修正並複查。archive I/O 錯誤後禁止再次加密以避免 nonce 重用，另有回歸測試。沒有做正式的指定安全審查，不能視為安全審查放行。
 
-##### 精確未完成項目（該輪當時；2026-11-09 現況：遷移 root 命令、匯入、確認頁與產品 adapters 已在 v1.81 整合分支接上，實機與真實供應商驗收仍待執行）
+##### 精確未完成項目（該輪當時；2026-11-09 現況：遷移 root 命令、匯入、確認頁與產品 adapters 的程式碼已包含在 v1.81.0 但尚未啟用，預計 v1.82.0 提供；實機與真實供應商驗收仍待執行）
 
 1. 尚無可操作的 `duduclaw-migrate` root 命令及 installer 遷移接線。`HostAdapter` 沒有 production implementation：root flock、停止舊 gateway、mask/timer/socket/cron/at/user-manager 封鎖、清空舊 uid 程序與讀回待做。舊 installer 目前只會拒絕跨入 v1.80。
 2. 快照走訪／AEAD 元件已有，但 fsync＋原子發布＋解密驗證整合、人工安全還原、期限清理及跨檔案系統複製待做。quarantine helper 只有同檔案系統 `RENAME_NOREPLACE`，呼叫端須先停止舊環境並封存父目錄權限。
@@ -3667,9 +3670,9 @@ Round 2 file responsibilities (in addition to the historical round 1 list):
 5. root-only gateway import endpoint、完整 stream 暫存到 worker 成功結束、host-bound migration/employee/source handle 檢查、正常 content API／最低信任 lineage 寫入未接線。Importer stdout 不可直接當成功完整匯入。
 6. 真實 session CSRF／step-up provider、每一類權威提案的正常寫入驗證／stage／publish／readback／disable adapter、secret vault／rotation verifier 未接線。因此 UI 只讀，所有 mutation RPC 拒絕；目前只有 Department 可批次核准的 engine 策略也較設計保守。
 7. 舊員工名稱對 immutable id、確認後 UID／loop 配置與容量檢查、舊使用者邀請、Personal owner 重新登入綁定、部分套用資源 tombstone／清除等，都仍是必須實作的 product adapters。
-8. 三個 Linux 發行版的原生／root 測試、完整 legacy planted authority 端到端遷移、gateway／CLI build、web build/tests/視覺驗收與正式 Daybreak 審查待做。
+8. 三個 Linux 發行版的原生／root 測試、完整 legacy planted authority 端到端遷移、gateway／CLI build、web build/tests/視覺驗收與正式安全審查待做。
 
-##### 下一位執行者的驗證指令
+##### 後續驗證指令
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-migration --offline
@@ -3679,7 +3682,7 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-auth otp::tests --
 cargo test -p duduclaw-import --test linux_binary -- --nocapture
 #### Linux root，可拋棄測試機
 cargo test -p duduclaw-migration -- --ignored iso_root_
-#### 遠端 builder：本地明確未跑
+#### 建置主機：開發機上明確未跑
 cargo test -p duduclaw-cli legacy_protected_upgrade_cannot_bypass_migration
 cargo test -p duduclaw-gateway migration_confirmation_methods_are_exact
 cd web
@@ -3693,7 +3696,7 @@ npx vitest run src/pages/MigrationConfirmationsPage.test.tsx src/components/layo
 
 ##### 檔案清單
 
-- `CHANGELOG.md`：未發行功能、認證與舊升級拒絕紀錄。
+- `CHANGELOG.md`：開發中功能、認證與舊升級拒絕紀錄。
 - `Cargo.lock`：登錄新 crates 的既有依賴。
 - `Cargo.toml`：加入兩個新 workspace members。
 - `crates/duduclaw-auth/src/db.rs`：setup token 用途／嘗試次數 schema 與舊 token 撤銷。
@@ -3739,7 +3742,7 @@ npx vitest run src/pages/MigrationConfirmationsPage.test.tsx src/components/layo
 - `web/src/lib/migration-confirmations.ts`：typed RPC request 與選取規則。
 - `web/src/pages/MigrationConfirmationsPage.test.tsx`：高風險／未就緒／遮罩／讀回失敗測試。
 - `web/src/pages/MigrationConfirmationsPage.tsx`：純文字檢視／秘密遮罩／唯讀拒絕 UI。
-- `wiki/reports/native-linux-isolation-package-g-2026-11-05.md`：交付證據、完整剩餘工作與遠端驗證指令。
+- `wiki/reports/native-linux-isolation-package-g-2026-11-05.md`：交付證據、完整剩餘工作與建置主機驗證指令。
 
 ## Package I1 — runtime integration (2026-11-05)
 
@@ -3749,8 +3752,8 @@ and is superseded where round 2 describes changed behavior.**
 ### Round 1 — historical integration subset
 
 Status: **PARTIAL — development wiring, not a runnable protected TEAM install.**
-This worktree remains uncommitted. No gateway/CLI/workspace build, installation,
-account mutation, migration or native-root test was performed in this session.
+No gateway/CLI/workspace build, installation, account mutation, migration or
+native-root test was performed in this round.
 The existing subprocess fence remains fail-closed. There is no new local-backend
 fallback. The remaining integration must not treat this diagnostic report or
 small-crate tests as full-product acceptance.
@@ -3830,8 +3833,8 @@ full isolation. No shared wire layout or capability canonical bytes changed.
 
 For the design §15 table: Linux 5.15/6.1/6.8 keep their detected ABI 1/2/4
 policies; a kernel reporting ABI 8 or later selects ABI 7. The external design
-file was not edited because this assignment restricts writes to this worktree.
-The handoff described this policy as pending owner confirmation; implementing
+file was not edited in this round.
+The design notes described this policy as pending owner confirmation; implementing
 it here is not owner release approval. Historical ABI-8 failures in the earlier
 acceptance table remain historical facts; the modified code requires re-testing.
 
@@ -3864,17 +3867,17 @@ acceptance table remain historical facts; the modified code requires re-testing.
    double-fork leftover, `WouldDeadlock`, and real SSH public-key/su/user-manager/
    crontab/at failures. No placeholder E2E test was added: the production chain
    needed to exercise it is still missing.
-8. Remote gateway/CLI compilation, frontend type-check/tests, the three Linux
-   distributions (including ABI 8+), native Windows/macOS regression where
-   applicable, and formal Daybreak security review remain required.
+8. Gateway/CLI compilation on the build host, frontend type-check/tests, the
+   three Linux distributions (including ABI 8+), native Windows/macOS regression
+   where applicable, and the formal security review remain required.
 
-### Validation and acceptance handoff
+### Validation and acceptance follow-up
 
 Actual commands and counts are recorded below. Cross-target
 checking is compilation/type checking, never native execution. No tests matching
 zero cases count as a test pass.
 
-Remote gateway/frontend checks (not run locally):
+Gateway/frontend checks on the build host (not run on the development machine):
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway isolation_readiness::tests
@@ -3883,8 +3886,8 @@ npx tsc -b
 npx vitest run src/components/IsolationReadinessBanner.test.tsx
 ```
 
-There are 5 new gateway cases and 7 UI cases. `web/node_modules` is absent in
-this worktree, so frontend dependencies were not installed. Local build limits
+There are 5 new gateway cases and 7 UI cases. `web/node_modules` was absent on
+the development machine, so frontend dependencies were not installed. Local build limits
 prohibit compiling gateway/CLI; the above remains an explicit unverified gate.
 
 Root builder commands, only on a disposable Linux VM:
@@ -3928,7 +3931,7 @@ The four final macOS test selections total **74 passed, 0 failed**; the earlier
 review covered B2, gateway/web and B1/H. The live-edition latch, misleading
 privilege-receipt wording, fabricated unknown-device sentinel and invalid-input
 journal poisoning findings were corrected. No unresolved Critical/High/Medium
-was reported in that code review. It was **not** formal Daybreak review.
+was reported in that code review. It was **not** the formal security review.
 
 **CONTRACT CHANGE:** none to `duduclaw-isolation` wire formats, canonical bytes or
 hard limits. Additive internal APIs are H's `ImageStatus`/`EmployeeStorage::images`,
@@ -3974,15 +3977,14 @@ reuse existing workspace crates; no new third-party dependency or version.
 | `docs/architecture/native-linux-isolation.md` | This evidence-bounded handoff and corrected ABI history/current policy. |
 | `CHANGELOG.md` | Self-contained unreleased diagnosis and Landlock compatibility entries. |
 
-### Round 2 — historical integration handoff (2026-11-05)
+### Round 2 — historical integration record (2026-11-05)
 
-**PARTIAL / NOT READY FOR DEPLOYMENT.** Work remains uncommitted in the assigned
-worktree. This round changes TEAM admission from diagnostics into refusal at
+**PARTIAL / NOT READY FOR DEPLOYMENT.** This round changes TEAM admission from diagnostics into refusal at
 execution entry points, and adds real transport/lifecycle implementations. It
 still does not produce a runnable protected TEAM installation: the authoritative
 installation and runtime producers below are missing. No protected employee was
 executed here. No gateway/CLI/workspace build, root test, deployment, customer
-acceptance or formal Daybreak review was performed.
+acceptance or formal security review was performed.
 
 | Requested priority | Current implementation | Remaining closure |
 | --- | --- | --- |
@@ -4151,9 +4153,10 @@ partial imported-setting re-entry are not integrated.
    D8 second-run admission including a double-fork leftover, same-employee
    WouldDeadlock and actual ssh public-key/ssh forwarding/su/user-manager/cron/at
    rejection. Do not relabel the narrow fixtures below as that acceptance.
-7. Compile/test gateway and CLI remotely; run frontend checks when dependencies
-   exist; run root fixtures on disposable Ubuntu 22.04/24.04 and Debian 12,
-   including newer Landlock ABI. Formal Daybreak review remains a separate gate.
+7. Compile/test gateway and CLI on the build host; run frontend checks when
+   dependencies exist; run root fixtures on disposable Ubuntu 22.04/24.04 and
+   Debian 12, including newer Landlock ABI. The formal security review remains a
+   separate gate.
 
 #### Round-2 validation and remote filters
 
@@ -4262,7 +4265,7 @@ not changed again remain described in the preceding table. Review found and
 corrected retained-backend admission bypass, EOF false readiness, incomplete
 init-stage evidence, fast-exit outcome loss, clock-domain mismatch, G compensation/
 monitor/retry issues and API-only MoA/tool-loop omissions. This is ordinary
-independent code review, **not** the required formal Daybreak security sign-off.
+independent code review, **not** the required formal security sign-off.
 
 **CONTRACT CHANGE:** no change to `duduclaw-isolation` wire formats, capability
 canonical bytes or hard limits. New protocols are private F health and G/B1
@@ -4270,13 +4273,9 @@ allocation; B1/B2 adds a sealed root manifest descriptor and private status kind
 (`IsolationReady`). Internal root readiness adds actual/selected ABI evidence;
 missing evidence refuses. No commit, merge, release or installation occurred.
 
-Evidence logs retained locally for this round: `/tmp/iso-i1-r2-final-local-tests.log`,
-`/tmp/iso-i1-r2-run-final-tests.log`, `/tmp/iso-i1-r2-final-linux-check.log`,
-`/tmp/iso-i1-r2-final-windows-check.log`, `/tmp/iso-i1-r2-boundary-test.log`,
-`/tmp/iso-i1-r2-fg-tests.log`, `/tmp/iso-i1-r2-boot-typecheck-tests.log`, and
-`/tmp/iso-i1-r2-readiness-harness.log`. The harness sources are under
-`/tmp/iso-i1-r2-boot-check` and `/tmp/iso-i1-r2-readiness-check`; their stubs are
-explicit and must not be mistaken for production implementations. `git diff
+Evidence logs for this round are kept in the development records, not in the
+public docs. The boot and readiness check harnesses use explicit stubs that must
+not be mistaken for production implementations. `git diff
 --check` passed after final integration.
 
 Final production storage closure: `main` now uses `Components::installed()`, which
@@ -4288,7 +4287,7 @@ supported backing, capacity reserve and complete inventory. Opening may create
 only the existing adapters' lock/metadata files. Failure retains the refusing
 UnavailableStorage implementation. The remaining installer, account evidence and
 runtime publication gates are unchanged. Independent review passed, and final
-Linux spawnd all-targets type-check passed (`/tmp/iso-i1-r2-installed-storage-check.log`).
+Linux spawnd all-targets type-check passed.
 
 
 ### Round 3 — historical integration handoff (2026-11-05)
@@ -4298,8 +4297,8 @@ implemented or demonstrated end to end.** This round supplies real installed
 publication consumers, post-StartRun MCP projection receipts and worker retirement.
 It does not fill missing authority with a synthetic principal, fixed policy
 revision or permissive tool factory. Consequently protected TEAM admission still
-refuses work, even if all service units exist. Rounds 1–3 remain uncommitted in the
-assigned worktree. No gateway/CLI/workspace build was run locally.
+refuses work, even if all service units exist. No gateway/CLI/workspace build was
+run on the development machine.
 
 #### Ordered progress and remaining work
 
@@ -4464,8 +4463,8 @@ commands and final local validation results are recorded below after final revie
 **CONTRACT CHANGE:** no shared isolation wire formats, canonical capability bytes
 or hard limits changed. Added schemas are private root publication/readback and
 E's opt-in pre-request handshake. zbus 5.19 was already in Cargo.lock; no new
-third-party version was introduced. No commit, deployment, installation, release
-or formal Daybreak review occurred.
+third-party version was introduced. No deployment, installation, release or
+formal security review occurred.
 
 
 The installed-publication tests below require the real signed F generation,
@@ -4517,7 +4516,7 @@ BootstrapPlan and rechecks native launch acceptance. Tests change argv, resource
 limits, timeouts, network and executable digest without changing profile/version,
 and verify that all refuse. The reviewer rechecked both HIGH findings and found
 no remaining HIGH/CRITICAL in the reviewed diff. This is ordinary independent
-review, not the requested formal Daybreak sign-off or proof of runtime acceptance.
+review, not the formal security sign-off or proof of runtime acceptance.
 
 #### Round-3 validation record
 
@@ -4662,10 +4661,9 @@ establish isolation acceptance.
 **Status: partial authority integration, not an executable protected TEAM release.**
 Work remained in the requested dependency order. The production Shared authority
 adapter now uses existing product records; complete BootSources, runtime entry
-contexts, PTY, and Claude/D8 full-chain tests are still unfinished. No commit,
-merge, release, local gateway/CLI/agent build, workspace build, or `cargo fmt` was
-performed. Existing rounds 1–3 remain uncommitted in this same supplied worktree;
-this session created no additional worktree. No contract wire format, canonical
+contexts, PTY, and Claude/D8 full-chain tests are still unfinished. No merge,
+release, local gateway/CLI/agent build, workspace build, or `cargo fmt` was
+performed. No contract wire format, canonical
 bytes, or hard limit changed.
 
 #### Authority and cancellation changes
@@ -4723,7 +4721,7 @@ bytes, or hard limit changed.
   production connector grant adapter currently refuses those routes.
 
 These are source and unit-level properties. Full prepared-run A→B→A/racing-root-
-Status execution tests, actual authenticated ingress capture and formal Daybreak
+Status execution tests, actual authenticated ingress capture and the formal
 security sign-off remain pending. The independent ordinary review found and
 rechecked fixes for tenant transfer, watcher starvation and legacy standalone
 CLI migration; its final read found no new HIGH/CRITICAL in the reviewed scope.
@@ -4857,20 +4855,12 @@ passed, 2 failed). Canonicalizing only the trusted parent fixed the actual code;
 the default-temp auth rerun passed all 8 and the explicit parent/leaf regression
 passed. No lockfile version workaround was used.
 
-Logs: `/private/tmp/iso-i1-r4-resource-authority-tests.log`,
-`iso-i1-policy-legacy-auth-final.log`, `iso-i1-r4-auth-org-tests.log`, `iso-i1-r4-core-final-tests.log`,
-`iso-i1-policy-epoch-org.log`, `iso-i1-policy-epoch-preset.log`,
-`iso-i1-policy-epoch-config.log`, `iso-i1-r4-policy-final-tests.log`,
-`iso-i1-r4-employee-check.log`, `iso-i1-cli-policy-helper-harness.log`,
-`iso-i1-r4-final-linux-check.log`, `iso-i1-r4-final-windows-check.log`,
-`iso-i1-r4-live-registry-check.log`, `iso-i1-r4-boot-no-worker-check.log`.
-Harness directories: `/private/tmp/iso-i1-r4-boot-check`,
-`/private/tmp/iso-i1-r4-employee-check`,
-`/private/tmp/iso-i1-cli-policy-helper-harness`.
+Test logs and harness sources for this round are kept in the development
+records, not in the public docs.
 
 The existing spawn checker still reports the same 34 inherited unclassified
-functions in this worktree (`/private/tmp/iso-i1-r4-spawn-inventory-before.log`).
-Per the owner, I2 already fixed these on the integration branch; this round did
+functions in this round's source tree.
+I2 already fixed these on the integration branch; this round did
 not redo or edit their inventory entries. No new process-launch site was added.
 The new `verify_blocking` call runs bounded host verification on Tokio's blocking
 pool; it does not launch an employee process and is not a scanner process site.
@@ -4976,8 +4966,8 @@ The owner's requested ordering was Claude first, then the other runtimes, then
 PTY. Claude's complete production path remains the first outstanding item. The
 other runtimes received only the requested fail-closed entry fences; PTY was not
 started. There is no contract wire-format/canonical-byte/hard-limit change, no
-new dependency version, no commit, and no local gateway/CLI/workspace build or
-`cargo fmt`. Work stayed in the supplied worktree; no worktree was created.
+new dependency version, and no local gateway/CLI/workspace build or
+`cargo fmt`.
 
 #### What changed in this round
 
@@ -5071,10 +5061,10 @@ principal propagation. The root test uses its own explicitly marked authority.
 6. **PTY:** carry allocation, fd transport, terminal size, resize/input/output,
    idle timeout, cancellation and retirement through A/B1/B2, with native tests.
    No PTY integration or PTY acceptance was added this round.
-7. **Acceptance/review:** actual package compilation on the owner's remote
-   builder, both new root tests, complete product-path tests and formal Daybreak
-   security review remain required. Ordinary independent review found no new
-   CRITICAL/HIGH issue after fixes, but it was not Daybreak/security signoff.
+7. **Acceptance/review:** actual package compilation on the build host, both
+   new root tests, complete product-path tests and the formal security review
+   remain required. Ordinary independent review found no new CRITICAL/HIGH issue
+   after fixes, but it was not the security signoff.
 
 The tool-factory gap requires operation routing work, not just filling two
 constructors. A's `ExecutionToolBridge::execute` reserves `context.employee`,
@@ -5243,9 +5233,9 @@ Status: **PARTIAL — inventory CI is repaired; authenticated inactive publicati
 installer migration routing, first-admin claim, local readiness checks and
 coordinated removal are implemented. Signed initial activation, G's platform
 adapter and I1 composite readiness remain implementation blockers.** This section
-supersedes the historical round-1 status below. No commit, cargo fmt, local
+supersedes the historical round-1 status below. No cargo fmt, local
 CLI/gateway/workspace build, release publication or live service mutation was
-performed. The supplied worktree is retained for the integration owner.
+performed.
 
 #### Completed changes and enforcement boundaries
 
@@ -5379,8 +5369,8 @@ precedence, managed reinstall overwrites, repeat-uninstall legacy fallback,
 volatile reboot fencing, singleton-lock ownership and readiness matching G's
 root-owned parent/private gateway home. The final ordinary review found no
 unresolved HIGH/CRITICAL in the reviewed changes. Ordinary review and
-fixture tests do not constitute formal `gpt-daybreak-blue-latest` security signoff;
-that review has not been obtained.
+fixture tests do not constitute the formal security signoff; that review has
+not been obtained.
 
 #### Remaining implementation and remote gates
 
@@ -5523,9 +5513,8 @@ already-claimed installer retry and the actual SSH-tunnel setup page.
 
 Status: **PARTIAL — release packaging and installation prerequisites are implemented;
 full fresh installation, migration activation and removal are not implemented.**
-This is a coherent staging-only subset within the delegated time/build limits.
-The existing worktree/branch was retained; no commit, formatter, release, service
-operation, other-worktree write or production-home access was performed.
+This is a coherent staging-only subset within the round's time/build limits.
+No formatter, release, service operation or production-home access was performed.
 
 ### Implemented behavior
 
@@ -5578,9 +5567,9 @@ operation, other-worktree write or production-home access was performed.
   the existing package-level kernel matrix. Kernel 7.0 / Landlock ABI 8 remains
   refused. No new supported-kernel claim was added by I2.
 
-### Validation in this worktree
+### Validation on the development machine
 
-No CLI/gateway/workspace Cargo build or test was run, as explicitly prohibited.
+No CLI/gateway/workspace Cargo build or test was run on the development machine.
 The standalone Rust harness compiles the **actual std-only layout module**, not
 an alternative implementation; it does not type-check the full Linux installer.
 The ignored root fixture was written, not executed or compiled as part of CLI.
@@ -5604,8 +5593,8 @@ in this environment; the setuid filesystem assertion is now Linux-only, while
 non-executable/group-write/ownership/link checks run on macOS too. A parallel fixture initially collided on a coarse timestamp; an atomic sequence now
 separates temporary roots. No production permission check was weakened. Independent ordinary code review drove fixes for
 gateway allocation at the inclusive useradd limit, parser-root reuse, signed-asset
-name collisions and relative CARGO_TARGET_DIR resolution. This is not a formal
-Daybreak security review. No new dependency or shared isolation contract change.
+name collisions and relative CARGO_TARGET_DIR resolution. This is not the formal
+security review. No new dependency or shared isolation contract change.
 
 ### Required next steps (implementation, not just acceptance)
 
@@ -5678,7 +5667,7 @@ bash scripts/release.sh linux-assets --target aarch64-unknown-linux-gnu --output
 
 ### Status and scope
 
-**Historical round-1 status; superseded by the round-2 section below.** Protected TEAM remains unavailable. This worktree connects an actual
+**Historical round-1 status; superseded by the round-2 section below.** Protected TEAM remains unavailable. This round connects an actual
 human WebChat/channel turn to the existing one-use Claude authorization and adds
 independent readiness proof interfaces. It also adds an ignored production-provider
 acceptance fixture. It does not complete approved background/delegation authority,
@@ -5778,7 +5767,7 @@ Task/session evidence is retained. The fixture has **not** been typechecked as p
 of the CLI or executed against systemd/a provider; a standalone Rust syntax parse
 is the only fixture-specific check completed here.
 
-### Actual validation in this worktree
+### Actual validation on the development machine
 
 No local gateway, CLI or workspace build/test and no `cargo fmt` was run. Small
 standalone harnesses compile actual selected source files against real isolation,
@@ -5796,7 +5785,7 @@ facades. They do not establish full-package type compatibility or live acceptanc
 | Spawn inventory `--require-migrated` | 498 functions classified; 0 pending |
 | `git diff --check` | passed |
 | Ordinary code review | stale B1 receipt and failed-start cleanup findings corrected; final review found no concrete remaining HIGH/CRITICAL issue |
-| Required `gpt-daybreak-blue-latest` formal security review | unavailable in this session; pending |
+| Required formal security review | unavailable in this round; pending |
 | Root services, provider, full gateway/CLI, Windows | not run |
 
 Exact successful local commands (temporary harnesses are local evidence, not new
@@ -5849,7 +5838,7 @@ on the disposable VM. Merely compiling it or reporting it ignored is not accepta
    runtime egress alias. Preserve attended approvals and original conversation
    attribution; do not replace the original turn with the alias. This package does
    not prove full egress-taint attribution for the product chain.
-5. Run remote full-package compilation and targeted tests, formal Daybreak review,
+5. Run full-package compilation and targeted tests on the build host, the formal security review,
    signed/provider-home provisioning and the actual root Claude fixture. Add live
    cancellation/revocation/provider-failure acceptance once the positive chain runs.
 
@@ -5963,7 +5952,7 @@ once; it cannot overwrite another probe or toggle a Boolean to ready.
 The external RuntimeAdapters state includes PTY readiness without introducing a
 ninth public component. Missing required hooks remain PendingIntegration; failures
 are Unavailable. Common final-time freshness and final B1/F rechecks from round 1
-remain in place. This worktree intentionally does not install fake E/runtime/PTY
+remain in place. This round intentionally does not install fake E/runtime/PTY
 producers; each sibling owns its actual proof.
 
 ### Egress lifecycle and per-turn attribution
@@ -6002,7 +5991,7 @@ The acceptance fixture from round 1 remains unexecuted.
 | `duduclaw-spawnd` Linux `--tests` check | passed; new Linux socket tests typechecked, not executed |
 | Rust syntax / spawn inventory / diff check | 28 changed Rust files parsed, 0 syntax errors (not typechecked); 498 spawn functions classified, 0 pending; diff check passed |
 | Ordinary code review | blocking readback, early-return side effects, stale pending renewal and same-name sender reuse findings fixed; final static review found no concrete remaining P1/P2 |
-| Full gateway/CLI, root services, real Claude, formal Daybreak review | not run; pending |
+| Full gateway/CLI, root services, real Claude, formal security review | not run; pending |
 
 Additional local commands (round-1 harness commands remain above):
 
@@ -6021,7 +6010,7 @@ Latest logs: `/private/tmp/iso-i1a-background-round2-test.log`,
 `/private/tmp/iso-i1a-egress-harness.log`. Temporary harnesses are local evidence,
 not repository packages or delivery artifacts.
 
-Remote builder: run the round-1 commands, plus the following; require nonzero test
+Build host: run the round-1 commands, plus the following; require nonzero test
 counts (do not count filtered-out or ignored tests as passes):
 
 ```sh
@@ -6039,8 +6028,8 @@ Linux VM per its companion guide. Add live positive/negative checks for each
 background source, pending deferral, owner/ACL/policy changes, record edits and
 cancellation, approved/rejected/expired renewal, both delegation transports,
 immutable sender/recipient replacement, per-run taint mapping and C revocation.
-Run the required `gpt-daybreak-blue-latest` security review; ordinary static review
-here is not that sign-off.
+Run the required formal security review; ordinary static review here is not
+that sign-off.
 
 ### Round-2 files and remaining scope
 
@@ -6165,12 +6154,10 @@ All commands below ran with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and offline
 | Windows `cargo check --target x86_64-pc-windows-gnu -p duduclaw-execution -p duduclaw-spawnd -p duduclaw-run --all-targets --offline` | Passed, compile only; `iso-i1e-windows-check.log` |
 | `git diff --check` | Passed |
 
-Logs are in `/private/tmp/`. The first Linux check failed because
-`x86_64-linux-gnu-gcc` was absent. The successful check used the existing Zig C/AR
-wrappers, `CC_x86_64_unknown_linux_gnu=/private/tmp/iso-i1-zig-cc`,
-`AR_x86_64_unknown_linux_gnu=/private/tmp/iso-zig-ar`, and this task's own
-`ZIG_GLOBAL_CACHE_DIR=/private/tmp/iso-i1e-zig-global` /
-`ZIG_LOCAL_CACHE_DIR=/private/tmp/iso-i1e-zig-local`.
+The first Linux check failed because `x86_64-linux-gnu-gcc` was absent. The
+successful check used Zig C/AR wrappers (`CC_x86_64_unknown_linux_gnu`,
+`AR_x86_64_unknown_linux_gnu`) with separate Zig global and local cache
+directories.
 
 macOS tests above do **not** execute Linux-only A transport, native master or
 B2 launch code. On the Linux builder run:
@@ -6187,9 +6174,9 @@ cargo test -p duduclaw-run --features root-test-fixture --test root iso_root_ful
 
 An independent read-only code review found the tail-I/O race and initial-size
 ordering gap; both were fixed and re-reviewed. No remaining CRITICAL/HIGH issue
-was identified in that static review. It was ordinary review, **not Daybreak**.
-No gateway/CLI/workspace builds, cargo fmt, commits, merges, releases, worktree
-creation/removal, signed installation changes or live-provider calls were made.
+was identified in that static review. It was ordinary review, **not the formal
+security review**. No gateway/CLI/workspace builds, cargo fmt, merges, releases,
+signed installation changes or live-provider calls were made.
 
 ### Changed files (one responsibility per file)
 
@@ -6236,7 +6223,7 @@ creation/removal, signed installation changes or live-provider calls were made.
    remove the gateway runtime refusal or invent vendor credentials/configuration.
    Exercise real runtime startup, input/output, SIGWINCH, idle and cancellation
    through product ingress after those packages merge. Provider acceptance remains open.
-3. Obtain the required formal Daybreak security review of the new activity TCB
+3. Obtain the required formal security review of the new activity TCB
    boundary, reserved Resize semantics, private master provenance and teardown.
    Keep full readiness and missing-factory gates fail closed throughout integration.
 ## Package I1d — other runtimes (2026-11-05)
@@ -6244,15 +6231,14 @@ creation/removal, signed installation changes or live-provider calls were made.
 **Round-2 status and current remaining work are in the final subsection below.**
 The following initial implementation/validation report is preserved as history.
 
-**PARTIAL / NOT READY.** This worktree adds a real isolated API-worker source and
+**PARTIAL / NOT READY.** This round adds a real isolated API-worker source and
 registered generic-CLI protocol consumers. It does **not** complete item 5:
 Codex/Grok home/project overlays and their consumers remain refused; generic
 vendor adapters and the installed API runtime publication/acceptance are absent.
 No production employee, provider, signed installation or root full chain was run.
 Composite readiness, the 22 A / 18 E product-tool inventories and ingress
 requirements are unchanged. No fabricated policy, acceptance receipt, no-op
-producer or gateway-UID fallback was introduced. Work stayed in the assigned
-`feat/iso-i1d-20261105` worktree; no commit, worktree creation or `cargo fmt`.
+producer or gateway-UID fallback was introduced. No `cargo fmt` was run.
 
 ### Implemented source paths
 
@@ -6351,9 +6337,9 @@ nonzero test counts exclude empty binary/doc/filtered integration targets.
 | `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | 499 functions classified, 0 migrations pending. Coverage only, not runtime acceptance. |
 | `git diff --check` | Passed. |
 
-Raw local logs: `/private/tmp/iso-i1d-{api-tests,main-plan-tests,boundary-tests,contract-tests,linux-check,boundary-linux-check,inventory-tests,inventory-final}.log`.
+Raw test logs are kept in the development records.
 No gateway/CLI/workspace build, root test, live provider request, deployment,
-Daybreak review or independent Claude review was performed. No new third-party
+formal security review or second independent review was performed. No new third-party
 dependency version, isolation wire/canonical-byte/hard-limit change or readiness
 promotion was made. The API worker introduces a separate explicitly versioned
 runtime-input protocol; its changed projection digest requires new acceptance.
@@ -6362,7 +6348,7 @@ runtime-input protocol; its changed projection digest requires new acceptance.
 
 1. **Codex and Grok remain unimplemented.** Keep their current terminal entry
    fences. Implement root-owned per-run home/project config overlays, preserve
-   employee-only login/cache behavior, retain PL-0 external-config detection,
+   employee-only login/cache behavior, retain the external Codex config detection,
    and prove exclusive config plus fd-3 inheritance with the exact CLI versions.
    B1 currently refuses non-flat RunConfig projections. Do not replace that
    refusal by accepting writable native files or gateway credentials. Then add
@@ -6406,7 +6392,7 @@ runtime-input protocol; its changed projection digest requires new acceptance.
    identity, authority revocation during HTTP, blocked private/metadata targets,
    output limits, cancellation and full cgroup retirement. None was written or
    run in this round; there is no honest exact root-chain filter yet. Test the
-   three target distributions, then run formal Daybreak security review.
+   three target distributions, then run the formal security review.
 
 This package does not close I1a ingress/readiness, I1b/I1c product-tool producers
 or I1e PTY, and does not change their ownership or acceptance requirements.
@@ -6440,7 +6426,7 @@ production credential, commit, merge or deployment was introduced.
   for Grok, both the project native config and `.mcp.json` pointing to D.
   Native processes start there instead of the employee-writable work root.
   Neither an employee home/project config nor a gateway config is merged.
-- PL-0 is retained conservatively: an external `CODEX_HOME`, even empty, refuses
+- The external Codex config detection is retained conservatively: an external `CODEX_HOME`, even empty, refuses
   before a launch; B1 refuses any `.codex` entry in the employee work root,
   including dangling links, without resolving employee paths as root. The
   minimal `/etc` and new project/home have no host Codex configuration sources.
@@ -6461,8 +6447,8 @@ production credential, commit, merge or deployment was introduced.
   removed to make a production-shaped employee pass.
 - Grok's root plan requires a real PTY entitlement, timeout and resources.
   Gateway consumption uses existing `duduclaw_execution::command::spawn_pty`,
-  `PtyChild`/RunHandle I/O, timeout, cancellation and retirement. **Merge I1e
-  `feat/iso-i1e-20261105` before running Grok**: this worktree intentionally
+  `PtyChild`/RunHandle I/O, timeout, cancellation and retirement. **Merge the I1e
+  PTY package before running Grok**: this round intentionally
   retains the base A/B PTY refusal and does not copy I1e's implementation.
 
 #### API vendor adapters
@@ -6593,14 +6579,12 @@ package,inventory-tests,inventory}.log`.
    explicitly refused modes remain open. Generic CLI vendor adapter ELFs are
    still absent; round 2 implemented API dialect adapters, not those unrelated
    native vendor wrappers.
-6. Independent Claude review and designated Daybreak security review remain
-   required. The available tools had no callable Daybreak/baton reviewer; the
-   final local `security-review` skill pass is a self-check, not independent
-   security approval. Full three-distribution production boot/ingress/dispatcher
-   acceptance remains separate from every source/test result above.
+6. A second independent code review and the designated security review remain
+   required. The designated reviewer was not available in this round; the
+   final local security self-check is not independent security approval. Full
+   three-distribution production boot/ingress/dispatcher acceptance remains
+   separate from every source/test result above.
 
-No unfinished worktree was removed: it was supplied by the owning session and
-contains both requested uncommitted rounds. This session created no worktree.
 ## Package I1c: production E web plans and host control routes (2026-11-05)
 
 **Status: PARTIAL.** This package closes the source-level web extraction producer
@@ -6700,28 +6684,27 @@ All local commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
 - `cargo check -p duduclaw-mcp-boundary --target x86_64-unknown-linux-gnu
   --offline --locked`: **passed**; existing unsafe-code warnings in
   `config_fd.rs` / MCP bridge remain.
-- `cargo test --manifest-path /private/tmp/iso-i1c-source-harness/Cargo.toml
-  --lib --offline --locked`: **36 passed, 0 failed**. The harness starts from
-  this worktree's Cargo.lock and includes the actual gateway `web_fetch.rs`,
+- `cargo test` on a standalone source harness
+  (`--lib --offline --locked`): **36 passed, 0 failed**. The harness starts from
+  the repository's Cargo.lock and includes the actual gateway `web_fetch.rs`,
   `isolation_worker_plans.rs`, core `net_addr.rs` and real boundary/isolation
   dependencies. Seven tests have `i1c_` names; the other tests cover existing
   fetch/cache/SSRF and address classification. The product-factory test uses a
   real cached HTML `File` and a **fixture transport response**, not a worker
-  process. Log: `/private/tmp/iso-i1c-source-tests.log`.
-- `cargo check --manifest-path /private/tmp/iso-i1c-source-harness/Cargo.toml
-  --offline --locked`: **passed**, also type-checking the actual CLI
+  process.
+- `cargo check` on the same harness (`--offline --locked`): **passed**, also type-checking the actual CLI
   `mcp/web.rs` against the real web-fetch and boundary code. Unrelated workflow,
   current-call selection and legacy HTML APIs are facades in that harness; this
-  is not a CLI package build. Log: `/private/tmp/iso-i1c-cli-source-check.log`.
+  is not a CLI package build.
 - Added CLI regressions `i1c_protected_fetch_without_origin_resolver_never_uses_legacy_fetch`
   and `i1c_protected_fetch_listing_still_requires_origin_and_resolver_without_worker`
-  for the remote builder; **not run locally**.
+  for the build host; **not run locally**.
 - Full gateway/CLI builds, native Linux, real worker parsing, actual HTTP
-  redirect/proxy behavior, original product list/call parity and Daybreak review
-  are **not verified** locally. Cross-target boundary checking is not a Linux
-  product execution test.
+  redirect/proxy behavior, original product list/call parity and the formal
+  security review are **not verified** locally. Cross-target boundary checking
+  is not a Linux product execution test.
 
-Run on the owner's remote builder with the normal feature flags:
+Run on the build host with the normal feature flags:
 
 ```sh
 cargo test -p duduclaw-mcp-boundary tool_policy
@@ -6802,7 +6785,7 @@ not transfer a mount fd to spawnd and is dropped after plan validation: root sti
 resolves its own employee mount. End-to-end root registry/mount identity and the
 spawn-time handoff must be verified before claiming workspace delivery acceptance.
 The assemble signature is an additive internal API dependency for sibling merges;
-all call sites in this worktree were updated. No contract crate was modified.
+all call sites in the repository were updated. No contract crate was modified.
 
 The process inventory has one exact `isolated_helper` classification, constrained
 to employee identity and the private `program_helper.rs::execute` symbol. Other
@@ -6839,20 +6822,20 @@ not evidence that the helper was installed or launched by the product.
    complete I1a target ingress and ephemeral provisioning, integrate E and other
    runtime packages, then exercise the actual gateway/product dispatch path on
    the Linux matrix. No root fixture or live-provider acceptance was run here.
-5. **Remote compilation and security review:** CLI/gateway Rust tests below are
-   written, not executed. Formal Daybreak review remains required; no Daybreak
-   tool/model was available in this session. Ordinary independent review is not
-   that signoff. Its discovery HIGH finding was fixed and re-reviewed separately.
+5. **Build host compilation and security review:** CLI/gateway Rust tests below
+   are written, not executed. The formal security review remains required; the
+   designated reviewer was not available in this round. Ordinary independent
+   review is not that signoff. Its discovery HIGH finding was fixed and
+   re-reviewed separately.
 
-### Validation and remote commands
+### Validation and build host commands
 
-Observed locally, without `cargo fmt`, gateway/CLI/workspace build, commit,
-merge, deployment, or edits to another project worktree:
+Observed locally, without `cargo fmt`, gateway/CLI/workspace build, merge or
+deployment:
 
-- `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<this-worktree>/target/i1b-syntax cargo build --manifest-path /private/tmp/iso-a-syntax/Cargo.toml --offline`:
-  existing small syn syntax utility compiled successfully; no product crate was
-  compiled. Its source was inspected before use.
-- `target/i1b-syntax/debug/iso-a-syntax <changed Rust paths>`: syntax only; final
+- A small existing syn-based syntax utility was built (`--offline`); no product
+  crate was compiled. Its source was inspected before use.
+- The syntax utility over the changed Rust paths: syntax only; final
   pass parsed **22 Rust files, 0 syntax errors**. This is not type checking.
 - `python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v`:
   **18 passed, 0 failed**.
@@ -6872,7 +6855,7 @@ merge, deployment, or edits to another project worktree:
   test were then added. Final inventory result above supersedes that failure.
 - `git diff --check`: passed.
 
-Run on the remote builder (do not mistake an empty test filter for a pass):
+Run on the build host (do not mistake an empty test filter for a pass):
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check --target x86_64-unknown-linux-gnu -p duduclaw-gateway -p duduclaw-cli --tests
@@ -6934,18 +6917,17 @@ fixed; re-review reported no remaining HIGH/Critical finding in this diff.
 The program timeout review finding was fixed with explicit result-delivery
 headroom and re-reviewed without a remaining HIGH or MEDIUM finding. A final
 resolver-vs-capability workspace regression was added, passed and reviewed.
-Gateway/CLI type checking, product execution and Daybreak signoff remain
-unverified; the small-crate checks above do not replace them.
+Gateway/CLI type checking, product execution and the formal security signoff
+remain unverified; the small-crate checks above do not replace them.
 
 ### I1b Round 2 handoff — 2026-11-05
 
 **Archived status; the I1b Round 3 handoff below supersedes this remaining-work list.**
 
 **Status: PARTIAL; supersedes the Round 1 preparation/remaining-work status.**
-The assigned `feat/iso-i1b-20261105` worktree still contains both rounds, all
-uncommitted. This session did not create or remove a worktree, run cargo fmt,
-commit, merge, release, deploy, change production data, or build the gateway/CLI
-packages. Their complete compilation/tests remain a remote-builder gate.
+This round did not run cargo fmt, merge, release, deploy, change production
+data, or build the gateway/CLI packages. Their complete compilation/tests remain
+a build host gate.
 
 #### Actual routing after this round
 
@@ -7084,7 +7066,7 @@ Round 1-only edits remain present and are listed in its archived table above.
 #### Round 2 observed validation and remaining acceptance
 
 Every cargo invocation used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, offline,
-and a target directory inside this assigned worktree. No gateway/CLI package or
+and a target directory inside the repository checkout. No gateway/CLI package or
 workspace build was run. Cross checks compile Linux/Windows branches and tests;
 they do **not** execute them.
 
@@ -7100,16 +7082,14 @@ they do **not** execute them.
 | `CARGO_TARGET_DIR=target/i1b-check cargo check --manifest-path /private/tmp/i1b-artifact-check/Cargo.toml --tests --target x86_64-unknown-linux-gnu --offline` | PASS; two Linux descriptor tests compile but did not execute. |
 | `python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v` | 18 passed, 0 failed. |
 | `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | 499 functions classified, 0 migrations pending; not producer readiness evidence. |
-| `target/i1b-syntax/debug/iso-a-syntax <all changed/untracked Rust paths>` | 43 Rust files parsed, 0 syntax errors; gateway/CLI type checking remains remote. |
+| `target/i1b-syntax/debug/iso-a-syntax <all changed/untracked Rust paths>` | 43 Rust files parsed, 0 syntax errors; gateway/CLI type checking remains on the build host. |
 | `git diff --check` | PASS. |
 
-For Linux checks that depend on bundled SQLite, the command additionally used
-`CC_x86_64_unknown_linux_gnu=/private/tmp/i1b-zig-cc`,
-`ZIG_GLOBAL_CACHE_DIR=/private/tmp/i1b-zig-cache`, and
-`ZIG_LOCAL_CACHE_DIR=/private/tmp/i1b-zig-local`. The small local wrapper executes
-installed `/opt/homebrew/bin/zig cc -target x86_64-linux-gnu`, removing cc-rs's
-incompatible `--target=x86_64-unknown-linux-gnu` spelling. The harness lockfile
-was copied from this worktree's Cargo.lock to preserve the existing locked
+For Linux checks that depend on bundled SQLite, the command additionally set
+`CC_x86_64_unknown_linux_gnu` to a small local wrapper plus Zig global and local
+cache directories. The wrapper executes `zig cc -target x86_64-linux-gnu`,
+removing cc-rs's incompatible `--target=x86_64-unknown-linux-gnu` spelling. The
+harness lockfile was copied from the repository's Cargo.lock to preserve the existing locked
 async-executor version. Initial harness attempts failed on offline resolution
 of a yanked dependency and missing cross gcc; the final pinned-lock/Zig check
 passed without dependency upgrades or gateway/CLI compilation. Unsafe-code
@@ -7120,9 +7100,9 @@ cancellation; durable pending-row leakage/cross-employee quota exhaustion;
 Office existing symlink input/output escape; artifact base64 exceeding the MCP
 response budget; code-map rendered text overflowing its typed bound. Reviewers
 read back fixes and reported no remaining CRITICAL/HIGH in the reviewed scope.
-This is **not Daybreak** implementation signoff; that tool/model was unavailable.
+This is **not the formal security** signoff; the designated reviewer was unavailable.
 
-Remote builder/native runner must still run these filters (plus full required
+The build host / native runner must still run these filters (plus full required
 Rust/CLI/gateway checks), on the actual integrated branch:
 
 ```sh
@@ -7156,16 +7136,15 @@ official signed helper/interpreter/script/dependency packaging and root profile
 registration; complete gateway/CLI compilation; proof-to-mount/root publication
 acceptance and actual D8 launch/result/cancel/restart on the Linux matrix; I1a
 parent→target launch authority/ephemeral provisioning; E and runtime/PTY sibling
-integration; formal Daybreak review and owner release decision. Protected TEAM,
+integration; the formal security review and owner release decision. Protected TEAM,
 provider, migration, release and customer acceptance are not claimed.
 
 ### I1b Round 3 handoff — 2026-11-05
 
 **Status: PARTIAL. This supersedes Round 2's five-missing-producer status; it
-is not A readiness or native/browser acceptance.** Rounds 1–3 remain uncommitted
-in the assigned `feat/iso-i1b-20261105` worktree. This session did not create a
-worktree, commit, run cargo fmt, build the gateway/CLI packages locally, deploy,
-sign/install a runtime, or change production data.
+is not A readiness or native/browser acceptance.** This round did not run cargo
+fmt, build the gateway/CLI packages locally, deploy, sign/install a runtime, or
+change production data.
 
 #### Readiness decision and exact remaining producers
 
@@ -7320,19 +7299,16 @@ Existing unsafe-code/deprecation warnings were not hidden.
 | `target/i1b-syntax/debug/iso-a-syntax <all changed/untracked Rust files>` | **50 files parsed, 0 syntax errors**; no full gateway/CLI type checking. |
 | `git diff --check` | PASS. |
 
-The Zig environment is unchanged from round 2:
-`CC_x86_64_unknown_linux_gnu=/private/tmp/i1b-zig-cc`,
-`ZIG_GLOBAL_CACHE_DIR=/private/tmp/i1b-zig-cache`,
-`ZIG_LOCAL_CACHE_DIR=/private/tmp/i1b-zig-local`. Final logs are
-`/private/tmp/i1b-r3-{execution,boundary,linux-helper,windows-helper,linux-boundary,plan,inventory-tests}.log`.
+The Zig environment is unchanged from round 2. Final logs are kept in the
+development records.
 
 Independent ordinary code review identified the missing D8-independent stop
 entry and navigation-after-observed-stop bug; both were fixed and re-read. The
 reviewer reported no remaining CRITICAL/HIGH in that reviewed scope and reran
-the three Node fixtures. This is **not Daybreak signoff**; the requested
-Daybreak model invocation was not available in this session.
+the three Node fixtures. This is **not the formal security signoff**; the
+designated reviewer was not available in this round.
 
-Remote builder/native runner must still run the full integrated gateway/CLI
+The build host / native runner must still run the full integrated gateway/CLI
 checks and the earlier round-2 filters, plus:
 
 ```sh
@@ -7357,11 +7333,10 @@ missing. None of the source/harness/fixture results authorizes A readiness.
 ### I1b Round 4 handoff — 2026-11-05
 
 **Status: PARTIAL / NOT READY. This supersedes the Round 3 remaining-work
-description, not its recording protocol or acceptance limitations.** Rounds
-1–4 remain uncommitted in the assigned worktree. The three fork producers are
-still not installed. A readiness and the 22-tool inventory were not changed.
-No gateway/CLI build, cargo fmt, deployment, runtime signing or live data access
-was performed. This session did not create a worktree or commit.
+description, not its recording protocol or acceptance limitations.** The three
+fork producers are still not installed. A readiness and the 22-tool inventory
+were not changed. No gateway/CLI build, cargo fmt, deployment, runtime signing
+or live data access was performed.
 
 #### Newly identified prerequisite: root workspace delivery
 
@@ -7483,7 +7458,7 @@ was correctly refused; the fixture was fixed. Independent code review found
 and prompted fixes for public Manifest deserialization, non-owned reservation
 cancellation, cancelled-future cleanup, per-fork rather than shared parent CAS,
 exact workspace grant checks and blocking SQLite on the async failure path.
-This is ordinary code review, **not Daybreak security signoff**.
+This is ordinary code review, **not the formal security signoff**.
 
 Remote/native follow-up (in addition to all Round 3 gateway/CLI tests):
 
@@ -7511,7 +7486,7 @@ carry its actual tool name rather than borrowing fetch permission.
 3. Run full remote compilation, original list/call parity and authenticated
    service/ownership tests. Exercise revoked origin, redirect to another origin,
    environment proxy, oversized/truncated HTML and worker retirement through the
-   actual gateway and E services, then obtain the assigned Daybreak review.
+   actual gateway and E services, then obtain the formal security review.
 4. I1a still owns ingress/composite readiness/Claude acceptance; I1b owns A tool
    producers; I1d owns other runtimes; I1e owns PTY. This package does not alter
    their readiness evidence or claim any of their acceptance gates.
@@ -7639,8 +7614,8 @@ Commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
 - Independent read-only code review found and prompted fixes for path-based
   knowledge staging, unbounded Whisper responses, malformed CONTRACT fallback,
   shared-source overwrite authority and premature wiki completion marking.
-  Final review found no new High in that diff. **This was not Daybreak review**;
-  the assigned Daybreak/security and full product acceptance gates remain open.
+  Final review found no new High in that diff. **This was not the formal security
+  review**; the formal security and full product acceptance gates remain open.
 
 Remote owner commands (normal feature flags; do not substitute the harness):
 
@@ -7703,18 +7678,16 @@ Paths below are relative to `crates/` unless prefixed `docs/` or named at the re
 **Next required work:** implement the five MISSING rows without shrinking their
 inventory; then finish descriptor-staged knowledge file proposals, shared
 adoption statistics under field-limited host authority, other media formats and
-bulk TTS output delivery, and the remote/real-service gates above. I1a/I1b/I1d/I1e
-ownership is unchanged. No worktree was created by this continuation; this
-owner-supplied dirty worktree is intentionally retained for the next round.
+bulk TTS output delivery, and the build host/real-service gates above. I1a/I1b/I1d/I1e
+ownership is unchanged.
 
 
 ### I1c round 3 handoff — remaining lifecycle controls (2026-11-05)
 
 **Status: PARTIAL; uncommitted; all-E readiness NOT flipped.** This section
-supersedes round 2 for its last five tools. The user timebox takes precedence
-over completing unsafe sinks. No gateway/CLI build, `cargo fmt`, commit,
-installation, model/provider request, production-home write or release occurred.
-The pre-existing worktree and rounds 1–2 edits remain in place.
+supersedes round 2 for its last five tools. The round's timebox takes precedence
+over completing unsafe sinks. No gateway/CLI build, `cargo fmt`, installation,
+model/provider request, production-home write or release occurred.
 
 #### Current last-five inventory
 
@@ -7809,10 +7782,10 @@ All commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
 - Independent read-only review prompted fixes for recording URL userinfo/
   encoded query values, URL-only placeholder bookkeeping, hub non-2xx handling,
   actual YAML validation (including explicit-null enum refusal), retained host-control resource eligibility and keeping unsafe curator sinks disabled. Final review
-  found no uncorrected definite High/Critical. **Not Daybreak review**; the
-  assigned security review and product/native/provider gates remain open.
+  found no uncorrected definite High/Critical. **Not the formal security
+  review**; that review and product/native/provider gates remain open.
 
-Owner remote builder (normal production feature flags; do not substitute facades):
+Build host (normal production feature flags; do not substitute facades):
 
 ```sh
 cargo check -p duduclaw-gateway --features isolation-worker-integration
@@ -7953,11 +7926,11 @@ Commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
   incompatibility, bounded enumeration, accurate action previews, strict config,
   live-state check ordering, generation time and archive cancellation recovery
   evidence; corrected. Final review found no definite remaining High/Critical.
-  **Not Daybreak review**; assigned security/native/product review stays open.
+  **Not the formal security review**; security/native/product review stays open.
 
 #### Remaining acceptance and explicit limitations
 
-1. Owner remote builder must compile real gateway/CLI with production features;
+1. The build host must compile real gateway/CLI with production features;
    the source harness is not a substitute. Run:
    `cargo check -p duduclaw-gateway --features isolation-worker-integration`,
    `cargo check -p duduclaw-cli`,
@@ -8027,9 +8000,8 @@ generation/grant theft denial. **Do not flip A readiness from this round.**
 **Archived: the final Round 6 handoff below supersedes the remaining-work and readiness decision.**
 
 **Status: PARTIAL / NOT READY.** This supersedes Round 4's workspace-delivery
-and uninstalled-host-control descriptions. Rounds 1–5 remain uncommitted in
-`feat/iso-i1b-20261105`; the assigned worktree was reused, not created here.
-No cargo fmt, gateway/CLI build, commit, deployment, runtime signing or live
+and uninstalled-host-control descriptions.
+No cargo fmt, gateway/CLI build, deployment, runtime signing or live
 customer access was performed. A readiness remains unchanged because the
 production model-branch producer is still missing. The A inventory was not shrunk.
 
@@ -8056,7 +8028,7 @@ existing root-owned detached work mount. The existing duduclaw-run manifest
 consumes that mount; no B2 manifest format changed. A nonempty relative cwd
 narrows the directory exposed as `/work`, rather than exposing a parent and
 chdir-ing below it. Without delivery, only default employee-work and empty/`.`
-cwd are accepted. No native privileged mount test ran in this session.
+cwd are accepted. No native privileged mount test ran in this round.
 
 #### Snapshot helper and D8 queue component
 
@@ -8134,9 +8106,9 @@ controls cannot appear complete in the readiness manifest.
    CAS and employee-writable `.fork-results` do not satisfy this requirement.
 4. Add restart root-handle retirement reconciliation, volume/staging retention,
    real usage/cost publication and all three fork producer acceptance journeys.
-5. Run full integrated gateway/CLI checks remotely, then native signed-profile
-   root/D8/provider tests. Only after all A producers are real should the A hook
-   be reconsidered. Daybreak security signoff is still outstanding.
+5. Run full integrated gateway/CLI checks on the build host, then native
+   signed-profile root/D8/provider tests. Only after all A producers are real
+   should the A hook be reconsidered. The formal security signoff is still outstanding.
 
 #### Round 5 files
 
@@ -8179,10 +8151,10 @@ Zig environment remains the Round 3 one; no dependency version was upgraded.
 Independent ordinary review covered the root contract/helper/queue and separately
 the CLI/boot/factory changes. It found executable-bit loss, accepted-queued being
 reported running, and discarded authorization proof; all were corrected. The
-review reported no remaining CRITICAL/HIGH in its scope. This is **not Daybreak
+review reported no remaining CRITICAL/HIGH in its scope. This is **not the formal
 security signoff**, and no native root mount/helper/provider acceptance is claimed.
 
-Remote follow-up, with the prior rounds' commands retained:
+Build host follow-up, with the prior rounds' commands retained:
 
 ```sh
 cargo check -p duduclaw-gateway --features isolation-worker-integration --tests
@@ -8209,10 +8181,9 @@ The full model-fork producer and immutable result publication/apply are **not
 implemented or enabled**. The final sub-package scope is the existing 22-tool A
 inventory with exactly three explicit exceptions: `fork_run`, `merge_or_select`,
 and `terminate_branch`. Non-protected installations retain their existing fork
-handlers, opt-in, account selection and budget behavior. Rounds 1–6 remain
-uncommitted on `feat/iso-i1b-20261105` in the assigned worktree. This session did
-not create a worktree, run cargo fmt, build gateway/CLI locally, commit, deploy,
-sign a runtime or access a live model/provider.
+handlers, opt-in, account selection and budget behavior. This round did not run
+cargo fmt, build gateway/CLI locally, deploy, sign a runtime or access a live
+model/provider.
 
 #### Decision and remaining implementation boundary
 
@@ -8328,11 +8299,11 @@ remains **unverified**, not inferred from these small-crate results.
 
 Independent ordinary review found a private-module visibility error in the
 Linux readiness call and a stale cost-tool description; both were corrected and
-re-reviewed with no remaining CRITICAL/HIGH in the round-6 scope. Daybreak
-security signoff remains outstanding; no Daybreak tool is available in this
-session. Ordinary review is not a substitute for that signoff.
+re-reviewed with no remaining CRITICAL/HIGH in the round-6 scope. The formal
+security signoff remains outstanding; the designated reviewer was not available
+in this round. Ordinary review is not a substitute for that signoff.
 
-Required next verification on an authorized remote builder (not implementation
+Required next verification on an authorized build host (not implementation
 of the deferred tools in this final sub-package):
 
 ```sh

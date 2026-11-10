@@ -1,6 +1,6 @@
 # Org chart editing (reporting lines and departments)
 
-Who an AI employee reports to (`reports_to`) and which department it belongs to decide who may delegate to whom. The authoritative record is `<home>/org.toml`, which no employee can write. Each employee's `agent.toml` holds a display copy. RM-027 adds the gateway API for changing both from the dashboard. **The org chart page is still read-only; the editing UI ships in a later release.**
+Who an AI employee reports to (`reports_to`) and which department it belongs to decide who may delegate to whom. The authoritative record is `<home>/org.toml`, which no employee can write. Each employee's `agent.toml` holds a display copy. Since v1.81.0 both can be changed on the dashboard org chart page: select an employee and use **Adjust position** in the side panel, or drag the employee onto a new manager, which opens the same panel with that manager pre-selected. Nothing is sent until you confirm there. The panel uses the gateway API described below.
 
 ## Who may change what
 
@@ -23,7 +23,7 @@ The same check (`duduclaw_core::org_change::validate_org_change`) runs on `agent
 
 `agents.update` now refuses an invalid `reports_to` with the same error. It was previously written unchecked. Its department behaviour is unchanged.
 
-The dashboard raw editor (`config.raw.set`, Admin) follows the same path when an `agent.toml` edit changes `[agent] reports_to` or `department`: it takes the global org lock, runs the whole-tree check (existence, self, cycle) against the authority, writes the authority first and the file second, and puts the authority back if the file write fails. If the check fails, the raw save is refused with the validation error and nothing is written. An edit that leaves both fields as they were never touches the authority.
+The dashboard raw editor (`config.raw.set`, Admin) follows the same path when an `agent.toml` edit changes `[agent] reports_to` or `department`: it takes the global org lock, runs the whole-tree check (existence, self, cycle) against the authority, writes the authority first and the file second, and puts the authority back if the file write fails. If the check fails, the raw save is refused with the validation error and nothing is written. Unlike the `org.*` calls, the raw editor does not check that the department already exists; use **Adjust position** on the org chart when you need the department rule. If the field you did not change differs from the authority, the save is refused with instructions for resolving the mismatch first. An edit that leaves both fields as they were never touches the authority.
 
 ### Protected from AI employees
 

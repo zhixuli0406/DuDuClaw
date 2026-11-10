@@ -34,19 +34,37 @@ triggering the question, so the check performs a real read of each folder.
 
 The LaunchAgent runs the gateway program directly, so macOS treats the gateway
 as the program asking for access — for itself and for every AI tool it starts.
-Today that program is a command-line binary without a stable app signature, so
-each update looks like a new program to macOS, and macOS asks once per update.
 
-When the signed DuDuClaw app build ships, the identity stays the same across
-updates and macOS remembers your answer: you allow once and are not asked
-again. Until then, expect one prompt per update.
+Since v1.81.0 the macOS gateway ships as a signed and notarized app,
+`DuDuClaw Gateway.app` (identifier `ai.duduclaw.gateway`, the same for CE and
+Pro). Its identity stays the same across updates, so macOS keeps folder,
+automation and Full Disk Access grants: you allow once and are not asked again
+after later updates.
+
+A gateway that still runs as a bare command-line binary (installed before
+v1.81.0 and not yet moved) has no stable app signature. Each update looks like
+a new program to macOS, and macOS asks once per update. Move it into the app in
+one of three ways:
+
+- Automatically, once, on the first v1.81 start under the login service
+  (launchd) when auto-update is on.
+- **Move to DuDuClaw Gateway.app** on the dashboard's System → Updates page
+  (Admin).
+- `duduclaw service migrate-bundle` in a terminal, then
+  `duduclaw service restart`.
+
+The move replaces the old binary with a link to the app, so existing commands
+keep working. macOS asks **once** for folder access for the new app right
+after the move. See [Dashboard settings](dashboard-settings.md#macos-duduclaw-gatewayapp-v1810)
+for how app updates are verified.
 
 ## How to re-grant access
 
 1. On the Mac running DuDuClaw, click **Allow** on the prompt.
 2. If you missed the prompt or clicked **Don't Allow**: open
    **System Settings › Privacy & Security › Files and Folders**, find
-   **duduclaw**, and turn on the folders it needs (Documents, Desktop,
+   **DuDuClaw Gateway** (or **duduclaw** for a gateway that still runs as a
+   bare binary), and turn on the folders it needs (Documents, Desktop,
    Downloads, Network Volumes, Removable Volumes).
 3. Nothing needs restarting. Answering a prompt that DuDuClaw was waiting on
    is noticed within seconds; a change in System Settings is noticed at the
@@ -65,8 +83,9 @@ The simplest fix is to keep DuDuClaw's files out of protected folders.
   Documents, Desktop or iCloud Drive — iCloud can also evict files to the
   cloud, which breaks databases.
 - **Shared drives:** a network or USB volume is always protected. If you
-  must use one, allow **Network Volumes** / **Removable Volumes** for duduclaw
-  after every update (until the signed app build).
+  must use one, allow **Network Volumes** / **Removable Volumes** for
+  DuDuClaw Gateway once. A gateway still running as a bare binary needs this
+  again after every update until it is moved into the app.
 
 ## Full Disk Access (optional)
 
@@ -76,17 +95,18 @@ everything on the Mac, including Mail, Messages and other apps' data. Prefer
 the per-folder switches above.
 
 Known issue: on macOS 26.1 and 26.2, a Full Disk Access grant for a bare
-command-line binary (which the gateway is until the signed app build) does not
-reliably take effect. If reads still fail after granting it, use the
-per-folder switches instead.
+command-line binary (a gateway not yet moved into `DuDuClaw Gateway.app`) does
+not reliably take effect. If reads still fail after granting it, move the
+gateway into the app or use the per-folder switches instead.
 
 ## Enterprise: pre-approve with a PPPC profile
 
 Managed Macs can pre-approve folder access with a Privacy Preferences Policy
-Control (PPPC) profile from your MDM. **This applies only to the signed
-DuDuClaw app build** (Team ID `7469HYQ6HH`, identifier
-`ai.duduclaw.gateway`); the current command-line binary has no stable
-signature for the profile to match.
+Control (PPPC) profile from your MDM. **This applies only to
+`DuDuClaw Gateway.app`** (Team ID `7469HYQ6HH`, identifier
+`ai.duduclaw.gateway`); a gateway still running as a bare command-line binary
+has no stable signature for the profile to match, so move it into the app
+first.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -131,12 +151,21 @@ Grant only the folders your teams actually use.
 
 ## Install with install.sh, not npm, on macOS
 
-macOS keys the permission to the program's path. The npm package installs the
-binary under a folder that includes the Node.js version
-(for example `…/node/v22.x/lib/node_modules/…`), so upgrading Node — or using
-a Node version manager — moves the binary and macOS asks again. The
-`install.sh` installer keeps it at a fixed path (`~/.duduclaw/bin/duduclaw`):
+The `install.sh` installer puts `DuDuClaw Gateway.app` in `~/Applications/`
+and starts the CLI through a link to it. It also keeps the standalone binary
+that older versions need for their update step. Before installing, it checks
+the release signature with minisign and the app's developer signature,
+identifier, version and edition:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
+
+`install.sh` needs [minisign](https://jedisct1.github.io/minisign/)
+(`brew install minisign`); without it the installer stops and explains how to
+install it instead of skipping the check.
+
+The npm package installs the app inside its platform package, under a folder
+that includes the Node.js version (for example
+`…/node/v22.x/lib/node_modules/…`), so upgrading Node, or using a Node version
+manager, moves the app. `install.sh` keeps one fixed location.

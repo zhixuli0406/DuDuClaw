@@ -211,7 +211,9 @@ legacy interactive session, which bypasses the gateway. Both forms remain
 available during the deprecation window and print a notice to stderr. Use
 `duduclaw tui` for interactive sessions. The `run` subcommand is hidden from
 help but remains parsed. Other `duduclaw agent` subcommands are unaffected.
-Removal is scheduled for **v1.81.0**.
+Both forms are still present in v1.81.0; no new removal version has been set.
+The stderr notice still says the session "will be removed in v1.81.0"; that
+date has passed and the notice is out of date.
 
 ### Pack legacy formats
 

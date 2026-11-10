@@ -171,7 +171,8 @@ CLI 設定檔的權限規則不會自動刪除，操作者可自行清理。
 不帶子指令的 `duduclaw agent` 與 `duduclaw agent run <name>` 會啟動會繞過
 gateway 的舊版互動工作階段。棄用期間兩種寫法仍可使用，並會在 stderr 顯示提示。
 互動操作請改用 `duduclaw tui`。`run` 子指令仍可解析，但不顯示在說明中；其他
-`duduclaw agent` 子指令不受影響。預計於 **v1.81.0** 移除。
+`duduclaw agent` 子指令不受影響。v1.81.0 仍保留這兩種寫法，尚未訂出新的移除版本。
+stderr 提示仍寫著「將於 v1.81.0 移除」，這段文字已過時。
 
 ### 板模包的舊格式
 
