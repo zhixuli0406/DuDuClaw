@@ -962,7 +962,7 @@ where
     // v1.81 P1g: an agent callback makes the employee run work — re-check
     // its CURRENT Personal ownership against the stored human origin (rows
     // created before the upgrade included). A static message runs nothing.
-    if reminder.mode == ReminderMode::AgentCallback && crate::runtime_readiness::is_protected_linux() {
+    if reminder.mode == ReminderMode::AgentCallback && crate::runtime_readiness::isolation_active() {
         let (home, target, principal) =
             (home_dir.to_path_buf(), reminder.agent_id.clone(), reminder.on_behalf_of.clone());
         let refusal = tokio::task::spawn_blocking(move || {

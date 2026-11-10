@@ -1524,6 +1524,8 @@ pub mod execution_gate;
 pub mod execution_blocking;
 /// SR5 round 3 N3: the one durable native-Linux protected-mode latch.
 pub mod protected_mode;
+/// Root-owned facts of an installed native-Linux isolation architecture.
+pub mod isolation_install;
 
 pub mod mcp_tool_defs;
 

@@ -501,7 +501,7 @@ fn path_occupied(path: &Path) -> std::io::Result<bool> {
 /// The request's private temp directory is removed on every pre-publication
 /// failure; a published directory is retained if marker publication fails.
 pub fn stage_restore(home: &Path, source: &Path) -> Result<RestoreStageReport, String> {
-    stage_restore_with_protection(home, source, protected_mode())
+    stage_restore_with_protection(home, source, protection())
 }
 
 /// Native Linux protected mode (v1.81, SR2 1c-u2): a whole-home restore is
@@ -521,20 +521,75 @@ pub const PROTECTED_RESTORE_REFUSED: &str = "受保護模式下不能整包還�
     核准紀錄與帳號資料，可能讓已交接（停用並移入隔離區）的個人專屬員工或已撤銷的授權復原。請改用受保護的資料匯入流程，\
     由管理員逐項核准。";
 
-/// Protected mode for restore purposes: the native Linux protected key mode
-/// (`DUDUCLAW_PROTECTED_KEY_MODE=native-systemd`, the same switch the boot
-/// path uses to require isolation).
-fn protected_mode() -> bool {
-    crate::runtime_readiness::is_protected_linux()
+/// L3: a protected single-binary host refuses an archive that carries
+/// isolation state (see `backup_restore_isolation.rs`): restored there, those
+/// records would no longer be enforced by the isolation gates.
+pub const PROTECTED_RESTORE_ISOLATION_STATE: &str = "受保護模式下不能還原這份備份：備份內含隔離架構的 AI 員工狀態\
+    （已確認的員工紀錄、個人專屬員工的擁有者紀錄、隔離區資料或遷移核准紀錄）。這台主機是單一執行檔的受保護安裝，\
+    還原後這些紀錄將不再受到隔離規則保護。請在原本的隔離安裝上改用受保護的資料匯入流程，由管理員逐項核准。";
+/// L3: the same check could not rule isolation state out (fail closed).
+pub const PROTECTED_RESTORE_ISOLATION_UNKNOWN: &str = "受保護模式下不能還原這份備份：無法確認備份是否含有隔離架構的 \
+    AI 員工狀態（相關的資料庫或目錄無法讀取或格式不符），為安全起見已拒絕。請確認備份的來源與完整性，\
+    或改用受保護的資料匯入流程。";
+
+#[path = "backup_restore_isolation.rs"]
+mod isolation_state;
+
+/// How a restore is protected on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreProtection {
+    /// Not protected: restore as before.
+    Off,
+    /// Protected single-binary host (protected mode, isolation not
+    /// installed): restore as in v1.80, except an archive carrying isolation
+    /// state ([`PROTECTED_RESTORE_ISOLATION_STATE`]).
+    SingleBinary,
+    /// Isolation installed: every whole-home restore is refused
+    /// ([`PROTECTED_RESTORE_REFUSED`]).
+    Isolation,
 }
 
-fn stage_restore_with_protection(home: &Path, source: &Path, protected: bool) -> Result<RestoreStageReport, String> {
-    if protected { return Err(PROTECTED_RESTORE_REFUSED.into()); }
-    with_restore_lock(home, || stage_restore_locked(home, source))
+/// Isolation: native Linux protected mode on a host where the isolation
+/// architecture is installed (the same switch the boot path uses to require
+/// isolation). The refusal protects isolation state (tombstones, proposals,
+/// quarantine) and points to the isolation import flow. SingleBinary:
+/// protected mode alone.
+fn protection() -> RestoreProtection {
+    if crate::runtime_readiness::isolation_active() { RestoreProtection::Isolation }
+    else if crate::runtime_readiness::is_protected_linux() { RestoreProtection::SingleBinary }
+    else { RestoreProtection::Off }
+}
+
+pub use isolation_state::IsolationEntry;
+
+/// L3: which archive entries [`archive_isolation_refusal`] reads, for a
+/// caller that extracts selectively (`duduclaw import`). `path` is relative
+/// to the restore root.
+pub fn archive_isolation_entry(path: &Path) -> IsolationEntry {
+    isolation_state::entry_kind(path)
+}
+
+/// L3: the archive's restore root carries no isolation state, or the refusal
+/// ([`PROTECTED_RESTORE_ISOLATION_STATE`] / [`PROTECTED_RESTORE_ISOLATION_UNKNOWN`]).
+/// The one inspection used by the dashboard restore and `duduclaw import` on a
+/// protected single-binary host.
+pub fn archive_isolation_refusal(root: &Path) -> Result<(), &'static str> {
+    match isolation_state::inspect(root) {
+        isolation_state::ArchiveIsolation::Absent => Ok(()),
+        isolation_state::ArchiveIsolation::Present => Err(PROTECTED_RESTORE_ISOLATION_STATE),
+        isolation_state::ArchiveIsolation::Unknown => Err(PROTECTED_RESTORE_ISOLATION_UNKNOWN),
+    }
+}
+
+fn stage_restore_with_protection(home: &Path, source: &Path, protection: RestoreProtection)
+    -> Result<RestoreStageReport, String> {
+    if protection == RestoreProtection::Isolation { return Err(PROTECTED_RESTORE_REFUSED.into()); }
+    let single_binary = protection == RestoreProtection::SingleBinary;
+    with_restore_lock(home, || stage_restore_locked(home, source, single_binary))
         .map_err(|e| format!("無法鎖定還原作業：{e}"))?
 }
 
-fn stage_restore_locked(home: &Path, source: &Path) -> Result<RestoreStageReport, String> {
+fn stage_restore_locked(home: &Path, source: &Path, single_binary: bool) -> Result<RestoreStageReport, String> {
     if path_occupied(&marker_path(home)).map_err(|e| e.to_string())? {
         return Err("已有待套用的還原，請先重新啟動閘道套用，再上傳新的還原。".into());
     }
@@ -544,6 +599,11 @@ fn stage_restore_locked(home: &Path, source: &Path) -> Result<RestoreStageReport
     let extraction = extract_tar_gz_safely(source, &extracted, &RestoreLimits::from_home(home))
         .map_err(|e| e.to_string())?;
     let root = resolve_restore_root(&extracted, home);
+    // L3: inspected in the private request directory, before any validation
+    // reads or publication; the request directory is removed on refusal.
+    if single_binary {
+        archive_isolation_refusal(&root)?;
+    }
     let read_config = |path: &Path| -> Result<String, String> {
         match std::fs::read_to_string(path) {
             Ok(text) => Ok(text),
@@ -694,7 +754,9 @@ pub enum RestoreSwapError {
     StagingMissingOrEmpty,
     GatewayRunning(String),
     /// Native Linux protected mode: a marker staged before protection was
-    /// enabled is never swapped in ([`PROTECTED_RESTORE_REFUSED`]). Nothing
+    /// enabled is never swapped in ([`PROTECTED_RESTORE_REFUSED`]; on a
+    /// single-binary host only an archive with isolation state,
+    /// [`PROTECTED_RESTORE_ISOLATION_STATE`] / `_UNKNOWN`). Nothing
     /// is moved; the staging tree and marker stay for an Admin to inspect.
     ProtectedMode(&'static str),
     Io(String),
@@ -740,20 +802,26 @@ pub fn perform_pending_restore_swap(
     home_dir: &Path,
     now_tag: &str,
 ) -> Result<Option<RestoreSwapReport>, RestoreSwapError> {
-    perform_pending_restore_swap_with_protection(home_dir, now_tag, protected_mode())
+    perform_pending_restore_swap_with_protection(home_dir, now_tag, protection())
 }
 
 fn perform_pending_restore_swap_with_protection(
     home_dir: &Path,
     now_tag: &str,
-    protected: bool,
+    protection: RestoreProtection,
 ) -> Result<Option<RestoreSwapReport>, RestoreSwapError> {
     if read_marker(home_dir).is_none() {
         return Ok(None);
     }
     // SR2 1c-u2: see `PROTECTED_RESTORE_REFUSED` (a restore could undo tombstones).
-    if protected {
+    if protection == RestoreProtection::Isolation {
         return Err(RestoreSwapError::ProtectedMode(PROTECTED_RESTORE_REFUSED));
+    }
+    // L3: a restore staged before protection was enabled (or by an older
+    // build) is inspected again; nothing moves, staging and marker stay.
+    if protection == RestoreProtection::SingleBinary {
+        archive_isolation_refusal(&resolve_restore_root(&staging_dir(home_dir), home_dir))
+            .map_err(RestoreSwapError::ProtectedMode)?;
     }
 
     // Hold through policy reads, staging rewrites, the entire swap and boot.
@@ -1891,7 +1959,8 @@ mod isolation_tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         // Staging: refused before any lock, read, temp directory or marker.
-        let error = super::stage_restore_with_protection(home, &home.join("missing.tar.gz"), true).unwrap_err();
+        let error = super::stage_restore_with_protection(home, &home.join("missing.tar.gz"),
+            super::RestoreProtection::Isolation).unwrap_err();
         assert_eq!(error, super::PROTECTED_RESTORE_REFUSED);
         assert!(error.contains("受保護模式") && error.contains("個人專屬員工"), "{error}");
         assert!(std::fs::read_dir(home).unwrap().next().is_none(), "nothing was written");
@@ -1903,11 +1972,108 @@ mod isolation_tests {
         std::fs::write(home.join("users.db"), b"current").unwrap();
         super::write_marker(home, &super::RestoreMarker {
             staged_at: chrono::Utc::now(), source_filename: "before-tombstone.tar.gz".into() }).unwrap();
-        assert_eq!(super::perform_pending_restore_swap_with_protection(home, "ts", true),
+        assert_eq!(super::perform_pending_restore_swap_with_protection(home, "ts", super::RestoreProtection::Isolation),
             Err(super::RestoreSwapError::ProtectedMode(super::PROTECTED_RESTORE_REFUSED)));
         assert!(super::read_marker(home).is_some());
         assert!(staging.join("agents/alice-helper").is_dir());
         assert!(!home.join("agents/alice-helper").exists());
+        assert_eq!(std::fs::read(home.join("users.db")).unwrap(), b"current");
+        assert!(!home.join("restore-backup-ts").exists());
+    }
+
+    /// Build a whole-home archive (`duduclaw/...`, as `device.backup_create`
+    /// writes it) from files under a scratch tree.
+    fn archive_of(tree: &std::path::Path, out: &std::path::Path) {
+        let file = std::fs::File::create(out).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+        builder.append_dir_all("duduclaw", tree).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn home_with_name() -> (tempfile::TempDir, std::path::PathBuf) {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("duduclaw");
+        std::fs::create_dir(&home).unwrap();
+        (parent, home)
+    }
+
+    fn sqlite(path: &std::path::Path, sql: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        rusqlite::Connection::open(path).unwrap().execute_batch(sql).unwrap();
+    }
+
+    /// L3: on a protected single-binary host a backup carrying isolation
+    /// state (here: a confirmed employee and a Personal mirror row, as taken
+    /// on an isolation host) is refused at staging, before publication: no
+    /// staging tree, no marker, no request directory left behind. An
+    /// unreadable store is refused too (fail closed). A plain v1.80 backup
+    /// still stages, and an unprotected host is unchanged.
+    #[test]
+    fn l3_single_binary_restore_refuses_archive_with_isolation_state() {
+        use super::RestoreProtection::{Off, SingleBinary};
+        let scratch = tempfile::tempdir().unwrap();
+        let isolation_tree = scratch.path().join("isolation");
+        std::fs::create_dir_all(&isolation_tree).unwrap();
+        std::fs::write(isolation_tree.join("config.toml"), b"").unwrap();
+        sqlite(&isolation_tree.join("migration-authority/apply.db"),
+            "CREATE TABLE confirmed_employees(label TEXT); INSERT INTO confirmed_employees VALUES('alice-personal');");
+        sqlite(&isolation_tree.join("users.db"),
+            "CREATE TABLE isolation_personal_agents(agent_name TEXT, owner_user_id TEXT);
+             INSERT INTO isolation_personal_agents VALUES('alice-personal', 'u1');");
+        let isolation_archive = scratch.path().join("isolation.tar.gz");
+        archive_of(&isolation_tree, &isolation_archive);
+
+        let unreadable_tree = scratch.path().join("unreadable");
+        std::fs::create_dir_all(&unreadable_tree).unwrap();
+        std::fs::write(unreadable_tree.join("migration-confirmations.db"), b"not a SQLite database").unwrap();
+        let unreadable_archive = scratch.path().join("unreadable.tar.gz");
+        archive_of(&unreadable_tree, &unreadable_archive);
+
+        let plain_tree = scratch.path().join("plain");
+        std::fs::create_dir_all(plain_tree.join("agents/dudu")).unwrap();
+        std::fs::write(plain_tree.join("config.toml"), b"").unwrap();
+        sqlite(&plain_tree.join("users.db"), "CREATE TABLE users(id TEXT); INSERT INTO users VALUES('u1');");
+        let plain_archive = scratch.path().join("plain.tar.gz");
+        archive_of(&plain_tree, &plain_archive);
+
+        for (archive, refusal) in [(&isolation_archive, super::PROTECTED_RESTORE_ISOLATION_STATE),
+            (&unreadable_archive, super::PROTECTED_RESTORE_ISOLATION_UNKNOWN)] {
+            let (_parent, home) = home_with_name();
+            let error = super::stage_restore_with_protection(&home, archive, SingleBinary).unwrap_err();
+            assert_eq!(error, refusal);
+            assert!(error.contains("受保護模式"), "{error}");
+            assert!(super::read_marker(&home).is_none());
+            assert!(!super::staging_dir(&home).exists());
+            let leftovers: Vec<_> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().starts_with(".restore-request-")).collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+        // Not protected: the same isolation archive stages as before.
+        let (_parent, home) = home_with_name();
+        assert!(super::stage_restore_with_protection(&home, &isolation_archive, Off).is_ok());
+        // Single-binary host, plain v1.80 backup: stages.
+        let (_parent, home) = home_with_name();
+        assert!(super::stage_restore_with_protection(&home, &plain_archive, SingleBinary).is_ok());
+        assert!(super::read_marker(&home).is_some());
+    }
+
+    /// L3 at the boot swap: an isolation-state archive staged earlier (before
+    /// protection, or by an older build) never swaps in on a protected
+    /// single-binary host; nothing moves and staging + marker stay.
+    #[test]
+    fn l3_single_binary_swap_refuses_staged_isolation_state() {
+        let (_parent, home) = home_with_name();
+        let root = super::staging_dir(&home).join("duduclaw");
+        std::fs::create_dir_all(root.join("isolation-quarantine/0123-0-alice")).unwrap();
+        std::fs::write(home.join("users.db"), b"current").unwrap();
+        super::write_marker(&home, &super::RestoreMarker {
+            staged_at: chrono::Utc::now(), source_filename: "isolation-host.tar.gz".into() }).unwrap();
+        assert_eq!(super::perform_pending_restore_swap_with_protection(&home, "ts", super::RestoreProtection::SingleBinary),
+            Err(super::RestoreSwapError::ProtectedMode(super::PROTECTED_RESTORE_ISOLATION_STATE)));
+        assert!(super::read_marker(&home).is_some());
+        assert!(root.join("isolation-quarantine").is_dir());
+        assert!(!home.join("isolation-quarantine").exists());
         assert_eq!(std::fs::read(home.join("users.db")).unwrap(), b"current");
         assert!(!home.join("restore-backup-ts").exists());
     }

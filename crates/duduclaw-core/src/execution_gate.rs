@@ -37,11 +37,17 @@ pub const REFUSAL: &str = "受保護模式無法啟動員工：隔離執行服�
 /// narrow execution for the rest of the process lifetime.
 pub fn require_isolation() { REQUIRED.store(true, Ordering::Release); }
 
-/// SR5 round 3 N3: the environment flag OR a host-owned durable fact
-/// ([`crate::protected_mode::active`], which latches itself); an
-/// employee-editable environment cannot turn it off.
+/// Employee work must use the isolation architecture: the trusted latch, or
+/// protected mode ([`crate::protected_mode::active`]: the environment flag OR
+/// a host-owned durable fact) on a host where the isolation architecture is
+/// installed ([`crate::isolation_install::installed`]: root-owned facts only).
+/// Both inputs latch on, so an employee-editable environment cannot turn this
+/// off. A protected single-binary host (every v1.80 / v1.81 install until the
+/// isolation bootstrap ships) is not required: its employees run under the
+/// service account with the v1.80 credential-protection controls.
 pub fn isolation_required() -> bool {
-    REQUIRED.load(Ordering::Acquire) || crate::protected_mode::active()
+    REQUIRED.load(Ordering::Acquire)
+        || (crate::protected_mode::active() && crate::isolation_install::installed())
 }
 
 pub fn local_allowed(required: bool, class: ExecutionClass) -> bool {
@@ -110,12 +116,25 @@ mod tests {
     #[tokio::test]
     async fn protected_native_fixture() {
         if std::env::var_os("DUDUCLAW_EXECUTION_GATE_FIXTURE").is_none() { return; }
-        let mut command = tokio::process::Command::new("/does-not-exist-isolation-fixture");
-        let error = spawn_local(&mut command, ExecutionClass::EmployeeMain).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(error.to_string(), REFUSAL);
-        let error = crate::process_tree::ManagedChild::spawn(&mut command).err().unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(crate::protected_mode::active());
+        // Protected mode alone (the v1.80-style single-binary host) keeps the
+        // v1.80 local execution under the service account.
+        if !crate::isolation_install::installed() {
+            assert!(!isolation_required());
+            assert!(check_local(ExecutionClass::EmployeeMain).is_ok());
+        }
+        // Where the isolation architecture is installed, native employee
+        // children are refused before executable lookup.
+        let isolation = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(isolation.path().join("var/lib/duduclaw-spawnd")).unwrap();
+        crate::isolation_install::with_thread_root(isolation.path().to_path_buf(), || {
+            let mut command = tokio::process::Command::new("/does-not-exist-isolation-fixture");
+            let error = spawn_local(&mut command, ExecutionClass::EmployeeMain).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), REFUSAL);
+            let error = crate::process_tree::ManagedChild::spawn(&mut command).err().unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        });
     }
 
     #[cfg(target_os = "linux")]

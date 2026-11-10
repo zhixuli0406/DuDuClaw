@@ -346,7 +346,7 @@ pub(crate) async fn fire_time_personal_refusal(
     home: &Path,
     msg: &crate::message_queue::QueueMessage,
 ) -> Option<&'static str> {
-    if !crate::runtime_readiness::is_protected_linux() {
+    if !crate::runtime_readiness::isolation_active() {
         return None;
     }
     let (home, target) = (home.to_path_buf(), msg.target.clone());
@@ -362,7 +362,7 @@ pub(crate) async fn fire_time_personal_refusal(
 /// v1.81 P1g: the JSONL rail's fire-time check (principal `on_behalf_of`,
 /// acting = the sending employee).
 async fn bus_fire_time_refusal(home: &Path, msg: &BusMessage) -> Option<&'static str> {
-    if !crate::runtime_readiness::is_protected_linux() {
+    if !crate::runtime_readiness::isolation_active() {
         return None;
     }
     let (home, msg) = (home.to_path_buf(), msg.clone());
@@ -2282,7 +2282,7 @@ async fn dispatch_taskspec_inner(
         }
         // v1.81 P1g: fire-time Personal ownership check of the step's
         // employee (owner principal, or the plan's own / same-owner employee).
-        if crate::runtime_readiness::is_protected_linux() {
+        if crate::runtime_readiness::isolation_active() {
             let (home, target, acting) = (home_dir.to_path_buf(), target_agent.clone(), spec.agent_id.clone());
             let principal = crate::on_behalf_of::current();
             let refusal = tokio::task::spawn_blocking(move || {

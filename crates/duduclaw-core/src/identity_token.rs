@@ -90,9 +90,11 @@
 //! - protected, tombstoned: `Rejected`, and no token is minted;
 //! - index present but unreadable or corrupt: `Rejected`, no token is minted;
 //! - unprotected (no index, or no row for the label): v1, exactly as before.
-//! - SR5 item 6, native Linux protected mode ([`token_binding`] with
-//!   `execution_gate::isolation_required()`): the soft-mode grace never
-//!   applies; a label with no confirmed row is refused (no token minted,
+//! - SR5 item 6, native Linux protected mode: the soft-mode grace never
+//!   applies (`protected_mode::active()`, single-binary hosts included). Where
+//!   the isolation architecture is installed ([`token_binding`] with
+//!   `execution_gate::isolation_required()`) a label with no confirmed row is
+//!   refused (no token minted,
 //!   none verifies), except an `eph-…` child — a v2 token for its label over
 //!   its ROOT employee's live tuple (host-recorded parent chain) — and the
 //!   gateway's signed `doctor-probe` (v1).
@@ -482,8 +484,10 @@ pub enum TokenBinding {
 /// The cold-start probe the gateway signs for an MCP check; no employee reach.
 const DOCTOR_PROBE: &str = "doctor-probe";
 
-/// SR5 item 6: the token binding of `label`. `required` is protected mode
-/// (`execution_gate::isolation_required()` in production).
+/// SR5 item 6: the token binding of `label`. `required` is protected mode on a
+/// host with the isolation architecture installed
+/// (`execution_gate::isolation_required()` in production); a protected
+/// single-binary host binds labels as v1, as in v1.80.
 ///
 /// - A confirmed row decides as before: live ⇒ v2 of its tuple, tombstoned ⇒
 ///   refused.
@@ -1288,8 +1292,12 @@ fn verify_claim_inner(
 ) -> IdentityVerdict {
     // Recheck even when the caller cached false or passed it directly. Expiry
     // must restore strict verification without waiting for a gateway restart.
-    // SR5 item 6: protected mode ignores the grace entirely.
-    let require = if require || protected_mode { true } else {
+    // SR5 item 6: protected mode ignores the grace entirely. `protected_mode`
+    // is the isolation binding (`execution_gate::isolation_required`); strict
+    // identity is a credential-protection control, so it also holds on a
+    // protected single-binary host (`protected_mode::active`), where labels
+    // keep their v1 binding.
+    let require = if require || protected_mode || crate::protected_mode::active() { true } else {
         match crate::require_identity_token_from_home(home_dir) {
             Ok(require) => require,
             Err(_) => return IdentityVerdict::Rejected,

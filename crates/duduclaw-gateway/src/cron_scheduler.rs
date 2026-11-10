@@ -85,7 +85,7 @@ pub(crate) async fn cron_fire_time_refusal(
     task: &CronTaskRow,
     scoped_principal: Option<&str>,
 ) -> Option<&'static str> {
-    if !crate::runtime_readiness::is_protected_linux() {
+    if !crate::runtime_readiness::isolation_active() {
         return None;
     }
     let home = home.to_path_buf();

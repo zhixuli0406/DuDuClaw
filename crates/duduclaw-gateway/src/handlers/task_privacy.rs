@@ -128,7 +128,7 @@ pub(crate) struct TaskReader<'a> {
 
 impl<'a> TaskReader<'a> {
     pub(crate) fn new(home: &'a Path, ctx: &UserContext) -> Result<Self, WsFrame> {
-        Self::build(home, ctx, crate::runtime_readiness::is_protected_linux())
+        Self::build(home, ctx, crate::runtime_readiness::isolation_active())
     }
 
     /// [`Self::new`] with the protected-mode flag passed in (tests).

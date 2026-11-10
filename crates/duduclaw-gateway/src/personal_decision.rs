@@ -117,13 +117,13 @@ pub(crate) fn channel_card_refusal(
     channel: &str,
     sender: &str,
 ) -> Option<&'static str> {
-    channel_card_refusal_with(home, crate::runtime_readiness::is_protected_linux(), rec, channel, sender)
+    channel_card_refusal_with(home, crate::runtime_readiness::isolation_active(), rec, channel, sender)
 }
 
 /// Like [`channel_card_refusal`] for decision cards keyed by their employee
 /// (goal kickoff approvals and needs-human goal tasks).
 pub(crate) fn channel_agent_refusal(home: &Path, agent: &str, channel: &str, sender: &str) -> Option<&'static str> {
-    channel_text(decider_refusal(home, crate::runtime_readiness::is_protected_linux(), agent, || {
+    channel_text(decider_refusal(home, crate::runtime_readiness::isolation_active(), agent, || {
         channel_decider(home, channel, sender)
     }))
 }

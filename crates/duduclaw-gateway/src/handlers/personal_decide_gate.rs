@@ -45,7 +45,7 @@ impl MethodHandler {
         csrf: Option<[u8; 32]>,
         method: &'static str,
     ) -> Result<(), WsFrame> {
-        if !crate::runtime_readiness::is_protected_linux() {
+        if !crate::runtime_readiness::isolation_active() {
             return Ok(());
         }
         let refuse = |message: &str| WsFrame::error_response("", message);

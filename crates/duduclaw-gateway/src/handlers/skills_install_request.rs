@@ -561,7 +561,7 @@ impl MethodHandler {
                 super::skills_install_target::authorize_requested_write(
                     &home,
                     db.as_deref(),
-                    crate::runtime_readiness::is_protected_linux(),
+                    crate::runtime_readiness::isolation_active(),
                     &super::skills_install_target::RequestedWrite {
                         method: super::skills_install_target::request_method(&req_for_check),
                         request_id: &req_for_check.id,

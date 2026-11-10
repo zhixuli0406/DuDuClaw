@@ -5398,6 +5398,49 @@ that review has not been obtained.
   gateway-only install with `--migrate-from` can import a user-mode v1.79.x home
   and record a 1.81.x floor. Do not trust the floor for this decision, and do not
   add a marker file in its place.
+- v1.82 isolation switch: protected mode alone no longer means "isolation
+  required". `execution_gate::isolation_required()` is the trusted latch OR
+  (`protected_mode::active()` AND `isolation_install::installed()`), and every
+  isolation decision (spawnd routing, isolation MCP authorization, the
+  background queue, composite readiness, Personal/Shared employee rules,
+  proposal-only employee creation, label quarantine) follows it; v1.80
+  credential protection keeps `protected_mode::active()`. `installed()` checks
+  only root-owned fixed paths (`duduclaw_core::isolation_install::FACTS`: the
+  spawnd control socket, every isolation-only unit and directory of the
+  installer layout — spawnd, employees slice, egress, DNS broker, parse,
+  updated, import, migrate-expire; `/usr/lib/duduclaw`,
+  `/opt/duduclaw-isolated`, `/var/lib/duduclaw-spawnd`,
+  `/var/log/duduclaw-spawnd`, `/var/lib/duduclaw-updated`,
+  `/etc/duduclaw-updated`, `/var/lib/duduclaw-migrate` — plus
+  `/opt/duduclaw-isolated/current`, `/var/lib/duduclaw-updated/state.json`,
+  `/etc/duduclaw/migration-import.json` and the layout's fixed binaries).
+  Nothing a v1.80 single-binary install writes or uses is a fact
+  (`isolation_install::SINGLE_BINARY_LAYOUT`: `/etc/duduclaw`,
+  `duduclaw.slice`, `duduclaw-tcb.slice`, `/opt/duduclaw/bin`,
+  `/usr/local/libexec/duduclaw`, `/var/lib/duduclaw`,
+  `/var/lib/duduclaw-protected`, `duduclaw-gateway.service`; tested in
+  duduclaw-core and duduclaw-cli). The bootstrap must create one of these
+  facts before any employee runs; otherwise employees run single-binary under
+  the gateway account. Employee runtimes see the fact through the read-only
+  `/usr` clone (`/usr/lib/duduclaw/duduclaw-run`); a mount policy that hides
+  it must project another fact first.
+- v1.82 bootstrap ordering (L1): the gateway decides composite readiness once
+  (`isolation_readiness::initialize`, at boot and on an edition change), while
+  `execution_gate::isolation_required()` re-reads the facts every
+  `OFF_CACHE_WINDOW`. The bootstrap MUST therefore stop the gateway
+  (`duduclaw-gateway.service`) and pass the processes-clear check (no process
+  of the gateway / isolation service accounts or the employee uid range, as
+  `protected_linux_uninstall::processes_clear`) BEFORE publishing the first
+  isolation fact, and start the gateway only after the install is complete.
+  As a fail-closed backstop, a running TEAM gateway that sees isolation become
+  required without initialised readiness logs one error and refuses all
+  employee work with `ISOLATION_NOT_READY` until restart
+  (`isolation_readiness::late_requirement`).
+- v1.82 acceptance (L5): `bootstrap::tests::employee_runtime_sees_an_isolation_install_fact`
+  only checks constants. The root-capable VM / root-fixture suite MUST add a
+  test that launches a real employee runtime through spawnd and asserts
+  `duduclaw_core::isolation_install::installed()` is true inside that runtime
+  view (read-only `/usr` clone, projected `/etc`, no `/var/lib`).
 - Wire I1 composite readiness and verified DNS/unit configuration; no current
   readiness command can return overall success with `MissingComposite`.
 - Connect H's complete storage inventory to removal; run real fresh-install,

@@ -880,7 +880,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // interrupted adoption (`adopting` quarantine row). Protected mode only;
     // spawnd IPC on the blocking pool, never delays boot. A roll-forward puts
     // the adopted tree under agents/, so the registry is rescanned after.
-    if crate::runtime_readiness::is_protected_linux() {
+    // Only where the isolation architecture (spawnd) is installed.
+    if crate::runtime_readiness::isolation_active() {
         let (recover_home, recover_registry) = (home_dir.clone(), handler.registry().clone());
         tokio::spawn(async move {
             let now = chrono::Utc::now().timestamp();

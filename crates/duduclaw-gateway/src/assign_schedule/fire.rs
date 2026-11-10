@@ -166,7 +166,7 @@ async fn fire_one(
     // creator is not the employee's CURRENT owner (an Admin's schedule made
     // before the upgrade included) pauses instead of running.
     if crate::personal_visibility::fire_time_refusal(
-        home, crate::runtime_readiness::is_protected_linux(), &[Some(principal.as_str())], None, &row.agent_id,
+        home, crate::runtime_readiness::isolation_active(), &[Some(principal.as_str())], None, &row.agent_id,
     ).is_some() {
         return auto_pause(home, store, row, &slot_s, "access_lost").await;
     }

@@ -169,7 +169,7 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
             }
             // v1.81 P1b: a step is work handed to that employee, like spawn_agent.
             if let Some(refusal) = duduclaw_gateway::personal_visibility::management_refusal(home_dir,
-                duduclaw_gateway::runtime_readiness::is_protected_linux(), caller, &agent) {
+                duduclaw_gateway::runtime_readiness::isolation_active(), caller, &agent) {
                 return mcp_error(&format!("step {i}: {refusal}"));
             }
         }
@@ -336,7 +336,7 @@ pub(crate) async fn handle_task_status(params: &Value, home_dir: &Path, caller: 
             // v1.81 P1b: a step run by another person's Personal employee
             // keeps its status; its output is not shown.
             let hidden = super::personal_target::hidden_step_agents(home_dir,
-                duduclaw_gateway::runtime_readiness::is_protected_linux(), caller,
+                duduclaw_gateway::runtime_readiness::isolation_active(), caller,
                 spec.steps.iter().map(|s| s.agent.as_str()));
             for step in &spec.steps {
                 report.push_str(&format!(

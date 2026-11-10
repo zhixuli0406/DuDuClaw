@@ -18,13 +18,15 @@ impl MethodHandler {
     /// only through an approved Employee proposal and its root allocation, so
     /// direct creation is refused here. Admins use `isolation.employee_propose`
     /// (step-up, then the approval card); staff request a Personal employee
-    /// with `me.isolation.request_personal_employee`.
+    /// with `me.isolation.request_personal_employee`. Only where the isolation
+    /// architecture is installed: a protected single-binary host creates
+    /// employees directly, as in v1.80.
     pub(crate) async fn handle_agents_create_as(
         &self,
         params: Value,
         caller: Option<&UserContext>,
     ) -> WsFrame {
-        if crate::runtime_readiness::is_protected_linux() {
+        if crate::runtime_readiness::isolation_active() {
             return WsFrame::error_response("", super::isolation_employee_rpc::DIRECT_CREATE_REFUSED);
         }
         self.create_agent_files(params, caller).await

@@ -114,15 +114,15 @@ pub const OFF_CACHE_WINDOW: Duration = Duration::from_secs(5);
 /// said "off" (younger than [`OFF_CACHE_WINDOW`]), the answer is reused
 /// without re-statting the marker or re-opening SQLite. A positive probe
 /// clears it. The lock is held across the probe so concurrent callers do not
-/// stampede the probe.
-struct OffCache(Mutex<Option<Instant>>);
+/// stampede the probe. Shared with [`crate::isolation_install`].
+pub(crate) struct OffCache(Mutex<Option<Instant>>);
 
 impl OffCache {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self(Mutex::new(None))
     }
 
-    fn decide(&self, now: Instant, probe: impl FnOnce() -> bool) -> bool {
+    pub(crate) fn decide(&self, now: Instant, probe: impl FnOnce() -> bool) -> bool {
         let mut off_until = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if (*off_until).is_some_and(|until| now < until) {
             return false;
@@ -136,8 +136,11 @@ impl OffCache {
 
 static SYSTEM_OFF: OffCache = OffCache::new();
 
-/// The protected-mode switch. Every protected-mode decision in the product
-/// must use this (directly or through `execution_gate::isolation_required`).
+/// The protected-mode switch: the v1.80 credential-protection controls (root
+/// key, engine socket policy, protected update channel, runtime resolution
+/// under ProtectHome, strict caller identity) use this. Decisions about the
+/// isolation architecture use `execution_gate::isolation_required`, which is
+/// this AND [`crate::isolation_install::installed`].
 ///
 /// "On" (from the system sources) latches for the life of the process; an
 /// "off" answer is reused for at most [`OFF_CACHE_WINDOW`] (R3-4), so a
@@ -241,9 +244,45 @@ mod tests {
         std::fs::write(&s.marker, b"").unwrap();
         let before = active();
         assert!(with_thread_sources(s.clone(), active));
-        assert!(with_thread_sources(s, crate::execution_gate::isolation_required));
+        // Isolation is required only where it is also installed.
+        let isolation = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(isolation.path().join("var/lib/duduclaw-spawnd")).unwrap();
+        assert!(with_thread_sources(s, || crate::isolation_install::with_thread_root(
+            isolation.path().to_path_buf(), crate::execution_gate::isolation_required)));
         // Popped again; the process-wide answer did not change.
         assert_eq!(active(), before);
+    }
+
+    /// The v1.80-style single-binary host: protected mode on, isolation not
+    /// installed ⇒ isolation is not required (employees run as in v1.80);
+    /// with an isolation fact present it is required.
+    #[test]
+    fn protected_single_binary_host_does_not_require_isolation() {
+        if crate::isolation_install::installed() {
+            return; // This test host carries a real isolation install.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = sources(dir.path());
+        std::fs::create_dir_all(s.marker.parent().unwrap()).unwrap();
+        std::fs::write(&s.marker, b"native-systemd\n").unwrap();
+        let mut by_env = sources(dir.path());
+        by_env.marker = dir.path().join("absent-marker");
+        by_env.env = Some(MODE_VALUE.into());
+        let isolation = tempfile::tempdir().unwrap();
+        for protected in [s, by_env] {
+            with_thread_sources(protected, || {
+                assert!(active());
+                assert!(!crate::isolation_install::installed());
+                // (No core test calls `require_isolation`.)
+                assert!(!crate::execution_gate::isolation_required(),
+                    "protected mode alone never requires isolation");
+                std::fs::create_dir_all(isolation.path().join("run/duduclaw-spawnd")).unwrap();
+                std::fs::write(isolation.path().join("run/duduclaw-spawnd/control.sock"), b"").unwrap();
+                assert!(crate::isolation_install::with_thread_root(isolation.path().to_path_buf(),
+                    crate::execution_gate::isolation_required));
+                std::fs::remove_dir_all(isolation.path().join("run")).unwrap();
+            });
+        }
     }
 
     #[test]

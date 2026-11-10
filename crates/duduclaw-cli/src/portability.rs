@@ -100,6 +100,8 @@ pub fn export_home(home: &Path, out: &Path) -> Result<usize> {
 /// `..` path traversal).
 pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) -> Result<()> {
     require_legacy_import(duduclaw_parse_worker::client::required())?;
+    // Before the home is touched; rechecked under the lock.
+    refuse_isolation_host(import_protection())?;
     if !archive.is_file() {
         return Err(io_err(
             "import",
@@ -187,7 +189,14 @@ fn snapshot_archive(archive: &Path, home: &Path, max_bytes: u64) -> Result<File>
 }
 
 fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: bool) -> Result<()> {
+    // Protection only ever narrows (both switches latch on), so deciding
+    // again here can only refuse more.
+    let protection = import_protection();
+    refuse_isolation_host(protection)?;
     let mut snapshot = snapshot_archive(archive, home, MAX_IMPORT_ARCHIVE_BYTES)?;
+    if protection == ImportProtection::SingleBinary {
+        refuse_archive_isolation_state(&mut snapshot, home, &RestoreLimits::default())?;
+    }
     let decision = validate_import_policy(&mut snapshot, home, personal)?;
     apply_import_snapshot(&mut snapshot, home, force, &decision, |_| Ok(()))
 }
@@ -1369,11 +1378,246 @@ fn require_legacy_import(isolation_required: bool) -> Result<()> {
     }
 }
 
+/// How `duduclaw import` is protected on this host: the same switch as the
+/// dashboard restore (`backup_restore::protection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportProtection {
+    /// Not protected: import as before.
+    Off,
+    /// Protected mode, isolation not installed: import as in v1.80, except an
+    /// archive carrying isolation state.
+    SingleBinary,
+    /// Protected mode on an isolation host: refused outright.
+    Isolation,
+}
+
+fn import_protection() -> ImportProtection {
+    if !duduclaw_core::protected_mode::active() { ImportProtection::Off }
+    else if duduclaw_core::isolation_install::installed() { ImportProtection::Isolation }
+    else { ImportProtection::SingleBinary }
+}
+
+/// L1: an isolation host imports only through the protected import flow.
+const IMPORT_ISOLATION_HOST_REFUSED: &str = "這台主機已安裝隔離架構，受保護模式下不能用 duduclaw import 整包匯入資料目錄：\
+    整包匯入會一次覆寫 AI 員工的隔離配置、核准紀錄與帳號資料。請改用受保護的資料匯入流程，由管理員逐項核准。";
+
+fn refuse_isolation_host(protection: ImportProtection) -> Result<()> {
+    if protection == ImportProtection::Isolation {
+        Err(io_err("import isolation", IMPORT_ISOLATION_HOST_REFUSED))
+    } else {
+        Ok(())
+    }
+}
+
+/// L1: on a protected single-binary host, refuse an archive that carries
+/// isolation state, with the dashboard restore's inspection
+/// (`backup_restore::archive_isolation_refusal`). The entries it reads are
+/// extracted into a private directory first (only the top-level name of an
+/// `isolation-*` entry is materialised); nothing reaches the home, and the
+/// directory is removed on return. Any extraction failure refuses.
+fn refuse_archive_isolation_state(snapshot: &mut File, home: &Path, limits: &RestoreLimits) -> Result<()> {
+    use duduclaw_gateway::backup_restore::{self as restore, IsolationEntry};
+    let unknown = || io_err("import isolation", restore::PROTECTED_RESTORE_ISOLATION_UNKNOWN);
+    validate_import_tar_headers(snapshot, limits)?;
+    let inspection = tempfile::Builder::new().prefix(".import-isolation-").tempdir_in(home)
+        .map_err(|e| io_err("import isolation", e))?;
+    snapshot.rewind().map_err(|e| io_err("import isolation", e))?;
+    let mut archive = tar::Archive::new(GzDecoder::new(&mut *snapshot));
+    let mut targets = HashSet::new();
+    let mut budget = ImportBudget::default();
+    for entry in archive.entries().map_err(|e| io_err("import isolation", e))? {
+        let mut entry = entry.map_err(|e| io_err("import isolation", e))?;
+        budget.check(&entry, limits)?;
+        let path = checked_import_entry(&entry, &mut targets)?;
+        if is_live_lock(&path) { continue; }
+        match restore::archive_isolation_entry(&path) {
+            IsolationEntry::Ignored => {}
+            IsolationEntry::TopLevelName => {
+                let top = path.components().next().ok_or_else(unknown)?;
+                fs::OpenOptions::new().write(true).create(true).open(inspection.path().join(top.as_os_str()))
+                    .map_err(|_| unknown())?;
+            }
+            IsolationEntry::Content => {
+                let target = inspection.path().join(&path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|_| unknown())?;
+                }
+                entry.unpack(&target).map_err(|_| unknown())?;
+            }
+        }
+    }
+    drop(archive);
+    let verdict = restore::archive_isolation_refusal(inspection.path());
+    snapshot.rewind().map_err(|e| io_err("import snapshot rewind", e))?;
+    verdict.map_err(|message| io_err("import isolation", message))
+}
+
 #[cfg(test)]
 mod parse_isolation_tests {
     #[test]
     fn parse_isolation_portability_import_refuses() {
         assert!(super::require_legacy_import(true).is_err());
         assert!(super::require_legacy_import(false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod protected_import_tests {
+    use super::*;
+    use duduclaw_gateway::backup_restore::{PROTECTED_RESTORE_ISOLATION_STATE, PROTECTED_RESTORE_ISOLATION_UNKNOWN};
+
+    fn write(path: &Path, contents: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn db(path: &Path, sql: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        rusqlite::Connection::open(path).unwrap().execute_batch(sql).unwrap();
+    }
+
+    /// `source` exported to an archive; returns the archive path.
+    fn archive_of(root: &Path, source: &Path) -> PathBuf {
+        let archive = root.join("input.tar.gz");
+        export_home(source, &archive).unwrap();
+        archive
+    }
+
+    fn check(archive: &Path, home: &Path) -> Result<()> {
+        fs::create_dir_all(home).unwrap();
+        let mut snapshot = snapshot_archive(archive, home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+        refuse_archive_isolation_state(&mut snapshot, home, &RestoreLimits::default())
+    }
+
+    fn only_entries(home: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(home).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// Protected mode on this thread only (marker fact), as other CLI tests do.
+    fn protected<R>(f: impl FnOnce() -> R) -> R {
+        let facts = tempfile::tempdir().unwrap();
+        let marker = facts.path().join("protected-mode");
+        fs::write(&marker, b"native-systemd\n").unwrap();
+        let sources = duduclaw_core::protected_mode::Sources {
+            env: None, marker, service_home: facts.path().join("no-service-home"),
+        };
+        duduclaw_core::protected_mode::with_thread_sources(sources, f)
+    }
+
+    #[test]
+    fn protected_import_protection_follows_both_switches() {
+        assert!(refuse_isolation_host(ImportProtection::Off).is_ok());
+        assert!(refuse_isolation_host(ImportProtection::SingleBinary).is_ok());
+        let refused = refuse_isolation_host(ImportProtection::Isolation).unwrap_err().to_string();
+        assert!(refused.contains("受保護的資料匯入流程"), "{refused}");
+        if !duduclaw_core::protected_mode::active() {
+            assert_eq!(import_protection(), ImportProtection::Off);
+        }
+        protected(|| {
+            if !duduclaw_core::isolation_install::installed() {
+                assert_eq!(import_protection(), ImportProtection::SingleBinary);
+            }
+            let facts = tempfile::tempdir().unwrap();
+            let socket = facts.path().join(duduclaw_isolation::ids::SPAWND_SOCKET.trim_start_matches('/'));
+            write(&socket, b"");
+            duduclaw_core::isolation_install::with_thread_root(facts.path().to_path_buf(), || {
+                assert_eq!(import_protection(), ImportProtection::Isolation);
+            });
+        });
+    }
+
+    #[test]
+    fn protected_import_isolation_host_refuses_before_touching_home() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        write(&source.join("agents/dudu/SOUL.md"), b"soul");
+        let archive = archive_of(root.path(), &source);
+        let target = root.path().join("target");
+        let facts = tempfile::tempdir().unwrap();
+        write(&facts.path().join("opt/duduclaw-isolated/current"), b"");
+        let error = protected(|| duduclaw_core::isolation_install::with_thread_root(facts.path().to_path_buf(),
+            || import_archive(&archive, &target, true, true))).unwrap_err().to_string();
+        assert!(error.contains(IMPORT_ISOLATION_HOST_REFUSED), "{error}");
+        assert!(!target.exists(), "the home is not even created");
+    }
+
+    #[test]
+    fn protected_import_single_binary_refuses_archive_with_isolation_state() {
+        type Plant = fn(&Path);
+        let plants: [(&str, Plant); 6] = [
+            ("quarantine", |source| write(&source.join("isolation-quarantine/alice/SOUL.md"), b"x")),
+            ("fork store", |source| write(&source.join("isolation-forks.db"), b"")),
+            ("background receipts", |source| write(&source.join("isolation_background.db"), b"")),
+            ("confirmed employee", |source| db(&source.join("migration-authority/apply.db"),
+                "CREATE TABLE confirmed_employees(label TEXT); INSERT INTO confirmed_employees VALUES('alice');")),
+            ("personal mirror", |source| db(&source.join("users.db"),
+                "CREATE TABLE isolation_personal_agents(agent_name TEXT, owner_user_id TEXT);
+                 INSERT INTO isolation_personal_agents VALUES('alice', 'u1');")),
+            ("migration confirmation", |source| db(&source.join("migration-confirmations.db"),
+                "CREATE TABLE migration_proposals(id TEXT); INSERT INTO migration_proposals VALUES('p');")),
+        ];
+        for (name, plant) in plants {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            write(&source.join("agents/dudu/SOUL.md"), b"soul");
+            plant(&source);
+            let archive = archive_of(root.path(), &source);
+            let home = root.path().join("home");
+            let error = check(&archive, &home).unwrap_err().to_string();
+            assert!(error.contains(PROTECTED_RESTORE_ISOLATION_STATE), "{name}: {error}");
+            assert!(only_entries(&home).is_empty(), "{name}: nothing left in the home");
+        }
+    }
+
+    #[test]
+    fn protected_import_single_binary_unreadable_state_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        write(&source.join("migration-confirmations.db"), b"not a SQLite database");
+        let archive = archive_of(root.path(), &source);
+        let home = root.path().join("home");
+        let error = check(&archive, &home).unwrap_err().to_string();
+        assert!(error.contains(PROTECTED_RESTORE_ISOLATION_UNKNOWN), "{error}");
+        assert!(only_entries(&home).is_empty());
+    }
+
+    #[test]
+    fn protected_import_single_binary_accepts_ordinary_home() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        write(&source.join("agents/dudu/SOUL.md"), b"soul");
+        db(&source.join("users.db"), "CREATE TABLE users(id TEXT); INSERT INTO users VALUES('u1');
+            CREATE TABLE isolation_personal_agents(agent_name TEXT, owner_user_id TEXT);
+            CREATE TABLE isolation_personal_agent_removals(agent_name TEXT, owner_user_id TEXT);");
+        db(&source.join("tasks.db"), "CREATE TABLE tasks(id TEXT); INSERT INTO tasks VALUES('t');");
+        let archive = archive_of(root.path(), &source);
+        let home = root.path().join("home");
+        check(&archive, &home).unwrap();
+        assert!(only_entries(&home).is_empty(), "the inspection directory is removed");
+    }
+
+    #[test]
+    fn protected_import_single_binary_end_to_end_refuses_before_publishing() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        write(&source.join("agents/new/SOUL.md"), b"new");
+        write(&source.join("isolation-connectors.db"), b"");
+        let archive = archive_of(root.path(), &source);
+        let target = root.path().join("target");
+        write(&target.join("agents/old/SOUL.md"), b"old");
+        let error = protected(|| {
+            if duduclaw_core::isolation_install::installed() { return None; }
+            Some(import_archive(&archive, &target, true, true))
+        });
+        let Some(result) = error else { return }; // isolation host running the tests
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(PROTECTED_RESTORE_ISOLATION_STATE), "{error}");
+        assert!(target.join("agents/old/SOUL.md").is_file());
+        assert!(!target.join("agents/new").exists());
+        assert!(!target.join("agents.pre-import").exists());
+        assert!(!target.join("isolation-connectors.db").exists());
     }
 }

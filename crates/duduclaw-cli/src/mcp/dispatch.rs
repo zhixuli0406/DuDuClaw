@@ -46,10 +46,15 @@ pub(crate) async fn handle_tools_call(
     // handler or isolation route, for every principal kind.
     // P1d: an external key is judged as `external:<client id>`, never as the
     // employee its client id may spell (`personal_wildcard.rs`).
-    let personal_protected = duduclaw_gateway::runtime_readiness::is_protected_linux();
+    // Personal target rules: isolation-architecture hosts only (a single-binary
+    // protected host has no Personal employees and behaves as v1.80). The
+    // external-key/employee-id collision refusal is an identity-confusion
+    // control and follows protected mode itself (L4).
+    let personal_protected = duduclaw_gateway::runtime_readiness::isolation_active();
+    let identity_protected = super::personal_wildcard::external_identity_gate_applies();
     let personal_acting = super::personal_wildcard::personal_acting_id(principal, default_agent);
     let acting_for_target = personal_acting.as_str();
-    if let Some(refusal) = super::personal_wildcard::external_identity_refusal(home_dir, personal_protected, principal)
+    if let Some(refusal) = super::personal_wildcard::external_identity_refusal(home_dir, identity_protected, principal)
         .or_else(|| super::personal_target::pre_dispatch_refusal(
             home_dir, personal_protected, tool_name, &arguments,
             acting_for_target, default_agent, &ns_ctx.write_namespace,
