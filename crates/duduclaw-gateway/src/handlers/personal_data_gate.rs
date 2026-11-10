@@ -400,7 +400,7 @@ impl MethodHandler {
         target: Target<'_>,
         csrf: Option<[u8; 32]>,
     ) -> Result<(), &'static str> {
-        if !crate::runtime_readiness::is_protected_linux() {
+        if !crate::runtime_readiness::isolation_active() {
             return Ok(());
         }
         let home = self.home_dir.clone();
@@ -459,7 +459,7 @@ impl MethodHandler {
         let by_items = items_write_scoped(method);
         if (category.is_none() && !by_task && by_id.is_none() && by_write.is_none() && by_nested.is_none()
             && by_items.is_none())
-            || !crate::runtime_readiness::is_protected_linux()
+            || !crate::runtime_readiness::isolation_active()
         {
             return Ok(());
         }
@@ -526,7 +526,7 @@ impl MethodHandler {
         by_id: bool,
         rows: &[crate::approval::ApprovalRecord],
     ) -> Result<std::collections::BTreeSet<String>, WsFrame> {
-        if !crate::runtime_readiness::is_protected_linux() {
+        if !crate::runtime_readiness::isolation_active() {
             return Ok(Default::default());
         }
         let mut hidden = self
@@ -550,7 +550,7 @@ impl MethodHandler {
     /// `agents.resume` call (protected mode only).
     pub(super) async fn personal_control_audit(&self, ctx: &UserContext, method: &str, agent: &str)
         -> Result<(), &'static str> {
-        if !crate::runtime_readiness::is_protected_linux() {
+        if !crate::runtime_readiness::isolation_active() {
             return Ok(());
         }
         let db = self.user_db.read().await.clone();
@@ -568,7 +568,7 @@ impl MethodHandler {
     /// another person's Personal employee. Metadata only, so a failed write
     /// never blocks the read; no row for the owner or a Shared employee.
     pub(super) async fn personal_metadata_audit(&self, ctx: &UserContext, method: &str, agent: &str) {
-        if !crate::runtime_readiness::is_protected_linux() {
+        if !crate::runtime_readiness::isolation_active() {
             return;
         }
         let db = self.user_db.read().await.clone();
@@ -584,7 +584,7 @@ impl MethodHandler {
     /// outside protected mode; unreadable ⇒ `Err` (the caller refuses).
     pub(super) async fn personal_hidden_agents(&self, ctx: &UserContext)
         -> Result<std::collections::BTreeSet<String>, &'static str> {
-        if !crate::runtime_readiness::is_protected_linux() {
+        if !crate::runtime_readiness::isolation_active() {
             return Ok(Default::default());
         }
         let (home, user) = (self.home_dir.clone(), ctx.user_id.clone());

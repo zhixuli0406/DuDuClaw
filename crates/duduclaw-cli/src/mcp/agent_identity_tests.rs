@@ -147,17 +147,36 @@ fn sr5r3_mcp_child_identity_rules_follow_the_durable_latch() {
     unsafe { std::env::remove_var(duduclaw_core::root_key::MODE_ENV); }
     set_claim("sales-rep", &duduclaw_core::mint_identity_token(&key, "sales-rep"));
     let unprotected = super::caller_identity_verdict(tmp.path());
-    let (protected, create_refused) = duduclaw_core::protected_mode::with_thread_sources(sources, || (
-        super::caller_identity_verdict(tmp.path()),
-        super::agents::protected_create_refusal(duduclaw_gateway::runtime_readiness::is_protected_linux()).is_some(),
-    ));
+    let isolation = TempDir::new();
+    fs::create_dir_all(isolation.path().join("var/lib/duduclaw-spawnd")).unwrap();
+    let (single_binary, single_binary_create_refused, isolated, create_refused) =
+        duduclaw_core::protected_mode::with_thread_sources(sources.clone(), || (
+            super::caller_identity_verdict(tmp.path()),
+            super::agents::protected_create_refusal(duduclaw_gateway::runtime_readiness::isolation_active()).is_some(),
+            duduclaw_core::isolation_install::with_thread_root(isolation.path().to_path_buf(),
+                || super::caller_identity_verdict(tmp.path())),
+            duduclaw_core::isolation_install::with_thread_root(isolation.path().to_path_buf(),
+                || super::agents::protected_create_refusal(duduclaw_gateway::runtime_readiness::isolation_active()).is_some()),
+        ));
+    // A wrong token: soft mode would only warn; protected mode is strict.
+    set_claim("sales-rep", "not-the-token");
+    let forged = duduclaw_core::protected_mode::with_thread_sources(sources,
+        || super::caller_identity_verdict(tmp.path()));
     clear_claim();
     if !duduclaw_core::protected_mode::active() {
         assert_eq!(unprotected, duduclaw_core::IdentityVerdict::Verified);
     }
-    assert_eq!(protected, duduclaw_core::IdentityVerdict::Rejected,
-        "env absent + durable fact: a label without a confirmed row is refused");
-    assert!(create_refused, "create_agent stays refused through the latch");
+    if !duduclaw_core::isolation_install::installed() {
+        // The v1.80-style single-binary host: the label keeps its v1 binding
+        // and `create_agent` works as in v1.80.
+        assert_eq!(single_binary, duduclaw_core::IdentityVerdict::Verified);
+        assert!(!single_binary_create_refused);
+    }
+    assert_eq!(forged, duduclaw_core::IdentityVerdict::Rejected,
+        "env absent + durable fact: the soft-mode grace is gone");
+    assert_eq!(isolated, duduclaw_core::IdentityVerdict::Rejected,
+        "isolation installed: a label without a confirmed row is refused");
+    assert!(create_refused, "create_agent stays refused where isolation is installed");
 }
 
 /// No `identity.key` in soft mode ⇒ zero impact, even for a forged token.

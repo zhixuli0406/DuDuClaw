@@ -213,16 +213,29 @@ fn sr5r3_protected_checks_hold_with_the_env_flag_absent_but_a_durable_fact() {
     let by_index = duduclaw_core::protected_mode::Sources {
         env: None, marker: facts.path().join("absent-marker"), service_home: home.to_path_buf(),
     };
+    // A root-owned isolation fact (here the spawnd state directory).
+    let isolation = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(isolation.path().join("var/lib/duduclaw-spawnd")).unwrap();
     for sources in [by_marker, by_index] {
         duduclaw_core::protected_mode::with_thread_sources(sources, || {
             assert!(crate::runtime_readiness::is_protected_linux());
-            assert!(crate::isolation_label_stores::protected_active());
-            assert!(duduclaw_core::execution_gate::isolation_required());
-            // The writer gate and the bind refusal follow the latch.
-            assert_eq!(crate::isolation_label_stores::check_label_writable(home, LABEL),
-                Err(crate::isolation_label_stores::GateRefusal::Quarantined));
-            assert_eq!(crate::isolation_label_stores::bind_refusal(home, LABEL),
-                Some(crate::isolation_label_stores::LABEL_QUARANTINED));
+            // Protected mode alone (a single-binary host): no isolation rules.
+            if !duduclaw_core::isolation_install::installed() {
+                assert!(!crate::runtime_readiness::isolation_active());
+                assert!(!crate::isolation_label_stores::protected_active());
+                assert!(!duduclaw_core::execution_gate::isolation_required());
+                assert_eq!(crate::isolation_label_stores::bind_refusal(home, LABEL), None);
+            }
+            duduclaw_core::isolation_install::with_thread_root(isolation.path().to_path_buf(), || {
+                assert!(crate::runtime_readiness::isolation_active());
+                assert!(crate::isolation_label_stores::protected_active());
+                assert!(duduclaw_core::execution_gate::isolation_required());
+                // The writer gate and the bind refusal follow the latch.
+                assert_eq!(crate::isolation_label_stores::check_label_writable(home, LABEL),
+                    Err(crate::isolation_label_stores::GateRefusal::Quarantined));
+                assert_eq!(crate::isolation_label_stores::bind_refusal(home, LABEL),
+                    Some(crate::isolation_label_stores::LABEL_QUARANTINED));
+            });
         });
     }
     assert_eq!(duduclaw_core::protected_mode::active(), system, "thread sources never latch the process");

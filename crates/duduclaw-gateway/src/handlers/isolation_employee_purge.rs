@@ -57,7 +57,7 @@ impl MethodHandler {
             return Err(ADMIN_REQUIRED.into());
         }
         let session = crate::google_personal::session_for(&ctx.user_id).map_err(|_| ADMIN_REQUIRED)?;
-        if !crate::runtime_readiness::is_protected_linux() { return Err(NOT_PROTECTED.into()); }
+        if !crate::runtime_readiness::isolation_active() { return Err(NOT_PROTECTED.into()); }
         let db = self.user_db.read().await.clone().ok_or(USERS_UNAVAILABLE)?;
         let params = if params.is_null() { json!({}) } else { params };
         let input: QuarantinePurge = serde_json::from_value(params).map_err(|_| Failure::Rpc(RpcError::Invalid))?;

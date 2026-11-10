@@ -13,8 +13,9 @@ impl MethodHandler {
         use crate::premium_templates as pt;
         // Native Linux protected mode (SR2 1c): before the license/premium
         // read; `create_template_with_skills` refuses again for every caller.
+        // Only where the isolation architecture is installed (v1.80 otherwise).
         if let Some(refused) = super::isolation_employee_rpc::protected_create_refusal(
-            crate::runtime_readiness::is_protected_linux()) {
+            crate::runtime_readiness::isolation_active()) {
             return refused;
         }
         let role_id = params.get("role_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -63,7 +64,7 @@ impl MethodHandler {
         // only through an approved Employee proposal. Every template writer
         // (role, company, bundled, library) commits here, so refuse first.
         if let Some(refused) = super::isolation_employee_rpc::protected_create_refusal(
-            crate::runtime_readiness::is_protected_linux()) {
+            crate::runtime_readiness::isolation_active()) {
             return refused;
         }
         if !caller.is_admin() { return WsFrame::error_response("", "Administrator required"); }

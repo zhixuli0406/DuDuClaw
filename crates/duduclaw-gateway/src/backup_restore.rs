@@ -521,11 +521,13 @@ pub const PROTECTED_RESTORE_REFUSED: &str = "受保護模式下不能整包還�
     核准紀錄與帳號資料，可能讓已交接（停用並移入隔離區）的個人專屬員工或已撤銷的授權復原。請改用受保護的資料匯入流程，\
     由管理員逐項核准。";
 
-/// Protected mode for restore purposes: the native Linux protected key mode
-/// (`DUDUCLAW_PROTECTED_KEY_MODE=native-systemd`, the same switch the boot
-/// path uses to require isolation).
+/// Protected mode for restore purposes: native Linux protected mode on a host
+/// where the isolation architecture is installed (the same switch the boot
+/// path uses to require isolation). The refusal protects isolation state
+/// (tombstones, proposals, quarantine) and points to the isolation import
+/// flow; a protected single-binary host restores as in v1.80.
 fn protected_mode() -> bool {
-    crate::runtime_readiness::is_protected_linux()
+    crate::runtime_readiness::isolation_active()
 }
 
 fn stage_restore_with_protection(home: &Path, source: &Path, protected: bool) -> Result<RestoreStageReport, String> {

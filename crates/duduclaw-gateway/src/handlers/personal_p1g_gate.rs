@@ -262,7 +262,7 @@ impl MethodHandler {
     /// only. Unreadable ownership refuses.
     pub(super) async fn personal_default_deny(&self, method: &str, params: &Value, ctx: &UserContext)
         -> Result<(), WsFrame> {
-        if !crate::runtime_readiness::is_protected_linux() || metadata_allowlisted(method) {
+        if !crate::runtime_readiness::isolation_active() || metadata_allowlisted(method) {
             return Ok(());
         }
         if named_employees(params).is_empty() {
@@ -283,7 +283,7 @@ impl MethodHandler {
     /// allowlist is exempt; error frames pass unchanged. If ownership cannot
     /// be read, a successful payload is withheld (fail closed).
     pub(super) async fn personal_hide_rows(&self, method: &str, ctx: &UserContext, frame: WsFrame) -> WsFrame {
-        if !crate::runtime_readiness::is_protected_linux() || metadata_allowlisted(method) {
+        if !crate::runtime_readiness::isolation_active() || metadata_allowlisted(method) {
             return frame;
         }
         let (id, mut payload, error) = match frame {
@@ -309,7 +309,7 @@ impl MethodHandler {
     /// P1g (a*): `logs.subscribe` in protected mode only for a caller with no
     /// hidden Personal employee (the raw tail cannot be filtered per row).
     pub(super) async fn p1g_log_tail_allowed(&self, ctx: &UserContext) -> Result<(), WsFrame> {
-        if !crate::runtime_readiness::is_protected_linux() {
+        if !crate::runtime_readiness::isolation_active() {
             return Ok(());
         }
         match self.personal_hidden_agents(ctx).await {
@@ -326,7 +326,7 @@ impl MethodHandler {
     /// owner only, no break-glass).
     pub(super) async fn p1g_admin_cron_guard(&self, method: &str, params: &Value, ctx: &UserContext)
         -> Result<(), WsFrame> {
-        if !crate::runtime_readiness::is_protected_linux() || matches!(method, "cron.list" | "cron.templates") {
+        if !crate::runtime_readiness::isolation_active() || matches!(method, "cron.list" | "cron.templates") {
             return Ok(());
         }
         let mut agents = named_employees(params);

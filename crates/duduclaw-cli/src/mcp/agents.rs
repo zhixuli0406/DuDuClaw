@@ -43,8 +43,10 @@ pub(crate) async fn handle_create_agent(
     // depth; the real gate is the isolated adapter's disposition table
     // (`crate::mcp_isolation_disposition::intentional_refusal`:
     // `create_agent` => `ProposalRequired`), which refuses the tool for an
-    // employee whatever its environment says.
-    if let Some(refused) = protected_create_refusal(duduclaw_gateway::runtime_readiness::is_protected_linux()) {
+    // employee whatever its environment says. Only where the isolation
+    // architecture is installed (`isolation_active`): a protected
+    // single-binary host keeps v1.80's `create_agent` (main + permission).
+    if let Some(refused) = protected_create_refusal(duduclaw_gateway::runtime_readiness::isolation_active()) {
         return refused;
     }
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -752,7 +754,7 @@ mod product_policy_creation_tests {
         assert!(protected_create_refusal(false).is_none());
         let home = fixture();
         let response = handle_create_agent(&params("openai/gpt-4o"), home.path(), "dashboard").await;
-        if duduclaw_gateway::runtime_readiness::is_protected_linux() {
+        if duduclaw_gateway::runtime_readiness::isolation_active() {
             assert_eq!(response["content"][0]["text"], PROPOSAL_REQUIRED, "{response}");
             assert!(!home.path().join("agents").exists());
         } else {

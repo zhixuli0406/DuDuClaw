@@ -26,6 +26,33 @@ fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
     assert!(LAUNCHER_TEXT.starts_with("#!/bin/sh\n"));
 }
 
+/// Every fixed-path isolation binary the installer layout publishes is a fact
+/// of `duduclaw_core::isolation_install`, so an installed isolation component
+/// always switches the gateway onto the isolation path.
+#[test]
+fn service_protected_isolation_install_facts_cover_layout() {
+    let facts = duduclaw_core::isolation_install::FACTS;
+    for binary in super::layout::BINARIES {
+        assert!(facts.contains(binary), "layout binary missing from isolation facts: {binary}");
+    }
+    for (unit, _) in super::layout::UNITS.iter().filter(|(unit, _)| unit.starts_with("duduclaw-spawnd.")) {
+        assert!(facts.contains(&format!("/etc/systemd/system/{unit}").as_str()), "{unit}");
+    }
+    assert!(super::layout::DIRECTORIES.iter().any(|(path, _)| facts.contains(path)), "spawnd state directory");
+    // The single-binary protected install writes none of them.
+    for path in [BINARY, LAUNCHER, UNIT_PATH, duduclaw_core::protected_mode::MODE_MARKER] {
+        assert!(!facts.contains(&path), "{path}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_protected_isolation_install_manifest_matches_migration() {
+    assert_eq!(duduclaw_core::isolation_install::DURABLE_IMPORT_MANIFEST,
+        duduclaw_migration::import_manifest::DURABLE_IMPORT_MANIFEST);
+    assert_eq!(duduclaw_core::isolation_install::FACTS[0], duduclaw_isolation::ids::SPAWND_SOCKET);
+}
+
 #[test]
 fn service_protected_account_is_nonlogin_unprivileged() {
     for shell in ["/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false"] {

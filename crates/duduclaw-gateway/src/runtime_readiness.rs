@@ -11,6 +11,16 @@ pub fn is_protected_linux() -> bool {
     duduclaw_core::protected_mode::active()
 }
 
+/// The isolation architecture applies: protected mode on a host where it is
+/// installed ([`duduclaw_core::execution_gate::isolation_required`]). Every
+/// isolation decision (Personal / Shared employee rules, the proposal-only
+/// employee lifecycle, label quarantine, spawnd-backed recovery) uses this;
+/// v1.80 credential protection keeps [`is_protected_linux`]. A protected
+/// single-binary host is `false` here and behaves as v1.80.
+pub fn isolation_active() -> bool {
+    duduclaw_core::execution_gate::isolation_required()
+}
+
 /// Fixed operator guidance. Never copy the operator's CLI credential store.
 pub fn protected_runtime_guidance(binary: &str) -> String {
     let install = if binary == "claude" {
@@ -171,6 +181,37 @@ pub(crate) fn log_startup_missing(home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolation_install_manifest_literal_matches_migration() {
+        assert_eq!(duduclaw_core::isolation_install::DURABLE_IMPORT_MANIFEST,
+            duduclaw_migration::import_manifest::DURABLE_IMPORT_MANIFEST);
+    }
+
+    /// Protected mode alone (the single-binary host) is not "isolation active";
+    /// a root-owned isolation fact makes it so.
+    #[cfg(unix)]
+    #[test]
+    fn isolation_active_needs_protected_mode_and_an_isolation_install() {
+        if duduclaw_core::isolation_install::installed() { return; }
+        let isolation = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(isolation.path().join("opt/duduclaw-isolated")).unwrap();
+        std::os::unix::fs::symlink("generations/missing", isolation.path().join("opt/duduclaw-isolated/current")).unwrap();
+        if !is_protected_linux() {
+            // Installed facts without protected mode change nothing.
+            assert!(!duduclaw_core::isolation_install::with_thread_root(isolation.path().to_path_buf(), isolation_active));
+        }
+        let facts = tempfile::tempdir().unwrap();
+        let marker = facts.path().join("protected-mode");
+        std::fs::write(&marker, b"native-systemd\n").unwrap();
+        let sources = duduclaw_core::protected_mode::Sources { env: None, marker,
+            service_home: facts.path().join("no-service-home") };
+        duduclaw_core::protected_mode::with_thread_sources(sources, || {
+            assert!(is_protected_linux());
+            assert!(!isolation_active());
+            assert!(duduclaw_core::isolation_install::with_thread_root(isolation.path().to_path_buf(), isolation_active));
+        });
+    }
 
     #[test]
     fn protected_runtime_guidance_contains_system_install_and_service_login() {

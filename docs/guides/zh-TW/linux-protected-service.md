@@ -37,7 +37,7 @@ Kernel 7.0 **目前不接受**：trampoline 會拒絕大於 7 的 Landlock ABI�
 
 ## 單一執行檔受保護服務（目前版本）
 
-在隔離元件可以安裝之前（預計 v1.82.0），`service install --protected-linux` 安裝的是 v1.80 的單一執行檔受保護 gateway：root 擁有的程式 `/opt/duduclaw/bin/duduclaw`、啟動器 `/usr/local/libexec/duduclaw/protected-launcher`、服務單元 `duduclaw-gateway.service` 及版本下限 `/var/lib/duduclaw-protected/version-floor`。AI 員工與 v1.80 相同，以 gateway 帳號執行。
+在隔離元件可以安裝之前（預計 v1.82.0），`service install --protected-linux` 安裝的是 v1.80 的單一執行檔受保護 gateway：root 擁有的程式 `/opt/duduclaw/bin/duduclaw`、啟動器 `/usr/local/libexec/duduclaw/protected-launcher`、服務單元 `duduclaw-gateway.service` 及版本下限 `/var/lib/duduclaw-protected/version-floor`。在主機安裝隔離架構之前（預計 v1.82.0），AI 員工與 v1.80 相同，以 gateway 的服務帳號執行，並套用 v1.80 的憑證保護；員工也與 v1.80 相同，可直接從儀表板建立。本指南描述的隔離執行方式（spawnd 啟動、個人專屬員工、員工配置提案）只會在確實安裝了隔離架構的主機上啟用。
 
 **新主機。** 沒有版本下限紀錄時，只有在能確認主機從未安裝過 DuDuClaw 的情況下，安裝才會繼續：沒有 `duduclaw` 帳號，而且下列路徑都不存在：`/var/lib/duduclaw`、`/var/lib/duduclaw-protected/root.key`、`/var/lib/duduclaw-protected/version-floor`、`/var/lib/duduclaw-protected/version-pending`、`/opt/duduclaw/bin/duduclaw`、啟動器、`/etc/systemd/system/duduclaw-gateway.service`、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json`、`/opt/duduclaw-isolated/current`。只要其中任何一項存在或無法確認，缺少的版本下限就可能屬於 v1.79.3 安裝，安裝器會顯示遷移訊息並拒絕。不要為了通過檢查刪除這些路徑，其中可能有資料與金鑰。
 

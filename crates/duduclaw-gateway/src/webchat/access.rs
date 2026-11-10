@@ -156,7 +156,7 @@ impl WebChatState {
         // v1.81 P1g: talking to a Personal employee makes it run work for the
         // caller — its owner only, whatever the role (read fresh; unreadable
         // ownership refuses). Checked before the Admin shortcut.
-        if crate::runtime_readiness::is_protected_linux() {
+        if crate::runtime_readiness::isolation_active() {
             let (home, who, target) = (self.ctx.home_dir.clone(), user.to_owned(), agent.to_owned());
             let refused = tokio::task::spawn_blocking(move || {
                 crate::personal_visibility::acl_denies(&home, true, &who, &target)

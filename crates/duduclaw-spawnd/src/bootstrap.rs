@@ -363,6 +363,17 @@ mod tests {
         assert!(duduclaw_core::protected_mode::durable_fact(&marker, &dir.join("no-service-home")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    /// Inside an employee runtime `/etc` is the projection above and
+    /// `/var/lib` is not mounted, but `/usr` is the host's read-only clone, so
+    /// the trampoline every spawnd launch executes is visible there and
+    /// `duduclaw_core::isolation_install::installed()` stays true: a sandboxed
+    /// `duduclaw mcp-server` keeps the isolation rules. If a later mount policy
+    /// hides it, the projection must carry another isolation fact first.
+    #[test]
+    fn employee_runtime_sees_an_isolation_install_fact() {
+        assert!(duduclaw_core::isolation_install::FACTS.contains(&crate::systemd::TRAMPOLINE));
+        assert_eq!(TRAMPOLINE_ARGV, &[crate::systemd::TRAMPOLINE]);
+    }
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires a root-capable Linux acceptance VM; validates real sealed bootstrap memfd"]

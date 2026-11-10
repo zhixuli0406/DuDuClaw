@@ -84,7 +84,7 @@ impl MethodHandler {
         // v1.81 P1d: never another person's Personal employee's forks
         // (`fork.inspect` / `fork.resolve` are gated on the fork's employee).
         let hidden = match crate::personal_visibility::hidden_from(
-            &self.home_dir, crate::runtime_readiness::is_protected_linux(), &live.user_id,
+            &self.home_dir, crate::runtime_readiness::isolation_active(), &live.user_id,
         ) {
             Ok(hidden) => hidden,
             Err(_) => return WsFrame::error_response("", crate::personal_visibility::OWNERSHIP_UNAVAILABLE),

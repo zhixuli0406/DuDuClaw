@@ -92,14 +92,14 @@ impl GateRefusal {
 // ── Protected mode ──────────────────────────────────────────────────────
 
 /// Protected mode as the neighbouring isolation code detects it: SR5 round 3
-/// N3, the durable latch ([`duduclaw_core::protected_mode::active`] through
-/// `runtime_readiness::is_protected_linux`) — the environment flag OR a
-/// host-owned durable fact. Tests force it per thread through
-/// [`TEST_PROTECTED`].
+/// N3, the durable latch ([`duduclaw_core::protected_mode::active`]: the
+/// environment flag OR a host-owned durable fact) on a host where the
+/// isolation architecture is installed (`runtime_readiness::isolation_active`).
+/// Tests force it per thread through [`TEST_PROTECTED`].
 pub(crate) fn protected_active() -> bool {
     #[cfg(test)]
     if let Some(forced) = TEST_PROTECTED.with(std::cell::Cell::get) { return forced; }
-    crate::runtime_readiness::is_protected_linux()
+    crate::runtime_readiness::isolation_active()
 }
 
 #[cfg(test)]

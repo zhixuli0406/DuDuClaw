@@ -5398,6 +5398,22 @@ that review has not been obtained.
   gateway-only install with `--migrate-from` can import a user-mode v1.79.x home
   and record a 1.81.x floor. Do not trust the floor for this decision, and do not
   add a marker file in its place.
+- v1.82 isolation switch: protected mode alone no longer means "isolation
+  required". `execution_gate::isolation_required()` is the trusted latch OR
+  (`protected_mode::active()` AND `isolation_install::installed()`), and every
+  isolation decision (spawnd routing, isolation MCP authorization, the
+  background queue, composite readiness, Personal/Shared employee rules,
+  proposal-only employee creation, label quarantine) follows it; v1.80
+  credential protection keeps `protected_mode::active()`. `installed()` checks
+  only root-owned fixed paths (`duduclaw_core::isolation_install::FACTS`: the
+  spawnd control socket and units, `/var/lib/duduclaw-spawnd`,
+  `/opt/duduclaw-isolated/current`, `/var/lib/duduclaw-updated/state.json`,
+  `/etc/duduclaw/migration-import.json` and the layout's fixed binaries). The
+  bootstrap must create one of these facts before any employee runs;
+  otherwise employees run single-binary under the gateway account. Employee
+  runtimes see the fact through the read-only `/usr` clone
+  (`/usr/lib/duduclaw/duduclaw-run`); a mount policy that hides it must
+  project another fact first.
 - Wire I1 composite readiness and verified DNS/unit configuration; no current
   readiness command can return overall success with `MissingComposite`.
 - Connect H's complete storage inventory to removal; run real fresh-install,

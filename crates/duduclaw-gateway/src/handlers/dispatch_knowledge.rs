@@ -413,7 +413,7 @@ impl MethodHandler {
             // replace one); in native Linux protected mode employees exist
             // only through the Employee proposal path.
             "experts.install" | "experts.install_builtin" | "experts.install_draft"
-                if crate::runtime_readiness::is_protected_linux() => {
+                if crate::runtime_readiness::isolation_active() => {
                 require_admin!();
                 WsFrame::error_response("", super::isolation_employee_rpc::DIRECT_CREATE_REFUSED)
             }

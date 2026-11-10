@@ -37,7 +37,7 @@ Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大
 
 ## 単一実行ファイルの保護サービス（現行版）
 
-隔離コンポーネントをインストールできるようになるまで（v1.82.0 予定）、`service install --protected-linux` は v1.80 の単一実行ファイル保護 gateway をインストールします。root 所有のプログラム `/opt/duduclaw/bin/duduclaw`、ランチャー `/usr/local/libexec/duduclaw/protected-launcher`、ユニット `duduclaw-gateway.service`、バージョン下限 `/var/lib/duduclaw-protected/version-floor` で構成されます。AI 社員は v1.80 と同じく gateway アカウントで実行します。
+隔離コンポーネントをインストールできるようになるまで（v1.82.0 予定）、`service install --protected-linux` は v1.80 の単一実行ファイル保護 gateway をインストールします。root 所有のプログラム `/opt/duduclaw/bin/duduclaw`、ランチャー `/usr/local/libexec/duduclaw/protected-launcher`、ユニット `duduclaw-gateway.service`、バージョン下限 `/var/lib/duduclaw-protected/version-floor` で構成されます。ホストに隔離構成がインストールされるまで（v1.82.0 予定）、AI 社員は v1.80 と同じく gateway のサービスアカウントで実行され、v1.80 の認証情報保護が適用されます。社員も v1.80 と同じくダッシュボードから直接作成できます。このガイドで説明する隔離実行（spawnd による起動、個人専用社員、社員配置の提案）は、隔離構成が実際にインストールされたホストでのみ有効になります。
 
 **新しいホスト。** バージョン下限の記録がない場合、ホストに DuDuClaw がインストールされたことがないと確認できたときだけインストールを続けます。条件は、`duduclaw` アカウントがなく、次のパスがすべて存在しないことです：`/var/lib/duduclaw`、`/var/lib/duduclaw-protected/root.key`、`/var/lib/duduclaw-protected/version-floor`、`/var/lib/duduclaw-protected/version-pending`、`/opt/duduclaw/bin/duduclaw`、ランチャー、`/etc/systemd/system/duduclaw-gateway.service`、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json`、`/opt/duduclaw-isolated/current`。いずれかが存在するか確認できない場合、記録のない下限は v1.79.3 のインストールである可能性があるため、インストーラーは移行のメッセージを表示して拒否します。拒否を回避するためにこれらのパスを削除しないでください。データや鍵が含まれている場合があります。
 

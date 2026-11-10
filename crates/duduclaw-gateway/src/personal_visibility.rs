@@ -49,9 +49,11 @@
 //!   [`work_item_employees`]); discovery runs resolve their employee
 //!   ([`WorkItem::DiscoveryRun`]).
 //!
-//! Every check here runs only in protected mode (`protected = true`, from
-//! `runtime_readiness::is_protected_linux()`); otherwise nothing is read and
-//! the existing behaviour is unchanged. The mirror is read through the
+//! Every check here runs only where the isolation architecture applies
+//! (`protected = true`, from `runtime_readiness::isolation_active()`: protected
+//! mode on a host with isolation installed); otherwise nothing is read and
+//! the existing behaviour is unchanged (a protected single-binary host
+//! behaves as v1.80). The mirror is read through the
 //! hardened authority-store opener; an unreadable store is [`Unavailable`]
 //! and every caller refuses.
 //!
@@ -151,7 +153,7 @@ impl AclRestriction {
     }
 
     fn protected(&self) -> bool {
-        self.protected.unwrap_or_else(crate::runtime_readiness::is_protected_linux)
+        self.protected.unwrap_or_else(crate::runtime_readiness::isolation_active)
     }
 }
 

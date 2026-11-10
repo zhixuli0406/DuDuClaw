@@ -391,7 +391,7 @@ impl PushGate {
             } else { gate.filter(&frame.line) };
             gate.task_snapshot = None;
             // v1.81 P1c: never about another person's Personal employee (personal_push.rs).
-            let result = result.filter(|_| !super::personal_push::withheld(&gate.home, crate::runtime_readiness::is_protected_linux(), &gate.ctx.user_id, &frame));
+            let result = result.filter(|_| !super::personal_push::withheld(&gate.home, crate::runtime_readiness::isolation_active(), &gate.ctx.user_id, &frame));
             (gate, result)
         }).await?;
         *self = next;

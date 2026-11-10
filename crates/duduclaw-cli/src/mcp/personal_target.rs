@@ -222,7 +222,7 @@ pub(crate) fn named_targets<'a>(tool: &'a str, arguments: &'a Value) -> impl Ite
 }
 
 /// Refusal text when `acting_agent` may not use `tool` on the employee named
-/// in `arguments`. `protected` is `runtime_readiness::is_protected_linux()`
+/// in `arguments`. `protected` is `runtime_readiness::isolation_active()`
 /// in production (a parameter so tests need no process environment).
 pub(crate) fn personal_target_refusal(
     home_dir: &Path,

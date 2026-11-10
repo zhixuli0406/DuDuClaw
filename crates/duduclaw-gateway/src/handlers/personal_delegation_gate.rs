@@ -172,7 +172,7 @@ impl MethodHandler {
         if delegation_target_keys(method).is_empty() {
             return Ok(());
         }
-        let refusal = if crate::runtime_readiness::is_protected_linux() {
+        let refusal = if crate::runtime_readiness::isolation_active() {
             let (home, session, method, params) = (self.home_dir.clone(), ctx.clone(), method.to_owned(), params.clone());
             tokio::task::spawn_blocking(move || delegation_decision(&home, true, &session, &method, &params))
                 .await
@@ -192,7 +192,7 @@ impl MethodHandler {
     /// employee `ctx` does not own. A blank target is left to the handler.
     pub(super) async fn delegation_check(&self, ctx: &UserContext, raw: &str) -> Result<(), WsFrame> {
         let agent = visibility::canonical_agent(raw).map_err(|message| WsFrame::error_response("", message))?;
-        if agent.is_empty() || !crate::runtime_readiness::is_protected_linux() {
+        if agent.is_empty() || !crate::runtime_readiness::isolation_active() {
             return Ok(());
         }
         let (home, session, agent) = (self.home_dir.clone(), ctx.clone(), agent.to_owned());

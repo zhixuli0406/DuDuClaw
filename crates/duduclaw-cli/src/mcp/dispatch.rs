@@ -46,7 +46,9 @@ pub(crate) async fn handle_tools_call(
     // handler or isolation route, for every principal kind.
     // P1d: an external key is judged as `external:<client id>`, never as the
     // employee its client id may spell (`personal_wildcard.rs`).
-    let personal_protected = duduclaw_gateway::runtime_readiness::is_protected_linux();
+    // Isolation-architecture hosts only (a single-binary protected host has no
+    // Personal employees and behaves as v1.80).
+    let personal_protected = duduclaw_gateway::runtime_readiness::isolation_active();
     let personal_acting = super::personal_wildcard::personal_acting_id(principal, default_agent);
     let acting_for_target = personal_acting.as_str();
     if let Some(refusal) = super::personal_wildcard::external_identity_refusal(home_dir, personal_protected, principal)

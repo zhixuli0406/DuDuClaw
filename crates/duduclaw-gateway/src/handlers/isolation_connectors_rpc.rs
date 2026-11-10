@@ -131,7 +131,7 @@ impl MethodHandler {
         let Ok(session) = crate::google_personal::session_for(&ctx.user_id) else {
             return WsFrame::error_response("", "請以管理員帳號重新登入後再操作。");
         };
-        if !crate::runtime_readiness::is_protected_linux() {
+        if !crate::runtime_readiness::isolation_active() {
             return WsFrame::error_response("", "這個環境未啟用受保護模式，沒有可管理的隔離連線帳號。");
         }
         let Some(db) = self.user_db.read().await.clone() else {

@@ -243,7 +243,7 @@ impl MethodHandler {
         let session = if admin {
             Some(crate::google_personal::session_for(&ctx.user_id).map_err(|_| ADMIN_REQUIRED)?)
         } else { None };
-        if !crate::runtime_readiness::is_protected_linux() { return Err(NOT_PROTECTED); }
+        if !crate::runtime_readiness::isolation_active() { return Err(NOT_PROTECTED); }
         let db = self.user_db.read().await.clone().ok_or(USERS_UNAVAILABLE)?;
         let params = if params.is_null() { json!({}) } else { params };
         let (home, user, epoch) = (self.home_dir.clone(), ctx.user_id.clone(), ctx.credential_epoch);

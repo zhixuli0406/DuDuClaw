@@ -604,7 +604,7 @@ pub async fn apply_install_request(
         target::authorize_requested_write(
             home_dir,
             audit_db,
-            crate::runtime_readiness::is_protected_linux(),
+            crate::runtime_readiness::isolation_active(),
             &target::RequestedWrite {
                 method: target::request_method(req),
                 request_id: &req.id,

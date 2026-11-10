@@ -179,7 +179,7 @@ async fn personal_request_requires_active_user() {
     // The RPC refuses outside protected mode and for forced-password callers.
     let handler = MethodHandler::new(home.to_path_buf()).await;
     let params = json!({"label": "carol-two", "display_name": "Carol"});
-    if !crate::runtime_readiness::is_protected_linux() {
+    if !crate::runtime_readiness::isolation_active() {
         let frame = handler.handle_isolation_employee(REQUEST, params.clone(), &caller(&carol, UserRole::Employee)).await;
         assert_eq!(error_of(&frame), NOT_PROTECTED);
     }
@@ -618,7 +618,7 @@ async fn templates_create_refused_in_protected_mode() {
     let refused = protected_create_refusal(true).expect("refused in protected mode");
     assert_eq!(error_of(&refused), DIRECT_CREATE_REFUSED);
     assert!(protected_create_refusal(false).is_none());
-    if crate::runtime_readiness::is_protected_linux() {
+    if crate::runtime_readiness::isolation_active() {
         let f = fixture();
         let handler = MethodHandler::new(f.home().to_path_buf()).await;
         let admin = caller(&f.bob, UserRole::Admin);
@@ -626,6 +626,45 @@ async fn templates_create_refused_in_protected_mode() {
         assert_eq!(error_of(&frame), DIRECT_CREATE_REFUSED);
         assert!(!f.home().join("agents/tpl-agent").exists());
     }
+}
+
+/// v1.80-style single-binary protected host (protected mode on, isolation
+/// architecture not installed): `agents.create` creates the employee directly,
+/// as in v1.80. With a root-owned isolation fact the direct path refuses.
+#[test]
+fn agents_create_direct_on_single_binary_protected_host_only() {
+    if duduclaw_core::isolation_install::installed() { return; }
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        // Current-thread: the thread-local sources below stay visible.
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
+    }
+    let facts = tempfile::tempdir().unwrap();
+    let marker = facts.path().join("protected-mode");
+    std::fs::write(&marker, b"native-systemd\n").unwrap();
+    let sources = duduclaw_core::protected_mode::Sources { env: None, marker,
+        service_home: facts.path().join("no-service-home") };
+    let isolation = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(isolation.path().join("run/duduclaw-spawnd")).unwrap();
+    std::fs::write(isolation.path().join("run/duduclaw-spawnd/control.sock"), b"").unwrap();
+    let home = crate::fs_safe::private_test_home().unwrap();
+    duduclaw_core::protected_mode::with_thread_sources(sources, || {
+        assert!(crate::runtime_readiness::is_protected_linux());
+        assert!(!crate::runtime_readiness::isolation_active());
+        let refused = duduclaw_core::isolation_install::with_thread_root(isolation.path().to_path_buf(), || block_on(async {
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            handler.handle_agents_create_as(json!({"name": "iso-direct", "display_name": "Iso"}),
+                Some(&UserContext::admin_fallback())).await
+        }));
+        assert_eq!(error_of(&refused), DIRECT_CREATE_REFUSED);
+        assert!(!home.path().join("agents/iso-direct").exists());
+        let created = block_on(async {
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            handler.handle_agents_create_as(json!({"name": "v180-direct", "display_name": "V180"}),
+                Some(&UserContext::admin_fallback())).await
+        });
+        assert!(matches!(created, WsFrame::Response { ok: true, .. }), "{created:?}");
+        assert!(home.path().join("agents/v180-direct/agent.toml").is_file());
+    });
 }
 
 /// SR2 3: at most MAX_REQUESTS_PER_DAY staff requests per user in 24 h,
