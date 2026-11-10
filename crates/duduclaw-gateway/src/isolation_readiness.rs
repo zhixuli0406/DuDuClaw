@@ -14,6 +14,14 @@ pub(crate) mod reasons;
 pub use reasons::{EmployeeReadiness, Overall, Reason, record_connector_build};
 
 static REQUIRED: AtomicBool = AtomicBool::new(false);
+/// A TEAM edition was resolved on Linux by [`initialize`] (boot or a live
+/// promotion). Only then can isolation become required for this composite.
+static TEAM_SEEN: AtomicBool = AtomicBool::new(false);
+/// L1: isolation became required after [`initialize`] decided it was not.
+/// Latched until restart; admission is refused meanwhile.
+static LATE_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+const NOT_READY: &str = "ISOLATION_NOT_READY: 受保護團隊的隔離服務尚未就緒，請由管理員檢查服務狀態。";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +105,9 @@ fn latch_requirement(latch: &AtomicBool, required: bool) -> bool {
 /// only narrows the existing native-systemd fence; Personal/local installs gain
 /// no new gate and this function never clears another component's latch.
 pub fn initialize(team: bool) {
+    // L1: remembered so admission can notice isolation becoming required
+    // after this decision (see [`late_requirement`]). Never cleared.
+    if cfg!(target_os = "linux") && team { TEAM_SEEN.store(true, Ordering::Release); }
     // SR5 round 3 N3: the durable latch (env flag OR host-owned fact), and
     // only where the isolation architecture is installed: a protected
     // single-binary host runs employees as in v1.80 and is never paused here.
@@ -199,13 +210,37 @@ pub async fn connect_backend() {
 
 fn admit(required: bool, components: Option<Components>) -> Result<(), String> {
     if !required || components.is_some_and(|value| value.all_ready()) { return Ok(()); }
-    Err("ISOLATION_NOT_READY: 受保護團隊的隔離服務尚未就緒，請由管理員檢查服務狀態。".into())
+    Err(NOT_READY.into())
+}
+
+/// L1: [`initialize`] decides once (boot or edition change), while
+/// `execution_gate::isolation_required` re-reads the facts every
+/// `OFF_CACHE_WINDOW`. If isolation becomes required later (a fact published
+/// by a bootstrap while this gateway runs), readiness was never initialised:
+/// no update probe, no backend. Fail closed until restart and say so once.
+/// `initialised`: the readiness latch is set (normal path, nothing to do).
+/// `team_seen`: a Linux TEAM edition was resolved. `applies_now` is consulted
+/// only when the answer is not already decided.
+fn late_requirement(latch: &AtomicBool, initialised: bool, team_seen: bool,
+    applies_now: impl FnOnce() -> bool) -> bool {
+    if initialised || !team_seen { return false; }
+    if latch.load(Ordering::Acquire) { return true; }
+    if !applies_now() { return false; }
+    if !latch.swap(true, Ordering::AcqRel) {
+        tracing::error!("隔離架構在閘道啟動後才出現，但隔離就緒狀態未曾初始化；員工執行已拒絕，請停止閘道、完成隔離安裝檢查後重新啟動。");
+    }
+    true
 }
 
 /// Covers API-only work as well as subprocesses. No request parameter can
 /// override this process-wide requirement, including human-interactive calls.
 pub fn check_execution() -> Result<(), String> {
     let required = REQUIRED.load(Ordering::Acquire);
+    if late_requirement(&LATE_REQUIRED, required, TEAM_SEEN.load(Ordering::Acquire), || {
+        duduclaw_core::protected_mode::active() && duduclaw_core::isolation_install::installed()
+    }) {
+        return admit(true, None);
+    }
     admit(required, required.then(|| Components::current(spawnd_verified())))
 }
 
@@ -300,6 +335,26 @@ mod tests {
         assert!(!latch_requirement(&latch, applies(true, true, true)));
         assert!(!latch_requirement(&latch, applies(true, true, false)));
         assert!(latch.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn late_isolation_requirement_fails_closed_until_restart() {
+        // Normal paths never consult the facts: readiness initialised, or no
+        // Linux TEAM edition resolved (Personal / local / non-Linux).
+        let latch = AtomicBool::new(false);
+        assert!(!late_requirement(&latch, true, true, || panic!("not consulted")));
+        assert!(!late_requirement(&latch, false, false, || panic!("not consulted")));
+        // TEAM single-binary host, isolation still not installed: v1.80 path.
+        assert!(!late_requirement(&latch, false, true, || false));
+        assert!(!latch.load(Ordering::Acquire));
+        // A fact appeared after boot: refused, and latched until restart.
+        assert!(late_requirement(&latch, false, true, || true));
+        assert!(latch.load(Ordering::Acquire));
+        assert!(late_requirement(&latch, false, true, || false), "never reopens");
+        assert!(late_requirement(&latch, false, true, || panic!("latched, not consulted")));
+        // The refusal is the existing readiness refusal.
+        assert_eq!(admit(true, None).unwrap_err(), NOT_READY);
+        assert!(NOT_READY.starts_with("ISOLATION_NOT_READY:"));
     }
 
     #[test]

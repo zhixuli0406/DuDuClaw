@@ -26,23 +26,47 @@ fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
     assert!(LAUNCHER_TEXT.starts_with("#!/bin/sh\n"));
 }
 
-/// Every fixed-path isolation binary the installer layout publishes is a fact
-/// of `duduclaw_core::isolation_install`, so an installed isolation component
-/// always switches the gateway onto the isolation path.
+/// Layout entries a v1.80-style single-binary install also creates or uses:
+/// `/etc/duduclaw` holds the protected-mode marker (`write_mode_marker`), and
+/// the single-binary gateway unit runs in `duduclaw-tcb.slice` (child of
+/// `duduclaw.slice`). They can never prove an isolation install.
+const SHARED_WITH_SINGLE_BINARY: &[&str] = &["/etc/duduclaw",
+    "/etc/systemd/system/duduclaw.slice", "/etc/systemd/system/duduclaw-tcb.slice"];
+
+/// Every isolation-only binary, unit and directory the installer layout
+/// publishes is a fact of `duduclaw_core::isolation_install`, so an installed
+/// isolation component always switches the gateway onto the isolation path.
 #[test]
 fn service_protected_isolation_install_facts_cover_layout() {
     let facts = duduclaw_core::isolation_install::FACTS;
     for binary in super::layout::BINARIES {
         assert!(facts.contains(binary), "layout binary missing from isolation facts: {binary}");
     }
-    for (unit, _) in super::layout::UNITS.iter().filter(|(unit, _)| unit.starts_with("duduclaw-spawnd.")) {
-        assert!(facts.contains(&format!("/etc/systemd/system/{unit}").as_str()), "{unit}");
+    let mut checked = 0;
+    for (unit, _) in super::layout::UNITS {
+        let path = format!("/etc/systemd/system/{unit}");
+        if SHARED_WITH_SINGLE_BINARY.contains(&path.as_str()) { continue; }
+        assert!(facts.contains(&path.as_str()), "layout unit missing from isolation facts: {unit}");
+        checked += 1;
     }
-    assert!(super::layout::DIRECTORIES.iter().any(|(path, _)| facts.contains(path)), "spawnd state directory");
+    assert_eq!(checked, super::layout::UNITS.len() - 2, "only the two shared slices are excluded");
+    for (path, _) in super::layout::DIRECTORIES {
+        if SHARED_WITH_SINGLE_BINARY.contains(path) { continue; }
+        assert!(facts.contains(path), "layout directory missing from isolation facts: {path}");
+    }
     // The single-binary protected install writes none of them.
-    for path in [BINARY, LAUNCHER, UNIT_PATH, duduclaw_core::protected_mode::MODE_MARKER] {
+    let single = duduclaw_core::isolation_install::SINGLE_BINARY_LAYOUT;
+    // (protected_linux_install.rs VERSION_FLOOR / VERSION_PENDING /
+    // RECOVERY_BOUND and fresh::FRESH_PENDING are Linux-only private consts.)
+    for path in [BINARY, LAUNCHER, UNIT_PATH, duduclaw_core::protected_mode::MODE_MARKER,
+        "/var/lib/duduclaw-protected/version-floor", "/var/lib/duduclaw-protected/version-pending",
+        "/etc/systemd/system/duduclaw-gateway.recovery-bound",
+        "/var/lib/duduclaw-protected/fresh-install-pending", "/var/lib/duduclaw", "/var/lib/duduclaw-protected"]
+        .into_iter().chain(SHARED_WITH_SINGLE_BINARY.iter().copied()) {
         assert!(!facts.contains(&path), "{path}");
+        assert!(single.contains(&path), "single-binary layout list misses {path}");
     }
+    assert!(unit_text().lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
 }
 
 #[cfg(target_os = "linux")]

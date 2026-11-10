@@ -13,12 +13,13 @@
 //! [`installed`] is true when ANY of [`FACTS`] exists, or cannot be proven
 //! absent (a `symlink_metadata` error other than NotFound, a dangling symlink,
 //! an entry of any type). The facts are only root-owned, fixed paths: the
-//! spawnd control socket and its units, the spawnd state directory, the
-//! updater-managed generation selector and state, the durable migration
-//! import manifest and the fixed-path isolation binaries of the installer
-//! layout. Every one of them lives below a root-owned directory that the
-//! gateway's service account cannot write (`/run`, `/var/lib`, `/etc`,
-//! `/etc/systemd/system`, `/opt/duduclaw-isolated`, `/opt/duduclaw/bin`,
+//! spawnd control socket, every isolation-only unit and directory of the
+//! installer layout, the updater-managed generation selector and state, the
+//! durable migration import manifest and the fixed-path isolation binaries.
+//! Paths a v1.80 single-binary install also writes are never facts
+//! ([`SINGLE_BINARY_LAYOUT`]). Every fact lives below a root-owned directory that the
+//! gateway's service account cannot write (`/run`, `/var/lib`, `/var/log`, `/etc`,
+//! `/etc/systemd/system`, `/opt`, `/opt/duduclaw-isolated`, `/opt/duduclaw/bin`,
 //! `/usr/lib`, `/usr/libexec`), so an employee running as that account can
 //! neither create one (which could only narrow: isolation required and
 //! refused) nor remove one (which would widen). No fact is read from the
@@ -27,7 +28,11 @@
 //! `/usr/lib/duduclaw/duduclaw-run` is visible and a sandboxed `duduclaw
 //! mcp-server` sees the install too (tested in duduclaw-spawnd). The v1.82
 //! bootstrap must create one of these facts before any employee runs on the
-//! isolation path; until then employees run single-binary. Once true, the answer latches
+//! isolation path; until then employees run single-binary. It must stop the
+//! gateway and pass the processes-clear check before publishing the first
+//! fact (a running gateway decided readiness at boot; if it sees a fact
+//! later it refuses employee work until restart, see
+//! `isolation_readiness::late_requirement`). Once true, the answer latches
 //! for the life of the process, so it only ever narrows. Only Linux consults
 //! the system paths; elsewhere the architecture does not exist and the answer
 //! is false (protected mode is off there as well).
@@ -40,17 +45,51 @@ use std::time::Instant;
 /// tested in duduclaw-cli and duduclaw-gateway, which see both).
 pub const DURABLE_IMPORT_MANIFEST: &str = "/etc/duduclaw/migration-import.json";
 
-/// The root-owned facts of an isolation install. The installer's fixed-path
-/// binaries (`protected_linux_layout::BINARIES`) are all included (tested in
-/// duduclaw-cli).
+/// The root-owned facts of an isolation install. Every isolation-only entry of
+/// the installer layout (`protected_linux_layout::{BINARIES, UNITS,
+/// DIRECTORIES}`) is included (tested in duduclaw-cli). Layout entries that a
+/// v1.80-style single-binary install also creates or uses are deliberately
+/// NOT facts: `/etc/duduclaw` (the protected-mode marker's directory) and the
+/// `duduclaw.slice` / `duduclaw-tcb.slice` units (the single-binary gateway
+/// unit runs in `duduclaw-tcb.slice`); likewise `/opt/duduclaw/bin`,
+/// `/usr/local/libexec/duduclaw`, `/var/lib/duduclaw`,
+/// `/var/lib/duduclaw-protected` and `duduclaw-gateway.service`.
 pub const FACTS: &[&str] = &[
     duduclaw_isolation::ids::SPAWND_SOCKET,
+    // Isolation units (layout::UNITS minus the two slices above).
     "/etc/systemd/system/duduclaw-spawnd.socket",
     "/etc/systemd/system/duduclaw-spawnd.service",
+    "/etc/systemd/system/duduclaw-employees.slice",
+    "/etc/systemd/system/duduclaw-egress.socket",
+    "/etc/systemd/system/duduclaw-egress.service",
+    "/etc/systemd/system/duduclaw-dns-broker.socket",
+    "/etc/systemd/system/duduclaw-dns-broker.service",
+    "/etc/systemd/system/duduclaw-parse.socket",
+    "/etc/systemd/system/duduclaw-parse@.service",
+    "/etc/systemd/system/duduclaw-updated.service",
+    "/etc/systemd/system/duduclaw-import@.service",
+    "/etc/systemd/system/duduclaw-migrate-expire@.service",
+    "/etc/systemd/system/duduclaw-migrate-expire@.timer",
+    // Isolation-only directories (layout::DIRECTORIES minus /etc/duduclaw).
+    "/usr/lib/duduclaw",
+    "/usr/lib/duduclaw/parse-root",
+    "/usr/lib/duduclaw/parse-root-tree",
     "/var/lib/duduclaw-spawnd",
+    "/var/lib/duduclaw-spawnd/etc",
+    "/var/log/duduclaw-spawnd",
+    "/etc/duduclaw-updated",
+    "/var/lib/duduclaw-updated",
+    "/opt/duduclaw-isolated",
+    "/opt/duduclaw-isolated/generations",
+    "/opt/duduclaw-isolated/slots",
+    "/opt/duduclaw-isolated/slots/a",
+    "/opt/duduclaw-isolated/slots/b",
+    "/var/lib/duduclaw-migrate",
+    // Updater / migration state.
     "/opt/duduclaw-isolated/current",
     "/var/lib/duduclaw-updated/state.json",
     DURABLE_IMPORT_MANIFEST,
+    // Fixed-path isolation binaries (layout::BINARIES).
     "/usr/lib/duduclaw/duduclaw-spawnd",
     "/usr/lib/duduclaw/duduclaw-run",
     "/opt/duduclaw/bin/duduclaw-egress",
@@ -59,6 +98,34 @@ pub const FACTS: &[&str] = &[
     "/usr/lib/duduclaw/current/duduclaw-migrate",
     "/usr/lib/duduclaw/current/duduclaw-mcp-bridge",
     "/usr/libexec/duduclaw-updated-launch",
+];
+
+/// What a v1.80-style single-binary protected install writes or uses (see
+/// `duduclaw-cli` `protected_linux_install::install` without published
+/// isolation components). None of these, nor any path below them other than
+/// the explicit isolation binaries, is a fact.
+#[doc(hidden)]
+pub const SINGLE_BINARY_LAYOUT: &[&str] = &[
+    crate::protected_mode::MODE_MARKER,
+    "/etc/duduclaw",
+    "/opt/duduclaw",
+    "/opt/duduclaw/bin",
+    "/opt/duduclaw/bin/duduclaw",
+    "/usr/local/libexec",
+    "/usr/local/libexec/duduclaw",
+    "/usr/local/libexec/duduclaw/protected-launcher",
+    "/etc/systemd/system/duduclaw-gateway.service",
+    "/etc/systemd/system/duduclaw-gateway.recovery-bound",
+    "/etc/systemd/system/duduclaw.slice",
+    "/etc/systemd/system/duduclaw-tcb.slice",
+    "/var/lib/duduclaw",
+    "/var/lib/duduclaw/.duduclaw",
+    "/var/lib/duduclaw/.duduclaw/config.toml",
+    "/var/lib/duduclaw-protected",
+    "/var/lib/duduclaw-protected/root.key",
+    "/var/lib/duduclaw-protected/version-floor",
+    "/var/lib/duduclaw-protected/version-pending",
+    "/var/lib/duduclaw-protected/fresh-install-pending",
 ];
 
 static LATCHED: AtomicBool = AtomicBool::new(false);
@@ -144,13 +211,21 @@ mod tests {
     fn isolation_install_absent_without_any_fact() {
         let root = tempfile::tempdir().unwrap();
         assert!(!installed_under(root.path()));
-        // The v1.80 single-binary protected layout is not an isolation install.
-        for single_binary in [crate::protected_mode::MODE_MARKER, "/opt/duduclaw/bin/duduclaw",
-            "/usr/local/libexec/duduclaw/protected-launcher", "/etc/systemd/system/duduclaw-gateway.service",
-            "/var/lib/duduclaw-protected/version-floor", "/var/lib/duduclaw/.duduclaw/config.toml"] {
-            place(root.path(), single_binary);
+        // The full v1.80 single-binary protected layout is not an isolation
+        // install: directories as directories, everything else as files.
+        for path in SINGLE_BINARY_LAYOUT {
+            let parent_of_another = SINGLE_BINARY_LAYOUT.iter()
+                .any(|other| other.strip_prefix(path).is_some_and(|rest| rest.starts_with('/')));
+            if parent_of_another {
+                std::fs::create_dir_all(root.path().join(path.trim_start_matches('/'))).unwrap();
+            } else {
+                place(root.path(), path);
+            }
         }
         assert!(!installed_under(root.path()));
+        for path in SINGLE_BINARY_LAYOUT {
+            assert!(!FACTS.contains(path), "single-binary path is a fact: {path}");
+        }
     }
 
     #[test]

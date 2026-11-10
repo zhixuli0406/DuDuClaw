@@ -17,7 +17,9 @@
 //!   not that employee; in protected mode an external key whose client id
 //!   names an existing employee is refused outright
 //!   ([`external_identity_refusal`]), because other gates resolve such a
-//!   client id to that employee.
+//!   client id to that employee. That refusal follows protected mode alone
+//!   ([`external_identity_gate_applies`]), also on a single-binary protected
+//!   host; the Personal listing rules follow the isolation install.
 use duduclaw_gateway::personal_visibility as visibility;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -39,6 +41,14 @@ pub(crate) fn personal_acting_id(principal: &crate::mcp_auth::Principal, default
     } else {
         super::acting_agent_id(&principal.client_id, default_agent).to_owned()
     }
+}
+
+/// Whether [`external_identity_refusal`] applies: protected mode itself
+/// (`protected_mode::active()`), NOT "isolation installed". The collision is
+/// an identity-confusion control (other gates resolve such a client id to the
+/// employee), so it holds on a v1.80-style single-binary protected host too.
+pub(crate) fn external_identity_gate_applies() -> bool {
+    duduclaw_gateway::runtime_readiness::is_protected_linux()
 }
 
 /// Protected mode: refuse an external key whose client id is an existing

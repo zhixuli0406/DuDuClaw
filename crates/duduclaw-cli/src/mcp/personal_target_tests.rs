@@ -625,6 +625,43 @@ fn p1d_external_client_id_is_never_an_employee() {
     assert_eq!(external_identity_refusal(home, true, &principal(PERSONAL, false)), None);
 }
 
+/// L4: the external-key/employee-id collision refusal follows protected mode
+/// itself, so it also holds on a v1.80-style single-binary protected host
+/// (isolation not installed), while the Personal rules stay off there.
+#[test]
+fn l4_external_identity_refusal_follows_protected_mode_not_isolation_install() {
+    use super::super::personal_wildcard::{EXTERNAL_ID_IS_EMPLOYEE, external_identity_gate_applies,
+        external_identity_refusal};
+    let dir = home();
+    let home = dir.path();
+    super::super::tests::create_test_agent(&home.join("agents"), PERSONAL, "");
+    let external = crate::mcp_auth::Principal {
+        client_id: PERSONAL.into(),
+        scopes: Default::default(),
+        is_external: true,
+        created_at: chrono::Utc::now(),
+    };
+    if !duduclaw_core::protected_mode::active() {
+        assert!(!external_identity_gate_applies());
+        assert_eq!(external_identity_refusal(home, external_identity_gate_applies(), &external), None);
+    }
+    let facts = tempfile::tempdir().unwrap();
+    let marker = facts.path().join("protected-mode");
+    std::fs::write(&marker, b"native-systemd\n").unwrap();
+    let sources = duduclaw_core::protected_mode::Sources {
+        env: None, marker, service_home: facts.path().join("no-service-home"),
+    };
+    duduclaw_core::protected_mode::with_thread_sources(sources, || {
+        assert!(external_identity_gate_applies());
+        if !duduclaw_core::isolation_install::installed() {
+            // Single-binary protected host: no isolation, refusal still applies.
+            assert!(!duduclaw_gateway::runtime_readiness::isolation_active());
+        }
+        assert_eq!(external_identity_refusal(home, external_identity_gate_applies(), &external),
+            Some(EXTERNAL_ID_IS_EMPLOYEE));
+    });
+}
+
 #[tokio::test]
 async fn p1e_activity_post_cannot_forge_goal_ownership() {
     use super::super::RecordActor;
