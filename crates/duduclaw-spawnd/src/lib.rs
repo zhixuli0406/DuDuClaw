@@ -12,7 +12,9 @@ pub mod helper_cgroup;
 #[cfg(target_os = "linux")]
 pub mod helper_host;
 pub mod storage;
-#[cfg(unix)]
+// Linux-only: descriptor-relative root-owned anchors (`libc` is a Linux-only
+// dependency of this crate, and the anchor directory only exists on Linux).
+#[cfg(target_os = "linux")]
 pub mod work_anchor;
 pub mod bootstrap;
 #[cfg(target_os = "linux")]

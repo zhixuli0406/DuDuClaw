@@ -10,7 +10,13 @@ fn reply(items: Vec<ParsedItem>) -> WorkerReply {
 fn item(name: &str, value: &str) -> ParsedItem {
     ParsedItem::Html { input_slot: 0, query: Text::new(name.into()).unwrap(), value: Text::new(value.into()).unwrap() }
 }
+/// An absolute factory home on every platform ("/tmp/…" has no drive prefix
+/// and is not absolute on Windows). Nothing is written here by these tests.
+fn plans_home() -> PathBuf { std::env::temp_dir().join("i1c") }
 
+// Worker plans carry an `AuthorizedFile` host snapshot bound to its (dev,
+// inode) identity, which is Unix-only (fails closed elsewhere).
+#[cfg(unix)]
 #[test]
 fn i1c_web_plan_uses_real_fd_and_exact_html_operation() {
     let bytes = "<p>繁體中文</p>".as_bytes();
@@ -36,7 +42,7 @@ fn i1c_web_rejects_unknown_arguments_and_bad_formats_before_fetch() {
         args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         assert!(web_query(&args).is_err(), "{args}");
     }
-    let factory = GatewayWorkerPlans::new(PathBuf::from("/tmp/i1c")).unwrap();
+    let factory = GatewayWorkerPlans::new(plans_home()).unwrap();
     assert!(factory.supports("web_extract"));
     for name in ["web_extract_extra", "web_fetch_cached", "skill_hub_install", "meeting_transcribe"] {
         assert!(!factory.supports(name));
@@ -96,9 +102,10 @@ fn media_call(name: &str, args: Value) -> AuthorizedToolCall {
     duduclaw_mcp_boundary::tool_policy::authorize(&context, name, &args, &Resolver).unwrap()
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn i1c_media_factory_uses_real_decoded_input_and_request_local_state() {
-    let factory = GatewayWorkerPlans::new(PathBuf::from("/tmp/i1c")).unwrap();
+    let factory = GatewayWorkerPlans::new(plans_home()).unwrap();
     let bytes = b"actual audio bytes; the E parser must validate the container";
     let call = media_call("transcribe_audio", json!({"audio_base64":base64::engine::general_purpose::STANDARD.encode(bytes),"language":"zh-TW"}));
     let (plan, state) = factory.prepare_with_state(&call).await.unwrap();
@@ -161,7 +168,7 @@ fn scan(passed: bool, risk: &str, findings: &[&str]) -> ParsedItem {
 
 #[tokio::test]
 async fn i1c_skill_scan_is_bound_to_boot_employee_and_rejects_cross_agent() {
-    let factory = GatewayWorkerPlans::for_employee(PathBuf::from("/tmp/i1c"), "alice".into(), EmployeeId([2; 16])).unwrap();
+    let factory = GatewayWorkerPlans::for_employee(plans_home(), "alice".into(), EmployeeId([2; 16])).unwrap();
     assert!(factory.supports("skill_security_scan"));
     let own = skill_call("skill_security_scan", json!({"agent_id":"alice","skill_name":"notes"}));
     assert!(factory.authorize_handler(&own).await.is_ok());
@@ -170,7 +177,7 @@ async fn i1c_skill_scan_is_bound_to_boot_employee_and_rejects_cross_agent() {
     let other = skill_call("skill_security_scan", json!({"agent_id":"bob","skill_name":"notes"}));
     assert!(factory.authorize_handler(&other).await.is_err());
     assert!(try_skill_call("skill_security_scan", json!({"agent_id":"alice","skill_name":"../notes"})).is_err());
-    let wrong_binding = GatewayWorkerPlans::for_employee(PathBuf::from("/tmp/i1c"), "alice".into(), EmployeeId([9; 16])).unwrap();
+    let wrong_binding = GatewayWorkerPlans::for_employee(plans_home(), "alice".into(), EmployeeId([9; 16])).unwrap();
     assert!(wrong_binding.authorize_handler(&own).await.is_err());
     // A legacy finite record (workspace grant, no EmployeeScope) is not authority.
     let finite = media_call("transcribe_audio", json!({"audio_base64":"eA=="}));

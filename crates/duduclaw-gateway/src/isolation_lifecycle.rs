@@ -1029,6 +1029,9 @@ pub(crate) fn open_store(home: &Path, store: &str, access: Access) -> Result<Con
     Ok(db)
 }
 
-#[cfg(test)]
+// The fixture is the real authority stores, opened through the hardened
+// `fs_safe::sqlite::open_existing`, which is Unix-only (fails closed
+// elsewhere, as does the whole protected lifecycle). Unix-only tests.
+#[cfg(all(test, unix))]
 #[path = "isolation_lifecycle_tests.rs"]
 mod tests;

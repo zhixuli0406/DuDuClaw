@@ -140,7 +140,9 @@ fn validate(file: &File, user: &[usize]) -> io::Result<()> {
 }
 
 /// Shared handle-based ACL check. Existing homes may grant outsiders read-only
-/// access; private state and secrets permit only owner, SYSTEM and Administrators.
+/// access; private state and secrets permit only owner, the current account,
+/// SYSTEM and Administrators. The owner must be the current account, SYSTEM or
+/// Administrators (an elevated administrator's default object owner).
 pub(crate) fn validate_acl(file: &File, user: &[usize], private: bool) -> io::Result<()> {
     use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{DELETE, WRITE_DAC, WRITE_OWNER,
@@ -157,8 +159,16 @@ pub(crate) fn validate_acl(file: &File, user: &[usize], private: bool) -> io::Re
         return Err(io::Error::from_raw_os_error(status as i32));
     }
     let _security = LocalAllocation(raw);
+    let current = user_sid(user);
+    // An elevated administrator's default object owner is BUILTIN\Administrators
+    // (the Windows Server default, and every GitHub Windows runner), so state
+    // this account itself created can be owned by that group rather than its
+    // user SID. SYSTEM and Administrators are already fully trusted by the DACL
+    // rule below, so accepting them as owner grants no principal any new access.
     if owner.is_null() || unsafe { IsValidSid(owner) } == 0
-        || unsafe { EqualSid(owner, user_sid(user)) } == 0
+        || (unsafe { EqualSid(owner, current) } == 0
+            && unsafe { IsWellKnownSid(owner, WinBuiltinAdministratorsSid) } == 0
+            && unsafe { IsWellKnownSid(owner, WinLocalSystemSid) } == 0)
     {
         return Err(denied("identity key must be owned by the current account"));
     }
@@ -187,7 +197,9 @@ pub(crate) fn validate_acl(file: &File, user: &[usize], private: bool) -> io::Re
         if unsafe { IsValidSid(sid) } == 0 {
             return Err(denied("invalid access-control SID"));
         }
+        // The current account stays trusted when the owner is the group above.
         let trusted = unsafe { EqualSid(sid, owner) } != 0
+            || unsafe { EqualSid(sid, current) } != 0
             || unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0
             || unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } != 0;
         let mutation_rights = GENERIC_ALL | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER

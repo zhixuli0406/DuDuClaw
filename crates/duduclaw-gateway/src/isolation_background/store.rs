@@ -219,6 +219,9 @@ mod tests {
         assert!(!home.path().join("isolation_background.db").exists());
     }
 
+    // The receipt store and approvals reads go through the descriptor-pinned
+    // `fs_safe::sqlite` opens, which are Unix-only (fail closed elsewhere).
+    #[cfg(unix)]
     #[test]
     fn background_receipt_roundtrip_replacement_and_expired_reclamation() {
         let home = crate::fs_safe::private_test_home().unwrap();
@@ -238,6 +241,7 @@ mod tests {
         assert_eq!(load(home.path(), "cron", &second.id).unwrap(), Some(second));
     }
 
+    #[cfg(unix)]
     #[test]
     fn background_approval_requires_exact_payload_admin_decision_and_decision_window() {
         let home = crate::fs_safe::private_test_home().unwrap();

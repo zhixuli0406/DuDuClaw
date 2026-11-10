@@ -63,7 +63,7 @@ impl Host for FakeHost {
         if self.hold { return Ok(None); }
         match self.jobs.remove(&ticket).ok_or(ErrorCode::Internal)? {
             BrokerJob::OpenWorkFile { .. } => Ok(Some(BrokerReply::WorkFile {
-                metadata: WorkFileMetadata { size: 1, inode: 1, device: 1 }, file: std::fs::File::open("/dev/null").unwrap(), source: None })),
+                metadata: WorkFileMetadata { size: 1, inode: 1, device: 1 }, file: null_file(), source: None })),
             BrokerJob::WorkAnchor { .. } => Ok(Some(BrokerReply::WorkAnchor(WorkAnchorIdentity { device: 3, inode: 4 }))),
             BrokerJob::EmployeeIdle { employee } => {
                 if self.unknown.contains(&employee) { return Err(ErrorCode::NotFound); }
@@ -73,6 +73,11 @@ impl Host for FakeHost {
         }
     }
     fn broker_abandon(&mut self, ticket: Ticket) { self.jobs.remove(&ticket); self.abandoned.push(ticket); }
+}
+/// Any readable file stands in for the brokered work file (the coordinator
+/// never reads it). The null device name is platform-specific.
+fn null_file() -> std::fs::File {
+    std::fs::File::open(if cfg!(windows) { "NUL" } else { "/dev/null" }).unwrap()
 }
 fn conn() -> ControlConnectionId { ControlConnectionId([1; 16]) }
 fn stopped(outcome: BrokerOutcome) -> (EmployeeId, Vec<RunId>, bool) {
