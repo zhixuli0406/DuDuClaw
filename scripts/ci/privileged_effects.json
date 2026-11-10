@@ -1892,6 +1892,18 @@
       "rationale": "Regression fixture: legacy command/PTY construction, native byte equivalence, backend lifecycle or protocol behavior; not a production execution entry."
     },
     {
+      "symbol": "crates/duduclaw-execution/src/local.rs::ConsoleOnDrop::close_detached",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "side_effect"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "The lexical spawn match starts a Rust thread that drops the Windows ConPTY master off the dropping thread; it does not create an OS child process."
+    },
+    {
       "symbol": "crates/duduclaw-execution/src/local.rs::policy_command",
       "apis": {
         "command_constructor": 1
