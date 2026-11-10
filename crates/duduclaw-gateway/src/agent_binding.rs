@@ -670,7 +670,14 @@ fn read_durable_state(path:&std::path::Path)->std::io::Result<BindState> {
 fn write_durable_state(path:&std::path::Path,state:&BindState)->std::io::Result<()> {
     let encoded=serde_json::to_string_pretty(state).map_err(|_|std::io::Error::other("binding encoding failed"))?;
     crate::handlers::config_commit::replace_owner_only(path,&encoded)?;
-    std::fs::File::open(path.parent().ok_or_else(||std::io::Error::other("binding path"))?).and_then(|f|f.sync_all())
+    let parent=path.parent().ok_or_else(||std::io::Error::other("binding path"))?;
+    // Directory fsync is Unix-only (as in config_commit): Windows refuses to
+    // open a directory with File::open, which failed every committed write.
+    #[cfg(unix)]
+    std::fs::File::open(parent).and_then(|f|f.sync_all())?;
+    #[cfg(not(unix))]
+    let _=parent;
+    Ok(())
 }
 
 // ── F6h (isolation_label_stores, S9): global channel routes to one label ──

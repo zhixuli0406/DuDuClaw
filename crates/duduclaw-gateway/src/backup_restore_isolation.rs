@@ -221,6 +221,18 @@ fn any_row_in_any_table(connection: &Connection) -> Result<bool, ()> {
 }
 
 fn apply_rows(root: &Path) -> Result<bool, ()> {
+    // Unix stats `migration-authority/apply.db` through a non-directory as
+    // ENOTDIR (Unknown below); Windows reports NotFound, which would read as
+    // Absent. Anything there but a plain directory cannot be ruled out.
+    #[cfg(not(unix))]
+    {
+        match std::fs::symlink_metadata(root.join(APPLY_DIR)) {
+            Ok(metadata) if !metadata.is_dir() => return Err(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(()),
+        }
+    }
     match open(&root.join(APPLY_DIR), APPLY_DB)? {
         Some(connection) => any_row_in_any_table(&connection),
         None => Ok(false),

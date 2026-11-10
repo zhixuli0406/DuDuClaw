@@ -13,3 +13,8 @@
 # OpenSSH-generated SSHSIG vectors: the armor is parsed LF-only (CRLF is rejected
 # by design) and message.json is the exact signed byte string; never convert.
 /crates/duduclaw-updated/tests/fixtures/** -text
+# Pinned legacy SQLite catalogs embedded with include_str! and compared byte-for-byte
+# against sqlite_schema.sql (CRLF would never match a live store); keep LF.
+/crates/duduclaw-import/src/*.sql text eol=lf
+# Served with include_str!; its inline <script> is pinned by a CSP sha256 hash.
+/crates/duduclaw-gateway/src/migration_setup.html text eol=lf

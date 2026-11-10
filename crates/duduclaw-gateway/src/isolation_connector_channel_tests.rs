@@ -132,7 +132,8 @@ fn channel_tokens_preserve_line_base64_and_keep_telegram_url_path_closed(){
 fn home_sender_factory_never_substitutes_an_ambient_home(){
     // Source boundary regression: the generic factory must honor its explicit
     // registered home for every subtype (Google Chat/Teams previously did not).
-    let source=include_str!("channel_sender.rs");
+    // include_str! keeps the checkout's line endings (CRLF on Windows autocrlf).
+    let source=include_str!("channel_sender.rs").replace("\r\n","\n");
     let factory=source.split("pub fn create_sender_for_home(").nth(1).unwrap().split("///").next().unwrap();
     assert!(!factory.contains("platform::duduclaw_home()"));
     assert!(factory.contains("create_googlechat_sender(\n            home_dir.to_path_buf()"));

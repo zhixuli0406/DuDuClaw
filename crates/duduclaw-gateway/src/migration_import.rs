@@ -366,6 +366,9 @@ mod tests {
             }}))
         }
     }
+    // Confirmed materialization is part of the Linux root import: `validate`
+    // requires a Unix-absolute workspace, which Windows paths never are.
+    #[cfg(unix)]
     #[tokio::test]
     async fn migration_import_memory_uses_low_trust_lineage_and_retries_without_duplicates() {
         let home = tempfile::tempdir().unwrap();
@@ -524,6 +527,8 @@ mod tests {
         }
     }
 
+    // Same Unix-absolute workspace requirement as above (the confirmed apply).
+    #[cfg(unix)]
     #[tokio::test]
     async fn migration_import_archived_stream_materializes_after_confirmation_and_crash_resume() {
         let home=tempfile::tempdir().unwrap();
