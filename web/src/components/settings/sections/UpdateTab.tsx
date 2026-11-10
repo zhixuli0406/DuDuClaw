@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
 import { client } from '@/lib/ws-client';
-import { submitProtectedUpdate, newProtectedUpdateId, pendingProtectedUpdate, rememberProtectedUpdate, protectedUpdateFinished, type ProtectedUpdateState } from '@/lib/protected-update';
+import { submitProtectedUpdate, newProtectedUpdateId, pendingProtectedUpdate, rememberProtectedUpdate, protectedUpdateFinished, isUpdaterNotInstalled, HOST_UPGRADE_COMMAND, type ProtectedUpdateState } from '@/lib/protected-update';
 import { updateFailure } from '@/lib/update-failure';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -84,7 +84,8 @@ export function UpdateTab() {
   const [retry, setRetry] = useState<RetryState | null>(null);
   const [installed, setInstalled] = useState(false);
   const [protectedRequest, setProtectedRequest] = useState(pendingProtectedUpdate);
-  const [protectedState, setProtectedState] = useState<ProtectedUpdateState | 'unavailable' | null>(null);
+  // 'notInstalled': no root updater on this host; the gateway sent nothing.
+  const [protectedState, setProtectedState] = useState<ProtectedUpdateState | 'unavailable' | 'notInstalled' | null>(null);
   const [pollGeneration, setPollGeneration] = useState(0);
   const [autoUpdate, setAutoUpdate] = useState(false);
   const [edition, setEdition] = useState('community');
@@ -139,6 +140,12 @@ export function UpdateTab() {
       try {
         const result = await api.system.protectedUpdateStatus(protectedRequest);
         if (cancelled) return;
+        if (isUpdaterNotInstalled(result)) {
+          // Keep the id: the result of an earlier request is still unknown.
+          setProtectedState('notInstalled');
+          clearInterval(timer);
+          return;
+        }
         if (result.protected_request_id !== protectedRequest) throw new Error('update response mismatch');
         setProtectedState(result.protected_state);
         setError(null);
@@ -282,7 +289,10 @@ export function UpdateTab() {
       if (updateInfo?.update_channel === 'protected') {
         const requestId = newProtectedUpdateId();
         const outcome = await submitProtectedUpdate(requestId, api.system.applyUpdate);
-        if (outcome.kind === 'unknown') {
+        if (outcome.kind === 'updater_not_installed') {
+          setProtectedState('notInstalled');
+          takeDesktopResume();
+        } else if (outcome.kind === 'unknown') {
           setProtectedRequest(outcome.requestId);
           setProtectedState('unavailable');
         } else {
@@ -489,7 +499,10 @@ export function UpdateTab() {
               {intl.formatMessage({ id: 'settings.update.protected.reload' })}
             </Button>
           )}
-          {protectedState === 'unavailable' && protectedRequest && (
+          {protectedState === 'notInstalled' && (
+            <code className="mt-2 block break-all text-xs">{HOST_UPGRADE_COMMAND}</code>
+          )}
+          {(protectedState === 'unavailable' || protectedState === 'notInstalled') && protectedRequest && (
             <Button variant="brand" size="sm" onClick={() => setPollGeneration((n) => n + 1)} className="mt-2">
               {intl.formatMessage({ id: 'settings.update.protected.refresh' })}
             </Button>

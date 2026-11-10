@@ -59,6 +59,7 @@
   "settings.update.protected.maintenance": "The update service needs manual repair. Contact your administrator.",
   "settings.update.protected.unavailable": "The update result is temporarily unavailable. We will check again when connected; do not start another installation.",
   "settings.update.protected.refresh": "Check result again",
+  "settings.update.protected.notInstalled": "This host has no separate update service, so the dashboard cannot update the protected install. No update request was sent. Run this command in the host terminal to update:",
   "agent.selection.revoked": "This AI employee is no longer available. Please select again.",
   "settings.update.failure.download": "Unable to download the update. Check your connection and check for updates again.",
   "settings.update.failure.verify": "Update verification failed; installation was stopped. Download the official release again.",

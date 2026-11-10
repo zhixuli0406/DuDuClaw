@@ -4,6 +4,8 @@ v1.80 の構成では、gateway、AI 社員、文書解析、特権更新を分�
 
 **開発状況：** 署名検証後の未有効化世代の配置、インストーラーから移行への接続、最初の管理者設定、読み取り専用の導入検査、固定パスの協調削除を実装しました。完全な新規導入、署名済み世代の有効化、移行プラットフォーム、gateway の総合準備検査は未完了です。今回 root 実機での導入・削除は検証していません。サービスの `active` や世代の配置だけでは隔離の準備完了を示しません。[実装と検証記録](../../architecture/native-linux-isolation.md)を参照してください。
 
+**現在インストールできる内容：** `service install --protected-linux` は spawnd、egress、独立した更新サービスをインストールせず、移行計画を作成する処理もありません。隔離構成の新規インストール手順が完成するまで（v1.82.0 予定）、保護サービスは下記「単一実行ファイルの保護サービス（現行版）」で説明する v1.80 の単一実行ファイル gateway サービスです。このガイドで説明する社員ごとの隔離は適用されません。
+
 ## 利用者にとっての変更
 
 - 隔離が必須の場合、社員は gateway のアカウントで実行されません。同じ社員は同時に一つの仕事を実行し、追加の会話やスケジュールは待機します。
@@ -33,6 +35,33 @@ Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大
 
 `getent`、`id`、`useradd`、util-linux、systemd ツール、curl などの信頼できるシステムツールが必要です。社員の loop ストレージには ext4 または XFS、対応する非 thin provisioning の下位デバイス構成、社員のクォータと TCB の予約容量が必要です。不明な構成や容量不足は準備完了を拒否します。外部 IAM／NSS は社員 UID 範囲を永続的に予約する必要があります。
 
+## 単一実行ファイルの保護サービス（現行版）
+
+隔離コンポーネントをインストールできるようになるまで（v1.82.0 予定）、`service install --protected-linux` は v1.80 の単一実行ファイル保護 gateway をインストールします。root 所有のプログラム `/opt/duduclaw/bin/duduclaw`、ランチャー `/usr/local/libexec/duduclaw/protected-launcher`、ユニット `duduclaw-gateway.service`、バージョン下限 `/var/lib/duduclaw-protected/version-floor` で構成されます。AI 社員は v1.80 と同じく gateway アカウントで実行します。
+
+**新しいホスト。** バージョン下限の記録がない場合、ホストに DuDuClaw がインストールされたことがないと確認できたときだけインストールを続けます。条件は、`duduclaw` アカウントがなく、次のパスがすべて存在しないことです：`/var/lib/duduclaw`、`/var/lib/duduclaw-protected/root.key`、`/var/lib/duduclaw-protected/version-floor`、`/var/lib/duduclaw-protected/version-pending`、`/opt/duduclaw/bin/duduclaw`、ランチャー、`/etc/systemd/system/duduclaw-gateway.service`、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json`、`/opt/duduclaw-isolated/current`。いずれかが存在するか確認できない場合、記録のない下限は v1.79.3 のインストールである可能性があるため、インストーラーは移行のメッセージを表示して拒否します。拒否を回避するためにこれらのパスを削除しないでください。データや鍵が含まれている場合があります。
+
+`--migrate-from` を指定すると、インストーラーはアカウント作成などの変更を行う前に移行元ディレクトリを検査します。読み取り中に変化した移行元は拒否されるため、ユーザーモードの gateway を先に停止してください。アカウントを作成する前に、root だけがアクセスできるマーカー `/var/lib/duduclaw-protected/fresh-install-pending` を書き込みます。その後インストールが失敗しても、マーカーが改変されておらず、バージョン下限、ルート鍵、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json`、`/opt/duduclaw-isolated/current` がまだ存在しなければ、同じコマンドを再実行するとインストールを続行します。前回すでにデータをコピーしていた場合は `--force-migrate` を追加してください（前回のコピーはバックアップとして保持されます）。マーカーは下限の記録後、または `uninstall` で削除されます。
+
+このマーカーは、このホストで新規インストールを開始したことをインストーラーが記録するファイルです。root 所有、権限 0600 の通常ファイルで、内容がインストーラーの書き込んだものと完全に一致している必要があります。マーカーが存在してもこの検査に通らない場合、インストーラーはホストを新しいホストとして扱わず、インストールを拒否します。root は `sudo ls -l /var/lib/duduclaw-protected/fresh-install-pending` で確認できます。ホストにバージョン下限もルート鍵もなく、新規インストールを行うつもりの場合に限り、root で削除してください（`sudo rm /var/lib/duduclaw-protected/fresh-install-pending`）。削除後も、インストーラーは上記の新しいホストの条件を適用します。
+
+```sh
+# 検証済みのプログラムを root 所有の場所から実行します（「インストールと準備完了の確認」を参照）。
+sudo ./duduclaw service install --protected-linux --enable-now
+```
+
+**v1.80.x のホスト。** 記録された下限が 1.80.0 以上のホストは、v1.80 の更新方法を引き続き使います。
+
+```sh
+sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y.Z]
+```
+
+`--version` を省略すると最新版を使います。コマンドはまず設定済みの AI CLI を検査し（下記参照）、公式リリースをダウンロードしてチェックサム、署名、埋め込みバージョンを検証し、プログラムをアトミックに置き換えます。ユニットとランチャーの内容が異なる場合は更新し、自動復旧の設定を再確認し、新しい下限を記録して、実行中の gateway を再起動します。対象バージョンはコマンドを実行するプログラムより新しい必要があり、そのプログラムは記録済みの下限より古くてはいけません（古いユニットとランチャーを書き込むため）。インストール済みの `/opt/duduclaw/bin/duduclaw` を使ってください。検証済みのより新しいプログラムに移る場合は、そのプログラムの `sudo ./duduclaw service install --protected-linux` を実行してください。再インストールでデータとルート鍵を保持するのは、バージョン下限が存在する間だけです。`service uninstall --protected-linux` は下限を削除しますが、データ、ルート鍵、アカウントは保持するため、その後のインストールは下限が不明なホストとして拒否されます。
+
+**ダッシュボード。** 独立した更新サービスがない場合、ダッシュボードから保護されたインストールを更新できません。画面にその旨と上記のコマンドを表示し、要求は送信しません。
+
+独立した更新サービスがインストールを管理するようになると（`/var/lib/duduclaw-updated/state.json` と `/opt/duduclaw-isolated/current` の両方が存在）、`service upgrade --protected-linux` は `--version` が必須になり、そのサービスへ要求を送るだけになります。接続できない場合も、プログラムを自ら置き換えることはありません。
+
 ## インストールと準備完了の確認
 
 管理者自身の端末で、AI セッションの外から操作します。x86_64 または aarch64 の完全なリリースを取得し、root 所有で全祖先が他のアカウントに書き込みを許さないステージング領域で検証してから root で実行してください。Linux アーカイブは個別のコンポーネントバイナリを含みます。`duduclaw` だけをコピーしても、この構成はインストールできません。
@@ -56,7 +85,7 @@ Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大
 
 ## v1.79.3 からの移行
 
-旧バイナリをその場で交換したり、旧データベースを新しい home にコピーしたりしないでください。旧環境は社員と UID を共有するため、旧権限データは信頼できません。インストーラーは v1.79.3 から v1.80 への境界（旧バージョン下限不明を含む）を G の移行処理へ渡し、root 所有の固定計画 `/var/lib/duduclaw-migrate/plan.json` を読みます。計画が欠落・不正なら旧サービス停止前に拒否し、旧方式の上書き更新には戻りません。
+旧バイナリをその場で交換したり、旧データベースを新しい home にコピーしたりしないでください。旧環境は社員と UID を共有するため、旧権限データは信頼できません。インストーラーは v1.79.3 から v1.80 への境界（旧バージョン下限が不明で、新しいホストとも確認できない場合を含む。上記の単一実行ファイルの節を参照）を G の移行処理へ渡し、root 所有の固定計画 `/var/lib/duduclaw-migrate/plan.json` を読みます。計画が欠落・不正なら旧サービス停止前に拒否し、旧方式の上書き更新には戻りません。
 
 管理者の手順は次のとおりです。
 
@@ -93,13 +122,13 @@ sudo -u duduclaw -H claude auth login
 
 `-H` と `--prefix /usr` は両方必要です。省略すると、元ユーザーの `~/.npmrc` の prefix 設定により CLI が再びユーザーのホームにインストールされる場合があります。Codex、Grok、AGY、Gemini を設定している場合も、サービスから読める同じシステム PATH にインストールし、各 CLI の手順でサービスアカウントとしてログインしてください。
 
-`service install --protected-linux` と `service upgrade --protected-linux` の最後に、設定された主要推論 runtime と各社員の `agent.toml` が選択する runtime を検査します。移行時は移行先の設定を読みます。サービスアカウントとサービス PATH で実行権限を確認し、隠されたパスを除外します。元ユーザーのホームにしかない CLI はサービスで利用できないと表示します。主要 runtime がない場合は警告を表示し、非ゼロで終了します。後で runtime を設定する場合に限り、どちらのコマンドにも `--allow-missing-runtime` を指定できます。このフラグは CLI のインストールやログインを行いません。検査の失敗は、すでに行ったインストールやアップグレードを元に戻しません。下記の独立した更新サービス経由で更新する場合、`service upgrade --protected-linux` は要求を送信する前にこの検査を行い、失敗した場合は送信しません。
+`service install --protected-linux` と `service upgrade --protected-linux` の最後に、設定された主要推論 runtime と各社員の `agent.toml` が選択する runtime を検査します。移行時は移行先の設定を読みます。サービスアカウントとサービス PATH で実行権限を確認し、隠されたパスを除外します。元ユーザーのホームにしかない CLI はサービスで利用できないと表示します。主要 runtime がない場合は警告を表示し、非ゼロで終了します。後で runtime を設定する場合に限り、どちらのコマンドにも `--allow-missing-runtime` を指定できます。このフラグは CLI のインストールやログインを行いません。インストール最後の検査が失敗しても、すでに行ったインストールは元に戻りません。`service upgrade --protected-linux` はリリースのダウンロードや更新要求の送信より前にこの検査を行い、失敗した場合は何も変更しません。
 
 移行でコピーするのは `.duduclaw` のデータだけで、**AI CLI 本体やログイン認証情報は移行しません**。Claude があってもサービスアカウントが未ログインの場合、インストール時に上記のログインコマンドを表示します。元ユーザーのホームから認証情報をコピーせず、個別にログインしてください。gateway の起動時に設定された推論バイナリが見つからない場合は、修復手順を含む ERROR を記録します。runtime の状態と doctor にも保護サービス用の手順を表示します。
 
 ## 更新とアンインストール
 
-移行と更新サービスの完全な準備後、Admin はダッシュボードで安定版を要求するか、インストール済み CLI を使います。
+独立した更新サービスはまだインストールできません（v1.82.0 予定）。現在のホストは上記の単一実行ファイルの節に従って更新してください。移行と更新サービスの完全な準備後、Admin はダッシュボードで安定版を要求するか、インストール済み CLI を使います。
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
@@ -142,7 +171,7 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 
 ## リリース済み v1.80.x の単一実行ファイル保護サービス
 
-以下の各節は、v1.80.x リリースの保護サービスを説明します。gateway は root がインストールした単一の実行ファイルで、`service upgrade --protected-linux` はプロセス内で検証して置き換えます。これらはそのリリースと、隔離アーキテクチャでも維持する認証情報保護の制御（エンジンソケットポリシーと自動復旧）の参照情報です。この開発ブランチからビルドした版では、`service upgrade --protected-linux` は上記の独立した更新サービスへ要求を送信し、実行ファイルを自ら置き換えません。
+以下の各節は、v1.80.x リリースの保護サービスを説明します。gateway は root がインストールした単一の実行ファイルで、`service upgrade --protected-linux` はプロセス内で検証して置き換えます。これらはそのリリースと、隔離アーキテクチャでも維持する認証情報保護の制御（エンジンソケットポリシーと自動復旧）の参照情報です。現行版でも、単一実行ファイルのインストールではこのプロセス内更新を使います（上記「単一実行ファイルの保護サービス」を参照）。独立した更新サービスが管理するインストールだけが更新要求を送信し、その場合 CLI が実行ファイルを置き換えることはありません。
 
 公式 GitHub 更新は minisign の trusted comment `duduclaw v{version} {archive-file-name}` をプラットフォーム・アーキテクチャまで厳密に照合します。Pro 更新は `duduclaw-pro` と独自の固定公開鍵を使います。ペイロード署名とコメントを保護する global signature の両方が必要です。すべてのアーカイブ導入経路で、検証器が生成した `VerifiedReleaseIdentity` が必須となり、アーカイブのダイジェスト、版、ファイル名、署名済みコメントを結び付けます。整合性確認だけでは導入できません。置換前に実行ファイルの版も確認します。保護アップグレードでは root でダウンロードしたコードを実行せず、ビルド時の固定形式レコードを読みます。ヘッダー `NUL + DUDUCLAW_RELEASE_ID:V1:`、安定版 `X.Y.Z`、末尾 `NUL + DUDUCLAW_RELEASE_END + NUL` の完全なレコードが正確に一つ必要です。すべての `DUDUCLAW_RELEASE_ID` がこの形式に一致しなければなりません。欠落、不正、重複、競合、マーカーのない旧版は拒否します。署名前に実際のアーカイブ内の実行ファイルを解析し、tag と照合します。Pro のパッケージ作成にも適用します。通常更新は `version` 出力を確認します。不一致は置換および保護版の intent/floor 更新前に中止します。この検査には修正済みの更新プログラムが必要です。旧版の更新プログラムは管理者が確認した手動導入で先に更新してください。
 

@@ -5391,6 +5391,13 @@ that review has not been obtained.
   copying or symlink shortcuts. Do not activate a mixed generation.
 - Supply the signed G platform adapter and runtime/storage/authority materializers,
   then verify quarantine/import, pending confirmations and first-admin setup.
+- v1.82 bootstrap isolation gate: treat **every single-binary protected host**
+  (no F-managed generation, any recorded floor) as needing G's
+  migration/quarantine. A floor >= 1.80 does not mean "migrated or provably
+  fresh": v1.80.x hosts carry such floors without G, and a fresh v1.81
+  gateway-only install with `--migrate-from` can import a user-mode v1.79.x home
+  and record a 1.81.x floor. Do not trust the floor for this decision, and do not
+  add a marker file in its place.
 - Wire I1 composite readiness and verified DNS/unit configuration; no current
   readiness command can return overall success with `MissingComposite`.
 - Connect H's complete storage inventory to removal; run real fresh-install,

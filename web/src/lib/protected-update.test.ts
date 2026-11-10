@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { submitProtectedUpdate, newProtectedUpdateId, pendingProtectedUpdate, protectedUpdateFinished, rememberProtectedUpdate } from './protected-update';
+import { submitProtectedUpdate, newProtectedUpdateId, pendingProtectedUpdate, protectedUpdateFinished, rememberProtectedUpdate, isUpdaterNotInstalled, UPDATER_NOT_INSTALLED, HOST_UPGRADE_COMMAND } from './protected-update';
+import zhTW from '@/i18n/zh-TW.json';
+import en from '@/i18n/en.json';
+import jaJP from '@/i18n/ja-JP.json';
 
 describe('protected update readback', () => {
   beforeEach(() => sessionStorage.clear());
@@ -79,5 +82,45 @@ describe('protected update acceptance with a lost reply', () => {
     expect(outcome).toEqual({ kind: 'unknown', requestId: id });
     expect(pendingProtectedUpdate()).toBe(id);
     expect(JSON.stringify(outcome)).not.toContain('/root/internal/secret');
+  });
+});
+
+describe('protected update without an installed root updater', () => {
+  beforeEach(() => sessionStorage.clear());
+
+  const notInstalled = {
+    success: false, needs_restart: false, code: 'updater_not_installed',
+    message: '這台主機沒有可用的獨立更新服務',
+  };
+
+  it('reports a distinct result and stops tracking the never-sent request', async () => {
+    const id = '10000000-0000-4000-8000-000000000001';
+    const outcome = await submitProtectedUpdate(id, async () => notInstalled);
+    expect(outcome).toEqual({ kind: 'updater_not_installed' });
+    expect(pendingProtectedUpdate()).toBeNull();
+    expect(JSON.stringify(outcome)).not.toContain('獨立更新服務');
+  });
+
+  it('only accepts the exact code without a request id', () => {
+    expect(UPDATER_NOT_INSTALLED).toBe('updater_not_installed');
+    expect(isUpdaterNotInstalled(notInstalled)).toBe(true);
+    for (const reply of [null, undefined, 'updater_not_installed', {}, { code: 'other' },
+      { ...notInstalled, protected_request_id: '10000000-0000-4000-8000-000000000001' }]) {
+      expect(isUpdaterNotInstalled(reply)).toBe(false);
+    }
+  });
+
+  it('a rejected call is still a lost reply, not "not installed"', async () => {
+    const id = '10000000-0000-4000-8000-000000000001';
+    const outcome = await submitProtectedUpdate(id, async () => { throw notInstalled; });
+    expect(outcome).toEqual({ kind: 'unknown', requestId: id });
+    expect(pendingProtectedUpdate()).toBe(id);
+  });
+
+  it('has the host instruction in every dashboard language', () => {
+    expect(HOST_UPGRADE_COMMAND).toBe('sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux');
+    for (const messages of [zhTW, en, jaJP] as unknown as Record<string, string>[]) {
+      expect(messages['settings.update.protected.notInstalled']).toBeTruthy();
+    }
   });
 });

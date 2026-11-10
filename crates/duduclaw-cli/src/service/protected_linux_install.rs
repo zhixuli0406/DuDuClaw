@@ -4,6 +4,10 @@ use std::{fs, io::Write, os::unix::{fs::{DirBuilderExt, MetadataExt, OpenOptions
 mod readiness;
 #[path = "protected_linux_uninstall.rs"]
 mod removal;
+#[path = "protected_linux_fresh.rs"]
+mod fresh;
+#[path = "protected_linux_upgrade.rs"]
+mod in_place;
 
 fn gate() -> Result<()> {
     if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 {
@@ -215,9 +219,7 @@ fn parse_runtime_tree(install: bool) -> Result<()> {
 }
 
 // Read and compare through the same pinned descriptor that was validated.
-// MERGE-NOTE: only the legacy in-process upgrade used this; `upgrade` now
-// hands off to the privileged updater (see the note on `upgrade`).
-#[allow(dead_code)]
+// Used by the single-binary in-process upgrade (protected_linux_upgrade.rs).
 fn update_text_if_different(path: &str, mode: u32, expected: &str) -> Result<bool> {
     use std::io::Read;
     parents(Path::new(path))?;
@@ -392,13 +394,15 @@ fn read_version_file(path: &str) -> Result<Option<String>> {
     Ok(value)
 }
 
-fn check_floor(target: &str, upgrade: bool) -> Result<()> {
+// `fresh_host` is the install-time fact from `fresh::host_is_fresh` (no
+// residue of any earlier install); upgrades always pass false.
+fn check_floor(target: &str, upgrade: bool, fresh_host: bool) -> Result<()> {
     let floor = read_version_file(VERSION_FLOOR)?;
-    require_isolation_migration(floor.as_deref(), target)?;
+    require_isolation_migration(floor.as_deref(), target, fresh_host)?;
     if upgrade {
         // A newer floor can survive an interrupted upgrade while the old
         // executable still runs; both must authorize the migration boundary.
-        require_isolation_migration(Some(duduclaw_gateway::updater::current_version()), target)?;
+        require_isolation_migration(Some(duduclaw_gateway::updater::current_version()), target, false)?;
     }
     // The atomic writer uses one version without whitespace. Do not normalize
     // malformed existing files into an accepted floor.
@@ -413,9 +417,18 @@ fn check_floor(target: &str, upgrade: bool) -> Result<()> {
 
 // The old single-binary updater cannot establish D9's independent bootstrap
 // trust or quarantine authority. Never cross that boundary by replacing bytes.
-fn require_isolation_migration(installed: Option<&str>, target: &str) -> Result<()> {
+// An unknown floor is only acceptable on a provably fresh host: there is no
+// earlier data to migrate. Otherwise it may hide a v1.79 install.
+//
+// A floor >= 1.80 does NOT mean "migrated by G or provably fresh": a fresh
+// install with --migrate-from can import a user-mode v1.79.x home and record a
+// 1.81.x floor, and v1.80.x single-binary hosts already carry such floors
+// without G. The v1.82 isolation bootstrap gate must therefore treat every
+// single-binary protected host (any floor, no F-managed generation) as needing
+// G's migration/quarantine, and must not trust this floor for that decision.
+fn require_isolation_migration(installed: Option<&str>, target: &str, fresh_host: bool) -> Result<()> {
     let target = semver::Version::parse(target).map_err(|_| refused("invalid target version"))?;
-    if installed.is_none() && (target.major, target.minor) >= (1, 80) {
+    if installed.is_none() && !fresh_host && (target.major, target.minor) >= (1, 80) {
         return Err(refused("無法確認這個安裝是否已完成資料遷移，已停止升級。請使用官方遷移流程。"));
     }
     if let Some(installed) = installed {
@@ -434,13 +447,25 @@ mod isolation_migration_tests {
     #[test]
     fn legacy_protected_upgrade_cannot_bypass_migration() {
         for target in ["1.80.0", "1.80.0-rc.1", "1.80.1", "2.0.0"] {
-            assert!(require_isolation_migration(Some("1.79.3"), target).is_err());
+            assert!(require_isolation_migration(Some("1.79.3"), target, false).is_err());
         }
-        assert!(require_isolation_migration(Some("1.79.3"), "1.79.4").is_ok());
-        assert!(require_isolation_migration(Some("1.80.0"), "1.80.1").is_ok());
-        assert!(require_isolation_migration(Some("invalid"), "1.80.0").is_err());
-        assert!(require_isolation_migration(None, "1.80.0").is_err());
-        assert!(require_isolation_migration(None, "1.79.3").is_ok());
+        assert!(require_isolation_migration(Some("1.79.3"), "1.79.4", false).is_ok());
+        assert!(require_isolation_migration(Some("1.80.0"), "1.80.1", false).is_ok());
+        assert!(require_isolation_migration(Some("invalid"), "1.80.0", false).is_err());
+        // Unknown floor on a host with residue: still the migration refusal.
+        assert!(require_isolation_migration(None, "1.80.0", false).is_err());
+        assert!(require_isolation_migration(None, "1.79.3", false).is_ok());
+    }
+
+    #[test]
+    fn fresh_host_allows_unknown_floor_only() {
+        for target in ["1.80.0", "1.81.0", "2.0.0"] {
+            assert!(require_isolation_migration(None, target, true).is_ok());
+            // A recorded legacy floor is never overridden by the fresh fact.
+            assert!(require_isolation_migration(Some("1.79.3"), target, true).is_err());
+        }
+        assert!(require_isolation_migration(Some("invalid"), "1.80.0", true).is_err());
+        assert!(require_isolation_migration(None, "bad", true).is_err());
     }
 }
 
@@ -452,8 +477,16 @@ fn prepare_version(version: &str) -> Result<()> {
 }
 
 fn record_floor(version: &str) -> Result<()> {
+    // atomic_install fsyncs the floor file and its parent before returning,
+    // so the floor is durable before the marker below is touched.
     atomic_install(VERSION_FLOOR, 0o600, |file| { file.write_all(version.as_bytes())?; Ok(()) })?;
     fs::remove_file(VERSION_PENDING)?;
+    // The floor exists durably now, so an interrupted fresh install is
+    // complete. A crash before this removal is harmless: a marker beside a
+    // floor never continues a fresh install, and the next record_floor (or
+    // uninstall) removes it. clear_pending syncs the parent after removing.
+    fresh::clear_pending(Path::new("/"))?;
+    // Persists the VERSION_PENDING removal.
     fs::File::open("/var/lib/duduclaw-protected")?.sync_all()?;
     Ok(())
 }
@@ -516,11 +549,18 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         parse_runtime_tree(true)?;
         return readiness::check(&mut readiness::MissingComposite);
     }
+    // The single authoritative probe, under the lock so no concurrent install,
+    // upgrade or uninstall can change the answer. The lock file and the mode
+    // marker are not residue, so creating them above never changes it. It also
+    // continues an interrupted fresh install from its strictly validated marker.
+    let fresh_host = fresh::host_is_fresh();
     let floor = read_version_file(VERSION_FLOOR)?;
-    if native_migration::run_if_required(floor.as_deref(), version)? {
+    // A fresh host has no earlier data, so there is nothing for G to migrate:
+    // continue with the v1.80 gateway-only protected install.
+    if !fresh_host && native_migration::run_if_required(floor.as_deref(), version)? {
         return readiness::check(&mut readiness::MissingComposite);
     }
-    check_floor(version, false)?;
+    check_floor(version, false, fresh_host)?;
     let executable = fs::canonicalize("/proc/self/exe")?;
     if parents(&executable).and_then(|()| trusted(&executable, false)).is_err() {
         eprintln!("警告：正在執行的程式或其上層目錄可由非 root 帳號修改。首次安裝前必須驗證官方簽章，並從 root 管理的位置執行；這個檢查不能撤回已經以 root 執行的程式。");
@@ -528,6 +568,16 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
             return Err(refused("請先驗證執行檔；確認後才可使用 --i-verified-this-binary"));
         }
     }
+    // The common migration refusals (a source that changes while it is being
+    // read, links, foreign owners, an existing target) happen here, before any
+    // side effect. Preflight does not detect a running source gateway as such.
+    // copy() repeats every check against the live tree.
+    if let Some(source) = options.migrate_from.as_deref() {
+        super::migrate::preflight(source, options.force_migrate)?;
+    }
+    // From here on a failure leaves the account and data behind. The marker
+    // lets a retry continue this fresh install; record_floor removes it.
+    if fresh_host { fresh::mark_pending()?; }
     let (uid, gid) = account()?;
     for dir in ["/opt/duduclaw", "/opt/duduclaw/bin", "/usr/local/libexec", "/usr/local/libexec/duduclaw"] {
         mkdir(dir, 0o755)?;
@@ -568,6 +618,12 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
 pub(super) fn uninstall() -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
+    // The fresh-install marker goes first, on both the coordinated-removal and
+    // the plain path: once a floor or key may be removed, a later install must
+    // not continue an earlier fresh install over retained data. Removing it
+    // only narrows (no marker means "not fresh"), so a later refusal is safe.
+    parents(Path::new(fresh::FRESH_PENDING))?;
+    fresh::clear_pending(Path::new("/"))?;
     for path in layout::BINARIES.iter().copied().chain([
         "/var/lib/duduclaw-updated/state.json", "/opt/duduclaw-isolated/current",
         "/var/lib/duduclaw-protected/uninstall-units",
@@ -579,7 +635,10 @@ pub(super) fn uninstall() -> Result<()> {
         }
     }
     // Validate every removal before stopping anything; never follow a replaced path.
-    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND] {
+    // The fresh-install marker is already gone, so no step below can leave a
+    // marker without the floor that blocks it.
+    let removed = [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND];
+    for file in removed {
         let path = Path::new(file);
         parents(path)?;
         match fs::symlink_metadata(path) {
@@ -589,13 +648,14 @@ pub(super) fn uninstall() -> Result<()> {
         }
     }
     if Path::new(UNIT_PATH).exists() { checked("systemctl", &["disable", "--now", UNIT])?; }
-    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND] {
+    for file in removed {
         match fs::remove_file(file) {
             Ok(()) => (),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
             Err(error) => return Err(error.into()),
         }
     }
+    fs::File::open("/var/lib/duduclaw-protected")?.sync_all()?;
     checked("systemctl", &["daemon-reload"])?;
     println!("已移除服務、執行檔、啟動器與版本下限。資料保留於 /var/lib/duduclaw；根金鑰保留於 /var/lib/duduclaw-protected/root.key；duduclaw 系統帳號保留。");
     Ok(())
@@ -606,36 +666,83 @@ pub(super) fn readiness() -> Result<()> {
     readiness::check(&mut readiness::MissingComposite)
 }
 
-// The privileged update service owns verification, installation and restart.
-// This command only submits a stable version; it never supplies paths or URLs.
+// The route is decided from installed state, under the version lock, before
+// any download or updater request:
+// - updater-managed generation (F state + selector): only duduclaw-updated
+//   verifies, installs and restarts; this command submits a stable version.
+// - v1.80-style single binary (stable floor >= 1.80): the v1.80 in-process
+//   upgrade (protected_linux_upgrade.rs). Kept until the isolation bootstrap
+//   is installable (planned v1.82.0).
+// - anything else (no floor, legacy floor, unreadable floor): G's migration.
+// A failed updater request never falls back to replacing bytes here.
 //
-// MERGE-NOTE: origin/main extended the legacy in-process upgrade (download,
-// byte replacement, launcher/unit refresh via `update_text_if_different`,
-// `invalidate_recovery_bound` + `reload_and_certify_recovery`, then a runtime
-// check). The isolation branch replaced that flow with a request to the
-// privileged updater, which must not be bypassed by replacing bytes from the
-// CLI. The stricter updater handoff is kept; main's `--allow-missing-runtime`
-// runtime check runs as a preflight before the request is submitted. The
-// updater must apply main's unit/launcher refresh and restart-bound
-// certification for updater-managed generations.
+// Pure decision from installed state and the request, taken before account(),
+// the runtime check, any download or any updater IPC. Omitting --version is
+// only meaningful for the in-process path ("latest release").
+fn upgrade_route(managed: bool, floor: Option<&str>, version: Option<&str>) -> Result<in_place::Route> {
+    let route = in_place::route(managed, floor);
+    match (route, version) {
+        (in_place::Route::Updater, None) => Err(refused("請指定 --version x.y.z，或從儀表板檢查並安裝更新。")),
+        (in_place::Route::Migration, None) => Err(refused("請指定 --version x.y.z。")),
+        _ => Ok(route),
+    }
+}
+
+#[cfg(test)]
+mod upgrade_route_tests {
+    use super::{upgrade_route, in_place::Route};
+
+    #[test]
+    fn service_protected_upgrade_updater_route_requires_version_before_side_effects() {
+        // An updater-managed generation without --version stops here, before
+        // account(), check_runtimes() or request_update() can run.
+        for floor in [None, Some("1.79.3"), Some("1.81.0")] {
+            let error = upgrade_route(true, floor, None).unwrap_err().to_string();
+            assert!(error.contains("--version") && error.contains("儀表板"), "{error}");
+            assert_eq!(upgrade_route(true, floor, Some("1.81.0")).unwrap(), Route::Updater);
+        }
+        // Single-binary hosts may omit it (latest); migration hosts may not.
+        assert_eq!(upgrade_route(false, Some("1.80.1"), None).unwrap(), Route::InPlace);
+        assert_eq!(upgrade_route(false, Some("1.80.1"), Some("1.81.0")).unwrap(), Route::InPlace);
+        assert!(upgrade_route(false, None, None).is_err());
+        assert!(upgrade_route(false, Some("1.79.3"), None).is_err());
+        assert_eq!(upgrade_route(false, Some("1.79.3"), Some("1.81.0")).unwrap(), Route::Migration);
+    }
+}
+
 pub(super) async fn upgrade(version: Option<&str>, allow_missing_runtime: bool) -> Result<()> {
-    use duduclaw_isolation::ids::RequestId;
-    use duduclaw_isolation::update::{UpdateRequest, UpdateRequestV1, UpdateResponse, UpdateResponseV1};
-    let requested = version.ok_or_else(|| refused("請指定 --version x.y.z，或從儀表板檢查並安裝更新。"))?;
-    let version = duduclaw_updated::parse_version(requested)
-        .map_err(|_| refused("版本必須是正式版 x.y.z。"))?;
+    if let Some(requested) = version {
+        duduclaw_updated::parse_version(requested).map_err(|_| refused("版本必須是正式版 x.y.z。"))?;
+    }
     gate()?;
     let _lock = version_lock()?;
-    if !managed_install()? {
-        let floor = read_version_file(VERSION_FLOOR)?;
-        if native_migration::run_if_required(floor.as_deref(), requested)? {
-            return readiness::check(&mut readiness::MissingComposite);
+    let managed = managed_install()?;
+    let floor = if managed { None } else { read_version_file(VERSION_FLOOR)? };
+    let route = upgrade_route(managed, floor.as_deref(), version)?;
+    if route == in_place::Route::Migration {
+        if let Some(requested) = version {
+            if native_migration::run_if_required(floor.as_deref(), requested)? {
+                return readiness::check(&mut readiness::MissingComposite);
+            }
         }
+        return Err(refused("無法確認這個安裝的版本下限，未執行升級。"));
     }
     // A configured AI CLI the service account cannot reach refuses the
-    // request unless the operator passed --allow-missing-runtime.
+    // upgrade before anything changes unless --allow-missing-runtime is set.
     let (uid, gid) = account()?;
     check_runtimes(uid, gid, allow_missing_runtime)?;
+    match (route, version) {
+        (in_place::Route::Updater, Some(requested)) => request_update(requested).await,
+        (in_place::Route::InPlace, version) => in_place::run(version).await,
+        _ => Err(refused("請指定 --version x.y.z，或從儀表板檢查並安裝更新。")),
+    }
+}
+
+async fn request_update(requested: &str) -> Result<()> {
+    use duduclaw_isolation::ids::RequestId;
+    use duduclaw_isolation::update::{UpdateRequest, UpdateRequestV1, UpdateResponse, UpdateResponseV1};
+    let version = duduclaw_updated::parse_version(requested)
+        .map_err(|_| refused("版本必須是正式版 x.y.z。"))?;
     let request_id = RequestId(*uuid::Uuid::new_v4().as_bytes());
     let response = tokio::task::spawn_blocking(move ||
         duduclaw_updated::client::request(UpdateRequest::V1(UpdateRequestV1::Apply { version, request_id })))

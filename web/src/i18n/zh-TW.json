@@ -59,6 +59,7 @@
   "settings.update.protected.maintenance": "更新服務需要人工修復，請聯絡管理員。",
   "settings.update.protected.unavailable": "暫時無法確認更新結果；連線恢復後會繼續查詢，請勿重複安裝。",
   "settings.update.protected.refresh": "重新查詢結果",
+  "settings.update.protected.notInstalled": "這台主機沒有可用的獨立更新服務，儀表板無法更新受保護安裝，也沒有送出任何更新要求。請在主機終端機執行下列指令更新：",
   "agent.selection.revoked": "目前無法使用這位 AI 員工，請重新選擇。",
   "settings.update.failure.download": "無法下載更新。請確認網路連線後重新檢查更新。",
   "settings.update.failure.verify": "更新檔驗證未通過，已停止安裝。請重新下載官方版本。",
