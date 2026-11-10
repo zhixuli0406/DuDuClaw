@@ -176,7 +176,7 @@ legal_dispute = ["訴訟", "lawsuit"]  # a new category; list it in excluded_cat
 - **Review approvals.** Approving a quarantined batch or a held claim runs the same check, including facts the person deleted in "My memory"; a refused row stays inactive and records why (`invalidated_by_event = privacy_excluded:<category>` or `privacy_forgotten`, audit event `memory_privacy_approval_blocked`).
 - **Not covered.** Memories stored before this feature are not removed.
 
-**"My memory" (RPCs only; the dashboard page comes later).** Any signed-in dashboard user can call `me.memory.list` and `me.memory.forget`. Both see only facts whose subject is the caller, across every AI employee:
+**"My memory" (dashboard page since v1.81.0).** Staff open **My memory** in the Settings group of the sidebar (`/me/memory`), filter by source or AI employee and delete items they do not want remembered. The page uses two RPCs that any signed-in dashboard user can call: `me.memory.list` and `me.memory.forget`. Both see only facts whose subject is the caller, across every AI employee:
 
 - `user:<dashboard user id>`
 - the caller's WebChat identity

@@ -26,7 +26,7 @@ In `config.toml`:
 enabled = true
 ```
 
-or, as an admin, call `system.update_config` with `{"external_status_enabled": true}`. The setting is read on every request, so no gateway restart is needed.
+or, as an admin, call `system.update_config` with `{"external_status_enabled": true}`. No gateway restart is needed: a dashboard change applies to the next request, and a hand edit of `config.toml` is picked up within 2 seconds (the setting is cached for up to 2 seconds).
 
 ## 2. Each staff member creates their own read-only credential
 

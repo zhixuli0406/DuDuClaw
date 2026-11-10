@@ -1,8 +1,10 @@
-# Linux protected mode: acceptance runbook (v1.81)
+# Linux protected mode: acceptance runbook (planned for v1.82.0)
 
 [繁體中文](zh-TW/linux-protected-acceptance.md) · [日本語](ja-JP/linux-protected-acceptance.md)
 
-This runbook is for release maintainers. It lists what you need, which commands to run, and how to read the results for the native Linux protected-mode acceptance of v1.81: Personal and Shared employees, connectors, and the Package H tools.
+> **Status: planned for v1.82.0, not available in v1.81.0.** The per-employee Linux isolation this runbook accepts cannot be installed on a customer host in v1.81.0. In v1.81.0 the protected service installs, updates and runs employees as in v1.80.
+
+This runbook is for release maintainers. It lists what you need, which commands to run, and how to read the results for the native Linux isolation acceptance planned for v1.82.0: Personal and Shared employees, connectors, and the Package H tools.
 
 > **These harnesses cannot get past setup yet.** `connectors-acceptance.sh`, `package-h-acceptance.sh` and the `iso_personal_chain` / `iso_package_h_chain` tests need the isolation components (spawnd, egress, the separate updater) installed and running. `duduclaw service install --protected-linux` does not install them; it installs only the single-binary protected gateway (see [Single-binary protected service](linux-protected-service.md#single-binary-protected-service-current-releases)). Until the isolation fresh bootstrap lands (planned v1.82.0), expect every run to stop during setup. That outcome is not an acceptance result for the employee, connector or Package H features.
 

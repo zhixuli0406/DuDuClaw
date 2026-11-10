@@ -1,10 +1,18 @@
-# Native Linux protected mode (v1.81)
+# Native Linux protected mode (planned for v1.82.0)
+
+> **Status: planned for v1.82.0, not available in v1.81.0.** The code is included in v1.81.0, but it cannot be installed or enabled on a customer host yet.
+>
+> What v1.81.0 does instead: `sudo duduclaw service install --protected-linux` installs the single-binary protected service as in v1.80, and `sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux` updates it. AI employees are created and run exactly as in v1.80. See [Single-binary protected service](../guides/linux-protected-service.md#single-binary-protected-service-current-releases).
+>
+> Everything below (the Settings management page, Personal and Shared employees, per-employee connector accounts, retire and restore, the migration from v1.79.3) describes the planned release.
 
 Protected mode runs every AI employee under its own account in its own execution environment on a native Linux host. Conversations, memory, files, connections and permissions stay with that employee, and the gateway's own account is never lent to it. When the isolation service or a trusted policy is missing, the employee's work is refused instead of falling back to the gateway account.
 
 The feature is off by default and only available in the Enterprise edition. Installations that do not use it behave as before. It has not yet been accepted on real Linux hosts (see [What still needs a real host](#what-still-needs-a-real-host)).
 
-## Turning it on
+## Turning it on (planned for v1.82.0)
+
+These steps apply once the isolation components can be installed. On v1.81.0 they stop at step 1: the installer sets up only the single-binary protected service, readiness does not report the isolation as ready, and the management page does not appear.
 
 1. Install the protected service on a supported host (Ubuntu 22.04, Ubuntu 24.04 or Debian 12; x86_64 or ARM64) with `sudo duduclaw service install --protected-linux`. Steps are in the [protected service guide](../guides/linux-protected-service.md).
 2. Run `sudo duduclaw service readiness --protected-linux`. In the dashboard, the readiness banner names what blocks protected work (account or connection setup unfinished, authorization revoked, service temporarily unavailable) and shows a support reference.

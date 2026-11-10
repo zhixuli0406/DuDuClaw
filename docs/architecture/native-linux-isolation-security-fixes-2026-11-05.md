@@ -1,10 +1,12 @@
 # Native Linux isolation security fixes — rounds 1–3, 2026-11-05
 
-**2026-11-09 補註：**本文是 2026-11-05 當時的紀錄，其中「仍未完成」的 boot caller、Google requester／非 OAuth 來源、背景入口等項目已在 v1.81 整合分支接上（見工具矩陣與工作分解頁）；原生實機與真實供應商驗收仍未執行。
+> **發行狀態：** 本文描述的原生 Linux 隔離架構預計 v1.82.0 提供。程式碼已包含在 v1.81.0，但客戶主機還無法安裝或啟用；v1.81.0 的受保護服務照 v1.80 的方式執行員工。
 
-**狀態（2026-11-05 當時）：PARTIAL／NO-GO。** Round 3 接續本 worktree 未提交的 rounds 1–2，保留在 `feat/iso-secfix-20261105`，沒有 commit。Connector 具體 executor 原始碼已覆蓋 **62／62**；四個先前缺少的 finite adapters 已有受限實作；Spawnd 已有 authorized-workspace hookup。正式 boot caller、Google 完整 requester／非 OAuth 路徑、所有 Service／背景入口及原生整合驗收仍未完成。缺件拒絕不是功能驗收。依交辦未在本機建置 gateway／CLI，不能宣稱整棵 workspace 編譯通過。
+**2026-11-09 補註：**本文是 2026-11-05 當時的紀錄，其中「仍未完成」的 boot caller、Google requester／非 OAuth 來源、背景入口等項目已在 v1.81.0 的程式碼中接上（見工具矩陣），但整套架構尚未啟用；原生實機與真實供應商驗收仍未執行。
 
-依據為 round-1 MCP boundary 與 egress/parse reviews（`20261105-131141-codex-75237-219.md`、`20261105-130643-codex-75237-217.md`）及 design §6。本文件保留於 docs，僅記錄安全邊界、修補狀態與驗證，不收錄操作性攻擊重現。逐工具狀態見 [tool matrix](native-linux-isolation-tools.md)。
+**狀態（2026-11-05 當時）：PARTIAL／NO-GO。** Round 3 接續 rounds 1–2 尚未合併的變更。Connector 具體 executor 原始碼已覆蓋 **62／62**；四個先前缺少的 finite adapters 已有受限實作；Spawnd 已有 authorized-workspace hookup。正式 boot caller、Google 完整 requester／非 OAuth 路徑、所有 Service／背景入口及原生整合驗收仍未完成。缺件拒絕不是功能驗收。這一輪沒有在開發機建置 gateway／CLI，不能宣稱整個 workspace 編譯通過。
+
+依據為 round-1 MCP boundary 與 egress/parse 的安全審查及 design §6。本文件保留於 docs，僅記錄安全邊界、修補狀態與驗證，不收錄操作性攻擊重現。逐工具狀態見 [tool matrix](native-linux-isolation-tools.md)。
 
 ## Round 3 已落地
 
@@ -45,11 +47,11 @@ Memory 額外補上 `decay.rs`／`lifecycle.rs` 的窄範圍交易：取得 engi
 
 `SpawndBackend::with_workspace_bridge` 新增 `spawn_authorized` hookup。可信 `RootWorkspaceBridge` receipt 綁定 reservation／employee／runtime／workspace handle／relative cwd，保留實際 directory 與 root generation lease；token 對實際目錄驗證，input、IPC／TakeIo、status／wait 都重查，sticky revocation monitor 取消 run。**未改 A execution producers 或 IPC v1**。預設 `connect()` 沒有 bridge，仍拒絕 protected workspace plans；production root receipt producer／mount pin／cleanup receipt 仍由 B/H integration 提供。
 
-一般獨立 code review 已發現並回修 source-lock recursion、recheck 隱式 migration、channel wrong-home／Personal substitution、DB directory anchor、LINE token grammar 與送出後結果等問題；追加檢查 finite SQL／reminder 後，已讀的新 patch 未留下 HIGH／CRITICAL。這不是 Daybreak clearance，也不是完整 Service 覆蓋證明。
+一般獨立 code review 已發現並回修 source-lock recursion、recheck 隱式 migration、channel wrong-home／Personal substitution、DB directory anchor、LINE token grammar 與送出後結果等問題；追加檢查 finite SQL／reminder 後，已讀的新 patch 未留下 HIGH／CRITICAL。這不是指定安全審查的放行結果，也不是完整 Service 覆蓋證明。
 
 ## Round 3 實際驗證
 
-全部使用 `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`；沒有 cargo fmt、gateway／CLI 本機 build、commit、merge、release 或部署。原 worktree 與 rounds 1–2 未提交變更保留；本 session 沒有新增 worktree。
+全部使用 `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`；這一輪沒有 cargo fmt、gateway／CLI 本機 build、merge、release 或部署，rounds 1–2 的變更保留不動。
 
 | 驗證 | 實際結果與邊界 |
 | --- | --- |
@@ -63,18 +65,11 @@ Memory 額外補上 `decay.rs`／`lifecycle.rs` 的窄範圍交易：取得 engi
 | 全部已修改／新增 Rust 語法 | 174 files syn parse passed；僅語法，不是全 crate 型別檢查。 |
 | 差異檢查 | `git diff --check` passed。 |
 
-Google Home readonly selection 新增了真實 owner module 的 regression test，但依禁止本機 gateway build 的交辦，此測試本輪**未型別編譯／執行**。CLI readiness／parity source 亦未跑完整 CLI suite；不能用 fixture harness 取代完整 crate build。
+Google Home readonly selection 新增了真實 owner module 的 regression test，但這一輪不在開發機建置 gateway，此測試**未型別編譯／執行**。CLI readiness／parity source 亦未跑完整 CLI suite；不能用 fixture harness 取代完整 crate build。
 
-原始紀錄：
+各項測試的原始輸出保留在開發紀錄，不收錄於公開文件。
 
-- `/private/tmp/iso-sec-r3-boundary.log`、`iso-sec-r3-boundary-linux.log`
-- `/private/tmp/iso-sec-r3-memory-all-tests.log`、`iso-sec-r3-memory-parent-final.log`
-- `/private/tmp/iso-sec-r3-execution-tests.log`、`iso-sec-r3-execution-linux.log`
-- `/private/tmp/iso-sec-r3-db-all.log`、`iso-sec-r3-connectors-tests.log`
-- `/private/tmp/iso-sec-r3-service-tests.log`、`iso-sec-r3-service-handoff.md`
-- `/private/tmp/iso-sec-r3-google-boot-harness.log`、`iso-sec-r3-syntax.log`
-
-Linux acceptance 重新執行 SSH check，遭 sandbox 拒絕（`Operation not permitted`；`iso-sec-r3-linux-host-check.log`）。指定 `gpt-daybreak-blue-latest` 只讀審查再次因 in-process app-server client 初始化被拒絕，沒有可用審查結果（`iso-sec-r3-daybreak.log`）。未嘗試繞過環境限制。一般 code review 的回修／追加檢查不等於 Daybreak GO。
+這一輪無法連到 Linux 驗收主機，因此沒有做 Linux 實機驗收。指定的唯讀安全審查也因審查環境無法啟動而沒有結果。未嘗試繞過環境限制。一般 code review 的回修／追加檢查不等於指定安全審查放行。
 
 ## Round 2 已落地（歷史紀錄）
 
@@ -135,7 +130,7 @@ Execution backend 新增 authorized-workspace 介面，須檢查實際 backend r
 | Background durable authority | Reminder 現在重啟／原 capability 過期即拒絕；如產品要繼續執行，仍需 host 重新核准的 durable authority，不能序列化舊 request 當有效憑證。其他延後工作的 scope 必須逐一核對。 |
 | Execution production receipt | Hookup／測試已落地；B/H 真正 root receipt producer、實際 work mount 與 generation pin／cleanup readback 未接。只加接點，未修改另一套件的 A producers；預設仍拒絕。 |
 | Installer bootstrap／upgrade | 初次安裝 recorded-state 接點、跨版本 runtime tree 的停服與更新協調；Linux root-owned tree／systemd sentinel 驗收。 |
-| 整合與安全驗收 | 在允許的 Linux host 完整 build gateway／CLI，執行真 provider、FD／openat2、撤銷／transport、root cleanup 與跨 run egress tests；完整 Service 審查及指定 Daybreak review。 |
+| 整合與安全驗收 | 在允許的 Linux host 完整 build gateway／CLI，執行真 provider、FD／openat2、撤銷／transport、root cleanup 與跨 run egress tests；完整 Service 審查及指定的安全審查。 |
 
 Finite `goals_list`／`list_reminders`／`responsibility_get` 與受限 `db_query` 已不再列為缺 executor 的 startup blocker；每個 call 仍須實際資源解析與 adapter 的語法／範圍檢查。複雜有限 SQL 拒絕，EmployeeScope 不擴權。Round 2 的 50／62 數字及下方測試表是歷史紀錄，未列作 round-3 重跑證據。
 
@@ -157,7 +152,7 @@ Cargo 使用 `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`；未執行 cargo fmt、ga
 | Connector actual-source harness | 26 focused tests passed；涵蓋實際 selection／DB／Odoo 與 CLI Odoo source slice；並型別檢查 search adapter。未連接真實 provider。 |
 | Odoo | 新增 2 authority tests passed。較早完整 suite 為 154 passed／1 failed；既有 localhost socket bind 被 sandbox 拒絕。另一整體 harness 的 4 pool tests 也因此失敗，不能報整套通過。 |
 | Service actual-source harness | 167 tests passed；涵蓋實際 storage／HTTP／canvas／goals／plans 等選定模組，不是完整 gateway。 |
-| CronStore actual-source harness | 14 tests passed；含有限 owner／grant 查詢、mutex 等待撤銷、兩個 SQLite 連線的 busy 等待撤銷與未發布寫入。 |
+| CronStore actual-source harness | 14 tests passed；含有限 owner／grant 查詢、mutex 等待撤銷、兩個 SQLite 連線的 busy 等待撤銷，以及撤銷後不提交寫入。 |
 | Worker gateway adapter harness | macOS 3 tests passed；Linux `--tests` typecheck passed。 |
 | Parse worker | macOS 9 tests passed；Linux `--tests` typecheck passed。新增 3 個 Linux transport 測試只有編譯，未執行。 |
 | Runtime tree helper | 12 Python tests passed；不等於 root／systemd 驗收。 |
@@ -165,18 +160,9 @@ Cargo 使用 `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`；未執行 cargo fmt、ga
 | Execution crate | `--lib` check passed；不代表 production authorized backend 已完成。 |
 | 最終語法／差異檢查 | 110 個修改／新增 Rust 檔 syn syntax parse 通過；`git diff --check` 通過。語法檢查不是型別檢查。 |
 
-本輪主要原始記錄位於 `/private/tmp/`：
+本輪各項測試的原始輸出保留在開發紀錄，不收錄於公開文件。Round 1 的 capability／egress／engine 測試紀錄也不列作本輪重跑證據。
 
-- `iso-sec-r2-boundary.log`、`iso-sec-r2-boundary-linux.log`
-- `iso-round2-memory-all-tests.log`、`iso-round2-service-harness-tests.log`
-- `iso-sec-r2-db-final.log`、`iso-sec-r2-connectors-final.log`、`iso-sec-r2-odoo-authority-tests.log`、`iso-sec-r2-cron-tests.log`
-- `iso-sec-r2-worker-harness.log`、`iso-sec-r2-worker-linux.log`、`iso-sec-r2-execution-check.log`
-- `iso-sec-r2-syntax-final.log`
-- `iso-sec-parse-r2-tests.log`、`iso-sec-parse-r2-linux.log`、`iso-sec-runtime-tree-r2.log`、`iso-sec-installer-r2-check.log`
-
-Round 1 的 capability／egress／engine 測試紀錄仍保留於原 `/private/tmp/iso-sec-*final*.log`，不列作本輪重跑證據。
-
-Linux acceptance 的 SSH check 遭目前 sandbox 拒絕，本輪沒有繞過。指定 `gpt-daybreak-blue-latest` 審查的 app-server 初始化也遭 sandbox 拒絕（`iso-sec-r2-daybreak.log`）。一般 code reviewer 已複核並修正本輪發現的型別、scope、provider 與交易問題，但不是 Daybreak GO，也不取代原生驗收。
+這一輪無法連到 Linux 驗收主機，沒有繞過。指定的安全審查環境同樣無法啟動。一般 code reviewer 已複核並修正本輪發現的型別、scope、provider 與交易問題，但不是指定安全審查放行，也不取代原生驗收。
 
 ## Round 3 主要新增／修改檔群
 

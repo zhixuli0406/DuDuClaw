@@ -18,7 +18,7 @@ Open **My team → Team conversations**, or choose **View conversations** beside
 
 Each conversation open is recorded. Changing filters, refreshing or receiving a refusal clears displayed content; returning focus refreshes the reporting scope. A failed request shows an error instead of keeping an earlier transcript. An opaque load-more cursor is passed back unchanged.
 
-Administrators find **Organisation settings → Manager conversation access** on **User Management**. Inform staff before enabling it; turning it off and on starts a new time boundary. The adjacent AI-detection shortcut opens the existing redaction settings. A notice below the WebChat composer and an eye on the staff selector appear only when the gateway says that this person’s conversation with that AI staff member can be read by a manager.
+Administrators find **Manager conversation access** in the **Organisation settings** card on Manage → Advanced → **Members**. Inform staff before enabling it; turning it off and on starts a new time boundary. The adjacent AI-detection shortcut opens the existing redaction settings. A notice below the WebChat composer and an eye on the staff selector appear only when the gateway says that this person’s conversation with that AI staff member can be read by a manager.
 
 ### Who viewed my conversations
 
@@ -27,6 +27,14 @@ Every Enterprise account, including an Employee, can open **Settings → Who vie
 The records remain available when manager viewing is switched off or the reporting relationship changes. This is a record of the dedicated team-history entry point, not a complete account of older administrative reading paths. Only `team_history_viewed` with this account as the WebChat report is supported; screen-status events and unknown event types do not become view receipts.
 
 Choose **Load more** for earlier pages. Each call scans at most 4 MiB / 10,000 audit lines and returns at most 100 own receipts (the page requests 50). A page may contain no matches while an earlier page remains available. There is no global/hidden count. Opaque cursors are bound to the account and home, expire after ten minutes and stop working after a gateway restart or an audit snapshot change; refresh to start again. The independent receipt-list quota is 300 calls per account per hour. At most two reads run at once; a busy, corrupt, truncated or unreadable log shows an error rather than “no views.” Local log removal or archiving limits historical coverage. This bounded reader checks scanned chain links; it is not a full-file forensic verification or proof against same-OS-user log modification.
+
+## Archived conversations and restore (v1.81.0)
+
+Team conversations also list conversations that were archived after a period without activity (default 30 days, set in the same **Organisation settings** card) and mark them **Archived**. The time boundary and the usual permission checks still apply. An Admin, or a manager who can currently see that conversation, can press **Restore** to bring it back to the normal list (`users.team_history.restore`, audit event `team_history_session_restored`).
+
+Conversations that staff or customers cleared themselves (`/new`, a channel reset) are never shown to managers: they do not appear in Team conversations and cannot be read or restored there, even after they are restored. Conversations cleared with `/new` in an earlier version are treated the same way after the upgrade.
+
+The **Team conversations start date** (`team_history_since`, between 2020-01-01 and today) sets from when managers can read. Moving it earlier requires the Admin's current password (plus a two-step code when enabled), and every change is audited as `team_history_since_changed`. See [Dashboard settings](../guides/dashboard-settings.md#how-saving-works).
 
 ## The switch and time boundary
 

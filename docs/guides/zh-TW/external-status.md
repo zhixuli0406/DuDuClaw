@@ -26,7 +26,7 @@
 enabled = true
 ```
 
-或由管理員呼叫 `system.update_config`，參數 `{"external_status_enabled": true}`。設定每次查詢都會重新讀取，不需要重啟 gateway。
+或由管理員呼叫 `system.update_config`，參數 `{"external_status_enabled": true}`。不需要重啟 gateway：在儀表板變更，下一次查詢即生效；直接修改 `config.toml` 則在 2 秒內生效（設定最多快取 2 秒）。
 
 ## 2. 同仁建立自己的唯讀憑證
 

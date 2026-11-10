@@ -1,7 +1,9 @@
 # Native Linux MCP resource routes (security revision, 2026-11-05)
 # Native Linux tool dispositions — I1b round 6 (v1.80.0)
 
-**Status 2026-11-09 (v1.81 integration branch): every tool in this inventory is routed, refused with a stated reason, or gated off by default.** Employee permissions remain the product contract; missing adapters are startup failures, not newly acceptable product restrictions. The endpoint invokes `require_complete_services()` before admitting MCP traffic, and production boot now installs the connector stack (F1), the work broker and spawnd feature source (W1) and the recording job store (SFR). What is still open is acceptance on a real Linux host (Ubuntu 22.04/24.04, Debian 12 as root) and with real provider accounts; the inventory tests use discovery doubles and do not prove provider execution.
+> **Release status:** the isolation architecture described here is planned for v1.82.0. Its code is included in v1.81.0 but cannot be installed or enabled on a customer host; v1.81.0 runs the single-binary protected service as in v1.80.
+
+**Status 2026-11-09 (code included in v1.81.0, not enabled): every tool in this inventory is routed, refused with a stated reason, or gated off by default.** Employee permissions remain the product contract; missing adapters are startup failures, not newly acceptable product restrictions. The endpoint invokes `require_complete_services()` before admitting MCP traffic, and production boot now installs the connector stack (F1), the work broker and spawnd feature source (W1) and the recording job store (SFR). What is still open is acceptance on a real Linux host (Ubuntu 22.04/24.04, Debian 12 as root) and with real provider accounts; the inventory tests use discovery doubles and do not prove provider execution.
 
 Disposition summary:
 
@@ -222,7 +224,7 @@ Existing scope, allowed/denied tools, permissions, approvals, record/audience, e
 | Existing Admin/operator gate | The original employee policy decides access. |
 | HostAuthority | A run cannot control or observe the host desktop, devices, power, network configuration or local model services. |
 | Missing adapter | Boot fails; this is unfinished parity, not an intentional tool restriction. |
-| ProposalRequired | v1.81 protected mode: `create_agent` is refused; a protected employee exists only through an approved Employee proposal and its root allocation. |
+| ProposalRequired | Isolation architecture (planned for v1.82.0): `create_agent` is refused; a protected employee exists only through an approved Employee proposal and its root allocation. |
 | ForkNextRelease | v1.80.0 protected TEAM only: `fork_run`, `merge_or_select`, `terminate_branch` are deferred until fresh child capability/account/budget authority and immutable result apply are complete. Non-protected installations retain their existing behavior. |
 
 `Refused: HostAuthority`, `Refused: ProposalRequired` and `Refused: ForkNextRelease` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.

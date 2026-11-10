@@ -23,15 +23,15 @@
 
 儀表板放在路徑前綴下時，請在 `config.toml` 設定 `[dashboard] public_url = "https://host/agents"`，網址必須包含路徑。nginx 範例：`location /agents/ { proxy_pass http://127.0.0.1:18889/; }`；Google Cloud 請登記 `https://host/agents/api/me/google/callback`（遠端 MCP 使用 `https://host/agents/oauth/mcp/callback`）。只有公開網址與瀏覽器已驗證的儀表板 origin 相同時，OAuth 才會套用這個前綴；區網存取與貼回網址流程維持原行為。升級至包含此修正的版本並更新已登記的回呼網址後，可移除 v1.79.1 為無前綴 `/api/me/google/callback` 與 `/me/connections` 加上的 nginx 暫時規則。
 
-企業版設定（v1.76.0，成員管理 → 組織設定）：`users.org_settings.get/update` 管理 `[people] manager_team_history`，有效設定檔預設開，變更立即生效；重新開啟會重設時間窗，進階編輯器也列為受保護稽核鍵。開啟前請先告知職員。見[主管唯讀團隊對話](../../features/zh-TW/68-manager-team-history.md)。
+企業版設定（v1.76.0，管理 → 進階設定 → 成員頁的「組織設定」卡片；成員頁只在企業版提供）：`users.org_settings.get/update` 管理 `[people] manager_team_history`，有效設定檔預設開，變更立即生效；重新開啟會重設時間窗，進階編輯器也列為受保護稽核鍵。開啟前請先告知職員。見[主管唯讀團隊對話](../../features/zh-TW/68-manager-team-history.md)。
 
-對話保存（v1.81.0，RM-173，成員管理 → 組織設定，管理員）：同一組 RPC 也讀寫 `[sessions] archive_after_days`（「對話多久沒有動靜就收起」，預設 30 天，0＝不收起，最多 3650）與 `[sessions] purge_after_days`（「收起後多久清除內容」，預設 0＝永不清除，從收起當下起算，最多 3650）。不用重啟：每 6 小時的整理工作每次都重新讀取；設定檔讀不到或數值不正確時照預設收起、絕不清除。兩個鍵在進階編輯器也是受保護稽核鍵，超出 0–3650 會被擋下。收起的對話不在一般清單，但有新訊息就會自動回來；同仁可在 WebChat 歷史對話選單的「已收起的對話」還原自己的對話（`chat.sessions.restore`），主管在「團隊對話」還原（`users.team_history.restore`）。「團隊紀錄起算時間」（`team_history_since`，2020-01-01 到現在）決定主管從何時起看得到；往前調會讓主管看到更早的對話，需要再輸入管理員自己的登入密碼（啟用兩步驟驗證時另需驗證碼），每次變更都記錄稽核事件 `team_history_since_changed`。升級提醒：舊版固定為 3 天收起、收起 90 天後刪除。
+對話保存（v1.81.0，企業版，管理 → 進階設定 → 成員頁的「組織設定」卡片，管理員）：同一組 RPC 也讀寫 `[sessions] archive_after_days`（「對話多久沒有動靜就收起」，預設 30 天，0＝不收起，最多 3650）與 `[sessions] purge_after_days`（「收起後多久清除內容」，預設 0＝永不清除，從收起當下起算，最多 3650）。不用重啟：每 6 小時的整理工作每次都重新讀取；設定檔讀不到或數值不正確時照預設收起、絕不清除。兩個鍵在進階編輯器也是受保護稽核鍵，超出 0–3650 會被擋下。收起的對話不在一般清單，但有新訊息就會自動回來；同仁可在 WebChat 歷史對話選單的「已收起的對話」還原自己的對話（`chat.sessions.restore`），主管在「團隊對話」還原（`users.team_history.restore`）。「團隊紀錄起算時間」（`team_history_since`，2020-01-01 到現在）決定主管從何時起看得到；往前調會讓主管看到更早的對話，需要再輸入管理員自己的登入密碼（啟用兩步驟驗證時另需驗證碼），每次變更都記錄稽核事件 `team_history_since_changed`。升級提醒：舊版固定為 3 天收起、收起 90 天後刪除。
 
 這份文件列出 v1.68.0 起可以在儀表板設定的項目：在哪一頁、寫到哪個設定鍵、存檔後是否要重啟 gateway。最後一節說明「設定檔進階編輯」，用來修改沒有專屬控制項的鍵。
 
 英文版：[../dashboard-settings.md](../dashboard-settings.md)　日文版：[../ja-JP/dashboard-settings.md](../ja-JP/dashboard-settings.md)
 
-**保護模式公開網頁（原生 Linux 保護模式，目前僅能透過設定檔）：** AI 員工在保護模式下的執行是否可使用 `web_fetch_cached` 與 `web_extract`，須依員工在 `agents/<id>/agent.toml` 設定 `[isolation] public_web = true`（預設 `false`，不可存取網頁）。目前儀表板沒有對應控制項：請直接編輯該檔案，或使用管理員設定編輯器（`agent:<id>`），該編輯器會將此鍵列為受保護變更。員工表單的鍵值編輯器會拒絕 `[isolation]` 區段，非管理員的 `agents.update` 無法變更它，員工自行編輯檔案中的該區段也會被拒絕。此開關與員工表單的**網路存取**（`[container] network_access`）互相獨立，後者仍只控制任務沙箱的網路。即使啟用，保護模式下的擷取也只能連到公開的 HTTPS 網站（不可使用 IP 位址、內部名稱或重新導向）。未處於保護模式的安裝會忽略此鍵。
+**保護模式公開網頁（原生 Linux 隔離架構，預計 v1.82.0 提供；僅能透過設定檔）：** AI 員工在保護模式下的執行是否可使用 `web_fetch_cached` 與 `web_extract`，須依員工在 `agents/<id>/agent.toml` 設定 `[isolation] public_web = true`（預設 `false`，不可存取網頁）。目前儀表板沒有對應控制項：請直接編輯該檔案，或使用管理員設定編輯器（`agent:<id>`），該編輯器會將此鍵列為受保護變更。員工表單的鍵值編輯器會拒絕 `[isolation]` 區段，非管理員的 `agents.update` 無法變更它，員工自行編輯檔案中的該區段也會被拒絕。此開關與員工表單的**網路存取**（`[container] network_access`）互相獨立，後者仍只控制任務沙箱的網路。即使啟用，保護模式下的擷取也只能連到公開的 HTTPS 網站（不可使用 IP 位址、內部名稱或重新導向）。未處於保護模式的安裝會忽略此鍵。
 
 目標費用與重複呼叫防護目前在「設定檔進階編輯」設定，沒有獨立的自動化控制項。`config.toml [goal_loop]` 的 `default_cost_cap_cents = 0` 是未設定個別上限的目標所使用的美分上限（`0`＝不限額）；`tool_streak_pause = 8` 表示一輪結束後，相同工具與參數連續呼叫達此次數就暫停（`0`＝關閉）。透過進階編輯器儲存會重新載入目標迴圈；直接修改 `config.toml` 則需重新啟動 gateway。`tool_streak_advisory` 另行控制既有提醒。個別上限可在交辦目標時填寫；`/goals` 顯示費用，並讓有權限的操作者提高暫停目標的上限後重試。
 
@@ -380,7 +380,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 **誰能存檔（v1.76.0，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔v1760)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 
-**權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
+**權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。`can_create_agents` 例外：從 v1.81.0 起，沒寫這個鍵時只有 `main` 員工視為 `true`，其他員工視為 `false`；v1.68 的開機遷移不再替非 main 員工打開它；透過 MCP `create_agent` 建立的員工一律為 `false`（見[安全防線](../../features/zh-TW/05-security-defense.md)）。這頁的開關在缺少這個鍵時會顯示為開啟，即使實際值是關閉；請查看 `agent.toml`，或明確設定開關。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
 
 ## 管理 → 成員：直屬主管與組織圖（企業版，1.76.0）
 
@@ -672,7 +672,7 @@ email_relay = true
 
 #### 安裝金鑰與授權控制台核准
 
-每個安裝都有自己的 Ed25519 金鑰，存於 `<home>/state/installation.key`（32 bytes 種子，與代寄憑證相同的僅限擁有者存取保護），與 `identity.key` 分開。只有檔案不存在時才會建立：執行 `duduclaw license activate`、授權更新（gateway 自動更新或 `duduclaw license refresh`），或執行 `duduclaw license installation-key` 時。無法讀取、格式錯誤或不安全的檔案（擁有者或權限不符、符號連結、多重硬連結、擴充 ACL）只會回報錯誤，絕不覆寫；修正或還原前代寄維持不可用。AI 員工無法透過檔案守門讀取 `state/` 下的任何檔案。備份資料目錄時請一併保留此金鑰。
+每個安裝都有自己的 Ed25519 金鑰，存於 `<home>/state/installation.key`（32 bytes 種子，與代寄憑證相同的僅限擁有者存取保護），與 `identity.key` 分開。只有檔案不存在時才會建立：從 CLI 啟用授權、授權更新（gateway 自動更新或 `duduclaw license refresh`），或執行 `duduclaw license installation-key` 時。無法讀取、格式錯誤或不安全的檔案（擁有者或權限不符、符號連結、多重硬連結、擴充 ACL）只會回報錯誤，絕不覆寫；修正或還原前代寄維持不可用。AI 員工無法透過檔案守門讀取 `state/` 下的任何檔案。備份資料目錄時請一併保留此金鑰。
 
 授權更新與換綁請求會以 `installation_pubkey` 送出公鑰。授權內含相同的已簽章公鑰後才能代寄。授權服務未見過的金鑰會在授權控制台建立待核准申請，並通知帳號擁有者。等待核准期間付費功能照常運作，SMTP 也仍可寄送驗證碼，只有代寄需要等待。每個既有安裝都要核准一次。
 
