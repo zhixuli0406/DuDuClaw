@@ -18,7 +18,12 @@ static REQUIRED: AtomicBool = AtomicBool::new(false);
 /// promotion). Only then can isolation become required for this composite.
 static TEAM_SEEN: AtomicBool = AtomicBool::new(false);
 /// L1: isolation became required after [`initialize`] decided it was not.
-/// Latched until restart; admission is refused meanwhile.
+/// Once set it is never cleared, and admission is refused while it applies.
+/// A live TEAM promotion that calls `initialize(true)` after the fact appeared
+/// sets [`REQUIRED`] instead; the late check then no longer applies (it only
+/// covers an uninitialised readiness), and admission falls to the normal
+/// readiness gate, which is still fail closed: no isolation backend is
+/// connected after boot ([`connect_backend`] runs only at trusted boot).
 static LATE_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 const NOT_READY: &str = "ISOLATION_NOT_READY: 受保護團隊的隔離服務尚未就緒，請由管理員檢查服務狀態。";
@@ -217,7 +222,11 @@ fn admit(required: bool, components: Option<Components>) -> Result<(), String> {
 /// `execution_gate::isolation_required` re-reads the facts every
 /// `OFF_CACHE_WINDOW`. If isolation becomes required later (a fact published
 /// by a bootstrap while this gateway runs), readiness was never initialised:
-/// no update probe, no backend. Fail closed until restart and say so once.
+/// no update probe, no backend. Fail closed and say so once. The latch is
+/// never cleared, but a later live TEAM promotion (`initialize(true)`) sets
+/// the readiness latch, after which this check no longer applies; admission
+/// then goes through the normal readiness gate, still fail closed because no
+/// backend is connected after boot.
 /// `initialised`: the readiness latch is set (normal path, nothing to do).
 /// `team_seen`: a Linux TEAM edition was resolved. `applies_now` is consulted
 /// only when the answer is not already decided.
@@ -347,7 +356,7 @@ mod tests {
         // TEAM single-binary host, isolation still not installed: v1.80 path.
         assert!(!late_requirement(&latch, false, true, || false));
         assert!(!latch.load(Ordering::Acquire));
-        // A fact appeared after boot: refused, and latched until restart.
+        // A fact appeared after boot: refused, and latched (never cleared).
         assert!(late_requirement(&latch, false, true, || true));
         assert!(latch.load(Ordering::Acquire));
         assert!(late_requirement(&latch, false, true, || false), "never reopens");

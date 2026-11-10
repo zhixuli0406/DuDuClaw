@@ -560,8 +560,20 @@ fn protection() -> RestoreProtection {
     else { RestoreProtection::Off }
 }
 
-/// L3: the archive's restore root carries no isolation state, or the refusal.
-fn archive_isolation_refusal(root: &Path) -> Result<(), &'static str> {
+pub use isolation_state::IsolationEntry;
+
+/// L3: which archive entries [`archive_isolation_refusal`] reads, for a
+/// caller that extracts selectively (`duduclaw import`). `path` is relative
+/// to the restore root.
+pub fn archive_isolation_entry(path: &Path) -> IsolationEntry {
+    isolation_state::entry_kind(path)
+}
+
+/// L3: the archive's restore root carries no isolation state, or the refusal
+/// ([`PROTECTED_RESTORE_ISOLATION_STATE`] / [`PROTECTED_RESTORE_ISOLATION_UNKNOWN`]).
+/// The one inspection used by the dashboard restore and `duduclaw import` on a
+/// protected single-binary host.
+pub fn archive_isolation_refusal(root: &Path) -> Result<(), &'static str> {
     match isolation_state::inspect(root) {
         isolation_state::ArchiveIsolation::Absent => Ok(()),
         isolation_state::ArchiveIsolation::Present => Err(PROTECTED_RESTORE_ISOLATION_STATE),

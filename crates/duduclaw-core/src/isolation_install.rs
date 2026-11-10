@@ -31,7 +31,7 @@
 //! isolation path; until then employees run single-binary. It must stop the
 //! gateway and pass the processes-clear check before publishing the first
 //! fact (a running gateway decided readiness at boot; if it sees a fact
-//! later it refuses employee work until restart, see
+//! later it refuses employee work, fail closed, see
 //! `isolation_readiness::late_requirement`). Once true, the answer latches
 //! for the life of the process, so it only ever narrows. Only Linux consults
 //! the system paths; elsewhere the architecture does not exist and the answer
@@ -102,8 +102,11 @@ pub const FACTS: &[&str] = &[
 
 /// What a v1.80-style single-binary protected install writes or uses (see
 /// `duduclaw-cli` `protected_linux_install::install` without published
-/// isolation components). None of these, nor any path below them other than
-/// the explicit isolation binaries, is a fact.
+/// isolation components). None of these paths is itself a fact, but some
+/// facts live below them: the isolation binary `/opt/duduclaw/bin/duduclaw-egress`
+/// and the durable migration import manifest [`DURABLE_IMPORT_MANIFEST`]
+/// (`/etc/duduclaw/migration-import.json`). Any other path below them is not
+/// a fact.
 #[doc(hidden)]
 pub const SINGLE_BINARY_LAYOUT: &[&str] = &[
     crate::protected_mode::MODE_MARKER,
