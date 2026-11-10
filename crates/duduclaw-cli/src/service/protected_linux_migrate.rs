@@ -137,11 +137,7 @@ fn tree(source: &File, destination: &Path, uid: u32, gid: u32, source_uid: u32, 
             io::copy(&mut input, &mut target)?;
             let after = input.metadata()?;
             source_owner(&after, source_uid)?;
-            if metadata.len() != after.len() || metadata.mtime() != after.mtime()
-                || metadata.mtime_nsec() != after.mtime_nsec() || metadata.ctime() != after.ctime()
-                || metadata.ctime_nsec() != after.ctime_nsec() {
-                return Err(refused("migration source changed; stop the old gateway before copying"));
-            }
+            file_unchanged(&metadata, &after)?;
             owner(&target, uid, gid)?;
             // Keep runnable employee scripts while removing all group/other and
             // setuid/setgid permissions from the imported tree.
@@ -151,11 +147,79 @@ fn tree(source: &File, destination: &Path, uid: u32, gid: u32, source_uid: u32, 
     }
     let after = source.metadata()?;
     source_owner(&after, source_uid)?;
+    directory_unchanged(&before, &after)?;
+    File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
+fn file_unchanged(before: &fs::Metadata, after: &fs::Metadata) -> Result<()> {
+    if before.len() != after.len() || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec() || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec() {
+        return Err(refused("migration source changed; stop the old gateway before copying"));
+    }
+    Ok(())
+}
+
+fn directory_unchanged(before: &fs::Metadata, after: &fs::Metadata) -> Result<()> {
     if before.mtime() != after.mtime() || before.mtime_nsec() != after.mtime_nsec() {
         return Err(refused("migration source directory changed; stop the old gateway first"));
     }
-    File::open(destination)?.sync_all()?;
     Ok(())
+}
+
+// The same traversal and refusals as `tree`, writing nothing: ownership,
+// links/special files, nesting, and change detection while each file is read
+// and each directory listed. A quiet source can still change later; `tree`
+// repeats every check during the real copy.
+fn walk(source: &File, source_uid: u32, depth: usize) -> Result<()> {
+    if depth > 128 { return Err(refused("migration directory nesting exceeds 128")); }
+    let before = source.metadata()?;
+    source_owner(&before, source_uid)?;
+    if !before.is_dir() { return Err(refused("migration source must be a directory")); }
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", source.as_raw_fd()))? {
+        let name = entry?.file_name();
+        let mut input = child(source, &name, source_uid)?;
+        let metadata = input.metadata()?;
+        source_owner(&metadata, source_uid)?;
+        if metadata.is_dir() {
+            walk(&input, source_uid, depth + 1)?;
+        } else if metadata.is_file() && metadata.nlink() == 1 {
+            io::copy(&mut input, &mut io::sink())?;
+            let after = input.metadata()?;
+            source_owner(&after, source_uid)?;
+            file_unchanged(&metadata, &after)?;
+        } else { return Err(refused("migration refuses symlinks, hard links and special files")); }
+    }
+    let after = source.metadata()?;
+    source_owner(&after, source_uid)?;
+    directory_unchanged(&before, &after)
+}
+
+fn authorize(source: &Path) -> Result<(u32, File)> {
+    let sudo_uid = std::env::var_os("SUDO_UID");
+    let sudo_gid = std::env::var_os("SUDO_GID");
+    let (source_uid, _) = sudo_identity(sudo_uid.as_deref(), sudo_gid.as_deref())?;
+    let invoking_home = invoking_home(source_uid)?;
+    Ok((source_uid, authorized_source(source, &invoking_home, source_uid)?))
+}
+
+fn target_exists(target: &Path, force: bool) -> Result<bool> {
+    let exists = match fs::symlink_metadata(target) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if exists && !force { return Err(refused("migration target exists; use --force-migrate to preserve it as a backup and replace it")); }
+    Ok(exists)
+}
+
+/// Every source check `copy` makes that can be made up front, before the
+/// installer creates the account or anything else. Creates nothing.
+pub(super) fn preflight(source: &Path, force: bool) -> Result<()> {
+    let (source_uid, source) = authorize(source)?;
+    target_exists(&Path::new("/var/lib/duduclaw").join(".duduclaw"), force)?;
+    walk(&source, source_uid, 0)
 }
 
 fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
@@ -170,17 +234,8 @@ fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
 pub(super) fn copy(source: &Path, uid: u32, gid: u32, force: bool) -> Result<()> {
     let home = Path::new("/var/lib/duduclaw");
     let target = home.join(".duduclaw");
-    let sudo_uid = std::env::var_os("SUDO_UID");
-    let sudo_gid = std::env::var_os("SUDO_GID");
-    let (source_uid, _) = sudo_identity(sudo_uid.as_deref(), sudo_gid.as_deref())?;
-    let invoking_home = invoking_home(source_uid)?;
-    let source = authorized_source(source, &invoking_home, source_uid)?;
-    let exists = match fs::symlink_metadata(&target) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
-    };
-    if exists && !force { return Err(refused("migration target exists; use --force-migrate to preserve it as a backup and replace it")); }
+    let (source_uid, source) = authorize(source)?;
+    let exists = target_exists(&target, force)?;
     // The top-level temporary directory remains root-owned 0700 throughout.
     let staging = tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).prefix(".duduclaw-migrate-").tempdir_in("/var/lib")?;
     let staged = staging.path().join("data");
@@ -261,6 +316,29 @@ mod tests {
         assert!(open_source(&root.join("alias/data")).is_err());
         assert!(open_source(&root.join("alias")).is_err());
         assert!(open_source(&root.join("source/../source/data")).is_err());
+    }
+
+    #[test]
+    fn service_migration_preflight_walk_refuses_before_any_copy() {
+        let uid = unsafe { libc::getuid() };
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("agents/a")).unwrap();
+        fs::write(root.path().join("agents/a/config.toml"), b"data").unwrap();
+        fs::write(root.path().join("config.toml"), b"data").unwrap();
+        let before: Vec<_> = fs::read_dir(root.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert!(walk(&File::open(root.path()).unwrap(), uid, 0).is_ok());
+        let after: Vec<_> = fs::read_dir(root.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(before, after, "the walk writes nothing");
+        let other = if uid == 1000 { 1001 } else { 1000 };
+        assert!(walk(&File::open(root.path()).unwrap(), other, 0).is_err());
+        // A nested symlink or hard link refuses the whole walk, as copy would.
+        symlink("config.toml", root.path().join("agents/a/link")).unwrap();
+        assert!(walk(&File::open(root.path()).unwrap(), uid, 0).is_err());
+        fs::remove_file(root.path().join("agents/a/link")).unwrap();
+        fs::hard_link(root.path().join("config.toml"), root.path().join("agents/hard")).unwrap();
+        assert!(walk(&File::open(root.path()).unwrap(), uid, 0).is_err());
+        fs::remove_file(root.path().join("agents/hard")).unwrap();
+        assert!(walk(&File::open(root.path()).unwrap(), uid, 0).is_ok());
     }
 
     #[test]

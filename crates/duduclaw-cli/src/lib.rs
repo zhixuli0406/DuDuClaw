@@ -3695,11 +3695,13 @@ enum ServiceCommands {
         allow_missing_runtime: bool,
     },
 
-    /// Upgrade using the already installed, root-owned protected executable
+    /// Upgrade the root-managed protected Linux service to an official release
     Upgrade {
         #[arg(long, required = true)]
         protected_linux: bool,
-        /// Official release version (X.Y.Z); defaults to latest
+        /// Official release version (X.Y.Z). Defaults to the latest release on
+        /// single-binary (v1.80-style) installs; required when the separate
+        /// update service manages the install
         #[arg(long)]
         version: Option<String>,
         /// Keep upgrade successful even if a configured AI CLI is missing

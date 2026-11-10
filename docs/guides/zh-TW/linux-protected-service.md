@@ -4,6 +4,8 @@ v1.80 架構將 gateway、AI 員工、文件解析與特權更新分開。每位
 
 **開發狀態：** 已實作簽章驗證後的未啟用世代暫存、安裝器遷移轉接、首位管理員設定、唯讀安裝檢查與固定路徑的協調移除。完整新安裝、簽章啟用、遷移平台與 gateway 綜合就緒介面仍未完成；本輪未做 root 實機安裝／移除驗收。服務顯示 `active` 或世代已暫存，都不代表隔離就緒。詳見[實作與驗收紀錄](../../architecture/native-linux-isolation.md)。
 
+**目前能安裝的內容：** `service install --protected-linux` 不會安裝 spawnd、egress 或獨立更新服務，也沒有任何流程會建立遷移計畫。在隔離架構的新安裝流程完成前（預計 v1.82.0），受保護服務就是下方「單一執行檔受保護服務（目前版本）」一節說明的 v1.80 單一執行檔 gateway 服務，本指南描述的員工個別隔離不適用。
+
 ## 使用者會遇到的變化
 
 - 要求隔離時，員工不再使用 gateway 帳號執行。同一位員工一次執行一項工作，其餘對話與排程會排隊。
@@ -33,6 +35,31 @@ Kernel 7.0 **目前不接受**：trampoline 會拒絕大於 7 的 Landlock ABI�
 
 主機需有可信任的系統工具，包括 `getent`、`id`、`useradd`、util-linux、systemd 工具及 curl。員工 loop 儲存空間需要 ext4 或 XFS、受支援且非 thin provisioning 的底層裝置鏈，並保留員工配額與 TCB 所需空間。未知儲存配置或容量不足會使就緒檢查失敗。使用外部 IAM／NSS 時，必須永久保留員工 UID 範圍。
 
+## 單一執行檔受保護服務（目前版本）
+
+在隔離元件可以安裝之前（預計 v1.82.0），`service install --protected-linux` 安裝的是 v1.80 的單一執行檔受保護 gateway：root 擁有的程式 `/opt/duduclaw/bin/duduclaw`、啟動器 `/usr/local/libexec/duduclaw/protected-launcher`、服務單元 `duduclaw-gateway.service` 及版本下限 `/var/lib/duduclaw-protected/version-floor`。AI 員工與 v1.80 相同，以 gateway 帳號執行。
+
+**新主機。** 沒有版本下限紀錄時，只有在能確認主機從未安裝過 DuDuClaw 的情況下，安裝才會繼續：沒有 `duduclaw` 帳號，而且下列路徑都不存在：`/var/lib/duduclaw`、`/var/lib/duduclaw-protected/root.key`、`/var/lib/duduclaw-protected/version-floor`、`/var/lib/duduclaw-protected/version-pending`、`/opt/duduclaw/bin/duduclaw`、啟動器、`/etc/systemd/system/duduclaw-gateway.service`、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json`、`/opt/duduclaw-isolated/current`。只要其中任何一項存在或無法確認，缺少的版本下限就可能屬於 v1.79.3 安裝，安裝器會顯示遷移訊息並拒絕。不要為了通過檢查刪除這些路徑，其中可能有資料與金鑰。
+
+使用 `--migrate-from` 時，安裝器會在建立帳號或其他任何變更之前先檢查來源目錄；讀取期間有變動的來源會被拒絕，請先停止使用者模式的 gateway。建立帳號前，安裝器會寫入只有 root 可存取的標記 `/var/lib/duduclaw-protected/fresh-install-pending`。之後若安裝失敗，只要標記完好，且版本下限、根金鑰、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json` 與 `/opt/duduclaw-isolated/current` 仍不存在，重新執行同一指令即可接續安裝。若前一次已複製資料，請加上 `--force-migrate`（前一份複本會保留為備份）。記錄版本下限後或執行 `uninstall` 時會移除標記。
+
+```sh
+# 從 root 擁有的位置執行已驗證的程式（見「安裝與就緒檢查」）。
+sudo ./duduclaw service install --protected-linux --enable-now
+```
+
+**v1.80.x 主機。** 版本下限紀錄為 1.80.0 以上的主機，繼續使用 v1.80 的升級方式：
+
+```sh
+sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y.Z]
+```
+
+未指定 `--version` 時使用最新版本。指令會先檢查設定的 AI CLI（見下方），再下載官方發行版、驗證檢查碼、簽章與內嵌版本，以原子方式替換程式；服務單元與啟動器內容不同時一併更新，重新確認自動復原設定，記錄新的版本下限，並重新啟動執行中的 gateway。目標版本必須比執行指令的程式新，而且執行指令的程式不能比已記錄的版本下限舊（否則會寫入較舊的服務單元與啟動器），請使用已安裝的 `/opt/duduclaw/bin/duduclaw`。若要改用已驗證過的較新程式，請改執行該程式的 `sudo ./duduclaw service install --protected-linux`；只有在版本下限仍存在時，重新安裝才會保留資料與根金鑰。`service uninstall --protected-linux` 會移除版本下限，但保留資料、根金鑰與帳號，因此之後的安裝會被視為版本下限不明的主機而拒絕。
+
+**儀表板。** 沒有獨立更新服務時，儀表板無法更新受保護安裝。畫面會說明這點並顯示上面的指令，不會送出任何要求。
+
+當安裝改由獨立更新服務管理後（`/var/lib/duduclaw-updated/state.json` 與 `/opt/duduclaw-isolated/current` 都存在），`service upgrade --protected-linux` 必須指定 `--version`，而且只會向該服務送出要求；即使無法連線，也不會自行替換程式。
+
 ## 安裝與就緒檢查
 
 由管理員在自己的終端機執行，不能在 AI 工作階段內操作。取得 x86_64 或 aarch64 的完整發行包，放在 root 擁有、上層目錄不可由其他帳號寫入的暫存區，完成驗證後才以 root 執行。Linux 封存檔含分開的元件執行檔；只複製 `duduclaw` 無法安裝這個架構。
@@ -56,7 +83,7 @@ Kernel 7.0 **目前不接受**：trampoline 會拒絕大於 7 的 Landlock ABI�
 
 ## 從 v1.79.3 遷移
 
-不要原地替換舊執行檔，也不要把舊資料庫複製進新 home。舊環境與員工共用 UID，其權威資料必須視為不可信。安裝器已將 v1.79.3 跨入 v1.80（含無法確認原版本下限）的要求交給 G 遷移流程，固定讀取 root 擁有的 `/var/lib/duduclaw-migrate/plan.json`；計畫缺少或無法驗證時，在停止舊服務前拒絕，不退回原地更新。
+不要原地替換舊執行檔，也不要把舊資料庫複製進新 home。舊環境與員工共用 UID，其權威資料必須視為不可信。安裝器已將 v1.79.3 跨入 v1.80（含無法確認原版本下限、且無法確認為新主機的情況，見上方單一執行檔一節）的要求交給 G 遷移流程，固定讀取 root 擁有的 `/var/lib/duduclaw-migrate/plan.json`；計畫缺少或無法驗證時，在停止舊服務前拒絕，不退回原地更新。
 
 管理員流程如下：
 
@@ -93,13 +120,13 @@ sudo -u duduclaw -H claude auth login
 
 `-H` 與 `--prefix /usr` 都要保留，否則原使用者的 `~/.npmrc` prefix 設定可能讓 npm 又把 CLI 裝回使用者家目錄。若設定使用 Codex、Grok、AGY 或 Gemini，也要安裝到相同的服務可讀系統 PATH，並依各 CLI 的登入方式替服務帳號登入。
 
-`service install --protected-linux` 與 `service upgrade --protected-linux` 結尾會檢查設定中的主要推論 runtime，以及各員工 `agent.toml` 選用的 runtime；有遷移時讀取遷移後的目的地設定。檢查以服務帳號及服務 PATH 確認執行權限，並排除被隱藏的路徑。只安裝在原使用者家目錄的 CLI 會明確標示為服務無法使用。主要 runtime 缺少時會印出警告，並以非零狀態結束。只有刻意稍後才設定 runtime 時，才在上述任一指令加上 `--allow-missing-runtime`；此旗標不會代為安裝或登入。檢查失敗不會撤回已執行的安裝或升級。透過下方獨立更新服務升級時，`service upgrade --protected-linux` 會在送出要求前執行此檢查，檢查失敗就不送出。
+`service install --protected-linux` 與 `service upgrade --protected-linux` 結尾會檢查設定中的主要推論 runtime，以及各員工 `agent.toml` 選用的 runtime；有遷移時讀取遷移後的目的地設定。檢查以服務帳號及服務 PATH 確認執行權限，並排除被隱藏的路徑。只安裝在原使用者家目錄的 CLI 會明確標示為服務無法使用。主要 runtime 缺少時會印出警告，並以非零狀態結束。只有刻意稍後才設定 runtime 時，才在上述任一指令加上 `--allow-missing-runtime`；此旗標不會代為安裝或登入。安裝結尾的檢查失敗不會撤回已執行的安裝。`service upgrade --protected-linux` 會先執行此檢查，再下載發行版或送出更新要求；檢查失敗時不做任何變更。
 
 遷移只複製 `.duduclaw` 資料，**不會搬移 AI CLI 或其登入憑證**。Claude 已安裝但服務帳號尚未登入時，安裝流程會顯示上面的服務帳號登入指令。請另行登入，不要複製原使用者家目錄的憑證。Gateway 啟動時若找不到設定的推論執行檔，會記錄 ERROR 與修復方式；runtime 狀態與 doctor 也會顯示受保護服務專用的指引。
 
 ## 升級與解除安裝
 
-完成遷移及更新服務佈署後，Admin 可在儀表板要求正式版更新，或使用已安裝的 CLI：
+獨立更新服務目前還無法安裝（預計 v1.82.0）；現有主機請依上方單一執行檔一節升級。完成遷移及更新服務佈署後，Admin 可在儀表板要求正式版更新，或使用已安裝的 CLI：
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
@@ -142,7 +169,7 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 
 ## v1.80.x 已發行的單一執行檔受保護服務
 
-以下各節說明 v1.80.x 發行版的受保護服務：gateway 是 root 安裝的單一執行檔，`service upgrade --protected-linux` 會在程序內驗證並替換執行檔。這些內容仍是上述發行版，以及隔離架構沿用的憑證保護控制（引擎 socket 政策與自動復原）的參考。以本開發分支建置的版本，`service upgrade --protected-linux` 改為向上方的獨立更新服務送出要求，不會自行替換執行檔。
+以下各節說明 v1.80.x 發行版的受保護服務：gateway 是 root 安裝的單一執行檔，`service upgrade --protected-linux` 會在程序內驗證並替換執行檔。這些內容仍是上述發行版，以及隔離架構沿用的憑證保護控制（引擎 socket 政策與自動復原）的參考。目前的版本對單一執行檔安裝仍使用這種程序內升級（見上方「單一執行檔受保護服務」）；只有由獨立更新服務管理的安裝會改送更新要求，而且 CLI 不會自行替換執行檔。
 
 官方 GitHub 更新會精確核對 minisign 簽章註解 `duduclaw v{版本} {封存檔名}`，包含平台與架構；Pro 更新則使用 `duduclaw-pro` 及該管道自己的固定公鑰。封存檔簽章與涵蓋註解的全域簽章都必須通過。所有封存檔安裝路徑都必須提供驗證器產生的 `VerifiedReleaseIdentity`，綁定封存檔摘要、版本、檔名與簽章註解，僅通過完整性檢查不能安裝。換檔前還會確認執行檔版本。Linux 受保護升級只讀取編譯時的固定格式標記，不以 root 執行下載的程式：標記必須恰有一筆，header 為 `NUL + DUDUCLAW_RELEASE_ID:V1:`，接穩定版 `X.Y.Z`，suffix 為 `NUL + DUDUCLAW_RELEASE_END + NUL`。每個 `DUDUCLAW_RELEASE_ID` 都必須構成完整標記，缺少、畸形、重複或衝突一律拒絕；沒有標記的舊版封存檔也不接受。發版流程會在簽章前解析實際封存檔內的執行檔，確認標記與 tag 相同，Pro 打包也適用。一般更新則核對 `version` 輸出。任何不符都會在換檔及寫入受保護版本意圖／下限前中止。這些檢查適用於已包含修補的更新程式；舊更新程式仍需先由管理員審查並手動更新。
 

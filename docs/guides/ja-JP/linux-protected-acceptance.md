@@ -4,6 +4,8 @@
 
 リリース担当者向けの手順書です。v1.81 のネイティブ Linux 保護モードの受け入れで、準備するもの、実行するコマンド、結果の読み方を説明します。対象は個人用と共有の AI 社員、外部連携、Package H のツールです。
 
+> **これらの受け入れツールは現在、準備段階を通過できません。** `connectors-acceptance.sh`、`package-h-acceptance.sh`、`iso_personal_chain`／`iso_package_h_chain` テストには、インストール済みで動作中の隔離コンポーネント（spawnd、egress、独立した更新サービス）が必要です。`duduclaw service install --protected-linux` はこれらをインストールせず、単一実行ファイルの保護 gateway だけをインストールします（[保護サービスガイドの「単一実行ファイルの保護サービス（現行版）」](linux-protected-service.md)を参照）。隔離構成の新規インストール手順が完成するまで（v1.82.0 予定）、毎回準備段階で停止します。この結果は AI 社員、外部連携、Package H 機能の受け入れ結果ではありません。
+
 > **以下の手順はすべてホストを変更します。** 受け入れツールは保護モードのサービスをインストールし、システムアカウントを作り、`/var/lib/duduclaw*`・`/opt`・`/etc` に書き込み、`/etc/hosts` を変更し、使い捨ての認証局を入れ、最後にすべて削除します。使い捨ての VM だけで実行してください。`DUDUCLAW_ISO_DISPOSABLE=1` がないと実行を拒否し、ツール自身が作っていない DuDuClaw のインストールがある場合も拒否します。あなた自身の `~/.duduclaw` や Claude／agy のログインは使いません。操作用 CLI の `HOME` と `DUDUCLAW_HOME` は専用の一時ディレクトリを指します。
 
 ## 対象

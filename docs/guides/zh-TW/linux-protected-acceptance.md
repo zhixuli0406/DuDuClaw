@@ -4,6 +4,8 @@
 
 這份手冊給發行維護者使用，說明 v1.81 原生 Linux 保護模式驗收要準備什麼、要執行哪些指令，以及怎麼看結果。範圍包含個人與共用 AI 員工、外部連線，以及 Package H 工具。
 
+> **這些驗收工具目前無法通過準備階段。** `connectors-acceptance.sh`、`package-h-acceptance.sh` 以及 `iso_personal_chain`／`iso_package_h_chain` 測試，都需要已安裝並執行中的隔離元件（spawnd、egress、獨立更新服務）。`duduclaw service install --protected-linux` 不會安裝這些元件，只會安裝單一執行檔的受保護 gateway（見[受保護服務指南的「單一執行檔受保護服務（目前版本）」](linux-protected-service.md)）。在隔離架構的新安裝流程完成前（預計 v1.82.0），每次執行都會在準備階段停止；這個結果不代表 AI 員工、外部連線或 Package H 功能的驗收結果。
+
 > **以下每個步驟都會改動主機。** 驗收工具會安裝保護模式服務、建立系統帳號、寫入 `/var/lib/duduclaw*`、`/opt`、`/etc`、修改 `/etc/hosts`、安裝一次性憑證機構，結束後再全部移除。請只在可丟棄的虛擬機上執行。沒有設定 `DUDUCLAW_ISO_DISPOSABLE=1` 時工具會拒絕執行；主機上已有不是它建立的 DuDuClaw 安裝時也會拒絕。工具不會用到你自己的 `~/.duduclaw`，也不會用到你自己的 Claude 或 agy 登入：操作端 CLI 的 `HOME` 與 `DUDUCLAW_HOME` 都指向私有的暫存目錄。
 
 ## 涵蓋範圍

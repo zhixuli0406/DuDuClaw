@@ -40,9 +40,25 @@ export function pendingProtectedUpdate(): string | null {
   } catch { return null; }
 }
 
+/** Gateway result code: the host has no reachable root updater, so the gateway
+ * sent NO request. Until the separate update service is installable (planned
+ * v1.82.0) the administrator updates from the host terminal instead. */
+export const UPDATER_NOT_INSTALLED = 'updater_not_installed';
+
+/** Root-managed command the dashboard shows instead of updating itself. */
+export const HOST_UPGRADE_COMMAND = 'sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux';
+
+/** Only an ok payload carrying the code and no request id qualifies. */
+export function isUpdaterNotInstalled(reply: unknown): boolean {
+  if (!reply || typeof reply !== 'object') return false;
+  const data = reply as { code?: unknown; protected_request_id?: unknown };
+  return data.code === UPDATER_NOT_INSTALLED && data.protected_request_id === undefined;
+}
+
 export type ProtectedSubmission =
   | { kind: 'known'; result: ProtectedUpdateResult }
-  | { kind: 'unknown'; requestId: string };
+  | { kind: 'unknown'; requestId: string }
+  | { kind: 'updater_not_installed' };
 
 /** A gateway error can wrap a lost daemon reply AFTER durable acceptance.
  * Only a correlated daemon result settles the request; rejection shape is not evidence.
@@ -55,6 +71,11 @@ export async function submitProtectedUpdate(
   try {
     const reply = await submit(requestId);
     if (!reply || typeof reply !== 'object') return { kind: 'unknown', requestId };
+    if (isUpdaterNotInstalled(reply)) {
+      // Nothing was sent, so there is no request to reconcile later.
+      rememberProtectedUpdate(null);
+      return { kind: 'updater_not_installed' };
+    }
     const data = reply as Partial<ProtectedUpdateResult>;
     const states: readonly string[] = ['queued', 'downloading', 'prepared', 'activated', 'committed', 'failed', 'maintenance'];
     if (data.protected_request_id !== requestId || typeof data.protected_state !== 'string'

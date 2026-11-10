@@ -59,6 +59,7 @@
   "settings.update.protected.maintenance": "更新サービスの修復が必要です。管理者に連絡してください。",
   "settings.update.protected.unavailable": "更新結果を一時的に確認できません。接続が復旧すると再確認します。重複してインストールしないでください。",
   "settings.update.protected.refresh": "結果を再確認",
+  "settings.update.protected.notInstalled": "このホストには独立した更新サービスがないため、ダッシュボードから保護されたインストールを更新できません。更新リクエストは送信していません。ホストの端末で次のコマンドを実行して更新してください：",
   "agent.selection.revoked": "この AI スタッフは現在利用できません。選び直してください。",
   "settings.update.failure.download": "更新をダウンロードできません。接続を確認し、更新を再確認してください。",
   "settings.update.failure.verify": "更新ファイルの検証に失敗したため、インストールを停止しました。公式版を再ダウンロードしてください。",

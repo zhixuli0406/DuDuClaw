@@ -4,6 +4,8 @@ The v1.80 architecture separates the gateway, AI employees, document parsing and
 
 **Development status:** signed inactive-generation staging, the installer migration handoff, first-administrator setup, read-only installation checks and coordinated fixed-path removal are implemented. Complete fresh installation, signed activation, the migration platform adapter and the gateway composite-readiness adapter remain incomplete. This round has no live root installation/removal acceptance. An `active` service or staged generation is not isolation readiness. See the [implementation and acceptance record](../architecture/native-linux-isolation.md).
 
+**What you can install today:** `service install --protected-linux` does not install spawnd, egress or the separate updater, and nothing creates the migration plan. Until the isolation fresh bootstrap lands (planned v1.82.0), the protected service is the v1.80 single-binary gateway service described in [Single-binary protected service (current releases)](#single-binary-protected-service-current-releases). The per-employee isolation described in this guide does not apply to it.
+
 ## What changes for customers
 
 - Employees no longer execute as the gateway account when isolation is required. One employee runs one job at a time; additional conversations and scheduled jobs queue.
@@ -33,6 +35,31 @@ Kernel 7.0 is **not currently accepted**: the trampoline refuses Landlock ABIs a
 
 The host needs trusted system tools including `getent`, `id`, `useradd`, util-linux, systemd tools and curl. Loop-backed employee storage requires ext4 or XFS on a supported non-thin backing-device chain, with room for employee quotas and the TCB reserve. Unknown backing layouts or inadequate capacity refuse readiness. External IAM/NSS must permanently reserve the employee UID range.
 
+## Single-binary protected service (current releases)
+
+Until the isolation components can be installed (planned v1.82.0), `service install --protected-linux` installs the v1.80 single-binary protected gateway: the root-owned program `/opt/duduclaw/bin/duduclaw`, the launcher `/usr/local/libexec/duduclaw/protected-launcher`, the unit `duduclaw-gateway.service` and the version floor `/var/lib/duduclaw-protected/version-floor`. AI employees run as the gateway account, as in v1.80.
+
+**New host.** With no recorded version floor, the installer continues only when it can show the host never had DuDuClaw installed: there is no `duduclaw` account and none of these paths exist: `/var/lib/duduclaw`, `/var/lib/duduclaw-protected/root.key`, `/var/lib/duduclaw-protected/version-floor`, `/var/lib/duduclaw-protected/version-pending`, `/opt/duduclaw/bin/duduclaw`, the launcher, `/etc/systemd/system/duduclaw-gateway.service`, `/etc/duduclaw/migration-import.json`, `/var/lib/duduclaw-migrate`, `/var/lib/duduclaw-updated/state.json` and `/opt/duduclaw-isolated/current`. If any of them exists or cannot be checked, the missing floor may belong to a v1.79.3 installation and the installer refuses with the migration message. Do not delete these paths to get past the refusal; they can hold data and keys.
+
+`--migrate-from` checks the source tree first, before the installer creates the account or anything else: stop the user-mode gateway, because a source that changes while it is read is refused. Before creating the account the installer writes the root-only marker `/var/lib/duduclaw-protected/fresh-install-pending`. If the install then fails, rerunning the same command continues it, as long as the marker is intact and the version floor, root key, `/etc/duduclaw/migration-import.json`, `/var/lib/duduclaw-migrate`, `/var/lib/duduclaw-updated/state.json` and `/opt/duduclaw-isolated/current` are still absent. If the earlier run had already copied the data, add `--force-migrate` (the earlier copy is kept as a backup). The marker is removed once the floor is recorded, and by `uninstall`.
+
+```sh
+# Run the verified binary from a root-owned location (see "Installation and readiness").
+sudo ./duduclaw service install --protected-linux --enable-now
+```
+
+**v1.80.x host.** A host whose recorded floor is 1.80.0 or later keeps the v1.80 upgrade:
+
+```sh
+sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux [--version X.Y.Z]
+```
+
+Without `--version` it uses the latest release. The command checks the configured AI CLIs first (see below), then downloads the official release, verifies its checksum, signature and embedded version, replaces the program atomically, refreshes the unit and launcher when their content differs, recertifies automatic recovery, records the new floor and restarts an active gateway. The target must be newer than the program that runs the command, and that program must not be older than the recorded floor (its unit and launcher would be older), so run the installed `/opt/duduclaw/bin/duduclaw`. To move the service to a newer binary you have already verified, run that binary's `sudo ./duduclaw service install --protected-linux` instead; reinstalling keeps the data and root key only while the version floor exists. `service uninstall --protected-linux` removes the floor but keeps the data, root key and account, so a later install is refused as a host with an unknown floor.
+
+**Dashboard.** The dashboard cannot update a protected install without the separate update service. It says so, shows the command above and sends no request.
+
+Once the separate update service manages the install (both `/var/lib/duduclaw-updated/state.json` and `/opt/duduclaw-isolated/current` exist), `service upgrade --protected-linux` requires `--version` and only sends a request to that service. It never replaces the program itself, including when the service cannot be reached.
+
 ## Installation and readiness
 
 Run from a human administrator's terminal, outside an AI session. Obtain the complete release for x86_64 or aarch64 and verify it in a root-owned staging directory with non-writable ancestors before executing any program as root. Linux archives contain separate component binaries; copying only `duduclaw` cannot install this architecture.
@@ -56,7 +83,7 @@ Run `sudo duduclaw service readiness --protected-linux` (the `ops` alias is equi
 
 ## Migrate from v1.79.3
 
-Do not replace the old binary in place or copy its databases into the new home. The old environment shares a UID with employees, so its authority data must be treated as untrusted. The installer now routes the v1.79.3-to-v1.80 boundary, including an unknown installed floor, into G's migration flow using the fixed root-owned plan `/var/lib/duduclaw-migrate/plan.json`. Missing or invalid plans refuse before stopping the old service; there is no legacy in-place fallback.
+Do not replace the old binary in place or copy its databases into the new home. The old environment shares a UID with employees, so its authority data must be treated as untrusted. The installer now routes the v1.79.3-to-v1.80 boundary, including an unknown installed floor on a host that is not provably new (see the single-binary section above), into G's migration flow using the fixed root-owned plan `/var/lib/duduclaw-migrate/plan.json`. Missing or invalid plans refuse before stopping the old service; there is no legacy in-place fallback.
 
 The administrator flow is:
 
@@ -93,13 +120,13 @@ sudo -u duduclaw -H claude auth login
 
 Keep both `-H` and `--prefix /usr`: an operator's `~/.npmrc` prefix can otherwise install the CLI back into the operator's home. Install any configured Codex, Grok, AGY or Gemini CLI in the same service-readable system PATH and authenticate it as the service account using its own login procedure.
 
-At the end of `service install --protected-linux` and `service upgrade --protected-linux`, the command checks the configured primary inference runtime and runtimes selected in agents' `agent.toml` files, reading the destination configuration after any migration. It checks executable access as the service account with the service PATH and excludes hidden paths. A CLI found only in the operator's home is reported as unavailable to the service. If the primary runtime is missing, the command prints a warning and exits nonzero. Use `--allow-missing-runtime` on either command only when deliberately completing runtime setup later; this flag does not install or authenticate a CLI. A nonzero runtime check does not undo installation or upgrade work already performed. When upgrades go through the separate updater (below), `service upgrade --protected-linux` runs this check before submitting the request and does not submit it when the check fails.
+At the end of `service install --protected-linux` and `service upgrade --protected-linux`, the command checks the configured primary inference runtime and runtimes selected in agents' `agent.toml` files, reading the destination configuration after any migration. It checks executable access as the service account with the service PATH and excludes hidden paths. A CLI found only in the operator's home is reported as unavailable to the service. If the primary runtime is missing, the command prints a warning and exits nonzero. Use `--allow-missing-runtime` on either command only when deliberately completing runtime setup later; this flag does not install or authenticate a CLI. A nonzero runtime check at the end of installation does not undo installation work already performed. `service upgrade --protected-linux` runs this check first, before downloading a release or submitting an updater request, and changes nothing when it fails.
 
 Migration copies only `.duduclaw` data, **not AI CLI installations or their login credentials**. When Claude is installed but the service account has no login, installation prints the service-account login command above. Authenticate that account separately; do not copy credentials from the operator's home. On gateway startup, a missing configured inference binary produces an ERROR with repair guidance; runtime status and doctor also show the protected-service instructions.
 
 ## Upgrade and uninstall
 
-After migration and complete updater provisioning, an Admin requests a stable release in the dashboard or uses the installed CLI:
+The separate updater cannot be installed yet (planned v1.82.0); current hosts upgrade as described in the single-binary section above. After migration and complete updater provisioning, an Admin requests a stable release in the dashboard or uses the installed CLI:
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
@@ -142,7 +169,7 @@ Container engines and hardware-dependent features remain unavailable through the
 
 ## Released v1.80.x single-binary protected service
 
-The following sections describe the protected service as released in v1.80.x, where the gateway is a single root-installed binary and `service upgrade --protected-linux` verifies and replaces it in-process. They remain the reference for those releases and for the credential-protection controls (engine socket policy and automatic recovery) that the isolation architecture keeps. On builds from this development branch, `service upgrade --protected-linux` instead submits a request to the separate updater described above and never replaces the binary itself.
+The following sections describe the protected service as released in v1.80.x, where the gateway is a single root-installed binary and `service upgrade --protected-linux` verifies and replaces it in-process. They remain the reference for those releases and for the credential-protection controls (engine socket policy and automatic recovery) that the isolation architecture keeps. Current builds keep this in-process upgrade for single-binary installs (see "Single-binary protected service" above). Only installs managed by the separate updater send an updater request instead, and those never replace the binary from the CLI.
 
 Official GitHub updates bind the minisign trusted comment exactly to `duduclaw v{version} {archive-file-name}`, including the platform and architecture. Provider updates use `duduclaw-pro` for Pro archives and their own pinned signing key. Both the payload and the global signature covering the comment must verify. All archive installation paths require a verifier-created `VerifiedReleaseIdentity` bound to the archive digest, version, file and signed comment; an integrity-only check cannot authorize installation. Before replacement, the extracted binary must match the requested version. Protected upgrades inspect exactly one build-time record with fixed header `NUL + DUDUCLAW_RELEASE_ID:V1:`, a stable `X.Y.Z`, and suffix `NUL + DUDUCLAW_RELEASE_END + NUL`, without running downloaded code as root. Every occurrence of the magic `DUDUCLAW_RELEASE_ID` must be that complete record; missing, malformed, duplicate or conflicting records are refused. Older binaries without this record are refused too. Release signing checks the actual archived binary's marker against the tag, including Pro packaging. Ordinary updates check the binary’s `version` output. Any mismatch aborts before replacement or writing the protected version intent/floor. These checks apply when the installed updater includes this fix; older updaters must first be replaced through an administrator-reviewed installation.
 

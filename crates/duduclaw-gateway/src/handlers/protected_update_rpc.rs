@@ -19,6 +19,38 @@ fn request_id(text: &str) -> Result<RequestId, &'static str> {
     Ok(RequestId(*id.as_bytes()))
 }
 
+/// Result code (in an `ok` payload, never an error frame) meaning: this host
+/// has no reachable root updater, so NO request was sent. The gateway never
+/// updates itself; the administrator updates from the host instead. Until the
+/// isolation bootstrap is installable (planned v1.82.0) this is every host.
+pub(crate) const UPDATER_NOT_INSTALLED: &str = "updater_not_installed";
+const UPDATER_NOT_INSTALLED_MESSAGE: &str = "這台主機沒有可用的獨立更新服務，儀表板無法更新受保護安裝，未送出任何更新要求。請在主機終端機執行 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux。";
+
+// The gateway's unprivileged account cannot read the updater's root-only
+// state, but it must be able to reach the socket it would connect to. Only a
+// socket at the fixed path counts; a missing or unreadable path, a symlink or
+// any other file type means "not installed", so no request is attempted.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn updater_socket_present(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    matches!(std::fs::symlink_metadata(path), Ok(metadata) if metadata.file_type().is_socket())
+}
+
+fn updater_installed() -> bool {
+    #[cfg(target_os = "linux")]
+    { updater_socket_present(std::path::Path::new(duduclaw_isolation::ids::UPDATED_SOCKET)) }
+    #[cfg(not(target_os = "linux"))]
+    { false }
+}
+
+fn updater_not_installed_frame() -> WsFrame {
+    WsFrame::ok_response("", json!({
+        "success": false, "needs_restart": false,
+        "code": UPDATER_NOT_INSTALLED, "message": UPDATER_NOT_INSTALLED_MESSAGE,
+    }))
+}
+
 async fn exchange(request: UpdateRequest) -> Result<UpdateResponse, &'static str> {
     #[cfg(target_os = "linux")]
     {
@@ -73,6 +105,13 @@ fn response_frame(response: UpdateResponse, expected: RequestId, applying: bool)
 impl MethodHandler {
     // Both entry points are Admin-gated by dispatch_system, including status.
     pub(crate) async fn handle_protected_update_apply(&self, params: Value) -> WsFrame {
+        // Same order as status: a non-protected install never reports
+        // updater_not_installed. Today's only caller already checks this.
+        if !crate::updater::is_native_protected_install() {
+            return WsFrame::error_response("", "目前安裝不使用受保護更新服務。");
+        }
+        // Decided before anything is sent; never a fallback after a failed exchange.
+        if !updater_installed() { return updater_not_installed_frame(); }
         let params: ApplyParams = match serde_json::from_value(params) {
             Ok(params) => params,
             Err(_) => return WsFrame::error_response("", "更新要求只能包含識別碼。"),
@@ -104,6 +143,7 @@ impl MethodHandler {
         if !crate::updater::is_native_protected_install() {
             return WsFrame::error_response("", "目前安裝不使用受保護更新服務。");
         }
+        if !updater_installed() { return updater_not_installed_frame(); }
         let params: StatusParams = match serde_json::from_value(params) {
             Ok(params) => params,
             Err(_) => return WsFrame::error_response("", "更新狀態要求格式無效。"),
@@ -162,5 +202,36 @@ mod tests {
         }
         let wrong = response_frame(UpdateResponse::V1(UpdateResponseV1::Accepted { request_id: RequestId([2; 16]) }), id, true);
         assert!(!serde_json::to_string(&wrong).unwrap().contains("protected_request_id"));
+    }
+
+    #[test]
+    fn protected_update_updater_not_installed_is_a_distinct_known_result() {
+        let value = serde_json::to_value(updater_not_installed_frame()).unwrap();
+        // An ok payload, so the dashboard can tell "nothing was sent" apart
+        // from a lost reply; it never names a request or claims success.
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["payload"]["code"], json!(UPDATER_NOT_INSTALLED));
+        assert_eq!(value["payload"]["success"], json!(false));
+        assert!(value["payload"].get("protected_request_id").is_none());
+        assert!(value["payload"].get("protected_state").is_none());
+        let message = value["payload"]["message"].as_str().unwrap();
+        assert!(message.contains("sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_update_updater_presence_requires_a_real_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        assert!(!updater_socket_present(&socket));
+        std::fs::write(&socket, b"").unwrap();
+        assert!(!updater_socket_present(&socket), "regular file is not the updater");
+        std::fs::remove_file(&socket).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(updater_socket_present(&socket));
+        let link = dir.path().join("link.sock");
+        std::os::unix::fs::symlink(&socket, &link).unwrap();
+        assert!(!updater_socket_present(&link), "symlinks are never followed");
+        assert!(!updater_socket_present(&dir.path().join("missing/control.sock")));
     }
 }

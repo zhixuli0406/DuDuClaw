@@ -93,7 +93,12 @@ async fn service_protected_upgrade_operator_gate_precedes_download() {
 #[tokio::test]
 async fn service_protected_upgrade_requires_stable_version_before_ipc() {
     let _session = crate::ai_session_guard::test_session(&[]);
-    assert!(upgrade(None, false).await.unwrap_err().to_string().contains("--version"));
+    // Omitting --version is decided only after routing from installed state
+    // (latest on single-binary installs, refused for updater-managed ones),
+    // so an unprivileged test stops at the root gate instead.
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(upgrade(None, false).await.unwrap_err().to_string().contains("sudo"));
+    }
     for version in ["1.80.0-beta", "1.80.0+build", "../update", "https://example.com/update"] {
         assert!(upgrade(Some(version), false).await.unwrap_err().to_string().contains("正式版"));
     }
