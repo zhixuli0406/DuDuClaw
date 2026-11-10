@@ -305,7 +305,7 @@ mod tests {
         let start = Instant::now();
         let probe = || installed_under(root.path());
         assert!(!decide_latched(&latch, &cache, start, probe));
-        let fact = place(root.path(), "/opt/duduclaw-isolated/current");
+        let fact = place(root.path(), "/etc/duduclaw/migration-import.json");
         // Inside the window the cached "off" is reused; after it the fact is seen.
         assert!(!decide_latched(&latch, &cache, start + window / 2, probe));
         assert!(decide_latched(&latch, &cache, start + window, probe));
