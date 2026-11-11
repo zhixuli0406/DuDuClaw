@@ -166,14 +166,6 @@ jobs:
           python3 scripts/check_update_archive_size.py ${{ matrix.artifact }}.app.zip
           shasum -a 256 ${{ matrix.artifact }}.app.zip > ${{ matrix.artifact }}.app.zip.sha256
 
-      - name: Sign gateway bundle with cosign (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          cosign sign-blob --yes \
-            --output-signature ${{ matrix.artifact }}.app.zip.sig \
-            --output-certificate ${{ matrix.artifact }}.app.zip.pem \
-            ${{ matrix.artifact }}.app.zip
-
       - name: Check binary is portable (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -228,6 +220,7 @@ jobs:
   # Rekor/Fulcio failures must not discard hours of compilation. Unsigned build
   # artifacts remain available after failure; rerun only the failed signing job
   # with `gh run rerun RUN_ID --job SIGN_JOB_ID` (and its downstream dependents).
+  # The macOS gateway bundle (.app.zip) is signed here too.
   sign:
     needs: build
     name: Sign ${{ matrix.artifact }}
@@ -241,8 +234,10 @@ jobs:
         include:
           - artifact: duduclaw-darwin-arm64
             extension: tar.gz
+            app_bundle: true
           - artifact: duduclaw-darwin-x64
             extension: tar.gz
+            app_bundle: true
           - artifact: duduclaw-linux-x64
             extension: tar.gz
           - artifact: duduclaw-linux-arm64
@@ -261,6 +256,8 @@ jobs:
         shell: bash
         env:
           ARCHIVE: ${{ matrix.artifact }}.${{ matrix.extension }}
+          APP_ZIP: ${{ matrix.artifact }}.app.zip
+          APP_BUNDLE: ${{ matrix.app_bundle || 'false' }}
           CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
         run: |
           set -euo pipefail
@@ -281,17 +278,27 @@ jobs:
               delay=$((delay * 2))
             done
           }
-          sha256sum --check "$ARCHIVE.sha256"
-          retry cosign sign-blob --yes \
-            --output-signature "$ARCHIVE.sig" \
-            --output-certificate "$ARCHIVE.pem" \
-            "$ARCHIVE"
-          retry cosign verify-blob \
-            --signature "$ARCHIVE.sig" \
-            --certificate "$ARCHIVE.pem" \
-            --certificate-identity "$CERTIFICATE_IDENTITY" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "$ARCHIVE"
+          files=("$ARCHIVE")
+          if [ "$APP_BUNDLE" = "true" ]; then
+            files+=("$APP_ZIP")
+          fi
+          for f in "${files[@]}"; do
+            if [ ! -f "$f" ] || [ ! -f "$f.sha256" ]; then
+              echo "::error::missing $f or $f.sha256"
+              exit 1
+            fi
+            sha256sum --check "$f.sha256"
+            retry cosign sign-blob --yes \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem" \
+              "$f"
+            retry cosign verify-blob \
+              --signature "$f.sig" \
+              --certificate "$f.pem" \
+              --certificate-identity "$CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$f"
+          done
 
       - name: Upload verified signed archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
