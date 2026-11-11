@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY vendor/ vendor/
+# The root Cargo.toml patches sqlx-sqlite to this local stub (RUSTSEC-2026-0459); cargo needs it to resolve the workspace.
+COPY third_party/ third_party/
 # duduclaw-memory/-cli use include_str! against templates/wiki/* and docs/README.md
 COPY templates/ templates/
 # duduclaw-gateway embeds synthetic fixtures via include_str!.
