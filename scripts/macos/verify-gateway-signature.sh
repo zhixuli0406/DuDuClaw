@@ -24,13 +24,20 @@ run() {
     fi
 }
 for artifact in "$APP" "$EXE"; do
+    # A bare Mach-O is "not an app" to the exec assessment on current macOS
+    # (rc 3), so the CLI binary is assessed via its primary signature instead.
+    if [[ "$artifact" == "$EXE" ]]; then
+        spctl_args=(-a -vv -t open --context context:primary-signature)
+    else
+        spctl_args=(-a -vv -t exec)
+    fi
     run codesign --verify --strict --deep -vv "$artifact"
     run codesign --verify -R "=$PINNED_DR" "$artifact"
     if [[ "$DRY_RUN" == 1 ]]; then
         run codesign -d -r- "$artifact"
         run codesign -d --verbose=4 "$artifact"
         run codesign -d --entitlements :- "$artifact"
-        run spctl -a -vv -t exec "$artifact"
+        run spctl "${spctl_args[@]}" "$artifact"
         continue
     fi
     requirement="$(codesign -d -r- "$artifact" 2>&1)"
@@ -41,11 +48,11 @@ for artifact in "$APP" "$EXE"; do
 import plistlib, sys
 with open(sys.argv[1], "rb") as f:
     expected = plistlib.load(f)
-if plistlib.load(sys.stdin.buffer) != expected:
+if plistlib.loads(sys.stdin.buffer.read()) != expected:
     sys.exit("Entitlements mismatch")
 ' "$ENTITLEMENTS"
-    assessment="$(spctl -a -vv -t exec "$artifact" 2>&1)"
-    [[ "$assessment" == *'source=Notarized Developer ID'* ]] || { echo 'Notarization missing' >&2; exit 1; }
+    assessment="$(spctl "${spctl_args[@]}" "$artifact" 2>&1 || true)"
+    [[ "$assessment" == *'source=Notarized Developer ID'* ]] || { printf 'Notarization missing for %s:\n%s\n' "$artifact" "$assessment" >&2; exit 1; }
 done
 run xcrun stapler validate "$APP"
 if [[ "$DRY_RUN" == 1 ]]; then
