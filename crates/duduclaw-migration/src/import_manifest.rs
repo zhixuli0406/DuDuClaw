@@ -183,7 +183,10 @@ pub fn stage_pending_proposals(store: &mut crate::confirmation::ConfirmationStor
     Ok(())
 }
 
-#[cfg(test)]
+// The manifest is a Linux root protocol: `validate` accepts only Unix absolute
+// paths (RootDir/Normal components), which no Windows path can satisfy, and the
+// gateway reads it only on Linux. The fixtures use Unix homes, so run on Unix.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::{ids::{EmployeeId, Sha256Digest}, import_receiver::ContentClass};

@@ -163,6 +163,9 @@ pub fn active() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Symlink-free temp roots: the index is opened with SQLITE_OPEN_NOFOLLOW,
+    // which refuses macOS's `/var -> /private/var` temp path component.
+    use crate::identity_token::real_tempdir;
 
     fn sources(dir: &Path) -> Sources {
         Sources { env: None, marker: dir.join("etc/protected-mode"), service_home: dir.join("home") }
@@ -186,7 +189,7 @@ mod tests {
 
     #[test]
     fn sr5r3_env_absent_without_durable_fact_is_unprotected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         assert!(!sources(dir.path()).decide());
         // An index without rows is no fact.
         confirmed_index(&dir.path().join("home"), 0);
@@ -195,7 +198,7 @@ mod tests {
 
     #[test]
     fn sr5r3_env_flag_alone_still_turns_protected_mode_on() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let mut s = sources(dir.path());
         s.env = Some(MODE_VALUE.into());
         assert!(s.decide());
@@ -205,7 +208,7 @@ mod tests {
 
     #[test]
     fn sr5r3_marker_keeps_protected_mode_with_env_absent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let s = sources(dir.path());
         std::fs::create_dir_all(s.marker.parent().unwrap()).unwrap();
         std::fs::write(&s.marker, b"").unwrap();
@@ -218,7 +221,7 @@ mod tests {
 
     #[test]
     fn sr5r3_confirmed_index_keeps_protected_mode_with_env_absent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let s = sources(dir.path());
         confirmed_index(&s.service_home, 1);
         assert!(s.decide());
@@ -227,7 +230,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sr5r3_unreadable_index_counts_as_protected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let s = sources(dir.path());
         let directory = s.service_home.join(crate::identity_token::APPLY_DB_DIR);
         std::fs::create_dir_all(&directory).unwrap();
@@ -238,7 +241,7 @@ mod tests {
 
     #[test]
     fn sr5r3_thread_sources_only_narrow_and_never_latch() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let s = sources(dir.path());
         std::fs::create_dir_all(s.marker.parent().unwrap()).unwrap();
         std::fs::write(&s.marker, b"").unwrap();
@@ -261,7 +264,7 @@ mod tests {
         if crate::isolation_install::installed() {
             return; // This test host carries a real isolation install.
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let s = sources(dir.path());
         std::fs::create_dir_all(s.marker.parent().unwrap()).unwrap();
         std::fs::write(&s.marker, b"native-systemd\n").unwrap();
@@ -287,7 +290,7 @@ mod tests {
 
     #[test]
     fn sr5r3f_off_answer_is_cached_briefly_and_a_later_source_is_seen() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let s = sources(dir.path());
         let cache = OffCache::new();
         let start = Instant::now();
@@ -310,7 +313,7 @@ mod tests {
 
     #[test]
     fn sr5r3f_confirmed_index_appearing_after_window_is_seen() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = real_tempdir();
         let s = sources(dir.path());
         let cache = OffCache::new();
         let start = Instant::now();

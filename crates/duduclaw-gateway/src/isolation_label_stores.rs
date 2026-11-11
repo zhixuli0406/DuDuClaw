@@ -1015,6 +1015,9 @@ fn live_channel_route(home: &Path, lifecycle: &crate::isolation_lifecycle::Emplo
     Ok(false)
 }
 
-#[cfg(test)]
+// The protected-mode gates read apply.db and re-key/purge the label stores
+// through the hardened `fs_safe::sqlite::open_existing`, which is Unix-only
+// (fails closed elsewhere; protected mode itself is Linux-only).
+#[cfg(all(test, unix))]
 #[path = "isolation_label_stores_tests.rs"]
 mod tests;

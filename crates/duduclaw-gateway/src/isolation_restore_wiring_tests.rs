@@ -33,6 +33,9 @@ fn log_rule_requires_step_up_and_transaction() {
         Err(SELF_APPROVAL_AUDIT_UNAVAILABLE));
 }
 
+// The rule opens users.db through `fs_safe::sqlite::open_existing`, which is
+// Unix-only (every other platform refuses: always LogUnavailable there).
+#[cfg(unix)]
 #[test]
 fn retire_rule_fails_closed() {
     use crate::isolation_retire::{ApprovalRefusal, ApprovalRule as _};

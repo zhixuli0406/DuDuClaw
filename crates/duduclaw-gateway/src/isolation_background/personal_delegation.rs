@@ -383,6 +383,8 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
+// `admit` stores the receipt through the background store, whose writer is the
+// Unix-only hardened SQLite opener (fails closed elsewhere). Unix-only tests.
+#[cfg(all(test, unix))]
 #[path = "personal_delegation_tests.rs"]
 mod tests;

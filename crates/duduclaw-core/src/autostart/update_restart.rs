@@ -419,8 +419,13 @@ mod tests {
         // A plist still naming the old bare binary does not authorize the helper.
         let c = Fake::new(vec![ok(r#"{"Label":"com.duduclaw.gateway","ProgramArguments":["/Users/k/.duduclaw/bin/duduclaw","run"]}"#)]);
         assert!(validate_gateway(&c, Path::new("/tmp/home"), LAUNCHD_LABEL, installed).await.is_err());
-        let p = helper_plist(installed, Path::new("/Users/k"), Path::new("/Users/k/.duduclaw"), LAUNCHD_LABEL, 42).unwrap();
-        assert!(p.contains("<string>/Users/k/Applications/DuDuClaw Gateway.app/Contents/MacOS/duduclaw</string><string>service</string>"));
+        // launchd helper plists take Unix absolute paths; "/Users/k" has no
+        // drive prefix and is (correctly) not absolute on Windows.
+        #[cfg(unix)]
+        {
+            let p = helper_plist(installed, Path::new("/Users/k"), Path::new("/Users/k/.duduclaw"), LAUNCHD_LABEL, 42).unwrap();
+            assert!(p.contains("<string>/Users/k/Applications/DuDuClaw Gateway.app/Contents/MacOS/duduclaw</string><string>service</string>"));
+        }
     }
 
     #[tokio::test]

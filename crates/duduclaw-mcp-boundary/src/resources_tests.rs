@@ -243,6 +243,9 @@ fn selected_call(workspace: &str, path: &str) -> crate::tool_policy::AuthorizedT
         &serde_json::json!({"path":path}), &Selected(workspace.into())).unwrap()
 }
 
+// Workspace/file tokens bind the descriptor's (dev, inode); `file_identity`
+// is Unix-only and fails closed elsewhere, so token-minting tests are Unix-only.
+#[cfg(unix)]
 #[test]
 fn authorized_tokens_are_bound_to_call_selection_and_file_inode() {
     let work = selected_call("work", "input.txt");
@@ -287,6 +290,7 @@ fn authorized_file_open_retains_selected_inode_after_path_swap() {
     assert_eq!(text, "selected");
 }
 
+#[cfg(unix)]
 #[test]
 fn overbroad_resolver_cannot_replace_explicit_or_ambiguous_workspace_selection() {
     struct Overbroad;
@@ -322,6 +326,7 @@ fn overbroad_resolver_cannot_replace_explicit_or_ambiguous_workspace_selection()
     assert!(roots.authorize_workspace(&baseline, "work").is_ok());
 }
 
+#[cfg(unix)]
 #[test]
 fn host_snapshots_bind_selected_origin_call_and_operation() {
     use crate::tool_policy::{authorize, ResourceResolver, ToolPolicy};
@@ -395,12 +400,17 @@ fn public_origin_url_resolves_to_the_exact_authorized_origin() {
     assert_eq!((authorized.url(), authorized.origin().as_str(), authorized.host()),
         ("https://example.com/a", "https://example.com", "example.com"));
     assert!(authorized.verify(&call).is_ok());
-    let token = AuthorizedFile::from_host_snapshot(&call, HostSnapshotSource::WebFetch { url: "https://example.com/a" }, b"body").unwrap();
-    assert!(token.verify(&call).is_ok());
-    assert!(token.verify_operation(ParseOperation::ExtractHtml).is_ok());
     // Another URL of the same origin is a different call; another origin is refused.
     let next = authorize(&context, "web_extract", &json!({"url":"https://example.com/b","selector":"p"}), &Unused).unwrap();
-    assert!(authorized.verify(&next).is_err() && token.verify(&next).is_err());
+    assert!(authorized.verify(&next).is_err());
+    // Snapshot tokens bind the snapshot's (dev, inode): Unix-only (fails closed elsewhere).
+    #[cfg(unix)]
+    {
+        let token = AuthorizedFile::from_host_snapshot(&call, HostSnapshotSource::WebFetch { url: "https://example.com/a" }, b"body").unwrap();
+        assert!(token.verify(&call).is_ok());
+        assert!(token.verify_operation(ParseOperation::ExtractHtml).is_ok());
+        assert!(token.verify(&next).is_err());
+    }
     assert!(AuthorizedFile::from_host_snapshot(&call, HostSnapshotSource::WebFetch { url: "https://example.com/b" }, b"x").is_err());
     assert!(authorize(&context, "web_extract", &json!({"url":"https://other.example/a","selector":"p"}), &Unused).is_err());
     // The PublicOrigins path does not extend to non-web snapshots.

@@ -629,7 +629,11 @@ async fn data_tool_auto_connects_and_explicit_connect_reuses_identity_across_pro
     let next_process: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
     let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &next_process, "agnes").await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
-    assert_eq!(authentications.load(Ordering::SeqCst), 1);
+    // Cross-process reuse comes from the on-disk connection cache, which is
+    // descriptor-pinned and Unix-only; off Unix it is deliberately disabled
+    // (duduclaw-odoo `connection_cache::store`), so the next process
+    // authenticates afresh.
+    assert_eq!(authentications.load(Ordering::SeqCst), if cfg!(unix) { 1 } else { 2 });
     server.abort();
 }
 

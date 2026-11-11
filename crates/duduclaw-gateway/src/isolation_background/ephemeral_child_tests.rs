@@ -21,7 +21,7 @@ fn request() -> EphemeralRequest {
 }
 /// The receipt `record_child` captures for `job` (self-delegation).
 fn child_receipt(job: &EphemeralJob) -> RecordAuthority {
-    let mut receipt = super::super::tests::receipt(Path::new("/trusted-home"));
+    let mut receipt = super::super::tests::receipt(&super::super::tests::trusted_home());
     receipt.kind = "delegation".into();
     receipt.id = message_id(&job.id);
     receipt.binding = Some(job.parent.binding.clone());
@@ -78,7 +78,7 @@ fn h13b_personal_spawn_ephemeral_requires_owner_initiated_parent() {
 /// A same-owner delegated background receipt: `bob` (Personal, same owner)
 /// delegated to `alice` from the owner's live run.
 fn delegated_receipt(owner: &str) -> RecordAuthority {
-    let mut receipt = super::super::tests::receipt(Path::new("/trusted-home"));
+    let mut receipt = super::super::tests::receipt(&super::super::tests::trusted_home());
     receipt.kind = "delegation".into();
     receipt.id = "message-1".into();
     receipt.binding = Some(personal(owner));

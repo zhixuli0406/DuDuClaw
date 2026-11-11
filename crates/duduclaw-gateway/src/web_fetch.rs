@@ -1033,6 +1033,9 @@ mod i1c_protected_tests {
         assert!(matches!(web_fetch_protected_cached(credential_url, 60, dir.path()).await,
             Err(FetchError::SsrfBlocked(_))));
     }
+    // Worker snapshots bind a (dev, inode) identity (`duduclaw_mcp_boundary::
+    // resources::file_identity`), which is Unix-only and refuses elsewhere.
+    #[cfg(unix)]
     #[tokio::test]
     async fn i1c_product_factory_passes_cached_html_fd_to_worker_and_preserves_result() {
         use std::io::Read;

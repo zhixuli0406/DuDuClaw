@@ -82,6 +82,8 @@ pub(crate) fn production_backend(home: PathBuf, employee: Arc<dyn MigrationAutho
     Arc::new(CompositeBackend::new(vec![employee, Arc::new(retire)]))
 }
 
-#[cfg(test)]
+// The retire engine reads apply.db through the hardened, Unix-only
+// `fs_safe::sqlite::open_existing` (fails closed elsewhere). Unix-only tests.
+#[cfg(all(test, unix))]
 #[path = "migration_authority_retire_tests.rs"]
 mod tests;

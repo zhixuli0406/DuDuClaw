@@ -35,7 +35,8 @@ fn private(path: &Path) {
 /// A home with the employee index. `incarnation_column = false` is the
 /// pre-F6a schema (no `incarnation` column yet).
 fn index(incarnation_column: bool) -> tempfile::TempDir {
-    let home = tempfile::tempdir().unwrap();
+    // Symlink-free root: the NOFOLLOW open refuses macOS's `/var` symlink.
+    let home = real_tempdir();
     std::fs::create_dir(home.path().join(APPLY_DB_DIR)).unwrap();
     let db = Connection::open(db_path(home.path())).unwrap();
     db.execute_batch("CREATE TABLE confirmed_employees (
@@ -159,7 +160,7 @@ fn token_v1_refused_for_protected_employee() {
 #[test]
 fn token_v1_still_accepted_without_protected_mode() {
     // No index at all: an ordinary install, byte-identical v1 behaviour.
-    let home = tempfile::tempdir().unwrap();
+    let home = real_tempdir();
     grace_config(home.path());
     assert_eq!(protected_employee(home.path(), "alice"), Ok(ProtectedEmployee::Unprotected));
     assert_eq!(agent_identity_env_vars(home.path(), "alice").len(), 1, "no key ⇒ id only");
@@ -365,7 +366,8 @@ fn unreadable_or_corrupt_index_refuses_protected_tokens() {
         (receipt("alice", ALICE_ID, false), Some(-1)),
         (receipt("alice", ALICE_ID, false), None),
     ] {
-        let home = tempfile::tempdir().unwrap();
+        // Symlink-free root so the failure is the corrupt row, not the path.
+        let home = real_tempdir();
         grace_config(home.path());
         ensure_key(home.path()).unwrap();
         std::fs::create_dir(home.path().join(APPLY_DB_DIR)).unwrap();
@@ -379,7 +381,7 @@ fn unreadable_or_corrupt_index_refuses_protected_tokens() {
         assert_closed(home.path(), &format!("row {receipt_json} / {incarnation:?}"));
     }
     // The index directory itself is not a directory.
-    let home = tempfile::tempdir().unwrap();
+    let home = real_tempdir();
     ensure_key(home.path()).unwrap();
     std::fs::write(home.path().join(APPLY_DB_DIR), b"").unwrap();
     assert_closed(home.path(), "index dir is a file");

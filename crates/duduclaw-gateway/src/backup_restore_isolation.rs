@@ -221,6 +221,18 @@ fn any_row_in_any_table(connection: &Connection) -> Result<bool, ()> {
 }
 
 fn apply_rows(root: &Path) -> Result<bool, ()> {
+    // Unix stats `migration-authority/apply.db` through a non-directory as
+    // ENOTDIR (Unknown below); Windows reports NotFound, which would read as
+    // Absent. Anything there but a plain directory cannot be ruled out.
+    #[cfg(not(unix))]
+    {
+        match std::fs::symlink_metadata(root.join(APPLY_DIR)) {
+            Ok(metadata) if !metadata.is_dir() => return Err(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(()),
+        }
+    }
     match open(&root.join(APPLY_DIR), APPLY_DB)? {
         Some(connection) => any_row_in_any_table(&connection),
         None => Ok(false),
@@ -255,9 +267,23 @@ mod tests {
         Connection::open(path).unwrap().execute_batch(sql).unwrap();
     }
 
+    /// A temp root with no symlinked path component: [`open`] uses
+    /// `SQLITE_OPEN_NOFOLLOW`, which SQLite applies to every path component,
+    /// and macOS's temp dir sits under `/var -> /private/var`.
+    fn real_tempdir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        {
+            tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            tempfile::tempdir().unwrap()
+        }
+    }
+
     #[test]
     fn l3_archive_without_isolation_state_is_absent() {
-        let root = tempfile::tempdir().unwrap();
+        let root = real_tempdir();
         assert_eq!(inspect(root.path()), ArchiveIsolation::Absent);
         // An ordinary v1.80 / v1.81 single-binary home: users.db (even with
         // the empty mirror and removal tables), empty isolation stores, other
@@ -303,7 +329,7 @@ mod tests {
             ("isolation directory, any case", |root| std::fs::create_dir_all(root.join("Isolation_Future")).unwrap()),
         ];
         for (name, plant) in plants {
-            let root = tempfile::tempdir().unwrap();
+            let root = real_tempdir();
             plant(root.path());
             assert_eq!(inspect(root.path()), ArchiveIsolation::Present, "{name}");
         }
@@ -323,12 +349,12 @@ mod tests {
             ("file in place of migration-authority", |root| std::fs::write(root.join(APPLY_DIR), b"x").unwrap()),
         ];
         for (name, plant) in plants {
-            let root = tempfile::tempdir().unwrap();
+            let root = real_tempdir();
             plant(root.path());
             assert_eq!(inspect(root.path()), ArchiveIsolation::Unknown, "{name}");
         }
         // Present wins over unknown.
-        let root = tempfile::tempdir().unwrap();
+        let root = real_tempdir();
         std::fs::write(root.path().join(USERS_DB), b"not a SQLite database").unwrap();
         std::fs::create_dir_all(root.path().join(QUARANTINE_DIR)).unwrap();
         assert_eq!(inspect(root.path()), ArchiveIsolation::Present);
@@ -336,7 +362,7 @@ mod tests {
 
     #[test]
     fn l3_inspection_connection_is_hardened() {
-        let root = tempfile::tempdir().unwrap();
+        let root = real_tempdir();
         db(&root.path().join(USERS_DB), "CREATE TABLE users(id TEXT);");
         let connection = open(root.path(), USERS_DB).unwrap().unwrap();
         assert!(connection.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE).unwrap());

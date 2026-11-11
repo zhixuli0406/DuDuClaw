@@ -18,7 +18,25 @@ const LOGIN_SESSION_ENV: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO",
 ];
 const TERMINAL_RETENTION: Duration = Duration::from_secs(300);
-type Master = Arc<Mutex<Box<dyn MasterPty + Send>>>;
+/// The PTY master. `None` once the Windows supervisor has closed the
+/// pseudoconsole after the child exited (see `start_pty`); Unix never clears it.
+type Master = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
+/// Windows only: bound on ClosePseudoConsole itself. Closing should complete
+/// promptly because the reader thread keeps draining; if it does not, the
+/// supervisor waits at most this long again for the output EOF and then
+/// reports the outcome anyway, so `wait`/`kill` can never hang on a stall.
+#[cfg(windows)]
+const CONPTY_CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Windows only: after a natural exit, conhost may still be rendering the
+/// child's final output. Close only once the output has been idle this long
+/// (measured from the later of reap and the last read) ...
+#[cfg(windows)]
+const CONPTY_TAIL_IDLE: Duration = Duration::from_millis(200);
+/// ... or this long after the child was reaped, whichever comes first.
+#[cfg(windows)]
+const CONPTY_TAIL_CAP: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const CONPTY_TAIL_POLL: Duration = Duration::from_millis(20);
 
 struct Entry {
     employee: EmployeeId,
@@ -340,7 +358,9 @@ impl ExecutionBackend for LocalBackend {
             let master = self.runs.lock().map_err(|_| BackendError::Unavailable)?
                 .get(&run.0).ok_or(BackendError::NotFound)?.master.clone()
                 .ok_or(BackendError::Denied)?;
-            master.lock().map_err(|_| BackendError::Unavailable)?.resize(pty_size(size))
+            let guard = master.lock().map_err(|_| BackendError::Unavailable)?;
+            // `None`: the Windows pseudoconsole was already closed after exit.
+            guard.as_ref().ok_or(BackendError::Denied)?.resize(pty_size(size))
                 .map_err(|_| BackendError::Io)
         })
     }
@@ -371,6 +391,31 @@ fn kill_group(pid: Option<u32>) {
 struct GroupOnDrop(Option<u32>);
 impl GroupOnDrop { fn disarm(&mut self) { self.0 = None; } }
 impl Drop for GroupOnDrop { fn drop(&mut self) { kill_group(self.0.take()); } }
+
+/// Windows: takes the pseudoconsole out of the shared slot (lock held only for
+/// the take, never while closing).
+#[cfg(windows)]
+fn take_console(master: &Master) -> Option<Box<dyn MasterPty + Send>> {
+    master.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+}
+
+/// Windows: closes the pseudoconsole if the PTY supervisor ends without having
+/// done so (task dropped at runtime shutdown, `spawn_blocking` unavailable).
+/// The close runs on a fresh thread because ClosePseudoConsole can block.
+#[cfg(windows)]
+struct ConsoleOnDrop(Master);
+#[cfg(windows)]
+impl ConsoleOnDrop {
+    fn close_detached(&self) {
+        if let Some(console) = take_console(&self.0) {
+            // If the thread cannot be spawned the closure (and console) is
+            // dropped here; blocking is the only remaining option then.
+            let _ = std::thread::Builder::new().spawn(move || drop(console));
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for ConsoleOnDrop { fn drop(&mut self) { self.close_detached(); } }
 
 struct PtyOnDrop(Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>);
 impl PtyOnDrop { fn disarm(&mut self) { self.0 = None; } }
@@ -547,8 +592,19 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
     let pid = child.process_id();
     entry.pid = pid;
     let mut killer = child.clone_killer();
-    let master = Arc::new(Mutex::new(pair.master));
+    let master = Arc::new(Mutex::new(Some(pair.master)));
+    // Windows: the supervisor closes the pseudoconsole once the child is gone
+    // (see below), so it keeps its own handle to the shared master slot. The
+    // guard also closes it if the supervisor is dropped before doing so.
+    #[cfg(windows)]
+    let console = ConsoleOnDrop(master.clone());
     entry.master = Some(master);
+    // Windows: the reader stamps every successful read (millis since `epoch`)
+    // so the supervisor can tell when conhost has stopped rendering output.
+    #[cfg(windows)]
+    let (epoch, last_read) = (Instant::now(), Arc::new(AtomicU64::new(0)));
+    #[cfg(windows)]
+    let read_stamp = last_read.clone();
     let (cancel, mut cancelled) = mpsc::channel(1);
     entry.cancel = Some(cancel.clone());
     let budget = Arc::new(OutputBudget::new(output_limit, cancel));
@@ -557,24 +613,56 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
     let (read_tx, read_rx) = mpsc::channel(16);
     std::thread::spawn(move || {
         let mut buffer = [0u8; 8192];
+        // Windows: output is "active" both when it is read and while it is
+        // being delivered, so a reader held up by a slow consumer (blocked in
+        // the send below) is not mistaken for an idle console.
+        #[cfg(windows)]
+        let stamp = || read_stamp.store(epoch.elapsed().as_millis() as u64, Ordering::Release);
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
+                    #[cfg(windows)]
+                    stamp();
                     if !reader_budget.charge(count) {
                         let _ = read_tx.try_send(Err(BackendError::Denied));
                         break;
                     }
-                    if !pty_send(&read_tx, Ok(buffer[..count].to_vec()), &reader_budget) { break; }
+                    #[cfg(not(windows))]
+                    let sent = pty_send(&read_tx, Ok(buffer[..count].to_vec()), &reader_budget);
+                    #[cfg(windows)]
+                    let sent = pty_send_stamped(&read_tx, Ok(buffer[..count].to_vec()), &reader_budget, &stamp);
+                    if !sent { break; }
                 },
                 Err(_error) => {
                     // Unix PTYs commonly report EIO when the last slave closes.
                     #[cfg(unix)]
                     if _error.raw_os_error() == Some(libc::EIO) { break; }
+                    // ConPTY's equivalent: the output pipe reports a broken
+                    // (ERROR_BROKEN_PIPE) or disconnected pipe
+                    // (ERROR_PIPE_NOT_CONNECTED, 233) once the pseudoconsole
+                    // has been closed.
+                    #[cfg(windows)]
+                    if _error.kind() == std::io::ErrorKind::BrokenPipe || _error.raw_os_error() == Some(233) {
+                        break;
+                    }
                     let _ = read_tx.try_send(Err(BackendError::Io));
                     break;
                 },
             }
+        }
+        // Windows: ClosePseudoConsole may block until conhost has written its
+        // final output, and the master still holds its own read handle, so the
+        // output pipe must keep being drained while the supervisor closes it.
+        // When forwarding stopped early (cancel, output budget, receiver gone)
+        // keep reading and discard until the pipe reports EOF / an error,
+        // which happens once the pseudoconsole is closed. After a real EOF or
+        // error the next read returns immediately, so this is a no-op there.
+        // The sender is dropped first so the consumer sees EOF right away.
+        #[cfg(windows)]
+        {
+            drop(read_tx);
+            while matches!(reader.read(&mut buffer), Ok(count) if count > 0) {}
         }
         let _ = read_done.send(());
     });
@@ -632,6 +720,82 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
         };
         group.disarm();
         teardown.disarm();
+        // Windows ConPTY: unlike a Unix PTY (EIO once the last slave closes),
+        // the output pipe never reaches EOF while the pseudoconsole exists,
+        // even after the child has exited. The master lives in the backend
+        // entry, so without closing it here the wait below never finishes —
+        // and after a cancel (already consumed by the select above) with no
+        // runtime deadline, `kill`/`wait` hung forever. The child is reaped at
+        // this point, so close the pseudoconsole now: off the async runtime,
+        // because ClosePseudoConsole can block while conhost flushes, and
+        // outside the master lock so a concurrent `resize` is not held up.
+        // The reader thread keeps draining the pipe meanwhile (and, after a
+        // natural exit, still forwards the final output to the consumer).
+        // Set when a cancel or the runtime deadline cut the tail idle-wait
+        // short (see below); the EOF wait is then bounded as well.
+        #[cfg(windows)]
+        let mut tail_cut = false;
+        #[cfg(windows)]
+        let close_stalled = {
+            // Natural exit only: conhost renders asynchronously and some
+            // Windows builds do not flush on close, so first let the output
+            // go idle (bounded). Cancel / timeout / budget close immediately.
+            if !budget.stopping.load(Ordering::Acquire) && !budget.exceeded.load(Ordering::Acquire) {
+                let reaped = epoch.elapsed();
+                loop {
+                    let now = epoch.elapsed();
+                    let active = Duration::from_millis(last_read.load(Ordering::Acquire)).max(reaped);
+                    if now.saturating_sub(active) >= CONPTY_TAIL_IDLE || now.saturating_sub(reaped) >= CONPTY_TAIL_CAP {
+                        break;
+                    }
+                    // The child already exited on its own; this wait is only
+                    // extra delay we add for conhost. A cancel or the runtime
+                    // deadline therefore just ends it (close now) and must
+                    // not turn the natural exit into Cancelled/RuntimeTimeout
+                    // or stop forwarding the tail.
+                    tokio::select! {
+                        _ = tokio::time::sleep(CONPTY_TAIL_POLL) => {},
+                        _ = cancelled.recv() => { tail_cut = true; break; },
+                        _ = &mut deadline, if runtime_ms != 0 => {
+                            // A completed `Sleep` stays ready; push it out so
+                            // the EOF wait below does not report a timeout.
+                            deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 60 * 60));
+                            tail_cut = true;
+                            break;
+                        },
+                    }
+                }
+            }
+            // Bound only the close itself; the output EOF is awaited below
+            // exactly as on Unix, so a slow consumer still gets every byte.
+            let slot = console.0.clone();
+            let closing = tokio::task::spawn_blocking(move || drop(take_console(&slot)));
+            match tokio::time::timeout(CONPTY_CLOSE_GRACE, closing).await {
+                Ok(Ok(())) => false,
+                // The blocking pool refused or lost the task: close on a
+                // dedicated thread instead and treat it like a stall.
+                Ok(Err(_)) => { console.close_detached(); true },
+                Err(_) => true,
+            }
+        };
+        // Only if the close stalled (or a reader blocked by a consumer is
+        // keeping it from completing) stop waiting for EOF after a bounded
+        // fallback, so `kill`/`wait` can never hang. Unix never needs this.
+        //
+        // The same bound applies when the tail wait was cut (`tail_cut`):
+        // the child is reaped and the console was just closed, so the reader
+        // normally reaches EOF promptly and `read_completion` wins. But a
+        // cancel consumed above cannot be observed again here, and the
+        // deadline was disarmed, so if the reader is stuck delivering to a
+        // consumer that stopped reading, nothing else would end this wait
+        // and the `kill` that sent the cancel would hang.
+        #[cfg(windows)]
+        let eof_fallback = async move {
+            if close_stalled || tail_cut { tokio::time::sleep(CONPTY_CLOSE_GRACE).await } else { std::future::pending::<()>().await }
+        };
+        #[cfg(not(windows))]
+        let eof_fallback = std::future::pending::<()>();
+        tokio::pin!(eof_fallback);
         tokio::select! {
             _ = read_completion => {},
             reason = cancelled.recv() => {
@@ -642,6 +806,7 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
                 budget.stopping.store(true, Ordering::Release);
                 outcome = RunOutcome::RuntimeTimeout;
             },
+            _ = &mut eof_fallback => {},
         }
         let outcome = if budget.exceeded.load(Ordering::Acquire) { RunOutcome::Rejected } else { outcome };
         completion.send_replace(Some(outcome));
@@ -649,6 +814,7 @@ fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySize, prompt: 
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn pty_send(tx: &mpsc::Sender<Result<Vec<u8>, BackendError>>, mut message: Result<Vec<u8>, BackendError>,
     budget: &OutputBudget) -> bool
 {
@@ -659,6 +825,27 @@ fn pty_send(tx: &mpsc::Sender<Result<Vec<u8>, BackendError>>, mut message: Resul
             Err(mpsc::error::TrySendError::Closed(_)) => return false,
             Err(mpsc::error::TrySendError::Full(value)) => {
                 message = value;
+                std::thread::sleep(Duration::from_millis(5));
+            },
+        }
+    }
+}
+
+/// Windows `pty_send`: additionally calls `stamp` after each delivery and on
+/// every retry while the channel is full, keeping the ConPTY tail idle-wait
+/// from treating a consumer-blocked reader as an idle console.
+#[cfg(windows)]
+fn pty_send_stamped(tx: &mpsc::Sender<Result<Vec<u8>, BackendError>>, mut message: Result<Vec<u8>, BackendError>,
+    budget: &OutputBudget, stamp: &dyn Fn()) -> bool
+{
+    loop {
+        if budget.stopping.load(Ordering::Acquire) { return false; }
+        match tx.try_send(message) {
+            Ok(()) => { stamp(); return true },
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(value)) => {
+                message = value;
+                stamp();
                 std::thread::sleep(Duration::from_millis(5));
             },
         }

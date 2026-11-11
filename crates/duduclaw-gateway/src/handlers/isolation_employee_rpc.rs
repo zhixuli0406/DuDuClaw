@@ -1114,6 +1114,9 @@ pub(crate) async fn invalidate_employee_approvals(home: &Path, label: &str, empl
     }
 }
 
-#[cfg(test)]
+// The fixture records receipts and reads apply.db/users.db through the
+// hardened `fs_safe::sqlite::open_existing`, which is Unix-only (fails closed
+// elsewhere, like protected mode itself). Unix-only tests.
+#[cfg(all(test, unix))]
 #[path = "isolation_employee_rpc_tests.rs"]
 mod tests;

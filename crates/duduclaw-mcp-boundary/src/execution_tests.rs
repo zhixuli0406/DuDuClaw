@@ -39,6 +39,10 @@ fn bind_plan(call: &AuthorizedToolCall, policy: SpawnPolicy) -> AuthorizedExecut
     AuthorizedExecutionPlan::new(roots.authorize_workspace(call, "work").unwrap(), policy).unwrap()
 }
 
+// Binding a plan to a workspace needs the retained directory's (dev, inode)
+// identity (`resources::file_identity`), which is Unix-only and fails closed
+// elsewhere; isolated execution itself only exists on Linux. Every test that
+// reaches `bind_plan`/`test_workspace` is therefore `#[cfg(unix)]`.
 fn test_workspace() -> std::fs::File {
     static DIRECTORY: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     std::fs::File::open(DIRECTORY.get_or_init(|| tempfile::tempdir().unwrap()).path()).unwrap()
@@ -184,6 +188,7 @@ async fn isolated_execution_handler_refusal_precedes_reservation() {
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_execution_bad_plan_cancels_without_spawn() {
     let backend = Arc::new(Backend::default());
@@ -193,6 +198,7 @@ async fn isolated_execution_bad_plan_cancels_without_spawn() {
     assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_execution_spawn_failure_is_uncertain_and_cancelled() {
     let backend = Arc::new(Backend { fail_spawn: true, ..Default::default() });
@@ -202,6 +208,7 @@ async fn isolated_execution_spawn_failure_is_uncertain_and_cancelled() {
     assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_execution_returns_queued_handle_without_waiting() {
     for tool in ["codrive_run"] {
@@ -227,6 +234,7 @@ async fn isolated_execution_never_cancels_a_forged_caller_reservation() {
     assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn isolated_execution_plan_requires_registered_runtime_workspace_and_class() {
     let context = context("codrive_run");
@@ -252,6 +260,7 @@ fn isolated_execution_plan_requires_registered_runtime_workspace_and_class() {
     for name in ["memory_search", "unknown", "codrive_run_extra", "skill_extract"] { assert!(!bridge.supports(name)); }
 }
 
+#[cfg(unix)]
 #[test]
 fn isolated_execution_plan_cannot_be_built_from_another_selected_workspace() {
     let context = context("codrive_run");
@@ -314,6 +323,7 @@ async fn isolated_execution_resource_refusal_precedes_reservation() {
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_execution_resource_change_after_prepare_cancels_before_spawn() {
     let backend = Arc::new(Backend::default());
@@ -335,6 +345,7 @@ async fn legacy_backend_is_not_ready_and_never_receives_a_protected_spawn() {
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn backend_cannot_substitute_a_same_named_different_workspace_root() {
     let backend = Arc::new(Backend { wrong_workspace: true, ..Default::default() });
@@ -344,6 +355,7 @@ async fn backend_cannot_substitute_a_same_named_different_workspace_root() {
     assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn execution_resource_rechecks_run_off_reactor_and_refuse_revocation() {
     struct ThreadCheckedResolver {
@@ -373,6 +385,7 @@ async fn execution_resource_rechecks_run_off_reactor_and_refuse_revocation() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn execution_resource_change_during_final_handler_check_cancels_before_spawn() {
     use std::sync::atomic::AtomicBool;
@@ -421,7 +434,7 @@ async fn execution_resource_change_during_final_handler_check_cancels_before_spa
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(feature = "binding-store")]
+#[cfg(all(unix, feature = "binding-store"))]
 #[tokio::test]
 async fn isolated_execution_collector_retries_queued_io_without_cancelling() {
     use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
@@ -444,7 +457,7 @@ async fn isolated_execution_collector_retries_queued_io_without_cancelling() {
     assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(feature = "binding-store")]
+#[cfg(all(unix, feature = "binding-store"))]
 #[tokio::test]
 async fn isolated_execution_failed_spawn_persists_uncertainty_and_job_selector() {
     use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
@@ -460,7 +473,7 @@ async fn isolated_execution_failed_spawn_persists_uncertainty_and_job_selector()
     assert_eq!(jobs.read(&owner, "codrive_run", RunHandle(RunId([9; 16]))).unwrap()["status"], "uncertain");
 }
 
-#[cfg(feature = "binding-store")]
+#[cfg(all(unix, feature = "binding-store"))]
 #[tokio::test]
 async fn isolated_execution_aborted_insert_cannot_leave_a_pending_record() {
     use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};

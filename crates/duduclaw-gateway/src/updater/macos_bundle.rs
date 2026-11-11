@@ -1194,6 +1194,9 @@ mod tests {
 
     const EXE: &str = "DuDuClaw Gateway.app/Contents/MacOS/duduclaw";
 
+    // The extractor runs only in the macOS updater (`install_into`).
+    // On Windows the fixture zips built here are refused (no Unix host modes).
+    #[cfg(unix)]
     #[test]
     fn strict_extractor_accepts_a_signed_bundle_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1210,6 +1213,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn strict_extractor_refuses_unsafe_archives_without_writing_them() {
         let pro = "DuDuClaw Gateway.app/Contents/MacOS/duduclaw-pro";

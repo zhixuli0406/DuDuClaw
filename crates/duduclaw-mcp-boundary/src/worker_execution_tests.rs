@@ -54,11 +54,18 @@ fn call() -> AuthorizedToolCall {
     tool_policy::authorize(&context(), "model_load", &json!({}),
         &Resolver { calls: AtomicUsize::new(0), changes: false }).unwrap()
 }
+// A `WorkerPlan` carries an `AuthorizedFile`, which binds the input's
+// (dev, inode) identity: Unix-only (`resources::file_identity` fails closed
+// elsewhere, and the isolated worker only exists on Linux). Tests that build
+// a plan are `#[cfg(unix)]`; pure request/reply checks run everywhere.
 fn plan() -> WorkerPlan { plan_for(&call()) }
+fn table_parse_request(input: &std::fs::File) -> ParseRequest {
+    table_request(input, &TableOptions { kind: TableKind::Csv, delimiter: b',',
+        has_header: true, offset: 0, limit: 2, sheet: None }).unwrap()
+}
 fn plan_for(call: &AuthorizedToolCall) -> WorkerPlan {
     let input = tempfile::tempfile().unwrap();
-    let request = table_request(&input, &TableOptions { kind: TableKind::Csv, delimiter: b',',
-        has_header: true, offset: 0, limit: 2, sheet: None }).unwrap();
+    let request = table_parse_request(&input);
     WorkerPlan::new(request, crate::resources::AuthorizedFile::for_test(call, input)).unwrap()
 }
 fn reply(request: &ParseRequest) -> WorkerReply {
@@ -80,6 +87,7 @@ fn bridge(refused: bool, changes: bool, forged: bool) -> (WorkerToolBridge, Arc<
     (bridge, factory, invocations)
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_worker_factory_serves_only_registered_worker_routes() {
     let (bridge, factory, invocations) = bridge(false, false, false);
@@ -99,6 +107,7 @@ async fn isolated_worker_factory_policy_refusal_never_launches() {
     assert_eq!(factory.finishes.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_worker_factory_rechecks_resource_after_parse() {
     let (bridge, factory, invocations) = bridge(false, true, false);
@@ -107,6 +116,7 @@ async fn isolated_worker_factory_rechecks_resource_after_parse() {
     assert_eq!(factory.finishes.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_worker_factory_rejects_forged_result_before_finish() {
     let (bridge, factory, invocations) = bridge(false, false, true);
@@ -115,6 +125,7 @@ async fn isolated_worker_factory_rejects_forged_result_before_finish() {
     assert_eq!(factory.finishes.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn isolated_worker_factory_bounds_plan_and_output_bytes() {
     let mut plan = plan();
@@ -134,7 +145,7 @@ fn isolated_worker_factory_bounds_plan_and_output_bytes() {
 
 #[test]
 fn isolated_worker_factory_checks_output_artifact_digest() {
-    let mut request = plan().request;
+    let mut request = table_parse_request(&tempfile::tempfile().unwrap());
     request.outputs = List::new(vec![duduclaw_isolation::worker::OutputFd {
         slot: 1, max_bytes: 4.try_into().unwrap(),
     }]).unwrap();
@@ -149,6 +160,7 @@ fn isolated_worker_factory_checks_output_artifact_digest() {
     assert!(validate_reply(&request, &result).is_err());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_worker_rejects_other_calls_regular_file_before_invoke() {
     struct WrongInput;
@@ -194,6 +206,7 @@ impl WorkerPlanFactory for StatefulFactory {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_worker_host_metadata_stays_request_local_across_concurrent_calls() {
     let bridge = WorkerToolBridge::new(Arc::new(StatefulFactory),

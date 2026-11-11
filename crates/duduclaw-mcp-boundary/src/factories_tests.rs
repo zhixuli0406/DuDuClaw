@@ -27,8 +27,23 @@ fn table_call() -> AuthorizedToolCall {
     crate::tool_policy::authorize(&context("csv_read"), "csv_read",
         &json!({"workspace":"work","path":"table.csv"}), resolver(false, false).as_ref()).unwrap()
 }
+// `AuthorizedFile`/`AuthorizedWorkspace` bind the descriptor's (dev, inode)
+// identity, which is Unix-only (`resources::file_identity` fails closed
+// elsewhere; the isolated worker/execution path only exists on Linux). Tests
+// that mint such a token are `#[cfg(unix)]`.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn table_input(call: &AuthorizedToolCall, file: std::fs::File) -> AuthorizedFile {
     AuthorizedFile::for_test(call, file)
+}
+/// A directory handle: Windows needs FILE_FLAG_BACKUP_SEMANTICS to open one.
+fn open_directory(path: &std::path::Path) -> std::fs::File {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(0x02000000).open(path).unwrap()
+    }
+    #[cfg(not(windows))]
+    { std::fs::File::open(path).unwrap() }
 }
 
 struct Resolver { calls: AtomicUsize, changes: bool, refuses: bool }
@@ -76,6 +91,7 @@ async fn isolated_boot_resource_authorization_precedes_factory() {
     assert_eq!(plans.0.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_boot_resource_change_during_factory_is_refused() {
     struct ChangedPlans(Arc<AtomicUsize>);
@@ -108,7 +124,7 @@ async fn isolated_boot_plan_cannot_select_workspace_outside_resolved_grants() {
     let call = crate::tool_policy::authorize(&context, "execute_program", &json!({}), resolver(false, false).as_ref()).unwrap();
     let mut roots = crate::resources::ResourceRoots::default();
     let directory = tempfile::tempdir().unwrap();
-    roots.insert("other".into(), context.record().employee, std::fs::File::open(directory.path()).unwrap()).unwrap();
+    roots.insert("other".into(), context.record().employee, open_directory(directory.path())).unwrap();
     // Both workspaces occur in the capability, but this operation resolves only work.
     assert!(matches!(roots.authorize_workspace(&call, "other"), Err(VerificationError::BindingMismatch)));
 }
@@ -134,6 +150,7 @@ fn options() -> TableOptions {
 }
 fn table() -> Value { json!({"columns":["name"],"rows":[{"name":"員工"}],"truncated":false}) }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_worker_adapter_delivers_authorized_fd_and_bounded_options() {
     let invoked = Arc::new(AtomicUsize::new(0));
@@ -154,6 +171,7 @@ async fn isolated_worker_adapter_delivers_authorized_fd_and_bounded_options() {
     assert_eq!(invoked.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn isolated_worker_adapter_rejects_mismatched_input_and_untrusted_result() {
     let invoked = Arc::new(AtomicUsize::new(0));
@@ -188,6 +206,7 @@ fn isolated_worker_adapter_bounds_utf8_result_chunks() {
     assert!(encode_table_result(&request, json!("員".repeat(MAX_RESULT_TEXT_BYTES))).is_err());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn table_parser_refuses_a_token_from_another_call_before_transport() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -217,6 +236,7 @@ fn revocable_call(live: Arc<Revocable>) -> AuthorizedToolCall {
         resolver(false, false).as_ref()).unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn table_queued_on_blocking_pool_rechecks_revocation_before_transport() {
     use std::{future::Future, task::Poll};
@@ -249,6 +269,7 @@ fn table_queued_on_blocking_pool_rechecks_revocation_before_transport() {
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn authorized_input_rechecks_authority_at_each_snapshot_read() {
     use std::io::{Read, Seek, Write};
@@ -263,6 +284,7 @@ fn authorized_input_rechecks_authority_at_each_snapshot_read() {
     assert_eq!(input.read(&mut buffer).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
 }
 
+#[cfg(unix)]
 #[test]
 fn dropped_table_request_fences_queued_job_without_revoking_connection() {
     use std::task::Poll;

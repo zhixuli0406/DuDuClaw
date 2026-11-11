@@ -142,7 +142,9 @@ impl MaterializationStore {
     }
 }
 
-#[cfg(test)]
+// Materialization is part of the Linux root import: `validate` requires Unix
+// absolute workspaces (RootDir/Normal only), which Windows paths never are.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::{contract::{ProposalOperationId, ImportedBlob}, import_receiver::ContentClass};
@@ -224,7 +226,9 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// The allocation workspace is a tempdir; on Windows it carries a drive prefix,
+// which the (Linux-only) Unix-absolute workspace check refuses by design.
+#[cfg(all(test, unix))]
 mod partial_batch_tests {
     use super::*;
     use crate::{contract::{ProposalOperationId, ImportedBlob}, import_receiver::ContentClass};

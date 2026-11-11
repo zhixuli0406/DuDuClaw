@@ -26,7 +26,8 @@ pub use personal_delegation::{DelegationError,
 pub(crate) use personal_delegation::shown_task as personal_delegation_shown_task;
 #[cfg(test)]
 pub(crate) use personal_delegation::test_support as personal_delegation_test_support;
-#[cfg(test)]
+// Real authority stores through the Unix-only hardened SQLite opener.
+#[cfg(all(test, unix))]
 mod lifecycle_tests;
 /// Shown when background work is asked of a Personal employee. Such an
 /// employee only acts for its owner in a live session (never a Background
@@ -676,6 +677,9 @@ mod tests {
             proposal_id: duduclaw_migration::ids::RequestId([id; 16]), revision: 1 },
             proposal_digest: duduclaw_isolation::ids::Sha256Digest([id; 32]) }
     }
+    /// A home that is absolute on every platform (receipts require one;
+    /// "/trusted-home" has no drive prefix on Windows). Never touched on disk.
+    pub(super) fn trusted_home() -> PathBuf { std::env::temp_dir().join("trusted-home") }
     pub(super) fn receipt(home: &Path) -> RecordAuthority {
         RecordAuthority { home: home.to_owned(), kind: "cron".into(), id: "original-record".into(),
             agent: "alice".into(), employee: EmployeeId([1;16]),
@@ -690,7 +694,7 @@ mod tests {
 
     #[test]
     fn background_authority_binds_owner_record_and_original_epochs() {
-        let receipt = receipt(Path::new("/trusted-home"));
+        let receipt = receipt(&trusted_home());
         assert!(check_material(&receipt, "alice", Some("user:original-user"), &receipt.material).is_ok());
         for (agent, owner, digest) in [("bob", Some("user:original-user"), receipt.material.as_str()),
             ("alice", None, receipt.material.as_str()), ("alice", Some("user:other"), receipt.material.as_str()),
@@ -709,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn background_authority_is_one_use_and_does_not_cross_spawn() {
         assert!(take_record().is_err());
-        RECORD.scope(Mutex::new(Some(receipt(Path::new("/trusted-home")))), async {
+        RECORD.scope(Mutex::new(Some(receipt(&trusted_home()))), async {
             assert!(tokio::spawn(async { take_record().is_err() }).await.unwrap());
             assert_eq!(take_record().unwrap().epoch, 7);
             assert!(take_record().is_err());

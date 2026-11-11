@@ -115,6 +115,28 @@ mod tests_v2;
 #[cfg(test)]
 mod tests_sr5;
 
+/// Test helper: a temp directory whose path has no symlinked component.
+///
+/// The confirmed employee index is opened with `SQLITE_OPEN_NOFOLLOW` on Unix
+/// (see `lifecycle::open_read_only`), and SQLite then refuses the path if ANY
+/// component is a symlink. On macOS the system temp dir lives under
+/// `/var/folders/...` and `/var -> /private/var` is a symlink, so a plain
+/// `tempfile::tempdir()` makes every index read fail closed. Canonicalizing
+/// the temp root keeps production fail-closed while letting the fixtures
+/// exercise the real read path. Non-Unix opens do not use NOFOLLOW, so the
+/// plain temp dir is kept there (avoids `\\?\` verbatim paths on Windows).
+#[cfg(test)]
+pub(crate) fn real_tempdir() -> tempfile::TempDir {
+    #[cfg(unix)]
+    {
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        tempfile::tempdir().unwrap()
+    }
+}
+
 pub use lifecycle::{
     any_confirmed_employee, protected_employee, AgentIncarnation, LifecycleUnavailable, ProtectedEmployee, APPLY_DB_DIR,
     APPLY_DB_FILE,

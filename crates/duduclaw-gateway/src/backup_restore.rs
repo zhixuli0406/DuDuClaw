@@ -1992,6 +1992,12 @@ mod isolation_tests {
     }
 
     fn home_with_name() -> (tempfile::TempDir, std::path::PathBuf) {
+        // Symlink-free parent: the L3 isolation inspection opens databases
+        // with SQLITE_OPEN_NOFOLLOW, which refuses ANY symlinked component
+        // (macOS temp dirs sit under `/var -> /private/var`).
+        #[cfg(unix)]
+        let parent = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        #[cfg(not(unix))]
         let parent = tempfile::tempdir().unwrap();
         let home = parent.path().join("duduclaw");
         std::fs::create_dir(&home).unwrap();

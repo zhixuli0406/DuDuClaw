@@ -772,7 +772,9 @@ mod tests {
 
     #[test]
     fn installed_boot_cannot_be_reused_for_another_employee_home_or_name() {
-        let home = PathBuf::from("/installed-home");
+        // Homes must be absolute on every platform ("/x" is not on Windows).
+        let home = std::env::temp_dir().join("installed-home");
+        let another = std::env::temp_dir().join("another-home");
         let registry = Arc::new(ConnectorProviderRegistry::default());
         let bindings = Arc::new(Mutex::new(BindingStore::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap()));
         let resolver = Arc::new(GatewayResourceResolver::new(home.clone(), EmployeeId([1;16]), "bot".into(), bindings).unwrap());
@@ -781,7 +783,7 @@ mod tests {
         for (path, name, employee) in [
             (home.as_path(), "other", EmployeeId([1;16])),
             (home.as_path(), "bot", EmployeeId([2;16])),
-            (std::path::Path::new("/another-home"), "bot", EmployeeId([1;16])),
+            (another.as_path(), "bot", EmployeeId([1;16])),
         ] { assert_eq!(installed.verify_identity(path, name, employee), Err(VerificationError::BindingMismatch)); }
         assert_eq!(installed.verify_identity(&home, "bot", EmployeeId([1;16])), Err(VerificationError::Unavailable),
             "the right identity does not make an incomplete provider registry ready");

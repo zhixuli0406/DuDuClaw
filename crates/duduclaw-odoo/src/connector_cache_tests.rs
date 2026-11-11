@@ -67,6 +67,11 @@ async fn server(auth_result: Value, status: u16) -> (OdooConfig, Arc<AtomicUsize
 
 #[tokio::test]
 async fn cached_uid_skips_auth_and_edition_but_data_call_sends_current_credential() {
+    // The on-disk cache is descriptor-pinned and therefore Unix-only; off Unix
+    // it is deliberately disabled (`connection_cache::store`), so every
+    // connect authenticates afresh. Expect exactly that on each platform.
+    let cached = cfg!(unix);
+    let hit = usize::from(!cached);
     let (config, auth, total, task) = server(json!({"result":7}), 200).await;
     let home = TestHome::new();
     let first = OdooConnector::connect_cached(&config, "key-one", Some(home.path()), vec![3]).await.unwrap();
@@ -75,15 +80,18 @@ async fn cached_uid_skips_auth_and_edition_but_data_call_sends_current_credentia
     assert_eq!(auth.load(Ordering::SeqCst), 1);
     let first_total = total.load(Ordering::SeqCst);
     let second = OdooConnector::connect_cached(&config, "key-one", Some(home.path()), vec![3]).await.unwrap();
-    assert_eq!(auth.load(Ordering::SeqCst), 1);
-    assert_eq!(total.load(Ordering::SeqCst), first_total, "cache hit must make no authentication, edition or version RPC");
+    assert_eq!(auth.load(Ordering::SeqCst), 1 + hit);
+    if cached {
+        assert_eq!(total.load(Ordering::SeqCst), first_total, "cache hit must make no authentication, edition or version RPC");
+    }
     assert_eq!(first.connection_identity(), second.connection_identity());
     second.execute_kw("crm.lead", "search_read", vec![], json!({})).await.unwrap();
-    assert_eq!(auth.load(Ordering::SeqCst), 1);
+    assert_eq!(auth.load(Ordering::SeqCst), 1 + hit);
+    // A different credential or company scope never reuses a cached identity.
     OdooConnector::connect_cached(&config, "key-two", Some(home.path()), vec![3]).await.unwrap();
-    assert_eq!(auth.load(Ordering::SeqCst), 2);
+    assert_eq!(auth.load(Ordering::SeqCst), 2 + hit);
     OdooConnector::connect_cached(&config, "key-two", Some(home.path()), vec![4]).await.unwrap();
-    assert_eq!(auth.load(Ordering::SeqCst), 3);
+    assert_eq!(auth.load(Ordering::SeqCst), 3 + hit);
     task.abort();
 }
 
