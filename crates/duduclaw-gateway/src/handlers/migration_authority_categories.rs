@@ -86,6 +86,7 @@ impl McpPlan {
 #[cfg(test)] mod tests {
     use super::*;
     use duduclaw_migration::{confirmation::{ConfirmationStore,ApprovalSession},import_manifest::PendingProposal,ids::RequestId};
+    #[cfg(unix)]
     #[test]
     fn migration_authority_planted_admin_and_mcp_inactive_until_individual_confirmation() {
         let home=tempfile::tempdir().unwrap();
