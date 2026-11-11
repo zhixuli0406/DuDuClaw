@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS 企業版 binary 的簽章驗證腳本在 Python 3.14 讀取 entitlements 時會失敗，已修正。
+
 ## [1.81.0] - 2026-11-11 — 工具權限表、我的記憶與 Email 驗證碼代寄
 
 ### Added

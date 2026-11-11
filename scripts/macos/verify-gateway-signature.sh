@@ -41,7 +41,7 @@ for artifact in "$APP" "$EXE"; do
 import plistlib, sys
 with open(sys.argv[1], "rb") as f:
     expected = plistlib.load(f)
-if plistlib.load(sys.stdin.buffer) != expected:
+if plistlib.loads(sys.stdin.buffer.read()) != expected:
     sys.exit("Entitlements mismatch")
 ' "$ENTITLEMENTS"
     assessment="$(spctl -a -vv -t exec "$artifact" 2>&1)"
