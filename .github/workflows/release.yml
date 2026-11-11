@@ -130,6 +130,26 @@ jobs:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
+      # The verification tool (not the product source) follows the workflow
+      # revision, so a broken verifier inside a signed tag can be fixed via
+      # workflow_dispatch instead of moving the tag. The binary is still built
+      # from the tag commit before this step runs.
+      - name: Use workflow revision of the gateway verify script (macOS)
+        if: runner.os == 'macOS' && github.sha != needs.delivery-gate.outputs.commit
+        shell: bash
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+          TAG_COMMIT: ${{ needs.delivery-gate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::workflow SHA is not a 40-char lowercase hex commit"
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
+          git checkout FETCH_HEAD -- scripts/macos/verify-gateway-signature.sh
+          echo "verify-gateway-signature.sh taken from workflow revision $WORKFLOW_SHA (build source commit: $TAG_COMMIT)"
+
       - name: Build, sign and notarize macOS gateway
         if: runner.os == 'macOS'
         env:
