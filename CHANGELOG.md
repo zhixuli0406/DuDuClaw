@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- macOS 企業版 binary 的簽章驗證腳本在 Python 3.14 讀取 entitlements 時會失敗，已修正。
+- macOS 企業版 binary 的簽章驗證腳本在 Python 3.14 讀取 entitlements 時會失敗，且新版 macOS 會把單獨的命令列 binary 判為「不是 app」而拒絕檢查，已修正並改用命令列工具適用的公證檢查。
 
 ## [1.81.0] - 2026-11-11 — 工具權限表、我的記憶與 Email 驗證碼代寄
 
