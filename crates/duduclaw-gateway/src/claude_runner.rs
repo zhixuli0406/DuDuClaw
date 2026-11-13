@@ -3799,9 +3799,6 @@ async fn get_api_key(home_dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Hard max timeout — absolute safety net to kill truly hung processes.
-const HARD_MAX_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
-
 /// Response from a Claude CLI call, including optional token usage telemetry.
 struct ClaudeResponse {
     text: String,
@@ -3936,7 +3933,7 @@ fn claude_tool_result_content_text(content: &serde_json::Value) -> Option<String
 /// Spawn a `claude` CLI process with streaming output and read the result.
 ///
 /// Uses `--output-format stream-json --verbose`. No idle timeout — the process
-/// runs until it completes or hits the hard max timeout (30 min safety net).
+/// runs until it completes or hits the effective runtime timeout.
 /// An optional `on_progress` callback receives `ProgressEvent`s for keepalive
 /// and tool-use progress (used by channel reply; cron/dispatch pass `None`).
 ///
@@ -3945,6 +3942,7 @@ async fn call_claude_streaming(
     cmd: &mut tokio::process::Command,
     on_progress: Option<&crate::channel_reply::ProgressCallback>,
     protected_input: Option<(&Path, &str, &str, &str)>,
+    hard_max_timeout_secs: u64,
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -4027,7 +4025,7 @@ async fn call_claude_streaming(
     keepalive.reset();
 
     // Hard max timeout — absolute safety net
-    let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS));
+    let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(hard_max_timeout_secs));
     tokio::pin!(hard_deadline);
 
     loop {
@@ -4183,10 +4181,10 @@ async fn call_claude_streaming(
             }
 
             _ = &mut hard_deadline => {
-                warn!("claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process");
+                warn!("claude CLI hard timeout ({hard_max_timeout_secs}s) — killing process");
                 child.kill_and_reap().await;
                 return Err(format!(
-                    "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, partial output: {} chars)",
+                    "claude CLI hard timeout ({hard_max_timeout_secs}s, partial output: {} chars)",
                     result_text.len()
                 ));
             }
@@ -4409,7 +4407,7 @@ pub(crate) fn signed_mcp_config_cli_args(
         return Ok(None);
     };
     let guard = bind_delegation_mcp_config(&mut args, guard,
-        || delegation_context_env(home_dir, worker, HARD_MAX_TIMEOUT_SECS))?;
+        || delegation_context_env(home_dir, worker, crate::runtime_config::claude_timeout_secs(home_dir, config_dir.or(work_dir))))?;
     Ok(Some((args, guard)))
 }
 
@@ -5057,6 +5055,9 @@ async fn call_claude_with_env(
     // Team-as-Agent: identity-scoped config dir + explicit `--mcp-config`.
     identity: SpawnIdentity<'_>,
 ) -> Result<ClaudeResponse, String> {
+    let home = identity.config_dir.or(work_dir).and_then(duduclaw_core::preset::agent_home_dir)
+        .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
+    let hard_max_timeout_secs = crate::runtime_config::claude_timeout_secs(&home, identity.config_dir.or(work_dir));
     if duduclaw_core::execution_gate::isolation_required() {
         if !env_vars.is_empty() || effort.is_some() || identity.mcp_config.is_some() {
             return Err(protected_claude_options_refusal());
@@ -5064,7 +5065,7 @@ async fn call_claude_with_env(
         let agent_dir = identity.config_dir.or(work_dir).ok_or_else(protected_claude_options_refusal)?;
         let system_prompt = system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
         let mut marker = tokio::process::Command::new("root-selected-claude");
-        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model))).await;
+        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model)), hard_max_timeout_secs).await;
     }
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
     // `_cmd_guards` holds the `--system-prompt-file` and (RFC-23 §13.6)
@@ -5097,7 +5098,7 @@ async fn call_claude_with_env(
     // outside its workspace (e.g. `~/.claude`).
     crate::runtime::apply_native_sandbox(&mut cmd, capabilities, work_dir, "claude")?;
 
-    call_claude_streaming(&mut cmd, None, None).await
+    call_claude_streaming(&mut cmd, None, None, hard_max_timeout_secs).await
 }
 
 pub(crate) fn protected_claude_options_refusal() -> String {
@@ -6578,7 +6579,7 @@ mod process_tree_cancellation_tests {
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.current_dir(dir.path())
             .args(["-c", "/bin/sleep 300 & echo $! > grandchild.pid; wait"]);
-        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None, None).await });
+        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None, None, 1800).await });
         let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(pid) = std::fs::read_to_string(dir.path().join("grandchild.pid"))

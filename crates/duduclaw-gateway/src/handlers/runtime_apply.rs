@@ -167,6 +167,12 @@ pub(crate) fn apply_runtime_to_table_reporting(
     table: &mut toml::Table,
     params: &Value,
 ) -> Result<RuntimeApplyOutcome, String> {
+    apply_runtime_with_timeout_ceiling(table, params, crate::runtime_config::MAX_TIMEOUT_SECS)
+}
+
+pub(crate) fn apply_runtime_with_timeout_ceiling(
+    table: &mut toml::Table, params: &Value, max_timeout_secs: u64,
+) -> Result<RuntimeApplyOutcome, String> {
     let mut changes: Vec<String> = Vec::new();
     let mut deprecated: Vec<DeprecatedRuntimeWrite> = Vec::new();
 
@@ -186,8 +192,8 @@ pub(crate) fn apply_runtime_to_table_reporting(
     // formatting and publishes nothing if this closure returns an error.
     let timeout_secs = rt.get("timeout_secs");
     if let Some(value) = timeout_secs.filter(|v| !v.is_null()) {
-        if !value.as_i64().is_some_and(|secs| (30..=3600).contains(&secs)) {
-            return Err("單次執行時間上限必須是 30–3600 秒的整數".to_string());
+        if !value.as_u64().is_some_and(|secs| (30..=max_timeout_secs).contains(&secs)) {
+            return Err(format!("單次執行時間上限必須是 30–{max_timeout_secs} 秒的整數（全域上限）"));
         }
     }
 
@@ -427,4 +433,15 @@ mod timeout_tests {
         apply_runtime_to_table(&mut table, &serde_json::json!({"runtime": {"timeout_secs": null}})).unwrap();
         assert!(table["runtime"].get("timeout_secs").is_none());
     }
+
+    #[test]
+    fn employee_save_obeys_configured_timeout_ceiling() {
+        let mut table = toml::Table::new();
+        assert!(apply_runtime_with_timeout_ceiling(&mut table, &serde_json::json!({"runtime":{"timeout_secs":601}}), 600)
+            .unwrap_err().contains("600"));
+        assert!(table.is_empty());
+        apply_runtime_with_timeout_ceiling(&mut table, &serde_json::json!({"runtime":{"timeout_secs":12000}}), 14400).unwrap();
+        assert_eq!(table["runtime"]["timeout_secs"].as_integer(), Some(12000));
+    }
+
 }

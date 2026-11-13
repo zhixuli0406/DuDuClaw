@@ -538,7 +538,8 @@ pub(super) async fn spawn_claude_cli_with_env(
     keepalive.reset(); // don't fire immediately
 
     // Hard max timeout — absolute safety net
-    let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS));
+    let hard_max_timeout_secs = crate::runtime_config::claude_timeout_secs(home_dir, work_dir);
+    let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(hard_max_timeout_secs));
     tokio::pin!(hard_deadline);
 
     loop {
@@ -997,7 +998,7 @@ pub(super) async fn spawn_claude_cli_with_env(
             // Priority 3: hard max timeout — kill truly hung processes
             _ = &mut hard_deadline => {
                 warn!(
-                    "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process"
+                    "claude CLI hard timeout ({hard_max_timeout_secs}s) — killing process"
                 );
                 child.kill_and_reap().await;
                 if result_text.is_empty() && !assistant_text.is_empty() {
@@ -1007,7 +1008,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                 }
                 if result_text.is_empty() {
                     return Err(format!(
-                        "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, no output)"
+                        "claude CLI hard timeout ({hard_max_timeout_secs}s, no output)"
                     ));
                 }
                 warn!(

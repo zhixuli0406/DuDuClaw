@@ -152,6 +152,10 @@ pub fn check_timeout_widening(
     may_widen: bool,
 ) -> Result<(), String> {
     let Some(secs) = secs else { return Ok(()) };
+    let global_max = crate::runtime_config::TimeoutPolicy::load(home_dir).max_secs;
+    if secs > global_max {
+        return Err(format!("timeout_secs exceeds the global ceiling ({global_max} s)"));
+    }
     if may_widen {
         return Ok(());
     }
@@ -248,6 +252,9 @@ async fn create_goal_task_inner(
         return Err("cost_cap_cents must be a positive integer <= 9223372036854775807".into());
     }
     check_timeout_secs(req.timeout_secs)?;
+    // Every producer, including Admins and scheduled goals, obeys the
+    // deployment ceiling. Caller-specific widening is checked at admission.
+    check_timeout_widening(home_dir, &req.agent_id, req.timeout_secs, true)?;
     let duration_hours = match req.duration_hours {
         None => None,
         Some(h) if (1.0..=720.0).contains(&h) => Some(h),
@@ -664,5 +671,31 @@ mod tests {
         let mut bad = req("a");
         bad.timeout_secs = Some(4000);
         assert!(create_goal_task(home.path(), &store, bad).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn global_ceiling_also_restricts_admin_goals() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=600\n").unwrap();
+        assert!(check_timeout_widening(home.path(), "worker", Some(601), true).is_err());
+        assert!(check_timeout_widening(home.path(), "worker", Some(600), true).is_ok());
+    }
+
+    #[test]
+    fn global_default_and_ceiling_never_widen_non_admin_goal_authority() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[runtime]\nprovider='claude'\n").unwrap();
+        std::fs::write(home.path().join("config.toml"), "[runtime]\ndefault_timeout_secs=1200\nmax_timeout_secs=7200\n").unwrap();
+        assert!(check_timeout_widening(home.path(), "worker", Some(301), false).is_err());
+        assert!(check_timeout_widening(home.path(), "worker", Some(300), false).is_ok());
+        std::fs::write(dir.join("agent.toml"), "[runtime]\nprovider='claude'\ntimeout_secs=120\n").unwrap();
+        assert!(check_timeout_widening(home.path(), "worker", Some(121), false).is_err());
     }
 }

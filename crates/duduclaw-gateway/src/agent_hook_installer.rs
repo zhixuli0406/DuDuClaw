@@ -600,7 +600,7 @@ fn build_named_hook_command(duduclaw_bin: &Path, hook: &str, agent_id: &str, hom
 
 /// `<home>` for `<home>/agents/<id>` or `<home>/agents/.ephemeral/<id>`;
 /// `None` for any other shape.
-fn home_of_agent_dir(agent_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn home_of_agent_dir(agent_dir: &Path) -> Option<PathBuf> {
     let parent = agent_dir.parent()?;
     let agents = if parent
         .file_name()

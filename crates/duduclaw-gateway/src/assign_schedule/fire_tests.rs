@@ -484,7 +484,7 @@ async fn a_non_admin_schedule_only_narrows_the_run_limit_and_it_reaches_the_goal
     let o = org(dir.path());
     let store = TaskStore::open(dir.path()).unwrap();
     let manager = Creator::new(&o.mgr, false).unwrap();
-    // `sales-rep` has no `[runtime] timeout_secs`: its own limit is 300 s.
+    // The authorization baseline for an unset employee stays 300 s.
     let mut wider = weekly_goal("寫週報");
     wider.payload.timeout_secs = Some(600);
     assert!(create(dir.path(), &store, &manager, wider, now()).await.is_err());
@@ -578,4 +578,21 @@ async fn scheduled_non_admin_work_pauses_when_target_becomes_main_or_default() {
             assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
         }
     }
+}
+
+#[tokio::test]
+async fn existing_admin_schedule_clamps_to_lowered_global_ceiling() {
+    let (dir, reg) = home().await;
+    let o = org(dir.path());
+    let store = TaskStore::open(dir.path()).unwrap();
+    let admin = Creator::new(&o.admin, true).unwrap();
+    let mut req = weekly_goal("clamped goal");
+    req.payload.timeout_secs = Some(3600);
+    create(dir.path(), &store, &admin, req.clone(), now()).await.unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[runtime]\nmax_timeout_secs=600\n").unwrap();
+    assert!(create(dir.path(), &store, &admin, req, now()).await.is_err());
+    let report = tick(dir.path(), &reg, at("2026-10-26T01:00:20Z")).await.unwrap();
+    assert_eq!(report.created.len(), 1);
+    let task = store.get_task(&report.created[0]).await.unwrap().unwrap();
+    assert_eq!(task.timeout_secs, Some(600));
 }

@@ -213,9 +213,9 @@ export function isAdminOnlyPath(path: string, serverList?: ReadonlyArray<string>
 }
 
 /** Match the gateway's effective timeout (unset/wrong type = 300). */
-export function effectiveRuntimeTimeout(value: unknown): number {
+export function effectiveRuntimeTimeout(value: unknown, fallback = 300, ceiling = 14400): number {
   return typeof value === 'number' && Number.isInteger(value)
-    ? Math.min(3600, Math.max(30, value)) : 300;
+    ? Math.min(ceiling, Math.max(30, value)) : fallback;
 }
 
 export function runtimeTimeoutNeedsAdmin(before: unknown, after: unknown): boolean {

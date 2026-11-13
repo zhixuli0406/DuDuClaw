@@ -934,7 +934,7 @@ impl MethodHandler {
 
             // ── Runtime ([runtime] section, RT.1) ──
             // provider enum / fallback.
-            let rt_outcome = apply_runtime_to_table_reporting(table, &params_clone)?;
+            let rt_outcome = super::runtime_apply::apply_runtime_with_timeout_ceiling(table, &params_clone, crate::runtime_config::TimeoutPolicy::load(&home_for_update).max_secs)?;
             changes.extend(rt_outcome.changes);
             if let Ok(mut slot) = deprecated_for_closure.lock() {
                 *slot = rt_outcome.deprecated;
@@ -1167,7 +1167,7 @@ impl MethodHandler {
 
             // ── v1.68 authority guard: a real change to an org-guarded key
             // needs an admin; every change is audited after the commit. ──
-            let authority = super::agents_update_v168::authority_diff(&table_before, table);
+            let authority = super::agent_authority::authority_diff_with_timeout_policy(&table_before, table, crate::runtime_config::TimeoutPolicy::load(&home_for_update));
             if !authority.is_empty() && !caller_is_admin {
                 let keys: Vec<&str> = authority.iter().map(|c| c.key.as_str()).collect();
                 // The model↔provider auto-align above is what moved the

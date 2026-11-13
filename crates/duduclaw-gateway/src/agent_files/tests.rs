@@ -262,3 +262,13 @@ fn user_writes_mask_before_hash_history_disk_and_baseline() {
     let again = commit_locked(&commit(&home, FileKey::User, None), |_| Ok(raw.into()), || Ok(())).unwrap();
     assert!(again.unchanged);
 }
+
+
+#[test]
+fn pending_cap_is_configurable_and_invalid_values_keep_twenty() {
+    assert_eq!(AgentFilesConfig::default().max_pending_per_user, 20);
+    for (literal, expected) in [("1", 1), ("200", 200), ("0", 20), ("201", 20), ("'bad'", 20)] {
+        let t: toml::Table = format!("max_pending_per_user={literal}").parse().unwrap();
+        assert_eq!(AgentFilesConfig::from_table(&t).max_pending_per_user, expected);
+    }
+}

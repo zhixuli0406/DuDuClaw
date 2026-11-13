@@ -259,7 +259,7 @@ impl MethodHandler {
         // the dashboard onboarding pick a non-Claude backend at create time
         // instead of a follow-up update. No `runtime` key ⇒ no-op (existing
         // callers unaffected). Invalid provider ⇒ fail and clean up the dir.
-        let runtime_outcome = match apply_runtime_to_table_reporting(&mut agent_config, &params) {
+        let runtime_outcome = match super::runtime_apply::apply_runtime_with_timeout_ceiling(&mut agent_config, &params, crate::runtime_config::TimeoutPolicy::load(&self.home_dir).max_secs) {
             Ok(o) => o,
             Err(e) => return WsFrame::error_response("", &e),
         };

@@ -142,6 +142,9 @@ export type OrgChartAgent = Pick<AgentInfo, 'name' | 'role'> & Partial<Pick<Agen
   'display_name' | 'status' | 'icon' | 'reports_to' | 'department'>>;
 
 export interface AgentDetail extends AgentInfo {
+  timeout_authorization_ceiling_secs?: number;
+  effective_timeout_secs?: number;
+  max_timeout_secs?: number;
   budget: AgentBudget;
   model: AgentModel;
   sandbox_enabled?: boolean;
@@ -3504,7 +3507,7 @@ export type RuntimeProvider =
  *  string clears the fallback. */
 export interface AgentRuntime {
   provider?: RuntimeProvider;
-  /** Per-run CLI / per-request OpenAI-compatible API limit, 30–3600 seconds. Claude is fixed at 30 minutes. Null clears it. */
+  /** Per-run CLI / per-request OpenAI-compatible API limit for all runtimes including Claude, from 30 seconds to the global ceiling. Null clears it. */
   timeout_secs?: number | null;
   /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
   fallback?: string;

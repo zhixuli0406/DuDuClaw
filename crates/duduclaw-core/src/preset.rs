@@ -86,8 +86,8 @@ pub const PRESET_BINDINGS_SCHEMA: i64 = 1;
 const ORG_TABLE: &str = "agent";
 const SECRET_TABLES: &[&str] = &["channels", "odoo"];
 const PER_AGENT_SCALAR_FIELDS: &[(&str, &str)] = &[
-    // Clearing a per-agent timeout must mean the fixed 300-second default,
-    // never reveal a wider preset value behind the Owner authority gate.
+    // Clearing a per-agent timeout adopts the provider/global policy default,
+    // never a wider preset value behind the Owner authority gate.
     ("runtime", "timeout_secs"),
     ("os_watch", "paths"),
     ("model", "account_pool"),

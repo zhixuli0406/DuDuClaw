@@ -59,7 +59,7 @@ where
     if value.is_wrong_type() {
         static WRONG_TYPE_WARNING: std::sync::Once = std::sync::Once::new();
         WRONG_TYPE_WARNING.call_once(|| {
-            tracing::warn!("[runtime] timeout_secs must be integer seconds; using 300s for wrong-typed settings");
+            tracing::warn!("[runtime] timeout_secs must be integer seconds; using the runtime default for wrong-typed settings");
         });
     }
     Ok(value.value())

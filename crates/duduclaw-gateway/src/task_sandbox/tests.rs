@@ -447,3 +447,13 @@ fn codex_isolation_refusal_preserves_file_and_cannot_bypass() {
     }
     assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn sandbox_timeout_applies_current_global_ceiling_to_container_and_old_task() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=600\n").unwrap();
+    assert_eq!(super::effective_sandbox_timeout(home.path(), "anna", 7_200_000), std::time::Duration::from_secs(600));
+    crate::runtime_config::TASK_TIMEOUT_SECS.scope(Some(("anna".into(), 3600)), async {
+        assert_eq!(super::effective_sandbox_timeout(home.path(), "anna", 7_200_000), std::time::Duration::from_secs(600));
+    }).await;
+}

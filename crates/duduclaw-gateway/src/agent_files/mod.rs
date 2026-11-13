@@ -183,6 +183,7 @@ pub(crate) struct AgentFilesConfig {
     pub review_daily_limit_per_agent: u32,
     /// Checks one person may start per minute.
     pub checks_per_minute: u32,
+    pub max_pending_per_user: usize,
     /// What a review that did not complete counts as (`warn` or `block`;
     /// there is deliberately no "off").
     pub on_analysis_failure: verdict::Verdict,
@@ -198,6 +199,7 @@ impl Default for AgentFilesConfig {
             review_daily_limit_per_user: 40,
             review_daily_limit_per_agent: 60,
             checks_per_minute: 10,
+            max_pending_per_user: 20,
             on_analysis_failure: verdict::Verdict::Warn,
             review_provider: None,
             review_model: None,
@@ -233,6 +235,9 @@ impl AgentFilesConfig {
         }
         if let Some(n) = int("checks_per_minute", 1_000) {
             c.checks_per_minute = n.max(1);
+        }
+        if let Some(n) = t.get("max_pending_per_user").and_then(|v| v.as_integer()).filter(|n| (1..=200).contains(n)) {
+            c.max_pending_per_user = n as usize;
         }
         // Only "block" changes anything; every other value keeps "warn".
         if t.get("on_analysis_failure").and_then(|v| v.as_str()) == Some("block") {
