@@ -261,11 +261,12 @@ pub(crate) async fn mcp_post_handler(
             ),
             "ping" => jsonrpc_response(&id, json!({})),
             "tools/list" => {
-                crate::mcp::handle_tools_list_for_agent(
+                crate::mcp::handle_tools_list_for_transport(
                     &id,
                     &principal,
                     &state.home_dir,
                     &state.dispatcher.default_agent,
+                    state.dispatcher.is_remote_bearer(),
                 )
                 .await
             }
@@ -446,11 +447,12 @@ async fn modern_request(
             crate::mcp_protocol::discover_result(json!({ "tools": {} })),
         ),
         "tools/list" => with_cache_hints(
-            crate::mcp::handle_tools_list_for_agent(
+            crate::mcp::handle_tools_list_for_transport(
                 id,
                 principal,
                 &state.home_dir,
                 &state.dispatcher.default_agent,
+                state.dispatcher.is_remote_bearer(),
             )
             .await,
             crate::mcp_protocol::TOOLS_LIST_TTL_MS,

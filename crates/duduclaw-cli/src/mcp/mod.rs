@@ -332,6 +332,9 @@ mod mail_tool_tests;
 mod mcp_scope_dispatch_tests;
 #[cfg(test)]
 mod odoo_pool_dispatch_tests;
+/// v1.82 (RM-134): per-agent keys on the HTTP transport vs process-agent tools.
+#[cfg(test)]
+mod per_agent_bearer_tests;
 /// RM-120: explicit-grant generic `odoo_create` / `odoo_write`.
 #[cfg(test)]
 mod odoo_generic_write_tests;

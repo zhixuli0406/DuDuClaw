@@ -26,8 +26,9 @@ https://<你的網址>/mcp
 ```
 
 claude.ai 會自動走 OAuth 探索（RFC 9728 → RFC 8414 → 動態註冊），把你導到
-DuDuClaw 的授權頁。頁面上貼一把**內部 MCP API key**（`config.toml [mcp_keys]` 中
-`is_external = false` 的 key）按「同意連線」即完成。
+DuDuClaw 的授權頁。頁面上貼一把**內部 MCP API key**（在「管理 → 整合 → MCP API 金鑰」
+建立、未勾選「外部用戶端」、未停用也未到期的金鑰；v1.82 起這些金鑰已不在 `config.toml`）
+按「同意連線」即完成。
 
 ## 固定 origin 與代理設定
 

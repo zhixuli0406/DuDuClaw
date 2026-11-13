@@ -303,7 +303,41 @@ pub(crate) async fn push_health_notice(
     text: &str,
     targets: Vec<(String, String)>,
 ) -> Receipt {
+    push_plain_notice(home, "employee.health", text, targets).await
+}
+
+/// Verified channel identities of every active Admin account — where
+/// installation-wide notices (RM-134 MCP key expiry) go. No identity store
+/// means nobody to notify.
+pub(crate) fn admin_targets(home: &Path) -> Result<Vec<(String, String)>, String> {
+    let Some(db) = crate::decision_notify::open_user_db(home)? else { return Ok(Vec::new()) };
+    let mut targets = Vec::new();
+    for user in db.list_users()? {
+        if user.status != duduclaw_auth::UserStatus::Active || user.role != duduclaw_auth::UserRole::Admin {
+            continue;
+        }
+        for link in db.verified_channels_for_user(&user.id)? {
+            let target = (link.channel, link.channel_user_id);
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    Ok(targets)
+}
+
+/// A plain notice (no decision buttons) to verified-user DM targets, with
+/// quiet-hour deferral. `notify_type` labels the deferred row and the stats.
+pub(crate) async fn push_plain_notice(
+    home: &Path,
+    notify_type: &'static str,
+    text: &str,
+    targets: Vec<(String, String)>,
+) -> Receipt {
     let mut receipt = Receipt::empty();
+    if targets.is_empty() {
+        return receipt;
+    }
     let Ok(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() else { return receipt; };
     let level = crate::notify_governance::NotifyLevel::Confirm;
     let policy = crate::notify_governance::QuietPolicy {
@@ -315,7 +349,7 @@ pub(crate) async fn push_health_notice(
             let queued = crate::notify_governance::enqueue(home, crate::notify_governance::DeferredNotice {
                 id: uuid::Uuid::new_v4().to_string(), agent_id: String::new(),
                 channel: channel.clone(), chat_id: chat_id.clone(),
-                level: level.as_str().into(), notify_type: "employee.health".into(),
+                level: level.as_str().into(), notify_type: notify_type.into(),
                 queued_at: chrono::Utc::now().to_rfc3339(), deliver_after: until.to_rfc3339(),
                 kind: crate::notify_governance::NoticeKind::Plain, text: text.into(), link: None,
                 no_button_hint: None, decision_source: None, decision_id: None,
@@ -328,7 +362,7 @@ pub(crate) async fn push_health_notice(
                 receipt.attempted += 1;
                 if crate::channel_sender::send_plain_text(home, &http, &channel, &token, &chat_id, text).await {
                     outcome = DeliverOutcome::Sent;
-                    crate::notify_stats::record_push(home, "employee.health", level, None);
+                    crate::notify_stats::record_push(home, notify_type, level, None);
                     break;
                 }
             }

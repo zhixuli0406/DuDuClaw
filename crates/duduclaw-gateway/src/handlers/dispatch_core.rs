@@ -448,7 +448,7 @@ impl MethodHandler {
                 WsFrame::ok_response("", boxed_frame(|| crate::inference_local::stop()).await)
             }
 
-            // ── MCP API keys (global config.toml [mcp_keys], MK.1–MK.4) ──
+            // ── MCP API keys (hashed store mcp_keys.db, RM-134; OAuth grants) ──
             "mcp_oauth_grants.list" => {
                 require_admin!();
                 boxed_frame(|| self.handle_mcp_oauth_grants_list()).await
@@ -462,18 +462,8 @@ impl MethodHandler {
                 }
                 boxed_frame(|| self.handle_mcp_oauth_grants_revoke(params, ctx)).await
             }
-            "mcp_keys.list" => {
-                require_admin!();
-                boxed_frame(|| self.handle_mcp_keys_list()).await
-            }
-            "mcp_keys.create" => {
-                require_admin!();
-                boxed_frame(|| self.handle_mcp_keys_create(params)).await
-            }
-            "mcp_keys.revoke" => {
-                require_admin!();
-                boxed_frame(|| self.handle_mcp_keys_revoke(params)).await
-            }
+            // `mcp_keys.*` (RM-134) is routed in `MethodHandler::dispatch`
+            // before any extension, like the other bearer-secret namespaces.
 
             // ── Kill switch (global ~/.duduclaw/KILLSWITCH.toml, KS.1–KS.2) ──
             "killswitch.get" => {

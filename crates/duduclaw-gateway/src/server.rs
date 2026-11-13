@@ -743,6 +743,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         ))
     })?);
 
+    // RM-134 (v1.82) — move dashboard-issued `[mcp_keys]` entries into the
+    // hashed key store (`mcp_keys.db`) and out of config.toml. Runs after the
+    // internal key provisioning above (which records that key's fingerprint).
+    // Idempotent and crash-safe: the pending set is recorded first, an entry
+    // leaves config only once the store holds it and its audit record is
+    // written; until then it stays pending, where the legacy window still
+    // accepts it. Once nothing is pending the completion marker is written
+    // and config.toml is never consulted for a non-internal key again; a
+    // later `[mcp_keys]` entry is reported as ignored, never imported.
+    match crate::mcp_keys_lifecycle::migrate_config_keys(&home_dir) {
+        Ok(report) if report.inserted + report.removed_from_config + report.kept_in_config > 0 => {
+            info!(?report, "MCP key store migration");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "MCP key store migration did not complete; keys stay in config.toml"),
+    }
+
     // RM-166 (round 2, owner decision 2026-11-09) — record once when this
     // release first started on this home, for the dashboard's 30-day
     // "strict mode is on" notice. Never writes config.toml and never weakens
@@ -1376,6 +1393,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
     tokio::spawn(crate::employee_health::run(home_dir.clone(), handler.registry().clone()));
+    // RM-134: MCP key expiry notices (7 days / 1 day before), gateway-lock holder only.
+    tokio::spawn(crate::mcp_keys_lifecycle::run_expiry_notices(home_dir.clone()));
 
     // ── Channel-outage alerting ─────────────────────────────────────────
     // `channel_failures.jsonl` previously had no reverse notification path —

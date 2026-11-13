@@ -18,36 +18,8 @@ use super::*;
 /// silently drifted (2026-08 audit — see that module's doc comment).
 pub(crate) const KNOWN_MCP_SCOPES: &[&str] = duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS;
 
-/// Validate an MCP API key against `^ddc_(prod|staging|dev)_[a-f0-9]{32}$`
-/// (mirrors `duduclaw-cli::mcp_auth::is_valid_key_format`).
-pub(crate) fn is_valid_mcp_key_format(key: &str) -> bool {
-    let rest = match key.strip_prefix("ddc_") {
-        Some(r) => r,
-        None => return false,
-    };
-    let hex = if let Some(h) = rest.strip_prefix("prod_") {
-        h
-    } else if let Some(h) = rest.strip_prefix("staging_") {
-        h
-    } else if let Some(h) = rest.strip_prefix("dev_") {
-        h
-    } else {
-        return false;
-    };
-    hex.len() == 32
-        && hex
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-}
-
-/// Generate a fresh MCP API key of the form `ddc_<env>_<32hex>`.
-/// `env` must already be validated to one of prod/staging/dev.
-pub(crate) fn generate_mcp_key(env: &str) -> String {
-    // `Uuid::simple()` renders 32 lowercase hex chars (`[a-f0-9]{32}`) — exactly
-    // the suffix format required by `is_valid_mcp_key_format`.
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
-    format!("ddc_{env}_{suffix}")
-}
+// RM-134 (v1.82): key generation and the format check moved to the hashed
+// key store (`duduclaw_auth::mcp_keys` / `duduclaw_core::mcp_key_store`).
 
 /// Mask an MCP key for display: keep the `ddc_<env>_` prefix + first 4 hex of
 /// the suffix, replace the rest with `…`. NEVER returns the full key.

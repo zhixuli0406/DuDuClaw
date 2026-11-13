@@ -706,6 +706,15 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
         }
 
+        // RM-134 dashboard MCP API keys are gateway-owned bearer secrets too.
+        // The whole namespace is Admin-only; a refused mutation is audited,
+        // and an unknown member is refused by the handler. The gate, the
+        // refusal audit and the handler run in ONE boxed frame so nothing of
+        // this branch is embedded in the shared dispatcher future.
+        if method.split('.').next() == Some("mcp_keys") {
+            return boxed_frame(|| self.route_mcp_keys_rpc(method, params, ctx)).await;
+        }
+
         // RM-064 status credentials are gateway-owned bearer secrets. Route
         // before extension dispatch so no plugin sees a freshly issued one.
         if let Some(role) = status_tokens_rpc::minimum_role(method) {

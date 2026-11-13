@@ -471,6 +471,28 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 `[google] requesters`（預設 `bound_people`，另有 `owner_only`、`anyone`）這一頁還沒有控制項，用 `agents.google_identity_set`（`anyone` 要加 `confirm_anyone: true`）或設定檔進階編輯（管理員）設定。非管理員的擁有者改 `agent.toml` 時，`[google]` 只能改得更窄（改成 `none`、拿掉 `fallback`、收緊 `requesters`）。細節見[每位 AI 員工用不同的 Google 帳號](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
+## 整合 → MCP API 金鑰（v1.82）
+
+只有管理員。金鑰存在 `<home>/mcp_keys.db`，只保存每把金鑰的 SHA-256 指紋；完整金鑰只在建立後顯示一次。這一頁的任何操作都不會寫入 `config.toml`。下列每一項變更都會連同操作者記入安全稽核紀錄（`security_audit.jsonl`）；非管理員的嘗試被拒絕時也會記錄。
+
+| 控制項 | 寫入 | 生效 |
+|---|---|---|
+| 建立金鑰：名稱、金鑰用途、用戶端 ID／AI 員工代號、環境、權限範圍、到期 | `mcp_keys.db` 新增一列（`mcp_keys.create`） | 立即。名稱必填、不可重複（不分大小寫），最多 60 個字元。**外部整合**（以用戶端 ID）：一律是外部金鑰（`is_external: false` 會被拒絕）；用戶端 ID 不能是 AI 員工的代號或名稱，也不能是系統保留名稱（`dashboard`、`cron`、`default`、`gateway-internal`……）；權限範圍只有伺服器列出可給外部金鑰的那幾項（`memory:read`、`memory:write`、`wiki:read`、`wiki:write`、`messaging:send`），其他範圍會被拒絕並註明是哪一項。**AI 員工自己的金鑰**（`agent_id`；RFC-21 的每位員工專用金鑰、v1.76 的 Google 專用金鑰）：代表該員工的內部金鑰，可帶 v1.81 對話框提供過的權限範圍，不能帶 `admin`；同仁的個人專屬員工只有擁有者，或重新驗證身分並留下稽核的管理員能建立。到期可選 30 天、90 天（預設）、365 天、自訂日期（到當天結束為止）或**不過期**。選不過期會顯示風險說明，必須勾選確認；稽核紀錄會記下誰在何時確認。 |
+| 重新命名 | 該列名稱（`mcp_keys.rename`） | 立即。用這把金鑰同意過的 OAuth 連線不受影響。 |
+| 變更到期日 | 該列到期日（`mcp_keys.set_expiry`） | 下一次呼叫。選項同建立時；延長已到期的金鑰會讓它恢復可用。到期通知會重新計算。 |
+| 停用／啟用 | `disabled_at`／`disabled_by`（`mcp_keys.disable`／`mcp_keys.enable`） | 下一次呼叫，閘道與所有執行中的 `mcp-server`／`http-server` 都一樣（它們每次呼叫都重讀儲存區）。停用與到期的金鑰收到相同的「已到期或已停用」拒絕訊息。 |
+| 刪除（需確認） | 將該列標為已刪除（`mcp_keys.delete`） | 下一次呼叫。該列從清單消失；指紋保留，所以舊的金鑰副本（例如還原的 `config.toml` 備份）永遠不會復活。 |
+| 橫幅：7 天內到期的金鑰 | 無 | 列出到期日在 7 天內的使用中金鑰。有驗證過聊天通道的管理員也會在到期前 7 天與 1 天收到訊息。通知送到管理員（或排入勿擾時段佇列）才算完成；失敗會在之後以遞增間隔重試，每把金鑰每個門檻最多送達一次；金鑰已到期、已刪除或到期日已改時直接結束、不再發送。變更到期日、停用或刪除金鑰時，會在同一次變更裡關閉它尚未送出的通知（包括已被檢查認領、正要送出的那則）；每則通知送出前都會再核對金鑰 ID、到期日與版本號，所以不會發出舊日期的通知。 |
+| 橫幅：檢查搬移過來的金鑰（一次性）→ 知道了 | `mcp_api_key_meta`（`mcp_keys.dismiss_migration_hint`，寫入稽核） | 升級把金鑰搬出 `config.toml` 後顯示。所有搬移過來的金鑰都改過到期日後也會自動消失。 |
+| 橫幅：仍在 config.toml 等待搬移的金鑰 | 無 | 升級時記為「待搬移」但尚未搬完的項目（搬完前仍可使用）。請查看閘道紀錄，下次啟動會再試。 |
+| 橫幅：被忽略的 config.toml 項目 | 無 | 金鑰儲存區不認得的 `[mcp_keys]` 項目（搬移完成後才加入的，或閘道從未記錄過的 `gateway-internal` 項目），只顯示提示。它們永遠不會通過驗證，請從 `config.toml` 刪除。 |
+
+欄位：名稱（附 `ddc_<env>_…<末 4 碼>` 提示、用戶端 ID 與權限範圍——對外部金鑰永遠無效的已存範圍，例如搬移過來的金鑰上的 `odoo:read`，會加刪除線並列出）、建立者、建立時間、到期日、最後使用（記在 `<home>/mcp_keys_usage.db`，由 MCP 伺服器每把金鑰每分鐘最多寫一次，列出清單時讀取，只供顯示）、狀態（使用中／已停用／已到期）。
+
+**從 v1.81 升級。** 閘道第一次啟動時，會在同一筆交易裡把 `config.toml` 中 `gateway-internal` 以外的每個 `[mcp_keys.<金鑰>]` 指紋記為「待搬移」，再逐一搬進 `mcp_keys.db`（只存指紋；原有的 `name` 或 `label` 欄位成為名稱，否則為 `migrated-<id>`；保留用戶端、外部旗標、權限範圍與建立時間）。到期時間就是 v1.81 開始拒絕它的那一刻（建立時間 + 31 天，以秒為單位），所以有效期間不變。寫好稽核紀錄後才從 `config.toml` 移除該項，檔案其餘內容保持原樣。搬移或稽核失敗的項目會留在 `config.toml`、維持「待搬移」並繼續可用，下次啟動再試。全部搬完後寫下「搬移完成」標記，從此非內部金鑰不再參考 `config.toml`。gateway-internal 金鑰仍留在 `config.toml`，但只接受閘道記錄在 `mcp_keys.db` 的那把。唯一的例外是 `mcp_keys.db` 還不存在的資料夾（從未啟動過 v1.82 閘道）：在閘道建立儲存區之前，`[mcp_keys]` 依 v1.81 規則驗證。若 `mcp_keys.db` 存在但無法讀取或結構不符，所有金鑰都會被拒絕，包括 gateway-internal 金鑰。
+
+**降級。** 金鑰的搬移是單向的。v1.81 看不到 `mcp_keys.db`，降級後外部金鑰必須重新發行。請不要為此還原舊的 `config.toml`：那會讓已在 v1.82 刪除或停用的金鑰重新生效。
+
 ## 整合 → Google → 公司授權代表（v1.76.0）
 
 只有管理員，兩個版本都有。
@@ -571,7 +593,7 @@ macOS 上的 gateway 改為已簽章的 App「DuDuClaw Gateway.app」（識別�
 位置：系統設定 → 進階設定 → 設定檔進階編輯。只有管理員看得到，RPC 是 `config.raw.get` / `config.raw.set`。
 
 - **可編輯的檔案**：系統設定（`config.toml`）、推理設定（`inference.toml`），以及每位 AI 員工的 `agent.toml`（必須是 `agents/` 底下的實際目錄，不接受符號連結）。
-- **密鑰遮罩**：鍵名以 `_enc` 結尾、名為 `key` 或以 `_key` 結尾、或含 token、secret、password、passwd、api_key、apikey、widget_key、private_key、credential、service_account_json 的值，以及 `headers`、`otlp_headers`、`env` 表格裡的每個值、帶密碼的網址，都顯示成 `«set»`。存檔時原樣保留 `«set»` 就保留原值；原本沒有值卻寫 `«set»` 會被拒絕。`[mcp_keys]` 整段不顯示。
+- **密鑰遮罩**：鍵名以 `_enc` 結尾、名為 `key` 或以 `_key` 結尾、或含 token、secret、password、passwd、api_key、apikey、widget_key、private_key、credential、service_account_json 的值，以及 `headers`、`otlp_headers`、`env` 表格裡的每個值、帶密碼的網址，都顯示成 `«set»`。存檔時原樣保留 `«set»` 就保留原值；原本沒有值卻寫 `«set»` 會被拒絕。`[mcp_keys]` 整段不顯示（v1.82 起這裡只剩閘道自己的內部金鑰；儀表板金鑰存在 `mcp_keys.db`）。
 - **驗證**：先檢查 TOML 語法，錯誤會指出第幾行第幾欄；再用對應的型別（系統設定的各區段驗證、`InferenceConfig`、`AgentConfig`）檢查，失敗就不寫入。不能在這裡改員工的 `[agent] name`。
 - **文件知識庫**：集合、文件、分享與存取紀錄在側邊欄「公司 → 文件知識庫」管理；`[knowledge]` 這些全域上限還沒有設定頁，它的各個鍵（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`，`extract_when_unavailable` = `refuse`／`run_unsandboxed`、`auto_retrieve`、`inject_budget_chars_max`）在這裡會檢查型別。`[knowledge.embedding]` 的各個鍵（`provider` = `local`／`openai`／`gemini`／`none`、`local_model`、`cloud_model`、`cloud_account`、`cloud_base_url`、`allow_private_endpoint`、`batch_size`、`threads`、`max_vector_rows`、`idle_unload_minutes`）也一樣；揭露確認紀錄 `cloud_disclosure_ack` 不能在這裡改（存檔會被拒絕），只能經由「文件知識庫搜尋」的揭露對話框寫入。員工的 `[knowledge] collections` 在「AI 員工 → 編輯設定 → 工具與權限 → 文件知識庫」設定（只能選已分享給它的集合），也可以直接改該員工的 `agent.toml`；回覆相關的 `auto_retrieve`、`answer_mode` = `assist`／`kb_only`、`top_k`、`inject_budget_chars` 也在那裡。詳見[文件知識庫](../../features/zh-TW/63-knowledge-base.md)。
 - **衝突**：開啟時取得檔案內容的雜湊值，存檔時帶回。檔案在這段時間被改過就拒絕，請重新載入再改。

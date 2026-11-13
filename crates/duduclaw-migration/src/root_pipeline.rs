@@ -169,6 +169,8 @@ fn worker_shape(source:&Source)->Result<(String,String),Error>{
         "users.db"=>"authority_users_sqlite",
         "tasks.db"=>"authority_tasks_sqlite",
         "approvals.db"=>"authority_approvals_sqlite",
+        // RM-134 (v1.82): hashed MCP key store; every live key is a re-issue obligation.
+        "mcp_keys.db"=>"authority_mcp_keys_sqlite",
         "sessions.db"=>"authority_sessions_sqlite",
         "SOUL.md"|"IDENTITY.md"|"INSTRUCTIONS.md"|"CONTRACT.toml"=>"authority_instructions",
         "SKILL.md"=>"authority_skill",
@@ -206,7 +208,7 @@ fn prepare_sources(plan:&RootPlan)->Result<(),Error>{
         let id=root_sources::source_id(plan.migration,source);let (kind,title)=worker_shape(source)?;
         let file=root_sources::open_source(&root,&source.relative)?;
         let wal_path=source.relative.with_file_name(format!("{}-wal",source.relative.file_name().and_then(|s|s.to_str()).ok_or(Error::Invalid)?));
-        let sqlite=matches!(kind.as_str(),"sessions_sqlite"|"memory_sqlite"|"authority_users_sqlite"|"authority_tasks_sqlite"|"authority_approvals_sqlite"|"authority_sessions_sqlite"|"authority_cron_sqlite"|"authority_workflow_sqlite"|"authority_autopilot_sqlite");
+        let sqlite=matches!(kind.as_str(),"sessions_sqlite"|"memory_sqlite"|"authority_users_sqlite"|"authority_tasks_sqlite"|"authority_approvals_sqlite"|"authority_sessions_sqlite"|"authority_cron_sqlite"|"authority_workflow_sqlite"|"authority_autopilot_sqlite"|"authority_mcp_keys_sqlite");
         // Only ENOENT means no WAL. A link, permission or traversal failure is
         // never silently treated as a clean database.
         let wal=if sqlite {
@@ -382,6 +384,7 @@ mod tests {
     fn migration_pipeline_routes_authority_by_exact_components() {
         for (path,agent,kind,title) in [
             ("approvals.db",None,"authority_approvals_sqlite","approvals.db"),
+            ("mcp_keys.db",None,"authority_mcp_keys_sqlite","mcp_keys.db"),
             ("remote_mcp/servers.json",None,"authority_json","remote_mcp/servers.json"),
             ("person_credentials/store.json",None,"authority_json","person_credentials/store.json"),
             ("secrets/website_credentials.enc",None,"authority_notice","website_credentials.enc"),

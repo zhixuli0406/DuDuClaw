@@ -578,6 +578,15 @@ pub struct McpDispatcher {
     /// (complete mediation, invariant I3). `Arc` keeps `Clone` cheap.
     pub redaction: Option<Arc<crate::mcp_redaction::McpRedactionLayer>>,
     pub(crate) workflow_session: Option<Arc<crate::mcp::workflow_operation::WorkflowSession>>,
+    /// v1.82 (RM-134 review): this dispatcher serves remote bearer callers
+    /// (`duduclaw http-server`: `/mcp`, `/mcp/v1/call`, SSE). Its
+    /// `default_agent` is one fixed employee for every caller, so every
+    /// non-external key other than the verified gateway-internal one is
+    /// refused every tool that acts for that employee, acts as its own bound
+    /// employee for the rest, and is refused everything without a valid
+    /// binding (`crate::mcp::remote_access`). Set only by the HTTP transport
+    /// ([`Self::for_remote_bearer`]); stdio keeps `false`.
+    pub(crate) remote_bearer: bool,
 }
 
 impl McpDispatcher {
@@ -603,7 +612,20 @@ impl McpDispatcher {
             daily_quota,
             redaction: None,
             workflow_session: None,
+            remote_bearer: false,
         }
+    }
+
+    /// Mark this dispatcher as serving remote bearer callers (the HTTP MCP
+    /// server). See [`Self::remote_bearer`].
+    pub fn for_remote_bearer(mut self) -> Self {
+        self.remote_bearer = true;
+        self
+    }
+
+    /// Whether this dispatcher serves remote bearer callers.
+    pub fn is_remote_bearer(&self) -> bool {
+        self.remote_bearer
     }
 
     pub(crate) fn with_workflow_session(
@@ -703,6 +725,46 @@ impl McpDispatcher {
         params: &Value,
         id: &Value,
     ) -> Value {
+        // ── v1.82 (RM-134 third review): remote principals ───────────────────
+        // On the HTTP MCP server every non-external principal other than the
+        // verified gateway-internal key is classified from its authenticated
+        // kind (`mcp::remote_access`). A bound one acts as ITS employee: this
+        // call runs on a copy of the dispatcher whose `default_agent` IS the
+        // key's binding, inside a `RemoteBinding` scope, so no handler, gate
+        // or audit row reachable from here can fall back to the server's own
+        // employee. An unbound one runs inside an `Unbound` scope and is
+        // refused every tool below (`remote_key_unbound`). Stdio
+        // (`remote_bearer == false`) is unchanged.
+        let remote = self
+            .remote_bearer
+            .then(|| crate::mcp::remote_access(&self.home_dir, principal, &self.default_agent));
+        let bound;
+        let (this, scope) = match &remote {
+            Some(crate::mcp::RemoteAccess::Bound(agent)) => {
+                let mut copy = self.clone();
+                copy.default_agent = agent.clone();
+                bound = copy;
+                (&bound, Some(crate::mcp::RemoteBinding::Bound(agent.clone())))
+            }
+            Some(crate::mcp::RemoteAccess::Unbound(_)) => (self, Some(crate::mcp::RemoteBinding::Unbound)),
+            _ => (self, None),
+        };
+        let admitted = Box::pin(this.dispatch_admitted(principal, ns_ctx, params, id, remote.as_ref()));
+        match scope {
+            Some(binding) => crate::mcp::with_remote_binding(binding, admitted).await,
+            None => admitted.await,
+        }
+    }
+
+    /// [`Self::dispatch_tool_call`] after the remote principal was classified.
+    async fn dispatch_admitted(
+        &self,
+        principal: &Principal,
+        ns_ctx: &NamespaceContext,
+        params: &Value,
+        id: &Value,
+        remote: Option<&crate::mcp::RemoteAccess>,
+    ) -> Value {
         let workflow_params = params;
         let mut clean_params = params.clone();
         // Host account metadata can never be supplied by an MCP caller.
@@ -727,6 +789,11 @@ impl McpDispatcher {
         // whitelist, namespace isolation and the per-key rate limiter stay on
         // `principal.client_id`.
         let gate_agent: &str = acting_gate_agent(principal, &self.default_agent);
+        // RM-134 fourth review (Medium 2): a principal acting as its bound
+        // employee over HTTP exercises only per-employee scopes — `admin`
+        // never stands in for another scope on it (scope gates below,
+        // `mcp_auth::scope_gate_admits`).
+        let bound_remote = matches!(remote, Some(crate::mcp::RemoteAccess::Bound(_)));
 
         let mut google_lane =
             crate::mcp_auth::accept_google_lane(&self.home_dir, principal, tool_name);
@@ -786,6 +853,26 @@ impl McpDispatcher {
         if let Err(e) = self.rate_limiter.check(&principal.client_id, op_type) {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             return jsonrpc_error(id, -32029, &format!("Rate limited: {e}"));
+        }
+
+        // ── 2.5 Remote principal without a valid binding (v1.82, RM-134) ────
+        // A non-external key other than the verified gateway-internal one,
+        // presented to the HTTP MCP server, whose stored binding is absent or
+        // names no existing, non-deleted employee: refused EVERY tool (fail
+        // closed) — it must never act as the server's `default_agent`.
+        // Audited with the internal reason (no caller arguments are kept),
+        // attributed to the key's client id, never the server's employee.
+        if let Some(crate::mcp::RemoteAccess::Unbound(reason)) = remote {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            duduclaw_security::audit::append_tool_call_denied(
+                &self.home_dir,
+                &duduclaw_core::truncate_chars(&principal.client_id, 64),
+                tool_name,
+                "remote_key_unbound",
+                reason,
+                None,
+            );
+            return jsonrpc_error(id, -32003, crate::mcp::REMOTE_UNBOUND_MESSAGE);
         }
 
         // ── 3. Namespace injection (external clients only) ───────────────────
@@ -884,8 +971,7 @@ impl McpDispatcher {
                     tool_name,
                     params.get("arguments").unwrap_or(&Value::Null),
                 )
-                && !principal.scopes.contains(&required)
-                && !principal.scopes.contains(&Scope::Admin)
+                && !crate::mcp_auth::scope_gate_admits(principal, &required, bound_remote)
             {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 let detail = format!("required {required:?}, principal lacks it (and Admin)");
@@ -918,6 +1004,34 @@ impl McpDispatcher {
                      not for this key, so it is not available to a caller that is not an employee."
                 );
                 return Some((jsonrpc_error(id, -32003, &msg), "process_agent_tool", msg, None));
+            }
+
+            // ── 1.25 Non-gateway-internal key on the HTTP transport (v1.82) ──────
+            // The HTTP MCP server has ONE fixed `default_agent` for every caller,
+            // and the tools in the refused union (`mcp::acts_for_process_agent`)
+            // act for that process agent, not for the key. DEFAULT DENY (RM-134
+            // third review): every non-external principal other than the
+            // verified gateway-internal key — a per-agent key whose employee
+            // exists, one whose employee was removed or renamed, a key created
+            // under an alias, an unknown internal client id — is refused every
+            // such tool, decided from the authenticated principal's kind alone
+            // (`mcp::remote_process_agent_tool_refused`; never the filesystem).
+            // External keys (§1.2) and stdio processes are not affected.
+            // `tools/list` hides by the same classification.
+            // TODO(v1.83): resolve an `effective_agent` from the authenticated
+            // principal and pass it to these handlers instead of
+            // `default_agent`, then drop this refusal.
+            if let Some(access) = remote
+                && access.refuses_process_agent_tool(tool_name)
+            {
+                duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                let msg = format!(
+                    "Tool '{tool_name}' acts for the AI employee this MCP HTTP server runs as, \
+                     not for the employee this key belongs to, so it is not available \
+                     to a per-agent key over HTTP (only the gateway's own internal key may call it). \
+                     Use the employee's own (stdio) MCP server."
+                );
+                return Some((jsonrpc_error(id, -32003, &msg), "per_agent_key_process_tool", msg, None));
             }
 
             // ── 1.3 Shared-wiki writes from an external key ──────────────────────
@@ -1733,7 +1847,7 @@ impl McpDispatcher {
             tool_name,
             params_owned.get("arguments").unwrap_or(&Value::Null),
         ) {
-            if !principal.scopes.contains(&required) && !principal.scopes.contains(&Scope::Admin) {
+            if !crate::mcp_auth::scope_gate_admits(principal, &required, bound_remote) {
                 self.audit_dispatch_denial(
                     principal,
                     tool_name,
@@ -1935,7 +2049,7 @@ impl McpDispatcher {
             crate::mcp::workflow_operation::ReadObservation::Unobserved,
         ));
         // ── 4. Tool dispatch ─────────────────────────────────────────────────
-        let caller_is_admin = principal.scopes.contains(&Scope::Admin);
+        let caller_is_admin = !bound_remote && principal.scopes.contains(&Scope::Admin);
         let accepted_google = google_lane.map(|lane| {
             lane.bind(
                 params_owned

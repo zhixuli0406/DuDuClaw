@@ -122,7 +122,7 @@ Turning the feature off from the dashboard applies to the next request; a hand e
 
 ## Security notes
 
-- This is its own credential type and can call only this one path. Dashboard login, `/api/*` and the MCP server (`/mcp`, `/mcp/v1/call`, `/ingest/transcript`) all refuse anything starting with `ddc_status_`. It is not an `[mcp_keys]` key and MCP scopes do not apply to it.
+- This is its own credential type and can call only this one path. Dashboard login, `/api/*` and the MCP server (`/mcp`, `/mcp/v1/call`, `/ingest/transcript`) all refuse anything starting with `ddc_status_`. It is not an MCP API key (those are in `mcp_keys.db` since v1.82) and MCP scopes do not apply to it.
 - No CORS headers: server-to-server only — never embed it in browser code. Responses carry `Cache-Control: no-store`.
 - Every attributable call is audited (credential id, account id, result, number of employees) without response content. Calls are aggregated per credential, result and 10-minute window: the first call in a window writes one `status_token.used` / `status_token.refused` audit-log row, and later calls in that window only increase its call count and last-seen time, so an integration polling every second writes at most 6 rows an hour per result. The credential's last-used time is updated at most once per 10-minute window. These audit rows and counts are kept for 90 days, then deleted automatically in small batches; other audit-log entries are not affected.
 - Use HTTPS, and revoke a credential as soon as it may have leaked.

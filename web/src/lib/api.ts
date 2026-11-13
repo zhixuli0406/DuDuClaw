@@ -5482,26 +5482,90 @@ export interface McpOAuthGrant {
   last_used_unix: number | null;
 }
 
-/** A masked MCP key entry from `mcp_keys.list`. The full cleartext key is
- *  NEVER returned here — only on the one-time `mcp_keys.create` response. */
+/** RM-134: lifecycle state of a dashboard MCP key. */
+export type McpKeyStatus = 'active' | 'disabled' | 'expired';
+
+/** One key from `mcp_keys.list` (hashed store). Neither the key nor its
+ *  digest is ever returned — only on the one-time `mcp_keys.create` response
+ *  does the plaintext appear. Managed by `id`. */
 export interface McpKeyEntry {
-  masked: string;
+  id: string;
+  name: string;
+  /** `ddc_<env>_…<last 4>` — enough to recognise a key, never to use it. */
+  hint: string;
   client_id: string;
+  /** A key issued by client id is external; an AI employee's own key (and a
+   *  migrated key) may be internal. */
   is_external: boolean;
-  created_at: string;
+  /** The client id is an AI employee. */
+  employee_key: boolean;
+  /** The employee (directory id) an AI employee's own key is bound to —
+   *  fixed at creation. `null` for every other key. */
+  agent_binding?: string | null;
+  /** `live` | `employee_missing` | `employee_deleted` | `employee_unreadable`
+   *  | `binding_invalid` | `employee_recreated` (the employee's folder is
+   *  younger than the key: a later employee with the same id); `null` for an
+   *  unbound key. */
+  binding_status?: string | null;
+  /** The bound employee no longer exists (removed, renamed, deleted or
+   *  re-created under the same id): the key no longer works on the HTTP MCP
+   *  server. A deleted employee's keys are revoked for good. */
+  employee_missing?: boolean;
+  /** `scopes_not_allowed_for_employee_key`: a migrated key of an AI employee
+   *  whose scopes a per-employee key may not carry (e.g. `admin`); it was
+   *  left unbound and must be re-issued. `null` otherwise. */
+  needs_reissue?: string | null;
   scopes: string[];
-  rotate_recommended: boolean;
+  /** Stored scopes that never take effect for this external key (e.g. a
+   *  migrated key that carried `odoo:read`). */
+  ineffective_scopes: string[];
+  created_by: string | null;
+  created_by_name: string | null;
+  created_at: string;
+  /** `null` = no expiry. */
+  expires_at: string | null;
+  days_left: number | null;
+  /** From the separate usage file (display only), read when listing. */
+  last_used_at: string | null;
+  disabled_at: string | null;
+  disabled_by: string | null;
+  disabled_by_name: string | null;
+  status: McpKeyStatus;
+  /** Active and expiring within 7 days. */
+  expiring_soon: boolean;
+  /** Moved from `config.toml [mcp_keys]` at upgrade. */
+  migrated: boolean;
+  expiry_reviewed: boolean;
 }
+
+export interface McpKeyListResult {
+  keys: McpKeyEntry[];
+  /** One-time "review the expiry of migrated keys" hint. */
+  migration_hint: boolean;
+  /** `[mcp_keys]` entries still waiting to be moved (accepted meanwhile). */
+  legacy_pending: number;
+  /** Display hints (`ddc_<env>_…<last 4>`) of `[mcp_keys]` entries the key
+   *  store does not know: ignored, never authenticate. */
+  ignored_legacy_entries: string[];
+  /** The scopes an external integration key may carry (backend's list). */
+  effective_scopes: string[];
+  /** The scopes an AI employee's own (internal, per-agent) key may carry —
+   *  never `admin`. */
+  employee_key_scopes: string[];
+  expiry_presets_days: number[];
+}
+
+/** The Admin's expiry choice. `never` requires the risk-notice confirmation. */
+export type McpKeyExpiry =
+  | { kind: 'days'; days: 30 | 90 | 365 }
+  | { kind: 'date'; at: string }
+  | { kind: 'never'; confirm: true };
 
 export interface McpKeyCreateResult {
   success: boolean;
   /** Cleartext key — shown exactly once, never recoverable afterward. */
   key: string;
-  masked: string;
-  client_id: string;
-  is_external: boolean;
-  created_at: string;
-  scopes: string[];
+  key_info: McpKeyEntry;
   message: string;
 }
 
@@ -5571,72 +5635,13 @@ export interface ExternalStatusResponse {
   employees: ExternalEmployeeStatus[];
 }
 
-export type McpScope =
-  | 'memory:read'
-  | 'memory:write'
-  | 'wiki:read'
-  | 'wiki:write'
-  | 'messaging:send'
-  | 'identity:read'
-  | 'odoo:read'
-  | 'odoo:write'
-  | 'odoo:execute'
-  | 'google:read'
-  | 'google:write'
-  | 'notion:read'
-  | 'notion:write'
-  | 'github:read'
-  | 'github:write'
-  | 'fork:execute'
-  | 'os:native'
-  | 'skill:execute'
-  | 'recording'
-  | 'mail:read'
-  | 'mail:send'
-  | 'db:read'
-  | 'files:read'
-  | 'admin';
-
-/** All MCP scopes offered in the key-creation picker — mirrors the shared
- *  canonical list (`duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS`, read by both
- *  the gateway's `KNOWN_MCP_SCOPES` validator and `duduclaw-cli::mcp_auth::Scope`)
- *  minus the internal-only scopes. Was a 10-entry list that had drifted from
- *  the real scopes (2026-08 audit) — dashboard operators could not grant 12 of
- *  them without hand-editing config.toml.
- *
- *  Deliberately NOT offered: `team:handoff` (2026-09-28). It gates the
- *  Team-as-Agent `team_handoff` tool, is excluded from
- *  `EXTERNALLY_GRANTABLE_SCOPES` (so an external key carrying it still cannot
- *  call the tool), and every internal caller already reaches the tool through
- *  the `admin`-scoped `gateway-internal` key — a checkbox for it would grant
- *  nothing. The validator still accepts the string, so a hand-written
- *  config.toml entry keeps working. */
-export const MCP_SCOPES: ReadonlyArray<McpScope> = [
-  'memory:read',
-  'memory:write',
-  'wiki:read',
-  'wiki:write',
-  'messaging:send',
-  'identity:read',
-  'odoo:read',
-  'odoo:write',
-  'odoo:execute',
-  'google:read',
-  'google:write',
-  'notion:read',
-  'notion:write',
-  'github:read',
-  'github:write',
-  'fork:execute',
-  'os:native',
-  'skill:execute',
-  'recording',
-  'mail:read',
-  'mail:send',
-  'db:read',
-  'files:read',
-  'admin',
-];
+/** An MCP scope wire string. RM-157: the key-creation picker no longer
+ *  carries its own list — it renders `effective_scopes` (and, for an AI
+ *  employee's Google key, `employee_key_scopes`) from `mcp_keys.list`, the
+ *  backend's single source (`duduclaw_core::mcp_scopes`). Every scope keeps
+ *  a translated `mcpKeys.scopeDesc.*` description (pinned by
+ *  `McpKeysPage.test.tsx`). */
+export type McpScope = string;
 
 // ── COST: cache-efficiency telemetry (`cost.*`) ─────────────────
 
@@ -9541,12 +9546,31 @@ export const api = {
     list: () => client.call('mcp_oauth_grants.list') as Promise<{ grants: McpOAuthGrant[] }>,
     revoke: (id: string) => client.call('mcp_oauth_grants.revoke', { id }) as Promise<{ success: boolean; revoked: boolean }>,
   },
+  /** RM-134: dashboard MCP keys, managed by key id (Admin only). */
   mcpKeys: {
-    list: () => client.call('mcp_keys.list') as Promise<{ keys: McpKeyEntry[] }>,
-    create: (params: { client_id: string; is_external: boolean; scopes: string[]; env?: 'prod' | 'staging' | 'dev' }) =>
-      client.call('mcp_keys.create', { ...params }) as Promise<McpKeyCreateResult>,
-    revoke: (key: string) =>
-      client.call('mcp_keys.revoke', { key }) as Promise<{ success: boolean; revoked: string }>,
+    list: () => client.call('mcp_keys.list') as Promise<McpKeyListResult>,
+    /** Give `client_id` for an external integration key, or `agent_id` for
+     *  an AI employee's own internal key (Personal-gated, never `admin`). */
+    create: (params: {
+      name: string;
+      client_id?: string;
+      agent_id?: string;
+      scopes: string[];
+      env?: 'prod' | 'staging' | 'dev';
+      expiry: McpKeyExpiry;
+    }) => client.call('mcp_keys.create', { ...params }) as Promise<McpKeyCreateResult>,
+    rename: (id: string, name: string) =>
+      client.call('mcp_keys.rename', { id, name }) as Promise<{ success: boolean; key_info: McpKeyEntry }>,
+    setExpiry: (id: string, expiry: McpKeyExpiry) =>
+      client.call('mcp_keys.set_expiry', { id, expiry }) as Promise<{ success: boolean; key_info: McpKeyEntry }>,
+    disable: (id: string) =>
+      client.call('mcp_keys.disable', { id }) as Promise<{ success: boolean; key_info: McpKeyEntry }>,
+    enable: (id: string) =>
+      client.call('mcp_keys.enable', { id }) as Promise<{ success: boolean; key_info: McpKeyEntry }>,
+    remove: (id: string) =>
+      client.call('mcp_keys.delete', { id }) as Promise<{ success: boolean; deleted: string }>,
+    dismissMigrationHint: () =>
+      client.call('mcp_keys.dismiss_migration_hint') as Promise<{ success: boolean }>,
   },
   /** RM-064: the caller's own read-only status credentials. */
   statusTokens: {
