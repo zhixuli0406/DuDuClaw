@@ -75,28 +75,43 @@ pub(crate) fn is_background_system_sender(sender: &str) -> bool {
 /// every `gate_bus_dispatch` call, so a config write still takes effect on
 /// the very next message, exactly as before.
 ///
-/// A missing file or a file that fails to parse as TOML resolves to an empty
-/// table — same fail-closed default every extractor here already assumed
-/// (missing/malformed `[delegation]` ⇒ department policy + empty whitelist;
-/// missing/malformed `[acp]` ⇒ `trusted = false`).
-fn read_config_table(home_dir: &Path) -> (toml::Table, duduclaw_core::HumanPrincipalMode) {
+/// A missing file resolves to an empty table (department policy, empty
+/// whitelist, `[acp] trusted = false`, human_principal record). A file that
+/// exists but cannot be read or parsed resolves to the fail-closed answer for
+/// every extractor: delegation policy `none` (RM-137, v1.82 — it used to fall
+/// back to `department`), `trusted = false`, human_principal enforce.
+fn read_config_table(
+    home_dir: &Path,
+) -> (duduclaw_core::DelegationRules, toml::Table, duduclaw_core::HumanPrincipalMode) {
     let path = home_dir.join("config.toml");
     let table = match std::fs::read_to_string(&path) {
         Ok(content) => content.parse::<toml::Table>().ok(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (toml::Table::new(), duduclaw_core::HumanPrincipalMode::Record);
+            let table = toml::Table::new();
+            return (
+                delegation_rules_from_table(&table),
+                table,
+                duduclaw_core::HumanPrincipalMode::Record,
+            );
         }
         Err(_) => None,
     };
     let Some(table) = table else {
         warn!("config.toml unreadable or malformed; human_principal treated as enforce");
-        return (toml::Table::new(), duduclaw_core::HumanPrincipalMode::Enforce);
+        duduclaw_core::delegation_policy::warn_policy_once(
+            "config.toml 無法讀取或不是有效的 TOML;在修正前 AI 員工之間一律不能委派(視為 [delegation] policy = \"none\")。",
+        );
+        let rules = duduclaw_core::DelegationRules {
+            policy: duduclaw_core::DelegationPolicy::Disabled,
+            allow_pairs: Vec::new(),
+        };
+        return (rules, toml::Table::new(), duduclaw_core::HumanPrincipalMode::Enforce);
     };
     let (mode, warning) = duduclaw_core::HumanPrincipalMode::from_table(&table);
     if let Some(warning) = warning {
         warn!("{warning}");
     }
-    (table, mode)
+    (delegation_rules_from_table(&table), table, mode)
 }
 
 /// `config.toml [acp] trusted` — WP21 T7, design doc §2.6.
@@ -350,8 +365,7 @@ pub(crate) async fn gate_bus_dispatch(
     // WP21 欠帳⑤: one read + one parse of config.toml serves both extractors
     // below — previously `delegation_rules_from_home` and
     // `acp_trusted_from_home` each re-read and re-parsed the whole file.
-    let (config_table, human_mode) = read_config_table(home_dir);
-    let rules = delegation_rules_from_table(&config_table);
+    let (rules, config_table, human_mode) = read_config_table(home_dir);
     // WP21 T7: `[acp] trusted = true` widens the extra-system-senders list for
     // this decision only — see `acp_trusted_from_table` for the risk this opts
     // into. Default (false) leaves `GATEWAY_INTERNAL_SENDERS` untouched, which
@@ -372,7 +386,32 @@ pub(crate) async fn gate_bus_dispatch(
     let view = DispatchOrgView::new(home_dir, Some(&guard));
     let sender_id = view.canonical_id(sender);
     let target_id = view.canonical_id(target);
-    let decision = (if ephemeral_child && sender_id == target_id { Ok(()) }
+    // RM-137: under `none` the protected child is not released either —
+    // `spawn_ephemeral` is employee-created work, and the policy stops it.
+    let ephemeral_release = ephemeral_child && sender_id == target_id;
+    // RM-137 H3: an ACP session is not bound to one agent (the server is
+    // started with the home only and `contextId` names the target per
+    // message), so under `none` a trusted `a2a-client` row may reach only the
+    // installation's ACP default agent — the Main-role agent `"default"`
+    // resolves to. No Main-role agent ⇒ no target qualifies (fail closed).
+    let acp_cross_target_under_none = rules.policy == duduclaw_core::DelegationPolicy::Disabled
+        && sender_id == duduclaw_core::ACP_CLIENT_SENDER
+        && guard.main_agent().map(|m| m.config.agent.name.trim()) != Some(target_id.trim());
+    let decision = (if acp_cross_target_under_none {
+            Err(DelegationDenied {
+                sender: sender_id.clone(),
+                target: target_id.clone(),
+                policy: rules.policy,
+                reason: duduclaw_core::DelegationDenyReason::DelegationDisabled,
+            })
+        } else if ephemeral_release && rules.policy == duduclaw_core::DelegationPolicy::Disabled {
+            Err(DelegationDenied {
+                sender: sender_id.clone(),
+                target: target_id.clone(),
+                policy: rules.policy,
+                reason: duduclaw_core::DelegationDenyReason::DelegationDisabled,
+            })
+        } else if ephemeral_release { Ok(()) }
         else { can_delegate_rules_ext(&rules, &view, &sender_id, &target_id, &extra_senders) })
         .and_then(|()| {
             // The employee tree allowed it; in enforce mode the person the
@@ -479,6 +518,11 @@ pub(crate) fn denial_notice(denied: &DelegationDenied) -> String {
             "⛔ 這項委派未執行：發出這個指令的人沒有權限把工作交給「{t}」。\
              如需開通，請管理員到儀表板替這個人綁定該員工。"
         ),
+        duduclaw_core::DelegationDenyReason::DelegationDisabled => {
+            "⛔ 這項委派未執行：目前設定為 AI 員工之間不互相委派或指派工作。\
+             如需開通，請管理員到儀表板「委派權限」設定。"
+                .to_string()
+        }
         _ => format!(
             "⛔ 這項委派未執行：「{s}」沒有指派工作給「{t}」的權限。\
              如需開通，請管理員到儀表板「委派權限」設定。"
@@ -816,6 +860,72 @@ mod tests {
         assert!(audit_lines(home).is_empty());
     }
 
+    /// RM-137: `none` refuses every employee pair at C1 — parent→child,
+    /// same department, and an explicit allow pair — with the
+    /// `delegation_disabled` reason and the short user-facing notice; people
+    /// and schedules still dispatch.
+    #[tokio::test]
+    async fn none_policy_refuses_every_employee_pair_but_not_system_senders() {
+        let tmp = seed_home();
+        let home = tmp.path();
+        std::fs::write(
+            home.join("config.toml"),
+            "[delegation]\npolicy = \"none\"\nallow = [[\"sales_lead\", \"mkt_lead\"]]\n",
+        )
+        .unwrap();
+
+        for (sender, target) in [
+            ("sales_lead", "sales_rep"),
+            ("sales_rep", "sales_lead"),
+            ("sales_rep", "sales_rep2"),
+            ("sales_lead", "mkt_lead"),
+            ("mkt_lead", "sales_lead"),
+        ] {
+            let GateOutcome::Deny(d) = gate(home, Some(sender), target).await else {
+                panic!("{sender} -> {target} must be denied under none");
+            };
+            assert_eq!(d.reason, DelegationDenyReason::DelegationDisabled, "{sender} -> {target}");
+            let notice = denial_notice(&d);
+            assert!(notice.contains("委派權限") && !notice.contains("config.toml"), "{notice}");
+        }
+        let events = audit_lines(home);
+        assert_eq!(events.len(), 5);
+        assert!(events.iter().all(|e| e["details"]["reason"] == "delegation_disabled"
+            && e["details"]["policy"] == "none"));
+
+        for sender in ["dashboard", "cron", "heartbeat", "goal-loop-driver", "__deferred_gvu__"] {
+            assert!(allows_dispatch(&gate(home, Some(sender), "mkt_rep").await), "{sender}");
+        }
+    }
+
+    /// RM-137: an unrecognised value and an unreadable config are enforced
+    /// as `none` at C1 (they used to fall back to `department`, which let
+    /// same-department peers through).
+    #[tokio::test]
+    async fn unknown_policy_and_unreadable_config_are_none_at_c1() {
+        let tmp = seed_home();
+        let home = tmp.path();
+        for body in [
+            "[delegation]\npolicy = \"closed\"\n",
+            "[delegation]\npolicy = 1\n",
+            "delegation = \"open\"\n",
+            "[delegation\npolicy = \"open\"\n",
+        ] {
+            std::fs::write(home.join("config.toml"), body).unwrap();
+            let GateOutcome::Deny(d) = gate(home, Some("sales_rep"), "sales_rep2").await else {
+                panic!("{body:?} must be enforced as none");
+            };
+            assert_eq!(effective_policy(home), DelegationPolicy::Disabled, "{body:?}");
+            // Parseable configs only for the exact reason and the schedule
+            // check: other admission checks may refuse first on an
+            // unparsable file (still a denial, which is what matters).
+            if body.parse::<toml::Table>().is_ok() {
+                assert_eq!(d.reason, DelegationDenyReason::DelegationDisabled, "{body:?}");
+                assert!(allows_dispatch(&gate(home, Some("cron"), "sales_rep").await), "{body:?}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn unknown_and_traversal_ids_fail_closed() {
         let tmp = seed_home();
@@ -916,6 +1026,72 @@ mod tests {
 
         let outcome = gate(home, Some("ghost"), "mkt_rep").await;
         assert!(matches!(outcome, GateOutcome::Deny(_)));
+    }
+
+    /// RM-137 H3: under `none`, even a trusted `a2a-client` row reaches only
+    /// the ACP default (Main-role) agent; every other target is refused
+    /// `delegation_disabled`. ACP sessions have no per-agent binding.
+    #[tokio::test]
+    async fn none_refuses_trusted_a2a_client_rows_for_any_non_default_target() {
+        let tmp = seed_home();
+        let home = tmp.path();
+        // `ceo` is the Main-role agent (the ACP default).
+        let ceo = home.join("agents").join("ceo").join("agent.toml");
+        let raw = std::fs::read_to_string(&ceo).unwrap();
+        std::fs::write(&ceo, raw.replace("role = \"worker\"", "role = \"main\"")).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[delegation]\npolicy = \"none\"\n[acp]\ntrusted = true\n",
+        )
+        .unwrap();
+        let mut reg = AgentRegistry::new(home.join("agents"));
+        reg.scan().await.unwrap();
+        let registry = Arc::new(RwLock::new(reg));
+        let run = |target: &'static str| {
+            let registry = registry.clone();
+            async move {
+                gate_bus_dispatch(
+                    home,
+                    &registry,
+                    Some(duduclaw_core::ACP_CLIENT_SENDER),
+                    None,
+                    target,
+                    "task-acp",
+                    "bus_dispatch",
+                    None,
+                )
+                .await
+            }
+        };
+        for target in ["mkt_rep", "sales_rep", "sales_lead"] {
+            match run(target).await {
+                GateOutcome::Deny(d) => {
+                    assert_eq!(d.reason, DelegationDenyReason::DelegationDisabled, "{target}")
+                }
+                GateOutcome::Allow => panic!("{target}: a2a-client must not reach it under none"),
+            }
+        }
+        // The default agent is not refused by this rule (other gates may
+        // still apply to it).
+        assert!(!matches!(
+            run("ceo").await,
+            GateOutcome::Deny(ref d) if d.reason == DelegationDenyReason::DelegationDisabled
+        ));
+
+        // A registry with no Main-role agent resolved (the unscanned one the
+        // other tests use): nothing qualifies (fail closed).
+        assert!(matches!(
+            gate(home, Some(duduclaw_core::ACP_CLIENT_SENDER), "mkt_rep").await,
+            GateOutcome::Deny(ref d) if d.reason == DelegationDenyReason::DelegationDisabled
+        ));
+
+        // Under another policy the trusted client keeps its reach.
+        std::fs::write(
+            home.join("config.toml"),
+            "[delegation]\npolicy = \"department\"\n[acp]\ntrusted = true\n",
+        )
+        .unwrap();
+        assert!(allows_dispatch(&run("mkt_rep").await));
     }
 
     #[test]

@@ -234,7 +234,7 @@ That directory is resolved through the ephemeral resolver, so **both layouts wor
 | `invalid_packet` | Not JSON, not an object, or not the TaskPacket shape |
 | `forbidden_provider_field` | A `transcript` / `messages` / `tool_use` / `tool_calls` / `function_call` / `functionCall` / `thinking` / `reasoning` / `encrypted_content` key anywhere in the packet. The refusal names the offending key |
 | `blank_field`, `field_too_long`, `too_many_items`, `duplicate_constraint_id`, `contradictory_assertion`, `self_handoff`, `packet_too_large` | `TaskPacket::validate` — see [Error codes](#error-codes). The packet is refused whole; nothing is truncated |
-| `not_a_team_member` | The caller is not a role member (no `[team_member]`, no parseable `[agent] role`, or no readable `agent.toml`) |
+| `not_a_team_member` | The caller is not a role member (no `[team_member]`, no parseable `[agent] role`, or no readable `agent.toml`), or its identity is not token-verified (`DUDUCLAW_AGENT_TOKEN`; a soft-mode `Unverified` process that merely declares an `eph-*` id is refused) |
 | `team_member_unreadable` | A `[team_member]` table exists but cannot be read. Deliberately not a fallback: degrading would silently drop the task/round pinning |
 | `from_role_mismatch` | `from_role` is not the caller's role |
 | `task_id_mismatch` | `goal_id` is not the task the caller was assigned |

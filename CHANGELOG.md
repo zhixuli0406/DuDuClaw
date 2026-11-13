@@ -9,6 +9,30 @@
 ### Fixed
 
 - 使用 Claude 的 AI 員工自 v1.81.0 起，自行加入的第三方 MCP 工具在 `ask` 模式下每次呼叫都要人工確認；排程與提醒執行時沒有人能確認，報告與提醒因此送不出去。依程式判讀，存有加密憑證的第三方伺服器在同一情況下也會無法啟動（未以實機驗證）。現在 DuDuClaw 只在每次啟動專用、只有擁有者可讀的暫存 MCP 設定中（CLI 正常結束時刪除），把員工身分交給第三方 MCP 代理；這個權杖不會寫進 `.mcp.json` 裡第三方伺服器的項目，也不會出現在 CLI 環境，被包裝的第三方伺服器同樣拿不到。內建 DuDuClaw 項目原有的身分設定不變。Codex、Grok 與 openai-compat 員工不受影響。
+
+- 委派權限新增「不允許委派」（`config.toml [delegation] policy = "none"`）：AI 員工之間不能互相指派工作、傳訊、呼叫、建立員工或臨時助手；儀表板與排程（人或你設定的定時工作）仍可把工作交給員工。這個模式下跨部門協作配對不生效，團隊模式（同一份工作裡規劃、執行、檢查角色之間的交接）照常運作。AI 員工在這個模式下看不到 `send_to_agent`、`spawn_agent`、`spawn_ephemeral`、`create_agent` 這幾個工具；`tasks_create`、`create_task` 仍可用於自己的工作，指派給其他員工時會被拒絕。
+- AI 員工頁「總覽」新增唯讀的「委派範圍」：顯示這位員工實際適用的委派模式、來自全公司設定還是員工自己的「允許跨 AI 員工通訊」開關、和他有關的跨部門配對（目前模式下不生效的另外標示），以及設定檔有問題時的說明。管理員與有權查看這位員工的經理可以看到。新 RPC `delegation.effective`（唯讀）；`agents.inspect` 新增 `effective_permissions`，`delegation.get` 新增 `configured_policy`。
+
+### Changed
+
+- **無法辨識的委派設定值改為不允許委派**：`[delegation] policy` 寫了無法辨識的值（例如打錯字）、不是文字，或 `config.toml` 讀不到、格式錯誤時，過去會改用較寬的「部門模式」，現在一律視為 `none`（AI 員工之間不能委派），日誌只提醒一次，並在「委派權限」與員工頁的「委派範圍」顯示原因。升級前請確認設定值是 `department`、`hierarchy`、`open` 或 `none` 之一。
+- `delegation.get` 在 `config.toml` 讀不到或格式錯誤時回傳錯誤，不再回傳預設值。
+- **團隊交接（`team_handoff`）只接受經過驗證的團隊成員**：呼叫者必須是 gateway 為一輪團隊工作建立的角色成員（`agents/.ephemeral/eph-*`，`[team_member]` 與 `ephemeral.toml` 的上層員工一致），在任何委派模式下一般 AI 員工都會被拒絕（`not_a_team_member`），工具清單也只對團隊成員顯示（一般員工的工具清單少一支，新建員工 169 → 168）。過去一般員工在自己的 `agent.toml` 寫入完整的 `[team_member]` 就能交出封包。`[team_member]` 也加入員工不能自行修改的 `agent.toml` 區段（Write／Edit／MultiEdit 都擋）；`none` 模式下的交接例外只給經過驗證的團隊成員。呼叫者的身分還必須通過身分權杖驗證（`DUDUCLAW_AGENT_TOKEN`）：在管理員開啟的 30 天過渡寬鬆模式（`require_identity_token = false`）下，沒有有效權杖的程序只宣告一個既有的 `eph-*` id 也會被拒絕（`not_a_team_member`），看不到這個工具，也拿不到 `none` 模式的例外；寬鬆模式下其他行為不變。
+- **`duduclaw acp server` 不能在 AI 員工的工作階段中啟動**：偵測到 AI 員工的工作階段環境變數，或 `DUDUCLAW_AGENT_ID`、`DUDUCLAW_AGENT_TOKEN`、`DUDUCLAW_HOOK_TOKEN` 任一存在（即使是空值）時拒絕啟動；Bash 也不能替員工執行這個指令。`none` 模式下 ACP（`message/send`、`tasks/send` 與 `a2a-client` 佇列列）只能把工作交給預設（main）AI 員工——ACP 工作階段沒有綁定單一員工，`contextId` 每則訊息指定對象。
+- `none` 模式下，AI 員工不能用 `agent_update` 改另一位員工的 `status`、`heartbeat_enabled`、`heartbeat_cron`（會讓排程替對方啟動或重排背景工作）；其他模式下這三個欄位也要通過委派判斷，在寫入鎖內會再檢查一次。改自己的設定、改別人的其他欄位照舊。
+- `none` 模式下，AI 員工不能用 `channel_config` 把頻道的 `agent_override` 指向另一位員工；任何模式下指定的對象都必須是既有的員工 id。清除或指向自己照舊；儀表板與管理 RPC 不受影響。
+- `[permissions]` 的檢查改為讀一次「實際生效的檔案」（有預設組合時是 `agent_resolved/<id>.toml`）並對同一份內容做嚴格檢查：該檔格式錯誤、讀不到，或宣告了預設組合卻沒有這個檔、或 `preset_bindings.toml` 本身無法驗證時，一律拒絕需要權限的工具，不再退回較寬的預設值或原始 `agent.toml`。
+- `delegation.effective` 的配對只列出查看者有權查看的另一端員工；看不到的以「另一位你沒有檢視權限的員工」顯示，只保留數量（`hidden_allow_pairs`／`hidden_inactive_allow_pairs`）。
+- `delegation.effective` 不再回傳跨部門配對設定的警告原文（原文會引用寫錯的配對，可能出現查看者看不到、也與這位員工無關的員工 id）：一律只回傳數量 `allow_warning_count`，管理員另外收到原文 `allow_warnings`；原本合併的 `warnings` 欄位移除。「委派範圍」只顯示「委派設定有 N 則警告，管理員可以到「設定」查看」。`delegation.get`（僅管理員）照舊回傳完整警告。
+- `delegation.effective` 的 `config_error` 改為只回傳類別（`unreadable`、`unparsable`、`permissions_unreadable`、`unknown`），不再回傳錯誤原文（TOML 解析錯誤會引用最多 200 字的設定檔內容）；原文只給管理員查看者（`config_error_detail`）。「委派範圍」依類別顯示固定說明，不顯示原文；管理員可在「設定 › 委派權限」看到詳細原因。
+- 編輯 AI 員工頁的四個權限開關（建立員工、跨員工通訊、排程、修改自己的技能）只依 `agents.inspect.effective_permissions` 顯示；舊版 gateway 沒有這個欄位時一律顯示關閉，不再沿用檔案內的值。只影響顯示，沒動過的開關不會送出。
+- Bash 防護也以檔名辨識 `bus_queue.jsonl`、`message_queue.db` 及其附屬檔（`-wal`／`-shm`／`-journal`、`.lock`），即使路徑無法判斷位置也拒絕寫入。
+
+### Fixed
+
+- 「委派權限」頁讀取目前設定失敗時，仍可按儲存，會用「部門模式、沒有配對」蓋掉原本的設定。現在讀取失敗會顯示錯誤，在重新讀到設定之前無法選擇或儲存，也不會送出沒有讀到的內容。
+- 儲存委派設定時，若 `config.toml` 格式錯誤，會直接回報錯誤、不寫入任何內容，不會用預設值覆蓋。
+- AI 員工編輯頁沒有寫在設定檔的權限開關一律顯示為開啟，和實際套用的不一致（例如非主要員工沒設定「建立新員工」時實際是關閉）。現在依閘門實際套用的值顯示；沒有動過的開關不會在儲存時被寫入。
 - macOS 企業版 binary 的簽章驗證腳本在 Python 3.14 讀取 entitlements 時會失敗，且新版 macOS 會把單獨的命令列 binary 判為「不是 app」而拒絕檢查，已修正並改用命令列工具適用的公證檢查。
 - 在儀表板刪除的 AI 員工不再佔用授權名額：以前刪除只是把員工標成「已刪除」，建立新員工時仍把它算進上限，名額滿了就建不出新員工。現在儀表板新增員工、套用板模（單一角色與整組團隊）、MCP `create_agent` 與匯入專家包都用同一套算法：狀態不是「已刪除」的員工才佔名額；**已封存的員工仍佔名額**（隨時可以恢復），設定檔讀不到的員工也照算（保守處理）。名額已滿時，儀表板的新增員工頁與板模套用畫面會列出目前佔用名額的員工（代號、顯示名稱、狀態），方便決定刪除哪一位；錯誤回應帶 `code: "agent_seat_limit_reached"` 與 `seat_holders` 清單（只給管理員；顯示名稱等文字會去掉換行與控制字元），名額無法確認時一律先拒絕（`agent_seat_count_unavailable`）。MCP `create_agent` 與匯入專家包額滿時只回報上限與已使用的名額數，不列出佔用名額的員工。名額檢查與建立改為同一個步驟：所有建立、套用板模、解除封存與匯入共用一把跨程序的名額鎖，檢查後到新員工寫入完成前不會有其他建立插隊，同時建立也不會超過上限；整組板模與專家包一次檢查整批，要嘛全部放行、要嘛都不建立。
 - 已刪除的 AI 員工不再被載入：gateway 啟動與重新掃描時跳過狀態為「已刪除」的員工，不會再收到通道訊息、交辦或排程；資料夾與資料仍保留在磁碟上，不會被刪掉。

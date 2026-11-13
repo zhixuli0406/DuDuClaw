@@ -410,6 +410,12 @@ pub(crate) async fn handle_message_send(
         Ok(agent) => agent,
         Err((code, msg)) => return jsonrpc_error(id, code, &msg),
     };
+    // RM-137 H3: under `none`, only the default (Main-role) agent.
+    if let Err((code, msg)) =
+        super::handlers::check_acp_target_under_none(home_dir, &target_agent).await
+    {
+        return jsonrpc_error(id, code, &msg);
+    }
 
     enqueue_and_respond(id, &parsed, &context_id, &target_agent, home_dir, index).await
 }

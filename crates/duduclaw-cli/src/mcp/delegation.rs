@@ -562,6 +562,79 @@ pub(crate) async fn check_delegation_allowed(
     }
 }
 
+/// [`org_snapshot`] without `.await`: the same store-first walk, reading the
+/// `agent.toml` mirror with `std::fs`. For a re-check that runs inside a
+/// synchronous file-lock guard (RM-137 H4, `agent_update`).
+pub(crate) fn org_snapshot_blocking(home_dir: &Path, agents: &[&str]) -> duduclaw_core::MapOrgView {
+    let agents_dir = home_dir.join("agents");
+    let store = duduclaw_core::org_store::load(home_dir);
+    let mut view = duduclaw_core::MapOrgView::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for start in agents {
+        let mut current = start.trim().to_string();
+        for _ in 0..=duduclaw_core::MAX_ANCESTOR_HOPS {
+            if current.is_empty() || !seen.insert(current.clone()) {
+                break;
+            }
+            let (parent, department) = match store.get(&current) {
+                Some(entry) => (entry.reports_to.clone(), entry.department.clone()),
+                None => {
+                    let Some(cfg) = std::fs::read_to_string(agents_dir.join(&current).join("agent.toml"))
+                        .ok()
+                        .and_then(|c| toml::from_str::<duduclaw_core::types::AgentConfig>(&c).ok())
+                    else {
+                        break;
+                    };
+                    (
+                        normalize_reports_to(cfg.agent.reports_to.trim()).to_string(),
+                        cfg.agent.department.trim().to_string(),
+                    )
+                }
+            };
+            view.insert(current.as_str(), parent.as_str(), department.as_str());
+            if parent.is_empty() {
+                break;
+            }
+            current = parent;
+        }
+    }
+    view
+}
+
+/// RM-137 H4: the delegation predicate of [`check_delegation_allowed`]
+/// (policy, `[delegation] allow`, org tree) evaluated synchronously, with the
+/// same `delegation_denied` audit row on refusal. Used as the re-check inside
+/// a locked write; the front-door call has already run the human-principal
+/// half, so this only ever refuses more.
+pub(crate) fn check_delegation_allowed_blocking(
+    home_dir: &Path,
+    sender: &str,
+    target: &str,
+    path_kind: &str,
+) -> std::result::Result<(), String> {
+    let rules = duduclaw_core::delegation_rules_from_home(home_dir);
+    let org = org_snapshot_blocking(home_dir, &[sender, target]);
+    duduclaw_core::can_delegate_rules(&rules, &org, sender, target).map_err(|denied| {
+        duduclaw_security::audit::append_tool_call_with_extras(
+            home_dir,
+            sender,
+            "delegation_denied",
+            &format!(
+                "{path_kind}: '{sender}' -> '{target}' denied ({})",
+                denied.reason.as_str()
+            ),
+            false,
+            &[
+                ("target", serde_json::json!(target)),
+                ("reason", serde_json::json!(denied.reason.as_str())),
+                ("policy", serde_json::json!(denied.policy.as_str())),
+                ("path_kind", serde_json::json!(path_kind)),
+            ],
+        );
+        denied.message_zh()
+    })
+}
+
 /// WP21 T6 (design doc §2.5) — may `caller` see `target` in `list_agents` /
 /// `agent_status`?
 ///
@@ -596,7 +669,9 @@ pub(crate) fn org_visible(
             return true;
         }
     }
-    rules.allows_pair(caller, target)
+    // RM-137: under `none` the whitelist grants nothing, so it widens no
+    // listing either (the reporting line stays visible, as under hierarchy).
+    rules.policy.honors_allow_pairs() && rules.allows_pair(caller, target)
 }
 
 /// WP21 T6 — the single "not found or not visible" response for

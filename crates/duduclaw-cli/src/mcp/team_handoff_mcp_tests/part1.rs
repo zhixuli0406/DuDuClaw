@@ -3,9 +3,9 @@ use super::*;
 #[tokio::test(flavor = "current_thread")]
 async fn files_the_packet_at_the_documented_path() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
     let p = packet(Role::Planner, Role::Executor, 2);
-    let out = call(tmp.path(), "planner-1", &p).await;
+    let out = call(tmp.path(), &me, &p).await;
     assert!(!is_error(&out), "{out}");
     let body: Value = serde_json::from_str(&text_of(&out)).unwrap();
     assert_eq!(body["ok"], true);
@@ -33,13 +33,42 @@ async fn files_the_packet_at_the_documented_path() {
     assert!(!on_disk.with_extension("json.tmp").exists());
 }
 
+/// RM-137 (soft identity mode): the same genuine role member and packet, but
+/// the caller's identity is not token-verified (the soft migration runs such
+/// a process as `Unverified`) or is verified as someone else — refused with
+/// `not_a_team_member`, nothing filed.
+#[tokio::test(flavor = "current_thread")]
+async fn unverified_role_member_is_refused() {
+    let tmp = TempDir::new();
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
+    let args = serde_json::json!({
+        "packet": serde_json::to_value(packet(Role::Planner, Role::Executor, 2)).unwrap()
+    });
+    // No identity token in this test process.
+    assert!(!crate::mcp::caller_token_verified(tmp.path(), &me));
+    let unverified = super::super::handle_team_handoff(&args, tmp.path(), &me).await;
+    assert_eq!(refusal_code(&unverified), "not_a_team_member");
+    let explicit = file_team_handoff(&args, tmp.path(), &me, me.clone(), false).await;
+    assert_eq!(refusal_code(&explicit), "not_a_team_member");
+    let someone_else = crate::mcp::with_token_verified_caller(
+        "eph-planner-2",
+        super::super::handle_team_handoff(&args, tmp.path(), &me),
+    )
+    .await;
+    assert_eq!(refusal_code(&someone_else), "not_a_team_member");
+    assert!(!tmp.path().join("team_packets").exists());
+    // Verified: filed.
+    let verified = handle_team_handoff(&args, tmp.path(), &me).await;
+    assert!(!is_error(&verified), "{verified}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn refiling_the_same_packet_id_is_idempotent() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(1));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(1));
     let p = packet(Role::Planner, Role::Executor, 1);
-    let first = call(tmp.path(), "planner-1", &p).await;
-    let second = call(tmp.path(), "planner-1", &p).await;
+    let first = call(tmp.path(), &me, &p).await;
+    let second = call(tmp.path(), &me, &p).await;
     assert!(!is_error(&second), "{second}");
     let a: Value = serde_json::from_str(&text_of(&first)).unwrap();
     let b: Value = serde_json::from_str(&text_of(&second)).unwrap();
@@ -66,13 +95,13 @@ async fn planner_fanout_keeps_every_sub_task_packet() {
     // reads the whole round directory, so a second packet must land beside
     // the first instead of overwriting it.
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(1));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(1));
     let mut paths = Vec::new();
     for i in 0..3 {
         let mut p = packet(Role::Planner, Role::Executor, 1);
         p.packet_id = format!("pk-{i}");
         p.objective = format!("子任務 {i}");
-        let out = call(tmp.path(), "planner-1", &p).await;
+        let out = call(tmp.path(), &me, &p).await;
         assert!(!is_error(&out), "{out}");
         let body: Value = serde_json::from_str(&text_of(&out)).unwrap();
         paths.push(body["path"].as_str().unwrap().to_string());
@@ -96,10 +125,10 @@ async fn planner_fanout_keeps_every_sub_task_packet() {
 #[tokio::test(flavor = "current_thread")]
 async fn writes_a_provenance_row_and_an_audit_event() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "exec-1", "executor", Some(TASK), Some(1));
+    let me = mk_member(tmp.path(), "exec-1", "executor", Some(TASK), Some(1));
     let out = call(
         tmp.path(),
-        "exec-1",
+        &me,
         &packet(Role::Executor, Role::Verifier, 1),
     )
     .await;
@@ -120,7 +149,7 @@ async fn writes_a_provenance_row_and_an_audit_event() {
         assert_eq!(row["origin"], "produced");
         assert_eq!(row["task_id"], TASK);
         assert_eq!(row["round"], 1);
-        assert_eq!(row["agent_id"], "exec-1");
+        assert_eq!(row["agent_id"], me.as_str());
     }
 
     let audit = fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
@@ -132,7 +161,7 @@ async fn writes_a_provenance_row_and_an_audit_event() {
     )
     .unwrap();
     assert_eq!(ev["event_type"], "team_handoff");
-    assert_eq!(ev["agent_id"], "exec-1");
+    assert_eq!(ev["agent_id"], me.as_str());
     assert_eq!(ev["details"]["task_id"], TASK);
     assert_eq!(ev["details"]["round"], 1);
     assert_eq!(ev["details"]["from_role"], "executor");
@@ -219,32 +248,85 @@ async fn refuses_an_unpinned_identity_naming_someone_elses_task() {
     let mut p = packet(Role::Planner, Role::Executor, 7);
     p.goal_id = "aaaaaaaa-1111-4222-8333-444455556666".into();
     let out = call(tmp.path(), "squatter", &p).await;
-    assert_eq!(refusal_code(&out), "unpinned_team_member");
+    assert_eq!(refusal_code(&out), "not_a_team_member");
     assert!(
         !tmp.path().join("team_packets").exists(),
         "an unpinned caller must write nothing"
     );
 
-    // Pinned to that same task, the identical packet is accepted — so the
-    // refusal is about the missing pin, not about the packet.
-    mk_member(
+    // An unpinned record inside a real `.ephemeral/` scaffold is not a
+    // verified member either.
+    mk_ephemeral_member(tmp.path(), "eph-unpinned-planner", "planner", None, None);
+    let out = call(tmp.path(), "eph-unpinned-planner", &p).await;
+    assert_eq!(refusal_code(&out), "not_a_team_member");
+    assert!(!tmp.path().join("team_packets").exists());
+
+    // A verified role member pinned to that same task files the identical
+    // packet — so the refusal is about the identity, not about the packet.
+    let pinned = mk_member(
         tmp.path(),
         "pinned",
         "planner",
         Some("aaaaaaaa-1111-4222-8333-444455556666"),
         Some(7),
     );
-    let ok = call(tmp.path(), "pinned", &p).await;
+    let ok = call(tmp.path(), &pinned, &p).await;
     assert!(!is_error(&ok), "{ok}");
+}
+
+/// RM-137 H1 — this test REPLACES the old assertion that a "pinned"
+/// `[team_member]` in an ordinary `agents/<id>/` directory is accepted. An
+/// employee can write `[team_member] role="planner" task_id=<victim task>
+/// round=3` into its own `agent.toml`; that must never let it inject a
+/// planner→executor packet into another employee's round, under any
+/// delegation policy.
+#[tokio::test(flavor = "current_thread")]
+async fn refuses_a_forged_pinned_team_member_in_an_ordinary_agent_dir_under_every_policy() {
+    for policy in ["open", "department", "hierarchy", "none"] {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!("[delegation]\npolicy = \"{policy}\"\n"),
+        )
+        .unwrap();
+        mk_forged_member(tmp.path(), "forger", "planner", Some(TASK), Some(3));
+        let out = call(tmp.path(), "forger", &packet(Role::Planner, Role::Executor, 3)).await;
+        assert_eq!(refusal_code(&out), "not_a_team_member", "policy {policy}");
+        assert!(
+            !tmp.path().join("team_packets").exists(),
+            "policy {policy}: nothing may be written for a forged member"
+        );
+        // A verified member in the same home is unaffected.
+        let real = mk_member(tmp.path(), "planner-ok", "planner", Some(TASK), Some(3));
+        let ok = call(tmp.path(), &real, &packet(Role::Planner, Role::Executor, 3)).await;
+        assert!(!is_error(&ok), "policy {policy}: {ok}");
+    }
+}
+
+/// RM-137 H1: a scaffold whose `[team_member] parent` disagrees with its
+/// `ephemeral.toml` is not a verified member.
+#[tokio::test(flavor = "current_thread")]
+async fn refuses_an_ephemeral_member_whose_parent_record_disagrees() {
+    let tmp = TempDir::new();
+    let id = mk_member(tmp.path(), "planner-mismatch", "planner", Some(TASK), Some(1));
+    let dir = tmp.path().join("agents/.ephemeral").join(&id);
+    fs::write(
+        dir.join("ephemeral.toml"),
+        "parent = \"someone-else\"\ntier = \"standard\"\ncreated_at = \"2026-10-29T00:00:00Z\"\nexpires_at = \"2026-10-30T00:00:00Z\"\n",
+    )
+    .unwrap();
+    let out = call(tmp.path(), &id, &packet(Role::Planner, Role::Executor, 1)).await;
+    assert_eq!(refusal_code(&out), "not_a_team_member");
+    assert!(!tmp.path().join("team_packets").exists());
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn refuses_a_packet_claiming_someone_elses_role() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "exec-1", "executor", Some(TASK), Some(1));
+    let me = mk_member(tmp.path(), "exec-1", "executor", Some(TASK), Some(1));
     let out = call(
         tmp.path(),
-        "exec-1",
+        &me,
         &packet(Role::Planner, Role::Executor, 1),
     )
     .await;
@@ -254,18 +336,18 @@ async fn refuses_a_packet_claiming_someone_elses_role() {
 #[tokio::test(flavor = "current_thread")]
 async fn refuses_a_foreign_task_or_round() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
 
     let mut foreign = packet(Role::Planner, Role::Executor, 2);
     foreign.goal_id = "0000dead-1111-4222-8333-444455556666".to_string();
     assert_eq!(
-        refusal_code(&call(tmp.path(), "planner-1", &foreign).await),
+        refusal_code(&call(tmp.path(), &me, &foreign).await),
         "task_id_mismatch"
     );
 
     let stale = packet(Role::Planner, Role::Executor, 1);
     assert_eq!(
-        refusal_code(&call(tmp.path(), "planner-1", &stale).await),
+        refusal_code(&call(tmp.path(), &me, &stale).await),
         "round_mismatch"
     );
 }
@@ -281,7 +363,7 @@ async fn refuses_every_illegal_edge() {
         (Role::Utility, Role::Executor),
     ] {
         let id = format!("m-{from}-{to}");
-        mk_member(tmp.path(), &id, from.as_str(), Some(TASK), Some(1));
+        let id = mk_member(tmp.path(), &id, from.as_str(), Some(TASK), Some(1));
         let out = call(tmp.path(), &id, &packet(from, to, 1)).await;
         assert_eq!(
             refusal_code(&out),
@@ -341,7 +423,7 @@ async fn finds_a_forbidden_key_nested_inside_an_object() {
 #[tokio::test(flavor = "current_thread")]
 async fn rejects_an_over_cap_packet_whole_and_writes_nothing() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(1));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(1));
     let mut p = packet(Role::Planner, Role::Executor, 1);
     for i in 0..13 {
         p.constraints
@@ -350,7 +432,7 @@ async fn rejects_an_over_cap_packet_whole_and_writes_nothing() {
                 "越界",
             ));
     }
-    let out = call(tmp.path(), "planner-1", &p).await;
+    let out = call(tmp.path(), &me, &p).await;
     assert_eq!(refusal_code(&out), "too_many_items");
     assert!(!tmp.path().join("team_packets").exists(), "nothing written");
 }
@@ -388,12 +470,12 @@ async fn refuses_a_missing_or_malformed_packet() {
 #[tokio::test(flavor = "current_thread")]
 async fn accepts_a_json_encoded_packet_string() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(1));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(1));
     let encoded = serde_json::to_string(&packet(Role::Planner, Role::Executor, 1)).unwrap();
     let out = handle_team_handoff(
         &serde_json::json!({ "packet": encoded }),
         tmp.path(),
-        "planner-1",
+        &me,
     )
     .await;
     assert!(!is_error(&out), "{out}");
@@ -412,7 +494,18 @@ async fn refuses_an_unreadable_team_member_section() {
         &packet(Role::Planner, Role::Executor, 1),
     )
     .await;
-    assert_eq!(refusal_code(&out), "team_member_unreadable");
+    // RM-137 H1: an ordinary directory is refused before its record is read.
+    assert_eq!(refusal_code(&out), "not_a_team_member");
+
+    // Inside a real scaffold, an unreadable record is not a verified member.
+    mk_ephemeral_member(tmp.path(), "eph-broken-boss", "boss", Some(TASK), Some(1));
+    let out = call(
+        tmp.path(),
+        "eph-broken-boss",
+        &packet(Role::Planner, Role::Executor, 1),
+    )
+    .await;
+    assert_eq!(refusal_code(&out), "not_a_team_member");
 }
 
 // ── Round-2 live-test regressions ───────────────────────────────────
@@ -481,7 +574,7 @@ async fn the_documented_minimal_packet_is_accepted_verbatim() {
     // Exactly the seven keys the tool description shows, with the identity
     // values this member actually has.
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
     let raw = serde_json::json!({
         "packet_id": "pk-min",
         "goal_id": TASK,
@@ -494,7 +587,7 @@ async fn the_documented_minimal_packet_is_accepted_verbatim() {
     let out = handle_team_handoff(
         &serde_json::json!({ "packet": raw }),
         tmp.path(),
-        "planner-1",
+        &me,
     )
     .await;
     assert!(!is_error(&out), "{out}");

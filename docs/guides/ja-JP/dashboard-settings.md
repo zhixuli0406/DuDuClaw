@@ -232,6 +232,23 @@ public_url を設定すると、すべての OAuth コールバックと戻り�
 
 カスタムカテゴリと追加キーワードは、詳細設定エディターの `[memory_privacy.custom_keywords]` で設定し（例：`legal_dispute = ["訴訟", "lawsuit"]`）、`excluded_categories` に加えます。未知のカテゴリ名は保存時に拒否されます。`config.toml` が読めない、またはセクションが無効な場合、ゲートウェイは既定の 4 カテゴリを適用して警告を記録し、`system.config` は `memory_privacy.load_state = "failed_closed"` を返します。詳細と「自分の記憶」RPC は[記憶インテリジェンス](../../features/ja-JP/20-memory-intelligence.md)の「自動記憶に保存しない個人的な話題」を参照してください。
 
+## 設定 → 詳細 → セキュリティと記録 → 委任権限
+
+管理者のみ（`delegation.get`／`delegation.set`）。保存すると次の委任判断から反映され、再起動は不要です。
+
+| コントロール | 設定キー | 反映 |
+|---|---|---|
+| 委任モード → 部門モード（既定）／階層モード／オープンモード／委任しない（v1.82） | `config.toml [delegation] policy` = `department`／`hierarchy`／`open`／`none` | 次の委任 |
+| 部門をまたぐ協働 → ペア | `[delegation] allow = [["a", "b"], …]` | 次の委任 |
+
+**委任しない（`none`、v1.82.0）。** AI 社員どうしで委任、メッセージ送信、呼び出し、社員の作成、仕事の割り当てはできません。`send_to_agent`、`spawn_agent`、`spawn_ephemeral`、`create_agent`、他の社員を指定した `tasks_create`／`create_task`、タスクの付け替え、他の社員向けの予約、作業キューのディスパッチゲートがすべて拒否します。最初の 4 つのツールは社員のツール一覧に表示されません。`tasks_create`、`create_task` は社員自身の仕事のために表示されたままです。部門をまたぐペアは保存されたまま適用されません（ページに表示されます）。人と設定したスケジュール（ダッシュボード、cron、heartbeat、ゴールループ）は引き続き社員に仕事を渡せます。チームモード（1 人の社員の計画・実行・確認の役割が同じラウンド内でタスクパケットを受け渡す流れ）はそのまま動きます。
+
+**認識できない値は委任しない扱い（v1.82.0 の動作変更）。** `policy` が 4 つの値以外（入力ミス、数値）、`[delegation]` がセクションでない、または `config.toml` が存在するのに読めない・形式が誤っている場合は、すべて `none` として扱います。v1.82.0 より前はより広い `department` になっていました。ゲートウェイはプロセスごとに 1 回だけ警告を記録します。ページの警告欄に表示され、`delegation.get` は元の値を `configured_policy` として返します。ファイルを解析できない場合、`delegation.get` と `delegation.set` はエラーを返し、何も書き込みません。設定ファイルの詳細編集で修正してください。
+
+**読み込み失敗で設定が上書きされない（v1.82.0）。** 現在の設定を読み込めない場合、ページはエラーを表示し、「もう一度試す」が成功するまですべての選択肢と「保存」を無効にします。読み込んでいない内容は送信しません。
+
+**AI 社員ページ → 概要 → 委任範囲（v1.82.0）。** 読み取り専用のカードで、その社員に実際に適用される内容を表示します。有効な委任モード、全社設定によるものか社員自身の「エージェント間通信を許可」スイッチによるものか（`[permissions] can_send_cross_agent = false` でその社員は `none` 扱い）、社員や一時アシスタントを作成できるか、その社員を含むペア（現在のモードで適用されないものは別に表示）、設定の問題です。管理者と、その社員を閲覧できるマネージャーに表示されます（`delegation.effective {agent_id}`、読み取り専用）。誤りのため無視されたペア設定がある場合、カードには件数だけが表示されます（「委任設定に N 件の警告があります。管理者が「設定」で確認できます。」）。警告の本文は元の設定内容を引用するため、このページ（管理者）でのみ表示されます。変更はこのページか社員の編集ページで行います。
+
 ## チャネル管理
 
 - グループの「メンションのみ」（`mention_only`、グループごと）：v1.76 から、LINE グループでオンにすると、`@` で AI スタッフを呼ぶメッセージ（または @ 一覧の要求）と、呼ばれたスタッフが待っている 1 件にだけ返信します。以前はグループ全体が無反応になっていました。Telegram の共有 bot もスタッフ名を受け付けます。[@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照。
@@ -380,7 +397,7 @@ Claude の補助呼び出しは CLI が使える認証情報で軽量パスを�
 
 **保存できる人（v1.76.0、動作の変更）。** `agents.update` は保存のたびに呼び出し元のロールと社員への紐付けをアカウントデータベースから読み直し、書き込み直前にファイルロック内でもう一度確認します。紐付けの解除、アカウントの停止、パスワード変更の要求は、セッションの期限を待たず次の保存から有効です。どの経路からの `agent.toml` の書き込みも（このページ、チャットの `/model`、設定ファイルの詳細編集、自動の変更）コメントとキーの順序を保ち、版を残し（[設定ファイル](#設定ファイルv1760)を参照）、`agent_file_changed` を記録します。保存後に社員一覧を再読み込みできなかったときのメッセージは「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」です（定期的な再読み込みはありません）。
 
-**権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。ただし `can_create_agents` は例外です。v1.81.0 から、このキーがない場合に `true` とみなすのは `main` 社員だけで、それ以外の社員は `false` です。v1.68 の起動時移行は main 以外の社員でこれをオンにしなくなり、MCP `create_agent` で作成された社員は常に `false` です（[セキュリティ防御](../../features/ja-JP/05-security-defense.md)を参照）。このページのスイッチは、キーがない場合、実効値がオフでもオンと表示されます。`agent.toml` を確認するか、スイッチを明示的に設定してください。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
+**権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。ただし `can_create_agents` は例外です。v1.81.0 から、このキーがない場合に `true` とみなすのは `main` 社員だけで、それ以外の社員は `false` です。v1.68 の起動時移行は main 以外の社員でこれをオンにしなくなり、MCP `create_agent` で作成された社員は常に `false` です（[セキュリティ防御](../../features/ja-JP/05-security-defense.md)を参照）。v1.82.0 から、このページのスイッチはゲートが実際に適用する値を表示します（`agents.inspect` の `effective_permissions`。MCP ゲートと同じ読み取り関数）。main 以外の社員で `can_create_agents` がない場合はオフ、`agent.toml` を読めない場合や、古い gateway が `effective_permissions` を返さない場合はすべてオフと表示されます（ファイルの値は使いません）。触れていないスイッチは保存時に送信されないため、変更していないフォームで権限が変わることはありません。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
 
 ## 管理 → メンバー：直属の上司と組織図（Enterprise 版、1.76.0）
 

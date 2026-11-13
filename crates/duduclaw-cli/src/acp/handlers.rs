@@ -98,6 +98,45 @@ pub(crate) async fn resolve_send_target(
         })
 }
 
+/// RM-137 H3: under `[delegation] policy = "none"` the ACP server may reach
+/// only the installation's ACP default agent — the registry's Main-role agent
+/// that `contextId = "default"` resolves to. An ACP session is NOT bound to
+/// one agent (`run_acp_server` is started with the home only; `contextId`
+/// names the target per message), so the default agent is the only binding
+/// there is. Every other target is refused here (front door, before anything
+/// is enqueued or run); the gateway's C1 gate applies the same rule to
+/// `a2a-client` queue rows. Fail closed: an unresolvable main agent refuses.
+pub(crate) async fn check_acp_target_under_none(
+    home_dir: &Path,
+    target_agent: &str,
+) -> Result<(), (i64, String)> {
+    if duduclaw_core::delegation_policy_from_home(home_dir)
+        != duduclaw_core::DelegationPolicy::Disabled
+    {
+        return Ok(());
+    }
+    acp_target_is_default(resolve_send_target(home_dir, "default").await.ok().as_deref(), target_agent)
+}
+
+/// Pure half of [`check_acp_target_under_none`].
+pub(crate) fn acp_target_is_default(
+    default_agent: Option<&str>,
+    target_agent: &str,
+) -> Result<(), (i64, String)> {
+    match default_agent {
+        Some(main) if !main.trim().is_empty() && main.trim() == target_agent.trim() => Ok(()),
+        _ => Err((
+            -32003,
+            format!(
+                "delegation policy is \"none\": the ACP server may only address the default \
+                 (Main-role) agent, not '{}' / 目前的委派政策是「不允許委派(none)」:\
+                 ACP 只能把工作交給預設(main)AI 員工。",
+                duduclaw_core::truncate_chars(target_agent.trim(), 64)
+            ),
+        )),
+    }
+}
+
 /// Execute an A2A/ACP prompt by routing to the target agent through the
 /// gateway's provider-agnostic dispatch (RFC-25 Phase 2 choke-point).
 ///

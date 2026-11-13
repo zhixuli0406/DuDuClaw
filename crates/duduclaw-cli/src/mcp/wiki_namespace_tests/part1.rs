@@ -435,6 +435,48 @@ async fn role_member_tools_list_uses_ephemeral_capabilities() {
             "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
         return;
     }
+    // RM-137 (soft identity mode): `team_handoff` is listed only for a role
+    // member whose identity is token-verified. The child sets the id but no
+    // token, so as it stands it is not verified …
+    {
+        let home = tmp_home_for_tools_list();
+        let member = "eph-planner-123456";
+        write_role_member_fixture(home.path(), member);
+        let mut principal =
+            internal_principal_named(duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID);
+        principal.scopes.insert(crate::mcp_auth::Scope::Admin);
+        let listed = super::handle_tools_list_for_agent(&json!(0), &principal, home.path(), member).await;
+        assert!(!names_of(&listed).contains(&"team_handoff".to_string()), "unverified: {listed}");
+    }
+    // … and the rest runs as the verified member a real spawn is.
+    crate::mcp::with_token_verified_caller("eph-planner-123456", role_member_tools_list_verified()).await;
+}
+
+/// The role member scaffold [`role_member_tools_list_uses_ephemeral_capabilities`]
+/// lists for: `[team_member]` + `ephemeral.toml` + org row under `parent`.
+fn write_role_member_fixture(home: &std::path::Path, member: &str) {
+    let dir = home.join("agents/.ephemeral").join(member);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("agent.toml"),
+        "[agent]\nstatus = \"active\"\nreports_to = 'parent'\n[team_member]\nrole = 'planner'\ntask_id = 'task-round'\nround = 1\nparent = 'parent'\n[capabilities]\nallowed_tools = [\"team_handoff\"]\n",
+    )
+    .unwrap();
+    let parent_dir = home.join("agents/parent");
+    std::fs::create_dir_all(&parent_dir).unwrap();
+    std::fs::write(parent_dir.join("agent.toml"), "[agent]\nstatus = 'active'\n").unwrap();
+    std::fs::write(
+        dir.join("ephemeral.toml"),
+        "parent = 'parent'\ntier = 'standard'\ncreated_at = '2026-10-29T00:00:00Z'\nexpires_at = '2026-10-30T00:00:00Z'\n",
+    )
+    .unwrap();
+    duduclaw_core::org_store::with_org_lock(home, |org| {
+        duduclaw_core::org_store::upsert(org, member, duduclaw_core::org_store::OrgEntry::new("parent", ""))
+    }).unwrap();
+}
+
+async fn role_member_tools_list_verified() {
+    use serde_json::json;
     let home = tmp_home_for_tools_list();
     let member = "eph-planner-123456";
     let dir = home.path().join("agents/.ephemeral").join(member);

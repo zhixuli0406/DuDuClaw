@@ -111,6 +111,7 @@ import {
   runtimeTimeoutNeedsAdmin,
   type OdooFormState,
   clampInt,
+  permissionFormValues,
 } from './editPayload';
 import { ToolNameListField, TypedKvTable } from './v168-controls';
 import { ActionRulesEditor } from './ActionRulesEditor';
@@ -585,12 +586,10 @@ function EditAgentPageContent() {
       // F1 — the saved cron (older gateways do not return it: the field then
       // shows empty and is only sent once the operator edits it).
       heartbeat_cron: agent.heartbeat?.cron ?? '',
-      // Absent permission keys mean "allowed" server-side, so show ON.
-      can_create_agents: agent.permissions?.can_create_agents ?? true,
-      can_send_cross_agent: agent.permissions?.can_send_cross_agent ?? true,
-      can_modify_own_skills: agent.permissions?.can_modify_own_skills ?? true,
-      can_modify_own_soul: agent.permissions?.can_modify_own_soul ?? false,
-      can_schedule_tasks: agent.permissions?.can_schedule_tasks ?? true,
+      // RM-137: what the gateway applies (`effective_permissions`), not a
+      // UI-side default — a missing `can_create_agents` is OFF for every
+      // non-main employee. Display only; untouched switches are never sent.
+      ...permissionFormValues(agent),
       gvu_enabled: ev?.gvu_enabled ?? true,
       max_active_skills: ev?.max_active_skills ?? 5,
       skill_token_budget: ev?.skill_token_budget ?? 0,
@@ -1293,7 +1292,7 @@ function EditAgentPageContent() {
           <SettingsSection>
             <SettingsCard>
               <RowNumber label={t('agents.edit.maxActiveSkills')} value={form.max_active_skills ?? 5} min={1} max={20} onChange={(v) => updateField('max_active_skills', v)} />
-              <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? true} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
+              <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? false} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
               <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
             </SettingsCard>
           </SettingsSection>
@@ -1331,8 +1330,8 @@ function EditAgentPageContent() {
           {adminHint}
           <SettingsSection title={t('agents.edit.section.permissions')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.v168.perm.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? true} disabled={locked('form.can_send_cross_agent')} onChange={(v) => updateField('can_send_cross_agent', v)} />
-              <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.v168.perm.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? true} disabled={locked('form.can_schedule_tasks')} onChange={(v) => updateField('can_schedule_tasks', v)} />
+              <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.v168.perm.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? false} disabled={locked('form.can_send_cross_agent')} onChange={(v) => updateField('can_send_cross_agent', v)} />
+              <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.v168.perm.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? false} disabled={locked('form.can_schedule_tasks')} onChange={(v) => updateField('can_schedule_tasks', v)} />
             </SettingsCard>
           </SettingsSection>
 
@@ -1596,7 +1595,7 @@ function EditAgentPageContent() {
 
           <DangerZone title={t('agents.perm.danger.title')} description={t('agents.perm.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.v168.perm.canCreateAgents.help')} checked={form.can_create_agents ?? true} disabled={locked('form.can_create_agents')} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
+              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.v168.perm.canCreateAgents.help')} checked={form.can_create_agents ?? false} disabled={locked('form.can_create_agents')} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
               <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} disabled={!isAdmin} onChange={guardDanger(t('agents.edit.canModifySoul'), (v) => updateField('can_modify_own_soul', v), 'agents.edit.dangerConfirm.canModifySoul')} />
             </SettingsCard>
           </DangerZone>

@@ -121,6 +121,7 @@ impl MethodHandler {
                     { "name": "tick.sources.remove", "description": "Remove one tick source by id (admin)" },
                     { "name": "delegation.get", "description": "Read the org-wide delegation policy + cross-department pairs (admin)" },
                     { "name": "delegation.set", "description": "Update the delegation policy / cross-department pairs (admin)" },
+                    { "name": "delegation.effective", "description": "Read-only effective delegation for one AI employee: policy, its source (global or the employee's own switch), applying pairs, config_error (Manager and visible employee)" },
                     { "name": "system.autostart.status", "description": "Login/boot autostart registration status (admin)" },
                     { "name": "system.autostart.set", "description": "Enable/disable gateway autostart at login/boot (admin)" },
                     { "name": "system.identity_grace_start", "description": "Accept unverified AI-employee identities for at most 30 days (admin + current password; audited)" },

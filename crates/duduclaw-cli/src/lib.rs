@@ -6842,6 +6842,10 @@ fn agent_file_guard_decision(
                         .or_else(|| {
                             duduclaw_core::bash_operator_command_decision(command, &caller, meeting_cmd::OPERATOR_COMMANDS)
                         })
+                        .or_else(|| {
+                            // RM-137 H3: an employee may not run its own ACP server.
+                            duduclaw_core::bash_operator_command_decision(command, &caller, acp::server::OPERATOR_COMMANDS)
+                        })
                         .or_else(|| license::bash_license_decision(command, &caller))
                         .or_else(|| {
                             channel_ingress_cmd::bash_channel_ingress_decision(command, &caller)
@@ -14248,6 +14252,68 @@ mod protected_toml_hook_tests {
         let d =
             check_protected_toml_tool_call("MultiEdit", &env, &home.agent_toml(), &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert!(matches!(d, GuardDecision::BlockedOrgFieldChange { .. }));
+    }
+
+    /// RM-137 H1: an employee may not add or alter `[team_member]` in its own
+    /// `agent.toml` through Write, Edit or MultiEdit.
+    #[test]
+    fn team_member_section_is_frozen_for_write_edit_and_multiedit() {
+        let agent = duduclaw_core::HookCaller::Agent("agnes".to_string());
+        let forged = "\n[team_member]\nrole = \"planner\"\ntask_id = \"t-victim\"\nround = 3\nparent = \"agnes\"\n";
+        let blocked = |d: &GuardDecision| matches!(d, GuardDecision::BlockedAgentSecuritySection { .. });
+
+        // Adding the section.
+        let home = TempHome::new();
+        home.write_agent_toml(BASE);
+        let env = write_envelope(&home.agent_toml(), &format!("{BASE}{forged}"));
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "Write add: {d:?}");
+        let env = edit_envelope(
+            &home.agent_toml(),
+            "preferred = \"sonnet\"\n",
+            &format!("preferred = \"sonnet\"\n{forged}"),
+        );
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "Edit add: {d:?}");
+        let env = json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": home.agent_toml().to_string_lossy(),
+                "edits": [
+                    { "old_string": "preferred = \"sonnet\"\n", "new_string": format!("preferred = \"opus\"\n{forged}") }
+                ]
+            }
+        });
+        let d = check_protected_toml_tool_call("MultiEdit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "MultiEdit add: {d:?}");
+
+        // Altering an existing section (re-pinning to another task).
+        let home = TempHome::new();
+        let existing = format!("{BASE}{forged}");
+        home.write_agent_toml(&existing);
+        let env = write_envelope(&home.agent_toml(), &existing.replace("t-victim", "t-other"));
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "Write alter: {d:?}");
+        let env = edit_envelope(&home.agent_toml(), "round = 3", "round = 4");
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "Edit alter: {d:?}");
+        let env = json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": home.agent_toml().to_string_lossy(),
+                "edits": [
+                    { "old_string": "preferred = \"sonnet\"", "new_string": "preferred = \"opus\"" },
+                    { "old_string": "role = \"planner\"", "new_string": "role = \"verifier\"" }
+                ]
+            }
+        });
+        let d = check_protected_toml_tool_call("MultiEdit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "MultiEdit alter: {d:?}");
+
+        // An ordinary edit next to it stays allowed.
+        let env = edit_envelope(&home.agent_toml(), "preferred = \"sonnet\"", "preferred = \"opus\"");
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert_eq!(d, GuardDecision::AllowedAgentWrite);
     }
 
     #[test]

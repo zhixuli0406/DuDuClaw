@@ -117,6 +117,7 @@ Claude CLI の `minimal_context` は `--tools` で内蔵 CLI ツールを制御�
 | `[knowledge] enabled` とコレクションの付与 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | ナレッジベースが有効で、社員またはその部門に（`[knowledge] collections` で絞り込んだ後も）1 つ以上のコレクションが付与されていない限り `knowledge_*` 4 ツールを非表示。付与の変更で `list_changed` を送信（下の [`knowledge_*`](#knowledge_ドキュメントナレッジベース) を参照） |
 | `[responsibilities] enabled` | `config.toml` | `responsibility_*` 3 ツールを非表示（下の[継続タスクのツール](#responsibility_get--responsibility_followup--responsibility_ask--継続タスクのツール)を参照） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有効な付与 | タスクスコープの付与が有効になるまで非表示 |
+| チームのロールメンバー（v1.82） | `agents/.ephemeral/eph-*` のロールメンバーで、`[team_member]` と `ephemeral.toml` の上位社員が一致し、ID がトークンで検証済み（`DUDUCLAW_AGENT_TOKEN`） | どの委任モードでも、それ以外の呼び出し元には `team_handoff` を表示しません。そのため通常の社員のツール一覧は以前より 1 つ減ります。ハンドラーも同じ呼び出し元を `not_a_team_member` で拒否します |
 
 機器操作コンソール（`/console`）は管理者だけが利用できます。`system_operator` スタッフが機器操作ツールを実行するときも、サーバーで依頼者が有効な管理者かを確認します。他の AI スタッフとの通常の会話は、従来のアクセス規則で利用できます。
 

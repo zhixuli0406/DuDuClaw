@@ -196,6 +196,26 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_delegation_set(params, ctx)).await
             }
+            // RM-137: read-only effective delegation for one employee (the
+            // employee page). Same gate as `agents.export_profile`: Manager
+            // and up, with view access to that employee, re-read from
+            // users.db (Admin passes both).
+            "delegation.effective" => {
+                require_manager!();
+                let agent_id = check_agent!(AccessLevel::Viewer);
+                // RM-137 L1: the live (re-read) context also decides which
+                // allow-pair peers the payload may name.
+                let viewer = match crate::agent_files::flow::require_live_agent_access(
+                    &self.home_dir,
+                    ctx,
+                    &agent_id,
+                    AccessLevel::Viewer,
+                ) {
+                    Ok(fresh) => fresh,
+                    Err(e) => return WsFrame::error_response("", &e),
+                };
+                boxed_frame(|| self.handle_delegation_effective(&agent_id, &viewer)).await
+            }
             // ── v1.54: 校準式 forward model + held-out 學習閘 全域開關 ─────
             // Global `[task_forward_model]` toggles. Admin-gated like every
             // other config-writing RPC. `calibration_enabled` /

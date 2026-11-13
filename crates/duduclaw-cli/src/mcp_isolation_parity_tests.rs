@@ -556,9 +556,12 @@ async fn employee_tool_parity(home: &std::path::Path) {
             assert!(ordinary.contains(tool), "non-protected installations retain {tool}");
             assert!(!isolated.contains(tool), "protected TEAM defers {tool}");
         }
+        // `team_handoff` is not in this list: since RM-137 H1 it is listed only
+        // for a token-verified team role member, and `main` is not one.
+        assert!(!ordinary.contains("team_handoff") && !isolated.contains("team_handoff"));
         if extra.is_empty() {
             for tool in ["odoo_connect", "odoo_execute", "send_message", "send_photo", "send_sticker", "channel_status",
-                "send_to_agent", "team_handoff", "plan_start", "task_status", "session_restore_context", "memory_improve",
+                "send_to_agent", "plan_start", "task_status", "session_restore_context", "memory_improve",
                 "list_cron_tasks", "run_cron_task", "create_reminder", "cancel_reminder", "web_search", "mail_send",
                 "db_sources", "db_tables", "db_select", "db_query", "wiki_read", "wiki_write", "wiki_share",
                 "cost_summary", "list_agents", "computer_session_start", "computer_workspace_list", "computer_workspace_write",

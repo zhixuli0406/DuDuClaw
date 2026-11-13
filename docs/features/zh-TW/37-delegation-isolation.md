@@ -12,7 +12,7 @@ DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工�
 
 ---
 
-## 三層政策，自主選擇
+## 四種政策，自主選擇
 
 在 `config.toml` 或儀表板「進階設定」裡配置 `[delegation] policy`：
 
@@ -21,10 +21,17 @@ DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工�
 | `department`（預設） | 上下級可派工、同部門橫向協作、白名單配對都允許 | 大多數團隊 |
 | `hierarchy` | 只允許上下級與白名單配對，沒有同部門橫向 | 嚴格的指揮鏈 |
 | `open` | 舊版本行為，除了「不能派給自己」之外不做檢查 | 緊急回退用 |
+| `none`（v1.82） | AI 員工之間不能互相委派、傳訊、呼叫、建立員工或指派工作；白名單配對不生效。人與排程（儀表板、cron、heartbeat、目標循環）仍可把工作交給員工 | 每位員工各自工作，只由人派工 |
 
-白名單配對在 `department` 與 `hierarchy` 兩種政策下都有效；只有 `open` 用不到它（本來就全開）。
+白名單配對在 `department` 與 `hierarchy` 兩種政策下都有效；`open` 用不到它（本來就全開），`none` 則忽略它。
 
 預設值 `department` 適合一般協作：既已修正越級指派漏洞，同時保留同事互相支援的彈性。
+
+**`none` 的細節（v1.82.0）。** 下面所有路徑都由同一個判斷函式決定，所以 `send_to_agent`、`spawn_agent`、指派給其他員工的 `tasks_create`／`tasks_update`、`create_task` 步驟、替別人排的例行工作、改動其他員工的紀錄、co-drive 郵件交辦，以及 bus 分派閘門，都會以 `delegation_disabled` 拒絕。MCP 分派閘門也會對所有員工拒絕 `spawn_ephemeral` 與 `create_agent`（受保護模式下 `spawn_ephemeral` 的子工作也不會放行）；員工的工具清單不再列出 `send_to_agent`、`spawn_agent`、`spawn_ephemeral`、`create_agent`，`tasks_create`、`create_task` 仍列出供員工處理自己的工作。`list_agents` 不再因白名單配對而看得到更多員工。唯一的例外是團隊模式（Team-as-Agent）：同一位員工的規劃、執行、檢查角色在同一回合內透過 `team_handoff` 交換任務封包。在任何委派模式下，`team_handoff` 只接受經過驗證的團隊成員——gateway 在 `agents/.ephemeral/eph-*` 建立、`[team_member]` 記錄的上層員工與 `ephemeral.toml` 一致的角色成員；一般 AI 員工會被拒絕（`not_a_team_member`），也看不到這個工具，即使在自己的 `agent.toml` 寫入 `[team_member]` 也一樣（員工本來就不能修改這個區段）。呼叫者的身分還必須通過身分權杖驗證（`DUDUCLAW_AGENT_TOKEN`）：管理員開啟 30 天過渡寬鬆模式（`require_identity_token = false`）時，沒有有效權杖的程序以「未驗證」身分執行，這時只宣告一個既有的 `eph-*` id 既不能呼叫、也看不到這個工具，也拿不到 `none` 模式的例外（`not_a_team_member`）；寬鬆模式下其他行為不變。角色成員由團隊編排器自己執行，不經過委派判斷。另外在 `none` 模式下：`agent_update` 不能改另一位員工的 `status`、`heartbeat_enabled`、`heartbeat_cron`（這些會啟動或重排對方的背景工作；其他模式下也要通過委派判斷，並在寫入鎖內再檢查一次）；`channel_config` 不能把 `agent_override` 指向另一位員工；ACP 只能把工作交給預設（main）員工。
+
+**邊界。** `none` 與所有寄件者檢查，都建立在 AI 員工無法寫入 gateway 的佇列檔（`bus_queue.jsonl`、`message_queue.db` 及其附屬檔）之上：佇列列沒有准入簽章，能以 gateway 的作業系統使用者身分寫入這些檔案的程序就能冒充系統寄件者。員工檔案防護會在 Write／Edit 與 Bash 擋下這類寫入，但擁有不受限 Bash 的員工不在這個邊界內；原生 Linux 員工隔離才提供這個邊界。
+
+**無法辨識的值一律不允許委派（v1.82.0）。** `policy` 不是這四個值之一、不是文字、`[delegation]` 不是區段，或 `config.toml` 存在但讀不到、格式錯誤時，都以 `none` 執行（v1.82.0 以前會改用 `department`）。閘道每個程序只記錄一次警告，儀表板會顯示原因。
 
 ---
 
@@ -117,9 +124,10 @@ allow = [
 
 三個控制項：
 
-1. **政策選擇**（單選）：department / hierarchy / open
+1. **政策選擇**（單選）：department / hierarchy / open / 不允許委派（`none`，v1.82）
    - 每項附一句說明
    - `open` 附紅色風險警語："放棄所有檢查，回到舊版本行為"
+   - `none` 會說明下面的配對不生效、團隊模式照常運作
 
 2. **跨部門協作**（配對列表）
    - 每列顯示兩個 AI 員工名稱 + 部門徽章
@@ -128,7 +136,11 @@ allow = [
 
 3. **狀態指示**
    - 當前政策、配對數量
-   - 若有設定警告（例如無效 ID）會顯示
+   - 若有設定警告（例如無效 ID、無法辨識的政策值）會顯示
+
+讀不到目前設定時，頁面會顯示錯誤，所有選項與「儲存」都停用，直到重新讀取成功（v1.82.0）；以前讀取失敗會在畫面上留下「部門模式、沒有配對」，按儲存就會蓋掉真正的設定。`config.toml` 不是有效的 TOML 時，`delegation.set` 會拒絕且不寫入。
+
+**員工頁 → 總覽 → 委派範圍（v1.82.0）。** 唯讀卡片（`delegation.effective {agent_id}`，管理員與有權查看該員工的經理）顯示這位員工實際適用的政策、來自全公司設定還是員工自己的 `[permissions] can_send_cross_agent` 開關（`false` 會讓這位員工視為 `none`）、能否建立員工、和他有關的配對（不生效的另外列出），以及設定問題（`config_error`／政策值警告）。寫錯的配對設定所產生的警告會引用原始內容，可能出現任何員工的 id，所以卡片只收到數量（`allow_warning_count`，顯示「委派設定有 N 則警告，管理員可以到「設定」查看」）；原文只給管理員查看者（`allow_warnings`），`delegation.get`（僅管理員）照舊有完整警告。設定問題也一樣：`config_error` 只是一個類別——`unreadable`／`unparsable`（config.toml）、`permissions_unreadable`（這位員工的 `[permissions]`）或 `unknown`——卡片依類別顯示固定說明，因為詳細原因可能引用設定檔原文（TOML 解析錯誤的片段）。詳細原因只給管理員查看者（`config_error_detail`），卡片不顯示；管理員可在「設定 › 委派權限」透過 `delegation.get` 看到。
 
 ---
 
@@ -180,6 +192,10 @@ allow = [
 
 建議保持預設 `department` 政策。即使舊版本沒有任何檢查，新政策對現有合法指派零影響，只在不合理的穿插嘗試時發出警告。
 
+升級到 1.82 時：
+
+- **無法辨識的 `[delegation] policy` 現在代表不允許委派。** 打錯字（例如 `policy = "departement"`）、數字，或 `config.toml` 讀不到，以前會改用 `department`，現在一律以 `none` 執行。升級前請確認設定值是 `department`、`hierarchy`、`open` 或 `none`。儀表板的「委派權限」頁與員工頁的「委派範圍」會顯示問題。
+
 ---
 
 ## 技術細節
@@ -196,6 +212,8 @@ allow = [
 - `autopilot`（自動化規則，前提是規則本身經驗證）
 
 外部 A2A 呼叫預設用 `a2a-client` 身分，**不在清單內**。僅當 `[acp] trusted = true` 時才納入。
+
+`[acp] trusted = true` 等於信任每一個能以 gateway 的作業系統使用者身分啟動 ACP 伺服器（`duduclaw acp server`）的本機程序：伺服器從標準輸入讀取 JSON-RPC，不驗證呼叫者。v1.82 起 ACP 伺服器不能在 AI 員工的工作階段中啟動——偵測到 AI 工作階段環境變數，或員工身分（`DUDUCLAW_AGENT_ID`、`DUDUCLAW_AGENT_TOKEN`、`DUDUCLAW_HOOK_TOKEN`）時拒絕，Bash 防護也不讓員工執行這個指令。ACP 工作階段沒有綁定單一員工（每則訊息由 `contextId` 指定對象），所以在 `none` 模式下 ACP 只能把工作交給預設（main）員工，其他對象一律拒絕。
 
 上述名稱（加上 `a2a-client`、`default`、以及任何 `__` 開頭的名稱）是**保留字**，不能拿來建立 AI 員工，否則等於幫自己發一張通行證。
 

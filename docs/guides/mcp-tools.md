@@ -158,6 +158,7 @@ still reaches the real gates, which accept or refuse it under the existing rules
 | `[knowledge] enabled` + collection grants | `config.toml` / `knowledge.db` / `agent.toml [knowledge] collections` | 4 `knowledge_*` tools hidden unless the knowledge base is on and at least one collection is granted to the employee or its department (after `[knowledge] collections` narrowing); a grant change sends `list_changed` (see [`knowledge_*`](#knowledge_--document-knowledge-base) below) |
 | `[responsibilities] enabled` | `config.toml` | 3 `responsibility_*` tools hidden (see [responsibility tools](#responsibility_get--responsibility_followup--responsibility_ask--responsibility-tools) below) |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
+| Team role membership (v1.82) | `agents/.ephemeral/eph-*` scaffold whose `[team_member]` names the same parent as its `ephemeral.toml`, plus a token-verified identity (`DUDUCLAW_AGENT_TOKEN`) | `team_handoff` hidden from every other caller, under every delegation policy; an ordinary employee therefore sees one tool fewer than before. The handler refuses the same callers with `not_a_team_member` |
 
 The machine-operation console (`/console`) is available only to administrators. Machine-operation tools used by a `system_operator` employee also verify on the server that the person requesting them is an active administrator; ordinary chat with other AI employees remains available according to existing access rules.
 

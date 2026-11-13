@@ -455,7 +455,7 @@ pub(crate) fn creates_background_work(tool: &str) -> bool {
 pub(crate) fn changes_background_work(tool: &str, args: &Value) -> bool {
     creates_background_work(tool)
         || (tool == "agent_update"
-            && ["heartbeat_enabled", "heartbeat_cron", "status"]
+            && super::BACKGROUND_WORK_PARAMS
                 .iter()
                 .any(|key| args.get(*key).is_some()))
 }

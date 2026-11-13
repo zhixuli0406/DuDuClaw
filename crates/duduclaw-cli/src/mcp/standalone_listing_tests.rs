@@ -205,7 +205,12 @@ async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hid
     // employee has no knowledge collection granted. Moves only with a
     // deliberate CHANGELOG entry.
     // The saved Odoo overview and credential declaration each add one tool.
-    assert_eq!(per_agent.len(), 169, "{per_agent:?}");
+    // RM-137 H1 (v1.82): `team_handoff` is listed only for a verified team
+    // role member with a token-verified identity (`tools_list.rs`
+    // `team_handoff_listed`, the handler's own `not_a_team_member` check), so
+    // an ordinary employee no longer sees it: 169 → 168.
+    assert_eq!(per_agent.len(), 168, "{per_agent:?}");
+    assert!(!per_agent.contains("team_handoff"), "{per_agent:?}");
     assert!(per_agent.contains("odoo_schema_overview"));
     assert!(per_agent.contains("credential_declare"));
     assert!(!per_agent.contains("odoo_schema_scan"));

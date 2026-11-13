@@ -247,6 +247,67 @@ fn bash_write_to_home_state_is_blocked_for_an_agent() {
     }
 }
 
+/// RM-137 H2: the durable queue files and their side files are refused for
+/// an employee on the Write/Edit lane (home allow-list) and on the Bash lane,
+/// including spellings the token scan cannot place under `<home>`.
+const QUEUE_FILES: &[&str] = &[
+    "bus_queue.jsonl",
+    "bus_queue.jsonl.lock",
+    "bus_queue.jsonl.1",
+    "message_queue.db",
+    "message_queue.db-wal",
+    "message_queue.db-shm",
+    "message_queue.db-journal",
+];
+
+#[test]
+fn queue_files_are_refused_on_the_write_edit_lane() {
+    for rel in QUEUE_FILES {
+        for caller in [agent("sales-rep"), untrusted("sales-rep")] {
+            let d = check_caller_scope(&home().join(rel), &home(), &caller);
+            assert!(
+                matches!(d, GuardDecision::BlockedHomeStateWrite { .. }),
+                "{rel}: {d:?}"
+            );
+        }
+        // The operator is unaffected.
+        assert_eq!(
+            check_caller_scope(&home().join(rel), &home(), &HookCaller::Absent),
+            GuardDecision::NotAgentFile,
+            "{rel}"
+        );
+    }
+}
+
+#[test]
+fn queue_files_are_refused_on_the_bash_lane() {
+    for rel in QUEUE_FILES {
+        for cmd in [
+            format!("echo '{{\"sender_agent\":\"cron\"}}' >> /Users/alice/.duduclaw/{rel}"),
+            format!("echo x >> ~/.duduclaw/{rel}"),
+            format!("echo x >> ../../{rel}"),
+            // A `cd` the scan cannot follow: named by basename.
+            format!("cd \"$(cat /tmp/where)\" && echo x >> {rel}"),
+            format!("cp forged.jsonl {rel}"),
+        ] {
+            let d = check_bash_protected_write(&cmd, &home(), &agent("sales-rep"));
+            assert!(!d.is_allowed(), "{cmd}: {d:?}");
+        }
+    }
+    for cmd in [
+        "sqlite3 ~/.duduclaw/message_queue.db \"INSERT INTO message_queue VALUES (1)\"",
+        "sqlite3 message_queue.db \"INSERT INTO message_queue VALUES (1)\"",
+    ] {
+        let d = check_bash_protected_write(cmd, &home(), &agent("sales-rep"));
+        assert!(!d.is_allowed(), "{cmd}: {d:?}");
+    }
+    // Reading the bus file stays a read.
+    assert_eq!(
+        check_bash_protected_write("grep cron ~/.duduclaw/bus_queue.jsonl", &home(), &agent("sales-rep")),
+        GuardDecision::NotAgentFile
+    );
+}
+
 #[test]
 fn bash_relative_reach_into_a_peer_dir_is_blocked() {
     // `agents/<id>/` spelled through the cwd, which the old segment scan

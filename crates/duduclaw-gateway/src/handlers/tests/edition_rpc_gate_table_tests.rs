@@ -138,6 +138,7 @@ fn personal_surfaces_are_untouched() {
         // 委派權限 — 跨 agent 不是跨人 (§1.6)
         "delegation.get",
         "delegation.set",
+        "delegation.effective",
         // 授權：升級路徑本身，擋掉就再也升不了級
         "license.status",
         "license.fingerprint",
