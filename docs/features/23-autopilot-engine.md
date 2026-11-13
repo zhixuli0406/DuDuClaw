@@ -52,7 +52,7 @@ A rule can subscribe to thirteen kinds of `AutopilotEvent`. Each carries a paylo
 | **OsFileEvent** | `os_file` | The agent's `[os_watch]` watcher sees a file change | `agent_id`, `path`, `kind` (created / modified / removed / renamed), `file_name`, `extension` |
 | **OsFrontmostEvent** | `os_frontmost` | The frontmost app or window title changes | `agent_id`, `app`, `window_title`, `prev_app` |
 | **Tick** | `tick` | A resident-sensing source (`[[tick.sources]]`, editable since v1.68.0 under Settings → Advanced → Automation → Live data feeds) produces an observation | `source`, `ts`, the extracted fields and their `prev_` / `delta_` / `pct_` companions |
-| **SecurityEvent** | `security_event` | A warning- or critical-level audit event, or a security posture change | `severity`, `event_type`, `agent_id`, `source` |
+| **SecurityEvent** | `security_event` | A warning- or critical-level audit event, or a security posture change (emitted inside the gateway only; see "Gateway-only events") | `severity`, `event_type`, `agent_id`, `source` |
 | **OdooEvent** | `odoo_event` | The Odoo poller or `POST /webhook/odoo` reports an ERP change | `event_type`, `model`, `record_id`, `record` (its top-level scalar keys are also flattened) |
 
 A rule declares which `trigger_event` it cares about, so a `channel_message` rule never sees a `task_created`. `autopilot.create` accepts the twelve names other than `cron_tick`; `autopilot.update` accepts `cron_tick` only when the stored rule already has it, so such a rule can still be saved; changing another rule to `cron_tick` is refused with the same message as on create. Work that should run on a schedule belongs to the cron scheduler (the 例行工作 / Routines page, or `tasks_create` with `schedule`). All thirteen names are still legal `first` / `then` events of a `sequence` rule. The engine also carries an internal `cep_trigger` event that the sequence matcher emits to fire a matched rule; it is not a valid `trigger_event`.
@@ -134,6 +134,54 @@ invoke
 ```
 
 The path-containment check (`canonicalize()` + `starts_with`) means even a skill name that slips past the charset allowlist can't reference a file outside the agent's skills directory.
+
+Text fields (`prompt`, `text`) are templates: `{task.title}` is replaced with the event's field. Since v1.82 the double form `{{task.title}}` is the same placeholder; before, it left a stray `}` in the text. Task events expose the task under `task`, so the title is `task.title`, not `title`. An unknown field renders as an empty string.
+
+---
+
+## Waiting for Human Approval (`require_approval`)
+
+Any action can carry `"require_approval": true`. Such a rule never runs its action when it fires. **Behaviour change in v1.82:** up to v1.81 the flag had no effect in a running gateway — the action ran at once and history said `success`. After upgrading, rules that already have `require_approval: true` start waiting for approval.
+
+```
+rule fires ─> render the action exactly as it would run
+          ─> file ONE approval card (kind autopilot_action) that freezes:
+               rule id + rule revision hash, the triggering event,
+               the rendered action (target + prompt / skill / message text)
+          ─> history: awaiting_approval            (nothing runs)
+
+Admin approves on the dashboard ─> within 15 minutes of the decision?   ── no ─> expired
+                                   rule still exists, is enabled and has the
+                                   frozen revision?                       ── no ─> stale_after_approval
+                                   rule's circuit breaker closed?          ── no ─> blocked_breaker_open
+                                         │ yes (checked while rule edits wait)
+                                         v
+                                   card consumed (single use) ─> the frozen
+                                   action runs once ─> success / failure
+Admin denies, or 1 hour passes ───> denied / expired (nothing runs)
+```
+
+- **Who decides.** Only a current Admin, on the dashboard (inbox / approvals). Channels receive a notice without buttons and without the action's content: only that an automation action is waiting for an administrator to review it in the dashboard, the deadline and the card number (in the language set by `[general] default_language`).
+- **The Admin sees everything that will run.** The inbox has a dedicated view for these cards. It always shows the complete frozen action — the full prompt (for `run_skill` including the skill body) or the full message and its channel and chat, the target AI employee, the queue lane, the employee whose event triggered the rule, the triggering event reference, the rule name and full revision digest, the decision deadline and the latest execution time. Nothing is cut short; long content scrolls. Bidi controls, control characters and zero-width / invisible characters are shown as visible codes such as `\u{202E}`. A frozen action larger than 64 KiB is never filed (`approval_error`, nothing runs).
+- **What is approved is what runs.** The card holds the rendered prompt or message; after approval exactly that copy runs, once. Approve stays disabled until the full content has been shown, and the decision must carry the digest of the card that was shown (`expected_digest`): the gateway refuses to approve this kind without it, or with a digest that does not match the stored card, from any client. Denying needs no digest. A card whose content no longer matches what was frozen is refused (`approval_error`).
+- **Edited rules do not run old approvals.** If the rule is edited (trigger, conditions, action), disabled or removed before the approval is used, the approved action does not run (`stale_after_approval`). The final check and the use of the approval happen while rule edits wait (in this gateway and in any other process), so an edit cannot slip in between. Renaming a rule does not count as an edit.
+- **A loop still stops it.** If the rule's circuit breaker is open when the approved action is due, it does not run (`blocked_breaker_open`); the card is used up and the Admins are notified. The autonomy pause is checked again at that point too (`skipped`).
+- **Approvals are short-lived.** An approved action runs only within **15 minutes** after the decision (a fixed limit). Outside that window — including a decision time in the future — it is recorded as `expired`, the card is used up, and the Admins are notified.
+- **Fail closed.** If the card cannot be filed — no approval service attached, the approval store refuses it (for example the rendered text contains an API key), the frozen action is over 64 KiB, any store error — the action does not run. History records `blocked_no_approval_service` or `approval_error`, and Admins get a notice (Activity Feed, dashboard, and the Admins' verified channels), at most once per rule per hour. (When the card itself could not be filed after the fire was recorded in `autopilot.db`, that fire still gets its own Activity Feed entry; only its chat notice is limited.)
+- **Every outcome is announced, even across a crash.** Every gated fire that ends (ran, failed, denied, expired, stale, blocked, outcome unknown) gets exactly one history row and one Activity Feed entry. The outcome, its history row and the record of what still has to be announced are saved together; if the gateway stops before the Activity entry or the chat notice is out, the gateway that holds the data-directory lock sends them after it starts again, and keeps checking every few seconds while it runs. A chat notice counts as done only once it was sent, or queued for after quiet hours; a failed send is retried with growing delays (30 s, 2 min, 8 min, …, up to 6 attempts), and the Activity entry stays either way. The dashboard live event is best effort.
+- **Outcomes that must be heard are never muted.** `execution_uncertain`, `stale_after_approval` and `blocked_breaker_open` are always pushed to the Admins' chats (once per gated fire), not limited per rule per hour; the other notice outcomes are pushed at most once per rule per hour. The `execution_uncertain` notice says what to do: check the target employee's recent activity (or the target chat) and re-trigger the rule by hand if the action did not run.
+- **One gateway runs rules.** Only the gateway process that holds the data-directory lock reads `events.db` into the autopilot bus, runs the sequence matcher and runs rules. A second gateway on the same data directory runs none of them. In addition, one triggering event files at most one card per rule revision (a durable key in the ledger), so the same event can never produce two approvals.
+- **Restarts.** Approved actions are executed by the gateway that holds the data-directory lock, within a few seconds of the decision. An approval granted while the gateway was down runs after it starts again only if it was decided less than 15 minutes earlier (otherwise `expired` and a notice). A restart in the middle of an execution never runs the action twice: an action that had not started is checked again and runs at most once; one that may have run is recorded as `execution_uncertain`, the Admins are notified, and it is not repeated.
+- **The value must be a boolean.** `autopilot.create` / `autopilot.update` refuse a `require_approval` that is not `true` or `false`. A stored rule with any other value (written before v1.82 or by hand) is treated as requiring approval and logged at startup.
+- **The state is durable and private.** Each gated fire is a row in `autopilot.db` (`autopilot_approval_dispatch`: the frozen action, its digest, the event key, the approval id and the outcome). `autopilot.db` is opened like `approvals.db`: owner-only (`0600`, also its WAL/SHM files) and never through a symlink; if it cannot be opened that way the autopilot engine does not start and no rule runs. `duduclaw-import` accepts this v1.82 `autopilot.db` (catalog `autopilot-v182.sql`) and never reads the table.
+
+**Known limitations.**
+
+- `[approval] forbid_self_approval` does not cover the person who wrote the rule: cards are filed by the background `autopilot` sender, and rules do not record who created them, so the Admin who wrote a rule can approve its actions.
+- If the gateway stops in the moment after a chat notice was sent but before that was recorded, the notice is sent again after the restart (the Activity Feed entry is never duplicated).
+- Approval integrity relies on AI employees not having write access to the gateway's data files (`approvals.db`, `autopilot.db`) — the same as for every approval — and the native Linux isolation mode provides that boundary.
+
+History results for gated rules: `awaiting_approval`, `success` / `failure` (ran after approval), `denied`, `expired`, `stale_after_approval`, `blocked_breaker_open`, `blocked_no_approval_service`, `approval_error`, `execution_uncertain`, `skipped` (an autonomy pause at execution time, or the same event already filed a card for this rule).
 
 ---
 
@@ -235,7 +283,7 @@ Settings → Autopilot creates and edits rules. Before v1.67.1 its form sent an 
 - The trigger list is the twelve events `autopilot.create` accepts, including `tick` ("A monitoring source reports new data") and `odoo_event` ("An Odoo record changes"). A stored rule whose trigger the form does not offer (for example `cron_tick`) keeps it and shows it.
 - Conditions are a list of field / operator / value rows joined by "all" or "any" matching. Field names are suggested per trigger; any name can be typed. For `tick` and `odoo_event` the field names come from your source or Odoo records, and the form says so. Values for `gt` / `gte` / `lt` / `lte` must be numbers; `in` / `not_in` take a comma-separated list. With no rows the form saves `{ "all": [] }`, which fires on every event.
 - Actions are `delegate`, `notify` and `run_skill`, with the required fields from the table above. `notify` offers telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom and dingtalk.
-- Each rule has an edit button. Editing sends only the fields that changed. Conditions the form cannot show as a flat list, event-sequence rules and actions other than the three above are shown as locked and kept exactly as stored. Action keys the form does not own (`screen`, `context_ticks`, …) are kept as stored; the form cannot add them to a new rule, so set those through `autopilot.create` / `autopilot.update`.
+- Each rule has an edit button. Editing sends only the fields that changed. Conditions the form cannot show as a flat list, event-sequence rules and actions other than the three above are shown as locked and kept exactly as stored. Action keys the form does not own (`screen`, `context_ticks`, `require_approval`, …) are kept as stored; the form cannot add them to a new rule, so set those through `autopilot.create` / `autopilot.update`.
 - A refused save shows the server's message inside the dialog.
 
 ---
@@ -262,6 +310,8 @@ This SQLite bus replaced a legacy `events.jsonl` file bus. The columns and guara
 - **WAL mode + busy_timeout** — multiple processes can write concurrently without corrupting lines (no `events.jsonl` rotation race, no partial-line hazard).
 - **Monotonic `id INTEGER PRIMARY KEY AUTOINCREMENT`** — the reader just polls `fetch_since(last_id)`; no cursor file, no re-reading.
 - **Built-in retention** — a background prune deletes rows older than the 7-day cutoff, so the table never grows unbounded.
+
+**Gateway-only events.** `events.db` can be written by every AI employee's MCP process, so a row there is not proof that something happened. Since v1.82, `security_event` is *gateway-only*: only events emitted inside the gateway process (audit mirroring, security posture changes) carry the gateway origin, and a `security_event` row read from `events.db` is ignored and logged instead of firing rules. The same applies to sequence (`sequence`) rules. Future gateway-internal events (for example approval events) will be added to the same list.
 
 ---
 

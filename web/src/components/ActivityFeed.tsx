@@ -97,6 +97,21 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
     color: 'text-warning',
     bgColor: 'bg-warning/10',
   },
+  autopilot_awaiting_approval: {
+    icon: Zap,
+    color: 'text-warning',
+    bgColor: 'bg-warning/10',
+  },
+  autopilot_approval_blocked: {
+    icon: AlertTriangle,
+    color: 'text-destructive',
+    bgColor: 'bg-destructive/10',
+  },
+  autopilot_approval_settled: {
+    icon: Ban,
+    color: 'text-muted-foreground',
+    bgColor: 'bg-muted',
+  },
   error: {
     icon: AlertTriangle,
     color: 'text-destructive',
@@ -142,6 +157,10 @@ const TIER: Record<ActivityType, Tier> = {
   evolution_triggered: 2,
   autopilot_triggered: 2,
   autopilot_lag: 2,
+  // An approval-gate outcome an Admin must hear about is a headline event.
+  autopilot_approval_blocked: 1,
+  autopilot_awaiting_approval: 2,
+  autopilot_approval_settled: 2,
   memory_distilled: 2,
   wiki_written: 2,
   agent_reply: 3,

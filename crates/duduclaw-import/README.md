@@ -72,7 +72,12 @@ version), so the lease columns are never authorized for reading. These two `-v18
 catalogs describe the current fresh stores; whether a released v1.80.1 home already
 had these objects has not been verified, so a v1.80.1 home without them must match
 the `-v1793` catalog exactly or it is refused.
-The users, channel-settings, workflow and autopilot stores still
+`autopilot.db` has a second catalog, `autopilot-v182.sql`: the v1.79.3 store plus the
+v1.82 approval-gate ledger table `autopilot_approval_dispatch` (frozen approval-gated
+actions). Both are accepted (exact match only; `autopilot-v1793.sql` is unchanged), and
+the ledger is never authorized for reading: only rule ids and names are read, as before.
+The gateway test compares `autopilot-v182.sql` with a fresh `AutopilotStore`.
+The users, channel-settings and workflow stores still
 have a single `*-v1793.sql` catalog each, compared byte-for-byte as before; whether
 their v1.80 stores differ has not been reviewed (for example, the v1.80.0
 `mfa_email_codes`, `mfa_passkeys` and `remembered_*` tables are not in

@@ -362,6 +362,11 @@ impl CepMatcher {
         if event_name == "cep_trigger" {
             return Vec::new();
         }
+        // v1.82: a gateway-only event (`security_event`) without a gateway
+        // origin can neither open nor complete a sequence window.
+        if !event.admissible() {
+            return Vec::new();
+        }
         let fields = event.to_fields();
 
         let rules = match self.store.list_rules().await {

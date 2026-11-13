@@ -111,6 +111,9 @@ pub(crate) fn dashboard_only_reader(record: &ApprovalRecord) -> DashboardOnlyRea
         // `org.pending_changes`; the approval centre card is the Admin's.
         || record.action_kind == crate::org_change_approval::ACTION_KIND
         || record.action_kind == "support_pilot_review"
+        // v1.82: an autopilot rule action waits for a current Admin (rules
+        // are Admin-managed; the card carries the exact frozen action).
+        || record.action_kind == crate::autopilot_approval::ACTION_KIND
         || crate::approval::operator_cli_gate::spec_for(&record.action_kind).is_some()
         || crate::governance::ApprovalKind::parse(&record.action_kind).requires_board()
     {

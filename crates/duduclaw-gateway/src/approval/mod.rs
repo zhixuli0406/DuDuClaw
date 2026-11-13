@@ -120,6 +120,7 @@ fn masked_approval_value(value: &Value) -> Value {
 // ── Types ───────────────────────────────────────────────────
 
 pub mod action_grant;
+mod autopilot_consume;
 pub(crate) mod mail_requester;
 pub(crate) mod cli_egress;
 mod action_guard;
@@ -151,6 +152,9 @@ mod gates;
 pub mod operator_cli_gate;
 mod simulation;
 mod store;
+/// v1.82: the owner-only SQLite open `approvals.db` uses, shared with
+/// `autopilot.db` (`autopilot_store::AutopilotStore::open`).
+pub(crate) use store::{open_private_sqlite, secure_private_sidecars};
 mod live_events;
 pub use live_events::{decision_digest, decision_digest_at};
 pub(crate) use live_events::{
@@ -240,7 +244,7 @@ pub use gates::{
 use simulation::{GROUNDING_MAX_SNIPPETS, GROUNDING_SNIPPET_MAX_CHARS, protected_wiki_namespaces};
 pub use simulation::{
     SimulationNarrative, auto_approve_install, pending_summary_for_channel, render_grounding_block,
-    rule_requires_approval, simulation_grounding_snippets,
+    require_approval_malformed, rule_requires_approval, simulation_grounding_snippets,
 };
 
 /// Opaque approval identifier (UUIDv4 string).

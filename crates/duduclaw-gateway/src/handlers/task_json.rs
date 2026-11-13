@@ -379,6 +379,18 @@ pub(crate) fn validate_autopilot_action(action: &Value) -> Result<(), String> {
         other => return Err(format!("unknown action.type '{other}'")),
     }
 
+    // v1.82: `require_approval` is a gate; a value the engine cannot read as
+    // a plain yes/no is refused here (the engine treats a stored non-bool as
+    // `true`, fail closed — see `approval::rule_requires_approval`).
+    if let Some(v) = obj.get("require_approval") {
+        if !v.is_boolean() {
+            return Err(format!(
+                "action.require_approval must be true or false (a JSON boolean), got {}",
+                duduclaw_core::truncate_chars(&v.to_string(), 40)
+            ));
+        }
+    }
+
     // Resident sensing WP3: the optional local-model screening layer. Same
     // write-time contract as everything above — a typo'd `mode`, an
     // over-long prompt, or an out-of-range `timeout_secs` is refused here

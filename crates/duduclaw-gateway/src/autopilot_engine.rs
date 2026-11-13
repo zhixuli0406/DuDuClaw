@@ -13,6 +13,11 @@
 //! `action` is dispatched (`delegate` / `notify` / `run_skill`). Every
 //! execution appends to `autopilot_history` with `success` / `failure`
 //! so the dashboard History tab is populated.
+//!
+//! v1.82: an action with `require_approval` never runs at trigger time; it
+//! is frozen into one Admin approval and executed once after approval (see
+//! [`crate::autopilot_approval`] and the `approval_gate` child module).
+//! `security_event` is gateway-only ([`GATEWAY_ONLY_EVENTS`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +33,12 @@ use tracing::{debug, error, info, warn};
 use crate::autopilot_store::{AutopilotHistoryRow, AutopilotRuleRow, AutopilotStore};
 use crate::message_queue::{MessageQueue, MessageStatus, QueueMessage};
 use crate::task_store::{ActivityRow, TaskStore};
+
+/// v1.82 fail-closed approval gate: filing, executing and recovering
+/// approval-gated fires (a child module so it shares the engine's state).
+mod approval_gate;
+#[cfg(test)]
+mod approval_gate_tests;
 
 // ─── Event types ────────────────────────────────────────────
 
@@ -165,11 +176,18 @@ pub enum AutopilotEvent {
     /// `"circuit_breaker_tripped"`, `"contract_violation"`,
     /// `"security_posture_change"`, or any `event_type` a future
     /// `audit_and_emit` call site passes through verbatim).
+    ///
+    /// v1.82: gateway-only ([`GATEWAY_ONLY_EVENTS`]). `origin` is never
+    /// (de)serialized, so only an in-process producer that writes
+    /// [`EventOrigin::gateway`] can make one the engine accepts; the
+    /// events.db bridge refuses the event name outright.
     SecurityEvent {
         severity: String,
         event_type: String,
         agent_id: String,
         source: String,
+        #[serde(skip)]
+        origin: EventOrigin,
     },
     /// G4 (2026-09 feature audit): one Odoo ERP change observed by the
     /// `odoo_events` bridge — either the background poller
@@ -212,7 +230,73 @@ pub enum AutopilotEvent {
     },
 }
 
+/// Who put an event on the autopilot bus (v1.82).
+///
+/// `events.db` is writable by every employee's `duduclaw mcp-server`
+/// subprocess, so anything the poll bridge ([`spawn_events_db_poll`] →
+/// [`row_to_event`]) produces is attacker-shaped data. Events in
+/// [`GATEWAY_ONLY_EVENTS`] are only acted on when they carry
+/// [`EventOrigin::gateway`], which:
+///
+/// - is never (de)serialized (`#[serde(skip)]` on the variant field, default
+///   = external), so no JSON — from `events.db` or anywhere else — can carry it;
+/// - is constructed only by in-process producers inside the gateway
+///   (`security_autopilot::build_event`); `row_to_event` never constructs it
+///   and refuses gateway-only names (pinned by tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EventOrigin {
+    gateway: bool,
+}
+
+impl EventOrigin {
+    /// Emitted inside the gateway process. Only in-process producers may use
+    /// this — never the events.db bridge.
+    pub(crate) const fn gateway() -> Self {
+        Self { gateway: true }
+    }
+
+    /// Anything else: the events.db bridge, a deserialized event, a test.
+    pub const fn external() -> Self {
+        Self { gateway: false }
+    }
+
+    pub fn is_gateway(self) -> bool {
+        self.gateway
+    }
+}
+
+/// Event names the engine acts on only when emitted inside the gateway
+/// ([`EventOrigin::gateway`]); rows of these names read from `events.db` are
+/// dropped and logged.
+///
+/// Hook for future gateway-only events (RM-139: `approval_created`,
+/// `approval_resolved`, `budget_threshold`, `delivery_failed`): add the name
+/// here, give the variant an `#[serde(skip)] origin: EventOrigin` field
+/// returned by [`AutopilotEvent::origin`], stamp `EventOrigin::gateway()` at
+/// the single in-process emitter, and do NOT add a `row_to_event` arm.
+pub const GATEWAY_ONLY_EVENTS: &[&str] = &["security_event"];
+
+/// Whether `name` is in [`GATEWAY_ONLY_EVENTS`] (exact match).
+pub fn is_gateway_only_event(name: &str) -> bool {
+    GATEWAY_ONLY_EVENTS.iter().any(|n| *n == name)
+}
+
 impl AutopilotEvent {
+    /// Who emitted this event. Variants without an origin field are always
+    /// [`EventOrigin::external`] (they are not gateway-only).
+    pub fn origin(&self) -> EventOrigin {
+        match self {
+            Self::SecurityEvent { origin, .. } => *origin,
+            _ => EventOrigin::external(),
+        }
+    }
+
+    /// False for a gateway-only event that did not come from inside the
+    /// gateway. The engine and the sequence matcher drop such events.
+    pub fn admissible(&self) -> bool {
+        !is_gateway_only_event(self.event_name()) || self.origin().is_gateway()
+    }
+
     pub fn event_name(&self) -> &'static str {
         match self {
             Self::TaskCreated { .. } => "task_created",
@@ -365,6 +449,7 @@ impl AutopilotEvent {
                 event_type,
                 agent_id,
                 source,
+                ..
             } => {
                 map.insert("severity".into(), Value::String(severity.clone()));
                 map.insert("event_type".into(), Value::String(event_type.clone()));
@@ -561,22 +646,40 @@ fn number_pair(a: &Value, b: &Value) -> Option<(f64, f64)> {
 /// Unknown keys resolve to empty string. `{ }` with no valid closing brace
 /// are left alone. Intended for action templates like
 /// `"🚨 Urgent task: {task.title}"`.
+///
+/// v1.82: the Mustache-style double form `{{field.subfield}}` is the same
+/// placeholder as `{field.subfield}`. Before, `{{title}}` was parsed as the
+/// key `{title` (never a field) followed by a literal `}`, so the rendered
+/// text silently lost the placeholder and gained a stray `}`.
 pub fn render_template(template: &str, fields: &serde_json::Map<String, Value>) -> String {
+    fn text_of(v: Value) -> String {
+        match v {
+            Value::String(s) => s,
+            Value::Null => String::new(),
+            other => other.to_string(),
+        }
+    }
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(open) = rest.find('{') {
         out.push_str(&rest[..open]);
         let after_open = &rest[open + 1..];
+        // `{{key}}`: both brace pairs belong to one placeholder. Indices come
+        // from `find` on ASCII braces, so every slice is on a char boundary.
+        if let Some(inner) = after_open.strip_prefix('{') {
+            if let Some(close) = inner.find("}}") {
+                let key = &inner[..close];
+                if !key.contains('{') && !key.contains('}') {
+                    out.push_str(&text_of(lookup_path(fields, key)));
+                    rest = &inner[close + 2..];
+                    continue;
+                }
+            }
+        }
         match after_open.find('}') {
             Some(close) => {
                 let key = &after_open[..close];
-                let v = lookup_path(fields, key);
-                let s = match v {
-                    Value::String(s) => s,
-                    Value::Null => String::new(),
-                    other => other.to_string(),
-                };
-                out.push_str(&s);
+                out.push_str(&text_of(lookup_path(fields, key)));
                 rest = &after_open[close + 1..];
             }
             None => {
@@ -849,13 +952,18 @@ pub struct AutopilotEngine {
     /// Mutex never held across `.await` (pure in-memory map operations).
     circuit: Arc<tokio::sync::Mutex<HashMap<String, CircuitState>>>,
     running: Arc<std::sync::atomic::AtomicBool>,
-    /// Optional HITL approval broker. When present, a rule whose action
-    /// JSON carries `require_approval = true` requests human approval and
-    /// SKIPS immediate execution (fail-closed). Defaults to `None` — the
-    /// gate is opt-in via [`AutopilotEngine::with_approval_broker`] so
-    /// existing `new()` callers are unaffected. Re-dispatch on approval is
-    /// a follow-up (dashboard/channel decide → re-enqueue the payload).
+    /// HITL approval broker (v1.82: attached in production by `server.rs`).
+    /// A rule whose action carries `require_approval = true` (or a non-bool,
+    /// fail closed) never runs at trigger time: with a broker it files one
+    /// approval that freezes the rendered action and records
+    /// `awaiting_approval`; WITHOUT a broker it is blocked
+    /// (`blocked_no_approval_service`) — never executed. On approval the
+    /// engine's resumer (`approval_gate`) executes the frozen action once.
     approval_broker: Option<Arc<crate::approval::ApprovalBroker>>,
+    /// v1.82: last Admin notice per rule for a blocked / failed approval
+    /// gate, so a looping rule pushes at most one notice per hour
+    /// (`autopilot_approval::NOTICE_INTERVAL`).
+    approval_notices: std::sync::Mutex<HashMap<String, Instant>>,
     /// Optional ProactiveGate (P2-2). When present, the `proactive_notify`
     /// action routes through the gate (LLM proactive score ≥ dynamic threshold)
     /// instead of firing directly. Absent → `proactive_notify` fail-closed
@@ -892,6 +1000,45 @@ pub struct AutopilotEngine {
     /// preset ⇒ [`crate::autopilot_screen::OnUnavailable::Pass`], i.e.
     /// byte-identical to the pre-O15 behavior.
     screen_default: std::sync::OnceLock<crate::autopilot_screen::OnUnavailable>,
+    /// Test seam (v1.82 M2): runs right after an approved dispatch is claimed
+    /// and before the rule fence is taken — where a concurrent rule edit
+    /// would land.
+    #[cfg(test)]
+    after_claim_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test seam (v1.82 outbox): when set, `settle` returns right after the
+    /// settling transaction committed — as if the process died there.
+    #[cfg(test)]
+    crash_after_settle: std::sync::atomic::AtomicBool,
+    /// Test seam (v1.82 outbox): replaces the chat push of an outcome
+    /// notice (run inline, so tests see its result deterministically).
+    #[cfg(test)]
+    notice_pusher: std::sync::Mutex<Option<approval_gate::TestPusher>>,
+}
+
+/// v1.82 (M1): what the autopilot trigger side of this gateway process runs.
+/// Only the process holding the home's gateway lock
+/// (`duduclaw_core::gateway_instance`) tails `events.db` into the autopilot
+/// bus, runs the CEP sequence matcher and runs the trigger engine (rule
+/// matching, approval filing, approved execution). A second gateway on the
+/// same home would otherwise read the same `events.db` rows and file a
+/// second card for one trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TriggerRuntimePlan {
+    /// Re-broadcast `events.db` rows onto the autopilot bus. (A non-holder
+    /// still tails `events.db` for the dashboard live-feedback bridge only.)
+    pub events_db_to_autopilot: bool,
+    pub cep_matcher: bool,
+    pub engine: bool,
+}
+
+/// [`TriggerRuntimePlan`] for `home` in this process.
+pub(crate) fn trigger_runtime_plan(home: &std::path::Path) -> TriggerRuntimePlan {
+    let holder = duduclaw_core::gateway_instance::held(home);
+    TriggerRuntimePlan {
+        events_db_to_autopilot: holder,
+        cep_matcher: holder,
+        engine: holder,
+    }
 }
 
 impl AutopilotEngine {
@@ -914,12 +1061,33 @@ impl AutopilotEngine {
             circuit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_broker: None,
+            approval_notices: std::sync::Mutex::new(HashMap::new()),
             proactive_gate: None,
             os_goal_debounce: tokio::sync::Mutex::new(HashMap::new()),
             tick_hub: None,
             screener,
             screen_default: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            after_claim_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            crash_after_settle: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            notice_pusher: std::sync::Mutex::new(None),
         }
+    }
+
+    /// v1.82 (M2): whether the rule's circuit breaker blocks an approved
+    /// action right now. Read-only — admits no fire and advances no state.
+    /// Open and still cooling down ⇒ blocked. (After the cooldown the next
+    /// trigger would probe; an approved action is not a probe, but it also
+    /// is not blocked by a breaker that would admit a fire.)
+    pub(crate) async fn breaker_blocks_execution(&self, rule_id: &str) -> bool {
+        let map = self.circuit.lock().await;
+        matches!(
+            map.get(rule_id),
+            Some(CircuitState::Open { opened_at, .. })
+                if opened_at.elapsed() < CIRCUIT_OPEN_COOLDOWN
+        )
     }
 
     pub(crate) fn breaker_reader(&self) -> BreakerReader {
@@ -967,12 +1135,18 @@ impl AutopilotEngine {
         self
     }
 
-    /// Opt into the HITL approval gate (additive; leaves `new()` callers
-    /// unchanged). Rules with `require_approval = true` will request human
-    /// approval instead of dispatching immediately.
+    /// Attach the HITL approval broker. Rules with `require_approval = true`
+    /// then request human approval instead of dispatching immediately, and
+    /// approved requests are executed by the engine's resumer. Without it,
+    /// such rules are blocked (fail closed) — see `approval_broker`.
     pub fn with_approval_broker(mut self, broker: Arc<crate::approval::ApprovalBroker>) -> Self {
         self.approval_broker = Some(broker);
         self
+    }
+
+    /// Whether an approval broker is attached (startup wiring check).
+    pub fn has_approval_broker(&self) -> bool {
+        self.approval_broker.is_some()
     }
 
     /// Three-state circuit breaker.
@@ -1039,8 +1213,37 @@ impl AutopilotEngine {
         self.running.store(true, std::sync::atomic::Ordering::Release);
         let _running = EngineRunning(self.running.clone());
         info!("AutopilotEngine started");
+        // v1.82 approval gate: say loudly how the gate is wired, warn about
+        // stored rules whose `require_approval` is not a boolean (treated as
+        // `true`), and — in the process holding the gateway lock — settle
+        // ledger rows a previous process left half-way and re-drive every
+        // outcome announcement still owed (Activity entry / chat push).
+        self.log_approval_gate_wiring().await;
+        if duduclaw_core::gateway_instance::held(&self.home_dir) {
+            self.recover_approval_dispatches().await;
+        }
+        let mut resume = tokio::time::interval(crate::autopilot_approval::RESUME_INTERVAL);
+        resume.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match self.event_rx.recv().await {
+            // The select only picks what happened; the handling below runs
+            // after both branch futures are dropped.
+            let next = tokio::select! {
+                received = self.event_rx.recv() => Some(received),
+                _ = resume.tick() => None,
+            };
+            let Some(received) = next else {
+                // Approved autopilot actions are executed only by the process
+                // holding the gateway lock (one executor per home); the same
+                // process re-drives owed outcome announcements.
+                if duduclaw_core::gateway_instance::held(&self.home_dir) {
+                    if self.approval_broker.is_some() {
+                        self.resume_approvals_once().await;
+                    }
+                    self.announce_pending_notices().await;
+                }
+                continue;
+            };
+            match received {
                 Ok(event) => {
                     if let Err(e) = self.process_event(&event).await {
                         warn!(
@@ -1091,6 +1294,15 @@ impl AutopilotEngine {
     }
 
     async fn process_event(&self, event: &AutopilotEvent) -> Result<(), String> {
+        // v1.82: a gateway-only event (`security_event`) that did not come
+        // from inside the gateway is never matched against any rule.
+        if !event.admissible() {
+            warn!(
+                event = event.event_name(),
+                "autopilot: dropped a gateway-only event without a gateway origin (possible forgery)"
+            );
+            return Ok(());
+        }
         // P3-3 lightweight CEP: a synthetic trigger from `CepMatcher` names its
         // target rule directly and has already resolved the temporal pattern —
         // it bypasses the trigger_event/conditions dispatch loop below entirely.
@@ -1326,6 +1538,16 @@ impl AutopilotEngine {
             crate::metrics::global_metrics().tick_wake(&rule.id).await;
         }
 
+        // ── v1.82 HITL approval gate (fail closed) ────────────
+        // A rule that requires approval never runs here: it files one
+        // approval freezing the rendered action (or is blocked when no
+        // approval service is attached) and records its own history row.
+        if crate::approval::rule_requires_approval(&action) {
+            self.gate_on_approval(rule, event_name, &action, fields, screen_note)
+                .await;
+            return;
+        }
+
         let outcome = self
             .execute_action(&rule.id, &rule.name, &action, fields)
             .await;
@@ -1498,9 +1720,16 @@ impl AutopilotEngine {
         action: &Value,
         fields: &serde_json::Map<String, Value>,
     ) -> Result<(), String> {
+        // v1.82: an approval-gated action only ever runs through the approval
+        // resumer, with the frozen payload. Defence in depth for any caller
+        // that reaches this without going through `fire_matched_rule`.
+        if crate::approval::rule_requires_approval(action) {
+            return Err(format!(
+                "rule {rule_name}/{rule_id}: action requires approval; refusing to run it without one"
+            ));
+        }
         // Re-check after an awaited screening decision, before any side effect.
         self.autonomy_check(action, fields)?;
-        let action_type = action.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         // ── Perception input sanitization (P2-5) ──────────────
         // For OS-perceived events (os_file), neutralize the untrusted
@@ -1515,51 +1744,53 @@ impl AutopilotEngine {
         };
         let banner: Option<&str> = perception.as_ref().and_then(|(_, b)| b.as_deref());
 
-        // ── HITL approval gate ────────────────────────────────
-        // If the rule opts into human approval AND a broker is wired,
-        // record a pending approval carrying the exact action+fields to
-        // re-dispatch, then SKIP immediate execution (fail-closed: the
-        // action does not run until a human approves via dashboard/channel
-        // → re-enqueue). Without a broker the flag is a no-op (documented).
-        // The payload carries the NEUTRALIZED fields so a re-dispatch on
-        // approval can never resurrect the raw injection payload.
-        if crate::approval::rule_requires_approval(action) {
-            if let Some(broker) = &self.approval_broker {
-                let payload = serde_json::json!({
-                    "action": action,
-                    "fields": eff_fields,
-                    "rule_id": rule_id,
-                    "rule_name": rule_name,
-                });
-                let summary =
-                    format!("Autopilot 規則「{rule_name}」請求核准以執行 {action_type} 動作");
-                let id = broker
-                    .request(
-                        "autopilot",
-                        "autopilot_action",
-                        &summary,
-                        payload,
-                        crate::approval::DEFAULT_TTL_SECONDS,
-                    )
-                    .await?;
-                info!(
-                    approval_id = %id,
-                    rule = %rule_name,
-                    rule_id = %rule_id,
-                    action_type,
-                    "autopilot: action gated on human approval — skipping immediate execution"
-                );
-                return Ok(());
-            }
+        // v1.82: render everything first (`prepare_action`), then perform the
+        // rendered action. The approval path freezes exactly this rendered
+        // form, so what a human approves is what would have run here.
+        match self
+            .prepare_action(rule_id, rule_name, action, fields, eff_fields, banner)
+            .await?
+        {
+            Some(prepared) => self.perform_action(&prepared).await,
+            // `proactive_notify` suppressed by the ProactiveGate: a normal,
+            // non-error outcome (the gate already logged its decision).
+            None => Ok(()),
         }
+    }
 
+    /// Render a rule's action against the (already neutralized) event fields
+    /// into the exact artifact that will take effect. `Ok(None)` only for a
+    /// `proactive_notify` the ProactiveGate suppressed (or no gate wired).
+    ///
+    /// `raw_fields` is the untrusted event copy (only the ProactiveGate reads
+    /// it, and sanitizes it itself); `eff_fields` / `banner` are the
+    /// perception-neutralized copy every prompt / message is rendered from.
+    pub(crate) async fn prepare_action(
+        &self,
+        rule_id: &str,
+        rule_name: &str,
+        action: &Value,
+        raw_fields: &serde_json::Map<String, Value>,
+        eff_fields: &serde_json::Map<String, Value>,
+        banner: Option<&str>,
+    ) -> Result<Option<crate::autopilot_approval::FrozenAction>, String> {
+        use crate::autopilot_approval::FrozenAction;
+        let action_type = action.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match action_type {
-            "delegate" => self.action_delegate(action, eff_fields, banner).await,
-            "notify" => self.action_notify(action, eff_fields, banner).await,
-            "run_skill" => self.action_run_skill(action, eff_fields, banner).await,
+            "delegate" => self.prepare_delegate(action, eff_fields, banner).await.map(Some),
+            "notify" => {
+                self.autonomy_check(action, eff_fields)?;
+                let (channel, chat_id, text) = prepare_notify(action, eff_fields, banner)?;
+                Ok(Some(FrozenAction::Notify { channel, chat_id, text }))
+            }
+            "run_skill" => self.prepare_run_skill(action, eff_fields, banner).await.map(Some),
             "proactive_notify" => {
-                self.action_proactive_notify(action, fields, eff_fields, banner)
-                    .await
+                if !self.proactive_gate_allows(raw_fields).await? {
+                    return Ok(None);
+                }
+                self.autonomy_check(action, eff_fields)?;
+                let (channel, chat_id, text) = prepare_notify(action, eff_fields, banner)?;
+                Ok(Some(FrozenAction::ProactiveNotify { channel, chat_id, text }))
             }
             "" => Err(format!("rule {rule_name}/{rule_id}: action.type required")),
             other => Err(format!(
@@ -1568,12 +1799,58 @@ impl AutopilotEngine {
         }
     }
 
+    /// Perform an already-rendered action: enqueue the prompt or send the
+    /// message. Used by the immediate path and by the approval resumer (with
+    /// the frozen copy a human approved).
+    pub(crate) async fn perform_action(
+        &self,
+        prepared: &crate::autopilot_approval::FrozenAction,
+    ) -> Result<(), String> {
+        use crate::autopilot_approval::FrozenAction;
+        match prepared {
+            FrozenAction::Delegate { target_agent, prompt, lane } => {
+                self.enqueue_prompt(target_agent, prompt, lane.clone()).await
+            }
+            FrozenAction::RunSkill { target_agent, skill_name, prompt, lane } => {
+                // Narrowing re-check at perform time: a skill switched off
+                // since the prompt was rendered (e.g. while an approval was
+                // pending) is not run.
+                if !is_safe_agent_id(target_agent) || !is_safe_skill_name(skill_name) {
+                    return Err(format!("invalid run_skill target: {target_agent}/{skill_name}"));
+                }
+                if duduclaw_agent::skill_state::read_disabled(&self.home_dir, target_agent)
+                    .is_disabled(skill_name)
+                {
+                    return Err(format!("skill '{skill_name}' is switched off for {target_agent}"));
+                }
+                self.enqueue_prompt(target_agent, prompt, lane.clone()).await
+            }
+            FrozenAction::Notify { channel, chat_id, text }
+            | FrozenAction::ProactiveNotify { channel, chat_id, text } => {
+                self.send_notify(channel, chat_id, text).await
+            }
+        }
+    }
+
+    /// Render + perform a `delegate` in one step (test seam; production goes
+    /// through `prepare_action` → `perform_action`).
+    #[cfg(test)]
     async fn action_delegate(
         &self,
         action: &Value,
         fields: &serde_json::Map<String, Value>,
         banner: Option<&str>,
     ) -> Result<(), String> {
+        let prepared = self.prepare_delegate(action, fields, banner).await?;
+        self.perform_action(&prepared).await
+    }
+
+    async fn prepare_delegate(
+        &self,
+        action: &Value,
+        fields: &serde_json::Map<String, Value>,
+        banner: Option<&str>,
+    ) -> Result<crate::autopilot_approval::FrozenAction, String> {
         let target = action
             .get("target_agent")
             .and_then(|v| v.as_str())
@@ -1591,7 +1868,11 @@ impl AutopilotEngine {
             prompt.push_str("\n\n");
             prompt.push_str(&diff);
         }
-        self.enqueue_prompt(target, &prompt, lane_for_event(fields)).await
+        Ok(crate::autopilot_approval::FrozenAction::Delegate {
+            target_agent: target.to_string(),
+            prompt,
+            lane: lane_for_event(fields),
+        })
     }
 
     /// Belief Loop tick-wake hook (design-market-belief-loop-2026-08.md
@@ -1682,27 +1963,9 @@ impl AutopilotEngine {
         }
     }
 
-    async fn action_notify(
-        &self,
-        action: &Value,
-        fields: &serde_json::Map<String, Value>,
-        banner: Option<&str>,
-    ) -> Result<(), String> {
-        self.autonomy_check(action, fields)?;
-        let channel = action
-            .get("channel")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "notify.channel required".to_string())?;
-        let chat_id = action
-            .get("chat_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "notify.chat_id required".to_string())?;
-        let text_template = action
-            .get("text")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "notify.text required".to_string())?;
-        let text = with_perception_banner(banner, render_template(text_template, fields));
-
+    /// Send an already-rendered notification (`notify` / an allowed
+    /// `proactive_notify` / the frozen copy of either after approval).
+    async fn send_notify(&self, channel: &str, chat_id: &str, text: &str) -> Result<(), String> {
         // telegram/line/discord/slack keep the multi-candidate (global +
         // per-agent) token fallback the 2026-08-13 login-OTP outage fix
         // added (`config_crypto::channel_dm_token_candidates`) — an
@@ -1738,7 +2001,7 @@ impl AutopilotEngine {
                     extra_id: None,
                 };
                 match crate::channel_sender::create_sender_for_home(&self.home_dir, &target, notify_http_client().clone())
-                    .send_text(&text)
+                    .send_text(text)
                     .await
                 {
                     Ok(()) => return Ok(()),
@@ -1760,7 +2023,7 @@ impl AutopilotEngine {
         let target =
             crate::channel_sender::resolve_channel_target(&self.home_dir, channel, chat_id).await?;
         crate::channel_sender::create_sender_for_home(&self.home_dir, &target, notify_http_client().clone())
-            .send_text(&text)
+            .send_text(text)
             .await
             .map_err(|e| e.to_string())
     }
@@ -1771,27 +2034,24 @@ impl AutopilotEngine {
     /// directly. Deterministic `notify` is untouched; this is the opt-in
     /// proactive path (and the future front door for P3-4 goal kickoff).
     ///
-    /// - Gate not wired → **fail-closed suppress** (deny-by-default), logged, Ok.
-    /// - Gate Allow → performs the underlying `notify` with the neutralized
-    ///   (`eff_fields`) copy + perception banner.
-    /// - Gate Suppress → a normal, non-error outcome (Ok) — the decision is
-    ///   already recorded in `proactive_gate.jsonl` (P2-3 source).
+    /// - Gate not wired → **fail-closed suppress** (deny-by-default), logged,
+    ///   `Ok(false)`.
+    /// - Gate Allow → `Ok(true)`: the caller renders the underlying `notify`
+    ///   with the neutralized (`eff_fields`) copy + perception banner.
+    /// - Gate Suppress → `Ok(false)`, a normal, non-error outcome — the
+    ///   decision is already recorded in `proactive_gate.jsonl` (P2-3 source).
     ///
     /// `raw_fields` is the untrusted perceived copy (the gate sanitizes it
-    /// itself before scoring); `eff_fields` is the neutralized copy used for the
-    /// actual notify render.
-    async fn action_proactive_notify(
+    /// itself before scoring).
+    async fn proactive_gate_allows(
         &self,
-        action: &Value,
         raw_fields: &serde_json::Map<String, Value>,
-        eff_fields: &serde_json::Map<String, Value>,
-        banner: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let Some(gate) = self.proactive_gate.clone() else {
             warn!(
                 "proactive_notify fired but no ProactiveGate wired — suppressing (deny-by-default)"
             );
-            return Ok(());
+            return Ok(false);
         };
         let agent_id = raw_fields
             .get("agent_id")
@@ -1839,15 +2099,10 @@ impl AutopilotEngine {
             )
             .await;
 
-        if outcome.decision.is_allow() {
-            // Allowed → perform the underlying notification with the neutralized
-            // copy (same code path as deterministic `notify`).
-            self.action_notify(action, eff_fields, banner).await
-        } else {
-            // Suppressed is a normal outcome — already recorded in the gate's
-            // JSONL. Nothing to send.
-            Ok(())
-        }
+        // Allowed → the caller renders and performs the underlying
+        // notification (same code path as deterministic `notify`). Suppressed
+        // is a normal outcome — already recorded in the gate's JSONL.
+        Ok(outcome.decision.is_allow())
     }
 
     /// Fetch persona preference lines from the shared memory store for proactive
@@ -2095,12 +2350,12 @@ impl AutopilotEngine {
         Ok(())
     }
 
-    async fn action_run_skill(
+    async fn prepare_run_skill(
         &self,
         action: &Value,
         fields: &serde_json::Map<String, Value>,
         banner: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::autopilot_approval::FrozenAction, String> {
         let target = action
             .get("target_agent")
             .and_then(|v| v.as_str())
@@ -2154,7 +2409,12 @@ impl AutopilotEngine {
                 Value::Object(fields.clone())
             ),
         );
-        self.enqueue_prompt(target, &prompt, lane_for_event(fields)).await
+        Ok(crate::autopilot_approval::FrozenAction::RunSkill {
+            target_agent: target.to_string(),
+            skill_name: skill.to_string(),
+            prompt,
+            lane: lane_for_event(fields),
+        })
     }
 
     async fn enqueue_prompt(
@@ -2237,6 +2497,29 @@ fn is_safe_skill_name(name: &str) -> bool {
 }
 
 // ─── Channel send helpers ───────────────────────────────────
+
+/// Render a `notify` / `proactive_notify` action into `(channel, chat_id,
+/// text)`. Validation of the destination itself happens at send time.
+fn prepare_notify(
+    action: &Value,
+    fields: &serde_json::Map<String, Value>,
+    banner: Option<&str>,
+) -> Result<(String, String, String), String> {
+    let channel = action
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "notify.channel required".to_string())?;
+    let chat_id = action
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "notify.chat_id required".to_string())?;
+    let text_template = action
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "notify.text required".to_string())?;
+    let text = with_perception_banner(banner, render_template(text_template, fields));
+    Ok((channel.to_string(), chat_id.to_string(), text))
+}
 
 /// Global-then-per-agent token candidates for the four channels whose bot
 /// token shape supports `config_crypto::channel_dm_token_candidates`'s
@@ -2420,34 +2703,20 @@ fn row_to_event(event: &str, payload_json: &str) -> Option<AutopilotEvent> {
                 .cloned()
                 .unwrap_or(Value::Object(serde_json::Map::new())),
         }),
-        // OS security line P0 (C1): out-of-process symmetry for a future
-        // MCP/CLI writer (e.g. `duduclaw secaudit`'s own findings) — no
-        // production writer exists yet (both current producers,
-        // `security_autopilot.rs` and `posture_watch.rs`, are in-process and
-        // broadcast directly), but the mapping costs nothing to keep
-        // consistent with every other event this bridge already supports.
-        "security_event" => Some(AutopilotEvent::SecurityEvent {
-            severity: payload
-                .get("severity")
-                .and_then(|v| v.as_str())
-                .unwrap_or("warning")
-                .to_string(),
-            event_type: payload
-                .get("event_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            agent_id: payload
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("system")
-                .to_string(),
-            source: payload
-                .get("source")
-                .and_then(|v| v.as_str())
-                .unwrap_or("audit")
-                .to_string(),
-        }),
+        // v1.82: `security_event` is gateway-only (`GATEWAY_ONLY_EVENTS`).
+        // Until v1.81 this bridge mapped an events.db row of that name into a
+        // SecurityEvent, so any employee's MCP subprocess (which can append
+        // to events.db) could forge one and fire security rules. Both real
+        // producers (`security_autopilot.rs`, `posture_watch.rs`) broadcast
+        // in-process; such rows are now ignored and logged. Never add an arm
+        // for a gateway-only name here.
+        name if is_gateway_only_event(name) => {
+            warn!(
+                event = name,
+                "events.db: ignored a gateway-only event written from outside the gateway"
+            );
+            None
+        }
         _ => None,
     }
 }
@@ -2495,9 +2764,15 @@ fn should_rebroadcast(row: &crate::events_store::EventRow) -> bool {
 /// dashboard. Those event names are deliberately absent from [`row_to_event`],
 /// so they refresh views without triggering a single autopilot rule. `None`
 /// disables the bridge (tests, and any future caller without a socket).
+///
+/// v1.82 (M1): `tx` is `None` in a gateway process that does not hold the
+/// home's gateway lock ([`trigger_runtime_plan`]): it then only feeds the
+/// dashboard bridge and never re-broadcasts a row onto the autopilot bus,
+/// so a second gateway on the same home cannot fire rules (or file approval
+/// cards) for rows the lock holder already handles.
 pub fn spawn_events_db_poll(
     store: Arc<crate::events_store::EventBusStore>,
-    tx: broadcast::Sender<AutopilotEvent>,
+    tx: Option<broadcast::Sender<AutopilotEvent>>,
     dashboard_tx: Option<broadcast::Sender<String>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -2515,12 +2790,14 @@ pub fn spawn_events_db_poll(
                     if let Some(ref dtx) = dashboard_tx {
                         crate::dashboard_feedback::bridge_tick(store.home_dir(), &rows, &mut last_seen_id, dtx).await;
                     }
-                    for row in &rows {
-                        if !should_rebroadcast(row) {
-                            continue;
-                        }
-                        if let Some(ev) = row_to_event(&row.event, &row.payload) {
-                            let _ = tx.send(ev);
+                    if let Some(tx) = &tx {
+                        for row in &rows {
+                            if !should_rebroadcast(row) {
+                                continue;
+                            }
+                            if let Some(ev) = row_to_event(&row.event, &row.payload) {
+                                let _ = tx.send(ev);
+                            }
                         }
                     }
                     // Rows come back ordered by id ASC — advance watermark.
@@ -3057,6 +3334,7 @@ mod tests {
             event_type: "prompt_injection".into(),
             agent_id: "agent-1".into(),
             source: "audit".into(),
+            origin: EventOrigin::gateway(),
         };
         assert_eq!(ev.event_name(), "security_event");
         let fields = ev.to_fields();
@@ -3070,49 +3348,58 @@ mod tests {
         assert_eq!(fields["source"], Value::String("audit".into()));
     }
 
+    /// v1.82: `security_event` is gateway-only. An events.db row of that name
+    /// (which any employee's MCP subprocess can append) maps to nothing.
     #[test]
-    fn row_to_event_maps_security_event() {
+    fn row_to_event_refuses_gateway_only_security_event() {
         let payload = serde_json::json!({
-            "severity": "warning",
+            "severity": "critical",
             "event_type": "circuit_breaker_tripped",
             "agent_id": "agent-9",
             "source": "audit",
         })
         .to_string();
-        let ev = row_to_event("security_event", &payload).expect("mapped");
-        match ev {
-            AutopilotEvent::SecurityEvent {
-                severity,
-                event_type,
-                agent_id,
-                source,
-            } => {
-                assert_eq!(severity, "warning");
-                assert_eq!(event_type, "circuit_breaker_tripped");
-                assert_eq!(agent_id, "agent-9");
-                assert_eq!(source, "audit");
-            }
-            other => panic!("expected SecurityEvent, got {other:?}"),
+        assert!(row_to_event("security_event", &payload).is_none());
+        assert!(row_to_event("security_event", "{}").is_none());
+        assert!(row_to_event("security_event", "not json").is_none());
+        for name in GATEWAY_ONLY_EVENTS {
+            assert!(row_to_event(name, "{}").is_none(), "{name} must never map from events.db");
         }
     }
 
+    /// Nothing the events.db bridge produces carries the gateway origin, and a
+    /// deserialized event never does either (`#[serde(skip)]`).
     #[test]
-    fn row_to_event_security_event_missing_fields_gets_defaults() {
-        let ev = row_to_event("security_event", "{}").expect("mapped with defaults");
-        match ev {
-            AutopilotEvent::SecurityEvent {
-                severity,
-                event_type,
-                agent_id,
-                source,
-            } => {
-                assert_eq!(severity, "warning");
-                assert_eq!(event_type, "unknown");
-                assert_eq!(agent_id, "system");
-                assert_eq!(source, "audit");
-            }
-            other => panic!("expected SecurityEvent, got {other:?}"),
+    fn gateway_origin_cannot_come_from_the_bridge_or_from_json() {
+        for (name, payload) in [
+            ("task.created", "{}"),
+            ("task.updated", "{}"),
+            ("activity.new", "{}"),
+            ("run.at_risk", "{}"),
+            ("os_file", "{}"),
+            ("os_frontmost", "{}"),
+            ("tick", "{}"),
+            ("mcp.event", "{}"),
+        ] {
+            let ev = row_to_event(name, payload).unwrap_or_else(|| panic!("{name} maps"));
+            assert!(!ev.origin().is_gateway(), "{name}");
         }
+        let forged: AutopilotEvent = serde_json::from_value(serde_json::json!({
+            "kind": "security_event", "severity": "critical", "event_type": "x",
+            "agent_id": "a", "source": "audit", "origin": {"gateway": true}
+        }))
+        .expect("unknown keys are ignored");
+        assert!(!forged.origin().is_gateway());
+        assert!(!forged.admissible(), "a deserialized security_event is not admissible");
+        let real = AutopilotEvent::SecurityEvent {
+            severity: "critical".into(),
+            event_type: "x".into(),
+            agent_id: "a".into(),
+            source: "audit".into(),
+            origin: EventOrigin::gateway(),
+        };
+        assert!(real.admissible());
+        assert!(AutopilotEvent::TaskCreated { task: Value::Null }.admissible(), "ordinary events are unaffected");
     }
 
     /// End-to-end (unit level, per the P0 handoff brief): construct a
@@ -3126,6 +3413,7 @@ mod tests {
             event_type: "contract_violation".into(),
             agent_id: "agent-1".into(),
             source: "audit".into(),
+            origin: EventOrigin::gateway(),
         };
         let fields = ev.to_fields();
         let critical_only: Value = serde_json::json!({
@@ -3149,6 +3437,7 @@ mod tests {
             event_type: "circuit_breaker_tripped".into(),
             agent_id: "agent-1".into(),
             source: "audit".into(),
+            origin: EventOrigin::gateway(),
         };
         assert!(evaluate(
             &warning_or_critical_injection_or_breaker,
@@ -3321,6 +3610,28 @@ mod tests {
         let fields = fields_from(serde_json::json!({}));
         let out = render_template("a {b", &fields);
         assert_eq!(out, "a {b");
+    }
+
+    /// v1.82 regression (reproduced on v1.81.0): a delegate prompt ending in
+    /// `{{title}}` rendered as `…}` — the parser read the key `{title` and
+    /// left the second `}` behind. The double form is now one placeholder.
+    #[test]
+    fn render_double_brace_is_the_same_placeholder() {
+        let fields = AutopilotEvent::TaskCreated {
+            task: serde_json::json!({ "id": "t1", "title": "季報" }),
+        }
+        .to_fields();
+        // The reproduced template: `title` is not a top-level field of
+        // task_created (it is `task.title`), so it renders empty — but never
+        // as a stray brace.
+        assert_eq!(render_template("新任務：{{title}}", &fields), "新任務：");
+        assert_eq!(render_template("新任務：{{task.title}}", &fields), "新任務：季報");
+        assert_eq!(render_template("新任務：{task.title}", &fields), "新任務：季報");
+        assert_eq!(render_template("{{task.id}}/{task.id}", &fields), "t1/t1");
+        // Unbalanced doubles keep the old single-brace behaviour.
+        assert_eq!(render_template("a {{b", &fields), "a {{b");
+        // Literal JSON-ish text that does not start with `{{` is unchanged.
+        assert_eq!(render_template("x {\"k\": 1} y", &fields), "x  y");
     }
 
     #[test]

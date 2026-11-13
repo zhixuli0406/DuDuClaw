@@ -123,6 +123,10 @@ fn build_event(
         event_type: event_type.to_string(),
         agent_id: agent_id.unwrap_or("system").to_string(),
         source: source.to_string(),
+        // v1.82: `security_event` is gateway-only. This in-process producer
+        // is the only place that may stamp the gateway origin; the events.db
+        // bridge refuses the event name entirely.
+        origin: crate::autopilot_engine::EventOrigin::gateway(),
     })
 }
 
@@ -306,11 +310,13 @@ mod tests {
                 event_type,
                 agent_id,
                 source,
+                origin,
             } => {
                 assert_eq!(severity, "warning");
                 assert_eq!(event_type, "circuit_breaker_tripped");
                 assert_eq!(agent_id, "agent-x");
                 assert_eq!(source, "audit");
+                assert!(origin.is_gateway(), "in-process producer stamps the gateway origin");
             }
             other => panic!("expected SecurityEvent, got {other:?}"),
         }

@@ -52,7 +52,7 @@ MCP bridge         ─┘                                   1. 事件相符？  
 | **OsFileEvent** | `os_file` | agent 的 `[os_watch]` 監看到檔案變動 | `agent_id`、`path`、`kind`（created / modified / removed / renamed）、`file_name`、`extension` |
 | **OsFrontmostEvent** | `os_frontmost` | 前景 App 或視窗標題改變 | `agent_id`、`app`、`window_title`、`prev_app` |
 | **Tick** | `tick` | 常駐感知來源（`[[tick.sources]]`，v1.68.0 起可在系統設定 → 進階設定 → 自動化引擎 →「常駐感知」編輯）產生一筆觀測 | `source`、`ts`、擷取欄位及其 `prev_` / `delta_` / `pct_` 衍生欄位 |
-| **SecurityEvent** | `security_event` | warning 或 critical 等級的稽核事件，或安全態勢改變 | `severity`、`event_type`、`agent_id`、`source` |
+| **SecurityEvent** | `security_event` | warning 或 critical 等級的稽核事件，或安全態勢改變（只接受閘道內部產生的事件，見「只限閘道內部的事件」） | `severity`、`event_type`、`agent_id`、`source` |
 | **OdooEvent** | `odoo_event` | Odoo 輪詢或 `POST /webhook/odoo` 回報 ERP 變更 | `event_type`、`model`、`record_id`、`record`（其頂層純量欄位也會攤平） |
 
 規則會宣告它關心哪個 `trigger_event`，因此 `channel_message` 規則不會看到 `task_created`。`autopilot.create` 接受 `cron_tick` 以外的十二個名稱；`autopilot.update` 只在規則原本就是 `cron_tick` 時接受它，讓這種已存規則能照常儲存；把其他規則改成 `cron_tick` 會和建立時一樣被拒絕。要定時執行的工作請交給排程器（「例行工作」頁，或帶 `schedule` 的 `tasks_create`）。這十三個名稱仍都是 `sequence` 規則合法的 `first` / `then` 事件。引擎另有一個內部事件 `cep_trigger`，由序列比對器發出以觸發已比對成功的規則，不能當 `trigger_event` 使用。
@@ -134,6 +134,52 @@ canonicalize(skills_dir/skill_name)
 ```
 
 路徑包含檢查（`canonicalize()` + `starts_with`）意味著即使某個 skill 名稱越過了字元集 allowlist，也無法引用 agent skills 目錄之外的檔案。
+
+文字欄位（`prompt`、`text`）是範本：`{task.title}` 會換成事件裡的欄位值。v1.82 起雙大括號 `{{task.title}}` 視為同一個欄位；過去會在文字裡多留一個 `}`。任務事件的資料放在 `task` 底下，所以標題是 `task.title`，不是 `title`。不存在的欄位會換成空字串。
+
+---
+
+## 執行前等人核准（`require_approval`）
+
+任何動作都可以加上 `"require_approval": true`。這種規則被觸發時**不會直接執行**動作。**v1.82 行為改變：** v1.81 以前這個設定在運作中的閘道沒有作用——動作會立刻執行，歷史紀錄顯示「成功」。升級後，原本就設了 `require_approval: true` 的規則會開始停下來等核准。
+
+```
+規則觸發 ─> 依實際執行時的樣子套好動作內容
+        ─> 建立「一張」核准單（類型 autopilot_action），凍結：
+             規則編號＋規則版本、觸發事件、
+             套好的動作（對象＋提示／技能／訊息內容）
+        ─> 歷史紀錄：等待核准（awaiting_approval，不執行任何事）
+
+管理員在儀表板核准 ─> 距離核准不到 15 分鐘？                       ── 否 ─> expired
+                     規則仍存在、仍啟用、版本與凍結時相同？        ── 否 ─> stale_after_approval
+                     規則的斷路器是關閉的？                        ── 否 ─> blocked_breaker_open
+                              │ 是（檢查期間規則的修改會先等待）
+                              v
+                        核准單用掉（只能用一次）─> 凍結的動作執行一次 ─> success／failure
+管理員拒絕，或 1 小時沒人處理 ─> denied／expired（不執行）
+```
+
+- **誰能決定**：只有目前的管理員，在儀表板（收件匣／審批）決定。通訊頻道只會收到沒有按鈕、也不含動作內容的提醒：只說有一個自動化規則的動作等管理員到儀表板審核、期限與編號（語言依 `[general] default_language`）。
+- **管理員看得到會執行的全部內容**：收件匣為這類核准單提供專用畫面，一律完整顯示凍結的動作——完整的提示（`run_skill` 含技能本文）或完整訊息與它的通道和傳送對象、目標 AI 員工、佇列通道、觸發事件的 AI 員工、觸發事件識別、規則名稱與完整版本摘要、決定期限與最晚執行時間。內容不截斷，過長時可捲動。雙向文字控制字元、控制字元與零寬／隱藏字元會以 `\u{202E}` 這類代碼顯示。凍結的動作超過 64 KiB 時不會送審（`approval_error`，不執行）。
+- **核准的就是執行的**：核准單裡是套好的提示或訊息；核准後只執行這一份、只執行一次。完整內容顯示前「核准」按鈕無法按；核准時必須附上畫面上這張核准單的摘要值（`expected_digest`），閘道對任何用戶端都一樣：沒有附上或與儲存的核准單不符就拒絕核准。拒絕不需要摘要值。核准單內容與凍結的不符時一律拒絕（`approval_error`）。
+- **規則改過就不執行舊的核准**：核准使用前規則被修改（觸發、條件、動作）、停用或刪除，已核准的動作不執行（`stale_after_approval`）。最後一次檢查與用掉核准單是在規則修改必須等待的期間內完成（這個閘道與其他行程都一樣），修改無法插在中間。只改名稱不算修改。
+- **迴圈仍會擋下**：已核准的動作要執行時，若這條規則的斷路器是開啟的，就不執行（`blocked_breaker_open`），核准單用掉並通知管理員。自主暫停也會在這時再檢查一次（`skipped`）。
+- **核准的有效時間很短**：已核准的動作只會在決定後 **15 分鐘**內執行（固定值）。超過這個時間——包括核准時間晚於現在——記為 `expired`，核准單用掉並通知管理員。
+- **送不了審就不執行**：無法建立核准單時（核准服務沒有接上、核准資料庫拒收——例如套好的文字含有 API 金鑰——凍結的動作超過 64 KiB，或任何儲存錯誤），動作不執行。歷史紀錄寫 `blocked_no_approval_service` 或 `approval_error`，並通知管理員（動態牆、儀表板、已綁定通訊頻道的管理員），同一條規則每小時最多一次。（若這次觸發已記入 `autopilot.db`、之後才建立核准單失敗，這次觸發仍會有自己的動態牆項目，只有聊天通知受此限制。）
+- **每個結果都會通知，閘道中斷也一樣**：每次需要核准的觸發結束時（已執行、執行失敗、被拒絕、逾時、規則已變更、已攔下、結果不明），都只有一筆歷史紀錄和一則動態牆項目。結果、它的歷史紀錄，以及「還有哪些通知沒送出」會一起保存；閘道若在寫入動態牆或送出聊天通知前中斷，持有資料目錄鎖的閘道重新啟動後會補送，執行期間也每隔幾秒檢查一次。聊天通知要確實送出，或已排入勿擾時段後的佇列，才算完成；送出失敗會以逐漸拉長的間隔重試（30 秒、2 分鐘、8 分鐘……最多 6 次），動態牆項目不受影響。儀表板即時事件盡力送出。
+- **必須讓人知道的結果不會被靜音**：`execution_uncertain`、`stale_after_approval` 與 `blocked_breaker_open` 一律推播到管理員的聊天頻道（每次需要核准的觸發一次），不受「每條規則每小時一次」限制；其他需要通知的結果，同一條規則每小時最多推播一次。`execution_uncertain` 的通知會說明怎麼處理：查看目標 AI 員工最近的活動（或目標聊天室），若動作沒有執行，請手動重新觸發這條規則。
+- **只有一個閘道執行規則**：只有持有資料目錄鎖的閘道行程會把 `events.db` 送進自動化事件匯流排、執行事件序列比對與執行規則；同一個資料目錄上的第二個閘道一律不做。另外，同一個觸發事件對同一個規則版本最多只建立一張核准單（核准紀錄中有持久的識別鍵），同一個事件不會產生兩次核准。
+- **重新啟動**：已核准的動作由持有資料目錄鎖的閘道執行，通常在決定後幾秒內。閘道停機期間核准的動作，重新啟動後只有在距離核准不到 15 分鐘時才會執行（否則記為 `expired` 並通知）。執行途中重新啟動也不會執行兩次：還沒開始的會重新檢查，最多執行一次；可能已執行的記為 `execution_uncertain`、通知管理員，不會重做。
+- **值必須是布林**：`autopilot.create`／`autopilot.update` 會拒絕不是 `true` 或 `false` 的 `require_approval`。已存的規則若是其他值（v1.82 以前寫入或手動修改），一律當作需要核准，並在啟動日誌提醒。
+- **狀態會保存，且只有擁有者能讀**：每次需要核准的觸發都在 `autopilot.db` 留一列（`autopilot_approval_dispatch`：凍結的動作、摘要值、事件識別鍵、核准單編號與結果）。`autopilot.db` 的開啟方式與 `approvals.db` 相同：只有擁有者可讀寫（`0600`，WAL／SHM 檔也一樣），且絕不經由符號連結開啟；無法這樣開啟時，自動化引擎不會啟動，任何規則都不會執行。`duduclaw-import` 接受這個 v1.82 的 `autopilot.db`（catalog `autopilot-v182.sql`），且不讀取這張表。
+
+**已知限制**
+
+- `[approval] forbid_self_approval` 不涵蓋撰寫規則的人：核准單由背景的 `autopilot` 送出，規則也沒有記錄建立者，所以撰寫規則的管理員可以核准它的動作。
+- 閘道若剛好在聊天通知送出之後、記錄完成之前中斷，重新啟動後會再送一次這則通知（動態牆項目不會重複）。
+- 核准的可信度建立在 AI 員工無法寫入閘道的資料檔（`approvals.db`、`autopilot.db`）上——所有核准都一樣——原生 Linux 隔離模式提供這道邊界。
+
+需要核准的規則的歷史結果：`awaiting_approval`、`success`／`failure`（核准後執行）、`denied`、`expired`、`stale_after_approval`、`blocked_breaker_open`、`blocked_no_approval_service`、`approval_error`、`execution_uncertain`、`skipped`（執行時遇到自主暫停，或同一個事件已為這條規則送審過）。
 
 ---
 
@@ -235,7 +281,7 @@ autopilot.history ── 執行記錄
 - 觸發事件清單就是 `autopilot.create` 接受的十二個事件，包括 `tick`（監控來源有新資料時）與 `odoo_event`（Odoo 資料變動時）。已存規則的觸發事件若不在清單裡（例如 `cron_tick`），會照原值顯示並保留。
 - 條件是一列一列的「欄位／比較方式／比較值」，用「全部符合才執行」（`all`）或「任一符合就執行」（`any`）串起來。每種觸發事件會建議欄位名稱，也可以自己輸入。`tick` 與 `odoo_event` 的欄位名稱來自你的監控來源或 Odoo 紀錄，表單會提示這一點。`gt` / `gte` / `lt` / `lte` 的比較值必須是數字；`in` / `not_in` 用逗號分隔多個值。一列都沒有時，表單存成 `{ "all": [] }`，每次事件都會執行。
 - 動作有 `delegate`、`notify`、`run_skill`，必填欄位見上方表格。`notify` 可選 telegram、line、discord、slack、whatsapp、feishu、googlechat、teams、wecom、dingtalk。
-- 每條規則都有編輯按鈕，編輯時只送出有改動的欄位。表單無法攤成清單的條件、事件序列規則、以及上述三種以外的動作會顯示為鎖定，原樣保留。表單不管的動作欄位（`screen`、`context_ticks` 等）也原樣保留；新規則無法在表單加上它們，請改用 `autopilot.create` / `autopilot.update`。
+- 每條規則都有編輯按鈕，編輯時只送出有改動的欄位。表單無法攤成清單的條件、事件序列規則、以及上述三種以外的動作會顯示為鎖定，原樣保留。表單不管的動作欄位（`screen`、`context_ticks`、`require_approval` 等）也原樣保留；新規則無法在表單加上它們，請改用 `autopilot.create` / `autopilot.update`。
 - 儲存被拒絕時，對話框裡會顯示伺服器的訊息。
 
 ---
@@ -262,6 +308,8 @@ emit "task.created" ──> events.db ──> 背景讀取器
 - **WAL 模式 + busy_timeout** — 多個行程可並行寫入而不會損毀行（沒有 `events.jsonl` 輪替競態，沒有半行隱患）。
 - **單調遞增 `id INTEGER PRIMARY KEY AUTOINCREMENT`** — 讀取器只需輪詢 `fetch_since(last_id)`；不需游標檔，不需重讀。
 - **內建保留期** — 背景 prune 會刪除超過 7 天截止點的列，因此表格永不無界增長。
+
+**只限閘道內部的事件。** 每位 AI 員工的 MCP 程序都能寫入 `events.db`，所以那裡的一列不代表事情真的發生。v1.82 起 `security_event` 只限閘道內部：只有閘道程序自己產生的事件（稽核同步、安全態勢改變）帶有閘道來源標記；從 `events.db` 讀到的 `security_event` 會被忽略並記錄，不會觸發任何規則，事件序列（`sequence`）規則也一樣。之後的閘道內部事件（例如審批事件）會加進同一份清單。
 
 ---
 

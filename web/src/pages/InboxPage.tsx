@@ -483,10 +483,13 @@ export function InboxPage() {
   const [decideErrors, setDecideErrors] = useState<Record<string, unknown>>({});
 
   const decide = useCallback(
-    async (item: InboxItem, approve: boolean) => {
+    async (item: InboxItem, approve: boolean, renderedDigest?: string) => {
       const entry = findEntry(item.id);
       if (!entry) return;
       const a = entry.raw as ApprovalItem;
+      // v1.82: a view that renders the complete card (autopilot actions)
+      // passes the digest of exactly what it rendered.
+      const digest = renderedDigest ?? a.digest ?? undefined;
       setDecideErrors((prev) => {
         if (!(item.id in prev)) return prev;
         const { [item.id]: _cleared, ...rest } = prev;
@@ -496,8 +499,8 @@ export function InboxPage() {
         // v1.81 P1 break-glass: see lib/break-glass.ts.
         const res = await withBreakGlass(
           (token) => (token
-            ? api.approvals.decide(a.id, approve, undefined, a.digest ?? undefined, token)
-            : api.approvals.decide(a.id, approve, undefined, a.digest ?? undefined)),
+            ? api.approvals.decide(a.id, approve, undefined, digest, token)
+            : api.approvals.decide(a.id, approve, undefined, digest)),
           { purpose: 'decide' },
         );
         if (approve) setApprovedToday(bumpApprovedToday());
@@ -733,7 +736,7 @@ export function InboxPage() {
             outcome={outcomes[item.id]}
             approval={raw as ApprovalItem}
             agentName={agentName((raw as ApprovalItem).agent_id)}
-            onApprove={() => decide(item, true)}
+            onApprove={(renderedDigest) => decide(item, true, renderedDigest)}
             onReject={() => decide(item, false)}
             decideError={decideErrors[item.id]}
             onDecided={(outcome) => { if (outcome) setOutcomes((previous) => ({ ...previous, [item.id]: outcome })); markProcessed(item.id); }}

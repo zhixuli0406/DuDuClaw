@@ -221,6 +221,10 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
         // RM-027: moving an employee in the org chart is decided by a current
         // Admin, which a channel press cannot establish.
         || kind == crate::org_change_approval::ACTION_KIND
+        // v1.82: an autopilot rule action that waits for approval is decided
+        // by a current Admin on the dashboard (the channel gets a notice
+        // without buttons).
+        || kind == crate::autopilot_approval::ACTION_KIND
         || crate::approval::operator_cli_gate::spec_for(kind).is_some()
 }
 
@@ -248,6 +252,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         "這份設定檔修改的審核已逾期，修改沒有套用；需要的話請重新送出。"
     } else if kind == crate::org_change_approval::ACTION_KIND {
         crate::org_change_approval::EXPIRED_TEXT
+    } else if kind == crate::autopilot_approval::ACTION_KIND {
+        crate::autopilot_approval::EXPIRED_TEXT
     } else if let Some(spec) = crate::approval::operator_cli_gate::spec_for(kind) {
         spec.expired_text
     } else {
@@ -290,6 +296,16 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     }
     if rec.action_kind == crate::org_change_approval::ACTION_KIND {
         return crate::org_change_approval::notice_body(rec, reminder, &deadline_phrase(rec));
+    }
+    // v1.82 (L1): an automation action waits for an Admin — no action
+    // content. The push path uses the home's configured language
+    // (`push_dashboard_only`); everything else gets zh-TW.
+    if rec.action_kind == crate::autopilot_approval::ACTION_KIND {
+        return crate::autopilot_approval::pending_notice_body(
+            rec,
+            reminder,
+            crate::trigger_route::texts::Lang::ZhTw,
+        );
     }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"
@@ -435,7 +451,17 @@ async fn push_dashboard_only(
         // Quiet hours: the inbox still shows it; the reminder retries.
         return None;
     }
-    let mut text = dashboard_only_notice_body(rec, reminder);
+    let mut text = if rec.action_kind == crate::autopilot_approval::ACTION_KIND
+        && rec.payload.get("egress_guard").is_none()
+    {
+        crate::autopilot_approval::pending_notice_body(
+            rec,
+            reminder,
+            crate::trigger_route::texts::lang_for(home_dir),
+        )
+    } else {
+        dashboard_only_notice_body(rec, reminder)
+    };
     if let Some(p) = rec.on_behalf_of.as_deref() {
         let who = crate::on_behalf_of::label::display_label(home_dir, p);
         text.push_str(&format!("\n由 {} 交辦", crate::goal_state::xml_escape(&who)));

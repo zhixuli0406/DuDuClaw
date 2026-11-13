@@ -104,6 +104,25 @@ impl MethodHandler {
                     "synthetic pilot review requires an admin who can inspect Decision Lab",
                 );
             }
+            // v1.82: an autopilot rule action is decided only by a current
+            // Admin (role re-read from users.db). Approving it executes the
+            // frozen action once; denying records the denial.
+            if r.action_kind == crate::autopilot_approval::ACTION_KIND
+                && crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
+                    .is_err()
+            {
+                return WsFrame::error_response("", crate::autopilot_approval::ADMIN_REFUSAL);
+            }
+            // v1.82 (H1): approving an autopilot action REQUIRES the digest
+            // of the card the decider was shown (any RPC client). A wrong
+            // digest is refused by `check_expected_digest` below and again
+            // inside the broker's decision transaction. Denying needs none.
+            if r.action_kind == crate::autopilot_approval::ACTION_KIND
+                && approve
+                && params.get("expected_digest").is_none()
+            {
+                return WsFrame::error_response("", crate::autopilot_approval::DIGEST_REQUIRED);
+            }
             if kind.requires_board()
                 && crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
                     .is_err()
@@ -936,6 +955,131 @@ mod tests {
         ctx.email = user.email.clone();
         ctx.role = UserRole::Admin;
         ctx
+    }
+
+    /// v1.82: an autopilot rule action card is decided by a current Admin
+    /// only (role re-read from users.db), and only on the dashboard.
+    #[tokio::test]
+    async fn only_a_current_admin_decides_an_autopilot_action_card() {
+        let home = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db
+            .create_user("ada@example.com", "Ada", "fixture-password-only", UserRole::Admin)
+            .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = claiming_admin(&user);
+        let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let card = broker
+            .request(
+                crate::autopilot_approval::REQUESTER,
+                crate::autopilot_approval::ACTION_KIND,
+                "rule fired",
+                json!({}),
+                300,
+            )
+            .await
+            .unwrap();
+        assert!(crate::approval_notify::is_dashboard_only_kind(crate::autopilot_approval::ACTION_KIND));
+
+        db.update_user(&user.id, None, Some(UserRole::Manager), None).unwrap();
+        let frame = handler
+            .handle_approvals_decide(json!({"id": card.as_str(), "approve": true}), &ctx)
+            .await;
+        assert_eq!(refusal(&frame), crate::autopilot_approval::ADMIN_REFUSAL);
+        assert_eq!(
+            broker.get(&card).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Pending
+        );
+
+        db.update_user(&user.id, None, Some(UserRole::Admin), None).unwrap();
+        let rec = broker.get(&card).await.unwrap().unwrap();
+        let digest = crate::approval::decision_digest_at(home.path(), &rec);
+        let frame = handler
+            .handle_approvals_decide(
+                json!({"id": card.as_str(), "approve": true, "expected_digest": digest}),
+                &ctx,
+            )
+            .await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+        assert_eq!(
+            broker.get(&card).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Approved
+        );
+    }
+
+    /// v1.82 (H1): approving an autopilot action requires the digest of the
+    /// card that was shown — absent or wrong is refused for any RPC client;
+    /// denying does not need it.
+    #[tokio::test]
+    async fn approving_an_autopilot_action_requires_the_shown_card_digest() {
+        let home = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db
+            .create_user("ada@example.com", "Ada", "fixture-password-only", UserRole::Admin)
+            .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = claiming_admin(&user);
+        let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let file = |payload: Value| {
+            let broker = &broker;
+            async move {
+                broker
+                    .request(
+                        crate::autopilot_approval::REQUESTER,
+                        crate::autopilot_approval::ACTION_KIND,
+                        "rule fired",
+                        payload,
+                        300,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let card = file(json!({"autopilot_dispatch": {"action": {"type": "delegate", "prompt": "p"}}})).await;
+        let status = |id: crate::approval::ApprovalId| {
+            let broker = &broker;
+            async move { broker.get(&id).await.unwrap().unwrap().status }
+        };
+
+        // No digest → refused, still pending.
+        let frame = handler
+            .handle_approvals_decide(json!({"id": card.as_str(), "approve": true}), &ctx)
+            .await;
+        assert_eq!(refusal(&frame), crate::autopilot_approval::DIGEST_REQUIRED);
+        assert_eq!(status(card.clone()).await, crate::approval::ApprovalStatus::Pending);
+
+        // A wrong (well-formed) digest → refused, still pending.
+        let frame = handler
+            .handle_approvals_decide(
+                json!({"id": card.as_str(), "approve": true, "expected_digest": "0".repeat(64)}),
+                &ctx,
+            )
+            .await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+        assert_eq!(status(card.clone()).await, crate::approval::ApprovalStatus::Pending);
+
+        // The digest of a card that changed after it was shown → refused.
+        let shown = broker.get(&card).await.unwrap().unwrap();
+        let shown_digest = crate::approval::decision_digest_at(home.path(), &shown);
+        broker
+            .replace_text(&card, &shown.summary, &json!({"autopilot_dispatch": {"action": {"type": "delegate", "prompt": "other"}}}))
+            .await
+            .unwrap();
+        let frame = handler
+            .handle_approvals_decide(
+                json!({"id": card.as_str(), "approve": true, "expected_digest": shown_digest}),
+                &ctx,
+            )
+            .await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+        assert_eq!(status(card.clone()).await, crate::approval::ApprovalStatus::Pending);
+
+        // Denying needs no digest.
+        let frame = handler
+            .handle_approvals_decide(json!({"id": card.as_str(), "approve": false}), &ctx)
+            .await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+        assert_eq!(status(card).await, crate::approval::ApprovalStatus::Denied);
     }
 
     #[tokio::test]
