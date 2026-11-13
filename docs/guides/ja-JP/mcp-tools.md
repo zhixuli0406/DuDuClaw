@@ -186,7 +186,7 @@ AI 社員のものになっているレコードを変更・起動するツー�
 | `modify` | `false` | `true`。ただし追加・再生成だけの `memory_store`・`user_profile_record`・`wiki_rebuild_fts` は `false`。`wiki_export` は前回のエクスポート（人が編集したかもしれない Obsidian vault を含む）を上書きするため `true` のまま |
 | `delete`・`purchase`・`admin` と表にない名前 | `false` | `true` |
 
-メモリ・wiki・ユーザープロファイル・`code_map` のツールは `openWorldHint: false` も付きます。`memory_alias_add`・`wiki_export`・`wiki_rebuild_fts` は `idempotentHint: true` です。これらのリストは `crates/duduclaw-cli/src/mcp/tools_def/annotations.rs` にあります。
+メモリ・wiki・ユーザープロファイル・`code_map` のツールは `openWorldHint: false` も付きます。`memory_alias_add`・`wiki_export`・`wiki_rebuild_fts` は `idempotentHint: true` です。これらのリストは `crates/duduclaw-core/src/mcp_tool_defs/annotations.rs` にあります。
 
 ヒントは MCP クライアント向け（呼び出し前に確認するかどうかなど）で、権限を与えるものではありません。DuDuClaw のゲートは毎回そのまま動きます。Claude Code と Codex はモデルに名前・説明・入力スキーマだけを渡すため、上の説明バイト予算には含めません。
 

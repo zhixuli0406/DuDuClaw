@@ -1,13 +1,11 @@
 # Ignored advisories — upstream dependencies with no available fix.
 # Review periodically and remove once upstream publishes a fix.
 #
-# NOTE: cargo-audit reads this via `--ignore` flags in CI, not from this file.
-# This file serves as documentation for why each advisory is ignored.
+# Keep this list in sync with the explicit --ignore flags in CI.
 
 [advisories]
 ignore = [
     # rsa 0.9.10: Marvin Attack timing sidechannel — no fix upstream.
-    # Via: jsonwebtoken → livekit-api
     "RUSTSEC-2023-0071",
 
     # paste: unmaintained — transitive dep, no alternative available
@@ -15,8 +13,5 @@ ignore = [
 
     # fxhash: unmaintained — transitive dep via mistralrs/candle
     "RUSTSEC-2025-0057",
-
-    # number_prefix: unmaintained — transitive dep
-    "RUSTSEC-2025-0119",
 
 ]

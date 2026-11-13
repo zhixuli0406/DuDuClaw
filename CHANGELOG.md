@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- 授權寫入指令會提示目前資料目錄是否有 gateway 使用，並可用 `duduclaw license --home-check strict …` 讓未使用中的資料目錄檢查失敗；`license status` 也會顯示資料目錄與 gateway 鎖定狀態。
+- Docker 指南新增原生版轉容器版授權流程，以及依同時回覆員工數估算記憶體的參考表。
+
 ### Fixed
 
 - macOS 企業版 binary 的簽章驗證腳本在 Python 3.14 讀取 entitlements 時會失敗，且新版 macOS 會把單獨的命令列 binary 判為「不是 app」而拒絕檢查，已修正並改用命令列工具適用的公證檢查。

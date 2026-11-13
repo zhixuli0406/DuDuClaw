@@ -102,23 +102,99 @@ pub enum LicenseCommands {
 // ── Public entry point ────────────────────────────────────────
 
 pub async fn run(cmd: LicenseCommands) -> Result<()> {
+    run_with_home_check(cmd, false).await
+}
+
+pub async fn run_with_home_check(cmd: LicenseCommands, strict: bool) -> Result<()> {
     if should_refuse_in_ai_session(&cmd, &crate::ai_session_guard::command_markers()) {
         return Err(DuDuClawError::Agent(
             "這個指令不能在 AI 員工的工作階段中執行；請由管理者在自己的終端機執行。".into(),
         ));
     }
+    if command_writes_state(&cmd) {
+        check_gateway_home(strict)?;
+    }
     match cmd {
-        LicenseCommands::Activate { key } => cmd_activate(&key).await,
+        LicenseCommands::Activate { key, .. } => cmd_activate(&key).await,
         LicenseCommands::Status => cmd_status().await,
         LicenseCommands::Refresh => cmd_refresh().await,
         LicenseCommands::Export { base64 } => cmd_export(base64).await,
-        LicenseCommands::Import { path } => cmd_import(&path).await,
+        LicenseCommands::Import { path, .. } => cmd_import(&path).await,
         LicenseCommands::Deactivate => cmd_deactivate().await,
         LicenseCommands::Rebind => cmd_rebind().await,
         LicenseCommands::Subscriptions => cmd_subscriptions().await,
         LicenseCommands::Fingerprint { all } => cmd_fingerprint(all).await,
         LicenseCommands::InstallationKey => cmd_installation_key().await,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayHomeStatus {
+    Held,
+    NotHeld,
+    Unknown,
+}
+
+fn gateway_home_check(home: &std::path::Path) -> GatewayHomeStatus {
+    match duduclaw_core::gateway_instance::probe(home) {
+        Some(true) => GatewayHomeStatus::Held,
+        Some(false) => GatewayHomeStatus::NotHeld,
+        None => GatewayHomeStatus::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod gateway_home_check_tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_unlocked_gateway_home_is_not_in_use() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(gateway_home_check(home.path()), GatewayHomeStatus::NotHeld);
+        std::fs::create_dir_all(home.path().join("locks")).unwrap();
+        std::fs::File::create(home.path().join("locks/gateway.lock")).unwrap();
+        assert_eq!(gateway_home_check(home.path()), GatewayHomeStatus::NotHeld);
+    }
+
+    #[test]
+    fn held_gateway_lock_marks_home_in_use() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("locks")).unwrap();
+        duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+        assert_eq!(gateway_home_check(home.path()), GatewayHomeStatus::Held);
+    }
+
+    #[test]
+    fn inaccessible_gateway_lock_is_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("locks")).unwrap();
+        std::fs::write(home.path().join("locks/gateway.lock"), b"").unwrap();
+        // A directory at the lock path exists but cannot be opened as a file.
+        std::fs::remove_file(home.path().join("locks/gateway.lock")).unwrap();
+        std::fs::create_dir(home.path().join("locks/gateway.lock")).unwrap();
+        assert_eq!(gateway_home_check(home.path()), GatewayHomeStatus::Unknown);
+    }
+}
+
+fn check_gateway_home(strict: bool) -> Result<()> {
+    let home = storage::license_dir().map_err(|e| DuDuClawError::License(format!("license directory: {e}")))?;
+    match gateway_home_check(&home) {
+        GatewayHomeStatus::Held => return Ok(()),
+        GatewayHomeStatus::Unknown => {
+            eprintln!("無法確認此資料目錄是否有 gateway 使用：{}。", home.display());
+            return Ok(());
+        }
+        GatewayHomeStatus::NotHeld => {}
+    }
+    let message = format!(
+        "⚠️ 此資料目錄目前沒有執行中的 gateway：{}。容器版的資料存放在 Docker volume，請在容器內更新授權：`docker compose exec duduclaw duduclaw license <activate|import|refresh|deactivate|rebind>`。\n   This data directory has no running gateway. Container installs keep data in the Docker volume; run the license command inside the container.",
+        home.display()
+    );
+    if strict {
+        return Err(DuDuClawError::License(message));
+    }
+    eprintln!("{message}");
+    Ok(())
 }
 
 fn should_refuse_in_ai_session(cmd: &LicenseCommands, markers: &[&str]) -> bool {
@@ -614,6 +690,13 @@ fn parse_license_input(input: &str) -> Result<License> {
 async fn cmd_status() -> Result<()> {
     let home = storage::license_dir()
         .map_err(|e| DuDuClawError::License(format!("license directory: {e}")))?;
+    println!("Data directory:  {}", home.display());
+    let gateway_status = match gateway_home_check(&home) {
+        GatewayHomeStatus::Held => "yes",
+        GatewayHomeStatus::NotHeld => "no",
+        GatewayHomeStatus::Unknown => "unknown",
+    };
+    println!("Gateway using it: {gateway_status}");
     let warning = installed_warning(&home)?;
     if let Some(reason) = warning {
         println!("⚠️  {}", validation_warning_message(reason));
@@ -1346,6 +1429,9 @@ mod tests {
         let caller = duduclaw_core::HookCaller::Agent("worker".into());
         for command in [
             "duduclaw license activate abc",
+            "duduclaw license --home-check strict activate x",
+            "duduclaw license --home-check warn activate x",
+            "duduclaw license --home-check=strict activate x",
             "duduclaw license refresh",
             "duduclaw license import ./license.json",
             "duduclaw license deactivate",

@@ -2618,12 +2618,17 @@ enum MaintenanceCommands {
     ///     duduclaw license fingerprint
     ///     duduclaw license activate ./my-license.json
     ///     duduclaw license status
+    ///     duduclaw license --home-check strict activate ./my-license.json
     ///     duduclaw license refresh
     ///     duduclaw license export --base64 > license.b64
     ///     duduclaw license import ./transferred.json
     ///     duduclaw license deactivate
-    #[command(subcommand)]
-    License(license::LicenseCommands),
+    License {
+        #[arg(long, value_parser = ["warn", "strict"], default_value = "warn")]
+        home_check: String,
+        #[command(subcommand)]
+        command: license::LicenseCommands,
+    },
 
     /// Packs — ready-made bundles of AI employees: a whole team, a single
     /// industry persona, or one job preset. This is the main entry point;
@@ -6041,7 +6046,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::DataFileGuard)) => {
             cmd_hook_data_file_guard().await
         }
-        Commands::Maintenance(MaintenanceCommands::License(license_cmd)) => license::run(license_cmd).await,
+        Commands::Maintenance(MaintenanceCommands::License { home_check, command }) => {
+            license::run_with_home_check(command, home_check == "strict").await
+        },
         Commands::Maintenance(MaintenanceCommands::Pack { command }) => pack_cmd::run(command).await,
         Commands::Maintenance(MaintenanceCommands::Publishers { command }) => publishers_cmd::run(&duduclaw_home(), command).await,
         Commands::Maintenance(MaintenanceCommands::Expert { command }) => expert::run(command).await,
