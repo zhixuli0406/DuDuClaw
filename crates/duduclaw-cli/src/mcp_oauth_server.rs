@@ -790,8 +790,8 @@ pub(crate) async fn authorize_handler(
     let body = format!(
         "<p>應用程式 <b>{name}</b> 想連接你的 {product}（remote MCP）。</p>\
 <p>授權範圍：{scope_note}</p>\
-<p>貼上一把<b>內部 MCP API key</b>（<code>config.toml [mcp_keys]</code> 中 \
-<code>is_external = false</code> 的 key）以確認你是操作者本人：</p>\
+<p>貼上一把<b>內部 MCP API key</b>（儀表板「MCP 金鑰」頁建立、未勾選「外部用戶端」\
+且未停用、未到期的金鑰）以確認你是操作者本人：</p>\
 <form method=\"post\" action=\"/oauth/decision\">\
 <input type=\"hidden\" name=\"client_id\" value=\"{client_id}\">\
 <input type=\"hidden\" name=\"redirect_uri\" value=\"{redirect_uri}\">\

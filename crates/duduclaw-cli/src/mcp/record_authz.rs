@@ -74,6 +74,22 @@ impl<'a> RecordActor<'a> {
         }
     }
 
+    /// v1.82 (RM-134 third review): classify a REMOTE (HTTP) non-external
+    /// principal other than the verified gateway-internal key. The acting
+    /// employee is the key's stored binding — by construction the key's own
+    /// client id — and nothing else: no binding (`None`), or a caller that is
+    /// not the bound id, is an error. There is no fallback to `default_agent`
+    /// and no operator classification for such a principal.
+    pub(crate) fn resolve_remote(
+        caller_client_id: &'a str,
+        binding: Option<&str>,
+    ) -> std::result::Result<Self, RemoteBindingMissing> {
+        match binding {
+            Some(agent) if !agent.is_empty() && agent == caller_client_id => Ok(RecordActor::Agent(caller_client_id)),
+            _ => Err(RemoteBindingMissing),
+        }
+    }
+
     /// The identity this caller acts as: what a handler checks against and
     /// stamps (`created_by`, `claimed_by`, activity rows, reminder owner).
     pub(crate) fn id(self) -> &'a str {
@@ -95,24 +111,48 @@ impl<'a> RecordActor<'a> {
 /// Resolve the [`RecordActor`] of a live `tools/call` from the process
 /// environment. Production-only (reads `DUDUCLAW_AGENT_ID`); tests build the
 /// actor directly.
+///
+/// For a remote (HTTP) principal ([`RemoteBinding`] set by the dispatcher)
+/// the actor is [`RecordActor::resolve_remote`]: the key's binding, or an
+/// error — never `default_agent`.
+pub(crate) fn try_record_actor_for<'a>(
+    home_dir: &Path,
+    caller_client_id: &'a str,
+    default_agent: &'a str,
+) -> std::result::Result<RecordActor<'a>, RemoteBindingMissing> {
+    if let Some(call) = crate::mcp_isolation::current() {
+        return Ok(RecordActor::Agent(if call.agent == default_agent {
+            default_agent
+        } else { duduclaw_core::UNTRUSTED_AGENT_ID }));
+    }
+    if let Some(remote) = current_remote_binding() {
+        let binding = match &remote {
+            RemoteBinding::Bound(agent) => Some(agent.as_str()),
+            RemoteBinding::Unbound => None,
+        };
+        return RecordActor::resolve_remote(caller_client_id, binding);
+    }
+    let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
+    let client_is_agent = crate::mcp_namespace::client_is_agent(home_dir, caller_client_id);
+    Ok(RecordActor::resolve(
+        caller_client_id,
+        default_agent,
+        env_agent.as_deref(),
+        client_is_agent,
+    ))
+}
+
+/// [`try_record_actor_for`] for code that cannot return an error: a missing
+/// remote binding becomes the untrusted sentinel (an agent identity that owns
+/// nothing and that every record and background gate refuses), never
+/// `default_agent`. The dispatcher refuses such a call before any handler.
 pub(crate) fn record_actor_for<'a>(
     home_dir: &Path,
     caller_client_id: &'a str,
     default_agent: &'a str,
 ) -> RecordActor<'a> {
-    if let Some(call) = crate::mcp_isolation::current() {
-        return RecordActor::Agent(if call.agent == default_agent {
-            default_agent
-        } else { duduclaw_core::UNTRUSTED_AGENT_ID });
-    }
-    let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
-    let client_is_agent = crate::mcp_namespace::client_is_agent(home_dir, caller_client_id);
-    RecordActor::resolve(
-        caller_client_id,
-        default_agent,
-        env_agent.as_deref(),
-        client_is_agent,
-    )
+    try_record_actor_for(home_dir, caller_client_id, default_agent)
+        .unwrap_or(RecordActor::Agent(duduclaw_core::UNTRUSTED_AGENT_ID))
 }
 
 /// What kind of record is being changed — only shapes the refusal text.

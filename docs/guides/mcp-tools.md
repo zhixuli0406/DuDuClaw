@@ -99,6 +99,142 @@ proxy-private env fields on third-party entries. Forked copies use the original
 employee's host-known identity and policy directory, even when the copied file
 lives elsewhere.
 
+### MCP API keys (`ddc_<env>_…`) since v1.82
+
+Keys created on the dashboard's **Integrations → MCP API keys** page are kept in
+`<home>/mcp_keys.db` as SHA-256 fingerprints, never in `config.toml`. The stdio
+`duduclaw mcp-server` (key in `DUDUCLAW_MCP_API_KEY`) and `duduclaw http-server`
+(`Authorization: Bearer`) look the presented key up in that store on every call
+(an indexed lookup by fingerprint, then a constant-time comparison of the matched
+fingerprint), so a rename, a new expiry, a disable or a delete applies to the next
+call without a restart. They open `mcp_keys.db` strictly read-only; only the
+gateway writes it. Each key has the expiry the Admin chose (30 / 90 / 365 days, a
+date, or none) instead of the old fixed 30 days. An expired and a disabled key get
+the same refusal (`API key is expired or disabled`); the server log names the
+reason and the key id, never the key.
+
+Last use is recorded in a separate file, `<home>/mcp_keys_usage.db` (key id and
+time, at most once a minute per key). The gateway reads it when it lists the keys.
+It authenticates nothing: a damaged or edited usage file changes only what the
+"Last used" column shows.
+
+A dashboard key issued for a client ID is always **external**. Its scopes come
+from one list on the server (`memory:read`, `memory:write`, `wiki:read`,
+`wiki:write`, `messaging:send`); any other scope is refused with
+`mcp_key_scope_not_grantable`, which names the scope. The client ID cannot be an
+AI employee's ID or name, or a reserved system name (`dashboard`, `cron`, `default`,
+`gateway-internal`, …). An AI employee's own key (RFC-21 per-agent keys, the v1.76
+dedicated Google key) is requested explicitly with `agent_id`, which must be the
+employee's **ID** — its directory name under `agents/`, exact case. The `[agent]
+name` / display name, or another case of the ID, is refused
+(`mcp_key_employee_id_required`). The key is bound to that employee at creation
+(`agent_binding`, never changed afterwards). It is an internal key that acts as
+that employee and carries only scopes the v1.81 picker offered, never `admin`. For
+a colleague's Personal employee, only the owner, or an Admin after a fresh audited
+step-up, can create one.
+
+**Internal keys on `duduclaw http-server`.** The HTTP server acts for one fixed
+employee (its default agent) for every caller, and many tools act for that
+employee rather than for the key: `working_state_*`, `mail_*`, every `wiki_*`
+tool, `canvas_*`, `send_message`, `tasks_list`, `plan_*`, `odoo_*`, the
+computer-use, fork and knowledge tools, and the rest of the set
+`DEFAULT_AGENT_HANDLER_TOOLS` ∪ `PROCESS_AGENT_TOOLS` in
+`crates/duduclaw-cli/src/mcp/tools_list.rs`. Over HTTP the rule is default deny:
+
+- Only the gateway's own internal key (the `gateway-internal` key whose
+  fingerprint the gateway recorded, in a server whose own employee identity is
+  verified) may call those tools.
+- Every other non-external key — an employee's own key, a key created under a
+  display name, a migrated key, any unknown internal client ID — is refused all of
+  them (`-32003`, audit class `per_agent_key_process_tool`, whatever scopes the key
+  holds), and `tools/list` does not show them. This is decided from how the key
+  was authenticated, never from the files on disk.
+- For the remaining tools (`memory_store`, `memory_search`, `tasks_create`,
+  `file_read`, …) such a key acts as **the employee it is bound to**, never as the
+  server's default agent.
+- A non-external key with no binding, or whose bound employee no longer exists
+  (directory removed or renamed, or `status = "deleted"`), is refused **every**
+  tool (`-32003`, audit class `remote_key_unbound` with the reason) and is shown an
+  empty `tools/list`. The keys page marks such a key *Employee no longer exists*.
+
+**Deleting an employee revokes its keys for good.** When an employee is deleted on
+the dashboard, every key bound to it is deleted in the same operation (a tombstone:
+the fingerprint is kept, so the key never authenticates again), each with an
+`mcp_key_deleted` audit record (reason `employee_deleted`). Restoring the employee
+does not bring the keys back, and **a later employee created with the same ID never
+gets them**: issue that employee a new key. An employee removed outside the gateway
+(MCP `agent_remove` moving its folder to `agents/_trash`, or a manually removed
+folder) or marked `status = "deleted"` loses its keys the same way at the gateway's
+next key sweep (at start and every 10 minutes; nothing is decided while the whole
+`agents/` folder is missing). As a second line, the HTTP server refuses a key that
+is older than its employee's folder (reason `employee_recreated`, keys page *Employee
+no longer exists*) — that is an employee re-created under a removed one's ID, even
+before the next sweep. This check needs the folder's creation time from the operating
+system (macOS, Windows, most Linux file systems); where it is not available, the
+revocation above is the guarantee. Restoring or copying the whole DuDuClaw home from
+a backup resets those creation times, so per-employee keys issued before the restore
+are refused and must be re-issued.
+
+External keys and each employee's own stdio `mcp-server` are not affected. v1.83
+will run every tool as the key's employee and lift the refusal.
+
+**`config.toml [mcp_keys]` after the upgrade.** At its first v1.82 start the gateway
+records the fingerprints of the `[mcp_keys]` entries in `config.toml` as *pending*,
+in one transaction. It then moves each entry into the store, writes its audit
+record, and only then removes it from `config.toml`. When nothing is pending, it
+writes a *migration complete* marker. A migrated key keeps its client, external
+flag and scopes. It expires at the instant v1.81 would have started refusing it
+(`created_at` + 31 days, to the second). A migrated internal key is bound to an
+employee only when its client ID exactly equals an existing employee directory
+ID **and** every one of its scopes is one a per-employee key may carry (never
+`admin`); otherwise it has no binding (and is refused by the HTTP server, see
+above). An employee's legacy key with `admin` or another scope not allowed for a
+per-employee key is moved with its scopes unchanged, but unbound: the keys page
+marks it *Needs re-issue: scopes not allowed for a per-employee key* and the
+gateway log names it by its hint (`ddc_prod_…3f9a`). Issue the employee a new key
+by its ID and delete the old one. On a key bound to an employee only the
+per-employee scopes ever take effect, so `admin` never stands in for another scope.
+An entry whose `created_at` lies more than a few minutes in the future is never
+accepted, selected or migrated (it is listed as ignored). The rules every reader
+applies (the MCP server, the OAuth consent page and the Google key check):
+
+- `mcp_keys.db` does not exist (no v1.82 gateway has started on this home, e.g. an
+  `mcp-server` launched before the upgraded gateway ever ran): `[mcp_keys]` is read
+  under the v1.81 rules (30 days). This is the only bootstrap window. It closes for
+  good the moment the gateway creates the store. Deleting `mcp_keys.db` needs write
+  access to the home directory, and the store refuses a home that is writable by
+  group or others.
+- `mcp_keys.db` exists but cannot be read, lacks its tables, or has an unexpected
+  schema or `user_version`: every key is refused (`store unavailable`), including
+  the gateway-internal key. This is never treated as "no store".
+- A stored key decides alone. A stale `config.toml` copy of it is ignored and
+  removed at the next start.
+- Before the completion marker, `config.toml` is accepted only for the fingerprints
+  recorded as pending. After it, `config.toml` is never consulted for a non-internal
+  key. An entry added later is not imported and never authenticates. It is logged
+  once as an *ignored legacy entry* and listed on the keys page by its hint
+  (`ddc_prod_…3f9a`), so an Admin can remove it.
+- `gateway-internal`: the gateway records the fingerprint of the key it provisions or
+  rotates in `mcp_keys.db`. Only that key is accepted, as client `gateway-internal`,
+  with its `config.toml` entry present and within 30 days. An entry that merely
+  claims that client ID is refused. **On the first start after the upgrade the
+  gateway issues itself a new internal key** (or keeps the `DUDUCLAW_MCP_API_KEY`
+  it was started with, rewriting that key's `config.toml` date), records only that
+  one, and hands it to its own MCP registrations; later in the same start every
+  employee's `.mcp.json` is rewritten with it. Every `gateway-internal` entry
+  already in `config.toml`, whatever its date, is not adopted, not recorded and
+  never authenticates; it is logged once by its hint and listed on the keys page
+  as an ignored legacy entry.
+
+The OAuth consent page (`http-server`) accepts an active internal (non-external)
+key from the store, or a `config.toml` key allowed by the rules above, as operator
+proof. Consents given with a key before it moved into the store remain valid.
+
+**Downgrading is one-way for keys.** v1.81 does not read `mcp_keys.db`. After a
+downgrade, external keys must be re-issued on v1.81. Do not restore an old
+`config.toml` to get them back: it would bring back keys that were deleted or
+disabled on v1.82.
+
 ## Local text to speech
 
 `synthesize_speech` uses providers available in the MCP process: installed local

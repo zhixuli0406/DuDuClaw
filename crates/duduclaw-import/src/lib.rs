@@ -15,7 +15,7 @@ pub const MAX_REQUEST_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SourceKind { MemoryText, WikiText, ConversationText, TaskArchive, AuditArchive, SessionsSqlite, MemorySqlite, Attachment, WorkProduct, AuthorityJson, AuthorityToml, AuthorityUsersSqlite, AuthorityTasksSqlite, AuthorityApprovalsSqlite, AuthoritySessionsSqlite, AuthorityCronSqlite, AuthorityCronJsonl, AuthorityAutopilotSqlite, AuthorityWorkflowSqlite, AuthorityRemindersJsonl, AuthorityNotice, AuthorityInstructions, AuthoritySkill }
+pub enum SourceKind { MemoryText, WikiText, ConversationText, TaskArchive, AuditArchive, SessionsSqlite, MemorySqlite, Attachment, WorkProduct, AuthorityJson, AuthorityToml, AuthorityUsersSqlite, AuthorityTasksSqlite, AuthorityApprovalsSqlite, AuthoritySessionsSqlite, AuthorityCronSqlite, AuthorityCronJsonl, AuthorityAutopilotSqlite, AuthorityWorkflowSqlite, AuthorityRemindersJsonl, AuthorityNotice, AuthorityInstructions, AuthoritySkill, AuthorityMcpKeysSqlite }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,7 +61,7 @@ impl ImportRequest {
     pub fn validate(&self) -> Result<()> {
         if self.version != 1 || self.source_id.is_empty() || self.source_id.len() > 400
             || self.title.len() > 1024 || self.legacy_agent.as_ref().is_some_and(|a| a.is_empty() || a.len() > 128)
-            || (self.has_wal && !matches!(self.kind, SourceKind::SessionsSqlite | SourceKind::MemorySqlite | SourceKind::AuthorityUsersSqlite | SourceKind::AuthorityTasksSqlite | SourceKind::AuthorityApprovalsSqlite | SourceKind::AuthoritySessionsSqlite | SourceKind::AuthorityCronSqlite | SourceKind::AuthorityAutopilotSqlite | SourceKind::AuthorityWorkflowSqlite | SourceKind::AuthorityNotice))
+            || (self.has_wal && !matches!(self.kind, SourceKind::SessionsSqlite | SourceKind::MemorySqlite | SourceKind::AuthorityUsersSqlite | SourceKind::AuthorityTasksSqlite | SourceKind::AuthorityApprovalsSqlite | SourceKind::AuthoritySessionsSqlite | SourceKind::AuthorityCronSqlite | SourceKind::AuthorityAutopilotSqlite | SourceKind::AuthorityWorkflowSqlite | SourceKind::AuthorityNotice | SourceKind::AuthorityMcpKeysSqlite))
             || (matches!(self.kind, SourceKind::SessionsSqlite | SourceKind::MemorySqlite) && (self.employee.is_none() || self.legacy_agent.is_none())) {
             return Err(Error::InvalidRequest);
         }
@@ -91,7 +91,7 @@ pub fn import<R: Read, W: Write>(request: &ImportRequest, input: R, wal: Option<
     catalog::clear_schema_refusal();
     request.validate()?;
     if request.has_wal != wal.is_some() { return Err(Error::InvalidRequest); }
-    if matches!(request.kind,SourceKind::AuthorityJson|SourceKind::AuthorityToml|SourceKind::AuthorityUsersSqlite|SourceKind::AuthorityTasksSqlite|SourceKind::AuthorityApprovalsSqlite|SourceKind::AuthoritySessionsSqlite|SourceKind::AuthorityCronSqlite|SourceKind::AuthorityCronJsonl|SourceKind::AuthorityAutopilotSqlite|SourceKind::AuthorityWorkflowSqlite|SourceKind::AuthorityRemindersJsonl|SourceKind::AuthorityNotice|SourceKind::AuthorityInstructions|SourceKind::AuthoritySkill) {return authority::emit(request,input,wal,output);}
+    if matches!(request.kind,SourceKind::AuthorityJson|SourceKind::AuthorityToml|SourceKind::AuthorityUsersSqlite|SourceKind::AuthorityTasksSqlite|SourceKind::AuthorityApprovalsSqlite|SourceKind::AuthoritySessionsSqlite|SourceKind::AuthorityCronSqlite|SourceKind::AuthorityCronJsonl|SourceKind::AuthorityAutopilotSqlite|SourceKind::AuthorityWorkflowSqlite|SourceKind::AuthorityRemindersJsonl|SourceKind::AuthorityNotice|SourceKind::AuthorityInstructions|SourceKind::AuthoritySkill|SourceKind::AuthorityMcpKeysSqlite) {return authority::emit(request,input,wal,output);}
     let mut emitter = Emitter { request, output, budget: ImportBudget::default(), sequence: 0 };
     if matches!(request.kind, SourceKind::SessionsSqlite) {
         sqlite::sessions(input, wal, &mut emitter)?;

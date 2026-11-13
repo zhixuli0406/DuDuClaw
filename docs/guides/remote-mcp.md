@@ -27,9 +27,10 @@ https://<your-url>/mcp
 ```
 
 claude.ai runs OAuth discovery automatically (RFC 9728 → RFC 8414 → dynamic registration) and
-takes you to DuDuClaw's authorization page. Paste in an **internal MCP API key** (a key under
-`config.toml [mcp_keys]` with `is_external = false`) and click "Agree to connect" (同意連線) to
-finish.
+takes you to DuDuClaw's authorization page. Paste in an **internal MCP API key** (a key created
+on **Manage → Integrations → MCP API keys** with "External client" off, not disabled and not
+expired; since v1.82 these keys are no longer in `config.toml`) and click "Agree to connect"
+(同意連線) to finish.
 
 ## Canonical origin and proxy configuration
 

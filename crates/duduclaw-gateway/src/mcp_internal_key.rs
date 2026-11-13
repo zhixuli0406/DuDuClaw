@@ -30,8 +30,36 @@
 //! key is per-install (never leaves `config.toml` + local process envs).
 //! Concurrency: writes hold `duduclaw_core::with_file_lock` on `config.toml`
 //! (multi-instance gateways race on first boot otherwise).
+//!
+//! RM-134 (v1.82): the key still lives in `config.toml`, but a config entry
+//! merely carrying `client_id = "gateway-internal"` no longer authenticates.
+//! Provisioning records the fingerprint of the key it hands out (and of a
+//! rotated-in replacement) in `mcp_keys.db` (`mcp_internal_keys`); every
+//! verifier — the MCP authenticator, [`valid_internal_keys`] and so
+//! [`verify_internal_key`] — accepts only recorded fingerprints. Once any
+//! record exists, provisioning reuses only recorded entries and mints a fresh
+//! key otherwise.
+//!
+//! First start (third review, Medium): when `mcp_keys.db` does not exist yet
+//! (the first start of a v1.82 gateway on a home), provisioning ALWAYS mints
+//! a fresh key — it never selects one of the `gateway-internal` entries
+//! already in `config.toml`, whatever their dates, since none was ever
+//! recorded and any may have been planted. Only the fresh key (or the
+//! operator's environment key, whose config entry is rewritten with
+//! `created_at = now`) is recorded and handed to the gateway's own MCP
+//! registrations: the gateway exports it (`set_internal_mcp_api_key`) and the
+//! boot fixup `ensure_mcp_absolute_paths_all` later in the same boot rewrites
+//! every employee's `.mcp.json` with it. Every pre-existing
+//! `gateway-internal` entry is never recorded, so it never authenticates; the
+//! key store migration that runs right after provisioning logs it once by
+//! display hint and lists it on the keys page as an ignored legacy entry
+//! (`mcp_keys_lifecycle::migrate_config_keys`, step 4). A `created_at` more
+//! than a few minutes in the future is not credible anywhere an entry's age
+//! is evaluated (never reused, never valid). An unreadable `mcp_keys.db` is
+//! fail-closed: no internal key verifies.
 
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 use std::path::Path;
 use tracing::info;
 
@@ -51,14 +79,18 @@ pub const HARD_EXPIRY_DAYS: i64 = 30;
 /// still hands its children a key that authenticates.
 pub const ROTATE_AFTER_DAYS: i64 = 25;
 
-/// Whole-day age of `created_at` as of `now`, clamped at 0.
+/// Whole-day age of `created_at` as of `now`, clamped at 0, or `None` for a
+/// `created_at` further in the future than the clock-skew allowance
+/// (`duduclaw_core::mcp_key_store::legacy_created_at_credible`).
 ///
-/// The clamp mirrors the authenticator's L12 fix: a future-dated `created_at`
-/// (clock skew, mis-set system time) yields a negative duration there and is
-/// treated as age 0 rather than an absurd expiry, so rotation must agree —
-/// otherwise the gateway would mint a fresh key on every single boot.
-fn age_in_days(created_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
-    now.signed_duration_since(created_at).num_days().max(0)
+/// The clamp mirrors the authenticator's L12 fix for small clock skew. A
+/// date beyond the allowance is not credible (third review, Medium: before,
+/// a far-future entry counted as age 0 forever and won the "newest entry"
+/// selection); the authenticator refuses such an entry, so it is never
+/// reused or kept as valid here either.
+fn age_in_days(created_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<i64> {
+    duduclaw_core::mcp_key_store::legacy_created_at_credible(created_at, now)
+        .then(|| now.signed_duration_since(created_at).num_days().max(0))
 }
 
 /// Mint a fresh internal key. `Uuid::simple()` renders 32 lowercase hex
@@ -146,6 +178,26 @@ fn provision_internal_mcp_key(
     env_key: Option<&str>,
 ) -> Result<String, String> {
     let env_key = env_key.filter(|key| !key.trim().is_empty());
+    // RM-134: which internal entries the gateway recorded. `None` = no
+    // `mcp_keys.db` yet: this is the first start that creates the store. An
+    // unreadable store refuses provisioning (no internal key could verify
+    // anyway).
+    let recorded: Option<HashSet<String>> = duduclaw_core::mcp_key_store::internal_key_hashes(home_dir)
+        .map_err(|e| format!("internal MCP key provisioning failed: {e}"))?;
+    // Third review (Medium): on the first start that creates the store, NO
+    // pre-existing `gateway-internal` entry is reused — not the newest, not
+    // one with a future date — because none of them was ever recorded by a
+    // gateway and any of them may have been planted in config.toml. A fresh
+    // key is minted, recorded and handed to the gateway's own MCP
+    // registrations; every older entry stays an ignored legacy entry (never
+    // recorded, so it never authenticates; logged once by hint and listed on
+    // the keys page by `mcp_keys_lifecycle::migrate_config_keys`). Later
+    // starts reuse only recorded entries.
+    let first_start = recorded.is_none();
+    let reusable = |key: &str| {
+        recorded.as_ref().is_some_and(|set| set.contains(&duduclaw_core::mcp_key_store::digest(key)))
+    };
+    let mut outcome: Option<(String, DateTime<Utc>, Vec<(String, DateTime<Utc>)>)> = None;
     let (key, restored, fresh_team) = crate::handlers::config_commit::commit_boot_config(home_dir, |content, missing| {
         if missing && listener.is_none() {
             return Err("missing config.toml requires validated gateway listener and edition".into());
@@ -211,13 +263,24 @@ fn provision_internal_mcp_key(
                     continue;
                 };
 
-                let age = age_in_days(created_at, now);
+                let Some(age) = age_in_days(created_at, now) else {
+                    // Future-dated beyond the skew allowance: refused by the
+                    // authenticator, never reused, never recorded. Left in
+                    // config so the keys page lists it as ignored.
+                    continue;
+                };
                 if newest_age.is_none_or(|a| age < a) {
                     newest_age = Some(age);
                 }
 
                 if age > HARD_EXPIRY_DAYS {
                     prune.push(key.clone());
+                    continue;
+                }
+                // RM-134: an unrecorded entry (once records exist) is not
+                // the gateway's key; never reuse it. It is reported as an
+                // ignored legacy entry by the key store migration.
+                if !reusable(key) {
                     continue;
                 }
                 let is_newer = match &newest_valid {
@@ -233,9 +296,9 @@ fn provision_internal_mcp_key(
         let reused = newest_valid
             .as_ref()
             .filter(|(_, _, age)| *age < ROTATE_AFTER_DAYS)
-            .map(|(k, _, _)| k.clone());
+            .map(|(k, created, _)| (k.clone(), *created));
 
-        let (key, minted) = if let Some(key) = env_key {
+        let (key, minted, key_created) = if let Some(key) = env_key {
             // Refresh the same row when metadata or age requires it; never
             // create a second row or overwrite a foreign client's key.
             if let Some(entry) = table.get("mcp_keys").and_then(|v| v.get(key)) {
@@ -243,22 +306,50 @@ fn provision_internal_mcp_key(
                     return Err("environment MCP key belongs to another client".into());
                 }
             }
-            let valid = table.get("mcp_keys").and_then(|v| v.get(key))
-                .is_some_and(|entry| {
+            let created = table.get("mcp_keys").and_then(|v| v.get(key))
+                .filter(|entry| {
                     entry.get("is_external").and_then(|v| v.as_bool()) == Some(false)
                         && entry.get("scopes").and_then(|v| v.as_array())
                             .is_some_and(|v| v == &vec![toml::Value::String("admin".into())])
-                        && entry.get("created_at").and_then(|v| v.as_str())
-                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                            .is_some_and(|dt| age_in_days(dt.with_timezone(&Utc), now) < ROTATE_AFTER_DAYS)
-                });
-            (key.to_owned(), !valid)
+                })
+                .and_then(|entry| entry.get("created_at").and_then(|v| v.as_str()))
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .filter(|dt| age_in_days(*dt, now).is_some_and(|age| age < ROTATE_AFTER_DAYS));
+            // The operator's environment key (it comes from the gateway's
+            // environment, not from config.toml) stays the child key. On the
+            // first start its config entry is rewritten with `created_at =
+            // now` rather than trusting whatever metadata config.toml holds.
+            match created {
+                Some(created) if !first_start => (key.to_owned(), false, created),
+                _ => (key.to_owned(), true, now),
+            }
         } else {
             match reused {
-                Some(k) => (k, false),
-                None => (mint_key(), true),
+                Some((k, created)) => (k, false, created),
+                None => (mint_key(), true, now),
             }
         };
+
+        // RM-134: every still-valid internal entry left in config after this
+        // pass. Used only to PRUNE records whose entry left config; nothing
+        // in it is recorded except the key handed out.
+        let mut valid_after: Vec<(String, DateTime<Utc>)> = Vec::new();
+        if let Some(keys) = table.get("mcp_keys").and_then(|v| v.as_table()) {
+            for (entry_key, val) in keys {
+                if val.get("client_id").and_then(|v| v.as_str()) != Some(INTERNAL_CLIENT_ID) || prune.contains(entry_key) {
+                    continue;
+                }
+                if let Some(created) = val.get("created_at").and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .filter(|dt| age_in_days(*dt, now).is_some_and(|age| age <= HARD_EXPIRY_DAYS))
+                {
+                    valid_after.push((entry_key.clone(), created));
+                }
+            }
+        }
+        outcome = Some((key.clone(), key_created, valid_after));
 
         // Steady state: a young key and nothing to prune ⇒ no write at all.
         if !minted && prune.is_empty() && !restored && !missing {
@@ -323,7 +414,34 @@ fn provision_internal_mcp_key(
         Ok(())
     }).map_err(|e| format!("internal MCP key provisioning failed: {e}"))?;
     if restored && !fresh_team { crate::mfa::audit_policy_restored(home_dir); }
+    if let Some((handed_out, created_at, valid_after)) = outcome.filter(|(k, _, _)| *k == key) {
+        record_internal_keys(home_dir, &handed_out, created_at, &valid_after)
+            .map_err(|e| format!("internal MCP key provisioning failed: record fingerprint: {e}"))?;
+    }
     Ok(key)
+}
+
+/// RM-134: record the handed-out key's fingerprint in `mcp_keys.db` — and
+/// only that one, in the bootstrap window too (second review, Medium: an
+/// entry planted in `config.toml` before the upgrade must not be adopted) —
+/// then drop records whose entries left `config.toml` (pruned, rotated out,
+/// removed by an operator — removal is revocation). A previously recorded key
+/// that is still in `config.toml` (the one just rotated away from) keeps its
+/// record so in-flight children holding it keep working.
+fn record_internal_keys(
+    home: &Path,
+    key: &str,
+    created_at: DateTime<Utc>,
+    valid_after: &[(String, DateTime<Utc>)],
+) -> Result<(), String> {
+    let store = duduclaw_auth::mcp_keys::McpKeyStore::open(home)?;
+    let failed = |e: duduclaw_auth::mcp_keys::McpKeyError| e.code().to_string();
+    store.record_internal_key(key, created_at).map_err(failed)?;
+    let mut keep: HashSet<String> =
+        valid_after.iter().map(|(entry, _)| duduclaw_core::mcp_key_store::digest(entry)).collect();
+    keep.insert(duduclaw_core::mcp_key_store::digest(key));
+    store.retain_internal_keys(&keep).map_err(failed)?;
+    Ok(())
 }
 
 /// Every currently valid `gateway-internal` key in
@@ -331,11 +449,29 @@ fn provision_internal_mcp_key(
 ///
 /// Mirrors the MCP authenticator's acceptance rules for this one client:
 /// `client_id = "gateway-internal"`, not external, a parseable `created_at`
-/// no older than [`HARD_EXPIRY_DAYS`]. Every other key (an operator's
-/// external client keys included) is left out. Fail closed: an unreadable or
-/// malformed `config.toml` yields none. The caller must never log the
-/// returned values.
+/// no older than [`HARD_EXPIRY_DAYS`], and (RM-134) a fingerprint the
+/// gateway recorded in `mcp_keys.db` with a recorded `created_at` inside the
+/// same rule — or, only while `mcp_keys.db` does not exist yet, any such
+/// entry (the bootstrap window). Every other key (an operator's external
+/// client keys, an unrecorded entry claiming this client id) is left out.
+/// Fail closed: an unreadable or malformed `config.toml` or `mcp_keys.db`
+/// yields none. The caller must never log the returned values.
 pub fn valid_internal_keys(home_dir: &Path) -> Vec<String> {
+    use duduclaw_core::mcp_key_store::{Authority, LegacyWindow, legacy_age_accepts, resolve};
+    let now = Utc::now();
+    config_internal_keys(home_dir)
+        .into_iter()
+        .filter(|key| match resolve(home_dir, key) {
+            Ok(Authority::Internal(recorded)) => legacy_age_accepts(recorded.created_at, now),
+            Ok(Authority::Legacy(LegacyWindow::Bootstrap)) => true,
+            _ => false,
+        })
+        .collect()
+}
+
+/// The `gateway-internal` entries of `config.toml` that pass the 30-day rule
+/// (before the RM-134 record check).
+fn config_internal_keys(home_dir: &Path) -> Vec<String> {
     let Ok(content) = std::fs::read_to_string(home_dir.join("config.toml")) else {
         return Vec::new();
     };
@@ -362,7 +498,7 @@ pub fn valid_internal_keys(home_dir: &Path) -> Vec<String> {
         let Some(created_at) = created_at else {
             continue;
         };
-        if age_in_days(created_at, now) <= HARD_EXPIRY_DAYS && !key.is_empty() {
+        if age_in_days(created_at, now).is_some_and(|age| age <= HARD_EXPIRY_DAYS) && !key.is_empty() {
             out.push(key.clone());
         }
     }
@@ -474,6 +610,106 @@ mod tests {
 
     fn provision(home: &Path, personal: bool, env: Option<&str>) -> Result<String, String> {
         ensure_internal_mcp_key_for_gateway(home, "127.0.0.1:18888".parse().unwrap(), personal, env)
+    }
+
+    /// RM-134 H1: a `gateway-internal` entry the gateway did not record is
+    /// neither verified nor adopted; an unreadable key store fails closed.
+    #[test]
+    fn an_unrecorded_internal_entry_is_never_verified_or_reused() {
+        let home = tempfile::tempdir().unwrap();
+        let key = provision(home.path(), true, None).unwrap();
+        assert!(verify_internal_key(home.path(), &key));
+        let forged = "ddc_prod_fefefefefefefefefefefefefefefefe";
+        let mut text = config_text(home.path());
+        text.push_str(&format!(
+            "\n[mcp_keys.\"{forged}\"]\nclient_id = \"{INTERNAL_CLIENT_ID}\"\nis_external = false\n\
+             created_at = \"{}\"\nscopes = [\"admin\"]\n",
+            (Utc::now() + chrono::Duration::seconds(5)).to_rfc3339()
+        ));
+        std::fs::write(home.path().join("config.toml"), text).unwrap();
+        assert!(!verify_internal_key(home.path(), forged), "claiming the client id is not enough");
+        assert!(verify_internal_key(home.path(), &key));
+        assert_eq!(provision(home.path(), true, None).unwrap(), key, "the newer forged entry is not adopted");
+        assert!(!valid_internal_keys(home.path()).contains(&forged.to_string()));
+        // Fail closed when mcp_keys.db cannot be read.
+        std::fs::write(duduclaw_core::mcp_key_store::store_path(home.path()), b"corrupt, not sqlite").unwrap();
+        assert!(!verify_internal_key(home.path(), &key));
+        assert!(provision(home.path(), true, None).is_err());
+    }
+
+    /// RM-134 third review (Medium): the first v1.82 start — the one that
+    /// creates `mcp_keys.db` — never adopts a `gateway-internal` entry already
+    /// in the v1.81 config. With two such entries, one of them planted with a
+    /// future `created_at`, it mints a fresh key, records only that one, and
+    /// neither old entry authenticates; both are listed once as ignored
+    /// legacy entries; the employees' `.mcp.json` registrations, rewritten
+    /// later in the same boot, carry the new key.
+    #[test]
+    fn first_start_mints_a_fresh_internal_key_and_ignores_every_config_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let older = "ddc_prod_77777777777777777777777777777777";
+        let planted = "ddc_prod_88888888888888888888888888888888";
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "[mcp_keys.\"{older}\"]\nclient_id = \"{INTERNAL_CLIENT_ID}\"\nis_external = false\n\
+                 created_at = \"{}\"\nscopes = [\"admin\"]\n\n\
+                 [mcp_keys.\"{planted}\"]\nclient_id = \"{INTERNAL_CLIENT_ID}\"\nis_external = false\n\
+                 created_at = \"{}\"\nscopes = [\"admin\"]\n",
+                days_ago(3),
+                days_ago(-400),
+            ),
+        )
+        .unwrap();
+        assert!(!duduclaw_core::mcp_key_store::store_path(home.path()).exists(), "a v1.81 home");
+
+        let minted = provision(home.path(), true, None).unwrap();
+        assert!(minted != older && minted != planted, "a fresh key, never a config entry");
+        assert!(is_minted_shape(&minted));
+        let recorded = duduclaw_core::mcp_key_store::internal_key_hashes(home.path())
+            .unwrap()
+            .expect("the store exists after the first start");
+        assert_eq!(
+            recorded,
+            HashSet::from([duduclaw_core::mcp_key_store::digest(&minted)]),
+            "exactly the new fingerprint is recorded"
+        );
+        assert!(verify_internal_key(home.path(), &minted));
+        for old in [older, planted] {
+            assert!(!verify_internal_key(home.path(), old), "{old} must not authenticate");
+            assert!(matches!(
+                duduclaw_core::mcp_key_store::resolve(home.path(), old).unwrap(),
+                duduclaw_core::mcp_key_store::Authority::Unknown
+            ));
+        }
+        assert_eq!(valid_internal_keys(home.path()), vec![minted.clone()]);
+        // Kept in config, so the keys page can list them.
+        let text = config_text(home.path());
+        assert!(text.contains(older) && text.contains(planted) && text.contains(&minted));
+
+        // Listed once (by hint, never a fingerprint) as ignored legacy entries.
+        let report = crate::mcp_keys_lifecycle::migrate_config_keys(home.path()).unwrap();
+        let mut ignored = report.ignored.clone();
+        ignored.sort();
+        let mut expected =
+            vec![duduclaw_core::mcp_key_store::key_hint(older), duduclaw_core::mcp_key_store::key_hint(planted)];
+        expected.sort();
+        assert_eq!(ignored, expected);
+        // Later starts keep handing out the recorded key.
+        assert_eq!(provision(home.path(), true, None).unwrap(), minted);
+        assert!(!verify_internal_key(home.path(), older) && !verify_internal_key(home.path(), planted));
+
+        // Employee registrations: `server.rs` exports exactly the value
+        // returned here (`set_internal_mcp_api_key`) and the boot fixup that
+        // runs later in the same boot (`ensure_mcp_absolute_paths_all_except`)
+        // overwrites a stale `DUDUCLAW_MCP_API_KEY` in every employee's
+        // `.mcp.json` with it — pinned by
+        // `duduclaw_agent::mcp_template::tests::mcp_json_migration_overwrites_stale_forward_api_key`
+        // (the process-wide key is first-write-wins, so it is not set here).
+    }
+
+    fn is_minted_shape(key: &str) -> bool {
+        key.strip_prefix("ddc_prod_").is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
     }
 
     #[test]
@@ -755,20 +991,39 @@ mod tests {
         assert!(content.contains(&k1));
     }
 
+    /// Record `key` as the gateway's own (what an earlier start did).
+    fn record(dir: &Path, key: &str, created_at: DateTime<Utc>) {
+        duduclaw_auth::mcp_keys::McpKeyStore::open(dir).unwrap().record_internal_key(key, created_at).unwrap();
+    }
+
     #[test]
     fn young_key_is_reused_without_rewriting_config() {
         let dir = tempfile::tempdir().unwrap();
         let existing = "ddc_prod_11111111111111111111111111111111";
         write_internal_key(dir.path(), existing, &days_ago(10));
+        record(dir.path(), existing, Utc::now() - chrono::Duration::days(10));
         let before = config_text(dir.path());
 
         let key = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
-        assert_eq!(key, existing, "a 10-day-old key still authenticates");
+        assert_eq!(key, existing, "a recorded 10-day-old key still authenticates");
         assert_eq!(
             config_text(dir.path()),
             before,
             "steady state must not rewrite config.toml (mtime feeds the auth cache)"
         );
+    }
+
+    /// Third review (Medium): without `mcp_keys.db` (the first start) even a
+    /// young, well-formed entry is not adopted.
+    #[test]
+    fn first_start_never_adopts_a_young_config_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = "ddc_prod_11111111111111111111111111111111";
+        write_internal_key(dir.path(), existing, &days_ago(1));
+        let key = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
+        assert_ne!(key, existing);
+        assert!(!verify_internal_key(dir.path(), existing));
+        assert!(verify_internal_key(dir.path(), &key));
     }
 
     #[test]
@@ -852,6 +1107,9 @@ mod tests {
             ),
         )
         .unwrap();
+        // Both recorded by earlier starts (e.g. one rotated away from).
+        record(dir.path(), older, Utc::now() - chrono::Duration::days(20));
+        record(dir.path(), newer, Utc::now() - chrono::Duration::days(2));
 
         assert_eq!(ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap(), newer);
     }
@@ -915,14 +1173,27 @@ scopes = ["memory:read"]
         assert!(content.contains(&key));
     }
 
-    /// Future-dated `created_at` (clock skew) is age-0 for the authenticator,
-    /// so rotation must agree — otherwise every boot mints a new key.
+    /// Third review (Medium): a `created_at` within the clock-skew allowance
+    /// is age 0 (reused, so a skewed clock does not mint on every boot); one
+    /// further in the future is not credible — the authenticator refuses it,
+    /// so it is never reused or verified, even when recorded.
     #[test]
-    fn future_dated_key_is_reused_not_rotated() {
+    fn future_dated_key_beyond_the_skew_allowance_is_never_reused() {
         let dir = tempfile::tempdir().unwrap();
-        let existing = "ddc_prod_cccccccccccccccccccccccccccccccc";
-        write_internal_key(dir.path(), existing, &days_ago(-10));
-        assert_eq!(ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap(), existing);
+        let skewed = "ddc_prod_cccccccccccccccccccccccccccccccc";
+        let skew = Utc::now() + chrono::Duration::seconds(60);
+        write_internal_key(dir.path(), skewed, &skew.to_rfc3339());
+        record(dir.path(), skewed, Utc::now());
+        assert_eq!(ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap(), skewed);
+
+        let far = tempfile::tempdir().unwrap();
+        let planted = "ddc_prod_dddddddddddddddddddddddddddddddd";
+        write_internal_key(far.path(), planted, &days_ago(-10));
+        record(far.path(), planted, Utc::now() + chrono::Duration::days(10));
+        let key = ensure_internal_mcp_key_for_gateway(far.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
+        assert_ne!(key, planted, "a far-future entry never wins");
+        assert!(!verify_internal_key(far.path(), planted));
+        assert!(!valid_internal_keys(far.path()).contains(&planted.to_string()));
     }
 
     /// The contract with `duduclaw-cli/src/mcp_auth.rs`: that module refuses

@@ -169,3 +169,8 @@ fn test_parse_scopes_unknown_returns_invalid_scope() {
 /// Scope vocabulary, the tool → scope table, and the cross-crate drift
 /// guards that pin both against `duduclaw_core`.
 mod scope_table;
+
+/// RM-134: the hashed key store — success, expired / disabled / deleted /
+/// unknown, unreadable store, the legacy read path and the throttled
+/// `last_used_at`.
+mod key_store;

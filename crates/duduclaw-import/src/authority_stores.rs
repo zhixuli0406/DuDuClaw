@@ -173,10 +173,78 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
     Ok(())
 }
 
+/// The v1.82 `mcp_keys.db` catalog (RM-134), pinned byte-for-byte.
+pub(super) const MCP_KEYS_V182: &str = include_str!("mcp-keys-v182.sql");
+
+/// RM-134 `mcp_keys.db`: dashboard MCP API keys, stored as SHA-256 digests.
+/// A digest is never evidence of authority in the new installation, so every
+/// live key becomes a named re-issue obligation. Only the label and the
+/// delete marker are authorized for reading; digests, client ids, scopes,
+/// creators and timestamps all stay behind.
+pub(super) fn mcp_keys(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'_>)->Result<()> {
+    use rusqlite::{Connection,OpenFlags,hooks::{AuthAction,AuthContext,Authorization}};
+    let temp=tempfile::tempdir()?;let path=temp.path().join("source.db");
+    crate::sqlite::copy_bounded(input,&path)?;
+    if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
+    let mut conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    crate::sqlite::harden(&mut conn)?;
+    // The v1.82 store pins `user_version` (the catalog sets it); every other
+    // authority store keeps the `check_sqlite` rule of 0. Same quick_check.
+    let expected=Connection::open_in_memory()?;expected.execute_batch(MCP_KEYS_V182)?;
+    let version=|c:&Connection|c.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0));
+    if version(&conn)?!=version(&expected)? {return Err(Error::Schema);}
+    if conn.query_row("PRAGMA quick_check",[],|r|r.get::<_,String>(0))?!="ok" {return Err(Error::Content);}
+    if crate::sqlite::schema(&conn)?!=crate::sqlite::schema(&expected)? {return Err(Error::Schema);}
+    conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
+        AuthAction::Select=>Authorization::Allow,
+        AuthAction::Read {table_name:"mcp_api_keys",column_name:"name"|"deleted_at"}
+            if c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
+        _=>Authorization::Deny,
+    }))?;
+    let mut query=conn.prepare("SELECT name FROM main.mcp_api_keys WHERE deleted_at IS NULL ORDER BY name")?;
+    let mut rows=query.query([])?;
+    while let Some(row)=rows.next()? {
+        let name:String=row.get(0)?;
+        let name=name.trim();
+        if name.is_empty() || name.chars().count()>60 || name.chars().any(char::is_control) {return Err(Error::Content);}
+        reentry(builder,C::Connector,&format!("mcp_key:{name}"),vec![])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn request(kind:SourceKind,title:&str)->ImportRequest {ImportRequest {version:1,migration_id:RequestId([4;16]),employee:None,source_id:"old:store".into(),kind,title:title.into(),legacy_agent:Some("sales".into()),has_wal:false,blob_handle:None}}
+    fn mcp_keys_db(extra:&str)->tempfile::NamedTempFile {
+        let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
+        conn.execute_batch(MCP_KEYS_V182).unwrap();
+        conn.execute_batch(&format!("INSERT INTO mcp_api_keys(id,key_hash,name,client_id,is_external,env,hint,scopes,created_by,created_at)
+            VALUES ('mk_a','SECRET-DIGEST-A','Zapier','SECRET-CLIENT',1,'prod','ddc_prod_…SECRET','[\"SECRET-SCOPE\"]','SECRET-CREATOR','2026-11-01T00:00:00Z');
+            INSERT INTO mcp_api_keys(id,key_hash,name,client_id,is_external,env,hint,scopes,created_at,deleted_at)
+            VALUES ('mk_b','SECRET-DIGEST-B','Deleted one','c',0,'dev','h','[]','2026-11-01T00:00:00Z','2026-11-02T00:00:00Z');
+            {extra} PRAGMA wal_checkpoint(TRUNCATE);")).unwrap();
+        drop(conn);file
+    }
+    #[test]
+    fn authority_mcp_keys_become_reissue_obligations_without_digests() {
+        let file=mcp_keys_db("");
+        let p=extract(&request(SourceKind::AuthorityMcpKeysSqlite,"mcp_keys.db"),std::fs::File::open(file.path()).unwrap(),None).unwrap();
+        assert_eq!(p.len(),1,"deleted keys are not re-issued");
+        assert_eq!(p[0].category,C::Connector);
+        assert!(p[0].fields.iter().any(|f|f.name=="requires_reentry"));
+        assert!(p[0].fields.iter().any(|f|f.name=="name"&&matches!(&f.value,ProposalValue::Text{value} if value=="mcp_key:Zapier")));
+        assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));
+    }
+    #[test]
+    fn authority_mcp_keys_refuse_schema_drift_and_bad_labels() {
+        for extra in ["CREATE TABLE planted(x TEXT);","CREATE TRIGGER planted AFTER INSERT ON mcp_api_keys BEGIN SELECT 1; END;","PRAGMA user_version=2;","PRAGMA user_version=0;"] {
+            let file=mcp_keys_db(extra);
+            assert!(extract(&request(SourceKind::AuthorityMcpKeysSqlite,"mcp_keys.db"),std::fs::File::open(file.path()).unwrap(),None).is_err(),"{extra}");
+        }
+        let file=mcp_keys_db("INSERT INTO mcp_api_keys(id,key_hash,name,client_id,is_external,env,hint,scopes,created_at) VALUES ('mk_c','d','bad\u{7}label','c',0,'dev','h','[]','2026-11-01T00:00:00Z');");
+        assert_eq!(extract(&request(SourceKind::AuthorityMcpKeysSqlite,"mcp_keys.db"),std::fs::File::open(file.path()).unwrap(),None).err(),Some(Error::Content));
+    }
     fn approval_db()->tempfile::NamedTempFile {approval_db_with(crate::catalog::APPROVALS_V1793)}
     fn approval_db_with(catalog_sql:&str)->tempfile::NamedTempFile {
         let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();

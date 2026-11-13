@@ -213,9 +213,82 @@ pub(crate) fn resolve_audit_agent(
     if let Some(call) = crate::mcp_isolation::current() { return call.agent.clone(); }
     let Some(principal) = principal else { return default_agent.to_string(); };
     if principal.is_external { return principal.client_id.clone(); }
+    // v1.82 third review: a remote (HTTP) non-gateway-internal principal is
+    // attributed to its key's binding, never to the server's own employee.
+    match current_remote_binding() {
+        Some(RemoteBinding::Bound(agent)) => return agent,
+        Some(RemoteBinding::Unbound) => return principal.client_id.clone(),
+        None => {}
+    }
     verified_delegation_context(home, default_agent)
         .map(|context| context.sender)
         .unwrap_or_else(|| default_agent.to_string())
+}
+
+// ── Remote (HTTP) principal binding (v1.82, RM-134 third review) ─────────────
+
+/// The acting employee of a call the HTTP MCP server dispatches for a
+/// non-external principal other than the verified gateway-internal key
+/// (`mcp::RemoteAccess`): the key's stored binding, or none. Set by the
+/// dispatcher (`McpDispatcher::dispatch_tool_call`) and by `tools/list`
+/// around everything that runs for such a call; absent on stdio and for
+/// external / gateway-internal callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteBinding {
+    /// The key is bound to this existing, non-deleted employee.
+    Bound(String),
+    /// No valid binding: every identity resolution fails closed.
+    Unbound,
+}
+
+tokio::task_local! {
+    static REMOTE_BINDING: RemoteBinding;
+}
+
+/// Run `future` with `binding` as the remote principal's acting employee.
+pub(crate) fn with_remote_binding<F: std::future::Future>(
+    binding: RemoteBinding,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    REMOTE_BINDING.scope(binding, Box::pin(future))
+}
+
+/// The remote principal's binding for the current call, if one is set.
+pub(crate) fn current_remote_binding() -> Option<RemoteBinding> {
+    REMOTE_BINDING.try_with(Clone::clone).ok()
+}
+
+/// A remote (HTTP) principal has no valid employee binding: an identity
+/// lookup refuses instead of falling back to the server's `default_agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteBindingMissing;
+
+/// [`acting_agent_id`] that reports a missing remote binding as an error.
+///
+/// For a remote principal (a [`RemoteBinding`] is set) the acting employee is
+/// the key's binding — which is, by construction, the key's own client id —
+/// and nothing else: no binding, or a caller that is not the bound id, is
+/// [`RemoteBindingMissing`]; never `default_agent`. Elsewhere unchanged.
+pub(crate) fn try_acting_agent_id<'a>(
+    caller_client_id: &'a str,
+    default_agent: &'a str,
+) -> std::result::Result<&'a str, RemoteBindingMissing> {
+    match current_remote_binding() {
+        Some(RemoteBinding::Bound(agent)) if agent == caller_client_id && !caller_client_id.is_empty() => {
+            return Ok(caller_client_id);
+        }
+        Some(_) => return Err(RemoteBindingMissing),
+        None => {}
+    }
+    Ok(
+        if caller_client_id.is_empty()
+            || caller_client_id == duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
+        {
+            default_agent
+        } else {
+            caller_client_id
+        },
+    )
 }
 
 /// Which agent is actually acting behind `caller_client_id`?
@@ -237,14 +310,15 @@ pub(crate) fn resolve_audit_agent(
 /// client_id is an external client and is returned unchanged: an external
 /// caller must NEVER inherit the process's default agent, or one API key would
 /// read every internal agent's grants, files and recordings.
+///
+/// v1.82 (RM-134 third review): for a remote (HTTP) principal the answer is
+/// the key's binding ([`try_acting_agent_id`]); without one it is the
+/// untrusted sentinel (`duduclaw_core::UNTRUSTED_AGENT_ID`, an identity that
+/// owns nothing and that every per-agent gate refuses) — never
+/// `default_agent`. The dispatcher refuses such a call before any handler
+/// runs; this is the fail-closed backstop for code that cannot return an error.
 pub(crate) fn acting_agent_id<'a>(caller_client_id: &'a str, default_agent: &'a str) -> &'a str {
-    if caller_client_id.is_empty()
-        || caller_client_id == duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
-    {
-        default_agent
-    } else {
-        caller_client_id
-    }
+    try_acting_agent_id(caller_client_id, default_agent).unwrap_or(duduclaw_core::UNTRUSTED_AGENT_ID)
 }
 
 /// Extract the human-readable text portion of an MCP tool result envelope

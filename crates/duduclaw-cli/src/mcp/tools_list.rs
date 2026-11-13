@@ -95,6 +95,237 @@ pub(crate) const PROCESS_AGENT_TOOLS: &[&str] = &[
     "office_script",
 ];
 
+/// Every tool whose handler acts for the MCP process's `default_agent` (or a
+/// value derived from it) rather than for the authenticated principal —
+/// enumerated from the `GatewayHandler::invoke_inner` match in
+/// `mcp/dispatch.rs` (v1.82, RM-134 review): each arm that passes
+/// `default_agent`, `wiki_agent` (= `default_agent` for every non-external
+/// key) or `shared_wiki_reader` (same) to its handler.
+///
+/// This is a SUPERSET of [`PROCESS_AGENT_TOOLS`]. [`PROCESS_AGENT_TOOLS`]
+/// stays the set hidden from external keys and scoped non-employee callers
+/// (unchanged, so e.g. an external `messaging:send` key keeps `send_message`
+/// and an external key keeps its own `external/<id>` wiki). This set is what
+/// every non-external key other than the gateway's own internal key is
+/// refused on the HTTP MCP server ([`remote_process_agent_tool_refused`]):
+/// there the process agent is one fixed employee for every caller, so each of
+/// these would act for someone else.
+///
+/// Groups listed by reference and checked by [`acts_for_process_agent`]:
+/// [`COMPUTER_USE_TOOLS`], [`COMPUTER_WORKSPACE_TOOLS`], [`FORK_TOOLS`],
+/// `KNOWLEDGE_TOOLS` and every `odoo_*` tool (`handle_odoo_tool` takes
+/// `default_agent`).
+///
+/// TODO(v1.83): replace with an `effective_agent` resolved from the principal
+/// and passed to every handler (then this set and the HTTP refusal go away).
+pub(crate) const DEFAULT_AGENT_HANDLER_TOOLS: &[&str] = &[
+    // Messaging / beliefs / co-drive / decisions / planning
+    "send_message",
+    "belief_submit",
+    "belief_settle",
+    "belief_stats",
+    "codrive_run",
+    "codrive_status",
+    "decision_list",
+    "decision_resolve",
+    "plan_start",
+    "plan_get",
+    "plan_update_step",
+    // Cron / reminders / tasks / agents
+    "list_cron_tasks",
+    "list_reminders",
+    "cancel_reminder",
+    "list_agents",
+    "task_status",
+    "agent_status",
+    "tasks_list",
+    "tasks_renew",
+    "activity_list",
+    "discovery_catalog",
+    "discovery_list",
+    "discovery_tree",
+    "discovery_artifact",
+    "discovery_cancel",
+    // Skills / evolution / feedback
+    "skill_gaps",
+    "skill_list",
+    "skill_hub_install",
+    "skill_extract",
+    "submit_feedback",
+    "evolution_status",
+    "shared_skill_share",
+    "shared_skill_adopt",
+    // Channel history, identity, program execution, OS update attribution
+    "group_history_read",
+    "identity_resolve",
+    "execute_program",
+    "os_apply_update",
+    // Agent wiki (`wiki_agent`) and shared wiki (`shared_wiki_reader` /
+    // `handle_shared_wiki_write`): the whole `wiki_*` family
+    "wiki_ls",
+    "wiki_read",
+    "wiki_write",
+    "wiki_search",
+    "wiki_lint",
+    "wiki_stats",
+    "wiki_export",
+    "wiki_dedup",
+    "wiki_graph",
+    "wiki_rebuild_fts",
+    "wiki_trust_audit",
+    "wiki_trust_history",
+    "wiki_share",
+];
+
+/// Does `name`'s handler act for the process's `default_agent`?
+/// [`PROCESS_AGENT_TOOLS`] ∪ [`DEFAULT_AGENT_HANDLER_TOOLS`] ∪ the
+/// computer-use, fork, knowledge and `odoo_*` groups. Exact names only,
+/// except the `odoo_` family, which is one handler (`handle_odoo_tool`).
+pub(crate) fn acts_for_process_agent(name: &str) -> bool {
+    PROCESS_AGENT_TOOLS.contains(&name)
+        || DEFAULT_AGENT_HANDLER_TOOLS.contains(&name)
+        || COMPUTER_USE_TOOLS.contains(&name)
+        || COMPUTER_WORKSPACE_TOOLS.contains(&name)
+        || FORK_TOOLS.contains(&name)
+        || super::KNOWLEDGE_TOOLS.contains(&name)
+        || name.starts_with("odoo_")
+}
+
+/// Is this the verified gateway-internal principal: the `gateway-internal`
+/// client, non-external, authenticated through the fingerprint the gateway
+/// recorded as its own internal key ([`PrincipalKind::GatewayInternal`]),
+/// in a process whose own employee identity (`default_agent`, resolved and
+/// token-verified at startup, as today) is set and not the untrusted
+/// sentinel? Decided from the authenticated principal's kind — never from
+/// the filesystem.
+///
+/// [`PrincipalKind::GatewayInternal`]: crate::mcp_auth::PrincipalKind::GatewayInternal
+pub(crate) fn is_verified_gateway_internal(
+    principal: &crate::mcp_auth::Principal,
+    kind: Option<&crate::mcp_auth::PrincipalKind>,
+    default_agent: &str,
+) -> bool {
+    !principal.is_external
+        && principal.client_id == duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
+        && kind == Some(&crate::mcp_auth::PrincipalKind::GatewayInternal)
+        && !default_agent.trim().is_empty()
+        && default_agent != duduclaw_core::UNTRUSTED_AGENT_ID
+}
+
+/// v1.82 (RM-134 third review, High): on a remote-bearer transport (the HTTP
+/// MCP server), is this a non-external principal OTHER than the verified
+/// gateway-internal one ([`is_verified_gateway_internal`])? Default deny:
+/// a per-agent key whose employee exists, one whose employee was removed or
+/// renamed, a key created under an alias / display name, any unknown
+/// internal client id, a legacy `[mcp_keys]` entry and a call with no
+/// authority decision all answer `true`. Decided from the principal's kind
+/// only — the filesystem is never consulted.
+pub(crate) fn remote_non_gateway_internal(
+    principal: &crate::mcp_auth::Principal,
+    kind: Option<&crate::mcp_auth::PrincipalKind>,
+    default_agent: &str,
+) -> bool {
+    !principal.is_external && !is_verified_gateway_internal(principal, kind, default_agent)
+}
+
+/// On a remote-bearer transport, must this caller be refused `name` because
+/// the tool acts for the process agent? True for every
+/// [`remote_non_gateway_internal`] principal and any tool in the refused
+/// union ([`acts_for_process_agent`]: [`PROCESS_AGENT_TOOLS`] ∪
+/// [`DEFAULT_AGENT_HANDLER_TOOLS`] ∪ the computer-use, fork, knowledge and
+/// `odoo_*` groups), whatever scopes the key holds. The dispatch gate (error
+/// class `per_agent_key_process_tool`) and `tools/list` both read it, so
+/// discoverable ⇔ callable.
+pub(crate) fn remote_process_agent_tool_refused(
+    name: &str,
+    principal: &crate::mcp_auth::Principal,
+    kind: Option<&crate::mcp_auth::PrincipalKind>,
+    default_agent: &str,
+) -> bool {
+    remote_non_gateway_internal(principal, kind, default_agent) && acts_for_process_agent(name)
+}
+
+/// What the HTTP MCP server makes of an authenticated principal (v1.82,
+/// RM-134 third review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteAccess {
+    /// An external key (OAuth included): the external gates decide, unchanged.
+    External,
+    /// The verified gateway-internal principal: unchanged.
+    GatewayInternal,
+    /// Any other non-external principal whose stored key is bound to an
+    /// employee that exists and is not deleted: it acts as THAT employee
+    /// (never the server's `default_agent`) and is refused the
+    /// process-agent union.
+    Bound(String),
+    /// Any other non-external principal without a valid binding: refused
+    /// every tool. The reason is for the audit record only.
+    Unbound(&'static str),
+}
+
+impl RemoteAccess {
+    /// Whether this caller is refused the process-agent union for `name`.
+    pub(crate) fn refuses_process_agent_tool(&self, name: &str) -> bool {
+        matches!(self, Self::Bound(_) | Self::Unbound(_)) && acts_for_process_agent(name)
+    }
+}
+
+/// Classify the principal of a call on the HTTP MCP server from the
+/// authenticated call it arrived with (`mcp_auth::current_call_matches`).
+pub(crate) fn remote_access(
+    home_dir: &Path,
+    principal: &crate::mcp_auth::Principal,
+    default_agent: &str,
+) -> RemoteAccess {
+    let call = crate::mcp_auth::current_call_matches(principal);
+    remote_access_for(home_dir, principal, call.as_ref().map(|c| c.kind()), default_agent)
+}
+
+/// [`remote_access`] with the authority's decision passed in (tests).
+///
+/// The union refusal follows from the kind alone; only the separate
+/// "binding names an existing, non-deleted employee" check reads the
+/// filesystem (`duduclaw_core::mcp_key_store::key_binding_state`). Fail
+/// closed: no binding, a binding that is not the key's own client id, a
+/// missing, deleted, unreadable or re-created (younger than the key)
+/// employee are all [`RemoteAccess::Unbound`].
+pub(crate) fn remote_access_for(
+    home_dir: &Path,
+    principal: &crate::mcp_auth::Principal,
+    kind: Option<&crate::mcp_auth::PrincipalKind>,
+    default_agent: &str,
+) -> RemoteAccess {
+    use duduclaw_core::mcp_key_store::BindingState;
+    if principal.is_external {
+        return RemoteAccess::External;
+    }
+    if !remote_non_gateway_internal(principal, kind, default_agent) {
+        return RemoteAccess::GatewayInternal;
+    }
+    let Some(crate::mcp_auth::PrincipalKind::Stored { agent_binding: Some(binding), key_created_at }) = kind else {
+        return RemoteAccess::Unbound("no_binding");
+    };
+    if *binding != principal.client_id {
+        return RemoteAccess::Unbound("binding_mismatch");
+    }
+    // Fourth review (Medium 1): also refused when the employee's directory
+    // is younger than the key (`employee_recreated`): a key never predates
+    // the employee it is bound to, so this is a later employee re-created
+    // under a removed one's id.
+    match duduclaw_core::mcp_key_store::key_binding_state(home_dir, binding, *key_created_at) {
+        BindingState::Live => RemoteAccess::Bound(binding.clone()),
+        other => RemoteAccess::Unbound(other.as_str()),
+    }
+}
+
+/// The one external message for [`RemoteAccess::Unbound`]. The internal
+/// reason goes to the audit record only.
+pub(crate) const REMOTE_UNBOUND_MESSAGE: &str = "This MCP key is not bound to an existing AI employee, so the MCP \
+    HTTP server refuses every tool for it. Per-employee keys are created by the employee's id on the dashboard's \
+    MCP keys page; a key whose employee was removed, renamed or deleted stops working for good, also for a later \
+    employee with the same id. \
+    此 MCP 金鑰沒有綁定到現存的 AI 員工，MCP HTTP 伺服器拒絕它呼叫任何工具。";
+
 /// Does `tools/list` for this caller list only the tools its scopes reach?
 ///
 /// True for every principal that holds no `admin` scope and is not an AI
@@ -251,11 +482,37 @@ pub(crate) async fn handle_tools_list_for_agent(
     home_dir: &Path,
     default_agent: &str,
 ) -> Value {
-    let tools: Vec<Value> = visible_tools(principal, home_dir, default_agent)
-        .await
-        .into_iter()
-        .map(build_tool_schema)
-        .collect();
+    handle_tools_list_for_transport(id, principal, home_dir, default_agent, false).await
+}
+
+/// [`handle_tools_list_for_agent`] for a transport that may serve remote
+/// bearer callers (`McpDispatcher::is_remote_bearer`, the HTTP MCP server).
+/// There, the same classification as the dispatch gate ([`remote_access`]):
+/// an unbound non-external principal is shown nothing; a bound one is listed
+/// as ITS employee (never the server's `default_agent`) without the
+/// process-agent union; external keys and the verified gateway-internal key
+/// are listed as before. Discoverable ⇔ callable.
+pub(crate) async fn handle_tools_list_for_transport(
+    id: &Value,
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    remote_bearer: bool,
+) -> Value {
+    let access = remote_bearer.then(|| remote_access(home_dir, principal, default_agent));
+    let tools: Vec<&'static ToolDef> = match &access {
+        Some(RemoteAccess::Unbound(_)) => Vec::new(),
+        Some(RemoteAccess::Bound(agent)) => {
+            let listed = with_remote_binding(
+                RemoteBinding::Bound(agent.clone()),
+                visible_tools(principal, home_dir, agent),
+            )
+            .await;
+            listed.into_iter().filter(|t| !acts_for_process_agent(t.name)).collect()
+        }
+        _ => visible_tools(principal, home_dir, default_agent).await,
+    };
+    let tools: Vec<Value> = tools.into_iter().map(build_tool_schema).collect();
     jsonrpc_response(id, serde_json::json!({ "tools": tools }))
 }
 

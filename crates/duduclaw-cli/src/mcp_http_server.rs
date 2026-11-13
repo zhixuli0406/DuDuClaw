@@ -263,10 +263,28 @@ fn load_credential_hints(home: &std::path::Path, resource: &str) -> std::collect
                 let Some(client) = entry.get("client_id").and_then(|v| v.as_str()) else { continue; };
                 let Some(created) = entry.get("created_at").and_then(|v| v.as_str())
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) else { continue; };
-                if now.signed_duration_since(created).num_days().max(0) <= 30 {
+                // RM-134: a config entry the authority store would not accept
+                // (unknown once the store exists, not the recorded internal
+                // key) earns no admission bucket of its own.
+                use duduclaw_core::mcp_key_store::Authority;
+                let accepted = match duduclaw_core::mcp_key_store::resolve(home, key) {
+                    Ok(Authority::Legacy(_)) => true,
+                    Ok(Authority::Internal(_)) => client == duduclaw_core::mcp_key_store::RESERVED_INTERNAL_CLIENT_ID,
+                    _ => false,
+                };
+                if accepted && duduclaw_core::mcp_key_store::legacy_age_accepts(created.with_timezone(&chrono::Utc), now) {
                     hints.insert(digest(key), client.to_string());
                 }
             }
+        }
+    }
+    // RM-134: dashboard keys live in the hashed store; its digest is the same
+    // `digest(raw)` this map is keyed by. Inserted last so a store row wins
+    // over a not-yet-removed config copy. An unreadable store gives no hints
+    // (the live authenticator then denies those keys anyway).
+    if let Ok(keys) = duduclaw_core::mcp_key_store::usable_keys(home, now) {
+        for key in keys.into_iter().take(MAX_STATIC_HINTS) {
+            hints.insert(key.key_hash, key.client_id);
         }
     }
     hints
@@ -590,6 +608,16 @@ fn authenticate_bearer_or_query(
 
 // ── Router builder (extracted for testability) ────────────────────────────────
 
+/// The dispatcher every HTTP route uses. v1.82 (RM-134): every caller here is
+/// a remote bearer, so every non-external key other than the verified
+/// gateway-internal one is refused (and not shown) the tools that act for
+/// this server's fixed `default_agent`, acts as its own bound employee for
+/// the rest, and is refused everything without a valid binding
+/// (`McpDispatcher::for_remote_bearer`, `mcp::remote_access`).
+fn http_dispatcher(dispatcher: McpDispatcher) -> Arc<McpDispatcher> {
+    Arc::new(dispatcher.for_remote_bearer())
+}
+
 /// Build the Axum router with all MCP HTTP routes attached to `state`.
 /// Extracted from `run` so integration tests can call routes without binding a port.
 pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router {
@@ -597,7 +625,7 @@ pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router
     let state = HttpState {
         resource: format!("{origin}/mcp"),
         external_origin: origin,
-        dispatcher: Arc::new(dispatcher),
+        dispatcher: http_dispatcher(dispatcher),
         sse_store: Arc::new(SseEventStore::new()),
         call_timeout: cfg.call_timeout,
         home_dir: cfg.home_dir.clone(),
@@ -715,7 +743,7 @@ pub async fn run(mut cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result
     let state = HttpState {
         resource: format!("{origin}/mcp"),
         external_origin: origin,
-        dispatcher: Arc::new(dispatcher),
+        dispatcher: http_dispatcher(dispatcher),
         sse_store: Arc::new(SseEventStore::new()),
         call_timeout: cfg.call_timeout,
         home_dir: cfg.home_dir.clone(),
@@ -1290,6 +1318,61 @@ pub mod tests {
         }
     }
 
+    /// RM-134: the http-server authenticates dashboard keys from the hashed
+    /// store, gives them their own quota bucket, and refuses an expired or a
+    /// disabled key with the same external message.
+    #[tokio::test]
+    async fn http_bearer_reads_the_hashed_key_store() {
+        use duduclaw_auth::mcp_keys::{Expiry, KeyBinding, McpKeyStore, NewMcpKey};
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        let store = McpKeyStore::open(home.path()).unwrap();
+        let issue = |name: &str| {
+            let created = store.create(NewMcpKey {
+                name: name.into(), client_id: format!("{name}-client"), binding: KeyBinding::Integration, env: "prod".into(),
+                scopes: vec!["memory:read".into()], expiry: Expiry::Days(30), created_by: Some("admin".into()),
+            }, chrono::Utc::now()).unwrap();
+            (created.secret, created.key.id)
+        };
+        let (live, _) = issue("live");
+        let (off, off_id) = issue("off");
+        let (old, old_id) = issue("old");
+        store.set_disabled(&off_id, true, "admin", chrono::Utc::now()).unwrap();
+        drop(store);
+        rusqlite::Connection::open(duduclaw_core::mcp_key_store::store_path(home.path())).unwrap()
+            .execute("UPDATE mcp_api_keys SET expires_at = '2020-01-01T00:00:00Z' WHERE id = ?1", [&old_id]).unwrap();
+        let hints = load_credential_hints(home.path(), "");
+        assert_eq!(hints.get(&duduclaw_core::mcp_key_store::digest(&live)).map(String::as_str), Some("live-client"));
+        assert!(!hints.contains_key(&duduclaw_core::mcp_key_store::digest(&off)));
+
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().into());
+        let router = build_router(&cfg, make_test_dispatcher());
+        let send = |key: String| {
+            let router = router.clone();
+            async move {
+                let request = Request::builder().method("POST").uri("/mcp")
+                    .header("authorization", format!("Bearer {key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)).unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+                (status, String::from_utf8_lossy(&body).to_string())
+            }
+        };
+        assert_eq!(send(live).await.0, StatusCode::OK);
+        let (off_status, off_body) = send(off).await;
+        let (old_status, old_body) = send(old).await;
+        assert_eq!((off_status, old_status), (StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED));
+        assert_eq!(off_body, old_body, "expired and disabled are indistinguishable from outside");
+        assert!(off_body.contains(crate::mcp_auth::KEY_INACTIVE_MESSAGE));
+        // An unreadable store denies.
+        std::fs::write(duduclaw_core::mcp_key_store::store_path(home.path()), b"corrupt store bytes, not sqlite").unwrap();
+        let (status, body) = send("ddc_prod_0123456789abcdef0123456789abcdef".into()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("fail-closed"), "{body}");
+    }
+
     #[test]
     fn non_loopback_requires_https_proxy_or_explicit_insecure_opt_in() {
         let mut cfg = HttpServerConfig::new("0.0.0.0:8765".parse().unwrap(), "/tmp".into());
@@ -1376,6 +1459,14 @@ pub mod tests {
         assert_eq!(router.oneshot(request).await.unwrap().status(), StatusCode::OK);
     }
 
+    /// v1.82 (RM-134): the HTTP transport always serves through a
+    /// remote-bearer dispatcher; stdio dispatchers are not.
+    #[test]
+    fn http_routes_use_a_remote_bearer_dispatcher() {
+        assert!(!make_test_dispatcher().is_remote_bearer());
+        assert!(http_dispatcher(make_test_dispatcher()).is_remote_bearer());
+    }
+
     #[test]
     fn registration_has_dedicated_global_creation_limit() {
         let budget = RegistrationBudget::default();
@@ -1411,7 +1502,7 @@ pub mod tests {
                 external_origin: "http://127.0.0.1:8765".into(),
                 resource: "http://127.0.0.1:8765/mcp".into(),
                 home_dir: home.into(),
-                dispatcher: Arc::new(make_test_dispatcher()),
+                dispatcher: http_dispatcher(make_test_dispatcher()),
                 sse_store: Arc::new(SseEventStore::new()),
                 call_timeout: Duration::from_secs(30),
             },

@@ -54,9 +54,76 @@ pub const MCP_SCOPE_STRINGS: &[&str] = &[
     "admin",
 ];
 
+/// The scopes an operator may grant to an EXTERNAL MCP key — the backend's
+/// single source for them (RM-157). `duduclaw-cli`'s
+/// `mcp_auth::EXTERNALLY_GRANTABLE_SCOPES` is derived from this list (its
+/// `externally_grantable_scopes_derive_from_core` test pins the two), the
+/// dashboard's `mcp_keys.list` returns it as `effective_scopes`, and
+/// `mcp_keys.create` refuses any scope outside it. Credential-adjacent
+/// connector scopes, execution-class scopes, the person registry and `admin`
+/// are deliberately absent: external surfaces never reach them regardless of
+/// what a key claims.
+pub const EXTERNALLY_GRANTABLE_SCOPE_STRINGS: [&str; 5] =
+    ["memory:read", "memory:write", "wiki:read", "wiki:write", "messaging:send"];
+
+/// The scopes the v1.76 dedicated-employee Google lane honours on an
+/// EXTERNAL key whose client is an AI employee
+/// (`duduclaw-cli::mcp_auth::dedicated_google_tool_allowed`): on such a key
+/// they take effect although they are not externally grantable.
+pub const EMPLOYEE_GOOGLE_KEY_SCOPES: [&str; 2] = ["google:read", "google:write"];
+
+/// The scopes a dashboard-issued per-agent key (an internal key whose client
+/// id is one AI employee — RFC-21's per-agent keys and the v1.76 dedicated
+/// Google key) may carry: exactly the scopes the v1.81 key picker offered,
+/// minus `admin`. Nothing is added; the internal-only scopes the picker never
+/// offered (`messaging:read`, `team:handoff`, `discovery:execute`,
+/// `knowledge:*`) stay out, as does `admin` (RM-134 H3: a per-agent key acts
+/// as that employee; it never carries the all-tools scope).
+pub const EMPLOYEE_KEY_SCOPE_STRINGS: [&str; 23] = [
+    "memory:read",
+    "memory:write",
+    "wiki:read",
+    "wiki:write",
+    "messaging:send",
+    "identity:read",
+    "odoo:read",
+    "odoo:write",
+    "odoo:execute",
+    "google:read",
+    "google:write",
+    "notion:read",
+    "notion:write",
+    "github:read",
+    "github:write",
+    "fork:execute",
+    "os:native",
+    "skill:execute",
+    "recording",
+    "mail:read",
+    "mail:send",
+    "db:read",
+    "files:read",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grantable_lists_are_known_scopes() {
+        for s in EXTERNALLY_GRANTABLE_SCOPE_STRINGS
+            .iter()
+            .chain(EMPLOYEE_GOOGLE_KEY_SCOPES.iter())
+            .chain(EMPLOYEE_KEY_SCOPE_STRINGS.iter())
+        {
+            assert!(MCP_SCOPE_STRINGS.contains(s), "{s}");
+        }
+        assert!(!EXTERNALLY_GRANTABLE_SCOPE_STRINGS.contains(&"admin"));
+        assert!(!EMPLOYEE_KEY_SCOPE_STRINGS.contains(&"admin"));
+        for s in EXTERNALLY_GRANTABLE_SCOPE_STRINGS.iter().chain(EMPLOYEE_GOOGLE_KEY_SCOPES.iter()) {
+            assert!(EMPLOYEE_KEY_SCOPE_STRINGS.contains(s), "{s}");
+        }
+    }
 
     #[test]
     fn scope_list_has_no_duplicates() {

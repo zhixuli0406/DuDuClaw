@@ -31,7 +31,7 @@ pub fn classify(path:&Path)->Option<Source> {
     } else {None};
     let tail=if agent.is_some(){parts.get(2..)?}else{parts.as_slice()};
     let kind=match tail {
-        ["config.toml"|"org.toml"|"users.db"|"tasks.db"|"approvals.db"|"agent.toml"|".mcp.json"|"SOUL.md"|"IDENTITY.md"|"INSTRUCTIONS.md"|"CONTRACT.toml"
+        ["config.toml"|"org.toml"|"users.db"|"tasks.db"|"approvals.db"|"mcp_keys.db"|"agent.toml"|".mcp.json"|"SOUL.md"|"IDENTITY.md"|"INSTRUCTIONS.md"|"CONTRACT.toml"
             |"roles.json"|"departments.json"|"channel_bindings.json"|"connectors.json"|"data_sources.json"|"approvals.json"
             |"schedules.json"|"cron.json"|"reminders.json"|"workflows.json"|"autopilot.json"|"responsibilities.json"|"hooks.json"|"agent_bindings.json"|"access_control.json"|"mcp-oauth-configs.json"|"mcp-oauth-tokens.json"
             |"workflow.db"|"autopilot.db"|"cron_tasks.db"|"cron_tasks.jsonl"|"reminders.jsonl"|"KILLSWITCH.toml"|"USER.md"]=>"authority",
@@ -214,7 +214,7 @@ mod actual_stores_tests {
     use super::*;
     #[test]
     fn migration_source_recognizes_actual_authority_stores_and_baselines() {
-        for path in ["approvals.db","agent_bindings.json","access_control.json","remote_mcp/servers.json","person_credentials/store.json",
+        for path in ["approvals.db","mcp_keys.db","agent_bindings.json","access_control.json","remote_mcp/servers.json","person_credentials/store.json",
             "mcp-oauth-configs.json","mcp-oauth-tokens.json","secrets/website_credentials.enc","KILLSWITCH.toml","redaction/profiles/custom.toml",
             "workflow.db","autopilot.db","cron_tasks.db","cron_tasks.jsonl","reminders.jsonl","shared/wiki/.scope.toml","shared/skills/departments/sales/test/SKILL.md",
             "agents/sales/.soul_hash","agents/sales/.soul_hashes/sales.hash","agents/sales/.soul_history/SOUL_20260101.md","soul_hashes/sales.hash",
