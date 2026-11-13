@@ -154,6 +154,23 @@ pub(crate) async fn handle_tasks_list_hiding(
     )
 }
 
+/// A plain task may retain an implicit human owner, but any employee
+/// assignment (including a damaged profile) must pass the live gate.
+fn validate_created_task_assignee(
+    home: &Path,
+    assignee: &str,
+    implicit_operator_task: bool,
+) -> std::result::Result<(), &'static str> {
+    if implicit_operator_task
+        && matches!(duduclaw_core::agent_seats::resolve_agent_seat(home, assignee), Ok(None))
+        && matches!(std::fs::symlink_metadata(home.join("agents").join(assignee)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    duduclaw_core::agent_seats::validate_task_assignee(home, Some(assignee))
+}
+
 /// T5/O4 — the one agent-facing entry point for "create work".
 ///
 /// `kind` chooses the object (`task` = Kanban board row, the default and
@@ -215,6 +232,11 @@ pub(crate) async fn handle_tasks_create(
         }
     }
     if kind == crate::mcp_alias::TaskKind::Discovery {
+        if let Err(message) = duduclaw_core::agent_seats::validate_task_assignee(
+            home_dir, args.get("assigned_to").and_then(Value::as_str),
+        ) {
+            return tool_error(message);
+        }
         if args.get("schedule").is_some_and(|value| !value.is_null()) {
             return tool_error("discovery cannot be scheduled through ordinary task workers");
         }
@@ -261,12 +283,12 @@ pub(crate) async fn handle_tasks_create(
         .filter(|p| matches!(*p, "low" | "medium" | "high" | "urgent"))
         .unwrap_or("medium")
         .to_string();
-    let assigned_to = args
-        .get("assigned_to")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(default_agent)
-        .to_string();
+    let explicit_assignee = args.get("assigned_to").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let assigned_to = explicit_assignee.unwrap_or(default_agent).to_string();
+    let implicit_operator_task = actor.agent().is_none()
+        && explicit_assignee.is_none()
+        && kind == crate::mcp_alias::TaskKind::Task
+        && schedule.is_none();
     // Reject malformed / wildcard agent ids — `assigned_to` is stored verbatim
     // and later used as an equality filter, so an invalid value produces
     // tasks nobody can query.
@@ -277,6 +299,9 @@ pub(crate) async fn handle_tasks_create(
     }
     if !is_valid_agent_id(default_agent) {
         return tool_error("invalid caller agent id");
+    }
+    if let Err(message) = validate_created_task_assignee(home_dir, &assigned_to, implicit_operator_task) {
+        return tool_error(message);
     }
     // Giving a goal more time than its employee's own `[runtime]
     // timeout_secs` is an Admin decision made on the dashboard; no MCP
@@ -613,6 +638,9 @@ pub(crate) async fn handle_tasks_create(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
+    if let Err(message) = validate_created_task_assignee(home_dir, &row.assigned_to, implicit_operator_task) {
+        return tool_error(message);
+    }
     if let Err(e) = store.insert_task(&row).await {
         return tool_error(&format!("insert task: {e}"));
     }
@@ -852,6 +880,9 @@ pub(crate) async fn handle_tasks_update(
     // this branch only fires when the caller is reassigning to *someone else*.
     if let Some(new_owner) = args.get("assigned_to").and_then(|v| v.as_str()) {
         let new_owner = new_owner.trim();
+        if let Err(message) = duduclaw_core::agent_seats::validate_task_assignee(home_dir, Some(new_owner)) {
+            return tool_error(message);
+        }
         if !is_valid_agent_id(new_owner) {
             return tool_error(&format!(
                 "assigned_to must be a valid agent id (lowercase alphanumeric + hyphens), got: {new_owner}"
@@ -908,6 +939,11 @@ pub(crate) async fn handle_tasks_update(
         Err(reason) => return tool_error(&reason),
     };
     super::workflow_operation::effect_start();
+    if let Err(message) = duduclaw_core::agent_seats::validate_task_assignee(
+        home_dir, fields.get("assigned_to").and_then(Value::as_str),
+    ) {
+        return tool_error(message);
+    }
     let updated = match store
         .update_task_with_cost_policy(task_id, &Value::Object(fields), employee_default_cap)
         .await
@@ -1333,6 +1369,7 @@ mod cost_cap_tests {
     #[tokio::test]
     async fn tasks_create_cost_cap_validates_and_persists() {
         let home = tempfile::tempdir().unwrap();
+        super::super::tests::create_test_agent(&home.path().join("agents"), "bot", "");
         let actor = RecordActor::Operator("bot");
         for cap in [
             serde_json::json!(0),
@@ -1504,3 +1541,123 @@ mod autonomy_commit_tests {
 #[cfg(test)]
 #[path = "../mcp_collection_isolation_tests.rs"]
 mod isolation_collection_tests;
+
+#[cfg(test)]
+mod live_assignee_tests {
+    use super::*;
+
+    fn employee(home: &Path, id: &str, status: &str) {
+        crate::mcp::tests::create_test_agent(&home.join("agents"), id, "");
+        let path = home.join("agents").join(id).join("agent.toml");
+        let profile = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, profile.replace("status = \"active\"", &format!("status = \"{status}\""))).unwrap();
+    }
+
+    fn assert_unavailable(result: Value) {
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["content"][0]["text"], duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE);
+    }
+
+    fn assert_missing_caller(result: Value) {
+        assert_eq!(result["isError"], true, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("找不到這位員工的設定"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn mcp_plain_task_preserves_only_implicit_non_employee_operator_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let actor = RecordActor::Operator("dudu");
+        let params = serde_json::json!({"title": "工作"});
+        let result = handle_tasks_create(&params, home.path(), actor).await;
+        assert_ne!(result["isError"], true, "{result}");
+        let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+        let rows = store.list_tasks(None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].assigned_to, "dudu");
+        // Explicit assignment, goals, and schedules cannot use the implicit
+        // operator-owner exception, so each reaches the live-assignee gate.
+        for args in [
+            serde_json::json!({"title": "工作", "assigned_to": "dudu"}),
+            serde_json::json!({"title": "工作", "kind": "goal"}),
+            serde_json::json!({"title": "工作", "schedule": "0 9 * * *"}),
+        ] {
+            assert_unavailable(handle_tasks_create(&args, home.path(), actor).await);
+        }
+        // An Agent caller is rejected earlier by check_background_caller,
+        // before handle_tasks_create reaches validate_created_task_assignee.
+        assert_missing_caller(handle_tasks_create(&params, home.path(), RecordActor::Agent("dudu")).await);
+        for status in ["deleted", "archived"] {
+            employee(home.path(), "dudu", status);
+            assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
+        }
+        std::fs::write(home.path().join("agents/dudu/agent.toml"), "[agent").unwrap();
+        assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
+        std::fs::remove_file(home.path().join("agents/dudu/agent.toml")).unwrap();
+        assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
+        assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_create_rechecks_assignee_immediately_before_insert() {
+        let home = tempfile::tempdir().unwrap();
+        employee(home.path(), "live", "active");
+        let params = serde_json::json!({"title": "工作", "assigned_to": "live"});
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let call = TASK_CREATE_BEFORE_COMMIT.scope(
+            barrier.clone(), handle_tasks_create(&params, home.path(), RecordActor::Operator("live")),
+        );
+        let delete = async {
+            barrier.wait().await;
+            employee(home.path(), "live", "deleted");
+            barrier.wait().await;
+        };
+        let (response, ()) = tokio::time::timeout(
+            std::time::Duration::from_secs(10), async { tokio::join!(call, delete) },
+        ).await.expect("handler must reach the commit barrier");
+        assert_unavailable(response);
+        let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+        assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_create_accepts_live_and_rejects_unavailable_assignees() {
+        let home = tempfile::tempdir().unwrap();
+        employee(home.path(), "live", "active");
+        employee(home.path(), "deleted", "deleted");
+        employee(home.path(), "archived", "archived");
+        let actor = RecordActor::Operator("live");
+        let result = handle_tasks_create(&serde_json::json!({
+            "title": "工作", "assigned_to": "live"
+        }), home.path(), actor).await;
+        assert_ne!(result["isError"], true, "{result}");
+        for id in ["deleted", "archived", "unknown"] {
+            assert_unavailable(handle_tasks_create(&serde_json::json!({
+                "title": "工作", "assigned_to": id
+            }), home.path(), actor).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_reassign_rejects_deleted_but_other_edits_remain_available() {
+        let home = tempfile::tempdir().unwrap();
+        employee(home.path(), "live", "active");
+        employee(home.path(), "deleted", "deleted");
+        let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+        let row = duduclaw_gateway::task_store::TaskRow::new(
+            "old".into(), "工作".into(), String::new(), "medium".into(), "deleted".into(), "live".into());
+        store.insert_task(&row).await.unwrap();
+        let actor = RecordActor::Operator("live");
+        assert_unavailable(handle_tasks_update(&serde_json::json!({
+            "task_id": "old", "assigned_to": "deleted", "description": "must not write"
+        }), home.path(), actor).await);
+        assert_eq!(store.get_task("old").await.unwrap().unwrap().description, "");
+        let result = handle_tasks_update(&serde_json::json!({
+            "task_id": "old", "description": "仍可編輯"
+        }), home.path(), actor).await;
+        assert_ne!(result["isError"], true, "{result}");
+        let saved = store.get_task("old").await.unwrap().unwrap();
+        assert_eq!(saved.assigned_to, "deleted");
+        assert_eq!(saved.description, "仍可編輯");
+    }
+}

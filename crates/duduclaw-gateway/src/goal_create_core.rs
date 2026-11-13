@@ -379,10 +379,14 @@ async fn create_goal_task_inner(
         if slot.is_some() || req.plan_first {
             return Err("A2A does not support scheduled or planned creation".into());
         }
+        duduclaw_core::agent_seats::validate_task_assignee(home_dir, Some(&req.agent_id))
+            .map_err(str::to_string)?;
         if let Some(existing) = store.insert_a2a_task(&task, message_id, payload_sha256).await? {
             return Ok(GoalCreated { task: existing, plan_first: false });
         }
     } else {
+        duduclaw_core::agent_seats::validate_task_assignee(home_dir, Some(&req.agent_id))
+            .map_err(str::to_string)?;
         match slot {
             Some(slot) => store.insert_assign_schedule_task(&task, slot).await,
             None => store.insert_task(&task).await,
@@ -458,7 +462,52 @@ mod tests {
     }
 
     async fn store_in(home: &Path) -> TaskStore {
+        let dir = home.join("agents/a");
+        std::fs::create_dir_all(&dir).unwrap();
+        if !dir.join("agent.toml").exists() {
+            std::fs::write(dir.join("agent.toml"), "[agent]\nname = 'a'\nstatus = 'active'\n").unwrap();
+        }
         TaskStore::open(home).expect("open task store")
+    }
+
+    #[tokio::test]
+    async fn goal_core_refuses_unavailable_actual_assignees_without_inserting() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store_in(home.path()).await;
+        for (id, profile) in [
+            ("deleted", "[agent]\nstatus = 'deleted'"),
+            ("archived", "[agent]\nstatus = 'archived'"),
+            ("malformed", "[agent"),
+        ] {
+            let dir = home.path().join("agents").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), profile).unwrap();
+        }
+        for id in ["deleted", "archived", "malformed", "missing"] {
+            let error = create_goal_task(home.path(), &store, req(id)).await.unwrap_err();
+            if id == "malformed" {
+                assert_eq!(error, "agent.toml: invalid TOML");
+            } else {
+                assert_eq!(error, duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE);
+            }
+            assert!(store.list_tasks(None, None, None).await.unwrap().is_empty(), "{id}");
+        }
+        assert!(create_goal_task(home.path(), &store, req("a")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn goal_core_rechecks_assignee_after_admission() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store_in(home.path()).await;
+        let profile = home.path().join("agents/a/agent.toml");
+        let admission = Box::pin(async move {
+            std::fs::write(profile, "[agent]\nname = 'a'\nstatus = 'archived'\n").unwrap();
+            Ok(None)
+        });
+        let error = create_goal_task_with_admission(home.path(), &store, req("a"), admission)
+            .await.unwrap_err();
+        assert_eq!(error, duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE);
+        assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
     }
 
     #[tokio::test]

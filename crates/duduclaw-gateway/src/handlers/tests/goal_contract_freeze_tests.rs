@@ -152,6 +152,12 @@ fn payload(frame: &WsFrame) -> Value {
 /// production wires it via `set_task_store` during gateway boot
 /// (`server.rs`). Every test in this module needs the same wiring.
 async fn handler_with_task_store(home: &std::path::Path) -> MethodHandler {
+    for id in ["agent-x", "agent-y"] {
+        let dir = home.join("agents").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"),
+            format!("[agent]\nname = '{id}'\nstatus = 'active'\n")).unwrap();
+    }
     let handler = MethodHandler::new(home.to_path_buf()).await;
     handler
         .set_task_store(Arc::new(TaskStore::open(home).unwrap()))

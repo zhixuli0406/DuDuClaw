@@ -237,6 +237,40 @@ pub fn resolve_agent_seat(home: &Path, agent_id: &str) -> io::Result<Option<Agen
     Ok(all.into_iter().find(|s| s.id == agent_id))
 }
 
+/// Whether an employee belongs to the live registry roster. Reuse the
+/// registry's status predicate; missing, malformed or unknown status is an
+/// error, so credential writers and assignment callers can fail closed.
+pub fn agent_dir_is_live(agent_dir: &Path) -> io::Result<bool> {
+    let text = std::fs::read_to_string(agent_dir.join("agent.toml"))?;
+    let table = text.parse::<toml::Table>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid employee profile"))?;
+    let status = table.get("agent").and_then(|a| a.get("status"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "employee status missing"))?;
+    let status: crate::types::AgentStatus = status.clone().try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid employee status"))?;
+    Ok(status.is_listable(false))
+}
+
+pub const TASK_ASSIGNEE_ERROR_CODE: &str = "task_assignee_unavailable";
+pub const TASK_ASSIGNEE_ERROR_MESSAGE: &str =
+    "無法指派任務：指定的 AI 員工不存在、已刪除、已封存，或目前無法確認其狀態。請選擇其他員工或稍後再試。";
+
+/// Validate only a supplied assignee. None (ordinary edits) and the empty
+/// assignee (unassigned work) do not require a live employee. Resolve by the
+/// same exact registry name / directory rules as seat management.
+pub fn validate_task_assignee(home: &Path, assignee: Option<&str>) -> Result<(), &'static str> {
+    let Some(id) = assignee.filter(|id| !id.is_empty()) else { return Ok(()) };
+    let live = resolve_agent_seat(home, id)
+        .and_then(|seat| match seat {
+            Some(seat) => agent_dir_is_live(&home.join("agents").join(seat.id)),
+            None => Ok(false),
+        });
+    match live {
+        Ok(true) => Ok(()),
+        _ => Err(TASK_ASSIGNEE_ERROR_MESSAGE),
+    }
+}
+
 /// Pure decision: adding `adding` employees to `current` seat holders goes
 /// over `max` (`0` = unlimited). `adding = 1` is the same test as the
 /// gateway's `cap_exceeded(max, current)`.
@@ -379,6 +413,43 @@ mod tests {
 
     fn ids(seats: &[AgentSeat]) -> Vec<&str> {
         seats.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn live_status_matches_registry_and_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        for (status, live) in [("active", true), ("paused", true), ("terminated", true),
+            ("deleted", false), ("archived", false)] {
+            agent(home.path(), status, &with_status(status, status));
+            assert_eq!(agent_dir_is_live(&home.path().join("agents").join(status)).unwrap(), live);
+        }
+        for (id, text) in [("bad", "[agent"), ("missing", "[agent]"),
+            ("typed", "[agent]\nstatus = 1"), ("unknown", "[agent]\nstatus = 'future'")] {
+            agent(home.path(), id, text);
+            assert!(agent_dir_is_live(&home.path().join("agents").join(id)).is_err());
+            assert!(validate_task_assignee(home.path(), Some(id)).is_err());
+        }
+    }
+
+    #[test]
+    fn task_assignee_accepts_live_and_unassigned_and_rejects_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        agent(home.path(), "legacy-dir", &with_status("worker", "active"));
+        agent(home.path(), "deleted", &with_status("deleted", "deleted"));
+        agent(home.path(), "archived", &with_status("archived", "archived"));
+        assert!(validate_task_assignee(home.path(), Some("worker")).is_ok());
+        assert!(validate_task_assignee(home.path(), Some("")).is_ok());
+        // No new assignee: a description/status edit must not inspect the old owner.
+        assert!(validate_task_assignee(home.path(), None).is_ok());
+        for id in ["deleted", "archived", "ghost", "work", "worker-extra"] {
+            assert_eq!(validate_task_assignee(home.path(), Some(id)), Err(TASK_ASSIGNEE_ERROR_MESSAGE));
+        }
+        // Reassignment rechecks disk, even when an earlier check succeeded.
+        agent(home.path(), "legacy-dir", &with_status("worker", "deleted"));
+        assert!(validate_task_assignee(home.path(), Some("worker")).is_err());
+        // Two directories claiming the registry name must fail closed.
+        agent(home.path(), "other", &with_status("worker", "active"));
+        assert!(validate_task_assignee(home.path(), Some("worker")).is_err());
     }
 
     #[test]

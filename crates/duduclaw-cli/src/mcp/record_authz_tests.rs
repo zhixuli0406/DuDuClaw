@@ -640,6 +640,8 @@ async fn tasks_create_refuses_caller_supplied_reserved_tags() {
     )
     .await;
     assert!(!is_error(&out), "{out}");
+    let created: Value = serde_json::from_str(&text(&out)).unwrap();
+    assert_eq!(created["task"]["assigned_to"], "dudu");
 }
 
 #[tokio::test]
@@ -1106,6 +1108,8 @@ async fn tasks_create_under_a_parent_needs_a_relationship() {
     for actor in [A("sales-rep"), A("sales-lead"), OP] {
         let out = handle_tasks_create(&child(&parent), h, actor).await;
         assert!(!is_error(&out), "{actor:?}: {out}");
+        let created: Value = serde_json::from_str(&text(&out)).unwrap();
+        assert_eq!(created["task"]["assigned_to"], actor.id());
     }
     let out = handle_tasks_create(&child("no-such-task"), h, A("sales-rep")).await;
     assert!(is_error(&out), "{out}");

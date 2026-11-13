@@ -508,7 +508,7 @@ impl MethodHandler {
             Ok(c) => c,
             Err(e) => {
                 super::task_attachments::remove_saved(&saved).await;
-                return WsFrame::error_response("", &e);
+                return super::tasks_rpc::goal_create_refusal(&e);
             }
         };
         crate::recent_skills::record_chat(&self.home_dir, &self.registry,

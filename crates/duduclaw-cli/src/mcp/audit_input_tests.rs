@@ -189,6 +189,7 @@ async fn state_changing_call_result_text_activates_grounding_evidence() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_complete_self_echo_never_captured_as_grounding_evidence() {
     let tmp = TempDir::new();
+    super::tests::create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let memory = SqliteMemoryEngine::new(&tmp.path().join("memory.db")).expect("memory engine");
     let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
     let ns = crate::mcp_namespace::NamespaceContext {
