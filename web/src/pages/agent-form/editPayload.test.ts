@@ -3,6 +3,7 @@ import en from '@/i18n/en.json';
 import zhTW from '@/i18n/zh-TW.json';
 import jaJP from '@/i18n/ja-JP.json';
 import authorityFields from './__fixtures__/authority-fields.json';
+import type { AgentDetail, AgentDetailV168 } from '@/lib/api';
 import {
   buildUpdatePayload,
   clampInt,
@@ -14,6 +15,8 @@ import {
   teamRolesShareVendor,
   utilityModelMismatchesRuntime,
   runtimeTimeoutNeedsAdmin,
+  permissionFormValues,
+  GATED_PERMISSION_KEYS,
   type EditFormState,
   type PayloadContext,
 } from './editPayload';
@@ -390,5 +393,62 @@ describe('runtime timeout authority', () => {
     [900, null, false], [30, null, true], [4000, 3600, false], ['bad', 301, true],
   ])('compares effective values %s -> %s', (before, after, expected) => {
     expect(runtimeTimeoutNeedsAdmin(before, after)).toBe(expected);
+  });
+});
+
+describe('permission switches show what the gateway applies (RM-137)', () => {
+  it('prefers effective_permissions over the stored values', () => {
+    const values = permissionFormValues({
+      permissions: { can_create_agents: true, can_send_cross_agent: true, can_modify_own_soul: true },
+      effective_permissions: {
+        can_create_agents: false, can_send_cross_agent: false, can_schedule_tasks: true, can_modify_own_skills: true,
+      },
+    });
+    expect(values).toEqual({
+      can_create_agents: false, can_send_cross_agent: false, can_schedule_tasks: true,
+      can_modify_own_skills: true, can_modify_own_soul: true,
+    });
+  });
+
+  it('shows the gated switches OFF without effective_permissions (older gateway), never a stored or guessed ON', () => {
+    expect(permissionFormValues({
+      permissions: { can_send_cross_agent: true, can_create_agents: true, can_modify_own_soul: true },
+    })).toEqual({
+      can_create_agents: false, can_send_cross_agent: false, can_schedule_tasks: false,
+      can_modify_own_skills: false, can_modify_own_soul: true,
+    });
+    expect(permissionFormValues({ permissions: { can_send_cross_agent: true }, effective_permissions: null })
+      .can_send_cross_agent).toBe(false);
+    expect(Object.values(permissionFormValues({}))).toEqual([false, false, false, false, false]);
+    // A wrong-typed or missing flag is not a value, and does not fall back to the file.
+    expect(permissionFormValues({ effective_permissions: { can_create_agents: 'yes' } }).can_create_agents).toBe(false);
+    expect(permissionFormValues({
+      permissions: { can_schedule_tasks: true },
+      effective_permissions: { can_create_agents: true },
+    })).toMatchObject({ can_create_agents: true, can_schedule_tasks: false });
+  });
+
+  it('accepts the agents.inspect detail type as is (TS: no weak-type mismatch)', () => {
+    const detail: AgentDetail & AgentDetailV168 = {
+      ...({} as AgentDetail),
+      permissions: { can_send_cross_agent: true },
+      effective_permissions: {
+        can_create_agents: false, can_send_cross_agent: true, can_schedule_tasks: false,
+        can_modify_own_skills: false, error: null,
+      },
+    };
+    expect(permissionFormValues(detail).can_send_cross_agent).toBe(true);
+  });
+
+  it('an untouched form sends no permission even when the shown value differs from the file', () => {
+    const shown = permissionFormValues({
+      permissions: { can_create_agents: true },
+      effective_permissions: { can_create_agents: false },
+    });
+    const s = state({ form: { ...state().form, ...shown } });
+    const { payload, hasChanges } = buildUpdatePayload(s, new Set(), CTX);
+    expect(hasChanges).toBe(false);
+    for (const key of GATED_PERMISSION_KEYS) expect(payload).not.toHaveProperty(key);
+    expect(payload).not.toHaveProperty('can_modify_own_soul');
   });
 });

@@ -14,7 +14,7 @@ import {
 } from '@/components/mds';
 import { OptionSelect, type SelectOption } from '@/components/settings/controls';
 
-const POLICIES: DelegationPolicy[] = ['department', 'hierarchy', 'open'];
+export const DELEGATION_POLICIES: DelegationPolicy[] = ['department', 'hierarchy', 'open', 'none'];
 
 /** A whitelist row while it is being edited — either side may still be blank. */
 type PairDraft = { a: string; b: string };
@@ -22,10 +22,16 @@ type PairDraft = { a: string; b: string };
 /**
  * 委派權限 (WP21 §2.8) — who may hand work to whom, org-wide.
  *
- * Two controls: the delegation mode (three mutually exclusive options) and the
- * cross-department pair list that opens specific two-way exceptions on top of
- * it. Both are written to the gateway in one `delegation.set` call and take
- * effect on the next delegation, with no restart.
+ * Two controls: the delegation mode (four mutually exclusive options, `none`
+ * since v1.82) and the cross-department pair list that opens specific two-way
+ * exceptions on top of it. Both are written to the gateway in one
+ * `delegation.set` call and take effect on the next delegation, with no
+ * restart.
+ *
+ * RM-137: the form only ever submits what it loaded. Until `delegation.get`
+ * has succeeded, every control and the save button are disabled — a failed
+ * read used to leave the `department` + no-pairs defaults on screen, and one
+ * click on save wrote them over the real setting.
  *
  * Owner/admin only. The gateway gates both RPCs as well — this component
  * rendering `null` for everyone else is the polite half, not the enforcement.
@@ -35,11 +41,15 @@ export function DelegationTab() {
   const t = (id: string) => intl.formatMessage({ id });
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
 
+  // Placeholders only: nothing below is shown as a setting or submitted
+  // until `loaded` is true.
   const [policy, setPolicy] = useState<DelegationPolicy>('department');
   const [pairs, setPairs] = useState<PairDraft[]>([]);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [agents, setAgents] = useState<AgentDetail[]>([]);
   const [loading, setLoading] = useState(true);
+  // True only after the latest load succeeded.
+  const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   // P05: a failed read left the radio group on its `department` default and an
@@ -51,6 +61,8 @@ export function DelegationTab() {
 
   const load = useCallback(async () => {
     setLoadError(null);
+    setLoaded(false);
+    setLoading(true);
     try {
       const [settings, list] = await Promise.all([
         api.delegation.get(),
@@ -60,6 +72,7 @@ export function DelegationTab() {
       setPairs(settings.allow.map(([a, b]) => ({ a, b })));
       setWarnings(settings.warnings ?? []);
       setAgents(list.agents ?? []);
+      setLoaded(true);
     } catch (e) {
       console.warn('[api]', e);
       setLoadError(e);
@@ -96,13 +109,17 @@ export function DelegationTab() {
 
   const incomplete = pairs.some((p) => !p.a || !p.b);
   const hasSelfPair = pairs.some((p) => p.a && p.a === p.b);
-  const canSave = !loading && !saving && !incomplete && !hasSelfPair;
+  // Editing is possible only on a successfully loaded setting.
+  const editable = loaded && !loading && loadError == null;
+  const canSave = editable && !saving && !incomplete && !hasSelfPair;
 
   const updatePair = (index: number, side: 'a' | 'b', value: string) => {
     setPairs((prev) => prev.map((p, i) => (i === index ? { ...p, [side]: value } : p)));
   };
 
   const handleSave = async () => {
+    // Never submit a state that was not loaded (the button is disabled too).
+    if (!canSave) return;
     setSaving(true);
     setSaved(false);
     setSaveError(null);
@@ -154,7 +171,7 @@ export function DelegationTab() {
         description={t('settings.delegation.mode.desc')}
       >
         <SettingsCard>
-          {POLICIES.map((p) => (
+          {DELEGATION_POLICIES.map((p) => (
             <label
               key={p}
               className="flex cursor-pointer items-start gap-3 px-4 py-3.5 transition-colors hover:bg-surface-hover"
@@ -162,9 +179,10 @@ export function DelegationTab() {
               <input
                 type="radio"
                 name="delegation-policy"
+                value={p}
                 className="mt-1 accent-primary"
-                checked={policy === p}
-                disabled={loading}
+                checked={loaded && policy === p}
+                disabled={!editable}
                 onChange={() => setPolicy(p)}
               />
               <span className="min-w-0 flex-1">
@@ -178,10 +196,15 @@ export function DelegationTab() {
             </label>
           ))}
         </SettingsCard>
-        {policy === 'open' && (
+        {loaded && policy === 'open' && (
           <p className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-foreground">
             <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-warning" />
             {t('settings.delegation.policy.open.warning')}
+          </p>
+        )}
+        {loaded && policy === 'none' && (
+          <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
+            {t('settings.delegation.policy.none.note')}
           </p>
         )}
       </SettingsSection>
@@ -191,13 +214,24 @@ export function DelegationTab() {
         title={t('settings.delegation.pairs')}
         description={t('settings.delegation.pairs.desc')}
       >
+        {loaded && policy === 'none' && pairs.length > 0 && (
+          <p className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-foreground">
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-warning" />
+            {t('settings.delegation.pairs.inactiveUnderNone')}
+          </p>
+        )}
         <SettingsCard>
-          {pairs.length === 0 && (
+          {loaded && pairs.length === 0 && (
             <p className="px-4 py-4 text-center text-xs text-muted-foreground">
               {t('settings.delegation.pairs.empty')}
             </p>
           )}
-          {pairs.map((pair, index) => (
+          {!loaded && (
+            <p className="px-4 py-4 text-center text-xs text-muted-foreground">
+              {loading ? t('common.loading') : t('settings.delegation.notLoaded')}
+            </p>
+          )}
+          {loaded && pairs.map((pair, index) => (
             <div
               key={index}
               className="flex flex-wrap items-center gap-2 px-4 py-3 sm:flex-nowrap"
@@ -207,6 +241,7 @@ export function DelegationTab() {
                   value={pair.a}
                   showRaw={false}
                   options={agentOptions}
+                  disabled={!editable}
                   onChange={(v) => updatePair(index, 'a', v)}
                 />
                 {agentDepartment(pair.a) && (
@@ -219,6 +254,7 @@ export function DelegationTab() {
                   value={pair.b}
                   showRaw={false}
                   options={agentOptions}
+                  disabled={!editable}
                   onChange={(v) => updatePair(index, 'b', v)}
                 />
                 {agentDepartment(pair.b) && (
@@ -228,6 +264,7 @@ export function DelegationTab() {
               <Button
                 variant="ghost"
                 size="sm"
+                disabled={!editable}
                 aria-label={intl.formatMessage(
                   { id: 'settings.delegation.pair.remove' },
                   { a: agentLabel(pair.a), b: agentLabel(pair.b) },
@@ -242,7 +279,7 @@ export function DelegationTab() {
             <Button
               variant="outline"
               size="sm"
-              disabled={loading || agents.length < 2}
+              disabled={!editable || agents.length < 2}
               onClick={() => setPairs((prev) => [...prev, { a: '', b: '' }])}
             >
               <Plus className="size-4" />
@@ -265,6 +302,9 @@ export function DelegationTab() {
         />
       )}
       <div className="flex flex-wrap items-center justify-end gap-3">
+        {!loaded && !loading && (
+          <span className="text-xs text-warning">{t('settings.delegation.saveBlocked')}</span>
+        )}
         {incomplete && (
           <span className="text-xs text-warning">{t('settings.delegation.pair.incomplete')}</span>
         )}

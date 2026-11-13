@@ -283,6 +283,20 @@ pub(crate) async fn handle_tasks_send(
 
     let model = params.get("model").and_then(|v| v.as_str());
 
+    // RM-137 H3: under `none`, only the default (Main-role) agent — checked
+    // before anything runs. Other policies keep today's behaviour.
+    if duduclaw_core::delegation_policy_from_home(home_dir) == duduclaw_core::DelegationPolicy::Disabled {
+        let target = match super::handlers::resolve_send_target(home_dir, context_id).await {
+            Ok(t) => t,
+            Err((code, msg)) => return jsonrpc_error(id, code, &msg),
+        };
+        if let Err((code, msg)) =
+            super::handlers::check_acp_target_under_none(home_dir, &target).await
+        {
+            return jsonrpc_error(id, code, &msg);
+        }
+    }
+
     // Create a task in the manager
     let task = task_manager.create_task(context_id, message);
     let task_id = task.id.clone();
@@ -394,6 +408,77 @@ fn handle_tasks_cancel(id: &Value, params: &Value, task_manager: &mut A2ATaskMan
     }
 }
 
+// ── Startup refusal (RM-137 H3) ─────────────────────────────
+
+/// `duduclaw acp server` on the Bash lane: refused for AI employees (and
+/// unverified callers) like every other operator-only command. Messages the
+/// server enqueues are stamped `a2a-client`, which `[acp] trusted = true`
+/// treats as a system sender, so an employee that could start its own server
+/// would get past `[delegation] policy = "none"`.
+pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] = &[
+    duduclaw_core::OperatorCommand { name: "duduclaw acp server", path: &["acp", "server"] },
+    duduclaw_core::OperatorCommand {
+        name: "duduclaw acp server",
+        path: &["maintenance", "acp", "server"],
+    },
+];
+
+/// The employee-identity variables that refuse `duduclaw acp server` on
+/// their own (also members of `ai_session_guard::AI_SESSION_ENV_VARS`; listed
+/// here so the refusal does not depend on that list keeping them).
+pub(crate) const ACP_SERVER_IDENTITY_ENV_VARS: &[&str] = &[
+    duduclaw_core::ENV_AGENT_ID,
+    duduclaw_core::ENV_AGENT_TOKEN,
+    duduclaw_core::ENV_HOOK_TOKEN,
+];
+
+/// Why `duduclaw acp server` must not start here, if it must not:
+/// `session_markers` are the AI-session markers present
+/// (`ai_session_guard::command_markers`), `identity_present` the
+/// [`ACP_SERVER_IDENTITY_ENV_VARS`] present (even empty).
+pub(crate) fn acp_server_start_refusal(
+    session_markers: &[&str],
+    identity_present: &[&str],
+) -> Option<String> {
+    if session_markers.is_empty() && identity_present.is_empty() {
+        return None;
+    }
+    let mut found: Vec<&str> = session_markers.to_vec();
+    for k in identity_present {
+        if !found.contains(k) {
+            found.push(k);
+        }
+    }
+    Some(format!(
+        "duduclaw acp server 只能由本機操作人員啟動,不能在 AI 員工的工作階段中啟動\
+         (偵測到環境變數:{})。ACP 伺服器送出的工作以 a2a-client 身分排入佇列,\
+         在 [acp] trusted = true 時等同系統寄件者。\
+         / `duduclaw acp server` cannot be started from an AI employee session \
+         (found: {}); start it from an operator terminal.",
+        found.join(", "),
+        found.join(", ")
+    ))
+}
+
+fn identity_env_present() -> Vec<&'static str> {
+    #[cfg(not(test))]
+    {
+        ACP_SERVER_IDENTITY_ENV_VARS
+            .iter()
+            .copied()
+            .filter(|k| std::env::var_os(k).is_some())
+            .collect()
+    }
+    #[cfg(test)]
+    {
+        // Same isolated source as `command_markers()` in tests.
+        crate::ai_session_guard::command_markers()
+            .into_iter()
+            .filter(|k| ACP_SERVER_IDENTITY_ENV_VARS.contains(k))
+            .collect()
+    }
+}
+
 // ── Main server loop ────────────────────────────────────────
 
 /// Run the ACP server, reading JSON-RPC 2.0 from stdin and writing responses to stdout.
@@ -410,6 +495,14 @@ fn handle_tasks_cancel(id: &Value, params: &Value, task_manager: &mut A2ATaskMan
 /// - `message/stream` / `tasks/resubscribe` / `tasks/pushNotificationConfig/*`
 ///   — spec-shaped `UnsupportedOperationError` (-32004)
 pub async fn run_acp_server(home_dir: &Path) -> Result<()> {
+    // RM-137 H3: an AI employee must not run its own ACP server. Checked
+    // before stdin is read, so nothing is ever enqueued.
+    if let Some(reason) = acp_server_start_refusal(
+        &crate::ai_session_guard::command_markers(),
+        &identity_env_present(),
+    ) {
+        return Err(DuDuClawError::Config(reason));
+    }
     info!("Starting DuDuClaw ACP server (A2A protocol over stdio)");
 
     let mut task_manager = A2ATaskManager::new();

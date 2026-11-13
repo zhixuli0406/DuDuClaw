@@ -93,6 +93,12 @@ pub const AGENT_CAPABILITY_SECTION: &str = "capabilities";
 /// - `isolation` — native Linux protected-mode switches; `public_web` decides
 ///   whether the capability issuer grants the public-web tools (owner
 ///   decision 2026-11-08, separate from `[container] network_access`).
+/// - `team_member` — the Team-as-Agent role record (`role` / `task_id` /
+///   `round` / `parent`). `team_handoff` and the `none` delegation exemption
+///   believe it only inside a verified `.ephemeral/eph-*` scaffold, but an
+///   employee must not be able to add or re-pin one in its own `agent.toml`
+///   either (RM-137 H1). Only the gateway's team scaffold
+///   (`ephemeral::scaffold_with`, a Rust write outside the hook) writes it.
 ///
 /// Since G1 round 3 the freeze itself is an allow-list
 /// ([`AGENT_EDITABLE_SECTIONS`]): every section not listed editable is frozen,
@@ -121,7 +127,26 @@ pub const AGENT_SECURITY_SECTIONS: &[&str] = &[
     "google",
     // Protected-mode switches (`public_web`), admin-set only.
     "isolation",
+    // Team-as-Agent role record; written only by the gateway's scaffold.
+    "team_member",
 ];
+
+// RM-137 H1: `[team_member]` must never become employee-editable.
+const _: () = {
+    let mut i = 0;
+    while i < AGENT_EDITABLE_SECTIONS.len() {
+        let s = AGENT_EDITABLE_SECTIONS[i].as_bytes();
+        let t = b"team_member";
+        let mut same = s.len() == t.len();
+        let mut j = 0;
+        while same && j < s.len() {
+            same = s[j] == t[j];
+            j += 1;
+        }
+        assert!(!same, "team_member must stay frozen");
+        i += 1;
+    }
+};
 
 /// The only `agent.toml` sections the agent may still edit with Write/Edit
 /// (G1 round 3: an allow-list — every other top-level section, including any
@@ -181,7 +206,24 @@ pub const HOME_WRITABLE_DIRS: &[&str] = &["attachments"];
 /// DuDuClaw-specific evidence file names that the Bash lane recognises by
 /// basename alone (any directory, rotated suffixes included), because an
 /// agent can reach them through a `cd` the token scan cannot follow.
-pub(super) const HOME_EVIDENCE_BASENAMES: &[&str] = &["tool_calls.jsonl", "security_audit.jsonl"];
+///
+/// RM-137 H2: the two durable queue rails are named here too. Queue rows
+/// carry no admission signature, so a row written straight into
+/// `bus_queue.jsonl` / `message_queue.db` could claim a system sender
+/// (`cron`, `dashboard`, …) and get past `[delegation] policy = "none"`. The
+/// Write/Edit lane already refuses every `<home>` file outside the caller's
+/// own directory; this names them on the Bash lane wherever they are spelled.
+/// `bus_queue.jsonl.lock` / rotated copies match by the `.` suffix rule; the
+/// SQLite side files are listed because `-wal` / `-shm` / `-journal` do not.
+pub(super) const HOME_EVIDENCE_BASENAMES: &[&str] = &[
+    "tool_calls.jsonl",
+    "security_audit.jsonl",
+    "bus_queue.jsonl",
+    "message_queue.db",
+    "message_queue.db-wal",
+    "message_queue.db-shm",
+    "message_queue.db-journal",
+];
 
 /// Sections of `<home>/config.toml` that feed the delegation predicate.
 ///

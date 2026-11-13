@@ -212,6 +212,49 @@ export function isAdminOnlyPath(path: string, serverList?: ReadonlyArray<string>
   return list.some((entry) => matchesAdminPath(path, entry));
 }
 
+/** The gated `[permissions]` switches the edit page shows. */
+export const GATED_PERMISSION_KEYS = [
+  'can_create_agents', 'can_send_cross_agent', 'can_schedule_tasks', 'can_modify_own_skills',
+] as const;
+export type GatedPermissionKey = (typeof GATED_PERMISSION_KEYS)[number];
+
+/**
+ * What [`permissionFormValues`] reads from `agents.inspect`
+ * (`AgentDetail & AgentDetailV168`, or a test literal). Both fields are
+ * index-signature records rather than all-optional key lists: the detail's
+ * `permissions` (`Record<string, boolean>` intersected with the v1.68
+ * `{ permissions_enforced_since? }`) shares no declared key with such a list,
+ * which TypeScript rejects as a weak-type mismatch. An older gateway may omit
+ * `effective_permissions` entirely.
+ */
+export interface PermissionSource {
+  permissions?: Readonly<Record<string, unknown>> | null;
+  effective_permissions?: Readonly<Record<string, unknown>> | null;
+}
+
+/**
+ * RM-137 — the permission switches as the gateway applies them.
+ *
+ * `agents.inspect.effective_permissions` is the MCP gate's own reading (an
+ * unwritten `can_create_agents` resolved by role, every flag `false` when
+ * agent.toml is unreadable), so the page shows it rather than re-deriving
+ * defaults. Without it (an older gateway) — or for a missing or wrong-typed
+ * flag in it — the four gated switches show OFF: never the stored value and
+ * never a guessed ON. `can_modify_own_soul` is not one of them and shows the
+ * stored value (OFF when absent). This is display only: a switch the
+ * operator does not touch is not dirty and is never sent
+ * (`buildUpdatePayload`), so an untouched save cannot flip a permission.
+ */
+export function permissionFormValues(agent: PermissionSource): Record<GatedPermissionKey | 'can_modify_own_soul', boolean> {
+  const pick = (v: unknown): boolean | undefined => (typeof v === 'boolean' ? v : undefined);
+  const out = {} as Record<GatedPermissionKey | 'can_modify_own_soul', boolean>;
+  for (const key of GATED_PERMISSION_KEYS) {
+    out[key] = pick(agent.effective_permissions?.[key]) ?? false;
+  }
+  out.can_modify_own_soul = pick(agent.permissions?.can_modify_own_soul) ?? false;
+  return out;
+}
+
 /** Match the gateway's effective timeout (unset/wrong type = 300). */
 export function effectiveRuntimeTimeout(value: unknown): number {
   return typeof value === 'number' && Number.isInteger(value)

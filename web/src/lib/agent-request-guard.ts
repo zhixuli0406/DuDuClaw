@@ -44,7 +44,7 @@ export const AGENT_GUARD_READ_ONLY_METHODS = new Set([
   'cron.templates', 'dashboard.layout.get', 'dashboard.layout.view',
   'dashboard.widgets.catalog', 'data_exports.get', 'db_sources.grants.list',
   'db_sources.list', 'db_sources.tables', 'decisions.list',
-  'delegation.get', 'departments.list', 'device.backup_list',
+  'delegation.effective', 'delegation.get', 'departments.list', 'device.backup_list',
   'device.backup_schedule_get', 'device.network', 'device.status',
   'device.update_status', 'digest.latest', 'discovery.artifact',
   'discovery.catalog', 'discovery.list', 'discovery.tree',

@@ -282,8 +282,73 @@ pub(crate) fn write_packet_atomic(
     })
 }
 
+/// RM-137 (soft identity mode): is `caller` the identity this MCP process
+/// proves with its `DUDUCLAW_AGENT_TOKEN`?
+///
+/// `true` only for an [`duduclaw_core::IdentityVerdict::Verified`] claim (or a
+/// native isolated call's connection-bound employee) that names exactly
+/// `caller` — see [`crate::mcp_namespace::verified_employee_from_env`]. During
+/// the operator-enabled soft migration (`require_identity_token = false` with
+/// a grace deadline) a process without a valid token is `Unverified` and keeps
+/// working for everything else, but it is NOT verified here: a process that
+/// merely declares an existing `.ephemeral/eph-*` id must not file a
+/// `TaskPacket` (`team_handoff`) or receive the delegation-policy `none`
+/// exemption for it. `Disabled` (no `identity.key`) and `Rejected` are not
+/// verified either. Fail closed.
+pub(crate) fn caller_token_verified(home_dir: &Path, caller: &str) -> bool {
+    let caller = caller.trim();
+    if caller.is_empty() {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        if let Ok(verified) = TEST_TOKEN_VERIFIED_CALLER.try_with(|id| id.clone()) {
+            return verified == caller;
+        }
+    }
+    crate::mcp_namespace::verified_employee_from_env(home_dir).as_deref() == Some(caller)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only stand-in for a token-verified process identity, so tests of
+    /// [`caller_token_verified`]'s callers need neither `identity.key` nor
+    /// process-wide environment mutation. Not compiled into a release build.
+    static TEST_TOKEN_VERIFIED_CALLER: String;
+}
+
+/// Run `future` as if this process proved `agent` with a valid identity
+/// token (tests only; see [`caller_token_verified`]).
+#[cfg(test)]
+pub(crate) async fn with_token_verified_caller<F: std::future::Future>(
+    agent: &str,
+    future: F,
+) -> F::Output {
+    TEST_TOKEN_VERIFIED_CALLER.scope(agent.to_string(), future).await
+}
+
 pub(crate) async fn handle_team_handoff(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     let caller = current_authorizing_agent(home_dir, default_agent);
+    let verified = caller_token_verified(home_dir, &caller);
+    file_team_handoff(args, home_dir, default_agent, caller, verified).await
+}
+
+/// [`handle_team_handoff`] with the caller resolved and its token
+/// verification ([`caller_token_verified`]) passed in.
+///
+/// `default_agent` is the PROCESS's agent, kept separate from `caller`
+/// (the authorizing agent from [`current_authorizing_agent`]): it is only the
+/// fallback identity [`admit_background_identity`] admits when no
+/// `with_background_caller` scope is active — inside the dispatcher's scope
+/// the scoped (verified) actor is admitted and this argument is ignored —
+/// exactly as before the split.
+pub(crate) async fn file_team_handoff(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    caller: String,
+    token_verified: bool,
+) -> Value {
     // Every refusal gets an audited row carrying the stable code; the generic
     // state-changing audit in `handle_tools_call` records the call itself but
     // not *why* it failed (same shape as `codrive_run`).
@@ -343,7 +408,29 @@ pub(crate) async fn handle_team_handoff(args: &Value, home_dir: &Path, default_a
     // fields a caller may omit (below). It is also the refusal that teaches
     // the most, so a non-member learns it on its first call instead of after
     // twelve rounds of fighting the schema.
-    let identity_dir = caller_agent_dir(home_dir, &caller);
+    //
+    // RM-137 H1: the `[team_member]` record is only believed inside a real
+    // role-member scaffold — an `.ephemeral/eph-*` directory (containment
+    // proven by `resolve_agent_dir`) whose record names the same parent as its
+    // `ephemeral.toml` (`is_verified_role_member_dir`). An ordinary employee
+    // that writes a "pinned" `[team_member]` into its own `agents/<id>/
+    // agent.toml` is refused here under every delegation policy.
+    //
+    // RM-137 (soft identity mode): the caller must also hold a token-verified
+    // identity (`caller_token_verified`). In the operator-enabled soft
+    // migration a process without a valid token is only `Unverified`, and
+    // declaring an existing `eph-*` id would otherwise be enough to file a
+    // packet as that member. Same refusal code as a non-member.
+    let Some(identity_dir) = token_verified
+        .then(|| duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, &caller))
+        .flatten()
+        .filter(|dir| duduclaw_gateway::ephemeral::is_verified_role_member_dir(dir))
+    else {
+        return refuse(
+            "not_a_team_member",
+            "only a verified role member of a team may file a TaskPacket",
+        );
+    };
     let member = match read_team_member_identity(&identity_dir) {
         Ok(m) => m,
         Err("team_member_unreadable") => {

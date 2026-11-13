@@ -517,6 +517,31 @@ pub(crate) async fn visible_tools_in_lane(
         duduclaw_core::ActionRules::default()
     };
 
+    // RM-137: `[delegation] policy = "none"` (or a value that resolves to it)
+    // — mirror of dispatch §3.458, same predicate with no arguments, so only
+    // tools every call to which is refused are hidden. External callers are
+    // outside that gate in dispatch, so they are outside it here too.
+    let delegation_none = !principal.is_external
+        && duduclaw_core::delegation_policy_from_home(home_dir)
+            == duduclaw_core::DelegationPolicy::Disabled;
+    // RM-137 (soft identity mode): the handler and the `none` exemption also
+    // require a token-verified identity (`caller_token_verified`); a soft-mode
+    // `Unverified` process declaring an `eph-*` id gets neither. Only a role
+    // member can need it, so the identity check runs for `eph-*` callers only.
+    let member_token_verified =
+        is_member && super::caller_token_verified(home_dir, effective_agent);
+    // RM-137 H1: the `team_handoff` handler refuses every caller that is not a
+    // verified role member (`.ephemeral/eph-*` scaffold, `[team_member]`
+    // record agreeing with `ephemeral.toml`) with a token-verified identity,
+    // so listing follows the same predicate.
+    let team_handoff_listed = !principal.is_external
+        && member_token_verified
+        && duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+            home_dir,
+            effective_agent,
+            "team_handoff",
+        );
+
     let tool_allowed_by_capability = |name: &str| -> bool {
         if principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&name) {
             return true;
@@ -622,6 +647,21 @@ pub(crate) async fn visible_tools_in_lane(
                         t.name,
                     ))
         })
+        // RM-137: delegation policy `none` (mirror of dispatch §3.458).
+        .filter(|t| {
+            !delegation_none
+                || !crate::mcp_dispatch::delegation_none_refuses_for(
+                    home_dir,
+                    t.name,
+                    &serde_json::Value::Null,
+                    effective_agent,
+                    || member_token_verified,
+                )
+        })
+        // RM-137 H1: `team_handoff` is callable only by a verified team role
+        // member (the handler's own check), so only a verified role member
+        // sees it — under every policy.
+        .filter(|t| t.name != "team_handoff" || team_handoff_listed)
         // 2026-10: read-only explore lane (mirror of dispatch §0b).
         .filter(|t| lane_refusal(lane, t.name).is_none())
         // Standalone profile (2026-10-07): scope gate + process-agent tools.

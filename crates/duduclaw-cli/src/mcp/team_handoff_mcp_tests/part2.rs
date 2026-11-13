@@ -3,12 +3,12 @@ use super::*;
 #[tokio::test(flavor = "current_thread")]
 async fn a_shape_refusal_names_the_field_and_shows_the_example() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
     // Missing a required key.
     let out = handle_team_handoff(
         &serde_json::json!({ "packet": { "packet_id": "pk-1", "output_format": "markdown" }}),
         tmp.path(),
-        "planner-1",
+        &me,
     )
     .await;
     assert_eq!(refusal_code(&out), "invalid_packet");
@@ -30,7 +30,7 @@ async fn a_shape_refusal_names_the_field_and_shows_the_example() {
             "objectives": "typo",
         }}),
         tmp.path(),
-        "planner-1",
+        &me,
     )
     .await;
     assert_eq!(refusal_code(&out), "invalid_packet");
@@ -42,7 +42,7 @@ async fn a_shape_refusal_names_the_field_and_shows_the_example() {
             "packet_id": "pk-1", "objective": "x", "output_format": "csv",
         }}),
         tmp.path(),
-        "planner-1",
+        &me,
     )
     .await;
     assert_eq!(refusal_code(&out), "invalid_packet");
@@ -55,13 +55,13 @@ async fn a_shape_refusal_names_the_field_and_shows_the_example() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_validation_refusal_names_the_offending_item() {
     let tmp = TempDir::new();
-    mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
+    let me = mk_member(tmp.path(), "planner-1", "planner", Some(TASK), Some(2));
     let mut p = packet(Role::Planner, Role::Executor, 2);
     p.constraints = vec![
         duduclaw_core::task_packet::Constraint::new("c1", "ok"),
         duduclaw_core::task_packet::Constraint::new("c2", "越".repeat(201)),
     ];
-    let out = call(tmp.path(), "planner-1", &p).await;
+    let out = call(tmp.path(), &me, &p).await;
     assert_eq!(refusal_code(&out), "field_too_long");
     assert!(
         text_of(&out).contains("constraints[1].text"),

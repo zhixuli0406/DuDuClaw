@@ -25,6 +25,21 @@
 //! skips rules 3–5 and allows everything except rule 1 (the escape hatch that
 //! restores pre-WP21 behaviour for the back-door paths).
 //!
+//! [`DelegationPolicy::Disabled`] (`policy = "none"`, RM-137, v1.82) denies
+//! every agent sender right after rule 2: no ancestor rule, no department rule
+//! and **no `[delegation] allow` pair** applies. System senders (dashboard,
+//! cron, heartbeat, goal-loop-driver, …) still pass — a person or a schedule
+//! the operator configured is not an AI employee handing work on. An
+//! unrecognised policy value, and a `config.toml` that exists but cannot be
+//! read or parsed, resolve to `Disabled` as well (fail closed).
+//!
+//! Team-as-Agent role hand-offs never reach this predicate: the team composer
+//! scaffolds and runs its role members itself (`team_composer` →
+//! `ephemeral::dispatch_with`, no bus task), and the members exchange
+//! `TaskPacket`s only through the MCP `team_handoff` tool, which is pinned to a
+//! scaffolded member's own `(task, round)` and is not one of the tools
+//! `Disabled` refuses at the MCP dispatch gate. That is the whole exception.
+//!
 //! ## What this module is *not*
 //!
 //! It is not a rate limiter (`dispatch_guard`) and not a tool-permission gate
@@ -182,15 +197,29 @@ pub enum DelegationPolicy {
     /// Everything except self-delegation. The escape hatch that restores
     /// pre-WP21 behaviour (runaway guards and tool permissions still apply).
     Open,
+    /// `policy = "none"` (RM-137, v1.82): no AI employee may delegate to,
+    /// message, spawn, create or assign work to another AI employee. Explicit
+    /// `[delegation] allow` pairs do not apply. System senders still pass.
+    /// Also what an unrecognised value or an unreadable config resolves to.
+    Disabled,
 }
 
 impl DelegationPolicy {
-    /// Stable wire string (`department` / `hierarchy` / `open`).
+    /// Every policy, in the order the dashboard lists them.
+    pub const ALL: [DelegationPolicy; 4] = [
+        DelegationPolicy::Department,
+        DelegationPolicy::Hierarchy,
+        DelegationPolicy::Open,
+        DelegationPolicy::Disabled,
+    ];
+
+    /// Stable wire string (`department` / `hierarchy` / `open` / `none`).
     pub fn as_str(&self) -> &'static str {
         match self {
             DelegationPolicy::Department => "department",
             DelegationPolicy::Hierarchy => "hierarchy",
             DelegationPolicy::Open => "open",
+            DelegationPolicy::Disabled => "none",
         }
     }
 
@@ -200,7 +229,15 @@ impl DelegationPolicy {
             DelegationPolicy::Department => "部門(department)",
             DelegationPolicy::Hierarchy => "階級(hierarchy)",
             DelegationPolicy::Open => "開放(open)",
+            DelegationPolicy::Disabled => "不允許委派(none)",
         }
+    }
+
+    /// Do `[delegation] allow` pairs take part in decisions under this
+    /// policy? Only `department` and `hierarchy` consult them (`open` allows
+    /// everything anyway; `none` ignores them by design).
+    pub fn honors_allow_pairs(&self) -> bool {
+        matches!(self, DelegationPolicy::Department | DelegationPolicy::Hierarchy)
     }
 
     /// Parse a config value. Case- and whitespace-insensitive; unknown ⇒ `None`.
@@ -209,27 +246,36 @@ impl DelegationPolicy {
             "department" => Some(DelegationPolicy::Department),
             "hierarchy" => Some(DelegationPolicy::Hierarchy),
             "open" => Some(DelegationPolicy::Open),
+            "none" => Some(DelegationPolicy::Disabled),
             _ => None,
         }
     }
 
-    /// Parse for config loading: an unrecognised value falls back to the
-    /// (stricter) default and returns a warning string for the caller to log,
-    /// rather than silently widening or narrowing what the operator asked for.
+    /// Parse for config loading. Since v1.82 (RM-137) an unrecognised value
+    /// fails closed to [`DelegationPolicy::Disabled`] (it used to fall back to
+    /// the wider `department`) and returns a warning string for the caller to
+    /// log once ([`warn_policy_once`]) and to show on the dashboard.
     pub fn from_config_value(value: &str) -> (Self, Option<String>) {
         match Self::parse(value) {
             Some(p) => (p, None),
             None => (
-                Self::default(),
+                DelegationPolicy::Disabled,
                 Some(format!(
-                    "config.toml [delegation] policy = \"{}\" 無法辨識,已改用預設值 \"{}\"。\
-                     可用值:department / hierarchy / open。",
+                    "config.toml [delegation] policy = \"{}\" 無法辨識,已視為 \"none\"(不允許 AI 員工之間委派)。\
+                     可用值:department / hierarchy / open / none。",
                     crate::truncate_chars(value.trim(), 40),
-                    Self::default().as_str()
                 )),
             ),
         }
     }
+}
+
+/// Log a policy-level `[delegation]` problem (unrecognised value, unreadable
+/// config) once per process. The gates re-read the config on every decision;
+/// without this the same line would repeat for every message.
+pub fn warn_policy_once(message: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| tracing::warn!("{message}"));
 }
 
 // ── Whitelist pairs (WP21 T11 — design doc §2.1 rule 5b, §2.2) ────────────────
@@ -485,12 +531,16 @@ pub enum DenyReason {
     /// (`on_behalf_of`, `[delegation] human_principal = "enforce"`) may not
     /// hand work to the target, or could not be resolved.
     HumanPrincipalNotPermitted,
+    /// The policy is [`DelegationPolicy::Disabled`] (`none`, an unrecognised
+    /// value, or an unreadable config): no AI employee delegates to another.
+    DelegationDisabled,
 }
 
 impl DenyReason {
     /// Stable machine code for audit logs.
     pub fn as_str(&self) -> &'static str {
         match self {
+            DenyReason::DelegationDisabled => "delegation_disabled",
             DenyReason::SelfDelegation => "self_delegation",
             DenyReason::InvalidAgentId => "invalid_agent_id",
             DenyReason::NoHierarchyRelation => "no_hierarchy_relation",
@@ -529,6 +579,13 @@ impl DelegationDenied {
         let s = short_id(&self.sender);
         let t = short_id(&self.target);
         match self.reason {
+            DenyReason::DelegationDisabled => format!(
+                "委派遭拒:「{s}」不能把工作交給「{t}」— 委派政策是 {},AI 員工之間不能互相委派、\
+                 傳訊、建立或指派工作(跨部門協作配對在這個政策下不生效)。設定值無法辨識或 config.toml \
+                 無法讀取時也一律視為這個政策。可行處理:請管理員在 dashboard「委派權限」改成其他模式,\
+                 或修正 config.toml 的 [delegation] policy。",
+                self.policy.label_zh()
+            ),
             DenyReason::HumanPrincipalNotPermitted => format!(
                 "委派遭拒:發出這個指令的人沒有權限把工作交給「{t}」(「{s}」本身可以委派,\
                  但 [delegation] human_principal = \"enforce\" 也要求真人有權限)。\
@@ -536,7 +593,7 @@ impl DelegationDenied {
                  ② 改由有權限的人直接交辦;③ 需要時把 human_principal 改回 \"record\"。"
             ),
             DenyReason::SelfDelegation => format!(
-                "委派遭拒:「{s}」不可委派給自己。自我委派會形成回音迴圈,三種委派政策皆禁止。"
+                "委派遭拒:「{s}」不可委派給自己。自我委派會形成回音迴圈,所有委派政策皆禁止。"
             ),
             DenyReason::InvalidAgentId => {
                 "委派遭拒:發送者或目標的 agent 名稱為空,無法判定從屬關係,依 fail-closed 原則拒絕。"
@@ -688,6 +745,13 @@ fn can_delegate_ext_impl(
         return Ok(());
     }
 
+    // RM-137: `none` (and every value that resolves to it) stops every agent
+    // sender here — before the ancestor rules and before the whitelist, so an
+    // explicit `[delegation] allow` pair does not pass either.
+    if policy == DelegationPolicy::Disabled {
+        return deny(DenyReason::DelegationDisabled);
+    }
+
     // Open skips rules ③–⑤b entirely (escape hatch = pre-WP21 behaviour).
     if policy == DelegationPolicy::Open {
         return Ok(());
@@ -739,9 +803,11 @@ fn can_delegate_ext_impl(
                 deny(DenyReason::DifferentDepartment)
             }
         }
-        // Unreachable: Open returned Ok above. Kept exhaustive rather than
-        // wildcarded so a future policy variant must state its denial reason.
+        // Unreachable: Open returned Ok and Disabled denied above. Kept
+        // exhaustive rather than wildcarded so a future policy variant must
+        // state its denial reason.
         DelegationPolicy::Open => deny(DenyReason::NoHierarchyRelation),
+        DelegationPolicy::Disabled => deny(DenyReason::DelegationDisabled),
     }
 }
 
@@ -758,7 +824,8 @@ fn can_delegate_ext_impl(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct DelegationConfig {
-    /// `department` (default) / `hierarchy` / `open`.
+    /// `department` (default) / `hierarchy` / `open` / `none`. Anything else
+    /// resolves to `none` (RM-137).
     pub policy: String,
     /// `allow = [["a", "b"], ...]` — unordered whitelist pairs (design doc
     /// §2.2). Defaults to empty when the key is absent.
@@ -788,19 +855,31 @@ impl Default for DelegationConfig {
 /// extract every section from that one `toml::Table`, instead of each
 /// extractor re-reading and re-parsing the whole file independently.
 ///
-/// Same fail-closed defaults as `from_home`: a missing/non-table
-/// `[delegation]` section ⇒ [`DelegationConfig::default`] (`department`,
-/// empty `allow`).
+/// A missing `[delegation]` section or a missing `policy` key ⇒ the default
+/// (`department`, empty `allow`). Since v1.82 (RM-137) a `[delegation]` that
+/// is present but not a table, and a `policy` that is not a string, keep
+/// their TOML rendering as the raw policy value, so they resolve like any
+/// other unrecognised value: to `none`, with a warning.
 pub fn delegation_config_from_table(table: &toml::Table) -> DelegationConfig {
-    let Some(section) = table.get("delegation").and_then(|v| v.as_table()) else {
-        return DelegationConfig::default();
+    let section = match table.get("delegation") {
+        None => return DelegationConfig::default(),
+        Some(value) => match value.as_table() {
+            Some(section) => section,
+            None => {
+                return DelegationConfig {
+                    policy: value.to_string(),
+                    ..DelegationConfig::default()
+                };
+            }
+        },
     };
 
-    let policy = section
-        .get("policy")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| DelegationPolicy::default().as_str().to_string());
+    let policy = match section.get("policy") {
+        None => DelegationPolicy::default().as_str().to_string(),
+        Some(toml::Value::String(s)) => s.clone(),
+        // Not a string: unrecognised (fail closed), never the default.
+        Some(other) => other.to_string(),
+    };
 
     let allow = section
         .get("allow")
@@ -841,9 +920,11 @@ pub fn delegation_config_from_table(table: &toml::Table) -> DelegationConfig {
 
 impl DelegationConfig {
     /// Load `[delegation]` from `<home>/config.toml`. Parsed in isolation from a
-    /// generic `toml::Table` (same shape as `DispatchGuardConfig::from_home`), so
-    /// unrelated or malformed config elsewhere can never make this fail —
-    /// absent / malformed section ⇒ defaults (`department`, empty `allow`).
+    /// generic `toml::Table` (same shape as `DispatchGuardConfig::from_home`).
+    /// No file ⇒ defaults (`department`, empty `allow`). Since v1.82
+    /// (RM-137) a file that exists but cannot be read or parsed ⇒ policy
+    /// `none` (a gate that cannot read its config denies);
+    /// [`read_delegation_config`] also reports why.
     ///
     /// `policy` and `allow` are each pulled out of the raw table independently
     /// (rather than one `try_into::<DelegationConfig>()` call) so a
@@ -852,14 +933,18 @@ impl DelegationConfig {
     /// point of "壞項忽略,不整段失效" (design doc §2.2) applies to the section
     /// as a whole, not just to individual `allow` pairs.
     pub fn from_home(home_dir: &Path) -> Self {
-        let path = home_dir.join("config.toml");
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        let Ok(table) = content.parse::<toml::Table>() else {
-            return Self::default();
-        };
-        delegation_config_from_table(&table)
+        match read_config_table(home_dir) {
+            Ok(table) => delegation_config_from_table(&table),
+            Err(_) => Self::unreadable(),
+        }
+    }
+
+    /// The fail-closed stand-in for a config that could not be read.
+    fn unreadable() -> Self {
+        Self {
+            policy: DelegationPolicy::Disabled.as_str().to_string(),
+            ..Self::default()
+        }
     }
 
     /// Resolved policy plus an optional warning about an unrecognised value.
@@ -891,15 +976,134 @@ impl DelegationConfig {
     }
 }
 
-/// Convenience for call sites that just need the effective policy: reads
-/// `<home>/config.toml [delegation] policy` and logs a warning once if the
-/// value is unrecognised.
-pub fn policy_from_home(home_dir: &Path) -> DelegationPolicy {
-    let (policy, warning) = DelegationConfig::from_home(home_dir).resolve();
-    if let Some(w) = warning {
-        tracing::warn!("{w}");
+/// [`DelegationConfigRead::config_error_kind`]: `config.toml` exists but
+/// could not be read (I/O error, permissions, not UTF-8).
+pub const CONFIG_ERROR_UNREADABLE: &str = "unreadable";
+/// [`DelegationConfigRead::config_error_kind`]: `config.toml` was read but is
+/// not valid TOML.
+pub const CONFIG_ERROR_UNPARSABLE: &str = "unparsable";
+
+/// Read and parse `<home>/config.toml`. `Ok(empty)` when the file does not
+/// exist; `Err((kind, reason))` when it exists but cannot be read or is not
+/// valid TOML — `kind` is [`CONFIG_ERROR_UNREADABLE`] /
+/// [`CONFIG_ERROR_UNPARSABLE`] (content-free), `reason` is zh-TW with no path
+/// but MAY quote raw config text (the TOML parse excerpt).
+fn read_config_table(home_dir: &Path) -> Result<toml::Table, (&'static str, String)> {
+    match std::fs::read_to_string(home_dir.join("config.toml")) {
+        Ok(content) => content.parse::<toml::Table>().map_err(|e| {
+            (
+                CONFIG_ERROR_UNPARSABLE,
+                format!("config.toml 不是有效的 TOML:{}", crate::truncate_chars(&e.to_string(), 200)),
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(e) => Err((CONFIG_ERROR_UNREADABLE, format!("config.toml 無法讀取:{e}"))),
     }
-    policy
+}
+
+/// Everything one read of `[delegation]` produced — the rules the gates
+/// enforce plus what the dashboard needs to explain them (RM-137).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationConfigRead {
+    /// What every gate enforces.
+    pub rules: DelegationRules,
+    /// The `policy` value as written, when the key is present (non-string
+    /// values in their TOML rendering).
+    pub configured_policy: Option<String>,
+    /// Set when the configured policy was not recognised (enforced as `none`).
+    pub policy_warning: Option<String>,
+    /// One line per dropped `[delegation] allow` entry.
+    pub allow_warnings: Vec<String>,
+    /// Set when `config.toml` exists but could not be read or parsed
+    /// (enforced as `none`). May quote raw config text (the TOML parse
+    /// excerpt): show it to an Admin only; everyone else gets
+    /// [`Self::config_error_kind`].
+    pub config_error: Option<String>,
+    /// Content-free category of [`Self::config_error`]
+    /// ([`CONFIG_ERROR_UNREADABLE`] / [`CONFIG_ERROR_UNPARSABLE`]); `Some`
+    /// exactly when `config_error` is.
+    pub config_error_kind: Option<&'static str>,
+}
+
+impl DelegationConfigRead {
+    fn from_table(table: &toml::Table) -> Self {
+        let cfg = delegation_config_from_table(table);
+        let configured_policy = match table.get("delegation") {
+            None => None,
+            Some(v) => match v.as_table() {
+                None => Some(v.to_string()),
+                Some(section) => section.get("policy").map(|p| match p {
+                    toml::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                }),
+            },
+        };
+        let (policy, policy_warning) = cfg.resolve();
+        let (allow_pairs, allow_warnings) = resolve_allow_pairs(&cfg.allow);
+        Self {
+            rules: DelegationRules {
+                policy,
+                allow_pairs,
+            },
+            configured_policy,
+            policy_warning,
+            allow_warnings,
+            config_error: None,
+            config_error_kind: None,
+        }
+    }
+
+    fn unreadable(kind: &'static str, reason: String) -> Self {
+        Self {
+            rules: DelegationRules {
+                policy: DelegationPolicy::Disabled,
+                allow_pairs: Vec::new(),
+            },
+            configured_policy: None,
+            policy_warning: None,
+            allow_warnings: Vec::new(),
+            config_error: Some(format!(
+                "{reason}。在修正前,AI 員工之間一律不能委派(視為 \"none\")。"
+            )),
+            config_error_kind: Some(kind),
+        }
+    }
+
+    /// Log the policy-level problem once per process and every dropped
+    /// `allow` entry (the pre-v1.82 behaviour for those).
+    fn log(&self) {
+        if let Some(e) = self.config_error.as_deref().or(self.policy_warning.as_deref()) {
+            warn_policy_once(e);
+        }
+        for w in &self.allow_warnings {
+            tracing::warn!("{w}");
+        }
+    }
+}
+
+/// Read `<home>/config.toml [delegation]` for a gate or the dashboard.
+/// No file ⇒ defaults; an unreadable or unparsable file ⇒ policy `none` with
+/// [`DelegationConfigRead::config_error`] set. Never logs.
+pub fn read_delegation_config(home_dir: &Path) -> DelegationConfigRead {
+    match read_config_table(home_dir) {
+        Ok(table) => DelegationConfigRead::from_table(&table),
+        Err((kind, reason)) => DelegationConfigRead::unreadable(kind, reason),
+    }
+}
+
+/// [`read_delegation_config`] over an already-parsed table (no
+/// `config_error` is possible). Never logs.
+pub fn delegation_config_read_from_table(table: &toml::Table) -> DelegationConfigRead {
+    DelegationConfigRead::from_table(table)
+}
+
+/// Convenience for call sites that just need the effective policy: reads
+/// `<home>/config.toml [delegation] policy` and logs a warning once per
+/// process if the value is unrecognised or the file unreadable (both ⇒ `none`).
+pub fn policy_from_home(home_dir: &Path) -> DelegationPolicy {
+    let read = read_delegation_config(home_dir);
+    read.log();
+    read.rules.policy
 }
 
 /// Strict by default. Explicit false also requires a future UTC grace deadline
@@ -983,22 +1187,19 @@ fn identity_grace_valid(section: &toml::Table, now: chrono::DateTime<chrono::Utc
 /// — see [`delegation_config_from_table`] for why a call site would want
 /// that (reading `[delegation]` alongside other sections in one file pass).
 pub fn delegation_rules_from_table(table: &toml::Table) -> DelegationRules {
-    let (rules, warnings) = delegation_config_from_table(table).resolve_rules();
-    for w in warnings {
-        tracing::warn!("{w}");
-    }
-    rules
+    let read = DelegationConfigRead::from_table(table);
+    read.log();
+    read.rules
 }
 
 /// Convenience for call sites that need the full [`DelegationRules`] (policy
-/// + whitelist): reads `<home>/config.toml [delegation]` and logs a warning
-/// for the policy value (if unrecognised) and for each dropped `allow` entry.
+/// + whitelist): reads `<home>/config.toml [delegation]`, logs the policy
+/// problem (unrecognised value / unreadable file ⇒ `none`) once per process
+/// and a warning for each dropped `allow` entry.
 pub fn delegation_rules_from_home(home_dir: &Path) -> DelegationRules {
-    let (rules, warnings) = DelegationConfig::from_home(home_dir).resolve_rules();
-    for w in warnings {
-        tracing::warn!("{w}");
-    }
-    rules
+    let read = read_delegation_config(home_dir);
+    read.log();
+    read.rules
 }
 
 #[cfg(test)]
@@ -1304,15 +1505,23 @@ mod tests {
             Some(DelegationPolicy::Open)
         );
         assert_eq!(DelegationPolicy::parse("closed"), None);
+        assert_eq!(
+            DelegationPolicy::parse(" None "),
+            Some(DelegationPolicy::Disabled)
+        );
         assert_eq!(DelegationPolicy::default(), DelegationPolicy::Department);
-        for p in ALL {
+        for p in DelegationPolicy::ALL {
             assert_eq!(DelegationPolicy::parse(p.as_str()), Some(p));
         }
 
+        // RM-137: an unrecognised value fails closed to `none`, not the
+        // wider default.
         let (p, warn) = DelegationPolicy::from_config_value("nonsense");
-        assert_eq!(p, DelegationPolicy::Department);
-        assert!(warn.expect("warning").contains("nonsense"));
+        assert_eq!(p, DelegationPolicy::Disabled);
+        let warn = warn.expect("warning");
+        assert!(warn.contains("nonsense") && warn.contains("none"), "{warn}");
         assert!(DelegationPolicy::from_config_value("open").1.is_none());
+        assert!(DelegationPolicy::from_config_value("none").1.is_none());
     }
 
     #[test]
@@ -1349,27 +1558,169 @@ mod tests {
         );
         assert_eq!(policy_from_home(home), DelegationPolicy::Open);
 
-        // Unknown value ⇒ default + warning.
+        // Unknown value ⇒ `none` + warning (RM-137: fail closed).
         std::fs::write(
             home.join("config.toml"),
             "[delegation]\npolicy = \"anarchy\"\n",
         )
         .unwrap();
         let (p, warn) = DelegationConfig::from_home(home).resolve();
-        assert_eq!(p, DelegationPolicy::Department);
+        assert_eq!(p, DelegationPolicy::Disabled);
         assert!(warn.is_some());
+        assert_eq!(policy_from_home(home), DelegationPolicy::Disabled);
 
-        // Wrong type / malformed section ⇒ defaults, never a panic.
-        std::fs::write(home.join("config.toml"), "[delegation]\npolicy = 42\n").unwrap();
-        assert_eq!(
-            DelegationConfig::from_home(home).policy(),
-            DelegationPolicy::Department
+        // Wrong type / malformed section / unparsable file ⇒ `none`, never a
+        // panic and never the wider default.
+        for body in [
+            "[delegation]\npolicy = 42\n",
+            "[delegation]\npolicy = \"\"\n",
+            "delegation = false\n",
+            "not = valid = toml",
+        ] {
+            std::fs::write(home.join("config.toml"), body).unwrap();
+            assert_eq!(
+                DelegationConfig::from_home(home).policy(),
+                DelegationPolicy::Disabled,
+                "{body:?}"
+            );
+            assert_eq!(policy_from_home(home), DelegationPolicy::Disabled, "{body:?}");
+        }
+    }
+
+    // ── RM-137: `policy = "none"` ────────────────────────────────────────────
+
+    /// The full matrix under `none`: every agent pair is denied with
+    /// `delegation_disabled` — parent→child, child→parent, same department,
+    /// cross-department, and an explicit allow pair in both directions.
+    #[test]
+    fn none_policy_denies_every_agent_pair_including_allow_pairs() {
+        let rules = rules_with(
+            DelegationPolicy::Disabled,
+            &[("sales_lead", "mkt_lead"), ("sales_rep", "mkt_rep")],
         );
-        std::fs::write(home.join("config.toml"), "not = valid = toml").unwrap();
+        for (s, t) in [
+            ("sales_lead", "sales_rep"),
+            ("sales_rep", "sales_lead"),
+            ("ceo", "sales_rep"),
+            ("sales_rep", "ceo"),
+            ("sales_rep", "sales_rep2"),
+            ("sales_rep", "mkt_rep"),
+            ("sales_lead", "mkt_lead"),
+            ("mkt_lead", "sales_lead"),
+            ("mkt_rep", "sales_rep"),
+            ("ghost", "sales_rep"),
+        ] {
+            let d = can_delegate_rules(&rules, &org(), s, t)
+                .expect_err("`none` must deny every agent pair");
+            assert_eq!(d.reason, DenyReason::DelegationDisabled, "{s} -> {t}");
+            assert_eq!(d.reason.as_str(), "delegation_disabled");
+            assert_eq!(d.policy, DelegationPolicy::Disabled);
+            // The bare predicate agrees with the rules-aware one.
+            assert!(can_delegate(DelegationPolicy::Disabled, &org(), s, t).is_err());
+        }
+        // The same pairs under the other policies are what the matrix says
+        // they are — `none` is the only one that refuses the allow pair.
+        for p in [DelegationPolicy::Department, DelegationPolicy::Hierarchy] {
+            let r = rules_with(p, &[("sales_lead", "mkt_lead")]);
+            assert!(can_delegate_rules(&r, &org(), "sales_lead", "mkt_lead").is_ok(), "{p:?}");
+        }
+        assert!(DelegationPolicy::Department.honors_allow_pairs());
+        assert!(DelegationPolicy::Hierarchy.honors_allow_pairs());
+        assert!(!DelegationPolicy::Disabled.honors_allow_pairs());
+    }
+
+    /// People and configured schedules are not AI employees: they still
+    /// address any employee under `none`. Self-delegation keeps its own
+    /// reason; a trusted ACP client (an outside party, not an employee)
+    /// keeps the reach `[acp] trusted` gives it.
+    #[test]
+    fn none_policy_still_lets_system_senders_through() {
+        for sender in SYSTEM_SENDERS {
+            assert!(
+                can_delegate(DelegationPolicy::Disabled, &org(), sender, "mkt_rep").is_ok(),
+                "{sender}"
+            );
+        }
+        assert!(can_delegate_ext(
+            DelegationPolicy::Disabled,
+            &org(),
+            ACP_CLIENT_SENDER,
+            "mkt_rep",
+            &[ACP_CLIENT_SENDER]
+        )
+        .is_ok());
         assert_eq!(
-            DelegationConfig::from_home(home).policy(),
-            DelegationPolicy::Department
+            denial(DelegationPolicy::Disabled, "sales_rep", "sales_rep").reason,
+            DenyReason::SelfDelegation
         );
+        assert_eq!(
+            denial(DelegationPolicy::Disabled, ACP_CLIENT_SENDER, "mkt_rep").reason,
+            DenyReason::DelegationDisabled
+        );
+    }
+
+    #[test]
+    fn none_denial_message_explains_the_policy_without_paths() {
+        let d = denial(DelegationPolicy::Disabled, "sales_rep", "mkt_rep");
+        let msg = d.message_zh();
+        assert!(msg.contains("sales_rep") && msg.contains("mkt_rep"), "{msg}");
+        assert!(msg.contains("none") && msg.contains("委派權限"), "{msg}");
+        assert!(!msg.contains("agent.toml") && !msg.contains('/'), "{msg}");
+    }
+
+    /// `read_delegation_config` — the reader behind the gates and
+    /// `delegation.effective`: the raw value, the warning and the config
+    /// error are reported, and each of them enforces `none`.
+    #[test]
+    fn read_delegation_config_reports_why_the_policy_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        // No file: defaults, no error.
+        let read = read_delegation_config(home);
+        assert_eq!(read.rules.policy, DelegationPolicy::Department);
+        assert!(read.config_error.is_none() && read.policy_warning.is_none());
+        assert!(read.config_error_kind.is_none());
+        assert!(read.configured_policy.is_none());
+
+        // Explicit `none` with pairs: the pairs are still parsed (the
+        // dashboard shows them as inactive) but the policy is `none`.
+        std::fs::write(
+            home.join("config.toml"),
+            "[delegation]\npolicy = \"none\"\nallow = [[\"a\", \"b\"]]\n",
+        )
+        .unwrap();
+        let read = read_delegation_config(home);
+        assert_eq!(read.rules.policy, DelegationPolicy::Disabled);
+        assert_eq!(read.configured_policy.as_deref(), Some("none"));
+        assert_eq!(read.rules.allow_pairs, vec![("a".to_string(), "b".to_string())]);
+        assert!(read.policy_warning.is_none() && read.config_error.is_none());
+        assert!(can_delegate_rules(&read.rules, &MapOrgView::new(), "a", "b").is_err());
+
+        // Unknown value: warning, enforced as none.
+        std::fs::write(home.join("config.toml"), "[delegation]\npolicy = \"closed\"\n").unwrap();
+        let read = read_delegation_config(home);
+        assert_eq!(read.rules.policy, DelegationPolicy::Disabled);
+        assert_eq!(read.configured_policy.as_deref(), Some("closed"));
+        assert!(read.policy_warning.as_deref().is_some_and(|w| w.contains("closed")));
+        assert!(read.config_error.is_none());
+
+        // Unparsable file: config_error, enforced as none, no pairs.
+        std::fs::write(home.join("config.toml"), "[delegation\npolicy = \"open\"\n").unwrap();
+        let read = read_delegation_config(home);
+        assert_eq!(read.rules.policy, DelegationPolicy::Disabled);
+        assert!(read.rules.allow_pairs.is_empty());
+        assert!(read.config_error.is_some());
+        assert_eq!(read.config_error_kind, Some(CONFIG_ERROR_UNPARSABLE));
+        assert_eq!(delegation_rules_from_home(home).policy, DelegationPolicy::Disabled);
+
+        // Unreadable (a directory where the file should be): same.
+        std::fs::remove_file(home.join("config.toml")).unwrap();
+        std::fs::create_dir(home.join("config.toml")).unwrap();
+        let read = read_delegation_config(home);
+        assert_eq!(read.rules.policy, DelegationPolicy::Disabled);
+        assert!(read.config_error.is_some());
+        assert_eq!(read.config_error_kind, Some(CONFIG_ERROR_UNREADABLE));
     }
 
     #[test]

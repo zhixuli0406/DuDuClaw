@@ -199,6 +199,29 @@ pub(crate) const SELF_AUTHORITY_PARAMS: &[&str] = &[
     "role",
 ];
 
+/// RM-137 H4: every `agent_update` parameter that creates, resumes or
+/// reschedules background work for the target employee. The handler accepts
+/// no other proactive / tick / schedule field (`[heartbeat]` has only
+/// `enabled` and `cron` here; `[agent] status` is what the heartbeat scheduler
+/// and the proactive invoker check before running an employee). Shared with
+/// [`changes_background_work`].
+pub(crate) const BACKGROUND_WORK_PARAMS: &[&str] = &["status", "heartbeat_enabled", "heartbeat_cron"];
+
+/// RM-137 H4: the AI employee that must pass the delegation predicate for
+/// this `agent_update` — `Some(caller)` when an AI employee changes a
+/// [`BACKGROUND_WORK_PARAMS`] field of ANOTHER employee. Operators and
+/// self-edits keep today's rule (`None`).
+pub(crate) fn background_delegation_sender<'a>(
+    actor: RecordActor<'a>,
+    target: &str,
+    params: &Value,
+) -> Option<&'a str> {
+    let me = actor.agent()?;
+    (me.trim() != target.trim()
+        && BACKGROUND_WORK_PARAMS.iter().any(|k| params.get(*k).is_some()))
+    .then_some(me)
+}
+
 /// Update one or more fields of an existing agent's `agent.toml` (see the
 /// notes at the top of this file for the org gate).
 ///
@@ -253,6 +276,22 @@ pub(crate) async fn handle_agent_update(
         "調整 AI 員工設定"
     };
     if let Err(reason) = check_org_subject_allowed(home_dir, caller, agent_id, subject_what).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {reason}")}],
+            "isError": true
+        });
+    }
+
+    // RM-137 H4: starting, resuming, pausing or rescheduling another
+    // employee's background work (the heartbeat scheduler and the proactive
+    // invoker run it afterwards) is delegation, so it must pass the delegation
+    // predicate as well — refused under `none`. Re-checked inside the locked
+    // write below.
+    let background_sender = background_delegation_sender(actor, agent_id, params);
+    if let Some(me) = background_sender
+        && let Err(reason) =
+            check_delegation_allowed(home_dir, me, agent_id, "agent_update_background").await
+    {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: {reason}")}],
             "isError": true
@@ -719,6 +758,11 @@ pub(crate) async fn handle_agent_update(
         }
         Ok(())
     }, || {
+        // RM-137 H4: the policy / org tree may have changed since the front
+        // check; decide again under the agent.toml lock.
+        if let Some(me) = background_sender {
+            check_delegation_allowed_blocking(home_dir, me, agent_id, "agent_update_background")?;
+        }
         if background_edit {
             if stopping {
                 check_background_caller(home_dir, actor, "agent_update")?;

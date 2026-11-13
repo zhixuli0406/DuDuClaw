@@ -29,10 +29,30 @@ impl Drop for TempDir {
 
 const TASK: &str = "6f1c2a8e-1111-4222-8333-444455556666";
 
-/// Scaffold a role member the way WP-2's ephemeral spawn does — including
-/// the `parent` key, which `read_team_member_identity` must tolerate
-/// (`ephemeral::scaffold_with` writes all four of role/task_id/round/parent).
+/// Scaffold a VERIFIED role member the way WP-2's ephemeral spawn does —
+/// under `agents/.ephemeral/<eph-id>/`, with `ephemeral.toml` naming the same
+/// parent as `[team_member]` (RM-137 H1: nothing else is a member). A plain
+/// `id` is turned into `eph-<id>`; the member id actually created is returned
+/// and is what the caller must pass to the tool.
 fn mk_member(
+    home: &std::path::Path,
+    id: &str,
+    role: &str,
+    task: Option<&str>,
+    round: Option<u32>,
+) -> String {
+    let member = if duduclaw_gateway::ephemeral::is_ephemeral_id(id) {
+        id.to_string()
+    } else {
+        format!("eph-{id}")
+    };
+    mk_ephemeral_member(home, &member, role, task, round);
+    member
+}
+
+/// What RM-137 H1 closes: an ORDINARY employee (`agents/<id>/`) that writes a
+/// complete, pinned `[team_member]` into its own `agent.toml`.
+fn mk_forged_member(
     home: &std::path::Path,
     id: &str,
     role: &str,
@@ -113,6 +133,14 @@ fn text_of(v: &Value) -> String {
 fn refusal_code(v: &Value) -> String {
     assert!(is_error(v), "expected a refusal, got {v}");
     text_of(v).split(':').next().unwrap().to_string()
+}
+
+/// The handler as a gateway-spawned role member calls it: with the
+/// token-verified identity of `agent` (RM-137 soft identity mode — an
+/// unverified caller is refused, see `unverified_role_member_is_refused`).
+/// Shadows the module's `handle_team_handoff` for every test in this module.
+async fn handle_team_handoff(args: &Value, home: &std::path::Path, agent: &str) -> Value {
+    crate::mcp::with_token_verified_caller(agent, super::handle_team_handoff(args, home, agent)).await
 }
 
 async fn call(home: &std::path::Path, agent: &str, packet: &TaskPacket) -> Value {

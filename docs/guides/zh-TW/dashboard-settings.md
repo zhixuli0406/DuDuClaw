@@ -232,6 +232,23 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 
 自訂類別與額外關鍵字在進階設定編輯器的 `[memory_privacy.custom_keywords]` 設定（例如 `legal_dispute = ["訴訟", "lawsuit"]`），再列入 `excluded_categories`。未知的類別名稱在儲存時會被拒絕。`config.toml` 讀不到或區段無效時，閘道會套用四個預設類別並記錄警告，`system.config` 會回報 `memory_privacy.load_state = "failed_closed"`。細節與「我的記憶」RPC 見[記憶智慧](../../features/zh-TW/20-memory-intelligence.md)中的「自動記憶不保存的個人話題」一節。
 
+## 設定 → 進階 → 安全與紀錄 → 委派權限
+
+僅限管理員（`delegation.get`／`delegation.set`）。儲存後下一次委派判斷就生效，不需重新啟動。
+
+| 控制項 | 設定鍵 | 生效時機 |
+|---|---|---|
+| 委派模式 → 部門模式（預設）／階層模式／開放模式／不允許委派（v1.82） | `config.toml [delegation] policy` = `department`／`hierarchy`／`open`／`none` | 下一次委派 |
+| 跨部門協作 → 配對 | `[delegation] allow = [["a", "b"], …]` | 下一次委派 |
+
+**不允許委派（`none`，v1.82.0）。** AI 員工之間不能互相委派、傳訊、呼叫、建立員工或指派工作：`send_to_agent`、`spawn_agent`、`spawn_ephemeral`、`create_agent`、指派給其他員工的 `tasks_create`／`create_task`、改派任務、替其他員工排程，以及工作佇列的分派閘門都會拒絕。前四個工具不會出現在員工的工具清單；`tasks_create`、`create_task` 仍列出，供員工處理自己的工作。跨部門配對會保留但不生效（頁面會標示）。人與你設定的排程（儀表板、cron、heartbeat、目標循環）仍可把工作交給員工。團隊模式（同一位員工的規劃、執行、檢查角色在同一回合內交換任務封包）照常運作。
+
+**無法辨識的值一律視為不允許委派（v1.82.0 行為變更）。** `policy` 不是這四個值之一（打錯字、數字）、`[delegation]` 不是區段，或 `config.toml` 存在但讀不到、格式錯誤時，一律以 `none` 執行。v1.82.0 以前會改用較寬的 `department`。閘道每個程序只記錄一次警告；頁面會在警告區列出，`delegation.get` 以 `configured_policy` 回傳原始值；檔案無法解析時，`delegation.get` 與 `delegation.set` 都回傳錯誤，不會寫入任何內容。請在設定檔進階編輯修正。
+
+**讀取失敗不會蓋掉設定（v1.82.0）。** 頁面讀不到目前設定時會顯示錯誤，所有選項與「儲存」都停用，直到「再試一次」成功為止；不會送出沒有讀到的內容。
+
+**員工頁 → 總覽 → 委派範圍（v1.82.0）。** 唯讀卡片顯示這位員工實際適用的設定：生效的委派模式、來自全公司設定還是員工自己的「允許跨 AI 員工通訊」開關（`[permissions] can_send_cross_agent = false` 會讓這位員工視為 `none`）、能否建立員工或臨時助手、和他有關的配對（目前模式下不生效的另外列出），以及設定檔的問題。管理員與有權查看這位員工的經理可以看到（`delegation.effective {agent_id}`，唯讀）。配對設定有寫錯而被忽略的項目時，卡片只顯示數量（「委派設定有 N 則警告，管理員可以到「設定」查看」）；警告原文會引用原始設定內容，只在本頁（管理員）顯示。要修改請到本頁或員工編輯頁。
+
 ## 通道管理
 
 - 群組「只回提及」（`mention_only`，每個群組各自設定）：v1.76 起，LINE 群組開啟後只回應用 `@` 叫 AI 員工（或要 @ 名單）的訊息，以及被點名員工正在等的那一則；以前開了會整個群組沒有回應。Telegram 共用 bot 也接受員工名字。見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)。
@@ -380,7 +397,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 **誰能存檔（v1.76.0，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔v1760)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 
-**權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。`can_create_agents` 例外：從 v1.81.0 起，沒寫這個鍵時只有 `main` 員工視為 `true`，其他員工視為 `false`；v1.68 的開機遷移不再替非 main 員工打開它；透過 MCP `create_agent` 建立的員工一律為 `false`（見[安全防線](../../features/zh-TW/05-security-defense.md)）。這頁的開關在缺少這個鍵時會顯示為開啟，即使實際值是關閉；請查看 `agent.toml`，或明確設定開關。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
+**權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。`can_create_agents` 例外：從 v1.81.0 起，沒寫這個鍵時只有 `main` 員工視為 `true`，其他員工視為 `false`；v1.68 的開機遷移不再替非 main 員工打開它；透過 MCP `create_agent` 建立的員工一律為 `false`（見[安全防線](../../features/zh-TW/05-security-defense.md)）。從 v1.82.0 起，這頁的開關顯示閘門實際套用的值（`agents.inspect` 的 `effective_permissions`，和 MCP 閘門用同一個讀取函式）：非 main 員工沒寫 `can_create_agents` 時顯示為關閉，`agent.toml` 讀不到、或舊版 gateway 沒有回傳 `effective_permissions` 時全部顯示為關閉（不沿用檔案內的值）。沒有動過的開關不會在儲存時送出，所以沒改動的表單不會改變任何權限。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
 
 ## 管理 → 成員：直屬主管與組織圖（企業版，1.76.0）
 

@@ -111,6 +111,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 | `[knowledge] enabled` 加集合授權 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | 除非知識庫啟用、且至少有一個集合授權給員工或其部門（經 `[knowledge] collections` 縮小後），否則隱藏 4 個 `knowledge_*`；授權變更會送出 `list_changed`（見下方 [`knowledge_*`](#knowledge_文件知識庫)） |
 | `[responsibilities] enabled` | `config.toml` | 隱藏 3 個 `responsibility_*`（見下方[持續任務工具](#responsibility_get--responsibility_followup--responsibility_ask持續任務工具)） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有效授權 | 在階段性授權生效前一律隱藏 |
+| 團隊角色成員（v1.82） | `agents/.ephemeral/eph-*` 角色成員，`[team_member]` 與 `ephemeral.toml` 的上層員工一致，且身分通過權杖驗證（`DUDUCLAW_AGENT_TOKEN`） | 在任何委派模式下，其他呼叫者都看不到 `team_handoff`，所以一般員工的工具清單比以前少一支；處理程式對同樣的呼叫者回 `not_a_team_member` |
 
 機器操作主控台（`/console`）只開放給管理員。`system_operator` 員工執行機器操作工具時，伺服器也會確認交辦人仍是啟用中的管理員；其他 AI 員工的一般對話仍依原有授權使用。
 

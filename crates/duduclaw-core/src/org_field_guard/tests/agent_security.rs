@@ -110,7 +110,40 @@ const SECTION_CASES: &[(&str, &str, &str)] = &[
         "[isolation]\npublic_web = false",
         "[isolation]\npublic_web = true",
     ),
+    (
+        "team_member",
+        "[team_member]\nrole = \"planner\"\ntask_id = \"t-1\"\nround = 1\nparent = \"agnes\"",
+        "[team_member]\nrole = \"planner\"\ntask_id = \"t-victim\"\nround = 3\nparent = \"agnes\"",
+    ),
 ];
+
+/// RM-137 H1: an employee can neither add a `[team_member]` record to its
+/// own `agent.toml` (forging a "pinned" role member), re-pin one, nor remove
+/// one; the operator path is unchanged.
+#[test]
+fn team_member_section_is_frozen_for_an_employee() {
+    assert!(AGENT_SECURITY_SECTIONS.contains(&"team_member"));
+    assert!(!AGENT_EDITABLE_SECTIONS.contains(&"team_member"));
+    let pinned = with("[team_member]\nrole = \"planner\"\ntask_id = \"t-victim\"\nround = 3\nparent = \"agnes\"");
+    let repinned = pinned.replace("round = 3", "round = 4");
+    for (before, after) in [
+        (BASE, pinned.as_str()),
+        (pinned.as_str(), repinned.as_str()),
+        (pinned.as_str(), BASE),
+    ] {
+        match as_agent(before, after) {
+            GuardDecision::BlockedAgentSecuritySection { changed, .. } => assert!(
+                changed.iter().any(|c| c.starts_with("team_member.") || c.starts_with("[team_member]")),
+                "{changed:?}"
+            ),
+            other => panic!("expected BlockedAgentSecuritySection, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        check_protected_toml_write_as(&agent_path(), &home(), &HookCaller::Absent, Some(BASE), &pinned),
+        GuardDecision::AllowedAgentWrite
+    );
+}
 
 /// Owner decision 2026-11-08: the protected-mode public-web switch is its own
 /// admin-only field. The employee can neither turn it on, add it, nor remove
