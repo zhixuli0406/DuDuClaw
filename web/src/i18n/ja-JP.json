@@ -11437,5 +11437,12 @@
   "identityTransition.actionFailed": "本人確認の設定は変更されていません：{error}",
   "identityTransition.restartRequired": "保存しました。AI スタッフにはすぐに適用されます。DuDuClaw 本体に猶予期間を適用するには再起動してください。",
   "identityTransition.error": "AI スタッフの本人確認設定を読み取れないため、AI スタッフは現在自分のフォルダに保存できません。config.toml の [delegation] セクションを確認してください。",
-  "identityTransition.refusals": "過去 24 時間に、本人確認ができなかったため AI スタッフがフォルダに保存できなかったことが {count} 回ありました。DuDuClaw を再起動してください。それでも続く場合はサポートにお問い合わせください。"
+  "identityTransition.refusals": "過去 24 時間に、本人確認ができなかったため AI スタッフがフォルダに保存できなかったことが {count} 回ありました。DuDuClaw を再起動してください。それでも続く場合はサポートにお問い合わせください。",
+  "users.primary.personalSelf": "これらのメンバーの個人専用 AI は、メンバー本人が設定してください。",
+  "users.primary.empty": "メイン AI に設定できる AI はありません。",
+  "users.primary.label": "メイン AI",
+  "users.primary.save": "メイン AI を設定",
+  "users.primary.missing": "{count} 人のメンバーにメイン AI がありません",
+  "users.primary.repair": "最初の AI に設定",
+  "users.primary.confirm": "以下のメンバーのメイン AI を、最も早く紐付けたオーナーまたは操作権限の AI に設定しますか？"
 }

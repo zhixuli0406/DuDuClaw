@@ -391,6 +391,46 @@ paths:
       summary: 目前有效 Admin 查看每位使用者的 user_id、email、enabled；無秘密鍵
       responses:
         '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/users.set_primary_agent:
+    post:
+      tags: [auth]
+      summary: Set or clear a member's primary AI
+      description: Dashboard WebSocket RPC. Defaults to the caller; targeting another user requires a current active Admin. The selected employee must have a live Owner or Operator binding for the target. The change and user.set_primary_agent audit record commit together. Unknown keys and invalid types are refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [agent_id]
+              properties:
+                user_id: {type: string, minLength: 1, maxLength: 256}
+                agent_id: {type: string, nullable: true, minLength: 1, maxLength: 256}
+      responses:
+        '200':
+          description: RPC result or refusal; success contains primary_agent_id
+  /rpc/users.repair_primary_agents:
+    post:
+      tags: [auth]
+      summary: Preview or confirm missing primary AI repairs (Admin only)
+      description: Dashboard WebSocket RPC. Empty params preview active users with NULL primary and Owner or Operator bindings. Each candidate selects the earliest eligible bound_at (ties use insertion order). Protected mode excludes Personal bindings using the gate ownership authority. The preview includes members, preview_digest (SHA-256 of the full ordered candidates), and excluded_personal_count. Confirm sends only preview_digest; the IMMEDIATE transaction recomputes candidates and digest and refuses a mismatch. All changes and audit records commit together. Existing nonempty preferences are untouched.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                preview_digest:
+                  type: string
+                  minLength: 64
+                  maxLength: 64
+                  description: Omit to preview; provide the preview digest to confirm. Candidate rows are never accepted.
+      responses:
+        '200':
+          description: RPC result or refusal; success contains members, preview_digest, excluded_personal_count and changed (false for preview, true for confirmation)
   /rpc/users.mfa_reset:
     post:
       tags: [auth]

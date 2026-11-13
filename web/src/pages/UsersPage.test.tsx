@@ -4,6 +4,8 @@ import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { UsersPage } from './UsersPage';
+import { EditUserDialog } from './users/UserFormDialogs';
+import type { UserDetail } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -203,5 +205,67 @@ describe('UsersPage — invitation eligibility', () => {
     } finally {
       useAuthStore.setState({ user: previousUser });
     }
+  });
+});
+
+describe('UsersPage — primary AI', () => {
+  const member = {
+    id: 'member', email: 'member@example.com', display_name: 'Member', role: 'employee', status: 'active',
+    primary_agent_id: null, created_at: '', updated_at: '', assignable_primary_agents: ['first-ai'],
+    bindings: [
+      { user_id: 'member', agent_name: 'first-ai', access_level: 'operator', bound_at: '2026-01-01' },
+      { user_id: 'member', agent_name: 'viewer-ai', access_level: 'viewer', bound_at: '2025-01-01' },
+    ],
+  } as UserDetail;
+  const preview = [{ user_id: member.id, display_name: member.display_name, agent_id: 'first-ai' }];
+
+  it('previews the named members and repairs only after confirmation', async () => {
+    const user = userEvent.setup();
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'users.list') return { users: [member] };
+      if (method === 'users.repair_primary_agents') return { members: preview, preview_digest: 'digest-1', excluded_personal_count: 1, changed: false };
+      return { identities: [], departments: [], agents: [] };
+    });
+    renderWithProviders(<UsersPage />);
+    await user.click(await screen.findByRole('button', { name: 'Set to their first AI' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText(/Member → first-ai/)).toBeInTheDocument();
+    expect(within(dialog).getByText('Personal AI for these members must be set by the members themselves.')).toBeInTheDocument();
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.repair_primary_agents', {});
+    expect(mockWsClient.call).not.toHaveBeenCalledWith('users.repair_primary_agents', { preview_digest: 'digest-1' });
+    await user.click(within(dialog).getByRole('button', { name: 'Confirm' }));
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.repair_primary_agents', { preview_digest: 'digest-1' });
+  });
+
+  it('offers only eligible bindings and saves the selected primary for that member', async () => {
+    const user = userEvent.setup();
+    const onUpdated = vi.fn();
+    renderWithProviders(<EditUserDialog user={{ ...member, primary_personal_excluded: true, bindings: [...member.bindings, { user_id: 'member', agent_name: 'private-ai', access_level: 'owner', bound_at: '' }] }} users={[member]} onClose={vi.fn()} onUpdated={onUpdated} />);
+    await user.click(screen.getByRole('combobox', { name: 'Primary AI' }));
+    expect(screen.queryByRole('option', { name: 'viewer-ai' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'private-ai' })).not.toBeInTheDocument();
+    expect(screen.getByText('Personal AI for these members must be set by the members themselves.')).toBeInTheDocument();
+    await user.click(await screen.findByRole('option', { name: 'first-ai' }));
+    await user.click(screen.getByRole('button', { name: 'Set primary AI' }));
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.set_primary_agent', { agent_id: 'first-ai', user_id: 'member' });
+    expect(onUpdated).toHaveBeenCalled();
+  });
+
+  it('uses the preview count even when users.list has no visible eligible bindings', async () => {
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'users.list') return { users: [{ ...member, bindings: [] }] };
+      if (method === 'users.repair_primary_agents') return { members: preview, preview_digest: 'digest-1', excluded_personal_count: 0, changed: false };
+      return { identities: [], departments: [], agents: [] };
+    });
+    renderWithProviders(<UsersPage />);
+    expect(await screen.findByRole('button', { name: 'Set to their first AI' })).toBeInTheDocument();
+  });
+
+  it('hides the repair action from a non-admin', async () => {
+    useAuthStore.setState({ user: { id: 'member', role: 'employee' } as never });
+    mockWsClient.call.mockImplementation(async (method: string) => method === 'users.list' ? { users: [member] } : { identities: [] });
+    renderWithProviders(<UsersPage />);
+    await screen.findByText('Member');
+    expect(screen.queryByRole('button', { name: 'Set to their first AI' })).not.toBeInTheDocument();
   });
 });

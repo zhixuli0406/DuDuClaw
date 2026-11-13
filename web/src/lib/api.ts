@@ -2609,10 +2609,20 @@ export interface UserAgentBinding {
   bound_at: string;
 }
 
+export interface PrimaryAgentRepair { user_id: string; display_name: string; agent_id: string }
+export interface PrimaryAgentRepairPreview {
+  members: PrimaryAgentRepair[];
+  preview_digest: string;
+  excluded_personal_count: number;
+  changed: boolean;
+}
+
 export interface UserDetail extends UserInfo {
   /** Server-computed eligibility; the invite RPC rechecks before issuing. */
   invite_eligible?: boolean;
   bindings: UserAgentBinding[];
+  assignable_primary_agents?: string[];
+  primary_personal_excluded?: boolean;
 }
 
 /** One AI employee a manager may call through a report (`users.my_team`). */
@@ -9731,8 +9741,10 @@ export const api = {
         status: string;
         transferred_agents: string[];
       }>,
-    setPrimaryAgent: (agentId: string | null) =>
-      client.call('users.set_primary_agent', { agent_id: agentId }) as Promise<{ primary_agent_id: string | null }>,
+    repairPrimaryAgents: (previewDigest?: string) =>
+      client.call('users.repair_primary_agents', previewDigest !== undefined ? { preview_digest: previewDigest } : {}) as Promise<PrimaryAgentRepairPreview>,
+    setPrimaryAgent: (agentId: string | null, userId?: string) =>
+      client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>
       client.call('users.me') as Promise<{
         user: UserInfo;
