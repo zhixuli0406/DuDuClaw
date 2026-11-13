@@ -21,6 +21,22 @@ pub struct UserDb {
     pub(crate) remember_key: ring::hmac::Key,
 }
 
+/// Exact repair preview; confirmation must match the current candidates.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrimaryAgentRepair {
+    pub user_id: String,
+    pub display_name: String,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PrimaryAgentRepairPreview {
+    pub members: Vec<PrimaryAgentRepair>,
+    pub preview_digest: String,
+    pub excluded_personal_count: usize,
+}
+
 const POOL_SIZE: usize = 2;
 
 impl UserDb {
@@ -266,6 +282,86 @@ impl UserDb {
             params![agent_id, Utc::now().to_rfc3339(), user_id],
         ).map_err(|e| format!("set primary agent: {e}"))?;
         if changed == 1 { Ok(()) } else { Err("agent requires an Owner or Operator binding".into()) }
+    }
+
+    /// Attribute the preference change in the same transaction as the write.
+    pub fn set_primary_agent_as(&self, actor: &str, user_id: &str, agent_id: Option<&str>) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let permitted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active'
+             AND (id = ?2 OR role = 'admin'))", params![actor, user_id], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !permitted { return Err("permission denied".into()); }
+        let now = Utc::now().to_rfc3339();
+        let changed = tx.execute(
+            "UPDATE users SET primary_agent_id = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'active'
+             AND (?1 IS NULL OR EXISTS(SELECT 1 FROM user_agent_bindings
+                 WHERE user_id = ?3 AND agent_name = ?1 AND access_level IN ('owner', 'operator')))",
+            params![agent_id, now, user_id],
+        ).map_err(|e| e.to_string())?;
+        if changed != 1 { return Err("agent requires an Owner or Operator binding".into()); }
+        tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
+            VALUES(?1, 'user.set_primary_agent', ?2, ?3, ?4)",
+            params![actor, user_id, serde_json::json!({"primary_agent_id": agent_id}).to_string(), now],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Recompute candidates under the write lock. The predicate uses the
+    /// gateway's Personal ownership authority and must fail closed.
+    pub fn repair_primary_agents(
+        &self, actor: &str, preview_digest: Option<&str>,
+        mut is_personal: impl FnMut(&str) -> Result<bool, String>,
+    ) -> Result<PrimaryAgentRepairPreview, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let admin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND role = 'admin' AND status = 'active')",
+            [actor], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !admin { return Err("permission denied".into()); }
+        let bindings = {
+            let mut stmt = tx.prepare("SELECT u.id, u.display_name, b.agent_name
+                FROM users u JOIN user_agent_bindings b ON b.user_id = u.id
+                WHERE u.status = 'active' AND u.primary_agent_id IS NULL
+                AND b.access_level IN ('owner', 'operator') ORDER BY u.id, b.bound_at, b.rowid").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([], |r| Ok(PrimaryAgentRepair {
+                user_id: r.get(0)?, display_name: r.get(1)?, agent_id: r.get(2)?,
+            })).map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        let mut members = Vec::new();
+        let mut selected = std::collections::BTreeSet::new();
+        let mut excluded = std::collections::BTreeSet::new();
+        for binding in bindings {
+            if is_personal(&binding.agent_id)? {
+                excluded.insert(binding.user_id.clone());
+            } else if selected.insert(binding.user_id.clone()) {
+                members.push(binding);
+            }
+        }
+        let bytes = serde_json::to_vec(&members).map_err(|e| e.to_string())?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        let digest = digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        if let Some(expected) = preview_digest {
+            if expected != digest { return Err("primary AI candidates changed; preview again".into()); }
+            let now = Utc::now().to_rfc3339();
+            for member in &members {
+                tx.execute("UPDATE users SET primary_agent_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![member.agent_id, now, member.user_id]).map_err(|e| e.to_string())?;
+                tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
+                    VALUES(?1, 'user.set_primary_agent', ?2, ?3, ?4)",
+                    params![actor, member.user_id, serde_json::json!({"primary_agent_id": member.agent_id, "repair": true}).to_string(), now],
+                ).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(PrimaryAgentRepairPreview { members, preview_digest: digest, excluded_personal_count: excluded.len() })
+    }
+
+    /// Stored preference for the admin editor, without routing fallback.
+    pub fn configured_primary_agent(&self, user_id: &str) -> Result<Option<String>, String> {
+        self.conn().query_row("SELECT primary_agent_id FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+            .map_err(|e| e.to_string())
     }
 
     /// Resolve a stale preference against live bindings; clearing stays NULL.
@@ -700,6 +796,29 @@ impl UserDb {
         tx.commit().map_err(|e| format!("bind error: {e}"))
     }
 
+    /// Interactive binding only; migration, restore and Personal provisioning
+    /// use the preference-free shared writer instead.
+    pub fn bind_agent_as(&self, actor: &str, user_id: &str, agent_name: &str, access_level: AccessLevel) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let first_eligible: bool = tx.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM user_agent_bindings WHERE user_id = ?1 AND access_level IN ('owner', 'operator'))",
+            [user_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        bind_agent_in_transaction(&tx, user_id, agent_name, access_level, &now)?;
+        if first_eligible && matches!(access_level, AccessLevel::Owner | AccessLevel::Operator) {
+            let changed = tx.execute("UPDATE users SET primary_agent_id = ?1, updated_at = ?2
+                WHERE id = ?3 AND primary_agent_id IS NULL", params![agent_name, now, user_id]).map_err(|e| e.to_string())?;
+            if changed > 0 {
+                tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
+                    VALUES(?1, 'user.primary_agent_auto', ?2, ?3, ?4)",
+                    params![actor, user_id, serde_json::json!({"primary_agent_id": agent_name}).to_string(), now]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     /// Unbind a user from an agent.
     pub fn unbind_agent(&self, user_id: &str, agent_name: &str) -> Result<(), String> {
         let mut conn = self.conn();
@@ -1068,6 +1187,90 @@ mod tests {
         assert!(db.with_acl_generation(generation, || panic!("missing generation must deny")).is_err());
         other.execute_batch("DROP TABLE auth_meta").unwrap();
         assert!(db.with_acl_generation(generation, || panic!("unreadable generation must deny")).is_err());
+    }
+
+    #[test]
+    fn first_owner_operator_binding_sets_primary_but_later_bindings_preserve_empty_preference() {
+        let (db, _tmp) = test_db();
+        let user = db.create_user("first-binding@example.com", "First", "password123", UserRole::Employee).unwrap();
+        db.bind_agent_as(&user.id, &user.id, "first", AccessLevel::Operator).unwrap();
+        assert_eq!(db.bound_primary_agent(&user.id).unwrap().as_deref(), Some("first"));
+        db.set_primary_agent(&user.id, None).unwrap();
+        db.bind_agent_as(&user.id, &user.id, "first", AccessLevel::Owner).unwrap();
+        db.bind_agent_as(&user.id, &user.id, "second", AccessLevel::Operator).unwrap();
+        assert_eq!(db.configured_primary_agent(&user.id).unwrap(), None);
+        let viewer = db.create_user("viewer-first@example.com", "Viewer", "password123", UserRole::Employee).unwrap();
+        db.bind_agent_as(&viewer.id, &viewer.id, "read-only", AccessLevel::Viewer).unwrap();
+        assert_eq!(db.bound_primary_agent(&viewer.id).unwrap(), None);
+        db.bind_agent_as(&viewer.id, &viewer.id, "read-only", AccessLevel::Operator).unwrap();
+        assert_eq!(db.bound_primary_agent(&viewer.id).unwrap().as_deref(), Some("read-only"));
+        let audit = db.query_audit_log(Some(&user.id), Some("user.primary_agent_auto"), 10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].target.as_deref(), Some(user.id.as_str()));
+        db.conn().execute_batch("CREATE TRIGGER refuse_auto_audit BEFORE INSERT ON auth_audit_log
+            WHEN NEW.action = 'user.primary_agent_auto' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;").unwrap();
+        let fresh = db.create_user("audit-fresh@example.com", "Fresh", "password123", UserRole::Employee).unwrap();
+        assert!(db.bind_agent_as(&user.id, &fresh.id, "rollback", AccessLevel::Operator).is_err());
+        assert!(db.get_user_agents(&fresh.id).unwrap().is_empty());
+        assert_eq!(db.configured_primary_agent(&fresh.id).unwrap(), None);
+    }
+
+    #[test]
+    fn repair_is_atomic_and_does_not_change_viewers_or_configured_users() {
+        let (db, _tmp) = test_db();
+        let admin = db.create_user("repair-admin@example.com", "Admin", "password123", UserRole::Admin).unwrap();
+        let member = db.create_user("repair-member@example.com", "Member", "password123", UserRole::Employee).unwrap();
+        db.bind_agent(&member.id, "viewer", AccessLevel::Viewer).unwrap();
+        assert!(db.repair_primary_agents(&admin.id, None, |_| Ok(false)).unwrap().members.is_empty());
+        db.bind_agent(&member.id, "first", AccessLevel::Operator).unwrap();
+        db.bind_agent(&member.id, "last", AccessLevel::Owner).unwrap();
+        assert!(db.repair_primary_agents(&member.id, None, |_| Ok(false)).is_err());
+        let preview = db.repair_primary_agents(&admin.id, None, |_| Ok(false)).unwrap();
+        assert_eq!(preview.members[0].agent_id, "first");
+        db.set_primary_agent(&member.id, Some("last")).unwrap();
+        assert!(db.repair_primary_agents(&admin.id, Some(&preview.preview_digest), |_| Ok(false)).is_err());
+        assert_eq!(db.configured_primary_agent(&member.id).unwrap().as_deref(), Some("last"));
+        db.set_primary_agent(&member.id, None).unwrap();
+        let preview = db.repair_primary_agents(&admin.id, None, |_| Ok(false)).unwrap();
+        db.conn().execute_batch("CREATE TRIGGER refuse_primary_audit BEFORE INSERT ON auth_audit_log
+            WHEN NEW.action = 'user.set_primary_agent' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;").unwrap();
+        assert!(db.repair_primary_agents(&admin.id, Some(&preview.preview_digest), |_| Ok(false)).is_err());
+        assert_eq!(db.configured_primary_agent(&member.id).unwrap(), None);
+        assert!(db.set_primary_agent_as(&admin.id, &member.id, Some("first")).is_err());
+        assert_eq!(db.configured_primary_agent(&member.id).unwrap(), None);
+    }
+
+    #[test]
+    fn protected_repair_excludes_personal_and_rejects_changed_digest() {
+        let (db, _tmp) = test_db();
+        let admin = db.create_user("protected-admin@example.com", "Admin", "password123", UserRole::Admin).unwrap();
+        let member = db.create_user("protected-member@example.com", "Member", "password123", UserRole::Employee).unwrap();
+        db.bind_agent(&member.id, "private", AccessLevel::Owner).unwrap();
+        let preview = db.repair_primary_agents(&admin.id, None, |a| Ok(a == "private")).unwrap();
+        assert!(preview.members.is_empty());
+        assert_eq!(preview.excluded_personal_count, 1);
+        db.bind_agent(&member.id, "shared", AccessLevel::Operator).unwrap();
+        assert!(db.repair_primary_agents(&admin.id, Some(&preview.preview_digest), |a| Ok(a == "private")).is_err());
+        assert_eq!(db.configured_primary_agent(&member.id).unwrap(), None);
+        let preview = db.repair_primary_agents(&admin.id, None, |a| Ok(a == "private")).unwrap();
+        assert_eq!(preview.members[0].agent_id, "shared");
+        assert_eq!(preview.excluded_personal_count, 1);
+        assert!(db.repair_primary_agents(&admin.id, Some(&preview.preview_digest), |_| Err("unavailable".into())).is_err());
+        db.repair_primary_agents(&admin.id, Some(&preview.preview_digest), |a| Ok(a == "private")).unwrap();
+        assert_eq!(db.configured_primary_agent(&member.id).unwrap().as_deref(), Some("shared"));
+    }
+
+    #[test]
+    fn shared_restore_and_ordinary_binding_do_not_fill_primary() {
+        let (db, _tmp) = test_db();
+        let user = db.create_user("restore-primary@example.com", "Restore", "password123", UserRole::Employee).unwrap();
+        personal_tx(&db, |tx| restore_shared_bindings_in_transaction(tx, "restored", &[
+            RestoredMember { user_id: user.id.clone(), access_level: AccessLevel::Operator },
+        ])).unwrap();
+        assert_eq!(db.configured_primary_agent(&user.id).unwrap(), None);
+        db.bind_agent(&user.id, "ordinary", AccessLevel::Owner).unwrap();
+        assert_eq!(db.configured_primary_agent(&user.id).unwrap(), None);
+        assert!(db.query_audit_log(None, Some("user.primary_agent_auto"), 10).unwrap().is_empty());
     }
 
     #[test]
@@ -1480,6 +1683,7 @@ mod tests {
         db.bind_agent(&alice.id, "alice-personal", AccessLevel::Viewer).unwrap();
         // An existing lower binding is raised to Owner, then re-apply is a no-op.
         assert!(personal_tx(&db, |tx| bind_personal_owner_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        assert_eq!(db.configured_primary_agent(&alice.id).unwrap(), None);
         let generation = db.acl_generation().unwrap();
         assert!(!personal_tx(&db, |tx| bind_personal_owner_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
         assert_eq!(db.acl_generation().unwrap(), generation);

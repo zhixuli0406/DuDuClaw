@@ -196,6 +196,19 @@ fn validate_binding(operation:&str,agent:&str)->Result<(),String>{
 #[cfg(test)] mod binding_tests {
     use super::*;
     #[test]
+    fn migration_operator_binding_and_rollback_preserve_empty_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&dir.path().join("users.db")).unwrap();
+        let user = db.migration_invite_user("abc-1", &[1;32], "primary@example.test", "Member", UserRole::Employee).unwrap();
+        db.conn().execute("UPDATE users SET must_change_password=0,last_login='now' WHERE id=?1", [&user.id]).unwrap();
+        db.migration_bind_shared("def-1", &[2;32], &user.id, "sales", crate::AccessLevel::Operator).unwrap();
+        assert_eq!(db.configured_primary_agent(&user.id).unwrap(), None);
+        db.migration_binding_disable("def-1", &[2;32]).unwrap();
+        assert_eq!(db.configured_primary_agent(&user.id).unwrap(), None);
+        assert!(db.get_user_agents(&user.id).unwrap().is_empty());
+        assert!(db.query_audit_log(None, Some("user.primary_agent_auto"), 10).unwrap().is_empty());
+    }
+    #[test]
     fn migration_binding_requires_fresh_login_and_atomic_bound_receipt(){
         let dir=tempfile::tempdir().unwrap();let db=UserDb::new(&dir.path().join("users.db")).unwrap();
         let user=db.migration_invite_user("abc-1",&[1;32],"new@example.test","New",UserRole::Employee).unwrap();

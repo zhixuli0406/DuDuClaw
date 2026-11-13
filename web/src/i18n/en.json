@@ -11356,5 +11356,12 @@
   "identityTransition.actionFailed": "The identity setting was not changed: {error}",
   "identityTransition.restartRequired": "Saved. AI employees use it right away; restart DuDuClaw for the gateway itself to apply the grace period.",
   "identityTransition.error": "The AI employee identity setting cannot be read, so AI employees cannot save files to their own folders right now. Check the [delegation] section of config.toml.",
-  "identityTransition.refusals": "In the last 24 hours, AI employees were stopped {count, plural, one {# time} other {# times}} from saving to a folder because their identity could not be confirmed. Restart DuDuClaw; if it keeps happening, contact support."
+  "identityTransition.refusals": "In the last 24 hours, AI employees were stopped {count, plural, one {# time} other {# times}} from saving to a folder because their identity could not be confirmed. Restart DuDuClaw; if it keeps happening, contact support.",
+  "users.primary.personalSelf": "Personal AI for these members must be set by the members themselves.",
+  "users.primary.empty": "No AI is available to assign as primary.",
+  "users.primary.label": "Primary AI",
+  "users.primary.save": "Set primary AI",
+  "users.primary.missing": "{count} members have no primary AI",
+  "users.primary.repair": "Set to their first AI",
+  "users.primary.confirm": "Set the listed members’ primary AI to their earliest Owner or Operator binding?"
 }

@@ -791,7 +791,7 @@ impl Fixture {
             self.state.user_db.bind_agent(&user.id, agent, duduclaw_auth::AccessLevel::Owner).unwrap();
         }
         self.state.ctx.registry.write().await.scan().await.unwrap();
-        if let Some(primary) = primary { self.state.user_db.set_primary_agent(&user.id, Some(primary)).unwrap(); }
+        self.state.user_db.set_primary_agent(&user.id, primary).unwrap();
         let token = self.state.jwt_config.issue_access_token(&user, &[]).unwrap();
         (user.id, token)
     }

@@ -4,10 +4,44 @@ use super::users_org::{ManagerChange, org_error_frame, parse_manager_change};
 #[allow(unused_imports)]
 use super::*;
 
+
+/// Reject the entire request before any side effects, including invitations.
+pub(super) fn setting_error(key: &str, message: &str) -> WsFrame {
+    WsFrame::Response { id: String::new(), ok: false, payload: None,
+        error: Some(json!({"code": "invalid_setting", "key": key, "message": format!("{key}: {message}")})) }
+}
+
+pub(super) fn validate_settings(params: &Value, allowed: &[&str]) -> Result<(), WsFrame> {
+    let object = params.as_object().ok_or_else(|| setting_error("params", "must be an object"))?;
+    for (key, value) in object {
+        if !allowed.contains(&key.as_str()) { return Err(setting_error(key, "unsupported key")); }
+        let valid = match key.as_str() {
+            "invite" | "confirm" => value.is_boolean(),
+            "department" | "manager_user_id" | "agent_id" => value.is_string() || value.is_null(),
+            _ => value.is_string(),
+        };
+        if !valid { return Err(setting_error(key, "invalid value type")); }
+        if let Some(text) = value.as_str() {
+            let valid = match key.as_str() {
+                "user_id" | "agent_name" => !text.trim().is_empty() && text.len() <= 256,
+                "display_name" => !text.trim().is_empty() && text.len() <= 200,
+                "password" => (8..=1024).contains(&text.len()),
+                "department" => text.trim().is_empty() || duduclaw_core::is_valid_department(text.trim()),
+                _ => true,
+            };
+            if !valid { return Err(setting_error(key, "invalid value")); }
+        }
+        if key == "role" && value.as_str().and_then(|r| r.parse::<UserRole>().ok()).is_none() {
+            return Err(setting_error(key, "unrecognised role"));
+        }
+    }
+    Ok(())
+}
+
 impl MethodHandler {
     // ── User management handlers (admin only) ────────────────
 
-    pub(crate) async fn handle_users_list(&self) -> WsFrame {
+    pub(crate) async fn handle_users_list(&self, ctx: &UserContext) -> WsFrame {
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
@@ -16,7 +50,27 @@ impl MethodHandler {
             Ok(users) => {
                 let mut result: Vec<Value> = Vec::new();
                 for u in &users {
-                    let bindings = db.get_user_agents(&u.id).unwrap_or_default();
+                    let bindings = match db.get_user_agents(&u.id) {
+                        Ok(value) => value,
+                        Err(_) => return WsFrame::error_response("", "unable to read bindings"),
+                    };
+                    let primary = match db.configured_primary_agent(&u.id) {
+                        Ok(value) => value,
+                        Err(_) => return WsFrame::error_response("", "unable to read primary agent"),
+                    };
+                    let mut assignable_primary_agents = Vec::new();
+                    let mut primary_personal_excluded = false;
+                    for binding in &bindings {
+                        if !matches!(binding.access_level, AccessLevel::Owner | AccessLevel::Operator) { continue; }
+                        let denied = if crate::runtime_readiness::isolation_active() {
+                            match crate::personal_visibility::personal_owner(&self.home_dir, &binding.agent_name) {
+                                Ok(owner) => owner.is_some_and(|owner| owner != ctx.user_id),
+                                Err(_) => return WsFrame::error_response("", "unable to read Personal ownership"),
+                            }
+                        } else { false };
+                        if denied { primary_personal_excluded = true; }
+                        else { assignable_primary_agents.push(binding.agent_name.clone()); }
+                    }
                     let invite_eligible = match db.user_invite_eligible(&u.id) {
                         Ok(eligible) => eligible,
                         Err(_) => return super::user_invites_rpc::invite_error("invite_unavailable"),
@@ -34,6 +88,9 @@ impl MethodHandler {
                         "last_login": u.last_login,
                         "invite_eligible": invite_eligible,
                         "bindings": bindings,
+                        "primary_agent_id": primary,
+                        "assignable_primary_agents": assignable_primary_agents,
+                        "primary_personal_excluded": primary_personal_excluded,
                     }));
                 }
                 WsFrame::ok_response("", json!({ "users": result }))
@@ -43,11 +100,15 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_users_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if let Err(frame) = validate_settings(&params, &["email", "display_name", "password", "role", "department", "manager_user_id", "invite", "public_url"]) { return frame; }
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
         };
 
+        if params.get("department").is_some_and(Value::is_null) {
+            return setting_error("department", "must be a string");
+        }
         let invite = match params.get("invite") {
             None => false,
             Some(Value::Bool(value)) => *value,
@@ -77,22 +138,22 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("employee");
 
-        if email.is_empty() || display_name.is_empty() || (!invite && password.is_empty()) {
-            return WsFrame::error_response("", "email, display_name, and password are required");
+        for (key, missing) in [("email", email.is_empty()), ("display_name", display_name.is_empty()), ("password", !invite && password.is_empty())] {
+            if missing { return setting_error(key, "required"); }
         }
         // Email format validation (MEDIUM fix)
         if !email.contains('@') || email.len() > 254 {
-            return WsFrame::error_response("", "invalid email format");
+            return setting_error("email", "invalid email format");
         }
         // Display name length limit
         if display_name.len() > 200 {
-            return WsFrame::error_response("", "display_name too long (max 200 chars)");
+            return setting_error("display_name", "display_name too long (max 200 chars)");
         }
         if !invite && password.len() < 8 {
-            return WsFrame::error_response("", "password must be at least 8 characters");
+            return setting_error("password", "password must be at least 8 characters");
         }
         if !invite && password.len() > 1024 {
-            return WsFrame::error_response("", "password too long");
+            return setting_error("password", "password too long");
         }
 
         let role: UserRole = match role_str.parse() {
@@ -109,8 +170,8 @@ impl MethodHandler {
             .filter(|s| !s.is_empty());
         if let Some(d) = department {
             if !duduclaw_core::is_valid_department(d) {
-                return WsFrame::error_response(
-                    "",
+                return setting_error(
+                    "department",
                     "invalid department name (1-64 bytes, no path separators / whitespace / control chars)",
                 );
             }
@@ -120,7 +181,7 @@ impl MethodHandler {
         // account, so a refused manager leaves no account behind.
         let manager = match parse_manager_change(&params) {
             Ok(change) => change.target().map(str::to_string),
-            Err(frame) => return frame,
+            Err(_) => return setting_error("manager_user_id", "invalid manager id"),
         };
 
         // Argon2 + SQLite: off the runtime workers.
@@ -178,6 +239,7 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_users_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if let Err(frame) = validate_settings(&params, &["user_id", "display_name", "role", "password", "department", "manager_user_id"]) { return frame; }
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
@@ -185,27 +247,30 @@ impl MethodHandler {
 
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
-            None => return WsFrame::error_response("", "user_id is required"),
+            None => return setting_error("user_id", "user_id is required"),
         };
 
         let display_name = params.get("display_name").and_then(|v| v.as_str());
-        let role = params
-            .get("role")
-            .and_then(|v| v.as_str())
-            .and_then(|r| r.parse::<UserRole>().ok());
+        let role = match params.get("role") {
+            None => None,
+            Some(value) => match value.as_str().and_then(|r| r.parse::<UserRole>().ok()) {
+                Some(role) => Some(role),
+                None => return setting_error("role", "unrecognised role"),
+            },
+        };
         let password = params.get("password").and_then(|v| v.as_str());
 
         if let Some(pw) = password {
             if pw.len() < 8 {
-                return WsFrame::error_response("", "password must be at least 8 characters");
+                return setting_error("password", "password must be at least 8 characters");
             }
             if pw.len() > 1024 {
-                return WsFrame::error_response("", "password too long");
+                return setting_error("password", "password too long");
             }
         }
         if let Some(name) = display_name {
             if name.len() > 200 {
-                return WsFrame::error_response("", "display_name too long (max 200 chars)");
+                return setting_error("display_name", "display_name too long (max 200 chars)");
             }
         }
 
@@ -216,8 +281,8 @@ impl MethodHandler {
             Some(Value::String(s)) => {
                 let d = s.trim();
                 if !duduclaw_core::is_valid_department(d) {
-                    return WsFrame::error_response(
-                        "",
+                    return setting_error(
+                        "department",
                         "invalid department name (1-64 bytes, no path separators / whitespace / control chars)",
                     );
                 }
@@ -229,7 +294,7 @@ impl MethodHandler {
 
         let manager_change = match parse_manager_change(&params) {
             Ok(change) => change,
-            Err(frame) => return frame,
+            Err(_) => return setting_error("manager_user_id", "invalid manager id"),
         };
 
         // Every field of this request commits together or not at all: a
@@ -292,7 +357,7 @@ impl MethodHandler {
 
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
-            None => return WsFrame::error_response("", "user_id is required"),
+            None => return setting_error("user_id", "user_id is required"),
         };
 
         let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
@@ -314,6 +379,7 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_users_bind_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if let Err(frame) = validate_settings(&params, &["user_id", "agent_name", "access_level"]) { return frame; }
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
@@ -321,20 +387,20 @@ impl MethodHandler {
 
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
-            None => return WsFrame::error_response("", "user_id is required"),
+            None => return setting_error("user_id", "user_id is required"),
         };
         let agent_name = match params.get("agent_name").and_then(|v| v.as_str()) {
             Some(n) if !n.trim().is_empty() => n,
-            _ => return WsFrame::error_response("", "agent_name is required"),
+            _ => return setting_error("agent_name", "agent_name is required"),
         };
         let access_level_str = match params.get("access_level") {
             None => "operator",
             Some(Value::String(level)) => level.as_str(),
-            Some(_) => return WsFrame::error_response("", "invalid access_level"),
+            Some(_) => return setting_error("access_level", "invalid access_level"),
         };
         let access_level: AccessLevel = match access_level_str.parse() {
             Ok(l) => l,
-            Err(e) => return WsFrame::error_response("", &e),
+            Err(e) => return setting_error("access_level", &e),
         };
         // SR5 round 3 N5: a quarantined / tombstoned label is refused from the
         // lifecycle index, not only from the users.db mirror auth reads.
@@ -360,7 +426,7 @@ impl MethodHandler {
             Ok(value) => value == Some(AccessLevel::Owner),
             Err(_) => return WsFrame::error_response("", "無法確認原有負責人，未變更綁定。"),
         };
-        match db.bind_agent(user_id, agent_name, access_level) {
+        match db.bind_agent_as(&ctx.user_id, user_id, agent_name, access_level) {
             Ok(()) => {
                 if was_owner || access_level == AccessLevel::Owner {
                     if let Err(error) =
@@ -394,11 +460,11 @@ impl MethodHandler {
 
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
-            None => return WsFrame::error_response("", "user_id is required"),
+            None => return setting_error("user_id", "user_id is required"),
         };
         let agent_name = match params.get("agent_name").and_then(|v| v.as_str()) {
             Some(n) if !n.trim().is_empty() => n,
-            _ => return WsFrame::error_response("", "agent_name is required"),
+            _ => return setting_error("agent_name", "agent_name is required"),
         };
 
         let was_owner = match db.check_agent_access(user_id, agent_name) {
@@ -439,7 +505,7 @@ impl MethodHandler {
 
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
-            None => return WsFrame::error_response("", "user_id is required"),
+            None => return setting_error("user_id", "user_id is required"),
         };
         let transfer_to = params
             .get("transfer_to")
@@ -504,18 +570,57 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_users_set_primary_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if let Err(frame) = validate_settings(&params, &["user_id", "agent_id"]) { return frame; }
         let agent = match params.get("agent_id") {
             Some(Value::Null) => None,
-            Some(Value::String(id)) if !id.is_empty() && id.len() <= 256 => Some(id.as_str()),
-            _ => return WsFrame::error_response("", "agent_id must be a string or null"),
+            Some(Value::String(id)) if !id.trim().is_empty() && id.len() <= 256 => Some(id.as_str()),
+            _ => return setting_error("agent_id", "must be a non-empty string or null"),
         };
+        let target = params.get("user_id").and_then(Value::as_str).unwrap_or(&ctx.user_id);
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
         };
-        match db.set_primary_agent(&ctx.user_id, agent) {
+        if target != ctx.user_id && !super::user_invites_rpc::live_admin(&db, ctx) {
+            return WsFrame::error_response("", "permission denied");
+        }
+        match db.set_primary_agent_as(&ctx.user_id, target, agent) {
             Ok(()) => WsFrame::ok_response("", json!({ "primary_agent_id": agent })),
-            Err(_) => WsFrame::error_response("", "agent is not bound to current user"),
+            Err(error) if error == "agent requires an Owner or Operator binding" => setting_error("agent_id", "requires an active user and an Owner or Operator binding"),
+            Err(_) => WsFrame::error_response("", "unable to save primary AI; no change was written"),
+        }
+    }
+
+    pub(crate) async fn handle_users_repair_primary_agents(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if let Err(frame) = validate_settings(&params, &["preview_digest"]) { return frame; }
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+        if !super::user_invites_rpc::live_admin(&db, ctx) {
+            return WsFrame::error_response("", "permission denied");
+        }
+        let expected = params.get("preview_digest").and_then(Value::as_str);
+        if expected.is_some_and(|digest| digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return setting_error("preview_digest", "must be a preview digest");
+        }
+        let protected = crate::runtime_readiness::isolation_active();
+        match db.repair_primary_agents(&ctx.user_id, expected, |agent| {
+            if !protected { return Ok(false); }
+            // Same ownership authority as the Personal gate, including open
+            // quarantine rows; no break-glass exemption for batch repair.
+            crate::personal_visibility::personal_owner(&self.home_dir, agent)
+                .map(|owner| owner.is_some()).map_err(|_| "Personal ownership unavailable".to_string())
+        }) {
+            Ok(preview) => WsFrame::ok_response("", json!({
+                "members": preview.members, "preview_digest": preview.preview_digest,
+                "excluded_personal_count": preview.excluded_personal_count, "changed": expected.is_some(),
+            })),
+            Err(error) => {
+                tracing::warn!(error = %error, "primary AI repair refused");
+                WsFrame::Response { id: String::new(), ok: false, payload: None,
+                    error: Some(json!({"code": "primary_repair_refused", "message": "Unable to repair primary AI; preview again. No change was written."})) }
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 import { AdminMfa } from '@/components/mfa/AdminMfa';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type UserDetail, type UserInviteState } from '@/lib/api';
+import { api, type UserDetail, type UserInviteState, type PrimaryAgentRepairPreview } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { dashboardBaseUrl } from '@/lib/dashboard-base';
 import { InviteEmailPreview, InviteLinkDialog, InviteStatusChip } from './users/InviteControls';
@@ -50,6 +50,9 @@ export function UsersPage() {
   const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [inviteUser, setInviteUser] = useState<UserDetail | null>(null);
   const [inviting, setInviting] = useState(false);
+  const [repairPreview, setRepairPreview] = useState<PrimaryAgentRepairPreview | null>(null);
+  const [repairCandidates, setRepairCandidates] = useState<PrimaryAgentRepairPreview | null>(null);
+  const [repairing, setRepairing] = useState(false);
   const [users, setUsers] = useState<UserDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -79,6 +82,11 @@ export function UsersPage() {
       const { users: data } = await api.users.list();
       setUsers(data);
       if (isAdmin) {
+        try {
+          const preview = await api.users.repairPrimaryAgents();
+          setRepairCandidates(Array.isArray(preview.members) && typeof preview.preview_digest === 'string' ? preview : null);
+        }
+        catch { setRepairCandidates(null); }
         try { const result = await api.users.inviteStatus(); setInviteStates(result.statuses ?? {}); }
         catch { setInviteStates({}); }
       }
@@ -119,6 +127,20 @@ export function UsersPage() {
     }
   }, [intl, fetchUsers]);
 
+  const missingPrimaryCount = repairCandidates?.members.length ?? 0;
+  const repairPrimary = async (confirm: boolean) => {
+    if (repairing || (confirm && !repairPreview)) return;
+    setRepairing(true);
+    try {
+      const result = await api.users.repairPrimaryAgents(confirm ? repairPreview!.preview_digest : undefined);
+      if (confirm) { setRepairPreview(null); await fetchUsers(); }
+      else { setRepairPreview(result); setRepairCandidates(result); }
+    } catch (e) {
+      setRepairPreview(null);
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    } finally { setRepairing(false); }
+  };
+
   const sendInvite = async () => {
     if (!inviteUser || inviting) return;
     setInviting(true);
@@ -153,6 +175,21 @@ export function UsersPage() {
         </div>
       </div>
 
+      {isAdmin && (missingPrimaryCount > 0 || (repairCandidates?.excluded_personal_count ?? 0) > 0) && <div className="flex flex-wrap items-center gap-3 rounded-lg border border-surface-border bg-card px-4 py-3 text-sm">
+        <span>{intl.formatMessage({ id: 'users.primary.missing' }, { count: missingPrimaryCount })}</span>
+        <Button variant="outline" disabled={repairing} onClick={() => void repairPrimary(false)}>{intl.formatMessage({ id: 'users.primary.repair' })}</Button>
+      </div>}
+      {repairPreview && <Dialog open onOpenChange={open => !open && !repairing && setRepairPreview(null)}>
+        <DialogContent><DialogHeader><DialogTitle>{intl.formatMessage({ id: 'users.primary.repair' })}</DialogTitle></DialogHeader>
+          <p className="text-sm">{intl.formatMessage({ id: 'users.primary.confirm' })}</p>
+          <ul className="max-h-64 overflow-auto text-sm">{repairPreview.members.map(member => <li key={member.user_id}>{member.display_name} → {agentName(member.agent_id)}</li>)}</ul>
+          {repairPreview.excluded_personal_count > 0 && <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'users.primary.personalSelf' })}</p>}
+          <DialogFooter>
+            <Button variant="outline" disabled={repairing} onClick={() => setRepairPreview(null)}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+            <Button disabled={repairing || repairPreview.members.length === 0} onClick={() => void repairPrimary(true)}>{intl.formatMessage({ id: 'common.confirm' })}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>}
       <OrgHistorySettings />
       <AdminMfa />
 

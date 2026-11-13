@@ -364,6 +364,7 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("approvals.list", "(a) another person's Personal cards are metadata-only cards (personal_metadata_card)"),
     ("approvals.get", "(a) metadata card; the full card only after the audited step-up (personal_approval_hidden)"),
     ("users.list", "(a) people and their binding metadata (label, owner); no employee data"),
+    ("users.repair_primary_agents", "Admin only; request names no employee (digest only); protected-mode candidates exclude all Personal employees via the ownership authority; reply contains Shared candidate rows, digest and excluded member count only; hidden-row filter remains active"),
     ("users.me", "(a) the caller's own account"),
     // Everything below is covered by the P1g default deny (a named
     // Personal employee is refused unless an audited step-up of this
