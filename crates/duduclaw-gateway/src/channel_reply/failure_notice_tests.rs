@@ -223,3 +223,113 @@ async fn notice_rejects_a_session_owned_by_another_employee() {
     assert_eq!(ctx.session_manager.webchat_history(sid).await.unwrap().len(), 1);
     assert_eq!(ctx.session_manager.session_agent(sid).await.unwrap().as_deref(), Some("other"));
 }
+
+async fn failed_webchat_reply(ctx: &ReplyContext, sid: &str, reason: FailureReason) -> GuardedReply {
+    let session = ctx.session_manager.get_or_create(sid, "worker").await.unwrap();
+    ctx.session_manager.append_message(sid, "user", "question", 1).await.unwrap();
+    let delivery = Arc::new(super::super::ccr_delivery::CcrTurnDelivery::default());
+    super::super::ccr_delivery::CCR_TURN_DELIVERY.scope(delivery.clone(), bound(sid, &session.created_at, async {
+        super::super::record_turn_generation(Some(&session.created_at));
+        persist_failure_notice(ctx, sid, "worker", "failed-turn", reason.into(), Some(&session.created_at)).await;
+        // Repeated terminal handling must still leave only one notice.
+        persist_failure_notice(ctx, sid, "worker", "failed-turn", reason.into(), Some(&session.created_at)).await;
+    })).await;
+    let live = format_fallback_message("Worker", reason, &ctx.home_dir);
+    GuardedReply::new(live, None, Vec::new(), Some(super::super::ccr_delivery::TurnRollback {
+        delivery, session_mgr: ctx.session_manager.clone(),
+    })).await
+}
+
+#[tokio::test]
+async fn spawn_failure_webchat_persists_one_notice_without_ordinary_legacy_reply() {
+    let (home, ctx) = fixture();
+    for reason in [FailureReason::SpawnError, FailureReason::BinaryMissing, FailureReason::AuthFailed,
+        FailureReason::Timeout, FailureReason::Unknown] {
+        let sid = format!("webchat:{}", reason.as_str());
+        let reply = failed_webchat_reply(&ctx, &sid, reason).await;
+        if reason == FailureReason::SpawnError {
+            assert!(reply.text.contains("子程序失敗"));
+            assert!(reply.text.contains("~/.duduclaw/debug.log"));
+        }
+        let live = reply.text.clone();
+        reply.persist_webchat(&ctx.session_manager, &sid, &live).await.unwrap();
+        let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        reply.publish_webchat(&ctx.session_manager, &sid, &users, users.acl_generation().unwrap(),
+            &crate::webchat::access::TargetPolicy::test_admin(), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+        assert_eq!(reply.text, live, "live diagnostic delivery must remain unchanged");
+        assert_eq!(ctx.session_manager.webchat_history(&sid).await.unwrap().len(), 2);
+        assert_notice(&ctx, &sid, reason.into(), 1).await;
+        let conn = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap();
+        let rows: Vec<(i64, Option<String>)> = conn.prepare(
+            "SELECT hidden, notice_kind FROM session_messages WHERE session_id=?1 AND role='assistant'",
+        ).unwrap().query_map([&sid], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        assert_eq!(rows, vec![(1, Some("turn_failure".into()))]);
+    }
+}
+
+#[tokio::test]
+async fn follow_up_history_excludes_spawn_failure_legacy_text() {
+    let (_home, ctx) = fixture();
+    let sid = "webchat:spawn-follow-up";
+    let reply = failed_webchat_reply(&ctx, sid, FailureReason::SpawnError).await;
+    reply.persist_webchat(&ctx.session_manager, sid, &reply.text).await.unwrap();
+    ctx.session_manager.append_message(sid, "user", "follow-up", 1).await.unwrap();
+    let history = ctx.session_manager.get_messages(sid).await.unwrap();
+    assert_eq!(history.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect::<Vec<_>>(),
+        vec![("user", "question"), ("user", "follow-up")]);
+    assert_eq!(ctx.session_manager.read_last_n_turns_text(sid, 10).await.unwrap(),
+        "user: question\nuser: follow-up\n");
+}
+
+#[tokio::test]
+async fn notice_only_webchat_delivery_rejects_recreated_session_before_persist_or_publish() {
+    for clear_before_persist in [true, false] {
+        let (home, ctx) = fixture();
+        let sid = "webchat:notice-cleared";
+        let reply = failed_webchat_reply(&ctx, sid, FailureReason::SpawnError).await;
+        assert_notice(&ctx, sid, TurnFailureReason::Internal, 1).await;
+        let verdict = reply.rollback.as_ref().unwrap().delivery.subscribe();
+        let old_generation = ctx.session_manager.turn_generation(sid).await.unwrap().unwrap();
+        if !clear_before_persist {
+            reply.persist_webchat(&ctx.session_manager, sid, &reply.text).await.unwrap();
+        }
+        ctx.session_manager.clear_for_user(sid).await.unwrap().expect("cleared");
+        let fresh = ctx.session_manager.get_or_create(sid, "worker").await.unwrap();
+        assert_ne!(fresh.created_at, old_generation);
+        if clear_before_persist {
+            assert!(reply.persist_webchat(&ctx.session_manager, sid, &reply.text).await.is_err());
+        }
+        let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        assert!(reply.publish_webchat(&ctx.session_manager, sid, &users, users.acl_generation().unwrap(),
+            &crate::webchat::access::TargetPolicy::test_admin(), &tokio_util::sync::CancellationToken::new()).await.is_err());
+        assert!(!reply.still_valid().await, "the stale delivery must latch refusal");
+        drop(reply);
+        assert_eq!(verdict.await, Ok(false), "no successful publication verdict");
+        assert!(ctx.session_manager.webchat_history(sid).await.unwrap().is_empty());
+        let rows: i64 = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap()
+            .query_row("SELECT COUNT(*) FROM session_messages WHERE session_id=?1", [sid], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 0, "no diagnostic or notice may enter the fresh conversation");
+    }
+}
+
+#[tokio::test]
+async fn notice_only_webchat_delivery_still_rejects_stale_acl_and_cancellation() {
+    let (home, ctx) = fixture();
+    let users_path = home.path().join("users.db");
+    let users = duduclaw_auth::UserDb::new(&users_path).unwrap();
+    let generation = users.acl_generation().unwrap();
+    rusqlite::Connection::open(&users_path).unwrap().execute(
+        "UPDATE auth_meta SET value=value+1 WHERE key='acl_generation'", [],
+    ).unwrap();
+    for cancelled in [false, true] {
+        let sid = format!("webchat:fenced-{cancelled}");
+        let reply = failed_webchat_reply(&ctx, &sid, FailureReason::SpawnError).await;
+        reply.persist_webchat(&ctx.session_manager, &sid, &reply.text).await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let generation = if cancelled { cancel.cancel(); users.acl_generation().unwrap() } else { generation };
+        assert!(reply.publish_webchat(&ctx.session_manager, &sid, &users, generation,
+            &crate::webchat::access::TargetPolicy::test_admin(), &cancel).await.is_err());
+        assert_notice(&ctx, &sid, TurnFailureReason::Internal, 1).await;
+    }
+}

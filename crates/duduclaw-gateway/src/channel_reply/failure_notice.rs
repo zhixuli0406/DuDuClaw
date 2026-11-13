@@ -93,6 +93,11 @@ pub(super) async fn persist_failure_notice(
     let Some((stored_sid, stored_generation, stored_agent)) = failure_session() else { return; };
     if stored_sid != sid || stored_agent != agent || generation != Some(stored_generation.as_str()) { return; }
     if ctx.session_manager.session_agent(sid).await.ok().flatten().as_deref() != Some(agent) { return; }
+    // Latch before the best-effort notice write: even if it fails, WebChat
+    // must never substitute the live diagnostic as an ordinary model reply.
+    let _ = super::ccr_delivery::CCR_TURN_DELIVERY.try_with(|delivery| {
+        delivery.failure_notice_only.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
     let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
     if let Err(error) = ctx.session_manager.record_turn_failure(sid, turn, reason, language.as_deref(), generation).await {
         tracing::warn!(%error, "Turn failure notice persistence failed");

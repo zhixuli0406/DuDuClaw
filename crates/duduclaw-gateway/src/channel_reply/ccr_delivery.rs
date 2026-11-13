@@ -104,6 +104,8 @@ pub(crate) struct CcrTurnDelivery {
     /// started in), recorded once the turn ensured its session. `None`: not
     /// recorded (an early reply path) — writes are then unbound as before.
     pub(super) turn_generation: std::sync::Mutex<Option<String>>,
+    /// Failed turns persist only their fixed notice; diagnostic text is live-only.
+    pub(super) failure_notice_only: std::sync::atomic::AtomicBool,
     cleanup: Option<DeliveryCleanup>,
     published: std::sync::atomic::AtomicBool,
 }
@@ -121,6 +123,7 @@ impl Default for CcrTurnDelivery {
             waiters: Default::default(),
             settled: Default::default(),
             turn_generation: Default::default(),
+            failure_notice_only: Default::default(),
             cleanup: DELIVERY_CLEANUP.try_with(Clone::clone).ok(),
             published: Default::default(),
         }
@@ -513,6 +516,15 @@ impl GuardedReply {
         self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    async fn check_notice_incarnation(&self, sessions: &SessionManager, sid: &str, delivery: &CcrTurnDelivery) -> Result<(), ()> {
+        let generation = delivery.turn_generation.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        sessions.check_delivery_incarnation(sid, generation.as_deref()).await.map_err(|error| {
+            warn!(session_id = sid, %error, "WebChat notice incarnation check failed");
+            self.refuse_delivery();
+        })
+    }
+
     /// Stage a hidden durable row before live fan-out. Some early reply paths
     /// (and a failed pipeline append) have no assistant row. Record those here;
     /// publication waits for the final authority fence.
@@ -524,6 +536,9 @@ impl GuardedReply {
             self.refuse_delivery();
             return Err(());
         };
+        if rollback.delivery.failure_notice_only.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.check_notice_incarnation(sessions, sid, &rollback.delivery).await;
+        }
         let existing = rollback.delivery.assistant_message.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         match existing {
@@ -558,6 +573,17 @@ impl GuardedReply {
         generation: u64, policy: &crate::webchat::access::TargetPolicy, cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), ()> {
         let Some(rollback) = &self.rollback else { self.refuse_delivery(); return Err(()); };
+        if rollback.delivery.failure_notice_only.load(std::sync::atomic::Ordering::SeqCst) {
+            if !self.still_valid().await { return Err(()); }
+            self.check_notice_incarnation(sessions, sid, &rollback.delivery).await?;
+            let allowed = users.with_acl_generation(generation, || policy.with_current(|| {
+                !cancel.is_cancelled() && !self.revoked.load(std::sync::atomic::Ordering::SeqCst)
+            }));
+            if !matches!(allowed, Ok(Ok(true))) { self.refuse_delivery(); return Err(()); }
+            rollback.delivery.published.store(true, std::sync::atomic::Ordering::SeqCst);
+            rollback.delivery.publish(true);
+            return Ok(());
+        }
         let row = rollback.delivery.assistant_message.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let Some((stored_sid, id)) = row else { self.refuse_delivery(); return Err(()); };
