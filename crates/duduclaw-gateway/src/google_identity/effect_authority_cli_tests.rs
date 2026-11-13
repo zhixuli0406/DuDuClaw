@@ -179,7 +179,7 @@ struct Composed {
     gateway_url: String,
     exchanges: Exchanges,
     dispatcher: McpDispatcher,
-    cli: axum::Router,
+    cli: duduclaw_cli::mcp_http_server::McpHttpApp,
     redaction: Arc<McpRedactionLayer>,
 }
 impl Composed {
@@ -372,7 +372,7 @@ impl Drop for Composed {
     }
 }
 
-async fn cli_request(app: axum::Router, bearer: &str, params: Value) -> (u16, Value) {
+async fn cli_request(app: duduclaw_cli::mcp_http_server::McpHttpApp, bearer: &str, params: Value) -> (u16, Value) {
     let response = app
         .oneshot(
             Request::builder()

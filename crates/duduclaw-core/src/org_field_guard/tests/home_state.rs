@@ -21,6 +21,8 @@ const PROTECTED_HOME_PATHS: &[&str] = &[
     "tool_calls.jsonl",
     "tool_calls.jsonl.1",
     "security_audit.jsonl",
+    "mcp_auth_failures.jsonl",
+    "mcp_auth_failures.jsonl.1",
     "audit/browser/audit.jsonl",
     "budget_events.jsonl",
     "artifacts.jsonl",

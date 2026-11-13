@@ -26,7 +26,7 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tracing::info;
 
-use crate::mcp_auth::{Principal, authenticate_with_key};
+use crate::mcp_auth::Principal;
 use crate::mcp_capability::{inject_capability_headers, negotiate_capabilities};
 use crate::mcp_dispatch::McpDispatcher;
 use crate::mcp_http_errors::into_axum_response;
@@ -93,6 +93,9 @@ pub struct HttpState {
     pub sse_store: Arc<SseEventStore>,
     pub call_timeout: Duration,
     pub home_dir: std::path::PathBuf,
+    /// v1.82: the bounded `mcp_auth_failed` audit of this server
+    /// (`crate::mcp_auth_audit`).
+    pub(crate) auth_audit: Arc<crate::mcp_auth_audit::AuthFailureAudit>,
 }
 
 // Bounded process-local tables. Anonymous, registration and authenticated
@@ -322,6 +325,17 @@ async fn pre_auth_admission(
     next: middleware::Next,
 ) -> Response {
     let path = request.uri().path().to_owned();
+    // v1.82: an authentication refusal below this layer is counted in the
+    // bounded `mcp_auth_failed` audit against the TCP peer as the socket saw
+    // it (never X-Forwarded-For) and a fixed route label. Requests refused
+    // here (proxy / rate gates) never reached authentication.
+    let audit_context = crate::mcp_auth_audit::RequestContext {
+        audit: state.http.auth_audit.clone(),
+        source: crate::mcp_auth_audit::Source::from_peer(
+            request.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|p| p.0.ip()),
+        ),
+        route: crate::mcp_auth_audit::route_class(&path),
+    };
     if path != "/healthz" {
         let peer = request.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>()
             .map(|p| p.0.ip());
@@ -349,7 +363,7 @@ async fn pre_auth_admission(
         request.extensions_mut().insert(SourceIp(peer));
         request.extensions_mut().insert(RegistrationBudget(state.registration.clone()));
     }
-    next.run(request).await
+    crate::mcp_auth_audit::observe_request(audit_context, next.run(request)).await
 }
 
 // Keep the permit inside the blocking job, including when its HTTP future is
@@ -438,57 +452,85 @@ pub(crate) fn authenticate_bearer_call(
     home_dir: &std::path::Path,
     resource: &str,
 ) -> Result<(crate::mcp_auth::AuthenticatedCall, NamespaceContext), Response> {
+    // v1.82: every 401 below carries an internal refusal marker
+    // (`mcp_auth_audit::tag*`, a response extension — status, headers and
+    // body are unchanged) that the admission middleware turns into the
+    // bounded `mcp_auth_failed` audit. Nothing from the header is kept.
+    use crate::mcp_auth_audit::{FailureReason, tag, tag_refusal};
     let auth_header = headers
         .get("Authorization")
         .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(crate::mcp_dispatch::jsonrpc_error(
-                    &Value::Null,
-                    -32003,
-                    "Missing Authorization header. Use: Authorization: Bearer <key>",
-                )),
+            tag(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(crate::mcp_dispatch::jsonrpc_error(
+                        &Value::Null,
+                        -32003,
+                        "Missing Authorization header. Use: Authorization: Bearer <key>",
+                    )),
+                )
+                    .into_response(),
+                FailureReason::MissingHeader,
+                None,
             )
-                .into_response()
         })?
         .to_str()
         .map_err(|_| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(crate::mcp_dispatch::jsonrpc_error(
-                    &Value::Null,
-                    -32003,
-                    "Invalid Authorization header encoding",
-                )),
+            tag(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(crate::mcp_dispatch::jsonrpc_error(
+                        &Value::Null,
+                        -32003,
+                        "Invalid Authorization header encoding",
+                    )),
+                )
+                    .into_response(),
+                FailureReason::BadScheme,
+                None,
             )
-                .into_response()
         })?;
 
     let raw_key = auth_header
         .strip_prefix("Bearer ")
         .filter(|k| !k.is_empty())
         .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(crate::mcp_dispatch::jsonrpc_error(
-                    &Value::Null,
-                    -32003,
-                    "Authorization header must use: Bearer <key>",
-                )),
+            // `Bearer ` with nothing after it is an empty key; anything
+            // else is not the Bearer scheme.
+            let reason = if auth_header.starts_with("Bearer ") {
+                FailureReason::MalformedKey
+            } else {
+                FailureReason::BadScheme
+            };
+            tag(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(crate::mcp_dispatch::jsonrpc_error(
+                        &Value::Null,
+                        -32003,
+                        "Authorization header must use: Bearer <key>",
+                    )),
+                )
+                    .into_response(),
+                reason,
+                None,
             )
-                .into_response()
         })?;
 
     if crate::mcp_refresh::is_refresh_token_format(raw_key) {
-        return Err((StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
-            &Value::Null, -32003, crate::mcp_refresh::STDIO_ONLY_NOTICE,
-        ))).into_response());
+        return Err(tag(
+            (StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
+                &Value::Null, -32003, crate::mcp_refresh::STDIO_ONLY_NOTICE,
+            ))).into_response(),
+            FailureReason::WrongCredentialType,
+            None,
+        ));
     }
     // RM-064: a `ddc_status_` credential belongs to the gateway's status
     // endpoint only. Refuse the type outright — it must never reach the
     // `[mcp_keys]` / OAuth lookups or any scope table.
     if duduclaw_auth::status_tokens::is_status_token(raw_key) {
-        return Err(status_credential_refused());
+        return Err(tag(status_credential_refused(), FailureReason::WrongCredentialType, None));
     }
 
     // WP3.1-T2: OAuth-issued access tokens share the Bearer surface but live
@@ -498,19 +540,23 @@ pub(crate) fn authenticate_bearer_call(
     let auth_result = if crate::mcp_oauth_server::is_oauth_access_token(raw_key) {
         crate::mcp_oauth_server::validate_oauth_token(raw_key, home_dir, resource)
             .map(crate::mcp_auth::AuthenticatedCall::without_reference)
+            .map_err(crate::mcp_auth::Refusal::from)
     } else {
-        crate::mcp_auth::authenticate_with_key_call(raw_key, home_dir)
+        crate::mcp_auth::authenticate_with_key_call_refusal(raw_key, home_dir)
     };
-    let authenticated = auth_result.map_err(|e| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(crate::mcp_dispatch::jsonrpc_error(
-                &Value::Null,
-                -32003,
-                &format!("Authentication failed: {e}"),
-            )),
+    let authenticated = auth_result.map_err(|refusal| {
+        tag_refusal(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(crate::mcp_dispatch::jsonrpc_error(
+                    &Value::Null,
+                    -32003,
+                    &format!("Authentication failed: {}", refusal.error),
+                )),
+            )
+                .into_response(),
+            &refusal,
         )
-            .into_response()
     })?;
 
     let principal = authenticated.principal();
@@ -551,25 +597,35 @@ fn authenticate_bearer_or_query(
         return authenticate_bearer(headers, home_dir, resource);
     }
 
+    // v1.82: refusals carry the `mcp_auth_audit` marker, as in
+    // `authenticate_bearer_call`.
+    use crate::mcp_auth_audit::{FailureReason, tag, tag_refusal};
     if let Some(raw_key) = query_api_key.filter(|k| !k.is_empty()) {
         if crate::mcp_refresh::is_refresh_token_format(raw_key) {
-            return Err((StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
-                &Value::Null, -32003, crate::mcp_refresh::STDIO_ONLY_NOTICE,
-            ))).into_response());
+            return Err(tag(
+                (StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
+                    &Value::Null, -32003, crate::mcp_refresh::STDIO_ONLY_NOTICE,
+                ))).into_response(),
+                FailureReason::WrongCredentialType,
+                None,
+            ));
         }
         if duduclaw_auth::status_tokens::is_status_token(raw_key) {
-            return Err(status_credential_refused());
+            return Err(tag(status_credential_refused(), FailureReason::WrongCredentialType, None));
         }
-        let principal = authenticate_with_key(raw_key, home_dir).map_err(|e| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(crate::mcp_dispatch::jsonrpc_error(
-                    &Value::Null,
-                    -32003,
-                    &format!("Authentication failed: {e}"),
-                )),
+        let principal = crate::mcp_auth::authenticate_with_key_refusal(raw_key, home_dir).map_err(|refusal| {
+            tag_refusal(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(crate::mcp_dispatch::jsonrpc_error(
+                        &Value::Null,
+                        -32003,
+                        &format!("Authentication failed: {}", refusal.error),
+                    )),
+                )
+                    .into_response(),
+                &refusal,
             )
-                .into_response()
         })?;
         let ns_ctx = resolve_for_caller(
             &principal,
@@ -595,15 +651,19 @@ fn authenticate_bearer_or_query(
         return Ok((principal, ns_ctx));
     }
 
-    Err((
-        StatusCode::UNAUTHORIZED,
-        Json(crate::mcp_dispatch::jsonrpc_error(
-            &Value::Null,
-            -32003,
-            "Missing API key. Provide Authorization: Bearer <key> or ?api_key=<key>",
-        )),
-    )
-        .into_response())
+    Err(tag(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(crate::mcp_dispatch::jsonrpc_error(
+                &Value::Null,
+                -32003,
+                "Missing API key. Provide Authorization: Bearer <key> or ?api_key=<key>",
+            )),
+        )
+            .into_response(),
+        FailureReason::MissingHeader,
+        None,
+    ))
 }
 
 // ── Router builder (extracted for testability) ────────────────────────────────
@@ -618,9 +678,61 @@ fn http_dispatcher(dispatcher: McpDispatcher) -> Arc<McpDispatcher> {
     Arc::new(dispatcher.for_remote_bearer())
 }
 
-/// Build the Axum router with all MCP HTTP routes attached to `state`.
-/// Extracted from `run` so integration tests can call routes without binding a port.
-pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router {
+/// The MCP HTTP application: every route with every layer applied.
+///
+/// v1.82 (L1): deliberately **not** an `axum::Router`. `Router::layer` wraps
+/// only the routes that exist when it is called, so a `Router` handed out
+/// here would let a caller `.route(…)` past the proxy boundary, the
+/// admission gate and the authentication-failure audit (which counts and
+/// strips the internal refusal marker). This type has no way to add routes
+/// or layers: it can only be served ([`Self::into_make_service_with_connect_info`])
+/// or called as a `tower::Service`. Inside this module the only way to make
+/// one is `finish_app`, which applies the layers after the last route.
+///
+/// ```compile_fail
+/// fn add_route(app: duduclaw_cli::mcp_http_server::McpHttpApp) {
+///     let _ = app.route("/extra", axum::routing::get(|| async { "unaudited" }));
+/// }
+/// ```
+#[derive(Clone)]
+pub struct McpHttpApp(Router);
+
+impl McpHttpApp {
+    /// For `axum::serve` without connection info (the peer is then
+    /// unknown to the layers; loopback binds only).
+    pub fn into_make_service(self) -> axum::routing::IntoMakeService<Router> {
+        self.0.into_make_service()
+    }
+
+    /// For `axum::serve`, with the socket peer available to the layers.
+    pub fn into_make_service_with_connect_info<C>(
+        self,
+    ) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, C> {
+        self.0.into_make_service_with_connect_info::<C>()
+    }
+}
+
+impl<B> tower::Service<axum::http::Request<B>> for McpHttpApp
+where
+    Router: tower::Service<axum::http::Request<B>>,
+{
+    type Response = <Router as tower::Service<axum::http::Request<B>>>::Response;
+    type Error = <Router as tower::Service<axum::http::Request<B>>>::Error;
+    type Future = <Router as tower::Service<axum::http::Request<B>>>::Future;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        tower::Service::<axum::http::Request<B>>::poll_ready(&mut self.0, cx)
+    }
+
+    fn call(&mut self, request: axum::http::Request<B>) -> Self::Future {
+        tower::Service::call(&mut self.0, request)
+    }
+}
+
+/// Build the MCP HTTP application with all routes attached to `state`.
+/// Extracted from `run` so integration tests can call routes without binding
+/// a port. Returns the fully layered [`McpHttpApp`] (no routes can be added).
+pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> McpHttpApp {
     let origin = cfg.external_origin().expect("invalid MCP HTTP configuration");
     let state = HttpState {
         resource: format!("{origin}/mcp"),
@@ -629,13 +741,20 @@ pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router
         sse_store: Arc::new(SseEventStore::new()),
         call_timeout: cfg.call_timeout,
         home_dir: cfg.home_dir.clone(),
+        auth_audit: crate::mcp_auth_audit::AuthFailureAudit::new(cfg.home_dir.clone()),
     };
-    build_router_with_state(cfg, state)
+    build_app_with_state(cfg, state)
 }
 
-/// Build the router from a pre-constructed `HttpState` (so the SSE store can be
-/// shared with the background idle-eviction task in `run`).
-fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
+/// Build the application from a pre-constructed `HttpState` (so the SSE
+/// store and the audit can be shared with the background tasks in `run`).
+fn build_app_with_state(cfg: &HttpServerConfig, state: HttpState) -> McpHttpApp {
+    finish_app(cfg, state, mcp_routes(cfg))
+}
+
+/// Apply every layer to the complete route set — the one place an
+/// [`McpHttpApp`] is made, so no route can be added after the layers.
+fn finish_app(cfg: &HttpServerConfig, state: HttpState, routes: Router<HttpState>) -> McpHttpApp {
     let admission_state = AdmissionState {
         anonymous: Arc::new(std::sync::Mutex::new(Admission::default())),
         principals: Arc::new(std::sync::Mutex::new(Admission::default())),
@@ -644,6 +763,27 @@ fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
         trusted_proxies: cfg.trusted_proxies.clone(),
         http: state.clone(),
     };
+    // W22-P0 ADR-002: capability headers cover requests admitted by the proxy boundary.
+    // Layer order (axum: last .layer() = outermost = runs first on request, last on response):
+    //   outermost: require_proxy_peer — refuses untrusted TCP peers before processing
+    //   next: inject_capability_headers — adds standard headers (incl. 422)
+    //   inner: negotiate_capabilities   — validates client's x-duduclaw-capabilities header
+    //   innermost: pre_auth_admission   — rate gates + v1.82 auth-failure audit
+    McpHttpApp(
+        routes
+            .with_state(state)
+            .layer(middleware::from_fn_with_state(admission_state, pre_auth_admission))
+            .layer(middleware::from_fn(negotiate_capabilities)) // inner
+            .layer(middleware::from_fn(inject_capability_headers))
+            .layer(middleware::from_fn_with_state(ProxyBoundary {
+                required: !cfg.bind.ip().is_loopback() && !cfg.allow_insecure_lan,
+                trusted: cfg.trusted_proxies.clone(),
+            }, require_proxy_peer)), // outermost, including health checks and fallback routes
+    )
+}
+
+/// Every MCP HTTP route, without state or layers.
+fn mcp_routes(cfg: &HttpServerConfig) -> Router<HttpState> {
     let mut router = Router::new()
         .route("/healthz", get(healthz_handler))
         // WP3.1-T1: standard MCP Streamable HTTP endpoint (spec transport for
@@ -688,21 +828,7 @@ fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
             .route("/mcp/v1/stream", get(stream_handler))
             .route("/mcp/v1/stream/call", post(stream_call_handler));
     }
-
-    // W22-P0 ADR-002: capability headers cover requests admitted by the proxy boundary.
-    // Layer order (axum: last .layer() = outermost = runs first on request, last on response):
-    //   outermost: require_proxy_peer — refuses untrusted TCP peers before processing
-    //   next: inject_capability_headers — adds standard headers (incl. 422)
-    //   inner: negotiate_capabilities   — validates client's x-duduclaw-capabilities header
     router
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(admission_state, pre_auth_admission))
-        .layer(middleware::from_fn(negotiate_capabilities)) // inner
-        .layer(middleware::from_fn(inject_capability_headers))
-        .layer(middleware::from_fn_with_state(ProxyBoundary {
-            required: !cfg.bind.ip().is_loopback() && !cfg.allow_insecure_lan,
-            trusted: cfg.trusted_proxies.clone(),
-        }, require_proxy_peer)) // outermost, including health checks and fallback routes
 }
 
 // ── Server entry point ────────────────────────────────────────────────────────
@@ -747,6 +873,7 @@ pub async fn run(mut cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result
         sse_store: Arc::new(SseEventStore::new()),
         call_timeout: cfg.call_timeout,
         home_dir: cfg.home_dir.clone(),
+        auth_audit: crate::mcp_auth_audit::AuthFailureAudit::new(cfg.home_dir.clone()),
     };
 
     // D4: periodically evict idle SSE connections (no client ever called this before).
@@ -759,11 +886,24 @@ pub async fn run(mut cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result
         }
     });
 
-    let router = build_router_with_state(&cfg, state);
+    // v1.82: write the ended minute's detail summaries and the ended hour's
+    // chain summaries without waiting for the next failure (the writes
+    // themselves run off this task).
+    let auth_audit = state.auth_audit.clone();
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(crate::mcp_auth_audit::FLUSH_TICK_SECS));
+        loop {
+            ticker.tick().await;
+            auth_audit.flush();
+        }
+    });
+
+    let app = build_app_with_state(&cfg, state);
 
     info!(bind = %cfg.bind, "MCP HTTP server listening");
 
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(|e| format!("HTTP server error: {e}"))
 }
@@ -1373,6 +1513,311 @@ pub mod tests {
         assert!(body.contains("fail-closed"), "{body}");
     }
 
+    /// A dispatcher whose home is `home` (the unbound-key refusal reads the
+    /// employee directories of the dispatcher's home).
+    fn dispatcher_at(home: &std::path::Path) -> McpDispatcher {
+        McpDispatcher::new(
+            home.to_path_buf(),
+            reqwest::Client::new(),
+            Arc::new(duduclaw_memory::SqliteMemoryEngine::in_memory().expect("in-memory db")),
+            "dudu".to_string(),
+            Arc::new(crate::odoo_pool::OdooConnectorPool::default()),
+            RateLimiter::new(),
+            DailyQuota::new(),
+        )
+    }
+
+    /// The state `build_router` makes, with its audit handed back so a test
+    /// can roll the windows over.
+    fn state_with_audit(
+        cfg: &HttpServerConfig,
+        dispatcher: McpDispatcher,
+    ) -> (HttpState, Arc<crate::mcp_auth_audit::AuthFailureAudit>) {
+        let origin = cfg.external_origin().unwrap();
+        let audit = crate::mcp_auth_audit::AuthFailureAudit::new(cfg.home_dir.clone());
+        let state = HttpState {
+            resource: format!("{origin}/mcp"),
+            external_origin: origin,
+            dispatcher: http_dispatcher(dispatcher),
+            sse_store: Arc::new(SseEventStore::new()),
+            call_timeout: cfg.call_timeout,
+            home_dir: cfg.home_dir.clone(),
+            auth_audit: audit.clone(),
+        };
+        (state, audit)
+    }
+
+    fn from_peer(mut request: Request<Body>, last: u8) -> Request<Body> {
+        request.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([192, 0, 2, last], 4000))));
+        request
+    }
+
+    /// v1.82: every refusal on the HTTP transport keeps its exact status and
+    /// body. It leaves one detail line in `mcp_auth_failures.jsonl` (socket
+    /// peer — never X-Forwarded-For —, fixed route label, stored key id), an
+    /// immediate chain record for a stored key and a count in the hour
+    /// summary otherwise; neither file holds anything of the presented
+    /// credential, the query string or the User-Agent.
+    #[tokio::test]
+    async fn http_auth_failures_are_audited_and_the_response_is_unchanged() {
+        use crate::mcp_auth_audit::tests::{assert_nothing_of, chain_events, detail_lines, raw, wait_until};
+        use crate::mcp_auth_audit::{DETAIL_FILE, EVENT_MCP_AUTH_FAILED, EVENT_MCP_AUTH_FAILED_SUMMARY};
+        use axum::http::HeaderValue;
+        use duduclaw_auth::mcp_keys::{Expiry, KeyBinding, McpKeyStore, NewMcpKey};
+
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path();
+        std::fs::write(home_path.join("config.toml"), "").unwrap();
+        let store = McpKeyStore::open(home_path).unwrap();
+        let now = chrono::Utc::now();
+        let issue = |name: &str, binding: KeyBinding, client_id: &str| {
+            let created = store.create(NewMcpKey {
+                name: name.into(), client_id: client_id.into(), binding, env: "prod".into(),
+                scopes: vec!["memory:read".into()], expiry: Expiry::Days(30), created_by: Some("admin".into()),
+            }, now).unwrap();
+            (created.secret, created.key.id)
+        };
+        let (off, off_id) = issue("off", KeyBinding::Integration, "off-client");
+        let (old, old_id) = issue("old", KeyBinding::Integration, "old-client");
+        let (gone, gone_id) = issue("gone", KeyBinding::Integration, "gone-client");
+        // An employee key whose employee does not exist: refused every tool.
+        let (orphan, orphan_id) = issue("orphan", KeyBinding::Employee, "alice");
+        store.set_disabled(&off_id, true, "admin", now).unwrap();
+        store.delete(&gone_id, "admin", now).unwrap();
+        drop(store);
+        rusqlite::Connection::open(duduclaw_core::mcp_key_store::store_path(home_path)).unwrap()
+            .execute("UPDATE mcp_api_keys SET expires_at = '2020-01-01T00:00:00Z' WHERE id = ?1", [&old_id]).unwrap();
+        let scopes = crate::mcp_auth::parse_scopes("memory:read").unwrap();
+        let (refresh, _) = crate::mcp_refresh::issue_refresh_token(home_path, "dev", "external-client", &scopes, true).unwrap();
+        let users = duduclaw_auth::UserDb::new(&home_path.join("users.db")).unwrap();
+        let user = users
+            .create_user("alice@test.invalid", "Alice", "isolated-password", duduclaw_auth::UserRole::Admin)
+            .unwrap();
+        let status_token = users.status_token_create(&user.id, "odoo").unwrap().secret;
+        drop(users);
+
+        let unknown = "ddc_prod_0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string();
+        let malformed = "not-a-key-Zq9Xw8Vu7Ts6Rp5".to_string();
+        let oauth = format!("ddc_oauth_{}", "7c3e9a1f".repeat(8));
+        let sse_key = "ddc_prod_5eed4a7b5eed4a7b5eed4a7b5eed4a7b".to_string();
+        let store_probe = "ddc_prod_0123456789abcdef0123456789abcdef".to_string();
+        let user_agent = "AuditProbe/9.9 (ua-marker-4f2c)";
+        let forwarded = "198.51.100.200";
+
+        enum Expected { Json(Value), Bytes(Vec<u8>) }
+        let json_error = |message: &str| Expected::Json(crate::mcp_dispatch::jsonrpc_error(&Value::Null, -32003, message));
+        let not_found = || json_error("Authentication failed: API key not found in registry");
+        let inactive = || json_error(&format!("Authentication failed: {}", crate::mcp_auth::KEY_INACTIVE_MESSAGE));
+        let call = |authorization: Option<HeaderValue>| {
+            let mut request = Request::builder().method("POST").uri("/mcp/v1/call")
+                .header("content-type", "application/json")
+                // Client-controlled; never the audited source.
+                .header("x-forwarded-for", forwarded)
+                .header("user-agent", user_agent)
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"q"}}}"#,
+                ))
+                .unwrap();
+            if let Some(value) = authorization {
+                request.headers_mut().insert("authorization", value);
+            }
+            request
+        };
+        let bearer = |key: &str| Some(HeaderValue::from_str(&format!("Bearer {key}")).unwrap());
+        let sse = Request::builder()
+            .uri(format!("/mcp/v1/stream?api_key={sse_key}&conn_id=probe-conn"))
+            .header("x-forwarded-for", forwarded)
+            .header("user-agent", user_agent)
+            .body(Body::empty())
+            .unwrap();
+
+        // (case, request, status, exact body, reason, stored key id, route)
+        let cases: Vec<(&str, Request<Body>, StatusCode, Expected, &str, Option<String>, &str)> = vec![
+            ("missing", call(None), StatusCode::UNAUTHORIZED,
+                json_error("Missing Authorization header. Use: Authorization: Bearer <key>"), "missing_header", None, "mcp_v1_call"),
+            ("basic", call(Some(HeaderValue::from_static("Basic dXNlcjpwYXNz"))), StatusCode::UNAUTHORIZED,
+                json_error("Authorization header must use: Bearer <key>"), "bad_scheme", None, "mcp_v1_call"),
+            ("encoding", call(Some(HeaderValue::from_bytes(b"Bearer \xff\xfe").unwrap())), StatusCode::UNAUTHORIZED,
+                json_error("Invalid Authorization header encoding"), "bad_scheme", None, "mcp_v1_call"),
+            ("empty", call(Some(HeaderValue::from_static("Bearer "))), StatusCode::UNAUTHORIZED,
+                json_error("Authorization header must use: Bearer <key>"), "malformed_key", None, "mcp_v1_call"),
+            ("malformed", call(bearer(&malformed)), StatusCode::UNAUTHORIZED,
+                json_error("Authentication failed: API key has invalid format"), "malformed_key", None, "mcp_v1_call"),
+            ("unknown", call(bearer(&unknown)), StatusCode::UNAUTHORIZED, not_found(), "unknown_key", None, "mcp_v1_call"),
+            ("refresh", call(bearer(&refresh)), StatusCode::UNAUTHORIZED,
+                json_error(crate::mcp_refresh::STDIO_ONLY_NOTICE), "wrong_credential_type", None, "mcp_v1_call"),
+            ("status", call(bearer(&status_token)), StatusCode::UNAUTHORIZED,
+                json_error("Authentication failed: this credential cannot be used here"), "wrong_credential_type", None, "mcp_v1_call"),
+            ("oauth", call(bearer(&oauth)), StatusCode::UNAUTHORIZED, not_found(), "unknown_key", None, "mcp_v1_call"),
+            ("sse", sse, StatusCode::UNAUTHORIZED, not_found(), "unknown_key", None, "mcp_v1_stream"),
+            ("disabled", call(bearer(&off)), StatusCode::UNAUTHORIZED, inactive(), "key_disabled", Some(off_id.clone()), "mcp_v1_call"),
+            ("expired", call(bearer(&old)), StatusCode::UNAUTHORIZED, inactive(), "key_expired", Some(old_id.clone()), "mcp_v1_call"),
+            ("deleted", call(bearer(&gone)), StatusCode::UNAUTHORIZED, not_found(), "key_deleted", Some(gone_id.clone()), "mcp_v1_call"),
+            ("unbound", call(bearer(&orphan)), StatusCode::FORBIDDEN,
+                Expected::Json(crate::mcp_dispatch::jsonrpc_error(&serde_json::json!(1), -32003, crate::mcp::REMOTE_UNBOUND_MESSAGE)),
+                "key_unbound", Some(orphan_id.clone()), "mcp_v1_call"),
+        ];
+        let mut expected_detail: Vec<(String, &str, Option<String>, &str)> = Vec::new();
+
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home_path.into());
+        let (state, audit) = state_with_audit(&cfg, dispatcher_at(home_path));
+        let app = build_app_with_state(&cfg, state);
+        let check = |name: String, status: StatusCode, expected: Expected, response: Response| async move {
+            assert_eq!(response.status(), status, "{name}: status changed");
+            assert!(response.extensions().get::<crate::mcp_auth_audit::AuthFailureTag>().is_none(), "{name}");
+            let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            match expected {
+                Expected::Json(value) => {
+                    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), value, "{name}: body changed")
+                }
+                Expected::Bytes(bytes) => assert_eq!(body.to_vec(), bytes, "{name}: body changed"),
+            }
+        };
+        for (index, (name, request, status, expected, reason, key_id, route)) in cases.into_iter().enumerate() {
+            let last = 10 + index as u8;
+            let response = app.clone().oneshot(from_peer(request, last)).await.unwrap();
+            check(name.to_string(), status, expected, response).await;
+            expected_detail.push((format!("192.0.2.{last}"), reason, key_id, route));
+        }
+
+        // OAuth consent: a refused operator key (the disabled one again).
+        let register = Request::builder().method("POST").uri("/oauth/register")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"redirect_uris":["https://client.example/cb"]}"#)).unwrap();
+        let response = app.clone().oneshot(from_peer(register, 60)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let client: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        let form = format!(
+            "client_id={}&redirect_uri={}&code_challenge=abc&operator_key={}&action=approve",
+            urlencoding::encode(client["client_id"].as_str().unwrap()),
+            urlencoding::encode("https://client.example/cb"),
+            urlencoding::encode(&off),
+        );
+        let decision = Request::builder().method("POST").uri("/oauth/decision")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", forwarded)
+            .header("user-agent", user_agent)
+            .body(Body::from(form)).unwrap();
+        let refused = crate::mcp_oauth_server::html_error(
+            StatusCode::UNAUTHORIZED,
+            "operator key rejected — paste an internal (is_external = false) MCP API key",
+        );
+        let refused = axum::body::to_bytes(refused.into_body(), 65536).await.unwrap().to_vec();
+        let response = app.clone().oneshot(from_peer(decision, 61)).await.unwrap();
+        check("consent".into(), StatusCode::UNAUTHORIZED, Expected::Bytes(refused), response).await;
+        expected_detail.push(("192.0.2.61".into(), "key_disabled", Some(off_id.clone()), "oauth_decision"));
+
+        // An unreadable key store (last: it breaks every stored key).
+        std::fs::write(duduclaw_core::mcp_key_store::store_path(home_path), b"corrupt store bytes, not sqlite").unwrap();
+        let decided = crate::mcp_auth::authenticate_with_key_call_refusal(&store_probe, home_path).unwrap_err();
+        assert_eq!(decided.audit_reason(), crate::mcp_auth_audit::FailureReason::StoreUnavailable);
+        let response = app.clone().oneshot(from_peer(call(bearer(&store_probe)), 62)).await.unwrap();
+        check("store".into(), StatusCode::UNAUTHORIZED, json_error(&format!("Authentication failed: {}", decided.error)), response).await;
+        expected_detail.push(("192.0.2.62".into(), "store_unavailable", None, "mcp_v1_call"));
+
+        // Detail: one line per refusal; chain: the four stored-key pairs at once.
+        wait_until(|| {
+            detail_lines(home_path).len() >= expected_detail.len()
+                && chain_events(home_path, EVENT_MCP_AUTH_FAILED).len() >= 4
+        })
+        .await;
+        let detail = detail_lines(home_path);
+        assert_eq!(detail.len(), expected_detail.len(), "{detail:?}");
+        for (source, reason, key_id, route) in &expected_detail {
+            let line = detail.iter().find(|l| l["source"] == source.as_str())
+                .unwrap_or_else(|| panic!("no detail line for {reason} from {source}"));
+            assert_eq!(line["reason"], *reason, "{source}");
+            assert_eq!(line["route"], *route, "{source}");
+            assert_eq!(line["transport"], "http");
+            assert_eq!(line["count"], 1);
+            assert_eq!(line.get("key_id").and_then(Value::as_str), key_id.as_deref(), "{reason}");
+        }
+        let chain = chain_events(home_path, EVENT_MCP_AUTH_FAILED);
+        assert_eq!(chain.len(), 4, "{chain:?}");
+        for (reason, key_id) in [("key_disabled", &off_id), ("key_expired", &old_id), ("key_deleted", &gone_id), ("key_unbound", &orphan_id)] {
+            let event = chain.iter().find(|e| e["details"]["key_id"] == key_id.as_str())
+                .unwrap_or_else(|| panic!("no chain record for {reason}"));
+            assert_eq!(event["details"]["reason"], reason);
+            assert_eq!(event["details"]["aggregation"], "first_in_hour");
+            assert_eq!(event["details"]["route"], "mcp_v1_call");
+        }
+        assert!(chain_events(home_path, EVENT_MCP_AUTH_FAILED_SUMMARY).is_empty(), "anonymous failures wait for the hour");
+
+        // The hour ends: the second consent refusal of the disabled key and
+        // every anonymous failure are summarised.
+        audit.flush_at(std::time::Instant::now() + Duration::from_secs(61), chrono::Utc::now().timestamp() + 3600);
+        wait_until(|| {
+            !chain_events(home_path, EVENT_MCP_AUTH_FAILED_SUMMARY).is_empty()
+                && chain_events(home_path, EVENT_MCP_AUTH_FAILED).len() >= 5
+        })
+        .await;
+        let per_key: Vec<Value> = chain_events(home_path, EVENT_MCP_AUTH_FAILED).into_iter()
+            .filter(|e| e["details"]["aggregation"] == "hour_summary").collect();
+        assert_eq!(per_key.len(), 1, "{per_key:?}");
+        assert_eq!(per_key[0]["details"]["key_id"], off_id.as_str());
+        assert_eq!(per_key[0]["details"]["count"], 1);
+        assert_eq!(per_key[0]["details"]["route"], crate::mcp_auth_audit::ROUTE_MIXED);
+        let summary = chain_events(home_path, EVENT_MCP_AUTH_FAILED_SUMMARY);
+        assert_eq!(summary.len(), 1);
+        let summary = &summary[0]["details"];
+        assert_eq!(summary["count"], 11);
+        assert_eq!(summary["distinct_sources"], 11);
+        assert_eq!(summary["detail_log"], DETAIL_FILE);
+        for (reason, count) in [("missing_header", 1), ("bad_scheme", 2), ("malformed_key", 2), ("unknown_key", 3),
+            ("wrong_credential_type", 2), ("store_unavailable", 1)] {
+            assert_eq!(summary["reasons"][reason], count, "{reason}");
+        }
+
+        let raw_chain = raw(home_path, "security_audit.jsonl");
+        let raw_detail = raw(home_path, DETAIL_FILE);
+        assert!(!raw_chain.contains("192.0.2."), "no source address in the chain");
+        for text in [&raw_chain, &raw_detail] {
+            assert!(!text.contains(forwarded), "X-Forwarded-For is never the audited source");
+            assert!(!text.contains("dXNlcjpwYXNz"), "no Authorization value is kept");
+            assert!(!text.contains("ua-marker-4f2c"), "no User-Agent is kept");
+            assert!(!text.contains("api_key") && !text.contains("conn_id") && !text.contains("/mcp/v1/stream"),
+                "no raw URI or query is kept");
+            for secret in [&off, &old, &gone, &orphan, &unknown, &malformed, &refresh, &status_token, &oauth, &sse_key, &store_probe] {
+                assert_nothing_of(secret, text);
+            }
+        }
+    }
+
+    /// v1.82 (L1): the audit layer wraps every route composed into the
+    /// application — including one added to the route set the way a future
+    /// route would be — and the fallback. `McpHttpApp` itself offers no way
+    /// to add a route after the layers (see its `compile_fail` doc test).
+    #[tokio::test]
+    async fn a_route_composed_into_the_app_cannot_bypass_the_audit_layer() {
+        use crate::mcp_auth_audit::tests::{detail_lines, wait_until};
+        async fn tagging() -> Response {
+            crate::mcp_auth_audit::tag(
+                (StatusCode::UNAUTHORIZED, "refused").into_response(),
+                crate::mcp_auth_audit::FailureReason::UnknownKey,
+                None,
+            )
+        }
+        let home = tempfile::tempdir().unwrap();
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().into());
+        let (state, _) = state_with_audit(&cfg, make_test_dispatcher());
+        let app = finish_app(&cfg, state, mcp_routes(&cfg).route("/extra", get(tagging)));
+        let request = Request::builder().uri("/extra").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(from_peer(request, 99)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.extensions().get::<crate::mcp_auth_audit::AuthFailureTag>().is_none(), "the marker is stripped");
+        assert!(response.headers().contains_key("x-duduclaw-version"), "every layer ran");
+        wait_until(|| !detail_lines(home.path()).is_empty()).await;
+        let lines = detail_lines(home.path());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["source"], "192.0.2.99");
+        assert_eq!(lines[0]["route"], "other");
+        // The fallback passes the same layers.
+        let request = Request::builder().uri("/no-such-route").body(Body::empty()).unwrap();
+        let response = app.oneshot(from_peer(request, 98)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().contains_key("x-duduclaw-version"));
+    }
+
     #[test]
     fn non_loopback_requires_https_proxy_or_explicit_insecure_opt_in() {
         let mut cfg = HttpServerConfig::new("0.0.0.0:8765".parse().unwrap(), "/tmp".into());
@@ -1505,6 +1950,7 @@ pub mod tests {
                 dispatcher: http_dispatcher(make_test_dispatcher()),
                 sse_store: Arc::new(SseEventStore::new()),
                 call_timeout: Duration::from_secs(30),
+                auth_audit: crate::mcp_auth_audit::AuthFailureAudit::new(home.into()),
             },
         }
     }

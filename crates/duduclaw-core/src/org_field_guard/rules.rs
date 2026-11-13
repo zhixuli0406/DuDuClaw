@@ -227,6 +227,9 @@ pub const HOME_WRITABLE_DIRS: &[&str] = &["attachments"];
 pub(super) const HOME_EVIDENCE_BASENAMES: &[&str] = &[
     "tool_calls.jsonl",
     "security_audit.jsonl",
+    // v1.82: per-minute detail of refused MCP credentials (rotated copy
+    // `.1` and the `.lock` sidecar match by the `.` suffix rule).
+    "mcp_auth_failures.jsonl",
     "bus_queue.jsonl",
     "message_queue.db",
     "message_queue.db-wal",

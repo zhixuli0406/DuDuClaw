@@ -62,8 +62,16 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     // rotation/revocation in `config.toml [mcp_keys]` is now observed on the
     // very next call, not only after a restart.
     let auth_cache = crate::mcp_auth::KeyRegistryCache::new();
-    let principal = crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache)
-        .map_err(|e| DuDuClawError::Gateway(startup_auth_error(&e)))?;
+    let principal = match crate::mcp_auth::authenticate_from_env_cached_call_refusal(home_dir, &auth_cache) {
+        Ok(call) => call.principal().clone(),
+        Err(refusal) => {
+            // v1.82: the process exits right after this refusal, so wait for
+            // its `mcp_auth_failed` record — at most
+            // `mcp_auth_audit::STDIO_WRITE_TIMEOUT`, off this async thread.
+            crate::mcp_auth_audit::record_stdio_failure_before_exit(home_dir, &refusal).await;
+            return Err(DuDuClawError::Gateway(startup_auth_error(&refusal.error)));
+        }
+    };
 
     // Memory namespace unification (v1.68.0): an internal-key caller whose
     // `DUDUCLAW_AGENT_ID` is proven by `DUDUCLAW_AGENT_TOKEN` reads and writes
@@ -212,8 +220,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             }
             _ = watch.tick() => {
                 if last_advertised.is_some()
-                    && let Ok(p) =
-                        crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache)
+                    && let Ok(p) = authenticate_stdio(home_dir, &auth_cache)
                 {
                     let current: Vec<String> =
                         crate::mcp_auth::with_authenticated_call(p.clone(),
@@ -347,8 +354,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // A subscriber the watcher cannot authenticate would never be
                 // compared against, so refuse instead of acknowledging.
                 let baseline = if wants {
-                    match crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache)
-                    {
+                    match authenticate_stdio(home_dir, &auth_cache) {
                         Ok(p) => Some(
                             crate::mcp_auth::with_authenticated_call(
                                 p.clone(),
@@ -404,7 +410,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // Gap (a): re-authenticate per call instead of reusing the
                 // boot-time `principal` — a revoked/rescoped key must stop
                 // (or start) seeing tools without a restart.
-                match crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache) {
+                match authenticate_stdio(home_dir, &auth_cache) {
                     Ok(p) => {
                         let resp = crate::mcp_auth::with_authenticated_call(
                             p.clone(),
@@ -447,7 +453,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // `auth_cache` above) instead of reusing the boot-time
                 // `principal` for the whole life of this long-running
                 // subprocess.
-                match crate::mcp_auth::authenticate_from_env_cached_call(home_dir, &auth_cache) {
+                match authenticate_stdio(home_dir, &auth_cache) {
                     Ok(p) => match resolve_ns(p.principal()) {
                         Ok(ns) => {
                             crate::mcp_auth::with_authenticated_call(
@@ -479,6 +485,22 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The stdio server's re-authentication of its own `DUDUCLAW_MCP_API_KEY`
+/// on the paths that keep serving (`mcp_auth::authenticate_from_env_cached_call`,
+/// same decision). v1.82: a refusal starts the process's one
+/// `mcp_auth_failed` security-audit record on a blocking thread and does not
+/// wait for it (`mcp_auth_audit::record_stdio_failure`); the startup refusal
+/// above waits for it, bounded, because the process exits.
+fn authenticate_stdio(
+    home_dir: &Path,
+    cache: &crate::mcp_auth::KeyRegistryCache,
+) -> std::result::Result<crate::mcp_auth::AuthenticatedCall, crate::mcp_auth::AuthError> {
+    crate::mcp_auth::authenticate_from_env_cached_call_refusal(home_dir, cache).map_err(|refusal| {
+        crate::mcp_auth_audit::record_stdio_failure(home_dir, &refusal);
+        refusal.error
+    })
 }
 
 /// The boot-time authentication failure message. A missing key is the first

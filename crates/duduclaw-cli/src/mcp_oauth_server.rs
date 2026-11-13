@@ -715,7 +715,7 @@ button{{border-radius:8px;font:inherit;cursor:pointer}}\
     )
 }
 
-fn html_error(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn html_error(status: StatusCode, msg: &str) -> Response {
     (
         status,
         Html(oauth_page(
@@ -880,13 +880,19 @@ fn decision_response(home: &Path, client: RegisteredClient, f: DecisionForm, res
 
     // Operator proof: a valid INTERNAL key. External keys cannot mint grants
     // (no self-escalation), and failures never redirect a code anywhere.
-    match crate::mcp_auth::authenticate_with_key(&f.operator_key, home) {
+    // v1.82: a refused key (not a valid external one) carries the
+    // `mcp_auth_audit` marker; the response is unchanged.
+    match crate::mcp_auth::authenticate_with_key_refusal(&f.operator_key, home) {
         Ok(p) if !p.is_external => {}
-        _ => {
-            return html_error(
+        outcome => {
+            let response = html_error(
                 StatusCode::UNAUTHORIZED,
                 "operator key rejected — paste an internal (is_external = false) MCP API key",
             );
+            return match outcome {
+                Err(refusal) => crate::mcp_auth_audit::tag_refusal(response, &refusal),
+                Ok(_) => response,
+            };
         }
     }
 

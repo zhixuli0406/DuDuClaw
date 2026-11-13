@@ -314,7 +314,7 @@ async fn tc_http_08_http_rate_limit_triggers_after_60_requests() {
     let valid_body_clone = valid_body.clone();
 
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service()).await.unwrap();
     });
 
     let http_client = reqwest::Client::new();
