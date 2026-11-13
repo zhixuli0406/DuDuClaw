@@ -270,6 +270,30 @@ impl RemoteAccess {
     }
 }
 
+/// For a [`RemoteAccess::Bound`] caller on the HTTP MCP server: do the two
+/// gates that are specific to it let `principal` call `name`? The process-agent
+/// union ([`RemoteAccess::refuses_process_agent_tool`], dispatch error class
+/// `per_agent_key_process_tool`) and the key's own scopes
+/// (`mcp_auth::scope_gate_refusal` with `bound_employee = true`: the required
+/// scope must be a per-employee scope the key holds, `admin` never stands in,
+/// a tool missing from the scope table needs `admin`; dispatch error class
+/// `insufficient_scope`). Both are the dispatch gate's own functions, so the
+/// bound-key listing cannot drift from what dispatch admits.
+///
+/// Listing has no call arguments, so the scope is the argument-free one
+/// (`tool_requires_scope`). The only argument-dependent entry
+/// (`tasks_create` with `kind = "discovery"` → `discovery:execute`) is not a
+/// per-employee scope, so a bound key is refused it with any arguments.
+pub(crate) fn remote_bound_key_can_call(
+    access: &RemoteAccess,
+    name: &str,
+    principal: &crate::mcp_auth::Principal,
+) -> bool {
+    matches!(access, RemoteAccess::Bound(_))
+        && !access.refuses_process_agent_tool(name)
+        && crate::mcp_auth::scope_gate_refusal(principal, name, &Value::Null, true).is_none()
+}
+
 /// Classify the principal of a call on the HTTP MCP server from the
 /// authenticated call it arrived with (`mcp_auth::current_call_matches`).
 pub(crate) fn remote_access(
@@ -337,6 +361,11 @@ pub(crate) const REMOTE_UNBOUND_MESSAGE: &str = "This MCP key is not bound to an
 /// not callable without the matching scope.
 ///
 /// An `admin` holder passes every scope check, so its listing is unchanged.
+///
+/// A key bound to an employee on the HTTP MCP server is an AI-employee client
+/// here (so this answers `false`), but the HTTP dispatch gate does enforce its
+/// scopes: [`handle_tools_list_for_transport`] applies them separately through
+/// [`remote_bound_key_can_call`], leaving the stdio listing unchanged.
 pub(crate) fn scope_listing_applies(
     principal: &crate::mcp_auth::Principal,
     client_is_agent: bool,
@@ -490,8 +519,13 @@ pub(crate) async fn handle_tools_list_for_agent(
 /// There, the same classification as the dispatch gate ([`remote_access`]):
 /// an unbound non-external principal is shown nothing; a bound one is listed
 /// as ITS employee (never the server's `default_agent`) without the
-/// process-agent union; external keys and the verified gateway-internal key
-/// are listed as before. Discoverable ⇔ callable.
+/// process-agent union and without any tool its key's scopes do not reach
+/// ([`remote_bound_key_can_call`]); external keys and the verified
+/// gateway-internal key are listed as before. Discoverable ⇔ callable.
+///
+/// The stdio employee listing ([`visible_tools`], `remote_bearer == false`)
+/// is unchanged: the employee-process principal is exempt from the scope
+/// listing there ([`scope_listing_applies`]), as before.
 pub(crate) async fn handle_tools_list_for_transport(
     id: &Value,
     principal: &crate::mcp_auth::Principal,
@@ -503,12 +537,20 @@ pub(crate) async fn handle_tools_list_for_transport(
     let tools: Vec<&'static ToolDef> = match &access {
         Some(RemoteAccess::Unbound(_)) => Vec::new(),
         Some(RemoteAccess::Bound(agent)) => {
+            let bound_access = RemoteAccess::Bound(agent.clone());
             let listed = with_remote_binding(
                 RemoteBinding::Bound(agent.clone()),
                 visible_tools(principal, home_dir, agent),
             )
             .await;
-            listed.into_iter().filter(|t| !acts_for_process_agent(t.name)).collect()
+            // `visible_tools` exempts an AI-employee client from the scope
+            // listing (`scope_listing_applies`, kept for the stdio employee
+            // process); the HTTP dispatch gate does enforce a bound key's
+            // scopes, so they are applied here by the same predicate.
+            listed
+                .into_iter()
+                .filter(|t| remote_bound_key_can_call(&bound_access, t.name, principal))
+                .collect()
         }
         _ => visible_tools(principal, home_dir, default_agent).await,
     };

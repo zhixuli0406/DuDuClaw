@@ -285,7 +285,8 @@ The dashboard groups rules by table. **Query and read** writes both `read` and `
 > tools that operate on the HTTP server's own agent (`working_state_*`, `mail_*`,
 > `wiki_*`, `canvas_*`, `send_message`, `tasks_list`, `odoo_*`, …) are refused to
 > every key except the gateway's own internal key, and the remaining tools run as
-> the key's bound agent, never as the server's. A key whose bound agent no longer
+> the key's bound agent, never as the server's. Its `tools/list` shows only the
+> tools the key's scopes let it call. A key whose bound agent no longer
 > exists (removed, renamed or `status = "deleted"`), or an internal key with no
 > binding, is refused every tool over HTTP and is shown as *Employee no longer
 > exists* on the keys page. Each agent's own stdio `mcp-server` is unchanged.
