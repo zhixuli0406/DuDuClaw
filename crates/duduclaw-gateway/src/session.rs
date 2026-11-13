@@ -806,25 +806,7 @@ impl SessionManager {
             return Err(DuDuClawError::Gateway(CLEARED_DURING_TURN.into()));
         }
 
-        if let Some(expected) = generation {
-            let current: Option<String> = conn
-                .query_row(
-                    "SELECT created_at FROM sessions WHERE id = ?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-            if current.as_deref() != Some(expected) {
-                // Dropping the transaction rolls back (nothing was written).
-                info!(
-                    session_id, role,
-                    recreated = current.is_some(),
-                    "message dropped: the conversation was cleared while the turn ran"
-                );
-                return Err(DuDuClawError::Gateway(CLEARED_DURING_TURN.into()));
-            }
-        }
+        Self::check_delivery_incarnation_in(&conn, session_id, generation)?;
 
         // G4 checkpoint: every user turn starts a (potentially file-writing)
         // agent run, so record the turn-id watermark just before it. We
@@ -870,6 +852,41 @@ impl SessionManager {
         conn.commit()
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
         Ok(message_id)
+    }
+
+    /// Apply the append incarnation fence without inserting a message. The
+    /// IMMEDIATE transaction also fences clears made by other managers.
+    pub(crate) async fn check_delivery_incarnation(
+        &self, session_id: &str, generation: Option<&str>,
+    ) -> Result<()> {
+        let mut guard = self.acquire().await;
+        crate::isolation_label_stores::check_session_writable(&guard, session_id).map_err(DuDuClawError::Gateway)?;
+        let conn = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        Self::check_delivery_incarnation_in(&conn, session_id, generation)?;
+        conn.commit()
+            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))
+    }
+
+    fn check_delivery_incarnation_in(
+        conn: &Connection, session_id: &str, generation: Option<&str>,
+    ) -> Result<()> {
+        let current: Option<(String, bool)> = conn
+            .query_row(
+                &format!("SELECT created_at, {STUCK_USER_CLEAR} FROM sessions WHERE id = ?1"),
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        // An unbound early reply remains allowed for a live row, as in the
+        // append path. Missing rows would also fail its foreign-key insert.
+        if !matches!(current, Some((ref actual, false)) if generation.is_none_or(|expected| actual == expected)) {
+            info!(session_id, "delivery dropped: the conversation was cleared while the turn ran");
+            return Err(DuDuClawError::Gateway(CLEARED_DURING_TURN.into()));
+        }
+        Ok(())
     }
 
     /// Store only structured provenance for tool originals already committed
