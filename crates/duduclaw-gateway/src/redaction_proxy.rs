@@ -559,7 +559,7 @@ fn write_gated_mcp_config_value(
     own_server: &Value,
     preserve_cli_discovery: bool,
 ) -> Result<(Option<tempfile::TempPath>, Vec<String>), String> {
-    let rewrite = rewrite_mcp_config_for_gate(parsed, self_exe, purpose, own_server)?;
+    let mut rewrite = rewrite_mcp_config_for_gate(parsed, self_exe, purpose, own_server)?;
     require_resolvable_config(&rewrite.config)?;
     // A mandatory tool gate always freezes a copy, including built-in-only
     // files, so callers add strict config flags and disable ambient discovery.
@@ -574,6 +574,12 @@ fn write_gated_mcp_config_value(
         debug!("mcp-proxy: nothing to proxy in this .mcp.json");
         return Ok((None, Vec::new()));
     }
+    // RM-160: the Claude CLI's env carries no full employee token since
+    // RM-166, so the proxies get it here, from the same host definition the
+    // built-in entry of this file uses. Only this per-spawn, owner-only copy
+    // holds it; the employee's `.mcp.json` is never written. Without a token
+    // source nothing is attached and the proxy behaves as before.
+    duduclaw_core::mcp_proxy_rewrite::attach_proxy_identity(&mut rewrite.config, self_exe, own_server);
 
     let mut file = tempfile::Builder::new()
         .prefix("duduclaw-mcp-")
@@ -1192,6 +1198,85 @@ mod mcp_config_proxy_tests {
         assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
     }
 
+    /// RM-160: the Claude CLI env has no full token (RM-166), so the frozen
+    /// per-spawn config is where the proxy gets it, never the employee's file.
+    #[test]
+    fn rm160_claude_spawn_config_gives_proxies_the_spawn_identity() {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let path = agent_mcp_path(home.path());
+        let own = canonical_builtin(home.path());
+        let token = own["env"][duduclaw_core::ENV_AGENT_TOKEN].as_str().unwrap().to_string();
+        for raw in [
+            json!({"mcpServers": {"vendor": {"command":"vendor-mcp", "env":{"VENDOR_KEY":"v"}}}}),
+            json!({"mcpServers": {"duduclaw": own.clone(),
+                "vendor": {"command":"vendor-mcp", "env":{"VENDOR_KEY":"v"}}}}),
+        ] {
+            let raw = raw.to_string();
+            std::fs::write(&path, &raw).unwrap();
+            let temp = maybe_proxy_mcp_config(home.path(), &path).unwrap().expect("gated copy");
+            let effective: Value = serde_json::from_slice(&std::fs::read(&temp).unwrap()).unwrap();
+            let vendor = &effective["mcpServers"]["vendor"];
+            assert_eq!(vendor["args"][0], "mcp-proxy");
+            assert_eq!(vendor["env"]["DUDUCLAW_AGENT_ID"], "alice");
+            assert_eq!(vendor["env"][duduclaw_core::ENV_AGENT_TOKEN], token.as_str());
+            assert_eq!(duduclaw_core::identity_token::verify_claim(home.path(), "alice", &token, true),
+                duduclaw_core::IdentityVerdict::Verified);
+            if let Some(builtin) = effective["mcpServers"].get("duduclaw") {
+                assert_eq!(builtin["env"][duduclaw_core::ENV_AGENT_TOKEN], vendor["env"][duduclaw_core::ENV_AGENT_TOKEN],
+                    "same source as the built-in entry of this spawn");
+            }
+            // The upstream's own env map never carries it.
+            let blob: Value = serde_json::from_str(vendor["env"][PROXY_UPSTREAM_ENV_VAR].as_str().unwrap()).unwrap();
+            assert_eq!(blob, json!({"VENDOR_KEY":"v"}));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+            // The employee's file is byte-identical; no proxy entry is persisted.
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            let on_disk: Value = serde_json::from_str(&raw).unwrap();
+            assert!(on_disk["mcpServers"]["vendor"]["env"].get(duduclaw_core::ENV_AGENT_TOKEN).is_none());
+            let kept = temp.to_path_buf();
+            drop(temp);
+            assert!(!kept.exists(), "the token's lifetime ends with the spawn's temp file");
+        }
+    }
+
+    #[test]
+    fn rm160_without_a_token_source_the_proxy_entry_is_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let path = agent_mcp_path(home.path());
+        let raw = json!({"mcpServers": {"vendor": {"command":"vendor-mcp"}}}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        assert!(canonical_builtin(home.path())["env"].get(duduclaw_core::ENV_AGENT_TOKEN).is_none());
+        let temp = maybe_proxy_mcp_config(home.path(), &path).unwrap().expect("the gate still applies");
+        let effective: Value = serde_json::from_slice(&std::fs::read(&temp).unwrap()).unwrap();
+        let expected = rewrite_mcp_config_for_gate(
+            &serde_json::from_str(&raw).unwrap(), &duduclaw_core::resolve_duduclaw_bin(),
+            ProxyPurpose { redaction: redaction_active_for_spawn(home.path()), tool_gate: true, secret_env: false },
+            &canonical_builtin(home.path()),
+        ).unwrap().config;
+        assert_eq!(effective, expected, "no fallback: still proxied, still gated, no identity added");
+        assert!(effective["mcpServers"]["vendor"]["env"].get(duduclaw_core::ENV_AGENT_TOKEN).is_none());
+    }
+
+    #[test]
+    fn rm160_runtime_registered_configs_keep_supplying_identity_through_spawn_env() {
+        // Codex / Grok register the gated servers themselves and hand the
+        // proxy its token through `host_proxy_env`, never through this value.
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let path = agent_mcp_path(home.path());
+        std::fs::write(&path, runtime_sample(home.path()).to_string()).unwrap();
+        let exe = duduclaw_core::resolve_duduclaw_bin();
+        let own = canonical_builtin(home.path());
+        let gated = gated_mcp_config_for_runtime(home.path(), &path, &own, &exe, false).unwrap().unwrap();
+        assert_eq!(gated["mcpServers"]["crm_pg"]["args"][0], "mcp-proxy");
+        assert!(gated["mcpServers"]["crm_pg"]["env"].get(duduclaw_core::ENV_AGENT_TOKEN).is_none());
+    }
+
     #[test]
     fn host_canonical_builtin_passes_raw_validation_unchanged() {
         let home = tempfile::tempdir().unwrap();
@@ -1268,7 +1353,8 @@ mod mcp_config_proxy_tests {
         );
         assert!(
             env.get("DUDUCLAW_AGENT_TOKEN").is_none(),
-            "the host supplies the identity MAC at spawn; persistent carry must not copy it"
+            "the pure rewrite (shared by every runtime) never copies the identity MAC; \
+             only the Claude per-spawn writer attaches it (RM-160)"
         );
     }
 
