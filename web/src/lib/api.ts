@@ -6878,6 +6878,10 @@ export const api = {
       display_name: string;
       role?: string;
       trigger?: string;
+      /** Persona written to SOUL.md (canonical field). Scanned; a rejected
+       *  persona or a failed write refuses the whole create. */
+      soul_md?: string;
+      /** Older alias of `soul_md`. Sending both with different text is an error. */
       soul?: string;
       /** Supervisor agent name — must already exist. Omit/empty ⇒ standalone. */
       reports_to?: string;
@@ -6890,7 +6894,17 @@ export const api = {
        *  falls back to a default for programmatic callers only. */
       model_preferred?: string;
     }) =>
-      client.call('agents.create', params) as Promise<{ success: boolean; agent: AgentInfo }>,
+      client.call('agents.create', params) as Promise<{
+        success: boolean;
+        agent: AgentInfo;
+        /** Whether a persona (`soul_md` / `soul`) was written to SOUL.md. */
+        persona_supplied?: boolean;
+        /** Top-level request fields the gateway did not use (not rejected):
+         *  at most 20 names, each at most 64 characters, one plain line. */
+        ignored_fields?: string[];
+        /** How many more ignored fields there were beyond `ignored_fields`. */
+        ignored_fields_more?: number;
+      }>,
     /** Fire-and-forget bus message to one agent. No dashboard surface calls
      *  this since UX plan I-1a: the employee-card 交辦 action now opens the
      *  /assign page, which files a trackable, judge-verified goal task instead.

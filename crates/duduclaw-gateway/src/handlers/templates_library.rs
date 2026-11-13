@@ -424,9 +424,17 @@ impl MethodHandler {
             if reg.list().iter().any(|a|a.config.agent.name==*name || a.dir.file_name().and_then(|v|v.to_str())==Some(name.as_str()))
                 || reg.agents_dir().join(name).exists() { return Err("Employee name already exists".into()); }
         }
-        let count = reg.list().len();
         drop(reg);
-        if let Some(error) = self.tier_limit_message("agent",count + names.len().saturating_sub(1)).await { return Err(error); }
+        // Licence seats (RM-149): the whole batch must fit before anything is
+        // written, and it is admitted all-or-nothing — the seat admission
+        // lock is taken once here and held until every member is published
+        // (each member's create reuses it instead of taking its own), so no
+        // other create, restore or import can take a seat in between. The
+        // refusal carries the counted employees for the (Admin) dashboard.
+        let batch_admission = match self.admit_agent_seats(names.len(), None).await {
+            Ok(admission) => admission,
+            Err(refusal) => return Ok(seat_refusal_result(refusal)),
+        };
         let premium_dir = if roles.iter().any(|r|r.premium) {
             self.premium_dir_unlocked().await.map_err(|_|"Premium templates are locked")?
         } else { self.home_dir.join("company_templates") };
@@ -459,9 +467,18 @@ impl MethodHandler {
             let display_name = if is_team { format!("{} · {}",params.get("display_name").and_then(Value::as_str).unwrap_or(name),item.role.display_name) }
                 else {params.get("display_name").and_then(Value::as_str).unwrap_or(name).to_string()};
             let create_params = json!({"name":names[index],"display_name":display_name,"department":department});
-            let response = self.create_template_with_skills(&create_params,caller,&premium_dir,&item.role.role_id,&item.role,item.skills.as_ref(),item.premium,item.premium && item.revision.is_none(), &item.disabled_skills).await;
+            let response = self.create_template_with_skills(&create_params,caller,&premium_dir,&item.role.role_id,&item.role,item.skills.as_ref(),item.premium,item.premium && item.revision.is_none(), &item.disabled_skills, Some(&batch_admission)).await;
             if !matches!(response,WsFrame::Response{ok:true,..}) {
                 let error = match response { WsFrame::Response { error, .. } => error, _ => None };
+                // A structured refusal (seat limit reached mid-batch) keeps
+                // `error` a string and carries the details separately.
+                if let Some(refusal) = error.as_ref().filter(|e| e.get("code").and_then(Value::as_str)
+                    == Some(duduclaw_core::agent_seats::SEAT_LIMIT_ERROR_CODE)) {
+                    let mut out = seat_refusal_result(refusal.clone());
+                    out["agents"] = json!(created);
+                    return Ok(out);
+                }
+                let error = match error { Some(Value::Object(o)) => o.get("message").cloned(), other => other };
                 return Ok(json!({"success":false,"agents":created,"warning":"creation_failed","error":error}));
             }
             created.push(names[index].clone());
@@ -473,8 +490,22 @@ impl MethodHandler {
             }
             after_member(index).await;
         }
+        drop(batch_admission);
         Ok(json!({"success":true,"agents":created}))
     }
+}
+
+/// `templates.apply` result for a seat refusal (RM-149): the batch shape the
+/// dashboard already handles (`success: false`, `warning`, string `error`)
+/// plus the structured refusal under `seat_limit`.
+fn seat_refusal_result(refusal: Value) -> Value {
+    json!({
+        "success": false,
+        "agents": [],
+        "warning": "seat_limit",
+        "error": refusal.get("message").cloned().unwrap_or(Value::Null),
+        "seat_limit": refusal,
+    })
 }
 
 fn require_review(params: &Value) -> Result<(), String> {
@@ -519,5 +550,50 @@ mod revision_tests {
         assert_eq!(company::get(home.path(), &team.id).unwrap().revision, 2);
         assert!(handler.registry.read().await.get("concurrent-member-0").is_some());
         assert!(!home.path().join("agents/concurrent-member-1").exists());
+    }
+
+    /// RM-149 round 2 (H1): a team is admitted all-or-nothing. The seat
+    /// admission is taken once for the whole batch and held until the last
+    /// member is published, so no other admission (dashboard create,
+    /// restore, MCP `create_agent`, pack import — any process) gets in
+    /// between members; a team that does not fit writes nothing.
+    #[tokio::test]
+    async fn templates_apply_admits_the_whole_team_under_one_held_admission() {
+        use duduclaw_core::agent_seats::{SeatAdmission, SEAT_LIMIT_ERROR_CODE};
+        let home = tempfile::tempdir().unwrap();
+        let config = include_str!("../../../../templates/evaluator/agent.toml");
+        let member = company::draft("Member", "", config, "Helpful", "", BTreeMap::new(), false, vec![]).unwrap();
+        let team = company::create_team(home.path(), "Team", "", vec![member.clone(), member]).unwrap();
+        let handler = MethodHandler::new(home.path().into()).await;
+        handler.set_agent_cap_fixture(Some(3)).await;
+        // One seat in use: the team of two fills the cap exactly.
+        assert!(matches!(handler.handle_agents_create(json!({"name":"solo"})).await, WsFrame::Response { ok: true, .. }));
+
+        let params = json!({"id":format!("company:{}", team.id),"revision":1,"name":"batch","reviewed":true});
+        let path = home.path().to_path_buf();
+        let result = handler.library_apply_members(&params, &UserContext::admin_fallback(), |_| {
+            let path = path.clone();
+            async move {
+                let other = tokio::task::spawn_blocking(move || {
+                    SeatAdmission::acquire_within(&path, std::time::Duration::from_millis(200)).map(|_| ())
+                }).await.unwrap();
+                assert_eq!(other.unwrap_err().kind(), std::io::ErrorKind::TimedOut, "admission must be held between members");
+            }
+        }).await.unwrap();
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["agents"], json!(["batch-member-0", "batch-member-1"]));
+
+        // Full now: a later create is refused.
+        match handler.handle_agents_create(json!({"name":"late"})).await {
+            WsFrame::Response { ok: false, error: Some(e), .. } => assert_eq!(e["code"], SEAT_LIMIT_ERROR_CODE),
+            other => panic!("expected a seat refusal, got {other:?}"),
+        }
+        // A team that does not fit is refused as a whole.
+        let params = json!({"id":format!("company:{}", team.id),"revision":1,"name":"over","reviewed":true});
+        let result = handler.library_apply(&params, &UserContext::admin_fallback()).await.unwrap();
+        assert_eq!(result["warning"], "seat_limit", "{result}");
+        assert_eq!(result["agents"], json!([]));
+        assert!(!home.path().join("agents/over-member-0").exists());
+        assert!(!home.path().join("agents/over-member-1").exists());
     }
 }

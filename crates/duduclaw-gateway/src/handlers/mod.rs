@@ -327,6 +327,9 @@ pub struct MethodHandler {
     edition_override: RwLock<Option<duduclaw_core::EditionProfile>>,
     #[cfg(test)]
     edition_fixture_runtime: RwLock<Option<crate::license_runtime::LicenseRuntime>>,
+    /// Test seam: the agent cap `effective_agent_cap` returns (RM-149 tests).
+    #[cfg(test)]
+    agent_cap_fixture: RwLock<Option<usize>>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
     cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,

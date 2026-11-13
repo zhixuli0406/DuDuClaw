@@ -383,6 +383,14 @@ impl crate::expert::install::InstallCtx {
     }
 
     /// Refuse when adding `adding` employees would exceed the agent cap.
+    ///
+    /// RM-149 round 2: a real run takes the cross-process seat admission
+    /// first and keeps it in the context until the whole batch is written
+    /// ([`Self::release_seats`] or drop), so no other create takes a seat
+    /// between this check and the writes. Called before `begin_writes` (lock
+    /// order: seat admission, then the org lock). A second call in the same
+    /// run re-checks under the admission it already holds. A dry run only
+    /// checks.
     pub async fn ensure_quota(&self, adding: usize) -> Result<()> {
         let freed = self
             .freed()
@@ -392,7 +400,24 @@ impl crate::expert::install::InstallCtx {
                     .count()
             })
             .unwrap_or(0);
-        super::quota::ensure(&self.home, self.agent_cap, adding, freed).await
+        if self.dry_run {
+            return super::quota::ensure(&self.home, self.agent_cap, adding, freed).await;
+        }
+        let held = self.seat_admission.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let admission = match held {
+            Some(admission) => {
+                super::quota::check_under(&admission, self.agent_cap, adding, freed).await?;
+                admission
+            }
+            None => super::quota::admit(&self.home, self.agent_cap, adding, freed).await?,
+        };
+        *self.seat_admission.lock().unwrap_or_else(|p| p.into_inner()) = Some(admission);
+        Ok(())
+    }
+
+    /// Release the seat admission (the import's employees are written).
+    pub fn release_seats(&self) {
+        self.seat_admission.lock().unwrap_or_else(|p| p.into_inner()).take();
     }
 }
 

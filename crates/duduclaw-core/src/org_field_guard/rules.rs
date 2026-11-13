@@ -159,13 +159,22 @@ pub const AGENT_EDITABLE_SECTIONS: &[&str] = &[
 ///
 /// - `[agent] role` — `shared_wiki_delete` lets the `main` role delete any
 ///   shared page.
+/// - `[agent] status` — the lifecycle (RM-149): `"deleted"` frees a licence
+///   seat and unloads the employee, `"archived"` / `"active"` are the
+///   Admin-only archive / restore. An employee (or a team role member, which
+///   the hook identifies as that employee) that could rewrite it could free
+///   its seat, let another create pass, then come back — over the cap and
+///   around the Admin lifecycle. Changes go through the gateway's lifecycle
+///   handlers (`agents.remove` / `archive` / `unarchive`, pause / resume),
+///   which do not run through this hook. Adding, removing or reshaping the
+///   key counts as a change.
 /// - `[prompt] cli_bare_mode` — adds `--bare`, which makes the Claude CLI skip
 ///   hooks (this one included).
 /// - `[prompt] reply_language` — administrator-set reply language.
 /// - `[model] account_pool` — which rotator accounts (whose credentials and
 ///   quota) the agent may spend.
 pub const AGENT_SECURITY_KEYS: &[(&str, &[&str])] = &[
-    ("agent", &["role"]),
+    ("agent", &["role", "status"]),
     ("prompt", &["cli_bare_mode", "reply_language"]),
     ("model", &["account_pool"]),
 ];

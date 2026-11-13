@@ -478,6 +478,15 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **審査依頼：** 種類 `agent_file_change`。現在も管理者である人がダッシュボードでのみ判断でき、期限は 3 日（期限切れは拒否扱い）。チャネルにはボタンのない通知だけが届きます。提案された内容は依頼が終わるまで `<home>/agent_file_pending/` に保存されます。承認時はまず適用し、待っている間にファイルが変わっていた場合は拒否され、依頼者が送り直す必要があります。
 - **監査：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（記録するのはハッシュだけで、内容は記録しません）。
 
+### 作成後に社員のペルソナを変更する（v1.82.0）
+
+作成時に渡したペルソナ（空白から作成するフォームの任意の「ペルソナ」欄、`agents.create` の `soul_md` フィールド、またはテンプレートの SOUL.md）は出発点にすぎません。v1.82.0 以降、ペルソナを渡した場合は必ず書き込まれ、書き込めなければ作成全体が失敗します。既定の一文に置き換わることはありません。あとから変えるには：
+
+- **ダッシュボード：** 社員ページ →「設定ファイル」→「ペルソナ（`SOUL.md`）」→「編集」→「保存してチェック」。
+- **RPC：** まず `agent_files.get {agent_id, file: "soul"}` で現在の `content` とその `hash` を取得し、次に `agent_files.save {agent_id, file: "soul", content, base_hash: <取得した hash>}` を呼びます。保存できるのはその社員のオーナーと管理者だけで、AI 社員自身が自分の SOUL.md を変えることはできません。
+- **保存は審査を通り、そのまま適用されるわけではありません。** 上の「保存のたびのチェック」が走り、応答の `status` で結果が分かります：`applied`（社員の次の対話から有効）、`unchanged`、`needs_confirmation`（`action: "confirm"`、`review.analysis_id`、4 文字以上の `reason` を付けて送り直す）、`blocked`（管理者以外は `action: "request_approval"` で送り直すと `pending_approval` と `approval_id` が返り、管理者がダッシュボードで判断。管理者は `reason` と `acknowledge_risk: true` を付けたときだけ確定）、`conflict`（ほかの人が先に保存した：もう一度 `get` してから編集し直す）、`rejected`（固定ルールで拒否：内容を直す）。
+- 適用された変更はすべて版として残るので、`agent_files.history`／`agent_files.rollback` で以前のペルソナに戻せます。
+
 - **プロフィールの書き出し：** Manager と管理者は、閲覧可能な社員のメニューから書き出せます。DuDuClaw、OpenClaw、Hermes、AGENTS.md、Claude Code subagent に対応します。利用者紹介は初期状態では含まれず、明示的に選択します。OpenClaw／Hermes は各ファイルを同じフォルダーに保存してください。秘密情報、チャネル、能力、権限、アカウントプール、記憶は書き出しません。[Agent File リファレンス](../../spec/ja-JP/agent-file-spec.md)を参照してください。
 - **利用者紹介：** 同じロック、版管理、レビュー経路で保存します。プロンプトでは `<user_profile>` データブロックとして扱い、指示ではないと明記し、人格と同じ入力検査を行います。一般の Markdown バイト制限より優先して最大 4,000 文字です。
 

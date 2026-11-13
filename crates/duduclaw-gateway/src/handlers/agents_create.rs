@@ -152,11 +152,45 @@ impl MethodHandler {
             return WsFrame::error_response("", "部門名稱只能使用英數字、'-'、'_'（1–64 字元）");
         }
 
-        // Cloud-tier agent cap (self-host is never capped — Apache 2.0).
-        let agent_count = self.registry.read().await.list().len();
-        if let Some(msg) = self.tier_limit_message("agent", agent_count).await {
-            return WsFrame::error_response("", &msg);
+        // RM-146: the persona. `soul_md` is canonical, `soul` an alias; it is
+        // validated and scanned before anything is written, and a supplied
+        // persona is never replaced by the stock sentence.
+        let persona = match crate::agent_persona::requested_persona(&params, PERSONA_MAX_CHARS) {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let soul = match &persona {
+            Some(p) => {
+                let content = persona_soul_md(display_name, p);
+                // The same scan `templates.create_agent` runs on an edited
+                // SOUL.md (soul_scanner + input filter), over the file as it
+                // will be written. Findings are not logged (they may quote
+                // secrets); the refusal names only the reason categories.
+                if let Err(refused) = crate::agent_persona::scan_persona(&content) {
+                    warn!(agent = name, "agents.create refused: persona failed the SOUL.md scan");
+                    return WsFrame::error_response("", &refused);
+                }
+                content
+            }
+            None => format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n"),
+        };
+        // Unknown request fields are not rejected in this version; they are
+        // reported back (bounded and sanitised) so a caller sees what had no
+        // effect.
+        let ignored = crate::agent_persona::ignored_fields(&params, AGENTS_CREATE_FIELDS);
+        if !ignored.is_empty() {
+            warn!(agent = name, fields = %ignored.summary(), "agents.create: unknown request fields ignored");
         }
+
+        // Licence seats (RM-149): counted on disk by the shared rule —
+        // deleted employees free their seat, archived ones keep it — under
+        // the cross-process seat admission lock, which is held until the
+        // directory is published below (lock order: seat admission, then
+        // the org lock, then agent.toml locks).
+        let seat_admission = match self.admit_agent_seats(1, None).await {
+            Ok(admission) => admission,
+            Err(refusal) => return super::agents_basic::seat_refusal_frame(refusal),
+        };
 
         // Create agent directory and files. Own the agents-dir path and release
         // the read guard immediately — the post-create registry rescan below
@@ -281,24 +315,22 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to write agent.toml: {e}"));
         }
 
-        // Honor an optional `soul` param (the agent's persona / system prompt).
-        // Trim + cap defensively; fall back to a stock one-liner when absent.
-        // (Previously this param was silently dropped — see api.ts agents.create.)
-        let soul = params
-            .get("soul")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                format!(
-                    "# {display_name}\n\n{}\n",
-                    duduclaw_core::truncate_chars(s, 8000)
-                )
-            })
-            .unwrap_or_else(|| {
-                format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n")
-            });
-        let _ = tokio::fs::write(stage_dir.join("SOUL.md"), &soul).await;
+        // RM-146: SOUL.md (the persona validated above, or the stock one-liner
+        // when none was supplied). A failed write fails the create; dropping
+        // `staged` removes the half-built directory.
+        #[cfg(test)]
+        let injected = soul_write_seam::should_fail(name);
+        #[cfg(not(test))]
+        let injected = false;
+        let soul_write = if injected {
+            Err(std::io::Error::other("injected SOUL.md write failure"))
+        } else {
+            tokio::fs::write(stage_dir.join("SOUL.md"), &soul).await
+        };
+        if let Err(e) = soul_write {
+            warn!(agent = name, error = %e, "agents.create refused: SOUL.md not written");
+            return WsFrame::error_response("", &format!("Failed to write SOUL.md: {e}"));
+        }
 
         // A previous employee with this id (folder removed by hand) left its
         // profile file history behind: this new employee must not inherit it.
@@ -336,9 +368,13 @@ impl MethodHandler {
                 None => None,
             };
             drop(org);
+            drop(seat_admission);
             return WsFrame::error_response("", &create_failed_text(&e.to_string(), restore.as_deref()));
         }
         drop(org);
+        // Published: the new employee is on disk, so the next admission
+        // counts it.
+        drop(seat_admission);
 
         // R1 (2026-10): a deprecated runtime is still written, but the write
         // is audited with the caller so the migration is traceable.
@@ -385,9 +421,54 @@ impl MethodHandler {
                 "success": true,
                 "runtime_provider_auto_aligned": alignment.aligned_provider().map(|p|p.as_str().to_owned()),
                 "runtime_provider_align_skipped": alignment.skipped_reason(),
-                "agent": { "name": name, "display_name": display_name, "role": role, "status": "active" }
+                "agent": { "name": name, "display_name": display_name, "role": role, "status": "active" },
+                "persona_supplied": persona.is_some(),
+                "ignored_fields": ignored.shown,
+                "ignored_fields_more": ignored.more,
             }),
         )
+    }
+}
+
+/// Top-level `agents.create` fields this handler reads. Anything else is
+/// reported in `ignored_fields` (RM-146). `step_up_csrf` is added by the
+/// dashboard client on a step-up retry and is transport, not data.
+pub(crate) const AGENTS_CREATE_FIELDS: &[&str] = &[
+    "name",
+    "display_name",
+    "role",
+    "trigger",
+    "model_preferred",
+    "reports_to",
+    "department",
+    "runtime",
+    "soul_md",
+    "soul",
+    "step_up_csrf",
+];
+
+/// Longest persona `agents.create` accepts (characters). Longer text used to
+/// be cut silently; it is now refused (RM-146).
+pub(crate) const PERSONA_MAX_CHARS: usize = 8000;
+
+/// The SOUL.md written for a supplied persona.
+pub(crate) fn persona_soul_md(display_name: &str, persona: &str) -> String {
+    format!("# {display_name}\n\n{persona}\n")
+}
+
+/// Test seam: make the SOUL.md write of `agents.create` fail for one name.
+#[cfg(test)]
+pub(crate) mod soul_write_seam {
+    use std::sync::Mutex;
+
+    static FAIL_FOR: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn fail_for(name: &str) {
+        FAIL_FOR.lock().unwrap_or_else(|p| p.into_inner()).push(name.to_string());
+    }
+
+    pub(crate) fn should_fail(name: &str) -> bool {
+        FAIL_FOR.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|n| n == name)
     }
 }
 

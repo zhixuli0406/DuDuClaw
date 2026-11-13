@@ -555,6 +555,27 @@ terminal. Over HTTP with a non-internal key, both tools act as that key's own
 client id. Details:
 [Delegation isolation](../features/37-delegation-isolation.md#a-removed-employees-name-stays-reserved).
 
+### `create_agent` — persona and seats (v1.82.0)
+
+The persona goes in `soul_md` (`soul` is the older alias; an empty value counts
+as not sent, and two non-empty values with different text are an error). It
+passes the same SOUL.md scan as template creation, and a rejected persona or a
+failed SOUL.md write refuses the whole call with nothing left on disk; the
+refusal names the reason (HTML comment, invisible characters, hidden content,
+prompt-injection phrasing) without quoting the text. Arguments the tool does
+not read are not rejected; the reply lists them under "Ignored arguments (no
+effect)" (at most 20 names, each cut to 64 characters, then "… and N more").
+The licence seat check counts every employee whose status is not `deleted`
+(archived employees still count); when it refuses, the reply gives only the
+limit and the number of seats in use — it does not list who holds them (an
+administrator sees that list in the dashboard). The check and the creation are
+one step under a lock shared with the dashboard and the pack importer, so
+concurrent creates cannot together exceed the limit. An employee cannot change
+its own `[agent] status` with its file tools, and `agent_update` refuses a
+`status` change for an archived or deleted employee; archive, restore and
+delete are dashboard actions. To change a persona later, see
+[Change an employee's persona after creation](dashboard-settings.md#change-an-employees-persona-after-creation-v1820).
+
 ### `responsibility_get` / `responsibility_followup` / `responsibility_ask` — responsibility tools
 
 The three tools for [continuous responsibilities](continuous-responsibilities.md).

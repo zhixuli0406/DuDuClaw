@@ -483,6 +483,15 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 - **Approval requests:** kind `agent_file_change`, decided only in the dashboard by a current admin, 3 days to decide (expiry counts as a denial). Channels only get a notice without buttons. The proposed text is stored in `<home>/agent_file_pending/` until the request ends. Approving applies first; if the file changed while the request waited, the request is denied and the requester has to send it again.
 - **Audit:** `agent_file_changed`, `agent_file_change_refused`, `agent_file_review_failed`, `agent_file_change_requested` (hashes only, never the text).
 
+### Change an employee's persona after creation (v1.82.0)
+
+The persona you give at creation (the optional Persona box on the blank create form, `agents.create` field `soul_md`, or a template's SOUL.md) is only the starting text. Since v1.82.0 a supplied persona is always written or the create fails; it is never replaced by the default sentence. To change it later:
+
+- **Dashboard:** employee page → Profile files → Persona (`SOUL.md`) → Edit → Save and check.
+- **RPC:** first `agent_files.get {agent_id, file: "soul"}`, which returns the current `content` and its `hash`; then `agent_files.save {agent_id, file: "soul", content, base_hash: <that hash>}`. Only the employee's Owner and admins can save, and the AI employee itself can never change its own SOUL.md.
+- **The save is reviewed, not applied blindly.** It runs the check on every save described above, and the response `status` tells you what happened: `applied` (takes effect from the employee's next turn), `unchanged`, `needs_confirmation` (send the save again with `action: "confirm"`, the `review.analysis_id` and a `reason` of at least 4 characters), `blocked` (a non-admin sends it again with `action: "request_approval"` and gets `pending_approval` with an `approval_id` that an admin decides in the dashboard; an admin confirms only with a `reason` and `acknowledge_risk: true`), `conflict` (someone saved first: `get` again and redo the edit), or `rejected` (a fixed rule refused the text; fix it).
+- Every applied change is kept as a version, so `agent_files.history` / `agent_files.rollback` can restore the earlier persona.
+
 - **Export profile:** Managers and admins can choose Export profile from the employee page menu when they can view that employee. Choose DuDuClaw, OpenClaw, Hermes, AGENTS.md or Claude Code subagent. User introduction is excluded unless explicitly checked. Download the prepared file, or each file into the same folder for OpenClaw/Hermes. Secrets, channels, capabilities, permissions, account pools and memory are never exported. See [Agent File reference](../spec/agent-file-spec.md).
 - **User introduction:** saved through the same locked, versioned, reviewed writer. It is injected as a `<user_profile>` data block, explicitly not instructions, and scanned with the same input guard as persona text. Its 4,000-character limit overrides the general Markdown byte limit.
 

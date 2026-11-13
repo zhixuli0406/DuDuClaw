@@ -303,6 +303,10 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 `agent_remove` 會把該員工移到 `~/.duduclaw/agents/_trash/`，並回覆該員工已被移除、管理員可以還原、名稱已被保留，不會回傳路徑。接著 `create_agent` 會對所有 MCP 呼叫端拒絕這個名稱，條件是 trash 裡還有對應項目、`org.toml` 仍記錄這個 id 但沒有對應目錄，或 trash 無法列出；換一個名稱則可以建立。操作者可以從 Dashboard 或終端機重用這個名稱。透過 HTTP 且使用非內部金鑰時，兩個工具都以該金鑰自己的 client id 作為身分執行。細節見[委派隔離](../../features/zh-TW/37-delegation-isolation.md#被移除員工的名稱仍被保留)。
 
+### `create_agent`：人格設定與名額（v1.82.0）
+
+人格設定放在 `soul_md`（`soul` 是舊名稱；空字串視同沒給，兩個都有內容且不同才會被拒絕）。內容會經過和板模建立相同的 SOUL.md 安全檢查；檢查沒過或 SOUL.md 寫不進去，整個呼叫都會失敗，磁碟上不留任何東西；拒絕訊息會說明原因類別（HTML 註解、不可見字元、隱藏內容、提示注入句型），但不引用內容。工具沒有讀的參數不會被拒絕，回覆會在「Ignored arguments (no effect)」列出（最多 20 個名稱、每個最多 64 字，其餘以「… and N more」表示）。授權名額計算所有狀態不是 `deleted` 的員工（已封存的員工仍佔名額）；額滿拒絕時只回覆上限與目前已使用的名額數，不列出佔用名額的員工（管理員可在儀表板看到清單）。名額檢查與建立是同一個步驟，和儀表板、專家包匯入共用同一把鎖，同時建立也不會超過上限。員工不能用檔案工具修改自己的 `[agent] status`，`agent_update` 也不能變更已封存或已刪除員工的 `status`；封存、恢復與刪除只能在儀表板操作。之後要改人格設定，見[建立之後修改員工的人格設定](dashboard-settings.md#建立之後修改員工的人格設定v1820)。
+
 ### `responsibility_get` / `responsibility_followup` / `responsibility_ask`：持續任務工具
 
 [持續任務](continuous-responsibilities.md)的三個工具。只有 `config.toml [responsibilities] enabled` 為真、而且呼叫端是 AI 員工身分時才會列出（外部用戶端看不到）；功能關閉時每次呼叫都會被拒絕。它們和 `tasks_*` 工具一樣需要 Admin scope，閘道自己的金鑰帶有這個 scope。

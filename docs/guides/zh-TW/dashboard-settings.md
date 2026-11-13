@@ -478,6 +478,15 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
+### 建立之後修改員工的人格設定（v1.82.0）
+
+建立時給的人格設定（空白建立表單裡選填的「人格設定」、`agents.create` 的 `soul_md` 欄位，或板模的 SOUL.md）只是起點。從 v1.82.0 起，有給人格設定就一定會寫入，寫不進去就整個建立失敗，不會再被換成預設的一句話。之後要修改：
+
+- **儀表板：** 員工頁 →「設定檔」→「人格設定（`SOUL.md`）」→「編輯」→「儲存並檢查」。
+- **RPC：** 先呼叫 `agent_files.get {agent_id, file: "soul"}`，拿到目前的 `content` 與它的 `hash`；再呼叫 `agent_files.save {agent_id, file: "soul", content, base_hash: <剛才的 hash>}`。只有這位員工的負責人與管理員能存檔，AI 員工自己永遠不能改自己的 SOUL.md。
+- **存檔會經過審查，不是直接套用。** 會跑上面「每次存檔都檢查」的流程，回應的 `status` 說明結果：`applied`（從員工的下一則對話開始生效）、`unchanged`、`needs_confirmation`（再送一次並帶 `action: "confirm"`、`review.analysis_id` 與至少 4 個字的 `reason`）、`blocked`（非管理員再送一次並帶 `action: "request_approval"`，會得到 `pending_approval` 與 `approval_id`，由管理員在儀表板決定；管理員要帶 `reason` 與 `acknowledge_risk: true` 才能確認）、`conflict`（別人先存了：重新 `get` 再改一次），或 `rejected`（被固定規則拒絕，請修改內容）。
+- 每次套用的修改都會留下版本，可以用 `agent_files.history`／`agent_files.rollback` 還原先前的人格設定。
+
 - **匯出設定檔：** Manager 與管理員可從有權檢視的員工頁選單選擇「匯出設定檔」，支援 DuDuClaw、OpenClaw、Hermes、AGENTS.md 與 Claude Code subagent。服務對象介紹預設不包含，要明確勾選。OpenClaw／Hermes 請逐一下載並放入同一個資料夾。秘密、通道、能力、權限、帳號池與記憶不會匯出。見 [Agent File 參考](../../spec/zh-TW/agent-file-spec.md)。
 - **服務對象：** 使用相同的鎖定、版本與審查流程儲存。提示詞以 `<user_profile>` 資料區塊載入，明確註明不是指令，並經過與人格相同的輸入檢查。最多 4,000 個字，優先於一般 Markdown 的位元組上限。
 

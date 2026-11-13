@@ -102,6 +102,8 @@ impl MethodHandler {
             edition_override: RwLock::new(None),
             #[cfg(test)]
             edition_fixture_runtime: RwLock::new(None),
+            #[cfg(test)]
+            agent_cap_fixture: RwLock::new(None),
             cli_auth_sessions: RwLock::new(std::collections::HashMap::new()),
             setup_token_session: RwLock::new(None),
             cron_store: RwLock::new(None),

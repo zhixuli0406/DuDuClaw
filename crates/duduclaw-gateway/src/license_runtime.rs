@@ -1026,8 +1026,13 @@ pub async fn agent_cap_message_from_disk(
     if !cap_exceeded(cap.max, current) {
         return None;
     }
-    let max = cap.max;
-    Some(match cap.tier {
+    Some(agent_cap_text(cap.max, cap.tier.as_deref()))
+}
+
+/// The zh-TW agent-cap refusal: `tier = None` is the Personal-edition cap.
+/// One wording for the gateway and the processes outside it (RM-149).
+pub fn agent_cap_text(max: usize, tier: Option<&str>) -> String {
+    match tier {
         None => format!(
             "個人版最多可建立 {max} 個 AI 員工。\
              如需調整授權範圍，請聯絡總經銷：\
@@ -1037,8 +1042,13 @@ pub async fn agent_cap_message_from_disk(
             "您的方案（{tier}）最多可建立 {max} 個 Agent。\
              如需調整授權範圍，請聯絡總經銷：https://futurecorp.tw"
         ),
-    })
+    }
 }
+
+/// The note appended to an agent-cap refusal: deleted employees no longer
+/// count, archived ones still do (RM-149).
+pub const AGENT_SEAT_NOTE: &str =
+    "已刪除的 AI 員工不佔名額；已封存的 AI 員工仍佔名額，刪除後即釋出。";
 
 /// The agent-count cap that applies to this home, resolved from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]

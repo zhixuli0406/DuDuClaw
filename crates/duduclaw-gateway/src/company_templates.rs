@@ -82,13 +82,74 @@ pub fn scan_document(file: &str, body: &str) -> Result<(), String> {
     })
 }
 
+/// The portable-template boundary, part 1: an HTML comment anywhere.
+fn has_html_comment(body: &str) -> bool {
+    body.contains("<!--")
+}
+
+/// The portable-template boundary, part 2: invisible / format characters.
+fn has_invisible_chars(body: &str) -> bool {
+    body.chars().any(|c| matches!(c as u32,
+        0x00AD | 0x034F | 0x061C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E |
+        0x2060..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0000..=0xE007F | 0xE0100..=0xE01EF))
+}
+
+/// Why [`scan_document`] would refuse a document, as categories an
+/// administrator can act on. Diagnostic only — [`scan_document`] alone
+/// decides; this re-runs the same checks to name them. Never quotes the text
+/// (findings may contain secrets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanReason {
+    /// Over the byte limit, or contains a NUL character.
+    TooLongOrInvalid,
+    /// `<!--` anywhere.
+    HtmlComment,
+    /// Zero-width, bidi or other invisible / format characters.
+    InvisibleCharacters,
+    /// The SOUL.md hidden-content scanner reported a finding.
+    HiddenContent,
+    /// The input guard matched a prompt-injection rule.
+    PromptInjection,
+    /// A scanner failed; the document is refused to be safe.
+    ScannerFailed,
+}
+
+/// The [`ScanReason`]s that apply to `body` (empty when it passes).
+pub fn scan_refusal_reasons(body: &str) -> Vec<ScanReason> {
+    let mut out = Vec::new();
+    if text(body, MAX_TEXT).is_err() {
+        out.push(ScanReason::TooLongOrInvalid);
+        return out;
+    }
+    if has_html_comment(body) {
+        out.push(ScanReason::HtmlComment);
+    }
+    if has_invisible_chars(body) {
+        out.push(ScanReason::InvisibleCharacters);
+    }
+    match std::panic::catch_unwind(|| {
+        let hidden = duduclaw_security::soul_scanner::scan_soul(body);
+        let injection = duduclaw_security::input_guard::scan_input(body, 1);
+        (hidden.clean, !injection.blocked && injection.matched_rules.is_empty())
+    }) {
+        Ok((clean, no_injection)) => {
+            if !clean {
+                out.push(ScanReason::HiddenContent);
+            }
+            if !no_injection {
+                out.push(ScanReason::PromptInjection);
+            }
+        }
+        Err(_) => out.push(ScanReason::ScannerFailed),
+    }
+    out
+}
+
 fn scan_document_with(file: &str, body: &str, scanner: impl FnOnce() -> bool + std::panic::UnwindSafe) -> Result<(), String> {
     text(body, MAX_TEXT).map_err(|_| format!("{file} 內容過長或無效，已拒絕複製。"))?;
     // The shared scanner tolerates short comments and isolated invisible
     // characters. Portable templates deliberately use a stricter boundary.
-    let hidden = body.contains("<!--") || body.chars().any(|c| matches!(c as u32,
-        0x00AD | 0x034F | 0x061C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E |
-        0x2060..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0000..=0xE007F | 0xE0100..=0xE01EF));
+    let hidden = has_html_comment(body) || has_invisible_chars(body);
     match std::panic::catch_unwind(scanner) {
         Ok(true) if !hidden => Ok(()),
         Ok(_) => Err(format!("{file} 含隱藏內容或提示注入模式，已拒絕複製；請修正來源檔案後重試。")),

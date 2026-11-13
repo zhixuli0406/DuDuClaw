@@ -33,8 +33,13 @@ pub(super) const TOOLS: &[ToolDef] = &[
                 required: false,
             },
             ParamDef {
+                name: "soul_md",
+                description: "Persona/system prompt written to SOUL.md (scanned; refused if rejected)",
+                required: false,
+            },
+            ParamDef {
                 name: "soul",
-                description: "Personality/system prompt for this agent (written to SOUL.md)",
+                description: "Older alias of soul_md",
                 required: false,
             },
             ParamDef {

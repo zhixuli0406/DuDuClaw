@@ -15013,6 +15013,71 @@ mod g1_home_state_hook_tests {
         assert!(d.is_allowed(), "{d:?}");
     }
 
+    /// RM-149 round 2 (H2): `[agent] status` frees a licence seat when it
+    /// says `deleted`, so the employee cannot change it through any write
+    /// tool — set itself deleted to let another create pass, then come back.
+    #[test]
+    fn own_agent_status_is_frozen_for_write_edit_multiedit_and_team_roles() {
+        let h = tempfile::tempdir().unwrap();
+        let dir = h.path().join("agents/tester");
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = "[agent]\nname = \"tester\"\nreports_to = \"ceo\"\nstatus = \"active\"\ndisplay_name = \"T\"\n";
+        std::fs::write(dir.join("agent.toml"), active).unwrap();
+        let p = dir.join("agent.toml");
+        let frozen = |d: GuardDecision, what: &str| match d {
+            GuardDecision::BlockedAgentSecuritySection { ref changed, .. } => {
+                assert!(changed.iter().any(|c| c.starts_with("agent.status")), "{what}: {changed:?}")
+            }
+            other => panic!("{what}: expected BlockedAgentSecuritySection, got {other:?}"),
+        };
+
+        // Write.
+        let d = agent_file_guard_decision(
+            "Write", &write(&p, &active.replace("\"active\"", "\"deleted\"")), h.path(), &agent("tester"),
+        ).unwrap();
+        frozen(d, "Write");
+        // Edit.
+        let edit = json!({"tool_name": "Edit", "tool_input": {
+            "file_path": p.to_string_lossy(),
+            "old_string": "status = \"active\"", "new_string": "status = \"deleted\""}});
+        frozen(agent_file_guard_decision("Edit", &edit, h.path(), &agent("tester")).unwrap(), "Edit");
+        // MultiEdit (removing the key is a change too).
+        let multi = json!({"tool_name": "MultiEdit", "tool_input": {
+            "file_path": p.to_string_lossy(),
+            "edits": [
+                {"old_string": "display_name = \"T\"", "new_string": "display_name = \"T2\""},
+                {"old_string": "status = \"active\"\n", "new_string": ""}
+            ]}});
+        frozen(agent_file_guard_decision("MultiEdit", &multi, h.path(), &agent("tester")).unwrap(), "MultiEdit");
+        // A team role member runs in the employee's workspace and is
+        // identified as that employee by the hook installed there: same
+        // answer, relative path and all.
+        let role_edit = json!({"tool_name": "Edit", "cwd": dir.to_string_lossy(), "tool_input": {
+            "file_path": "agent.toml",
+            "old_string": "status = \"active\"", "new_string": "status = \"archived\""}});
+        frozen(agent_file_guard_decision("Edit", &role_edit, h.path(), &agent("tester")).unwrap(), "team role");
+        // An unverified claim is refused as well.
+        let d = agent_file_guard_decision(
+            "Write", &write(&p, &active.replace("\"active\"", "\"deleted\"")), h.path(),
+            &HookCaller::Untrusted("tester".into()),
+        ).unwrap();
+        assert!(!d.is_allowed(), "{d:?}");
+        // Bash: any write-shaped command naming agent.toml is refused.
+        let d = agent_file_guard_decision(
+            "Bash", &bash("sed -i '' 's/active/deleted/' agent.toml"), h.path(), &agent("tester"),
+        ).unwrap();
+        assert!(!d.is_allowed(), "{d:?}");
+        // Other `[agent]` keys stay editable; the operator is unaffected.
+        let d = agent_file_guard_decision(
+            "Write", &write(&p, &active.replace("\"T\"", "\"T2\"")), h.path(), &agent("tester"),
+        ).unwrap();
+        assert!(d.is_allowed(), "{d:?}");
+        let d = agent_file_guard_decision(
+            "Write", &write(&p, &active.replace("\"active\"", "\"deleted\"")), h.path(), &HookCaller::Absent,
+        ).unwrap();
+        assert!(d.is_allowed(), "{d:?}");
+    }
+
     #[test]
     fn notebook_edit_is_judged_like_write() {
         let h = home_with_agent();

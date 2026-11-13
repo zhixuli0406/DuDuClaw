@@ -580,6 +580,9 @@ fn org_lock_and_journal_are_protected_on_the_write_lane() {
     for p in [
         h.join("locks/org-mutation.lock"),
         h.join("locks/org-mutation"),
+        // RM-149 round 2: the seat admission lock.
+        h.join("locks/agent-seat-admission.lock"),
+        h.join("locks/agent-seat-admission"),
         h.join("org_change_journal"),
         h.join("org_change_journal/abc.json"),
     ] {
@@ -614,6 +617,8 @@ fn bash_cannot_hold_or_tamper_the_org_lock_or_journal() {
         "exec 9>~/.duduclaw/locks/org-mutation.lock && flock 9",
         "rm ~/.duduclaw/locks/org-mutation.lock",
         "cat ~/.duduclaw/locks/org-mutation.lock",
+        "flock /Users/alice/.duduclaw/locks/agent-seat-admission.lock sleep 3600",
+        "exec 9>~/.duduclaw/locks/agent-seat-admission.lock && flock 9",
     ] {
         assert!(
             matches!(

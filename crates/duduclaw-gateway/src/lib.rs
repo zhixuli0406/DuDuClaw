@@ -287,6 +287,7 @@ pub mod notify_stats;
 pub mod posture_watch;
 pub mod premium_templates;
 pub mod company_templates;
+pub mod agent_persona;
 pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;

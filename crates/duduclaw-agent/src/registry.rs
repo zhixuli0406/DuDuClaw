@@ -132,6 +132,14 @@ impl AgentRegistry {
 
             // Attempt to load the agent
             match Self::load_agent(&path).await {
+                // RM-149: a soft-deleted employee is not a runnable agent. Its
+                // directory stays on disk (data retained, still reported by
+                // `duduclaw_core::agent_seats`), but it is never loaded, so no
+                // route, dispatch, heartbeat or roster can reach it.
+                Ok(agent) if agent.config.agent.status == duduclaw_core::types::AgentStatus::Deleted => {
+                    info!(dir = %dir_name, "skipping soft-deleted agent (data retained on disk)");
+                    continue;
+                }
                 Ok(mut agent) => {
                     // WP7: three-layer skill composition — global (company) <
                     // department < per-agent. Nearest layer wins on a name
@@ -975,6 +983,30 @@ skill_security_scan = true
             std::collections::HashSet::from(["sales-lead", "warehouse-lead"])
         );
     }
+    /// RM-149: a soft-deleted employee is not loaded (no route, dispatch or
+    /// heartbeat can reach it), its directory stays on disk, and an archived
+    /// one is still loaded (restorable, hidden by the list filters).
+    #[tokio::test]
+    async fn scan_skips_soft_deleted_agents_and_keeps_their_directory() {
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let agents_dir = tmp.path().join("agents");
+        for n in ["kept", "shelved", "gone"] {
+            write_full_agent_toml(&agents_dir.join(n), n);
+        }
+        for (n, status) in [("shelved", "archived"), ("gone", "deleted")] {
+            let path = agents_dir.join(n).join("agent.toml");
+            let raw = std::fs::read_to_string(&path).unwrap()
+                .replace("status = \"active\"", &format!("status = \"{status}\""));
+            std::fs::write(path, raw).unwrap();
+        }
+        let mut registry = AgentRegistry::new(agents_dir.clone());
+        registry.scan().await.unwrap();
+        let names: Vec<&str> = registry.list().iter().map(|a| a.config.agent.name.as_str()).collect();
+        assert_eq!(names, vec!["kept", "shelved"]);
+        assert!(registry.get("gone").is_none());
+        assert!(agents_dir.join("gone").join("agent.toml").is_file(), "data retained on disk");
+    }
+
     /// B8: `list()` is ordered by agent name, not by `HashMap` iteration.
     #[tokio::test]
     async fn list_is_ordered_by_agent_name() {
