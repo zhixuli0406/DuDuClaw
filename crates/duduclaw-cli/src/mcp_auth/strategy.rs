@@ -124,6 +124,19 @@ pub fn is_rotation_due(config_dir: &Path) -> bool {
 /// Takes the window explicitly so it can be unit-tested independently of
 /// [`is_rotation_due`]'s default.
 pub fn check_any_key_rotation_due(config_dir: &Path, warn_before_days: u64) -> bool {
+    // RM-134: a stored key with an expiry inside the window is due as well
+    // (no-expiry keys never are). An unreadable store is reported as due so
+    // the startup check surfaces it rather than staying silent.
+    let now = Utc::now();
+    match duduclaw_core::mcp_key_store::usable_keys(config_dir, now) {
+        Err(_) => return true,
+        Ok(keys) => {
+            let window = chrono::Duration::days(warn_before_days as i64);
+            if keys.iter().any(|k| k.expires_at.is_some_and(|at| at - now <= window)) {
+                return true;
+            }
+        }
+    }
     let config_path = config_dir.join("config.toml");
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -140,11 +153,19 @@ pub fn check_any_key_rotation_due(config_dir: &Path, warn_before_days: u64) -> b
         None => return false,
     };
 
-    for (_key, val) in mcp_keys {
+    for (key, val) in mcp_keys {
         let tbl = match val.as_table() {
             Some(t) => t,
             None => continue,
         };
+        // RM-134: only entries that can still authenticate from config
+        // (legacy window or the recorded internal key) are considered.
+        use duduclaw_core::mcp_key_store::{Authority, resolve};
+        match resolve(config_dir, key) {
+            Err(_) => return true,
+            Ok(Authority::Legacy(_) | Authority::Internal(_)) => {}
+            Ok(Authority::Stored(_) | Authority::Unknown) => continue,
+        }
 
         let created_at_str = match tbl.get("created_at").and_then(|v| v.as_str()) {
             Some(s) => s,

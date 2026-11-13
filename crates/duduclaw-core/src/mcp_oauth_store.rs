@@ -54,24 +54,97 @@ pub struct Consent {
 }
 
 impl Consent {
+    /// RM-134: the authority store (`mcp_key_store::resolve`) decides which
+    /// source applies, exactly as for the MCP authenticator: a stored key is
+    /// checked there; the gateway-internal key only as a `gateway-internal`
+    /// entry whose fingerprint the gateway recorded; a `[mcp_keys]` entry only
+    /// in the documented legacy window (no store yet, or recorded as pending
+    /// legacy); anything else — and an unreadable store — refuses.
     pub fn capture(home: &Path, raw: &str, scope: &str) -> Option<Self> {
+        use crate::mcp_key_store::Authority;
+        if !crate::mcp_key_store::is_key_format(raw) { return None; }
+        let authority = crate::mcp_key_store::resolve(home, raw).ok()?;
+        if let Authority::Stored(key) = &authority {
+            return store_key_allows(key, scope).then(|| Self {
+                key_hash: key.key_hash.clone(), entry_hash: key.consent_fingerprint(),
+            });
+        }
         let keys = key_registry(home).ok()?;
         let entry = keys.get(raw)?;
-        if !valid_key_entry(raw, entry, scope) { return None; }
-        Some(Self { key_hash: digest(raw), entry_hash: digest(&entry.to_string()) })
+        if !legacy_entry_allowed(&authority, entry) || !valid_key_entry(raw, entry, scope) { return None; }
+        Some(Self { key_hash: digest(raw), entry_hash: legacy_entry_fingerprint(entry) })
     }
 
     pub fn valid(&self, home: &Path, scope: &str) -> bool {
-        let Ok(keys) = key_registry(home) else { return false; };
-        self.valid_with_registry(&keys, scope)
+        match crate::mcp_key_store::resolve_hash(home, &self.key_hash) {
+            Err(_) | Ok(crate::mcp_key_store::Authority::Unknown) => false,
+            Ok(crate::mcp_key_store::Authority::Stored(key)) => self.valid_for_store_key(&key, scope),
+            Ok(authority) => {
+                let Ok(keys) = key_registry(home) else { return false; };
+                self.valid_with_registry(&authority, &keys, scope)
+            }
+        }
     }
 
-    fn valid_with_registry(&self, keys: &toml::Table, scope: &str) -> bool {
+    /// A consent captured from a store key binds its fingerprint. A consent
+    /// captured before the key was migrated out of `[mcp_keys]` still binds
+    /// the legacy entry digest recorded at migration (the migration never
+    /// changes client, flag or scopes, and no RPC edits them afterwards).
+    fn valid_for_store_key(&self, key: &crate::mcp_key_store::StoredKey, scope: &str) -> bool {
+        store_key_allows(key, scope)
+            && (self.entry_hash == key.consent_fingerprint()
+                || key.legacy_entry_hash.as_deref() == Some(self.entry_hash.as_str()))
+    }
+
+    /// Store first (an unreadable store is an error for the whole list), then
+    /// the already-loaded legacy registry.
+    fn valid_with(&self, home: &Path, keys: &toml::Table, scope: &str) -> io::Result<bool> {
+        match crate::mcp_key_store::resolve_hash(home, &self.key_hash) {
+            Err(e) => Err(io::Error::other(e.to_string())),
+            Ok(crate::mcp_key_store::Authority::Stored(key)) => Ok(self.valid_for_store_key(&key, scope)),
+            Ok(authority) => Ok(self.valid_with_registry(&authority, keys, scope)),
+        }
+    }
+
+    fn valid_with_registry(&self, authority: &crate::mcp_key_store::Authority, keys: &toml::Table, scope: &str) -> bool {
         keys.iter().any(|(raw, entry)| {
-            digest(raw) == self.key_hash && digest(&entry.to_string()) == self.entry_hash
+            digest(raw) == self.key_hash && legacy_entry_fingerprint(entry) == self.entry_hash
+                && legacy_entry_allowed(authority, entry)
                 && valid_key_entry(raw, entry, scope)
         })
     }
+}
+
+/// May a `[mcp_keys]` entry be read at all, given what the authority store
+/// said about its fingerprint? (Never for a stored or unknown key; the
+/// gateway-internal key only as that client and inside its recorded age.)
+fn legacy_entry_allowed(authority: &crate::mcp_key_store::Authority, entry: &toml::Value) -> bool {
+    use crate::mcp_key_store::{Authority, RESERVED_INTERNAL_CLIENT_ID, legacy_age_accepts};
+    match authority {
+        Authority::Legacy(_) => true,
+        Authority::Internal(internal) => {
+            entry.get("client_id").and_then(|v| v.as_str()) == Some(RESERVED_INTERNAL_CLIENT_ID)
+                && legacy_age_accepts(internal.created_at, chrono::Utc::now())
+        }
+        Authority::Stored(_) | Authority::Unknown => false,
+    }
+}
+
+/// What a consent captured from a legacy `[mcp_keys.<key>]` entry binds. The
+/// RM-134 migration records it on the store row so such a consent survives
+/// the move.
+pub fn legacy_entry_fingerprint(entry: &toml::Value) -> String {
+    digest(&entry.to_string())
+}
+
+/// The operator-key rules of [`valid_key_entry`] for a store key: usable now,
+/// internal, only known scopes, and covering every requested scope.
+fn store_key_allows(key: &crate::mcp_key_store::StoredKey, scope: &str) -> bool {
+    key.state(chrono::Utc::now()) == crate::mcp_key_store::KeyState::Active
+        && !key.is_external
+        && key.client_id != crate::mcp_key_store::RESERVED_INTERNAL_CLIENT_ID
+        && key.scopes.iter().all(|s| crate::mcp_scopes::MCP_SCOPE_STRINGS.contains(&s.as_str()))
+        && scope.split_whitespace().all(|s| key.scopes.iter().any(|k| k == "admin" || k == s))
 }
 
 fn key_registry(home: &Path) -> io::Result<toml::Table> {
@@ -98,7 +171,7 @@ fn valid_key_entry(raw: &str, entry: &toml::Value, scope: &str) -> bool {
     }
     let Some(created) = entry.get("created_at").and_then(|v| v.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) else { return false; };
-    if chrono::Utc::now().signed_duration_since(created).num_days() > 30 { return false; }
+    if !crate::mcp_key_store::legacy_age_accepts(created.with_timezone(&chrono::Utc), chrono::Utc::now()) { return false; }
     let Some(scopes) = entry.get("scopes").and_then(|v| v.as_array()) else { return false; };
     let Some(scopes) = scopes.iter().map(|v| v.as_str()).collect::<Option<Vec<_>>>() else { return false; };
     if scopes.iter().any(|s| !crate::mcp_scopes::MCP_SCOPE_STRINGS.contains(s)) { return false; }
@@ -182,9 +255,13 @@ impl OAuthStore {
         let now = chrono::Utc::now().timestamp();
         let live: HashSet<_> = self.tokens.values().chain(self.refresh.values())
             .filter(|t| !t.used && t.expires_unix > now).map(|t| t.family_id.as_str()).collect();
-        let mut grants: Vec<_> = self.grants.iter().filter(|(id, g)| {
-            live.contains(id.as_str()) && g.consent.valid_with_registry(&keys, &g.scope)
-        }).map(|(id, g)| serde_json::json!({
+        let mut valid = Vec::new();
+        for (id, g) in &self.grants {
+            if live.contains(id.as_str()) && g.consent.valid_with(home, &keys, &g.scope)? {
+                valid.push((id, g));
+            }
+        }
+        let mut grants: Vec<_> = valid.into_iter().map(|(id, g)| serde_json::json!({
             "id": id, "client_name": g.client_name, "scopes": g.scope.split_whitespace().collect::<Vec<_>>(),
             "issued_unix": g.issued_unix, "last_used_unix": g.last_used_unix,
         })).collect();
@@ -757,4 +834,115 @@ mod tests {
         assert_eq!(store.clients.len(), MAX_CLIENTS);
     }
 
+    // ── RM-134: operator keys in the hashed store ──────────────────────────
+
+    fn store_key(home: &Path, external: bool, legacy_entry_hash: Option<String>) -> rusqlite::Connection {
+        use crate::mcp_key_store::test_support;
+        let conn = test_support::store(home);
+        test_support::insert(&conn, "mk_op", KEY, "operator", external, None, legacy_entry_hash);
+        conn
+    }
+
+    /// Corrupt the store's content while keeping it a private file, so the
+    /// failure is the content, not the file mode.
+    fn corrupt_store(home: &Path) {
+        let path = crate::mcp_key_store::store_path(home);
+        let _ = std::fs::remove_file(&path);
+        drop(crate::private_sqlite::open(home, crate::mcp_key_store::STORE_FILE, crate::private_sqlite::Access::Create).unwrap());
+        std::fs::write(path, b"corrupt store bytes, not sqlite").unwrap();
+    }
+
+    #[test]
+    fn store_operator_key_consent_follows_disable_expiry_and_store_health() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        let conn = store_key(home.path(), false, None);
+        let consent = Consent::capture(home.path(), KEY, "memory:read").expect("internal store key consents");
+        assert!(Consent::capture(home.path(), KEY, "memory:read wiki:write").is_none(), "never widens");
+        assert!(consent.valid(home.path(), "memory:read"));
+        // A rename does not cut the grant.
+        conn.execute("UPDATE mcp_api_keys SET name = 'renamed'", []).unwrap();
+        assert!(consent.valid(home.path(), "memory:read"));
+        conn.execute("UPDATE mcp_api_keys SET disabled_at = '2026-01-01T00:00:00Z'", []).unwrap();
+        assert!(!consent.valid(home.path(), "memory:read"));
+        conn.execute("UPDATE mcp_api_keys SET disabled_at = NULL, expires_at = '2020-01-01T00:00:00Z'", []).unwrap();
+        assert!(!consent.valid(home.path(), "memory:read"));
+        assert!(Consent::capture(home.path(), KEY, "memory:read").is_none());
+        conn.execute("UPDATE mcp_api_keys SET expires_at = NULL", []).unwrap();
+        assert!(consent.valid(home.path(), "memory:read"));
+        drop(conn);
+        corrupt_store(home.path());
+        assert!(!consent.valid(home.path(), "memory:read"), "unreadable store denies");
+        assert!(Consent::capture(home.path(), KEY, "memory:read").is_none());
+    }
+
+    /// H1: once the gateway's store exists, a `[mcp_keys]` entry it does not
+    /// know (not pending, migration complete) cannot consent, even as
+    /// `gateway-internal`; a table-less store denies rather than reading as
+    /// "no store".
+    #[test]
+    fn config_only_keys_cannot_consent_once_the_store_exists() {
+        use crate::mcp_key_store::test_support;
+        let home = tempfile::tempdir().unwrap();
+        // Bootstrap: no store file yet, the legacy entry consents.
+        let store = fixture(home.path());
+        let token = &store.tokens["access-digest"];
+        assert!(store.valid_token(token, home.path(), RESOURCE));
+        let conn = test_support::store(home.path());
+        // Store exists, migration not recorded: config is not consulted.
+        assert!(!store.valid_token(token, home.path(), RESOURCE));
+        test_support::set_meta(&conn, "complete:2026-11-13T00:00:00Z");
+        assert!(Consent::capture(home.path(), KEY, "memory:read").is_none());
+        assert!(!store.valid_token(token, home.path(), RESOURCE));
+        // A forged gateway-internal entry is not the recorded internal key.
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[mcp_keys.{KEY}]\nclient_id='gateway-internal'\nscopes=['admin']\nis_external=false\ncreated_at='{}'\n",
+            chrono::Utc::now().to_rfc3339(),
+        )).unwrap();
+        assert!(Consent::capture(home.path(), KEY, "memory:read").is_none());
+        conn.execute(
+            "INSERT INTO mcp_internal_keys(key_hash, created_at) VALUES (?1, ?2)",
+            rusqlite::params![digest(KEY), crate::mcp_key_store::timestamp(chrono::Utc::now())],
+        ).unwrap();
+        assert!(Consent::capture(home.path(), KEY, "memory:read").is_some(), "the recorded internal key");
+        drop(conn);
+        // A store without the tables is an error, not "no store".
+        let path = crate::mcp_key_store::store_path(home.path());
+        std::fs::remove_file(&path).unwrap();
+        drop(crate::private_sqlite::open(home.path(), crate::mcp_key_store::STORE_FILE, crate::private_sqlite::Access::Create).unwrap());
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE other(x)").unwrap();
+        assert!(Consent::capture(home.path(), KEY, "memory:read").is_none());
+        assert!(store.active_grants(home.path()).is_err());
+    }
+
+    #[test]
+    fn external_store_key_cannot_consent_and_store_shadows_config() {
+        let home = tempfile::tempdir().unwrap();
+        fixture(home.path());
+        store_key(home.path(), true, None);
+        // The same key is still in config.toml as internal (a migration that
+        // crashed before the config edit): the store row decides.
+        assert!(Consent::capture(home.path(), KEY, "memory:read").is_none());
+    }
+
+    #[test]
+    fn consent_captured_before_migration_survives_the_move() {
+        let home = tempfile::tempdir().unwrap();
+        let store = fixture(home.path());
+        let token = &store.tokens["access-digest"];
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let config: toml::Table = toml::from_str(&raw).unwrap();
+        let legacy = legacy_entry_fingerprint(&config["mcp_keys"][KEY]);
+        store_key(home.path(), false, Some(legacy));
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        assert!(store.valid_token(token, home.path(), RESOURCE));
+        assert_eq!(store.active_grants(home.path()).unwrap().len(), 1);
+        // Without the recorded legacy digest the old consent is void.
+        std::fs::remove_file(crate::mcp_key_store::store_path(home.path())).unwrap();
+        store_key(home.path(), false, None);
+        assert!(!store.valid_token(token, home.path(), RESOURCE));
+        // An unreadable store fails the whole list rather than hiding grants.
+        corrupt_store(home.path());
+        assert!(store.active_grants(home.path()).is_err());
+    }
 }

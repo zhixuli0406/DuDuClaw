@@ -352,7 +352,8 @@ impl BoundConnectorExecutor for EmployeeConnectors {
 }
 
 /// Production Google bridge inputs (E2/E4): the bridge authorizes each tool
-/// against the employee's own MCP key reference (`[mcp_keys]` entry whose
+/// against the employee's own MCP key reference (a usable `mcp_keys.db` key,
+/// or — only in the RM-134 legacy window — a `[mcp_keys]` entry, whose
 /// `client_id` is the agent and that carries a `google:` scope). No key, or
 /// more than one, means no bridge (`Ok(None)` ⇒ setup required while the
 /// employee has a Google route); the gateway never picks among several.
@@ -364,35 +365,52 @@ const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 /// The employee's unique Google-scoped legacy MCP key reference (digest only).
 pub(crate) fn employee_key_reference(home: &Path, agent: &str)
     -> Result<Option<duduclaw_core::google_identity::CredentialRef>, VerificationError> {
-    use sha2::Digest;
+    use duduclaw_core::google_identity::{CredentialKind, CredentialRef};
+    let google = |scope: &str| scope.starts_with("google:");
+    // RM-134: usable dashboard keys in the hashed store first; an unreadable
+    // store means no decision (Unavailable), never "no key".
+    let mut found: Vec<String> = duduclaw_core::mcp_key_store::usable_keys(home, chrono::Utc::now())
+        .map_err(|_| VerificationError::Unavailable)?
+        .into_iter()
+        .filter(|key| key.client_id == agent && key.scopes.iter().any(|s| google(s)))
+        .map(|key| key.key_hash)
+        .collect();
     let path = home.join("config.toml");
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let config = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(VerificationError::Unavailable),
         Ok(meta) if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES => return Err(VerificationError::Unavailable),
-        Ok(_) => {}
-    }
-    let raw = zeroize::Zeroizing::new(std::fs::read_to_string(&path).map_err(|_| VerificationError::Unavailable)?);
-    let doc: toml::Table = toml::from_str(&raw).map_err(|_| VerificationError::Unavailable)?;
-    let Some(keys) = doc.get("mcp_keys") else { return Ok(None) };
-    let keys = keys.as_table().ok_or(VerificationError::Unavailable)?;
-    let mut found = None;
-    for (key, value) in keys {
-        let Some(entry) = value.as_table() else { continue };
-        if entry.get("client_id").and_then(toml::Value::as_str) != Some(agent)
-            || !["ddc_prod_", "ddc_staging_", "ddc_dev_"].iter().any(|prefix| key.starts_with(prefix)) {
-            continue;
+        Ok(_) => Some(zeroize::Zeroizing::new(std::fs::read_to_string(&path).map_err(|_| VerificationError::Unavailable)?)),
+    };
+    if let Some(raw) = config {
+        let doc: toml::Table = toml::from_str(&raw).map_err(|_| VerificationError::Unavailable)?;
+        if let Some(keys) = doc.get("mcp_keys") {
+            let keys = keys.as_table().ok_or(VerificationError::Unavailable)?;
+            for (key, value) in keys {
+                let Some(entry) = value.as_table() else { continue };
+                if entry.get("client_id").and_then(toml::Value::as_str) != Some(agent)
+                    || !duduclaw_core::mcp_key_store::is_key_format(key) {
+                    continue;
+                }
+                let has_google = entry.get("scopes").and_then(toml::Value::as_array).is_some_and(|scopes|
+                    scopes.iter().any(|scope| scope.as_str().is_some_and(google)));
+                if !has_google { continue; }
+                let hash = duduclaw_core::mcp_key_store::digest(key);
+                // RM-134: a config entry counts only in the documented legacy
+                // window (no store yet, or recorded as pending legacy). A key
+                // the store knows is decided there (and was already counted
+                // above if it is usable); an unknown one is ignored.
+                match duduclaw_core::mcp_key_store::resolve_hash(home, &hash)
+                    .map_err(|_| VerificationError::Unavailable)? {
+                    duduclaw_core::mcp_key_store::Authority::Legacy(_) => found.push(hash),
+                    _ => continue,
+                }
+            }
         }
-        let google = entry.get("scopes").and_then(toml::Value::as_array).is_some_and(|scopes|
-            scopes.iter().any(|scope| scope.as_str().is_some_and(|scope| scope.starts_with("google:"))));
-        if !google { continue; }
-        if found.is_some() { return Ok(None); }
-        found = Some(duduclaw_core::google_identity::CredentialRef {
-            kind: duduclaw_core::google_identity::CredentialKind::Legacy,
-            sha256: format!("{:x}", sha2::Sha256::digest(key.as_bytes())),
-        });
     }
-    Ok(found)
+    // No key, or more than one: no bridge (the gateway never picks).
+    if found.len() != 1 { return Ok(None); }
+    Ok(found.pop().map(|sha256| CredentialRef { kind: CredentialKind::Legacy, sha256 }))
 }
 impl GoogleBridgeFactory for EmployeeKeyGoogleBridges {
     fn bridge(&self, home: &Path, agent: &str, employee: EmployeeId, catalog: Arc<ConnectorCatalog>)

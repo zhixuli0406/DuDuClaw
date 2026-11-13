@@ -20,6 +20,23 @@ pub(crate) async fn handle_tools_call(
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
+    // v1.82 (RM-134 third review): a remote (HTTP) non-external principal
+    // other than the verified gateway-internal key acts only as its key's
+    // binding; the dispatcher already refused one without a valid binding
+    // and passes the binding as `default_agent`. Backstop: if no valid
+    // binding is in scope here, refuse — never fall back to `default_agent`.
+    if try_acting_agent_id(caller_client_id, default_agent).is_err() {
+        duduclaw_security::audit::append_tool_call_denied(
+            home_dir,
+            &duduclaw_core::truncate_chars(caller_client_id, 64),
+            tool_name,
+            "remote_key_unbound",
+            "binding_missing_at_handler",
+            None,
+        );
+        return jsonrpc_error(id, -32003, REMOTE_UNBOUND_MESSAGE);
+    }
+
     // ── Namespace-aware wiki agent (W19-P0 M2) ──────────────────────────────
     // For external clients, any agent_id was stripped upstream; use the
     // namespace-derived client_id as the fallback wiki agent so their wiki
@@ -213,7 +230,10 @@ pub(crate) async fn handle_tools_call(
     );
     // Who this call acts as for the record-relationship checks
     // (`record_authz.rs`), resolved once per call.
-    let record_actor = record_actor_for(home_dir, caller_client_id, default_agent);
+    let record_actor = match try_record_actor_for(home_dir, caller_client_id, default_agent) {
+        Ok(actor) => actor,
+        Err(RemoteBindingMissing) => return jsonrpc_error(id, -32003, REMOTE_UNBOUND_MESSAGE),
+    };
     if changes_background_work(tool_name, &arguments)
         && let Err(reason) = check_background_caller(home_dir, record_actor, tool_name)
     {

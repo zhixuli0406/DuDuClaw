@@ -612,7 +612,7 @@ pub fn prepare_mcp_config_for_spawn(
     }
 }
 
-/// Scan every employee directory (one holding an `agent.toml`) and create or
+/// Scan live employee directories (with a readable status) and create or
 /// fix its `duduclaw` MCP server entry.
 ///
 /// Called on gateway startup to ensure subprocess-spawned Claude CLI can
@@ -657,8 +657,23 @@ pub fn ensure_mcp_absolute_paths_all_except(
         // writing a `.mcp.json` with the internal key there would turn it into
         // half an employee directory. The spawn gate (`refresh_for_spawn`)
         // still repairs a directory it is about to start, agent.toml or not.
-        if !dir.join("agent.toml").is_file() {
-            continue;
+        match dir.join("agent.toml").try_exists() {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(e) => {
+                tracing::warn!(agent_dir = %dir.display(), error = %e,
+                    "Employee profile unavailable; skipping MCP path fixup");
+                continue;
+            }
+        }
+        match duduclaw_core::agent_seats::agent_dir_is_live(&dir) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(agent_dir = %dir.display(), error = %e,
+                    "Employee status unavailable; skipping MCP path fixup");
+                continue;
+            }
         }
         match ensure_duduclaw_absolute_path(&dir) {
             Ok(true) => fixed += 1,
@@ -1808,13 +1823,46 @@ mod tests {
         let agents = tmp.path().join("agents");
         let employee = agents.join("agnes");
         std::fs::create_dir_all(&employee).unwrap();
-        std::fs::write(employee.join("agent.toml"), "[agent]\nname = \"agnes\"\n").unwrap();
+        std::fs::write(employee.join("agent.toml"), "[agent]\nname = \"agnes\"\nstatus = 'active'\n").unwrap();
         let wiki_only = agents.join("standalone-claude-code");
         std::fs::create_dir_all(wiki_only.join("wiki")).unwrap();
 
         assert_eq!(ensure_mcp_absolute_paths_all(&agents), 1);
         assert!(employee.join(".mcp.json").is_file());
         assert!(!wiki_only.join(".mcp.json").exists());
+    }
+
+    #[test]
+    fn boot_sweep_rewrites_only_live_employee_configs() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join("agents");
+        let original = br#"{ "mcpServers": {} }"#;
+        for (id, profile) in [
+            ("live", "[agent]\nname = 'live'\nstatus = 'active'"),
+            ("deleted", "[agent]\nname = 'deleted'\nstatus = 'deleted'"),
+            ("archived", "[agent]\nname = 'archived'\nstatus = 'archived'"),
+            ("malformed", "[agent"),
+            ("missing-status", "[agent]\nname = 'missing-status'"),
+            ("unreadable", ""),
+        ] {
+            let dir = agents.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            if id == "unreadable" {
+                // A directory in place of the file fails on every platform,
+                // including privileged test runners that ignore mode bits.
+                std::fs::create_dir(dir.join("agent.toml")).unwrap();
+            } else {
+                std::fs::write(dir.join("agent.toml"), profile).unwrap();
+            }
+            std::fs::write(dir.join(".mcp.json"), original).unwrap();
+        }
+        assert_eq!(ensure_mcp_absolute_paths_all(&agents), 1);
+        assert_ne!(std::fs::read(agents.join("live/.mcp.json")).unwrap(), original);
+        for id in ["deleted", "archived", "malformed", "missing-status", "unreadable"] {
+            assert_eq!(std::fs::read(agents.join(id).join(".mcp.json")).unwrap(), original, "{id}");
+        }
     }
 
     #[test]
@@ -1826,7 +1874,7 @@ mod tests {
         for name in ["failed", "healthy"] {
             let dir = agents.join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("agent.toml"), format!("[agent]\nname = '{name}'\n")).unwrap();
+            std::fs::write(dir.join("agent.toml"), format!("[agent]\nname = '{name}'\nstatus = 'active'\n")).unwrap();
         }
         let original = br#"{ "mcpServers": {"example":{"command":"npx","env":{"API_KEY":"sk-legacy-private"}}} }"#;
         let path = agents.join("failed/.mcp.json");

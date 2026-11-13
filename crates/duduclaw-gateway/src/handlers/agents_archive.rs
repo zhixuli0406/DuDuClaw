@@ -5,7 +5,9 @@ use super::*;
 
 impl MethodHandler {
     /// Soft-delete an agent (WP4). Marks `status = "deleted"` and halts the
-    /// heartbeat/evolution kill-switch. MCP credentials are removed; the agent
+    /// heartbeat/evolution kill-switch. MCP credentials are removed and every
+    /// MCP key bound to the employee is permanently revoked (restoring the
+    /// employee later does not bring them back); the agent
     /// directory and its `memory.db` stay on disk; the agent simply disappears
     /// from every list/route. Refuses the main agent (name kept `remove` for
     /// front-end compatibility, but the semantics are now soft, not hard).
@@ -42,6 +44,36 @@ impl MethodHandler {
         if let Err(e) = self.offboard_agent_toml(&agent_id, "deleted").await {
             return WsFrame::error_response("", &format!("Failed to soft-delete agent: {e}"));
         }
+        // RM-134 fourth review (Medium 1): in the same operation, every MCP
+        // key bound to this employee is permanently revoked (tombstoned,
+        // audited), so it never works for a later employee with the same id.
+        // On failure the keys stay refused (`status = "deleted"`) and the
+        // gateway's key sweep tombstones them later.
+        let revoked = {
+            let home = self.home_dir.clone();
+            let agent = agent_id.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::mcp_keys_lifecycle::revoke_employee_keys(&home, &agent, "dashboard:agents.remove")
+            })
+            .await
+        };
+        let keys_revoked = match revoked {
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) => {
+                warn!(agent = %agent_id, %error, "MCP keys of the deleted employee not revoked yet");
+                return WsFrame::error_response(
+                    "",
+                    "Employee deleted, but its MCP keys could not be revoked yet; they are refused meanwhile and the gateway revokes them on its next key sweep",
+                );
+            }
+            Err(_) => {
+                warn!(agent = %agent_id, "MCP key revocation for the deleted employee did not finish");
+                return WsFrame::error_response(
+                    "",
+                    "Employee deleted, but its MCP keys could not be revoked yet; they are refused meanwhile and the gateway revokes them on its next key sweep",
+                );
+            }
+        };
         if let Err(e) = duduclaw_security::mcp_secret_store::remove_agent(&self.home_dir, &agent_id) {
             warn!(agent = %agent_id, error = %e, "MCP credential cleanup failed after soft-delete");
             return WsFrame::error_response("", "Employee deleted, but encrypted MCP credential cleanup failed");
@@ -58,7 +90,8 @@ impl MethodHandler {
                 "agent_soft_delete",
                 &agent_id,
                 duduclaw_security::audit::Severity::Warning,
-                json!({ "status": "deleted", "data_retained": true, "source": "dashboard" }),
+                json!({ "status": "deleted", "data_retained": true, "source": "dashboard",
+                    "mcp_keys_revoked": keys_revoked }),
             ),
         );
 
@@ -73,6 +106,7 @@ impl MethodHandler {
                 "agent_id": agent_id,
                 "status": "deleted",
                 "data_retained": true,
+                "mcp_keys_revoked": keys_revoked,
             }),
         )
     }

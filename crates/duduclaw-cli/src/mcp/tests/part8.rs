@@ -191,6 +191,7 @@ async fn mcp_seat_refusal_has_no_holder_list() {
         assert!(!refusal.contains(leaked), "{leaked} in {refusal}");
     }
     assert!(!refusal.contains('\n'), "{refusal}");
+    assert!(refusal.contains("https://futurecorp.tw "), "{refusal}");
     // Room left: admitted.
     let admission = crate::mcp::agents::acquire_seat_admission(home).await.unwrap();
     assert!(crate::mcp::agents::mcp_seat_decision(admission, 2, None).is_ok());

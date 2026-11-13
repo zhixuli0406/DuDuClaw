@@ -2541,7 +2541,7 @@ enum MaintenanceCommands {
     ///   GET  /healthz             — health check
     ///
     /// Authentication: Bearer token via `Authorization: Bearer <api_key>` header.
-    /// API keys are stored in ~/.duduclaw/mcp_keys.toml.
+    /// Dashboard-issued API keys are stored hashed in ~/.duduclaw/mcp_keys.db.
     ///
     /// Example:
     ///     duduclaw http-server --bind 127.0.0.1:8765
@@ -11192,7 +11192,7 @@ async fn mcp_server_diagnostic(home: &std::path::Path) {
                 "            internal key 30 天到期，gateway 開機也會自動輪替 — 金鑰過期時重啟即可修復。"
             );
             println!(
-                "         2. 或手動設定 env DUDUCLAW_MCP_API_KEY=<config.toml [mcp_keys] 其中一把>。"
+                "         2. 或手動設定 env DUDUCLAW_MCP_API_KEY=<儀表板「MCP 金鑰」發出的金鑰>。"
             );
         }
         O::Abnormal { exit, stderr_tail } => {

@@ -252,6 +252,9 @@ impl MethodHandler {
         if !fresh.can_assign_to(&runner.agent_id) {
             return WsFrame::error_response("", "permission denied");
         }
+        if let Some(frame) = super::tasks_rpc::task_assignee_refusal(&self.home_dir, Some(&runner.agent_id)) {
+            return frame;
+        }
         // Files are decoded only once the caller may assign to the runner,
         // and all of them are checked before anything is written.
         let files = match decode_task_attachments(&params) {
@@ -327,7 +330,7 @@ impl MethodHandler {
                 Ok(c) => c,
                 Err(e) => {
                     remove_saved(&saved).await;
-                    return WsFrame::error_response("", &e);
+                    return super::tasks_rpc::goal_create_refusal(&e);
                 }
             };
         if let Err(error) = crate::recent_skills::record(&self.home_dir, &fresh.user_id, &runner.agent_id, &requested) {

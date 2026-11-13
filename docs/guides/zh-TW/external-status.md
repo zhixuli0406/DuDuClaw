@@ -123,7 +123,7 @@ curl -s "https://ai.example.com/api/v1/status/employees?agent_id=sales" \
 
 ## 安全說明
 
-- 這是獨立的憑證類型，只能呼叫這一個網址。儀表板登入、`/api/*`、MCP 伺服器（`/mcp`、`/mcp/v1/call`、`/ingest/transcript`）一律拒絕 `ddc_status_` 開頭的憑證；它也不是 `[mcp_keys]` 的金鑰，不受 MCP scope 設定影響。
+- 這是獨立的憑證類型，只能呼叫這一個網址。儀表板登入、`/api/*`、MCP 伺服器（`/mcp`、`/mcp/v1/call`、`/ingest/transcript`）一律拒絕 `ddc_status_` 開頭的憑證；它也不是 MCP API 金鑰（v1.82 起存在 `mcp_keys.db`），不受 MCP scope 設定影響。
 - 回應沒有 CORS 標頭，只供伺服器對伺服器呼叫，不要放在瀏覽器前端程式碼裡；回應帶 `Cache-Control: no-store`。
 - 每次可辨識的呼叫都會稽核（憑證 id、帳號 id、結果、員工數），不記錄回應內容。呼叫依「憑證、結果、每 10 分鐘」彙總：該時段第一次呼叫寫入一筆 `status_token.used`／`status_token.refused` 稽核紀錄，同時段之後的呼叫只累加次數與最後時間，所以每秒輪詢一次的整合，每種結果每小時最多 6 筆。憑證的最後使用時間每 10 分鐘最多更新一次。這些稽核紀錄與次數保留 90 天，之後分小批自動刪除；其他稽核紀錄不受影響。
 - 建議走 HTTPS；憑證外流時立即撤銷。

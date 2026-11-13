@@ -40,6 +40,8 @@ fn p1e_config_and_identity_writes_are_gated_methods() {
         ("skills.restore", "agent_id", Config),
         ("skills.adopt", "target_agent_id", Config), ("agents.google_identity_set", "agent_id", Identity),
         ("agents.channels.telegram.set", "agent_id", Identity), ("agents.channels.googlechat.remove", "agent_id", Identity),
+        // RM-134 H3: an employee-bound dashboard MCP key.
+        ("mcp_keys.create", "agent_id", Identity),
     ] {
         assert_eq!(write_scoped(method), Some((key, category)), "{method}");
         assert!(category.is_write());
@@ -331,6 +333,9 @@ const DISPATCH_SOURCES: &[(&str, &str)] = &[
     ("dispatch_system.rs", include_str!("dispatch_system.rs")),
     ("dispatch_ops.rs", include_str!("dispatch_ops.rs")),
     ("dispatch_kb.rs", include_str!("dispatch_kb.rs")),
+    // `mcp_keys.*` (RM-134) is routed in `MethodHandler::dispatch` before
+    // the extensions (after the P1 gates); its arms live here.
+    ("mcp_keys_rpc.rs", include_str!("mcp_keys_rpc.rs")),
 ];
 
 /// Parameter keys that name an employee.
@@ -455,6 +460,16 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.change_password", "the caller's own password"),
     ("users.change_email", "the caller's own address"),
     ("users.audit_log", "auth audit rows; P1g hidden rows drop those naming another person's Personal employee"),
+    // RM-134 (`mcp_keys.create` is gated: write_scoped on `agent_id`, the
+    // employee-bound key; an integration key's `client_id` may name no
+    // employee or reserved sender at all — refused in the handler).
+    // The other arms act on an existing key by `id` only.
+    ("mcp_keys.rename", "names a key by id; reads only `id` and `name`, never an employee parameter"),
+    ("mcp_keys.set_expiry", "names a key by id; reads only `id` and `expiry`"),
+    ("mcp_keys.disable", "names a key by id (tightening; Admin only)"),
+    ("mcp_keys.enable", "names a key by id; reads only `id`"),
+    ("mcp_keys.delete", "names a key by id; reads only `id` (a pasted `key` is refused)"),
+    ("mcp_keys.revoke", "alias of mcp_keys.delete: names a key by id only"),
 ];
 
 /// Namespaces (no gated method in them) whose arms may name an employee,
@@ -541,7 +556,8 @@ const NO_EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
     ("voice", "local TTS model install / status"),
     ("inference", "inference provider settings and local model serving"),
     ("mcp_oauth_grants", "OAuth grants of MCP clients"),
-    ("mcp_keys", "MCP API keys (external ids may not be eph-…)"),
+    // `mcp_keys.*` (RM-134): listed method by method in EMPLOYEE_ARMS (the
+    // namespace has a gated method, `mcp_keys.create`).
     ("killswitch", "global kill switch"),
     ("license", "license status and activation"),
     ("mfa", "the caller's own second factor"),

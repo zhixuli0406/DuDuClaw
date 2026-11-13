@@ -253,8 +253,59 @@ The dashboard groups rules by table. **Query and read** writes both `read` and `
 
 ### Mint per-agent API keys with the right scopes
 
-The MCP key registry (`config.toml [mcp_keys]`) gates which scopes each
-agent's API key may exercise:
+> **Since v1.82 (RM-134):** dashboard-issued keys live in the hashed key store
+> `<home>/mcp_keys.db`, not in `config.toml`. Create a per-agent key on
+> **Manage → Integrations → MCP API keys** with **Key for: An AI employee's own
+> key** (`mcp_keys.create` with `agent_id` = the agent id, the scopes below,
+> an expiry you choose). The agent id must be the agent's directory name under
+> `agents/`, exact case; an `[agent] name` / display name is refused
+> (`mcp_key_employee_id_required`). The key is bound to that agent at creation and
+> the binding never changes. It is an internal key that acts as that agent and
+> never carries `admin`. For a colleague's Personal employee, only the owner, or
+> an Admin after a fresh audited step-up, can create it. Disable, re-date or delete
+> it there by key id. A key created by **client ID** is always external and cannot
+> use an agent id. At its first v1.82 start the gateway moves the `[mcp_keys]`
+> entries shown below into the store; an internal entry is bound to an agent only
+> when its `client_id` exactly equals an existing agent directory id (so
+> `proj-alpha-pm` below is bound only if `agents/proj-alpha-pm/` exists) and every
+> one of its scopes is one a per-agent key may carry (never `admin`). An agent's
+> legacy entry with `admin` or another scope not allowed for a per-agent key is
+> moved with its scopes unchanged but unbound — refused over HTTP and marked
+> *Needs re-issue: scopes not allowed for a per-employee key* on the keys page —
+> so re-issue that agent's key by its agent id and delete the old one. On a key
+> bound to an agent only the per-agent scopes ever take effect. On that
+> first start the gateway also issues itself a new internal key and ignores every
+> `gateway-internal` entry already in `config.toml`. After that move, a
+> `[mcp_keys]` entry added to `config.toml` is ignored and never authenticates.
+> The `config.toml` example and the reload paragraph after it describe v1.81 and
+> earlier.
+>
+> **Per-agent keys on the HTTP MCP server (`duduclaw http-server`).** A per-agent
+> key used over HTTP can call only tools that act on its own agent by design:
+> tools that operate on the HTTP server's own agent (`working_state_*`, `mail_*`,
+> `wiki_*`, `canvas_*`, `send_message`, `tasks_list`, `odoo_*`, …) are refused to
+> every key except the gateway's own internal key, and the remaining tools run as
+> the key's bound agent, never as the server's. Its `tools/list` shows only the
+> tools the key's scopes let it call. A key whose bound agent no longer
+> exists (removed, renamed or `status = "deleted"`), or an internal key with no
+> binding, is refused every tool over HTTP and is shown as *Employee no longer
+> exists* on the keys page. Each agent's own stdio `mcp-server` is unchanged.
+>
+> **Deleting an agent revokes its keys for good.** Deleting an agent on the
+> dashboard deletes (tombstones, audits) every key bound to it in the same
+> operation. Deleted agents cannot be restored from the dashboard; even if an
+> operator restores their files on disk, their keys stay deleted. A later agent
+> created with the same id never gets them — issue it a new key. An agent removed
+> outside the gateway (MCP `agent_remove`, a manually removed folder) or marked
+> `status = "deleted"` loses its keys at the gateway's next key sweep (at start and
+> every 10 minutes). Where the operating system reports folder creation times, a
+> key older than its agent's folder (an agent re-created under a removed one's id)
+> is refused over HTTP even before that sweep; restoring or copying the whole home
+> resets those times, so per-agent keys issued before such a restore must be
+> re-issued. See [MCP tools](../guides/mcp-tools.md#mcp-api-keys-ddc_env_-since-v182).
+
+Before v1.82 the MCP key registry (`config.toml [mcp_keys]`) gated which scopes
+each agent's API key may exercise:
 
 ```toml
 [mcp_keys]

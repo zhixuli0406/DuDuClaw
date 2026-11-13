@@ -95,6 +95,17 @@ the SR5 `approvals.employee_incarnation` column (a card bound to its employee's
 incarnation). v1.79.3, v1.80.x and v1.81 are accepted (exact match only;
 `approvals-v1793.sql` / `approvals-v180.sql` are unchanged and no longer regenerated),
 v1.81 shares the v1.80 mapping and the new column is never authorized for reading.
+`mcp_keys.db` (v1.82, RM-134: dashboard MCP API keys stored as SHA-256 fingerprints) has
+one exact catalog, `mcp-keys-v182.sql`, a byte copy of `duduclaw_core::mcp_key_store::SCHEMA_SQL`
+(duduclaw-auth's `importer_catalog_matches_a_fresh_store` test checks the bytes and compares the
+schema with a fresh store). Unlike the other authority stores it pins `PRAGMA user_version = 1`
+(set by the catalog itself); any other version is a schema error. Only `name` and `deleted_at`
+are authorized for reading; the internal-key, pending-legacy, ignored-entry and notice tables
+are never read. `mcp_keys_usage.db` (last-use telemetry) authenticates nothing and has no
+catalog: it is not imported.
+A fingerprint is never evidence of authority in the new installation: every key that is not
+deleted becomes a `Connector` re-issue obligation named `mcp_key:<name>` with
+`requires_reentry`; only `name` and `deleted_at` are authorized for reading.
 `memory-v180.sql` is reproducible from the reviewed fresh engine SQL with
 `scripts/capture_memory_schema.py` (and `approvals-v181.sql` with
 `scripts/capture_approval_schema.py`); the gateway regression tests compare these

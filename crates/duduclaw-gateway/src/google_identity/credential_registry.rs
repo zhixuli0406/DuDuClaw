@@ -34,6 +34,25 @@ fn legacy(
     agent: &str,
     required: &str,
 ) -> Result<(), &'static str> {
+    // RM-134: the authority store decides, keyed by the same SHA-256 the
+    // reference carries (`mcp_key_store::resolve_hash`). An unreadable or
+    // malformed store refuses; a stored key decides alone (disabled /
+    // expired / deleted never fall through to a stale config copy);
+    // `[mcp_keys]` is read only in the documented legacy window (no store
+    // yet, or recorded as pending legacy) — never once the migration is
+    // complete, and never for the gateway-internal key (refused above).
+    use duduclaw_core::mcp_key_store::Authority;
+    match duduclaw_core::mcp_key_store::resolve_hash(home, &reference.sha256) {
+        Err(_) | Ok(Authority::Unknown | Authority::Internal(_)) => return Err(REFUSED),
+        Ok(Authority::Stored(key)) => {
+            let usable = key.state(Utc::now()) == duduclaw_core::mcp_key_store::KeyState::Active;
+            if !usable || key.client_id != agent || !key.scopes.iter().any(|scope| scope == required) {
+                return Err(REFUSED);
+            }
+            return Ok(());
+        }
+        Ok(Authority::Legacy(_)) => {}
+    }
     let path = home.join("config.toml");
     if std::fs::metadata(&path).map_err(|_| REFUSED)?.len() > 4 * 1024 * 1024 {
         return Err(REFUSED);
@@ -71,7 +90,7 @@ fn legacy(
         .and_then(toml::Value::as_str)
         .ok_or(REFUSED)?;
     let created = DateTime::parse_from_rfc3339(created).map_err(|_| REFUSED)?;
-    if Utc::now().signed_duration_since(created).num_days() > 30 {
+    if !duduclaw_core::mcp_key_store::legacy_age_accepts(created.with_timezone(&Utc), Utc::now()) {
         return Err(REFUSED);
     }
     let scopes = table
@@ -154,6 +173,71 @@ mod tests {
         write("employee-a", "'google:read'", 31);
         assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_err());
         std::fs::write(home.path().join("config.toml"), "[mcp_keys]\n").unwrap();
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_err());
+    }
+    /// H1: once the store exists, a config entry it does not know is never
+    /// read (migration complete, or not pending); a damaged store refuses.
+    #[test]
+    fn config_entries_are_read_only_in_the_legacy_window() {
+        use duduclaw_auth::mcp_keys::McpKeyStore;
+        let home = home();
+        let key = "ddc_dev_0123456789abcdef0123456789abcdef";
+        let reference = CredentialRef {
+            kind: CredentialKind::Legacy,
+            sha256: format!("{:x}", sha2::Sha256::digest(key.as_bytes())),
+        };
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[mcp_keys.{key}]\nclient_id='employee-a'\nscopes=['google:read']\nis_external=true\ncreated_at='{}'\n",
+            Utc::now().to_rfc3339())).unwrap();
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_ok(), "bootstrap");
+        let store = McpKeyStore::open(home.path()).unwrap();
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_err(), "store exists, not pending");
+        store.begin_legacy_migration(std::slice::from_ref(&reference.sha256), Utc::now()).unwrap();
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_ok(), "pending legacy");
+        store.clear_pending(&reference.sha256).unwrap();
+        store.complete_migration(Utc::now()).unwrap();
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_err(), "after the marker");
+        // The recorded internal key never reaches the Google lane.
+        store.record_internal_key(key, Utc::now()).unwrap();
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_err());
+    }
+
+    #[test]
+    fn stored_key_rechecks_state_owner_and_scope_and_shadows_config() {
+        use duduclaw_auth::mcp_keys::{Expiry, KeyBinding, McpKeyStore, NewMcpKey};
+        let home = home();
+        let store = McpKeyStore::open(home.path()).unwrap();
+        let created = store
+            .create(
+                NewMcpKey {
+                    name: "google bridge".into(),
+                    client_id: "employee-a".into(),
+                    binding: KeyBinding::Employee,
+                    env: "prod".into(),
+                    scopes: vec!["google:read".into()],
+                    expiry: Expiry::Days(30),
+                    created_by: Some("admin".into()),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        let reference = CredentialRef {
+            kind: CredentialKind::Legacy,
+            sha256: format!("{:x}", sha2::Sha256::digest(created.secret.as_bytes())),
+        };
+        // No config.toml at all: the store alone authorizes.
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_ok());
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_create_draft").is_err());
+        store.set_disabled(&created.key.id, true, "admin", Utc::now()).unwrap();
+        // A stale config copy of the same key cannot re-enable it.
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[mcp_keys.{}]\nclient_id='employee-a'\nscopes=['google:read']\nis_external=true\ncreated_at='{}'\n",
+            created.secret, Utc::now().to_rfc3339())).unwrap();
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_err());
+        store.set_disabled(&created.key.id, false, "admin", Utc::now()).unwrap();
+        assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_ok());
+        drop(store);
+        std::fs::write(home.path().join("mcp_keys.db"), b"corrupt store bytes, not sqlite").unwrap();
         assert!(authorize(home.path(), &reference, "employee-a", "gmail_search").is_err());
     }
     #[test]

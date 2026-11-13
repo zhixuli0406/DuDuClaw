@@ -97,6 +97,7 @@ pub fn extract(request:&ImportRequest,input:impl Read,wal:Option<&mut dyn Read>)
     if matches!(request.kind,SourceKind::AuthorityAutopilotSqlite|SourceKind::AuthorityWorkflowSqlite) {schedules::sqlite(input,wal,&mut b)?;return Ok(b.proposals);}
     if matches!(request.kind,SourceKind::AuthorityRemindersJsonl) {schedules::reminders(input,&mut b)?;return Ok(b.proposals);}
     if matches!(request.kind,SourceKind::AuthorityNotice) {stores::notice(&mut b)?;return Ok(b.proposals);}
+    if matches!(request.kind,SourceKind::AuthorityMcpKeysSqlite) {stores::mcp_keys(input,wal,&mut b)?;return Ok(b.proposals);}
     if wal.is_some() {return Err(Error::InvalidRequest);}
     let mut bytes=Vec::new();input.take(1024*1024+1).read_to_end(&mut bytes)?;if bytes.len()>1024*1024 {return Err(Error::Limit);}
     let agent=request.legacy_agent.as_deref();

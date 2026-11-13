@@ -495,22 +495,26 @@ fn test_unconfigured_grants_default_only_with_explicit_optin() {
     assert!(!principal.is_external);
 }
 
-// ── L12: future-dated key must not be treated as ancient ──────────────────
+// ── L12 + RM-134 third review: clock skew vs. a planted future date ───────
 #[test]
-fn test_future_dated_key_is_not_expired() {
+fn test_future_dated_key_within_skew_authenticates_and_beyond_is_refused() {
     let _guard = ENV_LOCK.lock().unwrap();
     let key = fresh_key("prod");
-    // created_at 10 days in the FUTURE (clock skew / mis-set system time).
-    let future = (Utc::now() + chrono::Duration::days(10)).to_rfc3339();
-    let dir = make_config_dir_with_key(&key, "client-future", &["memory:read"], false, &future);
+    // created_at one minute in the FUTURE (clock skew): age 0, accepted.
+    let skewed = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+    let dir = make_config_dir_with_key(&key, "client-future", &["memory:read"], false, &skewed);
     // SAFETY: protected by ENV_LOCK.
     unsafe { std::env::set_var("DUDUCLAW_MCP_API_KEY", &key) };
     let result = authenticate_from_env(dir.path());
     unsafe { std::env::remove_var("DUDUCLAW_MCP_API_KEY") };
     // Before the L12 fix, num_days() was negative and `as u64` wrapped to a
-    // huge value ⇒ KeyExpired. Now age clamps to 0 ⇒ authenticates.
-    let principal = result.expect("future-dated key must authenticate, not falsely expire");
+    // huge value ⇒ KeyExpired. Small skew still clamps to age 0.
+    let principal = result.expect("a slightly future-dated key must authenticate, not falsely expire");
     assert_eq!(principal.client_id, "client-future");
+    // Ten days ahead is not clock skew: it would never age out, so it is refused.
+    let far = (Utc::now() + chrono::Duration::days(10)).to_rfc3339();
+    let dir = make_config_dir_with_key(&key, "client-future", &["memory:read"], false, &far);
+    assert!(matches!(authenticate_with_key(&key, dir.path()), Err(AuthError::KeyExpired { .. })));
 }
 
 // ── Test 11: constant-time lookup — valid key matching different entries ──

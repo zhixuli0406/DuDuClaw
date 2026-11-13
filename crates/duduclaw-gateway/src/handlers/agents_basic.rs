@@ -238,10 +238,8 @@ impl MethodHandler {
                 Some(seat_count_unavailable_error())
             }
             SeatDecision::Full { max, current, holders } => {
-                let message = format!(
-                    "{}{}",
-                    self.agent_cap_text(max).await,
-                    crate::license_runtime::AGENT_SEAT_NOTE
+                let message = crate::license_runtime::with_agent_seat_note(
+                    &self.agent_cap_text(max).await, "\n",
                 );
                 Some(json!({
                     "code": duduclaw_core::agent_seats::SEAT_LIMIT_ERROR_CODE,

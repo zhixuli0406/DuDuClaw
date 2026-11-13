@@ -191,7 +191,7 @@ fn status_json_at(home: &Path, now: DateTime<Utc>) -> serde_json::Value {
 }
 
 /// Whole days left, rounded up (a deadline 1 hour away is "1 day").
-fn days_left(deadline: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+pub(crate) fn days_left(deadline: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
     let secs = (deadline - now).num_seconds();
     if secs <= 0 { 0 } else { (secs + 86_399) / 86_400 }
 }

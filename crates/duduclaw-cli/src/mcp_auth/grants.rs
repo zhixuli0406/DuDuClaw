@@ -59,13 +59,53 @@ pub(crate) fn dedicated_google_tool_allowed(
 /// SkillExecute/Recording), the person registry (IdentityRead) and Admin are
 /// deliberately absent: external surfaces never reach them regardless of what
 /// a key claims.
+///
+/// RM-157: the canonical list is
+/// `duduclaw_core::mcp_scopes::EXTERNALLY_GRANTABLE_SCOPE_STRINGS` (the
+/// dashboard's `mcp_keys.*` RPCs read that one); this constant is derived from
+/// it at compile time ([`scope_of`]) — a string that is not one of these
+/// [`Scope`]s, or a change in the list's length, fails the build.
 pub const EXTERNALLY_GRANTABLE_SCOPES: &[Scope] = &[
-    Scope::MemoryRead,
-    Scope::MemoryWrite,
-    Scope::WikiRead,
-    Scope::WikiWrite,
-    Scope::MessagingSend,
+    scope_of(GRANTABLE[0]),
+    scope_of(GRANTABLE[1]),
+    scope_of(GRANTABLE[2]),
+    scope_of(GRANTABLE[3]),
+    scope_of(GRANTABLE[4]),
 ];
+
+const GRANTABLE: [&str; 5] = duduclaw_core::mcp_scopes::EXTERNALLY_GRANTABLE_SCOPE_STRINGS;
+
+/// `const` wire-string → [`Scope`] for the externally grantable list. Any
+/// other string is a compile error when used in a `const` context.
+const fn scope_of(s: &str) -> Scope {
+    const fn eq(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    if eq(s, "memory:read") {
+        Scope::MemoryRead
+    } else if eq(s, "memory:write") {
+        Scope::MemoryWrite
+    } else if eq(s, "wiki:read") {
+        Scope::WikiRead
+    } else if eq(s, "wiki:write") {
+        Scope::WikiWrite
+    } else if eq(s, "messaging:send") {
+        Scope::MessagingSend
+    } else {
+        panic!("not an externally grantable scope")
+    }
+}
 
 /// C4: may this EXTERNAL principal call `tool_name`?
 ///
@@ -109,6 +149,13 @@ mod external_scope_tests {
             is_external: true,
             created_at: chrono::Utc::now(),
         }
+    }
+
+    /// RM-157: one source of the grantable list.
+    #[test]
+    fn externally_grantable_scopes_derive_from_core() {
+        let strings: Vec<String> = EXTERNALLY_GRANTABLE_SCOPES.iter().map(ToString::to_string).collect();
+        assert_eq!(strings, duduclaw_core::mcp_scopes::EXTERNALLY_GRANTABLE_SCOPE_STRINGS);
     }
 
     #[test]

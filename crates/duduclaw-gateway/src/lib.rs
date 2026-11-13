@@ -235,6 +235,8 @@ pub mod killswitch_triggers;
 pub mod markdown_render;
 pub mod mcp_external;
 pub mod mcp_internal_key;
+/// RM-134 (v1.82): `[mcp_keys]` → hashed store migration and expiry notices.
+pub(crate) mod mcp_keys_lifecycle;
 pub mod msteams;
 pub mod notion_workspace;
 pub mod person_credentials;

@@ -530,9 +530,10 @@ pub(crate) fn mcp_seat_decision(
 /// `max` and `current` only (see [`mcp_seat_decision`]).
 pub(crate) fn mcp_seat_refusal_text(max: usize, current: usize, tier: Option<&str>) -> String {
     format!(
-        "Error: {}{}目前已使用 {current} 個名額（上限 {max} 個），沒有建立新的 AI 員工。",
-        duduclaw_gateway::license_runtime::agent_cap_text(max, tier),
-        duduclaw_gateway::license_runtime::AGENT_SEAT_NOTE,
+        "Error: {} 目前已使用 {current} 個名額（上限 {max} 個），沒有建立新的 AI 員工。",
+        duduclaw_gateway::license_runtime::with_agent_seat_note(
+            &duduclaw_gateway::license_runtime::agent_cap_text(max, tier), " ",
+        ),
     )
 }
 

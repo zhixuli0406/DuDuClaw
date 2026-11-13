@@ -1050,6 +1050,11 @@ pub fn agent_cap_text(max: usize, tier: Option<&str>) -> String {
 pub const AGENT_SEAT_NOTE: &str =
     "已刪除的 AI 員工不佔名額；已封存的 AI 員工仍佔名額，刪除後即釋出。";
 
+/// Keep URLs separate from the seat explanation at every refusal call site.
+pub fn with_agent_seat_note(message: &str, separator: &str) -> String {
+    format!("{message}{separator}{AGENT_SEAT_NOTE}")
+}
+
 /// The agent-count cap that applies to this home, resolved from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCap {
@@ -1557,6 +1562,20 @@ fn write_last_seen_crl(home_dir: &Path, ts: chrono::DateTime<Utc>) -> std::io::R
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn seat_note_keeps_cap_url_separated() {
+        for tier in [None, Some("team")] {
+            for separator in [" ", "\n"] {
+                let message = with_agent_seat_note(&agent_cap_text(5, tier), separator);
+                assert!(message.contains(&format!("https://futurecorp.tw{separator}")));
+                assert!(message.ends_with(&format!("{separator}{AGENT_SEAT_NOTE}")));
+                assert!(!message.contains(&format!("https://futurecorp.tw{AGENT_SEAT_NOTE}")));
+                assert_eq!(message.contains('\n'), separator == "\n");
+            }
+        }
+    }
+
     use chrono::Duration as ChronoDuration;
     use duduclaw_license::License;
 

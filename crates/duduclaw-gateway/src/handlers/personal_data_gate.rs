@@ -149,7 +149,11 @@ pub(super) fn write_scoped(method: &str) -> Option<(&'static str, DataCategory)>
         "agents.google_identity_set"
         // Its own channel identities (bot / app it acts as).
         | "agents.channels.telegram.set" | "agents.channels.telegram.remove"
-        | "agents.channels.googlechat.set" | "agents.channels.googlechat.remove" => {
+        | "agents.channels.googlechat.set" | "agents.channels.googlechat.remove"
+        // RM-134 H3: a dashboard MCP key bound to this employee (the v1.76
+        // dedicated Google lane, `agent_id` names it): a credential that acts
+        // as the employee. Owner, or an Admin with a fresh, audited step-up.
+        | "mcp_keys.create" => {
             ("agent_id", DataCategory::Identity)
         }
         _ => return None,
