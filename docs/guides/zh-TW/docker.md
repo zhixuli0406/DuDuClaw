@@ -443,6 +443,39 @@ docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up
 
 之後卡片會顯示「保護金鑰被更換」。按「重新啟用」，已保存的個人連線全部失效，每個人重新連結。原生 Linux 主機可使用[受保護系統服務](linux-protected-service.md)。
 
+### 7.5 從原生安裝改用容器版
+
+先停止原生 gateway 並停用主機服務，再啟動容器版，避免兩個 gateway 各自操作不同資料目錄：
+
+```bash
+duduclaw service stop
+duduclaw service uninstall
+docker compose up -d
+```
+
+Compose 服務名稱是 `duduclaw`。容器版的主程式資料（包含 `license.json`）存放在 `duduclaw-data` volume，掛載於容器內 `/home/duduclaw/.duduclaw`。主機殘留的 `~/.duduclaw` 沒有掛進容器，因此不會被這個 gateway 使用。請在容器內更新授權：
+
+```bash
+docker compose exec duduclaw duduclaw license status
+docker compose exec duduclaw duduclaw license activate <key>
+# 或匯入容器內可讀到的授權檔：
+docker compose exec duduclaw duduclaw license import /path/in/container/license.json
+```
+
+需要保留的主機資料請先備份或遷移；不要假設在主機更新授權會改到容器版的授權。
+
+### 7.6 記憶體估算
+
+客戶回報的現場量測約為每位正在回覆的員工 300–400 MB。這是約略觀察值，不是保證上限。規劃時可用 **gateway 基本用量 + 同時回覆的員工數 × 約 400 MB**；設定硬上限前，請先量測自己的工作負載。
+
+| 同時回覆員工數 | 員工用量估算（每人約 400 MB） |
+|---:|---:|
+| 5 | 2 GB + gateway 基本用量 |
+| 10 | 4 GB + gateway 基本用量 |
+| 20 | 8 GB + gateway 基本用量 |
+
+範例 Compose 檔預設沒有設定記憶體上限。
+
 ## 8. 健康檢查與觀測
 
 ### 8.1 三條 health endpoint

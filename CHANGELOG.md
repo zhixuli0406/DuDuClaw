@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- 授權寫入指令會提示目前資料目錄是否有 gateway 使用，並可用 `duduclaw license --home-check strict …` 讓未使用中的資料目錄檢查失敗；`license status` 也會顯示資料目錄與 gateway 鎖定狀態。
+- Docker 指南新增原生版轉容器版授權流程，以及依同時回覆員工數估算記憶體的參考表。
+
 ### Fixed
 
 - 使用 Claude 的 AI 員工自 v1.81.0 起，自行加入的第三方 MCP 工具在 `ask` 模式下每次呼叫都要人工確認；排程與提醒執行時沒有人能確認，報告與提醒因此送不出去。依程式判讀，存有加密憑證的第三方伺服器在同一情況下也會無法啟動（未以實機驗證）。現在 DuDuClaw 只在每次啟動專用、只有擁有者可讀的暫存 MCP 設定中（CLI 正常結束時刪除），把員工身分交給第三方 MCP 代理；這個權杖不會寫進 `.mcp.json` 裡第三方伺服器的項目，也不會出現在 CLI 環境，被包裝的第三方伺服器同樣拿不到。內建 DuDuClaw 項目原有的身分設定不變。Codex、Grok 與 openai-compat 員工不受影響。

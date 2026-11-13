@@ -301,7 +301,7 @@ effect table the dispatch gate and `action_rules` use
 Memory, wiki, user-profile and `code_map` tools also say `openWorldHint: false`;
 `memory_alias_add`, `wiki_export` and `wiki_rebuild_fts` say
 `idempotentHint: true`. The overlays live in
-`crates/duduclaw-cli/src/mcp/tools_def/annotations.rs`.
+`crates/duduclaw-core/src/mcp_tool_defs/annotations.rs`.
 
 The hints are for the MCP client (for example, whether it asks before a call).
 They never authorize anything: every DuDuClaw gate still runs on the call. They

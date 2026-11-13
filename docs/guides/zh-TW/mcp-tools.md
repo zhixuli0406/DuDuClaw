@@ -180,7 +180,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 | `modify` | `false` | `true`；`memory_store`、`user_profile_record`、`wiki_rebuild_fts` 只新增或重新產生，標 `false`。`wiki_export` 仍標 `true`：它會覆寫上一次的匯出，包括可能已被人編輯過的 Obsidian vault |
 | `delete`、`purchase`、`admin` 與表上沒有的名稱 | `false` | `true` |
 
-記憶、wiki、使用者偏好與 `code_map` 工具另外標 `openWorldHint: false`；`memory_alias_add`、`wiki_export`、`wiki_rebuild_fts` 標 `idempotentHint: true`。這幾份清單在 `crates/duduclaw-cli/src/mcp/tools_def/annotations.rs`。
+記憶、wiki、使用者偏好與 `code_map` 工具另外標 `openWorldHint: false`；`memory_alias_add`、`wiki_export`、`wiki_rebuild_fts` 標 `idempotentHint: true`。這幾份清單在 `crates/duduclaw-core/src/mcp_tool_defs/annotations.rs`。
 
 這些提示給 MCP 用戶端參考（例如呼叫前要不要先問人），不代表任何授權，DuDuClaw 的每道閘門照常檢查。它們不計入上面的說明字數預算：Claude Code 與 Codex 交給模型的工具清單只有名稱、說明與輸入 schema。
 
