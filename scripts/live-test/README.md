@@ -47,7 +47,7 @@ scripts/live-test/mcp-probe.sh /tmp/ddc-live prod-shaped
 Expected probe output for a healthy build:
 
 ```
-tools/list  169 tools visible to prod-shaped
+tools/list  168 tools visible to prod-shaped
 tasks_list  ok
 memory_search  ok
 working_state_get  ok

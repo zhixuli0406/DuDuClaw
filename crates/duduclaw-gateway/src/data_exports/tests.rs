@@ -711,14 +711,19 @@ fn bound_conversation_exports_scope_mask_and_recollect_on_privilege_downgrade() 
     let (db,user)=user(dir.path(),"bound-export@test.invalid",UserRole::Employee);
     std::fs::write(dir.path().join("config.toml"),"[people]\nbound_history_privacy=true").unwrap();
     let conn=rusqlite::Connection::open(dir.path().join("sessions.db")).unwrap();
-    conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT,archive_reason TEXT,user_cleared_at TEXT); CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,timestamp TEXT,tokens INTEGER DEFAULT 0,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
+    conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT,archive_reason TEXT,user_cleared_at TEXT); CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,timestamp TEXT,tokens INTEGER DEFAULT 0,hidden INTEGER DEFAULT 0,undone_at TEXT,notice_kind TEXT);").unwrap();
     for (sid,kind,owner) in [("mine","webchat_user",user.user_id.as_str()),("theirs","webchat_user","stranger"),("whatsapp:+886912345678","channel","")] {
         conn.execute("INSERT INTO sessions(id,agent_id,origin_kind,owner_user_id,title,last_active,archived_at) VALUES (?1,'sales',?2,?3,'PRIVATE TITLE','2026-10-10T02:00:00Z',NULL)",params![sid,kind,owner]).unwrap();
         conn.execute("INSERT INTO session_messages(session_id,role,content,timestamp) VALUES (?1,'user','phone 0912-345-678 email a@example.com','2026-10-10T02:00:00Z')",[sid]).unwrap();
     }
+    // Hidden failure rows must not become exported assistant speech.
+    for sid in ["mine", "whatsapp:+886912345678"] {
+        conn.execute("INSERT INTO session_messages(session_id,role,content,timestamp,hidden,notice_kind) VALUES (?1,'assistant','FAILURE_NOTICE_SENTINEL','2026-10-10T02:00:01Z',1,'turn_failure')", [sid]).unwrap();
+    }
     let req=request(Dataset::Conversations,ExportFormat::Csv);
     let table=source::collect(dir.path(),&user,&req,||Ok(())).unwrap();
     assert_eq!(table.rows.len(),2);
+    assert!(table.rows.iter().all(|row| !format!("{:?}", row.cells).contains("FAILURE_NOTICE_SENTINEL")));
     let own=table.rows.iter().find(|r|matches!(&r.cells[1],Cell::Text(s) if s=="mine")).unwrap();
     assert!(matches!(&own.cells[5],Cell::Text(s) if s.contains("0912-345-678")));
     let external=table.rows.iter().find(|r|r.id!=own.id).unwrap();

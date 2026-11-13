@@ -181,6 +181,10 @@ pub(crate) fn canonicalize_db_source_ids(
     Ok(out)
 }
 
+/// RM-149 round 2: `agent_update` refuses a `status` change for an archived
+/// or soft-deleted employee (the Admin-only lifecycle).
+pub(crate) const ADMIN_LIFECYCLE_STATUS_REFUSED: &str = "Error: 這位 AI 員工已封存或已刪除，狀態只能由管理員在儀表板變更（解除封存，或新建一位 AI 員工）。未做任何變更。";
+
 /// `agent_update` parameters that change an employee's authority: the MCP
 /// counterparts of the keys the dashboard's `agents.update` treats as
 /// admin-only (`AUTHORITY_KEYS` in `duduclaw-gateway/src/handlers/
@@ -198,6 +202,29 @@ pub(crate) const SELF_AUTHORITY_PARAMS: &[&str] = &[
     "reply_language",
     "role",
 ];
+
+/// RM-137 H4: every `agent_update` parameter that creates, resumes or
+/// reschedules background work for the target employee. The handler accepts
+/// no other proactive / tick / schedule field (`[heartbeat]` has only
+/// `enabled` and `cron` here; `[agent] status` is what the heartbeat scheduler
+/// and the proactive invoker check before running an employee). Shared with
+/// [`changes_background_work`].
+pub(crate) const BACKGROUND_WORK_PARAMS: &[&str] = &["status", "heartbeat_enabled", "heartbeat_cron"];
+
+/// RM-137 H4: the AI employee that must pass the delegation predicate for
+/// this `agent_update` — `Some(caller)` when an AI employee changes a
+/// [`BACKGROUND_WORK_PARAMS`] field of ANOTHER employee. Operators and
+/// self-edits keep today's rule (`None`).
+pub(crate) fn background_delegation_sender<'a>(
+    actor: RecordActor<'a>,
+    target: &str,
+    params: &Value,
+) -> Option<&'a str> {
+    let me = actor.agent()?;
+    (me.trim() != target.trim()
+        && BACKGROUND_WORK_PARAMS.iter().any(|k| params.get(*k).is_some()))
+    .then_some(me)
+}
 
 /// Update one or more fields of an existing agent's `agent.toml` (see the
 /// notes at the top of this file for the org gate).
@@ -253,6 +280,22 @@ pub(crate) async fn handle_agent_update(
         "調整 AI 員工設定"
     };
     if let Err(reason) = check_org_subject_allowed(home_dir, caller, agent_id, subject_what).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {reason}")}],
+            "isError": true
+        });
+    }
+
+    // RM-137 H4: starting, resuming, pausing or rescheduling another
+    // employee's background work (the heartbeat scheduler and the proactive
+    // invoker run it afterwards) is delegation, so it must pass the delegation
+    // predicate as well — refused under `none`. Re-checked inside the locked
+    // write below.
+    let background_sender = background_delegation_sender(actor, agent_id, params);
+    if let Some(me) = background_sender
+        && let Err(reason) =
+            check_delegation_allowed(home_dir, me, agent_id, "agent_update_background").await
+    {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: {reason}")}],
             "isError": true
@@ -324,6 +367,24 @@ pub(crate) async fn handle_agent_update(
     // The typed config as read, so only the keys this call changes are
     // written back (format-preserving, see the write below).
     let config_before = config.clone();
+
+    // RM-149 round 2: `archived` and `deleted` are the Admin-only lifecycle
+    // (a deleted employee holds no licence seat). `status` here cannot move
+    // an employee out of either — that would resurrect it without the seat
+    // admission and around the dashboard's restore. Re-checked on the file
+    // as read under its lock below.
+    let status_requested = params.get("status").and_then(|v| v.as_str()).is_some();
+    if status_requested
+        && matches!(
+            config_before.agent.status,
+            duduclaw_core::types::AgentStatus::Archived | duduclaw_core::types::AgentStatus::Deleted
+        )
+    {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": ADMIN_LIFECYCLE_STATUS_REFUSED}],
+            "isError": true
+        });
+    }
 
     let mut changes = Vec::new();
 
@@ -707,6 +768,16 @@ pub(crate) async fn handle_agent_update(
     // org lock for every other org writer.
     let lock_wait = org_lock.as_ref().map(|_| org_locked_file_wait(home_dir));
     let written = duduclaw_gateway::agent_files::external::edit_agent_toml_guarded_within(home_dir, agent_id, "mcp", caller, |raw| {
+        // RM-149 round 2: the lifecycle check again, on the file as read
+        // under its lock (an Admin may have archived / deleted it meanwhile).
+        if status_requested
+            && matches!(
+                raw.get("agent").and_then(|a| a.get("status")).and_then(toml::Value::as_str),
+                Some(duduclaw_core::agent_seats::ARCHIVED_STATUS | duduclaw_core::agent_seats::DELETED_STATUS)
+            )
+        {
+            return Err(ADMIN_LIFECYCLE_STATUS_REFUSED.to_string());
+        }
         duduclaw_gateway::agent_files::external::apply_typed_changes(raw, &before_t, &after_t);
         // A requested stop must reach the fresh artifact even if the initial
         // snapshot had that status already and another writer resumed it.
@@ -719,6 +790,11 @@ pub(crate) async fn handle_agent_update(
         }
         Ok(())
     }, || {
+        // RM-137 H4: the policy / org tree may have changed since the front
+        // check; decide again under the agent.toml lock.
+        if let Some(me) = background_sender {
+            check_delegation_allowed_blocking(home_dir, me, agent_id, "agent_update_background")?;
+        }
         if background_edit {
             if stopping {
                 check_background_caller(home_dir, actor, "agent_update")?;

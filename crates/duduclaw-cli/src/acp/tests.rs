@@ -49,6 +49,78 @@ fn test_agent_card_v1_0_required_fields() {
     assert_eq!(ext["negotiationHeader"], "x-duduclaw-capabilities");
 }
 
+/// RM-137 H3: `duduclaw acp server` refuses to start inside an AI session
+/// and whenever an employee identity variable is present (even empty).
+#[test]
+fn acp_server_refuses_inside_an_ai_session_or_with_identity_env() {
+    use super::server::{ACP_SERVER_IDENTITY_ENV_VARS, acp_server_start_refusal};
+    assert!(acp_server_start_refusal(&[], &[]).is_none());
+    for k in ACP_SERVER_IDENTITY_ENV_VARS {
+        let msg = acp_server_start_refusal(&[], &[k]).expect("identity env refuses");
+        assert!(msg.contains(k) && msg.contains("acp server"), "{msg}");
+    }
+    let msg = acp_server_start_refusal(&[duduclaw_core::ENV_TRUST_TURN_ID], &[])
+        .expect("an AI-session marker refuses");
+    assert!(msg.contains(duduclaw_core::ENV_TRUST_TURN_ID), "{msg}");
+    for k in [duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::ENV_HOOK_TOKEN] {
+        assert!(ACP_SERVER_IDENTITY_ENV_VARS.contains(&k));
+    }
+}
+
+/// The real entry point refuses before reading stdin (thread-local session
+/// env, see `ai_session_guard::test_session`).
+#[tokio::test(flavor = "current_thread")]
+async fn run_acp_server_refuses_in_an_ai_session() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    for env in [
+        [(duduclaw_core::ENV_AGENT_ID, "sales-rep")],
+        [(duduclaw_core::ENV_HOOK_TOKEN, "")],
+        [(duduclaw_core::ENV_DISPATCH_RUN_ID, "run-1")],
+    ] {
+        let _session = crate::ai_session_guard::test_session(&env);
+        let err = super::server::run_acp_server(tmp.path())
+            .await
+            .expect_err("must refuse inside an AI session");
+        assert!(err.to_string().contains("acp server"), "{err}");
+    }
+    assert!(!tmp.path().join("bus_queue.jsonl").exists());
+}
+
+/// The Bash lane refuses `duduclaw acp server` for employees.
+#[test]
+fn acp_server_is_an_operator_command_on_the_bash_lane() {
+    use duduclaw_core::HookCaller;
+    let agent = HookCaller::Agent("sales-rep".into());
+    for cmd in [
+        "duduclaw acp server",
+        "duduclaw maintenance acp server",
+        "/opt/bin/duduclaw acp server",
+        "bash -c 'env duduclaw acp server'",
+    ] {
+        assert!(
+            duduclaw_core::bash_operator_command_decision(cmd, &agent, super::server::OPERATOR_COMMANDS).is_some(),
+            "{cmd}"
+        );
+    }
+    assert!(duduclaw_core::bash_operator_command_decision(
+        "duduclaw acp server",
+        &HookCaller::Absent,
+        super::server::OPERATOR_COMMANDS
+    )
+    .is_none());
+}
+
+/// RM-137 H3: under `none` the ACP front door accepts only the default
+/// (Main-role) agent as a target; no default agent ⇒ nothing.
+#[test]
+fn acp_target_rule_under_none_accepts_only_the_default_agent() {
+    use super::handlers::acp_target_is_default;
+    assert!(acp_target_is_default(Some("ceo"), "ceo").is_ok());
+    assert!(acp_target_is_default(Some("ceo"), "sales-rep").is_err());
+    assert!(acp_target_is_default(None, "ceo").is_err());
+    assert!(acp_target_is_default(Some(""), "").is_err());
+}
+
 #[test]
 fn test_both_well_known_paths_resolve() {
     use super::server::{

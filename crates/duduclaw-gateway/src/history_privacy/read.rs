@@ -17,6 +17,7 @@ pub struct Metadata {
 }
 pub struct StoredRow {
     pub id: i64,
+    pub notice_kind: Option<String>,
     pub message: SessionMessage,
 }
 /// Admission is acquired before spawn_blocking and held by the closure.
@@ -132,15 +133,28 @@ pub fn list_in(
     Ok(out)
 }
 pub fn rows(c: &Connection, id: &str) -> Result<Vec<StoredRow>, String> {
-    let mut s=c.prepare("SELECT id,role,CASE WHEN length(CAST(content AS BLOB))<=?2 THEN content ELSE NULL END,tokens,timestamp FROM session_messages WHERE session_id=?1 AND hidden=0 AND undone_at IS NULL AND role IN ('user','assistant') ORDER BY id LIMIT ?3").map_err(|_|"history unavailable")?;
+    read_rows(c, id, false)
+}
+/// Only the conversation display includes failure notices. Runs, search and
+/// portable exports must keep using `rows`.
+pub fn conversation_rows(c: &Connection, id: &str) -> Result<Vec<StoredRow>, String> {
+    read_rows(c, id, true)
+}
+fn read_rows(c: &Connection, id: &str, notices: bool) -> Result<Vec<StoredRow>, String> {
+    // Non-display readers retain the original schema requirements: they never
+    // need the notice column to read visible conversation rows.
+    let notice_column = if notices { "notice_kind" } else { "NULL" };
+    let sql = format!("SELECT id,role,CASE WHEN length(CAST(content AS BLOB))<=?2 THEN content ELSE NULL END,tokens,timestamp,{notice_column} FROM session_messages WHERE session_id=?1 AND (hidden=0 OR (?4 AND {notice_column}='turn_failure')) AND undone_at IS NULL AND role IN ('user','assistant') ORDER BY id LIMIT ?3");
+    let mut s=c.prepare(&sql).map_err(|_|"history unavailable")?;
     let entries = s
-        .query_map(params![id, MAX_BYTES as i64, (MAX_ROWS + 1) as i64], |r| {
+        .query_map(params![id, MAX_BYTES as i64, (MAX_ROWS + 1) as i64, notices], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, u32>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(|_| "history unavailable")?;
@@ -150,7 +164,7 @@ pub fn rows(c: &Connection, id: &str) -> Result<Vec<StoredRow>, String> {
         if i == MAX_ROWS {
             return Err("history unavailable".into());
         }
-        let (id, role, body, tokens, stamp) = row.map_err(|_| "history unavailable")?;
+        let (id, role, body, tokens, stamp, notice_kind) = row.map_err(|_| "history unavailable")?;
         let content = body.ok_or("history unavailable")?;
         bytes = bytes.saturating_add(content.len());
         if bytes > MAX_BYTES {
@@ -158,6 +172,7 @@ pub fn rows(c: &Connection, id: &str) -> Result<Vec<StoredRow>, String> {
         }
         out.push(StoredRow {
             id,
+            notice_kind,
             message: SessionMessage {
                 role,
                 content,

@@ -195,7 +195,7 @@ impl MethodHandler {
             }
             "users.list" => {
                 require_admin!();
-                boxed_frame(|| self.handle_users_list()).await
+                boxed_frame(|| self.handle_users_list(ctx)).await
             }
             "users.invite" | "users.invite_status" => {
                 require_admin!();
@@ -233,6 +233,10 @@ impl MethodHandler {
             "users.offboard" => {
                 require_admin!();
                 boxed_frame(|| self.handle_users_offboard(params, ctx)).await
+            }
+            "users.repair_primary_agents" => {
+                require_admin!();
+                boxed_frame(|| self.handle_users_repair_primary_agents(params, ctx)).await
             }
             "users.set_primary_agent" => boxed_frame(|| self.handle_users_set_primary_agent(params, ctx)).await,
             "users.me" => boxed_frame(|| self.handle_users_me(ctx)).await,

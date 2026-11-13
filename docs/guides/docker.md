@@ -425,6 +425,39 @@ docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up
 
 The card then shows "Protection key was replaced". Choose **Re-enable**; every saved personal connection stops working and each person connects again. For a native host, use the [Linux protected system service](linux-protected-service.md).
 
+### 7.5 Moving from a native install to the container edition
+
+Stop the native gateway and disable its host service before starting the container edition, so two gateways do not operate on separate data directories:
+
+```bash
+duduclaw service stop
+duduclaw service uninstall
+docker compose up -d
+```
+
+The Compose service is `duduclaw`. Its application data, including `license.json`, lives in the `duduclaw-data` volume mounted at `/home/duduclaw/.duduclaw` inside the container. A leftover host `~/.duduclaw` is not mounted and is not used by this gateway. Update the licence against the container volume:
+
+```bash
+docker compose exec duduclaw duduclaw license status
+docker compose exec duduclaw duduclaw license activate <key>
+# Or import a licence file already available inside the container:
+docker compose exec duduclaw duduclaw license import /path/in/container/license.json
+```
+
+Back up or migrate any host data you still need before retiring it. Do not assume a host-side licence update changes the container's licence.
+
+### 7.6 Memory sizing
+
+Field measurements reported by a customer are approximately 300–400 MB per employee while replying. This is an approximate observation, not a guaranteed ceiling. For planning, use **base gateway memory + concurrent replying employees × about 400 MB**; measure your own workload before setting a hard limit.
+
+| Concurrent replying employees | Approximate employee allowance (400 MB each) |
+|---:|---:|
+| 5 | 2 GB + base gateway memory |
+| 10 | 4 GB + base gateway memory |
+| 20 | 8 GB + base gateway memory |
+
+The example Compose file sets no memory limit by default.
+
 ## 8. Health checks and observability
 
 ### 8.1 Three health endpoints

@@ -791,7 +791,7 @@ impl Fixture {
             self.state.user_db.bind_agent(&user.id, agent, duduclaw_auth::AccessLevel::Owner).unwrap();
         }
         self.state.ctx.registry.write().await.scan().await.unwrap();
-        if let Some(primary) = primary { self.state.user_db.set_primary_agent(&user.id, Some(primary)).unwrap(); }
+        self.state.user_db.set_primary_agent(&user.id, primary).unwrap();
         let token = self.state.jwt_config.issue_access_token(&user, &[]).unwrap();
         (user.id, token)
     }
@@ -1436,4 +1436,45 @@ async fn assert_final_policy_window(change: &str) {
         drop(registry_lock);
         drop(config_lock);
     }).await.unwrap_or_else(|_| panic!("final policy window timed out: {change}"));
+}
+
+#[tokio::test]
+async fn live_budget_and_provider_refusals_keep_pre_notice_assistant_done_bytes() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::start(true).await.unwrap();
+    let token = fixture.user("failure-live");
+    let (mut socket, info) = fixture.connect(&token).await;
+    let base = info["session_id"].as_str().unwrap();
+    let budget = crate::budget::BudgetRefusal(crate::budget::BudgetVerdict::Deny {
+        scope: "daily", spent_cents: 500, cap_cents: 500,
+    }).to_string();
+    let mismatch = format!("⚠️ {}", crate::runtime_config::ensure_model_provider(
+        "gpt-5.4", duduclaw_core::types::RuntimeType::Claude,
+    ).unwrap_err());
+    for (conv, live, reason) in [
+        ("budget", budget, crate::channel_reply::TurnFailureReason::Quota),
+        ("provider", mismatch, crate::channel_reply::TurnFailureReason::Unavailable),
+    ] {
+        crate::agent_channels::e2e_seam::failure_reply(&fixture.state.ctx.home_dir, live.clone(), reason);
+        message(&mut socket, conv, conv).await;
+        let entered = fixture.entered().await;
+        entered.release.send(()).unwrap();
+        let received = frame(&mut socket).await;
+        // Pre-change transport used this exact AssistantDone shape and reply.
+        let expected = ChatMessage::AssistantDone {
+            content: live.clone(), tokens_used: crate::cost_telemetry::estimate_tokens(&live) as u32,
+            conv: Some(conv.into()), model: None, artifact: None, agent: Some("dudu".into()),
+            agent_name: Some("Main".into()), citations: None, thinking: None, task: None,
+        };
+        let mut expected = serde_json::to_value(expected).unwrap();
+        expected["session_id"] = json!(format!("{base}#conv:{conv}"));
+        expected["msg_id"] = json!(conv);
+        expected["progress_dropped"] = json!(0);
+        assert_eq!(serde_json::to_vec(&received).unwrap(), serde_json::to_vec(&expected).unwrap());
+        let rows = fixture.state.ctx.session_manager.webchat_history(&format!("{base}#conv:{conv}")).await.unwrap();
+        let notices: Vec<_> = rows.iter().filter(|r| r.notice_kind.as_deref() == Some("turn_failure")).collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].message.content, reason.text(None));
+        fixture.turn_count(0).await;
+    }
 }

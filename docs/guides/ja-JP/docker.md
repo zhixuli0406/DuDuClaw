@@ -439,6 +439,39 @@ docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up
 
 その後カードに「保護キーが置き換えられました」と表示されます。「再度有効にする」を選ぶと、保存済みの個人接続はすべて使えなくなり、各自が接続し直します。ネイティブ Linux ホストでは[保護システムサービス](linux-protected-service.md)を利用できます。
 
+### 7.5 ネイティブ版からコンテナ版への移行
+
+2つのgatewayが別々のデータディレクトリを使わないよう、ネイティブ版gatewayを停止してホストサービスを無効化してからコンテナ版を起動します。
+
+```bash
+duduclaw service stop
+duduclaw service uninstall
+docker compose up -d
+```
+
+Composeサービス名は `duduclaw` です。コンテナ版のアプリケーションデータ（`license.json` を含む）は `duduclaw-data` volumeにあり、コンテナ内の `/home/duduclaw/.duduclaw` にマウントされます。ホストに残った `~/.duduclaw` はマウントされず、このgatewayでは使われません。ライセンスはコンテナ内で更新してください。
+
+```bash
+docker compose exec duduclaw duduclaw license status
+docker compose exec duduclaw duduclaw license activate <key>
+# コンテナから読めるファイルをインポートする場合：
+docker compose exec duduclaw duduclaw license import /path/in/container/license.json
+```
+
+必要なホストデータは先にバックアップまたは移行してください。ホスト上で更新しても、コンテナ版のライセンスは変わりません。
+
+### 7.6 メモリの目安
+
+顧客から報告された現場測定では、返信中の社員1人あたり約300～400 MBです。概算であり、保証された上限ではありません。計画時は **gatewayの基本使用量 + 同時に返信する社員数 × 約400 MB** を目安にし、上限を設定する前に実際の負荷を測定してください。
+
+| 同時に返信する社員 | 社員分の概算（1人約400 MB） |
+|---:|---:|
+| 5 | 2 GB + gateway基本使用量 |
+| 10 | 4 GB + gateway基本使用量 |
+| 20 | 8 GB + gateway基本使用量 |
+
+サンプルComposeファイルはデフォルトでメモリ上限を設定していません。
+
 ## 8. ヘルスチェックと可観測性
 
 ### 8.1 3つのhealth endpoint

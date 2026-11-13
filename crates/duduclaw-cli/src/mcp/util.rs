@@ -40,20 +40,6 @@ pub(crate) fn is_valid_agent_id(id: &str) -> bool {
     duduclaw_core::is_valid_new_agent_id(id)
 }
 
-/// Count existing agents (directories under `<home>/agents/` that carry an
-/// `agent.toml`) — the denominator for the agent-count cap in
-/// `handle_create_agent`. Mirrors what the gateway registry would list.
-pub(crate) fn count_existing_agents(home_dir: &Path) -> usize {
-    std::fs::read_dir(home_dir.join("agents"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().join("agent.toml").is_file())
-                .count()
-        })
-        .unwrap_or(0)
-}
-
 /// WP22 T4 — collect every identifier that already resolves to an agent: each
 /// existing agent's directory name AND its `[agent] name` field. The two
 /// namespaces are supposed to coincide (create always sets them equal) but

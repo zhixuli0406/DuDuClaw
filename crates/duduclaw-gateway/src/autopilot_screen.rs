@@ -35,7 +35,9 @@
 //! ## Where the spec lives
 //!
 //! Inside the rule's `action` JSON, alongside the other per-rule dispatch
-//! modifiers that already live there (`require_approval`, `context_ticks`):
+//! modifiers that already live there (`require_approval`, `context_ticks`).
+//! Screening runs before the v1.82 approval gate, so a screened-out fire never
+//! files an approval:
 //!
 //! ```json
 //! { "type": "delegate", "target_agent": "trader", "prompt": "…",

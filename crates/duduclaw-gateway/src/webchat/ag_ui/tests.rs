@@ -449,3 +449,49 @@ async fn external_confirmation_requires_matching_result_origin_and_live_access()
         &connection, &[card], &mut HashMap::new()).await, Err("authorization_changed"));
     assert_eq!(broker.get(&id).await.unwrap().unwrap().decided_by.as_deref(), Some("dashboard:admin"));
 }
+
+#[test]
+fn web_lifetime_error_names_the_web_cap_and_suggests_background_work() {
+    let event = run::failure("run_timeout");
+    assert_eq!(event["code"], "run_timeout");
+    let message = event["message"].as_str().unwrap();
+    assert!(message.contains("網頁對話") && message.contains("15 分鐘") && message.contains("背景任務"));
+    assert!(!run::failure("runtime_failed")["message"].as_str().unwrap().contains("15 分鐘"));
+}
+
+mod timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn employee_hour_limit_does_not_extend_web_chat_past_fifteen_minutes() {
+        let f = Fixture::new(UserRole::Admin).await;
+        let path = f.home.path().join("agents/worker/agent.toml");
+        let mut table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        table.insert("runtime".into(), toml::Value::Table(
+            toml::from_str("provider='claude'\ntimeout_secs=3600").unwrap()));
+        std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+        assert_eq!(crate::runtime_config::claude_timeout_secs(f.home.path(), Some(path.parent().unwrap())), 3600);
+        let state = f.state();
+        let broker = state.chat.approvals.clone().unwrap();
+        let sid = session_id(&f.user, "worker", "thread");
+        let mut seam = crate::agent_channels::e2e_seam::arm_waiting(f.home.path());
+        let (connection, mut rx) = f.connection(f.input());
+        let (_incoming_tx, mut incoming) = mpsc::channel(1);
+        let user = f.user.clone();
+        let worker = tokio::spawn(async move {
+            run::execute(&state, &broker, &user, "worker", &sid, "timeout-turn", "hello",
+                connection, &mut incoming, &AtomicBool::new(false)).await
+        });
+        assert_eq!(frame(&mut rx).await["type"], "RUN_STARTED");
+        let _blocked_turn = tokio::time::timeout(Duration::from_secs(30), seam.entered.recv()).await.unwrap().unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(899)).await;
+        tokio::task::yield_now().await;
+        assert!(!worker.is_finished());
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let event = frame(&mut rx).await;
+        assert_eq!(event["code"], "run_timeout", "{event}");
+        assert!(!worker.await.unwrap());
+    }
+}

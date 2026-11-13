@@ -8,6 +8,8 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { formatError, toast } from '@/lib/toast';
+import { seatLimitOf } from '@/lib/seat-limit';
+import { SeatLimitNotice } from '@/components/shared/SeatLimitNotice';
 import {
   ActorAvatar, Badge, Button, Card, CardContent, CardHeader, CardTitle, Checkbox,
   CollectionPageHeader, CollectionPageState, Dialog, DialogContent, DialogDescription,
@@ -72,7 +74,7 @@ export function TemplatesPage() {
     setCopyPreview(null);
     return () => { reviewRequest.current++; };
   }, [mode, name, description, agent, detail, members, skills, allowed, denied, displayName, department, boundUsers]);
-  const [result, setResult] = useState<{ success: boolean; agents: string[]; warning?: string; error?: string | null } | null>(null);
+  const [result, setResult] = useState<{ success: boolean; agents: string[]; warning?: string; error?: string | null; seat_limit?: unknown } | null>(null);
 
   const load = useCallback(async () => {
     if (!isAdmin) return;
@@ -172,7 +174,7 @@ export function TemplatesPage() {
         });
         setResult(applied);
         // A partial team has committed employees. Never retry the whole batch.
-        if (applied.warning) toast.info(t(applied.warning === 'template_changed' ? 'templates.templateChanged' : applied.warning === 'binding_failed' ? 'templates.bindingFailed' : 'templates.creationFailed'));
+        if (applied.warning) toast.info(t(applied.warning === 'template_changed' ? 'templates.templateChanged' : applied.warning === 'binding_failed' ? 'templates.bindingFailed' : applied.warning === 'seat_limit' ? 'agents.seatLimit.title' : 'templates.creationFailed'));
         void fetchAgents().catch(() => {});
         return;
       }
@@ -281,8 +283,9 @@ export function TemplatesPage() {
           <DialogHeader><DialogTitle>{t(`templates.${mode ?? 'edit'}`)}</DialogTitle><DialogDescription>{t(mode === 'apply' ? 'templates.applyHelp' : 'templates.copyHelp')}</DialogDescription></DialogHeader>
           {result ? (
             <div className="space-y-4" role="status">
-              <p>{t(result.success ? 'templates.applied' : 'templates.partial')}</p>
-              {result.error && <p role="alert" className="whitespace-pre-wrap break-words text-sm text-destructive">{result.error}</p>}
+              {!(result.warning === 'seat_limit' && result.agents.length === 0) && <p>{t(result.success ? 'templates.applied' : 'templates.partial')}</p>}
+              {seatLimitOf(result.seat_limit) ? <SeatLimitNotice info={seatLimitOf(result.seat_limit)!} />
+                : result.error && <p role="alert" className="whitespace-pre-wrap break-words text-sm text-destructive">{result.error}</p>}
               {result.warning === 'template_changed' && <p role="alert">{t('templates.templateChanged')}</p>}
               <ul className="space-y-2">{result.agents.map((id) => <li key={id}><Link className="inline-flex items-center gap-2 text-brand underline" to={`/agents/${encodeURIComponent(id)}`}><ActorAvatar actorType="agent" name={id} />{id}</Link></li>)}</ul>
             </div>

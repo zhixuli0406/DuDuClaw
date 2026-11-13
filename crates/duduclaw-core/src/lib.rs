@@ -5,6 +5,7 @@ pub mod agent_guard;
 pub mod agent_names;
 pub mod agent_profile;
 pub mod agent_rename;
+pub mod agent_seats;
 pub mod agent_trash;
 pub mod agent_toml;
 pub mod appliance;
@@ -113,8 +114,8 @@ pub use delegation_policy::{
     can_delegate, can_delegate_ext, can_delegate_rules, can_delegate_rules_ext,
     delegation_rules_from_home, is_ancestor as is_org_ancestor, is_reserved_agent_id,
     is_reserved_queue_sender, is_system_sender,
-    policy_from_home as delegation_policy_from_home, require_identity_token_from_home,
-    resolve_allow_pairs, DelegationConfig,
+    policy_from_home as delegation_policy_from_home, read_delegation_config,
+    require_identity_token_from_home, resolve_allow_pairs, DelegationConfig, DelegationConfigRead,
     DelegationDenied, DelegationPolicy, DelegationRules, DenyReason as DelegationDenyReason,
     MapOrgView, OrgNode, OrgView, ACP_CLIENT_SENDER, MAX_ANCESTOR_HOPS, RESERVED_QUEUE_SENDERS,
     STANDALONE_CLIENT_PREFIX, SYSTEM_SENDERS,
@@ -193,7 +194,7 @@ pub use takeover_state::{
     BeginOutcome as TakeoverBeginOutcome, BeginRequest as TakeoverBeginRequest, TakeoverConfig,
     TakeoverRecord,
 };
-pub use text_utils::{truncate_bytes, truncate_chars};
+pub use text_utils::{plain_line, truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
 pub use tool_error_reason::{
     ensure_error_reason, ensure_error_reason_with, is_malformed_frame, lacks_error_reason,

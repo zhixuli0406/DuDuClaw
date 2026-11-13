@@ -259,6 +259,7 @@ pub mod channel_decision_route;
 // W2-4 notification governance: the gate every outbound notification passes
 // through (levels + quiet hours + deferred queue), its action-rate telemetry,
 // and the scheduled daily digest.
+pub mod autopilot_approval;
 pub mod autopilot_engine;
 pub mod autopilot_notify;
 pub mod autopilot_screen;
@@ -287,6 +288,7 @@ pub mod notify_stats;
 pub mod posture_watch;
 pub mod premium_templates;
 pub mod company_templates;
+pub mod agent_persona;
 pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;

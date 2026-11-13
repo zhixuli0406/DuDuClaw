@@ -206,6 +206,15 @@ async fn actual_shared_channel_pipeline_uses_effective_agent_and_never_implicit_
                 provider.as_str()
             );
             assert_eq!(row["runtime_failure"]["steps"][0]["reason"], "AuthFailed");
+            let history = context.session_manager.webchat_history("discord:owned").await.unwrap();
+            let notice = history.iter().find(|m| m.notice_kind.as_deref() == Some("turn_failure")).unwrap();
+            let turn = notice.client_msg_id.as_deref().unwrap().strip_prefix("turn_failure:").unwrap();
+            context.session_manager.record_turn_failure("discord:owned", turn, TurnFailureReason::Internal, None, None).await.unwrap();
+            let history = context.session_manager.webchat_history("discord:owned").await.unwrap();
+            assert_eq!(history.iter().filter(|m| m.notice_kind.as_deref() == Some("turn_failure")).count(), 1);
+            assert_eq!(notice.message.content, TurnFailureReason::Unavailable.text(None));
+            assert!(!notice.message.content.contains("/login"));
+            assert!(context.session_manager.get_messages("discord:owned").await.unwrap().iter().all(|m| m.role != "assistant"));
         }
     }
 }
@@ -300,4 +309,21 @@ fn local_moa_and_api_failure_metadata_never_claim_claude_cli_origin() {
         assert!(failure.claude_auth_error().is_none());
         assert!(!failure.message("Worker", home.path()).contains("/login"));
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn webchat_provider_failure_is_typed_and_persists_only_one_vocabulary_notice() {
+    let (_home, ctx, _registry, _calls) = owned_channel(RuntimeType::Codex).await;
+    let sid = "webchat:provider-failure";
+    let (_, reason) = track_failure_reason(build_guarded_reply_for_agent(
+        "普通訊息", &ctx, "worker", sid, "owner", None,
+    )).await;
+    assert_eq!(reason, Some(TurnFailureReason::Unknown));
+    let rows = ctx.session_manager.webchat_history(sid).await.unwrap();
+    let notice = rows.iter().find(|r| r.notice_kind.as_deref() == Some("turn_failure")).unwrap();
+    let turn = notice.client_msg_id.as_deref().unwrap().strip_prefix("turn_failure:").unwrap();
+    ctx.session_manager.record_turn_failure(sid, turn, TurnFailureReason::Internal, None, None).await.unwrap();
+    assert_eq!(ctx.session_manager.webchat_history(sid).await.unwrap().iter().filter(|r| r.notice_kind.as_deref() == Some("turn_failure")).count(), 1);
+    assert_eq!(notice.message.content, TurnFailureReason::Unavailable.text(None));
+    assert!(ctx.session_manager.get_messages(sid).await.unwrap().iter().all(|m| m.role == "user"));
 }

@@ -63,7 +63,8 @@ const BINARIES: &[&str] = &[
 
 /// Skip CLI options without treating their values as subcommands. `--home`
 /// is retained for wrapper/edition compatibility; the CLI's current global
-/// value option is `--redact`. Unknown flags are conservatively skipped.
+/// value options include `--redact` and the licence `--home-check` option.
+/// Unknown flags are conservatively skipped.
 fn skip_options(words: &[String], mut at: usize) -> usize {
     while let Some(word) = words.get(at) {
         if word == "--" {
@@ -72,7 +73,7 @@ fn skip_options(words: &[String], mut at: usize) -> usize {
         if !word.starts_with('-') {
             break;
         }
-        at += if matches!(word.as_str(), "--home" | "--redact") {
+        at += if matches!(word.as_str(), "--home" | "--redact" | "--home-check") {
             2
         } else {
             1

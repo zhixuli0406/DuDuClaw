@@ -59,7 +59,7 @@ where
     if value.is_wrong_type() {
         static WRONG_TYPE_WARNING: std::sync::Once = std::sync::Once::new();
         WRONG_TYPE_WARNING.call_once(|| {
-            tracing::warn!("[runtime] timeout_secs must be integer seconds; using 300s for wrong-typed settings");
+            tracing::warn!("[runtime] timeout_secs must be integer seconds; using the runtime default for wrong-typed settings");
         });
     }
     Ok(value.value())
@@ -141,6 +141,134 @@ pub fn default_can_create_agents(role: Option<&str>) -> bool {
 /// [`default_can_create_agents`].
 pub fn effective_can_create_agents(explicit: Option<bool>, role: Option<&str>) -> bool {
     explicit.unwrap_or_else(|| default_can_create_agents(role))
+}
+
+/// The four `[permissions]` flags the MCP dispatch gate enforces.
+pub const GATED_PERMISSION_FLAGS: [&str; 4] = [
+    "can_create_agents",
+    "can_send_cross_agent",
+    "can_schedule_tasks",
+    "can_modify_own_skills",
+];
+
+impl PermissionsSectionView {
+    /// Does the dispatch gate let this flag through? Only an explicit
+    /// `false` refuses — for `can_create_agents` that includes the
+    /// role-resolved value [`load_permissions_checked`] writes in. An unknown
+    /// flag name is refused (fail closed).
+    pub fn allows(&self, flag: &str) -> bool {
+        let value = match flag {
+            "can_create_agents" => self.can_create_agents,
+            "can_send_cross_agent" => self.can_send_cross_agent,
+            "can_schedule_tasks" => self.can_schedule_tasks,
+            "can_modify_own_skills" => self.can_modify_own_skills,
+            _ => return false,
+        };
+        value != Some(false)
+    }
+}
+
+/// `[permissions]` with nothing written: every flag absent except
+/// `can_create_agents`, which resolves by role — with no identifiable role it
+/// is `false`.
+pub fn unwritten_permissions() -> PermissionsSectionView {
+    PermissionsSectionView {
+        can_create_agents: Some(effective_can_create_agents(None, None)),
+        ..Default::default()
+    }
+}
+
+/// The `[permissions]` the MCP dispatch gate enforces for the employee in
+/// `agent_dir`, with `can_create_agents` already resolved by role (v1.81 S2).
+///
+/// RM-137 M2: the text that actually takes effect is read ONCE and the same
+/// text is both strictly type-checked and parsed — the preset-resolved
+/// artifact (`<home>/agent_resolved/<id>.toml`) when it exists, else
+/// `agent.toml` (the same choice [`load`] makes). Fail closed (`Err`: the gate
+/// refuses every permission-gated tool) when:
+///
+/// - the chosen file exists but cannot be read, or does not parse as TOML;
+/// - `[permissions]` is not a table, or one of the four gated flags is not
+///   `true`/`false`;
+/// - a preset binding is declared for this agent in
+///   `<home>/preset_bindings.toml` and the resolved artifact is missing — the
+///   raw `agent.toml` is never used in its place;
+/// - the resolved artifact exists but cannot be read (it is never silently
+///   replaced by `agent.toml`);
+/// - `<home>/preset_bindings.toml` itself cannot be read or validated (it
+///   cannot then be told whether a binding is declared).
+///
+/// No branch falls back to the permissive defaults. A missing `agent.toml`
+/// with no binding reads as "nothing written" ([`unwritten_permissions`]).
+/// One reader for the gate (`mcp_dispatch`), `agents.inspect` and
+/// `delegation.effective`, so the dashboard shows what the gate applies.
+pub fn load_permissions_checked(agent_dir: &Path) -> Result<PermissionsSectionView, String> {
+    let bound = match (
+        crate::preset::agent_home_dir(agent_dir),
+        agent_dir.file_name().and_then(|n| n.to_str()),
+    ) {
+        (Some(home), Some(id)) => crate::preset::load_bindings_checked(&home)
+            .map_err(|e| format!("preset_bindings.toml unreadable: {e}"))?
+            .contains(id),
+        _ => false,
+    };
+    let resolved = match resolved_override_path(agent_dir) {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if bound {
+                    return Err(
+                        "a preset binding is declared but its resolved permission file is missing"
+                            .to_string(),
+                    );
+                }
+                None
+            }
+            Err(e) => return Err(format!("resolved permission file unreadable: {e}")),
+        },
+        None => None,
+    };
+    let (text, source) = match resolved {
+        Some(text) => (text, "resolved permission file"),
+        None => match std::fs::read_to_string(agent_dir.join("agent.toml")) {
+            Ok(t) => (t, "agent.toml"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(unwritten_permissions());
+            }
+            Err(e) => return Err(format!("agent.toml unreadable: {e}")),
+        },
+    };
+    permissions_from_text(&text).map_err(|e| format!("{source}: {e}"))
+}
+
+/// Strict type check + parse of one `agent.toml`-shaped text (the half of
+/// [`load_permissions_checked`] that never touches the filesystem).
+fn permissions_from_text(text: &str) -> Result<PermissionsSectionView, String> {
+    let table: toml::Table = text.parse().map_err(|_| "does not parse".to_string())?;
+    if let Some(p) = table.get("permissions") {
+        let p = p.as_table().ok_or("[permissions] is not a table")?;
+        for k in GATED_PERMISSION_FLAGS {
+            if p.get(k).is_some_and(|v| !v.is_bool()) {
+                return Err(format!("[permissions] {k} is not true/false"));
+            }
+        }
+    }
+    if let Some(a) = table.get("agent")
+        && !a.is_table()
+    {
+        return Err("[agent] is not a table".to_string());
+    }
+    // The same text, never a re-read and never the all-defaults fallback of
+    // [`parse`].
+    let sections: AgentTomlSections = toml::Value::Table(table)
+        .try_into()
+        .map_err(|_| "sections do not parse".to_string())?;
+    let mut perms = sections.permissions;
+    perms.can_create_agents = Some(effective_can_create_agents(
+        perms.can_create_agents,
+        sections.agent.as_ref().and_then(|a| a.role.as_deref()),
+    ));
+    Ok(perms)
 }
 
 /// The `[agent]` identity keys the former shadow readers consumed.
@@ -1014,6 +1142,89 @@ model = \"gpt-5.5\"
             Some("codex"),
             "must prefer the resolved artifact once it exists"
         );
+    }
+
+    /// RM-137 M2: the permission gate reads the text that takes effect once
+    /// and type-checks that same text; a malformed resolved artifact denies
+    /// instead of falling back to permissive defaults or to `agent.toml`.
+    #[test]
+    fn permissions_follow_the_resolved_artifact_and_fail_closed_on_it() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let home = home_tmp.path();
+        let agent_dir = home.join("agents").join("bob");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // The raw file allows; it is NOT what takes effect once an artifact exists.
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[agent]\nrole = \"main\"\n[permissions]\ncan_send_cross_agent = true\n",
+        )
+        .unwrap();
+        let resolved = crate::preset::agent_resolved_path(home, "bob");
+        std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+
+        // A valid artifact is what the gate enforces.
+        std::fs::write(&resolved, "[agent]\nrole = \"worker\"\n[permissions]\ncan_send_cross_agent = false\n")
+            .unwrap();
+        let p = load_permissions_checked(&agent_dir).unwrap();
+        assert!(!p.allows("can_send_cross_agent"));
+        assert!(!p.allows("can_create_agents"), "role comes from the same text");
+
+        // Malformed artifacts deny — never the defaults that allow.
+        for bad in [
+            "[permissions\ncan_send_cross_agent = false\n",
+            "permissions = 5\n",
+            "[permissions]\ncan_send_cross_agent = \"no\"\n",
+            "[permissions]\ncan_schedule_tasks = 0\n",
+            "agent = \"main\"\n",
+            "[agent]\nrole = \"main\"\n[budget]\nhard_stop = true\n[heartbeat]\nenabled = [1]\n[runtime]\nprovider = 1\n[permissions]\ncan_create_agents = {}\n",
+        ] {
+            std::fs::write(&resolved, bad).unwrap();
+            assert!(load_permissions_checked(&agent_dir).is_err(), "{bad:?}");
+        }
+    }
+
+    /// RM-137 M2: a declared preset binding with no resolved artifact denies;
+    /// an unbound agent keeps reading its own `agent.toml`; an unreadable
+    /// binding store denies.
+    #[test]
+    fn a_declared_binding_without_its_resolved_artifact_denies() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let home = home_tmp.path();
+        let agent_dir = home.join("agents").join("bob");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[agent]\nrole = \"main\"\n[permissions]\ncan_send_cross_agent = true\n",
+        )
+        .unwrap();
+        // Unbound, no artifact: the raw file takes effect.
+        let p = load_permissions_checked(&agent_dir).unwrap();
+        assert!(p.allows("can_send_cross_agent"));
+        assert!(p.allows("can_create_agents"));
+
+        // Bound, artifact missing: deny, never the raw file.
+        std::fs::write(
+            crate::preset::bindings_path(home),
+            "schema = 1\n[agents.bob]\npreset_id = \"p\"\nversion = \"1\"\ncontent_sha256 = \"h\"\n",
+        )
+        .unwrap();
+        let err = load_permissions_checked(&agent_dir).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+        // Another, unbound agent in the same home is unaffected.
+        let other = home.join("agents").join("amy");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent.toml"), "[permissions]\ncan_send_cross_agent = true\n").unwrap();
+        assert!(load_permissions_checked(&other).unwrap().allows("can_send_cross_agent"));
+
+        // Bound, artifact present and valid: it takes effect.
+        let resolved = crate::preset::agent_resolved_path(home, "bob");
+        std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+        std::fs::write(&resolved, "[permissions]\ncan_send_cross_agent = false\n").unwrap();
+        assert!(!load_permissions_checked(&agent_dir).unwrap().allows("can_send_cross_agent"));
+
+        // A binding store that cannot be validated: deny.
+        std::fs::write(crate::preset::bindings_path(home), "schema = 2\n").unwrap();
+        assert!(load_permissions_checked(&agent_dir).is_err());
     }
 
     /// Non-standard layouts (ephemeral scaffolds, ad-hoc dirs) must not guess

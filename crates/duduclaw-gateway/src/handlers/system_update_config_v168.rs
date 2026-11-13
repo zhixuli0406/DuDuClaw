@@ -164,6 +164,7 @@ pub(crate) fn apply_v168_keys(table: &mut toml::Table, params: &Value) -> Result
     apply_simple_bools(table, params, &mut out)?;
     apply_judge_model(table, params, &mut out)?;
     apply_global_utility(table, params, &mut out)?;
+    apply_run_review_limits(table, params, &mut out)?;
     apply_telemetry(table, params, &mut out)?;
     apply_sandbox(table, params, &mut out)?;
     apply_computer_use(table, params, &mut out)?;
@@ -227,6 +228,35 @@ fn apply_global_utility(table: &mut toml::Table, params: &Value, out: &mut V168O
         set_or_clear_str(table, &["runtime"], "utility_model", if v.trim().is_empty() { "" } else { v }, out)?;
         out.applied_immediate = true;
     }
+    Ok(())
+}
+
+fn apply_run_review_limits(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
+    for (section, key, min, max) in [
+        ("runtime", "max_timeout_secs", 60, 14_400),
+        ("goal_defaults", "assign_schedule_max_active", 0, 200),
+        ("goal_defaults", "assign_schedule_min_interval_minutes", 60, 10_080),
+        ("agent_files", "review_daily_limit", 0, 100_000),
+        ("agent_files", "review_daily_limit_per_user", 0, 100_000),
+        ("agent_files", "review_daily_limit_per_agent", 0, 100_000),
+        ("agent_files", "checks_per_minute", 1, 1_000),
+        ("agent_files", "max_pending_per_user", 1, 200),
+    ] {
+        if let Some(v) = u64_param(params, &format!("{section}.{key}"), min, max)? {
+            set_int(table, &[section], key, v, out)?;
+            out.applied_immediate = true;
+        }
+    }
+    let key = "runtime.default_timeout_secs";
+    if params.get("runtime").and_then(|r| r.get("default_timeout_secs")).or_else(|| params.get(key)).is_some_and(Value::is_null) {
+        table_at_mut(table, &["runtime"])?.remove("default_timeout_secs");
+        out.changes.push(format!("{key} cleared"));
+        out.applied_immediate = true;
+    } else if let Some(v) = u64_param(params, key, 30, 14_400)? {
+        set_int(table, &["runtime"], "default_timeout_secs", v, out)?;
+        out.applied_immediate = true;
+    }
+    crate::runtime_config::TimeoutPolicy::from_table(table)?;
     Ok(())
 }
 
@@ -866,4 +896,23 @@ mod chat_credential_config_tests {
             assert!(apply_v168_keys(&mut toml::Table::new(), &json!({"security.chat_credentials":value})).is_err());
         }
     }
+
+    #[test]
+    fn run_limits_write_only_requested_keys_and_reject_short_schedules() {
+        let mut table = toml::Table::new();
+        let out = apply_v168_keys(&mut table, &json!({"goal_defaults": {
+            "assign_schedule_max_active": 30, "assign_schedule_min_interval_minutes": 120
+        }, "agent_files": {"max_pending_per_user": 2}, "runtime": {"max_timeout_secs": 7200, "default_timeout_secs": 600}})).unwrap();
+        assert!(out.applied_immediate);
+        assert_eq!(table["goal_defaults"]["assign_schedule_min_interval_minutes"].as_integer(), Some(120));
+        assert_eq!(table["agent_files"]["max_pending_per_user"].as_integer(), Some(2));
+        apply_v168_keys(&mut table, &json!({"runtime":{"default_timeout_secs":null}})).unwrap();
+        assert!(table["runtime"].get("default_timeout_secs").is_none());
+        for params in [json!({"goal_defaults.assign_schedule_min_interval_minutes":59}),
+            json!({"agent_files.max_pending_per_user":201}), json!({"runtime.max_timeout_secs":14401}),
+            json!({"runtime.default_timeout_secs":7201})] {
+            assert!(apply_v168_keys(&mut table.clone(), &params).is_err(), "{params}");
+        }
+    }
+
 }

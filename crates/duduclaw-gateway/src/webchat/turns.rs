@@ -54,6 +54,7 @@ struct Entry {
 pub(super) struct Ticket {
     registry: Arc<Registry>,
     pub id: String,
+    pub admission_generation: Option<String>,
     pub cancel: CancellationToken,
     pub delivery_cancel: CancellationToken,
     principal: String,
@@ -132,6 +133,7 @@ impl Registry {
         );
         Ok(Ticket {
             registry: self.clone(),
+            admission_generation: None,
             id,
             cancel,
             delivery_cancel,
@@ -524,14 +526,35 @@ pub(super) use outbound::{outbound_channel, SocketSender};
 pub(super) async fn execute(input: TurnInput, sink: TurnSink, mut ticket: Ticket) {
     let state = input.state.clone();
     let sid = input.sid.clone();
+    let turn_id = ticket.id.clone();
+    let admission_generation = ticket.admission_generation.clone();
     // Keep the FIFO ticket alive through panic notice persistence.
-    supervise(&sink, execute_inner(input, sink.clone(), &mut ticket), || async {
-        persist_failure(&state.ctx.session_manager, &sid, "Internal turn error").await;
+    crate::channel_reply::FAILURE_SESSION.scope(Arc::new(std::sync::Mutex::new(None)), async {
+        supervise(&sink, execute_inner(input, sink.clone(), &mut ticket), || async {
+            persist_admitted_failure(&state.ctx.session_manager, &state.ctx.home_dir, &sid, &turn_id, crate::channel_reply::TurnFailureReason::Internal, admission_generation.as_deref()).await;
+        }).await;
     }).await;
 }
 
-async fn persist_failure(sessions: &crate::session::SessionManager, sid: &str, text: &str) {
-    if let Err(error) = sessions.record_webchat_failure(sid, text).await {
+async fn persist_failure(
+    sessions: &crate::session::SessionManager, home: &std::path::Path, _sid: &str, turn: &str,
+    reason: crate::channel_reply::TurnFailureReason,
+) {
+    persist_admitted_failure(sessions, home, _sid, turn, reason, None).await;
+}
+
+async fn persist_admitted_failure(
+    sessions: &crate::session::SessionManager, home: &std::path::Path, admitted_sid: &str, turn: &str,
+    reason: crate::channel_reply::TurnFailureReason, admission_generation: Option<&str>,
+) {
+    // No fallback to the current session: before binding there is no stored
+    // question for this turn. In particular /new must not receive an old error.
+    let Some((sid, generation, agent)) = crate::channel_reply::failure_session() else { return; };
+    if sid == admitted_sid && admission_generation.is_some_and(|expected| expected != generation) { return; }
+    let sid = sid.as_str();
+    if sessions.session_agent(sid).await.ok().flatten().as_deref() != Some(agent.as_str()) { return; }
+    let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home, &agent).await;
+    if let Err(error) = sessions.record_turn_failure(sid, turn, reason, language.as_deref(), Some(&generation)).await {
         warn!(%error, "WebChat failure notice persistence failed");
     }
 }
@@ -722,6 +745,14 @@ async fn finish_cancel(
         let entry = entries.get(&ticket.id).unwrap();
         (entry.cancel_request_id.clone(), entry.cancel_cause, entry.user.clone())
     };
+    if result.is_ok() && ticket.started.load(Ordering::Acquire) {
+        let reason = if cause == CancelCause::Person {
+            crate::channel_reply::TurnFailureReason::Cancelled
+        } else {
+            crate::channel_reply::TurnFailureReason::SafetyGate
+        };
+        persist_admitted_failure(sessions, home, sid, &ticket.id, reason, ticket.admission_generation.as_deref()).await;
+    }
     let lineage_principal = ticket.lineage_principal.clone()
         .unwrap_or_else(|| downstream::lineage_principal(home, &user, sid));
     let offer = if cause == CancelCause::CredentialRevoked {

@@ -254,6 +254,19 @@ pub(crate) fn format_fallback_message(
     reason: FailureReason,
     home_dir: &Path,
 ) -> String {
+    let dir = home_dir.join("agents").join(agent_name);
+    let timeout_secs = crate::runtime_config::claude_timeout_secs(home_dir, Some(&dir));
+    format_fallback_message_with_timeout(agent_name, reason, home_dir, timeout_secs)
+}
+
+pub(super) fn format_fallback_message_with_timeout(
+    agent_name: &str, reason: FailureReason, home_dir: &Path, timeout_secs: u64,
+) -> String {
+    let duration = if timeout_secs % 60 == 0 {
+        format!("{} 分鐘", timeout_secs / 60)
+    } else {
+        format!("{timeout_secs} 秒")
+    };
     let body = match reason {
         FailureReason::BinaryMissing => format!(
             "{agent_name} 暫時無法回應：系統找不到 Claude Code CLI。\n\
@@ -276,8 +289,8 @@ pub(crate) fn format_fallback_message(
              請於 Anthropic Console 儲值，或在儀表板切換到其他有效帳號。"
         ),
         FailureReason::Timeout => format!(
-            "{agent_name} 這次處理逾時（已達 30 分鐘安全上限）。\n\
-             請重新送出訊息，或將任務拆成較小的步驟。"
+            "{agent_name} 這次處理逾時（已達 {duration}安全上限）。\n\
+             請重新送出訊息，或將任務拆成較小的步驟。需要延長上限時，請洽管理員。"
         ),
         FailureReason::SpawnError => format!(
             "{agent_name} 啟動 Claude Code 子程序失敗。\n\

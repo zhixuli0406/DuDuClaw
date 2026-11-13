@@ -158,6 +158,7 @@ still reaches the real gates, which accept or refuse it under the existing rules
 | `[knowledge] enabled` + collection grants | `config.toml` / `knowledge.db` / `agent.toml [knowledge] collections` | 4 `knowledge_*` tools hidden unless the knowledge base is on and at least one collection is granted to the employee or its department (after `[knowledge] collections` narrowing); a grant change sends `list_changed` (see [`knowledge_*`](#knowledge_--document-knowledge-base) below) |
 | `[responsibilities] enabled` | `config.toml` | 3 `responsibility_*` tools hidden (see [responsibility tools](#responsibility_get--responsibility_followup--responsibility_ask--responsibility-tools) below) |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
+| Team role membership (v1.82) | `agents/.ephemeral/eph-*` scaffold whose `[team_member]` names the same parent as its `ephemeral.toml`, plus a token-verified identity (`DUDUCLAW_AGENT_TOKEN`) | `team_handoff` hidden from every other caller, under every delegation policy; an ordinary employee therefore sees one tool fewer than before. The handler refuses the same callers with `not_a_team_member` |
 
 The machine-operation console (`/console`) is available only to administrators. Machine-operation tools used by a `system_operator` employee also verify on the server that the person requesting them is an active administrator; ordinary chat with other AI employees remains available according to existing access rules.
 
@@ -301,7 +302,7 @@ effect table the dispatch gate and `action_rules` use
 Memory, wiki, user-profile and `code_map` tools also say `openWorldHint: false`;
 `memory_alias_add`, `wiki_export` and `wiki_rebuild_fts` say
 `idempotentHint: true`. The overlays live in
-`crates/duduclaw-cli/src/mcp/tools_def/annotations.rs`.
+`crates/duduclaw-core/src/mcp_tool_defs/annotations.rs`.
 
 The hints are for the MCP client (for example, whether it asks before a call).
 They never authorize anything: every DuDuClaw gate still runs on the call. They
@@ -318,7 +319,7 @@ build the model's tool list from name, description and input schema only.
 
 ### `tasks_create` — per-goal run limit
 
-`tasks_create` with `kind="goal"` (not scheduled) accepts `timeout_secs`, an integer from 30 to 3600: the limit for each CLI run / API request of that goal's rounds, replacing the assignee's own run limit. Over MCP it can only be shorter than or equal to that limit; giving a goal more time is an Admin decision on the dashboard. Claude employees ignore it (fixed 30-minute limit). `tasks_update` refuses the field. Example: `{"kind":"goal","title":"Reconcile the ledger","assigned_to":"anna","timeout_secs":180}`.
+`tasks_create` with `kind="goal"` (not scheduled) accepts `timeout_secs`, an integer from 30 to 3600: the limit for each CLI run / API request of that goal's rounds, replacing the assignee's own run limit. Over MCP it can only be shorter than or equal to that limit; giving a goal more time is an Admin decision on the dashboard. Claude employees also obey it; execution is capped by the current global `[runtime] max_timeout_secs`. `tasks_update` refuses the field. Example: `{"kind":"goal","title":"Reconcile the ledger","assigned_to":"anna","timeout_secs":180}`.
 
 ### `office_script` — bundled office scripts
 
@@ -555,6 +556,27 @@ terminal. Over HTTP with a non-internal key, both tools act as that key's own
 client id. Details:
 [Delegation isolation](../features/37-delegation-isolation.md#a-removed-employees-name-stays-reserved).
 
+### `create_agent` — persona and seats (v1.82.0)
+
+The persona goes in `soul_md` (`soul` is the older alias; an empty value counts
+as not sent, and two non-empty values with different text are an error). It
+passes the same SOUL.md scan as template creation, and a rejected persona or a
+failed SOUL.md write refuses the whole call with nothing left on disk; the
+refusal names the reason (HTML comment, invisible characters, hidden content,
+prompt-injection phrasing) without quoting the text. Arguments the tool does
+not read are not rejected; the reply lists them under "Ignored arguments (no
+effect)" (at most 20 names, each cut to 64 characters, then "… and N more").
+The licence seat check counts every employee whose status is not `deleted`
+(archived employees still count); when it refuses, the reply gives only the
+limit and the number of seats in use — it does not list who holds them (an
+administrator sees that list in the dashboard). The check and the creation are
+one step under a lock shared with the dashboard and the pack importer, so
+concurrent creates cannot together exceed the limit. An employee cannot change
+its own `[agent] status` with its file tools, and `agent_update` refuses a
+`status` change for an archived or deleted employee; archive, restore and
+delete are dashboard actions. To change a persona later, see
+[Change an employee's persona after creation](dashboard-settings.md#change-an-employees-persona-after-creation-v1820).
+
 ### `responsibility_get` / `responsibility_followup` / `responsibility_ask` — responsibility tools
 
 The three tools for [continuous responsibilities](continuous-responsibilities.md).
@@ -674,7 +696,7 @@ Third-party MCP keys leave the employee's config files. `.mcp.json` stores `secr
 
 A built-in slot must use exactly `duduclaw`, `duduclaw-pro` or the current instance key; `duduclaw-evil` is a third-party server. Rewriting replaces the entire built-in definition with the host's current canonical entry, including after MCP key rotation or an executable change. A forged built-in command cannot survive into that effective config. Raw proxy invocations remain forbidden under every name, and third-party entries cannot carry proxy-private env. Claude's existing no-flags behavior remains when no proxy purpose is active or the file contains only built-in slots; the ordinary built-in preparation path still owns their repair. Copied fork configs always regenerate built-in slots, including when gates are off, because a source project may not have passed employee preparation. Secret reads require a valid `DUDUCLAW_AGENT_TOKEN` HMAC for the store owner, even with lenient delegation settings; a default agent cannot authorize a read.
 
-The proxy resolves references for its own employee only, immediately before starting the upstream server. Missing, invalid or undecryptable references prevent that server from starting; the error names the server and variable, never the value. A config requiring secret resolution cannot fall back to direct Claude/Grok loading if proxy rewriting fails. Exports retain environment names with empty placeholders, so the importer must enter values again.
+The proxy resolves references for its own employee only, immediately before starting the upstream server. It proves that employee with the `DUDUCLAW_AGENT_TOKEN` the host puts into the proxy's entry of the per-spawn MCP config (Claude, an owner-only temp file removed when the CLI exits) or into the spawn environment (Codex, Grok, openai-compat); the employee's `.mcp.json` never holds it for a proxy, and the upstream server never receives it. Missing, invalid or undecryptable references prevent that server from starting; the error names the server and variable, never the value. A config requiring secret resolution cannot fall back to direct Claude/Grok loading if proxy rewriting fails. Exports retain environment names with empty placeholders, so the importer must enter values again.
 
 At gateway boot, legacy literal env values are migrated after an encrypted backup is saved to `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc`. The encrypted store is written and read back before the config is replaced atomically. Every stage waits for a parent-directory fsync barrier in this order: key, encrypted backup, store, config. A failed stage aborts that employee; failure after config replacement restores the original bytes. If restoration also fails, the error is reported and the durable encrypted backup is retained for recovery. Migration continues with other employees; at most three migration backups are retained per employee after cleanup; an I/O failure is logged and cleanup is retried on the next sweep. Deleting a server or employee removes its store entries. Restoring a deleted employee requires re-entering its keys.
 

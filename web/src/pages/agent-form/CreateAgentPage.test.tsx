@@ -101,7 +101,67 @@ describe('CreateAgentPage', () => {
     );
   });
 
-  async function submitAgentCreateFailure(message: string | Error) {
+  it('sends the optional persona as soul_md on the blank path (RM-146)', async () => {
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Basics')).toBeInTheDocument());
+
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText('coder'), 'coder');
+    await user.type(screen.getByPlaceholderText('Coder'), 'Coder');
+    await user.selectOptions(screen.getByLabelText('Model'), 'opus');
+    await user.type(screen.getByLabelText('Persona (optional)'), 'I answer product questions.');
+    await user.click(screen.getByRole('button', { name: 'Create Agent' }));
+
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith(
+        'agents.create',
+        expect.objectContaining({ name: 'coder', soul_md: 'I answer product questions.' }),
+      ),
+    );
+    const params = mockWsClient.call.mock.calls.find(([m]) => m === 'agents.create')?.[1] as Record<string, unknown>;
+    expect(params).not.toHaveProperty('soul');
+  });
+
+  it('omits soul_md when the persona is left empty', async () => {
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Basics')).toBeInTheDocument());
+
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText('coder'), 'coder');
+    await user.type(screen.getByPlaceholderText('Coder'), 'Coder');
+    await user.selectOptions(screen.getByLabelText('Model'), 'opus');
+    await user.type(screen.getByLabelText('Persona (optional)'), '   ');
+    await user.click(screen.getByRole('button', { name: 'Create Agent' }));
+
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('agents.create', expect.anything()));
+    const params = mockWsClient.call.mock.calls.find(([m]) => m === 'agents.create')?.[1] as Record<string, unknown>;
+    expect(params).not.toHaveProperty('soul_md');
+  });
+
+  it('lists the employees holding seats when the seat limit refuses the create (RM-149)', async () => {
+    await submitAgentCreateFailure({
+      code: 'agent_seat_limit_reached',
+      message: '個人版最多可建立 2 個 AI 員工。',
+      max: 2,
+      current: 2,
+      adding: 1,
+      seat_holders: [
+        { id: 'helper', display_name: 'Helper', status: 'active' },
+        { id: 'old-bot', display_name: 'Old bot', status: 'archived' },
+      ],
+    });
+
+    const list = screen.getByRole('list', { name: 'AI staff currently holding a seat' });
+    expect(list).toHaveTextContent('helper');
+    expect(list).toHaveTextContent('Helper');
+    expect(list).toHaveTextContent('old-bot');
+    expect(list).toHaveTextContent('Archived');
+    expect(screen.getByText('Your license allows 2; 2 seats are in use.')).toBeInTheDocument();
+    expect(screen.getByText('個人版最多可建立 2 個 AI 員工。')).toBeInTheDocument();
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+  });
+
+  async function submitAgentCreateFailure(message: string | Error | Record<string, unknown>) {
     mockWsClient.call.mockImplementation((method) => {
       if (method === 'agents.create') return Promise.reject(message);
       return Promise.resolve({

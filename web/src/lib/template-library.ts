@@ -47,5 +47,9 @@ export const templateLibrary = {
   save: (params: { reviewed: true; id: string; revision: number; name: string; description: string; skills: string[]; allowed_tools: string[]; denied_tools: string[]; members?: Array<{ id: string; edit: { name: string; description: string; skills: string[]; allowed_tools: string[]; denied_tools: string[] } }> }) =>
     client.call('templates.save', params) as Promise<LibraryTemplateDetail>,
   apply: (params: { reviewed: true; id: string; revision?: number; name: string; display_name: string; department: string; bound_users: string[] }) =>
-    client.call('templates.apply', params) as Promise<{ success: boolean; agents: string[]; warning?: string; error?: string | null }>,
+    client.call('templates.apply', params) as Promise<{
+      success: boolean; agents: string[]; warning?: string; error?: string | null;
+      /** RM-149: present with `warning: 'seat_limit'` — the structured seat refusal. */
+      seat_limit?: unknown;
+    }>,
 };

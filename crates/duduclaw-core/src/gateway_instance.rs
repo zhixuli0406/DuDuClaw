@@ -92,13 +92,29 @@ fn acquire_inner(home: &Path, record_refusal: bool) -> Result<(), String> {
             .write(true)
             .open(lock_path(home))
             .map_err(|e| e.to_string())?;
-        file.try_lock_exclusive().map_err(|_| {
-            let holder = std::fs::read_to_string(holder_path(home)).unwrap_or_default();
-            format!(
-                "another gateway already runs on this data directory ({})",
-                holder.trim()
-            )
-        })?;
+        // A read-only probe may briefly hold a shared lock. Give it time to
+        // finish before refusing this gateway (five attempts over 250 ms).
+        for attempt in 0..5 {
+            match file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) => {
+                    let contended = error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error();
+                    if contended && attempt < 4 {
+                        std::thread::sleep(std::time::Duration::from_micros(62_500));
+                        continue;
+                    }
+                    if !contended {
+                        return Err(error.to_string());
+                    }
+                    let holder = std::fs::read_to_string(holder_path(home)).unwrap_or_default();
+                    return Err(format!(
+                        "another gateway already runs on this data directory ({})",
+                        holder.trim()
+                    ));
+                }
+            }
+        }
         // The holder line goes to the sidecar (see the module doc): readers
         // on Windows cannot see bytes inside the locked file.
         std::fs::write(
@@ -146,19 +162,30 @@ pub fn held(home: &Path) -> bool {
 /// Whether some process currently holds `home`'s gateway lock (checked from
 /// another process, e.g. `duduclaw doctor`).
 pub fn locked_elsewhere(home: &Path) -> bool {
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(lock_path(home))
-    else {
-        return false;
+    probe(home).unwrap_or(false)
+}
+
+/// Probe whether the gateway lock exists and is held, without creating files.
+/// Open read-only and briefly share the lock, never taking an exclusive lock.
+/// `None` means the lock could not be inspected for a reason other than absence.
+pub fn probe(home: &Path) -> Option<bool> {
+    let file = match OpenOptions::new().read(true).open(lock_path(home)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
     };
-    match file.try_lock_exclusive() {
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return None,
+    }
+    match fs2::FileExt::try_lock_shared(&file) {
         Ok(()) => {
             let _ = fs2::FileExt::unlock(&file);
-            false
+            Some(false)
         }
-        Err(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Some(true),
+        Err(_) => None,
     }
 }
 
@@ -178,6 +205,56 @@ pub fn status(home: &Path) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_reports_absent_unlocked_and_exclusively_held_locks() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(probe(home.path()), Some(false));
+        assert!(!lock_path(home.path()).exists());
+        std::fs::create_dir_all(home.path().join("locks")).unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path(home.path()))
+            .unwrap();
+        assert_eq!(probe(home.path()), Some(false));
+        assert!(!locked_elsewhere(home.path()));
+        file.try_lock_exclusive().unwrap();
+        assert_eq!(probe(home.path()), Some(true));
+        assert!(locked_elsewhere(home.path()));
+        fs2::FileExt::unlock(&file).unwrap();
+        assert_eq!(probe(home.path()), Some(false));
+    }
+
+    #[test]
+    fn probe_reports_unknown_when_lock_path_is_a_directory() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("locks/gateway.lock")).unwrap();
+
+        assert_eq!(probe(home.path()), None);
+    }
+
+    #[test]
+    fn acquire_waits_for_a_brief_shared_probe_without_recording_refusal() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("locks")).unwrap();
+        std::fs::File::create(lock_path(home.path())).unwrap();
+        let reader = OpenOptions::new().read(true).open(lock_path(home.path())).unwrap();
+        fs2::FileExt::try_lock_shared(&reader).unwrap();
+        // Concurrent probes can share the same read-only lock.
+        assert_eq!(probe(home.path()), Some(false));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            fs2::FileExt::unlock(&reader).unwrap();
+        });
+        let result = acquire(home.path());
+        release.join().unwrap();
+        result.unwrap();
+        assert!(held(home.path()));
+        assert!(!refused_marker_path(home.path()).exists());
+    }
 
     #[test]
     fn a_new_home_is_registered_under_its_created_path() {
@@ -243,9 +320,11 @@ mod tests {
             .open(lock_path(c.path()))
             .unwrap();
         first.try_lock_exclusive().unwrap();
+        assert_eq!(probe(c.path()), Some(true));
         let err = acquire(c.path()).unwrap_err();
         assert!(err.contains("another gateway"), "{err}");
         assert!(!held(c.path()));
+        assert_eq!(probe(c.path()), Some(true));
         assert!(status(c.path()).1.unwrap().contains("another gateway"));
         drop(first);
         // A forked test child can briefly retain an inherited copy of the flock until exec.

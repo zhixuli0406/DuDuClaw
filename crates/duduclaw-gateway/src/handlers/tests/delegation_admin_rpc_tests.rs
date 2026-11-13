@@ -134,8 +134,10 @@ async fn get_reports_warnings_for_bad_values() {
             .await,
     );
 
-    // Unknown policy falls back to the stricter default.
-    assert_eq!(data["policy"], json!("department"));
+    // RM-137: an unknown policy is enforced (and shown) as `none`; the raw
+    // value is reported alongside.
+    assert_eq!(data["policy"], json!("none"));
+    assert_eq!(data["configured_policy"], json!("anarchy"));
     // ["b","a"] is the same unordered pair as ["a","b"] ⇒ deduped.
     assert_eq!(data["allow"], json!([["a", "b"]]));
     let warnings = data["warnings"].as_array().unwrap();
@@ -463,6 +465,385 @@ async fn set_rejects_ambiguous_agent_name_and_names_it() {
         !home.path().join("config.toml").exists(),
         "rejected payload must not be partially written"
     );
+}
+
+// ── RM-137 ──────────────────────────────────────────────────────────────────
+
+/// `none` is a valid value: persisted and read back, pairs kept.
+#[tokio::test]
+async fn set_accepts_none_and_keeps_pairs() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    seed_agent(home.path(), "warehouse-lead", "warehouse");
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let frame = handler
+        .handle(
+            "delegation.set",
+            json!({ "policy": "none", "allow": [["sales-lead", "warehouse-lead"]] }),
+            &admin_ctx(),
+        )
+        .await;
+    assert!(frame_ok(&frame), "{frame:?}");
+    let data = frame_data(&handler.handle("delegation.get", json!({}), &admin_ctx()).await);
+    assert_eq!(data["policy"], json!("none"));
+    assert_eq!(data["allow"], json!([["sales-lead", "warehouse-lead"]]));
+    assert_eq!(data["warnings"], json!([]));
+}
+
+/// An unparsable config.toml: `delegation.set` refuses and writes nothing
+/// (the file is byte-identical afterwards, no audit row); `delegation.get`
+/// is an error rather than defaults the dashboard could save back.
+#[tokio::test]
+async fn broken_config_is_never_overwritten_and_get_reports_it() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    let broken = "[general\ndefault_agent = \"kiki\"\n[delegation]\npolicy = \"hierarchy\"\n";
+    std::fs::write(home.path().join("config.toml"), broken).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    for params in [
+        json!({ "policy": "department", "allow": [] }),
+        json!({ "policy": "none" }),
+        json!({ "allow": [] }),
+    ] {
+        let frame = handler.handle("delegation.set", params.clone(), &admin_ctx()).await;
+        assert!(!frame_ok(&frame), "{params} must be refused: {frame:?}");
+        assert!(frame_error(&frame).contains("TOML"), "{frame:?}");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            broken,
+            "a refused save must not touch the file"
+        );
+    }
+    let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();
+    assert!(!audit.contains("delegation_config_changed"), "{audit}");
+
+    let frame = handler.handle("delegation.get", json!({}), &admin_ctx()).await;
+    assert!(!frame_ok(&frame), "get must not return defaults: {frame:?}");
+}
+
+fn employee_ctx() -> UserContext {
+    UserContext {
+        role: UserRole::Employee,
+        user_id: "e1".to_string(),
+        email: "e1@test.local".to_string(),
+        ..manager_ctx()
+    }
+}
+
+/// `delegation.effective` — global policy, source, pairs naming the
+/// employee, and the inactive pairs under `none`.
+#[tokio::test]
+async fn effective_reports_global_policy_and_pairs() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    seed_agent(home.path(), "warehouse-lead", "warehouse");
+    seed_agent(home.path(), "intern", "sales");
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[delegation]\npolicy = \"hierarchy\"\nallow = [[\"sales-lead\", \"warehouse-lead\"]]\n",
+    )
+    .unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    let data = frame_data(
+        &handler
+            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+            .await,
+    );
+    assert_eq!(data["policy"], json!("hierarchy"));
+    assert_eq!(data["source"], json!("global"));
+    assert_eq!(data["global_policy"], json!("hierarchy"));
+    assert_eq!(data["may_delegate"], json!(true));
+    // seed_agent writes can_create_agents = false.
+    assert_eq!(data["may_create_agents"], json!(false));
+    assert_eq!(data["allow_pairs"], json!([["sales-lead", "warehouse-lead"]]));
+    assert_eq!(data["inactive_allow_pairs"], json!([]));
+    assert_eq!(data["config_error"], Value::Null);
+
+    // A pair not naming the employee is not listed for it.
+    let data = frame_data(
+        &handler
+            .handle("delegation.effective", json!({ "agent_id": "intern" }), &admin_ctx())
+            .await,
+    );
+    assert_eq!(data["allow_pairs"], json!([]));
+
+    // Under `none` the same pair is reported as inactive.
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[delegation]\npolicy = \"none\"\nallow = [[\"sales-lead\", \"warehouse-lead\"]]\n",
+    )
+    .unwrap();
+    let data = frame_data(
+        &handler
+            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+            .await,
+    );
+    assert_eq!(data["policy"], json!("none"));
+    assert_eq!(data["source"], json!("global"));
+    assert_eq!(data["may_delegate"], json!(false));
+    assert_eq!(data["allow_pairs"], json!([]));
+    assert_eq!(data["inactive_allow_pairs"], json!([["sales-lead", "warehouse-lead"]]));
+}
+
+/// RM-137 L1: the other end of an allow pair is named only when the viewer
+/// may view it; otherwise it is masked and only counted. Applies to the
+/// inactive list under `none` too.
+#[test]
+fn effective_masks_pair_peers_the_viewer_cannot_view() {
+    use crate::handlers::delegation_rpc::{HIDDEN_PEER_PLACEHOLDER, effective_delegation_json};
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    seed_agent(home.path(), "warehouse-lead", "warehouse");
+    seed_agent(home.path(), "private-bot", "ops");
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[delegation]\npolicy = \"hierarchy\"\n\
+         allow = [[\"sales-lead\", \"warehouse-lead\"], [\"private-bot\", \"sales-lead\"]]\n",
+    )
+    .unwrap();
+    let dir = home.path().join("agents/sales-lead");
+    let only_warehouse = |peer: &str| peer == "warehouse-lead";
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &only_warehouse, false);
+    assert_eq!(
+        data["allow_pairs"],
+        json!([["sales-lead", "warehouse-lead"], [HIDDEN_PEER_PLACEHOLDER, "sales-lead"]])
+    );
+    assert_eq!(data["hidden_allow_pairs"], json!(1));
+    assert_eq!(data["hidden_inactive_allow_pairs"], json!(0));
+    assert!(!data.to_string().contains("private-bot"), "{data}");
+
+    // Nothing visible: both peers masked, the employee itself still named.
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &|_| false, false);
+    assert_eq!(data["hidden_allow_pairs"], json!(2));
+    assert!(!data.to_string().contains("warehouse-lead"), "{data}");
+
+    // Under `none` the masked pairs move to the inactive list with their count.
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[delegation]\npolicy = \"none\"\nallow = [[\"private-bot\", \"sales-lead\"]]\n",
+    )
+    .unwrap();
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &|_| false, false);
+    assert_eq!(data["inactive_allow_pairs"], json!([[HIDDEN_PEER_PLACEHOLDER, "sales-lead"]]));
+    assert_eq!(data["hidden_inactive_allow_pairs"], json!(1));
+    assert_eq!(data["hidden_allow_pairs"], json!(0));
+    assert!(!duduclaw_core::is_valid_agent_id(HIDDEN_PEER_PLACEHOLDER));
+}
+
+/// RM-137 re-review L: a malformed / self `[delegation] allow` entry names
+/// employees verbatim in its warning. A Manager viewer of `sales-lead` —
+/// with view access to it only — receives just `allow_warning_count`, never
+/// the text (here naming `private-bot`, unrelated to `sales-lead` and not
+/// viewable); an Admin viewer receives the texts. `delegation.get`
+/// (Admin-only) keeps the full warnings.
+#[tokio::test]
+async fn effective_returns_allow_warning_text_only_to_an_admin() {
+    use crate::handlers::delegation_rpc::effective_delegation_json;
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    seed_agent(home.path(), "private-bot", "ops");
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[delegation]\npolicy = \"hierarchy\"\n\
+         allow = [[\"private-bot\", \"private-bot\"], [\"private-bot\"]]\n",
+    )
+    .unwrap();
+    let dir = home.path().join("agents/sales-lead");
+    let mut manager = manager_ctx();
+    manager
+        .agent_access
+        .insert("sales-lead".to_string(), AccessLevel::Viewer);
+    assert!(!manager.has_role(UserRole::Admin));
+    let data = effective_delegation_json(
+        home.path(),
+        &dir,
+        "sales-lead",
+        &|peer: &str| manager.has_agent_access(peer, AccessLevel::Viewer),
+        manager.has_role(UserRole::Admin),
+    );
+    assert_eq!(data["allow_warning_count"], json!(2), "{data}");
+    assert!(data.get("allow_warnings").is_none(), "{data}");
+    assert!(data.get("warnings").is_none(), "{data}");
+    assert!(!data.to_string().contains("private-bot"), "{data}");
+
+    let admin = admin_ctx();
+    assert!(admin.has_role(UserRole::Admin));
+    let data = effective_delegation_json(
+        home.path(),
+        &dir,
+        "sales-lead",
+        &|peer: &str| admin.has_agent_access(peer, AccessLevel::Viewer),
+        admin.has_role(UserRole::Admin),
+    );
+    assert_eq!(data["allow_warning_count"], json!(2), "{data}");
+    let texts = data["allow_warnings"].as_array().unwrap();
+    assert_eq!(texts.len(), 2, "{data}");
+    assert!(texts.iter().any(|w| w.as_str().unwrap_or("").contains("private-bot")), "{data}");
+
+    // Through the RPC as Admin (the live-context path), and `delegation.get`.
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let data = frame_data(
+        &handler
+            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+            .await,
+    );
+    assert_eq!(data["allow_warning_count"], json!(2), "{data}");
+    assert_eq!(data["allow_warnings"].as_array().map(Vec::len), Some(2), "{data}");
+    let data = frame_data(&handler.handle("delegation.get", json!({}), &admin_ctx()).await);
+    assert_eq!(data["warnings"].as_array().map(Vec::len), Some(2), "{data}");
+}
+
+/// The employee's own `can_send_cross_agent = false` makes it `none` for
+/// that employee, with the source saying so.
+#[tokio::test]
+async fn effective_reports_the_employee_switch_as_source() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    // After construction: the v1.68 boot migration resets unmarked `false`
+    // flags, and the RPC re-reads agent.toml on every call anyway.
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let path = home.path().join("agents/sales-lead/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("can_send_cross_agent = true"), "{raw}");
+    std::fs::write(&path, raw.replace("can_send_cross_agent = true", "can_send_cross_agent = false")).unwrap();
+    let data = frame_data(
+        &handler
+            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+            .await,
+    );
+    assert_eq!(data["policy"], json!("none"));
+    assert_eq!(data["source"], json!("agent_permissions"));
+    assert_eq!(data["global_policy"], json!("department"));
+    assert_eq!(data["permissions"]["can_send_cross_agent"], json!(false));
+}
+
+/// Unknown value and unparsable config: enforced as `none`, surfaced as
+/// `policy_warning` / `config_error`.
+#[tokio::test]
+async fn effective_surfaces_unknown_value_and_config_error() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy = \"closed\"\n").unwrap();
+    let data = frame_data(
+        &handler
+            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+            .await,
+    );
+    assert_eq!(data["policy"], json!("none"));
+    assert_eq!(data["configured_policy"], json!("closed"));
+    assert!(data["policy_warning"].as_str().is_some_and(|w| w.contains("closed")), "{data}");
+    assert_eq!(data["config_error"], Value::Null);
+
+    std::fs::write(home.path().join("config.toml"), "[delegation\npolicy = \"open\"\n").unwrap();
+    let data = frame_data(
+        &handler
+            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+            .await,
+    );
+    assert_eq!(data["policy"], json!("none"));
+    assert_eq!(data["global_policy"], json!("none"));
+    assert_eq!(data["config_error"], json!("unparsable"), "{data}");
+    // Admin viewer: the zh-TW detail as well.
+    assert!(data["config_error_detail"].as_str().is_some_and(|e| e.contains("TOML")), "{data}");
+}
+
+/// RM-137 re-review: a config problem reaches a non-Admin viewer only as a
+/// category (`config_error`), never as text — the TOML parse excerpt and the
+/// `[permissions]` reader's error can quote raw config. An Admin viewer also
+/// gets `config_error_detail`.
+#[test]
+fn effective_returns_config_error_text_only_to_an_admin() {
+    use crate::handlers::delegation_rpc::effective_delegation_json;
+    const MARKER: &str = "SECRET-CONFIG-MARKER";
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    let dir = home.path().join("agents/sales-lead");
+
+    // Unparsable config.toml whose offending line carries the marker.
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("[delegation-{MARKER}\npolicy = \"open\"\n"),
+    )
+    .unwrap();
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &|_| true, false);
+    assert_eq!(data["policy"], json!("none"), "{data}");
+    assert_eq!(data["config_error"], json!("unparsable"), "{data}");
+    assert!(data.get("config_error_detail").is_none(), "{data}");
+    assert!(!data.to_string().contains(MARKER), "{data}");
+    assert!(!data.to_string().contains("TOML"), "{data}");
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &|_| true, true);
+    assert_eq!(data["config_error"], json!("unparsable"), "{data}");
+    assert!(data["config_error_detail"].as_str().is_some_and(|e| !e.is_empty()), "{data}");
+
+    // Unreadable config.toml (a directory where the file should be).
+    std::fs::remove_file(home.path().join("config.toml")).unwrap();
+    std::fs::create_dir(home.path().join("config.toml")).unwrap();
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &|_| true, false);
+    assert_eq!(data["config_error"], json!("unreadable"), "{data}");
+    assert!(data.get("config_error_detail").is_none(), "{data}");
+    std::fs::remove_dir(home.path().join("config.toml")).unwrap();
+
+    // Readable config, unreadable `[permissions]` in the employee's agent.toml.
+    std::fs::write(dir.join("agent.toml"), format!("[permissions\n{MARKER} = 1\n")).unwrap();
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &|_| true, false);
+    assert_eq!(data["config_error"], json!("permissions_unreadable"), "{data}");
+    assert!(data.get("config_error_detail").is_none(), "{data}");
+    assert!(!data.to_string().contains(MARKER), "{data}");
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &|_| true, true);
+    assert_eq!(data["config_error"], json!("permissions_unreadable"), "{data}");
+    assert!(data["config_error_detail"].as_str().is_some_and(|e| !e.is_empty()), "{data}");
+
+    // No problem: null for everyone, and the Admin detail is null too.
+    seed_agent(home.path(), "sales-lead", "sales");
+    let data = effective_delegation_json(home.path(), &dir, "sales-lead", &|_| true, true);
+    assert_eq!(data["config_error"], Value::Null, "{data}");
+    assert_eq!(data["config_error_detail"], Value::Null, "{data}");
+}
+
+/// Read-only and gated: an Employee-role account and a Manager with no
+/// access to the employee are refused; nothing is written.
+#[tokio::test]
+async fn effective_is_gated_and_read_only() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    for ctx in [employee_ctx(), manager_ctx()] {
+        let frame = handler
+            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &ctx)
+            .await;
+        assert!(!frame_ok(&frame), "{:?} must be refused: {frame:?}", ctx.role);
+    }
+    let frame = handler
+        .handle("delegation.effective", json!({ "agent_id": "ghost" }), &admin_ctx())
+        .await;
+    assert!(!frame_ok(&frame), "{frame:?}");
+    assert!(!home.path().join("config.toml").exists(), "a read must not create config");
+}
+
+/// `agents.inspect.effective_permissions` reports what the MCP gate applies:
+/// the stored flags, and every flag off when agent.toml is unreadable.
+#[test]
+fn effective_permissions_use_the_gate_reader() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    let dir = home.path().join("agents/sales-lead");
+    let p = duduclaw_core::agent_toml::load_permissions_checked(&dir).unwrap();
+    assert!(!p.allows("can_create_agents"));
+    assert!(p.allows("can_send_cross_agent"));
+    assert!(!p.allows("can_schedule_tasks"));
+    // Unwritten can_create_agents on a non-main employee resolves to false.
+    std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"sales-lead\"\nrole = \"specialist\"\n").unwrap();
+    let p = duduclaw_core::agent_toml::load_permissions_checked(&dir).unwrap();
+    assert!(!p.allows("can_create_agents"));
+    assert!(p.allows("can_send_cross_agent"));
+    std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"sales-lead\"\nrole = \"main\"\n").unwrap();
+    assert!(duduclaw_core::agent_toml::load_permissions_checked(&dir).unwrap().allows("can_create_agents"));
+    std::fs::write(dir.join("agent.toml"), "[permissions]\ncan_send_cross_agent = \"yes\"\n").unwrap();
+    assert!(duduclaw_core::agent_toml::load_permissions_checked(&dir).is_err());
 }
 
 /// The escape hatch: typing the directory name directly — never

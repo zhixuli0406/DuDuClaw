@@ -389,7 +389,9 @@ fn render(
     let attachments = Regex::new(r"(?mi)^[^\r\n]*(?:📎(?:DELIVER:|\s*已生成檔案[：:])|!?\[[^\]\r\n]*\]\(|file://|attachment://|<img\b)[^\r\n]*$").map_err(|e| e.to_string())?;
     for row in rows
         .iter()
-        .filter(|r| r.role == "user" || r.role == "assistant")
+        // Only the SQL reader can promote a display notice to this marker;
+        // ordinary stored system/control rows remain excluded.
+        .filter(|r| r.role == "user" || r.role == "assistant" || r.role == "turn_failure")
     {
         let sender = row
             .content
@@ -397,7 +399,9 @@ fn render(
             .and_then(|s| s.split_once("]\n"))
             .map(|(id, _)| id)
             .unwrap_or("");
-        let sender_label = if row.role == "assistant" {
+        let sender_label = if row.role == "turn_failure" {
+            String::new()
+        } else if row.role == "assistant" {
             agent.to_owned()
         } else if let Some(label) = labels.get(sender) {
             label.clone()
@@ -448,6 +452,15 @@ fn render(
             &mut out.masked_counts,
             &salt,
         )?;
+        // NFKC is required for masking, but Chinese fixed notices must retain
+        // their vocabulary punctuation. Restore it only in unmasked text parts.
+        if row.role == "turn_failure" && clean.contains('，') {
+            for part in &mut parts {
+                if let Part::Text { v } = part {
+                    *v = v.replace(',', "，");
+                }
+            }
+        }
         // Truncate only complete parts after all sensitive spans are removed.
         let mut chars = 0;
         parts.retain_mut(|part| {
@@ -464,7 +477,7 @@ fn render(
             true
         });
         out.messages.push(Message {
-            role: row.role.clone(),
+            role: if row.role == "turn_failure" { "system".into() } else { row.role.clone() },
             sender_label,
             parts,
             timestamp: row.timestamp.clone(),

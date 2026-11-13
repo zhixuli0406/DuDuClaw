@@ -235,7 +235,7 @@ If `provider` is absent, the agent runs on Claude. An unrecognised value logs a 
 
 ### Execution time limit and background models
 
-`agent.toml [runtime] timeout_secs` sets the per-run limit for Codex, Grok and other CLI runtimes, and the per-request limit for OpenAI-compatible APIs (plain, streaming and tool-loop requests). It defaults to **300 seconds** and accepts integers from **30 to 3600**. Claude keeps its separate fixed **30-minute safety limit**; this setting does not change it. A manually edited integer outside that range is clamped with a warning; a wrong-typed value is ignored with a warning and uses 300 seconds. The dashboard rejects invalid values when saving. This is separate from the container task timeout.
+`agent.toml [runtime] timeout_secs` sets the per-run limit for Codex, Grok and other CLI runtimes, and the per-request limit for OpenAI-compatible APIs (plain, streaming and tool-loop requests). This also applies to Claude. Without an employee or global override, Claude defaults to **1800 seconds** and other runtimes to **300 seconds**. Values start at **30 seconds** and are bounded by `[runtime] max_timeout_secs` (default **3600**, configurable from **60 to 14400**); `[runtime] default_timeout_secs` optionally replaces the runtime default. A manually edited integer outside that range is clamped with a warning; a wrong-typed value is ignored with a warning and uses the runtime/global default. The dashboard rejects invalid values when saving. This is separate from the container task timeout.
 
 Increasing the effective `timeout_secs` requires an administrator. An Owner may lower it; clearing the setting restores 300 seconds and needs an administrator only when that increases the current effective limit.
 

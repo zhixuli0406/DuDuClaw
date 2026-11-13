@@ -1,4 +1,4 @@
-import { useState, type ComponentType, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { useAuthStore } from '@/stores/auth-store';
@@ -52,6 +52,13 @@ import { parseKnowledgeQuarantine, type KnowledgeQuarantineView } from './knowle
 import { WorkflowActivationFacts } from './WorkflowActivationFacts';
 import { AgentFileChangeFacts } from './AgentFileChangeFacts';
 import { OrgChangeFacts } from './OrgChangeFacts';
+import {
+  MAX_FROZEN_PAYLOAD_BYTES,
+  parseAutopilotAction,
+  payloadBytes,
+  type AutopilotActionCard,
+} from './autopilot-action-payload';
+import { visibleEscapes } from '@/lib/visible-escapes';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
 
@@ -502,7 +509,10 @@ export function ApprovalDetailPanel({
 }: {
   approval: ApprovalItem;
   agentName?: string;
-  onApprove: () => void;
+  /** `expectedDigest`: the review digest of the card the view rendered
+   *  (autopilot actions always pass it; the parent sends it as
+   *  `expected_digest`). */
+  onApprove: (expectedDigest?: string) => void;
   onReject: () => void;
   /** Called after a self-contained (skill_create) decision succeeds, so the
    *  parent can remove the decided row without issuing a second decide. */
@@ -532,6 +542,17 @@ export function ApprovalDetailPanel({
       );
     }
     // Missing artifact → fall through to the generic view.
+  }
+  // ── v1.82 autopilot rule action: the complete frozen action, always ──
+  if (approval.kind === 'autopilot_action') {
+    return (
+      <AutopilotActionApprovalView
+        approval={approval}
+        onApprove={onApprove}
+        onReject={onReject}
+        decideError={decideError}
+      />
+    );
   }
 
   return (
@@ -823,6 +844,204 @@ function GenericApprovalView({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+// ── v1.82 autopilot_action approval view ─────────────────────
+
+/** Serialization slack between the gateway's canonical JSON and the
+ *  browser's `JSON.stringify` when re-checking the size limit. */
+const PAYLOAD_SLACK_BYTES = 1024;
+
+/** A payload string with every hidden/control character shown as a visible
+ *  `\u{…}` code (`visibleEscapes`). Never truncated. */
+function Escaped({ value, mono }: { value: string; mono?: boolean }) {
+  return (
+    <span className={cn('min-w-0 whitespace-pre-wrap break-all text-right', mono && 'font-mono text-xs')}>
+      {visibleEscapes(value).text}
+    </span>
+  );
+}
+
+function localTime(value: string | number | null | undefined): string | null {
+  if (value == null || value === '') return null;
+  const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleString();
+}
+
+/**
+ * The dedicated view of an `autopilot_action` card (H1): the complete frozen
+ * action — full prompt (skill body included for `run_skill`) or full message
+ * and its destination, target employee, lane, source employee, triggering
+ * event reference, rule name and full revision digest, decision deadline and
+ * latest execution time. Nothing is truncated: long content scrolls. Hidden
+ * and control characters are shown as visible codes. Approve stays disabled
+ * until the complete content is in the DOM, and sends the review digest of
+ * exactly the card that was rendered.
+ */
+function AutopilotActionApprovalView({
+  approval,
+  onApprove,
+  onReject,
+  decideError,
+}: {
+  approval: ApprovalItem;
+  onApprove: (expectedDigest?: string) => void;
+  onReject: () => void;
+  decideError?: unknown;
+}) {
+  const intl = useIntl();
+  const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
+  const card: AutopilotActionCard | null = useMemo(() => parseAutopilotAction(approval.payload), [approval.payload]);
+  const tooLarge = useMemo(
+    () => payloadBytes(approval.payload) > MAX_FROZEN_PAYLOAD_BYTES + PAYLOAD_SLACK_BYTES,
+    [approval.payload],
+  );
+  const content = useMemo(() => (card ? visibleEscapes(card.content) : null), [card]);
+  const digest = typeof approval.digest === 'string' && approval.digest !== '' ? approval.digest : null;
+  const contentRef = useRef<HTMLPreElement>(null);
+  // The digest of the card whose complete content is in the DOM right now.
+  const [renderedDigest, setRenderedDigest] = useState<string | null>(null);
+  useEffect(() => {
+    const shown = contentRef.current?.textContent ?? null;
+    setRenderedDigest(card && content && !tooLarge && digest && shown === content.text ? digest : null);
+  }, [card, content, tooLarge, digest]);
+  const canApprove = renderedDigest !== null && renderedDigest === digest;
+  const blockedReason = !card
+    ? 'approval.autopilot.unavailable'
+    : tooLarge
+      ? 'approval.autopilot.tooLarge'
+      : !digest
+        ? 'approval.autopilot.noDigest'
+        : !canApprove
+          ? 'approval.autopilot.notReady'
+          : null;
+  const contentLabel = card
+    ? card.actionType === 'notify' || card.actionType === 'proactive_notify'
+      ? 'approval.autopilot.content.notify'
+      : `approval.autopilot.content.${card.actionType}`
+    : null;
+  const decideBy = localTime(approval.expires_at ?? null);
+  const latest = localTime(card?.latestExecutionAt ?? null);
+  const windowMinutes = Math.round((card?.executionWindowSecs ?? 900) / 60);
+
+  return (
+    <div className="flex h-full min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4" data-testid="autopilot-action-view">
+        <Section title={t('approval.autopilot.title')}>
+          <div className="space-y-2 rounded-lg bg-muted p-3">
+            <p className="text-sm text-foreground">{t('approval.autopilot.intro')}</p>
+          </div>
+        </Section>
+
+        {card && content && !tooLarge ? (
+          <>
+            <Section title={t('approval.autopilot.rule')}>
+              <Row label={t('approval.autopilot.rule')}><Escaped value={card.ruleName} /></Row>
+              <Row label={t('approval.autopilot.ruleRevision')}><Escaped value={card.ruleHash} mono /></Row>
+              <Row label={t('approval.autopilot.event')}><Escaped value={card.event} mono /></Row>
+              <Row label={t('approval.autopilot.eventRef')}><Escaped value={card.eventRef} mono /></Row>
+              {card.sourceAgent && (
+                <Row label={t('approval.autopilot.sourceAgent')}><Escaped value={card.sourceAgent} mono /></Row>
+              )}
+            </Section>
+
+            <Section title={t('approval.autopilot.actionType')}>
+              <Row label={t('approval.autopilot.actionType')}>
+                <span>{t(`approval.autopilot.action.${card.actionType}`)}</span>
+              </Row>
+              {card.targetAgent !== undefined && (
+                <Row label={t('approval.autopilot.targetAgent')}><Escaped value={card.targetAgent} mono /></Row>
+              )}
+              {card.skillName !== undefined && (
+                <Row label={t('approval.autopilot.skill')}><Escaped value={card.skillName} mono /></Row>
+              )}
+              {card.lane && <Row label={t('approval.autopilot.lane')}><Escaped value={card.lane} mono /></Row>}
+              {card.channel !== undefined && (
+                <Row label={t('approval.autopilot.channel')}><Escaped value={card.channel} mono /></Row>
+              )}
+              {card.chatId !== undefined && (
+                <Row label={t('approval.autopilot.chatId')}><Escaped value={card.chatId} mono /></Row>
+              )}
+            </Section>
+
+            <Section title={contentLabel ? t(contentLabel) : ''}>
+              <pre
+                ref={contentRef}
+                data-testid="autopilot-action-content"
+                className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 text-xs"
+                tabIndex={0}
+              >
+                {content.text}
+              </pre>
+              <p className="text-xs text-muted-foreground">
+                {t('approval.autopilot.contentLength', { count: Array.from(card.content).length })}
+              </p>
+              {content.escaped > 0 && (
+                <p
+                  role="alert"
+                  data-testid="autopilot-action-escaped"
+                  className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-foreground"
+                >
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-warning" aria-hidden="true" />
+                  {t('approval.autopilot.escaped', { count: content.escaped, example: '\\u{202E}' })}
+                </p>
+              )}
+            </Section>
+
+            <Section title={t('approval.autopilot.latestExecution')}>
+              {decideBy && <Row label={t('approval.autopilot.decideBy')}>{decideBy}</Row>}
+              {latest && (
+                <Row label={t('approval.autopilot.latestExecution')}>
+                  <span data-testid="autopilot-latest-execution">{latest}</span>
+                </Row>
+              )}
+              <p className="pt-1 text-xs text-muted-foreground">
+                {t('approval.autopilot.window', { minutes: windowMinutes })}
+              </p>
+            </Section>
+          </>
+        ) : null}
+
+        {blockedReason && (
+          <p
+            role={blockedReason === 'approval.autopilot.notReady' ? undefined : 'alert'}
+            data-testid="autopilot-action-blocked"
+            className="rounded-lg border p-3 text-sm"
+          >
+            {t(blockedReason)}
+          </p>
+        )}
+
+        {decideError != null && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+          >
+            <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+            <div className="min-w-0 space-y-0.5">
+              <p className="font-medium">{t('approval.decide.failed')}</p>
+              <p className="whitespace-pre-wrap break-words">{formatErrorDetail(decideError) || formatError(decideError)}</p>
+            </div>
+          </div>
+        )}
+      </div>
+      <div data-testid="approval-actions" className="z-10 flex shrink-0 items-center gap-2 border-t border-surface-border bg-surface py-3">
+        <Button
+          variant="brand"
+          onClick={() => {
+            if (canApprove && renderedDigest) onApprove(renderedDigest);
+          }}
+          disabled={!canApprove}
+          className="flex-1"
+        >
+          {t('inbox.approval.approve')}
+        </Button>
+        <Button variant="destructive" onClick={onReject} className="flex-1">
+          {t('inbox.approval.reject')}
+        </Button>
+      </div>
     </div>
   );
 }

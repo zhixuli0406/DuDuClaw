@@ -142,6 +142,9 @@ export type OrgChartAgent = Pick<AgentInfo, 'name' | 'role'> & Partial<Pick<Agen
   'display_name' | 'status' | 'icon' | 'reports_to' | 'department'>>;
 
 export interface AgentDetail extends AgentInfo {
+  timeout_authorization_ceiling_secs?: number;
+  effective_timeout_secs?: number;
+  max_timeout_secs?: number;
   budget: AgentBudget;
   model: AgentModel;
   sandbox_enabled?: boolean;
@@ -928,15 +931,67 @@ export interface CredentialInventoryReport {
 }
 
 // ── Delegation permissions (WP21 §2.8) ──
-/** How the gateway decides whether one AI staffer may hand work to another. */
-export type DelegationPolicy = 'department' | 'hierarchy' | 'open';
+/** How the gateway decides whether one AI staffer may hand work to another.
+ *  `none` (v1.82, RM-137): no AI employee delegates to another; an
+ *  unrecognised value or an unreadable config is enforced as `none` too. */
+export type DelegationPolicy = 'department' | 'hierarchy' | 'open' | 'none';
 
 export interface DelegationSettings {
+  /** The policy the gateway enforces (an unrecognised value reads `none`). */
   policy: DelegationPolicy;
+  /** The value as written in config.toml, when present (v1.82+). */
+  configured_policy?: string | null;
   /** Unordered agent-id pairs — a pair permits delegation in both directions. */
   allow: Array<[string, string]>;
   /** Operator-facing notes about values the gateway had to fall back on. */
   warnings: string[];
+}
+
+/** `delegation.effective.config_error` categories (v1.82, RM-137). */
+export type DelegationConfigError = 'unreadable' | 'unparsable' | 'permissions_unreadable' | 'unknown';
+
+/** `delegation.effective` (v1.82, RM-137) — what applies to one employee. */
+export interface DelegationEffective {
+  agent_id: string;
+  /** Effective for this employee: `none` when the global policy or its own switch stops it. */
+  policy: DelegationPolicy;
+  /** Whether `policy` comes from the global setting or the employee's own `can_send_cross_agent`. */
+  source: 'global' | 'agent_permissions';
+  global_policy: DelegationPolicy;
+  configured_policy: string | null;
+  /** Set when the configured policy value was not recognised (enforced as `none`). */
+  policy_warning: string | null;
+  /**
+   * Set when config.toml or this employee's agent.toml could not be read or
+   * parsed — a category only, never config text (it can quote raw config).
+   */
+  config_error: DelegationConfigError | null;
+  /** The zh-TW detail of `config_error` — sent to an Admin viewer only; may quote raw config. */
+  config_error_detail?: string | null;
+  /**
+   * How many `[delegation] allow` entries the gateway dropped as malformed.
+   * The only allow-warning information a non-Admin viewer receives (the
+   * texts quote the raw entries, which may name employees the viewer cannot
+   * view); an Admin reviews them in Settings › Delegation (`delegation.get`).
+   */
+  allow_warning_count?: number;
+  /** The warning texts themselves — sent to an Admin viewer only. */
+  allow_warnings?: string[];
+  may_delegate: boolean;
+  may_create_agents: boolean;
+  permissions: { can_send_cross_agent: boolean; can_create_agents: boolean };
+  /** Pairs naming this employee that take part in decisions. */
+  allow_pairs: Array<[string, string]>;
+  /** Pairs naming this employee that are written but do not apply under `policy`. */
+  inactive_allow_pairs: Array<[string, string]>;
+  /**
+   * RM-137 L1: how many pairs above name an employee the viewer cannot view;
+   * that end is sent as `hidden_peer_placeholder` instead of its id.
+   */
+  hidden_allow_pairs?: number;
+  hidden_inactive_allow_pairs?: number;
+  /** The placeholder string the gateway uses for a masked peer (`*hidden*`). */
+  hidden_peer_placeholder?: string;
 }
 
 /** v1.54 global `[task_forward_model]` switches (calibrated prediction + held-out learning gate). */
@@ -1364,6 +1419,14 @@ export type ActivityType =
   | 'evolution_triggered'
   | 'autopilot_triggered'
   | 'autopilot_lag'
+  // v1.82 approval gate (`autopilot_engine/approval_gate.rs`): a gated fire
+  // waiting for an Admin, an approval-gate outcome an Admin must hear about
+  // (blocked / approval error / expired / stale / breaker open / outcome
+  // unknown), and a gated fire that ended without running (denied, or
+  // skipped by an autonomy pause).
+  | 'autopilot_awaiting_approval'
+  | 'autopilot_approval_blocked'
+  | 'autopilot_approval_settled'
   | 'error'
   // W2-8 — `channel_alerts.rs` (W2-4) writes these two Activity Feed rows
   // (a channel outage crossing the alert threshold, and its later
@@ -1482,13 +1545,17 @@ export type {
   AutopilotCreateParams,
   AutopilotUpdateFields,
 } from './autopilot-rules';
+export type { AutopilotHistoryResult } from './autopilot-history';
 export interface AutopilotHistoryEntry {
   id: string;
   rule_id: string;
   rule_name: string;
   triggered_at: string;
-  result: 'success' | 'failure';
-  details?: string;
+  /** Every status the gateway writes (`./autopilot-history`); a newer
+   *  gateway may send one this dashboard does not know — rendered raw. */
+  result: import('./autopilot-history').AutopilotHistoryResult | (string & {});
+  /** `Option<String>` on the gateway: serialized as `null` when absent. */
+  details?: string | null;
 }
 
 // ── Resident sensing observability (WP4) ────────────────────
@@ -2545,10 +2612,20 @@ export interface UserAgentBinding {
   bound_at: string;
 }
 
+export interface PrimaryAgentRepair { user_id: string; display_name: string; agent_id: string }
+export interface PrimaryAgentRepairPreview {
+  members: PrimaryAgentRepair[];
+  preview_digest: string;
+  excluded_personal_count: number;
+  changed: boolean;
+}
+
 export interface UserDetail extends UserInfo {
   /** Server-computed eligibility; the invite RPC rechecks before issuing. */
   invite_eligible?: boolean;
   bindings: UserAgentBinding[];
+  assignable_primary_agents?: string[];
+  primary_personal_excluded?: boolean;
 }
 
 /** One AI employee a manager may call through a report (`users.my_team`). */
@@ -3504,7 +3581,7 @@ export type RuntimeProvider =
  *  string clears the fallback. */
 export interface AgentRuntime {
   provider?: RuntimeProvider;
-  /** Per-run CLI / per-request OpenAI-compatible API limit, 30–3600 seconds. Claude is fixed at 30 minutes. Null clears it. */
+  /** Per-run CLI / per-request OpenAI-compatible API limit for all runtimes including Claude, from 30 seconds to the global ceiling. Null clears it. */
   timeout_secs?: number | null;
   /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
   fallback?: string;
@@ -3590,6 +3667,17 @@ export interface AgentDetailV168 {
   budget?: { daily_cap_cents?: number };
   model?: { effort?: string; utility?: string | null };
   permissions?: { permissions_enforced_since?: string | number | null };
+  /** v1.82 (RM-137): the four gated `[permissions]` flags as the MCP gate
+   *  applies them (an unwritten `can_create_agents` resolved by role; all
+   *  false with `error` set when agent.toml cannot be read). Older gateways
+   *  omit it. */
+  effective_permissions?: {
+    can_create_agents: boolean;
+    can_send_cross_agent: boolean;
+    can_schedule_tasks: boolean;
+    can_modify_own_skills: boolean;
+    error: string | null;
+  };
   runtime?: { minimal_context?: boolean };
   fork?: { enabled?: boolean };
   team?: AgentTeamSection & {
@@ -6878,6 +6966,10 @@ export const api = {
       display_name: string;
       role?: string;
       trigger?: string;
+      /** Persona written to SOUL.md (canonical field). Scanned; a rejected
+       *  persona or a failed write refuses the whole create. */
+      soul_md?: string;
+      /** Older alias of `soul_md`. Sending both with different text is an error. */
       soul?: string;
       /** Supervisor agent name — must already exist. Omit/empty ⇒ standalone. */
       reports_to?: string;
@@ -6890,7 +6982,17 @@ export const api = {
        *  falls back to a default for programmatic callers only. */
       model_preferred?: string;
     }) =>
-      client.call('agents.create', params) as Promise<{ success: boolean; agent: AgentInfo }>,
+      client.call('agents.create', params) as Promise<{
+        success: boolean;
+        agent: AgentInfo;
+        /** Whether a persona (`soul_md` / `soul`) was written to SOUL.md. */
+        persona_supplied?: boolean;
+        /** Top-level request fields the gateway did not use (not rejected):
+         *  at most 20 names, each at most 64 characters, one plain line. */
+        ignored_fields?: string[];
+        /** How many more ignored fields there were beyond `ignored_fields`. */
+        ignored_fields_more?: number;
+      }>,
     /** Fire-and-forget bus message to one agent. No dashboard surface calls
      *  this since UX plan I-1a: the employee-card 交辦 action now opens the
      *  /assign page, which files a trackable, judge-verified goal task instead.
@@ -8027,6 +8129,9 @@ export const api = {
         allow: Array<[string, string]>;
         applied: boolean;
       }>,
+    /** Read-only effective delegation for one employee (Manager+ with view access). */
+    effective: (agentId: string) =>
+      client.call('delegation.effective', { agent_id: agentId }) as Promise<DelegationEffective>,
   },
   /** v1.54 校準式預測 + held-out 學習閘 全域開關 (admin only). */
   taskForwardModel: {
@@ -9639,8 +9744,10 @@ export const api = {
         status: string;
         transferred_agents: string[];
       }>,
-    setPrimaryAgent: (agentId: string | null) =>
-      client.call('users.set_primary_agent', { agent_id: agentId }) as Promise<{ primary_agent_id: string | null }>,
+    repairPrimaryAgents: (previewDigest?: string) =>
+      client.call('users.repair_primary_agents', previewDigest !== undefined ? { preview_digest: previewDigest } : {}) as Promise<PrimaryAgentRepairPreview>,
+    setPrimaryAgent: (agentId: string | null, userId?: string) =>
+      client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>
       client.call('users.me') as Promise<{
         user: UserInfo;

@@ -103,7 +103,13 @@ fn rule_requires_approval_parsing() {
     assert!(rule_requires_approval(&json!({"require_approval": true})));
     assert!(!rule_requires_approval(&json!({"require_approval": false})));
     assert!(!rule_requires_approval(&json!({"type": "delegate"})));
-    assert!(!rule_requires_approval(&json!({"require_approval": "yes"})));
+    // v1.82: a present non-bool fails closed (it used to read as `false`).
+    for odd in [json!("yes"), json!("false"), json!(0), json!(1), json!(null), json!({}), json!([])] {
+        assert!(
+            rule_requires_approval(&json!({"require_approval": odd.clone()})),
+            "non-bool {odd} must require approval"
+        );
+    }
 }
 
 #[test]

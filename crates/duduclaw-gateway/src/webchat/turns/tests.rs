@@ -173,8 +173,9 @@ async fn cancel_kills_process_records_session_and_withdraws_own_approval() {
         panic!("expected text")
     };
     let terminal: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(sessions.webchat_history("session").await.unwrap().iter()
-        .all(|m| m.notice_kind.is_none()));
+    persist_failure(&sessions, home.path(), "session", &ticket.id, crate::channel_reply::TurnFailureReason::Internal).await;
+    let notices = sessions.webchat_history("session").await.unwrap();
+    assert!(notices.is_empty(), "no question was stored for this cancellation");
     assert_eq!(terminal["code"], "cancelled");
     assert_eq!(terminal["delegations_cancelled"], 1);
     assert_eq!(terminal, serde_json::json!({"type":"error", "code":"cancelled", "message":"Turn cancelled",
@@ -295,14 +296,17 @@ async fn panic_emits_correlated_terminal_frame_after_cleanup() {
     let sink = TurnSink::new(tx, "s", Some("conv".into()), "m");
     let file = tempfile::NamedTempFile::new().unwrap();
     let sessions = crate::session::SessionManager::new(file.path()).unwrap();
-    sessions.get_or_create("s", "bot").await.unwrap();
+    let session = sessions.get_or_create("s", "bot").await.unwrap();
+    sessions.append_message("s", "user", "question", 1).await.unwrap();
+    crate::channel_reply::FAILURE_SESSION.scope(Arc::new(std::sync::Mutex::new(Some(("s".into(), session.created_at, "bot".into())))), async {
     supervise(&sink, async {
         crate::channel_reply::with_delivery_cleanup(async { panic!("injected turn panic") }).await;
-    }, || persist_failure(&sessions, "s", "Internal turn error")).await;
+    }, || persist_failure(&sessions, std::path::Path::new("/nonexistent"), "s", "turn", crate::channel_reply::TurnFailureReason::Internal)).await;
+    }).await;
     let stored = sessions.webchat_history("s").await.unwrap();
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].notice_kind.as_deref(), Some("turn_failure"));
-    assert_eq!(stored[0].message.content, "Internal turn error");
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[1].notice_kind.as_deref(), Some("turn_failure"));
+    assert_eq!(stored[1].message.content, crate::channel_reply::TurnFailureReason::Internal.text(None));
     let Message::Text(text) = rx.recv().await.unwrap().message else { panic!("text") };
     let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(frame["code"], "internal_error");
@@ -315,12 +319,16 @@ async fn panic_emits_correlated_terminal_frame_after_cleanup() {
 async fn panic_frame_survives_failure_notice_write_error() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let sessions = crate::session::SessionManager::new(file.path()).unwrap();
+    let session = sessions.get_or_create("s", "bot").await.unwrap();
+    sessions.append_message("s", "user", "question", 1).await.unwrap();
     let conn = rusqlite::Connection::open(file.path()).unwrap();
     conn.execute("DROP TABLE session_messages", []).unwrap();
     let (tx, mut rx) = outbound_channel();
     let sink = TurnSink::new(tx, "s", None, "m");
+    crate::channel_reply::FAILURE_SESSION.scope(Arc::new(std::sync::Mutex::new(Some(("s".into(), session.created_at, "bot".into())))), async {
     supervise(&sink, async { panic!("injected panic") },
-        || persist_failure(&sessions, "s", "Internal turn error")).await;
+        || persist_failure(&sessions, std::path::Path::new("/nonexistent"), "s", "turn", crate::channel_reply::TurnFailureReason::Internal)).await;
+    }).await;
     let Message::Text(text) = rx.recv().await.unwrap().message else { panic!("text") };
     let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(frame["code"], "internal_error");
@@ -1061,4 +1069,51 @@ fn logout_after_reconnect_matches_owned_original_conversation_nonce() {
     assert!(own.cancel.is_cancelled());
     assert!(!other.cancel.is_cancelled());
     assert!(!foreign.cancel.is_cancelled());
+}
+
+#[tokio::test]
+async fn empty_reply_notice_is_fixed_idempotent_and_excluded_from_the_next_prompt() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
+    let session = sessions.get_or_create("webchat:empty", "bot").await.unwrap();
+    sessions.append_message("webchat:empty", "user", "question", 1).await.unwrap();
+    crate::channel_reply::FAILURE_SESSION.scope(Arc::new(std::sync::Mutex::new(Some(("webchat:empty".into(), session.created_at, "bot".into())))), async {
+    for _ in 0..2 {
+        persist_failure(&sessions, home.path(), "webchat:empty", "turn", crate::channel_reply::TurnFailureReason::Internal).await;
+    }
+    }).await;
+    let history = sessions.webchat_history("webchat:empty").await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].notice_kind.as_deref(), Some("turn_failure"));
+    assert_eq!(history[1].message.content, crate::channel_reply::TurnFailureReason::Internal.text(None));
+    assert_eq!(sessions.read_last_n_turns_text("webchat:empty", 10).await.unwrap(), "user: question\n");
+}
+
+#[tokio::test]
+async fn panic_after_clear_does_not_write_into_the_replacement_session() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
+    let session = sessions.get_or_create("webchat:cleared", "bot").await.unwrap();
+    let target = Arc::new(std::sync::Mutex::new(Some(("webchat:cleared".into(), session.created_at, "bot".into()))));
+    sessions.acquire().await.execute("UPDATE sessions SET created_at='replacement' WHERE id='webchat:cleared'", []).unwrap();
+    crate::channel_reply::FAILURE_SESSION.scope(target, async {
+        persist_failure(&sessions, home.path(), "webchat:cleared", "turn", crate::channel_reply::TurnFailureReason::Internal).await;
+    }).await;
+    assert!(sessions.webchat_history("webchat:cleared").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unbound_cancel_or_panic_after_new_never_writes_to_the_replacement() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
+    let session = sessions.get_or_create("webchat:new", "bot").await.unwrap();
+    let mut ticket = Arc::new(Registry::default()).admit("alice", "webchat:new", None, "msg", 3, 10).unwrap();
+    ticket.admission_generation = Some(session.created_at);
+    sessions.acquire().await.execute("UPDATE sessions SET created_at='replacement' WHERE id='webchat:new'", []).unwrap();
+    crate::channel_reply::FAILURE_SESSION.scope(Arc::new(std::sync::Mutex::new(None)), async {
+        for reason in [crate::channel_reply::TurnFailureReason::Cancelled, crate::channel_reply::TurnFailureReason::Internal] {
+            persist_admitted_failure(&sessions, home.path(), "webchat:new", &ticket.id, reason, ticket.admission_generation.as_deref()).await;
+        }
+    }).await;
+    assert!(sessions.webchat_history("webchat:new").await.unwrap().is_empty());
 }

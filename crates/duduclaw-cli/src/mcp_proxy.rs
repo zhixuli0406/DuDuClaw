@@ -1756,6 +1756,38 @@ mod tests {
         assert!(upstream_env(inherited, None).is_empty());
     }
 
+    /// RM-160: the proxy process now receives the full employee token from the
+    /// Claude per-spawn config. The external server it starts must not: check
+    /// the command actually spawned, not just the env list.
+    #[test]
+    fn rm160_the_spawned_external_upstream_never_receives_the_employee_token() {
+        let inherited = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("DUDUCLAW_AGENT_ID".to_string(), "alice".to_string()),
+            ("DUDUCLAW_AGENT_TOKEN".to_string(), "full-token".to_string()),
+            ("duduclaw_agent_token".to_string(), "full-token".to_string()),
+            (duduclaw_core::ENV_HOOK_TOKEN.to_string(), "hook-token".to_string()),
+            ("DUDUCLAW_TURN_ID".to_string(), "turn".to_string()),
+            ("DUDUCLAW_EGRESS_TURN_ID".to_string(), "turn".to_string()),
+            ("DUDUCLAW_DISPATCH_RUN_ID".to_string(), "run".to_string()),
+        ];
+        // A declared map cannot smuggle it back in either.
+        let declared = r#"{"VENDOR_KEY":"v","DUDUCLAW_AGENT_TOKEN":"x","DUDUCLAW_HOOK_TOKEN":"y"}"#;
+        let pairs = upstream_env(inherited, Some(declared));
+        let cmd = upstream_command("vendor-mcp", &[], pairs, false);
+        let envs: HashMap<String, Option<String>> = cmd.as_std().get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+            .collect();
+        assert_eq!(envs.get("VENDOR_KEY"), Some(&Some("v".to_string())));
+        assert_eq!(envs.get("PATH"), Some(&Some("/usr/bin".to_string())));
+        for (name, value) in &envs {
+            let upper = name.to_ascii_uppercase();
+            assert!(!upper.starts_with("DUDUCLAW_"), "{name} reached the upstream");
+            let value = value.as_deref().unwrap_or_default();
+            assert!(!["full-token", "hook-token", "x", "y"].contains(&value), "{name}={value}");
+        }
+    }
+
     #[test]
     fn upstream_env_strips_duduclaw_internals_and_applies_the_declared_map() {
         let inherited = vec![

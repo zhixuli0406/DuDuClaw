@@ -111,6 +111,7 @@ import {
   runtimeTimeoutNeedsAdmin,
   type OdooFormState,
   clampInt,
+  permissionFormValues,
 } from './editPayload';
 import { ToolNameListField, TypedKvTable } from './v168-controls';
 import { ActionRulesEditor } from './ActionRulesEditor';
@@ -478,6 +479,9 @@ function EditAgentPageContent() {
   const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
   const [savedRuntimeTimeout, setSavedRuntimeTimeout] = useState(300);
   const savedRuntimeTimeoutRef = useRef(300);
+  const [runtimeTimeoutError, setRuntimeTimeoutError] = useState(false);
+  const [runtimeEffectiveTimeout, setRuntimeEffectiveTimeout] = useState(300);
+  const [runtimeMaxTimeout, setRuntimeMaxTimeout] = useState(3600);
   const isAdminRef = useRef(isAdmin);
   useEffect(() => { isAdminRef.current = isAdmin; }, [isAdmin]);
   // The gateway's own admin-only path list (`agents.inspect.admin_only_fields`);
@@ -585,12 +589,10 @@ function EditAgentPageContent() {
       // F1 — the saved cron (older gateways do not return it: the field then
       // shows empty and is only sent once the operator edits it).
       heartbeat_cron: agent.heartbeat?.cron ?? '',
-      // Absent permission keys mean "allowed" server-side, so show ON.
-      can_create_agents: agent.permissions?.can_create_agents ?? true,
-      can_send_cross_agent: agent.permissions?.can_send_cross_agent ?? true,
-      can_modify_own_skills: agent.permissions?.can_modify_own_skills ?? true,
-      can_modify_own_soul: agent.permissions?.can_modify_own_soul ?? false,
-      can_schedule_tasks: agent.permissions?.can_schedule_tasks ?? true,
+      // RM-137: what the gateway applies (`effective_permissions`), not a
+      // UI-side default — a missing `can_create_agents` is OFF for every
+      // non-main employee. Display only; untouched switches are never sent.
+      ...permissionFormValues(agent),
       gvu_enabled: ev?.gvu_enabled ?? true,
       max_active_skills: ev?.max_active_skills ?? 5,
       skill_token_budget: ev?.skill_token_budget ?? 0,
@@ -641,12 +643,16 @@ function EditAgentPageContent() {
     setContractHeld(null);
 
     const rt = agent.runtime;
-    savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(rt?.timeout_secs);
+    savedRuntimeTimeoutRef.current = agent.timeout_authorization_ceiling_secs
+      ?? effectiveRuntimeTimeout(rt?.timeout_secs, 300, agent.max_timeout_secs ?? 3600);
+    setRuntimeEffectiveTimeout(agent.effective_timeout_secs
+      ?? effectiveRuntimeTimeout(rt?.timeout_secs, rt?.provider === 'claude' || !rt?.provider ? 1800 : 300, agent.max_timeout_secs ?? 3600));
+    setRuntimeMaxTimeout(agent.max_timeout_secs ?? 3600);
     setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
     setRuntime({
       provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
       fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
-      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs),
+      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs, agent.effective_timeout_secs ?? (rt?.provider === 'claude' || !rt?.provider ? 1800 : 300), agent.max_timeout_secs ?? 3600),
     });
 
     const ef = ev?.external_factors ?? {};
@@ -797,7 +803,11 @@ function EditAgentPageContent() {
 
   const updateRuntime = useCallback(<K extends keyof typeof DEFAULT_RUNTIME>(key: K, value: (typeof DEFAULT_RUNTIME)[K]) => {
     if (lockedPath(`runtime.${String(key)}`)) return;
-    if (key === 'timeout_secs' && !isAdminRef.current && runtimeTimeoutNeedsAdmin(savedRuntimeTimeoutRef.current, value)) return;
+    if (key === 'timeout_secs') {
+      const exceedsCeiling = !isAdminRef.current && runtimeTimeoutNeedsAdmin(savedRuntimeTimeoutRef.current, value);
+      setRuntimeTimeoutError(exceedsCeiling);
+      if (exceedsCeiling) return;
+    }
     markDirty(`runtime.${String(key)}`);
     setRuntime((prev) => ({ ...prev, [key]: value }));
   }, [markDirty, lockedPath]);
@@ -941,9 +951,28 @@ function EditAgentPageContent() {
           setOdoo((current) => JSON.stringify(current.allowed_actions) === JSON.stringify(odoo.allowed_actions)
             ? { ...current, allowed_actions: sentActions } : current);
         }
-        if (payload.runtime && Object.hasOwn(payload.runtime, 'timeout_secs')) {
-          savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(payload.runtime.timeout_secs);
-          setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
+        if (payload.runtime || res?.runtime_provider_aligned) {
+          // Preserve the successful write even if the follow-up read fails or
+          // an older gateway returns no authorization ceiling.
+          const sentTimeout = payload.runtime?.timeout_secs;
+          if (sentTimeout !== undefined) {
+            savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(sentTimeout, 300, runtimeMaxTimeout);
+            setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
+            setRuntimeEffectiveTimeout(effectiveRuntimeTimeout(sentTimeout, runtimeEffectiveTimeout, runtimeMaxTimeout));
+          }
+          try {
+            const detail = await api.agents.inspect(agent.name);
+            const max = detail.max_timeout_secs ?? 3600;
+            const effective = detail.effective_timeout_secs
+              ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, detail.runtime?.provider === 'claude' || !detail.runtime?.provider ? 1800 : 300, max);
+            savedRuntimeTimeoutRef.current = detail.timeout_authorization_ceiling_secs
+              ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, 300, max);
+            setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
+            setRuntimeEffectiveTimeout(effective);
+            setRuntimeMaxTimeout(max);
+          } catch (error) {
+            console.warn('Saved agent settings but could not refresh runtime limits', error);
+          }
         }
         if (includesKv) setKvServerError(null);
         // Save-time auto-align: the gateway rewrote [runtime] provider to
@@ -1004,7 +1033,8 @@ function EditAgentPageContent() {
     }
   }, [
     agent, form, availableModels, updateAgent, intl, errorText,
-    caps, osWatch, research, runtime, evoAdv, odoo, adv, v168, contract, takeContractAnswer,
+    caps, osWatch, research, runtime, runtimeMaxTimeout, runtimeEffectiveTimeout,
+    evoAdv, odoo, adv, v168, contract, takeContractAnswer,
   ]);
 
   // CON — the review dialog's follow-up: resend the checked contract with
@@ -1293,7 +1323,7 @@ function EditAgentPageContent() {
           <SettingsSection>
             <SettingsCard>
               <RowNumber label={t('agents.edit.maxActiveSkills')} value={form.max_active_skills ?? 5} min={1} max={20} onChange={(v) => updateField('max_active_skills', v)} />
-              <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? true} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
+              <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? false} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
               <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
             </SettingsCard>
           </SettingsSection>
@@ -1331,8 +1361,8 @@ function EditAgentPageContent() {
           {adminHint}
           <SettingsSection title={t('agents.edit.section.permissions')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.v168.perm.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? true} disabled={locked('form.can_send_cross_agent')} onChange={(v) => updateField('can_send_cross_agent', v)} />
-              <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.v168.perm.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? true} disabled={locked('form.can_schedule_tasks')} onChange={(v) => updateField('can_schedule_tasks', v)} />
+              <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.v168.perm.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? false} disabled={locked('form.can_send_cross_agent')} onChange={(v) => updateField('can_send_cross_agent', v)} />
+              <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.v168.perm.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? false} disabled={locked('form.can_schedule_tasks')} onChange={(v) => updateField('can_schedule_tasks', v)} />
             </SettingsCard>
           </SettingsSection>
 
@@ -1596,7 +1626,7 @@ function EditAgentPageContent() {
 
           <DangerZone title={t('agents.perm.danger.title')} description={t('agents.perm.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.v168.perm.canCreateAgents.help')} checked={form.can_create_agents ?? true} disabled={locked('form.can_create_agents')} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
+              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.v168.perm.canCreateAgents.help')} checked={form.can_create_agents ?? false} disabled={locked('form.can_create_agents')} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
               <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} disabled={!isAdmin} onChange={guardDanger(t('agents.edit.canModifySoul'), (v) => updateField('can_modify_own_soul', v), 'agents.edit.dangerConfirm.canModifySoul')} />
             </SettingsCard>
           </DangerZone>
@@ -1901,7 +1931,8 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} disabled={locked('runtime.provider')} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
               <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} disabled={locked('runtime.fallback')} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
-              <RowNumber label={t('agents.runtime.timeout')} description={t(isAdmin ? 'agents.runtime.timeout.hint' : 'agents.runtime.timeout.lowerOnly')} value={runtime.timeout_secs} min={30} max={isAdmin ? 3600 : savedRuntimeTimeout} step={1} onChange={(v) => updateRuntime('timeout_secs', v)} />
+              <RowNumber label={t('agents.runtime.timeout')} description={<><span>{t(isAdmin ? 'agents.runtime.timeout.hint' : 'agents.runtime.timeout.lowerOnly')}</span> {intl.formatMessage({ id: isAdmin ? 'agents.runtime.timeout.effective' : 'agents.runtime.timeout.ownerCeiling' }, { value: runtimeEffectiveTimeout, max: runtimeMaxTimeout, ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</>} value={runtime.timeout_secs} min={30} max={isAdmin ? runtimeMaxTimeout : Math.min(savedRuntimeTimeout, runtimeMaxTimeout)} step={1} onChange={(v) => updateRuntime('timeout_secs', v)} />
+              {runtimeTimeoutError && <p role="alert" className="px-3 py-2 text-xs text-destructive">{intl.formatMessage({ id: 'agents.runtime.timeout.overCeiling' }, { ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</p>}
               <RowSwitch label={t('agents.v168.minimalContext')} description={t('agents.v168.minimalContext.help')} checked={v168.minimal_context} onChange={(v) => updateV('minimal_context', v)} />
             </SettingsCard>
             {usesGenericCli && (

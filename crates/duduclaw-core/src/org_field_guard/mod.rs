@@ -321,12 +321,15 @@ pub fn classify_identity_surface(file_path: &Path, home: &Path) -> Option<Protec
     // `<home>/org_change_journal/`. Holding the lock would stall every org
     // change; the journal is what the approval replays. Same surface as
     // `org.toml`: refused outright for every caller.
+    // RM-149 round 2: the seat admission lock (`<home>/locks/
+    // agent-seat-admission*`) likewise — holding it would stall every
+    // employee create / restore.
     let locks_dir = lexical_normalize(&home.join("locks"));
     if let Some(rest) = components_after_ci(&normalized, &locks_dir)
         && let [name] = rest.as_slice()
-        && name
-            .to_ascii_lowercase()
-            .starts_with(crate::org_store::ORG_MUTATION_LOCK)
+        && [crate::org_store::ORG_MUTATION_LOCK, crate::agent_seats::SEAT_ADMISSION_LOCK]
+            .iter()
+            .any(|lock| name.to_ascii_lowercase().starts_with(lock))
     {
         return Some(ProtectedSurface::OrgStore);
     }

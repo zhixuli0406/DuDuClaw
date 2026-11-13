@@ -385,11 +385,22 @@ async fn create_run(
                 // The creator's right is re-read at every fire: a creator who
                 // is no longer an Admin gets at most the employee's own limit.
                 timeout_secs: p.timeout_secs.map(|secs| {
-                    if via == "admin" {
-                        secs
-                    } else {
-                        secs.min(crate::runtime_config::employee_timeout_ceiling(home, &row.agent_id))
+                    let global_max = crate::runtime_config::TimeoutPolicy::load(home).max_secs;
+                    let ceiling = if via == "admin" { global_max } else {
+                        global_max.min(crate::runtime_config::employee_timeout_ceiling(home, &row.agent_id))
+                    };
+                    let effective = secs.min(ceiling);
+                    if effective != secs {
+                        static WARNED: OnceLock<Mutex<HashSet<(PathBuf, String)>>> = OnceLock::new();
+                        let first = WARNED.get_or_init(|| Mutex::new(HashSet::new()))
+                            .lock().unwrap_or_else(|e| e.into_inner())
+                            .insert((home.to_path_buf(), row.id.clone()));
+                        if first {
+                            tracing::warn!(schedule = %row.id, requested = secs, effective,
+                                "scheduled assignment: run limit clamped to current ceiling");
+                        }
                     }
+                    effective
                 }),
                 risk_boundary: p.risk_boundary,
                 require_beliefs: p.require_beliefs,

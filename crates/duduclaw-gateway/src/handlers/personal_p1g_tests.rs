@@ -584,3 +584,25 @@ fn p1g_http_routes_naming_an_employee_are_reviewed() {
     let shortcut = webchat.rfind("if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }").unwrap();
     assert!(refuse < shortcut, "the Personal check runs before the Admin shortcut");
 }
+
+#[test]
+fn protected_primary_repair_uses_gate_ownership_and_survives_hidden_row_filter() {
+    let h = home();
+    h.db.set_primary_agent(&h.alice, None).unwrap();
+    let preview = h.db.repair_primary_agents(&h.admin, None, |agent| {
+        visibility::personal_owner(h.path(), agent).map(|owner| owner.is_some()).map_err(|_| "unavailable".into())
+    }).unwrap();
+    assert_eq!(preview.excluded_personal_count, 1);
+    assert!(preview.members.iter().all(|member| member.agent_id != PERSONAL));
+    assert!(preview.members.iter().any(|member| member.user_id == h.alice && member.agent_id == SHARED));
+    assert!(!metadata_allowlisted("users.repair_primary_agents"));
+    let mut payload = serde_json::to_value(&preview).unwrap();
+    let original = payload.clone();
+    assert_eq!(drop_hidden_rows(&mut payload, &hidden_of(&h, &h.admin)), 0);
+    assert_eq!(payload, original);
+    let changed = h.db.repair_primary_agents(&h.admin, Some(&preview.preview_digest), |agent| {
+        visibility::personal_owner(h.path(), agent).map(|owner| owner.is_some()).map_err(|_| "unavailable".into())
+    }).unwrap();
+    assert_eq!(changed.members, preview.members);
+    assert_eq!(h.db.configured_primary_agent(&h.alice).unwrap().as_deref(), Some(SHARED));
+}

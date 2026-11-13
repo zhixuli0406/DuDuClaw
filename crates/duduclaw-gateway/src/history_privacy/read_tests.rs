@@ -1,7 +1,7 @@
 use super::*;
 fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    c.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT,archive_reason TEXT,user_cleared_at TEXT);CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,tokens INTEGER,timestamp TEXT,hidden INTEGER DEFAULT 0,undone_at TEXT);").unwrap();
+    c.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_id TEXT,origin_kind TEXT,owner_user_id TEXT,title TEXT,last_active TEXT,archived_at TEXT,archive_reason TEXT,user_cleared_at TEXT);CREATE TABLE session_messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,tokens INTEGER,timestamp TEXT,hidden INTEGER DEFAULT 0,undone_at TEXT,notice_kind TEXT);").unwrap();
     c
 }
 fn session(c: &Connection, id: &str, kind: &str, owner: &str, time: &str) {
@@ -134,4 +134,20 @@ fn bound_history_rows_are_bounded_visible_text_and_keep_message_ids_for_masked_r
     )
     .unwrap();
     assert!(rows(&c, "line:x").is_err());
+}
+
+#[test]
+fn restricted_history_includes_failure_notice_but_not_other_hidden_or_revoked_rows() {
+    let c = db();
+    session(&c, "line:failed", "channel", "", "2026-10-24T12:00:00Z");
+    let text = crate::channel_reply::TurnFailureReason::Timeout.text(None);
+    for (id, notice, undone) in [(1, "turn_failure", None), (2, "private", None), (3, "turn_failure", Some("revoked"))] {
+        c.execute("INSERT INTO session_messages(id,session_id,role,content,tokens,timestamp,hidden,notice_kind,undone_at)
+            VALUES (?1,'line:failed','assistant',?2,0,'2026-10-24T12:00:00Z',1,?3,?4)", params![id,text,notice,undone]).unwrap();
+    }
+    assert!(rows(&c, "line:failed").unwrap().is_empty());
+    let stored = conversation_rows(&c, "line:failed").unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].notice_kind.as_deref(), Some("turn_failure"));
+    assert_eq!(stored[0].message.content, text);
 }

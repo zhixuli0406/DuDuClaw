@@ -136,20 +136,23 @@ pub(crate) async fn handle_create_agent(
         });
     }
 
-    // Agent-count cap (edition / license quota). The dashboard enforces this
-    // in `tier_limit_message`; without the same gate here, any agent could
-    // `create_agent` its way past the Personal-edition cap or a signed
-    // P-License `max_agents` quota. The MCP server is a separate process, so
-    // the cap is resolved from disk (license + env), not the gateway global.
-    let current_agents = count_existing_agents(home_dir);
-    if let Some(msg) =
-        duduclaw_gateway::license_runtime::agent_cap_message_from_disk(home_dir, current_agents)
-            .await
+    // RM-146: the persona (`soul_md` canonical, `soul` alias), checked and
+    // scanned before anything is written.
+    let soul = match duduclaw_gateway::agent_persona::requested_persona(params, MCP_PERSONA_MAX_CHARS) {
+        Ok(soul) => soul,
+        Err(e) => return tool_error(&format!("Error: {e}")),
+    };
+    if let Some(soul) = &soul
+        && let Err(refused) = duduclaw_gateway::agent_persona::scan_persona(soul)
     {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error: {msg}")}],
-            "isError": true
-        });
+        tracing::warn!(caller = %caller_agent, requested = %name, "create_agent refused: persona failed the SOUL.md scan");
+        return tool_error(&format!("Error: {refused}"));
+    }
+    // Bounded (count and length) and sanitised before it reaches the log or
+    // the reply (L4).
+    let ignored = duduclaw_gateway::agent_persona::ignored_fields(params, MCP_CREATE_AGENT_FIELDS);
+    if !ignored.is_empty() {
+        tracing::warn!(caller = %caller_agent, requested = %name, fields = %ignored.summary(), "create_agent: unknown arguments ignored");
     }
 
     let role = params
@@ -173,7 +176,6 @@ pub(crate) async fn handle_create_agent(
         .get("reports_to")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let soul = params.get("soul").and_then(|v| v.as_str()).unwrap_or("");
     let model = params
         .get("model")
         .and_then(|v| v.as_str())
@@ -289,6 +291,21 @@ pub(crate) async fn handle_create_agent(
     }
     let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
+    // Agent-count cap (edition / license quota). Without this gate any agent
+    // could `create_agent` its way past the Personal-edition cap or a signed
+    // P-License `max_agents` quota. The MCP server is a separate process, so
+    // the cap is resolved from disk (license + env), not the gateway global.
+    // RM-149: seats are the shared rule (`duduclaw_core::agent_seats`) —
+    // deleted employees free their seat, archived and unreadable ones keep
+    // it — decided under the cross-process seat admission lock the dashboard
+    // and the pack importer take too, and held until the directory is
+    // published below. Lock order: seat admission, then the org lock, then
+    // the lifecycle barrier.
+    let seat_admission = match mcp_admit_seat(home_dir).await {
+        Ok(admission) => admission,
+        Err(refusal) => return tool_error(&refusal),
+    };
+
     // RM-027 round 4: the global org lock is taken at the START of the
     // creation — before the admission lease (lock order: the org lock always
     // comes before the lifecycle barrier) — and held to the publish. The
@@ -337,9 +354,22 @@ pub(crate) async fn handle_create_agent(
         });
     }
 
-    // Write SOUL.md if provided
-    if !soul.is_empty() {
-        let _ = std::fs::write(stage_dir.join("SOUL.md"), soul);
+    // Write SOUL.md if provided. A failed write fails the tool; dropping
+    // `staged` removes the half-built directory (RM-146).
+    if let Some(soul) = &soul {
+        #[cfg(test)]
+        let injected = soul_write_seam::should_fail(name);
+        #[cfg(not(test))]
+        let injected = false;
+        let written = if injected {
+            Err(std::io::Error::other("injected SOUL.md write failure"))
+        } else {
+            std::fs::write(stage_dir.join("SOUL.md"), soul)
+        };
+        if let Err(e) = written {
+            tracing::warn!(agent = %name, error = %e, "create_agent refused: SOUL.md not written");
+            return tool_error(&format!("Error writing SOUL.md: {e}. AI 員工沒有建立。"));
+        }
     }
 
     // Write empty MEMORY.md
@@ -358,6 +388,8 @@ pub(crate) async fn handle_create_agent(
         return tool_error(&format!("Error: AI 員工沒有建立：{e}"));
     }
     drop(org);
+    // Published: the next admission counts this employee.
+    drop(seat_admission);
 
     // Install agent-file-guard PreToolUse hook so the newly-created agent
     // immediately gets protected against out-of-tree Write/Edit.
@@ -406,17 +438,118 @@ pub(crate) async fn handle_create_agent(
         }
     }
 
+    let ignored_note = if ignored.is_empty() {
+        String::new()
+    } else {
+        format!("\nIgnored arguments (no effect): {}", ignored.summary())
+    };
     serde_json::json!({
         "content": [{"type": "text", "text": format!(
             "Agent '{display_name}' ({name}) created successfully.\n\
              Role: {role}\n\
              Reports to: {reports_to_display}\n\
              Model: {model}\n\
-             Directory: {}\n\n\
+             Persona (SOUL.md): {}\n\
+             Directory: {}{ignored_note}\n\n\
              The agent is now available for delegation via send_to_agent or spawn_agent.",
+            if soul.is_some() { "written" } else { "none supplied" },
             agent_dir.display()
         )}]
     })
+}
+
+/// Arguments `create_agent` reads. Anything else is reported back as ignored
+/// (RM-146; not rejected in this version).
+pub(crate) const MCP_CREATE_AGENT_FIELDS: &[&str] = &[
+    "name",
+    "display_name",
+    "role",
+    "reports_to",
+    "soul_md",
+    "soul",
+    "model",
+    "trigger",
+    "icon",
+];
+
+/// Longest persona `create_agent` accepts (characters) — the SOUL.md scan's
+/// own text limit.
+pub(crate) const MCP_PERSONA_MAX_CHARS: usize = 100_000;
+
+/// Refusal when the seat count (or the admission lock) is not available.
+pub(crate) const MCP_SEAT_UNVERIFIABLE: &str =
+    "Error: 目前無法確認已使用的 AI 員工名額，為了安全先不建立。請稍後再試。";
+
+/// RM-149: take the seat admission for one MCP `create_agent` and decide
+/// under it, with the cap resolved from disk. `Ok` = the held admission
+/// (keep it until the new directory is published); `Err` = the refusal text.
+pub(crate) async fn mcp_admit_seat(home_dir: &Path) -> std::result::Result<duduclaw_core::agent_seats::SeatAdmission, String> {
+    let admission = acquire_seat_admission(home_dir).await?;
+    // The cap is resolved inside the lock, like the dashboard does.
+    let cap = duduclaw_gateway::license_runtime::agent_cap_from_disk(home_dir).await;
+    mcp_seat_decision(admission, cap.max, cap.tier.as_deref())
+}
+
+/// The bounded wait for the seat admission lock, on a blocking thread.
+pub(crate) async fn acquire_seat_admission(home_dir: &Path) -> std::result::Result<duduclaw_core::agent_seats::SeatAdmission, String> {
+    let home = home_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || duduclaw_core::agent_seats::SeatAdmission::acquire(&home)).await {
+        Ok(Ok(admission)) => Ok(admission),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "create_agent: seat admission lock not acquired; refusing (fail closed)");
+            Err(MCP_SEAT_UNVERIFIABLE.to_string())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "create_agent: seat admission task failed; refusing (fail closed)");
+            Err(MCP_SEAT_UNVERIFIABLE.to_string())
+        }
+    }
+}
+
+/// The decision under a held admission. M3: the refusal an AI caller sees
+/// carries only the cap and the number of seats in use — never who holds
+/// them (an employee may not list other people's Personal employees, and
+/// their display names are untrusted text). The holder list is for the
+/// Admin dashboard only.
+pub(crate) fn mcp_seat_decision(
+    admission: duduclaw_core::agent_seats::SeatAdmission,
+    max: usize,
+    tier: Option<&str>,
+) -> std::result::Result<duduclaw_core::agent_seats::SeatAdmission, String> {
+    use duduclaw_core::agent_seats::SeatDecision;
+    match admission.decide(max, 1, None) {
+        SeatDecision::Admitted => Ok(admission),
+        SeatDecision::Unverifiable(e) => {
+            tracing::warn!(error = %e, "create_agent: seat count unreadable; refusing (fail closed)");
+            Err(MCP_SEAT_UNVERIFIABLE.to_string())
+        }
+        SeatDecision::Full { max, current, .. } => Err(mcp_seat_refusal_text(max, current, tier)),
+    }
+}
+
+/// `max` and `current` only (see [`mcp_seat_decision`]).
+pub(crate) fn mcp_seat_refusal_text(max: usize, current: usize, tier: Option<&str>) -> String {
+    format!(
+        "Error: {}{}目前已使用 {current} 個名額（上限 {max} 個），沒有建立新的 AI 員工。",
+        duduclaw_gateway::license_runtime::agent_cap_text(max, tier),
+        duduclaw_gateway::license_runtime::AGENT_SEAT_NOTE,
+    )
+}
+
+/// Test seam: make the SOUL.md write of `create_agent` fail for one name.
+#[cfg(test)]
+pub(crate) mod soul_write_seam {
+    use std::sync::Mutex;
+
+    static FAIL_FOR: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn fail_for(name: &str) {
+        FAIL_FOR.lock().unwrap_or_else(|p| p.into_inner()).push(name.to_string());
+    }
+
+    pub(crate) fn should_fail(name: &str) -> bool {
+        FAIL_FOR.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|n| n == name)
+    }
 }
 
 /// List all registered agents with role, status, and hierarchy.

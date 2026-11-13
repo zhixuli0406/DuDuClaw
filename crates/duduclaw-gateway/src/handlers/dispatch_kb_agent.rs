@@ -213,7 +213,7 @@ impl MethodHandler {
 
     /// Gateway start: line own collections up with their employees.
     pub(crate) async fn kb_own_reconcile(&self) {
-        let (inactive, known): (Vec<String>, Vec<String>) = {
+        let (mut inactive, known): (Vec<String>, Vec<String>) = {
             let reg = self.registry.read().await;
             let list = reg.list();
             (
@@ -225,8 +225,17 @@ impl MethodHandler {
             )
         };
         let home = self.home_dir.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || own::reconcile(&home, &inactive, &known)).await
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            // RM-149: soft-deleted employees are no longer loaded into the
+            // registry; their folder is still on disk, so they are found
+            // there and their own collection stays archived.
+            match duduclaw_core::agent_seats::scan_agent_seats(&home) {
+                Ok(seats) => inactive.extend(seats.into_iter().filter(|s| s.is_deleted()).map(|s| s.id)),
+                Err(e) => tracing::warn!(error = %e, "knowledge: deleted employees not listed for reconcile"),
+            }
+            own::reconcile(&home, &inactive, &known)
+        })
+        .await
         {
             tracing::error!(error = %e, "knowledge: own collection reconcile task failed");
         }

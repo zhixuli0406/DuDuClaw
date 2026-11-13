@@ -327,6 +327,9 @@ pub struct MethodHandler {
     edition_override: RwLock<Option<duduclaw_core::EditionProfile>>,
     #[cfg(test)]
     edition_fixture_runtime: RwLock<Option<crate::license_runtime::LicenseRuntime>>,
+    /// Test seam: the agent cap `effective_agent_cap` returns (RM-149 tests).
+    #[cfg(test)]
+    agent_cap_fixture: RwLock<Option<usize>>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
     cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,
@@ -608,13 +611,13 @@ impl MethodHandler {
             if let Err(error) = acl::require_role(ctx, UserRole::Admin) {
                 return WsFrame::error_response("", &error);
             }
-            return self.handle_migration_confirmations(method, params, ctx).await;
+            return boxed_frame(|| self.handle_migration_confirmations(method, params, ctx)).await;
         }
 
         // Recording lifecycle is host authority and must stay available under
         // D8. Extensions cannot replace its fresh dashboard-role checks.
         if matches!(method, "isolation.recording_status" | "isolation.recording_stop") {
-            return self.handle_isolation_recording(method, params, ctx).await;
+            return boxed_frame(|| self.handle_isolation_recording(method, params, ctx)).await;
         }
         // Connector routes are isolation authority; no extension sees the namespace.
         if isolation_connectors_rpc::owns(method) {
@@ -636,7 +639,7 @@ impl MethodHandler {
             if session_policy_rpc::minimum_role(method) != Some(UserRole::Admin) {
                 return WsFrame::error_response("", "不允許此操作。");
             }
-            return self.handle_session_policy_rpc(method, params, ctx).await;
+            return boxed_frame(|| self.handle_session_policy_rpc(method, params, ctx)).await;
         }
 
         // MFA is a gateway-owned authentication namespace, never delegated to
@@ -648,7 +651,7 @@ impl MethodHandler {
             if let Err(e) = acl::require_role(ctx, role) {
                 return WsFrame::error_response("", &e);
             }
-            return self.dispatch_org(method, params, ctx, conn).await;
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
         }
 
         // Customer identity is gateway-owned; extensions never intercept uploads.

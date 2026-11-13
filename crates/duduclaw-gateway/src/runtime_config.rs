@@ -398,6 +398,89 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 pub const MIN_TIMEOUT_SECS: u64 = 30;
 pub const MAX_TIMEOUT_SECS: u64 = 3600;
 
+/// Validated global timeout policy. Invalid configuration restores the old hard defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutPolicy {
+    pub default_secs: Option<u64>,
+    pub max_secs: u64,
+}
+
+impl Default for TimeoutPolicy {
+    fn default() -> Self { Self { default_secs: None, max_secs: MAX_TIMEOUT_SECS } }
+}
+
+impl TimeoutPolicy {
+    pub(crate) fn from_table(table: &toml::Table) -> Result<Self, String> {
+        let Some(runtime) = table.get("runtime") else { return Ok(Self::default()) };
+        let runtime = runtime.as_table().ok_or("[runtime] must be a table")?;
+        let integer = |key: &str, min: u64, max: u64| -> Result<Option<u64>, String> {
+            runtime.get(key).map(|v| v.as_integer().and_then(|n| u64::try_from(n).ok())
+                .filter(|n| (min..=max).contains(n))
+                .ok_or_else(|| format!("[runtime] {key} must be an integer between {min} and {max}"))).transpose()
+        };
+        let max_secs = integer("max_timeout_secs", 60, 14_400)?.unwrap_or(MAX_TIMEOUT_SECS);
+        let default_secs = integer("default_timeout_secs", MIN_TIMEOUT_SECS, max_secs)?;
+        Ok(Self { default_secs, max_secs })
+    }
+
+    pub fn load(home: &Path) -> Self {
+        let path = home.join("config.toml");
+        let result = match std::fs::read_to_string(&path) {
+            Ok(text) => text.parse::<toml::Table>().map_err(|e| e.message().to_string())
+                .and_then(|table| Self::from_table(&table)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => Err(e.to_string()),
+        };
+        result.unwrap_or_else(|error| {
+            tracing::warn!(%error, "invalid runtime timeout policy; using previous hard defaults");
+            Self::default()
+        })
+    }
+}
+
+fn timeout_policy(agent_dir: &Path) -> TimeoutPolicy {
+    let home = duduclaw_core::preset::agent_home_dir(agent_dir)
+        .or_else(|| crate::agent_hook_installer::home_of_agent_dir(agent_dir))
+        .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
+    TimeoutPolicy::load(&home)
+}
+
+/// Resolve stored provider names exactly as the runtime loader does.
+pub(crate) fn runtime_default_timeout(provider: Option<&str>, policy: TimeoutPolicy) -> u64 {
+    let provider = provider.and_then(RuntimeType::parse).unwrap_or_default();
+    let fallback = if provider == RuntimeType::Claude { 1800 } else { DEFAULT_TIMEOUT_SECS };
+    policy.default_secs.unwrap_or(fallback).clamp(MIN_TIMEOUT_SECS, policy.max_secs)
+}
+
+/// Historical authorization baseline; global defaults may narrow the unset baseline.
+/// Keep explicit values unclamped here so a global cap cannot hide a stored increase.
+pub(crate) fn timeout_authorization_baseline(raw: Option<i64>, policy: TimeoutPolicy) -> u64 {
+    raw.map(|n| n.max(MIN_TIMEOUT_SECS as i64) as u64)
+        .unwrap_or(policy.default_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).min(DEFAULT_TIMEOUT_SECS))
+}
+
+/// Claude keeps its historical 1800-second default, including utility calls.
+pub fn claude_timeout_secs(home: &Path, agent_dir: Option<&Path>) -> u64 {
+    let policy = TimeoutPolicy::load(home);
+    resolve_timeout(agent_dir, policy, runtime_default_timeout(Some("claude"), policy), true)
+}
+
+fn resolve_timeout(agent_dir: Option<&Path>, policy: TimeoutPolicy, fallback: u64, task: bool) -> u64 {
+    let scoped = if task { agent_dir.and_then(|dir| dir.file_name()).and_then(|n| n.to_str())
+        .and_then(scoped_task_timeout_secs) } else { None };
+    let requested = scoped.or_else(|| agent_dir.and_then(raw_agent_timeout_secs).map(|v| {
+        if v < MIN_TIMEOUT_SECS as i64 {
+            tracing::warn!(value = v, "runtime timeout below minimum; clamping");
+        }
+        v.max(MIN_TIMEOUT_SECS as i64) as u64
+    })).unwrap_or(policy.default_secs.unwrap_or(fallback));
+    let effective = requested.clamp(MIN_TIMEOUT_SECS, policy.max_secs);
+    if requested != effective {
+        tracing::warn!(requested, effective, "runtime timeout exceeds global ceiling; clamping");
+    }
+    effective
+}
+
 tokio::task_local! {
     /// `(agent id, limit)` of the task this call works on
     /// (`tasks.timeout_secs`), scoped by the dispatcher around a goal round or
@@ -426,11 +509,8 @@ pub fn scoped_task_timeout_secs(agent_id: &str) -> Option<u64> {
 /// task's own limit when one is scoped for this employee, otherwise the
 /// employee's. An agent-less call never takes a task's limit.
 pub fn call_timeout_secs(agent_dir: Option<&Path>) -> u64 {
-    let Some(dir) = agent_dir else { return DEFAULT_TIMEOUT_SECS };
-    dir.file_name()
-        .and_then(|name| name.to_str())
-        .and_then(scoped_task_timeout_secs)
-        .unwrap_or_else(|| agent_timeout_secs(dir))
+    let Some(dir) = agent_dir else { return resolve_timeout(None, TimeoutPolicy::load(&duduclaw_core::platform::duduclaw_home()), DEFAULT_TIMEOUT_SECS, false) };
+    resolve_timeout(Some(dir), timeout_policy(dir), DEFAULT_TIMEOUT_SECS, true)
 }
 
 /// The highest per-task limit a non-Admin (a dashboard Operator, an AI
@@ -444,7 +524,13 @@ pub fn employee_timeout_ceiling(home_dir: &Path, agent_id: &str) -> u64 {
         return DEFAULT_TIMEOUT_SECS;
     }
     let dir = home_dir.join("agents").join(agent_id);
-    let runtime = agent_timeout_secs(&dir);
+    if !dir.join("agent.toml").is_file() { return DEFAULT_TIMEOUT_SECS; }
+    // Authorization retains the pre-policy employee limit, independently of
+    // Claude's execution default and any larger global default/ceiling.
+    let legacy = raw_agent_timeout_secs(&dir)
+        .map(|n| n.clamp(MIN_TIMEOUT_SECS as i64, MAX_TIMEOUT_SECS as i64) as u64)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let runtime = legacy.min(effective_agent_timeout_secs(&dir));
     let container = std::fs::read_to_string(dir.join("agent.toml"))
         .ok()
         .and_then(|text| text.parse::<toml::Value>().ok())
@@ -504,23 +590,21 @@ fn raw_agent_timeout_secs(agent_dir: &Path) -> Option<i64> {
 
 /// Resolve the typed per-agent timeout, tolerating old or malformed settings.
 pub fn agent_timeout_secs(agent_dir: &Path) -> u64 {
-    match raw_agent_timeout_secs(agent_dir) {
-        Some(value) => {
-            let clamped = value.clamp(MIN_TIMEOUT_SECS as i64, MAX_TIMEOUT_SECS as i64);
-            if clamped != value {
-                static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, i64>>> = std::sync::OnceLock::new();
-                let should_warn = WARNED.get_or_init(Default::default).lock()
-                    .map(|mut values| values.insert(agent_dir.to_path_buf(), value) != Some(value))
-                    .unwrap_or(false);
-                if should_warn {
-                    tracing::warn!(agent_dir = %agent_dir.display(), value, effective = clamped,
-                        "[runtime] timeout_secs outside 30..=3600; clamping");
-                }
-            }
-            clamped as u64
-        }
-        None => DEFAULT_TIMEOUT_SECS,
-    }
+    resolve_timeout(Some(agent_dir), timeout_policy(agent_dir), DEFAULT_TIMEOUT_SECS, false)
+}
+
+/// Largest employee setting an owner may set without widening authority.
+/// An unset setting keeps the historical 300-second authorization baseline.
+pub fn agent_timeout_authorization_ceiling(agent_dir: &Path) -> u64 {
+    let policy = timeout_policy(agent_dir);
+    timeout_authorization_baseline(raw_agent_timeout_secs(agent_dir), policy).min(policy.max_secs)
+}
+
+pub fn effective_agent_timeout_secs(agent_dir: &Path) -> u64 {
+    let policy = timeout_policy(agent_dir);
+    let settings = load_runtime_settings(agent_dir);
+    let fallback = runtime_default_timeout(Some(settings.provider.as_str()), policy);
+    resolve_timeout(Some(agent_dir), policy, fallback, false)
 }
 
 /// Load `[runtime] provider` / `[runtime] fallback` / `[model] utility` from the
@@ -1286,12 +1370,14 @@ mod tests {
 
     #[test]
     fn runtime_timeout_defaults_clamps_and_ignores_wrong_types() {
-        let dir = TempDir::new().unwrap();
-        assert_eq!(agent_timeout_secs(dir.path()), 300);
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(agent_timeout_secs(&dir), 300);
         for (literal, expected) in [("900", 900), ("30", 30), ("3600", 3600),
             ("-1", 30), ("3601", 3600), ("\"oops\"", 300), ("1.5", 300), ("true", 300)] {
-            write_agent_toml(dir.path(), &format!("[runtime]\ntimeout_secs = {literal}\n"));
-            assert_eq!(agent_timeout_secs(dir.path()), expected, "{literal}");
+            write_agent_toml(&dir, &format!("[runtime]\ntimeout_secs = {literal}\n"));
+            assert_eq!(agent_timeout_secs(&dir), expected, "{literal}");
         }
     }
 
@@ -2145,6 +2231,102 @@ mod tests {
         let consulted = CONSULTED_NOTICES.with(|n| n.borrow().clone());
         assert!(consulted.is_empty());
     }
+
+    #[test]
+    fn claude_timeout_policy_preserves_defaults_and_clamps_employees() {
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_toml(&dir, "[runtime]\nprovider='claude'\n");
+        assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 1800);
+        assert_eq!(effective_agent_timeout_secs(&dir), 1800);
+        for provider in ["Claude", " claude ", "removed-runtime"] {
+            write_agent_toml(&dir, &format!("[runtime]\nprovider={provider:?}\n"));
+            assert_eq!(load_runtime_settings(&dir).provider, RuntimeType::Claude);
+            assert_eq!(runtime_default_timeout(Some(provider), TimeoutPolicy::default()), 1800);
+            assert_eq!(effective_agent_timeout_secs(&dir), 1800, "{provider}");
+        }
+        for provider in RuntimeType::ALL.iter().filter(|p| **p != RuntimeType::Claude) {
+            write_agent_toml(&dir, &format!("[runtime]\nprovider='{}'\n", provider.as_str()));
+            assert_eq!(call_timeout_secs(Some(&dir)), 300, "{provider:?}");
+            assert_eq!(effective_agent_timeout_secs(&dir), 300, "{provider:?}");
+        }
+        write_agent_toml(&dir, "[runtime]\nprovider='claude'\ntimeout_secs=900\n");
+        assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 900);
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=600\ndefault_timeout_secs=120\n").unwrap();
+        assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 600);
+        assert_eq!(call_timeout_secs(Some(&dir)), 600);
+        write_agent_toml(&dir, "[runtime]\nprovider='claude'\n");
+        assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 120);
+        assert_eq!(call_timeout_secs(Some(&dir)), 120);
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=14400\n").unwrap();
+        write_agent_toml(&dir, "[runtime]\ntimeout_secs=12000\n");
+        assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 12000);
+        assert_eq!(call_timeout_secs(Some(&dir)), 12000);
+    }
+
+    #[test]
+    fn employee_edit_authorization_is_separate_from_effective_timeout() {
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_toml(&dir, "[runtime]\nprovider='claude'\n");
+        assert_eq!(effective_agent_timeout_secs(&dir), 1800);
+        assert_eq!(agent_timeout_authorization_ceiling(&dir), 300);
+        write_agent_toml(&dir, "[runtime]\nprovider='claude'\ntimeout_secs=900\n");
+        assert_eq!(agent_timeout_authorization_ceiling(&dir), 900);
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=600\n").unwrap();
+        assert_eq!(agent_timeout_authorization_ceiling(&dir), 600);
+        assert_eq!(effective_agent_timeout_secs(&dir), 600);
+    }
+
+    #[test]
+    fn ephemeral_codex_role_uses_home_timeout_policy() {
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join("agents/.ephemeral/codex-role");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_toml(&dir, "[runtime]\nprovider='codex'\ntimeout_secs=1800\n");
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=600\ndefault_timeout_secs=120\n").unwrap();
+        assert_eq!(call_timeout_secs(Some(&dir)), 600);
+        write_agent_toml(&dir, "[runtime]\nprovider='codex'\n");
+        assert_eq!(call_timeout_secs(Some(&dir)), 120);
+    }
+
+    #[test]
+    fn invalid_timeout_policy_restores_previous_hard_defaults() {
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        for bad in ["runtime = false", "[runtime]\ndefault_timeout_secs=false", "not toml", "[runtime]\nmax_timeout_secs=0", "[runtime]\nmax_timeout_secs=14401",
+            "[runtime]\nmax_timeout_secs='unlimited'", "[runtime]\ndefault_timeout_secs=0",
+            "[runtime]\nmax_timeout_secs=60\ndefault_timeout_secs=61"] {
+            std::fs::write(home.path().join("config.toml"), bad).unwrap();
+            write_agent_toml(&dir, "[runtime]\nprovider='claude'\n");
+            assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 1800, "{bad}");
+            assert_eq!(call_timeout_secs(Some(&dir)), 300, "{bad}");
+            for provider in RuntimeType::ALL.iter().filter(|p| **p != RuntimeType::Claude) {
+                write_agent_toml(&dir, &format!("[runtime]\nprovider='{}'\n", provider.as_str()));
+                assert_eq!(effective_agent_timeout_secs(&dir), 300, "{bad}: {provider:?}");
+                assert_eq!(call_timeout_secs(Some(&dir)), 300, "{bad}: {provider:?}");
+            }
+            write_agent_toml(&dir, "[runtime]\ntimeout_secs=20000\n");
+            assert_eq!(claude_timeout_secs(home.path(), Some(&dir)), 3600);
+            assert_eq!(call_timeout_secs(Some(&dir)), 3600);
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_claude_task_timeout_cannot_exceed_global_ceiling() {
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=600\n").unwrap();
+        let got = TASK_TIMEOUT_SECS.scope(Some(("anna".into(), 1800)), async {
+            claude_timeout_secs(home.path(), Some(&dir))
+        }).await;
+        assert_eq!(got, 600);
+    }
+
 }
 
 #[path = "runtime_config/alignment.rs"]

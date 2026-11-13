@@ -75,6 +75,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
 import { WardrobeDialog } from '@/components/agent/WardrobeDialog';
 import { ToolPruningCard } from '@/components/agent/ToolPruningCard';
+import { DelegationEffectiveCard } from '@/components/agent/DelegationEffectiveCard';
 import { ComputerSessionPanel } from '@/components/agent/ComputerSessionPanel';
 import { AgentFilesTab } from '@/pages/agent-files/AgentFilesTab';
 import { UnsavedChangesDialog } from '@/components/agent-files/UnsavedChangesDialog';
@@ -718,6 +719,9 @@ function OverviewTab({
           </div>
 
           <ToolPruningCard key={detail.name} agentId={detail.name} />
+
+          {/* RM-137: the delegation the gateway applies to this employee (read-only). */}
+          <DelegationEffectiveCard agentId={detail.name} />
 
           {/* Live activity tail. */}
           <Card>

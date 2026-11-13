@@ -72,6 +72,31 @@ impl MethodHandler {
                 ) {
                     obj.insert("minimal_context".into(), json!(mc));
                 }
+                // RM-137: the four gated `[permissions]` flags as the MCP
+                // dispatch gate applies them (same reader,
+                // `agent_toml::load_permissions_checked`): a missing
+                // `can_create_agents` resolves by role, an unreadable file
+                // refuses all four. The edit page displays these instead of
+                // re-deriving defaults.
+                let effective_permissions =
+                    match duduclaw_core::agent_toml::load_permissions_checked(&a.dir) {
+                        Ok(p) => {
+                            let mut m = serde_json::Map::new();
+                            for flag in duduclaw_core::agent_toml::GATED_PERMISSION_FLAGS {
+                                m.insert(flag.to_string(), json!(p.allows(flag)));
+                            }
+                            m.insert("error".into(), Value::Null);
+                            Value::Object(m)
+                        }
+                        Err(e) => {
+                            let mut m = serde_json::Map::new();
+                            for flag in duduclaw_core::agent_toml::GATED_PERMISSION_FLAGS {
+                                m.insert(flag.to_string(), json!(false));
+                            }
+                            m.insert("error".into(), json!(e));
+                            Value::Object(m)
+                        }
+                    };
                 if let Some(obj) = capabilities_json.as_object_mut() {
                     // Empty lists are skipped on serialize; the editors need
                     // a stable `string[]`.
@@ -79,9 +104,7 @@ impl MethodHandler {
                         obj.entry(k).or_insert_with(|| json!([]));
                     }
                 }
-                WsFrame::ok_response(
-                    "",
-                    json!({
+                let mut payload = json!({
                         "name": cfg.agent.name,
                         "display_name": cfg.agent.display_name,
                         "role": format!("{:?}", cfg.agent.role).to_lowercase(),
@@ -238,6 +261,9 @@ impl MethodHandler {
                         // file so the dashboard tells "unset" from an explicit false
                         // (drives the PTY-pool OAuth default-enable materialization).
                         "runtime": runtime_json,
+                        "effective_timeout_secs": crate::runtime_config::effective_agent_timeout_secs(&self.home_dir.join("agents").join(&cfg.agent.name)),
+                        "max_timeout_secs": crate::runtime_config::TimeoutPolicy::load(&self.home_dir).max_secs,
+                        "timeout_authorization_ceiling_secs": crate::runtime_config::agent_timeout_authorization_ceiling(&self.home_dir.join("agents").join(&cfg.agent.name)),
                         // [os_watch] table — raw from agent.toml (typed config doesn't
                         // surface it), so the OS-native watch editor prefills the
                         // operator's own paths/ignore/debounce rather than defaults.
@@ -253,8 +279,11 @@ impl MethodHandler {
                             "self_study": research_cfg.self_study,
                             "self_study_hour": research_cfg.self_study_hour,
                         },
-                    }),
-                )
+                    });
+                // Added after the literal: the object above is already deep
+                // in `json!`'s recursion budget.
+                payload["effective_permissions"] = effective_permissions;
+                WsFrame::ok_response("", payload)
             }
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
         }

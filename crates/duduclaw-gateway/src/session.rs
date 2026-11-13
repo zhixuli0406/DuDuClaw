@@ -1039,22 +1039,45 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))
     }
 
-    /// Persist a display-only failure without affecting context or token totals.
-    pub(crate) async fn record_webchat_failure(&self, session_id: &str, text: &str) -> Result<()> {
-        let masked = duduclaw_security::credential_detect::mask(text);
-        let text = duduclaw_core::truncate_chars(&masked, 2000);
-        let conn = self.acquire().await;
-        crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?; // F6fb
-        conn.execute(
+    /// Display-only, closed-vocabulary outcome, idempotent across failure layers.
+    /// Reuse client_msg_id as the notice's turn key; no schema change is needed.
+    pub(crate) async fn record_turn_failure(
+        &self, session_id: &str, turn_id: &str,
+        reason: crate::channel_reply::TurnFailureReason, language: Option<&str>,
+        generation: Option<&str>,
+    ) -> Result<()> {
+        if crate::odoo_livechat::is_public_visitor_session(session_id) { return Ok(()); }
+        let mut conn = self.acquire().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        crate::isolation_label_stores::check_session_writable(&tx, session_id).map_err(DuDuClawError::Gateway)?;
+        let session: Option<(String, Option<String>)> = tx.query_row(
+            "SELECT created_at, origin_kind FROM sessions WHERE id=?1", [session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let Some((created, origin)) = session else { return Ok(()); };
+        // A /new must never attach an old failure to the new conversation.
+        if generation.is_some_and(|expected| expected != created) { return Ok(()); }
+        let widget_principal = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+            .try_with(|user| crate::webchat::is_widget_visitor(user)).unwrap_or(false);
+        let visitor = widget_principal
+            || matches!(origin.as_deref(), Some("webchat_visitor" | "public_visitor"))
+            || session_id.strip_prefix("webchat:").is_some_and(crate::webchat::is_widget_visitor);
+        let reason = if visitor { crate::channel_reply::TurnFailureReason::Unknown } else { reason };
+        tx.execute(
             "INSERT INTO session_messages
-             (session_id, role, content, tokens, timestamp, hidden, notice_kind)
-             VALUES (?1, 'assistant', ?2, 0, ?3, 1, 'turn_failure')",
-            params![session_id, text, chrono::Utc::now().to_rfc3339()],
+             (session_id, role, content, tokens, timestamp, hidden, notice_kind, client_msg_id)
+             SELECT ?1, 'assistant', ?2, 0, ?3, 1, 'turn_failure', ?4
+             WHERE NOT EXISTS (SELECT 1 FROM session_messages
+                 WHERE session_id=?1 AND notice_kind='turn_failure' AND client_msg_id=?4)",
+            params![session_id, reason.text(language), chrono::Utc::now().to_rfc3339(),
+                format!("turn_failure:{turn_id}")],
         ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-        Ok(())
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))
     }
 
-    /// Only the WebChat history display may read hidden failure notices.
+    /// Conversation displays may read hidden failure notices; model history,
+    /// runs, search and exports continue to exclude them.
     pub(crate) async fn webchat_history(&self, session_id: &str) -> Result<Vec<WebChatHistoryMessage>> {
         let conn = self.acquire().await;
         let mut stmt = conn.prepare(
@@ -2850,7 +2873,7 @@ mod tests {
         assert_eq!(old.len(), 1);
         assert!(old[0].notice_kind.is_none());
         assert_eq!(old[0].message.content, "old question");
-        mgr.record_webchat_failure("legacy", "failed").await.unwrap();
+        mgr.record_turn_failure("legacy", "t1", crate::channel_reply::TurnFailureReason::Unknown, None, None).await.unwrap();
         assert_eq!(mgr.get_messages("legacy").await.unwrap().len(), 1);
         assert_eq!(mgr.webchat_history("legacy").await.unwrap().len(), 2);
     }
@@ -2865,7 +2888,7 @@ mod tests {
         mgr.hide_message("s1", hidden).await.unwrap();
         let redacted = mgr.append_message_with_id("s1", "assistant", "redacted", 5).await.unwrap();
         mgr.revoke_message("s1", redacted, "redacted").await.unwrap();
-        mgr.record_webchat_failure("s1", "failure password: fixture-secret").await.unwrap();
+        mgr.record_turn_failure("s1", "t1", crate::channel_reply::TurnFailureReason::Internal, None, None).await.unwrap();
         let display = mgr.webchat_history("s1").await.unwrap();
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].message.content, "question");
@@ -2888,9 +2911,9 @@ mod tests {
         assert_eq!(mgr.read_first_n_turns_text("s1", 100).await.unwrap(), "user: question\n");
         assert_eq!(mgr.read_last_n_turns_text("s1", 100).await.unwrap(), "user: question\n");
         assert_eq!(mgr.list_summary_candidates().await.unwrap()[0].turn_count, 1);
-        mgr.record_webchat_failure("s1", &"錯".repeat(2100)).await.unwrap();
+        mgr.record_turn_failure("s1", "t2", crate::channel_reply::TurnFailureReason::Unknown, None, None).await.unwrap();
         let display = mgr.webchat_history("s1").await.unwrap();
-        assert_eq!(display.last().unwrap().message.content.chars().count(), 2000);
+        assert_eq!(display.last().unwrap().message.content, crate::channel_reply::TurnFailureReason::Unknown.text(None));
         // Undo/redaction still hides a notice from the display.
         mgr.revoke_message("s1", failure_id, "redacted").await.unwrap();
         assert!(mgr.webchat_history("s1").await.unwrap().iter().all(|m| m.id != failure_id));

@@ -1,5 +1,25 @@
 # 儀表板設定對照（v1.80.0）
 
+## 自動化 → 執行、排程與檔案審查限制（v1.82.0）
+
+三張卡片僅限管理員儲存，沿用有鎖定保護的設定寫入流程。儲存後從下一次執行、檢查或送審生效，不需重新啟動。
+
+| 卡片／欄位 | `config.toml` 設定 | 預設值／範圍 |
+|---|---|---|
+| 單次執行／預設秒數 | `[runtime] default_timeout_secs` | 可留空；30 秒至 `max_timeout_secs`。留空會移除覆寫，Claude 維持 1800 秒，其他執行環境維持 300 秒。 |
+| 單次執行／最高秒數 | `[runtime] max_timeout_secs` | 3600；60～14400 秒。提高上限會讓長時間工作消耗更多額度。 |
+| 排程交辦／每人啟用上限 | `[goal_defaults] assign_schedule_max_active` | 20；0～200。0 禁止新增與恢復排程。 |
+| 排程交辦／最短間隔 | `[goal_defaults] assign_schedule_min_interval_minutes` | 60；非管理員為 60～10080 分鐘。管理員最短仍為 5 分鐘。 |
+| 檔案審查／每日總上限 | `[agent_files] review_daily_limit` | 200；0～100000。 |
+| 檔案審查／每人每日上限 | `[agent_files] review_daily_limit_per_user` | 40；0～100000。 |
+| 檔案審查／每位員工每日上限 | `[agent_files] review_daily_limit_per_agent` | 60；0～100000。 |
+| 檔案檢查／每人每分鐘上限 | `[agent_files] checks_per_minute` | 10；1～1000。 |
+| 檔案審核／每人待審申請上限 | `[agent_files] max_pending_per_user` | 20；1～200。 |
+
+員工既有的 `[runtime] timeout_secs` 現在也適用於 Claude，員工頁會顯示生效秒數與最高上限。超出最高上限的值會在儲存時拒絕，執行時則縮至上限。全域逾時設定無法驗證時，會記錄警告並恢復原本的硬性預設（Claude 1800 秒、其他 300 秒、最高 3600 秒），不會無限執行。有效的全域預設只取代未個別設定員工的執行環境預設；未設定時的預設值也受最高上限約束。任務本身與沙箱的限制仍可能提早結束執行；任務個別設定仍維持原本 30～3600 秒的範圍。
+
+網頁對話另有 15 分鐘上限，達到時會提示改為交辦背景任務。例行工作的常數與角色覆寫維持不變。審查額度用完仍至少警告（或阻擋），不會略過審查；沒有暫時放寬開關。未設定員工個別值時，非管理員負責人只能設定 300 秒以下，並須遵守更低的全域預設值或最高上限。
+
 ## 進階設定與公司資訊（v1.80.0）
 
 兩個版本的管理員都可開啟「設定 → 進階」（`/app/system/settings/advanced`）。較少使用的設定集中在同一頁，分成下列四組。搜尋會依目前語言（繁體中文、英文、日文）即時篩選區塊名稱、說明與欄位文字；展開符合的區塊即可編輯，沿用原有儲存方式、重啟提示及 RPC 權限。「一般、帳號、語音、主動通知」保留在常用設定。非管理員看不到兩個新頁面的導覽，也無法直接開啟。
@@ -232,6 +252,23 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 
 自訂類別與額外關鍵字在進階設定編輯器的 `[memory_privacy.custom_keywords]` 設定（例如 `legal_dispute = ["訴訟", "lawsuit"]`），再列入 `excluded_categories`。未知的類別名稱在儲存時會被拒絕。`config.toml` 讀不到或區段無效時，閘道會套用四個預設類別並記錄警告，`system.config` 會回報 `memory_privacy.load_state = "failed_closed"`。細節與「我的記憶」RPC 見[記憶智慧](../../features/zh-TW/20-memory-intelligence.md)中的「自動記憶不保存的個人話題」一節。
 
+## 設定 → 進階 → 安全與紀錄 → 委派權限
+
+僅限管理員（`delegation.get`／`delegation.set`）。儲存後下一次委派判斷就生效，不需重新啟動。
+
+| 控制項 | 設定鍵 | 生效時機 |
+|---|---|---|
+| 委派模式 → 部門模式（預設）／階層模式／開放模式／不允許委派（v1.82） | `config.toml [delegation] policy` = `department`／`hierarchy`／`open`／`none` | 下一次委派 |
+| 跨部門協作 → 配對 | `[delegation] allow = [["a", "b"], …]` | 下一次委派 |
+
+**不允許委派（`none`，v1.82.0）。** AI 員工之間不能互相委派、傳訊、呼叫、建立員工或指派工作：`send_to_agent`、`spawn_agent`、`spawn_ephemeral`、`create_agent`、指派給其他員工的 `tasks_create`／`create_task`、改派任務、替其他員工排程，以及工作佇列的分派閘門都會拒絕。前四個工具不會出現在員工的工具清單；`tasks_create`、`create_task` 仍列出，供員工處理自己的工作。跨部門配對會保留但不生效（頁面會標示）。人與你設定的排程（儀表板、cron、heartbeat、目標循環）仍可把工作交給員工。團隊模式（同一位員工的規劃、執行、檢查角色在同一回合內交換任務封包）照常運作。
+
+**無法辨識的值一律視為不允許委派（v1.82.0 行為變更）。** `policy` 不是這四個值之一（打錯字、數字）、`[delegation]` 不是區段，或 `config.toml` 存在但讀不到、格式錯誤時，一律以 `none` 執行。v1.82.0 以前會改用較寬的 `department`。閘道每個程序只記錄一次警告；頁面會在警告區列出，`delegation.get` 以 `configured_policy` 回傳原始值；檔案無法解析時，`delegation.get` 與 `delegation.set` 都回傳錯誤，不會寫入任何內容。請在設定檔進階編輯修正。
+
+**讀取失敗不會蓋掉設定（v1.82.0）。** 頁面讀不到目前設定時會顯示錯誤，所有選項與「儲存」都停用，直到「再試一次」成功為止；不會送出沒有讀到的內容。
+
+**員工頁 → 總覽 → 委派範圍（v1.82.0）。** 唯讀卡片顯示這位員工實際適用的設定：生效的委派模式、來自全公司設定還是員工自己的「允許跨 AI 員工通訊」開關（`[permissions] can_send_cross_agent = false` 會讓這位員工視為 `none`）、能否建立員工或臨時助手、和他有關的配對（目前模式下不生效的另外列出），以及設定檔的問題。管理員與有權查看這位員工的經理可以看到（`delegation.effective {agent_id}`，唯讀）。配對設定有寫錯而被忽略的項目時，卡片只顯示數量（「委派設定有 N 則警告，管理員可以到「設定」查看」）；警告原文會引用原始設定內容，只在本頁（管理員）顯示。要修改請到本頁或員工編輯頁。
+
 ## 通道管理
 
 - 群組「只回提及」（`mention_only`，每個群組各自設定）：v1.76 起，LINE 群組開啟後只回應用 `@` 叫 AI 員工（或要 @ 名單）的訊息，以及被點名員工正在等的那一則；以前開了會整個群組沒有回應。Telegram 共用 bot 也接受員工名字。見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)。
@@ -357,7 +394,7 @@ WebChat 與儀表板 RPC 連線原本就由伺服器每 30 秒送出 WebSocket p
 | 腦袋與引擎 → 推理力度 | `[model] effort` |
 | 腦袋與引擎 → AI 後端／備援後端 | `[runtime] provider`／`fallback`，新增 qwen、kimi、copilot、kiro、cursor、vibe、opencode |
 | 腦袋與引擎 → 精簡啟動內容 | `[runtime] minimal_context` |
-| 腦袋與引擎 → 單次執行時間上限 | `[runtime] timeout_secs`：整數秒，預設 300，範圍 30～3600；適用 Codex／Grok／其他 CLI／OpenAI 相容 API；Claude 另有固定 30 分鐘上限 |
+| 腦袋與引擎 → 單次執行時間上限 | `[runtime] timeout_secs`: 30 秒至全域最高上限；Claude 與其他執行環境皆適用。預設值與驗證方式見上方 v1.82.0 限制說明。 |
 | 腦袋與引擎 → 輔助模型 | `[model] utility`：Codex 與 OpenAI 相容 API 留白時沿用主要模型；Claude 預設 `claude-haiku-4-5`；Grok 與通用 CLI 改用全域背景設定 |
 | 腦袋與引擎 → 一員工四角色 | `[team] enabled`、`[team.roles.<角色>]` |
 | 自動化 → 夜間整理 | `[night_engine] enabled` |
@@ -368,9 +405,9 @@ WebChat 與儀表板 RPC 連線原本就由伺服器每 30 秒送出 WebSocket p
 
 **員工預算。** `[budget] daily_cap_cents` 與 `monthly_limit_cents` 分別比對最近 24 小時與 30 天的已記錄花費，`hard_stop = true` 時達上限就拒絕下一次模型呼叫；0 代表不限額，執行中的呼叫仍可能超過上限。檢查涵蓋 Claude 與其他員工後端、派工與排程、提醒、郵件、心跳、輔助工作及 CLI 分支／評測。短期員工的已記錄花費也算進父員工，先以千分之一美分加總，再換算美分。員工設定檔可讀時，`[budget] when_unavailable = "allow"`（未填時的預設值）會在費用資料庫或查詢讀不到時留下明確警告與稽核紀錄並繼續；設成 `"deny"` 則在模型呼叫前拒絕。設定檔本身讀不到或無法解析時，無法確認這項政策，一律拒絕。未知政策值按 `"deny"` 處理並警告。無法檢查會顯示自己的原因與稽核事件，不會說成「花費達上限」，也不會發出斷路器開關通知。預算拒絕不觸發帳號輪替或備援。沒有員工 id 的呼叫不適用此政策。 指定員工目錄的輔助呼叫，以有效設定的 `[agent].name` 檢查預算並記錄後續花費，即使呼叫端原本使用作業名稱。舊有只記在作業名稱下的費用，無法可靠回填到各員工。
 
-單次執行時間上限與容器任務的逾時設定分開儲存。伺服器會拒絕非整數或超出 30～3600 秒的值；手動編輯檔案時，超出範圍的整數會調整到界線，型別錯誤則用預設值，兩者都會記錄警告。OpenAI 相容 API 員工需要在 `utility` 或 `preferred` 指定模型；Codex 可使用 CLI 預設模型；Grok 與通用 CLI 員工改用全域背景設定。輔助模型與 runtime 的廠商家族不符時，畫面會提醒對話壓縮、事實擷取等背景工作將失敗。
+單次執行時間上限與容器任務的逾時設定分開儲存。伺服器會拒絕非整數或超出 30 秒至全域最高上限的值；手動編輯檔案時，超出範圍的整數會調整到界線，型別錯誤則用預設值，兩者都會記錄警告。OpenAI 相容 API 員工需要在 `utility` 或 `preferred` 指定模型；Codex 可使用 CLI 預設模型；Grok 與通用 CLI 員工改用全域背景設定。輔助模型與 runtime 的廠商家族不符時，畫面會提醒對話壓縮、事實擷取等背景工作將失敗。
 
-提高 `timeout_secs` 的實際上限需要管理員。員工擁有者可降低上限；清空設定會還原為 300 秒，若因此高於目前上限，同樣需要管理員。
+提高 `timeout_secs` 的實際上限需要管理員。員工擁有者可降低上限；清空設定會還原為全域預設（未設全域預設時 Claude 為 1800 秒，其他為 300 秒），若因此高於目前上限，同樣需要管理員。
 
 Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪替；一般對話仍保留原有帳號輪替。
 
@@ -380,7 +417,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 **誰能存檔（v1.76.0，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔v1760)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 
-**權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。`can_create_agents` 例外：從 v1.81.0 起，沒寫這個鍵時只有 `main` 員工視為 `true`，其他員工視為 `false`；v1.68 的開機遷移不再替非 main 員工打開它；透過 MCP `create_agent` 建立的員工一律為 `false`（見[安全防線](../../features/zh-TW/05-security-defense.md)）。這頁的開關在缺少這個鍵時會顯示為開啟，即使實際值是關閉；請查看 `agent.toml`，或明確設定開關。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
+**權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。`can_create_agents` 例外：從 v1.81.0 起，沒寫這個鍵時只有 `main` 員工視為 `true`，其他員工視為 `false`；v1.68 的開機遷移不再替非 main 員工打開它；透過 MCP `create_agent` 建立的員工一律為 `false`（見[安全防線](../../features/zh-TW/05-security-defense.md)）。從 v1.82.0 起，這頁的開關顯示閘門實際套用的值（`agents.inspect` 的 `effective_permissions`，和 MCP 閘門用同一個讀取函式）：非 main 員工沒寫 `can_create_agents` 時顯示為關閉，`agent.toml` 讀不到、或舊版 gateway 沒有回傳 `effective_permissions` 時全部顯示為關閉（不沿用檔案內的值）。沒有動過的開關不會在儲存時送出，所以沒改動的表單不會改變任何權限。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
 
 ## 管理 → 成員：直屬主管與組織圖（企業版，1.76.0）
 
@@ -478,6 +515,15 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
+### 建立之後修改員工的人格設定（v1.82.0）
+
+建立時給的人格設定（空白建立表單裡選填的「人格設定」、`agents.create` 的 `soul_md` 欄位，或板模的 SOUL.md）只是起點。從 v1.82.0 起，有給人格設定就一定會寫入，寫不進去就整個建立失敗，不會再被換成預設的一句話。之後要修改：
+
+- **儀表板：** 員工頁 →「設定檔」→「人格設定（`SOUL.md`）」→「編輯」→「儲存並檢查」。
+- **RPC：** 先呼叫 `agent_files.get {agent_id, file: "soul"}`，拿到目前的 `content` 與它的 `hash`；再呼叫 `agent_files.save {agent_id, file: "soul", content, base_hash: <剛才的 hash>}`。只有這位員工的負責人與管理員能存檔，AI 員工自己永遠不能改自己的 SOUL.md。
+- **存檔會經過審查，不是直接套用。** 會跑上面「每次存檔都檢查」的流程，回應的 `status` 說明結果：`applied`（從員工的下一則對話開始生效）、`unchanged`、`needs_confirmation`（再送一次並帶 `action: "confirm"`、`review.analysis_id` 與至少 4 個字的 `reason`）、`blocked`（非管理員再送一次並帶 `action: "request_approval"`，會得到 `pending_approval` 與 `approval_id`，由管理員在儀表板決定；管理員要帶 `reason` 與 `acknowledge_risk: true` 才能確認）、`conflict`（別人先存了：重新 `get` 再改一次），或 `rejected`（被固定規則拒絕，請修改內容）。
+- 每次套用的修改都會留下版本，可以用 `agent_files.history`／`agent_files.rollback` 還原先前的人格設定。
+
 - **匯出設定檔：** Manager 與管理員可從有權檢視的員工頁選單選擇「匯出設定檔」，支援 DuDuClaw、OpenClaw、Hermes、AGENTS.md 與 Claude Code subagent。服務對象介紹預設不包含，要明確勾選。OpenClaw／Hermes 請逐一下載並放入同一個資料夾。秘密、通道、能力、權限、帳號池與記憶不會匯出。見 [Agent File 參考](../../spec/zh-TW/agent-file-spec.md)。
 - **服務對象：** 使用相同的鎖定、版本與審查流程儲存。提示詞以 `<user_profile>` 資料區塊載入，明確註明不是指令，並經過與人格相同的輸入檢查。最多 4,000 個字，優先於一般 Markdown 的位元組上限。
 
@@ -487,7 +533,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 
 直接開啟 `/goals` 的「我交辦的 → 排程」可暫停、恢復與刪除，管理員可切換看所有人的排程。暫停或刪除先於任務落地，就不會建立該輪任務；已落地的任務需另外停止。恢復會重驗建立者權限與目前執行間隔限制。
 
-設定檔 `[goal_defaults] assign_schedule_max_active` 預設每人 20 個（0–200）；`assign_schedule_min_interval_minutes` 預設非管理員最短 60 分鐘，只能調高，既有排程下次執行也會檢查。詳見[排程交辦](../../features/zh-TW/67-assigning-tasks.md)。
+管理員可在「設定 → 自動化 → 排程交辦限制」調整設定檔 `[goal_defaults] assign_schedule_max_active`，預設每人 20 個（0–200）；`assign_schedule_min_interval_minutes` 預設非管理員最短 60 分鐘，只能調高，既有排程下次執行也會檢查。詳見[排程交辦](../../features/zh-TW/67-assigning-tasks.md)。
 
 ## 系統 → 系統更新（v1.76.2）
 
@@ -766,3 +812,17 @@ AI 員工回覆時，你仍可輸入並送出下一則訊息。同一個對話�
 收件者開啟 `/invite#<token>`，設定並確認密碼（至少八個字元，最多 1,024 UTF-8 位元組），再走一般登入流程。此頁不會直接登入，原有 MFA 註冊與驗證要求仍適用。過期、已使用、已撤銷及不存在的連結顯示相同結果。停權或離職帳號不能使用邀請。變更帳號信箱、密碼或停用帳號，也會撤銷未使用的邀請。
 
 員工首頁在個人連線尚未完成時顯示「還差幾步」連線提醒卡片，各項連往「我的連線」。這張卡片與新同仁第一次登入的上手引導卡片標題相同，但只追蹤個人連線。全部完成或讀取失敗時不顯示，也可以在目前瀏覽器關閉卡片。系統記錄建立、寄送結果、使用與撤銷事件，不記錄權杖或連結。頁面讀取網址片段後立即從瀏覽紀錄移除，只在元件狀態保留權杖。公開 `/invite` 頁面不受登入或 FirstRunGate 限制。API 僅提供 `POST /api/invite/check`，以 `{token}` 回傳 `{valid,email_masked?}`，以及 `POST /api/invite/redeem`，接收 `{token,password}`；不再提供帶權杖的 API 路徑。請勿記錄請求本文。同一 TCP 來源 IP 與權杖 SHA-256 前 16 個十六進位字元共用每 15 分鐘 10 次額度；不設來源 IP 的總額度，避免反向代理後的使用者互相阻擋。記憶體表最多保存 10,000 個桶；容量滿時優先淘汰過期桶；沒有過期桶時，才淘汰最早插入的桶。排序索引讓每次請求都不必掃描全表。不採用轉送標頭。
+
+## 成員的主要 AI
+
+管理員可在「使用者 → 編輯 → 主要 AI」選擇該成員已綁定、具有負責人或操作權限的 AI，或選「無」，再按「設定主要 AI」。此按鈕只儲存主要 AI；其他帳號欄位請另外按「儲存」。成員仍可從側欄設定自己的主要 AI。這項設定不會增加使用權限，變更會留下帳號稽核紀錄。
+
+透過成員綁定 RPC 首次取得負責人或操作權限時，如果尚無主要 AI，會在同一筆交易設為主要 AI；先前只有檢視權限也適用。新增成員表單原本就要求從符合條件的綁定中指定主要 AI。升級不會自動補齊既有帳號，後續增加綁定也不會填回刻意清空的設定。
+
+在職成員有符合條件的綁定但沒有主要 AI 時，使用者頁會顯示「N 位成員尚未設定主要 AI → 設為第一位 AI」。點開後先查看成員及各自最早符合條件的綁定，再確認套用；取消不會變更。確認期間名單若有變動，需重新預覽。修補結果與稽核紀錄在同一筆交易寫入。
+
+`users.set_primary_agent` 接受 `{agent_id: string|null, user_id?: string}`；指定其他使用者時須為目前有效的管理員。`users.repair_primary_agents` 僅管理員可用：`{}` 預覽回傳 `{members, preview_digest, excluded_personal_count, changed:false}`；`{preview_digest}` 套用相同名單並回傳 `{members, preview_digest, excluded_personal_count, changed:true}`。名單每項包含 `user_id`、`display_name`、`agent_id`。
+
+`users.update`、`users.create`、`users.bind_agent` 會在寫入前拒絕未知欄位與無效值。輸入驗證錯誤以 `{code:"invalid_setting", key, message}` 指出欄位；主管循環等既有業務錯誤維持原代碼。`primary_agent_id` 不是 `users.update` 支援的欄位，請使用 `users.set_primary_agent`。
+
+受保護模式下，修補候選會排除個人專屬員工的綁定，預覽另回傳被排除的成員人數；橫幅人數以預覽為準。個人專屬 AI 須由成員自行設定，管理員選單會略過無法代設的綁定。確認只傳預覽摘要，伺服器在 IMMEDIATE 交易內重算完整有序名單與 SHA-256 摘要；不一致就拒絕整筆變更。migration、restore 與個人員工建立不會自動指定主要 AI。`users.list` 若讀不到綁定，會拒絕整份清單。

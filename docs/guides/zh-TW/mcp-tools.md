@@ -111,6 +111,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 | `[knowledge] enabled` 加集合授權 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | 除非知識庫啟用、且至少有一個集合授權給員工或其部門（經 `[knowledge] collections` 縮小後），否則隱藏 4 個 `knowledge_*`；授權變更會送出 `list_changed`（見下方 [`knowledge_*`](#knowledge_文件知識庫)） |
 | `[responsibilities] enabled` | `config.toml` | 隱藏 3 個 `responsibility_*`（見下方[持續任務工具](#responsibility_get--responsibility_followup--responsibility_ask持續任務工具)） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有效授權 | 在階段性授權生效前一律隱藏 |
+| 團隊角色成員（v1.82） | `agents/.ephemeral/eph-*` 角色成員，`[team_member]` 與 `ephemeral.toml` 的上層員工一致，且身分通過權杖驗證（`DUDUCLAW_AGENT_TOKEN`） | 在任何委派模式下，其他呼叫者都看不到 `team_handoff`，所以一般員工的工具清單比以前少一支；處理程式對同樣的呼叫者回 `not_a_team_member` |
 
 機器操作主控台（`/console`）只開放給管理員。`system_operator` 員工執行機器操作工具時，伺服器也會確認交辦人仍是啟用中的管理員；其他 AI 員工的一般對話仍依原有授權使用。
 
@@ -180,7 +181,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 | `modify` | `false` | `true`；`memory_store`、`user_profile_record`、`wiki_rebuild_fts` 只新增或重新產生，標 `false`。`wiki_export` 仍標 `true`：它會覆寫上一次的匯出，包括可能已被人編輯過的 Obsidian vault |
 | `delete`、`purchase`、`admin` 與表上沒有的名稱 | `false` | `true` |
 
-記憶、wiki、使用者偏好與 `code_map` 工具另外標 `openWorldHint: false`；`memory_alias_add`、`wiki_export`、`wiki_rebuild_fts` 標 `idempotentHint: true`。這幾份清單在 `crates/duduclaw-cli/src/mcp/tools_def/annotations.rs`。
+記憶、wiki、使用者偏好與 `code_map` 工具另外標 `openWorldHint: false`；`memory_alias_add`、`wiki_export`、`wiki_rebuild_fts` 標 `idempotentHint: true`。這幾份清單在 `crates/duduclaw-core/src/mcp_tool_defs/annotations.rs`。
 
 這些提示給 MCP 用戶端參考（例如呼叫前要不要先問人），不代表任何授權，DuDuClaw 的每道閘門照常檢查。它們不計入上面的說明字數預算：Claude Code 與 Codex 交給模型的工具清單只有名稱、說明與輸入 schema。
 
@@ -194,7 +195,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 
 ### `tasks_create` — 目標的單次執行時限
 
-`tasks_create` 搭配 `kind="goal"`（非排程）時接受 `timeout_secs`，30～3600 的整數秒：這個目標每一輪的每次 CLI 執行／API 請求都用它，取代被指派員工的單次執行時間上限。透過 MCP 只能設成小於或等於員工本身的上限；要給目標更多時間，由管理員在儀表板交辦。Claude 員工不套用（固定 30 分鐘）。`tasks_update` 會拒絕這個欄位。例如 `{"kind":"goal","title":"核對帳目","assigned_to":"anna","timeout_secs":180}`。
+`tasks_create` 搭配 `kind="goal"`（非排程）時接受 `timeout_secs`，30～3600 的整數秒：這個目標每一輪的每次 CLI 執行／API 請求都用它，取代被指派員工的單次執行時間上限。透過 MCP 只能設成小於或等於員工本身的上限；要給目標更多時間，由管理員在儀表板交辦。Claude 員工也適用；執行時仍受目前全域 `[runtime] max_timeout_secs` 約束。`tasks_update` 會拒絕這個欄位。例如 `{"kind":"goal","title":"核對帳目","assigned_to":"anna","timeout_secs":180}`。
 
 ### `office_script` — 內建 Office 腳本
 
@@ -303,6 +304,10 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 `agent_remove` 會把該員工移到 `~/.duduclaw/agents/_trash/`，並回覆該員工已被移除、管理員可以還原、名稱已被保留，不會回傳路徑。接著 `create_agent` 會對所有 MCP 呼叫端拒絕這個名稱，條件是 trash 裡還有對應項目、`org.toml` 仍記錄這個 id 但沒有對應目錄，或 trash 無法列出；換一個名稱則可以建立。操作者可以從 Dashboard 或終端機重用這個名稱。透過 HTTP 且使用非內部金鑰時，兩個工具都以該金鑰自己的 client id 作為身分執行。細節見[委派隔離](../../features/zh-TW/37-delegation-isolation.md#被移除員工的名稱仍被保留)。
 
+### `create_agent`：人格設定與名額（v1.82.0）
+
+人格設定放在 `soul_md`（`soul` 是舊名稱；空字串視同沒給，兩個都有內容且不同才會被拒絕）。內容會經過和板模建立相同的 SOUL.md 安全檢查；檢查沒過或 SOUL.md 寫不進去，整個呼叫都會失敗，磁碟上不留任何東西；拒絕訊息會說明原因類別（HTML 註解、不可見字元、隱藏內容、提示注入句型），但不引用內容。工具沒有讀的參數不會被拒絕，回覆會在「Ignored arguments (no effect)」列出（最多 20 個名稱、每個最多 64 字，其餘以「… and N more」表示）。授權名額計算所有狀態不是 `deleted` 的員工（已封存的員工仍佔名額）；額滿拒絕時只回覆上限與目前已使用的名額數，不列出佔用名額的員工（管理員可在儀表板看到清單）。名額檢查與建立是同一個步驟，和儀表板、專家包匯入共用同一把鎖，同時建立也不會超過上限。員工不能用檔案工具修改自己的 `[agent] status`，`agent_update` 也不能變更已封存或已刪除員工的 `status`；封存、恢復與刪除只能在儀表板操作。之後要改人格設定，見[建立之後修改員工的人格設定](dashboard-settings.md#建立之後修改員工的人格設定v1820)。
+
 ### `responsibility_get` / `responsibility_followup` / `responsibility_ask`：持續任務工具
 
 [持續任務](continuous-responsibilities.md)的三個工具。只有 `config.toml [responsibilities] enabled` 為真、而且呼叫端是 AI 員工身分時才會列出（外部用戶端看不到）；功能關閉時每次呼叫都會被拒絕。它們和 `tasks_*` 工具一樣需要 Admin scope，閘道自己的金鑰帶有這個 scope。
@@ -371,7 +376,7 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 只有精確名稱 `duduclaw`、`duduclaw-pro` 或目前 instance 的 key 才是內建欄位；`duduclaw-evil` 仍視為第三方。產生有效設定時，內建欄位的 command、args、env 整筆換成主程式當次產生的 canonical 設定，因此金鑰輪替、執行檔改名或偽造 command 都不會沿用原始值。任何名稱的 raw `mcp-proxy` 呼叫仍被拒絕，第三方也不能攜帶 proxy 私有環境變數。Claude 在沒有代理用途或只有內建伺服器時維持不加旗標；內建設定仍由原本的啟動準備流程修復。Fork 複本的來源可能是未經員工準備流程的一般專案，因此即使 gate 關閉，複本仍會重建內建欄位。讀取秘密必須有對應憑證庫擁有者的有效 `DUDUCLAW_AGENT_TOKEN` HMAC，即使 delegation 使用寬鬆設定也不能省略，且不會以預設員工身分代替。
 
-Proxy 只解析自己所屬員工的參照，並在啟動上游伺服器前才取得實際值。參照不存在、不合法或無法解密時，該伺服器不會啟動；錯誤只指出伺服器與變數名稱，不含值。需要解析秘密的設定若無法改寫為 proxy 路徑，Claude／Grok 不會退回直接載入原檔。匯出時只留下環境變數名稱與空白佔位值，匯入者必須重新輸入。
+Proxy 只解析自己所屬員工的參照，並在啟動上游伺服器前才取得實際值。它用主機放進 proxy 項目的 `DUDUCLAW_AGENT_TOKEN` 證明是哪位員工：Claude 放在每次啟動專用的 MCP 設定（只有擁有者可讀的暫存檔，CLI 結束即刪除），Codex、Grok、openai-compat 放在啟動環境；員工的 `.mcp.json` 不會替 proxy 存放這個權杖，上游伺服器也拿不到它。參照不存在、不合法或無法解密時，該伺服器不會啟動；錯誤只指出伺服器與變數名稱，不含值。需要解析秘密的設定若無法改寫為 proxy 路徑，Claude／Grok 不會退回直接載入原檔。匯出時只留下環境變數名稱與空白佔位值，匯入者必須重新輸入。
 
 Gateway 啟動時會遷移舊有明文 env：先將原檔加密備份至 `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc`，寫入並讀回驗證憑證庫後，才以原子操作替換設定檔。依金鑰、加密備份、憑證庫、設定檔的順序，每一步都須完成父目錄 fsync 才繼續。任一步失敗即停止該員工的遷移；若替換設定後同步失敗，會還原原始明文。還原也失敗時會明確報錯並保留已持久化的加密備份供復原，然後繼續處理其他員工；清理後每位員工最多保留三份遷移備份；清理若因 I/O 錯誤失敗會記錄，並於下次掃描重試。刪除伺服器或員工會移除對應的憑證庫項目，復原已刪除員工後須重新輸入金鑰。
 

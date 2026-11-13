@@ -110,7 +110,40 @@ const SECTION_CASES: &[(&str, &str, &str)] = &[
         "[isolation]\npublic_web = false",
         "[isolation]\npublic_web = true",
     ),
+    (
+        "team_member",
+        "[team_member]\nrole = \"planner\"\ntask_id = \"t-1\"\nround = 1\nparent = \"agnes\"",
+        "[team_member]\nrole = \"planner\"\ntask_id = \"t-victim\"\nround = 3\nparent = \"agnes\"",
+    ),
 ];
+
+/// RM-137 H1: an employee can neither add a `[team_member]` record to its
+/// own `agent.toml` (forging a "pinned" role member), re-pin one, nor remove
+/// one; the operator path is unchanged.
+#[test]
+fn team_member_section_is_frozen_for_an_employee() {
+    assert!(AGENT_SECURITY_SECTIONS.contains(&"team_member"));
+    assert!(!AGENT_EDITABLE_SECTIONS.contains(&"team_member"));
+    let pinned = with("[team_member]\nrole = \"planner\"\ntask_id = \"t-victim\"\nround = 3\nparent = \"agnes\"");
+    let repinned = pinned.replace("round = 3", "round = 4");
+    for (before, after) in [
+        (BASE, pinned.as_str()),
+        (pinned.as_str(), repinned.as_str()),
+        (pinned.as_str(), BASE),
+    ] {
+        match as_agent(before, after) {
+            GuardDecision::BlockedAgentSecuritySection { changed, .. } => assert!(
+                changed.iter().any(|c| c.starts_with("team_member.") || c.starts_with("[team_member]")),
+                "{changed:?}"
+            ),
+            other => panic!("expected BlockedAgentSecuritySection, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        check_protected_toml_write_as(&agent_path(), &home(), &HookCaller::Absent, Some(BASE), &pinned),
+        GuardDecision::AllowedAgentWrite
+    );
+}
 
 /// Owner decision 2026-11-08: the protected-mode public-web switch is its own
 /// admin-only field. The employee can neither turn it on, add it, nor remove
@@ -228,6 +261,45 @@ fn single_security_keys_are_frozen_and_their_siblings_are_not() {
     // `[agent] role` decides `shared_wiki_delete`'s main-agent rule.
     let d = as_agent(BASE, &BASE.replace("role = \"assistant\"", "role = \"main\""));
     assert!(matches!(d, GuardDecision::BlockedAgentSecuritySection { .. }), "{d:?}");
+}
+
+/// RM-149 round 2 (H2): `[agent] status` decides the licence seat and the
+/// Admin-only lifecycle, so the employee can neither set itself `deleted`
+/// (freeing its seat) nor bring itself back, nor add / remove / reshape the
+/// key. The operator's own terminal keeps editing it, and the sibling keys
+/// stay editable.
+#[test]
+fn agent_status_is_frozen_for_the_agent() {
+    let to = |status: &str| BASE.replace("status = \"active\"", &format!("status = \"{status}\""));
+    let deleted = to("deleted");
+    for (before, after) in [
+        (BASE.to_string(), deleted.clone()),
+        (deleted.clone(), BASE.to_string()),
+        (to("archived"), BASE.to_string()),
+        (BASE.to_string(), BASE.replace("status = \"active\"\n", "")),
+        (BASE.replace("status = \"active\"\n", ""), deleted.clone()),
+        (BASE.to_string(), BASE.replace("status = \"active\"", "status = [\"active\"]")),
+    ] {
+        match as_agent(&before, &after) {
+            GuardDecision::BlockedAgentSecuritySection { changed, .. } => {
+                assert!(changed.iter().any(|c| c.starts_with("agent.status")), "{changed:?}");
+            }
+            other => panic!("expected BlockedAgentSecuritySection, got {other:?}"),
+        }
+    }
+    // An untrusted caller (claimed identity that did not verify) likewise.
+    let untrusted = HookCaller::Untrusted("agnes".into());
+    assert!(!check_protected_toml_write_as(&agent_path(), &home(), &untrusted, Some(BASE), &deleted).is_allowed());
+    // The operator is unaffected.
+    assert_eq!(
+        check_protected_toml_write_as(&agent_path(), &home(), &HookCaller::Absent, Some(BASE), &deleted),
+        GuardDecision::AllowedAgentWrite
+    );
+    // Siblings stay editable for the agent.
+    assert_eq!(
+        as_agent(BASE, &BASE.replace("display_name = \"Agnes\"", "display_name = \"Agnes 2\"")),
+        GuardDecision::AllowedAgentWrite
+    );
 }
 
 #[test]

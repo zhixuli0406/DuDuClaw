@@ -248,6 +248,16 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("api", "anthropic_api_key", Str),
     ("api", "anthropic_api_key_enc", Str),
     ("runtime", "utility_provider", Str),
+    ("runtime", "default_timeout_secs", UInt),
+    ("runtime", "max_timeout_secs", UInt),
+    ("goal_defaults", "assign_schedule_max_active", UInt),
+    ("goal_defaults", "assign_schedule_min_interval_minutes", UInt),
+    ("agent_files", "review_daily_limit", UInt),
+    ("agent_files", "review_daily_limit_per_user", UInt),
+    ("agent_files", "review_daily_limit_per_agent", UInt),
+    ("agent_files", "checks_per_minute", UInt),
+    ("agent_files", "max_pending_per_user", UInt),
+
     ("runtime", "utility_model", Str),
     ("proactive", "natural_timing", Bool),
     ("evolution", "fault_attribution", Bool),
@@ -271,8 +281,26 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
 
 /// Check every listed key that is present. `text` is the file the table was
 /// parsed from, used for the line/column of the offending value.
+#[cfg(test)]
 pub(crate) fn check_config_types(text: &str, table: &toml::Table) -> Result<(), String> {
+    check_config_types_with_stored(text, table, None)
+}
+
+pub(crate) fn check_config_types_with_stored(
+    text: &str, table: &toml::Table, stored: Option<&toml::Table>,
+) -> Result<(), String> {
+    // These readers historically clamp legacy values. Only edits to a limit
+    // opt into the new validation, so unrelated raw saves remain possible.
+    let unchanged_legacy_limit = |section: &str, key: &str| {
+        let legacy = matches!((section, key),
+            ("goal_defaults", "assign_schedule_max_active" | "assign_schedule_min_interval_minutes")
+            | ("agent_files", "review_daily_limit" | "review_daily_limit_per_user"
+                | "review_daily_limit_per_agent" | "checks_per_minute" | "max_pending_per_user"));
+        legacy && stored.is_some_and(|old| old.get(section).and_then(|v| v.get(key))
+            == table.get(section).and_then(|v| v.get(key)))
+    };
     for (section, key, ty) in CONFIG_KEY_TYPES {
+        if unchanged_legacy_limit(section, key) { continue; }
         let mut cur = Some(table);
         for seg in section.split('.') {
             cur = cur.and_then(|t| t.get(seg)).and_then(|v| v.as_table());
@@ -286,6 +314,25 @@ pub(crate) fn check_config_types(text: &str, table: &toml::Table) -> Result<(), 
             ));
         }
     }
+    for (section, key, min, max) in [
+        ("runtime", "default_timeout_secs", 30, 14400),
+        ("runtime", "max_timeout_secs", 60, 14400),
+        ("goal_defaults", "assign_schedule_max_active", 0, 200),
+        ("goal_defaults", "assign_schedule_min_interval_minutes", 60, 10080),
+        ("agent_files", "review_daily_limit", 0, 100000),
+        ("agent_files", "review_daily_limit_per_user", 0, 100000),
+        ("agent_files", "review_daily_limit_per_agent", 0, 100000),
+        ("agent_files", "checks_per_minute", 1, 1000),
+        ("agent_files", "max_pending_per_user", 1, 200),
+    ] {
+        if unchanged_legacy_limit(section, key) { continue; }
+        if let Some(value) = table.get(section).and_then(|v| v.get(key)) {
+            if !value.as_integer().is_some_and(|n| (min..=max).contains(&n)) {
+                return Err(format!("[{section}] {key} must be between {min} and {max}"));
+            }
+        }
+    }
+    crate::runtime_config::TimeoutPolicy::from_table(table)?;
     Ok(())
 }
 
@@ -357,4 +404,40 @@ mod tests {
     fn right_types_and_unknown_keys_pass() {
         check("[gateway]\nport = 18889\nfuture_key = \"x\"\n[belief]\nflat_band_pct = 1\n[mystery]\nx = 1\n").unwrap();
     }
+
+    #[test]
+    fn unchanged_legacy_limits_do_not_block_unrelated_raw_edits() {
+        let old = "[goal_defaults]\nassign_schedule_min_interval_minutes=5\n[agent_files]\nreview_daily_limit=100001\nchecks_per_minute=0\n";
+        let stored: toml::Table = old.parse().unwrap();
+        let text = format!("{old}[gateway]\nport=18889\n");
+        check_config_types_with_stored(&text, &text.parse().unwrap(), Some(&stored)).unwrap();
+        for (key, invalid, replacement) in [
+            ("assign_schedule_min_interval_minutes", "5", "6"),
+            ("review_daily_limit", "100001", "100002"),
+            ("checks_per_minute", "0", "1001"),
+        ] {
+            let changed = text.replace(&format!("{key}={invalid}"), &format!("{key}={replacement}"));
+            assert!(check_config_types_with_stored(&changed, &changed.parse().unwrap(), Some(&stored)).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn run_schedule_and_review_limit_ranges_are_checked() {
+        for (section, key, min, max) in [
+            ("runtime", "max_timeout_secs", 60, 14400),
+            ("goal_defaults", "assign_schedule_max_active", 0, 200),
+            ("goal_defaults", "assign_schedule_min_interval_minutes", 60, 10080),
+            ("agent_files", "review_daily_limit", 0, 100000),
+            ("agent_files", "review_daily_limit_per_user", 0, 100000),
+            ("agent_files", "review_daily_limit_per_agent", 0, 100000),
+            ("agent_files", "checks_per_minute", 1, 1000),
+            ("agent_files", "max_pending_per_user", 1, 200),
+        ] {
+            for n in [min, max] { check(&format!("[{section}]\n{key}={n}\n")).unwrap(); }
+            for n in [min - 1, max + 1] { assert!(check(&format!("[{section}]\n{key}={n}\n")).is_err()); }
+        }
+        assert!(check("[runtime]\ndefault_timeout_secs=3601\n").is_err());
+        assert!(check("[runtime]\nmax_timeout_secs=600\ndefault_timeout_secs=601\n").is_err());
+    }
+
 }

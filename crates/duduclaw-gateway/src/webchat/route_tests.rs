@@ -282,6 +282,7 @@ async fn primary_selection_never_guesses_among_multiple_or_stale_bindings() {
     let db = &f.state.user_db;
     assert_eq!(f.state.resolve_new_agent(&f.emp).await.unwrap().as_deref(), Some("finance"));
     db.bind_agent(&f.emp, "sales-rep", AccessLevel::Owner).unwrap();
+    db.set_primary_agent(&f.emp, None).unwrap();
     assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("multiple_agents"));
     db.set_primary_agent(&f.emp, Some("sales-rep")).unwrap();
     assert_eq!(f.state.resolve_new_agent(&f.emp).await.unwrap().as_deref(), Some("sales-rep"));

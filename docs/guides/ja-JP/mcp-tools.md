@@ -117,6 +117,7 @@ Claude CLI の `minimal_context` は `--tools` で内蔵 CLI ツールを制御�
 | `[knowledge] enabled` とコレクションの付与 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | ナレッジベースが有効で、社員またはその部門に（`[knowledge] collections` で絞り込んだ後も）1 つ以上のコレクションが付与されていない限り `knowledge_*` 4 ツールを非表示。付与の変更で `list_changed` を送信（下の [`knowledge_*`](#knowledge_ドキュメントナレッジベース) を参照） |
 | `[responsibilities] enabled` | `config.toml` | `responsibility_*` 3 ツールを非表示（下の[継続タスクのツール](#responsibility_get--responsibility_followup--responsibility_ask--継続タスクのツール)を参照） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有効な付与 | タスクスコープの付与が有効になるまで非表示 |
+| チームのロールメンバー（v1.82） | `agents/.ephemeral/eph-*` のロールメンバーで、`[team_member]` と `ephemeral.toml` の上位社員が一致し、ID がトークンで検証済み（`DUDUCLAW_AGENT_TOKEN`） | どの委任モードでも、それ以外の呼び出し元には `team_handoff` を表示しません。そのため通常の社員のツール一覧は以前より 1 つ減ります。ハンドラーも同じ呼び出し元を `not_a_team_member` で拒否します |
 
 機器操作コンソール（`/console`）は管理者だけが利用できます。`system_operator` スタッフが機器操作ツールを実行するときも、サーバーで依頼者が有効な管理者かを確認します。他の AI スタッフとの通常の会話は、従来のアクセス規則で利用できます。
 
@@ -186,7 +187,7 @@ AI 社員のものになっているレコードを変更・起動するツー�
 | `modify` | `false` | `true`。ただし追加・再生成だけの `memory_store`・`user_profile_record`・`wiki_rebuild_fts` は `false`。`wiki_export` は前回のエクスポート（人が編集したかもしれない Obsidian vault を含む）を上書きするため `true` のまま |
 | `delete`・`purchase`・`admin` と表にない名前 | `false` | `true` |
 
-メモリ・wiki・ユーザープロファイル・`code_map` のツールは `openWorldHint: false` も付きます。`memory_alias_add`・`wiki_export`・`wiki_rebuild_fts` は `idempotentHint: true` です。これらのリストは `crates/duduclaw-cli/src/mcp/tools_def/annotations.rs` にあります。
+メモリ・wiki・ユーザープロファイル・`code_map` のツールは `openWorldHint: false` も付きます。`memory_alias_add`・`wiki_export`・`wiki_rebuild_fts` は `idempotentHint: true` です。これらのリストは `crates/duduclaw-core/src/mcp_tool_defs/annotations.rs` にあります。
 
 ヒントは MCP クライアント向け（呼び出し前に確認するかどうかなど）で、権限を与えるものではありません。DuDuClaw のゲートは毎回そのまま動きます。Claude Code と Codex はモデルに名前・説明・入力スキーマだけを渡すため、上の説明バイト予算には含めません。
 
@@ -200,7 +201,7 @@ AI 社員のものになっているレコードを変更・起動するツー�
 
 ### `tasks_create` — ゴールごとの実行時間の上限
 
-`tasks_create` は `kind="goal"`（予約なし）のとき `timeout_secs`（30～3600 の整数秒）を受け付けます。そのゴールの各ラウンドの CLI 実行／API リクエストごとの上限で、担当従業員自身の上限に代わります。MCP からは従業員自身の上限以下しか指定できません。ゴールにより長い時間を与えるのは、ダッシュボードでの管理者の判断です。Claude の従業員には適用されません（30 分固定）。`tasks_update` はこのフィールドを拒否します。例：`{"kind":"goal","title":"帳簿を照合","assigned_to":"anna","timeout_secs":180}`。
+`tasks_create` は `kind="goal"`（予約なし）のとき `timeout_secs`（30～3600 の整数秒）を受け付けます。そのゴールの各ラウンドの CLI 実行／API リクエストごとの上限で、担当従業員自身の上限に代わります。MCP からは従業員自身の上限以下しか指定できません。ゴールにより長い時間を与えるのは、ダッシュボードでの管理者の判断です。Claude の従業員にも適用され、実行時は現在のグローバル `[runtime] max_timeout_secs` が上限になります。`tasks_update` はこのフィールドを拒否します。例：`{"kind":"goal","title":"帳簿を照合","assigned_to":"anna","timeout_secs":180}`。
 
 ### `office_script` — 同梱 Office スクリプト
 
@@ -316,6 +317,10 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 
 `agent_remove` は社員を `~/.duduclaw/agents/_trash/` に移動し、社員が削除されたこと、管理者が復元できること、名前が予約されていることを答えます。パスは返しません。その後 `create_agent` は、ゴミ箱にエントリがある間、`org.toml` がディレクトリのない id を記録している間、またはゴミ箱を一覧できない間、すべての MCP caller についてその名前を拒否します。別の名前なら動作します。運用者はダッシュボードまたはターミナルから名前を再利用できます。非内部キーで HTTP 越しに呼ぶと、どちらのツールもそのキー自身の client id として動作します。詳細：[委譲の隔離](../../features/ja-JP/37-delegation-isolation.md#削除された社員の名前は予約されたままになる)。
 
+### `create_agent` — ペルソナと枠（v1.82.0）
+
+ペルソナは `soul_md` に入れます（`soul` は旧名。空文字は渡していないものとして扱い、両方に異なる内容がある場合のみエラー）。テンプレート作成と同じ SOUL.md の安全チェックを通り、チェックに通らない場合や SOUL.md を書き込めない場合は呼び出し全体が失敗し、ディスクには何も残りません。拒否メッセージは理由の種類（HTML コメント、不可視文字、隠しコンテンツ、プロンプトインジェクションの言い回し）を示しますが、内容は引用しません。ツールが読まない引数は拒否されず、返答の「Ignored arguments (no effect)」に並びます（最大 20 個、各 64 文字まで、残りは「… and N more」）。ライセンスの枠は状態が `deleted` でないすべての社員を数え（アーカイブした社員も枠を使います）、枠がいっぱいで拒否するときは上限と使用中の枠数だけを返し、枠を使っている社員は一覧しません（管理者はダッシュボードで確認できます）。枠の確認と作成は一つの手順で、ダッシュボードやエキスパートパックのインポートと同じロックを使うため、同時に作成しても上限を超えません。社員は自分の `[agent] status` をファイル操作ツールで変更できず、`agent_update` もアーカイブ済み・削除済みの社員の `status` は変更できません。アーカイブ・復元・削除はダッシュボードで行います。あとからペルソナを変えるには[作成後に社員のペルソナを変更する](dashboard-settings.md#作成後に社員のペルソナを変更するv1820)を参照してください。
+
 ### `responsibility_get` / `responsibility_followup` / `responsibility_ask` — 継続タスクのツール
 
 [継続タスク](continuous-responsibilities.md)用の 3 つのツールです。`config.toml [responsibilities] enabled` が true で、呼び出し元が AI従業員の身元であるときだけ掲載されます（外部クライアントには見えません）。機能がオフの間はすべての呼び出しが拒否されます。`tasks_*` と同じく Admin スコープが必要で、ゲートウェイ自身のキーはこのスコープを持っています。
@@ -382,7 +387,7 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 
 外部 MCP のキーは社員の設定ファイルから移されます。`.mcp.json` には `secret://mcp/<server>/<ENV_NAME>` 参照だけを残し、値は既存の `.keyfile` で暗号化して `<home>/secrets/mcp/<agent_id>.enc` に保存します。外部サーバーのすべての `env` が対象で、例外は `PATH`、`HOME`、`NODE_ENV`、`LOG_LEVEL` と既存の `secret://` 参照だけです。DuDuClaw 自身のサーバー項目と、その `DUDUCLAW_*` 変数は変更しません。
 
-組み込み枠は正確な名前 `duduclaw`、`duduclaw-pro`、現在の instance key だけです。`duduclaw-evil` は第三者として扱います。有効な設定を生成する際は command、args、env 全体をホストの最新 canonical 定義に置き換えるため、鍵の更新や実行ファイル変更でも古い値を使いません。raw `mcp-proxy` 呼び出しは名前にかかわらず拒否し、第三者の proxy 専用環境変数も拒否します。Claude ではプロキシ用途がない場合や組み込みだけの場合、既存の起動準備による修復を保ち、追加フラグを渡しません。Fork のコピー元は社員向け準備を通らない一般プロジェクトの場合があるため、コピーでは gate が無効でも組み込み枠を再生成します。秘密の読み出しには保管先の社員に対する有効な `DUDUCLAW_AGENT_TOKEN` HMAC が必要で、緩い delegation 設定や既定の社員へのフォールバックでは許可しません。
+組み込み枠は正確な名前 `duduclaw`、`duduclaw-pro`、現在の instance key だけです。`duduclaw-evil` は第三者として扱います。有効な設定を生成する際は command、args、env 全体をホストの最新 canonical 定義に置き換えるため、鍵の更新や実行ファイル変更でも古い値を使いません。raw `mcp-proxy` 呼び出しは名前にかかわらず拒否し、第三者の proxy 専用環境変数も拒否します。Claude ではプロキシ用途がない場合や組み込みだけの場合、既存の起動準備による修復を保ち、追加フラグを渡しません。Fork のコピー元は社員向け準備を通らない一般プロジェクトの場合があるため、コピーでは gate が無効でも組み込み枠を再生成します。秘密の読み出しには保管先の社員に対する有効な `DUDUCLAW_AGENT_TOKEN` HMAC が必要で、緩い delegation 設定や既定の社員へのフォールバックでは許可しません。プロキシはホストが自分のエントリに入れた `DUDUCLAW_AGENT_TOKEN` で社員を証明します。Claude では起動ごとの MCP 設定（所有者だけが読める一時ファイルで、CLI の終了時に削除）、Codex・Grok・openai-compat では起動時の環境に入ります。社員の `.mcp.json` がプロキシ用にこのトークンを持つことはなく、上流サーバーにも渡りません。
 
 移行は鍵、暗号化バックアップ、保管庫、設定の順に、各段階で親ディレクトリの fsync 完了を待ちます。失敗した社員の移行は中止し、設定を置換した後の失敗では元の内容を復元します。復元も失敗した場合はエラーを報告し、永続化済みの暗号化バックアップを残します。
 

@@ -391,30 +391,77 @@ pub(crate) fn permissions_for_call(
     out
 }
 
-/// `true` only when the flag is written as `false`.
+/// RM-137: does `[delegation] policy = "none"` refuse this call for an AI
+/// employee? Every call that needs `can_send_cross_agent` or
+/// `can_create_agents` by [`permissions_for_call`] — `send_to_agent`,
+/// `spawn_agent`, `spawn_ephemeral`, `create_agent`, `team_handoff`,
+/// `tasks_create` with `assigned_to` another employee, `create_task` with a
+/// step for another employee — and `agent_update` that changes another
+/// employee's background work (`mcp::BACKGROUND_WORK_PARAMS`).
+///
+/// `team_handoff` is NOT exempt here. The one exemption — a verified Team-as-
+/// Agent role member (`ephemeral::is_role_member_intrinsic_call`: an
+/// `.ephemeral/eph-*` scaffold whose `[team_member]` record names the same
+/// parent as its `ephemeral.toml`) filing a `TaskPacket` — is applied by the
+/// callers through [`delegation_none_refuses_for`], never by tool name alone.
+///
+/// The dispatch gate passes the real arguments; `tools/list` passes
+/// `Value::Null`, so a tool is hidden exactly when every call to it is
+/// refused (`tasks_create` / `create_task` / `agent_update` stay listed for
+/// the caller's own work). Paths that reach the delegation predicate further
+/// in (task reassignment, scheduled targets, …) are refused there as well.
+pub(crate) fn delegation_none_refuses(tool_name: &str, args: &Value, caller: &str) -> bool {
+    if tool_name == "agent_update" {
+        let target = args.get("agent_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        return !target.is_empty()
+            && target != caller.trim()
+            && crate::mcp::BACKGROUND_WORK_PARAMS.iter().any(|k| args.get(*k).is_some());
+    }
+    permissions_for_call(tool_name, args, caller)
+        .iter()
+        .any(|p| matches!(*p, "can_send_cross_agent" | "can_create_agents"))
+}
+
+/// [`delegation_none_refuses`] with the verified-role-member exemption: a
+/// `team_handoff` call is let through only when the caller is a verified team
+/// role member (`ephemeral::is_role_member_intrinsic_call`) AND holds a
+/// token-verified identity (`token_verified`, from
+/// [`crate::mcp::caller_token_verified`]). A soft-mode `Unverified` caller
+/// that merely declares an existing `eph-*` id gets no exemption. Shared by
+/// the dispatch gate and `tools/list`.
+pub(crate) fn delegation_none_refuses_for(
+    home_dir: &Path,
+    tool_name: &str,
+    args: &Value,
+    caller: &str,
+    token_verified: impl FnOnce() -> bool,
+) -> bool {
+    delegation_none_refuses(tool_name, args, caller)
+        && !(duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(home_dir, caller, tool_name)
+            && token_verified())
+}
+
+/// zh-TW refusal for [`delegation_none_refuses`].
+pub(crate) fn delegation_none_message(tool_name: &str) -> String {
+    format!(
+        "目前的委派政策是「不允許委派(none)」:AI 員工之間不能互相委派、傳訊、建立員工或指派工作,\
+         工具「{tool_name}」已拒絕(跨部門協作配對在這個政策下也不生效)。請把需要別位員工處理的事回報給管理員,\
+         或請管理員在儀表板「委派權限」改成其他模式。"
+    )
+}
+
+/// `true` only when the flag is written as `false` (the role-resolved
+/// `can_create_agents` included). Same predicate `agents.inspect` reports as
+/// `effective_permissions` (`PermissionsSectionView::allows`).
 pub(crate) fn permission_explicitly_denied(
     perms: &duduclaw_core::agent_toml::PermissionsSectionView,
     permission: &str,
 ) -> bool {
-    let flag = match permission {
-        "can_create_agents" => perms.can_create_agents,
-        "can_send_cross_agent" => perms.can_send_cross_agent,
-        "can_schedule_tasks" => perms.can_schedule_tasks,
-        "can_modify_own_skills" => perms.can_modify_own_skills,
-        _ => None,
-    };
-    flag == Some(false)
+    duduclaw_core::agent_toml::GATED_PERMISSION_FLAGS.contains(&permission)
+        && !perms.allows(permission)
 }
 
-/// `[permissions]` with nothing written: every flag absent except
-/// `can_create_agents`, which v1.81 (S2) resolves by role — with no
-/// identifiable role it is `false`.
-fn unwritten_permissions() -> duduclaw_core::agent_toml::PermissionsSectionView {
-    duduclaw_core::agent_toml::PermissionsSectionView {
-        can_create_agents: Some(duduclaw_core::agent_toml::effective_can_create_agents(None, None)),
-        ..Default::default()
-    }
-}
+use duduclaw_core::agent_toml::unwritten_permissions;
 
 /// The acting agent's `[permissions]`. Fails closed (`Err`) when the agent
 /// id is not a valid id or its `agent.toml` exists but cannot be read as
@@ -444,39 +491,9 @@ async fn load_agent_permissions(
         }
         home_dir.join("agents").join(agent_id)
     };
-    tokio::task::spawn_blocking(move || {
-        let path = dir.join("agent.toml");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(unwritten_permissions()),
-            Err(e) => return Err(format!("agent.toml unreadable: {e}")),
-        };
-        let table: toml::Table = text
-            .parse()
-            .map_err(|_| "agent.toml does not parse".to_string())?;
-        if let Some(p) = table.get("permissions") {
-            let p = p.as_table().ok_or("[permissions] is not a table")?;
-            for k in [
-                "can_create_agents",
-                "can_send_cross_agent",
-                "can_schedule_tasks",
-                "can_modify_own_skills",
-            ] {
-                if p.get(k).is_some_and(|v| !v.is_bool()) {
-                    return Err(format!("[permissions] {k} is not true/false"));
-                }
-            }
-        }
-        let sections = duduclaw_core::agent_toml::load(&dir);
-        let mut perms = sections.permissions;
-        perms.can_create_agents = Some(duduclaw_core::agent_toml::effective_can_create_agents(
-            perms.can_create_agents,
-            sections.agent.as_ref().and_then(|a| a.role.as_deref()),
-        ));
-        Ok(perms)
-    })
-    .await
-    .map_err(|e| format!("permission check failed: {e}"))?
+    tokio::task::spawn_blocking(move || duduclaw_core::agent_toml::load_permissions_checked(&dir))
+        .await
+        .map_err(|e| format!("permission check failed: {e}"))?
 }
 
 // Re-export OdooState so HTTP/SSE layers can reference it without depending on
@@ -1014,6 +1031,33 @@ impl McpDispatcher {
                 );
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 return Some((jsonrpc_error(id, -32003, &msg), "action_rule", msg, None));
+            }
+
+            // ── 3.458 [delegation] policy = "none" (RM-137, v1.82) ──────────────
+            // No AI employee delegates to, messages, spawns, creates or assigns
+            // work to another while the org-wide policy is `none` (an
+            // unrecognised value or an unreadable config resolves to `none`
+            // too). Same predicate `tools/list` hides with; `team_handoff` is
+            // exempt only for a verified team role member whose identity is
+            // token-verified (never a soft-mode `Unverified` claim). Only
+            // narrows: the delegation predicate further in still runs for
+            // every call that gets past here under the other policies.
+            if employee_policy_applies
+                && delegation_none_refuses_for(
+                    &self.home_dir,
+                    tool_name,
+                    params_owned.get("arguments").unwrap_or(&Value::Null),
+                    gate_agent,
+                    || crate::mcp::caller_token_verified(&self.home_dir, gate_agent),
+                )
+                && duduclaw_core::delegation_policy_from_home(&self.home_dir)
+                    == duduclaw_core::DelegationPolicy::Disabled
+            {
+                // Audited by the shared denial path below (error class
+                // `delegation_disabled`), after background admission.
+                let msg = delegation_none_message(tool_name);
+                duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                return Some((jsonrpc_error(id, -32003, &msg), "delegation_disabled", msg, None));
             }
 
             // ── 3.46 [permissions] flags (v1.68) ──────────────────────────────────
@@ -2878,6 +2922,48 @@ mod tests {
             )
             .await;
         assert_eq!(plain["error"]["code"], -32003, "{plain}");
+    }
+
+    /// RM-137 H1: under `none` the verified role member keeps `team_handoff`
+    /// (the one exemption), and loses it the moment it is no longer verified.
+    #[tokio::test]
+    async fn none_exempts_team_handoff_only_for_a_verified_role_member() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_s3_member(&tmp, "");
+        std::fs::write(tmp.path().join("config.toml"), "[delegation]\npolicy = \"none\"\n").unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        // The member's identity is token-verified (RM-137 soft-mode fix; the
+        // unverified case is `none_refuses_team_handoff_from_an_unverified_role_member_id`).
+        let call = |n: i64| {
+            let dispatcher = &dispatcher;
+            crate::mcp::with_token_verified_caller(S3_MEMBER, async move {
+                dispatcher
+                    .dispatch_tool_call(
+                        &s3_member_principal(),
+                        &make_ns_ctx(false),
+                        &make_params("team_handoff", serde_json::json!({})),
+                        &serde_json::json!(n),
+                    )
+                    .await
+            })
+        };
+        let member = call(1).await;
+        assert!(!refused_by_none(&member), "{member}");
+
+        // `ephemeral.toml` names another parent: not verified, no exemption.
+        let dir = tmp
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(S3_MEMBER);
+        std::fs::write(
+            dir.join("ephemeral.toml"),
+            "parent = \"someone-else\"\ntier = \"standard\"\n\
+             created_at = \"2026-11-08T00:00:00Z\"\nexpires_at = \"2099-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+        let forged = call(2).await;
+        assert!(refused_by_none(&forged), "{forged}");
     }
 
     /// A parent requiring approval for X: the member requires approval for X.
@@ -5756,6 +5842,230 @@ effect = "forbid"
                 .contains("allowed_tools"),
             "{result}"
         );
+    }
+
+    // ── RM-137: `[delegation] policy = "none"` at the dispatch gate ──────────
+
+    /// An employee whose own `[permissions]` would allow every
+    /// employee-to-employee tool, so only the delegation policy decides.
+    const FULLY_PERMITTED_MAIN: &str = "[agent]\nname = \"test-client\"\nrole = \"main\"\nstatus = \"active\"\n\
+         [permissions]\ncan_create_agents = true\ncan_send_cross_agent = true\ncan_schedule_tasks = true\n";
+
+    fn employee_to_employee_calls() -> Vec<(&'static str, Value)> {
+        vec![
+            ("send_to_agent", serde_json::json!({"agent_id": "other", "message": "hi"})),
+            ("spawn_agent", serde_json::json!({"agent_id": "other", "task": "do it"})),
+            ("spawn_ephemeral", serde_json::json!({"instruction": "x", "context": "y", "tools": ["Read"]})),
+            ("create_agent", serde_json::json!({"name": "newbie", "display_name": "Newbie"})),
+            ("tasks_create", serde_json::json!({"title": "t", "assigned_to": "other"})),
+            ("create_task", serde_json::json!({"title": "t", "steps": [{"agent": "other", "description": "d"}]})),
+        ]
+    }
+
+    async fn call_as_employee(dispatcher: &McpDispatcher, tool: &str, args: Value) -> Value {
+        dispatcher
+            .dispatch_tool_call(
+                &make_principal(vec![Scope::Admin], false),
+                &make_ns_ctx(false),
+                &make_params(tool, args),
+                &serde_json::json!(7),
+            )
+            .await
+    }
+
+    fn refused_by_none(result: &Value) -> bool {
+        result["error"]["code"] == -32003
+            && result["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("不允許委派(none)")
+    }
+
+    /// Every employee-to-employee entry point is refused under `none` (allow
+    /// pair included) and under an unrecognised value, even though the
+    /// employee's own switches allow it. (An unparsable config.toml is
+    /// refused earlier by the identity-token gate; its `none` resolution is
+    /// covered in `duduclaw-core` and the C1 gate tests.)
+    #[tokio::test]
+    async fn none_policy_refuses_every_employee_to_employee_tool() {
+        for config in [
+            "[delegation]\npolicy = \"none\"\nallow = [[\"test-client\", \"other\"]]\n",
+            "[delegation]\npolicy = \"closed\"\n",
+        ] {
+            for (tool, args) in employee_to_employee_calls() {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dispatcher = make_dispatcher(&tmp).await;
+                write_scoped_toml(&tmp, FULLY_PERMITTED_MAIN);
+                std::fs::write(tmp.path().join("config.toml"), config).unwrap();
+                let result = call_as_employee(&dispatcher, tool, args).await;
+                assert!(refused_by_none(&result), "{config:?} {tool}: {result}");
+                // Nothing was created on the way to the refusal.
+                assert!(!tmp.path().join("agents").join("newbie").exists(), "{tool}");
+            }
+        }
+    }
+
+    /// The same calls are not stopped by this gate under another policy (the
+    /// delegation predicate further in still judges the pair), and the
+    /// caller's own work stays possible under `none`.
+    #[tokio::test]
+    async fn none_gate_only_applies_to_employee_to_employee_calls() {
+        for (tool, args) in employee_to_employee_calls() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dispatcher = make_dispatcher(&tmp).await;
+            write_scoped_toml(&tmp, FULLY_PERMITTED_MAIN);
+            std::fs::write(tmp.path().join("config.toml"), "[delegation]\npolicy = \"department\"\n")
+                .unwrap();
+            let result = call_as_employee(&dispatcher, tool, args).await;
+            assert!(!refused_by_none(&result), "department {tool}: {result}");
+        }
+        // Under `none`: own tasks and own settings.
+        for (tool, args) in [
+            ("tasks_create", serde_json::json!({"title": "mine", "assigned_to": "test-client"})),
+            ("tasks_create", serde_json::json!({"title": "mine"})),
+            ("create_task", serde_json::json!({"title": "t", "steps": [{"description": "d"}]})),
+            ("agent_update", serde_json::json!({"agent_id": "test-client", "heartbeat_enabled": true})),
+            ("agent_update", serde_json::json!({"agent_id": "other", "display_name": "Other"})),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dispatcher = make_dispatcher(&tmp).await;
+            write_scoped_toml(&tmp, FULLY_PERMITTED_MAIN);
+            std::fs::write(tmp.path().join("config.toml"), "[delegation]\npolicy = \"none\"\n").unwrap();
+            let result = call_as_employee(&dispatcher, tool, args).await;
+            assert!(!refused_by_none(&result), "{tool}: {result}");
+        }
+    }
+
+    /// RM-137 H1: an ordinary employee — even one that wrote a complete,
+    /// pinned `[team_member]` into its own `agent.toml` — gets no `none`
+    /// exemption for `team_handoff`.
+    #[tokio::test]
+    async fn none_refuses_team_handoff_from_a_forged_member() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(
+            &tmp,
+            &format!(
+                "{FULLY_PERMITTED_MAIN}[team_member]\nrole = \"planner\"\n\
+                 task_id = \"6f1c2a8e-1111-4222-8333-444455556666\"\nround = 3\nparent = \"boss\"\n"
+            ),
+        );
+        std::fs::write(tmp.path().join("config.toml"), "[delegation]\npolicy = \"none\"\n").unwrap();
+        // Even with a token-verified identity: the scaffold is what is missing.
+        let caller = make_principal(vec![Scope::Admin], false).client_id;
+        let result = crate::mcp::with_token_verified_caller(
+            &caller,
+            call_as_employee(&dispatcher, "team_handoff", serde_json::json!({"packet": {}})),
+        )
+        .await;
+        assert!(refused_by_none(&result), "{result}");
+        assert!(!tmp.path().join("team_packets").exists());
+    }
+
+    /// RM-137 (soft identity mode): a caller whose identity is not
+    /// token-verified — the operator-enabled soft migration lets such a
+    /// process run as `Unverified` — gets no `none` exemption by declaring a
+    /// genuine role member's id; the same member with a verified identity
+    /// keeps it.
+    #[tokio::test]
+    async fn none_refuses_team_handoff_from_an_unverified_role_member_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_s3_member(&tmp, "");
+        std::fs::write(tmp.path().join("config.toml"), "[delegation]\npolicy = \"none\"\n").unwrap();
+        assert!(duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+            tmp.path(),
+            S3_MEMBER,
+            "team_handoff"
+        ));
+        assert!(delegation_none_refuses_for(tmp.path(), "team_handoff", &Value::Null, S3_MEMBER, || false));
+        assert!(!delegation_none_refuses_for(tmp.path(), "team_handoff", &Value::Null, S3_MEMBER, || true));
+        let dispatcher = make_dispatcher(&tmp).await;
+        let unverified = s3_call(&dispatcher, "team_handoff", serde_json::json!({})).await;
+        assert!(refused_by_none(&unverified), "{unverified}");
+        // Verified as some other id: still not this member.
+        let other = crate::mcp::with_token_verified_caller(
+            "eph-someone-else",
+            s3_call(&dispatcher, "team_handoff", serde_json::json!({})),
+        )
+        .await;
+        assert!(refused_by_none(&other), "{other}");
+        let verified = crate::mcp::with_token_verified_caller(
+            S3_MEMBER,
+            s3_call(&dispatcher, "team_handoff", serde_json::json!({})),
+        )
+        .await;
+        assert!(!refused_by_none(&verified), "{verified}");
+    }
+
+    /// RM-137 H4: under `none` an employee may not change another employee's
+    /// background work (status / heartbeat) — refused at the dispatch gate,
+    /// before the handler reads anything.
+    #[tokio::test]
+    async fn none_refuses_agent_update_background_fields_on_another_agent() {
+        for args in [
+            serde_json::json!({"agent_id": "other", "status": "active"}),
+            serde_json::json!({"agent_id": "other", "heartbeat_enabled": true}),
+            serde_json::json!({"agent_id": "other", "heartbeat_cron": "*/5 * * * *"}),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dispatcher = make_dispatcher(&tmp).await;
+            write_scoped_toml(&tmp, FULLY_PERMITTED_MAIN);
+            std::fs::write(tmp.path().join("config.toml"), "[delegation]\npolicy = \"none\"\n").unwrap();
+            let result = call_as_employee(&dispatcher, "agent_update", args.clone()).await;
+            assert!(refused_by_none(&result), "{args}: {result}");
+        }
+    }
+
+    /// The predicate shared with `tools/list`: argument-free tools that are
+    /// always employee-to-employee are refused with no arguments (hidden);
+    /// the argument-dependent ones are not (they stay listed for own work).
+    /// `team_handoff` is refused by name; only a verified role member is
+    /// exempted (`delegation_none_refuses_for`).
+    #[test]
+    fn delegation_none_predicate_matches_the_listing_rule() {
+        for tool in ["send_to_agent", "spawn_agent", "spawn_ephemeral", "create_agent", "team_handoff"] {
+            assert!(delegation_none_refuses(tool, &Value::Null, "a"), "{tool}");
+        }
+        for tool in ["tasks_create", "create_task", "agent_update", "memory_store", "list_agents"] {
+            assert!(!delegation_none_refuses(tool, &Value::Null, "a"), "{tool}");
+        }
+        // agent_update: background fields on another agent only.
+        for key in ["status", "heartbeat_enabled", "heartbeat_cron"] {
+            let mut other = serde_json::json!({"agent_id": "b"});
+            other[key] = serde_json::json!("x");
+            assert!(delegation_none_refuses("agent_update", &other, "a"), "{key}");
+            let mut own = serde_json::json!({"agent_id": "a"});
+            own[key] = serde_json::json!("x");
+            assert!(!delegation_none_refuses("agent_update", &own, "a"), "{key}");
+        }
+        assert!(!delegation_none_refuses(
+            "agent_update",
+            &serde_json::json!({"agent_id": "b", "display_name": "B"}),
+            "a"
+        ));
+        // A non-member is never exempted, wherever its `[team_member]` lives.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agents").join("a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[team_member]\nrole = \"planner\"\ntask_id = \"t\"\nround = 1\nparent = \"a\"\n",
+        )
+        .unwrap();
+        // Token verification does not turn a non-member into a member.
+        assert!(delegation_none_refuses_for(tmp.path(), "team_handoff", &Value::Null, "a", || true));
+        assert!(delegation_none_refuses_for(tmp.path(), "team_handoff", &Value::Null, "a", || false));
+        assert!(delegation_none_refuses(
+            "tasks_create",
+            &serde_json::json!({"assigned_to": "b"}),
+            "a"
+        ));
+        assert!(!delegation_none_refuses(
+            "tasks_create",
+            &serde_json::json!({"assigned_to": "a"}),
+            "a"
+        ));
+        assert!(PERMISSION_GATED_TOOLS.contains(&("team_handoff", "can_send_cross_agent")));
     }
 
     /// P2-A Q7: the responsibility tools through the real gates.

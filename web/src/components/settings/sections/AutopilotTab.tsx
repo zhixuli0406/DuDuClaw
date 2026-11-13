@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
 import { ruleActionTarget } from '@/lib/autopilot-rules';
+import { describeHistoryResult, HISTORY_TONE_CLASS } from '@/lib/autopilot-history';
 import { toast, formatError } from '@/lib/toast';
 import {
   Card,
@@ -247,6 +248,22 @@ export function AutopilotTab() {
   );
 }
 
+/** One history status: a label for every known status, the raw value (in a
+ *  neutral tone) for one a newer gateway may write. */
+export function HistoryResultBadge({ result }: { result: unknown }) {
+  const intl = useIntl();
+  const shown = describeHistoryResult(result);
+  const label =
+    shown.messageId && Object.hasOwn(intl.messages, shown.messageId)
+      ? intl.formatMessage({ id: shown.messageId })
+      : shown.raw;
+  return (
+    <Badge className={cn(HISTORY_TONE_CLASS[shown.tone])} data-tone={shown.tone}>
+      {label}
+    </Badge>
+  );
+}
+
 function AutopilotHistoryDialog({
   entries,
   error,
@@ -292,15 +309,7 @@ function AutopilotHistoryDialog({
                     <p className="mt-0.5 text-xs text-muted-foreground">{entry.details}</p>
                   )}
                 </div>
-                <Badge
-                  className={cn(
-                    entry.result === 'success'
-                      ? 'bg-success/10 text-success'
-                      : 'bg-destructive/10 text-destructive',
-                  )}
-                >
-                  {intl.formatMessage({ id: `autopilot.history.${entry.result}` })}
-                </Badge>
+                <HistoryResultBadge result={entry.result} />
               </div>
             ))
           )}

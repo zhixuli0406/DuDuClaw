@@ -211,3 +211,16 @@ async fn retained_page_titles_cannot_multiply_the_window_memory_cap() {
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn manager_team_history_keeps_failure_notices_without_other_hidden_rows() {
+    let (_home, sm, scope) = seeded().await;
+    sm.record_turn_failure("line:Ccustomer", "t1", crate::channel_reply::TurnFailureReason::Timeout, None, None).await.unwrap();
+    let hidden = sm.append_message_with_id("line:Ccustomer", "assistant", "PRIVATE HIDDEN", 1).await.unwrap();
+    sm.hide_message("line:Ccustomer", hidden).await.unwrap();
+    let session = get(&sm, &scope, "line:Ccustomer").await.unwrap().unwrap();
+    let notices: Vec<_> = session.rows.iter().filter(|row| row.role == "turn_failure").collect();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].content, crate::channel_reply::TurnFailureReason::Timeout.text(None));
+    assert!(session.rows.iter().all(|row| row.content != "PRIVATE HIDDEN"));
+}

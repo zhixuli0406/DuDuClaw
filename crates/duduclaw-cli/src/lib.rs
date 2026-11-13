@@ -2618,12 +2618,17 @@ enum MaintenanceCommands {
     ///     duduclaw license fingerprint
     ///     duduclaw license activate ./my-license.json
     ///     duduclaw license status
+    ///     duduclaw license --home-check strict activate ./my-license.json
     ///     duduclaw license refresh
     ///     duduclaw license export --base64 > license.b64
     ///     duduclaw license import ./transferred.json
     ///     duduclaw license deactivate
-    #[command(subcommand)]
-    License(license::LicenseCommands),
+    License {
+        #[arg(long, value_parser = ["warn", "strict"], default_value = "warn")]
+        home_check: String,
+        #[command(subcommand)]
+        command: license::LicenseCommands,
+    },
 
     /// Packs — ready-made bundles of AI employees: a whole team, a single
     /// industry persona, or one job preset. This is the main entry point;
@@ -6041,7 +6046,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::DataFileGuard)) => {
             cmd_hook_data_file_guard().await
         }
-        Commands::Maintenance(MaintenanceCommands::License(license_cmd)) => license::run(license_cmd).await,
+        Commands::Maintenance(MaintenanceCommands::License { home_check, command }) => {
+            license::run_with_home_check(command, home_check == "strict").await
+        },
         Commands::Maintenance(MaintenanceCommands::Pack { command }) => pack_cmd::run(command).await,
         Commands::Maintenance(MaintenanceCommands::Publishers { command }) => publishers_cmd::run(&duduclaw_home(), command).await,
         Commands::Maintenance(MaintenanceCommands::Expert { command }) => expert::run(command).await,
@@ -6834,6 +6841,10 @@ fn agent_file_guard_decision(
                         })
                         .or_else(|| {
                             duduclaw_core::bash_operator_command_decision(command, &caller, meeting_cmd::OPERATOR_COMMANDS)
+                        })
+                        .or_else(|| {
+                            // RM-137 H3: an employee may not run its own ACP server.
+                            duduclaw_core::bash_operator_command_decision(command, &caller, acp::server::OPERATOR_COMMANDS)
                         })
                         .or_else(|| license::bash_license_decision(command, &caller))
                         .or_else(|| {
@@ -14243,6 +14254,68 @@ mod protected_toml_hook_tests {
         assert!(matches!(d, GuardDecision::BlockedOrgFieldChange { .. }));
     }
 
+    /// RM-137 H1: an employee may not add or alter `[team_member]` in its own
+    /// `agent.toml` through Write, Edit or MultiEdit.
+    #[test]
+    fn team_member_section_is_frozen_for_write_edit_and_multiedit() {
+        let agent = duduclaw_core::HookCaller::Agent("agnes".to_string());
+        let forged = "\n[team_member]\nrole = \"planner\"\ntask_id = \"t-victim\"\nround = 3\nparent = \"agnes\"\n";
+        let blocked = |d: &GuardDecision| matches!(d, GuardDecision::BlockedAgentSecuritySection { .. });
+
+        // Adding the section.
+        let home = TempHome::new();
+        home.write_agent_toml(BASE);
+        let env = write_envelope(&home.agent_toml(), &format!("{BASE}{forged}"));
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "Write add: {d:?}");
+        let env = edit_envelope(
+            &home.agent_toml(),
+            "preferred = \"sonnet\"\n",
+            &format!("preferred = \"sonnet\"\n{forged}"),
+        );
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "Edit add: {d:?}");
+        let env = json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": home.agent_toml().to_string_lossy(),
+                "edits": [
+                    { "old_string": "preferred = \"sonnet\"\n", "new_string": format!("preferred = \"opus\"\n{forged}") }
+                ]
+            }
+        });
+        let d = check_protected_toml_tool_call("MultiEdit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "MultiEdit add: {d:?}");
+
+        // Altering an existing section (re-pinning to another task).
+        let home = TempHome::new();
+        let existing = format!("{BASE}{forged}");
+        home.write_agent_toml(&existing);
+        let env = write_envelope(&home.agent_toml(), &existing.replace("t-victim", "t-other"));
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "Write alter: {d:?}");
+        let env = edit_envelope(&home.agent_toml(), "round = 3", "round = 4");
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "Edit alter: {d:?}");
+        let env = json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": home.agent_toml().to_string_lossy(),
+                "edits": [
+                    { "old_string": "preferred = \"sonnet\"", "new_string": "preferred = \"opus\"" },
+                    { "old_string": "role = \"planner\"", "new_string": "role = \"verifier\"" }
+                ]
+            }
+        });
+        let d = check_protected_toml_tool_call("MultiEdit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert!(blocked(&d), "MultiEdit alter: {d:?}");
+
+        // An ordinary edit next to it stays allowed.
+        let env = edit_envelope(&home.agent_toml(), "preferred = \"sonnet\"", "preferred = \"opus\"");
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0, &agent).unwrap();
+        assert_eq!(d, GuardDecision::AllowedAgentWrite);
+    }
+
     #[test]
     fn write_creating_new_agent_toml_is_allowed() {
         let home = TempHome::new();
@@ -15010,6 +15083,71 @@ mod g1_home_state_hook_tests {
         // The operator keeps the pre-G1 rules.
         let d = agent_file_guard_decision("Write", &write(&p, widened), h.path(), &HookCaller::Absent)
             .unwrap();
+        assert!(d.is_allowed(), "{d:?}");
+    }
+
+    /// RM-149 round 2 (H2): `[agent] status` frees a licence seat when it
+    /// says `deleted`, so the employee cannot change it through any write
+    /// tool — set itself deleted to let another create pass, then come back.
+    #[test]
+    fn own_agent_status_is_frozen_for_write_edit_multiedit_and_team_roles() {
+        let h = tempfile::tempdir().unwrap();
+        let dir = h.path().join("agents/tester");
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = "[agent]\nname = \"tester\"\nreports_to = \"ceo\"\nstatus = \"active\"\ndisplay_name = \"T\"\n";
+        std::fs::write(dir.join("agent.toml"), active).unwrap();
+        let p = dir.join("agent.toml");
+        let frozen = |d: GuardDecision, what: &str| match d {
+            GuardDecision::BlockedAgentSecuritySection { ref changed, .. } => {
+                assert!(changed.iter().any(|c| c.starts_with("agent.status")), "{what}: {changed:?}")
+            }
+            other => panic!("{what}: expected BlockedAgentSecuritySection, got {other:?}"),
+        };
+
+        // Write.
+        let d = agent_file_guard_decision(
+            "Write", &write(&p, &active.replace("\"active\"", "\"deleted\"")), h.path(), &agent("tester"),
+        ).unwrap();
+        frozen(d, "Write");
+        // Edit.
+        let edit = json!({"tool_name": "Edit", "tool_input": {
+            "file_path": p.to_string_lossy(),
+            "old_string": "status = \"active\"", "new_string": "status = \"deleted\""}});
+        frozen(agent_file_guard_decision("Edit", &edit, h.path(), &agent("tester")).unwrap(), "Edit");
+        // MultiEdit (removing the key is a change too).
+        let multi = json!({"tool_name": "MultiEdit", "tool_input": {
+            "file_path": p.to_string_lossy(),
+            "edits": [
+                {"old_string": "display_name = \"T\"", "new_string": "display_name = \"T2\""},
+                {"old_string": "status = \"active\"\n", "new_string": ""}
+            ]}});
+        frozen(agent_file_guard_decision("MultiEdit", &multi, h.path(), &agent("tester")).unwrap(), "MultiEdit");
+        // A team role member runs in the employee's workspace and is
+        // identified as that employee by the hook installed there: same
+        // answer, relative path and all.
+        let role_edit = json!({"tool_name": "Edit", "cwd": dir.to_string_lossy(), "tool_input": {
+            "file_path": "agent.toml",
+            "old_string": "status = \"active\"", "new_string": "status = \"archived\""}});
+        frozen(agent_file_guard_decision("Edit", &role_edit, h.path(), &agent("tester")).unwrap(), "team role");
+        // An unverified claim is refused as well.
+        let d = agent_file_guard_decision(
+            "Write", &write(&p, &active.replace("\"active\"", "\"deleted\"")), h.path(),
+            &HookCaller::Untrusted("tester".into()),
+        ).unwrap();
+        assert!(!d.is_allowed(), "{d:?}");
+        // Bash: any write-shaped command naming agent.toml is refused.
+        let d = agent_file_guard_decision(
+            "Bash", &bash("sed -i '' 's/active/deleted/' agent.toml"), h.path(), &agent("tester"),
+        ).unwrap();
+        assert!(!d.is_allowed(), "{d:?}");
+        // Other `[agent]` keys stay editable; the operator is unaffected.
+        let d = agent_file_guard_decision(
+            "Write", &write(&p, &active.replace("\"T\"", "\"T2\"")), h.path(), &agent("tester"),
+        ).unwrap();
+        assert!(d.is_allowed(), "{d:?}");
+        let d = agent_file_guard_decision(
+            "Write", &write(&p, &active.replace("\"active\"", "\"deleted\"")), h.path(), &HookCaller::Absent,
+        ).unwrap();
         assert!(d.is_allowed(), "{d:?}");
     }
 

@@ -77,6 +77,40 @@ pub(crate) fn offboard_freeze_table(table: &mut toml::Table, status: &str) -> Re
     Ok(())
 }
 
+/// `error.code` of an `agents.unarchive` aimed at a soft-deleted employee.
+pub(crate) const UNARCHIVE_DELETED_CODE: &str = "agent_deleted";
+/// `error.code` of an `agents.unarchive` aimed at an employee that is not archived.
+pub(crate) const UNARCHIVE_NOT_ARCHIVED_CODE: &str = "agent_not_archived";
+
+pub(crate) const UNARCHIVE_DELETED_REFUSED: &str = "這位 AI 員工已被刪除，不能解除封存。刪除的員工資料仍保留在磁碟上，但不會再恢復；需要的話請新建一位 AI 員工。";
+
+/// RM-149: `agents.unarchive` restores only an archived employee. Checked on
+/// the `agent.toml` being rewritten (inside its file lock), so a status
+/// change racing the request is seen. Anything but exactly `"archived"`
+/// refuses (fail closed).
+pub(crate) fn require_archived_status(table: &toml::Table) -> Result<(), String> {
+    match table
+        .get("agent")
+        .and_then(|v| v.as_table())
+        .and_then(|a| a.get("status"))
+        .and_then(|v| v.as_str())
+    {
+        Some(duduclaw_core::agent_seats::ARCHIVED_STATUS) => Ok(()),
+        Some(duduclaw_core::agent_seats::DELETED_STATUS) => Err(UNARCHIVE_DELETED_REFUSED.to_string()),
+        Some(other) => Err(not_archived_message(other)),
+        None => Err("無法讀取這位 AI 員工的狀態，沒有解除封存。".to_string()),
+    }
+}
+
+/// `status` is untrusted file text: reduced to one plain line (no control,
+/// newline or bidi characters, at most 32 characters) before it is quoted.
+pub(crate) fn not_archived_message(status: &str) -> String {
+    format!(
+        "只有已封存的 AI 員工可以解除封存（目前狀態：{}）。",
+        duduclaw_core::agent_seats::status_label_zh(&duduclaw_core::plain_line(status, 32))
+    )
+}
+
 /// Restore evolution/heartbeat from the `[archive.restore]` snapshot (absent ⇒
 /// conservative `false`), set status active, and drop the snapshot block.
 pub(crate) fn unarchive_restore_table(table: &mut toml::Table) -> Result<(), String> {

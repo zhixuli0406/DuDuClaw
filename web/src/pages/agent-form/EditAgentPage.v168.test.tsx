@@ -204,11 +204,11 @@ describe('new controls round-trip from inspect to payload', () => {
     expect(timeout).toHaveValue(300);
   });
 
-  it('shows the 300-second runtime default without writing it on an unrelated edit', async () => {
+  it('shows the 1800-second Claude default without writing it on an unrelated edit', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=brain');
     const timeout = await screen.findByRole('spinbutton', { name: 'Execution time limit' });
-    expect(timeout).toHaveValue(300);
+    await waitFor(() => expect(timeout).toHaveValue(1800));
     await user.click(screen.getByRole('switch', { name: 'Slim startup context' }));
     await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
     expect(lastPayload()).toEqual({ runtime: { minimal_context: true } });
@@ -465,6 +465,10 @@ describe('removed dead controls and enforced permissions', () => {
     mockWsClient.call.mockResolvedValue({
       ...FULL,
       permissions: { can_send_cross_agent: false, can_schedule_tasks: true, permissions_enforced_since: '2026-10-03' },
+      effective_permissions: {
+        can_create_agents: false, can_send_cross_agent: false,
+        can_schedule_tasks: true, can_modify_own_skills: false, error: null,
+      },
     });
     renderAt('/agents/my-bot/edit?tab=tools');
     const cross = await screen.findByRole('switch', { name: en['agents.edit.canSendCrossAgent'] });
@@ -474,17 +478,59 @@ describe('removed dead controls and enforced permissions', () => {
     expect(screen.getByText(en['agents.v168.perm.canCreateAgents.help'])).toBeInTheDocument();
   });
 
-  it('shows absent permission keys as ON (allowed server-side) and sends nothing for them', async () => {
+  // An older gateway without `effective_permissions`: the gated switches show
+  // OFF even where the stored file says ON (never a stored or guessed ON).
+  it('shows the gated switches OFF when inspect carries no effective_permissions', async () => {
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      permissions: { can_send_cross_agent: true, can_schedule_tasks: true },
+    });
+    renderAt('/agents/my-bot/edit?tab=tools');
+    for (const id of ['agents.edit.canSendCrossAgent', 'agents.edit.canScheduleTasks'] as const) {
+      const sw = await screen.findByRole('switch', { name: en[id] });
+      await waitFor(() => expect(sw).not.toBeChecked());
+    }
+  });
+
+  // RM-137: the switches show what the gateway applies (`effective_permissions`),
+  // not a UI default — a non-main employee with no `can_create_agents` key is OFF.
+  it('shows the effective permission values and an untouched save sends none of them', async () => {
+    const user = userEvent.setup();
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      permissions: {},
+      effective_permissions: {
+        can_create_agents: false, can_send_cross_agent: true,
+        can_schedule_tasks: true, can_modify_own_skills: true, error: null,
+      },
+    });
+    renderAt('/agents/my-bot/edit?tab=tools');
+    for (const id of ['agents.edit.canSendCrossAgent', 'agents.edit.canScheduleTasks'] as const) {
+      const sw = await screen.findByRole('switch', { name: en[id] });
+      await waitFor(() => expect(sw).toBeChecked());
+    }
+    const create = await screen.findByRole('switch', { name: en['agents.edit.canCreateAgents'] });
+    await waitFor(() => expect(create).not.toBeChecked());
+    await user.click(screen.getByRole('switch', { name: 'Allow parallel branches' }));
+    await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
+    expect(lastPayload()).toEqual({ fork: { enabled: false } });
+  });
+
+  it('shows a permission neither the gateway nor the file states as OFF and never sends it', async () => {
     const user = userEvent.setup();
     mockWsClient.call.mockResolvedValue({ ...FULL, permissions: {} });
     renderAt('/agents/my-bot/edit?tab=tools');
     for (const id of ['agents.edit.canSendCrossAgent', 'agents.edit.canScheduleTasks', 'agents.edit.canCreateAgents'] as const) {
       const sw = await screen.findByRole('switch', { name: en[id] });
-      await waitFor(() => expect(sw).toBeChecked());
+      await waitFor(() => expect(sw).not.toBeChecked());
     }
     await user.click(screen.getByRole('switch', { name: 'Allow parallel branches' }));
     await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
-    expect(lastPayload()).toEqual({ fork: { enabled: false } });
+    const payload = lastPayload() as Record<string, unknown>;
+    expect(payload).toEqual({ fork: { enabled: false } });
+    for (const key of ['can_create_agents', 'can_send_cross_agent', 'can_schedule_tasks', 'can_modify_own_skills']) {
+      expect(payload).not.toHaveProperty(key);
+    }
   });
 });
 

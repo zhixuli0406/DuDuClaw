@@ -40,6 +40,11 @@ pub(super) struct InstallCtx {
     /// What a real replace moved away and what the new version wrote
     /// ([`InstallCtx::begin_writes`], [`InstallCtx::note_agent`]).
     pub replace_state: std::sync::Mutex<super::reimport::ReplaceState>,
+    /// RM-149 round 2: the seat admission a real import takes in
+    /// [`InstallCtx::ensure_quota`] and holds until its whole batch is
+    /// written (released by [`InstallCtx::release_seats`] or when the
+    /// context is dropped). Lock order: before the org lock.
+    pub seat_admission: std::sync::Mutex<Option<duduclaw_core::agent_seats::SeatAdmission>>,
 }
 
 /// Options of one pipeline run beyond the source itself.
@@ -270,6 +275,7 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         replace,
         agent_cap: opts.agent_cap,
         replace_state: Default::default(),
+        seat_admission: Default::default(),
     };
     if let Some(z) = &zip_summary {
         super::report::report_zip_summary(z, report);
@@ -330,6 +336,9 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
             return Err(e);
         }
     };
+    // Every employee of the import is written (a failure above rolled back
+    // while still holding it): the next seat admission may count them.
+    ctx.release_seats();
     let retired = state.retired;
     // The record is written: the replace has happened, its journal goes.
     if let Some(log) = &retired {
@@ -1258,7 +1267,7 @@ mod native_plan_tests {
             home: home.to_path_buf(), dry_run: true, confirm_profile: None, signature_status: None,
             rename: false, trust_hooks: false, attach_under: None,
             reimport: Default::default(), replace: None, agent_cap: None,
-            replace_state: Default::default(),
+            replace_state: Default::default(), seat_admission: Default::default(),
         }
     }
 

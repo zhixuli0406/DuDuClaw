@@ -24,7 +24,43 @@ pub(crate) fn validate_value(key: &str, value: &str) -> std::result::Result<(), 
     duduclaw_gateway::channel_settings::validate_setting_value(key, value)
 }
 
-pub(crate) async fn handle_channel_config(args: &Value, home_dir: &Path) -> Value {
+/// RM-137 M1: may this AI employee point a channel's `agent_override` at
+/// `value`? Clearing it (empty) or naming itself is always allowed. Any other
+/// value must be an existing agent id AND pass the delegation predicate
+/// (`check_delegation_allowed(caller → target)`, refused under `none`):
+/// routing a channel's future messages to another employee hands that
+/// employee work. Operators (`RecordActor::Operator`) and the dashboard /
+/// admin RPC paths are not judged here.
+pub(crate) async fn check_agent_override_allowed(
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+    value: &str,
+) -> std::result::Result<(), String> {
+    let Some(me) = actor.agent() else {
+        return Ok(());
+    };
+    let target = value.trim();
+    if target.is_empty() || target == me.trim() {
+        return Ok(());
+    }
+    let exists = duduclaw_core::is_valid_agent_id(target)
+        && !duduclaw_core::is_reserved_agent_id(target)
+        && home_dir.join("agents").join(target).join("agent.toml").is_file();
+    if !exists {
+        return Err(format!(
+            "agent_override 必須是既有的 AI 員工 id(或留空清除、或設為自己),「{}」不是 / \
+             agent_override must name an existing agent",
+            duduclaw_core::truncate_chars(target, 64)
+        ));
+    }
+    check_delegation_allowed(home_dir, me, target, "channel_config_agent_override").await
+}
+
+pub(crate) async fn handle_channel_config(
+    args: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
     let channel = match args.get("channel").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => return tool_error("Missing required parameter: channel"),
@@ -65,6 +101,11 @@ pub(crate) async fn handle_channel_config(args: &Value, home_dir: &Path) -> Valu
     if let Some(value) = args.get("value").and_then(|v| v.as_str()) {
         if let Err(e) = validate_value(key, value) {
             return tool_error(&format!("Invalid value: {e}"));
+        }
+        if key == duduclaw_gateway::channel_settings::keys::AGENT_OVERRIDE
+            && let Err(reason) = check_agent_override_allowed(home_dir, actor, value).await
+        {
+            return tool_error(&reason);
         }
         match mgr.set(channel, scope_id, key, value).await {
             Ok(()) => tool_text(&format!("Set {channel}/{scope_id}/{key} = {value}")),

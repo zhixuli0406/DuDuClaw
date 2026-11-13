@@ -35,6 +35,7 @@ mod redaction_rpc_tests;
 mod avatar_validation_tests;
 mod archive_restore_tests;
 mod agents_remove_org_store_tests;
+mod agent_seats_persona_tests;
 mod migrate_validation_tests;
 mod skill_synthesis_config_tests;
 mod autopilot_validation_tests;

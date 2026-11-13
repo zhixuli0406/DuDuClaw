@@ -118,7 +118,7 @@ where
     F: FnOnce(&mut toml::Table) -> Result<(), String>,
     G: FnOnce() -> Result<(), String>,
 {
-    update_agent_toml_edit_within(registry, agent_id, edit, None, mutate).await
+    update_agent_toml_edit_within(registry, agent_id, None, edit, None, mutate).await
 }
 
 /// [`update_agent_toml_edit`] whose `agent.toml` lock waits are bounded by
@@ -136,12 +136,33 @@ where
     F: FnOnce(&mut toml::Table) -> Result<(), String>,
     G: FnOnce() -> Result<(), String>,
 {
-    update_agent_toml_edit_within(registry, agent_id, edit, Some(lock_wait), mutate).await
+    update_agent_toml_edit_within(registry, agent_id, None, edit, Some(lock_wait), mutate).await
+}
+
+/// [`update_agent_toml_edit`] for an employee whose directory name
+/// (`dir_id`) may differ from its registry id (`[agent] name`, a legacy
+/// directory). The file written is `<home>/agents/<dir_id>/agent.toml`, and
+/// only when the registry entry for `agent_id` lives in exactly that
+/// directory (otherwise nothing is written). RM-149 round 2 (L5): used by
+/// `agents.unarchive`, which resolves the real directory first.
+pub async fn update_agent_toml_in_dir<F, G>(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    dir_id: &str,
+    edit: AgentTomlEdit<'_, G>,
+    mutate: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&mut toml::Table) -> Result<(), String>,
+    G: FnOnce() -> Result<(), String>,
+{
+    update_agent_toml_edit_within(registry, agent_id, Some(dir_id), edit, None, mutate).await
 }
 
 async fn update_agent_toml_edit_within<F, G>(
     registry: &Arc<RwLock<AgentRegistry>>,
     agent_id: &str,
+    dir_id: Option<&str>,
     edit: AgentTomlEdit<'_, G>,
     lock_wait: Option<std::time::Duration>,
     mutate: F,
@@ -150,7 +171,7 @@ where
     F: FnOnce(&mut toml::Table) -> Result<(), String>,
     G: FnOnce() -> Result<(), String>,
 {
-    if !duduclaw_core::is_valid_agent_id(agent_id) {
+    if !duduclaw_core::is_valid_agent_id(agent_id) || dir_id.is_some_and(|d| !duduclaw_core::is_valid_agent_id(d)) {
         return Err(format!("Invalid agent_id: {agent_id}"));
     }
     let home_dir = {
@@ -158,7 +179,12 @@ where
         let agent = reg
             .get(agent_id)
             .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
-        // `agent.dir` is `<home_dir>/agents/<agent_id>`.
+        if let Some(dir_id) = dir_id
+            && agent.dir.file_name().and_then(|n| n.to_str()) != Some(dir_id)
+        {
+            return Err(format!("Agent not found: {agent_id}"));
+        }
+        // `agent.dir` is `<home_dir>/agents/<directory>`.
         agent
             .dir
             .parent()
@@ -166,6 +192,8 @@ where
             .map(Path::to_path_buf)
             .ok_or_else(|| format!("Agent not found: {agent_id}"))?
     };
+    // The profile file writer addresses the file by directory name.
+    let path_id = dir_id.unwrap_or(agent_id);
 
     let model_changed = std::sync::atomic::AtomicBool::new(false);
     let render = |current: &str| -> Result<String, String> {
@@ -182,7 +210,7 @@ where
     };
     let commit = crate::agent_files::writer::Commit {
         home: &home_dir,
-        agent_id,
+        agent_id: path_id,
         key: crate::agent_files::FileKey::AgentToml,
         expected_hash: None,
         meta: crate::agent_files::writer::CommitMeta::new(edit.user_id, edit.source),
@@ -252,6 +280,7 @@ mod delivery;
 mod direct_api;
 mod entry;
 mod failure;
+mod failure_notice;
 mod failure_message;
 mod guarded;
 mod history;
@@ -271,6 +300,7 @@ pub use delivery::*;
 pub use direct_api::*;
 pub use entry::*;
 pub(crate) use failure::*;
+pub(crate) use failure_notice::*;
 pub(crate) use failure_message::*;
 pub use guarded::*;
 pub(crate) use history::*;

@@ -752,7 +752,7 @@ async fn f6fb_session_every_label_write_gated() {
     sessions.get_or_create("webchat:bob", OTHER).await.unwrap();
     quarantine_row(home, LABEL, 1, "sealed");
     let _mode = Mode::protected(true);
-    let refused = sessions.record_webchat_failure("webchat:old", "boom").await.unwrap_err();
+    let refused = sessions.record_turn_failure("webchat:old", "t1", crate::channel_reply::TurnFailureReason::Internal, None, None).await.unwrap_err();
     assert!(refused.to_string().contains(LABEL_QUARANTINED), "{refused}");
     assert!(sessions.compress("webchat:old", "planted summary").await.is_err());
     assert!(sessions.set_pinned("webchat:old", "planted").await.is_err());
@@ -764,7 +764,7 @@ async fn f6fb_session_every_label_write_gated() {
     assert_eq!(kept, 1, "compression deleted nothing");
     // Other labels are untouched by the gate.
     sessions.set_title("webchat:bob", "fine", 1).await.unwrap();
-    sessions.record_webchat_failure("webchat:bob", "boom").await.unwrap();
+    sessions.record_turn_failure("webchat:bob", "t1", crate::channel_reply::TurnFailureReason::Internal, None, None).await.unwrap();
     // The connection-level backstop on every pool connection (each guard is
     // held, so the next `acquire` returns another connection).
     let mut held = Vec::new();

@@ -3,9 +3,6 @@ use super::*;
 /// Keepalive interval — send progress if no stream-json events for this long.
 pub(crate) const KEEPALIVE_INTERVAL_SECS: u64 = 90;
 
-/// Hard max timeout — absolute safety net to kill truly hung processes.
-pub(super) const HARD_MAX_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
-
 /// Internal wrapper for GVU loop / internal-utility LLM calls.
 ///
 /// RFC-25 Phase 0: the previous hard allowlist *rejected* any model that wasn't
@@ -140,13 +137,14 @@ pub(super) async fn call_claude_cli_lightweight(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
+    let timeout_secs = crate::runtime_config::claude_timeout_secs(home_dir, None);
     let output = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Claude,
         crate::process_group::output_for_model(&mut cmd, None,
-            std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS)),
+            std::time::Duration::from_secs(timeout_secs)),
     ).await
         .map_err(|e| match e {
-            crate::process_group::OutputError::Timeout => "Claude utility hard timeout".to_owned(),
+            crate::process_group::OutputError::Timeout => format!("claude CLI hard timeout ({timeout_secs}s, utility call)"),
             crate::process_group::OutputError::Io(e) => {
                 let message = e.to_string();
                 if message.starts_with("AUTONOMY_") { message }

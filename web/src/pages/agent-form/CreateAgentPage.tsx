@@ -28,6 +28,8 @@ import { TEMPLATE_KIND_ORDER } from './defaults';
 import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { sanitizeErrorDetail } from '@/lib/error-message';
+import { seatLimitOf, type SeatLimitInfo } from '@/lib/seat-limit';
+import { SeatLimitNotice } from '@/components/shared/SeatLimitNotice';
 
 /**
  * CreateAgentPage — standalone route (/agents/new) for hiring a new AI
@@ -51,6 +53,10 @@ export function CreateAgentPage() {
   // `claude-sonnet-4-6` server-side). Only shown on the blank path; a template
   // brings its own model.
   const [model, setModel] = useState('');
+  // Optional persona for the blank path, sent as `soul_md` (RM-146: the
+  // gateway used to drop it and write a stock sentence). A template brings
+  // its own SOUL.md editor below.
+  const [persona, setPersona] = useState('');
   const {
     models: availableModels,
     loading: modelsLoading,
@@ -74,6 +80,8 @@ export function CreateAgentPage() {
   const [errorState, setErrorState] = useState<unknown>(null);
   /** How to re-attempt whatever produced `errorState`. */
   const [errorRetry, setErrorRetry] = useState<(() => void) | null>(null);
+  /** RM-149: a seat-limit refusal, with the employees currently counted. */
+  const [seatLimit, setSeatLimit] = useState<SeatLimitInfo | null>(null);
 
   // ── Template pack state (silent degrade when the RPC is unavailable) ──
   const [roster, setRoster] = useState<TemplateRoster | null>(null);
@@ -166,6 +174,7 @@ export function CreateAgentPage() {
     if (!name.trim() || !displayName.trim() || (reportsTo && !canSelectAgent(reportsTo))) return;
     setError(null);
     setErrorState(null);
+    setSeatLimit(null);
     setSubmitting(true);
     try {
       if (usingTemplate) {
@@ -191,6 +200,7 @@ export function CreateAgentPage() {
           model_preferred: model,
           ...(reportsTo ? { reports_to: reportsTo } : {}),
           ...(department ? { department } : {}),
+          ...(persona.trim() ? { soul_md: persona } : {}),
         });
       }
       // Same post-create behavior as the former dialog's onCreated: refresh
@@ -198,6 +208,14 @@ export function CreateAgentPage() {
       await fetchAgents();
       navigate('/agents');
     } catch (e) {
+      // Seat limit (either path): show who holds the seats instead of a
+      // one-line error.
+      const seats = seatLimitOf(e);
+      if (seats) {
+        setErrorState(null);
+        setSeatLimit(seats);
+        return;
+      }
       // Template errors carry an actionable zh-TW message (e.g. bad TOML).
       if (usingTemplate) {
         setErrorState(e);
@@ -364,6 +382,21 @@ export function CreateAgentPage() {
           </SettingsCard>
         </SettingsSection>
 
+        {/* Persona (blank path; a template has its own SOUL.md editor). */}
+        {!usingTemplate && (
+          <SettingsSection title={t('agents.create.persona')}>
+            <FieldBlock description={t('agents.create.personaHint')}>
+              <Textarea
+                value={persona}
+                onChange={(e) => setPersona(e.target.value)}
+                aria-label={t('agents.create.persona')}
+                placeholder={t('agents.create.personaPlaceholder')}
+                className="min-h-32 resize-y leading-relaxed"
+              />
+            </FieldBlock>
+          </SettingsSection>
+        )}
+
         {/* Template overrides. */}
         {usingTemplate && (
           <SettingsSection title={t('agents.create.template.soul')}>
@@ -401,6 +434,7 @@ export function CreateAgentPage() {
           </SettingsSection>
         )}
 
+        {seatLimit && <SeatLimitNotice info={seatLimit} />}
         {errorState != null && (
           <ErrorState
             variant="inline"

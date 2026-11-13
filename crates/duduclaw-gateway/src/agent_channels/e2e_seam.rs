@@ -15,6 +15,30 @@ pub(crate) fn arm(home: &Path) {
     armed().lock().unwrap().insert(home.to_path_buf());
 }
 
+#[derive(Clone)]
+enum AdapterOutcome {
+    Failure(String, crate::channel_reply::TurnFailureReason),
+    Empty,
+    Panic,
+}
+
+fn failures() -> &'static Mutex<HashMap<PathBuf, AdapterOutcome>> {
+    static FAILURES: OnceLock<Mutex<HashMap<PathBuf, AdapterOutcome>>> = OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+/// Simulate a runtime refusal after its question was saved. The real WebChat
+/// adapter must keep the original live text even when a notice also exists.
+pub(crate) fn failure_reply(home: &Path, text: String, reason: crate::channel_reply::TurnFailureReason) {
+    failures().lock().unwrap().insert(home.into(), AdapterOutcome::Failure(text, reason));
+}
+
+/// Exercise the actual guarded entry points after user persistence, without
+/// pre-writing a notice that could conceal a missing empty/panic handler.
+pub(crate) fn empty_or_panicking_reply(home: &Path, panic: bool) {
+    failures().lock().unwrap().insert(home.into(), if panic { AdapterOutcome::Panic } else { AdapterOutcome::Empty });
+}
+
 /// One model seam invocation paused until the test explicitly releases it.
 pub(crate) struct WaitingTurn {
     pub session_id: String,
@@ -56,6 +80,7 @@ impl Drop for WaitingTurns {
         waiting().lock().unwrap().remove(&self.home);
         armed().lock().unwrap().remove(&self.home);
         delegation_capture().lock().unwrap().remove(&self.home);
+        failures().lock().unwrap().remove(&self.home);
     }
 }
 
@@ -112,6 +137,20 @@ pub(crate) async fn answer(
         if waiter.send(WaitingTurn { session_id: session_id.into(), delegation_id, release }).is_ok() {
             let _ = released.await;
         }
+    }
+    let failure = failures().lock().unwrap().get(&ctx.home_dir).cloned();
+    if let Some(outcome) = failure {
+        let session = ctx.session_manager.get_or_create(session_id, agent).await.unwrap();
+        ctx.session_manager.append_message(session_id, "user", "Hello", 1).await.unwrap();
+        crate::channel_reply::bind_failure_session(session_id, &session.created_at, agent);
+        return Some(match outcome {
+            AdapterOutcome::Failure(text, reason) => {
+                ctx.session_manager.record_turn_failure(session_id, turn_id, reason, None, Some(&session.created_at)).await.unwrap();
+                text
+            }
+            AdapterOutcome::Empty => String::new(),
+            AdapterOutcome::Panic => panic!("adapter panic after user persistence"),
+        });
     }
     // Simulate only the model's host-owned environment AFTER the real reply
     // pipeline selected its employee/session. Register through the real API.
