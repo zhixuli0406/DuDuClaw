@@ -20,6 +20,7 @@ import { changedPayload, parseTomlSubset, tomlBool, tomlStr, type FlatValues } f
 import { TakeoverMailSection } from './TakeoverMailSection';
 import { TickSettingsSection } from './TickSettingsSection';
 import { TeamDefaultsSection } from './TeamDefaultsSection';
+import { RunLimitsSections } from './RunLimitsSections';
 
 // dispatch.policy enum accepted by the gateway's system.update_config.
 // v1.68: `role_team` (one employee in four roles) is accepted by the reader
@@ -584,6 +585,7 @@ export function AutomationTab() {
 
       {/* v1.68 (W2) — cards with their own save: each writes only its own
           keys, so saving one never touches another card's settings. */}
+      <RunLimitsSections />
       <TakeoverMailSection />
       <TeamDefaultsSection />
       <TickSettingsSection />

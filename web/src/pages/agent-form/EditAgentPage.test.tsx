@@ -85,6 +85,15 @@ beforeEach(() => {
 });
 
 describe('EditAgentPage', () => {
+  it('shows the effective Claude default and configured ceiling', async () => {
+    mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'claude' }, effective_timeout_secs: 1800, max_timeout_secs: 7200 });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    const field = await screen.findByRole('spinbutton', { name: 'Execution time limit' });
+    await waitFor(() => expect(field).toHaveValue(1800));
+    expect(field).toHaveAttribute('max', '7200');
+    expect(screen.getByText(/Effective value: 1800 seconds; ceiling: 7200 seconds/)).toBeInTheDocument();
+  });
+
   it('renders every sub-tab in the rail across both groups', async () => {
     renderAt('/agents/my-bot/edit');
 

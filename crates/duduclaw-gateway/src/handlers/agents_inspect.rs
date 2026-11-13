@@ -261,6 +261,9 @@ impl MethodHandler {
                         // file so the dashboard tells "unset" from an explicit false
                         // (drives the PTY-pool OAuth default-enable materialization).
                         "runtime": runtime_json,
+                        "effective_timeout_secs": crate::runtime_config::effective_agent_timeout_secs(&self.home_dir.join("agents").join(&cfg.agent.name)),
+                        "max_timeout_secs": crate::runtime_config::TimeoutPolicy::load(&self.home_dir).max_secs,
+                        "timeout_authorization_ceiling_secs": crate::runtime_config::agent_timeout_authorization_ceiling(&self.home_dir.join("agents").join(&cfg.agent.name)),
                         // [os_watch] table — raw from agent.toml (typed config doesn't
                         // surface it), so the OS-native watch editor prefills the
                         // operator's own paths/ignore/debounce rather than defaults.

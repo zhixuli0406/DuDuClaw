@@ -1,5 +1,25 @@
 # Dashboard settings map (v1.80.0)
 
+## Automation → Run, schedule and file review limits (v1.82.0)
+
+These three cards are Admin-only and save through the locked configuration writer. Changes apply to subsequent runs, checks or approval requests without a restart.
+
+| Card / field | `config.toml` key | Default / allowed range |
+|---|---|---|
+| Single-run / default seconds | `[runtime] default_timeout_secs` | Optional; 30 up to `max_timeout_secs`. Blank removes the override: Claude keeps 1800 seconds, other runtimes keep 300. |
+| Single-run / ceiling seconds | `[runtime] max_timeout_secs` | 3600; 60–14400 seconds. Raising it allows long runs to consume more quota. |
+| Assignment schedules / active per person | `[goal_defaults] assign_schedule_max_active` | 20; 0–200. Zero prevents creation and resume. |
+| Assignment schedules / minimum interval | `[goal_defaults] assign_schedule_min_interval_minutes` | 60; 60–10080 minutes for non-Admins. The Admin minimum stays 5 minutes. |
+| File reviews / daily total | `[agent_files] review_daily_limit` | 200; 0–100000. |
+| File reviews / daily per person | `[agent_files] review_daily_limit_per_user` | 40; 0–100000. |
+| File reviews / daily per employee | `[agent_files] review_daily_limit_per_agent` | 60; 0–100000. |
+| File checks / per person per minute | `[agent_files] checks_per_minute` | 10; 1–1000. |
+| File approvals / pending per person | `[agent_files] max_pending_per_user` | 20; 1–200. |
+
+The employee's existing `[runtime] timeout_secs` now applies to Claude as well. When no employee value is set, a non-Admin owner can only set 300 seconds or less (and must obey any lower global default or ceiling). The employee page shows the effective seconds and ceiling. Values above the ceiling are rejected on save and clamped at execution. An invalid global timeout configuration logs a warning and restores the previous hard defaults (Claude 1800 seconds, others 300, ceiling 3600); it never permits unlimited execution. A valid global default replaces the runtime-specific default only when the employee value is absent. The ceiling also bounds an unset default. Task-specific limits and sandbox limits can still shorten a run; task-specific stored limits retain their existing 30–3600-second range.
+
+Web conversations retain their separate 15-minute limit; when it is reached, the error recommends assigning a background task. Routine constants and role overrides are unchanged. Exhausting a review quota still produces at least a warning (or a block), never skips review. There is no temporary relaxation switch.
+
 ## Advanced settings and company information (v1.80.0)
 
 Admins in both editions can open **Settings → Advanced** (`/app/system/settings/advanced`). One page groups the less frequently used settings below. Search filters section names, descriptions and field labels immediately in the selected language (English, Traditional Chinese or Japanese). Expand a matching section to edit it; existing save behavior, restart notices and RPC permissions still apply. General, Account, Voice and Proactive notifications remain in the everyday settings rail. Non-Admins cannot open either new page or see its navigation.
@@ -377,7 +397,7 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 | Brain & engine → Reasoning effort | `[model] effort` |
 | Brain & engine → Provider / Fallback | `[runtime] provider` / `fallback`, now including qwen, kimi, copilot, kiro, cursor, vibe, opencode |
 | Brain & engine → Slim startup context | `[runtime] minimal_context` |
-| Brain & engine → Per-run time limit | `[runtime] timeout_secs`: integer seconds, default 300, range 30–3600; Codex / Grok / other CLI runtimes / OpenAI-compatible API; Claude retains its fixed 30-minute limit |
+| Brain & engine → Per-run time limit | `[runtime] timeout_secs`: 30 seconds to the global ceiling; Claude and all other runtimes. Defaults and validation: see the v1.82.0 limits above. |
 | Brain & engine → Utility model | `[model] utility`: blank follows the main model on Codex and OpenAI-compatible APIs; Claude defaults to `claude-haiku-4-5`; Grok and generic CLIs use global background settings |
 | Brain & engine → One employee, four roles | `[team] enabled`, `[team.roles.<role>]` |
 | Automation → Night-time tidy-up | `[night_engine] enabled` |
@@ -388,9 +408,9 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 
 **Employee budget.** `[budget] daily_cap_cents` and `monthly_limit_cents` cap recorded spend over rolling 24-hour and 30-day windows when `hard_stop = true`; 0 means no cap. Calls already running can exceed the cap. Checks include Claude and other employee runtimes, delegated and scheduled work, reminders, mail, heartbeat, utility work and CLI forks/evals. Spend recorded under ephemeral children is included in the parent's budget, summed in millicents before conversion to cents. When the employee configuration can be read, `[budget] when_unavailable = "allow"` (the default when omitted) allows unavailable telemetry or failed cost queries with an explicit warning and audit record; `"deny"` refuses before the model runs. If the configuration cannot be read or parsed, the policy cannot be confirmed and the call is refused. Unknown policy values use `"deny"` and warn. An unavailable check has its own explanation and audit event; it does not announce a reached cap or a breaker transition. Budget refusals do not rotate accounts or trigger failover. Calls with no employee id are outside this policy. Employee-scoped utility calls use the effective `[agent].name` for budget checks and future cost rows, even when an operation label was supplied. Historical rows recorded only under operation labels cannot be assigned back to employees reliably.
 
-The per-run time limit is saved separately from the container task timeout. The server rejects values outside 30–3600 seconds and non-integers. For manually edited files, out-of-range integers are clamped and wrong-typed values use the default, with a warning.  OpenAI-compatible employees require a model in either `utility` or `preferred`; Codex can use its CLI default; Grok and generic CLIs use global background settings. A vendor-family mismatch in the utility model shows an inline warning because background work such as conversation compression and fact extraction will fail.
+The per-run time limit is saved separately from the container task timeout. The server rejects values outside 30 seconds to the global ceiling and non-integers. For manually edited files, out-of-range integers are clamped and wrong-typed values use the default, with a warning.  OpenAI-compatible employees require a model in either `utility` or `preferred`; Codex can use its CLI default; Grok and generic CLIs use global background settings. A vendor-family mismatch in the utility model shows an inline warning because background work such as conversation compression and fact extraction will fail.
 
-Increasing the effective `timeout_secs` requires an administrator. An Owner may lower it; clearing the setting restores 300 seconds and needs an administrator only when that increases the current effective limit.
+Increasing the effective `timeout_secs` requires an administrator. An Owner may lower it; clearing the setting restores the global default (or Claude 1800 / other runtimes 300 seconds when no global default is set) and needs an administrator only when that increases the current effective limit.
 
 Claude utility calls use the lightweight lane with the CLI's available credentials and do not enter account rotation. Normal chat retains its existing account rotation.
 
@@ -520,7 +540,7 @@ The persona you give at creation (the optional Persona box on the blank create f
 | Open `/goals` directly → Assigned by me → Scheduled: **Pause / Resume / Remove** | the row's `status` | At once. Resume re-checks the creator's right and continues from the next slot after now; a one-time schedule whose time passed cannot resume. Remove keeps the row as `removed` (never listed or run again). |
 | **Show everyone's** (Admins) | — | Lists every person's schedules with the creator's name. |
 
-Caps live in `config.toml` (no control yet; Advanced config editor): `[goal_defaults] assign_schedule_max_active` (default 20 per person, 0..200) and `assign_schedule_min_interval_minutes` (non-Admins, default 60, can only be raised). Existing schedules also recheck the interval at every run and resume. Pause/remove prevents a run whose task has not yet been stored; stop an already stored task separately. Details: [Scheduling an assignment](../features/67-assigning-tasks.md#scheduling-an-assignment).
+Admins can edit these caps in Settings → Automation (or the Advanced config editor): `[goal_defaults] assign_schedule_max_active` (default 20 per person, 0..200) and `assign_schedule_min_interval_minutes` (non-Admins, default 60, can only be raised). Existing schedules also recheck the interval at every run and resume. Pause/remove prevents a run whose task has not yet been stored; stop an already stored task separately. Details: [Scheduling an assignment](../features/67-assigning-tasks.md#scheduling-an-assignment).
 
 ## System → Updates (v1.76.2)
 

@@ -21,9 +21,6 @@ use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus
 pub(crate) const ACTION_KIND: &str = "agent_file_change";
 /// Three days; expiry counts as a denial.
 pub(crate) const TTL_SECS: i64 = 3 * 24 * 3600;
-/// At most this many requests by one person may wait at once.
-pub(crate) const MAX_PENDING_PER_USER: usize = 20;
-
 /// The plain zh-TW name of a file (channel notices, summaries).
 pub(crate) fn plain_name(key: &FileKey) -> &'static str {
     match key {
@@ -108,7 +105,7 @@ pub(crate) async fn file_request(
             waiting += 1;
         }
     }
-    if waiting >= MAX_PENDING_PER_USER {
+    if waiting >= super::AgentFilesConfig::load(home).max_pending_per_user {
         return Err(format!("你已有 {waiting} 份修改在等待審核，請等管理員處理或撤回一些再送出"));
     }
     let categories = super::verdict::categories(&analysis.reasons);
@@ -235,4 +232,23 @@ mod tests {
             assert!(!valid_id(bad), "{bad}");
         }
     }
+
+    #[tokio::test]
+    async fn file_requests_enforce_the_configured_pending_cap() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[agent_files]\nmax_pending_per_user=1\n").unwrap();
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        broker.request("anna", ACTION_KIND, "pending", json!({
+            "requested_by":"u1", "agent_id":"anna", "file":"SOUL.md"
+        }), TTL_SECS).await.unwrap();
+        let analysis = Analysis {
+            user_id: "u1".into(), agent_id: "anna".into(), file: FileKey::Identity,
+            base_hash: "base".into(), content_sha256: "content".into(),
+            verdict: Verdict::Warn, basis: "review", summary: String::new(), reasons: vec![], source: "dashboard",
+        };
+        let error = file_request(home.path(), &analysis, "proposal", "u@example.test", "reason").await.unwrap_err();
+        assert!(error.contains("1 份修改"));
+        assert_eq!(broker.list_by_kind(ACTION_KIND).await.unwrap().len(), 1);
+    }
+
 }

@@ -479,6 +479,9 @@ function EditAgentPageContent() {
   const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
   const [savedRuntimeTimeout, setSavedRuntimeTimeout] = useState(300);
   const savedRuntimeTimeoutRef = useRef(300);
+  const [runtimeTimeoutError, setRuntimeTimeoutError] = useState(false);
+  const [runtimeEffectiveTimeout, setRuntimeEffectiveTimeout] = useState(300);
+  const [runtimeMaxTimeout, setRuntimeMaxTimeout] = useState(3600);
   const isAdminRef = useRef(isAdmin);
   useEffect(() => { isAdminRef.current = isAdmin; }, [isAdmin]);
   // The gateway's own admin-only path list (`agents.inspect.admin_only_fields`);
@@ -640,12 +643,16 @@ function EditAgentPageContent() {
     setContractHeld(null);
 
     const rt = agent.runtime;
-    savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(rt?.timeout_secs);
+    savedRuntimeTimeoutRef.current = agent.timeout_authorization_ceiling_secs
+      ?? effectiveRuntimeTimeout(rt?.timeout_secs, 300, agent.max_timeout_secs ?? 3600);
+    setRuntimeEffectiveTimeout(agent.effective_timeout_secs
+      ?? effectiveRuntimeTimeout(rt?.timeout_secs, rt?.provider === 'claude' || !rt?.provider ? 1800 : 300, agent.max_timeout_secs ?? 3600));
+    setRuntimeMaxTimeout(agent.max_timeout_secs ?? 3600);
     setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
     setRuntime({
       provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
       fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
-      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs),
+      timeout_secs: effectiveRuntimeTimeout(rt?.timeout_secs, agent.effective_timeout_secs ?? (rt?.provider === 'claude' || !rt?.provider ? 1800 : 300), agent.max_timeout_secs ?? 3600),
     });
 
     const ef = ev?.external_factors ?? {};
@@ -796,7 +803,11 @@ function EditAgentPageContent() {
 
   const updateRuntime = useCallback(<K extends keyof typeof DEFAULT_RUNTIME>(key: K, value: (typeof DEFAULT_RUNTIME)[K]) => {
     if (lockedPath(`runtime.${String(key)}`)) return;
-    if (key === 'timeout_secs' && !isAdminRef.current && runtimeTimeoutNeedsAdmin(savedRuntimeTimeoutRef.current, value)) return;
+    if (key === 'timeout_secs') {
+      const exceedsCeiling = !isAdminRef.current && runtimeTimeoutNeedsAdmin(savedRuntimeTimeoutRef.current, value);
+      setRuntimeTimeoutError(exceedsCeiling);
+      if (exceedsCeiling) return;
+    }
     markDirty(`runtime.${String(key)}`);
     setRuntime((prev) => ({ ...prev, [key]: value }));
   }, [markDirty, lockedPath]);
@@ -940,9 +951,28 @@ function EditAgentPageContent() {
           setOdoo((current) => JSON.stringify(current.allowed_actions) === JSON.stringify(odoo.allowed_actions)
             ? { ...current, allowed_actions: sentActions } : current);
         }
-        if (payload.runtime && Object.hasOwn(payload.runtime, 'timeout_secs')) {
-          savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(payload.runtime.timeout_secs);
-          setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
+        if (payload.runtime || res?.runtime_provider_aligned) {
+          // Preserve the successful write even if the follow-up read fails or
+          // an older gateway returns no authorization ceiling.
+          const sentTimeout = payload.runtime?.timeout_secs;
+          if (sentTimeout !== undefined) {
+            savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(sentTimeout, 300, runtimeMaxTimeout);
+            setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
+            setRuntimeEffectiveTimeout(effectiveRuntimeTimeout(sentTimeout, runtimeEffectiveTimeout, runtimeMaxTimeout));
+          }
+          try {
+            const detail = await api.agents.inspect(agent.name);
+            const max = detail.max_timeout_secs ?? 3600;
+            const effective = detail.effective_timeout_secs
+              ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, detail.runtime?.provider === 'claude' || !detail.runtime?.provider ? 1800 : 300, max);
+            savedRuntimeTimeoutRef.current = detail.timeout_authorization_ceiling_secs
+              ?? effectiveRuntimeTimeout(sentTimeout ?? detail.runtime?.timeout_secs, 300, max);
+            setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
+            setRuntimeEffectiveTimeout(effective);
+            setRuntimeMaxTimeout(max);
+          } catch (error) {
+            console.warn('Saved agent settings but could not refresh runtime limits', error);
+          }
         }
         if (includesKv) setKvServerError(null);
         // Save-time auto-align: the gateway rewrote [runtime] provider to
@@ -1003,7 +1033,8 @@ function EditAgentPageContent() {
     }
   }, [
     agent, form, availableModels, updateAgent, intl, errorText,
-    caps, osWatch, research, runtime, evoAdv, odoo, adv, v168, contract, takeContractAnswer,
+    caps, osWatch, research, runtime, runtimeMaxTimeout, runtimeEffectiveTimeout,
+    evoAdv, odoo, adv, v168, contract, takeContractAnswer,
   ]);
 
   // CON — the review dialog's follow-up: resend the checked contract with
@@ -1900,7 +1931,8 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} disabled={locked('runtime.provider')} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
               <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} disabled={locked('runtime.fallback')} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
-              <RowNumber label={t('agents.runtime.timeout')} description={t(isAdmin ? 'agents.runtime.timeout.hint' : 'agents.runtime.timeout.lowerOnly')} value={runtime.timeout_secs} min={30} max={isAdmin ? 3600 : savedRuntimeTimeout} step={1} onChange={(v) => updateRuntime('timeout_secs', v)} />
+              <RowNumber label={t('agents.runtime.timeout')} description={<><span>{t(isAdmin ? 'agents.runtime.timeout.hint' : 'agents.runtime.timeout.lowerOnly')}</span> {intl.formatMessage({ id: isAdmin ? 'agents.runtime.timeout.effective' : 'agents.runtime.timeout.ownerCeiling' }, { value: runtimeEffectiveTimeout, max: runtimeMaxTimeout, ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</>} value={runtime.timeout_secs} min={30} max={isAdmin ? runtimeMaxTimeout : Math.min(savedRuntimeTimeout, runtimeMaxTimeout)} step={1} onChange={(v) => updateRuntime('timeout_secs', v)} />
+              {runtimeTimeoutError && <p role="alert" className="px-3 py-2 text-xs text-destructive">{intl.formatMessage({ id: 'agents.runtime.timeout.overCeiling' }, { ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</p>}
               <RowSwitch label={t('agents.v168.minimalContext')} description={t('agents.v168.minimalContext.help')} checked={v168.minimal_context} onChange={(v) => updateV('minimal_context', v)} />
             </SettingsCard>
             {usesGenericCli && (

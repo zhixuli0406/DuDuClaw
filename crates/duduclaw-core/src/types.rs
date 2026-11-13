@@ -4276,8 +4276,8 @@ pub struct RuntimeSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
     /// Per-run CLI or per-request OpenAI-compatible API limit in seconds.
-    /// Claude retains its fixed 30-minute limit. Missing or wrong-typed values use
-    /// the runtime default; resolution clamps integers to 30..=3600.
+    /// Applies to Claude and other runtimes. Missing or wrong-typed values use
+    /// the runtime/global default; resolution clamps to the global ceiling.
     #[serde(deserialize_with = "crate::agent_toml::deserialize_timeout_secs")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<i64>,

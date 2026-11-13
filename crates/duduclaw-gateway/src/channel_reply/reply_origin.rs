@@ -216,7 +216,7 @@ impl ReplyFailure {
                 let origin = ReplyOrigin::Runtime(step.runtime);
                 let body = match &step.outcome {
                     RuntimeStepOutcome::ExecutionError(error) => {
-                        origin_message(agent, origin, classify_origin_reason(origin, error), home)
+                        origin_message_with_applied_timeout(agent, origin, classify_origin_reason(origin, error), home, applied_claude_timeout(error))
                     }
                     RuntimeStepOutcome::Empty => {
                         origin_message(agent, origin, FailureReason::EmptyResponse, home)
@@ -246,11 +246,12 @@ impl ReplyFailure {
             }
             return messages.join("\n\n");
         }
-        let primary = origin_message(
+        let primary = origin_message_with_applied_timeout(
             agent,
             self.origin,
             classify_origin_reason(self.origin, &self.summary),
             home,
+            applied_claude_timeout(&self.summary),
         );
         if let Some((origin, error)) = &self.secondary {
             format!(
@@ -290,7 +291,21 @@ fn classify_origin_reason(origin: ReplyOrigin, error: &str) -> FailureReason {
     }
     classify_cli_failure(error)
 }
+// The process timeout carries the captured run limit; do not re-read a
+// setting that may have changed while that run was executing.
+fn applied_claude_timeout(error: &str) -> Option<u64> {
+    let (_, rest) = error.split_once("claude CLI hard timeout (")?;
+    let (seconds, _) = rest.split_once("s,")?;
+    seconds.parse::<u64>().ok().filter(|n| (30..=14_400).contains(n))
+}
+
 fn origin_message(agent: &str, origin: ReplyOrigin, reason: FailureReason, home: &Path) -> String {
+    origin_message_with_applied_timeout(agent, origin, reason, home, None)
+}
+
+fn origin_message_with_applied_timeout(
+    agent: &str, origin: ReplyOrigin, reason: FailureReason, home: &Path, applied: Option<u64>,
+) -> String {
     // RM-155: a timeout while macOS folder access is pending/denied is the
     // consent prompt nobody answered, not a slow model — say so.
     if reason == FailureReason::Timeout {
@@ -299,7 +314,10 @@ fn origin_message(agent: &str, origin: ReplyOrigin, reason: FailureReason, home:
         }
     }
     if origin.is_claude_cli() {
-        return format_fallback_message(agent, reason, home);
+        return match applied {
+            Some(seconds) => super::failure_message::format_fallback_message_with_timeout(agent, reason, home, seconds),
+            None => format_fallback_message(agent, reason, home),
+        };
     }
     let hint = match reason {
         FailureReason::AuthFailed => "認證失敗，請管理員檢查此後端的登入或 API 憑證設定。",
@@ -309,7 +327,7 @@ fn origin_message(agent: &str, origin: ReplyOrigin, reason: FailureReason, home:
         FailureReason::RateLimited => "使用量已達限制，請稍後重試或檢查此後端配額。",
         FailureReason::Billing => "帳務或額度不足，請管理員檢查此後端帳務。",
         FailureReason::Timeout if matches!(origin, ReplyOrigin::Runtime(_)) => {
-            "回應逾時，可在員工設定提高時間上限。"
+            "回應逾時，請管理員在員工設定調整時間上限。"
         }
         FailureReason::Timeout => "回應逾時，請稍後重試或將任務拆成較小的步驟。",
         FailureReason::EmptyResponse => "回傳空白內容，請稍後重試。",
@@ -422,6 +440,28 @@ mod timeout_tests {
                 assert!(message.contains("員工設定"), "{runtime:?}");
             }
         }
+    }
+
+    #[test]
+    fn configured_claude_timeout_names_the_applied_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[runtime]\nprovider='claude'\ntimeout_secs=900\n").unwrap();
+        let origin = ReplyOrigin::Runtime(RuntimeType::Claude);
+        let configured = origin_message("worker", origin, FailureReason::Timeout, home.path());
+        assert!(configured.contains("15 分鐘安全上限"), "{configured}");
+        assert!(configured.contains("請洽管理員"));
+        assert!(!configured.contains("員工設定"));
+        // The employee was changed after this run started. Its failure still
+        // reports the captured 600 s, not today's 900 s setting.
+        let failure = ReplyFailure::simple(origin, "claude CLI hard timeout (600s, no output)".into());
+        let message = failure.message("worker", home.path());
+        assert!(message.contains("10 分鐘安全上限"), "{message}");
+        assert!(!message.contains("15 分鐘"));
+        let message = ReplyFailure::simple(origin, "claude CLI hard timeout (95s, no output)".into())
+            .message("worker", home.path());
+        assert!(message.contains("95 秒安全上限"), "{message}");
     }
 
     /// RM-155: while macOS folder access is pending, a timeout names the

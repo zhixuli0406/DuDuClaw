@@ -12,7 +12,10 @@ pub(super) fn finished(input: &RunInput, outcome: Value) -> Value {
     json!({"type":"RUN_FINISHED", "threadId":input.thread_id, "runId":input.run_id, "outcome":outcome})
 }
 pub(super) fn failure(code: &str) -> Value {
-    json!({"type":"RUN_ERROR", "code":code, "message":"無法繼續這次執行，請確認登入狀態、權限及核准要求。"})
+    let message = if code == "run_timeout" {
+        "已達網頁對話的 15 分鐘執行上限。較長的工作請改為交辦背景任務。"
+    } else { "無法繼續這次執行，請確認登入狀態、權限及核准要求。" };
+    json!({"type":"RUN_ERROR", "code":code, "message":message})
 }
 pub(super) async fn reject(connection: Connection, code: &str) {
     if send(&connection, started(&connection.input)).await.is_ok() {

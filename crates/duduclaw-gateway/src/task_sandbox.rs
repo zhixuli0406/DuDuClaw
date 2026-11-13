@@ -406,6 +406,13 @@ fn audit(home: &Path, kind: &str, agent_id: &str, details: Value) {
     );
 }
 
+fn effective_sandbox_timeout(home: &Path, agent_id: &str, container_timeout_ms: u64) -> Duration {
+    crate::runtime_config::scoped_task_timeout_secs(agent_id)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_millis(container_timeout_ms))
+        .min(Duration::from_secs(crate::runtime_config::TimeoutPolicy::load(home).max_secs))
+}
+
 /// Entry point from `dispatcher::dispatch_sandboxed`.
 pub async fn dispatch(
     home: &Path,
@@ -456,9 +463,7 @@ pub async fn dispatch(
             network_access: agent.config.container.network_access,
             // A task's own limit (`tasks.timeout_secs`, scoped by the
             // dispatcher for this employee) replaces its container timeout.
-            timeout: crate::runtime_config::scoped_task_timeout_secs(&agent.config.agent.name)
-                .map(Duration::from_secs)
-                .unwrap_or_else(|| Duration::from_millis(agent.config.container.timeout_ms)),
+            timeout: effective_sandbox_timeout(home, &agent.config.agent.name, agent.config.container.timeout_ms),
             disallowed_tools: agent.config.capabilities.disallowed_tools(),
             explicit_denied_tools: agent.config.capabilities.denied_tools.clone(),
             account_pool: agent.config.model.account_pool.clone(),

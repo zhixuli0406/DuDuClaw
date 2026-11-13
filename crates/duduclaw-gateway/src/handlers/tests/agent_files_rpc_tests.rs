@@ -263,14 +263,52 @@ async fn runtime_timeout_owner_may_only_lower_admin_may_raise() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
     ok(&f.call("agents.update", update(json!(600)), &f.admin).await);
     ok(&f.call("agents.update", update(json!(450)), &f.owner_a).await);
-    ok(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
-    assert_eq!(crate::runtime_config::agent_timeout_secs(path.parent().unwrap()), 300);
+    // Since v1.82 Claude runs obey timeout_secs; clearing returns to the 1800 s Claude default, which is a raise.
+    let e = err(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
+    assert!(e.contains("runtime.timeout_secs"), "{e}");
+    ok(&f.call("agents.update", update(Value::Null), &f.admin).await);
+    assert_eq!(crate::runtime_config::effective_agent_timeout_secs(path.parent().unwrap()), 1800);
     ok(&f.call("agents.update", update(json!(30)), &f.owner_a).await);
     let before = std::fs::read(&path).unwrap();
     let e = err(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
     assert!(e.contains("runtime.timeout_secs"), "{e}");
     assert_eq!(std::fs::read(&path).unwrap(), before, "clearing 30 to default 300 is widening");
     ok(&f.call("agents.update", update(Value::Null), &f.admin).await);
+}
+
+#[tokio::test]
+async fn runtime_timeout_non_claude_owner_may_clear_only_without_widening() {
+    let f = fixture().await;
+    let path = f.home.join("agents/a1/agent.toml");
+    // Set a matching model too: the fixture's Claude model would auto-align
+    // a provider-only update back to Claude before the authority check.
+    ok(&f.call("agents.update", json!({"agent_id": "a1", "preferred": "gpt-5.4", "runtime": {"provider": "codex"}}), &f.admin).await);
+    let stored = std::fs::read_to_string(&path).unwrap().parse::<toml::Table>().unwrap();
+    assert_eq!(stored["runtime"]["provider"].as_str(), Some("codex"));
+    assert_eq!(crate::runtime_config::TimeoutPolicy::load(&f.home).default_secs, None);
+    let update = |seconds: Value| json!({"agent_id": "a1", "runtime": {"timeout_secs": seconds}});
+    ok(&f.call("agents.update", update(json!(450)), &f.admin).await);
+    ok(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
+    assert_eq!(crate::runtime_config::effective_agent_timeout_secs(path.parent().unwrap()), 300);
+    ok(&f.call("agents.update", update(json!(200)), &f.admin).await);
+    let before = std::fs::read(&path).unwrap();
+    let e = err(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
+    assert!(e.contains("runtime.timeout_secs"), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    ok(&f.call("agents.update", update(Value::Null), &f.admin).await);
+    assert_eq!(crate::runtime_config::effective_agent_timeout_secs(path.parent().unwrap()), 300);
+}
+
+#[tokio::test]
+async fn runtime_timeout_claude_clear_uses_global_default() {
+    let f = fixture().await;
+    let path = f.home.join("agents/a1/agent.toml");
+    assert_eq!(crate::runtime_config::agent_runtime_provider(path.parent().unwrap()), duduclaw_core::types::RuntimeType::Claude);
+    std::fs::write(f.home.join("config.toml"), "[runtime]\ndefault_timeout_secs = 240\n").unwrap();
+    let update = |seconds: Value| json!({"agent_id": "a1", "runtime": {"timeout_secs": seconds}});
+    ok(&f.call("agents.update", update(json!(450)), &f.admin).await);
+    ok(&f.call("agents.update", update(Value::Null), &f.owner_a).await);
+    assert_eq!(crate::runtime_config::effective_agent_timeout_secs(path.parent().unwrap()), 240);
 }
 
 #[tokio::test]

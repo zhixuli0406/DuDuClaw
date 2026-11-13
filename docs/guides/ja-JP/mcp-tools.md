@@ -201,7 +201,7 @@ AI 社員のものになっているレコードを変更・起動するツー�
 
 ### `tasks_create` — ゴールごとの実行時間の上限
 
-`tasks_create` は `kind="goal"`（予約なし）のとき `timeout_secs`（30～3600 の整数秒）を受け付けます。そのゴールの各ラウンドの CLI 実行／API リクエストごとの上限で、担当従業員自身の上限に代わります。MCP からは従業員自身の上限以下しか指定できません。ゴールにより長い時間を与えるのは、ダッシュボードでの管理者の判断です。Claude の従業員には適用されません（30 分固定）。`tasks_update` はこのフィールドを拒否します。例：`{"kind":"goal","title":"帳簿を照合","assigned_to":"anna","timeout_secs":180}`。
+`tasks_create` は `kind="goal"`（予約なし）のとき `timeout_secs`（30～3600 の整数秒）を受け付けます。そのゴールの各ラウンドの CLI 実行／API リクエストごとの上限で、担当従業員自身の上限に代わります。MCP からは従業員自身の上限以下しか指定できません。ゴールにより長い時間を与えるのは、ダッシュボードでの管理者の判断です。Claude の従業員にも適用され、実行時は現在のグローバル `[runtime] max_timeout_secs` が上限になります。`tasks_update` はこのフィールドを拒否します。例：`{"kind":"goal","title":"帳簿を照合","assigned_to":"anna","timeout_secs":180}`。
 
 ### `office_script` — 同梱 Office スクリプト
 

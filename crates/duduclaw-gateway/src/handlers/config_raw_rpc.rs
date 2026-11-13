@@ -628,7 +628,12 @@ fn de_location(text: &str, e: &toml::de::Error) -> String {
 }
 
 /// Validate `text` as the given file kind. Returns the parsed table.
+#[cfg(test)]
 pub(crate) fn validate_raw(file: &RawFile, text: &str) -> Result<toml::Table, String> {
+    validate_raw_with_stored(file, text, None)
+}
+
+fn validate_raw_with_stored(file: &RawFile, text: &str, stored: Option<&toml::Table>) -> Result<toml::Table, String> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
         let (line, col) = e
             .span()
@@ -644,7 +649,7 @@ pub(crate) fn validate_raw(file: &RawFile, text: &str) -> Result<toml::Table, St
     })?;
     match file {
         RawFile::Config => {
-            super::config_schema::check_config_types(text, &table)?;
+            super::config_schema::check_config_types_with_stored(text, &table, stored)?;
             validate_config_table(&table)?;
             duduclaw_inference::transcription::config::TranscriptionConfig::from_toml(text)?;
             if let Some(credentials) = table.get("transcription_credentials") {
@@ -956,8 +961,16 @@ impl MethodHandler {
             new_text = mark_permissions_if_edited(&new_text, &stored).map_err(|e| rctx.scrub(&e))?;
         }
         // Every validation message is scrubbed of restored secrets.
-        let after = validate_raw(&kind, &new_text).map_err(|e| rctx.scrub(&e))?;
         let before: toml::Table = stored.parse().unwrap_or_default();
+        let after = validate_raw_with_stored(&kind, &new_text, Some(&before)).map_err(|e| rctx.scrub(&e))?;
+        if matches!(kind, RawFile::Agent(_)) {
+            if let Some(value) = super::config_commit::toml_at(&after, "runtime.timeout_secs") {
+                let max = crate::runtime_config::TimeoutPolicy::load(&self.home_dir).max_secs;
+                if !value.as_integer().is_some_and(|n| (30..=max as i64).contains(&n)) {
+                    return Err(format!("[runtime] timeout_secs must be an integer between 30 and {max} (global ceiling)").into());
+                }
+            }
+        }
         if matches!(kind, RawFile::Config) {
             crate::mfa::refuse_policy_change(&stored, &new_text)?;
         }

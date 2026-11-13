@@ -204,11 +204,11 @@ describe('new controls round-trip from inspect to payload', () => {
     expect(timeout).toHaveValue(300);
   });
 
-  it('shows the 300-second runtime default without writing it on an unrelated edit', async () => {
+  it('shows the 1800-second Claude default without writing it on an unrelated edit', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=brain');
     const timeout = await screen.findByRole('spinbutton', { name: 'Execution time limit' });
-    expect(timeout).toHaveValue(300);
+    await waitFor(() => expect(timeout).toHaveValue(1800));
     await user.click(screen.getByRole('switch', { name: 'Slim startup context' }));
     await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
     expect(lastPayload()).toEqual({ runtime: { minimal_context: true } });

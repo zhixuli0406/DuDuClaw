@@ -130,7 +130,7 @@ fn effective(table: &toml::Table, key: &str) -> Value {
         "agent.reports_to" | "agent.department" | "agent.name" | "agent.role" | "runtime.fallback" => {
             or(Value::String(String::new()))
         }
-        "runtime.timeout_secs" => json!(raw.as_i64().map(|v| v.clamp(30, 3600)).unwrap_or(300)),
+        "runtime.timeout_secs" => json!(raw.as_i64().map(|v| v.clamp(30, 14_400)).unwrap_or(300)),
         "runtime.provider" => or(Value::String(duduclaw_core::types::RuntimeType::default().as_str().into())),
         "container.sandbox_enabled"
         | "container.network_access"
@@ -229,6 +229,45 @@ fn google_only_narrows(before: &Value, after: &Value) -> bool {
 }
 
 /// Before/after of every authority key whose change needs an admin.
+pub(crate) fn authority_diff_with_timeout_policy(
+    before: &toml::Table, after: &toml::Table, policy: crate::runtime_config::TimeoutPolicy,
+) -> Vec<ProtectedChange> {
+    // Keep the historical authority baseline (300 s when unset). The
+    // runtime's actual Claude default is separate from permission to widen it.
+    // A global default/ceiling may narrow this gate, never raise its baseline.
+    let materialize = |table: &toml::Table| {
+        let mut table = table.clone();
+        let runtime = table.entry("runtime").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(runtime) = runtime.as_table_mut() {
+            let secs = crate::runtime_config::timeout_authorization_baseline(
+                runtime.get("timeout_secs").and_then(toml::Value::as_integer), policy,
+            );
+            runtime.insert("timeout_secs".into(), toml::Value::Integer(secs as i64));
+        }
+        table
+    };
+    let mut changes = authority_diff(&materialize(before), &materialize(after));
+    // Clearing adopts the actual runtime default of the AFTER provider.
+    // That cannot grant an owner permission to increase the limit.
+    let stored = |table: &toml::Table| table.get("runtime").and_then(|r| r.get("timeout_secs"))
+        .and_then(toml::Value::as_integer);
+    if stored(after).is_none() {
+        if let Some(previous) = stored(before) {
+            let provider = after.get("runtime").and_then(|r| r.get("provider"))
+                .and_then(toml::Value::as_str);
+            let default = crate::runtime_config::runtime_default_timeout(provider, policy);
+            // A clear is judged only by the value that will actually apply,
+            // not by the unset authorization baseline used for explicit writes.
+            changes.retain(|c| c.key != "runtime.timeout_secs");
+            if default > previous.max(30) as u64 {
+                changes.push(ProtectedChange { key: "runtime.timeout_secs".into(),
+                    before: json!(previous), after: json!(default) });
+            }
+        }
+    }
+    changes
+}
+
 pub(crate) fn authority_diff(before: &toml::Table, after: &toml::Table) -> Vec<ProtectedChange> {
     AUTHORITY
         .iter()
@@ -401,4 +440,65 @@ mod tests {
             assert!(!p.contains(&path), "{path} is judged by value on the server");
         }
     }
+
+    #[test]
+    fn clearing_timeout_checks_the_actual_after_provider_default() {
+        let policy = crate::runtime_config::TimeoutPolicy::default();
+        for (provider, previous, requires_admin) in [
+            ("claude", 900, true), ("codex", 200, true), ("claude", 3600, false),
+            ("Claude", 900, true), (" claude ", 900, true), ("removed-runtime", 900, true),
+        ] {
+            let before = t(&format!("[runtime]\nprovider='{provider}'\ntimeout_secs={previous}\n"));
+            let after = t(&format!("[runtime]\nprovider='{provider}'\n"));
+            assert_eq!(authority_diff_with_timeout_policy(&before, &after, policy)
+                .iter().any(|c| c.key == "runtime.timeout_secs"), requires_admin);
+        }
+        let before = t("[runtime]\nprovider='codex'\ntimeout_secs=900\n");
+        let after = t("[runtime]\nprovider='claude'\n");
+        assert!(authority_diff_with_timeout_policy(&before, &after, policy)
+            .iter().any(|c| c.key == "runtime.timeout_secs"));
+    }
+
+    #[test]
+    fn timeout_tests_global_policy_does_not_replace_stored_authority() {
+        let policy = crate::runtime_config::TimeoutPolicy { default_secs: Some(1200), max_secs: 7200 };
+        let unset = t("[runtime]\nprovider='claude'\n");
+        let raised = t("[runtime]\nprovider='claude'\ntimeout_secs=600\n");
+        assert!(authority_diff_with_timeout_policy(&unset, &raised, policy).iter().any(|c| c.key == "runtime.timeout_secs"));
+        let stored = t("[runtime]\ntimeout_secs=120\n");
+        let raised = t("[runtime]\ntimeout_secs=121\n");
+        assert!(authority_diff_with_timeout_policy(&stored, &raised, policy).iter().any(|c| c.key == "runtime.timeout_secs"));
+        let policy = crate::runtime_config::TimeoutPolicy { default_secs: None, max_secs: 60 };
+        // Comparing clamped values would hide this raise (both become 60).
+        assert!(authority_diff_with_timeout_policy(&stored, &raised, policy).iter().any(|c| c.key == "runtime.timeout_secs"));
+    }
+
+    #[test]
+    fn explicit_timeouts_use_the_authorization_baseline_not_the_clear_default() {
+        let policy = crate::runtime_config::TimeoutPolicy::default();
+        let unset = t("[runtime]\nprovider='claude'\n");
+        for seconds in [30, 120, 300] {
+            let explicit = t(&format!("[runtime]\nprovider='claude'\ntimeout_secs={seconds}\n"));
+            assert!(authority_diff_with_timeout_policy(&unset, &explicit, policy).is_empty());
+        }
+        let before = t("[runtime]\nprovider='claude'\ntimeout_secs=600\n");
+        let after = t("[runtime]\nprovider='claude'\ntimeout_secs=450\n");
+        assert!(authority_diff_with_timeout_policy(&before, &after, policy).is_empty());
+        let policy = crate::runtime_config::TimeoutPolicy { default_secs: Some(30), max_secs: 3600 };
+        let before = t("[runtime]\nprovider='claude'\ntimeout_secs=60\n");
+        assert!(authority_diff_with_timeout_policy(&before, &unset, policy).is_empty());
+    }
+
+    #[test]
+    fn timeout_authority_uses_actual_defaults_and_global_ceiling() {
+        let policy = crate::runtime_config::TimeoutPolicy { default_secs: Some(1200), max_secs: 7200 };
+        let before = t("[runtime]\nprovider='claude'\ntimeout_secs=900\n");
+        let unset = t("[runtime]\nprovider='claude'\n");
+        assert!(authority_diff_with_timeout_policy(&before, &unset, policy).iter().any(|c| c.key == "runtime.timeout_secs"));
+        assert!(authority_diff_with_timeout_policy(&unset, &before, policy).iter().any(|c| c.key == "runtime.timeout_secs"));
+        let after = t("[runtime]\nprovider='claude'\ntimeout_secs=5000\n");
+        let before = t("[runtime]\nprovider='claude'\ntimeout_secs=4000\n");
+        assert!(authority_diff_with_timeout_policy(&before, &after, policy).iter().any(|c| c.key == "runtime.timeout_secs"));
+    }
+
 }
