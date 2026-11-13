@@ -46,3 +46,11 @@ it('formats assistant text parts while retaining masks and hiding raw content an
   expect(screen.getByText('Phone 1')).toBeInTheDocument();
   expect(screen.queryByText(/PRIVATE-FILENAME|UNSAFE FALLBACK/)).not.toBeInTheDocument();
 });
+
+it('renders failure notices as plain system status instead of staff replies', () => {
+  useConversationsStore.setState({readOnlyView:{...data,messages:[{...data.messages[0],role:'assistant',notice_kind:'turn_failure',parts:[{t:'text',v:'**This turn received no reply.**'}]}]}} as never);
+  const {container}=renderWithProviders(<ReadOnlyHistoryView/>);
+  expect(screen.getByText('System notice').closest('li')).toHaveTextContent('**This turn received no reply.**');
+  expect(container.querySelector('strong')).toBeNull();
+  expect(screen.getByText('System notice').closest('li')).toHaveClass('text-destructive');
+});

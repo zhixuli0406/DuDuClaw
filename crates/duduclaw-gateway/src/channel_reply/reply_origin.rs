@@ -141,6 +141,19 @@ impl ReplyFailure {
             })
             .unwrap_or(self.origin)
     }
+    pub(super) fn notice_reason(&self) -> TurnFailureReason {
+        if self.spawn_gate_message().is_some() { return TurnFailureReason::SafetyGate; }
+        if let Some(preflight) = self.runtime.as_ref().and_then(|failure| failure.preflight.as_ref()) {
+            return match preflight.kind {
+                RuntimePreflightKind::Config => TurnFailureReason::Unavailable,
+                RuntimePreflightKind::Policy => TurnFailureReason::SafetyGate,
+                // BudgetUnavailable must not claim that the quota was exhausted.
+                RuntimePreflightKind::Budget => TurnFailureReason::Unknown,
+            };
+        }
+        self.reason().into()
+    }
+
     pub(super) fn reason(&self) -> FailureReason {
         if let Some((origin, error)) = &self.secondary {
             return classify_origin_reason(*origin, error);

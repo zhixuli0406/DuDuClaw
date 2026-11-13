@@ -1,5 +1,7 @@
 # Subsystem reference (developer view)
 
+RM-156 (v1.82.0, implementation unverified): `channel_reply/failure_notice.rs` owns the closed `TurnFailureReason` vocabulary (zh-TW, zh-CN, English/Japanese aliases). Failure eligibility binds the routed session generation only after the current user row is stored; no failure handler creates a session. Runtime/provider fallback, post-contract empty replies and adapter panics use the shared per-turn scope on all channels; WebChat cancellation/panic/empty handling shares the same dedupe key. Pre-persist gates and intentional silences write nothing. Live messages and existing typed transport outcomes are unchanged. `SessionManager::record_turn_failure` stores hidden rows with an idempotent namespaced `client_msg_id` key and rejects stale generations after `/new`; ticket admission captures the original generation and unbound failures never fall back to the current one. Only conversation display readers (bound `conversation_rows`, team history, WebChat history) include notices; model history, runs, search and exports exclude them. Public widget notices are generic; `odoolivechat:` writes nothing. Builds and tests were not run in the implementation session, per delegation instructions.
+
 > Antigravity runtime removed in v1.77.1 without a deprecation window; existing settings require an explicit runtime and model choice.
 
 > L2 internal. Moved verbatim out of the root `CLAUDE.md` ("Architecture

@@ -114,19 +114,31 @@ pub(super) fn conversation_outcome_evidence(
 }
 
 
-// Transport adapters need a typed failure signal without parsing user-facing text.
+// Transport adapters consume a typed terminal outcome, never diagnostic text.
 tokio::task_local! {
-    static FAILURE_OBSERVER: std::sync::Arc<std::sync::atomic::AtomicBool>;
+    static FAILURE_OBSERVER: std::sync::Arc<std::sync::Mutex<Option<super::TurnFailureReason>>>;
+}
+
+pub(crate) async fn track_failure_reason<F: std::future::Future>(work: F) -> (F::Output, Option<super::TurnFailureReason>) {
+    let failed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let result = FAILURE_OBSERVER.scope(failed.clone(), work).await;
+    let reason = *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    (result, reason)
 }
 
 pub(crate) async fn track_failure<F: std::future::Future>(work: F) -> (F::Output, bool) {
-    let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let result = FAILURE_OBSERVER.scope(failed.clone(), work).await;
-    (result, failed.load(std::sync::atomic::Ordering::Acquire))
+    let (result, reason) = track_failure_reason(work).await;
+    (result, reason.is_some())
+}
+
+pub(super) fn mark_turn_failure(reason: super::TurnFailureReason) {
+    let _ = FAILURE_OBSERVER.try_with(|failed| {
+        *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    });
 }
 
 pub(super) fn mark_runtime_failure() {
-    let _ = FAILURE_OBSERVER.try_with(|failed| failed.store(true, std::sync::atomic::Ordering::Release));
+    mark_turn_failure(super::TurnFailureReason::Unknown);
 }
 
 #[cfg(test)]

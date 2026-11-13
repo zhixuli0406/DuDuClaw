@@ -129,7 +129,7 @@ pub(super) async fn build_reply_with_session_inner(
     // it as the citation key meant prior turns' citations were attributed
     // to the next turn's prediction error. The session id is still used for
     // session manager / metrics; only the trust feedback path switches.
-    let turn_id = crate::webchat::current_turn_id()
+    let turn_id = super::FAILURE_TURN.try_with(Clone::clone).ok().or_else(crate::webchat::current_turn_id)
         .unwrap_or_else(|| format!("{session_id}#{}", uuid::Uuid::new_v4()));
     // Runs this turn dispatches (they carry its turn id) are limited to
     // what this turn's person may read.
@@ -148,10 +148,13 @@ pub(super) async fn build_reply_with_session_inner(
         via_trigger = crate::trigger_route::in_called_turn();
         match reg.get(name) {
             Some(agent) => Some(agent),
-            None => return if public_visitor {
-                crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into()
-            } else {
-                SELECTED_AGENT_UNAVAILABLE.into()
+            None => {
+
+                return if public_visitor {
+                    crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into()
+                } else {
+                    SELECTED_AGENT_UNAVAILABLE.into()
+                };
             },
         }
     } else {
@@ -347,7 +350,7 @@ pub(super) async fn build_reply_with_session_inner(
     // Reading never migrates a profile; an authorized writer owns repairs.
     if let Some(dir) = agent_dir.as_deref() {
         let settings = crate::runtime_config::load_runtime_settings(dir);
-        if let Err(error) = crate::runtime_config::ensure_model_provider(&model, settings.provider) {
+        if let Err(error) = super::model_alignment_gate(ctx, session_id, &agent_id, &turn_id, &model, settings.provider, None).await {
             super::health::receive(ctx, &agent_id, session_id).await;
             super::health::mark(&agent_id, Some("other"));
             return if public_visitor { crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into() } else { format!("⚠️ {error}") };
@@ -378,6 +381,7 @@ pub(super) async fn build_reply_with_session_inner(
             Some(a) => crate::prompt_identity::resolve_fixed_message_language(&ctx.home_dir, &a.config).await,
             None => crate::prompt_identity::read_default_language(&ctx.home_dir).await,
         };
+
         return operator_access_refusal(language.as_deref()).to_string();
     }
 
@@ -567,6 +571,7 @@ pub(super) async fn build_reply_with_session_inner(
         Ok(prompt) => prompt,
         Err(error) => {
             tracing::warn!(agent = %agent_id, %error, "Agent profile could not be loaded");
+
             return "⚠️ 無法讀取這位員工的設定，已暫停本次執行。請管理者檢查設定後重試。".to_string();
         }
     };
@@ -789,6 +794,7 @@ pub(super) async fn build_reply_with_session_inner(
     {
         super::health::receive(ctx, &agent_id, session_id).await;
         super::health::mark(&agent_id, Some("gate_refused"));
+
         return stop;
     }
 
@@ -803,6 +809,7 @@ pub(super) async fn build_reply_with_session_inner(
         ).await {
             super::health::receive(ctx, &agent_id, session_id).await;
             super::health::mark(&agent_id, Some("quota"));
+
             return refusal.to_string();
         }
     }
@@ -826,6 +833,7 @@ pub(super) async fn build_reply_with_session_inner(
             rules = ?scan.matched_rules,
             "Prompt injection detected — blocking message"
         );
+
         return format!("⚠️ {}", scan.summary);
     }
 
@@ -857,6 +865,7 @@ pub(super) async fn build_reply_with_session_inner(
             warn!(session_id, error = %e, "redaction of user input failed — turn stopped");
             super::health::receive(ctx, &agent_id, session_id).await;
             super::health::mark(&agent_id, Some("gate_refused"));
+
             return REDACTION_FAILED_REPLY.to_string();
         }
     };
@@ -1004,6 +1013,9 @@ pub(super) async fn build_reply_with_session_inner(
         }
     };
     if let Some(id) = user_message_id {
+        if let Some(generation) = turn_generation.as_deref() {
+            super::bind_failure_session(session_id, generation, &agent_id);
+        }
         let _ = super::WEBCHAT_TURN_DELIVERY.try_with(|turn| turn.accepted.try_send((session_id.to_owned(), id)));
         crate::credential_ledger::bind_message(&ctx.home_dir, &credential_source, session_id, id);
         if let Ok(user) = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone) {
@@ -1490,6 +1502,7 @@ pub(super) async fn build_reply_with_session_inner(
             warn!(session_id, error = %e, "redaction of system prompt failed — turn stopped");
             super::health::receive(ctx, &agent_id, session_id).await;
             super::health::mark(&agent_id, Some("gate_refused"));
+            super::persist_failure_notice(ctx, session_id, &agent_id, &turn_id, TurnFailureReason::SafetyGate, turn_generation.as_deref()).await;
             return REDACTION_FAILED_REPLY.to_string();
         }
     };
@@ -1636,9 +1649,9 @@ pub(super) async fn build_reply_with_session_inner(
     // choke-point both need it, so load here and thread the settings through
     // `AgentPrompt.runtime_settings` instead of re-reading inside the choke-point.
     if let Some(dir) = agent_dir.as_deref() {
-        if let Err(e) = crate::runtime_config::ensure_active_agent_provider(dir) {
+        if let Err(e) = super::active_provider_gate(ctx, session_id, &agent_id, &turn_id, dir, turn_generation.as_deref()).await {
             super::health::mark(&agent_id, Some("other"));
-            return format!("⚠️ {e}");
+            return if public_visitor { crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into() } else { format!("⚠️ {e}") };
         }
     }
     let runtime_settings = agent_dir
@@ -1648,7 +1661,7 @@ pub(super) async fn build_reply_with_session_inner(
         .as_ref()
         .and_then(|s| s.non_claude_provider());
     if let Some(settings)=&runtime_settings {
-        if let Err(error)=crate::runtime_config::ensure_model_provider(&model,settings.provider) {
+        if let Err(error)=super::model_alignment_gate(ctx, session_id, &agent_id, &turn_id, &model, settings.provider, turn_generation.as_deref()).await {
             super::health::mark(&agent_id, Some("other"));
             return if public_visitor {crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into()} else {format!("⚠️ {error}")};
         }
@@ -3952,6 +3965,8 @@ pub(super) async fn build_reply_with_session_inner(
     let diagnostic = failure.audit();
     let err_str = diagnostic.to_string();
     super::failure::mark_runtime_failure();
+    let notice_reason = failure.notice_reason();
+    super::persist_failure_notice(ctx, session_id, &agent_id, &turn_id, notice_reason, turn_generation.as_deref()).await;
     warn!(
         agent = %name,
         reason = ?reason,

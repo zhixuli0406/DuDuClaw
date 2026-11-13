@@ -1,5 +1,7 @@
 # Session Memory Stack
 
+通訊頻道與 WebChat 只有在本輪使用者訊息成功存入後，回覆失敗才會留下一筆僅供顯示的 `turn_failure` 提示，涵蓋執行階段／模型供應商失敗、回覆經合約檢查後變空白、adapter panic，以及訊息存入後的 WebChat 取消。存入前的拒絕（包含員工無法使用、預算與安全檢查）、刻意靜默的訊息丟棄、session 不存在或屬於其他員工，以及 `/new` 之後的舊請求，都不寫提示，也不建立 session。WebChat 與 AG-UI 即時訊息保留原有文字、訊框類型與僅管理員可見的診斷規則；固定詞彙只用於儲存的提示。提示支援繁中、簡中、英文、日文及語言別名，不會進入模型提示、執行狀態計算、搜尋或對話匯出。受限對話紀錄與團隊紀錄沿用既有隱私篩選顯示提示。公開 WebChat 訪客只會看到通用提示，`odoolivechat:` session 不寫提示；同一輪的各個失敗處理共用去重鍵。
+
 **Codex 外部設定檢查（v1.80.0 起）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../../architecture/extension-gates.md)。
 
 > Instruction Pinning、Snowball Recap 與 Key-Fact Accumulator：三層廉價的機制，取代了一套 6,500 token 的重量級記憶系統。

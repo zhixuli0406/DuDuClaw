@@ -515,3 +515,29 @@ fn bootstrap_login_transcript_stops_when_the_first_user_is_created() {
     assert!(gate.filter(&transcript).is_none());
     assert!(legacy_gate.filter(&transcript).is_none());
 }
+
+#[tokio::test]
+async fn failure_notices_do_not_complete_bound_runs_or_enter_bound_search() {
+    let f = fixture().await;
+    let sessions = crate::session::SessionManager::new(&f.home.join("sessions.db")).unwrap();
+    let sid = "line:failure-regression";
+    sessions.get_or_create_with_origin(sid, "sales", &crate::session_origin::SessionOrigin::of_kind(
+        crate::session_origin::OriginKind::Channel,
+    )).await.unwrap();
+    let id = sessions.append_message_with_id(sid, "user", "ordinary question", 1).await.unwrap();
+    sessions.acquire().await.execute("UPDATE session_messages SET timestamp='2020-01-01T00:00:00Z' WHERE session_id=?1", [sid]).unwrap();
+    let before = f.handler.bound_runs_list(&f.alice, "sales", 20).await.unwrap();
+    assert_eq!(before[0]["status"], "no_reply");
+    sessions.record_turn_failure(sid, "failed", crate::channel_reply::TurnFailureReason::Timeout, Some("en"), None).await.unwrap();
+    let after = f.handler.bound_runs_list(&f.alice, "sales", 20).await.unwrap();
+    assert_eq!(after[0]["status"], "no_reply");
+    let run = f.handler.bound_run_get(&f.alice, &format!("{sid}#{id}"), "sales",
+        crate::history_privacy::Class::External { channel: "line".into() },
+    ).await.unwrap();
+    assert_eq!(run["run"]["status"], "no_reply");
+    assert_eq!(run["events"].as_array().unwrap().len(), 1);
+    assert!(f.handler.bound_conversation_search(&f.alice, "sales", "timed out", 20).await.unwrap().is_empty());
+    assert_eq!(f.handler.bound_conversation_search(&f.alice, "sales", "ordinary", 20).await.unwrap().len(), 1);
+    let display = crate::history_privacy::read::conversation_rows(&crate::history_privacy::read::open(&f.home).unwrap(), sid).unwrap();
+    assert_eq!(display.len(), 2);
+}
