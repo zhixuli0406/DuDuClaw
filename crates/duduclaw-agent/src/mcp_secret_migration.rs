@@ -72,7 +72,53 @@ pub fn migrate_all(home: &Path) -> MigrationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
+
+    #[test]
+    fn migration_preserves_non_live_and_unreadable_configs() {
+        let home = tempfile::tempdir().unwrap();
+        let original = br#"{ "mcpServers": {"vendor":{"command":"vendor","env":{"TOKEN":"old"}}} }"#;
+        for (id, profile) in [
+            ("deleted", "[agent]\nstatus = 'deleted'"),
+            ("archived", "[agent]\nstatus = 'archived'"),
+            ("malformed", "[agent"),
+            ("missing-status", "[agent]"),
+            ("unreadable", ""),
+            ("missing-profile", ""),
+        ] {
+            let dir = home.path().join("agents").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            if id == "unreadable" {
+                std::fs::create_dir(dir.join("agent.toml")).unwrap();
+            } else if id != "missing-profile" {
+                std::fs::write(dir.join("agent.toml"), profile).unwrap();
+            }
+            std::fs::write(dir.join(".mcp.json"), original).unwrap();
+        }
+        let report = migrate_all(home.path());
+        assert_eq!(report.migrated, 2);
+        for id in ["deleted", "malformed", "unreadable", "missing-profile"] {
+            assert_eq!(std::fs::read(home.path().join("agents").join(id).join(".mcp.json")).unwrap(), original);
+            assert!(!home.path().join("secrets/mcp").join(format!("{id}.enc")).exists());
+        }
+        for id in ["malformed", "unreadable"] {
+            assert!(report.failed.contains(id));
+        }
+        for id in ["archived", "missing-status"] {
+            let config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(home.path().join("agents").join(id).join(".mcp.json")).unwrap(),
+            ).unwrap();
+            let env = config["mcpServers"]["vendor"]["env"].as_object().unwrap();
+            assert_ne!(env["TOKEN"], "old");
+            let resolved = duduclaw_security::mcp_secret_store::resolve_mcp_env(
+                home.path(), id, "vendor", env,
+            ).unwrap();
+            assert_eq!(resolved["TOKEN"], "old");
+            assert!(home.path().join("secrets/mcp").join(format!("{id}.enc")).exists());
+            assert!(!report.failed.contains(id));
+        }
+        assert_eq!(report.failed.len(), 2);
+        assert!(!report.failed.contains("missing-profile"));
+    }
 
     #[test]
     fn sweep_continues_after_failure_and_skips_deleted_employees() {

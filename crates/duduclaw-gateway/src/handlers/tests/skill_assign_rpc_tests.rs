@@ -147,6 +147,28 @@ fn attachment_files(f: &Fx, agent: &str) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
+async fn skill_assign_refuses_a_deleted_runner_from_a_stale_registry() {
+    let f = fixture().await;
+    disable(&f, "b1");
+    let path = f.home.join("agents/a1/agent.toml");
+    let profile = std::fs::read_to_string(&path).unwrap();
+    let mut profile: toml::Value = toml::from_str(&profile).unwrap();
+    profile["agent"]["status"] = toml::Value::String("deleted".into());
+    std::fs::write(path, toml::to_string(&profile).unwrap()).unwrap();
+    // Keep the registry's active snapshot: admission must inspect disk.
+    let frame = assign(&f, json!({"skill_name": SKILL}), &f.owner_a).await;
+    match frame {
+        WsFrame::Response { ok: false, error: Some(error), .. } => {
+            assert_eq!(error["code"], duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_CODE);
+            assert_eq!(error["message"], duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE);
+        }
+        other => panic!("expected assignee refusal, got {other:?}"),
+    }
+    assert_eq!(task_count(&f).await, 0);
+    assert!(attachment_files(&f, "a1").is_empty());
+}
+
+#[tokio::test]
 async fn never_run_goes_to_the_first_enabled_holder_with_the_skill_text() {
     let f = fixture().await;
     let p = ok(&assign(

@@ -131,6 +131,7 @@ fn merged_wiki_tools_keep_their_original_scopes() {
 async fn tasks_create_rejects_unknown_kind_and_malformed_schedule() {
     let home = std::env::temp_dir().join(format!("duduclaw-o4-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).unwrap();
+    super::tests::create_test_agent(&home.join("agents"), "a", "");
 
     let bad_kind = handle_tasks_create(
         &serde_json::json!({"title": "t", "kind": "goals"}),

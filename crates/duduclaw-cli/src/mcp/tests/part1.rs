@@ -195,6 +195,7 @@ async fn scheduled_tasks_create_persists_and_raises_cron_changed() {
 async fn rejected_scheduled_tasks_create_raises_no_event() {
     let tmp = TempDir::new();
     let home = tmp.path();
+    create_test_agent(&home.join("agents"), "agnes", "");
 
     let args = serde_json::json!({
         "title": "壞排程",

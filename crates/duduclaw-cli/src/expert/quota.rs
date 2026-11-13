@@ -127,9 +127,10 @@ fn decide_import(
             "import.quota_exceeded",
             json!({ "max": max, "current": current, "adding": adding }),
             format!(
-                "目前的授權最多 {max} 位 AI 員工，已有 {current} 位，這次要新增 {adding} 位，超過上限，什麼都沒有寫入。\
-                 {}請先刪除不需要的 AI 員工，或洽詢授權調整。",
-                duduclaw_gateway::license_runtime::AGENT_SEAT_NOTE,
+                "{} 請先刪除不需要的 AI 員工，或洽詢授權調整。",
+                duduclaw_gateway::license_runtime::with_agent_seat_note(&format!(
+                    "目前的授權最多 {max} 位 AI 員工，已有 {current} 位，這次要新增 {adding} 位，超過上限，什麼都沒有寫入。"
+                ), " "),
             ),
         )),
     }

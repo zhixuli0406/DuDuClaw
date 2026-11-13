@@ -3,6 +3,36 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// A supplied destination must still be in the live employee roster on disk.
+pub(super) fn task_assignee_refusal(home: &std::path::Path, assignee: Option<&str>) -> Option<WsFrame> {
+    duduclaw_core::agent_seats::validate_task_assignee(home, assignee).err().map(|message| {
+        WsFrame::Response {
+            id: String::new(),
+            ok: false,
+            payload: None,
+            error: Some(json!({
+                "code": duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_CODE,
+                "message": message,
+            })),
+        }
+    })
+}
+
+/// Preserve the structured assignee error from the shared goal core.
+pub(super) fn goal_create_refusal(message: &str) -> WsFrame {
+    if message == duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE {
+        WsFrame::Response {
+            id: String::new(), ok: false, payload: None,
+            error: Some(json!({
+                "code": duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_CODE,
+                "message": message,
+            })),
+        }
+    } else {
+        WsFrame::error_response("", message)
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Task Board, Activity Feed, Autopilot, Shared Skills handlers
 // ═══════════════════════════════════════════════════════════════
@@ -219,12 +249,17 @@ impl MethodHandler {
 
     pub(crate) async fn handle_tasks_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
         // v1.81 P1d: canonical target only; owner-only for a Personal one.
-        let raw_target = params.get("assigned_to").and_then(Value::as_str).unwrap_or("");
+        let is_goal = params.get("kind").and_then(Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("goal"));
+        let raw_target = params.get(if is_goal { "agent_id" } else { "assigned_to" })
+            .and_then(Value::as_str).unwrap_or("");
+        if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(raw_target.trim())) {
+            return frame;
+        }
         if let Err(frame) = self.delegation_check(ctx, raw_target).await { return frame; }
         let target = raw_target.trim();
         if let Err(frame) = self.deny_main_for_non_admin(ctx, target).await { return frame; }
         if !ctx.is_admin() {
-            let target = params.get("assigned_to").and_then(Value::as_str).unwrap_or("").trim();
             if let Err(refusal) = crate::machine_employee::check_target(
                 &self.home_dir, target, Some(&format!("user:{}", ctx.user_id)),
             ) {
@@ -327,6 +362,9 @@ impl MethodHandler {
         row.on_behalf_of = crate::trigger_route::assign::principal_for_user(&ctx.user_id);
         row.created_via = row.on_behalf_of.as_ref().map(|_| "dashboard".to_string());
 
+        if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(&row.assigned_to)) {
+            return frame;
+        }
         if let Err(e) = store.insert_task(&row).await {
             return WsFrame::error_response("", &format!("create task: {e}"));
         }
@@ -413,6 +451,9 @@ impl MethodHandler {
         // allowed to hand that agent work: Operator on it, or a team grant
         // that derived Operator (`can_assign_to`, on the live identity).
         if let Some(dest) = params.get("assigned_to").and_then(|v| v.as_str()) {
+            if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(dest.trim())) {
+                return frame;
+            }
             // v1.81 P1d: canonical destination; owner-only for a Personal one
             // (also reached in-process from `tasks.assign`).
             if let Err(frame) = self.delegation_check(ctx, dest).await { return frame; }
@@ -473,6 +514,11 @@ impl MethodHandler {
         }
         // Capture previous status for TaskStatusChanged event emission.
         let prev_status = existing.map(|r| r.status);
+        if let Some(frame) = task_assignee_refusal(
+            &self.home_dir, params.get("assigned_to").and_then(Value::as_str).map(str::trim),
+        ) {
+            return frame;
+        }
         match store.update_task(task_id, &params).await {
             Ok(Some(row)) => {
                 let task_json = task_row_to_json(&row);
@@ -828,4 +874,94 @@ fn creator_may_manage(home: &std::path::Path, live: &UserContext, row: &TaskRow)
         && row.created_by == live.user_id
         && live.can_assign_to(&row.assigned_to)
         && task_audience_allows(home, live, &row.id)
+}
+
+#[cfg(test)]
+mod live_assignee_tests {
+    use super::*;
+
+    fn employee(home: &std::path::Path, id: &str, status: &str) {
+        let dir = home.join("agents").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"),
+            format!("[agent]\nname = '{id}'\nstatus = '{status}'\n")).unwrap();
+    }
+
+    fn assert_ok(frame: WsFrame) {
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+    }
+
+    fn assert_unavailable(frame: WsFrame) {
+        match frame {
+            WsFrame::Response { ok: false, error: Some(error), .. } => {
+                assert_eq!(error["code"], duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_CODE);
+                assert_eq!(error["message"], duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE);
+            }
+            other => panic!("expected assignee refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_create_checks_agent_id_even_with_a_different_live_assigned_to() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let store = Arc::new(TaskStore::open(home.path()).unwrap());
+        handler.set_task_store(store.clone()).await;
+        let ctx = UserContext::admin_fallback();
+        employee(home.path(), "live", "active");
+        employee(home.path(), "archived", "archived");
+        assert_unavailable(handler.handle_tasks_create(json!({
+            "kind": "goal", "agent_id": "archived", "assigned_to": "live",
+            "description": "must not write"
+        }), &ctx).await);
+        assert_unavailable(handler.handle_tasks_goal_create(json!({
+            "agent_id": "archived", "description": "must not write"
+        }), &ctx).await);
+        assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+        assert_ok(handler.handle_tasks_create(json!({
+            "kind": "goal", "agent_id": "live", "assigned_to": "archived",
+            "description": "工作"
+        }), &ctx).await);
+        let rows = store.list_tasks(None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].assigned_to, "live");
+    }
+
+    #[tokio::test]
+    async fn create_checks_live_assignee_and_keeps_unassigned_tasks() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        handler.set_task_store(Arc::new(TaskStore::open(home.path()).unwrap())).await;
+        let ctx = UserContext::admin_fallback();
+        employee(home.path(), "live", "active");
+        employee(home.path(), "deleted", "deleted");
+        employee(home.path(), "archived", "archived");
+        for id in ["live", ""] {
+            assert_ok(handler.handle_tasks_create(json!({"title": "工作", "assigned_to": id}), &ctx).await);
+        }
+        for id in ["deleted", "archived", "unknown"] {
+            assert_unavailable(handler.handle_tasks_create(json!({"title": "工作", "assigned_to": id}), &ctx).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_rejects_deleted_destination_but_allows_other_edits() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let store = Arc::new(TaskStore::open(home.path()).unwrap());
+        handler.set_task_store(store.clone()).await;
+        let ctx = UserContext::admin_fallback();
+        employee(home.path(), "deleted", "deleted");
+        let row = TaskRow::new("old".into(), "工作".into(), String::new(),
+            "medium".into(), "deleted".into(), "system".into());
+        store.insert_task(&row).await.unwrap();
+        assert_unavailable(handler.handle_tasks_update(json!({
+            "task_id": "old", "assigned_to": "deleted", "description": "must not write"
+        }), &ctx).await);
+        assert_eq!(store.get_task("old").await.unwrap().unwrap().description, "");
+        assert_ok(handler.handle_tasks_update(json!({"task_id": "old", "description": "仍可編輯"}), &ctx).await);
+        let saved = store.get_task("old").await.unwrap().unwrap();
+        assert_eq!(saved.assigned_to, "deleted");
+        assert_eq!(saved.description, "仍可編輯");
+    }
 }
