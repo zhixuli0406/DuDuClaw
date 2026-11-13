@@ -304,6 +304,48 @@ async fn mcp_agent_toml_writes_are_format_preserving_and_versioned() {
     assert_eq!(r.get("isError").and_then(|v| v.as_bool()), Some(true), "{r}");
 }
 
+/// RM-149 round 2: MCP `agent_update` cannot move an archived or
+/// soft-deleted employee out of the Admin-only lifecycle (a deleted one would
+/// take a licence seat again without the seat admission).
+#[tokio::test]
+async fn agent_update_cannot_change_an_archived_or_deleted_status() {
+    let tmp = TempDir::new();
+    let home = tmp.path();
+    write_named_agent(home, "keeper", "Kim");
+    std::fs::write(home.join("config.toml"), "[delegation]\npolicy = \"open\"\n").unwrap();
+    let path = home.join("agents").join("keeper").join("agent.toml");
+    let set_status = |status: &str| {
+        let mut t: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        t.get_mut("agent")
+            .and_then(|a| a.as_table_mut())
+            .unwrap()
+            .insert("status".into(), toml::Value::String(status.into()));
+        std::fs::write(&path, toml::to_string(&t).unwrap()).unwrap();
+    };
+    let status_on_disk = || -> String {
+        let t: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        t["agent"]["status"].as_str().unwrap().to_string()
+    };
+    let op = crate::mcp::record_authz::RecordActor::Operator("dudu");
+    for lifecycle in ["deleted", "archived"] {
+        set_status(lifecycle);
+        for wanted in ["active", "paused", "terminated"] {
+            let r = handle_agent_update(&serde_json::json!({ "agent_id": "keeper", "status": wanted }), home, op).await;
+            assert_eq!(r.get("isError").and_then(|v| v.as_bool()), Some(true), "{lifecycle} -> {wanted}: {r}");
+            assert_eq!(
+                r["content"][0]["text"].as_str(),
+                Some(crate::mcp::agent_update::ADMIN_LIFECYCLE_STATUS_REFUSED)
+            );
+            assert_eq!(status_on_disk(), lifecycle);
+        }
+    }
+    // An ordinary employee's status still changes.
+    set_status("active");
+    let r = handle_agent_update(&serde_json::json!({ "agent_id": "keeper", "status": "paused" }), home, op).await;
+    assert!(r.get("isError").and_then(|v| v.as_bool()) != Some(true), "{r}");
+    assert_eq!(status_on_disk(), "paused");
+}
+
 #[tokio::test]
 async fn mcp_rename_never_writes_injected_text() {
     let tmp = TempDir::new();

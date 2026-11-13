@@ -230,6 +230,45 @@ fn single_security_keys_are_frozen_and_their_siblings_are_not() {
     assert!(matches!(d, GuardDecision::BlockedAgentSecuritySection { .. }), "{d:?}");
 }
 
+/// RM-149 round 2 (H2): `[agent] status` decides the licence seat and the
+/// Admin-only lifecycle, so the employee can neither set itself `deleted`
+/// (freeing its seat) nor bring itself back, nor add / remove / reshape the
+/// key. The operator's own terminal keeps editing it, and the sibling keys
+/// stay editable.
+#[test]
+fn agent_status_is_frozen_for_the_agent() {
+    let to = |status: &str| BASE.replace("status = \"active\"", &format!("status = \"{status}\""));
+    let deleted = to("deleted");
+    for (before, after) in [
+        (BASE.to_string(), deleted.clone()),
+        (deleted.clone(), BASE.to_string()),
+        (to("archived"), BASE.to_string()),
+        (BASE.to_string(), BASE.replace("status = \"active\"\n", "")),
+        (BASE.replace("status = \"active\"\n", ""), deleted.clone()),
+        (BASE.to_string(), BASE.replace("status = \"active\"", "status = [\"active\"]")),
+    ] {
+        match as_agent(&before, &after) {
+            GuardDecision::BlockedAgentSecuritySection { changed, .. } => {
+                assert!(changed.iter().any(|c| c.starts_with("agent.status")), "{changed:?}");
+            }
+            other => panic!("expected BlockedAgentSecuritySection, got {other:?}"),
+        }
+    }
+    // An untrusted caller (claimed identity that did not verify) likewise.
+    let untrusted = HookCaller::Untrusted("agnes".into());
+    assert!(!check_protected_toml_write_as(&agent_path(), &home(), &untrusted, Some(BASE), &deleted).is_allowed());
+    // The operator is unaffected.
+    assert_eq!(
+        check_protected_toml_write_as(&agent_path(), &home(), &HookCaller::Absent, Some(BASE), &deleted),
+        GuardDecision::AllowedAgentWrite
+    );
+    // Siblings stay editable for the agent.
+    assert_eq!(
+        as_agent(BASE, &BASE.replace("display_name = \"Agnes\"", "display_name = \"Agnes 2\"")),
+        GuardDecision::AllowedAgentWrite
+    );
+}
+
 #[test]
 fn unchanged_security_sections_and_ordinary_sections_pass() {
     let all: String = SECTION_CASES

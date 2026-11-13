@@ -611,6 +611,18 @@ paths:
     post:
       tags: [agents]
       summary: Create a new agent
+      description: |
+        Creates a blank AI employee. Unknown top-level fields are not
+        rejected; they are listed in `ignored_fields` in the response.
+        A seat-limit refusal is a structured error (`SeatLimitError`) that
+        lists the employees currently counted against the licence
+        (every employee whose status is not `deleted`; archived ones count).
+        The seat check and the creation are one step: the check runs under a
+        cross-process seat admission lock shared with template creation,
+        `agents.unarchive`, MCP `create_agent` and the pack importer, held
+        until the new employee is on disk, so concurrent creates cannot
+        together exceed the cap. If that lock cannot be taken within 30
+        seconds the create is refused with `agent_seat_count_unavailable`.
       requestBody:
         content:
           application/json:
@@ -625,7 +637,44 @@ paths:
                   type: string
                 role:
                   type: string
-                  description: Agent role description
+                  description: "Agent role (`main`, `specialist`, `worker`, …; default `specialist`)"
+                trigger:
+                  type: string
+                  description: Trigger keyword (default `@display_name`)
+                model_preferred:
+                  type: string
+                reports_to:
+                  type: string
+                  description: Existing agent this one reports to
+                department:
+                  type: string
+                runtime:
+                  type: object
+                  description: "Optional `[runtime]` (`provider`, `fallback`, `timeout_secs`)"
+                soul_md:
+                  type: string
+                  maxLength: 8000
+                  description: |
+                    Persona written to SOUL.md (canonical field, same name as in
+                    `templates.create_agent` and `agents.inspect`). Trimmed and
+                    written under a `# <display_name>` heading. It passes the
+                    same SOUL.md scan as template creation; a rejected persona,
+                    text over 8000 characters, or a failed SOUL.md write refuses
+                    the whole create and nothing is left on disk. A scan refusal
+                    names the reason categories (HTML comment, invisible
+                    characters, hidden content, prompt-injection phrasing,
+                    too long / invalid) without quoting the text; a length
+                    refusal states the limit and the length sent. Omitted or
+                    blank: a default one-line persona is written. To change it
+                    later, use `agent_files.get` / `agent_files.save`.
+                soul:
+                  type: string
+                  deprecated: true
+                  description: |
+                    Older alias of `soul_md`. An empty or blank value of either
+                    field counts as not sent (so `soul_md: ""` with a non-empty
+                    `soul` uses `soul`); two non-empty values with different
+                    text are an error.
       responses:
         "200":
           description: Agent created
@@ -638,6 +687,38 @@ paths:
                     type: boolean
                   agent:
                     $ref: "#/components/schemas/AgentSummary"
+                  persona_supplied:
+                    type: boolean
+                    description: Whether `soul_md` / `soul` was written to SOUL.md
+                  ignored_fields:
+                    type: array
+                    items:
+                      type: string
+                    description: |
+                      Top-level request fields the gateway did not use (sorted).
+                      Not rejected in this version; also logged as a warning.
+                      At most 20 names are listed, each cut to 64 characters
+                      with control, line-break and text-direction characters
+                      removed; `ignored_fields_more` counts the rest.
+                  ignored_fields_more:
+                    type: integer
+                    description: Number of ignored fields not listed in `ignored_fields`.
+                  runtime_provider_auto_aligned:
+                    type: string
+                    nullable: true
+                  runtime_provider_align_skipped:
+                    type: string
+                    nullable: true
+        default:
+          description: |
+            Refused. `error` is a string, or a structured object such as
+            `SeatLimitError` (`code: agent_seat_limit_reached`) or
+            `{code: agent_seat_count_unavailable, message}` when the seat
+            count could not be read while a cap applies (fail closed).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SeatLimitError"
 
   /rpc/agents.delegate:
     post:
@@ -874,7 +955,11 @@ paths:
   /rpc/agents.remove:
     post:
       tags: [agents]
-      summary: Remove an agent (moved to trash)
+      summary: Soft-delete an agent (data retained)
+      description: |
+        Sets `status = "deleted"`. The directory stays on disk, but the
+        agent is no longer loaded, listed, routed or dispatched to, it frees
+        its licence seat, and `agents.unarchive` cannot bring it back.
       requestBody:
         content:
           application/json:
@@ -886,7 +971,7 @@ paths:
                   type: string
       responses:
         "200":
-          description: Agent removed
+          description: Agent soft-deleted
           content:
             application/json:
               schema:
@@ -896,8 +981,51 @@ paths:
                     type: boolean
                   agent_id:
                     type: string
-                  trash_path:
+                  status:
                     type: string
+                    enum: [deleted]
+                  data_retained:
+                    type: boolean
+
+  /rpc/agents.unarchive:
+    post:
+      tags: [agents]
+      summary: Restore an archived agent
+      description: |
+        Only an agent whose status is `archived` can be restored. A
+        soft-deleted agent is refused with `{code: agent_deleted, message}`;
+        any other status with `{code: agent_not_archived, message}`. The
+        licence seat limit applies: an archived agent already holds its
+        seat, so this is refused (`SeatLimitError`) only when the other seat
+        holders alone already reach the cap. `agent_id` is the registry id
+        (`[agent] name`); the employee's real directory is resolved first,
+        so a legacy directory whose name differs is found and restored. The
+        check and the status change run under the same seat admission lock as
+        a create.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Agent restored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  agent_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [active]
 
   /rpc/agents.export_profile:
     post:
@@ -3099,6 +3227,45 @@ components:
       properties:
         success:
           type: boolean
+
+    SeatLimitError:
+      type: object
+      description: |
+        `error` of a create / restore refused by the licence seat limit
+        (`agents.create`, `templates.create_agent`, `agents.unarchive`;
+        `templates.apply` returns it under `seat_limit` with
+        `warning: seat_limit`). Seat holders are every employee whose
+        `[agent] status` is not `deleted`; archived employees and employees
+        whose `agent.toml` cannot be read (`status: unreadable`) count.
+        These RPCs are Admin-only; the holder list is not given to AI
+        callers (MCP `create_agent` reports only the cap and the number of
+        seats in use). `id`, `display_name` and `status` are one plain line
+        each (control, line-break and text-direction characters removed, at
+        most 64 characters).
+      properties:
+        code:
+          type: string
+          enum: [agent_seat_limit_reached]
+        message:
+          type: string
+        max:
+          type: integer
+        current:
+          type: integer
+        adding:
+          type: integer
+        seat_holders:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              display_name:
+                type: string
+              status:
+                type: string
+                description: "`active`, `paused`, `terminated`, `archived`, `unreadable`, `unknown`, or the value as written"
 
     AgentSummary:
       type: object

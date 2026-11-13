@@ -563,7 +563,7 @@ export function WelcomePage() {
           display_name: state.displayName.trim(),
           role: 'main',
           trigger: state.trigger.trim() || `@${state.displayName.trim()}`,
-          soul: state.soul.trim() ? sanitizeSoul(state.soul) : undefined,
+          soul_md: state.soul.trim() ? sanitizeSoul(state.soul) : undefined,
           runtime: { provider: runtimeProvider() },
         });
       }

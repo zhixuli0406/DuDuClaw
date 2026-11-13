@@ -49,15 +49,22 @@ impl MethodHandler {
         &self, params: &Value, caller: &UserContext, premium_dir: &Path,
         role_id: &str, assembled: &crate::premium_templates::AssembledRole,
     ) -> WsFrame {
-        self.create_template_with_skills(params, caller, premium_dir, role_id, assembled, None, true, true, &[]).await
+        self.create_template_with_skills(params, caller, premium_dir, role_id, assembled, None, true, true, &[], None).await
     }
 
     /// Shared commit path for company and bundled templates. Skills are written
     /// before the registry-visible configuration, with the same rollback boundary.
+    ///
+    /// `batch_admission`: `Some` when the caller (`templates.apply` for a
+    /// team) already holds the seat admission for its whole batch and
+    /// admitted every member under it; `None` takes the admission here for
+    /// this one employee and holds it to the publish (RM-149).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn create_template_with_skills(
         &self, params: &Value, caller: &UserContext, premium_dir: &Path,
         role_id: &str, assembled: &crate::premium_templates::AssembledRole,
         skills: Option<&std::collections::BTreeMap<String, String>>, premium: bool, install_evals: bool, disabled_skills: &[String],
+        batch_admission: Option<&duduclaw_core::agent_seats::SeatAdmission>,
     ) -> WsFrame {
         use crate::premium_templates as pt;
         // Native Linux protected mode (SR2 1c): a protected employee exists
@@ -218,11 +225,18 @@ impl MethodHandler {
             .unwrap_or("specialist")
             .to_string();
 
-        // Cloud-tier agent cap (self-host is never capped — Apache 2.0).
-        let agent_count = self.registry.read().await.list().len();
-        if let Some(msg) = self.tier_limit_message("agent", agent_count).await {
-            return WsFrame::error_response("", &msg);
-        }
+        // Licence seats (RM-149): the shared on-disk rule — deleted employees
+        // free their seat, archived ones keep it — decided under the
+        // cross-process seat admission lock, held until the publish below
+        // (lock order: seat admission, then the org lock). A team batch
+        // passes its own held admission (all members admitted at once).
+        let own_admission = match batch_admission {
+            Some(_) => None,
+            None => match self.admit_agent_seats(1, None).await {
+                Ok(admission) => Some(admission),
+                Err(refusal) => return super::agents_basic::seat_refusal_frame(refusal),
+            },
+        };
 
         let agents_dir = self.registry.read().await.agents_dir().to_path_buf();
         let agent_dir = agents_dir.join(&name);
@@ -353,6 +367,7 @@ impl MethodHandler {
                     None => None,
                 };
                 drop(org);
+                drop(own_admission);
                 return WsFrame::error_response(
                     "",
                     &super::agents_create::create_failed_text(&e.to_string(), restore.as_deref()),
@@ -360,6 +375,8 @@ impl MethodHandler {
             }
         }
         drop(org);
+        // Published: the next admission counts this employee.
+        drop(own_admission);
 
         // Same protections as agents.create: file-guard hook + registry rescan.
         alignment.audit(&self.home_dir, &name, "templates.create_agent", &caller.user_id);

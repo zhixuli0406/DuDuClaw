@@ -770,7 +770,11 @@ pub fn org_mutation_lock_path(home: &Path) -> PathBuf {
 /// chain and refuses a cycle ([`OrgStoreError::Cycle`]).
 ///
 /// Lock order, everywhere: this lock is taken **first** — before any
-/// `agent.toml` lock and before the autonomy lifecycle barrier. The
+/// `agent.toml` lock and before the autonomy lifecycle barrier. The one lock
+/// that may be held while taking it is the licence seat admission lock
+/// ([`crate::agent_seats::SeatAdmission`], RM-149), which every create /
+/// restore / import path takes before this one; never take the seat
+/// admission while holding this lock. The
 /// `org.toml` sidecar lock (inside [`mutate`]) is only ever taken while this
 /// lock is held, so it can never be part of a lock cycle. Never take this
 /// lock while holding an `agent.toml` lock or the barrier.

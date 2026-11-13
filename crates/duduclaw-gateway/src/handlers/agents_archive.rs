@@ -9,6 +9,8 @@ impl MethodHandler {
     /// directory and its `memory.db` stay on disk; the agent simply disappears
     /// from every list/route. Refuses the main agent (name kept `remove` for
     /// front-end compatibility, but the semantics are now soft, not hard).
+    /// RM-149: the registry no longer loads it after the rescan this write
+    /// triggers, it frees its licence seat, and `agents.unarchive` refuses it.
     pub(crate) async fn handle_agents_remove(&self, params: Value) -> WsFrame {
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
@@ -145,8 +147,12 @@ impl MethodHandler {
         )
     }
 
-    /// Restore an archived (or soft-deleted) agent to `active` and re-enable the
-    /// heartbeat/evolution kill-switch.
+    /// Restore an **archived** agent to `active` and re-enable the
+    /// heartbeat/evolution kill-switch. RM-149: a soft-deleted agent is
+    /// refused (it used to be resurrected here), any other status is refused,
+    /// and the licence seat limit is enforced like a create — under the seat
+    /// admission lock, held until the status is rewritten (lock order: seat
+    /// admission, then the `agent.toml` lock).
     pub(crate) async fn handle_agents_unarchive(&self, params: Value) -> WsFrame {
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
@@ -155,15 +161,68 @@ impl MethodHandler {
         if !is_valid_agent_id(&agent_id) {
             return WsFrame::error_response("", "Invalid agent_id format");
         }
+        let admission = match self.acquire_seat_admission().await {
+            Ok(admission) => admission,
+            Err(refusal) => return super::agents_basic::seat_refusal_frame(refusal),
+        };
+        // Status from disk, read under the admission: a soft-deleted
+        // employee is not in the registry and must get its own answer rather
+        // than "not found". L5: the registry id is the `[agent] name`, which
+        // need not be the directory name, so the real directory is resolved
+        // first (same rule as the registry).
+        let seat = {
+            let (home, id) = (self.home_dir.clone(), agent_id.clone());
+            match tokio::task::spawn_blocking(move || duduclaw_core::agent_seats::resolve_agent_seat(&home, &id)).await {
+                Ok(Ok(seat)) => seat,
+                Ok(Err(e)) => {
+                    warn!(agent = %agent_id, error = %e, "agents.unarchive: employee directory not resolved; refusing");
+                    return WsFrame::error_response("", "無法確認這位 AI 員工的資料夾（可能有兩個資料夾使用同一個名稱），沒有解除封存。");
+                }
+                Err(e) => {
+                    warn!(agent = %agent_id, error = %e, "agents.unarchive: resolve task failed; refusing");
+                    return WsFrame::error_response("", "無法確認這位 AI 員工的資料夾，沒有解除封存。");
+                }
+            }
+        };
+        let seat = match seat {
+            Some(s) if s.is_deleted() => {
+                return unarchive_refusal(UNARCHIVE_DELETED_CODE, UNARCHIVE_DELETED_REFUSED);
+            }
+            Some(s) if !s.is_archived() => {
+                return unarchive_refusal(UNARCHIVE_NOT_ARCHIVED_CODE, &not_archived_message(&s.status));
+            }
+            Some(s) => s,
+            None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
+        };
+        // The registry must point at the same directory the status was read
+        // from (the write below goes through the registry).
         {
             let reg = self.registry.read().await;
-            if reg.get(&agent_id).is_none() {
-                return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
+            match reg.get(&agent_id) {
+                Some(a) if a.dir.file_name().and_then(|n| n.to_str()) == Some(seat.id.as_str()) => {}
+                Some(_) => {
+                    warn!(agent = %agent_id, "agents.unarchive: registry and disk disagree on the directory; refusing");
+                    return WsFrame::error_response("", "這位 AI 員工的資料夾與目前載入的設定不一致，沒有解除封存。請重新整理後再試。");
+                }
+                None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
             }
         }
-        let res = self
-            .update_agent_toml(&agent_id, unarchive_restore_table)
-            .await;
+        // An archived employee already holds its seat; restoring it is
+        // refused only when the others alone already fill the cap (e.g. the
+        // licence was lowered while it was archived). Its own seat is matched
+        // on the resolved directory.
+        if let Some(refusal) = self.seat_refusal_under(&admission, 1, Some(&seat.id)).await {
+            return super::agents_basic::seat_refusal_frame(refusal);
+        }
+        // Written into the resolved directory (the status is re-checked on
+        // the file as read under its lock).
+        let edit = crate::channel_reply::AgentTomlEdit { source: "agents.update", user_id: "system", guard: || Ok(()) };
+        let res = crate::channel_reply::update_agent_toml_in_dir(&self.registry, &agent_id, &seat.id, edit, |table| {
+            require_archived_status(table)?;
+            unarchive_restore_table(table)
+        })
+        .await;
+        drop(admission);
         if let Err(e) = res {
             return WsFrame::error_response("", &format!("Failed to unarchive agent: {e}"));
         }
@@ -190,7 +249,19 @@ impl MethodHandler {
             }),
         )
     }
+}
 
+/// Structured `agents.unarchive` refusal (`{code, message}`).
+fn unarchive_refusal(code: &str, message: &str) -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({ "code": code, "message": message })),
+    }
+}
+
+impl MethodHandler {
     /// Hand off an off-boarding agent's work to a successor (WP4). Moves any
     /// combination of memory / wiki / open tasks (each a boolean switch, default
     /// on) from `from_agent` to `to_agent`, then archives the source unless

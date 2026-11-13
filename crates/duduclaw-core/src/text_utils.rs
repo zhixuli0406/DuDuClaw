@@ -27,6 +27,30 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// One line of untrusted text made safe to place inside plain-text output
+/// (tool results, logs, one-line summaries): C0 / C1 control characters
+/// (newlines and tabs included), Unicode line / paragraph separators, bidi
+/// controls and zero-width / byte-order marks are removed, then the result is
+/// capped at `max_chars` characters with [`truncate_chars`]. Never slices by
+/// byte index.
+pub fn plain_line(s: &str, max_chars: usize) -> String {
+    let cleaned: String = s.chars().filter(|c| !is_unsafe_inline_char(*c)).collect();
+    truncate_chars(&cleaned, max_chars)
+}
+
+/// Characters [`plain_line`] removes.
+pub fn is_unsafe_inline_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +92,15 @@ mod tests {
     fn truncate_chars_counts_codepoints_not_bytes() {
         assert_eq!(truncate_chars("學生好", 2), "學生");
         assert_eq!(truncate_chars("學生好", 10), "學生好");
+    }
+
+    #[test]
+    fn plain_line_strips_controls_bidi_and_caps_by_chars() {
+        assert_eq!(plain_line("a\nb\r\tc\u{1b}[31m", 64), "abc[31m");
+        assert_eq!(plain_line("x\u{202E}y\u{2066}z\u{200B}\u{FEFF}\u{2028}", 64), "xyz");
+        assert_eq!(plain_line("\u{85}員\u{9f}工", 64), "員工", "C1 controls");
+        assert_eq!(plain_line(&"員".repeat(100), 64).chars().count(), 64);
+        assert_eq!(plain_line("ok 名稱", 64), "ok 名稱");
     }
 
     #[test]

@@ -117,12 +117,15 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
     // only a "write": `flock … sleep`, `exec 9>…` or `python -c` holds it
     // without a write verb and would stall every org change. The journal is
     // refused for write-shaped commands like the store itself.
-    let lock_name = format!("locks/{}", crate::org_store::ORG_MUTATION_LOCK);
-    if normalized.contains(&lock_name) {
-        return GuardDecision::BlockedBashProtectedWrite {
-            file_name: format!("{}.lock", crate::org_store::ORG_MUTATION_LOCK),
-            verb: "lock".to_string(),
-        };
+    // RM-149 round 2: the seat admission lock the same way — holding it
+    // would stall every employee create / restore.
+    for lock in [crate::org_store::ORG_MUTATION_LOCK, crate::agent_seats::SEAT_ADMISSION_LOCK] {
+        if normalized.contains(&format!("locks/{lock}")) {
+            return GuardDecision::BlockedBashProtectedWrite {
+                file_name: format!("{lock}.lock"),
+                verb: "lock".to_string(),
+            };
+        }
     }
     let mentions_org_journal = normalized.contains(crate::org_store::ORG_CHANGE_JOURNAL_DIR);
 

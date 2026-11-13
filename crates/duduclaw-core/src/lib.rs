@@ -5,6 +5,7 @@ pub mod agent_guard;
 pub mod agent_names;
 pub mod agent_profile;
 pub mod agent_rename;
+pub mod agent_seats;
 pub mod agent_trash;
 pub mod agent_toml;
 pub mod appliance;
@@ -193,7 +194,7 @@ pub use takeover_state::{
     BeginOutcome as TakeoverBeginOutcome, BeginRequest as TakeoverBeginRequest, TakeoverConfig,
     TakeoverRecord,
 };
-pub use text_utils::{truncate_bytes, truncate_chars};
+pub use text_utils::{plain_line, truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
 pub use tool_error_reason::{
     ensure_error_reason, ensure_error_reason_with, is_malformed_frame, lacks_error_reason,
