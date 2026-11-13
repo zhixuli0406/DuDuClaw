@@ -617,7 +617,7 @@ fn no_expiry_details(details: &mut Value, key: &StoredKey, ctx: &UserContext) ->
 /// Dashboard row. Never the digest.
 fn key_json(key: &StoredKey, now: chrono::DateTime<Utc>, context: &RowContext) -> Value {
     let state = key.state(now);
-    let days_left = key.expires_at.map(|at| (at - now).num_days());
+    let days_left = key.expires_at.map(|at| crate::identity_transition::days_left(at, now));
     let expiring_soon = state == KeyState::Active
         && key.expires_at.is_some_and(|at| at - now <= chrono::Duration::days(ks::NOTICE_THRESHOLDS_DAYS[0]));
     let label = |id: &Option<String>| id.as_ref().and_then(|id| context.labels.get(id).cloned());

@@ -4,6 +4,17 @@ use super::*;
 
 use duduclaw_core::mcp_key_store as ks;
 
+#[test]
+fn mcp_key_days_left_rounds_up_and_never_goes_negative() {
+    let now = Utc::now();
+    let days_left = crate::identity_transition::days_left;
+
+    assert_eq!(days_left(now + chrono::Duration::days(29) + chrono::Duration::seconds(1), now), 30);
+    assert_eq!(days_left(now + chrono::Duration::days(30), now), 30);
+    assert_eq!(days_left(now + chrono::Duration::seconds(1), now), 1);
+    assert_eq!(days_left(now - chrono::Duration::seconds(1), now), 0);
+}
+
 const MUTATING: [&str; 8] = [
     "mcp_keys.create", "mcp_keys.rename", "mcp_keys.set_expiry", "mcp_keys.disable",
     "mcp_keys.enable", "mcp_keys.delete", "mcp_keys.revoke", "mcp_keys.dismiss_migration_hint",
@@ -93,7 +104,7 @@ async fn create_returns_the_key_once_and_stores_only_its_digest() {
     assert_eq!(info["name"], "Zapier");
     assert_eq!(info["status"], "active");
     assert_eq!(info["created_by"], "admin-rm134");
-    assert_eq!(info["days_left"], 89);
+    assert_eq!(info["days_left"], 90);
     assert_eq!(info["is_external"], true, "every dashboard key is external");
 
     let listed = ok_payload(handler.handle("mcp_keys.list", json!({}), &admin()).await);
@@ -166,7 +177,7 @@ async fn management_acts_by_id_and_every_change_is_audited() {
     let renamed = ok_payload(call("mcp_keys.rename", json!({ "id": id, "name": "ops bot" })).await);
     assert_eq!(renamed["key_info"]["name"], "ops bot");
     let changed = ok_payload(call("mcp_keys.set_expiry", json!({ "id": id, "expiry": { "kind": "days", "days": 365 } })).await);
-    assert_eq!(changed["key_info"]["days_left"], 364);
+    assert_eq!(changed["key_info"]["days_left"], 365);
     let disabled = ok_payload(call("mcp_keys.disable", json!({ "id": id })).await);
     assert_eq!(disabled["key_info"]["status"], "disabled");
     assert_eq!(disabled["key_info"]["disabled_by"], "admin-rm134");
