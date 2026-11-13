@@ -520,6 +520,207 @@ fn predicate_refuses_the_union_to_every_non_gateway_internal_principal() {
     }
 }
 
+// ── Bound-key listing follows the key's scopes (v1.82 key-list fix) ─────────
+
+/// Every scope a per-employee key may carry, comma-joined.
+fn all_employee_scopes() -> String {
+    duduclaw_core::mcp_scopes::EMPLOYEE_KEY_SCOPE_STRINGS.join(",")
+}
+
+/// The bound-key pipeline BEFORE the HTTP-only gates (the process-agent
+/// union and the key's scopes): `visible_tools` as `tools/list` runs it for a
+/// key bound to `agent` — employee allow/deny lists, `[permissions]`,
+/// capability switches, … all applied.
+async fn bound_pipeline(p: &Principal, home: &Path, agent: &str) -> BTreeSet<String> {
+    let authenticated = AuthenticatedCall::without_reference(p.clone()).with_kind(bound(agent));
+    let tools = crate::mcp_auth::with_authenticated_call(
+        authenticated,
+        with_remote_binding(
+            RemoteBinding::Bound(agent.into()),
+            visible_tools_with(p, home, agent, false),
+        ),
+    )
+    .await;
+    tools.into_iter().map(|t| t.name.to_string()).collect()
+}
+
+/// Measured defect: a per-employee key holding only `memory:read` was listed
+/// 87 tools over HTTP (memory_store, send_photo, create_agent, …) that the
+/// dispatch scope gate then refused. It is now listed only what that scope
+/// reaches; dispatch still refuses the rest (unchanged).
+#[tokio::test(flavor = "current_thread")]
+async fn bound_memory_read_key_lists_only_memory_read_tools() {
+    use crate::mcp_auth::{Scope, tool_requires_scope};
+    let tmp = home();
+    let alice = principal("alice", "memory:read", false);
+    let remote = listed(&alice, bound("alice"), tmp.path(), "bob", true).await;
+    assert!(remote.contains("memory_search"), "{remote:?}");
+
+    let all: BTreeSet<&str> = tools().map(|t| t.name).collect();
+    let channel_config: Vec<&str> =
+        all.iter().copied().filter(|n| n.starts_with("channel_config")).collect();
+    assert!(!channel_config.is_empty(), "fixture: channel_config* tools exist");
+    for absent in [
+        "memory_store",
+        "send_message",
+        "send_photo",
+        "create_agent",
+        "agent_remove",
+        "cost_summary",
+        "model_load",
+    ]
+    .into_iter()
+    .chain(channel_config)
+    {
+        assert!(all.contains(absent), "fixture: {absent} is a declared tool");
+        assert!(!remote.contains(absent), "{absent} needs a scope the key lacks: {remote:?}");
+    }
+    for name in &remote {
+        assert_eq!(tool_requires_scope(name), Some(Scope::MemoryRead), "{name} listed: {remote:?}");
+    }
+
+    // Hiding is not authorization: dispatch still refuses by scope.
+    let d = dispatcher(tmp.path(), "bob", true);
+    for (tool, args) in [
+        ("memory_store", json!({"content": "x"})),
+        ("send_photo", json!({"channel": "telegram", "chat_id": "1", "url": "https://example.invalid/a.png"})),
+        ("create_agent", json!({"name": "carol"})),
+        ("cost_summary", json!({})),
+    ] {
+        let resp = call(&d, &alice, bound("alice"), tool, args).await;
+        assert_eq!(resp["error"]["code"], -32003, "{tool}: {resp}");
+        assert!(
+            resp["error"]["message"].as_str().unwrap_or_default().contains("Insufficient scope"),
+            "{tool}: {resp}"
+        );
+    }
+    let resp = call(&d, &alice, bound("alice"), "memory_search", json!({"query": "x"})).await;
+    assert!(resp.get("error").is_none(), "{resp}");
+}
+
+/// Property over every declared tool: for a key bound to an employee, listed
+/// over HTTP ⇔ the bound-key pipeline lists it, it does not act for the
+/// process agent, and its required scope is both employee-grantable and
+/// held by the key. The oracle does not call the dispatch gate predicates;
+/// representative calls also exercise the real dispatcher.
+#[tokio::test(flavor = "current_thread")]
+async fn bound_key_listing_equals_the_dispatch_scope_and_binding_gates() {
+    use crate::mcp_auth::{Scope, tool_requires_scope};
+
+    let tmp = home();
+    let d = dispatcher(tmp.path(), "bob", true);
+    let all_scopes = all_employee_scopes();
+    assert_eq!(tool_requires_scope("__nonexistent_bound_key_oracle_tool__"), Some(Scope::Admin));
+    let insufficient_scope = |resp: &Value| {
+        resp["error"]["message"].as_str().unwrap_or_default().contains("Insufficient scope")
+    };
+    for scopes in ["memory:read", "memory:read,memory:write", "wiki:read", all_scopes.as_str()] {
+        let p = principal("alice", scopes, false);
+        let kind = bound("alice");
+        // The dispatch classification of this call.
+        let access = remote_access_for(tmp.path(), &p, Some(&kind), "bob");
+        assert_eq!(access, RemoteAccess::Bound("alice".into()), "{scopes}");
+        let listing = listed(&p, kind.clone(), tmp.path(), "bob", true).await;
+        let pipeline = bound_pipeline(&p, tmp.path(), "alice").await;
+        assert!(pipeline.contains("memory_store"), "fixture: scope is the deciding gate: {pipeline:?}");
+
+        for tool in tools() {
+            let name = tool.name;
+            let union_admits = !acts_for_process_agent(name);
+            // Bound employee keys require the exact employee-grantable
+            // scope; Admin never substitutes for it.
+            let scope_admits = tool_requires_scope(name).is_some_and(|required| {
+                duduclaw_core::mcp_scopes::EMPLOYEE_KEY_SCOPE_STRINGS
+                    .contains(&required.to_string().as_str())
+                    && p.scopes.contains(&required)
+            });
+            let expected = pipeline.contains(name) && union_admits && scope_admits;
+            assert_eq!(
+                listing.contains(name),
+                expected,
+                "{scopes}: {name} (pipeline={}, union={union_admits}, scope={scope_admits})",
+                pipeline.contains(name)
+            );
+        }
+        // Nothing outside the declared tools is listed.
+        assert!(listing.iter().all(|n| tools().any(|t| t.name == n.as_str())), "{listing:?}");
+
+        // These real Admin tools stay hidden even with every employee scope.
+        // Hiding alone is not authorization: exercise the actual dispatcher.
+        for name in ["create_agent", "cost_summary", "model_load", "memory_store"] {
+            assert!(tools().any(|t| t.name == name), "fixture: {name} is a declared tool");
+            if name == "memory_store" && p.scopes.contains(&Scope::MemoryWrite) {
+                continue;
+            }
+            assert!(!listing.contains(name), "{scopes}: {name} must be hidden");
+            let resp = call(&d, &p, kind.clone(), name, json!({})).await;
+            assert_eq!(resp["error"]["code"], -32003, "{scopes}: {name}: {resp}");
+            assert!(insufficient_scope(&resp), "{scopes}: {name}: {resp}");
+        }
+        // Read-only probes cover both admitted and missing memory:read.
+        for (name, args) in [
+            ("memory_search", json!({"query": "x"})),
+            ("memory_read", json!({"id": "__nonexistent_oracle_memory__"})),
+        ] {
+            let held = p.scopes.contains(&Scope::MemoryRead);
+            assert_eq!(listing.contains(name), held, "{scopes}: {name}");
+            let resp = call(&d, &p, kind.clone(), name, args).await;
+            assert_eq!(insufficient_scope(&resp), !held, "{scopes}: {name}: {resp}");
+            if !held {
+                assert_eq!(resp["error"]["code"], -32003, "{scopes}: {name}: {resp}");
+            }
+        }
+        // The one argument-dependent scope (`tasks_create` + kind=discovery
+        // → `discovery:execute`) is not a per-employee scope, so no argument
+        // makes a hidden tool callable for a bound key.
+        assert!(!listing.contains("tasks_create"), "{scopes}: tasks_create must be hidden");
+        let resp = call(&d, &p, kind.clone(), "tasks_create", json!({"kind": "discovery"})).await;
+        assert_eq!(resp["error"]["code"], -32003, "{scopes}: tasks_create: {resp}");
+        assert!(insufficient_scope(&resp), "{scopes}: tasks_create: {resp}");
+    }
+    // Non-vacuous: the narrow keys see the right tools.
+    let p = principal("alice", "memory:read,memory:write", false);
+    let listing = listed(&p, bound("alice"), tmp.path(), "bob", true).await;
+    assert!(listing.contains("memory_store") && listing.contains("memory_search"), "{listing:?}");
+    let p = principal("alice", "wiki:read", false);
+    let listing = listed(&p, bound("alice"), tmp.path(), "bob", true).await;
+    assert!(!listing.contains("memory_search") && !listing.contains("memory_store"), "{listing:?}");
+}
+
+/// Stdio employee processes and external keys are listed exactly as before:
+/// the stdio listing is the unchanged pipeline (`visible_tool_names`, which
+/// the stdio `list_changed` watcher compares against) and does not depend on
+/// the key's scopes for an employee client; an external key is listed the
+/// same over HTTP as over stdio.
+#[tokio::test(flavor = "current_thread")]
+async fn stdio_employee_and_external_listings_are_unchanged() {
+    let tmp = home();
+    let narrow = principal("alice", "memory:read", false);
+    let wide = principal("alice", &all_employee_scopes(), false);
+    for kind in [bound("alice"), unbound(), PrincipalKind::Other] {
+        let narrow_stdio = listed(&narrow, kind.clone(), tmp.path(), "alice", false).await;
+        let wide_stdio = listed(&wide, kind.clone(), tmp.path(), "alice", false).await;
+        assert_eq!(narrow_stdio, wide_stdio, "{kind:?}: the stdio employee exemption is unchanged");
+        let authenticated = AuthenticatedCall::without_reference(narrow.clone()).with_kind(kind.clone());
+        let pipeline: BTreeSet<String> = crate::mcp_auth::with_authenticated_call(
+            authenticated,
+            visible_tool_names(&narrow, tmp.path(), "alice"),
+        )
+        .await
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(narrow_stdio, pipeline, "{kind:?}");
+        assert!(narrow_stdio.contains("working_state_get"), "{kind:?}: {narrow_stdio:?}");
+    }
+
+    let external = principal("ext-client", "memory:read", true);
+    let over_http = listed(&external, PrincipalKind::Other, tmp.path(), "bob", true).await;
+    let over_stdio = listed(&external, PrincipalKind::Other, tmp.path(), "bob", false).await;
+    assert_eq!(over_http, over_stdio);
+    assert!(over_http.contains("memory_search") && !over_http.contains("memory_store"), "{over_http:?}");
+}
+
 /// Third review: inside a remote scope, identity resolution never falls back
 /// to `default_agent`.
 #[tokio::test(flavor = "current_thread")]

@@ -149,9 +149,12 @@ computer-use, fork and knowledge tools, and the rest of the set
   them (`-32003`, audit class `per_agent_key_process_tool`, whatever scopes the key
   holds), and `tools/list` does not show them. This is decided from how the key
   was authenticated, never from the files on disk.
-- For the remaining tools (`memory_store`, `memory_search`, `tasks_create`,
-  `file_read`, …) such a key acts as **the employee it is bound to**, never as the
-  server's default agent.
+- For the remaining tools (`memory_store`, `memory_search`, `file_read`, …) such
+  a key acts as **the employee it is bound to**, never as the server's default
+  agent. `tools/list` shows only the tools the key's scopes let it call (a key
+  with only `memory:read` does not see `memory_store`); tools that need `admin`
+  (such as `tasks_create`) are never callable with a per-employee key and are not
+  listed.
 - A non-external key with no binding, or whose bound employee no longer exists
   (directory removed or renamed, or `status = "deleted"`), is refused **every**
   tool (`-32003`, audit class `remote_key_unbound` with the reason) and is shown an

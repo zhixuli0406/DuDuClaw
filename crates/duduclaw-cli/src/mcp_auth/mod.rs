@@ -597,6 +597,24 @@ pub(crate) fn scope_gate_admits(principal: &Principal, required: &Scope, bound_e
     principal.scopes.contains(required) || principal.scopes.contains(&Scope::Admin)
 }
 
+/// The dispatch scope gate as one decision: the scope `tool` called with
+/// `args` requires ([`tool_requires_scope_for_args`]; a tool missing from the
+/// table needs `admin`) when [`scope_gate_admits`] refuses it, else `None`.
+///
+/// Both scope checks in `McpDispatcher::dispatch_tool_call` and the HTTP
+/// `tools/list` for a key bound to an employee (`mcp::tools_list`, with
+/// `args = Value::Null`, i.e. [`tool_requires_scope`]) call this function, so
+/// a bound key lists exactly the tools this gate lets it call.
+pub(crate) fn scope_gate_refusal(
+    principal: &Principal,
+    tool: &str,
+    args: &serde_json::Value,
+    bound_employee: bool,
+) -> Option<Scope> {
+    tool_requires_scope_for_args(tool, args)
+        .filter(|required| !scope_gate_admits(principal, required, bound_employee))
+}
+
 /// The 30-day rule of a `[mcp_keys]` entry
 /// (`duduclaw_core::mcp_key_store::legacy_age_accepts`).
 fn legacy_principal(entry: &KeyEntry) -> Result<Principal, AuthError> {

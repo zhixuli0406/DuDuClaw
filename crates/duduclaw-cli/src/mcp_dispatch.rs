@@ -966,12 +966,15 @@ impl McpDispatcher {
             }
 
             // ── 1. Scope check ───────────────────────────────────────────────────
+            // `tools/list` for a bound HTTP key filters by the same
+            // `scope_gate_refusal` (discoverable ⇔ callable).
             if removed_reply.is_none()
-                && let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(
+                && let Some(required) = crate::mcp_auth::scope_gate_refusal(
+                    principal,
                     tool_name,
                     params.get("arguments").unwrap_or(&Value::Null),
+                    bound_remote,
                 )
-                && !crate::mcp_auth::scope_gate_admits(principal, &required, bound_remote)
             {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 let detail = format!("required {required:?}, principal lacks it (and Admin)");
@@ -1843,24 +1846,24 @@ impl McpDispatcher {
 
         // Policy rewrites can change tasks_create.kind. Recheck the effective
         // arguments before either human approval or execution.
-        if let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(
+        if let Some(required) = crate::mcp_auth::scope_gate_refusal(
+            principal,
             tool_name,
             params_owned.get("arguments").unwrap_or(&Value::Null),
+            bound_remote,
         ) {
-            if !crate::mcp_auth::scope_gate_admits(principal, &required, bound_remote) {
-                self.audit_dispatch_denial(
-                    principal,
-                    tool_name,
-                    &params_owned,
-                    "insufficient_scope",
-                    "effective arguments exceed caller scope",
-                );
-                return jsonrpc_error(
-                    id,
-                    -32003,
-                    &scope_denial_message(tool_name, required),
-                );
-            }
+            self.audit_dispatch_denial(
+                principal,
+                tool_name,
+                &params_owned,
+                "insufficient_scope",
+                "effective arguments exceed caller scope",
+            );
+            return jsonrpc_error(
+                id,
+                -32003,
+                &scope_denial_message(tool_name, required),
+            );
         }
 
         // Reserve before executing any private read, across all MCP processes.
