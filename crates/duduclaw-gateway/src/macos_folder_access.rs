@@ -797,9 +797,9 @@ pub fn admin_notice_text(state: AccessState, labels: &[String]) -> Option<String
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const NOTICE_NO_BUTTON_HINT: &str = "這則通知不需要按鈕操作；請在這台 Mac 上處理，或打開儀表板查看狀態。";
 
-/// Verified channel identities of every Active Admin.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn admin_links(home: &Path) -> Vec<(String, String)> {
+/// Verified channel identities of every Active Admin. Also used by the
+/// autopilot approval gate's Admin notice (`autopilot_approval`).
+pub(crate) fn admin_links(home: &Path) -> Vec<(String, String)> {
     use duduclaw_auth::models::{UserRole, UserStatus};
     let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else {
         return Vec::new();

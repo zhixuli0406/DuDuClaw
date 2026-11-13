@@ -610,7 +610,9 @@ mod tests {
         drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());
         let actual=Connection::open(home.path().join("autopilot.db")).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        expected.execute_batch(include_str!("../../duduclaw-import/src/autopilot-v1793.sql")).unwrap();
+        // Fresh stores are the newest known catalog (v1.82: v1.79.3 plus the
+        // approval-gate ledger); autopilot-v1793.sql pins the older release.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/autopilot-v182.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
 
         drop(crate::workflow::WorkflowStore::open(home.path()).unwrap());

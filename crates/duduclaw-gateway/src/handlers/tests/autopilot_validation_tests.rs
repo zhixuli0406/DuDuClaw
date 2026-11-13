@@ -272,6 +272,72 @@ fn action_rejects_non_object() {
     assert!(validate_autopilot_action(&json!("delegate")).is_err());
 }
 
+// ── v1.82: `require_approval` must be a JSON boolean ──────────
+
+#[test]
+fn action_require_approval_accepts_only_a_boolean() {
+    for ok in [json!(true), json!(false)] {
+        let action = json!({
+            "type": "delegate", "target_agent": "plain", "prompt": "p", "require_approval": ok
+        });
+        assert!(validate_autopilot_action(&action).is_ok(), "{action}");
+    }
+    // Absent stays valid (no gate).
+    assert!(
+        validate_autopilot_action(&json!({"type": "delegate", "target_agent": "plain", "prompt": "p"}))
+            .is_ok()
+    );
+    for bad in [json!("true"), json!("yes"), json!(1), json!(0), json!(null), json!({}), json!([true])] {
+        let action = json!({
+            "type": "notify", "channel": "telegram", "chat_id": "1", "text": "t", "require_approval": bad
+        });
+        let err = validate_autopilot_action(&action).expect_err("non-bool must be refused");
+        assert!(err.contains("require_approval"), "{err}");
+        assert!(err.contains("JSON boolean"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn autopilot_create_and_update_refuse_a_non_bool_require_approval() {
+    use crate::handlers::task_privacy_tests::fixture;
+    let f = fixture().await;
+    let store = Arc::new(AutopilotStore::open(&f.home).unwrap());
+    f.handler.set_autopilot_store(store.clone()).await;
+    let refused = f
+        .handler
+        .handle_autopilot_create(json!({"name": "gate", "action": {
+            "type": "delegate", "target_agent": "plain", "prompt": "{task.title}", "require_approval": "yes"
+        }}))
+        .await;
+    assert!(
+        matches!(refused, WsFrame::Response { ok: false, error: Some(ref e), .. }
+            if e.as_str().is_some_and(|s| s.contains("require_approval"))),
+        "{refused:?}"
+    );
+    assert!(store.list_rules().await.unwrap().is_empty(), "nothing is stored");
+
+    let created = f
+        .handler
+        .handle_autopilot_create(json!({"name": "gate", "action": {
+            "type": "delegate", "target_agent": "plain", "prompt": "{task.title}", "require_approval": true
+        }}))
+        .await;
+    let rule_id = match created {
+        WsFrame::Response { ok: true, payload: Some(p), .. } => p["rule"]["id"].as_str().unwrap().to_string(),
+        other => panic!("{other:?}"),
+    };
+    let refused = f
+        .handler
+        .handle_autopilot_update(json!({"rule_id": rule_id, "action": {
+            "type": "delegate", "target_agent": "plain", "prompt": "p", "require_approval": 0
+        }}))
+        .await;
+    assert!(matches!(refused, WsFrame::Response { ok: false, .. }), "{refused:?}");
+    let stored = store.get_rule(&rule_id).await.unwrap().unwrap();
+    let action: Value = serde_json::from_str(&stored.action).unwrap();
+    assert_eq!(action["require_approval"], json!(true), "the refused update changed nothing");
+}
+
 // ── WP3: `action.screen` structural validation ────────────────
 
 fn delegate_with_screen(screen: Value) -> Value {

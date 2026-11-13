@@ -321,12 +321,25 @@ pub fn auto_approve_install(agent_dir: &Path) -> bool {
 // ── Decision source: autopilot rule ─────────────────────────
 
 /// True when an autopilot rule's `action` JSON opts into human approval
-/// via `require_approval = true`. Absent / non-bool ⇒ `false` (no gate).
+/// via `require_approval = true`.
+///
+/// v1.82 (fail closed): absent or an explicit `false` ⇒ `false`; `true` ⇒
+/// `true`; **any other JSON type** (`"yes"`, `1`, `null`, an object …) ⇒
+/// `true`. Rule writes refuse a non-bool value
+/// (`handlers::validate_autopilot_action`), so only a rule stored before
+/// v1.82 or edited by hand can carry one — and an unreadable gate denies.
+/// Before v1.82 a non-bool was read as `false`, i.e. the gate failed open.
 pub fn rule_requires_approval(action: &Value) -> bool {
-    action
-        .get("require_approval")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    match action.get("require_approval") {
+        None | Some(Value::Bool(false)) => false,
+        Some(_) => true,
+    }
+}
+
+/// `Some(value)` when `require_approval` is present but not a JSON boolean
+/// (the fail-closed case of [`rule_requires_approval`]); used for warnings.
+pub fn require_approval_malformed(action: &Value) -> Option<&Value> {
+    action.get("require_approval").filter(|v| !v.is_boolean())
 }
 
 // ── Notification surface (channel) ──────────────────────────

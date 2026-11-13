@@ -1416,6 +1416,14 @@ export type ActivityType =
   | 'evolution_triggered'
   | 'autopilot_triggered'
   | 'autopilot_lag'
+  // v1.82 approval gate (`autopilot_engine/approval_gate.rs`): a gated fire
+  // waiting for an Admin, an approval-gate outcome an Admin must hear about
+  // (blocked / approval error / expired / stale / breaker open / outcome
+  // unknown), and a gated fire that ended without running (denied, or
+  // skipped by an autonomy pause).
+  | 'autopilot_awaiting_approval'
+  | 'autopilot_approval_blocked'
+  | 'autopilot_approval_settled'
   | 'error'
   // W2-8 — `channel_alerts.rs` (W2-4) writes these two Activity Feed rows
   // (a channel outage crossing the alert threshold, and its later
@@ -1534,13 +1542,17 @@ export type {
   AutopilotCreateParams,
   AutopilotUpdateFields,
 } from './autopilot-rules';
+export type { AutopilotHistoryResult } from './autopilot-history';
 export interface AutopilotHistoryEntry {
   id: string;
   rule_id: string;
   rule_name: string;
   triggered_at: string;
-  result: 'success' | 'failure';
-  details?: string;
+  /** Every status the gateway writes (`./autopilot-history`); a newer
+   *  gateway may send one this dashboard does not know — rendered raw. */
+  result: import('./autopilot-history').AutopilotHistoryResult | (string & {});
+  /** `Option<String>` on the gateway: serialized as `null` when absent. */
+  details?: string | null;
 }
 
 // ── Resident sensing observability (WP4) ────────────────────

@@ -16,11 +16,25 @@ enum ActivityAccess<'a> {
 
 impl TaskStore {
     pub async fn append_activity(&self, row: &ActivityRow) -> Result<(), String> {
+        self.insert_activity(row, false).await.map(|_| ())
+    }
+
+    /// Insert `row` unless an activity row with the same `id` already exists
+    /// (idempotent per id — v1.82 autopilot outcome entries are keyed by
+    /// their dispatch). `Ok(true)` when this call inserted it.
+    pub async fn append_activity_once(&self, row: &ActivityRow) -> Result<bool, String> {
+        self.insert_activity(row, true).await.map(|n| n == 1)
+    }
+
+    async fn insert_activity(&self, row: &ActivityRow, or_ignore: bool) -> Result<usize, String> {
         let mut conn = self.conn.lock().await;
         let tx = begin_live_write(&mut conn)?;
-        tx.execute(
-            "INSERT INTO activity (id, event_type, agent_id, task_id, summary, timestamp, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        let verb = if or_ignore { "INSERT OR IGNORE" } else { "INSERT" };
+        let n = tx.execute(
+            &format!(
+                "{verb} INTO activity (id, event_type, agent_id, task_id, summary, timestamp, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            ),
             params![
                 row.id,
                 row.event_type,
@@ -42,7 +56,7 @@ impl TaskStore {
         )
         .map_err(|e| format!("append activity: {e}"))?;
         commit_live_write(tx)?;
-        Ok(())
+        Ok(n)
     }
 
     pub async fn list_activity(

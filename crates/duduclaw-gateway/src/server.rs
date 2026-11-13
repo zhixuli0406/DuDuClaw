@@ -1892,7 +1892,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 Some(arc)
             }
             Err(e) => {
-                warn!("Failed to open autopilot store: {e}");
+                // v1.82 (M5): `autopilot.db` is opened owner-only / no-follow
+                // like `approvals.db`. If that fails (symlink, not a regular
+                // file, permissions) the autopilot engine does not start, so
+                // no rule — gated or not — runs (fail closed).
+                error!(
+                    "autopilot.db could not be opened securely: {e} — the autopilot engine is NOT \
+                     started and no autopilot rule (including approval-gated actions) will run \
+                     until this is fixed"
+                );
                 None
             }
         };
@@ -2023,6 +2031,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // drop isn't silent.
         let (ap_tx, ap_rx) =
             tokio::sync::broadcast::channel::<crate::autopilot_engine::AutopilotEvent>(8192);
+        // v1.82 (M1): only the process holding the gateway lock runs the
+        // autopilot trigger side (events.db → bus, CEP matcher, engine).
+        let trigger_plan = crate::autopilot_engine::trigger_runtime_plan(&home_dir);
+        if !trigger_plan.engine {
+            error!(
+                "another gateway holds this data directory: the autopilot events.db bridge, sequence \
+                 matcher and trigger engine do not run in this process (no rule fires here)"
+            );
+        }
         handler.set_autopilot_event_tx(ap_tx.clone()).await;
         // OS security line P0 (C1 producer 甲): give every gateway call site
         // (many have no `&self` on `MethodHandler`/`ReplyContext` to thread a
@@ -2120,9 +2137,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                     // (`cron.changed` / `memory.changed` / `skill.changed`) to
                     // the dashboard WebSocket, so a routine created from
                     // Telegram appears on RoutinesPage without a reload.
+                    // v1.82 (M1): a non-holder tails it for the dashboard
+                    // bridge only — never onto the autopilot bus.
                     bg_handles.push(crate::autopilot_engine::spawn_events_db_poll(
                         bus.clone(),
-                        ap_tx.clone(),
+                        trigger_plan.events_db_to_autopilot.then(|| ap_tx.clone()),
                         Some(event_tx.clone()),
                     ));
                     info!("Event bus (events.db) poll task started");
@@ -2220,11 +2239,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // goes through the identical circuit-breaker / execute_action /
         // history tail as an ordinary single-event rule match. Purely
         // additive: rules without a `sequence` column are untouched.
-        bg_handles.push(crate::cep_matcher::CepMatcher::spawn(
-            ap_store.clone(),
-            ap_tx.subscribe(),
-            ap_tx.clone(),
-        ));
+        if trigger_plan.cep_matcher {
+            bg_handles.push(crate::cep_matcher::CepMatcher::spawn(
+                ap_store.clone(),
+                ap_tx.subscribe(),
+                ap_tx.clone(),
+            ));
+        }
 
         // ── Resident sensing: external data streams → autopilot bus ─────
         // One poll task per `config.toml [[tick.sources]]` entry, feeding
@@ -2267,19 +2288,43 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
         odoo_event_tx = Some(ap_tx.clone());
 
-        // Spawn the engine loop
-        let engine = crate::autopilot_engine::AutopilotEngine::new(
-            home_dir.clone(),
-            ap_store,
-            ts,
-            mq_for_autopilot,
-            ap_rx,
-        )
-        .with_proactive_gate(proactive_gate)
-        .with_tick_hub(tick_hub);
-        handler.set_autopilot_breakers(engine.breaker_reader()).await;
-        bg_handles.push(tokio::spawn(async move { engine.run().await }));
-        info!("Autopilot trigger engine started");
+        // Spawn the engine loop — v1.82 (M1): only in the lock holder.
+        if !trigger_plan.engine {
+            drop(ap_rx);
+        } else {
+            let mut engine = crate::autopilot_engine::AutopilotEngine::new(
+                home_dir.clone(),
+                ap_store,
+                ts,
+                mq_for_autopilot,
+                ap_rx,
+            )
+            .with_proactive_gate(proactive_gate)
+            .with_tick_hub(tick_hub);
+            // v1.82 (security): attach the real ApprovalBroker so rules with
+            // `require_approval` wait for an Admin's approval and approved
+            // actions are executed (once) by the engine. Until v1.81 nothing
+            // attached it and such rules ran immediately (fail open). If the
+            // broker cannot open, the engine still starts but every gated rule
+            // is BLOCKED (fail closed) — and says so loudly at startup.
+            match crate::approval::ApprovalBroker::open(&home_dir) {
+                Ok(broker) => {
+                    engine = engine.with_approval_broker(Arc::new(broker));
+                }
+                Err(e) => error!(
+                    error = %e,
+                    "approvals.db open failed — autopilot rules with require_approval are BLOCKED until restart"
+                ),
+            }
+            if engine.has_approval_broker() {
+                info!("Autopilot approval gate attached (ApprovalBroker)");
+            } else {
+                error!("Autopilot approval gate NOT attached — gated rules will be blocked, never run");
+            }
+            handler.set_autopilot_breakers(engine.breaker_reader()).await;
+            bg_handles.push(tokio::spawn(async move { engine.run().await }));
+            info!("Autopilot trigger engine started");
+        }
     } else {
         info!("Autopilot engine disabled (missing task or autopilot store)");
         // OS-native Phase 1 watchers are only started inside the block above

@@ -3,73 +3,97 @@
 
 use super::*;
 
+/// Open (or create) `<canonical home>/<file_name>` as an owner-only SQLite
+/// database: the home is resolved first (SQLite NOFOLLOW rejects symlinked
+/// parent components too, e.g. macOS /var -> /private/var), then the
+/// database and its `-wal` / `-shm` side files are refused when they are
+/// symlinks, the database is refused when it is not a regular file, a new
+/// database is created `0600` with `O_NOFOLLOW`, and the database and any
+/// existing side files are set to `0600`. The connection itself is opened
+/// with `SQLITE_OPEN_NOFOLLOW`. Call [`secure_private_sidecars`] again once
+/// the schema (and so the WAL) exists.
+///
+/// `label` names the store in errors (`"{label} database symlink refused"`).
+/// Shared by `approvals.db` and (v1.82) `autopilot.db`.
+pub(crate) fn open_private_sqlite(
+    home_dir: &Path,
+    file_name: &str,
+    label: &str,
+) -> Result<(Connection, PathBuf), String> {
+    let db_path = std::fs::canonicalize(home_dir)
+        .map_err(|e| format!("resolve {label} home: {e}"))?
+        .join(file_name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        secure_private_sidecars(&db_path, label)?;
+        match std::fs::symlink_metadata(&db_path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!("{label} database symlink refused"));
+            }
+            Ok(m) if !m.is_file() => {
+                return Err(format!("{label} database is not a regular file"));
+            }
+            _ => {}
+        }
+        // Never open-and-close an existing database file: closing any fd
+        // on it drops every POSIX lock this process holds there, so other
+        // live connections lose their WAL locks and another process may
+        // checkpoint and remove the WAL under them (stale reads, then
+        // "disk I/O error"; seen in workflow::resume_tests). Only create.
+        if !db_path.exists() {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&db_path)
+            {
+                Ok(_) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(e) => return Err(format!("private {label} store: {e}")),
+            }
+        }
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    let conn = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|e| format!("open {label} store: {e}"))?;
+    Ok((conn, db_path))
+}
+
+/// Refuse a symlinked `-wal` / `-shm` side file of `db_path` and set any
+/// existing one to `0600` (see [`open_private_sqlite`]).
+pub(crate) fn secure_private_sidecars(db_path: &Path, label: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!("{label} sidecar symlink refused"));
+            }
+            if path.exists() {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (db_path, label);
+    Ok(())
+}
+
 impl ApprovalStore {
     /// Open (or create) the store at `<home>/approvals.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         verify_live_io()?;
-        // SQLite NOFOLLOW rejects symlinked parent components too (e.g. macOS
-        // /var -> /private/var). Resolve the trusted home, while still refusing
-        // a symlink at the actual database or sidecar path.
-        let db_path = std::fs::canonicalize(home_dir)
-            .map_err(|e| format!("resolve approval home: {e}"))?
-            .join("approvals.db");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            for suffix in ["-wal", "-shm"] {
-                let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
-                if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-                    return Err("approval sidecar symlink refused".into());
-                }
-                if path.exists() {
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            if std::fs::symlink_metadata(&db_path).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Err("approval database symlink refused".into());
-            }
-            // Never open-and-close an existing database file: closing any fd
-            // on it drops every POSIX lock this process holds there, so other
-            // live connections lose their WAL locks and another process may
-            // checkpoint and remove the WAL under them (stale reads, then
-            // "disk I/O error"; seen in workflow::resume_tests). Only create.
-            if !db_path.exists() {
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&db_path)
-                {
-                    Ok(_) => (),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-                    Err(e) => return Err(format!("private approval store: {e}")),
-                }
-            }
-            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| e.to_string())?;
-        }
-        let conn = Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(|e| format!("open approvals store: {e}"))?;
+        let (conn, db_path) = open_private_sqlite(home_dir, "approvals.db", "approval")?;
         Self::init_schema(&conn)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["-wal", "-shm"] {
-                let p = PathBuf::from(format!("{}{suffix}", db_path.display()));
-                if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
-                    return Err("approval sidecar symlink refused".into());
-                }
-                if p.exists() {
-                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
+        secure_private_sidecars(&db_path, "approval")?;
         debug!(?db_path, "ApprovalStore initialized");
         Ok(Self {
             conn: Mutex::new(conn),
