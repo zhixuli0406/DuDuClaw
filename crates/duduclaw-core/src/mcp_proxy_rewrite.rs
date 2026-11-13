@@ -84,9 +84,14 @@ pub fn spawn_env_file_name(server: &str) -> Option<String> {
 /// same agent identity and the same MCP credential the built-in server does.
 ///
 /// `DUDUCLAW_AGENT_TOKEN` is deliberately absent from this persistent carry
-/// set. The host supplies it and the turn identity separately at spawn for
-/// the proxy's signed egress-ledger requests; the external upstream never
-/// inherits these values.
+/// set. The host supplies it separately at spawn for the proxy's signed
+/// egress-ledger requests: the Claude CLI path through
+/// [`attach_proxy_identity`] on the per-spawn temp config (RM-160; the CLI's
+/// own env has carried no full token since RM-166), Codex/Grok/openai-compat
+/// through `host_proxy_env`. The turn and run identity reach the proxy the
+/// same way they reach the built-in server (the Claude CLI's env, or the
+/// runtime's per-spawn channel). The external upstream never inherits these
+/// values (`duduclaw_cli::mcp_proxy::PROXY_PRIVATE_ENV`).
 pub const PROXY_CARRY_ENV: &[&str] = &[
     "DUDUCLAW_HOME",
     "DUDUCLAW_PORT",
@@ -451,6 +456,61 @@ fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPu
     Ok(ProxyRewrite { config: out, dropped_remote })
 }
 
+/// RM-160: give every host-generated `duduclaw mcp-proxy` entry of a
+/// **per-spawn** config the employee identity token the built-in server of the
+/// same spawn carries, so the proxy can sign its gateway requests (egress
+/// ledger, third-party tool gate) as that employee. Returns how many entries
+/// received it.
+///
+/// Only for the frozen temp config a Claude CLI spawn is pinned to
+/// (`--mcp-config … --strict-mcp-config`). Never apply it to a file that
+/// persists (`<agent_dir>/.mcp.json`, `.grok/config.toml`): the token would
+/// outlive the spawn there. Runtimes that register servers themselves supply
+/// the same token through their own per-spawn env instead.
+///
+/// The token comes only from `own_server`, the host's canonical definition
+/// ([`canonical_duduclaw_server`]); it is attached only to entries that invoke
+/// `self_exe mcp-proxy` and name the same employee as `own_server`. Raw
+/// configs can never contain such an entry ([`validate_raw_mcp_config`]
+/// refuses them), so call this only on the output of a successful rewrite.
+/// Without a token source (no `identity.key`, tombstoned employee, no
+/// employee id) nothing is attached and the proxy behaves exactly as before:
+/// its signed requests fail and the gate treats the turn's data as unknown.
+/// The proxy strips the token from its upstream's environment.
+pub fn attach_proxy_identity(config: &mut Value, self_exe: &Path, own_server: &Value) -> usize {
+    let token_key = crate::identity_token::ENV_AGENT_TOKEN;
+    let own_env = own_server.get("env");
+    let Some(token) = own_env.and_then(|env| env.get(token_key))
+        .and_then(Value::as_str).filter(|token| !token.trim().is_empty())
+    else {
+        return 0;
+    };
+    let Some(agent) = own_env.and_then(|env| env.get(crate::ENV_AGENT_ID))
+        .and_then(Value::as_str).filter(|agent| crate::is_valid_agent_id(agent))
+    else {
+        return 0;
+    };
+    let Some(servers) = config.get_mut("mcpServers").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    let exe = self_exe.to_string_lossy();
+    let mut attached = 0;
+    for def in servers.values_mut() {
+        if def.get("command").and_then(Value::as_str) != Some(&*exe) || !invokes_proxy(def) {
+            continue;
+        }
+        let Some(env) = def.get_mut("env").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if env.get(crate::ENV_AGENT_ID).and_then(Value::as_str) != Some(agent) {
+            continue;
+        }
+        env.insert(token_key.to_string(), Value::String(token.to_string()));
+        attached += 1;
+    }
+    attached
+}
+
 /// Whether the raw config contains this binary's bridge, including malformed
 /// targets that the rewrite must refuse rather than bypassing its validation.
 pub fn has_remote_bridge_entries(config: &Value, self_exe: &Path) -> bool {
@@ -767,6 +827,76 @@ mod tests {
         let purpose = ProxyPurpose { redaction: true, tool_gate: true, secret_env: true };
         let once = rewrite_mcp_config_for_gate(&cfg(exe.to_str().unwrap()), exe, purpose, &cfg(exe.to_str().unwrap())["mcpServers"]["duduclaw"]).unwrap();
         assert!(rewrite_mcp_config_for_gate(&once.config, exe, purpose, &cfg(exe.to_str().unwrap())["mcpServers"]["duduclaw"]).is_err());
+    }
+
+    #[test]
+    fn rm160_spawn_identity_reaches_only_host_generated_proxy_entries() {
+        let home = tempfile::tempdir().unwrap();
+        crate::identity_token::ensure_key(home.path()).unwrap();
+        let exe = Path::new("/opt/duduclaw");
+        let own = canonical_duduclaw_server(home.path(), "a1", exe);
+        let token = own["env"][crate::identity_token::ENV_AGENT_TOKEN].as_str().unwrap().to_string();
+        let raw = json!({"mcpServers": {
+            "duduclaw": {"command": "/old/duduclaw", "args": ["mcp-server"]},
+            "pg": {"command": "npx", "args": ["-y", "pg-mcp"], "env": {"PGPASSWORD": "x"}},
+            "zap": {"command": exe, "args": ["mcp-remote-bridge", "--agent", "a1", "--server", "zap"]},
+            "notes": {"command": "notes-mcp"}
+        }});
+        assert_eq!(crate::identity_token::verify_claim(home.path(), "a1", &token, true),
+            crate::identity_token::IdentityVerdict::Verified);
+        let purpose = ProxyPurpose { redaction: false, tool_gate: true, secret_env: false };
+        let mut config = rewrite_mcp_config_for_gate(&raw, exe, purpose, &own).unwrap().config;
+        let before = config.clone();
+        // The rewrite alone (shared with every runtime) still carries no token.
+        assert!(config["mcpServers"]["pg"]["env"].get(crate::identity_token::ENV_AGENT_TOKEN).is_none());
+        assert_eq!(attach_proxy_identity(&mut config, exe, &own), 2, "pg and notes are proxied");
+        for name in ["pg", "notes"] {
+            let env = &config["mcpServers"][name]["env"];
+            assert_eq!(config["mcpServers"][name]["args"][0], "mcp-proxy");
+            assert_eq!(env[crate::identity_token::ENV_AGENT_TOKEN], token.as_str());
+            assert_eq!(env[crate::ENV_AGENT_ID], "a1");
+            // Upstream env still travels separately and never holds the token.
+            let upstream: Value = serde_json::from_str(env[PROXY_UPSTREAM_ENV_VAR].as_str().unwrap()).unwrap();
+            assert!(upstream.get(crate::identity_token::ENV_AGENT_TOKEN).is_none());
+        }
+        // The built-in and the self-gating bridge are untouched.
+        assert_eq!(config["mcpServers"]["duduclaw"], before["mcpServers"]["duduclaw"]);
+        assert_eq!(config["mcpServers"]["zap"], before["mcpServers"]["zap"]);
+        // The input stays token-free; a frozen output is never valid raw input.
+        assert!(!raw.to_string().contains(&token));
+        assert!(validate_raw_mcp_config(&config, exe, &own).is_err());
+    }
+
+    #[test]
+    fn rm160_without_a_token_source_proxy_entries_stay_as_today() {
+        let exe = Path::new("/opt/duduclaw");
+        let raw = json!({"mcpServers": {"pg": {"command": "npx"}}});
+        let purpose = ProxyPurpose { redaction: false, tool_gate: true, secret_env: false };
+        // No identity.key ⇒ the canonical definition has no token.
+        let home = tempfile::tempdir().unwrap();
+        let own = canonical_duduclaw_server(home.path(), "a1", exe);
+        assert!(own["env"].get(crate::identity_token::ENV_AGENT_TOKEN).is_none());
+        let mut config = rewrite_mcp_config_for_gate(&raw, exe, purpose, &own).unwrap().config;
+        let before = config.clone();
+        assert_eq!(attach_proxy_identity(&mut config, exe, &own), 0);
+        assert_eq!(config, before);
+        // A blank token, a missing or invalid employee id, or an entry naming
+        // another employee never receives a token either.
+        for own in [
+            json!({"env": {"DUDUCLAW_AGENT_ID": "a1", "DUDUCLAW_AGENT_TOKEN": "  "}}),
+            json!({"env": {"DUDUCLAW_AGENT_TOKEN": "t"}}),
+            json!({"env": {"DUDUCLAW_AGENT_ID": "../a1", "DUDUCLAW_AGENT_TOKEN": "t"}}),
+            json!({"env": {"DUDUCLAW_AGENT_ID": "b2", "DUDUCLAW_AGENT_TOKEN": "t"}}),
+            Value::Null,
+        ] {
+            let mut config = before.clone();
+            assert_eq!(attach_proxy_identity(&mut config, exe, &own), 0, "{own}");
+            assert_eq!(config, before);
+        }
+        // A different binary path is not this host's proxy.
+        let own = json!({"env": {"DUDUCLAW_AGENT_ID": "a1", "DUDUCLAW_AGENT_TOKEN": "t"}});
+        let mut config = before.clone();
+        assert_eq!(attach_proxy_identity(&mut config, Path::new("/other/duduclaw"), &own), 0);
     }
 
     #[test]

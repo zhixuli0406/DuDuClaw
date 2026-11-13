@@ -2357,7 +2357,7 @@ fn explore_lane_mcp_config(
             ),
         );
     }
-    let rewritten = rewrite.config;
+    let mut rewritten = rewrite.config;
     if duduclaw_core::mcp_proxy_rewrite::has_unrouted_mcp_secret_refs(&rewritten) {
         return Err(crate::mcp_spawn_gate::spawn_gate_error(
             "第三方 MCP 憑證引用無法交由代理解析，已拒絕啟動。",
@@ -2366,6 +2366,10 @@ fn explore_lane_mcp_config(
     if rewritten == parsed {
         return Ok(None);
     }
+    // RM-160: same per-spawn proxy identity as the gateway's Claude spawns
+    // (`redaction_proxy::maybe_proxy_mcp_config*`); only this owner-only temp
+    // copy carries it. No token source ⇒ nothing attached, as before.
+    duduclaw_core::mcp_proxy_rewrite::attach_proxy_identity(&mut rewritten, &exe, &own);
     let mut file = tempfile::Builder::new()
         .prefix("duduclaw-mcp-")
         .suffix(".json")
@@ -2401,6 +2405,34 @@ mod secret_proxy_gate_tests {
         let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
         assert!(audit.contains("mcp.remote_connect"));
         assert!(!audit.contains("example.invalid"));
+    }
+
+    #[test]
+    fn rm160_proactive_proxy_gets_the_spawn_identity_only_in_the_temp_copy() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".mcp.json");
+        let raw = serde_json::json!({"mcpServers": {"stdio": {"command":"test-upstream"}}}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        // No identity.key: no token source, the entry is exactly as before.
+        let guard = super::explore_lane_mcp_config(home.path(), "alice", &path).unwrap().unwrap();
+        let effective: serde_json::Value = serde_json::from_slice(&std::fs::read(&guard).unwrap()).unwrap();
+        assert!(effective["mcpServers"]["stdio"]["env"].get(duduclaw_core::ENV_AGENT_TOKEN).is_none());
+        drop(guard);
+
+        duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+        let guard = super::explore_lane_mcp_config(home.path(), "alice", &path).unwrap().unwrap();
+        let effective: serde_json::Value = serde_json::from_slice(&std::fs::read(&guard).unwrap()).unwrap();
+        let env = &effective["mcpServers"]["stdio"]["env"];
+        assert_eq!(effective["mcpServers"]["stdio"]["args"][0], "mcp-proxy");
+        assert_eq!(duduclaw_core::identity_token::verify_claim(home.path(), "alice",
+            env[duduclaw_core::ENV_AGENT_TOKEN].as_str().unwrap(), true),
+            duduclaw_core::IdentityVerdict::Verified);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&guard).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw, "the employee's file is never written");
     }
 
     #[test]
