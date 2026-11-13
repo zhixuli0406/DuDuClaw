@@ -65,8 +65,8 @@ fn messages(
     let broad = (since - chrono::Duration::seconds(1)).to_rfc3339();
     let mut stmt = conn
         .prepare(
-            "SELECT role,content,tokens,timestamp FROM session_messages
-        WHERE session_id=?1 AND hidden=0 AND undone_at IS NULL AND role IN ('user','assistant')
+            "SELECT CASE WHEN notice_kind='turn_failure' THEN 'turn_failure' ELSE role END,content,tokens,timestamp FROM session_messages
+        WHERE session_id=?1 AND (hidden=0 OR notice_kind='turn_failure') AND undone_at IS NULL AND role IN ('user','assistant')
           AND julianday(timestamp)>=julianday(?2) ORDER BY id LIMIT 20001",
         )
         .map_err(|e| e.to_string())?;

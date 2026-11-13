@@ -59,7 +59,7 @@ impl MethodHandler {
                 // private or pre-filter content. A generic label needs no NER.
                 let title = if external { Some("External conversation".to_owned()) } else { m.title };
                 let id = if external { handles::issue(&home, &user, &m.id)? } else { m.id.clone() };
-                let turns: i64 = c.query_row("SELECT COUNT(*) FROM session_messages WHERE session_id=?1 AND hidden=0 AND undone_at IS NULL AND role IN ('user','assistant')",[&m.id],|r|r.get(0)).map_err(|_|"history unavailable")?;
+                let turns: i64 = c.query_row("SELECT COUNT(*) FROM session_messages WHERE session_id=?1 AND (hidden=0 OR notice_kind='turn_failure') AND undone_at IS NULL AND role IN ('user','assistant')",[&m.id],|r|r.get(0)).map_err(|_|"history unavailable")?;
                 let mut row = json!({"session_id":id,"agent_id":m.agent,"title":title,"last_active":m.last_active,"turns":turns,"tokens":0,"lineage":null,"channel":channel,"read_only":external,"title_masked":external,"archived":archived});
                 if archived {
                     // RM-173: label why (`user` = they cleared it, `retention`).
@@ -90,20 +90,29 @@ impl MethodHandler {
         let rows = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let c = read::open(&home)?;
-            read::rows(&c, &raw)
+            read::conversation_rows(&c, &raw)
         })
         .await
         .map_err(|_| "history unavailable")??;
-        let messages = rows.into_iter().map(|r| r.message).collect();
+        let notices: Vec<_> = rows.iter().map(|r| r.notice_kind.clone()).collect();
+        let messages = rows.into_iter().map(|mut r| {
+            if r.notice_kind.as_deref() == Some("turn_failure") {
+                r.message.role = "turn_failure".into();
+            }
+            r.message
+        }).collect();
         let mut transcript =
             privacy::projection::project(self.home_dir.clone(), messages, true, agent.into())
                 .await?;
+        // Projection preserves one output per user/assistant input row.
+        // Refuse rather than associate a notice with the wrong masked message.
+        if transcript.messages.len() != notices.len() { return Err("history unavailable".into()); }
         let start = transcript.messages.len().saturating_sub(limit);
         transcript.messages.drain(..start);
         mask::recount(&mut transcript);
-        let messages: Vec<Value> = transcript.messages.iter().map(|m| {
+        let messages: Vec<Value> = transcript.messages.iter().zip(notices.iter().skip(start)).map(|(m, notice)| {
             let content = privacy::plain_parts(&m.parts);
-            json!({"role":m.role,"content":content,"sender_label":m.sender_label,"parts":m.parts,"timestamp":m.timestamp,"tokens":0})
+            json!({"role":m.role,"content":content,"sender_label":m.sender_label,"parts":m.parts,"timestamp":m.timestamp,"tokens":0,"notice_kind":notice})
         }).collect();
         let handle = handles::issue(&self.home_dir, &ctx.user_id, id)?;
         self.bound_history_recheck(ctx, agent, Mode::Filtered)?;

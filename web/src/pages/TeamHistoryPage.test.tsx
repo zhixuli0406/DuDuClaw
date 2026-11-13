@@ -200,3 +200,15 @@ describe('TeamHistoryPage archived conversations (RM-173)', () => {
 
 import { api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
+
+it('shows a failed team-history turn as a system notice', async () => {
+  const normal = mockWsClient.call.getMockImplementation()!;
+  mockWsClient.call.mockImplementation((method, params) => method === 'users.team_history.get'
+    ? Promise.resolve({ ...detail('a'), messages: [{ role: 'system', sender_label: '', timestamp: '', parts: [{ t: 'text', v: 'This turn received no reply.' }] }] })
+    : normal(method, params));
+  renderWithProviders(<TeamHistoryPage />);
+  await userEvent.setup().click(await screen.findByRole('button', { name: /Conversation a/ }));
+  const notice = await screen.findByText('This turn received no reply.');
+  expect(notice).toHaveTextContent('This turn received no reply.');
+  expect(notice.closest('article')).toHaveClass('text-destructive');
+});

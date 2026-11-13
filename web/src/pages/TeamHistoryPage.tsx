@@ -2,7 +2,7 @@ import { useSelectableAgents, useVisibleAgents, useAgentVisibilityUnrestricted }
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
 import { useSearchParams } from 'react-router';
-import { ArchiveRestore, Eye, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, ArchiveRestore, Eye, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
 import { api, type MyTeam, type TeamHistoryClass, type TeamHistoryList, type TeamHistoryTranscript } from '@/lib/api';
 import { Button } from '@/components/mds';
 import { HistoryPart, historyCategoryLabel as categoryLabel } from '@/components/chat/HistoryPart';
@@ -179,9 +179,9 @@ export function TeamHistoryPage() {
           <section aria-label={msg('conversation')} className="min-w-0 space-y-3 rounded-xl border border-surface-border bg-card p-4">
             {detailLoading && selected && <Loader2 aria-label={msg('loading')} className="mx-auto my-8 size-5 animate-spin" />}
             {!selected && <p className="py-10 text-center text-sm text-muted-foreground">{msg('choose')}</p>}
-            {currentDetail?.messages.map((message, i) => <article key={i} className={cn('max-w-full space-y-1 rounded-xl p-3', message.role === 'assistant' ? 'bg-muted' : 'bg-background')}>
-              <header className="flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"><span>{message.sender_label}</span><time dateTime={message.timestamp}>{formatDate(message.timestamp, intl.locale)}</time></header>
-              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.parts.map((part, n) => <HistoryPart key={n} part={part} />)}</p>
+            {currentDetail?.messages.map((message, i) => <article key={i} className={cn('max-w-full space-y-1 rounded-xl p-3', message.role === 'system' ? 'bg-destructive/10 text-destructive ring-1 ring-inset ring-destructive/20' : message.role === 'assistant' ? 'bg-muted' : 'bg-background')}>
+              <header className="flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"><span>{message.role === 'system' ? msg('systemNotice') : message.sender_label}</span><time dateTime={message.timestamp}>{formatDate(message.timestamp, intl.locale)}</time></header>
+              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.role === 'system' && <AlertTriangle className="mr-1 inline size-3.5" aria-hidden="true" />}{message.parts.map((part, n) => <HistoryPart key={n} part={part} />)}</p>
             </article>)}
           </section>
         </div>

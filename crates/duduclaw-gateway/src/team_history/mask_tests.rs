@@ -288,3 +288,23 @@ fn equal_priority_labels_do_not_depend_on_rule_map_iteration_order() {
         serde_json::to_value(b).unwrap()
     );
 }
+
+#[test]
+fn projected_failure_notice_is_system_status_and_ordinary_control_records_stay_hidden() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "").unwrap();
+    use crate::channel_reply::TurnFailureReason::*;
+    let masker = ViewMasker::for_home(home.path()).unwrap();
+    for language in ["zh-TW", "zh-CN", "en", "ja-JP"] {
+        for reason in [Timeout, Unavailable, Quota, Cancelled, SafetyGate, Internal, Unknown] {
+            let text = reason.text(Some(language));
+            let rows = [row("turn_failure", text), row("system", "PRIVATE CONTROL")];
+            for transcript in [masker.mask_transcript(&rows, &BTreeMap::new(), "Employee").unwrap(), full_transcript(&rows, "User", "Employee").unwrap()] {
+                assert_eq!(transcript.messages.len(), 1);
+                assert_eq!(transcript.messages[0].role, "system");
+                assert!(transcript.messages[0].sender_label.is_empty());
+                assert_eq!(serde_json::to_value(&transcript).unwrap()["messages"][0]["parts"][0]["v"], text);
+            }
+        }
+    }
+}

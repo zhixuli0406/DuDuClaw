@@ -303,7 +303,7 @@ pub(crate) async fn reply_identity_scope<T>(
 }
 
 /// Build an agent reply and retain its source leases through channel send.
-pub async fn build_guarded_reply_for_agent(
+async fn build_guarded_reply_for_agent_inner(
     text: &str,
     ctx: &ReplyContext,
     agent_name: &str,
@@ -339,6 +339,9 @@ pub async fn build_guarded_reply_for_agent(
     };
     let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
     let (enforced, health_blocked) = enforce_contract_with_status(restored, &ctx.home_dir, &agent_id).await;
+    if enforced.trim().is_empty() {
+        super::persist_bound_failure(ctx, TurnFailureReason::Internal).await;
+    }
     let health_outcome = health_outcome.map(|(id, reason)|
         (id, reason.or(enforced.trim().is_empty().then_some("empty_reply"))));
     // The "rules changed / model switched" FYI is for the operator; a public
@@ -388,7 +391,7 @@ pub(super) async fn attach_turn_rollback(
 /// (e.g., the sender's account id — never a shared chat/room id, which would
 /// merge different people into one CCR retrieval scope). This also feeds the
 /// prediction engine's per-user statistical models.
-pub async fn build_guarded_reply_with_session(
+async fn build_guarded_reply_with_session_inner(
     text: &str,
     ctx: &ReplyContext,
     session_id: &str,
@@ -427,6 +430,9 @@ pub async fn build_guarded_reply_with_session(
     };
     let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
     let (enforced, health_blocked) = enforce_contract_with_status(restored, &ctx.home_dir, &agent_id).await;
+    if enforced.trim().is_empty() {
+        super::persist_bound_failure(ctx, TurnFailureReason::Internal).await;
+    }
     let health_outcome = health_outcome.map(|(id, reason)|
         (id, reason.or(enforced.trim().is_empty().then_some("empty_reply"))));
     let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
@@ -537,4 +543,21 @@ pub(super) fn restore_target(who: &crate::trigger_route::AnsweredBy) -> (String,
 #[cfg(test)]
 pub(crate) fn restore_target_for_test(who: &crate::trigger_route::AnsweredBy) -> (String, String) {
     restore_target(who)
+}
+
+/// Observe the complete adapter, including contract enforcement, on every channel.
+pub async fn build_guarded_reply_for_agent(
+    text: &str, ctx: &ReplyContext,
+    agent_name: &str,
+    session_id: &str, user_id: &str, on_progress: Option<ProgressCallback>,
+) -> GuardedReply {
+    super::observe_turn(ctx, Box::pin(build_guarded_reply_for_agent_inner(text, ctx, agent_name, session_id, user_id, on_progress))).await
+}
+
+/// Observe the complete adapter, including contract enforcement, on every channel.
+pub async fn build_guarded_reply_with_session(
+    text: &str, ctx: &ReplyContext,
+    session_id: &str, user_id: &str, on_progress: Option<ProgressCallback>,
+) -> GuardedReply {
+    super::observe_turn(ctx, Box::pin(build_guarded_reply_with_session_inner(text, ctx, session_id, user_id, on_progress))).await
 }

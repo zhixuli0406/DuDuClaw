@@ -1,5 +1,5 @@
 import { useIntl } from 'react-intl';
-import { Eye, Loader2, Plus, RefreshCw, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, Eye, Loader2, Plus, RefreshCw, ShieldCheck } from 'lucide-react';
 import { Button } from '@/components/mds';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -25,14 +25,15 @@ export function ReadOnlyHistoryView() {
         <p className="text-sm text-muted-foreground">{staff?.display_name || data.agent_id} · {channelLabel(data.channel ?? '')}</p>
         <p className="rounded-xl bg-muted/40 p-4 text-sm text-muted-foreground">{msg('description')}</p>
         {data.ner === false && <p className="flex gap-2 rounded-xl border border-amber-500/25 bg-amber-500/5 p-4 text-sm"><ShieldCheck className="mt-0.5 size-4 shrink-0" />{msg('regexOnly')}</p>}
-        <ol className="flex flex-col gap-4">{data.messages.map((message, index) => <li key={index} className="rounded-xl border border-border/60 p-4">
+        <ol className="flex flex-col gap-4">{data.messages.map((message, index) => <li key={index} className={message.notice_kind === 'turn_failure' ? 'rounded-xl border border-destructive/20 bg-destructive/10 p-4 text-destructive' : 'rounded-xl border border-border/60 p-4'}>
+          {message.notice_kind === 'turn_failure' ? <><div className="mb-2 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"><span>{msg('systemNotice')}</span></div><div className="flex items-start gap-1.5 whitespace-pre-wrap break-words text-sm"><AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" /><span>{message.parts?.map((part, n) => <HistoryPart key={n} part={part} showAttachmentNames={false} />)}</span></div></> : <>
           <div className="mb-2 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"><span>{(message.role==='assistant' && staff?.display_name) || message.sender_label || intl.formatMessage({ id: message.role === 'assistant' ? 'boundHistory.staff' : 'boundHistory.customer' })}</span><time>{Number.isFinite(Date.parse(message.timestamp)) ? intl.formatDate(new Date(message.timestamp), { dateStyle: 'medium', timeStyle: 'short' }) : ''}</time></div>
           {message.role === 'assistant' ? (
             <div className="min-w-0 text-sm leading-relaxed">{message.parts?.map((part, n) => part.t === 'text'
               ? <MarkdownContent key={n} text={part.v} />
               : <HistoryPart key={n} part={part} showAttachmentNames={false} />)}</div>
           ) : <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.parts?.map((part, n) => <HistoryPart key={n} part={part} showAttachmentNames={false} />)}</p>}
-        </li>)}</ol>
+        </>}</li>)}</ol>
       </>}
   </section>;
 }

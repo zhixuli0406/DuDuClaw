@@ -1535,12 +1535,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         continue;
                                     }
                                 };
+                                let admission_generation = state.ctx.session_manager.turn_generation(sid).await.ok().flatten();
                                 match Box::pin(state.turns.admit_persistent(
                                     state.approvals.as_ref(), &cancel_principal, &auth_user, sid, conv_nonce.clone(), &msg_id,
                                     turns::configured_limit(&state.ctx.home_dir),
                                     turns::configured_global_limit(&state.ctx.home_dir),
                                 )).await {
-                                    Ok(ticket) => {
+                                    Ok(mut ticket) => {
+                                        ticket.admission_generation = admission_generation;
                                         let validity = state.credential_validity(credential.as_ref(), true).await;
                                         recovery.observe(validity, false);
                                         if !turns::credential_allows_turn(validity, &turn_sink).await {
