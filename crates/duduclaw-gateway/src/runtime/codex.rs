@@ -936,13 +936,19 @@ fn parse_codex_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChun
                 "item.completed" => {
                     // Extract text from message items
                     if let Some(item) = event.extra.get("item") {
+                        if matches!(item.get("phase").and_then(|v| v.as_str()), Some("commentary" | "analysis"))
+                            || item.get("channel").and_then(|v| v.as_str()) == Some("analysis")
+                        {
+                            content.clear();
+                            continue;
+                        }
                         match item.get("type").and_then(|t| t.as_str()) {
                             Some("message") => {
                                 if let Some(text) = item
                                     .get("content")
                                     .and_then(|c| c.as_array())
                                     .and_then(|arr| {
-                                        arr.iter().find(|b| {
+                                        arr.iter().rev().find(|b| {
                                             b.get("type").and_then(|t| t.as_str())
                                                 == Some("output_text")
                                         })
@@ -967,7 +973,7 @@ fn parse_codex_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChun
                                     .get("content")
                                     .and_then(|c| c.as_array())
                                     .and_then(|arr| {
-                                        arr.iter().find(|b| {
+                                        arr.iter().rev().find(|b| {
                                             b.get("type").and_then(|t| t.as_str())
                                                 == Some("output_text")
                                         })
@@ -1063,8 +1069,8 @@ fn parse_codex_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChun
     (content, input_tokens, output_tokens, chunks)
 }
 
-/// Keep completed assistant messages in emission order for a timed-out run.
-/// The normal parser deliberately keeps only the last message; do not change it.
+/// Track completed visible messages for timeout diagnostics. Only the final
+/// assistant segment is eligible as reply text.
 fn completed_codex_messages(stdout: &str) -> Vec<String> {
     stdout.lines().filter_map(|line| {
         let event: CodexEvent = serde_json::from_str(line).ok()?;
@@ -1072,6 +1078,9 @@ fn completed_codex_messages(stdout: &str) -> Vec<String> {
             return None;
         }
         let item = event.extra.get("item")?;
+        if matches!(item.get("phase").and_then(|v| v.as_str()), Some("commentary" | "analysis"))
+            || item.get("channel").and_then(|v| v.as_str()) == Some("analysis")
+        { return None; }
         let kind = item.get("type")?.as_str()?;
         if kind != "agent_message" && kind != "message" {
             return None;
@@ -1082,7 +1091,7 @@ fn completed_codex_messages(stdout: &str) -> Vec<String> {
             item.get("content")?.as_array()?.iter()
                 .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("output_text"))
                 .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                .collect::<Vec<_>>().join("\n")
+                .last().unwrap_or("").to_string()
         };
         (!text.trim().is_empty()).then_some(text)
     }).collect()
@@ -1108,7 +1117,6 @@ struct CodexOutput {
     chunk_bytes: usize,
     completed: Vec<String>,
     completed_bytes: usize,
-    last_line: String,
     status: Option<std::process::ExitStatus>,
 }
 
@@ -1139,7 +1147,6 @@ impl CodexOutput {
             self.truncated = true;
         }
         let line = String::from_utf8_lossy(&line_bytes);
-        self.last_line = line.lines().last().unwrap_or("").to_string();
         // Parse each bounded event as it arrives, even after the raw-output
         // retention cap. In particular, final usage must not disappear merely
         // because earlier tool output consumed the raw-log budget.
@@ -1203,7 +1210,9 @@ impl CodexOutput {
         }
         warn!(timeout_secs, completed_messages = self.completed.len(),
             "Codex CLI hard timeout; returning completed output");
-        Ok(self.completed.join("\n\n"))
+        // The latest assistant event may be blank or reasoning-only; never
+        // revive an older narration just because it was non-empty.
+        Ok(duduclaw_core::think_tags::strip_reasoning_prefix(&self.content))
     }
 }
 
@@ -1867,10 +1876,8 @@ async fn execute_codex_command_with_input(
         };
     }
 
-    if response.content.is_empty() {
-        // Fallback: use the last line as content
-        response.content = output.last_line.clone();
-    }
+    // JSONL metadata/reasoning lines are never fallback answers.
+    response.content = duduclaw_core::think_tags::strip_reasoning_prefix(&response.content);
 
     // Still empty ⇒ FAILURE, not success: Ok("") would be silently dropped
     // by every channel and poison the session with an empty assistant turn.
@@ -2366,7 +2373,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_keeps_all_completed_messages_from_truncated_jsonl() {
+    fn timeout_uses_only_last_assistant_segment_from_truncated_jsonl() {
         let stdout = concat!(
             "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"查詢完成\"}}\n",
             "{\"type\":\"item.started\",\"item\":{\"type\":\"agent_message\",\"text\":\"未完成\"}}\n",
@@ -2374,11 +2381,23 @@ mod tests {
             "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"  \"}}\n",
             "{\"type\":\"item.completed\",\"item\":{"
         );
-        assert_eq!(completed_codex_messages(stdout), vec!["查詢完成", "已整理\n細節"]);
+        assert_eq!(completed_codex_messages(stdout), vec!["查詢完成", "細節"]);
         assert_eq!(collected_fixture(stdout).timeout_content(300).unwrap(),
-            "查詢完成\n\n已整理\n細節");
+            "  ");
         // Normal parsing still returns only the final completed message (even blank).
         assert_eq!(parse_codex_stdout(stdout).0, "  ");
+    }
+
+    #[test]
+    fn reasoning_and_commentary_are_not_final_answers() {
+        let stdout = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"private\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"phase\":\"commentary\",\"text\":\"Let me check\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n"
+        );
+        assert_eq!(parse_codex_stdout(stdout).0, "");
+        assert_eq!(collected_fixture(stdout).content, "");
+        assert!(completed_codex_messages(stdout).is_empty());
     }
 
     #[test]

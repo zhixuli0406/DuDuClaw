@@ -86,6 +86,31 @@ impl ReplyFailure {
             secondary: None,
         }
     }
+    pub(super) fn stop_fallbacks(&self) -> bool {
+        if self.spawn_gate_message().is_some() { return true; }
+        if self.runtime.as_ref().is_some_and(|failure| failure.preflight.is_some()) { return true; }
+        crate::budget::budget_refusal_message(&self.summary).is_some()
+            || matches!(self.summary.as_str(), "cancelled" | "canceled" | "turn cancelled" | "turn canceled")
+    }
+    pub(super) fn retryable_empty(&self) -> bool {
+        if self.stop_fallbacks() { return false; }
+        if let Some(runtime) = &self.runtime {
+            let mut empty = false;
+            for step in &runtime.steps {
+                match &step.outcome {
+                    RuntimeStepOutcome::Empty => empty = true,
+                    RuntimeStepOutcome::ExecutionError(error)
+                        if error.starts_with("Empty response") || error == crate::claude_runner::LOCAL_THINK_ONLY_ERR => empty = true,
+                    RuntimeStepOutcome::NotRegistered | RuntimeStepOutcome::Cooldown
+                    | RuntimeStepOutcome::NoCompatibleModel | RuntimeStepOutcome::CrossFamilyRefused => {}
+                    _ => return false,
+                }
+            }
+            return empty;
+        }
+        self.summary.starts_with("Empty response")
+            || self.summary == crate::claude_runner::LOCAL_THINK_ONLY_ERR
+    }
     pub(super) fn append_direct_api_failure(&mut self, error: String) {
         self.secondary = Some((ReplyOrigin::AnthropicApi, error));
     }
