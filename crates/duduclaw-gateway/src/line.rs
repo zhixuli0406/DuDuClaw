@@ -820,21 +820,18 @@ async fn process_line_events(
                         {
                             // External URL — download directly
                             crate::media::download_url(
-                                &state.http,
                                 url,
                                 None,
                                 crate::media::MAX_FILE_SIZE as usize,
                             )
                             .await
-                            .ok()
                         } else {
                             // LINE-hosted — download via Content API
-                            download_line_content(&state.http, &token, msg_id)
+                            download_line_content(&token, msg_id)
                                 .await
-                                .ok()
                         };
 
-                        if let Some(data) = content_data {
+                        if let Ok(data) = &content_data {
                             // Transcribe voice/audio messages to text.
                             if msg.msg_type == "audio" {
                                 match crate::stt::transcribe_channel_audio(
@@ -879,6 +876,11 @@ async fn process_line_events(
                                 }
                                 Err(e) => warn!("Failed to save LINE {type_label}: {e}"),
                             }
+                        } else if let Err(error) = content_data {
+                            warn!("LINE: attachment download failed: {error}");
+                            attachment_lines.push(crate::media::attachment_download_failed(
+                                msg.file_name.as_deref().unwrap_or(type_label),
+                            ));
                         }
                     }
                 }
@@ -1456,14 +1458,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Download message content (image/video/audio/file) from LINE Content API.
-async fn download_line_content(
-    http: &reqwest::Client,
-    token: &str,
-    message_id: &str,
-) -> Result<Vec<u8>, String> {
+async fn download_line_content(token: &str, message_id: &str) -> Result<Vec<u8>, String> {
     let url = format!("https://api-data.line.me/v2/bot/message/{message_id}/content");
     crate::media::download_url(
-        http,
         &url,
         Some(("Authorization", &format!("Bearer {token}"))),
         crate::media::MAX_FILE_SIZE as usize,

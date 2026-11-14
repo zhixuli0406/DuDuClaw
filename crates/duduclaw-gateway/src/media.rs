@@ -343,20 +343,43 @@ fn data_file_tool_hint(filename: &str) -> &'static str {
     }
 }
 
+/// Whole-request bound for one attachment download (connect, headers, body).
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Connect bound for one attachment download.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Download a file from a URL with an optional auth header.
 ///
-/// URLs are SSRF-validated first — callers pass externally-supplied URLs
-/// (e.g. LINE external content providers), which must never reach internal
-/// hosts or cloud metadata endpoints. Pattern-level check only (the shared
-/// client can't do per-request DNS pinning); fixed API hosts pass unchanged.
+/// Callers pass externally-supplied URLs (e.g. LINE external content
+/// providers), which must never reach internal hosts or cloud metadata
+/// endpoints, so every download:
+///
+/// 1. passes the pattern-level gate [`crate::web_fetch::validate_url`];
+/// 2. resolves the host now through [`crate::web_fetch::resolve_public_addrs`]
+///    (every answer must be public, otherwise the whole answer is refused) and
+///    pins the connection to exactly those addresses, so a DNS rebind between
+///    the check and the dial cannot redirect it;
+/// 3. uses a one-shot client with no redirects and no ambient proxy. A 3xx is
+///    returned as-is and refused by [`check_download_status`]; the auth header
+///    therefore never leaves the origin it was meant for;
+/// 4. reads the body chunk by chunk and aborts as soon as `max_bytes` is
+///    exceeded, whatever `Content-Length` claims.
+///
+/// No channel that calls this is known (in code or comments) to need a
+/// redirect from its media endpoint; if one ever does, it must validate and
+/// re-pin every hop itself rather than loosen this function.
 pub async fn download_url(
-    http: &reqwest::Client,
     url: &str,
     auth_header: Option<(&str, &str)>,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    crate::web_fetch::validate_url(url).map_err(|e| format!("URL blocked: {e}"))?;
-    let mut req = http.get(url);
+    let parsed = crate::web_fetch::validate_url(url).map_err(|e| format!("URL blocked: {e}"))?;
+    let client = pinned_download_client(&parsed).await?;
+    let mut req = client
+        .get(parsed.as_str())
+        // Same defence as web_fetch: a GCP metadata server refuses requests
+        // carrying this header value.
+        .header("Metadata-Flavor", "none");
     if let Some((key, value)) = auth_header {
         req = req.header(key, value);
     }
@@ -365,23 +388,100 @@ pub async fn download_url(
         .await
         .map_err(|e| format!("Download failed: {e}"))?;
 
+    download_response(resp, max_bytes).await
+}
+
+/// A one-shot client for `url`: no redirects, no proxy, and (for a host name)
+/// the connection pinned to the public addresses resolved right now. An IP
+/// literal needs no DNS; `validate_url` has already refused internal ones.
+async fn pinned_download_client(url: &reqwest::Url) -> Result<reqwest::Client, String> {
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL blocked: no port".to_string())?;
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(DOWNLOAD_TIMEOUT)
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT);
+    match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            let addrs = crate::web_fetch::resolve_public_addrs(domain, port)
+                .await
+                .map_err(|e| format!("URL blocked: {e}"))?;
+            builder = builder.resolve_to_addrs(domain, &addrs);
+        }
+        Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => {}
+        None => return Err("URL blocked: missing host".into()),
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Download client unavailable: {e}"))
+}
+
+async fn download_response(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
+    check_download_status(resp.status())?;
+
+    // Early refusal only; the running total below is the real bound because
+    // a chunked response has no length and a declared one may lie.
     if let Some(len) = resp.content_length() {
         if len > max_bytes as u64 {
             return Err(format!("File too large: {len} bytes (max {max_bytes})"));
         }
     }
 
-    let bytes = resp
-        .bytes()
+    let mut body = BoundedBody::new(max_bytes);
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("Download bytes: {e}"))?;
-    if bytes.len() > max_bytes {
-        return Err(format!(
-            "File too large: {} bytes (max {max_bytes})",
-            bytes.len()
-        ));
+        .map_err(|e| format!("Download bytes: {e}"))?
+    {
+        body.push(&chunk)?;
     }
-    Ok(bytes.to_vec())
+    Ok(body.into_inner())
+}
+
+/// Response-body accumulator with a checked running total. The first chunk
+/// that would take the total past `max_bytes` fails the download before it
+/// is copied, so memory never grows past the cap.
+struct BoundedBody {
+    buf: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl BoundedBody {
+    fn new(max_bytes: usize) -> Self {
+        Self { buf: Vec::new(), max_bytes }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
+        let within_cap = self
+            .buf
+            .len()
+            .checked_add(chunk.len())
+            .is_some_and(|total| total <= self.max_bytes);
+        if !within_cap {
+            return Err(format!("File too large: more than {} bytes", self.max_bytes));
+        }
+        self.buf.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+fn check_download_status(status: reqwest::StatusCode) -> Result<(), String> {
+    if status.is_success() {
+        Ok(())
+    } else {
+        tracing::warn!(status = status.as_u16(), "Attachment download rejected by HTTP status");
+        Err("附件下載失敗，伺服器未回傳成功狀態。".into())
+    }
+}
+
+pub(crate) fn attachment_download_failed(filename: &str) -> String {
+    format!("[附件「{filename}」下載失敗]")
 }
 
 /// Infer media type from MIME string.
@@ -487,6 +587,151 @@ mod tests {
             "圖片無法在隔離環境中完成轉換。");
         let legacy = resize_image_with_isolation(&bytes, 1, false).unwrap();
         assert_eq!(detect_mime(&legacy), "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn download_response_never_returns_provider_error_body_as_attachment() {
+        for code in [302, 403, 404, 429, 500] {
+            let response = reqwest::Response::from(axum::http::Response::builder()
+                .status(code).body("private provider error body").unwrap());
+            let error = download_response(response, 1024).await.unwrap_err();
+            assert!(!error.contains("private provider"));
+            assert!(error.contains("下載失敗"));
+        }
+        let response = reqwest::Response::from(axum::http::Response::builder()
+            .status(200).body("attachment bytes").unwrap());
+        assert_eq!(download_response(response, 1024).await.unwrap(), b"attachment bytes");
+        let response = reqwest::Response::from(axum::http::Response::builder()
+            .status(200).body("too large").unwrap());
+        assert!(download_response(response, 2).await.is_err());
+    }
+
+    #[test]
+    fn bounded_body_refuses_the_chunk_that_crosses_the_cap() {
+        let mut body = BoundedBody::new(8);
+        body.push(b"1234").unwrap();
+        body.push(b"5678").unwrap();
+        // Exactly at the cap is fine; one more byte is not, and the refused
+        // chunk is never copied.
+        assert!(body.push(b"9").is_err());
+        assert_eq!(body.into_inner(), b"12345678");
+        let mut huge = BoundedBody::new(usize::MAX);
+        huge.push(b"x").unwrap();
+        assert!(huge.push(&[]).is_ok());
+    }
+
+    /// One-shot local HTTP fixture: answers every connection with `respond`
+    /// and counts the requests it saw.
+    async fn spawn_fixture<F>(respond: F) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(usize, u16) -> Vec<Vec<u8>> + Send + Sync + 'static,
+    {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buffer[..n]),
+                    }
+                }
+                let index = seen.fetch_add(1, Ordering::SeqCst);
+                for part in respond(index, local.port()) {
+                    if stream.write_all(&part).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+        (local, requests, server)
+    }
+
+    fn chunked_parts(chunk: usize, count: usize) -> Vec<Vec<u8>> {
+        let mut parts = vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec()];
+        for _ in 0..count {
+            let mut part = format!("{chunk:x}\r\n").into_bytes();
+            part.extend(std::iter::repeat_n(b'a', chunk));
+            part.extend_from_slice(b"\r\n");
+            parts.push(part);
+        }
+        parts.push(b"0\r\n\r\n".to_vec());
+        parts
+    }
+
+    #[tokio::test]
+    async fn download_url_streams_chunked_body_and_aborts_past_the_cap() {
+        let (local, _, server) = spawn_fixture(|_, _| chunked_parts(1024, 256)).await;
+        let host = "m4-chunked.example.net";
+        crate::web_fetch::test_dns::answer_unvetted(host, vec![local]);
+        let url = format!("http://{host}:{}/file", local.port());
+        // 256 KiB announced without Content-Length; the cap is 4 KiB.
+        let error = download_url(&url, None, 4096).await.unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+        // The same stream under a generous cap arrives intact.
+        let bytes = download_url(&url, None, 512 * 1024).await.unwrap();
+        assert_eq!(bytes.len(), 256 * 1024);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_url_never_follows_a_redirect() {
+        let host = "m3-redirect.example.net";
+        let (local, requests, server) = spawn_fixture(move |index, port| {
+            if index == 0 {
+                vec![format!("HTTP/1.1 302 Found\r\nLocation: http://{host}:{port}/followed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()]
+            } else {
+                vec![b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfollowed".to_vec()]
+            }
+        }).await;
+        crate::web_fetch::test_dns::answer_unvetted(host, vec![local]);
+        let url = format!("http://{host}:{}/start", local.port());
+        let error = download_url(&url, Some(("Authorization", "Bearer secret")), 1024).await.unwrap_err();
+        assert!(error.contains("下載失敗"), "{error}");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1, "the Location was not fetched");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_url_refuses_a_name_that_resolves_to_an_internal_address() {
+        let (local, requests, server) = spawn_fixture(|_, _| {
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecret".to_vec()]
+        }).await;
+        for (host, addr) in [
+            ("m3-rebind-loopback.example.net", local),
+            ("m3-rebind-metadata.example.net", "169.254.169.254:80".parse().unwrap()),
+            ("m3-rebind-private.example.net", "10.0.0.5:80".parse().unwrap()),
+        ] {
+            // The screened answer: the public-address check still applies.
+            crate::web_fetch::test_dns::answer(host, vec![addr]);
+            let url = format!("http://{host}:{}/file", local.port());
+            let error = download_url(&url, None, 1024).await.unwrap_err();
+            assert!(error.starts_with("URL blocked"), "{host}: {error}");
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing was dialled");
+        // Literal internal addresses stay refused by the pattern gate.
+        assert!(download_url("http://127.0.0.1:1/x", None, 1024).await.is_err());
+        assert!(download_url("http://169.254.169.254/latest", None, 1024).await.is_err());
+        server.abort();
+    }
+
+    #[test]
+    fn download_status_rejects_error_and_redirect_bodies() {
+        for code in [301, 302, 400, 403, 404, 429, 500, 503] {
+            let error = check_download_status(reqwest::StatusCode::from_u16(code).unwrap()).unwrap_err();
+            assert_eq!(error, "附件下載失敗，伺服器未回傳成功狀態。");
+        }
+        for code in [200, 201, 204, 206] {
+            assert!(check_download_status(reqwest::StatusCode::from_u16(code).unwrap()).is_ok());
+        }
     }
 
     #[test]

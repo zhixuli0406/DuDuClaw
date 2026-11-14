@@ -1536,7 +1536,6 @@ async fn handle_message_create(
             let download = tokio::time::timeout(
                 DISCORD_ATTACHMENT_TIMEOUT,
                 crate::media::download_url(
-                    &ctx.http,
                     url,
                     None,
                     crate::media::MAX_FILE_SIZE as usize,
@@ -1562,7 +1561,7 @@ async fn handle_message_create(
                 }
                 Err(e) => {
                     warn!("Discord: failed to download attachment {filename}: {e}");
-                    attachment_lines.push(format!("[Attached file: {filename}]({url})"));
+                    attachment_lines.push(crate::media::attachment_download_failed(filename));
                 }
             }
         }

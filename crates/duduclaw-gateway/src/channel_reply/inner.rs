@@ -1627,6 +1627,11 @@ pub(super) async fn build_reply_with_session_inner(
         default_language.as_deref(),
     );
 
+    let effective_message = super::prompt_build::with_file_delivery_reminder(
+        effective_message,
+        session_id.split(':').next().unwrap_or("unknown"),
+    );
+
     // #12 glue (2026-05-12) — request-boundary budget enforcement.
     //
     // Read the agent's `[budget] max_input_tokens` (0 = disabled,

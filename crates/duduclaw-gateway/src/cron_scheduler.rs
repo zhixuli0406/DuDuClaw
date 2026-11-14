@@ -1354,10 +1354,31 @@ async fn deliver_cron_result(
     // need a shared pool.
     let http = reqwest::Client::new();
     let sender = crate::channel_sender::create_sender_for_home(home_dir, &target, http);
+    let body = prepare_cron_message(home_dir, task, response, sender.as_ref()).await;
     sender
         .send_text(&body)
         .await
         .map_err(|e| format!("send_text failed: {e}"))
+}
+
+async fn prepare_cron_message(
+    home_dir: &Path,
+    task: &CronTaskRow,
+    response: &str,
+    sender: &dyn crate::channel_sender::ChannelSender,
+) -> String {
+    // Process complete marker lines before clamping, including markers beyond
+    // the text limit. Path validation remains in the ordinary reply pipeline.
+    let delivered = crate::office_docs::process_deliverables(
+        response, &home_dir.join("agents").join(&task.agent_id), home_dir, sender,
+    ).await;
+    const MAX_CHARS: usize = 3500;
+    let message = if delivered.chars().count() > MAX_CHARS {
+        format!("{}\n[…truncated]", delivered.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        delivered
+    };
+    format!("⏰ [{}] {}", task.name, message)
 }
 
 /// RM-124: append a cron result to the WebChat conversation that created
@@ -1370,10 +1391,15 @@ async fn deliver_cron_result_webchat(
     session: &str,
     response: &str,
 ) -> Result<(), String> {
-    let body = crate::scheduled_webchat::format_body(&task.name, response);
     let result = match crate::recipient_guard::admit_scheduled_session(home_dir, &task.agent_id, session).await {
         Err(reason) => Err(reason),
-        Ok(()) => crate::scheduled_webchat::deliver(home_dir, &task.agent_id, session, &body).await,
+        Ok(()) => {
+            let response = crate::office_docs::process_history_deliverables(
+                response, &home_dir.join("agents").join(&task.agent_id), home_dir,
+            ).await;
+            let body = crate::scheduled_webchat::format_body(&task.name, &response);
+            crate::scheduled_webchat::deliver(home_dir, &task.agent_id, session, &body).await
+        }
     };
     if let Err(reason) = &result {
         crate::scheduled_webchat::audit_drop(home_dir, &task.agent_id, "cron", &task.id, reason);
@@ -1658,6 +1684,22 @@ mod principal_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cron_delivery_strips_markers_before_text_clamp() {
+        let home = tempfile::tempdir().unwrap();
+        let task = CronTaskRow::new("test".into(), "報告".into(), "worker".into(),
+            "0 9 * * *".into(), "test".into());
+        let raw = "/private/operator/report.pdf";
+        for response in [format!("完成\n📎DELIVER:{raw}"),
+            format!("{}\n📎DELIVER:{raw}", "文".repeat(3600))] {
+            let body = prepare_cron_message(home.path(), &task, &response, &crate::channel_sender::NullSender).await;
+            assert!(!body.contains("DELIVER:"));
+            assert!(!body.contains("/private/operator"));
+            assert!(body.starts_with("⏰ [報告]"));
+        }
+    }
+
 
     #[test]
     fn cron_next_run_matches_scheduler_in_taipei_and_new_york() {

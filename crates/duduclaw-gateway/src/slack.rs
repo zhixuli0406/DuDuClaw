@@ -908,7 +908,6 @@ async fn handle_event(
             let filename = f.get("name").and_then(|v| v.as_str()).unwrap_or("file");
             let mt = crate::media::media_type_from_mime(mime);
             match crate::media::download_url(
-                http,
                 url,
                 Some(("Authorization", &format!("Bearer {bot_token}"))),
                 crate::media::MAX_FILE_SIZE as usize,
@@ -924,7 +923,10 @@ async fn handle_event(
                         Err(e) => warn!("Slack: failed to save attachment {filename}: {e}"),
                     }
                 }
-                Err(e) => warn!("Slack: failed to download attachment {filename}: {e}"),
+                Err(e) => {
+                    warn!("Slack: attachment download failed: {e}");
+                    attachment_lines.push(crate::media::attachment_download_failed(filename));
+                }
             }
         }
     }
