@@ -196,7 +196,7 @@ async fn frame(socket: &mut Socket) -> Value {
             {
                 WireMessage::Text(text) => {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["type"] == "turn_accepted" { continue; }
+                    if matches!(value["type"].as_str(), Some("turn_accepted" | "turn_queued" | "turn_merged" | "turn_consumed")) { continue; }
                     return value;
                 },
                 WireMessage::Ping(data) => socket.send(WireMessage::Pong(data)).await.unwrap(),
@@ -274,6 +274,10 @@ async fn exercise(mut fixture: Fixture) {
     let limited = frame(&mut second).await;
     assert_eq!(limited["type"], "error");
     assert_eq!(limited["code"], "turn_limit");
+    assert_eq!(limited["admission"]["reason"], "user_limit");
+    assert_eq!(limited["admission"]["limit"], 3);
+    assert_eq!(limited["admission"]["running"], 2);
+    assert_eq!(limited["admission"]["queued"], 1);
     assert_eq!(limited["request_id"], "c1");
     assert_eq!(limited["msg_id"], "c1");
     assert_eq!(limited["conv"], "c");

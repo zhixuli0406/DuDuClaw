@@ -197,7 +197,7 @@ fn is_progress(value: &serde_json::Value) -> bool {
 
 fn is_terminal(value: &serde_json::Value) -> bool {
     matches!(value.get("type").and_then(serde_json::Value::as_str),
-        Some("assistant_done" | "error" | "cancelled" | "no_reply"))
+        Some("assistant_done" | "error" | "cancelled" | "no_reply" | "turn_consumed"))
 }
 
 #[derive(Clone)]
@@ -207,6 +207,7 @@ pub(in crate::webchat) struct TurnSink {
     conv: Option<String>,
     pub(in crate::webchat) msg_id: String,
     wait_ack: bool,
+    outcome: Arc<Mutex<super::MergedOutcome>>,
     route: Option<subscriptions::Route>,
     pub(in crate::webchat) progress_dropped: Arc<AtomicU64>,
 }
@@ -214,8 +215,12 @@ pub(in crate::webchat) struct TurnSink {
 impl TurnSink {
     pub(in crate::webchat) fn new(tx: OutboundSender, sid: &str, conv: Option<String>, msg_id: &str) -> Self {
         Self { tx, sid: sid.into(), conv, msg_id: msg_id.into(), wait_ack: false, route: None,
-            progress_dropped: Arc::new(AtomicU64::new(0)) }
+            progress_dropped: Arc::new(AtomicU64::new(0)), outcome: Arc::new(Mutex::new(super::MergedOutcome::Failed)) }
     }
+
+    pub(super) fn outcome(&self) -> super::MergedOutcome { *self.outcome.lock().unwrap() }
+
+    pub(super) fn complete(&self) { *self.outcome.lock().unwrap() = super::MergedOutcome::Done; }
 
     pub(super) fn routed(mut self, route: subscriptions::Route) -> Self {
         self.route = Some(route);
@@ -259,6 +264,10 @@ impl TurnSink {
 
     fn envelope(&self, mut value: serde_json::Value) -> Message {
         if is_terminal(&value) {
+            *self.outcome.lock().unwrap() = match value["type"].as_str() {
+                Some("error") if value["code"] == "cancelled" => super::MergedOutcome::Cancelled,
+                _ => super::MergedOutcome::Failed,
+            };
             self.tx.finish_progress(&self.progress_dropped);
             let dropped = self.progress_dropped.load(Ordering::Relaxed);
             value["progress_dropped"] = serde_json::json!(dropped);

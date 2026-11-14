@@ -997,21 +997,48 @@ pub(super) async fn build_reply_with_session_inner(
     };
 
     // Append user message to session using improved CJK-aware token estimate
-    let user_tokens = estimate_tokens(&sanitized_text);
     let client_msg_id = super::WEBCHAT_TURN_DELIVERY.try_with(|turn| turn.client_msg_id.clone()).ok();
-    let user_message_id = match session_mgr
-        .append_delivery_message_in(
-            session_id, "user", &sanitized_text, user_tokens, client_msg_id.as_deref(), false,
+    let originals = super::WEBCHAT_ORIGINAL_MESSAGES.try_with(Clone::clone).unwrap_or_default();
+    let merged_dispatch = !originals.is_empty();
+    let mut history_rows = Vec::new();
+    for (msg_id, original) in originals {
+        let credential_text = crate::credential_ledger::process_message(
+            &ctx.home_dir, &original, &credential_source, &credential_sender, &agent_id, "chat",
+        ).await;
+        let original = match crate::redaction_sources::redact_text(
+            ctx.redaction_manager.as_ref(), &agent_id, Some(session_id), &credential_text,
+            &duduclaw_redaction::Source::UserChannelInput {
+                channel_id: session_id.split(':').next().unwrap_or("").to_string(),
+            },
+        ) {
+            Ok(text) => text,
+            Err(_) => return REDACTION_FAILED_REPLY.to_string(),
+        };
+        let original = if original.starts_with("assistant:") || original.starts_with("system:") {
+            format!("[user input] {original}")
+        } else { original };
+        let original = if user_id != "anonymous" && !user_id.is_empty() {
+            format!("{SENDER_PREFIX_OPEN}{user_id}]\n{original}")
+        } else { original };
+        history_rows.push((Some(msg_id), original));
+    }
+    if history_rows.is_empty() { history_rows.push((client_msg_id, sanitized_text.clone())); }
+    let mut user_message_id = None;
+    for (msg_id, row) in history_rows {
+        match session_mgr.append_delivery_message_in(
+            session_id, "user", &row, estimate_tokens(&row), msg_id.as_deref(), false,
             turn_generation.as_deref(),
-        )
-        .await
-    {
-        Ok(id) => Some(id),
-        Err(e) => {
-            warn!("Failed to save user message to session: {e}");
-            None
+        ).await {
+            Ok(id) => {
+                if user_message_id.is_none() { user_message_id = Some(id); }
+                crate::credential_ledger::bind_message(&ctx.home_dir, &credential_source, session_id, id);
+            }
+            Err(e) => {
+                warn!("Failed to save user message to session: {e}");
+                if merged_dispatch { return "Unable to save this message. Please try again.".to_string(); }
+            }
         }
-    };
+    }
     if let Some(id) = user_message_id {
         if let Some(generation) = turn_generation.as_deref() {
             super::bind_failure_session(session_id, generation, &agent_id);

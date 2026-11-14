@@ -60,6 +60,9 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     // to the prompt — the agent (Claude CLI) reads them from
     // disk, exactly as channel attachments are handled.
     let mut full_content = content.clone();
+    let mut originals: Vec<(String, String)> = if ticket.merged.is_empty() { Vec::new() } else {
+        ticket.originals.iter().map(|(id, text, _)| (id.clone(), text.clone())).collect()
+    };
     if !attachments.is_empty() {
         // WP1.3: land inbound files under the resolved agent's dir.
         let attach_base = crate::channel_reply::resolve_attachment_base(
@@ -83,6 +86,14 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
             }
         };
         if !refs.is_empty() {
+            let mut references = refs.iter();
+            for ((_, text), (_, _, count)) in originals.iter_mut().zip(&ticket.originals) {
+                let own_refs = references.by_ref().take(*count).cloned().collect::<Vec<_>>().join("\n");
+                if !own_refs.is_empty() {
+                    if !text.trim().is_empty() { text.push_str("\n\n"); }
+                    text.push_str(&own_refs);
+                }
+            }
             if !full_content.trim().is_empty() {
                 full_content.push_str("\n\n");
             }
@@ -264,7 +275,8 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         state: state.clone(), user: auth_user.clone(), client_msg_id: sink.msg_id.clone(), accepted: accepted_tx,
         refused: Arc::new(AtomicBool::new(false)),
     };
-    let work = crate::channel_reply::WEBCHAT_TURN_DELIVERY.scope(delivery.clone(), work);
+    let work = crate::channel_reply::WEBCHAT_ORIGINAL_MESSAGES.scope(originals,
+        crate::channel_reply::WEBCHAT_TURN_DELIVERY.scope(delivery.clone(), work));
     tokio::pin!(work);
     // The model the backend ACTUALLY answered with
     // (ProgressEvent::ModelInfo) — stamped onto the
@@ -572,6 +584,7 @@ async fn send_terminal(
             .and_then(|value| value.get("content").and_then(|v| v.as_str()).map(str::to_owned)),
         _ => None,
     };
+    let has_reply = content.is_some();
     if let Some(content) = content {
         if guarded.persist_webchat(&state.ctx.session_manager, sid, &content).await.is_err() {
             rollback_owned_webchat_archives(owned_archives).await;
@@ -612,5 +625,6 @@ async fn send_terminal(
         _ => { guarded.refuse_delivery(); Err(()) }
     };
     if published.is_err() { rollback_owned_webchat_archives(owned_archives).await; }
+    if published.is_ok() && has_reply { sink.complete(); }
     published
 }
