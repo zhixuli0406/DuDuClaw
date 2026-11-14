@@ -1572,12 +1572,22 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             content, attachments, assign_event, arrival_seq,
                                             resume_acl: resume_acl || routed.called,
                                         };
+                                        ticket.stage(&input);
                                         ticket.set_origin(input.effective_agent.as_deref().unwrap_or(&input.agent_id), &user_id);
+                                        if let Some(notice) = ticket.queue_notice(turns::configured_limit(&state.ctx.home_dir)) {
+                                            turn_sink.value(serde_json::json!({"type":"turn_queued", "admission":notice})).await;
+                                        }
                                         subscription.subscribe(sid, input.conv_nonce.clone());
                                         tokio::spawn(turns::execute(input, turn_sink, ticket));
                                     }
-                                    Err(code) => {
-                                        let value = turn_admission_error(code, sid, conv_nonce.as_deref(), &msg_id);
+                                    Err(error) => {
+                                        let employee = effective_agent.as_deref().unwrap_or(&agent_id);
+                                        // Ordinary gateway event log, never the hash-chained security audit.
+                                        error.log_refusal(&auth_user, employee);
+                                        let mut value = turn_admission_error(error.code(), sid, conv_nonce.as_deref(), &msg_id);
+                                        if !is_widget_visitor(&auth_user) && !sid.starts_with("odoolivechat:") {
+                                            value["admission"] = serde_json::to_value(&error).unwrap();
+                                        }
                                         let _ = out_tx.send(turns::Outbound { route: None, identity_notice: None, message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
                                     }
                                 }
@@ -1589,9 +1599,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let accepted = state.turns.cancel(
                                     &auth_user, cancel_sid.as_deref(), conv.as_deref(), msg_id.as_deref(),
                                     Some(&request_id),
-                                ).is_ok();
-                                let value = if accepted {
-                                    serde_json::json!({"type":"cancel_accepted", "request_id":request_id})
+                                );
+                                let value = if let Ok(outcome) = accepted {
+                                    serde_json::json!({"type":"cancel_accepted", "request_id":request_id,
+                                        "session_id":cancel_sid, "conv":conv, "msg_id":msg_id, "cancel_outcome":outcome})
                                 } else {
                                     serde_json::json!({"type":"error", "code":"turn_not_found",
                                         "message":"Pending conversation not found or ambiguous", "request_id":request_id})

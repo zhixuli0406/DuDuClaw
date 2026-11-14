@@ -54,6 +54,8 @@ pub(crate) struct WebChatTurnDelivery {
 
 tokio::task_local! {
     pub(crate) static WEBCHAT_TURN_DELIVERY: WebChatTurnDelivery;
+    /// Original client messages of a merged dispatch, in arrival order.
+    pub(crate) static WEBCHAT_ORIGINAL_MESSAGES: Vec<(String, String)>;
 }
 
 pub(super) async fn webchat_commit_allowed(agent: &str) -> bool {

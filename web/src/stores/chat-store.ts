@@ -66,6 +66,8 @@ export interface ChatMessage {
   readonly turnId?: string;
   readonly delivery?: 'queued' | 'running' | 'done' | 'cancelled' | 'failed';
   readonly deliveryError?: string;
+  readonly deliveryNotice?: string;
+  readonly mergedInto?: string;
   /** Transport progress was lost; a correlated late reply can still complete it. */
   readonly interrupted?: boolean;
   readonly liveActivity?: TurnActivity;
@@ -447,7 +449,8 @@ export function shouldRenderChatFrame(
   if (frame.type === 'error' && (frame.code === 'turn_limit' || frame.code === 'identity_unavailable') && !msg) return false;
   if (conv && conv !== current.convId) return false;
   if (msg && msg !== current.activeMessageId && !current.messages?.some(m =>
-    m.role === 'user' && m.turnId === msg && (m.delivery === 'queued' || m.delivery === 'running' || m.interrupted))) return false;
+    m.role === 'user' && m.turnId === msg && (m.delivery === 'queued' || m.delivery === 'running' || m.interrupted
+      || (m.delivery === 'cancelled' && frame.type === 'error' && (frame.code === 'cancelled' || frame.code === 'cancel_failed'))))) return false;
   if (conv || msg) return true;
   if (frame.type !== 'session_info' && typeof frame.session_id === 'string' && frame.session_id) {
     const composed = current.resumedExplicitly
@@ -460,14 +463,32 @@ export function shouldRenderChatFrame(
 
 /** Insert a reply beside its user message, even with later queued turns. */
 function replySlot(messages: readonly ChatMessage[], turnId: string | null): number {
-  const user = messages.findIndex(m => m.role === 'user' && m.turnId === turnId);
+  const user = messages.findLastIndex(m => m.role === 'user' && (m.turnId === turnId || m.mergedInto === turnId));
   if (user < 0) return messages.length - (messages.at(-1)?.role === 'assistant' ? 1 : 0);
   return user + 1;
 }
 
 function finishMessage(messages: readonly ChatMessage[], turnId: string | null, delivery: 'done' | 'failed' | 'cancelled') {
-  return messages.map(m => m.role === 'user' && m.turnId === turnId ? { ...m, delivery, liveActivity: undefined,
+  return messages.map(m => m.role === 'user' && (m.turnId === turnId || m.mergedInto === turnId) ? { ...m, delivery, liveActivity: undefined,
     ...(m.interrupted ? { interrupted: undefined, deliveryError: undefined } : {}) } : m);
+}
+
+/** Closed wire reasons map to public, localized copy only. */
+export function admissionText(admission: unknown): string {
+  if (!admission || typeof admission !== 'object') return lookupMessage('webchat.turnLimit');
+  const detail = admission as Record<string, unknown>;
+  const keys: Record<string, string> = {
+    user_limit: 'userLimit', global_limit: 'globalLimit', cancel_quota: 'cancelQuota',
+    store_unavailable: 'storeUnavailable', config_invalid: 'configInvalid', conversation_queue: 'conversationQueue',
+  };
+  const key = typeof detail.reason === 'string' ? keys[detail.reason] : undefined;
+  if (!key) return lookupMessage('webchat.turnLimit');
+  let text = lookupMessage(`webchat.admission.${key}`);
+  for (const field of ['limit', 'running', 'queued']) {
+    const count = detail[field];
+    text = text.replace(`{${field}}`, typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? String(count) : '—');
+  }
+  return text;
 }
 
 /** The wire shape of one message returned by `chat.sessions.history`. */
@@ -533,6 +554,7 @@ export function isResumeNotFound(message: string | null | undefined): boolean {
 // Module-level WebSocket reference — kept outside Zustand to avoid
 // serialization issues and enable reconnection logic.
 let wsRef: WebSocket | null = null;
+const pendingCancels = new Map<string, { msg: string; conv: string }>();
 
 // True between "user message sent" and "first server frame for that turn".
 // The first frame confirms the server has persisted the user message, so the
@@ -707,6 +729,26 @@ export const useChatStore = create<ChatStore>((set, get) => {
         if (data.type === 'assistant_done' && data.session_id === get().sessionId) {
           set(state => ({ historyReplyRevision: state.historyReplyRevision + 1 }));
         }
+        if (data.type === 'cancel_accepted') {
+          const pending = pendingCancels.get(data.request_id);
+          pendingCancels.delete(data.request_id);
+          // Match a local request as well as its conversation, never the foreground fallback.
+          if (!pending || pending.conv !== get().convId) return;
+          const message = get().messages.find(m => m.role === 'user' && m.turnId === pending.msg);
+          if (!message || !['queued', 'running'].includes(message.delivery ?? '')) return;
+          const waiting = data.cancel_outcome ? data.cancel_outcome === 'waiting' : message.delivery === 'queued';
+          set(state => {
+            const messages = finishMessage(state.messages, pending.msg, 'cancelled').map(m =>
+              m.role === 'user' && m.turnId === pending.msg ? { ...m,
+                deliveryError: lookupMessage(waiting ? 'webchat.cancelledWaiting' : 'webchat.stoppedRunning') } : m);
+            return { messages,
+              ...(state.activeMessageId === pending.msg || !state.activeMessageId
+                ? remainingActivity(messages, 'done') : {}),
+            };
+          });
+          if (!get().isStreaming) clearVisemeIdle();
+          return;
+        }
         if (!shouldRenderChatFrame(data, get())) {
           if (isOtherConversationFailure(data, get())) toast.info(lookupMessage('chat.otherConversationFailed'));
           return;
@@ -719,7 +761,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         const frameTurnId = data.type === 'error' && ['turn_limit', 'identity_unavailable'].includes(data.code)
           ? data.request_id ?? data.msg_id : data.msg_id;
         const targetTurnId = typeof frameTurnId === 'string' ? frameTurnId : get().activeMessageId;
-        if ((IN_TURN_FRAME_TYPES.has(data.type) || data.type === 'assistant_done') && targetTurnId) {
+        if ((IN_TURN_FRAME_TYPES.has(data.type) || data.type === 'assistant_done' || data.type === 'turn_merged') && targetTurnId) {
           recoveringTurns.delete(targetTurnId);
           if (!recoveringTurns.size) clearTurnRecovery();
           const user = get().messages.find(m => m.role === 'user' && m.turnId === targetTurnId);
@@ -742,6 +784,26 @@ export const useChatStore = create<ChatStore>((set, get) => {
           set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
         }
         switch (data.type) {
+          case 'turn_consumed': {
+            const delivery = data.outcome === 'done' ? 'done' : data.outcome === 'cancelled' ? 'cancelled' : 'failed';
+            set(state => {
+              const messages = finishMessage(state.messages, targetTurnId, delivery);
+              return { messages, ...remainingActivity(messages, delivery === 'failed' ? 'error' : 'done') };
+            });
+            if (!get().isStreaming) clearVisemeIdle();
+            break;
+          }
+          case 'turn_queued': {
+            set(state => ({ messages: state.messages.map(m => m.role === 'user' && m.turnId === targetTurnId
+              ? { ...m, delivery: 'queued' as const, deliveryNotice: admissionText(data.admission) } : m) }));
+            break;
+          }
+          case 'turn_merged': {
+            const ids = Array.isArray(data.merged_msg_ids) ? data.merged_msg_ids.filter((id: unknown) => typeof id === 'string') : [];
+            set(state => ({ messages: state.messages.map(m => m.role === 'user' && m.turnId && ids.includes(m.turnId)
+              ? { ...m, mergedInto: targetTurnId ?? undefined, delivery: 'running' as const } : m) }));
+            break;
+          }
           case 'turn_accepted': {
             if (typeof data.msg_id === 'string' && Number.isSafeInteger(data.user_row_id) && data.user_row_id > 0) {
               set(state => ({ messages: state.messages.map(message =>
@@ -973,14 +1035,15 @@ export const useChatStore = create<ChatStore>((set, get) => {
             if (targetTurnId && !isResumeNotFound(data.message)) {
               set(state => {
                 const accessKey = chatAccessMessageKey(data.code, data.reason);
-                const error = data.code === 'turn_limit' ? lookupMessage('webchat.turnLimit')
+                const error = data.code === 'turn_limit' ? admissionText(data.admission)
+                  : data.code === 'cancelled' ? lookupMessage(data.cancel_outcome === 'waiting' ? 'webchat.cancelledWaiting' : 'webchat.stoppedRunning')
                   : data.code === 'attachment_upload_refused' ? lookupMessage('webchat.attachmentUploadRefused')
                   : accessKey ? lookupMessage(accessKey) : mentionErrorText(data) ?? data.message;
                 const messages = finishMessage(state.messages, targetTurnId, data.code === 'cancelled' ? 'cancelled' : 'failed')
-                  .map(m => m.role === 'user' && m.turnId === targetTurnId ? { ...m, ...(data.code === 'turn_limit' ? { deliveryError: error } : {}) } : m);
+                  .map(m => m.role === 'user' && m.turnId === targetTurnId ? { ...m, ...(['turn_limit', 'cancelled'].includes(data.code) ? { deliveryError: error } : {}) } : m);
                 // Admission errors are shown on the retained user bubble. Other
                 // terminal notices follow this turn's reply, before queued users.
-                if (data.code !== 'turn_limit') {
+                if (data.code !== 'turn_limit' && data.code !== 'cancelled') {
                   const slot = replySlot(messages, targetTurnId);
                   messages.splice(slot + (messages[slot]?.role === 'assistant' ? 1 : 0), 0,
                     { id: nextId(), role: 'system', content: error, timestamp: Date.now() });
@@ -1027,7 +1090,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   role: 'system',
                   // `@` refusals and choices arrive as codes and are worded
                   // in the viewer's language here.
-                  content: (chatAccessMessageKey(data.code, data.reason)
+                  content: data.code === 'cancelled'
+                    ? lookupMessage(data.cancel_outcome === 'waiting' ? 'webchat.cancelledWaiting' : 'webchat.stoppedRunning')
+                    : (chatAccessMessageKey(data.code, data.reason)
                     ? lookupMessage(chatAccessMessageKey(data.code, data.reason)!) : null)
                     ?? mentionErrorText(data) ?? data.message,
                   timestamp: Date.now(),
@@ -1284,7 +1349,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
     cancel: (msgId = get().activeMessageId ?? undefined) => {
       if (!msgId || !wsRef || wsRef.readyState !== WebSocket.OPEN) return;
-      wsRef.send(JSON.stringify({ type: 'cancel', request_id: newClientMessageId(),
+      const requestId = newClientMessageId();
+      if (pendingCancels.size >= 64) pendingCancels.delete(pendingCancels.keys().next().value!);
+      pendingCancels.set(requestId, { msg: msgId, conv: get().convId });
+      wsRef.send(JSON.stringify({ type: 'cancel', request_id: requestId,
         conv: get().convId, msg_id: msgId }));
     },
 
