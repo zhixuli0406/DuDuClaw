@@ -130,6 +130,8 @@ allowed_subject_domains = ["customer.com"]
 
 網站的公開訪客（WebChat 小工具、Odoo 線上客服）在任何設定下都會被拒。沒有綁定帳號的通道發話者，除非設成 `anyone`，否則也會被拒。
 
+**Google Chat 的發話者（v1.82）**：管理員在 **使用者 → 驗證身分** 綁定了他的 Chat 使用者代號，或——僅在管理員開啟預設關閉的選用設定 `[google] chat_identity_from_account`（管理 → 整合 → Google）時——同仁在 **我的連線** 連結了自己的 Google 帳號（以 Google 帳號代號比對；這項自動認出**尚未以真實 Google Workspace 驗證**，除非您已在自己的 Workspace 確認兩種代號一致，否則請保持關閉）時，這裡就把他當成該同仁本人。不做 Email 比對。v1.82 以前所有 Chat 發話者都算沒有綁定，只有 `anyone` 會放行。詳見 [儀表板設定 → 使用者 → 驗證身分](dashboard-settings.md#使用者--驗證身分通訊軟體身分v182)。
+
 ### 用不了的時候
 
 工具呼叫會失敗，並說明原因和誰能處理，不會悄悄改用公司共用帳號。可能的原因：呼叫者不是通過驗證的員工；發問者沒有權限；信箱不在允許的網域；那位同事的 DuDuClaw 帳號已停權或離職；憑證保護還沒就緒（或保護金鑰被換掉，封存的金鑰解不開，要重設憑證保護後重新匯入金鑰）；還沒匯入金鑰；Google 拒絕委派（`unauthorized_client` 通常是管理控制台的權限清單少了幾項，`invalid_grant` 是帳號不存在或已停用）；DuDuClaw 主程式沒有在執行。

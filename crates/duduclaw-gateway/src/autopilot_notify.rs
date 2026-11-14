@@ -53,8 +53,8 @@ use tracing::info;
 use crate::autopilot_store::{AutopilotHistoryRow, AutopilotRuleRow, AutopilotStore};
 use crate::decision_action::{DecisionAct, DecisionSource};
 use crate::decision_notify::{
-    DecisionCard, PressAuth, authorize_press, destination_matches_any, identity_system_active,
-    mapped_role, refusal_text,
+    DecisionCard, PressAuth, authorize_press, destination_matches_any,
+    has_recognisable_approver_identity, mapped_role, refusal_text,
 };
 use crate::task_store::{ActivityRow, TaskStore};
 
@@ -289,7 +289,7 @@ pub(crate) async fn apply_pause(
     // was delivered to is honoured. Fail-closed everywhere else.
     let auth = authorize_press(
         mapped_role(home_dir, channel, channel_user_id),
-        identity_system_active(home_dir),
+        has_recognisable_approver_identity(home_dir),
         destination_matches_any(
             &delivered_targets(home_dir, &rule),
             channel,

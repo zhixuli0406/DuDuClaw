@@ -32,7 +32,7 @@ fn links_where(
         if !may_receive(&ctx) {
             continue;
         }
-        if let Ok(ids) = db.verified_channels_for_user(&user.id) {
+        if let Ok(ids) = db.verified_dm_destinations_for_user(&user.id) {
             out.extend(ids.into_iter().map(|i| (i.channel, i.channel_user_id)));
         }
     }

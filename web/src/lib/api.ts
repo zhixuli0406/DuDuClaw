@@ -6184,6 +6184,8 @@ export interface GoogleServiceProbe {
 
 export interface GoogleCredentialsStatus {
   chat_read?: boolean;
+  /** `config.toml [google] chat_identity_from_account` (RM-152, default off). */
+  chat_identity_from_account?: boolean;
   /** `config.toml [integrations] google_workspace` — the master gate. */
   integration_enabled: boolean;
   /** Which path a real tool call would take right now. */
@@ -8757,6 +8759,8 @@ export const api = {
    */
   googleCredentials: {
     setChatRead: (chatRead: boolean) => client.call('google.integration.set', { chat_read: chatRead }) as Promise<{ chat_read: boolean; changed: boolean }>,
+    setChatIdentityFromAccount: (enabled: boolean) =>
+      client.call('google.integration.set', { chat_identity_from_account: enabled }) as Promise<{ chat_identity_from_account: boolean; changed: boolean }>,
     get: () => client.call('google.credentials.get') as Promise<GoogleCredentialsStatus>,
     set: (params: GoogleCredentialsInput) =>
       client.call('google.credentials.set', params).then(notifyDisconnectForget) as Promise<{ ok: boolean; mode: string; staged?: boolean }>,

@@ -17,6 +17,10 @@ export interface ChannelIdentity {
   channel_user_id: string;
   verified: boolean;
   created_at: string;
+  /** `'google_account'`: a Google Chat identity recognised from the person's
+   * own linked Google account (read-only here; removed by disconnecting
+   * Google). Absent: a binding an administrator created. */
+  source?: 'google_account';
 }
 
 function authHeader(): Record<string, string> {
@@ -59,6 +63,27 @@ export async function bindChannelIdentity(
   channelUserId: string,
 ): Promise<void> {
   const res = await fetch('/api/channel-identity/bind', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeader() },
+    body: JSON.stringify({ user_id: userId, channel, channel_user_id: channelUserId }),
+  });
+  if (!res.ok) throw new Error(await errorText(res));
+}
+
+/** Channels whose administrator bindings can be removed from the dashboard
+ * (mirrors `server.rs::handle_channel_unbind`, which accepts Google Chat only). */
+export const UNBINDABLE_CHANNELS: ReadonlyArray<string> = ['googlechat'];
+
+/**
+ * POST /api/channel-identity/unbind — admin-only. Removes an
+ * administrator-created binding of `userId` (Google Chat only).
+ */
+export async function unbindChannelIdentity(
+  userId: string,
+  channel: string,
+  channelUserId: string,
+): Promise<void> {
+  const res = await fetch('/api/channel-identity/unbind', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeader() },
     body: JSON.stringify({ user_id: userId, channel, channel_user_id: channelUserId }),

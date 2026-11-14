@@ -812,7 +812,7 @@ pub(crate) fn admin_links(home: &Path) -> Vec<(String, String)> {
         if u.status != UserStatus::Active || u.role != UserRole::Admin {
             continue;
         }
-        if let Ok(idents) = db.verified_channels_for_user(&u.id) {
+        if let Ok(idents) = db.verified_dm_destinations_for_user(&u.id) {
             for i in idents {
                 out.push((i.channel, i.channel_user_id));
             }

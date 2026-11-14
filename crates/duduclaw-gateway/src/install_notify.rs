@@ -112,7 +112,7 @@ pub async fn resolve_channel_target(
 
     let users = db.list_users().ok()?;
     for approver in approvers_for(&users, req) {
-        if let Ok(channels) = db.verified_channels_for_user(&approver.id) {
+        if let Ok(channels) = db.verified_dm_destinations_for_user(&approver.id) {
             if let Some(ident) = channels.into_iter().next() {
                 return Some((ident.channel, ident.channel_user_id, None));
             }
@@ -194,7 +194,7 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
     // below moved into `notify_push` (O5).
     let mut targets: Vec<(String, String)> = Vec::new();
     for approver in &approvers {
-        let channels = match db.verified_channels_for_user(&approver.id) {
+        let channels = match db.verified_dm_destinations_for_user(&approver.id) {
             Ok(c) => c,
             Err(e) => {
                 warn!(user = %approver.id, error = %e, "install-notify: channel lookup failed");
@@ -216,7 +216,7 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
 /// Notify the requester of their request's FINAL outcome (approved+executed /
 /// approved-but-failed / denied) on their linked channels. Best-effort.
 pub async fn notify_requester(home_dir: &Path, db: &UserDb, req: &InstallRequest, text: &str) {
-    let channels = match db.verified_channels_for_user(&req.requester_id) {
+    let channels = match db.verified_dm_destinations_for_user(&req.requester_id) {
         Ok(c) => c,
         Err(e) => {
             warn!(user = %req.requester_id, error = %e, "install-notify: requester channel lookup failed");
@@ -343,7 +343,9 @@ pub(crate) async fn apply_decision(
     // row means "someone typed this channel id into the binding form" — with
     // the old call, filing an unverified binding against a manager/admin
     // account was enough to inherit their approval rights from that chat.
-    let user_id = match db.find_verified_user_id_by_channel(channel, channel_user_id) {
+    // Through the single resolver (RM-152): a Google Chat sender whose two
+    // identity sources disagree is nobody, never the administrator binding.
+    let user_id = match crate::googlechat_identity::verified_user_id(home_dir, &db, channel, channel_user_id) {
         Ok(Some(uid)) => uid,
         Ok(None) => {
             return Err(crate::decision_notify::refusal_text(

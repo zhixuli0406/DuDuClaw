@@ -54,6 +54,15 @@ Open the printed Chat Configuration link. Google does not provide a configuratio
 
 A successful import or resource creation does not prove that Chat is configured or that a message round trip works. The dashboard offers the bootstrap command, Cloud Shell, copyable configuration values; manual fields remain under **Manual setup**.
 
+### Recognising who is messaging (v1.82)
+
+By default a Google Chat sender is an unknown person, so `[google] requesters = "bound_people"` / `owner_only` refuse them and `@` calls reach only the default and public employees. A sender is recognised as a dashboard account when:
+
+- an Admin bound their Chat user id (`users/<digits>`) under **Users → Verify identity → Google Chat** (the default and only way, unless the next option is on), or
+- optional, **off by default**: an Admin turned on **Manage → Integrations → Google → Recognise Google Chat senders by their connected Google account** (`[google] chat_identity_from_account = true`) and the person connected their own Google account under **My connections**. The sender's id is then compared with that Google account's id and a match counts as the person. **Not yet verified against a real Google Workspace** — leave it off unless you have confirmed in your own Workspace that the two ids match.
+
+No e-mail matching. Messages from another Chat app (not a person) are ignored, and a Google Chat identity never receives DuDuClaw's own notifications. Google Chat cannot receive login or two-factor codes. Details and the uniqueness rules: [Dashboard settings → Users → Verify identity](dashboard-settings.md#users--verify-identity-channel-identities-v182).
+
 ### Key policy
 
 If key creation reports `FAILED_PRECONDITION`, ask an Organization Policy Administrator to review the project exception. Organizations created on or after 2024-05-03 commonly enforce key-creation restrictions. The script prints the commands and stops; it does not change policy:

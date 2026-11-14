@@ -2909,6 +2909,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/mfa/passkey/login/finish", post(server_mfa_passkey::login_finish))
         .route("/api/mfa/passkey/delete", post(server_mfa_passkey::delete))
         .route("/api/channel-identity/bind", post(handle_channel_bind))
+        .route("/api/channel-identity/unbind", post(handle_channel_unbind))
         .route(
             "/api/channel-identity/list",
             get(handle_channel_identity_list),
@@ -4013,13 +4014,14 @@ async fn handle_channel_bind(
     headers: axum::http::HeaderMap,
     Json(body): Json<ChannelBindBody>,
 ) -> impl IntoResponse {
-    // Fail-closed input validation (Haiku review #4).
-    const OTP_CHANNELS: [&str; 4] = ["telegram", "line", "discord", "slack"];
+    // Fail-closed input validation (Haiku review #4). Which channels may be
+    // bound is `BINDABLE_CHANNELS`, not the OTP delivery list: Google Chat can
+    // be bound (RM-152) but never receives a login code.
     if body.user_id.is_empty()
         || body.user_id.len() > 255
         || body.channel_user_id.is_empty()
         || body.channel_user_id.len() > 512
-        || !OTP_CHANNELS.contains(&body.channel.as_str())
+        || !duduclaw_auth::otp::is_bindable_channel(&body.channel)
     {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -4027,6 +4029,23 @@ async fn handle_channel_bind(
         )
             .into_response();
     }
+    let googlechat = body.channel == crate::googlechat_identity::CHANNEL;
+    // Google Chat ids are stored in their one canonical `users/<digits>` form
+    // so the sender lookup is exact equality on the whole id.
+    let channel_user_id = if googlechat {
+        match crate::googlechat_identity::normalize_user_id(body.channel_user_id.trim()) {
+            Some(id) => id,
+            None => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Google Chat 使用者代號格式不正確：請填 users/ 後接一串數字（例如 users/123456789012345678901），或只填那串數字。"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body.channel_user_id.clone()
+    };
     let token = match extract_bearer_token(&headers) {
         Some(t) => t,
         None => {
@@ -4080,10 +4099,37 @@ async fn handle_channel_bind(
         Ok(_) => (),
         Err(_) => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"authentication service unavailable"}))).into_response(),
     };
+    // One Chat user id stands for at most one person: refuse when another
+    // account's own linked Google account already derives it (the
+    // `channel_identities` primary key + takeover guard cover the rest).
+    if googlechat {
+        match crate::googlechat_identity::admin_bind_conflict(
+            &state.home_dir,
+            &state.user_db,
+            &channel_user_id,
+            &body.user_id,
+        ) {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": reason})),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "目前無法確認同仁的 Google 帳號連結，沒有綁定，請稍後再試。"})),
+                )
+                    .into_response();
+            }
+        }
+    }
     match state.user_db.bind_channel_identity_authorized(
         &body.user_id,
         &body.channel,
-        &body.channel_user_id,
+        &channel_user_id,
         true,
         Some(&caller.id),
     ) {
@@ -4095,8 +4141,22 @@ async fn handle_channel_bind(
                 Some(&body.channel),
                 None,
             );
+            if googlechat {
+                audit_googlechat_identity(&state, "googlechat_identity_bound", &caller.id, &body.user_id, &channel_user_id).await;
+            }
             Json(serde_json::json!({"success": true})).into_response()
         }
+        // Re-read inside the bind transaction (`bind_channel_identity_authorized`).
+        Err(e) if e == duduclaw_auth::otp::BIND_TARGET_NOT_ACTIVE => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "這位同仁的帳號目前不是啟用狀態（已停用、已離職或已刪除），不能綁定通道身分。請先恢復帳號再綁定。"})),
+        )
+            .into_response(),
+        Err(e) if googlechat && e == "channel already bound to another user" => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "這個 Google Chat 使用者已綁定給另一位同仁；請先在那位同仁的資料移除綁定。"})),
+        )
+            .into_response(),
         Err(e) => (
             axum::http::StatusCode::CONFLICT,
             Json(serde_json::json!({"error": e})),
@@ -4176,13 +4236,177 @@ async fn handle_channel_identity_list(
             .into_response();
     }
     match state.user_db.verified_channels_for_user(&q.user_id) {
-        Ok(identities) => Json(serde_json::json!({ "identities": identities })).into_response(),
+        Ok(identities) => {
+            let mut list = match serde_json::to_value(&identities) {
+                Ok(serde_json::Value::Array(list)) => list,
+                _ => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "identity list unavailable"})),
+                    )
+                        .into_response();
+                }
+            };
+            // RM-152: the Google Chat identity that comes from the person's
+            // own linked Google account is shown read-only (`source`), so an
+            // administrator can see why that sender is recognised. It is
+            // removed by disconnecting Google, not from here.
+            match crate::googlechat_identity::google_account_chat_user(&state.home_dir, &q.user_id) {
+                Ok(Some((chat_user, linked_at))) => list.push(serde_json::json!({
+                    "user_id": q.user_id,
+                    "channel": crate::googlechat_identity::CHANNEL,
+                    "channel_user_id": chat_user,
+                    "verified": true,
+                    "created_at": linked_at,
+                    "source": "google_account",
+                })),
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "channel identity list: linked Google accounts unreadable"),
+            }
+            Json(serde_json::json!({ "identities": list })).into_response()
+        }
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e})),
         )
             .into_response(),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ChannelUnbindBody {
+    user_id: String,
+    channel: String,
+    channel_user_id: String,
+}
+
+/// POST /api/channel-identity/unbind — admin-only (RM-152). Removes an
+/// administrator-created Google Chat binding of `user_id`. Only `googlechat`
+/// is accepted here (other channels keep their existing bind-only surface);
+/// a Google-account-derived identity is removed by disconnecting Google.
+/// Same auth posture as `handle_channel_bind`; the admin role is re-read
+/// from the DB inside the delete transaction.
+async fn handle_channel_unbind(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ChannelUnbindBody>,
+) -> impl IntoResponse {
+    let channel_user_id = match crate::googlechat_identity::normalize_user_id(body.channel_user_id.trim()) {
+        Some(id)
+            if body.channel == crate::googlechat_identity::CHANNEL
+                && !body.user_id.is_empty()
+                && body.user_id.len() <= 255
+                && body.channel_user_id.len() <= 512 =>
+        {
+            id
+        }
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid channel unbinding request"})),
+            )
+                .into_response();
+        }
+    };
+    let Some(token) = extract_bearer_token(&headers) else {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "missing Authorization header"})),
+        )
+            .into_response();
+    };
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
+    let Ok(claims) = state.jwt_config.verify_access_token(token) else {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid or expired token"})),
+        )
+            .into_response();
+    };
+    let caller = match state.user_db.get_user(&claims.sub) {
+        Ok(Some(u)) => u,
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "user not found"})),
+            )
+                .into_response();
+        }
+    };
+    if caller.role != duduclaw_auth::UserRole::Admin {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin required"})),
+        )
+            .into_response();
+    }
+    match state.user_db.unbind_channel_identity_authorized(
+        &body.user_id,
+        crate::googlechat_identity::CHANNEL,
+        &channel_user_id,
+        &caller.id,
+    ) {
+        Ok(true) => {
+            let _ = state.user_db.log_action(
+                Some(&caller.id),
+                "channel_identity_unbound",
+                Some(&body.user_id),
+                Some(crate::googlechat_identity::CHANNEL),
+                None,
+            );
+            audit_googlechat_identity(&state, "googlechat_identity_unbound", &caller.id, &body.user_id, &channel_user_id).await;
+            Json(serde_json::json!({"success": true})).into_response()
+        }
+        Ok(false) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "binding not found"})),
+        )
+            .into_response(),
+        Err(e) if e == "admin required" => (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin required"})),
+        )
+            .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "unbind failed"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Security audit row for an administrator's Google Chat bind / unbind
+/// (low frequency; `security_audit.jsonl`). Best-effort like the
+/// `auth_audit_log` row written next to it: the change is already committed.
+async fn audit_googlechat_identity(
+    state: &AppState,
+    event: &'static str,
+    actor: &str,
+    user_id: &str,
+    chat_user: &str,
+) {
+    let home = state.home_dir.clone();
+    let details = serde_json::json!({
+        "actor": actor,
+        "user_id": user_id,
+        "channel": crate::googlechat_identity::CHANNEL,
+        "channel_user_id": chat_user,
+        "source": "admin",
+    });
+    let _ = tokio::task::spawn_blocking(move || {
+        duduclaw_security::audit::append_audit_event(
+            &home,
+            &duduclaw_security::audit::AuditEvent::new(
+                event,
+                "gateway",
+                duduclaw_security::audit::Severity::Info,
+                details,
+            ),
+        );
+    })
+    .await;
 }
 
 /// Iterate every agent's wiki under `agents_dir` and run the Phase 3

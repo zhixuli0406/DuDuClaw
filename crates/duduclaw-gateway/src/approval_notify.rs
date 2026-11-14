@@ -43,7 +43,7 @@ use crate::approval::{
 use crate::decision_action::{DecisionAct, DecisionSource};
 use crate::decision_notify::{
     DecisionCard, PressAuth, approver_links, authorize_press, destination_matches_any,
-    identity_system_active, mapped_role, origin_target, refusal_text, resolve_targets,
+    has_recognisable_approver_identity, mapped_role, origin_target, refusal_text, resolve_targets,
 };
 use crate::task_store::{ActivityRow, TaskStore};
 
@@ -658,7 +658,7 @@ pub(crate) async fn apply_decision(
     // delivered to is honoured. Fail-closed everywhere else.
     let auth = authorize_press(
         role,
-        identity_system_active(home_dir),
+        has_recognisable_approver_identity(home_dir),
         destination_matches_any(&delivered_targets(&rec), channel, channel_user_id),
     );
     if auth != PressAuth::Allow {

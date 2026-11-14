@@ -93,4 +93,22 @@ it('does not offer the Chat switch to a non-administrator', async () => {
   renderWithProviders(<GoogleIntegrationPage/>);
   await screen.findByTestId('google-gate-on');
   expect(screen.queryByRole('checkbox', {name:'Read Google Chat'})).not.toBeInTheDocument();
+  expect(screen.queryByTestId('google-chat-identity')).not.toBeInTheDocument();
+});
+
+it('Chat sender recognition by Google account is off by default, admin-only and carries the risk note', async () => {
+  useAuthStore.setState({user:{id:'admin',email:'admin@example.test',display_name:'Admin',role:'admin',status:'active'}});
+  // An older gateway that does not report the key reads as off.
+  mockGet({});
+  const set = vi.spyOn(api.googleCredentials, 'setChatIdentityFromAccount')
+    .mockResolvedValue({chat_identity_from_account:true,changed:true});
+  const chatRead = vi.spyOn(api.googleCredentials, 'setChatRead');
+  renderWithProviders(<GoogleIntegrationPage/>);
+  const toggle = await screen.findByRole('checkbox', {name:'Recognise Google Chat senders by their connected Google account'});
+  expect(toggle).not.toBeChecked();
+  expect(screen.getByText(/Not yet tested with a real Google Workspace/)).toBeInTheDocument();
+  await userEvent.click(toggle);
+  await waitFor(()=>expect(toggle).toBeChecked());
+  expect(set).toHaveBeenCalledWith(true);
+  expect(chatRead).not.toHaveBeenCalled();
 });

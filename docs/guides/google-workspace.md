@@ -174,6 +174,17 @@ some requesters (`requesters`):
 Public website visitors (WebChat widget, Odoo Live Chat) are refused under
 every setting. An unbound channel sender is refused unless `anyone` is set.
 
+**Google Chat senders (v1.82):** a Chat sender counts as a person here when
+an Admin bound their Chat user id under **Users → Verify identity**, or — only
+if an Admin turned on the optional, **off-by-default** setting
+`[google] chat_identity_from_account` (Manage → Integrations → Google) — when
+they connected their own Google account under **My connections** (matched on
+the Google account id; this automatic match has **not yet been verified
+against a real Google Workspace**; leave the setting off unless you have
+confirmed in your own Workspace that the two ids match). There is no e-mail matching. Before v1.82 every Chat sender was
+unbound, so only `anyone` let them through. See
+[Dashboard settings → Users → Verify identity](dashboard-settings.md#users--verify-identity-channel-identities-v182).
+
 ### When it cannot be used
 
 The tool call fails with a reason and who can fix it. It does not quietly

@@ -231,6 +231,7 @@ pub mod googlechat;
 pub mod googlechat_pubsub;
 mod googlechat_inbox;
 pub mod googlechat_agents;
+pub mod googlechat_identity;
 pub mod killswitch_triggers;
 pub mod markdown_render;
 pub mod mcp_external;

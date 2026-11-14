@@ -27,7 +27,7 @@ pub fn owners(home: &Path, agent: &str) -> Result<Vec<String>, String> {
             && (!restricted || user.role == duduclaw_auth::UserRole::Admin)) {
             continue;
         }
-        for identity in db.verified_channels_for_user(&binding.user_id)? {
+        for identity in db.verified_dm_destinations_for_user(&binding.user_id)? {
             if let Some(recipient) = channel_recipient(&identity.channel, &identity.channel_user_id) {
                 recipients.push(recipient);
             }

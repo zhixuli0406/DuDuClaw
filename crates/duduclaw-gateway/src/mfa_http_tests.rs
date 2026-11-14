@@ -586,6 +586,162 @@ async fn mfa_channel_bind_refuses_enforced_self_but_accepts_other_admin() {
     }
 }
 
+/// RM-152: Google Chat joins the bindable list (admin only, canonical id,
+/// one owner, audited) without becoming an OTP channel; unbind is admin
+/// only and limited to Google Chat.
+#[tokio::test]
+async fn googlechat_channel_bind_and_unbind_are_admin_only_and_canonical() {
+    let (_dir, state, admin) = fixture(false, false).await;
+    let headers_for = |u: &duduclaw_auth::User| {
+        let mut headers = axum::http::HeaderMap::new();
+        let token = state.jwt_config.issue_access_token(u, &[]).unwrap();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    };
+    let emp = state.user_db.create_user("emp@example.test", "Emp", "password-test", UserRole::Employee).unwrap();
+    let other = state.user_db.create_user("other-emp@example.test", "Other", "password-test", UserRole::Employee).unwrap();
+    let bind = |user: &str, channel: &str, id: &str| ChannelBindBody {
+        user_id: user.into(), channel: channel.into(), channel_user_id: id.into(),
+    };
+    let unbind = |user: &str, channel: &str, id: &str| ChannelUnbindBody {
+        user_id: user.into(), channel: channel.into(), channel_user_id: id.into(),
+    };
+
+    // A non-admin cannot bind a Google Chat id to themselves.
+    let r = handle_channel_bind(State(state.clone()), headers_for(&emp), Json(bind(&emp.id, "googlechat", "users/123456"))).await.into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(state.user_db.find_user_id_by_channel("googlechat", "users/123456").unwrap(), None);
+
+    // Malformed ids (incl. the e-mail alias form) are refused before anything is written.
+    for bad in ["users/abc", "alice@example.test", "users/alice@example.test", "users/app", "users/"] {
+        let r = handle_channel_bind(State(state.clone()), headers_for(&admin), Json(bind(&emp.id, "googlechat", bad))).await.into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // Channels outside the bindable list stay refused.
+    for channel in ["whatsapp", "feishu", "teams", "GoogleChat", "googlechat "] {
+        let r = handle_channel_bind(State(state.clone()), headers_for(&admin), Json(bind(&emp.id, channel, "123456"))).await.into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{channel}");
+    }
+
+    // An admin binds; typed input is trimmed and stored in canonical form.
+    let r = handle_channel_bind(State(state.clone()), headers_for(&admin), Json(bind(&emp.id, "googlechat", "  123456 "))).await.into_response();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(state.user_db.find_verified_user_id_by_channel("googlechat", "users/123456").unwrap(), Some(emp.id.clone()));
+    assert_eq!(state.user_db.find_user_id_by_channel("googlechat", "123456").unwrap(), None);
+    let audit = std::fs::read_to_string(state.home_dir.join("security_audit.jsonl")).unwrap();
+    assert!(audit.contains("googlechat_identity_bound"));
+
+    // One Chat id, one person.
+    let r = handle_channel_bind(State(state.clone()), headers_for(&admin), Json(bind(&other.id, "googlechat", "users/123456"))).await.into_response();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert_eq!(state.user_db.find_verified_user_id_by_channel("googlechat", "users/123456").unwrap(), Some(emp.id.clone()));
+
+    // A binding never becomes an OTP login target.
+    assert!(state.user_db.request_otp("emp@example.test").unwrap().is_none());
+
+    // Unbind: admin only, Google Chat only, only the named user's binding.
+    let r = handle_channel_unbind(State(state.clone()), headers_for(&emp), Json(unbind(&emp.id, "googlechat", "users/123456"))).await.into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = handle_channel_unbind(State(state.clone()), headers_for(&admin), Json(unbind(&emp.id, "telegram", "123456"))).await.into_response();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let r = handle_channel_unbind(State(state.clone()), headers_for(&admin), Json(unbind(&other.id, "googlechat", "users/123456"))).await.into_response();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let r = handle_channel_unbind(State(state.clone()), headers_for(&admin), Json(unbind(&emp.id, "googlechat", "123456"))).await.into_response();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(state.user_db.find_user_id_by_channel("googlechat", "users/123456").unwrap(), None);
+    let audit = std::fs::read_to_string(state.home_dir.join("security_audit.jsonl")).unwrap();
+    assert!(audit.contains("googlechat_identity_unbound"));
+}
+
+/// RM-152: an admin cannot bind a Chat id that another person's own linked
+/// Google account already stands for; the list shows that derived identity.
+#[tokio::test]
+async fn googlechat_bind_refuses_another_persons_google_identity_and_list_shows_it() {
+    let (_dir, state, admin) = fixture(false, false).await;
+    let mut headers = axum::http::HeaderMap::new();
+    let token = state.jwt_config.issue_access_token(&admin, &[]).unwrap();
+    headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let alice = state.user_db.create_user("alice@example.test", "Alice", "password-test", UserRole::Employee).unwrap();
+    let bob = state.user_db.create_user("bob@example.test", "Bob", "password-test", UserRole::Employee).unwrap();
+    // M4: Google-account-derived recognition is opt-in.
+    let cfg = state.home_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&cfg).unwrap_or_default();
+    text.push_str("\n[google]\nchat_identity_from_account = true\n");
+    std::fs::write(&cfg, text).unwrap();
+    let file = crate::person_credentials::path(&state.home_dir);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, serde_json::to_vec(&json!({"version": 1, "epochs": {}, "records": [{
+        "owner_kind": "user", "owner_id": alice.id, "provider": "google",
+        "credential_id": uuid::Uuid::new_v4().to_string(), "revision": 1,
+        "account_email": "alice@c.test", "google_sub": "246810", "hosted_domain": null,
+        "granted_scopes": ["openid"], "status": "connected",
+        "connected_at": chrono::Utc::now().to_rfc3339(), "last_refresh_at": null,
+        "oauth_client_id": "client-1", "secret": "pk:v1:stub",
+    }]})).unwrap()).unwrap();
+
+    let r = handle_channel_bind(State(state.clone()), headers.clone(), Json(ChannelBindBody {
+        user_id: bob.id.clone(), channel: "googlechat".into(), channel_user_id: "users/246810".into(),
+    })).await.into_response();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert_eq!(state.user_db.find_user_id_by_channel("googlechat", "users/246810").unwrap(), None);
+    // Binding it to the same person is allowed (both sources then agree).
+    let r = handle_channel_bind(State(state.clone()), headers.clone(), Json(ChannelBindBody {
+        user_id: alice.id.clone(), channel: "googlechat".into(), channel_user_id: "users/246810".into(),
+    })).await.into_response();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    let (status, listed) = body(handle_channel_identity_list(State(state.clone()), headers.clone(),
+        Query(ChannelIdentityListQuery { user_id: alice.id.clone() })).await.into_response()).await;
+    assert_eq!(status, StatusCode::OK);
+    let identities = listed["identities"].as_array().unwrap();
+    assert!(identities.iter().any(|i| i["channel"] == "googlechat" && i["channel_user_id"] == "users/246810" && i.get("source").is_none()));
+    assert!(identities.iter().any(|i| i["channel"] == "googlechat" && i["channel_user_id"] == "users/246810" && i["source"] == "google_account"));
+    let (_, listed) = body(handle_channel_identity_list(State(state.clone()), headers.clone(),
+        Query(ChannelIdentityListQuery { user_id: bob.id.clone() })).await.into_response()).await;
+    assert!(listed["identities"].as_array().unwrap().is_empty());
+
+    // M4: with the setting off the linked Google account is not an identity:
+    // no read-only chip, and it no longer blocks an administrator binding.
+    std::fs::write(&cfg, std::fs::read_to_string(&cfg).unwrap().replace("chat_identity_from_account = true", "chat_identity_from_account = false")).unwrap();
+    let (_, listed) = body(handle_channel_identity_list(State(state.clone()), headers.clone(),
+        Query(ChannelIdentityListQuery { user_id: alice.id.clone() })).await.into_response()).await;
+    let identities = listed["identities"].as_array().unwrap();
+    assert!(!identities.iter().any(|i| i["source"] == "google_account"), "{identities:?}");
+    assert_eq!(identities.len(), 1, "only the administrator binding");
+    let r = handle_channel_bind(State(state.clone()), headers, Json(ChannelBindBody {
+        user_id: bob.id.clone(), channel: "googlechat".into(), channel_user_id: "users/13579".into(),
+    })).await.into_response();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// M3: binding a channel identity to a suspended / offboarded / deleted
+/// account is refused with a clear 409/404, and nothing is written.
+#[tokio::test]
+async fn channel_bind_refuses_an_inactive_target() {
+    let (_dir, state, admin) = fixture(false, false).await;
+    let mut headers = axum::http::HeaderMap::new();
+    let token = state.jwt_config.issue_access_token(&admin, &[]).unwrap();
+    headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    for (n, status) in [duduclaw_auth::UserStatus::Suspended, duduclaw_auth::UserStatus::Offboarded].into_iter().enumerate() {
+        let user = state.user_db.create_user(&format!("inactive{n}@example.test"), "X", "password-test", UserRole::Employee).unwrap();
+        state.user_db.set_user_status(&user.id, status).unwrap();
+        for (channel, id) in [("googlechat", "users/8080"), ("telegram", "tg-8080")] {
+            let r = handle_channel_bind(State(state.clone()), headers.clone(), Json(ChannelBindBody {
+                user_id: user.id.clone(), channel: channel.into(), channel_user_id: id.into(),
+            })).await.into_response();
+            let (code, value) = body(r).await;
+            assert_eq!(code, StatusCode::CONFLICT, "{status:?} {channel}");
+            assert!(value["error"].as_str().unwrap().contains("不是啟用狀態"), "{value}");
+            assert_eq!(state.user_db.find_user_id_by_channel(channel, id).unwrap(), None);
+        }
+    }
+    let r = handle_channel_bind(State(state.clone()), headers, Json(ChannelBindBody {
+        user_id: "deleted-user".into(), channel: "googlechat".into(), channel_user_id: "users/8081".into(),
+    })).await.into_response();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    assert_eq!(state.user_db.find_user_id_by_channel("googlechat", "users/8081").unwrap(), None);
+}
+
 #[tokio::test]
 async fn mfa_live_socket_read_failure_pauses_recovers_and_retires_queued_output() {
     use crate::handlers::live_context::{SocketRecovery, SocketValidity};

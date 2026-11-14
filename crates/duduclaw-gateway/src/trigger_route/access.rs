@@ -324,7 +324,15 @@ pub fn for_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> 
         channel_user_id.to_string(),
     );
     let now = Instant::now();
-    let generation = read_generation(home);
+    // A Google Chat sender may be recognised through the person's linked
+    // Google account (`googlechat_identity`), which lives outside users.db and
+    // does not bump the ACL generation: never cache it, so disconnecting
+    // Google stops recognition on the very next turn.
+    let generation = if channel == crate::googlechat_identity::CHANNEL {
+        None
+    } else {
+        read_generation(home)
+    };
     let Ok(edition) = crate::team_edition::snapshot(home) else { return SenderAccess::unmapped(); };
     if let Some(g) = generation {
         if let Some((access, at, cached_gen, cached_edition)) = lookup_cache().get(&key) {
@@ -354,7 +362,9 @@ pub(crate) fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id:
     let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else {
         return SenderAccess::unmapped();
     };
-    let Ok(Some(user_id)) = db.find_verified_user_id_by_channel(channel, channel_user_id) else {
+    let Ok(Some(user_id)) =
+        crate::googlechat_identity::verified_user_id(home, &db, channel, channel_user_id)
+    else {
         return SenderAccess::unmapped();
     };
     match load_account(home, &db, &user_id) {
@@ -371,7 +381,10 @@ pub(crate) fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id:
 /// through a **verified** `channel_identities` row; `None` for an unbound
 /// sender, an unverified row, an inactive account or any lookup failure
 /// (the least a sender can have). Used by the knowledge base to decide whose
-/// collections a channel turn may read.
+/// collections a channel turn may read, and by the Google requester gate.
+/// A Google Chat sender may also be recognised through the person's own
+/// linked Google account; see [`crate::googlechat_identity`] (both lookups
+/// here go through `googlechat_identity::verified_user_id`).
 pub fn verified_user_for_channel_sender(
     home: &Path,
     channel: &str,
@@ -381,8 +394,7 @@ pub fn verified_user_for_channel_sender(
         return None;
     }
     let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
-    let user_id = db
-        .find_verified_user_id_by_channel(channel, channel_user_id)
+    let user_id = crate::googlechat_identity::verified_user_id(home, &db, channel, channel_user_id)
         .ok()
         .flatten()?;
     load_account(home, &db, &user_id).ok().flatten().map(|_| user_id)

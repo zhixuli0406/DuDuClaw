@@ -22,7 +22,34 @@ impl MethodHandler {
     /// OAuth / credential save, so the Google tab was visible to everyone
     /// while the tools behind it refused every call on a stock install. The
     /// page now reads the flag and offers this.
-    pub(crate) async fn handle_google_integration_set(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_google_integration_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        // RM-152 M4: opt-in Google-account-derived Chat sender recognition.
+        // Admin only (dispatch `require_admin!`), written through the same
+        // `config_commit` path, and a real change is a security audit event.
+        if let Some(value) = params.get(crate::googlechat_identity::DERIVATION_KEY) {
+            let Some(enabled) = value.as_bool() else {
+                return WsFrame::error_response("", "Google Chat 身分比對設定必須是布林值。");
+            };
+            if params.get("enabled").is_some() || params.get("chat_read").is_some() {
+                return WsFrame::error_response("", "請分別更新 Google 整合、Chat 讀取與 Chat 身分比對設定。");
+            }
+            return match crate::googlechat_identity::set_derivation_enabled(&self.home_dir, enabled) {
+                Ok(changed) => {
+                    if changed {
+                        duduclaw_security::audit::log_config_changed(
+                            &self.home_dir,
+                            &ctx.email,
+                            &format!("{:?}", ctx.role).to_lowercase(),
+                            &[format!("google.chat_identity_from_account set to {enabled}")],
+                        );
+                        crate::security_autopilot::emit_config_changed();
+                        info!(enabled, "google.integration.set updated [google] chat_identity_from_account");
+                    }
+                    WsFrame::ok_response("", json!({"chat_identity_from_account": enabled, "changed": changed}))
+                }
+                Err(error) => WsFrame::error_response("", &error),
+            };
+        }
         if let Some(value) = params.get("chat_read") {
             let Some(enabled) = value.as_bool() else {
                 return WsFrame::error_response("", "Google Chat 讀取設定必須是布林值。");
@@ -88,6 +115,11 @@ impl MethodHandler {
                 "integration_enabled":
                     crate::google_workspace::integration_enabled(&self.home_dir),
                 "chat_read": crate::google_workspace::chat_read_enabled(&self.home_dir),
+                // Display only, not a gate: an unreadable or malformed setting
+                // shows as off here, while every gate treats it as an error and
+                // fails closed (`googlechat_identity::derivation_enabled`).
+                "chat_identity_from_account":
+                    crate::googlechat_identity::derivation_enabled(&self.home_dir).unwrap_or(false),
                 "effective": effective,
                 "service_account": {
                     "configured": sa_configured,

@@ -361,7 +361,7 @@ impl MethodHandler {
             // and offers this switch instead.
             "google.integration.set" => {
                 require_admin!();
-                boxed_frame(|| self.handle_google_integration_set(params)).await
+                boxed_frame(|| self.handle_google_integration_set(params, ctx)).await
             }
             // ── Per-employee Google identity (B2a) ──────────────
             // Who each AI employee acts as. Writing an identity, the sealed
