@@ -575,7 +575,7 @@ function InteractiveWebChatPage() {
 
   // ── Conversation status dot ───────────────────────────────────────────────────
   const statusTone =
-    connectionState === 'connected' ? 'bg-success' : connectionState !== 'disconnected' ? 'bg-warning' : 'bg-muted-foreground';
+    connectionState === 'connected' ? 'bg-success' : connectionState !== 'disconnected' ? 'bg-warning' : 'bg-destructive';
   const statusText =
     connectionState === 'connected'
       ? intl.formatMessage({ id: 'webchat.connected', defaultMessage: 'Connected' })
@@ -608,7 +608,12 @@ function InteractiveWebChatPage() {
             <span className="truncate text-sm font-medium text-foreground">{partnerName}</span>
           </div>
         </div>
-        <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <span
+          className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+          role="img"
+          aria-label={statusText}
+          title={statusText}
+        >
           <span className={cn('size-1.5 rounded-full', statusTone)} aria-hidden="true" />
           <span className="hidden sm:inline">{statusText}</span>
         </span>

@@ -105,6 +105,11 @@ describe('WebChatPage', () => {
     expect(screen.getByPlaceholderText(/message/i)).toBeInTheDocument();
   });
 
+  it('shows the connection indicator with a connected label', () => {
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByRole('img', { name: 'Connected' })).toBeInTheDocument();
+  });
+
   it('renders the list+detail split (conversations column)', () => {
     renderWithProviders(<WebChatPage />);
     // The left column carries a "New conversation" action.

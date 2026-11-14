@@ -181,6 +181,17 @@
 | 通道失敗追蹤 | `channel_failures.jsonl` + `FailureReason` 分類（RateLimited/Billing/Timeout/BinaryMissing/SpawnError/EmptyResponse/NoAccounts/Unknown） |
 | Discord Gateway 強化（v1.9.2） | 真正的 op 6 RESUME：跨重連保存 `session_id` + `resume_gateway_url` + sequence；`select!` 停滯看門狗於 2× 心跳沉默後中斷（修復 18 分鐘殭屍狀態）；心跳 channel 容量 1→16 配 `try_send`；op 9 依 `d.bool` 選 RESUME 或 IDENTIFY 並加 1-5s jitter；close code 4007/4009/4003 清除 session；backoff 上限 300s→60s；處理 `RESUMED` dispatch |
 
+
+### WebChat 與 WordPress 聊天小工具
+
+儀表板聊天標題旁常駐連線狀態點：已連線為綠色，連線中／重新連線中為警示色，已斷線為錯誤色。窄螢幕也保留螢幕閱讀器可讀取的狀態標籤。
+
+WordPress 小工具（外掛 0.1.1）會在標題列顯示連線狀態。斷線後從 1 秒開始嘗試重新連線，每次等待時間加倍，最長 30 秒，最多 10 次。達到上限後可按「重新連線」。回到可見頁面、網路恢復或還原頁面時也會重新連線。
+
+尚未連線時送出，文字會留在輸入框，訊息泡泡標示「未送出」。按「重試」後才會在連線就緒時送出一次，單純恢復連線不會自動重送。等待回覆時斷線會提示「連線中斷，回覆可能沒有送達」；若後續收到回覆，會清除提示，但重新連線不保證能找回先前的回覆。錯誤只顯示通用提示，不透露內部資訊。
+
+小工具依網頁 HTML 的 `lang` 選擇文字：中文使用繁中，其他語言使用英文，未設定時維持原本的繁中。網站管理者設定的標題保持原樣，狀態變更會提供給螢幕閱讀器。小工具沒有自動化測試，小工具尚未在真實瀏覽器驗證。
+
 ## 演化系統
 
 > **進化系統 v3（2026-08-06）→ S11（2026-09-29）**：進化標的從「整份改寫
