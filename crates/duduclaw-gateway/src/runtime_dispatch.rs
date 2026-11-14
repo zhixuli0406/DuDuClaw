@@ -240,7 +240,7 @@ async fn run_agent_prompt_inner(
         home_dir: req.home_dir.to_path_buf(),
         agent_id: req.agent_id.to_string(),
         preferred_provider: None,
-        conversation_history: req.conversation_history.to_vec(),
+        conversation_history: crate::runtime::cap_conversation_history(req.conversation_history),
         // Capability enforcement (W1): resolved from `agent.toml [capabilities]`
         // so every runtime (Claude AND non-Claude) receives the agent's tool
         // restrictions. `None` only for agent-less utility calls (no agent_dir).

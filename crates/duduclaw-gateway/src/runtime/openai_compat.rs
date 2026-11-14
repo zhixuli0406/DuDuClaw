@@ -44,7 +44,7 @@ impl OpenAiCompatRuntime {
             return Err(refusal());
         }
         let mut messages = vec![duduclaw_api_worker::Message { role: "system".into(), content: context.system_prompt.clone() }];
-        messages.extend(context.conversation_history.iter().map(|turn| duduclaw_api_worker::Message {
+        messages.extend(super::cap_conversation_history(&context.conversation_history).iter().map(|turn| duduclaw_api_worker::Message {
             role: turn.role.clone(), content: turn.content.clone() }));
         messages.push(duduclaw_api_worker::Message { role: "user".into(), content: prompt.into() });
         let request = duduclaw_api_worker::Request { protocol: duduclaw_api_worker::PROTOCOL.into(),
@@ -277,7 +277,7 @@ impl OpenAiCompatRuntime {
             role: "system".to_string(),
             content: context.system_prompt.clone(),
         });
-        for turn in &context.conversation_history {
+        for turn in &super::cap_conversation_history(&context.conversation_history) {
             // Skip empty turns: strict OpenAI-compat providers reject them, and
             // an empty assistant turn (from a past dropped reply) teaches the
             // model to answer with nothing — self-reinforcing session breakage.
@@ -636,7 +636,7 @@ fn build_tool_chat_request(
         req.system
             .push(SystemBlock::uncached(context.system_prompt.clone()));
     }
-    for turn in &context.conversation_history {
+    for turn in &super::cap_conversation_history(&context.conversation_history) {
         // Same empty-turn filter as the plain path: an empty assistant turn
         // teaches the model to answer with nothing (session breakage).
         if turn.content.trim().is_empty() {
@@ -1328,6 +1328,30 @@ mod tests {
         assert!(matches!(&req.messages[1].parts[0], ContentPart::Text(t) if t == "reply"));
         assert_eq!(req.messages[2].role, Role::User);
         assert!(matches!(&req.messages[2].parts[0], ContentPart::Text(t) if t == "now"));
+    }
+
+    #[test]
+    fn native_tool_request_caps_history_and_preserves_current_message() {
+        let mut ctx = tool_ctx("system", "deepseek-chat");
+        ctx.conversation_history = (0..20).map(|index| crate::runtime::ConversationTurn {
+            role: if index % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: format!("{index}:{}最新內容", "中文🙂".repeat(1200)),
+        }).collect();
+        // The current message has its own input limit; history capping must
+        // not remove or shorten it, even when it is larger than the history cap.
+        let current = "目前問題🙂".repeat(10_000);
+        let req = build_tool_chat_request(&ctx, &current, "deepseek/deepseek-chat".into());
+        let expected = super::super::cap_conversation_history(&ctx.conversation_history);
+        assert_eq!(req.messages.len(), expected.len() + 1);
+        let mut bytes = 0;
+        for (message, turn) in req.messages.iter().zip(&expected) {
+            let ContentPart::Text(text) = &message.parts[0] else { panic!("expected text") };
+            assert_eq!(text, &turn.content);
+            bytes += text.len();
+        }
+        assert!(bytes <= super::super::CONVERSATION_HISTORY_MAX_BYTES);
+        assert!(matches!(&req.messages.last().unwrap().parts[0], ContentPart::Text(text) if text == &current));
+        assert_eq!(ctx.conversation_history.len(), 20, "outbound cap must not mutate source history");
     }
 
     #[test]

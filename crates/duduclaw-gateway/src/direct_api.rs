@@ -297,6 +297,13 @@ async fn call_direct_api_inner(
     conversation_history: &[(String, String)],
     limits: RequestLimits,
 ) -> Result<DirectApiResponse, String> {
+    let capped = crate::runtime::cap_conversation_history(&conversation_history.iter()
+        .map(|(role, content)| crate::runtime::ConversationTurn {
+            role: role.clone(), content: content.clone(),
+        }).collect::<Vec<_>>());
+    let conversation_history: Vec<_> = capped.into_iter()
+        .map(|turn| (turn.role, turn.content)).collect();
+    let conversation_history = conversation_history.as_slice();
     let client = http_client();
 
     // Build system blocks: cached segments (split on CACHE_SPLIT_MARKER),
@@ -755,6 +762,13 @@ fn build_moa_messages(
     conversation_history: &[(String, String)],
     user_message: &str,
 ) -> Vec<duduclaw_llm::ChatMessage> {
+    let capped = crate::runtime::cap_conversation_history(&conversation_history.iter()
+        .map(|(role, content)| crate::runtime::ConversationTurn {
+            role: role.clone(), content: content.clone(),
+        }).collect::<Vec<_>>());
+    let conversation_history: Vec<_> = capped.into_iter()
+        .map(|turn| (turn.role, turn.content)).collect();
+    let conversation_history = conversation_history.as_slice();
     let mut messages = Vec::with_capacity(conversation_history.len() + 1);
     for (role, content) in conversation_history {
         if role.eq_ignore_ascii_case("assistant") {

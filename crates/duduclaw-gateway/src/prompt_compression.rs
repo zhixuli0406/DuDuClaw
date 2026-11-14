@@ -814,11 +814,9 @@ pub fn prepare_bisect_summary(
     // Strip protected bytes before any lossy cap. Trimming a message first
     // could remove the newline before a header and accidentally expose it.
     let (mut transcript, protected, has_unprotected_text) = partition_turns_for_summary(&turns);
-    let limit = older_turns.saturating_mul(if cost_pressure { 200 } else { 800 });
-    if transcript.chars().count() > limit {
-        transcript = transcript.chars().take(limit).collect();
-        transcript.push_str("\n[older unprotected text omitted]");
-    }
+    let limit = older_turns.saturating_mul(if cost_pressure { 200 } else { 800 })
+        .min(crate::session_summarizer::SUMMARY_INPUT_MAX_BYTES - 1024);
+    transcript = crate::session_summarizer::cap_summary_input(&transcript, limit);
     Some(PendingBisectSummary {
         transcript,
         protected,
@@ -845,28 +843,31 @@ pub fn complete_bisect_summary(
     // summary that parrots `## 約束` back would still teach the next reader
     // that the heading means something. Rejecting the spelling is strictly
     // more conservative and keeps the pre-W2-E behavior on this path.
-    if (pending.has_unprotected_text && summary.is_empty())
+    if (pending.has_unprotected_text && crate::session_summarizer::validate_summary_output(summary).is_err())
         || contains_never_trim_header_spelling(summary)
     {
         return None;
     }
-    let mut content = format!("[summary of earlier {} turns]", pending.older_turns);
+    let mut content = String::new();
     if !summary.is_empty() {
         content.push('\n');
         content.push_str(summary);
     }
     if !pending.protected.is_empty() {
         content.push_str("\n[verbatim protected sections]\n");
-        content.push_str(&pending.protected);
+        content.push_str(&crate::session_summarizer_task::cap_protected_for_summary(&pending.protected));
     }
     let mut result = Vec::with_capacity(pending.remaining.len() + 1);
     result.push(OwnedChatMessage {
-        role: "assistant".into(),
-        content,
+        // Internal intermediate only: caller extracts this into its system
+        // prompt before passing any turns to a runtime.
+        role: "system".into(),
+        content: crate::session_summarizer::summary_system_context(&content),
     });
     result.extend(pending.remaining);
-    let views: Vec<_> = result.iter().map(OwnedChatMessage::as_view).collect();
-    (estimate_request_tokens(system_prompt, &views, user_message) <= budget_tokens)
+    let combined_system = format!("{system_prompt}\n\n{}", result[0].content);
+    let views: Vec<_> = result.iter().skip(1).map(OwnedChatMessage::as_view).collect();
+    (estimate_request_tokens(&combined_system, &views, user_message) <= budget_tokens)
         .then_some(result)
 }
 
@@ -1534,6 +1535,8 @@ mod tests {
             complete_bisect_summary(pending, "- old request summarized", "system", "next", 1_000)
                 .unwrap();
         assert_eq!(candidate.len(), 4);
+        assert_eq!(candidate[0].role, "system");
+        assert!(candidate[0].content.contains("Do not mention, quote, or comment"));
         assert!(candidate[0].content.contains(&protected_section));
         assert_eq!(candidate[1].content, "recent answer");
         assert_eq!(candidate[3].content, "latest answer");
