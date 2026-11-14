@@ -289,7 +289,7 @@ WordPress 小工具（外掛 0.1.1）會在標題列顯示連線狀態。斷線�
 | 統一多源審計日誌 | `audit.unified_log` 合併 `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`；日誌頁提供來源篩選 + 嚴重度下拉 |
 | JSONL 審計日誌 | 完整記錄工具呼叫，async 寫入 |
 | Unicode 正規化 | NFKC 正規化，偵測同形字攻擊 |
-| Action Claim Verifier | 工具呼叫聲明的簽章驗證 |
+| Action Claim Verifier | 以正規表示式比對回覆中「已完成」的說法與工具呼叫紀錄：代理管理類說法（所有回覆路徑，只記錄）與寄信／行事曆／試算表／文件／任務類說法（聊天回覆，只認同一段對話的紀錄，預設附上只給內部人員看的提醒；`[action_claims] mode`）（[78-action-claim-check.md](78-action-claim-check.md)） |
 | 容器沙盒 | 兩條獨立路徑。任務沙箱（`agent.toml [container] sandbox_enabled`）：只支援 Docker，把被委派任務的 AI CLI 放進唯讀、非 root、有資源上限的容器，不能用時直接失敗（fail closed）（[指南](../../guides/zh-TW/task-sandbox.md)）。腳本沙箱（PTC `execute_program`、`duduclaw secaudit` 的 PoC 步驟）：Docker（Windows 先試 WSL2），`--network=none`、唯讀根檔案系統，只掛一個唯讀的私有腳本目錄；沙箱不能用時 PTC 拒絕執行，除非設 `script_when_unavailable = "run_unsandboxed"` |
 | Secret 洩漏掃描 | 19 種 secret 樣式（Anthropic / OpenAI / AWS / GitHub / GitLab / Slack / Stripe / Google / SendGrid / JWT / PEM 金鑰，以及金鑰或密碼賦值）加上高熵檢查，供 skill 安全掃描器使用 |
 | 敏感資料遮蔽（RFC-23，v1.14.0） | `duduclaw-redaction` crate：內部資料（Odoo／shared wiki／file tools）以 `<REDACT:CATEGORY:hash8>` token 取代後才送 LLM，受信出口（使用者通道回覆、白名單工具）自動還原；AES-256-GCM SQLite vault（per-agent 32-byte key，0o600）、TTL 7d 兩階段 GC、5 個內建 profile、五層 enable/disable resolver、JSONL audit 10MB rotation；2026-09 新增欄位級規則：`db_field`（Odoo `model.field`／`model.*` 語法糖）與通用 `json_path`，命中欄位整值 token 化，不比對內容樣態，並附 `duduclaw redaction verify` JSON 模式，可對範例工具結果證明規則會觸發；`db_field` 原本只認 Odoo 的對照表，2026-09 進一步抽成任何 MCP 工具都能綁的 `[redaction.data_sources.*]` 登錄表，去識別化的涵蓋範圍也首次跨出 DuDuClaw 自己的 MCP server，見下一列 |

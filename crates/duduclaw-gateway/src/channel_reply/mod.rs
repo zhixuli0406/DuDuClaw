@@ -274,6 +274,7 @@ mod access_gate;
 pub(crate) mod assembly;
 mod breaker_wait;
 mod ccr_delivery;
+mod claim_notice;
 mod cli_env;
 mod cli_spawn;
 mod context;

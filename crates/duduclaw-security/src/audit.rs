@@ -1019,6 +1019,99 @@ pub fn read_tool_calls_since(
         .collect()
 }
 
+/// Most bytes [`read_session_tool_calls`] reads from the end of
+/// `tool_calls.jsonl` and from the end of its one rotated backup.
+pub const SESSION_TOOL_CALLS_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Most rows [`read_session_tool_calls`] returns (the newest are kept).
+const SESSION_TOOL_CALLS_MAX_ROWS: usize = 2000;
+
+/// Tool-call rows of one employee in one session: every row of `turn_id`
+/// (when given) plus every row stamped at or after `since`. Rows without a
+/// `session_id`, or of another employee or session, never match (exact
+/// equality on each field).
+///
+/// Reads under the stable family sidecar lock the writer holds across
+/// rotation and append (same lock as the gateway's pending-confirmation
+/// reader), so a rotation cannot happen mid-read. The lock wait is bounded
+/// by `lock_wait` (`with_file_lock_timeout`): a lock not acquired in time is
+/// an [`std::io::ErrorKind::TimedOut`] error, never an unbounded wait. When
+/// the live file fits in the read bound, the tail of `tool_calls.jsonl.old`
+/// is read too: the window may straddle a rotation. Bounded: at most
+/// [`SESSION_TOOL_CALLS_TAIL_BYTES`] from each file and
+/// [`SESSION_TOOL_CALLS_MAX_ROWS`] rows.
+///
+/// A missing file (or an empty agent / session id) is `Ok` with no rows;
+/// an unavailable lock or an unreadable file is `Err` — the caller must
+/// treat that as "unknown", not as "no rows". Unparsable lines are skipped.
+pub fn read_session_tool_calls(
+    home_dir: &Path,
+    agent_id: &str,
+    session_id: &str,
+    turn_id: Option<&str>,
+    since: chrono::DateTime<Utc>,
+    lock_wait: std::time::Duration,
+) -> std::io::Result<Vec<serde_json::Value>> {
+    if agent_id.is_empty() || session_id.is_empty() {
+        return Ok(Vec::new());
+    }
+    let turn_id = turn_id.filter(|t| !t.is_empty());
+    let path = home_dir.join("tool_calls.jsonl");
+    let backup = path.with_extension("jsonl.old");
+    let (old, live) = duduclaw_core::with_file_lock_timeout(&path, lock_wait, || {
+        let (live, whole) = read_file_tail(&path, SESSION_TOOL_CALLS_TAIL_BYTES)?;
+        let old = if whole {
+            read_file_tail(&backup, SESSION_TOOL_CALLS_TAIL_BYTES)?.0
+        } else {
+            String::new()
+        };
+        Ok((old, live))
+    })?;
+
+    let mut rows: Vec<serde_json::Value> = old
+        .lines()
+        .chain(live.lines())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| {
+            let field = |name: &str| row.get(name).and_then(|v| v.as_str());
+            if field("agent_id") != Some(agent_id) || field("session_id") != Some(session_id) {
+                return false;
+            }
+            let same_turn = turn_id.is_some_and(|t| field("turn_id") == Some(t));
+            let in_window = field("timestamp")
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .is_some_and(|dt| dt.with_timezone(&Utc) >= since);
+            same_turn || in_window
+        })
+        .collect();
+    if rows.len() > SESSION_TOOL_CALLS_MAX_ROWS {
+        rows.drain(..rows.len() - SESSION_TOOL_CALLS_MAX_ROWS);
+    }
+    Ok(rows)
+}
+
+/// The last `max_bytes` of `path`, starting at a line boundary (a partial
+/// first line is dropped), and whether the whole file was read. A missing
+/// file reads as empty and whole.
+fn read_file_tail(path: &Path, max_bytes: u64) -> std::io::Result<(String, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((String::new(), true)),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    if start == 0 {
+        return Ok((text.into_owned(), true));
+    }
+    Ok((text.split_once('\n').map_or(String::new(), |(_, rest)| rest.to_string()), false))
+}
+
 /// Rotation threshold for `tool_calls.jsonl`, in bytes.
 ///
 /// Raised from 5 MB to 16 MB (2026-08 M4 review): B3b's `result_text`
@@ -1121,6 +1214,47 @@ pub fn log_tool_hallucination(
         }),
     );
     append_audit_event(home_dir, &event);
+}
+
+/// [`log_tool_hallucination`] for a rate-limited workspace claim (mail /
+/// calendar / sheets / docs / tasks on the channel-reply path): the same
+/// Critical `tool_hallucination` row plus `suppressed_since_last_row`, the
+/// number of identical (employee, claim family) occurrences that were
+/// counted but not written since the previous row, and
+/// `limiter_overflow_total`, how many staff claims since start were not
+/// audited because the rate limiter's table was full.
+///
+/// Unlike the best-effort writers, the writer-lock wait is bounded by
+/// `lock_wait` ([`crate::audit_chain::append_chained_line_within`]) and
+/// every failure (lock timeout, serialization, write) is returned: the
+/// caller must not treat the row as written on `Err`.
+pub fn log_workspace_claim_hallucination(
+    home_dir: &Path,
+    agent_id: &str,
+    claimed_action: &str,
+    expected_tool: &str,
+    suppressed_since_last_row: u64,
+    limiter_overflow_total: u64,
+    lock_wait: std::time::Duration,
+) -> std::io::Result<()> {
+    let event = AuditEvent::new(
+        "tool_hallucination",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "claimed_action": claimed_action,
+            "expected_tool": expected_tool,
+            "explanation": "Agent claimed to perform an action without calling the corresponding MCP tool",
+            "suppressed_since_last_row": suppressed_since_last_row,
+            "limiter_overflow_total": limiter_overflow_total,
+        }),
+    );
+    let serde_json::Value::Object(map) = serde_json::to_value(&event)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+    else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "audit event must be an object"));
+    };
+    crate::audit_chain::append_chained_line_within(&home_dir.join("security_audit.jsonl"), map, lock_wait)
 }
 
 /// Log an OS ground-truth reconciliation discrepancy (P3-3).

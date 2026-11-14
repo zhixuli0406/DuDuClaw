@@ -7,6 +7,14 @@
 //! - AgentHallu (arXiv 2601.06818): Tool-use hallucination classification
 //!
 //! Design: Zero LLM cost — pure regex matching + log cross-reference.
+//!
+//! Two claim groups:
+//! - agent-management claims ([`extract_action_claims`] /
+//!   [`detect_hallucinations`]): evidence is the employee's rows since the
+//!   dispatch started. Used by the channel reply, cron and bus paths.
+//! - workspace claims (mail / calendar / sheets / docs / tasks, module
+//!   `workspace`): evidence is the employee's rows in the same session only.
+//!   Used by the channel reply path only.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -119,10 +127,23 @@ pub enum ClaimType {
     MessageSent,
     /// Agent claims to have spawned a sub-agent task.
     AgentSpawned,
+    /// Workspace family: claims an email was sent.
+    MailSent,
+    /// Workspace family: claims a calendar event was created.
+    CalendarEventCreated,
+    /// Workspace family: claims a spreadsheet was written to.
+    SheetWritten,
+    /// Workspace family: claims a Google Doc was written to.
+    DocWritten,
+    /// Workspace family: claims a task was created.
+    TaskCreated,
 }
 
 impl ClaimType {
     /// The MCP tool name that must appear in the audit log for this claim.
+    /// For the workspace families this is the representative name written
+    /// to the `tool_hallucination` audit row; the full evidence rule is
+    /// [`ClaimType::evidence_tools`] (and, for mail, `sent == true`).
     pub fn expected_tool(&self) -> &str {
         match self {
             Self::AgentCreated => "create_agent",
@@ -130,9 +151,53 @@ impl ClaimType {
             Self::SoulUpdated => "agent_update_soul",
             Self::MessageSent => "send_to_agent",
             Self::AgentSpawned => "spawn_agent",
+            Self::MailSent => "mail_send",
+            Self::CalendarEventCreated => "calendar_create_event",
+            Self::SheetWritten => "sheets_append",
+            Self::DocWritten => "docs_append",
+            Self::TaskCreated => "tasks_create",
+        }
+    }
+
+    /// Whether this is one of the session-scoped workspace families
+    /// (mail / calendar / sheets / docs / tasks).
+    pub fn is_workspace(&self) -> bool {
+        matches!(
+            self,
+            Self::MailSent
+                | Self::CalendarEventCreated
+                | Self::SheetWritten
+                | Self::DocWritten
+                | Self::TaskCreated
+        )
+    }
+
+    /// Tool names whose successful row backs this claim. Mail has none:
+    /// only a row with `sent == true` backs a "sent" claim — a draft or a
+    /// mail waiting for confirmation is not a sent mail.
+    pub fn evidence_tools(&self) -> &'static [&'static str] {
+        match self {
+            Self::AgentCreated => &["create_agent"],
+            Self::AgentDeleted => &["agent_remove"],
+            Self::SoulUpdated => &["agent_update_soul"],
+            Self::MessageSent => &["send_to_agent"],
+            Self::AgentSpawned => &["spawn_agent"],
+            Self::MailSent => &[],
+            Self::CalendarEventCreated => &["calendar_create_event"],
+            Self::SheetWritten => &["sheets_append"],
+            Self::DocWritten => &["docs_append"],
+            Self::TaskCreated => &["tasks_create", "gtasks_create"],
         }
     }
 }
+
+mod workspace;
+
+pub use workspace::{
+    MAX_SCAN_CHARS, SESSION_EVIDENCE_LOCK_WAIT, SESSION_EVIDENCE_WINDOW_MINUTES, UnbackedClaim,
+    UnbackedKind, WORKSPACE_FAMILIES, detect_unbacked_workspace_claims, extract_workspace_claims,
+    verify_claims_in_session, verify_workspace_claims,
+};
 
 /// A single action claim extracted from agent output.
 #[derive(Debug, Clone, Serialize, Deserialize)]

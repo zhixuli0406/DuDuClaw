@@ -697,6 +697,15 @@ The gateway adds the current source conversation and verified `users.db` Owner b
 
 When enabled, only the gateway-attested, verified company account that started the turn may confirm a held `mail_send` in the same one-to-one conversation or authenticated dashboard WebChat, and only while it has Operator access to that AI employee. The card shows full recipients, subject, body summary and private-read status. Group conversations, unverified/external senders and automated turns cannot decide; a dashboard Admin can still decide. This changes no other outgoing tool. Single-use argument binding, dispatch-time revalidation and expiry-as-deny still apply. See [the complete rule](../features/05-security-defense.md#requester-confirmation-for-mail). Only an adapter-attested one-to-one conversation or authenticated dashboard WebChat is eligible. Group chats and unknown chat types still need a dashboard Admin; public WebChat widget visitors are never eligible. Channel notices for ineligible requests contain no recipients, subject or body; full content stays in the dashboard.
 
+## Action claim check (advanced config editor only)
+
+`config.toml [action_claims] mode` has no switch on a settings page; an Admin sets it in **Settings → Advanced → Advanced config editor**. Values: `"notice"` (default) or `"shadow"`. A missing file, section or key uses the default; the editor refuses any other value, and a hand-edited unknown value is read as `"shadow"` with one warning in the gateway log. The value is read on every reply; no restart is needed.
+
+- `notice`: when a chat reply says an email was sent, a calendar event or task was created, or a spreadsheet or Google Doc was written, and this conversation has no success record for it, one short notice is added to the reply. Only company staff see it (signed-in dashboard accounts in WebChat, and one-to-one messaging-app chats with a verified Admin or an account bound to the employee); visitors, group chats and unverified senders get the reply unchanged.
+- `shadow`: record only. The reply is never changed.
+
+Both modes write each unbacked claim to the gateway log and the security audit log. See [Action claim check](../features/78-action-claim-check.md).
+
 ## Security → Data deletion receipts
 
 Disconnecting a channel, Google account, database source or Remote MCP automatically prepares a memory-deletion request. A disconnect success and a completed deletion are separate results.
