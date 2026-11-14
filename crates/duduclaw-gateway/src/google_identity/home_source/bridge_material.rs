@@ -316,7 +316,12 @@ impl Resolved {
         io.at("after_program")?;
         let mut value = match pending {
             Ok(outcome) => render::render(outcome, &mut io),
-            Err(error) => crate::google_workspace::native_call::tool_error(&error.to_string()),
+            Err(error) => {
+                let mut value = crate::google_workspace::native_call::tool_error(&error.to_string());
+                // RM-130: a tool failure always carries a reason.
+                duduclaw_core::tool_error_reason::ensure_error_reason(template.tool(), None, &mut value);
+                value
+            }
         };
         io.at("after_render")?;
         if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {

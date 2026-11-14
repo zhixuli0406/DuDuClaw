@@ -222,8 +222,10 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
         };
         let space = event.pointer("/message/space/name").and_then(Value::as_str).unwrap_or("");
         let sender = event.pointer("/message/sender/name").and_then(Value::as_str).unwrap_or("");
-        let group = json!([state.agent, space]).to_string();
-        let conversation = json!([state.agent, space, sender]).to_string();
+        // Same queue (and queue-full notice throttle) keys as the HTTP path.
+        let (group, conversation) = crate::googlechat::queue_keys(state.agent.as_deref(), space, sender);
+        let thread = event.pointer("/message/thread/name").and_then(Value::as_str).map(str::to_string);
+        let notice_space = space.to_string();
         let bind = crate::agent_channels::binding_lock().await;
         if !still_current(&state.ctx, state.agent.as_deref(), config).await { break; }
         if !inbox.transition(&stream, &row.id, "pending", "queued")? { continue; }
@@ -241,9 +243,11 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
                 tracing::error!(error = e, "Google Chat inbox completion failed");
             }
         }).is_err() {
-            // Match HTTP overload behavior: ACK/drop, never retry a full queue.
+            // Match HTTP overload behavior: ACK/drop, never retry a full
+            // queue, and tell the space (same throttled notice and keys).
             inbox.transition(&stream, &row.id, "queued", "dropped")?;
             tracing::warn!(agent = ?state.agent, "Google Chat Pub/Sub queue full: ACK and drop; no turn");
+            crate::googlechat::notify_queue_full(state, &group, &conversation, &notice_space, thread.as_deref());
         }
         drop(bind);
     }

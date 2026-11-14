@@ -4,6 +4,10 @@ use super::*;
 pub(crate) const SELECTED_AGENT_UNAVAILABLE: &str =
     "⚠️ 指定的 AI 員工目前無法使用，請檢查頻道設定或重新選擇。";
 
+/// The shared Google Chat app found no employee to answer (no channel
+/// binding, no `default_agent`, no main employee, nobody called by `@`).
+pub(crate) const NO_RESPONDER_TEXT: &str = "尚未設定負責回覆的 AI 員工，請管理員完成設定。";
+
 /// Inner implementation shared by both default-agent and explicit-agent paths.
 ///
 /// Some(name) must resolve exactly; a missing explicit target is refused.
@@ -228,6 +232,14 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
     };
+    // The shared Google Chat app with nobody to answer used to run the turn
+    // with an empty agent id (the default model, no employee's instructions
+    // or memory). Refuse instead; the access gate and takeover ran above.
+    if agent.is_none()
+        && crate::trajectory_guard::channel_from_session_id(session_id) == Some("googlechat")
+    {
+        return NO_RESPONDER_TEXT.into();
+    }
     if let Some(a) = agent {
         // Revalidate the actual LoadedAgent, not the earlier selected name.
         // The authenticated account is host-owned task-local state; a model
@@ -4039,13 +4051,18 @@ pub(super) async fn build_reply_with_session_inner(
     // new token. Alarm once per outage; `record_outage` debounces and
     // swallows its own errors, so this can never turn a fallback message into
     // a hard failure.
+    let outage_agent = if agent_id.trim().is_empty() {
+        "system"
+    } else {
+        agent_id.as_str()
+    };
     if let Some(auth_error) = failure.claude_auth_error() {
-        let outage_agent = if agent_id.trim().is_empty() {
-            "system"
-        } else {
-            agent_id.as_str()
-        };
         crate::auth_outage::record_outage(&ctx.home_dir, outage_agent, auth_error).await;
+    } else if super::failure_message::is_quota_exhaustion(reason) {
+        // Same immediate, once-per-outage alarm for "every account is out of
+        // quota" (Activity Feed row + one push); the member is told an
+        // administrator was notified.
+        crate::auth_outage::record_quota_outage(&ctx.home_dir, outage_agent).await;
     }
 
     // Append a structured audit line so the dashboard can surface failure trends.

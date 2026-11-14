@@ -21,6 +21,7 @@ pub(super) async fn gmail_search(
             json!({ "query": query, "limit": max_results }),
         )
         .await?;
+    require_success(google_apps_script::BridgeAction::GmailSearch, &v, &[Needs::List("messages")])?;
     let messages: Vec<GmailMessageMeta> = v
         .get("messages")
         .and_then(|m| m.as_array())
@@ -55,6 +56,7 @@ pub(super) async fn gmail_read(
             json!({ "message_id": message_id }),
         )
         .await?;
+    require_success(google_apps_script::BridgeAction::GmailRead, &v, &[Needs::Text("message_id")])?;
     let attachments = v
         .get("attachments")
         .and_then(|a| a.as_array())
@@ -106,6 +108,8 @@ pub(super) async fn gmail_create_draft(
             json!({ "to": to, "subject": subject, "body": body_text }),
         )
         .await?;
+    // No draft id = no proof a draft exists; never report "Draft created".
+    require_success(google_apps_script::BridgeAction::GmailCreateDraft, &v, &[Needs::Text("draft_id")])?;
     Ok(GmailDraftResult {
         draft_id: bs(&v, "draft_id"),
         message_id: bs(&v, "message_id"),
@@ -129,6 +133,7 @@ pub(super) async fn calendar_list_events(
             json!({ "days": days }),
         )
         .await?;
+    require_success(google_apps_script::BridgeAction::CalendarListEvents, &v, &[Needs::List("events")])?;
     let events: Vec<CalendarEvent> = v
         .get("events")
         .and_then(|e| e.as_array())
@@ -186,13 +191,18 @@ pub(super) async fn calendar_create_event(
             }),
         )
         .await?;
+    // No event id back = no proof the event exists.
+    require_success(google_apps_script::BridgeAction::CalendarCreateEvent, &v, &[Needs::Text("id")])?;
     Ok(CalendarCreateResult {
         id: bs(&v, "id"),
-        summary: bs(&v, "title"),
-        start: bs(&v, "start"),
+        summary: Some(bs(&v, "title")).filter(|s| !s.is_empty()).unwrap_or_else(|| summary.to_string()),
+        start: Some(bs(&v, "start")).filter(|s| !s.is_empty()).unwrap_or_else(|| start_rfc3339.to_string()),
         end: end_rfc3339.to_string(),
+        // The script returns no link; the renderer omits an empty one.
         html_link: String::new(),
         meet_link: None,
+        // Attendees are refused above, so nobody was invited.
+        attendees_invited: 0,
     })
 }
 pub(super) async fn sheets_read(
@@ -206,6 +216,7 @@ pub(super) async fn sheets_read(
             json!({ "spreadsheet": spreadsheet_id, "range": range }),
         )
         .await?;
+    require_success(google_apps_script::BridgeAction::SheetsRead, &v, &[Needs::List("values")])?;
     let rows: Vec<Vec<String>> = v
         .get("values")
         .and_then(|r| r.as_array())
@@ -234,23 +245,102 @@ pub(super) async fn sheets_append(
     range: &str,
     values: Vec<String>,
 ) -> Result<SheetsAppendResult, GoogleApiError> {
-    let cells = values.len() as u64;
+    // The script appends one row after the last row of the FIRST sheet and
+    // takes no range. (It also accepts an optional sheet name, but a copy
+    // deployed from an older template may not, and would then append to the
+    // first sheet anyway — so none is sent.) The result says so instead of
+    // echoing the requested range back as if it had been used.
     let v = io
         .call(
             google_apps_script::BridgeAction::SheetsAppend,
             json!({ "spreadsheet": spreadsheet_id, "values": values }),
         )
         .await?;
+    require_success(google_apps_script::BridgeAction::SheetsAppend, &v, &[Needs::Yes("appended")])?;
     let row = bu(&v, "row");
     Ok(SheetsAppendResult {
-        updated_range: if row > 0 {
-            format!("row {row}")
-        } else {
-            range.to_string()
-        },
-        updated_rows: 1,
-        updated_cells: cells,
+        // Only what the script reported: the last row number after the append.
+        updated_range: if row > 0 { format!("first sheet, row {row}") } else { String::new() },
+        // The script reports no row/cell counts; omit them rather than guess.
+        updated_rows: None,
+        updated_cells: None,
+        note: Some(bridge_append_note(range)),
     })
+}
+
+/// What a bridge append did with the requested range.
+pub(super) fn bridge_append_note(range: &str) -> String {
+    let range = range.trim();
+    if range.is_empty() {
+        "The Apps Script bridge appended the row to the first sheet of the spreadsheet.".to_string()
+    } else {
+        format!(
+            "The Apps Script bridge appended the row to the first sheet of the spreadsheet; the requested range \"{}\" was ignored.",
+            duduclaw_core::truncate_chars(range, 200)
+        )
+    }
+}
+
+/// One field a bridge reply must carry to count as a success.
+#[derive(Clone, Copy)]
+pub(super) enum Needs {
+    /// A non-empty string (an id).
+    Text(&'static str),
+    /// A JSON array (possibly empty).
+    List(&'static str),
+    /// The literal `true`.
+    Yes(&'static str),
+}
+
+/// A bridge reply is a success only in the shape the shipped script returns
+/// for that action. An empty object, `{"ok": false}`, an `error` of any type
+/// (string, object, number) or a missing/blank required field is a tool
+/// error with a reason — never a success filled with empty strings.
+pub(super) fn require_success(
+    action: google_apps_script::BridgeAction,
+    v: &Value,
+    needs: &[Needs],
+) -> Result<(), GoogleApiError> {
+    let fail = |reason: String| {
+        Err(GoogleApiError::Api {
+            status: 502,
+            message: format!("Apps Script bridge `{}` did not succeed: {reason}", action.as_str()),
+        })
+    };
+    let Some(map) = v.as_object() else {
+        return fail("the reply is not a JSON object".into());
+    };
+    if let Some(error) = map.get("error").filter(|e| !e.is_null()) {
+        let text = error
+            .as_str()
+            .or_else(|| error.get("message").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| duduclaw_core::truncate_chars(t, 300));
+        return fail(text.unwrap_or_else(|| {
+            duduclaw_core::tool_error_reason::missing_error_reason(action.as_str(), Some("apps_script_bridge"), None, None)
+        }));
+    }
+    if map.get("ok").is_some_and(|ok| ok.as_bool() != Some(true)) {
+        return fail("the script reported ok: false".into());
+    }
+    for need in needs {
+        let missing = match *need {
+            Needs::Text(key) => !map
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty()),
+            Needs::List(key) => !map.get(key).is_some_and(Value::is_array),
+            Needs::Yes(key) => map.get(key).and_then(Value::as_bool) != Some(true),
+        };
+        if missing {
+            let key = match *need {
+                Needs::Text(k) | Needs::List(k) | Needs::Yes(k) => k,
+            };
+            return fail(format!("the reply has no `{key}`"));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn bs(v: &Value, key: &str) -> String {
@@ -279,6 +369,107 @@ pub(super) fn bridge_err(e: crate::google_apps_script::BridgeError) -> GoogleApi
     GoogleApiError::Api {
         status: 502,
         message: e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod success_shape_tests {
+    use super::*;
+
+    /// Answers every call with one fixed reply.
+    struct Reply(Value);
+    #[async_trait::async_trait]
+    impl LocalIo for Reply {
+        async fn call(
+            &mut self,
+            _: google_apps_script::BridgeAction,
+            _: Value,
+        ) -> Result<Value, GoogleApiError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn not_success() -> Vec<Value> {
+        vec![
+            json!({}),
+            json!({"ok": false}),
+            json!({"error": {"code": 500}}),
+            json!({"error": {"message": "quota exceeded"}}),
+            json!({"error": 7}),
+            json!({"error": "boom"}),
+            json!([]),
+            json!("ok"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn empty_failed_or_error_replies_are_errors_with_a_reason() {
+        for reply in not_success() {
+            let draft = gmail_create_draft(&mut Reply(reply.clone()), "a@b.test", "s", "b", None).await;
+            let event = calendar_create_event(&mut Reply(reply.clone()), "s", "2026-08-01T00:00:00Z", "2026-08-01T01:00:00Z", None, None, false).await;
+            let append = sheets_append(&mut Reply(reply.clone()), "sheet", "A1", vec!["x".into()]).await;
+            let search = gmail_search(&mut Reply(reply.clone()), "q", 5).await;
+            for message in [
+                draft.err().map(|e| e.to_string()),
+                event.err().map(|e| e.to_string()),
+                append.err().map(|e| e.to_string()),
+                search.err().map(|e| e.to_string()),
+            ] {
+                let message = message.unwrap_or_else(|| panic!("{reply} must be an error"));
+                assert!(message.contains("did not succeed"), "{message}");
+                assert!(message.len() > "did not succeed: ".len());
+            }
+        }
+        let error = gmail_create_draft(&mut Reply(json!({"error":{"message":"quota exceeded"}})), "a@b.test", "s", "b", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("quota exceeded"), "{error}");
+        let error = gmail_create_draft(&mut Reply(json!({"error":{"code":1}})), "a@b.test", "s", "b", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("returned no error message"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn blank_ids_are_not_success() {
+        assert!(gmail_create_draft(&mut Reply(json!({"draft_id": "", "message_id": "m"})), "a@b.test", "s", "b", None).await.is_err());
+        assert!(gmail_create_draft(&mut Reply(json!({"draft_id": "  "})), "a@b.test", "s", "b", None).await.is_err());
+        assert!(calendar_create_event(&mut Reply(json!({"id": "", "title": "s"})), "s", "a", "b", None, None, false).await.is_err());
+        assert!(sheets_append(&mut Reply(json!({"appended": false, "row": 3})), "sheet", "A1", vec![]).await.is_err());
+        assert!(sheets_append(&mut Reply(json!({"row": 3})), "sheet", "A1", vec![]).await.is_err());
+        let draft = gmail_create_draft(&mut Reply(json!({"draft_id": "d1", "message_id": "m1"})), "a@b.test", "s", "b", None).await.unwrap();
+        assert_eq!(draft.draft_id, "d1");
+    }
+
+    #[tokio::test]
+    async fn calendar_event_reports_no_attendees() {
+        let event = calendar_create_event(
+            &mut Reply(json!({"id": "ev1", "title": "s", "start": "2026-08-01T00:00:00.000Z"})),
+            "s", "2026-08-01T00:00:00Z", "2026-08-01T01:00:00Z", None, None, false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(event.id, "ev1");
+        assert_eq!(event.attendees_invited, 0);
+        assert!(event.html_link.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sheets_append_says_the_range_was_ignored_and_reports_no_assumed_counts() {
+        let result = sheets_append(&mut Reply(json!({"appended": true, "row": 12})), "sheet", "Sheet2!B3", vec!["x".into(), "y".into()])
+            .await
+            .unwrap();
+        assert_eq!(result.updated_range, "first sheet, row 12");
+        assert_eq!(result.updated_rows, None);
+        assert_eq!(result.updated_cells, None);
+        let note = result.note.unwrap();
+        assert!(note.contains("first sheet"), "{note}");
+        assert!(note.contains("\"Sheet2!B3\" was ignored"), "{note}");
+        let result = sheets_append(&mut Reply(json!({"appended": true})), "sheet", "", vec![]).await.unwrap();
+        assert!(result.updated_range.is_empty());
+        assert!(!result.note.unwrap().contains("ignored"));
     }
 }
 

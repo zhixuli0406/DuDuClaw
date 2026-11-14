@@ -299,17 +299,54 @@ async fn check_reminder(home: &Path, agent: &str) {
             if serde_json::from_slice::<crate::auth_outage::AuthOutageState>(&raw).is_ok_and(|s| s.active) { return; }
         }
     }
-    let targets = match owner_targets(home, agent) {
-        Ok(targets) if !targets.is_empty() => targets,
-        _ => return,
-    };
+    // A lookup error is treated like "nobody to push to": the episode is
+    // still announced, on the dashboard.
+    let targets = owner_targets(home, agent).unwrap_or_default();
     // Persist the claim before I/O, once per episode across processes/restarts.
     let claim_home = home.to_path_buf();
     let claim_agent = agent.to_owned();
     let claimed = tokio::task::spawn_blocking(move || claim_reminder(&claim_home, &claim_agent, cfg)).await;
     if !matches!(claimed, Ok(Ok(true))) { return; }
     let text = "有 AI 員工持續無法完成回覆，請到儀表板的「員工健康」查看並處理。";
-    let _ = crate::notify_push::push_health_notice(home, agent, text, targets).await;
+    let reached = if targets.is_empty() {
+        false
+    } else {
+        let receipt = crate::notify_push::push_health_notice(home, agent, text, targets).await;
+        receipt.attempted > 0 || receipt.delivered.is_some()
+    };
+    if !reached {
+        post_unreachable_notice(home, agent).await;
+    }
+}
+
+/// Activity Feed event for a health alert no admin could be pushed.
+pub(crate) const UNREACHABLE_EVENT: &str = "employee_health_unreachable";
+const UNREACHABLE_TEXT: &str =
+    "有 AI 員工持續無法完成回覆，但沒有管理員或負責人綁定可接收通知的帳號，所以這則提醒只顯示在儀表板。請到「員工健康」查看並處理，並在「使用者」頁綁定通知帳號。";
+
+/// No owner/admin has a pushable verified channel: record the alert where
+/// the dashboard shows account-wide alarms (the Activity Feed, same as the
+/// account-outage alarm) instead of telling nobody.
+async fn post_unreachable_notice(home: &Path, agent: &str) {
+    let store = match crate::task_store::TaskStore::open(home) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::warn!(error = %e, "employee health: dashboard notice store unavailable");
+            return;
+        }
+    };
+    let row = crate::task_store::ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: UNREACHABLE_EVENT.to_string(),
+        agent_id: agent.to_string(),
+        task_id: None,
+        summary: UNREACHABLE_TEXT.to_string(),
+        timestamp: Utc::now().to_rfc3339(),
+        metadata: None,
+    };
+    if let Err(e) = store.append_activity(&row).await {
+        tracing::warn!(error = %e, "employee health: dashboard notice append failed");
+    }
 }
 pub(crate) async fn run(home: PathBuf, registry: std::sync::Arc<tokio::sync::RwLock<duduclaw_agent::registry::AgentRegistry>>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -373,6 +410,23 @@ mod tests {
         assert_eq!(snapshot.by_agent["a"]["timeout"], 1);
         assert_eq!(snapshot.by_agent["a"]["gate_refused"], 1);
         assert_eq!(snapshot.by_agent["a"].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn health_alert_without_any_admin_binding_lands_on_the_dashboard_once() {
+        let home = tempfile::tempdir().unwrap();
+        record_received(home.path(), "a").await;
+        for _ in 0..5 {
+            record_turn(home.path(), "a", Some("timeout")).await;
+        }
+        check_reminder(home.path(), "a").await;
+        check_reminder(home.path(), "a").await;
+        let store = crate::task_store::TaskStore::open(home.path()).unwrap();
+        let (rows, _) = store.list_activity(None, Some(UNREACHABLE_EVENT), 50, 0).await.unwrap();
+        assert_eq!(rows.len(), 1, "one dashboard notice per episode");
+        assert_eq!(rows[0].agent_id, "a");
+        assert!(rows[0].summary.contains("員工健康"));
+        assert!(state(home.path(), "a").unwrap().alerted);
     }
 
     #[test]

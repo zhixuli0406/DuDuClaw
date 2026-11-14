@@ -471,16 +471,23 @@ async fn receive_webhook(
                                     .map(|a| a.config.agent.name.clone())
                                     .unwrap_or_default()
                             };
-                            let reply = crate::chat_commands::handle_command_for_sender(
-                &cmd,
-                &state.ctx,
-                "whatsapp",
-                &session_id,
-                &agent_id,
-                sender,
-            )
+                            // Behind the same access gate as the reply path; a
+                            // WhatsApp conversation is always one person's.
+                            let origin = crate::chat_commands::CommandOrigin {
+                                channel: "whatsapp",
+                                gate_session: &session_id,
+                                command_session: &session_id,
+                                sender,
+                                text: &input_text,
+                                shared: false,
+                            };
+                            let reply = crate::chat_commands::handle_gated_command(
+                                &cmd, &state.ctx, &origin, &agent_id,
+                            )
                             .await;
-                            send_text(&state.http, &access_token, &phone_id, sender, &reply).await;
+                            if !reply.trim().is_empty() {
+                                send_text(&state.http, &access_token, &phone_id, sender, &reply).await;
+                            }
                             continue;
                         }
                     }

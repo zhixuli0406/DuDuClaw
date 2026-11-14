@@ -409,12 +409,23 @@ pub(super) async fn calendar_create_event<I: LocalIo>(
     )
     .await?;
 
+    // No event id back = no proof the event exists; never report success.
+    let id = resp
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| GoogleApiError::Api {
+            status: 502,
+            message: "Google Calendar returned no event id; the event may not have been created. Check the calendar before retrying.".into(),
+        })?
+        .to_string();
     Ok(CalendarCreateResult {
-        id: resp
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        id,
+        attendees_invited: resp
+            .get("attendees")
+            .and_then(|v| v.as_array())
+            .map_or(0, Vec::len),
         summary: resp
             .get("summary")
             .and_then(|v| v.as_str())
@@ -508,14 +519,9 @@ pub(super) async fn sheets_append<I: LocalIo>(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        updated_rows: updates
-            .get("updatedRows")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        updated_cells: updates
-            .get("updatedCells")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        updated_rows: updates.get("updatedRows").and_then(|v| v.as_u64()),
+        updated_cells: updates.get("updatedCells").and_then(|v| v.as_u64()),
+        note: None,
     })
 }
 
@@ -1533,6 +1539,50 @@ fn tool_text(text: &str) -> Value {
 fn tool_error(text: &str) -> Value {
     json!({"content":[{"type":"text","text":text}],"isError":true})
 }
+/// Only what Google reported: attendees are mentioned only when the event
+/// has some (and "added", not "notified" — whether Google emailed them is
+/// not reported), an empty link is left out.
+pub(super) fn calendar_created_text(r: &CalendarCreateResult) -> String {
+    let mut text = format!(
+        "Calendar event created (externally visible).\nEvent ID: {}\nSummary: {}\nStart: {}\nEnd: {}",
+        r.id, r.summary, r.start, r.end
+    );
+    if !r.html_link.is_empty() {
+        text.push_str(&format!("\nLink: {}", r.html_link));
+    }
+    if r.attendees_invited > 0 {
+        text.push_str(&format!("\nAttendees added: {}", r.attendees_invited));
+    } else {
+        text.push_str("\nAttendees: none");
+    }
+    if let Some(meet) = r.meet_link.as_deref() {
+        text.push_str(&format!("\nGoogle Meet: {meet}"));
+    }
+    text
+}
+
+/// Counts appear only when the service reported them.
+pub(super) fn sheets_appended_text(r: &SheetsAppendResult) -> String {
+    let mut text = match r.updated_rows {
+        Some(1) => "Appended 1 row to the sheet.".to_string(),
+        Some(n) => format!("Appended {n} rows to the sheet."),
+        None => "Appended a row to the sheet.".to_string(),
+    };
+    if !r.updated_range.is_empty() {
+        text.push_str(&format!("\nUpdated range: {}", r.updated_range));
+    }
+    if let Some(n) = r.updated_rows {
+        text.push_str(&format!("\nUpdated rows: {n}"));
+    }
+    if let Some(n) = r.updated_cells {
+        text.push_str(&format!("\nUpdated cells: {n}"));
+    }
+    if let Some(note) = r.note.as_deref() {
+        text.push_str(&format!("\nNote: {note}"));
+    }
+    text
+}
+
 pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
     match value {
         Outcome::Chat(r) => render_chat(&r, io),
@@ -1548,25 +1598,19 @@ pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
         Outcome::DriveRead(r) => render_json(&r, io),
         Outcome::DocsRead(r) => render_json(&r, io),
         Outcome::SlidesRead(r) => render_json(&r, io),
+        // Last line of defence for every backend: no id, no "created".
+        Outcome::GmailDraft(r) if r.draft_id.trim().is_empty() => tool_error(
+            "Gmail returned no draft id; the draft may not have been created. Check Gmail drafts before retrying.",
+        ),
+        Outcome::CalendarCreate(r) if r.id.trim().is_empty() => tool_error(
+            "Google Calendar returned no event id; the event may not have been created. Check the calendar before retrying.",
+        ),
         Outcome::GmailDraft(r) => tool_text(&format!(
             "Draft created — NOT sent. Review and send it manually in Gmail.\nDraft ID: {}\nTo: {}\nSubject: {}",
             r.draft_id, r.to, r.subject
         )),
-        Outcome::CalendarCreate(r) => {
-            let meet = r
-                .meet_link
-                .as_deref()
-                .map(|l| format!("\nGoogle Meet: {l}"))
-                .unwrap_or_default();
-            tool_text(&format!(
-                "Calendar event created (externally visible; attendees notified).\nEvent ID: {}\nSummary: {}\nStart: {}\nEnd: {}\nLink: {}{}",
-                r.id, r.summary, r.start, r.end, r.html_link, meet
-            ))
-        }
-        Outcome::SheetsAppend(r) => tool_text(&format!(
-            "Appended 1 row to the sheet.\nUpdated range: {}\nUpdated rows: {}\nUpdated cells: {}",
-            r.updated_range, r.updated_rows, r.updated_cells
-        )),
+        Outcome::CalendarCreate(r) => tool_text(&calendar_created_text(&r)),
+        Outcome::SheetsAppend(r) => tool_text(&sheets_appended_text(&r)),
         Outcome::TasksCreate(t) => tool_text(&format!(
             "Task created in the user's Google Tasks.\nTask ID: {}\nTitle: {}\nStatus: {}\nDue: {}",
             t.id,
@@ -1706,7 +1750,12 @@ pub(super) async fn run<I: LocalIo>(template: &NativeCallTemplate, io: &mut I) -
     }
     match result {
         Ok(value) => render(value, io),
-        Err(e) => tool_error(&e.to_string()),
+        Err(e) => {
+            let mut value = tool_error(&e.to_string());
+            // RM-130: a tool failure always carries a reason.
+            duduclaw_core::tool_error_reason::ensure_error_reason(template.tool(), None, &mut value);
+            value
+        }
     }
 }
 // Every representation transform stays in this owner-local instance.

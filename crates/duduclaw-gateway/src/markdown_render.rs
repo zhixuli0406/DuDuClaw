@@ -18,6 +18,13 @@
 //! per-platform. All text handling is CJK-safe (no raw byte slicing;
 //! display-width aware table alignment).
 
+#[path = "markdown_render/googlechat_markup.rs"]
+mod googlechat_markup;
+
+#[cfg(test)]
+#[path = "markdown_render/googlechat_markup_tests.rs"]
+mod googlechat_markup_tests;
+
 // ── Block IR ───────────────────────────────────────────────────
 
 /// A block-level markdown element.
@@ -443,9 +450,11 @@ pub fn convert_inline(text: &str, target: InlineTarget) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
 
-    // Push plain text with target escaping.
+    // Push plain text with target escaping (Google Chat: mention / link
+    // delimiters in untrusted text are made inert).
     let push_text = |out: &mut String, s: &str| match target {
         InlineTarget::TelegramHtml => out.push_str(&escape_html(s)),
+        InlineTarget::GoogleChat => out.push_str(&googlechat_markup::neutralize(s)),
         _ => out.push_str(s),
     };
 
@@ -486,7 +495,7 @@ pub fn convert_inline(text: &str, target: InlineTarget) -> String {
                         ));
                     }
                     InlineTarget::GoogleChat => {
-                        out.push_str(&format!("<{url}|{text_part}>"));
+                        out.push_str(&googlechat_markup::link(&text_part, &url));
                     }
                     InlineTarget::WhatsApp | InlineTarget::Plain => {
                         if text_part == url {
@@ -727,7 +736,9 @@ fn googlechat_text(text: &str, quote_depth: u8) -> String {
                     let title = row.first().filter(|v| !v.is_empty()).cloned()
                         .unwrap_or_else(|| format!("#{}", index + 1));
                     // The title already has bold delimiters; avoid nesting them.
-                    let title = convert_inline(&title, InlineTarget::Plain);
+                    // Plain conversion does not escape, so neutralize here.
+                    let title =
+                        googlechat_markup::neutralize(&convert_inline(&title, InlineTarget::Plain));
                     let mut lines = vec![format!("*{title}*")];
                     for (column, value) in row.iter().enumerate().skip(1) {
                         let key = headers.get(column).map(String::as_str).unwrap_or("");

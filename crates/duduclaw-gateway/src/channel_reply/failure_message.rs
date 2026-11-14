@@ -392,7 +392,29 @@ pub(super) fn operator_access_refusal(language: Option<&str>) -> &'static str {
     }
 }
 
+/// Every account is out of quota: usage limit, rate limit, credit, or a
+/// quota cooldown. Same grouping as the turn-failure notice's `Quota`.
+pub(crate) fn is_quota_exhaustion(reason: FailureReason) -> bool {
+    matches!(
+        super::failure_notice::TurnFailureReason::from(reason),
+        super::failure_notice::TurnFailureReason::Quota
+    )
+}
+
+/// What a member (not an operator, not a public visitor) is told when no
+/// account could answer. No account names, provider text or links.
 pub(super) fn end_user_failure_message(agent: &str, reason: FailureReason, language: Option<&str>) -> String {
+    if is_quota_exhaustion(reason) {
+        // The quota alarm (`auth_outage::record_quota_outage`) has fired
+        // for this failure, so "已通知管理員" is true.
+        return match language.unwrap_or("zh-TW") {
+            "zh-CN" | "zh_CN" => "目前 AI 服务用量已达上限，暂时无法回应。已通知管理员，请稍后再试。",
+            "en" => "The AI service has reached its usage limit and cannot respond right now. An administrator has been notified; please try again later.",
+            "ja" | "ja-JP" => "AI サービスの利用上限に達したため、現在応答できません。管理者に通知しました。しばらくしてからもう一度お試しください。",
+            _ => "目前 AI 服務用量已達上限，暫時無法回應。已通知管理員，請稍後再試。",
+        }
+        .to_string();
+    }
     match (language.unwrap_or("zh-TW"), reason) {
         ("zh-CN" | "zh_CN", FailureReason::Timeout) => format!("{agent} 这次处理超时，请稍后重试，或将工作拆成较小的步骤。"),
         ("zh-CN" | "zh_CN", _) => format!("{agent} 暂时无法回应，请稍后再试；若持续发生，请联系管理员。"),
@@ -408,6 +430,53 @@ pub(super) fn end_user_failure_message(agent: &str, reason: FailureReason, langu
 #[cfg(test)]
 mod audience_tests {
     use super::*;
+
+    #[test]
+    fn quota_exhaustion_gets_its_own_member_sentence() {
+        const QUOTA: &str = "目前 AI 服務用量已達上限，暫時無法回應。已通知管理員，請稍後再試。";
+        for reason in [
+            FailureReason::RateLimited,
+            FailureReason::Billing,
+            FailureReason::AccountsCoolingDownLong,
+            FailureReason::AccountsCoolingDownShort,
+        ] {
+            assert!(is_quota_exhaustion(reason), "{reason:?}");
+            assert_eq!(end_user_failure_message("Worker", reason, None), QUOTA);
+            for language in ["en", "ja-JP", "zh-CN"] {
+                let text = end_user_failure_message("Worker", reason, Some(language));
+                assert_ne!(text, QUOTA);
+                assert!(!text.contains("Worker"), "no detail: {text}");
+            }
+        }
+        for reason in [
+            FailureReason::AuthFailed,
+            FailureReason::SpawnError,
+            FailureReason::Unknown,
+            FailureReason::NoAccounts,
+            FailureReason::AccountsCoolingDownUnknown,
+        ] {
+            assert!(!is_quota_exhaustion(reason), "{reason:?}");
+            assert_eq!(
+                end_user_failure_message("Worker", reason, None),
+                "Worker 暫時無法回應，請稍後再試；若持續發生，請聯絡管理員。"
+            );
+        }
+        assert!(end_user_failure_message("Worker", FailureReason::Timeout, None).contains("逾時"));
+    }
+
+    /// The all-accounts-failed branch raises the same once-per-outage alarm
+    /// for quota exhaustion as for authentication (checked over the source:
+    /// the branch sits at the end of a full model turn).
+    #[test]
+    fn quota_exhaustion_raises_the_outage_alarm() {
+        let src = include_str!("inner.rs").replace("\r\n", "\n");
+        let auth = src.find("crate::auth_outage::record_outage(&ctx.home_dir, outage_agent").unwrap();
+        let quota = src.find("} else if super::failure_message::is_quota_exhaustion(reason) {").unwrap();
+        let alarm = src.find("crate::auth_outage::record_quota_outage(&ctx.home_dir, outage_agent)").unwrap();
+        assert!(auth < quota && quota < alarm);
+        // Before the member's sentence is chosen.
+        assert!(alarm < src.find("return end_user_failure_message(&name, reason").unwrap());
+    }
 
     #[test]
     fn prompt_identity_simplified_chinese_fixed_messages() {

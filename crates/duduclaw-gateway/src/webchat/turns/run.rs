@@ -28,6 +28,24 @@ impl Drop for RefuseCancelledDelivery<'_> {
     }
 }
 
+/// The access verdict for a WebChat chat command: the fail-closed command
+/// gate on the same session and sender a normal message is gated on.
+/// `None` = may run; `Some("")` = silence; `Some(text)` = the same pairing
+/// hint / `/pair` verdict a normal message would get (no other wording, so a
+/// public widget visitor learns nothing about the policy).
+pub(super) async fn webchat_command_gate(
+    ctx: &crate::channel_reply::ReplyContext,
+    sid: &str,
+    user_id: &str,
+    content: &str,
+) -> Option<String> {
+    crate::channel_reply::check_command_access_gate(ctx, sid, user_id, content).await
+}
+
+#[cfg(test)]
+#[path = "run_command_gate_tests.rs"]
+mod command_gate_tests;
+
 pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     let TurnInput {
         state,
@@ -104,6 +122,32 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     // Check for chat commands first
     if crate::chat_commands::is_command(&content) {
         if !ticket.begin_delivery() {
+            return;
+        }
+        // The access gate a normal message meets at the top of the reply
+        // pipeline, on the same `sid` / `user_id`, before any command
+        // handling. Credential, target ACL and admin checks stay separate,
+        // later restrictions.
+        if let Some(gate_reply) = webchat_command_gate(&state.ctx, sid, &user_id, &content).await {
+            if gate_reply.trim().is_empty() {
+                // Kept silent on purpose, exactly like a gated message.
+                return;
+            }
+            let done = ChatMessage::AssistantDone {
+                content: gate_reply,
+                tokens_used: 0,
+                conv: conv_nonce.clone(),
+                model: None,
+                artifact: None,
+                agent: None,
+                agent_name: None,
+                citations: None,
+                thinking: None,
+                task: None,
+            };
+            if let Ok(json) = serde_json::to_string(&done) {
+                let _ = sink.send(Message::Text(json.into())).await;
+            }
             return;
         }
         if let Some(mut cmd) = crate::chat_commands::parse_command(&content, None) {

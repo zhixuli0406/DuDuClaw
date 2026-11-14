@@ -301,6 +301,26 @@ fn strip_feishu_mentions(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Where a Feishu chat command came from. The conversation counts as shared
+/// (group rule for clearing history) unless Feishu says it is an explicit
+/// 1:1 chat (`chat_type = "p2p"`): `group`, `topic_group`, a missing or an
+/// unknown type all fail closed, the same rule as the thinking policy.
+fn feishu_command_origin<'a>(
+    message: &serde_json::Value,
+    session_id: &'a str,
+    sender: &'a str,
+    text: &'a str,
+) -> crate::chat_commands::CommandOrigin<'a> {
+    crate::chat_commands::CommandOrigin {
+        channel: "feishu",
+        gate_session: session_id,
+        command_session: session_id,
+        sender: crate::ccr_runtime::reply_principal_for_sender(sender),
+        text,
+        shared: crate::thinking::channel_policy::feishu_is_group(message),
+    }
+}
+
 async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     if crate::product_policy::require_channel(&state.ctx.home_dir, "feishu").is_err() { return; }
     let message = match event.get("message") {
@@ -426,15 +446,13 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command_for_sender(
-                &cmd,
-                &state.ctx,
-                "feishu",
-                &session_id,
-                &agent_id,
-                sender,
-            )
-            .await;
+            // Same access gate as the reply path (same session, same laundered
+            // sender); a group chat's history is cleared only by a verified
+            // Admin/Manager.
+            let origin = feishu_command_origin(message, &session_id, sender, &text);
+            let reply =
+                crate::chat_commands::handle_gated_command(&cmd, &state.ctx, &origin, &agent_id)
+                    .await;
             if !reply.trim().is_empty() {
                 send_message(state, chat_id, &reply).await;
             }
@@ -953,3 +971,7 @@ mod ccr_principal_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "feishu_command_tests.rs"]
+mod command_access_tests;
