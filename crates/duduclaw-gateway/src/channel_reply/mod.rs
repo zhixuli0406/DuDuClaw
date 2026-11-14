@@ -271,6 +271,7 @@ pub use crate::runtime::ConversationTurn;
 // re-exports below.
 
 mod access_gate;
+pub(crate) mod assembly;
 mod breaker_wait;
 mod ccr_delivery;
 mod cli_env;

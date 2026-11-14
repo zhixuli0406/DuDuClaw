@@ -1684,9 +1684,12 @@ pub(super) async fn build_reply_with_session_inner(
         runtime_settings.as_ref().map(|s| s.provider.as_str()).unwrap_or("claude"),
     );
 
-    let cli_future: std::pin::Pin<
+    let reply_assembly = super::assembly::Assembly::new(
+        session_id, &ctx.home_dir, agent_dir.as_deref(), &agent_id,
+    );
+    let make_cli_future = || -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ReplyAttempt, ReplyFailure>> + Send + '_>,
-    > = if duduclaw_llm::is_moa_model_id(&model) {
+    > { if duduclaw_llm::is_moa_model_id(&model) {
         // MoA virtual model (`moa:<name>`) — API-mode only. A CLI spawn can
         // never serve an ensemble (and `claude -p --model moa:x` would just
         // 404 upstream), so route straight through the duduclaw-llm MoA
@@ -1840,7 +1843,9 @@ pub(super) async fn build_reply_with_session_inner(
             .map(|text| ReplyAttempt::new(text, ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude)))
             .map_err(|error| ReplyFailure::simple(ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude), error))
         })
+    }
     };
+    let cli_future = reply_assembly.run(make_cli_future);
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES
         .iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
@@ -1871,9 +1876,10 @@ pub(super) async fn build_reply_with_session_inner(
     let inference_mode = crate::claude_runner::get_inference_mode(&ctx.home_dir).await;
     let mut local_attempted_first = false;
     let mut local_first_reply: Option<String> = None;
+    let mut local_first_refusal = None;
     if local_inference_first(&inference_mode) {
         local_attempted_first = true;
-        match crate::claude_runner::try_local_inference(
+        match reply_assembly.text(ReplyOrigin::Local, || crate::claude_runner::try_local_inference(
             &ctx.home_dir,
             &sanitized_text,
             &full_system_prompt,
@@ -1881,7 +1887,7 @@ pub(super) async fn build_reply_with_session_inner(
             Some(&agent_id),
             capabilities.as_ref(),
         )
-        .await
+        ).await
         {
             Ok(local_reply) => {
                 info!(
@@ -1896,6 +1902,8 @@ pub(super) async fn build_reply_with_session_inner(
                 );
             }
             Err(e) => {
+                let failure = ReplyFailure::simple(ReplyOrigin::Local, e.clone());
+                if failure.stop_fallbacks() { local_first_refusal = Some(failure); }
                 warn!(
                     "inference_mode=local but local inference failed → falling back to the configured runtime: {e}"
                 );
@@ -1943,7 +1951,7 @@ pub(super) async fn build_reply_with_session_inner(
     // this request's history was compressed and by which stages.
     let cli_future = crate::prompt_compression::CHANNEL_REPLY_COMPRESSION
         .scope(compression_info.clone(), cli_future);
-    let reply = match local_first_reply {
+    let reply = if let Some(refusal) = local_first_refusal { Err(refusal) } else { match local_first_reply {
         // Local-first already answered (inference_mode=local): skip the CLI
         // entirely — the unconsumed cli_future is lazy and simply drops.
         Some(local_reply) => Ok(ReplyAttempt::new(local_reply, ReplyOrigin::Local)),
@@ -1963,7 +1971,7 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
         None => cli_future.await,
-    };
+    } };
     let reply = match reply {
         // Last-line defense: an empty "success" must NOT flow onward — the
         // channels all skip empty sends (user sees nothing) and an empty
@@ -2002,7 +2010,7 @@ pub(super) async fn build_reply_with_session_inner(
     // could not be confirmed. Answering from a local model or the plain
     // Direct API instead would hide that from the person, so skip both
     // fallbacks and show the gate's own sentence (step 3 below).
-    let mcp_gate_refused = last_cli_error.as_ref().and_then(ReplyFailure::spawn_gate_message).is_some();
+    let mut mcp_gate_refused = last_cli_error.as_ref().is_some_and(ReplyFailure::stop_fallbacks);
 
     // 2. Fallback: Local model inference (if configured)
     let reply = match reply {
@@ -2014,7 +2022,7 @@ pub(super) async fn build_reply_with_session_inner(
             None
         }
         None => {
-            match crate::claude_runner::try_local_inference(
+            match reply_assembly.text(ReplyOrigin::Local, || crate::claude_runner::try_local_inference(
                 &ctx.home_dir,
                 &sanitized_text,
                 &full_system_prompt,
@@ -2022,7 +2030,7 @@ pub(super) async fn build_reply_with_session_inner(
                 Some(&agent_id),
                 capabilities.as_ref(),
             )
-            .await
+            ).await
             {
                 Ok(local_reply) if local_reply.trim().is_empty() => {
                     last_cli_error = Some(ReplyFailure::simple(ReplyOrigin::Local, "Empty response".into()));
@@ -2032,9 +2040,15 @@ pub(super) async fn build_reply_with_session_inner(
                     info!("Replied via local model ({} chars)", local_reply.len());
                     let notice = last_cli_error.as_ref().map(ReplyFailure::local_notice)
                         .unwrap_or_else(||"⚠️ 本次由已設定的本地模型代為回應。\n\n".into());
-                    Some(format!("{notice}{local_reply}"))
+                    Some(if super::assembly::public_session(session_id) { local_reply }
+                        else { format!("{notice}{local_reply}") })
                 }
                 Err(e) => {
+                    let failure = ReplyFailure::simple(ReplyOrigin::Local, e.clone());
+                    if failure.stop_fallbacks() {
+                        mcp_gate_refused = true;
+                        last_cli_error = Some(failure);
+                    }
                     if e != "ROUTER_ESCALATE_TO_CLOUD" {
                         warn!("Local inference unavailable: {e}");
                     }
@@ -2073,7 +2087,8 @@ pub(super) async fn build_reply_with_session_inner(
                 .map(|c| c.system_operator)
                 .unwrap_or(false);
             let operator_tool_reply = if is_operator {
-                try_operator_direct_api_tool_loop(
+                reply_assembly.text(ReplyOrigin::AnthropicApi, || async {
+                    try_operator_direct_api_tool_loop(
                     &agent_id,
                     key,
                     &model,
@@ -2081,29 +2096,36 @@ pub(super) async fn build_reply_with_session_inner(
                     &sanitized_text,
                     capabilities.as_ref(),
                 )
-                .await
+                .await.ok_or_else(|| "Operator tool loop unavailable".to_string())
+                }).await
             } else {
-                None
+                Err("Operator tool loop not selected".into())
             };
-            if let Some(text) = operator_tool_reply.filter(|text| !text.trim().is_empty()) {
+            let operator_refusal = operator_tool_reply.as_ref().err()
+                .map(|error| ReplyFailure::simple(ReplyOrigin::AnthropicApi, error.clone()))
+                .filter(ReplyFailure::stop_fallbacks);
+            if let Some(refusal) = operator_refusal {
+                last_cli_error = Some(refusal);
+                None
+            } else if let Some(text) = operator_tool_reply.ok().filter(|text| !text.trim().is_empty()) {
                 Some(text)
             } else {
-                match crate::direct_api::call_direct_api(
+                match reply_assembly.text(ReplyOrigin::AnthropicApi, || async { crate::direct_api::call_direct_api(
                     key,
                     &model,
                     &full_system_prompt,
                     &sanitized_text,
                     &[],
                 )
-                .await
+                .await.map(|resp| resp.text) }).await
                 {
-                    Ok(resp) if resp.text.trim().is_empty() => {
+                    Ok(resp) if resp.trim().is_empty() => {
                         last_cli_error = Some(ReplyFailure::simple(ReplyOrigin::AnthropicApi, "Empty response".into()));
                         None
                     }
                     Ok(resp) => {
-                        info!("Claude replied via Direct API ({} chars)", resp.text.len());
-                        Some(resp.text)
+                        info!("Claude replied via Direct API ({} chars)", resp.len());
+                        Some(resp)
                     }
                     Err(e) => {
                         let diagnostic = ReplyFailure::simple(ReplyOrigin::AnthropicApi,e.clone()).audit();
@@ -2136,6 +2158,11 @@ pub(super) async fn build_reply_with_session_inner(
             None
         }
     };
+
+    // Sanitize every fallback before persistence and delivery, including the
+    // in-process operator tool loop. Never persist an empty thinking-only turn.
+    let reply = reply.map(|text| duduclaw_core::think_tags::strip_reasoning_prefix(&text))
+        .filter(|text| !text.trim().is_empty());
 
     // KILLSWITCH [triggers] max_consecutive_errors / error_rate_threshold.
     crate::killswitch_triggers::record_reply_outcome(ctx, session_id, &agent_id, reply.is_some())
@@ -4048,7 +4075,7 @@ pub(super) async fn build_reply_with_session_inner(
     // A public website visitor (Odoo Live Chat) is a customer, not the
     // operator: account states, dashboard links and file names must not
     // reach them. The audit row above keeps the real reason.
-    if crate::odoo_livechat::is_public_visitor_session(session_id) {
+    if super::assembly::public_session(session_id) {
         return crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.to_string();
     }
     if !operator_diagnostics_allowed(&ctx.home_dir, session_id) {
@@ -4079,9 +4106,13 @@ pub(super) async fn build_reply_with_session_inner(
 
 /// Render operational status at the audience boundary, never in model text.
 fn runtime_content_for_session(response: crate::runtime::RuntimeResponse, session_id: &str) -> String {
-    let mut content = response.content;
+    let mut content = duduclaw_core::think_tags::strip_reasoning_prefix(&response.content);
+    if content.trim().is_empty() { return content; }
+    if response.partial_timeout_secs.is_some() && super::assembly::public_session(session_id) {
+        return String::new();
+    }
     if let Some(seconds) = response.partial_timeout_secs {
-        if !crate::odoo_livechat::is_public_visitor_session(session_id) {
+        if !super::assembly::public_session(session_id) {
             content.push_str(&format!("\n\n（已達執行時間上限 {seconds} 秒，以上為已完成的部分。）"));
         }
     }
@@ -4094,13 +4125,13 @@ mod timeout_audience_tests {
 
     #[test]
     fn partial_runtime_timeout_notice_is_operator_only() {
-        for session in ["odoolivechat:site:visitor", "webchat:owner", "line:owner"] {
+        for session in ["odoolivechat:site:visitor", "widget-visitor:abc", "webchat:owner", "line:owner"] {
             let response = crate::runtime::RuntimeResponse {
                 content: "已完成的答覆".into(), partial_timeout_secs: Some(300), ..Default::default()
             };
             let text = runtime_content_for_session(response, session);
-            if crate::odoo_livechat::is_public_visitor_session(session) {
-                assert_eq!(text, "已完成的答覆");
+            if super::super::assembly::public_session(session) {
+                assert!(text.is_empty());
             } else {
                 assert_eq!(text, "已完成的答覆\n\n（已達執行時間上限 300 秒，以上為已完成的部分。）");
             }

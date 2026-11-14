@@ -349,7 +349,7 @@ impl OpenAiCompatRuntime {
         );
         // Open models often inline their reasoning as a leading
         // `<think>…</think>` block — never part of the answer.
-        let content = duduclaw_core::think_tags::strip_leading_think_block(&raw_content);
+        let content = duduclaw_core::think_tags::strip_reasoning_prefix(&raw_content);
 
         // Empty content is an ERROR, never a success. Reasoning models (Grok,
         // DeepSeek R1) can burn the whole `max_tokens` budget on
@@ -675,7 +675,7 @@ fn build_tool_chat_request(
 /// leading inline `<think>` block is removed, and nothing left is an error
 /// (failover), never an empty `Ok` that a channel would silently drop.
 fn sse_final_content(content: &str, model: &str) -> Result<String, String> {
-    let text = duduclaw_core::think_tags::strip_leading_think_block(content);
+    let text = duduclaw_core::think_tags::strip_reasoning_prefix(content);
     if text.trim().is_empty() {
         return Err(format!(
             "Empty response from OpenAI-compat SSE stream (model={model}); \
@@ -687,7 +687,7 @@ fn sse_final_content(content: &str, model: &str) -> Result<String, String> {
 
 fn classify_final_text(resp: &ChatResponse, model: &str) -> Result<String, String> {
     // A leading inline `<think>` block is the model's reasoning, not answer.
-    let text = duduclaw_core::think_tags::strip_leading_think_block(&resp.text());
+    let text = duduclaw_core::think_tags::strip_reasoning_prefix(&resp.text());
     if text.trim().is_empty() {
         return Err(format!(
             "Empty response from OpenAI-compat tool loop (model={model} stop={:?}); \

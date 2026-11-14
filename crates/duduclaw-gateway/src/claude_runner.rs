@@ -3248,7 +3248,7 @@ pub(crate) const LOCAL_THINK_ONLY_ERR: &str =
 /// nothing but thinking is an error, so every caller takes its existing
 /// failure path (fallback to the CLI, or the local-only error message).
 pub(crate) fn finish_local_reply(reply: String) -> Result<String, String> {
-    let answer = duduclaw_core::think_tags::strip_leading_think_block(&reply);
+    let answer = duduclaw_core::think_tags::strip_reasoning_prefix(&reply);
     if answer.trim().is_empty() && !reply.trim().is_empty() {
         return Err(LOCAL_THINK_ONLY_ERR.to_string());
     }
@@ -3991,10 +3991,10 @@ async fn call_claude_streaming(
         }
     });
 
-    // Split accumulators — same contract as the channel path: `assistant_text`
-    // appends (a reply is a sequence of text blocks, possibly across several
-    // `assistant` events), the terminal `result` event replaces. Overwriting per
-    // block kept only the last fragment of a long answer.
+    // The terminal result replaces the last assistant text segment.
+    let public_fallback = duduclaw_memory::feedback::CURRENT_SESSION_ID
+        .try_with(|sid| sid.as_deref().is_some_and(crate::channel_reply::assembly::public_session))
+        .unwrap_or(false);
     let mut assistant_text = String::new();
     let mut result_text = String::new();
     let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
@@ -4093,14 +4093,10 @@ async fn call_claude_streaming(
                                         &event, &mut native_events, &mut open_native_calls,
                                     );
                                     if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) {
+                                        assistant_text = duduclaw_core::think_tags::last_assistant_text(content);
                                         for block in content {
                                             let block_type = block.get("type").and_then(|t| t.as_str());
                                             match block_type {
-                                                Some("text") => {
-                                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                                        assistant_text.push_str(text);
-                                                    }
-                                                }
                                                 Some("tool_use") => {
                                                     // WP-A4 collector: handled once per
                                                     // event (not per block) below via
@@ -4209,14 +4205,13 @@ async fn call_claude_streaming(
         ));
     }
 
-    // No authoritative `result` text (tool-use turn, or the CLI omitted it) —
-    // the accumulated assistant prose IS the reply.
-    let mut result_text = result_text;
-    if result_text.is_empty() && !assistant_text.is_empty() {
-        result_text = std::mem::take(&mut assistant_text);
-    }
-    let result_text = result_text.trim().to_string();
-    if result_text.is_empty() {
+    // No result: use only the last assistant text segment, never a transcript.
+    let result_text = duduclaw_core::think_tags::final_reply_text(
+        &result_text, &assistant_text, !public_fallback,
+    );
+    // Channel assembly owns the WebChat/public empty-answer retry. Let
+    // rotation record usage and account cost before it sees the empty text.
+    if result_text.is_empty() && !crate::channel_reply::assembly::current_session_retries_empty() {
         return Err("Empty response from claude CLI".to_string());
     }
 
