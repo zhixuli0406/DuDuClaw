@@ -47,7 +47,12 @@ fn email_hash(token: &str, code: &str) -> String {
 }
 
 impl UserDb {
-    pub fn mfa_admin_reset_reauth(&self, actor: &str, user: &str, token: &str, session: &str, now: i64) -> Result<()> {
+    /// Password-capability reset. Test fixture only (eligibility-log writer
+    /// tests): it has no Administrator-target rules. Production resets go
+    /// through [`UserDb::mfa_admin_reset_checked`] (RM-136), which refuses
+    /// the password alone for an Administrator target.
+    #[cfg(test)]
+    pub(crate) fn mfa_admin_reset_reauth(&self, actor: &str, user: &str, token: &str, session: &str, now: i64) -> Result<()> {
         if actor==user {return Err("不能重設自己的兩步驟驗證。".into());}
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;

@@ -291,6 +291,38 @@ pub fn check_admin_filing(conn: &Connection, filer: &str, owner: &str, now: i64)
     Ok(())
 }
 
+/// RM-136: is `user` a *qualifying* Admin now — eligible now and eligible
+/// continuously for the whole cooling window, not created or promoted inside
+/// it (an unattributed creation/promotion counts as by `user` itself)? The
+/// same S2 qualification [`decide`] applies to an approver, read from the
+/// same log; used to refuse a recently made Admin resetting another Admin's
+/// second factor. Read inside the caller's transaction, like [`decide`].
+///
+/// Fail closed: an unreadable, inconsistent or too-young log is
+/// [`ApprovalRefusal::AdminLogUnavailable`] or
+/// [`NotQualified::EligibleUnderCooling`] (a log younger than the window
+/// cannot show when `user` became an Admin), never "qualified".
+pub fn check_qualified_admin(conn: &Connection, user: &str, now: i64) -> Result<(), ApprovalRefusal> {
+    if user.is_empty() || now <= 0 {
+        return Err(ApprovalRefusal::InvalidRequest);
+    }
+    if conn.is_autocommit() {
+        return Err(ApprovalRefusal::NotInTransaction);
+    }
+    let snapshot = Snapshot::read(conn, now).map_err(|_| ApprovalRefusal::AdminLogUnavailable)?;
+    snapshot.qualification(user, &[user]).map_err(ApprovalRefusal::ApproverNotQualified)
+}
+
+/// RM-136: was `user` an Admin at any moment of the cooling window ending at
+/// `now` according to the log (a log row is only ever written for an account
+/// that is or was an Admin)? Lets a reset treat a just-demoted Admin as an
+/// Admin, so demote → reset → promote cannot skip the Admin-target rules.
+pub fn admin_within_window(conn: &Connection, user: &str, now: i64) -> Result<bool, String> {
+    let start = now.checked_sub(COOLING_SECS).ok_or("time out of range")?;
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM admin_eligibility_log WHERE user_id=?1 AND at>?2)",
+        params![user, start], |r| r.get(0)).map_err(|e| e.to_string())
+}
+
 fn precheck(conn: &Connection, request: &ApprovalRequest<'_>) -> Option<ApprovalRefusal> {
     let owner_blank = request.owner_user_id.is_some_and(str::is_empty);
     let personal_mismatch = request.kind.is_personal()

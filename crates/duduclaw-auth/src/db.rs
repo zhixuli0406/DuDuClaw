@@ -259,6 +259,9 @@ impl UserDb {
         crate::account_email_history::migrate(&conn)?;
         // SR4 item 1: Admin attestations of Google delegate subjects.
         crate::google_delegate_attestation::migrate(&conn)?;
+        // RM-135: first-Admin setup codes; its triggers read users and every
+        // MFA factor table, so it runs after all of them exist.
+        crate::mfa::bootstrap::migrate(&conn)?;
         Ok(())
     }
 

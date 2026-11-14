@@ -22,6 +22,11 @@ impl MethodHandler {
         params: Value,
         ctx: &UserContext,
     ) -> WsFrame {
+        // RM-136: every gate of an Admin reset (users.db, policy store,
+        // session, rate limit) runs under its single audit guard.
+        if method == "users.mfa_reset" {
+            return self.handle_mfa_reset_rpc(params, ctx).await;
+        }
         let Some(db) = self.user_db.read().await.clone() else {
             return WsFrame::error_response("", "無法讀取帳號資料。");
         };
@@ -31,13 +36,12 @@ impl MethodHandler {
             Err(_) if method == "mfa.overview" => false,
             Err(e) => return WsFrame::error_response("", &e),
         };
-        let session = if matches!(method, "mfa.enroll_begin" | "mfa.enroll_confirm" | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove")
-            || (method=="users.mfa_reset" && params.get("password").is_some()) {
+        let session = if matches!(method, "mfa.enroll_begin" | "mfa.enroll_confirm" | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove") {
             match crate::google_personal::session_for(&ctx.user_id) {
                 Ok(s) => Some(s), Err(_) => return WsFrame::error_response("", "請重新使用帳號登入後再註冊雙因素驗證。"),
             }
         } else { None };
-        if matches!(method, "mfa.enroll_begin" | "mfa.disable" | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove" | "users.mfa_reset") && !crate::server::check_login_rate_limit(
+        if matches!(method, "mfa.enroll_begin" | "mfa.disable" | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove") && !crate::server::check_login_rate_limit(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), &ctx.email) {
             return WsFrame::error_response("", "嘗試次數過多，請稍後再試。");
         }
@@ -50,7 +54,6 @@ impl MethodHandler {
             "mfa.disable" => Some((id.clone(), "移除驗證器")),
             "mfa.email_confirm" => Some((id.clone(), "新增 Email 驗證碼")),
             "mfa.email_remove" => Some((id.clone(), "移除 Email 驗證碼")),
-            "users.mfa_reset" => params.get("user_id").and_then(Value::as_str).map(|id|(id.to_owned(),"管理員重設兩步驟驗證")),
             _ => None,
         };
         let notify_db = db.clone();
@@ -157,17 +160,6 @@ impl MethodHandler {
                         Ok(json!({"recovery_codes": db.mfa_change(&id, code, false, &cipher, now)?}))
                     }
                 }
-                "users.mfa_reset"=> {
-                    let target=params.get("user_id").and_then(Value::as_str).ok_or("請指定帳號。")?;
-                    if let Some(password)=params.get("password").and_then(Value::as_str) {
-                        let session=session.as_deref().ok_or("請重新登入。")?;
-                        let token=db.mfa_factor_password_challenge(&id,password,session,now)?;
-                        db.mfa_admin_reset_reauth(&id,target,&token,session,now)?;
-                    } else {
-                        db.mfa_admin_reset(&id,target,params.get("code").and_then(Value::as_str).unwrap_or(""),&cipher,now)?;
-                    }
-                    Ok(json!({"reset":true}))
-                }
                 "users.mfa_enrollment_code"=> {
                     let target=params.get("user_id").and_then(Value::as_str).ok_or("請指定帳號。")?;
                     Ok(json!({"enrollment_code":db.mfa_issue_enrollment_code(Some(&id),target,params.get("challenge_ref").and_then(Value::as_str).ok_or("請提供註冊識別碼。")?,now)?,"expires_in":duduclaw_auth::mfa::TTL}))
@@ -175,9 +167,12 @@ impl MethodHandler {
                 "mfa.overview"=> {
                     crate::mfa::require_admin(&db,&id)?;
                     let rows=db.list_users()?.into_iter().map(|u| {
-                        Ok(json!({"user_id":u.id,"email":u.email,"enabled":db.mfa_active(&u.id)?,"channel_bindings":db.mfa_channel_binding_times(&u.id)?}))
+                        Ok(json!({"user_id":u.id,"email":u.email,"admin":u.role==UserRole::Admin,"enabled":db.mfa_active(&u.id)?,"channel_bindings":db.mfa_channel_binding_times(&u.id)?}))
                     }).collect::<Result<Vec<Value>,String>>()?;
-                    Ok(json!({"users":rows,"enforced":crate::mfa::enforced(&home,personal).ok(),"policy":crate::mfa::policy_status(&home)}))
+                    // RM-136: resets whose notice reached nobody (Admin-visible notice).
+                    let notices=crate::mfa_email::recent_reset_notice_failures(&db)?;
+                    Ok(json!({"users":rows,"enforced":crate::mfa::enforced(&home,personal).ok(),"policy":crate::mfa::policy_status(&home),
+                        "reset_notice_failures":notices}))
                 }
                 _=>Err("不允許此操作。".into()),
             }

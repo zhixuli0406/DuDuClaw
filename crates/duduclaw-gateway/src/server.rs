@@ -1258,6 +1258,28 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             println!();
         }
     }
+    // RM-135 (M3): the daemon never generates, prints or logs a first
+    // administrator setup code (stdout ends up in journald / `docker logs`).
+    // While the first-administrator window is open, one informational line
+    // without any code tells the operator to run the host command, which
+    // prints the code only to an interactive terminal.
+    if _migration_bootstrap.is_none() {
+        match user_db.mfa_bootstrap_pending() {
+            Ok(true) => info!(
+                "First administrator two-factor setup is waiting: run `duduclaw ops users mfa-setup-code` on this host \
+                 (Docker: inside the container, e.g. `docker exec -it <container> duduclaw ops users mfa-setup-code`) \
+                 and enter the code on the dashboard"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(%error, "first administrator two-factor setup state unreadable; setup refused"),
+        }
+    }
+    // RM-136 (M5): deliver `users.mfa_reset` audit rows a previous process
+    // committed but did not deliver (held rows included). Only the gateway
+    // lock holder drains.
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        crate::handlers::drain_reset_audit_outbox(&home_dir, &user_db, true);
+    }
     let jwt_config = Arc::new(JwtConfig::load_or_generate(&home_dir).map_err(|e| {
         duduclaw_core::error::DuDuClawError::Gateway(format!("Failed to initialize JWT: {e}"))
     })?);
@@ -2900,6 +2922,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/mfa/verify", post(server_mfa::verify))
         .route("/api/mfa/enroll/begin", post(server_mfa::enroll_begin))
         .route("/api/mfa/enroll/confirm", post(server_mfa::enroll_confirm))
+        // RM-135: first-Admin bootstrap proof (loopback claim / host setup code).
+        .route("/api/mfa/enroll/bootstrap", post(server_mfa::enroll_bootstrap))
         .route("/api/mfa/email/send", post(server_mfa_email::send))
         .route("/api/mfa/email/verify", post(server_mfa_email::verify))
         .route("/api/mfa/passkey/list", post(server_mfa_passkey::list))

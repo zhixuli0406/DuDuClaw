@@ -260,7 +260,10 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     let old = state.jwt_config.issue_session_tokens(&user, &[]).unwrap();
     let (_, response) = login(&state, 184).await;
     assert_eq!(response.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["challenge_ref", "email_available", "email_unavailable_reason", "enrollment_token", "mfa_enrollment_required"]);
+        vec!["challenge_ref", "email_available", "email_unavailable_reason", "enrollment_token", "mfa_enrollment_required",
+            "setup_code_required"]);
+    // RM-135 hint (renamed from `bootstrap_available`): a plain boolean.
+    assert!(response["setup_code_required"].is_boolean());
     assert_eq!(response["email_available"], false);
     assert_eq!(response["email_unavailable_reason"], "no_smtp");
     assert_eq!(response["mfa_enrollment_required"], true);

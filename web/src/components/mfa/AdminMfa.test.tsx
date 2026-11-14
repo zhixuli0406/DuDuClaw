@@ -119,7 +119,7 @@ it('does not expose enforced Personal policy controls to non-Admins', () => {
   expect(mfaApi.overview).not.toHaveBeenCalled();
 });
 
-it('lets a passkey-only admin confirm a reset with their current password', async () => {
+it('lets an admin confirm a staff reset with their current password', async () => {
   await expect(mfaApi.resetPassword('admin', 'admin', 'secret')).rejects.toThrow('MFA_SELF_RESET');
   expect(mockWsClient.call).not.toHaveBeenCalledWith('users.mfa_reset', expect.anything());
   const reset = vi.spyOn(mfaApi, 'resetPassword').mockResolvedValue({ reset: true });
@@ -130,4 +130,54 @@ it('lets a passkey-only admin confirm a reset with their current password', asyn
   fireEvent.change(within(row).getByLabelText('Current password'), { target: { value: 'admin-password' } });
   fireEvent.click(within(row).getByRole('button', { name: 'Confirm' }));
   await waitFor(() => expect(reset).toHaveBeenCalledWith('admin', 'other', 'admin-password'));
+});
+
+const withAdmins: MfaOverview = { ...overview, users: overview.users.map(u => u.user_id === 'new' ? u : { ...u, admin: true }) };
+
+it('offers no password-only confirmation when the target is an administrator', async () => {
+  vi.mocked(mfaApi.overview).mockResolvedValue(withAdmins);
+  renderWithProviders(<AdminMfaPanel actor="admin" />);
+  const row = (await screen.findByText(/other@example.com/)).closest('li')!;
+  fireEvent.click(within(row).getByRole('button', { name: 'Reset two-factor setup' }));
+  const select = within(row).getByRole('combobox');
+  expect(within(select).queryByRole('option', { name: 'Current password' })).toBeNull();
+  expect(within(row).getByText(/not just your password/)).toBeInTheDocument();
+});
+
+it('lets an admin without an authenticator app reset an administrator with password and email code', async () => {
+  vi.mocked(mfaApi.overview).mockResolvedValue(withAdmins);
+  vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: true, enforced: true, factors: { totp: false, email: false, passkey: true } } as never);
+  const begin = vi.spyOn(mfaApi, 'resetEmailBegin').mockResolvedValue({ email_code_sent: true, reset_token: 'capability', expires_in: 300 });
+  const confirm = vi.spyOn(mfaApi, 'resetEmailConfirm').mockResolvedValue({ reset: true });
+  renderWithProviders(<AdminMfaPanel actor="admin" />);
+  const row = (await screen.findByText(/other@example.com/)).closest('li')!;
+  fireEvent.click(within(row).getByRole('button', { name: 'Reset two-factor setup' }));
+  await within(row).findByRole('option', { name: 'Password and a code sent to your email' });
+  fireEvent.change(within(row).getByRole('combobox'), { target: { value: 'email' } });
+  fireEvent.change(within(row).getByLabelText('Current password'), { target: { value: 'admin-password' } });
+  fireEvent.click(within(row).getByRole('button', { name: 'Send code' }));
+  await waitFor(() => expect(begin).toHaveBeenCalledWith('admin', 'other', 'admin-password'));
+  fireEvent.change(await within(row).findByLabelText('Code from your email'), { target: { value: '123456' } });
+  fireEvent.click(within(row).getByRole('button', { name: 'Confirm' }));
+  await waitFor(() => expect(confirm).toHaveBeenCalledWith('admin', 'other', 'capability', '123456'));
+});
+
+it('shows the server refusal for a recently promoted administrator', async () => {
+  vi.mocked(mfaApi.overview).mockResolvedValue(withAdmins);
+  vi.spyOn(mfaApi, 'reset').mockRejectedValue({ code: 'MFA_RESET_COOLING', message: '成為管理員未滿 7 天' });
+  renderWithProviders(<AdminMfaPanel actor="admin" />);
+  const row = (await screen.findByText(/other@example.com/)).closest('li')!;
+  fireEvent.click(within(row).getByRole('button', { name: 'Reset two-factor setup' }));
+  fireEvent.change(within(row).getByLabelText('Fresh authenticator code or unused recovery code'), { target: { value: '654321' } });
+  fireEvent.click(within(row).getByRole('button', { name: 'Confirm' }));
+  expect(await screen.findByText(/for the last 7 days in a row can reset another administrator/)).toBeInTheDocument();
+});
+
+it('warns when a reset notice reached nobody and advises a second administrator', async () => {
+  vi.mocked(mfaApi.overview).mockResolvedValue({ ...overview,
+    users: overview.users.map(u => u.user_id === 'admin' ? { ...u, admin: true } : u),
+    reset_notice_failures: [{ user_id: 'other', at: '2026-11-14T08:00:00Z' }] });
+  renderWithProviders(<AdminMfaPanel actor="admin" />);
+  expect(await screen.findByText(/other@example.com was reset on .+ but the notice could not be delivered/)).toBeInTheDocument();
+  expect(screen.getByText(/You are the only administrator/)).toBeInTheDocument();
 });

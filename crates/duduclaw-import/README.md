@@ -81,7 +81,9 @@ The users, channel-settings and workflow stores still
 have a single `*-v1793.sql` catalog each, compared byte-for-byte as before; whether
 their v1.80 stores differ has not been reviewed (for example, the v1.80.0
 `mfa_email_codes`, `mfa_passkeys` and `remembered_*` tables are not in
-`users-v1793.sql`). Extra tables,
+`users-v1793.sql`; neither are the v1.82 `mfa_bootstrap_tokens`, `mfa_bootstrap_state`
+first-administrator latch and `mfa_reset_audit_outbox` tables, so a v1.82 `users.db` is refused
+as a source and the latch never travels through import — the new installation keeps its own). Extra tables,
 columns, indexes, views or triggers reject the whole source; other historical
 variants are deliberately rejected until exact catalogs are reviewed.
 `tasks.db` additionally has a third catalog, `tasks-v181.sql`: the v1.80.x store plus the

@@ -649,6 +649,13 @@ impl MethodHandler {
                 return WsFrame::error_response("", "不允許此操作。");
             };
             if let Err(e) = acl::require_role(ctx, role) {
+                if method == "users.mfa_reset" {
+                    // RM-136: a refused reset is recorded like an allowed one
+                    // (outbox row or direct audit, via the attempt guard).
+                    let db = self.user_db.read().await.clone();
+                    let attempt = mfa_reset_rpc::ResetAttempt::begin(&self.home_dir, db, ctx, &params);
+                    drop(attempt.refuse(duduclaw_auth::mfa::AdminResetRefusal::ActorNotAdmin));
+                }
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
@@ -785,6 +792,11 @@ impl MethodHandler {
 }
 
 mod mfa_rpc;
+// RM-136: `users.mfa_reset` rules adapter (second factor, 7 days, audit).
+mod mfa_reset_rpc;
+pub(crate) use mfa_reset_rpc::drain_reset_audit_outbox;
+#[cfg(test)]
+pub(crate) use mfa_reset_rpc::{RESET_AUDIT_EVENT as RESET_AUDIT_EVENT_FOR_TESTS, test_support::pending as reset_outbox_pending_for_tests};
 mod migration_confirmations_rpc;
 mod migration_authority;
 pub(crate) use migration_authority::employee::resolve_confirmed_employee;

@@ -34,7 +34,7 @@ export interface FactorAvailability {
 }
 export type LoginChallenge = FactorAvailability & (
   | { mfa_required: true; challenge_id: string }
-  | { mfa_enrollment_required: true; enrollment_token: string; challenge_ref: string });
+  | { mfa_enrollment_required: true; enrollment_token: string; challenge_ref: string; setup_code_required?: boolean });
 export type LoginResult = LoginChallenge | void;
 
 interface AuthStore {
