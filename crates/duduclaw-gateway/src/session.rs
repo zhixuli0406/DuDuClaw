@@ -1256,7 +1256,8 @@ impl SessionManager {
         // ("#2", "#3", …) so users can tell a compressed session apart.
         tx.execute(
             "UPDATE sessions SET summary = ?1, total_tokens = 0, last_active = ?2,
-                    lineage = COALESCE(lineage, 1) + 1
+                    lineage = COALESCE(lineage, 1) + 1,
+                    summary_of_prior = NULL, summarized_through_turn = 0, last_summarized_at = NULL
              WHERE id = ?3",
             params![summary, now, session_id],
         )
@@ -1918,6 +1919,42 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Refuse stale summaries after a concurrent append, clear or compression.
+    /// The visible-row identity snapshot and cursor are checked while holding
+    /// the same DB connection used for the update.
+    pub(crate) async fn set_summary_if_unchanged(
+        &self, session_id: &str, summary: &str, through_turn: u32,
+        previous_through: u32, expected_ids: &[i64],
+    ) -> Result<()> {
+        let conn = self.acquire().await;
+        crate::isolation_label_stores::check_session_writable(&conn, session_id)
+            .map_err(DuDuClawError::Gateway)?;
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let current = {
+            let mut stmt = tx.prepare("SELECT id FROM session_messages WHERE session_id=?1
+                AND hidden=0 AND undone_at IS NULL ORDER BY id ASC")
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            let rows = stmt.query_map([session_id], |row| row.get::<_, i64>(0))
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?
+        };
+        if current.as_slice() != expected_ids {
+            return Err(DuDuClawError::Gateway("session changed during summary".into()));
+        }
+        let changed = tx.execute("UPDATE sessions SET summary_of_prior=?1,
+            summarized_through_turn=?2, last_summarized_at=?3
+            WHERE id=?4 AND summarized_through_turn=?5",
+            params![duduclaw_security::credential_detect::mask(summary), through_turn as i64,
+                chrono::Utc::now().to_rfc3339(), session_id, previous_through as i64])
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if changed != 1 {
+            return Err(DuDuClawError::Gateway("summary cursor changed".into()));
+        }
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
     /// Scan all sessions and emit summarization candidates (#13).
     ///
     /// One row per session — the background task then runs
@@ -1989,17 +2026,24 @@ impl SessionManager {
         session_id: &str,
         n: u32,
     ) -> Result<Vec<(String, String)>> {
+        self.read_summary_turn_range(session_id, 0, n).await
+    }
+
+    /// Same visible-row ordinal space as get_summary/list_summary_candidates.
+    pub async fn read_summary_turn_range(
+        &self, session_id: &str, after: u32, through: u32,
+    ) -> Result<Vec<(String, String)>> {
         let conn = self.acquire().await;
         let mut stmt = conn
             .prepare(
                 "SELECT role, content FROM session_messages
                  WHERE session_id = ?1 AND hidden = 0 AND undone_at IS NULL
                  ORDER BY id ASC
-                 LIMIT ?2",
+                 LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| DuDuClawError::Gateway(format!("read_first_n prepare: {e}")))?;
         let rows = stmt
-            .query_map(params![session_id, n as i64], |row| {
+            .query_map(params![session_id, through.saturating_sub(after) as i64, after as i64], |row| {
                 let role: String = row.get(0)?;
                 let content: String = row.get(1)?;
                 Ok((role, content))
@@ -2377,6 +2421,26 @@ impl SessionManager {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn stale_summary_cannot_overwrite_state_or_history_and_compression_resets_cursor() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("rolling", "worker").await.unwrap();
+        mgr.append_message("rolling", "user", "first", 1).await.unwrap();
+        mgr.set_summary("rolling", "- existing fact", 1).await.unwrap();
+        let snapshot = mgr.get_message_ids("rolling").await.unwrap();
+        mgr.append_message("rolling", "user", "arrived during summary", 1).await.unwrap();
+        let current = mgr.get_message_ids("rolling").await.unwrap();
+        assert!(mgr.set_summary_if_unchanged("rolling", "- stale", 1, 1, &snapshot).await.is_err());
+        assert_eq!(mgr.get_summary("rolling").await.unwrap(), ("- existing fact".into(), 1));
+        assert_eq!(mgr.get_message_ids("rolling").await.unwrap(), current);
+        mgr.compress_if_unchanged("rolling", "- combined facts", &current).await.unwrap();
+        assert_eq!(mgr.get_summary("rolling").await.unwrap(), (String::new(), 0));
+        assert_eq!(mgr.compression_summary("rolling").await.unwrap(), "- combined facts");
+        let rows = mgr.read_summary_turn_range("rolling", 0, 1).await.unwrap();
+        assert_eq!(rows, vec![("system".into(), "- combined facts".into())]);
+    }
 
     #[tokio::test]
     async fn webchat_client_message_id_survives_reopen_without_acceptance_frame() {

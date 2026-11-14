@@ -1043,11 +1043,7 @@ pub(super) async fn build_reply_with_session_inner(
     // stored by SessionManager::compress(). They belong in the system prompt,
     // not in the conversation turns (Anthropic Messages API rejects them).
     //
-    // #13 glue (2026-05-12): when the async summarizer task has folded
-    // older turns into `summary_of_prior`, prepend the summary as a
-    // synthetic `assistant` recap turn and skip the verbatim slice it
-    // covers. Falls through to verbatim history when no summary exists
-    // (summarizer hasn't run yet, or session is below the threshold).
+    // Async summaries belong in system context, never a forged assistant turn.
     let max_history_turns = 20;
     let compression_summary = session_mgr.compression_summary(session_id).await.unwrap_or_default();
     let (async_summary, summarized_through) = session_mgr
@@ -1057,21 +1053,9 @@ pub(super) async fn build_reply_with_session_inner(
     let conversation_history: Vec<ConversationTurn> =
         match session_mgr.get_messages(session_id).await {
             Ok(msgs) => {
-                // Optional prefix when the summarizer task has run for this
-                // session. Encoded as a single assistant-role turn so the
-                // Messages API doesn't reject it (no `system` role in turns).
                 let mut out: Vec<ConversationTurn> = Vec::new();
-                if !async_summary.trim().is_empty() {
-                    out.push(ConversationTurn {
-                        role: "assistant".to_string(),
-                        content: format!(
-                            "[summary of earlier turns 1..={summarized_through}]\n{async_summary}"
-                        ),
-                    });
-                }
-
                 // Verbatim slice: skip the first `summarized_through` turns
-                // (already captured in the prefix) and the LAST turn (which
+                // (already captured in system context) and the LAST turn (which
                 // is the user message about to be re-sent below). The +1
                 // index skip is intentional — we want messages.len() - 1
                 // minus the summarized prefix.
@@ -1079,6 +1063,7 @@ pub(super) async fn build_reply_with_session_inner(
                 let prior_full: Vec<_> = msgs
                     .iter()
                     .take(msgs.len().saturating_sub(1))
+                    .skip(summarized_through_usize)
                     .filter_map(|m| {
                         if m.role == "system" {
                             None
@@ -1090,20 +1075,7 @@ pub(super) async fn build_reply_with_session_inner(
                         }
                     })
                     .collect();
-                // Trim already-summarized turns (best-effort: the count we
-                // skip is approximate because the summarizer indexes raw
-                // messages, including potential hidden ones — but trimming
-                // a bit conservatively is fine, the model sees the summary
-                // either way).
-                let prior: Vec<_> = if summarized_through_usize > 0
-                    && prior_full.len() > summarized_through_usize
-                {
-                    prior_full[summarized_through_usize..].to_vec()
-                } else if summarized_through_usize >= prior_full.len() {
-                    Vec::new()
-                } else {
-                    prior_full
-                };
+                let prior = prior_full;
 
                 // Keep only the most recent turns to prevent token overflow
                 let trimmed = if prior.len() > max_history_turns {
@@ -1119,6 +1091,7 @@ pub(super) async fn build_reply_with_session_inner(
                 vec![]
             }
         };
+    let conversation_history = crate::runtime::cap_conversation_history(&conversation_history);
     let has_history = !conversation_history.is_empty();
 
     // ── Instruction Pinning: load + accumulate ──
@@ -1455,8 +1428,11 @@ pub(super) async fn build_reply_with_session_inner(
             prompt = format!("{prompt}\n\n{hint}");
         }
 
-        if !compression_summary.is_empty() {
-            prompt = format!("{prompt}\n\n## Prior Conversation Summary\n{compression_summary}");
+        for summary in [&compression_summary, &async_summary] {
+            if !summary.trim().is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&crate::session_summarizer::summary_system_context(summary));
+            }
         }
         if !pinned.is_empty() {
             prompt = format!(
@@ -1626,17 +1602,15 @@ pub(super) async fn build_reply_with_session_inner(
     // the compression pipeline on `conversation_history`. The
     // `cost_pressure` flag from #6.3 makes early stages more aggressive.
     //
-    // Failure mode is intentionally NON-fatal: if the pipeline can't
-    // bring us under budget, we log a warn + emit an evolution event
-    // and proceed with the full history. Rejecting the request would
-    // surprise the user with a silent failure mid-conversation; the
-    // 200 K cliff merely doubles input price, it doesn't break the
-    // call. Future work can flip this to hard-reject behind a flag.
+    // Compression failure is non-fatal; the provider-independent history
+    // byte ceiling still applies, including throughout summary back-off.
+    let mut full_system_prompt = full_system_prompt;
     let (conversation_history, compression_info) = maybe_compress_history(
-        &full_system_prompt,
+        &mut full_system_prompt,
         conversation_history,
         &effective_message,
         &agent_id,
+        session_id,
     )
     .await;
 
@@ -3859,66 +3833,82 @@ pub(super) async fn build_reply_with_session_inner(
             if let Some(verdict) = compression_verdict {
                 if !matches!(verdict.await, Ok(true)) { return; }
             }
-            if sm.should_compress(&sid).await {
+            if sm.should_compress(&sid).await
+                && crate::session_summarizer::summary_retry_ready_async(&home_for_compress, &sid, "compression").await {
+                use crate::session_summarizer::{SummaryFailure, summary_attempt_finished_async};
                 // Capture ids before reading text; the final transaction refuses
                 // any intervening turn or visibility change instead of deleting it.
                 let expected_ids = match sm.get_message_ids(&sid).await {
                     Ok(ids) => ids,
-                    Err(_) => return,
+                    Err(_) => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
+                        return;
+                    }
                 };
                 let msgs = match sm.get_messages(&sid).await {
                     Ok(messages) => messages,
-                    Err(_) => return,
-                };
-                let transcript = {
-                    let mut buf = String::with_capacity(msgs.len() * 350);
-                    for m in &msgs {
-                        if !buf.is_empty() {
-                            buf.push('\n');
-                        }
-                        use std::fmt::Write;
-                        // Byte-budget truncation must walk back to a char
-                        // boundary (project rule #1: raw `&s[..n]` panics
-                        // mid-char on CJK/emoji content).
-                        let _ = write!(
-                            buf,
-                            "[{}] {}",
-                            m.role,
-                            duduclaw_core::truncate_bytes(&duduclaw_security::credential_detect::mask(&m.content), 300)
-                        );
+                    Err(_) => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
+                        return;
                     }
-                    buf
                 };
-                let prompt = format!(
-                    "Summarize the following conversation history concisely for use as context \
-                     in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
-                );
+                let (previous, after) = match sm.get_summary(&sid).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
+                        return;
+                    }
+                };
+                let mut turns = Vec::new();
+                if !previous.is_empty() {
+                    turns.push(("background".to_owned(), duduclaw_security::credential_detect::mask(&previous)));
+                }
+                // The ordinal matches the async summarizer's visible-row space.
+                // A prior destructive compression is represented by its system row.
+                turns.extend(msgs.iter().skip(after as usize).map(|m| (m.role.clone(),
+                    duduclaw_security::credential_detect::mask(&m.content))));
+                let (transcript, protected, has_unprotected) =
+                    crate::prompt_compression::partition_turns_for_summary(&turns);
+                let prompt = crate::session_summarizer::format_summarization_prompt(&transcript);
                 // Read the denial flag inside the scope: non-Claude runtimes
                 // wrap the refusal text, so the prefix alone can miss a pause
                 // that lands between the context check and spawn/send.
                 let (result, denied) = crate::autonomous_runtime::scope(
                     &home_for_compress, &agent_for_compress, &[],
                     async {
-                        let result = super::cli_spawn::call_background_utility(
+                        let result = if has_unprotected { super::cli_spawn::call_background_utility(
                             &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
                         )
-                        .await;
+                        .await } else { Ok(String::new()) };
                         (result, crate::autonomous_runtime::was_denied())
                     },
                 )
                 .await;
                 let summary = match result {
-                    _ if denied => return,
+                    _ if denied => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::Utility)).await;
+                        return;
+                    }
                     Ok(s) => s,
-                    Err(e) if e.starts_with("AUTONOMY_") => return,
                     Err(_) => {
-                        "[Session compressed — previous conversation summary omitted for brevity]"
-                            .to_string()
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::Utility)).await;
+                        return;
                     }
                 };
-                if let Err(e) = sm.compress_if_unchanged(&sid, &summary, &expected_ids).await {
-                    warn!("Session compression failed: {e}");
+                if has_unprotected {
+                    if let Err(reason) = crate::session_summarizer::validate_summary_output(&summary) {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(reason)).await;
+                        return;
+                    }
                 }
+                let protected = crate::session_summarizer_task::cap_protected_for_summary(&protected);
+                let summary = if protected.is_empty() { summary } else {
+                    format!("{summary}\n[verbatim protected sections]\n{protected}")
+                };
+                let failure = sm.compress_if_unchanged(&sid, &summary, &expected_ids).await
+                    .err().map(|_| SummaryFailure::Store);
+                summary_attempt_finished_async(&home_for_compress, &sid, "compression", failure).await;
+
             }
         });
 

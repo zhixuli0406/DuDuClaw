@@ -39,7 +39,11 @@ async fn webchat_cancel_preserves_real_compression_in_next_turn_prompt() {
     let captured: serde_json::Value = serde_json::from_str(&actual)
         .unwrap_or_else(|error| panic!("prompt boundary was not reached: {error}; reply={actual}"));
     let prompt = captured["prompt"].as_str().unwrap();
-    assert!(prompt.contains("## Prior Conversation Summary\nREAL_COMPRESSION: the chosen color is blue"), "{prompt}");
+    let summary_context = crate::session_summarizer::summary_system_context(
+        "REAL_COMPRESSION: the chosen color is blue",
+    );
+    assert!(prompt.contains(&summary_context), "{prompt}");
+    assert!(!prompt.contains("## Prior Conversation Summary"), "{prompt}");
     assert!(!actual.contains("cancelled-turn-marker"));
     assert!(!actual.contains("cancelled-msg-marker"));
     assert!(!actual.contains("legacy-cancel-marker"));

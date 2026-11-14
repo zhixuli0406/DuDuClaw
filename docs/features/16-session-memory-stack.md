@@ -219,3 +219,13 @@ If utility-model extraction fails (rate limit, timeout), the session still works
 ## The Takeaway
 
 The chef doesn't re-memorize the recipe book on every plate. They look at a sticky note above the pass, scan the running order slip, and occasionally pull a card from the prep box. DuDuClaw's session memory stack is the same architecture: cheap surfaces in high-attention positions, not a heavy memory block competing with the actual work.
+
+## Conversation summary reliability
+
+Conversation summaries are internal background in the model's system context, after the stable cached prefix. They are never synthetic user or assistant turns. The model is instructed not to mention, quote, or comment on the summary or its source. Conversation text remains untrusted data; credential masking and protected-section handling still apply.
+
+The scheduled summarizer rolls the previous summary forward using only messages after its saved cursor, leaving the newest three messages verbatim. The complete summarization prompt is capped at 48 KiB; the oldest input is omitted on UTF-8 character boundaries when necessary. Claude and Codex utility calls send prompts through stdin; API runtimes use the request body. Other CLI utility profiles remain refused or use the existing supported global fallback.
+
+Empty output, output over 8 KiB, protected-heading forgeries, and anchored refusal or meta commentary are rejected. Protected verbatim material retains its separate 4 KiB payload cap. A failed summary preserves the previous summary, cursor, and conversation history, and the user's turn continues. Retry delays increase from 10 minutes to 1 hour, 6 hours, then at most 24 hours, per session and summary path. Retry state is stored in `session_summary_retry.json` in the session home and survives restart; failures emit structured reason fields to the gateway log. The Linux long-conversation case has not yet been verified on a real Linux host.
+
+History sent to any runtime is also capped at 48 KiB of turn content, independently of the provider, token-budget setting, or summary retry state. It keeps the newest contiguous whole turns; if the newest turn alone exceeds the cap, only its UTF-8-safe tail is sent. The current user message is supplied separately and is never dropped by this limit. Stored messages are unchanged. If the retry-state lock is busy, summarization is skipped for this turn; retry-state file I/O runs off the async runtime workers.
