@@ -316,6 +316,7 @@ pub async fn send_channel_message_as(
                 error
             })?;
             crate::googlechat::send_text_to_space_as(home_dir, Some(agent), chat_id, text).await
+                .map_err(|e| e.to_string())
         }
         _ => send_channel_message(home_dir, http, channel, chat_id, text).await,
     }
@@ -327,6 +328,59 @@ async fn read_config(home_dir: &Path) -> Option<toml::Table> {
     let path = home_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&path).await.ok()?;
     content.parse().ok()
+}
+
+/// Keep scheduled file delivery behind the same recipient admission and I/O
+/// permit as text. The producing employee, not the sending bot, owns the files.
+async fn send_reminder_result(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    reminder: &Reminder,
+    text: &str,
+    sender_agent: Option<&str>,
+) -> Result<(), String> {
+    if !text.contains(crate::office_docs::DELIVER_MARKER) {
+        return send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, text, sender_agent).await;
+    }
+    let channel = reminder.channel.as_str();
+    let own = sender_agent.filter(|a| duduclaw_core::is_valid_agent_id(a));
+    let sender: Box<dyn crate::channel_sender::ChannelSender> = match (channel, own) {
+        ("googlechat", Some(agent)) => {
+            crate::product_policy::require_channel(home_dir, channel)?;
+            crate::channel_sender::create_googlechat_sender_for(
+                home_dir.to_path_buf(), reminder.chat_id.clone(), String::new(), Some(agent.into()),
+            )
+        }
+        ("telegram", Some(agent)) => {
+            crate::product_policy::require_channel(home_dir, channel)?;
+            let cfg = SecretManagerConfig::load_from_home(home_dir).await;
+            let token = crate::config_crypto::read_agent_channel_token(home_dir, agent, "telegram", &cfg)
+                .await.map(|t| crate::config_crypto::repair_telegram_token(t.expose()).into_owned())
+                .ok_or_else(|| format!("AI employee {agent}'s own Telegram bot is no longer configured"))?;
+            let target = crate::channel_sender::ChannelTarget {
+                channel_type: channel.into(), chat_id: reminder.chat_id.clone(), token, extra_id: None,
+            };
+            crate::channel_sender::create_sender_for_home(home_dir, &target, http.clone())
+        }
+        _ => {
+            let target = resolve_channel_target(home_dir, channel, &reminder.chat_id).await?;
+            crate::channel_sender::create_sender_for_home(home_dir, &target, http.clone())
+        }
+    };
+    let text = prepare_reminder_reply(home_dir, reminder, text, sender.as_ref()).await;
+    if text.trim().is_empty() { return Ok(()); }
+    sender.send_text(&text).await.map_err(|e| e.to_string())
+}
+
+async fn prepare_reminder_reply(
+    home_dir: &Path,
+    reminder: &Reminder,
+    text: &str,
+    sender: &dyn crate::channel_sender::ChannelSender,
+) -> String {
+    crate::office_docs::process_deliverables(
+        text, &home_dir.join("agents").join(&reminder.agent_id), home_dir, sender,
+    ).await
 }
 
 /// Read one `[channels] <field>(_enc)` credential from an already-parsed
@@ -1065,13 +1119,18 @@ where
     // the gateway-attested origin — see `mcp/reminders.rs`) is appended to
     // that conversation after the fire-time ownership re-check.
     if reminder.channel == crate::scheduled_webchat::CHANNEL {
-        let body = format!("⏰ {}", crate::scheduled_webchat::bound(&text));
         let delivered = match crate::recipient_guard::admit_scheduled_session(
             home_dir, &reminder.agent_id, &reminder.chat_id,
         ).await {
-            Ok(()) => crate::scheduled_webchat::deliver(
-                home_dir, &reminder.agent_id, &reminder.chat_id, &body,
-            ).await,
+            Ok(()) => {
+                let text = crate::office_docs::process_history_deliverables(
+                    &text, &home_dir.join("agents").join(&reminder.agent_id), home_dir,
+                ).await;
+                let body = format!("⏰ {}", crate::scheduled_webchat::bound(&text));
+                crate::scheduled_webchat::deliver(
+                    home_dir, &reminder.agent_id, &reminder.chat_id, &body,
+                ).await
+            },
             Err(reason) => Err(reason),
         };
         if let Err(reason) = &delivered {
@@ -1093,14 +1152,14 @@ where
     let result = {
         let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
         duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
-        send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender).await
+        send_reminder_result(home_dir, http, reminder, &text, sender).await
     };
     if let Err(first_err) = result {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         crate::recipient_guard::admit_scheduled(home_dir, &reminder.agent_id, &recipients, recipient_args).await?;
         let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
         duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
-        send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender)
+        send_reminder_result(home_dir, http, reminder, &text, sender)
             .await
             .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
     }
@@ -1289,6 +1348,19 @@ pub fn start_reminder_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reminder_delivery_strips_markers_and_host_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let reminder = callback_reminder("worker", None);
+        let reply = prepare_reminder_reply(home.path(), &reminder,
+            "完成\n📎DELIVER:/private/operator/report.pdf", &crate::channel_sender::NullSender).await;
+        assert!(reply.contains("report.pdf"));
+        assert!(reply.contains("傳送失敗"));
+        assert!(!reply.contains("DELIVER:"));
+        assert!(!reply.contains("/private/operator"));
+    }
+
 
     #[tokio::test]
     async fn scoped_blocking_reminder_mutation_refuses_publication_after_revocation() {

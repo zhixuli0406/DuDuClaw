@@ -13,8 +13,8 @@
 //!    gateway strips the marker, fail-closed-validates the path stays inside the
 //!    agent's sandbox (agent dir or the shared `attachments/` fallback), then
 //!    reads the bytes and hands them to the channel's `send_document`. Any
-//!    failure degrades honestly to a text note that still tells the user where
-//!    the file is — never a silent drop.
+//!    failure degrades honestly to a text note naming the file without exposing
+//!    host paths — never a silent drop.
 
 use std::path::{Path, PathBuf};
 
@@ -120,45 +120,151 @@ pub fn parse_deliverables(reply: &str) -> (String, Vec<String>) {
     (kept.join("\n").trim_end().to_string(), paths)
 }
 
-/// Fail-closed validation of a delivered path.
-///
-/// The path MUST be absolute, exist as a regular file, and — after
-/// canonicalisation (which resolves `..` and symlinks) — live under either the
-/// agent's own directory or the shared `{home}/attachments` fallback. A
-/// traversal like `.../agents/me/../victim/secret` canonicalises out of the
-/// agent root and is rejected. Returns the canonical path on success.
+/// Fail-closed validation of a delivered path (the file is opened and
+/// dropped). Delivery itself goes through [`open_and_read_deliverable`],
+/// which reads from the same handle it validated.
 pub fn validate_deliver_path(
     raw: &str,
     agent_dir: &Path,
     home_dir: &Path,
 ) -> Result<PathBuf, String> {
+    open_deliverable(raw, agent_dir, home_dir).map(|(path, _file)| path)
+}
+
+/// Open a delivered file exactly once, never following a symlink.
+///
+/// The path MUST be absolute, contain no `.`/`..` component, and lexically
+/// live under either the agent's own directory or the shared
+/// `{home}/attachments` fallback (matched against the root as configured and
+/// its canonical form, so macOS `/var` → `/private/var` does not produce a
+/// spurious mismatch). The gateway-chosen root is then opened as a pinned
+/// directory handle ([`crate::fs_safe::SafeDir`]) and every remaining
+/// component is opened relative to the previous handle with no-follow
+/// semantics: a symlinked intermediate directory or final file is refused, and
+/// a swap after this point cannot redirect the read because the caller only
+/// ever uses the returned handle. Files with more than one hard link are
+/// refused too, so a hard link to a host file cannot stand in for a product.
+///
+/// Returns the display path (canonical root + checked components; used only
+/// for the filename, extension and provenance — never reopened) and the open
+/// regular-file handle.
+fn open_deliverable(
+    raw: &str,
+    agent_dir: &Path,
+    home_dir: &Path,
+) -> Result<(PathBuf, std::fs::File), String> {
+    use std::path::Component;
+
     let candidate = Path::new(raw);
     if !candidate.is_absolute() {
         return Err(format!("path is not absolute: {raw}"));
     }
-    let canon =
-        std::fs::canonicalize(candidate).map_err(|e| format!("path not accessible: {e}"))?;
-    if !canon.is_file() {
+    // The component walk below never interprets `..`; refuse it outright
+    // instead of resolving it (`.../agents/me/../victim/secret`).
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(format!("path escapes the agent sandbox: {raw}"));
+    }
+
+    for root in [agent_dir.to_path_buf(), home_dir.join("attachments")] {
+        // A root that does not exist yet cannot match (fail closed).
+        let Ok(canon_root) = std::fs::canonicalize(&root) else {
+            continue;
+        };
+        let Some(rel) = candidate
+            .strip_prefix(&root)
+            .ok()
+            .or_else(|| candidate.strip_prefix(&canon_root).ok())
+        else {
+            continue;
+        };
+        let names = rel
+            .components()
+            .map(|c| match c {
+                Component::Normal(name) => name
+                    .to_str()
+                    .ok_or_else(|| "path is not valid UTF-8".to_string()),
+                _ => Err(format!("path escapes the agent sandbox: {raw}")),
+            })
+            .collect::<Result<Vec<&str>, String>>()?;
+        let Some((leaf, dirs)) = names.split_last() else {
+            return Err("path is not a regular file".to_string());
+        };
+
+        // The root is gateway-chosen; canonicalising it is the trusted step.
+        // Opening it no-follow from `/` still refuses a root swapped for a
+        // link after the canonicalisation.
+        let base = crate::fs_safe::SafeDir::open_nofollow(&canon_root, false)
+            .map_err(|e| format!("path not accessible: {e}"))?;
+        let parent = if dirs.is_empty() {
+            base
+        } else {
+            base.open_path(dirs, false)
+                .map_err(|e| format!("path not accessible: {e}"))?
+                .ok_or_else(|| "path not accessible: not found".to_string())?
+        };
+        let file = parent
+            .open_read_checked(leaf, true)
+            .map_err(|e| format!("path not accessible: {e}"))?
+            .ok_or_else(|| "path not accessible: not found".to_string())?;
+
+        let mut display = canon_root;
+        for name in &names {
+            display.push(name);
+        }
+        return Ok((display, file));
+    }
+    Err(format!("path escapes the agent sandbox: {raw}"))
+}
+
+/// Size-check and read an already-open deliverable through its own handle:
+/// `fstat` must report a regular file within [`MAX_FILE_SIZE`] (an oversize
+/// file is refused before any byte is read), and the read itself is bounded
+/// in case the file grows after the check.
+fn read_opened_deliverable(file: std::fs::File) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let meta = file.metadata().map_err(|e| format!("stat failed: {e}"))?;
+    if !meta.is_file() {
         return Err("path is not a regular file".to_string());
     }
-
-    // Canonicalise the allowed roots too, so macOS `/var`→`/private/var` style
-    // symlinks don't produce spurious mismatches. A root that doesn't exist
-    // yet simply can't match (fail-closed).
-    let agent_root = std::fs::canonicalize(agent_dir).ok();
-    let attach_root = std::fs::canonicalize(home_dir.join("attachments")).ok();
-
-    let under_agent = agent_root.as_ref().is_some_and(|r| canon.starts_with(r));
-    let under_attach = attach_root.as_ref().is_some_and(|r| canon.starts_with(r));
-
-    if under_agent || under_attach {
-        Ok(canon)
-    } else {
-        Err(format!(
-            "path escapes the agent sandbox: {}",
-            canon.display()
-        ))
+    if meta.len() > MAX_FILE_SIZE {
+        return Err(format!(
+            "file too large: {} bytes (max {MAX_FILE_SIZE})",
+            meta.len()
+        ));
     }
+    let mut data = Vec::new();
+    file.take(MAX_FILE_SIZE + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if data.len() as u64 > MAX_FILE_SIZE {
+        return Err(format!("file too large: more than {MAX_FILE_SIZE} bytes"));
+    }
+    Ok(data)
+}
+
+/// Open once (no-follow, relative to the allowed root) and read from that
+/// same handle, off the async executor. Every delivery path — interactive
+/// replies, cron, reminders, WebChat and the sweep — reaches the file only
+/// through here.
+async fn open_and_read_deliverable(
+    raw: &str,
+    agent_dir: &Path,
+    home_dir: &Path,
+) -> Result<(PathBuf, Vec<u8>), String> {
+    let raw = raw.to_owned();
+    let agent_dir = agent_dir.to_path_buf();
+    let home_dir = home_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let (path, file) = open_deliverable(&raw, &agent_dir, &home_dir)?;
+        let data = read_opened_deliverable(file)?;
+        Ok((path, data))
+    })
+    .await
+    .map_err(|e| format!("read task failed: {e}"))?
 }
 
 /// Post-process an agent reply: deliver any `📎DELIVER:` files through the
@@ -167,8 +273,8 @@ pub fn validate_deliver_path(
 /// - No marker present → the original reply is returned byte-for-byte (keeps
 ///   prompt-cache/formatting stable for the overwhelming common case).
 /// - Each valid file is sent via [`ChannelSender::send_document`]; on any
-///   validation/read/send failure a zh-TW note naming the path is appended so
-///   the user is never left without the deliverable's location.
+///   validation/read/send failure a zh-TW note naming only the file is appended;
+///   full paths and internal errors stay in server-side warnings.
 pub async fn process_deliverables(
     reply: &str,
     agent_dir: &Path,
@@ -176,6 +282,41 @@ pub async fn process_deliverables(
     sender: &dyn ChannelSender,
 ) -> String {
     process_deliverables_checked(reply, agent_dir, home_dir, sender, None).await
+}
+
+/// Detached WebChat schedules have history, but no live socket for document
+/// frames. Stage through the ordinary validation/archive path and leave a
+/// filename-only notice pointing to the authenticated employee Files page.
+/// Call only after the schedule's WebChat ownership admission.
+pub(crate) async fn process_history_deliverables(
+    reply: &str,
+    agent_dir: &Path,
+    home_dir: &Path,
+) -> String {
+    struct HistorySender(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl ChannelSender for HistorySender {
+        async fn send_text(&self, text: &str) -> Result<(), crate::channel_sender::ChannelSendError> {
+            self.0.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+        async fn send_photo(&self, _: &[u8], _: &str) -> Result<(), crate::channel_sender::ChannelSendError> {
+            Err(crate::channel_sender::ChannelSendError("No live WebChat socket".into()))
+        }
+        async fn send_document(&self, _: &[u8], filename: &str, _: &str) -> Result<(), crate::channel_sender::ChannelSendError> {
+            let filename = crate::channel_sender::delivery_filename(filename);
+            self.send_text(&format!("📎 已產生檔案「{filename}」，可至此員工的檔案頁下載。")).await
+        }
+        async fn request_confirmation(&self, _: &str, _: Option<&[u8]>, _: u64) -> Result<bool, crate::channel_sender::ChannelSendError> {
+            Ok(false)
+        }
+        fn channel_type(&self) -> &'static str { "webchat" }
+    }
+    let sender = HistorySender(std::sync::Mutex::new(Vec::new()));
+    let cleaned = process_deliverables(reply, agent_dir, home_dir, &sender).await;
+    let mut parts = vec![cleaned];
+    parts.extend(sender.0.into_inner().unwrap());
+    parts.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 /// The guarded path checks again after every awaited staging step and before
@@ -193,7 +334,7 @@ pub async fn process_deliverables_checked(
     }
     let (cleaned, paths) = parse_deliverables(reply);
     if paths.is_empty() {
-        return reply.to_string();
+        return if reply.contains(DELIVER_MARKER) { cleaned } else { reply.to_string() };
     }
 
     let mut notes: Vec<String> = Vec::new();
@@ -221,7 +362,8 @@ pub async fn process_deliverables_checked(
                     return crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT.to_string();
                 }
                 warn!(path = %raw, error = %e, "📎DELIVER: delivery failed — degrading to text");
-                notes.push(format!("⚠️ 檔案傳送失敗，已生成於 {raw}（{e}）"));
+                let filename = crate::channel_sender::delivery_filename(raw);
+                notes.push(format!("⚠️ 檔案「{filename}」傳送失敗，無法在此交付，請向管理員確認。"));
             }
         }
     }
@@ -341,24 +483,10 @@ pub async fn stage_deliverable_checked(
     if !delivery_valid(check) {
         return Err(SOURCE_CHANGED.into());
     }
-    let path = validate_deliver_path(raw, agent_dir, home_dir)?;
-
-    let meta = tokio::fs::metadata(&path)
-        .await
-        .map_err(|e| format!("stat failed: {e}"))?;
-    if !delivery_valid(check) {
-        return Err(SOURCE_CHANGED.into());
-    }
-    if meta.len() > MAX_FILE_SIZE {
-        return Err(format!(
-            "file too large: {} bytes (max {MAX_FILE_SIZE})",
-            meta.len()
-        ));
-    }
-
-    let data = tokio::fs::read(&path)
-        .await
-        .map_err(|e| format!("read failed: {e}"))?;
+    // One no-follow open; stat, size check and read all use that handle. The
+    // returned path is never reopened below — only its name, extension and
+    // display form are used.
+    let (path, data) = open_and_read_deliverable(raw, agent_dir, home_dir).await?;
     if !delivery_valid(check) {
         return Err(SOURCE_CHANGED.into());
     }
@@ -387,8 +515,8 @@ pub async fn stage_deliverable_checked(
     // deliverable stays browsable/downloadable in the dashboard Files page
     // even after channel delivery (and even when the send fails).
     // Files already inside attachments/ are listed as-is — no duplicate copy.
-    // `path` is canonicalized by validate_deliver_path, so the guard base must
-    // be canonicalized too (macOS: /var vs /private/var).
+    // `path` is built on the canonical root by open_deliverable, so the guard
+    // base must be canonicalized too (macOS: /var vs /private/var).
     let attach_base = std::fs::canonicalize(agent_dir.join("attachments"))
         .unwrap_or_else(|_| agent_dir.join("attachments"));
     let mut new_archive_path = None;
@@ -519,6 +647,13 @@ async fn send_staged_document(
 
 /// Extensions the sweep treats as user deliverables. Deliberately excludes
 /// `.md`/`.txt`/`.json` — agents constantly write those as internal state.
+///
+/// Images are deliberately excluded as well and are delivered only through an
+/// explicit `📎DELIVER:` marker. The sweep selects files by the shared
+/// employee directory, an mtime window and reply keywords — it has no notion
+/// of which conversation produced a file — and agents produce images (charts,
+/// screenshots) far more often than documents, so a marker-less image sweep
+/// would hand one conversation's image to another.
 const SWEEP_EXTS: &[&str] = &["docx", "xlsx", "pptx", "pdf", "csv", "odt", "ods", "odp"];
 /// Max age of a file's mtime for the sweep to attribute it to the reply that
 /// just finished (long CLI runs take minutes).
@@ -1088,12 +1223,30 @@ mod tests {
 
         let reply = format!("完成。\n📎DELIVER:{}", file.to_str().unwrap());
         let out = process_deliverables(&reply, &agent_dir, &home, &sender).await;
-        // Text kept + honest note naming the path.
+        // Text kept + honest note naming only the file.
         assert!(out.starts_with("完成。"));
-        assert!(out.contains("檔案傳送失敗"));
-        assert!(out.contains(file.to_str().unwrap()));
+        assert!(out.contains("傳送失敗"));
+        assert!(out.contains("out.docx"));
+        assert!(!out.contains(file.to_str().unwrap()));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn history_deliverables_archive_without_exposing_markers_or_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/a");
+        std::fs::create_dir_all(&agent).unwrap();
+        let file = agent.join("report.docx");
+        std::fs::write(&file, minimal_zip_bytes()).unwrap();
+        let reply = process_history_deliverables(
+            &format!("完成\n📎DELIVER:{}", file.display()), &agent, home.path(),
+        ).await;
+        assert!(reply.contains("report.docx"));
+        assert!(reply.contains("檔案頁下載"));
+        assert!(!reply.contains("DELIVER:"));
+        assert!(!reply.contains(home.path().to_str().unwrap()));
+        assert_eq!(std::fs::read_dir(agent.join("attachments")).unwrap().count(), 1);
     }
 
     #[tokio::test]
@@ -1147,6 +1300,141 @@ mod tests {
         assert!(names.contains(&"報告.docx".to_string()));
         assert!(names.contains(&"data.xlsx".to_string()));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// M1: the marker-less sweep has no conversation ownership, so a fresh
+    /// image in the shared employee directory must never be swept into a
+    /// reply. The same image is delivered once a reply declares it.
+    #[tokio::test]
+    async fn images_are_delivered_only_with_an_explicit_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/a");
+        std::fs::create_dir_all(&agent).unwrap();
+        let png = b"\x89PNG\r\n\x1a\nconversation-a-chart".to_vec();
+        for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
+            let image = agent.join(format!("chart.{ext}"));
+            std::fs::write(&image, &png).unwrap();
+            assert!(sweep_candidates(&agent).is_empty(), "{ext} must not be a sweep candidate");
+            std::fs::remove_file(image).unwrap();
+        }
+
+        let image = agent.join("chart.png");
+        std::fs::write(&image, &png).unwrap();
+        let docs = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender {
+            docs: docs.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+        // Conversation B: a reply that talks about a produced file but carries
+        // no marker gets nothing.
+        assert_eq!(sweep_undeclared_deliverables(&agent, home.path(), &sender).await, 0);
+        assert!(docs.lock().unwrap().is_empty());
+
+        // Conversation A declares its image → delivered.
+        let reply = format!("圖表完成。\n📎DELIVER:{}", image.display());
+        let out = process_deliverables(&reply, &agent, home.path(), &sender).await;
+        assert_eq!(out, "圖表完成。");
+        let sent = docs.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "chart.png");
+        assert_eq!(sent[0].1, "image/png");
+        assert_eq!(sent[0].2, png.len());
+    }
+
+    #[cfg(unix)]
+    fn sandbox_refusal_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, RecordingSender, Arc<Mutex<Vec<(String, String, usize)>>>) {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/a");
+        std::fs::create_dir_all(&agent).unwrap();
+        let outside = home.path().join("host-secret");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.docx"), minimal_zip_bytes()).unwrap();
+        let docs = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender {
+            docs: docs.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+        (home, agent, outside, sender, docs)
+    }
+
+    /// M2: a symlink as the final component is refused by the no-follow
+    /// open, both declared and swept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deliver_refuses_symlink_at_final_component() {
+        let (home, agent, outside, sender, docs) = sandbox_refusal_fixture();
+        let link = agent.join("report.docx");
+        std::os::unix::fs::symlink(outside.join("secret.docx"), &link).unwrap();
+
+        assert!(validate_deliver_path(link.to_str().unwrap(), &agent, home.path()).is_err());
+        let reply = format!("完成。\n📎DELIVER:{}", link.display());
+        let out = process_deliverables(&reply, &agent, home.path(), &sender).await;
+        assert!(out.contains("傳送失敗"), "{out}");
+        assert_eq!(sweep_undeclared_deliverables(&agent, home.path(), &sender).await, 0);
+        assert!(docs.lock().unwrap().is_empty());
+        assert!(!agent.join("attachments").exists() || std::fs::read_dir(agent.join("attachments")).unwrap().next().is_none());
+    }
+
+    /// M2: a symlinked intermediate directory inside the agent root is
+    /// refused, even though the final component is a real regular file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deliver_refuses_symlinked_intermediate_directory() {
+        let (home, agent, outside, sender, docs) = sandbox_refusal_fixture();
+        std::os::unix::fs::symlink(&outside, agent.join("out")).unwrap();
+        let through_link = agent.join("out").join("secret.docx");
+
+        assert!(validate_deliver_path(through_link.to_str().unwrap(), &agent, home.path()).is_err());
+        let reply = format!("完成。\n📎DELIVER:{}", through_link.display());
+        let out = process_deliverables(&reply, &agent, home.path(), &sender).await;
+        assert!(out.contains("傳送失敗"), "{out}");
+        assert!(docs.lock().unwrap().is_empty());
+    }
+
+    /// M2: a hard link to a file outside the sandbox cannot stand in for a
+    /// produced file (checked on the opened handle).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deliver_refuses_hard_linked_file() {
+        let (home, agent, outside, sender, docs) = sandbox_refusal_fixture();
+        let linked = agent.join("report.docx");
+        std::fs::hard_link(outside.join("secret.docx"), &linked).unwrap();
+
+        let reply = format!("完成。\n📎DELIVER:{}", linked.display());
+        let out = process_deliverables(&reply, &agent, home.path(), &sender).await;
+        assert!(out.contains("傳送失敗"), "{out}");
+        assert!(docs.lock().unwrap().is_empty());
+    }
+
+    /// M2: an oversize file is refused from the handle's `fstat` before any
+    /// read (a sparse file: reading it all would allocate the full size).
+    #[tokio::test]
+    async fn deliver_refuses_oversize_file_without_reading_it() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/a");
+        std::fs::create_dir_all(&agent).unwrap();
+        let big = agent.join("huge.pdf");
+        std::fs::File::create(&big).unwrap().set_len(MAX_FILE_SIZE + 1).unwrap();
+
+        let err = stage_deliverable(
+            big.to_str().unwrap(),
+            &agent,
+            home.path(),
+            crate::artifacts::ArtifactOrigin::Declared,
+            Some("recording"),
+        )
+        .await
+        .err()
+        .expect("oversize file must be refused");
+        assert!(err.contains("too large"), "{err}");
+        assert!(!agent.join("attachments").exists());
+
+        // The refusal comes from the opened handle's metadata.
+        let (_, file) = open_deliverable(big.to_str().unwrap(), &agent, home.path()).unwrap();
+        let err = read_opened_deliverable(file).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
     }
 
     #[test]
@@ -1227,8 +1515,9 @@ mod tests {
         assert_eq!(archived, 0, "a hard-rejected file must not be archived");
         // The user still learns something was attempted and why it failed.
         assert!(out.starts_with("已完成。"));
-        assert!(out.contains("檔案傳送失敗"));
-        assert!(out.contains("空的"), "{out}");
+        assert!(out.contains("傳送失敗"));
+        assert!(out.contains("empty.docx"), "{out}");
+        assert!(!out.contains(file.to_str().unwrap()), "{out}");
 
         let _ = std::fs::remove_dir_all(&home);
     }

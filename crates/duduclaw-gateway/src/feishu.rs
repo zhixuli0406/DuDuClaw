@@ -394,7 +394,10 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
                         Err(e) => warn!("Feishu: failed to save attachment {filename}: {e}"),
                     }
                 }
-                Err(e) => warn!("Feishu: failed to download resource {file_key}: {e}"),
+                Err(e) => {
+                    warn!("Feishu: attachment download failed: {e}");
+                    attachment_lines.push(crate::media::attachment_download_failed(filename));
+                }
             }
         }
     }
@@ -618,7 +621,6 @@ async fn download_feishu_resource(
     let url =
         format!("{FEISHU_API}/im/v1/messages/{message_id}/resources/{file_key}?type={res_type}");
     crate::media::download_url(
-        &state.http,
         &url,
         Some(("Authorization", &format!("Bearer {token}"))),
         crate::media::MAX_FILE_SIZE as usize,

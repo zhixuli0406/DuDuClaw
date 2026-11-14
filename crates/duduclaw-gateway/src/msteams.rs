@@ -859,7 +859,6 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
             crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), None).await;
         for (name, url) in &file_attachments {
             match crate::media::download_url(
-                &state.ctx.http,
                 url,
                 None,
                 crate::media::MAX_FILE_SIZE as usize,
@@ -876,7 +875,10 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
                         Err(e) => warn!("Teams: failed to save attachment {name}: {e}"),
                     }
                 }
-                Err(e) => warn!("Teams: failed to download attachment {name}: {e}"),
+                Err(e) => {
+                    warn!("Teams: attachment download failed: {e}");
+                    attachment_lines.push(crate::media::attachment_download_failed(name));
+                }
             }
         }
     }

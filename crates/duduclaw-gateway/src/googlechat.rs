@@ -700,15 +700,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                     }
                 }
                 GchatAttachmentRef::Drive { file_id } => {
-                    // Explicit degrade: downloading Drive content requires a
-                    // Drive API scope the Chat service account is not granted.
-                    warn!(
-                        "Google Chat: Drive attachment {filename} ({file_id}) skipped — \
-                         service account lacks Drive scope"
-                    );
-                    attachment_lines.push(format!(
-                        "[Attached Google Drive file: {filename} — not downloaded (Drive scope not granted)]"
-                    ));
+                    attachment_lines.push(drive_attachment_note(&filename, file_id));
                 }
             }
         }
@@ -949,6 +941,40 @@ async fn deliver_reply(
     true
 }
 
+/// Only provider resource IDs, never arbitrary text, may enter the tool hint.
+fn drive_attachment_note(filename: &str, file_id: &str) -> String {
+    let valid = (1..=256).contains(&file_id.len())
+        && file_id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'));
+    if valid {
+        format!("[Attached Google Drive file: {filename} — not downloaded automatically. driveFileId: {file_id}. Open this id with the Drive read tool (drive_read); access depends on the connected Google identity and file type.]")
+    } else {
+        format!("[Attached Google Drive file: {filename} — not downloaded automatically; no valid Drive file id available.]")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoogleChatSendError {
+    InvalidTarget,
+    Configuration(String),
+    Http { status: u16 },
+    Transport,
+}
+
+impl std::fmt::Display for GoogleChatSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTarget => f.write_str("Google Chat 目標必須是有效的 spaces/<id>，不能使用使用者 ID 或電子郵件。"),
+            Self::Configuration(reason) => f.write_str(reason),
+            Self::Http { status: 403 | 404 } => f.write_str("對方尚未與此 Chat 應用程式建立對話，或應用程式不在該聊天室。請對方先私訊此應用程式一次，或請管理員為對方安裝。"),
+            Self::Http { status } if *status == 429 || (500..=599).contains(status) => f.write_str("Google Chat 暫時無法傳送訊息，請稍後重試。"),
+            Self::Http { .. } => f.write_str("Google Chat 拒絕傳送訊息，請管理員確認應用程式設定。"),
+            Self::Transport => f.write_str("Google Chat 暫時無法連線或取得授權，請稍後重試。"),
+        }
+    }
+}
+
+impl std::error::Error for GoogleChatSendError {}
+
 /// Send markdown text to a space (proactive / delegation-forwarding path).
 /// The Chat app must already be a member of the space.
 pub async fn send_text_to_space(
@@ -956,7 +982,7 @@ pub async fn send_text_to_space(
     space: &str,
     markdown: &str,
 ) -> Result<(), String> {
-    send_text_to_space_as(home_dir, None, space, markdown).await
+    send_text_to_space_as(home_dir, None, space, markdown).await.map_err(|e| e.to_string())
 }
 
 /// [`send_text_to_space`] as an employee's own Chat app when `agent` has one
@@ -966,8 +992,12 @@ pub async fn send_text_to_space_as(
     agent: Option<&str>,
     space: &str,
     markdown: &str,
-) -> Result<(), String> {
-    let (creds, member) = sending_creds(home_dir, agent, space).await?;
+) -> Result<(), GoogleChatSendError> {
+    if !crate::google_workspace::chat_read::valid_space(space) {
+        return Err(GoogleChatSendError::InvalidTarget);
+    }
+    let (creds, member) = sending_creds(home_dir, agent, space).await
+        .map_err(GoogleChatSendError::Configuration)?;
     let formatted = crate::markdown_render::to_googlechat_text(markdown);
     for chunk in crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK) {
         if let Err(status) = post_message(&creds, space, None, &chunk).await {
@@ -976,9 +1006,13 @@ pub async fn send_text_to_space_as(
             if let Some(member) = member.as_deref()
                 && matches!(status, Some(403) | Some(404))
             {
+                warn!(space, member, ?status, "Google Chat: removing inaccessible app from space roster");
                 crate::agent_channels::gchat_spaces::forget(home_dir, space, member);
             }
-            return Err("Google Chat send failed".into());
+            return Err(match status {
+                Some(status) => GoogleChatSendError::Http { status },
+                None => GoogleChatSendError::Transport,
+            });
         }
     }
     Ok(())
@@ -1190,7 +1224,6 @@ async fn download_media(creds: &GoogleChatCreds, resource_name: &str) -> Result<
     let url = media_download_url(&creds.api_base(), resource_name);
     let bearer = format!("Bearer {token}");
     crate::media::download_url(
-        &creds.http,
         &url,
         Some(("Authorization", &bearer)),
         crate::media::MAX_FILE_SIZE as usize,
@@ -1271,6 +1304,40 @@ pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drive_attachment_note_only_includes_valid_bounded_id() {
+        assert!(drive_attachment_note("report", "Abc_123-xyz").contains("driveFileId: Abc_123-xyz"));
+        assert!(drive_attachment_note("report", "Abc_123-xyz").contains("drive_read"));
+        for id in ["", "abc\ninstructions", "../secret", "abc?x=y", "中文", &"a".repeat(257)] {
+            let note = drive_attachment_note("report", id);
+            assert!(!note.contains("driveFileId:"), "{note}");
+            assert!(!note.contains("scope not granted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn proactive_rejects_invalid_target_before_credentials_or_network() {
+        let home = tempfile::tempdir().unwrap();
+        for target in ["users/123", "a@example.com", "spaces/a/messages", "spaces/a?x=y", "spaces/..", "spaces/a\n", "spaces/中文"] {
+            assert_eq!(send_text_to_space_as(home.path(), None, target, "hello").await,
+                Err(GoogleChatSendError::InvalidTarget));
+        }
+    }
+
+    #[test]
+    fn proactive_errors_explain_membership_and_temporary_failures() {
+        for status in [403, 404] {
+            let error = GoogleChatSendError::Http { status };
+            assert!(error.to_string().contains("請對方先私訊此應用程式一次"));
+            assert_eq!(error, GoogleChatSendError::Http { status });
+        }
+        for status in [429, 500, 502, 503, 599] {
+            assert!(GoogleChatSendError::Http { status }.to_string().contains("稍後重試"));
+        }
+        assert!(!GoogleChatSendError::Http { status: 400 }.to_string().contains("尚未"));
+    }
+
     #[test]
     fn googlechat_dedupe_only_records_accepted_messages() {
         let key = format!("test:{}", uuid::Uuid::new_v4());

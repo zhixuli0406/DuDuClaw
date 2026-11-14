@@ -283,7 +283,7 @@ async fn google_chat_sends_pick_the_app_that_is_in_the_space() {
     )
     .await
     .unwrap_err();
-    assert!(err.contains("could not be loaded"), "{err}");
+    assert!(err.to_string().contains("could not be loaded"), "{err}");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !gchat::texts_with_bearer(&fake, &format!("Bearer tok-{shared_email}"))
