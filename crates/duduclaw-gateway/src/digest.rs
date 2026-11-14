@@ -747,6 +747,7 @@ pub async fn deliver_governed(
                 no_button_hint: None,
                 decision_source: None,
                 decision_id: Some(digest.date.clone()),
+                origin_proof: None,
             },
         );
         return if queued {

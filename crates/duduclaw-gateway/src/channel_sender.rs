@@ -770,11 +770,12 @@ pub async fn resolve_channel_target(
     if sender_self_configures(channel) {
         let marker = self_config_marker_field(channel)
             .expect("self-configuring channel must declare a marker field");
-        let present =
+        let present = if channel == "googlechat" {
+            crate::agent_channels::gchat_spaces::has_sending_app(home_dir, None, chat_id).await
+        } else {
             crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
-                .await
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
+                .await.map(|v| !v.is_empty()).unwrap_or(false)
+        };
         if !present {
             return Err(format!(
                 "channel {channel} is not configured (missing `{marker}` in config.toml [channels])"

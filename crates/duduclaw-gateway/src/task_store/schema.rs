@@ -406,6 +406,10 @@ impl TaskStore {
             ("on_behalf_of", "on_behalf_of TEXT"),
             ("created_via", "created_via TEXT"),
             ("a2a_owner", "a2a_owner TEXT"),
+            // v1.82: gateway proof of the human behind an AI-created goal's
+            // source conversation, re-verified before every goal push.
+            // Nullable — every older row reads back as "no proof".
+            ("source_origin_proof", "source_origin_proof TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {

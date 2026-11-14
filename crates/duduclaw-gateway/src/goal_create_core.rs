@@ -89,6 +89,10 @@ pub struct GoalCreateRequest {
     /// The conversation progress notices go back to: `(channel, chat_id)`,
     /// stamped as `source_channel` / `source_chat_id`.
     pub source: Option<(String, String)>,
+    /// Opaque id of the gateway-held origin proof for an AI-created `source`
+    /// ([`crate::recipient_guard::origin`]), stamped as `source_origin_proof`
+    /// and re-verified by id before every goal push there.
+    pub source_origin_proof: Option<String>,
     /// A caller-chosen task id (a chat assignment derives it from the event,
     /// so a redelivered message creates nothing twice). `None` ⇒ random.
     pub task_id: Option<String>,
@@ -342,6 +346,7 @@ async fn create_goal_task_inner(
         task.source_discord_guild_id = (channel == "discord")
             .then(|| crate::discord::guild_id_for_channel(home_dir, chat_id))
             .flatten();
+        task.source_origin_proof = req.source_origin_proof.clone();
     }
 
     crate::team_composer::check_team_dispatchable(home_dir, &req.agent_id)?;

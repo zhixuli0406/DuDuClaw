@@ -89,7 +89,15 @@ P1e `task_store_markers` table that every fresh v1.81 `tasks.db` creates, so a h
 by this release is accepted as a source. Both the v1.80 and v1.81 catalogs are accepted
 (exact match only, `tasks-v180.sql` is unchanged), share the v1.80 mapping, and the
 marker table is never authorized for reading. `scripts/capture_tasks_schema.py`
-regenerates both files; the gateway test compares `tasks-v181.sql` with a fresh `TaskStore`.
+regenerates both files. A fourth catalog, v1.82, is `tasks-v181.sql` plus the additive
+`tasks.source_origin_proof` column (`TASKS_V182` in `catalog.rs`; no separate file): the
+opaque id of the gateway-held proof of an AI-created goal's source conversation, mapped as
+v1.80; the reader never selects it. The gateway test compares that v1.82 catalog with a fresh `TaskStore`.
+`sessions.db` v1.82 is either pinned v1.81 shape (fresh / upgraded) plus the gateway-owned
+`schedule_origin_proofs` table (`session-origin-proofs-v182.sql`, the same text as
+`recipient_guard::origin::SCHEMA`; `SESSION_V182` / `SESSION_V182_UPGRADED` in `catalog.rs`).
+Both map as v1.81 and the proof table is never authorized for reading. The gateway tests
+compare both shapes with a fresh and an upgraded `SessionManager`.
 `approvals.db` likewise has a third catalog, `approvals-v181.sql`: the v1.80.x store plus
 the SR5 `approvals.employee_incarnation` column (a card bound to its employee's
 incarnation). v1.79.3, v1.80.x and v1.81 are accepted (exact match only;

@@ -8,6 +8,7 @@ pub fn cron(row: &crate::cron_store::CronTaskRow) -> Value {
         "trigger_kind": row.trigger_kind, "condition_script": row.condition_script,
         "watch_command": row.watch_command, "notify_channel": row.notify_channel,
         "notify_chat_id": row.notify_chat_id, "notify_thread_id": row.notify_thread_id,
+        "notify_sender": row.notify_sender, "notify_origin": row.notify_origin,
         "on_behalf_of": row.on_behalf_of, "created_at": row.created_at,
         "created_by_user_id": row.created_by_user_id, "scoped_by_user_id": row.scoped_by_user_id})
 }
@@ -15,7 +16,7 @@ pub fn cron(row: &crate::cron_store::CronTaskRow) -> Value {
 pub fn reminder(row: &crate::reminder_scheduler::Reminder) -> Value {
     json!({"id": row.id, "agent_id": row.agent_id, "trigger_at": row.trigger_at,
         "channel": row.channel, "chat_id": row.chat_id, "message": row.message,
-        "prompt": row.prompt, "mode": row.mode, "sender_agent": row.sender_agent,
+        "prompt": row.prompt, "mode": row.mode, "sender_agent": row.sender_agent, "notify_origin": row.notify_origin,
         "on_behalf_of": row.on_behalf_of, "created_at": row.created_at})
 }
 
@@ -114,7 +115,7 @@ fn read_source(home: &std::path::Path, kind: &str, id: &str, ancestor: bool) -> 
             let row = conn.query_row("SELECT id,name,agent_id,cron,task,enabled,
                 created_at,updated_at,last_run_at,last_status,last_error,run_count,failure_count,
                 notify_channel,notify_chat_id,notify_thread_id,cron_timezone,trigger_kind,
-                condition_script,condition_state,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id
+                condition_script,condition_state,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id,notify_sender,notify_origin,last_delivery_status,last_delivery_reason,notify_origin_proof
                 FROM cron_tasks WHERE id=?1", [id], crate::cron_store::row_to_cron_task)
                 .map_err(|e| e.to_string())?;
             if !row.enabled { return Err("background cron is disabled".into()); }
@@ -311,9 +312,10 @@ mod tests {
             enabled INTEGER,created_at TEXT,updated_at TEXT,last_run_at TEXT,last_status TEXT,last_error TEXT,
             run_count INTEGER,failure_count INTEGER,notify_channel TEXT,notify_chat_id TEXT,notify_thread_id TEXT,
             cron_timezone TEXT,trigger_kind TEXT,condition_script TEXT,condition_state TEXT,watch_command TEXT,on_behalf_of TEXT,
-            created_by_user_id TEXT,scoped_by_user_id TEXT);
+            created_by_user_id TEXT,scoped_by_user_id TEXT,notify_sender TEXT,notify_origin TEXT,last_delivery_status TEXT,last_delivery_reason TEXT,
+            notify_origin_proof TEXT);
             INSERT INTO cron_tasks VALUES('id','name','alice','0 0 * * *','work',1,'created','updated',
-                NULL,NULL,NULL,0,0,NULL,NULL,NULL,NULL,'time',NULL,NULL,NULL,'user:owner','creator','creator');").unwrap();
+                NULL,NULL,NULL,0,0,NULL,NULL,NULL,NULL,'time',NULL,NULL,NULL,'user:owner','creator','creator',NULL,NULL,NULL,NULL,NULL);").unwrap();
         let original = read_current(home.path(), "cron", "id").unwrap();
         conn.execute("UPDATE cron_tasks SET run_count=17,last_status='ok'", []).unwrap();
         assert_eq!(original, read_current(home.path(), "cron", "id").unwrap());

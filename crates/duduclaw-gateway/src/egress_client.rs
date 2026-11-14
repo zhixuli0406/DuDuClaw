@@ -115,6 +115,27 @@ fn turn_id() -> Option<String> {
     )
 }
 
+/// The conversation turn (`DUDUCLAW_TURN_ID`) of an ordinary MCP process: the
+/// id the gateway's live turn registry (`turn_context`) is keyed by, and so
+/// the only id that can resolve a schedule / reminder / goal origin or mint an
+/// origin proof. Never the execution alias (`DUDUCLAW_EGRESS_TURN_ID`, which
+/// only the egress ledger knows) and never a fallback to it: an absent or
+/// malformed conversation turn resolves no origin at all (fail closed).
+fn checked_conversation_turn_id() -> Result<String, &'static str> {
+    checked_conversation_identity(std::env::var_os(duduclaw_core::ENV_TRUST_TURN_ID))
+}
+
+fn checked_conversation_identity(primary: Option<std::ffi::OsString>) -> Result<String, &'static str> {
+    primary
+        .ok_or(crate::egress_guard::UNTRACKED_TURN)?
+        .into_string()
+        .ok()
+        .filter(|turn| crate::computer_use_sessions::turns::valid_turn_id(turn))
+        .ok_or("invalid turn identity")
+}
+
+/// Egress-ledger identity only; origin lookups use
+/// [`checked_conversation_turn_id`].
 fn resolve_turn_id(
     primary: Option<std::ffi::OsString>,
     alias: Option<std::ffi::OsString>,
@@ -430,8 +451,37 @@ pub use crate::recipient_guard::RecipientContext;
 /// The opaque turn id is the only caller-supplied recipient context.
 pub async fn recipients(home: &Path, agent: &str) -> Result<RecipientContext, String> {
     let turn = read_turn_id(checked_turn_id())?;
-    let value = exchange_value(home, agent, &turn, "recipients", None, None, None, None).await?;
+    recipient_context(home, agent, &turn, false).await
+}
+
+/// `mint_origin` asks the gateway to persist origin proof records for this
+/// turn (`payload: true` in the signed body); the answer carries only their
+/// opaque ids. Never set for an ordinary recipient query.
+async fn recipient_context(home: &Path, agent: &str, turn: &str, mint_origin: bool) -> Result<RecipientContext, String> {
+    let value = exchange_value(home, agent, turn, "recipients", None, None, mint_origin.then_some(true), None).await?;
     serde_json::from_value(value).map_err(|_| "invalid recipient context".into())
+}
+
+/// Scheduling needs the conversation identity, not the separate execution
+/// alias used by the outgoing-data ledger. Host run metadata is authoritative
+/// in isolation (that dispatcher runs inside the gateway process); ordinary
+/// MCP obtains the live turn binding by signed loopback, keyed by its
+/// conversation turn (`checked_conversation_turn_id`); without one nothing
+/// is requested and there is no origin. Either way the gateway mints the
+/// origin proof records and only their ids come back.
+pub async fn schedule_context(home: &Path, agent: &str) -> Result<RecipientContext, String> {
+    if let Some(identity) = crate::isolation_egress::current(home, agent) {
+        identity?;
+        let (turn, _) = crate::isolation_egress::resolved_identity()
+            .ok_or("isolated conversation identity unavailable")?;
+        let mut context = crate::recipient_guard::context(home, agent, &turn, true)?;
+        let metadata = crate::isolation_egress::run_metadata();
+        context.reply_channel = metadata.as_ref().and_then(|metadata| metadata.reply_channel.clone());
+        context.reply_sender = metadata.and_then(|metadata| metadata.reply_sender);
+        return Ok(context);
+    }
+    let turn = checked_conversation_turn_id()?;
+    recipient_context(home, agent, &turn, true).await
 }
 
 async fn exchange_with_read(
@@ -722,6 +772,108 @@ mod tests {
         assert_eq!(resolve_turn_id(None, Some("".into())), None);
         assert_eq!(resolve_turn_id(Some("valid-provenance".into()), Some("".into())), None);
         assert_eq!(resolve_turn_id(Some("valid-provenance".into()), Some("bad\nexecution".into())), None);
+    }
+
+    /// Origin lookups are keyed by the conversation turn only: no alias
+    /// fallback when it is absent or malformed, while the egress identity
+    /// still prefers the alias.
+    #[test]
+    fn conversation_identity_never_falls_back_to_the_execution_alias() {
+        assert_eq!(checked_conversation_identity(Some("conversation-turn".into())).unwrap(), "conversation-turn");
+        assert_eq!(checked_conversation_identity(None).unwrap_err(), crate::egress_guard::UNTRACKED_TURN);
+        for malformed in ["", "bad\nturn"] {
+            let reason = checked_conversation_identity(Some(malformed.into())).unwrap_err();
+            assert_ne!(reason, crate::egress_guard::UNTRACKED_TURN, "{malformed:?}");
+        }
+        assert_eq!(checked_identity(Some("conversation-turn".into()), Some("runtime-alias".into())).unwrap(),
+            "runtime-alias");
+    }
+
+    /// Live-test regression: an MCP process inherits both `DUDUCLAW_TURN_ID`
+    /// and `DUDUCLAW_EGRESS_TURN_ID`. The schedule-origin request must carry
+    /// the conversation turn (the key of the gateway's turn registry) and an
+    /// egress request the alias; with only the alias, no origin is requested.
+    #[tokio::test]
+    async fn schedule_origin_request_carries_conversation_turn_and_egress_keeps_alias() {
+        // Process isolation keeps credential/turn env changes out of parallel tests.
+        const CHILD: &str = "DUDUCLAW_SCHEDULE_TURN_WIRE_CHILD";
+        const CONVERSATION: &str = "conversation-turn";
+        const ALIAS: &str = "runtime-execution-alias";
+        if std::env::var_os(CHILD).is_none() {
+            for conversation in [Some(CONVERSATION), None] {
+                let expected = if conversation.is_some() { 2 } else { 1 };
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    for stream in listener.incoming().take(expected) {
+                        let Ok(mut stream) = stream else { break };
+                        let _ = tx.send(read_request(&stream));
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                    }
+                });
+                let home = tempfile::tempdir().unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "egress_client::tests::schedule_origin_request_carries_conversation_turn_and_egress_keeps_alias", "--nocapture"])
+                    .env(CHILD, "1").env("DUDUCLAW_HOME", home.path())
+                    .env(duduclaw_core::egress_guard::ENV_TURN_ALIAS, ALIAS)
+                    .env(duduclaw_core::ENV_MCP_API_KEY, "test-key")
+                    .env(duduclaw_core::ENV_AGENT_TOKEN, "test-token")
+                    .env("DUDUCLAW_PORT", port.to_string());
+                match conversation {
+                    Some(turn) => { command.env(duduclaw_core::ENV_TRUST_TURN_ID, turn); }
+                    None => { command.env_remove(duduclaw_core::ENV_TRUST_TURN_ID); }
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let requests: Vec<_> = rx.try_iter().map(Option::unwrap).collect();
+                let routes: Vec<_> = requests.iter().map(|(route, _)| route.as_str()).collect();
+                if conversation.is_some() {
+                    assert_eq!(routes, [crate::egress_guard::RECIPIENTS_ROUTE, crate::egress_guard::MARK_ROUTE]);
+                    assert_eq!(requests[0].1["turn_id"], CONVERSATION);
+                    assert_eq!(requests[0].1["payload"], true);
+                    assert_eq!(requests[1].1["turn_id"], ALIAS);
+                } else {
+                    // No origin requested at all; the egress ledger is unchanged.
+                    assert_eq!(routes, [crate::egress_guard::MARK_ROUTE]);
+                    assert_eq!(requests[0].1["turn_id"], ALIAS);
+                }
+            }
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let origin = schedule_context(home.path(), "bot").await.err().unwrap();
+        if std::env::var_os(duduclaw_core::ENV_TRUST_TURN_ID).is_some() {
+            assert_eq!(origin, "gateway refused taint request");
+        } else {
+            assert_eq!(origin, crate::egress_guard::UNTRACKED_TURN);
+        }
+        assert_eq!(mark(home.path(), "bot", "memory_search").await.unwrap_err(), "gateway refused taint request");
+    }
+
+    /// One HTTP/1.1 request from the client: its path and JSON body.
+    fn read_request(stream: &std::net::TcpStream) -> Option<(String, serde_json::Value)> {
+        use std::io::{BufRead, Read};
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let path = line.split_whitespace().nth(1)?.to_owned();
+        let mut length = 0usize;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).ok()?;
+            let header = header.trim_end();
+            if header.is_empty() { break; }
+            if let Some((name, value)) = header.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse().ok()?; }
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).ok()?;
+        Some((path, serde_json::from_slice(&body).ok()?))
     }
 
     #[test]

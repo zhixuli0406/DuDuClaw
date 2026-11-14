@@ -420,6 +420,18 @@ pub(crate) async fn handle_tasks_create(
             on_behalf_of: on_behalf_of.clone(),
             ..Default::default()
         };
+        // H3: progress / needs-human pushes default to the conversation this
+        // turn answers only with the gateway proof stored alongside; it is
+        // re-verified before every push. Unproven ⇒ no source (the goal
+        // falls back to the employee's own notification settings).
+        let req = match schedule_origin(home_dir, actor.agent(), &assigned_to).await {
+            Some(origin) => duduclaw_gateway::goal_create_core::GoalCreateRequest {
+                source: Some((origin.channel, origin.chat)),
+                source_origin_proof: Some(origin.proof),
+                ..req
+            },
+            None => req,
+        };
         let admission_home = home_dir.to_path_buf();
         let admission_agent = actor.agent().map(str::to_owned);
         let admission = Box::pin(async move {
@@ -491,9 +503,11 @@ pub(crate) async fn handle_tasks_create(
                 } else {
                     assigned_to.clone()
                 };
-                let origin_env = std::env::var(duduclaw_core::ENV_ORIGIN_SESSION).ok();
-                let target = match resolve_notify_target(
-                    args, home_dir, actor.agent(), &scheduled_target, origin_env.as_deref(),
+                // H1: only the gateway's live turn context supplies a
+                // default; the process environment is never consulted.
+                let context = turn_context(home_dir, actor.agent(), &scheduled_target).await;
+                let target = match resolve_turn_notify_target(
+                    args, actor.agent(), &scheduled_target, context.as_ref(),
                 ) {
                     Ok(target) => target,
                     Err(message) => return tool_error(&message),
@@ -503,16 +517,16 @@ pub(crate) async fn handle_tasks_create(
                         "a one-shot schedule (RFC3339 instant) also needs notify_channel and \
                          notify_chat_id — the wake-up runs detached and has nowhere to reply. \
                          一次性排程需要通知管道（notify_channel 與 notify_chat_id），否則結果無處可送；\
-                         在 WebChat 對話中建立時會自動回到該對話。",
+                         在支援的聊天通道或 WebChat 對話中建立時會自動回到該對話。",
                     );
                 }
                 // The origin conversation is never passed as an argument: the
-                // reminder rail re-derives it from the same attested env and
-                // refuses a supplied `webchat` target.
-                let (channel, chat) = match target.delivery() {
-                    Delivery::OriginWebchat => (None, None),
-                    _ => (target.channel, target.chat),
-                };
+                // reminder rail re-derives it from the same gateway turn
+                // context and refuses a supplied `webchat` target.
+                let (channel, chat) = if args.get("notify_channel").and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty()) {
+                    (target.channel, target.chat)
+                } else { (None, None) };
                 let synth = serde_json::json!({
                     "time": at,
                     "mode": "agent_callback",

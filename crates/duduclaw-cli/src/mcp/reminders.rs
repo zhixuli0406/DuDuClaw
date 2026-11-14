@@ -47,32 +47,30 @@ pub(crate) async fn handle_create_reminder(
         });
     }
 
-    // RM-124: no target named ⇒ the WebChat conversation this turn answers,
-    // when the gateway attested one and it binds to the acting employee who
-    // is also the reminder's employee.
-    let origin = if supplied_channel.is_empty() && supplied_chat.is_empty() {
-        let target = if agent_id == "default" {
-            resolve_main_agent_name(home_dir).await
-        } else {
-            agent_id.to_string()
-        };
-        let env = std::env::var(duduclaw_core::ENV_ORIGIN_SESSION).ok();
-        actor
-            .agent()
-            .filter(|acting| *acting == target)
-            .and_then(|acting| duduclaw_gateway::scheduled_webchat::bind_origin(home_dir, env.as_deref(), acting))
-    } else {
-        None
+    let executor = if agent_id == "default" {
+        resolve_main_agent_name(home_dir).await
+    } else { agent_id.to_string() };
+    // H1/H2: the default destination, the stored origin and its proof all
+    // come from the gateway's live turn context — never the process env.
+    let context = turn_context(home_dir, actor.agent(), &executor).await;
+    let target = match resolve_turn_notify_target(
+        &serde_json::json!({"notify_channel": supplied_channel, "notify_chat_id": supplied_chat}),
+        actor.agent(), &executor, context.as_ref(),
+    ) {
+        Ok(target) => target,
+        Err(message) => return tool_error(&message),
     };
-    let (channel, chat_id): (&str, &str) = match origin.as_deref() {
-        Some(session) => (duduclaw_gateway::scheduled_webchat::CHANNEL, session),
-        None => (supplied_channel, supplied_chat),
-    };
+    // The stored origin (channel or WebChat) and the opaque id of its
+    // gateway proof record; the gateway re-verifies the record at send.
+    let origin = stored_origin(context.as_ref(), &target);
+    let webchat_origin = target.delivery() == Delivery::OriginWebchat;
+    let channel = target.channel.as_deref().unwrap_or("");
+    let chat_id = target.chat.as_deref().unwrap_or("");
 
     if time_str.is_empty() || channel.is_empty() || chat_id.is_empty() {
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: time, channel, and chat_id are required \
-                (in a WebChat conversation channel/chat_id may be omitted: the reminder then reports back to it)"}],
+                (in a supported conversation channel/chat_id may be omitted: the reminder then reports back to the conversation this was created from)"}],
             "isError": true
         });
     }
@@ -138,7 +136,7 @@ pub(crate) async fn handle_create_reminder(
     // gateway-attested origin above (RM-124): the reminder is then appended
     // to that conversation's history at fire time, after an ownership
     // re-check, instead of being sent.
-    if origin.is_none() && !matches!(
+    if !webchat_origin && !matches!(
         channel,
         "telegram"
             | "line"
@@ -196,7 +194,7 @@ pub(crate) async fn handle_create_reminder(
 
     let reminder = Reminder {
         id: uuid::Uuid::new_v4().to_string(),
-        agent_id: agent_id.to_string(),
+        agent_id: executor.clone(),
         trigger_at,
         channel: channel.to_string(),
         chat_id: chat_id.to_string(),
@@ -212,7 +210,9 @@ pub(crate) async fn handle_create_reminder(
         error: None,
         // B11: set in a conversation that came through an employee's own
         // bot / app ⇒ delivered through the same one.
-        sender_agent: duduclaw_gateway::claude_runner::reply_sender_for(channel, chat_id),
+        sender_agent: turn_reply_sender(context.as_ref(), channel, chat_id).or_else(|| (channel == "googlechat").then(|| executor.clone())),
+        notify_origin: origin.as_ref().map(|(recipient, _)| recipient.clone()),
+        notify_origin_proof: origin.map(|(_, proof)| proof),
         on_behalf_of: principal,
         isolation_bound: false, // The append boundary stamps the verified host scope.
     };
@@ -228,7 +228,7 @@ pub(crate) async fn handle_create_reminder(
     match append_reminder_checked_admitted(
         home_dir, &reminder, MAX_REMINDERS_PER_AGENT, admission,
     ).await {
-        Ok(AppendResult::Ok) if origin.is_some() => serde_json::json!({
+        Ok(AppendResult::Ok) if webchat_origin => serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Reminder created (id: {id}, trigger: {trigger_display}, channel: webchat). \
                  提醒會在時間到時回到這個 WebChat 對話，不會即時推播；重新開啟此對話即可查看。\
@@ -237,7 +237,9 @@ pub(crate) async fn handle_create_reminder(
         }),
         Ok(AppendResult::Ok) => serde_json::json!({
             "content": [{"type": "text", "text": format!(
-                "Reminder created (id: {id}, trigger: {trigger_display}, channel: {channel})"
+                "Reminder created (id: {id}, trigger: {trigger_display}, channel: {channel}). 提醒會傳送到 {} 的{}對話。",
+                duduclaw_gateway::decision_notify::channel_display_name(channel),
+                if supplied_channel.is_empty() && supplied_chat.is_empty() { "原本這個" } else { "指定" }
             )}]
         }),
         Ok(AppendResult::LimitReached(count)) => serde_json::json!({
@@ -284,6 +286,7 @@ pub(crate) fn render_reminders(reminders: &[duduclaw_gateway::reminder_scheduler
                 "message": r.message,
                 "mode": r.mode,
                 "status": r.status,
+                "error": r.error,
                 "agent_id": r.agent_id,
             })
         })

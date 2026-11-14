@@ -23,7 +23,8 @@ pub(crate) const TASK_COLUMNS: &str = "id, title, description, status, priority,
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
      pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json,
      discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision, \
-     on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review, a2a_owner";
+     on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review, a2a_owner, \
+     source_origin_proof";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -426,6 +427,13 @@ pub struct TaskRow {
     /// `dashboard`, …). `None` when `on_behalf_of` is `None`.
     #[serde(default)]
     pub created_via: Option<String>,
+    /// Opaque id of the gateway-held proof of the human behind an AI-created
+    /// goal's `source_channel`/`source_chat_id`
+    /// ([`crate::recipient_guard::origin`]), re-verified by id against the
+    /// gateway's record before every goal push to that conversation and
+    /// copied onto the goal's deferred-queue entries. Never serialized out.
+    #[serde(default, skip_serializing)]
+    pub source_origin_proof: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -504,6 +512,7 @@ impl TaskRow {
             criteria_ledger: None,
             on_behalf_of: None,
             created_via: None,
+            source_origin_proof: None,
         }
     }
 }
