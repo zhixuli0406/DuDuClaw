@@ -835,6 +835,26 @@ AI 員工回覆時，你仍可輸入並送出下一則訊息。同一個對話�
 
 員工首頁在個人連線尚未完成時顯示「還差幾步」連線提醒卡片，各項連往「我的連線」。這張卡片與新同仁第一次登入的上手引導卡片標題相同，但只追蹤個人連線。全部完成或讀取失敗時不顯示，也可以在目前瀏覽器關閉卡片。系統記錄建立、寄送結果、使用與撤銷事件，不記錄權杖或連結。頁面讀取網址片段後立即從瀏覽紀錄移除，只在元件狀態保留權杖。公開 `/invite` 頁面不受登入或 FirstRunGate 限制。API 僅提供 `POST /api/invite/check`，以 `{token}` 回傳 `{valid,email_masked?}`，以及 `POST /api/invite/redeem`，接收 `{token,password}`；不再提供帶權杖的 API 路徑。請勿記錄請求本文。同一 TCP 來源 IP 與權杖 SHA-256 前 16 個十六進位字元共用每 15 分鐘 10 次額度；不設來源 IP 的總額度，避免反向代理後的使用者互相阻擋。記憶體表最多保存 10,000 個桶；容量滿時優先淘汰過期桶；沒有過期桶時，才淘汰最早插入的桶。排序索引讓每次請求都不必掃描全表。不採用轉送標頭。
 
+## 使用者 → 驗證身分：通訊軟體身分（v1.82）
+
+在某位同仁那一列按 **驗證身分**（僅管理員），把他在通訊軟體上的帳號對應到這個 dashboard 帳號。綁定後，從那個帳號傳來的訊息就當作這位同仁本人：他能用 `@` 叫哪些 AI 員工，以及誰能透過 AI 員工使用公司授權代表或同仁本人的 Google 帳號（`[google] requesters`）。
+
+| 通道 | 可以綁定 | 能收登入／雙因素驗證碼 |
+|---|---|---|
+| Telegram、LINE、Discord、Slack | 可以 | 可以 |
+| Google Chat（v1.82） | 可以 | **不行** |
+
+- **Google Chat**：填 `users/` 後接一串數字，或只填那串數字；系統一律存成 `users/<數字>`。其他格式（Email、`users/app`）會被拒絕。通常可請 Google Workspace 管理員在管理控制台打開這位同仁的帳號，網址最後那串數字就是。
+- **預設只認手動綁定**：只有管理員在這裡綁定的 Chat 使用者代號，傳訊者才會被認出是同仁。
+- **可選：從同仁自己的 Google 帳號自動認出（預設關閉、尚未驗證）**：管理員可在「管理 → 整合 → Google」開啟 **用連結的 Google 帳號認出 Google Chat 傳訊者**（`config.toml [google] chat_identity_from_account = true`；預設 `false`；設定不存在當作關閉，`config.toml` 讀不到或值不是布林值則視為錯誤，修正前不會認出任何 Google Chat 傳訊者）。開啟後，同仁在 **我的連線** 連結自己的 Google 帳號，不必手動綁定 Google Chat 也會認出是他：系統會把 Chat 傳訊者的代號與同仁連結的 Google 帳號代號比對，相同就視為本人。**這項比對尚未以真實 Google Workspace 驗證**：如果 Google Chat 的使用者代號和登入帳號代號其實是兩套不同的編號，碰巧相同時可能把別人認成這位同仁，所以預設關閉。除非您已在自己的 Workspace 確認兩種代號一致，否則請保持關閉。開啟期間，自動認出的身分會在他那一列帶連結符號顯示，不能在這裡移除：同仁中斷 Google 連結、帳號被停用／離職／刪除，或關閉這個設定時就會失效。變更這個設定會以 `config_changed` 寫入安全稽核紀錄。
+- **一個 Chat 使用者只對應一位同仁**：要綁定的 Chat 代號已綁給別人時會被拒絕並說明原因；自動認出開啟時，已由另一位同仁自己的 Google 帳號認出的代號也會被拒絕。手動綁定與某人自己的 Google 帳號若指向不同的人，兩個都不採用，傳訊者當作不認識的人。自動認出開啟而讀不到 Google 帳號連結紀錄時，Google Chat 的傳訊者一律當作不認識的人。
+- **不能綁定給非啟用中的帳號**：帳號已停用、已離職或已刪除時，任何通道身分都不能綁定（HTTP 409；帳號不存在時 404）。
+- **Google Chat 身分只用來認人**：DuDuClaw 主動發出的通知、簽核卡片、摘要等訊息，不會寄到 Google Chat 使用者代號，仍然送到同仁的 Telegram／LINE／Discord／Slack 等私訊。只綁了 Google Chat 的同仁，在 Google Chat 傳訊時會被認出，但不會從那裡收到主動通知。其他 Chat 應用程式（傳訊者不是真人）傳來的訊息一律忽略。
+- **移除**：游標移到 Google Chat 身分上按 ×。這一頁只能移除管理員建立的 Google Chat 綁定；其他通道維持原本的做法。
+- Google Chat 身分的綁定與移除會寫入安全稽核紀錄（`googlechat_identity_bound`、`googlechat_identity_unbound`），也會記在帳號稽核紀錄。
+
+API（管理員 JWT）：`POST /api/channel-identity/bind {user_id, channel, channel_user_id}`、`POST /api/channel-identity/unbind {user_id, channel: "googlechat", channel_user_id}`、`GET /api/channel-identity/list?user_id=`（由 Google 帳號自動認出的項目帶 `"source": "google_account"`，只在自動認出開啟時列出）。設定由 `google.credentials.get`（`chat_identity_from_account`）讀取，僅管理員可透過 `google.integration.set {chat_identity_from_account: bool}` 寫入。沒有任何自助途徑能建立 Google Chat 綁定。
+
 ## 成員的主要 AI
 
 管理員可在「使用者 → 編輯 → 主要 AI」選擇該成員已綁定、具有負責人或操作權限的 AI，或選「無」，再按「設定主要 AI」。此按鈕只儲存主要 AI；其他帳號欄位請另外按「儲存」。成員仍可從側欄設定自己的主要 AI。這項設定不會增加使用權限，變更會留下帳號稽核紀錄。

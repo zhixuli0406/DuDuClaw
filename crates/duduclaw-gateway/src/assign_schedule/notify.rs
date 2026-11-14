@@ -53,7 +53,7 @@ pub(super) async fn creator_paused(home: &Path, row: &AssignScheduleRow, reason:
             return;
         }
     };
-    let channels = match db.verified_channels_for_user(&row.creator_user_id) {
+    let channels = match db.verified_dm_destinations_for_user(&row.creator_user_id) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "scheduled assignment: channel lookup failed for the pause notice");

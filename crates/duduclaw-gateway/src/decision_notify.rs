@@ -128,8 +128,7 @@ fn bound_decision_authority(
         .list_users()
         .map_err(|_| "identity list unavailable")?
         .is_empty();
-    let uid = db
-        .find_verified_user_id_by_channel(channel, principal)
+    let uid = crate::googlechat_identity::verified_user_id(home, &db, channel, principal)
         .map_err(|_| "verified identity lookup failed")?;
     let role = match uid {
         Some(uid) => db
@@ -142,9 +141,15 @@ fn bound_decision_authority(
     Ok((role, active))
 }
 
-/// Verified channel identities of every Active Admin/Manager — the humans the
-/// dashboard would let decide. Empty when `users.db` does not exist (a solo
-/// deployment that never onboarded dashboard users).
+/// Where a pending decision may be pushed for the humans the dashboard would
+/// let decide: the verified **DM destinations** of every Active
+/// Admin/Manager. Empty when `users.db` does not exist (a solo deployment
+/// that never onboarded dashboard users).
+///
+/// A notification destination list only — a Google Chat identity
+/// (`users/<id>`) is excluded (`duduclaw_auth::otp::is_dm_destination_channel`)
+/// because Chat messages go to a space, not a person id. Whether approvers
+/// are *recognisable* is [`has_recognisable_approver_identity`], never this.
 pub(crate) fn approver_links(home_dir: &Path) -> Vec<(String, String)> {
     let Ok(Some(db)) = open_user_db(home_dir) else {
         return Vec::new();
@@ -158,7 +163,7 @@ pub(crate) fn approver_links(home_dir: &Path) -> Vec<(String, String)> {
         {
             continue;
         }
-        if let Ok(idents) = db.verified_channels_for_user(&u.id) {
+        if let Ok(idents) = db.verified_dm_destinations_for_user(&u.id) {
             for i in idents {
                 out.push((i.channel, i.channel_user_id));
             }
@@ -179,19 +184,62 @@ pub(crate) fn mapped_role(
     channel_user_id: &str,
 ) -> Option<UserRole> {
     let db = open_user_db(home_dir).ok().flatten()?;
-    let uid = db
-        .find_verified_user_id_by_channel(channel, channel_user_id)
+    let uid = crate::googlechat_identity::verified_user_id(home_dir, &db, channel, channel_user_id)
         .ok()
         .flatten()?;
     let u = db.get_user(&uid).ok().flatten()?;
     (u.status == UserStatus::Active).then_some(u.role)
 }
 
-/// Whether this deployment has any channel-reachable approver identity at
-/// all. When false, the only authority available is the destination the
-/// operator configured — see [`authorize_press`].
-pub(crate) fn identity_system_active(home_dir: &Path) -> bool {
-    open_user_db(home_dir).is_err() || !approver_links(home_dir).is_empty()
+/// Whether this deployment can recognise an approver in a channel at all —
+/// the `identity_system_active` input of [`authorize_press`]. When false, the
+/// only authority available is the destination the operator configured.
+///
+/// True when ANY Active Admin/Manager has
+/// (a) a verified `channel_identities` row on any channel (Google Chat
+///     administrator bindings included — this is about recognition, not
+///     delivery), or
+/// (b) a usable Google-account-derived Chat identity, counted only while
+///     `[google] chat_identity_from_account` is on
+///     (`googlechat_identity::any_derived_identity`).
+///
+/// Fail closed (= true, role rules apply, no destination fallback) on an
+/// unreadable `users.db`, a user-list or channel-row read error, a
+/// linked-Google store read error, and an unreadable or malformed
+/// `[google] chat_identity_from_account` setting (only an absent setting is
+/// "off"; `googlechat_identity::derivation_enabled`). Duplicate Google owners and
+/// administrator-binding/Google disagreements do not reduce (b): an approver
+/// who would be recognised but for a conflict still counts. False only when
+/// `users.db` is absent, or every read succeeded and no Active Admin/Manager
+/// has either kind of identity. Deliberately NOT derived from
+/// [`approver_links`] (a notification-destination list).
+pub(crate) fn has_recognisable_approver_identity(home_dir: &Path) -> bool {
+    let db = match open_user_db(home_dir) {
+        Ok(Some(db)) => db,
+        Ok(None) => return false,
+        Err(_) => return true,
+    };
+    let Ok(users) = db.list_users() else {
+        return true;
+    };
+    let approvers: Vec<&str> = users
+        .iter()
+        .filter(|u| {
+            u.status == UserStatus::Active && matches!(u.role, UserRole::Admin | UserRole::Manager)
+        })
+        .map(|u| u.id.as_str())
+        .collect();
+    for id in &approvers {
+        match db.verified_channels_for_user(id) {
+            Ok(rows) if !rows.is_empty() => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    if approvers.is_empty() {
+        return false;
+    }
+    crate::googlechat_identity::any_derived_identity(home_dir, &approvers).unwrap_or(true)
 }
 
 // ── Authorization ───────────────────────────────────────────────

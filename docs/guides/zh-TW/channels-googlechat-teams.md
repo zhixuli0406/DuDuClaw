@@ -52,6 +52,15 @@ duduclaw channels googlechat import --project-number 123456789012 --key-file /pr
 
 資源建立或匯入成功不代表 Chat 設定與收發已成功。儀表板提供可複製的建立指令、Cloud Shell、設定值；既有欄位保留在「手動設定」。
 
+### 認出傳訊的是誰（v1.82）
+
+Google Chat 的傳訊者預設是不認識的人，所以 `[google] requesters = "bound_people"`／`owner_only` 會拒絕，`@` 也只能叫預設員工與公開員工。符合下列情況時，傳訊者就會被認出是某個 dashboard 帳號：
+
+- 管理員在 **使用者 → 驗證身分 → Google Chat** 綁定了他的 Chat 使用者代號（`users/<數字>`）——預設只有這種方式；或
+- 選用、**預設關閉**：管理員在「管理 → 整合 → Google」開啟 **用連結的 Google 帳號認出 Google Chat 傳訊者**（`[google] chat_identity_from_account = true`），且同仁在 **我的連線** 連結了自己的 Google 帳號。系統會把傳訊者的代號與這個 Google 帳號的代號比對，相同就視為本人。**尚未以真實 Google Workspace 驗證**——除非您已在自己的 Workspace 確認兩種代號一致，否則請保持關閉。
+
+不做 Email 比對。其他 Chat 應用程式（不是真人）傳來的訊息一律忽略；Google Chat 身分也不會收到 DuDuClaw 主動發出的通知。Google Chat 不能收登入驗證碼或雙因素驗證碼。詳細規則（含一個代號只能對應一位同仁）：[儀表板設定 → 使用者 → 驗證身分](dashboard-settings.md#使用者--驗證身分通訊軟體身分v182)。
+
 ### 金鑰政策
 
 建立金鑰若回報 `FAILED_PRECONDITION`，請組織政策管理員審核專案例外。2024-05-03 起建立的組織通常預設限制金鑰建立。腳本只印出以下指令並停止，不會自動修改政策：

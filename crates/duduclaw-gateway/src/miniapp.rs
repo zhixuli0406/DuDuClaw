@@ -654,7 +654,7 @@ async fn verified_context(
 /// leak with extra steps: the detail IS the thing worth protecting.
 fn authorize_read(home_dir: &Path, rec: &ApprovalRecord, user_id: &str) -> PressAuth {
     let role = crate::decision_notify::mapped_role(home_dir, "telegram", user_id);
-    let identity_active = crate::decision_notify::identity_system_active(home_dir);
+    let identity_active = crate::decision_notify::has_recognisable_approver_identity(home_dir);
     let targets = crate::approval_notify::delivered_targets(rec);
     let destination_match =
         crate::decision_notify::destination_matches_any(&targets, "telegram", user_id);

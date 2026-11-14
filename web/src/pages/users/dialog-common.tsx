@@ -9,12 +9,15 @@ import { Input } from '@/components/mds';
 
 
 /** Channels the backend's admin-prefill bind endpoint accepts (mirrors
- * `OTP_CHANNELS` in `server.rs::handle_channel_bind` — keep in sync). */
+ * `BINDABLE_CHANNELS` in `duduclaw-auth/src/otp.rs`, checked by
+ * `server.rs::handle_channel_bind` — keep in sync). Google Chat can be bound
+ * so its sender is recognised, but it is not a login-code channel. */
 export const IDENTITY_CHANNELS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'telegram', label: 'Telegram' },
   { value: 'line', label: 'LINE' },
   { value: 'discord', label: 'Discord' },
   { value: 'slack', label: 'Slack' },
+  { value: 'googlechat', label: 'Google Chat' },
 ];
 
 export function channelLabel(value: string): string {

@@ -151,6 +151,23 @@ mod tests {
         assert_eq!(token_field("feishu"), None);
     }
 
+    /// RM-152: the auth crate's OTP delivery list and this sender agree, and a
+    /// bindable-only channel (Google Chat) has no OTP sender.
+    #[test]
+    fn otp_delivery_list_matches_the_senders_here() {
+        for channel in duduclaw_auth::otp::OTP_DELIVERY_CHANNELS {
+            assert!(token_field(channel).is_some(), "{channel}");
+        }
+        for channel in duduclaw_auth::otp::BINDABLE_CHANNELS {
+            assert_eq!(
+                token_field(channel).is_some(),
+                duduclaw_auth::otp::is_otp_delivery_channel(channel),
+                "{channel}"
+            );
+        }
+        assert_eq!(token_field("googlechat"), None);
+    }
+
     #[tokio::test]
     async fn mock_records_delivery() {
         let mock = MockDeliverer::default();

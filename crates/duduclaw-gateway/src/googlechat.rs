@@ -521,6 +521,12 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
                 warn!("Google Chat: MESSAGE event without space name — refused");
                 return (StatusCode::BAD_REQUEST, "bad request").into_response();
             }
+            if !event.get("message").is_some_and(is_human_message) {
+                // ACK so Google does not redeliver; nothing is enqueued and
+                // the sender id is never mapped to an account.
+                info!("Google Chat: MESSAGE from a non-human sender ignored");
+                return (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response();
+            }
             let sender = event
                 .pointer("/message/sender/name")
                 .and_then(|v| v.as_str())
@@ -600,6 +606,15 @@ fn enqueue_once(key: Option<&str>, submit: impl FnOnce() -> bool) -> bool {
     true
 }
 
+/// Only a message Google reports as written by a person (`sender.type ==
+/// "HUMAN"`) may start a turn or be mapped to a dashboard account — the same
+/// rule the Pub/Sub worker applies to its authoritative re-read
+/// (`googlechat_pubsub::authoritative_event`). A `BOT` sender (another Chat
+/// app, possibly echoing a person's id) or a missing/unknown type is dropped.
+pub(crate) fn is_human_message(message: &serde_json::Value) -> bool {
+    message.pointer("/sender/type").and_then(|v| v.as_str()) == Some("HUMAN")
+}
+
 /// The space a MESSAGE event belongs to (the queue key; same lookup as
 /// [`handle_message`]).
 fn event_space(event: &serde_json::Value) -> String {
@@ -613,6 +628,10 @@ fn event_space(event: &serde_json::Value) -> String {
 
 async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value) {
     let message = event.get("message").cloned().unwrap_or_default();
+    // Defence in depth: every entry already requires a human sender.
+    if !is_human_message(&message) {
+        return;
+    }
     // argumentText has the app @mention stripped; fall back to raw text.
     let text = message
         .get("argumentText")

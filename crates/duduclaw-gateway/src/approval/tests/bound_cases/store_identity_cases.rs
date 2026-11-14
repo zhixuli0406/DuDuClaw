@@ -147,7 +147,7 @@ async fn corrupt_identity_store_never_downgrades_bound_channel_to_solo() {
         b.get(&id).await.unwrap().unwrap().status,
         ApprovalStatus::Pending
     );
-    assert!(crate::decision_notify::identity_system_active(home.path()));
+    assert!(crate::decision_notify::has_recognisable_approver_identity(home.path()));
     std::fs::remove_file(home.path().join("users.db")).unwrap();
     assert!(
         crate::decision_notify::route_bound_text(home.path(), &context(), &format!("確認 {id}"))

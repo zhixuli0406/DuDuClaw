@@ -4,7 +4,7 @@ import { useEffect, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import type { UserDetail } from '@/lib/api';
-import type { ChannelIdentity } from '@/lib/channel-identity-api';
+import { UNBINDABLE_CHANNELS, type ChannelIdentity } from '@/lib/channel-identity-api';
 import { ROLE_LEVELS } from '@/lib/roles';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore, type UserRole } from '@/stores/auth-store';
@@ -148,8 +148,18 @@ export function BindingChips({
   );
 }
 
-/** Verified channel identities plus the 驗證身分 button. */
-export function IdentityChips({ state, onAdd }: { state: IdentityState; onAdd: () => void }) {
+/** Verified channel identities plus the 驗證身分 button. An identity that
+ *  comes from the person's own linked Google account is read-only; an
+ *  administrator's Google Chat binding can be removed (`onRemove`). */
+export function IdentityChips({
+  state,
+  onAdd,
+  onRemove,
+}: {
+  state: IdentityState;
+  onAdd: () => void;
+  onRemove?: (ident: ChannelIdentity) => void;
+}) {
   const intl = useIntl();
   return (
     <>
@@ -160,21 +170,37 @@ export function IdentityChips({ state, onAdd }: { state: IdentityState; onAdd: (
           {intl.formatMessage({ id: 'users.channelIdentity.loadError' })}
         </span>
       ) : (
-        state.map((ident) => (
-          <span
-            key={`${ident.channel}:${ident.channel_user_id}`}
-            className="inline-flex max-w-40 items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-            title={`${channelLabel(ident.channel)} · ${ident.channel_user_id}`}
-          >
-            <ShieldCheck
-              className="size-3 shrink-0 text-success"
-              aria-label={intl.formatMessage({ id: 'users.channelIdentity.verifiedTooltip' })}
-            />
-            <span className="truncate">
-              {channelLabel(ident.channel)} · {ident.channel_user_id}
+        state.map((ident) => {
+          const fromGoogle = ident.source === 'google_account';
+          const removable = !fromGoogle && onRemove !== undefined && UNBINDABLE_CHANNELS.includes(ident.channel);
+          const label = `${channelLabel(ident.channel)} · ${ident.channel_user_id}`;
+          return (
+            <span
+              key={`${ident.source ?? 'binding'}:${ident.channel}:${ident.channel_user_id}`}
+              className="group inline-flex max-w-48 items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+              title={fromGoogle ? `${label} — ${intl.formatMessage({ id: 'users.channelIdentity.fromGoogle' })}` : label}
+            >
+              <ShieldCheck
+                className="size-3 shrink-0 text-success"
+                aria-label={intl.formatMessage({ id: 'users.channelIdentity.verifiedTooltip' })}
+              />
+              <span className="truncate">{label}</span>
+              {fromGoogle && <Link2 className="size-3 shrink-0" aria-label={intl.formatMessage({ id: 'users.channelIdentity.fromGoogle' })} />}
+              {removable && (
+                <button
+                  type="button"
+                  data-stop-row-nav
+                  onClick={() => onRemove?.(ident)}
+                  className="shrink-0 rounded-full p-0.5 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 pointer-coarse:opacity-100"
+                  title={intl.formatMessage({ id: 'users.channelIdentity.remove' })}
+                  aria-label={`${intl.formatMessage({ id: 'users.channelIdentity.remove' })} ${label}`}
+                >
+                  <X className="size-3" />
+                </button>
+              )}
             </span>
-          </span>
-        ))
+          );
+        })
       )}
       <button
         type="button"

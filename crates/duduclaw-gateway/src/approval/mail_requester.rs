@@ -60,7 +60,7 @@ pub(crate) fn requester_user(home: &Path, context: &DecisionContext, agent: &str
     let uid = if context.channel == "webchat" {
         context.principal_id.clone()
     } else {
-        db.find_verified_user_id_by_channel(&context.channel, &context.principal_id).ok()??
+        crate::googlechat_identity::verified_user_id(home, &db, &context.channel, &context.principal_id).ok()??
     };
     let user = db.get_user(&uid).ok()??;
     if user.status != UserStatus::Active

@@ -77,11 +77,19 @@ impl UserDb {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         if challenge_user(&tx, token, "enroll", now)? != user { return Err(DENIED.into()); }
-        let channel: Option<(String,String)> = tx.query_row(
-            "SELECT channel,channel_user_id FROM channel_identities WHERE user_id=?1 AND verified=1
-             AND verified_at < (SELECT enforced_at FROM mfa_policy_state WHERE id=1 AND enforced=1)
-             ORDER BY channel,channel_user_id LIMIT 1", [&user], |r|Ok((r.get(0)?,r.get(1)?)))
-            .optional().map_err(|e|e.to_string())?;
+        // Only a channel a code can be delivered through counts: a bindable-only
+        // identity (Google Chat, RM-152) sorts ahead of LINE/Slack/Telegram and
+        // must never become the enrollment proof target.
+        let channel: Option<(String,String)> = {
+            let mut q = tx.prepare(
+                "SELECT channel,channel_user_id FROM channel_identities WHERE user_id=?1 AND verified=1
+                 AND verified_at < (SELECT enforced_at FROM mfa_policy_state WHERE id=1 AND enforced=1)
+                 ORDER BY channel,channel_user_id").map_err(|e|e.to_string())?;
+            let rows: Vec<(String,String)> = q.query_map([&user], |r|Ok((r.get(0)?,r.get(1)?)))
+                .map_err(|e|e.to_string())?
+                .collect::<std::result::Result<_,_>>().map_err(|e|e.to_string())?;
+            rows.into_iter().find(|(c, _)| crate::otp::is_otp_delivery_channel(c))
+        };
         let old: Option<String> = tx.query_row("SELECT kind FROM mfa_enrollment_proofs WHERE token_hash=?1", [token_hash(token)], |r|r.get(0)).optional().map_err(|e|e.to_string())?;
         if old.as_deref()==Some("password") && any_factor(&tx,&user)? && proof_verified(&tx,token)? {
             tx.commit().map_err(|e|e.to_string())?;

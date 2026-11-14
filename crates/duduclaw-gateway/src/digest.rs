@@ -692,7 +692,7 @@ async fn deliver(home: &Path, digest: &Digest) {
     for u in users.iter().filter(|u| {
         u.role == duduclaw_auth::UserRole::Admin && u.status == duduclaw_auth::UserStatus::Active
     }) {
-        let Ok(channels) = db.verified_channels_for_user(&u.id) else {
+        let Ok(channels) = db.verified_dm_destinations_for_user(&u.id) else {
             continue;
         };
         for ident in channels {
@@ -1012,7 +1012,7 @@ pub async fn apply_channel_feedback(
             ));
         }
     };
-    let uid = match db.find_verified_user_id_by_channel(channel, channel_user_id) {
+    let uid = match crate::googlechat_identity::verified_user_id(home, &db, channel, channel_user_id) {
         Ok(Some(uid)) if uid != "system" => uid,
         _ => {
             return Err(crate::decision_notify::refusal_text(

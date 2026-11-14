@@ -194,7 +194,7 @@ pub(crate) async fn push_person_notice(home: &Path, user_id: &str, text: &str) {
     let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return; };
     let Ok(Some(user)) = db.get_user(user_id) else { return; };
     if user.status != duduclaw_auth::UserStatus::Active { return; }
-    let Ok(links) = db.verified_channels_for_user(user_id) else { return; };
+    let Ok(links) = db.verified_dm_destinations_for_user(user_id) else { return; };
     let Ok(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() else { return; };
     let level = crate::notify_governance::NotifyLevel::Confirm;
     let policy = crate::notify_governance::QuietPolicy {
@@ -316,7 +316,7 @@ pub(crate) fn admin_targets(home: &Path) -> Result<Vec<(String, String)>, String
         if user.status != duduclaw_auth::UserStatus::Active || user.role != duduclaw_auth::UserRole::Admin {
             continue;
         }
-        for link in db.verified_channels_for_user(&user.id)? {
+        for link in db.verified_dm_destinations_for_user(&user.id)? {
             let target = (link.channel, link.channel_user_id);
             if !targets.contains(&target) {
                 targets.push(target);

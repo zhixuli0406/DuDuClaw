@@ -275,7 +275,7 @@ fn owner_targets(home: &Path, agent: &str) -> Result<Vec<(String, String)>, Stri
         if user.status != duduclaw_auth::UserStatus::Active { continue; }
         if user.role != duduclaw_auth::UserRole::Admin && !owners.iter().any(|b|
             b.user_id == user.id && b.access_level == duduclaw_auth::AccessLevel::Owner) { continue; }
-        for link in db.verified_channels_for_user(&user.id)? {
+        for link in db.verified_dm_destinations_for_user(&user.id)? {
             let target = (link.channel, link.channel_user_id);
             if !targets.contains(&target) { targets.push(target); }
         }
