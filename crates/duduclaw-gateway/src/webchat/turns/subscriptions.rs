@@ -19,7 +19,8 @@ pub(in crate::webchat) struct Route {
     targets: Weak<Targets>,
     sid: String,
     pub(in crate::webchat) user: String,
-    pub(in crate::webchat) agent: String,
+    /// `None`: no target employee (the no-responder notice).
+    pub(in crate::webchat) agent: Option<String>,
     epoch: u64,
     pub(in crate::webchat) origin_credential: Option<duduclaw_auth::jwt::Claims>,
     pub(in crate::webchat) source: crate::channel_reply::ReplyDeliveryFence,
@@ -32,7 +33,7 @@ impl Route {
             self.source.refuse();
         }
         if !self.source.valid().await { return false; }
-        if state.authorize_target(&self.user, &self.agent, true).await.is_err() {
+        if state.authorize_turn(&self.user, self.agent.as_deref(), true).await.is_err() {
             self.source.refuse();
             return false;
         }
@@ -91,14 +92,14 @@ impl Subscriptions {
         subscription
     }
 
-    pub(super) fn sinks(&self, user: &str, sid: &str, msg_id: &str, agent: &str, credential: Option<&duduclaw_auth::jwt::Claims>,
+    pub(super) fn sinks(&self, user: &str, sid: &str, msg_id: &str, agent: Option<&str>, credential: Option<&duduclaw_auth::jwt::Claims>,
         source: crate::channel_reply::ReplyDeliveryFence) -> Vec<TurnSink> {
         self.0.lock().unwrap().iter().filter_map(Weak::upgrade)
             .filter(|subscription| subscription.user == user)
             .filter_map(|subscription| {
                 let (conv, epoch) = subscription.targets.lock().unwrap().get(sid).cloned()?;
                 Some(TurnSink::new(subscription.tx.clone(), sid, conv, msg_id)
-                    .routed(Route { targets: Arc::downgrade(&subscription.targets), sid: sid.into(), user: user.into(), agent: agent.into(), epoch,
+                    .routed(Route { targets: Arc::downgrade(&subscription.targets), sid: sid.into(), user: user.into(), agent: agent.map(str::to_owned), epoch,
                         origin_credential: credential.cloned(), source: source.clone() })
                     .acknowledged())
             }).collect()
@@ -118,7 +119,7 @@ mod tests {
             let (tx, mut rx) = outbound_channel();
             let subscription = registry.register("alice", tx);
             subscription.subscribe("owned", conv.clone());
-            let mut turn = registry.sinks("alice", "owned", "first", "finance", None,
+            let mut turn = registry.sinks("alice", "owned", "first", Some("finance"), None,
                 crate::channel_reply::ReplyDeliveryFence::test_live()).pop().unwrap();
             let sending = tokio::spawn(async move {
                 turn.send(Message::Text(r#"{"type":"assistant_done","content":"reply"}"#.into())).await
@@ -153,10 +154,10 @@ mod tests {
             let (tx, mut rx) = outbound_channel();
             let subscription = registry.register("alice", tx);
             subscription.subscribe("owned", Some("old-tab".into()));
-            let mut sinks = registry.sinks("alice", "owned", "m", "finance", None,
+            let mut sinks = registry.sinks("alice", "owned", "m", Some("finance"), None,
                 crate::channel_reply::ReplyDeliveryFence::test_live());
             assert_eq!(sinks.len(), 1);
-            assert!(registry.sinks("bob", "owned", "m", "finance", None,
+            assert!(registry.sinks("bob", "owned", "m", Some("finance"), None,
                 crate::channel_reply::ReplyDeliveryFence::test_live()).is_empty());
             let mut turn = sinks.pop().unwrap();
             let sending = tokio::spawn(async move {
@@ -188,7 +189,7 @@ mod tests {
         assert_eq!(subscription.targets.lock().unwrap().len(), 64);
         assert!(!subscription.targets.lock().unwrap().contains_key("s0"));
         drop(subscription);
-        assert!(registry.sinks("alice", "s999", "m", "finance", None,
+        assert!(registry.sinks("alice", "s999", "m", Some("finance"), None,
             crate::channel_reply::ReplyDeliveryFence::test_live()).is_empty());
     }
 }

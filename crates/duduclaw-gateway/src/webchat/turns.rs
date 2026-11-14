@@ -17,6 +17,8 @@ pub(super) mod downstream;
 pub(super) use identity::IdentityUnavailable;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod no_responder_tests;
 pub(super) use run::TurnInput;
 
 tokio::task_local! {
@@ -564,7 +566,7 @@ impl Outbound {
                 return None;
             }
             if !recovery.observe(validity, false) || !route.authorized(state).await { return None; }
-            let policy = state.target_policy(&route.user, &route.agent, true).await.ok()?;
+            let policy = state.turn_policy(&route.user, route.agent.as_deref(), true).await.ok()?;
             Some((generation?, policy))
         };
         let generation = tokio::time::timeout_at(deadline, check).await.ok().flatten();
@@ -790,11 +792,14 @@ async fn execute_inner(mut input: TurnInput, sink: TurnSink, ticket: &mut Ticket
     ).await {
         return;
     }
+    // No employee is named and none resolves: only the no-responder notice
+    // can answer, so the turn is authorised without a target.
+    let target = (!state.no_responder_turn(&agent, &sid, &input.user_id).await).then_some(agent.as_str());
     let allowed = recheck_turn_access(
         &ticket.cancel,
         input.resume_acl,
         async {
-            if state.authorize_target(&input.auth_user, &agent, true).await.is_err() {
+            if state.authorize_turn(&input.auth_user, target, true).await.is_err() {
                 return false;
             }
             match &input.requested_agent {

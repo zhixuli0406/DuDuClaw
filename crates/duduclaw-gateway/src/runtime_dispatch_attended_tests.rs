@@ -113,6 +113,8 @@ fn request<'a>(home: &'a Path, request_type: RequestType, prompt: &'a str) -> Ag
         model: MODEL, max_tokens: 8, provider_override: Some(RuntimeType::Codex),
         conversation_history: &[], request_type, runtime_settings: None, effort: None,
         allow_cross_family_failover: false,
+        // Agent-less fixture: only utility work may run without a directory.
+        purpose: super::SpawnPurpose::Utility,
     }
 }
 

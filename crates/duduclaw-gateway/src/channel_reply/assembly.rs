@@ -38,6 +38,12 @@ impl<'a> Assembly<'a> {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<ReplyAttempt, ReplyFailure>>,
     {
+        // Every model call of a channel reply goes through here (Claude CLI,
+        // multi-runtime, MoA, local inference, paid Direct API). It is always
+        // an employee turn: without that employee's directory nothing runs.
+        if self.agent_dir.is_none() {
+            return Err(ReplyFailure::simple(ReplyOrigin::Unknown, super::no_employee_spawn_refusal()));
+        }
         loop {
             let result = call().await.map(|mut reply| {
                 reply.text = duduclaw_core::think_tags::strip_reasoning_prefix(&reply.text);
@@ -91,7 +97,7 @@ mod tests {
         for (session, expected) in [("webchat:owner", 2), ("odoolivechat:site:1", 2),
             ("widget-visitor:abc", 2), ("line:owner", 1), ("xwebchat:owner", 1)] {
             let home = tempfile::tempdir().unwrap();
-            let assembly = Assembly::new(session, home.path(), None, "");
+            let assembly = Assembly::new(session, home.path(), Some(home.path()), "");
             let count = AtomicUsize::new(0);
             let reply = assembly.text(ReplyOrigin::Local, || async {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -112,7 +118,7 @@ mod tests {
     async fn retry_can_return_visible_cjk_answer_and_stops_on_refusal() {
         let home = tempfile::tempdir().unwrap();
         for refuse in [false, true] {
-            let assembly = Assembly::new("webchat:owner", home.path(), None, "");
+            let assembly = Assembly::new("webchat:owner", home.path(), Some(home.path()), "");
             let count = AtomicUsize::new(0);
             let result = assembly.text(ReplyOrigin::Local, || async {
                 if count.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -133,7 +139,7 @@ mod tests {
     async fn gate_refusal_and_cancellation_errors_are_terminal() {
         let home = tempfile::tempdir().unwrap();
         for error in [format!("{}Empty response", duduclaw_agent::mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX), "cancelled".into(), format!("{}unavailable", crate::budget::BUDGET_REFUSAL_PREFIX)] {
-            let assembly = Assembly::new("webchat:owner", home.path(), None, "");
+            let assembly = Assembly::new("webchat:owner", home.path(), Some(home.path()), "");
             let count = AtomicUsize::new(0);
             assert!(assembly.text(ReplyOrigin::Local, || async {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -147,7 +153,7 @@ mod tests {
     async fn dropping_cancelled_work_does_not_start_retry() {
         use std::future::Future;
         let home = tempfile::tempdir().unwrap();
-        let assembly = Assembly::new("webchat:owner", home.path(), None, "");
+        let assembly = Assembly::new("webchat:owner", home.path(), Some(home.path()), "");
         let count = AtomicUsize::new(0);
         let mut work = Box::pin(assembly.text(ReplyOrigin::Local, || async {
             count.fetch_add(1, Ordering::SeqCst);

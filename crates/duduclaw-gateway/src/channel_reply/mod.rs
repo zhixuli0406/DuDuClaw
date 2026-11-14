@@ -296,6 +296,7 @@ pub(crate) use access_gate::*;
 pub(crate) use breaker_wait::as_sender;
 pub use ccr_delivery::*;
 use cli_env::*;
+pub(crate) use cli_env::{in_channel_reply_turn, no_employee_spawn_refusal};
 pub use cli_spawn::*;
 pub use context::*;
 pub use delivery::*;

@@ -62,6 +62,9 @@ impl AgentRuntime for ClaudeRuntime {
             // how effort reaches Claude through `run_agent_prompt`; `None` here
             // still falls back to the agent dir inside the callee.
             context.effort,
+            // Utility calls took the lightweight lane above; everything else
+            // is an employee's work and needs its directory (fail closed).
+            crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
         )
         .await?;
 

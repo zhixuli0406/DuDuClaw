@@ -218,6 +218,7 @@ async fn dispatch_absent_and_invalid_fallback_configs_reach_real_manager_without
             runtime_settings: None,
             effort: None,
             allow_cross_family_failover: true,
+            purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
         };
         let error = crate::runtime_dispatch::run_agent_prompt_detailed(request)
             .await
@@ -250,6 +251,7 @@ async fn dispatch_known_mismatch_is_call_zero_and_never_changes_the_profile() {
         runtime_settings: None,
         effort: None,
         allow_cross_family_failover: true,
+        purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
     };
     let error = crate::runtime_dispatch::run_agent_prompt_detailed(request)
         .await

@@ -1,5 +1,40 @@
 use super::*;
 
+/// Whether the current task is a channel reply turn: the guarded reply
+/// builder scopes `CHANNEL_REPLY_USER_ID` over the whole turn and the inner
+/// pipeline scopes `CHANNEL_REPLY_AGENT_ID` over its model call. Task-locals
+/// do not cross `tokio::spawn`, so this is only an additional refusal at the
+/// spawn choke points; the decisive signal is the caller's `SpawnPurpose`.
+pub(crate) fn in_channel_reply_turn() -> bool {
+    crate::claude_runner::CHANNEL_REPLY_AGENT_ID.try_with(|_| ()).is_ok()
+        || crate::claude_runner::CHANNEL_REPLY_USER_ID.try_with(|_| ()).is_ok()
+}
+
+/// Refusal for a channel reply model call without an employee directory
+/// (no instructions, no MCP config, no file-guard hook, gateway cwd). It
+/// carries the spawn-gate prefix, so account rotation, runtime failover and
+/// the reply fallbacks stop instead of trying the same call elsewhere.
+pub(crate) fn no_employee_spawn_refusal() -> String {
+    duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        "尚未設定負責回覆的 AI 員工，本次沒有執行模型。請管理員完成設定。",
+    )
+}
+
+/// Is a Claude CLI spawn without an employee directory refused for this
+/// stated purpose? An employee turn always is; utility work only runs with
+/// an explicit tool allowlist (`None` capabilities mean the full surface).
+pub(crate) fn directory_less_spawn_refused(
+    purpose: crate::runtime_dispatch::SpawnPurpose,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> bool {
+    match purpose {
+        crate::runtime_dispatch::SpawnPurpose::EmployeeTurn => true,
+        crate::runtime_dispatch::SpawnPurpose::Utility => {
+            !capabilities.is_some_and(|caps| !caps.allowed_tools().is_empty())
+        }
+    }
+}
+
 /// Core primitive: spawn the `claude` CLI subprocess with a streaming JSON reader.
 ///
 /// `env_vars` allows the caller to inject per-account credentials
@@ -23,8 +58,23 @@ pub(super) async fn spawn_claude_cli_with_env(
     claude_session_id: Option<&str>,
     // P1/WP-3: per-call reasoning effort. `None` ⇒ no `--effort` flag.
     effort: Option<duduclaw_core::effort::Effort>,
+    // Why this CLI runs, stated by the caller (never inferred).
+    purpose: crate::runtime_dispatch::SpawnPurpose,
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // The CLI runs with full tools and `--dangerously-skip-permissions`, so
+    // without an employee directory it would have no instructions, MCP
+    // config, file-guard hook or cwd. An employee turn is refused outright;
+    // only agent-less utility work (custom widget / expert-pack generation,
+    // night passes) may run, and only with an explicit tool allowlist. The
+    // channel-turn task-local is a second, independent refusal.
+    if work_dir.is_none()
+        && (directory_less_spawn_refused(purpose, capabilities) || in_channel_reply_turn())
+    {
+        warn!(?purpose, "Claude CLI spawn without an employee directory — refused");
+        return Err(no_employee_spawn_refusal());
+    }
 
     let protected = duduclaw_core::execution_gate::isolation_required();
     if protected {
