@@ -321,6 +321,11 @@ pub(super) async fn build_reply_with_session_inner(
         .map(|a| a.config.agent.name.clone())
         .unwrap_or_default();
 
+    let internal_sender = sender_is_internal_for_reply(&ctx.home_dir, session_id, user_id, &agent_id);
+    let on_progress = on_progress.map(|callback| -> ProgressCallback {
+        Box::new(move |event| callback(event.for_sender(internal_sender)))
+    });
+
     // ── Goal intent router (P0, `goal_intent.rs`) ──────────────────────
     // Placed after the access gate and takeover interception above (never
     // bypasses either) and after `agent_id` resolution, so both the pending-
@@ -1611,10 +1616,10 @@ pub(super) async fn build_reply_with_session_inner(
     } else {
         format!("<task_recap>\n{pinned}\n</task_recap>\n\n{user_part}")
     };
-    // End-of-turn language reminder (only when a non-auto language is pinned):
+    // End-of-turn language reminder, including user-language matching for auto:
     // long English tool/wiki output must not drag the reply out of the
     // chosen language. Same user-side tail as the recap; one short line.
-    let effective_message = crate::prompt_identity::with_reply_language_reminder(
+    let effective_message = crate::prompt_identity::with_channel_reply_language_reminder(
         effective_message,
         default_language.as_deref(),
     );

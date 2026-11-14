@@ -11,7 +11,7 @@
 //! | WhatsApp    | `*x*`       | ``` fence          | none → fence      | none → `*x*` |
 //! | LINE        | none (plain)| none               | none → key-value  | none → 【x】 |
 //! | Feishu      | Card 2.0 markdown (near-CommonMark) | native | native | native |
-//! | Google Chat | `*x*`       | ``` fence          | none → fence      | none → `*x*` |
+//! | Google Chat | `*x*`       | ``` fence          | none → key-value  | none → `*x*` |
 //! | MS Teams    | markdown text (no tables) / Adaptive Card | fence | none → fence | none → `**x**` |
 //!
 //! This module parses markdown into a small block IR once, then renders it
@@ -44,6 +44,10 @@ pub enum MdBlock {
 /// Parse markdown text into block IR. Never fails — unrecognised input
 /// degrades to `Paragraph`.
 pub fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
+    parse_blocks(text, false)
+}
+
+fn parse_blocks(text: &str, googlechat: bool) -> Vec<MdBlock> {
     let lines: Vec<&str> = text.lines().collect();
     let mut blocks: Vec<MdBlock> = Vec::new();
     let mut para: Vec<&str> = Vec::new();
@@ -86,14 +90,26 @@ pub fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
         }
 
         // ── Table (header row + separator row) ──
-        if trimmed.starts_with('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
+        if (trimmed.starts_with('|') || googlechat) && i + 1 < lines.len()
+            && (if googlechat { googlechat_table_separator(lines[i + 1]) } else { is_table_separator(lines[i + 1]) })
+            && (!googlechat || googlechat_table_row(trimmed, split_table_row(lines[i + 1]).len()))
+        {
             flush_para(&mut para, &mut blocks);
             let headers = split_table_row(trimmed);
             i += 2; // skip header + separator
             let mut rows: Vec<Vec<String>> = Vec::new();
-            while i < lines.len() && lines[i].trim_start().starts_with('|') {
-                rows.push(split_table_row(lines[i].trim_start()));
-                i += 1;
+            while i < lines.len() {
+                if googlechat && lines[i].trim().is_empty() && i + 1 < lines.len()
+                    && googlechat_table_row(lines[i + 1], headers.len())
+                {
+                    i += 1; // Only one blank line may separate confirmed rows.
+                }
+                let is_row = if googlechat { googlechat_table_row(lines[i], headers.len()) }
+                    else { lines[i].trim_start().starts_with('|') };
+                if is_row {
+                    rows.push(split_table_row(lines[i].trim_start()));
+                    i += 1;
+                } else { break; }
             }
             blocks.push(MdBlock::Table { headers, rows });
             continue;
@@ -103,7 +119,9 @@ pub fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
         if trimmed.starts_with('#') {
             let level = trimmed.chars().take_while(|&c| c == '#').count();
             if (1..=6).contains(&level) {
-                if let Some(text) = trimmed[level..].strip_prefix(' ') {
+                if let Some(text) = trimmed.get(level..).and_then(|rest| {
+                    if googlechat { Some(rest) } else { rest.strip_prefix(' ') }
+                }) {
                     flush_para(&mut para, &mut blocks);
                     blocks.push(MdBlock::Heading {
                         level: level as u8,
@@ -159,6 +177,18 @@ pub fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
     }
     flush_para(&mut para, &mut blocks);
     blocks
+}
+
+fn googlechat_table_row(line: &str, columns: usize) -> bool {
+    columns >= 2 && line.chars().any(|c| c == '|') && split_table_row(line).len() == columns
+}
+
+fn googlechat_table_separator(line: &str) -> bool {
+    let cells = split_table_row(line);
+    cells.len() >= 2 && cells.iter().all(|cell| {
+        let dashes = cell.trim().trim_start_matches(':').trim_end_matches(':');
+        dashes.len() >= 3 && dashes.chars().all(|c| c == '-')
+    })
 }
 
 /// Is this line a GFM table separator (`| --- | :---: |`)?
@@ -670,16 +700,19 @@ pub fn to_whatsapp_text(text: &str) -> String {
 
 /// Render markdown to Google Chat text markup.
 pub fn to_googlechat_text(text: &str) -> String {
-    let blocks = parse_markdown_blocks(text);
+    googlechat_text(text, 0)
+}
+
+fn googlechat_text(text: &str, quote_depth: u8) -> String {
+    let blocks = parse_blocks(text, true);
     let mut parts: Vec<String> = Vec::new();
     for block in blocks {
         match block {
             MdBlock::Paragraph(p) => {
-                let lines: Vec<String> = p
-                    .lines()
-                    .map(|l| convert_inline(l, InlineTarget::GoogleChat))
-                    .collect();
-                parts.push(lines.join("\n"));
+                let p = p.lines().map(prettify_bullets).collect::<Vec<_>>().join("\n");
+                // not verified on a real Google Chat client
+                // Preserve boundaries; do not insert spaces around markup.
+                parts.push(convert_inline(&p, InlineTarget::GoogleChat));
             }
             MdBlock::Heading { text, .. } => {
                 parts.push(format!(
@@ -689,17 +722,33 @@ pub fn to_googlechat_text(text: &str) -> String {
             }
             MdBlock::CodeFence { code, .. } => parts.push(format!("```\n{code}\n```")),
             MdBlock::Table { headers, rows } => {
-                parts.push(format!(
-                    "```\n{}\n```",
-                    render_table_monospace(&headers, &rows)
-                ));
+                // Adapt LINE's key-value layout, with Chat markup and no width cap.
+                let records: Vec<String> = rows.iter().enumerate().map(|(index, row)| {
+                    let title = row.first().filter(|v| !v.is_empty()).cloned()
+                        .unwrap_or_else(|| format!("#{}", index + 1));
+                    // The title already has bold delimiters; avoid nesting them.
+                    let title = convert_inline(&title, InlineTarget::Plain);
+                    let mut lines = vec![format!("*{title}*")];
+                    for (column, value) in row.iter().enumerate().skip(1) {
+                        let key = headers.get(column).map(String::as_str).unwrap_or("");
+                        lines.push(format!("{}: {}", convert_inline(key, InlineTarget::GoogleChat),
+                            convert_inline(value, InlineTarget::GoogleChat)));
+                    }
+                    lines.join("\n")
+                }).collect();
+                parts.push(if rows.is_empty() {
+                    convert_inline(&headers.join(" / "), InlineTarget::GoogleChat)
+                } else { records.join("\n\n") });
             }
             MdBlock::Quote(q) => {
-                let quoted: Vec<String> = q
-                    .lines()
-                    .map(|l| format!("> {}", convert_inline(l, InlineTarget::GoogleChat)))
-                    .collect();
-                parts.push(quoted.join("\n"));
+                // Parse the quote contents again so quoted tables keep their schema.
+                let rendered = if quote_depth < 16 {
+                    googlechat_text(&q, quote_depth + 1)
+                } else {
+                    convert_inline(&q, InlineTarget::GoogleChat)
+                };
+                parts.push(rendered.lines()
+                    .map(|line| format!("> {line}")).collect::<Vec<_>>().join("\n"));
             }
             MdBlock::Divider => parts.push("────────".to_string()),
         }
@@ -1023,5 +1072,43 @@ mod tests {
         let q = "> a\n> b\n> c\n> d\n> e";
         let html = to_telegram_html(q);
         assert!(html.contains("<blockquote expandable>"));
+    }
+}
+
+#[cfg(test)]
+mod googlechat_display_tests {
+    use super::*;
+
+    #[test]
+    fn table_variants_preserve_cells() {
+        for input in [
+            "名稱 | 說明\n---|---\n甲 | **重要**\n\n乙 | 第二列",
+            "|名稱|說明|\n|---|---|\n|甲|**重要**|\n\n|乙|第二列|",
+            "> 名稱 | 說明\n> ---|---\n> 甲 | **重要**\n>\n> 乙 | 第二列",
+        ] {
+            let output = to_googlechat_text(input);
+            assert!(output.contains("*甲*"));
+            assert!(output.contains("說明: *重要*"));
+            assert!(output.contains("*乙*"));
+            assert!(!output.contains('|'));
+        }
+        let long = "完整內容🙂".repeat(40);
+        assert!(to_googlechat_text(&format!("a|b\n---|---\nx|{long}")).contains(&long));
+    }
+
+    #[test]
+    fn prose_pipes_are_not_tables() {
+        for input in ["甲 | 乙\n一般文字", "甲|乙\n--|---\n丙|丁", "甲|乙\n---|文字", "甲|乙\n---|---|---"] {
+            assert_eq!(to_googlechat_text(input), input);
+        }
+        assert!(to_googlechat_text("a|b\n---|---\nx|y\n\n\nz|w").ends_with("z|w"));
+        assert_eq!(to_line_plain("a|b\n---|---\nx|y"), "a|b\n---|---\nx|y");
+    }
+
+    #[test]
+    fn bullets_multiline_bold_and_compact_cjk_heading() {
+        assert_eq!(to_googlechat_text("###標題\n\n- 項目\n* 項目\n中文**跨\n行**結尾"),
+            "*標題*\n\n• 項目\n• 項目\n中文*跨\n行*結尾");
+        assert_eq!(to_googlechat_text("```\n###原樣 **字**\n```"), "```\n###原樣 **字**\n```");
     }
 }
