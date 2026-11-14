@@ -262,6 +262,10 @@ Residual risks:
 
 See [docs/features/05-security-defense.md](docs/features/05-security-defense.md#forget-by-source-needs-an-admin-approval).
 
+### First-Administrator setup code: known limitation (v1.82.0)
+
+An AI employee with Bash can get past the checks of `duduclaw ops users mfa-setup-code` (they are a speed bump, not containment); see "Known limitation" under [Two-factor login](docs/features/05-security-defense.md#two-factor-login).
+
 ## Binary Distribution Security
 
 DuDuClaw binaries are:

@@ -113,6 +113,7 @@ pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
     }
     email::migrate(conn)?;
     passkey::migrate(conn)?;
+    reset_outbox::migrate(conn)?;
     read_enforcement(conn)?;
     tx.commit().map_err(|e| e.to_string())
 }
@@ -740,7 +741,12 @@ impl UserDb {
         tx.commit().map_err(|e| e.to_string())
     }
     /// Fresh role and target checks share the reset transaction.
-    pub fn mfa_admin_reset(&self, actor: &str, user: &str, code: &str, cipher: &dyn MfaCipher, now: i64) -> Result<()> {
+    ///
+    /// Test fixture only (eligibility-log writer tests): it has no
+    /// Administrator-target rules. Production resets go through
+    /// [`UserDb::mfa_admin_reset_checked`] (RM-136).
+    #[cfg(test)]
+    pub(crate) fn mfa_admin_reset(&self, actor: &str, user: &str, code: &str, cipher: &dyn MfaCipher, now: i64) -> Result<()> {
         if actor == user { return Err("不能重設自己的雙因素驗證。".into()); }
         let mut conn = self.conn();
         let tx = conn
@@ -881,6 +887,12 @@ pub mod email;
 pub mod passkey;
 pub mod owner_factor;
 pub use owner_factor::{OwnerFactor, OwnerFactorError};
+pub mod admin_reset;
+pub use admin_reset::{AdminResetEmail, AdminResetOutcome, AdminResetProof, AdminResetRefusal};
+pub mod bootstrap;
+pub use bootstrap::{BOOTSTRAP_CLOSED, BOOTSTRAP_TOKEN_TTL};
+pub mod reset_outbox;
+pub use reset_outbox::{new_attempt_id, ResetAuditRow, ResetAuditSink, RESET_OUTBOX_MAX_ROWS};
 use enrollment::proof_verified;
 
 #[cfg(test)]

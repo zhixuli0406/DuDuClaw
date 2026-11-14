@@ -372,7 +372,7 @@ fn owner_account(tx: &Connection, user: &str, epoch: u64) -> Proof<crate::User> 
 
 /// `(failures, window start)` of the login lockout, the higher of the two
 /// counters `check_factor` keeps.
-fn lockout(tx: &Connection, user: &str) -> Proof<(i64, i64)> {
+pub(super) fn lockout(tx: &Connection, user: &str) -> Proof<(i64, i64)> {
     let read = |sql: &str| tx.query_row(sql, [user], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).optional()
         .map_err(unavailable).map(|row| row.unwrap_or((0, 0)));
     let factor = read("SELECT attempts,window FROM mfa_factor_failures WHERE user_id=?1")?;
@@ -380,12 +380,12 @@ fn lockout(tx: &Connection, user: &str) -> Proof<(i64, i64)> {
     Ok(if totp.0 > factor.0 { totp } else { factor })
 }
 
-fn locked((failures, window): (i64, i64), now: i64) -> bool {
+pub(super) fn locked((failures, window): (i64, i64), now: i64) -> bool {
     window > now - LOCKOUT_WINDOW_SECS && failures >= LOCKOUT_ATTEMPTS
 }
 
 /// Count one passkey / email attempt exactly as `check_factor` counts a TOTP.
-fn count_attempt(tx: &Connection, user: &str, verified: bool, (failures, window): (i64, i64), now: i64) -> Proof<()> {
+pub(super) fn count_attempt(tx: &Connection, user: &str, verified: bool, (failures, window): (i64, i64), now: i64) -> Proof<()> {
     let fresh = window <= now - LOCKOUT_WINDOW_SECS;
     let attempts = if verified { 0 } else if fresh { 1 } else { failures + 1 };
     let window = if fresh { now } else { window };

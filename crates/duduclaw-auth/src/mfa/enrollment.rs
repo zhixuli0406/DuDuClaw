@@ -159,7 +159,14 @@ impl UserDb {
 pub(super) fn require_independent_proof(conn: &Connection, token: &str, now: i64) -> Result<()> {
     let user=challenge_user(conn,token,"enroll",now)?;
     if any_factor(conn,&user)? && proof_verified(conn,token)? { return Ok(()); }
-    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mfa_enrollment_proofs WHERE token_hash=?1 AND verified=1 AND kind IN ('channel','admin'))",
-        [token_hash(token)],|r|r.get(0)).map_err(|e|e.to_string())?;
+    let kind:Option<String>=conn.query_row("SELECT kind FROM mfa_enrollment_proofs WHERE token_hash=?1 AND verified=1",
+        [token_hash(token)],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    // RM-135: a bootstrap proof stays valid only while its window is open,
+    // re-checked here inside the transaction that writes the factor.
+    let valid=match kind.as_deref() {
+        Some("channel" | "admin") => true,
+        Some("bootstrap") => super::bootstrap::bootstrap_allowed(conn,&user)?,
+        _ => false,
+    };
     if valid { Ok(()) } else { Err("請重新開始註冊並完成獨立身分驗證。".into()) }
 }

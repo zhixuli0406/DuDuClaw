@@ -57,10 +57,13 @@ async fn first_factor_response(
         let now = chrono::Utc::now().timestamp();
         let challenge = work.mfa_challenge(&user_id, first, !active, now)?;
         let delivery = if !active { work.mfa_prepare_enrollment(&challenge, true, now)? } else { None };
-        Ok(Some((active, challenge, delivery)))
+        // RM-135: a hint only (the dashboard asks for the host setup code);
+        // the proof itself re-checks everything.
+        let bootstrap = !active && delivery.is_none() && work.mfa_bootstrap_available(&user_id).unwrap_or(false);
+        Ok(Some((active, challenge, delivery, bootstrap)))
     }).await;
     let result = match result {
-        Ok(Ok(Some((active, challenge, delivery)))) => {
+        Ok(Ok(Some((active, challenge, delivery, bootstrap)))) => {
             if let Some(otp) = delivery {
                 if state.otp_delivery.deliver(&otp.channel, &otp.channel_user_id,
                     &format!("DuDuClaw 雙因素註冊驗證碼：{}（5 分鐘內有效）", otp.code)).await.is_err() {
@@ -72,7 +75,8 @@ async fn first_factor_response(
                 factors["mfa_required"]=serde_json::json!(true);
                 factors["challenge_id"]=serde_json::json!(challenge);
                 factors
-            } else {serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge)})};
+            } else {serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge),
+                "setup_code_required":bootstrap})};
             let reason=crate::mfa_email::unavailable_reason(&state.home_dir);
             payload["email_available"]=serde_json::json!(reason.is_none());
             payload["email_unavailable_reason"]=serde_json::json!(reason);
@@ -384,6 +388,186 @@ async fn enroll(
     }
 }
 
+/// Security audit event type of every first-Admin bootstrap attempt (RM-135).
+pub(super) const BOOTSTRAP_AUDIT_EVENT: &str = "mfa.bootstrap_enrollment";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BootstrapBody {
+    enrollment_token: String,
+    setup_code: Option<String>,
+}
+
+/// Security audit event written once the process-wide cap of bootstrap audit
+/// events per window is reached (M4).
+pub(super) const BOOTSTRAP_AUDIT_SUPPRESSED_EVENT: &str = "mfa.bootstrap_enrollment_suppressed";
+/// Post-validation bootstrap audit events per window, process-wide (M4).
+pub(super) const BOOTSTRAP_AUDIT_CAP: u32 = 20;
+const BOOTSTRAP_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
+const BOOTSTRAP_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the bootstrap limiter allows for one event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AuditSlot {
+    /// Write the event.
+    Write,
+    /// Cap just reached: write the one summary event instead.
+    Summary,
+    /// Over the cap: write nothing.
+    Suppressed,
+}
+
+/// Process-wide, bounded bookkeeping of first-Administrator bootstrap
+/// refusals (M4). Fixed size: three counters, a flag and two instants.
+///
+/// - Before the password-bound enrollment token is validated, nothing reaches
+///   the security audit (its writer re-reads the whole hash chain and fsyncs
+///   per record): refusals are only counted and summarized by at most one
+///   ordinary `tracing::warn!` per [`BOOTSTRAP_WARN_INTERVAL`].
+/// - After validation, at most [`BOOTSTRAP_AUDIT_CAP`] audit events per
+///   [`BOOTSTRAP_AUDIT_WINDOW`], then one summary event, then nothing until
+///   the window rolls over. A successful proof is always written (it needs
+///   a fresh host-issued code, so it cannot be flooded) and counts too.
+#[derive(Debug, Default)]
+pub(super) struct BootstrapAuditLimiter {
+    unauthenticated: u64,
+    last_warn: Option<std::time::Instant>,
+    window_start: Option<std::time::Instant>,
+    audited: u32,
+    summarized: bool,
+    suppressed: u64,
+}
+
+impl BootstrapAuditLimiter {
+    pub(super) const fn new() -> Self {
+        Self { unauthenticated: 0, last_warn: None, window_start: None, audited: 0, summarized: false, suppressed: 0 }
+    }
+
+    /// Count one refusal before token validation. Returns the number of
+    /// refusals to report when a warning is due now.
+    pub(super) fn unauthenticated_refusal(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.unauthenticated = self.unauthenticated.saturating_add(1);
+        let due = self.last_warn.is_none_or(|at| now.duration_since(at) >= BOOTSTRAP_WARN_INTERVAL);
+        if !due { return None; }
+        self.last_warn = Some(now);
+        Some(std::mem::take(&mut self.unauthenticated))
+    }
+
+    /// Slot for one post-validation event. Returns the events suppressed in
+    /// a window that just ended, if any (to be reported in `tracing`).
+    pub(super) fn validated_event(&mut self, now: std::time::Instant, success: bool) -> (AuditSlot, Option<u64>) {
+        let mut ended = None;
+        if self.window_start.is_none_or(|at| now.duration_since(at) >= BOOTSTRAP_AUDIT_WINDOW) {
+            if self.suppressed > 0 { ended = Some(self.suppressed); }
+            self.window_start = Some(now);
+            self.audited = 0;
+            self.summarized = false;
+            self.suppressed = 0;
+        }
+        let slot = if self.audited < BOOTSTRAP_AUDIT_CAP {
+            self.audited += 1;
+            AuditSlot::Write
+        } else if success {
+            AuditSlot::Write
+        } else if !self.summarized {
+            self.summarized = true;
+            AuditSlot::Summary
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            AuditSlot::Suppressed
+        };
+        (slot, ended)
+    }
+}
+
+static BOOTSTRAP_AUDIT_LIMITER: std::sync::Mutex<BootstrapAuditLimiter> = std::sync::Mutex::new(BootstrapAuditLimiter::new());
+
+/// A bootstrap refusal before the enrollment token was validated: no audit
+/// write, only the bounded counter and a rate-limited `tracing::warn!`.
+fn note_unauthenticated_bootstrap_refusal() {
+    let report = BOOTSTRAP_AUDIT_LIMITER.lock().unwrap_or_else(|e| e.into_inner())
+        .unauthenticated_refusal(std::time::Instant::now());
+    if let Some(refusals) = report {
+        tracing::warn!(refusals, "first administrator setup: refused requests without a valid sign-in (not audited individually)");
+    }
+}
+
+/// A post-validation bootstrap outcome, under the process-wide cap.
+/// `reason` is a closed label; the setup code and tokens never reach here.
+pub(super) fn audit_validated_bootstrap(limiter: &std::sync::Mutex<BootstrapAuditLimiter>, home: &std::path::Path,
+    outcome: &str, reason: &str) {
+    let (slot, ended) = limiter.lock().unwrap_or_else(|e| e.into_inner())
+        .validated_event(std::time::Instant::now(), outcome == "allowed");
+    if let Some(suppressed) = ended {
+        tracing::warn!(suppressed, "first administrator setup: audit events suppressed in the last hour");
+    }
+    let event = match slot {
+        AuditSlot::Write => duduclaw_security::audit::AuditEvent::new(
+            BOOTSTRAP_AUDIT_EVENT, "dashboard", duduclaw_security::audit::Severity::Warning,
+            serde_json::json!({"method": "setup_code", "outcome": outcome, "reason": reason})),
+        AuditSlot::Summary => duduclaw_security::audit::AuditEvent::new(
+            BOOTSTRAP_AUDIT_SUPPRESSED_EVENT, "dashboard", duduclaw_security::audit::Severity::Warning,
+            serde_json::json!({"cap": BOOTSTRAP_AUDIT_CAP, "window_secs": BOOTSTRAP_AUDIT_WINDOW.as_secs(),
+                "note": "further first administrator setup attempts in this window are not audited individually"})),
+        AuditSlot::Suppressed => return,
+    };
+    crate::security_autopilot::audit_and_emit(home, &event);
+}
+
+/// POST /api/mfa/enroll/bootstrap (RM-135): prove host access for the first
+/// Administrator's first-time enrollment with the one-time setup code the
+/// host command `duduclaw ops users mfa-setup-code` printed. There is no
+/// code-free path (no "same machine" claim: a reverse proxy on the host makes
+/// every peer loopback). On success the ordinary `/api/mfa/enroll/begin` and
+/// `/confirm` (or passkey registration) continue without an enrollment code.
+/// Same rate limits as enrollment; the code is never logged or echoed.
+/// Nothing reaches the security audit until the password-bound enrollment
+/// token is validated (M4, [`BootstrapAuditLimiter`]).
+pub(super) async fn enroll_bootstrap(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<BootstrapBody>,
+) -> axum::response::Response {
+    if !check_otp_verify_rate_limit(addr.ip()) || !check_login_rate_limit(addr.ip(), "mfa") {
+        note_unauthenticated_bootstrap_refusal();
+        return limited();
+    }
+    let personal = state.handler.resolve_edition_profile().await.is_personal();
+    if enforced(&state.home_dir, personal).is_err() {
+        note_unauthenticated_bootstrap_refusal();
+        return denied();
+    }
+    let setup = body.setup_code.map(|code| code.trim().to_owned()).filter(|code| !code.is_empty());
+    let work = state.clone();
+    let token = body.enrollment_token;
+    // Ok(None): token not valid (unauthenticated); Ok(Some(result)): validated.
+    let result = tokio::task::spawn_blocking(move || -> Option<Result<(), &'static str>> {
+        let now = chrono::Utc::now().timestamp();
+        work.user_db.mfa_enrollment_user(&token, now).ok()?;
+        let Some(code) = setup else { return Some(Err("setup_code_required")) };
+        Some(work.user_db.mfa_prove_bootstrap(&token, &code, now).map_err(|_| "proof_refused"))
+    }).await;
+    match result {
+        Ok(Some(Ok(()))) => {
+            audit_validated_bootstrap(&BOOTSTRAP_AUDIT_LIMITER, &state.home_dir, "allowed", "allowed");
+            json_response(serde_json::json!({"bootstrap": true}))
+        }
+        Ok(Some(Err(reason))) => {
+            audit_validated_bootstrap(&BOOTSTRAP_AUDIT_LIMITER, &state.home_dir, "refused", reason);
+            let _ = state.user_db.log_action(None, "mfa.verification_failed", None, None, Some(&addr.ip().to_string()));
+            denied()
+        }
+        Ok(None) | Err(_) => {
+            note_unauthenticated_bootstrap_refusal();
+            denied()
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "mfa_http_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mfa_bootstrap_http_tests.rs"]
+mod bootstrap_tests;

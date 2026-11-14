@@ -25,7 +25,12 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
   const [target, setTarget] = useState<string | null>(null);
   const [action, setAction] = useState<'reset' | 'issue' | null>(null);
   const [factor, setFactor] = useState('');
-  const [resetProof, setResetProof] = useState<'code' | 'password'>('code');
+  const [resetProof, setResetProof] = useState<'code' | 'password' | 'email'>('code');
+  // Email-code confirmation (no authenticator app): the server-issued capability.
+  const [resetToken, setResetToken] = useState<string | null>(null);
+  const [emailCode, setEmailCode] = useState('');
+  // Whether this admin has an authenticator app (null: unknown).
+  const [ownTotp, setOwnTotp] = useState<boolean | null>(null);
   const [reference, setReference] = useState('');
   const [issued, setIssued] = useState<{ enrollment_code: string; expires_in: number } | null>(null);
   const [confirmPolicy, setConfirmPolicy] = useState<{ expected_state: boolean; desired_state: boolean } | null>(null);
@@ -38,6 +43,9 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
     let active = true;
     void mfaApi.overview().then(value => { if (active) setOverview(value); })
       .catch(error => { if (active) setError(t(mfaErrorId(error))); });
+    void Promise.resolve().then(() => mfaApi.status())
+      .then(status => { if (active && status?.factors) setOwnTotp(status.factors.totp === true); })
+      .catch(() => { if (active) setOwnTotp(null); });
     return () => { active = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -49,6 +57,15 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
   };
   const blocked = overview?.users.filter(u => !u.enabled).length ?? 0;
   const degraded = systemDegraded || overview?.policy.degraded;
+  const admins = overview?.users.filter(u => u.admin === true).length ?? 0;
+  const emailOf = (id: string) => overview?.users.find(u => u.user_id === id)?.email;
+  const closeReset = () => { setAction(null); setIssued(null); setFactor(''); setReference(''); setResetToken(null); setEmailCode(''); };
+  // An administrator target needs a second factor: no password-only option.
+  const proofChoices = (targetAdmin: boolean) => [
+    'code' as const,
+    ...(ownTotp === false ? ['email' as const] : []),
+    ...(targetAdmin ? [] : ['password' as const]),
+  ];
   // Keep the existing policy controls reachable after an edition downgrade.
   if (isPersonal && !error && !degraded && (!overview || overview.enforced === false)) return null;
   return <Card className="space-y-4 p-4">
@@ -62,6 +79,10 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
       <p>{intl.formatMessage({ id: 'mfa.admin.blocked' }, { count: blocked })}</p>
       {overview.policy.enforced_at != null && <p className="text-sm text-muted-foreground">{t('mfa.enforcedAt')}: {intl.formatDate(overview.policy.enforced_at / 1000, { dateStyle: 'medium', timeStyle: 'short' })}</p>}
       {blocked > 0 && <p role="alert" className="text-sm text-warning">{t('mfa.admin.warning')}</p>}
+      {(overview.reset_notice_failures ?? []).map(notice => <p role="alert" className="break-all text-sm text-warning" key={`${notice.user_id}:${notice.at}`}>
+        {intl.formatMessage({ id: 'mfa.reset.noticeFailed' }, { email: emailOf(notice.user_id) ?? t('mfa.reset.removedAccount'), time: intl.formatDate(notice.at, { dateStyle: 'medium', timeStyle: 'short' }) })}
+      </p>)}
+      {admins === 1 && <p className="text-sm text-muted-foreground">{t('mfa.admin.singleAdmin')}</p>}
       <p className="text-sm text-muted-foreground">{t('mfa.admin.review')}</p>
       <Button role="switch" aria-checked={overview.enforced === true} variant="outline" disabled={busy || degraded || overview.enforced === null} onClick={() => { if (overview.enforced !== null) setConfirmPolicy({ expected_state: overview.enforced, desired_state: !overview.enforced }); setTyped(''); }}>{t(overview.enforced ? 'mfa.policy.disable' : 'mfa.policy.enable')}</Button>
       {confirmPolicy && <form className="space-y-3 rounded-lg border p-3" onSubmit={e => {
@@ -84,24 +105,40 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
             {binding.channel} · {t('mfa.boundAt')}: {binding.verified && binding.verified_at ? intl.formatDate(binding.verified_at / 1000, { dateStyle: 'medium', timeStyle: 'short' }) : t('mfa.unknownTime')}
           </p>)}
           <div className="flex flex-wrap gap-2">
-            <Button variant="destructive" disabled={busy || row.user_id === actor || !row.enabled} title={row.user_id === actor ? t('mfa.selfReset') : undefined} onClick={() => { setTarget(row.user_id); setAction('reset'); setResetProof('code'); setFactor(''); setIssued(null); }}>{t('mfa.reset')}</Button>
+            <Button variant="destructive" disabled={busy || row.user_id === actor || !row.enabled} title={row.user_id === actor ? t('mfa.selfReset') : undefined} onClick={() => { setTarget(row.user_id); setAction('reset'); setResetProof(row.admin === true && ownTotp === false ? 'email' : 'code'); setFactor(''); setIssued(null); setResetToken(null); setEmailCode(''); }}>{t('mfa.reset')}</Button>
             <Button variant="outline" disabled={busy || row.enabled || row.user_id === actor} onClick={() => { setTarget(row.user_id); setAction('issue'); setReference(''); setIssued(null); }}>{t('mfa.issue')}</Button>
           </div>
           {target === row.user_id && action && <form className="space-y-3" onSubmit={e => {
             e.preventDefault();
             if (action === 'reset') {
               if (target === actor) return;
-              void run(async () => { if (resetProof === 'password') await mfaApi.resetPassword(actor, target, factor); else await mfaApi.reset(actor, target, factor); setFactor(''); setAction(null); await load(); setNotice(t('mfa.updated')); });
+              const done = async () => { closeReset(); await load(); setNotice(t('mfa.reset.done')); };
+              // A presented code is spent even when wrong: start over with a new one.
+              if (resetProof === 'email' && resetToken) void run(async () => {
+                try { await mfaApi.resetEmailConfirm(actor, target, resetToken, emailCode); }
+                catch (failure) { setResetToken(null); setEmailCode(''); throw failure; }
+                await done();
+              });
+              else if (resetProof === 'email') void run(async () => { const sent = await mfaApi.resetEmailBegin(actor, target, factor); setFactor(''); setResetToken(sent.reset_token); });
+              else void run(async () => { if (resetProof === 'password') await mfaApi.resetPassword(actor, target, factor); else await mfaApi.reset(actor, target, factor); await done(); });
             } else void run(async () => { setIssued(await mfaApi.issueCode(target, reference)); setReference(''); });
           }}>
-            {action === 'reset' && <label className="block space-y-2">{t('mfa.admin.confirmWith')}<select aria-label={t('mfa.admin.confirmWith')} className="w-full rounded-lg border bg-background p-2" disabled={busy} value={resetProof} onChange={e => { setResetProof(e.target.value as typeof resetProof); setFactor(''); }}>
-              <option value="code">{t('mfa.freshFactor')}</option><option value="password">{t('mfa.password')}</option>
-            </select></label>}
-            <label className="block space-y-2">{t(action === 'reset' ? resetProof === 'password' ? 'mfa.password' : 'mfa.freshFactor' : 'mfa.challengeRef')}
-              <Input type={action === 'reset' && resetProof === 'password' ? 'password' : 'text'} autoComplete={action === 'reset' && resetProof === 'password' ? 'current-password' : 'off'} pattern={action === 'issue' ? '[0-9a-fA-F]{12}' : undefined} maxLength={action === 'issue' ? 12 : resetProof === 'password' ? 4096 : 128} value={action === 'reset' ? factor : reference} onChange={e => action === 'reset' ? setFactor(e.target.value) : setReference(e.target.value)} required />
-            </label>
-            <Button type="submit" disabled={busy || (action === 'reset' ? !factor.trim() : !reference.trim())}>{t('mfa.confirm')}</Button>
-            <Button type="button" variant="outline" disabled={busy} onClick={() => { setAction(null); setIssued(null); setFactor(''); setReference(''); }}>{t('mfa.close')}</Button>
+            {action === 'reset' && <>
+              <p className="text-sm text-muted-foreground">{t(row.admin === true ? 'mfa.reset.adminRule' : 'mfa.reset.willNotify')}</p>
+              <label className="block space-y-2">{t('mfa.admin.confirmWith')}<select aria-label={t('mfa.admin.confirmWith')} className="w-full rounded-lg border bg-background p-2" disabled={busy || resetToken !== null} value={resetProof} onChange={e => { setResetProof(e.target.value as typeof resetProof); setFactor(''); }}>
+                {proofChoices(row.admin === true).map(choice => <option key={choice} value={choice}>{t(choice === 'code' ? 'mfa.freshFactor' : choice === 'email' ? 'mfa.reset.emailProof' : 'mfa.password')}</option>)}
+              </select></label>
+            </>}
+            {action === 'reset' && resetProof === 'email' && resetToken ? <>
+              <p role="status" className="text-sm">{t('mfa.reset.emailSent')}</p>
+              <label className="block space-y-2">{t('mfa.reset.emailCode')}
+                <Input autoComplete="one-time-code" inputMode="numeric" value={emailCode} onChange={e => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))} required pattern="[0-9]{6}" />
+              </label>
+            </> : <label className="block space-y-2">{t(action === 'reset' ? resetProof !== 'code' ? 'mfa.password' : 'mfa.freshFactor' : 'mfa.challengeRef')}
+              <Input type={action === 'reset' && resetProof !== 'code' ? 'password' : 'text'} autoComplete={action === 'reset' && resetProof !== 'code' ? 'current-password' : 'off'} pattern={action === 'issue' ? '[0-9a-fA-F]{12}' : undefined} maxLength={action === 'issue' ? 12 : resetProof !== 'code' ? 4096 : 128} value={action === 'reset' ? factor : reference} onChange={e => action === 'reset' ? setFactor(e.target.value) : setReference(e.target.value)} required />
+            </label>}
+            <Button type="submit" disabled={busy || (action === 'reset' ? (resetProof === 'email' && resetToken ? emailCode.length !== 6 : !factor.trim()) : !reference.trim())}>{t(action === 'reset' && resetProof === 'email' && !resetToken ? 'mfa.reset.sendCode' : 'mfa.confirm')}</Button>
+            <Button type="button" variant="outline" disabled={busy} onClick={closeReset}>{t('mfa.close')}</Button>
             {issued && <p role="status" className="break-all">{t('mfa.issued')}: <code>{issued.enrollment_code}</code> · {intl.formatMessage({ id: 'mfa.expires' }, { seconds: issued.expires_in })}</p>}
           </form>}
         </li>)}

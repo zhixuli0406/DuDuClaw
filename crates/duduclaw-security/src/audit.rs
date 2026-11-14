@@ -139,6 +139,32 @@ pub fn try_append_audit_event(home_dir: &Path, event: &AuditEvent) -> Result<(),
         .map_err(|e| e.to_string())
 }
 
+/// Current length in bytes of the security audit log (0 when it does not
+/// exist yet): the `since` a caller of [`try_append_audit_event_once`]
+/// stores durably before its first attempt.
+pub fn audit_log_position(home_dir: &Path) -> Result<u64, String> {
+    crate::audit_chain::chained_len(&home_dir.join("security_audit.jsonl")).map_err(|e| e.to_string())
+}
+
+/// [`try_append_audit_event`] at most once per logical event: when a record
+/// appended at or after byte `since` already satisfies `present` (an earlier
+/// delivery whose acknowledgement was lost), nothing is written and
+/// `Ok(false)` is returned. The check and the append run under one lock;
+/// only the records after `since` are read.
+pub fn try_append_audit_event_once(
+    home_dir: &Path,
+    event: &AuditEvent,
+    since: u64,
+    present: &dyn Fn(&serde_json::Value) -> bool,
+) -> Result<bool, String> {
+    let value = serde_json::to_value(event).map_err(|e| e.to_string())?;
+    let serde_json::Value::Object(map) = value else {
+        return Err("audit event must be an object".to_string());
+    };
+    crate::audit_chain::append_chained_line_strict_once(&home_dir.join("security_audit.jsonl"), map, since, present)
+        .map_err(|e| e.to_string())
+}
+
 /// Read recent audit events (last N entries).
 ///
 /// Simplified: collect all lines, then slice the tail (MW-L2).

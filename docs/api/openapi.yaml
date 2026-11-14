@@ -149,6 +149,7 @@ paths:
                       mfa_enrollment_required: {const: true}
                       challenge_ref: {type: string, minLength: 12, maxLength: 12}
                       enrollment_token: {type: string}
+                      setup_code_required: {type: boolean, description: '第一位管理員首次設定：請輸入主機 `duduclaw ops users mfa-setup-code` 印出的設定碼（`/api/mfa/enroll/bootstrap`）'}
         '401': {description: 登入失敗或設定不可讀}
         '429': {description: 登入嘗試過多}
   /api/otp/verify:
@@ -269,6 +270,34 @@ paths:
                   secret: {type: string}
                   otpauth_uri: {type: string}
         '401': {description: 註冊憑證無效或資料不可讀}
+        '429': {description: 嘗試過多}
+  /api/mfa/enroll/bootstrap:
+    post:
+      summary: 第一位管理員的首次註冊主機證明（RM-135）
+      description: |
+        只在政策強制、目標為有效的 bootstrap owner Admin、沒有任何管理員設定任何第二因素，
+        且每套安裝的關閉旗標（`users.db` 的 `mfa_bootstrap_state`）尚未設定時有效；任何管理員一有第二因素，
+        旗標就永久設定，之後即使移除因素或降級管理員也不會重新開放，請改用主機 `duduclaw ops users mfa-reset <email>`。
+        **一律需要 setup_code**：主機一次性設定碼（32 個十六進位字元，30 分鐘、單次、雜湊保存、輸錯 5 次作廢），
+        只能在主機執行 `duduclaw ops users mfa-setup-code` 取得（只印到互動式終端機；Docker 請在容器內以
+        `docker exec -it` 執行）；閘道不會在任何紀錄中顯示設定碼。沒有本機（loopback）免設定碼的方式。
+        登入回應以 `setup_code_required: true` 表示可使用這個證明。成功後以 begin／confirm 繼續，不需 proof_code。
+        註冊憑證驗證前的拒絕不寫入安全稽核；驗證後的結果寫入 `mfa.bootstrap_enrollment`（整個閘道每小時最多 20 筆，之後一筆彙總）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enrollment_token, setup_code]
+              properties:
+                enrollment_token: {type: string, writeOnly: true}
+                setup_code: {type: string, writeOnly: true, description: '`duduclaw ops users mfa-setup-code` 印出的設定碼'}
+      responses:
+        '200': {description: '`{bootstrap:true}`'}
+        '401': {description: 證明被拒絕（註冊憑證無效、未帶設定碼、條件不符、首次設定已關閉、設定碼錯誤／過期／已使用）}
         '429': {description: 嘗試過多}
   /api/mfa/enroll/confirm:
     post:
@@ -434,20 +463,30 @@ paths:
   /rpc/users.mfa_reset:
     post:
       tags: [auth]
-      summary: 目前有效 Admin 以自身新 TOTP 或備援碼重設別人 MFA；拒絕自我重設
-      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      summary: 目前有效 Admin 重設別人 MFA；管理員對象需自身第二因素與 7 天資格；拒絕自我重設
+      description: |
+        透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。證明擇一：
+        `code`（新的 TOTP 或未用過的備援碼）；`password`（僅限非管理員對象）；
+        `password` + `send_email_code: true`（沒有驗證器的操作者，回傳 `reset_token`，確認碼寄到操作者自己的信箱），
+        之後以 `reset_token` + `email_code` 完成。管理員對象（目前為 admin，或 7 天內曾是 admin）拒絕只用密碼，
+        並要求操作者 7 天冷卻期內連續具管理員資格。拒絕回傳 `{code,message}`，code 為 `MFA_RESET_*` 封閉集合。
+        每次嘗試寫入安全稽核 `mfa.admin_reset`。
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [user_id, code]
+              required: [user_id]
               properties:
                 user_id: {type: string}
                 code: {type: string, writeOnly: true}
+                password: {type: string, writeOnly: true}
+                send_email_code: {type: boolean}
+                reset_token: {type: string, writeOnly: true}
+                email_code: {type: string, writeOnly: true}
       responses:
-        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+        '200': {description: RPC 結果（成功 `{reset:true}`、`{email_code_sent,reset_token,expires_in}` 或 `{code,message}` 拒絕）}
   /rpc/users.mfa_enrollment_code:
     post:
       tags: [auth]
