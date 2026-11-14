@@ -122,6 +122,25 @@ pub fn domain_allowed(home: &Path, metadata: &Metadata) -> Result<bool, String> 
     }))
 }
 
+/// Said instead of "你的 Google 連線…" when the person asking is not the
+/// connection's owner (a member asking through the employee, a scheduled
+/// run): they cannot reconnect someone else's account.
+pub(crate) const OWNER_RECONNECT_FOR_OTHERS: &str =
+    "這位 AI 員工負責人的 Google 連線需要重新連結，請通知負責人或管理員。";
+
+/// A `needs_reconnect` refusal, worded for who is asking: the connection's
+/// own person keeps today's text; anyone else is told whose connection it
+/// is and whom to tell. Every other refusal is unchanged.
+pub(crate) fn for_requester(refusal: Refusal, requester: &RequesterIdentity, owner_id: &str) -> Refusal {
+    if refusal.code != "needs_reconnect" || requester_gate::is_person(requester, owner_id) {
+        return refusal;
+    }
+    Refusal {
+        message_zh: OWNER_RECONNECT_FOR_OTHERS.to_string(),
+        ..refusal
+    }
+}
+
 fn check_record(home: &Path, record: &vault::Record, tool: &str) -> Result<(), Refusal> {
     // Every unseal/refresh path must name an explicit bearer operation.
     if !scopes::token_tool(tool) {
@@ -235,6 +254,8 @@ pub async fn resolve(
     // Google email, to implement owner_only.
     requester_gate::check(effective.requesters, requester, agent, &user.email, people)?;
     check_person(home, db, agent, &user)?;
+    let owner_id = user.id.clone();
+    let audience = |refusal: Refusal| for_requester(refusal, requester, &owner_id);
     // A legitimately resumed person is normalized before fixing authority.
     // Keep this before the first await so later ABA cannot be recaptured.
     vault::sync_user_status(home, &user.id, true).map_err(store_error)?;
@@ -253,7 +274,7 @@ pub async fn resolve(
                 "負責人還沒連結 Google，請本人到「我的連線」按「連結我的 Google」。",
             )
         })?;
-    check_record(home, &record, tool)?;
+    check_record(home, &record, tool).map_err(audience)?;
     let config = crate::mcp_oauth::get_client_config(home, "google").ok_or_else(|| {
         Refusal::hard(
             "config_invalid",
@@ -279,10 +300,10 @@ pub async fn resolve(
     {
         let _grant_lease = super::grants::acquire(home).await.map_err(store_error)?;
         let Some(refresh_token) = secret.refresh_token.as_deref() else {
-            return Err(Refusal::soft(
+            return Err(audience(Refusal::soft(
                 "needs_reconnect",
                 "Google 沒有提供背景更新連線，請本人重新連結並同意背景存取。",
-            ));
+            )));
         };
         match oauth::refresh(&config.client_id, &config.client_secret, refresh_token).await {
             Ok(mut tokens) => {
@@ -316,7 +337,7 @@ pub async fn resolve(
                 record = vault::get(home, &user.id)
                     .map_err(store_error)?
                     .ok_or_else(|| store_error("connection removed"))?;
-                check_record(home, &record, tool)?;
+                check_record(home, &record, tool).map_err(audience)?;
             }
             Err(oauth::Error::InvalidGrant) => {
                 // v1.81 C4: consent revoked at Google; fence catalog routes first.
@@ -338,7 +359,7 @@ pub async fn resolve(
                 // v1.81 E3: in protected mode (or inside an isolated request)
                 // the call that observed the revoked consent fails; it never
                 // continues on the configured home fallback account.
-                return Err(consent_revoked_refusal());
+                return Err(audience(consent_revoked_refusal()));
             }
             Err(_) => {
                 return Err(Refusal::soft(
@@ -571,7 +592,8 @@ async fn resolve_pinned_core(
     let record = vault::get(home, user_id)
         .map_err(store_error)?
         .ok_or_else(pinned_changed)?;
-    check_record(home, &record, purpose_key)?;
+    let audience = |refusal: Refusal| for_requester(refusal, requester, user_id);
+    check_record(home, &record, purpose_key).map_err(audience)?;
     let prior_revision = record.metadata.revision;
     let before = super::authority::PersonalAuthority::new(selected.clone(), prior_revision);
     before.validate(home, agent, requester, people, purpose_key)?;
@@ -616,10 +638,10 @@ async fn resolve_pinned_core(
         #[cfg(test)]
         pinned_test::observe(home, "refresh_grant");
         let refresh_token = secret.refresh_token.as_deref().ok_or_else(|| {
-            Refusal::hard(
+            audience(Refusal::hard(
                 "needs_reconnect",
                 "Google 沒有提供背景更新連線，請本人重新連結並同意背景存取。",
-            )
+            ))
         })?;
         let client = client.decrypt()?;
         // The capsule proves which bytes were decrypted. Live gates still
@@ -658,10 +680,10 @@ async fn resolve_pinned_core(
             before.validate(home, agent, requester, people, purpose_key)?;
         }
         let mut tokens = result.map_err(|error| match error {
-            oauth::Error::InvalidGrant => Refusal::hard(
+            oauth::Error::InvalidGrant => audience(Refusal::hard(
                 "needs_reconnect",
                 "你的 Google 連線已失效，請本人到「我的連線」重新連結。",
-            ),
+            )),
             _ => Refusal::hard(
                 "google_unreachable",
                 "暫時無法更新 Google 連線，這次操作已停止。",
@@ -719,6 +741,10 @@ async fn resolve_pinned_core(
     pinned_test::observe(home, "resolve_locks_released");
     Ok(material)
 }
+
+#[cfg(test)]
+#[path = "access_audience_tests.rs"]
+mod audience_tests;
 
 /// Home-keyed owned-fixture injection, absent from production. Hooks run at
 /// real authority boundaries and never replace the gates, CAS or lease.

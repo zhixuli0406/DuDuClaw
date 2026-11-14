@@ -272,7 +272,7 @@ impl ChannelSettingsManager {
         channel: &str,
         scope: &str,
     ) -> Result<Vec<(String, String, String)>, String> {
-        self.refresh_snapshot_filtered(channel, scope, None).await
+        self.refresh_snapshot_filtered(channel, scope, None, true).await
     }
 
     /// Like [`Self::refresh_channel_snapshot`], but only `keys` are validated
@@ -285,7 +285,21 @@ impl ChannelSettingsManager {
         scope: &str,
         keys: &[&str],
     ) -> Result<Vec<(String, String, String)>, String> {
-        self.refresh_snapshot_filtered(channel, scope, Some(keys))
+        self.refresh_snapshot_filtered(channel, scope, Some(keys), true)
+            .await
+    }
+
+    /// Authoritative `global`-scope rows for `keys` WITHOUT value validation:
+    /// the caller parses and classifies malformed values itself (the user
+    /// access policy snapshot). `Err` = SQLite / I/O failure, revoked I/O
+    /// authority, or a non-durable (in-memory fallback) store. An error is
+    /// never cached.
+    pub(crate) async fn read_global_rows_raw(
+        &self,
+        channel: &str,
+        keys: &[&str],
+    ) -> Result<Vec<(String, String, String)>, String> {
+        self.refresh_snapshot_filtered(channel, "global", Some(keys), false)
             .await
     }
 
@@ -294,6 +308,7 @@ impl ChannelSettingsManager {
         channel: &str,
         scope: &str,
         only: Option<&[&str]>,
+        validate: bool,
     ) -> Result<Vec<(String, String, String)>, String> {
         let wanted = |key: &str| only.is_none_or(|keys| keys.contains(&key));
         let conn = self.conn.lock().await;
@@ -321,7 +336,7 @@ impl ChannelSettingsManager {
             .map_err(|e| e.to_string())?
         };
         for (_, key, value) in &rows {
-            if wanted(key) {
+            if validate && wanted(key) {
                 validate_setting_value(key, value)?;
             }
         }
@@ -356,11 +371,21 @@ impl ChannelSettingsManager {
         // Slow path: query DB and populate cache
         let conn = self.conn.lock().await;
         if verify_live_io().is_err() { return None; }
-        let result: Option<String> = conn.query_row(
+        let result: Option<String> = match conn.query_row(
             "SELECT value FROM channel_settings WHERE channel_type = ?1 AND scope_id = ?2 AND key = ?3",
             params![channel_type, scope_id, key],
             |row| row.get(0),
-        ).ok();
+        ) {
+            Ok(value) => Some(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            // A read failure is not "unset": answer None for this call only,
+            // never cache it. Access decisions use the Result-returning
+            // snapshot (`channel_reply::read_user_access_policy`) instead.
+            Err(e) => {
+                tracing::warn!(error = %e, key, "channel settings read failed");
+                return None;
+            }
+        };
         #[cfg(test)]
         pause_after_settings_read().await;
 

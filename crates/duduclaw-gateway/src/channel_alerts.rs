@@ -109,7 +109,9 @@ const ACTIVITY_AGENT_ID: &str = "channel_alert";
 ///
 /// See the module docs: this list, not the mere presence of a `channel`
 /// field, is what makes a record count toward an outage.
-pub const SEND_FAILURE_EVENTS: &[&str] = &["telegram_send_failed"];
+/// `googlechat_send_failed`: the final reply could not be delivered even
+/// after the new-message fallback (`googlechat::SEND_FAILED_EVENT`).
+pub const SEND_FAILURE_EVENTS: &[&str] = &["telegram_send_failed", "googlechat_send_failed"];
 
 /// The `event` written when a channel comes back.
 pub const RECOVERED_EVENT: &str = "channel_recovered";
@@ -578,6 +580,15 @@ mod tests {
         let rec = parse_failure_line(line).unwrap();
         assert_eq!(rec.agent.as_deref(), Some("sales-bot"));
         assert_eq!(rec.event, "telegram_send_failed");
+    }
+
+    #[test]
+    fn googlechat_final_delivery_failure_counts_as_send_failure() {
+        let line = r#"{"event":"googlechat_send_failed","channel":"googlechat","space":"spaces/A","status":403,"reason":"final_delivery_failed","agent":"sales","timestamp":"2026-08-11T10:00:00Z"}"#;
+        let rec = parse_failure_line(line).unwrap();
+        assert_eq!(rec.channel, "googlechat");
+        assert_eq!(rec.event, crate::googlechat::SEND_FAILED_EVENT);
+        assert_eq!(rec.agent.as_deref(), Some("sales"));
     }
 
     #[test]

@@ -16,7 +16,9 @@ impl LocalIo for RecordingIo {
             step.query().to_vec(),
             step.body().cloned(),
         ));
-        Ok(self.json.pop_front().unwrap_or(json!({})))
+        // Default: a generic success carrying an id (a write with no id back
+        // is reported as an error, not as created).
+        Ok(self.json.pop_front().unwrap_or(json!({"id":"fixture-id"})))
     }
     async fn text(&mut self, step: NativeStep<'_>) -> Result<String, GoogleApiError> {
         self.wire.push((
@@ -285,6 +287,77 @@ async fn drive_uses_fixed_export_mapping_and_ignores_provider_export_link() {
     assert!(!result.to_string().contains("unexpected.invalid"));
     assert!(result.to_string().contains("document text"));
 }
+fn text_of(result: &Value) -> &str {
+    result["content"][0]["text"].as_str().unwrap()
+}
+
+#[tokio::test]
+async fn calendar_create_never_claims_notified_attendees_or_a_missing_event() {
+    let args = json!({"summary":"s","start":"2026-08-01T00:00:00Z","end":"2026-08-01T01:00:00Z"});
+    let template = NativeCallTemplate::prepare("calendar_create_event", &args).unwrap();
+    let mut io = RecordingIo {
+        json: VecDeque::from([json!({"id":"ev1","summary":"s"})]),
+        ..Default::default()
+    };
+    let result = run(&template, &mut io).await;
+    assert_ne!(result["isError"], true);
+    let text = text_of(&result);
+    assert!(text.contains("Event ID: ev1"), "{text}");
+    assert!(text.contains("Attendees: none"), "{text}");
+    assert!(!text.contains("notified"), "{text}");
+    assert!(!text.contains("Link:"), "empty link is omitted: {text}");
+
+    let mut io = RecordingIo {
+        json: VecDeque::from([json!({"id":"ev2","htmlLink":"https://calendar.example/ev2","attendees":[{"email":"a@b.test"},{"email":"c@d.test"}]})]),
+        ..Default::default()
+    };
+    let text = run(&template, &mut io).await["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(text.contains("Attendees added: 2"), "{text}");
+    assert!(text.contains("Link: https://calendar.example/ev2"), "{text}");
+    assert!(!text.contains("notified"), "{text}");
+
+    for reply in [json!({}), json!({"id":""}), json!({"id":"  "}), json!({"summary":"s"})] {
+        let mut io = RecordingIo { json: VecDeque::from([reply.clone()]), ..Default::default() };
+        let result = run(&template, &mut io).await;
+        assert_eq!(result["isError"], true, "{reply}");
+        assert!(text_of(&result).contains("no event id"), "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn sheets_append_reports_only_counts_google_returned() {
+    let args = json!({"spreadsheet_id":"s","range":"A1","values":["x","y"]});
+    let template = NativeCallTemplate::prepare("sheets_append", &args).unwrap();
+    let mut io = RecordingIo {
+        json: VecDeque::from([json!({"updates":{"updatedRange":"Sheet1!A5:B5","updatedRows":1,"updatedCells":2}})]),
+        ..Default::default()
+    };
+    let text = run(&template, &mut io).await["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(text.contains("Updated range: Sheet1!A5:B5"), "{text}");
+    assert!(text.contains("Updated rows: 1"), "{text}");
+    assert!(text.contains("Updated cells: 2"), "{text}");
+
+    let mut io = RecordingIo { json: VecDeque::from([json!({})]), ..Default::default() };
+    let text = run(&template, &mut io).await["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(!text.contains("Updated rows"), "{text}");
+    assert!(!text.contains("Updated cells"), "{text}");
+    assert!(!text.contains("Updated range"), "{text}");
+    assert!(!text.contains("1 row"), "no assumed count: {text}");
+}
+
+#[tokio::test]
+async fn draft_without_an_id_is_an_error() {
+    let template = NativeCallTemplate::prepare(
+        "gmail_create_draft",
+        &json!({"to":"a@b.test","subject":"subject","body":"body"}),
+    )
+    .unwrap();
+    let mut io = RecordingIo { json: VecDeque::from([json!({})]), ..Default::default() };
+    let result = run(&template, &mut io).await;
+    assert_eq!(result["isError"], true);
+    assert!(!text_of(&result).contains("Draft created"));
+}
+
 impl LocalRender for RecordingIo {
     fn inspect_curated(&mut self, _: &Value) -> Result<(), GoogleApiError> {
         Ok(())

@@ -31,6 +31,8 @@ Twenty-one agent-facing MCP tools, gated by two scopes (`google:read` /
 | `docs_append` | write | Append text to the **end** of a Doc. Append-only — no tool rewrites or deletes existing content. |
 | `slides_read` | read | Read a presentation's text slide by slide (shapes, grouped shapes, table cells). |
 
+Write results report only what Google returned. `calendar_create_event` lists how many attendees were added (or "Attendees: none") and never claims anyone was notified; a missing event ID is an error. `gmail_create_draft` with no draft ID back is an error. `sheets_append` shows row and cell counts only when Google reports them. On the Apps Script path, a row is always appended to the **first sheet** of the spreadsheet: the result says so and that the requested range was ignored. An Apps Script reply counts as success only in that action's success shape; an empty reply, `ok: false` or any `error` field is a tool error with the reason.
+
 > **No Slides write tool** ships on purpose: DuDuClaw's office document suite
 > already produces real `.pptx` files, which is both safer and better output
 > than driving the Slides `batchUpdate` element API.

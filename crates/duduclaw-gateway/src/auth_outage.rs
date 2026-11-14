@@ -111,6 +111,31 @@ pub fn state_path(home_dir: &Path) -> PathBuf {
     home_dir.join("state").join("auth_outage.json")
 }
 
+/// `<home>/state/quota_outage.json` — same shape and debounce as the
+/// authentication outage, for "every account hit its usage/rate limit".
+pub fn quota_state_path(home_dir: &Path) -> PathBuf {
+    home_dir.join("state").join("quota_outage.json")
+}
+
+/// Why every account failed. Each cause has its own state file, so an open
+/// quota outage never silences an authentication alarm (or the reverse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutageCause {
+    /// Authentication failed on every account (D7).
+    Auth,
+    /// Every account is out of quota / rate-limited / out of credit.
+    Quota,
+}
+
+impl OutageCause {
+    fn path(self, home_dir: &Path) -> PathBuf {
+        match self {
+            OutageCause::Auth => state_path(home_dir),
+            OutageCause::Quota => quota_state_path(home_dir),
+        }
+    }
+}
+
 /// Read the current state. Missing / unreadable / corrupt ⇒ inactive
 /// (degrade, never fabricate: a broken file must not invent an outage, and
 /// must not keep one open forever either).
@@ -182,6 +207,31 @@ fn recovery_text() -> String {
     "✅ Claude 帳號認證已恢復，排程與自動回覆重新運作。".to_string()
 }
 
+/// Quota outage alarm. Provider text is never shown: the cause is fixed.
+fn quota_outage_text() -> String {
+    "⚠️ 所有 AI 模型帳號的用量都已達上限，AI 員工暫時無法回覆，排程與自動回覆也會受影響。\
+     請到 儀表板 → 設定 → 帳號 檢查額度或加入其他帳號；恢復後會再通知一次。"
+        .to_string()
+}
+
+fn quota_recovery_text() -> String {
+    "✅ AI 服務用量已恢復，AI 員工可以正常回覆。".to_string()
+}
+
+fn entered_text(cause: OutageCause, detail: &str) -> String {
+    match cause {
+        OutageCause::Auth => outage_text(detail),
+        OutageCause::Quota => quota_outage_text(),
+    }
+}
+
+fn recovered_text(cause: OutageCause) -> String {
+    match cause {
+        OutageCause::Auth => recovery_text(),
+        OutageCause::Quota => quota_recovery_text(),
+    }
+}
+
 // ── Notification seam ────────────────────────────────────────────────────
 
 /// Which side of the transition a notice belongs to.
@@ -192,10 +242,12 @@ pub(crate) enum NoticeKind {
 }
 
 impl NoticeKind {
-    fn event_type(self) -> &'static str {
-        match self {
-            NoticeKind::Entered => "auth_outage",
-            NoticeKind::Recovered => "auth_outage_recovered",
+    fn event_type(self, cause: OutageCause) -> &'static str {
+        match (cause, self) {
+            (OutageCause::Auth, NoticeKind::Entered) => "auth_outage",
+            (OutageCause::Auth, NoticeKind::Recovered) => "auth_outage_recovered",
+            (OutageCause::Quota, NoticeKind::Entered) => "quota_outage",
+            (OutageCause::Quota, NoticeKind::Recovered) => "quota_outage_recovered",
         }
     }
 
@@ -217,11 +269,20 @@ impl NoticeKind {
 pub(crate) struct OutageNotice {
     pub agent_id: String,
     pub kind: NoticeKind,
+    pub cause: OutageCause,
     pub text: String,
 }
 
+impl OutageNotice {
+    fn event_type(&self) -> &'static str {
+        self.kind.event_type(self.cause)
+    }
+}
+
 /// Real delivery: Activity Feed row + one channel push. Both are best-effort
-/// — an alarm that panics is worse than an alarm that misses.
+/// — an alarm that panics is worse than an alarm that misses. The Activity
+/// Feed row is written first and unconditionally, so the dashboard shows the
+/// alarm even when nobody has a channel it could be pushed to.
 async fn deliver(home_dir: &Path, notice: OutageNotice) {
     post_activity(home_dir, &notice).await;
 
@@ -229,7 +290,7 @@ async fn deliver(home_dir: &Path, notice: OutageNotice) {
         home_dir,
         &notice.agent_id,
         notice.kind.level(),
-        notice.kind.event_type(),
+        notice.event_type(),
         &notice.text,
     )
     .await;
@@ -237,15 +298,15 @@ async fn deliver(home_dir: &Path, notice: OutageNotice) {
         crate::goal_notify::NotifyOutcome::NoTarget => {
             info!(
                 agent = %notice.agent_id,
-                event = notice.kind.event_type(),
-                "auth outage: no notification target configured (feed row only)"
+                event = notice.event_type(),
+                "account outage: no notification target configured (feed row only)"
             );
         }
         crate::goal_notify::NotifyOutcome::SendFailed => {
             warn!(
                 agent = %notice.agent_id,
-                event = notice.kind.event_type(),
-                "auth outage: channel push failed (non-fatal)"
+                event = notice.event_type(),
+                "account outage: channel push failed (non-fatal)"
             );
         }
         other => {
@@ -267,7 +328,7 @@ async fn post_activity(home_dir: &Path, notice: &OutageNotice) {
     };
     let row = crate::task_store::ActivityRow {
         id: uuid::Uuid::new_v4().to_string(),
-        event_type: notice.kind.event_type().to_string(),
+        event_type: notice.event_type().to_string(),
         agent_id: notice.agent_id.clone(),
         task_id: None,
         summary: notice.text.clone(),
@@ -306,7 +367,26 @@ pub async fn record_recovery(home_dir: &Path, agent_id: &str) -> OutageTransitio
         return OutageTransition::Ignored;
     }
     let home = home_dir.to_path_buf();
-    record_recovery_with(home_dir, agent_id, move |notice| async move {
+    let auth = record_recovery_with(home_dir, agent_id, move |notice| async move {
+        deliver(&home, notice).await;
+    })
+    .await;
+    // A success also ends a quota outage (any account answered again).
+    let home = home_dir.to_path_buf();
+    let quota = record_recovery_for(OutageCause::Quota, home_dir, agent_id, move |notice| async move {
+        deliver(&home, notice).await;
+    })
+    .await;
+    if auth == OutageTransition::Ignored { quota } else { auth }
+}
+
+/// Record that a reply ended with every account out of quota (usage limit,
+/// rate limit, credit). Same once-per-outage alarm as [`record_outage`]
+/// (Activity Feed row + one push), in its own state file; cleared by
+/// [`record_recovery`] on the next success.
+pub async fn record_quota_outage(home_dir: &Path, agent_id: &str) -> OutageTransition {
+    let home = home_dir.to_path_buf();
+    record_outage_for(OutageCause::Quota, home_dir, agent_id, "", move |notice| async move {
         deliver(&home, notice).await;
     })
     .await
@@ -346,7 +426,22 @@ where
     N: FnOnce(OutageNotice) -> F,
     F: std::future::Future<Output = ()>,
 {
-    let path = state_path(home_dir);
+    record_outage_for(OutageCause::Auth, home_dir, agent_id, detail, notify).await
+}
+
+/// [`record_outage_with`] for one [`OutageCause`] (its own state file).
+pub(crate) async fn record_outage_for<N, F>(
+    cause: OutageCause,
+    home_dir: &Path,
+    agent_id: &str,
+    detail: &str,
+    notify: N,
+) -> OutageTransition
+where
+    N: FnOnce(OutageNotice) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let path = cause.path(home_dir);
     let clean = sanitize_detail(detail);
     let now = Utc::now().to_rfc3339();
 
@@ -372,26 +467,28 @@ where
     match outcome {
         Ok(None) => {
             MAYBE_ACTIVE.store(true, Ordering::Relaxed);
-            debug!(agent = %agent_id, "auth outage already open — staying quiet");
+            debug!(agent = %agent_id, ?cause, "account outage already open — staying quiet");
             OutageTransition::StillInOutage
         }
         Ok(Some(_)) => {
             MAYBE_ACTIVE.store(true, Ordering::Relaxed);
             warn!(
                 agent = %agent_id,
-                "all Claude accounts failed authentication — entering auth outage"
+                ?cause,
+                "all accounts failed — entering account outage"
             );
             notify(OutageNotice {
                 agent_id: agent_id.to_string(),
                 kind: NoticeKind::Entered,
-                text: outage_text(detail),
+                cause,
+                text: entered_text(cause, detail),
             })
             .await;
             OutageTransition::EnteredOutage
         }
         Err(e) => {
             // Fail-open: an unwritable state file must not break the caller.
-            warn!(error = %e, "auth outage: state write failed (non-fatal)");
+            warn!(error = %e, "account outage: state write failed (non-fatal)");
             OutageTransition::Ignored
         }
     }
@@ -408,7 +505,21 @@ where
     N: FnOnce(OutageNotice) -> F,
     F: std::future::Future<Output = ()>,
 {
-    let path = state_path(home_dir);
+    record_recovery_for(OutageCause::Auth, home_dir, agent_id, notify).await
+}
+
+/// [`record_recovery_with`] for one [`OutageCause`].
+pub(crate) async fn record_recovery_for<N, F>(
+    cause: OutageCause,
+    home_dir: &Path,
+    agent_id: &str,
+    notify: N,
+) -> OutageTransition
+where
+    N: FnOnce(OutageNotice) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let path = cause.path(home_dir);
 
     let outcome = duduclaw_core::with_file_lock(&path, || {
         let current = load(&path);
@@ -428,11 +539,12 @@ where
         Ok(false) => OutageTransition::Ignored,
         Ok(true) => {
             MAYBE_ACTIVE.store(false, Ordering::Relaxed);
-            info!(agent = %agent_id, "Claude account authentication recovered — clearing auth outage");
+            info!(agent = %agent_id, ?cause, "accounts recovered — clearing account outage");
             notify(OutageNotice {
                 agent_id: agent_id.to_string(),
                 kind: NoticeKind::Recovered,
-                text: recovery_text(),
+                cause,
+                text: recovered_text(cause),
             })
             .await;
             OutageTransition::Recovered
@@ -609,6 +721,51 @@ mod tests {
             OutageTransition::Ignored
         );
         assert!(sink2.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quota_outage_alerts_once_in_its_own_state_and_recovers() {
+        let dir = home();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        for expected in [OutageTransition::EnteredOutage, OutageTransition::StillInOutage] {
+            assert_eq!(
+                record_outage_for(OutageCause::Quota, dir.path(), "a", "429 provider text", capture(sink.clone())).await,
+                expected
+            );
+        }
+        assert!(quota_state_path(dir.path()).exists());
+        assert!(!state_path(dir.path()).exists(), "a quota outage never opens the auth alarm");
+        {
+            let notices = sink.lock().unwrap();
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].cause, OutageCause::Quota);
+            assert_eq!(notices[0].event_type(), "quota_outage");
+            assert!(notices[0].text.contains("用量都已達上限"));
+            assert!(!notices[0].text.contains("429 provider text"), "provider text never shown");
+        }
+        // An auth outage is still announced while the quota one is open.
+        assert_eq!(
+            record_outage_with(dir.path(), "a", "authentication_failed", capture(sink.clone())).await,
+            OutageTransition::EnteredOutage
+        );
+        assert_eq!(
+            record_recovery_for(OutageCause::Quota, dir.path(), "a", capture(sink.clone())).await,
+            OutageTransition::Recovered
+        );
+        assert!(!quota_state_path(dir.path()).exists());
+        let notices = sink.lock().unwrap();
+        assert_eq!(notices.len(), 3);
+        assert_eq!(notices[2].event_type(), "quota_outage_recovered");
+    }
+
+    #[tokio::test]
+    async fn quota_outage_without_push_target_is_on_the_dashboard() {
+        let dir = home();
+        assert_eq!(record_quota_outage(dir.path(), "a").await, OutageTransition::EnteredOutage);
+        assert_eq!(record_quota_outage(dir.path(), "a").await, OutageTransition::StillInOutage);
+        let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+        let (rows, _) = store.list_activity(None, Some("quota_outage"), 50, 0).await.unwrap();
+        assert_eq!(rows.len(), 1, "one Activity Feed row per outage, no push target needed");
     }
 
     #[tokio::test]

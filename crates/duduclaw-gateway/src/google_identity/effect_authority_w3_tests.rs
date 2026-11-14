@@ -112,7 +112,7 @@ fn count(wire: &D1Wire) -> usize {
 #[tokio::test]
 async fn w3_home_sa_and_delegate_execute_all_eighteen_actual_native_recipes() {
     for kind in ["sa", "delegate"] {
-        let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let wire = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new(kind, &wire).await;
         for (tool, args) in d1_cases() {
             let value = h.call(tool, args).await.unwrap();
@@ -153,7 +153,7 @@ async fn w3_home_sa_and_delegate_execute_all_eighteen_actual_native_recipes() {
 }
 #[tokio::test]
 async fn w3_bridge_all_seven_actions_use_independent_request_contracts() {
-    let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let wire = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("bridge", &wire).await;
     for (tool, args) in d1_cases().into_iter().take(7) {
         let value = h.call(tool, args).await.unwrap();
@@ -198,7 +198,7 @@ async fn w3_bridge_direct_only_and_unsupported_fields_never_send() {
         "sheets_read",
         "sheets_append",
     ];
-    let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let wire = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("bridge", &wire).await;
     let native_cases = d1_cases();
     assert_eq!(native_cases.len(), 18);
@@ -244,7 +244,7 @@ async fn w3_bridge_direct_only_and_unsupported_fields_never_send() {
 }
 #[tokio::test]
 async fn w3_selected_home_sa_preflight_is_once_before_bind_and_execute() {
-    let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let wire = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("sa", &wire).await;
     h.personal_unavailable();
     let store = SelectionStore::default();
@@ -305,7 +305,7 @@ async fn w3_selected_home_sa_preflight_is_once_before_bind_and_execute() {
 }
 #[tokio::test]
 async fn w3_selected_bridge_keeps_historical_failure_and_refuses_local_recovery() {
-    let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let wire = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("bridge", &wire).await;
     h.personal_unavailable();
     let store = SelectionStore::default();
@@ -343,7 +343,7 @@ async fn w3_selected_bridge_keeps_historical_failure_and_refuses_local_recovery(
 }
 #[tokio::test]
 async fn w3_ask_material_expiry_prunes_without_post_ask_mint() {
-    let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let wire = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("sa", &wire).await;
     h.personal_unavailable();
     let store = SelectionStore::default();
@@ -441,7 +441,7 @@ async fn w3_sa_delegate_full_codecs_scrub_before_output_and_reject_derived_ids()
 #[tokio::test]
 async fn w3_sa_delegate_remote_real_closed_slots_use_full_scopes_and_complete_reply() {
     for kind in ["sa", "delegate"] {
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new(kind, &native).await;
         let wire = m1_wire(true).await;
         let registry = m1_registry(&h.f, &wire).await;
@@ -456,7 +456,7 @@ async fn w3_sa_delegate_remote_real_closed_slots_use_full_scopes_and_complete_re
 }
 #[tokio::test]
 async fn w3_delegate_requester_and_protection_hard_errors_never_fall_back() {
-    let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let wire = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("delegate", &wire).await;
     let path = h.f.home.path().join("agents/bot/agent.toml");
     let old = std::fs::read_to_string(&path).unwrap();
@@ -492,7 +492,7 @@ async fn w3_delegate_requester_and_protection_hard_errors_never_fall_back() {
 #[tokio::test]
 async fn w3_metadata_status_and_invalid_arguments_resolve_zero_credentials() {
     for kind in ["sa", "delegate", "bridge"] {
-        let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let wire = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new(kind, &wire).await;
         let status = h.call("google_status", json!({})).await.unwrap();
         assert_ne!(status["isError"], true);
@@ -504,7 +504,7 @@ async fn w3_metadata_status_and_invalid_arguments_resolve_zero_credentials() {
 }
 #[tokio::test]
 async fn w3_oversize_retained_bridge_secret_is_refused_by_actual_selection_capacity() {
-    let wire = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let wire = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("bridge", &wire).await;
     h.personal_unavailable();
     let path = h.f.home.path().join("config.toml");
@@ -734,7 +734,7 @@ async fn w3_selected_bridge_external_recovery_does_not_reselect_or_remint() {
 #[tokio::test]
 async fn w3_missing_or_tampered_owned_issuer_refuses_without_network_fallback() {
     for tampered in [false, true] {
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new("sa", &native).await;
         let marker = h.f.home.path().join(".w3-issuer-owned-fixture");
         if tampered {
@@ -749,7 +749,7 @@ async fn w3_missing_or_tampered_owned_issuer_refuses_without_network_fallback() 
 }
 #[tokio::test]
 async fn w3_cancelled_preflight_releases_reservation_and_never_commits() {
-    let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let native = d1_wire(|_, _| D1Reply::ok()).await;
     let mut h = Harness::new("sa", &native).await;
     h.personal_unavailable();
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -782,7 +782,7 @@ async fn w3_cancelled_preflight_releases_reservation_and_never_commits() {
 #[tokio::test]
 async fn w3_eighteen_second_server_preflight_deadline_discards_late_issuer_result() {
     // Intentionally long: the actual 18-second server deadline is exercised.
-    let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let native = d1_wire(|_, _| D1Reply::ok()).await;
     let mut h = Harness::new("sa", &native).await;
     h.personal_unavailable();
     let slow = d1_wire(|_, _| D1Reply {
@@ -810,7 +810,7 @@ async fn w3_eighteen_second_server_preflight_deadline_discards_late_issuer_resul
 #[tokio::test]
 async fn w3_delegate_soft_missing_key_falls_back_only_when_explicit() {
     for enabled in [false, true] {
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new("delegate", &native).await;
         std::fs::remove_file(crate::google_identity::delegation_key::path(
             h.f.home.path(),
@@ -843,7 +843,7 @@ async fn w3_delegate_soft_missing_key_falls_back_only_when_explicit() {
 }
 #[tokio::test]
 async fn w3_remote_delegate_captures_true_visitor_and_never_home_falls_back() {
-    let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let native = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("delegate", &native).await;
     let wire = m1_wire(false).await;
     let registry = m1_registry(&h.f, &wire).await;
@@ -867,7 +867,7 @@ async fn w3_remote_delegate_captures_true_visitor_and_never_home_falls_back() {
 }
 #[tokio::test]
 async fn w3_same_source_different_operation_material_cannot_replace_original() {
-    let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let native = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("sa", &native).await;
     let args = json!({"query":"q"});
     let context = || {
@@ -900,7 +900,7 @@ async fn w3_same_source_different_operation_material_cannot_replace_original() {
 }
 #[tokio::test]
 async fn w3_bridge_remote_is_not_a_bearer_and_has_zero_bridge_posts() {
-    let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let native = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("bridge", &native).await;
     let wire = m1_wire(false).await;
     let path = h.f.home.path().join("agents/bot/agent.toml");
@@ -937,7 +937,7 @@ async fn w3_bridge_remote_is_not_a_bearer_and_has_zero_bridge_posts() {
 #[tokio::test]
 async fn w3_signed_route_truthful_tags_bind_and_one_shot_execute_actual_prepared_material() {
     for kind in ["sa", "bridge"] {
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new(kind, &native).await;
         h.personal_unavailable();
         duduclaw_core::ensure_identity_key(h.f.home.path()).unwrap();
@@ -1016,7 +1016,7 @@ async fn w3_signed_route_truthful_tags_bind_and_one_shot_execute_actual_prepared
 #[tokio::test]
 async fn w3_mcp_inner_json_concat_is_clean_before_true_global_hook() {
     for kind in ["sa", "delegate"] {
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new(kind, &native).await;
         let wire = m1_wire(false).await;
         let registry = m1_registry(&h.f, &wire).await;
@@ -1116,7 +1116,7 @@ async fn w3_file_and_encrypted_pointer_capture_same_bytes_then_refuse_rotation()
 #[tokio::test]
 async fn w3_owned_proxy_and_env_child() {
     for kind in ["sa", "delegate", "bridge"] {
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new(kind, &native).await;
         let result = h.call("gmail_search", json!({"query":"q"})).await.unwrap();
         assert_ne!(result["isError"], true);
@@ -1124,7 +1124,7 @@ async fn w3_owned_proxy_and_env_child() {
         assert_eq!(count(&h.issuer), usize::from(kind != "bridge"));
     }
     if let Ok(secret) = std::env::var("DUDUCLAW_W3_SECRET_FIXTURE") {
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new("bridge", &native).await;
         let config = h.f.home.path().join("config.toml");
         let old = std::fs::read_to_string(&config).unwrap();
@@ -1177,7 +1177,7 @@ async fn w3_isolated_ambient_proxy_has_zero_hits_for_new_owners() {
 
 #[tokio::test]
 async fn w3_security_projection_preserves_unrelated_config_and_fences_domain_policy_changes() {
-    let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+    let native = d1_wire(|_, _| D1Reply::ok()).await;
     let h = Harness::new("delegate", &native).await;
     let source = crate::google_identity::home_source::w3_observation::SourceSnapshot::capture(
         h.f.home.path(),
@@ -1205,7 +1205,7 @@ async fn w3_security_projection_preserves_unrelated_config_and_fences_domain_pol
 #[tokio::test]
 async fn w3_immediate_final_claim_validation_rechecks_original_deadline() {
     for expired in [false, true] {
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let h = Harness::new("sa", &native).await;
         let tail =
             super::super::host_claim::immediate_tail_clock::install(h.f.home.path(), expired);
@@ -1235,7 +1235,7 @@ async fn w3_oauth_private_mono_expiry_is_enforced_at_bind_claim_and_effect() {
         rows[0]["expires_at"] =
             json!((chrono::Utc::now() + chrono::Duration::seconds(300)).to_rfc3339());
         std::fs::write(path, serde_json::to_vec(&rows).unwrap()).unwrap();
-        let native = d1_wire(|_, _| D1Reply::json(json!({}))).await;
+        let native = d1_wire(|_, _| D1Reply::ok()).await;
         let _native =
             crate::google_workspace::native_call::testing::install(f.home.path(), &native.endpoint);
         let store = SelectionStore::default();

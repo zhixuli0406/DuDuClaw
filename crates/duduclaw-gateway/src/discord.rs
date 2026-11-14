@@ -37,6 +37,9 @@ mod routing_test_transport;
 #[cfg(test)]
 #[path = "discord/routing_tests.rs"]
 mod routing_tests;
+#[cfg(test)]
+#[path = "discord/slash_gate_tests.rs"]
+mod slash_gate_tests;
 
 #[cfg(test)]
 pub(crate) fn test_sender_url(token: &str, original: &str) -> String {
@@ -1789,6 +1792,18 @@ async fn handle_message_create(
                     return;
                 }
             };
+            // A guild channel/thread is shared by its members: only a
+            // verified Admin/Manager may clear it (DMs reset as before).
+            if let Some(refusal) = crate::chat_commands::shared_reset_refusal(
+                &ctx.home_dir,
+                "discord",
+                user_id,
+                !guild_id.is_empty(),
+                &cmd,
+            ) {
+                let _ = send_discord_message(http, token, channel_id, json!({ "content": refusal })).await;
+                return;
+            }
             // Real per-channel admin status (fail-closed) — never hardcoded.
             let is_admin =
                 crate::channel_reply::is_channel_admin(ctx, "discord", &[user_id, &session_id])
@@ -2691,6 +2706,29 @@ async fn handle_component_interaction(
     let custom_id = cdata["custom_id"].as_str().unwrap_or("");
     let guild_id = data["guild_id"].as_str().unwrap_or("");
 
+    // Every non-decision component (goal-intent, new conversation, agent
+    // menu / select) passes the DuDuClaw access policy on the real presser
+    // first; MANAGE_GUILD checks below only narrow it further. Decision
+    // buttons keep their own trusted authorization path.
+    if crate::decision_action::parse(custom_id).is_none() {
+        let presser = data["member"]["user"]["id"]
+            .as_str()
+            .or_else(|| data["user"]["id"].as_str())
+            .unwrap_or("");
+        let channel_id = data["channel_id"].as_str().unwrap_or("");
+        if let Some(reply) =
+            discord_interaction_gate(ctx, app_id, guild_id, channel_id, presser, "").await
+        {
+            if reply.is_empty() {
+                send_interaction_response(http, interaction_id, interaction_token, 6, None).await;
+            } else {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(json!({ "content": reply, "flags": 64 }))).await;
+            }
+            return;
+        }
+    }
+
     // Goal-intent confirmation buttons (P1) use a separate
     // codec from `decision_action` below (see
     // `channel_format`'s "Goal-intent confirmation" module doc): wire format
@@ -2815,9 +2853,37 @@ async fn handle_component_interaction(
             } else {
                 payload.to_string()
             };
-            let msg = match ctx.session_manager.delete_session(&session_id).await {
-                Ok(()) => "✅ 已開啟新的對話".to_string(),
-                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+            let presser = data["member"]["user"]["id"]
+                .as_str()
+                .or_else(|| data["user"]["id"].as_str())
+                .unwrap_or("");
+            // Same checks as a typed `/new`: the access gate (also on the
+            // target session, which only narrows the gate above), then the
+            // rule that only a verified Admin/Manager clears a guild
+            // conversation.
+            if let Some(reply) =
+                crate::channel_reply::check_command_access_gate(ctx, &session_id, presser, "").await
+            {
+                if reply.is_empty() {
+                    send_interaction_response(http, interaction_id, interaction_token, 6, None).await;
+                } else {
+                    send_interaction_response(http, interaction_id, interaction_token, 4,
+                        Some(ephemeral(reply))).await;
+                }
+                return;
+            }
+            let msg = if crate::chat_commands::shared_clear_refused(
+                &ctx.home_dir,
+                "discord",
+                presser,
+                !guild_id.is_empty(),
+            ) {
+                crate::chat_commands::GROUP_RESET_REFUSED.to_string()
+            } else {
+                match ctx.session_manager.delete_session(&session_id).await {
+                    Ok(()) => "✅ 已開啟新的對話".to_string(),
+                    Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+                }
             };
             send_interaction_response(
                 http,
@@ -2940,6 +3006,61 @@ async fn handle_component_interaction(
     }
 }
 
+/// The access verdict for one slash command or component press, before
+/// dispatch. `None` = may run; `Some("")` = silence (blocked, or the policy
+/// could not be read/parsed); `Some(text)` = ephemeral reply (guild not
+/// authorised, pairing hint, `/pair` verdict). Reads the trusted guild /
+/// channel / user policy once, fail-closed.
+pub(crate) async fn discord_interaction_gate(
+    ctx: &ReplyContext,
+    app_id: &str,
+    guild_id: &str,
+    channel_id: &str,
+    invoker: &str,
+    text: &str,
+) -> Option<String> {
+    // Guild whitelist applies to slash commands too.
+    if !guild_id.is_empty()
+        && !ctx
+            .channel_settings
+            .is_guild_allowed("discord", guild_id)
+            .await
+    {
+        let product = crate::distributor_brand::channel_name();
+        return Some(format!("❌ 此伺服器未被授權使用 {product}"));
+    }
+    let session_id = format!("discord:{channel_id}");
+    let access = match crate::decision_notify::read_trusted_channel_access(
+        ctx,
+        &crate::approval::DecisionContext {
+            channel: "discord".into(),
+            account_id: app_id.into(),
+            conversation_id: channel_id.into(),
+            principal_id: invoker.into(),
+        },
+        crate::decision_notify::DecisionAccessScope {
+            channel_id: (!guild_id.is_empty()).then_some(channel_id),
+            guild_id: (!guild_id.is_empty()).then_some(guild_id),
+            session_id: Some(&session_id),
+        },
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(_) => {
+            crate::channel_reply::record_silent_reply(
+                &ctx.home_dir,
+                &session_id,
+                invoker,
+                "silent_by_design: access_policy_unavailable",
+            );
+            return Some(String::new());
+        }
+    };
+    crate::channel_reply::check_command_access_with_policy(ctx, &session_id, invoker, text, &access)
+        .await
+}
+
 /// Check if the member has MANAGE_GUILD permission (bit 5).
 fn has_manage_guild_permission(data: &Value) -> bool {
     const MANAGE_GUILD: u64 = 1 << 5;
@@ -2979,59 +3100,34 @@ async fn handle_slash_command(
 
     info!("Discord /{cmd_name} from [{username}] guild:{guild_id}");
 
+    // Every slash command passes the DuDuClaw access policy on the real
+    // invoking user BEFORE dispatch. Discord permissions (MANAGE_GUILD for
+    // /config and /agent) are an additional restriction checked later; they
+    // never replace this gate.
+    let ask_prompt = cmd_data["options"]
+        .as_array()
+        .and_then(|opts| opts.first())
+        .and_then(|o| o["value"].as_str())
+        .unwrap_or("");
+    let gate_text = if cmd_name == "ask" { ask_prompt } else { "" };
+    let invoker = user.and_then(|u| u["id"].as_str()).unwrap_or("");
+    if let Some(reply) =
+        discord_interaction_gate(ctx, app_id, guild_id, channel_id, invoker, gate_text).await
+    {
+        if !reply.is_empty() {
+            send_interaction_response(http, interaction_id, interaction_token, 4,
+                Some(json!({"content": reply, "flags": 64}))).await;
+        }
+        return; // blocked / unreadable policy: silence, like a message
+    }
+
     match cmd_name {
         "ask" => {
-            // Guild whitelist applies to slash commands too.
-            if !guild_id.is_empty()
-                && !ctx
-                    .channel_settings
-                    .is_guild_allowed("discord", guild_id)
-                    .await
-            {
-                let product = crate::distributor_brand::channel_name();
-                send_interaction_response(http, interaction_id, interaction_token, 4,
-                    Some(json!({"content": format!("❌ 此伺服器未被授權使用 {product}"), "flags": 64}))).await;
-                return;
-            }
-
             // Deferred response (type 5) — we'll edit it later
             send_interaction_response(http, interaction_id, interaction_token, 5, None).await;
 
-            let prompt = cmd_data["options"]
-                .as_array()
-                .and_then(|opts| opts.first())
-                .and_then(|o| o["value"].as_str())
-                .unwrap_or("");
-
+            let prompt = ask_prompt;
             let session_id = format!("discord:{channel_id}");
-            // The same access/pairing gate as the ordinary reply runs before
-            // selection errors; a missing target must not expose private state.
-            let access = match crate::decision_notify::read_trusted_channel_access(
-                ctx,
-                &crate::approval::DecisionContext {
-                    channel: "discord".into(),
-                    account_id: app_id.into(),
-                    conversation_id: channel_id.into(),
-                    principal_id: user_id.into(),
-                },
-                crate::decision_notify::DecisionAccessScope {
-                    channel_id: (!guild_id.is_empty()).then_some(channel_id),
-                    guild_id: (!guild_id.is_empty()).then_some(guild_id),
-                    session_id: Some(&session_id),
-                },
-            ).await {
-                Ok(policy) => policy,
-                Err(_) => {
-                    edit_interaction_response(http, app_id, interaction_token, &json!({"content":crate::channel_reply::SELECTED_AGENT_UNAVAILABLE}), &ctx.home_dir).await;
-                    return;
-                }
-            };
-            if let Some(reply) = crate::channel_reply::check_user_access_gate_with_policy(ctx, &session_id, user_id, prompt, &access).await {
-                if !reply.is_empty() {
-                    edit_interaction_response(http, app_id, interaction_token, &json!({"content":reply}), &ctx.home_dir).await;
-                }
-                return;
-            }
             let agent_override = match agent_selection::explicit_agent(ctx, agent_name, guild_id).await {
                 Ok(selected) => selected,
                 Err(()) => {
@@ -3269,9 +3365,21 @@ async fn handle_slash_command(
                     .await;
                 }
                 "reset" => {
-                    let msg = match ctx.session_manager.delete_session(&session_id).await {
-                        Ok(()) => format!("✅ Session `{session_id}` cleared."),
-                        Err(e) => format!("⚠️ Failed to clear session: {e}"),
+                    // Same checks as a typed `/new`: the access gate (ran
+                    // before dispatch), then only a verified Admin/Manager
+                    // clears a guild channel.
+                    let msg = if crate::chat_commands::shared_clear_refused(
+                        &ctx.home_dir,
+                        "discord",
+                        user_id,
+                        !guild_id.is_empty(),
+                    ) {
+                        crate::chat_commands::GROUP_RESET_REFUSED.to_string()
+                    } else {
+                        match ctx.session_manager.delete_session(&session_id).await {
+                            Ok(()) => format!("✅ Session `{session_id}` cleared."),
+                            Err(e) => format!("⚠️ Failed to clear session: {e}"),
+                        }
                     };
                     send_interaction_response(
                         http,

@@ -924,10 +924,10 @@ async fn process_line_events(
                         // Central access gate (pairing / allowlist / blocklist) —
                         // same enforcement the AI path applies; commands must not
                         // bypass it.
-                        if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                        if let Some(gate_reply) = crate::channel_reply::check_command_access_gate(
                             &state.ctx,
                             &session_id,
-                            sender,
+                            crate::ccr_runtime::reply_principal_for_sender(sender),
                             &input_text,
                         )
                         .await
@@ -959,6 +959,23 @@ async fn process_line_events(
                             if !messages.is_empty() {
                                 let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
                             }
+                            continue;
+                        }
+                        // A group/room session is shared by its members: only a
+                        // verified Admin/Manager may clear it (1:1 as before).
+                        let shared_chat = source
+                            .as_ref()
+                            .is_some_and(|s| s.group_id.is_some() || s.room_id.is_some());
+                        if let Some(refusal) = crate::chat_commands::shared_reset_refusal(
+                            &state.home_dir,
+                            "line",
+                            sender,
+                            shared_chat,
+                            &cmd,
+                        ) {
+                            let messages =
+                                vec![serde_json::json!({ "type": "text", "text": refusal })];
+                            let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
                             continue;
                         }
                         // Real per-channel admin status (fail-closed) — never hardcoded.
@@ -1320,6 +1337,25 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
         }
     }
 
+    // Every non-decision postback below passes the same fail-closed access
+    // gate as a typed command, on the presser (a placeholder sender counts
+    // as unknown and is denied once a policy exists).
+    let conversation = format!("line:{}", ingress::line_conversation(event));
+    if let Some(reply) = crate::channel_reply::check_command_access_gate(
+        &state.ctx,
+        &conversation,
+        crate::ccr_runtime::reply_principal_for_sender(sender),
+        "",
+    )
+    .await
+    {
+        if !reply.is_empty() {
+            let messages = vec![serde_json::json!({ "type": "text", "text": reply })];
+            let _ = send_reply_rich(&state.http, token, reply_token, messages).await;
+        }
+        return;
+    }
+
     // Goal-intent confirmation buttons (P1) use a separate codec from
     // `decision_action` above. Ordinary employees keep
     // nonce-based confirmation; machine employees require verified Admin.
@@ -1340,13 +1376,7 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
 
     // "更多" on the `@` list: the next page, filtered for this presser.
     if let Some(page) = crate::trigger_route::list::parse_line_page(data) {
-        let session_id = format!("line:{}", ingress::line_conversation(event));
-        if crate::channel_reply::check_user_access_gate(&state.ctx, &session_id, sender, "")
-            .await
-            .is_some()
-        {
-            return;
-        }
+        // The access gate ran above on this same conversation.
         let messages = trigger::list_page_messages(state, event, page).await;
         let _ = send_reply_rich(&state.http, token, reply_token, messages).await;
         return;
@@ -1363,9 +1393,33 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
             } else {
                 format!("line:{sender}")
             };
-            match state.ctx.session_manager.delete_session(&session_id).await {
-                Ok(()) => "✅ 已開啟新的對話".to_string(),
-                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+            // Same checks as a typed `/new`: the access gate first, then
+            // only a verified Admin/Manager clears a group/room.
+            if let Some(reply) = crate::channel_reply::check_command_access_gate(
+                &state.ctx,
+                &session_id,
+                crate::ccr_runtime::reply_principal_for_sender(sender),
+                "",
+            )
+            .await
+            {
+                if !reply.is_empty() {
+                    let messages = vec![serde_json::json!({ "type": "text", "text": reply })];
+                    let _ = send_reply_rich(&state.http, token, reply_token, messages).await;
+                }
+                return;
+            }
+            let shared_chat = source
+                .as_ref()
+                .is_some_and(|s| s.group_id.is_some() || s.room_id.is_some());
+            if crate::chat_commands::shared_clear_refused(&state.home_dir, "line", sender, shared_chat)
+            {
+                crate::chat_commands::GROUP_RESET_REFUSED.to_string()
+            } else {
+                match state.ctx.session_manager.delete_session(&session_id).await {
+                    Ok(()) => "✅ 已開啟新的對話".to_string(),
+                    Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+                }
             }
         }
         _ => "未知的按鈕動作".to_string(),

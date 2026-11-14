@@ -403,6 +403,8 @@ pub struct CalendarCreateResult {
     pub end: String,
     pub html_link: String,
     pub meet_link: Option<String>,
+    /// Attendees on the created event as Google returned it (0 = none).
+    pub attendees_invited: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -415,9 +417,13 @@ pub struct SheetsReadResult {
 
 #[derive(Debug, Serialize)]
 pub struct SheetsAppendResult {
+    /// Where the row went, as the service reported it (empty = not reported).
     pub updated_range: String,
-    pub updated_rows: u64,
-    pub updated_cells: u64,
+    /// Counts only when the service reported them — never assumed.
+    pub updated_rows: Option<u64>,
+    pub updated_cells: Option<u64>,
+    /// What the backend did differently from the request, if anything.
+    pub note: Option<String>,
 }
 
 // ── Forms result shapes ─────────────────────────────────────────────────────

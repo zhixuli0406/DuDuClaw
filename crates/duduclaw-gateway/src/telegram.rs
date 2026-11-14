@@ -1905,6 +1905,21 @@ async fn handle_callback_query(
         }
     }
 
+    // Every non-decision button below acts on this conversation, so it
+    // passes the same fail-closed access gate as a typed command, on the
+    // pressing user (never the shared chat id). A denied press only clears
+    // the spinner.
+    {
+        let presser = cb.from.as_ref().filter(|u| !u.is_bot).map(|u| u.id);
+        if telegram_command_gate(ctx, chat_id, thread_id, presser, "")
+            .await
+            .is_some()
+        {
+            answer_callback_query(client, api_base, &cb.id, "").await;
+            return;
+        }
+    }
+
     // Goal-intent confirmation buttons (P1) use a separate codec from
     // `decision_action` above. Ordinary employees keep
     // nonce-based confirmation; machine employees also require the pressing
@@ -1948,17 +1963,8 @@ async fn handle_callback_query(
     // goes to that employee (one-shot), after re-checking their access.
     if let Some(picked) = crate::trigger_route::list::parse_telegram_pick(data) {
         answer_callback_query(client, api_base, &cb.id, "").await;
-        let session_id = match thread_id {
-            Some(tid) => format!("telegram:{chat_id}:{tid}"),
-            None => format!("telegram:{chat_id}"),
-        };
+        let session_id = telegram_gate_session(chat_id, thread_id);
         let presser = cb.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
-        if crate::channel_reply::check_user_access_gate(ctx, &session_id, &presser, "")
-            .await
-            .is_some()
-        {
-            return;
-        }
         let text = telegram_pick(
             ctx,
             &session_id,
@@ -1973,20 +1979,27 @@ async fn handle_callback_query(
 
     let answer = match data {
         "duduclaw:new_session" => {
-            let conversation = if let Some(tid) = thread_id {
-                format!("telegram:{chat_id}:{tid}")
-            } else {
-                format!("telegram:{chat_id}")
-            };
+            let conversation = telegram_gate_session(chat_id, thread_id);
             let presser = cb.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
-            let session_id =
-                reset_target_session(ctx, &conversation, agent_name, chat_id, &presser).await;
-            match ctx.session_manager.delete_session(&session_id).await {
-                Ok(()) => {
-                    ctx.voice_failure_notices.lock().await.remove(&session_id);
-                    "✅ 已開啟新的對話".to_string()
+            // Same gate as a typed `/new`: the access gate ran above (a
+            // blocked or unpaired presser got nothing), then the group rule.
+            if crate::chat_commands::shared_clear_refused(
+                &ctx.home_dir,
+                "telegram",
+                &presser,
+                !is_private_chat_with(chat_id, &presser),
+            ) {
+                crate::chat_commands::GROUP_RESET_REFUSED.to_string()
+            } else {
+                let session_id =
+                    reset_target_session(ctx, &conversation, agent_name, chat_id, &presser).await;
+                match ctx.session_manager.delete_session(&session_id).await {
+                    Ok(()) => {
+                        ctx.voice_failure_notices.lock().await.remove(&session_id);
+                        "✅ 已開啟新的對話".to_string()
+                    }
+                    Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
                 }
-                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
             }
         }
         "duduclaw:voice_toggle" => {
@@ -2068,6 +2081,52 @@ fn reply_principal_for_sender(from_user_id: Option<i64>) -> String {
     from_user_id.map(|id| id.to_string()).unwrap_or_default()
 }
 
+/// The conversation id the access gate and the reply pipeline share.
+fn telegram_gate_session(chat_id: i64, thread_id: Option<i64>) -> String {
+    match thread_id {
+        Some(tid) => format!("telegram:{chat_id}:{tid}"),
+        None => format!("telegram:{chat_id}"),
+    }
+}
+
+/// Access verdict for a typed command or a button press: the fail-closed
+/// command gate on the human sender (`from_user_id`), with the conversation
+/// only as the session subject. `None` = may run.
+async fn telegram_command_gate(
+    ctx: &ReplyContext,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    from_user_id: Option<i64>,
+    text: &str,
+) -> Option<String> {
+    crate::channel_reply::check_command_access_gate(
+        ctx,
+        &telegram_gate_session(chat_id, thread_id),
+        &reply_principal_for_sender(from_user_id),
+        text,
+    )
+    .await
+}
+
+/// `/start <token>` onboarding stays open to unpaired users, but not to a
+/// blocked one, and not when the policy cannot be read (fail closed).
+async fn telegram_start_allowed(
+    ctx: &ReplyContext,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    from_user_id: Option<i64>,
+) -> bool {
+    let session = telegram_gate_session(chat_id, thread_id);
+    let sender = reply_principal_for_sender(from_user_id);
+    match crate::channel_reply::read_user_access_policy(ctx, "telegram").await {
+        Ok(policy) => !policy
+            .blocked
+            .iter()
+            .any(|b| (!sender.is_empty() && b == &sender) || b == &session),
+        Err(_) => false,
+    }
+}
+
 /// Handle bot commands (/ask, /status, /voice, /reset, /help).
 ///
 /// `from_user_id` is the Telegram sender's personal user id (when present)
@@ -2101,6 +2160,11 @@ async fn handle_command(
         let raw = text.split_whitespace().next().unwrap_or("");
         let base = raw.split('@').next().unwrap_or(raw);
         if base == "/start" && agent_name.is_none() {
+            // Onboarding stays open to unpaired users, but not to a blocked
+            // one, and not when the policy cannot be read (fail closed).
+            if !telegram_start_allowed(ctx, chat_id, thread_id, from_user_id).await {
+                return;
+            }
             // Split off the command token by whitespace rather than a raw byte
             // slice (coding convention #1: never index strings by byte offset —
             // safe here even with leading whitespace / multi-byte payloads).
@@ -2118,15 +2182,12 @@ async fn handle_command(
     // intercept runs BEFORE channel_reply's pipeline gate, so apply the SAME
     // gate here: unpaired/blocked users must not run /reset //undo //handoff
     // etc. (/ask is gated again inside build_reply — harmless and idempotent).
+    // The principal is the human sender, never `scope_id`: in a group that
+    // is the chat id every member shares, so a blocked member would pass.
+    // The conversation id stays only the session subject.
     {
-        let gate_session_id = if let Some(tid) = thread_id {
-            format!("telegram:{chat_id}:{tid}")
-        } else {
-            format!("telegram:{chat_id}")
-        };
         if let Some(gate_reply) =
-            crate::channel_reply::check_user_access_gate(ctx, &gate_session_id, scope_id, text)
-                .await
+            telegram_command_gate(ctx, chat_id, thread_id, from_user_id, text).await
         {
             if !gate_reply.is_empty() {
                 send_reply(
@@ -2146,8 +2207,13 @@ async fn handle_command(
     // Parse command (strip @bot_username suffix)
     let raw_cmd = text.split_whitespace().next().unwrap_or("");
     let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd);
-    // Use raw_cmd.len() to skip the full "/ask@BotName" token, not just "/ask"
-    let args = text[raw_cmd.len()..].trim();
+    // Skip the full "/ask@BotName" token by splitting on whitespace, never
+    // by a byte offset into `text`.
+    let args = text
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("");
 
     match cmd {
         "/ask" => {
@@ -2262,6 +2328,18 @@ async fn handle_command(
                 format!("telegram:{chat_id}")
             };
             let sender = from_user_id.map(|id| id.to_string()).unwrap_or_default();
+            // A group shares one session: only a verified Admin/Manager may
+            // clear it (a private chat resets its own as before).
+            if crate::chat_commands::shared_clear_refused(
+                &ctx.home_dir,
+                "telegram",
+                &sender,
+                !is_private_chat_with(chat_id, &sender),
+            ) {
+                let refusal = crate::chat_commands::GROUP_RESET_REFUSED;
+                send_reply(client, api_base, chat_id, refusal, thread_id, None, None).await;
+                return;
+            }
             let session_id =
                 reset_target_session(ctx, &conversation, agent_name, chat_id, &sender).await;
             let msg = match ctx.session_manager.delete_session(&session_id).await {
@@ -2345,6 +2423,17 @@ async fn handle_command(
                 // hardcoded. Matches the sender's personal user id, the chat
                 // id, or the full session id against `admin_users`.
                 let from_id_str = from_user_id.map(|id| id.to_string());
+                let own_sender = from_id_str.as_deref().unwrap_or("");
+                if let Some(refusal) = crate::chat_commands::shared_reset_refusal(
+                    &ctx.home_dir,
+                    "telegram",
+                    own_sender,
+                    !is_private_chat_with(chat_id, own_sender),
+                    &parsed,
+                ) {
+                    send_reply(client, api_base, chat_id, refusal, thread_id, None, None).await;
+                    return;
+                }
                 let mut identities: Vec<&str> = vec![scope_id, &session_id];
                 if let Some(fid) = from_id_str.as_deref() {
                     identities.push(fid);
@@ -4590,6 +4679,10 @@ mod f4_decision_route_tests;
 #[cfg(test)]
 #[path = "telegram_rm172_tests.rs"]
 mod rm172_primary_route_tests;
+
+#[cfg(test)]
+#[path = "telegram_access_gate_tests.rs"]
+mod access_gate_tests;
 
 #[cfg(test)]
 mod routing_text_tests {

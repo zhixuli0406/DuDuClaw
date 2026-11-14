@@ -124,8 +124,24 @@ pub fn people_for(home: &std::path::Path, users: Option<&Arc<UserDb>>) -> Box<dy
 
 const REFUSED: &str = "這個對話的發問者沒有權限透過這位 AI 員工使用 Google 帳號。";
 
+/// The next step for a Google Chat sender the gate cannot recognise (no
+/// verified binding). The raw Chat id is never printed: in a space every
+/// member would see it.
+pub(crate) const GOOGLECHAT_BIND_NEXT_STEP: &str =
+    "請管理員在儀表板「使用者」頁把你的 Google Chat 帳號綁定到你的同事帳號。";
+
 fn refused() -> Refusal {
     Refusal::hard("requester_refused", REFUSED)
+}
+
+/// [`refused`] with the next step a refused requester can act on.
+fn refused_for(requester: &RequesterIdentity) -> Refusal {
+    match requester {
+        RequesterIdentity::ChannelUser { channel, user_id: None, .. } if channel == "googlechat" => {
+            Refusal::hard("requester_refused", format!("{REFUSED}{GOOGLECHAT_BIND_NEXT_STEP}"))
+        }
+        _ => refused(),
+    }
 }
 
 /// The person a requester stands for, if any.
@@ -142,6 +158,13 @@ fn person_of(req: &RequesterIdentity) -> Option<&str> {
         } => Some(user_id.as_str()),
         _ => None,
     }
+}
+
+/// Whether `requester` stands for exactly the DuDuClaw account `user_id`
+/// (exact id equality; an unbound sender or a system turn on behalf of
+/// nobody is never that person).
+pub fn is_person(requester: &RequesterIdentity, user_id: &str) -> bool {
+    !user_id.is_empty() && person_of(requester) == Some(user_id)
 }
 
 /// Decide whether `requester` may use `account_email` through `agent`.
@@ -170,7 +193,7 @@ pub fn check(
         return Ok(());
     }
     let Some(user_id) = person_of(requester) else {
-        return Err(refused());
+        return Err(refused_for(requester));
     };
     let Some(p) = people.by_id(user_id).filter(|p| p.active) else {
         return Err(refused());
@@ -182,4 +205,55 @@ pub fn check(
         _ => p.admin || people.bound(&p.user_id, agent),
     };
     if allowed { Ok(()) } else { Err(refused()) }
+}
+
+#[cfg(test)]
+mod next_step_tests {
+    use super::*;
+
+    fn sender(channel: &str, chat: &str, user_id: Option<&str>) -> RequesterIdentity {
+        RequesterIdentity::ChannelUser {
+            channel: channel.into(),
+            chat: chat.into(),
+            sender: "users/1234567890".into(),
+            user_id: user_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unbound_google_chat_sender_is_told_how_to_get_bound_without_the_raw_id() {
+        let error = check(Requesters::BoundPeople, &sender("googlechat", "spaces/A", None), "a", "", &NoPeople)
+            .unwrap_err();
+        assert_eq!(error.code, "requester_refused");
+        assert!(error.message_zh.starts_with(REFUSED));
+        assert!(error.message_zh.ends_with(GOOGLECHAT_BIND_NEXT_STEP));
+        assert!(!error.message_zh.contains("users/"), "{}", error.message_zh);
+        assert!(!error.message_zh.contains("1234567890"));
+    }
+
+    #[test]
+    fn other_refusals_keep_their_text() {
+        for requester in [
+            sender("line", "U1", None),
+            sender("widget", "w", None),
+            sender("googlechat", "spaces/A", Some("missing-user")),
+            RequesterIdentity::Unknown,
+        ] {
+            let error = check(Requesters::BoundPeople, &requester, "a", "", &NoPeople).unwrap_err();
+            assert_eq!(error.message_zh, REFUSED, "{requester:?}");
+        }
+    }
+
+    #[test]
+    fn is_person_is_exact() {
+        let alice = sender("googlechat", "spaces/A", Some("alice"));
+        assert!(is_person(&alice, "alice"));
+        assert!(!is_person(&alice, "alic"));
+        assert!(!is_person(&alice, ""));
+        assert!(!is_person(&sender("googlechat", "spaces/A", None), "alice"));
+        assert!(!is_person(
+            &RequesterIdentity::System { kind: "cron".into(), on_behalf_of: None },
+            "alice"
+        ));
+    }
 }

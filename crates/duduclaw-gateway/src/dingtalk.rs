@@ -386,15 +386,24 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command_for_sender(
-                &cmd,
-                &state.ctx,
-                "dingtalk",
-                &session_id,
-                &agent_id,
-                &sender,
-            )
-            .await;
+            // Same access gate as the reply path (same session, same
+            // laundered sender); a group's history is cleared only by a
+            // verified Admin/Manager. An empty conversation id falls back to
+            // the sender's own session, which is one person's.
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "dingtalk",
+                gate_session: &session_id,
+                command_session: &session_id,
+                sender: crate::ccr_runtime::reply_principal_for_sender(&sender),
+                text: &text,
+                shared: is_group || (!conversation_id.is_empty() && payload
+                    .get("conversationType")
+                    .and_then(|v| v.as_str())
+                    != Some("1")),
+            };
+            let reply =
+                crate::chat_commands::handle_gated_command(&cmd, &state.ctx, &origin, &agent_id)
+                    .await;
             if !reply.trim().is_empty() {
                 send_via_webhook(&state.http, &session_webhook, &reply, false).await;
             }
