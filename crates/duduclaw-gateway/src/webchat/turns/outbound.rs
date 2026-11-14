@@ -227,6 +227,13 @@ impl TurnSink {
         self
     }
 
+    /// Same destination and route, under another source fence: a retried
+    /// frame gets a fence of its own, so its refusal or contention is its own.
+    pub(super) fn with_source(mut self, source: crate::channel_reply::ReplyDeliveryFence) -> Self {
+        if let Some(route) = self.route.as_mut() { route.source = source; }
+        self
+    }
+
     pub(in crate::webchat) fn acknowledged(mut self) -> Self {
         self.wait_ack = true;
         self

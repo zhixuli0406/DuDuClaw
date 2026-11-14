@@ -557,9 +557,15 @@ async fn deliver_with_hook(
     // authorisation write until we are done) and the edition snapshot (an
     // Enterprise→Personal downgrade does not bump the ACL generation). If
     // either moved, `tx` is dropped un-committed and the append rolls back.
+    // This path holds sessions.db's write lock while it waits for users.db —
+    // the reverse of WebChat publication. Both waits are bounded by
+    // `ACL_DELIVERY_WAIT`, so a collision fails one side closed, never hangs.
     users
         .with_acl_generation(generation, || edition.with_current(|| tx.commit()))
-        .map_err(|_| "對話擁有者的授權剛剛變更，已停止傳送".to_string())?
+        .map_err(|error| match error {
+            duduclaw_auth::AclDeliveryError::Contended => "帳號資料庫忙碌，已停止傳送，請稍後再試".to_string(),
+            _ => "對話擁有者的授權剛剛變更，已停止傳送".to_string(),
+        })?
         .map_err(|_| "對話擁有者的授權剛剛變更，已停止傳送".to_string())?
         .map_err(|_| "對話紀錄無法寫入".to_string())
 }

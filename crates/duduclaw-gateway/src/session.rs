@@ -2155,14 +2155,24 @@ impl SessionManager {
 
     /// Publish under the users.db generation lease AND the live config/registry
     /// policy locks. No await separates the final policy check and UPDATE.
+    ///
+    /// Lock order: users.db write reservation, then sessions.db's write lock.
+    /// Both waits share one `ACL_DELIVERY_WAIT` budget, counted from after the
+    /// pooled connection was acquired, so a cycle with a path holding them in
+    /// the opposite order (scheduled WebChat delivery commits its sessions.db
+    /// transaction inside the users.db lease) ends in a fail-closed
+    /// `Contended` refusal, never a hang. `Contended` means the row stayed
+    /// unpublished only because a store was busy; `Changed` is a real change.
     pub(crate) async fn publish_webchat_message(
         &self, session_id: &str, message_id: i64, users: &duduclaw_auth::UserDb,
         generation: u64, policy: &crate::webchat::access::TargetPolicy, allowed: impl FnOnce() -> bool,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, duduclaw_auth::AclDeliveryError> {
+        use duduclaw_auth::AclDeliveryError;
         let conn = self.acquire().await;
-        conn.busy_timeout(std::time::Duration::ZERO)
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let deadline = std::time::Instant::now() + duduclaw_auth::ACL_DELIVERY_WAIT;
         let result = users.with_acl_generation(generation, || {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            conn.busy_timeout(remaining).map_err(AclDeliveryError::from_sqlite)?;
             policy.with_current(|| {
                 if !allowed() { return Ok(false); }
                 conn.execute(
@@ -2170,9 +2180,13 @@ impl SessionManager {
                      WHERE id = ?1 AND session_id = ?2 AND role = 'assistant'
                        AND delivery_pending = 1 AND undone_at IS NOT NULL",
                     params![message_id, session_id],
-                ).map(|rows| rows == 1).map_err(|e| DuDuClawError::Gateway(e.to_string()))
-            }).map_err(DuDuClawError::Gateway).and_then(|result| result)
-        }).map_err(DuDuClawError::Gateway).and_then(|result| result);
+                ).map(|rows| rows == 1).map_err(AclDeliveryError::from_sqlite)
+            }).map_err(|_| AclDeliveryError::Changed).and_then(|result| result)
+        }).and_then(|result| result);
+        if matches!(result, Err(AclDeliveryError::Contended)) {
+            tracing::warn!(session_id, message_id,
+                "WebChat publication wait budget exhausted; reply left unpublished");
+        }
         if let Err(error) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
             tracing::warn!(%error, "Session connection timeout restore failed");
         }
@@ -2372,6 +2386,10 @@ impl SessionManager {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+#[path = "session_publish_tests.rs"]
+mod publish_contention_tests;
 
 #[cfg(test)]
 mod tests {

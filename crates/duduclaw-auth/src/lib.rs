@@ -20,7 +20,7 @@ pub mod invitation_content;
 mod user_row;
 
 pub use acl::UserContext;
-pub use db::UserDb;
+pub use db::{AclDeliveryError, UserDb, ACL_DELIVERY_WAIT};
 pub use jwt::JwtConfig;
 pub use models::*;
 pub use org::{EffectiveAccess, GrantSource, OrgError, OverseenReport, TeamGrant, MAX_ORG_DEPTH};

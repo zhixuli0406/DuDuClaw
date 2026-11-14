@@ -61,10 +61,22 @@ fn delegation_capture() -> &'static Mutex<HashSet<PathBuf>> {
     CAPTURE.get_or_init(Default::default)
 }
 
+fn failure_binding() -> &'static Mutex<HashSet<PathBuf>> {
+    static BINDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    BINDING.get_or_init(Default::default)
+}
+
 impl WaitingTurns {
     /// Enqueue a real row from the model seam's host-owned lineage scope.
     pub(crate) fn capture_delegations(&self) {
         delegation_capture().lock().unwrap().insert(self.home.clone());
+    }
+
+    /// Before waiting, save the question and bind the turn's failure session,
+    /// as the real pipeline does before the model runs, so a later delivery
+    /// failure can record its notice. The stub reply is unchanged.
+    pub(crate) fn bind_failure_sessions(&self) {
+        failure_binding().lock().unwrap().insert(self.home.clone());
     }
 }
 
@@ -80,6 +92,7 @@ impl Drop for WaitingTurns {
         waiting().lock().unwrap().remove(&self.home);
         armed().lock().unwrap().remove(&self.home);
         delegation_capture().lock().unwrap().remove(&self.home);
+        failure_binding().lock().unwrap().remove(&self.home);
         failures().lock().unwrap().remove(&self.home);
     }
 }
@@ -131,6 +144,11 @@ pub(crate) async fn answer(
     } else {
         None
     };
+    if failure_binding().lock().unwrap().contains(&ctx.home_dir) {
+        let session = ctx.session_manager.get_or_create(session_id, agent).await.unwrap();
+        ctx.session_manager.append_message(session_id, "user", "Hello", 1).await.unwrap();
+        crate::channel_reply::bind_failure_session(session_id, &session.created_at, agent);
+    }
     let waiter = waiting().lock().unwrap().get(&ctx.home_dir).cloned();
     if let Some(waiter) = waiter {
         let (release, released) = tokio::sync::oneshot::channel();

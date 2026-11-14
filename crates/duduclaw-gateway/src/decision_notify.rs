@@ -114,6 +114,22 @@ pub(crate) fn open_user_db(home_dir: &Path) -> Result<Option<UserDb>, String> {
     }
 }
 
+/// [`open_user_db`] for request-time lookups (per message, turn or reply):
+/// opens the existing `users.db` read-only, with no schema initialisation,
+/// no migration and no write reservation, so it never waits for, or
+/// contends with, another writer. `Ok(None)` when the file is absent; it is
+/// never created. Callers treat `None` and every error as "unknown sender".
+pub(crate) fn open_user_db_read_only(home_dir: &Path) -> Result<Option<UserDb>, String> {
+    let path = home_dir.join("users.db");
+    match std::fs::metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("identity store metadata unavailable".into()),
+        Ok(_) => UserDb::open_read_only(&path)
+            .map(Some)
+            .map_err(|_| "identity store unreadable or corrupt".into()),
+    }
+}
+
 /// New bound decisions distinguish an absent identity deployment from every
 /// database/lookup failure. A configured system never downgrades to solo mode.
 fn bound_decision_authority(

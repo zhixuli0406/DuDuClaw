@@ -369,16 +369,39 @@ pub(crate) struct ReplyDeliveryFence {
     cancel: Option<tokio_util::sync::CancellationToken>,
     guards: Vec<duduclaw_llm::CcrDeliveryGuards>,
     revoked: Arc<std::sync::atomic::AtomicBool>,
+    /// Set (with `revoked`) when the socket writer withheld a frame only
+    /// because the ACL fence's wait budget ran out: no byte was written.
+    contended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ReplyDeliveryFence {
     #[cfg(test)]
     pub(crate) fn test_live() -> Self {
-        Self { cancel: None, guards: Vec::new(), revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+        Self { cancel: None, guards: Vec::new(), revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            contended: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+    }
+
+    /// Fence for a fixed, content-free notice that holds no source lease: the
+    /// writer still applies every account, ACL generation and policy fence.
+    /// Never use it for reply content.
+    pub(crate) fn content_free() -> Self {
+        Self { cancel: None, guards: Vec::new(), revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            contended: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
     }
 
     pub(crate) fn refuse(&self) {
         self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Refuse, recording that the only cause was ACL fence contention.
+    pub(crate) fn refuse_contended(&self) {
+        self.contended.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.refuse();
+    }
+
+    /// True when a frame under this fence was withheld for contention.
+    pub(crate) fn was_contended(&self) -> bool {
+        self.contended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn for_turn(mut self, cancel: &tokio_util::sync::CancellationToken) -> Self {
@@ -406,7 +429,8 @@ impl ReplyDeliveryFence {
 
 impl GuardedReply {
     pub(crate) fn delivery_fence(&self) -> ReplyDeliveryFence {
-        ReplyDeliveryFence { cancel: None, guards: self.guards.clone(), revoked: self.revoked.clone() }
+        ReplyDeliveryFence { cancel: None, guards: self.guards.clone(), revoked: self.revoked.clone(),
+            contended: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
     }
 
     pub(super) async fn new(
@@ -600,7 +624,14 @@ impl GuardedReply {
                 Ok(())
             }
             result => {
-                if let Err(error) = result { warn!(session_id = sid, %error, "WebChat reply publication failed"); }
+                // Fail closed either way; the WebChat turn then tells the
+                // client with the fixed failure notice instead of a reply.
+                match result {
+                    Err(duduclaw_auth::AclDeliveryError::Contended) => warn!(session_id = sid,
+                        "WebChat reply publication refused: delivery wait budget exhausted"),
+                    Err(error) => warn!(session_id = sid, %error, "WebChat reply publication failed"),
+                    Ok(_) => {}
+                }
                 self.refuse_delivery();
                 Err(())
             }
