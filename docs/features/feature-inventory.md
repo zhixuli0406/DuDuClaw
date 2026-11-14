@@ -183,6 +183,17 @@
 | Channel Failure Tracking | `channel_failures.jsonl` with `FailureReason` enum (RateLimited/Billing/Timeout/BinaryMissing/SpawnError/EmptyResponse/NoAccounts/Unknown) |
 | Discord Gateway Hardening (v1.9.2) | Real op 6 RESUME — persists `session_id` + `resume_gateway_url` + sequence across reconnects; `select!` stall watchdog breaks after 2× heartbeat silence (fixes 18-min zombie); heartbeat channel capacity 1→16 with `try_send`; op 9 reads `d.bool` for RESUME vs IDENTIFY with 1-5s jitter; close codes 4007/4009/4003 clear session; backoff cap 300s→60s; handles `RESUMED` dispatch |
 
+
+### WebChat and the WordPress widget
+
+Dashboard WebChat keeps a connection dot in the conversation header: green for connected, warning for connecting/reconnecting, and error for disconnected. Its accessible label remains available on narrow screens.
+
+The WordPress widget (plugin 0.1.1) shows connection status in its header. Dropped connections retry after 1 second, doubling to a 30-second maximum, for up to 10 attempts. After that, visitors can press **Reconnect**. Returning to a visible page, coming back online, or restoring the page also reconnects.
+
+Sending without a ready connection keeps the text in the input and marks a message bubble **Not sent**. **Retry** sends it once connected; reconnecting alone never resends a message. A drop while waiting for a reply displays “Connection interrupted, the reply may not have arrived.” A subsequent reply clears that notice; reconnecting does not guarantee recovery of earlier replies. Visitor errors are generic and contain no internal details.
+
+Widget labels use the HTML page language: Chinese selects Traditional Chinese, other languages select English, and a missing `lang` defaults to Traditional Chinese. The configured title stays as supplied by the site owner. Status changes are announced to screen readers. The widget has no automated test harness and has not yet been verified in a real browser by the author.
+
 ## Evolution System
 
 > **Evolution v3 (2026-08-06) → S11 (2026-09-29)**: the evolution target moved

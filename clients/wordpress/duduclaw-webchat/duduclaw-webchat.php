@@ -3,7 +3,7 @@
  * Plugin Name: DuDuClaw WebChat Widget
  * Plugin URI:  https://github.com/zhixuli0406/DuDuClaw
  * Description: 在你的網站加一顆聊天泡泡，訪客直接跟你自架 DuDuClaw gateway 上的 AI 員工對話。只連你自己設定的 gateway，無任何第三方服務、無遙測。
- * Version:     0.1.0
+ * Version:     0.1.1
  * Author:      Dudu Technology Ltd.
  * Author URI:  https://github.com/zhixuli0406
  * License:     GPLv2 or later
@@ -139,7 +139,7 @@ add_action('wp_enqueue_scripts', function () {
         'duduclaw-webchat',
         plugins_url('widget.js', __FILE__),
         array(),
-        '0.1.0',
+        '0.1.1',
         true
     );
     wp_localize_script('duduclaw-webchat', 'DUDUCLAW_WC', array(
@@ -149,6 +149,6 @@ add_action('wp_enqueue_scripts', function () {
         'position' => $o['position'],
     ));
     wp_enqueue_script('duduclaw-webchat');
-    wp_register_style('duduclaw-webchat', plugins_url('widget.css', __FILE__), array(), '0.1.0');
+    wp_register_style('duduclaw-webchat', plugins_url('widget.css', __FILE__), array(), '0.1.1');
     wp_enqueue_style('duduclaw-webchat');
 });
