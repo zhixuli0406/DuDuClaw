@@ -74,33 +74,30 @@ pub(crate) fn agent_notify_target(home_dir: &Path, agent_id: &str) -> Option<(St
 /// `pub(crate)`: also reused by `skill_gap_digest` (WP2.6 P1), which pushes to
 /// the same `[proactive]` destination with the same token cascade.
 ///
-/// Self-configuring channels (`wecom`/`dingtalk`/`googlechat`/`teams`, see
-/// [`crate::channel_sender::sender_self_configures`]) never have a
-/// `<channel>_bot_token`-shaped value — their senders pull multi-field
-/// credentials (service-account JSON, app id/password, corpid+corpsecret)
-/// straight from `home_dir` at send time, always globally (there is no
-/// per-agent scoping for these four: `googlechat.rs`/`msteams.rs`/`wecom.rs`/
-/// `dingtalk.rs` all read `config.toml` directly, never `agent.toml`). Both
-/// branches below therefore missed them entirely — the `reports_to` cascade
-/// walks `agent.toml [channels.<ch>] bot_token`, which these channels never
-/// populate, and `otp_delivery::token_field` returns `None` for all four, so
-/// `channel_token` short-circuited to `None` and every caller (`notify_agent_
-/// plain`, `notify_goal_needs_human`, `notify_goal_observer`, `notify_goal_
-/// kickoff`, `notify_goal_progress`) silently reported `NotifyOutcome::
-/// NoTarget` for an agent whose `[proactive]` destination WAS one of these
-/// four channels, even when the channel was fully configured. The correct
-/// "is there a token" question for these four is "is the marker field set"
-/// (mirrors `cron_scheduler.rs::deliver_cron_result`'s identical check). The
-/// returned placeholder is never read as a real token: every caller either
-/// routes through [`send_plain_text`] (dispatches these four via their
-/// dedicated constructors, ignoring the token) or `decision_notify::
-/// deliver_now` (no button codec exists for any of the four, so it degrades
-/// to the same plain-text path).
+/// Self-configuring senders load their credentials at send time. Google
+/// Chat supports the sending employee's own app and the verified space
+/// roster as well as the shared app; the preflight follows that selection.
+pub(crate) async fn channel_token_for_target(
+    home: &Path, agent: &str, channel: &str, chat: &str,
+) -> Option<String> {
+    if channel == "googlechat" {
+        return crate::agent_channels::gchat_spaces::has_sending_app(home, Some(agent), chat)
+            .await.then(String::new);
+    }
+    channel_token(home, agent, channel).await
+}
+
 pub(crate) async fn channel_token(
     home_dir: &Path,
     agent_id: &str,
     channel: &str,
 ) -> Option<String> {
+    if channel == "googlechat" {
+        let space = agent_notify_target(home_dir, agent_id)
+            .filter(|(ch, _)| ch == channel).map(|(_, chat)| chat).unwrap_or_default();
+        return crate::agent_channels::gchat_spaces::has_sending_app(home_dir, Some(agent_id), &space)
+            .await.then(String::new);
+    }
     if crate::channel_sender::sender_self_configures(channel) {
         let marker = crate::channel_sender::self_config_marker_field(channel)?;
         let present =
@@ -195,6 +192,7 @@ pub async fn notify_agent_plain(
                 no_button_hint: None,
                 decision_source: None,
                 decision_id: None,
+                origin_proof: None,
             },
         );
         return if queued {
@@ -206,12 +204,12 @@ pub async fn notify_agent_plain(
         };
     }
 
-    let Some(token) = channel_token(home_dir, agent_id, &channel).await else {
+    let Some(token) = channel_token_for_target(home_dir, agent_id, &channel, &chat_id).await else {
         info!(agent = %agent_id, %channel, "agent-notify: no bot token; skipping push");
         return NotifyOutcome::NoTarget;
     };
     let http = reqwest::Client::new();
-    if crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, text).await {
+    if send_goal_text(home_dir, &http, agent_id, &channel, &token, &chat_id, text).await {
         crate::notify_stats::record_push(home_dir, notify_type, level, None);
         NotifyOutcome::Sent
     } else {
@@ -319,6 +317,23 @@ pub(crate) fn takeover_defer(
     text: &str,
     decision: Option<(DecisionSource, &str, Option<&str>, &str)>,
 ) -> Option<NotifyOutcome> {
+    takeover_defer_proven(home_dir, agent_id, channel, chat_id, level, notify_type, text, decision, None)
+}
+
+/// [`takeover_defer`] for a verified turn-origin destination: the queued copy
+/// carries `origin_proof`, so the drainer re-verifies it before delivery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn takeover_defer_proven(
+    home_dir: &Path,
+    agent_id: &str,
+    channel: &str,
+    chat_id: &str,
+    level: NotifyLevel,
+    notify_type: &str,
+    text: &str,
+    decision: Option<(DecisionSource, &str, Option<&str>, &str)>,
+    origin_proof: Option<&str>,
+) -> Option<NotifyOutcome> {
     let rec = crate::takeover::target_record(home_dir, channel, chat_id)?;
     crate::takeover::log_skip("goal_notify", channel, chat_id, notify_type);
     let (kind, decision_source, decision_id, link, hint) = match decision {
@@ -354,6 +369,7 @@ pub(crate) fn takeover_defer(
             no_button_hint: hint,
             decision_source,
             decision_id,
+            origin_proof: origin_proof.map(str::to_owned),
         },
     );
     // A failed queue write is reported as a send failure so the caller's own
@@ -377,6 +393,121 @@ fn task_source_target(task: &TaskRow) -> Option<(String, String)> {
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
     Some((channel.to_string(), chat_id.to_string()))
+}
+
+/// Where a goal push goes after the H3 origin gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GoalTarget {
+    /// Deliver to this conversation. `proof` is the opaque id of the verified
+    /// gateway origin proof of an AI-created source, carried onto any
+    /// deferred copy so the queue re-checks the record at delivery time.
+    Send { channel: String, chat_id: String, proof: Option<String> },
+    /// No source conversation and no `[proactive]` destination.
+    Nothing,
+    /// The source conversation was refused: Activity Feed only, never a
+    /// fallback to the `[proactive]` channel or any other conversation.
+    Refused(crate::recipient_guard::origin::OriginDenial),
+}
+
+/// H3: the fire-time gate for a goal's stored source conversation, run before
+/// every push. Public-visitor and WebChat conversations are refused for every
+/// goal. An AI-created goal (it carries an origin proof, or was created by
+/// an employee — `created_via = "agent"`) must pass the shared
+/// [`crate::recipient_guard::origin::verify`]; without a proof it is refused.
+/// Sources stamped by a human entry point (`/goal`, chat assignment, a
+/// scheduled assignment) keep their pre-existing behaviour. `Ok` carries the
+/// verified proof (if any).
+pub(crate) fn source_admission(
+    home_dir: &Path, task: &TaskRow, channel: &str, chat_id: &str,
+) -> Result<Option<String>, crate::recipient_guard::origin::OriginDenial> {
+    use crate::recipient_guard::origin::{self, OriginDenial};
+    if origin::refused_conversation(channel, chat_id) {
+        return Err(OriginDenial::PublicVisitor);
+    }
+    let ai_created = task.source_origin_proof.is_some() || task.created_via.as_deref() == Some("agent");
+    if !ai_created {
+        return Ok(None);
+    }
+    let recipient = duduclaw_core::recipient_policy::channel_recipient(channel, chat_id)
+        .ok_or(OriginDenial::ProofInvalid)?;
+    origin::verify(home_dir, &task.assigned_to, &recipient, task.source_origin_proof.as_deref())
+        .map(|_| task.source_origin_proof.clone())
+}
+
+/// The destination of a goal push: the source conversation (gated by
+/// [`source_admission`]) or, only when the goal has no source at all, the
+/// assigned employee's `[proactive]` destination.
+pub(crate) fn goal_target(home_dir: &Path, task: &TaskRow) -> GoalTarget {
+    if let Some((channel, chat_id)) = task_source_target(task) {
+        return match source_admission(home_dir, task, &channel, &chat_id) {
+            Ok(proof) => GoalTarget::Send { channel, chat_id, proof },
+            Err(denial) => {
+                crate::recipient_guard::origin::audit_refusal(home_dir, &task.assigned_to, "goal", &task.id, denial);
+                GoalTarget::Refused(denial)
+            }
+        };
+    }
+    match agent_notify_target(home_dir, &task.assigned_to) {
+        Some((channel, chat_id)) => GoalTarget::Send { channel, chat_id, proof: None },
+        None => GoalTarget::Nothing,
+    }
+}
+
+/// H3: a deferred notice queued for a proven turn-origin conversation
+/// carries the goal's opaque proof id and is re-verified against the
+/// gateway's record when the queue delivers it. A queued goal decision card
+/// fails closed: it must name its task (`decision_id`) and that task must
+/// still exist (a deleted goal's card is dropped, never sent with its old
+/// content); a card carrying a proof id must carry its task's own id, and a
+/// card without one is re-checked against the task's source gate when it is
+/// addressed to that source. A refusal drops the notice (it already left the
+/// queue) with an audit row; it is never re-routed. Any other notice is
+/// unaffected.
+pub(crate) async fn deferred_origin_allowed(
+    home_dir: &Path, notice: &crate::notify_governance::DeferredNotice,
+) -> bool {
+    use crate::recipient_guard::origin::{self, OriginDenial};
+    let verify_proof = |proof: &str| {
+        duduclaw_core::recipient_policy::channel_recipient(&notice.channel, &notice.chat_id)
+            .ok_or(OriginDenial::ProofInvalid)
+            .and_then(|recipient| origin::verify(home_dir, &notice.agent_id, &recipient, Some(proof)).map(|_| ()))
+    };
+    let goal_card = notice.kind == crate::notify_governance::NoticeKind::Decision
+        && notice.decision_source.as_deref() == Some(DecisionSource::Goal.token());
+    let verdict = if goal_card {
+        match notice.decision_id.as_deref().filter(|id| !id.is_empty()) {
+            None => Err(OriginDenial::NoProof),
+            Some(task_id) => match TaskStore::open(home_dir) {
+                Err(_) => Err(OriginDenial::Unreadable),
+                Ok(store) => match store.get_task(task_id).await {
+                    Err(_) => Err(OriginDenial::Unreadable),
+                    // The goal is gone: nothing can prove this card's origin.
+                    Ok(None) => Err(OriginDenial::NoProof),
+                    Ok(Some(task)) => match notice.origin_proof.as_deref() {
+                        Some(proof) if task.source_origin_proof.as_deref() != Some(proof) =>
+                            Err(OriginDenial::ProofInvalid),
+                        Some(proof) => verify_proof(proof),
+                        None => match task_source_target(&task) {
+                            Some((channel, chat)) if channel == notice.channel && chat == notice.chat_id =>
+                                source_admission(home_dir, &task, &channel, &chat).map(|_| ()),
+                            _ => Ok(()),
+                        },
+                    },
+                },
+            },
+        }
+    } else if let Some(proof) = notice.origin_proof.as_deref() {
+        verify_proof(proof)
+    } else {
+        return true;
+    };
+    match verdict {
+        Ok(()) => true,
+        Err(denial) => {
+            origin::audit_refusal(home_dir, &notice.agent_id, "deferred_notice", &notice.id, denial);
+            false
+        }
+    }
 }
 
 /// Render the zh-TW one-to-three-line progress line for a phase transition.
@@ -453,10 +584,9 @@ pub async fn notify_goal_progress(
     task: &TaskRow,
     progress: GoalProgress,
 ) -> NotifyOutcome {
-    let Some((channel, chat_id)) =
-        task_source_target(task).or_else(|| agent_notify_target(home_dir, &task.assigned_to))
-    else {
-        // No source and no [proactive] destination — Activity-only, silent.
+    // H3: the source conversation is re-verified before every push; a
+    // refusal (like no destination at all) leaves only the Activity Feed row.
+    let GoalTarget::Send { channel, chat_id, proof } = goal_target(home_dir, task) else {
         return NotifyOutcome::NoTarget;
     };
     // V-M-10: a chat is not a dashboard identity; a task limited to an
@@ -467,7 +597,7 @@ pub async fn notify_goal_progress(
         crate::goal_notify_private::private_progress_body(task, &progress)
     };
     // W3-1 D5: never narrate progress into a conversation a human is running.
-    if let Some(out) = takeover_defer(
+    if let Some(out) = takeover_defer_proven(
         home_dir,
         &task.assigned_to,
         &channel,
@@ -476,15 +606,16 @@ pub async fn notify_goal_progress(
         "goal.progress",
         &text,
         None,
+        proof.as_deref(),
     ) {
         return out;
     }
-    let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
+    let Some(token) = channel_token_for_target(home_dir, &task.assigned_to, &channel, &chat_id).await else {
         info!(task = %task.id, %channel, "goal-progress: no bot token; skipping push");
         return NotifyOutcome::NoTarget;
     };
     let http = reqwest::Client::new();
-    if crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await {
+    if send_goal_text(home_dir, &http, &task.assigned_to, &channel, &token, &chat_id, &text).await {
         NotifyOutcome::Sent
     } else {
         NotifyOutcome::SendFailed
@@ -754,10 +885,16 @@ fn render_trajectory_reply(raw: &str) -> Option<String> {
 /// destination" config gap (mark notified, no point retrying) from a
 /// transient send failure (worth retrying next tick).
 pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyOutcome {
-    let Some((channel, chat_id)) = agent_notify_target(home_dir, &task.assigned_to) else {
-        info!(task = %task.id, agent = %task.assigned_to,
-              "goal-notify: agent has no [proactive] notify destination; skipping push");
-        return NotifyOutcome::NoTarget;
+    // H3: same source gate as every other goal push; a refusal never falls
+    // back to the [proactive] destination.
+    let (channel, chat_id, proof) = match goal_target(home_dir, task) {
+        GoalTarget::Send { channel, chat_id, proof } => (channel, chat_id, proof),
+        GoalTarget::Refused(_) => return NotifyOutcome::NoTarget,
+        GoalTarget::Nothing => {
+            info!(task = %task.id, agent = %task.assigned_to,
+                  "goal-notify: agent has no [proactive] notify destination; skipping push");
+            return NotifyOutcome::NoTarget;
+        }
     };
     // V-M-10: limited task ⇒ no buttons, no reason, no trajectory (which
     // would cost a model call over the private work); decide on the dashboard.
@@ -765,7 +902,7 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
         let link =
             crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
         let text = crate::goal_notify_private::private_decision_notice(task, link.as_deref());
-        return send_private_notice(home_dir, task, &channel, &chat_id, "goal.needs_human", &text)
+        return send_private_notice(home_dir, task, &channel, &chat_id, "goal.needs_human", &text, proof.as_deref())
             .await;
     }
     // W3-1 D5: checked BEFORE the trajectory LLM call — a card that is going
@@ -776,7 +913,7 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
         let body = needs_human_body(task, None, &channel);
         let link =
             crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
-        if let Some(out) = takeover_defer(
+        if let Some(out) = takeover_defer_proven(
             home_dir,
             &task.assigned_to,
             &channel,
@@ -790,6 +927,7 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
                 link.as_deref(),
                 NEEDS_HUMAN_NO_BUTTON_HINT,
             )),
+            proof.as_deref(),
         ) {
             return out;
         }
@@ -797,7 +935,7 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
     // Probe the token before paying for the trajectory LLM call below: a
     // destination with no reachable bot is `NoTarget`, not a send failure,
     // and rendering a card for it would be wasted spend.
-    if channel_token(home_dir, &task.assigned_to, &channel)
+    if channel_token_for_target(home_dir, &task.assigned_to, &channel, &chat_id)
         .await
         .is_none()
     {
@@ -820,18 +958,25 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
         link: link.as_deref(),
         no_button_hint: NEEDS_HUMAN_NO_BUTTON_HINT,
     };
+    // The trajectory model call above can take a while: re-prove a
+    // turn-origin destination immediately before the actual send.
+    if proof.is_some() && !matches!(goal_target(home_dir, task), GoalTarget::Send { .. }) {
+        return NotifyOutcome::NoTarget;
+    }
     push_goal_card(
         home_dir,
         &card,
         &task.assigned_to,
         channel,
         chat_id,
+        proof.as_deref(),
     )
     .await
 }
 
 /// A content-free plain notice (V-M-10), with the same takeover deferral as
-/// the other goal pushes.
+/// the other goal pushes. `proof` is the verified origin proof of the
+/// destination (if any), carried onto a deferred copy.
 async fn send_private_notice(
     home_dir: &Path,
     task: &TaskRow,
@@ -839,8 +984,9 @@ async fn send_private_notice(
     chat_id: &str,
     kind: &str,
     text: &str,
+    proof: Option<&str>,
 ) -> NotifyOutcome {
-    if let Some(out) = takeover_defer(
+    if let Some(out) = takeover_defer_proven(
         home_dir,
         &task.assigned_to,
         channel,
@@ -849,14 +995,15 @@ async fn send_private_notice(
         kind,
         text,
         None,
+        proof,
     ) {
         return out;
     }
-    let Some(token) = channel_token(home_dir, &task.assigned_to, channel).await else {
+    let Some(token) = channel_token_for_target(home_dir, &task.assigned_to, channel, chat_id).await else {
         return NotifyOutcome::NoTarget;
     };
     let http = reqwest::Client::new();
-    if crate::channel_sender::send_plain_text(home_dir, &http, channel, &token, chat_id, text).await
+    if send_goal_text(home_dir, &http, &task.assigned_to, channel, &token, chat_id, text).await
     {
         NotifyOutcome::Sent
     } else {
@@ -876,11 +1023,13 @@ async fn push_goal_card(
     agent_id: &str,
     channel: String,
     chat_id: String,
+    origin_proof: Option<&str>,
 ) -> NotifyOutcome {
-    let receipt = crate::notify_push::push(
+    let receipt = crate::notify_push::push_guarded(
         home_dir,
         card,
         &crate::notify_push::NotifyDest::agent(agent_id, channel, chat_id),
+        origin_proof,
     )
     .await;
     if receipt.attempted == 0 {
@@ -896,14 +1045,18 @@ async fn push_goal_card(
 /// Push a text-only needs_human notice (no buttons) — used for `Observer`
 /// autonomy, where the loop does not wait for a human. Best-effort.
 pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &str) -> bool {
-    let Some((channel, chat_id)) = agent_notify_target(home_dir, &task.assigned_to) else {
-        return false;
+    // H3: gated like every goal push. A refused source is final (nothing to
+    // retry, never another conversation); no destination keeps `false`.
+    let (channel, chat_id, proof) = match goal_target(home_dir, task) {
+        GoalTarget::Send { channel, chat_id, proof } => (channel, chat_id, proof),
+        GoalTarget::Refused(_) => return true,
+        GoalTarget::Nothing => return false,
     };
     if !crate::goal_notify_private::channel_may_carry(home_dir, &task.id, &channel) {
         let link =
             crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
         let text = crate::goal_notify_private::private_decision_notice(task, link.as_deref());
-        return send_private_notice(home_dir, task, &channel, &chat_id, "goal.observer", &text)
+        return send_private_notice(home_dir, task, &channel, &chat_id, "goal.observer", &text, proof.as_deref())
             .await
             != NotifyOutcome::SendFailed;
     }
@@ -931,7 +1084,7 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
     );
     // W3-1 D5: same family as the other two goal pushes — deferred to the
     // handback rather than landing while a human runs the conversation.
-    if let Some(out) = takeover_defer(
+    if let Some(out) = takeover_defer_proven(
         home_dir,
         &task.assigned_to,
         &channel,
@@ -940,14 +1093,15 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
         "goal.observer",
         &text,
         None,
+        proof.as_deref(),
     ) {
         return out != NotifyOutcome::SendFailed;
     }
-    let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
+    let Some(token) = channel_token_for_target(home_dir, &task.assigned_to, &channel, &chat_id).await else {
         return false;
     };
     let http = reqwest::Client::new();
-    crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
+    send_goal_text(home_dir, &http, &task.assigned_to, &channel, &token, &chat_id, &text).await
 }
 
 /// Render the zh-TW kickoff approval body. `trajectory` is the optional D2
@@ -1090,7 +1244,7 @@ pub async fn notify_goal_kickoff(
     // Same pre-render probe as `notify_goal_needs_human`: the kickoff
     // trajectory below is an LLM call, and a destination with no bot token
     // must not pay for it.
-    if channel_token(home_dir, agent_id, &channel).await.is_none() {
+    if channel_token_for_target(home_dir, agent_id, &channel, &chat_id).await.is_none() {
         return NotifyOutcome::NoTarget;
     }
     let trajectory = build_kickoff_trajectory(home_dir, approval_id).await;
@@ -1111,7 +1265,9 @@ pub async fn notify_goal_kickoff(
         link: link.as_deref(),
         no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁同意或拒絕。",
     };
-    push_goal_card(home_dir, &card, agent_id, channel, chat_id).await
+    // The kickoff card only ever goes to the employee's own `[proactive]`
+    // destination (never a turn origin), so there is no origin proof to carry.
+    push_goal_card(home_dir, &card, agent_id, channel, chat_id, None).await
 }
 
 /// The destinations a goal decision's card was pushed to — the assigned
@@ -3205,4 +3361,205 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].kind, crate::notify_governance::NoticeKind::Plain);
     }
+}
+
+/// H3: every goal push to a stored source conversation goes through the
+/// shared origin gate — progress, needs-human, observer and the deferred
+/// queue — and a refusal never falls back to another conversation.
+#[cfg(test)]
+mod origin_gate_tests {
+    use super::*;
+    use crate::recipient_guard::origin::{OriginDenial, tests::fixture};
+
+    fn hold(home: &Path, channel: &str, chat_id: &str) {
+        duduclaw_core::takeover_state::begin(
+            home,
+            &duduclaw_core::takeover_state::BeginRequest {
+                conversation: format!("{channel}:{chat_id}"),
+                agent_id: "alice".into(),
+                holder_user_id: "555".into(),
+                holder_display: "王小明".into(),
+            },
+            &duduclaw_core::takeover_state::TakeoverConfig::default(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    }
+
+    fn after_handback() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+            + chrono::Duration::minutes(duduclaw_core::takeover_state::DEFAULT_DURATION_MINUTES + 1)
+    }
+
+    fn ai_goal(channel: &str, chat_id: &str) -> TaskRow {
+        let mut t = TaskRow::new("ai-goal".into(), "月報".into(), "整理月報".into(), "medium".into(),
+            "alice".into(), "alice".into());
+        t.goal_mode = true;
+        t.created_via = Some("agent".into());
+        t.source_channel = Some(channel.into());
+        t.source_chat_id = Some(chat_id.into());
+        t
+    }
+
+    /// Every conversation a push could reach is held by a human, so any
+    /// attempted push (source or fallback) would be queued: an empty queue
+    /// proves nothing was attempted anywhere.
+    fn seed_fallback_and_holds(home: &Path) {
+        let dir = home.join("agents").join("alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"),
+            "[proactive]\nnotify_channel = \"telegram\"\nnotify_chat_id = \"777\"\n").unwrap();
+        hold(home, "telegram", "777");
+        hold(home, "telegram", "12345");
+    }
+
+    // (d) AI-created goal without a proof: every push path is refused and
+    // nothing is attempted at the [proactive] fallback either.
+    #[tokio::test]
+    async fn unproven_ai_goal_pushes_nowhere_on_any_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        seed_fallback_and_holds(home);
+        let mut task = ai_goal("telegram", "12345");
+        assert_eq!(goal_target(home, &task), GoalTarget::Refused(OriginDenial::NoProof));
+        assert_eq!(notify_goal_progress(home, &task, GoalProgress::Done).await, NotifyOutcome::NoTarget);
+        task.status = "needs_human".into();
+        assert_eq!(notify_goal_needs_human(home, &task).await, NotifyOutcome::NoTarget);
+        assert!(notify_goal_observer(home, &task, "已放棄").await, "a refusal is final, not retried");
+        assert!(crate::notify_governance::take_due(home, after_handback()).is_empty());
+        let audit = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap();
+        assert!(audit.contains("origin_unproven"));
+    }
+
+    // (d) A proven source is pushed (here: deferred by a takeover) with the
+    // proof on the queued copy; the drainer re-verifies it at delivery.
+    #[tokio::test]
+    async fn proven_source_is_reverified_when_the_deferred_copy_drains() {
+        let f = fixture("alice").await;
+        let home = f.home.path();
+        hold(home, "googlechat", "spaces/ORIGIN");
+        let mut task = ai_goal("googlechat", "spaces/ORIGIN");
+        task.source_origin_proof = Some(f.proof.clone());
+        assert!(matches!(goal_target(home, &task), GoalTarget::Send { ref proof, .. } if proof.is_some()));
+        assert_eq!(notify_goal_progress(home, &task, GoalProgress::Reviewing).await, NotifyOutcome::Deferred);
+        let due = crate::notify_governance::take_due(home, after_handback());
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].origin_proof.as_deref(), Some(f.proof.as_str()));
+        assert!(deferred_origin_allowed(home, &due[0]).await);
+        duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap()
+            .unbind_channel_identity("googlechat", crate::recipient_guard::origin::tests::SENDER).unwrap();
+        assert!(!deferred_origin_allowed(home, &due[0]).await, "identity revoked while queued");
+        assert_eq!(goal_target(home, &task), GoalTarget::Refused(OriginDenial::IdentityUnbound));
+    }
+
+    // (d) A queued goal decision card (task id, no proof on the row) is
+    // re-checked against the task's source gate at delivery.
+    #[tokio::test]
+    async fn queued_goal_card_for_an_unproven_source_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let task = ai_goal("telegram", "12345");
+        TaskStore::open(home).unwrap().insert_task(&task).await.unwrap();
+        let card = |channel: &str, chat: &str| crate::notify_governance::DeferredNotice {
+            id: "n".into(), agent_id: "alice".into(), channel: channel.into(), chat_id: chat.into(),
+            level: "L3".into(), notify_type: "goal.needs_human".into(),
+            queued_at: chrono::Utc::now().to_rfc3339(), deliver_after: chrono::Utc::now().to_rfc3339(),
+            kind: crate::notify_governance::NoticeKind::Decision, text: "card".into(), link: None,
+            no_button_hint: None, decision_source: Some(DecisionSource::Goal.token().into()),
+            decision_id: Some(task.id.clone()), origin_proof: None,
+        };
+        assert!(!deferred_origin_allowed(home, &card("telegram", "12345")).await);
+        assert!(deferred_origin_allowed(home, &card("telegram", "777")).await, "not addressed to the source");
+    }
+
+    // M: a queued goal decision card fails closed when its task was deleted
+    // or when it names no task at all — for human goals too.
+    #[tokio::test]
+    async fn queued_goal_card_whose_task_is_gone_or_unnamed_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut human = ai_goal("telegram", "777");
+        human.created_via = None;
+        human.created_by = "goal:telegram".into();
+        let store = TaskStore::open(home).unwrap();
+        store.insert_task(&human).await.unwrap();
+        let card = |decision_id: Option<&str>| crate::notify_governance::DeferredNotice {
+            id: "n".into(), agent_id: "alice".into(), channel: "telegram".into(), chat_id: "777".into(),
+            level: "L3".into(), notify_type: "goal.needs_human".into(),
+            queued_at: chrono::Utc::now().to_rfc3339(), deliver_after: chrono::Utc::now().to_rfc3339(),
+            kind: crate::notify_governance::NoticeKind::Decision, text: "old card content".into(), link: None,
+            no_button_hint: None, decision_source: Some(DecisionSource::Goal.token().into()),
+            decision_id: decision_id.map(str::to_owned), origin_proof: None,
+        };
+        assert!(deferred_origin_allowed(home, &card(Some(&human.id))).await, "control: a live human goal keeps its card");
+        assert!(!deferred_origin_allowed(home, &card(None)).await, "no decision_id");
+        assert!(!deferred_origin_allowed(home, &card(Some(""))).await, "empty decision_id");
+        assert!(store.remove_task(&human.id).await.unwrap());
+        assert!(!deferred_origin_allowed(home, &card(Some(&human.id))).await, "task deleted");
+        let audit = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap();
+        assert!(audit.contains("origin_unproven"));
+    }
+
+    // A queued goal card with a proof id must carry its own task's id, and
+    // a deleted task's queued copies die with its proof record.
+    #[tokio::test]
+    async fn queued_goal_card_proof_must_be_its_tasks_and_dies_with_the_task() {
+        let f = fixture("alice").await;
+        let home = f.home.path();
+        let mut task = ai_goal("googlechat", "spaces/ORIGIN");
+        task.source_origin_proof = Some(f.proof.clone());
+        let store = TaskStore::open(home).unwrap();
+        store.insert_task(&task).await.unwrap();
+        let card = |proof: &str| crate::notify_governance::DeferredNotice {
+            id: "n".into(), agent_id: "alice".into(), channel: "googlechat".into(), chat_id: "spaces/ORIGIN".into(),
+            level: "L3".into(), notify_type: "goal.needs_human".into(),
+            queued_at: chrono::Utc::now().to_rfc3339(), deliver_after: chrono::Utc::now().to_rfc3339(),
+            kind: crate::notify_governance::NoticeKind::Decision, text: "card".into(), link: None,
+            no_button_hint: None, decision_source: Some(DecisionSource::Goal.token().into()),
+            decision_id: Some(task.id.clone()), origin_proof: Some(proof.to_owned()),
+        };
+        assert!(deferred_origin_allowed(home, &card(&f.proof)).await);
+        let h = home;
+        let other = crate::recipient_guard::origin::tests::insert_for_test(h,
+            crate::recipient_guard::origin::tests::draft(h, "alice", crate::recipient_guard::origin::tests::RECIPIENT,
+                crate::recipient_guard::origin::tests::SESSION, &f.user));
+        assert!(!deferred_origin_allowed(home, &card(&other)).await, "a valid id of another job");
+        // A plain progress copy of the same goal is refused once the record is gone.
+        let mut plain = card(&f.proof);
+        plain.kind = crate::notify_governance::NoticeKind::Plain;
+        plain.decision_source = None;
+        plain.decision_id = None;
+        assert!(deferred_origin_allowed(home, &plain).await);
+        crate::recipient_guard::origin::forget(home, &[f.proof.clone()]);
+        assert!(!deferred_origin_allowed(home, &plain).await, "proof record deleted with the goal");
+    }
+
+    // (e) Public-visitor and WebChat sources are refused for every goal,
+    // including human-entry ones that need no proof.
+    #[tokio::test]
+    async fn public_visitor_sources_are_refused_for_every_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        for (channel, chat) in [("odoolivechat", "visitor-1"), ("widget", "v"), ("webchat", "webchat:widget-visitor:1")] {
+            let mut task = ai_goal(channel, chat);
+            task.created_via = None;
+            task.created_by = "goal:telegram".into();
+            assert_eq!(goal_target(home, &task), GoalTarget::Refused(OriginDenial::PublicVisitor), "{channel}");
+        }
+        // A human `/goal` source keeps its pre-existing behaviour.
+        let mut human = ai_goal("telegram", "12345");
+        human.created_via = None;
+        human.created_by = "goal:telegram".into();
+        assert!(matches!(goal_target(home, &human), GoalTarget::Send { proof: None, .. }));
+    }
+}
+
+async fn send_goal_text(
+    home: &Path, http: &reqwest::Client, agent: &str, channel: &str, token: &str, chat: &str, text: &str,
+) -> bool {
+    if channel == "googlechat" {
+        if crate::product_policy::require_channel(home, channel).is_err() { return false; }
+        return crate::googlechat::send_text_to_space_as(home, Some(agent), chat, text).await.is_ok();
+    }
+    crate::channel_sender::send_plain_text(home, http, channel, token, chat, text).await
 }

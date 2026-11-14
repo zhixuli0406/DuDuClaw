@@ -744,7 +744,11 @@ fn handle(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let valid = match op {
-        "query" | "recipients" => request.source.is_none() && request.reservation.is_none() && request.payload.is_none(),
+        "query" => request.source.is_none() && request.reservation.is_none() && request.payload.is_none(),
+        // `payload: true` asks for a schedule context: the gateway mints its
+        // own origin proof records and answers with their opaque ids only.
+        "recipients" => request.source.is_none() && request.reservation.is_none()
+            && request.payload.is_none_or(|mint| mint),
         "mark" => request.source.as_deref().is_some_and(valid_source) && request.reservation.is_none() && request.payload.is_none(),
         "reserve" => request.source.as_deref().is_some_and(valid_source) && request.payload.is_none(),
         "finish" => request.source.is_none() && request.payload.is_some(),
@@ -790,7 +794,7 @@ fn handle(
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let value = if op == "recipients" {
-        match crate::recipient_guard::context(&state.home, &caller.agent_id, &request.turn_id) {
+        match crate::recipient_guard::context(&state.home, &caller.agent_id, &request.turn_id, request.payload == Some(true)) {
             Ok(context) => serde_json::json!(context),
             Err(error) => serde_json::json!({"error": error}),
         }
@@ -865,7 +869,7 @@ pub(crate) fn isolated_exchange(home: &Path, agent: &str, turn: &str, op: &str,
         return Err("invalid isolated ledger request".into());
     }
     if op == "recipients" {
-        return crate::recipient_guard::context(home, agent, turn)
+        return crate::recipient_guard::context(home, agent, turn, payload == Some(true))
             .map(|context| serde_json::json!(context));
     }
     let remote = remote_server.filter(|_| op == "mark")

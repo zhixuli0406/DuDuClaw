@@ -94,7 +94,7 @@ pub fn notify_type(source: DecisionSource) -> &'static str {
 pub(crate) fn is_pushable_channel(channel: &str) -> bool {
     matches!(
         channel,
-        "telegram" | "slack" | "discord" | "line" | "whatsapp" | "feishu" | "googlechat" | "teams"
+        "telegram" | "slack" | "discord" | "line" | "whatsapp" | "feishu" | "googlechat" | "teams" | "wecom" | "dingtalk"
     )
 }
 
@@ -335,7 +335,8 @@ pub(crate) fn refusal_text(auth: PressAuth, subject: &str) -> String {
 /// with the `<type>:thread:<id>` marker collapsing to `<id>`. Returns `None`
 /// for a malformed value or a non-pushable transport (webchat, dashboard, …) —
 /// the caller then falls through to the next link in the chain.
-pub(crate) fn parse_origin(reply_channel: &str) -> Option<(String, String)> {
+pub fn parse_origin(reply_channel: &str) -> Option<(String, String)> {
+    if reply_channel.len() > 512 || reply_channel.chars().any(char::is_control) { return None; }
     // An employee bucket (`#agent:`) is not part of the chat id (B11).
     let rc = duduclaw_core::session_conversation(reply_channel.trim());
     let parts: Vec<&str> = rc.splitn(3, ':').collect();
@@ -343,7 +344,7 @@ pub(crate) fn parse_origin(reply_channel: &str) -> Option<(String, String)> {
         return None;
     }
     let channel = parts[0].trim();
-    if !is_pushable_channel(channel) {
+    if !duduclaw_core::SUPPORTED_CHANNEL_TYPES.contains(&channel) || !is_pushable_channel(channel) {
         return None;
     }
     let chat_id = if parts.len() == 3 && parts[1] == "thread" {
@@ -459,6 +460,23 @@ pub(crate) async fn deliver_outcome(
     chat_id: &str,
     card: &DecisionCard<'_>,
 ) -> DeliverOutcome {
+    deliver_outcome_as(home_dir, http, channel, token, chat_id, card, None).await
+}
+
+pub(crate) async fn deliver_outcome_as(
+    home_dir: &Path, http: &reqwest::Client, channel: &str, token: &str,
+    chat_id: &str, card: &DecisionCard<'_>, sender: Option<&str>,
+) -> DeliverOutcome {
+    deliver_outcome_guarded(home_dir, http, channel, token, chat_id, card, sender, None).await
+}
+
+/// [`deliver_outcome_as`] for a verified turn-origin destination: a deferred
+/// copy carries `origin_proof` so the drainer re-verifies it at delivery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn deliver_outcome_guarded(
+    home_dir: &Path, http: &reqwest::Client, channel: &str, token: &str,
+    chat_id: &str, card: &DecisionCard<'_>, sender: Option<&str>, origin_proof: Option<&str>,
+) -> DeliverOutcome {
     let level = notify_level(card.source);
     // Cards addressed to a specific agent would ideally use that agent's
     // quiet hours; a `DecisionCard` carries no agent id, so the deployment
@@ -475,7 +493,7 @@ pub(crate) async fn deliver_outcome(
             home_dir,
             crate::notify_governance::DeferredNotice {
                 id: uuid::Uuid::new_v4().to_string(),
-                agent_id: String::new(),
+                agent_id: sender.unwrap_or("").to_string(),
                 channel: channel.to_string(),
                 chat_id: chat_id.to_string(),
                 level: level.as_str().to_string(),
@@ -488,6 +506,7 @@ pub(crate) async fn deliver_outcome(
                 no_button_hint: Some(card.no_button_hint.to_string()),
                 decision_source: Some(card.source.token().to_string()),
                 decision_id: Some(card.decision_id.to_string()),
+                origin_proof: origin_proof.map(str::to_owned),
             },
         );
         return if queued {
@@ -496,7 +515,7 @@ pub(crate) async fn deliver_outcome(
             DeliverOutcome::Failed
         };
     }
-    if deliver_now(home_dir, http, channel, token, chat_id, card).await {
+    if deliver_now_as(home_dir, http, channel, token, chat_id, card, sender).await {
         crate::notify_stats::record_push(
             home_dir,
             notify_type(card.source),
@@ -524,6 +543,13 @@ pub(crate) async fn deliver_now(
     token: &str,
     chat_id: &str,
     card: &DecisionCard<'_>,
+) -> bool {
+    deliver_now_as(home_dir, http, channel, token, chat_id, card, None).await
+}
+
+pub(crate) async fn deliver_now_as(
+    home_dir: &Path, http: &reqwest::Client, channel: &str, token: &str,
+    chat_id: &str, card: &DecisionCard<'_>, sender: Option<&str>,
 ) -> bool {
     // D-S1: a Telegram private-chat approval card also gets a `web_app`
     // button opening the Mini App detail view. `None` in every other case —
@@ -616,6 +642,10 @@ pub(crate) async fn deliver_now(
                         false
                     }
                 };
+            }
+            if channel == "googlechat" {
+                if crate::product_policy::require_channel(home_dir, channel).is_err() { return false; }
+                return crate::googlechat::send_text_to_space_as(home_dir, sender, chat_id, &text).await.is_ok();
             }
             crate::channel_sender::send_plain_text(home_dir, http, channel, token, chat_id, &text)
                 .await
@@ -875,6 +905,8 @@ mod tests {
 
     #[test]
     fn parse_origin_rejects_non_pushable_and_malformed() {
+        assert_eq!(parse_origin("googlechat:spaces/X\n"), None);
+        assert_eq!(parse_origin("googlechat:"), None);
         assert_eq!(parse_origin("webchat:conn-1"), None);
         assert_eq!(parse_origin("webchat:conn#agent:a#conv:n"), None);
         assert_eq!(parse_origin("dashboard:alice"), None);
@@ -2056,5 +2088,15 @@ mod bounded_execution_tests {
         })
         .await
         .unwrap();
+    }
+}
+
+/// Human-readable destination names for schedule receipts.
+pub fn channel_display_name(channel: &str) -> &str {
+    match channel {
+        "googlechat" => "Google Chat", "telegram" => "Telegram", "slack" => "Slack",
+        "discord" => "Discord", "line" => "LINE", "whatsapp" => "WhatsApp",
+        "feishu" => "飛書", "teams" => "Microsoft Teams", "wecom" => "企業微信",
+        "dingtalk" => "釘釘", _ => "聊天通道",
     }
 }

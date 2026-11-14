@@ -90,6 +90,23 @@ pub struct CronTaskRow {
     /// Last dashboard employee who activated or edited this job.
     #[serde(default)]
     pub scoped_by_user_id: Option<String>,
+    #[serde(default)]
+    pub notify_sender: Option<String>,
+    #[serde(default)]
+    pub notify_origin: Option<String>,
+    #[serde(default)]
+    pub last_delivery_status: Option<String>,
+    #[serde(default)]
+    pub last_delivery_reason: Option<String>,
+    /// Opaque id of the gateway-held proof of the human behind
+    /// `notify_origin` ([`crate::recipient_guard::origin`]); the tuple lives
+    /// only in the gateway's `sessions.db` and is re-verified by id before
+    /// every delivery. `None` ⇒ a delivery to `notify_origin` is refused
+    /// (`origin_unproven`). v1.81 WebChat rows get one from the gateway's
+    /// startup backfill when their creator still passes the live checks.
+    /// Never serialized out.
+    #[serde(default, skip_serializing)]
+    pub notify_origin_proof: Option<String>,
 }
 
 /// serde default for [`CronTaskRow::trigger_kind`].
@@ -126,6 +143,11 @@ impl CronTaskRow {
             on_behalf_of: None,
             created_by_user_id: None,
             scoped_by_user_id: None,
+            notify_sender: None,
+            notify_origin: None,
+            last_delivery_status: None,
+            last_delivery_reason: None,
+            notify_origin_proof: None,
         }
     }
 
@@ -135,6 +157,12 @@ impl CronTaskRow {
             && matches!(&self.notify_chat_id, Some(id) if !id.is_empty())
     }
 }
+
+/// Notification outcome is independent of the employee execution outcome.
+/// `Refused` carries the closed reason code of a fire-time refusal (e.g.
+/// [`crate::recipient_guard::origin::OriginDenial::code`]).
+#[derive(Debug, Clone, Copy)]
+pub enum DeliveryOutcome { Delivered, Failed, Refused(&'static str) }
 
 /// Persistent, thread-safe cron task store.
 pub struct CronStore {
@@ -357,6 +385,11 @@ impl CronStore {
             "on_behalf_of",
             "created_by_user_id",
             "scoped_by_user_id",
+            "notify_sender",
+            "notify_origin",
+            "last_delivery_status",
+            "last_delivery_reason",
+            "notify_origin_proof",
         ] {
             let sql = format!("ALTER TABLE cron_tasks ADD COLUMN {col} TEXT");
             if let Err(e) = conn.execute(&sql, []) {
@@ -393,7 +426,7 @@ impl CronStore {
         let sql = format!("SELECT id, name, agent_id, cron, task, enabled,
             created_at, updated_at, last_run_at, last_status, last_error, run_count, failure_count,
             notify_channel, notify_chat_id, notify_thread_id, cron_timezone, trigger_kind,
-            condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id FROM cron_tasks
+            condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id, notify_sender, notify_origin, last_delivery_status, last_delivery_reason, notify_origin_proof FROM cron_tasks
             WHERE agent_id=? AND (?=0 OR enabled=1) AND id IN ({placeholders}) ORDER BY created_at ASC");
         let mut values = vec![rusqlite::types::Value::Text(agent.to_owned()),
             rusqlite::types::Value::Integer(i64::from(enabled_only))];
@@ -415,7 +448,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id, notify_sender, notify_origin, last_delivery_status, last_delivery_reason, notify_origin_proof
                  FROM cron_tasks
                  ORDER BY created_at ASC",
             )
@@ -438,7 +471,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id, notify_sender, notify_origin, last_delivery_status, last_delivery_reason, notify_origin_proof
                  FROM cron_tasks
                  WHERE enabled = 1
                  ORDER BY created_at ASC",
@@ -462,7 +495,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id, notify_sender, notify_origin, last_delivery_status, last_delivery_reason, notify_origin_proof
                  FROM cron_tasks WHERE id = ?1",
                 params![id],
                 row_to_cron_task,
@@ -482,7 +515,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id, notify_sender, notify_origin, last_delivery_status, last_delivery_reason, notify_origin_proof
                  FROM cron_tasks WHERE name = ?1 LIMIT 1",
                 params![name],
                 row_to_cron_task,
@@ -519,7 +552,7 @@ impl CronStore {
         let current = tx.query_row(
             "SELECT id,name,agent_id,cron,task,enabled,created_at,updated_at,last_run_at,last_status,last_error,
              run_count,failure_count,notify_channel,notify_chat_id,notify_thread_id,cron_timezone,
-             trigger_kind,condition_script,condition_state,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id FROM cron_tasks WHERE id=?1",
+             trigger_kind,condition_script,condition_state,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id, notify_sender, notify_origin, last_delivery_status, last_delivery_reason, notify_origin_proof FROM cron_tasks WHERE id=?1",
             params![expected.id], row_to_cron_task,
         ).optional().map_err(|e| e.to_string())?;
         let Some(current) = current else { return Ok(false) };
@@ -549,7 +582,7 @@ impl CronStore {
         conn.query_row(
             "SELECT id,name,agent_id,cron,task,enabled,created_at,updated_at,last_run_at,last_status,last_error,
              run_count,failure_count,notify_channel,notify_chat_id,notify_thread_id,cron_timezone,
-             trigger_kind,condition_script,condition_state,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id
+             trigger_kind,condition_script,condition_state,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id, notify_sender, notify_origin, last_delivery_status, last_delivery_reason, notify_origin_proof
              FROM cron_tasks WHERE id=?1", params![id], row_to_cron_task,
         ).optional().map_err(|e| e.to_string())
     }
@@ -559,7 +592,8 @@ impl CronStore {
         conn.execute(
             "UPDATE cron_tasks SET name=?2,agent_id=?3,cron=?4,task=?5,enabled=?6,
              notify_channel=?7,notify_chat_id=?8,notify_thread_id=?9,cron_timezone=?10,
-             trigger_kind=?11,condition_script=?12,watch_command=?13,on_behalf_of=?14,updated_at=?15 WHERE id=?1",
+             trigger_kind=?11,condition_script=?12,watch_command=?13,on_behalf_of=?14,updated_at=?15,notify_origin=CASE WHEN agent_id=?3 THEN notify_origin ELSE NULL END,
+             notify_origin_proof=CASE WHEN agent_id=?3 THEN notify_origin_proof ELSE NULL END WHERE id=?1",
             params![row.id,row.name,row.agent_id,row.cron,row.task,row.enabled,row.notify_channel,
                 row.notify_chat_id,row.notify_thread_id,row.cron_timezone,row.trigger_kind,
                 row.condition_script,row.watch_command,row.on_behalf_of,Utc::now().to_rfc3339()],
@@ -742,6 +776,18 @@ impl CronStore {
         success: bool,
         error: Option<&str>,
     ) -> Result<(), String> {
+        self.record_run_with_delivery(id, success, error, None).await
+    }
+
+    pub async fn record_run_with_delivery(
+        &self, id: &str, success: bool, error: Option<&str>, delivery: Option<DeliveryOutcome>,
+    ) -> Result<(), String> {
+        let (delivery_status, delivery_reason) = match delivery {
+            Some(DeliveryOutcome::Delivered) => (Some("delivered"), None),
+            Some(DeliveryOutcome::Failed) => (Some("delivery_failed"), Some("notification_delivery_failed")),
+            Some(DeliveryOutcome::Refused(code)) => (Some("delivery_refused"), Some(code)),
+            None => (None, None),
+        };
         let now = Utc::now().to_rfc3339();
         let status = if success { "success" } else { "failure" };
         let mut guard = self.conn.lock().await;
@@ -751,10 +797,12 @@ impl CronStore {
              SET last_run_at = ?2,
                  last_status = ?3,
                  last_error = ?4,
+                 last_delivery_status = ?6,
+                 last_delivery_reason = ?7,
                  run_count = run_count + 1,
                  failure_count = failure_count + CASE WHEN ?5 = 1 THEN 0 ELSE 1 END
              WHERE id = ?1",
-            params![id, now, status, error, if success { 1 } else { 0 }],
+            params![id, now, status, error, if success { 1 } else { 0 }, delivery_status, delivery_reason],
         )
         .map_err(|e| format!("record_run: {e}"))?;
         commit_write(conn)?;
@@ -883,6 +931,11 @@ impl CronStore {
                 on_behalf_of: None,
                 created_by_user_id: None,
                 scoped_by_user_id: None,
+                notify_sender: None,
+                notify_origin: None,
+                last_delivery_status: None,
+                last_delivery_reason: None,
+                notify_origin_proof: None,
                 trigger_kind: value
                     .get("trigger_kind")
                     .and_then(|v| v.as_str())
@@ -978,6 +1031,11 @@ pub(crate) fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cron
         on_behalf_of: row.get(21)?,
         created_by_user_id: row.get(22)?,
         scoped_by_user_id: row.get(23)?,
+        notify_sender: row.get(24)?,
+        notify_origin: row.get(25)?,
+        last_delivery_status: row.get(26)?,
+        last_delivery_reason: row.get(27)?,
+        notify_origin_proof: row.get(28)?,
     })
 }
 
@@ -1322,9 +1380,9 @@ fn insert_cron_row(conn:&Connection,row:&CronTaskRow)->Result<(),String> {
                  run_count, failure_count,
                  notify_channel, notify_chat_id, notify_thread_id,
                  cron_timezone,
-                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id)
+                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id, notify_sender, notify_origin, last_delivery_status, last_delivery_reason, notify_origin_proof)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 row.id,
                 row.name,
@@ -1350,6 +1408,12 @@ fn insert_cron_row(conn:&Connection,row:&CronTaskRow)->Result<(),String> {
                 row.on_behalf_of,
                 row.created_by_user_id,
                 row.scoped_by_user_id,
+                row.notify_sender,
+                row.notify_origin,
+                row.last_delivery_status,
+                row.last_delivery_reason,
+                // A proof only ever accompanies its origin.
+                row.notify_origin.as_ref().and(row.notify_origin_proof.as_ref()),
             ],
         )
         .map_err(|e| format!("insert cron task: {e}"))?;
@@ -1439,5 +1503,64 @@ mod isolation_tests {
             assert!(store.list_isolated("alice", &["task".into()], false).await.is_err());
             assert!(CronStore::open(home.path()).is_err());
         }).await;
+    }
+}
+
+#[cfg(test)]
+mod channel_delivery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn existing_database_gets_origin_sender_and_delivery_columns() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = Connection::open(home.path().join("cron_tasks.db")).unwrap();
+        conn.execute_batch(include_str!("../../duduclaw-import/src/cron-v180.sql")).unwrap();
+        conn.execute_batch("INSERT INTO cron_tasks(id,name,agent_id,cron,task,created_at,updated_at)
+            VALUES('old','Old','sales','0 9 * * *','report','then','then');").unwrap();
+        drop(conn);
+        let store = CronStore::open(home.path()).unwrap();
+        let old = store.get("old").await.unwrap().unwrap();
+        assert!(old.notify_sender.is_none() && old.notify_origin.is_none() && old.last_delivery_status.is_none());
+        let mut row = CronTaskRow::new("new".into(), "New".into(), "sales".into(), "0 9 * * *".into(), "report".into());
+        row.notify_sender = Some("sales".into());
+        row.notify_origin = Some("googlechat:spaces/ORIGIN".into());
+        store.insert(&row).await.unwrap();
+        store.record_run_with_delivery("new", true, None, Some(DeliveryOutcome::Failed)).await.unwrap();
+        drop(store);
+        let store = CronStore::open(home.path()).unwrap();
+        let row = store.get("new").await.unwrap().unwrap();
+        assert_eq!(row.notify_sender.as_deref(), Some("sales"));
+        assert_eq!(row.notify_origin.as_deref(), Some("googlechat:spaces/ORIGIN"));
+        assert_eq!(row.last_status.as_deref(), Some("success"));
+        assert_eq!(row.last_delivery_status.as_deref(), Some("delivery_failed"));
+        store.record_run_with_delivery("new", true, None, Some(DeliveryOutcome::Delivered)).await.unwrap();
+        let row = store.list_all().await.unwrap().into_iter().find(|r| r.id == "new").unwrap();
+        assert_eq!(row.last_delivery_status.as_deref(), Some("delivered"));
+        assert!(row.last_delivery_reason.is_none());
+        store.record_run_with_delivery("new", true, None, Some(DeliveryOutcome::Refused("origin_access_revoked"))).await.unwrap();
+        let row = store.get("new").await.unwrap().unwrap();
+        assert_eq!(row.last_delivery_status.as_deref(), Some("delivery_refused"));
+        assert_eq!(row.last_delivery_reason.as_deref(), Some("origin_access_revoked"));
+        assert!(old.notify_origin_proof.is_none(), "legacy rows carry no origin proof");
+    }
+
+    #[tokio::test]
+    async fn origin_proof_round_trips_never_serializes_and_drops_with_owner_change() {
+        let home = tempfile::tempdir().unwrap();
+        let store = CronStore::open(home.path()).unwrap();
+        let mut row = CronTaskRow::new("p".into(), "P".into(), "sales".into(), "0 9 * * *".into(), "report".into());
+        row.notify_origin = Some("googlechat:spaces/ORIGIN".into());
+        row.notify_origin_proof = Some("{\"v\":1}".into());
+        store.insert(&row).await.unwrap();
+        let mut orphan = CronTaskRow::new("q".into(), "Q".into(), "sales".into(), "0 9 * * *".into(), "report".into());
+        orphan.notify_origin_proof = Some("{\"v\":1}".into());
+        store.insert(&orphan).await.unwrap();
+        assert!(store.get("q").await.unwrap().unwrap().notify_origin_proof.is_none(), "no proof without an origin");
+        let got = store.get("p").await.unwrap().unwrap();
+        assert_eq!(got.notify_origin_proof.as_deref(), Some("{\"v\":1}"));
+        assert!(serde_json::to_value(&got).unwrap().get("notify_origin_proof").is_none());
+        store.update_fields("p", "P", "hr", "0 9 * * *", "report", true).await.unwrap();
+        let moved = store.get("p").await.unwrap().unwrap();
+        assert!(moved.notify_origin.is_none() && moved.notify_origin_proof.is_none());
     }
 }

@@ -410,6 +410,7 @@ async fn create_run(
                 on_behalf_of: Some(principal),
                 created_via: Some(row.created_via.clone()),
                 source,
+                source_origin_proof: None,
                 task_id: Some(task_id.to_string()),
                 grant_via: Some(via.to_string()),
                 a2a_owner: None,

@@ -594,17 +594,22 @@ mod tests {
         drop(crate::channel_settings::ChannelSettingsManager::from_session_db(&path).unwrap());
         let actual=Connection::open(path).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        // Fresh stores are the newest known catalog (v1.81: v1.80.x plus the RM-173
-        // archive_reason/user_cleared_at columns and the session_migrations marker
-        // table); session-v1793/-v180.sql pin older releases.
+        // Fresh stores are the newest known catalog (v1.82: the fresh v1.81 shape —
+        // v1.80.x plus the RM-173 archive_reason/user_cleared_at columns and the
+        // session_migrations marker table — plus the gateway-owned origin proof
+        // table); session-v1793/-v180/-v181.sql pin older releases.
         expected.execute_batch(include_str!("../../duduclaw-import/src/session-v181.sql")).unwrap();
+        expected.execute_batch(include_str!("../../duduclaw-import/src/session-origin-proofs-v182.sql")).unwrap();
         expected.execute_batch(include_str!("../../duduclaw-import/src/channel-settings-v1793.sql")).unwrap();
+        // The pinned text is the gateway's own schema.
+        assert!(include_str!("../../duduclaw-import/src/session-origin-proofs-v182.sql")
+            .contains(crate::recipient_guard::origin::SCHEMA));
         assert_eq!(schema(&actual),schema(&expected));
 
         drop(crate::cron_store::CronStore::open(home.path()).unwrap());
         let actual=Connection::open(home.path().join("cron_tasks.db")).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        expected.execute_batch(include_str!("../../duduclaw-import/src/cron-v180.sql")).unwrap();
+        expected.execute_batch(include_str!("../../duduclaw-import/src/cron-v182.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
 
         drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());
@@ -639,8 +644,10 @@ mod tests {
             schema(&conn)
         }
         let channel=include_str!("../../duduclaw-import/src/channel-settings-v1793.sql");
-        let upgraded=catalog(&[include_str!("../../duduclaw-import/src/session-v181-upgraded.sql"),channel]);
-        let fresh=catalog(&[include_str!("../../duduclaw-import/src/session-v181.sql"),channel]);
+        // v1.82 adds the origin proof table on every start, fresh or upgraded.
+        let proofs=include_str!("../../duduclaw-import/src/session-origin-proofs-v182.sql");
+        let upgraded=catalog(&[include_str!("../../duduclaw-import/src/session-v181-upgraded.sql"),proofs,channel]);
+        let fresh=catalog(&[include_str!("../../duduclaw-import/src/session-v181.sql"),proofs,channel]);
         for (release,start) in [("v1.80.x",include_str!("../../duduclaw-import/src/session-v180.sql")),
             ("v1.79.3",include_str!("../../duduclaw-import/src/session-v1793.sql"))] {
             let home=tempfile::tempdir().unwrap();

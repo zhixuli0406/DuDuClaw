@@ -110,6 +110,20 @@ pub fn app_for_space(home: &Path, space: &str) -> Option<SpaceApp> {
     pick(load(home).get(space.trim()))
 }
 
+/// Preflight mirrors the sender's app selection. A configured app may still
+/// fail credential loading or delivery; that error must reach the caller.
+pub async fn has_sending_app(home: &Path, sender: Option<&str>, space: &str) -> bool {
+    if sender.is_some_and(|id| crate::agent_channels::store::agent_has_googlechat_section(home, id)) {
+        return true;
+    }
+    match app_for_space(home, space) {
+        Some(SpaceApp::Agent(id)) => crate::agent_channels::store::agent_has_googlechat_section(home, &id),
+        Some(SpaceApp::Shared) | None => crate::config_crypto::read_encrypted_config_field(
+            home, "channels", "googlechat_service_account_json",
+        ).await.is_some_and(|value| !value.trim().is_empty()),
+    }
+}
+
 fn pick(members: Option<&BTreeMap<String, i64>>) -> Option<SpaceApp> {
     let (member, _) = members?
         .iter()
@@ -159,5 +173,23 @@ mod tests {
         );
         record(h, "not-a-space", Some("sales"));
         assert_eq!(load(h).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod sending_app_tests {
+    use super::*;
+    #[tokio::test]
+    async fn employee_app_and_space_roster_work_without_global_app() {
+        let home = tempfile::tempdir().unwrap(); let h = home.path();
+        std::fs::create_dir_all(h.join("agents/sales")).unwrap();
+        std::fs::write(h.join("agents/sales/agent.toml"), "[agent]\nname='sales'\n[channels.googlechat]\nproject_number='123'\nservice_account_json='marker-only'\n").unwrap();
+        assert!(has_sending_app(h, Some("sales"), "spaces/OWN").await);
+        assert!(!has_sending_app(h, None, "spaces/OWN").await);
+        record(h, "spaces/OWN", Some("sales"));
+        assert!(has_sending_app(h, None, "spaces/OWN").await);
+        assert!(crate::channel_sender::resolve_channel_target(h, "googlechat", "spaces/OWN").await.is_ok());
+        assert!(crate::goal_notify::channel_token_for_target(h, "sales", "googlechat", "spaces/OWN").await.is_some());
+        assert!(!has_sending_app(h, None, "spaces/OTHER").await);
     }
 }

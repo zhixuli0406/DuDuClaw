@@ -17,11 +17,29 @@ pub(crate) const SESSION_V1793: &str = include_str!("session-v1793.sql");
 pub(crate) const SESSION_V180: &str = include_str!("session-v180.sql");
 pub(crate) const SESSION_V181: &str = include_str!("session-v181.sql");
 pub(crate) const SESSION_V181_UPGRADED: &str = include_str!("session-v181-upgraded.sql");
+/// v1.82 sessions.db = the v1.81 shape it started from plus the
+/// gateway-owned `schedule_origin_proofs` table (a separate object, so it is
+/// the same text on a fresh and on an upgraded store).
+#[cfg(test)]
+pub(crate) const SESSION_ORIGIN_PROOFS_V182: &str = include_str!("session-origin-proofs-v182.sql");
+pub(crate) const SESSION_V182: &str = concat!(include_str!("session-v181.sql"), include_str!("session-origin-proofs-v182.sql"));
+pub(crate) const SESSION_V182_UPGRADED: &str =
+    concat!(include_str!("session-v181-upgraded.sql"), include_str!("session-origin-proofs-v182.sql"));
 pub(crate) const TASKS_V1793: &str = include_str!("tasks-v1793.sql");
 pub(crate) const TASKS_V180: &str = include_str!("tasks-v180.sql");
 pub(crate) const TASKS_V181: &str = include_str!("tasks-v181.sql");
+/// v1.82 tasks.db = v1.81 plus one additive, nullable column (the opaque id
+/// of the gateway-held origin proof of an AI-created goal's source
+/// conversation; the proof itself lives in sessions.db). `ALTER TABLE …
+/// ADD COLUMN` appends to the stored `CREATE TABLE` text wherever it runs, so
+/// appending it to the v1.81 catalog yields the exact fresh-store schema.
+pub(crate) const TASKS_V182: &str = concat!(
+    include_str!("tasks-v181.sql"),
+    "ALTER TABLE tasks ADD COLUMN source_origin_proof TEXT;\n"
+);
 pub(crate) const CRON_V1793: &str = include_str!("cron-v1793.sql");
 pub(crate) const CRON_V180: &str = include_str!("cron-v180.sql");
+pub(crate) const CRON_V182: &str = include_str!("cron-v182.sql");
 pub(crate) const MEMORY_V1793: &str = include_str!("memory-v1793.sql");
 pub(crate) const MEMORY_V180: &str = include_str!("memory-v180.sql");
 pub(crate) const APPROVALS_V1793: &str = include_str!("approvals-v1793.sql");
@@ -69,14 +87,24 @@ impl Catalog {
 // both a user clear and the inactivity task set `archived_at`, so the
 // V1793/V180 readers import an archived conversation only when the shared
 // legacy rule classifies it as an inactivity archive.
-static SESSIONS: [Catalog; 4] = [Catalog::new(SchemaVersion::V1793, SESSION_V1793), Catalog::new(SchemaVersion::V180, SESSION_V180),
-    Catalog::new(SchemaVersion::V181, SESSION_V181), Catalog::new(SchemaVersion::V181, SESSION_V181_UPGRADED)];
+// Sessions v1.82 = either v1.81 shape plus the gateway-owned
+// `schedule_origin_proofs` table, which the reader never reads (its
+// authorizer denies it), so both map as V181.
+static SESSIONS: [Catalog; 6] = [Catalog::new(SchemaVersion::V1793, SESSION_V1793), Catalog::new(SchemaVersion::V180, SESSION_V180),
+    Catalog::new(SchemaVersion::V181, SESSION_V181), Catalog::new(SchemaVersion::V181, SESSION_V181_UPGRADED),
+    Catalog { version: SchemaVersion::V181, sql: SESSION_V182, label: "v1.82" },
+    Catalog { version: SchemaVersion::V181, sql: SESSION_V182_UPGRADED, label: "v1.82" }];
 // Tasks: the v1.81 catalog is the v1.80.x one plus the `task_store_markers`
 // table of the goal-creator backfill. It has no readable content for the
 // importer (the authorizer denies that table), so it maps as V180.
-static TASKS: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, TASKS_V1793), Catalog::new(SchemaVersion::V180, TASKS_V180),
-    Catalog { version: SchemaVersion::V180, sql: TASKS_V181, label: "v1.81" }];
-static CRON: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, CRON_V1793), Catalog::new(SchemaVersion::V180, CRON_V180)];
+// Tasks v1.82 adds `tasks.source_origin_proof`, routing provenance the reader
+// never selects or imports, so it also maps as V180.
+static TASKS: [Catalog; 4] = [Catalog::new(SchemaVersion::V1793, TASKS_V1793), Catalog::new(SchemaVersion::V180, TASKS_V180),
+    Catalog { version: SchemaVersion::V180, sql: TASKS_V181, label: "v1.81" },
+    Catalog { version: SchemaVersion::V180, sql: TASKS_V182, label: "v1.82" }];
+// v1.82 adds routing provenance and delivery state, never imported as authority.
+static CRON: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, CRON_V1793), Catalog::new(SchemaVersion::V180, CRON_V180),
+    Catalog { version: SchemaVersion::V180, sql: CRON_V182, label: "v1.82" }];
 // Memory and approvals: the newest catalog adds only an index (memory) and two
 // decision-lease columns (approvals) that neither reader is authorized to read.
 static MEMORY: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, MEMORY_V1793), Catalog::new(SchemaVersion::V180, MEMORY_V180)];

@@ -439,3 +439,15 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 `mail_send` 沿用收件人與資料外送防護。已驗證且目前有該員工 Operator 操作權限的交辦人，僅可在一對一對話或已登入的儀表板 WebChat 確認完整收件人、主旨與內文摘要；不符資格時由儀表板 Admin 決定。核准綁定最終參數，只能用一次，逾期視為拒絕。`[security] mail_requester_approval = false` 恢復僅 Admin 核准；預設 `true`，但設定無法讀取或格式錯誤時採拒絕此例外。詳見[資格與限制](../../features/zh-TW/05-security-defense.md#寄信由交辦人在原對話確認)。群組對話與未知聊天類型仍須儀表板 Admin 核准，公開 WebChat 小工具訪客不適用。不符資格的通道通知不含收件人、主旨或內文，完整內容只留在儀表板。
 
 此確認只放行對外資料閘門。原生郵件工具仍會建立既有的寄件匣草稿確認；通過此閘門不代表郵件已寄出。
+
+### MCP 排程與提醒的通知對象
+
+從支援的聊天通道建立例行排程（`tasks_create` 搭配 cron `schedule`）、一次性排程或提醒（`create_reminder`）時，只要由同一位 AI 員工執行、對話中的使用者是 gateway 在該回合確認過的已綁定帳號，且沒有另填通知對象，結果就會回到**建立時的那個對話**。對話由 gateway 依進行中的回合解析並記錄，MCP 工具沒有讓員工選擇對話的參數，因此沒有 Bash 的員工無法把排程的預設通知導向其他對話。已授予 Bash 的員工與 gateway 以同一個 OS 使用者執行，可讀寫 gateway 的本機資料庫；對這類員工而言，這是減速帶，不是隔離。目前的因應方式是不給不該有 Bash 的員工 Bash、使用任務沙箱，或使用原生 Linux 員工隔離；詳見[這些守衛擋不住什麼](../../features/zh-TW/05-security-defense.md#這些守衛擋不住什麼)。支援 Google Chat、Telegram、LINE、Discord、Slack、WhatsApp、飛書、Microsoft Teams、企業微信與釘釘。WebChat 仍將結果存回對話紀錄，重新開啟即可查看。
+
+另填成對欄位時，優先使用指定對象：排程為 `notify_channel`／`notify_chat_id`，提醒為 `channel`／`chat_id`。無法確認來源對話時，例行工作只保留執行紀錄；提醒與一次性排程仍須指定目的地。透過 `tasks_create kind=goal` 建立的目標，其進度與需要人工處理的通知也會在相同條件下回到來源對話；沒有來源對話的目標使用員工原有的通知設定。
+
+回到建立時對話的通知，每次實際傳送前都會重新確認（因勿擾時段或真人接手而延後的通知，送出時也會再確認一次）：建立者的帳號仍啟用且仍可使用這位 AI 員工、通道身分仍綁定，且原對話沒有被清除或重建。任一項不符或無法讀取時就不傳送，也不會改傳到其他對話；目標只保留 Activity Feed 紀錄。公開訪客（網站小工具、Live Chat）的對話不會收到這類通知。升級前在 WebChat 建立的排程與提醒，升級後照常回到原對話；gateway 會在升級後第一次順利完成檢查的啟動時各確認一次，完成後不再重做（該次啟動無法完成時不會記為完成，下次啟動會重試）：建立者帳號仍啟用且仍可使用這位 AI 員工、原對話仍由建立者擁有且未被清除。確認通過後，每次傳送前都會像新建立的一樣重新確認；無法確認的會以 `origin_unproven` 拒絕，也不會改傳到其他對話。延後送出的目標決定卡，若目標已刪除就直接丟棄。
+
+Google Chat 依既有順序選用員工自己的 App、該空間記錄的 App 或共用 App，選中的 App 仍須有權在該空間發訊。收件人防護持續生效：已保存且驗證過的來源對話視為來源；另外指定的對象不會取得這項豁免。尚未綁定使用者的通道，不會只因建立排程就取得已驗證來源的豁免。
+
+例行工作清單與明細會分別回報工作與通知結果：`last_status` 是工作執行狀態；`last_delivery_status` 為 `delivered`（已送達）、`delivery_failed`（傳送失敗）、`delivery_refused`（傳送前的確認未通過），未嘗試傳送時為空。失敗時 `last_delivery_reason` 為固定代碼 `notification_delivery_failed`；未通過確認時為 `origin_unproven`、`origin_proof_invalid`、`origin_public_visitor`、`origin_state_unreadable`、`origin_account_inactive`、`origin_access_revoked`、`origin_identity_unbound`、`origin_conversation_changed` 其中之一。這些欄位記錄最近一次執行。提醒清單沿用 `delivered`／`failed` 狀態，並在有錯誤時列出 `error`（未通過確認的提醒為 `failed`，`error` 帶相同代碼）；傳送失敗不會記成已送達。

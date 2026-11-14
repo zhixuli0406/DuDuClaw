@@ -94,6 +94,8 @@ impl MethodHandler {
                 tasks.push(json!({ "id": row.id, "name": row.name, "agent_id": row.agent_id,
                     "cron": row.cron, "schedule": row.cron, "task": row.task, "enabled": row.enabled,
                     "last_run_at": row.last_run_at, "last_status": row.last_status,
+            "last_delivery_status": row.last_delivery_status,
+            "last_delivery_reason": row.last_delivery_reason,
                     "can_manage": writable, "can_edit": can_edit, "can_resume": can_activate,
                     "can_run": can_activate }));
             }

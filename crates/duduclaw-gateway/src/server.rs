@@ -684,6 +684,26 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
     }
 
+    // Turn-origin proof records (schedules, reminders, goals): remove the
+    // ones no job references any more. Only the gateway-lock holder works.
+    {
+        let home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let pass_home = home.clone();
+                if tokio::task::spawn_blocking(move || crate::recipient_guard::origin::maintenance(&pass_home))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("origin proof cleanup pass failed");
+                }
+            }
+        });
+    }
+
     // ── Forget by source: resume unfinished external steps (P2-B, D10) ───
     // An apply already deleted the rows and wrote the tombstones; what may
     // remain are its follow-up steps (auto wiki pages, review cards, hiding
@@ -1972,6 +1992,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 None
             }
         };
+
+    // WebChat schedules and reminders released in v1.81 predate gateway
+    // origin proofs. Mint theirs once, through the same live WebChat checks a
+    // turn uses, before either scheduler can fire: awaited here, ahead of the
+    // cron scheduler below and the reminder scheduler further down. Only the
+    // gateway-lock holder does any work; the cron store above already added
+    // the proof column.
+    crate::recipient_guard::origin::startup_backfill(&home_dir).await;
 
     let (cron_handle, cron_scheduler) = crate::cron_scheduler::start_cron_scheduler(
         home_dir.clone(),

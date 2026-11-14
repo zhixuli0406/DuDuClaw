@@ -409,6 +409,10 @@ impl SessionManager {
         // for a signed-in WebChat account, who owns it. NULL on rows written
         // before this migration (see `session_origin::backfill`).
         crate::session_origin::store::migrate(conn);
+        // v1.82: gateway-held turn-origin proofs of schedules, reminders and
+        // goals (`recipient_guard::origin`); jobs store only the opaque id.
+        crate::recipient_guard::origin::migrate(conn)
+            .map_err(|e| DuDuClawError::Gateway(format!("origin proof table: {e}")))?;
         Self::migrate_legacy_user_clears(conn)?;
         Self::sweep_webchat_cancellations(conn, WEBCHAT_CANCEL_RETENTION_DAYS)?;
 

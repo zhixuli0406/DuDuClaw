@@ -675,6 +675,7 @@ pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         created_via: row.get(48)?,
         cost_cap_cents: row.get(49)?,
         timeout_secs: row.get(50)?,
+        source_origin_proof: row.get(53)?,
     })
 }
 
@@ -758,11 +759,12 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
              revision_round, diminishing, agent_seconds, source_discord_guild_id,
              deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
              plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision,
-             on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review, a2a_owner)
+             on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review, a2a_owner,
+             source_origin_proof)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                  ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46,
-                 ?47, ?48, ?49, ?50, ?51, ?52)",
+                 ?47, ?48, ?49, ?50, ?51, ?52, ?53)",
         params![
             row.id,
             mask_derived_text(&row.title),
@@ -816,6 +818,8 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
             row.timeout_secs,
             row.plan_review.as_deref().map(mask_derived_text),
             row.a2a_owner,
+            // A proof only ever accompanies the source conversation it covers.
+            row.source_chat_id.as_ref().and(row.source_origin_proof.as_ref()),
         ],
     )
     .map_err(|e| format!("insert task: {e}"))?;

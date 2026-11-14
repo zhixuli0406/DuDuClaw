@@ -248,6 +248,30 @@ fn rm173_upgraded_session_stores_match_a_pinned_catalog() {
 }
 
 #[test]
+fn import_accepts_v182_sessions_without_reading_origin_proofs() {
+    // v1.82 = either v1.81 shape plus the gateway-owned proof table; both map
+    // as V181 and the reader never emits a proof record.
+    for (catalog, base) in [(SESSION_V182, SESSION_V181), (SESSION_V182_UPGRADED, SESSION_V181_UPGRADED)] {
+        assert_eq!(detected(catalog, Store::Sessions, None), Detected { version: SchemaVersion::V181, extension: false });
+        assert_eq!(detected(catalog, Store::Sessions, Some(CHANNEL_SETTINGS_SCHEMA)), Detected { version: SchemaVersion::V181, extension: true });
+        // Opening a v1.81 store with this release adds exactly that table.
+        let (upgraded, expected) = (Connection::open_in_memory().unwrap(), Connection::open_in_memory().unwrap());
+        upgraded.execute_batch(base).unwrap();
+        upgrade(&upgraded, SESSION_ORIGIN_PROOFS_V182);
+        expected.execute_batch(catalog).unwrap();
+        assert_eq!(schema(&upgraded).unwrap(), schema(&expected).unwrap());
+        let file = store(catalog, "INSERT INTO sessions(id,agent_id,last_active,created_at) VALUES ('s','sales','now','now');
+            INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('s','user','legacy question','now');
+            INSERT INTO schedule_origin_proofs VALUES ('SECRET-ID','sales','SECRET-RECIPIENT','SECRET-USER','googlechat','SECRET-SENDER','s','now',0);");
+        let mut out = Vec::new();
+        assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, &mut out), Ok(1));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("legacy question") && !text.contains("SECRET"), "{text}");
+        assert!(take_schema_refusal().is_none());
+    }
+}
+
+#[test]
 fn rm173_import_refuses_v181_sessions_with_planted_objects() {
     for sql in ["CREATE INDEX planted_idx ON sessions(user_cleared_at);", "CREATE INDEX planted_idx ON session_migrations(applied_at);",
         "CREATE TABLE planted_markers(name TEXT);", "CREATE VIEW planted AS SELECT * FROM session_migrations;",
@@ -263,7 +287,7 @@ fn rm173_import_refuses_v181_sessions_with_planted_objects() {
         assert_eq!((refusal.store, refusal.closest, refusal.closest_extension), (Store::Sessions, SchemaVersion::V181, false), "{sql}");
         assert_eq!(refusal.differences.len(), 1, "{sql}: {:?}", refusal.differences);
         let message = refusal.to_string();
-        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81)") && message.contains("closest (v1.81)"), "{message}");
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.82)") && message.contains("closest (v1.81)"), "{message}");
     }
     let file = store(SESSION_V181, "CREATE INDEX planted_idx ON sessions(user_cleared_at);");
     assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, Vec::new()), Err(Error::Schema));
@@ -330,7 +354,7 @@ fn import_refuses_unknown_schema_with_diff() {
     assert!(refusal.differences.contains(&Difference::Missing { object: "index".into(), name: "idx_cron_scoped_actor".into() }));
     assert!(refusal.differences.contains(&Difference::Changed { object: "table".into(), name: "cron_tasks".into(), missing_columns: vec!["scoped_by_user_id".into()] }));
     let message = refusal.to_string();
-    for expected in ["cron_tasks.db", "known catalogs (v1.79.3, v1.80.x)", "closest (v1.80.x)",
+    for expected in ["cron_tasks.db", "known catalogs (v1.79.3, v1.80.x, v1.82)", "closest (v1.80.x)",
         "missing index idx_cron_scoped_actor", "changed table cron_tasks (missing column scoped_by_user_id)"] {
         assert!(message.contains(expected), "{message}");
     }
@@ -359,4 +383,26 @@ fn import_refuses_unknown_schema_with_diff() {
     assert_eq!((refusal.store, refusal.closest), (Store::Sessions, SchemaVersion::V180));
     assert_eq!(refusal.differences, vec![Difference::Unexpected { object: "index".into(), name: "planted_idx".into() }]);
     assert!(refusal.to_string().contains("sessions.db"));
+}
+
+#[test]
+fn import_accepts_v182_tasks_without_importing_origin_proofs() {
+    assert_eq!(detected(TASKS_V182, Store::Tasks, None).version, SchemaVersion::V180);
+    assert!(take_schema_refusal().is_none());
+    let file = store(TASKS_V182, "INSERT INTO tasks(id,title,description,assigned_to,created_at,updated_at,kind,goal_mode,source_channel,source_chat_id,source_origin_proof)
+        VALUES ('goal','Quarterly goal','Do work','sales','now','now','goal',1,'googlechat','spaces/SECRET-CHAT','SECRET-PROOF');");
+    let p = extract(&request(SourceKind::AuthorityTasksSqlite, "tasks.db"), source(&file), None).unwrap();
+    assert_eq!(p.len(), 1);
+    let encoded = serde_json::to_string(&p).unwrap();
+    assert!(encoded.contains("Quarterly goal") && !encoded.contains("SECRET-PROOF"));
+}
+
+#[test]
+fn import_accepts_v182_cron_without_importing_delivery_authority() {
+    assert_eq!(detected(CRON_V182, Store::Cron, None).version, SchemaVersion::V180);
+    let file = store(CRON_V182, "INSERT INTO cron_tasks(id,name,agent_id,cron,task,created_at,updated_at,notify_sender,notify_origin,last_delivery_status,last_delivery_reason,notify_origin_proof)
+        VALUES('c','Daily','sales','0 9 * * *','report','then','then','SECRET-SENDER','googlechat:SECRET-ORIGIN','SECRET-STATUS','SECRET-REASON','SECRET-PROOF');");
+    let proposals = extract(&request(SourceKind::AuthorityCronSqlite, "cron_tasks"), source(&file), None).unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert!(!serde_json::to_string(&proposals).unwrap().contains("SECRET"));
 }
