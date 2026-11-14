@@ -17,6 +17,7 @@
 //!   the timer only), whatever the sender.
 //! - The stricter of `[thinking] display` and the answering employee's
 //!   `[model] show_thinking` caps all of it.
+//! - Google Chat only shows a duration to internal senders; no summaries.
 //! - Public visitors (Odoo Live Chat, the WebChat widget) never get a
 //!   thinking sink at all, so nothing here applies to them.
 //!
@@ -183,7 +184,24 @@ pub fn resolve_channel(
         super::policy::agent_ceiling(&home.join("agents").join(agent_id))
     };
     let internal = sender_is_internal(home, channel, channel_user_id, agent_id);
-    channel_show(&cfg, internal, is_group, global, agent)
+    let show = channel_show(&cfg, internal, is_group, global, agent);
+    // Chat has no separate thinking surface: only staff may see a duration.
+    if channel == "googlechat" { googlechat_show(show, internal) } else { show }
+}
+
+fn googlechat_show(show: ShowThinking, internal: bool) -> ShowThinking {
+    if !internal || show == ShowThinking::Off { ShowThinking::Off } else { ShowThinking::Status }
+}
+
+#[cfg(test)]
+mod googlechat_audience_tests {
+    use super::*;
+    #[test]
+    fn chat_never_exposes_summary_even_with_everyone_audience() {
+        assert_eq!(googlechat_show(ShowThinking::Summary, false), ShowThinking::Off);
+        assert_eq!(googlechat_show(ShowThinking::Summary, true), ShowThinking::Status);
+        assert_eq!(googlechat_show(ShowThinking::Off, true), ShowThinking::Off);
+    }
 }
 
 /// Feishu, for thinking display: fail closed — only an explicit 1:1 chat

@@ -313,3 +313,119 @@ mod tests {
         assert!(read_default_language(dir.path()).await.is_none());
     }
 }
+
+/// Channel-only tail: auto follows the user's language without changing cached system prompts.
+pub fn with_channel_reply_language_reminder(message: String, language: Option<&str>) -> String {
+    if language.is_none() || language == Some("auto") {
+        format!("{message}\n\n<reply_language>Always respond in the language matching the user's input.</reply_language>")
+    } else {
+        with_reply_language_reminder(message, language)
+    }
+}
+
+/// Only an explicitly resolved zh-TW reply gets the conservative character safety net.
+/// Preserve code (including variable-length fences/spans) and URL bytes verbatim.
+pub(crate) fn normalize_channel_reply(text: &str, language: Option<&str>) -> String {
+    if language != Some("zh-TW") { return text.to_string(); }
+    let mut output = String::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut inline = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        let run = trimmed.chars().take_while(|c| *c == marker).count();
+        if let Some((open, length)) = fence {
+            output.push_str(line);
+            if marker == open && run >= length && trimmed.chars().skip(run).all(char::is_whitespace) {
+                fence = None;
+            }
+            continue;
+        }
+        if inline == 0 && matches!(marker, '`' | '~') && run >= 3 {
+            fence = Some((marker, run));
+            output.push_str(line);
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        let mut prose = String::new();
+        while i < chars.len() {
+            if chars[i] == '`' {
+                output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
+                prose.clear();
+                let count = chars.iter().skip(i).take_while(|c| **c == '`').count();
+                if inline == 0 { inline = count; } else if inline == count { inline = 0; }
+                output.extend(std::iter::repeat_n('`', count));
+                i += count;
+            } else if inline > 0 {
+                output.push(chars[i]);
+                i += 1;
+            } else if chars[i] == '(' && i > 0 && chars[i - 1] == ']' {
+                // Markdown destinations can also be relative URLs with CJK paths.
+                output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
+                prose.clear();
+                let mut depth = 0usize;
+                let mut escaped = false;
+                while i < chars.len() {
+                    let c = chars[i];
+                    output.push(c);
+                    i += 1;
+                    if !escaped {
+                        if c == '(' { depth += 1; }
+                        if c == ')' { depth = depth.saturating_sub(1); }
+                    }
+                    escaped = c == '\\' && !escaped;
+                    if depth == 0 { break; }
+                }
+            } else {
+                let boundary = i == 0 || !chars[i - 1].is_ascii_alphanumeric();
+                let scheme_len = if boundary && chars[i].is_ascii_alphabetic() {
+                    chars.iter().skip(i).take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, '+' | '-' | '.')).count()
+                } else { 0 };
+                let scheme_url = scheme_len > 0 && chars.iter().skip(i + scheme_len).copied().take(3).eq("://".chars());
+                let other_url = ["mailto:", "www."].iter().any(|prefix| {
+                    chars.len() - i >= prefix.len() && chars.iter().skip(i).zip(prefix.chars())
+                        .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+                });
+                if scheme_url || other_url {
+                    output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
+                    prose.clear();
+                    while i < chars.len() && !chars[i].is_whitespace() && !matches!(chars[i], '<' | '>' | '`') {
+                        output.push(chars[i]);
+                        i += 1;
+                    }
+                } else {
+                    prose.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+        output.push_str(&duduclaw_core::zh_variant::to_traditional(&prose));
+    }
+    output
+}
+
+#[cfg(test)]
+mod channel_language_tests {
+    use super::*;
+    #[test]
+    fn traditional_prose_preserves_code_and_urls() {
+        let text = "用户 `用户` ``用户`字`` https://例子/用户?q=档案\n```rust\n用户\n```\n~~~\n档案\n~~~\n用户";
+        let expected = "用戶 `用户` ``用户`字`` https://例子/用户?q=档案\n```rust\n用户\n```\n~~~\n档案\n~~~\n用戶";
+        assert_eq!(normalize_channel_reply(text, Some("zh-TW")), expected);
+        assert_eq!(normalize_channel_reply("用户 HTTPS://例子/用户 s3://档案/用户", Some("zh-TW")),
+            "用戶 HTTPS://例子/用户 s3://档案/用户");
+        assert_eq!(normalize_channel_reply("[用户](/档案/用户) 用户", Some("zh-TW")),
+            "[用戶](/档案/用户) 用戶");
+        for language in [None, Some("auto"), Some("zh-CN"), Some("en")] {
+            assert_eq!(normalize_channel_reply(text, language), text);
+        }
+    }
+    #[test]
+    fn channel_auto_reminder_is_at_turn_end() {
+        assert!(with_channel_reply_language_reminder("hello".into(), None)
+            .ends_with("<reply_language>Always respond in the language matching the user's input.</reply_language>"));
+        assert_eq!(with_channel_reply_language_reminder("hello".into(), Some("zh-TW")),
+            with_reply_language_reminder("hello".into(), Some("zh-TW")));
+    }
+}

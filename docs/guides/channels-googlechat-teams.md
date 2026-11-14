@@ -18,6 +18,18 @@ Both channels include:
   TODO task board (from `TodoWrite`) are shown via message edits and removed
   when the final reply arrives.
 
+### Reply display and delivery
+
+Google Chat tables appear as a list: each row starts with its first cell in bold, followed by `column: value` lines. Cell contents are kept in full. Bullets use `•`; headings and bold text spanning lines are converted to Chat markup. Chinese text next to bold markers keeps its original spacing.
+
+Tool details and task lists are visible only to internal staff (an administrator or a verified account directly bound to the answering employee). Other senders see generic progress. Configuration-change notices wait for the next internal reply. Access denial, mute and human takeover do not produce an empty-reply warning; the temporary placeholder is removed when possible.
+
+Final delivery stops further progress edits. If replacing the placeholder fails, DuDuClaw retries once after a short delay (up to three seconds for a rate-limit response), then sends a new message and tries to replace the old placeholder with a neutral line. Remaining answer parts are still attempted. If the original edit succeeded but its response was lost, the fallback can duplicate the first part.
+
+Google Chat never includes a thinking summary in the answer. Existing thinking settings can allow internal staff a duration line; other senders see none. A resolved `zh-TW` reply uses conservative Traditional Chinese character conversion while preserving code and URLs. Auto language adds a reminder to follow the user's message language.
+
+Rendering has not been verified on a real Google Chat client (尚未在真實 Google Chat 用戶端驗證). Check desktop and mobile table lists, Chinese bold boundaries, multiline bold and placeholder replacement.
+
 ## Google Chat
 
 ### Before you start
@@ -156,7 +168,7 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 | LINE | plain text + Flex bubble | key-value records | loading animation (1:1, ≤60 s) |
 | WhatsApp | `*bold*` / `~strike~` / ``` blocks | monospace fence | `typing_indicator` (≤25 s, on inbound) |
 | Feishu | interactive Card 2.0 markdown | native | — (progress via messages) |
-| Google Chat | Chat markup (`*bold*`, `<url\|text>`) | monospace fence | placeholder + edit-in-place |
+| Google Chat | Chat markup (`*bold*`, `<url\|text>`) | Key–value list with bold row titles | placeholder + edit-in-place |
 | MS Teams | markdown activity | monospace fence | `typing` activity every 3 s |
 | WebChat | raw markdown (dashboard renders) | native | `progress` WS events |
 

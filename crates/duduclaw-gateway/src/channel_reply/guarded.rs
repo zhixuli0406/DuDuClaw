@@ -350,9 +350,12 @@ async fn build_guarded_reply_for_agent_inner(
     let final_text = if crate::odoo_livechat::is_public_visitor_session(session_id) {
         enforced
     } else {
-        append_pending_agent_notice(enforced, &ctx.home_dir, agent_name)
+        append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id, session_id, user_id)
     };
     let final_text = crate::knowledge::cite_turn::with_footer(final_text, session_id, &cited);
+    let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
+    let final_text = crate::prompt_identity::normalize_channel_reply(
+        &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
     let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
@@ -435,7 +438,7 @@ async fn build_guarded_reply_with_session_inner(
     }
     let health_outcome = health_outcome.map(|(id, reason)|
         (id, reason.or(enforced.trim().is_empty().then_some("empty_reply"))));
-    let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
+    let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id, session_id, user_id);
     // Messaging apps: label replies from a called (non-default) employee.
     let labelled = match &answered_by {
         Some(who) if who.via_trigger && footer_applies_to_session(session_id) => {
@@ -445,6 +448,9 @@ async fn build_guarded_reply_with_session_inner(
     };
     let with_sources = crate::knowledge::cite_turn::with_footer(labelled, session_id, &cited);
     let final_text = append_product_footer(with_sources, session_id);
+    let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
+    let final_text = crate::prompt_identity::normalize_channel_reply(
+        &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
     let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)

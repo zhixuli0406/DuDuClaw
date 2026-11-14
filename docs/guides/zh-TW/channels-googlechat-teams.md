@@ -16,6 +16,18 @@ Discord／Slack／WhatsApp／Feishu／WebChat 並列）。Teams 與 Google Chat 
 - **即時進度**：agent 執行長任務期間，工具活動與 agent 的 TODO 任務看板
   （來自 `TodoWrite`）會透過訊息編輯即時顯示，最終回覆送達後即會移除。
 
+### 回覆顯示與送達
+
+Google Chat 表格改以清單呈現：每列以第一欄作為粗體標題，其餘欄位顯示為「欄名: 值」，保留完整內容。清單符號改用 `•`，標題及跨行粗體會轉成 Chat 標記；粗體旁的中文字不額外加空格。
+
+工具細節與工作清單僅供內部人員查看（管理員，或已驗證且直接綁定該員工的帳號），其他發話者只看到一般處理進度。設定變更通知會保留到下一次內部回覆。存取遭拒、靜音或人工接手時，不會顯示「沒有產生回覆」警告，並會盡可能移除佔位訊息。
+
+最終回覆開始送出後，進度不再修改同一則訊息。若無法更新佔位訊息，會短暫等待後重試一次（遇到流量限制最多等待三秒），再失敗則改發新訊息，並盡可能將舊佔位訊息改成中性提示；其餘回覆段落仍會嘗試送出。若原本的更新已成功、只是回應遺失，第一段可能重複出現。
+
+Google Chat 回覆不附加思考摘要。既有思考設定最多讓內部人員看到一行思考時間，其他人不顯示。回覆語言明確為 `zh-TW` 時，會以有限字表將簡體字轉為繁體字，保留程式碼與網址；自動語言則在每次提問末尾提醒依使用者訊息的語言回覆。
+
+尚未在真實 Google Chat 用戶端驗證。請在網頁版與手機版確認表格清單、中文粗體邊界、跨行粗體及佔位訊息替換。
+
 ## Google Chat
 
 ### 開始之前
@@ -151,7 +163,7 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 | LINE | 純文字 + Flex bubble | key-value 記錄 | loading 動畫（1:1，≤60 秒） |
 | WhatsApp | `*bold*` ／ `~strike~` ／``` 區塊 | 等寬 code fence | `typing_indicator`（≤25 秒，收到訊息時觸發） |
 | Feishu | 互動式 Card 2.0 markdown | 原生支援 | 無（透過訊息顯示進度） |
-| Google Chat | Chat markup（`*bold*`、`<url\|text>`） | 等寬 code fence | 佔位訊息 + 原地編輯 |
+| Google Chat | Chat markup（`*bold*`、`<url\|text>`） | 粗體列標題＋欄名和值清單 | 佔位訊息 + 原地編輯 |
 | MS Teams | markdown activity | 等寬 code fence | `typing` activity 每 3 秒一次 |
 | WebChat | 原始 markdown（由儀表板渲染） | 原生支援 | `progress` WS 事件 |
 

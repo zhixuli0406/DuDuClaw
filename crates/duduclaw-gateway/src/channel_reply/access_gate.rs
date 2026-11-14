@@ -2,7 +2,8 @@ use super::*;
 
 /// Append any pending "rules changed" / "model switched" FYI line(s) — see
 /// `pending_agent_notice` — to an outgoing reply, then clear the flag(s) so
-/// the same change is never announced twice. A reply that is already empty
+/// the same change is never announced twice. External senders leave it pending.
+/// A reply that is already empty
 /// (silent-by-design drops: circuit-breaker denial, blocked/unpaired user,
 /// injection-scan block) is left untouched — turning a deliberate silence
 /// into a visible message would defeat the gate that produced it.
@@ -10,13 +11,62 @@ pub(super) fn append_pending_agent_notice(
     reply: String,
     home_dir: &std::path::Path,
     agent_id: &str,
+    session_id: &str,
+    user_id: &str,
 ) -> String {
-    if reply.is_empty() {
+    if reply.is_empty() || !sender_is_internal_for_reply(home_dir, session_id, user_id, agent_id) {
         return reply;
     }
     match crate::pending_agent_notice::take_pending_notice_suffix(home_dir, agent_id) {
         Some(suffix) => format!("{reply}\n\n{suffix}"),
         None => reply,
+    }
+}
+
+/// Share the thinking policy's sender identity checks; unknown/public sessions fail closed.
+pub(super) fn sender_is_internal_for_reply(
+    home: &Path, session: &str, user: &str, agent: &str,
+) -> bool {
+    if super::assembly::public_session(session) { return false; }
+    crate::trajectory_guard::channel_from_session_id(session).is_some_and(|channel| {
+        crate::thinking::channel_policy::sender_is_internal(home, channel, user, agent)
+    })
+}
+
+#[cfg(test)]
+mod notice_audience_tests {
+    use super::*;
+
+    #[test]
+    fn only_verified_staff_consume_pending_notices() {
+        let home = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let employee = db.create_user("staff@test.local", "Staff", "StaffPass-12345",
+            duduclaw_auth::UserRole::Employee).unwrap();
+        db.bind_agent(&employee.id, "a", duduclaw_auth::AccessLevel::Operator).unwrap();
+        db.bind_channel_identity(&employee.id, "googlechat", "users/staff", true).unwrap();
+        db.bind_channel_identity(&employee.id, "googlechat", "users/unverified", false).unwrap();
+        crate::pending_agent_notice::mark_model_changed(home.path(), "a");
+        assert_eq!(append_pending_agent_notice("answer".into(), home.path(), "a",
+            "googlechat:spaces/a", "users/unverified"), "answer");
+        assert_eq!(append_pending_agent_notice("".into(), home.path(), "a",
+            "googlechat:spaces/a", "users/staff"), "");
+        assert_eq!(append_pending_agent_notice("answer".into(), home.path(), "a",
+            "googlechat:spaces/a", "users/staff"), "answer\n\n（已切換至新模型）");
+        assert_eq!(append_pending_agent_notice("answer".into(), home.path(), "a",
+            "googlechat:spaces/a", "users/staff"), "answer");
+        assert!(!sender_is_internal_for_reply(home.path(), "odoolivechat:1", "users/staff", "a"));
+    }
+
+    #[test]
+    fn external_turns_leave_notice_pending() {
+        let home = tempfile::tempdir().unwrap();
+        crate::pending_agent_notice::mark_model_changed(home.path(), "a");
+        for session in ["googlechat:spaces/a", "telegram:1", "odoolivechat:1", "unknown:1"] {
+            assert_eq!(append_pending_agent_notice("answer".into(), home.path(), "a", session, "visitor"), "answer");
+        }
+        assert_eq!(crate::pending_agent_notice::take_pending_notice_suffix(home.path(), "a"),
+            Some("（已切換至新模型）".into()));
     }
 }
 
