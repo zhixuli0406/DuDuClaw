@@ -899,15 +899,22 @@ mod origin_target_tests {
                 .args(["--exact", "mcp::cron_tasks::origin_target_tests::forged_origin_session_env_is_ignored"])
                 .env(CHILD, "1")
                 .env(duduclaw_core::ENV_ORIGIN_SESSION, &session)
+                .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
                 .env_remove(duduclaw_core::ENV_TRUST_TURN_ID)
                 .env_remove(duduclaw_core::egress_guard::ENV_TURN_ALIAS)
                 .output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             return;
         }
         assert_eq!(std::env::var(duduclaw_core::ENV_ORIGIN_SESSION).as_deref(), Ok(session.as_str()));
+        // Creation now requires an operational caller; the forged origin
+        // must still confer no recipient authority.
+        std::fs::create_dir_all(home.path().join("agents/sales")).unwrap();
+        std::fs::write(home.path().join("agents/sales/agent.toml"),
+            "[agent]\nname = 'sales'\nrole = 'specialist'\nstatus = 'active'\n").unwrap();
         let created = handle_schedule_task(
-            &serde_json::json!({"cron":"0 9 * * *","task":"report","name":"Daily"}), home.path(), "sales",
+            &serde_json::json!({"agent_id":"sales","cron":"0 9 * * *","task":"report","name":"Daily"}), home.path(), "sales",
         ).await;
         assert_ne!(created["isError"], true, "{created}");
         assert!(created["content"][0]["text"].as_str().unwrap().contains("不會傳送到任何地方"));

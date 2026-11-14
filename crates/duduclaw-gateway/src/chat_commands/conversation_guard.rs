@@ -18,9 +18,10 @@
 //!    refuse. A 1:1 conversation keeps resetting its own history as before.
 //!
 //!    This rule only applies when the installation HAS an approver identity
-//!    system ([`approver_identity_exists`]). A single-user / personal
+//!    system ([`crate::decision_notify::has_recognisable_approver_identity`]). A single-user / personal
 //!    install with no `users.db`, or with no Active Admin/Manager holding any
-//!    verified channel identity, has nobody who could ever be a verified
+//!    verified channel identity or recognisable derived Google identity, has
+//!    nobody who could ever be a verified
 //!    Admin/Manager; there, any sender who passes the access gate (check 1)
 //!    may run these commands, exactly as before the rule existed. Check 1
 //!    itself is unconditional.
@@ -38,21 +39,6 @@ pub fn clears_conversation(cmd: &ChatCommand) -> bool {
     matches!(cmd, ChatCommand::New | ChatCommand::Compact)
 }
 
-/// Whether this installation has a recognisable approver identity system —
-/// the same predicate the decision-button approval code uses. `false` only
-/// when `users.db` does not exist, or exists and is readable but holds no
-/// Active Admin/Manager with a verified channel identity. A `users.db` that
-/// exists but cannot be opened counts as `true` (fail closed).
-///
-/// MERGE NOTE: on this branch the predicate is
-/// `decision_notify::identity_system_active(home)`; a sibling branch
-/// replaces it with `decision_notify::has_recognisable_approver_identity(home)`.
-/// This wrapper is the ONLY call site in the chat-command guard — on merge,
-/// change the one line below and nothing else.
-fn approver_identity_exists(home: &Path) -> bool {
-    crate::decision_notify::identity_system_active(home)
-}
-
 /// `true` when `sender` may NOT clear a conversation: it is `shared`, the
 /// installation has an approver identity system, and the sender is not a
 /// verified Admin/Manager. `shared` must be `true` whenever the caller cannot
@@ -63,7 +49,7 @@ pub fn shared_clear_refused(home: &Path, channel: &str, sender: &str, shared: bo
     if !shared {
         return false;
     }
-    if !approver_identity_exists(home) {
+    if !crate::decision_notify::has_recognisable_approver_identity(home) {
         return false;
     }
     if sender.trim().is_empty() {
@@ -169,6 +155,7 @@ mod tests {
         ReplyContext::new(registry, home.to_path_buf(), sessions, status, tx)
     }
 
+    // Google Chat identities use users/<digits>, including in fixtures.
     fn bind(home: &Path, channel_user: &str, role: duduclaw_auth::UserRole) {
         let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
         let email = format!("{}@test.local", channel_user.replace('/', "-"));
@@ -196,15 +183,15 @@ mod tests {
     async fn blocked_member_cannot_new_or_compact() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
-        bind(dir.path(), "users/bad", duduclaw_auth::UserRole::Admin);
+        bind(dir.path(), "users/105", duduclaw_auth::UserRole::Admin);
         ctx.channel_settings
-            .set("googlechat", "global", keys::BLOCKED_USERS, r#"["users/bad"]"#)
+            .set("googlechat", "global", keys::BLOCKED_USERS, r#"["users/105"]"#)
             .await
             .unwrap();
         for text in ["/new", "/reset", "/compact"] {
             // Even a mapped Admin who is blocked on the channel gets silence.
-            assert_eq!(run(&ctx, text, "users/bad", true).await, "", "{text}");
-            assert_eq!(run(&ctx, text, "users/bad", false).await, "", "{text}");
+            assert_eq!(run(&ctx, text, "users/105", true).await, "", "{text}");
+            assert_eq!(run(&ctx, text, "users/105", false).await, "", "{text}");
         }
     }
 
@@ -212,27 +199,27 @@ mod tests {
     async fn non_admin_in_space_is_refused_admin_and_manager_allowed() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
-        bind(dir.path(), "users/emp", duduclaw_auth::UserRole::Employee);
-        bind(dir.path(), "users/admin", duduclaw_auth::UserRole::Admin);
-        bind(dir.path(), "users/mgr", duduclaw_auth::UserRole::Manager);
+        bind(dir.path(), "users/101", duduclaw_auth::UserRole::Employee);
+        bind(dir.path(), "users/102", duduclaw_auth::UserRole::Admin);
+        bind(dir.path(), "users/103", duduclaw_auth::UserRole::Manager);
         for text in ["/new", "/reset", "/compact"] {
-            assert_eq!(run(&ctx, text, "users/emp", true).await, GROUP_RESET_REFUSED);
-            assert_eq!(run(&ctx, text, "users/stranger", true).await, GROUP_RESET_REFUSED);
+            assert_eq!(run(&ctx, text, "users/101", true).await, GROUP_RESET_REFUSED);
+            assert_eq!(run(&ctx, text, "users/104", true).await, GROUP_RESET_REFUSED);
             assert_eq!(run(&ctx, text, "", true).await, GROUP_RESET_REFUSED);
         }
-        for who in ["users/admin", "users/mgr"] {
+        for who in ["users/102", "users/103"] {
             let reply = run(&ctx, "/new", who, true).await;
             assert!(reply.starts_with('✅'), "{who}: {reply}");
         }
         // Other commands are not affected by the rule.
-        assert_ne!(run(&ctx, "/help", "users/emp", true).await, GROUP_RESET_REFUSED);
+        assert_ne!(run(&ctx, "/help", "users/101", true).await, GROUP_RESET_REFUSED);
     }
 
     #[tokio::test]
     async fn one_to_one_member_may_reset_own_conversation() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
-        let reply = run(&ctx, "/new", "users/emp", false).await;
+        let reply = run(&ctx, "/new", "users/101", false).await;
         assert!(reply.starts_with('✅'), "{reply}");
     }
 
@@ -242,12 +229,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
         for text in ["/new", "/reset", "/compact"] {
-            let reply = run(&ctx, text, "users/emp", true).await;
+            let reply = run(&ctx, text, "users/101", true).await;
             assert_ne!(reply, GROUP_RESET_REFUSED, "{text}");
             assert!(!reply.is_empty(), "{text}");
-            assert!(!shared_clear_refused(dir.path(), "googlechat", "users/emp", true));
+            assert!(!shared_clear_refused(dir.path(), "googlechat", "users/101", true));
         }
-        assert!(run(&ctx, "/new", "users/emp", true).await.starts_with('✅'));
+        assert!(run(&ctx, "/new", "users/101", true).await.starts_with('✅'));
         // The check must not conjure an identity store as a side effect.
         assert!(!dir.path().join("users.db").exists());
     }
@@ -258,19 +245,19 @@ mod tests {
         // identity (an employee binding and an unverified admin claim only):
         // nobody can ever be a verified approver, so the old behaviour holds.
         let dir = tempfile::tempdir().unwrap();
-        bind(dir.path(), "users/emp", duduclaw_auth::UserRole::Employee);
+        bind(dir.path(), "users/101", duduclaw_auth::UserRole::Employee);
         let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
         let admin = db
             .create_user("admin@test.local", "admin", "StaffPass-12345", duduclaw_auth::UserRole::Admin)
             .unwrap();
-        db.bind_channel_identity(&admin.id, "googlechat", "users/admin", false).unwrap();
+        db.bind_channel_identity(&admin.id, "googlechat", "users/102", false).unwrap();
         let ctx = test_ctx(dir.path());
-        assert!(run(&ctx, "/new", "users/emp", true).await.starts_with('✅'));
-        assert!(run(&ctx, "/new", "users/stranger", true).await.starts_with('✅'));
+        assert!(run(&ctx, "/new", "users/101", true).await.starts_with('✅'));
+        assert!(run(&ctx, "/new", "users/104", true).await.starts_with('✅'));
         // Once one approver verifies a binding, the rule applies to everyone.
-        db.bind_channel_identity(&admin.id, "googlechat", "users/admin", true).unwrap();
-        assert_eq!(run(&ctx, "/new", "users/emp", true).await, GROUP_RESET_REFUSED);
-        assert!(run(&ctx, "/new", "users/admin", true).await.starts_with('✅'));
+        db.bind_channel_identity(&admin.id, "googlechat", "users/102", true).unwrap();
+        assert_eq!(run(&ctx, "/new", "users/101", true).await, GROUP_RESET_REFUSED);
+        assert!(run(&ctx, "/new", "users/102", true).await.starts_with('✅'));
     }
 
     #[tokio::test]
@@ -278,12 +265,12 @@ mod tests {
         async fn block_and_check(home: &Path) {
             let ctx = test_ctx(home);
             ctx.channel_settings
-                .set("googlechat", "global", keys::BLOCKED_USERS, r#"["users/bad"]"#)
+                .set("googlechat", "global", keys::BLOCKED_USERS, r#"["users/105"]"#)
                 .await
                 .unwrap();
             for text in ["/new", "/reset", "/compact"] {
-                assert_eq!(run(&ctx, text, "users/bad", true).await, "", "{text}");
-                assert_eq!(run(&ctx, text, "users/bad", false).await, "", "{text}");
+                assert_eq!(run(&ctx, text, "users/105", true).await, "", "{text}");
+                assert_eq!(run(&ctx, text, "users/105", false).await, "", "{text}");
             }
         }
         // 1. No users.db.
@@ -291,7 +278,7 @@ mod tests {
         block_and_check(none.path()).await;
         // 2. users.db with a verified Admin — the blocked sender IS that admin.
         let with_admin = tempfile::tempdir().unwrap();
-        bind(with_admin.path(), "users/bad", duduclaw_auth::UserRole::Admin);
+        bind(with_admin.path(), "users/105", duduclaw_auth::UserRole::Admin);
         block_and_check(with_admin.path()).await;
         // 3. Unreadable users.db.
         let broken = tempfile::tempdir().unwrap();
@@ -304,8 +291,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("users.db"), b"not a sqlite database").unwrap();
         let ctx = test_ctx(dir.path());
-        assert_eq!(run(&ctx, "/new", "users/admin", true).await, GROUP_RESET_REFUSED);
-        assert!(shared_clear_refused(dir.path(), "googlechat", "users/admin", true));
+        assert_eq!(run(&ctx, "/new", "users/102", true).await, GROUP_RESET_REFUSED);
+        assert!(shared_clear_refused(dir.path(), "googlechat", "users/102", true));
     }
 
     #[tokio::test]

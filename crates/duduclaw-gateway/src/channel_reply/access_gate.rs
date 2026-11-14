@@ -44,18 +44,18 @@ mod notice_audience_tests {
         let employee = db.create_user("staff@test.local", "Staff", "StaffPass-12345",
             duduclaw_auth::UserRole::Employee).unwrap();
         db.bind_agent(&employee.id, "a", duduclaw_auth::AccessLevel::Operator).unwrap();
-        db.bind_channel_identity(&employee.id, "googlechat", "users/staff", true).unwrap();
-        db.bind_channel_identity(&employee.id, "googlechat", "users/unverified", false).unwrap();
+        db.bind_channel_identity(&employee.id, "googlechat", "users/101", true).unwrap();
+        db.bind_channel_identity(&employee.id, "googlechat", "users/102", false).unwrap();
         crate::pending_agent_notice::mark_model_changed(home.path(), "a");
         assert_eq!(append_pending_agent_notice("answer".into(), home.path(), "a",
-            "googlechat:spaces/a", "users/unverified"), "answer");
+            "googlechat:spaces/a", "users/102"), "answer");
         assert_eq!(append_pending_agent_notice("".into(), home.path(), "a",
-            "googlechat:spaces/a", "users/staff"), "");
+            "googlechat:spaces/a", "users/101"), "");
         assert_eq!(append_pending_agent_notice("answer".into(), home.path(), "a",
-            "googlechat:spaces/a", "users/staff"), "answer\n\n（已切換至新模型）");
+            "googlechat:spaces/a", "users/101"), "answer\n\n（已切換至新模型）");
         assert_eq!(append_pending_agent_notice("answer".into(), home.path(), "a",
-            "googlechat:spaces/a", "users/staff"), "answer");
-        assert!(!sender_is_internal_for_reply(home.path(), "odoolivechat:1", "users/staff", "a"));
+            "googlechat:spaces/a", "users/101"), "answer");
+        assert!(!sender_is_internal_for_reply(home.path(), "odoolivechat:1", "users/101", "a"));
     }
 
     #[test]

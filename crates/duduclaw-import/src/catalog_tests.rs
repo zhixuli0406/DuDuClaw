@@ -305,7 +305,7 @@ fn import_refuses_tasks_store_with_extra_unknown_table() {
         let file = store(schema, "CREATE TABLE planted_markers(name TEXT);");
         assert_eq!(extract(&request(SourceKind::AuthorityTasksSqlite, "tasks.db"), source(&file), None).err(), Some(Error::Schema));
         let message = take_schema_refusal().expect("refusal report").to_string();
-        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81)"), "{message}");
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.82)"), "{message}");
         assert!(message.contains("unexpected table planted_markers"), "{message}");
     }
 }

@@ -113,11 +113,11 @@ pub fn app_for_space(home: &Path, space: &str) -> Option<SpaceApp> {
 /// Preflight mirrors the sender's app selection. A configured app may still
 /// fail credential loading or delivery; that error must reach the caller.
 pub async fn has_sending_app(home: &Path, sender: Option<&str>, space: &str) -> bool {
-    if sender.is_some_and(|id| crate::agent_channels::store::agent_has_googlechat_section(home, id)) {
-        return true;
+    if let Some(id) = sender.filter(|id| crate::agent_channels::store::agent_has_googlechat_section(home, id)) {
+        return crate::agent_channels::store::agent_chat_app(home, id).await.is_some();
     }
     match app_for_space(home, space) {
-        Some(SpaceApp::Agent(id)) => crate::agent_channels::store::agent_has_googlechat_section(home, &id),
+        Some(SpaceApp::Agent(id)) => crate::agent_channels::store::agent_chat_app(home, &id).await.is_some(),
         Some(SpaceApp::Shared) | None => crate::config_crypto::read_encrypted_config_field(
             home, "channels", "googlechat_service_account_json",
         ).await.is_some_and(|value| !value.trim().is_empty()),

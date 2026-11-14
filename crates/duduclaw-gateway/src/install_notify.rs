@@ -353,7 +353,13 @@ pub(crate) async fn apply_decision(
                 "核准",
             ));
         }
-        Err(e) => return Err(format!("查詢身分失敗：{e}")),
+        Err(e) => {
+            tracing::warn!(error = %e, "Install sign-off identity lookup refused");
+            return Err(crate::decision_notify::refusal_text(
+                crate::decision_notify::PressAuth::DenyUnknown,
+                "核准",
+            ));
+        }
     };
     let user = match db.get_user(&user_id) {
         Ok(Some(u)) if u.status == UserStatus::Active => u,

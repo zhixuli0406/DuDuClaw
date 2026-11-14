@@ -149,7 +149,7 @@ async fn notify(state: std::sync::Arc<crate::webchat::WebChatState>, user: Strin
     let session = state.ctx.session_manager.get_or_create(&sid, "finance").await.unwrap();
     crate::channel_reply::FAILURE_SESSION.scope(std::sync::Arc::new(std::sync::Mutex::new(None)), async {
         crate::channel_reply::bind_failure_session(&sid, &session.created_at, "finance");
-        crate::webchat::turns::run::notify_undelivered(&state, &user, "finance", &sid, None, msg_id,
+        crate::webchat::turns::run::notify_undelivered(&state, &user, Some("finance"), &sid, None, msg_id,
             &format!("direct-{msg_id}"), &cancel).await;
     }).await;
 }

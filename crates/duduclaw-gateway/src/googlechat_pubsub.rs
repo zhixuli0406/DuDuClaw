@@ -715,7 +715,21 @@ mod googlechat_pubsub_tests {
         *h.fake.delivery.lock().unwrap() = vec![delivery("overload-replay", &notification())];
         pull(&h, &mut batch).await.unwrap();
         assert!(waiting.entered.try_recv().is_err());
-        assert!(h.fake.calls.lock().unwrap().iter().all(|(_, path, _)| path != "/spaces/AAA/messages"));
+        // The overload notice is spawned asynchronously; wait for that one
+        // send, while retaining the assertion that no model turn ran.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if h.fake.calls.lock().unwrap().iter().any(|(method, path, _)|
+                    *method == Method::POST && path == "/spaces/AAA/messages") { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let calls = h.fake.calls.lock().unwrap();
+        let messages: Vec<_> = calls.iter().filter(|(_, path, _)| path == "/spaces/AAA/messages").collect();
+        assert_eq!(messages.len(), 1, "only the rate-limited overload notice is sent");
+        assert_eq!(messages[0].0, Method::POST);
+        assert_eq!(messages[0].2["text"], "目前排隊中的訊息太多，這則訊息沒有受理，請稍後再傳一次。");
+        assert!(waiting.entered.try_recv().is_err());
     }
 
     #[tokio::test]

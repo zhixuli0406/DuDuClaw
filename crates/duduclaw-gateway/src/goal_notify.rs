@@ -3089,7 +3089,8 @@ mod tests {
     /// consulted for self-configuring channels — a stray `bot_token` under
     /// the agent's own `[channels.<ch>]` (which these four channels never
     /// actually populate) must not be mistaken for "configured", and its
-    /// absence must not make a marker-set channel fall through to `None`.
+    /// absence must not make a valid sending app fall through to `None`.
+    /// An explicit invalid own-app section still refuses, even with a shared app.
     #[tokio::test]
     async fn channel_token_self_configuring_ignores_bot_token_cascade() {
         let dir = tempfile::tempdir().unwrap();
@@ -3105,18 +3106,17 @@ mod tests {
         // above was never what resolved it.
         assert_eq!(channel_token(dir.path(), "alice", "googlechat").await, None);
 
-        // Now set the real marker — resolves, independent of the agent-level
-        // bot_token noise still sitting there.
+        // An explicit but invalid own-app section shadows the shared app.
+        // It must not become configured merely because the shared marker exists.
         std::fs::write(
             dir.path().join("config.toml"),
             "[channels]\ngooglechat_service_account_json = \"marker-only\"\n",
         )
         .unwrap();
-        assert!(
-            channel_token(dir.path(), "alice", "googlechat")
-                .await
-                .is_some()
-        );
+        assert_eq!(channel_token(dir.path(), "alice", "googlechat").await, None);
+        // With no own-app section, the shared marker is the sending app.
+        std::fs::remove_file(agent_dir.join("agent.toml")).unwrap();
+        assert!(channel_token(dir.path(), "alice", "googlechat").await.is_some());
     }
 
     /// End-to-end through `notify_agent_plain` (same `channel_token` +

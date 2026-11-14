@@ -181,7 +181,7 @@ pub(crate) async fn deliver_reset_notice(home: &Path, db: &UserDb, target: &str)
             Err(_) => NoticeRoute::Failed,
         },
     };
-    let channel = match db.verified_channels_for_user(target) {
+    let channel = match db.verified_dm_destinations_for_user(target) {
         Err(_) => NoticeRoute::Failed,
         Ok(links) if links.is_empty() => NoticeRoute::NoTarget,
         Ok(links) => {

@@ -3847,7 +3847,9 @@ async fn forward_to_channel_as(
     // converts once, then splits the converted text for the API limit.
     if channel_type == "googlechat" {
         let report = format!("📨 **{}** 的回報：\n\n{}", safe_agent, safe_text);
-        return crate::googlechat::send_text_to_space_as(home_dir, sender, channel_id, &report).await;
+        return crate::googlechat::send_text_to_space_as(home_dir, sender, channel_id, &report)
+            .await
+            .map_err(|e| e.to_string());
     }
 
     // Split the body into paragraph/line-aligned chunks instead of truncating.

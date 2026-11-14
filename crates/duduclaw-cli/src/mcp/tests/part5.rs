@@ -500,6 +500,20 @@ fn is_agent_id_shape_rejects_obvious_bad() {
 /// Exercise both real enqueue paths with a host pair instead of global env.
 #[tokio::test]
 async fn spawn_downstream_lineage_is_complete_or_dropped_and_audited() {
+    // Other tests mutate the host principal. Run this background-lineage
+    // fixture in a child so the fail-closed main-target gate sees no
+    // unrelated account from another test's home.
+    const CHILD: &str = "DUDUCLAW_SPAWN_LINEAGE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mcp::tests::part5::spawn_downstream_lineage_is_complete_or_dropped_and_audited"])
+            .env(CHILD, "1")
+            .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
+            .output().unwrap();
+        assert!(output.status.success(), "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
     for ephemeral in [false, true] {
         for (turn, session, missing) in [
             (Some("origin-turn"), Some("webchat:person#agent:boss"), None),

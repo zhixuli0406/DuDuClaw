@@ -442,6 +442,10 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 
 ### MCP 排程與提醒的通知對象
 
+`tasks_create` 搭配 `schedule` 時，`notify_channel` 填通道類型，`notify_chat_id` 填聊天、頻道或聊天室 ID。`create_reminder` 使用 `channel`（例如 `telegram`、`line`）與 `chat_id`。要使用已驗證的來源對話，請將成對欄位**全部省略**；由同一位員工執行的已登入 WebChat 回合也適用。不要自行將通道填為 `webchat`，只有 gateway 能選定該對話。一次性排程需要目的地，可使用已驗證的來源對話或另填成對欄位。
+
+Google Chat 員工專用應用程式區段優先於共用應用程式。若該區段不完整或無法讀取，預檢會拒絕；單獨的 `bot_token` 不代表已設定 Chat 應用程式，也不會改用共用憑證。
+
 從支援的聊天通道建立例行排程（`tasks_create` 搭配 cron `schedule`）、一次性排程或提醒（`create_reminder`）時，只要由同一位 AI 員工執行、對話中的使用者是 gateway 在該回合確認過的已綁定帳號，且沒有另填通知對象，結果就會回到**建立時的那個對話**。對話由 gateway 依進行中的回合解析並記錄，MCP 工具沒有讓員工選擇對話的參數，因此沒有 Bash 的員工無法把排程的預設通知導向其他對話。已授予 Bash 的員工與 gateway 以同一個 OS 使用者執行，可讀寫 gateway 的本機資料庫；對這類員工而言，這是減速帶，不是隔離。目前的因應方式是不給不該有 Bash 的員工 Bash、使用任務沙箱，或使用原生 Linux 員工隔離；詳見[這些守衛擋不住什麼](../../features/zh-TW/05-security-defense.md#這些守衛擋不住什麼)。支援 Google Chat、Telegram、LINE、Discord、Slack、WhatsApp、飛書、Microsoft Teams、企業微信與釘釘。WebChat 仍將結果存回對話紀錄，重新開啟即可查看。
 
 另填成對欄位時，優先使用指定對象：排程為 `notify_channel`／`notify_chat_id`，提醒為 `channel`／`chat_id`。無法確認來源對話時，例行工作只保留執行紀錄；提醒與一次性排程仍須指定目的地。透過 `tasks_create kind=goal` 建立的目標，其進度與需要人工處理的通知也會在相同條件下回到來源對話；沒有來源對話的目標使用員工原有的通知設定。
