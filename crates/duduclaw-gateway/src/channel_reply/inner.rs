@@ -2193,6 +2193,14 @@ pub(super) async fn build_reply_with_session_inner(
                 }
             }
         }
+        // Workspace claims (mail / calendar / sheets / docs / tasks): evidence
+        // is this employee's rows in this session; `[action_claims] mode =
+        // "notice"` (default) appends one staff-only notice before the reply
+        // is saved. See `claim_notice`.
+        reply = super::claim_notice::check_reply(
+            &ctx.home_dir, &agent_id, source_conversation, session_id, &turn_id, user_id, reply,
+        )
+        .await;
 
         // Record outbound for circuit breaker echo detection
         let reply_tokens = estimate_tokens(&reply);

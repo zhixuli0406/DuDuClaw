@@ -195,6 +195,36 @@ pub(crate) fn append_chained_line_locked(
     }
 }
 
+/// [`append_chained_line`] (no create-mode tightening) with a **hard upper
+/// bound** on the writer-lock wait, for callers that must not wait
+/// unboundedly on a busy log. Same lock protocol: on Unix the data-file
+/// `flock`, taken with `duduclaw_core::fs_lock::lock_handle_within`; elsewhere
+/// the sidecar lock via `with_file_lock_timeout`. A lock not acquired within
+/// `lock_wait` is an [`io::ErrorKind::TimedOut`] error and nothing is written.
+/// Every failure is returned.
+pub fn append_chained_line_within(
+    path: &Path,
+    record: serde_json::Map<String, serde_json::Value>,
+    lock_wait: std::time::Duration,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let guard = duduclaw_core::fs_lock::lock_handle_within(file, lock_wait)?;
+        chain_and_write(path, guard.file(), record)
+    }
+    #[cfg(not(unix))]
+    {
+        duduclaw_core::with_file_lock_timeout(path, lock_wait, || {
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            chain_and_write(path, &file, record)
+        })
+    }
+}
+
 /// A fail-closed writer for access-control audit events. The sidecar lock
 /// serializes Windows writers; on Unix the data-file flock also serializes
 /// with the existing best-effort writer. Neither lock failure is ignored.
@@ -366,6 +396,28 @@ mod tests {
         duduclaw_core::with_file_lock(&path, || {
             append_chained_line(&path, obj(&[("event", "credential_ledger")]), None)
         }).unwrap();
+        assert!(verify_chain(&path).unwrap().is_intact());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_append_times_out_on_a_held_writer_lock() {
+        let home = fresh_home();
+        let path = home.join("security_audit.jsonl");
+        append_chained_line(&path, obj(&[("event", "one")]), None).unwrap();
+        // Another writer holds the data-file lock the best-effort writer takes.
+        let holder = OpenOptions::new().append(true).open(&path).unwrap();
+        duduclaw_core::platform::flock_exclusive(&holder).unwrap();
+        let started = std::time::Instant::now();
+        let err = append_chained_line_within(&path, obj(&[("event", "two")]), std::time::Duration::from_millis(150))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(holder);
+        append_chained_line_within(&path, obj(&[("event", "two")]), std::time::Duration::from_millis(150)).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 2);
         assert!(verify_chain(&path).unwrap().is_intact());
         std::fs::remove_dir_all(home).unwrap();
     }

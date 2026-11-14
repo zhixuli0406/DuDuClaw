@@ -273,6 +273,7 @@ pub use crate::runtime::ConversationTurn;
 mod access_gate;
 mod breaker_wait;
 mod ccr_delivery;
+mod claim_notice;
 mod cli_env;
 mod cli_spawn;
 mod context;
