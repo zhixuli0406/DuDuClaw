@@ -1548,10 +1548,14 @@ pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
         Outcome::DriveRead(r) => render_json(&r, io),
         Outcome::DocsRead(r) => render_json(&r, io),
         Outcome::SlidesRead(r) => render_json(&r, io),
-        Outcome::GmailDraft(r) => tool_text(&format!(
-            "Draft created — NOT sent. Review and send it manually in Gmail.\nDraft ID: {}\nTo: {}\nSubject: {}",
-            r.draft_id, r.to, r.subject
-        )),
+        Outcome::GmailDraft(r) => {
+            let mut result = tool_text(&format!(
+                "Draft created — NOT sent. Review and send it manually in Gmail.\nDraft ID: {}\nTo: {}\nSubject: {}",
+                r.draft_id, r.to, r.subject
+            ));
+            result["_meta"]["duduclaw_pending_draft_id"] = serde_json::json!(r.draft_id);
+            result
+        },
         Outcome::CalendarCreate(r) => {
             let meet = r
                 .meet_link

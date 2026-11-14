@@ -14,7 +14,9 @@
 //!
 //! Windows: open children relative to pinned directory handles with NtCreateFile;
 //! enumerate, rename and delete by handle. Reject reparse points on opened handles.
-//! Directory handles deny delete sharing; write sharing is needed by native rename.
+//! Directory and data handles deny delete sharing; write sharing is needed by native rename.
+//! Only the attribute-only opens behind `entry`, `modified` and listing also share
+//! delete, so inspecting a name never makes a concurrent replace or delete fail.
 //! Other platforms retain best-effort path checks and canonical containment.
 
 use std::io;
@@ -106,6 +108,42 @@ pub(crate) struct EntryInfo {
 
 fn no_fault(_: WriteStep) -> io::Result<()> {
     Ok(())
+}
+
+/// The `limit` smallest names offered (each with a payload), for
+/// `SafeDir::list_after`: at most `limit + 1` names are held at any time, and
+/// it remembers whether any offered name was left out.
+struct Smallest<T> {
+    limit: usize,
+    heap: std::collections::BinaryHeap<(String, T)>,
+    dropped: bool,
+}
+
+impl<T: Ord> Smallest<T> {
+    fn new(limit: usize) -> Self {
+        Self { limit, heap: std::collections::BinaryHeap::new(), dropped: false }
+    }
+
+    fn offer(&mut self, name: &str, payload: T) {
+        if self.heap.len() < self.limit {
+            self.heap.push((name.to_string(), payload));
+            return;
+        }
+        self.dropped = true;
+        if self.heap.peek().is_some_and(|(largest, _)| name < largest.as_str()) {
+            self.heap.pop();
+            self.heap.push((name.to_string(), payload));
+        }
+    }
+
+    /// The kept names in ascending order, and the resume cursor (the last
+    /// kept name) when some offered name sorted after it was left out.
+    fn finish(self) -> (Vec<(String, T)>, Option<String>) {
+        let Self { heap, dropped, .. } = self;
+        let sorted = heap.into_sorted_vec();
+        let next = if dropped { sorted.last().map(|(name, _)| name.clone()) } else { None };
+        (sorted, next)
+    }
 }
 
 #[cfg(unix)]
@@ -513,8 +551,32 @@ mod imp {
             std::fs::File::from(self.fd.try_clone()?).set_permissions(std::fs::Permissions::from_mode(mode))
         }
 
+        /// Modification time of entry `name` itself (`lstat`, never
+        /// followed). `Ok(None)` when absent. A time before the epoch is
+        /// reported as the epoch.
+        #[allow(clippy::unnecessary_cast)] // st_mtime / st_mtime_nsec widths vary by target.
+        pub(crate) fn modified(&self, name: &str) -> io::Result<Option<std::time::SystemTime>> {
+            check_name(name)?;
+            Ok(self.stat(name)?.map(|st| {
+                let secs = (st.st_mtime as i64).max(0) as u64;
+                let nanos = (st.st_mtime_nsec as i64).clamp(0, 999_999_999) as u32;
+                std::time::UNIX_EPOCH
+                    .checked_add(std::time::Duration::new(secs, nanos))
+                    .unwrap_or(std::time::UNIX_EPOCH)
+            }))
+        }
+
         /// Every entry of this directory except `.` and `..`, never followed.
         pub(crate) fn list(&self) -> io::Result<Vec<EntryInfo>> {
+            self.list_bounded(usize::MAX).map(|(entries, _)| entries)
+        }
+
+        /// [`Self::list`] reading at most `limit` entries (besides `.` and
+        /// `..`) from the directory stream, so memory and work stay bounded
+        /// however large the directory is. The flag is `true` when entries
+        /// were left unread. Readdir order picks the subset; the returned
+        /// subset is sorted by name like [`Self::list`].
+        pub(crate) fn list_bounded(&self, limit: usize) -> io::Result<(Vec<EntryInfo>, bool)> {
             // A second handle on the same directory for `fdopendir`, which
             // takes ownership of it (closed by `closedir`).
             let raw = openat(
@@ -530,7 +592,8 @@ mod imp {
             if dir.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let mut names = Vec::new();
+            let mut names: Vec<Vec<u8>> = Vec::new();
+            let mut truncated = false;
             loop {
                 // SAFETY: `dir` is a valid open stream until `closedir` below.
                 let ent = unsafe { libc::readdir(dir) };
@@ -538,16 +601,20 @@ mod imp {
                     break;
                 }
                 // SAFETY: `d_name` is NUL-terminated per readdir(3).
-                let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
-                names.push(name.to_bytes().to_vec());
+                let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                if names.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                names.push(name.to_vec());
             }
             // SAFETY: `dir` came from `fdopendir` and is closed exactly once.
             unsafe { libc::closedir(dir) };
             let mut out = Vec::new();
             for raw_name in names {
-                if raw_name == b"." || raw_name == b".." {
-                    continue;
-                }
                 // A name that is not UTF-8 or not a plain component (it may
                 // hold `\\`), or one that cannot be stat'ed, is reported as an
                 // unnamed `Other` entry: it never fails the whole listing.
@@ -568,7 +635,59 @@ mod imp {
                 }
             }
             out.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(out)
+            Ok((out, truncated))
+        }
+
+        /// A resumable bounded listing: the (at most `limit`) smallest names
+        /// sorting strictly after `after` (byte order), sorted, never
+        /// followed. Every name in the stream is compared, but only the kept
+        /// ones are allocated and stat'ed, so memory and per-entry work stay
+        /// bounded by `limit`. Names that are not UTF-8 or not a plain
+        /// component are skipped. The second value is the cursor for the next
+        /// call (the last kept name) when names after it were left unread,
+        /// `None` once the end of the directory was reached.
+        pub(crate) fn list_after(&self, after: Option<&str>, limit: usize) -> io::Result<(Vec<EntryInfo>, Option<String>)> {
+            let raw = openat(
+                Some(self.fd.as_raw_fd()),
+                ".",
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(to_io)?;
+            // SAFETY: freshly returned fd; ownership moves to the DIR stream.
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            let dir = unsafe { libc::fdopendir(owned.into_raw_fd()) };
+            if dir.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let mut kept = super::Smallest::new(limit);
+            loop {
+                // SAFETY: `dir` is a valid open stream until `closedir` below.
+                let ent = unsafe { libc::readdir(dir) };
+                if ent.is_null() {
+                    break;
+                }
+                // SAFETY: `d_name` is NUL-terminated per readdir(3).
+                let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+                let Ok(name) = std::str::from_utf8(name) else { continue };
+                if check_name(name).is_err() || after.is_some_and(|after| name <= after) {
+                    continue;
+                }
+                kept.offer(name, ());
+            }
+            // SAFETY: `dir` came from `fdopendir` and is closed exactly once.
+            unsafe { libc::closedir(dir) };
+            let (names, next) = kept.finish();
+            let mut out = Vec::with_capacity(names.len());
+            for (name, ()) in names {
+                match self.entry(&name) {
+                    Ok(Some(info)) => out.push(info),
+                    Ok(None) => {}
+                    // Keep the name so a caller can still advance past it.
+                    Err(_) => out.push(EntryInfo { name, kind: EntryKind::Other, size: 0, nlink: 1 }),
+                }
+            }
+            Ok((out, next))
         }
     }
 }
@@ -591,7 +710,8 @@ mod imp {
         FILE_ID_BOTH_DIR_INFO, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
         FILE_DISPOSITION_INFO, FileDispositionInfo, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, DELETE, SYNCHRONIZE};
+        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        DELETE, SYNCHRONIZE};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     // Every child access is a single-component NtCreateFile relative to an
@@ -682,6 +802,26 @@ mod imp {
         // The descriptor is borrowed only for this synchronous NtCreateFile call.
         pub(super) fn relative_secure(&self, value: &str, access: u32, disposition: u32,
             options: u32, security: Option<&windows_sys::Win32::Security::SECURITY_DESCRIPTOR>) -> io::Result<File> {
+            // Native rename needs a target-directory writer; data handles never share DELETE.
+            self.nt_open(value, access, disposition, options, security, FILE_SHARE_READ | FILE_SHARE_WRITE)
+        }
+
+        /// The attribute-only open behind `entry`, `modified` and listing:
+        /// `FILE_READ_ATTRIBUTES` only, sharing read, write AND delete, so the
+        /// short-lived handle can never make a concurrent replace (rename onto
+        /// `name`) or delete of `name` fail with a sharing violation. Same
+        /// no-follow rules as every other open: one validated component,
+        /// relative to the re-validated pinned directory, with
+        /// `FILE_OPEN_REPARSE_POINT` (the leaf is never followed; callers
+        /// inspect the reparse attribute on the handle). Data handles keep
+        /// the strict share mode of [`Self::relative_secure`].
+        fn relative_metadata(&self, name: &str) -> io::Result<File> {
+            self.nt_open(name, FILE_READ_ATTRIBUTES, FILE_OPEN, 0, None,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        }
+
+        fn nt_open(&self, value: &str, access: u32, disposition: u32, options: u32,
+            security: Option<&windows_sys::Win32::Security::SECURITY_DESCRIPTOR>, share: u32) -> io::Result<File> {
             check_name(value)?;
             real_file(&self.dir, true, false)?;
             let mut wide: Vec<u16> = value.encode_utf16().collect();
@@ -701,7 +841,7 @@ mod imp {
             // output buffers. FILE_OPEN_REPARSE_POINT never follows the leaf.
             let status = unsafe { NtCreateFile(&mut handle, access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                 &attributes, status_block.as_mut_ptr(), std::ptr::null(), 0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, // Native rename needs a target-directory writer; never share DELETE.
+                share,
                 disposition, FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | options,
                 std::ptr::null(), 0) };
             nt_result(status)?;
@@ -709,8 +849,10 @@ mod imp {
             Ok(unsafe { File::from_raw_handle(handle) })
         }
 
+        /// What `name` is, never followed, through the delete-sharing
+        /// attribute-only open ([`Self::relative_metadata`]).
         pub(crate) fn entry(&self, name: &str) -> io::Result<Option<EntryInfo>> {
-            let file = match self.relative(name, FILE_READ_ATTRIBUTES, FILE_OPEN, 0) {
+            let file = match self.relative_metadata(name) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e),
@@ -874,13 +1016,102 @@ mod imp {
             delete(&file)
         }
 
+        /// Modification time of entry `name` itself (never followed).
+        /// `Ok(None)` when absent. Opened attribute-only and sharing DELETE
+        /// ([`Self::relative_metadata`]), so it never makes a concurrent
+        /// replace or delete of `name` fail.
+        pub(crate) fn modified(&self, name: &str) -> io::Result<Option<std::time::SystemTime>> {
+            let file = match self.relative_metadata(name) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            file.metadata()?.modified().map(Some)
+        }
+
         pub(crate) fn list(&self) -> io::Result<Vec<EntryInfo>> {
+            self.list_bounded(usize::MAX).map(|(entries, _)| entries)
+        }
+
+        /// [`Self::list`] reading at most `limit` entries (besides `.` and
+        /// `..`); the enumeration buffer is fixed, so work and memory stay
+        /// bounded. The flag is `true` when entries were left unread.
+        pub(crate) fn list_bounded(&self, limit: usize) -> io::Result<(Vec<EntryInfo>, bool)> {
+            let mut out = Vec::new();
+            let mut seen = 0usize;
+            let mut truncated = false;
+            self.each_name(&mut |value, attributes| {
+                if seen >= limit {
+                    truncated = true;
+                    return false;
+                }
+                seen += 1;
+                let unnamed = EntryInfo { name: String::new(), kind: EntryKind::Other, size: 0, nlink: 1 };
+                match value {
+                    Ok(name) if check_name(&name).is_ok() => {
+                        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                            out.push(EntryInfo { name, ..unnamed });
+                        } else {
+                            match self.entry(&name) {
+                                Ok(Some(info)) => out.push(info),
+                                Ok(None) => {},
+                                Err(_) => out.push(unnamed),
+                            }
+                        }
+                    }
+                    _ => out.push(unnamed),
+                }
+                true
+            })?;
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok((out, truncated))
+        }
+
+        /// A resumable bounded listing: the (at most `limit`) smallest names
+        /// sorting strictly after `after`, sorted, never followed. Every name
+        /// is compared, but only the kept ones are stat'ed (through the
+        /// delete-sharing attribute open), so per-entry work and memory stay
+        /// bounded by `limit`. Names that are not UTF-16 text or not a plain
+        /// component are skipped. The second value is the cursor for the next
+        /// call when names after the last kept one were left unread, `None`
+        /// once the end of the directory was reached.
+        pub(crate) fn list_after(&self, after: Option<&str>, limit: usize) -> io::Result<(Vec<EntryInfo>, Option<String>)> {
+            let mut kept = super::Smallest::new(limit);
+            self.each_name(&mut |value, attributes| {
+                if let Ok(name) = value {
+                    if check_name(&name).is_ok() && !after.is_some_and(|after| name.as_str() <= after) {
+                        kept.offer(&name, attributes);
+                    }
+                }
+                true
+            })?;
+            let (names, next) = kept.finish();
+            let mut out = Vec::with_capacity(names.len());
+            for (name, attributes) in names {
+                if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    out.push(EntryInfo { name, kind: EntryKind::Other, size: 0, nlink: 1 });
+                    continue;
+                }
+                match self.entry(&name) {
+                    Ok(Some(info)) => out.push(info),
+                    Ok(None) => {}
+                    // Keep the name so a caller can still advance past it.
+                    Err(_) => out.push(EntryInfo { name, kind: EntryKind::Other, size: 0, nlink: 1 }),
+                }
+            }
+            Ok((out, next))
+        }
+
+        /// Enumerate this directory by handle, calling `visit` with each
+        /// name except `.` and `..` (decoded from UTF-16) and its attributes
+        /// from the enumeration record. `visit` returns `false` to stop. The
+        /// enumeration buffer is fixed.
+        fn each_name(&self, visit: &mut dyn FnMut(Result<String, std::string::FromUtf16Error>, u32) -> bool) -> io::Result<()> {
             // Restart/continuation share a handle cursor, so serialize each full scan.
             let _guard = self.enumeration.lock().map_err(|_| io::Error::other("directory enumeration poisoned"))?;
             real_file(&self.dir, true, false)?;
             let mut storage = vec![0u64; 8192];
             let bytes_len = storage.len() * 8;
-            let mut out = Vec::new();
             let mut first = true;
             loop {
                 storage.fill(0);
@@ -909,22 +1140,8 @@ mod imp {
                     let wide = unsafe { std::slice::from_raw_parts(
                         storage.as_ptr().cast::<u8>().add(offset + header).cast::<u16>(), length / 2) };
                     let value = String::from_utf16(wide);
-                    if !matches!(value.as_deref(), Ok("." | "..")) {
-                        let unnamed = EntryInfo { name: String::new(), kind: EntryKind::Other, size: 0, nlink: 1 };
-                        match value {
-                            Ok(name) if check_name(&name).is_ok() => {
-                                if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                                    out.push(EntryInfo { name, ..unnamed });
-                                } else {
-                                    match self.entry(&name) {
-                                        Ok(Some(info)) => out.push(info),
-                                        Ok(None) => {},
-                                        Err(_) => out.push(unnamed),
-                                    }
-                                }
-                            }
-                            _ => out.push(unnamed),
-                        }
+                    if !matches!(value.as_deref(), Ok("." | "..")) && !visit(value, entry.FileAttributes) {
+                        return Ok(());
                     }
                     let next = entry.NextEntryOffset as usize;
                     if next == 0 { break; }
@@ -934,8 +1151,7 @@ mod imp {
                     offset += next;
                 }
             }
-            out.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(out)
+            Ok(())
         }
     }
 }
@@ -1151,10 +1367,29 @@ mod imp {
             std::fs::remove_file(self.path.join(name))
         }
 
+        /// Modification time of entry `name` itself (`symlink_metadata`).
+        pub(crate) fn modified(&self, name: &str) -> io::Result<Option<std::time::SystemTime>> {
+            check_name(name)?;
+            self.meta(name)?.map(|m| m.modified()).transpose()
+        }
+
         pub(crate) fn list(&self) -> io::Result<Vec<EntryInfo>> {
+            self.list_bounded(usize::MAX).map(|(entries, _)| entries)
+        }
+
+        /// [`Self::list`] reading at most `limit` entries; the flag is `true`
+        /// when entries were left unread.
+        pub(crate) fn list_bounded(&self, limit: usize) -> io::Result<(Vec<EntryInfo>, bool)> {
             let mut out = Vec::new();
+            let mut seen = 0usize;
+            let mut truncated = false;
             for entry in std::fs::read_dir(&self.path)? {
                 let Ok(entry) = entry else { continue };
+                if seen >= limit {
+                    truncated = true;
+                    break;
+                }
+                seen += 1;
                 let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                     out.push(EntryInfo {
                         name: String::new(),
@@ -1176,7 +1411,30 @@ mod imp {
                 }
             }
             out.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(out)
+            Ok((out, truncated))
+        }
+
+        /// The (at most `limit`) smallest names after `after`, and the resume
+        /// cursor when more remain (see the Unix implementation).
+        pub(crate) fn list_after(&self, after: Option<&str>, limit: usize) -> io::Result<(Vec<EntryInfo>, Option<String>)> {
+            let mut kept = super::Smallest::new(limit);
+            for entry in std::fs::read_dir(&self.path)? {
+                let Ok(entry) = entry else { continue };
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+                if check_name(&name).is_ok() && !after.is_some_and(|after| name.as_str() <= after) {
+                    kept.offer(&name, ());
+                }
+            }
+            let (names, next) = kept.finish();
+            let mut out = Vec::with_capacity(names.len());
+            for (name, ()) in names {
+                match self.entry(&name) {
+                    Ok(Some(info)) => out.push(info),
+                    Ok(None) => {}
+                    Err(_) => out.push(EntryInfo { name, kind: EntryKind::Other, size: 0, nlink: 1 }),
+                }
+            }
+            Ok((out, next))
         }
     }
 }

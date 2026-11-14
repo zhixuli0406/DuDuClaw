@@ -321,7 +321,21 @@ pub(crate) async fn run_approval_bound(
         }
     };
 
-    match broker.await_decision(&approval_id, poll).await {
+    let pending_tool = match subject {
+        ApprovalSubject::Install => Some("mcp_install"),
+        ApprovalSubject::ToolCall(tool) if duduclaw_core::tool_effect::effect_of_builtin(tool)
+            .is_some_and(|effect| effect != duduclaw_core::tool_effect::ToolEffect::Read) => Some(tool),
+        _ => None,
+    };
+    if let Some(tool) = pending_tool { broker.record_tool_pending_state(agent_id, tool, &approval_id, "pending"); }
+    let decision = broker.await_decision(&approval_id, poll).await;
+    match &decision {
+        Ok(ApprovalStatus::Approved) => { if let Some(tool) = pending_tool { broker.record_tool_pending_state(agent_id, tool, &approval_id, "completed"); } },
+        Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated | ApprovalStatus::Expired) =>
+            { if let Some(tool) = pending_tool { broker.record_tool_pending_state(agent_id, tool, &approval_id, "cancelled"); } },
+        _ => {},
+    }
+    match decision {
         Ok(ApprovalStatus::Approved) => match grant {
             None => InstallApprovalOutcome::Proceed,
             Some(g) => {

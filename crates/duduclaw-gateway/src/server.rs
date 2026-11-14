@@ -657,6 +657,33 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
     }
 
+    // Pending-confirmation ledger GC (expired ledgers, orphan locks, stale
+    // temp files). `maintenance` re-checks the gateway instance lock on every
+    // pass and does nothing in a process that does not hold it.
+    {
+        let home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                interval.tick().await;
+                let pass_home = home.clone();
+                match tokio::task::spawn_blocking(move || crate::pending_items::maintenance(&pass_home)).await {
+                    Ok(Ok(report)) => tracing::debug!(
+                        removed_ledgers = report.removed_ledgers,
+                        rewritten_ledgers = report.rewritten_ledgers,
+                        removed_locks = report.removed_locks,
+                        removed_temps = report.removed_temps,
+                        busy = report.busy,
+                        refused = report.refused,
+                        "pending ledger GC pass"
+                    ),
+                    Ok(Err(error)) => tracing::warn!(%error, "pending ledger GC pass failed"),
+                    Err(error) => tracing::warn!(%error, "pending ledger GC task failed"),
+                }
+            }
+        });
+    }
+
     // ── Forget by source: resume unfinished external steps (P2-B, D10) ───
     // An apply already deleted the rows and wrote the tombstones; what may
     // remain are its follow-up steps (auto wiki pages, review cards, hiding

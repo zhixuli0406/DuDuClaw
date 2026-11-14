@@ -1595,6 +1595,11 @@ pub(super) async fn build_reply_with_session_inner(
         default_language.as_deref(),
     );
 
+    let in_chat_approval = crate::approval::CURRENT_TRUSTED_REPLY_TARGET
+        .try_with(|target| target.is_some()).unwrap_or(false);
+    let effective_message = crate::pending_items::with_reminder(effective_message,
+        crate::pending_items::reminder(&ctx.home_dir, session_id, user_id, &agent_id, in_chat_approval));
+
     // #12 glue (2026-05-12) — request-boundary budget enforcement.
     //
     // Read the agent's `[budget] max_input_tokens` (0 = disabled,
@@ -2110,6 +2115,9 @@ pub(super) async fn build_reply_with_session_inner(
             None
         }
     };
+
+    // Persist even when the final model reply failed: the tool may have created a draft.
+    crate::pending_items::finish_turn(&ctx.home_dir, session_id, user_id, &agent_id, &turn_id);
 
     // KILLSWITCH [triggers] max_consecutive_errors / error_rate_threshold.
     crate::killswitch_triggers::record_reply_outcome(ctx, session_id, &agent_id, reply.is_some())

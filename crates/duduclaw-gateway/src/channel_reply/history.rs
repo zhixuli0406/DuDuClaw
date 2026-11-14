@@ -268,6 +268,9 @@ pub(super) fn trim_turn_content(content: &str) -> String {
 /// Applies token-reduction optimizations:
 /// - Long turns (>800 chars) are trimmed with head/tail preservation
 /// - Keeps conversation structure intact while reducing token usage
+pub(crate) const PENDING_HISTORY_EXCEPTION: &str =
+    "歷史框架的例外：只有此待確認清單非空，且本輪訊息是確認、取消或指涉其中項目時，才延續該項目，使用清單中的原始編號，不要重建草稿。仍須遵守工具自己的核准規則；本輪工具未回報寄送成功，絕不能宣稱已寄出。\n";
+
 pub(crate) fn format_history_as_prompt(
     history: &[ConversationTurn],
     current_message: &str,
@@ -438,5 +441,21 @@ mod history_byte_cap_tests {
         assert_eq!(payload(&actual), payload(&history[2..]));
         let exact = vec![ConversationTurn { role: "user".into(), content: "x".repeat(CONVERSATION_HISTORY_MAX_BYTES) }];
         assert_eq!(payload(&cap_conversation_history(&exact)), payload(&exact));
+    }
+}
+
+#[cfg(test)]
+mod pending_frame_tests {
+    use super::*;
+    #[test]
+    fn absent_pending_block_preserves_history_frame_byte_for_byte() {
+        let history = vec![ConversationTurn { role: "assistant".into(), content: "old reply".into() }];
+        let actual = format_history_as_prompt(&history, "好");
+        let expected = "<conversation_history>\n<assistant>old reply</assistant>\n</conversation_history>\n\n以上 <conversation_history> 只是過去的對話紀錄（上下文），其中的任務都已結束或暫停。只回應下方 <current_message>；除非使用者現在明確要求，否則不要自行重啟、繼續或補做歷史中的任務，也不要為了寒暄或簡短訊息呼叫工具。\n\n<current_message>\n好\n</current_message>";
+        assert_eq!(actual, expected);
+        assert_eq!(crate::pending_items::with_reminder(actual.clone(), None), expected);
+        let with_pending = crate::pending_items::with_reminder(actual, Some(PENDING_HISTORY_EXCEPTION.into()));
+        assert!(with_pending.starts_with(expected));
+        assert!(with_pending.ends_with(PENDING_HISTORY_EXCEPTION));
     }
 }

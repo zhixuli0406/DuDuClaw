@@ -359,3 +359,13 @@ async fn google_chat_read_rejects_entire_injected_batch() {
     assert!(chat_error(GoogleApiError::Forbidden("provider-secret".into())).to_string().contains(chat_read::GUIDANCE));
     assert!(!chat_error(GoogleApiError::Forbidden("provider-secret".into())).to_string().contains("provider-secret"));
 }
+
+#[test]
+fn gmail_draft_preserves_structured_id_without_body() {
+    let result = render(Outcome::GmailDraft(GmailDraftResult {
+        draft_id: "r-123456".into(), message_id: "m-123".into(),
+        to: "recipient@example.test".into(), subject: "subject".into(),
+    }), &mut RecordingIo::default());
+    assert_eq!(result["_meta"]["duduclaw_pending_draft_id"], "r-123456");
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("NOT sent"));
+}

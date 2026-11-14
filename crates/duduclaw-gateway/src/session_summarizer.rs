@@ -349,6 +349,7 @@ pub fn format_summarization_prompt(turns_text: &str) -> String {
          - Open questions / TODOs\n\
          - User preferences expressed\n\
          \n\
+         Keep identifiers of unfinished items and pending actions verbatim. \
          Do not invent details. Be terse — aim for under 500 characters. \
          Output format: dash-prefixed bullets only, no preamble or epilogue.\n\
          \n\

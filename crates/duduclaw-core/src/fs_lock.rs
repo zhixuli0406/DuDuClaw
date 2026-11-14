@@ -69,6 +69,25 @@ impl Drop for FileLockGuard {
     }
 }
 
+impl FileLockGuard {
+    /// The locked handle, e.g. to compare its identity with the current
+    /// directory entry after the wait.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+/// [`lock_exclusive_within`] on a sidecar handle the caller already opened
+/// itself (for example with `O_NOFOLLOW` and owner / file-type checks, which
+/// the path-based [`with_file_lock`] does not do). Same lock primitive and
+/// the same bound rules: `wait` is a hard upper bound, an enclosing
+/// [`with_lock_deadline`] can only shorten it, and a zero `wait` is a single
+/// non-blocking try. The caller is responsible for opening the right
+/// `<path>.lock` file and for re-checking that it is still linked.
+pub fn lock_handle_within(file: File, wait: std::time::Duration) -> io::Result<FileLockGuard> {
+    Ok(FileLockGuard { file: lock_within(file, wait, None)? })
+}
+
 /// Take the lock [`with_file_lock`] would take, returning a guard instead of
 /// running a closure. Blocks until the lock can be acquired. Two guards for
 /// the same path conflict even inside one process (each holds its own open
@@ -148,7 +167,10 @@ fn acquire(path: &Path) -> io::Result<File> {
 /// Poll a non-blocking exclusive try every 10 ms until `wait` has passed.
 /// An enclosing [`with_lock_deadline`] can only shorten the bound.
 fn acquire_within(path: &Path, wait: std::time::Duration) -> io::Result<File> {
-    let file = open_lock_file(path)?;
+    lock_within(open_lock_file(path)?, wait, Some(path))
+}
+
+fn lock_within(file: File, wait: std::time::Duration, path: Option<&Path>) -> io::Result<File> {
     let own_deadline = Instant::now() + wait;
     let scoped = LOCK_DEADLINE.with(Cell::get).filter(|scope| *scope < own_deadline);
     let deadline = scoped.unwrap_or(own_deadline);
@@ -162,9 +184,10 @@ fn acquire_within(path: &Path, wait: std::time::Duration) -> io::Result<File> {
             if scoped.is_some() {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "file lock deadline exceeded"));
             }
+            let held = path.map_or_else(|| "lock handle".to_string(), |path| lock_path_for(path).display().to_string());
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("lock_wait_timeout: {} still held after {} ms", lock_path_for(path).display(), wait.as_millis()),
+                format!("lock_wait_timeout: {held} still held after {} ms", wait.as_millis()),
             ));
         }
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));

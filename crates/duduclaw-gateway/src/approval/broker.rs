@@ -140,6 +140,17 @@ impl ApprovalBroker {
     /// signature untouched (every existing caller keeps working) while making
     /// the notification automatically OFF under `open_in_memory` — so no unit
     /// test ever attempts a network send.
+    /// Record lifecycle receipts for a tool approval. No arguments or body text.
+    pub fn record_tool_pending_state(&self, agent: &str, tool: &str, id: &ApprovalId, state: &str) {
+        if !matches!(state, "pending" | "completed" | "cancelled") { return; }
+        if let Some(home) = self.home_dir() {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                &home, agent, "approval_request", "tool approval", true,
+                &[("approval_id", serde_json::json!(id.as_str())), ("state", serde_json::json!(state)), ("pending_tool", serde_json::json!(tool))],
+            );
+        }
+    }
+
     pub(super) fn home_dir(&self) -> Option<PathBuf> {
         self.store
             .db_path

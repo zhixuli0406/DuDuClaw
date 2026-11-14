@@ -11,6 +11,19 @@
 //! effects. Unknown execution outcomes require operator reconciliation and
 //! are never replayed automatically. Decision and execution CAS recheck TTL.
 
+/// Channels supported by the bound in-chat decision sender/parser.
+pub fn supports_text_decisions(channel: &str) -> bool {
+    matches!(channel, "telegram" | "discord" | "slack" | "line")
+}
+
+pub fn pending_confirmation_hint(in_chat: bool) -> &'static str {
+    if in_chat {
+        "需要核准的項目請依核准卡的權限與指示操作，文字決定須附完整編號；聊天中的一般答覆不代表工具已成功。\n"
+    } else {
+        "需要核准的項目須由管理員在儀表板確認；在這個聊天室回覆「確認」不會核准，也不會寄出。\n"
+    }
+}
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
