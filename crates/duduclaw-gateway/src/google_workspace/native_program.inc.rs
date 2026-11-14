@@ -1605,10 +1605,14 @@ pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
         Outcome::CalendarCreate(r) if r.id.trim().is_empty() => tool_error(
             "Google Calendar returned no event id; the event may not have been created. Check the calendar before retrying.",
         ),
-        Outcome::GmailDraft(r) => tool_text(&format!(
-            "Draft created — NOT sent. Review and send it manually in Gmail.\nDraft ID: {}\nTo: {}\nSubject: {}",
-            r.draft_id, r.to, r.subject
-        )),
+        Outcome::GmailDraft(r) => {
+            let mut result = tool_text(&format!(
+                "Draft created — NOT sent. Review and send it manually in Gmail.\nDraft ID: {}\nTo: {}\nSubject: {}",
+                r.draft_id, r.to, r.subject
+            ));
+            result["_meta"]["duduclaw_pending_draft_id"] = serde_json::json!(r.draft_id);
+            result
+        },
         Outcome::CalendarCreate(r) => tool_text(&calendar_created_text(&r)),
         Outcome::SheetsAppend(r) => tool_text(&sheets_appended_text(&r)),
         Outcome::TasksCreate(t) => tool_text(&format!(

@@ -610,6 +610,7 @@ pub mod night_llm;
 // record shape + window filter, used by both `dispatch_engine` (judge
 // evidence block) and `prediction::task_observe` (A3 observation layer).
 pub mod recent_actions;
+mod pending_items;
 pub(crate) mod recent_skills;
 pub mod tool_activity;
 

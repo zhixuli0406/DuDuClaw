@@ -344,6 +344,21 @@ pub(crate) async fn handle_tools_call(
         );
     }
 
+    // Provider-owned metadata, separate from rendered text and model arguments.
+    // Both isolated and legacy transports must retain the same draft receipt.
+    if tool_name == "gmail_create_draft" && result.get("isError").and_then(Value::as_bool) != Some(true) {
+        let actual_agent = if isolated { default_agent.to_string() }
+            else { resolve_audit_agent(home_dir, Some(principal), default_agent) };
+        if let Some(id) = result.get("_meta")
+            .and_then(|meta| meta.get("duduclaw_pending_draft_id")).and_then(Value::as_str)
+        {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir, &actual_agent, tool_name, "Gmail draft (not sent)", true,
+                &[("draft_id", serde_json::json!(id)), ("state", serde_json::json!("draft"))],
+            );
+        }
+    }
+
     if matches!(tool_name, "google_chat_spaces" | "google_chat_messages") && !google_caller.is_dedicated() {
         let agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
         duduclaw_gateway::google_workspace::chat_read::audit(home_dir, &agent, tool_name, &arguments, &result);

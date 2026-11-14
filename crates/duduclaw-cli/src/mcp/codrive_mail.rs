@@ -381,9 +381,14 @@ pub(crate) async fn handle_mail_send(args: &Value, home_dir: &Path, default_agen
                 serde_json::json!(duduclaw_core::truncate_chars(&to, 120)),
             ),
             ("state", serde_json::json!("pending_confirmation")),
+            ("sent", serde_json::json!(false)),
         ],
     );
 
+    let in_chat = crate::mcp_isolation_identity::var(duduclaw_core::ENV_REPLY_CHANNEL)
+        .ok().and_then(|s| s.split(':').next().map(str::to_owned))
+        .is_some_and(|channel| duduclaw_gateway::approval::supports_text_decisions(&channel));
+    let confirmation_hint = duduclaw_gateway::approval::pending_confirmation_hint(in_chat);
     tool_text(
         &serde_json::json!({
             "sent": false,
@@ -391,7 +396,7 @@ pub(crate) async fn handle_mail_send(args: &Value, home_dir: &Path, default_agen
             "mail_id": mail_id,
             "approval_id": approval_id.as_str(),
             "message": format!(
-                "這封信【還沒有寄出】。已排入待確認寄件匣，等人在儀表板（或通道的確認按鈕）按下確認才會寄出；\
+                "這封信【還沒有寄出】。已排入待確認寄件匣。{confirmation_hint}\
                  逾時未確認會自動取消。回報時請說「已排入待確認」，不要說已寄出。收件者：{}",
                 duduclaw_core::truncate_chars(to.trim(), 120)
             ),

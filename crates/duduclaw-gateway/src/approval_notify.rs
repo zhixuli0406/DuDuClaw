@@ -161,7 +161,7 @@ pub(crate) fn approval_body_with(
         )),
         trajectory = crate::goal_state::xml_escape(&trajectory_line(rec)),
         deadline = deadline_phrase(rec),
-        id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
+        id = rec.id.as_str(),
     )
 }
 
@@ -549,8 +549,7 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         decision_id: rec.id.as_str(),
         body: &body,
         link: link.as_deref(),
-        no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁同意或拒絕，\
-                         或改用 Telegram／Slack／Discord／LINE 直接按按鈕。",
+        no_button_hint: "此通道須由管理員在儀表板的待辦決定頁同意或拒絕；在這個聊天室回覆「確認」不會核准。",
     };
     // O5: the token cascade + per-target deliver + first-success bookkeeping
     // this function used to inline is `notify_push::push`. Which destinations
@@ -940,6 +939,17 @@ mod tests {
             .is_err(),
             "a non-admin must not read this review's terminal decision through a channel",
         );
+    }
+
+    #[test]
+    fn text_decision_cards_show_full_uuid() {
+        let mut record = rec("mcp_call");
+        let id = "12345678-1234-4abc-8abc-123456789abc";
+        record.id = ApprovalId::from(id.to_string());
+        for reminder in [false, true] {
+            let body = approval_body(&record, reminder);
+            assert!(body.contains(&format!("編號：{id}")));
+        }
     }
 
     fn rec(kind: &str) -> ApprovalRecord {

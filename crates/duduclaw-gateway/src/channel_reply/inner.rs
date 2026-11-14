@@ -4,9 +4,100 @@ use super::*;
 pub(crate) const SELECTED_AGENT_UNAVAILABLE: &str =
     "⚠️ 指定的 AI 員工目前無法使用，請檢查頻道設定或重新選擇。";
 
-/// The shared Google Chat app found no employee to answer (no channel
-/// binding, no `default_agent`, no main employee, nobody called by `@`).
+/// No employee answers this channel conversation (no channel binding, no
+/// `default_agent`, no main employee, nobody called by `@`). Staff-facing.
 pub(crate) const NO_RESPONDER_TEXT: &str = "尚未設定負責回覆的 AI 員工，請管理員完成設定。";
+
+/// What a public visitor (website widget, Odoo Live Chat, unknown origin)
+/// sees when no employee answers: no operator-facing wording. Language is the
+/// global `[general] default_language` (no employee to take it from).
+pub(crate) fn no_responder_public_text(language: Option<&str>) -> &'static str {
+    let language = language.unwrap_or("zh-TW");
+    let primary = language.split(['-', '_']).next().unwrap_or("");
+    match (primary, language) {
+        (_, "zh-CN" | "zh_CN") => "目前无法提供服务，请稍后再试。",
+        ("en", _) => "This service is not available right now. Please try again later.",
+        ("ja", _) => "現在サービスをご利用いただけません。しばらくしてからもう一度お試しください。",
+        _ => "目前無法提供服務，請稍後再試。",
+    }
+}
+
+/// Fixed channel label for the no-responder log line (never the user or the
+/// conversation id). Unknown session shapes are "unknown".
+fn no_responder_channel(session_id: &str) -> &'static str {
+    if crate::odoo_livechat::is_public_visitor_session(session_id) {
+        return crate::odoo_livechat::SESSION_PREFIX;
+    }
+    if session_id
+        .split_once(':')
+        .is_some_and(|(kind, id)| kind == "widget-visitor" && !id.is_empty())
+    {
+        return "widget-visitor";
+    }
+    crate::trajectory_guard::channel_from_session_id(session_id).unwrap_or("unknown")
+}
+
+/// Whether the no-responder setup sentence may be shown: only to a requester
+/// the host verified as internal — an authenticated dashboard account on
+/// WebChat, or a messaging sender whose verified channel identity maps to an
+/// active company account (the lookup `sender_is_internal_for_reply` uses;
+/// with no employee there is no per-employee binding to require). Anything
+/// that cannot be decided gets the neutral line.
+fn no_responder_requester_is_internal(home: &Path, session_id: &str, user_id: &str) -> bool {
+    if super::assembly::public_session(session_id) {
+        return false;
+    }
+    if let Ok(principal) = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone) {
+        return !principal.is_empty() && !crate::webchat::is_widget_visitor(&principal);
+    }
+    if user_id.is_empty() || !footer_applies_to_session(session_id) {
+        return false;
+    }
+    crate::trajectory_guard::channel_from_session_id(session_id).is_some_and(|channel| {
+        !matches!(
+            crate::trigger_route::access::lookup_channel_sender(home, channel, user_id).sender,
+            crate::trigger_route::access::Sender::Unmapped
+        )
+    })
+}
+
+/// The fixed no-responder notices (both wordings, every language). Nothing
+/// else may take the live-only delivery path.
+pub(crate) fn is_no_responder_notice(text: &str) -> bool {
+    text == NO_RESPONDER_TEXT
+        || ["zh-TW", "zh-CN", "en", "ja"]
+            .into_iter()
+            .any(|language| text == no_responder_public_text(Some(language)))
+}
+
+/// One warn per channel per window: a public widget can be hit repeatedly.
+fn warn_no_responder(channel: &'static str) {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let now = std::time::Instant::now();
+    let due = {
+        let mut last = LAST
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let due = last
+            .get(channel)
+            .is_none_or(|at| now.duration_since(*at) >= WINDOW);
+        if due {
+            last.insert(channel, now);
+        }
+        due
+    };
+    if due {
+        warn!(
+            channel,
+            "no AI employee resolves for this channel reply — answered without a model call; \
+             set a main employee, `[general] default_agent`, or a channel binding"
+        );
+    }
+}
 
 /// Inner implementation shared by both default-agent and explicit-agent paths.
 ///
@@ -31,6 +122,21 @@ pub(crate) const NO_RESPONDER_TEXT: &str = "尚未設定負責回覆的 AI 員�
     )
 )]
 pub(super) async fn build_reply_with_session_inner(
+    text: &str,
+    ctx: &ReplyContext,
+    agent_override: Option<&str>,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    // Keep the instrumented future small even for callers that bypass the
+    // guarded entry points: debug task-local poll frames copy their futures.
+    Box::pin(build_reply_with_session_inner_impl(
+        text, ctx, agent_override, session_id, user_id, on_progress,
+    )).await
+}
+
+async fn build_reply_with_session_inner_impl(
     text: &str,
     ctx: &ReplyContext,
     agent_override: Option<&str>,
@@ -232,13 +338,22 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
     };
-    // The shared Google Chat app with nobody to answer used to run the turn
-    // with an empty agent id (the default model, no employee's instructions
-    // or memory). Refuse instead; the access gate and takeover ran above.
-    if agent.is_none()
-        && crate::trajectory_guard::channel_from_session_id(session_id) == Some("googlechat")
-    {
-        return NO_RESPONDER_TEXT.into();
+    // Nobody answers: this used to run the turn with an empty agent id (the
+    // default model, full tools, no employee's instructions, MCP config,
+    // file guard or cwd). Refuse on every session, without a model call; the
+    // access gate, takeover and `@` routing ran above. No session exists, so
+    // the fixed notice is delivered live only and never stored. Everyone gets
+    // the neutral line; only a requester the host verified as internal gets
+    // the setup sentence.
+    if agent.is_none() {
+        let channel = no_responder_channel(session_id);
+        warn_no_responder(channel);
+        super::mark_no_responder_notice();
+        if no_responder_requester_is_internal(&ctx.home_dir, session_id, user_id) {
+            return NO_RESPONDER_TEXT.into();
+        }
+        let language = crate::prompt_identity::read_default_language(&ctx.home_dir).await;
+        return no_responder_public_text(language.as_deref()).into();
     }
     if let Some(a) = agent {
         // Revalidate the actual LoadedAgent, not the earlier selected name.
@@ -1589,7 +1704,7 @@ pub(super) async fn build_reply_with_session_inner(
     let _knowledge_ledger = crate::knowledge::ledger::open(&agent_id, &turn_id);
     let turn_knowledge = match agent_dir.as_ref() {
         Some(dir) => {
-            crate::knowledge::auto_retrieve::prepare(crate::knowledge::auto_retrieve::TurnInput {
+            Box::pin(crate::knowledge::auto_retrieve::prepare(crate::knowledge::auto_retrieve::TurnInput {
                 home: ctx.home_dir.clone(),
                 users: None,
                 agent_id: agent_id.clone(),
@@ -1597,7 +1712,7 @@ pub(super) async fn build_reply_with_session_inner(
                 requester: crate::knowledge::turn_requesters::current_requester(),
                 query: text.to_string(),
                 turn_id: turn_id.clone(),
-            })
+            }))
             .await
         }
         None => Default::default(),
@@ -1643,6 +1758,10 @@ pub(super) async fn build_reply_with_session_inner(
         effective_message,
         session_id.split(':').next().unwrap_or("unknown"),
     );
+    let in_chat_approval = crate::approval::CURRENT_TRUSTED_REPLY_TARGET
+        .try_with(|target| target.is_some()).unwrap_or(false);
+    let effective_message = crate::pending_items::with_reminder(effective_message,
+        crate::pending_items::reminder(&ctx.home_dir, session_id, user_id, &agent_id, in_chat_approval));
 
     // #12 glue (2026-05-12) — request-boundary budget enforcement.
     //
@@ -1654,13 +1773,13 @@ pub(super) async fn build_reply_with_session_inner(
     // Compression failure is non-fatal; the provider-independent history
     // byte ceiling still applies, including throughout summary back-off.
     let mut full_system_prompt = full_system_prompt;
-    let (conversation_history, compression_info) = maybe_compress_history(
+    let (conversation_history, compression_info) = Box::pin(maybe_compress_history(
         &mut full_system_prompt,
         conversation_history,
         &effective_message,
         &agent_id,
         session_id,
-    )
+    ))
     .await;
 
     // RFC-25 Phase 1 (L8): provider-agnostic routing via the centralized
@@ -1775,7 +1894,7 @@ pub(super) async fn build_reply_with_session_inner(
         let hb_session_id = session_id;
         Box::pin(async move {
             let work =
-                crate::runtime_dispatch::run_agent_prompt_detailed(crate::runtime_dispatch::AgentPrompt {
+                Box::pin(crate::runtime_dispatch::run_agent_prompt_detailed(crate::runtime_dispatch::AgentPrompt {
                     agent_dir: hb_agent_dir,
                     home_dir: hb_home,
                     agent_id: hb_agent_id,
@@ -1793,7 +1912,8 @@ pub(super) async fn build_reply_with_session_inner(
                     effort: None,
                     // P0/WP-B: ordinary caller — failover behavior unchanged.
                     allow_cross_family_failover: true,
-                });
+                    purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+                }));
             let work = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), work);
             tokio::pin!(work);
             let mut ticker =
@@ -1850,7 +1970,7 @@ pub(super) async fn build_reply_with_session_inner(
     } else {
         Box::pin(async {
             #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,false);
-            call_claude_cli_rotated(
+            Box::pin(call_claude_cli_rotated(
             &effective_message,
             &model,
             &full_system_prompt,
@@ -1862,7 +1982,8 @@ pub(super) async fn build_reply_with_session_inner(
             &conversation_history,
             &account_pool,
             None,
-        ).await
+            crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+        )).await
             .map(|text| ReplyAttempt::new(text, ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude)))
             .map_err(|error| ReplyFailure::simple(ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude), error))
         })
@@ -2186,6 +2307,8 @@ pub(super) async fn build_reply_with_session_inner(
     // in-process operator tool loop. Never persist an empty thinking-only turn.
     let reply = reply.map(|text| duduclaw_core::think_tags::strip_reasoning_prefix(&text))
         .filter(|text| !text.trim().is_empty());
+    // Persist even when the final model reply failed: the tool may have created a draft.
+    crate::pending_items::finish_turn(&ctx.home_dir, session_id, user_id, &agent_id, &turn_id);
 
     // KILLSWITCH [triggers] max_consecutive_errors / error_rate_threshold.
     crate::killswitch_triggers::record_reply_outcome(ctx, session_id, &agent_id, reply.is_some())
@@ -2261,6 +2384,14 @@ pub(super) async fn build_reply_with_session_inner(
                 }
             }
         }
+        // Workspace claims (mail / calendar / sheets / docs / tasks): evidence
+        // is this employee's rows in this session; `[action_claims] mode =
+        // "notice"` (default) appends one staff-only notice before the reply
+        // is saved. See `claim_notice`.
+        reply = super::claim_notice::check_reply(
+            &ctx.home_dir, &agent_id, source_conversation, session_id, &turn_id, user_id, reply,
+        )
+        .await;
 
         // Record outbound for circuit breaker echo detection
         let reply_tokens = estimate_tokens(&reply);
@@ -3640,6 +3771,8 @@ pub(super) async fn build_reply_with_session_inner(
                                             effort: None,
                                             // P0/WP-B: ordinary caller — failover behavior unchanged.
                                             allow_cross_family_failover: true,
+                                            // GVU on this employee's own directory.
+                                            purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
                                         },
                                     )
                                     .await
@@ -3952,9 +4085,9 @@ pub(super) async fn build_reply_with_session_inner(
                 let (result, denied) = crate::autonomous_runtime::scope(
                     &home_for_compress, &agent_for_compress, &[],
                     async {
-                        let result = if has_unprotected { super::cli_spawn::call_background_utility(
+                        let result = if has_unprotected { Box::pin(super::cli_spawn::call_background_utility(
                             &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
-                        )
+                        ))
                         .await } else { Ok(String::new()) };
                         (result, crate::autonomous_runtime::was_denied())
                     },
