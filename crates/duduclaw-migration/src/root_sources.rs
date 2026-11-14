@@ -223,6 +223,14 @@ mod actual_stores_tests {
         }
     }
     #[test]
+    fn migration_source_skips_local_mcp_telemetry_and_auth_failure_detail() {
+        // v1.82: last-use telemetry and the refused-credential detail log are local
+        // diagnostics (the detail carries peer addresses), never authority or content.
+        for path in ["mcp_keys_usage.db","mcp_auth_failures.jsonl","mcp_auth_failures.jsonl.1","mcp_auth_failures.jsonl.lock"] {
+            assert!(classify(Path::new(path)).is_none(),"{path}");
+        }
+    }
+    #[test]
     fn migration_source_session_content_and_channel_settings_have_distinct_ids() {
         let tmp=tempfile::tempdir().unwrap();let agent=tmp.path().join("agents/sales");std::fs::create_dir_all(&agent).unwrap();
         std::fs::write(agent.join("agent.toml"),"").unwrap();std::fs::write(tmp.path().join("sessions.db"),"").unwrap();

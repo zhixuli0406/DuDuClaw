@@ -864,6 +864,14 @@ impl McpDispatcher {
         // attributed to the key's client id, never the server's employee.
         if let Some(crate::mcp::RemoteAccess::Unbound(reason)) = remote {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            // v1.82: also counted in the bounded `mcp_auth_failed` security
+            // audit (reason `key_unbound`, the stored key id when the store
+            // decided the key) against this HTTP request's peer and route.
+            crate::mcp_auth_audit::record_remote_unbound(
+                crate::mcp_auth::current_call_matches(principal)
+                    .as_ref()
+                    .and_then(|call| call.stored_key_id()),
+            );
             duduclaw_security::audit::append_tool_call_denied(
                 &self.home_dir,
                 &duduclaw_core::truncate_chars(&principal.client_id, 64),

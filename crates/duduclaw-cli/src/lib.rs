@@ -53,6 +53,7 @@ pub mod mcp_alias; // T5 O3/O4/O13: merged-entry parameter parsing (wiki scope /
 // T5 O14: `mcp_auth_strategy` (a never-constructed Strategy-Pattern
 // abstraction) was folded into `mcp_auth::strategy` on 2026-09-29.
 pub mod mcp_auth;
+pub(crate) mod mcp_auth_audit; // v1.82: bounded MCP auth-failure audit (hourly chain records + capped detail file)
 pub mod mcp_capability; // W22-P0 ADR-002: inject_capability_headers + negotiate_capabilities
 pub mod mcp_db; // §13.7 WP-D: read-only SQL data-source MCP tools
 pub mod mcp_dispatch; // W20-P1 Phase 2A: transport-agnostic dispatcher

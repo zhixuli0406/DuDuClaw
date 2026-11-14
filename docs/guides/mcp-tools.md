@@ -178,6 +178,36 @@ revocation above is the guarantee. Restoring or copying the whole DuDuClaw home 
 a backup resets those creation times, so per-employee keys issued before the restore
 are refused and must be re-issued.
 
+**Refused keys are audited.** Every refused credential is recorded with a `reason`
+— one of `missing_header`, `bad_scheme`, `malformed_key`, `wrong_credential_type`,
+`unknown_key`, `key_disabled`, `key_expired`, `key_deleted`, `key_unbound` or
+`store_unavailable` — and a fixed `route` label (`mcp`, `mcp_v1_call`,
+`mcp_v1_stream`, …). A disabled, expired, deleted or unbound key adds its key id
+(`mk_…`). No record contains the key, a part of it, its fingerprint, the query
+string or the User-Agent. Records go to two files:
+
+- `<home>/security_audit.jsonl`, the hash-chained security audit (plus a warning in
+  the server log). A refusal of an **existing key** — disabled, expired, deleted, or
+  its employee no longer exists — is written at once as `mcp_auth_failed` with the
+  key id: once per key and reason per hour, and the rest of that hour's attempts as
+  one more record with a `count` after the hour. **Every other refusal** is counted
+  into one `mcp_auth_failed_summary` per hour: the count per reason, the number of
+  distinct sources (up to 1,024), any records that could not be written, and the
+  name of the detail file. So someone without a valid key adds at most one record
+  an hour to the security audit, and a revoked key that an integration keeps
+  retrying shows up at once with its key id.
+- `<home>/mcp_auth_failures.jsonl` (owner-only), the per-minute detail with the
+  `source`: the peer address the server's socket saw (never `X-Forwarded-For`;
+  behind a reverse proxy this is the proxy). On `http-server` the first failure per
+  source, reason and key in a minute is written at once and the rest of that minute
+  as one record with a `count`; at most 60 such records a minute, anything beyond
+  summed into one `source: "many"` record. At 4 MiB the file is renamed to
+  `mcp_auth_failures.jsonl.1`, replacing the previous one, so the two together stay
+  under about 8 MiB. `duduclaw import` does not migrate it.
+
+The stdio `mcp-server` writes at most one `mcp_auth_failed` record per process to
+the security audit, and no detail line.
+
 External keys and each employee's own stdio `mcp-server` are not affected. v1.83
 will run every tool as the key's employee and lift the refusal.
 

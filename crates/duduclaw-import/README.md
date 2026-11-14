@@ -102,7 +102,9 @@ schema with a fresh store). Unlike the other authority stores it pins `PRAGMA us
 (set by the catalog itself); any other version is a schema error. Only `name` and `deleted_at`
 are authorized for reading; the internal-key, pending-legacy, ignored-entry and notice tables
 are never read. `mcp_keys_usage.db` (last-use telemetry) authenticates nothing and has no
-catalog: it is not imported.
+catalog: it is not imported. Likewise `mcp_auth_failures.jsonl` and its rotated
+`mcp_auth_failures.jsonl.1` (v1.82 per-minute detail of refused MCP credentials, peer
+addresses included) are local diagnostics, not authority: they are not imported.
 A fingerprint is never evidence of authority in the new installation: every key that is not
 deleted becomes a `Connector` re-issue obligation named `mcp_key:<name>` with
 `requires_reentry`; only `name` and `deleted_at` are authorized for reading.

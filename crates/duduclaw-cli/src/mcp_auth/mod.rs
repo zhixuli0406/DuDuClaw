@@ -89,6 +89,9 @@ pub(crate) struct AuthenticatedCall {
     principal: Principal,
     credential_ref: Option<duduclaw_core::google_identity::CredentialRef>,
     kind: PrincipalKind,
+    /// The hashed-store row id (`mk_…`) when the store decided the key, for
+    /// the security audit only (`mcp_auth_audit`, reason `key_unbound`).
+    stored_key_id: Option<String>,
 }
 
 impl AuthenticatedCall {
@@ -102,11 +105,16 @@ impl AuthenticatedCall {
     pub(crate) fn kind(&self) -> &PrincipalKind {
         &self.kind
     }
+    /// The hashed-store row id of the key, when the store decided it.
+    pub(crate) fn stored_key_id(&self) -> Option<&str> {
+        self.stored_key_id.as_deref()
+    }
     pub(crate) fn without_reference(principal: Principal) -> Self {
         Self {
             principal,
             credential_ref: None,
             kind: PrincipalKind::Other,
+            stored_key_id: None,
         }
     }
     /// The same call with the authority's decision attached.
@@ -127,6 +135,7 @@ impl AuthenticatedCall {
                 sha256: format!("{:x}", sha2::Sha256::digest(raw.as_bytes())),
             }),
             kind: PrincipalKind::Other,
+            stored_key_id: None,
         }
     }
 }
@@ -191,6 +200,33 @@ pub enum InactiveReason {
 
 /// The one external text for an expired or disabled stored key.
 pub const KEY_INACTIVE_MESSAGE: &str = "API key is expired or disabled";
+
+/// A refused credential as the security audit sees it (v1.82,
+/// `mcp_auth_failed` — `crate::mcp_auth_audit`). `error` is the unchanged
+/// decision: every caller's status code and text come from it alone.
+/// `stored_key_id` is the id (`mk_…`) of the hashed-store row the presented
+/// key resolved to (a disabled, expired or deleted dashboard key), taken
+/// from the row the decision already loaded — never derived from the
+/// presented text, and no extra store read is made for it.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub(crate) error: AuthError,
+    pub(crate) stored_key_id: Option<String>,
+}
+
+impl From<AuthError> for Refusal {
+    fn from(error: AuthError) -> Self {
+        Self { error, stored_key_id: None }
+    }
+}
+
+impl Refusal {
+    /// The audit reason (`disabled` / `expired` come from the error itself;
+    /// an `UnknownKey` decided from a stored row is a deleted key).
+    pub(crate) fn audit_reason(&self) -> crate::mcp_auth_audit::FailureReason {
+        crate::mcp_auth_audit::FailureReason::from_auth_error(&self.error, self.stored_key_id.is_some())
+    }
+}
 
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -444,15 +480,54 @@ pub(crate) fn authenticate_with_key_call(
     raw_key: &str,
     config_dir: &Path,
 ) -> Result<AuthenticatedCall, AuthError> {
+    authenticate_with_key_call_refusal(raw_key, config_dir).map_err(|refusal| refusal.error)
+}
+
+/// [`authenticate_with_key_call`] with the refusal's audit detail
+/// ([`Refusal`]). Same decision.
+pub(crate) fn authenticate_with_key_call_refusal(
+    raw_key: &str,
+    config_dir: &Path,
+) -> Result<AuthenticatedCall, Refusal> {
     let registry = load_key_registry(config_dir);
-    authenticate_against_registry(raw_key, config_dir, &registry).map(|(principal, kind)| {
-        AuthenticatedCall::verified(
-            principal,
+    decide_against_registry(raw_key, config_dir, &registry)
+        .map(|decided| decided.into_call(raw_key))
+}
+
+/// [`authenticate_with_key`] with the refusal's audit detail ([`Refusal`]).
+/// Same decision.
+pub(crate) fn authenticate_with_key_refusal(
+    raw_key: &str,
+    config_dir: &Path,
+) -> Result<Principal, Refusal> {
+    let registry = load_key_registry(config_dir);
+    decide_against_registry(raw_key, config_dir, &registry).map(|decided| decided.principal)
+}
+
+/// A key the authority accepted: the principal, how it was decided, and the
+/// hashed-store row id when the store decided it.
+struct Decided {
+    principal: Principal,
+    kind: PrincipalKind,
+    stored_key_id: Option<String>,
+}
+
+impl Decided {
+    fn unstored(principal: Principal, kind: PrincipalKind) -> Self {
+        Self { principal, kind, stored_key_id: None }
+    }
+
+    /// The call for a legacy-format API key (`CredentialKind::Legacy`).
+    fn into_call(self, raw_key: &str) -> AuthenticatedCall {
+        let mut call = AuthenticatedCall::verified(
+            self.principal,
             raw_key,
             duduclaw_core::google_identity::CredentialKind::Legacy,
         )
-        .with_kind(kind)
-    })
+        .with_kind(self.kind);
+        call.stored_key_id = self.stored_key_id;
+        call
+    }
 }
 
 /// Core lookup shared by [`authenticate_with_key`] (fresh parse every call)
@@ -482,28 +557,48 @@ fn authenticate_against_registry(
     config_dir: &Path,
     registry: &HashMap<String, KeyEntry>,
 ) -> Result<(Principal, PrincipalKind), AuthError> {
+    decide_against_registry(raw_key, config_dir, registry)
+        .map(|decided| (decided.principal, decided.kind))
+        .map_err(|refusal| refusal.error)
+}
+
+/// The decision of [`authenticate_against_registry`], keeping the stored
+/// row's id on both outcomes (v1.82 auth-failure audit). The decision, its
+/// order and its store reads are exactly those documented there.
+fn decide_against_registry(
+    raw_key: &str,
+    config_dir: &Path,
+    registry: &HashMap<String, KeyEntry>,
+) -> Result<Decided, Refusal> {
     use duduclaw_core::mcp_key_store::{self as ks, Authority};
     if !is_valid_key_format(raw_key) {
-        return Err(AuthError::InvalidFormat);
+        return Err(AuthError::InvalidFormat.into());
     }
     let legacy = legacy_lookup(raw_key, registry);
     match ks::resolve(config_dir, raw_key) {
         Err(error) => {
             tracing::warn!(%error, "MCP key store unreadable — denying key authentication (fail-closed)");
-            Err(AuthError::StoreUnavailable)
+            Err(AuthError::StoreUnavailable.into())
         }
-        Ok(Authority::Stored(key)) => stored_principal(config_dir, &key).map(|principal| {
-            (principal, PrincipalKind::Stored { agent_binding: key.agent_binding.clone(), key_created_at: key.created_at })
-        }),
+        Ok(Authority::Stored(key)) => match stored_principal(config_dir, &key) {
+            Ok(principal) => Ok(Decided {
+                principal,
+                kind: PrincipalKind::Stored { agent_binding: key.agent_binding.clone(), key_created_at: key.created_at },
+                stored_key_id: Some(key.id.clone()),
+            }),
+            Err(error) => Err(Refusal { error, stored_key_id: Some(key.id.clone()) }),
+        },
         Ok(Authority::Internal(internal)) => match legacy {
             Some(entry) if !entry.is_external && entry.client_id == ks::RESERVED_INTERNAL_CLIENT_ID => {
                 if !ks::legacy_age_accepts(internal.created_at, Utc::now()) {
                     let days_old = Utc::now().signed_duration_since(internal.created_at).num_days().max(0) as u64;
-                    return Err(AuthError::KeyExpired { days_old });
+                    return Err(AuthError::KeyExpired { days_old }.into());
                 }
-                legacy_principal(entry).map(|principal| (principal, PrincipalKind::GatewayInternal))
+                legacy_principal(entry)
+                    .map(|principal| Decided::unstored(principal, PrincipalKind::GatewayInternal))
+                    .map_err(Refusal::from)
             }
-            _ => Err(AuthError::UnknownKey),
+            _ => Err(AuthError::UnknownKey.into()),
         },
         Ok(Authority::Legacy(window)) => match legacy {
             Some(entry) => {
@@ -512,15 +607,17 @@ fn authenticate_against_registry(
                     window = ?window,
                     "MCP key authenticated through the legacy [mcp_keys] read path"
                 );
-                legacy_principal(entry).map(|principal| (principal, PrincipalKind::Other))
+                legacy_principal(entry)
+                    .map(|principal| Decided::unstored(principal, PrincipalKind::Other))
+                    .map_err(Refusal::from)
             }
-            None => Err(AuthError::UnknownKey),
+            None => Err(AuthError::UnknownKey.into()),
         },
         Ok(Authority::Unknown) => {
             if legacy.is_some() {
                 tracing::info!("MCP key refused: a [mcp_keys] entry the key store does not know is ignored");
             }
-            Err(AuthError::UnknownKey)
+            Err(AuthError::UnknownKey.into())
         }
     }
 }
@@ -761,6 +858,15 @@ pub(crate) fn authenticate_from_env_cached_call(
     config_dir: &Path,
     cache: &KeyRegistryCache,
 ) -> Result<AuthenticatedCall, AuthError> {
+    authenticate_from_env_cached_call_refusal(config_dir, cache).map_err(|refusal| refusal.error)
+}
+
+/// [`authenticate_from_env_cached_call`] with the refusal's audit detail
+/// ([`Refusal`]). Same decision.
+pub(crate) fn authenticate_from_env_cached_call_refusal(
+    config_dir: &Path,
+    cache: &KeyRegistryCache,
+) -> Result<AuthenticatedCall, Refusal> {
     let raw_key = match std::env::var("DUDUCLAW_MCP_API_KEY") {
         Ok(k) => k,
         Err(_) => {
@@ -785,21 +891,21 @@ pub(crate) fn authenticate_from_env_cached_call(
                     default_internal_principal(),
                 ));
             }
-            return Err(AuthError::MissingKey);
+            return Err(AuthError::MissingKey.into());
         }
     };
 
     // Same prefix-based dispatch as `authenticate_from_env`.
     if raw_key.starts_with(crate::mcp_refresh::REFRESH_TOKEN_PREFIX) {
-        return crate::mcp_refresh::authenticate_with_refresh_token(&raw_key, config_dir).map(
-            |principal| {
+        return crate::mcp_refresh::authenticate_with_refresh_token(&raw_key, config_dir)
+            .map(|principal| {
                 AuthenticatedCall::verified(
                     principal,
                     &raw_key,
                     duduclaw_core::google_identity::CredentialKind::Refresh,
                 )
-            },
-        );
+            })
+            .map_err(Refusal::from);
     }
 
     let registry = cache.registry(config_dir).map_err(|()| {
@@ -807,19 +913,12 @@ pub(crate) fn authenticate_from_env_cached_call(
             "MCP key registry reload failed (I/O or parse error on config.toml) — \
              denying this call (fail-closed); a stale cached principal is never reused"
         );
-        AuthError::ReloadFailed
+        Refusal::from(AuthError::ReloadFailed)
     })?;
 
     // The hashed store is not cached: like refresh tokens it is re-read on
     // every call (one indexed SELECT), so a disable takes effect at once.
-    authenticate_against_registry(&raw_key, config_dir, &registry).map(|(principal, kind)| {
-        AuthenticatedCall::verified(
-            principal,
-            &raw_key,
-            duduclaw_core::google_identity::CredentialKind::Legacy,
-        )
-        .with_kind(kind)
-    })
+    decide_against_registry(&raw_key, config_dir, &registry).map(|decided| decided.into_call(&raw_key))
 }
 
 /// M6: whether the operator has explicitly opted into running the MCP server
