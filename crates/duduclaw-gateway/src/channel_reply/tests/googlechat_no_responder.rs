@@ -1,5 +1,6 @@
 //! The shared Google Chat app with no employee to answer refuses instead of
-//! running a turn with an empty agent id.
+//! running a turn with an empty agent id, with the neutral line for anyone
+//! not verified as internal.
 use super::*;
 
 fn test_ctx(home: &std::path::Path) -> ReplyContext {
@@ -20,5 +21,6 @@ async fn shared_google_chat_app_without_an_employee_refuses() {
         "hello", &ctx, None, "googlechat:spaces/A", "users/x", None,
     ))
     .await;
-    assert_eq!(reply, NO_RESPONDER_TEXT);
+    // `users/x` is not a verified company member: the neutral line.
+    assert_eq!(reply, no_responder_public_text(None));
 }

@@ -705,6 +705,8 @@ async fn run_live_via_runtime(
             runtime_settings: None,
             effort: None,
             allow_cross_family_failover: false,
+            // The case's employee, run in its own directory (checked above).
+            purpose: duduclaw_gateway::runtime_dispatch::SpawnPurpose::EmployeeTurn,
         },
     );
     let response = duduclaw_gateway::runtime::RUNTIME_OUTCOME

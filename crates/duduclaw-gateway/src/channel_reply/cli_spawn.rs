@@ -49,6 +49,7 @@ pub(super) async fn call_claude_cli(
     work_dir: Option<&Path>,
     on_progress: Option<&ProgressCallback>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    purpose: crate::runtime_dispatch::SpawnPurpose,
 ) -> Result<String, String> {
     let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     spawn_claude_cli_with_env(
@@ -62,6 +63,7 @@ pub(super) async fn call_claude_cli(
         &empty,
         None,
         None,
+        purpose,
     )
     .await
 }
@@ -369,6 +371,8 @@ pub(crate) async fn call_claude_cli_rotated(
     // P1/WP-3: per-call reasoning effort (`agent.toml [model] effort`, or a
     // team role spec). `None` ⇒ no `--effort` flag, argv byte-identical.
     effort: Option<duduclaw_core::effort::Effort>,
+    // Employee turn or agent-less utility work — checked at the spawn.
+    purpose: crate::runtime_dispatch::SpawnPurpose,
 ) -> Result<String, String> {
     // MoA virtual models must never reach a CLI spawn — fail with a clear
     // reason instead of a confusing upstream model-not-found error.
@@ -398,6 +402,7 @@ pub(crate) async fn call_claude_cli_rotated(
                 work_dir,
                 on_progress,
                 capabilities,
+                purpose,
             )
             .await;
         }
@@ -419,6 +424,7 @@ pub(crate) async fn call_claude_cli_rotated(
             work_dir,
             on_progress,
             capabilities,
+            purpose,
         )
         .await;
     }
@@ -470,6 +476,7 @@ pub(crate) async fn call_claude_cli_rotated(
                     &env_vars,
                     None,
                     effort,
+                    purpose,
                 )
                 .await
             }

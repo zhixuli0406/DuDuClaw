@@ -1176,7 +1176,7 @@ async fn webchat_queued_reply_rechecks_answerer_acl_and_retracts_history() {
         assert!(!fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap().iter()
             .any(|row| row.role == "assistant"), "queued replies remain unpublished");
         let route = queued.route.as_ref().unwrap();
-        assert_eq!(route.agent, "finance");
+        assert_eq!(route.agent.as_deref(), Some("finance"));
         assert!(fixture.state.authorize_target(&user, "sales", true).await.is_ok());
         if failure == "revoked" {
             fixture.state.user_db.unbind_agent(&user, "finance").unwrap();
@@ -1261,7 +1261,7 @@ async fn webchat_writer_rechecks_acl_after_backpressure_before_start_send() {
         subscription.subscribe("owned", None);
         let cancel = CancellationToken::new();
         let source = crate::channel_reply::ReplyDeliveryFence::test_live().for_turn(&cancel);
-        let mut turn = subscriptions.sinks(&user, "owned", "m", "finance", Some(&credential), source.clone())
+        let mut turn = subscriptions.sinks(&user, "owned", "m", Some("finance"), Some(&credential), source.clone())
             .pop().unwrap();
         let sending = tokio::spawn(async move {
             turn.send(Message::Text(r#"{"type":"assistant_done","content":"private"}"#.into())).await
@@ -1358,7 +1358,7 @@ async fn assert_final_policy_window(change: &str) {
         let subscription = subscriptions.register(&user, tx);
         subscription.subscribe("owned", None);
         let source = crate::channel_reply::ReplyDeliveryFence::test_live();
-        let mut turn = subscriptions.sinks(&user, "owned", "m", "finance", Some(&credential), source.clone()).pop().unwrap();
+        let mut turn = subscriptions.sinks(&user, "owned", "m", Some("finance"), Some(&credential), source.clone()).pop().unwrap();
         let sending = tokio::spawn(async move {
             turn.send(Message::Text(r#"{"type":"assistant_done","content":"private"}"#.into())).await
         });

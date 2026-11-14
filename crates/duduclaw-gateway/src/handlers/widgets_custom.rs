@@ -243,6 +243,7 @@ impl MethodHandler {
             // System-level utility call, not an agent turn — no account pool.
             &[],
             None, // P1/WP-3 effort: resolved from the agent dir in the callee
+            crate::runtime_dispatch::SpawnPurpose::Utility, // zero-tool allowlist above
         )
         )
         .await

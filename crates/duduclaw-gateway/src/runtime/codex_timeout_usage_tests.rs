@@ -30,6 +30,8 @@ fn request<'a>(home: &'a Path, agent: &'a str, settings: &'a RuntimeSettings) ->
         model: "gpt-5.4", max_tokens: 16, provider_override: Some(RuntimeType::Codex),
         conversation_history: &[], request_type: RequestType::Dispatch,
         runtime_settings: Some(settings), effort: None, allow_cross_family_failover: true,
+        // Agent-less fixture: only utility work may run without a directory.
+        purpose: runtime_dispatch::SpawnPurpose::Utility,
     }
 }
 

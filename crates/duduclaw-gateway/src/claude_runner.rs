@@ -1148,6 +1148,7 @@ async fn call_claude_for_agent_impl(
                 // never be silently answered by Claude and then recorded as
                 // codex; the round degrades explicitly instead.
                 allow_cross_family_failover: overrides.allow_cross_family_failover,
+                purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
             },
         ))
         .await;

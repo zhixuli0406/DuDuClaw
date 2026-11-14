@@ -70,7 +70,10 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     }
     let sid = sid.as_str();
     let effective_agent_id = effective_agent.as_deref().unwrap_or(&agent_id);
-    if let Err(frame) = state.authorize_target(&auth_user, effective_agent_id, true).await {
+    // `None`: no employee is named and none resolves — the no-responder
+    // notice, authorised without a target (re-decided here, fail closed).
+    let target = (!state.no_responder_turn(effective_agent_id, sid, &user_id).await).then_some(effective_agent_id);
+    if let Err(frame) = state.authorize_turn(&auth_user, target, true).await {
         sink.frame(frame).await;
         return;
     }
@@ -406,9 +409,15 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         sink.identity_unavailable(validity, false).await;
         return;
     }
-    let answering_agent = guarded.answered_by.as_ref().map(|a| a.id.as_str()).unwrap_or(effective_agent_id);
+    // Only a turn authorised without a target, answering with the fixed
+    // no-responder notice, keeps the target-less re-check at delivery.
+    let answering_agent = match &guarded.answered_by {
+        Some(a) => Some(a.id.as_str()),
+        None if target.is_none() && guarded.no_responder_notice() => None,
+        None => Some(effective_agent_id),
+    };
     if delivery.refused.load(Ordering::SeqCst)
-        || state.authorize_target(&auth_user, answering_agent, true).await.is_err() {
+        || state.authorize_turn(&auth_user, answering_agent, true).await.is_err() {
         guarded.refuse_delivery();
         return;
     }
@@ -588,7 +597,7 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
 async fn send_terminal(
     state: &WebChatState,
     auth_user: &str,
-    answering_agent: &str,
+    answering_agent: Option<&str>,
     sid: &str,
     cancel: &CancellationToken,
     credential: Option<&duduclaw_auth::jwt::Claims>,
@@ -597,14 +606,14 @@ async fn send_terminal(
     owned_archives: &[PathBuf],
     frame: Message,
 ) -> Result<(), ()> {
-    if cancel.is_cancelled() || state.authorize_target(auth_user, answering_agent, true).await.is_err() {
+    if cancel.is_cancelled() || state.authorize_turn(auth_user, answering_agent, true).await.is_err() {
         guarded.refuse_delivery();
         rollback_owned_webchat_archives(owned_archives).await;
         return Err(());
     }
     let validity = state.credential_validity(credential, true).await;
     let mut recovery = crate::handlers::live_context::SocketRecovery::default();
-    if cancel.is_cancelled() || state.authorize_target(auth_user, answering_agent, true).await.is_err()
+    if cancel.is_cancelled() || state.authorize_turn(auth_user, answering_agent, true).await.is_err()
         || !rollback_before_final_reply(validity, &mut recovery, owned_archives).await {
         guarded.refuse_delivery();
         rollback_owned_webchat_archives(owned_archives).await;
@@ -622,7 +631,7 @@ async fn send_terminal(
             return Err(());
         }
     }
-    if state.authorize_target(auth_user, answering_agent, true).await.is_err() {
+    if state.authorize_turn(auth_user, answering_agent, true).await.is_err() {
         guarded.refuse_delivery();
         rollback_owned_webchat_archives(owned_archives).await;
         return Err(());
@@ -630,7 +639,7 @@ async fn send_terminal(
     // The pipeline staged a tombstoned row. Socket failure alone still permits
     // publication after fan-out; source or authority failure leaves it hidden.
     for mut destination in state.subscriptions.sinks(auth_user, sid, &sink.msg_id, answering_agent, credential, guarded.delivery_fence().for_turn(cancel)) {
-        if state.authorize_target(auth_user, answering_agent, true).await.is_err() {
+        if state.authorize_turn(auth_user, answering_agent, true).await.is_err() {
             guarded.refuse_delivery();
         }
         if !guarded.still_valid().await {
@@ -643,13 +652,13 @@ async fn send_terminal(
     let generation = tokio::task::spawn_blocking(move || users.acl_generation()).await
         .ok().and_then(Result::ok);
     let validity = state.credential_validity(credential, true).await;
-    if cancel.is_cancelled() || state.authorize_target(auth_user, answering_agent, true).await.is_err()
+    if cancel.is_cancelled() || state.authorize_turn(auth_user, answering_agent, true).await.is_err()
         || !rollback_before_final_reply(validity, &mut recovery, owned_archives).await {
         guarded.refuse_delivery();
         rollback_owned_webchat_archives(owned_archives).await;
         return Err(());
     }
-    let policy = state.target_policy(auth_user, answering_agent, true).await;
+    let policy = state.turn_policy(auth_user, answering_agent, true).await;
     let published = match (generation, policy) {
         (Some(generation), Ok(policy)) => guarded.publish_webchat(&state.ctx.session_manager, sid,
             &state.user_db, generation, &policy, cancel).await,

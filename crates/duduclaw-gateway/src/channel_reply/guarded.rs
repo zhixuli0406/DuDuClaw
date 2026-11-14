@@ -418,6 +418,16 @@ async fn build_guarded_reply_with_session_inner(
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
         return reply;
     };
+    // No employee answered: the fixed notice goes out as it is (no restore,
+    // contract or pending operator notice), live only — WebChat delivers it
+    // without a stored row (`GuardedReply::persist_webchat`).
+    if delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst) {
+        let text = append_product_footer(raw, session_id);
+        let reply = attach_turn_rollback(text, None, guards, delivery, ctx).await;
+        Box::pin(super::health::finish(&ctx.home_dir, health_outcome, false, &reply)).await;
+        build_rollback.disarm();
+        return reply;
+    }
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     // WP11-A: last-line-of-defence filter for AI-runtime internal messages

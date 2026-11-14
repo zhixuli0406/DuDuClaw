@@ -106,6 +106,9 @@ pub(crate) struct CcrTurnDelivery {
     pub(super) turn_generation: std::sync::Mutex<Option<String>>,
     /// Failed turns persist only their fixed notice; diagnostic text is live-only.
     pub(super) failure_notice_only: std::sync::atomic::AtomicBool,
+    /// No employee answers this turn: its fixed notice is delivered live
+    /// only. No session exists and none is created, so nothing is stored.
+    pub(super) no_responder_notice: std::sync::atomic::AtomicBool,
     cleanup: Option<DeliveryCleanup>,
     published: std::sync::atomic::AtomicBool,
 }
@@ -124,6 +127,7 @@ impl Default for CcrTurnDelivery {
             settled: Default::default(),
             turn_generation: Default::default(),
             failure_notice_only: Default::default(),
+            no_responder_notice: Default::default(),
             cleanup: DELIVERY_CLEANUP.try_with(Clone::clone).ok(),
             published: Default::default(),
         }
@@ -265,6 +269,14 @@ pub(super) fn record_turn_generation(generation: Option<&str>) {
             .turn_generation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = generation.map(str::to_owned);
+    });
+}
+
+/// The turn answers with the fixed no-responder notice before any session
+/// exists: deliver it live, never store it. No-op outside a guarded reply.
+pub(super) fn mark_no_responder_notice() {
+    let _ = CCR_TURN_DELIVERY.try_with(|delivery| {
+        delivery.no_responder_notice.store(true, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
@@ -516,6 +528,13 @@ impl GuardedReply {
         self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// No employee answered this turn: it carries the fixed no-responder
+    /// notice (`mark_no_responder_notice`), delivered live only.
+    pub(crate) fn no_responder_notice(&self) -> bool {
+        self.rollback.as_ref().is_some_and(|rollback|
+            rollback.delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     async fn check_notice_incarnation(&self, sessions: &SessionManager, sid: &str, delivery: &CcrTurnDelivery) -> Result<(), ()> {
         let generation = delivery.turn_generation.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
@@ -536,6 +555,15 @@ impl GuardedReply {
             self.refuse_delivery();
             return Err(());
         };
+        if rollback.delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst) {
+            // No session row exists (or may be created): nothing to stage.
+            // Only the fixed notice itself may take this path.
+            if !is_no_responder_notice(text) {
+                self.refuse_delivery();
+                return Err(());
+            }
+            return Ok(());
+        }
         if rollback.delivery.failure_notice_only.load(std::sync::atomic::Ordering::SeqCst) {
             return self.check_notice_incarnation(sessions, sid, &rollback.delivery).await;
         }
@@ -573,9 +601,13 @@ impl GuardedReply {
         generation: u64, policy: &crate::webchat::access::TargetPolicy, cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), ()> {
         let Some(rollback) = &self.rollback else { self.refuse_delivery(); return Err(()); };
-        if rollback.delivery.failure_notice_only.load(std::sync::atomic::Ordering::SeqCst) {
+        let no_responder = rollback.delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst);
+        if no_responder || rollback.delivery.failure_notice_only.load(std::sync::atomic::Ordering::SeqCst) {
             if !self.still_valid().await { return Err(()); }
-            self.check_notice_incarnation(sessions, sid, &rollback.delivery).await?;
+            // A live-only no-responder notice has no session to fence.
+            if !no_responder {
+                self.check_notice_incarnation(sessions, sid, &rollback.delivery).await?;
+            }
             let allowed = users.with_acl_generation(generation, || policy.with_current(|| {
                 !cancel.is_cancelled() && !self.revoked.load(std::sync::atomic::Ordering::SeqCst)
             }));
