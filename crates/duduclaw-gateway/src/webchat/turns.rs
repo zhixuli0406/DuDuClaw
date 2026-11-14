@@ -574,16 +574,23 @@ impl Outbound {
             if let Some(ack) = self.ack { let _ = ack.send(false); }
             return if recovery.closed() { Err(()) } else { Ok(()) };
         };
-        *gate.lock().unwrap() = Some(writer::WritePermit {
+        *gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer::WritePermit {
             users: state.user_db.clone(), generation, policy, route: route.clone(), deadline,
             home: state.ctx.home_dir.clone(), receiving_credential: credential.cloned(),
+            contended: false,
         });
         // SplitSink::start_send only buffers a slot. The permit is enforced by
         // GuardedSocket below that adapter, when its flush reaches the socket.
         let sent = tokio::time::timeout_at(deadline, sink.0.send(self.message)).await;
-        gate.lock().unwrap().take();
+        let contended = gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+            .is_some_and(|permit| permit.contended);
         let result = if matches!(sent, Ok(Ok(()))) { Ok(()) } else { Err(()) };
         if let Some(ack) = self.ack { let _ = ack.send(result.is_ok()); }
+        // The caller stops this socket's writer on Err, dropping every other
+        // turn's queued frame. A frame withheld only for an exhausted wait
+        // budget wrote no byte and left SplitSink's slot empty, so only this
+        // turn fails (its ack above is false); the socket stays in service.
+        if contended { return Ok(()); }
         result
     }
 

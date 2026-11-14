@@ -39,29 +39,124 @@ pub struct PrimaryAgentRepairPreview {
 
 const POOL_SIZE: usize = 2;
 
+/// Total time one ACL-fenced delivery may wait for an ACL delivery connection
+/// and then for users.db's write reservation (and, for a WebChat publication,
+/// for sessions.db's write lock with what remains). Every holder keeps the
+/// reservation only for one synchronous delivery decision — a socket write or
+/// a single UPDATE — so benign contention clears within milliseconds. 250 ms
+/// absorbs a burst of replies finishing together plus an ordinary ACL write,
+/// while a socket writer or worker thread blocked for the whole budget still
+/// stays far below WebChat's 10 s send deadline. Running out fails closed.
+pub const ACL_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Longest wait of a [`UserDb::open_read_only`] read. WAL readers do not wait
+/// for a writer; this only bounds a brief WAL recovery or checkpoint.
+const READ_ONLY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Poll interval while both ACL delivery connections are in use.
+const ACL_SLOT_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Why [`UserDb::with_acl_generation`] did not run its delivery callback.
+/// Every variant is a refusal: nothing may be delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AclDeliveryError {
+    /// The ACL connection or the write reservation stayed busy for the whole
+    /// [`ACL_DELIVERY_WAIT`]. The access rule may well be unchanged.
+    Contended,
+    /// The ACL generation moved, or the caller's final policy is no longer
+    /// current: a real access change.
+    Changed,
+    /// The store could not be used or read.
+    Unavailable(String),
+}
+
+impl AclDeliveryError {
+    /// SQLite busy/locked is contention; every other failure is unavailable.
+    pub fn from_sqlite(error: rusqlite::Error) -> Self {
+        match error.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => Self::Contended,
+            _ => Self::Unavailable(error.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for AclDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contended => f.write_str("ACL delivery wait budget exhausted"),
+            Self::Changed => f.write_str("ACL changed before delivery"),
+            Self::Unavailable(error) => write!(f, "ACL delivery store unavailable: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AclDeliveryError {}
+
+impl From<AclDeliveryError> for String {
+    fn from(error: AclDeliveryError) -> Self { error.to_string() }
+}
+
 impl UserDb {
     /// Linearize a nonblocking delivery with every ACL writer, including other
     /// processes. A WAL read transaction alone would not exclude revocation.
-    /// The callback must not await, block, or re-enter this database.
-    pub fn with_acl_generation<T>(&self, expected: u64, deliver: impl FnOnce() -> T) -> Result<T, String> {
-        let mut conn = self.pool.iter().find_map(|slot| slot.try_lock().ok())
-            .ok_or_else(|| "ACL delivery connection busy".to_string())?;
-        conn.busy_timeout(std::time::Duration::ZERO).map_err(|e| e.to_string())?;
-        let result = (|| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|e| e.to_string())?;
-            if crate::user_row::read_acl_generation(&tx)? != expected {
-                return Err("ACL changed before delivery".into());
-            }
-            // No database mutation: dropping the transaction releases the
-            // writer reservation only after the synchronous delivery decision.
-            Ok(deliver())
-        })();
-        let restored = conn.busy_timeout(std::time::Duration::from_secs(5));
-        // The callback may already have sent bytes; never disguise its result
-        // as a refusal because restoring the connection's timeout failed.
-        if let Err(error) = restored { warn!(%error, "ACL connection timeout restore failed"); }
+    /// The callback must not await or re-enter this database. It may block on
+    /// another store only for the rest of [`ACL_DELIVERY_WAIT`], and only in
+    /// the lock order users.db reservation → sessions.db write lock.
+    ///
+    /// Contention (both delivery connections in use, or another writer holding
+    /// the reservation) waits within [`ACL_DELIVERY_WAIT`] instead of refusing
+    /// at once; only a changed generation, an unreadable store or the budget
+    /// running out refuse, and the generation check and the callback still run
+    /// inside one IMMEDIATE transaction.
+    pub fn with_acl_generation<T>(&self, expected: u64, deliver: impl FnOnce() -> T) -> Result<T, AclDeliveryError> {
+        let deadline = std::time::Instant::now() + ACL_DELIVERY_WAIT;
+        let result = self.acl_delivery_connection(deadline).and_then(|mut conn| {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            conn.busy_timeout(remaining).map_err(AclDeliveryError::from_sqlite)?;
+            let result = (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(AclDeliveryError::from_sqlite)?;
+                if crate::user_row::read_acl_generation(&tx).map_err(AclDeliveryError::Unavailable)? != expected {
+                    return Err(AclDeliveryError::Changed);
+                }
+                // No database mutation: dropping the transaction releases the
+                // writer reservation only after the synchronous delivery decision.
+                Ok(deliver())
+            })();
+            let restored = conn.busy_timeout(std::time::Duration::from_secs(5));
+            // The callback may already have sent bytes; never disguise its result
+            // as a refusal because restoring the connection's timeout failed.
+            if let Err(error) = restored { warn!(%error, "ACL connection timeout restore failed"); }
+            result
+        });
+        if matches!(result, Err(AclDeliveryError::Contended)) {
+            warn!(budget_ms = ACL_DELIVERY_WAIT.as_millis() as u64,
+                "ACL delivery wait budget exhausted; delivery refused without sending");
+        }
         result
+    }
+
+    /// Bounded wait for a free pool connection. A poisoned slot is never used
+    /// for a delivery decision; with no usable slot at all this fails closed.
+    fn acl_delivery_connection(
+        &self, deadline: std::time::Instant,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, AclDeliveryError> {
+        loop {
+            let mut busy = false;
+            for slot in &self.pool {
+                match slot.try_lock() {
+                    Ok(conn) => return Ok(conn),
+                    Err(std::sync::TryLockError::WouldBlock) => busy = true,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {}
+                }
+            }
+            if !busy {
+                return Err(AclDeliveryError::Unavailable("ACL delivery connection poisoned".into()));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline { return Err(AclDeliveryError::Contended); }
+            std::thread::sleep(ACL_SLOT_RETRY.min(deadline - now));
+        }
     }
 
     /// Open (or create) the user database at the given path.
@@ -84,6 +179,41 @@ impl UserDb {
         let db = Self { pool, remember_key };
         db.init_tables(enforced)?;
         Ok(db)
+    }
+
+    /// Open an EXISTING user database for request-time lookups only. Never
+    /// creates the file, runs no schema initialisation or migration and never
+    /// takes the write reservation, so a WAL reader does not wait for another
+    /// writer.
+    ///
+    /// Through this handle (opened `SQLITE_OPEN_READ_ONLY`):
+    /// - read-only queries work, including the read-only remembered-session
+    ///   checks [`Self::remember_session_valid`] and
+    ///   [`Self::remember_login_exchanged`]: they read rows by id and use no
+    ///   key, so they answer as on a [`Self::new`] handle;
+    /// - every write fails, and so does the delivery fence
+    ///   [`Self::with_acl_generation`]: its IMMEDIATE transaction cannot begin
+    ///   on a read-only connection, so it refuses (`Unavailable`) and its
+    ///   callback never runs;
+    /// - remembered-session issuance, rotation and logout fail: they write,
+    ///   and the MAC key here is random per handle, so no presented
+    ///   remembered-session token authenticates either.
+    ///
+    /// `pub` only because its one caller,
+    /// `duduclaw_gateway::decision_notify::open_user_db_read_only`, is in
+    /// another crate; Rust has no narrower visibility that reaches it. Use
+    /// that wrapper, not this constructor.
+    pub fn open_read_only(db_path: &Path) -> Result<Self, String> {
+        use rusqlite::OpenFlags;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+        let conn = Connection::open_with_flags(db_path, flags)
+            .map_err(|e| format!("failed to open user db read-only: {e}"))?;
+        conn.busy_timeout(READ_ONLY_BUSY_TIMEOUT)
+            .map_err(|e| format!("failed to set busy timeout: {e}"))?;
+        let mut key = [0u8; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
+            .map_err(|_| "failed to create an ephemeral key".to_string())?;
+        Ok(Self { pool: vec![Mutex::new(conn)], remember_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key) })
     }
 
     pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1839,6 +1969,10 @@ mod tests {
         assert_eq!(mirror_owner(&db, "team"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "db_acl_delivery_tests.rs"]
+mod acl_delivery_tests;
 
 /// Shared ordinary/migration writer; caller owns the immediate transaction.
 ///

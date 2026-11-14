@@ -358,8 +358,11 @@ pub fn for_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> 
     access
 }
 
+/// Read-only: never creates `users.db`, runs no schema initialisation and
+/// takes no write reservation; absent or unreadable ⇒ unmapped. Blocking:
+/// async callers run it on the blocking pool.
 pub(crate) fn lookup_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> SenderAccess {
-    let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else {
+    let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else {
         return SenderAccess::unmapped();
     };
     let Ok(Some(user_id)) =
@@ -393,7 +396,7 @@ pub fn verified_user_for_channel_sender(
     if channel_user_id.is_empty() {
         return None;
     }
-    let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
+    let db = crate::decision_notify::open_user_db_read_only(home).ok().flatten()?;
     let user_id = crate::googlechat_identity::verified_user_id(home, &db, channel, channel_user_id)
         .ok()
         .flatten()?;

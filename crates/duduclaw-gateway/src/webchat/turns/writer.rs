@@ -13,6 +13,10 @@ pub(in crate::webchat) struct WritePermit {
     pub deadline: tokio::time::Instant,
     pub home: PathBuf,
     pub receiving_credential: Option<duduclaw_auth::jwt::Claims>,
+    /// Set when the frame was withheld only because the ACL fence's wait
+    /// budget ran out. No byte reached the socket, so the writer keeps
+    /// serving the socket's other turns instead of treating it as dead.
+    pub contended: bool,
 }
 
 pub(in crate::webchat) struct GuardedSocket<S> {
@@ -39,10 +43,16 @@ impl<S: futures_util::Sink<Message> + Unpin> futures_util::Sink<Message> for Gua
 
     fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), ()> {
         let this = self.get_mut();
-        let gate = this.gate.lock().unwrap();
-        let Some(permit) = gate.as_ref() else {
+        let mut gate = this.gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(permit) = gate.as_mut() else {
             return Pin::new(&mut this.inner).start_send(message).map_err(|_| ());
         };
+        // `start_send` is synchronous and runs on an async worker. The fence
+        // may block it for at most `duduclaw_auth::ACL_DELIVERY_WAIT` (250 ms):
+        // only while another delivery or ACL writer holds users.db for one
+        // synchronous decision, normally milliseconds. Each socket has its own
+        // writer task, the wait is bounded, and the IMMEDIATE transaction must
+        // span this write, so it cannot be moved off the worker in a small change.
         let result = permit.users.with_acl_generation(permit.generation, || {
             permit.policy.with_current(|| {
                 permit.route.with_live(|| {
@@ -61,6 +71,15 @@ impl<S: futures_util::Sink<Message> + Unpin> futures_util::Sink<Message> for Gua
         });
         match result {
             Ok(result) => result,
+            Err(duduclaw_auth::AclDeliveryError::Contended) => {
+                // Fail closed for this turn only: its reply is withdrawn and
+                // never published, and the turn sends the fixed failure notice.
+                // Latched on the fence before the frame's ack is answered, so
+                // the notice sender can tell this from a refusal and retry.
+                permit.route.source.refuse_contended();
+                permit.contended = true;
+                Err(())
+            }
             Err(_) => { permit.route.source.refuse(); Err(()) }
         }
     }

@@ -1482,3 +1482,6 @@ async fn live_budget_and_provider_refusals_keep_pre_notice_assistant_done_bytes(
         fixture.turn_count(0).await;
     }
 }
+
+#[path = "contention_socket_tests.rs"]
+mod contention;

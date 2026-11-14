@@ -205,13 +205,15 @@ async fn arm_thinking(
             Some(a) => a.to_string(),
             None => resolve_agent_for_restore(ctx, session_id).await,
         };
-        let show = crate::thinking::channel_policy::resolve_channel(
+        // The sender lookup reads users.db: on the blocking pool.
+        let show = crate::thinking::channel_policy::resolve_channel_async(
             &ctx.home_dir,
             &agent_id,
             presenter.channel(),
             user_id,
             presenter.is_group(),
-        );
+        )
+        .await;
         // When `@` / trigger routing hands the turn to another employee, the
         // presenter decides again for the one that actually answers.
         let resolver: crate::thinking::channel_presenter::ShowResolver = {
