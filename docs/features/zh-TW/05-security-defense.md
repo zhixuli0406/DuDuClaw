@@ -501,7 +501,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 **SOUL.md 漂移偵測** — `soul_guard` 在開機與每次 heartbeat tick 以 SHA-256 對每份 `SOUL.md` 取指紋，在 `.soul_history/` 保留最多 10 個版本備份，並連同 Agent Stability Index 一起回報漂移。
 
-**稽核軌跡** — `tool_calls.jsonl` 記錄每次工具呼叫，`result_text`／`input_text` 都經遮罩（三輪秘密遮罩，先遮再截斷），權限 `0600`，行與行之間雜湊串接，16 MB 輪替。`security_audit.jsonl` 另外承載安全事件。這份 log 同時是 grounding precheck 與驗收判官讀的證據來源，弱化它等於弱化驗證。
+**稽核軌跡** — `tool_calls.jsonl` 記錄每次工具呼叫，`result_text`／`input_text` 都經遮罩（三輪秘密遮罩，先遮再截斷），權限 `0600`，行與行之間雜湊串接，16 MB 輪替。`security_audit.jsonl` 另外承載安全事件。這份 log 同時是 grounding precheck 與驗收判官讀的證據來源，弱化它等於弱化驗證。 在 macOS／Linux，`security_audit.jsonl` 也只有執行 DuDuClaw 的帳號可讀寫（0600），既有檔案會在下一次寫入時自動收緊；Windows 維持使用 NTFS ACL。
 
 **每 agent 金鑰隔離** — MCP API key 與連接器憑證都是 per-agent，經 `secret_ref` 解析，所以單一 agent 外洩不等於平台外洩。通道憑證分兩種：LINE、WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘使用 `config.toml [channels]` 裡整個部署共用的憑證；只有 Telegram、Discord、Slack 有員工專屬的 bot token（員工沒有自己的 token 時沿 `reports_to` 往上找，最後用全域 token）。
 

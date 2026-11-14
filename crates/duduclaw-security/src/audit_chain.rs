@@ -80,6 +80,8 @@ use ring::digest;
 #[cfg(unix)]
 use tracing::warn;
 
+pub(crate) const SECURITY_AUDIT_FILE_MODE: u32 = 0o600;
+
 /// Sentinel `_prev_hash` for the first record in a chain — a brand-new file,
 /// or the first record after a rotation boundary (see module docs). 64
 /// hex-zero chars, matching the width of a real SHA-256 hex digest so a
@@ -131,8 +133,7 @@ pub fn last_line_hash(path: &Path) -> io::Result<String> {
 /// `unix_create_mode`: when `Some(mode)`, the file is created with that mode
 /// (Unix only, mirrors the `tool_calls.jsonl` 0600 discipline) and tightened
 /// to it on every append if an existing file's permissions drifted wider.
-/// `None` leaves file creation at the process umask — unchanged from the
-/// historical `security_audit.jsonl` behavior.
+/// `None` leaves file creation at the process umask without tightening.
 ///
 /// See the module doc for the concurrency contract (lock spans read+write).
 pub fn append_chained_line(
@@ -207,9 +208,20 @@ pub fn append_chained_line_strict(
         fs::create_dir_all(parent)?;
     }
     duduclaw_core::with_file_lock(path, || {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
         #[cfg(unix)]
-        duduclaw_core::platform::flock_exclusive(&file)?;
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(SECURITY_AUDIT_FILE_MODE);
+        }
+        let file = opts.open(path)?;
+        #[cfg(unix)]
+        {
+            duduclaw_core::platform::flock_exclusive(&file)?;
+            // Permission failures are warned, but must not discard the event.
+            tighten_permissions(&file, SECURITY_AUDIT_FILE_MODE, path);
+        }
         chain_and_write(path, &file, record)?;
         file.sync_all()?;
         // File fsync alone does not persist a newly created directory
