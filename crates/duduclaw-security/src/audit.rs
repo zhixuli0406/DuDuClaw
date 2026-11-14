@@ -55,6 +55,8 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
+use crate::audit_chain::SECURITY_AUDIT_FILE_MODE;
+
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -106,9 +108,8 @@ impl AuditEvent {
 /// B1 (OS security line P0): every line gains a `_prev_hash` SHA-256 chain
 /// field via [`crate::audit_chain::append_chained_line`] — tampering with
 /// any historical line is detectable via [`crate::audit_chain::verify_chain`].
-/// File creation mode is unchanged from before B1 (`None` — process umask,
-/// no explicit tightening), preserving this file's pre-existing permission
-/// behavior exactly.
+/// On Unix the file is owner-only (0600); existing wider permissions are
+/// tightened on the next append.
 pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
     let path = home_dir.join("security_audit.jsonl");
     let map = match serde_json::to_value(event) {
@@ -122,7 +123,7 @@ pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
             return;
         }
     };
-    if let Err(e) = crate::audit_chain::append_chained_line(&path, map, None) {
+    if let Err(e) = crate::audit_chain::append_chained_line(&path, map, Some(SECURITY_AUDIT_FILE_MODE)) {
         warn!("Failed to write audit event to {}: {e}", path.display());
     }
 }
@@ -562,7 +563,7 @@ pub fn append_tool_call_with_extras(
     // drifted wider (upgraded installs), same discipline as before B1.
     if let Err(e) = duduclaw_core::with_file_lock(&path, || {
         maybe_rotate_tool_calls(&path);
-        crate::audit_chain::append_chained_line_locked(&path, map, Some(0o600))
+        crate::audit_chain::append_chained_line_locked(&path, map, Some(SECURITY_AUDIT_FILE_MODE))
     }) {
         warn!("Failed to write tool call record to {}: {e}", path.display());
     }
@@ -1849,6 +1850,57 @@ mod tests {
         assert!(!raw.contains("/tmp"), "no path/value should leak into the audit record");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    fn assert_security_audit_permissions(strict: bool, existing: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::audit_chain::{verify_chain, ChainVerifyResult};
+
+        let home = fresh_home();
+        let path = home.join("security_audit.jsonl");
+        let event = AuditEvent::new("permission_test", "agnes", Severity::Info, serde_json::json!({}));
+        if existing {
+            append_audit_event(&home, &event);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        }
+
+        if strict {
+            try_append_audit_event(&home, &event).unwrap();
+        } else {
+            append_audit_event(&home, &event);
+        }
+
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(verify_chain(&path).unwrap(), ChainVerifyResult::Intact {
+            lines_checked: if existing { 2 } else { 1 },
+        });
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_audit_event_creates_owner_only_file() {
+        assert_security_audit_permissions(false, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_append_audit_event_creates_owner_only_file() {
+        assert_security_audit_permissions(true, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_audit_event_tightens_existing_file_and_preserves_chain() {
+        assert_security_audit_permissions(false, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_append_audit_event_tightens_existing_file_and_preserves_chain() {
+        assert_security_audit_permissions(true, true);
     }
 
     // ── B1: hash chain integration on the two production writers ─────
