@@ -118,6 +118,47 @@ async fn concurrent_creates_for_the_last_seat_admit_exactly_one() {
     assert_eq!(duduclaw_core::agent_seats::seat_holders(home.path()).unwrap().len(), 2);
 }
 
+/// The same race when the blocking pool cannot grow (one thread here; on a
+/// loaded host, new threads refused). The loser used to wait for the seat
+/// lock on a blocking thread, so the winner's own blocking work (seat scan,
+/// org lock, file writes) queued behind it: the winner could not publish,
+/// and after the full 30 s wait the loser refused with
+/// `agent_seat_count_unavailable` instead of `agent_seat_limit_reached`.
+#[test]
+fn concurrent_creates_for_the_last_seat_do_not_starve_on_the_blocking_pool() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let home = tempfile::tempdir().unwrap();
+        let h = MethodHandler::new(home.path().to_path_buf()).await;
+        h.set_agent_cap_fixture(Some(2)).await;
+        payload(&create(&h, "pool-base").await);
+        // Held elsewhere until both creates are waiting for it.
+        let held = duduclaw_core::agent_seats::SeatAdmission::acquire(home.path()).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let (a, b) = tokio::join!(create(&h, "pool-a"), create(&h, "pool-b"));
+        release.join().unwrap();
+        let elapsed = started.elapsed();
+        let won = [&a, &b].into_iter().filter(|f| matches!(f, WsFrame::Response { ok: true, .. })).count();
+        assert_eq!(won, 1, "a: {a:?}\nb: {b:?}");
+        let lost = if matches!(a, WsFrame::Response { ok: true, .. }) { &b } else { &a };
+        assert_eq!(
+            refusal(lost)["code"],
+            duduclaw_core::agent_seats::SEAT_LIMIT_ERROR_CODE,
+            "after {elapsed:?}"
+        );
+        assert_eq!(duduclaw_core::agent_seats::seat_holders(home.path()).unwrap().len(), 2);
+    });
+}
+
 /// H1: a create waits for a seat admission held elsewhere (another create,
 /// restore, MCP `create_agent` or pack import — any process), then decides
 /// on what that holder published.

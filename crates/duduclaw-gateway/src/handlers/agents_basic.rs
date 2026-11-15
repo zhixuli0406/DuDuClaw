@@ -182,18 +182,14 @@ impl MethodHandler {
         }
     }
 
-    /// Take the seat admission lock (bounded wait, on a blocking thread).
-    /// Fails closed with the `agent_seat_count_unavailable` refusal.
+    /// Take the seat admission lock (bounded wait, polled without holding a
+    /// blocking thread — the holder needs those to publish). Fails closed
+    /// with the `agent_seat_count_unavailable` refusal.
     pub(crate) async fn acquire_seat_admission(&self) -> Result<duduclaw_core::agent_seats::SeatAdmission, Value> {
-        let home = self.home_dir.clone();
-        match tokio::task::spawn_blocking(move || duduclaw_core::agent_seats::SeatAdmission::acquire(&home)).await {
-            Ok(Ok(admission)) => Ok(admission),
-            Ok(Err(e)) => {
-                warn!(error = %e, "agent seat admission lock not acquired; refusing (fail closed)");
-                Err(seat_count_unavailable_error())
-            }
+        match duduclaw_core::agent_seats::SeatAdmission::acquire_async(&self.home_dir).await {
+            Ok(admission) => Ok(admission),
             Err(e) => {
-                warn!(error = %e, "agent seat admission task failed; refusing (fail closed)");
+                warn!(error = %e, "agent seat admission lock not acquired; refusing (fail closed)");
                 Err(seat_count_unavailable_error())
             }
         }

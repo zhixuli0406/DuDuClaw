@@ -38,7 +38,10 @@
 //! autonomy lifecycle barrier. Never take it while holding one of those. It
 //! is not re-entrant: a batch takes it once and passes it down. Every wait on
 //! it is bounded by [`SEAT_ADMISSION_WAIT`]; a caller that cannot get it
-//! refuses (fail closed).
+//! refuses (fail closed). Async callers wait with
+//! [`SeatAdmission::acquire_async`], never on a blocking thread: the holder
+//! needs blocking threads to publish, so a waiter parked on one can keep the
+//! holder from finishing.
 //!
 //! Reports: display names and statuses copied out of `agent.toml` are
 //! untrusted text. They are reduced to one plain line
@@ -74,6 +77,10 @@ pub const SEAT_ADMISSION_LOCK: &str = "agent-seat-admission";
 /// it takes to write one employee directory (a pack import: its whole
 /// batch); past this the caller refuses rather than wait unboundedly.
 pub const SEAT_ADMISSION_WAIT: Duration = Duration::from_secs(30);
+
+/// How often [`SeatAdmission::acquire_async`] retries (the same interval as
+/// the blocking wait in [`crate::fs_lock`]).
+const ADMISSION_POLL: Duration = Duration::from_millis(10);
 
 /// One employee directory and whether it holds a licence seat.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,9 +345,8 @@ pub struct SeatAdmission {
 }
 
 impl SeatAdmission {
-    /// Take the lock, waiting at most [`SEAT_ADMISSION_WAIT`]. Blocking:
-    /// async callers run it on a blocking thread and keep the guard across
-    /// their `.await`s until the new employee is published.
+    /// Take the lock, waiting at most [`SEAT_ADMISSION_WAIT`]. Blocking, for
+    /// synchronous callers; async callers use [`Self::acquire_async`].
     pub fn acquire(home: &Path) -> io::Result<Self> {
         Self::acquire_within(home, SEAT_ADMISSION_WAIT)
     }
@@ -349,6 +355,53 @@ impl SeatAdmission {
     pub fn acquire_within(home: &Path, wait: Duration) -> io::Result<Self> {
         let lock = crate::fs_lock::lock_exclusive_within(&seat_admission_lock_path(home), wait)?;
         Ok(Self { home: home.to_path_buf(), _lock: lock })
+    }
+
+    /// One non-blocking try. `Ok(None)` = someone else holds it; any other
+    /// error (the lock file cannot be opened) is returned.
+    pub fn try_acquire(home: &Path) -> io::Result<Option<Self>> {
+        match Self::acquire_within(home, Duration::ZERO) {
+            Ok(admission) => Ok(Some(admission)),
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The async form of [`Self::acquire`] (same bound, same refusal), for
+    /// callers that keep the guard across their `.await`s until the new
+    /// employee is published.
+    ///
+    /// The wait is polled with [`Self::try_acquire`] and an async sleep, so
+    /// a waiter holds no thread. It used to wait on a blocking thread: the
+    /// holder needs blocking threads to publish (seat scan, org lock, file
+    /// writes), and when the blocking pool could not grow (a loaded host
+    /// refusing new threads) those tasks queued behind the waiter, the
+    /// holder could not finish, and the waiter ran out its whole bound and
+    /// refused with "count unavailable" instead of "limit reached".
+    pub async fn acquire_async(home: &Path) -> io::Result<Self> {
+        Self::acquire_async_within(home, SEAT_ADMISSION_WAIT).await
+    }
+
+    /// [`Self::acquire_async`] with an explicit bound on the wait.
+    pub async fn acquire_async_within(home: &Path, wait: Duration) -> io::Result<Self> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(admission) = Self::try_acquire(home)? {
+                return Ok(admission);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "lock_wait_timeout: {}.lock still held after {} ms",
+                        seat_admission_lock_path(home).display(),
+                        wait.as_millis()
+                    ),
+                ));
+            }
+            tokio::time::sleep(deadline.saturating_duration_since(now).min(ADMISSION_POLL)).await;
+        }
     }
 
     /// The home this admission locks.
@@ -650,6 +703,53 @@ mod tests {
         assert!(matches!(next.decide(3, 1, None), SeatDecision::Full { current: 3, .. }));
         // A batch that does not fit is refused as a whole.
         assert!(matches!(next.decide(5, 3, None), SeatDecision::Full { .. }));
+    }
+
+    /// The async wait is bounded like the blocking one, and a try never
+    /// waits.
+    #[test]
+    fn async_admission_is_bounded_and_try_does_not_wait() {
+        let h = tempfile::tempdir().unwrap();
+        let held = SeatAdmission::acquire(h.path()).unwrap();
+        assert!(SeatAdmission::try_acquire(h.path()).unwrap().is_none());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let err = rt
+            .block_on(SeatAdmission::acquire_async_within(h.path(), Duration::from_millis(100)))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("lock_wait_timeout"), "{err}");
+        drop(held);
+        let got = rt.block_on(SeatAdmission::acquire_async_within(h.path(), Duration::from_millis(100))).unwrap();
+        assert!(SeatAdmission::try_acquire(h.path()).unwrap().is_none(), "the async guard excludes others");
+        drop(got);
+        assert!(SeatAdmission::try_acquire(h.path()).unwrap().is_some());
+    }
+
+    /// A waiter must not occupy a blocking thread: with a one-thread
+    /// blocking pool, the holder's blocking work (here: the task that
+    /// releases the lock) still runs while the waiter waits. Waiting on a
+    /// blocking thread instead stalls both until the bound runs out.
+    #[test]
+    fn an_async_waiter_leaves_the_blocking_pool_to_the_holder() {
+        let h = tempfile::tempdir().unwrap();
+        let held = SeatAdmission::acquire(h.path()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let (waited, released) = rt.block_on(async {
+            let holder = async move {
+                // Let the waiter start waiting first.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::task::spawn_blocking(move || drop(held)).await
+            };
+            tokio::join!(SeatAdmission::acquire_async_within(h.path(), Duration::from_secs(20)), holder)
+        });
+        released.unwrap();
+        assert!(waited.is_ok(), "{waited:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     }
 
     #[test]
