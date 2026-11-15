@@ -156,7 +156,7 @@ assign_schedule_min_interval_minutes = 60  # 非管理員；只能調高（60..1
 
 ### MCP 排程與提醒的通知對象
 
-從支援的聊天通道建立例行排程（`tasks_create` 搭配 cron `schedule`）、一次性排程或提醒（`create_reminder`）時，只要由同一位 AI 員工執行、對話中的使用者是 gateway 在該回合確認過的已綁定帳號，且沒有另填通知對象，結果就會回到**建立時的那個對話**。對話由 gateway 依進行中的回合解析並記錄，MCP 工具沒有讓員工選擇對話的參數，因此沒有 Bash 的員工無法把排程的預設通知導向其他對話。已授予 Bash 的員工與 gateway 以同一個 OS 使用者執行，可讀寫 gateway 的本機資料庫；對這類員工而言，這是減速帶，不是隔離。目前的因應方式是不給不該有 Bash 的員工 Bash、使用任務沙箱，或使用原生 Linux 員工隔離；詳見[這些守衛擋不住什麼](05-security-defense.md#這些守衛擋不住什麼)。支援 Google Chat、Telegram、LINE、Discord、Slack、WhatsApp、飛書、Microsoft Teams、企業微信與釘釘。WebChat 仍將結果存回對話紀錄，重新開啟即可查看。
+從支援的聊天通道建立例行排程（`tasks_create` 搭配 cron `schedule`）、一次性排程或提醒（`create_reminder`）時，只要由同一位 AI 員工執行、對話中的使用者是 gateway 在該回合確認過的已綁定帳號，且沒有另填通知對象，結果就會回到**建立時的那個對話**。對話由 gateway 依進行中的回合解析並記錄，MCP 工具沒有讓員工選擇對話的參數，因此沒有 Bash 的員工無法把排程的預設通知導向其他對話。已授予 Bash 的員工與 gateway 以同一個 OS 使用者執行，可讀寫 gateway 的本機資料庫；對這類員工而言，這是減速帶，不是隔離。目前的因應方式是不給不該有 Bash 的員工 Bash、使用任務沙箱，或使用原生 Linux 員工隔離（尚未提供）；詳見[這些守衛擋不住什麼](05-security-defense.md#這些守衛擋不住什麼)。支援 Google Chat、Telegram、LINE、Discord、Slack、WhatsApp、飛書、Microsoft Teams、企業微信與釘釘。WebChat 仍將結果存回對話紀錄，重新開啟即可查看。
 
 另填成對欄位時，優先使用指定對象：排程為 `notify_channel`／`notify_chat_id`，提醒為 `channel`／`chat_id`。無法確認來源對話時，例行工作只保留執行紀錄；提醒與一次性排程仍須指定目的地。透過 `tasks_create kind=goal` 建立的目標，其進度與需要人工處理的通知也會在相同條件下回到來源對話；沒有來源對話的目標使用員工原有的通知設定。
 

@@ -156,7 +156,7 @@ assign_schedule_min_interval_minutes = 60  # 管理者以外。引き上げの�
 
 ### MCP のスケジュールとリマインダーの通知先
 
-対応するチャネルの会話から定期実行（`tasks_create` の cron `schedule`）、単発実行、またはリマインダー（`create_reminder`）を作成するとき、実行する AI 社員が作成した社員と同じで、会話の相手がそのターンで gateway が確認した紐付け済みアカウントであり、通知先の両方の項目を省略した場合、結果は**作成元の会話**に戻ります。会話は gateway が進行中のターンから解決して記録し、MCP ツールには AI 社員が会話を選ぶパラメーターがないため、Bash を持たない AI 社員はスケジュールの既定の通知先を別の会話に向けられません。Bash を付与された AI 社員は gateway と同じ OS ユーザーで動作し、gateway のローカルデータベースを読み書きできるため、その AI 社員に対しては減速帯であって隔離ではありません。現在の対策は、Bash が不要な AI 社員に Bash を付与しないこと、タスク sandbox、またはネイティブ Linux の従業員隔離です。[これらのガードがカバーしないもの](05-security-defense.md#これらのガードがカバーしないもの)を参照してください。Google Chat、Telegram、LINE、Discord、Slack、WhatsApp、Feishu、Microsoft Teams、WeCom、DingTalk に対応します。WebChat は従来どおり会話履歴に保存され、会話を開き直すと確認できます。
+対応するチャネルの会話から定期実行（`tasks_create` の cron `schedule`）、単発実行、またはリマインダー（`create_reminder`）を作成するとき、実行する AI 社員が作成した社員と同じで、会話の相手がそのターンで gateway が確認した紐付け済みアカウントであり、通知先の両方の項目を省略した場合、結果は**作成元の会話**に戻ります。会話は gateway が進行中のターンから解決して記録し、MCP ツールには AI 社員が会話を選ぶパラメーターがないため、Bash を持たない AI 社員はスケジュールの既定の通知先を別の会話に向けられません。Bash を付与された AI 社員は gateway と同じ OS ユーザーで動作し、gateway のローカルデータベースを読み書きできるため、その AI 社員に対しては減速帯であって隔離ではありません。現在の対策は、Bash が不要な AI 社員に Bash を付与しないこと、タスク sandbox、またはネイティブ Linux の従業員隔離（まだ提供されていません）です。[これらのガードがカバーしないもの](05-security-defense.md#これらのガードがカバーしないもの)を参照してください。Google Chat、Telegram、LINE、Discord、Slack、WhatsApp、Feishu、Microsoft Teams、WeCom、DingTalk に対応します。WebChat は従来どおり会話履歴に保存され、会話を開き直すと確認できます。
 
 スケジュールの `notify_channel` / `notify_chat_id`、リマインダーの `channel` / `chat_id` を指定すると、その通知先が優先されます。作成元を確認できない場合、定期実行は実行記録のみを残し、単発実行とリマインダーには通知先が必要です。`tasks_create kind=goal` で作成した目標も、同じ条件で進捗と人の対応が必要な通知を作成元の会話へ送ります。作成元の会話がない目標は社員の通知設定を使用します。
 

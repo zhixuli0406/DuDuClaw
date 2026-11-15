@@ -4,7 +4,7 @@ v1.80 の構成では、gateway、AI 社員、文書解析、特権更新を分�
 
 **開発状況：** 署名検証後の未有効化世代の配置、インストーラーから移行への接続、最初の管理者設定、読み取り専用の導入検査、固定パスの協調削除を実装しました。完全な新規導入、署名済み世代の有効化、移行プラットフォーム、gateway の総合準備検査は未完了です。今回 root 実機での導入・削除は検証していません。サービスの `active` や世代の配置だけでは隔離の準備完了を示しません。[実装と検証記録](../../architecture/native-linux-isolation.md)を参照してください。
 
-**現在インストールできる内容：** `service install --protected-linux` は spawnd、egress、独立した更新サービスをインストールせず、移行計画を作成する処理もありません。隔離構成の新規インストール手順が完成するまで（v1.82.0 予定）、保護サービスは下記「単一実行ファイルの保護サービス（現行版）」で説明する v1.80 の単一実行ファイル gateway サービスです。このガイドで説明する社員ごとの隔離は適用されません。
+**現在インストールできる内容：** `service install --protected-linux` は spawnd、egress、独立した更新サービスをインストールせず、移行計画を作成する処理もありません。隔離構成の新規インストール手順が完成するまで（今後のバージョンで提供予定）、保護サービスは下記「単一実行ファイルの保護サービス（現行版）」で説明する v1.80 の単一実行ファイル gateway サービスです。このガイドで説明する社員ごとの隔離は適用されません。
 
 ## 利用者にとっての変更
 
@@ -37,7 +37,7 @@ Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大
 
 ## 単一実行ファイルの保護サービス（現行版）
 
-隔離コンポーネントをインストールできるようになるまで（v1.82.0 予定）、`service install --protected-linux` は v1.80 の単一実行ファイル保護 gateway をインストールします。root 所有のプログラム `/opt/duduclaw/bin/duduclaw`、ランチャー `/usr/local/libexec/duduclaw/protected-launcher`、ユニット `duduclaw-gateway.service`、バージョン下限 `/var/lib/duduclaw-protected/version-floor` で構成されます。ホストに隔離構成がインストールされるまで（v1.82.0 予定）、AI 社員は v1.80 と同じく gateway のサービスアカウントで実行され、v1.80 の認証情報保護が適用されます。社員も v1.80 と同じくダッシュボードから直接作成できます。このガイドで説明する隔離実行（spawnd による起動、個人専用社員、社員配置の提案）は、隔離構成が実際にインストールされたホストでのみ有効になります。
+隔離コンポーネントをインストールできるようになるまで（今後のバージョンで提供予定）、`service install --protected-linux` は v1.80 の単一実行ファイル保護 gateway をインストールします。root 所有のプログラム `/opt/duduclaw/bin/duduclaw`、ランチャー `/usr/local/libexec/duduclaw/protected-launcher`、ユニット `duduclaw-gateway.service`、バージョン下限 `/var/lib/duduclaw-protected/version-floor` で構成されます。ホストに隔離構成がインストールされるまで（今後のバージョンで提供予定）、AI 社員は v1.80 と同じく gateway のサービスアカウントで実行され、v1.80 の認証情報保護が適用されます。社員も v1.80 と同じくダッシュボードから直接作成できます。このガイドで説明する隔離実行（spawnd による起動、個人専用社員、社員配置の提案）は、隔離構成が実際にインストールされたホストでのみ有効になります。
 
 **新しいホスト。** バージョン下限の記録がない場合、ホストに DuDuClaw がインストールされたことがないと確認できたときだけインストールを続けます。条件は、`duduclaw` アカウントがなく、次のパスがすべて存在しないことです：`/var/lib/duduclaw`、`/var/lib/duduclaw-protected/root.key`、`/var/lib/duduclaw-protected/version-floor`、`/var/lib/duduclaw-protected/version-pending`、`/opt/duduclaw/bin/duduclaw`、ランチャー、`/etc/systemd/system/duduclaw-gateway.service`、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json`、`/opt/duduclaw-isolated/current`。いずれかが存在するか確認できない場合、記録のない下限は v1.79.3 のインストールである可能性があるため、インストーラーは移行のメッセージを表示して拒否します。拒否を回避するためにこれらのパスを削除しないでください。データや鍵が含まれている場合があります。
 
@@ -128,7 +128,7 @@ sudo -u duduclaw -H claude auth login
 
 ## 更新とアンインストール
 
-独立した更新サービスはまだインストールできません（v1.82.0 予定）。現在のホストは上記の単一実行ファイルの節に従って更新してください。移行と更新サービスの完全な準備後、Admin はダッシュボードで安定版を要求するか、インストール済み CLI を使います。
+独立した更新サービスはまだインストールできません（今後のバージョンで提供予定）。現在のホストは上記の単一実行ファイルの節に従って更新してください。移行と更新サービスの完全な準備後、Admin はダッシュボードで安定版を要求するか、インストール済み CLI を使います。
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z

@@ -8009,6 +8009,7 @@
   "channels.webchatWidget.desc": "把聊天視窗放到你的網站上，讓訪客直接跟 AI 員工對話。立即生效。",
   "channels.webchatWidget.enabled": "開放網站聊天元件",
   "channels.webchatWidget.enabled.help": "開啟前要先設定元件金鑰。",
+  "channels.webchatWidget.enabled.caution": "開放前請檢查負責回覆的 AI 員工：訪客的訊息由這位員工處理，能使用哪些工具由這位員工自己的工具與權限設定決定。對外開放的員工請不要開放指令執行（Bash）、檔案寫入等不需要的工具。",
   "channels.webchatWidget.key": "元件金鑰",
   "channels.webchatWidget.key.help": "貼進網站嵌入碼的金鑰，至少 16 個字元。存好後不會再顯示，請先複製。",
   "channels.webchatWidget.key.set": "已設定",

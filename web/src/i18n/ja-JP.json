@@ -8009,6 +8009,7 @@
   "channels.webchatWidget.desc": "Web サイトにチャット窓を置き、訪問者が AI 社員と直接話せるようにします。すぐに反映されます。",
   "channels.webchatWidget.enabled": "Web チャットウィジェットを公開",
   "channels.webchatWidget.enabled.help": "オンにする前にウィジェットキーを設定してください。",
+  "channels.webchatWidget.enabled.caution": "公開する前に、応答を担当する AI 社員を確認してください。訪問者のメッセージはその社員が処理し、使えるツールはその社員自身のツールと権限の設定で決まります。外部に公開する社員には、コマンド実行（Bash）やファイル書き込みなど不要なツールを許可しないでください。",
   "channels.webchatWidget.key": "ウィジェットキー",
   "channels.webchatWidget.key.help": "Web サイトの埋め込みコードに貼るキーで、16 文字以上。保存後は表示されないので先にコピーしてください。",
   "channels.webchatWidget.key.set": "設定済み",

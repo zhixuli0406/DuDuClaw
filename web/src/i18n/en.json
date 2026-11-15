@@ -8009,6 +8009,7 @@
   "channels.webchatWidget.desc": "Put a chat window on your website so visitors can talk to an AI employee. Applies at once.",
   "channels.webchatWidget.enabled": "Open the website chat widget",
   "channels.webchatWidget.enabled.help": "Set a widget key before turning this on.",
+  "channels.webchatWidget.enabled.caution": "Before you open it, check the AI employee that answers: visitors' messages are handled by that employee, and the tools it may use are decided by its own tool and permission settings. Do not grant command execution (Bash), file writing or other unneeded tools to an employee that faces the public.",
   "channels.webchatWidget.key": "Widget key",
   "channels.webchatWidget.key.help": "The key you paste into the site's embed code, at least 16 characters. It is not shown again after saving, so copy it first.",
   "channels.webchatWidget.key.set": "Set",

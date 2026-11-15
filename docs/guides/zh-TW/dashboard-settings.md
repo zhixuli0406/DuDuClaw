@@ -51,7 +51,7 @@
 
 英文版：[../dashboard-settings.md](../dashboard-settings.md)　日文版：[../ja-JP/dashboard-settings.md](../ja-JP/dashboard-settings.md)
 
-**保護模式公開網頁（原生 Linux 隔離架構，預計 v1.82.0 提供；僅能透過設定檔）：** AI 員工在保護模式下的執行是否可使用 `web_fetch_cached` 與 `web_extract`，須依員工在 `agents/<id>/agent.toml` 設定 `[isolation] public_web = true`（預設 `false`，不可存取網頁）。目前儀表板沒有對應控制項：請直接編輯該檔案，或使用管理員設定編輯器（`agent:<id>`），該編輯器會將此鍵列為受保護變更。員工表單的鍵值編輯器會拒絕 `[isolation]` 區段，非管理員的 `agents.update` 無法變更它，員工自行編輯檔案中的該區段也會被拒絕。此開關與員工表單的**網路存取**（`[container] network_access`）互相獨立，後者仍只控制任務沙箱的網路。即使啟用，保護模式下的擷取也只能連到公開的 HTTPS 網站（不可使用 IP 位址、內部名稱或重新導向）。未處於保護模式的安裝會忽略此鍵。
+**保護模式公開網頁（原生 Linux 隔離架構，預計在之後的版本提供；僅能透過設定檔）：** AI 員工在保護模式下的執行是否可使用 `web_fetch_cached` 與 `web_extract`，須依員工在 `agents/<id>/agent.toml` 設定 `[isolation] public_web = true`（預設 `false`，不可存取網頁）。目前儀表板沒有對應控制項：請直接編輯該檔案，或使用管理員設定編輯器（`agent:<id>`），該編輯器會將此鍵列為受保護變更。員工表單的鍵值編輯器會拒絕 `[isolation]` 區段，非管理員的 `agents.update` 無法變更它，員工自行編輯檔案中的該區段也會被拒絕。此開關與員工表單的**網路存取**（`[container] network_access`）互相獨立，後者仍只控制任務沙箱的網路。即使啟用，保護模式下的擷取也只能連到公開的 HTTPS 網站（不可使用 IP 位址、內部名稱或重新導向）。未處於保護模式的安裝會忽略此鍵。
 
 目標費用與重複呼叫防護目前在「設定檔進階編輯」設定，沒有獨立的自動化控制項。`config.toml [goal_loop]` 的 `default_cost_cap_cents = 0` 是未設定個別上限的目標所使用的美分上限（`0`＝不限額）；`tool_streak_pause = 8` 表示一輪結束後，相同工具與參數連續呼叫達此次數就暫停（`0`＝關閉）。透過進階編輯器儲存會重新載入目標迴圈；直接修改 `config.toml` 則需重新啟動 gateway。`tool_streak_advisory` 另行控制既有提醒。個別上限可在交辦目標時填寫；`/goals` 顯示費用，並讓有權限的操作者提高暫停目標的上限後重試。
 
@@ -272,7 +272,7 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 ## 通道管理
 
 - 群組「只回提及」（`mention_only`，每個群組各自設定）：v1.76 起，LINE 群組開啟後只回應用 `@` 叫 AI 員工（或要 @ 名單）的訊息，以及被點名員工正在等的那一則；以前開了會整個群組沒有回應。Telegram 共用 bot 也接受員工名字。見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)。
-- 網站聊天元件：「開放網站聊天元件」寫 `[webchat] public_widget`，「元件金鑰」寫 `[webchat] widget_key`（16 到 256 個可見 ASCII 字元，有「產生」按鈕；開啟元件時必須有金鑰；金鑰不會在回應中回傳）。立即生效。元件金鑰以明文存在 `config.toml`：它是公開的金鑰，會出現在網站的頁面原始碼裡，所以不當成密鑰處理。
+- 網站聊天元件：「開放網站聊天元件」寫 `[webchat] public_widget`，「元件金鑰」寫 `[webchat] widget_key`（16 到 256 個可見 ASCII 字元，有「產生」按鈕；開啟元件時必須有金鑰；金鑰不會在回應中回傳）。立即生效。元件金鑰以明文存在 `config.toml`：它是公開的金鑰，會出現在網站的頁面原始碼裡，所以不當成密鑰處理。**開放前請檢查負責回覆的 AI 員工**：訪客的訊息由這位員工處理，可以使用哪些工具由這位員工自己的工具與權限設定決定，系統不會因為對象是訪客就另外限制這位員工的指令執行與檔案工具（知識庫與公司帳號的使用另有訪客限制）。對外開放的員工請不要開放指令執行（Bash）、檔案寫入等不需要的工具。
 - WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘：六條 webhook 路由一律掛著。通道設定好之前回 404；設定好之後會驗證平台的簽章，簽章錯誤回 401。`channels.add` 不必重啟就會啟動通道，`channels.add` 回 `hot_started` 與 `restart_required: false`；憑證不完整時附 `not_started_reason`。個別員工的 Slack bot 也會在新增時直接啟動。
 - 通訊軟體的思考顯示（沒有專屬控制項，在設定檔進階編輯裡設定，每次回覆都重新讀取）：`[thinking] channel_audience` = `internal`（預設：通道身分已驗證、帳號啟用中，且是管理員或綁定回答員工的發話者看得到計時與遮蔽後的摘要，其他人只看計時）、`all`（一對一聊天的所有發話者都看得到摘要）或 `none`（都不顯示）；`[thinking] channel_group_display` = `status`（預設：群組聊天只顯示計時）、`summary` 或 `off`。`[thinking] display` 與回答員工的 `[model] show_thinking` 取較嚴格者，仍是兩者的上限。`config.toml` 讀不到或值不認得時都不顯示。網站訪客（Odoo 線上客服、WebChat 網站小工具）永遠看不到思考。詳見[通訊軟體的思考顯示](../../features/zh-TW/66-thinking-in-messaging-apps.md)。
 
@@ -471,7 +471,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 `[google] requesters`（預設 `bound_people`，另有 `owner_only`、`anyone`）這一頁還沒有控制項，用 `agents.google_identity_set`（`anyone` 要加 `confirm_anyone: true`）或設定檔進階編輯（管理員）設定。非管理員的擁有者改 `agent.toml` 時，`[google]` 只能改得更窄（改成 `none`、拿掉 `fallback`、收緊 `requesters`）。細節見[每位 AI 員工用不同的 Google 帳號](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
-## 整合 → MCP API 金鑰（v1.82）
+## 整合 → 工具伺服器：MCP API 金鑰（v1.82）
 
 只有管理員。金鑰存在 `<home>/mcp_keys.db`，只保存每把金鑰的 SHA-256 指紋；完整金鑰只在建立後顯示一次。這一頁的任何操作都不會寫入 `config.toml`。下列每一項變更都會連同操作者記入安全稽核紀錄（`security_audit.jsonl`）；非管理員的嘗試被拒絕時也會記錄。
 

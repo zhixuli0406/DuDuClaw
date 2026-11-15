@@ -4,7 +4,7 @@ v1.80 架構將 gateway、AI 員工、文件解析與特權更新分開。每位
 
 **開發狀態：** 已實作簽章驗證後的未啟用世代暫存、安裝器遷移轉接、首位管理員設定、唯讀安裝檢查與固定路徑的協調移除。完整新安裝、簽章啟用、遷移平台與 gateway 綜合就緒介面仍未完成；本輪未做 root 實機安裝／移除驗收。服務顯示 `active` 或世代已暫存，都不代表隔離就緒。詳見[實作與驗收紀錄](../../architecture/native-linux-isolation.md)。
 
-**目前能安裝的內容：** `service install --protected-linux` 不會安裝 spawnd、egress 或獨立更新服務，也沒有任何流程會建立遷移計畫。在隔離架構的新安裝流程完成前（預計 v1.82.0），受保護服務就是下方「單一執行檔受保護服務（目前版本）」一節說明的 v1.80 單一執行檔 gateway 服務，本指南描述的員工個別隔離不適用。
+**目前能安裝的內容：** `service install --protected-linux` 不會安裝 spawnd、egress 或獨立更新服務，也沒有任何流程會建立遷移計畫。在隔離架構的新安裝流程完成前（預計在之後的版本提供），受保護服務就是下方「單一執行檔受保護服務（目前版本）」一節說明的 v1.80 單一執行檔 gateway 服務，本指南描述的員工個別隔離不適用。
 
 ## 使用者會遇到的變化
 
@@ -37,7 +37,7 @@ Kernel 7.0 **目前不接受**：trampoline 會拒絕大於 7 的 Landlock ABI�
 
 ## 單一執行檔受保護服務（目前版本）
 
-在隔離元件可以安裝之前（預計 v1.82.0），`service install --protected-linux` 安裝的是 v1.80 的單一執行檔受保護 gateway：root 擁有的程式 `/opt/duduclaw/bin/duduclaw`、啟動器 `/usr/local/libexec/duduclaw/protected-launcher`、服務單元 `duduclaw-gateway.service` 及版本下限 `/var/lib/duduclaw-protected/version-floor`。在主機安裝隔離架構之前（預計 v1.82.0），AI 員工與 v1.80 相同，以 gateway 的服務帳號執行，並套用 v1.80 的憑證保護；員工也與 v1.80 相同，可直接從儀表板建立。本指南描述的隔離執行方式（spawnd 啟動、個人專屬員工、員工配置提案）只會在確實安裝了隔離架構的主機上啟用。
+在隔離元件可以安裝之前（預計在之後的版本提供），`service install --protected-linux` 安裝的是 v1.80 的單一執行檔受保護 gateway：root 擁有的程式 `/opt/duduclaw/bin/duduclaw`、啟動器 `/usr/local/libexec/duduclaw/protected-launcher`、服務單元 `duduclaw-gateway.service` 及版本下限 `/var/lib/duduclaw-protected/version-floor`。在主機安裝隔離架構之前（預計在之後的版本提供），AI 員工與 v1.80 相同，以 gateway 的服務帳號執行，並套用 v1.80 的憑證保護；員工也與 v1.80 相同，可直接從儀表板建立。本指南描述的隔離執行方式（spawnd 啟動、個人專屬員工、員工配置提案）只會在確實安裝了隔離架構的主機上啟用。
 
 **新主機。** 沒有版本下限紀錄時，只有在能確認主機從未安裝過 DuDuClaw 的情況下，安裝才會繼續：沒有 `duduclaw` 帳號，而且下列路徑都不存在：`/var/lib/duduclaw`、`/var/lib/duduclaw-protected/root.key`、`/var/lib/duduclaw-protected/version-floor`、`/var/lib/duduclaw-protected/version-pending`、`/opt/duduclaw/bin/duduclaw`、啟動器、`/etc/systemd/system/duduclaw-gateway.service`、`/etc/duduclaw/migration-import.json`、`/var/lib/duduclaw-migrate`、`/var/lib/duduclaw-updated/state.json`、`/opt/duduclaw-isolated/current`。只要其中任何一項存在或無法確認，缺少的版本下限就可能屬於 v1.79.3 安裝，安裝器會顯示遷移訊息並拒絕。不要為了通過檢查刪除這些路徑，其中可能有資料與金鑰。
 
@@ -128,7 +128,7 @@ sudo -u duduclaw -H claude auth login
 
 ## 升級與解除安裝
 
-獨立更新服務目前還無法安裝（預計 v1.82.0）；現有主機請依上方單一執行檔一節升級。完成遷移及更新服務佈署後，Admin 可在儀表板要求正式版更新，或使用已安裝的 CLI：
+獨立更新服務目前還無法安裝（預計在之後的版本提供）；現有主機請依上方單一執行檔一節升級。完成遷移及更新服務佈署後，Admin 可在儀表板要求正式版更新，或使用已安裝的 CLI：
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z

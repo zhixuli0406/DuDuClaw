@@ -4,7 +4,7 @@ The v1.80 architecture separates the gateway, AI employees, document parsing and
 
 **Development status:** signed inactive-generation staging, the installer migration handoff, first-administrator setup, read-only installation checks and coordinated fixed-path removal are implemented. Complete fresh installation, signed activation, the migration platform adapter and the gateway composite-readiness adapter remain incomplete. This round has no live root installation/removal acceptance. An `active` service or staged generation is not isolation readiness. See the [implementation and acceptance record](../architecture/native-linux-isolation.md).
 
-**What you can install today:** `service install --protected-linux` does not install spawnd, egress or the separate updater, and nothing creates the migration plan. Until the isolation fresh bootstrap lands (planned v1.82.0), the protected service is the v1.80 single-binary gateway service described in [Single-binary protected service (current releases)](#single-binary-protected-service-current-releases). The per-employee Linux isolation described in this guide does not apply to it.
+**What you can install today:** `service install --protected-linux` does not install spawnd, egress or the separate updater, and nothing creates the migration plan. Until the isolation fresh bootstrap lands (planned for a later release), the protected service is the v1.80 single-binary gateway service described in [Single-binary protected service (current releases)](#single-binary-protected-service-current-releases). The per-employee Linux isolation described in this guide does not apply to it.
 
 ## What changes for customers
 
@@ -37,7 +37,7 @@ The host needs trusted system tools including `getent`, `id`, `useradd`, util-li
 
 ## Single-binary protected service (current releases)
 
-Until the isolation components can be installed (planned v1.82.0), `service install --protected-linux` installs the v1.80 single-binary protected gateway: the root-owned program `/opt/duduclaw/bin/duduclaw`, the launcher `/usr/local/libexec/duduclaw/protected-launcher`, the unit `duduclaw-gateway.service` and the version floor `/var/lib/duduclaw-protected/version-floor`. Until the isolation architecture is installed on the host (planned v1.82.0), AI employees run under the gateway's service account as in v1.80, with the v1.80 credential protection; employees are created directly from the dashboard as in v1.80. The isolation path described in this guide (spawnd launches, Personal employees, employee proposals) engages only on hosts where the isolation architecture is actually installed.
+Until the isolation components can be installed (planned for a later release), `service install --protected-linux` installs the v1.80 single-binary protected gateway: the root-owned program `/opt/duduclaw/bin/duduclaw`, the launcher `/usr/local/libexec/duduclaw/protected-launcher`, the unit `duduclaw-gateway.service` and the version floor `/var/lib/duduclaw-protected/version-floor`. Until the isolation architecture is installed on the host (planned for a later release), AI employees run under the gateway's service account as in v1.80, with the v1.80 credential protection; employees are created directly from the dashboard as in v1.80. The isolation path described in this guide (spawnd launches, Personal employees, employee proposals) engages only on hosts where the isolation architecture is actually installed.
 
 **New host.** With no recorded version floor, the installer continues only when it can show the host never had DuDuClaw installed: there is no `duduclaw` account and none of these paths exist: `/var/lib/duduclaw`, `/var/lib/duduclaw-protected/root.key`, `/var/lib/duduclaw-protected/version-floor`, `/var/lib/duduclaw-protected/version-pending`, `/opt/duduclaw/bin/duduclaw`, the launcher, `/etc/systemd/system/duduclaw-gateway.service`, `/etc/duduclaw/migration-import.json`, `/var/lib/duduclaw-migrate`, `/var/lib/duduclaw-updated/state.json` and `/opt/duduclaw-isolated/current`. If any of them exists or cannot be checked, the missing floor may belong to a v1.79.3 installation and the installer refuses with the migration message. Do not delete these paths to get past the refusal; they can hold data and keys.
 
@@ -128,7 +128,7 @@ Migration copies only `.duduclaw` data, **not AI CLI installations or their logi
 
 ## Upgrade and uninstall
 
-The separate updater cannot be installed yet (planned v1.82.0); current hosts upgrade as described in the single-binary section above. After migration and complete updater provisioning, an Admin requests a stable release in the dashboard or uses the installed CLI:
+The separate updater cannot be installed yet (planned for a later release); current hosts upgrade as described in the single-binary section above. After migration and complete updater provisioning, an Admin requests a stable release in the dashboard or uses the installed CLI:
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
