@@ -490,17 +490,13 @@ pub(crate) async fn mcp_admit_seat(home_dir: &Path) -> std::result::Result<duduc
     mcp_seat_decision(admission, cap.max, cap.tier.as_deref())
 }
 
-/// The bounded wait for the seat admission lock, on a blocking thread.
+/// The bounded wait for the seat admission lock, polled without holding a
+/// blocking thread (the holder needs those to publish).
 pub(crate) async fn acquire_seat_admission(home_dir: &Path) -> std::result::Result<duduclaw_core::agent_seats::SeatAdmission, String> {
-    let home = home_dir.to_path_buf();
-    match tokio::task::spawn_blocking(move || duduclaw_core::agent_seats::SeatAdmission::acquire(&home)).await {
-        Ok(Ok(admission)) => Ok(admission),
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "create_agent: seat admission lock not acquired; refusing (fail closed)");
-            Err(MCP_SEAT_UNVERIFIABLE.to_string())
-        }
+    match duduclaw_core::agent_seats::SeatAdmission::acquire_async(home_dir).await {
+        Ok(admission) => Ok(admission),
         Err(e) => {
-            tracing::warn!(error = %e, "create_agent: seat admission task failed; refusing (fail closed)");
+            tracing::warn!(error = %e, "create_agent: seat admission lock not acquired; refusing (fail closed)");
             Err(MCP_SEAT_UNVERIFIABLE.to_string())
         }
     }

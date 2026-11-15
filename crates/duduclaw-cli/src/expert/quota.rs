@@ -84,13 +84,12 @@ pub async fn ensure(home: &Path, gateway_cap: Option<usize>, adding: usize, free
 /// Take the seat admission for a real import and check under it. `Ok` hands
 /// the held admission back; the caller keeps it until every employee of the
 /// import is written. Waits at most
-/// [`duduclaw_core::agent_seats::SEAT_ADMISSION_WAIT`] for the lock
-/// (refuses past it: nothing written).
+/// [`duduclaw_core::agent_seats::SEAT_ADMISSION_WAIT`] for the lock, without
+/// holding a blocking thread (refuses past it: nothing written).
 pub async fn admit(home: &Path, gateway_cap: Option<usize>, adding: usize, freed: usize) -> Result<SeatAdmission> {
-    let h = home.to_path_buf();
-    let admission = match tokio::task::spawn_blocking(move || SeatAdmission::acquire(&h)).await {
-        Ok(Ok(admission)) => admission,
-        _ => return Err(unverifiable(adding, None)),
+    let admission = match SeatAdmission::acquire_async(home).await {
+        Ok(admission) => admission,
+        Err(_) => return Err(unverifiable(adding, None)),
     };
     check_under(&admission, gateway_cap, adding, freed).await?;
     Ok(admission)
