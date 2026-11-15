@@ -5388,7 +5388,7 @@ not been obtained.
   gateway-only install with `--migrate-from` can import a user-mode v1.79.x home
   and record a 1.81.x floor. Do not trust the floor for this decision, and do not
   add a marker file in its place.
-- v1.82 isolation switch: protected mode alone no longer means "isolation
+- Isolation switch: protected mode alone no longer means "isolation
   required". `execution_gate::isolation_required()` is the trusted latch OR
   (`protected_mode::active()` AND `isolation_install::installed()`), and every
   isolation decision (spawnd routing, isolation MCP authorization, the
