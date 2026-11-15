@@ -449,11 +449,10 @@ duduclaw service uninstall
 docker compose up -d
 ```
 
-Composeサービス名は `duduclaw` です。コンテナ版のアプリケーションデータ（`license.json` を含む）は `duduclaw-data` volumeにあり、コンテナ内の `/home/duduclaw/.duduclaw` にマウントされます。ホストに残った `~/.duduclaw` はマウントされず、このgatewayでは使われません。ライセンスはコンテナ内で更新してください。
+Composeサービス名は `duduclaw` です。コンテナ版のアプリケーションデータ（`license.json` を含む）は `duduclaw-data` volumeにあり、コンテナ内の `/home/duduclaw/.duduclaw` にマウントされます。ホストに残った `~/.duduclaw` はマウントされず、このgatewayでは使われません。ライセンスの状態はコンテナ内で確認してください。ライセンスキーの入力や変更は、ダッシュボードの「ライセンス管理」ページで行います。
 
 ```bash
 docker compose exec duduclaw duduclaw license status
-docker compose exec duduclaw duduclaw license activate <key>
 # コンテナから読めるファイルをインポートする場合：
 docker compose exec duduclaw duduclaw license import /path/in/container/license.json
 ```

@@ -453,12 +453,11 @@ duduclaw service uninstall
 docker compose up -d
 ```
 
-Compose 服務名稱是 `duduclaw`。容器版的主程式資料（包含 `license.json`）存放在 `duduclaw-data` volume，掛載於容器內 `/home/duduclaw/.duduclaw`。主機殘留的 `~/.duduclaw` 沒有掛進容器，因此不會被這個 gateway 使用。請在容器內更新授權：
+Compose 服務名稱是 `duduclaw`。容器版的主程式資料（包含 `license.json`）存放在 `duduclaw-data` volume，掛載於容器內 `/home/duduclaw/.duduclaw`。主機殘留的 `~/.duduclaw` 沒有掛進容器，因此不會被這個 gateway 使用。請在容器內確認授權；啟用或更換授權碼請到儀表板的「授權管理」頁操作：
 
 ```bash
 docker compose exec duduclaw duduclaw license status
-docker compose exec duduclaw duduclaw license activate <key>
-# 或匯入容器內可讀到的授權檔：
+# 匯入容器內可讀到的授權檔：
 docker compose exec duduclaw duduclaw license import /path/in/container/license.json
 ```
 
