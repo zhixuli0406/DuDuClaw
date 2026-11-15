@@ -2220,7 +2220,7 @@ impl SessionManager {
         let deadline = std::time::Instant::now() + duduclaw_auth::ACL_DELIVERY_WAIT;
         let result = users.with_acl_generation(generation, || {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            conn.busy_timeout(remaining).map_err(AclDeliveryError::from_sqlite)?;
+            conn.busy_timeout(duduclaw_auth::busy_timeout_at_least(remaining)).map_err(AclDeliveryError::from_sqlite)?;
             policy.with_current(|| {
                 if !allowed() { return Ok(false); }
                 conn.execute(
