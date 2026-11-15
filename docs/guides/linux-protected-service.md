@@ -1,12 +1,14 @@
 # Protected native Linux service
 
-The v1.80 architecture separates the gateway, AI employees, document parsing and privileged updates. Each confirmed employee receives a permanent Linux identity; each run receives its own process, filesystem and network namespaces. An unavailable isolation component stops employee execution.
+The per-employee isolation architecture (planned for a later release) separates the gateway, AI employees, document parsing and privileged updates. Each confirmed employee receives a permanent Linux identity; each run receives its own process, filesystem and network namespaces. An unavailable isolation component stops employee execution.
 
 **Development status:** signed inactive-generation staging, the installer migration handoff, first-administrator setup, read-only installation checks and coordinated fixed-path removal are implemented. Complete fresh installation, signed activation, the migration platform adapter and the gateway composite-readiness adapter remain incomplete. This round has no live root installation/removal acceptance. An `active` service or staged generation is not isolation readiness. See the [implementation and acceptance record](../architecture/native-linux-isolation.md).
 
 **What you can install today:** `service install --protected-linux` does not install spawnd, egress or the separate updater, and nothing creates the migration plan. Until the isolation fresh bootstrap lands (planned for a later release), the protected service is the v1.80 single-binary gateway service described in [Single-binary protected service (current releases)](#single-binary-protected-service-current-releases). The per-employee Linux isolation described in this guide does not apply to it.
 
 ## What changes for customers
+
+The changes below apply once the isolation architecture is available. They do not apply to current installations.
 
 - Employees no longer execute as the gateway account when isolation is required. One employee runs one job at a time; additional conversations and scheduled jobs queue.
 - Employees can read their own CLI login tokens. They cannot use another employee's home or the gateway's credentials through the isolated execution path. Personal connections require a confirmed Personal employee with one owner; shared employees cannot use personal credentials.
