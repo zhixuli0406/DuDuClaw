@@ -589,6 +589,29 @@ fn still_linked(_dir: &SafeDir, _name: &str, _held: &std::fs::File) -> io::Resul
     Ok(true)
 }
 
+/// Has the open handle lost its last link (unlinked since it was opened)? A
+/// link count never rises again from zero, so this cannot hide a file that
+/// had several links when it was checked.
+#[cfg(unix)]
+fn unlinked(file: &std::fs::File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(file.metadata()?.nlink() == 0)
+}
+
+#[cfg(not(unix))]
+fn unlinked(_file: &std::fs::File) -> io::Result<bool> {
+    // A sidecar pending deletion cannot be opened at all (module docs).
+    Ok(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs in [`lock_rounds`] with the sidecar name once its
+    /// handle is open and before it is verified — the window a releasing
+    /// holder's unlink can hit. Thread-local, so concurrent tests never see it.
+    pub(super) static AFTER_SIDECAR_OPEN: std::cell::RefCell<Option<Box<dyn Fn(&str)>>> = std::cell::RefCell::new(None);
+}
+
 /// One hard deadline for a lock acquisition, fixed before the first try.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Deadline(Instant);
@@ -660,7 +683,23 @@ pub(super) fn lock_rounds(
                 None => return Ok(None),
             }
         };
-        verify_private(&file)?;
+        #[cfg(test)]
+        AFTER_SIDECAR_OPEN.with(|hook| if let Some(hook) = hook.borrow().as_ref() { hook(lock) });
+        if let Err(refusal) = verify_private(&file) {
+            // A releasing holder unlinks the sidecar while still holding it
+            // ([`LedgerLock::release`]), so a handle opened just before that
+            // unlink can have no link left when it is checked. That inode is
+            // no longer at the name: like a failed re-check below, retry on
+            // the current one within the deadline. Every other refusal
+            // (several links, foreign owner, not a file) stands.
+            if !matches!(unlinked(&file), Ok(true)) {
+                return Err(refusal);
+            }
+            if !create {
+                return Ok(None);
+            }
+            continue;
+        }
         let guard = lock_handle_within(file, budget)?;
         after_lock(budget);
         if still_linked(dir, lock, guard.file())? {

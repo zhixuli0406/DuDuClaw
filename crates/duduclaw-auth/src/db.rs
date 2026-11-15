@@ -49,6 +49,16 @@ const POOL_SIZE: usize = 2;
 /// stays far below WebChat's 10 s send deadline. Running out fails closed.
 pub const ACL_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Round SQLite busy waits up because SQLite accepts whole milliseconds only.
+pub fn busy_timeout_at_least(remaining: std::time::Duration) -> std::time::Duration {
+    if remaining.is_zero() {
+        return remaining;
+    }
+    let whole_millis = remaining.as_millis();
+    let rounded_millis = whole_millis + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
+    std::time::Duration::from_millis(rounded_millis.min(u64::MAX as u128) as u64)
+}
+
 /// Longest wait of a [`UserDb::open_read_only`] read. WAL readers do not wait
 /// for a writer; this only bounds a brief WAL recovery or checkpoint.
 const READ_ONLY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -112,7 +122,7 @@ impl UserDb {
         let deadline = std::time::Instant::now() + ACL_DELIVERY_WAIT;
         let result = self.acl_delivery_connection(deadline).and_then(|mut conn| {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            conn.busy_timeout(remaining).map_err(AclDeliveryError::from_sqlite)?;
+            conn.busy_timeout(busy_timeout_at_least(remaining)).map_err(AclDeliveryError::from_sqlite)?;
             let result = (|| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(AclDeliveryError::from_sqlite)?;

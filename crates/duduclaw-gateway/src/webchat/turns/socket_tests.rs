@@ -574,8 +574,36 @@ async fn webchat_memory_socket_mfa_revocation_blocks_fifo_waiter_and_turn_frames
     // before session creation; the queued turn has not entered the seam at all.
     // Waiting for either receipt here would retain SOCKET_TEST_LOCK forever.
     assert!(fixture.gate.entered.try_recv().is_err(), "FIFO waiter must not start before revocation");
+    // turn_queued is different: the reader sends it at admission, after its
+    // own credential check and before the waiter is spawned. turn_count(2)
+    // returns as soon as the slot is reserved, so read that notice here —
+    // while the credential is still valid — instead of leaving it to race
+    // the revocation into the closing loop below, which must see no frame.
+    let notice = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match socket.next().await.expect("WebChat closed before the queue notice").unwrap() {
+                WireMessage::Text(text) => {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    // Anything read here precedes the revocation.
+                    if value["type"] == "turn_queued" && value["msg_id"] == "queued" { break value; }
+                }
+                WireMessage::Ping(data) => socket.send(WireMessage::Pong(data)).await.unwrap(),
+                WireMessage::Pong(_) => {}
+                other => panic!("unexpected WebChat frame: {other:?}"),
+            }
+        }
+    }).await.expect("queue notice timed out");
+    assert_eq!(notice["admission"]["reason"], "conversation_queue", "{notice}");
+    assert_eq!(notice["admission"]["running"], 1, "{notice}");
+    assert_eq!(notice["admission"]["queued"], 1, "{notice}");
     assert!(fixture.state.ctx.session_manager.session_agent(&running.session_id).await.unwrap().is_none());
     fixture.state.user_db.mfa_operator_reset("revoked@socket.test").unwrap();
+    // A message to the same conversation now would queue behind the held turn
+    // and be announced by turn_queued; it must be refused before admission,
+    // so the closing loop below fails on any notice for it. The writer may
+    // already have closed the transport: a rejected send is valid too.
+    let _ = socket.send(WireMessage::Text(json!({"type":"user_message", "content":"Hello",
+        "conv":"same", "msg_id":"queued-after-revocation"}).to_string().into())).await;
     running.release.send(()).unwrap();
     fixture.turn_count(0).await;
     assert!(fixture.gate.entered.try_recv().is_err(), "revoked FIFO waiter must not start");

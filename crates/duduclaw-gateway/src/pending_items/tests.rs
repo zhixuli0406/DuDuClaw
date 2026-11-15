@@ -693,6 +693,54 @@ fn lock_deadline_holds_under_repeated_inode_changes() {
     assert_eq!(*budgets.borrow(), vec![Duration::from_millis(2000), Duration::from_millis(1100), Duration::from_millis(200)]);
 }
 
+/// Install a [`store::AFTER_SIDECAR_OPEN`] hook that unlinks the opened
+/// sidecar once — what a releasing holder does between a waiter's open and its
+/// check. Returns how often it unlinked.
+#[cfg(unix)]
+fn unlink_sidecar_once_after_open(home: &Path) -> std::rc::Rc<std::cell::Cell<u32>> {
+    let pending = pending_dir(home);
+    let unlinks = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let seen = unlinks.clone();
+    let hook: Box<dyn Fn(&str)> = Box::new(move |lock: &str| {
+        if seen.get() == 0 {
+            seen.set(1);
+            std::fs::remove_file(pending.join(lock)).unwrap();
+        }
+    });
+    store::AFTER_SIDECAR_OPEN.with(|slot| *slot.borrow_mut() = Some(hook));
+    unlinks
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_retries_a_sidecar_its_holder_unlinked_between_open_and_check() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = store::open_dir(home.path(), true).unwrap().unwrap();
+    // The sidecar is at the name (another turn holds it), so the waiter opens
+    // the existing one; the holder releases — unlinking it — before the check.
+    dir.create_file_new(store::ADMISSION_LOCK, b"").unwrap();
+    let unlinks = unlink_sidecar_once_after_open(home.path());
+    let held = store::lock(&dir, store::ADMISSION_LOCK, true, store::TURN_LOCK_WAIT);
+    store::AFTER_SIDECAR_OPEN.with(|hook| hook.borrow_mut().take());
+    assert_eq!(unlinks.get(), 1, "the window was hit");
+    let held = match held {
+        Ok(Some(held)) => held,
+        Ok(None) => panic!("a creating lock returned no lock"),
+        Err(e) => panic!("an unlinked sidecar must be retried, not refused: {e}"),
+    };
+    held.release(&dir);
+    assert!(entries(home.path()).is_empty(), "the retried sidecar is unlinked on release");
+
+    // A non-creating try (GC's orphan check) treats it as gone.
+    dir.create_file_new(store::ADMISSION_LOCK, b"").unwrap();
+    let unlinks = unlink_sidecar_once_after_open(home.path());
+    let gone = store::lock(&dir, store::ADMISSION_LOCK, false, Duration::ZERO);
+    store::AFTER_SIDECAR_OPEN.with(|hook| hook.borrow_mut().take());
+    assert_eq!(unlinks.get(), 1, "the window was hit");
+    assert!(matches!(gone, Ok(None)), "an unlinked sidecar is absent, not refused");
+    assert!(entries(home.path()).is_empty());
+}
+
 // ── M1: GC ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -879,6 +927,21 @@ mod unix_safe_open {
         assert!(update(home.path(), "googlechat:space", "alice", "agent", "turn-2", cap(10)).is_err());
         assert_eq!(std::fs::read(&other).unwrap(), before);
         assert_eq!(std::fs::read(&ledger).unwrap(), before);
+    }
+
+    #[test]
+    fn hard_linked_lock_sidecar_is_still_refused() {
+        // The retry for a sidecar unlinked in flight never accepts one that
+        // has several links at rest.
+        let home = tempfile::tempdir().unwrap();
+        let dir = store::open_dir(home.path(), true).unwrap().unwrap();
+        dir.create_file_new(store::ADMISSION_LOCK, b"").unwrap();
+        std::fs::hard_link(pending_dir(home.path()).join(store::ADMISSION_LOCK), home.path().join("other-link")).unwrap();
+        for create in [true, false] {
+            let error = store::lock(&dir, store::ADMISSION_LOCK, create, store::TURN_LOCK_WAIT).err().expect("must be refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{error}");
+        }
+        assert_eq!(entries(home.path()), vec![store::ADMISSION_LOCK.to_string()], "the linked sidecar is left alone");
     }
 
     #[test]
