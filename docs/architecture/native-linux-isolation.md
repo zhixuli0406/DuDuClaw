@@ -1,8 +1,8 @@
 # Native Linux isolation implementation
 
 > **Release status:** the per-employee Linux isolation architecture described in this
-> note is planned for v1.82.0. Its code is included in v1.81.0 but cannot be
-> installed or enabled on a customer host. In v1.81.0 the protected service
+> note is planned for a later release. Its code has been included since v1.81.0 but cannot be
+> installed or enabled on a customer host. The protected service still
 > installs, updates and runs employees as in v1.80
 > (`sudo duduclaw service install --protected-linux`,
 > `sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`).
@@ -12,7 +12,7 @@ isolation. Source migration, compilation, protocol fixtures, native acceptance
 and deployment are separate gates. Nothing in this note is production isolation
 acceptance.
 
-**Status 2026-11-09 (code included in v1.81.0, not enabled).** Everything below
+**Status 2026-11-09 (code included since v1.81.0, not enabled).** Everything below
 is a dated per-round development log. Its "pending", "not yet" and "still
 required" wording describes the state at the time of that round. Current
 per-tool state is in [the tool matrix](native-linux-isolation-tools.md) (every
@@ -1577,7 +1577,7 @@ The shared contract changes are explicitly listed above.
 | `crates/duduclaw-parse-worker/tests/systemd.rs` | Six ignored real-systemd tests; one further ignored resource test is in sandbox.rs. |
 | `docs/README.md` | Architecture note index. |
 | `docs/architecture/native-linux-isolation.md` | Internal Package E implementation, seams, tests and handoff. |
-| `docs/features/05-security-defense.md` | English behavior (planned for v1.82.0) and acceptance boundaries. |
+| `docs/features/05-security-defense.md` | English behavior (planned for a later release) and acceptance boundaries. |
 | `docs/features/ja-JP/05-security-defense.md` | Japanese behavior and acceptance boundaries. |
 | `docs/features/zh-TW/05-security-defense.md` | Traditional Chinese behavior and acceptance boundaries. |
 | `wiki/impl/native-linux-isolation-package-e-20261105.md` | Removed; relevant historical evidence and handoff moved into this Package E section. |
@@ -3661,7 +3661,7 @@ Round 2 file responsibilities (in addition to the historical round 1 list):
 
 獨立 code-reviewer 看過實際變更；指出的缺 version-floor 放行、proposal 總量上限及 inherited fd 的 unsafe precondition 已修正並複查。archive I/O 錯誤後禁止再次加密以避免 nonce 重用，另有回歸測試。沒有做正式的指定安全審查，不能視為安全審查放行。
 
-##### 精確未完成項目（該輪當時；2026-11-09 現況：遷移 root 命令、匯入、確認頁與產品 adapters 的程式碼已包含在 v1.81.0 但尚未啟用，預計 v1.82.0 提供；實機與真實供應商驗收仍待執行）
+##### 精確未完成項目（該輪當時；2026-11-09 現況：遷移 root 命令、匯入、確認頁與產品 adapters 的程式碼自 v1.81.0 起已包含在內但尚未啟用，預計在之後的版本提供；實機與真實供應商驗收仍待執行）
 
 1. 尚無可操作的 `duduclaw-migrate` root 命令及 installer 遷移接線。`HostAdapter` 沒有 production implementation：root flock、停止舊 gateway、mask/timer/socket/cron/at/user-manager 封鎖、清空舊 uid 程序與讀回待做。舊 installer 目前只會拒絕跨入 v1.80。
 2. 快照走訪／AEAD 元件已有，但 fsync＋原子發布＋解密驗證整合、人工安全還原、期限清理及跨檔案系統複製待做。quarantine helper 只有同檔案系統 `RENAME_NOREPLACE`，呼叫端須先停止舊環境並封存父目錄權限。

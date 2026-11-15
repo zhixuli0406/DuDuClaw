@@ -1,12 +1,12 @@
-# Linux protected mode: acceptance runbook (planned for v1.82.0)
+# Linux protected mode: acceptance runbook (planned for a later release)
 
 [繁體中文](zh-TW/linux-protected-acceptance.md) · [日本語](ja-JP/linux-protected-acceptance.md)
 
-> **Status: planned for v1.82.0, not available in v1.81.0.** The per-employee Linux isolation this runbook accepts cannot be installed on a customer host in v1.81.0. In v1.81.0 the protected service installs, updates and runs employees as in v1.80.
+> **Status: planned for a later release, not available in v1.82.0.** The per-employee Linux isolation this runbook accepts cannot be installed on a customer host in v1.82.0. The protected service still installs, updates and runs employees as in v1.80.
 
-This runbook is for release maintainers. It lists what you need, which commands to run, and how to read the results for the native Linux isolation acceptance planned for v1.82.0: Personal and Shared employees, connectors, and the Package H tools.
+This runbook is for release maintainers. It lists what you need, which commands to run, and how to read the results for the native Linux isolation acceptance planned for a later release: Personal and Shared employees, connectors, and the Package H tools.
 
-> **These harnesses cannot get past setup yet.** `connectors-acceptance.sh`, `package-h-acceptance.sh` and the `iso_personal_chain` / `iso_package_h_chain` tests need the isolation components (spawnd, egress, the separate updater) installed and running. `duduclaw service install --protected-linux` does not install them; it installs only the single-binary protected gateway (see [Single-binary protected service](linux-protected-service.md#single-binary-protected-service-current-releases)). Until the isolation fresh bootstrap lands (planned v1.82.0), expect every run to stop during setup. That outcome is not an acceptance result for the employee, connector or Package H features.
+> **These harnesses cannot get past setup yet.** `connectors-acceptance.sh`, `package-h-acceptance.sh` and the `iso_personal_chain` / `iso_package_h_chain` tests need the isolation components (spawnd, egress, the separate updater) installed and running. `duduclaw service install --protected-linux` does not install them; it installs only the single-binary protected gateway (see [Single-binary protected service](linux-protected-service.md#single-binary-protected-service-current-releases)). Until the isolation fresh bootstrap lands (planned for a later release), expect every run to stop during setup. That outcome is not an acceptance result for the employee, connector or Package H features.
 
 > **Every step below is destructive.** The harnesses install the protected service, create system accounts, write under `/var/lib/duduclaw*`, `/opt`, `/etc`, change `/etc/hosts`, install a throw-away CA and remove all of it afterwards. Use a disposable VM. They refuse to run unless `DUDUCLAW_ISO_DISPOSABLE=1` is set, and refuse when a DuDuClaw installation exists that they did not create. They never use your own `~/.duduclaw` or your own Claude / agy login: `HOME` and `DUDUCLAW_HOME` of the operator CLI point into a private temp directory.
 

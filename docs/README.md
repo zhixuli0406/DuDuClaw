@@ -6,9 +6,9 @@
 
 Native Linux personal accounts: [Protected system service](guides/linux-protected-service.md) · [繁體中文](guides/zh-TW/linux-protected-service.md) · [日本語](guides/ja-JP/linux-protected-service.md)
 
-Release maintainers, native Linux isolation (planned for v1.82.0; not available in v1.81.0): [Acceptance runbook (G1, G2, G3, H15)](guides/linux-protected-acceptance.md) · [繁體中文](guides/zh-TW/linux-protected-acceptance.md) · [日本語](guides/ja-JP/linux-protected-acceptance.md)
+Release maintainers, native Linux isolation (planned for a later release; not available in v1.82.0): [Acceptance runbook (G1, G2, G3, H15)](guides/linux-protected-acceptance.md) · [繁體中文](guides/zh-TW/linux-protected-acceptance.md) · [日本語](guides/ja-JP/linux-protected-acceptance.md)
 
-Developer implementation notes: [Native Linux isolation](architecture/native-linux-isolation.md) (planned for v1.82.0; not active product behavior in v1.81.0).
+Developer implementation notes: [Native Linux isolation](architecture/native-linux-isolation.md) (planned for a later release; not active product behavior in v1.82.0).
 
 ## Feature Highlights
 
@@ -92,7 +92,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/73-meeting-transcripts.md](features/73-meeting-transcripts.md) | Meeting recordings to Taiwan Traditional Chinese transcripts, timestamps, provider privacy and limits; [繁體中文](features/zh-TW/73-meeting-transcripts.md) / [日本語](features/ja-JP/73-meeting-transcripts.md) |
 | [features/74-ag-ui.md](features/74-ag-ui.md) | AG-UI 1.0 HTTP/SSE frontend endpoint, account-bound conversations and approval interrupts; [繁體中文](features/zh-TW/74-ag-ui.md) / [日本語](features/ja-JP/74-ag-ui.md) |
 | [features/75-compliance-reports.md](features/75-compliance-reports.md) | Enterprise Admin compliance reports: recorded outbound decisions, approvals, action reviews and data-source accesses; [繁體中文](features/zh-TW/75-compliance-reports.md) / [日本語](features/ja-JP/75-compliance-reports.md) |
-| [features/77-protected-mode.md](features/77-protected-mode.md) | Native Linux protected mode (planned for v1.82.0): Personal and Shared employees, connectors, retire/restore/adopt/purge rules, recording gate, what still needs a real host. Not available in v1.81.0, where the protected service runs as in v1.80; [繁體中文](features/zh-TW/77-protected-mode.md) / [日本語](features/ja-JP/77-protected-mode.md) |
+| [features/77-protected-mode.md](features/77-protected-mode.md) | Native Linux protected mode (planned for a later release): Personal and Shared employees, connectors, retire/restore/adopt/purge rules, recording gate, what still needs a real host. Not available in v1.82.0, where the protected service runs as in v1.80; [繁體中文](features/zh-TW/77-protected-mode.md) / [日本語](features/ja-JP/77-protected-mode.md) |
 | [features/78-action-claim-check.md](features/78-action-claim-check.md) | Action claim check: mail / calendar / sheets / docs / tasks completion claims in chat replies checked against the same conversation's tool records, the two notice texts, who sees them, `[action_claims] mode` (default `notice`) and known limits; [繁體中文](features/zh-TW/78-action-claim-check.md) / [日本語](features/ja-JP/78-action-claim-check.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
@@ -121,9 +121,9 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description | Status |
 |----------|-------------|--------|
 | [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
-| [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation implementation: egress and DNS, execution backends and spawn inventory, package boundaries, integration status and pending acceptance | Planned for v1.82.0; not enabled in v1.81.0 |
-| [architecture/native-linux-isolation-security-fixes-2026-11-05.md](architecture/native-linux-isolation-security-fixes-2026-11-05.md) | Security review fixes for the native Linux isolation components (2026-11-05) | Planned for v1.82.0; not enabled in v1.81.0 |
-| [architecture/native-linux-isolation-tools.md](architecture/native-linux-isolation-tools.md) | Package D: exact tool routes and intentional restrictions | Planned for v1.82.0; not live acceptance |
+| [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation implementation: egress and DNS, execution backends and spawn inventory, package boundaries, integration status and pending acceptance | Planned for a later release; not enabled in v1.82.0 |
+| [architecture/native-linux-isolation-security-fixes-2026-11-05.md](architecture/native-linux-isolation-security-fixes-2026-11-05.md) | Security review fixes for the native Linux isolation components (2026-11-05) | Planned for a later release; not enabled in v1.82.0 |
+| [architecture/native-linux-isolation-tools.md](architecture/native-linux-isolation-tools.md) | Package D: exact tool routes and intentional restrictions | Planned for a later release; not live acceptance |
 | [architecture/extension-gates.md](architecture/extension-gates.md) | Extension RPC/HTTP and third-party MCP boundaries; Odoo Live Chat and voice entry-point inventory; pilot entry-point inventory and unwired ModuleLease core spike | Current (v1.81.0 spike) |
 | [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + AEE/Playbook (the only evolution path; the legacy SOUL.md rewrite path was removed) + Cognitive Memory | Current |
 

@@ -78,7 +78,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 72 | [Group context](72-group-context.md) | Opt-in retention, explicit employee reads and Discord choices |
 | 73 | [Meeting transcripts](73-meeting-transcripts.md) | Recordings to Taiwan Traditional Chinese with timestamps and optional speaker labels |
 | 76 | [Org chart editing](76-org-chart-editing.md) | Change reporting lines and departments: Admins apply after a before/after check, Managers propose for Admin approval; shared loop/existence/department rules; `org.*` RPCs and the **Adjust position** panel on the org chart page (v1.81.0) |
-| 77 | [Native Linux protected mode (planned for v1.82.0)](77-protected-mode.md) | Not available in the current release. Per-employee accounts and execution environments on native Linux: Personal vs Shared, connectors, retire/restore/adopt/purge, recording gate, host acceptance status |
+| 77 | [Native Linux protected mode (planned for a later release)](77-protected-mode.md) | Not available in the current release. Per-employee accounts and execution environments on native Linux: Personal vs Shared, connectors, retire/restore/adopt/purge, recording gate, host acceptance status |
 | 78 | [Action claim check](78-action-claim-check.md) | Chat replies that say an email was sent, an event or task was created, or a sheet or doc was written are checked against the same conversation's tool records; staff-only notice by default, `[action_claims] mode = "shadow"` to only record |
 
 ---
