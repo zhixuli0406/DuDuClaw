@@ -435,12 +435,11 @@ duduclaw service uninstall
 docker compose up -d
 ```
 
-The Compose service is `duduclaw`. Its application data, including `license.json`, lives in the `duduclaw-data` volume mounted at `/home/duduclaw/.duduclaw` inside the container. A leftover host `~/.duduclaw` is not mounted and is not used by this gateway. Update the licence against the container volume:
+The Compose service is `duduclaw`. Its application data, including `license.json`, lives in the `duduclaw-data` volume mounted at `/home/duduclaw/.duduclaw` inside the container. A leftover host `~/.duduclaw` is not mounted and is not used by this gateway. Check the licence against the container volume; to enter or replace a licence key, use the dashboard's License page:
 
 ```bash
 docker compose exec duduclaw duduclaw license status
-docker compose exec duduclaw duduclaw license activate <key>
-# Or import a licence file already available inside the container:
+# Import a licence file already available inside the container:
 docker compose exec duduclaw duduclaw license import /path/in/container/license.json
 ```
 
