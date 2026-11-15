@@ -477,7 +477,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 | 控制項 | 寫入 | 生效 |
 |---|---|---|
-| 建立金鑰：名稱、金鑰用途、用戶端 ID／AI 員工代號、環境、權限範圍、到期 | `mcp_keys.db` 新增一列（`mcp_keys.create`） | 立即。名稱必填、不可重複（不分大小寫），最多 60 個字元。**外部整合**（以用戶端 ID）：一律是外部金鑰（`is_external: false` 會被拒絕）；用戶端 ID 不能是 AI 員工的代號或名稱，也不能是系統保留名稱（`dashboard`、`cron`、`default`、`gateway-internal`……）；權限範圍只有伺服器列出可給外部金鑰的那幾項（`memory:read`、`memory:write`、`wiki:read`、`wiki:write`、`messaging:send`），其他範圍會被拒絕並註明是哪一項。**AI 員工自己的金鑰**（`agent_id`；RFC-21 的每位員工專用金鑰、v1.76 的 Google 專用金鑰）：代表該員工的內部金鑰，可帶 v1.81 對話框提供過的權限範圍，不能帶 `admin`；同仁的個人專屬員工只有擁有者，或重新驗證身分並留下稽核的管理員能建立。到期可選 30 天、90 天（預設）、365 天、自訂日期（到當天結束為止）或**不過期**。選不過期會顯示風險說明，必須勾選確認；稽核紀錄會記下誰在何時確認。 |
+| 建立金鑰：名稱、金鑰用途、用戶端 ID／AI 員工代號、環境、權限範圍、到期 | `mcp_keys.db` 新增一列（`mcp_keys.create`） | 立即。名稱必填、不可重複（不分大小寫），最多 60 個字元。**外部整合**（以用戶端 ID）：一律是外部金鑰（`is_external: false` 會被拒絕）；用戶端 ID 不能是 AI 員工的代號或名稱，也不能是系統保留名稱（`dashboard`、`cron`、`default`、`gateway-internal`……）；權限範圍只有伺服器列出可給外部金鑰的那幾項（`memory:read`、`memory:write`、`wiki:read`、`wiki:write`、`messaging:send`），其他範圍會被拒絕並註明是哪一項。**AI 員工自己的金鑰**（`agent_id`；RFC-21 的每位員工專用金鑰、v1.76 的 Google 專用金鑰）：代表該員工的內部金鑰，可帶 v1.81 對話框提供過的權限範圍，不能帶 `admin`；同仁的個人專屬員工只有擁有者，或重新驗證身分並留下稽核的管理員能建立（個人專屬員工屬於尚未提供的原生 Linux 員工隔離，目前的安裝沒有這類員工）。到期可選 30 天、90 天（預設）、365 天、自訂日期（到當天結束為止）或**不過期**。選不過期會顯示風險說明，必須勾選確認；稽核紀錄會記下誰在何時確認。 |
 | 重新命名 | 該列名稱（`mcp_keys.rename`） | 立即。用這把金鑰同意過的 OAuth 連線不受影響。 |
 | 變更到期日 | 該列到期日（`mcp_keys.set_expiry`） | 下一次呼叫。選項同建立時；延長已到期的金鑰會讓它恢復可用。到期通知會重新計算。 |
 | 停用／啟用 | `disabled_at`／`disabled_by`（`mcp_keys.disable`／`mcp_keys.enable`） | 下一次呼叫，閘道與所有執行中的 `mcp-server`／`http-server` 都一樣（它們每次呼叫都重讀儲存區）。停用與到期的金鑰收到相同的「已到期或已停用」拒絕訊息。 |
@@ -876,4 +876,4 @@ API（管理員 JWT）：`POST /api/channel-identity/bind {user_id, channel, cha
 
 `users.update`、`users.create`、`users.bind_agent` 會在寫入前拒絕未知欄位與無效值。輸入驗證錯誤以 `{code:"invalid_setting", key, message}` 指出欄位；主管循環等既有業務錯誤維持原代碼。`primary_agent_id` 不是 `users.update` 支援的欄位，請使用 `users.set_primary_agent`。
 
-受保護模式下，修補候選會排除個人專屬員工的綁定，預覽另回傳被排除的成員人數；橫幅人數以預覽為準。個人專屬 AI 須由成員自行設定，管理員選單會略過無法代設的綁定。確認只傳預覽摘要，伺服器在 IMMEDIATE 交易內重算完整有序名單與 SHA-256 摘要；不一致就拒絕整筆變更。migration、restore 與個人員工建立不會自動指定主要 AI。`users.list` 若讀不到綁定，會拒絕整份清單。
+受保護模式下，修補候選會排除個人專屬員工的綁定，預覽另回傳被排除的成員人數；橫幅人數以預覽為準（個人專屬員工屬於尚未提供的原生 Linux 員工隔離，目前的安裝沒有這類員工）。個人專屬 AI 須由成員自行設定，管理員選單會略過無法代設的綁定。確認只傳預覽摘要，伺服器在 IMMEDIATE 交易內重算完整有序名單與 SHA-256 摘要；不一致就拒絕整筆變更。migration、restore 與個人員工建立不會自動指定主要 AI。`users.list` 若讀不到綁定，會拒絕整份清單。

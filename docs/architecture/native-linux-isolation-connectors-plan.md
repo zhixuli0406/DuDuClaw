@@ -1,13 +1,20 @@
 # Protected isolation: Personal bindings and production connectors
 
-Status 2026-11-09: the plan below was written on 2026-11-05 and is now
-implemented on the v1.81 integration branch (packages A–G, see the table).
+> **Release status:** Personal bindings and the production connectors described
+> here belong to the per-employee Linux isolation architecture, which is planned
+> for a later release. Its code has been included since v1.81.0 but cannot be
+> installed or enabled on a customer host; v1.82.0 runs the single-binary
+> protected service as in v1.80, and no installation has Personal employees or
+> employee-specific connector accounts yet.
+
+Status 2026-11-09: the plan below was written on 2026-11-05. Its packages A–G
+are now written in code (see the table); none of it is enabled in a release.
 "Existing implementation" and "Missing production authority" describe the
 starting point, not today's code. Native execution on Ubuntu 22.04/24.04 and
 Debian 12 as root and real provider acceptance (Google Workspace test tenant,
-Notion, GitHub, Odoo) remain separate gates and have not run for this branch.
+Notion, GitHub, Odoo) remain separate gates and have not run for this code.
 
-| Package | State on the integration branch |
+| Package | State of the code (not enabled in any release) |
 | --- | --- |
 | A: lifecycle read model | Done (A1–A4; Personal exclusivity in users.db, root receipt records the binding). A1–A3 passed security review SR1, with its two High findings fixed. |
 | B: production binding authority | Done (B1–B3; Personal owner and Shared tenant come from the lifecycle read model, background receipts keep original authority). Reviewed in SR2/SR3 (gate passed after fixes). |

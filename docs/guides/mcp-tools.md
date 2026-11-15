@@ -131,7 +131,8 @@ name` / display name, or another case of the ID, is refused
 (`agent_binding`, never changed afterwards). It is an internal key that acts as
 that employee and carries only scopes the v1.81 picker offered, never `admin`. For
 a colleague's Personal employee, only the owner, or an Admin after a fresh audited
-step-up, can create one.
+step-up, can create one. (Personal employees belong to the native Linux employee
+isolation that is not available yet; current installations have none.)
 
 **Internal keys on `duduclaw http-server`.** The HTTP server acts for one fixed
 employee (its default agent) for every caller, and many tools act for that

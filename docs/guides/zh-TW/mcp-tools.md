@@ -73,7 +73,7 @@ CIMD `private_key_jwt`。
 
 最後使用時間記在另一個檔案 `<home>/mcp_keys_usage.db`（只有金鑰 ID 與時間，每把金鑰每分鐘最多一次），閘道列出金鑰時讀取。它不參與任何驗證：損壞或被改過的使用紀錄只會影響「最後使用」欄的顯示。
 
-以用戶端 ID 發出的儀表板金鑰一律是**外部**金鑰。可用的權限範圍由伺服器的一份清單決定（`memory:read`、`memory:write`、`wiki:read`、`wiki:write`、`messaging:send`），其他範圍會被拒絕（`mcp_key_scope_not_grantable`，並註明是哪一項）。用戶端 ID 不能是 AI 員工的代號或名稱，也不能是系統保留名稱（`dashboard`、`cron`、`default`、`gateway-internal`……）。AI 員工自己的金鑰（RFC-21 的每位員工專用金鑰、v1.76 的 Google 專用金鑰）要以 `agent_id` 明確建立，而且必須填員工**代號**（`agents/` 底下的資料夾名稱，大小寫須完全相同）；填 `[agent] name`／顯示名稱或大小寫不同的代號會被拒絕（`mcp_key_employee_id_required`）。金鑰在建立時就綁定這位員工（`agent_binding`，之後不會改變）。它是代表該員工的內部金鑰，只能帶 v1.81 金鑰對話框提供過的權限範圍，不能帶 `admin`；同仁的個人專屬員工只有擁有者，或重新驗證身分（step-up）並留下稽核的管理員能建立。
+以用戶端 ID 發出的儀表板金鑰一律是**外部**金鑰。可用的權限範圍由伺服器的一份清單決定（`memory:read`、`memory:write`、`wiki:read`、`wiki:write`、`messaging:send`），其他範圍會被拒絕（`mcp_key_scope_not_grantable`，並註明是哪一項）。用戶端 ID 不能是 AI 員工的代號或名稱，也不能是系統保留名稱（`dashboard`、`cron`、`default`、`gateway-internal`……）。AI 員工自己的金鑰（RFC-21 的每位員工專用金鑰、v1.76 的 Google 專用金鑰）要以 `agent_id` 明確建立，而且必須填員工**代號**（`agents/` 底下的資料夾名稱，大小寫須完全相同）；填 `[agent] name`／顯示名稱或大小寫不同的代號會被拒絕（`mcp_key_employee_id_required`）。金鑰在建立時就綁定這位員工（`agent_binding`，之後不會改變）。它是代表該員工的內部金鑰，只能帶 v1.81 金鑰對話框提供過的權限範圍，不能帶 `admin`；同仁的個人專屬員工只有擁有者，或重新驗證身分（step-up）並留下稽核的管理員能建立（個人專屬員工屬於尚未提供的原生 Linux 員工隔離，目前的安裝沒有這類員工）。
 
 **內部金鑰用在 `duduclaw http-server`。** HTTP 伺服器對所有呼叫者都以同一位固定員工（它的預設員工）的身分執行，而許多工具是以那位員工、而不是金鑰本身的身分讀寫：`working_state_*`、`mail_*`、所有 `wiki_*` 工具、`canvas_*`、`send_message`、`tasks_list`、`plan_*`、`odoo_*`、電腦操作、分支與知識庫工具，以及 `crates/duduclaw-cli/src/mcp/tools_list.rs` 裡 `DEFAULT_AGENT_HANDLER_TOOLS` ∪ `PROCESS_AGENT_TOOLS` 的其餘工具。在 HTTP 上採「預設拒絕」：
 
