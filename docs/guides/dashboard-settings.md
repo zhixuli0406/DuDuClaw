@@ -474,7 +474,7 @@ Everyone bound to the employee (Viewer and up) sees which Google account it uses
 
 `[google] requesters` (`bound_people` default, `owner_only`, `anyone`) has no control on this page yet; set it with `agents.google_identity_set` (`anyone` needs `confirm_anyone: true`) or the Advanced config editor (Admin). A non-admin Owner editing `agent.toml` may only narrow `[google]` (switch to `none`, drop `fallback`, tighten `requesters`). Details: [Per-employee Google accounts](google-workspace.md#per-employee-google-accounts-company-delegation-v1760).
 
-## Integrations → MCP API keys (v1.82)
+## Integrations → Tool servers: MCP API keys (v1.82)
 
 Admin only. Keys live in `<home>/mcp_keys.db`; only each key's SHA-256 fingerprint is stored, and the full key is shown once, right after creation. Nothing on this page writes `config.toml`. Every change below is recorded in the security audit log (`security_audit.jsonl`) with who made it; a refused (non-Admin) attempt is recorded too.
 

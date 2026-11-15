@@ -101,7 +101,7 @@ lives elsewhere.
 
 ### MCP API keys (`ddc_<env>_…`) since v1.82
 
-Keys created on the dashboard's **Integrations → MCP API keys** page are kept in
+Keys created in the MCP API keys section of the dashboard's **Integrations → Tool servers** tab are kept in
 `<home>/mcp_keys.db` as SHA-256 fingerprints, never in `config.toml`. The stdio
 `duduclaw mcp-server` (key in `DUDUCLAW_MCP_API_KEY`) and `duduclaw http-server`
 (`Authorization: Bearer`) look the presented key up in that store on every call

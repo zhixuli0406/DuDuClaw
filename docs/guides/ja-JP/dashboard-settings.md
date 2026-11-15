@@ -471,7 +471,7 @@ AI 社員に紐づいている人（閲覧者以上）なら誰でも見られ�
 
 `[google] requesters`（既定 `bound_people`、ほかに `owner_only`、`anyone`）はこのページにまだ操作がありません。`agents.google_identity_set`（`anyone` には `confirm_anyone: true` が必要）か設定ファイルの詳細編集（管理者）で設定します。管理者でない担当者が `agent.toml` を編集する場合、`[google]` は狭める方向にしか変えられません（`none` にする、`fallback` を外す、`requesters` を厳しくする）。詳しくは[AI 社員ごとに別の Google アカウントを使う](google-workspace.md#ai-社員ごとに別の-google-アカウントを使う会社の委任v1760)。
 
-## 連携 → MCP API キー（v1.82）
+## 連携 → ツールサーバー：MCP API キー（v1.82）
 
 管理者のみ。キーは `<home>/mcp_keys.db` に保存され、保存されるのは各キーの SHA-256 指紋だけです。完全なキーは作成直後に一度だけ表示されます。このページの操作は `config.toml` に書き込みません。以下の変更はすべて操作者とともにセキュリティ監査ログ（`security_audit.jsonl`）に記録され、管理者以外の試行が拒否された場合も記録されます。
 

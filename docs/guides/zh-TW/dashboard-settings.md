@@ -471,7 +471,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 `[google] requesters`（預設 `bound_people`，另有 `owner_only`、`anyone`）這一頁還沒有控制項，用 `agents.google_identity_set`（`anyone` 要加 `confirm_anyone: true`）或設定檔進階編輯（管理員）設定。非管理員的擁有者改 `agent.toml` 時，`[google]` 只能改得更窄（改成 `none`、拿掉 `fallback`、收緊 `requesters`）。細節見[每位 AI 員工用不同的 Google 帳號](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
-## 整合 → MCP API 金鑰（v1.82）
+## 整合 → 工具伺服器：MCP API 金鑰（v1.82）
 
 只有管理員。金鑰存在 `<home>/mcp_keys.db`，只保存每把金鑰的 SHA-256 指紋；完整金鑰只在建立後顯示一次。這一頁的任何操作都不會寫入 `config.toml`。下列每一項變更都會連同操作者記入安全稽核紀錄（`security_audit.jsonl`）；非管理員的嘗試被拒絕時也會記錄。
 

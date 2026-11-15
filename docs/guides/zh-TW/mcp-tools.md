@@ -69,7 +69,7 @@ CIMD `private_key_jwt`。
 
 ## MCP API 金鑰（`ddc_<env>_…`，v1.82 起）
 
-在儀表板「整合 → MCP API 金鑰」建立的金鑰以 SHA-256 指紋存在 `<home>/mcp_keys.db`，不再寫進 `config.toml`。stdio 的 `duduclaw mcp-server`（金鑰放在 `DUDUCLAW_MCP_API_KEY`）與 `duduclaw http-server`（`Authorization: Bearer`）每次呼叫都到儲存區查詢（先以指紋做索引查詢，再對查到的那筆以固定時間比對指紋），所以重新命名、變更到期日、停用或刪除都在下一次呼叫生效，不必重啟。它們只以唯讀方式開啟 `mcp_keys.db`，寫入只有閘道。每把金鑰的到期日由管理員決定（30／90／365 天、指定日期或不過期），不再固定 30 天。已到期與已停用的金鑰收到相同的拒絕訊息（`API key is expired or disabled`）；伺服器紀錄會寫明原因與金鑰 ID，絕不寫出金鑰本身。
+在儀表板「整合 → 工具伺服器」分頁的 MCP API 金鑰區塊建立的金鑰以 SHA-256 指紋存在 `<home>/mcp_keys.db`，不再寫進 `config.toml`。stdio 的 `duduclaw mcp-server`（金鑰放在 `DUDUCLAW_MCP_API_KEY`）與 `duduclaw http-server`（`Authorization: Bearer`）每次呼叫都到儲存區查詢（先以指紋做索引查詢，再對查到的那筆以固定時間比對指紋），所以重新命名、變更到期日、停用或刪除都在下一次呼叫生效，不必重啟。它們只以唯讀方式開啟 `mcp_keys.db`，寫入只有閘道。每把金鑰的到期日由管理員決定（30／90／365 天、指定日期或不過期），不再固定 30 天。已到期與已停用的金鑰收到相同的拒絕訊息（`API key is expired or disabled`）；伺服器紀錄會寫明原因與金鑰 ID，絕不寫出金鑰本身。
 
 最後使用時間記在另一個檔案 `<home>/mcp_keys_usage.db`（只有金鑰 ID 與時間，每把金鑰每分鐘最多一次），閘道列出金鑰時讀取。它不參與任何驗證：損壞或被改過的使用紀錄只會影響「最後使用」欄的顯示。
 
