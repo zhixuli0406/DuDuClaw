@@ -84,6 +84,9 @@ export function WebChatWidgetCard() {
           checked={enabled}
           onChange={(v) => form.set('webchat.public_widget', v)}
         />
+        <p className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-foreground">
+          {t('channels.webchatWidget.enabled.caution')}
+        </p>
         <SettingsRow
           label={
             <span className="flex items-center gap-2">

@@ -34,6 +34,12 @@ beforeEach(() => {
 });
 
 describe('<WebChatWidgetCard>', () => {
+  it('shows the public widget tool caution while the widget is off', async () => {
+    configMock.mockResolvedValue({ config: '[webchat]\npublic_widget = false\n' });
+    renderWithProviders(<WebChatWidgetCard />);
+    expect(await screen.findByText(/Before you open it, check the AI employee that answers:/)).toBeInTheDocument();
+  });
+
   it('clears a stored key with an explicit action, sending ""', async () => {
     configMock.mockResolvedValue({ config: '[webchat]\npublic_widget = false\nwidget_key = "********"\n' });
     renderWithProviders(<WebChatWidgetCard />);
