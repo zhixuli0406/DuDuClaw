@@ -76,6 +76,19 @@ pub async fn registry(home_dir: &Path) -> &'static RuntimeRegistry {
     built
 }
 
+/// Why a model runs, stated by every caller of the two spawn choke points
+/// ([`run_agent_prompt_detailed`] and the Claude CLI spawn). There is no
+/// default: a caller that does not say what it is cannot reach a spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnPurpose {
+    /// An employee's own work (a channel reply, a dispatch). Refused without
+    /// that employee's directory (spawn-gate refusal, no fallback).
+    EmployeeTurn,
+    /// Agent-less helper work through a restricted lane (the utility lane;
+    /// on the Claude CLI also an explicit tool allowlist).
+    Utility,
+}
+
 /// Parameters for a provider-agnostic agent prompt.
 pub struct AgentPrompt<'a> {
     pub agent_dir: Option<&'a Path>,
@@ -119,6 +132,8 @@ pub struct AgentPrompt<'a> {
     /// moved the provider, so a decorrelated judge can never be silently
     /// answered by the worker's family.
     pub allow_cross_family_failover: bool,
+    /// Employee turn or agent-less utility work; see [`SpawnPurpose`].
+    pub purpose: SpawnPurpose,
 }
 
 /// Execute a prompt through the agent's configured runtime provider.
@@ -181,6 +196,23 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
 async fn run_agent_prompt_inner(
     req: AgentPrompt<'_>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+    // Every runtime (Codex, Grok, OpenAI-compatible, generic CLIs, Claude via
+    // failover) would otherwise start an employee's work with no employee
+    // directory: gateway cwd, no MCP config, no hook. The caller's stated
+    // purpose decides; the channel-turn task-local is a second refusal.
+    // Preflight + spawn-gate prefix: no fallback.
+    if req.agent_dir.is_none()
+        && (req.purpose == SpawnPurpose::EmployeeTurn
+            || (!in_utility_call() && crate::channel_reply::in_channel_reply_turn()))
+    {
+        tracing::warn!(purpose = ?req.purpose, "runtime dispatch without an employee directory — refused");
+        return Err(RuntimeDispatchFailure::preflight(
+            req.provider_override,
+            req.model,
+            RuntimePreflightKind::Config,
+            crate::channel_reply::no_employee_spawn_refusal(),
+        ));
+    }
     crate::isolation_readiness::check_execution().map_err(|error|
         RuntimeDispatchFailure::preflight(req.provider_override, req.model, RuntimePreflightKind::Config, error))?;
     if let Some(dir) = req.agent_dir {
@@ -240,7 +272,7 @@ async fn run_agent_prompt_inner(
         home_dir: req.home_dir.to_path_buf(),
         agent_id: req.agent_id.to_string(),
         preferred_provider: None,
-        conversation_history: req.conversation_history.to_vec(),
+        conversation_history: crate::runtime::cap_conversation_history(req.conversation_history),
         // Capability enforcement (W1): resolved from `agent.toml [capabilities]`
         // so every runtime (Claude AND non-Claude) receives the agent's tool
         // restrictions. `None` only for agent-less utility calls (no agent_dir).
@@ -899,6 +931,7 @@ pub async fn run_utility_prompt_with_hint(
             runtime_settings: None,
             effort: hint.and_then(|h| h.effort),
             allow_cross_family_failover,
+            purpose: SpawnPurpose::Utility,
         });
         let fut = UTILITY_CALL.scope((), fut);
         match schema {
@@ -1494,6 +1527,8 @@ mod utility_policy_tests {
             model: "gpt-5.4", max_tokens: 16, provider_override: Some(RuntimeType::OpenAiCompat),
             conversation_history: &[], request_type: RequestType::Chat, runtime_settings: None,
             effort: None, allow_cross_family_failover: false,
+            // Agent-less fixture: only utility work may run without a directory.
+            purpose: SpawnPurpose::Utility,
         }
     }
 
@@ -1568,6 +1603,7 @@ mod budget_preflight_tests {
             max_tokens: 16, provider_override: Some(RuntimeType::Claude),
             conversation_history: &[], request_type: RequestType::Chat,
             runtime_settings: None, effort: None, allow_cross_family_failover: true,
+            purpose: SpawnPurpose::EmployeeTurn,
         }).await.unwrap_err();
         assert_eq!(error.preflight.as_ref().unwrap().kind, RuntimePreflightKind::Budget);
         assert!(error.steps.is_empty());
@@ -1586,6 +1622,7 @@ mod budget_preflight_tests {
             max_tokens: 16, provider_override: Some(RuntimeType::Claude),
             conversation_history: &[], request_type: RequestType::Chat,
             runtime_settings: None, effort: None, allow_cross_family_failover: true,
+            purpose: SpawnPurpose::EmployeeTurn,
         }).await.unwrap_err();
         assert_eq!(error.preflight.as_ref().unwrap().kind, RuntimePreflightKind::Config);
         assert!(error.steps.is_empty());

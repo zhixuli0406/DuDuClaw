@@ -146,6 +146,40 @@ impl WebChatState {
         self.authorize_target_inner(user, agent, public).await
     }
 
+    /// v1.82: a turn that names no employee and for which none resolves on
+    /// this conversation can only answer with the no-responder notice. Any
+    /// named or resolvable employee keeps `authorize_target`.
+    pub(in crate::webchat) async fn no_responder_turn(&self, target: &str, sid: &str, user_id: &str) -> bool {
+        if !target.is_empty() { return false; }
+        let reg = self.ctx.registry.read().await;
+        crate::channel_reply::resolve_fallback_agent(&self.ctx, &reg, sid, user_id).await.is_none()
+    }
+
+    /// The target-less re-check for the no-responder notice: only what does
+    /// not depend on an employee. The account must still exist and be Active
+    /// (unreadable refuses); the credential and the turn's cancellation are
+    /// re-checked by every caller next to this call, as around
+    /// `authorize_target`. Widget visitors pass as they do there.
+    pub(crate) async fn authorize_no_target(&self, user: &str) -> Result<(), ChatMessage> {
+        if is_widget_visitor(user) { return Ok(()); }
+        let (db, uid) = (self.user_db.clone(), user.to_owned());
+        let account = tokio::task::spawn_blocking(move || db.get_user(&uid)).await;
+        if !matches!(account, Ok(Ok(Some(u))) if u.status == duduclaw_auth::UserStatus::Active) {
+            tracing::warn!(user, reason = "account_unavailable", "WebChat turn without a target unavailable");
+            return Err(agent_unavailable());
+        }
+        Ok(())
+    }
+
+    /// `authorize_target` when the turn has a target employee; the
+    /// target-less re-check when it has none (`None`, the no-responder notice).
+    pub(crate) async fn authorize_turn(&self, user: &str, target: Option<&str>, public: bool) -> Result<(), ChatMessage> {
+        match target {
+            Some(agent) => self.authorize_target(user, agent, public).await,
+            None => self.authorize_no_target(user).await,
+        }
+    }
+
     async fn authorize_target_inner(&self, user: &str, agent: &str, public: bool) -> Result<(), ChatMessage> {
         let denied = |reason: &str| {
             tracing::warn!(user, agent, reason, "WebChat target unavailable");

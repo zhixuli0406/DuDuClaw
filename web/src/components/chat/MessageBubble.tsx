@@ -69,7 +69,7 @@ export function MessageBubble({
         ))}
         {isUser && message.delivery === 'queued' && (
           <div className="mt-2 text-xs" role="status">
-            {intl.formatMessage({ id: 'webchat.queued' })}
+            {message.deliveryNotice ?? intl.formatMessage({ id: 'webchat.queued' })}
             <button type="button" className="ml-2 underline" onClick={() => cancel(message.turnId)}>
               {intl.formatMessage({ id: 'webchat.cancelQueued' })}
             </button>

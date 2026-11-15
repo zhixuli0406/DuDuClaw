@@ -767,8 +767,13 @@ async fn handle_event(
             };
             // Central access gate (pairing / allowlist / blocklist) — same
             // enforcement the AI path applies; commands must not bypass it.
-            if let Some(gate_reply) =
-                crate::channel_reply::check_user_access_gate(ctx, &session_id, user, text).await
+            if let Some(gate_reply) = crate::channel_reply::check_command_access_gate(
+                ctx,
+                &session_id,
+                crate::ccr_runtime::reply_principal_for_sender(user),
+                text,
+            )
+            .await
             {
                 if !gate_reply.is_empty() {
                     send_message(
@@ -793,15 +798,28 @@ async fn handle_event(
             let is_admin =
                 crate::channel_reply::is_channel_admin(ctx, "slack", &[user, &session_id]).await;
             let caller = crate::chat_commands::CommandCaller::for_channel(&ctx.home_dir, "slack", user);
-            let reply = crate::chat_commands::handle_command_with_caller(
+            // A channel's session is shared by its members: only a verified
+            // Admin/Manager may clear it (a DM resets its own as before).
+            let reply = match crate::chat_commands::shared_reset_refusal(
+                &ctx.home_dir,
+                "slack",
+                user,
+                !is_dm,
                 &cmd,
-                ctx,
-                &session_id,
-                &agent_id,
-                is_admin,
-                &caller,
-            )
-            .await;
+            ) {
+                Some(refusal) => refusal.to_string(),
+                None => {
+                    crate::chat_commands::handle_command_with_caller(
+                        &cmd,
+                        ctx,
+                        &session_id,
+                        &agent_id,
+                        is_admin,
+                        &caller,
+                    )
+                    .await
+                }
+            };
             send_message(
                 http,
                 bot_token,
@@ -908,7 +926,6 @@ async fn handle_event(
             let filename = f.get("name").and_then(|v| v.as_str()).unwrap_or("file");
             let mt = crate::media::media_type_from_mime(mime);
             match crate::media::download_url(
-                http,
                 url,
                 Some(("Authorization", &format!("Bearer {bot_token}"))),
                 crate::media::MAX_FILE_SIZE as usize,
@@ -924,7 +941,10 @@ async fn handle_event(
                         Err(e) => warn!("Slack: failed to save attachment {filename}: {e}"),
                     }
                 }
-                Err(e) => warn!("Slack: failed to download attachment {filename}: {e}"),
+                Err(e) => {
+                    warn!("Slack: attachment download failed: {e}");
+                    attachment_lines.push(crate::media::attachment_download_failed(filename));
+                }
             }
         }
     }
@@ -1207,10 +1227,10 @@ async fn handle_slash_command_envelope(
             // this command) and with the sender's account id, which the shared
             // `handle_command` signature does not carry.
             if let Some(tk) = crate::chat_commands::parse_takeover(&cmd_text) {
-                if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                if let Some(gate_reply) = crate::channel_reply::check_command_access_gate(
                     ctx,
                     &session_id,
-                    user_id,
+                    crate::ccr_runtime::reply_principal_for_sender(user_id),
                     &cmd_text,
                 )
                 .await
@@ -1229,10 +1249,10 @@ async fn handle_slash_command_envelope(
             if let Some(cmd) = crate::chat_commands::parse_command(&cmd_text, None) {
                 // Central access gate — slash commands must not bypass the
                 // pairing/allowlist/blocklist enforcement the AI path applies.
-                if let Some(gate_reply) = crate::channel_reply::check_user_access_gate(
+                if let Some(gate_reply) = crate::channel_reply::check_command_access_gate(
                     ctx,
                     &session_id,
-                    user_id,
+                    crate::ccr_runtime::reply_principal_for_sender(user_id),
                     &cmd_text,
                 )
                 .await
@@ -1256,15 +1276,29 @@ async fn handle_slash_command_envelope(
                         .await;
                 let caller =
                     crate::chat_commands::CommandCaller::for_channel(&ctx.home_dir, "slack", user_id);
-                let reply = crate::chat_commands::handle_command_with_caller(
+                // `slack:group:<channel>` is shared by the channel's members
+                // (only a `D…` direct-message channel is one person's).
+                let shared = !channel_id.starts_with('D');
+                let reply = match crate::chat_commands::shared_reset_refusal(
+                    &ctx.home_dir,
+                    "slack",
+                    user_id,
+                    shared,
                     &cmd,
-                    ctx,
-                    &session_id,
-                    &agent_id,
-                    is_admin,
-                    &caller,
-                )
-                .await;
+                ) {
+                    Some(refusal) => refusal.to_string(),
+                    None => {
+                        crate::chat_commands::handle_command_with_caller(
+                            &cmd,
+                            ctx,
+                            &session_id,
+                            &agent_id,
+                            is_admin,
+                            &caller,
+                        )
+                        .await
+                    }
+                };
                 respond_via_response_url(http, response_url, "ephemeral", &reply).await;
             } else {
                 respond_via_response_url(
@@ -1402,6 +1436,26 @@ async fn handle_interactive_envelope(
     // possible plan-first LLM call directly is safe. Posted `in_channel` (not
     // ephemeral) so the result — a created goal task, or a generated plan —
     // is visible the same way a plain-text `1`/`2`/`3` reply would have been.
+    // Every non-decision button below passes the same fail-closed access gate
+    // as a typed command, on the presser, in the conversation it was pressed
+    // in (a DM is the presser's own `slack:<user>` session).
+    {
+        let channel = payload["channel"]["id"].as_str().unwrap_or("");
+        let conversation = if channel.starts_with('D') && !slack_uid.is_empty() {
+            format!("slack:{slack_uid}")
+        } else {
+            format!("slack:group:{channel}")
+        };
+        if let Some(reply) =
+            crate::channel_reply::check_command_access_gate(ctx, &conversation, slack_uid, "").await
+        {
+            if !reply.is_empty() {
+                respond_via_response_url(http, response_url, "ephemeral", &reply).await;
+            }
+            return;
+        }
+    }
+
     if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(action_data) {
         let sender = payload["user"]["id"].as_str().unwrap_or("");
         let outcome = crate::goal_intent::handle_gintent_button_for_sender(ctx, choice, &nonce, "slack", sender).await;
@@ -1417,9 +1471,30 @@ async fn handle_interactive_envelope(
             } else {
                 value.to_string()
             };
-            let msg = match ctx.session_manager.delete_session(&session_id).await {
-                Ok(()) => "✅ 已開啟新的對話".to_string(),
-                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+            // Same checks as a typed `/new`: the access gate, then only a
+            // verified Admin/Manager clears a conversation other than the
+            // presser's own DM (exact session match).
+            if let Some(reply) =
+                crate::channel_reply::check_command_access_gate(ctx, &session_id, slack_uid, "").await
+            {
+                if !reply.is_empty() {
+                    respond_via_response_url(http, response_url, "ephemeral", &reply).await;
+                }
+                return;
+            }
+            let own_dm = !slack_uid.is_empty() && session_id == format!("slack:{slack_uid}");
+            let msg = if crate::chat_commands::shared_clear_refused(
+                &ctx.home_dir,
+                "slack",
+                slack_uid,
+                !own_dm,
+            ) {
+                crate::chat_commands::GROUP_RESET_REFUSED.to_string()
+            } else {
+                match ctx.session_manager.delete_session(&session_id).await {
+                    Ok(()) => "✅ 已開啟新的對話".to_string(),
+                    Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+                }
             };
             respond_via_response_url(http, response_url, "ephemeral", &msg).await;
         }

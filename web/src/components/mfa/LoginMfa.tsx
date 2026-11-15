@@ -6,6 +6,7 @@ import { apiPost, useAuthStore, type LoginChallenge, type SessionTokens } from '
 import { mfaApi, mfaErrorId } from '@/lib/mfa-api';
 import { authenticatePasskey, passkeyAvailable, type RequestOptionsJSON } from '@/lib/passkey';
 import { AlternativeEnrollment } from './AlternativeEnrollment';
+import { FirstAdminSetup } from './FirstAdminSetup';
 import { MfaEnrollment } from './MfaEnrollment';
 
 export function LoginMfa({ challenge, onComplete, onCancel }: { challenge: LoginChallenge; onComplete: () => void; onCancel: () => void }) {
@@ -16,6 +17,7 @@ export function LoginMfa({ challenge, onComplete, onCancel }: { challenge: Login
   const [factor, setFactor] = useState<'totp' | 'email' | 'passkey'>(() =>
     challenge.last_used && factors[challenge.last_used] ? challenge.last_used : factors.totp ? 'totp' : factors.email ? 'email' : 'passkey');
   const [enrollFactor, setEnrollFactor] = useState<'totp' | 'email' | 'passkey'>('totp');
+  const [bootstrapped, setBootstrapped] = useState(false);
   const [recovery, setRecovery] = useState(false);
   const [sent, setSent] = useState(false);
   const [resendAt, setResendAt] = useState(0);
@@ -56,6 +58,8 @@ export function LoginMfa({ challenge, onComplete, onCancel }: { challenge: Login
     finally { if (active.current) setBusy(false); }
   };
   if ('mfa_enrollment_required' in challenge) return <>
+    {challenge.setup_code_required && !bootstrapped &&<FirstAdminSetup enrollmentToken={challenge.enrollment_token} onConfirmed={() => setBootstrapped(true)} />}
+    {bootstrapped && <p role="status" className="text-sm">{t('mfa.bootstrap.done')}</p>}
     <label className="block space-y-2">{t('mfa.choose')}<select className="w-full rounded-lg border bg-background p-2" value={enrollFactor} onChange={e => setEnrollFactor(e.target.value as typeof enrollFactor)}>
       <option value="totp">{t('mfa.factor.totp')}</option>
       <option value="email" disabled={!challenge.email_available}>{t('mfa.factor.email')}</option>
@@ -63,9 +67,9 @@ export function LoginMfa({ challenge, onComplete, onCancel }: { challenge: Login
     </select></label>
     {!challenge.email_available && <DisabledFactorExplanation factor="email" reason={challenge.email_unavailable_reason} />}
     {!passkeyAvailable() && <DisabledFactorExplanation factor="passkey" />}
-    {enrollFactor !== 'totp' ? <AlternativeEnrollment factor={enrollFactor} enrollmentToken={challenge.enrollment_token} challengeRef={challenge.challenge_ref} emailAvailable={challenge.email_available} emailUnavailableReason={challenge.email_unavailable_reason} onComplete={finish} onCancel={onCancel} /> : <>
+    {enrollFactor !== 'totp' ? <AlternativeEnrollment factor={enrollFactor} enrollmentToken={challenge.enrollment_token} challengeRef={challenge.challenge_ref} emailAvailable={challenge.email_available} emailUnavailableReason={challenge.email_unavailable_reason} proofDone={bootstrapped} onComplete={finish} onCancel={onCancel} /> : <>
     {error && <p role="alert" className="text-destructive">{error}</p>}
-    <MfaEnrollment initial={{ enrollment_token: challenge.enrollment_token, challenge_ref: challenge.challenge_ref, proof_required: true }}
+    <MfaEnrollment key={bootstrapped ? 'bootstrapped' : 'pending'} initial={{ enrollment_token: challenge.enrollment_token, challenge_ref: challenge.challenge_ref, proof_required: !bootstrapped }}
       begin={async input => ({ ...await mfaApi.httpBegin(input), enrollment_token: challenge.enrollment_token })}
       confirm={async input => {
         const result = await mfaApi.httpConfirm(input);

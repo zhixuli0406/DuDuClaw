@@ -71,7 +71,7 @@ impl UserDbAdminNotifier {
             .iter()
             .filter(|u| u.role == UserRole::Admin && u.status == UserStatus::Active)
         {
-            match self.db.verified_channels_for_user(&admin.id) {
+            match self.db.verified_dm_destinations_for_user(&admin.id) {
                 Ok(links) => {
                     targets.extend(links.into_iter().map(|l| (l.channel, l.channel_user_id)))
                 }

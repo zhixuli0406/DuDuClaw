@@ -1503,6 +1503,21 @@ struct D1Reply {
     disconnect: bool,
 }
 impl D1Reply {
+    /// A body in the success shape of every D1 tool on both the direct
+    /// Google APIs and the Apps Script bridge: ids present, lists empty, the
+    /// append confirmed. A bare `{}` is no longer a success for a write (no
+    /// id = nothing proves it was created) or for a bridge reply.
+    fn ok() -> Self {
+        Self::json(serde_json::json!({
+            "id": "fixture-id",
+            "draft_id": "fixture-draft",
+            "message_id": "fixture-message",
+            "messages": [],
+            "events": [],
+            "values": [],
+            "appended": true,
+        }))
+    }
     fn json(value: serde_json::Value) -> Self {
         Self {
             status: 200,
@@ -1727,7 +1742,7 @@ fn d1_cases() -> Vec<(&'static str, serde_json::Value)> {
 async fn d1_both_real_claim_owners_execute_all_eighteen_native_tools() {
     for home in [false, true] {
         let f = d1_fixture(home);
-        let wire = d1_wire(|_, _| D1Reply::json(serde_json::json!({}))).await;
+        let wire = d1_wire(|_, _| D1Reply::ok()).await;
         let _fixture =
             crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
         for (tool, args) in d1_cases() {
@@ -2154,7 +2169,7 @@ async fn d1_response_aggregate_fanout_recipe_and_result_limits_fail_without_part
         );
         assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 6);
         drop(guard);
-        let wire = d1_wire(|_, _| D1Reply::json(serde_json::json!({}))).await;
+        let wire = d1_wire(|_, _| D1Reply::ok()).await;
         let guard =
             crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
         let args = serde_json::json!({"query":"x".repeat(1024*1024+1)});
@@ -2335,7 +2350,7 @@ async fn d1_same_scope_equal_digest_foreign_template_step_never_reaches_wire() {
     use crate::google_workspace::native_call::NativeCallTemplate;
     for home in [false, true] {
         let f = d1_fixture(home);
-        let wire = d1_wire(|_, _| D1Reply::json(serde_json::json!({}))).await;
+        let wire = d1_wire(|_, _| D1Reply::ok()).await;
         let _fixture =
             crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
         let args = serde_json::json!({"message_id":"abc"});
@@ -2446,7 +2461,7 @@ async fn d1_r2_preflight_failures_audit_once_without_resolving_or_sending() {
                 Some(f.db.clone()),
             ),
         ));
-        let wire = d1_wire(|_, _| D1Reply::json(serde_json::json!({}))).await;
+        let wire = d1_wire(|_, _| D1Reply::ok()).await;
         let _fixture =
             crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
         for (index, tool, args, reason) in [

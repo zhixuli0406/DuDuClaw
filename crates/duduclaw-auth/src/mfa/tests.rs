@@ -391,6 +391,26 @@ fn mfa_channel_proof_cannot_be_used_as_login_otp_or_on_another_challenge() {
 }
 
 #[test]
+fn mfa_enrollment_proof_is_never_sent_to_a_googlechat_binding() {
+    // RM-152: "googlechat" sorts before "line"; it is bindable but cannot
+    // deliver a code, so the LINE DM must stay the proof target.
+    let (_dir,db,id)=setup();
+    db.bind_channel_identity(&id,"googlechat","users/123456",true).unwrap();
+    db.bind_channel_identity(&id,"line","U-line",true).unwrap();
+    record_enforcement(&mut db.conn(),true,chrono::Utc::now().timestamp_micros()+1).unwrap();
+    let token=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    let otp=db.mfa_prepare_enrollment(&token,true,3000).unwrap().unwrap();
+    assert_eq!(otp.channel,"line");
+    assert_eq!(otp.channel_user_id,"U-line");
+    // A Google Chat-only account falls back to the administrator code path.
+    let (_dir2,db2,id2)=setup();
+    db2.bind_channel_identity(&id2,"googlechat","users/123456",true).unwrap();
+    record_enforcement(&mut db2.conn(),true,chrono::Utc::now().timestamp_micros()+1).unwrap();
+    let token2=db2.mfa_challenge(&id2,FirstFactor::Password,true,3000).unwrap();
+    assert!(db2.mfa_prepare_enrollment(&token2,true,3000).unwrap().is_none());
+}
+
+#[test]
 fn mfa_never_enrolled_password_change_preserves_epoch_zero_but_cancels_pending() {
     let (_dir,db,id)=setup();
     let token=db.mfa_password_challenge(&id,"password-test","session",3000).unwrap();

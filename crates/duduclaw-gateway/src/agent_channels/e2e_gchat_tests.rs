@@ -182,7 +182,7 @@ pub(crate) fn googlechat_section(home: &Path, project: &str, sa_json: &str) -> S
 pub(crate) fn message_event(space: &str, text: &str) -> Value {
     json!({"type": "MESSAGE", "space": {"name": space, "type": "SPACE"}, "message": {
         "text": text, "argumentText": text, "space": {"name": space, "type": "SPACE"},
-        "sender": {"name": "users/42", "displayName": "Human"}}})
+        "sender": {"name": "users/42", "type": "HUMAN", "displayName": "Human"}}})
 }
 
 pub(crate) async fn post(app: &Router, agent: &str, bearer: Option<&str>, event: &Value) -> StatusCode {
@@ -254,6 +254,56 @@ async fn googlechat_full_queue_acks_without_creating_a_turn() {
     let turns: i64 = db.query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0)).unwrap();
     assert_eq!(turns, 0, "a rejected event must not create a turn");
     assert_eq!(texts_with_bearer(&fake, &format!("Bearer tok-{email}")).len(), 1);
+}
+
+#[test]
+fn only_a_human_sender_type_is_admitted() {
+    let with = |sender: Value| json!({"sender": sender});
+    assert!(crate::googlechat::is_human_message(&with(json!({"name": "users/42", "type": "HUMAN"}))));
+    for sender in [
+        json!({"name": "users/42", "type": "BOT"}),
+        json!({"name": "users/42", "type": "human"}),
+        json!({"name": "users/42", "type": "TYPE_UNSPECIFIED"}),
+        json!({"name": "users/42"}),
+        json!({"name": "users/42", "type": 1}),
+    ] {
+        assert!(!crate::googlechat::is_human_message(&with(sender.clone())), "{sender}");
+    }
+    assert!(!crate::googlechat::is_human_message(&json!({})));
+}
+
+/// L5: a `BOT` sender (another Chat app — possibly carrying a person's id)
+/// on the HTTP MESSAGE path is acknowledged and dropped: no turn, no reply,
+/// no identity mapping. The next human message is answered normally.
+#[tokio::test]
+async fn bot_sender_on_the_http_path_never_starts_a_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = start_fake().await;
+    let email = format!("bot-{}@p0-test.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+    let sa = service_account(&fake, &email);
+    crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "sales", "", "specialist",
+        &googlechat_section(home.path(), "444444445", &sa));
+    let ctx = super::e2e_tests::reply_ctx(home.path()).await;
+    super::e2e_seam::arm(home.path());
+    let app = crate::googlechat_agents::router(ctx);
+    let mut bot = message_event("spaces/BOTS", "BOT_ECHO_TEXT");
+    bot["message"]["sender"]["type"] = json!("BOT");
+    bot["message"]["name"] = json!("spaces/BOTS/messages/bot");
+    assert_eq!(post(&app, "sales", Some(&chat_jwt("444444445")), &bot).await, StatusCode::OK);
+    // Same sender id, same conversation queue: had the bot message been
+    // admitted it would be answered first.
+    let mut human = message_event("spaces/BOTS", "human text");
+    human["message"]["name"] = json!("spaces/BOTS/messages/human");
+    assert_eq!(post(&app, "sales", Some(&chat_jwt("444444445")), &human).await, StatusCode::OK);
+    wait_text(&fake, &format!("Bearer tok-{email}"), "OWN_BOT_REPLY").await;
+    let replies = texts_with_bearer(&fake, &format!("Bearer tok-{email}"))
+        .iter().filter(|text| text.contains("OWN_BOT_REPLY")).count();
+    assert_eq!(replies, 1, "the BOT message must not have been answered");
+    let db = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap();
+    let echoed: i64 = db
+        .query_row("SELECT COUNT(*) FROM session_messages WHERE content LIKE '%BOT_ECHO_TEXT%'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(echoed, 0, "a BOT sender must not create a turn");
 }
 
 #[tokio::test]

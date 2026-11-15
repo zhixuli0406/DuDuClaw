@@ -107,7 +107,9 @@ impl MethodHandler {
             | "mfa.recovery_regenerate" | "mfa.disable" => {
                 self.handle_mfa_rpc(method, params, ctx).await
             }
-            "mfa.overview" | "users.mfa_reset" | "users.mfa_enrollment_code" => {
+            // RM-136: the role check runs under the reset attempt's audit guard.
+            "users.mfa_reset" => self.handle_mfa_rpc(method, params, ctx).await,
+            "mfa.overview" | "users.mfa_enrollment_code" => {
                 require_admin!();
                 self.handle_mfa_rpc(method, params, ctx).await
             }
@@ -361,7 +363,7 @@ impl MethodHandler {
             // and offers this switch instead.
             "google.integration.set" => {
                 require_admin!();
-                boxed_frame(|| self.handle_google_integration_set(params)).await
+                boxed_frame(|| self.handle_google_integration_set(params, ctx)).await
             }
             // ── Per-employee Google identity (B2a) ──────────────
             // Who each AI employee acts as. Writing an identity, the sealed

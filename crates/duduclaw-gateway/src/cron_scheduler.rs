@@ -1155,6 +1155,7 @@ async fn execute_cron_task(
             // poll the dashboard to see them. When the task row carries a
             // notify_* target, forward the response to that channel so
             // Discord/Telegram/LINE/Slack users receive it automatically.
+            let mut delivery_outcome = None;
             if task.has_notify_target() {
                 // Tokens minted for the trigger context go back to their
                 // real values for the operator's own channel.
@@ -1164,7 +1165,16 @@ async fn execute_cron_task(
                     Some(&redaction_session),
                     response.clone(),
                 );
-                if let Err(e) = deliver_cron_result(home_dir, task, &delivered).await {
+                let delivery = deliver_cron_result(home_dir, task, &delivered).await;
+                delivery_outcome = Some(match &delivery {
+                    Ok(()) => crate::cron_store::DeliveryOutcome::Delivered,
+                    // H2: a refused turn origin is recorded with its closed
+                    // reason; nothing was sent anywhere else.
+                    Err(CronDeliveryError::Refused(denial)) =>
+                        crate::cron_store::DeliveryOutcome::Refused(denial.code()),
+                    Err(CronDeliveryError::Failed(_)) => crate::cron_store::DeliveryOutcome::Failed,
+                });
+                if let Err(e) = delivery {
                     warn!(
                         id = %task.id,
                         name = %task.name,
@@ -1227,7 +1237,7 @@ async fn execute_cron_task(
                 }
             }
 
-            if let Err(e) = store.record_run(&task.id, true, None).await {
+            if let Err(e) = store.record_run_with_delivery(&task.id, true, None, delivery_outcome).await {
                 warn!(id = %task.id, "failed to record successful run: {e}");
             }
         }
@@ -1254,7 +1264,7 @@ async fn deliver_cron_result(
     home_dir: &Path,
     task: &CronTaskRow,
     response: &str,
-) -> Result<(), String> {
+) -> Result<(), CronDeliveryError> {
     let channel = task
         .notify_channel
         .as_deref()
@@ -1296,15 +1306,16 @@ async fn deliver_cron_result(
     let token = if crate::channel_sender::sender_self_configures(channel) {
         let marker = crate::channel_sender::self_config_marker_field(channel)
             .expect("self-configuring channel must declare a marker field");
-        let present =
+        let present = if channel == "googlechat" {
+            crate::agent_channels::gchat_spaces::has_sending_app(home_dir, task.notify_sender.as_deref(), chat_id).await
+        } else {
             crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
-                .await
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
+                .await.map(|v| !v.is_empty()).unwrap_or(false)
+        };
         if !present {
             return Err(format!(
                 "channel {channel} is not configured (missing `{marker}` in config.toml [channels])"
-            ));
+            ).into());
         }
         String::new() // factory-built {channel} sender ignores the token
     } else {
@@ -1313,7 +1324,7 @@ async fn deliver_cron_result(
             return Err(format!(
                 "no bot token configured for channel {channel} (tried agent {} and global config)",
                 task.agent_id
-            ));
+            ).into());
         }
         token
     };
@@ -1339,44 +1350,152 @@ async fn deliver_cron_result(
         recipients.push(duduclaw_core::recipient_policy::channel_recipient("discord", &effective_chat_id)
             .unwrap_or_default());
     }
-    crate::recipient_guard::admit_scheduled(home_dir, &task.agent_id, &recipients,
-        serde_json::json!({"task_id": task.id, "channel": channel, "chat_id": chat_id,
-            "thread_id": task.notify_thread_id, "text": body})).await?;
-
-    let target = crate::channel_sender::ChannelTarget {
-        channel_type: channel.to_string(),
-        chat_id: effective_chat_id,
-        token,
-        extra_id: None,
+    // H2: the stored turn origin is re-proved against live account, binding
+    // and conversation state before the policy may treat it as the source.
+    let stored = crate::recipient_guard::StoredOrigin {
+        recipient: task.notify_origin.as_deref(),
+        proof: task.notify_origin_proof.as_deref(),
     };
-    // `reqwest::Client` is cheap to construct for a per-task send; the
-    // cron pipeline fires at most once per minute per task so we don't
-    // need a shared pool.
-    let http = reqwest::Client::new();
-    let sender = crate::channel_sender::create_sender_for_home(home_dir, &target, http);
+    if let Err(refusal) = crate::recipient_guard::admit_scheduled_from_origin(home_dir, &task.agent_id, stored, &recipients,
+        serde_json::json!({"task_id": task.id, "channel": channel, "chat_id": chat_id,
+            "thread_id": task.notify_thread_id, "text": body})).await
+    {
+        if let crate::recipient_guard::ScheduledRefusal::Origin(denial) = &refusal {
+            crate::recipient_guard::origin::audit_refusal(home_dir, &task.agent_id, "cron", &task.id, *denial);
+        }
+        return Err(refusal.into());
+    }
+
+    let sender = if channel == "googlechat" {
+        crate::product_policy::require_channel(home_dir, channel)?;
+        crate::channel_sender::create_googlechat_sender_for(
+            home_dir.to_path_buf(), effective_chat_id, String::new(), task.notify_sender.clone(),
+        )
+    } else {
+        let target = crate::channel_sender::ChannelTarget {
+            channel_type: channel.to_string(),
+            chat_id: effective_chat_id,
+            token,
+            extra_id: None,
+        };
+        // `reqwest::Client` is cheap to construct for a per-task send; the
+        // cron pipeline fires at most once per minute per task so we don't
+        // need a shared pool.
+        let http = reqwest::Client::new();
+        crate::channel_sender::create_sender_for_home(home_dir, &target, http)
+    };
+    let body = prepare_cron_message(home_dir, task, response, sender.as_ref()).await;
     sender
         .send_text(&body)
         .await
-        .map_err(|e| format!("send_text failed: {e}"))
+        .map_err(|e| CronDeliveryError::Failed(format!("send_text failed: {e}")))
+}
+
+/// Why a cron result was not delivered: a closed fire-time refusal of the
+/// stored turn origin (recorded as `delivery_refused` + its code, never sent
+/// elsewhere) or any other failure (`delivery_failed`).
+#[derive(Debug)]
+enum CronDeliveryError {
+    Refused(crate::recipient_guard::origin::OriginDenial),
+    Failed(String),
+}
+
+impl std::fmt::Display for CronDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(denial) => write!(f, "{denial}"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for CronDeliveryError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for CronDeliveryError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
+impl From<crate::recipient_guard::ScheduledRefusal> for CronDeliveryError {
+    fn from(refusal: crate::recipient_guard::ScheduledRefusal) -> Self {
+        match refusal {
+            crate::recipient_guard::ScheduledRefusal::Origin(denial) => Self::Refused(denial),
+            crate::recipient_guard::ScheduledRefusal::Other(message) => Self::Failed(message),
+        }
+    }
+}
+
+async fn prepare_cron_message(
+    home_dir: &Path,
+    task: &CronTaskRow,
+    response: &str,
+    sender: &dyn crate::channel_sender::ChannelSender,
+) -> String {
+    // Process complete marker lines before clamping, including markers beyond
+    // the text limit. Path validation remains in the ordinary reply pipeline.
+    let delivered = crate::office_docs::process_deliverables(
+        response, &home_dir.join("agents").join(&task.agent_id), home_dir, sender,
+    ).await;
+    const MAX_CHARS: usize = 3500;
+    let message = if delivered.chars().count() > MAX_CHARS {
+        format!("{}\n[…truncated]", delivered.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        delivered
+    };
+    format!("⏰ [{}] {}", task.name, message)
+}
+
+/// [`deliver_cron_result`] for tests outside this module: an origin refusal
+/// is its closed code, any other failure its message.
+#[cfg(test)]
+pub(crate) async fn deliver_cron_result_for_test(
+    home_dir: &Path, task: &CronTaskRow, response: &str,
+) -> Result<(), String> {
+    deliver_cron_result(home_dir, task, response).await.map_err(|error| match error {
+        CronDeliveryError::Refused(denial) => denial.code().to_owned(),
+        CronDeliveryError::Failed(message) => message,
+    })
 }
 
 /// RM-124: append a cron result to the WebChat conversation that created
 /// the schedule. Admitted by `recipient_guard::admit_scheduled_session`
-/// (session still live, same employee, same dashboard account, account still
-/// allowed); a refusal drops the message with an audit row.
+/// (the row's gateway origin proof, then: session still live, same employee,
+/// same dashboard account, account still allowed); a refusal drops the
+/// message with an audit row. An origin refusal keeps its closed code.
 async fn deliver_cron_result_webchat(
     home_dir: &Path,
     task: &CronTaskRow,
     session: &str,
     response: &str,
-) -> Result<(), String> {
-    let body = crate::scheduled_webchat::format_body(&task.name, response);
-    let result = match crate::recipient_guard::admit_scheduled_session(home_dir, &task.agent_id, session).await {
-        Err(reason) => Err(reason),
-        Ok(()) => crate::scheduled_webchat::deliver(home_dir, &task.agent_id, session, &body).await,
+) -> Result<(), CronDeliveryError> {
+    // A v1.81 row has no `notify_origin`; its WebChat target is the origin.
+    let stored = crate::recipient_guard::StoredOrigin {
+        recipient: crate::scheduled_webchat::stored_origin(task.notify_origin.as_deref(), session),
+        proof: task.notify_origin_proof.as_deref(),
     };
-    if let Err(reason) = &result {
-        crate::scheduled_webchat::audit_drop(home_dir, &task.agent_id, "cron", &task.id, reason);
+    let result = match crate::recipient_guard::admit_scheduled_session(home_dir, &task.agent_id, stored, session).await {
+        Err(refusal) => Err(CronDeliveryError::from(refusal)),
+        Ok(()) => {
+            let response = crate::office_docs::process_history_deliverables(
+                response, &home_dir.join("agents").join(&task.agent_id), home_dir,
+            ).await;
+            let body = crate::scheduled_webchat::format_body(&task.name, &response);
+            crate::scheduled_webchat::deliver(home_dir, &task.agent_id, session, &body).await
+                .map_err(CronDeliveryError::Failed)
+        }
+    };
+    if let Err(error) = &result {
+        match error {
+            CronDeliveryError::Refused(denial) =>
+                crate::recipient_guard::origin::audit_refusal(home_dir, &task.agent_id, "cron", &task.id, *denial),
+            CronDeliveryError::Failed(reason) =>
+                crate::scheduled_webchat::audit_drop(home_dir, &task.agent_id, "cron", &task.id, reason),
+        }
         // RM-173 (e): a conversation that is gone (cleared by its user,
         // purged, recreated) can never receive this schedule again — pause
         // it instead of failing on every run. Other refusals (account
@@ -1639,11 +1758,13 @@ async fn run_cron_task_now_with(
     let updated = store.get(&row.id).await?.unwrap_or(row);
     let status = updated.last_status.as_deref().unwrap_or("未執行");
     Ok(format!(
-        "已觸發排程「{name}」（id: {id}）。狀態：{status}｜累計執行 {runs} 次（失敗 {fails} 次）",
+        "已觸發排程「{name}」（id: {id}）。狀態：{status}｜通知：{delivery}（{reason}）｜累計執行 {runs} 次（失敗 {fails} 次）",
         name = updated.name,
         id = updated.id,
         runs = updated.run_count,
         fails = updated.failure_count,
+        delivery = updated.last_delivery_status.as_deref().unwrap_or("未傳送"),
+        reason = updated.last_delivery_reason.as_deref().unwrap_or("-"),
     ))
 }
 
@@ -1658,6 +1779,22 @@ mod principal_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cron_delivery_strips_markers_before_text_clamp() {
+        let home = tempfile::tempdir().unwrap();
+        let task = CronTaskRow::new("test".into(), "報告".into(), "worker".into(),
+            "0 9 * * *".into(), "test".into());
+        let raw = "/private/operator/report.pdf";
+        for response in [format!("完成\n📎DELIVER:{raw}"),
+            format!("{}\n📎DELIVER:{raw}", "文".repeat(3600))] {
+            let body = prepare_cron_message(home.path(), &task, &response, &crate::channel_sender::NullSender).await;
+            assert!(!body.contains("DELIVER:"));
+            assert!(!body.contains("/private/operator"));
+            assert!(body.starts_with("⏰ [報告]"));
+        }
+    }
+
 
     #[test]
     fn cron_next_run_matches_scheduler_in_taipei_and_new_york() {
@@ -1763,6 +1900,25 @@ mod tests {
         assert_eq!(got.run_count, 1);
         assert_eq!(got.failure_count, 0);
         assert_eq!(got.last_status.as_deref(), Some("success"));
+    }
+
+    #[tokio::test]
+    async fn successful_execution_with_failed_delivery_records_both_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        active_agent(dir.path(), "agnes");
+        let store = Arc::new(CronStore::open(dir.path()).unwrap());
+        let mut row = CronTaskRow::new("delivery-failure".into(), "Daily".into(), "agnes".into(), "0 9 * * *".into(), "report".into());
+        row.notify_channel = Some("googlechat".into());
+        row.notify_chat_id = Some("spaces/NOT_CONFIGURED".into());
+        store.insert(&row).await.unwrap();
+        let invoker = RecordingInvoker { calls: Arc::new(StdMutex::new(Vec::new())), reply: "done".into(), fail: false };
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(dir.path().join("agents"))));
+        dispatch_cron_task(dir.path(), &store, &registry, &row, &invoker).await;
+        let got = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(got.last_status.as_deref(), Some("success"));
+        assert_eq!(got.last_delivery_status.as_deref(), Some("delivery_failed"));
+        assert_eq!(got.last_delivery_reason.as_deref(), Some("notification_delivery_failed"));
+        assert_eq!(store.list_all().await.unwrap()[0].last_delivery_status, got.last_delivery_status);
     }
 
     /// A failing invoke is recorded as a failed run through the same path.
@@ -1984,17 +2140,21 @@ mod tests {
 
     // ── RM-124: schedules created from WebChat report back into it. ──
 
-    fn webchat_task(agent: &str, session: &str) -> CronTaskRow {
-        let mut row = task_with_notify(Some("webchat"), Some(session), None);
+    /// A schedule created from the fixture's WebChat conversation: the target
+    /// is the stored origin and carries the gateway proof id minted for it.
+    fn webchat_task(agent: &str, f: &crate::scheduled_webchat::tests::Fixture) -> CronTaskRow {
+        let mut row = task_with_notify(Some("webchat"), Some(&f.target), None);
         row.agent_id = agent.to_string();
         row.name = "每日摘要".to_string();
+        row.notify_origin = Some(f.target.clone());
+        row.notify_origin_proof = Some(f.proof.clone());
         row
     }
 
     #[tokio::test]
     async fn cron_webchat_delivery_appends_to_the_origin_conversation() {
         let f = crate::scheduled_webchat::tests::fixture("agnes").await;
-        let task = webchat_task("agnes", &f.target);
+        let task = webchat_task("agnes", &f);
         deliver_cron_result(f.home.path(), &task, "今天沒有待辦").await.unwrap();
         assert_eq!(
             crate::scheduled_webchat::tests::messages(&f).await,
@@ -2016,20 +2176,38 @@ mod tests {
         let h = f.home.path();
         let db = duduclaw_auth::UserDb::new(&h.join("users.db")).unwrap();
         db.unbind_agent(&f.user, "agnes").unwrap();
-        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.target), "secret").await.is_err());
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f), "secret").await.is_err());
         db.bind_agent(&f.user, "agnes", duduclaw_auth::AccessLevel::Operator).unwrap();
         db.set_user_status(&f.user, duduclaw_auth::UserStatus::Suspended).unwrap();
-        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.target), "secret").await.is_err());
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f), "secret").await.is_err());
         db.set_user_status(&f.user, duduclaw_auth::UserStatus::Active).unwrap();
         // A row re-pointed at another employee's schedule is dropped too.
-        assert!(deliver_cron_result(h, &webchat_task("bob", &f.target), "secret").await.is_err());
+        assert!(deliver_cron_result(h, &webchat_task("bob", &f), "secret").await.is_err());
         // Permanently deleted conversation; delete_session only archives.
         let manager = crate::session::SessionManager::new(&h.join("sessions.db")).unwrap();
         manager.purge_session(&f.session).await.unwrap();
-        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.target), "secret").await.is_err());
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f), "secret").await.is_err());
         assert!(crate::scheduled_webchat::tests::messages(&f).await.is_empty());
+        // The gateway record is re-checked first, so each refusal is a closed origin code.
         let audit = std::fs::read_to_string(h.join("tool_calls.jsonl")).unwrap();
-        assert!(audit.contains("webchat_owner_check_failed"));
+        for code in ["origin_access_revoked", "origin_account_inactive", "origin_proof_invalid", "origin_conversation_changed"] {
+            assert!(audit.contains(code), "{code}");
+        }
+    }
+
+    /// A WebChat schedule without a gateway proof (legacy row) is refused
+    /// `origin_unproven` and nothing lands in the conversation.
+    #[tokio::test]
+    async fn cron_webchat_delivery_without_a_proof_is_refused() {
+        let f = crate::scheduled_webchat::tests::fixture("agnes").await;
+        let mut legacy = webchat_task("agnes", &f);
+        legacy.notify_origin = None;
+        legacy.notify_origin_proof = None;
+        match deliver_cron_result(f.home.path(), &legacy, "secret").await {
+            Err(CronDeliveryError::Refused(denial)) => assert_eq!(denial.code(), "origin_unproven"),
+            other => panic!("expected an origin refusal, got {other:?}"),
+        }
+        assert!(crate::scheduled_webchat::tests::messages(&f).await.is_empty());
     }
 
     #[tokio::test]
@@ -2042,7 +2220,7 @@ mod tests {
             "UPDATE sessions SET archived_at=?2, archive_reason='retention' WHERE id=?1",
             rusqlite::params![f.session, chrono::Utc::now().to_rfc3339()],
         ).unwrap();
-        deliver_cron_result(f.home.path(), &webchat_task("agnes", &f.target), "今天沒有待辦")
+        deliver_cron_result(f.home.path(), &webchat_task("agnes", &f), "今天沒有待辦")
             .await.unwrap();
         assert_eq!(
             crate::scheduled_webchat::tests::messages(&f).await,
@@ -2063,7 +2241,7 @@ mod tests {
         manager.delete_session(&f.session).await.unwrap();
         // The target id no longer has a row (moved to `#cleared:`): refused.
         assert!(
-            deliver_cron_result(f.home.path(), &webchat_task("agnes", &f.target), "今天沒有待辦")
+            deliver_cron_result(f.home.path(), &webchat_task("agnes", &f), "今天沒有待辦")
                 .await
                 .is_err()
         );
@@ -2078,7 +2256,7 @@ mod tests {
         let f = crate::scheduled_webchat::tests::fixture("agnes").await;
         let h = f.home.path();
         let store = CronStore::open(h).unwrap();
-        let task = webchat_task("agnes", &f.target);
+        let task = webchat_task("agnes", &f);
         store.insert(&task).await.unwrap();
         // Temporary refusal: dropped, schedule stays enabled.
         let db = duduclaw_auth::UserDb::new(&h.join("users.db")).unwrap();
@@ -2165,6 +2343,18 @@ mod tests {
             other => panic!("expected typed autonomy refusal, got {other:?}"),
         }
         assert_eq!(store.get(&row.id).await.unwrap().unwrap().run_count, 0);
+    }
+
+    /// H2: an origin refusal stays a typed refusal end to end, so the run
+    /// records `delivery_refused` with the closed code (not a send failure).
+    #[test]
+    fn origin_refusal_maps_to_a_closed_delivery_reason() {
+        use crate::recipient_guard::{ScheduledRefusal, origin::OriginDenial};
+        let refused = CronDeliveryError::from(ScheduledRefusal::Origin(OriginDenial::IdentityUnbound));
+        assert!(matches!(refused, CronDeliveryError::Refused(OriginDenial::IdentityUnbound)));
+        assert!(refused.to_string().starts_with("origin_identity_unbound"));
+        let failed = CronDeliveryError::from(ScheduledRefusal::Other("policy unreadable".into()));
+        assert!(matches!(failed, CronDeliveryError::Failed(_)));
     }
 
 }

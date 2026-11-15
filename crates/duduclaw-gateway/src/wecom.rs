@@ -632,15 +632,19 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command_for_sender(
-                &cmd,
-                &state.ctx,
-                "wecom",
-                &session_id,
-                &agent_id,
-                &from_user,
-            )
-            .await;
+            // Same access gate as the reply path; a WeCom app conversation
+            // here is one person's (`wecom:<user>`).
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "wecom",
+                gate_session: &session_id,
+                command_session: &session_id,
+                sender: &from_user,
+                text: &text,
+                shared: false,
+            };
+            let reply =
+                crate::chat_commands::handle_gated_command(&cmd, &state.ctx, &origin, &agent_id)
+                    .await;
             if !reply.trim().is_empty() {
                 send_text(state, &from_user, &reply, None).await;
             }

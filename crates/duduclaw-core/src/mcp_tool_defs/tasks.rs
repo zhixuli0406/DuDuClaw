@@ -81,12 +81,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "notify_channel",
-                description: "Result channel for schedule; required for one-shot runs. Optional with notify_chat_id in WebChat: omit both to return results to this conversation. Never 'webchat'.",
+                description: "Schedule result channel; pair with notify_chat_id. Omit both to use the verified source conversation for the same employee. One-shot runs need a destination. Never 'webchat'.",
                 required: false,
             },
             ParamDef {
                 name: "notify_chat_id",
-                description: "With schedule: chat/channel/room ID. Optional with notify_channel in WebChat: omit both to return results to this conversation.",
+                description: "Schedule result chat/channel/room ID; pair with notify_channel. Omit both to use the verified source conversation for the same employee. See docs/guides/mcp-tools.md.",
                 required: false,
             },
             ParamDef {

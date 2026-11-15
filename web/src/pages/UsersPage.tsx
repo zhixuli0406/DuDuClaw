@@ -21,7 +21,7 @@ import {
   UserActions,
   useAgentDisplayName,
 } from './users/UserRowParts';
-import { listChannelIdentities, type ChannelIdentity } from '@/lib/channel-identity-api';
+import { listChannelIdentities, unbindChannelIdentity, type ChannelIdentity } from '@/lib/channel-identity-api';
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
   Button,
@@ -126,6 +126,18 @@ export function UsersPage() {
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
   }, [intl, fetchUsers]);
+
+  // RM-152 — remove an administrator's Google Chat binding.
+  const handleIdentityRemove = useCallback(async (userId: string, ident: ChannelIdentity) => {
+    try {
+      await unbindChannelIdentity(userId, ident.channel, ident.channel_user_id);
+      toast.success(intl.formatMessage({ id: 'users.channelIdentity.removed' }));
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    } finally {
+      refreshIdentity(userId);
+    }
+  }, [intl, refreshIdentity]);
 
   const missingPrimaryCount = repairCandidates?.members.length ?? 0;
   const repairPrimary = async (confirm: boolean) => {
@@ -256,7 +268,11 @@ export function UsersPage() {
                     {intl.formatMessage({ id: 'users.col.channelIdentity' })}
                   </p>
                   <div className="flex flex-wrap gap-1">
-                    <IdentityChips state={identities[user.id]} onAdd={() => setShowIdentityBind(user.id)} />
+                    <IdentityChips
+                      state={identities[user.id]}
+                      onAdd={() => setShowIdentityBind(user.id)}
+                      {...(isAdmin ? { onRemove: (ident: ChannelIdentity) => void handleIdentityRemove(user.id, ident) } : {})}
+                    />
                   </div>
                 </div>
               </li>
@@ -295,7 +311,11 @@ export function UsersPage() {
                   <BindingChips user={user} agentName={agentName} onUnbind={(a) => handleUnbind(user.id, a)} />
                 </ListGridCell>
                 <ListGridCell className="flex-wrap gap-1 py-1.5">
-                  <IdentityChips state={identities[user.id]} onAdd={() => setShowIdentityBind(user.id)} />
+                  <IdentityChips
+                    state={identities[user.id]}
+                    onAdd={() => setShowIdentityBind(user.id)}
+                    {...(isAdmin ? { onRemove: (ident: ChannelIdentity) => void handleIdentityRemove(user.id, ident) } : {})}
+                  />
                 </ListGridCell>
                 <ListGridCell className="flex-col items-start gap-1">
                   <StatusBadge status={user.status} />

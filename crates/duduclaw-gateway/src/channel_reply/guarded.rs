@@ -205,13 +205,15 @@ async fn arm_thinking(
             Some(a) => a.to_string(),
             None => resolve_agent_for_restore(ctx, session_id).await,
         };
-        let show = crate::thinking::channel_policy::resolve_channel(
+        // The sender lookup reads users.db: on the blocking pool.
+        let show = crate::thinking::channel_policy::resolve_channel_async(
             &ctx.home_dir,
             &agent_id,
             presenter.channel(),
             user_id,
             presenter.is_group(),
-        );
+        )
+        .await;
         // When `@` / trigger routing hands the turn to another employee, the
         // presenter decides again for the one that actually answers.
         let resolver: crate::thinking::channel_presenter::ShowResolver = {
@@ -350,9 +352,12 @@ async fn build_guarded_reply_for_agent_inner(
     let final_text = if crate::odoo_livechat::is_public_visitor_session(session_id) {
         enforced
     } else {
-        append_pending_agent_notice(enforced, &ctx.home_dir, agent_name)
+        append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id, session_id, user_id)
     };
     let final_text = crate::knowledge::cite_turn::with_footer(final_text, session_id, &cited);
+    let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
+    let final_text = crate::prompt_identity::normalize_channel_reply(
+        &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
     let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
@@ -415,6 +420,16 @@ async fn build_guarded_reply_with_session_inner(
         Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
         return reply;
     };
+    // No employee answered: the fixed notice goes out as it is (no restore,
+    // contract or pending operator notice), live only — WebChat delivers it
+    // without a stored row (`GuardedReply::persist_webchat`).
+    if delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst) {
+        let text = append_product_footer(raw, session_id);
+        let reply = attach_turn_rollback(text, None, guards, delivery, ctx).await;
+        Box::pin(super::health::finish(&ctx.home_dir, health_outcome, false, &reply)).await;
+        build_rollback.disarm();
+        return reply;
+    }
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
     // WP11-A: last-line-of-defence filter for AI-runtime internal messages
@@ -435,7 +450,7 @@ async fn build_guarded_reply_with_session_inner(
     }
     let health_outcome = health_outcome.map(|(id, reason)|
         (id, reason.or(enforced.trim().is_empty().then_some("empty_reply"))));
-    let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
+    let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id, session_id, user_id);
     // Messaging apps: label replies from a called (non-default) employee.
     let labelled = match &answered_by {
         Some(who) if who.via_trigger && footer_applies_to_session(session_id) => {
@@ -445,6 +460,9 @@ async fn build_guarded_reply_with_session_inner(
     };
     let with_sources = crate::knowledge::cite_turn::with_footer(labelled, session_id, &cited);
     let final_text = append_product_footer(with_sources, session_id);
+    let language = crate::prompt_identity::resolve_reply_language_for_id(&ctx.home_dir, &agent_id).await;
+    let final_text = crate::prompt_identity::normalize_channel_reply(
+        &crate::dispatcher::sanitize_for_channel(&final_text), language.as_deref());
     let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)

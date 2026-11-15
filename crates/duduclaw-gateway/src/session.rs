@@ -409,6 +409,10 @@ impl SessionManager {
         // for a signed-in WebChat account, who owns it. NULL on rows written
         // before this migration (see `session_origin::backfill`).
         crate::session_origin::store::migrate(conn);
+        // v1.82: gateway-held turn-origin proofs of schedules, reminders and
+        // goals (`recipient_guard::origin`); jobs store only the opaque id.
+        crate::recipient_guard::origin::migrate(conn)
+            .map_err(|e| DuDuClawError::Gateway(format!("origin proof table: {e}")))?;
         Self::migrate_legacy_user_clears(conn)?;
         Self::sweep_webchat_cancellations(conn, WEBCHAT_CANCEL_RETENTION_DAYS)?;
 
@@ -1256,7 +1260,8 @@ impl SessionManager {
         // ("#2", "#3", …) so users can tell a compressed session apart.
         tx.execute(
             "UPDATE sessions SET summary = ?1, total_tokens = 0, last_active = ?2,
-                    lineage = COALESCE(lineage, 1) + 1
+                    lineage = COALESCE(lineage, 1) + 1,
+                    summary_of_prior = NULL, summarized_through_turn = 0, last_summarized_at = NULL
              WHERE id = ?3",
             params![summary, now, session_id],
         )
@@ -1918,6 +1923,42 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Refuse stale summaries after a concurrent append, clear or compression.
+    /// The visible-row identity snapshot and cursor are checked while holding
+    /// the same DB connection used for the update.
+    pub(crate) async fn set_summary_if_unchanged(
+        &self, session_id: &str, summary: &str, through_turn: u32,
+        previous_through: u32, expected_ids: &[i64],
+    ) -> Result<()> {
+        let conn = self.acquire().await;
+        crate::isolation_label_stores::check_session_writable(&conn, session_id)
+            .map_err(DuDuClawError::Gateway)?;
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let current = {
+            let mut stmt = tx.prepare("SELECT id FROM session_messages WHERE session_id=?1
+                AND hidden=0 AND undone_at IS NULL ORDER BY id ASC")
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            let rows = stmt.query_map([session_id], |row| row.get::<_, i64>(0))
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?
+        };
+        if current.as_slice() != expected_ids {
+            return Err(DuDuClawError::Gateway("session changed during summary".into()));
+        }
+        let changed = tx.execute("UPDATE sessions SET summary_of_prior=?1,
+            summarized_through_turn=?2, last_summarized_at=?3
+            WHERE id=?4 AND summarized_through_turn=?5",
+            params![duduclaw_security::credential_detect::mask(summary), through_turn as i64,
+                chrono::Utc::now().to_rfc3339(), session_id, previous_through as i64])
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if changed != 1 {
+            return Err(DuDuClawError::Gateway("summary cursor changed".into()));
+        }
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
     /// Scan all sessions and emit summarization candidates (#13).
     ///
     /// One row per session — the background task then runs
@@ -1989,17 +2030,24 @@ impl SessionManager {
         session_id: &str,
         n: u32,
     ) -> Result<Vec<(String, String)>> {
+        self.read_summary_turn_range(session_id, 0, n).await
+    }
+
+    /// Same visible-row ordinal space as get_summary/list_summary_candidates.
+    pub async fn read_summary_turn_range(
+        &self, session_id: &str, after: u32, through: u32,
+    ) -> Result<Vec<(String, String)>> {
         let conn = self.acquire().await;
         let mut stmt = conn
             .prepare(
                 "SELECT role, content FROM session_messages
                  WHERE session_id = ?1 AND hidden = 0 AND undone_at IS NULL
                  ORDER BY id ASC
-                 LIMIT ?2",
+                 LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| DuDuClawError::Gateway(format!("read_first_n prepare: {e}")))?;
         let rows = stmt
-            .query_map(params![session_id, n as i64], |row| {
+            .query_map(params![session_id, through.saturating_sub(after) as i64, after as i64], |row| {
                 let role: String = row.get(0)?;
                 let content: String = row.get(1)?;
                 Ok((role, content))
@@ -2155,14 +2203,24 @@ impl SessionManager {
 
     /// Publish under the users.db generation lease AND the live config/registry
     /// policy locks. No await separates the final policy check and UPDATE.
+    ///
+    /// Lock order: users.db write reservation, then sessions.db's write lock.
+    /// Both waits share one `ACL_DELIVERY_WAIT` budget, counted from after the
+    /// pooled connection was acquired, so a cycle with a path holding them in
+    /// the opposite order (scheduled WebChat delivery commits its sessions.db
+    /// transaction inside the users.db lease) ends in a fail-closed
+    /// `Contended` refusal, never a hang. `Contended` means the row stayed
+    /// unpublished only because a store was busy; `Changed` is a real change.
     pub(crate) async fn publish_webchat_message(
         &self, session_id: &str, message_id: i64, users: &duduclaw_auth::UserDb,
         generation: u64, policy: &crate::webchat::access::TargetPolicy, allowed: impl FnOnce() -> bool,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, duduclaw_auth::AclDeliveryError> {
+        use duduclaw_auth::AclDeliveryError;
         let conn = self.acquire().await;
-        conn.busy_timeout(std::time::Duration::ZERO)
-            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let deadline = std::time::Instant::now() + duduclaw_auth::ACL_DELIVERY_WAIT;
         let result = users.with_acl_generation(generation, || {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            conn.busy_timeout(remaining).map_err(AclDeliveryError::from_sqlite)?;
             policy.with_current(|| {
                 if !allowed() { return Ok(false); }
                 conn.execute(
@@ -2170,9 +2228,13 @@ impl SessionManager {
                      WHERE id = ?1 AND session_id = ?2 AND role = 'assistant'
                        AND delivery_pending = 1 AND undone_at IS NOT NULL",
                     params![message_id, session_id],
-                ).map(|rows| rows == 1).map_err(|e| DuDuClawError::Gateway(e.to_string()))
-            }).map_err(DuDuClawError::Gateway).and_then(|result| result)
-        }).map_err(DuDuClawError::Gateway).and_then(|result| result);
+                ).map(|rows| rows == 1).map_err(AclDeliveryError::from_sqlite)
+            }).map_err(|_| AclDeliveryError::Changed).and_then(|result| result)
+        }).and_then(|result| result);
+        if matches!(result, Err(AclDeliveryError::Contended)) {
+            tracing::warn!(session_id, message_id,
+                "WebChat publication wait budget exhausted; reply left unpublished");
+        }
         if let Err(error) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
             tracing::warn!(%error, "Session connection timeout restore failed");
         }
@@ -2374,9 +2436,33 @@ impl SessionManager {
 }
 
 #[cfg(test)]
+#[path = "session_publish_tests.rs"]
+mod publish_contention_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn stale_summary_cannot_overwrite_state_or_history_and_compression_resets_cursor() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("rolling", "worker").await.unwrap();
+        mgr.append_message("rolling", "user", "first", 1).await.unwrap();
+        mgr.set_summary("rolling", "- existing fact", 1).await.unwrap();
+        let snapshot = mgr.get_message_ids("rolling").await.unwrap();
+        mgr.append_message("rolling", "user", "arrived during summary", 1).await.unwrap();
+        let current = mgr.get_message_ids("rolling").await.unwrap();
+        assert!(mgr.set_summary_if_unchanged("rolling", "- stale", 1, 1, &snapshot).await.is_err());
+        assert_eq!(mgr.get_summary("rolling").await.unwrap(), ("- existing fact".into(), 1));
+        assert_eq!(mgr.get_message_ids("rolling").await.unwrap(), current);
+        mgr.compress_if_unchanged("rolling", "- combined facts", &current).await.unwrap();
+        assert_eq!(mgr.get_summary("rolling").await.unwrap(), (String::new(), 0));
+        assert_eq!(mgr.compression_summary("rolling").await.unwrap(), "- combined facts");
+        let rows = mgr.read_summary_turn_range("rolling", 0, 1).await.unwrap();
+        assert_eq!(rows, vec![("system".into(), "- combined facts".into())]);
+    }
 
     #[tokio::test]
     async fn webchat_client_message_id_survives_reopen_without_acceptance_frame() {

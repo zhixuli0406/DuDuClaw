@@ -320,6 +320,7 @@ impl MethodHandler {
             on_behalf_of: crate::trigger_route::assign::principal_for_user(&ctx.user_id),
             created_via: Some("dashboard".to_string()),
             source: None,
+            source_origin_proof: None,
             task_id: None,
             grant_via: crate::trigger_route::assign::dashboard_grant_via(ctx, &runner.agent_id),
             a2a_owner: None,

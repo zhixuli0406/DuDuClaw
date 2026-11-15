@@ -837,17 +837,23 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command_for_sender(
-                &cmd,
-                &state.ctx,
-                "teams",
-                &session_id,
-                &agent_id,
-                &sender_id,
-            )
-            .await;
+            // Same access gate as the reply path; a group chat or channel
+            // conversation is cleared only by a verified Admin/Manager.
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "teams",
+                gate_session: &session_id,
+                command_session: &session_id,
+                sender: crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+                text: &text,
+                shared: is_group_conversation,
+            };
+            let reply =
+                crate::chat_commands::handle_gated_command(&cmd, &state.ctx, &origin, &agent_id)
+                    .await;
             drop(typing_guard);
-            deliver_reply(&state.creds, &target, &reply, None).await;
+            if !reply.trim().is_empty() {
+                deliver_reply(&state.creds, &target, &reply, None).await;
+            }
             return;
         }
     }
@@ -859,7 +865,6 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
             crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), None).await;
         for (name, url) in &file_attachments {
             match crate::media::download_url(
-                &state.ctx.http,
                 url,
                 None,
                 crate::media::MAX_FILE_SIZE as usize,
@@ -876,7 +881,10 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
                         Err(e) => warn!("Teams: failed to save attachment {name}: {e}"),
                     }
                 }
-                Err(e) => warn!("Teams: failed to download attachment {name}: {e}"),
+                Err(e) => {
+                    warn!("Teams: attachment download failed: {e}");
+                    attachment_lines.push(crate::media::attachment_download_failed(name));
+                }
             }
         }
     }

@@ -87,13 +87,15 @@ pub(super) fn jsonl(input:impl Read,builder:&mut Builder<'_>)->Result<()> {
         let value:Value=serde_json::from_slice(&bytes).map_err(|_|Error::Content)?;
         let object=value.as_object().ok_or(Error::Content)?;
         // Only fields emitted by CronTaskRow and the reviewed JSONL aliases
-        // may be ignored. Future trigger semantics require a fresh setup.
+        // may be ignored. Delivery provenance/status is discarded, never
+        // restored as a grant. Future trigger semantics require a fresh setup.
         let known_fields=object.keys().all(|key|matches!(key.as_str(),
             "id"|"name"|"agent_id"|"cron"|"schedule"|"task"|"description"|"action"|
             "enabled"|"created_at"|"updated_at"|"last_run_at"|"last_status"|"last_error"|
             "run_count"|"failure_count"|"notify_channel"|"notify_chat_id"|"notify_thread_id"|
             "cron_timezone"|"trigger_kind"|"condition_script"|"condition_state"|"watch_command"|
             "on_behalf_of"|"created_by_user_id"|"scoped_by_user_id"|
+            "notify_sender"|"notify_origin"|"last_delivery_status"|"last_delivery_reason"|
             "workflow_id"|"activation_id"|"workflow_binding"));
         if let Some(id)=string(&value,"id")? {
             if id.is_empty() || id.len()>128 || !seen.insert(id.to_string()) {return Err(Error::Content);}

@@ -453,3 +453,28 @@ pub(super) fn build_system_prompt(
     })
 }
 
+
+/// Per-turn tail; capability differences must not enter the cached system prompt.
+pub(super) fn with_file_delivery_reminder(message: String, channel: &str) -> String {
+    if crate::channel_capabilities::capabilities(channel).is_some_and(|c| !c.file_upload) {
+        let images = if crate::channel_capabilities::supports(channel, crate::channel_capabilities::Capability::PhotoUpload) {
+            ""
+        } else {
+            "圖片也無法交付。"
+        };
+        format!("{message}\n\n[本通道無法直接傳送檔案附件。{images}請將內容直接放在回覆中，或明確告知檔案無法在此傳送；不得向使用者提供檔案位置或承諾附件已送達。]")
+    } else {
+        message
+    }
+}
+
+#[cfg(test)]
+mod file_delivery_tests {
+    #[test]
+    fn reminder_follows_capability_table() {
+        for caps in crate::channel_capabilities::all_channels() {
+            let out = super::with_file_delivery_reminder("question".into(), caps.channel);
+            assert_eq!(out.contains("無法直接傳送檔案"), !caps.file_upload);
+        }
+    }
+}

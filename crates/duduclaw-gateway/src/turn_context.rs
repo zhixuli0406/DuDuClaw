@@ -20,36 +20,25 @@ const MAX_REPLY_CHANNEL_LEN: usize = 512;
 
 type Key = (String, String);
 
-/// `(agent, turn) → [(registration id, reply channel)]`, newest last. Leaf
-/// lock, never held across an `.await`.
-fn registry() -> &'static Mutex<
-    HashMap<
-        Key,
-        Vec<(
-            u64,
-            String,
-            Option<crate::approval::DecisionContext>,
-            Option<crate::approval::TrustedReplyTarget>,
-            Option<crate::computer_use_sessions::attended::AttendedInputProof>,
-            Option<String>,
-        )>,
-    >,
-> {
-    static TURNS: OnceLock<
-        Mutex<
-            HashMap<
-                Key,
-                Vec<(
-                    u64,
-                    String,
-                    Option<crate::approval::DecisionContext>,
-                    Option<crate::approval::TrustedReplyTarget>,
-                    Option<crate::computer_use_sessions::attended::AttendedInputProof>,
-                    Option<String>,
-                )>,
-            >,
-        >,
-    > = OnceLock::new();
+/// One registration: `(registration id, reply channel, decision context,
+/// trusted reply target, attended-input proof, host session id, reply
+/// sender, WebChat origin session)`. Every value is captured from gateway
+/// task-locals at [`register`]; none comes from an MCP process.
+type Entry = (
+    u64,
+    String,
+    Option<crate::approval::DecisionContext>,
+    Option<crate::approval::TrustedReplyTarget>,
+    Option<crate::computer_use_sessions::attended::AttendedInputProof>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// `(agent, turn) → [registration]`, newest last. Leaf lock, never held
+/// across an `.await`.
+fn registry() -> &'static Mutex<HashMap<Key, Vec<Entry>>> {
+    static TURNS: OnceLock<Mutex<HashMap<Key, Vec<Entry>>>> = OnceLock::new();
     TURNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -115,6 +104,13 @@ pub fn register(agent_id: &str, turn_id: &str, reply_channel: &str) -> Option<Tu
                 .flatten(),
             crate::computer_use_sessions::attended::capture(agent_id, turn_id),
             duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone).ok().flatten(),
+            crate::claude_runner::REPLY_SENDER.try_with(Clone::clone).ok()
+                .filter(|sender| duduclaw_core::is_valid_agent_id(sender)),
+            // H1: the signed-in WebChat conversation this turn answers, as
+            // scoped by the reply pipeline (`scheduled_webchat::turn_origin`).
+            // Replaces the `DUDUCLAW_ORIGIN_SESSION` value an MCP process
+            // could forge: schedule tools obtain it only from here.
+            crate::scheduled_webchat::current_origin(),
         ));
     Some(TurnGuard { key, id,
         _watch_socket: crate::computer_watch_links::delivery::register_socket(agent_id, turn_id),
@@ -152,6 +148,25 @@ pub fn reply_channel_for(agent_id: &str, turn_id: &str) -> Option<String> {
         .get(&(agent_id.to_string(), turn_id.to_string()))
         .and_then(|list| list.last())
         .map(|(_, channel, ..)| channel.clone())
+}
+
+/// App identity captured at gateway registration, never from an MCP process env.
+pub fn reply_sender_for(agent: &str, turn: &str) -> Option<String> {
+    if !valid_turn_id(turn) { return None; }
+    registry().lock().unwrap_or_else(|p| p.into_inner())
+        .get(&(agent.into(), turn.into())).and_then(|entries| entries.last())
+        .and_then(|(_, _, _, _, _, _, sender, _)| sender.clone())
+}
+
+/// The signed-in WebChat session `agent`'s live turn `turn` answers, as
+/// captured at gateway registration. `None` for every other turn, for an
+/// unknown turn and for another employee's turn (exact match on both parts).
+pub fn webchat_origin_for(agent: &str, turn: &str) -> Option<String> {
+    if !valid_turn_id(turn) { return None; }
+    registry().lock().unwrap_or_else(|p| p.into_inner())
+        .get(&(agent.into(), turn.into())).and_then(|entries| entries.last())
+        .and_then(|(_, _, _, _, _, _, _, origin)| origin.clone())
+        .filter(|origin| !origin.is_empty())
 }
 
 /// Register the turn the current task is answering, for a CLI spawn of
@@ -280,7 +295,7 @@ pub fn decision_context_for(
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.into(), turn_id.into()))
         .and_then(|v| v.last())
-        .and_then(|(_, _, c, _, _, _)| c.clone())
+        .and_then(|(_, _, c, _, _, _, _, _)| c.clone())
 }
 
 /// Never reconstruct a transport from a chat id or an employee-supplied token.
@@ -296,7 +311,7 @@ pub(crate) fn target_for(
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.into(), turn_id.into()))
         .and_then(|v| v.last())
-        .and_then(|(_, _, _, t, _, _)| t.clone())
+        .and_then(|(_, _, _, t, _, _, _, _)| t.clone())
 }
 
 /// A verified inbound human message is still live for this exact employee and
@@ -305,7 +320,7 @@ pub(crate) fn attended_live_for(agent_id:&str,turn_id:&str)->bool {
     if !valid_turn_id(turn_id) {return false;}
     registry().lock().unwrap_or_else(|p|p.into_inner())
         .get(&(agent_id.into(),turn_id.into())).and_then(|list|list.last())
-        .and_then(|(_,_,_,_,proof,_)|proof.as_ref())
+        .and_then(|(_,_,_,_,proof,_,_,_)|proof.as_ref())
         .is_some_and(|proof|proof.valid_for(agent_id,turn_id))
 }
 
@@ -385,5 +400,38 @@ pub(crate) fn session_for(agent_id: &str, turn_id: &str) -> Option<String> {
     registry().lock().unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.into(), turn_id.into()))
         .and_then(|list| list.last())
-        .and_then(|(_, _, _, _, _, session)| session.clone())
+        .and_then(|(_, _, _, _, _, session, _, _)| session.clone())
+}
+
+#[cfg(test)]
+mod schedule_sender_tests {
+    use super::*;
+    #[tokio::test]
+    async fn sender_is_captured_from_gateway_scope_and_expires_with_turn() {
+        let guard = crate::claude_runner::REPLY_SENDER.scope("sales".into(), async {
+            register("sender-bot", "sender-turn", "googlechat:spaces/ORIGIN").unwrap()
+        }).await;
+        assert_eq!(reply_sender_for("sender-bot", "sender-turn").as_deref(), Some("sales"));
+        assert!(reply_sender_for("other-bot", "sender-turn").is_none());
+        drop(guard);
+        assert!(reply_sender_for("sender-bot", "sender-turn").is_none());
+    }
+
+    /// H1: the WebChat origin is captured from the gateway task-local at
+    /// registration, exact on employee and turn, and ends with the turn.
+    #[tokio::test]
+    async fn webchat_origin_is_captured_from_gateway_scope_only() {
+        let session = "webchat:webchat:0123456789ab:c1#agent:origin-bot".to_string();
+        let guard = crate::scheduled_webchat::ORIGIN_SESSION.scope(session.clone(), async {
+            register("origin-bot", "origin-turn", "webchat:origin").unwrap()
+        }).await;
+        assert_eq!(webchat_origin_for("origin-bot", "origin-turn").as_deref(), Some(session.as_str()));
+        assert!(webchat_origin_for("other-bot", "origin-turn").is_none());
+        assert!(webchat_origin_for("origin-bot", "other-turn").is_none());
+        drop(guard);
+        assert!(webchat_origin_for("origin-bot", "origin-turn").is_none());
+        // Outside the scope (e.g. a non-WebChat turn) nothing is captured.
+        let _plain = register("origin-bot", "plain-turn", "line:abc").unwrap();
+        assert!(webchat_origin_for("origin-bot", "plain-turn").is_none());
+    }
 }

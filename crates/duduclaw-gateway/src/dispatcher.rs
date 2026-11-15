@@ -3669,7 +3669,7 @@ pub(crate) fn prepare_channel_text(text: &str) -> String {
 
 /// Sanitize agent response text before forwarding to a public channel.
 /// Strips internal paths, DUDUCLAW_SYSTEM markers, and other implementation details.
-fn sanitize_for_channel(text: &str) -> String {
+pub(crate) fn sanitize_for_channel(text: &str) -> String {
     text.lines()
         .filter(|line| !line.contains("[DUDUCLAW_SYSTEM:"))
         .map(|line| {
@@ -3842,6 +3842,15 @@ async fn forward_to_channel_as(
     let safe_text = prepare_channel_text(text);
     // Escape agent name for Telegram MarkdownV1 to prevent formatting injection
     let safe_agent = escape_markdown_v1(responder_agent);
+
+    // Chat must see the whole table schema before any chunking. Its sender
+    // converts once, then splits the converted text for the API limit.
+    if channel_type == "googlechat" {
+        let report = format!("📨 **{}** 的回報：\n\n{}", safe_agent, safe_text);
+        return crate::googlechat::send_text_to_space_as(home_dir, sender, channel_id, &report)
+            .await
+            .map_err(|e| e.to_string());
+    }
 
     // Split the body into paragraph/line-aligned chunks instead of truncating.
     // For everything except Telegram/Slack MarkdownV1 escaping, the splitter
@@ -4187,19 +4196,6 @@ async fn forward_to_channel_as(
                         total
                     ));
                 }
-                if i + 1 < total {
-                    tokio::time::sleep(chunk_gap).await;
-                }
-            }
-        }
-        "googlechat" => {
-            // The app the conversation came in through (B11 M2): the
-            // employee's own app when `sender` names it, else the app the
-            // space is known to contain (shared by default).
-            for (i, body) in chunks.iter().enumerate() {
-                crate::googlechat::send_text_to_space_as(home_dir, sender, channel_id, body)
-                    .await
-                    .map_err(|e| format!("googlechat send chunk {}/{}: {e}", i + 1, total))?;
                 if i + 1 < total {
                     tokio::time::sleep(chunk_gap).await;
                 }

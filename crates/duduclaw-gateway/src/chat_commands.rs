@@ -10,6 +10,13 @@ use crate::channel_reply::ReplyContext;
 use duduclaw_security::safety_word::{SafetyWordAction, SafetyWordScope};
 use tracing::warn;
 
+#[path = "chat_commands/conversation_guard.rs"]
+mod conversation_guard;
+pub use conversation_guard::{
+    CommandOrigin, GROUP_RESET_REFUSED, clears_conversation, command_preflight,
+    handle_gated_command, shared_clear_refused, shared_reset_refusal,
+};
+
 /// Parsed chat command from user input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatCommand {
@@ -629,7 +636,7 @@ pub async fn handle_command(
         ChatCommand::Help => handle_help(),
         ChatCommand::Compact => handle_compact(ctx, session_id).await,
         ChatCommand::Model(name) => handle_model(ctx, agent_id, name.as_deref()).await,
-        ChatCommand::Pair(code) => handle_pair(ctx, session_id, code).await,
+        ChatCommand::Pair(code) => handle_pair(ctx, session_id, channel_user_id, code).await,
         ChatCommand::Voice => {
             let (channel, chat_id) = source_from_session(session_id);
             let mut voice_set = ctx.voice_sessions.lock().await;
@@ -806,16 +813,29 @@ async fn handle_compact(ctx: &ReplyContext, session_id: &str) -> String {
     }
 }
 
-async fn handle_pair(ctx: &ReplyContext, session_id: &str, code: &str) -> String {
-    // Channels that intercept commands here don't carry a user id, so the
-    // pairing subject is the session id. The central access gate in
-    // channel_reply checks BOTH user id and session id, so either form of
-    // approval unlocks the conversation. Codes come from the operator via
-    // the `pairing_generate` MCP tool.
-    if ctx
-        .access_control
-        .verify_pairing_code(session_id, code)
-        .await
+async fn handle_pair(
+    ctx: &ReplyContext,
+    session_id: &str,
+    channel_user_id: &str,
+    code: &str,
+) -> String {
+    // Same two subjects, in the same order, as the central access gate's
+    // `/pair`: the sender's own account id first (a code generated for one
+    // member only ever matches that member's exact id), then the
+    // conversation. The conversation is normalised by the controller, so an
+    // employee's own bucket (`…#agent:<id>`) pairs as the conversation the
+    // access gate checks. Codes come from the operator via the
+    // `pairing_manage` MCP tool (`action: "generate"`).
+    let by_sender = !channel_user_id.is_empty()
+        && ctx
+            .access_control
+            .verify_pairing_code(channel_user_id, code)
+            .await;
+    if by_sender
+        || ctx
+            .access_control
+            .verify_pairing_code(session_id, code)
+            .await
     {
         "✅ 配對成功，現在可以開始對話了。".to_string()
     } else {
@@ -3290,7 +3310,16 @@ mod goal_contract_tests {
                 src.contains(&format!("\"{channel}\",")),
                 "{channel} must pass its own channel key to handle_command_for_sender"
             );
-            assert!(src.contains("handle_command_for_sender("), "{channel}");
+            assert!(
+                src.contains("handle_command_for_sender(") || src.contains("handle_gated_command("),
+                "{channel}"
+            );
+            // Commands run behind the same access gate as the reply path.
+            assert!(
+                src.contains("chat_commands::handle_gated_command(")
+                    || src.contains("chat_commands::command_preflight("),
+                "{channel} must gate chat commands"
+            );
         }
     }
 }

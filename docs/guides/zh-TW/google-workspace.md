@@ -30,6 +30,8 @@
 | `docs_append` | write | 把文字附加到一份 Doc 的**結尾**。僅能附加，沒有任何工具會改寫或刪除既有內容。 |
 | `slides_read` | read | 逐頁讀取簡報的文字內容（圖形、群組圖形、表格儲存格）。 |
 
+寫入類工具的結果只寫 Google 實際回報的內容。`calendar_create_event` 只寫加入了幾位參與者（沒有時寫「Attendees: none」），不宣稱已通知任何人；沒有回傳活動代號時回報錯誤。`gmail_create_draft` 沒有回傳草稿代號時回報錯誤。`sheets_append` 只在 Google 回報時才顯示列數與儲存格數。透過 Apps Script 連線時，新增的列一律加在試算表的**第一個工作表**，結果會說明這點以及指定的範圍沒有被使用。Apps Script 的回覆必須符合該動作成功時的格式才算成功；空的回覆、`ok: false` 或任何錯誤欄位都會回報為工具錯誤並附上原因。
+
 > **刻意沒有 Slides 寫入工具**：DuDuClaw 自己的辦公文件套件已經能產出真正的
 > `.pptx` 檔案，這比透過 Slides 的 `batchUpdate` 元件 API 去操作要安全、
 > 輸出品質也更好。
@@ -129,6 +131,8 @@ allowed_subject_domains = ["customer.com"]
 | `anyone` | 能和這位員工對話的人（用 RPC 設定時要加 `confirm_anyone: true`） |
 
 網站的公開訪客（WebChat 小工具、Odoo 線上客服）在任何設定下都會被拒。沒有綁定帳號的通道發話者，除非設成 `anyone`，否則也會被拒。
+
+**Google Chat 的發話者（v1.82）**：管理員在 **使用者 → 驗證身分** 綁定了他的 Chat 使用者代號，或——僅在管理員開啟預設關閉的選用設定 `[google] chat_identity_from_account`（管理 → 整合 → Google）時——同仁在 **我的連線** 連結了自己的 Google 帳號（以 Google 帳號代號比對；這項自動認出**尚未以真實 Google Workspace 驗證**，除非您已在自己的 Workspace 確認兩種代號一致，否則請保持關閉）時，這裡就把他當成該同仁本人。不做 Email 比對。v1.82 以前所有 Chat 發話者都算沒有綁定，只有 `anyone` 會放行。詳見 [儀表板設定 → 使用者 → 驗證身分](dashboard-settings.md#使用者--驗證身分通訊軟體身分v182)。
 
 ### 用不了的時候
 

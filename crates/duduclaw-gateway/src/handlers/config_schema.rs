@@ -36,6 +36,9 @@ const STRICT_REPLY_PARSING_VALUES: &[&str] = &["off", "shadow", "enforce"];
 /// `[action_review] mode` values (2026-10).
 const ACTION_REVIEW_MODE_VALUES: &[&str] = &["off", "shadow", "enforce"];
 
+/// `[action_claims] mode` values (`channel_reply::claim_notice`).
+const ACTION_CLAIMS_MODE_VALUES: &[&str] = &["notice", "shadow"];
+
 /// `[goal_loop] criteria_ledger` values (WP-G2).
 const CRITERIA_LEDGER_VALUES: &[&str] = &["off", "report", "enforce"];
 
@@ -173,6 +176,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("dispatch", "two_stage_judge", Bool),
     ("dispatch", "strict_reply_parsing", OneOf(STRICT_REPLY_PARSING_VALUES)),
     ("action_review", "mode", OneOf(ACTION_REVIEW_MODE_VALUES)),
+    ("action_claims", "mode", OneOf(ACTION_CLAIMS_MODE_VALUES)),
     ("dispatch", "grounding_precheck_enabled", Bool),
     ("dispatch", "grounding_min_overlap_chars", UInt),
     ("dispatch", "admission", Str),
@@ -398,6 +402,17 @@ mod tests {
         let e = check("[goal_loop]\ncriteria_ledger = \"shadow\"\n").unwrap_err();
         assert!(e.contains("criteria_ledger") && e.contains("\"report\""), "{e}");
         assert!(check("[goal_loop]\ncriteria_ledger = false\n").is_err());
+    }
+
+    #[test]
+    fn action_claims_mode_is_an_optional_string_enum() {
+        for v in ["notice", "shadow"] {
+            check(&format!("[action_claims]\nmode = \"{v}\"\n")).unwrap();
+        }
+        check("[action_claims]\n").unwrap();
+        let e = check("[action_claims]\nmode = \"enforce\"\n").unwrap_err();
+        assert!(e.contains("[action_claims] mode") && e.contains("\"notice\""), "{e}");
+        assert!(check("[action_claims]\nmode = false\n").is_err());
     }
 
     #[test]

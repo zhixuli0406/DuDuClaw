@@ -161,8 +161,7 @@ pub fn resolve_decider_name(
         return None;
     }
     let db = duduclaw_auth::UserDb::new(&path).ok()?;
-    let uid = db
-        .find_verified_user_id_by_channel(channel, channel_user_id)
+    let uid = crate::googlechat_identity::verified_user_id(home_dir, &db, channel, channel_user_id)
         .ok()
         .flatten()?;
     let user = db.get_user(&uid).ok().flatten()?;

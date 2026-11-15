@@ -6,11 +6,35 @@ use duduclaw_core::recipient_policy::{Decision, Mode, channel_recipient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod origin;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecipientContext {
     pub source: Option<String>,
+    /// Registered transport destination; this does not itself grant a source exemption.
+    #[serde(default)]
+    pub reply_channel: Option<String>,
+    #[serde(default)]
+    pub reply_sender: Option<String>,
     pub owners: Vec<String>,
+    /// Opaque id of the gateway-held proof of the bound human behind
+    /// `source` ([`origin::mint`]); the tuple itself stays in the gateway.
+    /// A schedule may default to `source` only with this id; the gateway
+    /// re-verifies its own record before every send. Minted only when the
+    /// caller asks for a schedule context.
+    #[serde(default)]
+    pub origin_proof_id: Option<String>,
+    /// The signed-in WebChat conversation this turn answers, already bound
+    /// to the employee (session id + creation stamp, see
+    /// [`crate::scheduled_webchat::bind_origin`]). Captured by the gateway at
+    /// turn registration; never taken from the MCP process environment.
+    #[serde(default)]
+    pub webchat_origin: Option<String>,
+    /// Opaque id of the gateway-held proof of `webchat_origin`
+    /// ([`origin::mint_webchat`]), stored with a job that reports back there.
+    #[serde(default)]
+    pub webchat_origin_proof_id: Option<String>,
 }
 
 /// Only active users bound as owners contribute verified channel identities.
@@ -27,7 +51,7 @@ pub fn owners(home: &Path, agent: &str) -> Result<Vec<String>, String> {
             && (!restricted || user.role == duduclaw_auth::UserRole::Admin)) {
             continue;
         }
-        for identity in db.verified_channels_for_user(&binding.user_id)? {
+        for identity in db.verified_dm_destinations_for_user(&binding.user_id)? {
             if let Some(recipient) = channel_recipient(&identity.channel, &identity.channel_user_id) {
                 recipients.push(recipient);
             }
@@ -38,10 +62,30 @@ pub fn owners(home: &Path, agent: &str) -> Result<Vec<String>, String> {
     Ok(recipients)
 }
 
-pub fn context(home: &Path, agent: &str, turn: &str) -> Result<RecipientContext, String> {
+/// The live turn context of `agent`'s turn `turn`. `mint_origin` (only the
+/// schedule-creating tools ask for it) makes the gateway persist origin
+/// proof records for this turn's source / WebChat conversation and return
+/// their opaque ids; an ordinary recipient query never writes anything.
+pub fn context(home: &Path, agent: &str, turn: &str, mint_origin: bool) -> Result<RecipientContext, String> {
+    let source = crate::turn_context::source_conversation_for(agent, turn);
+    let webchat_origin = crate::turn_context::webchat_origin_for(agent, turn)
+        .and_then(|session| crate::scheduled_webchat::bind_origin(home, Some(&session), agent));
+    let (origin_proof_id, webchat_origin_proof_id) = if mint_origin {
+        (
+            source.as_deref().and_then(|recipient| origin::mint(home, agent, turn, recipient)),
+            webchat_origin.as_deref().and_then(|target| origin::mint_webchat(home, agent, turn, target)),
+        )
+    } else {
+        (None, None)
+    };
     Ok(RecipientContext {
-        source: crate::turn_context::source_conversation_for(agent, turn),
+        source,
+        reply_channel: crate::turn_context::reply_channel_for(agent, turn),
+        reply_sender: crate::turn_context::reply_sender_for(agent, turn),
         owners: owners(home, agent)?,
+        origin_proof_id,
+        webchat_origin,
+        webchat_origin_proof_id,
     })
 }
 
@@ -100,7 +144,7 @@ pub(crate) async fn scheduled_agent(
         .ok_or_else(|| "排程的預設員工不存在，無法確認收件人政策。".into())
 }
 
-fn scheduled_decision(home: &Path, agent: &str, targets: &[String]) -> Result<Decision, String> {
+fn scheduled_decision(home: &Path, agent: &str, targets: &[String], source: Option<&str>) -> Result<Decision, String> {
     let dir = crate::ephemeral::resolve_agent_dir(home, agent)
         .unwrap_or_else(|| home.join("agents").join(agent));
     let policy = duduclaw_core::recipient_policy::load(home, Some(&dir));
@@ -111,15 +155,92 @@ fn scheduled_decision(home: &Path, agent: &str, targets: &[String]) -> Result<De
         Err(error) => return Err(error),
     };
     if !policy.valid { return Err("無法讀取收件人防護設定，已暫停排程通知。".into()); }
-    Ok(policy.evaluate(targets, None, &owners))
+    Ok(policy.evaluate(targets, source, &owners))
 }
 
-/// Re-read policy at fire time. Scheduled jobs never inherit a source chat.
+/// Re-read policy at fire time. Legacy scheduled jobs have no source chat.
 /// A fresh approval covers this exact occurrence, destination and message only.
 pub(crate) async fn admit_scheduled(
     home: &Path, agent: &str, targets: &[String], args: Value,
 ) -> Result<(), String> {
-    let decision = scheduled_decision(home, agent, targets)?;
+    admit_scheduled_from_origin(home, agent, StoredOrigin::NONE, targets, args).await
+        .map_err(String::from)
+}
+
+/// The turn origin stored with a scheduled job: the destination (normalized
+/// channel recipient, or the stamped WebChat target) and the opaque id of
+/// the gateway-held [`origin::OriginProof`]. Only the id is trusted, and only
+/// through [`origin::verify`], which reads the gateway's own record.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoredOrigin<'a> {
+    pub recipient: Option<&'a str>,
+    pub proof: Option<&'a str>,
+}
+
+impl StoredOrigin<'static> {
+    /// A job with no stored turn origin.
+    pub(crate) const NONE: Self = StoredOrigin { recipient: None, proof: None };
+}
+
+/// A refused scheduled delivery: a closed turn-origin denial (recorded as
+/// such, never retried elsewhere) or any other admission failure.
+#[derive(Debug)]
+pub(crate) enum ScheduledRefusal {
+    Origin(origin::OriginDenial),
+    Other(String),
+}
+
+impl std::fmt::Display for ScheduledRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Origin(denial) => write!(f, "{denial}"),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<ScheduledRefusal> for String {
+    fn from(refusal: ScheduledRefusal) -> Self {
+        refusal.to_string()
+    }
+}
+
+/// The source exemption this delivery may use. Only a destination equal to
+/// the stored origin can use it, and only after [`origin::verify`] re-proved
+/// the creator against the gateway's record and live state. When a target
+/// IS the stored origin, a missing (legacy row) or failing proof refuses the
+/// delivery outright — whatever `recipient_guard` says, including `off`: no
+/// approval card, no downgrade into ordinary policy, no other conversation.
+/// A job whose targets do not include its stored origin is unaffected here
+/// and follows ordinary policy.
+fn origin_source(
+    home: &Path, agent: &str, stored: StoredOrigin<'_>, targets: &[String],
+) -> Result<Option<String>, origin::OriginDenial> {
+    let Some(recipient) = stored.recipient.filter(|recipient| !recipient.is_empty()) else {
+        return Ok(None);
+    };
+    if !targets.iter().any(|target| target == recipient) {
+        return Ok(None);
+    }
+    origin::verify(home, agent, recipient, stored.proof).map(|_| Some(recipient.to_owned()))
+}
+
+/// Fire-time admission of a scheduled notification. The source exemption is
+/// derived only from the stored, re-verified turn origin ([`origin_source`]);
+/// explicit other targets remain subject to ordinary recipient policy.
+pub(crate) async fn admit_scheduled_from_origin(
+    home: &Path, agent: &str, stored: StoredOrigin<'_>, targets: &[String], args: Value,
+) -> Result<(), ScheduledRefusal> {
+    let source = origin_source(home, agent, stored, targets).map_err(ScheduledRefusal::Origin)?;
+    admit_with_source(home, agent, source.as_deref(), targets, args).await
+        .map_err(ScheduledRefusal::Other)
+}
+
+/// Policy + approval for one occurrence, with an already re-verified source.
+async fn admit_with_source(
+    home: &Path, agent: &str, source: Option<&str>, targets: &[String], args: Value,
+) -> Result<(), String> {
+    let decision = scheduled_decision(home, agent, targets, source)?;
     if decision == Decision::Allow { return Ok(()); }
     if decision == Decision::WouldAsk {
         duduclaw_security::audit::append_tool_call_with_extras(home, agent, "scheduled_notification",
@@ -136,7 +257,7 @@ pub(crate) async fn admit_scheduled(
         return Err(format!("排程通知未獲管理員核准（審批編號 {id}）。"));
     }
     // A malformed or unreadable policy cannot be overridden by an approval.
-    scheduled_decision(home, agent, targets)?;
+    scheduled_decision(home, agent, targets, source)?;
     verify_and_consume(&broker, &id, &grant).await
         .map_err(|_| "排程通知核准已失效或使用，已停止傳送。".into())
 }
@@ -148,19 +269,32 @@ pub(crate) async fn admit_scheduled(
 /// of "the source conversation", which the recipient policy always allows —
 /// so it is NOT evaluated as an external recipient and never raises an
 /// approval card. What replaces the policy is the fire-time ownership
-/// re-check: the session must still exist, still belong to `agent` and to
-/// the same dashboard account, and that account must still be Active and
-/// allowed to talk to `agent`. Any miss refuses (fail closed); the caller
-/// drops the message with an audit row.
+/// re-check: a WebChat target is only ever a turn origin, so it must be the
+/// job's stored origin and pass [`origin::verify`] against the gateway's
+/// record (a row without a proof id is refused `origin_unproven`; v1.81
+/// WebChat rows are backfilled at startup, `origin::startup_backfill`);
+/// then the session must still exist, still belong to `agent` and to the
+/// same dashboard account, and that account must still be Active and allowed
+/// to talk to `agent`. Any miss refuses (fail closed); the caller drops the
+/// message with an audit row.
 pub(crate) async fn admit_scheduled_session(
-    home: &Path, agent: &str, session: &str,
-) -> Result<(), String> {
+    home: &Path, agent: &str, stored: StoredOrigin<'_>, session: &str,
+) -> Result<(), ScheduledRefusal> {
+    match stored.recipient.filter(|origin| !origin.is_empty()) {
+        Some(origin) if origin == session => {}
+        None => return Err(ScheduledRefusal::Origin(origin::OriginDenial::NoProof)),
+        Some(_) => return Err(ScheduledRefusal::Origin(origin::OriginDenial::ProofInvalid)),
+    }
     let (home, agent, session) = (home.to_path_buf(), agent.to_owned(), session.to_owned());
+    let proof = stored.proof.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
-        crate::scheduled_webchat::verify_delivery(&home, &agent, &session).map(|_| ())
+        origin::verify(&home, &agent, &session, proof.as_deref()).map_err(ScheduledRefusal::Origin)?;
+        crate::scheduled_webchat::verify_delivery(&home, &agent, &session)
+            .map(|_| ())
+            .map_err(ScheduledRefusal::Other)
     })
     .await
-    .unwrap_or_else(|_| Err("WebChat 對話擁有者檢查失敗".into()))
+    .unwrap_or_else(|_| Err(ScheduledRefusal::Other("WebChat 對話擁有者檢查失敗".into())))
 }
 
 fn scheduled_request(agent: &str, targets: &[String], args: Value) -> (Value, crate::approval::action_grant::ActionGrant) {
@@ -238,11 +372,11 @@ mod tests {
         std::fs::write(home.path().join("config.toml"), "[security]\nrecipient_guard='ask'\n").unwrap();
         std::fs::write(dir.join("agent.toml"), "[capabilities]\nrecipients=['telegram:123']\n").unwrap();
         let targets = vec!["telegram:123".into()];
-        assert_eq!(scheduled_decision(home.path(), "bot", &targets).unwrap(), Decision::Allow);
+        assert_eq!(scheduled_decision(home.path(), "bot", &targets, None).unwrap(), Decision::Allow);
         std::fs::write(dir.join("agent.toml"), "[capabilities]\nrecipients=[]\n").unwrap();
-        assert_eq!(scheduled_decision(home.path(), "bot", &targets).unwrap(), Decision::Ask);
+        assert_eq!(scheduled_decision(home.path(), "bot", &targets, None).unwrap(), Decision::Ask);
         std::fs::write(home.path().join("config.toml"), "[security]\nrecipient_guard='shadow'\n").unwrap();
-        assert_eq!(scheduled_decision(home.path(), "bot", &targets).unwrap(), Decision::WouldAsk);
+        assert_eq!(scheduled_decision(home.path(), "bot", &targets, None).unwrap(), Decision::WouldAsk);
     }
 
     #[tokio::test]
@@ -330,34 +464,48 @@ recipient_guard = "ask"
         let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
         let agent = scheduled_agent(&registry, "default").await.unwrap();
         assert_eq!(agent, "real-main");
-        assert_eq!(scheduled_decision(home.path(), &agent, &["line:outside".into()]).unwrap(), Decision::Ask);
+        assert_eq!(scheduled_decision(home.path(), &agent, &["line:outside".into()], None).unwrap(), Decision::Ask);
         let empty = std::sync::Arc::new(tokio::sync::RwLock::new(
             duduclaw_agent::registry::AgentRegistry::new(home.path().join("empty"))));
         assert!(scheduled_agent(&empty, "default").await.is_err());
     }
 
-    /// RM-124: a WebChat session target is admitted by ownership, not by the
-    /// external-recipient policy — even `recipient_guard='ask'` with an empty
-    /// allow-list files no approval card — and is refused once the session
-    /// owner loses access, the session moves to another employee, or it is
-    /// deleted.
+    /// RM-124: a WebChat session target is admitted by its gateway origin
+    /// proof and ownership, not by the external-recipient policy — even
+    /// `recipient_guard='ask'` with an empty allow-list files no approval
+    /// card — and is refused without a proof, once the session owner loses
+    /// access, the session moves to another employee, or it is deleted.
     #[tokio::test]
-    async fn webchat_session_target_is_admitted_by_ownership_not_policy() {
+    async fn webchat_session_target_is_admitted_by_its_proof_and_ownership_not_policy() {
+        use origin::OriginDenial;
         let f = crate::scheduled_webchat::tests::fixture("sales").await;
         let h = f.home.path();
         std::fs::create_dir_all(h.join("agents/sales")).unwrap();
         std::fs::write(h.join("config.toml"), "[security]\nrecipient_guard='ask'\n").unwrap();
         std::fs::write(h.join("agents/sales/agent.toml"), "[capabilities]\nrecipients=[]\n").unwrap();
-        admit_scheduled_session(h, "sales", &f.target).await.unwrap();
+        let stored = StoredOrigin { recipient: Some(&f.target), proof: Some(&f.proof) };
+        admit_scheduled_session(h, "sales", stored, &f.target).await.unwrap();
         assert!(!h.join("approvals.db").exists(), "no approval card for the user's own conversation");
-        assert!(admit_scheduled_session(h, "hr", &f.target).await.is_err());
-        assert!(admit_scheduled_session(h, "sales", "webchat:webchat:000000000000:x").await.is_err());
+        let origin_denial = |result: Result<(), ScheduledRefusal>| match result {
+            Err(ScheduledRefusal::Origin(denial)) => Some(denial),
+            _ => None,
+        };
+        // A legacy WebChat row (no stored origin / proof) is refused, never downgraded.
+        assert_eq!(origin_denial(admit_scheduled_session(h, "sales", StoredOrigin::NONE, &f.target).await),
+            Some(OriginDenial::NoProof));
+        let unproven = StoredOrigin { recipient: Some(&f.target), proof: None };
+        assert_eq!(origin_denial(admit_scheduled_session(h, "sales", unproven, &f.target).await),
+            Some(OriginDenial::NoProof));
+        let elsewhere = StoredOrigin { recipient: Some("webchat:webchat:000000000000:x"), proof: Some(&f.proof) };
+        assert_eq!(origin_denial(admit_scheduled_session(h, "sales", elsewhere, &f.target).await),
+            Some(OriginDenial::ProofInvalid));
+        assert!(admit_scheduled_session(h, "hr", stored, &f.target).await.is_err());
         let db = UserDb::new(&h.join("users.db")).unwrap();
         db.unbind_agent(&f.user, "sales").unwrap();
-        assert!(admit_scheduled_session(h, "sales", &f.target).await.is_err());
+        assert!(admit_scheduled_session(h, "sales", stored, &f.target).await.is_err());
         db.bind_agent(&f.user, "sales", AccessLevel::Operator).unwrap();
         db.set_user_status(&f.user, UserStatus::Suspended).unwrap();
-        assert!(admit_scheduled_session(h, "sales", &f.target).await.is_err());
+        assert!(admit_scheduled_session(h, "sales", stored, &f.target).await.is_err());
         // The external-recipient path still never accepts a webchat address.
         assert_eq!(duduclaw_core::recipient_policy::channel_recipient("webchat", &f.session), None);
     }
@@ -384,13 +532,81 @@ mod restricted_owner_tests {
         }
         let before = owners(h, "sales").unwrap();
         assert_eq!(before, ["line:admin", "line:old-owner"]);
-        assert_eq!(scheduled_decision(h, "sales", &["line:old-owner".into()]).unwrap(), Decision::Allow);
+        assert_eq!(scheduled_decision(h, "sales", &["line:old-owner".into()], None).unwrap(), Decision::Allow);
         duduclaw_core::preset::install_system_operator_preset(h, false).unwrap();
         duduclaw_core::preset::bind(h, "sales", &h.join("agents/sales"), "system-operator", "test", "test").unwrap();
         assert_eq!(owners(h, "sales").unwrap(), ["line:admin"]);
-        assert_eq!(scheduled_decision(h, "sales", &["line:old-owner".into()]).unwrap(), Decision::Ask);
-        assert_eq!(scheduled_decision(h, "sales", &["line:admin".into()]).unwrap(), Decision::Allow);
+        assert_eq!(scheduled_decision(h, "sales", &["line:old-owner".into()], None).unwrap(), Decision::Ask);
+        assert_eq!(scheduled_decision(h, "sales", &["line:admin".into()], None).unwrap(), Decision::Allow);
         duduclaw_core::preset::unbind(h, "sales", "test", "test").unwrap();
         assert_eq!(owners(h, "sales").unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod schedule_origin_tests {
+    use super::*;
+    use super::origin::tests::{RECIPIENT, fixture};
+
+    #[tokio::test]
+    async fn stored_origin_is_allowed_in_ask_mode_only_with_a_live_proof() {
+        let f = fixture("sales").await;
+        let h = f.home.path();
+        std::fs::write(h.join("config.toml"), "[security]\nrecipient_guard='ask'\n").unwrap();
+        let store = crate::cron_store::CronStore::open(h).unwrap();
+        let mut row = crate::cron_store::CronTaskRow::new("id".into(), "Daily".into(), "sales".into(), "0 9 * * *".into(), "report".into());
+        row.notify_origin = Some(RECIPIENT.into());
+        row.notify_origin_proof = Some(f.proof.clone());
+        store.insert(&row).await.unwrap();
+        let row = store.get("id").await.unwrap().unwrap();
+        let stored = StoredOrigin { recipient: row.notify_origin.as_deref(), proof: row.notify_origin_proof.as_deref() };
+        let origin = [RECIPIENT.to_string()];
+        let other = ["googlechat:spaces/OTHER".to_string()];
+        assert_eq!(origin_source(h, "sales", stored, &origin).unwrap().as_deref(), Some(RECIPIENT));
+        assert_eq!(origin_source(h, "sales", stored, &other).unwrap(), None, "another target never borrows it");
+        assert_eq!(scheduled_decision(h, "sales", &other, Some(RECIPIENT)).unwrap(), Decision::Ask);
+        admit_scheduled_from_origin(h, "sales", stored, &origin, json!({})).await.unwrap();
+    }
+
+    // (f) A legacy row (origin but no proof) aimed at that origin is refused
+    // `origin_unproven` in every mode — `off` included — with no approval
+    // card; a target that is not the stored origin still follows ordinary
+    // policy (allowed by `off`, asked by `ask`).
+    #[tokio::test]
+    async fn legacy_origin_without_proof_is_denied_even_when_the_guard_is_off() {
+        let f = fixture("sales").await;
+        let h = f.home.path();
+        let legacy = StoredOrigin { recipient: Some(RECIPIENT), proof: None };
+        let at_origin = [RECIPIENT.to_string()];
+        let other = ["googlechat:spaces/OTHER".to_string()];
+        for mode in ["off", "shadow", "ask"] {
+            std::fs::write(h.join("config.toml"), format!("[security]\nrecipient_guard='{mode}'\n")).unwrap();
+            assert_eq!(origin_source(h, "sales", legacy, &at_origin).unwrap_err(), origin::OriginDenial::NoProof, "{mode}");
+            let refusal = admit_scheduled_from_origin(h, "sales", legacy, &at_origin, json!({})).await.unwrap_err();
+            assert!(matches!(refusal, ScheduledRefusal::Origin(origin::OriginDenial::NoProof)), "{mode}: {refusal}");
+            assert!(refusal.to_string().starts_with("origin_unproven"));
+            assert_eq!(origin_source(h, "sales", legacy, &other).unwrap(), None, "{mode}: not the origin");
+        }
+        assert!(!h.join("approvals.db").exists());
+        std::fs::write(h.join("config.toml"), "[security]\nrecipient_guard='off'\n").unwrap();
+        admit_scheduled_from_origin(h, "sales", legacy, &other, json!({})).await.unwrap();
+        std::fs::write(h.join("config.toml"), "[security]\nrecipient_guard='ask'\n").unwrap();
+        assert_eq!(scheduled_decision(h, "sales", &other, None).unwrap(), Decision::Ask);
+    }
+
+    // (b) A failing proof refuses outright with its closed reason — even when
+    // policy is off — and files no approval card.
+    #[tokio::test]
+    async fn revoked_creator_refuses_the_origin_delivery_without_fallback() {
+        let f = fixture("sales").await;
+        let h = f.home.path();
+        std::fs::write(h.join("config.toml"), "[security]\nrecipient_guard='off'\n").unwrap();
+        duduclaw_auth::UserDb::new(&h.join("users.db")).unwrap()
+            .set_user_status(&f.user, UserStatus::Suspended).unwrap();
+        let stored = StoredOrigin { recipient: Some(RECIPIENT), proof: Some(&f.proof) };
+        let refusal = admit_scheduled_from_origin(h, "sales", stored, &[RECIPIENT.to_string()], json!({}))
+            .await.unwrap_err();
+        assert!(matches!(refusal, ScheduledRefusal::Origin(origin::OriginDenial::AccountInactive)), "{refusal}");
+        assert!(!h.join("approvals.db").exists());
     }
 }

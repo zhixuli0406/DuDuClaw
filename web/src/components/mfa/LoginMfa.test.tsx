@@ -56,6 +56,7 @@ describe('MFA login', () => {
     const establishSession = vi.fn().mockResolvedValue(undefined); useAuthStore.setState({ establishSession });
     const local = vi.spyOn(Storage.prototype, 'setItem');
     renderWithProviders(<LoginMfa challenge={enrollment} onComplete={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.queryByText('First administrator setup')).toBeNull();
     fireEvent.change(screen.getByLabelText('Current password'), { target: { value: 'pw' } });
     fireEvent.change(screen.getByLabelText('Channel or Admin enrollment code'), { target: { value: 'proof' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue setup' }));
@@ -68,6 +69,49 @@ describe('MFA login', () => {
     fireEvent.click(screen.getByLabelText('I saved my recovery codes'));
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await waitFor(() => expect(establishSession).toHaveBeenCalledWith(tokens, useAuthStore.getState().authAttempt, expect.any(Function)));
+  });
+});
+
+describe('first administrator setup', () => {
+  const first = { mfa_enrollment_required: true as const, enrollment_token: 'enroll', challenge_ref: 'ref', setup_code_required: true };
+
+  it('tells how to get the setup code on the host and offers no code-free shortcut', () => {
+    renderWithProviders(<LoginMfa challenge={first} onComplete={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.getByText('First administrator setup')).toBeInTheDocument();
+    expect(screen.getByText('duduclaw ops users mfa-setup-code')).toBeInTheDocument();
+    expect(screen.getByText(/docker exec -it/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /computer that runs DuDuClaw/ })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Use setup code' })).toBeDisabled();
+  });
+
+  it('confirms with the host setup code, then enrolls without an enrollment code', async () => {
+    const bootstrap = vi.spyOn(mfaApi, 'bootstrap').mockResolvedValue({ bootstrap: true });
+    const begin = vi.spyOn(mfaApi, 'httpBegin').mockResolvedValue({ enrollment_token: 'enroll', secret: 'SECRET', otpauth_uri: 'otpauth://totp/test?secret=SECRET' });
+    renderWithProviders(<LoginMfa challenge={first} onComplete={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.getByLabelText('Channel or Admin enrollment code')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('One-time setup code'), { target: { value: 'abcdef0123456789abcdef0123456789' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Use setup code' }));
+    await screen.findByText(/Confirmed. Continue setting up/);
+    expect(bootstrap).toHaveBeenCalledWith('enroll', 'abcdef0123456789abcdef0123456789');
+    expect(screen.queryByText('First administrator setup')).toBeNull();
+    expect(screen.queryByLabelText('Channel or Admin enrollment code')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Current password'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Continue setup' }));
+    await screen.findByText('SECRET');
+    expect(begin).toHaveBeenCalledWith({ password: 'pw', enrollment_token: 'enroll', proof_code: '' });
+  });
+
+  it('sends the typed setup code and explains a refusal without echoing it', async () => {
+    const bootstrap = vi.spyOn(mfaApi, 'bootstrap').mockRejectedValue(new ApiError(401, 'raw detail'));
+    renderWithProviders(<LoginMfa challenge={first} onComplete={vi.fn()} onCancel={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText('One-time setup code'), { target: { value: ' 0123abcd ' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Use setup code' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('wrong, expired or already used');
+    expect(alert).not.toHaveTextContent('0123abcd');
+    expect(alert).not.toHaveTextContent('raw detail');
+    expect(bootstrap).toHaveBeenCalledWith('enroll', '0123abcd');
+    expect(screen.getByLabelText('One-time setup code')).toHaveValue('');
   });
 });
 

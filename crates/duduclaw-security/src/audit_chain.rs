@@ -80,6 +80,8 @@ use ring::digest;
 #[cfg(unix)]
 use tracing::warn;
 
+pub(crate) const SECURITY_AUDIT_FILE_MODE: u32 = 0o600;
+
 /// Sentinel `_prev_hash` for the first record in a chain — a brand-new file,
 /// or the first record after a rotation boundary (see module docs). 64
 /// hex-zero chars, matching the width of a real SHA-256 hex digest so a
@@ -131,8 +133,7 @@ pub fn last_line_hash(path: &Path) -> io::Result<String> {
 /// `unix_create_mode`: when `Some(mode)`, the file is created with that mode
 /// (Unix only, mirrors the `tool_calls.jsonl` 0600 discipline) and tightened
 /// to it on every append if an existing file's permissions drifted wider.
-/// `None` leaves file creation at the process umask — unchanged from the
-/// historical `security_audit.jsonl` behavior.
+/// `None` leaves file creation at the process umask without tightening.
 ///
 /// See the module doc for the concurrency contract (lock spans read+write).
 pub fn append_chained_line(
@@ -195,6 +196,36 @@ pub(crate) fn append_chained_line_locked(
     }
 }
 
+/// [`append_chained_line`] (no create-mode tightening) with a **hard upper
+/// bound** on the writer-lock wait, for callers that must not wait
+/// unboundedly on a busy log. Same lock protocol: on Unix the data-file
+/// `flock`, taken with `duduclaw_core::fs_lock::lock_handle_within`; elsewhere
+/// the sidecar lock via `with_file_lock_timeout`. A lock not acquired within
+/// `lock_wait` is an [`io::ErrorKind::TimedOut`] error and nothing is written.
+/// Every failure is returned.
+pub fn append_chained_line_within(
+    path: &Path,
+    record: serde_json::Map<String, serde_json::Value>,
+    lock_wait: std::time::Duration,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let guard = duduclaw_core::fs_lock::lock_handle_within(file, lock_wait)?;
+        chain_and_write(path, guard.file(), record)
+    }
+    #[cfg(not(unix))]
+    {
+        duduclaw_core::with_file_lock_timeout(path, lock_wait, || {
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            chain_and_write(path, &file, record)
+        })
+    }
+}
+
 /// A fail-closed writer for access-control audit events. The sidecar lock
 /// serializes Windows writers; on Unix the data-file flock also serializes
 /// with the existing best-effort writer. Neither lock failure is ignored.
@@ -203,13 +234,93 @@ pub fn append_chained_line_strict(
     path: &Path,
     record: serde_json::Map<String, serde_json::Value>,
 ) -> io::Result<()> {
+    strict_append(path, record, None).map(|_| ())
+}
+
+/// Predicate over one parsed line of a chained log.
+pub type LineMatch<'a> = &'a dyn Fn(&serde_json::Value) -> bool;
+
+/// [`append_chained_line_strict`] at most once: when a line that starts at
+/// or after byte `since` already satisfies `present`, nothing is written and
+/// `Ok(false)` is returned; otherwise the record is appended and synced
+/// (`Ok(true)`). The check and the append are one critical section under
+/// the same locks every writer of the file takes, so no concurrent writer
+/// can slip a matching line in between.
+///
+/// For a caller that durably stored `since` (from [`chained_len`]) before
+/// its first append attempt: only the lines appended after that point are
+/// read, never the whole log. A log shorter than `since` was replaced, and
+/// is then checked from its start.
+pub fn append_chained_line_strict_once(
+    path: &Path,
+    record: serde_json::Map<String, serde_json::Value>,
+    since: u64,
+    present: LineMatch<'_>,
+) -> io::Result<bool> {
+    strict_append(path, record, Some((since, present)))
+}
+
+/// Length in bytes of the chained log at `path`, 0 when it does not exist.
+/// The log is append-only, so every line appended after this call starts at
+/// or after the returned offset. A non-file in its place is an error.
+pub fn chained_len(path: &Path) -> io::Result<u64> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(meta.len()),
+        Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, "audit log path is not a file")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a line starting at or after byte `since` satisfies `present`.
+/// Must run under the writer lock. Lines are parsed from raw bytes (an
+/// offset may fall inside a multi-byte character of a line before it).
+fn present_since(path: &Path, since: u64, present: LineMatch<'_>) -> io::Result<bool> {
+    use std::io::Seek;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    file.seek(io::SeekFrom::Start(if len < since { 0 } else { since }))?;
+    for line in BufReader::new(file).split(b'\n') {
+        let line = line?;
+        if serde_json::from_slice::<serde_json::Value>(&line).is_ok_and(|value| present(&value)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn strict_append(
+    path: &Path,
+    record: serde_json::Map<String, serde_json::Value>,
+    once: Option<(u64, LineMatch<'_>)>,
+) -> io::Result<bool> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
     duduclaw_core::with_file_lock(path, || {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
         #[cfg(unix)]
-        duduclaw_core::platform::flock_exclusive(&file)?;
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(SECURITY_AUDIT_FILE_MODE);
+        }
+        let file = opts.open(path)?;
+        #[cfg(unix)]
+        {
+            duduclaw_core::platform::flock_exclusive(&file)?;
+            // Permission failures are warned, but must not discard the event.
+            tighten_permissions(&file, SECURITY_AUDIT_FILE_MODE, path);
+        }
+        if let Some((since, present)) = once
+            && present_since(path, since, present)?
+        {
+            return Ok(false);
+        }
         chain_and_write(path, &file, record)?;
         file.sync_all()?;
         // File fsync alone does not persist a newly created directory
@@ -219,7 +330,7 @@ pub fn append_chained_line_strict(
             let parent=path.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or_else(||Path::new("."));
             fs::File::open(parent)?.sync_all()?;
         }
-        Ok(())
+        Ok(true)
     })
 }
 
@@ -370,6 +481,28 @@ mod tests {
         std::fs::remove_dir_all(home).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_append_times_out_on_a_held_writer_lock() {
+        let home = fresh_home();
+        let path = home.join("security_audit.jsonl");
+        append_chained_line(&path, obj(&[("event", "one")]), None).unwrap();
+        // Another writer holds the data-file lock the best-effort writer takes.
+        let holder = OpenOptions::new().append(true).open(&path).unwrap();
+        duduclaw_core::platform::flock_exclusive(&holder).unwrap();
+        let started = std::time::Instant::now();
+        let err = append_chained_line_within(&path, obj(&[("event", "two")]), std::time::Duration::from_millis(150))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(holder);
+        append_chained_line_within(&path, obj(&[("event", "two")]), std::time::Duration::from_millis(150)).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 2);
+        assert!(verify_chain(&path).unwrap().is_intact());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn snapshot_verifier_uses_captured_bytes_after_path_changes() {
         let home = fresh_home();
@@ -384,6 +517,33 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(verify_chain_content(&snapshot).is_intact());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn strict_once_appends_only_when_no_match_follows_the_stored_offset() {
+        let home = fresh_home();
+        let path = home.join("test.jsonl");
+        assert_eq!(chained_len(&path).unwrap(), 0);
+        append_chained_line_strict(&path, obj(&[("id", "old")])).unwrap();
+        let since = chained_len(&path).unwrap();
+        fn is(id: &'static str) -> impl Fn(&serde_json::Value) -> bool {
+            move |line| line["id"] == id
+        }
+        // First delivery writes; a replay from the same offset does not.
+        assert!(append_chained_line_strict_once(&path, obj(&[("id", "a")]), since, &is("a")).unwrap());
+        append_chained_line_strict(&path, obj(&[("id", "other")])).unwrap();
+        assert!(!append_chained_line_strict_once(&path, obj(&[("id", "a")]), since, &is("a")).unwrap());
+        // A match before the offset is not looked at (only the tail is read).
+        let tail = chained_len(&path).unwrap();
+        assert!(append_chained_line_strict_once(&path, obj(&[("id", "a")]), tail, &is("a")).unwrap());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().filter(|l| l.contains("\"a\"")).count(), 2);
+        assert!(verify_chain(&path).unwrap().is_intact());
+        // An offset past the end (replaced log) checks the whole file.
+        assert!(!append_chained_line_strict_once(&path, obj(&[("id", "old")]), u64::MAX, &is("old")).unwrap());
+        // A directory in place of the log has no position.
+        assert!(chained_len(&home).is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

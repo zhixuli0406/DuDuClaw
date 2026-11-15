@@ -34,6 +34,8 @@ impl MethodHandler {
             "last_run_at": row.last_run_at,
             "next_run": crate::cron_scheduler::next_run(row, Utc::now()).map(|at| at.to_rfc3339()),
             "last_status": row.last_status,
+            "last_delivery_status": row.last_delivery_status,
+            "last_delivery_reason": row.last_delivery_reason,
             "last_error": row.last_error,
             "run_count": row.run_count,
             "failure_count": row.failure_count,
@@ -519,10 +521,20 @@ impl MethodHandler {
             Err(f) => return f,
         };
 
+        // The gateway deletes a removed job's origin proof record with it.
         let result = if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
-            store.delete(id).await
+            crate::recipient_guard::origin::delete_cron_task(&self.home_dir, &store, id).await
         } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
-            store.delete_by_name(name).await
+            let proofs: Vec<String> = match store.list_all().await {
+                Ok(rows) => rows.into_iter().filter(|row| row.name == name)
+                    .filter_map(|row| row.notify_origin_proof).collect(),
+                Err(e) => return WsFrame::error_response("", &format!("delete: {e}")),
+            };
+            let deleted = store.delete_by_name(name).await;
+            if matches!(deleted, Ok(true)) {
+                crate::recipient_guard::origin::forget_async(&self.home_dir, proofs).await;
+            }
+            deleted
         } else {
             return WsFrame::error_response("", "Missing 'id' or 'name' parameter");
         };
@@ -620,5 +632,21 @@ impl MethodHandler {
             "",
             json!({ "templates": crate::cron_templates::templates_json() }),
         )
+    }
+}
+
+#[cfg(test)]
+mod delivery_fields_tests {
+    use super::*;
+    #[test]
+    fn dashboard_keeps_execution_status_and_adds_delivery_status() {
+        let mut row = CronTaskRow::new("id".into(), "Daily".into(), "sales".into(), "0 9 * * *".into(), "report".into());
+        row.last_status = Some("success".into());
+        row.last_delivery_status = Some("delivery_failed".into());
+        row.last_delivery_reason = Some("notification_delivery_failed".into());
+        let value = MethodHandler::cron_row_to_json(&row);
+        assert_eq!(value["last_status"], "success");
+        assert_eq!(value["last_delivery_status"], "delivery_failed");
+        assert_eq!(value["last_delivery_reason"], "notification_delivery_failed");
     }
 }

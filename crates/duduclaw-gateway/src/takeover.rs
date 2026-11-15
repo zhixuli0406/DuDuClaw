@@ -94,7 +94,7 @@ pub fn manager_display_name(
         .ok()
         .flatten()
         .and_then(|db| {
-            db.find_verified_user_id_by_channel(channel, channel_user_id)
+            crate::googlechat_identity::verified_user_id(home_dir, &db, channel, channel_user_id)
                 .ok()
                 .flatten()
                 .and_then(|uid| db.get_user(&uid).ok().flatten())
@@ -109,7 +109,7 @@ pub fn manager_display_name(
 /// Used only to explain `/takeover` to somebody in a deployment that never
 /// linked a dashboard identity — never to loosen the gate.
 pub fn identity_available(home_dir: &Path) -> bool {
-    crate::decision_notify::identity_system_active(home_dir)
+    crate::decision_notify::has_recognisable_approver_identity(home_dir)
 }
 
 // ── D5: the predicate every dispatch path consults ──────────────

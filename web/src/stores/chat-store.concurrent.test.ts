@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { shouldRenderChatFrame, useChatStore } from './chat-store';
+import { admissionText, shouldRenderChatFrame, useChatStore } from './chat-store';
 import { lookupMessage, toast } from '@/lib/toast';
 
 class FakeSocket {
@@ -276,21 +276,71 @@ describe('messages queued behind a running WebChat turn', () => {
     expect(useChatStore.getState().isStreaming).toBe(false);
   });
 
-  it('cancels the exact queued msg_id without ending the running turn', () => {
+  it.each([
+    ['acknowledgement first', 'waiting'],
+    ['terminal first', 'waiting'],
+    ['acknowledgement first', undefined],
+    ['terminal first', undefined],
+  ])('cancels the exact queued msg_id without ending the running turn: %s (cancel_outcome: %s)', (order, outcome) => {
+    const errorToast = vi.spyOn(toast, 'error').mockImplementation(() => {});
+    const infoToast = vi.spyOn(toast, 'info').mockImplementation(() => {});
     const first = send('first');
+    frame(first, 'step', { phase: 'start', tool: 'Read' });
+    frame(first, 'assistant_chunk', { content: 'running reply' });
     const second = send('second');
+    const before = useChatStore.getState();
+    const runningMessages = before.messages.filter(m => m.turnId === first.msg_id);
+    const assertRunningUnchanged = () => {
+      const state = useChatStore.getState();
+      expect(state.messages.filter(m => m.turnId === first.msg_id)).toEqual(runningMessages);
+      expect(state.messages.find(m => m.role === 'user' && m.turnId === first.msg_id)?.delivery).toBe('running');
+      expect(state.activeMessageId).toBe(first.msg_id);
+      expect(state.isStreaming).toBe(true);
+      expect(state.thinking).toBe(before.thinking);
+      expect(state.steps).toBe(before.steps);
+      expect(state.stepTree).toBe(before.stepTree);
+      expect(state.phase).toBe(before.phase);
+      expect(state.viseme).toEqual(before.viseme);
+      expect(errorToast).not.toHaveBeenCalled();
+      expect(infoToast).not.toHaveBeenCalled();
+    };
+    const assertCancelled = () => {
+      const state = useChatStore.getState();
+      expect(state.messages).toHaveLength(before.messages.length);
+      expect(state.messages.filter(m => m.turnId === second.msg_id)).toHaveLength(1);
+      expect(state.messages.find(m => m.turnId === second.msg_id)).toMatchObject({
+        delivery: 'cancelled', deliveryError: lookupMessage('webchat.cancelledWaiting'),
+      });
+      expect(state.messages.filter(m => m.deliveryError === lookupMessage('webchat.cancelledWaiting'))).toHaveLength(1);
+      expect(state.messages.some(m => m.role === 'system')).toBe(false);
+      assertRunningUnchanged();
+    };
+    expect(before.messages.at(-1)?.delivery).toBe('queued');
+    assertRunningUnchanged();
     useChatStore.getState().cancel(second.msg_id as string);
     const request = JSON.parse(FakeSocket.last.sent.at(-1)!);
     expect(request).toMatchObject({ type: 'cancel', conv: second.conv, msg_id: second.msg_id });
     expect(request.request_id).toBeTruthy();
-    deliver({ type: 'cancel_accepted', request_id: request.request_id });
     expect(useChatStore.getState().messages.at(-1)?.delivery).toBe('queued');
-    frame(second, 'error', { code: 'cancelled', message: 'cancelled' });
-    expect(useChatStore.getState().messages.find(m => m.turnId === second.msg_id)?.delivery).toBe('cancelled');
-    expect(useChatStore.getState().activeMessageId).toBe(first.msg_id);
-    expect(useChatStore.getState().isStreaming).toBe(true);
+    assertRunningUnchanged();
+    const acknowledge = () => deliver({ type: 'cancel_accepted', request_id: request.request_id,
+      conv: second.conv, msg_id: second.msg_id, ...(outcome ? { cancel_outcome: outcome } : {}) });
+    const terminate = () => frame(second, 'error', { code: 'cancelled', message: 'cancelled',
+      cancel_outcome: 'waiting', request_id: request.request_id });
+    // The token is already cancelled at acknowledgement; cleanup can finish
+    // before or after it, without adding a second notice or changing activity.
+    const sequence = order === 'terminal first' ? [terminate, acknowledge] : [acknowledge, terminate];
+    for (const deliverCancellation of sequence) {
+      deliverCancellation();
+      assertCancelled();
+    }
+    const settledMessages = useChatStore.getState().messages;
+    terminate();
+    expect(useChatStore.getState().messages).toEqual(settledMessages);
+    assertCancelled();
     frame(second, 'assistant_chunk', { content: 'late' });
     expect(useChatStore.getState().messages.some(m => m.content === 'late')).toBe(false);
+    assertCancelled();
   });
 
   it.each(['msg_id', 'request_id'])('keeps rejected text and the running reply on turn_limit via %s', field => {
@@ -347,4 +397,92 @@ it('preserves independent @ routed turns when their frames interleave', () => {
   deliver({ type: 'assistant_done', content: 'A done', tokens_used: 1, conv: first.conv, msg_id: first.msg_id });
   expect(useChatStore.getState().isStreaming).toBe(false);
   expect(useChatStore.getState().messages.find(m => m.id === useChatStore.getState().lastCompletedReplyId)?.content).toBe('A done');
+});
+
+
+describe('queue cancellation and supplementary dispatch', () => {
+  it('settles a waiting cancel acknowledgement immediately without touching the running reply', () => {
+    const running = send('first');
+    const waiting = send('supplement');
+    useChatStore.getState().cancel(waiting.msg_id as string);
+    const request = JSON.parse(FakeSocket.last.sent.at(-1)!);
+    deliver({ type: 'cancel_accepted', request_id: request.request_id, cancel_outcome: 'waiting' });
+    const state = useChatStore.getState();
+    expect(state.messages.find(m => m.turnId === waiting.msg_id)?.delivery).toBe('cancelled');
+    expect(state.messages.find(m => m.turnId === waiting.msg_id)?.deliveryError).toBe(lookupMessage('webchat.cancelledWaiting'));
+    expect(state.messages.find(m => m.turnId === running.msg_id)?.delivery).toBe('running');
+    expect(state.activeMessageId).toBe(running.msg_id);
+    expect(state.isStreaming).toBe(true);
+    deliver({ type: 'assistant_done', msg_id: running.msg_id, conv: running.conv, content: 'finished', tokens_used: 1 });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('settles an accepted running stop without an error bubble or spinner', () => {
+    const turn = send('first');
+    useChatStore.getState().cancel();
+    const request = JSON.parse(FakeSocket.last.sent.at(-1)!);
+    deliver({ type: 'cancel_accepted', request_id: request.request_id, cancel_outcome: 'running' });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    deliver({ type: 'error', code: 'cancelled', message: 'Turn cancelled', msg_id: turn.msg_id,
+      conv: turn.conv, cancel_outcome: 'running', request_id: request.request_id });
+    expect(useChatStore.getState().messages).toHaveLength(1);
+    expect(useChatStore.getState().messages[0].deliveryError).toBe(lookupMessage('webchat.stoppedRunning'));
+  });
+
+  it('handles terminal cancellation before the acknowledgement and ignores unrelated acknowledgements', () => {
+    const turn = send('first');
+    useChatStore.getState().cancel();
+    const request = JSON.parse(FakeSocket.last.sent.at(-1)!);
+    deliver({ type: 'cancel_accepted', request_id: 'unknown', cancel_outcome: 'running' });
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    deliver({ type: 'error', code: 'cancelled', message: 'Turn cancelled', msg_id: turn.msg_id,
+      conv: turn.conv, cancel_outcome: 'running' });
+    deliver({ type: 'cancel_accepted', request_id: request.request_id, cancel_outcome: 'running' });
+    expect(useChatStore.getState().messages).toHaveLength(1);
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('shows the structured reason and separate running and queued counts on the refused message', () => {
+    const running = send('first');
+    const refused = send('second');
+    const admission = { reason: 'user_limit', limit: 3, running: 2, queued: 1 };
+    deliver({ type: 'error', code: 'turn_limit', message: 'internal wording', msg_id: refused.msg_id,
+      request_id: refused.msg_id, conv: refused.conv, admission });
+    expect(useChatStore.getState().messages.find(m => m.turnId === refused.msg_id)?.deliveryError).toBe(admissionText(admission));
+    expect(admissionText(admission)).toContain('3');
+    expect(admissionText(admission)).toContain('2');
+    expect(admissionText(admission)).toContain('1');
+    expect(admissionText(admission)).not.toContain('user_limit');
+    expect(useChatStore.getState().activeMessageId).toBe(running.msg_id);
+  });
+
+  it('localizes every closed reason and ignores unknown reason text', () => {
+    for (const reason of ['user_limit', 'global_limit', 'cancel_quota', 'store_unavailable', 'config_invalid', 'conversation_queue']) {
+      const text = admissionText({ reason, limit: 3, running: 1, queued: 2 });
+      expect(text).not.toContain(reason);
+      expect(text).not.toContain('webchat.admission.');
+    }
+    expect(admissionText({ reason: 'internal_secret' })).toBe(lookupMessage('webchat.turnLimit'));
+  });
+
+  it('completes all merged supplements with one reply and retains their individual messages', () => {
+    const first = send('first');
+    const second = send('second');
+    const third = send('third');
+    deliver({ type: 'assistant_done', msg_id: first.msg_id, conv: first.conv, content: 'first reply', tokens_used: 1 });
+    deliver({ type: 'turn_merged', msg_id: second.msg_id, conv: second.conv, merged_msg_ids: [third.msg_id] });
+    deliver({ type: 'assistant_done', msg_id: second.msg_id, conv: second.conv, content: 'combined reply', tokens_used: 1 });
+    const state = useChatStore.getState();
+    expect(state.messages.filter(m => m.role === 'user').map(m => m.content)).toEqual(['first', 'second', 'third']);
+    expect(state.messages.filter(m => m.role === 'user').every(m => m.delivery === 'done')).toBe(true);
+    expect(state.isStreaming).toBe(false);
+  });
+
+  it('settles a supplement merged on another connection without making another reply bubble', () => {
+    const supplement = send('supplement from this tab');
+    deliver({ type: 'turn_consumed', msg_id: supplement.msg_id, conv: supplement.conv, outcome: 'done' });
+    expect(useChatStore.getState().messages).toHaveLength(1);
+    expect(useChatStore.getState().messages[0].delivery).toBe('done');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
 });

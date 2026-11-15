@@ -10,16 +10,27 @@
 //!
 //! ## Trust model
 //!
-//! * The only accepted source of a WebChat target is
-//!   [`duduclaw_core::ENV_ORIGIN_SESSION`], which the gateway sets for the MCP
-//!   child of a `webchat:` turn ([`ORIGIN_SESSION`] task-local, scoped in
-//!   `channel_reply::inner`). A `webchat` target the model (or a dashboard
-//!   edit) supplies is refused ([`refuse_supplied_target`]).
-//! * At creation the env value is bound to the verified acting employee
-//!   ([`bind_origin`]): the `#agent:` segment (when present) and the stored
-//!   session row must both name that employee, and the row must be a signed-in
-//!   dashboard account's conversation (`origin_kind = 'webchat_user'`) whose
-//!   owner hashes to the owner tag inside the id.
+//! * The only accepted source of a WebChat target is the gateway's live turn
+//!   registry: the [`ORIGIN_SESSION`] task-local (scoped in
+//!   `channel_reply::inner` for a signed-in `webchat:` turn) is captured when
+//!   the turn registers (`turn_context::webchat_origin_for`) and handed to
+//!   the MCP server inside the signed `RecipientContext`. The
+//!   [`duduclaw_core::ENV_ORIGIN_SESSION`] variable is still exported for
+//!   compatibility but is never read for a notify target — an MCP process
+//!   could set it. A `webchat` target the model (or a dashboard edit)
+//!   supplies is refused ([`refuse_supplied_target`]).
+//! * At creation the gateway binds that session to the verified acting
+//!   employee ([`bind_origin`]): the `#agent:` segment (when present) and the
+//!   stored session row must both name that employee, and the row must be a
+//!   signed-in dashboard account's conversation (`origin_kind =
+//!   'webchat_user'`) whose owner hashes to the owner tag inside the id. The
+//!   gateway then persists an origin proof record for exactly that stamped
+//!   target (`recipient_guard::origin::mint_webchat`); the job stores the
+//!   target as its origin plus the record's opaque id, and a WebChat target
+//!   without a valid proof is refused (`origin_unproven`) before anything
+//!   else is checked. Rows created by v1.81 (no proof, no `notify_origin`)
+//!   get their proof once from the gateway's startup backfill
+//!   (`recipient_guard::origin::startup_backfill`), through the same mint.
 //! * At fire time ([`verify_delivery`] / [`deliver`]) everything is re-read:
 //!   the session must still exist (archived is allowed), still belong to the same
 //!   employee and the same dashboard account, that account must still be
@@ -98,6 +109,28 @@ fn split_target(target: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// [`split_target`] for the WebChat origin proof
+/// (`recipient_guard::origin`), which binds exactly one stamped target.
+pub(crate) fn target_parts(target: &str) -> (&str, Option<&str>) {
+    split_target(target)
+}
+
+/// The stored turn origin of a job whose WebChat notify target is `target`.
+/// A WebChat target has only ever been the gateway-bound origin of the turn
+/// that created the job (see the trust model above), so a row written by
+/// v1.81 — before `notify_origin` existed — has its target as origin. This
+/// grants nothing by itself: the destination is admitted only with a gateway
+/// proof minted for exactly this target and employee
+/// (`recipient_guard::origin::verify`); a row without one stays refused
+/// (`origin_unproven`), and a row whose origin names another destination is
+/// refused as before.
+pub(crate) fn stored_origin<'a>(notify_origin: Option<&'a str>, target: &'a str) -> Option<&'a str> {
+    match notify_origin {
+        Some(origin) if !origin.is_empty() => Some(origin),
+        _ => Some(target).filter(|target| !target.is_empty()),
+    }
+}
+
 /// Cancel every schedule / pending reminder aimed at `session` (any
 /// generation). Called when a conversation is purged. Best effort: delivery is
 /// independently refused for a purged / recreated conversation.
@@ -114,7 +147,8 @@ pub async fn cancel_for_session(home: &Path, session: &str) {
                         .iter()
                         .filter(|r| aimed(r.notify_channel.as_deref(), r.notify_chat_id.as_deref()))
                     {
-                        if let Err(e) = store.delete(&row.id).await {
+                        // The job's gateway origin proof goes with it.
+                        if let Err(e) = crate::recipient_guard::origin::delete_cron_task(home, &store, &row.id).await {
                             tracing::warn!(id = %row.id, error = %e, "cancel schedule of purged WebChat session failed");
                         }
                     }
@@ -557,9 +591,15 @@ async fn deliver_with_hook(
     // authorisation write until we are done) and the edition snapshot (an
     // Enterprise→Personal downgrade does not bump the ACL generation). If
     // either moved, `tx` is dropped un-committed and the append rolls back.
+    // This path holds sessions.db's write lock while it waits for users.db —
+    // the reverse of WebChat publication. Both waits are bounded by
+    // `ACL_DELIVERY_WAIT`, so a collision fails one side closed, never hangs.
     users
         .with_acl_generation(generation, || edition.with_current(|| tx.commit()))
-        .map_err(|_| "對話擁有者的授權剛剛變更，已停止傳送".to_string())?
+        .map_err(|error| match error {
+            duduclaw_auth::AclDeliveryError::Contended => "帳號資料庫忙碌，已停止傳送，請稍後再試".to_string(),
+            _ => "對話擁有者的授權剛剛變更，已停止傳送".to_string(),
+        })?
         .map_err(|_| "對話擁有者的授權剛剛變更，已停止傳送".to_string())?
         .map_err(|_| "對話紀錄無法寫入".to_string())
 }
@@ -575,9 +615,12 @@ pub(crate) mod tests {
         pub session: String,
         /// The stored schedule target (session id + creation stamp).
         pub target: String,
+        /// Opaque id of the gateway origin proof minted for `target`.
+        pub proof: String,
     }
 
-    /// A dashboard Employee bound to `agent`, owning one WebChat session.
+    /// A dashboard Employee bound to `agent`, owning one WebChat session,
+    /// with the gateway origin proof a live turn there would mint.
     pub(crate) async fn fixture(agent: &str) -> Fixture {
         let home = tempfile::tempdir().unwrap();
         let db = UserDb::new(&home.path().join("users.db")).unwrap();
@@ -591,7 +634,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let target = bind_origin(home.path(), Some(&session), agent).expect("fixture origin binds");
-        Fixture { home, user: user.id, session, target }
+        let turn = uuid::Uuid::new_v4().to_string();
+        let proof = crate::recipient_guard::origin::mint_webchat(home.path(), agent, &turn, &target)
+            .expect("fixture origin proof");
+        Fixture { home, user: user.id, session, target, proof }
     }
 
     pub(crate) async fn messages(f: &Fixture) -> Vec<String> {

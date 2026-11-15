@@ -521,6 +521,12 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
                 warn!("Google Chat: MESSAGE event without space name — refused");
                 return (StatusCode::BAD_REQUEST, "bad request").into_response();
             }
+            if !event.get("message").is_some_and(is_human_message) {
+                // ACK so Google does not redeliver; nothing is enqueued and
+                // the sender id is never mapped to an account.
+                info!("Google Chat: MESSAGE from a non-human sender ignored");
+                return (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response();
+            }
             let sender = event
                 .pointer("/message/sender/name")
                 .and_then(|v| v.as_str())
@@ -530,8 +536,7 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
             let queued = event.clone();
             // The queue outlives each request. Include the app identity so
             // two apps in one space do not block each other or share caps.
-            let group = serde_json::json!([state.agent.as_deref(), &space]).to_string();
-            let conversation = serde_json::json!([state.agent.as_deref(), &space, &sender]).to_string();
+            let (group, conversation) = queue_keys(state.agent.as_deref(), &space, &sender);
             let message_name = event.pointer("/message/name").and_then(|v| v.as_str()).filter(|name| !name.is_empty() && name.len() <= 1024);
             let dedupe_key = message_name.map(|name| serde_json::json!([
                 state.ctx.home_dir, state.agent, state.creds.client_email(), name
@@ -540,18 +545,8 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
                 .submit_in(&group, &conversation, async move { handle_message(&st, &queued).await }).is_ok());
             if !accepted
             {
-                let notify = state.ctx.googlechat_full_notices.allow(&[
-                    (&format!("sender:{conversation}"), std::time::Duration::from_secs(60)),
-                    (&format!("space:{group}"), std::time::Duration::from_secs(10)),
-                ]);
-                warn!(notify, "Google Chat: queue full for a space or sender");
-                if notify {
-                    let st = state.clone();
-                    tokio::spawn(async move {
-                        let thread = event.pointer("/message/thread/name").and_then(|v| v.as_str());
-                        create_message(&st.creds, &space, thread, QUEUE_FULL_TEXT).await;
-                    });
-                }
+                let thread = event.pointer("/message/thread/name").and_then(|v| v.as_str());
+                notify_queue_full(&state, &group, &conversation, &space, thread);
                 // ACK and drop this event: the notice asks the user to resend.
                 return (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response();
             }
@@ -600,6 +595,51 @@ fn enqueue_once(key: Option<&str>, submit: impl FnOnce() -> bool) -> bool {
     true
 }
 
+/// Only a message Google reports as written by a person (`sender.type ==
+/// "HUMAN"`) may start a turn or be mapped to a dashboard account — the same
+/// rule the Pub/Sub worker applies to its authoritative re-read
+/// (`googlechat_pubsub::authoritative_event`). A `BOT` sender (another Chat
+/// app, possibly echoing a person's id) or a missing/unknown type is dropped.
+pub(crate) fn is_human_message(message: &serde_json::Value) -> bool {
+    message.pointer("/sender/type").and_then(|v| v.as_str()) == Some("HUMAN")
+}
+
+/// Queue keys shared by the HTTP and Pub/Sub paths: one per app+space and
+/// one per app+space+sender (also the throttle keys of the queue-full notice).
+pub(crate) fn queue_keys(agent: Option<&str>, space: &str, sender: &str) -> (String, String) {
+    (
+        serde_json::json!([agent, space]).to_string(),
+        serde_json::json!([agent, space, sender]).to_string(),
+    )
+}
+
+/// Tell the space its message was not accepted because the queue is full,
+/// at most once a minute per sender and once every 10 s per space. Both the
+/// HTTP endpoint and the Pub/Sub worker use this, with the same keys.
+/// Returns whether a notice was sent (spawned).
+pub(crate) fn notify_queue_full(
+    state: &Arc<GoogleChatState>,
+    group: &str,
+    conversation: &str,
+    space: &str,
+    thread: Option<&str>,
+) -> bool {
+    let notify = state.ctx.googlechat_full_notices.allow(&[
+        (&format!("sender:{conversation}"), std::time::Duration::from_secs(60)),
+        (&format!("space:{group}"), std::time::Duration::from_secs(10)),
+    ]);
+    warn!(notify, "Google Chat: queue full for a space or sender");
+    if notify && !space.is_empty() {
+        let st = state.clone();
+        let space = space.to_string();
+        let thread = thread.map(str::to_string);
+        tokio::spawn(async move {
+            create_message(&st.creds, &space, thread.as_deref(), QUEUE_FULL_TEXT).await;
+        });
+    }
+    notify
+}
+
 /// The space a MESSAGE event belongs to (the queue key; same lookup as
 /// [`handle_message`]).
 fn event_space(event: &serde_json::Value) -> String {
@@ -613,6 +653,10 @@ fn event_space(event: &serde_json::Value) -> String {
 
 async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value) {
     let message = event.get("message").cloned().unwrap_or_default();
+    // Defence in depth: every entry already requires a human sender.
+    if !is_human_message(&message) {
+        return;
+    }
     // argumentText has the app @mention stripped; fall back to raw text.
     let text = message
         .get("argumentText")
@@ -700,15 +744,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                     }
                 }
                 GchatAttachmentRef::Drive { file_id } => {
-                    // Explicit degrade: downloading Drive content requires a
-                    // Drive API scope the Chat service account is not granted.
-                    warn!(
-                        "Google Chat: Drive attachment {filename} ({file_id}) skipped — \
-                         service account lacks Drive scope"
-                    );
-                    attachment_lines.push(format!(
-                        "[Attached Google Drive file: {filename} — not downloaded (Drive scope not granted)]"
-                    ));
+                    attachment_lines.push(drive_attachment_note(&filename, file_id));
                 }
             }
         }
@@ -727,7 +763,9 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     }
 
     // ── Placeholder message (Chat has no typing API) ──
-    let placeholder = create_message(&state.creds, &space, thread.as_deref(), "🤔 思考中…").await;
+    let placeholder = Arc::new(tokio::sync::Mutex::new(
+        create_message(&state.creds, &space, thread.as_deref(), "🤔 思考中…").await,
+    ));
 
     // ── Progress: PATCH the placeholder in place ──
     let progress_state = state.clone();
@@ -738,9 +776,6 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
             .unwrap_or_else(std::time::Instant::now),
     ));
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-        let Some(name) = progress_name.clone() else {
-            return;
-        };
         // Allowlist: dashboard-only events (Step / ModelInfo / Thinking) never
         // reach the channel — and never consume the progress throttle.
         if !forwards_progress(&event) {
@@ -761,8 +796,16 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         }
         let st = progress_state.clone();
         let msg_text = event.to_display();
+        let slot = progress_name.clone();
         tokio::spawn(async move {
-            update_message(&st.creds, &name, &msg_text).await;
+            // Hold the lock until PATCH completes. Final delivery waits, then
+            // takes the name; queued callbacks observe None and cannot overwrite it.
+            let name = slot.lock().await;
+            if let Some(name) = name.as_deref() {
+                if let Err(error) = update_message(&st.creds, name, &msg_text).await {
+                    warn!(status = ?error.status, "Google Chat progress update failed");
+                }
+            }
         });
     });
 
@@ -774,35 +817,69 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         Some(agent) => crate::trigger_route::called_session(&session_id, agent),
         None => session_id.clone(),
     };
+    let delivery_target = DeliveryTarget {
+        home: &state.ctx.home_dir,
+        space: &space,
+        agent: state.agent.as_deref(),
+    };
     if crate::chat_commands::is_command(&text) {
         if let Some(cmd) = crate::chat_commands::parse_command(&text, None) {
-            let agent_id = match &state.agent {
-                Some(agent) => agent.clone(),
+            // The same access gate the reply pipeline runs (on the space, with
+            // the same laundered sender id), then the shared-space rule for
+            // clearing history: the session is shared by every member and
+            // thread of the space, so only a verified Admin/Manager may clear
+            // it there; a 1:1 DM keeps resetting its own conversation.
+            // The space type comes from the trusted event / read-back, else
+            // `spaces.get` (cached); unknown = shared. Only resolved for the
+            // commands the rule applies to.
+            let one_to_one = crate::chat_commands::clears_conversation(&cmd)
+                && crate::googlechat_space_kind::is_one_to_one(
+                    &state.creds,
+                    &space,
+                    &message,
+                    event,
+                )
+                .await;
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "googlechat",
+                gate_session: &session_id,
+                command_session: &reply_session,
+                sender: crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+                text: &text,
+                shared: !one_to_one,
+            };
+            let reply = match crate::chat_commands::command_preflight(&cmd, &state.ctx, &origin).await {
+                Some(reply) => reply,
                 None => {
-                    let reg = state.ctx.registry.read().await;
-                    reg.main_agent()
-                        .map(|a| a.config.agent.name.clone())
-                        .unwrap_or_default()
+                    let agent_id = match &state.agent {
+                        Some(agent) => agent.clone(),
+                        None => {
+                            let reg = state.ctx.registry.read().await;
+                            reg.main_agent()
+                                .map(|a| a.config.agent.name.clone())
+                                .unwrap_or_default()
+                        }
+                    };
+                    crate::chat_commands::handle_command_for_sender(
+                        &cmd,
+                        &state.ctx,
+                        "googlechat",
+                        &reply_session,
+                        &agent_id,
+                        origin.sender,
+                    )
+                    .await
                 }
             };
-            let reply = crate::chat_commands::handle_command_for_sender(
-                &cmd,
-                &state.ctx,
-                "googlechat",
-                &reply_session,
-                &agent_id,
-                &sender_id,
-            )
-            .await;
-            deliver_reply(
+            // An empty reply (blocked sender) removes the placeholder: silence.
+            report_delivery(delivery_target, deliver_reply(
                 &state.creds,
                 &space,
                 thread.as_deref(),
-                placeholder.as_deref(),
+                &placeholder,
                 &reply,
                 None,
-            )
-            .await;
+            ).await);
             return;
         }
     }
@@ -821,8 +898,8 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         .or_else(|| event.pointer("/space/type"))
         .and_then(|v| v.as_str())
         == Some("DM");
-    // Thinking display: this platform cannot edit messages, so the answer
-    // ends with one "💭 思考了 N 秒" line (+ summary for allowed senders).
+    // Chat's placeholder is reserved for progress/final delivery. Thinking
+    // contributes at most a staff-only duration; never a summary in the answer.
     let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
         "googlechat",
         !is_dm,
@@ -830,7 +907,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         None,
     );
     let on_progress = thinking.wrap(on_progress);
-    let guarded = group_turn.scope(async { match &state.agent {
+    let (guarded, deliberate_silence) = crate::channel_reply::track_silence(group_turn.scope(async { match &state.agent {
         // Own app: deterministic routing to its employee, in the employee's
         // bucket; the access gate and takeover still run on the space.
         Some(agent) => {
@@ -858,18 +935,17 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                 ))
                 .await
         }
-    } }).await;
+    } })).await;
     let thinking_footer = thinking.finish().await;
     if !guarded.still_valid().await {
-        deliver_reply(
+        report_delivery(delivery_target, deliver_reply(
             &state.creds,
             &space,
             thread.as_deref(),
-            placeholder.as_deref(),
+            &placeholder,
             crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
             None,
-        )
-        .await;
+        ).await);
         return;
     }
 
@@ -894,60 +970,237 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     };
 
     if reply.trim().is_empty() {
-        warn!("Google Chat: reply is empty — cleaning up placeholder");
-        if let Some(name) = placeholder.as_deref() {
-            update_message(&state.creds, name, "⚠️ 沒有產生回覆，請再試一次。").await;
+        if deliberate_silence {
+            if let Some(name) = placeholder.lock().await.take() {
+                delete_placeholder(&state.creds, &name).await;
+            }
+        } else {
+            report_delivery(delivery_target, deliver_reply(&state.creds, &space, thread.as_deref(),
+                &placeholder, "⚠️ 沒有產生回覆，請再試一次。", None).await);
         }
         return;
     }
     let reply = crate::thinking::channel_presenter::with_footer(reply, thinking_footer.as_ref());
 
-    group_turn.delivery(&state.ctx, guarded.answered_by.as_ref(), thread.as_deref()).scope(deliver_reply(
+    let answered = DeliveryTarget {
+        agent: guarded.answered_by.as_ref().map(|who| who.id.as_str()).or(delivery_target.agent),
+        ..delivery_target
+    };
+    report_delivery(answered, group_turn.delivery(&state.ctx, guarded.answered_by.as_ref(), thread.as_deref()).scope(deliver_reply(
         &state.creds,
         &space,
         thread.as_deref(),
-        placeholder.as_deref(),
+        &placeholder,
         &reply,
         Some(&guarded),
-    )).await;
+    )).await);
 }
 
 /// Deliver the final reply: first chunk replaces the placeholder (PATCH),
 /// remaining chunks are new messages in the same thread.
+type Placeholder = Arc<tokio::sync::Mutex<Option<String>>>;
+
+/// The `channel_failures.jsonl` event for a reply Google Chat could not
+/// deliver even after the new-message fallback. Counted by channel alerts
+/// (`channel_alerts::SEND_FAILURE_EVENTS`).
+pub(crate) const SEND_FAILED_EVENT: &str = "googlechat_send_failed";
+
+/// Where a final reply was going, for the failure record (never content).
+#[derive(Clone, Copy)]
+struct DeliveryTarget<'a> {
+    home: &'a Path,
+    space: &'a str,
+    /// The employee whose answer it was, when known.
+    agent: Option<&'a str>,
+}
+
+fn report_delivery(target: DeliveryTarget<'_>, result: Result<(), Option<u16>>) {
+    if let Err(status) = result {
+        warn!(?status, "Google Chat final delivery failed");
+        let rec = send_failure_record(target.space, target.agent, status);
+        if let Err(e) = crate::trajectory_guard::append_anomaly(target.home, &rec) {
+            warn!(error = %e, "googlechat: 寫入 channel_failures.jsonl 失敗");
+        }
+    }
+}
+
+/// The failure line: identifiers and the HTTP status only — no message text.
+fn send_failure_record(space: &str, agent: Option<&str>, status: Option<u16>) -> serde_json::Value {
+    let mut rec = serde_json::json!({
+        "event": SEND_FAILED_EVENT,
+        "channel": "googlechat",
+        "space": space,
+        "status": status,
+        "reason": "final_delivery_failed",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Some(agent) = agent.filter(|a| !a.is_empty()) {
+        rec["agent"] = serde_json::json!(agent);
+    }
+    rec
+}
+
 async fn deliver_reply(
     creds: &GoogleChatCreds,
     space: &str,
     thread: Option<&str>,
-    placeholder: Option<&str>,
+    placeholder: &Placeholder,
     reply_markdown: &str,
     guarded: Option<&crate::channel_reply::GuardedReply>,
-) -> bool {
+) -> Result<(), Option<u16>> {
+    // Taking the name waits for any in-flight progress PATCH and permanently
+    // disables all queued progress updates, including during retry back-off.
+    let placeholder = placeholder.lock().await.take();
+    if reply_markdown.trim().is_empty() {
+        if let Some(name) = placeholder.as_deref() { delete_placeholder(creds, name).await; }
+        return Ok(());
+    }
     let formatted = crate::markdown_render::to_googlechat_text(reply_markdown);
     let chunks = crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK);
+    let mut failure = None;
     for (index, chunk) in chunks.iter().enumerate() {
         if crate::channel_reply::guard_lost(guarded).await {
             let refusal = crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT;
-            if index == 0
-                && let Some(name) = placeholder
-            {
-                update_message(creds, name, refusal).await;
+            let result = if index == 0 && let Some(name) = placeholder.as_deref() {
+                replace_placeholder(name,
+                    || update_message(creds, name, refusal),
+                    || post_message(creds, space, thread, refusal),
+                    || update_message(creds, name, "處理已結束。"),
+                ).await.map(|_| ())
             } else {
-                create_message(creds, space, thread, refusal).await;
+                post_message(creds, space, thread, refusal).await.map(|_| ())
+            };
+            if let Err(status) = result {
+                warn!(?status, "Google Chat refusal delivery failed");
+                return Err(status);
             }
-            return false;
+            // The refusal replaced the answer on purpose; an earlier chunk
+            // that failed is still a delivery failure.
+            return match failure { Some(status) => Err(status), None => Ok(()) };
         }
-        if index == 0
-            && let Some(name) = placeholder
-        {
-            if !update_message(creds, name, chunk).await { return false; }
-            crate::channel_reply::group_buffer::delivered(chunk, Some(name)).await;
+        let result = if index == 0 && let Some(name) = placeholder.as_deref() {
+            replace_placeholder(name,
+                || async {
+                    if crate::channel_reply::guard_lost(guarded).await {
+                        return Err(PatchFailure { status: None, retry_after: std::time::Duration::ZERO });
+                    }
+                    update_message(creds, name, chunk).await
+                },
+                || async {
+                    if crate::channel_reply::guard_lost(guarded).await { return Err(None); }
+                    post_message(creds, space, thread, chunk).await
+                },
+                || update_message(creds, name, "處理已結束。"),
+            ).await
         } else {
-            let Ok(id) = post_message(creds, space, thread, chunk).await else { return false; };
-            crate::channel_reply::group_buffer::delivered(chunk, id.as_deref()).await;
+            post_message(creds, space, thread, chunk).await
+        };
+        match result {
+            Ok(id) => crate::channel_reply::group_buffer::delivered(chunk, id.as_deref()).await,
+            Err(status) => {
+                warn!(?status, "Google Chat chunk delivery failed");
+                failure.get_or_insert(status);
+                // Still attempt every remaining chunk, rather than losing the answer tail.
+            }
         }
     }
-    true
+    match failure { Some(status) => Err(status), None => Ok(()) }
 }
+
+#[derive(Debug, Clone)]
+struct PatchFailure {
+    status: Option<u16>,
+    retry_after: std::time::Duration,
+}
+
+fn patch_backoff(status: u16, retry_after: Option<&str>) -> std::time::Duration {
+    let seconds = if status == 429 {
+        retry_after.and_then(|value| value.parse::<u64>().ok().or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(value).ok().map(|at| {
+                (at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds().max(0) as u64
+            })
+        })).unwrap_or(1).min(3)
+    } else { 1 };
+    std::time::Duration::from_secs(seconds)
+}
+
+/// The first chunk always has a new-message fallback after exactly one retry.
+/// Small injectable operations let tests exercise failure ordering without Chat credentials.
+async fn replace_placeholder<P, PF, S, SF, C, CF>(
+    name: &str, mut patch: P, post: S, clear: C,
+) -> Result<Option<String>, Option<u16>>
+where
+    P: FnMut() -> PF, PF: std::future::Future<Output = Result<(), PatchFailure>>,
+    S: FnOnce() -> SF, SF: std::future::Future<Output = Result<Option<String>, Option<u16>>>,
+    C: FnOnce() -> CF, CF: std::future::Future<Output = Result<(), PatchFailure>>,
+{
+    match patch().await {
+        Ok(()) => return Ok(Some(name.to_string())),
+        Err(error) => {
+            warn!(status = ?error.status, "Google Chat final PATCH failed; retrying");
+            tokio::time::sleep(error.retry_after).await;
+        }
+    }
+    match patch().await {
+        Ok(()) => Ok(Some(name.to_string())),
+        Err(error) => {
+            warn!(status = ?error.status, "Google Chat final PATCH failed; sending new message");
+            let sent = post().await;
+            if let Err(error) = clear().await {
+                warn!(status = ?error.status, "Google Chat placeholder cleanup failed");
+            }
+            sent
+        }
+    }
+}
+
+async fn delete_placeholder(creds: &GoogleChatCreds, name: &str) {
+    let Ok(token) = creds.get_token().await else {
+        warn!(status = ?Option::<u16>::None, "Google Chat placeholder removal token unavailable");
+        return;
+    };
+    match creds.http.delete(format!("{}/{name}", creds.api_base()))
+        .bearer_auth(token).send_authorized().await
+    {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => warn!(status = response.status().as_u16(), "Google Chat placeholder removal failed"),
+        Err(_) => warn!(status = ?Option::<u16>::None, "Google Chat placeholder removal transport failure"),
+    }
+}
+
+/// Only provider resource IDs, never arbitrary text, may enter the tool hint.
+fn drive_attachment_note(filename: &str, file_id: &str) -> String {
+    let valid = (1..=256).contains(&file_id.len())
+        && file_id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'));
+    if valid {
+        format!("[Attached Google Drive file: {filename} — not downloaded automatically. driveFileId: {file_id}. Open this id with the Drive read tool (drive_read); access depends on the connected Google identity and file type.]")
+    } else {
+        format!("[Attached Google Drive file: {filename} — not downloaded automatically; no valid Drive file id available.]")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoogleChatSendError {
+    InvalidTarget,
+    Configuration(String),
+    Http { status: u16 },
+    Transport,
+}
+
+impl std::fmt::Display for GoogleChatSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTarget => f.write_str("Google Chat 目標必須是有效的 spaces/<id>，不能使用使用者 ID 或電子郵件。"),
+            Self::Configuration(reason) => f.write_str(reason),
+            Self::Http { status: 403 | 404 } => f.write_str("對方尚未與此 Chat 應用程式建立對話，或應用程式不在該聊天室。請對方先私訊此應用程式一次，或請管理員為對方安裝。"),
+            Self::Http { status } if *status == 429 || (500..=599).contains(status) => f.write_str("Google Chat 暫時無法傳送訊息，請稍後重試。"),
+            Self::Http { .. } => f.write_str("Google Chat 拒絕傳送訊息，請管理員確認應用程式設定。"),
+            Self::Transport => f.write_str("Google Chat 暫時無法連線或取得授權，請稍後重試。"),
+        }
+    }
+}
+
+impl std::error::Error for GoogleChatSendError {}
 
 /// Send markdown text to a space (proactive / delegation-forwarding path).
 /// The Chat app must already be a member of the space.
@@ -956,7 +1209,7 @@ pub async fn send_text_to_space(
     space: &str,
     markdown: &str,
 ) -> Result<(), String> {
-    send_text_to_space_as(home_dir, None, space, markdown).await
+    send_text_to_space_as(home_dir, None, space, markdown).await.map_err(|e| e.to_string())
 }
 
 /// [`send_text_to_space`] as an employee's own Chat app when `agent` has one
@@ -966,8 +1219,12 @@ pub async fn send_text_to_space_as(
     agent: Option<&str>,
     space: &str,
     markdown: &str,
-) -> Result<(), String> {
-    let (creds, member) = sending_creds(home_dir, agent, space).await?;
+) -> Result<(), GoogleChatSendError> {
+    if !crate::google_workspace::chat_read::valid_space(space) {
+        return Err(GoogleChatSendError::InvalidTarget);
+    }
+    let (creds, member) = sending_creds(home_dir, agent, space).await
+        .map_err(GoogleChatSendError::Configuration)?;
     let formatted = crate::markdown_render::to_googlechat_text(markdown);
     for chunk in crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK) {
         if let Err(status) = post_message(&creds, space, None, &chunk).await {
@@ -976,9 +1233,13 @@ pub async fn send_text_to_space_as(
             if let Some(member) = member.as_deref()
                 && matches!(status, Some(403) | Some(404))
             {
+                warn!(space, member, ?status, "Google Chat: removing inaccessible app from space roster");
                 crate::agent_channels::gchat_spaces::forget(home_dir, space, member);
             }
-            return Err("Google Chat send failed".into());
+            return Err(match status {
+                Some(status) => GoogleChatSendError::Http { status },
+                None => GoogleChatSendError::Transport,
+            });
         }
     }
     Ok(())
@@ -1065,11 +1326,7 @@ async fn post_message(
             .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))),
         Ok(resp) => {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!(
-                "Google Chat send failed ({status}): {}",
-                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
-            );
+            warn!(status = status.as_u16(), "Google Chat send failed");
             Err(Some(status.as_u16()))
         }
         Err(e) => {
@@ -1190,7 +1447,6 @@ async fn download_media(creds: &GoogleChatCreds, resource_name: &str) -> Result<
     let url = media_download_url(&creds.api_base(), resource_name);
     let bearer = format!("Bearer {token}");
     crate::media::download_url(
-        &creds.http,
         &url,
         Some(("Authorization", &bearer)),
         crate::media::MAX_FILE_SIZE as usize,
@@ -1199,35 +1455,20 @@ async fn download_media(creds: &GoogleChatCreds, resource_name: &str) -> Result<
 }
 
 /// spaces.messages.patch — edit a message's text in place.
-async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str) -> bool {
-    let token = match creds.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Google Chat token error: {e}");
-            return false;
-        }
-    };
+async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str) -> Result<(), PatchFailure> {
+    let token = creds.get_token().await.map_err(|_| PatchFailure {
+        status: None, retry_after: std::time::Duration::from_secs(1),
+    })?;
     let url = format!("{}/{message_name}?updateMask=text", creds.api_base());
     let body = serde_json::json!({ "text": text });
-    match creds
-        .http
-        .patch(&url)
-        .bearer_auth(&token)
-        .json(&body)
-        .send_authorized()
-        .await
-    {
-        Ok(resp) if !resp.status().is_success() => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(
-                "Google Chat update failed ({status}): {}",
-                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
-            );
-            false
+    match creds.http.patch(&url).bearer_auth(&token).json(&body).send_authorized().await {
+        Ok(resp) if resp.status().is_success() => Ok(()),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let retry_after = patch_backoff(status, resp.headers().get("Retry-After").and_then(|v| v.to_str().ok()));
+            Err(PatchFailure { status: Some(status), retry_after })
         }
-        Err(e) => { warn!("Google Chat update error: {e}"); false },
-        _ => true
+        Err(_) => Err(PatchFailure { status: None, retry_after: std::time::Duration::from_secs(1) }),
     }
 }
 
@@ -1271,6 +1512,40 @@ pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drive_attachment_note_only_includes_valid_bounded_id() {
+        assert!(drive_attachment_note("report", "Abc_123-xyz").contains("driveFileId: Abc_123-xyz"));
+        assert!(drive_attachment_note("report", "Abc_123-xyz").contains("drive_read"));
+        for id in ["", "abc\ninstructions", "../secret", "abc?x=y", "中文", &"a".repeat(257)] {
+            let note = drive_attachment_note("report", id);
+            assert!(!note.contains("driveFileId:"), "{note}");
+            assert!(!note.contains("scope not granted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn proactive_rejects_invalid_target_before_credentials_or_network() {
+        let home = tempfile::tempdir().unwrap();
+        for target in ["users/123", "a@example.com", "spaces/a/messages", "spaces/a?x=y", "spaces/..", "spaces/a\n", "spaces/中文"] {
+            assert_eq!(send_text_to_space_as(home.path(), None, target, "hello").await,
+                Err(GoogleChatSendError::InvalidTarget));
+        }
+    }
+
+    #[test]
+    fn proactive_errors_explain_membership_and_temporary_failures() {
+        for status in [403, 404] {
+            let error = GoogleChatSendError::Http { status };
+            assert!(error.to_string().contains("請對方先私訊此應用程式一次"));
+            assert_eq!(error, GoogleChatSendError::Http { status });
+        }
+        for status in [429, 500, 502, 503, 599] {
+            assert!(GoogleChatSendError::Http { status }.to_string().contains("稍後重試"));
+        }
+        assert!(!GoogleChatSendError::Http { status: 400 }.to_string().contains("尚未"));
+    }
+
     #[test]
     fn googlechat_dedupe_only_records_accepted_messages() {
         let key = format!("test:{}", uuid::Uuid::new_v4());
@@ -1528,5 +1803,197 @@ mod ccr_principal_tests {
             source_acl_for_principal(AGENT, SESSION, alice).unwrap(),
             source_acl_for_principal(AGENT, SESSION, bob).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "googlechat_command_access_tests.rs"]
+mod command_access_tests;
+
+#[cfg(test)]
+mod access_notice_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_state(home: &Path) -> Arc<GoogleChatState> {
+        let registry = Arc::new(RwLock::new(duduclaw_agent::AgentRegistry::new(home.join("agents"))));
+        let sessions = Arc::new(crate::session::SessionManager::new(&home.join("sessions.db")).unwrap());
+        let status: crate::channel_reply::ChannelStatusMap =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let ctx = Arc::new(ReplyContext::new(registry, home.to_path_buf(), sessions, status, tx));
+        // A candidate key never signs, so the spawned notice fails locally
+        // without any network access.
+        let creds = GoogleChatCreds::candidate(
+            r#"{"client_email":"queue-test@example.invalid","private_key":"not-a-key"}"#,
+        )
+        .unwrap();
+        Arc::new(GoogleChatState { ctx, creds: Arc::new(creds), agent: None })
+    }
+
+    #[test]
+    fn only_a_single_user_dm_is_one_to_one() {
+        use crate::googlechat_space_kind::{SpaceKind, carried_space, classify_space};
+        let msg = |space: serde_json::Value| json!({ "space": space });
+        let none = json!({});
+        let kind = |m: &serde_json::Value, e: &serde_json::Value| classify_space(&carried_space(m, e));
+        assert_eq!(kind(&msg(json!({"type":"DM","singleUserBotDm":true})), &none), SpaceKind::OneToOneDm);
+        // The event-level space is consulted when the message lacks it.
+        assert_eq!(
+            kind(&json!({}), &json!({"space":{"spaceType":"DIRECT_MESSAGE","singleUserBotDm":true}})),
+            SpaceKind::OneToOneDm
+        );
+        for space in [
+            json!({"type":"ROOM"}),
+            json!({"type":"SPACE"}),
+            json!({"spaceType":"GROUP_CHAT"}),
+            json!({"spaceType":"SPACE","type":"DM"}),
+            json!({"type":"DM","singleUserBotDm":false}),
+        ] {
+            assert_eq!(kind(&msg(space.clone()), &none), SpaceKind::Shared, "{space}");
+        }
+        // Not stated → resolved by spaces.get (googlechat_space_kind tests).
+        for space in [json!({"spaceType":"DIRECT_MESSAGE"}), json!({"type":"DM"}), json!({"name":"spaces/A"})] {
+            assert_eq!(kind(&msg(space.clone()), &none), SpaceKind::Unknown, "{space}");
+        }
+    }
+
+    #[test]
+    fn command_space_type_uses_the_resolver() {
+        // Structural: the command intercept takes `shared` from the resolver
+        // (event fields, then spaces.get), on both transports.
+        let src = include_str!("googlechat.rs");
+        let resolve = src.find("crate::googlechat_space_kind::is_one_to_one(").unwrap();
+        let origin = src.find("shared: !one_to_one,").unwrap();
+        assert!(resolve < origin);
+        let pubsub = include_str!("googlechat_pubsub.rs");
+        assert!(pubsub.contains("crate::googlechat::process_pubsub_event(&st, &event)"));
+    }
+
+    #[test]
+    fn queue_keys_match_both_transports() {
+        let (group, conversation) = queue_keys(Some("sales"), "spaces/A", "users/x");
+        let agent: Option<String> = Some("sales".into());
+        assert_eq!(group, json!([agent, "spaces/A"]).to_string());
+        assert_eq!(conversation, json!([agent, "spaces/A", "users/x"]).to_string());
+        assert_eq!(queue_keys(None, "spaces/A", "u").0, json!([null, "spaces/A"]).to_string());
+    }
+
+    #[tokio::test]
+    async fn queue_full_notice_is_throttled_per_sender_and_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let (group, alice) = queue_keys(None, "spaces/A", "users/alice");
+        let (_, bob) = queue_keys(None, "spaces/A", "users/bob");
+        let (other_group, carol) = queue_keys(None, "spaces/B", "users/carol");
+        assert!(notify_queue_full(&state, &group, &alice, "spaces/A", None));
+        // Same sender again, and another sender in the same space within 10 s.
+        assert!(!notify_queue_full(&state, &group, &alice, "spaces/A", None));
+        assert!(!notify_queue_full(&state, &group, &bob, "spaces/A", Some("spaces/A/threads/t")));
+        // Another space is throttled separately.
+        assert!(notify_queue_full(&state, &other_group, &carol, "spaces/B", None));
+    }
+
+    #[test]
+    fn pubsub_queue_full_uses_the_shared_notice() {
+        let src = include_str!("googlechat_pubsub.rs");
+        assert!(src.contains("crate::googlechat::notify_queue_full(state, &group, &conversation"));
+        assert!(src.contains("crate::googlechat::queue_keys("));
+    }
+
+    #[test]
+    fn failed_final_delivery_is_recorded_without_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DeliveryTarget { home: dir.path(), space: "spaces/A", agent: Some("sales") };
+        report_delivery(target, Ok(()));
+        assert!(!dir.path().join("channel_failures.jsonl").exists());
+        report_delivery(target, Err(Some(403)));
+        report_delivery(DeliveryTarget { agent: None, ..target }, Err(None));
+        let raw = std::fs::read_to_string(dir.path().join("channel_failures.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> =
+            raw.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event"], SEND_FAILED_EVENT);
+        assert_eq!(lines[0]["channel"], "googlechat");
+        assert_eq!(lines[0]["status"], 403);
+        assert_eq!(lines[0]["agent"], "sales");
+        assert!(lines[1].get("agent").is_none());
+        assert!(lines[1]["status"].is_null());
+        for line in &lines {
+            for key in ["text", "reply", "message", "content"] {
+                assert!(line.get(key).is_none(), "{line}");
+            }
+        }
+        assert!(crate::channel_alerts::SEND_FAILURE_EVENTS.contains(&SEND_FAILED_EVENT));
+    }
+
+    #[test]
+    fn commands_run_behind_the_access_gate() {
+        // Structural: the command intercept must run the shared preflight
+        // (access gate + shared-space rule) before any command handler.
+        let src = include_str!("googlechat.rs");
+        let preflight = src.find("chat_commands::command_preflight(&cmd").unwrap();
+        let handler = src.find("chat_commands::handle_command_for_sender(").unwrap();
+        assert!(preflight < handler);
+    }
+}
+
+#[cfg(test)]
+mod delivery_display_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn final_take_waits_for_progress_and_blocks_late_updates() {
+        let slot: Placeholder = Arc::new(tokio::sync::Mutex::new(Some("message".into())));
+        let progress = slot.lock().await;
+        let final_slot = slot.clone();
+        let final_send = tokio::spawn(async move { final_slot.lock().await.take() });
+        tokio::task::yield_now().await;
+        assert!(!final_send.is_finished());
+        drop(progress);
+        assert_eq!(final_send.await.unwrap().as_deref(), Some("message"));
+        assert!(slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_patch_retries_then_posts_and_clears() {
+        let order = std::sync::Mutex::new(Vec::new());
+        let result = replace_placeholder("old", || async {
+            order.lock().unwrap().push("patch");
+            Err(PatchFailure { status: Some(429), retry_after: std::time::Duration::ZERO })
+        }, || async {
+            order.lock().unwrap().push("post");
+            Ok(Some("new".into()))
+        }, || async {
+            order.lock().unwrap().push("clear");
+            Ok(())
+        }).await;
+        assert_eq!(result.unwrap().as_deref(), Some("new"));
+        assert_eq!(*order.lock().unwrap(), ["patch", "patch", "post", "clear"]);
+    }
+
+    #[tokio::test]
+    async fn successful_retry_avoids_duplicate_and_failed_post_is_reported() {
+        let calls = AtomicUsize::new(0);
+        let result = replace_placeholder("old", || async {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(PatchFailure { status: Some(503), retry_after: std::time::Duration::ZERO })
+            } else { Ok(()) }
+        }, || async { panic!("must not post after successful PATCH") },
+        || async { panic!("must not clear after successful PATCH") }).await;
+        assert_eq!(result.unwrap().as_deref(), Some("old"));
+        let result = replace_placeholder("old", || async {
+            Err(PatchFailure { status: Some(500), retry_after: std::time::Duration::ZERO })
+        }, || async { Err(Some(403)) }, || async { Ok(()) }).await;
+        assert_eq!(result, Err(Some(403)));
+    }
+
+    #[test]
+    fn retry_after_is_bounded() {
+        assert_eq!(patch_backoff(429, Some("60")).as_secs(), 3);
+        assert_eq!(patch_backoff(429, Some("2")).as_secs(), 2);
+        assert_eq!(patch_backoff(429, Some("invalid")).as_secs(), 1);
+        assert_eq!(patch_backoff(503, Some("60")).as_secs(), 1);
     }
 }

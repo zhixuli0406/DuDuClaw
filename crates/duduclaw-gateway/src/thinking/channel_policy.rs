@@ -17,6 +17,7 @@
 //!   the timer only), whatever the sender.
 //! - The stricter of `[thinking] display` and the answering employee's
 //!   `[model] show_thinking` caps all of it.
+//! - Google Chat only shows a duration to internal senders; no summaries.
 //! - Public visitors (Odoo Live Chat, the WebChat widget) never get a
 //!   thinking sink at all, so nothing here applies to them.
 //!
@@ -142,7 +143,9 @@ pub fn channel_show(
 /// that is an Admin or is bound to this very employee (the same binding the
 /// dashboard's agent ACL uses). Read live from `users.db` (no cache), so a
 /// revoked binding takes effect on the next message. Any lookup failure ⇒
-/// `false`.
+/// `false`. The read is read-only (never creates `users.db`, never takes its
+/// write reservation) but blocking: async code uses
+/// [`sender_is_internal_async`].
 pub fn sender_is_internal(
     home: &Path,
     channel: &str,
@@ -160,6 +163,38 @@ pub fn sender_is_internal(
         Sender::Account { access, .. } => access.direct.contains_key(agent_id),
         Sender::Unmapped => false,
     }
+}
+
+/// [`sender_is_internal`] on the blocking pool, for async callers (a reply
+/// path must not run the SQLite read on an async worker). A failed blocking
+/// task ⇒ `false`.
+pub async fn sender_is_internal_async(
+    home: &Path,
+    channel: &str,
+    channel_user_id: &str,
+    agent_id: &str,
+) -> bool {
+    let (home, channel, channel_user_id, agent_id) =
+        (home.to_path_buf(), channel.to_string(), channel_user_id.to_string(), agent_id.to_string());
+    tokio::task::spawn_blocking(move || sender_is_internal(&home, &channel, &channel_user_id, &agent_id))
+        .await
+        .unwrap_or(false)
+}
+
+/// [`resolve_channel`] on the blocking pool, for async callers. A failed
+/// blocking task ⇒ `Off`.
+pub async fn resolve_channel_async(
+    home: &Path,
+    agent_id: &str,
+    channel: &str,
+    channel_user_id: &str,
+    is_group: bool,
+) -> ShowThinking {
+    let (home, agent_id, channel, channel_user_id) =
+        (home.to_path_buf(), agent_id.to_string(), channel.to_string(), channel_user_id.to_string());
+    tokio::task::spawn_blocking(move || resolve_channel(&home, &agent_id, &channel, &channel_user_id, is_group))
+        .await
+        .unwrap_or(ShowThinking::Off)
 }
 
 /// Resolve one turn for the employee `agent_id`: both config layers, the
@@ -183,7 +218,24 @@ pub fn resolve_channel(
         super::policy::agent_ceiling(&home.join("agents").join(agent_id))
     };
     let internal = sender_is_internal(home, channel, channel_user_id, agent_id);
-    channel_show(&cfg, internal, is_group, global, agent)
+    let show = channel_show(&cfg, internal, is_group, global, agent);
+    // Chat has no separate thinking surface: only staff may see a duration.
+    if channel == "googlechat" { googlechat_show(show, internal) } else { show }
+}
+
+fn googlechat_show(show: ShowThinking, internal: bool) -> ShowThinking {
+    if !internal || show == ShowThinking::Off { ShowThinking::Off } else { ShowThinking::Status }
+}
+
+#[cfg(test)]
+mod googlechat_audience_tests {
+    use super::*;
+    #[test]
+    fn chat_never_exposes_summary_even_with_everyone_audience() {
+        assert_eq!(googlechat_show(ShowThinking::Summary, false), ShowThinking::Off);
+        assert_eq!(googlechat_show(ShowThinking::Summary, true), ShowThinking::Status);
+        assert_eq!(googlechat_show(ShowThinking::Off, true), ShowThinking::Off);
+    }
 }
 
 /// Feishu, for thinking display: fail closed — only an explicit 1:1 chat
@@ -321,5 +373,35 @@ mod tests {
         assert_eq!(resolve_channel(h, "sales", "telegram", "42", true), Status);
         std::fs::write(h.join("agents/sales/agent.toml"), "[model]\nshow_thinking = \"off\"\n").unwrap();
         assert_eq!(resolve_channel(h, "sales", "telegram", "42", false), Off);
+    }
+
+    /// The per-message sender lookup only reads: a missing store stays
+    /// missing, and another writer holding users.db's write reservation (a
+    /// second process, an ACL write, a delivery fence) does not delay it.
+    #[tokio::test]
+    async fn sender_lookup_never_creates_the_store_or_waits_for_its_writer() {
+        use crate::trigger_route::access::{Sender, lookup_channel_sender};
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        assert!(!sender_is_internal(h, "telegram", "7", "finance"));
+        assert!(!sender_is_internal_async(h, "telegram", "7", "finance").await);
+        assert!(matches!(lookup_channel_sender(h, "telegram", "7").sender, Sender::Unmapped));
+        assert!(!h.join("users.db").exists(), "a lookup must never create the account database");
+        let db = duduclaw_auth::UserDb::new(&h.join("users.db")).unwrap();
+        let emp = db
+            .create_user("emp@test.local", "Emp", "EmpPass-12345", duduclaw_auth::UserRole::Employee)
+            .unwrap();
+        db.bind_agent(&emp.id, "finance", duduclaw_auth::AccessLevel::Operator).unwrap();
+        db.bind_channel_identity(&emp.id, "telegram", "7", true).unwrap();
+        let hold = rusqlite::Connection::open(h.join("users.db")).unwrap();
+        hold.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        assert!(sender_is_internal(h, "telegram", "7", "finance"));
+        assert!(!sender_is_internal(h, "telegram", "7", "sales"));
+        assert!(sender_is_internal_async(h, "telegram", "7", "finance").await);
+        assert!(matches!(lookup_channel_sender(h, "telegram", "7").sender, Sender::Account { .. }));
+        let elapsed = started.elapsed();
+        hold.execute_batch("ROLLBACK").unwrap();
+        assert!(elapsed < std::time::Duration::from_secs(1), "lookups waited {elapsed:?} for the writer");
     }
 }

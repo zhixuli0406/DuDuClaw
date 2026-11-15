@@ -5,6 +5,8 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { UsersPage } from './UsersPage';
 import { EditUserDialog } from './users/UserFormDialogs';
+import { IdentityChips } from './users/UserRowParts';
+import type { ChannelIdentity } from '@/lib/channel-identity-api';
 import type { UserDetail } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -205,6 +207,31 @@ describe('UsersPage — invitation eligibility', () => {
     } finally {
       useAuthStore.setState({ user: previousUser });
     }
+  });
+});
+
+describe('IdentityChips — Google Chat (RM-152)', () => {
+  const identities: ChannelIdentity[] = [
+    { user_id: 'u', channel: 'telegram', channel_user_id: '42', verified: true, created_at: '' },
+    { user_id: 'u', channel: 'googlechat', channel_user_id: 'users/1', verified: true, created_at: '' },
+    { user_id: 'u', channel: 'googlechat', channel_user_id: 'users/2', verified: true, created_at: '', source: 'google_account' },
+  ];
+
+  it('removes only an administrator Google Chat binding; the Google-account one is read-only', async () => {
+    const user = userEvent.setup();
+    const onRemove = vi.fn();
+    renderWithProviders(<IdentityChips state={identities} onAdd={vi.fn()} onRemove={onRemove} />);
+    const remove = screen.getAllByRole('button', { name: /^Remove binding/ });
+    expect(remove).toHaveLength(1);
+    await user.click(remove[0]);
+    expect(onRemove).toHaveBeenCalledWith(identities[1]);
+    expect(screen.getByText('Google Chat · users/2')).toBeInTheDocument();
+    expect(screen.getByText('Telegram · 42')).toBeInTheDocument();
+  });
+
+  it('offers no removal without an admin handler', () => {
+    renderWithProviders(<IdentityChips state={identities} onAdd={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: /^Remove binding/ })).not.toBeInTheDocument();
   });
 });
 

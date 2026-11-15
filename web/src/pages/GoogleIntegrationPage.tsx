@@ -77,6 +77,7 @@ export function GoogleIntegrationPage() {
   // off when it is on.
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [chatRead, setChatRead] = useState<boolean | null>(null);
+  const [chatIdentity, setChatIdentity] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [advanced, setAdvanced] = useState(false);
@@ -87,9 +88,11 @@ export function GoogleIntegrationPage() {
       const status = await api.googleCredentials.get();
       setEnabled(status.integration_enabled);
       setChatRead(status.chat_read === true);
+      setChatIdentity(status.chat_identity_from_account === true);
     } catch {
       setEnabled(null);
       setChatRead(null);
+      setChatIdentity(null);
     }
   }, []);
 
@@ -177,6 +180,20 @@ export function GoogleIntegrationPage() {
         </label>
         <p className="text-sm text-muted-foreground">{t('google.chatRead.hint', '開啟後，請使用者到「我的連線」重新連結 Google，並勾選 Chat 權限。AI 員工可讀取該帳號加入的聊天室與最近訊息；不會傳送訊息或下載附件。')}</p>
         <p className="text-sm text-muted-foreground">{t('google.chatRead.setup', 'OAuth 用戶端所屬的 Google Cloud 專案須啟用 Google Chat API 並完成 Chat 應用程式設定；Workspace 管理員可能還須允許此應用程式。')}</p>
+      </CardContent></Card>}
+
+      {admin && chatIdentity !== null && <Card data-testid="google-chat-identity"><CardContent className="space-y-3 py-4">
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input type="checkbox" checked={chatIdentity} disabled={busy} onChange={event => {
+            const next = event.target.checked;
+            setBusy(true);
+            void api.googleCredentials.setChatIdentityFromAccount(next).then(result => setChatIdentity(result.chat_identity_from_account))
+              .catch(error => toast.error(formatError(error))).finally(() => setBusy(false));
+          }} />
+          {t('google.chatIdentity.title', '用連結的 Google 帳號認出 Google Chat 傳訊者')}
+        </label>
+        <p className="text-sm text-muted-foreground">{t('google.chatIdentity.hint', '關閉時（預設），只有管理員在「成員管理」手動綁定的 Google Chat 使用者會被認出是同仁。')}</p>
+        <p className="flex items-start gap-2 text-sm text-warning"><AlertTriangle className="mt-0.5 size-4 shrink-0" />{t('google.chatIdentity.risk', '尚未以真實 Google Workspace 驗證；開啟後，系統會把 Chat 傳訊者的代號與同仁連結的 Google 帳號代號比對，相同就視為本人。')}</p>
       </CardContent></Card>}
 
       {advanced && <div id="google-advanced-settings" className="space-y-4">

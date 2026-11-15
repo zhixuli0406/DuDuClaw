@@ -4,6 +4,101 @@ use super::*;
 pub(crate) const SELECTED_AGENT_UNAVAILABLE: &str =
     "⚠️ 指定的 AI 員工目前無法使用，請檢查頻道設定或重新選擇。";
 
+/// No employee answers this channel conversation (no channel binding, no
+/// `default_agent`, no main employee, nobody called by `@`). Staff-facing.
+pub(crate) const NO_RESPONDER_TEXT: &str = "尚未設定負責回覆的 AI 員工，請管理員完成設定。";
+
+/// What a public visitor (website widget, Odoo Live Chat, unknown origin)
+/// sees when no employee answers: no operator-facing wording. Language is the
+/// global `[general] default_language` (no employee to take it from).
+pub(crate) fn no_responder_public_text(language: Option<&str>) -> &'static str {
+    let language = language.unwrap_or("zh-TW");
+    let primary = language.split(['-', '_']).next().unwrap_or("");
+    match (primary, language) {
+        (_, "zh-CN" | "zh_CN") => "目前无法提供服务，请稍后再试。",
+        ("en", _) => "This service is not available right now. Please try again later.",
+        ("ja", _) => "現在サービスをご利用いただけません。しばらくしてからもう一度お試しください。",
+        _ => "目前無法提供服務，請稍後再試。",
+    }
+}
+
+/// Fixed channel label for the no-responder log line (never the user or the
+/// conversation id). Unknown session shapes are "unknown".
+fn no_responder_channel(session_id: &str) -> &'static str {
+    if crate::odoo_livechat::is_public_visitor_session(session_id) {
+        return crate::odoo_livechat::SESSION_PREFIX;
+    }
+    if session_id
+        .split_once(':')
+        .is_some_and(|(kind, id)| kind == "widget-visitor" && !id.is_empty())
+    {
+        return "widget-visitor";
+    }
+    crate::trajectory_guard::channel_from_session_id(session_id).unwrap_or("unknown")
+}
+
+/// Whether the no-responder setup sentence may be shown: only to a requester
+/// the host verified as internal — an authenticated dashboard account on
+/// WebChat, or a messaging sender whose verified channel identity maps to an
+/// active company account (the lookup `sender_is_internal_for_reply` uses;
+/// with no employee there is no per-employee binding to require). Anything
+/// that cannot be decided gets the neutral line.
+fn no_responder_requester_is_internal(home: &Path, session_id: &str, user_id: &str) -> bool {
+    if super::assembly::public_session(session_id) {
+        return false;
+    }
+    if let Ok(principal) = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone) {
+        return !principal.is_empty() && !crate::webchat::is_widget_visitor(&principal);
+    }
+    if user_id.is_empty() || !footer_applies_to_session(session_id) {
+        return false;
+    }
+    crate::trajectory_guard::channel_from_session_id(session_id).is_some_and(|channel| {
+        !matches!(
+            crate::trigger_route::access::lookup_channel_sender(home, channel, user_id).sender,
+            crate::trigger_route::access::Sender::Unmapped
+        )
+    })
+}
+
+/// The fixed no-responder notices (both wordings, every language). Nothing
+/// else may take the live-only delivery path.
+pub(crate) fn is_no_responder_notice(text: &str) -> bool {
+    text == NO_RESPONDER_TEXT
+        || ["zh-TW", "zh-CN", "en", "ja"]
+            .into_iter()
+            .any(|language| text == no_responder_public_text(Some(language)))
+}
+
+/// One warn per channel per window: a public widget can be hit repeatedly.
+fn warn_no_responder(channel: &'static str) {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let now = std::time::Instant::now();
+    let due = {
+        let mut last = LAST
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let due = last
+            .get(channel)
+            .is_none_or(|at| now.duration_since(*at) >= WINDOW);
+        if due {
+            last.insert(channel, now);
+        }
+        due
+    };
+    if due {
+        warn!(
+            channel,
+            "no AI employee resolves for this channel reply — answered without a model call; \
+             set a main employee, `[general] default_agent`, or a channel binding"
+        );
+    }
+}
+
 /// Inner implementation shared by both default-agent and explicit-agent paths.
 ///
 /// Some(name) must resolve exactly; a missing explicit target is refused.
@@ -27,6 +122,21 @@ pub(crate) const SELECTED_AGENT_UNAVAILABLE: &str =
     )
 )]
 pub(super) async fn build_reply_with_session_inner(
+    text: &str,
+    ctx: &ReplyContext,
+    agent_override: Option<&str>,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    // Keep the instrumented future small even for callers that bypass the
+    // guarded entry points: debug task-local poll frames copy their futures.
+    Box::pin(build_reply_with_session_inner_impl(
+        text, ctx, agent_override, session_id, user_id, on_progress,
+    )).await
+}
+
+async fn build_reply_with_session_inner_impl(
     text: &str,
     ctx: &ReplyContext,
     agent_override: Option<&str>,
@@ -228,6 +338,23 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
     };
+    // Nobody answers: this used to run the turn with an empty agent id (the
+    // default model, full tools, no employee's instructions, MCP config,
+    // file guard or cwd). Refuse on every session, without a model call; the
+    // access gate, takeover and `@` routing ran above. No session exists, so
+    // the fixed notice is delivered live only and never stored. Everyone gets
+    // the neutral line; only a requester the host verified as internal gets
+    // the setup sentence.
+    if agent.is_none() {
+        let channel = no_responder_channel(session_id);
+        warn_no_responder(channel);
+        super::mark_no_responder_notice();
+        if no_responder_requester_is_internal(&ctx.home_dir, session_id, user_id) {
+            return NO_RESPONDER_TEXT.into();
+        }
+        let language = crate::prompt_identity::read_default_language(&ctx.home_dir).await;
+        return no_responder_public_text(language.as_deref()).into();
+    }
     if let Some(a) = agent {
         // Revalidate the actual LoadedAgent, not the earlier selected name.
         // The authenticated account is host-owned task-local state; a model
@@ -320,6 +447,11 @@ pub(super) async fn build_reply_with_session_inner(
     let agent_id = agent
         .map(|a| a.config.agent.name.clone())
         .unwrap_or_default();
+
+    let internal_sender = sender_is_internal_for_reply(&ctx.home_dir, session_id, user_id, &agent_id);
+    let on_progress = on_progress.map(|callback| -> ProgressCallback {
+        Box::new(move |event| callback(event.for_sender(internal_sender)))
+    });
 
     // ── Goal intent router (P0, `goal_intent.rs`) ──────────────────────
     // Placed after the access gate and takeover interception above (never
@@ -997,21 +1129,48 @@ pub(super) async fn build_reply_with_session_inner(
     };
 
     // Append user message to session using improved CJK-aware token estimate
-    let user_tokens = estimate_tokens(&sanitized_text);
     let client_msg_id = super::WEBCHAT_TURN_DELIVERY.try_with(|turn| turn.client_msg_id.clone()).ok();
-    let user_message_id = match session_mgr
-        .append_delivery_message_in(
-            session_id, "user", &sanitized_text, user_tokens, client_msg_id.as_deref(), false,
+    let originals = super::WEBCHAT_ORIGINAL_MESSAGES.try_with(Clone::clone).unwrap_or_default();
+    let merged_dispatch = !originals.is_empty();
+    let mut history_rows = Vec::new();
+    for (msg_id, original) in originals {
+        let credential_text = crate::credential_ledger::process_message(
+            &ctx.home_dir, &original, &credential_source, &credential_sender, &agent_id, "chat",
+        ).await;
+        let original = match crate::redaction_sources::redact_text(
+            ctx.redaction_manager.as_ref(), &agent_id, Some(session_id), &credential_text,
+            &duduclaw_redaction::Source::UserChannelInput {
+                channel_id: session_id.split(':').next().unwrap_or("").to_string(),
+            },
+        ) {
+            Ok(text) => text,
+            Err(_) => return REDACTION_FAILED_REPLY.to_string(),
+        };
+        let original = if original.starts_with("assistant:") || original.starts_with("system:") {
+            format!("[user input] {original}")
+        } else { original };
+        let original = if user_id != "anonymous" && !user_id.is_empty() {
+            format!("{SENDER_PREFIX_OPEN}{user_id}]\n{original}")
+        } else { original };
+        history_rows.push((Some(msg_id), original));
+    }
+    if history_rows.is_empty() { history_rows.push((client_msg_id, sanitized_text.clone())); }
+    let mut user_message_id = None;
+    for (msg_id, row) in history_rows {
+        match session_mgr.append_delivery_message_in(
+            session_id, "user", &row, estimate_tokens(&row), msg_id.as_deref(), false,
             turn_generation.as_deref(),
-        )
-        .await
-    {
-        Ok(id) => Some(id),
-        Err(e) => {
-            warn!("Failed to save user message to session: {e}");
-            None
+        ).await {
+            Ok(id) => {
+                if user_message_id.is_none() { user_message_id = Some(id); }
+                crate::credential_ledger::bind_message(&ctx.home_dir, &credential_source, session_id, id);
+            }
+            Err(e) => {
+                warn!("Failed to save user message to session: {e}");
+                if merged_dispatch { return "Unable to save this message. Please try again.".to_string(); }
+            }
         }
-    };
+    }
     if let Some(id) = user_message_id {
         if let Some(generation) = turn_generation.as_deref() {
             super::bind_failure_session(session_id, generation, &agent_id);
@@ -1043,11 +1202,7 @@ pub(super) async fn build_reply_with_session_inner(
     // stored by SessionManager::compress(). They belong in the system prompt,
     // not in the conversation turns (Anthropic Messages API rejects them).
     //
-    // #13 glue (2026-05-12): when the async summarizer task has folded
-    // older turns into `summary_of_prior`, prepend the summary as a
-    // synthetic `assistant` recap turn and skip the verbatim slice it
-    // covers. Falls through to verbatim history when no summary exists
-    // (summarizer hasn't run yet, or session is below the threshold).
+    // Async summaries belong in system context, never a forged assistant turn.
     let max_history_turns = 20;
     let compression_summary = session_mgr.compression_summary(session_id).await.unwrap_or_default();
     let (async_summary, summarized_through) = session_mgr
@@ -1057,21 +1212,9 @@ pub(super) async fn build_reply_with_session_inner(
     let conversation_history: Vec<ConversationTurn> =
         match session_mgr.get_messages(session_id).await {
             Ok(msgs) => {
-                // Optional prefix when the summarizer task has run for this
-                // session. Encoded as a single assistant-role turn so the
-                // Messages API doesn't reject it (no `system` role in turns).
                 let mut out: Vec<ConversationTurn> = Vec::new();
-                if !async_summary.trim().is_empty() {
-                    out.push(ConversationTurn {
-                        role: "assistant".to_string(),
-                        content: format!(
-                            "[summary of earlier turns 1..={summarized_through}]\n{async_summary}"
-                        ),
-                    });
-                }
-
                 // Verbatim slice: skip the first `summarized_through` turns
-                // (already captured in the prefix) and the LAST turn (which
+                // (already captured in system context) and the LAST turn (which
                 // is the user message about to be re-sent below). The +1
                 // index skip is intentional — we want messages.len() - 1
                 // minus the summarized prefix.
@@ -1079,6 +1222,7 @@ pub(super) async fn build_reply_with_session_inner(
                 let prior_full: Vec<_> = msgs
                     .iter()
                     .take(msgs.len().saturating_sub(1))
+                    .skip(summarized_through_usize)
                     .filter_map(|m| {
                         if m.role == "system" {
                             None
@@ -1090,20 +1234,7 @@ pub(super) async fn build_reply_with_session_inner(
                         }
                     })
                     .collect();
-                // Trim already-summarized turns (best-effort: the count we
-                // skip is approximate because the summarizer indexes raw
-                // messages, including potential hidden ones — but trimming
-                // a bit conservatively is fine, the model sees the summary
-                // either way).
-                let prior: Vec<_> = if summarized_through_usize > 0
-                    && prior_full.len() > summarized_through_usize
-                {
-                    prior_full[summarized_through_usize..].to_vec()
-                } else if summarized_through_usize >= prior_full.len() {
-                    Vec::new()
-                } else {
-                    prior_full
-                };
+                let prior = prior_full;
 
                 // Keep only the most recent turns to prevent token overflow
                 let trimmed = if prior.len() > max_history_turns {
@@ -1119,6 +1250,7 @@ pub(super) async fn build_reply_with_session_inner(
                 vec![]
             }
         };
+    let conversation_history = crate::runtime::cap_conversation_history(&conversation_history);
     let has_history = !conversation_history.is_empty();
 
     // ── Instruction Pinning: load + accumulate ──
@@ -1455,8 +1587,11 @@ pub(super) async fn build_reply_with_session_inner(
             prompt = format!("{prompt}\n\n{hint}");
         }
 
-        if !compression_summary.is_empty() {
-            prompt = format!("{prompt}\n\n## Prior Conversation Summary\n{compression_summary}");
+        for summary in [&compression_summary, &async_summary] {
+            if !summary.trim().is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&crate::session_summarizer::summary_system_context(summary));
+            }
         }
         if !pinned.is_empty() {
             prompt = format!(
@@ -1569,7 +1704,7 @@ pub(super) async fn build_reply_with_session_inner(
     let _knowledge_ledger = crate::knowledge::ledger::open(&agent_id, &turn_id);
     let turn_knowledge = match agent_dir.as_ref() {
         Some(dir) => {
-            crate::knowledge::auto_retrieve::prepare(crate::knowledge::auto_retrieve::TurnInput {
+            Box::pin(crate::knowledge::auto_retrieve::prepare(crate::knowledge::auto_retrieve::TurnInput {
                 home: ctx.home_dir.clone(),
                 users: None,
                 agent_id: agent_id.clone(),
@@ -1577,7 +1712,7 @@ pub(super) async fn build_reply_with_session_inner(
                 requester: crate::knowledge::turn_requesters::current_requester(),
                 query: text.to_string(),
                 turn_id: turn_id.clone(),
-            })
+            }))
             .await
         }
         None => Default::default(),
@@ -1611,13 +1746,22 @@ pub(super) async fn build_reply_with_session_inner(
     } else {
         format!("<task_recap>\n{pinned}\n</task_recap>\n\n{user_part}")
     };
-    // End-of-turn language reminder (only when a non-auto language is pinned):
+    // End-of-turn language reminder, including user-language matching for auto:
     // long English tool/wiki output must not drag the reply out of the
     // chosen language. Same user-side tail as the recap; one short line.
-    let effective_message = crate::prompt_identity::with_reply_language_reminder(
+    let effective_message = crate::prompt_identity::with_channel_reply_language_reminder(
         effective_message,
         default_language.as_deref(),
     );
+
+    let effective_message = super::prompt_build::with_file_delivery_reminder(
+        effective_message,
+        session_id.split(':').next().unwrap_or("unknown"),
+    );
+    let in_chat_approval = crate::approval::CURRENT_TRUSTED_REPLY_TARGET
+        .try_with(|target| target.is_some()).unwrap_or(false);
+    let effective_message = crate::pending_items::with_reminder(effective_message,
+        crate::pending_items::reminder(&ctx.home_dir, session_id, user_id, &agent_id, in_chat_approval));
 
     // #12 glue (2026-05-12) — request-boundary budget enforcement.
     //
@@ -1626,18 +1770,16 @@ pub(super) async fn build_reply_with_session_inner(
     // the compression pipeline on `conversation_history`. The
     // `cost_pressure` flag from #6.3 makes early stages more aggressive.
     //
-    // Failure mode is intentionally NON-fatal: if the pipeline can't
-    // bring us under budget, we log a warn + emit an evolution event
-    // and proceed with the full history. Rejecting the request would
-    // surprise the user with a silent failure mid-conversation; the
-    // 200 K cliff merely doubles input price, it doesn't break the
-    // call. Future work can flip this to hard-reject behind a flag.
-    let (conversation_history, compression_info) = maybe_compress_history(
-        &full_system_prompt,
+    // Compression failure is non-fatal; the provider-independent history
+    // byte ceiling still applies, including throughout summary back-off.
+    let mut full_system_prompt = full_system_prompt;
+    let (conversation_history, compression_info) = Box::pin(maybe_compress_history(
+        &mut full_system_prompt,
         conversation_history,
         &effective_message,
         &agent_id,
-    )
+        session_id,
+    ))
     .await;
 
     // RFC-25 Phase 1 (L8): provider-agnostic routing via the centralized
@@ -1684,9 +1826,12 @@ pub(super) async fn build_reply_with_session_inner(
         runtime_settings.as_ref().map(|s| s.provider.as_str()).unwrap_or("claude"),
     );
 
-    let cli_future: std::pin::Pin<
+    let reply_assembly = super::assembly::Assembly::new(
+        session_id, &ctx.home_dir, agent_dir.as_deref(), &agent_id,
+    );
+    let make_cli_future = || -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ReplyAttempt, ReplyFailure>> + Send + '_>,
-    > = if duduclaw_llm::is_moa_model_id(&model) {
+    > { if duduclaw_llm::is_moa_model_id(&model) {
         // MoA virtual model (`moa:<name>`) — API-mode only. A CLI spawn can
         // never serve an ensemble (and `claude -p --model moa:x` would just
         // 404 upstream), so route straight through the duduclaw-llm MoA
@@ -1749,7 +1894,7 @@ pub(super) async fn build_reply_with_session_inner(
         let hb_session_id = session_id;
         Box::pin(async move {
             let work =
-                crate::runtime_dispatch::run_agent_prompt_detailed(crate::runtime_dispatch::AgentPrompt {
+                Box::pin(crate::runtime_dispatch::run_agent_prompt_detailed(crate::runtime_dispatch::AgentPrompt {
                     agent_dir: hb_agent_dir,
                     home_dir: hb_home,
                     agent_id: hb_agent_id,
@@ -1767,7 +1912,8 @@ pub(super) async fn build_reply_with_session_inner(
                     effort: None,
                     // P0/WP-B: ordinary caller — failover behavior unchanged.
                     allow_cross_family_failover: true,
-                });
+                    purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+                }));
             let work = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), work);
             tokio::pin!(work);
             let mut ticker =
@@ -1824,7 +1970,7 @@ pub(super) async fn build_reply_with_session_inner(
     } else {
         Box::pin(async {
             #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,false);
-            call_claude_cli_rotated(
+            Box::pin(call_claude_cli_rotated(
             &effective_message,
             &model,
             &full_system_prompt,
@@ -1836,11 +1982,14 @@ pub(super) async fn build_reply_with_session_inner(
             &conversation_history,
             &account_pool,
             None,
-        ).await
+            crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+        )).await
             .map(|text| ReplyAttempt::new(text, ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude)))
             .map_err(|error| ReplyFailure::simple(ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude), error))
         })
+    }
     };
+    let cli_future = reply_assembly.run(make_cli_future);
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES
         .iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
@@ -1871,9 +2020,10 @@ pub(super) async fn build_reply_with_session_inner(
     let inference_mode = crate::claude_runner::get_inference_mode(&ctx.home_dir).await;
     let mut local_attempted_first = false;
     let mut local_first_reply: Option<String> = None;
+    let mut local_first_refusal = None;
     if local_inference_first(&inference_mode) {
         local_attempted_first = true;
-        match crate::claude_runner::try_local_inference(
+        match reply_assembly.text(ReplyOrigin::Local, || crate::claude_runner::try_local_inference(
             &ctx.home_dir,
             &sanitized_text,
             &full_system_prompt,
@@ -1881,7 +2031,7 @@ pub(super) async fn build_reply_with_session_inner(
             Some(&agent_id),
             capabilities.as_ref(),
         )
-        .await
+        ).await
         {
             Ok(local_reply) => {
                 info!(
@@ -1896,6 +2046,8 @@ pub(super) async fn build_reply_with_session_inner(
                 );
             }
             Err(e) => {
+                let failure = ReplyFailure::simple(ReplyOrigin::Local, e.clone());
+                if failure.stop_fallbacks() { local_first_refusal = Some(failure); }
                 warn!(
                     "inference_mode=local but local inference failed → falling back to the configured runtime: {e}"
                 );
@@ -1943,7 +2095,7 @@ pub(super) async fn build_reply_with_session_inner(
     // this request's history was compressed and by which stages.
     let cli_future = crate::prompt_compression::CHANNEL_REPLY_COMPRESSION
         .scope(compression_info.clone(), cli_future);
-    let reply = match local_first_reply {
+    let reply = if let Some(refusal) = local_first_refusal { Err(refusal) } else { match local_first_reply {
         // Local-first already answered (inference_mode=local): skip the CLI
         // entirely — the unconsumed cli_future is lazy and simply drops.
         Some(local_reply) => Ok(ReplyAttempt::new(local_reply, ReplyOrigin::Local)),
@@ -1963,7 +2115,7 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
         None => cli_future.await,
-    };
+    } };
     let reply = match reply {
         // Last-line defense: an empty "success" must NOT flow onward — the
         // channels all skip empty sends (user sees nothing) and an empty
@@ -2002,7 +2154,7 @@ pub(super) async fn build_reply_with_session_inner(
     // could not be confirmed. Answering from a local model or the plain
     // Direct API instead would hide that from the person, so skip both
     // fallbacks and show the gate's own sentence (step 3 below).
-    let mcp_gate_refused = last_cli_error.as_ref().and_then(ReplyFailure::spawn_gate_message).is_some();
+    let mut mcp_gate_refused = last_cli_error.as_ref().is_some_and(ReplyFailure::stop_fallbacks);
 
     // 2. Fallback: Local model inference (if configured)
     let reply = match reply {
@@ -2014,7 +2166,7 @@ pub(super) async fn build_reply_with_session_inner(
             None
         }
         None => {
-            match crate::claude_runner::try_local_inference(
+            match reply_assembly.text(ReplyOrigin::Local, || crate::claude_runner::try_local_inference(
                 &ctx.home_dir,
                 &sanitized_text,
                 &full_system_prompt,
@@ -2022,7 +2174,7 @@ pub(super) async fn build_reply_with_session_inner(
                 Some(&agent_id),
                 capabilities.as_ref(),
             )
-            .await
+            ).await
             {
                 Ok(local_reply) if local_reply.trim().is_empty() => {
                     last_cli_error = Some(ReplyFailure::simple(ReplyOrigin::Local, "Empty response".into()));
@@ -2032,9 +2184,15 @@ pub(super) async fn build_reply_with_session_inner(
                     info!("Replied via local model ({} chars)", local_reply.len());
                     let notice = last_cli_error.as_ref().map(ReplyFailure::local_notice)
                         .unwrap_or_else(||"⚠️ 本次由已設定的本地模型代為回應。\n\n".into());
-                    Some(format!("{notice}{local_reply}"))
+                    Some(if super::assembly::public_session(session_id) { local_reply }
+                        else { format!("{notice}{local_reply}") })
                 }
                 Err(e) => {
+                    let failure = ReplyFailure::simple(ReplyOrigin::Local, e.clone());
+                    if failure.stop_fallbacks() {
+                        mcp_gate_refused = true;
+                        last_cli_error = Some(failure);
+                    }
                     if e != "ROUTER_ESCALATE_TO_CLOUD" {
                         warn!("Local inference unavailable: {e}");
                     }
@@ -2073,7 +2231,8 @@ pub(super) async fn build_reply_with_session_inner(
                 .map(|c| c.system_operator)
                 .unwrap_or(false);
             let operator_tool_reply = if is_operator {
-                try_operator_direct_api_tool_loop(
+                reply_assembly.text(ReplyOrigin::AnthropicApi, || async {
+                    try_operator_direct_api_tool_loop(
                     &agent_id,
                     key,
                     &model,
@@ -2081,29 +2240,36 @@ pub(super) async fn build_reply_with_session_inner(
                     &sanitized_text,
                     capabilities.as_ref(),
                 )
-                .await
+                .await.ok_or_else(|| "Operator tool loop unavailable".to_string())
+                }).await
             } else {
-                None
+                Err("Operator tool loop not selected".into())
             };
-            if let Some(text) = operator_tool_reply.filter(|text| !text.trim().is_empty()) {
+            let operator_refusal = operator_tool_reply.as_ref().err()
+                .map(|error| ReplyFailure::simple(ReplyOrigin::AnthropicApi, error.clone()))
+                .filter(ReplyFailure::stop_fallbacks);
+            if let Some(refusal) = operator_refusal {
+                last_cli_error = Some(refusal);
+                None
+            } else if let Some(text) = operator_tool_reply.ok().filter(|text| !text.trim().is_empty()) {
                 Some(text)
             } else {
-                match crate::direct_api::call_direct_api(
+                match reply_assembly.text(ReplyOrigin::AnthropicApi, || async { crate::direct_api::call_direct_api(
                     key,
                     &model,
                     &full_system_prompt,
                     &sanitized_text,
                     &[],
                 )
-                .await
+                .await.map(|resp| resp.text) }).await
                 {
-                    Ok(resp) if resp.text.trim().is_empty() => {
+                    Ok(resp) if resp.trim().is_empty() => {
                         last_cli_error = Some(ReplyFailure::simple(ReplyOrigin::AnthropicApi, "Empty response".into()));
                         None
                     }
                     Ok(resp) => {
-                        info!("Claude replied via Direct API ({} chars)", resp.text.len());
-                        Some(resp.text)
+                        info!("Claude replied via Direct API ({} chars)", resp.len());
+                        Some(resp)
                     }
                     Err(e) => {
                         let diagnostic = ReplyFailure::simple(ReplyOrigin::AnthropicApi,e.clone()).audit();
@@ -2136,6 +2302,13 @@ pub(super) async fn build_reply_with_session_inner(
             None
         }
     };
+
+    // Sanitize every fallback before persistence and delivery, including the
+    // in-process operator tool loop. Never persist an empty thinking-only turn.
+    let reply = reply.map(|text| duduclaw_core::think_tags::strip_reasoning_prefix(&text))
+        .filter(|text| !text.trim().is_empty());
+    // Persist even when the final model reply failed: the tool may have created a draft.
+    crate::pending_items::finish_turn(&ctx.home_dir, session_id, user_id, &agent_id, &turn_id);
 
     // KILLSWITCH [triggers] max_consecutive_errors / error_rate_threshold.
     crate::killswitch_triggers::record_reply_outcome(ctx, session_id, &agent_id, reply.is_some())
@@ -2211,6 +2384,14 @@ pub(super) async fn build_reply_with_session_inner(
                 }
             }
         }
+        // Workspace claims (mail / calendar / sheets / docs / tasks): evidence
+        // is this employee's rows in this session; `[action_claims] mode =
+        // "notice"` (default) appends one staff-only notice before the reply
+        // is saved. See `claim_notice`.
+        reply = super::claim_notice::check_reply(
+            &ctx.home_dir, &agent_id, source_conversation, session_id, &turn_id, user_id, reply,
+        )
+        .await;
 
         // Record outbound for circuit breaker echo detection
         let reply_tokens = estimate_tokens(&reply);
@@ -3590,6 +3771,8 @@ pub(super) async fn build_reply_with_session_inner(
                                             effort: None,
                                             // P0/WP-B: ordinary caller — failover behavior unchanged.
                                             allow_cross_family_failover: true,
+                                            // GVU on this employee's own directory.
+                                            purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
                                         },
                                     )
                                     .await
@@ -3859,66 +4042,82 @@ pub(super) async fn build_reply_with_session_inner(
             if let Some(verdict) = compression_verdict {
                 if !matches!(verdict.await, Ok(true)) { return; }
             }
-            if sm.should_compress(&sid).await {
+            if sm.should_compress(&sid).await
+                && crate::session_summarizer::summary_retry_ready_async(&home_for_compress, &sid, "compression").await {
+                use crate::session_summarizer::{SummaryFailure, summary_attempt_finished_async};
                 // Capture ids before reading text; the final transaction refuses
                 // any intervening turn or visibility change instead of deleting it.
                 let expected_ids = match sm.get_message_ids(&sid).await {
                     Ok(ids) => ids,
-                    Err(_) => return,
+                    Err(_) => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
+                        return;
+                    }
                 };
                 let msgs = match sm.get_messages(&sid).await {
                     Ok(messages) => messages,
-                    Err(_) => return,
-                };
-                let transcript = {
-                    let mut buf = String::with_capacity(msgs.len() * 350);
-                    for m in &msgs {
-                        if !buf.is_empty() {
-                            buf.push('\n');
-                        }
-                        use std::fmt::Write;
-                        // Byte-budget truncation must walk back to a char
-                        // boundary (project rule #1: raw `&s[..n]` panics
-                        // mid-char on CJK/emoji content).
-                        let _ = write!(
-                            buf,
-                            "[{}] {}",
-                            m.role,
-                            duduclaw_core::truncate_bytes(&duduclaw_security::credential_detect::mask(&m.content), 300)
-                        );
+                    Err(_) => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
+                        return;
                     }
-                    buf
                 };
-                let prompt = format!(
-                    "Summarize the following conversation history concisely for use as context \
-                     in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
-                );
+                let (previous, after) = match sm.get_summary(&sid).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
+                        return;
+                    }
+                };
+                let mut turns = Vec::new();
+                if !previous.is_empty() {
+                    turns.push(("background".to_owned(), duduclaw_security::credential_detect::mask(&previous)));
+                }
+                // The ordinal matches the async summarizer's visible-row space.
+                // A prior destructive compression is represented by its system row.
+                turns.extend(msgs.iter().skip(after as usize).map(|m| (m.role.clone(),
+                    duduclaw_security::credential_detect::mask(&m.content))));
+                let (transcript, protected, has_unprotected) =
+                    crate::prompt_compression::partition_turns_for_summary(&turns);
+                let prompt = crate::session_summarizer::format_summarization_prompt(&transcript);
                 // Read the denial flag inside the scope: non-Claude runtimes
                 // wrap the refusal text, so the prefix alone can miss a pause
                 // that lands between the context check and spawn/send.
                 let (result, denied) = crate::autonomous_runtime::scope(
                     &home_for_compress, &agent_for_compress, &[],
                     async {
-                        let result = super::cli_spawn::call_background_utility(
+                        let result = if has_unprotected { Box::pin(super::cli_spawn::call_background_utility(
                             &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
-                        )
-                        .await;
+                        ))
+                        .await } else { Ok(String::new()) };
                         (result, crate::autonomous_runtime::was_denied())
                     },
                 )
                 .await;
                 let summary = match result {
-                    _ if denied => return,
+                    _ if denied => {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::Utility)).await;
+                        return;
+                    }
                     Ok(s) => s,
-                    Err(e) if e.starts_with("AUTONOMY_") => return,
                     Err(_) => {
-                        "[Session compressed — previous conversation summary omitted for brevity]"
-                            .to_string()
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::Utility)).await;
+                        return;
                     }
                 };
-                if let Err(e) = sm.compress_if_unchanged(&sid, &summary, &expected_ids).await {
-                    warn!("Session compression failed: {e}");
+                if has_unprotected {
+                    if let Err(reason) = crate::session_summarizer::validate_summary_output(&summary) {
+                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(reason)).await;
+                        return;
+                    }
                 }
+                let protected = crate::session_summarizer_task::cap_protected_for_summary(&protected);
+                let summary = if protected.is_empty() { summary } else {
+                    format!("{summary}\n[verbatim protected sections]\n{protected}")
+                };
+                let failure = sm.compress_if_unchanged(&sid, &summary, &expected_ids).await
+                    .err().map(|_| SummaryFailure::Store);
+                summary_attempt_finished_async(&home_for_compress, &sid, "compression", failure).await;
+
             }
         });
 
@@ -3985,13 +4184,18 @@ pub(super) async fn build_reply_with_session_inner(
     // new token. Alarm once per outage; `record_outage` debounces and
     // swallows its own errors, so this can never turn a fallback message into
     // a hard failure.
+    let outage_agent = if agent_id.trim().is_empty() {
+        "system"
+    } else {
+        agent_id.as_str()
+    };
     if let Some(auth_error) = failure.claude_auth_error() {
-        let outage_agent = if agent_id.trim().is_empty() {
-            "system"
-        } else {
-            agent_id.as_str()
-        };
         crate::auth_outage::record_outage(&ctx.home_dir, outage_agent, auth_error).await;
+    } else if super::failure_message::is_quota_exhaustion(reason) {
+        // Same immediate, once-per-outage alarm for "every account is out of
+        // quota" (Activity Feed row + one push); the member is told an
+        // administrator was notified.
+        crate::auth_outage::record_quota_outage(&ctx.home_dir, outage_agent).await;
     }
 
     // Append a structured audit line so the dashboard can surface failure trends.
@@ -4048,7 +4252,7 @@ pub(super) async fn build_reply_with_session_inner(
     // A public website visitor (Odoo Live Chat) is a customer, not the
     // operator: account states, dashboard links and file names must not
     // reach them. The audit row above keeps the real reason.
-    if crate::odoo_livechat::is_public_visitor_session(session_id) {
+    if super::assembly::public_session(session_id) {
         return crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.to_string();
     }
     if !operator_diagnostics_allowed(&ctx.home_dir, session_id) {
@@ -4079,9 +4283,13 @@ pub(super) async fn build_reply_with_session_inner(
 
 /// Render operational status at the audience boundary, never in model text.
 fn runtime_content_for_session(response: crate::runtime::RuntimeResponse, session_id: &str) -> String {
-    let mut content = response.content;
+    let mut content = duduclaw_core::think_tags::strip_reasoning_prefix(&response.content);
+    if content.trim().is_empty() { return content; }
+    if response.partial_timeout_secs.is_some() && super::assembly::public_session(session_id) {
+        return String::new();
+    }
     if let Some(seconds) = response.partial_timeout_secs {
-        if !crate::odoo_livechat::is_public_visitor_session(session_id) {
+        if !super::assembly::public_session(session_id) {
             content.push_str(&format!("\n\n（已達執行時間上限 {seconds} 秒，以上為已完成的部分。）"));
         }
     }
@@ -4094,13 +4302,13 @@ mod timeout_audience_tests {
 
     #[test]
     fn partial_runtime_timeout_notice_is_operator_only() {
-        for session in ["odoolivechat:site:visitor", "webchat:owner", "line:owner"] {
+        for session in ["odoolivechat:site:visitor", "widget-visitor:abc", "webchat:owner", "line:owner"] {
             let response = crate::runtime::RuntimeResponse {
                 content: "已完成的答覆".into(), partial_timeout_secs: Some(300), ..Default::default()
             };
             let text = runtime_content_for_session(response, session);
-            if crate::odoo_livechat::is_public_visitor_session(session) {
-                assert_eq!(text, "已完成的答覆");
+            if super::super::assembly::public_session(session) {
+                assert!(text.is_empty());
             } else {
                 assert_eq!(text, "已完成的答覆\n\n（已達執行時間上限 300 秒，以上為已完成的部分。）");
             }

@@ -54,6 +54,8 @@ pub(crate) struct WebChatTurnDelivery {
 
 tokio::task_local! {
     pub(crate) static WEBCHAT_TURN_DELIVERY: WebChatTurnDelivery;
+    /// Original client messages of a merged dispatch, in arrival order.
+    pub(crate) static WEBCHAT_ORIGINAL_MESSAGES: Vec<(String, String)>;
 }
 
 pub(super) async fn webchat_commit_allowed(agent: &str) -> bool {
@@ -106,6 +108,9 @@ pub(crate) struct CcrTurnDelivery {
     pub(super) turn_generation: std::sync::Mutex<Option<String>>,
     /// Failed turns persist only their fixed notice; diagnostic text is live-only.
     pub(super) failure_notice_only: std::sync::atomic::AtomicBool,
+    /// No employee answers this turn: its fixed notice is delivered live
+    /// only. No session exists and none is created, so nothing is stored.
+    pub(super) no_responder_notice: std::sync::atomic::AtomicBool,
     cleanup: Option<DeliveryCleanup>,
     published: std::sync::atomic::AtomicBool,
 }
@@ -124,6 +129,7 @@ impl Default for CcrTurnDelivery {
             settled: Default::default(),
             turn_generation: Default::default(),
             failure_notice_only: Default::default(),
+            no_responder_notice: Default::default(),
             cleanup: DELIVERY_CLEANUP.try_with(Clone::clone).ok(),
             published: Default::default(),
         }
@@ -268,6 +274,14 @@ pub(super) fn record_turn_generation(generation: Option<&str>) {
     });
 }
 
+/// The turn answers with the fixed no-responder notice before any session
+/// exists: deliver it live, never store it. No-op outside a guarded reply.
+pub(super) fn mark_no_responder_notice() {
+    let _ = CCR_TURN_DELIVERY.try_with(|delivery| {
+        delivery.no_responder_notice.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
 /// Subscribe to this turn's CCR delivery verdict. `None` means no gate is in
 /// scope (non-channel caller) — callers then keep their previous behaviour.
 pub(super) fn ccr_delivery_verdict() -> Option<tokio::sync::oneshot::Receiver<bool>> {
@@ -367,16 +381,39 @@ pub(crate) struct ReplyDeliveryFence {
     cancel: Option<tokio_util::sync::CancellationToken>,
     guards: Vec<duduclaw_llm::CcrDeliveryGuards>,
     revoked: Arc<std::sync::atomic::AtomicBool>,
+    /// Set (with `revoked`) when the socket writer withheld a frame only
+    /// because the ACL fence's wait budget ran out: no byte was written.
+    contended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ReplyDeliveryFence {
     #[cfg(test)]
     pub(crate) fn test_live() -> Self {
-        Self { cancel: None, guards: Vec::new(), revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+        Self { cancel: None, guards: Vec::new(), revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            contended: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+    }
+
+    /// Fence for a fixed, content-free notice that holds no source lease: the
+    /// writer still applies every account, ACL generation and policy fence.
+    /// Never use it for reply content.
+    pub(crate) fn content_free() -> Self {
+        Self { cancel: None, guards: Vec::new(), revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            contended: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
     }
 
     pub(crate) fn refuse(&self) {
         self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Refuse, recording that the only cause was ACL fence contention.
+    pub(crate) fn refuse_contended(&self) {
+        self.contended.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.refuse();
+    }
+
+    /// True when a frame under this fence was withheld for contention.
+    pub(crate) fn was_contended(&self) -> bool {
+        self.contended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn for_turn(mut self, cancel: &tokio_util::sync::CancellationToken) -> Self {
@@ -404,7 +441,8 @@ impl ReplyDeliveryFence {
 
 impl GuardedReply {
     pub(crate) fn delivery_fence(&self) -> ReplyDeliveryFence {
-        ReplyDeliveryFence { cancel: None, guards: self.guards.clone(), revoked: self.revoked.clone() }
+        ReplyDeliveryFence { cancel: None, guards: self.guards.clone(), revoked: self.revoked.clone(),
+            contended: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
     }
 
     pub(super) async fn new(
@@ -516,6 +554,13 @@ impl GuardedReply {
         self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// No employee answered this turn: it carries the fixed no-responder
+    /// notice (`mark_no_responder_notice`), delivered live only.
+    pub(crate) fn no_responder_notice(&self) -> bool {
+        self.rollback.as_ref().is_some_and(|rollback|
+            rollback.delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     async fn check_notice_incarnation(&self, sessions: &SessionManager, sid: &str, delivery: &CcrTurnDelivery) -> Result<(), ()> {
         let generation = delivery.turn_generation.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
@@ -536,6 +581,15 @@ impl GuardedReply {
             self.refuse_delivery();
             return Err(());
         };
+        if rollback.delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst) {
+            // No session row exists (or may be created): nothing to stage.
+            // Only the fixed notice itself may take this path.
+            if !is_no_responder_notice(text) {
+                self.refuse_delivery();
+                return Err(());
+            }
+            return Ok(());
+        }
         if rollback.delivery.failure_notice_only.load(std::sync::atomic::Ordering::SeqCst) {
             return self.check_notice_incarnation(sessions, sid, &rollback.delivery).await;
         }
@@ -573,9 +627,13 @@ impl GuardedReply {
         generation: u64, policy: &crate::webchat::access::TargetPolicy, cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), ()> {
         let Some(rollback) = &self.rollback else { self.refuse_delivery(); return Err(()); };
-        if rollback.delivery.failure_notice_only.load(std::sync::atomic::Ordering::SeqCst) {
+        let no_responder = rollback.delivery.no_responder_notice.load(std::sync::atomic::Ordering::SeqCst);
+        if no_responder || rollback.delivery.failure_notice_only.load(std::sync::atomic::Ordering::SeqCst) {
             if !self.still_valid().await { return Err(()); }
-            self.check_notice_incarnation(sessions, sid, &rollback.delivery).await?;
+            // A live-only no-responder notice has no session to fence.
+            if !no_responder {
+                self.check_notice_incarnation(sessions, sid, &rollback.delivery).await?;
+            }
             let allowed = users.with_acl_generation(generation, || policy.with_current(|| {
                 !cancel.is_cancelled() && !self.revoked.load(std::sync::atomic::Ordering::SeqCst)
             }));
@@ -598,7 +656,14 @@ impl GuardedReply {
                 Ok(())
             }
             result => {
-                if let Err(error) = result { warn!(session_id = sid, %error, "WebChat reply publication failed"); }
+                // Fail closed either way; the WebChat turn then tells the
+                // client with the fixed failure notice instead of a reply.
+                match result {
+                    Err(duduclaw_auth::AclDeliveryError::Contended) => warn!(session_id = sid,
+                        "WebChat reply publication refused: delivery wait budget exhausted"),
+                    Err(error) => warn!(session_id = sid, %error, "WebChat reply publication failed"),
+                    Ok(_) => {}
+                }
                 self.refuse_delivery();
                 Err(())
             }

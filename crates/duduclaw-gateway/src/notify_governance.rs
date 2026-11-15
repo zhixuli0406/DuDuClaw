@@ -515,6 +515,12 @@ pub struct DeferredNotice {
     pub decision_source: Option<String>,
     #[serde(default)]
     pub decision_id: Option<String>,
+    /// Opaque id of the goal's gateway-held origin proof when the destination
+    /// is a turn-origin conversation ([`crate::recipient_guard::origin`]); the
+    /// drainer re-verifies the gateway's record before delivery and drops the
+    /// notice on refusal. A copy only: it never keeps the record alive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_proof: Option<String>,
 }
 
 impl DeferredNotice {
@@ -767,6 +773,19 @@ impl DeferredNotifyDrainer {
         if due.is_empty() {
             return 0;
         }
+        // H3: a notice aimed at a turn-origin conversation is re-verified
+        // now, before it is merged or sent; a refused one is dropped (never
+        // re-routed). Unrelated notices pass unchanged.
+        let mut admitted = Vec::with_capacity(due.len());
+        for notice in due {
+            if crate::goal_notify::deferred_origin_allowed(&self.home_dir, &notice).await {
+                admitted.push(notice);
+            }
+        }
+        let due = admitted;
+        if due.is_empty() {
+            return 0;
+        }
         let http = reqwest::Client::new();
         let mut delivered = 0usize;
 
@@ -777,7 +796,7 @@ impl DeferredNotifyDrainer {
                     crate::config_crypto::channel_dm_token_candidates(&self.home_dir, &batch.channel).await
                 }
                 PlainTokenSource::Agent(agent_id) => {
-                    crate::goal_notify::channel_token(&self.home_dir, agent_id, &batch.channel)
+                    crate::goal_notify::channel_token_for_target(&self.home_dir, agent_id, &batch.channel, &batch.chat_id)
                         .await.into_iter().collect()
                 }
             };
@@ -791,14 +810,18 @@ impl DeferredNotifyDrainer {
             }
             let mut ok = false;
             for token in tokens {
-                if crate::channel_sender::send_plain_text(
+                let sent = if batch.channel == "googlechat" && !batch.agent_id.is_empty() {
+                    crate::product_policy::require_channel(&self.home_dir, &batch.channel).is_ok()
+                        && crate::googlechat::send_text_to_space_as(&self.home_dir, Some(&batch.agent_id), &batch.chat_id, &batch.text).await.is_ok()
+                } else { crate::channel_sender::send_plain_text(
                     &self.home_dir,
                     &http,
                     &batch.channel,
                     &token,
                     &batch.chat_id,
                     &batch.text,
-                ).await {
+                ).await };
+                if sent {
                     ok = true;
                     break;
                 }
@@ -858,7 +881,7 @@ impl DeferredNotifyDrainer {
             return false;
         };
         let Some(token) =
-            crate::goal_notify::channel_token(&self.home_dir, &n.agent_id, &n.channel).await
+            crate::goal_notify::channel_token_for_target(&self.home_dir, &n.agent_id, &n.channel, &n.chat_id).await
         else {
             warn!(channel = %n.channel, "notify-governance: 延後的決定卡找不到 bot token，未能投遞");
             return false;
@@ -870,13 +893,14 @@ impl DeferredNotifyDrainer {
             link: n.link.as_deref(),
             no_button_hint: n.no_button_hint.as_deref().unwrap_or("請至儀表板處理。"),
         };
-        crate::decision_notify::deliver_now(
+        crate::decision_notify::deliver_now_as(
             &self.home_dir,
             http,
             &n.channel,
             &token,
             &n.chat_id,
             &card,
+            (!n.agent_id.is_empty()).then_some(n.agent_id.as_str()),
         )
         .await
     }
@@ -1339,6 +1363,7 @@ pub(crate) mod tests {
             no_button_hint: None,
             decision_source: None,
             decision_id: None,
+            origin_proof: None,
         }
     }
 

@@ -181,6 +181,17 @@
 | 通道失敗追蹤 | `channel_failures.jsonl` + `FailureReason` 分類（RateLimited/Billing/Timeout/BinaryMissing/SpawnError/EmptyResponse/NoAccounts/Unknown） |
 | Discord Gateway 強化（v1.9.2） | 真正的 op 6 RESUME：跨重連保存 `session_id` + `resume_gateway_url` + sequence；`select!` 停滯看門狗於 2× 心跳沉默後中斷（修復 18 分鐘殭屍狀態）；心跳 channel 容量 1→16 配 `try_send`；op 9 依 `d.bool` 選 RESUME 或 IDENTIFY 並加 1-5s jitter；close code 4007/4009/4003 清除 session；backoff 上限 300s→60s；處理 `RESUMED` dispatch |
 
+
+### WebChat 與 WordPress 聊天小工具
+
+儀表板聊天標題旁常駐連線狀態點：已連線為綠色，連線中／重新連線中為警示色，已斷線為錯誤色。窄螢幕也保留螢幕閱讀器可讀取的狀態標籤。
+
+WordPress 小工具（外掛 0.1.1）會在標題列顯示連線狀態。斷線後從 1 秒開始嘗試重新連線，每次等待時間加倍，最長 30 秒，最多 10 次。達到上限後可按「重新連線」。回到可見頁面、網路恢復或還原頁面時也會重新連線。
+
+尚未連線時送出，文字會留在輸入框，訊息泡泡標示「未送出」。按「重試」後才會在連線就緒時送出一次，單純恢復連線不會自動重送。等待回覆時斷線會提示「連線中斷，回覆可能沒有送達」；若後續收到回覆，會清除提示，但重新連線不保證能找回先前的回覆。錯誤只顯示通用提示，不透露內部資訊。
+
+小工具依網頁 HTML 的 `lang` 選擇文字：中文使用繁中，其他語言使用英文，未設定時維持原本的繁中。網站管理者設定的標題保持原樣，狀態變更會提供給螢幕閱讀器。小工具沒有自動化測試，小工具尚未在真實瀏覽器驗證。
+
 ## 演化系統
 
 > **進化系統 v3（2026-08-06）→ S11（2026-09-29）**：進化標的從「整份改寫
@@ -278,7 +289,7 @@
 | 統一多源審計日誌 | `audit.unified_log` 合併 `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`；日誌頁提供來源篩選 + 嚴重度下拉 |
 | JSONL 審計日誌 | 完整記錄工具呼叫，async 寫入 |
 | Unicode 正規化 | NFKC 正規化，偵測同形字攻擊 |
-| Action Claim Verifier | 工具呼叫聲明的簽章驗證 |
+| Action Claim Verifier | 以正規表示式比對回覆中「已完成」的說法與工具呼叫紀錄：代理管理類說法（所有回覆路徑，只記錄）與寄信／行事曆／試算表／文件／任務類說法（聊天回覆，只認同一段對話的紀錄，預設附上只給內部人員看的提醒；`[action_claims] mode`）（[78-action-claim-check.md](78-action-claim-check.md)） |
 | 容器沙盒 | 兩條獨立路徑。任務沙箱（`agent.toml [container] sandbox_enabled`）：只支援 Docker，把被委派任務的 AI CLI 放進唯讀、非 root、有資源上限的容器，不能用時直接失敗（fail closed）（[指南](../../guides/zh-TW/task-sandbox.md)）。腳本沙箱（PTC `execute_program`、`duduclaw secaudit` 的 PoC 步驟）：Docker（Windows 先試 WSL2），`--network=none`、唯讀根檔案系統，只掛一個唯讀的私有腳本目錄；沙箱不能用時 PTC 拒絕執行，除非設 `script_when_unavailable = "run_unsandboxed"` |
 | Secret 洩漏掃描 | 19 種 secret 樣式（Anthropic / OpenAI / AWS / GitHub / GitLab / Slack / Stripe / Google / SendGrid / JWT / PEM 金鑰，以及金鑰或密碼賦值）加上高熵檢查，供 skill 安全掃描器使用 |
 | 敏感資料遮蔽（RFC-23，v1.14.0） | `duduclaw-redaction` crate：內部資料（Odoo／shared wiki／file tools）以 `<REDACT:CATEGORY:hash8>` token 取代後才送 LLM，受信出口（使用者通道回覆、白名單工具）自動還原；AES-256-GCM SQLite vault（per-agent 32-byte key，0o600）、TTL 7d 兩階段 GC、5 個內建 profile、五層 enable/disable resolver、JSONL audit 10MB rotation；2026-09 新增欄位級規則：`db_field`（Odoo `model.field`／`model.*` 語法糖）與通用 `json_path`，命中欄位整值 token 化，不比對內容樣態，並附 `duduclaw redaction verify` JSON 模式，可對範例工具結果證明規則會觸發；`db_field` 原本只認 Odoo 的對照表，2026-09 進一步抽成任何 MCP 工具都能綁的 `[redaction.data_sources.*]` 登錄表，去識別化的涵蓋範圍也首次跨出 DuDuClaw 自己的 MCP server，見下一列 |

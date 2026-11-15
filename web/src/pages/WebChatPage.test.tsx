@@ -105,6 +105,11 @@ describe('WebChatPage', () => {
     expect(screen.getByPlaceholderText(/message/i)).toBeInTheDocument();
   });
 
+  it('shows the connection indicator with a connected label', () => {
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByRole('img', { name: 'Connected' })).toBeInTheDocument();
+  });
+
   it('renders the list+detail split (conversations column)', () => {
     renderWithProviders(<WebChatPage />);
     // The left column carries a "New conversation" action.
@@ -136,7 +141,7 @@ describe('WebChatPage', () => {
     }));
 
     expect(screen.getByRole('status')).toHaveTextContent(/Thinking/);
-    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop current reply' })).toBeInTheDocument();
   });
 
   it('does not send on Enter while a CJK IME is composing, but sends on a plain Enter', async () => {
@@ -375,7 +380,7 @@ it('keeps the composer and Send enabled during streaming, with a separate Stop c
   await waitFor(() => expect(input).toBeEnabled());
   fireEvent.change(input, { target: { value: 'follow-up' } });
   expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
-  fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Stop current reply' }));
   expect(cancel).toHaveBeenCalledOnce();
   fireEvent.click(screen.getByRole('button', { name: 'Send' }));
   expect(send).toHaveBeenCalledWith('follow-up', []);

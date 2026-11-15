@@ -94,7 +94,7 @@ pub fn notify_type(source: DecisionSource) -> &'static str {
 pub(crate) fn is_pushable_channel(channel: &str) -> bool {
     matches!(
         channel,
-        "telegram" | "slack" | "discord" | "line" | "whatsapp" | "feishu" | "googlechat" | "teams"
+        "telegram" | "slack" | "discord" | "line" | "whatsapp" | "feishu" | "googlechat" | "teams" | "wecom" | "dingtalk"
     )
 }
 
@@ -114,6 +114,22 @@ pub(crate) fn open_user_db(home_dir: &Path) -> Result<Option<UserDb>, String> {
     }
 }
 
+/// [`open_user_db`] for request-time lookups (per message, turn or reply):
+/// opens the existing `users.db` read-only, with no schema initialisation,
+/// no migration and no write reservation, so it never waits for, or
+/// contends with, another writer. `Ok(None)` when the file is absent; it is
+/// never created. Callers treat `None` and every error as "unknown sender".
+pub(crate) fn open_user_db_read_only(home_dir: &Path) -> Result<Option<UserDb>, String> {
+    let path = home_dir.join("users.db");
+    match std::fs::metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("identity store metadata unavailable".into()),
+        Ok(_) => UserDb::open_read_only(&path)
+            .map(Some)
+            .map_err(|_| "identity store unreadable or corrupt".into()),
+    }
+}
+
 /// New bound decisions distinguish an absent identity deployment from every
 /// database/lookup failure. A configured system never downgrades to solo mode.
 fn bound_decision_authority(
@@ -128,8 +144,7 @@ fn bound_decision_authority(
         .list_users()
         .map_err(|_| "identity list unavailable")?
         .is_empty();
-    let uid = db
-        .find_verified_user_id_by_channel(channel, principal)
+    let uid = crate::googlechat_identity::verified_user_id(home, &db, channel, principal)
         .map_err(|_| "verified identity lookup failed")?;
     let role = match uid {
         Some(uid) => db
@@ -142,9 +157,15 @@ fn bound_decision_authority(
     Ok((role, active))
 }
 
-/// Verified channel identities of every Active Admin/Manager — the humans the
-/// dashboard would let decide. Empty when `users.db` does not exist (a solo
-/// deployment that never onboarded dashboard users).
+/// Where a pending decision may be pushed for the humans the dashboard would
+/// let decide: the verified **DM destinations** of every Active
+/// Admin/Manager. Empty when `users.db` does not exist (a solo deployment
+/// that never onboarded dashboard users).
+///
+/// A notification destination list only — a Google Chat identity
+/// (`users/<id>`) is excluded (`duduclaw_auth::otp::is_dm_destination_channel`)
+/// because Chat messages go to a space, not a person id. Whether approvers
+/// are *recognisable* is [`has_recognisable_approver_identity`], never this.
 pub(crate) fn approver_links(home_dir: &Path) -> Vec<(String, String)> {
     let Ok(Some(db)) = open_user_db(home_dir) else {
         return Vec::new();
@@ -158,7 +179,7 @@ pub(crate) fn approver_links(home_dir: &Path) -> Vec<(String, String)> {
         {
             continue;
         }
-        if let Ok(idents) = db.verified_channels_for_user(&u.id) {
+        if let Ok(idents) = db.verified_dm_destinations_for_user(&u.id) {
             for i in idents {
                 out.push((i.channel, i.channel_user_id));
             }
@@ -179,19 +200,62 @@ pub(crate) fn mapped_role(
     channel_user_id: &str,
 ) -> Option<UserRole> {
     let db = open_user_db(home_dir).ok().flatten()?;
-    let uid = db
-        .find_verified_user_id_by_channel(channel, channel_user_id)
+    let uid = crate::googlechat_identity::verified_user_id(home_dir, &db, channel, channel_user_id)
         .ok()
         .flatten()?;
     let u = db.get_user(&uid).ok().flatten()?;
     (u.status == UserStatus::Active).then_some(u.role)
 }
 
-/// Whether this deployment has any channel-reachable approver identity at
-/// all. When false, the only authority available is the destination the
-/// operator configured — see [`authorize_press`].
-pub(crate) fn identity_system_active(home_dir: &Path) -> bool {
-    open_user_db(home_dir).is_err() || !approver_links(home_dir).is_empty()
+/// Whether this deployment can recognise an approver in a channel at all —
+/// the `identity_system_active` input of [`authorize_press`]. When false, the
+/// only authority available is the destination the operator configured.
+///
+/// True when ANY Active Admin/Manager has
+/// (a) a verified `channel_identities` row on any channel (Google Chat
+///     administrator bindings included — this is about recognition, not
+///     delivery), or
+/// (b) a usable Google-account-derived Chat identity, counted only while
+///     `[google] chat_identity_from_account` is on
+///     (`googlechat_identity::any_derived_identity`).
+///
+/// Fail closed (= true, role rules apply, no destination fallback) on an
+/// unreadable `users.db`, a user-list or channel-row read error, a
+/// linked-Google store read error, and an unreadable or malformed
+/// `[google] chat_identity_from_account` setting (only an absent setting is
+/// "off"; `googlechat_identity::derivation_enabled`). Duplicate Google owners and
+/// administrator-binding/Google disagreements do not reduce (b): an approver
+/// who would be recognised but for a conflict still counts. False only when
+/// `users.db` is absent, or every read succeeded and no Active Admin/Manager
+/// has either kind of identity. Deliberately NOT derived from
+/// [`approver_links`] (a notification-destination list).
+pub(crate) fn has_recognisable_approver_identity(home_dir: &Path) -> bool {
+    let db = match open_user_db(home_dir) {
+        Ok(Some(db)) => db,
+        Ok(None) => return false,
+        Err(_) => return true,
+    };
+    let Ok(users) = db.list_users() else {
+        return true;
+    };
+    let approvers: Vec<&str> = users
+        .iter()
+        .filter(|u| {
+            u.status == UserStatus::Active && matches!(u.role, UserRole::Admin | UserRole::Manager)
+        })
+        .map(|u| u.id.as_str())
+        .collect();
+    for id in &approvers {
+        match db.verified_channels_for_user(id) {
+            Ok(rows) if !rows.is_empty() => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    if approvers.is_empty() {
+        return false;
+    }
+    crate::googlechat_identity::any_derived_identity(home_dir, &approvers).unwrap_or(true)
 }
 
 // ── Authorization ───────────────────────────────────────────────
@@ -287,7 +351,8 @@ pub(crate) fn refusal_text(auth: PressAuth, subject: &str) -> String {
 /// with the `<type>:thread:<id>` marker collapsing to `<id>`. Returns `None`
 /// for a malformed value or a non-pushable transport (webchat, dashboard, …) —
 /// the caller then falls through to the next link in the chain.
-pub(crate) fn parse_origin(reply_channel: &str) -> Option<(String, String)> {
+pub fn parse_origin(reply_channel: &str) -> Option<(String, String)> {
+    if reply_channel.len() > 512 || reply_channel.chars().any(char::is_control) { return None; }
     // An employee bucket (`#agent:`) is not part of the chat id (B11).
     let rc = duduclaw_core::session_conversation(reply_channel.trim());
     let parts: Vec<&str> = rc.splitn(3, ':').collect();
@@ -295,7 +360,7 @@ pub(crate) fn parse_origin(reply_channel: &str) -> Option<(String, String)> {
         return None;
     }
     let channel = parts[0].trim();
-    if !is_pushable_channel(channel) {
+    if !duduclaw_core::SUPPORTED_CHANNEL_TYPES.contains(&channel) || !is_pushable_channel(channel) {
         return None;
     }
     let chat_id = if parts.len() == 3 && parts[1] == "thread" {
@@ -411,6 +476,23 @@ pub(crate) async fn deliver_outcome(
     chat_id: &str,
     card: &DecisionCard<'_>,
 ) -> DeliverOutcome {
+    deliver_outcome_as(home_dir, http, channel, token, chat_id, card, None).await
+}
+
+pub(crate) async fn deliver_outcome_as(
+    home_dir: &Path, http: &reqwest::Client, channel: &str, token: &str,
+    chat_id: &str, card: &DecisionCard<'_>, sender: Option<&str>,
+) -> DeliverOutcome {
+    deliver_outcome_guarded(home_dir, http, channel, token, chat_id, card, sender, None).await
+}
+
+/// [`deliver_outcome_as`] for a verified turn-origin destination: a deferred
+/// copy carries `origin_proof` so the drainer re-verifies it at delivery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn deliver_outcome_guarded(
+    home_dir: &Path, http: &reqwest::Client, channel: &str, token: &str,
+    chat_id: &str, card: &DecisionCard<'_>, sender: Option<&str>, origin_proof: Option<&str>,
+) -> DeliverOutcome {
     let level = notify_level(card.source);
     // Cards addressed to a specific agent would ideally use that agent's
     // quiet hours; a `DecisionCard` carries no agent id, so the deployment
@@ -427,7 +509,7 @@ pub(crate) async fn deliver_outcome(
             home_dir,
             crate::notify_governance::DeferredNotice {
                 id: uuid::Uuid::new_v4().to_string(),
-                agent_id: String::new(),
+                agent_id: sender.unwrap_or("").to_string(),
                 channel: channel.to_string(),
                 chat_id: chat_id.to_string(),
                 level: level.as_str().to_string(),
@@ -440,6 +522,7 @@ pub(crate) async fn deliver_outcome(
                 no_button_hint: Some(card.no_button_hint.to_string()),
                 decision_source: Some(card.source.token().to_string()),
                 decision_id: Some(card.decision_id.to_string()),
+                origin_proof: origin_proof.map(str::to_owned),
             },
         );
         return if queued {
@@ -448,7 +531,7 @@ pub(crate) async fn deliver_outcome(
             DeliverOutcome::Failed
         };
     }
-    if deliver_now(home_dir, http, channel, token, chat_id, card).await {
+    if deliver_now_as(home_dir, http, channel, token, chat_id, card, sender).await {
         crate::notify_stats::record_push(
             home_dir,
             notify_type(card.source),
@@ -476,6 +559,13 @@ pub(crate) async fn deliver_now(
     token: &str,
     chat_id: &str,
     card: &DecisionCard<'_>,
+) -> bool {
+    deliver_now_as(home_dir, http, channel, token, chat_id, card, None).await
+}
+
+pub(crate) async fn deliver_now_as(
+    home_dir: &Path, http: &reqwest::Client, channel: &str, token: &str,
+    chat_id: &str, card: &DecisionCard<'_>, sender: Option<&str>,
 ) -> bool {
     // D-S1: a Telegram private-chat approval card also gets a `web_app`
     // button opening the Mini App detail view. `None` in every other case —
@@ -568,6 +658,10 @@ pub(crate) async fn deliver_now(
                         false
                     }
                 };
+            }
+            if channel == "googlechat" {
+                if crate::product_policy::require_channel(home_dir, channel).is_err() { return false; }
+                return crate::googlechat::send_text_to_space_as(home_dir, sender, chat_id, &text).await.is_ok();
             }
             crate::channel_sender::send_plain_text(home_dir, http, channel, token, chat_id, &text)
                 .await
@@ -827,6 +921,8 @@ mod tests {
 
     #[test]
     fn parse_origin_rejects_non_pushable_and_malformed() {
+        assert_eq!(parse_origin("googlechat:spaces/X\n"), None);
+        assert_eq!(parse_origin("googlechat:"), None);
         assert_eq!(parse_origin("webchat:conn-1"), None);
         assert_eq!(parse_origin("webchat:conn#agent:a#conv:n"), None);
         assert_eq!(parse_origin("dashboard:alice"), None);
@@ -2008,5 +2104,15 @@ mod bounded_execution_tests {
         })
         .await
         .unwrap();
+    }
+}
+
+/// Human-readable destination names for schedule receipts.
+pub fn channel_display_name(channel: &str) -> &str {
+    match channel {
+        "googlechat" => "Google Chat", "telegram" => "Telegram", "slack" => "Slack",
+        "discord" => "Discord", "line" => "LINE", "whatsapp" => "WhatsApp",
+        "feishu" => "飛書", "teams" => "Microsoft Teams", "wecom" => "企業微信",
+        "dingtalk" => "釘釘", _ => "聊天通道",
     }
 }

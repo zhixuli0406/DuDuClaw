@@ -222,8 +222,10 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
         };
         let space = event.pointer("/message/space/name").and_then(Value::as_str).unwrap_or("");
         let sender = event.pointer("/message/sender/name").and_then(Value::as_str).unwrap_or("");
-        let group = json!([state.agent, space]).to_string();
-        let conversation = json!([state.agent, space, sender]).to_string();
+        // Same queue (and queue-full notice throttle) keys as the HTTP path.
+        let (group, conversation) = crate::googlechat::queue_keys(state.agent.as_deref(), space, sender);
+        let thread = event.pointer("/message/thread/name").and_then(Value::as_str).map(str::to_string);
+        let notice_space = space.to_string();
         let bind = crate::agent_channels::binding_lock().await;
         if !still_current(&state.ctx, state.agent.as_deref(), config).await { break; }
         if !inbox.transition(&stream, &row.id, "pending", "queued")? { continue; }
@@ -241,9 +243,11 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
                 tracing::error!(error = e, "Google Chat inbox completion failed");
             }
         }).is_err() {
-            // Match HTTP overload behavior: ACK/drop, never retry a full queue.
+            // Match HTTP overload behavior: ACK/drop, never retry a full
+            // queue, and tell the space (same throttled notice and keys).
             inbox.transition(&stream, &row.id, "queued", "dropped")?;
             tracing::warn!(agent = ?state.agent, "Google Chat Pub/Sub queue full: ACK and drop; no turn");
+            crate::googlechat::notify_queue_full(state, &group, &conversation, &notice_space, thread.as_deref());
         }
         drop(bind);
     }
@@ -711,7 +715,21 @@ mod googlechat_pubsub_tests {
         *h.fake.delivery.lock().unwrap() = vec![delivery("overload-replay", &notification())];
         pull(&h, &mut batch).await.unwrap();
         assert!(waiting.entered.try_recv().is_err());
-        assert!(h.fake.calls.lock().unwrap().iter().all(|(_, path, _)| path != "/spaces/AAA/messages"));
+        // The overload notice is spawned asynchronously; wait for that one
+        // send, while retaining the assertion that no model turn ran.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if h.fake.calls.lock().unwrap().iter().any(|(method, path, _)|
+                    *method == Method::POST && path == "/spaces/AAA/messages") { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let calls = h.fake.calls.lock().unwrap();
+        let messages: Vec<_> = calls.iter().filter(|(_, path, _)| path == "/spaces/AAA/messages").collect();
+        assert_eq!(messages.len(), 1, "only the rate-limited overload notice is sent");
+        assert_eq!(messages[0].0, Method::POST);
+        assert_eq!(messages[0].2["text"], "目前排隊中的訊息太多，這則訊息沒有受理，請稍後再傳一次。");
+        assert!(waiting.entered.try_recv().is_err());
     }
 
     #[tokio::test]

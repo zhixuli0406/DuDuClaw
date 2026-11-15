@@ -390,6 +390,15 @@ pub(crate) fn parse_todo_write_input(input: &serde_json::Value) -> Option<Vec<To
 }
 
 impl ProgressEvent {
+    /// Channel callbacks must not expose tool inputs or task descriptions to visitors.
+    pub(super) fn for_sender(self, internal: bool) -> Self {
+        if internal { return self; }
+        match self {
+            Self::ToolUse { .. } | Self::TodoUpdate { .. } => Self::Keepalive,
+            event => event,
+        }
+    }
+
     /// Format as a user-facing progress message.
     pub fn to_display(&self) -> String {
         match self {
@@ -477,3 +486,15 @@ pub(crate) fn render_todo_list(todos: &[TodoItem]) -> String {
 /// Implementations should be lightweight (just enqueue a message send).
 pub type ProgressCallback = Box<dyn Fn(ProgressEvent) + Send + Sync>;
 
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+    #[test]
+    fn external_progress_has_no_tool_name_or_input() {
+        let event = || ProgressEvent::ToolUse { tool: "Bash".into(), detail: Some("/home/private query".into()) };
+        assert_eq!(event().for_sender(false).to_display(), "⏳ 仍在處理中…");
+        assert_eq!(event().for_sender(true).to_display(), event().to_display());
+        assert_eq!(ProgressEvent::TodoUpdate { todos: vec![] }.for_sender(false).to_display(), "⏳ 仍在處理中…");
+    }
+}

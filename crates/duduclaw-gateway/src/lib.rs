@@ -230,7 +230,9 @@ pub mod google_workspace;
 pub mod googlechat;
 pub mod googlechat_pubsub;
 mod googlechat_inbox;
+mod googlechat_space_kind;
 pub mod googlechat_agents;
+pub mod googlechat_identity;
 pub mod killswitch_triggers;
 pub mod markdown_render;
 pub mod mcp_external;
@@ -608,6 +610,7 @@ pub mod night_llm;
 // record shape + window filter, used by both `dispatch_engine` (judge
 // evidence block) and `prediction::task_observe` (A3 observation layer).
 pub mod recent_actions;
+mod pending_items;
 pub(crate) mod recent_skills;
 pub mod tool_activity;
 

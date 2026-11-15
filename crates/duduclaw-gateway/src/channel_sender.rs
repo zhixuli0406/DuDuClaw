@@ -326,6 +326,7 @@ pub trait ChannelSender: Send + Sync {
             "send_document: no native override, degrading to text notice",
         );
         let kb = data.len() / 1024;
+        let filename = delivery_filename(filename);
         self.send_text(&format!(
             "📎 已生成檔案「{filename}」（約 {kb} KB）。此通道不支援直接傳送檔案，請至 Dashboard 檔案面板下載。"
         ))
@@ -770,11 +771,12 @@ pub async fn resolve_channel_target(
     if sender_self_configures(channel) {
         let marker = self_config_marker_field(channel)
             .expect("self-configuring channel must declare a marker field");
-        let present =
+        let present = if channel == "googlechat" {
+            crate::agent_channels::gchat_spaces::has_sending_app(home_dir, None, chat_id).await
+        } else {
             crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
-                .await
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
+                .await.map(|v| !v.is_empty()).unwrap_or(false)
+        };
         if !present {
             return Err(format!(
                 "channel {channel} is not configured (missing `{marker}` in config.toml [channels])"
@@ -1782,27 +1784,42 @@ pub fn create_googlechat_sender_for(
     })
 }
 
+/// Keep user-visible filenames independent of the host's path syntax.
+pub(crate) fn delivery_filename(filename: &str) -> &str {
+    filename.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or("document")
+}
+
+fn googlechat_file_notice(filename: &str) -> String {
+    let filename = delivery_filename(filename);
+    format!("📎 已產生檔案「{filename}」，但 Google Chat 目前無法直接傳送附件。請向管理員索取，或改用可傳檔的通道。")
+}
+
 #[async_trait]
 impl ChannelSender for GoogleChatSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
         crate::googlechat::send_text_to_space_as(&self.home_dir, self.agent.as_deref(), &self.space, text)
             .await
-            .map_err(ChannelSendError)
+            .map_err(|e| ChannelSendError(e.to_string()))
     }
 
-    async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
-        // Chat attachment upload needs a multi-step media API; deliver the
-        // caption + a size note (fail-soft, consistent with LINE's fallback).
+    async fn send_photo(&self, _png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
+        // Preserve confirmation text while making the missing image explicit.
         crate::channel_capabilities::log_unsupported(
             self.channel_type(),
             crate::channel_capabilities::Capability::PhotoUpload,
             "send_photo: no native image-upload API, degrading to text notice",
         );
-        let msg = format!(
-            "{caption}\n(📸 截圖已擷取，共 {} KB — Google Chat 附件上傳尚未支援)",
-            png_data.len() / 1024
-        );
-        self.send_text(&msg).await
+        let notice = googlechat_file_notice("image.png");
+        self.send_text(&format!("{caption}\n{notice}")).await
+    }
+
+    async fn send_document(
+        &self,
+        _data: &[u8],
+        filename: &str,
+        _mime: &str,
+    ) -> Result<(), ChannelSendError> {
+        self.send_text(&googlechat_file_notice(filename)).await
     }
 
     async fn request_confirmation(
@@ -2221,6 +2238,24 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].contains("report.docx"), "{}", msgs[0]);
         assert!(msgs[0].contains("2 KB"), "{}", msgs[0]);
+    }
+
+    #[tokio::test]
+    async fn fallback_filename_never_includes_host_directories() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender = TextOnlySender { seen: seen.clone() };
+        for filename in ["/private/operator/報告.pdf", r"C:\Users\operator\報告.pdf"] {
+            sender.send_document(b"data", filename, "application/pdf").await.unwrap();
+            let note = googlechat_file_notice(filename);
+            assert!(note.contains("「報告.pdf」"));
+            assert!(!note.contains("operator"));
+            assert!(!note.contains("Dashboard"));
+            assert!(note.contains("目前無法直接傳送附件"));
+        }
+        for note in seen.lock().unwrap().iter() {
+            assert!(note.contains("報告.pdf"));
+            assert!(!note.contains("operator"));
+        }
     }
 
     #[test]

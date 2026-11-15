@@ -20,10 +20,19 @@ export interface MfaPolicy { degraded: boolean; last_good_enforced?: boolean | n
 export interface MfaOverview {
   enforced: boolean | null;
   policy: MfaPolicy;
-  users: Array<{ user_id: string; email: string; enabled: boolean; channel_bindings: Array<{
+  users: Array<{ user_id: string; email: string; admin?: boolean; enabled: boolean; channel_bindings: Array<{
     channel: string; channel_user_id: string; verified: boolean; verified_at: number | null;
   }> }>;
+  /** Resets in the last 30 days whose notice reached the person by no route. */
+  reset_notice_failures?: Array<{ user_id: string; at: string }>;
 }
+/** Stable refusal codes of `users.mfa_reset` (shown through `mfa.reset.error.*`). */
+export const MFA_RESET_ERRORS = [
+  'MFA_RESET_SECOND_FACTOR_REQUIRED', 'MFA_RESET_USE_AUTHENTICATOR', 'MFA_RESET_NO_SECOND_FACTOR',
+  'MFA_RESET_FACTOR_FAILED', 'MFA_RESET_EMAIL_UNAVAILABLE', 'MFA_RESET_RATE_LIMITED', 'MFA_RESET_COOLING',
+  'MFA_RESET_ADMIN_LOG_UNAVAILABLE', 'MFA_RESET_TARGET_UNAVAILABLE', 'MFA_RESET_NOT_ADMIN', 'MFA_RESET_SELF',
+  'MFA_RESET_INVALID', 'MFA_RESET_UNAVAILABLE',
+] as const;
 export interface MfaStatus extends FactorAvailability {
   enabled: boolean;
   enforced: boolean;
@@ -56,6 +65,18 @@ export const mfaApi = {
     if (actor === user_id) return Promise.reject(new Error('MFA_SELF_RESET'));
     return client.call('users.mfa_reset', { user_id, password });
   },
+  /** No authenticator app (passkey or email only): password, then a code mailed to the actor. */
+  resetEmailBegin: (actor: string, user_id: string, password: string) => {
+    if (actor === user_id) return Promise.reject(new Error('MFA_SELF_RESET'));
+    return client.call('users.mfa_reset', { user_id, password, send_email_code: true }) as Promise<{ email_code_sent: boolean; reset_token: string; expires_in: number }>;
+  },
+  resetEmailConfirm: (actor: string, user_id: string, reset_token: string, email_code: string) => {
+    if (actor === user_id) return Promise.reject(new Error('MFA_SELF_RESET'));
+    return client.call('users.mfa_reset', { user_id, reset_token, email_code });
+  },
+  /** First administrator, first-time setup: the one-time code from `duduclaw ops users mfa-setup-code` (always required). */
+  bootstrap: (enrollment_token: string, setup_code: string) =>
+    apiPost<{ bootstrap: boolean }>('/api/mfa/enroll/bootstrap', { enrollment_token, setup_code }),
   issueCode: (user_id: string, challenge_ref: string) => client.call('users.mfa_enrollment_code', { user_id, challenge_ref }) as Promise<{ enrollment_code: string; expires_in: number }>,
   verify: (challenge_id: string, code: string, recovery: boolean) =>
     apiPost<SessionTokens>('/api/mfa/verify', { challenge_id, [recovery ? 'recovery_code' : 'code']: code }),
@@ -76,6 +97,10 @@ export const mfaApi = {
 
 // Never render raw transport errors or echo a submitted credential.
 export function mfaErrorId(error: unknown): string {
+  if (error && typeof error === 'object' && !(error instanceof Error)) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string' && (MFA_RESET_ERRORS as readonly string[]).includes(code)) return `mfa.reset.error.${code}`;
+  }
   if (error instanceof ApiError) {
     if (error.status === 503) return 'mfa.error.unavailable';
     if (error.status === 429) return 'mfa.error.attempts';

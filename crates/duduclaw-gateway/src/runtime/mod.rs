@@ -832,6 +832,41 @@ pub fn round_task_env() -> Option<(String, String)> {
         .map(|id| (duduclaw_core::ENV_TASK_ID.to_string(), id))
 }
 
+/// Provider-independent history payload ceiling, matching the bisect summary
+/// input budget. The separately supplied current user message is never trimmed.
+pub(crate) const CONVERSATION_HISTORY_MAX_BYTES: usize =
+    crate::session_summarizer::SUMMARY_INPUT_MAX_BYTES;
+
+/// Keep a contiguous suffix of whole turns. Only an oversized newest turn is
+/// shortened, keeping its tail (latest context), on a UTF-8 boundary. This is
+/// an outbound copy; stored session rows and the current message are untouched.
+pub(crate) fn cap_conversation_history(history: &[ConversationTurn]) -> Vec<ConversationTurn> {
+    let mut bytes = 0;
+    let mut start = history.len();
+    for (index, turn) in history.iter().enumerate().rev() {
+        if turn.content.len() > CONVERSATION_HISTORY_MAX_BYTES - bytes {
+            if start == history.len() {
+                // truncate_bytes gives a safe prefix boundary. Advancing past
+                // the character at that boundary leaves a suffix within cap.
+                let excess = turn.content.len() - CONVERSATION_HISTORY_MAX_BYTES;
+                let boundary = duduclaw_core::truncate_bytes(&turn.content, excess).len();
+                let tail_start = if boundary < excess {
+                    boundary + turn.content.get(boundary..).expect("UTF-8 boundary from truncate_bytes")
+                        .chars().next().unwrap().len_utf8()
+                } else { boundary };
+                return vec![ConversationTurn {
+                    role: turn.role.clone(),
+                    content: turn.content.get(tail_start..).expect("UTF-8 tail boundary").to_owned(),
+                }];
+            }
+            break;
+        }
+        bytes += turn.content.len();
+        start = index;
+    }
+    history[start..].to_vec()
+}
+
 /// Format conversation history as an XML-delimited prompt prefix.
 ///
 /// Used by CLI-based runtimes (Gemini, Codex) that lack native multi-turn
@@ -840,12 +875,13 @@ pub fn round_task_env() -> Option<(String, String)> {
 /// NOTE: The canonical implementation with turn trimming lives in
 /// `channel_reply.rs`. This version is for the AgentRuntime trait path.
 pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &str) -> String {
+    let history = cap_conversation_history(history);
     if history.is_empty() {
         return current_message.to_string();
     }
     let mut buf = String::with_capacity(history.len() * 200 + current_message.len() + 64);
     buf.push_str("<conversation_history>\n");
-    for turn in history {
+    for turn in &history {
         // Escape closing tags in content to prevent XML structure corruption
         let safe_content = turn
             .content

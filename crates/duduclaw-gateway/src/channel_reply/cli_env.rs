@@ -1,5 +1,40 @@
 use super::*;
 
+/// Whether the current task is a channel reply turn: the guarded reply
+/// builder scopes `CHANNEL_REPLY_USER_ID` over the whole turn and the inner
+/// pipeline scopes `CHANNEL_REPLY_AGENT_ID` over its model call. Task-locals
+/// do not cross `tokio::spawn`, so this is only an additional refusal at the
+/// spawn choke points; the decisive signal is the caller's `SpawnPurpose`.
+pub(crate) fn in_channel_reply_turn() -> bool {
+    crate::claude_runner::CHANNEL_REPLY_AGENT_ID.try_with(|_| ()).is_ok()
+        || crate::claude_runner::CHANNEL_REPLY_USER_ID.try_with(|_| ()).is_ok()
+}
+
+/// Refusal for a channel reply model call without an employee directory
+/// (no instructions, no MCP config, no file-guard hook, gateway cwd). It
+/// carries the spawn-gate prefix, so account rotation, runtime failover and
+/// the reply fallbacks stop instead of trying the same call elsewhere.
+pub(crate) fn no_employee_spawn_refusal() -> String {
+    duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        "尚未設定負責回覆的 AI 員工，本次沒有執行模型。請管理員完成設定。",
+    )
+}
+
+/// Is a Claude CLI spawn without an employee directory refused for this
+/// stated purpose? An employee turn always is; utility work only runs with
+/// an explicit tool allowlist (`None` capabilities mean the full surface).
+pub(crate) fn directory_less_spawn_refused(
+    purpose: crate::runtime_dispatch::SpawnPurpose,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> bool {
+    match purpose {
+        crate::runtime_dispatch::SpawnPurpose::EmployeeTurn => true,
+        crate::runtime_dispatch::SpawnPurpose::Utility => {
+            !capabilities.is_some_and(|caps| !caps.allowed_tools().is_empty())
+        }
+    }
+}
+
 /// Core primitive: spawn the `claude` CLI subprocess with a streaming JSON reader.
 ///
 /// `env_vars` allows the caller to inject per-account credentials
@@ -23,8 +58,23 @@ pub(super) async fn spawn_claude_cli_with_env(
     claude_session_id: Option<&str>,
     // P1/WP-3: per-call reasoning effort. `None` ⇒ no `--effort` flag.
     effort: Option<duduclaw_core::effort::Effort>,
+    // Why this CLI runs, stated by the caller (never inferred).
+    purpose: crate::runtime_dispatch::SpawnPurpose,
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // The CLI runs with full tools and `--dangerously-skip-permissions`, so
+    // without an employee directory it would have no instructions, MCP
+    // config, file-guard hook or cwd. An employee turn is refused outright;
+    // only agent-less utility work (custom widget / expert-pack generation,
+    // night passes) may run, and only with an explicit tool allowlist. The
+    // channel-turn task-local is a second, independent refusal.
+    if work_dir.is_none()
+        && (directory_less_spawn_refused(purpose, capabilities) || in_channel_reply_turn())
+    {
+        warn!(?purpose, "Claude CLI spawn without an employee directory — refused");
+        return Err(no_employee_spawn_refusal());
+    }
 
     let protected = duduclaw_core::execution_gate::isolation_required();
     if protected {
@@ -436,10 +486,13 @@ pub(super) async fn spawn_claude_cli_with_env(
         None
     };
 
-    // Split accumulators: `result` is authoritative when present, but a
-    // stream that ends without one still has the assistant text.
-    // `assistant_text` appends (a reply is a sequence of text blocks across
-    // one or more `assistant` events); the terminal `result` event replaces.
+    // The result is authoritative. Without it, retain only the last text
+    // segment of the last assistant event, never intermediate narration.
+    // Public visitors require a proper final result; a partial narration is
+    // never a safe fallback, even if it is the last assistant segment.
+    let public_fallback = duduclaw_memory::feedback::CURRENT_SESSION_ID
+        .try_with(|sid| sid.as_deref().is_some_and(super::assembly::public_session))
+        .unwrap_or(false);
     let mut assistant_text = String::new();
     let mut result_text = String::new();
     // RFC-22 P1-7: capture token usage from `result` event so cost_telemetry
@@ -886,20 +939,14 @@ pub(super) async fn spawn_claude_cli_with_env(
                                         .pointer("/message/content")
                                         .and_then(|c| c.as_array())
                                     {
+                                        assistant_text = duduclaw_core::think_tags::last_assistant_text(content);
                                         for block in content {
                                             let block_type = block.get("type").and_then(|t| t.as_str());
                                             match block_type {
                                                 Some("text") => {
                                                     text_blocks += 1;
-                                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                                        // Append, never replace: overwriting kept
-                                                        // only the LAST fragment of a long reply,
-                                                        // which reached the user as a few
-                                                        // characters with a two-digit token count.
-                                                        assistant_text.push_str(text);
-                                                    }
                                                 }
-                                                Some("thinking") => {
+                                                Some("thinking" | "redacted_thinking" | "reasoning") => {
                                                     thinking_blocks += 1;
                                                 }
                                                 Some("tool_use") => {
@@ -1001,9 +1048,8 @@ pub(super) async fn spawn_claude_cli_with_env(
                     "claude CLI hard timeout ({hard_max_timeout_secs}s) — killing process"
                 );
                 child.kill_and_reap().await;
-                if result_text.is_empty() && !assistant_text.is_empty() {
-                    // No authoritative `result` text (tool-use turn, or the CLI
-                    // omitted it) — the accumulated assistant prose IS the reply.
+                if result_text.is_empty() && !assistant_text.is_empty() && !public_fallback {
+                    // No authoritative result: only the final text segment is eligible.
                     result_text = std::mem::take(&mut assistant_text);
                 }
                 if result_text.is_empty() {
@@ -1068,18 +1114,10 @@ pub(super) async fn spawn_claude_cli_with_env(
         ));
     }
 
-    // Normal completion: with no authoritative `result` text (tool-use turns,
-    // or a CLI that omits the event), the accumulated assistant prose IS the
-    // reply. Folding it in here is what stops a long answer from arriving as
-    // its last fragment.
-    let mut result_text = result_text;
-    if result_text.is_empty() && !assistant_text.is_empty() {
-        result_text = std::mem::take(&mut assistant_text);
-    }
-    let result_text = result_text.trim().to_string();
-    if result_text.is_empty() {
-        return Err(format!("Empty response from claude CLI ({diag})"));
-    }
+    // Missing final result: use the last segment only for non-public sessions.
+    let result_text = duduclaw_core::think_tags::final_reply_text(
+        &result_text, &assistant_text, !public_fallback,
+    );
 
     // OTel GenAI: post-hoc usage recording onto the active `invoke_agent`
     // span (fields declared Empty at the instrumented entry — see
@@ -1145,6 +1183,12 @@ pub(super) async fn spawn_claude_cli_with_env(
         crate::runtime::extend_native_tool_events(operator_native_events);
     }
 
+    // Record the consumed tokens before assembly decides whether to retry.
+    // For WebChat/public turns an empty success reaches that single owner
+    // through rotation, which also accounts for this attempt's cost.
+    if result_text.is_empty() && !super::assembly::current_session_retries_empty() {
+        return Err(format!("Empty response from claude CLI ({diag})"));
+    }
     Ok(result_text)
 }
 

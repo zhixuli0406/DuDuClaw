@@ -81,7 +81,9 @@ The users, channel-settings and workflow stores still
 have a single `*-v1793.sql` catalog each, compared byte-for-byte as before; whether
 their v1.80 stores differ has not been reviewed (for example, the v1.80.0
 `mfa_email_codes`, `mfa_passkeys` and `remembered_*` tables are not in
-`users-v1793.sql`). Extra tables,
+`users-v1793.sql`; neither are the v1.82 `mfa_bootstrap_tokens`, `mfa_bootstrap_state`
+first-administrator latch and `mfa_reset_audit_outbox` tables, so a v1.82 `users.db` is refused
+as a source and the latch never travels through import — the new installation keeps its own). Extra tables,
 columns, indexes, views or triggers reject the whole source; other historical
 variants are deliberately rejected until exact catalogs are reviewed.
 `tasks.db` additionally has a third catalog, `tasks-v181.sql`: the v1.80.x store plus the
@@ -89,7 +91,15 @@ P1e `task_store_markers` table that every fresh v1.81 `tasks.db` creates, so a h
 by this release is accepted as a source. Both the v1.80 and v1.81 catalogs are accepted
 (exact match only, `tasks-v180.sql` is unchanged), share the v1.80 mapping, and the
 marker table is never authorized for reading. `scripts/capture_tasks_schema.py`
-regenerates both files; the gateway test compares `tasks-v181.sql` with a fresh `TaskStore`.
+regenerates both files. A fourth catalog, v1.82, is `tasks-v181.sql` plus the additive
+`tasks.source_origin_proof` column (`TASKS_V182` in `catalog.rs`; no separate file): the
+opaque id of the gateway-held proof of an AI-created goal's source conversation, mapped as
+v1.80; the reader never selects it. The gateway test compares that v1.82 catalog with a fresh `TaskStore`.
+`sessions.db` v1.82 is either pinned v1.81 shape (fresh / upgraded) plus the gateway-owned
+`schedule_origin_proofs` table (`session-origin-proofs-v182.sql`, the same text as
+`recipient_guard::origin::SCHEMA`; `SESSION_V182` / `SESSION_V182_UPGRADED` in `catalog.rs`).
+Both map as v1.81 and the proof table is never authorized for reading. The gateway tests
+compare both shapes with a fresh and an upgraded `SessionManager`.
 `approvals.db` likewise has a third catalog, `approvals-v181.sql`: the v1.80.x store plus
 the SR5 `approvals.employee_incarnation` column (a card bound to its employee's
 incarnation). v1.79.3, v1.80.x and v1.81 are accepted (exact match only;

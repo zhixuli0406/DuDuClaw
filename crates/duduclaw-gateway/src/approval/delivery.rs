@@ -107,10 +107,7 @@ impl TrustedReplyTarget {
         context.validate()?;
         if token.is_empty()
             || chat_id.is_empty()
-            || !matches!(
-                context.channel.as_str(),
-                "telegram" | "line" | "slack" | "discord"
-            )
+            || !super::supports_text_decisions(&context.channel)
         {
             return Err("unsupported exact confirmation target".into());
         }

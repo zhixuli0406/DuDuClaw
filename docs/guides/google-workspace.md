@@ -31,6 +31,8 @@ Twenty-one agent-facing MCP tools, gated by two scopes (`google:read` /
 | `docs_append` | write | Append text to the **end** of a Doc. Append-only — no tool rewrites or deletes existing content. |
 | `slides_read` | read | Read a presentation's text slide by slide (shapes, grouped shapes, table cells). |
 
+Write results report only what Google returned. `calendar_create_event` lists how many attendees were added (or "Attendees: none") and never claims anyone was notified; a missing event ID is an error. `gmail_create_draft` with no draft ID back is an error. `sheets_append` shows row and cell counts only when Google reports them. On the Apps Script path, a row is always appended to the **first sheet** of the spreadsheet: the result says so and that the requested range was ignored. An Apps Script reply counts as success only in that action's success shape; an empty reply, `ok: false` or any `error` field is a tool error with the reason.
+
 > **No Slides write tool** ships on purpose: DuDuClaw's office document suite
 > already produces real `.pptx` files, which is both safer and better output
 > than driving the Slides `batchUpdate` element API.
@@ -173,6 +175,17 @@ some requesters (`requesters`):
 
 Public website visitors (WebChat widget, Odoo Live Chat) are refused under
 every setting. An unbound channel sender is refused unless `anyone` is set.
+
+**Google Chat senders (v1.82):** a Chat sender counts as a person here when
+an Admin bound their Chat user id under **Users → Verify identity**, or — only
+if an Admin turned on the optional, **off-by-default** setting
+`[google] chat_identity_from_account` (Manage → Integrations → Google) — when
+they connected their own Google account under **My connections** (matched on
+the Google account id; this automatic match has **not yet been verified
+against a real Google Workspace**; leave the setting off unless you have
+confirmed in your own Workspace that the two ids match). There is no e-mail matching. Before v1.82 every Chat sender was
+unbound, so only `anyone` let them through. See
+[Dashboard settings → Users → Verify identity](dashboard-settings.md#users--verify-identity-channel-identities-v182).
 
 ### When it cannot be used
 

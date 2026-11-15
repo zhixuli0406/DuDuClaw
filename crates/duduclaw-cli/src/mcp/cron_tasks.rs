@@ -96,16 +96,18 @@ pub(crate) async fn handle_schedule_task_for_actor(
         }
     };
 
-    // RM-124: the model's notify target, or — when it names none — the
-    // WebChat conversation this turn answers (gateway-attested, bound to the
-    // acting employee). A model-supplied `webchat` target is refused.
-    let origin_env = std::env::var(duduclaw_core::ENV_ORIGIN_SESSION).ok();
-    let target = match resolve_notify_target(
-        params, home_dir, actor.agent(), &scheduled_target, origin_env.as_deref(),
+    // RM-124 / H1: the model's notify target, or — when it names none — the
+    // conversation this turn answers, taken only from the gateway's live turn
+    // context (bound to the acting employee). A model-supplied `webchat`
+    // target is refused; no environment value is consulted.
+    let context = turn_context(home_dir, actor.agent(), &scheduled_target).await;
+    let target = match resolve_turn_notify_target(
+        params, actor.agent(), &scheduled_target, context.as_ref(),
     ) {
         Ok(target) => target,
         Err(message) => return tool_error(&message),
     };
+    let origin = stored_origin(context.as_ref(), &target);
     let delivery = target.delivery();
     let NotifyTarget { channel: notify_channel, chat: notify_chat_id, thread: notify_thread_id, .. } = target;
     // v1.8.25: auto-detect the host's IANA timezone when the caller doesn't
@@ -155,10 +157,21 @@ pub(crate) async fn handle_schedule_task_for_actor(
     let mut row = CronTaskRow::new(
         task_id.clone(),
         name.to_string(),
-        agent_id.to_string(),
+        scheduled_target.clone(),
         cron.to_string(),
         task.to_string(),
     );
+    // H2: the origin is stored only together with the opaque id of the
+    // gateway proof record re-verified before every delivery; an unproven
+    // turn stores neither.
+    if let Some((recipient, proof)) = origin {
+        row.notify_origin = Some(recipient);
+        row.notify_origin_proof = Some(proof);
+    }
+    row.notify_sender = match notify_channel.as_deref().zip(notify_chat_id.as_deref()) {
+        Some((channel, chat)) => turn_reply_sender(context.as_ref(), channel, chat),
+        None => None,
+    }.or_else(|| Some(scheduled_target.clone()));
     row.on_behalf_of = principal;
     row.notify_channel = notify_channel;
     row.notify_chat_id = notify_chat_id;
@@ -182,7 +195,11 @@ pub(crate) async fn handle_schedule_task_for_actor(
             let receipt = format!(
                 "{}{}",
                 cron_created_receipt(name, cron, row.cron_timezone.as_deref()),
-                delivery_receipt_suffix(delivery),
+                if delivery == Delivery::Channel {
+                    format!("執行結果會傳送到 {} 的{}對話。", row.notify_channel.as_deref()
+                        .map(duduclaw_gateway::decision_notify::channel_display_name).unwrap_or("聊天通道"),
+                        if params.get("notify_channel").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty()) { "指定" } else { "原本這個" })
+                } else { delivery_receipt_suffix(delivery).to_string() },
             );
             serde_json::json!({
                 "content": [{"type": "text", "text": format!(
@@ -311,23 +328,123 @@ impl NotifyTarget {
     }
 }
 
+/// The gateway's live turn context, only for work the acting employee
+/// schedules for itself (scheduling for someone else never borrows the
+/// caller's conversation). Ordinary MCP obtains it over the signed loopback
+/// route; isolated MCP resolves the same registry in-process against the
+/// verified capability and host run map. No process environment value —
+/// in particular not `DUDUCLAW_ORIGIN_SESSION` — contributes (H1).
+pub(crate) async fn turn_context(
+    home: &Path, acting: Option<&str>, executor: &str,
+) -> Option<duduclaw_gateway::egress_client::RecipientContext> {
+    let agent = acting.filter(|agent| *agent == executor)?;
+    duduclaw_gateway::egress_client::schedule_context(home, agent).await.ok()
+}
+
+/// A channel conversation this turn answers, proven by the gateway: its
+/// transport address, the normalized recipient stored as the origin, and the
+/// opaque id of the gateway-held proof record. This process never sees the
+/// proven tuple; the gateway re-verifies its own record before every send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvenOrigin {
+    pub channel: String,
+    pub chat: String,
+    pub recipient: String,
+    pub proof: String,
+}
+
+/// The proven channel origin of `context`, or `None` (no default origin, no
+/// exemption) unless the gateway minted a proof for this turn's source and
+/// the transport destination is exactly that source.
+pub(crate) fn proven_origin(
+    context: &duduclaw_gateway::egress_client::RecipientContext,
+) -> Option<ProvenOrigin> {
+    let proof = context.origin_proof_id.clone().filter(|id| !id.is_empty())?;
+    let recipient = context.source.clone()?;
+    let (channel, chat) = duduclaw_gateway::decision_notify::parse_origin(context.reply_channel.as_deref()?)?;
+    if duduclaw_core::recipient_policy::channel_recipient(&channel, &chat).as_deref() != Some(recipient.as_str()) {
+        return None;
+    }
+    Some(ProvenOrigin { channel, chat, recipient, proof })
+}
+
+/// The turn origin stored with a new job, as `(origin, proof id)`: the
+/// gateway-bound WebChat conversation when that is the job's target, else
+/// the proven channel conversation of the turn. `None` stores neither.
+pub(crate) fn stored_origin(
+    context: Option<&duduclaw_gateway::egress_client::RecipientContext>, target: &NotifyTarget,
+) -> Option<(String, String)> {
+    let context = context?;
+    if target.delivery() == Delivery::OriginWebchat {
+        let chat = target.chat.as_deref().filter(|chat| context.webchat_origin.as_deref() == Some(*chat))?;
+        let proof = context.webchat_origin_proof_id.clone().filter(|id| !id.is_empty())?;
+        return Some((chat.to_owned(), proof));
+    }
+    proven_origin(context).map(|origin| (origin.recipient, origin.proof))
+}
+
+/// The proven origin of the current turn (see [`proven_origin`]).
+pub(crate) async fn schedule_origin(
+    home: &Path, acting: Option<&str>, executor: &str,
+) -> Option<ProvenOrigin> {
+    turn_context(home, acting, executor).await.as_ref().and_then(proven_origin)
+}
+
+/// RM-124 / H1: the notify target of a new schedule, reminder or one-shot.
+/// An explicit target wins; otherwise the gateway-bound WebChat conversation
+/// of this turn (only with its gateway proof id), then its proven channel
+/// conversation. When the live turn cannot be resolved there is no default
+/// (fail closed).
+pub(crate) fn resolve_turn_notify_target(
+    params: &Value, acting: Option<&str>, executor: &str,
+    context: Option<&duduclaw_gateway::egress_client::RecipientContext>,
+) -> std::result::Result<NotifyTarget, String> {
+    let webchat = context
+        .filter(|context| context.webchat_origin_proof_id.as_deref().is_some_and(|id| !id.is_empty()))
+        .and_then(|context| context.webchat_origin.as_deref());
+    let target = resolve_notify_target(params, acting, executor, webchat)?;
+    if target.delivery() != Delivery::Nowhere { return Ok(target); }
+    Ok(match context.and_then(proven_origin).filter(|_| acting == Some(executor)) {
+        Some(origin) => NotifyTarget { channel: Some(origin.channel), chat: Some(origin.chat), thread: None },
+        None => target,
+    })
+}
+
+/// Preserve the app identity only for the gateway-bound source destination.
+pub(crate) fn turn_reply_sender(
+    context: Option<&duduclaw_gateway::egress_client::RecipientContext>, channel: &str, chat: &str,
+) -> Option<String> {
+    let context = context?;
+    let (ch, id) = duduclaw_gateway::decision_notify::parse_origin(context.reply_channel.as_deref()?)?;
+    if ch != channel || id != chat { return None; }
+    context.reply_sender.clone().filter(|id| duduclaw_core::is_valid_agent_id(id))
+}
+
+/// [`turn_reply_sender`] for the current turn.
+#[cfg(test)]
+pub(crate) async fn schedule_reply_sender(
+    home: &Path, acting: Option<&str>, executor: &str, channel: &str, chat: &str,
+) -> Option<String> {
+    turn_reply_sender(turn_context(home, acting, executor).await.as_ref(), channel, chat)
+}
+
 /// RM-124: resolve the notify target of a new schedule.
 ///
 /// * A target the model supplies is used as-is — except `webchat`, which is
-///   refused: a WebChat conversation is only ever taken from the
-///   gateway-attested `origin_env` ([`duduclaw_core::ENV_ORIGIN_SESSION`]).
-/// * With no target, the origin WebChat conversation becomes the default,
-///   but only when the schedule runs as the verified acting employee
-///   (`acting_agent == scheduled_target`) and the session id binds to that
-///   employee (`scheduled_webchat::bind_origin`: `#agent:` segment + stored
-///   session row + owner tag). Anything else ⇒ no target (the receipt says
-///   so).
+///   refused: a WebChat conversation is only ever the gateway-bound
+///   `webchat_target` of the live turn (`RecipientContext::webchat_origin`,
+///   captured by the gateway's turn registry and already bound by
+///   `scheduled_webchat::bind_origin` to the verified employee: `#agent:`
+///   segment + stored session row + owner tag). No environment value is read.
+/// * With no target, that WebChat conversation becomes the default, but only
+///   when the schedule runs as the verified acting employee
+///   (`acting_agent == scheduled_target`). Anything else ⇒ no target (the
+///   receipt says so).
 pub(crate) fn resolve_notify_target(
     params: &Value,
-    home_dir: &Path,
     acting_agent: Option<&str>,
     scheduled_target: &str,
-    origin_env: Option<&str>,
+    webchat_target: Option<&str>,
 ) -> std::result::Result<NotifyTarget, String> {
     let field = |key: &str| {
         params
@@ -350,7 +467,9 @@ pub(crate) fn resolve_notify_target(
     }
     let origin = acting_agent
         .filter(|agent| *agent == scheduled_target)
-        .and_then(|agent| duduclaw_gateway::scheduled_webchat::bind_origin(home_dir, origin_env, agent));
+        .and(webchat_target)
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned);
     Ok(match origin {
         Some(session) => NotifyTarget {
             channel: Some(duduclaw_gateway::scheduled_webchat::CHANNEL.to_string()),
@@ -364,7 +483,7 @@ pub(crate) fn resolve_notify_target(
 /// Receipt tail (zh-TW + English) telling the user where results will go.
 pub(crate) fn delivery_receipt_suffix(delivery: Delivery) -> &'static str {
     match delivery {
-        Delivery::Channel => "",
+        Delivery::Channel => "執行結果會傳送到指定的聊天對話。Results will be sent to the selected conversation.",
         Delivery::OriginWebchat => {
             "執行結果會回到這個 WebChat 對話，不會即時推播；重新開啟此對話即可查看。\
              Results will be posted back to this WebChat conversation. There is no live push; reopen this conversation to see them."
@@ -533,13 +652,15 @@ pub(crate) fn render_cron_tasks(tasks: &[duduclaw_gateway::cron_store::CronTaskR
         let last_run = t.last_run_at.as_deref().unwrap_or("never");
         let last_status = t.last_status.as_deref().unwrap_or("-");
         lines.push(format!(
-            "{status_icon} [{id}] {name}\n  cron: {cron} | agent: {agent} | runs: {runs} (fail: {fail})\n  last_run: {last_run} | last_status: {last_status}\n  task: {task}\n",
+            "{status_icon} [{id}] {name}\n  cron: {cron} | agent: {agent} | runs: {runs} (fail: {fail})\n  last_run: {last_run} | last_status: {last_status}\n  delivery: {delivery} | reason: {reason}\n  task: {task}\n",
             id = truncate_bytes(&t.id, 8),
             name = t.name,
             cron = t.cron,
             agent = t.agent_id,
             runs = t.run_count,
             fail = t.failure_count,
+            delivery = t.last_delivery_status.as_deref().unwrap_or("-"),
+            reason = t.last_delivery_reason.as_deref().unwrap_or("-"),
             task = {
                 let t_task = truncate_bytes(&t.task, 120);
                 if t_task.len() < t.task.len() { format!("{t_task}…") } else { t.task.clone() }
@@ -736,12 +857,18 @@ mod origin_target_tests {
         session
     }
 
+    /// The gateway-bound target (`RecipientContext::webchat_origin`).
+    fn bound(home: &Path, session: &str, agent: &str) -> Option<String> {
+        duduclaw_gateway::scheduled_webchat::bind_origin(home, Some(session), agent)
+    }
+
     // Not run here: builds and tests are not executed in this worktree.
     #[tokio::test]
     async fn no_target_defaults_to_the_origin_webchat_conversation() {
         let home = tempfile::tempdir().unwrap();
         let session = origin_session(home.path(), "sales").await;
-        let target = resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "sales", Some(&session))
+        let webchat = bound(home.path(), &session, "sales").unwrap();
+        let target = resolve_notify_target(&serde_json::json!({}), Some("sales"), "sales", Some(&webchat))
             .unwrap();
         assert_eq!(target.channel.as_deref(), Some("webchat"));
         // The stored target is the session id stamped with its creation time.
@@ -753,10 +880,53 @@ mod origin_target_tests {
         // A channel the model names wins over the origin.
         let named = resolve_notify_target(
             &serde_json::json!({"notify_channel":"line","notify_chat_id":"U1"}),
-            home.path(), Some("sales"), "sales", Some(&session),
+            Some("sales"), "sales", Some(&webchat),
         ).unwrap();
         assert_eq!((named.channel.as_deref(), named.chat.as_deref()), (Some("line"), Some("U1")));
         assert_eq!(named.delivery(), Delivery::Channel);
+    }
+
+    // (a) H1: a forged `DUDUCLAW_ORIGIN_SESSION` naming a real conversation
+    // of the same employee is ignored — with no live gateway turn the job is
+    // created without a default destination and the receipt says so.
+    #[tokio::test]
+    async fn forged_origin_session_env_is_ignored() {
+        const CHILD: &str = "DUDUCLAW_FORGED_ORIGIN_SESSION_TEST_CHILD";
+        let home = tempfile::tempdir().unwrap();
+        let session = origin_session(home.path(), "sales").await;
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mcp::cron_tasks::origin_target_tests::forged_origin_session_env_is_ignored"])
+                .env(CHILD, "1")
+                .env(duduclaw_core::ENV_ORIGIN_SESSION, &session)
+                .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
+                .env_remove(duduclaw_core::ENV_TRUST_TURN_ID)
+                .env_remove(duduclaw_core::egress_guard::ENV_TURN_ALIAS)
+                .output().unwrap();
+            assert!(output.status.success(), "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        assert_eq!(std::env::var(duduclaw_core::ENV_ORIGIN_SESSION).as_deref(), Ok(session.as_str()));
+        // Creation now requires an operational caller; the forged origin
+        // must still confer no recipient authority.
+        std::fs::create_dir_all(home.path().join("agents/sales")).unwrap();
+        std::fs::write(home.path().join("agents/sales/agent.toml"),
+            "[agent]\nname = 'sales'\nrole = 'specialist'\nstatus = 'active'\n").unwrap();
+        let created = handle_schedule_task(
+            &serde_json::json!({"agent_id":"sales","cron":"0 9 * * *","task":"report","name":"Daily"}), home.path(), "sales",
+        ).await;
+        assert_ne!(created["isError"], true, "{created}");
+        assert!(created["content"][0]["text"].as_str().unwrap().contains("不會傳送到任何地方"));
+        let rows = duduclaw_gateway::cron_store::CronStore::open(home.path()).unwrap().list_all().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].notify_channel.is_none() && rows[0].notify_chat_id.is_none());
+        assert!(rows[0].notify_origin.is_none() && rows[0].notify_origin_proof.is_none());
+        let reminder = handle_create_reminder(
+            &serde_json::json!({"time":"10m","message":"check"}), home.path(), RecordActor::Agent("sales"),
+        ).await;
+        assert_eq!(reminder["isError"], true, "no default destination: {reminder}");
+        assert!(duduclaw_gateway::reminder_scheduler::list_reminders(home.path(), None, None).await.is_empty());
     }
 
     #[tokio::test]
@@ -774,31 +944,36 @@ mod origin_target_tests {
     async fn model_supplied_webchat_target_is_rejected() {
         let home = tempfile::tempdir().unwrap();
         let session = origin_session(home.path(), "sales").await;
+        let webchat = bound(home.path(), &session, "sales").unwrap();
         for args in [
             serde_json::json!({"notify_channel":"webchat","notify_chat_id": session}),
             serde_json::json!({"notify_channel":"WebChat","notify_chat_id":"webchat:webchat:x"}),
         ] {
-            assert!(resolve_notify_target(&args, home.path(), Some("sales"), "sales", Some(&session)).is_err(), "{args}");
+            assert!(resolve_notify_target(&args, Some("sales"), "sales", Some(&webchat)).is_err(), "{args}");
         }
         // Partial targets are still refused.
-        assert!(resolve_notify_target(&serde_json::json!({"notify_channel":"line"}), home.path(), Some("sales"), "sales", None).is_err());
+        assert!(resolve_notify_target(&serde_json::json!({"notify_channel":"line"}), Some("sales"), "sales", None).is_err());
     }
 
     #[tokio::test]
     async fn origin_bound_to_another_employee_is_ignored() {
         let home = tempfile::tempdir().unwrap();
         let session = origin_session(home.path(), "sales").await;
-        // Acting employee differs from the session's `#agent:` / stored owner.
-        let other = resolve_notify_target(&serde_json::json!({}), home.path(), Some("hr"), "hr", Some(&session)).unwrap();
-        assert_eq!(other.delivery(), Delivery::Nowhere);
+        // The gateway binds the turn's session only to its own employee
+        // (`#agent:` segment / stored owner); another employee gets none.
+        assert_eq!(bound(home.path(), &session, "hr"), None);
+        let webchat = bound(home.path(), &session, "sales").unwrap();
         // Scheduling for someone else never borrows the caller's conversation.
-        let delegated = resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "hr", Some(&session)).unwrap();
+        let delegated = resolve_notify_target(&serde_json::json!({}), Some("sales"), "hr", Some(&webchat)).unwrap();
         assert_eq!(delegated.delivery(), Delivery::Nowhere);
         // Operator callers (no acting employee) and absent / unknown origins.
-        assert_eq!(resolve_notify_target(&serde_json::json!({}), home.path(), None, "sales", Some(&session)).unwrap().delivery(), Delivery::Nowhere);
-        assert_eq!(resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "sales", None).unwrap().delivery(), Delivery::Nowhere);
+        assert_eq!(resolve_notify_target(&serde_json::json!({}), None, "sales", Some(&webchat)).unwrap().delivery(), Delivery::Nowhere);
+        assert_eq!(resolve_notify_target(&serde_json::json!({}), Some("sales"), "sales", None).unwrap().delivery(), Delivery::Nowhere);
         let unknown = session.replace("c0ffee", "beef");
-        assert_eq!(resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "sales", Some(&unknown)).unwrap().delivery(), Delivery::Nowhere);
+        assert_eq!(bound(home.path(), &unknown, "sales"), None);
+        // No live turn ⇒ no context ⇒ no default, whatever the process env says.
+        assert_eq!(resolve_turn_notify_target(&serde_json::json!({}), Some("sales"), "sales", None)
+            .unwrap().delivery(), Delivery::Nowhere);
         let receipt = delivery_receipt_suffix(Delivery::Nowhere);
         assert!(receipt.contains("不會傳送到任何地方") && receipt.contains("will not be delivered anywhere"));
         assert!(receipt.contains("notify_channel"));
@@ -954,3 +1129,7 @@ pub(crate) async fn handle_run_cron_task(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "channel_schedule_tests.rs"]
+mod channel_schedule_tests;

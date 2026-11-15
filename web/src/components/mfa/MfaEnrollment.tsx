@@ -91,7 +91,7 @@ export function MfaEnrollment({ initial, begin, confirm, onSaved, onCancel }: {
       <label className="block space-y-2">{t('mfa.code')}<Input autoComplete="one-time-code" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} required pattern="[0-9]{6}" /></label>
     </> : <>
       <label className="block space-y-2">{t('mfa.password')}<Input type="password" maxLength={4096} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required /></label>
-      {enrollment?.enrollment_token && <>
+      {enrollment?.enrollment_token && enrollment.proof_required !== false && <>
         <p className="text-sm">{t('mfa.proof.hint')}</p>
         {enrollment.challenge_ref && <p className="break-all text-sm">{t('mfa.challengeRef')}: <code>{enrollment.challenge_ref}</code></p>}
         <label className="block space-y-2">{t('mfa.proof')}<Input autoComplete="off" value={proof} onChange={e => setProof(e.target.value)} required /></label>

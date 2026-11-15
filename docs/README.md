@@ -93,6 +93,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/74-ag-ui.md](features/74-ag-ui.md) | AG-UI 1.0 HTTP/SSE frontend endpoint, account-bound conversations and approval interrupts; [繁體中文](features/zh-TW/74-ag-ui.md) / [日本語](features/ja-JP/74-ag-ui.md) |
 | [features/75-compliance-reports.md](features/75-compliance-reports.md) | Enterprise Admin compliance reports: recorded outbound decisions, approvals, action reviews and data-source accesses; [繁體中文](features/zh-TW/75-compliance-reports.md) / [日本語](features/ja-JP/75-compliance-reports.md) |
 | [features/77-protected-mode.md](features/77-protected-mode.md) | Native Linux protected mode (planned for v1.82.0): Personal and Shared employees, connectors, retire/restore/adopt/purge rules, recording gate, what still needs a real host. Not available in v1.81.0, where the protected service runs as in v1.80; [繁體中文](features/zh-TW/77-protected-mode.md) / [日本語](features/ja-JP/77-protected-mode.md) |
+| [features/78-action-claim-check.md](features/78-action-claim-check.md) | Action claim check: mail / calendar / sheets / docs / tasks completion claims in chat replies checked against the same conversation's tool records, the two notice texts, who sees them, `[action_claims] mode` (default `notice`) and known limits; [繁體中文](features/zh-TW/78-action-claim-check.md) / [日本語](features/ja-JP/78-action-claim-check.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---

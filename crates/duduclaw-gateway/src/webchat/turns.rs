@@ -17,10 +17,56 @@ pub(super) mod downstream;
 pub(super) use identity::IdentityUnavailable;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod no_responder_tests;
 pub(super) use run::TurnInput;
 
 tokio::task_local! {
     pub(crate) static TURN_ID: String;
+}
+
+/// Dispatch budget includes separators; an oversized single message runs alone unchanged.
+const MAX_MERGED_CHARS: usize = 32_000;
+const MERGE_SEPARATOR: &str = "\n\n---\n";
+
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AdmissionReason { UserLimit, GlobalLimit, CancelQuota, StoreUnavailable, ConfigInvalid, DuplicateMessage, ConversationQueue }
+
+#[derive(Debug, serde::Serialize)]
+pub(super) struct AdmissionError {
+    pub reason: AdmissionReason,
+    pub limit: usize,
+    pub running: usize,
+    pub queued: usize,
+}
+impl AdmissionError {
+    pub fn code(&self) -> &'static str {
+        if self.reason == AdmissionReason::DuplicateMessage { "duplicate_message" } else { "turn_limit" }
+    }
+    pub fn log_refusal(&self, user: &str, employee: &str) {
+        let record = self.record(user, employee);
+        tracing::info!(event = "webchat_turn_refused", record = %record, "WebChat admission refused");
+    }
+    pub fn record(&self, user: &str, employee: &str) -> serde_json::Value {
+        serde_json::json!({"event":"webchat_turn_refused", "user":user, "employee":employee,
+            "reason":self.reason, "limit":self.limit, "running":self.running, "queued":self.queued,
+            "timestamp":chrono::Utc::now().to_rfc3339()})
+    }
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CancelOutcome { Waiting, Running }
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MergedOutcome { Done, Failed, Cancelled }
+
+struct PendingMessage {
+    credential: Option<(u64, Option<String>)>,
+    content: String,
+    attachments: Vec<ChatAttachment>,
 }
 
 #[derive(Default)]
@@ -49,6 +95,10 @@ struct Entry {
     admitted: bool,
     active: bool,
     tail: Option<oneshot::Receiver<()>>,
+    sequence: usize,
+    pending: Option<PendingMessage>,
+    merged_into: Option<String>,
+    result: Arc<Mutex<MergedOutcome>>,
 }
 
 pub(super) struct Ticket {
@@ -62,6 +112,9 @@ pub(super) struct Ticket {
     started: AtomicBool,
     predecessor: Option<oneshot::Receiver<()>>,
     finished: Option<oneshot::Sender<()>>,
+    originals: Vec<(String, String, usize)>,
+    merged: Vec<String>,
+    result: Arc<Mutex<MergedOutcome>>,
 }
 
 /// Widget identities rotate per connection; the transport IP does not.
@@ -98,20 +151,35 @@ impl Registry {
         msg_id: &str,
         limit: usize,
         global_limit: usize,
-    ) -> Result<Ticket, &'static str> {
+    ) -> Result<Ticket, AdmissionError> {
         let mut entries = self.entries.lock().unwrap();
+        let counts = |global: bool| {
+            let live: Vec<_> = entries.values().filter(|e| !e.cancel.is_cancelled() && e.merged_into.is_none() && (global || e.user == user)).collect();
+            (live.iter().filter(|e| e.active).count(), live.iter().filter(|e| !e.active).count())
+        };
+        let (running, queued) = counts(false);
+        let (global_running, global_queued) = counts(true);
+        let refusal = |reason, limit, running, queued| AdmissionError { reason, limit, running, queued };
         if entries
             .values()
             .any(|e| e.user == user && e.sid == sid && e.msg_id == msg_id)
         {
-            return Err("duplicate_message");
+            return Err(refusal(AdmissionReason::DuplicateMessage, limit, running, queued));
         }
-        if entries.len() >= global_limit || entries.values().filter(|e| e.user == user).count() >= limit {
-            return Err("turn_limit");
+        if limit == 0 || global_limit == 0 {
+            return Err(refusal(AdmissionReason::ConfigInvalid, 0, running, queued));
         }
+        if global_running + global_queued >= global_limit {
+            return Err(refusal(AdmissionReason::GlobalLimit, global_limit, global_running, global_queued));
+        }
+        if running + queued >= limit {
+            return Err(refusal(AdmissionReason::UserLimit, limit, running, queued));
+        }
+        let sequence = entries.values().map(|e| e.sequence).max().unwrap_or(0) + 1;
         let id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
         let delivery_cancel = CancellationToken::new();
+        let result = Arc::new(Mutex::new(MergedOutcome::Failed));
         entries.insert(
             id.clone(),
             Entry {
@@ -129,6 +197,7 @@ impl Registry {
                 admitted: false,
                 active: false,
                 tail: None,
+                sequence, pending: None, merged_into: None, result: result.clone(),
             },
         );
         Ok(Ticket {
@@ -142,6 +211,7 @@ impl Registry {
             started: AtomicBool::new(false),
             predecessor: None,
             finished: None,
+            originals: Vec::new(), merged: Vec::new(), result,
         })
     }
 
@@ -149,7 +219,7 @@ impl Registry {
     pub(super) fn admit(
         self: &Arc<Self>, user: &str, sid: &str, conv: Option<String>, msg_id: &str,
         limit: usize, global_limit: usize,
-    ) -> Result<Ticket, &'static str> {
+    ) -> Result<Ticket, AdmissionError> {
         let mut ticket = self.reserve(user, sid, conv, msg_id, limit, global_limit)?;
         ticket.join_lane(sid);
         Ok(ticket)
@@ -161,26 +231,43 @@ impl Registry {
         self: &Arc<Self>, broker: Option<&crate::approval::ApprovalBroker>, principal: &str,
         user: &str, sid: &str, conv: Option<String>, msg_id: &str,
         limit: usize, global_limit: usize,
-    ) -> Result<Ticket, &'static str> {
+    ) -> Result<Ticket, AdmissionError> {
         // Reserve both caps before quota I/O; join the FIFO only once accepted.
         // A refused reservation drops its slot without touching the session lane.
         let mut ticket = self.reserve(user, sid, conv, msg_id, limit, global_limit)?;
-        let broker = broker.ok_or("turn_limit")?;
+        let error = |reason, bound| {
+            let entries = self.entries.lock().unwrap();
+            let live: Vec<_> = entries.iter().filter(|(id, e)| **id != ticket.id && e.user == user && !e.cancel.is_cancelled()).map(|(_, e)| e).collect();
+            AdmissionError { reason, limit: bound, running: live.iter().filter(|e| e.active).count(), queued: live.iter().filter(|e| !e.active).count() }
+        };
+        let broker = broker.ok_or_else(|| error(AdmissionReason::StoreUnavailable, limit))?;
         #[cfg(test)]
         self.quota_reads.fetch_add(1, Ordering::Relaxed);
         broker.check_webchat_turn_admission(principal).await.map_err(|error| {
             warn!(%error, "WebChat persistent admission refused");
-            "turn_limit"
+            if error == "turn_limit" {
+                // The durable gate's exact closed sentinel, never a substring match.
+                AdmissionError { reason: AdmissionReason::CancelQuota, limit: 100, ..self.snapshot(user) }
+            } else {
+                AdmissionError { reason: AdmissionReason::StoreUnavailable, limit, ..self.snapshot(user) }
+            }
         })?;
         ticket.principal = principal.to_owned();
         ticket.join_lane(sid);
         Ok(ticket)
     }
 
+    fn snapshot(&self, user: &str) -> AdmissionError {
+        let entries = self.entries.lock().unwrap();
+        let live: Vec<_> = entries.values().filter(|e| e.user == user && e.admitted && !e.cancel.is_cancelled() && e.merged_into.is_none()).collect();
+        AdmissionError { reason: AdmissionReason::ConversationQueue, limit: 0,
+            running: live.iter().filter(|e| e.active).count(), queued: live.iter().filter(|e| !e.active).count() }
+    }
+
     pub(super) fn cancel(
         &self, user: &str, sid: Option<&str>, conv: Option<&str>, msg: Option<&str>,
         request_id: Option<&str>,
-    ) -> Result<(), ()> {
+    ) -> Result<CancelOutcome, ()> {
         if sid.is_none() && conv.is_none() {
             return Err(());
         }
@@ -195,16 +282,73 @@ impl Registry {
             })
             .collect();
         // Without msg_id, select the active turn; a conv matching several sessions is ambiguous.
-        if matches.len() != 1 || matches[0].delivering || matches[0].cancel.is_cancelled() {
+        if matches.len() != 1 || matches[0].delivering || matches[0].merged_into.is_some() || matches[0].cancel.is_cancelled() {
             return Err(());
         }
         matches[0].cancel_request_id = request_id.map(str::to_owned);
+        matches[0].pending = None;
         matches[0].cancel.cancel();
-        Ok(())
+        Ok(if matches[0].active { CancelOutcome::Running } else { CancelOutcome::Waiting })
     }
 }
 
 impl Ticket {
+    pub(super) fn queue_notice(&self, limit: usize) -> Option<AdmissionError> {
+        let entries = self.registry.entries.lock().unwrap();
+        let own = entries.get(&self.id)?;
+        if own.active || is_widget_visitor(&own.user) || own.sid.starts_with("odoolivechat:") { return None; }
+        let user = own.user.clone();
+        drop(entries);
+        Some(AdmissionError { limit, ..self.registry.snapshot(&user) })
+    }
+
+    pub(super) fn stage(&self, input: &TurnInput) {
+        if is_widget_visitor(&input.auth_user) || input.sid.starts_with("odoolivechat:")
+            || crate::chat_commands::is_command(&input.content) { return; }
+        self.registry.entries.lock().unwrap().get_mut(&self.id).unwrap().pending = Some(PendingMessage {
+            credential: input.credential.as_ref().map(|c| (c.credential_epoch, c.jti.clone())),
+            content: input.content.clone(), attachments: input.attachments.clone(),
+        });
+    }
+
+    /// Claim only a consecutive FIFO prefix. Claimed messages can no longer be
+    /// cancelled separately: they are now part of this dispatched turn.
+    fn merge_waiting(&mut self, input: &mut TurnInput) -> bool {
+        let mut entries = self.registry.entries.lock().unwrap();
+        let own = entries.get_mut(&self.id).unwrap();
+        if own.merged_into.is_some() { return false; }
+        let was_waiting = !own.active;
+        own.active = true;
+        let own_pending = own.pending.take();
+        if !was_waiting || own_pending.is_none() || self.cancel.is_cancelled() { return true; }
+        let mut chars = input.content.chars().count();
+        self.originals.push((own.msg_id.clone(), input.content.clone(), input.attachments.len()));
+        let agent = own.agent.clone();
+        let credential = own_pending.unwrap().credential;
+        let mut candidates: Vec<_> = entries.iter_mut().filter(|(id, e)| **id != self.id
+            && e.admitted && e.sid == input.sid && !e.active && !e.cancel.is_cancelled() && e.merged_into.is_none()).collect();
+        candidates.sort_by_key(|(_, e)| e.sequence);
+        for (_, entry) in candidates {
+            if entry.user != input.auth_user || entry.agent != agent { break; }
+            let Some(message) = entry.pending.as_ref() else { break; };
+            if message.credential != credential { break; }
+            let size = message.content.chars().count() + MERGE_SEPARATOR.chars().count();
+            if chars + size > MAX_MERGED_CHARS
+                || input.attachments.len() + message.attachments.len() > super::uploads::MAX_FILES { break; }
+            let message = entry.pending.take().unwrap();
+            // truncate_chars preserves all characters here; the budget was checked above.
+            input.content.push_str(MERGE_SEPARATOR);
+            input.content.push_str(&duduclaw_core::truncate_chars(&message.content, MAX_MERGED_CHARS));
+            chars += size;
+            self.originals.push((entry.msg_id.clone(), message.content, message.attachments.len()));
+            input.attachments.extend(message.attachments);
+            self.merged.push(entry.msg_id.clone());
+            entry.merged_into = Some(self.id.clone());
+            entry.result = self.result.clone();
+        }
+        true
+    }
+
     pub(super) fn set_origin(&self, agent: &str, origin: &str) {
         let mut entries = self.registry.entries.lock().unwrap();
         let entry = entries.get_mut(&self.id).unwrap();
@@ -248,10 +392,25 @@ impl Ticket {
 
 impl Drop for Ticket {
     fn drop(&mut self) {
-        self.registry.entries.lock().unwrap().remove(&self.id);
-        if let Some(finished) = self.finished.take() {
-            let _ = finished.send(());
+        if self.cancel.is_cancelled() {
+            if self.predecessor.is_some() && self.finished.is_some() {
+                let previous = self.predecessor.take().unwrap();
+                let finished = self.finished.take().unwrap();
+                // Retain only the FIFO link until its predecessor finishes. It
+                // holds no payload or admission capacity. Keeping its tail in
+                // the registry also fences messages arriving AFTER cancellation.
+                let registry = self.registry.clone();
+                let id = self.id.clone();
+                tokio::spawn(async move {
+                    let _ = previous.await;
+                    registry.entries.lock().unwrap().remove(&id);
+                    let _ = finished.send(());
+                });
+                return;
+            }
         }
+        self.registry.entries.lock().unwrap().remove(&self.id);
+        if let Some(finished) = self.finished.take() { let _ = finished.send(()); }
     }
 }
 
@@ -407,7 +566,7 @@ impl Outbound {
                 return None;
             }
             if !recovery.observe(validity, false) || !route.authorized(state).await { return None; }
-            let policy = state.target_policy(&route.user, &route.agent, true).await.ok()?;
+            let policy = state.turn_policy(&route.user, route.agent.as_deref(), true).await.ok()?;
             Some((generation?, policy))
         };
         let generation = tokio::time::timeout_at(deadline, check).await.ok().flatten();
@@ -415,16 +574,23 @@ impl Outbound {
             if let Some(ack) = self.ack { let _ = ack.send(false); }
             return if recovery.closed() { Err(()) } else { Ok(()) };
         };
-        *gate.lock().unwrap() = Some(writer::WritePermit {
+        *gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer::WritePermit {
             users: state.user_db.clone(), generation, policy, route: route.clone(), deadline,
             home: state.ctx.home_dir.clone(), receiving_credential: credential.cloned(),
+            contended: false,
         });
         // SplitSink::start_send only buffers a slot. The permit is enforced by
         // GuardedSocket below that adapter, when its flush reaches the socket.
         let sent = tokio::time::timeout_at(deadline, sink.0.send(self.message)).await;
-        gate.lock().unwrap().take();
+        let contended = gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+            .is_some_and(|permit| permit.contended);
         let result = if matches!(sent, Ok(Ok(()))) { Ok(()) } else { Err(()) };
         if let Some(ack) = self.ack { let _ = ack.send(result.is_ok()); }
+        // The caller stops this socket's writer on Err, dropping every other
+        // turn's queued frame. A frame withheld only for an exhausted wait
+        // budget wrote no byte and left SplitSink's slot empty, so only this
+        // turn fails (its ack above is false); the socket stays in service.
+        if contended { return Ok(()); }
         result
     }
 
@@ -534,6 +700,7 @@ pub(super) async fn execute(input: TurnInput, sink: TurnSink, mut ticket: Ticket
             persist_admitted_failure(&state.ctx.session_manager, &state.ctx.home_dir, &sid, &turn_id, crate::channel_reply::TurnFailureReason::Internal, admission_generation.as_deref()).await;
         }).await;
     }).await;
+    *ticket.result.lock().unwrap() = sink.outcome();
 }
 
 async fn persist_failure(
@@ -593,20 +760,32 @@ where
     }
 }
 
-async fn execute_inner(input: TurnInput, sink: TurnSink, ticket: &mut Ticket) {
+async fn execute_inner(mut input: TurnInput, sink: TurnSink, ticket: &mut Ticket) {
     ticket.lineage_principal = Some(downstream::lineage_principal(&input.state.ctx.home_dir, &input.auth_user, &input.sid));
-    // Even a cancelled waiter keeps its FIFO link until its predecessor ends.
-    if let Some(previous) = ticket.predecessor.take() {
-        let _ = previous.await;
+    if let Some(mut previous) = ticket.predecessor.take() {
+        let cancelled = tokio::select! {
+            biased;
+            _ = ticket.cancel.cancelled() => true,
+            _ = &mut previous => false,
+        };
+        if cancelled {
+            ticket.predecessor = Some(previous);
+            let agent = input.effective_agent.as_deref().unwrap_or(&input.agent_id);
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(input.auth_user.clone(),
+                finish_cancel(&input.state.ctx.home_dir, input.state.approvals.as_ref(),
+                    &input.state.ctx.session_manager, &input.sid, agent, ticket, &sink, Ok(())),
+            ).await;
+            return;
+        }
     }
-    ticket
-        .registry
-        .entries
-        .lock()
-        .unwrap()
-        .get_mut(&ticket.id)
-        .unwrap()
-        .active = true;
+    if !ticket.merge_waiting(&mut input) {
+        let outcome = *ticket.registry.entries.lock().unwrap().get(&ticket.id).unwrap().result.lock().unwrap();
+        sink.value(serde_json::json!({"type":"turn_consumed", "outcome":outcome})).await;
+        return;
+    }
+    if !ticket.merged.is_empty() {
+        sink.value(serde_json::json!({"type":"turn_merged", "merged_msg_ids":ticket.merged})).await;
+    }
     let state = input.state.clone();
     let sid = input.sid.clone();
     let auth_user = input.auth_user.clone();
@@ -620,11 +799,14 @@ async fn execute_inner(input: TurnInput, sink: TurnSink, ticket: &mut Ticket) {
     ).await {
         return;
     }
+    // No employee is named and none resolves: only the no-responder notice
+    // can answer, so the turn is authorised without a target.
+    let target = (!state.no_responder_turn(&agent, &sid, &input.user_id).await).then_some(agent.as_str());
     let allowed = recheck_turn_access(
         &ticket.cancel,
         input.resume_acl,
         async {
-            if state.authorize_target(&input.auth_user, &agent, true).await.is_err() {
+            if state.authorize_turn(&input.auth_user, target, true).await.is_err() {
                 return false;
             }
             match &input.requested_agent {
@@ -740,10 +922,10 @@ async fn finish_cancel(
         Err(error) => Err(error),
     };
     let result = sessions.record_webchat_cancel(sid, agent, &ticket.id, &sink.msg_id).await;
-    let (request_id, cause, user) = {
+    let (request_id, cause, user, active) = {
         let entries = ticket.registry.entries.lock().unwrap();
         let entry = entries.get(&ticket.id).unwrap();
-        (entry.cancel_request_id.clone(), entry.cancel_cause, entry.user.clone())
+        (entry.cancel_request_id.clone(), entry.cancel_cause, entry.user.clone(), entry.active)
     };
     if result.is_ok() && ticket.started.load(Ordering::Acquire) {
         let reason = if cause == CancelCause::Person {
@@ -767,6 +949,7 @@ async fn finish_cancel(
     match (result, withdrawal, cleanup) {
         (Ok(()), Ok((withdrawal, delegations_cancelled)), Ok(())) => {
             let mut frame = serde_json::json!({"type":"error", "message":"Turn cancelled", "code":"cancelled",
+                "cancel_outcome":if active { CancelOutcome::Running } else { CancelOutcome::Waiting },
                 "approved_before_cancel":withdrawal, "delegations_cancelled":delegations_cancelled, "request_id":request_id});
             if let Some((count, reference)) = offer {
                 frame["downstream_running"] = count.into();

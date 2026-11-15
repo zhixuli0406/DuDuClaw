@@ -130,6 +130,18 @@ pub(crate) async fn push(
     card: &NotifyCard<'_>,
     dest: &NotifyDest,
 ) -> Receipt {
+    push_guarded(home_dir, card, dest, None).await
+}
+
+/// [`push`] to a verified turn-origin destination: a card held back by quiet
+/// hours carries `origin_proof`, so the drainer re-verifies it before it is
+/// delivered (`goal_notify::deferred_origin_allowed`).
+pub(crate) async fn push_guarded(
+    home_dir: &Path,
+    card: &NotifyCard<'_>,
+    dest: &NotifyDest,
+    origin_proof: Option<&str>,
+) -> Receipt {
     if dest.targets().is_empty() {
         return Receipt::empty();
     }
@@ -139,7 +151,7 @@ pub(crate) async fn push(
     for (channel, chat_id) in dest.targets() {
         let outcome = match dest {
             NotifyDest::Agent { agent_id, .. } => {
-                let Some(token) = crate::goal_notify::channel_token(home_dir, agent_id, channel)
+                let Some(token) = crate::goal_notify::channel_token_for_target(home_dir, agent_id, channel, chat_id)
                     .await
                 else {
                     info!(
@@ -149,8 +161,8 @@ pub(crate) async fn push(
                     continue;
                 };
                 receipt.attempted += 1;
-                crate::decision_notify::deliver_outcome(
-                    home_dir, &http, channel, &token, chat_id, card,
+                crate::decision_notify::deliver_outcome_guarded(
+                    home_dir, &http, channel, &token, chat_id, card, Some(agent_id), origin_proof,
                 )
                 .await
             }
@@ -194,7 +206,7 @@ pub(crate) async fn push_person_notice(home: &Path, user_id: &str, text: &str) {
     let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return; };
     let Ok(Some(user)) = db.get_user(user_id) else { return; };
     if user.status != duduclaw_auth::UserStatus::Active { return; }
-    let Ok(links) = db.verified_channels_for_user(user_id) else { return; };
+    let Ok(links) = db.verified_dm_destinations_for_user(user_id) else { return; };
     let Ok(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() else { return; };
     let level = crate::notify_governance::NotifyLevel::Confirm;
     let policy = crate::notify_governance::QuietPolicy {
@@ -209,7 +221,7 @@ pub(crate) async fn push_person_notice(home: &Path, user_id: &str, text: &str) {
                 level: level.as_str().into(), notify_type: "google.personal_connection".into(),
                 queued_at: chrono::Utc::now().to_rfc3339(), deliver_after: until.to_rfc3339(),
                 kind: crate::notify_governance::NoticeKind::Plain, text: text.into(), link: None,
-                no_button_hint: None, decision_source: None, decision_id: None,
+                no_button_hint: None, decision_source: None, decision_id: None, origin_proof: None,
             });
         } else {
             crate::install_notify::send_plain_text(home, &http, &link.channel, &link.channel_user_id, text).await;
@@ -316,7 +328,7 @@ pub(crate) fn admin_targets(home: &Path) -> Result<Vec<(String, String)>, String
         if user.status != duduclaw_auth::UserStatus::Active || user.role != duduclaw_auth::UserRole::Admin {
             continue;
         }
-        for link in db.verified_channels_for_user(&user.id)? {
+        for link in db.verified_dm_destinations_for_user(&user.id)? {
             let target = (link.channel, link.channel_user_id);
             if !targets.contains(&target) {
                 targets.push(target);
@@ -352,7 +364,7 @@ pub(crate) async fn push_plain_notice(
                 level: level.as_str().into(), notify_type: notify_type.into(),
                 queued_at: chrono::Utc::now().to_rfc3339(), deliver_after: until.to_rfc3339(),
                 kind: crate::notify_governance::NoticeKind::Plain, text: text.into(), link: None,
-                no_button_hint: None, decision_source: None, decision_id: None,
+                no_button_hint: None, decision_source: None, decision_id: None, origin_proof: None,
             });
             if queued { DeliverOutcome::Deferred } else { DeliverOutcome::Failed }
         } else {

@@ -179,6 +179,17 @@
 | チャネル失敗追跡 | `channel_failures.jsonl` + `FailureReason` 列挙（RateLimited/Billing/Timeout/BinaryMissing/SpawnError/EmptyResponse/NoAccounts/Unknown） |
 | Discord Gateway 強化（v1.9.2）| 本物の op 6 RESUME — 再接続を跨いで `session_id` + `resume_gateway_url` + sequence を保持；`select!` 停滞ウォッチドッグが 2× ハートビート沈黙で中断（18 分ゾンビ修正）；ハートビート channel 容量 1→16 を `try_send`；op 9 は `d.bool` で RESUME か IDENTIFY を選択し 1-5s jitter；close code 4007/4009/4003 で session クリア；バックオフ上限 300s→60s；`RESUMED` dispatch 対応 |
 
+
+### WebChat と WordPress チャットウィジェット
+
+ダッシュボードの会話ヘッダーには接続状態のドットが常に表示されます。接続済みは緑、接続中／再接続中は警告色、切断はエラー色です。狭い画面でもスクリーンリーダー用の状態ラベルを利用できます。
+
+WordPress ウィジェット（プラグイン 0.1.1）はヘッダーに接続状態を表示します。切断後は 1 秒から待機時間を倍増させ、最大 30 秒の間隔で 10 回まで再接続を試みます。上限後は **Reconnect** ボタンで再接続できます。ページが再び表示されたとき、ネットワーク復旧時、ページ復元時にも再接続します。
+
+接続前に送信すると、入力欄の文章を残し、吹き出しを **Not sent** と表示します。**Retry** を押した場合だけ、接続後に一度送信します。再接続だけでは再送しません。返信を待っている間に切断すると、返信が届かなかった可能性を知らせます。その後返信を受け取れば通知は消えますが、再接続による以前の返信の復元は保証しません。エラー表示には内部情報を含めません。
+
+表示言語はページの HTML `lang` に従い、中国語には繁体字中国語、それ以外には英語を使用します。未設定時は従来どおり繁体字中国語です。サイト管理者が設定したタイトルはそのまま表示します。状態の変化はスクリーンリーダーにも通知します。ウィジェットには自動テスト環境がなく、作成者による実ブラウザーでの検証は未実施です。
+
 ## 進化システム
 
 > **進化システム v3（2026-08-06）→ S11（2026-09-29）**:進化対象は
@@ -277,7 +288,7 @@
 | 統一監査ログ | `audit.unified_log` が `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` を統合。Logs ページのソースフィルタ + 重要度ドロップダウン |
 | JSONL 監査ログ | ツール呼び出しの完全記録、非同期書込 |
 | Unicode 正規化 | NFKC で同形異字攻撃を検出 |
-| Action Claim Verifier | ツール実行クレームの署名検証 |
+| Action Claim Verifier | 返信中の「完了しました」という主張を正規表現でツール呼び出し記録と照合：エージェント管理系の主張（全返信経路、記録のみ）と、メール／カレンダー／スプレッドシート／ドキュメント／タスク系の主張（チャット返信、同じ会話の記録のみ有効、既定で社内スタッフ向けのお知らせを追記。`[action_claims] mode`）（[78-action-claim-check.md](78-action-claim-check.md)） |
 | コンテナサンドボックス | 独立した 2 つのパス。タスクサンドボックス（`agent.toml [container] sandbox_enabled`）：Docker のみ。委任されたタスクの AI CLI を読み取り専用・非 root・リソース制限付きのコンテナで実行し、使えないときは隔離なしにせずタスクを失敗させる（[ガイド](../../guides/ja-JP/task-sandbox.md)）。スクリプトサンドボックス（PTC `execute_program`、`duduclaw secaudit` の PoC ステップ）：Docker（Windows ではまず WSL2）、`--network=none`、読み取り専用ルート、マウントは読み取り専用の専用スクリプトディレクトリのみ。サンドボックスが使えないとき PTC は実行しない（`script_when_unavailable = "run_unsandboxed"` の場合を除く） |
 | シークレット漏洩スキャナ | 19 のシークレットパターン（Anthropic / OpenAI / AWS / GitHub / GitLab / Slack / Stripe / Google / SendGrid / JWT / PEM 鍵、および鍵やパスワードの代入）と高エントロピー判定。スキルのセキュリティスキャナが使用 |
 | 機密データのリダクション（RFC-23、v1.14.0）| `duduclaw-redaction` crate — 内部データ（Odoo / shared wiki / file tools）を `<REDACT:CATEGORY:hash8>` トークンに置換してから LLM へ送り、信頼境界（user channel reply、許可リストツールの egress）で自動復元；AES-256-GCM SQLite vault（per-agent 32-byte key、0o600）、TTL 7d の 2 段階 GC、5 つの組み込みプロファイル、5 層の enable/disable リゾルバ、JSONL 監査ログ 10MB ローテーション；2026-09 にフィールド単位のルールを追加、`db_field`（Odoo `model.field` / `model.*` の糖衣構文）と汎用 `json_path` は内容のパターン照合ではなく該当フィールドの値そのものをトークン化する。`duduclaw redaction verify` の JSON モードで実際に効くことを検証できる；`db_field` は元々 Odoo 専用に固定されたテーブルしか持たなかったが、2026-09 に任意の MCP ツールが紐付けられる `[redaction.data_sources.*]` レジストリへ一般化され、リダクションの適用範囲も DuDuClaw 自身の MCP server の外へ初めて広がった（詳細は次の行）|

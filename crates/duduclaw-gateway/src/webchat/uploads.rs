@@ -5,7 +5,7 @@ use base64::Engine;
 use serde::{Deserialize, de::{DeserializeSeed, Error, SeqAccess, Visitor}};
 
 pub(super) const MAX_MESSAGE_BYTES: usize = 28 * 1024 * 1024;
-const MAX_FILES: usize = 8;
+pub(super) const MAX_FILES: usize = 8;
 const MAX_BYTES: usize = 20 * 1024 * 1024;
 const MAX_ENCODED: usize = MAX_BYTES.div_ceil(3) * 4;
 const USER_BYTES: u64 = 512 * 1024 * 1024;

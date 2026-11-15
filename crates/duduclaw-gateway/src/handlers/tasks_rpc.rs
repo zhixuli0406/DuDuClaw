@@ -654,21 +654,25 @@ impl MethodHandler {
         if !task_privacy::a2a_owner_allows(&self.home_dir, ctx, task_id) {
             return WsFrame::error_response("", PERMISSION_DENIED);
         }
-        match store.get_task(task_id).await.ok().flatten() {
+        let origin_proof = match store.get_task(task_id).await.ok().flatten() {
             Some(row) => {
                 let direct = ctx.has_agent_access(&row.assigned_to, AccessLevel::Operator)
                     && task_content_visible(&self.home_dir, ctx, task_id, &row.assigned_to);
                 if !direct && !creator_may_manage(&self.home_dir, ctx, &row) {
                     return WsFrame::error_response("", PERMISSION_DENIED);
                 }
+                row.source_origin_proof
             }
             None if !ctx.is_admin() => {
                 return WsFrame::error_response("", "permission denied");
             }
-            None => {}
-        }
+            None => None,
+        };
         match store.remove_task(task_id).await {
             Ok(true) => {
+                // The goal's gateway origin proof goes with it; queued copies
+                // of its pushes are then refused at delivery.
+                crate::recipient_guard::origin::forget_async(&self.home_dir, origin_proof.into_iter().collect()).await;
                 self.broadcast_event("task.removed", json!({ "task_id": task_id }))
                     .await;
                 WsFrame::ok_response("", json!({ "success": true }))

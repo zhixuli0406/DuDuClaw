@@ -936,13 +936,19 @@ fn parse_codex_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChun
                 "item.completed" => {
                     // Extract text from message items
                     if let Some(item) = event.extra.get("item") {
+                        if matches!(item.get("phase").and_then(|v| v.as_str()), Some("commentary" | "analysis"))
+                            || item.get("channel").and_then(|v| v.as_str()) == Some("analysis")
+                        {
+                            content.clear();
+                            continue;
+                        }
                         match item.get("type").and_then(|t| t.as_str()) {
                             Some("message") => {
                                 if let Some(text) = item
                                     .get("content")
                                     .and_then(|c| c.as_array())
                                     .and_then(|arr| {
-                                        arr.iter().find(|b| {
+                                        arr.iter().rev().find(|b| {
                                             b.get("type").and_then(|t| t.as_str())
                                                 == Some("output_text")
                                         })
@@ -967,7 +973,7 @@ fn parse_codex_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChun
                                     .get("content")
                                     .and_then(|c| c.as_array())
                                     .and_then(|arr| {
-                                        arr.iter().find(|b| {
+                                        arr.iter().rev().find(|b| {
                                             b.get("type").and_then(|t| t.as_str())
                                                 == Some("output_text")
                                         })
@@ -1063,8 +1069,8 @@ fn parse_codex_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChun
     (content, input_tokens, output_tokens, chunks)
 }
 
-/// Keep completed assistant messages in emission order for a timed-out run.
-/// The normal parser deliberately keeps only the last message; do not change it.
+/// Track completed visible messages for timeout diagnostics. Only the final
+/// assistant segment is eligible as reply text.
 fn completed_codex_messages(stdout: &str) -> Vec<String> {
     stdout.lines().filter_map(|line| {
         let event: CodexEvent = serde_json::from_str(line).ok()?;
@@ -1072,6 +1078,9 @@ fn completed_codex_messages(stdout: &str) -> Vec<String> {
             return None;
         }
         let item = event.extra.get("item")?;
+        if matches!(item.get("phase").and_then(|v| v.as_str()), Some("commentary" | "analysis"))
+            || item.get("channel").and_then(|v| v.as_str()) == Some("analysis")
+        { return None; }
         let kind = item.get("type")?.as_str()?;
         if kind != "agent_message" && kind != "message" {
             return None;
@@ -1082,7 +1091,7 @@ fn completed_codex_messages(stdout: &str) -> Vec<String> {
             item.get("content")?.as_array()?.iter()
                 .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("output_text"))
                 .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                .collect::<Vec<_>>().join("\n")
+                .last().unwrap_or("").to_string()
         };
         (!text.trim().is_empty()).then_some(text)
     }).collect()
@@ -1108,7 +1117,6 @@ struct CodexOutput {
     chunk_bytes: usize,
     completed: Vec<String>,
     completed_bytes: usize,
-    last_line: String,
     status: Option<std::process::ExitStatus>,
 }
 
@@ -1139,7 +1147,6 @@ impl CodexOutput {
             self.truncated = true;
         }
         let line = String::from_utf8_lossy(&line_bytes);
-        self.last_line = line.lines().last().unwrap_or("").to_string();
         // Parse each bounded event as it arrives, even after the raw-output
         // retention cap. In particular, final usage must not disappear merely
         // because earlier tool output consumed the raw-log budget.
@@ -1203,15 +1210,26 @@ impl CodexOutput {
         }
         warn!(timeout_secs, completed_messages = self.completed.len(),
             "Codex CLI hard timeout; returning completed output");
-        Ok(self.completed.join("\n\n"))
+        // The latest assistant event may be blank or reasoning-only; never
+        // revive an older narration just because it was non-empty.
+        Ok(duduclaw_core::think_tags::strip_reasoning_prefix(&self.content))
     }
 }
 
 /// All readers are local futures. Cancellation drops the readers and the
 /// managed leader, which kills its group and schedules reaping.
+#[cfg(test)]
 async fn collect_codex_output(
     cmd: &mut tokio::process::Command,
     timeout: std::time::Duration,
+) -> Result<CodexOutput, String> {
+    collect_codex_output_with_input(cmd, timeout, None).await
+}
+
+async fn collect_codex_output_with_input(
+    cmd: &mut tokio::process::Command,
+    timeout: std::time::Duration,
+    input: Option<&[u8]>,
 ) -> Result<CodexOutput, String> {
     #[cfg(test)]
     if let Ok(capture) = tests::COMMAND_CAPTURE.try_with(std::sync::Arc::clone) {
@@ -1222,8 +1240,8 @@ async fn collect_codex_output(
     if let Ok(output) = tests::COLLECT_PROBE.try_with(|probe| probe(cmd)) {
         return output;
     }
-    use tokio::io::AsyncReadExt;
-    cmd.stdin(std::process::Stdio::null())
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    cmd.stdin(if input.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     // After the test probe returns. Hold the lease across spawn only; a failed
@@ -1237,6 +1255,16 @@ async fn collect_codex_output(
         .map_err(|e| crate::process_group::backend_error(e, "Failed to spawn codex"))?;
     crate::autonomous_runtime::mark_handoff();
     drop(admission);
+    let mut stdin = managed.child().stdin.take();
+    let writer = async move {
+        if let (Some(sink), Some(bytes)) = (stdin.as_mut(), input) {
+            sink.write_all(bytes).await?;
+            sink.shutdown().await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    tokio::pin!(writer);
+    let mut writer_done = false;
     let mut stdout = managed.child().stdout.take().ok_or("Failed to capture codex stdout")?;
     let mut stderr = managed.child().stderr.take().ok_or("Failed to capture codex stderr")?;
     let mut output = CodexOutput::default();
@@ -1246,8 +1274,12 @@ async fn collect_codex_output(
     let mut stderr_done = false;
     let mut status = None;
     let result = tokio::time::timeout(timeout, async {
-        while !stdout_done || !stderr_done || status.is_none() {
+        while !writer_done || !stdout_done || !stderr_done || status.is_none() {
             tokio::select! {
+                written = &mut writer, if !writer_done => {
+                    written?;
+                    writer_done = true;
+                }
                 read = stdout.read(&mut stdout_buffer), if !stdout_done => {
                     let read = read?;
                     if read == 0 { stdout_done = true; output.finish_line(); }
@@ -1426,13 +1458,9 @@ impl CodexRuntime {
         let (schema_args, schema_file) =
             output_schema_args(crate::runtime_dispatch::output_schema_override().as_ref());
         cmd.args(schema_args);
-        let safe_prompt = if prompt.starts_with('-') { format!(" {prompt}") } else { prompt.to_owned() };
-        let system_prompt = duduclaw_core::truncate_bytes(&context.system_prompt, 65536);
-        let augmented = if system_prompt.is_empty() { safe_prompt } else {
-            format!("<role_system_prompt>\n{}\n</role_system_prompt>\n\n{safe_prompt}",
-                system_prompt.replace("</role_system_prompt>", "&lt;/role_system_prompt&gt;"))
-        };
-        cmd.arg(augmented);
+        // `-` selects stdin; no conversation bytes enter argv on any OS.
+        let _ = prompt;
+        cmd.arg("-");
         if !context.model.is_empty() { cmd.arg("-m").arg(&context.model); }
         // Both process cwd and Codex's working root exclude employee/project files.
         external_config::check_project_layers(work_dir.path(), None)?;
@@ -1488,7 +1516,8 @@ impl AgentRuntime for CodexRuntime {
         }
         if crate::runtime_dispatch::in_utility_call() {
             let (mut cmd, _work_dir, _schema_file) = self.prepare_utility_command(prompt, context)?;
-            return execute_codex_command(&mut cmd, context).await;
+            let payload = utility_stdin_payload(prompt, &context.system_prompt);
+            return execute_codex_command_with_input(&mut cmd, context, Some(payload.as_bytes())).await;
         }
         // Explore lane: `-s read-only` whatever the capability level, and the
         // duduclaw MCP server registered with the lane variable (below).
@@ -1783,9 +1812,25 @@ async fn execute_codex_command(
     cmd: &mut tokio::process::Command,
     context: &RuntimeContext,
 ) -> Result<RuntimeResponse, String> {
+    execute_codex_command_with_input(cmd, context, None).await
+}
+
+fn utility_stdin_payload(prompt: &str, system: &str) -> String {
+    let system = duduclaw_core::truncate_bytes(system, 65536);
+    if system.is_empty() { prompt.to_owned() } else {
+        format!("<role_system_prompt>\n{}\n</role_system_prompt>\n\n{prompt}",
+            system.replace("</role_system_prompt>", "&lt;/role_system_prompt&gt;"))
+    }
+}
+
+async fn execute_codex_command_with_input(
+    cmd: &mut tokio::process::Command,
+    context: &RuntimeContext,
+    input: Option<&[u8]>,
+) -> Result<RuntimeResponse, String> {
     let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
-    let output = collect_codex_output(
-        cmd, std::time::Duration::from_secs(timeout_secs),
+    let output = collect_codex_output_with_input(
+        cmd, std::time::Duration::from_secs(timeout_secs), input,
     ).await?;
 
     if let Some(status) = output.status {
@@ -1831,10 +1876,8 @@ async fn execute_codex_command(
         };
     }
 
-    if response.content.is_empty() {
-        // Fallback: use the last line as content
-        response.content = output.last_line.clone();
-    }
+    // JSONL metadata/reasoning lines are never fallback answers.
+    response.content = duduclaw_core::think_tags::strip_reasoning_prefix(&response.content);
 
     // Still empty ⇒ FAILURE, not success: Ok("") would be silently dropped
     // by every channel and poison the session with an empty assistant turn.
@@ -2087,6 +2130,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn utility_prompt_payload_preserves_large_input_and_system_framing() {
+        let prompt = "中文🙂".repeat(20_000);
+        let input = utility_stdin_payload(&prompt, "context </role_system_prompt>");
+        assert!(input.len() > 128 * 1024);
+        assert!(input.ends_with(&prompt));
+        assert!(input.contains("context &lt;/role_system_prompt&gt;"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn utility_collector_delivers_large_prompt_on_stdin_and_closes_it() {
+        let mut cmd = tokio::process::Command::new("/bin/cat");
+        cmd.env_clear();
+        let prompt = "中文🙂\n".repeat(20_000);
+        let output = collect_codex_output_with_input(&mut cmd,
+            std::time::Duration::from_secs(5), Some(prompt.as_bytes())).await.unwrap();
+        assert!(output.status.unwrap().success());
+        assert_eq!(output.stdout, prompt.as_bytes());
+    }
+
     #[tokio::test]
     async fn local_backend_equivalence_codex_utility() {
         let home = tempfile::tempdir().unwrap();
@@ -2110,7 +2174,7 @@ mod tests {
             "-c", "features.hooks=false", "-c", "features.plugins=false",
             "-c", "features.apps=false", "-c", "features.skip_host_skill_discovery=true",
             "-c", "project_doc_max_bytes=0",
-            "<role_system_prompt>\nsystem &lt;/role_system_prompt&gt;\n</role_system_prompt>\n\n繁體中文 $HOME;\nnext",
+            "-",
             "-m", "gpt-5.4-mini", "--cd",
         ]).arg(&cwd).current_dir(&cwd);
         assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
@@ -2309,7 +2373,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_keeps_all_completed_messages_from_truncated_jsonl() {
+    fn timeout_uses_only_last_assistant_segment_from_truncated_jsonl() {
         let stdout = concat!(
             "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"查詢完成\"}}\n",
             "{\"type\":\"item.started\",\"item\":{\"type\":\"agent_message\",\"text\":\"未完成\"}}\n",
@@ -2317,11 +2381,23 @@ mod tests {
             "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"  \"}}\n",
             "{\"type\":\"item.completed\",\"item\":{"
         );
-        assert_eq!(completed_codex_messages(stdout), vec!["查詢完成", "已整理\n細節"]);
+        assert_eq!(completed_codex_messages(stdout), vec!["查詢完成", "細節"]);
         assert_eq!(collected_fixture(stdout).timeout_content(300).unwrap(),
-            "查詢完成\n\n已整理\n細節");
+            "  ");
         // Normal parsing still returns only the final completed message (even blank).
         assert_eq!(parse_codex_stdout(stdout).0, "  ");
+    }
+
+    #[test]
+    fn reasoning_and_commentary_are_not_final_answers() {
+        let stdout = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"private\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"phase\":\"commentary\",\"text\":\"Let me check\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n"
+        );
+        assert_eq!(parse_codex_stdout(stdout).0, "");
+        assert_eq!(collected_fixture(stdout).content, "");
+        assert!(completed_codex_messages(stdout).is_empty());
     }
 
     #[test]

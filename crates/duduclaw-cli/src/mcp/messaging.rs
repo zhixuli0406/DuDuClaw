@@ -202,6 +202,7 @@ pub(crate) async fn handle_send_media(
                 }
             }
         }
+        "googlechat" => return super::egress_gate::pre_dispatch_error("Google Chat 目前無法直接傳送圖片或附件。請將內容直接放在回覆中，或告知使用者無法在此傳送；不要承諾圖片已送達。"),
         _ => return super::egress_gate::pre_dispatch_error(&format!("Channel '{channel}' does not support {media_type} yet")),
     };
 
@@ -213,4 +214,30 @@ fn sink_result(result: std::result::Result<String, String>) -> Value {
     let failed = result.is_err();
     let text = result.unwrap_or_else(|error| error);
     serde_json::json!({"content":[{"type":"text","text":text}], "isError":failed})
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    #[tokio::test]
+    async fn googlechat_photo_is_a_clear_tool_error() {
+        let home = tempfile::tempdir().unwrap();
+        let out = super::handle_send_media(
+            &serde_json::json!({"channel":"googlechat", "chat_id":"spaces/A", "url":"https://example.com/image.png"}),
+            home.path(), &reqwest::Client::new(), "photo",
+        ).await;
+        assert_eq!(out["isError"], true);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("無法直接傳送圖片"));
+        assert!(text.contains("不要承諾"));
+    }
+
+    #[test]
+    fn googlechat_send_error_stays_an_error_at_mcp_boundary() {
+        for status in [403, 404, 429, 503] {
+            let error = duduclaw_gateway::googlechat::GoogleChatSendError::Http { status };
+            let out = super::sink_result(Err(error.to_string()));
+            assert_eq!(out["isError"], true);
+            assert!(!out["content"][0]["text"].as_str().unwrap().contains("successfully"));
+        }
+    }
 }

@@ -123,6 +123,16 @@ pub struct Reminder {
     /// shared bot / app (and every reminder created before this field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_agent: Option<String>,
+    /// Gateway-attested source conversation, never a tool argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_origin: Option<String>,
+    /// Opaque id of the gateway-held proof of the human behind
+    /// `notify_origin` ([`crate::recipient_guard::origin`]), re-verified by id
+    /// before each send. Absent ⇒ a send to `notify_origin` is refused
+    /// (`origin_unproven`). Pending v1.81 WebChat reminders get one from the
+    /// gateway's startup backfill when their creator still passes the checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_origin_proof: Option<String>,
     /// Host-carried human origin; absent legacy records remain background work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
@@ -316,6 +326,7 @@ pub async fn send_channel_message_as(
                 error
             })?;
             crate::googlechat::send_text_to_space_as(home_dir, Some(agent), chat_id, text).await
+                .map_err(|e| e.to_string())
         }
         _ => send_channel_message(home_dir, http, channel, chat_id, text).await,
     }
@@ -327,6 +338,68 @@ async fn read_config(home_dir: &Path) -> Option<toml::Table> {
     let path = home_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&path).await.ok()?;
     content.parse().ok()
+}
+
+/// Keep scheduled file delivery behind the same recipient admission and I/O
+/// permit as text. The producing employee, not the sending bot, owns the files.
+async fn send_reminder_result(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    reminder: &Reminder,
+    text: &str,
+    sender_agent: Option<&str>,
+    prepared_reply: &mut Option<String>,
+) -> Result<(), String> {
+    if !text.contains(crate::office_docs::DELIVER_MARKER) {
+        return send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, text, sender_agent).await;
+    }
+    let channel = reminder.channel.as_str();
+    let own = sender_agent.filter(|a| duduclaw_core::is_valid_agent_id(a));
+    let sender: Box<dyn crate::channel_sender::ChannelSender> = match (channel, own) {
+        ("googlechat", Some(agent)) => {
+            crate::product_policy::require_channel(home_dir, channel)?;
+            crate::channel_sender::create_googlechat_sender_for(
+                home_dir.to_path_buf(), reminder.chat_id.clone(), String::new(), Some(agent.into()),
+            )
+        }
+        ("telegram", Some(agent)) => {
+            crate::product_policy::require_channel(home_dir, channel)?;
+            let cfg = SecretManagerConfig::load_from_home(home_dir).await;
+            let token = crate::config_crypto::read_agent_channel_token(home_dir, agent, "telegram", &cfg)
+                .await.map(|t| crate::config_crypto::repair_telegram_token(t.expose()).into_owned())
+                .ok_or_else(|| format!("AI employee {agent}'s own Telegram bot is no longer configured"))?;
+            let target = crate::channel_sender::ChannelTarget {
+                channel_type: channel.into(), chat_id: reminder.chat_id.clone(), token, extra_id: None,
+            };
+            crate::channel_sender::create_sender_for_home(home_dir, &target, http.clone())
+        }
+        _ => {
+            let target = resolve_channel_target(home_dir, channel, &reminder.chat_id).await?;
+            crate::channel_sender::create_sender_for_home(home_dir, &target, http.clone())
+        }
+    };
+    // A final text retry must not deliver the documents a second time.
+    let text = match prepared_reply.as_ref() {
+        Some(text) => text.clone(),
+        None => {
+            let text = prepare_reminder_reply(home_dir, reminder, text, sender.as_ref()).await;
+            *prepared_reply = Some(text.clone());
+            text
+        }
+    };
+    if text.trim().is_empty() { return Ok(()); }
+    sender.send_text(&text).await.map_err(|e| e.to_string())
+}
+
+async fn prepare_reminder_reply(
+    home_dir: &Path,
+    reminder: &Reminder,
+    text: &str,
+    sender: &dyn crate::channel_sender::ChannelSender,
+) -> String {
+    crate::office_docs::process_deliverables(
+        text, &home_dir.join("agents").join(&reminder.agent_id), home_dir, sender,
+    ).await
 }
 
 /// Read one `[channels] <field>(_enc)` credential from an already-parsed
@@ -570,6 +643,96 @@ pub async fn append_reminder_checked_admitted(
     }))
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
+}
+
+/// Largest `reminders.jsonl` the strict reader accepts (same bound as the
+/// isolated reader and the origin proof collector).
+const MAX_STRICT_REMINDER_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Every reminder on disk, read strictly: a missing file is empty; an
+/// oversized file or any line that does not parse is an error — nothing is
+/// guessed or silently dropped. For the gateway's startup origin backfill.
+pub(crate) fn load_reminders_strict_sync(home_dir: &Path) -> Result<Vec<Reminder>, String> {
+    use std::io::Read;
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+    let file = match std::fs::File::open(home_dir.join("reminders.jsonl")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read reminders: {e}")),
+    };
+    let mut content = String::new();
+    file.take(MAX_STRICT_REMINDER_BYTES + 1).read_to_string(&mut content).map_err(|e| e.to_string())?;
+    if content.len() as u64 > MAX_STRICT_REMINDER_BYTES {
+        return Err("reminder storage exceeds bound".into());
+    }
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Reminder>(line).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// A gateway origin proof minted by the startup backfill for one legacy
+/// WebChat reminder, with the reminder fields it was minted for.
+pub(crate) struct LegacyWebchatProof {
+    pub reminder_id: String,
+    pub agent_id: String,
+    pub chat_id: String,
+    pub on_behalf_of: Option<String>,
+    pub proof: String,
+}
+
+/// Attach backfilled proofs under the reminders lock, re-reading the file
+/// strictly. A proof is attached only when its reminder (unique id) is still
+/// the pending legacy WebChat reminder it was minted for — same employee,
+/// target and recorded creator, no proof yet, not isolation-bound; nothing
+/// else on the reminder changes. Returns the ids that got their proof. Any
+/// read or write error attaches nothing.
+pub(crate) fn attach_legacy_webchat_proofs_sync(
+    home_dir: &Path,
+    proofs: &[LegacyWebchatProof],
+) -> Result<HashSet<String>, String> {
+    let mut attached = HashSet::new();
+    if proofs.is_empty() {
+        return Ok(attached);
+    }
+    let _lock = acquire_lock(home_dir)?;
+    let mut reminders = load_reminders_strict_sync(home_dir)?;
+    for proof in proofs {
+        if reminders.iter().filter(|r| r.id == proof.reminder_id).count() != 1 {
+            continue;
+        }
+        let Some(r) = reminders.iter_mut().find(|r| r.id == proof.reminder_id) else { continue };
+        let still_legacy = r.status == ReminderStatus::Pending
+            && r.channel == crate::scheduled_webchat::CHANNEL
+            && r.chat_id == proof.chat_id
+            && r.agent_id == proof.agent_id
+            && r.on_behalf_of == proof.on_behalf_of
+            && !r.isolation_bound
+            && r.notify_origin_proof.as_deref().is_none_or(str::is_empty)
+            && r.notify_origin.as_deref().is_none_or(|origin| origin.is_empty() || origin == r.chat_id);
+        if still_legacy {
+            r.notify_origin_proof = Some(proof.proof.clone());
+            attached.insert(proof.reminder_id.clone());
+        }
+    }
+    if !attached.is_empty() {
+        save_reminders_sync(home_dir, &reminders)?;
+    }
+    Ok(attached)
+}
+
+/// Fire one reminder through the real delivery path with an empty registry
+/// and no model (direct reminders only).
+#[cfg(test)]
+pub(crate) async fn deliver_for_test(home_dir: &Path, reminder: &Reminder) -> Result<(), String> {
+    let registry = Arc::new(RwLock::new(AgentRegistry::new(home_dir.join("agents"))));
+    let http = reqwest::Client::new();
+    let sem = Arc::new(tokio::sync::Semaphore::new(1));
+    deliver_reminder_with(home_dir, &http, &registry, &sem, reminder, |_, _| async {
+        Err::<String, String>("no model in this test".into())
+    })
+    .await
 }
 
 /// Result of a checked append operation.
@@ -1065,14 +1228,30 @@ where
     // the gateway-attested origin — see `mcp/reminders.rs`) is appended to
     // that conversation after the fire-time ownership re-check.
     if reminder.channel == crate::scheduled_webchat::CHANNEL {
-        let body = format!("⏰ {}", crate::scheduled_webchat::bound(&text));
+        // The WebChat target must be the stored origin with a valid gateway
+        // proof (`origin_unproven` otherwise), then pass the ownership check.
+        // A v1.81 reminder has no `notify_origin`; its target is the origin.
+        let stored = crate::recipient_guard::StoredOrigin {
+            recipient: crate::scheduled_webchat::stored_origin(reminder.notify_origin.as_deref(), &reminder.chat_id),
+            proof: reminder.notify_origin_proof.as_deref(),
+        };
         let delivered = match crate::recipient_guard::admit_scheduled_session(
-            home_dir, &reminder.agent_id, &reminder.chat_id,
+            home_dir, &reminder.agent_id, stored, &reminder.chat_id,
         ).await {
-            Ok(()) => crate::scheduled_webchat::deliver(
-                home_dir, &reminder.agent_id, &reminder.chat_id, &body,
-            ).await,
-            Err(reason) => Err(reason),
+            Ok(()) => {
+                let text = crate::office_docs::process_history_deliverables(
+                    &text, &home_dir.join("agents").join(&reminder.agent_id), home_dir,
+                ).await;
+                let body = format!("⏰ {}", crate::scheduled_webchat::bound(&text));
+                crate::scheduled_webchat::deliver(
+                    home_dir, &reminder.agent_id, &reminder.chat_id, &body,
+                ).await
+            },
+            Err(crate::recipient_guard::ScheduledRefusal::Origin(denial)) => {
+                crate::recipient_guard::origin::audit_refusal(home_dir, &reminder.agent_id, "reminder", &reminder.id, denial);
+                return Err(denial.to_string());
+            }
+            Err(crate::recipient_guard::ScheduledRefusal::Other(reason)) => Err(reason),
         };
         if let Err(reason) = &delivered {
             crate::scheduled_webchat::audit_drop(home_dir, &reminder.agent_id, "reminder", &reminder.id, reason);
@@ -1086,21 +1265,37 @@ where
         .unwrap_or_default()];
     let recipient_args = serde_json::json!({"reminder_id": reminder.id, "channel": reminder.channel,
         "chat_id": reminder.chat_id, "text": text});
-    crate::recipient_guard::admit_scheduled(home_dir, &reminder.agent_id, &recipients, recipient_args.clone()).await?;
+    // H2: the stored turn origin is re-proved before each send attempt; a
+    // refusal fails the reminder with its closed reason, never another chat.
+    let stored = crate::recipient_guard::StoredOrigin {
+        recipient: reminder.notify_origin.as_deref(),
+        proof: reminder.notify_origin_proof.as_deref(),
+    };
+    let targets: &[String] = &recipients;
+    let admit = |args: serde_json::Value| async move {
+        let result = crate::recipient_guard::admit_scheduled_from_origin(
+            home_dir, &reminder.agent_id, stored, targets, args).await;
+        if let Err(crate::recipient_guard::ScheduledRefusal::Origin(denial)) = &result {
+            crate::recipient_guard::origin::audit_refusal(home_dir, &reminder.agent_id, "reminder", &reminder.id, *denial);
+        }
+        result.map_err(String::from)
+    };
+    admit(recipient_args.clone()).await?;
 
     // Keep the send permit out of approval waits and callback generation.
     let sender = reminder.sender_agent.as_deref();
+    let mut prepared_reply = None;
     let result = {
         let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
         duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
-        send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender).await
+        send_reminder_result(home_dir, http, reminder, &text, sender, &mut prepared_reply).await
     };
     if let Err(first_err) = result {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        crate::recipient_guard::admit_scheduled(home_dir, &reminder.agent_id, &recipients, recipient_args).await?;
+        admit(recipient_args).await?;
         let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
         duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
-        send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender)
+        send_reminder_result(home_dir, http, reminder, &text, sender, &mut prepared_reply)
             .await
             .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
     }
@@ -1289,6 +1484,19 @@ pub fn start_reminder_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reminder_delivery_strips_markers_and_host_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let reminder = callback_reminder("worker", None);
+        let reply = prepare_reminder_reply(home.path(), &reminder,
+            "完成\n📎DELIVER:/private/operator/report.pdf", &crate::channel_sender::NullSender).await;
+        assert!(reply.contains("report.pdf"));
+        assert!(reply.contains("傳送失敗"));
+        assert!(!reply.contains("DELIVER:"));
+        assert!(!reply.contains("/private/operator"));
+    }
+
 
     #[tokio::test]
     async fn scoped_blocking_reminder_mutation_refuses_publication_after_revocation() {

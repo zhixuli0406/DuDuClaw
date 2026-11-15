@@ -356,7 +356,11 @@ impl ChannelThinking {
         if self.show() == ShowThinking::Off || !self.state().seen {
             return None;
         }
-        let view = self.view(true);
+        let mut view = self.view(true);
+        if self.channel == "googlechat" {
+            view.summary = None;
+            view.line = None;
+        }
         let Some(surface) = self.surface.clone() else {
             return Some(Footer { view });
         };
@@ -457,3 +461,24 @@ pub fn with_reply_extra(
 #[cfg(test)]
 #[path = "channel_presenter_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod googlechat_footer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chat_footer_contains_duration_without_summary() {
+        let presenter = ChannelThinking::new("googlechat", false, Lang::ZhTw, None);
+        presenter.set_show(ShowThinking::Summary);
+        {
+            let mut state = presenter.state();
+            state.seen = true;
+            state.blocks.push(("block".into(), "private summary".into()));
+            state.line = Some("private line".into());
+        }
+        let footer = presenter.finish().await.unwrap();
+        assert_eq!(footer.view.summary, None);
+        assert_eq!(footer.view.line, None);
+        assert!(!footer.text().contains("private"));
+    }
+}

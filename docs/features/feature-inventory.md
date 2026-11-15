@@ -183,6 +183,17 @@
 | Channel Failure Tracking | `channel_failures.jsonl` with `FailureReason` enum (RateLimited/Billing/Timeout/BinaryMissing/SpawnError/EmptyResponse/NoAccounts/Unknown) |
 | Discord Gateway Hardening (v1.9.2) | Real op 6 RESUME — persists `session_id` + `resume_gateway_url` + sequence across reconnects; `select!` stall watchdog breaks after 2× heartbeat silence (fixes 18-min zombie); heartbeat channel capacity 1→16 with `try_send`; op 9 reads `d.bool` for RESUME vs IDENTIFY with 1-5s jitter; close codes 4007/4009/4003 clear session; backoff cap 300s→60s; handles `RESUMED` dispatch |
 
+
+### WebChat and the WordPress widget
+
+Dashboard WebChat keeps a connection dot in the conversation header: green for connected, warning for connecting/reconnecting, and error for disconnected. Its accessible label remains available on narrow screens.
+
+The WordPress widget (plugin 0.1.1) shows connection status in its header. Dropped connections retry after 1 second, doubling to a 30-second maximum, for up to 10 attempts. After that, visitors can press **Reconnect**. Returning to a visible page, coming back online, or restoring the page also reconnects.
+
+Sending without a ready connection keeps the text in the input and marks a message bubble **Not sent**. **Retry** sends it once connected; reconnecting alone never resends a message. A drop while waiting for a reply displays “Connection interrupted, the reply may not have arrived.” A subsequent reply clears that notice; reconnecting does not guarantee recovery of earlier replies. Visitor errors are generic and contain no internal details.
+
+Widget labels use the HTML page language: Chinese selects Traditional Chinese, other languages select English, and a missing `lang` defaults to Traditional Chinese. The configured title stays as supplied by the site owner. Status changes are announced to screen readers. The widget has no automated test harness and has not yet been verified in a real browser by the author.
+
 ## Evolution System
 
 > **Evolution v3 (2026-08-06) → S11 (2026-09-29)**: the evolution target moved
@@ -283,7 +294,7 @@ Local Kokoro-82M v1.1-zh (Apache-2.0; download about 134 MB from Settings → Vo
 | Unified Audit Log | `audit.unified_log` merges `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` — Logs page source filter + severity dropdown |
 | JSONL Audit Log | Full tool call recording, async write |
 | Unicode Normalization | NFKC normalization to detect homograph attacks |
-| Action Claim Verifier | Signature validation for tool execution claims |
+| Action Claim Verifier | Regex check of a reply's completion claims against the tool-call log: agent-management claims (all reply paths, log only) and mail / calendar / sheets / docs / tasks claims (chat replies, same-session evidence, staff-only notice by default; `[action_claims] mode`) ([78-action-claim-check.md](78-action-claim-check.md)) |
 | Container Sandbox | Two separate paths. Task sandbox (`agent.toml [container] sandbox_enabled`): Docker only, runs a delegated task's AI CLI in a read-only, non-root, resource-limited container, fails closed ([guide](../guides/task-sandbox.md)). Script sandbox (PTC `execute_program`, `duduclaw secaudit` PoC): Docker (WSL2 first on Windows), `--network=none`, read-only root, only a private read-only script directory mounted; PTC refuses to run when the sandbox is unavailable unless `script_when_unavailable = "run_unsandboxed"` |
 | Secret Leak Scanner | 19 secret patterns (Anthropic / OpenAI / AWS / GitHub / GitLab / Slack / Stripe / Google / SendGrid / JWT / PEM keys and key or password assignments) plus a high-entropy check, used by the skill security scanner |
 | Sensitive Data Redaction (RFC-23, v1.14.0) | `duduclaw-redaction` crate — internal data (Odoo / shared wiki / file tools) is replaced with `<REDACT:CATEGORY:hash8>` tokens before reaching the LLM and auto-restored at trusted egress (user channel reply, whitelisted tools); AES-256-GCM SQLite vault (per-agent 32-byte key, 0o600), TTL 7d two-phase GC, 5 built-in profiles, five-layer enable/disable resolver, JSONL audit with 10MB rotation; field-level rules added 2026-09 — `db_field` (Odoo `model.field` / `model.*` sugar) and generic `json_path` tokenize the whole matched field value instead of pattern-matching content, plus a `duduclaw redaction verify` JSON mode to prove a rule fires against a sample tool result; `db_field`'s Odoo-only table generalized (2026-09) into a `[redaction.data_sources.*]` registry any MCP tool can bind to, and redaction's reach extended past DuDuClaw's own MCP server for the first time — see the next row |

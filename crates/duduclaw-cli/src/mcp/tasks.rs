@@ -1,5 +1,20 @@
 use super::*;
 
+/// Returned with a goal created while autonomous execution is paused: the
+/// goal exists, but the goal loop will not pick it up until it is resumed.
+pub(crate) const GOAL_PAUSED_NOTE: &str = "The goal was created, but autonomous execution is paused, so it will not start until autonomous execution is resumed. 目標已建立，但自主執行目前已暫停，恢復自主執行後才會開始。";
+
+/// Whether autonomous execution is paused for `agent`'s goal loop
+/// (installation-wide or for that employee). An unreadable pause state
+/// counts as paused, as the gate itself treats it. Other refusals (a
+/// missing or non-operational employee) are not a pause and get no note.
+pub(crate) fn goal_start_paused(home: &std::path::Path, agent: &str) -> bool {
+    match duduclaw_core::autonomy_gate::check(home, agent, duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop) {
+        Ok(()) => false,
+        Err(info) => matches!(info.reason.as_str(), "global_pause" | "agent_pause" | "state_unreadable"),
+    }
+}
+
 pub(crate) fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> Value {
     let tags: Vec<&str> = row
         .tags
@@ -420,6 +435,18 @@ pub(crate) async fn handle_tasks_create(
             on_behalf_of: on_behalf_of.clone(),
             ..Default::default()
         };
+        // H3: progress / needs-human pushes default to the conversation this
+        // turn answers only with the gateway proof stored alongside; it is
+        // re-verified before every push. Unproven ⇒ no source (the goal
+        // falls back to the employee's own notification settings).
+        let req = match schedule_origin(home_dir, actor.agent(), &assigned_to).await {
+            Some(origin) => duduclaw_gateway::goal_create_core::GoalCreateRequest {
+                source: Some((origin.channel, origin.chat)),
+                source_origin_proof: Some(origin.proof),
+                ..req
+            },
+            None => req,
+        };
         let admission_home = home_dir.to_path_buf();
         let admission_agent = actor.agent().map(str::to_owned);
         let admission = Box::pin(async move {
@@ -442,14 +469,16 @@ pub(crate) async fn handle_tasks_create(
                     }
                     Err(_) => tracing::debug!("goal wake event suppressed by autonomy admission"),
                 }
-                tool_text(
-                    &serde_json::json!({
-                        "task": task_row_to_json(&created.task),
-                        "kind": "goal",
-                        "plan_first": created.plan_first,
-                    })
-                    .to_string(),
-                )
+                let mut out = serde_json::json!({
+                    "task": task_row_to_json(&created.task),
+                    "kind": "goal",
+                    "plan_first": created.plan_first,
+                });
+                if goal_start_paused(home_dir, &created.task.assigned_to) {
+                    out["autonomy_paused"] = serde_json::json!(true);
+                    out["note"] = serde_json::json!(GOAL_PAUSED_NOTE);
+                }
+                tool_text(&out.to_string())
             }
             Err(e) => tool_error(&e),
         };
@@ -491,9 +520,11 @@ pub(crate) async fn handle_tasks_create(
                 } else {
                     assigned_to.clone()
                 };
-                let origin_env = std::env::var(duduclaw_core::ENV_ORIGIN_SESSION).ok();
-                let target = match resolve_notify_target(
-                    args, home_dir, actor.agent(), &scheduled_target, origin_env.as_deref(),
+                // H1: only the gateway's live turn context supplies a
+                // default; the process environment is never consulted.
+                let context = turn_context(home_dir, actor.agent(), &scheduled_target).await;
+                let target = match resolve_turn_notify_target(
+                    args, actor.agent(), &scheduled_target, context.as_ref(),
                 ) {
                     Ok(target) => target,
                     Err(message) => return tool_error(&message),
@@ -503,16 +534,16 @@ pub(crate) async fn handle_tasks_create(
                         "a one-shot schedule (RFC3339 instant) also needs notify_channel and \
                          notify_chat_id — the wake-up runs detached and has nowhere to reply. \
                          一次性排程需要通知管道（notify_channel 與 notify_chat_id），否則結果無處可送；\
-                         在 WebChat 對話中建立時會自動回到該對話。",
+                         在支援的聊天通道或 WebChat 對話中建立時會自動回到該對話。",
                     );
                 }
                 // The origin conversation is never passed as an argument: the
-                // reminder rail re-derives it from the same attested env and
-                // refuses a supplied `webchat` target.
-                let (channel, chat) = match target.delivery() {
-                    Delivery::OriginWebchat => (None, None),
-                    _ => (target.channel, target.chat),
-                };
+                // reminder rail re-derives it from the same gateway turn
+                // context and refuses a supplied `webchat` target.
+                let (channel, chat) = if args.get("notify_channel").and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty()) {
+                    (target.channel, target.chat)
+                } else { (None, None) };
                 let synth = serde_json::json!({
                     "time": at,
                     "mode": "agent_callback",
@@ -1497,6 +1528,39 @@ mod cost_cap_tests {
 #[cfg(test)]
 mod autonomy_commit_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_created_while_paused_says_it_will_not_start() {
+        let home = tempfile::tempdir().unwrap();
+        super::super::tests::create_test_agent(&home.path().join("agents"), "bot", "");
+        let args = serde_json::json!({"title":"goal","kind":"goal"});
+        let actor = RecordActor::Operator("bot");
+        let parsed = |v: &Value| -> Value {
+            serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+        let running = parsed(&handle_tasks_create(&args, home.path(), actor).await);
+        assert!(running.get("note").is_none(), "{running}");
+        assert!(running.get("autonomy_paused").is_none(), "{running}");
+
+        let outcome = duduclaw_core::autonomy_gate::mutate_async(
+            home.path(), None,
+            Some(duduclaw_core::autonomy_gate::PauseEntry {
+                reason: "maintenance".into(), who: "operator".into(),
+                at: chrono::Utc::now().to_rfc3339(),
+            }),
+        ).await;
+        assert!(matches!(outcome, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+        let out = handle_tasks_create(&args, home.path(), actor).await;
+        assert_ne!(out["isError"], true, "{out}");
+        let paused = parsed(&out);
+        assert_eq!(paused["kind"], "goal");
+        assert!(paused["task"]["id"].is_string(), "the goal exists: {paused}");
+        assert_eq!(paused["autonomy_paused"], true);
+        assert_eq!(paused["note"], GOAL_PAUSED_NOTE);
+        duduclaw_core::autonomy_gate::resume(home.path(), None).unwrap();
+        assert!(!goal_start_paused(home.path(), "bot"));
+        assert!(!goal_start_paused(home.path(), "missing-employee"), "not a pause");
+    }
 
     #[tokio::test]
     async fn tasks_create_pause_between_check_and_insert_lands_no_task() {

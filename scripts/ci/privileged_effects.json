@@ -113,6 +113,18 @@
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
     },
     {
+      "symbol": "crates/duduclaw-auth/src/db_acl_delivery_tests.rs::run_concurrently",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped Rust threads synchronize concurrent ACL delivery attempts across two database pools; no OS process is launched."
+    },
+    {
       "symbol": "crates/duduclaw-auth/src/migration.rs::tests::migration_invite_concurrent_connections_return_one_identity",
       "apis": {
         "terminal_spawn": 2
@@ -3262,6 +3274,20 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/egress_client.rs::tests::schedule_origin_request_carries_conversation_turn_and_egress_keeps_alias",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn",
+        "thread_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Regression fixture re-executes the current test binary with controlled conversation-turn, alias and credential environment; a Rust thread serves the loopback HTTP fixture."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/egress_guard.rs::tests::egress_saturated_gateway_clients_fail_closed",
       "apis": {
         "command_constructor": 1,
@@ -4024,7 +4050,7 @@
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
     },
     {
-      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::collect_codex_output",
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::collect_codex_output_with_input",
       "apis": {
         "backend_spawn_class": 1,
         "command_constructor": 1
@@ -4095,6 +4121,18 @@
         "process_spawn"
       ],
       "rationale": "Independent legacy runtime command oracle: asserts original argv, explicit environment overlay/removals and cwd against the production builder before LocalBackend registration; test only."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::tests::utility_collector_delivers_large_prompt_on_stdin_and_closes_it",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Unix regression fixture constructs /bin/cat with a cleared environment and uses the managed Codex collector to verify large stdin delivery and EOF."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::tests::timeout_collector_kills_long_sleeping_grandchild",
@@ -6490,6 +6528,45 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test-only scoped Rust threads hold the store lock and validate concurrently; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/mcp/channel_schedule_tests.rs::forged_process_reply_channel_cannot_establish_a_source",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Regression fixture re-executes the current test binary with forged reply channel/sender and cleared trusted turn/alias environment to verify that no schedule source is established."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/mcp/cron_tasks.rs::origin_target_tests::forged_origin_session_env_is_ignored",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Regression fixture re-executes the current test binary with a forged origin session and cleared caller/turn/alias environment to verify that the session grants no recipient authority."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/mcp/tests/part5.rs::spawn_downstream_lineage_is_complete_or_dropped_and_audited",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Regression fixture re-executes the current test binary with a child marker and cleared on-behalf-of identity to isolate host-principal state while checking downstream lineage and audits."
     },
     {
       "symbol": "crates/duduclaw-cli/src/mcp/tests/part5.rs::spawn_ephemeral_forged_env_sender_never_widens_verified_parent",

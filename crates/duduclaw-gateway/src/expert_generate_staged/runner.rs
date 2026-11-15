@@ -71,6 +71,7 @@ impl StageLlm for RotatedStageLlm {
             // System-level utility call, not an agent turn — no account pool.
             &[],
             None,
+            crate::runtime_dispatch::SpawnPurpose::Utility, // stage allowlist above
         )
         .await
         {

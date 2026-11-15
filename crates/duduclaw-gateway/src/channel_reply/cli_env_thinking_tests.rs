@@ -49,6 +49,8 @@ fn sink_at(
 }
 
 async fn spawn(home: &Path) -> Result<String, String> {
+    // Directory-less spawns must be utility work with an explicit allowlist.
+    let caps = crate::night_llm::night_capabilities();
     spawn_claude_cli_with_env(
         "hi",
         "claude-opus-5",
@@ -56,10 +58,11 @@ async fn spawn(home: &Path) -> Result<String, String> {
         home,
         None,
         None,
-        None,
+        Some(&caps),
         &std::collections::HashMap::new(),
         None,
         None,
+        crate::runtime_dispatch::SpawnPurpose::Utility,
     )
     .await
 }

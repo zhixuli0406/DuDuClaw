@@ -307,15 +307,30 @@ pub async fn call(
 /// login page is what "Who has access: Only myself" returns).
 pub fn parse_response(body: &str) -> Result<Value, BridgeError> {
     let v: Value = serde_json::from_str(body.trim()).map_err(|_| BridgeError::MalformedResponse)?;
-    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-        let hint = if err == "unauthorized" {
-            "unauthorized — the secret in config.toml does not match SECRET in the deployed script"
-        } else {
-            err
+    if !v.is_object() {
+        return Err(BridgeError::MalformedResponse);
+    }
+    // Any `error` counts — a string, an object or anything else non-null —
+    // not only a string (an object error used to pass as a success).
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        let text = err
+            .as_str()
+            .or_else(|| err.get("message").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        let hint = match text {
+            Some("unauthorized") => {
+                "unauthorized — the secret in config.toml does not match SECRET in the deployed script"
+            }
+            Some(text) => text,
+            None => "the script reported an error without a message",
         };
         return Err(BridgeError::Script(duduclaw_core::truncate_chars(
             hint, 300,
         )));
+    }
+    if v.get("ok").is_some_and(|ok| ok.as_bool() != Some(true)) {
+        return Err(BridgeError::Script("the script reported ok: false".into()));
     }
     Ok(v)
 }

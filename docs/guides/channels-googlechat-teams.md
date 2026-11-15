@@ -18,6 +18,18 @@ Both channels include:
   TODO task board (from `TodoWrite`) are shown via message edits and removed
   when the final reply arrives.
 
+### Reply display and delivery
+
+Google Chat tables appear as a list: each row starts with its first cell in bold, followed by `column: value` lines. Cell contents are kept in full. Bullets use `•`; headings and bold text spanning lines are converted to Chat markup. Chinese text next to bold markers keeps its original spacing.
+
+Tool details and task lists are visible only to internal staff (an administrator or a verified account directly bound to the answering employee). Other senders see generic progress. Configuration-change notices wait for the next internal reply. Access denial, mute and human takeover do not produce an empty-reply warning; the temporary placeholder is removed when possible.
+
+Final delivery stops further progress edits. If replacing the placeholder fails, DuDuClaw retries once after a short delay (up to three seconds for a rate-limit response), then sends a new message and tries to replace the old placeholder with a neutral line. Remaining answer parts are still attempted. If the original edit succeeded but its response was lost, the fallback can duplicate the first part.
+
+Google Chat never includes a thinking summary in the answer. Existing thinking settings can allow internal staff a duration line; other senders see none. A resolved `zh-TW` reply uses conservative Traditional Chinese character conversion while preserving code and URLs. Auto language adds a reminder to follow the user's message language.
+
+Rendering has not been verified on a real Google Chat client (尚未在真實 Google Chat 用戶端驗證). Check desktop and mobile table lists, Chinese bold boundaries, multiline bold and placeholder replacement.
+
 ## Google Chat
 
 ### Before you start
@@ -54,6 +66,15 @@ Open the printed Chat Configuration link. Google does not provide a configuratio
 
 A successful import or resource creation does not prove that Chat is configured or that a message round trip works. The dashboard offers the bootstrap command, Cloud Shell, copyable configuration values; manual fields remain under **Manual setup**.
 
+### Recognising who is messaging (v1.82)
+
+By default a Google Chat sender is an unknown person, so `[google] requesters = "bound_people"` / `owner_only` refuse them and `@` calls reach only the default and public employees. A sender is recognised as a dashboard account when:
+
+- an Admin bound their Chat user id (`users/<digits>`) under **Users → Verify identity → Google Chat** (the default and only way, unless the next option is on), or
+- optional, **off by default**: an Admin turned on **Manage → Integrations → Google → Recognise Google Chat senders by their connected Google account** (`[google] chat_identity_from_account = true`) and the person connected their own Google account under **My connections**. The sender's id is then compared with that Google account's id and a match counts as the person. **Not yet verified against a real Google Workspace** — leave it off unless you have confirmed in your own Workspace that the two ids match.
+
+No e-mail matching. Messages from another Chat app (not a person) are ignored, and a Google Chat identity never receives DuDuClaw's own notifications. Google Chat cannot receive login or two-factor codes. Details and the uniqueness rules: [Dashboard settings → Users → Verify identity](dashboard-settings.md#users--verify-identity-channel-identities-v182).
+
 ### Key policy
 
 If key creation reports `FAILED_PRECONDITION`, ask an Organization Policy Administrator to review the project exception. Organizations created on or after 2024-05-03 commonly enforce key-creation restrictions. The script prints the commands and stops; it does not change policy:
@@ -85,7 +106,34 @@ In Chat Configuration, turn off **Build this Chat app as a Google Workspace add-
 
 The gateway re-reads every message from Google Chat with [`spaces.messages.get`](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/get), using app authentication and `https://www.googleapis.com/auth/chat.bot`. No administrator-approved Chat scope is requested. The pull token separately uses only `https://www.googleapis.com/auth/pubsub`. Pub/Sub content is an untrusted notification: only a strictly validated Chat message resource name is used for the lookup. Sender, space, text, attachments and thread come from the API response. Sender allowlists, pairing and approval rules apply to that fetched identity. A missing/inaccessible message (including 403/404), invalid resource or mismatched space is dropped with a diagnostic and creates no turn. Check app access and the `chat.bot` scope when the operator hint appears. Events without a fetchable message, including app-added events, do not start employee turns.
 
-A bounded persistent inbox deduplicates by event type and Chat message resource name, so republishing with a new Pub/Sub message ID does not rerun a retained event. Records are retained for seven days; messages whose API creation time is older than seven days are refused even after pruning. Accepted events are stored before acknowledgement. After a restart, not-started work may resume, while interrupted running work is marked uncertain and is not automatically rerun. Full queues are acknowledged and dropped without starting a turn. This is not an end-to-end exactly-once delivery guarantee. The Unix-only inbox stores only resource references, never message text, sender details or attachments. Each app stream (employee/shared app and project number) is capped at 1,000 rows and 10 pending/queued/running entries, reserving capacity for other streams; global hard caps remain 10,000 rows and 100 active entries, 2 KiB per reference and a 64 MiB database; live queued/running entries are not evicted. Pub/Sub key-file import is refused on non-Unix platforms until equivalent owner/ACL validation is available. Google-side message retrieval and round trips still require live acceptance. Import and worker startup reject subscriptions with exactly-once delivery enabled; keep that option disabled in Google Cloud. An invalid/expired ACK response (HTTP 400) discards only the old delivery batch and pulls again; durable deduplication records remain intact. Transient ACK failures retain the batch for retry.
+A bounded persistent inbox deduplicates by event type and Chat message resource name, so republishing with a new Pub/Sub message ID does not rerun a retained event. Records are retained for seven days; messages whose API creation time is older than seven days are refused even after pruning. Accepted events are stored before acknowledgement. After a restart, not-started work may resume, while interrupted running work is marked uncertain and is not automatically rerun. Full queues are acknowledged and dropped without starting a turn; as in HTTP mode, the space is told to resend (at most once a minute per sender and once every 10 seconds per space). This is not an end-to-end exactly-once delivery guarantee. The Unix-only inbox stores only resource references, never message text, sender details or attachments. Each app stream (employee/shared app and project number) is capped at 1,000 rows and 10 pending/queued/running entries, reserving capacity for other streams; global hard caps remain 10,000 rows and 100 active entries, 2 KiB per reference and a 64 MiB database; live queued/running entries are not evicted. Pub/Sub key-file import is refused on non-Unix platforms until equivalent owner/ACL validation is available. Google-side message retrieval and round trips still require live acceptance. Import and worker startup reject subscriptions with exactly-once delivery enabled; keep that option disabled in Google Cloud. An invalid/expired ACK response (HTTP 400) discards only the old delivery batch and pulls again; durable deduplication records remain intact. Transient ACK failures retain the batch for retry.
+
+### Commands, access and pairing
+
+Chat commands (`/new`, `/reset`, `/compact`, `/pair`, `/status`, …) pass the same access check as ordinary messages, on the same space. A blocked sender gets no answer; an unpaired sender gets the pairing hint.
+
+A space has one conversation shared by all its members and threads (an employee's own Chat app keeps its own conversation in the same space). Who may clear or compress a shared conversation (`/new`, `/reset`, `/compact`):
+
+| Installation | 1:1 DM with the app | Space, group chat (group DM) or unknown type |
+|---|---|---|
+| No user accounts, or no active **Admin**/**Manager** with a verified channel identity (e.g. a personal install) | anyone who passes the access check | anyone who passes the access check |
+| At least one active Admin/Manager with a verified channel identity | anyone who passes the access check | only a sender whose verified channel identity is bound to an active Admin or Manager; others are told 「只有管理員可以清除這個聊天室的對話。」 |
+| A user database that exists but cannot be read | anyone who passes the access check | refused |
+
+A blocked or unpaired sender can never run these commands. In the second row, an unverified identity or a failed lookup is refused. The space type comes from the message (the HTTP event, or the message re-read through `spaces.messages.get` in Pub/Sub mode). When the message does not say, the gateway asks Google Chat (`spaces.get`, as the app) and remembers the answer for 24 hours. A 1:1 DM means a direct message between one person and the app. A group chat with several people is a shared conversation. If the type is still unknown, the space is treated as shared. The same rule applies to Telegram groups, Discord server channels, Slack channels, LINE groups and rooms, Teams group chats and channels, Feishu groups and DingTalk groups, and to the “new conversation” buttons.
+
+Pairing (`require_pairing`): generate a code with the `pairing_manage` tool (`action: "generate"`) for one of two subjects:
+
+- `users/<id>` — a member's own Chat account. Only that member can redeem the code; anyone else who types it fails.
+- `googlechat:spaces/<id>` — the whole space. After pairing, everyone in that space is let through.
+
+`/pair <code>` checks the sender first, then the space, exactly as an ordinary message does. A subject for an employee's bucket (`googlechat:spaces/<id>#agent:<employee>`) is stored and checked as the space itself, so pairing in an employee's own Chat app takes effect. Pairings saved by earlier versions with that suffix never let anyone through. After the upgrade they still do not, so they do not suddenly open the whole space. To pair such a space, generate a new code. Each code expires after 5 minutes, locks after 5 wrong attempts, and a subject cannot get new codes after 15 failures in total.
+
+### Limitations
+
+- Google Chat still cannot send generated files or images as attachments. DuDuClaw now says so plainly, without exposing host paths or directing members to a Dashboard account they may not have. Ask an administrator for the file, or use a channel that supports file delivery. Scheduled replies also process file-delivery markers before sending text.
+- Drive attachments are not downloaded automatically. A validated file ID is passed to the employee so it can try the Drive read tool using its connected Google identity; access and supported file types still apply. Failed direct-attachment downloads are reported instead of saving an HTTP error response as a file. Pasted Drive links are unchanged.
+- Proactive sends require a `spaces/<id>` target. A 403/404 response explains that the app may not be in the conversation: ask the recipient to message the app once or ask an administrator to install it. Rate limits and server failures are reported as temporary failures. This does not resolve people to DM spaces or send as a user.
 
 ## Microsoft Teams
 
@@ -147,7 +195,7 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 | LINE | plain text + Flex bubble | key-value records | loading animation (1:1, ≤60 s) |
 | WhatsApp | `*bold*` / `~strike~` / ``` blocks | monospace fence | `typing_indicator` (≤25 s, on inbound) |
 | Feishu | interactive Card 2.0 markdown | native | — (progress via messages) |
-| Google Chat | Chat markup (`*bold*`, `<url\|text>`) | monospace fence | placeholder + edit-in-place |
+| Google Chat | Chat markup (`*bold*`, `<url\|text>`) | Key–value list with bold row titles | placeholder + edit-in-place |
 | MS Teams | markdown activity | monospace fence | `typing` activity every 3 s |
 | WebChat | raw markdown (dashboard renders) | native | `progress` WS events |
 

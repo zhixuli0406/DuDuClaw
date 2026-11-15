@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use crate::prompt_compression::{contains_never_trim_header_spelling, partition_turns_for_summary};
+use crate::prompt_compression::{partition_turns_for_summary};
 use crate::session::SessionManager;
 use crate::session_summarizer::{
     SummarizeDecision, SummarizeParams, decide_summarization, format_summarization_prompt,
@@ -80,6 +80,16 @@ pub(crate) async fn tick_once(
         return;
     }
 
+    // Filter before quota allocation so a cooling-down failure cannot starve
+    // another session. Oldest successful summaries go first.
+    let mut ready = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if crate::session_summarizer::summary_retry_ready_async(home_dir, &candidate.session_id, "async").await {
+            ready.push(candidate);
+        }
+    }
+    let mut candidates = ready;
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.seconds_since_last_summary.unwrap_or(u64::MAX)));
     let decisions = decide_summarization(&candidates, params);
     let to_run: Vec<(String, u32)> = decisions
         .into_iter()
@@ -111,46 +121,64 @@ pub(crate) async fn tick_once(
             home_dir, &candidate.agent_id, &[],
             summarize_one(session_manager, home_dir, &session_id, through_turn),
         ).await {
-            Ok(bytes) => info!(
+            Ok(bytes) => {
+                crate::session_summarizer::summary_attempt_finished_async(home_dir, &session_id, "async", None).await;
+                info!(
                 session_id = %session_id,
                 through_turn,
                 summary_bytes = bytes,
                 "summarizer: persisted summary"
-            ),
-            Err(e) => warn!(
+                );
+            }
+            Err(e) => {
+                crate::session_summarizer::summary_attempt_finished_async(home_dir, &session_id, "async", Some(e)).await;
+                warn!(
                 session_id = %session_id,
                 through_turn,
-                error = %e,
+                reason = ?e,
                 "summarizer: session-level failure (continuing with next)"
-            ),
+                );
+            }
         }
     }
 }
 
-/// Summarize one session's first `through_turn` turns and persist the
+/// Roll the previous summary forward through `through_turn` and persist the
 /// result. Returns the byte length of the persisted summary on success.
 async fn summarize_one(
     session_manager: &SessionManager,
     home_dir: &std::path::Path,
     session_id: &str,
     through_turn: u32,
-) -> Result<usize, String> {
+) -> Result<usize, crate::session_summarizer::SummaryFailure> {
+    use crate::session_summarizer::SummaryFailure;
+    let expected_ids = session_manager.get_message_ids(session_id).await
+        .map_err(|_| SummaryFailure::ReadState)?;
+    let (previous, after) = session_manager.get_summary(session_id).await
+        .map_err(|_| SummaryFailure::ReadState)?;
     let turns = session_manager
-        .read_first_n_turns(session_id, through_turn)
+        .read_summary_turn_range(session_id, after, through_turn)
         .await
-        .map_err(|e| format!("read_first_n_turns: {e}"))?;
+        .map_err(|_| SummaryFailure::ReadState)?;
     let turns: Vec<_> = turns.into_iter().map(|(role, text)|
         (role, duduclaw_security::credential_detect::mask(&text))).collect();
-    let (transcript, protected, has_unprotected_text) = partition_turns_for_summary(&turns);
+    let mut rolling = Vec::new();
+    if !previous.is_empty() {
+        rolling.push(("background".to_owned(), duduclaw_security::credential_detect::mask(&previous)));
+    }
+    rolling.extend(turns);
+    let (transcript, protected, has_unprotected_text) = partition_turns_for_summary(&rolling);
+    let transcript = crate::session_summarizer::rolling_summary_input("", &transcript);
     if transcript.trim().is_empty() {
-        return Err("transcript is empty — nothing to summarize".to_string());
+        return Err(SummaryFailure::EmptyInput);
     }
 
     let summary = if has_unprotected_text {
         let prompt = format_summarization_prompt(&transcript);
         let agent_id = session_manager.session_agent(session_id).await
-            .map_err(|e| format!("session_agent: {e}"))?;
-        let agent_dir = crate::runtime_config::session_agent_dir(home_dir, agent_id.as_deref())?;
+            .map_err(|_| SummaryFailure::ReadState)?;
+        let agent_dir = crate::runtime_config::session_agent_dir(home_dir, agent_id.as_deref())
+            .map_err(|_| SummaryFailure::ReadState)?;
         let agent_id = agent_dir.as_ref().and(agent_id.as_deref()).unwrap_or("");
         // The protected sections never enter the utility-model prompt.
         crate::runtime_dispatch::run_utility_prompt(
@@ -162,19 +190,14 @@ async fn summarize_one(
             crate::runtime_dispatch::UTILITY_MAX_TOKENS,
         )
         .await
-        .map_err(|e| format!("utility summarize: {e}"))?
+        .map_err(|_| SummaryFailure::Utility)?
     } else {
         String::new()
     };
 
-    let trimmed = summary.trim();
-    // Spelling, not marker — same reasoning as `complete_bisect_summary`: the
-    // utility model cannot mint a real marker, but it must not parrot the
-    // heading back into a summary that is re-injected every turn.
-    if has_unprotected_text && (trimmed.is_empty() || contains_never_trim_header_spelling(trimmed))
-    {
-        return Err("summarizer returned empty or protected-looking response".to_string());
-    }
+    let trimmed = if has_unprotected_text {
+        crate::session_summarizer::validate_summary_output(&summary)?
+    } else { "" };
     let protected = cap_protected_for_summary(&protected);
     let persisted = if protected.is_empty() {
         trimmed.to_string()
@@ -185,9 +208,9 @@ async fn summarize_one(
     };
     let bytes = persisted.len();
     session_manager
-        .set_summary(session_id, &persisted, through_turn)
+        .set_summary_if_unchanged(session_id, &persisted, through_turn, after, &expected_ids)
         .await
-        .map_err(|e| format!("set_summary: {e}"))?;
+        .map_err(|_| SummaryFailure::Store)?;
     Ok(bytes)
 }
 
@@ -211,7 +234,7 @@ pub const PROTECTED_SUMMARY_MAX_BYTES: usize = 4 * 1024;
 /// log line only: a reader of the summary must be able to tell that it is
 /// holding a prefix, otherwise the pinned constraint silently becomes a
 /// different constraint.
-fn cap_protected_for_summary(protected: &str) -> String {
+pub(crate) fn cap_protected_for_summary(protected: &str) -> String {
     if protected.len() <= PROTECTED_SUMMARY_MAX_BYTES {
         return protected.to_string();
     }
@@ -240,17 +263,74 @@ mod tests {
     impl crate::runtime::AgentRuntime for SessionUtilityRuntime {
         fn name(&self) -> &str { "openai_compat" }
         async fn is_available(&self) -> bool { panic!("owned registry must not probe host") }
-        async fn execute(&self, _prompt: &str, context: &crate::runtime::RuntimeContext)
+        async fn execute(&self, prompt: &str, context: &crate::runtime::RuntimeContext)
             -> Result<crate::runtime::RuntimeResponse, String> {
+            if context.home_dir.join("summary-output-fixture").exists() {
+                assert!(prompt.contains("- Previously established fact"));
+                assert!(prompt.contains("new 中文"));
+                assert!(!prompt.contains("old one"));
+                assert!(!prompt.contains("old two"));
+                assert!(!prompt.contains("user: latest"));
+            }
+            assert!(prompt.len() <= crate::session_summarizer::SUMMARY_INPUT_MAX_BYTES);
             assert_eq!(context.agent_id, "utility-worker");
             assert_eq!(context.model, "gpt-5.4");
             assert_eq!(context.agent_dir.as_deref(), Some(context.home_dir.join("agents/utility-worker").canonicalize().unwrap().as_path()));
             Ok(crate::runtime::RuntimeResponse {
                 partial_timeout_secs: None,
-                content: "Session utility result".into(), input_tokens: 1, output_tokens: 1,
+                content: std::fs::read_to_string(context.home_dir.join("summary-output-fixture"))
+                    .unwrap_or_else(|_| "Session utility result".into()), input_tokens: 1, output_tokens: 1,
                 cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "openai_compat".into(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn refusal_keeps_previous_summary_cursor_and_history() {
+        let (sm, home) = make_session_manager();
+        let dir = home.path().join("agents/utility-worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\nstatus='active'\n[runtime]\nprovider='openai_compat'\n[model]\npreferred='gpt-5.4'\n").unwrap();
+        std::fs::write(home.path().join("summary-output-fixture"), "I cannot summarize this conversation.").unwrap();
+        let runtimes = std::collections::HashMap::from([(
+            crate::runtime::RuntimeType::OpenAiCompat,
+            Box::new(SessionUtilityRuntime) as Box<dyn crate::runtime::AgentRuntime>,
+        )]);
+        let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+            home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes),
+        ).await;
+        for sid in ["owned", "odoolivechat:visitor"] {
+            sm.get_or_create(sid, "utility-worker").await.unwrap();
+            for text in ["old one", "old two", "new 中文", "latest"] {
+                sm.append_message(sid, "user", text, 1).await.unwrap();
+            }
+            sm.set_summary(sid, "- Previously established fact", 2).await.unwrap();
+            let ids = sm.get_message_ids(sid).await.unwrap();
+            let result = crate::autonomous_runtime::scope(home.path(), "utility-worker", &[],
+                summarize_one(&sm, home.path(), sid, 3)).await;
+            assert_eq!(result, Err(crate::session_summarizer::SummaryFailure::RefusalOrMeta));
+            assert_eq!(sm.get_summary(sid).await.unwrap(), ("- Previously established fact".into(), 2));
+            assert_eq!(sm.get_message_ids(sid).await.unwrap(), ids);
+            let delta = sm.read_summary_turn_range(sid, 2, 3).await.unwrap();
+            assert_eq!(delta, vec![("user".into(), "new 中文".into())]);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tick_backs_off_without_changing_history_even_after_restart() {
+        let (sm, home) = make_session_manager();
+        sm.get_or_create("bad-owner", "../missing").await.unwrap();
+        for _ in 0..12 { sm.append_message("bad-owner", "user", "keep this", 1).await.unwrap(); }
+        let before = sm.get_message_ids("bad-owner").await.unwrap();
+        tick_once(&sm, home.path(), &SummarizeParams::default()).await;
+        assert_eq!(sm.get_message_ids("bad-owner").await.unwrap(), before);
+        assert_eq!(sm.get_summary("bad-owner").await.unwrap(), (String::new(), 0));
+        let path = home.path().join("session_summary_retry.json");
+        let first = std::fs::read(&path).unwrap();
+        let restarted = SessionManager::new(&home.path().join("sessions.db")).unwrap();
+        tick_once(&restarted, home.path(), &SummarizeParams::default()).await;
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(restarted.get_message_ids("bad-owner").await.unwrap(), before);
     }
 
     #[tokio::test]
@@ -323,7 +403,7 @@ mod tests {
             sm.append_message(&sid, "user", "Summarize this conversation", 4).await.unwrap();
             sm.append_message(&sid, "assistant", "Discussion content", 4).await.unwrap();
             let error = summarize_one(&sm, home.path(), &sid, 2).await.unwrap_err();
-            assert!(error.contains("invalid session owner"), "{error}");
+            assert_eq!(error, crate::session_summarizer::SummaryFailure::ReadState);
             assert_eq!(sm.get_summary(&sid).await.unwrap().0, "");
         }
     }

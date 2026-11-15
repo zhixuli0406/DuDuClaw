@@ -297,7 +297,8 @@ impl PersonalSelection {
                     }
                     Some(metadata) => {
                         if let Err(error) = super::access::check_metadata(&home, &metadata, tool) {
-                            unavailable = Some(allow_soft(error)?);
+                            // "你的連線…" only for the connection's own person.
+                            unavailable = Some(allow_soft(super::access::for_requester(error, who, &user.id))?);
                         }
                         if unavailable.is_none() && !client_validated {
                             check_client_metadata(&home, &metadata)?;

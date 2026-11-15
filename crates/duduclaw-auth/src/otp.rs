@@ -28,6 +28,48 @@ pub const OTP_RATE_MAX: usize = 3;
 /// Setup-token validity window (30 minutes).
 pub const SETUP_TOKEN_TTL_SECS: i64 = 1800;
 
+/// Channels on which an administrator may bind a person's channel identity
+/// (`channel_identities.channel`). A binding on one of these makes the sender
+/// recognisable as that dashboard account; it says nothing about whether a
+/// login code can be sent there — see [`OTP_DELIVERY_CHANNELS`].
+///
+/// `googlechat` is bindable (RM-152) but is NOT an OTP delivery channel:
+/// there is no 1:1 bot-DM sender for it (`otp_delivery::token_field`).
+pub const BINDABLE_CHANNELS: [&str; 5] = ["telegram", "line", "discord", "slack", "googlechat"];
+
+/// Channels through which a login / enrollment code can be delivered as a 1:1
+/// bot DM. Must stay a subset of [`BINDABLE_CHANNELS`] and in step with
+/// `duduclaw_gateway::otp_delivery::token_field`.
+pub const OTP_DELIVERY_CHANNELS: [&str; 4] = ["telegram", "line", "discord", "slack"];
+
+/// The error [`UserDb::bind_channel_identity_authorized`] returns when the
+/// target account is not Active (suspended, offboarded or deleted).
+pub const BIND_TARGET_NOT_ACTIVE: &str = "target user is not active";
+
+/// Whether a verified identity on `channel` is somewhere a proactive 1:1
+/// notification / DM can be addressed. A Google Chat identity
+/// (`users/<id>`, RM-152) only recognises an inbound sender; outbound Chat
+/// messages go to a `spaces/<id>` the app is in, so a `googlechat` row is
+/// never a delivery destination. Every other channel keeps its behaviour.
+///
+/// Deliberately NOT [`OTP_DELIVERY_CHANNELS`]: notification delivery also
+/// reaches channels that are not bindable at all (WhatsApp, Feishu, Teams
+/// rows written by older versions), and those must keep receiving what they
+/// received before. The two sets agree only in excluding `googlechat`.
+pub fn is_dm_destination_channel(channel: &str) -> bool {
+    channel != "googlechat"
+}
+
+/// Exact, whole-value membership in [`BINDABLE_CHANNELS`].
+pub fn is_bindable_channel(channel: &str) -> bool {
+    BINDABLE_CHANNELS.iter().any(|c| *c == channel)
+}
+
+/// Exact, whole-value membership in [`OTP_DELIVERY_CHANNELS`].
+pub fn is_otp_delivery_channel(channel: &str) -> bool {
+    OTP_DELIVERY_CHANNELS.iter().any(|c| *c == channel)
+}
+
 /// A verified (or pending) channel identity for a user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChannelIdentity {
@@ -147,6 +189,19 @@ impl UserDb {
                 return Err("強制雙因素驗證期間，請由另一位管理員或主機操作員核准通道綁定。".into());
             }
         }
+        // A channel identity is authorization input: never attach one to a
+        // suspended, offboarded or deleted account (re-read in this write
+        // transaction, so a concurrent suspension cannot slip between).
+        let target_active: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND status='active')",
+                [user_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("bind lookup failed: {e}"))?;
+        if !target_active {
+            return Err(BIND_TARGET_NOT_ACTIVE.to_string());
+        }
         let existing: Option<(String, i64)> = tx
             .query_row(
                 "SELECT user_id, verified FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2",
@@ -184,6 +239,42 @@ impl UserDb {
         .map_err(|e| format!("unbind failed: {e}"))?;
         bump_acl_generation(&tx).map_err(|e| format!("unbind failed: {e}"))?;
         tx.commit().map_err(|e| format!("unbind failed: {e}"))
+    }
+
+    /// Dashboard unbind: remove `user_id`'s own binding of
+    /// `(channel, channel_user_id)`. `actor` must be an active administrator
+    /// (re-read inside the write transaction). Returns `false` when no such
+    /// binding of THAT user exists — a binding owned by someone else is never
+    /// touched by a request naming a different user.
+    pub fn unbind_channel_identity_authorized(
+        &self, user_id: &str, channel: &str, channel_user_id: &str, actor: &str,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("unbind failed: {e}"))?;
+        let admin: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='admin' AND status='active')",
+                [actor],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("unbind failed: {e}"))?;
+        if !admin {
+            return Err("admin required".into());
+        }
+        let removed = tx
+            .execute(
+                "DELETE FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2 AND user_id = ?3",
+                params![channel, channel_user_id, user_id],
+            )
+            .map_err(|e| format!("unbind failed: {e}"))?;
+        if removed == 0 {
+            return Ok(false);
+        }
+        bump_acl_generation(&tx).map_err(|e| format!("unbind failed: {e}"))?;
+        tx.commit().map_err(|e| format!("unbind failed: {e}"))?;
+        Ok(true)
     }
 
     /// Reverse lookup: which user owns this channel DM identity (verified or not)?
@@ -252,6 +343,19 @@ impl UserDb {
             .map_err(|e| format!("row map failed: {e}"))
     }
 
+    /// The verified identities of `user_id` that a proactive notification /
+    /// DM may be addressed to ([`is_dm_destination_channel`]). Every outbound
+    /// delivery list uses this; [`Self::verified_channels_for_user`] stays the
+    /// "who is this person on which channel" answer (identity display,
+    /// memory subjects, sender labels).
+    pub fn verified_dm_destinations_for_user(&self, user_id: &str) -> Result<Vec<ChannelIdentity>, String> {
+        Ok(self
+            .verified_channels_for_user(user_id)?
+            .into_iter()
+            .filter(|c| is_dm_destination_channel(&c.channel))
+            .collect())
+    }
+
     fn find_user_id_by_email(&self, email: &str) -> Result<Option<String>, String> {
         let conn = self.conn();
         conn.query_row(
@@ -280,8 +384,14 @@ impl UserDb {
                 return Ok(None);
             }
         };
+        // Only a channel a code can actually be delivered through is a login
+        // target: a bindable-only identity (Google Chat) must never be picked
+        // ahead of the person's Telegram / LINE / Discord / Slack DM.
         let channels = self.verified_channels_for_user(&user_id)?;
-        let target = match channels.into_iter().next() {
+        let target = match channels
+            .into_iter()
+            .find(|c| is_otp_delivery_channel(&c.channel))
+        {
             Some(c) => c,
             None => {
                 let _ = hash_password("timing-equalization-dummy");
@@ -732,6 +842,177 @@ mod tests {
                 .unwrap(),
             Some(u.id)
         );
+    }
+
+    // ── RM-152: bindable vs OTP-delivery channel lists ───────────
+
+    #[test]
+    fn googlechat_is_bindable_but_not_an_otp_delivery_channel() {
+        assert!(is_bindable_channel("googlechat"));
+        assert!(!is_otp_delivery_channel("googlechat"));
+        // Exact whole-value membership only.
+        for near in ["googlechat ", "Googlechat", "google", "googlechat:agent", ""] {
+            assert!(!is_bindable_channel(near), "{near:?}");
+            assert!(!is_otp_delivery_channel(near), "{near:?}");
+        }
+    }
+
+    #[test]
+    fn existing_channels_keep_their_membership_in_both_lists() {
+        for c in ["telegram", "line", "discord", "slack"] {
+            assert!(is_bindable_channel(c), "{c} must stay bindable");
+            assert!(is_otp_delivery_channel(c), "{c} must stay an OTP channel");
+        }
+        assert_eq!(OTP_DELIVERY_CHANNELS, ["telegram", "line", "discord", "slack"]);
+        assert_eq!(BINDABLE_CHANNELS.len(), OTP_DELIVERY_CHANNELS.len() + 1);
+        assert!(OTP_DELIVERY_CHANNELS.iter().all(|c| is_bindable_channel(c)));
+        for other in ["whatsapp", "feishu", "teams", "webchat", "widget"] {
+            assert!(!is_bindable_channel(other) && !is_otp_delivery_channel(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn otp_is_never_targeted_at_a_googlechat_binding() {
+        let db = db();
+        let u = make_user(&db);
+        // Bound first, so it is the oldest verified identity.
+        db.bind_channel_identity(&u.id, "googlechat", "users/1234567890", true).unwrap();
+        assert!(
+            db.request_otp("boss@example.com").unwrap().is_none(),
+            "a Google Chat-only account has no OTP login target"
+        );
+        db.bind_channel_identity(&u.id, "line", "U-line-1", true).unwrap();
+        let ch = db.request_otp("boss@example.com").unwrap().expect("challenge");
+        assert_eq!(ch.channel, "line");
+    }
+
+    #[test]
+    fn non_admin_cannot_bind_or_unbind_googlechat_for_themselves() {
+        let db = db();
+        let _admin = make_user(&db);
+        let emp = db
+            .create_user("emp@example.com", "Emp", "pw-unused-123456", UserRole::Employee)
+            .unwrap();
+        assert_eq!(
+            db.bind_channel_identity_authorized(&emp.id, "googlechat", "users/42", true, Some(&emp.id))
+                .unwrap_err(),
+            "admin required"
+        );
+        assert_eq!(db.find_user_id_by_channel("googlechat", "users/42").unwrap(), None);
+        db.bind_channel_identity(&emp.id, "googlechat", "users/42", true).unwrap();
+        assert_eq!(
+            db.unbind_channel_identity_authorized(&emp.id, "googlechat", "users/42", &emp.id)
+                .unwrap_err(),
+            "admin required"
+        );
+        assert_eq!(
+            db.find_verified_user_id_by_channel("googlechat", "users/42").unwrap(),
+            Some(emp.id)
+        );
+    }
+
+    #[test]
+    fn admin_unbind_only_removes_the_named_users_binding() {
+        let db = db();
+        let admin = make_user(&db);
+        let a = db
+            .create_user("a@example.com", "A", "pw-unused-123456", UserRole::Employee)
+            .unwrap();
+        let b = db
+            .create_user("b@example.com", "B", "pw-unused-123456", UserRole::Employee)
+            .unwrap();
+        db.bind_channel_identity_authorized(&a.id, "googlechat", "users/7", true, Some(&admin.id))
+            .unwrap();
+        // A request naming another user leaves A's binding alone.
+        assert!(!db
+            .unbind_channel_identity_authorized(&b.id, "googlechat", "users/7", &admin.id)
+            .unwrap());
+        assert_eq!(
+            db.find_verified_user_id_by_channel("googlechat", "users/7").unwrap(),
+            Some(a.id.clone())
+        );
+        assert!(db
+            .unbind_channel_identity_authorized(&a.id, "googlechat", "users/7", &admin.id)
+            .unwrap());
+        assert_eq!(db.find_verified_user_id_by_channel("googlechat", "users/7").unwrap(), None);
+    }
+
+    #[test]
+    fn googlechat_id_has_at_most_one_verified_owner() {
+        let db = db();
+        let admin = make_user(&db);
+        let a = db
+            .create_user("a@example.com", "A", "pw-unused-123456", UserRole::Employee)
+            .unwrap();
+        let b = db
+            .create_user("b@example.com", "B", "pw-unused-123456", UserRole::Employee)
+            .unwrap();
+        db.bind_channel_identity_authorized(&a.id, "googlechat", "users/99", true, Some(&admin.id))
+            .unwrap();
+        assert_eq!(
+            db.bind_channel_identity_authorized(&b.id, "googlechat", "users/99", true, Some(&admin.id))
+                .unwrap_err(),
+            "channel already bound to another user"
+        );
+        assert_eq!(
+            db.find_verified_user_id_by_channel("googlechat", "users/99").unwrap(),
+            Some(a.id)
+        );
+    }
+
+    #[test]
+    fn binding_requires_an_active_target_account() {
+        use crate::models::UserStatus;
+        for status in [UserStatus::Suspended, UserStatus::Offboarded] {
+            let db = db();
+            let admin = make_user(&db);
+            let t = db
+                .create_user("t@example.com", "T", "pw-unused-123456", UserRole::Employee)
+                .unwrap();
+            db.set_user_status(&t.id, status).unwrap();
+            for channel in ["googlechat", "telegram"] {
+                let id = if channel == "googlechat" { "users/5150" } else { "tg-5150" };
+                assert_eq!(
+                    db.bind_channel_identity_authorized(&t.id, channel, id, true, Some(&admin.id))
+                        .unwrap_err(),
+                    BIND_TARGET_NOT_ACTIVE,
+                    "{status:?} {channel}"
+                );
+                // The host path enforces the same rule.
+                assert_eq!(
+                    db.bind_channel_identity(&t.id, channel, id, true).unwrap_err(),
+                    BIND_TARGET_NOT_ACTIVE
+                );
+                assert_eq!(db.find_user_id_by_channel(channel, id).unwrap(), None);
+            }
+        }
+        // A deleted (never existing) account.
+        let db = db();
+        let admin = make_user(&db);
+        assert_eq!(
+            db.bind_channel_identity_authorized("no-such-user", "googlechat", "users/1", true, Some(&admin.id))
+                .unwrap_err(),
+            BIND_TARGET_NOT_ACTIVE
+        );
+        assert_eq!(db.find_user_id_by_channel("googlechat", "users/1").unwrap(), None);
+    }
+
+    #[test]
+    fn a_googlechat_identity_is_never_a_dm_destination() {
+        assert!(!is_dm_destination_channel("googlechat"));
+        for c in ["telegram", "line", "discord", "slack", "whatsapp", "feishu", "teams"] {
+            assert!(is_dm_destination_channel(c), "{c}");
+        }
+        let db = db();
+        let u = make_user(&db);
+        db.bind_channel_identity(&u.id, "googlechat", "users/31337", true).unwrap();
+        assert!(db.verified_dm_destinations_for_user(&u.id).unwrap().is_empty());
+        db.bind_channel_identity(&u.id, "line", "U-31337", true).unwrap();
+        let dests = db.verified_dm_destinations_for_user(&u.id).unwrap();
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].channel, "line");
+        // The identity itself is still listed as an identity.
+        assert_eq!(db.verified_channels_for_user(&u.id).unwrap().len(), 2);
     }
 
     #[test]

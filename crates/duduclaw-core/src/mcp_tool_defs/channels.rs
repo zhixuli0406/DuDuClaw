@@ -233,12 +233,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "channel",
-                description: "Channel type (e.g. telegram, line). Optional with chat_id in WebChat: omit both to return results to this conversation. Never 'webchat'.",
+                description: "Reminder channel (e.g. telegram, line); pair with chat_id. Omit both to use the verified source conversation for the same employee. Never 'webchat'. See docs/guides/mcp-tools.md.",
                 required: false,
             },
             ParamDef {
                 name: "chat_id",
-                description: "Chat/group/channel ID. Optional with channel in WebChat: omit both to return results to this conversation.",
+                description: "Chat/group/channel ID. Optional with channel in a supported channel or WebChat turn running as the same employee: omit both to return results to the conversation this was created from.",
                 required: false,
             },
             ParamDef {

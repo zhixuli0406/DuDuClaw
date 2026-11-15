@@ -213,6 +213,7 @@ impl NightLlm for RotatedNightLlm {
             &[],         // conversation_history — prompts are self-contained
             &[],         // account_pool — system-level utility call, no agent pool
             None,        // P1/WP-3 effort: resolved from the agent dir in the callee
+            crate::runtime_dispatch::SpawnPurpose::Utility, // zero-tool allowlist above
         )
         .await
         {

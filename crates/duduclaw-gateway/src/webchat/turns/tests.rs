@@ -33,7 +33,7 @@ fn cap_is_per_authenticated_user_and_counts_queued_turns() {
     let _b = registry.admit("alice", "socket2-b", None, "2", 2, 10).unwrap();
     assert!(matches!(
         registry.admit("alice", "socket2-c", None, "3", 2, 10),
-        Err("turn_limit")
+        Err(AdmissionError { .. })
     ));
     assert!(registry.admit("bob", "socket3-a", None, "1", 2, 10).is_ok());
 }
@@ -179,7 +179,7 @@ async fn cancel_kills_process_records_session_and_withdraws_own_approval() {
     assert_eq!(terminal["code"], "cancelled");
     assert_eq!(terminal["delegations_cancelled"], 1);
     assert_eq!(terminal, serde_json::json!({"type":"error", "code":"cancelled", "message":"Turn cancelled",
-        "approved_before_cancel":[], "delegations_cancelled":1, "request_id":null,
+        "cancel_outcome":"running", "approved_before_cancel":[], "delegations_cancelled":1, "request_id":null,
         "session_id":"session", "conv":null, "msg_id":"message", "progress_dropped":0}));
     assert!(queue.pending_messages(10).await.unwrap().is_empty());
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -249,7 +249,7 @@ fn global_turn_limit_survives_new_widget_identities_and_queued_work() {
     let first = registry.admit("widget:1", "s", None, "1", 3, 2).unwrap();
     let queued = registry.admit("widget:2", "s", None, "2", 3, 2).unwrap();
     assert!(queued.predecessor.is_some());
-    assert!(matches!(registry.admit("widget:3", "new-socket", None, "3", 3, 2), Err("turn_limit")));
+    assert!(matches!(registry.admit("widget:3", "new-socket", None, "3", 3, 2), Err(AdmissionError { .. })));
     drop(first);
     assert!(registry.admit("widget:3", "new-socket", None, "3", 3, 2).is_ok());
 }
@@ -363,7 +363,7 @@ async fn queued_cancel_keeps_fifo_and_never_creates_session() {
 fn duplicate_at_capacity_is_never_a_terminal_limit_error() {
     let registry = Arc::new(Registry::default());
     let _active = registry.admit("alice", "s", None, "m", 1, 1).unwrap();
-    assert!(matches!(registry.admit("alice", "s", None, "m", 1, 1), Err("duplicate_message")));
+    assert!(matches!(registry.admit("alice", "s", None, "m", 1, 1), Err(AdmissionError { reason: AdmissionReason::DuplicateMessage, .. })));
 }
 
 #[tokio::test]
@@ -434,11 +434,11 @@ async fn persistent_cancel_quota_refuses_admission_but_inflight_cancel_still_fen
     // A new registry and broker emulate restart: no in-memory quota survives.
     let restarted = Arc::new(Registry::default());
     assert!(matches!(restarted.admit_persistent(Some(&broker), "user:alice", "alice", "new", None, "next", 3, 10).await,
-        Err("turn_limit")));
+        Err(AdmissionError { reason: AdmissionReason::CancelQuota, limit: 100, .. })));
     assert!(restarted.entries.lock().unwrap().is_empty(), "quota refusal must release the slot");
     assert!(restarted.admit_persistent(Some(&broker), "user:bob", "bob", "other", None, "next", 3, 10).await.is_ok());
     assert!(matches!(registry.admit_persistent(Some(&broker), "user:alice", "alice", "session", None, "active", 3, 10).await,
-        Err("duplicate_message")));
+        Err(AdmissionError { reason: AdmissionReason::DuplicateMessage, .. })));
     registry.cancel("alice", Some("session"), None, Some("active"), None).unwrap();
     let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
     let (tx, mut rx) = outbound_channel();
@@ -489,8 +489,8 @@ async fn over_memory_caps_never_reads_persistent_quota() {
     let _active = registry.admit_persistent(Some(&broker), "user:alice", "alice", "s", None, "active", 1, 2).await.unwrap();
     assert_eq!(registry.quota_reads.load(Ordering::Relaxed), 1);
     for n in 0..1000 {
-        assert!(matches!(registry.admit_persistent(Some(&broker), "user:alice", "alice", "s", None, &n.to_string(), 1, 2).await, Err("turn_limit")));
-        assert!(matches!(registry.admit_persistent(Some(&broker), "user:bob", "bob", "b", None, &n.to_string(), 1, 1).await, Err("turn_limit")));
+        assert!(matches!(registry.admit_persistent(Some(&broker), "user:alice", "alice", "s", None, &n.to_string(), 1, 2).await, Err(AdmissionError { .. })));
+        assert!(matches!(registry.admit_persistent(Some(&broker), "user:bob", "bob", "b", None, &n.to_string(), 1, 1).await, Err(AdmissionError { .. })));
     }
     assert_eq!(registry.quota_reads.load(Ordering::Relaxed), 1);
 }
@@ -1116,4 +1116,175 @@ async fn unbound_cancel_or_panic_after_new_never_writes_to_the_replacement() {
         }
     }).await;
     assert!(sessions.webchat_history("webchat:new").await.unwrap().is_empty());
+}
+
+
+#[tokio::test]
+async fn waiting_cancel_releases_slot_without_touching_running_handles_or_fifo() {
+    let registry = Arc::new(Registry::default());
+    let first = registry.admit("alice", "s", None, "A", 2, 2).unwrap();
+    let running_cancel = first.cancel.clone();
+    let running_delivery = first.delivery_cancel.clone();
+    let waiting = registry.admit("alice", "s", None, "B", 2, 2).unwrap();
+    let first_id = first.id.clone();
+    assert!(matches!(registry.cancel("alice", Some("s"), None, Some("B"), None), Ok(CancelOutcome::Waiting)));
+    // B no longer consumes either cap even before cleanup or Drop.
+    let mut third = registry.admit("alice", "s", None, "C", 2, 2).unwrap();
+    assert!(!running_cancel.is_cancelled());
+    assert!(!running_delivery.is_cancelled());
+    assert_eq!(registry.entries.lock().unwrap().get(&first_id).unwrap().msg_id, "A");
+    drop(waiting);
+    tokio::task::yield_now().await;
+    assert_eq!(third.predecessor.as_mut().unwrap().try_recv(), Err(oneshot::error::TryRecvError::Empty));
+    drop(first);
+    third.predecessor.take().unwrap().await.unwrap();
+}
+
+#[tokio::test]
+async fn arriving_after_cancelled_waiter_cleanup_still_waits_for_running_turn() {
+    let registry = Arc::new(Registry::default());
+    let first = registry.admit("alice", "s", None, "A", 2, 2).unwrap();
+    let waiting = registry.admit("alice", "s", None, "B", 2, 2).unwrap();
+    registry.cancel("alice", Some("s"), None, Some("B"), None).unwrap();
+    drop(waiting);
+    tokio::task::yield_now().await;
+    let mut third = registry.admit("alice", "s", None, "C", 2, 2).unwrap();
+    assert_eq!(third.predecessor.as_mut().unwrap().try_recv(), Err(oneshot::error::TryRecvError::Empty));
+    assert!(!first.cancel.is_cancelled());
+    drop(first);
+    third.predecessor.take().unwrap().await.unwrap();
+}
+
+#[tokio::test]
+async fn admission_reasons_counts_and_refusal_record_are_structured() {
+    let registry = Arc::new(Registry::default());
+    let _running = registry.admit("alice", "s", None, "A", 2, 4).unwrap();
+    let _waiting = registry.admit("alice", "s", None, "B", 2, 4).unwrap();
+    let error = registry.admit("alice", "other", None, "C", 2, 4).err().unwrap();
+    assert_eq!(error.reason, AdmissionReason::UserLimit);
+    assert_eq!((error.limit, error.running, error.queued), (2, 1, 1));
+    let record = error.record("alice", "employee");
+    assert_eq!(record["event"], "webchat_turn_refused");
+    assert_eq!(record["user"], "alice");
+    assert_eq!(record["employee"], "employee");
+    assert_eq!(record["reason"], "user_limit");
+    assert_eq!(record["limit"], 2);
+    assert_eq!(record["running"], 1);
+    assert_eq!(record["queued"], 1);
+    assert!(chrono::DateTime::parse_from_rfc3339(record["timestamp"].as_str().unwrap()).is_ok());
+    let global = registry.admit("bob", "b", None, "C", 3, 2).err().unwrap();
+    assert_eq!(global.reason, AdmissionReason::GlobalLimit);
+    assert_eq!((global.limit, global.running, global.queued), (2, 1, 1));
+    let invalid = registry.admit("bob", "b", None, "C", 0, 4).err().unwrap();
+    assert_eq!(invalid.reason, AdmissionReason::ConfigInvalid);
+    let unavailable = registry.admit_persistent(None, "user:bob", "bob", "b", None, "C", 3, 4).await.err().unwrap();
+    assert_eq!(unavailable.reason, AdmissionReason::StoreUnavailable);
+    assert_eq!(unavailable.limit, 3);
+}
+
+#[tokio::test]
+async fn queued_supplements_merge_in_arrival_order_and_leave_cjk_over_cap_for_next_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let state = credential_fixture(home.path()).await;
+    let mut input = credential_input(state.clone());
+    input.content = "第一則".into();
+    let user = input.auth_user.clone();
+    let first = state.turns.admit(&user, "session", None, "A", 8, 8).unwrap();
+    let mut leader = state.turns.admit(&user, "session", None, "B", 8, 8).unwrap();
+    leader.stage(&input);
+    leader.set_origin("dudu", "alice");
+    let second = state.turns.admit(&user, "session", None, "C", 8, 8).unwrap();
+    let mut supplement = credential_input(state.clone());
+    supplement.content = "再補充日本語😀".into();
+    second.stage(&supplement);
+    second.set_origin("dudu", "alice");
+    let third = state.turns.admit(&user, "session", None, "D", 8, 8).unwrap();
+    supplement.content = "界".repeat(MAX_MERGED_CHARS);
+    third.stage(&supplement);
+    third.set_origin("dudu", "alice");
+    drop(first);
+    leader.predecessor.take().unwrap().await.unwrap();
+    assert!(leader.merge_waiting(&mut input));
+    assert_eq!(input.content, format!("第一則{MERGE_SEPARATOR}再補充日本語😀"));
+    assert_eq!(leader.originals, vec![("B".into(), "第一則".into(), 0), ("C".into(), "再補充日本語😀".into(), 0)]);
+    assert_eq!(leader.merged, vec!["C"]);
+    assert!(state.turns.entries.lock().unwrap().get(&third.id).unwrap().merged_into.is_none());
+    assert!(state.turns.cancel(&user, Some("session"), None, Some("C"), None).is_err());
+    // The claimed follower does not dispatch a second model call.
+    drop(leader);
+    let mut second = second;
+    second.predecessor.take().unwrap().await.unwrap();
+    assert!(!second.merge_waiting(&mut supplement));
+    drop(second);
+    let mut third = third;
+    third.predecessor.take().unwrap().await.unwrap();
+    assert!(third.merge_waiting(&mut supplement));
+    assert_eq!(supplement.content.chars().count(), MAX_MERGED_CHARS);
+}
+
+
+#[test]
+fn refusals_emit_structured_gateway_log_records() {
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = Writer(buffer.clone());
+    let subscriber = tracing_subscriber::fmt().json().with_writer(move || writer.clone()).finish();
+    tracing::subscriber::with_default(subscriber, || {
+        AdmissionError { reason: AdmissionReason::UserLimit, limit: 3, running: 2, queued: 1 }
+            .log_refusal("alice", "dudu");
+    });
+    let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+    let record: serde_json::Value = serde_json::from_str(event["fields"]["record"].as_str().unwrap()).unwrap();
+    assert_eq!(event["fields"]["event"], "webchat_turn_refused");
+    assert_eq!(record["user"], "alice");
+    assert_eq!(record["employee"], "dudu");
+    assert_eq!(record["reason"], "user_limit");
+    assert_eq!(record["limit"], 3);
+    assert_eq!(record["running"], 2);
+    assert_eq!(record["queued"], 1);
+    assert!(record["timestamp"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn merge_budget_preserves_exact_cjk_boundary_and_public_paths_do_not_merge() {
+    let home = tempfile::tempdir().unwrap();
+    let state = credential_fixture(home.path()).await;
+    let mut input = credential_input(state.clone());
+    let user = input.auth_user.clone();
+    let running = state.turns.admit(&user, "session", None, "A", 8, 8).unwrap();
+    let mut leader = state.turns.admit(&user, "session", None, "B", 8, 8).unwrap();
+    input.content = "界".repeat(MAX_MERGED_CHARS - MERGE_SEPARATOR.chars().count() - 1);
+    leader.stage(&input);
+    let follower = state.turns.admit(&user, "session", None, "C", 8, 8).unwrap();
+    let mut next = credential_input(state.clone());
+    next.content = "😀".into();
+    follower.stage(&next);
+    let remaining = state.turns.admit(&user, "session", None, "D", 8, 8).unwrap();
+    next.content = "中".into();
+    remaining.stage(&next);
+    drop(running);
+    leader.predecessor.take().unwrap().await.unwrap();
+    assert!(leader.merge_waiting(&mut input));
+    assert_eq!(input.content.chars().count(), MAX_MERGED_CHARS);
+    assert!(input.content.ends_with("😀"));
+    assert_eq!(leader.merged, vec!["C"]);
+    assert!(state.turns.entries.lock().unwrap().get(&remaining.id).unwrap().pending.is_some());
+    // Public visitors preserve their existing one-message-per-turn path.
+    for (user, sid) in [("widget-visitor:test", "widget-session"), ("operator", "odoolivechat:test")] {
+        let public = state.turns.admit(user, sid, None, "public", 8, 8).unwrap();
+        next.auth_user = user.into();
+        next.sid = sid.into();
+        public.stage(&next);
+        assert!(state.turns.entries.lock().unwrap().get(&public.id).unwrap().pending.is_none());
+        assert!(public.queue_notice(8).is_none());
+    }
 }

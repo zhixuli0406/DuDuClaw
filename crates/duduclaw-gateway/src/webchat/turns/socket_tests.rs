@@ -196,7 +196,7 @@ async fn frame(socket: &mut Socket) -> Value {
             {
                 WireMessage::Text(text) => {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["type"] == "turn_accepted" { continue; }
+                    if matches!(value["type"].as_str(), Some("turn_accepted" | "turn_queued" | "turn_merged" | "turn_consumed")) { continue; }
                     return value;
                 },
                 WireMessage::Ping(data) => socket.send(WireMessage::Pong(data)).await.unwrap(),
@@ -274,6 +274,10 @@ async fn exercise(mut fixture: Fixture) {
     let limited = frame(&mut second).await;
     assert_eq!(limited["type"], "error");
     assert_eq!(limited["code"], "turn_limit");
+    assert_eq!(limited["admission"]["reason"], "user_limit");
+    assert_eq!(limited["admission"]["limit"], 3);
+    assert_eq!(limited["admission"]["running"], 2);
+    assert_eq!(limited["admission"]["queued"], 1);
     assert_eq!(limited["request_id"], "c1");
     assert_eq!(limited["msg_id"], "c1");
     assert_eq!(limited["conv"], "c");
@@ -1176,7 +1180,7 @@ async fn webchat_queued_reply_rechecks_answerer_acl_and_retracts_history() {
         assert!(!fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap().iter()
             .any(|row| row.role == "assistant"), "queued replies remain unpublished");
         let route = queued.route.as_ref().unwrap();
-        assert_eq!(route.agent, "finance");
+        assert_eq!(route.agent.as_deref(), Some("finance"));
         assert!(fixture.state.authorize_target(&user, "sales", true).await.is_ok());
         if failure == "revoked" {
             fixture.state.user_db.unbind_agent(&user, "finance").unwrap();
@@ -1261,7 +1265,7 @@ async fn webchat_writer_rechecks_acl_after_backpressure_before_start_send() {
         subscription.subscribe("owned", None);
         let cancel = CancellationToken::new();
         let source = crate::channel_reply::ReplyDeliveryFence::test_live().for_turn(&cancel);
-        let mut turn = subscriptions.sinks(&user, "owned", "m", "finance", Some(&credential), source.clone())
+        let mut turn = subscriptions.sinks(&user, "owned", "m", Some("finance"), Some(&credential), source.clone())
             .pop().unwrap();
         let sending = tokio::spawn(async move {
             turn.send(Message::Text(r#"{"type":"assistant_done","content":"private"}"#.into())).await
@@ -1358,7 +1362,7 @@ async fn assert_final_policy_window(change: &str) {
         let subscription = subscriptions.register(&user, tx);
         subscription.subscribe("owned", None);
         let source = crate::channel_reply::ReplyDeliveryFence::test_live();
-        let mut turn = subscriptions.sinks(&user, "owned", "m", "finance", Some(&credential), source.clone()).pop().unwrap();
+        let mut turn = subscriptions.sinks(&user, "owned", "m", Some("finance"), Some(&credential), source.clone()).pop().unwrap();
         let sending = tokio::spawn(async move {
             turn.send(Message::Text(r#"{"type":"assistant_done","content":"private"}"#.into())).await
         });
@@ -1478,3 +1482,6 @@ async fn live_budget_and_provider_refusals_keep_pre_notice_assistant_done_bytes(
         fixture.turn_count(0).await;
     }
 }
+
+#[path = "contention_socket_tests.rs"]
+mod contention;
