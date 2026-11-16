@@ -13,6 +13,13 @@ pub mod recording_layout;
 pub mod update;
 pub mod worker;
 
+/// The highest Landlock ABI whose rule set this release knows (plan Q4). The
+/// single source for every consumer: the trampoline's policy clamp
+/// (`duduclaw-run` selects `min(detected, this)`), spawnd's evidence check,
+/// the recording sandbox, the gateway's readiness notice and the installer's
+/// composite readiness check. Raising it requires the matching rule set.
+pub const LANDLOCK_HIGHEST_KNOWN_ABI: u32 = 7;
+
 /// Fail-closed structural errors; never include input, paths or secrets (§4.4).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContractError {

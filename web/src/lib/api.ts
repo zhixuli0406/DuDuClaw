@@ -352,7 +352,11 @@ export type IsolationComponentState = 'ready' | 'unavailable' | 'pending_integra
 export type IsolationReasonCode = 'binding_evidence_missing' | 'connector_setup_required' |
   'personal_binding_conflict' | 'revoked' | 'service_unavailable' |
   'workspace_broker_unavailable' | 'helper_launcher_unavailable' | 'helper_runtime_missing' |
-  'helper_recording_unsupported';
+  'helper_recording_unsupported' |
+  /** v1.83: a data migration waits for administrator confirmation (action required). */
+  'migration_pending' |
+  /** v1.83: the kernel's Landlock ABI was clamped to the highest known one (notice only). */
+  'landlock_abi_clamped';
 export interface IsolationReason {
   code: IsolationReasonCode;
   /** Connector provider family (only for `connector_setup_required`). */

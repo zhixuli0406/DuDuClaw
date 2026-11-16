@@ -11,6 +11,9 @@ pub mod native_stop;
 pub mod bootstrap;
 #[path = "root_pipeline.rs"]
 pub mod pipeline;
+/// v1.83 R4: read-only journal verification for the installer's readiness check.
+#[path = "root_readiness.rs"]
+pub mod readiness;
 
 use crate::{Error, archive::{ArchiveWriter, decrypt}, journal::{Evidence, HostAdapter, Journal, StageOperation}, snapshot};
 

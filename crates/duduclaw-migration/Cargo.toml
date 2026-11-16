@@ -9,7 +9,9 @@ duduclaw-isolation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-rusqlite.workspace = true
+# `hooks` (progress handler) and `limits` (sqlite3_limit) bound the read-only
+# journal verification (`root_host::readiness`). Features only; no new package.
+rusqlite = { workspace = true, features = ["hooks", "limits"] }
 sha2 = "0.10"
 hmac = "0.12"
 chacha20poly1305 = "0.10"

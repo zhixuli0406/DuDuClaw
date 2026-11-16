@@ -77,6 +77,23 @@ fn service_protected_isolation_install_manifest_matches_migration() {
     assert_eq!(duduclaw_core::isolation_install::FACTS[0], duduclaw_isolation::ids::SPAWND_SOCKET);
 }
 
+/// v1.83 R4: the four readiness call sites (managed `install`, `install`
+/// after migration, `readiness`, `upgrade` after migration) use the real
+/// composite check; the placeholder that always refused is gone. The
+/// composite itself is tested with injected sources in
+/// `protected_linux_readiness_tests.rs` (Linux only).
+#[test]
+fn service_protected_readiness_call_sites_use_installed_composite() {
+    let install = include_str!("protected_linux_install.rs");
+    assert_eq!(install.matches("readiness::check(&mut readiness::InstalledComposite)").count(), 4);
+    assert_eq!(install.matches("readiness::check(").count(), 4, "no other composite at any call site");
+    let readiness = include_str!("protected_linux_readiness.rs");
+    for removed in ["MissingComposite", "尚未接上完整隔離就緒檢查"] {
+        assert!(!install.contains(removed) && !readiness.contains(removed), "{removed}");
+    }
+    assert!(readiness.contains("impl CompositeReadiness for InstalledComposite"));
+}
+
 #[test]
 fn service_protected_account_is_nonlogin_unprivileged() {
     for shell in ["/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false"] {

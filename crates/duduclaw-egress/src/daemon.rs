@@ -206,12 +206,23 @@ fn emit_audit(audit: &crate::session::AuditRecord) {
     if let Ok(line) = serde_json::to_string(audit) { eprintln!("{line}"); }
 }
 
-#[derive(Deserialize)]
+/// The dedicated DNS broker's root configuration ([`BROKER_CONFIG_PATH`], read
+/// with [`read_root_config`]). Public, with [`BrokerConfig::validate`], so the
+/// installer's readiness check accepts exactly what the broker accepts at
+/// start; there is no second copy of these rules.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BrokerConfig { upstream: std::net::SocketAddr }
+pub struct BrokerConfig { pub upstream: std::net::SocketAddr }
+impl BrokerConfig {
+    /// The broker's single upstream rule
+    /// ([`crate::resolver::validate_broker_upstream`]), also enforced again by
+    /// `serve_dns_broker` itself.
+    pub fn validate(&self) -> Result<(), EgressError> { crate::resolver::validate_broker_upstream(self.upstream) }
+}
 pub async fn broker_main() -> Result<(), EgressError> {
     harden("duduclaw-dns")?;
     let config: BrokerConfig = read_root_config(BROKER_CONFIG_PATH)?;
+    config.validate()?;
     let egress = nix::unistd::User::from_name(EGRESS_USER).map_err(io_error)?.ok_or(EgressError::Unavailable)?;
     let fd = activated_listener(DNS_BROKER_SOCKET, libc::SOCK_STREAM)?;
     let socket = std::os::unix::net::UnixListener::from(fd);

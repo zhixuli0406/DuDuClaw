@@ -22,7 +22,14 @@
 //!   `helper_launcher_unavailable{reason}` / `helper_runtime_missing{runtime}`.
 //!   These are action-required only while some protected employee's
 //!   configured tool list names a tool that needs them ([`ToolNeeds`]);
-//!   otherwise `report` lists them as informational `notices`.
+//!   otherwise `report` lists them as informational `notices`;
+//! - v1.83 R4, host-wide ([`host_reasons`]): the migration confirmation
+//!   store's `incomplete()` (what the confirmation page serves as
+//!   `confirmations_incomplete`) ⇒ `migration_pending` (action required;
+//!   diagnostic only: a store that cannot be verified reports nothing);
+//!   spawnd's checked evidence showing an applied Landlock clamp ⇒
+//!   `landlock_abi_clamped`, which is notice-only on every path
+//!   ([`Reason::notice_only`]).
 //!
 //! Fail closed: an unreadable source is `service_unavailable`, never "ready".
 //! The payload holds fixed codes, provider family names from the factory's
@@ -79,6 +86,63 @@ pub enum Reason {
     /// host has not proven that Chromium launches under the helper sandbox
     /// (spawnd's `helper_recording` bit is absent); recording stays refused.
     HelperRecordingUnsupported,
+    /// v1.83 R4 (design §10.3): a data migration waits for administrator
+    /// confirmation. The host may be ready, but unconfirmed employees cannot
+    /// run. Same code as the installer's host-side readiness check.
+    MigrationPending,
+    /// v1.83 R4 (plan Q4): the kernel reports a Landlock ABI newer than the
+    /// highest one this release knows; spawnd applied the highest known rule
+    /// set and its self test passed. Informational only (`notices`), never an
+    /// admission input. Same code as the installer's host-side check.
+    LandlockAbiClamped,
+}
+
+impl Reason {
+    /// Stable code of [`Reason::MigrationPending`] (its serialized `code`).
+    /// The installer's host-side readiness check reports the same code.
+    pub const MIGRATION_PENDING_CODE: &'static str = "migration_pending";
+    /// Stable code of [`Reason::LandlockAbiClamped`] (its serialized `code`).
+    pub const LANDLOCK_ABI_CLAMPED_CODE: &'static str = "landlock_abi_clamped";
+    /// Administrator text (zh-TW) shared by the installer's readiness summary.
+    pub const MIGRATION_PENDING_MESSAGE: &'static str =
+        "主機就緒；資料遷移尚待管理員確認，未確認的員工不能執行。";
+    /// The highest Landlock ABI whose rule set this release knows: the shared
+    /// contract constant (`duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI`)
+    /// that the trampoline clamps to and spawnd's evidence check compares with.
+    pub const LANDLOCK_HIGHEST_KNOWN_ABI: u32 = duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI;
+
+    /// Informational only: never an admission input and never part of
+    /// `reasons` (action required). [`Reason::LandlockAbiClamped`] is the only
+    /// such reason; every report path routes it to `notices`. Listed
+    /// explicitly, never by a wildcard.
+    pub fn notice_only(&self) -> bool {
+        match self {
+            Reason::LandlockAbiClamped => true,
+            Reason::BindingEvidenceMissing | Reason::ConnectorSetupRequired { .. } | Reason::PersonalBindingConflict
+            | Reason::Revoked | Reason::ServiceUnavailable | Reason::HelperLauncherUnavailable { .. }
+            | Reason::HelperRuntimeMissing { .. } | Reason::WorkspaceBrokerUnavailable
+            | Reason::HelperRecordingUnsupported | Reason::MigrationPending => false,
+        }
+    }
+
+    /// Administrator text (zh-TW) for a clamped Landlock ABI, shared by the
+    /// installer's readiness output. Numbers only; no host detail.
+    pub fn landlock_abi_clamped_message(detected_abi: u32) -> String {
+        format!("核心 Landlock ABI {detected_abi}，套用 ABI {} 規則集。", Self::LANDLOCK_HIGHEST_KNOWN_ABI)
+    }
+
+    /// [`Reason::LandlockAbiClamped`] exactly when spawnd's evidence shows a
+    /// detected ABI above the highest known one and the clamp to it was
+    /// applied. `landlock` = `(detected_abi, selected_abi)`; `None` (no
+    /// evidence) and any other combination report nothing here: whether the
+    /// evidence is acceptable at all is decided by spawnd's own check. Pure.
+    pub fn landlock_notice(landlock: Option<(u32, u32)>) -> Option<Self> {
+        match landlock {
+            Some((detected, selected)) if detected > Self::LANDLOCK_HIGHEST_KNOWN_ABI
+                && selected == Self::LANDLOCK_HIGHEST_KNOWN_ABI => Some(Self::LandlockAbiClamped),
+            _ => None,
+        }
+    }
 }
 
 /// W1: host-wide reasons of the brokered work root and the in-run helpers.
@@ -151,7 +215,9 @@ impl ToolNeeds {
     fn helpers(&self) -> bool { self.program || self.code_map || self.office }
 
     /// Whether `reason` (a [`feature_reasons`] entry) concerns these tools.
-    /// Non-feature reasons always do.
+    /// Other action reasons always do; a notice-only reason
+    /// ([`Reason::notice_only`]) never does. Every variant is listed, so a new
+    /// reason cannot become action-required through a wildcard.
     pub fn concerns(&self, reason: &Reason) -> bool {
         match reason {
             // The in-run helpers need the same Workspace grant as the file tools.
@@ -162,7 +228,10 @@ impl ToolNeeds {
                 duduclaw_execution::code_map_helper::RUNTIME => self.code_map,
                 _ => self.office,
             },
-            _ => true,
+            Reason::LandlockAbiClamped => false,
+            Reason::BindingEvidenceMissing | Reason::ConnectorSetupRequired { .. } | Reason::PersonalBindingConflict
+            | Reason::Revoked | Reason::ServiceUnavailable | Reason::HelperRecordingUnsupported
+            | Reason::MigrationPending => true,
         }
     }
 
@@ -205,6 +274,112 @@ pub(crate) fn installed_feature_reasons() -> Vec<Reason> {
 /// Protected mode exists only on Linux; elsewhere `report` never runs.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn installed_feature_reasons() -> Vec<Reason> { Vec::new() }
+
+/// v1.83 R4: host-wide reasons the gateway verifies from its own sources.
+/// `action` joins the report's `reasons`; `notices` are informational only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostReasons {
+    pub action: Vec<Reason>,
+    pub notices: Vec<Reason>,
+}
+
+/// v1.83 R4 (plan §4.4 dashboard row). `landlock` = `(detected, selected)`
+/// from a spawnd evidence report whose own `check()` passed (`None` when the
+/// report is missing, stale or invalid: the launch-service component already
+/// reports that). `migration_pending` = the confirmation store's
+/// `incomplete()` (the `confirmations_incomplete` value the migration
+/// confirmation page serves); `Err` = cannot determine. Pure.
+/// [`Reason::MigrationPending`] is diagnostic only and never an admission
+/// input (the gates enforce confirmation themselves), so "cannot determine"
+/// reports nothing: neither `migration_pending` nor any other reason.
+/// [`Reason::LandlockAbiClamped`] is only ever a notice.
+pub fn host_reasons(landlock: Option<(u32, u32)>, migration_pending: Result<bool, ()>) -> HostReasons {
+    let mut host = HostReasons::default();
+    if migration_pending == Ok(true) { host.action.push(Reason::MigrationPending); }
+    if let Some(notice) = Reason::landlock_notice(landlock) { host.notices.push(notice); }
+    host
+}
+
+/// The store the confirmation page serves (`migration.confirmations.list`)
+/// and its file bound.
+#[cfg(target_os = "linux")]
+const CONFIRMATIONS_DB: &str = "migration-confirmations.db";
+#[cfg(target_os = "linux")]
+const MAX_CONFIRMATIONS_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The confirmation store's `incomplete()`. `Ok(false)`: no store, i.e. no
+/// migration on this host. `Err(())`: cannot determine (see [`host_reasons`]).
+///
+/// The store is opened `O_PATH | O_NOFOLLOW` and checked on that descriptor:
+/// a regular file owned by the gateway's effective uid (the owner
+/// `fs_safe::sqlite::open_existing` requires of this store), not group/other
+/// writable, exactly one link, at most 64 MiB. The store runs in rollback
+/// journal mode (`ConfirmationStore::from_connection` never enables WAL), so
+/// any `-wal`, `-shm` or `-journal` sidecar is "cannot determine". SQLite then
+/// opens it read-only through `/proc/self/fd/N` for the existing
+/// `from_read_only_connection`; afterwards the name must still be that inode
+/// with one link and no sidecar. An `O_PATH` descriptor is used because
+/// closing an ordinary descriptor of the inode would drop every POSIX lock
+/// this process holds on it, including those of a live SQLite connection
+/// (see `fs_safe::sqlite`); closing an `O_PATH` descriptor drops none.
+/// Blocking (SQLite).
+#[cfg(target_os = "linux")]
+pub(crate) fn migration_confirmations_pending(home: &Path) -> Result<bool, ()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = home.join(CONFIRMATIONS_DB);
+    let file = match std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    // With O_PATH | O_NOFOLLOW a symlink is opened itself and refused here.
+    let opened = file.metadata().map_err(|_| ())?;
+    if !opened.file_type().is_file() || opened.uid() != nix::unistd::geteuid().as_raw()
+        || opened.mode() & 0o022 != 0 || opened.nlink() != 1 || opened.len() > MAX_CONFIRMATIONS_FILE_BYTES {
+        return Err(());
+    }
+    let unchanged = || -> Result<(), ()> {
+        let named = std::fs::symlink_metadata(&path).map_err(|_| ())?;
+        if !named.file_type().is_file() || named.nlink() != 1 || (named.dev(), named.ino()) != (opened.dev(), opened.ino()) {
+            return Err(());
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            match std::fs::symlink_metadata(home.join(format!("{CONFIRMATIONS_DB}{suffix}"))) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(()),
+            }
+        }
+        Ok(())
+    };
+    unchanged()?;
+    let conn = rusqlite::Connection::open_with_flags(format!("/proc/self/fd/{}", file.as_raw_fd()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|_| ())?;
+    let pending = duduclaw_migration::confirmation::ConfirmationStore::from_read_only_connection(conn)
+        .and_then(|store| store.incomplete()).map_err(|_| ())?;
+    unchanged()?;
+    Ok(pending)
+}
+
+/// Protected mode exists only on Linux: elsewhere nothing can be determined.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn migration_confirmations_pending(_: &Path) -> Result<bool, ()> { Err(()) }
+
+/// [`host_reasons`] from the live sources: spawnd's published evidence (only
+/// when it passes the same `check()` admission uses) and the confirmation store.
+#[cfg(target_os = "linux")]
+pub(crate) fn installed_host_reasons(home: &Path) -> HostReasons {
+    let landlock = duduclaw_spawnd::host::EvidenceReport::read(nix::unistd::getegid().as_raw()).ok()
+        .filter(|report| report.check().is_ok())
+        .and_then(|report| report.landlock.as_ref().map(|landlock| (landlock.detected_abi, landlock.selected_abi)));
+    host_reasons(landlock, migration_confirmations_pending(home))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn installed_host_reasons(home: &Path) -> HostReasons {
+    host_reasons(None, migration_confirmations_pending(home))
+}
 
 /// Fixed ids reported by `helper_runtime_missing` (office scripts are one
 /// family of `duduclaw-office-<skill>-<script>-v1` runtimes).
@@ -459,5 +634,94 @@ mod hx5_tests {
         assert!(feature_reasons(Some(SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_RECORDING)), true, Some(&published))
             .contains(&Reason::HelperRecordingUnsupported));
         assert!(!feature_reasons(Some(base), true, Some(&published[..3])).contains(&Reason::HelperRecordingUnsupported));
+    }
+
+    /// v1.83 R4: the two host-side codes are the serialized codes the
+    /// dashboard receives, and the Landlock notice only reports an applied
+    /// clamp above the highest known ABI (never a missing or invalid one).
+    #[test]
+    fn r4_migration_and_landlock_codes_are_shared_and_clamp_only() {
+        assert_eq!(serde_json::to_value(Reason::MigrationPending).unwrap(),
+            serde_json::json!({"code": Reason::MIGRATION_PENDING_CODE}));
+        assert_eq!(serde_json::to_value(Reason::LandlockAbiClamped).unwrap(),
+            serde_json::json!({"code": Reason::LANDLOCK_ABI_CLAMPED_CODE}));
+        for code in [Reason::MIGRATION_PENDING_CODE, Reason::LANDLOCK_ABI_CLAMPED_CODE] {
+            assert!(code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "{code}");
+        }
+        assert_eq!(Reason::landlock_notice(Some((8, 7))), Some(Reason::LandlockAbiClamped));
+        assert_eq!(Reason::landlock_notice(Some((12, 7))), Some(Reason::LandlockAbiClamped));
+        for evidence in [None, Some((7, 7)), Some((6, 6)), Some((1, 1)), Some((8, 8)), Some((8, 6)), Some((0, 0))] {
+            assert_eq!(Reason::landlock_notice(evidence), None, "{evidence:?}");
+        }
+        assert_eq!(Reason::landlock_abi_clamped_message(8), "核心 Landlock ABI 8，套用 ABI 7 規則集。");
+        // A notice is never a feature reason: no employee tool list makes it
+        // action-required through the W1 split by itself.
+        assert!(!feature_reasons(Some(duduclaw_isolation::ipc::SpawndFeatures::NONE), false, None)
+            .iter().any(|reason| matches!(reason, Reason::LandlockAbiClamped | Reason::MigrationPending)));
+        assert_eq!(Reason::LANDLOCK_HIGHEST_KNOWN_ABI, duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI);
+    }
+
+    /// v1.83 R4: the producer. Pending confirmations ⇒ `migration_pending`
+    /// (action); an applied clamp ⇒ `landlock_abi_clamped` (notice); a store
+    /// that cannot be read ⇒ nothing at all (diagnostic only, never admission).
+    #[test]
+    fn r4_host_reasons_produce_both_codes_with_their_severity() {
+        assert_eq!(host_reasons(Some((8, 7)), Ok(true)),
+            HostReasons { action: vec![Reason::MigrationPending], notices: vec![Reason::LandlockAbiClamped] });
+        assert_eq!(host_reasons(None, Ok(false)), HostReasons::default());
+        assert_eq!(host_reasons(Some((8, 8)), Ok(false)), HostReasons::default(), "an unclamped ABI is not a notice");
+        assert_eq!(host_reasons(None, Err(())), HostReasons::default());
+        assert_eq!(host_reasons(Some((8, 7)), Err(())),
+            HostReasons { action: vec![], notices: vec![Reason::LandlockAbiClamped] });
+    }
+
+    /// The live store reader: absent ⇒ no migration; a valid empty store ⇒
+    /// nothing pending; anything else (directory, not a database, symlink,
+    /// second link, group/other writable, any sidecar) ⇒ cannot determine.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn r4_migration_confirmation_store_absent_valid_or_undeterminable() {
+        use std::os::unix::fs::PermissionsExt;
+        use duduclaw_migration::confirmation::ConfirmationStore;
+        let private = |path: &Path| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Ok(false));
+        std::fs::create_dir(home.path().join(CONFIRMATIONS_DB)).unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(CONFIRMATIONS_DB), b"not a database").unwrap();
+        private(&home.path().join(CONFIRMATIONS_DB));
+        assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+
+        // A real, empty store: readable, nothing pending.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(CONFIRMATIONS_DB);
+        drop(ConfirmationStore::from_connection(rusqlite::Connection::open(&path).unwrap()).unwrap());
+        private(&path);
+        assert_eq!(migration_confirmations_pending(home.path()), Ok(false));
+        let bytes = std::fs::read(&path).unwrap();
+        // Group/other writable.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620)).unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+        private(&path);
+        // A second link.
+        std::fs::hard_link(&path, home.path().join("alias.db")).unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+        std::fs::remove_file(home.path().join("alias.db")).unwrap();
+        // Any sidecar (the store never runs in WAL mode).
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = home.path().join(format!("{CONFIRMATIONS_DB}{suffix}"));
+            std::fs::write(&sidecar, b"").unwrap();
+            private(&sidecar);
+            assert_eq!(migration_confirmations_pending(home.path()), Err(()), "{suffix}");
+            std::fs::remove_file(&sidecar).unwrap();
+        }
+        assert_eq!(migration_confirmations_pending(home.path()), Ok(false));
+        // A symlink to the valid store is never followed.
+        let link_home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&path, link_home.path().join(CONFIRMATIONS_DB)).unwrap();
+        assert_eq!(migration_confirmations_pending(link_home.path()), Err(()));
+        // The reader never wrote.
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
