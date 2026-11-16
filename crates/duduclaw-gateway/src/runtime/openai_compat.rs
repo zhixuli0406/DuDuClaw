@@ -1035,6 +1035,7 @@ impl OpenAiCompatRuntime {
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let admission = crate::autonomous_runtime::admit_current().await?;
         crate::autonomous_runtime::mark_handoff();
+        let total_deadline = tokio::time::Instant::now() + request_timeout(context);
         let response = completion_request(&url, context)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
@@ -1053,8 +1054,17 @@ impl OpenAiCompatRuntime {
             ));
         }
 
+        Self::collect_sse(response.bytes_stream(), context, total_deadline).await
+    }
+
+    async fn collect_sse<S, B>(
+        mut stream: S, context: &RuntimeContext, total_deadline: tokio::time::Instant,
+    ) -> Result<RuntimeResponse, String>
+    where
+        S: futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
+        B: AsRef<[u8]>,
+    {
         // Stream SSE chunks instead of buffering the entire response
-        let mut stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut content = String::new();
         // Thinking display: `reasoning_content` / `reasoning` deltas and a
@@ -1063,10 +1073,17 @@ impl OpenAiCompatRuntime {
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut done = false;
+        let mut terminal_deadline = None;
 
         let mut idle = crate::work_outcome::IdleWatch::new(crate::runtime_config::idle_timeout_secs(&context.home_dir, context.agent_dir.as_deref()));
         while !done {
             let next = tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(deadline) = terminal_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else { std::future::pending::<()>().await; }
+                } => break,
                 next = stream.next() => next,
                 _ = idle.expired() => return Err(idle.outcome(content.clone()).encode()),
             };
@@ -1074,8 +1091,12 @@ impl OpenAiCompatRuntime {
             if done {
                 break;
             }
-            let chunk = chunk.map_err(|e| transport_error("SSE stream", e))?;
-            buf.extend_from_slice(&chunk);
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) if idle.is_terminal() => break,
+                Err(error) => return Err(transport_error("SSE stream", error)),
+            };
+            buf.extend_from_slice(chunk.as_ref());
 
             // Process all complete lines available in the buffer
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -1093,13 +1114,20 @@ impl OpenAiCompatRuntime {
                         break;
                     }
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        idle.observe_openai(&chunk);
-                        reasoning.observe(&chunk);
-                        if let Some(delta) = chunk
-                            .pointer("/choices/0/delta/content")
-                            .and_then(|v| v.as_str())
-                        {
-                            content.push_str(delta);
+                        if !idle.is_terminal() {
+                            idle.observe_openai(&chunk);
+                            reasoning.observe(&chunk);
+                            if let Some(delta) = chunk
+                                .pointer("/choices/0/delta/content")
+                                .and_then(|v| v.as_str())
+                            {
+                                content.push_str(delta);
+                            }
+                            if idle.is_terminal() {
+                                // Keep the completed answer while allowing trailing usage.
+                                terminal_deadline = Some(total_deadline.min(tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(2)));
+                            }
                         }
                         if let Some(usage) = chunk.get("usage") {
                             input_tokens = usage
@@ -1123,13 +1151,15 @@ impl OpenAiCompatRuntime {
             if let Some(json_str) = line.strip_prefix("data: ") {
                 if json_str != "[DONE]" {
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        idle.observe_openai(&chunk);
-                        reasoning.observe(&chunk);
-                        if let Some(delta) = chunk
-                            .pointer("/choices/0/delta/content")
-                            .and_then(|v| v.as_str())
-                        {
-                            content.push_str(delta);
+                        if !idle.is_terminal() {
+                            idle.observe_openai(&chunk);
+                            reasoning.observe(&chunk);
+                            if let Some(delta) = chunk
+                                .pointer("/choices/0/delta/content")
+                                .and_then(|v| v.as_str())
+                            {
+                                content.push_str(delta);
+                            }
                         }
                         if let Some(usage) = chunk.get("usage") {
                             input_tokens = usage
@@ -1163,6 +1193,42 @@ impl OpenAiCompatRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn sse_terminal_then_open_silent_connection_returns_completed_answer() {
+        for seconds_left in [60, 1] {
+            let frame = b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec();
+            let stream = futures_util::stream::iter([Ok::<_, reqwest::Error>(frame)])
+                .chain(futures_util::stream::pending());
+            let context = tool_ctx("", "test-model");
+            let started = tokio::time::Instant::now();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(3),
+                OpenAiCompatRuntime::collect_sse(stream, &context,
+                    started + std::time::Duration::from_secs(seconds_left)),
+            ).await.expect("a missing DONE must not stall a completed answer").unwrap();
+            assert_eq!(response.content, "answer");
+            assert_eq!(tokio::time::Instant::now() - started,
+                std::time::Duration::from_secs(seconds_left.min(2)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sse_terminal_grace_records_trailing_usage_and_done() {
+        let terminal = b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec();
+        let stream = futures_util::stream::iter([Ok::<_, reqwest::Error>(terminal)])
+            .chain(futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                Ok(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\ndata: [DONE]\n\n".to_vec())
+            }))
+            .chain(futures_util::stream::pending()).boxed();
+        let context = tool_ctx("", "test-model");
+        let started = tokio::time::Instant::now();
+        let response = OpenAiCompatRuntime::collect_sse(stream, &context,
+            started + std::time::Duration::from_secs(60)).await.unwrap();
+        assert_eq!(response.content, "answer");
+        assert_eq!((response.input_tokens, response.output_tokens), (11, 7));
+        assert_eq!(tokio::time::Instant::now() - started, std::time::Duration::from_secs(1));
+    }
+
     #[test]
     fn empty_model_is_rejected_before_sending_an_api_request() {
         assert!(super::validate_model("").unwrap_err().contains("requires a model"));

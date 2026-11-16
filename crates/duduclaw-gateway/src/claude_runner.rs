@@ -4081,7 +4081,7 @@ async fn call_claude_streaming(
                                     // silently surfacing CLI errors as the reply.
                                     if let Some(error) = crate::work_outcome::result_error(&event, max_turns,
                                         if result_text.is_empty() { &partial_assistant_text } else { &result_text }) {
-                                        child.kill_and_reap().await;
+                                        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline(), true).await;
                                         return Err(error);
                                     }
                                     terminal_received = true;
@@ -4216,13 +4216,13 @@ async fn call_claude_streaming(
         if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
     }
     let status = if terminal_received {
-        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline()).await
+        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline(), false).await
     } else {
         Some(child.child().wait().await.map_err(|e| format!("wait error: {e}"))?)
     };
     // Preserve successful completion semantics; cancellation before this point
     // drops the managed owner and terminates all descendants.
-    child.disarm();
+    if !terminal_received { child.disarm(); }
     // Any non-zero exit is now a hard failure. Previously we only errored
     // when result_text was empty, which would surface CLI error text as
     // the "reply" whenever the stream-json layer accidentally wrote it.

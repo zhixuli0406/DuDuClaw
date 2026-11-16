@@ -49,6 +49,7 @@ pub(crate) struct IdleWatch {
 }
 impl IdleWatch {
     pub(crate) fn new(seconds: u64) -> Self { Self { seconds, last_event: tokio::time::Instant::now(), pending: vec![], terminal: false, initialized: false } }
+    pub(crate) fn is_terminal(&self) -> bool { self.terminal }
     pub(crate) async fn expired(&self) {
         if self.seconds == 0 || self.terminal { std::future::pending::<()>().await; }
         tokio::time::sleep_until(self.last_event + std::time::Duration::from_secs(self.seconds)).await;

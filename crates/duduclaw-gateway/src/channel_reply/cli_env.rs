@@ -808,7 +808,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                                         &event, max_turns,
                                         if result_text.is_empty() { &partial_assistant_text } else { &result_text },
                                     ) {
-                                        child.kill_and_reap().await;
+                                        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline(), true).await;
                                         return Err(error);
                                     }
                                     terminal_received = true;
@@ -1058,11 +1058,11 @@ pub(super) async fn spawn_claude_cli_with_env(
         if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
     }
     let status = if terminal_received {
-        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline()).await
+        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline(), false).await
     } else {
         Some(child.child().wait().await.map_err(|e| format!("wait error: {e}"))?)
     };
-    child.disarm();
+    if !terminal_received { child.disarm(); }
 
     // Snapshot stderr tail for error diagnostics.
     let stderr_tail: String = stderr_buf

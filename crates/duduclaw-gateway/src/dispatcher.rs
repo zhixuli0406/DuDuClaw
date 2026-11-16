@@ -3476,7 +3476,7 @@ async fn append_subagent_reply_to_parent_session_with(
     // once the session row is read), so only the owned strings move in.
     let failure = DISPATCH_FAILURE_REFERENCE.try_with(Clone::clone).ok();
     let response_owned = failure.as_ref().map(|f| f.partial.clone()).unwrap_or_else(|| response_text.to_string());
-    let failure_only = failure.is_some() && response_owned.trim().is_empty();
+    let failed = failure.is_some();
     let responder_owned = responder_agent.to_string();
 
     let parent = parent_agent_id.to_string();
@@ -3491,6 +3491,11 @@ async fn append_subagent_reply_to_parent_session_with(
         std::iter::once(parent.as_str()).chain(root.as_deref()),
     );
 
+    // Capture task-local widget identity before entering spawn_blocking.
+    let candidates: Vec<_> = candidates.into_iter().map(|sid| {
+        let public = crate::channel_reply::assembly::public_session(&sid);
+        (sid, public)
+    }).collect();
     let ch_type = channel_type.to_string();
     let ch_id = channel_id.to_string();
     let responder_for_log = responder_agent.to_string();
@@ -3504,7 +3509,7 @@ async fn append_subagent_reply_to_parent_session_with(
         // Try each candidate session_id in order. Accept a session whose
         // owner matches either the direct parent OR the chain root.
         // Direct match wins if both are available for the same session.
-        for sid in &candidates {
+        for (sid, public) in &candidates {
             // RM-173: a user clear left at its original id
             // (`STUCK_USER_CLEAR`) is not a live conversation — skip it.
             let existing: Option<String> = conn
@@ -3535,9 +3540,11 @@ async fn append_subagent_reply_to_parent_session_with(
                 continue;
             };
 
-            // A delivery notice is never an ordinary assistant turn, including
-            // public visitor wording and references. Empty partials add no row.
-            if failure_only { return Ok(Some((sid.clone(), is_relayed))); }
+            // Match direct-channel history: public visitors retain no failed
+            // partials; other sessions retain only nonempty model partials.
+            if failed && (*public || response_owned.trim().is_empty()) {
+                return Ok(Some((sid.clone(), is_relayed)));
+            }
 
             let content = subagent_reply_turn_content(
                 redaction.as_ref(),
@@ -5160,7 +5167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_failure_history_keeps_only_model_partial() {
+    async fn dispatch_failure_history_keeps_only_non_public_model_partial() {
         for (channel, chat) in [("telegram", "42"), ("odoolivechat", "site:42"), ("webchat", "widget-visitor:42")] {
             for partial in ["", "模型完成的部分"] {
                 let sid = format!("{channel}:{chat}");
@@ -5169,13 +5176,16 @@ mod tests {
                     reference: "failure-ref".into(), language: Some("zh-TW".into()), partial: partial.into(),
                     reason: crate::channel_reply::TurnFailureReason::TimeoutNoProgress,
                 };
-                DISPATCH_FAILURE_REFERENCE.scope(failure,
-                    append_subagent_reply_to_parent_session(&home, channel, chat, None, "agnes", None,
-                        "worker", "platform notice and failure-ref")).await;
+                crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(
+                    if channel == "webchat" { "widget-visitor:42" } else { "member" }.into(),
+                    DISPATCH_FAILURE_REFERENCE.scope(failure,
+                        append_subagent_reply_to_parent_session(&home, channel, chat, None, "agnes", None,
+                            "worker", "platform notice and failure-ref")),
+                ).await;
                 let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
                 let messages = sm.get_messages(&sid).await.unwrap();
                 let assistants: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
-                assert_eq!(assistants.len(), usize::from(!partial.is_empty()));
+                assert_eq!(assistants.len(), usize::from(channel == "telegram" && !partial.is_empty()));
                 if let Some(message) = assistants.first() {
                     assert!(message.content.contains(partial));
                     assert!(!message.content.contains("failure-ref"));
