@@ -54,6 +54,15 @@ pub struct SessionMessage {
     pub timestamp: String,
 }
 
+/// Model context and visible-row identities from one SQLite read snapshot.
+pub(crate) struct SessionHistorySnapshot {
+    pub compression_summary: String,
+    pub rolling_summary: String,
+    pub summarized_through_turn: u32,
+    pub messages: Vec<SessionMessage>,
+    pub message_ids: Vec<i64>,
+}
+
 /// Display-only WebChat row. Never use this type to build model context.
 pub(crate) struct WebChatHistoryMessage {
     pub id: i64,
@@ -420,18 +429,24 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Run at every open, before serving turns. A single atomic, idempotent
-    /// statement also repairs databases written by older gateway versions.
+    /// Read first at every open; only acquire a write lock for invalid bookmarks.
     fn repair_summary_bookmarks(conn: &Connection) -> Result<usize> {
+        const PREDICATE: &str = "summarized_through_turn > (
+            SELECT COUNT(*) FROM session_messages m
+            WHERE m.session_id = sessions.id AND m.hidden = 0 AND m.undone_at IS NULL
+        )";
+        let needed: bool = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM sessions WHERE {PREDICATE})"),
+            [], |row| row.get(0),
+        ).map_err(|e| DuDuClawError::Gateway(format!("check summary bookmarks: {e}")))?;
+        if !needed { return Ok(0); }
         let repaired = conn.execute(
-            "UPDATE sessions SET summary_of_prior = NULL, summarized_through_turn = 0,
-                    last_summarized_at = NULL
-             WHERE summarized_through_turn > (
-                 SELECT COUNT(*) FROM session_messages m
-                 WHERE m.session_id = sessions.id AND m.hidden = 0 AND m.undone_at IS NULL
-             )", [],
+            &format!("UPDATE sessions SET summary_of_prior = NULL, summarized_through_turn = 0,
+                    last_summarized_at = NULL WHERE {PREDICATE}"), [],
         ).map_err(|e| DuDuClawError::Gateway(format!("repair summary bookmarks: {e}")))?;
-        info!(repaired, "Repaired invalid session summary bookmarks");
+        if repaired > 0 {
+            info!(repaired, "Repaired invalid session summary bookmarks");
+        }
         Ok(repaired)
     }
 
@@ -1141,6 +1156,40 @@ impl SessionManager {
         })).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
+    /// Keep compression/rolling summaries and visible rows in the same snapshot.
+    pub(crate) async fn history_snapshot(&self, session_id: &str) -> Result<SessionHistorySnapshot> {
+        let mut conn = self.acquire().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let (compression_summary, rolling_summary, bookmark): (String, String, i64) = tx.query_row(
+            "SELECT COALESCE(summary, ''), COALESCE(summary_of_prior, ''), summarized_through_turn
+             FROM sessions WHERE id=?1", [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|e| DuDuClawError::Gateway(e.to_string()))?
+            .unwrap_or_default();
+        let mut messages = Vec::new();
+        let mut message_ids = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, role, content, tokens, timestamp FROM session_messages
+                 WHERE session_id=?1 AND hidden=0 AND undone_at IS NULL ORDER BY id ASC",
+            ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            let rows = stmt.query_map([session_id], |row| Ok((row.get::<_, i64>(0)?, SessionMessage {
+                role: row.get(1)?, content: row.get(2)?, tokens: row.get(3)?, timestamp: row.get(4)?,
+            }))).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            for row in rows {
+                let (id, message) = row.map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+                message_ids.push(id);
+                messages.push(message);
+            }
+        }
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(SessionHistorySnapshot {
+            compression_summary, rolling_summary, summarized_through_turn: bookmark.max(0) as u32,
+            messages, message_ids,
+        })
     }
 
     /// Retrieve all messages for a session, ordered by timestamp.
@@ -1936,15 +1985,21 @@ impl SessionManager {
     ) -> Result<()> {
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE sessions
              SET summary_of_prior = ?1,
                  summarized_through_turn = ?2,
                  last_summarized_at = ?3
-             WHERE id = ?4",
+             WHERE id = ?4 AND ?2 <= (
+                 SELECT COUNT(*) FROM session_messages
+                 WHERE session_id=?4 AND hidden=0 AND undone_at IS NULL
+             )",
             params![duduclaw_security::credential_detect::mask(summary), through_turn as i64, now, session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(format!("set_summary: {e}")))?;
+        if changed != 1 {
+            return Err(DuDuClawError::Gateway("summary bookmark exceeds visible rows or session is missing".into()));
+        }
         Ok(())
     }
 
@@ -1969,6 +2024,9 @@ impl SessionManager {
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| DuDuClawError::Gateway(e.to_string()))?
         };
+        if through_turn as usize > current.len() {
+            return Err(DuDuClawError::Gateway("summary bookmark exceeds visible rows".into()));
+        }
         if current.as_slice() != expected_ids {
             return Err(DuDuClawError::Gateway("session changed during summary".into()));
         }
@@ -2500,7 +2558,9 @@ mod tests {
             for _ in 0..count {
                 mgr.append_message(id, "user", "raw fact", 1).await.unwrap();
             }
-            mgr.set_summary(id, "- existing fact", bookmark).await.unwrap();
+            mgr.acquire().await.execute("UPDATE sessions SET summary_of_prior='- existing fact',
+                summarized_through_turn=?1, last_summarized_at=?2 WHERE id=?3",
+                params![bookmark, chrono::Utc::now().to_rfc3339(), id]).unwrap();
         }
         let conn = Connection::open(tmp.path()).unwrap();
         // Only one of these three rows is visible. Boot repair must use the
@@ -2534,6 +2594,45 @@ mod tests {
         drop(reopened);
         let reopened = SessionManager::new(tmp.path()).unwrap();
         assert_eq!(reopened.get_summary("stuck-260").await.unwrap(), (String::new(), 0));
+    }
+
+    #[tokio::test]
+    async fn healthy_bookmark_repair_is_read_only() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("healthy", "worker").await.unwrap();
+        mgr.append_message("healthy", "user", "fact", 1).await.unwrap();
+        mgr.set_summary("healthy", "- fact", 1).await.unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.pragma_update(None, "query_only", true).unwrap();
+        let before: i64 = conn.query_row("SELECT total_changes()", [], |r| r.get(0)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(SessionManager::repair_summary_bookmarks(&conn).unwrap(), 0);
+        }
+        let after: i64 = conn.query_row("SELECT total_changes()", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(mgr.get_summary("healthy").await.unwrap(), ("- fact".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn summary_writers_refuse_bookmarks_beyond_visible_rows() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("bounds", "worker").await.unwrap();
+        for _ in 0..3 { mgr.append_message("bounds", "user", "fact", 1).await.unwrap(); }
+        let ids = mgr.get_message_ids("bounds").await.unwrap();
+        mgr.hide_message("bounds", ids[0]).await.unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute("UPDATE session_messages SET undone_at='retracted' WHERE id=?1", [ids[1]]).unwrap();
+        let ids = mgr.get_message_ids("bounds").await.unwrap();
+        assert_eq!(ids.len(), 1);
+        mgr.set_summary("bounds", "- retained", 1).await.unwrap();
+        for through in [2, 17] {
+            assert!(mgr.set_summary("bounds", "- invalid", through).await.is_err());
+            assert!(mgr.set_summary_if_unchanged("bounds", "- invalid", through, 1, &ids).await.is_err());
+            assert_eq!(mgr.get_summary("bounds").await.unwrap(), ("- retained".into(), 1));
+        }
+        mgr.set_summary_if_unchanged("bounds", "- valid", 1, 1, &ids).await.unwrap();
     }
 
     #[tokio::test]
@@ -4124,6 +4223,7 @@ mod credential_summary_tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let manager = SessionManager::new(file.path()).unwrap();
         manager.get_or_create("test:s1", "test").await.unwrap();
+        manager.append_message("test:s1", "user", "fact", 1).await.unwrap();
         manager.set_summary("test:s1", "密碼：fixture-value", 1).await.unwrap();
         let (summary, _) = manager.get_summary("test:s1").await.unwrap();
         assert!(!summary.contains("fixture-value"));

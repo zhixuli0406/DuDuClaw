@@ -1203,15 +1203,15 @@ async fn build_reply_with_session_inner_impl(
     // not in the conversation turns (Anthropic Messages API rejects them).
     //
     // Async summaries belong in system context, never a forged assistant turn.
-    let compression_summary = session_mgr.compression_summary(session_id).await.unwrap_or_default();
-    let (async_summary, summarized_through) = session_mgr
-        .get_summary(session_id).await.unwrap_or_default();
-    let (async_summary, conversation_history) = match session_mgr.get_messages(session_id).await {
-        Ok(msgs) => crate::session_summarizer::session_history(
-            session_id, &msgs, &async_summary, summarized_through),
+    let (compression_summary, async_summary, conversation_history) = match session_mgr.history_snapshot(session_id).await {
+        Ok(snapshot) => {
+            let (summary, history) = crate::session_summarizer::session_history(
+                session_id, &snapshot.messages, &snapshot.rolling_summary, snapshot.summarized_through_turn);
+            (snapshot.compression_summary, summary, history)
+        }
         Err(e) => {
-            warn!("Failed to load session messages: {e}");
-            (String::new(), vec![])
+            warn!("Failed to load session history snapshot: {e}");
+            (String::new(), String::new(), vec![])
         }
     };
     let conversation_history = crate::runtime::cap_conversation_history(&conversation_history);
@@ -4009,31 +4009,18 @@ async fn build_reply_with_session_inner_impl(
             if sm.should_compress(&sid).await
                 && crate::session_summarizer::summary_retry_ready_async(&home_for_compress, &sid, "compression").await {
                 use crate::session_summarizer::{SummaryFailure, summary_attempt_finished_async};
-                // Capture ids before reading text; the final transaction refuses
-                // any intervening turn or visibility change instead of deleting it.
-                let expected_ids = match sm.get_message_ids(&sid).await {
-                    Ok(ids) => ids,
+                // Read summaries, text and ids together; the final transaction
+                // refuses intervening turns or visibility changes.
+                let snapshot = match sm.history_snapshot(&sid).await {
+                    Ok(snapshot) => snapshot,
                     Err(_) => {
                         summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
                         return;
                     }
                 };
-                let msgs = match sm.get_messages(&sid).await {
-                    Ok(messages) => messages,
-                    Err(_) => {
-                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
-                        return;
-                    }
-                };
-                let (previous, after) = match sm.get_summary(&sid).await {
-                    Ok(value) => value,
-                    Err(_) => {
-                        summary_attempt_finished_async(&home_for_compress, &sid, "compression", Some(SummaryFailure::ReadState)).await;
-                        return;
-                    }
-                };
+                let expected_ids = snapshot.message_ids;
                 let turns = crate::session_summarizer::compression_turns(
-                    &sid, &msgs, &previous, after);
+                    &sid, &snapshot.messages, &snapshot.rolling_summary, snapshot.summarized_through_turn);
                 let (transcript, protected, has_unprotected) =
                     crate::prompt_compression::partition_turns_for_summary(&turns);
                 let prompt = crate::session_summarizer::format_summarization_prompt(&transcript);
