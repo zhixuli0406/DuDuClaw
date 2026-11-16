@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.82.0] - 2026-11-16 — 網頁聊天回覆送達修正、Google Chat 身分綁定與聊天中的排程回到原對話
+
 ### Added
 
 - 授權寫入指令會提示目前資料目錄是否有 gateway 使用，並可用 `duduclaw license --home-check strict …` 讓未使用中的資料目錄檢查失敗；`license status` 也會顯示資料目錄與 gateway 鎖定狀態。
