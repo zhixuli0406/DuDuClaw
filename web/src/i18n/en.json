@@ -11566,5 +11566,9 @@
   "users.primary.save": "Set primary AI",
   "users.primary.missing": "{count} members have no primary AI",
   "users.primary.repair": "Set to their first AI",
-  "users.primary.confirm": "Set the listed members’ primary AI to their earliest Owner or Operator binding?"
+  "users.primary.confirm": "Set the listed members’ primary AI to their earliest Owner or Operator binding?",
+  "channels.detail.behavior.dmReplyPlacement": "DM reply placement",
+  "channels.detail.behavior.dmReplyPlacement.help": "Main-view messages reply in the main view by default; thread replies stay in their thread.",
+  "channels.detail.behavior.dmReplyPlacement.main": "Main view (default)",
+  "channels.detail.behavior.dmReplyPlacement.thread": "Always in thread"
 }

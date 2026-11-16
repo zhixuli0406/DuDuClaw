@@ -131,15 +131,15 @@ fn sanitize_chat<I: LocalIo>(value: &mut Value, io: &I) {
     }
 }
 fn chat_error(error: GoogleApiError) -> GoogleApiError {
-    let message = match error {
-        GoogleApiError::Forbidden(_) | GoogleApiError::Unauthorized => chat_read::GUIDANCE.to_owned(),
-        GoogleApiError::RateLimited => "Google Chat 請求次數過多，請稍後再試。".into(),
-        GoogleApiError::Http(_) => "無法連線至 Google Chat，請稍後再試。".into(),
-        GoogleApiError::Api { status: 404, .. } => "找不到此 Google Chat 空間，或目前連結的使用者沒有存取權。".into(),
-        GoogleApiError::Api { .. } => "Google Chat 讀取失敗，請確認空間、時間與討論串設定。".into(),
-        GoogleApiError::Auth(_) => chat_read::GUIDANCE.to_owned(),
+    tracing::warn!(error = %error, "Google Chat read failed");
+    let status = match error {
+        GoogleApiError::Forbidden(_) => 403,
+        GoogleApiError::Unauthorized | GoogleApiError::Auth(_) => 403,
+        GoogleApiError::RateLimited => 429,
+        GoogleApiError::Api { status, .. } => status,
+        GoogleApiError::Http(_) => 503,
     };
-    GoogleApiError::Forbidden(message)
+    GoogleApiError::Forbidden(chat_read::api_error_text(status, crate::trigger_route::texts::Lang::ZhTw).to_owned())
 }
 fn render_chat<I: LocalRender>(value: &Value, io: &mut I) -> Value {
     if let Err(error) = io.inspect_curated(value) { return tool_error(&error.to_string()); }

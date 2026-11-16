@@ -1033,6 +1033,17 @@ function ChannelBehaviorTab({ platform, active }: { platform: string; active: bo
     <div className="space-y-5">
       <SettingsSection>
         <SettingsCard>
+          {platform === 'googlechat' && (
+            <SettingsRow label={t('channels.detail.behavior.dmReplyPlacement')} description={t('channels.detail.behavior.dmReplyPlacement.help')}>
+              <Select value={settings.dm_reply_placement ?? 'main'} onValueChange={(v) => update('dm_reply_placement', v as 'main' | 'thread')}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="main">{t('channels.detail.behavior.dmReplyPlacement.main')}</SelectItem>
+                  <SelectItem value="thread">{t('channels.detail.behavior.dmReplyPlacement.thread')}</SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingsRow>
+          )}
           {hasGroupContext && (
             <SettingsRow
               label={t('channels.detail.behavior.mentionOnly')}

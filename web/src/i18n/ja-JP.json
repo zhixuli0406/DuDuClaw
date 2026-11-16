@@ -11566,5 +11566,9 @@
   "users.primary.save": "メイン AI を設定",
   "users.primary.missing": "{count} 人のメンバーにメイン AI がありません",
   "users.primary.repair": "最初の AI に設定",
-  "users.primary.confirm": "以下のメンバーのメイン AI を、最も早く紐付けたオーナーまたは操作権限の AI に設定しますか？"
+  "users.primary.confirm": "以下のメンバーのメイン AI を、最も早く紐付けたオーナーまたは操作権限の AI に設定しますか？",
+  "channels.detail.behavior.dmReplyPlacement": "DM の返信先",
+  "channels.detail.behavior.dmReplyPlacement.help": "通常のメッセージにはメイン画面で返信し、スレッド内のメッセージには同じスレッドで返信します。",
+  "channels.detail.behavior.dmReplyPlacement.main": "メイン画面（既定）",
+  "channels.detail.behavior.dmReplyPlacement.thread": "常にスレッド内"
 }

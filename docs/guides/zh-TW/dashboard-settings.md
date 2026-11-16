@@ -877,3 +877,9 @@ API（管理員 JWT）：`POST /api/channel-identity/bind {user_id, channel, cha
 `users.update`、`users.create`、`users.bind_agent` 會在寫入前拒絕未知欄位與無效值。輸入驗證錯誤以 `{code:"invalid_setting", key, message}` 指出欄位；主管循環等既有業務錯誤維持原代碼。`primary_agent_id` 不是 `users.update` 支援的欄位，請使用 `users.set_primary_agent`。
 
 受保護模式下，修補候選會排除個人專屬員工的綁定，預覽另回傳被排除的成員人數；橫幅人數以預覽為準（個人專屬員工屬於尚未提供的原生 Linux 員工隔離，目前的安裝沒有這類員工）。個人專屬 AI 須由成員自行設定，管理員選單會略過無法代設的綁定。確認只傳預覽摘要，伺服器在 IMMEDIATE 交易內重算完整有序名單與 SHA-256 摘要；不一致就拒絕整筆變更。migration、restore 與個人員工建立不會自動指定主要 AI。`users.list` 若讀不到綁定，會拒絕整份清單。
+
+### Google Chat 回覆與預覽連結
+
+私訊預設回覆在主畫面；使用者在討論串內傳送的訊息（`threadReply = true`）仍回覆在原討論串。聊天室維持既有討論串行為。管理員可到「通道 → Google Chat → 行為 → 私訊回覆位置」選擇「主畫面」（預設）或「一律回覆在討論串」。此設定僅能由儀表板修改，儲存在通道設定資料庫，請勿加入 `config.toml`。對話 session 仍以整個聊天室為單位。
+
+Google 文件／試算表的預覽連結會作為不可信訊息文字交給 AI，移除重複連結後最多保留 10 個 HTTPS 連結，每個上限 2048 位元組，含控制字元的連結會捨棄。閘道不會抓取連結。Chat 讀取工具的 `links` 陣列也納入內容掃描。缺少名稱時顯示可讀的替代文字；資源名稱與附件儲存路徑僅供工具操作，不應轉述給使用者。附件保留原始檔名，不需要新增 OAuth 權限。

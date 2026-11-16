@@ -224,7 +224,8 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
         let sender = event.pointer("/message/sender/name").and_then(Value::as_str).unwrap_or("");
         // Same queue (and queue-full notice throttle) keys as the HTTP path.
         let (group, conversation) = crate::googlechat::queue_keys(state.agent.as_deref(), space, sender);
-        let thread = event.pointer("/message/thread/name").and_then(Value::as_str).map(str::to_string);
+        let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, space, &event["message"], &event).await;
+        let thread = crate::googlechat::reply_thread(state, &event, is_dm).await;
         let notice_space = space.to_string();
         let bind = crate::agent_channels::binding_lock().await;
         if !still_current(&state.ctx, state.agent.as_deref(), config).await { break; }
@@ -581,9 +582,13 @@ mod googlechat_pubsub_tests {
         let h = harness().await;
         let mut message = api_message();
         message["attachment"] = json!([{"contentName":"real attachment", "source":"DRIVE_FILE"}]);
+        message["threadReply"] = json!(true);
+        message["annotations"] = json!([{"type":"RICH_LINK","richLinkMetadata":{"uri":"https://docs.google.com/document/d/example"}}]);
         *h.fake.message.lock().unwrap() = message.clone();
         let event = authoritative_event(&h.state.creds, &notification()).await.unwrap();
         assert_eq!(event["message"], message);
+        assert_eq!(event["message"]["threadReply"], true);
+        assert!(crate::googlechat::inbound_text(&event["message"]).contains("https://docs.google.com/document/d/example"));
         assert_eq!(event["space"]["type"], "SPACE");
         assert!(event["message"].get("argumentText").is_none());
         let calls = h.fake.calls.lock().unwrap();

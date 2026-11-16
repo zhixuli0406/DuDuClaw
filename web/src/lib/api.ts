@@ -273,6 +273,7 @@ export interface ChannelStatus {
 
 /** W2-2 (E1) — a channel's behavior settings (`channels.config_get/set`). */
 export interface ChannelConfigSettings {
+  dm_reply_placement: 'main' | 'thread';
   mention_only: boolean;
   auto_thread: boolean;
   allowed_channels: string[];
