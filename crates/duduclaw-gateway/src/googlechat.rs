@@ -1197,6 +1197,7 @@ where
                 warn!(failed = 1, "Google Chat placeholder state update failed");
             }
         }
+        return sent;
     }
     if clear().await.is_terminal() {
         if let Some(registration) = registration { registration.retire(); }
@@ -2321,6 +2322,25 @@ mod placeholder_lifecycle_tests {
             drop(registration);
             store.remove_placeholder(&name).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn definite_fallback_http_failure_keeps_pending_placeholder_without_delete() {
+        use axum::http::StatusCode;
+        let (_home, fake, creds, store) = fixture().await;
+        let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/FAILED", None,
+            Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
+        let name = name.unwrap();
+        chat::placeholder_statuses(&fake, Some(StatusCode::SERVICE_UNAVAILABLE),
+            Some(StatusCode::SERVICE_UNAVAILABLE), None);
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(name.clone())));
+        let result = deliver_reply(&creds, "spaces/FAILED", None, &slot, registration.as_ref(), "ANSWER", None).await;
+        assert!(result.is_err());
+        assert!(!chat::chat_calls(&fake).iter().any(|(method, _, _, _)| method == "DELETE"));
+        let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_name, name);
+        assert_eq!(rows[0].state, "pending");
     }
 
     #[tokio::test]

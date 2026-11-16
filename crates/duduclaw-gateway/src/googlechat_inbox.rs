@@ -153,13 +153,7 @@ impl Inbox {
             prepare_private(&PathBuf::from(format!("{}{suffix}", path.display())), false)?;
         }
         // v1 databases already have the table. Never rebuild/drop recovery rows.
-        let has_state = conn.prepare("PRAGMA table_info(pending_placeholders)")
-            .and_then(|mut q| q.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>())
-            .map_err(|_| "Google Chat placeholder migration failed")?.iter().any(|name| name == "state");
-        if !has_state {
-            conn.execute_batch("ALTER TABLE pending_placeholders ADD COLUMN state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','cleanup_only'));")
-                .map_err(|_| "Google Chat placeholder migration failed")?;
-        }
+        migrate_placeholder_state(&conn)?;
         let store = Self { conn: Mutex::new(conn), home: home.canonicalize().map_err(|_| "placeholder home unavailable")? };
         store.prune(chrono::Utc::now().timestamp())?;
         Ok(store)
@@ -305,6 +299,46 @@ impl Inbox {
     }
 }
 
+fn migrate_placeholder_state(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|_| "Google Chat placeholder migration failed")?;
+    let result = (|| {
+        if !placeholder_state_column(conn)? {
+            if let Err(error) = conn.execute_batch("ALTER TABLE pending_placeholders ADD COLUMN state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','cleanup_only'));") {
+                let duplicate_column = error.to_string().to_ascii_lowercase().contains("duplicate column name");
+                if !duplicate_column || !placeholder_state_column(conn)? {
+                    return Err("Google Chat placeholder migration failed");
+                }
+            }
+        }
+        if !placeholder_state_column(conn)? {
+            return Err("Google Chat placeholder migration failed");
+        }
+        conn.execute_batch("COMMIT;").map_err(|_| "Google Chat placeholder migration failed")
+    })();
+    if result.is_err() { let _ = conn.execute_batch("ROLLBACK;"); }
+    result
+}
+
+fn placeholder_state_column(conn: &Connection) -> Result<bool, String> {
+    let mut query = conn.prepare("PRAGMA table_info(pending_placeholders)")
+        .map_err(|_| "Google Chat placeholder migration failed")?;
+    let columns = query.query_map([], |row| Ok((
+        row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
+        row.get::<_, Option<String>>(4)?,
+    )))
+        .map_err(|_| "Google Chat placeholder migration failed")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| "Google Chat placeholder migration failed")?;
+    match columns.iter().find(|(name, _, _, _)| name == "state") {
+        None => Ok(false),
+        Some((_, column_type, not_null, default)) => Ok(
+            column_type.eq_ignore_ascii_case("TEXT") && *not_null == 1
+                && default.as_deref() == Some("'pending'"),
+        ),
+    }
+}
+
 fn prepare_private(path: &Path, create: bool) -> Result<(), String> {
     #[cfg(not(unix))]
     { let _ = (path, create); Err("Google Chat Pub/Sub 收件匣目前需要 Unix 檔案權限防護".into()) }
@@ -398,6 +432,35 @@ mod googlechat_inbox_tests {
             assert_eq!(store.conn.lock().unwrap().query_row(
                 "SELECT count(*) FROM pragma_table_info('pending_placeholders') WHERE name='state'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         }
+    }
+
+    #[test]
+    fn placeholder_v1_migration_is_safe_across_concurrent_connections() {
+        use std::sync::{Arc, Barrier};
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("googlechat_inbox.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../../duduclaw-import/src/googlechat-placeholders-v183.sql")).unwrap();
+        drop(conn);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2).map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let conn = Connection::open(path).unwrap();
+                barrier.wait();
+                migrate_placeholder_state(&conn).unwrap();
+            })
+        }).collect();
+        for handle in handles { handle.join().unwrap(); }
+
+        let conn = Connection::open(path).unwrap();
+        assert!(placeholder_state_column(&conn).unwrap());
+        let state_columns: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('pending_placeholders') WHERE name='state'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(state_columns, 1);
     }
 
     #[test]
