@@ -121,6 +121,7 @@ const MSG_MIGRATION_COMPLETION: &str = "資料遷移的內容已匯入，但最�
 const MSG_MIGRATION_IN_PROGRESS: &str = "資料遷移有尚未完成的步驟；請再次執行遷移流程。";
 const MSG_MIGRATION_RECEIPTS: &str = "資料遷移的步驟紀錄不完整或無效，需要人工檢查。";
 const MSG_MIGRATION_PLAN_MISSING: &str = "偵測到資料遷移的檔案，但缺少遷移計畫，需要人工檢查。";
+const MSG_MIGRATION_LEGACY: &str = "資料遷移紀錄為舊版格式；請繼續執行遷移流程，將遷移紀錄更新為目前格式。";
 const MSG_EDITION: &str = "此版本不支援員工隔離。";
 const MSG_EDITION_UNVERIFIED: &str = "無法確認團隊版授權；員工隔離維持停用。";
 const MSG_READY: &str = "所有就緒檢查均已通過，可以執行員工工作。";
@@ -471,6 +472,7 @@ fn migration_error(code: &str) -> (&'static str, &'static str) {
     match code {
         "migration_intent_pending" => ("migration_intent_pending", MSG_MIGRATION_IN_PROGRESS),
         "migration_receipts_invalid" => ("migration_receipts_invalid", MSG_MIGRATION_RECEIPTS),
+        "migration_journal_legacy" => ("migration_journal_legacy", MSG_MIGRATION_LEGACY),
         "migration_plan_missing" => ("migration_plan_missing", MSG_MIGRATION_PLAN_MISSING),
         "migration_plan_invalid" => ("migration_plan_invalid", MSG_MIGRATION_UNREADABLE),
         "migration_state_dir_unsafe" => ("migration_state_dir_unsafe", MSG_MIGRATION_UNREADABLE),

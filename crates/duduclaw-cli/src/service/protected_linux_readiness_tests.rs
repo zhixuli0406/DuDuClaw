@@ -503,7 +503,7 @@ fn service_protected_readiness_migration_pending_changes_summary_only() {
     use duduclaw_migration::root_host::readiness::ReadinessError as E;
     for error in [E::Unavailable, E::StateDirUnsafe, E::PlanMissing, E::PlanInvalid, E::JournalMissing,
         E::JournalUnsafe, E::JournalOversized, E::JournalSidecar, E::JournalChanged, E::JournalSchema,
-        E::JournalUnreadable, E::JournalConflict, E::IntentPending, E::ReceiptsInvalid] {
+        E::JournalUnreadable, E::JournalConflict, E::IntentPending, E::ReceiptsInvalid, E::JournalLegacy] {
         let mut fake = Fake::healthy(); fake.migration = Err(error.code());
         let findings = fake.assess();
         assert_eq!(failures(&findings), [(Item::Migration, error.code())], "{error:?}");
@@ -512,6 +512,8 @@ fn service_protected_readiness_migration_pending_changes_summary_only() {
     }
     assert_eq!(migration_error("migration_plan_missing").1, MSG_MIGRATION_PLAN_MISSING);
     assert_eq!(migration_error("migration_intent_pending").1, MSG_MIGRATION_IN_PROGRESS);
+    assert_eq!(migration_error("migration_journal_legacy"), ("migration_journal_legacy", MSG_MIGRATION_LEGACY));
+    assert_eq!(MSG_MIGRATION_LEGACY, "資料遷移紀錄為舊版格式；請繼續執行遷移流程，將遷移紀錄更新為目前格式。");
     // An unknown code collapses to the generic one.
     let mut fake = Fake::healthy(); fake.migration = Err("something_else");
     assert_eq!(failures(&fake.assess()), [(Item::Migration, "migration_state_unreadable")]);

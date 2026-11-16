@@ -244,11 +244,59 @@ pub fn probe_dns_broker_health(timeout: Duration) -> Result<(), EgressError> {
     let deadline = std::time::Instant::now() + timeout;
     let (path, uid) = route_socket(DnsRoute::DedicatedDnsBroker)?;
     socket_path_trusted(path, uid)?;
-    let mut stream = std::os::unix::net::UnixStream::connect(path).map_err(|_| EgressError::Unavailable)?;
+    let mut stream = connect_before(path, deadline)?;
     let peer = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
         .map_err(|_| EgressError::Unavailable)?;
     if peer.uid() != 0 && peer.uid() != uid { return Err(EgressError::Unavailable); }
     health_exchange(&mut stream, deadline)
+}
+
+/// Retry interval of [`connect_before`] while the listen backlog is full.
+const CONNECT_RETRY: Duration = Duration::from_millis(10);
+
+/// Connect to the AF_UNIX stream socket `path` before `deadline`. A blocking
+/// `connect` waits without bound while the listener's backlog is full, so the
+/// socket is non-blocking during connect: Linux then reports a full backlog as
+/// `EAGAIN` at once, and the connect is retried until `deadline`
+/// ([`EgressError::Timeout`]). The returned stream is blocking again; the
+/// exchange bounds every read and write by the same deadline.
+#[allow(clippy::unnecessary_cast)] // `c_char` is `u8` on some architectures.
+fn connect_before(path: &str, deadline: std::time::Instant) -> Result<std::os::unix::net::UnixStream, EgressError> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let remaining = || deadline.checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero()).ok_or(EgressError::Timeout);
+    // SAFETY: an all-zero `sockaddr_un` is a valid value of the C struct.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_bytes();
+    // Room for the terminating NUL; no interior NUL.
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
+        return Err(EgressError::Unavailable);
+    }
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) { *slot = *byte as libc::c_char; }
+    let length = libc::socklen_t::try_from(std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1)
+        .map_err(|_| EgressError::Unavailable)?;
+    // SAFETY: plain socket(2) call; the result is checked and owned at once.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 { return Err(EgressError::Unavailable); }
+    // SAFETY: `raw` is a fresh, valid descriptor that nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    loop {
+        remaining()?;
+        // SAFETY: `address` is an initialized `sockaddr_un`; `length` is within it.
+        let rc = unsafe { libc::connect(fd.as_raw_fd(), (&address as *const libc::sockaddr_un).cast(), length) };
+        if rc == 0 { break; }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => {}
+            // Linux AF_UNIX: the listener's backlog is full. Retry until the deadline.
+            Some(libc::EAGAIN) => std::thread::sleep(remaining()?.min(CONNECT_RETRY)),
+            // Anything else, including an (unexpected for AF_UNIX) EINPROGRESS: fail closed.
+            _ => return Err(EgressError::Unavailable),
+        }
+    }
+    let stream = std::os::unix::net::UnixStream::from(fd);
+    stream.set_nonblocking(false).map_err(|_| EgressError::Unavailable)?;
+    Ok(stream)
 }
 
 /// Send the fixed request and expect exactly the fixed NUL-terminated reply
@@ -506,6 +554,46 @@ mod tests {
             server.read_exact(&mut sent).unwrap();
             assert_eq!(&sent[..BROKER_HEALTH_REQUEST.len()], BROKER_HEALTH_REQUEST);
         }
+    }
+
+    /// The local connect is bounded too: a listener that never accepts, then
+    /// the same listener with a full backlog (where a blocking connect would
+    /// wait forever), both end in `Timeout` by the deadline.
+    #[test]
+    fn broker_health_probe_connect_is_bounded_by_the_deadline() {
+        use std::os::fd::AsRawFd;
+        use std::time::Instant;
+        let path = std::env::temp_dir().join(format!("duduclaw-egress-probe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // SAFETY: listen(2) again on a listening socket only resets its backlog
+        // (Linux); 0 admits one queued connection, so the second one is refused.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let path_text = path.to_str().unwrap();
+        // Never accepted, never answered: the exchange hits the deadline.
+        let mut first = connect_before(path_text, Instant::now() + Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        assert_eq!(health_exchange(&mut first, started + Duration::from_millis(200)), Err(EgressError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Fill the backlog.
+        let mut queued = vec![first];
+        let full = loop {
+            assert!(queued.len() < 4096, "the backlog never filled");
+            match connect_before(path_text, Instant::now() + Duration::from_millis(50)) {
+                Ok(stream) => queued.push(stream),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(full, EgressError::Timeout);
+        let started = Instant::now();
+        assert_eq!(connect_before(path_text, started + Duration::from_millis(300)).err(), Some(EgressError::Timeout));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(2), "{elapsed:?}");
+        // An expired deadline never connects; a missing socket is unavailable.
+        assert_eq!(connect_before(path_text, Instant::now()).err(), Some(EgressError::Timeout));
+        drop((queued, listener));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(connect_before(path_text, Instant::now() + Duration::from_secs(1)).err(), Some(EgressError::Unavailable));
     }
 
     #[tokio::test]

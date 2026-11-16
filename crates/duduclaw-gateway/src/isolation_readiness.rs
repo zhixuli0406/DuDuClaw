@@ -560,12 +560,13 @@ mod tests {
             HostReasons::default(), true);
         assert_eq!(readiness.status, Some(Overall::Ready));
         assert_eq!(readiness.notices, Some(vec![Reason::LandlockAbiClamped]));
-        // No clamp, no migration: nothing; an unreadable store fails closed.
+        // No clamp, no migration: nothing. A store that cannot be read is
+        // diagnostic only: no reason at all, the status is unchanged.
         assert_eq!(host_reasons(Some((7, 7)), Ok(false)), HostReasons::default());
         let readiness = with_features(base(all_ready()), Assessment::default(), Vec::new(), ToolNeeds::default(),
             host_reasons(None, Err(())), true);
-        assert_eq!(readiness.status, Some(Overall::ServiceUnavailable));
-        assert!(readiness.reasons.unwrap().contains(&Reason::ServiceUnavailable));
+        assert_eq!(readiness.status, Some(Overall::Ready));
+        assert_eq!(readiness.reasons, Some(vec![]));
         // No wildcard escalation: the split and `concerns` keep the clamp a notice.
         assert!(!ToolNeeds::ALL.concerns(&Reason::LandlockAbiClamped));
         assert!(ToolNeeds::default().concerns(&Reason::MigrationPending));

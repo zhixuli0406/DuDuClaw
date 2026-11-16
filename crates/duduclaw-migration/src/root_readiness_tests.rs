@@ -178,6 +178,108 @@ fn root_readiness_missing_extra_forged_or_invalid_receipts_block() {
     }
 }
 
+fn put_receipt(db: &Connection, target_state: MigrationState, evidence: &Evidence) {
+    let json = serde_json::to_string(evidence).unwrap();
+    db.execute("INSERT INTO migration_receipts VALUES(?1,?2,?3)",
+        rusqlite::params![target(target_state), json, Sha256::digest(json.as_bytes()).as_slice()]).unwrap();
+}
+
+/// A journal written before ContentArchived existed, at legacy `state`: the
+/// archive-only import recorded as ContentImported with `Content` evidence.
+fn legacy_journal(state: MigrationState) -> Fixture {
+    let fixture = Fixture::installed(MigrationState::EmployeeProposalsStaged);
+    let db = fixture.rw();
+    let index = LEGACY_ORDER.iter().position(|stage| *stage == state).unwrap();
+    for stage in &LEGACY_ORDER[LEGACY_ARCHIVE..=index] {
+        let proof = if *stage == MigrationState::ContentImported { evidence(MigrationState::ContentArchived) } else { evidence(*stage) };
+        put_receipt(&db, *stage, &proof);
+    }
+    db.execute("UPDATE migration SET state=?1", [target(state)]).unwrap();
+    fixture
+}
+
+/// The exact pre-ContentArchived shape has its own code (also with an intent
+/// recorded); the verifier never upgrades it, the mutating open does.
+#[test]
+fn root_readiness_legacy_journal_has_its_own_code_and_is_not_upgraded() {
+    use MigrationState as S;
+    assert_eq!(ReadinessError::JournalLegacy.code(), "migration_journal_legacy");
+    for (state, upgraded) in [(S::ContentImported, S::ContentArchived), (S::ConfirmationReady, S::ConfirmationReady),
+        (S::IsolationVerified, S::IsolationVerified), (S::AwaitingAdministrator, S::AwaitingAdministrator),
+        (S::Complete, S::AwaitingAdministrator)] {
+        let fixture = legacy_journal(state);
+        let bytes = fs::read(fixture.journal_path()).unwrap();
+        assert_eq!(fixture.verify(), Err(ReadinessError::JournalLegacy), "{state:?}");
+        assert_eq!(fs::read(fixture.journal_path()).unwrap(), bytes, "{state:?}: the verifier wrote");
+        // The mutating open (the R5 resume step) brings it up to date.
+        drop(Journal::from_connection(fixture.rw(), RequestId([7; 16])).unwrap());
+        assert_eq!(fixture.verify(), Ok(Some(upgraded)), "{state:?}");
+    }
+    let fixture = legacy_journal(S::ConfirmationReady);
+    let operation = StageOperation { migration: RequestId([7; 16]), target: S::IsolationVerified };
+    fixture.rw().execute("UPDATE migration SET intent=?1", [serde_json::to_string(&operation).unwrap()]).unwrap();
+    assert_eq!(fixture.verify(), Err(ReadinessError::JournalLegacy));
+}
+
+/// Only the exact legacy shape is `JournalLegacy`; any other mismatch around
+/// it stays `ReceiptsInvalid`.
+#[test]
+fn root_readiness_near_legacy_journals_are_receipts_invalid() {
+    use MigrationState as S;
+    let mutations: [(&str, fn(&Connection)); 5] = [
+        ("legacy archive receipt invalid", |db| {
+            let json = serde_json::to_string(&Evidence::Content { root_only_endpoint: false, source_labels_stamped: true,
+                import_mode_stopped: true }).unwrap();
+            db.execute("UPDATE migration_receipts SET evidence=?1, digest=?2 WHERE target=?3",
+                rusqlite::params![json, Sha256::digest(json.as_bytes()).as_slice(), target(S::ContentImported)]).unwrap();
+        }),
+        ("legacy archive digest forged", |db| {
+            db.execute("UPDATE migration_receipts SET digest=zeroblob(32) WHERE target=?1", [target(S::ContentImported)]).unwrap();
+        }),
+        ("earlier receipt missing", |db| {
+            db.execute("DELETE FROM migration_receipts WHERE target=?1", [target(S::KeysRotated)]).unwrap();
+        }),
+        ("both archive receipts", |db| put_receipt(db, S::ContentArchived, &evidence(S::ContentArchived))),
+        ("extra future receipt", |db| put_receipt(db, S::Complete, &evidence(S::Complete))),
+    ];
+    for (name, mutate) in mutations {
+        let fixture = legacy_journal(S::AwaitingAdministrator);
+        mutate(&fixture.rw());
+        assert_eq!(fixture.verify(), Err(ReadinessError::ReceiptsInvalid), "{name}");
+    }
+    // A legacy-shaped receipt set under a state before the archive stage.
+    let fixture = legacy_journal(S::ContentImported);
+    fixture.rw().execute("UPDATE migration SET state=?1", [target(S::EmployeeProposalsStaged)]).unwrap();
+    assert_eq!(fixture.verify(), Err(ReadinessError::ReceiptsInvalid));
+}
+
+/// KNOWN GAP (R5): receipts hash only their evidence, so the receipts of
+/// migration A copied into the journal of migration B verify. This test
+/// fails until R5 binds receipts to the migration id.
+#[test]
+#[ignore = "known gap: receipts are not bound to the migration id; fixed with the R5 receipt format (see PLAN §4.5)"]
+fn root_readiness_receipts_replayed_from_another_migration_are_refused() {
+    let source = Fixture::installed(MigrationState::Complete);
+    let rows: Vec<(String, String, Vec<u8>)> = {
+        let db = source.rw();
+        let mut statement = db.prepare("SELECT target, evidence, digest FROM migration_receipts").unwrap();
+        let rows: Vec<(String, String, Vec<u8>)> = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        rows
+    };
+    let victim = Fixture::new();
+    victim.make_state_dir();
+    victim.write_plan(&victim.plan(RequestId([8; 16])));
+    victim.journal_for(RequestId([8; 16]), MigrationState::Planned);
+    let db = victim.rw();
+    for (target_text, evidence_text, digest) in &rows {
+        db.execute("INSERT INTO migration_receipts VALUES(?1,?2,?3)", rusqlite::params![target_text, evidence_text, digest]).unwrap();
+    }
+    db.execute("UPDATE migration SET state=?1", [target(MigrationState::Complete)]).unwrap();
+    drop(db);
+    assert!(victim.verify().is_err(), "receipts of migration A must not complete migration B");
+}
+
 #[test]
 fn root_readiness_sidecars_block() {
     for sidecar in SIDECARS {
@@ -264,7 +366,7 @@ fn root_readiness_reason_codes_are_stable_ascii() {
     use ReadinessError as E;
     let all = [E::Unavailable, E::StateDirUnsafe, E::PlanMissing, E::PlanInvalid, E::JournalMissing, E::JournalUnsafe,
         E::JournalOversized, E::JournalSidecar, E::JournalChanged, E::JournalSchema, E::JournalUnreadable,
-        E::JournalConflict, E::IntentPending, E::ReceiptsInvalid];
+        E::JournalConflict, E::IntentPending, E::ReceiptsInvalid, E::JournalLegacy];
     let mut codes: Vec<_> = all.iter().map(|error| error.code()).collect();
     for code in &codes {
         assert!(code.starts_with("migration_") && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "{code}");

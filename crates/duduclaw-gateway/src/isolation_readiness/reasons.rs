@@ -25,7 +25,8 @@
 //!   otherwise `report` lists them as informational `notices`;
 //! - v1.83 R4, host-wide ([`host_reasons`]): the migration confirmation
 //!   store's `incomplete()` (what the confirmation page serves as
-//!   `confirmations_incomplete`) ⇒ `migration_pending` (action required);
+//!   `confirmations_incomplete`) ⇒ `migration_pending` (action required;
+//!   diagnostic only: a store that cannot be verified reports nothing);
 //!   spawnd's checked evidence showing an applied Landlock clamp ⇒
 //!   `landlock_abi_clamped`, which is notice-only on every path
 //!   ([`Reason::notice_only`]).
@@ -287,36 +288,83 @@ pub struct HostReasons {
 /// report is missing, stale or invalid: the launch-service component already
 /// reports that). `migration_pending` = the confirmation store's
 /// `incomplete()` (the `confirmations_incomplete` value the migration
-/// confirmation page serves); `Err` = unreadable. Pure; fail closed: an
-/// unreadable store is `service_unavailable`, never "no migration".
-/// [`Reason::MigrationPending`] is action-required (an administrator must
-/// confirm); [`Reason::LandlockAbiClamped`] is only ever a notice.
+/// confirmation page serves); `Err` = cannot determine. Pure.
+/// [`Reason::MigrationPending`] is diagnostic only and never an admission
+/// input (the gates enforce confirmation themselves), so "cannot determine"
+/// reports nothing: neither `migration_pending` nor any other reason.
+/// [`Reason::LandlockAbiClamped`] is only ever a notice.
 pub fn host_reasons(landlock: Option<(u32, u32)>, migration_pending: Result<bool, ()>) -> HostReasons {
     let mut host = HostReasons::default();
-    match migration_pending {
-        Ok(true) => host.action.push(Reason::MigrationPending),
-        Ok(false) => {}
-        Err(()) => host.action.push(Reason::ServiceUnavailable),
-    }
+    if migration_pending == Ok(true) { host.action.push(Reason::MigrationPending); }
     if let Some(notice) = Reason::landlock_notice(landlock) { host.notices.push(notice); }
     host
 }
 
-/// Same file and bound as the confirmation page's `migration.confirmations.list`
-/// (`migration-confirmations.db` in the gateway home, a regular file of at
-/// most 64 MiB, opened read-only). Absent = no migration on this host.
+/// The store the confirmation page serves (`migration.confirmations.list`)
+/// and its file bound.
+#[cfg(target_os = "linux")]
+const CONFIRMATIONS_DB: &str = "migration-confirmations.db";
+#[cfg(target_os = "linux")]
+const MAX_CONFIRMATIONS_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The confirmation store's `incomplete()`. `Ok(false)`: no store, i.e. no
+/// migration on this host. `Err(())`: cannot determine (see [`host_reasons`]).
+///
+/// The store is opened `O_PATH | O_NOFOLLOW` and checked on that descriptor:
+/// a regular file owned by the gateway's effective uid (the owner
+/// `fs_safe::sqlite::open_existing` requires of this store), not group/other
+/// writable, exactly one link, at most 64 MiB. The store runs in rollback
+/// journal mode (`ConfirmationStore::from_connection` never enables WAL), so
+/// any `-wal`, `-shm` or `-journal` sidecar is "cannot determine". SQLite then
+/// opens it read-only through `/proc/self/fd/N` for the existing
+/// `from_read_only_connection`; afterwards the name must still be that inode
+/// with one link and no sidecar. An `O_PATH` descriptor is used because
+/// closing an ordinary descriptor of the inode would drop every POSIX lock
+/// this process holds on it, including those of a live SQLite connection
+/// (see `fs_safe::sqlite`); closing an `O_PATH` descriptor drops none.
 /// Blocking (SQLite).
+#[cfg(target_os = "linux")]
 pub(crate) fn migration_confirmations_pending(home: &Path) -> Result<bool, ()> {
-    let path = home.join("migration-confirmations.db");
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 64 * 1024 * 1024 => {
-            duduclaw_migration::confirmation::ConfirmationStore::open_read_only(&path)
-                .and_then(|store| store.incomplete()).map_err(|_| ())
-        }
-        _ => Err(()),
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = home.join(CONFIRMATIONS_DB);
+    let file = match std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    // With O_PATH | O_NOFOLLOW a symlink is opened itself and refused here.
+    let opened = file.metadata().map_err(|_| ())?;
+    if !opened.file_type().is_file() || opened.uid() != nix::unistd::geteuid().as_raw()
+        || opened.mode() & 0o022 != 0 || opened.nlink() != 1 || opened.len() > MAX_CONFIRMATIONS_FILE_BYTES {
+        return Err(());
     }
+    let unchanged = || -> Result<(), ()> {
+        let named = std::fs::symlink_metadata(&path).map_err(|_| ())?;
+        if !named.file_type().is_file() || named.nlink() != 1 || (named.dev(), named.ino()) != (opened.dev(), opened.ino()) {
+            return Err(());
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            match std::fs::symlink_metadata(home.join(format!("{CONFIRMATIONS_DB}{suffix}"))) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(()),
+            }
+        }
+        Ok(())
+    };
+    unchanged()?;
+    let conn = rusqlite::Connection::open_with_flags(format!("/proc/self/fd/{}", file.as_raw_fd()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|_| ())?;
+    let pending = duduclaw_migration::confirmation::ConfirmationStore::from_read_only_connection(conn)
+        .and_then(|store| store.incomplete()).map_err(|_| ())?;
+    unchanged()?;
+    Ok(pending)
 }
+
+/// Protected mode exists only on Linux: elsewhere nothing can be determined.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn migration_confirmations_pending(_: &Path) -> Result<bool, ()> { Err(()) }
 
 /// [`host_reasons`] from the live sources: spawnd's published evidence (only
 /// when it passes the same `check()` admission uses) and the confirmation store.
@@ -614,35 +662,66 @@ mod hx5_tests {
     }
 
     /// v1.83 R4: the producer. Pending confirmations ⇒ `migration_pending`
-    /// (action); an applied clamp ⇒ `landlock_abi_clamped` (notice); an
-    /// unreadable store ⇒ `service_unavailable`, never "no migration".
+    /// (action); an applied clamp ⇒ `landlock_abi_clamped` (notice); a store
+    /// that cannot be read ⇒ nothing at all (diagnostic only, never admission).
     #[test]
     fn r4_host_reasons_produce_both_codes_with_their_severity() {
         assert_eq!(host_reasons(Some((8, 7)), Ok(true)),
             HostReasons { action: vec![Reason::MigrationPending], notices: vec![Reason::LandlockAbiClamped] });
         assert_eq!(host_reasons(None, Ok(false)), HostReasons::default());
         assert_eq!(host_reasons(Some((8, 8)), Ok(false)), HostReasons::default(), "an unclamped ABI is not a notice");
-        assert_eq!(host_reasons(None, Err(())).action, vec![Reason::ServiceUnavailable]);
+        assert_eq!(host_reasons(None, Err(())), HostReasons::default());
+        assert_eq!(host_reasons(Some((8, 7)), Err(())),
+            HostReasons { action: vec![], notices: vec![Reason::LandlockAbiClamped] });
     }
 
-    /// The live store reader: absent ⇒ no migration; anything that is not a
-    /// readable confirmation store ⇒ unreadable (fail closed).
+    /// The live store reader: absent ⇒ no migration; a valid empty store ⇒
+    /// nothing pending; anything else (directory, not a database, symlink,
+    /// second link, group/other writable, any sidecar) ⇒ cannot determine.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn r4_migration_confirmation_store_absent_or_unreadable() {
+    fn r4_migration_confirmation_store_absent_valid_or_undeterminable() {
+        use std::os::unix::fs::PermissionsExt;
+        use duduclaw_migration::confirmation::ConfirmationStore;
+        let private = |path: &Path| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let home = tempfile::tempdir().unwrap();
         assert_eq!(migration_confirmations_pending(home.path()), Ok(false));
-        std::fs::create_dir(home.path().join("migration-confirmations.db")).unwrap();
+        std::fs::create_dir(home.path().join(CONFIRMATIONS_DB)).unwrap();
         assert_eq!(migration_confirmations_pending(home.path()), Err(()));
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("migration-confirmations.db"), b"not a database").unwrap();
+        std::fs::write(home.path().join(CONFIRMATIONS_DB), b"not a database").unwrap();
+        private(&home.path().join(CONFIRMATIONS_DB));
         assert_eq!(migration_confirmations_pending(home.path()), Err(()));
-        #[cfg(unix)]
-        {
-            let home = tempfile::tempdir().unwrap();
-            let target = home.path().join("real.db");
-            std::fs::write(&target, b"").unwrap();
-            std::os::unix::fs::symlink(&target, home.path().join("migration-confirmations.db")).unwrap();
-            assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+
+        // A real, empty store: readable, nothing pending.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(CONFIRMATIONS_DB);
+        drop(ConfirmationStore::from_connection(rusqlite::Connection::open(&path).unwrap()).unwrap());
+        private(&path);
+        assert_eq!(migration_confirmations_pending(home.path()), Ok(false));
+        let bytes = std::fs::read(&path).unwrap();
+        // Group/other writable.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620)).unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+        private(&path);
+        // A second link.
+        std::fs::hard_link(&path, home.path().join("alias.db")).unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+        std::fs::remove_file(home.path().join("alias.db")).unwrap();
+        // Any sidecar (the store never runs in WAL mode).
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = home.path().join(format!("{CONFIRMATIONS_DB}{suffix}"));
+            std::fs::write(&sidecar, b"").unwrap();
+            private(&sidecar);
+            assert_eq!(migration_confirmations_pending(home.path()), Err(()), "{suffix}");
+            std::fs::remove_file(&sidecar).unwrap();
         }
+        assert_eq!(migration_confirmations_pending(home.path()), Ok(false));
+        // A symlink to the valid store is never followed.
+        let link_home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&path, link_home.path().join(CONFIRMATIONS_DB)).unwrap();
+        assert_eq!(migration_confirmations_pending(link_home.path()), Err(()));
+        // The reader never wrote.
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

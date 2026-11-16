@@ -15,6 +15,16 @@
 //! A reported state is complete evidence: no pending intent, and exactly the
 //! receipts of every stage up to that state, each validating for its stage
 //! with a matching digest. Any other journal is an error with its own code.
+//!
+//! A journal still in the pre-ContentArchived format (the exact shape
+//! `journal::upgrade_archive_receipts` rewrites) is reported as
+//! [`ReadinessError::JournalLegacy`]; this verifier never upgrades it.
+//! R5 must provide: an explicit mutating migration-resume step that runs
+//! before composite readiness.
+//!
+//! Known gap, recorded for R5 (PLAN §4.5): a receipt digest covers only its
+//! evidence, not the migration id, so receipts are not bound to their
+//! migration (see `checked_receipt`).
 use std::{io::Read, path::Path, time::{Duration, Instant}};
 use duduclaw_isolation::{ids::RequestId, migration::MigrationState};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, limits::Limit};
@@ -59,6 +69,9 @@ pub enum ReadinessError {
     #[error("migration stage in progress")] IntentPending,
     /// A required stage receipt is missing, invalid or unexpected.
     #[error("migration receipts rejected")] ReceiptsInvalid,
+    /// The journal is exactly in the pre-ContentArchived format and needs the
+    /// archive-receipt upgrade, which only the mutating resume step performs.
+    #[error("migration journal in a legacy format")] JournalLegacy,
 }
 
 impl ReadinessError {
@@ -78,6 +91,7 @@ impl ReadinessError {
             Self::JournalConflict => "migration_journal_conflict",
             Self::IntentPending => "migration_intent_pending",
             Self::ReceiptsInvalid => "migration_receipts_invalid",
+            Self::JournalLegacy => "migration_journal_legacy",
         }
     }
 }
@@ -200,14 +214,18 @@ fn schema(_: rusqlite::Error) -> ReadinessError { ReadinessError::JournalSchema 
 /// read-only, verify the schema, then the singleton row and every receipt.
 fn read_journal(fd: &OwnedFd, migration: RequestId) -> Result<MigrationState, ReadinessError> {
     let uri = format!("file:/proc/self/fd/{}?mode=ro&immutable=1", fd.as_raw_fd());
-    let conn = Connection::open_with_flags(&uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
+    let mut conn = Connection::open_with_flags(&uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(unreadable)?;
-    harden(&conn)?;
+    harden(&mut conn)?;
     verify_schema(&conn)?;
     journal_state(&conn, migration)
 }
 
-fn harden(conn: &Connection) -> Result<(), ReadinessError> {
+/// The deadline is installed first, before any SQL runs (PRAGMAs and the
+/// schema read included): the whole read of the journal shares one 2 s budget.
+fn harden(conn: &mut Connection) -> Result<(), ReadinessError> {
+    let deadline = Instant::now() + QUERY_DEADLINE;
+    conn.progress_handler(1000, Some(move || Instant::now() >= deadline)).map_err(unreadable)?;
     for (limit, value) in [(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES as i32), (Limit::SQLITE_LIMIT_SQL_LENGTH, 4096),
         (Limit::SQLITE_LIMIT_VDBE_OP, 200_000), (Limit::SQLITE_LIMIT_ATTACHED, 0),
         (Limit::SQLITE_LIMIT_EXPR_DEPTH, 32), (Limit::SQLITE_LIMIT_COLUMN, 16)] {
@@ -219,8 +237,6 @@ fn harden(conn: &Connection) -> Result<(), ReadinessError> {
     if (query_only, trusted_schema) != (1, 0) || !conn.is_readonly("main").map_err(unreadable)? {
         return Err(ReadinessError::JournalUnreadable);
     }
-    let deadline = Instant::now() + QUERY_DEADLINE;
-    conn.progress_handler(1000, Some(move || Instant::now() >= deadline)).map_err(unreadable)?;
     Ok(())
 }
 
@@ -293,6 +309,10 @@ fn journal_state(conn: &Connection, migration: RequestId) -> Result<MigrationSta
     let state_text = bounded(state)?;
     let state: MigrationState = serde_json::from_str(&state_text).map_err(|_| E::JournalUnreadable)?;
     if encode(&state)? != state_text { return Err(E::JournalUnreadable); }
+    // A journal in the pre-ContentArchived format is reported as such (also
+    // with an intent recorded): only the mutating resume step can bring it up
+    // to date, and that step also reconciles the intent.
+    if legacy_archive_receipts(conn, state)? { return Err(E::JournalLegacy); }
     // A recorded intent means an effect may be half done; only the locked
     // runner may reconcile it.
     if intent.is_some() { return Err(E::IntentPending); }
@@ -309,21 +329,78 @@ fn verify_receipts(conn: &Connection, state: MigrationState) -> Result<(), Readi
         current = next_stage(current).ok_or(E::JournalUnreadable)?;
         expected.push(current);
     }
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM migration_receipts", [], |row| row.get(0)).map_err(unreadable)?;
-    if usize::try_from(count).map_or(true, |count| count != expected.len() || count > MAX_RECEIPTS) {
-        return Err(E::ReceiptsInvalid);
-    }
-    for target in expected {
-        let receipt: Option<(String, Vec<u8>)> = conn.query_row(
-            "SELECT evidence, digest FROM migration_receipts WHERE target=?1", [encode(&target)?],
-            |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(unreadable)?;
-        let (evidence, digest) = receipt.ok_or(E::ReceiptsInvalid)?;
-        let evidence = bounded(evidence)?;
-        if digest.as_slice() != Sha256::digest(evidence.as_bytes()).as_slice() { return Err(E::ReceiptsInvalid); }
-        serde_json::from_str::<Evidence>(&evidence).map_err(|_| E::ReceiptsInvalid)?
-            .validate(target).map_err(|_| E::ReceiptsInvalid)?;
-    }
+    if receipt_count(conn)? != expected.len() { return Err(E::ReceiptsInvalid); }
+    for target in expected { checked_receipt(conn, target, target)?; }
     Ok(())
+}
+
+/// Number of receipt rows; more than [`MAX_RECEIPTS`] is invalid.
+fn receipt_count(conn: &Connection) -> Result<usize, ReadinessError> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM migration_receipts", [], |row| row.get(0)).map_err(unreadable)?;
+    usize::try_from(count).ok().filter(|count| *count <= MAX_RECEIPTS).ok_or(ReadinessError::ReceiptsInvalid)
+}
+
+/// The bounded receipt row stored under `target`, if any.
+fn stored_receipt(conn: &Connection, target: MigrationState) -> Result<Option<(String, Vec<u8>)>, ReadinessError> {
+    let receipt: Option<(String, Vec<u8>)> = conn.query_row(
+        "SELECT evidence, digest FROM migration_receipts WHERE target=?1", [encode(&target)?],
+        |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(unreadable)?;
+    match receipt {
+        Some((evidence, digest)) => Ok(Some((bounded(evidence)?, digest))),
+        None => Ok(None),
+    }
+}
+
+/// The receipt stored under `target` exists, its digest matches and its
+/// evidence validates as evidence of `stage`.
+fn checked_receipt(conn: &Connection, target: MigrationState, stage: MigrationState) -> Result<(), ReadinessError> {
+    use ReadinessError as E;
+    let (evidence, digest) = stored_receipt(conn, target)?.ok_or(E::ReceiptsInvalid)?;
+    // KNOWN LIMITATION (R5, PLAN §4.5): the digest covers `evidence` only. It
+    // binds neither the migration id nor the stage nor a domain-separation
+    // tag, so a valid receipt row copied from the journal of migration A
+    // into the journal of migration B verifies here as well. The format is
+    // written by the migration state machine (`journal::Journal::run_one`,
+    // owned by R5) and is not changed in R4; R5 must bind receipts to the
+    // migration id and stage. See the ignored test
+    // `root_readiness_receipts_replayed_from_another_migration_are_refused`.
+    if digest.as_slice() != Sha256::digest(evidence.as_bytes()).as_slice() { return Err(E::ReceiptsInvalid); }
+    serde_json::from_str::<Evidence>(&evidence).map_err(|_| E::ReceiptsInvalid)?
+        .validate(stage).map_err(|_| E::ReceiptsInvalid)
+}
+
+/// Stage order of journals written before the ContentArchived stage existed:
+/// the archive-only import was recorded as `ContentImported`, followed
+/// directly by `ConfirmationReady`.
+const LEGACY_ORDER: [MigrationState; 10] = [MigrationState::OldEnvironmentStopped, MigrationState::LegacyQuarantined,
+    MigrationState::KeysRotated, MigrationState::TokenRevocationRecorded, MigrationState::EmployeeProposalsStaged,
+    MigrationState::ContentImported, MigrationState::ConfirmationReady, MigrationState::IsolationVerified,
+    MigrationState::AwaitingAdministrator, MigrationState::Complete];
+/// Position of the legacy archive stage in [`LEGACY_ORDER`].
+const LEGACY_ARCHIVE: usize = 5;
+
+/// Exactly the legacy shape `journal::upgrade_archive_receipts` rewrites:
+/// `state` is at or after the legacy archive stage, the `ContentImported`
+/// receipt holds archive (`Content`) evidence, there is no `ContentArchived`
+/// receipt, and the receipts are exactly those of [`LEGACY_ORDER`] up to
+/// `state`, each with a matching digest and valid evidence (the legacy archive
+/// receipt as `ContentArchived` evidence). Anything else is `false`, and the
+/// normal verification decides.
+fn legacy_archive_receipts(conn: &Connection, state: MigrationState) -> Result<bool, ReadinessError> {
+    use MigrationState as S;
+    let Some(index) = LEGACY_ORDER.iter().position(|stage| *stage == state) else { return Ok(false) };
+    if index < LEGACY_ARCHIVE { return Ok(false); }
+    // New journals only ever record `Materialized` evidence under ContentImported.
+    let Some((evidence, _)) = stored_receipt(conn, S::ContentImported)? else { return Ok(false) };
+    if !matches!(serde_json::from_str::<Evidence>(&evidence), Ok(Evidence::Content { .. })) { return Ok(false); }
+    if stored_receipt(conn, S::ContentArchived)?.is_some() { return Ok(false); }
+    let legacy = &LEGACY_ORDER[..=index];
+    if receipt_count(conn)? != legacy.len() { return Ok(false); }
+    for target in legacy {
+        let stage = if *target == S::ContentImported { S::ContentArchived } else { *target };
+        if checked_receipt(conn, *target, stage).is_err() { return Ok(false); }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
