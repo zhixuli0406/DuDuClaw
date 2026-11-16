@@ -76,15 +76,17 @@ pub(crate) fn rich_links(message: &Value, text: &str) -> Vec<String> {
     for annotation in message.get("annotations").and_then(Value::as_array).into_iter().flatten() {
         if annotation.get("type").and_then(Value::as_str) != Some("RICH_LINK") { continue; }
         let Some(uri) = annotation.pointer("/richLinkMetadata/uri").and_then(Value::as_str) else { continue; };
-        if uri.len() > 2048 || uri.chars().any(|c| c.is_whitespace() || c.is_control()
+        if uri.chars().any(|c| c.is_whitespace() || c.is_control()
             || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
                 | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{200b}'..='\u{200d}'
                 | '\u{2060}' | '\u{feff}')) { continue; }
         let Ok(parsed) = url::Url::parse(uri) else { continue; };
         if parsed.scheme() != "https" || parsed.host().is_none()
             || !parsed.username().is_empty() || parsed.password().is_some() { continue; }
-        if text.contains(uri) || links.iter().any(|link| link == uri) { continue; }
-        links.push(uri.to_owned());
+        let normalized = parsed.as_str();
+        if normalized.len() > 2048 { continue; }
+        if text.contains(uri) || links.iter().any(|link| link == normalized) { continue; }
+        links.push(normalized.to_owned());
         if links.len() == 10 { break; }
     }
     links
@@ -331,6 +333,13 @@ mod rich_link_tests {
         assert_eq!(spaces_response(&json!({"spaces":[{"spaceType":"DIRECT_MESSAGE","name":"spaces/a"}]}),1)["spaces"][0]["display_name"],"私訊");
         let output = messages_response(&json!({"messages":[{"annotations":[chip(malicious)]}]}), &args);
         assert!(scanned_envelope(&output).is_err());
+    }
+    #[test]
+    fn normalized_spellings_are_deduplicated() {
+        let links = rich_links(&json!({"annotations":[
+            chip("https://example.com"), chip("https://example.com/")
+        ]}), "");
+        assert_eq!(links, vec!["https://example.com/"]);
     }
     #[test]
     fn links_reject_userinfo_whitespace_and_invisible_characters() {

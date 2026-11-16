@@ -246,6 +246,7 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
             // Match HTTP overload behavior: ACK/drop, never retry a full
             // queue, and tell the space (same throttled notice and keys).
             inbox.transition(&stream, &row.id, "queued", "dropped")?;
+            drop(bind);
             tracing::warn!(agent = ?state.agent, "Google Chat Pub/Sub queue full: ACK and drop; no turn");
             let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &notice_space, &notice_event["message"], &notice_event).await;
             let thread = crate::googlechat::reply_thread(state, &notice_event, is_dm).await;
