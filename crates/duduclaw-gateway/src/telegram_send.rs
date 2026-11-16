@@ -280,7 +280,7 @@ async fn send_until(client: &reqwest::Client, api_base: &str, chat_id: &str,
     let bounded_prefix = options.literal_prefix.map(|prefix| duduclaw_core::truncate_bytes(prefix, MAX_PREFIX_BYTES));
     let prefix_truncated = bounded_prefix.as_deref().zip(options.literal_prefix)
         .is_some_and(|(bounded, original)| bounded.len() < original.len());
-    let text_budget = MAX_INPUT_BYTES - bounded_prefix.as_ref().map_or(0, String::len);
+    let text_budget = MAX_INPUT_BYTES - bounded_prefix.map_or(0, str::len);
     let bounded = duduclaw_core::truncate_bytes(text, text_budget);
     let truncated = prefix_truncated || bounded.len() < text.len();
     let mut delivered = 0;

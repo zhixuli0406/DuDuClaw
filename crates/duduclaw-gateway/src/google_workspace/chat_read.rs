@@ -121,7 +121,7 @@ pub(crate) fn localize_error_result(result: &mut Value, lang: crate::trigger_rou
 
 pub(crate) fn spaces_response(data: &Value, limit: u32) -> Value {
     let rows: Vec<_> = data.get("spaces").and_then(Value::as_array).into_iter().flatten().take(limit as usize).map(|row| json!({
-        "name": field(row, "name", 256), "display_name": { let name = field(row, "displayName", 512); if name.is_empty() { if row["spaceType"] == "DIRECT_MESSAGE" || row["type"] == "DM" { "私訊".to_owned() } else { "未命名聊天室".to_owned() } } else { name } },
+        "name": field(row, "name", 256), "display_name": ({ let name = field(row, "displayName", 512); if name.is_empty() { if row["spaceType"] == "DIRECT_MESSAGE" || row["type"] == "DM" { "私訊".to_owned() } else { "未命名聊天室".to_owned() } } else { name } }),
         "type": field(row, "spaceType", 64), "last_active_time": field(row, "lastActiveTime", 64),
     })).collect();
     bounded("spaces", rows, data, None)

@@ -252,7 +252,6 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
             let thread = crate::googlechat::reply_thread(state, &notice_event, is_dm).await;
             crate::googlechat::notify_queue_full(state, &group, &conversation, &notice_space, thread.as_deref());
         }
-        drop(bind);
     }
     Ok(())
 }
