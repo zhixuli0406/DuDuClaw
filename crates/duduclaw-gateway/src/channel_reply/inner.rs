@@ -1203,53 +1203,17 @@ async fn build_reply_with_session_inner_impl(
     // not in the conversation turns (Anthropic Messages API rejects them).
     //
     // Async summaries belong in system context, never a forged assistant turn.
-    let max_history_turns = 20;
     let compression_summary = session_mgr.compression_summary(session_id).await.unwrap_or_default();
     let (async_summary, summarized_through) = session_mgr
-        .get_summary(session_id)
-        .await
-        .unwrap_or_default();
-    let conversation_history: Vec<ConversationTurn> =
-        match session_mgr.get_messages(session_id).await {
-            Ok(msgs) => {
-                let mut out: Vec<ConversationTurn> = Vec::new();
-                // Verbatim slice: skip the first `summarized_through` turns
-                // (already captured in system context) and the LAST turn (which
-                // is the user message about to be re-sent below). The +1
-                // index skip is intentional — we want messages.len() - 1
-                // minus the summarized prefix.
-                let summarized_through_usize = summarized_through as usize;
-                let prior_full: Vec<_> = msgs
-                    .iter()
-                    .take(msgs.len().saturating_sub(1))
-                    .skip(summarized_through_usize)
-                    .filter_map(|m| {
-                        if m.role == "system" {
-                            None
-                        } else {
-                            Some(ConversationTurn {
-                                role: m.role.clone(),
-                                content: m.content.clone(),
-                            })
-                        }
-                    })
-                    .collect();
-                let prior = prior_full;
-
-                // Keep only the most recent turns to prevent token overflow
-                let trimmed = if prior.len() > max_history_turns {
-                    prior[prior.len() - max_history_turns..].to_vec()
-                } else {
-                    prior
-                };
-                out.extend(trimmed);
-                out
-            }
-            Err(e) => {
-                warn!("Failed to load session messages: {e}");
-                vec![]
-            }
-        };
+        .get_summary(session_id).await.unwrap_or_default();
+    let (async_summary, conversation_history) = match session_mgr.get_messages(session_id).await {
+        Ok(msgs) => crate::session_summarizer::session_history(
+            session_id, &msgs, &async_summary, summarized_through),
+        Err(e) => {
+            warn!("Failed to load session messages: {e}");
+            (String::new(), vec![])
+        }
+    };
     let conversation_history = crate::runtime::cap_conversation_history(&conversation_history);
     let has_history = !conversation_history.is_empty();
 
@@ -4068,14 +4032,8 @@ async fn build_reply_with_session_inner_impl(
                         return;
                     }
                 };
-                let mut turns = Vec::new();
-                if !previous.is_empty() {
-                    turns.push(("background".to_owned(), duduclaw_security::credential_detect::mask(&previous)));
-                }
-                // The ordinal matches the async summarizer's visible-row space.
-                // A prior destructive compression is represented by its system row.
-                turns.extend(msgs.iter().skip(after as usize).map(|m| (m.role.clone(),
-                    duduclaw_security::credential_detect::mask(&m.content))));
+                let turns = crate::session_summarizer::compression_turns(
+                    &sid, &msgs, &previous, after);
                 let (transcript, protected, has_unprotected) =
                     crate::prompt_compression::partition_turns_for_summary(&turns);
                 let prompt = crate::session_summarizer::format_summarization_prompt(&transcript);

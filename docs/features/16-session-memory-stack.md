@@ -194,6 +194,8 @@ The session memory stack isn't isolated from evolution:
 - **Key facts** feed into `external_factors` — user corrections, preference signals — which drive SOUL.md updates.
 - **Session compression** (50k token threshold) produces a summary that is injected into the *system prompt*, not as a new conversation turn.
 
+Compression resets the rolling summary and its visible-row bookmark, as well as the automatic-title progress. Undo, rollback, hide, restore and revoke also clear the rolling summary in the same transaction as the visibility change. At startup, bookmarks beyond the visible history are repaired; read-side recovery ignores the stale summary and includes recent raw messages (the current user message is sent separately). Compression input also includes the recent rows so they are not discarded unread. After a reset, the stored compression-summary row may be folded into the next rolling summary.
+
 ---
 
 ## Why This Matters

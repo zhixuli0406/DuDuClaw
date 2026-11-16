@@ -414,8 +414,33 @@ impl SessionManager {
         crate::recipient_guard::origin::migrate(conn)
             .map_err(|e| DuDuClawError::Gateway(format!("origin proof table: {e}")))?;
         Self::migrate_legacy_user_clears(conn)?;
+        Self::repair_summary_bookmarks(conn)?;
         Self::sweep_webchat_cancellations(conn, WEBCHAT_CANCEL_RETENTION_DAYS)?;
 
+        Ok(())
+    }
+
+    /// Run at every open, before serving turns. A single atomic, idempotent
+    /// statement also repairs databases written by older gateway versions.
+    fn repair_summary_bookmarks(conn: &Connection) -> Result<usize> {
+        let repaired = conn.execute(
+            "UPDATE sessions SET summary_of_prior = NULL, summarized_through_turn = 0,
+                    last_summarized_at = NULL
+             WHERE summarized_through_turn > (
+                 SELECT COUNT(*) FROM session_messages m
+                 WHERE m.session_id = sessions.id AND m.hidden = 0 AND m.undone_at IS NULL
+             )", [],
+        ).map_err(|e| DuDuClawError::Gateway(format!("repair summary bookmarks: {e}")))?;
+        info!(repaired, "Repaired invalid session summary bookmarks");
+        Ok(repaired)
+    }
+
+    /// Call inside the transaction that changes the visible-row ordinal space.
+    pub(crate) fn reset_rolling_summary(conn: &Connection, session_id: &str) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET summary_of_prior = NULL, summarized_through_turn = 0,
+                    last_summarized_at = NULL WHERE id = ?1", [session_id],
+        ).map_err(|e| DuDuClawError::Gateway(format!("reset rolling summary: {e}")))?;
         Ok(())
     }
 
@@ -1260,7 +1285,7 @@ impl SessionManager {
         // ("#2", "#3", …) so users can tell a compressed session apart.
         tx.execute(
             "UPDATE sessions SET summary = ?1, total_tokens = 0, last_active = ?2,
-                    lineage = COALESCE(lineage, 1) + 1,
+                    lineage = COALESCE(lineage, 1) + 1, titled_through_turn = 0,
                     summary_of_prior = NULL, summarized_through_turn = 0, last_summarized_at = NULL
              WHERE id = ?3",
             params![summary, now, session_id],
@@ -2164,12 +2189,18 @@ impl SessionManager {
     /// The message remains in the database and can be restored later.
     pub async fn hide_message(&self, session_id: &str, message_id: i64) -> Result<bool> {
         let conn = self.acquire().await;
-        let rows = conn
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let rows = tx
             .execute(
                 "UPDATE session_messages SET hidden = 1 WHERE id = ?1 AND session_id = ?2",
                 params![message_id, session_id],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if rows > 0 {
+            Self::reset_rolling_summary(&tx, session_id)?;
+        }
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         Ok(rows > 0)
     }
 
@@ -2191,13 +2222,19 @@ impl SessionManager {
     ) -> Result<bool> {
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
-        let rows = conn
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let rows = tx
             .execute(
                 "UPDATE session_messages SET content = ?1, undone_at = ?2, delivery_pending = 0
                  WHERE id = ?3 AND session_id = ?4 AND (undone_at IS NULL OR delivery_pending = 1)",
                 params![replacement, now, message_id, session_id],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if rows > 0 {
+            Self::reset_rolling_summary(&tx, session_id)?;
+        }
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         Ok(rows > 0)
     }
 
@@ -2244,12 +2281,18 @@ impl SessionManager {
     /// Restore a previously hidden message back to active context.
     pub async fn restore_message(&self, session_id: &str, message_id: i64) -> Result<bool> {
         let conn = self.acquire().await;
-        let rows = conn
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let rows = tx
             .execute(
                 "UPDATE session_messages SET hidden = 0 WHERE id = ?1 AND session_id = ?2 AND notice_kind IS NULL",
                 params![message_id, session_id],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if rows > 0 {
+            Self::reset_rolling_summary(&tx, session_id)?;
+        }
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         Ok(rows > 0)
     }
 
@@ -2445,6 +2488,107 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[tokio::test]
+    async fn boot_repair_resets_only_invalid_bookmarks_and_is_idempotent() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        for (id, count, bookmark) in [
+            ("stuck-260", 62, 260), ("stuck-156", 3, 156),
+            ("healthy", 12, 9), ("equal", 3, 3), ("empty", 0, 1),
+            ("visibility", 3, 2),
+        ] {
+            mgr.get_or_create(id, "worker").await.unwrap();
+            for _ in 0..count {
+                mgr.append_message(id, "user", "raw fact", 1).await.unwrap();
+            }
+            mgr.set_summary(id, "- existing fact", bookmark).await.unwrap();
+        }
+        let conn = Connection::open(tmp.path()).unwrap();
+        // Only one of these three rows is visible. Boot repair must use the
+        // same hidden/tombstone predicate as history, not the physical count.
+        conn.execute("UPDATE session_messages SET hidden=1 WHERE id=(
+            SELECT MIN(id) FROM session_messages WHERE session_id='visibility')", []).unwrap();
+        conn.execute("UPDATE session_messages SET undone_at='retracted' WHERE id=(
+            SELECT MAX(id) FROM session_messages WHERE session_id='visibility')", []).unwrap();
+        let healthy_before: Vec<_> = ["healthy", "equal"].into_iter().map(|id| {
+            conn.query_row("SELECT summary_of_prior, summarized_through_turn, last_summarized_at
+                FROM sessions WHERE id=?1", [id], |row| Ok((
+                    row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?
+                ))).unwrap()
+        }).collect();
+        drop(mgr);
+        let reopened = SessionManager::new(tmp.path()).unwrap();
+        for id in ["stuck-260", "stuck-156", "empty", "visibility"] {
+            assert_eq!(reopened.get_summary(id).await.unwrap(), (String::new(), 0));
+            let cleared: bool = conn.query_row("SELECT summary_of_prior IS NULL
+                AND last_summarized_at IS NULL FROM sessions WHERE id=?1", [id], |row| row.get(0)).unwrap();
+            assert!(cleared);
+        }
+        for (id, before) in ["healthy", "equal"].into_iter().zip(healthy_before) {
+            let after = conn.query_row("SELECT summary_of_prior, summarized_through_turn, last_summarized_at
+                FROM sessions WHERE id=?1", [id], |row| Ok((
+                    row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?
+                ))).unwrap();
+            assert_eq!(after, before);
+        }
+        assert_eq!(SessionManager::repair_summary_bookmarks(&conn).unwrap(), 0);
+        drop(reopened);
+        let reopened = SessionManager::new(tmp.path()).unwrap();
+        assert_eq!(reopened.get_summary("stuck-260").await.unwrap(), (String::new(), 0));
+    }
+
+    #[tokio::test]
+    async fn visibility_changes_clear_rolling_summary_in_same_transaction() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("visibility", "worker").await.unwrap();
+        for i in 0..4 {
+            mgr.append_message("visibility", "user", &format!("row {i}"), 1).await.unwrap();
+        }
+        let ids = mgr.get_message_ids("visibility").await.unwrap();
+        for operation in ["hide", "restore", "revoke"] {
+            let count = mgr.get_messages("visibility").await.unwrap().len();
+            mgr.set_summary("visibility", "- content that must be cleared", count as u32).await.unwrap();
+            let changed = match operation {
+                "hide" => mgr.hide_message("visibility", ids[0]).await.unwrap(),
+                "restore" => mgr.restore_message("visibility", ids[0]).await.unwrap(),
+                "revoke" => mgr.revoke_message("visibility", ids[0], "revoked").await.unwrap(),
+                _ => unreachable!(),
+            };
+            assert!(changed, "{operation}");
+            let (summary, bookmark) = mgr.get_summary("visibility").await.unwrap();
+            assert!(summary.is_empty(), "{operation}");
+            assert_eq!(bookmark, 0, "{operation}");
+            assert!(bookmark as usize <= mgr.get_messages("visibility").await.unwrap().len());
+            let conn = Connection::open(tmp.path()).unwrap();
+            assert!(conn.query_row("SELECT last_summarized_at IS NULL FROM sessions
+                WHERE id='visibility'", [], |row| row.get::<_, bool>(0)).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_summary_reset_rolls_back_visibility_change() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("atomic", "worker").await.unwrap();
+        mgr.append_message("atomic", "user", "retained", 1).await.unwrap();
+        let id = mgr.get_message_ids("atomic").await.unwrap()[0];
+        mgr.set_summary("atomic", "- retained", 1).await.unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_summary_reset BEFORE UPDATE OF summary_of_prior
+            ON sessions BEGIN SELECT RAISE(ABORT, 'reset blocked'); END;").unwrap();
+        assert!(mgr.hide_message("atomic", id).await.is_err());
+        assert!(mgr.revoke_message("atomic", id, "revoked").await.is_err());
+        assert_eq!(mgr.get_messages("atomic").await.unwrap()[0].content, "retained");
+        assert_eq!(mgr.get_summary("atomic").await.unwrap(), ("- retained".into(), 1));
+        conn.execute_batch("DROP TRIGGER reject_summary_reset;").unwrap();
+        mgr.hide_message("atomic", id).await.unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_summary_reset BEFORE UPDATE OF summary_of_prior
+            ON sessions BEGIN SELECT RAISE(ABORT, 'reset blocked'); END;").unwrap();
+        assert!(mgr.restore_message("atomic", id).await.is_err());
+        assert!(mgr.get_messages("atomic").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn stale_summary_cannot_overwrite_state_or_history_and_compression_resets_cursor() {
         let tmp = NamedTempFile::new().unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
@@ -2457,7 +2601,9 @@ mod tests {
         assert!(mgr.set_summary_if_unchanged("rolling", "- stale", 1, 1, &snapshot).await.is_err());
         assert_eq!(mgr.get_summary("rolling").await.unwrap(), ("- existing fact".into(), 1));
         assert_eq!(mgr.get_message_ids("rolling").await.unwrap(), current);
+        mgr.set_title("rolling", "Old title", 260).await.unwrap();
         mgr.compress_if_unchanged("rolling", "- combined facts", &current).await.unwrap();
+        assert_eq!(mgr.get_title("rolling").await.unwrap(), ("Old title".into(), 0));
         assert_eq!(mgr.get_summary("rolling").await.unwrap(), (String::new(), 0));
         assert_eq!(mgr.compression_summary("rolling").await.unwrap(), "- combined facts");
         let rows = mgr.read_summary_turn_range("rolling", 0, 1).await.unwrap();

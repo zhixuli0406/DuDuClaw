@@ -3,6 +3,71 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A bookmark is an ordinal in the current visible-row space, never a message id.
+/// Old databases and concurrent visibility changes can invalidate that ordinal.
+pub(crate) struct SummaryBookmark<'a> {
+    pub summary: &'a str,
+    pub after: usize,
+    pub clamped: bool,
+}
+
+pub(crate) fn checked_summary_bookmark<'a>(
+    session_id: &str, summary: &'a str, bookmark: u32, visible_rows: usize,
+) -> SummaryBookmark<'a> {
+    let clamped = bookmark as usize > visible_rows;
+    if clamped {
+        static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let mut warned = WARNED.get_or_init(Default::default)
+            .lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if warned.insert(session_id.to_owned()) {
+            tracing::warn!(session_id, bookmark, visible_rows,
+                "Invalid rolling-summary bookmark; ignoring stale summary");
+        }
+    }
+    SummaryBookmark {
+        summary: if clamped { "" } else { summary },
+        after: if clamped { 0 } else { bookmark as usize },
+        clamped,
+    }
+}
+
+/// The final user row is sent separately as the current prompt. On recovery,
+/// all raw rows are eligible, including the latest three (current prompt included).
+pub(crate) fn session_history(
+    session_id: &str, messages: &[crate::session::SessionMessage],
+    summary: &str, bookmark: u32,
+) -> (String, Vec<crate::runtime::ConversationTurn>) {
+    let checked = checked_summary_bookmark(session_id, summary, bookmark, messages.len());
+    let mut history: Vec<_> = messages.iter()
+        .take(messages.len().saturating_sub(1))
+        .skip(checked.after)
+        .filter(|message| message.role != "system")
+        .map(|message| crate::runtime::ConversationTurn {
+            role: message.role.clone(), content: message.content.clone(),
+        }).collect();
+    if history.len() > 20 {
+        history.drain(..history.len() - 20);
+    }
+    (checked.summary.to_owned(), history)
+}
+
+/// Include every unsummarized visible row before destructive compression.
+pub(crate) fn compression_turns(
+    session_id: &str, messages: &[crate::session::SessionMessage],
+    summary: &str, bookmark: u32,
+) -> Vec<(String, String)> {
+    let checked = checked_summary_bookmark(session_id, summary, bookmark, messages.len());
+    let mut turns = Vec::new();
+    if !checked.summary.is_empty() {
+        turns.push(("background".to_owned(),
+            duduclaw_security::credential_detect::mask(checked.summary)));
+    }
+    turns.extend(messages.iter().skip(checked.after).map(|message|
+        (message.role.clone(), duduclaw_security::credential_detect::mask(&message.content))));
+    turns
+}
+
 /// A session that *might* need summarizing. Lighter than the full
 /// session row so this module can stay generic — the caller queries
 /// the session store and builds these.
@@ -10,7 +75,7 @@ use serde::{Deserialize, Serialize};
 pub struct SummaryCandidate {
     pub session_id: String,
     pub agent_id: String,
-    /// Total number of turns recorded so far.
+    /// Number of currently visible message rows.
     pub turn_count: u32,
     /// Up to which turn was the last summary based on. 0 if never
     /// summarized.
@@ -67,7 +132,7 @@ pub enum SkipReason {
     OverPerTickQuota,
 }
 
-/// Pure decision function. Takes the full candidate list, returns the
+/// Decision policy. Takes the full candidate list, returns the
 /// decision per session. Caller drives the actual Haiku call + session
 /// store update; this layer is just policy.
 pub fn decide_summarization(
@@ -92,15 +157,15 @@ fn decide_one(
     params: &SummarizeParams,
     already_taken: usize,
 ) -> SummarizeDecision {
-    let new_turns = candidate
-        .turn_count
-        .saturating_sub(candidate.summarized_through_turn);
+    let checked = checked_summary_bookmark(&candidate.session_id, "",
+        candidate.summarized_through_turn, candidate.turn_count as usize);
+    let new_turns = candidate.turn_count.saturating_sub(checked.after as u32);
     if new_turns < params.min_new_turns_to_trigger {
         return SummarizeDecision::Skip {
             reason: SkipReason::BelowMinTurns,
         };
     }
-    if let Some(s) = candidate.seconds_since_last_summary {
+    if let Some(s) = candidate.seconds_since_last_summary.filter(|_| !checked.clamped) {
         if s < params.cooldown_seconds {
             return SummarizeDecision::Skip {
                 reason: SkipReason::InCooldown,
@@ -112,8 +177,7 @@ fn decide_one(
             reason: SkipReason::OverPerTickQuota,
         };
     }
-    // Summarize through the second-to-last turn so the *last* turn
-    // (the actual hot context) stays verbatim. Saturating sub keeps
+    // Keep the latest three visible rows verbatim. Saturating sub keeps
     // us safe at turn_count==1 (which couldn't pass the threshold
     // anyway, but be defensive).
     SummarizeDecision::SummarizeUpTo {
@@ -362,6 +426,74 @@ pub fn format_summarization_prompt(turns_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn visible_messages(count: usize) -> Vec<crate::session::SessionMessage> {
+        (0..count).map(|i| crate::session::SessionMessage {
+            role: if i % 2 == 0 || i + 1 == count { "user" } else { "assistant" }.into(),
+            content: format!("recent raw row {i}"), tokens: 1, timestamp: String::new(),
+        }).collect()
+    }
+
+    #[test]
+    fn stale_bookmarks_keep_recent_raw_history() {
+        for (bookmark, count) in [(260, 62), (156, 3)] {
+            let messages = visible_messages(count);
+            let (summary, history) = session_history(
+                "stuck-history", &messages, "stale retracted facts", bookmark);
+            assert!(summary.is_empty());
+            // The current (last) row is sent separately, so the three-row
+            // session has two history rows plus its current raw prompt.
+            for i in count.saturating_sub(3)..count - 1 {
+                assert!(history.iter().any(|turn| turn.content == messages[i].content));
+            }
+            assert_eq!(history.len(), (count - 1).min(20));
+            let prompt = crate::runtime::format_history_as_prompt(
+                &history, &messages[count - 1].content);
+            for message in messages.iter().rev().take(3) {
+                assert!(prompt.contains(&message.content));
+            }
+        }
+    }
+
+    #[test]
+    fn stuck_session_compression_input_contains_recent_rows() {
+        for (bookmark, count) in [(260, 62), (156, 3)] {
+            let messages = visible_messages(count);
+            let turns = compression_turns("stuck-compression", &messages,
+                "stale retracted facts", bookmark);
+            assert_eq!(turns.len(), count);
+            let (transcript, _, _) = crate::prompt_compression::partition_turns_for_summary(&turns);
+            let prompt = format_summarization_prompt(&transcript);
+            assert!(!prompt.contains("stale retracted facts"));
+            for message in &messages {
+                assert!(prompt.contains(&message.content));
+            }
+        }
+    }
+
+    #[test]
+    fn valid_bookmark_keeps_summary_and_unsummarized_suffix() {
+        let messages = visible_messages(10);
+        let (summary, history) = session_history("healthy-history", &messages, "- fact", 6);
+        assert_eq!(summary, "- fact");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content, messages[6].content);
+        let boundary = checked_summary_bookmark("equal", "- fact", 10, 10);
+        assert!(!boundary.clamped);
+        assert_eq!(boundary.after, 10);
+    }
+
+    #[test]
+    fn decide_one_recovers_clamped_session_without_stale_cooldown() {
+        let params = SummarizeParams::default();
+        assert_eq!(decide_one(&cand("stuck", 62, 260, Some(0)), &params, 0),
+            SummarizeDecision::SummarizeUpTo { turn: 59 });
+        assert_eq!(decide_one(&cand("short-stuck", 3, 156, Some(0)), &params, 0),
+            SummarizeDecision::Skip { reason: SkipReason::BelowMinTurns });
+        // Once enough visible rows arrive, the old cursor cannot suppress it.
+        assert_eq!(decide_one(&cand("short-stuck", 10, 156, Some(0)), &params, 0),
+            SummarizeDecision::SummarizeUpTo { turn: 7 });
+    }
 
     #[tokio::test]
     async fn busy_retry_lock_is_not_ready_without_waiting_for_release() {

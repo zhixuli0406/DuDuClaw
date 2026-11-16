@@ -156,15 +156,17 @@ async fn summarize_one(
         .map_err(|_| SummaryFailure::ReadState)?;
     let (previous, after) = session_manager.get_summary(session_id).await
         .map_err(|_| SummaryFailure::ReadState)?;
+    let checked = crate::session_summarizer::checked_summary_bookmark(
+        session_id, &previous, after, expected_ids.len());
     let turns = session_manager
-        .read_summary_turn_range(session_id, after, through_turn)
+        .read_summary_turn_range(session_id, checked.after as u32, through_turn)
         .await
         .map_err(|_| SummaryFailure::ReadState)?;
     let turns: Vec<_> = turns.into_iter().map(|(role, text)|
         (role, duduclaw_security::credential_detect::mask(&text))).collect();
     let mut rolling = Vec::new();
-    if !previous.is_empty() {
-        rolling.push(("background".to_owned(), duduclaw_security::credential_detect::mask(&previous)));
+    if !checked.summary.is_empty() {
+        rolling.push(("background".to_owned(), duduclaw_security::credential_detect::mask(checked.summary)));
     }
     rolling.extend(turns);
     let (transcript, protected, has_unprotected_text) = partition_turns_for_summary(&rolling);
@@ -265,6 +267,12 @@ mod tests {
         async fn is_available(&self) -> bool { panic!("owned registry must not probe host") }
         async fn execute(&self, prompt: &str, context: &crate::runtime::RuntimeContext)
             -> Result<crate::runtime::RuntimeResponse, String> {
+            if context.home_dir.join("summary-clamp-fixture").exists() {
+                assert!(!prompt.contains("stale summary must be ignored"));
+                assert!(prompt.contains("user: raw fact 0"));
+                assert!(prompt.contains("user: raw fact 58"));
+                assert!(!prompt.contains("user: raw fact 59"));
+            }
             if context.home_dir.join("summary-output-fixture").exists() {
                 assert!(prompt.contains("- Previously established fact"));
                 assert!(prompt.contains("new 中文"));
@@ -283,6 +291,32 @@ mod tests {
                 cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "openai_compat".into(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn clamped_summary_reads_raw_prefix_and_replaces_original_cursor() {
+        let (sm, home) = make_session_manager();
+        let dir = home.path().join("agents/utility-worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\nstatus='active'\n[runtime]\nprovider='openai_compat'\n[model]\npreferred='gpt-5.4'\n").unwrap();
+        std::fs::write(home.path().join("summary-clamp-fixture"), "").unwrap();
+        let runtimes = std::collections::HashMap::from([(
+            crate::runtime::RuntimeType::OpenAiCompat,
+            Box::new(SessionUtilityRuntime) as Box<dyn crate::runtime::AgentRuntime>,
+        )]);
+        let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+            home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes),
+        ).await;
+        sm.get_or_create("stuck", "utility-worker").await.unwrap();
+        for i in 0..62 {
+            sm.append_message("stuck", "user", &format!("raw fact {i}"), 1).await.unwrap();
+        }
+        sm.set_summary("stuck", "- stale summary must be ignored", 260).await.unwrap();
+        let ids = sm.get_message_ids("stuck").await.unwrap();
+        crate::autonomous_runtime::scope(home.path(), "utility-worker", &[],
+            summarize_one(&sm, home.path(), "stuck", 59)).await.unwrap();
+        assert_eq!(sm.get_summary("stuck").await.unwrap(), ("Session utility result".into(), 59));
+        assert_eq!(sm.get_message_ids("stuck").await.unwrap(), ids);
     }
 
     #[tokio::test]
