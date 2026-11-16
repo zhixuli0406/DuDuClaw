@@ -634,7 +634,8 @@ pub fn to_telegram_html(text: &str) -> String {
                 ));
             }
             MdBlock::CodeFence { lang, code } => {
-                if lang.is_empty() {
+                if lang.is_empty() || lang.len() > 32
+                    || !lang.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '.' | '-')) {
                     parts.push(format!("<pre>{}</pre>", escape_html(&code)));
                 } else {
                     parts.push(format!(
@@ -866,6 +867,18 @@ pub fn to_teams_markdown(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telegram_fence_language_rejects_attribute_injection() {
+        for lang in ["rust\"onclick=\"bad", "a/b", "a b", "abcdefghijklmnopqrstuvwxyz0123456"] {
+            let html = to_telegram_html(&format!("```{lang}\ncode\n```"));
+            assert!(!html.contains("class="), "{html}");
+            assert!(html.contains("<pre>code</pre>"));
+        }
+        for lang in ["rust", "c++", "c-sharp", "a.b_1"] {
+            assert!(to_telegram_html(&format!("```{lang}\ncode\n```")).contains(&format!("class=\"language-{lang}\"")));
+        }
+    }
 
     #[test]
     fn distributor_footer_is_literal_in_each_platform_renderer() {

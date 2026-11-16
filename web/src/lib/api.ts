@@ -8319,6 +8319,8 @@ export const api = {
           enabled: boolean;
           last_run_at?: string | null;
           last_status?: string | null;
+          last_delivery_status?: string | null;
+          last_delivery_reason?: string | null;
         }>;
       }>,
     add: (params: { name: string; agent_id: string; cron: string; task?: string }) =>

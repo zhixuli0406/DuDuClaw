@@ -256,3 +256,11 @@ duduclaw dashboard → notify.stats RPC
 - コード：`crates/duduclaw-gateway/src/notify_governance.rs`、`notify_stats.rs`、`notify_digest.rs`
 - フロントエンド：`web/src/pages/agent-form/EditAgentPage.tsx`（自動化タブ）、`web/src/components/settings/sections/ProactiveTab.tsx`、`SystemTab.tsx`、`web/src/pages/ReportPage.tsx`
 - 関連機能：[34-goal-loop.md](34-goal-loop.md)（needs_human決定カード）、[23-autopilot-engine.md](23-autopilot-engine.md)（ルールのサーキットブレーカー通知）
+
+## 定期配信と Telegram の書式
+
+Telegram の cron 結果、リマインダーの応答、書式付き通知は Markdown をエスケープ済み HTML に変換し、タグと文字参照を壊さずにメッセージ上限内で分割します。コマンドの応答は従来の Markdown 書式を維持します。Telegram が書式の解析エラーで拒否した部分はプレーンテキストで再送します。プレーンテキストを指定した通知の `_` と `*` はそのまま届きます。
+
+最終的な失敗は、操作の種類、参照 id、HTTP ステータス、機密情報を除いた Telegram のエラー説明とともに `channel_failures.jsonl` に記録されます。本文は記録しません。cron の結果が内容の問題で配信できない場合、同じチャットにダッシュボードでの確認を案内する短い通知を一度送信します。401／403 の認証・ブロックエラーでは送信せず、公開サイトの訪問者にも表示しません。通知は `[general] default_language` が英語・日本語の場合はその言語、それ以外は繁体字中国語になります。
+
+外部チャネルの cron 結果は、Discord の 2000 文字制限を含む各チャネルの上限に合わせて分割し、3500 文字で一律に切り捨てません。WebChat の会話履歴の長さ制限は従来どおりです。ダッシュボードの定期タスク一覧には実行状態とは別に前回の配信状態と短い失敗理由を表示します。

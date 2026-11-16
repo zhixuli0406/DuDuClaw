@@ -11566,5 +11566,12 @@
   "users.primary.save": "設定主要 AI",
   "users.primary.missing": "{count} 位成員尚未設定主要 AI",
   "users.primary.repair": "設為第一位 AI",
-  "users.primary.confirm": "要將下列成員的主要 AI 設為最早綁定、具有負責人或操作權限的 AI 嗎？"
+  "users.primary.confirm": "要將下列成員的主要 AI 設為最早綁定、具有負責人或操作權限的 AI 嗎？",
+  "routines.delivery.delivered": "已送達",
+  "routines.delivery.failed": "送達失敗",
+  "routines.delivery.refused": "已拒絕送達",
+  "routines.delivery.none": "尚無送達紀錄",
+  "routines.delivery.notificationFailed": "通知無法送達，請檢查通道設定。",
+  "routines.delivery.accessChanged": "收件對象的存取權已變更，請確認通知目的地。",
+  "routines.delivery.unknownReason": "無法完成送達。"
 }

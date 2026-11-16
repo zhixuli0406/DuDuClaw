@@ -11566,5 +11566,12 @@
   "users.primary.save": "メイン AI を設定",
   "users.primary.missing": "{count} 人のメンバーにメイン AI がありません",
   "users.primary.repair": "最初の AI に設定",
-  "users.primary.confirm": "以下のメンバーのメイン AI を、最も早く紐付けたオーナーまたは操作権限の AI に設定しますか？"
+  "users.primary.confirm": "以下のメンバーのメイン AI を、最も早く紐付けたオーナーまたは操作権限の AI に設定しますか？",
+  "routines.delivery.delivered": "配信済み",
+  "routines.delivery.failed": "配信失敗",
+  "routines.delivery.refused": "配信拒否",
+  "routines.delivery.none": "配信履歴なし",
+  "routines.delivery.notificationFailed": "通知を配信できませんでした。チャネル設定を確認してください。",
+  "routines.delivery.accessChanged": "送信先のアクセス権が変更されました。通知先を確認してください。",
+  "routines.delivery.unknownReason": "配信を完了できませんでした。"
 }
