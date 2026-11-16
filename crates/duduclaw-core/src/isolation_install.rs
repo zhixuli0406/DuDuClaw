@@ -287,6 +287,13 @@ mod tests {
     }
 
     #[test]
+    fn isolation_install_facts_equal_bootstrap_verifier_mirror() {
+        // duduclaw-bootstrap refuses while a fact of another generation exists;
+        // it cannot link this crate, so it reads the duduclaw-isolation copy.
+        assert_eq!(FACTS, duduclaw_isolation::update::ISOLATION_FACTS);
+    }
+
+    #[test]
     fn isolation_install_thread_root_only_narrows_and_never_latches() {
         let root = tempfile::tempdir().unwrap();
         let before = installed();

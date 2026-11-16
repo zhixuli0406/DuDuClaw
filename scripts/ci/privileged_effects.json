@@ -6174,6 +6174,44 @@
       "rationale": "Ignored root test executes only a copied trusted true fixture through the verified-fd adapter after replacing its pathname; not downloaded production code."
     },
     {
+      "symbol": "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::tests::exec_probe",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test helper (R1 bootstrap verifier): forks once with a private pty on fd 0/1/2 and execveats a sealed memfd copy of the trusted /usr/bin/test through the production exec_sealed adapter; no downloaded code, no network."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::tests::iso_root_bootstrap_execveat_memfd_keeps_tty",
+      "apis": {
+        "pty_openpty": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test (R1 bootstrap verifier) opens one private pty whose slave becomes the probe's fd 0/1/2, proving the sealed-memfd execveat keeps the terminal and closes every other descriptor."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/trust_init.rs::tests::iso_root_bootstrap_launcher_boots_slot_a",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored disposable-VM root test (R1 trust initialisation) starts the operator-built duduclaw-updated --launch once with a cleared environment and null stdio, waits for the slot-A self-test marker, then kills it; never linked into production."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/installed_account_root_tests.rs::Harness::run",
       "apis": {
         "command_constructor": 1,

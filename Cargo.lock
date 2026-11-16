@@ -2651,10 +2651,12 @@ name = "duduclaw-updated"
 version = "1.82.0"
 dependencies = [
  "base64 0.22.1",
+ "blake2",
  "duduclaw-isolation",
  "ed25519-dalek",
  "hex",
  "libc",
+ "minisign-verify",
  "nix 0.29.0",
  "serde",
  "serde_json",

@@ -101,6 +101,11 @@ mod tests {
         assert_eq!(store.verify_content(Some("unknown"), Some(SIG), b"x").unwrap().state, SignatureState::Unsigned);
     }
     #[test]
+    fn official_key_equals_bootstrap_verifier_legacy_key() {
+        // The root bootstrap verifier (duduclaw-updated) reads the isolation copy.
+        assert_eq!(OFFICIAL_PUBLISHER_KEY, duduclaw_isolation::update::LEGACY_RELEASE_MINISIGN_KEY);
+    }
+    #[test]
     fn missing_store_is_empty_but_invalid_store_is_an_error() {
         let home = tempfile::tempdir().unwrap();
         assert!(TrustStore::load(home.path()).unwrap().publishers.is_empty());

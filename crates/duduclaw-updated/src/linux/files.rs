@@ -35,7 +35,9 @@ fn name(value: &str) -> Result<CString> {
     }
     cstring(value)
 }
-fn open_at(parent: &File, path: &CString, flags: i32, mode: u32, no_xdev: bool) -> Result<File> {
+/// openat2 with O_CLOEXEC|O_NOFOLLOW and RESOLVE_BENEATH|NO_MAGICLINKS|NO_SYMLINKS
+/// (+NO_XDEV). Also used by the bootstrap verifier for its fixed inbox.
+pub(crate) fn open_at(parent: &File, path: &CString, flags: i32, mode: u32, no_xdev: bool) -> Result<File> {
     let how = OpenHow { flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
         mode: mode as u64, resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS
             | if no_xdev { RESOLVE_NO_XDEV } else { 0 } };

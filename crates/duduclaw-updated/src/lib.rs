@@ -6,6 +6,7 @@ pub mod state;
 pub mod activation_contract;
 pub mod trust_store;
 pub mod publication;
+pub mod bundle;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]

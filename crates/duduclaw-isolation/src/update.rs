@@ -10,6 +10,61 @@ pub const ROOT_SSHSIG_NAMESPACE: &str = "duduclaw-root-metadata-v1@dudustudio";
 pub const RELEASE_SSHSIG_NAMESPACE: &str = "duduclaw-release-manifest-v1@dudustudio";
 pub const RUNTIME_SSHSIG_NAMESPACE: &str = "duduclaw-runtime-manifest-v1@dudustudio";
 pub const EMERGENCY_SSHSIG_NAMESPACE: &str = "duduclaw-emergency-v1@dudustudio";
+/// Root-threshold authorization of one migration bundle (plan §3.2). Fixed in the
+/// verifier, never read from the bundle or its signature files.
+pub const MIGRATION_BUNDLE_SSHSIG_NAMESPACE: &str = "duduclaw-migration-bundle-v1@dudustudio";
+/// Legacy release minisign key, the other half of the transition dual signature
+/// (plan §3.2, design §8). Mirror of `duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY`:
+/// the root bootstrap verifier must not link duduclaw-core (sqlite, tokio, pty), so
+/// the constant lives here and duduclaw-core tests that both are equal.
+pub const LEGACY_RELEASE_MINISIGN_KEY: &str = "RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh";
+/// Upper bound of the uncompressed migration bundle tar (plan §4.1 step 3).
+pub const MAX_MIGRATION_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Mirror of `duduclaw_core::isolation_install::FACTS` for the root bootstrap
+/// verifier, which must refuse while any of them exists for another generation
+/// (plan §4.1 step 2). duduclaw-core tests that both lists are identical, so a
+/// change to the facts must update both.
+pub const ISOLATION_FACTS: &[&str] = &[
+    crate::ids::SPAWND_SOCKET,
+    "/etc/systemd/system/duduclaw-spawnd.socket",
+    "/etc/systemd/system/duduclaw-spawnd.service",
+    "/etc/systemd/system/duduclaw-employees.slice",
+    "/etc/systemd/system/duduclaw-egress.socket",
+    "/etc/systemd/system/duduclaw-egress.service",
+    "/etc/systemd/system/duduclaw-dns-broker.socket",
+    "/etc/systemd/system/duduclaw-dns-broker.service",
+    "/etc/systemd/system/duduclaw-parse.socket",
+    "/etc/systemd/system/duduclaw-parse@.service",
+    "/etc/systemd/system/duduclaw-updated.service",
+    "/etc/systemd/system/duduclaw-import@.service",
+    "/etc/systemd/system/duduclaw-migrate-expire@.service",
+    "/etc/systemd/system/duduclaw-migrate-expire@.timer",
+    "/usr/lib/duduclaw",
+    "/usr/lib/duduclaw/parse-root",
+    "/usr/lib/duduclaw/parse-root-tree",
+    "/var/lib/duduclaw-spawnd",
+    "/var/lib/duduclaw-spawnd/etc",
+    "/var/log/duduclaw-spawnd",
+    "/etc/duduclaw-updated",
+    "/var/lib/duduclaw-updated",
+    "/opt/duduclaw-isolated",
+    "/opt/duduclaw-isolated/generations",
+    "/opt/duduclaw-isolated/slots",
+    "/opt/duduclaw-isolated/slots/a",
+    "/opt/duduclaw-isolated/slots/b",
+    "/var/lib/duduclaw-migrate",
+    "/opt/duduclaw-isolated/current",
+    "/var/lib/duduclaw-updated/state.json",
+    "/etc/duduclaw/migration-import.json",
+    "/usr/lib/duduclaw/duduclaw-spawnd",
+    "/usr/lib/duduclaw/duduclaw-run",
+    "/opt/duduclaw/bin/duduclaw-egress",
+    "/usr/libexec/duduclaw/duduclaw-parse-worker",
+    "/usr/lib/duduclaw/current/duduclaw-import",
+    "/usr/lib/duduclaw/current/duduclaw-migrate",
+    "/usr/lib/duduclaw/current/duduclaw-mcp-bridge",
+    "/usr/libexec/duduclaw-updated-launch",
+];
 pub const ROOT_SK_APPLICATION: &str = "ssh:duduclaw-root";
 pub const TARGET_SK_APPLICATION: &str = "ssh:duduclaw-target";
 pub const SSHSIG_HASH_ALGORITHM: &str = "sha512";
@@ -280,6 +335,36 @@ pub struct EmergencyAuthorization {
     pub expires_at_unix: u64,
 }
 
+/// Root-threshold authorization of one migration bundle tar (plan §3.2), canonical
+/// JSON signed under [`MIGRATION_BUNDLE_SSHSIG_NAMESPACE`]. Structural checks only;
+/// the verifier compares digest, size, version and architecture with the bytes it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleAuthorization {
+    pub schema_version: u16,
+    pub product: Product,
+    pub version: ReleaseVersion,
+    pub arch: Architecture,
+    pub bundle_sha256: Sha256Digest,
+    pub bundle_size: u64,
+    pub expires_at_unix: u64,
+}
+
+impl BundleAuthorization {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != 1 {
+            return Err(ContractError::UnsupportedVersion);
+        }
+        if self.product != Product::Duduclaw || self.expires_at_unix == 0 {
+            return Err(ContractError::InvalidValue("bundle authorization"));
+        }
+        if self.bundle_size == 0 || self.bundle_size > MAX_MIGRATION_BUNDLE_BYTES {
+            return Err(ContractError::LimitExceeded("migration bundle"));
+        }
+        Ok(())
+    }
+}
+
 /// Unprivileged update RPC (design §8); envelope uses the shared bounded frame codec.
 /// Authenticate the fixed gateway uid/gid with SO_PEERCRED; reject ancillary fds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,5 +613,36 @@ mod tests {
         assert_ne!(RUNTIME_SSHSIG_NAMESPACE, RELEASE_SSHSIG_NAMESPACE);
         assert_ne!(EMERGENCY_SSHSIG_NAMESPACE, ROOT_SSHSIG_NAMESPACE);
         assert_eq!(SSHSIG_HASH_ALGORITHM, "sha512");
+    }
+
+    #[test]
+    fn bundle_authorization_validate() {
+        let good = BundleAuthorization { schema_version: 1, product: Product::Duduclaw,
+            version: ReleaseVersion { major: 1, minor: 83, patch: 0 }, arch: Architecture::X86_64,
+            bundle_sha256: Sha256Digest([3; 32]), bundle_size: 4096, expires_at_unix: 200 };
+        assert!(good.validate().is_ok());
+        let json = serde_json::to_value(&good).unwrap();
+        assert_eq!(json["product"], "duduclaw");
+        assert_eq!(serde_json::from_value::<BundleAuthorization>(json.clone()).unwrap(), good);
+        let mut extra = json;
+        extra["path"] = "/root/duduclaw-migrate".into();
+        assert!(serde_json::from_value::<BundleAuthorization>(extra).is_err());
+        for bad in [
+            BundleAuthorization { schema_version: 2, ..good.clone() },
+            BundleAuthorization { product: Product::DuduclawPro, ..good.clone() },
+            BundleAuthorization { bundle_size: 0, ..good.clone() },
+            BundleAuthorization { bundle_size: MAX_MIGRATION_BUNDLE_BYTES + 1, ..good.clone() },
+            BundleAuthorization { expires_at_unix: 0, ..good.clone() },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        assert!(BundleAuthorization { bundle_size: MAX_MIGRATION_BUNDLE_BYTES, ..good }.validate().is_ok());
+        for namespace in [ROOT_SSHSIG_NAMESPACE, RELEASE_SSHSIG_NAMESPACE, RUNTIME_SSHSIG_NAMESPACE,
+            EMERGENCY_SSHSIG_NAMESPACE] {
+            assert_ne!(MIGRATION_BUNDLE_SSHSIG_NAMESPACE, namespace);
+        }
+        for fact in ISOLATION_FACTS {
+            assert!(fact.starts_with('/') && !fact.contains(".."), "{fact}");
+        }
     }
 }

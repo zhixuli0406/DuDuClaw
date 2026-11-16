@@ -16,7 +16,7 @@ pub fn validate_root(root: &RootMetadata, now: u64) -> Result<()> {
     Ok(())
 }
 
-fn signatures(armors: &[String]) -> Result<Vec<SshSignature>> {
+pub(crate) fn signatures(armors: &[String]) -> Result<Vec<SshSignature>> {
     if armors.is_empty() || armors.len() > 6 { return Err(Error::Signature); }
     let mut seen = BTreeSet::new();
     let mut signatures = Vec::new();
@@ -28,7 +28,7 @@ fn signatures(armors: &[String]) -> Result<Vec<SshSignature>> {
     Ok(signatures)
 }
 
-fn threshold(root: &RootMetadata, signatures: &[SshSignature], namespace: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn threshold(root: &RootMetadata, signatures: &[SshSignature], namespace: &str, bytes: &[u8]) -> Result<()> {
     let mut count = 0;
     for signature in signatures {
         if let Some(key) = root.root_keys.iter().find(|key| key.key_id == signature.key_id()) {
@@ -40,7 +40,7 @@ fn threshold(root: &RootMetadata, signatures: &[SshSignature], namespace: &str, 
     Ok(())
 }
 
-fn reject_unknown(signatures: &[SshSignature], roots: &[&RootMetadata]) -> Result<()> {
+pub(crate) fn reject_unknown(signatures: &[SshSignature], roots: &[&RootMetadata]) -> Result<()> {
     if signatures.iter().any(|signature| !roots.iter().any(|root|
         root.root_keys.iter().any(|key| key.key_id == signature.key_id()))) {
         return Err(Error::Signature);

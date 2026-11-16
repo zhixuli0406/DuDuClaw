@@ -32,6 +32,8 @@ BIN_PACKAGES = {
     "duduclaw-run": "duduclaw-run",
     "duduclaw-egress": "duduclaw-egress",
     "duduclaw-updated": "duduclaw-updated",
+    # Root transition verifier (plan R1); customers compare its published SHA-256.
+    "duduclaw-bootstrap": "duduclaw-updated",
     "duduclaw-parse-worker": "duduclaw-parse-worker",
     "duduclaw-import": "duduclaw-import",
     "duduclaw-migrate": "duduclaw-migration",

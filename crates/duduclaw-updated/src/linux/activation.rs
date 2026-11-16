@@ -153,6 +153,24 @@ fn publish_current(install: &Directory, committed: Sha256Digest, next: Sha256Dig
     if unsafe { libc::fchmod(generation.raw_fd(), 0o755) } != 0 { return Err(std::io::Error::last_os_error().into()); }
     generation.sync()?;
     if current == next { install.sync()?; return Ok(()); }
+    swap_current(install, next)
+}
+/// First `current` of a host (plan R1 `trust_init`): the same temporary symlink +
+/// rename protocol as an activation. Only an absent selector or one that already
+/// names `next` (an interrupted earlier run) is accepted; never another generation.
+pub(crate) fn publish_initial_current(install: &Directory, next: Sha256Digest) -> Result<()> {
+    match read_current_at(install) {
+        Ok(current) if current == next => { install.sync()?; return Ok(()); }
+        Ok(_) => return Err(Error::Maintenance),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    let generation = install.child("generations")?.child(&hex::encode(next.0))?;
+    if unsafe { libc::fchmod(generation.raw_fd(), 0o755) } != 0 { return Err(std::io::Error::last_os_error().into()); }
+    generation.sync()?;
+    swap_current(install, next)
+}
+fn swap_current(install: &Directory, next: Sha256Digest) -> Result<()> {
     match install.remove("current.next") {
         Ok(()) => (), Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (), Err(e) => return Err(e),
     }

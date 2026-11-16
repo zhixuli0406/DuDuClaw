@@ -13,7 +13,7 @@ const STAGE: &str = "bootstrap-generation.next";
 fn missing(error: &Error) -> bool {
     matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
-fn host_architecture() -> Result<Architecture> {
+pub(crate) fn host_architecture() -> Result<Architecture> {
     match std::env::consts::ARCH {
         "x86_64" => Ok(Architecture::X86_64),
         "aarch64" => Ok(Architecture::Aarch64),
@@ -68,7 +68,8 @@ fn verify_generation(generation: &Directory, manifest: &ReleaseManifest, bytes: 
     Ok(())
 }
 
-fn publish_generation(artifacts: &Directory, install: &Directory, manifest: &ReleaseManifest,
+/// Also reused by `trust_init::publish` (plan R1) to publish the verified staging area.
+pub(crate) fn publish_generation(artifacts: &Directory, install: &Directory, manifest: &ReleaseManifest,
     bytes: &[u8], signature: &str) -> Result<Sha256Digest> {
     // Open and verify the whole set before changing any destination. Retain those
     // fds through the copy; never reopen an input by name after hashing it.

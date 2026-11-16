@@ -8,6 +8,8 @@ pub mod activation;
 pub mod trust_admin;
 pub mod emergency;
 pub mod bootstrap;
+pub mod bootstrap_verify;
+pub mod trust_init;
 
 use crate::{Error, Result};
 pub const STATE_ROOT: &str = "/var/lib/duduclaw-updated";
