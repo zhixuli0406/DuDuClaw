@@ -119,9 +119,12 @@ pub(crate) async fn tick_once(
         };
         match crate::autonomous_runtime::scope(
             home_dir, &candidate.agent_id, &[],
-            summarize_one(session_manager, home_dir, &session_id, through_turn),
+            summarize_one(session_manager, home_dir, &session_id, through_turn, params.min_new_turns_to_trigger),
         ).await {
-            Ok(bytes) => {
+            Ok(None) => {
+                debug!(session_id, "summarizer: current snapshot no longer needs summarization");
+            }
+            Ok(Some(bytes)) => {
                 crate::session_summarizer::summary_attempt_finished_async(home_dir, &session_id, "async", None).await;
                 info!(
                 session_id = %session_id,
@@ -144,24 +147,29 @@ pub(crate) async fn tick_once(
 }
 
 /// Roll the previous summary forward through `through_turn` and persist the
-/// result. Returns the byte length of the persisted summary on success.
+/// result. Returns its byte length, or None when the current snapshot is ineligible.
 async fn summarize_one(
     session_manager: &SessionManager,
     home_dir: &std::path::Path,
     session_id: &str,
     through_turn: u32,
-) -> Result<usize, crate::session_summarizer::SummaryFailure> {
+    min_new_turns: u32,
+) -> Result<Option<usize>, crate::session_summarizer::SummaryFailure> {
     use crate::session_summarizer::SummaryFailure;
-    let expected_ids = session_manager.get_message_ids(session_id).await
+    let snapshot = session_manager.history_snapshot(session_id).await
         .map_err(|_| SummaryFailure::ReadState)?;
-    let (previous, after) = session_manager.get_summary(session_id).await
-        .map_err(|_| SummaryFailure::ReadState)?;
+    let expected_ids = snapshot.message_ids;
+    let after = snapshot.summarized_through_turn;
     let checked = crate::session_summarizer::checked_summary_bookmark(
-        session_id, &previous, after, expected_ids.len());
-    let turns = session_manager
-        .read_summary_turn_range(session_id, checked.after as u32, through_turn)
-        .await
-        .map_err(|_| SummaryFailure::ReadState)?;
+        session_id, &snapshot.rolling_summary, after, snapshot.messages.len());
+    let through_turn = (through_turn as usize).min(snapshot.messages.len().saturating_sub(3)) as u32;
+    if through_turn as usize <= checked.after
+        || snapshot.messages.len().saturating_sub(checked.after) < min_new_turns as usize {
+        return Ok(None);
+    }
+    let turns: Vec<_> = snapshot.messages.into_iter()
+        .take(through_turn as usize).skip(checked.after)
+        .map(|message| (message.role, message.content)).collect();
     let turns: Vec<_> = turns.into_iter().map(|(role, text)|
         (role, duduclaw_security::credential_detect::mask(&text))).collect();
     let mut rolling = Vec::new();
@@ -213,7 +221,7 @@ async fn summarize_one(
         .set_summary_if_unchanged(session_id, &persisted, through_turn, after, &expected_ids)
         .await
         .map_err(|_| SummaryFailure::Store)?;
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 /// Hard byte cap on the verbatim protected text this task pins into a session
@@ -294,6 +302,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_target_skips_below_trigger_without_writing() {
+        let (sm, home) = make_session_manager();
+        sm.get_or_create("shrunk", "worker").await.unwrap();
+        for _ in 0..20 { sm.append_message("shrunk", "user", "fact", 1).await.unwrap(); }
+        let ids = sm.get_message_ids("shrunk").await.unwrap();
+        for id in &ids[..15] { sm.hide_message("shrunk", *id).await.unwrap(); }
+        let conn = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_summary_write BEFORE UPDATE OF summary_of_prior
+            ON sessions BEGIN SELECT RAISE(ABORT, 'unexpected summary write'); END;").unwrap();
+        assert_eq!(summarize_one(&sm, home.path(), "shrunk", 17, 10).await.unwrap(), None);
+        assert_eq!(sm.get_summary("shrunk").await.unwrap(), (String::new(), 0));
+        conn.execute_batch("DROP TRIGGER reject_summary_write;").unwrap();
+        sm.set_summary("shrunk", "- current", 2).await.unwrap();
+        assert_eq!(summarize_one(&sm, home.path(), "shrunk", 17, 1).await.unwrap(), None);
+        assert_eq!(sm.get_summary("shrunk").await.unwrap(), ("- current".into(), 2));
+    }
+
+    #[tokio::test]
+    async fn stale_target_is_capped_to_current_raw_tail() {
+        let (sm, home) = make_session_manager();
+        sm.get_or_create("capped", "worker").await.unwrap();
+        let text = format!("## 約束\n{}\n- retain", marker());
+        for _ in 0..5 { sm.append_message("capped", "user", &text, 1).await.unwrap(); }
+        let bytes = summarize_one(&sm, home.path(), "capped", 17, 1).await.unwrap();
+        assert!(bytes.is_some());
+        assert_eq!(sm.get_summary("capped").await.unwrap().1, 2);
+        assert_eq!(sm.get_messages("capped").await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
     async fn clamped_summary_reads_raw_prefix_and_replaces_original_cursor() {
         let (sm, home) = make_session_manager();
         let dir = home.path().join("agents/utility-worker");
@@ -311,10 +349,13 @@ mod tests {
         for i in 0..62 {
             sm.append_message("stuck", "user", &format!("raw fact {i}"), 1).await.unwrap();
         }
-        sm.set_summary("stuck", "- stale summary must be ignored", 260).await.unwrap();
+        rusqlite::Connection::open(home.path().join("sessions.db")).unwrap().execute(
+            "UPDATE sessions SET summary_of_prior='- stale summary must be ignored',
+             summarized_through_turn=260 WHERE id='stuck'", [],
+        ).unwrap();
         let ids = sm.get_message_ids("stuck").await.unwrap();
         crate::autonomous_runtime::scope(home.path(), "utility-worker", &[],
-            summarize_one(&sm, home.path(), "stuck", 59)).await.unwrap();
+            summarize_one(&sm, home.path(), "stuck", 59, 1)).await.unwrap();
         assert_eq!(sm.get_summary("stuck").await.unwrap(), ("Session utility result".into(), 59));
         assert_eq!(sm.get_message_ids("stuck").await.unwrap(), ids);
     }
@@ -335,13 +376,13 @@ mod tests {
         ).await;
         for sid in ["owned", "odoolivechat:visitor"] {
             sm.get_or_create(sid, "utility-worker").await.unwrap();
-            for text in ["old one", "old two", "new 中文", "latest"] {
+            for text in ["old one", "old two", "new 中文", "latest", "raw tail", "current"] {
                 sm.append_message(sid, "user", text, 1).await.unwrap();
             }
             sm.set_summary(sid, "- Previously established fact", 2).await.unwrap();
             let ids = sm.get_message_ids(sid).await.unwrap();
             let result = crate::autonomous_runtime::scope(home.path(), "utility-worker", &[],
-                summarize_one(&sm, home.path(), sid, 3)).await;
+                summarize_one(&sm, home.path(), sid, 3, 1)).await;
             assert_eq!(result, Err(crate::session_summarizer::SummaryFailure::RefusalOrMeta));
             assert_eq!(sm.get_summary(sid).await.unwrap(), ("- Previously established fact".into(), 2));
             assert_eq!(sm.get_message_ids(sid).await.unwrap(), ids);
@@ -386,10 +427,11 @@ mod tests {
         sm.get_or_create("owned", "utility-worker").await.unwrap();
         sm.append_message("owned", "user", "Summarize this session", 4).await.unwrap();
         sm.append_message("owned", "assistant", "Here is the discussion", 4).await.unwrap();
+        for _ in 0..3 { sm.append_message("owned", "user", "raw tail", 1).await.unwrap(); }
         // Production `tick_once` scopes the owner before `summarize_one`.
         crate::autonomous_runtime::scope(
             home.path(), "utility-worker", &[],
-            summarize_one(&sm, home.path(), "owned", 2),
+            summarize_one(&sm, home.path(), "owned", 2, 1),
         ).await.unwrap();
         assert_eq!(sm.get_summary("owned").await.unwrap(), ("Session utility result".into(), 2));
     }
@@ -411,9 +453,10 @@ mod tests {
         sm.get_or_create("fallback-owner", "utility-worker").await.unwrap();
         sm.append_message("fallback-owner", "user", "Summarize this session", 4).await.unwrap();
         sm.append_message("fallback-owner", "assistant", "Here is the discussion", 4).await.unwrap();
+        for _ in 0..3 { sm.append_message("fallback-owner", "user", "raw tail", 1).await.unwrap(); }
         crate::autonomous_runtime::scope(
             home.path(), "utility-worker", &[],
-            summarize_one(&sm, home.path(), "fallback-owner", 2),
+            summarize_one(&sm, home.path(), "fallback-owner", 2, 1),
         ).await.unwrap();
         assert_eq!(sm.get_summary("fallback-owner").await.unwrap().0, "Session utility result");
     }
@@ -436,7 +479,8 @@ mod tests {
             sm.get_or_create(&sid, owner).await.unwrap();
             sm.append_message(&sid, "user", "Summarize this conversation", 4).await.unwrap();
             sm.append_message(&sid, "assistant", "Discussion content", 4).await.unwrap();
-            let error = summarize_one(&sm, home.path(), &sid, 2).await.unwrap_err();
+            for _ in 0..3 { sm.append_message(&sid, "user", "raw tail", 1).await.unwrap(); }
+            let error = summarize_one(&sm, home.path(), &sid, 2, 1).await.unwrap_err();
             assert_eq!(error, crate::session_summarizer::SummaryFailure::ReadState);
             assert_eq!(sm.get_summary(&sid).await.unwrap().0, "");
         }
@@ -544,11 +588,13 @@ mod tests {
         )
         .await
         .unwrap();
+        for _ in 0..3 { sm.append_message("protected-only", "user", "raw tail", 1).await.unwrap(); }
         summarize_one(
             &sm,
             std::path::Path::new("/nonexistent"),
             "protected-only",
             2,
+            1,
         )
         .await
         .unwrap();

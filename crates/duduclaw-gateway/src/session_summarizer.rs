@@ -11,18 +11,47 @@ pub(crate) struct SummaryBookmark<'a> {
     pub clamped: bool,
 }
 
+const BOOKMARK_WARNING_CAP: usize = 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+enum BookmarkWarning { Session, SuppressFurther, None }
+
+#[derive(Default)]
+struct BookmarkWarnings {
+    ids: std::collections::HashSet<String>,
+    suppressed: bool,
+}
+
+impl BookmarkWarnings {
+    fn record(&mut self, session_id: &str) -> BookmarkWarning {
+        if self.ids.contains(session_id) { return BookmarkWarning::None; }
+        if self.ids.len() < BOOKMARK_WARNING_CAP {
+            self.ids.insert(session_id.to_owned());
+            BookmarkWarning::Session
+        } else if !self.suppressed {
+            self.suppressed = true;
+            BookmarkWarning::SuppressFurther
+        } else {
+            BookmarkWarning::None
+        }
+    }
+}
+
 pub(crate) fn checked_summary_bookmark<'a>(
     session_id: &str, summary: &'a str, bookmark: u32, visible_rows: usize,
 ) -> SummaryBookmark<'a> {
     let clamped = bookmark as usize > visible_rows;
     if clamped {
-        static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        static WARNED: std::sync::OnceLock<std::sync::Mutex<BookmarkWarnings>> =
             std::sync::OnceLock::new();
         let mut warned = WARNED.get_or_init(Default::default)
             .lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if warned.insert(session_id.to_owned()) {
-            tracing::warn!(session_id, bookmark, visible_rows,
-                "Invalid rolling-summary bookmark; ignoring stale summary");
+        match warned.record(session_id) {
+            BookmarkWarning::Session => tracing::warn!(session_id, bookmark, visible_rows,
+                "Invalid rolling-summary bookmark; ignoring stale summary"),
+            BookmarkWarning::SuppressFurther => tracing::warn!(
+                "Invalid rolling-summary bookmark warning limit reached; further warnings suppressed"),
+            BookmarkWarning::None => {},
         }
     }
     SummaryBookmark {
@@ -32,16 +61,27 @@ pub(crate) fn checked_summary_bookmark<'a>(
     }
 }
 
-/// The final user row is sent separately as the current prompt. On recovery,
-/// all raw rows are eligible, including the latest three (current prompt included).
+/// The final user row is sent separately as the current prompt. Always retain
+/// the latest three raw rows (current prompt included), even if already summarized.
 pub(crate) fn session_history(
     session_id: &str, messages: &[crate::session::SessionMessage],
     summary: &str, bookmark: u32,
 ) -> (String, Vec<crate::runtime::ConversationTurn>) {
     let checked = checked_summary_bookmark(session_id, summary, bookmark, messages.len());
+    let mut non_system_rows = 0;
+    let mut floor = 0;
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role != "system" {
+            non_system_rows += 1;
+            if non_system_rows == 3 {
+                floor = index;
+                break;
+            }
+        }
+    }
     let mut history: Vec<_> = messages.iter()
         .take(messages.len().saturating_sub(1))
-        .skip(checked.after)
+        .skip(checked.after.min(floor))
         .filter(|message| message.role != "system")
         .map(|message| crate::runtime::ConversationTurn {
             role: message.role.clone(), content: message.content.clone(),
@@ -478,9 +518,50 @@ mod tests {
         assert_eq!(summary, "- fact");
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].content, messages[6].content);
-        let boundary = checked_summary_bookmark("equal", "- fact", 10, 10);
-        assert!(!boundary.clamped);
-        assert_eq!(boundary.after, 10);
+    }
+
+    #[test]
+    fn bookmarks_at_tail_keep_summary_and_last_three_raw_rows() {
+        for count in [0usize, 1, 2, 3, 10] {
+            let messages = visible_messages(count);
+            for bookmark in [count, count.saturating_sub(1)] {
+                let (summary, history) = session_history("tail", &messages, "- fact", bookmark as u32);
+                assert_eq!(summary, "- fact");
+                assert_eq!(history.len(), count.saturating_sub(1).min(2));
+                if let Some(first) = history.first() {
+                    assert_eq!(first.content, messages[count.saturating_sub(3)].content);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tail_system_rows_do_not_hide_last_non_system_history() {
+        let mut messages = visible_messages(5);
+        messages[3].role = "system".into();
+        messages[4].role = "user".into();
+
+        let (summary, history) = session_history("system-tail", &messages, "- fact", 5);
+
+        assert_eq!(summary, "- fact");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, messages[1].content);
+        assert_eq!(history[1].content, messages[2].content);
+    }
+
+    #[test]
+    fn bookmark_warning_ids_are_bounded_and_suppression_is_once() {
+        let mut warned = BookmarkWarnings::default();
+        for i in 0..BOOKMARK_WARNING_CAP {
+            let id = format!("session-{i}");
+            assert_eq!(warned.record(&id), BookmarkWarning::Session);
+            assert_eq!(warned.record(&id), BookmarkWarning::None);
+        }
+        assert_eq!(warned.record("overflow"), BookmarkWarning::SuppressFurther);
+        for i in 0..100 {
+            assert_eq!(warned.record(&format!("overflow-{i}")), BookmarkWarning::None);
+        }
+        assert_eq!(warned.ids.len(), BOOKMARK_WARNING_CAP);
     }
 
     #[test]
