@@ -1,10 +1,11 @@
 //! Gateway-owned MCP startup observations and bounded, gated probes.
-use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
+use std::{collections::{HashMap, HashSet, VecDeque}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use duduclaw_core::mcp_start_status::{ReasonCode, StartStatus, safe_label};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const MAX_RESULTS: usize = 4096;
+const MAX_EMPLOYEE_RESULTS: usize = 64;
 pub(crate) const MAX_INIT_BYTES: usize = 64 * 1024;
 const MAX_INIT_SERVERS: usize = 64;
 type Key = (PathBuf, String, String);
@@ -22,15 +23,34 @@ fn key(home: &Path, agent: &str, server: &str) -> Key {
 }
 
 #[derive(Default)]
-struct Results { entries: HashMap<Key, (Instant, StartStatus)> }
+struct Results { entries: HashMap<Key, (Instant, StartStatus)>, order: VecDeque<Key>, employee_counts: HashMap<(PathBuf, String), usize> }
 impl Results {
-    fn insert(&mut self, key: Key, status: StartStatus) {
-        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_RESULTS {
-            if let Some(oldest) = self.entries.iter().min_by_key(|(_, (time, _))| *time)
-                .map(|(key, _)| key.clone()) {
-                self.entries.remove(&oldest);
+    fn remove(&mut self, key: &Key) {
+        if self.entries.remove(key).is_some() {
+            let employee = (key.0.clone(), key.1.clone());
+            if let Some(count) = self.employee_counts.get_mut(&employee) {
+                *count -= 1;
+                if *count == 0 { self.employee_counts.remove(&employee); }
             }
         }
+    }
+    fn insert(&mut self, key: Key, status: StartStatus) {
+        if self.entries.contains_key(&key) {
+            self.remove(&key);
+        }
+        let employee = (key.0.clone(), key.1.clone());
+        if self.employee_counts.get(&employee).copied().unwrap_or(0) >= MAX_EMPLOYEE_RESULTS {
+            if let Some(index) = self.order.iter().position(|old| old.0 == key.0 && old.1 == key.1) {
+                let oldest = self.order.remove(index).expect("position came from queue");
+                self.remove(&oldest);
+            }
+        }
+        while self.entries.len() >= MAX_RESULTS {
+            let Some(oldest) = self.order.pop_front() else { break; };
+            if self.entries.contains_key(&oldest) { self.remove(&oldest); }
+        }
+        self.employee_counts.entry(employee).and_modify(|n| *n += 1).or_insert(1);
+        self.order.push_back(key.clone());
         self.entries.insert(key, (Instant::now(), status));
     }
 }
@@ -55,7 +75,10 @@ pub(crate) fn clear(home: &Path, agent: &str, server: Option<&str>) {
         for (_, valid) in active.iter().filter(|(k, _)| matches(k)) {
             valid.store(false, Ordering::SeqCst);
         }
-        if let Ok(mut map) = LAST.lock() { map.entries.retain(|k, _| !matches(k)); }
+        if let Ok(mut map) = LAST.lock() {
+            let removed: Vec<_> = map.entries.keys().filter(|k| matches(k)).cloned().collect();
+            for key in removed { map.remove(&key); }
+        }
     }
 }
 
@@ -145,6 +168,18 @@ fn result_status(result: Result<usize, ReasonCode>) -> StartStatus {
         reason_code: result.err(), time: chrono::Utc::now().to_rfc3339() }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProbeResult {
+    pub ok: bool,
+    pub tool_count: Option<usize>,
+    pub reason_code: Option<ReasonCode>,
+}
+impl From<&StartStatus> for ProbeResult {
+    fn from(status: &StartStatus) -> Self {
+        Self { ok: status.ok, tool_count: status.tool_count, reason_code: status.reason_code }
+    }
+}
+
 pub(crate) async fn probe(home: &Path, agent: &str, server: &str) -> StartStatus {
     let probe_key = key(home, agent, server);
     let occupied = IN_FLIGHT.lock().map(|active| active.contains_key(&probe_key)).unwrap_or(true);
@@ -165,10 +200,6 @@ pub(crate) async fn probe(home: &Path, agent: &str, server: &str) -> StartStatus
     if let Ok(_active) = IN_FLIGHT.lock() {
         if flight.valid.load(Ordering::SeqCst) {
             remember(home, agent, server, status.clone());
-            if !status.ok {
-                append_failure(home, json!({"classification":"mcp_start", "agent_id":safe_label(agent),
-                    "server":safe_label(server), "ok":false, "reason_code":status.reason_code, "time":status.time}));
-            }
         }
     }
     status
@@ -293,19 +324,42 @@ mod tests {
     }
 
     #[test]
-    fn map_evicts_only_oldest_and_stores_bounded_sanitised_keys() {
+    fn map_caps_each_employee_without_evicting_others_and_enforces_global_cap() {
         let mut map = Results::default();
         let home = Path::new("isolated-home");
-        for n in 0..=MAX_RESULTS {
+        map.insert(key(home, "other", "keep"), result_status(Ok(0)));
+        for n in 0..10_000 {
             map.insert(key(home, "員工\n", &format!("server/{n}")), result_status(Ok(n)));
+            assert!(map.employee_counts.get(&(home.into(), label_key("員工\n"))).copied().unwrap_or(0) <= MAX_EMPLOYEE_RESULTS);
         }
-        assert_eq!(map.entries.len(), MAX_RESULTS);
+        assert_eq!(map.employee_counts.get(&(home.into(), label_key("員工\n"))), Some(&MAX_EMPLOYEE_RESULTS));
+        assert_eq!(map.entries.len(), MAX_EMPLOYEE_RESULTS + 1);
+        assert!(map.entries.contains_key(&key(home, "other", "keep")));
         assert!(!map.entries.contains_key(&key(home, "員工\n", "server/0")));
-        assert!(map.entries.contains_key(&key(home, "員工\n", "server/1")));
+        assert!(map.entries.contains_key(&key(home, "員工\n", "server/9999")));
         assert!(map.entries.keys().all(|(_, agent, server)|
             agent.len() <= 145 && server.len() <= 145 && agent.chars().chain(server.chars())
                 .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))));
         assert_ne!(key(home, "employee", "a/b"), key(home, "employee", "a_b"));
+
+        let mut global = Results::default();
+        for n in 0..MAX_RESULTS / MAX_EMPLOYEE_RESULTS + 1 {
+            for s in 0..MAX_EMPLOYEE_RESULTS {
+                global.insert(key(home, &format!("employee-{n}"), &format!("server-{s}")), result_status(Ok(s)));
+            }
+        }
+        assert_eq!(global.entries.len(), MAX_RESULTS);
+        assert_eq!(global.employee_counts.values().sum::<usize>(), MAX_RESULTS);
+        assert!(!global.entries.contains_key(&key(home, "employee-0", "server-0")));
+    }
+
+    #[test]
+    fn explicit_probe_failure_updates_memory_without_appending_failure_record() {
+        let home = tempfile::tempdir().unwrap();
+        let status = result_status(Err(ReasonCode::PolicyDenied));
+        remember(home.path(), "employee", "server", status.clone());
+        assert_eq!(last(home.path(), "employee", "server").unwrap().reason_code, status.reason_code);
+        assert!(!home.path().join("channel_failures.jsonl").exists());
     }
 
     #[tokio::test]
@@ -424,7 +478,9 @@ mod tests {
                     panic!("probe RPC failed: {frame:?}");
                 };
                 assert_eq!(temp_configs(), before_temp, "{mode} leaked a probe config");
-                let status: StartStatus = serde_json::from_value(payload).unwrap();
+                assert_eq!(payload.as_object().unwrap().len(), 3);
+                assert!(payload.get("time").is_none());
+                let status: ProbeResult = serde_json::from_value(payload).unwrap();
                 assert_eq!(status.reason_code, expected, "{mode}");
                 assert_eq!(status.ok, mode == "success");
                 if status.ok { assert_eq!(status.tool_count, Some(1)); }
@@ -436,6 +492,8 @@ mod tests {
             let frame = Box::pin(handler.handle("mcp.probe", json!({"agent_id":"alice","server_name":"fixture"}),
                 &duduclaw_auth::UserContext::admin_fallback())).await;
             let crate::protocol::WsFrame::Response { ok: true, payload: Some(payload), .. } = frame else { panic!("busy RPC"); };
+            assert_eq!(payload.as_object().unwrap().len(), 3);
+            assert!(payload.get("time").is_none());
             assert_eq!(payload["reason_code"], "busy");
             // A busy install probe must not retain the old start result.
             remember(home.path(), "alice", "missing", result_status(Ok(99)));

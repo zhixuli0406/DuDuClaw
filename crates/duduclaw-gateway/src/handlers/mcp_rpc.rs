@@ -83,7 +83,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "server_name is required");
         };
         let status = crate::mcp_start::probe(&self.home_dir, agent, server).await;
-        WsFrame::ok_response("", json!(status))
+        WsFrame::ok_response("", json!(crate::mcp_start::ProbeResult::from(&status)))
     }
 
     pub(crate) async fn handle_mcp_update(&self, params: &Value) -> WsFrame {
@@ -185,7 +185,7 @@ impl MethodHandler {
                 {
                     Ok(Ok(())) => {
                         let probe = crate::mcp_start::probe(&self.home_dir, agent_id, server_name).await;
-                        WsFrame::ok_response("", json!({ "success": true, "probe": probe }))
+                        WsFrame::ok_response("", json!({ "success": true, "probe": crate::mcp_start::ProbeResult::from(&probe) }))
                     },
                     Ok(Err(e)) => WsFrame::error_response("", &e),
                     Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),

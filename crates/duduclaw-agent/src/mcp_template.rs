@@ -486,7 +486,7 @@ fn effective_duduclaw_config(
                             .collect()
                     })
                     .unwrap_or_default();
-                if !dropped.is_empty() {
+                if persist && !dropped.is_empty() {
                     tracing::warn!(
                         agent = %agent_id,
                         server = %key,

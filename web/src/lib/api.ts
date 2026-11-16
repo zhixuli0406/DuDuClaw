@@ -3109,11 +3109,17 @@ export interface McpServerDef {
   env: Record<string, string>;
 }
 
-export interface McpStartResult {
+export interface McpLastStartResult {
   ok: boolean;
   tool_count?: number | null;
   reason_code?: string | null;
   time?: string;
+}
+
+export interface McpStartResult {
+  ok: boolean;
+  tool_count?: number | null;
+  reason_code?: string | null;
 }
 
 export interface McpServerEntry extends McpServerDef {
@@ -3121,7 +3127,7 @@ export interface McpServerEntry extends McpServerDef {
   source?: 'mcp_json' | 'agent_toml';
   read_only?: boolean;
   effective_runtimes?: string[];
-  last_start?: McpStartResult | null;
+  last_start?: McpLastStartResult | null;
 }
 
 export interface McpAgentConfig {
