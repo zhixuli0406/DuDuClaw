@@ -1707,6 +1707,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     crate::relay_client::spawn_relay_client(&home_dir, reply_ctx.clone());
     // Webhook channels: fill the always-mounted slots for the channels that
     // are configured now; `channels.add` fills the rest later (hot start).
+    // Await bounded placeholder recovery before shared/own HTTP or Pub/Sub ingress.
+    crate::googlechat_recovery::startup(&home_dir).await;
     let webhook_slots = crate::webhook_slots::global();
     for (channel, _) in crate::webhook_slots::WEBHOOK_CHANNELS {
         let r = crate::webhook_slots::start_webhook(channel, &home_dir, reply_ctx.clone()).await;

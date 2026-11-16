@@ -18,6 +18,41 @@ pub(crate) struct Pending { pub id: String, pub payload: String }
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Admission { Inserted, Duplicate, Full }
 
+/// Resource references only; app_email pins the sender across app reconfiguration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingPlaceholder {
+    pub message_name: String,
+    pub space: String,
+    pub app_agent: Option<String>,
+    pub app_email: String,
+    pub employee_id: String,
+    pub session_id: String,
+    pub thread_name: Option<String>,
+    pub created_at: i64,
+}
+
+/// Explicitly retired by final delivery or silence. Dropping a cancelled or
+/// panicked turn deliberately preserves recovery evidence for the next start.
+pub(crate) struct PlaceholderRegistration {
+    store: Arc<Inbox>,
+    name: String,
+    retired: std::sync::atomic::AtomicBool,
+}
+impl PlaceholderRegistration {
+    pub(crate) fn new(store: Arc<Inbox>, row: &PendingPlaceholder) -> Result<Self, String> {
+        store.insert_placeholder(row)?;
+        Ok(Self { store, name: row.message_name.clone(), retired: false.into() })
+    }
+}
+impl PlaceholderRegistration {
+    pub(crate) fn retire(&self) {
+        if self.retired.load(std::sync::atomic::Ordering::Relaxed) { return; }
+        if self.store.remove_placeholder(&self.name).is_err() {
+            tracing::warn!(failed = 1, "Google Chat placeholder retirement failed");
+        } else { self.retired.store(true, std::sync::atomic::Ordering::Relaxed); }
+    }
+}
+
 impl Inbox {
     pub(crate) fn shared(home: &Path) -> Result<Arc<Self>, String> {
         static STORES: OnceLock<Mutex<Vec<(PathBuf, Weak<Inbox>)>>> = OnceLock::new();
@@ -32,12 +67,21 @@ impl Inbox {
 
     fn open(home: &Path) -> Result<Self, String> {
         let path = home.canonicalize().map_err(|_| "無法開啟 Google Chat 收件匣目錄")?.join("googlechat_inbox.db");
+        #[cfg(unix)]
         prepare_private(&path, true)?;
+        #[cfg(unix)]
         for suffix in ["-wal", "-shm", "-journal"] {
             prepare_private(&PathBuf::from(format!("{}{suffix}", path.display())), false)?;
         }
+        #[cfg(unix)]
         let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)
             .map_err(|_| "無法開啟 Google Chat 耐久收件匣")?;
+        // HTTP Google Chat is also supported on Windows. Reuse the shared
+        // private SQLite opener there (including its documented home-ACL trust).
+        #[cfg(not(unix))]
+        let conn = duduclaw_core::private_sqlite::open(home, "googlechat_inbox.db", duduclaw_core::private_sqlite::Access::Create)
+            .map_err(|_| "無法開啟 Google Chat 耐久收件匣")?
+            .ok_or("無法開啟 Google Chat 耐久收件匣")?;
         // 64 MiB database ceiling (4 KiB pages); checkpoints bound WAL growth.
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA page_size=4096;
             PRAGMA max_page_count=16384; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
@@ -48,15 +92,53 @@ impl Inbox {
                 PRIMARY KEY(stream,event_key));
             CREATE INDEX IF NOT EXISTS notifications_pending ON notifications(stream,status,received_at);
             CREATE INDEX IF NOT EXISTS notifications_age ON notifications(received_at);
+            CREATE TABLE IF NOT EXISTS pending_placeholders (
+                message_name TEXT PRIMARY KEY NOT NULL, space TEXT NOT NULL,
+                app_agent TEXT, app_email TEXT NOT NULL, employee_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, thread_name TEXT, created_at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS pending_placeholders_age ON pending_placeholders(created_at);
             UPDATE notifications SET status='pending' WHERE status='queued';
             UPDATE notifications SET status='uncertain',payload=NULL WHERE status='running';")
             .map_err(|_| "Google Chat 收件匣初始化失敗")?;
+        #[cfg(unix)]
         for suffix in ["", "-wal", "-shm"] {
             prepare_private(&PathBuf::from(format!("{}{suffix}", path.display())), false)?;
         }
         let store = Self { conn: Mutex::new(conn) };
         store.prune(chrono::Utc::now().timestamp())?;
         Ok(store)
+    }
+
+    // Placeholder maintenance must not spend its startup budget waiting for
+    // another SQLite writer or this process's notification operations.
+    fn placeholder_access<T>(&self, work: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
+        let conn = self.conn.try_lock().map_err(|_| "placeholder store busy")?;
+        conn.busy_timeout(std::time::Duration::ZERO).map_err(|_| "placeholder store unavailable")?;
+        let result = work(&conn);
+        conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| "placeholder store unavailable")?;
+        result.map_err(|_| "placeholder store operation failed".into())
+    }
+
+    pub(crate) fn insert_placeholder(&self, row: &PendingPlaceholder) -> Result<(), String> {
+        self.placeholder_access(|conn| conn.execute(
+            "INSERT INTO pending_placeholders(message_name,space,app_agent,app_email,employee_id,session_id,thread_name,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![row.message_name,row.space,row.app_agent,row.app_email,row.employee_id,row.session_id,row.thread_name,row.created_at]).map(|_| ()))
+    }
+
+    pub(crate) fn remove_placeholder(&self, name: &str) -> Result<(), String> {
+        self.placeholder_access(|conn| conn.execute(
+            "DELETE FROM pending_placeholders WHERE message_name=?1", [name]).map(|_| ()))
+    }
+
+    pub(crate) fn stale_placeholders(&self, now: i64) -> Result<Vec<PendingPlaceholder>, String> {
+        self.placeholder_access(|conn| {
+            let mut query = conn.prepare("SELECT message_name,space,app_agent,app_email,employee_id,session_id,thread_name,created_at FROM pending_placeholders WHERE created_at < ?1 ORDER BY created_at,message_name LIMIT 200")?;
+            let rows = query.query_map([now - 5], |r| Ok(PendingPlaceholder {
+                message_name: r.get(0)?, space: r.get(1)?, app_agent: r.get(2)?, app_email: r.get(3)?,
+                employee_id: r.get(4)?, session_id: r.get(5)?, thread_name: r.get(6)?, created_at: r.get(7)?,
+            }))?;
+            rows.collect()
+        })
     }
 
     pub(crate) fn prune(&self, now: i64) -> Result<(), String> {
@@ -162,6 +244,28 @@ fn prepare_private(path: &Path, create: bool) -> Result<(), String> {
 #[cfg(all(test, unix))]
 mod googlechat_inbox_tests {
     use super::*;
+    #[test]
+    fn placeholders_survive_reopen_and_retire_without_changing_inbound_dedupe() {
+        let home = tempfile::tempdir().unwrap();
+        let row = PendingPlaceholder {
+            message_name: "spaces/A/messages/status".into(), space: "spaces/A".into(),
+            app_agent: Some("sales".into()), app_email: "sales@test.invalid".into(), employee_id: "sales".into(),
+            session_id: "googlechat:spaces/A:sales".into(), thread_name: Some("spaces/A/threads/T".into()),
+            created_at: chrono::Utc::now().timestamp() - 10,
+        };
+        let store = Inbox::open(home.path()).unwrap();
+        store.insert_placeholder(&row).unwrap();
+        store.persist("app", "MESSAGE:spaces/A/messages/inbound", "reference").unwrap();
+        store.transition("app", "MESSAGE:spaces/A/messages/inbound", "pending", "running").unwrap();
+        drop(store);
+        let store = Inbox::open(home.path()).unwrap();
+        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap(), vec![row.clone()]);
+        store.remove_placeholder(&row.message_name).unwrap();
+        assert!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap().is_empty());
+        assert!(store.diagnostic("app").unwrap().is_some());
+        assert_eq!(store.persist("app", "MESSAGE:spaces/A/messages/inbound", "reference").unwrap(), Admission::Duplicate);
+    }
+
     #[test]
     fn recovery_replays_queued_but_never_uncertain_resource() {
         let home = tempfile::tempdir().unwrap();

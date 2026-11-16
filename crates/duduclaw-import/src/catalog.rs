@@ -49,12 +49,13 @@ const MAX_REPORTED: usize = 16;
 
 /// A legacy store with more than one accepted schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Store { Sessions, Tasks, Cron, Memory, Approvals }
+pub enum Store { Sessions, Tasks, Cron, Memory, Approvals, GoogleChatInbox }
 impl Store {
     pub fn file_name(self) -> &'static str {
         match self {
             Self::Sessions => "sessions.db", Self::Tasks => "tasks.db", Self::Cron => "cron_tasks.db",
             Self::Memory => "memory.db", Self::Approvals => "approvals.db",
+            Self::GoogleChatInbox => "googlechat_inbox.db",
         }
     }
 }
@@ -112,10 +113,18 @@ static MEMORY: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, MEMORY_V1793),
 // column; the reader never authorizes it, so it maps as V180.
 static APPROVALS: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V1793), Catalog::new(SchemaVersion::V180, APPROVALS_V180),
     Catalog { version: SchemaVersion::V180, sql: APPROVALS_V181, label: "v1.81" }];
+// Recovery state is fingerprinted for schema inventory, never imported or replayed.
+const GOOGLECHAT_INBOX_V182: &str = include_str!("googlechat-inbox-v182.sql");
+const GOOGLECHAT_INBOX_V183: &str = concat!(include_str!("googlechat-inbox-v182.sql"), include_str!("googlechat-placeholders-v183.sql"));
+static GOOGLECHAT_INBOX: [Catalog; 2] = [
+    Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V182, label: "v1.82" },
+    Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V183, label: "v1.83" },
+];
 fn catalogs(store: Store) -> &'static [Catalog] {
     match store {
         Store::Sessions => &SESSIONS, Store::Tasks => &TASKS, Store::Cron => &CRON,
         Store::Memory => &MEMORY, Store::Approvals => &APPROVALS,
+        Store::GoogleChatInbox => &GOOGLECHAT_INBOX,
     }
 }
 

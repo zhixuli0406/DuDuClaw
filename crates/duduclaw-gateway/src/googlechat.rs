@@ -773,10 +773,40 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         return;
     }
 
-    // ── Placeholder message (Chat has no typing API) ──
-    let placeholder = Arc::new(tokio::sync::Mutex::new(
-        create_message(&state.creds, &space, thread.as_deref(), "🤔 思考中…").await,
-    ));
+    // Resolve the durable identity before creating any visible placeholder.
+    let session_id = format!("googlechat:{space}");
+    let reply_session = match &state.agent {
+        Some(agent) => crate::trigger_route::called_session(&session_id, agent),
+        None => session_id.clone(),
+    };
+    let employee_id = match &state.agent {
+        Some(agent) => agent.clone(),
+        None => state.ctx.registry.read().await.main_agent()
+            .map(|a| a.config.agent.name.clone()).unwrap_or_default(),
+    };
+    // Fail closed: never create a placeholder when recovery cannot be persisted.
+    let store = match crate::googlechat_inbox::Inbox::shared(&state.ctx.home_dir) {
+        Ok(store) => store,
+        Err(_) => { warn!(failed = 1, "Google Chat placeholder store unavailable"); return; }
+    };
+    let name = create_message(&state.creds, &space, thread.as_deref(), "🤔 思考中…").await;
+    let registration = if let Some(name) = name.as_ref() {
+        let row = crate::googlechat_inbox::PendingPlaceholder {
+            message_name: name.clone(), space: space.clone(), app_agent: state.agent.clone(),
+            app_email: state.creds.client_email().to_owned(), employee_id,
+            session_id: reply_session.clone(), thread_name: thread.clone(),
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        match crate::googlechat_inbox::PlaceholderRegistration::new(store, &row) {
+            Ok(registration) => Some(registration),
+            Err(_) => {
+                delete_placeholder(&state.creds, name).await;
+                warn!(failed = 1, "Google Chat placeholder persistence failed");
+                return;
+            }
+        }
+    } else { None };
+    let placeholder = Arc::new(tokio::sync::Mutex::new(name));
 
     // ── Progress: PATCH the placeholder in place ──
     let progress_state = state.clone();
@@ -821,14 +851,6 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     });
 
     // ── Chat commands ──
-    // Future thread segmentation must require threadReply == true: every main-view DM message gets a fresh thread.
-    let session_id = format!("googlechat:{space}");
-    // An employee's own app answers in the employee's own bucket of the space
-    // (two employees' apps can share one space).
-    let reply_session = match &state.agent {
-        Some(agent) => crate::trigger_route::called_session(&session_id, agent),
-        None => session_id.clone(),
-    };
     let delivery_target = DeliveryTarget {
         home: &state.ctx.home_dir,
         space: &space,
@@ -889,6 +911,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                 &space,
                 thread.as_deref(),
                 &placeholder,
+                registration.as_ref(),
                 &reply,
                 None,
             ).await);
@@ -950,6 +973,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
             &space,
             thread.as_deref(),
             &placeholder,
+            registration.as_ref(),
             crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
             None,
         ).await);
@@ -981,9 +1005,10 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
             if let Some(name) = placeholder.lock().await.take() {
                 delete_placeholder(&state.creds, &name).await;
             }
+            if let Some(registration) = registration.as_ref() { registration.retire(); }
         } else {
             report_delivery(delivery_target, deliver_reply(&state.creds, &space, thread.as_deref(),
-                &placeholder, "⚠️ 沒有產生回覆，請再試一次。", None).await);
+                &placeholder, registration.as_ref(), "⚠️ 沒有產生回覆，請再試一次。", None).await);
         }
         return;
     }
@@ -998,6 +1023,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         &space,
         thread.as_deref(),
         &placeholder,
+        registration.as_ref(),
         &reply,
         Some(&guarded),
     )).await);
@@ -1052,6 +1078,7 @@ async fn deliver_reply(
     space: &str,
     thread: Option<&str>,
     placeholder: &Placeholder,
+    registration: Option<&crate::googlechat_inbox::PlaceholderRegistration>,
     reply_markdown: &str,
     guarded: Option<&crate::channel_reply::GuardedReply>,
 ) -> Result<(), Option<u16>> {
@@ -1060,6 +1087,7 @@ async fn deliver_reply(
     let placeholder = placeholder.lock().await.take();
     if reply_markdown.trim().is_empty() {
         if let Some(name) = placeholder.as_deref() { delete_placeholder(creds, name).await; }
+        if let Some(registration) = registration { registration.retire(); }
         return Ok(());
     }
     let formatted = crate::markdown_render::to_googlechat_text(reply_markdown);
@@ -1077,6 +1105,7 @@ async fn deliver_reply(
             } else {
                 post_message(creds, space, thread, refusal).await.map(|_| ())
             };
+            if index == 0 { if let Some(registration) = registration { registration.retire(); } }
             if let Err(status) = result {
                 warn!(?status, "Google Chat refusal delivery failed");
                 return Err(status);
@@ -1102,6 +1131,7 @@ async fn deliver_reply(
         } else {
             post_message(creds, space, thread, chunk).await
         };
+        if index == 0 { if let Some(registration) = registration { registration.retire(); } }
         match result {
             Ok(id) => crate::channel_reply::group_buffer::delivered(chunk, id.as_deref()).await,
             Err(status) => {
@@ -1111,12 +1141,13 @@ async fn deliver_reply(
             }
         }
     }
+    if let Some(registration) = registration { registration.retire(); }
     match failure { Some(status) => Err(status), None => Ok(()) }
 }
 
 #[derive(Debug, Clone)]
-struct PatchFailure {
-    status: Option<u16>,
+pub(crate) struct PatchFailure {
+    pub(crate) status: Option<u16>,
     retry_after: std::time::Duration,
 }
 
@@ -1493,7 +1524,7 @@ async fn download_media(creds: &GoogleChatCreds, resource_name: &str) -> Result<
 }
 
 /// spaces.messages.patch — edit a message's text in place.
-async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str) -> Result<(), PatchFailure> {
+pub(crate) async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str) -> Result<(), PatchFailure> {
     let token = creds.get_token().await.map_err(|_| PatchFailure {
         status: None, retry_after: std::time::Duration::from_secs(1),
     })?;
@@ -2079,5 +2110,48 @@ mod delivery_display_tests {
         assert_eq!(patch_backoff(429, Some("2")).as_secs(), 2);
         assert_eq!(patch_backoff(429, Some("invalid")).as_secs(), 1);
         assert_eq!(patch_backoff(503, Some("60")).as_secs(), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod placeholder_lifecycle_tests {
+    use super::*;
+    use crate::agent_channels::{e2e_gchat_tests as chat, e2e_tests, e2e_seam};
+    use crate::googlechat_inbox::{Inbox, PendingPlaceholder, PlaceholderRegistration};
+
+    #[tokio::test]
+    async fn lost_guard_retires_placeholder_at_delivery_and_cancellation_preserves_it() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = chat::start_fake().await;
+        let email = format!("guard-{}@test.invalid", uuid::Uuid::new_v4().simple());
+        let sa = chat::service_account(&fake, &email);
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "sales", "", "specialist",
+            &chat::googlechat_section(home.path(), "444444443", &sa));
+        let ctx = e2e_tests::reply_ctx(home.path()).await;
+        e2e_seam::arm(home.path());
+        let creds = crate::googlechat_agents::agent_creds(home.path(), "sales").await.unwrap();
+        let store = Inbox::shared(home.path()).unwrap();
+        let name = create_message(&creds, "spaces/GUARD", None, "🤔 思考中…").await.unwrap();
+        let row = PendingPlaceholder {
+            message_name: name.clone(), space: "spaces/GUARD".into(), app_agent: Some("sales".into()),
+            app_email: email.clone(), employee_id: "sales".into(), session_id: "googlechat:spaces/GUARD".into(),
+            thread_name: None, created_at: chrono::Utc::now().timestamp() - 10,
+        };
+        let registration = PlaceholderRegistration::new(store.clone(), &row).unwrap();
+        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap(), vec![row.clone()]);
+        let guarded = crate::channel_reply::build_guarded_reply_for_agent(
+            "hello", &ctx, "sales", &row.session_id, "users/42", None).await;
+        guarded.refuse_delivery();
+        let placeholder = Arc::new(tokio::sync::Mutex::new(Some(name)));
+        deliver_reply(&creds, &row.space, None, &placeholder, Some(&registration), "SECRET ANSWER", Some(&guarded)).await.unwrap();
+        // Retirement happens inside delivery, before registration itself is dropped.
+        assert!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap().is_empty());
+        let text = chat::texts_with_bearer(&fake, &format!("Bearer tok-{email}")).join("\n");
+        assert!(text.contains(crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT));
+        assert!(!text.contains("SECRET ANSWER"));
+        drop(registration);
+        let cancelled = PlaceholderRegistration::new(store.clone(), &row).unwrap();
+        drop(cancelled);
+        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap(), vec![row]);
     }
 }

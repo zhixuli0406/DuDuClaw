@@ -139,3 +139,12 @@ mod tests {
         assert_eq!(lang_for(t.path()), Lang::En);
     }
 }
+
+/// Only used to edit an existing Google Chat placeholder after a restart.
+pub fn googlechat_interrupted(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhTw => "這次回覆中斷了，請再傳一次。",
+        Lang::En => "This reply was interrupted. Please send your message again.",
+        Lang::Ja => "返信が中断されました。もう一度メッセージを送ってください。",
+    }
+}
