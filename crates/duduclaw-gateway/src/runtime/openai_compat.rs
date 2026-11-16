@@ -1194,7 +1194,7 @@ impl OpenAiCompatRuntime {
 #[cfg(test)]
 mod tests {
     #[tokio::test(start_paused = true)]
-    async fn sse_terminal_then_open_silent_connection_returns_completed_answer() {
+    async fn sse_stop_then_open_silent_connection_returns_completed_answer() {
         for seconds_left in [60, 1] {
             let frame = b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec();
             let stream = futures_util::stream::iter([Ok::<_, reqwest::Error>(frame)])
@@ -1212,7 +1212,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn sse_terminal_grace_records_trailing_usage_and_done() {
+    async fn sse_stop_grace_records_trailing_usage_and_done() {
         let terminal = b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec();
         let stream = futures_util::stream::iter([Ok::<_, reqwest::Error>(terminal)])
             .chain(futures_util::stream::once(async {
@@ -1227,6 +1227,36 @@ mod tests {
         assert_eq!(response.content, "answer");
         assert_eq!((response.input_tokens, response.output_tokens), (11, 7));
         assert_eq!(tokio::time::Instant::now() - started, std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sse_non_stop_finish_reasons_wait_for_done_or_total_timeout() {
+        for finish_reason in ["tool_calls", "length"] {
+            let frame = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"answer\"}},\"finish_reason\":\"{finish_reason}\"}}]}}\n\n"
+            ).into_bytes();
+            let stream = futures_util::stream::iter([Ok::<_, reqwest::Error>(frame)])
+                .chain(futures_util::stream::pending());
+            let context = tool_ctx("", "test-model");
+            let started = tokio::time::Instant::now();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5),
+                OpenAiCompatRuntime::collect_sse(stream, &context,
+                    started + std::time::Duration::from_secs(5)),
+            ).await.expect_err("non-stop finish reason must not end the stream early");
+            assert_eq!(response.into_inner(), "elapsed");
+            assert_eq!(tokio::time::Instant::now() - started, std::time::Duration::from_secs(5));
+
+            let frame = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"answer\"}},\"finish_reason\":\"{finish_reason}\"}}]}}\n\n"
+            ).into_bytes();
+            let stream = futures_util::stream::iter([
+                Ok::<_, reqwest::Error>(frame),
+                Ok(b"data: [DONE]\n\n".to_vec()),
+            ]);
+            let response = OpenAiCompatRuntime::collect_sse(stream, &context,
+                started + std::time::Duration::from_secs(60)).await.unwrap();
+            assert_eq!(response.content, "answer");
+        }
     }
 
     #[test]

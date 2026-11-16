@@ -146,8 +146,7 @@ impl IdleWatch {
         let Some(choices) = event.get("choices").and_then(|v| v.as_array()) else { return; };
         let mut progress = false;
         for choice in choices {
-            if matches!(choice.get("finish_reason").and_then(|v| v.as_str()),
-                Some("stop" | "length" | "tool_calls" | "content_filter" | "function_call")) {
+            if choice.get("finish_reason").and_then(|v| v.as_str()) == Some("stop") {
                 self.terminal = true;
             }
             if let Some(delta) = choice.get("delta") {
