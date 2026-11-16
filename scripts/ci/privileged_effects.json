@@ -7241,6 +7241,44 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Root acceptance fixture forks the trampoline serve child for in-run helper scenarios; root-test-fixture feature is required and release builds are forbidden. Not a shipped spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/mcp_start.rs::probe_entry",
+      "apis": {
+        "platform_command_factory": 1,
+        "backend_spawn_class": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Admin install probe uses the real employee spawn gate, rewritten per-spawn identity, ThirdPartyMcp classification and BackendChild cleanup."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/third_party_mcp_tests.rs::exchange",
+      "apis": {
+        "platform_command_factory": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Rust-only regression launches the exact Claude-prepared proxy entry with a cleared environment; includes the missing-token negative control."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/third_party_mcp_tests.rs::isolated_spawn_regression",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Runs the real-proxy regression in its own filtered test process so the binary resolver override cannot affect parallel unit tests."
     }
   ]
 }

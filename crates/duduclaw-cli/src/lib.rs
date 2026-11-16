@@ -15772,3 +15772,6 @@ if [ -t 1 ]; then printf 'pty-probe-ok'; fi
     }
 }
 mod users_mfa_cmd;
+
+#[cfg(test)]
+mod third_party_mcp_tests;

@@ -618,6 +618,9 @@ pub(super) async fn spawn_claude_cli_with_env(
 
                         lines_seen += 1;
                         let parsed = serde_json::from_str::<serde_json::Value>(&line).ok();
+                        if let Some(event) = parsed.as_ref() {
+                            crate::mcp_start::observe_init(home_dir, &step_agent_id, event);
+                        }
 
                         // Keep only a truncated tail for diagnostics (full line
                         // can contain the user's prompt — we don't want it on disk).

@@ -24,9 +24,9 @@ impl MethodHandler {
                 };
                 let config = match read_mcp_config(&dir) {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(_) => duduclaw_agent::mcp_template::McpConfig { mcp_servers: Default::default() },
                 };
-                let servers: Vec<Value> = config
+                let mut servers: Vec<Value> = config
                     .mcp_servers
                     .iter()
                     .map(|(k, v)| {
@@ -38,9 +38,13 @@ impl MethodHandler {
                             "command": v.command,
                             "args": v.args,
                             "env": masked_env(&v.env),
+                            "source": "mcp_json",
+                            "effective_runtimes": ["claude", "codex", "grok", "in_process"],
+                            "last_start": crate::mcp_start::last(&self.home_dir, &name, k),
                         })
                     })
                     .collect();
+                servers.extend(agent_toml_servers(&dir));
                 agents.push(json!({
                     "agent_id": name,
                     "servers": servers,
@@ -82,7 +86,7 @@ impl MethodHandler {
         };
         let action = match params.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
-            None => return WsFrame::error_response("", "action is required (add/remove)"),
+            None => return WsFrame::error_response("", "action is required (add/edit/remove)"),
         };
         let server_name = match params.get("server_name").and_then(|v| v.as_str()) {
             Some(n) => n,
@@ -99,7 +103,7 @@ impl MethodHandler {
         }
 
         match action {
-            "add" => {
+            "add" | "edit" => {
                 let mut def: McpServerDef = match params.get("server_def") {
                     Some(v) => match serde_json::from_value(v.clone()) {
                         Ok(d) => d,
@@ -166,7 +170,10 @@ impl MethodHandler {
                 })
                 .await
                 {
-                    Ok(Ok(())) => WsFrame::ok_response("", json!({ "success": true })),
+                    Ok(Ok(())) => {
+                        let probe = crate::mcp_start::probe(&self.home_dir, agent_id, server_name).await;
+                        WsFrame::ok_response("", json!({ "success": true, "probe": probe }))
+                    },
                     Ok(Err(e)) => WsFrame::error_response("", &e),
                     Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
                 }
@@ -220,7 +227,7 @@ impl MethodHandler {
             }
             _ => WsFrame::error_response(
                 "",
-                &format!("Unknown action: {action}. Use 'add' or 'remove'"),
+                &format!("Unknown action: {action}. Use 'add', 'edit' or 'remove'"),
             ),
         }
     }
@@ -291,4 +298,20 @@ mod masked_env_tests {
             [("K".to_string(), "set".to_string())].into_iter().collect();
         assert!(resolve_masked_env(&mut env, None).is_err());
     }
+}
+
+/// Read-only metadata: credentials and headers never enter the RPC payload.
+fn agent_toml_servers(dir: &std::path::Path) -> Vec<Value> {
+    let Ok(raw) = duduclaw_core::agent_toml::read_effective_text(dir) else { return Vec::new(); };
+    let Ok(value) = raw.parse::<toml::Value>() else { return Vec::new(); };
+    value.get("mcp").and_then(|m| m.get("external")).and_then(toml::Value::as_array)
+        .into_iter().flatten().enumerate().map(|(index, entry)| {
+            let name = entry.get("name").and_then(toml::Value::as_str)
+                .or_else(|| entry.get("preset").and_then(toml::Value::as_str))
+                .map(str::to_string).unwrap_or_else(|| format!("external-{}", index + 1));
+            json!({"name":name, "command":entry.get("command").and_then(toml::Value::as_str).unwrap_or(""),
+                "args":[], "env":{}, "source":"agent_toml", "read_only":true,
+                "effective_runtimes":["in_process"],
+                "enabled":entry.get("enabled").and_then(toml::Value::as_bool).unwrap_or(true)})
+        }).collect()
 }

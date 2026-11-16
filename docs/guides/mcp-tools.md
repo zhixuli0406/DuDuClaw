@@ -12,6 +12,46 @@ declaration surface, not the implementation. To run the server on its own,
 without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
 
+## Configuration scope and startup results
+
+| Configuration | Runtimes that read it | Dashboard |
+|---|---|---|
+| Employee `.mcp.json` | Claude, Codex, Grok and the in-process tool loop (OpenAI-compatible, direct API, local inference) | Editable by administrators; `source: "mcp_json"` |
+| Employee `agent.toml`, `[[mcp.external]]` | In-process tool loop only | Read-only; `source: "agent_toml"` |
+
+Claude, Codex and Grok do not load `[[mcp.external]]`. The MCP page shows
+“Used by” for each entry; `mcp.list` exposes `effective_runtimes` (`claude`,
+`codex`, `grok`, `in_process`). These are configuration capabilities, not proof
+that a server connected. Disabled TOML entries stay disabled. No automatic
+migration or credential transfer occurs between formats. When both formats
+register the same server, the in-process loop prefers its TOML mount.
+
+Adding or editing a stdio entry through the administrator-only `mcp.update`
+RPC saves it, then performs a start probe through the same spawn gate and
+identity-bearing temporary proxy configuration as a real run. The probe sends
+`initialize` and `tools/list`, with a 10-second deadline and process cleanup on
+completion or timeout. It never calls an upstream tool. The response includes
+`probe: {ok, tool_count, reason_code}`; the dashboard displays it after saving.
+A failed probe leaves the entry saved, so an administrator can supply missing
+credentials and retry. Success confirms startup and visible tool discovery,
+not permission to call every tool or remote-service health.
+
+A proxy startup refusal retains the existing fail-closed identity checks. It
+appends one bounded, sanitised `mcp_start` record to
+`<DUDUCLAW_HOME>/channel_failures.jsonl` under a cross-process lock and answers
+the first JSON-RPC request with error `-32001`, a fixed message, and
+`error.data.reason_code`. `identity_rejected` covers the identity verifier's
+rejected verdict, including absent/invalid credentials or unreadable policy
+or key; diagnostics do not re-run verification to guess a narrower cause.
+Tokens, environment values and upstream arguments are not recorded.
+
+For Claude chat and background runs, disconnected servers in `system/init`
+produce a gateway WARN and an anomaly record without failing the turn. The
+MCP page shows the last known result, translated reason and timestamp through
+optional `mcp.list` `last_start` fields. Unknown results remain unknown; the
+in-gateway cache is bounded and disposable, and recent proxy refusal records
+can supply diagnostics after a restart. This is not continuous health monitoring.
+
 ## MCP client protocol versions
 
 The API/openai-compat client and remote MCP bridge prefer **2026-07-28**. They

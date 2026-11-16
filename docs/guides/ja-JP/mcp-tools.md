@@ -8,6 +8,42 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 ツールを追加する場合は先に [custom-mcp-tool.md](../custom-mcp-tool.md) を読んでください。このページは実装ではなく宣言面の話です。gateway なしで MCP サーバーだけを使う場合は [mcp-standalone.md](mcp-standalone.md) を参照してください。
 
 
+## 設定の適用範囲と起動結果
+
+| 設定 | 読み取るランタイム | ダッシュボード |
+|---|---|---|
+| 従業員の `.mcp.json` | Claude、Codex、Grok、プロセス内ツールループ（OpenAI 互換、Direct API、ローカル推論） | 管理者が編集可能。`source: "mcp_json"` |
+| 従業員の `agent.toml` の `[[mcp.external]]` | プロセス内ツールループのみ | 読み取り専用。`source: "agent_toml"` |
+
+Claude・Codex・Grok は `[[mcp.external]]` を読み取りません。MCP ページは各項目の
+使用先を表示し、`mcp.list` は `effective_runtimes` に `claude`、`codex`、`grok`、
+`in_process` を返します。これは設定の適用範囲であり、接続成功の保証ではありません。
+無効な TOML 項目は無効のままです。形式間の自動移行や認証情報の転送は行いません。
+両方に同じサーバーがある場合、プロセス内ループは TOML の登録を優先します。
+
+管理者専用の `mcp.update` で stdio 項目を追加・編集すると、保存後に実際の起動と
+同じ spawn gate、従業員の認証情報を付けた一時 proxy 設定を使って起動確認します。
+`initialize` と `tools/list` を送り、期限は 10 秒です。完了時もタイムアウト時も
+プロセスを終了し、上流ツールは呼び出しません。応答の
+`probe: {ok, tool_count, reason_code}` を保存後に画面へ表示します。
+確認に失敗しても設定は保存されるため、管理者は認証情報を補って再試行できます。
+成功は起動と表示可能なツールの取得だけを確認し、全ツールの呼び出し権限や
+リモートサービスの正常性は保証しません。従業員はこの RPC を利用できません。
+
+proxy の起動拒否でも既存の認証判定と fail-closed 動作を維持します。
+`<DUDUCLAW_HOME>/channel_failures.jsonl` に、長さを制限し安全な文字に整えた
+`mcp_start` レコードをプロセス間ロック付きで 1 件記録します。最初の JSON-RPC
+リクエストには `-32001`、固定メッセージ、`error.data.reason_code` を返します。
+`identity_rejected` は認証器の拒否判定を表し、認証情報の欠落・不正、ポリシーや
+鍵の読み取り失敗などを含みます。診断のための再認証で詳細な原因を推測しません。
+トークン、環境変数の値、上流コマンドの引数は記録しません。
+
+Claude のチャット・バックグラウンド実行では、`system/init` の未接続サーバーごとに
+WARN と異常記録を残し、ターンは継続します。MCP ページは `mcp.list` の任意フィールド
+`last_start` から最後の既知の結果、翻訳した理由、時刻を表示します。不明な状態を
+推測しません。gateway 内のメモリーキャッシュは容量制限付きで破棄可能です。
+再起動後は最近の proxy 拒否記録から診断を取得する場合があります。常時監視ではありません。
+
 ## MCP クライアントのプロトコルバージョン
 
 API／openai-compat クライアントとリモート MCP bridge は **2026-07-28** を優先します。

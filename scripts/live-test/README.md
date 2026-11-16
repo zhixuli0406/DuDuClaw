@@ -6,6 +6,7 @@ production home (`~/.duduclaw`).
 | Script | What it does |
 |---|---|
 | `tui-control-room.sh [port]` | Requires Node 22+ and `DUDUCLAW_BIN` pointing to a built executable. Creates an isolated home with `make-home.sh`, starts a real loopback gateway (default port 18979), logs in with a local account JWT, checks `autonomy.pause` / `autonomy.resume` via the same `/ws` RPC shapes as the TUI and reads back `autonomy.status`. Runs the real `tui inbox --json`, checks freshness, stops its own gateway and retains artifacts. Run from an operator shell: AI-session markers are not removed. This implementation was not live-run in the restricted sandbox. |
+| `third-party-mcp.sh [port]` | Requires Node 22+, `lsof`, `DUDUCLAW_BIN` and `MCP_FIXTURE_BIN` (the Rust `third_party_mcp_fixture` example). Creates its own isolated home and loopback gateway (default 18983), installs a Rust stdio fixture, checks the install probe, then checks real chat and cron preparation with a local Claude shim. Both runs verify initialize/tools/list and the missing-token negative control. No model or external MCP service is used. Stops its own gateway and retains sanitised results and gateway logs. Not live-run during implementation. |
 | `make-home.sh <target-dir> [--port N]` | Creates an isolated DuDuClaw home: loopback `config.toml` (default port 18977) and two employees. `plain` has no tool allowlist (the old kind of test employee). `prod-shaped` is written like a production employee: `[capabilities] allowed_tools = ["mcp__duduclaw__*", "Read", "Write", "Edit", "Bash"]`, a `denied_tools` entry, `approval_required_tools`, all four `[permissions]` flags, `[budget]`, `[evolution] gvu_enabled = true`, a `CONTRACT.toml` and a `SOUL.md`. Refuses a non-empty target and any target inside `~/.duduclaw`. Writes no secrets. |
 | `mcp-probe.sh <home> <agent-id> [tool ...]` | Starts the real `duduclaw mcp-server` for that employee from the command and env in its own `.mcp.json`, sends `initialize`, `tools/list` and one `tools/call` per tool (default: `tasks_list`, `memory_search`, `working_state_get`, `user_profile_get`), and prints `ok`, `REFUSED: ...` or `ERROR: ...` per call. Exits 1 when a default check fails for `prod-shaped`. |
 | `google-delegated-identity.mjs` (historical, paused) | Do not run during the narrowed EXT follow-up; use the ordinary baseline below. Retained for the original evidence. Creates its own temporary home, starts a real gateway and stdio MCP servers, and exchanges signed RSA assertions with a loopback fake Google. Requires a debug build with `--features live-test-mocks` and Node 22+. Credential protection uses an in-memory store; no real keychain, model or Google account is touched. Checks shared-account compatibility, two delegated subjects, same-process account changes, domain refusal, unsigned and unproven callers, provider rejection, explicit fallback, `none`, the master switch, audit redaction and offline gateway refusal. Artifacts remain in the printed temporary folder. |
@@ -147,3 +148,28 @@ mock credential store uses one home path.
 node --test scripts/live-test/google-connectors-harness.test.mjs
 node scripts/live-test/google-connectors-baseline.mjs /path/to/mock-debug-binary
 ```
+
+## Third-party stdio MCP regression
+
+Build the CLI and Rust fixture in the reviewer tree, then run:
+
+```bash
+cargo build -p duduclaw-cli --bin duduclaw --example third_party_mcp_fixture
+DUDUCLAW_BIN="$PWD/target/debug/duduclaw" \
+MCP_FIXTURE_BIN="$PWD/target/debug/examples/third_party_mcp_fixture" \
+scripts/live-test/third-party-mcp.sh 18983
+```
+
+`results.jsonl` must contain successful `chat` and `cron` rows, including
+`missing_token_refused: true`. The fixture never writes the temporary MCP
+configuration or its tokens to artifacts. Negative controls deliberately add
+`identity_rejected` records to the isolated `channel_failures.jsonl`.
+The test uses a local Claude shim; real vendor CLI behavior and native protected
+execution still require separate acceptance. Run from an operator test shell.
+No production home, account, model endpoint or external MCP endpoint is used.
+
+For the Rust regression, set `DUDUCLAW_P1_PILOT_BINARY` to the built CLI and
+select `third_party_mcp_tests::isolated_spawn_regression` in the
+`duduclaw-cli` library tests. It runs the full regression in a separate test
+process (including Rust stdio children); without a binary it prints an explicit
+SKIP. Its process helpers are registered in `scripts/ci/privileged_effects.json`.

@@ -169,3 +169,51 @@ async fn manifest_import_install_stores_only_env_references() {
     let doc: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(doc["mcpServers"]["example"]["env"]["LOG_LEVEL"], "info");
 }
+
+#[tokio::test]
+async fn mcp_list_includes_both_sources_and_keeps_toml_credentials_private() {
+    let home = tempfile::tempdir().unwrap();
+    let h = handler_with_agent(home.path()).await;
+    let dir = home.path().join("agents/alice");
+    std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{"local":{"command":"fixture","args":[],"env":{}}}}"#).unwrap();
+    std::fs::write(dir.join("agent.toml"), "[[mcp.external]]\nname = 'api-only'\ncommand = 'fixture'\nbearer_token = 'do-not-disclose'\nenv = { KEY = 'also-secret' }\n").unwrap();
+    let list = payload(h.handle_mcp_list().await);
+    let servers = list["agents"][0]["servers"].as_array().unwrap();
+    let local = servers.iter().find(|v| v["source"] == "mcp_json").unwrap();
+    assert_eq!(local["effective_runtimes"], json!(["claude", "codex", "grok", "in_process"]));
+    let external = servers.iter().find(|v| v["source"] == "agent_toml").unwrap();
+    assert_eq!(external["read_only"], true);
+    assert_eq!(external["effective_runtimes"], json!(["in_process"]));
+    assert!(!list.to_string().contains("do-not-disclose"));
+    assert!(!list.to_string().contains("also-secret"));
+}
+
+#[tokio::test]
+async fn mcp_update_probe_is_admin_only() {
+    use duduclaw_auth::{UserContext, models::UserRole};
+    let home = tempfile::tempdir().unwrap();
+    let h = handler_with_agent(home.path()).await;
+    let employee = UserContext { credential_epoch:0, user_id:"employee".into(), email:"employee@example.invalid".into(),
+        role:UserRole::Employee, agent_access:Default::default(), must_change_password:false,
+        team_access:Default::default(), acl_generation:0 };
+    for action in ["add", "edit"] {
+        let frame = Box::pin(h.handle("mcp.update", json!({"agent_id":"alice","action":action,
+            "server_name":"fixture","server_def":{"command":"fixture","args":[],"env":{}}}), &employee)).await;
+        assert!(!error_text(frame).is_empty());
+    }
+    assert!(!home.path().join("agents/alice/.mcp.json").exists());
+}
+
+#[tokio::test]
+async fn mcp_update_keeps_saved_entry_when_probe_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let h = handler_with_agent(home.path()).await;
+    for action in ["add", "edit"] {
+        let result = payload(h.handle_mcp_update(&json!({"agent_id":"alice", "action":action,
+            "server_name":"missing", "server_def":{"command":"/nonexistent/mcp-fixture", "args":[],"env":{}}})).await);
+        assert_eq!(result["success"], true);
+        assert_eq!(result["probe"]["ok"], false);
+        assert!(result["probe"]["reason_code"].is_string());
+        assert!(duduclaw_agent::mcp_template::read_mcp_config(&home.path().join("agents/alice")).unwrap().mcp_servers.contains_key("missing"));
+    }
+}

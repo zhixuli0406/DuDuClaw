@@ -2,6 +2,37 @@
 
 DuDuClaw 可以把第三方 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器掛載在自己內建的 MCP server 旁邊，讓 agent 的工具迴圈直接拿到外部伺服器的工具，不必手刻一支 Rust 連接器。Plane、Chatwoot、Invoice Ninja、Gmail/Calendar、WooCommerce，以及其他任何 MCP server，都是這樣接進 agent 的。
 
+## 設定生效範圍與啟動結果
+
+| 設定 | 讀取它的執行環境 | 儀表板 |
+|---|---|---|
+| 員工的 `.mcp.json` | Claude、Codex、Grok，以及內建工具迴圈（OpenAI 相容、Direct API、本機推論） | 管理員可編輯；`source: "mcp_json"` |
+| 員工 `agent.toml` 的 `[[mcp.external]]` | 僅內建工具迴圈 | 唯讀；`source: "agent_toml"` |
+
+Claude、Codex、Grok 不讀取 `[[mcp.external]]`。MCP 頁面會在每筆項目顯示適用環境；
+`mcp.list` 以 `effective_runtimes` 回傳 `claude`、`codex`、`grok`、`in_process`。
+這表示設定的適用範圍，不保證已連線。停用的 TOML 項目仍維持停用；兩種格式之間不會
+自動搬移設定或憑證。同一伺服器出現在兩種格式時，內建工具迴圈優先使用 TOML 項目。
+
+管理員透過 `mcp.update` 新增或編輯 stdio 項目後，系統先儲存，再透過與實際啟動相同的
+spawn gate、暫存 proxy 設定與員工身分執行啟動檢查。檢查會送出 `initialize` 與
+`tools/list`，期限為 10 秒，完成或逾時都會清理程序，不呼叫上游工具。
+回應包含 `probe: {ok, tool_count, reason_code}`，儀表板會在儲存後顯示結果。
+檢查失敗仍保留設定，讓管理員補上憑證後重試。成功只代表能啟動並列出可見工具，
+不代表每個工具都能呼叫，也不代表遠端服務運作正常。員工無法使用這個安裝 RPC。
+
+proxy 拒絕啟動時，身分驗證仍維持拒絕優先，不提供替代身分。系統會以跨程序鎖在
+`<DUDUCLAW_HOME>/channel_failures.jsonl` 寫入一筆經過長度限制與清理的 `mcp_start`
+紀錄，並對第一個 JSON-RPC 請求回傳 `-32001`、固定短訊息與
+`error.data.reason_code`。`identity_rejected` 表示既有驗證器拒絕，涵蓋缺少或無效的
+憑證、無法讀取政策或金鑰等情況；診斷不會再次驗證來猜測更細的原因。
+紀錄不含權杖、環境變數值或上游指令參數。
+
+Claude 聊天與背景執行的 `system/init` 若回報伺服器未連線，gateway 會寫入 WARN
+及異常紀錄，繼續處理該回合。MCP 頁面透過 `mcp.list` 的選用欄位 `last_start`
+顯示最後已知結果、翻譯後的原因與時間。沒有結果時不推測狀態。gateway 的記憶體快取
+有容量限制，重啟後也可能從近期 proxy 拒絕紀錄取得診斷；這不是持續健康監控。
+
 ## 第三方工具檢查（v1.80.0 起）
 
 `[[mcp.external]]` 的 stdio 與 Streamable HTTP 掛載都採用與受管理 MCP 代理相同的 `ThirdPartyGate`，依工具宣告判定影響類別。伺服器的工具允許／拒絕清單仍會限縮工具，員工的名稱限制、動作規則與審批要求也會套用到清單與呼叫。annotations 只能將預設 Modify 提高為 Delete，唯讀宣稱即使搭配舊信任設定也不得降低風險；遭拒的工具不會提供給模型。

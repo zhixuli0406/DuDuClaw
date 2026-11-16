@@ -649,18 +649,7 @@ pub fn anomaly_record(
 /// gateway and Python adapters). Best-effort: returns the io result so the
 /// caller can log-and-continue; a failure here must never break a reply.
 pub fn append_anomaly(home_dir: &Path, record: &serde_json::Value) -> std::io::Result<()> {
-    let path = home_dir.join("channel_failures.jsonl");
-    let mut masked = record.clone();
-    duduclaw_security::credential_detect::mask_json(&mut masked);
-    let line = format!("{masked}\n");
-    duduclaw_core::with_file_lock(&path, || {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        f.write_all(line.as_bytes())
-    })
+    duduclaw_security::audit::append_anomaly(home_dir, record)
 }
 
 #[cfg(test)]
