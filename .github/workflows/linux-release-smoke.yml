@@ -33,6 +33,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
+      - name: Add swap (Linux)
+        # Release-mode rustc for duduclaw-gateway exceeds the 16 GB runner (SIGKILL).
+        # /mnt is the large ephemeral disk.
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /mnt/duduclaw-swap || sudo dd if=/dev/zero of=/mnt/duduclaw-swap bs=1M count=16384
+          sudo chmod 600 /mnt/duduclaw-swap && sudo mkswap /mnt/duduclaw-swap && sudo swapon /mnt/duduclaw-swap
+          free -h
+
       # Keep Linux setup/build steps identical to release.yml; enforced by
       # scripts/tests/test_ci_workflow.py. This is an advisory PR build only.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
