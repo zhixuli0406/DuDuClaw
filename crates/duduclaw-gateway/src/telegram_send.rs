@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 use crate::isolation_http::LiveRequest;
 
 const LIMIT: usize = crate::channel_format::limits::TELEGRAM_MESSAGE;
+// Bound synchronous parsing/rendering before the delivery chunk cap applies.
+const MAX_INPUT_BYTES: usize = 15 * LIMIT;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Format { MarkdownHtml, LegacyMarkdown, Plain }
@@ -265,17 +267,24 @@ async fn post(client: &reqwest::Client, api_base: &str, chat_id: &str, text: &st
     unreachable!()
 }
 
-/// Render, bound and deliver with independent entity/reply fallbacks.
+/// Bound, render and deliver with independent entity/reply fallbacks.
 pub(crate) async fn send(client: &reqwest::Client, api_base: &str, chat_id: &str,
     text: &str, format: Format, options: Options<'_>) -> Result<(), Failure> {
     let deadline = Instant::now() + Duration::from_secs(120);
+    send_until(client, api_base, chat_id, text, format, options, deadline).await
+}
+
+async fn send_until(client: &reqwest::Client, api_base: &str, chat_id: &str,
+    text: &str, format: Format, options: Options<'_>, deadline: Instant) -> Result<(), Failure> {
+    let bounded = duduclaw_core::truncate_bytes(text, MAX_INPUT_BYTES);
+    let truncated = bounded.len() < text.len();
     let mut delivered = 0;
     let mut total = 0;
     let mut language = None;
     let delivery = async {
         language = crate::prompt_identity::read_default_language(options.home).await;
-        let mut chunks = chunks(text, format, options.literal_prefix);
-        if chunks.len() > crate::channel_format::limits::DELIVERY_CHUNKS {
+        let mut chunks = chunks(bounded, format, options.literal_prefix);
+        if truncated || chunks.len() > crate::channel_format::limits::DELIVERY_CHUNKS {
             chunks.truncate(crate::channel_format::limits::DELIVERY_CHUNKS - 1);
             let notice = delivery_notice(language.as_deref(), false).to_owned();
             chunks.push(Chunk { text: notice.clone(), plain: notice, mode: None });
@@ -313,7 +322,8 @@ pub(crate) async fn send(client: &reqwest::Client, api_base: &str, chat_id: &str
         if let Err(e) = crate::trajectory_guard::append_anomaly(options.home, &record) {
             tracing::warn!(error = %e, "telegram: failure record could not be written");
         }
-        if error.delivered_chunks > 0 && PARTIAL.try_with(|partial| !partial.replace(true)).unwrap_or(false) {
+        if error.delivered_chunks > 0 && PARTIAL.try_with(|partial| !partial.replace(true)).unwrap_or(false)
+            && !is_public_visitor(chat_id) {
             // This notice shares the delivery budget and never retries the body.
             let _ = post(client, api_base, chat_id, delivery_notice(language.as_deref(), true), None,
                 &options, None, None, deadline, None).await;
@@ -321,6 +331,10 @@ pub(crate) async fn send(client: &reqwest::Client, api_base: &str, chat_id: &str
         return Err(error);
     }
     Ok(())
+}
+
+fn is_public_visitor(chat_id: &str) -> bool {
+    chat_id.starts_with("odoolivechat:")
 }
 
 fn cron_notice(name: &str, language: Option<&str>) -> String {
@@ -335,15 +349,18 @@ fn cron_notice(name: &str, language: Option<&str>) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_cron(client: &reqwest::Client, api_base: &str, chat_id: &str,
     text: &str, name: &str, id: &str, home: &Path) -> Result<(), Failure> {
+    let deadline = Instant::now() + Duration::from_secs(120);
     let prefix = format!("⏰ [{name}] ");
     let mut options = Options::new(home, "cron", id);
     options.literal_prefix = Some(&prefix);
-    let result = send(client, api_base, chat_id, text, Format::MarkdownHtml, options).await;
-    if result.as_ref().err().is_some_and(|e| e.content) && !chat_id.starts_with("odoolivechat:") {
+    let result = send_until(client, api_base, chat_id, text, Format::MarkdownHtml, options, deadline).await;
+    if result.as_ref().err().is_some_and(|e| e.content) && !is_public_visitor(chat_id) {
         let name = duduclaw_core::plain_line(name, 120);
-        let language = crate::prompt_identity::read_default_language(home).await;
+        let language = tokio::time::timeout_at(deadline, crate::prompt_identity::read_default_language(home))
+            .await.unwrap_or(None);
         let notice = cron_notice(&name, language.as_deref());
-        let _ = send(client, api_base, chat_id, &notice, Format::Plain, Options::new(home, "cron_notice", id)).await;
+        let _ = send_until(client, api_base, chat_id, &notice, Format::Plain,
+            Options::new(home, "cron_notice", id), deadline).await;
     }
     result
 }

@@ -299,3 +299,85 @@ async fn partial_delivery_tracks_progress_and_sends_one_incomplete_notice() {
     let record = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
     assert_eq!(serde_json::from_str::<Value>(record.trim()).unwrap()["delivered_chunks"], 1);
 }
+
+#[tokio::test]
+async fn oversized_markdown_is_bounded_before_rendering() {
+    let provider = TestChannelProvider::start().await;
+    let home = tempfile::tempdir().unwrap();
+    // The complete link must never reach the renderer: its closing delimiter is
+    // several MiB beyond the input budget, including a multibyte boundary.
+    let input = format!("[help]({})", "貓🐈".repeat(500_000));
+    let bounded = duduclaw_core::truncate_bytes(&input, MAX_INPUT_BYTES);
+    assert!(bounded.len() < MAX_INPUT_BYTES);
+    let expected = chunks(bounded, Format::MarkdownHtml, None);
+    send(&reqwest::Client::new(), &crate::telegram::telegram_poll_api_base(&provider.token), "1",
+        &input, Format::MarkdownHtml, Options::new(home.path(), "notify", "oversized")).await.unwrap();
+    let requests = provider.requests();
+    assert!(requests.len() <= 16);
+    assert_eq!(requests[0].body["text"], expected[0].text);
+    assert!(requests[0].body["text"].as_str().unwrap().starts_with("[help]("));
+    assert_eq!(requests.last().unwrap().body["text"], delivery_notice(None, false));
+    assert!(requests.last().unwrap().body.get("parse_mode").is_none());
+}
+
+#[tokio::test]
+async fn truncated_markdown_with_few_rendered_chunks_still_gets_fixed_notice() {
+    let provider = TestChannelProvider::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let input = format!("**hello**\n\n{}", "\n".repeat(3 * 1024 * 1024));
+    send(&reqwest::Client::new(), &crate::telegram::telegram_poll_api_base(&provider.token), "1",
+        &input, Format::MarkdownHtml, Options::new(home.path(), "notify", "short-render")).await.unwrap();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body["text"], "<b>hello</b>");
+    assert_eq!(requests[1].body["text"], delivery_notice(None, false));
+    assert!(requests[1].body.get("parse_mode").is_none());
+}
+
+#[tokio::test]
+async fn cron_body_and_failure_notice_share_one_delivery_budget() {
+    let provider = TestChannelProvider::start().await;
+    for delay in [40000, 40000] {
+        provider.enqueue_response("sendMessage", json!({"__delay_millis":delay,"ok":true,"result":{}}));
+    }
+    provider.enqueue_response("sendMessage", json!({"__delay_millis":30000,"__status":400,"ok":false,"description":"message is too long"}));
+    provider.enqueue_response("sendMessage", json!({"__delay_millis":40000,"ok":true,"result":{}}));
+    let home = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let base = crate::telegram::telegram_poll_api_base(&provider.token);
+    let input = "a".repeat(LIMIT * 3);
+    let delivery = send_cron(&client, &base, "1", &input, "budget", "cron-budget", home.path());
+    let clock = async {
+        let mut started = None;
+        for (index, seconds) in [40, 40, 30, 10].into_iter().enumerate() {
+            while provider.requests().len() <= index { tokio::task::yield_now().await; }
+            if index == 0 {
+                tokio::time::pause();
+                started = Some(Instant::now());
+            }
+            tokio::time::advance(Duration::from_secs(seconds)).await;
+        }
+        started.unwrap()
+    };
+    let (result, started) = tokio::join!(delivery, clock);
+    let elapsed = started.elapsed();
+    tokio::time::resume();
+    assert!(result.unwrap_err().content);
+    assert_eq!(provider.requests().len(), 4);
+    assert!(elapsed <= Duration::from_secs(120), "elapsed: {elapsed:?}");
+    assert!(provider.requests()[3].body["text"].as_str().unwrap().contains("結果無法送達"));
+}
+
+#[tokio::test]
+async fn partial_visitor_delivery_sets_flag_without_incomplete_notice() {
+    let provider = TestChannelProvider::start().await;
+    provider.enqueue_response("sendMessage", json!({"ok":true,"result":{}}));
+    provider.enqueue_response("sendMessage", json!({"__status":403,"ok":false,"description":"Forbidden"}));
+    let home = tempfile::tempdir().unwrap();
+    let (result, partial) = track_partial(send(&reqwest::Client::new(),
+        &crate::telegram::telegram_poll_api_base(&provider.token), "odoolivechat:visitor", &"a".repeat(LIMIT + 1),
+        Format::Plain, Options::new(home.path(), "notify", "visitor-partial"))).await;
+    assert!(partial);
+    assert_eq!(result.unwrap_err().delivered_chunks, 1);
+    assert_eq!(provider.requests().len(), 2);
+}
