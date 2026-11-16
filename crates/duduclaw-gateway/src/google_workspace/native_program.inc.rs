@@ -131,14 +131,17 @@ fn sanitize_chat<I: LocalIo>(value: &mut Value, io: &I) {
     }
 }
 fn chat_error(error: GoogleApiError) -> GoogleApiError {
-    tracing::warn!(error = %error, "Google Chat read failed");
-    let status = match error {
-        GoogleApiError::Forbidden(_) => 403,
-        GoogleApiError::Unauthorized | GoogleApiError::Auth(_) => 403,
-        GoogleApiError::RateLimited => 429,
-        GoogleApiError::Api { status, .. } => status,
-        GoogleApiError::Http(_) => 503,
+    let unauthorized = matches!(&error, GoogleApiError::Unauthorized);
+    let (kind, status) = match error {
+        GoogleApiError::Forbidden(_) => ("forbidden", 403),
+        GoogleApiError::Unauthorized => ("unauthorized", 401),
+        GoogleApiError::Auth(_) => ("auth", 403),
+        GoogleApiError::RateLimited => ("rate_limited", 429),
+        GoogleApiError::Api { status, .. } => ("api", status),
+        GoogleApiError::Http(_) => ("transport", 503),
     };
+    tracing::warn!(kind, status, "Google Chat read failed");
+    let status = if unauthorized { 403 } else { status };
     GoogleApiError::Forbidden(chat_read::api_error_text(status, crate::trigger_route::texts::Lang::ZhTw).to_owned())
 }
 fn render_chat<I: LocalRender>(value: &Value, io: &mut I) -> Value {

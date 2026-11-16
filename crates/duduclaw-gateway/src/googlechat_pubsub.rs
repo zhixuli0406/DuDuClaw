@@ -224,8 +224,7 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
         let sender = event.pointer("/message/sender/name").and_then(Value::as_str).unwrap_or("");
         // Same queue (and queue-full notice throttle) keys as the HTTP path.
         let (group, conversation) = crate::googlechat::queue_keys(state.agent.as_deref(), space, sender);
-        let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, space, &event["message"], &event).await;
-        let thread = crate::googlechat::reply_thread(state, &event, is_dm).await;
+        let notice_event = event.clone();
         let notice_space = space.to_string();
         let bind = crate::agent_channels::binding_lock().await;
         if !still_current(&state.ctx, state.agent.as_deref(), config).await { break; }
@@ -248,6 +247,8 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
             // queue, and tell the space (same throttled notice and keys).
             inbox.transition(&stream, &row.id, "queued", "dropped")?;
             tracing::warn!(agent = ?state.agent, "Google Chat Pub/Sub queue full: ACK and drop; no turn");
+            let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &notice_space, &notice_event["message"], &notice_event).await;
+            let thread = crate::googlechat::reply_thread(state, &notice_event, is_dm).await;
             crate::googlechat::notify_queue_full(state, &group, &conversation, &notice_space, thread.as_deref());
         }
         drop(bind);
