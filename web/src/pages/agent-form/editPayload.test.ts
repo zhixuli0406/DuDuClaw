@@ -111,6 +111,21 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     expect(r.payload).toEqual({ display_name: 'Bot' });
   });
 
+  it('sends only edited step limits and preserves null as inherit', () => {
+    for (const max_turns of [75, null]) {
+      const r = buildUpdatePayload(state({ runtime: { ...DEFAULT_RUNTIME, max_turns } }), new Set(['runtime.max_turns']), CTX);
+      expect(r.payload).toEqual({ runtime: { max_turns } });
+    }
+    expect(buildUpdatePayload(state(), new Set(), CTX).payload).toEqual({});
+    for (const locale of [en, zhTW, jaJP]) {
+      for (const key of ['agents.runtime.maxTurns', 'agents.runtime.maxTurns.hint',
+        'settings.limits.default_max_turns', 'settings.limits.default_max_turns.help',
+        'settings.limits.max_turns_limit', 'settings.limits.max_turns_limit.help']) {
+        expect((locale as Record<string, string>)[key]).toBeTruthy();
+      }
+    }
+  });
+
   it('sends only the runtime timeout when it is edited', () => {
     const r = buildUpdatePayload(
       state({ runtime: { ...DEFAULT_RUNTIME, timeout_secs: 600 } }),

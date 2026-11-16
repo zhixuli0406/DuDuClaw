@@ -234,6 +234,8 @@ fn apply_global_utility(table: &mut toml::Table, params: &Value, out: &mut V168O
 fn apply_run_review_limits(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
     for (section, key, min, max) in [
         ("runtime", "max_timeout_secs", 60, 14_400),
+        ("runtime", "default_max_turns", 1, 10_000),
+        ("runtime", "max_turns_limit", 1, 10_000),
         ("goal_defaults", "assign_schedule_max_active", 0, 200),
         ("goal_defaults", "assign_schedule_min_interval_minutes", 60, 10_080),
         ("agent_files", "review_daily_limit", 0, 100_000),
@@ -257,6 +259,7 @@ fn apply_run_review_limits(table: &mut toml::Table, params: &Value, out: &mut V1
         out.applied_immediate = true;
     }
     crate::runtime_config::TimeoutPolicy::from_table(table)?;
+    duduclaw_core::turn_limits::TurnPolicy::validate(table)?;
     Ok(())
 }
 
@@ -915,4 +918,19 @@ mod chat_credential_config_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod turn_tests {
+    use super::*;
+    #[test]
+    fn step_policy_rpc_validates_ceiling_and_default_together() {
+        let mut t = toml::Table::new();
+        apply_v168_keys(&mut t, &json!({"runtime":{"default_max_turns":80,"max_turns_limit":100}})).unwrap();
+        assert_eq!(t["runtime"]["default_max_turns"].as_integer(), Some(80));
+        for p in [json!({"runtime":{"default_max_turns":101}}), json!({"runtime":{"max_turns_limit":10001}}),
+            json!({"runtime":{"default_max_turns":0}}), json!({"runtime":{"max_turns_limit":"200"}})] {
+            assert!(apply_v168_keys(&mut t.clone(), &p).is_err());
+        }
+    }
 }

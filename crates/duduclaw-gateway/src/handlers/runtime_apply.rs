@@ -173,6 +173,12 @@ pub(crate) fn apply_runtime_to_table_reporting(
 pub(crate) fn apply_runtime_with_timeout_ceiling(
     table: &mut toml::Table, params: &Value, max_timeout_secs: u64,
 ) -> Result<RuntimeApplyOutcome, String> {
+    apply_runtime_with_limits(table, params, max_timeout_secs, 200)
+}
+
+pub(crate) fn apply_runtime_with_limits(
+    table: &mut toml::Table, params: &Value, max_timeout_secs: u64, max_turns_limit: u64,
+) -> Result<RuntimeApplyOutcome, String> {
     let mut changes: Vec<String> = Vec::new();
     let mut deprecated: Vec<DeprecatedRuntimeWrite> = Vec::new();
 
@@ -190,6 +196,12 @@ pub(crate) fn apply_runtime_with_timeout_ceiling(
 
     // Validate before touching the proposal. The config commit path preserves
     // formatting and publishes nothing if this closure returns an error.
+    let max_turns = rt.get("max_turns");
+    if let Some(value) = max_turns.filter(|v| !v.is_null()) {
+        if !value.as_u64().is_some_and(|n| (1..=max_turns_limit).contains(&n)) {
+            return Err(format!("max_turns must be an integer between 1 and {max_turns_limit}"));
+        }
+    }
     let timeout_secs = rt.get("timeout_secs");
     if let Some(value) = timeout_secs.filter(|v| !v.is_null()) {
         if !value.as_u64().is_some_and(|secs| (30..=max_timeout_secs).contains(&secs)) {
@@ -249,6 +261,15 @@ pub(crate) fn apply_runtime_with_timeout_ceiling(
             if introduces(previous, v) {
                 deprecated.extend(DeprecatedRuntimeWrite::for_value("fallback", v));
             }
+        }
+    }
+    if let Some(value) = max_turns {
+        if value.is_null() {
+            section.remove("max_turns");
+            changes.push("runtime.max_turns cleared".into());
+        } else if let Some(turns) = value.as_i64() {
+            section.insert("max_turns".into(), toml::Value::Integer(turns));
+            changes.push(format!("runtime.max_turns = {turns}"));
         }
     }
     if let Some(value) = timeout_secs {

@@ -360,6 +360,7 @@ export function buildUpdatePayload(
   if (has(dirty, 'runtime.provider')) rt.provider = s.runtime.provider;
   if (has(dirty, 'runtime.fallback')) rt.fallback = s.runtime.fallback;
   if (has(dirty, 'runtime.timeout_secs')) rt.timeout_secs = s.runtime.timeout_secs;
+  if (has(dirty, 'runtime.max_turns')) rt.max_turns = s.runtime.max_turns;
   if (has(dirty, 'v.minimal_context')) rt.minimal_context = s.v.minimal_context;
   if (Object.keys(rt).length > 0) put('runtime', rt);
 

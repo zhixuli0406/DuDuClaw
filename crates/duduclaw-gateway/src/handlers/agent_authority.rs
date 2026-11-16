@@ -102,6 +102,7 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("runtime.provider", &["runtime.provider"], Change),
     key("runtime.fallback", &["runtime.fallback"], Change),
     key("runtime.timeout_secs", &["runtime.timeout_secs"], Loosen),
+    key("runtime.max_turns", &["runtime.max_turns"], Loosen),
     // `--bare` skips the hooks, the employee file guard included.
     key("prompt.cli_bare_mode", &[], Change),
     key("prompt.reply_language", &["form.reply_language"], Change),
@@ -130,6 +131,7 @@ fn effective(table: &toml::Table, key: &str) -> Value {
         "agent.reports_to" | "agent.department" | "agent.name" | "agent.role" | "runtime.fallback" => {
             or(Value::String(String::new()))
         }
+        "runtime.max_turns" => json!(raw.as_i64().filter(|n| *n > 0).unwrap_or(50)),
         "runtime.timeout_secs" => json!(raw.as_i64().map(|v| v.clamp(30, 14_400)).unwrap_or(300)),
         "runtime.provider" => or(Value::String(duduclaw_core::types::RuntimeType::default().as_str().into())),
         "container.sandbox_enabled"
@@ -204,7 +206,7 @@ fn needs_admin(k: &AuthorityKey, before: &Value, after: &Value) -> bool {
         Loosen if k.toml_key == "budget.hard_stop" => {
             before.as_bool() == Some(true) && after.as_bool() != Some(true)
         }
-        Loosen if k.toml_key == "runtime.timeout_secs" => after.as_u64() > before.as_u64(),
+        Loosen if matches!(k.toml_key, "runtime.timeout_secs" | "runtime.max_turns") => after.as_u64() > before.as_u64(),
         Loosen => cap_loosened(before, after),
         GoogleNarrow => !google_only_narrows(before, after),
     }
@@ -265,6 +267,20 @@ pub(crate) fn authority_diff_with_timeout_policy(
             }
         }
     }
+    changes
+}
+
+pub(crate) fn authority_diff_with_runtime_policy(
+    before: &toml::Table, after: &toml::Table, timeout: crate::runtime_config::TimeoutPolicy,
+    turns: duduclaw_core::turn_limits::TurnPolicy,
+) -> Vec<ProtectedChange> {
+    let mut changes = authority_diff_with_timeout_policy(before, after, timeout);
+    changes.retain(|c| c.key != "runtime.max_turns");
+    let baseline = |table: &toml::Table| table.get("runtime").and_then(|r| r.get("max_turns"))
+        .and_then(toml::Value::as_integer).filter(|n| *n > 0)
+        .map(|n| n as u64).unwrap_or(turns.default.min(turns.limit));
+    let (b, a) = (baseline(before), baseline(after));
+    if a > b { changes.push(ProtectedChange { key: "runtime.max_turns".into(), before: json!(b), after: json!(a) }); }
     changes
 }
 
@@ -501,4 +517,25 @@ mod tests {
         assert!(authority_diff_with_timeout_policy(&before, &after, policy).iter().any(|c| c.key == "runtime.timeout_secs"));
     }
 
+}
+
+#[cfg(test)]
+mod turn_tests {
+    use super::*;
+    #[test]
+    fn owners_can_only_narrow_steps_including_clear_and_stored_over_ceiling() {
+        let table = |s: &str| s.parse::<toml::Table>().unwrap();
+        let timeout = crate::runtime_config::TimeoutPolicy::default();
+        let turns = duduclaw_core::turn_limits::TurnPolicy { default: 70, limit: 90 };
+        for (before, after, admin) in [
+            ("", "[runtime]\nmax_turns=71", true),
+            ("", "[runtime]\nmax_turns=60", false),
+            ("[runtime]\nmax_turns=60", "", true),
+            ("[runtime]\nmax_turns=80", "", false),
+            ("[runtime]\nmax_turns=100", "[runtime]\nmax_turns=110", true),
+        ] {
+            assert_eq!(authority_diff_with_runtime_policy(&table(before), &table(after), timeout, turns)
+                .iter().any(|c| c.key == "runtime.max_turns"), admin);
+        }
+    }
 }

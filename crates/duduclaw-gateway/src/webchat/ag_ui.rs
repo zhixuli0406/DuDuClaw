@@ -16,7 +16,10 @@ use input::{RunInput, ResumeEntry};
 const MAX_BODY: usize = 256 * 1024;
 const MAX_RUNS: usize = 10;
 const MAX_PER_USER: usize = 2;
-const RUN_LIFETIME: Duration = Duration::from_secs(15 * 60);
+fn run_lifetime(home: &std::path::Path) -> Duration {
+    // Every employee/task timeout is capped by this policy. Leave time for final delivery.
+    Duration::from_secs(crate::runtime_config::TimeoutPolicy::load(home).max_secs + 30)
+}
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct AgUiState {
@@ -146,7 +149,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "run_store_unavailable"),
         };
         let matches = receipts.get(&sid).is_some_and(|(at, entries)|
-            at.elapsed() < RUN_LIFETIME && same_decisions(entries, &input.resume));
+            at.elapsed() < run_lifetime(&state.chat.ctx.home_dir) && same_decisions(entries, &input.resume));
         if !matches { return error(StatusCode::CONFLICT, "stale_or_unknown_interrupt"); }
         true
     } else { false };

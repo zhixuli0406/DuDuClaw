@@ -1033,3 +1033,8 @@ port = 18889
 #   Distributor brand: signed <home>/distributor_brand.json; any tier except OpenSource with a matching signed subscription.
 #   No [branding] section or customer-side setter; old branding.json is ignored.
 #   See docs/guides/white-label.md for the signed name/logo contract.
+
+# Per-run limits (administrator-controlled; more steps consume more quota and time).
+# [runtime]
+# default_max_turns = 50     # Default Claude step budget; OpenAI-compatible loops keep 10 unless explicitly overridden per employee
+# max_turns_limit = 200      # Ceiling for employee max_turns; integer 1..=10000, never unlimited

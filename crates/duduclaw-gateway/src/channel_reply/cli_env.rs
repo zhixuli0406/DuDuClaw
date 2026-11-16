@@ -98,6 +98,9 @@ pub(super) async fn spawn_claude_cli_with_env(
         None
     };
 
+    let max_turns = if protected { 50 } else { duduclaw_core::turn_limits::max_turns(home_dir, work_dir) };
+    let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
+    let system_prompt = budget_prompt.as_str();
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
     let hook_args = if protected { Vec::new() } else {
         crate::agent_hook_installer::claude_hook_args(home_dir, work_dir, false)?
@@ -162,7 +165,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         "--dangerously-skip-permissions",
         // Allow enough agentic turns for complex tasks.
         "--max-turns",
-        "50",
+        &max_turns.to_string(),
     ]);
     // An unset model (`[model] utility = ""`, a failover with no model) must
     // leave the choice to the CLI. `--model ""` was sent verbatim before
@@ -209,7 +212,8 @@ pub(super) async fn spawn_claude_cli_with_env(
         } else if !allowed.is_empty() {
             cmd.args(["--allowedTools", &allowed.join(",")]);
         }
-        let denied = caps.disallowed_tools();
+        let mut denied = caps.disallowed_tools();
+        denied.push("AskUserQuestion".into());
         if !denied.is_empty() {
             let denied_csv = denied.join(",");
             cmd.args(["--disallowedTools", &denied_csv]);

@@ -70,6 +70,7 @@ pub fn claude_arguments(model: &str) -> Result<Vec<String>, BackendError> {
     if model.len() > 256 || model.chars().any(char::is_control) || model.trim() != model {
         return Err(BackendError::Denied);
     }
+    // RM-098: protected mode stays fixed at 50 until root-signed policy supports a bounded range.
     let mut args: Vec<String> = ["-p", "--input-format", "text", "--output-format", "stream-json",
         "--verbose", "--system-prompt-file", "/proc/self/fd/5", "--tools", "", "--allowedTools", "mcp__duduclaw__*",
         "--max-turns", "50"].into_iter().map(str::to_owned).collect();
@@ -153,6 +154,7 @@ mod tests {
         let resources = runtime.resources.clone();
         let plan = claude_plan(&policy(employee, runtime), employee, ExecutionClass::Dispatch,
             b"prompt".to_vec(), b"system".to_vec(), "model").unwrap();
+        assert!(claude_arguments("model").unwrap().windows(2).any(|w| w[0] == "--max-turns" && w[1] == "50"));
         assert_eq!(plan.resources, resources);
         assert_eq!(plan.inputs.prompt.max_bytes, 6);
         assert_eq!(plan.inputs.attachments.len(), 1);

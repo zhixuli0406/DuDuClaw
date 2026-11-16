@@ -499,7 +499,7 @@ pub fn scoped_task_timeout_secs(agent_id: &str) -> Option<u64> {
             scoped
                 .as_ref()
                 .filter(|(id, _)| id == agent_id)
-                .map(|(_, secs)| (*secs).clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS))
+                .map(|(_, secs)| (*secs).max(MIN_TIMEOUT_SECS))
         })
         .ok()
         .flatten()
@@ -705,6 +705,9 @@ pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
     }
     if let Some(secs) = raw_agent_timeout_secs(agent_dir) {
         obj.insert("timeout_secs".into(), serde_json::Value::from(secs));
+    }
+    if let Some(turns) = duduclaw_core::turn_limits::raw_agent_max_turns(agent_dir) {
+        obj.insert("max_turns".into(), serde_json::Value::from(turns));
     }
     serde_json::Value::Object(obj)
 }
@@ -2325,6 +2328,11 @@ mod tests {
             claude_timeout_secs(home.path(), Some(&dir))
         }).await;
         assert_eq!(got, 600);
+        std::fs::write(home.path().join("config.toml"), "[runtime]\nmax_timeout_secs=7200\n").unwrap();
+        let got = TASK_TIMEOUT_SECS.scope(Some(("anna".into(), 6000)), async {
+            claude_timeout_secs(home.path(), Some(&dir))
+        }).await;
+        assert_eq!(got, 6000);
     }
 
 }

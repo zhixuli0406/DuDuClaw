@@ -529,7 +529,7 @@ impl OpenAiCompatRuntime {
             &provider,
             req,
             &guarded,
-            duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
+            duduclaw_core::turn_limits::tool_loop_max_turns(&context.home_dir, context.agent_dir.as_deref()),
             duduclaw_llm::ProvenanceConfig::default(),
             interceptor,
             crate::ccr_runtime::for_agent(&context.home_dir, &context.agent_id),

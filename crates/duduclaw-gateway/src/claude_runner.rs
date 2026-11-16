@@ -4509,6 +4509,9 @@ fn prepare_claude_cmd(
     // Identity-scoped config directory. Defaults to the cwd — which IS the
     // agent directory for every caller but a team role member.
     let config_dir = identity.config_dir.or(work_dir);
+    let max_turns = duduclaw_core::turn_limits::max_turns(home_dir, config_dir);
+    let budget_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, max_turns);
+    let system_prompt = budget_prompt.as_str();
     let git_env_granted = duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
     // A team role is a short-lived `-p` main conversation, so give its
     // otherwise stable role/identity prefix the one-hour cache window. This
@@ -4593,7 +4596,7 @@ fn prepare_claude_cmd(
         // per-agent `allowed_tools` override (HS12) can narrow it.
         // Allow enough agentic turns for complex tasks (read → think → write).
         "--max-turns",
-        "50",
+        &max_turns.to_string(),
     ]);
     // An unset model (`[model] utility = ""`, a failover with no model) must
     // leave the choice to the CLI. `--model ""` was sent verbatim before
@@ -4650,6 +4653,7 @@ fn prepare_claude_cmd(
     cmd.args(["--allowedTools", &allowed_csv]);
 
     let mut denied = caps.disallowed_tools();
+    denied.push("AskUserQuestion".into());
     // WP3 (PORTICO) auxiliary enforcement: fold in any `scoped_tools` that lack
     // an active task-scoped grant. `config_dir` is the agent directory, from which
     // the helper derives home + agent_id and reads the shared grant store
@@ -4855,13 +4859,13 @@ mod role_cache_ttl_tests {
             "--verbose", "--permission-mode", "auto", "--max-turns", "50",
             "--model", "fixture-model", "--allowedTools",
             "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite",
-            "--disallowedTools", "computer"]);
+            "--disallowedTools", "computer,AskUserQuestion"]);
         if duduclaw_core::agent_toml::resolve_minimal_context(None) {
             expected.args(["--setting-sources", "project,local", "--tools",
                 "Bash,Edit,Glob,Grep,Read,TodoWrite,WebFetch,WebSearch,Write"]);
         }
         let prompt_file = _guards.prompt.as_ref().expect("system prompt fixture file");
-        assert_eq!(std::fs::read_to_string(prompt_file).unwrap(), "stable");
+        assert_eq!(std::fs::read_to_string(prompt_file).unwrap(), duduclaw_core::turn_limits::budget_prompt("stable", 50));
         expected.arg("--system-prompt-file").arg(prompt_file);
         expected.env_remove("CLAUDECODE")
             .env_remove(duduclaw_core::egress_guard::ENV_TURN_ALIAS)
@@ -5059,7 +5063,8 @@ async fn call_claude_with_env(
             return Err(protected_claude_options_refusal());
         }
         let agent_dir = identity.config_dir.or(work_dir).ok_or_else(protected_claude_options_refusal)?;
-        let system_prompt = system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
+        let system_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, 50)
+            .replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
         let mut marker = tokio::process::Command::new("root-selected-claude");
         return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model)), hard_max_timeout_secs).await;
     }
@@ -6593,5 +6598,26 @@ mod process_tree_cancellation_tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }).await.expect("cancel must kill the actual streaming spawn's grandchild");
+    }
+}
+
+#[cfg(test)]
+mod turn_budget_tests {
+    use super::*;
+    #[test]
+    fn dispatch_resolves_steps_and_blocks_questions_for_both_context_modes() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        for minimal in [true, false] {
+            std::fs::write(dir.join("agent.toml"), format!("[runtime]\nmax_turns=88\nminimal_context={minimal}\n")).unwrap();
+            let (cmd, guards) = prepare_claude_cmd("claude", "hi", "m", "stable", None, None,
+                home.path(), None, SpawnIdentity { config_dir: Some(&dir), mcp_config: None }).unwrap();
+            let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
+            assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "88"));
+            assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].split(',').any(|t| t == "AskUserQuestion")));
+            let text = std::fs::read_to_string(guards.prompt.as_ref().unwrap()).unwrap();
+            assert!(text.contains("Step budget for this turn: 88"));
+        }
     }
 }

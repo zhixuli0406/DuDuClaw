@@ -143,6 +143,9 @@ export type OrgChartAgent = Pick<AgentInfo, 'name' | 'role'> & Partial<Pick<Agen
 
 export interface AgentDetail extends AgentInfo {
   timeout_authorization_ceiling_secs?: number;
+  effective_max_turns?: number;
+  max_turns_limit?: number;
+  default_max_turns?: number;
   effective_timeout_secs?: number;
   max_timeout_secs?: number;
   budget: AgentBudget;
@@ -177,6 +180,7 @@ export interface AgentDetail extends AgentInfo {
     provider?: string;
     fallback?: string;
     timeout_secs?: number | null;
+    max_turns?: number | null;
   };
   /** [research] table — returned by agents.inspect so the automation tab's
    *  self-study toggle can prefill the agent's own value (belief loop ×
@@ -3583,6 +3587,7 @@ export interface AgentRuntime {
   provider?: RuntimeProvider;
   /** Per-run CLI / per-request OpenAI-compatible API limit for all runtimes including Claude, from 30 seconds to the global ceiling. Null clears it. */
   timeout_secs?: number | null;
+  max_turns?: number | null;
   /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
   fallback?: string;
   /** v1.68 W1 — `[runtime] minimal_context` (精簡啟動內容). Default true. */

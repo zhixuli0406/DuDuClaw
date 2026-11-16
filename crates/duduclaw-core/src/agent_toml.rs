@@ -65,6 +65,13 @@ where
     Ok(value.value())
 }
 
+pub(crate) fn deserialize_max_turns<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where D: serde::Deserializer<'de> {
+    let value: Tri<i64> = crate::lenient::tri(d)?;
+    if value.is_wrong_type() { crate::turn_limits::warn_invalid(); }
+    Ok(value.value())
+}
+
 /// The `[model]` keys the former shadow readers consumed.
 ///
 /// A deliberately narrow projection rather than [`crate::types::ModelConfig`]:

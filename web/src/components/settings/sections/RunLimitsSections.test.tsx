@@ -24,6 +24,16 @@ function saveCard(label: string) {
 }
 
 describe('Run limit settings cards', () => {
+  it('saves the step budget through the existing config RPC', async () => {
+    renderWithProviders(<RunLimitsSections />);
+    const field = await screen.findByRole('spinbutton', { name: 'Default step limit' });
+    await waitFor(() => expect(field).toHaveValue(50));
+    expect(screen.getByRole('spinbutton', { name: 'Step limit ceiling' })).toHaveValue(200);
+    fireEvent.change(field, { target: { value: '80' } });
+    saveCard('Default step limit');
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ runtime: { default_max_turns: 80 } }));
+  });
+
   it('gives each new save button a distinct accessible name', () => {
     renderWithProviders(<RunLimitsSections />);
     expect(screen.getByRole('button', { name: 'Save run limits' })).toBeInTheDocument();

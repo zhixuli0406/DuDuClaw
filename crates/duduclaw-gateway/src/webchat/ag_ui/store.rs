@@ -3,7 +3,6 @@ use std::{path::Path, sync::{Arc, Mutex}, time::Duration};
 use rusqlite::{Connection, OptionalExtension, params};
 
 const RETENTION_SECONDS: i64 = 24 * 60 * 60;
-const THREAD_SECONDS: i64 = 15 * 60;
 const MAX_ROWS: i64 = 4096;
 const MAX_PRINCIPAL_ROWS: i64 = 256;
 const MAX_PRINCIPAL_PER_MINUTE: i64 = 32;
@@ -11,6 +10,7 @@ const MAX_PRINCIPAL_PER_MINUTE: i64 = 32;
 #[derive(Clone)]
 pub(super) struct Store {
     conn: Arc<Mutex<Connection>>,
+    home: std::path::PathBuf,
 }
 
 impl Store {
@@ -48,7 +48,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_ag_ui_threads_principal ON ag_ui_threads(principal);",
         ).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| format!("commit AG-UI migration: {e}"))?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)), home: home.to_path_buf() })
     }
 
     pub(super) async fn admit(&self, principal: &str, sid: &str, run_id: &str, has_live_thread: bool) -> Result<String, String> {
@@ -103,7 +103,7 @@ impl Store {
         let turn = existing_turn.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         if existing_turn.is_none() && !missing_live_origin {
             tx.execute("INSERT INTO ag_ui_threads(session_id,turn_id,deadline,state,principal) VALUES (?1,?2,?3,'active',?4)",
-                params![sid, turn, now + THREAD_SECONDS, principal]).map_err(|e| e.to_string())?;
+                params![sid, turn, now + super::run_lifetime(&self.home).as_secs() as i64, principal]).map_err(|e| e.to_string())?;
         }
         // A refused retry still consumes its run id. Never extend an actor's deadline.
         tx.commit().map_err(|e| format!("commit AG-UI admission: {e}"))?;
@@ -162,16 +162,16 @@ mod tests {
         let deadline: i64 = store.conn.lock().unwrap().query_row(
             "SELECT deadline FROM ag_ui_threads WHERE session_id='s'", [], |r| r.get(0),
         ).unwrap();
-        assert_eq!(deadline, 1900);
-        assert_eq!(store.admit_at("user:one", "s", "late-resume", true, 1900).unwrap(), turn);
+        assert_eq!(deadline, 4630);
+        assert_eq!(store.admit_at("user:one", "s", "late-resume", true, 4630).unwrap(), turn);
         let deadline: i64 = store.conn.lock().unwrap().query_row(
             "SELECT deadline FROM ag_ui_threads WHERE session_id='s'", [], |r| r.get(0),
         ).unwrap();
-        assert_eq!(deadline, 1900);
-        assert_eq!(store.admit_at("user:one", "s", "r3", false, 1900).unwrap_err(), "orphaned_thread");
-        assert_eq!(store.admit_at("user:one", "s", "r1", true, 1901).unwrap_err(), "run_id_reused");
-        store.admit_at("user:one", "other", "new", false, 1902).unwrap();
-        assert_eq!(store.admit_at("user:one", "s", "r4", false, 1903).unwrap_err(), "orphaned_thread");
+        assert_eq!(deadline, 4630);
+        assert_eq!(store.admit_at("user:one", "s", "r3", false, 4630).unwrap_err(), "orphaned_thread");
+        assert_eq!(store.admit_at("user:one", "s", "r1", true, 4631).unwrap_err(), "run_id_reused");
+        store.admit_at("user:one", "other", "new", false, 4632).unwrap();
+        assert_eq!(store.admit_at("user:one", "s", "r4", false, 4633).unwrap_err(), "orphaned_thread");
     }
 
     #[tokio::test]
@@ -286,7 +286,7 @@ mod tests {
             "CREATE TABLE ag_ui_runs(session_id TEXT NOT NULL,run_id TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(session_id,run_id));
              CREATE TABLE ag_ui_threads(session_id TEXT PRIMARY KEY,turn_id TEXT NOT NULL,deadline INTEGER NOT NULL,state TEXT NOT NULL);
              INSERT INTO ag_ui_runs VALUES ('legacy','old',1000);
-             INSERT INTO ag_ui_threads VALUES ('legacy','old-turn',1900,'active');",
+             INSERT INTO ag_ui_threads VALUES ('legacy','old-turn',4630,'active');",
         ).unwrap();
         drop(conn);
         let store = Store::open(home.path()).unwrap();

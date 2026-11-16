@@ -495,3 +495,17 @@ mod timeout_tests {
         assert!(!worker.await.unwrap());
     }
 }
+
+#[test]
+fn webchat_deadline_covers_resolved_employee_timeout_and_global_ceiling() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("agents/anna");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent.toml"), "[runtime]\ntimeout_secs=7000\n").unwrap();
+    for max in [600, 7200, 14400] {
+        std::fs::write(home.path().join("config.toml"), format!("[runtime]\nmax_timeout_secs={max}\n")).unwrap();
+        let timeout = crate::runtime_config::claude_timeout_secs(home.path(), Some(&dir));
+        assert!(run_lifetime(home.path()).as_secs() > timeout);
+        assert_eq!(run_lifetime(home.path()).as_secs(), max + 30);
+    }
+}

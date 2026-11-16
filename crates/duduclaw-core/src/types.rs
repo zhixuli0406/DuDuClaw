@@ -4281,6 +4281,10 @@ pub struct RuntimeSection {
     #[serde(deserialize_with = "crate::agent_toml::deserialize_timeout_secs")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<i64>,
+    /// Optional bounded step budget; absent uses the global default (API loops: 10).
+    #[serde(deserialize_with = "crate::agent_toml::deserialize_max_turns")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<i64>,
     /// Minimal-context spawn optimization (WP-7A). When applied, the spawned
     /// official CLI drops the operator's *user*-global settings and memory
     /// (`--setting-sources project,local` — keeps the agent's own
@@ -4865,6 +4869,8 @@ impl Default for ProactiveConfig {
     }
 }
 
+pub const MAX_PROACTIVE_TURNS: u32 = 64;
+
 impl ProactiveConfig {
     /// Clamp values to valid ranges after deserialization.
     pub fn sanitize(&mut self) {
@@ -4886,12 +4892,12 @@ impl ProactiveConfig {
             tracing::warn!("proactive.max_turns is 0, bumping to default (8)");
             self.max_turns = 8;
         }
-        if self.max_turns > 64 {
+        if self.max_turns > MAX_PROACTIVE_TURNS {
             tracing::warn!(
                 value = self.max_turns,
                 "proactive.max_turns unusually high, clamping to 64"
             );
-            self.max_turns = 64;
+            self.max_turns = MAX_PROACTIVE_TURNS;
         }
     }
 }

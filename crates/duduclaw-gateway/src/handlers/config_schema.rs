@@ -254,6 +254,8 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("runtime", "utility_provider", Str),
     ("runtime", "default_timeout_secs", UInt),
     ("runtime", "max_timeout_secs", UInt),
+    ("runtime", "default_max_turns", UInt),
+    ("runtime", "max_turns_limit", UInt),
     ("goal_defaults", "assign_schedule_max_active", UInt),
     ("goal_defaults", "assign_schedule_min_interval_minutes", UInt),
     ("agent_files", "review_daily_limit", UInt),
@@ -321,6 +323,8 @@ pub(crate) fn check_config_types_with_stored(
     for (section, key, min, max) in [
         ("runtime", "default_timeout_secs", 30, 14400),
         ("runtime", "max_timeout_secs", 60, 14400),
+        ("runtime", "default_max_turns", 1, 10000),
+        ("runtime", "max_turns_limit", 1, 10000),
         ("goal_defaults", "assign_schedule_max_active", 0, 200),
         ("goal_defaults", "assign_schedule_min_interval_minutes", 60, 10080),
         ("agent_files", "review_daily_limit", 0, 100000),
@@ -337,6 +341,7 @@ pub(crate) fn check_config_types_with_stored(
         }
     }
     crate::runtime_config::TimeoutPolicy::from_table(table)?;
+    duduclaw_core::turn_limits::TurnPolicy::validate(table)?;
     Ok(())
 }
 
@@ -440,6 +445,8 @@ mod tests {
     fn run_schedule_and_review_limit_ranges_are_checked() {
         for (section, key, min, max) in [
             ("runtime", "max_timeout_secs", 60, 14400),
+        ("runtime", "default_max_turns", 1, 10000),
+        ("runtime", "max_turns_limit", 1, 10000),
             ("goal_defaults", "assign_schedule_max_active", 0, 200),
             ("goal_defaults", "assign_schedule_min_interval_minutes", 60, 10080),
             ("agent_files", "review_daily_limit", 0, 100000),

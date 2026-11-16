@@ -91,6 +91,23 @@ fn child(home: std::path::PathBuf) {
         let command = captured.lock().unwrap().take().unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
         assert!(before.argv.iter().any(|arg| arg == "hi"));
+        assert!(before.argv.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].split(',').any(|t| t == "AskUserQuestion")));
+        for minimal in [true, false] {
+            let dir = home.join("agents/agnes");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), format!("[runtime]\nminimal_context={minimal}\nmax_turns=73\n")).unwrap();
+            let capture = Arc::new(Mutex::new(None));
+            let caps = crate::night_llm::night_capabilities();
+            let error = COMMAND_CAPTURE.scope(capture.clone(), spawn_claude_cli_with_env(
+                "hi", "m", "stable", &home, Some(&dir), None, Some(&caps), &Default::default(),
+                None, None, crate::runtime_dispatch::SpawnPurpose::Utility,
+            )).await.unwrap_err();
+            assert!(error.contains("captured"), "{error}");
+            let cmd = capture.lock().unwrap().take().unwrap();
+            let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
+            assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "73"));
+            assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].split(',').any(|t| t == "AskUserQuestion")));
+        }
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before,
             "channel argv, env removals and cwd survive LocalBackend registration unchanged");
 
@@ -111,7 +128,12 @@ fn child(home: std::path::PathBuf) {
         assert!(live.iter().any(|a| a == "--include-partial-messages"), "{live:?}");
         let mut without_flag = live.clone();
         without_flag.retain(|a| a != "--include-partial-messages");
-        assert_eq!(without_flag, plain, "the flag is the only difference");
+        let normalize = |args: &[String]| {
+            let mut args = args.to_vec();
+            if let Some(i) = args.iter().position(|a| a == "--system-prompt-file") { args[i + 1] = "<prompt-file>".into(); }
+            args
+        };
+        assert_eq!(normalize(&without_flag), normalize(&plain), "the flag is the only difference");
         let events = got.lock().unwrap().clone();
         let texts: Vec<String> = events.iter().filter_map(|e| e.text.clone()).collect();
         let last = texts.last().expect("thinking text shown");
@@ -135,7 +157,7 @@ fn child(home: std::path::PathBuf) {
         crate::thinking::scope_turn(Some(sink), spawn(&home))
             .await
             .unwrap();
-        assert_eq!(argv(&home, 3), plain);
+        assert_eq!(normalize(&argv(&home, 3)), normalize(&plain));
         let events = got.lock().unwrap().clone();
         assert!(!events.is_empty(), "the turn still knows it thought");
         assert!(events.iter().all(|e| e.text.is_none() && e.line.is_none()));

@@ -7,6 +7,8 @@ import { useConfigForm, vNum } from '../useConfigForm';
 const GROUPS = [
   { id: 'runtime', fields: [
     ['max_timeout_secs', 3600, 60, 14400],
+    ['default_max_turns', 50, 1, 10000],
+    ['max_turns_limit', 200, 1, 10000],
   ] },
   { id: 'goal_defaults', fields: [
     ['assign_schedule_max_active', 20, 0, 200],
@@ -49,7 +51,7 @@ function LimitsCard({ group }: { group: (typeof GROUPS)[number] }) {
         )}
         {group.fields.map(([key, fallback, min, upper]) => (
           <RowNumber key={key} label={t(key)} description={t(`${key}.help`)}
-            value={vNum(form.values, `${group.id}.${key}`, fallback)} min={min} max={upper} step={1}
+            value={vNum(form.values, `${group.id}.${key}`, fallback)} min={min} max={key === 'default_max_turns' ? vNum(form.values, 'runtime.max_turns_limit', 200) : upper} step={1}
             onChange={(v) => form.set(`${group.id}.${key}`, v)} />
         ))}
       </SettingsCard>
