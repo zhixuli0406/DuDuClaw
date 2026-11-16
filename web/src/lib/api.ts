@@ -8842,6 +8842,8 @@ export const api = {
   mcp: {
     list: () =>
       client.call('mcp.list') as Promise<{ agents: McpAgentConfig[]; catalog: McpCatalogItem[] }>,
+    probe: (agentId: string, serverName: string) =>
+      client.call('mcp.probe', { agent_id: agentId, server_name: serverName }) as Promise<McpStartResult>,
     update: (agentId: string, action: 'add' | 'edit' | 'remove', serverName: string, serverDef?: McpServerDef) =>
       client.call('mcp.update', {
         agent_id: agentId,

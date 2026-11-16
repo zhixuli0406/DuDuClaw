@@ -2364,16 +2364,3 @@ mod credential_declaration_sink_tests {
         std::fs::remove_dir_all(home).unwrap();
     }
 }
-
-/// Shared anomaly sink for gateway and stdio subprocess startup reports.
-pub fn append_anomaly(home: &std::path::Path, record: &serde_json::Value) -> std::io::Result<()> {
-    let path = home.join("channel_failures.jsonl");
-    let mut masked = record.clone();
-    crate::credential_detect::mask_json(&mut masked);
-    let line = format!("{masked}\n");
-    duduclaw_core::with_file_lock(&path, || {
-        use std::io::Write;
-        std::fs::OpenOptions::new().create(true).append(true).open(&path)?
-            .write_all(line.as_bytes())
-    })
-}

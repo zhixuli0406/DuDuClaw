@@ -115,9 +115,13 @@ async fn remove_preserves_org_store_entry() {
     );
 
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    crate::mcp_start::observe_init(home.path(), agent_id, &["fixture".into()],
+        &json!({"type":"system","subtype":"init","mcp_servers":[{"name":"fixture","status":"connected"}]}));
+    assert!(crate::mcp_start::last(home.path(), agent_id, "fixture").is_some());
     let frame = handler
         .handle_agents_remove(json!({ "agent_id": agent_id }))
         .await;
+    assert!(crate::mcp_start::last(home.path(), agent_id, "fixture").is_none());
     assert!(frame_ok(&frame), "{frame:?}");
     assert_eq!(
         frame_data(&frame)["status"].as_str(),

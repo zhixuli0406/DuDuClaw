@@ -3948,6 +3948,15 @@ async fn call_claude_streaming(
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    // This is the final signed config attached to this command. A protected
+    // runtime does not receive this employee stdio config, so observes no names.
+    let mcp_names = {
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        let config = args.windows(2).find(|pair| pair[0] == std::ffi::OsStr::new("--mcp-config"))
+            .map(|pair| Path::new(pair[1]));
+        crate::mcp_start::frozen_names(config)
+    };
+
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -4045,7 +4054,9 @@ async fn call_claude_streaming(
 
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
                             if let Some((home, agent)) = mcp_observer {
-                                crate::mcp_start::observe_init(home, agent, &event);
+                                if line.len() <= crate::mcp_start::MAX_INIT_BYTES {
+                                    crate::mcp_start::observe_init(home, agent, &mcp_names, &event);
+                                }
                             }
                             // Partial `stream_event` lines stop here: never the
                             // native-tool collector, never the answer text.

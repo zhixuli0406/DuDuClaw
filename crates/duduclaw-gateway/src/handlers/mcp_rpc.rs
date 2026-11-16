@@ -75,6 +75,17 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "agents": agents, "catalog": catalog }))
     }
 
+    pub(crate) async fn handle_mcp_probe(&self, params: &Value) -> WsFrame {
+        let Some(agent) = params["agent_id"].as_str().filter(|id| is_valid_agent_id(id)) else {
+            return WsFrame::error_response("", "Invalid agent_id");
+        };
+        let Some(server) = params["server_name"].as_str().filter(|name| !name.is_empty()) else {
+            return WsFrame::error_response("", "server_name is required");
+        };
+        let status = crate::mcp_start::probe(&self.home_dir, agent, server).await;
+        WsFrame::ok_response("", json!(status))
+    }
+
     pub(crate) async fn handle_mcp_update(&self, params: &Value) -> WsFrame {
         use duduclaw_agent::mcp_template::{
             McpServerDef, add_server_to_config, apply_required_env, remove_server_from_config,
@@ -166,7 +177,9 @@ impl MethodHandler {
                 match tokio::task::spawn_blocking(move || {
                     let (installed, _) =
                         crate::remote_mcp::bridge_def::prepare_for_install(&home, &aid, &sn, &def)?;
-                    add_server_to_config(&ad, &sn, &installed)
+                    add_server_to_config(&ad, &sn, &installed)?;
+                    crate::mcp_start::clear(&home, &aid, Some(&sn));
+                    Ok::<_, String>(())
                 })
                 .await
                 {
@@ -189,6 +202,7 @@ impl MethodHandler {
                         .and_then(|c| c.mcp_servers.get(&sn).cloned())
                         .is_some_and(|d| crate::remote_mcp::bridge_def::is_bridge_def(&d));
                     remove_server_from_config(&ad, &sn)?;
+                    crate::mcp_start::clear(&home, &aid, Some(&sn));
                     // Removing a remote server also deletes its stored
                     // credentials (no orphaned tokens), then records the
                     // local-only outcome for the unverified provider grant.

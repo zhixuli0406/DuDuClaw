@@ -94,6 +94,8 @@ async fn browserbase_install_without_values_is_refused_naming_variables() {
     );
     assert!(err.contains("BROWSERBASE_PROJECT_ID") && err.contains("GEMINI_API_KEY"), "{err}");
     assert!(!err.contains("only-this"), "{err}");
+    let frame = Box::pin(h.handle("mcp.probe", json!({"agent_id":"alice","server_name":"fixture"}), &employee)).await;
+    assert!(!error_text(frame).is_empty());
     assert!(!home.path().join("agents/alice/.mcp.json").exists());
 }
 
@@ -216,4 +218,18 @@ async fn mcp_update_keeps_saved_entry_when_probe_fails() {
         assert!(result["probe"]["reason_code"].is_string());
         assert!(duduclaw_agent::mcp_template::read_mcp_config(&home.path().join("agents/alice")).unwrap().mcp_servers.contains_key("missing"));
     }
+}
+
+#[tokio::test]
+async fn mcp_list_ignores_forged_shared_start_records() {
+    let home = tempfile::tempdir().unwrap();
+    let h = handler_with_agent(home.path()).await;
+    std::fs::write(home.path().join("agents/alice/.mcp.json"), json!({"mcpServers":{
+        "fixture":{"command":"fixture","args":[],"env":{}}
+    }}).to_string()).unwrap();
+    let before = payload(h.handle_mcp_list().await);
+    std::fs::write(home.path().join("channel_failures.jsonl"), json!({"classification":"mcp_start",
+        "agent_id":"alice","server":"fixture","reason_code":"identity_rejected","ok":false,
+        "time":"2099-01-01T00:00:00Z"}).to_string()).unwrap();
+    assert_eq!(payload(h.handle_mcp_list().await), before);
 }

@@ -1,100 +1,176 @@
-//! MCP startup observations and bounded, gated install probes.
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::{LazyLock, Mutex}};
+//! Gateway-owned MCP startup observations and bounded, gated probes.
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use duduclaw_core::mcp_start_status::{ReasonCode, StartStatus, safe_label};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-// Home is part of the key to keep isolated gateways/tests independent.
-static LAST: LazyLock<Mutex<HashMap<(PathBuf, String, String), StartStatus>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+const MAX_RESULTS: usize = 4096;
+pub(crate) const MAX_INIT_BYTES: usize = 64 * 1024;
+const MAX_INIT_SERVERS: usize = 64;
+type Key = (PathBuf, String, String);
 
-pub(crate) fn last(home: &Path, agent: &str, server: &str) -> Option<StartStatus> {
-    let current = LAST.lock().ok()?.get(&(home.into(), agent.into(), server.into())).cloned();
-    // Proxy subprocesses report through the shared locked anomaly sink. Read
-    // only a bounded tail; this is diagnostic state, never an authority source.
-    let disk = latest_refusal(home, agent, server);
-    match (current, disk) {
-        (Some(a), Some(b)) => Some(if a.time >= b.time { a } else { b }),
-        (a, b) => a.or(b),
-    }
+// Hash the original identity as well as storing its bounded sanitised label,
+// so two different configured names cannot alias after label sanitisation.
+fn label_key(value: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hash);
+    format!("{}-{:016x}", safe_label(value), hash.finish())
+}
+fn key(home: &Path, agent: &str, server: &str) -> Key {
+    (home.into(), label_key(agent), label_key(server))
 }
 
-fn latest_refusal(home: &Path, agent: &str, server: &str) -> Option<StartStatus> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(home.join("channel_failures.jsonl")).ok()?;
-    let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(65536))).ok()?;
-    let mut tail = String::new();
-    // A truncated UTF-8 boundary is harmless: skip its partial first record.
-    let mut bytes = Vec::new();
-    file.take(65536).read_to_end(&mut bytes).ok()?;
-    tail.push_str(&String::from_utf8_lossy(&bytes));
-    tail.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|v| v["classification"] == "mcp_start" && v["agent_id"] == safe_label(agent)
-            && v["server"] == safe_label(server) && v["reason_code"] != "connection_failed")
-        .and_then(|v| serde_json::from_value(v).ok())
-}
-
-fn remember(home: &Path, agent: &str, server: &str, status: StartStatus) {
-    if let Ok(mut map) = LAST.lock() {
-        // Diagnostic state is bounded and disposable, never authorization state.
-        if map.len() >= 4096 { map.clear(); }
-        map.insert((home.into(), agent.into(), server.into()), status);
-    }
-}
-
-pub(crate) fn observe_init(home: &Path, agent: &str, event: &Value) {
-    if event["type"] != "system" || event["subtype"] != "init" { return; }
-    let Some(servers) = event["mcp_servers"].as_array() else { return; };
-    for server in servers {
-        let Some(name) = server["name"].as_str() else { continue; };
-        let status = server["status"].as_str().unwrap_or("unknown");
-        let ok = status == "connected";
-        let refusal = (!ok).then(|| latest_refusal(home, agent, name)).flatten()
-            .filter(|s| chrono::DateTime::parse_from_rfc3339(&s.time).ok().is_some_and(|t|
-                (chrono::Utc::now().signed_duration_since(t).num_seconds()).abs() <= 60));
-        let result = StartStatus { ok, reason_code: if ok { None } else {
-            refusal.and_then(|s| s.reason_code).or(Some(ReasonCode::ConnectionFailed))
-        },
-            time: chrono::Utc::now().to_rfc3339(), tool_count: None };
-        remember(home, agent, name, result.clone());
-        if !ok {
-            let agent = safe_label(agent);
-            let name = safe_label(name);
-            let status = safe_label(status);
-            tracing::warn!(employee = %agent, server = %name, status = %status, "MCP server did not connect");
-            if let Err(e) = crate::trajectory_guard::append_anomaly(home, &json!({
-                "classification":"mcp_start", "agent_id":agent, "server":name,
-                "status":status, "ok":false, "reason_code":result.reason_code, "time":result.time,
-            })) {
-                tracing::warn!(error = %e, "MCP startup anomaly append failed");
+#[derive(Default)]
+struct Results { entries: HashMap<Key, (Instant, StartStatus)> }
+impl Results {
+    fn insert(&mut self, key: Key, status: StartStatus) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_RESULTS {
+            if let Some(oldest) = self.entries.iter().min_by_key(|(_, (time, _))| *time)
+                .map(|(key, _)| key.clone()) {
+                self.entries.remove(&oldest);
             }
         }
+        self.entries.insert(key, (Instant::now(), status));
+    }
+}
+static LAST: LazyLock<Mutex<Results>> = LazyLock::new(|| Mutex::new(Results::default()));
+static PROBES: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(4));
+static IN_FLIGHT: LazyLock<Mutex<HashMap<Key, Arc<AtomicBool>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn last(home: &Path, agent: &str, server: &str) -> Option<StartStatus> {
+    LAST.lock().ok()?.entries.get(&key(home, agent, server)).map(|(_, status)| status.clone())
+}
+fn remember(home: &Path, agent: &str, server: &str, status: StartStatus) {
+    if let Ok(mut map) = LAST.lock() { map.insert(key(home, agent, server), status); }
+}
+
+pub(crate) fn clear(home: &Path, agent: &str, server: Option<&str>) {
+    let agent_key = label_key(agent);
+    let matches = |k: &Key| k.0.as_path() == home && k.1 == agent_key
+        && server.is_none_or(|s| k.2 == label_key(s));
+    // Same lock order as publishing a completed probe. Invalidate work already
+    // running so a late completion cannot restore an obsolete result.
+    if let Ok(active) = IN_FLIGHT.lock() {
+        for (_, valid) in active.iter().filter(|(k, _)| matches(k)) {
+            valid.store(false, Ordering::SeqCst);
+        }
+        if let Ok(mut map) = LAST.lock() { map.entries.retain(|k, _| !matches(k)); }
     }
 }
 
-/// Use exactly the preparation/rewrite/identity attachment used by Claude.
-/// The TempPath must stay alive until the probe child is reaped.
+/// Read names from the final per-child frozen config, never the mutable source.
+pub(crate) fn frozen_names(path: Option<&Path>) -> Vec<String> {
+    let Some(path) = path else { return Vec::new(); };
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new(); };
+    let Ok(config) = serde_json::from_slice::<Value>(&bytes) else { return Vec::new(); };
+    config["mcpServers"].as_object().into_iter().flat_map(|m| m.keys())
+        .filter(|name| name.len() <= 128).take(MAX_INIT_SERVERS).cloned().collect()
+}
+
+// Stop serialisation at the event budget without allocating another event-sized
+// string. Caller-side raw frame limits also avoid feeding oversized init frames.
+fn bounded_event(event: &Value) -> bool {
+    struct Budget(usize);
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.0 { return Err(std::io::ErrorKind::InvalidData.into()); }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    serde_json::to_writer(Budget(MAX_INIT_BYTES), event).is_ok()
+}
+
+pub(crate) fn observe_init(home: &Path, agent: &str, allowed: &[String], event: &Value) {
+    if event["type"] != "system" || event["subtype"] != "init" || !bounded_event(event) { return; }
+    let Some(servers) = event["mcp_servers"].as_array() else { return; };
+    let mut seen = HashSet::new();
+    let mut failures = Vec::new();
+    let time = chrono::Utc::now().to_rfc3339();
+    for server in servers.iter().take(MAX_INIT_SERVERS) {
+        let Some(name) = server["name"].as_str() else { continue; };
+        // Check the original exact name before sanitising any diagnostic label.
+        if name.len() > 128 || !allowed.iter().take(MAX_INIT_SERVERS).any(|n| n == name)
+            || !seen.insert(name) { continue; }
+        let status = safe_label(server["status"].as_str().unwrap_or("unknown"));
+        let ok = server["status"].as_str() == Some("connected");
+        remember(home, agent, name, StartStatus { ok,
+            reason_code: (!ok).then_some(ReasonCode::ConnectionFailed), time: time.clone(), tool_count: None });
+        if !ok { failures.push(json!({"server":safe_label(name), "status":status})); }
+    }
+    if !failures.is_empty() {
+        append_failure(home, json!({"classification":"mcp_start", "agent_id":safe_label(agent),
+            "failures":failures, "ok":false, "reason_code":ReasonCode::ConnectionFailed, "time":time}));
+    }
+}
+
+fn append_failure(home: &Path, record: Value) {
+    if let Err(e) = crate::trajectory_guard::append_anomaly(home, &record) {
+        tracing::warn!(error = %e, "MCP startup anomaly append failed");
+    }
+}
+
+/// Validate and freeze the same effective proxy config without persisted repair.
+/// The TempPath stays alive until the probe child is reaped on every exit path.
 fn prepare(home: &Path, agent: &str, server: &str) -> Result<(Value, tempfile::TempPath), ReasonCode> {
-    let dir = home.join("agents").join(agent);
-    duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&dir)
+    let config = duduclaw_agent::mcp_template::effective_mcp_config_for_probe(&home.join("agents").join(agent))
         .map_err(|_| ReasonCode::PolicyDenied)?;
-    let guard = crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(home, &dir.join(".mcp.json"), false)
-        .map_err(|_| ReasonCode::PolicyDenied)?.ok_or(ReasonCode::PolicyDenied)?;
+    let guard = crate::redaction_proxy::proxy_config_for_probe(home, agent, &config)
+        .map_err(|_| ReasonCode::PolicyDenied)?;
     let config: Value = serde_json::from_slice(&std::fs::read(&guard).map_err(|_| ReasonCode::PolicyDenied)?)
         .map_err(|_| ReasonCode::PolicyDenied)?;
     let entry = config["mcpServers"].get(server).cloned().ok_or(ReasonCode::PolicyDenied)?;
     Ok((entry, guard))
 }
 
+struct Flight { key: Key, valid: Arc<AtomicBool> }
+impl Flight {
+    fn acquire(key: Key) -> Option<Self> {
+        let mut active = IN_FLIGHT.lock().ok()?;
+        if active.contains_key(&key) { return None; }
+        let valid = Arc::new(AtomicBool::new(true));
+        active.insert(key.clone(), valid.clone());
+        Some(Self { key, valid })
+    }
+}
+impl Drop for Flight {
+    fn drop(&mut self) {
+        if let Ok(mut active) = IN_FLIGHT.lock() { active.remove(&self.key); }
+    }
+}
+fn result_status(result: Result<usize, ReasonCode>) -> StartStatus {
+    StartStatus { ok: result.is_ok(), tool_count: result.as_ref().ok().copied(),
+        reason_code: result.err(), time: chrono::Utc::now().to_rfc3339() }
+}
+
 pub(crate) async fn probe(home: &Path, agent: &str, server: &str) -> StartStatus {
+    let probe_key = key(home, agent, server);
+    let occupied = IN_FLIGHT.lock().map(|active| active.contains_key(&probe_key)).unwrap_or(true);
+    if occupied { return result_status(Err(ReasonCode::Busy)); }
+    // Acquire a global permit before admitting a key: queued RPCs cannot grow
+    // the in-flight map. Every process launch is inside both guards' lifetimes.
+    let Ok(Ok(_permit)) = tokio::time::timeout(Duration::from_secs(2), PROBES.acquire()).await else {
+        return result_status(Err(ReasonCode::Busy));
+    };
+    let Some(flight) = Flight::acquire(probe_key) else {
+        return result_status(Err(ReasonCode::Busy));
+    };
     let result = match prepare(home, agent, server) {
-        Ok((entry, _guard)) => probe_entry(&entry, std::time::Duration::from_secs(10)).await,
+        Ok((entry, _guard)) => probe_entry(&entry, Duration::from_secs(10)).await,
         Err(reason) => Err(reason),
     };
-    let status = StartStatus { ok: result.is_ok(), tool_count: result.as_ref().ok().copied(),
-        reason_code: result.err(), time: chrono::Utc::now().to_rfc3339() };
-    remember(home, agent, server, status.clone());
+    let status = result_status(result);
+    if let Ok(_active) = IN_FLIGHT.lock() {
+        if flight.valid.load(Ordering::SeqCst) {
+            remember(home, agent, server, status.clone());
+            if !status.ok {
+                append_failure(home, json!({"classification":"mcp_start", "agent_id":safe_label(agent),
+                    "server":safe_label(server), "ok":false, "reason_code":status.reason_code, "time":status.time}));
+            }
+        }
+    }
     status
 }
 
@@ -157,7 +233,7 @@ mod tests {
     #[test]
     fn init_observes_failed_server_without_failing_turn_or_logging_raw_error() {
         let home = tempfile::tempdir().unwrap();
-        observe_init(home.path(), "employee", &json!({"type":"system", "subtype":"init",
+        observe_init(home.path(), "employee", &["good".into(), "bad".into()], &json!({"type":"system", "subtype":"init",
             "mcp_servers":[{"name":"good","status":"connected"},
                 {"name":"bad","status":"failed","error":"secret-never-log"}]}));
         assert!(last(home.path(), "employee", "good").unwrap().ok);
@@ -166,7 +242,211 @@ mod tests {
         assert_eq!(log.lines().count(), 1);
         assert!(!log.contains("secret-never-log"));
         let record: Value = serde_json::from_str(log.trim()).unwrap();
-        assert_eq!(record["status"], "failed");
+        assert_eq!(record["failures"][0]["status"], "failed");
+    }
+
+    fn init_event(servers: Vec<Value>) -> Value {
+        json!({"type":"system", "subtype":"init", "mcp_servers":servers})
+    }
+
+    #[test]
+    fn init_only_accepts_frozen_exact_names_deduplicates_and_summarises() {
+        let home = tempfile::tempdir().unwrap();
+        let allowed = vec!["real".into(), "other".into()];
+        observe_init(home.path(), "employee", &allowed, &init_event(vec![
+            json!({"name":"real.evil","status":"failed"}),
+            json!({"name":"real","status":"connected"}),
+            json!({"name":"real","status":"failed"}),
+            json!({"name":"other","status":"failed\ncredential-text"}),
+        ]));
+        assert!(last(home.path(), "employee", "real").unwrap().ok);
+        assert!(last(home.path(), "employee", "real.evil").is_none());
+        let log = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        let row: Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(row["failures"].as_array().unwrap().len(), 1);
+        assert_eq!(row["failures"][0]["status"], "failed_credential-text");
+    }
+
+    #[test]
+    fn init_caps_array_event_size_and_label_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        let long_name = "員".repeat(60);
+        let allowed: Vec<String> = (0..65).map(|n| format!("s{n}")).chain([long_name.clone()]).collect();
+        let mut servers: Vec<_> = (0..65).map(|n| json!({"name":format!("s{n}"),"status":"失敗".repeat(70)})).collect();
+        servers.insert(0, json!({"name":long_name,"status":"failed"}));
+        observe_init(home.path(), "employee", &allowed, &init_event(servers));
+        assert!(last(home.path(), "employee", &long_name).is_none());
+        assert!(last(home.path(), "employee", "s63").is_none());
+        assert!(last(home.path(), "employee", "s62").is_some());
+        let log = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        let row: Value = serde_json::from_str(log.trim()).unwrap();
+        for failure in row["failures"].as_array().unwrap() {
+            assert!(failure["status"].as_str().unwrap().len() <= 128);
+        }
+        let mut oversized = init_event(vec![json!({"name":"s0","status":"connected"})]);
+        oversized["padding"] = json!("x".repeat(MAX_INIT_BYTES));
+        observe_init(home.path(), "employee", &allowed, &oversized);
+        assert!(!last(home.path(), "employee", "s0").unwrap().ok);
+        assert_eq!(std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap(), log);
+    }
+
+    #[test]
+    fn map_evicts_only_oldest_and_stores_bounded_sanitised_keys() {
+        let mut map = Results::default();
+        let home = Path::new("isolated-home");
+        for n in 0..=MAX_RESULTS {
+            map.insert(key(home, "員工\n", &format!("server/{n}")), result_status(Ok(n)));
+        }
+        assert_eq!(map.entries.len(), MAX_RESULTS);
+        assert!(!map.entries.contains_key(&key(home, "員工\n", "server/0")));
+        assert!(map.entries.contains_key(&key(home, "員工\n", "server/1")));
+        assert!(map.entries.keys().all(|(_, agent, server)|
+            agent.len() <= 145 && server.len() <= 145 && agent.chars().chain(server.chars())
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))));
+        assert_ne!(key(home, "employee", "a/b"), key(home, "employee", "a_b"));
+    }
+
+    #[tokio::test]
+    async fn concurrency_is_bounded_and_each_key_has_one_flight() {
+        let home = tempfile::tempdir().unwrap();
+        let k = key(home.path(), "employee", "server");
+        let first = Flight::acquire(k.clone()).unwrap();
+        assert!(Flight::acquire(k.clone()).is_none());
+        let status = probe(home.path(), "employee", "server").await;
+        assert_eq!(status.reason_code, Some(ReasonCode::Busy));
+        assert!(last(home.path(), "employee", "server").is_none());
+        drop(first);
+        assert!(Flight::acquire(k).is_some());
+        let permits = PROBES.acquire_many(4).await.unwrap();
+        let status = probe(home.path(), "employee", "server").await;
+        assert_eq!(status.reason_code, Some(ReasonCode::Busy));
+        assert!(last(home.path(), "employee", "server").is_none());
+        drop(permits);
+    }
+
+    #[test]
+    fn clear_scopes_to_employee_and_invalidates_pending_probes() {
+        let home = tempfile::tempdir().unwrap();
+        for agent in ["alice", "bob"] {
+            for server in ["one", "two"] { remember(home.path(), agent, server, result_status(Ok(1))); }
+        }
+        let flight = Flight::acquire(key(home.path(), "alice", "one")).unwrap();
+        clear(home.path(), "alice", Some("one"));
+        assert!(!flight.valid.load(Ordering::SeqCst));
+        assert!(last(home.path(), "alice", "one").is_none());
+        assert!(last(home.path(), "alice", "two").is_some());
+        clear(home.path(), "alice", None);
+        assert!(last(home.path(), "alice", "two").is_none());
+        assert!(last(home.path(), "bob", "one").is_some());
+    }
+
+    #[test]
+    fn frozen_names_do_not_follow_later_source_edits() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("frozen.json");
+        std::fs::write(&path, json!({"mcpServers":{"known":{}}}).to_string()).unwrap();
+        let names = frozen_names(Some(&path));
+        std::fs::write(&path, json!({"mcpServers":{"new":{}}}).to_string()).unwrap();
+        observe_init(home.path(), "employee", &names, &init_event(vec![
+            json!({"name":"known","status":"connected"}), json!({"name":"new","status":"failed"})]));
+        assert!(last(home.path(), "employee", "known").unwrap().ok);
+        assert!(last(home.path(), "employee", "new").is_none());
+        assert!(!home.path().join("channel_failures.jsonl").exists());
+    }
+
+    #[test]
+    fn preparation_refusal_never_repairs_employee_config() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+        for raw in ["{}", "not-json", r#"{"mcpServers":{"forged":{"command":"evil","env":{"DUDUCLAW_AGENT_ID":"victim"}}}}"#] {
+            std::fs::write(&path, raw).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            assert!(matches!(prepare(home.path(), "alice", "missing"), Err(ReasonCode::PolicyDenied)));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+    }
+
+    // Reexec isolates DUDUCLAW_BIN from all other tests. The shim is the
+    // stdio peer fixture, not a substitute for proxy identity-refusal tests.
+    #[cfg(unix)]
+    #[test]
+    fn rpc_probe_outcomes_leave_employee_bytes_mtime_and_directory_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        const TEST: &str = "mcp_start::tests::rpc_probe_outcomes_leave_employee_bytes_mtime_and_directory_unchanged";
+        if std::env::var_os("DDC_PROBE_TEST_CHILD").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let shim = temp.path().join("proxy-fixture");
+            let exe = std::env::current_exe().unwrap().to_string_lossy().replace('\'', "'\"'\"'");
+            std::fs::write(&shim, format!("#!/bin/sh\nexec '{exe}' --exact mcp_start::tests::fixture --ignored --nocapture\n")).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"]).env("DDC_PROBE_TEST_CHILD", "1")
+                .env("DUDUCLAW_BIN", &shim).env("TMPDIR", temp.path()).status().unwrap().success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let dir = home.path().join("agents/alice");
+            std::fs::create_dir_all(&dir).unwrap();
+            let handler = crate::handlers::MethodHandler::new(home.path().into()).await;
+            for (mode, expected) in [("success", None), ("failure", Some(ReasonCode::IdentityRejected)),
+                ("timeout", Some(ReasonCode::Timeout))] {
+                let path = dir.join(".mcp.json");
+                // The persisted file intentionally lacks the built-in slot;
+                // a normal spawn would repair it. A probe must not do so.
+                let raw = json!({"mcpServers":{"fixture":{"command":"fixture", "args":[],
+                    "env":{"MCP_FIXTURE_MODE":mode}}}}).to_string().into_bytes();
+                std::fs::write(&path, &raw).unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let (entry, temp) = prepare(home.path(), "alice", "fixture").unwrap();
+                let temp_path = temp.to_path_buf();
+                assert_eq!(std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777, 0o600);
+                assert!(entry["command"].is_string());
+                drop(temp);
+                assert!(!temp_path.exists());
+                let temp_configs = || -> HashSet<PathBuf> {
+                    std::fs::read_dir(std::env::temp_dir()).unwrap().filter_map(|entry| {
+                        let path = entry.ok()?.path();
+                        path.file_name()?.to_str()?.strip_prefix("duduclaw-mcp-")?;
+                        Some(path)
+                    }).collect()
+                };
+                let before_temp = temp_configs();
+                let frame = Box::pin(handler.handle("mcp.probe", json!({"agent_id":"alice", "server_name":"fixture"}),
+                    &duduclaw_auth::UserContext::admin_fallback())).await;
+                let crate::protocol::WsFrame::Response { ok: true, payload: Some(payload), .. } = frame else {
+                    panic!("probe RPC failed: {frame:?}");
+                };
+                assert_eq!(temp_configs(), before_temp, "{mode} leaked a probe config");
+                let status: StartStatus = serde_json::from_value(payload).unwrap();
+                assert_eq!(status.reason_code, expected, "{mode}");
+                assert_eq!(status.ok, mode == "success");
+                if status.ok { assert_eq!(status.tool_count, Some(1)); }
+                assert_eq!(std::fs::read(&path).unwrap(), raw, "{mode}");
+                assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified, "{mode}");
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "{mode}");
+            }
+            let permits = PROBES.acquire_many(4).await.unwrap();
+            let frame = Box::pin(handler.handle("mcp.probe", json!({"agent_id":"alice","server_name":"fixture"}),
+                &duduclaw_auth::UserContext::admin_fallback())).await;
+            let crate::protocol::WsFrame::Response { ok: true, payload: Some(payload), .. } = frame else { panic!("busy RPC"); };
+            assert_eq!(payload["reason_code"], "busy");
+            // A busy install probe must not retain the old start result.
+            remember(home.path(), "alice", "missing", result_status(Ok(99)));
+            handler.handle_mcp_update(&json!({"agent_id":"alice","action":"edit", "server_name":"missing",
+                "server_def":{"command":"/nonexistent/mcp-fixture","args":[],"env":{}}})).await;
+            assert!(last(home.path(), "alice", "missing").is_none());
+            drop(permits);
+            remember(home.path(), "alice", "missing", result_status(Ok(99)));
+            handler.handle_mcp_update(&json!({"agent_id":"alice","action":"remove","server_name":"missing"})).await;
+            assert!(last(home.path(), "alice", "missing").is_none());
+        });
     }
 
     #[test]
@@ -175,7 +455,10 @@ mod tests {
         // Separate libtest progress text from protocol frames.
         println!();
         use std::io::{BufRead, Write};
-        let mode = std::env::var("MCP_FIXTURE_MODE").unwrap_or_default();
+        let mode = std::env::var("MCP_FIXTURE_MODE").ok().or_else(|| {
+            let raw = std::env::var(crate::redaction_proxy::PROXY_UPSTREAM_ENV_VAR).ok()?;
+            serde_json::from_str::<Value>(&raw).ok()?["MCP_FIXTURE_MODE"].as_str().map(str::to_owned)
+        }).unwrap_or_default();
         if mode == "timeout" { std::thread::sleep(std::time::Duration::from_secs(30)); return; }
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break; };

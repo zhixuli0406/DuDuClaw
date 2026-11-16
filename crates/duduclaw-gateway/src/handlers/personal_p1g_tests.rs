@@ -98,7 +98,7 @@ fn p1g_allowlisted_management_actions_pass_with_audit() {
     // P1h: no prefix match (an unreviewed lifecycle-looking name is not
     // exempt) and `topology.list` left the allowlist (N6).
     for method in ["agents.update", "cron.update", "heartbeat.trigger", "memory.search", "odoo.agent_config_set",
-        "mcp.update", "experts.remove", "org.apply_change", "finetune.datasets.preview", "belief.recent",
+        "mcp.update", "mcp.probe", "experts.remove", "org.apply_change", "finetune.datasets.preview", "belief.recent",
         "topology.list", "isolation.employee_restore", "isolation.anything_new", "migration.other",
         "me.isolation.anything_new"] {
         assert!(!metadata_allowlisted(method), "{method}");

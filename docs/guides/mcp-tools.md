@@ -26,31 +26,41 @@ that a server connected. Disabled TOML entries stay disabled. No automatic
 migration or credential transfer occurs between formats. When both formats
 register the same server, the in-process loop prefers its TOML mount.
 
-Adding or editing a stdio entry through the administrator-only `mcp.update`
-RPC saves it, then performs a start probe through the same spawn gate and
-identity-bearing temporary proxy configuration as a real run. The probe sends
-`initialize` and `tools/list`, with a 10-second deadline and process cleanup on
-completion or timeout. It never calls an upstream tool. The response includes
-`probe: {ok, tool_count, reason_code}`; the dashboard displays it after saving.
-A failed probe leaves the entry saved, so an administrator can supply missing
-credentials and retry. Success confirms startup and visible tool discovery,
-not permission to call every tool or remote-service health.
+Adding or editing a stdio entry through administrator-only `mcp.update` saves it,
+clears its previous start result, then runs the same bounded probe as the MCP
+page's **Check now** action (`mcp.probe`, `{agent_id, server_name}`, also Admin
+only). The probe validates and produces the effective config in memory without
+repairing `.mcp.json` or writing under the employee directory. Its only config
+file is a 0600 temporary proxy config, removed on completion, failure or timeout.
+It sends `initialize` and `tools/list` with a 10-second deadline, cleans up the
+child, and never calls an upstream tool. `mcp.probe` returns
+`{ok, tool_count, reason_code}`; `mcp.update` returns it in `probe` after saving.
+A failed probe keeps the saved entry. Success confirms startup and visible tool
+discovery, not tool-call permission or remote-service health. At most four probes
+run gateway-wide, with a two-second permit wait; concurrent checks for the same
+employee/server or an exhausted permit wait return `busy`. Retry shortly.
 
-A proxy startup refusal retains the existing fail-closed identity checks. It
-appends one bounded, sanitised `mcp_start` record to
-`<DUDUCLAW_HOME>/channel_failures.jsonl` under a cross-process lock and answers
-the first JSON-RPC request with error `-32001`, a fixed message, and
-`error.data.reason_code`. `identity_rejected` covers the identity verifier's
-rejected verdict, including absent/invalid credentials or unreadable policy
-or key; diagnostics do not re-run verification to guess a narrower cause.
-Tokens, environment values and upstream arguments are not recorded.
+A proxy refusal keeps the same identity checks and fail-closed order. The proxy
+writes no startup result to shared files: it answers its own peer's first
+JSON-RPC request with `-32001`, a fixed message and `error.data.reason_code`, and
+prints a fixed reason-code line to its own stderr. `identity_rejected` covers the
+verifier's rejected verdict (including missing/invalid credentials or unreadable
+policy/key); diagnostics do not re-run verification to infer a narrower cause.
+Only the gateway records start results: a probe reads the reason from its proxy
+peer's error frame, and a gateway-spawned Claude `system/init` event supplies only
+connected / not connected (`connection_failed`). The init observer accepts exact
+names from that spawn's frozen effective config, limits event size, names and
+statuses, deduplicates up to 64 entries and appends at most one failure summary
+per event. Failed probes may append one sanitised `mcp_start` anomaly through the
+gateway's locked, bounded `channel_failures.jsonl` helper. Tokens, env values and
+upstream arguments are excluded. A failed init event does not fail the turn.
 
-For Claude chat and background runs, disconnected servers in `system/init`
-produce a gateway WARN and an anomaly record without failing the turn. The
-MCP page shows the last known result, translated reason and timestamp through
-optional `mcp.list` `last_start` fields. Unknown results remain unknown; the
-in-gateway cache is bounded and disposable, and recent proxy refusal records
-can supply diagnostics after a restart. This is not continuous health monitoring.
+`mcp.list` reads `last_start` only from the gateway's bounded memory map (oldest
+entries are evicted); it never reads JSONL as a status source. The page shows the
+translated reason and timestamp. After a runtime “not connected” result, use
+**Check now** for the precise reason. Removing/updating a server or deleting its
+employee clears the previous result; restarting the gateway loses the map.
+Unknown remains unknown. This is not continuous health monitoring.
 
 ## MCP client protocol versions
 

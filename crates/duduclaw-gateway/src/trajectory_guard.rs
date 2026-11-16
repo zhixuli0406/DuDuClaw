@@ -649,7 +649,23 @@ pub fn anomaly_record(
 /// gateway and Python adapters). Best-effort: returns the io result so the
 /// caller can log-and-continue; a failure here must never break a reply.
 pub fn append_anomaly(home_dir: &Path, record: &serde_json::Value) -> std::io::Result<()> {
-    duduclaw_security::audit::append_anomaly(home_dir, record)
+    let path = home_dir.join("channel_failures.jsonl");
+    let mut masked = record.clone();
+    duduclaw_security::credential_detect::mask_json(&mut masked);
+    let line = format!("{masked}\n");
+    // Keep both a single record and the retained log bounded under the same
+    // advisory lock. Startup diagnostics never need raw upstream payloads.
+    if line.len() > 64 * 1024 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "anomaly record too large"));
+    }
+    duduclaw_core::with_file_lock(&path, || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        if file.metadata()?.len().saturating_add(line.len() as u64) > 4 * 1024 * 1024 {
+            file.set_len(0)?;
+        }
+        file.write_all(line.as_bytes())
+    })
 }
 
 #[cfg(test)]
@@ -1249,6 +1265,18 @@ mod tests {
         let stored = std::fs::read_to_string(dir.path().join("channel_failures.jsonl")).unwrap();
         assert!(!stored.contains("fixture-"));
         assert!(serde_json::from_str::<serde_json::Value>(stored.trim()).is_ok());
+    }
+
+    #[test]
+    fn anomaly_sink_bounds_record_and_retained_file() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("channel_failures.jsonl");
+        std::fs::write(&path, vec![b' '; 4 * 1024 * 1024]).unwrap();
+        append_anomaly(home.path(), &serde_json::json!({"classification":"mcp_start"})).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let before = std::fs::read(&path).unwrap();
+        assert!(append_anomaly(home.path(), &serde_json::json!({"large":"x".repeat(65536)})).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]

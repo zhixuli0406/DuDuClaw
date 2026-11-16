@@ -16,11 +16,12 @@ pub enum ReasonCode {
     ProtocolError,
     Timeout,
     ConnectionFailed,
+    Busy,
 }
 
 /// Treat labels as untrusted claims, never as authority or free-form log text.
 pub fn safe_label(value: &str) -> String {
-    value.chars().take(128).map(|c| {
+    crate::truncate_bytes(value, 128).chars().map(|c| {
         if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }
     }).collect()
 }
@@ -39,7 +40,7 @@ mod tests {
     #[test]
     fn labels_are_bounded_and_cannot_inject_log_lines() {
         let label = super::safe_label(&format!("員工\n\r\t{}", "🦀".repeat(200)));
-        assert_eq!(label.chars().count(), 128);
+        assert!(label.len() <= 128);
         assert!(!label.chars().any(char::is_control));
         assert!(label.starts_with("員工___"));
     }

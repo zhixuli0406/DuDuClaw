@@ -364,6 +364,22 @@ pub fn write_fresh_duduclaw_config(build_dir: &Path, final_dir: &Path) -> Result
 }
 
 fn ensure_duduclaw_absolute_path_checked(agent_dir: &Path, raw_spawn: bool) -> Result<bool, String> {
+    effective_duduclaw_config(agent_dir, raw_spawn, true).map(|(changed, _)| changed)
+}
+
+/// Validate and regenerate the effective spawn config without repairing or
+/// creating any file (including a lock file) under the employee directory.
+/// The caller must freeze this returned value, never reread the original file.
+pub fn effective_mcp_config_for_probe(agent_dir: &Path) -> Result<serde_json::Value, String> {
+    if !is_repairable_agent_dir(agent_dir) || !agent_dir.is_dir() {
+        return Err("not an employee directory".into());
+    }
+    effective_duduclaw_config(agent_dir, true, false).map(|(_, config)| config)
+}
+
+fn effective_duduclaw_config(
+    agent_dir: &Path, raw_spawn: bool, persist: bool,
+) -> Result<(bool, serde_json::Value), String> {
     let path = agent_dir.join(".mcp.json");
 
     let abs_bin = duduclaw_core::resolve_duduclaw_bin();
@@ -391,7 +407,7 @@ fn ensure_duduclaw_absolute_path_checked(agent_dir: &Path, raw_spawn: bool) -> R
         &home_dir, &agent_id, &abs_bin,
     );
 
-    with_mcp_config_lock(&path, || {
+    let prepare = || {
         let (mut doc, created) = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 (serde_json::json!({ "mcpServers": {} }), true)
@@ -482,8 +498,8 @@ fn ensure_duduclaw_absolute_path_checked(agent_dir: &Path, raw_spawn: bool) -> R
             servers.insert(key.clone(), desired.clone());
             changed = true;
         }
-        if !changed {
-            return Ok(false);
+        if !changed || !persist {
+            return Ok((changed, doc));
         }
         let json = serde_json::to_string_pretty(&doc)
             .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
@@ -494,8 +510,9 @@ fn ensure_duduclaw_absolute_path_checked(agent_dir: &Path, raw_spawn: bool) -> R
             agent_id = %agent_id,
             "Repaired duduclaw MCP server entry (command, args, env regenerated)"
         );
-        Ok(true)
-    })
+        Ok((true, doc))
+    };
+    if persist { with_mcp_config_lock(&path, prepare) } else { prepare() }
 }
 
 /// Whether `agent_dir` is an employee directory this module repairs:

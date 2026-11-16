@@ -325,6 +325,7 @@ export function McpPage() {
                       selectedAgentId &&
                       setAddPreset({ agentId: selectedAgentId, serverName: entry.name, lock: true })
                     }
+                    agentId={selectedAgentId ?? undefined}
                     onRemove={() => selectedAgentId && setRemoveTarget({ agentId: selectedAgentId, serverName: entry.name })}
                   />
                 ))}
@@ -415,7 +416,7 @@ export function McpPage() {
 const START_REASONS = new Set([
   'spawn_scope_unavailable', 'server_missing', 'command_missing', 'identity_rejected',
   'environment_rejected', 'redaction_unavailable', 'upstream_spawn_failed',
-  'upstream_io_unavailable', 'policy_denied', 'protocol_error', 'timeout', 'connection_failed',
+  'upstream_io_unavailable', 'policy_denied', 'protocol_error', 'timeout', 'connection_failed', 'busy',
 ]);
 
 export function McpStartOutcome({ result }: { result: McpStartResult }) {
@@ -435,7 +436,9 @@ export function ServerRow({
   canEdit,
   onEdit,
   onRemove,
+  agentId,
 }: {
+  agentId?: string;
   entry: McpServerEntry;
   canEdit: boolean;
   onEdit: () => void;
@@ -443,12 +446,35 @@ export function ServerRow({
 }) {
   const intl = useIntl();
   const transport = transportOf(entry);
+  const [checking, setChecking] = useState(false);
+  const [checked, setChecked] = useState<McpStartResult | null>(null);
+  const checkEpoch = useRef(0);
+  useEffect(() => {
+    checkEpoch.current += 1;
+    setChecked(null);
+    setChecking(false);
+    return () => { checkEpoch.current += 1; };
+  }, [entry, agentId]);
+  const result = checked ?? entry.last_start;
+  const checkNow = async () => {
+    if (!agentId || checking) return;
+    const epoch = checkEpoch.current;
+    setChecking(true);
+    try {
+      const next = await api.mcp.probe(agentId, entry.name);
+      if (epoch === checkEpoch.current) setChecked(next);
+    } catch {
+      if (epoch === checkEpoch.current) toast.error(intl.formatMessage({ id: 'common.error' }));
+    } finally {
+      if (epoch === checkEpoch.current) setChecking(false);
+    }
+  };
   const envCount = Object.keys(entry.env).length;
   return (
     <ListGridRow className="cursor-default">
       <ListGridCell className="gap-2">
-        <span className={cn('size-1.5 shrink-0 rounded-full', entry.last_start
-          ? entry.last_start.ok ? 'bg-success' : 'bg-destructive' : 'bg-muted-foreground')} />
+        <span className={cn('size-1.5 shrink-0 rounded-full', result
+          ? result.ok ? 'bg-success' : 'bg-destructive' : 'bg-muted-foreground')} />
         <Plug className="size-4 shrink-0 text-muted-foreground" />
         <span className="truncate text-sm font-medium text-foreground" title={entry.name}>
           {entry.name}
@@ -464,7 +490,7 @@ export function ServerRow({
               ? intl.formatMessage({ id: 'mcp.runtime.inProcess' }) : (({ claude: 'Claude', codex: 'Codex', grok: 'Grok' } as Record<string, string>)[r] ?? '')).filter(Boolean).join(', '),
           })}</div>}
           {entry.source === 'agent_toml' && <div>{intl.formatMessage({ id: 'mcp.agentTomlNote' })}</div>}
-          {entry.last_start && <McpStartOutcome result={entry.last_start} />}
+          {result && <McpStartOutcome result={result} />}
         </div>
       </ListGridCell>
       <ListGridCell>
@@ -474,6 +500,11 @@ export function ServerRow({
         <span className="font-mono text-xs tabular-nums text-muted-foreground">{envCount}</span>
       </ListGridCell>
       <ListGridCell className="justify-end">
+        {canEdit && agentId && entry.command.trim().length > 0 && (
+          <Button variant="ghost" size="sm" disabled={checking} onClick={() => void checkNow()}>
+            {intl.formatMessage({ id: checking ? 'mcp.probe.checking' : 'mcp.probe.checkNow' })}
+          </Button>
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger
             render={
