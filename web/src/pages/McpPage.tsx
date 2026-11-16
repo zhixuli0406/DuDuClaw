@@ -9,7 +9,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { toast } from '@/lib/toast';
-import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate, type McpServerEntry } from '@/lib/api';
+import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate, type McpServerEntry, type McpStartResult } from '@/lib/api';
 import { DangerZone, ConfirmDialog } from '@/components/settings/controls';
 import { AutonomyNote } from '@/components/AutonomyNote';
 import { AgentSelect, type AgentLite } from '@/components/mcp/AgentSelect';
@@ -139,6 +139,7 @@ export function McpPage() {
   const [selectedAgentId, setSelectedAgentId] = useUrlStateNullable('mcp_agent');
   // `null` = closed. One dialog for every install / edit entry point.
   const [addPreset, setAddPreset] = useState<AddDialogPreset | null>(null);
+  const lastProbe = useMcpStore((s) => s.lastProbe);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [catalogFilter, setCatalogFilter] = useUrlStateNullable('mcp_cat');
@@ -223,6 +224,10 @@ export function McpPage() {
 
   return (
     <div className="space-y-6">
+      {lastProbe && <div role="status" className="text-sm">
+        {intl.formatMessage({ id: 'mcp.probe.saved' }, { server: lastProbe.server, agent: lastProbe.agent })}
+        <McpStartOutcome result={lastProbe.result} />
+      </div>}
       {/* Slim header (inside the Integrations tab — no big page title). */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-muted-foreground">
@@ -313,13 +318,14 @@ export function McpPage() {
               >
                 {serverEntries.map((entry) => (
                   <ServerRow
-                    key={entry.name}
+                    key={`${entry.source ?? "mcp_json"}:${entry.name}`}
                     entry={entry}
-                    canEdit={isAdmin}
+                    canEdit={isAdmin && entry.source !== 'agent_toml' && !entry.read_only}
                     onEdit={() =>
                       selectedAgentId &&
                       setAddPreset({ agentId: selectedAgentId, serverName: entry.name, lock: true })
                     }
+                    agentId={selectedAgentId ?? undefined}
                     onRemove={() => selectedAgentId && setRemoveTarget({ agentId: selectedAgentId, serverName: entry.name })}
                   />
                 ))}
@@ -407,14 +413,32 @@ export function McpPage() {
   );
 }
 
+const START_REASONS = new Set([
+  'spawn_scope_unavailable', 'server_missing', 'command_missing', 'identity_rejected',
+  'environment_rejected', 'redaction_unavailable', 'upstream_spawn_failed',
+  'upstream_io_unavailable', 'policy_denied', 'protocol_error', 'timeout', 'connection_failed', 'busy',
+]);
+
+export function McpStartOutcome({ result }: { result: McpStartResult }) {
+  const intl = useIntl();
+  const reason = result.reason_code && START_REASONS.has(result.reason_code) ? result.reason_code : 'connection_failed';
+  return <div className={result.ok ? 'text-success' : 'text-destructive'}>
+    {intl.formatMessage({ id: result.ok ? 'mcp.start.connected' : `mcp.start.${reason}` })}
+    {result.tool_count != null && <> · {intl.formatMessage({ id: 'mcp.probe.tools' }, { count: result.tool_count })}</>}
+    {result.time && <> · <time dateTime={result.time}>{result.time}</time></>}
+  </div>;
+}
+
 // ── Agent-config server row (spec §4 ListGrid) ─────────────────
 
-function ServerRow({
+export function ServerRow({
   entry,
   canEdit,
   onEdit,
   onRemove,
+  agentId,
 }: {
+  agentId?: string;
   entry: McpServerEntry;
   canEdit: boolean;
   onEdit: () => void;
@@ -422,20 +446,52 @@ function ServerRow({
 }) {
   const intl = useIntl();
   const transport = transportOf(entry);
+  const [checking, setChecking] = useState(false);
+  const [checked, setChecked] = useState<McpStartResult | null>(null);
+  const checkEpoch = useRef(0);
+  useEffect(() => {
+    checkEpoch.current += 1;
+    setChecked(null);
+    setChecking(false);
+    return () => { checkEpoch.current += 1; };
+  }, [entry, agentId]);
+  const result = checked ?? entry.last_start;
+  const checkNow = async () => {
+    if (!agentId || checking) return;
+    const epoch = checkEpoch.current;
+    setChecking(true);
+    try {
+      const next = await api.mcp.probe(agentId, entry.name);
+      if (epoch === checkEpoch.current) setChecked(next);
+    } catch {
+      if (epoch === checkEpoch.current) toast.error(intl.formatMessage({ id: 'common.error' }));
+    } finally {
+      if (epoch === checkEpoch.current) setChecking(false);
+    }
+  };
   const envCount = Object.keys(entry.env).length;
   return (
     <ListGridRow className="cursor-default">
       <ListGridCell className="gap-2">
-        <span className="size-1.5 shrink-0 rounded-full bg-success" title={intl.formatMessage({ id: 'common.enabled' })} />
+        <span className={cn('size-1.5 shrink-0 rounded-full', result
+          ? result.ok ? 'bg-success' : 'bg-destructive' : 'bg-muted-foreground')} />
         <Plug className="size-4 shrink-0 text-muted-foreground" />
         <span className="truncate text-sm font-medium text-foreground" title={entry.name}>
           {entry.name}
         </span>
       </ListGridCell>
       <ListGridCell>
-        <span className="truncate font-mono text-xs text-muted-foreground" title={`${entry.command} ${entry.args.join(' ')}`}>
-          {entry.command} {entry.args.join(' ')}
-        </span>
+        <div className="min-w-0 text-xs text-muted-foreground">
+          <div className="truncate font-mono" title={`${entry.command} ${entry.args.join(' ')}`}>
+            {entry.command} {entry.args.join(' ')}
+          </div>
+          {entry.effective_runtimes && <div>{intl.formatMessage({ id: 'mcp.usedBy' }, {
+            runtimes: entry.effective_runtimes.map((r) => r === 'in_process'
+              ? intl.formatMessage({ id: 'mcp.runtime.inProcess' }) : (({ claude: 'Claude', codex: 'Codex', grok: 'Grok' } as Record<string, string>)[r] ?? '')).filter(Boolean).join(', '),
+          })}</div>}
+          {entry.source === 'agent_toml' && <div>{intl.formatMessage({ id: 'mcp.agentTomlNote' })}</div>}
+          {result && <McpStartOutcome result={result} />}
+        </div>
       </ListGridCell>
       <ListGridCell>
         <Badge variant="secondary">{transport}</Badge>
@@ -444,6 +500,11 @@ function ServerRow({
         <span className="font-mono text-xs tabular-nums text-muted-foreground">{envCount}</span>
       </ListGridCell>
       <ListGridCell className="justify-end">
+        {canEdit && agentId && entry.command.trim().length > 0 && (
+          <Button variant="ghost" size="sm" disabled={checking} onClick={() => void checkNow()}>
+            {intl.formatMessage({ id: checking ? 'mcp.probe.checking' : 'mcp.probe.checkNow' })}
+          </Button>
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger
             render={
@@ -462,7 +523,7 @@ function ServerRow({
               <Pencil />
               {intl.formatMessage({ id: 'common.edit' })}
             </DropdownMenuItem>
-            <DropdownMenuItem variant="destructive" onClick={onRemove}>
+            <DropdownMenuItem variant="destructive" onClick={onRemove} disabled={!canEdit}>
               <Trash2 />
               {intl.formatMessage({ id: 'mcp.remove' })}
             </DropdownMenuItem>

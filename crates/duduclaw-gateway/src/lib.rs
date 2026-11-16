@@ -793,3 +793,5 @@ pub mod meeting_jobs;
 
 pub mod meeting_uploads;
 pub mod meeting_links;
+
+mod mcp_start;

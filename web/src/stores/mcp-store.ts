@@ -1,7 +1,8 @@
 import { create } from 'zustand';
-import { api, type McpAgentConfig, type McpCatalogItem, type McpServerDef, type McpOAuthProvider } from '@/lib/api';
+import { api, type McpAgentConfig, type McpCatalogItem, type McpServerDef, type McpOAuthProvider, type McpStartResult } from '@/lib/api';
 
 interface McpStore {
+  lastProbe: { agent: string; server: string; result: McpStartResult } | null;
   readonly agentConfigs: ReadonlyArray<McpAgentConfig>;
   readonly catalog: ReadonlyArray<McpCatalogItem>;
   readonly loading: boolean;
@@ -18,6 +19,7 @@ interface McpStore {
 }
 
 export const useMcpStore = create<McpStore>((set, get) => ({
+  lastProbe: null,
   agentConfigs: [],
   catalog: [],
   loading: false,
@@ -38,11 +40,13 @@ export const useMcpStore = create<McpStore>((set, get) => ({
   },
   addServer: async (agentId, name, def) => {
     try {
-      await api.mcp.update(agentId, 'add', name, def);
+      const response = await api.mcp.update(agentId, 'add', name, def);
+      set({ lastProbe: response.probe ? { agent: agentId, server: name, result: response.probe } : null });
       // Re-fetch to get the authoritative state after update
       await get().fetchAll();
-    } catch {
+    } catch (e) {
       set({ error: 'mcp.loadFailed' });
+      throw e;
     }
   },
   removeServer: async (agentId, name) => {

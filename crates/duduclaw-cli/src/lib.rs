@@ -4268,6 +4268,20 @@ pub async fn entry_point() {
     if let Commands::Tooling(ToolingCommands::KnowledgeExtract { format, input, max_chars }) = &cli.command {
         knowledge_extract_cmd::run(format, input, *max_chars);
     }
+    if matches!(&cli.command, Commands::Tooling(ToolingCommands::McpProxy { .. })) {
+        // An unverified proxy must not create gateway log/override files.
+        // Its only diagnostic peer is its own stderr and JSON-RPC stdio.
+        if let Some(mode) = cli.redact.as_deref() {
+            // Same per-process redaction flag as the normal CLI entry path.
+            unsafe { std::env::set_var("DUDUCLAW_REDACT_CLI_FLAG", mode); }
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        if run(cli).await.is_err() {
+            // Startup refusals have already reported their closed reason code.
+            std::process::exit(1);
+        }
+        return;
+    }
     if is_read_only_survival_command(&cli.command) {
         // Analysis must reach neither persistent logging/OTLP initialization
         // nor the persistent redaction override path before dispatch.
@@ -15772,3 +15786,6 @@ if [ -t 1 ]; then printf 'pty-probe-ok'; fi
     }
 }
 mod users_mfa_cmd;
+
+#[cfg(test)]
+mod third_party_mcp_tests;

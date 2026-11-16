@@ -3117,8 +3117,25 @@ export interface McpServerDef {
   env: Record<string, string>;
 }
 
+export interface McpLastStartResult {
+  ok: boolean;
+  tool_count?: number | null;
+  reason_code?: string | null;
+  time?: string;
+}
+
+export interface McpStartResult {
+  ok: boolean;
+  tool_count?: number | null;
+  reason_code?: string | null;
+}
+
 export interface McpServerEntry extends McpServerDef {
   name: string;
+  source?: 'mcp_json' | 'agent_toml';
+  read_only?: boolean;
+  effective_runtimes?: string[];
+  last_start?: McpLastStartResult | null;
 }
 
 export interface McpAgentConfig {
@@ -8843,13 +8860,15 @@ export const api = {
   mcp: {
     list: () =>
       client.call('mcp.list') as Promise<{ agents: McpAgentConfig[]; catalog: McpCatalogItem[] }>,
-    update: (agentId: string, action: 'add' | 'remove', serverName: string, serverDef?: McpServerDef) =>
+    probe: (agentId: string, serverName: string) =>
+      client.call('mcp.probe', { agent_id: agentId, server_name: serverName }) as Promise<McpStartResult>,
+    update: (agentId: string, action: 'add' | 'edit' | 'remove', serverName: string, serverDef?: McpServerDef) =>
       client.call('mcp.update', {
         agent_id: agentId,
         action,
         server_name: serverName,
         ...(serverDef ? { server_def: serverDef } : {}),
-      }).then(notifyDisconnectForget) as Promise<{ success: boolean }>,
+      }).then(notifyDisconnectForget) as Promise<{ success: boolean; probe?: McpStartResult }>,
     oauthProviders: () =>
       client.call('mcp.oauth.providers') as Promise<{ providers: McpOAuthProvider[] }>,
     oauthStart: (providerId: string, clientId?: string, clientSecret?: string, acknowledgeGoogleData?: boolean) =>

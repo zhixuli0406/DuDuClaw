@@ -414,6 +414,7 @@ pub fn upstream_env_blob(
 /// The message is constructed from server/env names only, never credential data.
 async fn startup_error_frame<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     input: R, output: &mut W, message: &str,
+    reason: Option<duduclaw_core::mcp_start_status::ReasonCode>,
 ) {
     use tokio::io::AsyncReadExt;
     let mut input = BufReader::new(input.take(65536));
@@ -422,7 +423,7 @@ async fn startup_error_frame<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if let Ok(frame) = serde_json::from_str::<Value>(&line) {
             if let Some(id) = frame.get("id") {
                 let error = serde_json::json!({"jsonrpc":"2.0", "id":id,
-                    "error":{"code":-32001,"message":message}});
+                    "error":{"code":-32001,"message":message,"data":{"reason_code":reason}}});
                 let _ = write_line(output, &error.to_string()).await;
             }
         }
@@ -934,6 +935,17 @@ async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, line: &str) -> std::io::Re
     w.flush().await
 }
 
+/// Report only a fixed diagnostic. Identity verification is not repeated here:
+/// its existing verdict deliberately does not expose which credential failed.
+async fn report_startup_refusal(reason: duduclaw_core::mcp_start_status::ReasonCode) {
+    // Only the gateway may attribute and persist a startup result. This process
+    // reports solely to its own stdio peer; environment claims are not evidence.
+    eprintln!("mcp-proxy startup_refused reason_code={}",
+        serde_json::to_value(reason).expect("closed reason code").as_str().expect("string reason code"));
+    startup_error_frame(tokio::io::stdin(), &mut tokio::io::stdout(),
+        "MCP server startup refused", Some(reason)).await;
+}
+
 // ── Subcommand entry point ──────────────────────────────────────────────────
 
 /// `duduclaw mcp-proxy --server <name> -- <cmd> [args…]`.
@@ -970,6 +982,7 @@ pub async fn run_mcp_proxy_scoped(
     args: &[String],
     spawn_scoped: bool,
 ) -> Result<i32> {
+    use duduclaw_core::mcp_start_status::ReasonCode;
     // Checked before anything else starts: a refused spawn-scoped proxy
     // launches no upstream and initialises nothing.
     let scoped_blob = if spawn_scoped {
@@ -979,7 +992,7 @@ pub async fn run_mcp_proxy_scoped(
         ) {
             Ok(blob) => Some(blob),
             Err(why) => {
-                tracing::warn!(server = %server, reason = %why, "mcp-proxy: spawn-scoped entry not registered for this spawn — not starting the upstream");
+                report_startup_refusal(ReasonCode::SpawnScopeUnavailable).await;
                 return Err(DuDuClawError::Gateway(format!(
                     "mcp-proxy: MCP server '{server}' is not available here ({why})"
                 )));
@@ -989,18 +1002,21 @@ pub async fn run_mcp_proxy_scoped(
         None
     };
     if server.trim().is_empty() {
+        report_startup_refusal(ReasonCode::ServerMissing).await;
         return Err(DuDuClawError::Gateway(
             "mcp-proxy: --server must be a non-empty server name".to_string(),
         ));
     }
     if command.trim().is_empty() {
+        report_startup_refusal(ReasonCode::CommandMissing).await;
         return Err(DuDuClawError::Gateway(
             "mcp-proxy: missing upstream command after `--`".to_string(),
         ));
     }
 
-    let default_agent = crate::mcp::get_default_agent(home_dir).await;
+    let default_agent = crate::mcp::get_default_agent_for_proxy(home_dir).await;
     if default_agent == duduclaw_core::UNTRUSTED_AGENT_ID {
+        report_startup_refusal(ReasonCode::IdentityRejected).await;
         return Err(DuDuClawError::Gateway(
             "MCP caller identity rejected: refusing to start the upstream proxy".into(),
         ));
@@ -1041,7 +1057,7 @@ pub async fn run_mcp_proxy_scoped(
     let env_pairs = match resolved {
         Ok(pairs) => pairs,
         Err(message) => {
-            startup_error_frame(tokio::io::stdin(), &mut tokio::io::stdout(), &message).await;
+            report_startup_refusal(ReasonCode::EnvironmentRejected).await;
             return Err(DuDuClawError::Gateway(message));
         }
     };
@@ -1066,6 +1082,7 @@ pub async fn run_mcp_proxy_scoped(
             opt.map(Arc::new)
         }
         Err(e) => {
+            report_startup_refusal(ReasonCode::RedactionUnavailable).await;
             tracing::error!(
                 server = %server,
                 error = %e,
@@ -1089,23 +1106,32 @@ pub async fn run_mcp_proxy_scoped(
 
     let mut cmd = upstream_command(command, args, env_pairs, upstream_is_bridge);
 
-    let mut child = duduclaw_core::execution_gate::with_runtime(
+    let spawned = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Registered(
             duduclaw_core::execution_gate::Text::new("third-party-mcp".into()).expect("constant runtime id")),
         duduclaw_core::execution_gate::spawn(&mut cmd,
-        duduclaw_core::execution_gate::ExecutionClass::ThirdPartyMcp)).await.map_err(|e| {
-        DuDuClawError::Gateway(format!(
-            "mcp-proxy: failed to spawn upstream '{command}': {e}"
-        ))
-    })?;
-    let upstream_in = child
-        .stdin
-        .take()
-        .ok_or_else(|| DuDuClawError::Gateway("mcp-proxy: upstream stdin unavailable".into()))?;
-    let upstream_out = child
-        .stdout
-        .take()
-        .ok_or_else(|| DuDuClawError::Gateway("mcp-proxy: upstream stdout unavailable".into()))?;
+            duduclaw_core::execution_gate::ExecutionClass::ThirdPartyMcp)).await;
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            report_startup_refusal(ReasonCode::UpstreamSpawnFailed).await;
+            return Err(DuDuClawError::Gateway(format!("mcp-proxy: failed to spawn upstream '{command}': {e}")));
+        }
+    };
+    let upstream_in = match child.stdin.take() {
+        Some(pipe) => pipe,
+        None => {
+            report_startup_refusal(ReasonCode::UpstreamIoUnavailable).await;
+            return Err(DuDuClawError::Gateway("mcp-proxy: upstream stdin unavailable".into()));
+        }
+    };
+    let upstream_out = match child.stdout.take() {
+        Some(pipe) => pipe,
+        None => {
+            report_startup_refusal(ReasonCode::UpstreamIoUnavailable).await;
+            return Err(DuDuClawError::Gateway("mcp-proxy: upstream stdout unavailable".into()));
+        }
+    };
 
     let io = ProxyIo {
         client_in: Box::new(tokio::io::stdin()),
@@ -1694,12 +1720,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refusal_error_has_fixed_message_and_closed_reason() {
+        let mut output = Vec::new();
+        startup_error_frame(
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"request-1\",\"method\":\"initialize\"}\n".as_slice(),
+            &mut output, "MCP server startup refused",
+            Some(duduclaw_core::mcp_start_status::ReasonCode::IdentityRejected)).await;
+        let frame: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(frame["jsonrpc"], "2.0");
+        assert_eq!(frame["id"], "request-1");
+        assert_eq!(frame["error"]["code"], -32001);
+        assert_eq!(frame["error"]["message"], "MCP server startup refused");
+        assert_eq!(frame["error"]["data"]["reason_code"], "identity_rejected");
+    }
+
+    #[tokio::test]
     async fn unresolved_startup_answers_with_an_mcp_error() {
         let request = br#"{"jsonrpc":"2.0","id":17,"method":"initialize"}
 "#;
         let mut output = Vec::new();
         startup_error_frame(request.as_slice(), &mut output,
-            "MCP server 'server': unresolved env 'API_KEY'; upstream was not started").await;
+            "MCP server 'server': unresolved env 'API_KEY'; upstream was not started", None).await;
         let frame: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(frame["id"], 17);
         assert_eq!(frame["error"]["code"], -32001);

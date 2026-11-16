@@ -71,7 +71,7 @@ async fn background_stream_parser_preserves_partial_and_empty_or_missing_result(
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"已完成第一步"}]}}"#)).unwrap();
         let mut cmd = tokio::process::Command::new("/bin/cat");
         cmd.arg(&fixture);
-        let error = call_claude_streaming(&mut cmd, None, None, 300, 60, 7).await.err().expect("terminal work result");
+        let error = call_claude_streaming(&mut cmd, None, None, 300, 60, 7, None).await.err().expect("terminal work result");
         assert_eq!(crate::work_outcome::WorkOutcome::decode(&error), Some(crate::work_outcome::WorkOutcome::MaxTurns {
             limit:7, partial:"已完成第一步".into() }));
     }
@@ -93,7 +93,7 @@ async fn background_idle_stops_pending_tool_and_keepalive_does_not_reset_it() {
     });
     let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.args(["-c", r#"printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"one","name":"Bash"}]}}'; /bin/sleep 300"#]);
-    let task = tokio::spawn(async move { call_claude_streaming(&mut cmd, Some(&callback), None, 300, 120, 7).await });
+    let task = tokio::spawn(async move { call_claude_streaming(&mut cmd, Some(&callback), None, 300, 120, 7, None).await });
     tokio::time::timeout(std::time::Duration::from_secs(5), started.notified()).await.expect("tool event must arrive");
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(90)).await;
@@ -112,7 +112,7 @@ async fn terminal_result_survives_a_hung_process() {
     let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.args(["-c", r#"printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"完成","usage":{"input_tokens":2,"output_tokens":3}}'; exec /bin/sleep 300"#]);
     let response = tokio::time::timeout(std::time::Duration::from_secs(10),
-        call_claude_streaming(&mut cmd, None, None, 300, 1, 7)).await
+        call_claude_streaming(&mut cmd, None, None, 300, 1, 7, None)).await
         .expect("terminal cleanup must be bounded").expect("terminal result must survive cleanup");
     assert_eq!(response.text, "完成");
 }
