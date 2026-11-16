@@ -109,6 +109,11 @@ unicode-normalization = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 duduclaw-migration = { path = "../duduclaw-migration" }
+# v1.83 R4 composite readiness: spawnd's host evidence reader and egress's
+# root config reader/validator (both already in the Linux tree via the gateway
+# and the shipped isolation binaries; no new third-party crate).
+duduclaw-spawnd = { path = "../duduclaw-spawnd" }
+duduclaw-egress = { path = "../duduclaw-egress" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

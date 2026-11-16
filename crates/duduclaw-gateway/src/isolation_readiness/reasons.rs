@@ -79,6 +79,48 @@ pub enum Reason {
     /// host has not proven that Chromium launches under the helper sandbox
     /// (spawnd's `helper_recording` bit is absent); recording stays refused.
     HelperRecordingUnsupported,
+    /// v1.83 R4 (design §10.3): a data migration waits for administrator
+    /// confirmation. The host may be ready, but unconfirmed employees cannot
+    /// run. Same code as the installer's host-side readiness check.
+    MigrationPending,
+    /// v1.83 R4 (plan Q4): the kernel reports a Landlock ABI newer than the
+    /// highest one this release knows; spawnd applied the highest known rule
+    /// set and its self test passed. Informational only (`notices`), never an
+    /// admission input. Same code as the installer's host-side check.
+    LandlockAbiClamped,
+}
+
+impl Reason {
+    /// Stable code of [`Reason::MigrationPending`] (its serialized `code`).
+    /// The installer's host-side readiness check reports the same code.
+    pub const MIGRATION_PENDING_CODE: &'static str = "migration_pending";
+    /// Stable code of [`Reason::LandlockAbiClamped`] (its serialized `code`).
+    pub const LANDLOCK_ABI_CLAMPED_CODE: &'static str = "landlock_abi_clamped";
+    /// Administrator text (zh-TW) shared by the installer's readiness summary.
+    pub const MIGRATION_PENDING_MESSAGE: &'static str =
+        "主機就緒；資料遷移尚待管理員確認，未確認的員工不能執行。";
+    /// The highest Landlock ABI whose rule set this release knows. spawnd
+    /// selects `min(detected, this)` (`duduclaw-spawnd` host evidence).
+    pub const LANDLOCK_HIGHEST_KNOWN_ABI: u32 = 7;
+
+    /// Administrator text (zh-TW) for a clamped Landlock ABI, shared by the
+    /// installer's readiness output. Numbers only; no host detail.
+    pub fn landlock_abi_clamped_message(detected_abi: u32) -> String {
+        format!("核心 Landlock ABI {detected_abi}，套用 ABI {} 規則集。", Self::LANDLOCK_HIGHEST_KNOWN_ABI)
+    }
+
+    /// [`Reason::LandlockAbiClamped`] exactly when spawnd's evidence shows a
+    /// detected ABI above the highest known one and the clamp to it was
+    /// applied. `landlock` = `(detected_abi, selected_abi)`; `None` (no
+    /// evidence) and any other combination report nothing here: whether the
+    /// evidence is acceptable at all is decided by spawnd's own check. Pure.
+    pub fn landlock_notice(landlock: Option<(u32, u32)>) -> Option<Self> {
+        match landlock {
+            Some((detected, selected)) if detected > Self::LANDLOCK_HIGHEST_KNOWN_ABI
+                && selected == Self::LANDLOCK_HIGHEST_KNOWN_ABI => Some(Self::LandlockAbiClamped),
+            _ => None,
+        }
+    }
 }
 
 /// W1: host-wide reasons of the brokered work root and the in-run helpers.
@@ -459,5 +501,29 @@ mod hx5_tests {
         assert!(feature_reasons(Some(SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_RECORDING)), true, Some(&published))
             .contains(&Reason::HelperRecordingUnsupported));
         assert!(!feature_reasons(Some(base), true, Some(&published[..3])).contains(&Reason::HelperRecordingUnsupported));
+    }
+
+    /// v1.83 R4: the two host-side codes are the serialized codes the
+    /// dashboard receives, and the Landlock notice only reports an applied
+    /// clamp above the highest known ABI (never a missing or invalid one).
+    #[test]
+    fn r4_migration_and_landlock_codes_are_shared_and_clamp_only() {
+        assert_eq!(serde_json::to_value(Reason::MigrationPending).unwrap(),
+            serde_json::json!({"code": Reason::MIGRATION_PENDING_CODE}));
+        assert_eq!(serde_json::to_value(Reason::LandlockAbiClamped).unwrap(),
+            serde_json::json!({"code": Reason::LANDLOCK_ABI_CLAMPED_CODE}));
+        for code in [Reason::MIGRATION_PENDING_CODE, Reason::LANDLOCK_ABI_CLAMPED_CODE] {
+            assert!(code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "{code}");
+        }
+        assert_eq!(Reason::landlock_notice(Some((8, 7))), Some(Reason::LandlockAbiClamped));
+        assert_eq!(Reason::landlock_notice(Some((12, 7))), Some(Reason::LandlockAbiClamped));
+        for evidence in [None, Some((7, 7)), Some((6, 6)), Some((1, 1)), Some((8, 8)), Some((8, 6)), Some((0, 0))] {
+            assert_eq!(Reason::landlock_notice(evidence), None, "{evidence:?}");
+        }
+        assert_eq!(Reason::landlock_abi_clamped_message(8), "核心 Landlock ABI 8，套用 ABI 7 規則集。");
+        // A notice is never a feature reason: no employee tool list makes it
+        // action-required through the W1 split by itself.
+        assert!(!feature_reasons(Some(duduclaw_isolation::ipc::SpawndFeatures::NONE), false, None)
+            .iter().any(|reason| matches!(reason, Reason::LandlockAbiClamped | Reason::MigrationPending)));
     }
 }

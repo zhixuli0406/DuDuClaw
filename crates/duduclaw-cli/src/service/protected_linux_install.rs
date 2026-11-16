@@ -547,7 +547,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         // The invoking CLI's templates may be older than F's committed
         // generation. A reinstall cannot replace signed service policy.
         parse_runtime_tree(true)?;
-        return readiness::check(&mut readiness::MissingComposite);
+        return readiness::check(&mut readiness::InstalledComposite);
     }
     // The single authoritative probe, under the lock so no concurrent install,
     // upgrade or uninstall can change the answer. The lock file and the mode
@@ -558,7 +558,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
     // A fresh host has no earlier data, so there is nothing for G to migrate:
     // continue with the v1.80 gateway-only protected install.
     if !fresh_host && native_migration::run_if_required(floor.as_deref(), version)? {
-        return readiness::check(&mut readiness::MissingComposite);
+        return readiness::check(&mut readiness::InstalledComposite);
     }
     check_floor(version, false, fresh_host)?;
     let executable = fs::canonicalize("/proc/self/exe")?;
@@ -663,7 +663,7 @@ pub(super) fn uninstall() -> Result<()> {
 
 pub(super) fn readiness() -> Result<()> {
     gate()?;
-    readiness::check(&mut readiness::MissingComposite)
+    readiness::check(&mut readiness::InstalledComposite)
 }
 
 // The route is decided from installed state, under the version lock, before
@@ -722,7 +722,7 @@ pub(super) async fn upgrade(version: Option<&str>, allow_missing_runtime: bool) 
     if route == in_place::Route::Migration {
         if let Some(requested) = version {
             if native_migration::run_if_required(floor.as_deref(), requested)? {
-                return readiness::check(&mut readiness::MissingComposite);
+                return readiness::check(&mut readiness::InstalledComposite);
             }
         }
         return Err(refused("無法確認這個安裝的版本下限，未執行升級。"));
