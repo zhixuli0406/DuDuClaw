@@ -25,11 +25,12 @@ pub trait OtpDeliverer: Send + Sync {
     async fn deliver(&self, channel: &str, chat_id: &str, text: &str) -> Result<(), String>;
 }
 
-/// The shared sender uses legacy Markdown for Telegram, Markdown for Discord,
+/// The shared sender uses plain text for Telegram, Markdown for Discord,
 /// mrkdwn for Slack and literal text for LINE. Escape at that boundary.
 pub(crate) fn message(channel: &str, product: &str, code: &str) -> String {
     let product = match channel {
-        "telegram" | "discord" => crate::distributor_brand::escape_channel_name(product),
+        "telegram" => product.replace('@', "@\u{200b}"),
+        "discord" => crate::distributor_brand::escape_channel_name(product),
         "slack" => product.replace('&', "&amp;").replace('<', "&lt;")
             .replace('>', "&gt;").replace('@', "@\u{200b}"),
         _ => product.to_string(),
@@ -94,7 +95,7 @@ impl OtpDeliverer for ConfigOtpDeliverer {
                 extra_id: None,
             };
             match crate::channel_sender::create_sender_for_home(&self.home_dir, &target, self.http.clone())
-                .send_text(text)
+                .send_text_context(text, "otp", chat_id)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -112,11 +113,11 @@ mod tests {
 
     #[test]
     fn brand_punctuation_is_escaped_for_the_otp_transport() {
-        for channel in ["telegram", "discord"] {
+        for channel in ["discord"] {
             assert!(message(channel, "*_[", "123456").starts_with("\\*\\_\\[ 登入驗證碼：123456\n"));
             assert!(message(channel, "DuDuClaw", "123456").starts_with("DuDuClaw 登入驗證碼："));
         }
-        for channel in ["line", "slack"] {
+        for channel in ["telegram", "line", "slack"] {
             assert!(message(channel, "*_[", "123456").starts_with("*_[ 登入驗證碼：123456\n"));
         }
         assert!(message("slack", "@everyone &", "123456").starts_with("@\u{200b}everyone &amp;"));

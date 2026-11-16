@@ -1285,18 +1285,20 @@ where
     // Keep the send permit out of approval waits and callback generation.
     let sender = reminder.sender_agent.as_deref();
     let mut prepared_reply = None;
-    let result = {
+    let (result, partial) = crate::telegram_send::track_partial(async {
         let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
         duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         send_reminder_result(home_dir, http, reminder, &text, sender, &mut prepared_reply).await
-    };
+    }).await;
     if let Err(first_err) = result {
+        if partial { return Err(first_err); }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         admit(recipient_args).await?;
         let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
         duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
-        send_reminder_result(home_dir, http, reminder, &text, sender, &mut prepared_reply)
-            .await
+        crate::telegram_send::track_partial(
+            send_reminder_result(home_dir, http, reminder, &text, sender, &mut prepared_reply))
+            .await.0
             .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
     }
 
@@ -1484,6 +1486,31 @@ pub fn start_reminder_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn partial_reminder_is_not_retried_and_notifies_once() {
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        provider.enqueue_response("sendMessage", serde_json::json!({"ok":true,"result":{}}));
+        provider.enqueue_response("sendMessage", serde_json::json!({"__status":403,"ok":false,"description":"Forbidden"}));
+        let (home, registry, _, _) = principal_fixture().await;
+        std::fs::write(home.path().join("config.toml"),
+            format!("[channels]\ntelegram_bot_token = {:?}\n[security]\nrecipient_guard = 'off'\n", provider.token)).unwrap();
+        let mut reminder = callback_reminder("worker", None);
+        reminder.mode = ReminderMode::Direct;
+        reminder.channel = "telegram".into();
+        reminder.chat_id = "12345".into();
+        reminder.message = Some("a".repeat(6000));
+        let error = deliver_reminder_with(home.path(), &reqwest::Client::new(), &registry,
+            &Arc::new(tokio::sync::Semaphore::new(1)), &reminder,
+            |_, _| async { panic!("direct reminder must not call a model"); }).await.unwrap_err();
+        assert!(!error.contains("after retry"), "{error}");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.iter().filter(|r| r.body["text"] == crate::telegram_send::delivery_notice(None, true)).count(), 1);
+        assert!(requests[2].body.get("parse_mode").is_none());
+        let record = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(record.trim()).unwrap()["delivered_chunks"], 1);
+    }
 
     #[tokio::test]
     async fn reminder_delivery_strips_markers_and_host_paths() {

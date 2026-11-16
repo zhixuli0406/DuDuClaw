@@ -3169,7 +3169,7 @@ pub(crate) async fn forward_delegation_response(
         "Forwarding sub-agent response to originating channel"
     );
 
-    match forward_to_channel_as(
+    let (forwarded, partial) = crate::telegram_send::track_partial(forward_to_channel_as(
         home_dir,
         &channel_type,
         &channel_id,
@@ -3180,8 +3180,8 @@ pub(crate) async fn forward_delegation_response(
         chain_root.as_deref(),
         sender_agent.as_deref(),
     )
-    .await
-    {
+    ).await;
+    match forwarded {
         Ok(()) => {
             // v1.8.17 Fix 2 (Option A): forward succeeded — also persist the
             // sub-agent's reply into the PARENT agent's session history so
@@ -3209,13 +3209,13 @@ pub(crate) async fn forward_delegation_response(
         }
         Err(e) => {
             let next_retry = retry_count + 1;
-            if next_retry >= 5 {
+            if partial || next_retry >= 5 {
                 warn!(
                     channel = %channel_type,
                     chat_id = %channel_id,
                     error = %e,
                     retries = retry_count,
-                    "Delegation callback forwarding permanently failed after 5 retries — dropping"
+                    "Delegation callback forwarding stopped after partial delivery or retry limit — dropping"
                 );
             } else {
                 warn!(
@@ -5835,6 +5835,28 @@ bot_token = "{token}"
             rusqlite::params![id, sender, target, response, reply_channel],
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_delegation_is_not_requeued_and_notifies_once() {
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        provider.enqueue_response("sendMessage", serde_json::json!({"ok":true,"result":{}}));
+        provider.enqueue_response("sendMessage", serde_json::json!({"__status":403,"ok":false,"description":"Forbidden"}));
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            format!("[channels]\ntelegram_bot_token = {:?}\n", provider.token)).unwrap();
+        setup_done_message(home.path(), "partial-forward", "worker", "responder", "report", None);
+        let conn = rusqlite::Connection::open(home.path().join("message_queue.db")).unwrap();
+        conn.execute("INSERT INTO delegation_callbacks (message_id, agent_id, channel_type, channel_id, retry_count, created_at) VALUES ('partial-forward', 'worker', 'telegram', '12345', 0, '2026-11-17')", []).unwrap();
+        forward_delegation_response(home.path(), "partial-forward", &"a".repeat(6000), "responder").await;
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id = 'partial-forward'", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0, "partially delivered callback must not be requeued");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.iter().filter(|r| r.body["text"] == crate::telegram_send::delivery_notice(None, true)).count(), 1);
+        assert!(requests[2].body.get("parse_mode").is_none());
+        let record = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(record.trim()).unwrap()["delivered_chunks"], 1);
     }
 
     #[tokio::test]

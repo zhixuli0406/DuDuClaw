@@ -1378,7 +1378,8 @@ async fn deliver_cron_result(
             body.strip_prefix(&prefix).unwrap_or(&body), &task.name, &task.id, home_dir)
             .await.map_err(|e| CronDeliveryError::Failed(e.to_string()));
     }
-    send_cron_chunks(sender.as_ref(), channel, &body, &task.id).await
+    send_cron_chunks(sender.as_ref(), channel, &body, &task.id,
+        crate::prompt_identity::read_default_language(home_dir).await.as_deref()).await
         .map_err(|e| CronDeliveryError::Failed(format!("send_text failed: {e}")))
 }
 
@@ -1437,31 +1438,41 @@ async fn prepare_cron_message(
 
 /// Channel limits are byte budgets here, conservatively below provider character limits.
 async fn send_cron_chunks(sender: &dyn crate::channel_sender::ChannelSender, channel: &str,
-    body: &str, id: &str) -> Result<(), crate::channel_sender::ChannelSendError> {
+    body: &str, id: &str, language: Option<&str>) -> Result<(), crate::channel_sender::ChannelSendError> {
     use crate::channel_format::limits;
-    // These senders already render/chunk with their provider-specific budget.
-    if matches!(channel, "googlechat" | "teams" | "wecom" | "dingtalk") {
-        return sender.send_text_context(body, "cron", id).await;
-    }
     let limit = match channel {
         "discord" => limits::DISCORD_MESSAGE,
         "slack" => limits::SLACK_MESSAGE,
         "line" => limits::LINE_MESSAGE,
-        "whatsapp" => 4000,
+        "whatsapp" => limits::WHATSAPP_MESSAGE,
+        // Leave room for provider renderers that add framing.
+        "googlechat" => 3000,
+        "teams" => 6000,
+        "wecom" | "dingtalk" => 1500,
         _ => limits::TELEGRAM_MESSAGE,
     };
-    // This chunker keeps every character, including whitespace, and never adds
-    // Markdown fences to channels that receive literal text.
-    let mut chunk = String::new();
-    for ch in body.chars() {
-        if chunk.len() + ch.len_utf8() > limit {
-            sender.send_text_context(&chunk, "cron", id).await?;
-            chunk.clear();
+    let delivery = async {
+        let mut chars = body.chars().peekable();
+        for index in 0..limits::DELIVERY_CHUNKS {
+            let mut chunk = String::new();
+            while let Some(&ch) = chars.peek() {
+                if chunk.len() + ch.len_utf8() > limit { break; }
+                chunk.push(ch);
+                chars.next();
+            }
+            if index + 1 == limits::DELIVERY_CHUNKS && chars.peek().is_some() {
+                chunk = crate::telegram_send::delivery_notice(language, false).into();
+            }
+            if !chunk.is_empty() {
+                tokio::time::timeout(std::time::Duration::from_secs(45), sender.send_text_context(&chunk, "cron", id))
+                    .await.map_err(|_| crate::channel_sender::ChannelSendError("Delivery request timeout".into()))??;
+            }
+            if chars.peek().is_none() { break; }
         }
-        chunk.push(ch);
-    }
-    if !chunk.is_empty() { sender.send_text_context(&chunk, "cron", id).await?; }
-    Ok(())
+        Ok(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(120), delivery).await
+        .map_err(|_| crate::channel_sender::ChannelSendError("Delivery budget exhausted".into()))?
 }
 
 /// [`deliver_cron_result`] for tests outside this module: an origin refusal
@@ -2378,6 +2389,21 @@ mod delivery_chunk_tests {
     use super::*;
 
     #[tokio::test]
+    async fn discord_cron_caps_at_fifteen_chunks_and_fixed_notice() {
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        let sender = crate::channel_sender::DiscordSender {
+            bot_token: provider.token.clone(), channel_id: "123456789".into(),
+            user_id: String::new(), http: reqwest::Client::new(),
+        };
+        let body = "a".repeat(crate::channel_format::limits::DISCORD_MESSAGE * 20);
+        send_cron_chunks(&sender, "discord", &body, "cap", Some("en")).await.unwrap();
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 16);
+        assert!(requests.iter().take(15).all(|r| r.body["content"] == "a".repeat(2000)));
+        assert_eq!(requests[15].body["content"], crate::telegram_send::delivery_notice(Some("en"), false));
+    }
+
+    #[tokio::test]
     async fn discord_cron_over_2000_is_delivered_intact_in_chunks() {
         let provider = crate::test_channel_provider::TestChannelProvider::start().await;
         let home = tempfile::tempdir().unwrap();
@@ -2388,7 +2414,7 @@ mod delivery_chunk_tests {
             user_id: String::new(), http: reqwest::Client::new(),
         };
         let body = prepare_cron_message(home.path(), &task, &"文🐈x".repeat(1500), &sender).await;
-        send_cron_chunks(&sender, "discord", &body, &task.id).await.unwrap();
+        send_cron_chunks(&sender, "discord", &body, &task.id, None).await.unwrap();
         let requests = provider.requests();
         assert!(requests.len() > 1);
         assert!(requests.iter().all(|r| r.body["content"].as_str().unwrap().chars().count() <= 2000));

@@ -1,5 +1,8 @@
 //! Shared Telegram text delivery. Failure telemetry never includes message bodies.
 use std::path::Path;
+use std::borrow::Cow;
+use std::time::Duration;
+use tokio::time::Instant;
 use serde_json::{Value, json};
 use crate::isolation_http::LiveRequest;
 
@@ -29,6 +32,7 @@ pub(crate) struct Failure {
     pub http_status: Option<u16>,
     pub description: String,
     pub content: bool,
+    pub delivered_chunks: usize,
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,6 +49,7 @@ fn plain_chunks(text: &str) -> Vec<Chunk> {
     for ch in text.chars() {
         if current.len() + ch.len_utf8() > LIMIT {
             chunks.push(Chunk { plain: current.clone(), text: std::mem::take(&mut current), mode: None });
+            if chunks.len() == 17 { return chunks; }
         }
         current.push(ch);
     }
@@ -52,23 +57,49 @@ fn plain_chunks(text: &str) -> Vec<Chunk> {
     chunks
 }
 
-// Tokenize rendered HTML, keeping tags and escaped characters indivisible.
-fn html_tokens(html: &str) -> Vec<String> {
-    let mut chars = html.chars();
+// Borrow tokens at character boundaries; ordinary characters never allocate.
+fn html_tokens(html: &str) -> Vec<&str> {
+    let mut chars = html.char_indices().peekable();
     let mut tokens = Vec::new();
-    while let Some(ch) = chars.next() {
-        let mut token = ch.to_string();
+    while let Some((start, ch)) = chars.next() {
+        let mut end = start + ch.len_utf8();
         if ch == '<' || ch == '&' {
-            let end = if ch == '<' { '>' } else { ';' };
-            for c in chars.by_ref() { token.push(c); if c == end { break; } }
+            let terminator = if ch == '<' { '>' } else { ';' };
+            for (offset, c) in chars.by_ref() {
+                end = offset + c.len_utf8();
+                if c == terminator { break; }
+            }
         }
-        tokens.push(token);
+        if html.get(start..end).is_some_and(|t| t.starts_with("<a href=")) {
+            if let Some(close) = html.get(end..).and_then(|rest| rest.find("</a>")) {
+                end += close + "</a>".len();
+                while chars.peek().is_some_and(|(offset, _)| *offset < end) { chars.next(); }
+            }
+        }
+        tokens.push(html.get(start..end).expect("character boundaries"));
     }
     tokens
 }
-fn visible(token: &str) -> String {
-    if token.starts_with('<') { return String::new(); }
-    match token { "&amp;" => "&", "&lt;" => "<", "&gt;" => ">", "&quot;" => "\"", "&#39;" | "&apos;" => "'", other => other }.to_owned()
+fn decode(text: &str) -> String {
+    text.replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'")
+        .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+// A complete anchor is indivisible: fallback of its chunk always keeps its URL.
+fn plain_tokens<'a>(tokens: &[&'a str]) -> Vec<Cow<'a, str>> {
+    tokens.iter().map(|&token| {
+        if let Some((href, label)) = token.strip_prefix("<a href=\"").and_then(|s| s.split_once("\">")) {
+            if let Some(label) = label.strip_suffix("</a>") {
+                let label: String = html_tokens(label).into_iter().map(visible).collect();
+                let url = decode(href);
+                return Cow::Owned(if label == url { label } else { format!("{label} ({url})") });
+            }
+        }
+        visible(token)
+    }).collect()
+}
+fn visible(token: &str) -> Cow<'_, str> {
+    if token.starts_with('<') { return Cow::Borrowed(""); }
+    match token { "&amp;" => "&", "&lt;" => "<", "&gt;" => ">", "&quot;" => "\"", "&#39;" | "&apos;" => "'", other => other }.into()
 }
 fn closing(stack: &[String]) -> String {
     stack.iter().rev().map(|tag| {
@@ -114,6 +145,7 @@ fn chunks(text: &str, format: Format, prefix: Option<&str>) -> Vec<Chunk> {
             for atom in atoms {
                 if current.len() + atom.len() > LIMIT && !current.is_empty() {
                     result.push(Chunk { text: current.clone(), plain: std::mem::take(&mut current), mode: Some("Markdown") });
+                    if result.len() == 17 { return result; }
                 }
                 if atom.len() > LIMIT { result.extend(plain_chunks(&atom)); } else { current.push_str(&atom); }
             }
@@ -123,23 +155,27 @@ fn chunks(text: &str, format: Format, prefix: Option<&str>) -> Vec<Chunk> {
         Format::MarkdownHtml => {
             let html = format!("{}{}", crate::markdown_render::escape_html(prefix.unwrap_or("")), crate::markdown_render::to_telegram_html(text));
             let tokens = html_tokens(&html);
-            let plain: String = tokens.iter().map(|t| visible(t)).collect();
+            let plain_tokens = plain_tokens(&tokens);
+            let plain: String = plain_tokens.iter().map(|s| s.as_ref()).collect();
             let mut result = Vec::new();
             let mut stack: Vec<String> = Vec::new();
             let mut current = String::new();
             let mut current_plain = String::new();
-            for token in tokens {
+            for (token, token_plain) in tokens.into_iter().zip(plain_tokens) {
                 let mut next_stack = stack.clone();
                 if token.starts_with("</") { next_stack.pop(); }
-                else if token.starts_with('<') { next_stack.push(token.clone()); }
-                if current.len() + token.len() + closing(&next_stack).len() > LIMIT {
+                else if token.starts_with('<') && !token.ends_with("</a>") { next_stack.push(token.to_owned()); }
+                if current.len() + token.len() + closing(&next_stack).len() > LIMIT
+                    || current_plain.len() + token_plain.len() > LIMIT {
                     if current_plain.is_empty() { return plain_chunks(&plain); }
                     result.push(Chunk { text: format!("{}{}", current, closing(&stack)), plain: std::mem::take(&mut current_plain), mode: Some("HTML") });
+                    if result.len() == 17 { return result; }
                     current = stack.concat();
-                    if current.len() + token.len() + closing(&next_stack).len() > LIMIT { return plain_chunks(&plain); }
+                    if current.len() + token.len() + closing(&next_stack).len() > LIMIT
+                    || current_plain.len() + token_plain.len() > LIMIT { return plain_chunks(&plain); }
                 }
                 current.push_str(&token);
-                current_plain.push_str(&visible(&token));
+                current_plain.push_str(&token_plain);
                 stack = next_stack;
             }
             if !current_plain.is_empty() { result.push(Chunk { text: format!("{}{}", current, closing(&stack)), plain: current_plain, mode: Some("HTML") }); }
@@ -158,75 +194,131 @@ fn safe_description(description: &str) -> String {
     "Telegram rejected request".to_owned()
 }
 
+fn failure(description: &str) -> Failure {
+    Failure { http_status: None, description: description.into(), content: false, delivered_chunks: 0 }
+}
+fn retry_seconds(data: &Value, attempt: usize) -> u64 {
+    data["parameters"]["retry_after"].as_u64().unwrap_or(if attempt == 1 { 1 } else { 3 }).clamp(1, 30)
+}
+
+// Bridge partial progress across the existing String-returning caller APIs.
+// Each outer retry owns a fresh task-local scope; unrelated sends cannot set it.
+tokio::task_local! { static PARTIAL: std::cell::Cell<bool>; }
+pub(crate) async fn track_partial<T>(future: impl std::future::Future<Output = T>) -> (T, bool) {
+    PARTIAL.scope(std::cell::Cell::new(false), async {
+        let result = future.await;
+        (result, PARTIAL.with(|partial| partial.get()))
+    }).await
+}
+
+pub(crate) fn delivery_notice(language: Option<&str>, incomplete: bool) -> &'static str {
+    let primary = language.unwrap_or("zh-TW").split(['-', '_']).next().unwrap_or("zh").to_ascii_lowercase();
+    match (primary.as_str(), incomplete) {
+        ("en", false) => "The rest of this message is under Automations in the dashboard.",
+        ("en", true) => "Message incomplete. See Automations in the dashboard.",
+        ("ja", false) => "続きはダッシュボードの「自動化」で確認してください。",
+        ("ja", true) => "メッセージの一部を配信できませんでした。ダッシュボードの「自動化」で確認してください。",
+        (_, false) => "其餘內容請到儀表板「自動化」查看。",
+        (_, true) => "訊息未完整送達，請到儀表板「自動化」查看。",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn post(client: &reqwest::Client, api_base: &str, chat_id: &str, text: &str,
-    mode: Option<&str>, options: &Options<'_>, reply: Option<Value>, markup: Option<Value>) -> Result<(), Failure> {
+    mode: Option<&str>, options: &Options<'_>, reply: Option<Value>, markup: Option<Value>,
+    deadline: Instant, accepted_chunks: Option<&mut usize>) -> Result<(), Failure> {
     let mut body = json!({"chat_id":chat_id, "text":text});
     if let Some(mode) = mode { body["parse_mode"] = json!(mode); }
     if let Some(thread) = options.thread { body["message_thread_id"] = json!(thread); }
     if let Some(reply) = reply { body["reply_parameters"] = reply; }
     if let Some(markup) = markup { body["reply_markup"] = markup; }
     for attempt in 1..=3 {
-        let resp = client.post(format!("{api_base}/sendMessage")).json(&body).send_authorized().await
-            .map_err(|_| Failure { http_status: None, description: "Telegram transport error".into(), content: false })?;
-        let status = resp.status().as_u16();
-        let data: Value = resp.json().await.map_err(|_| Failure { http_status: Some(status), description: "Invalid Telegram response".into(), content: false })?;
+        if Instant::now() >= deadline { return Err(failure("Telegram delivery budget exhausted")); }
+        if crate::channel_reply::guard_lost(options.guarded).await { return Err(failure("Reply guard lost")); }
+        let attempt_deadline = deadline.min(Instant::now() + Duration::from_secs(45));
+        let (status, data) = tokio::time::timeout_at(attempt_deadline, async {
+            let resp = client.post(format!("{api_base}/sendMessage")).json(&body).send_authorized().await
+                .map_err(|_| failure("Telegram transport error"))?;
+            let status = resp.status().as_u16();
+            Ok::<_, Failure>((status, resp.json::<Value>().await.unwrap_or(Value::Null)))
+        }).await.map_err(|_| failure(if Instant::now() >= deadline {
+            "Telegram delivery budget exhausted"
+        } else { "Telegram request timeout" }))??;
         if (200..300).contains(&status) && data["ok"] == true {
+            if let Some(count) = accepted_chunks { *count += 1; }
             let id = data["result"]["message_id"].as_i64().map(|v| v.to_string());
             let text = data["result"]["text"].as_str().unwrap_or(if mode.is_none() { text } else { "[文字回覆]" });
             crate::channel_reply::group_buffer::delivered(text, id.as_deref()).await;
             return Ok(());
         }
-        let code = data["error_code"].as_u64().unwrap_or(u64::from(status));
-        let description = safe_description(data["description"].as_str().unwrap_or(""));
+        let code = data["error_code"].as_u64().unwrap_or(0);
+        let description = if data.is_null() { "Invalid Telegram response".into() }
+            else { safe_description(data["description"].as_str().unwrap_or("")) };
         let content = status == 400 && matches!(description.as_str(), "can't parse entities" | "message is too long" | "message text is empty");
-        if attempt == 3 || !(code == 429 || (500..600).contains(&code)) {
-            return Err(Failure { http_status: Some(status), description, content });
+        let retryable = status == 429 || (500..600).contains(&status) || code == 429 || (500..600).contains(&code);
+        if attempt == 3 || !retryable {
+            return Err(Failure { http_status: Some(status), description, content, delivered_chunks: 0 });
         }
-        let seconds = data["parameters"]["retry_after"].as_u64().filter(|s| *s > 0).unwrap_or(if attempt == 1 {1} else {3});
-        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+        tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_secs(retry_seconds(&data, attempt))))
+            .await.map_err(|_| failure("Telegram delivery budget exhausted"))?;
     }
     unreachable!()
 }
 
-/// Render and chunk text, preserving HTML entities, then retry only entity
-/// rejection as plain text. Reply/thread/buttons and the generation guard survive.
+/// Render, bound and deliver with independent entity/reply fallbacks.
 pub(crate) async fn send(client: &reqwest::Client, api_base: &str, chat_id: &str,
     text: &str, format: Format, options: Options<'_>) -> Result<(), Failure> {
-    let mut chunks = chunks(text, format, options.literal_prefix);
-    if chunks.is_empty() {
-        chunks.push(Chunk { text: String::new(), plain: String::new(), mode: None });
-    }
-    for (i, chunk) in chunks.iter().enumerate() {
-        if crate::channel_reply::guard_lost(options.guarded).await {
-            return Err(Failure { http_status: None, description: "Reply guard lost".into(), content: false });
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut delivered = 0;
+    let mut total = 0;
+    let mut language = None;
+    let delivery = async {
+        language = crate::prompt_identity::read_default_language(options.home).await;
+        let mut chunks = chunks(text, format, options.literal_prefix);
+        if chunks.len() > crate::channel_format::limits::DELIVERY_CHUNKS {
+            chunks.truncate(crate::channel_format::limits::DELIVERY_CHUNKS - 1);
+            let notice = delivery_notice(language.as_deref(), false).to_owned();
+            chunks.push(Chunk { text: notice.clone(), plain: notice, mode: None });
         }
-        let mut reply = if i == 0 { options.reply_to.map(|id| json!({"message_id":id})) } else { None };
-        let markup = if i + 1 == chunks.len() { options.markup.clone() } else { None };
-        let mut result = post(client, api_base, chat_id, &chunk.text, chunk.mode, &options, reply.clone(), markup.clone()).await;
-        if result.as_ref().err().is_some_and(|e| e.http_status == Some(400) && e.description.contains("message") && e.description.contains("not found")) && reply.is_some() {
-            reply = None;
-            if !crate::channel_reply::guard_lost(options.guarded).await {
-                result = post(client, api_base, chat_id, &chunk.text, chunk.mode, &options, None, markup.clone()).await;
+        if chunks.is_empty() { chunks.push(Chunk { text: String::new(), plain: String::new(), mode: None }); }
+        total = chunks.len();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut reply = if i == 0 { options.reply_to.map(|id| json!({"message_id":id})) } else { None };
+            let markup = if i + 1 == chunks.len() { options.markup.clone() } else { None };
+            let mut plain = false;
+            loop {
+                let result = post(client, api_base, chat_id, if plain { &chunk.plain } else { &chunk.text },
+                    if plain { None } else { chunk.mode }, &options, reply.clone(), markup.clone(), deadline, Some(&mut delivered)).await;
+                match &result {
+                    Err(error) if reply.is_some() && error.http_status == Some(400)
+                        && matches!(error.description.as_str(), "message to be replied not found" | "replied message not found" | "message not found") => { reply = None; }
+                    Err(error) if !plain && chunk.mode.is_some() && error.http_status == Some(400)
+                        && error.description == "can't parse entities" => { plain = true; }
+                    _ => { result?; break; }
+                }
             }
         }
-        if chunk.mode.is_some() && result.as_ref().err().is_some_and(|e| e.http_status == Some(400) && e.description == "can't parse entities")
-            && !crate::channel_reply::guard_lost(options.guarded).await {
-            result = post(client, api_base, chat_id, &chunk.plain, None, &options, reply, markup).await;
+        Ok::<_, Failure>(())
+    };
+    let result = tokio::time::timeout_at(deadline, delivery).await
+        .unwrap_or_else(|_| Err(failure("Telegram delivery budget exhausted")));
+    if let Err(mut error) = result {
+        error.delivered_chunks = delivered;
+        tracing::warn!(kind = options.kind, ref_id = options.ref_id, delivered_chunks = error.delivered_chunks,
+            http_status = ?error.http_status, description = %error.description, "Telegram delivery failed");
+        let record = json!({"event":"telegram_send_failed", "channel":"telegram", "chat_id":chat_id,
+            "kind":options.kind, "ref_id":options.ref_id, "chunk":delivered+1, "total_chunks":total,
+            "delivered_chunks":error.delivered_chunks, "http_status":error.http_status, "description":error.description,
+            "failure_kind":if error.content {"content"} else {"transport_or_access"}, "timestamp":chrono::Utc::now().to_rfc3339()});
+        if let Err(e) = crate::trajectory_guard::append_anomaly(options.home, &record) {
+            tracing::warn!(error = %e, "telegram: failure record could not be written");
         }
-        if let Err(error) = result {
-            tracing::warn!(kind = options.kind, ref_id = options.ref_id,
-                failure_kind = if error.content { "content" } else { "transport_or_access" },
-                http_status = ?error.http_status, description = %error.description, "Telegram delivery failed");
-            let record = json!({"event":"telegram_send_failed", "channel":"telegram", "chat_id":chat_id,
-                "kind":options.kind, "ref_id":options.ref_id, "chunk":i+1, "total_chunks":chunks.len(),
-                "http_status":error.http_status, "description":error.description,
-                "failure_kind":if error.content {"content"} else {"transport_or_access"}, "timestamp":chrono::Utc::now().to_rfc3339()});
-            if let Err(e) = crate::trajectory_guard::append_anomaly(options.home, &record) {
-                tracing::warn!(error = %e, "telegram: failure record could not be written");
-            }
-            return Err(error);
+        if error.delivered_chunks > 0 && PARTIAL.try_with(|partial| !partial.replace(true)).unwrap_or(false) {
+            // This notice shares the delivery budget and never retries the body.
+            let _ = post(client, api_base, chat_id, delivery_notice(language.as_deref(), true), None,
+                &options, None, None, deadline, None).await;
         }
+        return Err(error);
     }
     Ok(())
 }
@@ -235,8 +327,8 @@ fn cron_notice(name: &str, language: Option<&str>) -> String {
     let primary = language.unwrap_or("zh-TW").split(['-', '_']).next().unwrap_or("zh").to_ascii_lowercase();
     match primary.as_str() {
         "en" => format!("⏰ [{name}] The result could not be delivered. View it under Automations in the dashboard."),
-        "ja" => format!("⏰ [{name}] 結果を配信できませんでした。ダッシュボードの「定期タスク」で確認してください。"),
-        _ => format!("⏰ [{name}] 的結果無法送達，請到儀表板『例行工作』查看"),
+        "ja" => format!("⏰ [{name}] 結果を配信できませんでした。ダッシュボードの「自動化」で確認してください。"),
+        _ => format!("⏰ [{name}] 的結果無法送達，請到儀表板「自動化」查看"),
     }
 }
 

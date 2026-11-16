@@ -923,7 +923,8 @@ impl ChannelSender for TelegramSender {
 
     async fn send_text_context(&self, text: &str, kind: &str, ref_id: &str) -> Result<(), ChannelSendError> {
         crate::telegram_send::send(&self.http, &crate::telegram::telegram_poll_api_base(&self.bot_token),
-            &self.chat_id, text, crate::telegram_send::Format::MarkdownHtml,
+            &self.chat_id, text, if kind == "otp" { crate::telegram_send::Format::Plain }
+                else { crate::telegram_send::Format::MarkdownHtml },
             crate::telegram_send::Options::new(&self.home_dir, kind, ref_id))
             .await.map_err(|e| ChannelSendError(e.to_string()))
     }
