@@ -256,3 +256,11 @@ The same `[proactive] quiet_hours` has two editing entry points: the「自動化
 - Code: `crates/duduclaw-gateway/src/notify_governance.rs`, `notify_stats.rs`, `notify_digest.rs`
 - Frontend: `web/src/pages/agent-form/EditAgentPage.tsx` (automation tab), `web/src/components/settings/sections/ProactiveTab.tsx`, `SystemTab.tsx`, `web/src/pages/ReportPage.tsx`
 - Related features: [34-goal-loop.md](34-goal-loop.md) (needs_human decision cards), [23-autopilot-engine.md](23-autopilot-engine.md) (rule circuit-breaker notifications)
+
+## Scheduled delivery and Telegram formatting
+
+Telegram cron results, reminder callbacks and formatted notifications render Markdown as escaped HTML. Text is split within the message limit while keeping HTML entities and tags valid. Command replies retain their existing Markdown format. If Telegram rejects a chunk with an entity parse error, that chunk is retried as plain text. Calls explicitly sending plain text preserve `_` and `*` literally.
+
+Final Telegram text failures are recorded in `channel_failures.jsonl` with the operation kind, reference id, HTTP status and a sanitized Telegram error description; message bodies are excluded. If a cron result still fails for a content reason, the same chat receives one short plain-text notice directing the user to the dashboard. Authentication failures and blocked bots (401/403) do not trigger that notice, and public website visitors never receive it. The notice follows `[general] default_language` for English/Japanese, otherwise Traditional Chinese.
+
+External cron results are chunked to the channel limit (including Discord's 2000-character limit) rather than truncated to 3500 characters. WebChat retains its bounded conversation-history policy. The dashboard's Automations list shows the last delivery status and a short failure reason separately from execution status.

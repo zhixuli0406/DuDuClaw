@@ -1179,6 +1179,7 @@ async fn execute_cron_task(
                         id = %task.id,
                         name = %task.name,
                         channel = task.notify_channel.as_deref().unwrap_or(""),
+                        failure_kind = "cron_delivery",
                         "cron notification delivery failed: {e}"
                     );
                 }
@@ -1255,11 +1256,8 @@ async fn execute_cron_task(
 /// by channel_reply / dispatcher (per-agent token first, then global
 /// `config.toml [channels]`), then calls the unified `ChannelSender`.
 ///
-/// The response is clamped to a safe size per platform before sending —
-/// Discord's 2000-char message cap is the tightest limit, so we truncate
-/// at 3500 *chars* (not bytes) which works on every supported channel and
-/// still fits well inside Telegram's 4096-char cap. Longer responses get
-/// a `\n[…truncated]` suffix so the user knows there's more in the logs.
+/// External results are chunked within the channel limit without truncation.
+/// WebChat keeps its separate bounded history delivery policy.
 async fn deliver_cron_result(
     home_dir: &Path,
     task: &CronTaskRow,
@@ -1329,20 +1327,7 @@ async fn deliver_cron_result(
         token
     };
 
-    // Clamp by chars (not bytes) — CJK-safe because we already count code
-    // points, and it stays under every channel's message size cap.
-    const MAX_CHARS: usize = 3500;
-    let message = if response.chars().count() > MAX_CHARS {
-        let mut s: String = response.chars().take(MAX_CHARS).collect();
-        s.push_str("\n[…truncated]");
-        s
-    } else {
-        response.to_string()
-    };
-
-    // Prefix a one-line header so the user can tell scheduled messages
-    // apart from interactive replies at a glance.
-    let body = format!("⏰ [{}] {}", task.name, message);
+    let body = format!("⏰ [{}] {}", task.name, response);
 
     let mut recipients = vec![duduclaw_core::recipient_policy::channel_recipient(channel, chat_id)
         .unwrap_or_default()];
@@ -1369,13 +1354,13 @@ async fn deliver_cron_result(
     let sender = if channel == "googlechat" {
         crate::product_policy::require_channel(home_dir, channel)?;
         crate::channel_sender::create_googlechat_sender_for(
-            home_dir.to_path_buf(), effective_chat_id, String::new(), task.notify_sender.clone(),
+            home_dir.to_path_buf(), effective_chat_id.clone(), String::new(), task.notify_sender.clone(),
         )
     } else {
         let target = crate::channel_sender::ChannelTarget {
             channel_type: channel.to_string(),
-            chat_id: effective_chat_id,
-            token,
+            chat_id: effective_chat_id.clone(),
+            token: token.clone(),
             extra_id: None,
         };
         // `reqwest::Client` is cheap to construct for a per-task send; the
@@ -1385,9 +1370,15 @@ async fn deliver_cron_result(
         crate::channel_sender::create_sender_for_home(home_dir, &target, http)
     };
     let body = prepare_cron_message(home_dir, task, response, sender.as_ref()).await;
-    sender
-        .send_text(&body)
-        .await
+    if channel == "telegram" {
+        crate::product_policy::require_channel(home_dir, channel).map_err(CronDeliveryError::Failed)?;
+        let prefix = format!("⏰ [{}] ", task.name);
+        return crate::telegram_send::send_cron(&reqwest::Client::new(),
+            &crate::telegram::telegram_poll_api_base(&token), &effective_chat_id,
+            body.strip_prefix(&prefix).unwrap_or(&body), &task.name, &task.id, home_dir)
+            .await.map_err(|e| CronDeliveryError::Failed(e.to_string()));
+    }
+    send_cron_chunks(sender.as_ref(), channel, &body, &task.id).await
         .map_err(|e| CronDeliveryError::Failed(format!("send_text failed: {e}")))
 }
 
@@ -1441,13 +1432,36 @@ async fn prepare_cron_message(
     let delivered = crate::office_docs::process_deliverables(
         response, &home_dir.join("agents").join(&task.agent_id), home_dir, sender,
     ).await;
-    const MAX_CHARS: usize = 3500;
-    let message = if delivered.chars().count() > MAX_CHARS {
-        format!("{}\n[…truncated]", delivered.chars().take(MAX_CHARS).collect::<String>())
-    } else {
-        delivered
+    format!("⏰ [{}] {}", task.name, delivered)
+}
+
+/// Channel limits are byte budgets here, conservatively below provider character limits.
+async fn send_cron_chunks(sender: &dyn crate::channel_sender::ChannelSender, channel: &str,
+    body: &str, id: &str) -> Result<(), crate::channel_sender::ChannelSendError> {
+    use crate::channel_format::limits;
+    // These senders already render/chunk with their provider-specific budget.
+    if matches!(channel, "googlechat" | "teams" | "wecom" | "dingtalk") {
+        return sender.send_text_context(body, "cron", id).await;
+    }
+    let limit = match channel {
+        "discord" => limits::DISCORD_MESSAGE,
+        "slack" => limits::SLACK_MESSAGE,
+        "line" => limits::LINE_MESSAGE,
+        "whatsapp" => 4000,
+        _ => limits::TELEGRAM_MESSAGE,
     };
-    format!("⏰ [{}] {}", task.name, message)
+    // This chunker keeps every character, including whitespace, and never adds
+    // Markdown fences to channels that receive literal text.
+    let mut chunk = String::new();
+    for ch in body.chars() {
+        if chunk.len() + ch.len_utf8() > limit {
+            sender.send_text_context(&chunk, "cron", id).await?;
+            chunk.clear();
+        }
+        chunk.push(ch);
+    }
+    if !chunk.is_empty() { sender.send_text_context(&chunk, "cron", id).await?; }
+    Ok(())
 }
 
 /// [`deliver_cron_result`] for tests outside this module: an origin refusal
@@ -2357,4 +2371,28 @@ mod tests {
         assert!(matches!(failed, CronDeliveryError::Failed(_)));
     }
 
+}
+
+#[cfg(test)]
+mod delivery_chunk_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn discord_cron_over_2000_is_delivered_intact_in_chunks() {
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        let home = tempfile::tempdir().unwrap();
+        let task = CronTaskRow::new("cron-186".into(), "daily_report".into(), "worker".into(),
+            "0 9 * * *".into(), "test".into());
+        let sender = crate::channel_sender::DiscordSender {
+            bot_token: provider.token.clone(), channel_id: "123456789".into(),
+            user_id: String::new(), http: reqwest::Client::new(),
+        };
+        let body = prepare_cron_message(home.path(), &task, &"文🐈x".repeat(1500), &sender).await;
+        send_cron_chunks(&sender, "discord", &body, &task.id).await.unwrap();
+        let requests = provider.requests();
+        assert!(requests.len() > 1);
+        assert!(requests.iter().all(|r| r.body["content"].as_str().unwrap().chars().count() <= 2000));
+        assert_eq!(requests.iter().map(|r| r.body["content"].as_str().unwrap()).collect::<String>(), body);
+        assert!(!body.contains("truncated"));
+    }
 }

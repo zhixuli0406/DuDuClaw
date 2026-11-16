@@ -64,6 +64,8 @@ interface Routine {
   can_run?: boolean;
   last_run_at?: string | null;
   last_status?: string | null;
+  last_delivery_status?: string | null;
+  last_delivery_reason?: string | null;
 }
 
 interface CronTemplate {
@@ -294,7 +296,7 @@ function RoutineRow({
 }) {
   const intl = useIntl();
   return (
-    <ListGridRow className="cursor-default">
+    <ListGridRow rowSize="lg" className="cursor-default py-2">
       <ListGridCell className="gap-2">
         <Clock className="size-4 shrink-0 text-muted-foreground" />
         <span className="truncate text-sm font-medium text-foreground" title={routine.name || routine.id}>
@@ -322,10 +324,20 @@ function RoutineRow({
           })}
         />
       </ListGridCell>
-      <ListGridCell>
-        <span className="truncate text-xs text-muted-foreground">
+      <ListGridCell className="min-w-0 flex-col items-start gap-1">
+        <span className="text-xs text-muted-foreground">
           {routine.last_run_at ? timeAgo(routine.last_run_at) : '—'}
         </span>
+        <span className={`text-xs ${routine.last_delivery_status === 'delivery_failed' || routine.last_delivery_status === 'delivery_refused' ? 'text-destructive' : 'text-muted-foreground'}`}>
+          {intl.formatMessage({ id: `routines.delivery.${routine.last_delivery_status === 'delivered' ? 'delivered' : routine.last_delivery_status === 'delivery_failed' ? 'failed' : routine.last_delivery_status === 'delivery_refused' ? 'refused' : 'none'}` })}
+        </span>
+        {(routine.last_delivery_status === 'delivery_failed' || routine.last_delivery_status === 'delivery_refused') && (
+          <span className="text-xs text-muted-foreground">
+            {intl.formatMessage({ id: routine.last_delivery_reason === 'notification_delivery_failed'
+              ? 'routines.delivery.notificationFailed'
+              : routine.last_delivery_status === 'delivery_refused' ? 'routines.delivery.accessChanged' : 'routines.delivery.unknownReason' })}
+          </span>
+        )}
       </ListGridCell>
       <ListGridCell className="justify-end">
         {routine.can_manage !== false && <DropdownMenu>

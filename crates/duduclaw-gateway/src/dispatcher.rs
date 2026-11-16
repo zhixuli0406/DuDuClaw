@@ -3900,60 +3900,13 @@ async fn forward_to_channel_as(
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".into());
             }
-            let url = format!("{}/sendMessage", crate::telegram::telegram_poll_api_base(&token));
-            for (i, body) in chunks.iter().enumerate() {
-                let mut payload = serde_json::json!({
-                    "chat_id": channel_id,
-                    "text": body,
-                    "parse_mode": "Markdown",
-                });
-                if let Some(tid) = thread_id {
-                    if let Ok(tid_num) = tid.parse::<i64>() {
-                        payload["message_thread_id"] = serde_json::json!(tid_num);
-                    }
-                }
-                let resp = http.post(&url).json(&payload).send().await.map_err(|e| {
-                    format!(
-                        "telegram send chunk {}/{}: {}",
-                        i + 1,
-                        total,
-                        crate::secret_redact::redact_secrets(&e.to_string())
-                    )
-                })?;
-                if !resp.status().is_success() {
-                    // Retry without parse_mode in case Markdown causes issues on this chunk.
-                    // A failure here (network error or non-2xx) MUST propagate as Err —
-                    // this used to only `warn!` and fall through to `Ok(())`, which
-                    // silently swallowed the delivery failure and starved the
-                    // `forward_delegation_response` 5-attempt retry (every other
-                    // channel in this match already returns Err on the equivalent
-                    // path). Multi-chunk replies may re-send earlier chunks on the
-                    // outer retry — same accepted tradeoff as LINE/Discord/Slack above.
-                    let fallback_payload = serde_json::json!({
-                        "chat_id": channel_id,
-                        "text": body,
-                    });
-                    let fallback_resp = http
-                        .post(&url)
-                        .json(&fallback_payload)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            format!("telegram fallback send chunk {}/{}: {e}", i + 1, total)
-                        })?;
-                    if !fallback_resp.status().is_success() {
-                        return Err(format!(
-                            "Telegram API returned {} on chunk {}/{} (markdown and plain-text attempts both failed)",
-                            fallback_resp.status(),
-                            i + 1,
-                            total
-                        ));
-                    }
-                }
-                if i + 1 < total {
-                    tokio::time::sleep(chunk_gap).await;
-                }
-            }
+            let prefix = format!("📨 {} 的回報：\n\n", responder_agent);
+            let mut options = crate::telegram_send::Options::new(home_dir, "delegation", originating_agent);
+            options.thread = thread_id.and_then(|id| id.parse().ok());
+            options.literal_prefix = Some(&prefix);
+            crate::telegram_send::send(http, &crate::telegram::telegram_poll_api_base(&token),
+                channel_id, &safe_text, crate::telegram_send::Format::MarkdownHtml, options)
+                .await.map_err(|error| error.to_string())?;
         }
         "line" => {
             let token = resolve_forward_token(

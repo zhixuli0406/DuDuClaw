@@ -297,6 +297,11 @@ pub trait ChannelSender: Send + Sync {
     /// Send a text message to the channel.
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError>;
 
+    /// Attach the originating operation to failure telemetry.
+    async fn send_text_context(&self, text: &str, _kind: &str, _ref_id: &str) -> Result<(), ChannelSendError> {
+        self.send_text(text).await
+    }
+
     /// Send a photo (PNG bytes) with an optional caption.
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError>;
 
@@ -405,6 +410,7 @@ pub fn create_sender_for_home(home_dir: &Path, target: &ChannelTarget, http: req
     }
     match target.channel_type.as_str() {
         "telegram" => Box::new(TelegramSender {
+            home_dir: home_dir.to_path_buf(),
             bot_token: target.token.clone(),
             chat_id: target.chat_id.clone(),
             http,
@@ -688,6 +694,15 @@ pub(crate) async fn send_plain_text(
     chat_id: &str,
     text: &str,
 ) -> bool {
+    if channel == "telegram" {
+        if crate::product_policy::require_channel(home_dir, channel).is_err() { return false; }
+        return match crate::telegram_send::send(http, &crate::telegram::telegram_poll_api_base(token),
+            chat_id, text, crate::telegram_send::Format::Plain,
+            crate::telegram_send::Options::new(home_dir, "notify", chat_id)).await {
+            Ok(()) => true,
+            Err(error) => { warn!(%error, "channel-sender: plain send failed"); false }
+        };
+    }
     let sender: Box<dyn ChannelSender> = match channel {
         "googlechat" => create_googlechat_sender(
             home_dir.to_path_buf(),
@@ -894,6 +909,7 @@ pub async fn resolve_channel_target(
 
 /// Telegram channel sender — Bot API `sendMessage` / `sendPhoto`.
 pub struct TelegramSender {
+    pub(crate) home_dir: std::path::PathBuf,
     pub(crate) bot_token: String,
     pub(crate) chat_id: String,
     pub(crate) http: reqwest::Client,
@@ -902,25 +918,14 @@ pub struct TelegramSender {
 #[async_trait]
 impl ChannelSender for TelegramSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        let url = format!("{}/sendMessage", crate::telegram::telegram_poll_api_base(&self.bot_token));
-        let resp = self
-            .http
-            .post(&url)
-            .json(&serde_json::json!({
-                "chat_id": self.chat_id,
-                "text": text,
-                "parse_mode": "Markdown"
-            }))
-            .send_authorized()
-            .await
-            .map_err(|e| {
-                ChannelSendError(format!(
-                    "Telegram sendMessage: {}",
-                    crate::secret_redact::redact_secrets(&e.to_string())
-                ))
-            })?;
-        require_api_success("Telegram", resp).await?;
-        Ok(())
+        self.send_text_context(text, "notify", &self.chat_id).await
+    }
+
+    async fn send_text_context(&self, text: &str, kind: &str, ref_id: &str) -> Result<(), ChannelSendError> {
+        crate::telegram_send::send(&self.http, &crate::telegram::telegram_poll_api_base(&self.bot_token),
+            &self.chat_id, text, crate::telegram_send::Format::MarkdownHtml,
+            crate::telegram_send::Options::new(&self.home_dir, kind, ref_id))
+            .await.map_err(|e| ChannelSendError(e.to_string()))
     }
 
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {

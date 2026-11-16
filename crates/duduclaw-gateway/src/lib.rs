@@ -543,6 +543,7 @@ pub mod slack;
 pub mod stt;
 pub mod task_spec;
 pub mod telegram;
+mod telegram_send;
 pub mod tts;
 pub mod tts_kokoro;
 pub mod uki_patch;

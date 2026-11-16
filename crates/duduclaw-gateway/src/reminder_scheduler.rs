@@ -388,7 +388,7 @@ async fn send_reminder_result(
         }
     };
     if text.trim().is_empty() { return Ok(()); }
-    sender.send_text(&text).await.map_err(|e| e.to_string())
+    sender.send_text_context(&text, "reminder", &reminder.id).await.map_err(|e| e.to_string())
 }
 
 async fn prepare_reminder_reply(
