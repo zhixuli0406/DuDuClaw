@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use duduclaw_isolation::{ids::Sha256Digest, update::*};
 use crate::{Error, Result, bundle::{self, BundleEntries, Limits}, metadata::MAX_METADATA_BYTES,
-    publication::manifest_digest};
+    publication::manifest_digest, state::State, trust_store::TrustLedger};
 use super::files::{self, Directory, copy_artifact, verify_fd};
 
 /// Customer download directory (design §8 step 2), root 0700.
@@ -21,10 +21,20 @@ pub const STAGE_DIRECTORY: &str = "bootstrap";
 /// R3's re-entrant journal (plan §4.3); read here only for the resume check.
 pub const BOOTSTRAP_JOURNAL: &str = "isolation-bootstrap.json";
 pub const STAGE_RECEIPT: &str = "verified.json";
+/// Root-owned version floor of the single-binary protected install (plan §3.1,
+/// design §10.0 item 2; written by duduclaw-cli `protected_linux_install::record_floor`).
+pub const VERSION_FLOOR: &str = "version-floor";
+/// Version reserved by an interrupted single-binary upgrade (same writer and rules).
+pub const VERSION_PENDING: &str = "version-pending";
+/// Updater state and trust ledger below `linux::STATE_ROOT` (plan §3.1).
+const UPDATER_STATE: &str = "state.json";
+const UPDATER_LEDGER: &str = "trust-ledger.json";
 const STAGE_ARTIFACTS: &str = "artifacts";
 const MAX_SIDE_FILE_BYTES: u64 = 64 * 1024;
 const MAX_RECEIPT_BYTES: usize = 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
+/// Same bound as duduclaw-cli `read_version_file`.
+const MAX_VERSION_FILE_BYTES: u64 = 128;
 /// Linux 6.3+ `MFD_EXEC`; older kernels reject the unknown flag with EINVAL.
 const MFD_EXEC: libc::c_uint = 0x0010;
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
@@ -77,13 +87,13 @@ impl Step {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Harden => "需要以 root 執行，而且這個驗證程式必須是內建信任根指紋的發行建置。",
-            Self::Preconditions => "這台主機已有隔離安裝的紀錄，且不屬於這個安裝包或這個模式；請先執行 duduclaw-bootstrap rollback。",
+            Self::Preconditions => "這台主機已有隔離安裝的紀錄，且不屬於這個安裝包或這個模式時，請先執行 duduclaw-bootstrap rollback；rollback 只能用於日誌中尚未提交、且與這個安裝包相同的世代。",
             Self::OpenInbox => "遷移暫存目錄或其中的檔案不符合要求：必須由 root 擁有、目錄權限 0700、檔案不可被他人寫入、不可為連結，且檔名須與這個驗證程式的版本一致。",
             Self::Seal => "無法把安裝包複製進密封的記憶體檔案。",
             Self::LegacySignature => "安裝包的發行金鑰（minisign）簽章驗證未通過。",
             Self::Root => "信任根與內建指紋不符，或信任根的門檻簽章未通過。",
             Self::Authorization => "遷移安裝包授權（信任根門檻簽章）未通過、已過期，或與安裝包、版本、架構不符。",
-            Self::Manifest => "發行清單簽章未通過，或其版本、元件與安裝包授權不符。",
+            Self::Manifest => "發行清單簽章未通過、其版本或元件與安裝包授權不符，或其版本／序號不新於這台主機已記錄的版本下限或已接受的發行（不能用來降版）。",
             Self::Stage => "暫存區寫入或重新驗證失敗；既有的暫存內容與這次的驗證結果不同時不會覆寫。",
             Self::Announce => "無法輸出驗證結果。",
             Self::Exec => "無法執行已驗證的 gateway。",
@@ -170,11 +180,13 @@ pub(crate) struct Paths {
     pub protected: PathBuf,
     /// Root under which `ISOLATION_FACTS` are probed ("/" in production).
     pub facts_root: PathBuf,
+    /// Updater state directory holding state.json and trust-ledger.json (`linux::STATE_ROOT`).
+    pub state_root: PathBuf,
 }
 impl Paths {
     fn production() -> Self {
         Self { inbox: MIGRATE_INBOX.trim_start_matches('/').to_owned(), protected: PathBuf::from(PROTECTED_ROOT),
-            facts_root: PathBuf::from("/") }
+            facts_root: PathBuf::from("/"), state_root: PathBuf::from(super::STATE_ROOT) }
     }
 }
 
@@ -260,8 +272,7 @@ pub fn load_stage(generation: Sha256Digest) -> Result<StageReceipt> {
 /// Step 1: dumpable 0, NNP, umask 077; real AND effective uid 0; compiled pin present.
 fn harden_and_configure() -> Result<Config> {
     super::harden()?;
-    // SAFETY: getuid/geteuid take no arguments and cannot fail.
-    if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 { return Err(Error::Maintenance); }
+    super::require_root()?;
     Ok(Config { context: Context::production()?, paths: Paths::production(),
         #[cfg(test)]
         after_seal: None })
@@ -284,6 +295,10 @@ pub(crate) fn verify_and_stage_with(config: &Config, mode: BootstrapMode, step: 
         *step = Step::Preconditions;
         return Err(Error::Maintenance);
     }
+    // Anti-rollback (part of accepting the manifest): the root-owned version floor
+    // and, when present, the updater's accepted serials. Absent files impose nothing.
+    *step = Step::Manifest;
+    check_history(&read_history(&config.paths)?, &verified.manifest, generation, config.context.now)?;
     *step = Step::Stage;
     let receipt = stage(&config.paths, &config.context, mode, image.bytes(), &verified)?;
     let gateway = verified.manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Gateway)
@@ -301,7 +316,7 @@ pub(crate) fn facts_present(root: &Path) -> Vec<&'static str> {
     ISOLATION_FACTS.iter().copied().filter(|fact| present(&root.join(fact.trim_start_matches('/')))).collect()
 }
 
-struct Journal { mode: BootstrapMode, generation: Sha256Digest, committed: bool }
+pub(crate) struct Journal { pub mode: BootstrapMode, pub generation: Sha256Digest, pub committed: bool }
 
 /// Minimal strict read of R3's journal: the four fields this decision needs, each
 /// with an exact type. R3 owns the full `deny_unknown_fields` schema. Malformed = refuse.
@@ -335,13 +350,112 @@ fn read_journal(protected: &Path) -> Result<Option<Journal>> {
 /// mode, except for rollback); its generation must equal the one verified later.
 fn preconditions(paths: &Paths, mode: BootstrapMode) -> Result<Option<Sha256Digest>> {
     let facts = !facts_present(&paths.facts_root).is_empty();
-    match read_journal(&paths.protected)? {
+    precondition_rule(read_journal(&paths.protected)?.as_ref(), facts, mode)
+}
+
+/// Pure step-2 rule. Rollback is authority only to undo the in-progress run: it
+/// needs an uncommitted journal and is bound to that journal's exact generation
+/// (checked after step 8), and it never stages anything new (see `stage`). No
+/// emergency authorization exists for the bootstrap path (plan §4.1/§4.3), so an
+/// ordinary migration authorization can never move a host to another generation.
+pub(crate) fn precondition_rule(journal: Option<&Journal>, facts: bool, mode: BootstrapMode) -> Result<Option<Sha256Digest>> {
+    match journal {
         Some(journal) if journal.committed => Err(Error::Maintenance),
         Some(journal) if mode != BootstrapMode::Rollback && journal.mode != mode => Err(Error::Maintenance),
         Some(journal) => Ok(Some(journal.generation)),
+        None if mode == BootstrapMode::Rollback => Err(Error::Maintenance),
         None if facts => Err(Error::Maintenance),
         None => Ok(None),
     }
+}
+
+// Anti-rollback (deferred part of step 8) ----------------------------------------
+
+/// Root-owned history that bounds which release may be staged. `None` = absent.
+pub(crate) struct History {
+    pub floor: Option<ReleaseVersion>,
+    pub pending: Option<ReleaseVersion>,
+    pub state: Option<State>,
+    pub ledger: Option<TrustLedger>,
+}
+
+fn optional<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if missing(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The floor file format written by duduclaw-cli `record_floor`/`prepare_version`:
+/// one stable `X.Y.Z`, no prefix, no whitespace or newline. Anything else refuses.
+pub(crate) fn parse_version_file(bytes: &[u8]) -> Result<ReleaseVersion> {
+    if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_digit() || *b == b'.') { return Err(Error::Maintenance); }
+    crate::parse_version(std::str::from_utf8(bytes).map_err(|_| Error::Maintenance)?).map_err(|_| Error::Maintenance)
+}
+
+/// Same rules as duduclaw-cli `protected_linux_install::read_version_file` (regular
+/// file, no symlink, root:root, exactly 0600, one link, at most 128 bytes), read
+/// through the verified directory fd instead of a pathname.
+fn read_version_file(dir: &Directory, name: &str) -> Result<Option<ReleaseVersion>> {
+    let Some(file) = optional(dir.read(name))? else { return Ok(None) };
+    let metadata = file.metadata()?;
+    if metadata.permissions().mode() & 0o7777 != 0o600 || metadata.len() > MAX_VERSION_FILE_BYTES {
+        return Err(Error::Maintenance);
+    }
+    let mut bytes = Vec::new();
+    Read::take(&file, MAX_VERSION_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_err(|_| Error::Invalid)? != metadata.len() { return Err(Error::Maintenance); }
+    parse_version_file(&bytes).map(Some)
+}
+
+/// Read the version floor/pending files (protected root, 0700) and the updater's
+/// state.json/trust-ledger.json (state root, 0700) through the existing dirfd
+/// readers (`files::Directory`, the same `json` reader the launcher and
+/// `trust_admin::ledger` use). Only NotFound means absent; anything else refuses.
+pub(crate) fn read_history(paths: &Paths) -> Result<History> {
+    let (floor, pending) = match optional(Directory::open(&paths.protected))? {
+        None => (None, None),
+        Some(dir) => {
+            if mode_of(&dir)? != 0o700 { return Err(Error::Maintenance); }
+            (read_version_file(&dir, VERSION_FLOOR)?, read_version_file(&dir, VERSION_PENDING)?)
+        }
+    };
+    let (state, ledger) = match optional(Directory::open(&paths.state_root))? {
+        None => (None, None),
+        Some(dir) => {
+            if mode_of(&dir)? != 0o700 { return Err(Error::Maintenance); }
+            (optional(dir.json::<State>(UPDATER_STATE))?, optional(dir.json::<TrustLedger>(UPDATER_LEDGER))?)
+        }
+    };
+    Ok(History { floor, pending, state, ledger })
+}
+
+/// Pure anti-rollback rule; reuses the existing rules instead of a second policy:
+/// - floor/pending: the target may not be lower (duduclaw-core
+///   `check_protected_version`: `target < floor` refuses, equal is allowed);
+/// - updater state: `State::check_manifest` (version above the committed floor,
+///   serial above the committed serial and not below the highest accepted serial;
+///   an equal serial only as the exact pending retry). The one exception is the
+///   very generation the state already commits (an interrupted R3 run of this same
+///   bundle, written by `trust_init`): resuming the same digest is not a rollback;
+/// - trust ledger: must validate (`TrustLedger::current`), and cannot exist
+///   without the state it is bound to (`trust_admin::ledger`).
+pub(crate) fn check_history(history: &History, manifest: &ReleaseManifest, digest: Sha256Digest, now: u64) -> Result<()> {
+    if [history.floor, history.pending].into_iter().flatten().any(|floor| manifest.version < floor) {
+        return Err(Error::Rollback);
+    }
+    if let Some(ledger) = &history.ledger {
+        ledger.current(now)?;
+        if history.state.is_none() { return Err(Error::Maintenance); }
+    }
+    if let Some(state) = &history.state {
+        state.validate()?;
+        let same_generation = state.committed_digest == digest && state.serial == manifest.serial
+            && state.floor == manifest.version && state.product == manifest.product && state.arch == manifest.arch;
+        if !same_generation { state.check_manifest(manifest, digest, now)?; }
+    }
+    Ok(())
 }
 
 // Step 3 ------------------------------------------------------------------------
@@ -558,15 +672,22 @@ fn remove_partial(stages: &Directory, next: &str) -> Result<()> {
 }
 
 fn stage(paths: &Paths, context: &Context, mode: BootstrapMode, image: &[u8], verified: &Verified) -> Result<StageReceipt> {
-    let (parent, name) = open_parent(&paths.protected)?;
-    let protected = ensure_dir(&parent, &name, 0o700)?;
-    let stages = ensure_dir(&protected, STAGE_DIRECTORY, 0o700)?;
-    let _lock = stages.lock()?;
     let generation = manifest_digest(&verified.manifest_bytes);
     let expected = StageReceipt { schema_version: 1, mode, manifest_digest: generation, root_sha256: context.pin,
         bundle_sha256: verified.bundle_sha256, bundle_size: verified.bundle_size,
         authorization_sha256: verified.authorization_sha256, verifier_pin_kind: context.pin_kind,
         verified_at_unix: context.now, artifacts: verified.manifest.artifacts.clone() };
+    if mode == BootstrapMode::Rollback {
+        // Rollback never creates or writes a stage: it only re-verifies the
+        // generation the in-progress run already staged (same receipt), or refuses.
+        let (receipt, _) = open_stage_at(&paths.protected, generation, context)?;
+        if !same_verification(&receipt, &expected) { return Err(Error::Maintenance); }
+        return Ok(receipt);
+    }
+    let (parent, name) = open_parent(&paths.protected)?;
+    let protected = ensure_dir(&parent, &name, 0o700)?;
+    let stages = ensure_dir(&protected, STAGE_DIRECTORY, 0o700)?;
+    let _lock = stages.lock()?;
     let final_name = hex::encode(generation.0);
     match stages.child(&final_name) {
         Ok(existing) => {
@@ -746,12 +867,19 @@ pub(crate) mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use ed25519_dalek::{Signer, SigningKey as PrivateKey};
 
-    pub(crate) const VERSION: ReleaseVersion = ReleaseVersion { major: 1, minor: 83, patch: 0 };
+    use crate::bundle::tests::OFFICIAL_SIGNATURE;
+
+    /// The verifier's own release: the workspace version, never a hardcoded literal
+    /// (the workspace is bumped only at release time).
+    pub(crate) fn version() -> ReleaseVersion {
+        crate::parse_version(env!("CARGO_PKG_VERSION")).expect("workspace version is a stable X.Y.Z")
+    }
+    fn next_patch() -> ReleaseVersion { ReleaseVersion { patch: version().patch + 1, ..version() } }
+    fn version_string() -> String { crate::version_text(version()) }
     // Fixed times keep fixtures (and so the generation digest) deterministic.
     pub(crate) const CREATED: u64 = 1_700_000_000;
     pub(crate) const EXPIRES: u64 = 4_000_000_000;
     const NOW: u64 = 1_800_000_000;
-    const OFFICIAL_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRUTh5pOpk0YmdButYZG9tlcekzhpZGpz83+E62dF1rtB5NtAoxXBenf0jZrluKejtL1R5cHtL60+75EzvH/EorwGHcc2aZlwkwQ=\ntrusted comment: duduclaw test\nmRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx2JdFAQ==\n";
 
     /// Software minisign signer for the test key set (prehashed = BLAKE2b-512).
     pub(crate) struct Minisign { secret: PrivateKey, key_id: [u8; 8] }
@@ -837,7 +965,7 @@ pub(crate) mod tests {
         let mut fixture = Fixture { roots, root, target, minisign: Minisign::new(21), root_bytes, root_signatures,
             manifest, manifest_bytes, manifest_signature, image: finish(tar),
             side: SideFiles { minisig: String::new(), authorization: vec![], authorization_signatures: vec![] } };
-        let authorization = fixture.authorization(VERSION, EXPIRES);
+        let authorization = fixture.authorization(version(), EXPIRES);
         fixture.authorize(&authorization, &[0, 1], MIGRATION_BUNDLE_SSHSIG_NAMESPACE);
         fixture.side.minisig = fixture.minisign.sign(&fixture.image, &fixture.trusted_comment(), true);
         fixture
@@ -855,7 +983,7 @@ pub(crate) mod tests {
         }
         pub(crate) fn context(&self, now: u64) -> Context {
             Context { pin: manifest_digest(&self.root_bytes), pin_kind: PinKind::Test, release_key: self.minisign.public(),
-                arch: self.manifest.arch, version: VERSION, now }
+                arch: self.manifest.arch, version: version(), now }
         }
         pub(crate) fn trusted_comment(&self) -> String { self.context(NOW).trusted_comment() }
     }
@@ -869,15 +997,15 @@ pub(crate) mod tests {
 
     #[test]
     fn authorization_threshold_namespace_expiry_size() {
-        let fixture = build(Architecture::X86_64, None, VERSION);
+        let fixture = build(Architecture::X86_64, None, version());
         let verified = verify(&fixture).unwrap();
         assert_eq!(verified.bundle_sha256, manifest_digest(&fixture.image));
-        let good = fixture.authorization(VERSION, NOW + 10);
+        let good = fixture.authorization(version(), NOW + 10);
         let check = |authorization: &BundleAuthorization, signers: &[usize], namespace: &str, now: u64| {
             let bytes = canonical_bytes(authorization).unwrap();
             let signatures = root_sign(&fixture.root, &fixture.roots, &bytes, namespace, signers);
             bundle::verify_authorization(&fixture.root, &bytes, &signatures, manifest_digest(&fixture.image),
-                fixture.image.len() as u64, Architecture::X86_64, VERSION, now)
+                fixture.image.len() as u64, Architecture::X86_64, version(), now)
         };
         let threshold: [&[usize]; 4] = [&[0, 1], &[0, 2], &[1, 2], &[0, 1, 2]];
         for signers in threshold { assert!(check(&good, signers, MIGRATION_BUNDLE_SSHSIG_NAMESPACE, NOW).is_ok()); }
@@ -891,13 +1019,13 @@ pub(crate) mod tests {
         let mut signatures = root_sign(&fixture.root, &fixture.roots, &bytes, MIGRATION_BUNDLE_SSHSIG_NAMESPACE, &[0, 1]);
         signatures.push(sign(&fixture.target, &fixture.root.target_key, MIGRATION_BUNDLE_SSHSIG_NAMESPACE, &bytes, 5));
         assert!(bundle::verify_authorization(&fixture.root, &bytes, &signatures, manifest_digest(&fixture.image),
-            fixture.image.len() as u64, Architecture::X86_64, VERSION, NOW).is_err());
+            fixture.image.len() as u64, Architecture::X86_64, version(), NOW).is_err());
         assert!(check(&good, &[0, 1], MIGRATION_BUNDLE_SSHSIG_NAMESPACE, NOW + 9).is_ok());
         assert!(matches!(check(&good, &[0, 1], MIGRATION_BUNDLE_SSHSIG_NAMESPACE, NOW + 10), Err(Error::Expired)));
         for bad in [BundleAuthorization { bundle_size: good.bundle_size + 1, ..good.clone() },
             BundleAuthorization { bundle_size: good.bundle_size - 1, ..good.clone() },
             BundleAuthorization { bundle_sha256: Sha256Digest([0; 32]), ..good.clone() },
-            BundleAuthorization { version: ReleaseVersion { major: 1, minor: 83, patch: 1 }, ..good.clone() },
+            BundleAuthorization { version: next_patch(), ..good.clone() },
             BundleAuthorization { arch: Architecture::Aarch64, ..good.clone() },
             BundleAuthorization { product: Product::DuduclawPro, ..good.clone() },
             BundleAuthorization { schema_version: 2, ..good.clone() }] {
@@ -907,14 +1035,14 @@ pub(crate) mod tests {
         let pretty = serde_json::to_vec_pretty(&good).unwrap();
         let signatures = root_sign(&fixture.root, &fixture.roots, &pretty, MIGRATION_BUNDLE_SSHSIG_NAMESPACE, &[0, 1]);
         assert!(bundle::verify_authorization(&fixture.root, &pretty, &signatures, manifest_digest(&fixture.image),
-            fixture.image.len() as u64, Architecture::X86_64, VERSION, NOW).is_err());
+            fixture.image.len() as u64, Architecture::X86_64, version(), NOW).is_err());
         // The pipeline stops at step 7 for an authorization of another size.
-        let mut wrong = build(Architecture::X86_64, None, VERSION);
-        let authorization = BundleAuthorization { bundle_size: wrong.image.len() as u64 - 1, ..wrong.authorization(VERSION, EXPIRES) };
+        let mut wrong = build(Architecture::X86_64, None, version());
+        let authorization = BundleAuthorization { bundle_size: wrong.image.len() as u64 - 1, ..wrong.authorization(version(), EXPIRES) };
         wrong.authorize(&authorization, &[0, 1], MIGRATION_BUNDLE_SSHSIG_NAMESPACE);
         assert_eq!(refused_at(verify(&wrong)), Step::Authorization);
-        let mut single = build(Architecture::X86_64, None, VERSION);
-        let authorization = single.authorization(VERSION, EXPIRES);
+        let mut single = build(Architecture::X86_64, None, version());
+        let authorization = single.authorization(version(), EXPIRES);
         single.authorize(&authorization, &[0], MIGRATION_BUNDLE_SSHSIG_NAMESPACE);
         assert_eq!(refused_at(verify(&single)), Step::Authorization);
     }
@@ -924,19 +1052,23 @@ pub(crate) mod tests {
         // The compiled constant is the real release key: an official signature verifies.
         bundle::verify_legacy_signature(b"FAKE_BINARY", OFFICIAL_SIGNATURE, LEGACY_RELEASE_MINISIGN_KEY, "duduclaw test").unwrap();
         assert!(bundle::verify_legacy_signature(b"tampered", OFFICIAL_SIGNATURE, LEGACY_RELEASE_MINISIGN_KEY, "duduclaw test").is_err());
+        let v = version_string();
+        let x86_comment = format!("duduclaw v{v} duduclaw-isolated-linux-x86_64-{v}.tar");
         assert!(bundle::verify_legacy_signature(b"FAKE_BINARY", OFFICIAL_SIGNATURE, LEGACY_RELEASE_MINISIGN_KEY,
-            "duduclaw v1.83.0 duduclaw-isolated-linux-x86_64-1.83.0.tar").is_err());
+            &x86_comment).is_err());
         #[cfg(not(duduclaw_test_root))]
         assert_eq!(legacy_release_key().unwrap(), LEGACY_RELEASE_MINISIGN_KEY);
-        let fixture = build(Architecture::X86_64, None, VERSION);
+        let fixture = build(Architecture::X86_64, None, version());
         verify(&fixture).unwrap();
         let comment = fixture.trusted_comment();
-        assert_eq!(comment, "duduclaw v1.83.0 duduclaw-isolated-linux-x86_64-1.83.0.tar");
-        // Missing, legacy (non-prehashed), other key, other comment, other bytes.
+        assert_eq!(comment, x86_comment);
+        // Missing, legacy (non-prehashed), other key, other comment, other bytes,
+        // and a valid signature followed by trailing lines (strict text, bundle.rs).
+        let trailing = format!("{}untrusted extra line\n", fixture.side.minisig);
         for minisig in [String::new(), fixture.minisign.sign(&fixture.image, &comment, false),
             Minisign::new(22).sign(&fixture.image, &comment, true),
-            fixture.minisign.sign(&fixture.image, "duduclaw v1.83.0 duduclaw-isolated-linux-aarch64-1.83.0.tar", true),
-            fixture.minisign.sign(b"other bytes", &comment, true), OFFICIAL_SIGNATURE.to_owned()] {
+            fixture.minisign.sign(&fixture.image, &format!("duduclaw v{v} duduclaw-isolated-linux-aarch64-{v}.tar"), true),
+            fixture.minisign.sign(b"other bytes", &comment, true), OFFICIAL_SIGNATURE.to_owned(), trailing] {
             let mut side = fixture.side.clone();
             side.minisig = minisig;
             let mut step = Step::Harden;
@@ -968,7 +1100,7 @@ pub(crate) mod tests {
         assert_eq!(PinKind::Test.label(), "TEST");
         #[cfg(not(duduclaw_test_root))]
         assert_eq!(BUILD_PIN_KIND, PinKind::Production);
-        let fixture = build(Architecture::X86_64, None, VERSION);
+        let fixture = build(Architecture::X86_64, None, version());
         let mut context = fixture.context(NOW);
         context.pin = Sha256Digest([0; 32]);
         let mut step = Step::Harden;
@@ -987,7 +1119,7 @@ pub(crate) mod tests {
 
     #[test]
     fn manifest_version_must_equal_authorization() {
-        let patch = ReleaseVersion { major: 1, minor: 83, patch: 1 };
+        let patch = next_patch();
         // Authorization names the verifier's version; the signed manifest says another.
         let mismatched = build(Architecture::X86_64, None, patch);
         let error = match verify(&mismatched) { Err((Step::Manifest, error)) => error, _ => panic!("expected step 8") };
@@ -997,26 +1129,132 @@ pub(crate) mod tests {
         let authorization = other.authorization(patch, EXPIRES);
         other.authorize(&authorization, &[0, 1], MIGRATION_BUNDLE_SSHSIG_NAMESPACE);
         assert_eq!(refused_at(verify(&other)), Step::Authorization);
-        let good = build(Architecture::X86_64, None, VERSION);
+        let good = build(Architecture::X86_64, None, version());
         let verified = verify(&good).unwrap();
-        assert_eq!(verified.manifest.version, VERSION);
+        assert_eq!(verified.manifest.version, version());
         assert_eq!(verified.manifest_bytes, good.manifest_bytes);
         assert_eq!(verified.entries.artifacts.len(), good.manifest.artifacts.len());
         // The tar must carry exactly the manifest's artifacts (no extra member).
         let mut extra = good.image[..good.image.len() - 10 * 512].to_vec();
         append(&mut extra, "artifacts/unsigned", b"unsigned");
-        let mut extended = build(Architecture::X86_64, None, VERSION);
+        let mut extended = build(Architecture::X86_64, None, version());
         extended.image = finish(extra);
-        let authorization = extended.authorization(VERSION, EXPIRES);
+        let authorization = extended.authorization(version(), EXPIRES);
         extended.authorize(&authorization, &[0, 1], MIGRATION_BUNDLE_SSHSIG_NAMESPACE);
         extended.side.minisig = extended.minisign.sign(&extended.image, &extended.trusted_comment(), true);
         assert_eq!(refused_at(verify(&extended)), Step::Manifest);
     }
 
+    fn no_history() -> History { History { floor: None, pending: None, state: None, ledger: None } }
+    /// A stable version the fixture's `minimum_version` (1.80.0) allows and below `version()`.
+    fn lower() -> ReleaseVersion {
+        let lower = ReleaseVersion { major: 1, minor: 80, patch: 0 };
+        assert!(lower < version(), "fixtures assume the workspace version is above 1.80.0");
+        lower
+    }
+
+    #[test]
+    fn version_file_format_is_strict() {
+        assert_eq!(parse_version_file(b"1.82.0").unwrap(), ReleaseVersion { major: 1, minor: 82, patch: 0 });
+        assert_eq!(parse_version_file(version_string().as_bytes()).unwrap(), version());
+        for bad in [&b""[..], b"v1.82.0", b"1.82.0\n", b" 1.82.0", b"1.82.0 ", b"1.82", b"1.82.0-rc.1", b"1.82.0+b",
+            b"01.82.0", b"1.82.0.0", b"1..0", "１.82.0".as_bytes(), b"1.82.0\0"] {
+            assert!(parse_version_file(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn version_floor_and_updater_serials_refuse_rollback() {
+        let fixture = build(Architecture::X86_64, None, version());
+        let manifest = &fixture.manifest;
+        let digest = manifest_digest(&fixture.manifest_bytes);
+        let check = |history: History| check_history(&history, manifest, digest, NOW);
+        // A host with no floor and no updater state: nothing changes.
+        check(no_history()).unwrap();
+        // Floor (and the pending reservation, same rule): equal or lower passes, higher refuses.
+        for floor in [lower(), version()] {
+            check(History { floor: Some(floor), ..no_history() }).unwrap();
+            check(History { pending: Some(floor), ..no_history() }).unwrap();
+        }
+        assert!(matches!(check(History { floor: Some(next_patch()), ..no_history() }), Err(Error::Rollback)));
+        assert!(matches!(check(History { pending: Some(next_patch()), ..no_history() }), Err(Error::Rollback)));
+        assert!(matches!(check(History { floor: Some(lower()), pending: Some(next_patch()), ..no_history() }),
+            Err(Error::Rollback)));
+
+        // Updater state: resuming the generation it already commits is not a rollback.
+        let same = crate::linux::trust_init::initial_state(manifest, digest);
+        check(History { state: Some(same.clone()), ..no_history() }).unwrap();
+        // Another generation at the same serial and version (a replayed older pair) refuses.
+        let other = Sha256Digest([7; 32]);
+        let replay = crate::linux::trust_init::initial_state(manifest, other);
+        assert!(matches!(check(History { state: Some(replay), ..no_history() }), Err(Error::Rollback)));
+        // Strictly newer than every accepted serial and above the floor: State::check_manifest accepts.
+        let mut older = crate::linux::trust_init::initial_state(manifest, other);
+        older.floor = lower();
+        older.serial = 0;
+        older.highest_serial = 0;
+        check(History { state: Some(older.clone()), ..no_history() }).unwrap();
+        // ... but not below the highest accepted serial, nor equal to it without the exact pending retry.
+        let mut highest = older.clone();
+        highest.highest_serial = manifest.serial + 1;
+        highest.highest_digest = Sha256Digest([8; 32]);
+        assert!(matches!(check(History { state: Some(highest), ..no_history() }), Err(Error::Rollback)));
+        let mut equal = older.clone();
+        equal.highest_serial = manifest.serial;
+        equal.highest_digest = Sha256Digest([9; 32]);
+        assert!(matches!(check(History { state: Some(equal), ..no_history() }), Err(Error::Rollback)));
+        // A committed floor above the target refuses; maintenance and invalid states refuse.
+        let mut newer = older.clone();
+        newer.floor = next_patch();
+        assert!(matches!(check(History { state: Some(newer), ..no_history() }), Err(Error::Rollback)));
+        let mut maintenance = older.clone();
+        maintenance.maintenance = true;
+        assert!(check(History { state: Some(maintenance), ..no_history() }).is_err());
+        let mut invalid = same.clone();
+        invalid.schema_version = 2;
+        assert!(check(History { state: Some(invalid), ..no_history() }).is_err());
+        // The floor applies even when the state would accept.
+        assert!(matches!(check(History { floor: Some(next_patch()), state: Some(older.clone()), ..no_history() }),
+            Err(Error::Rollback)));
+
+        // Trust ledger: must validate and cannot exist without its state.
+        let pin = manifest_digest(&fixture.root_bytes);
+        let ledger = TrustLedger::bootstrap(&fixture.root_bytes, &fixture.root_signatures, pin, NOW).unwrap();
+        assert!(check(History { ledger: Some(ledger.clone()), ..no_history() }).is_err());
+        check(History { ledger: Some(ledger.clone()), state: Some(same.clone()), ..no_history() }).unwrap();
+        let mut broken = ledger;
+        broken.pin = Sha256Digest([0; 32]);
+        assert!(check(History { ledger: Some(broken), state: Some(same), ..no_history() }).is_err());
+    }
+
+    #[test]
+    fn rollback_only_undoes_the_journaled_uncommitted_generation() {
+        use BootstrapMode::{Install, Rollback, Upgrade};
+        let generation = Sha256Digest([3; 32]);
+        let journal = |mode, committed| Journal { mode, generation, committed };
+        // Without an in-progress journal, rollback has no authority at all.
+        for facts in [false, true] { assert!(precondition_rule(None, facts, Rollback).is_err()); }
+        // It resumes exactly the journal's generation (bound after step 8), never a committed run.
+        for mode in [Install, Upgrade] {
+            for facts in [false, true] {
+                assert_eq!(precondition_rule(Some(&journal(mode, false)), facts, Rollback).unwrap(), Some(generation));
+                assert!(precondition_rule(Some(&journal(mode, true)), facts, Rollback).is_err());
+            }
+        }
+        // Install/upgrade keep their rules.
+        assert_eq!(precondition_rule(None, false, Install).unwrap(), None);
+        assert_eq!(precondition_rule(None, false, Upgrade).unwrap(), None);
+        assert!(precondition_rule(None, true, Install).is_err());
+        assert!(precondition_rule(None, true, Upgrade).is_err());
+        assert!(precondition_rule(Some(&journal(Install, false)), true, Upgrade).is_err());
+        assert!(precondition_rule(Some(&journal(Upgrade, false)), true, Install).is_err());
+        assert_eq!(precondition_rule(Some(&journal(Upgrade, false)), true, Upgrade).unwrap(), Some(generation));
+    }
+
     // ------------------------------------------------------------ root (VM) tests
 
     pub(crate) fn host_fixture(updater: Option<Vec<u8>>) -> Fixture {
-        build(super::super::bootstrap::host_architecture().unwrap(), updater, VERSION)
+        build(super::super::bootstrap::host_architecture().unwrap(), updater, version())
     }
     /// A root 0700 inbox below a /root temporary directory (same mount as "/").
     pub(crate) fn root_config(temp: &Path, fixture: &Fixture, facts_root: PathBuf) -> Config {
@@ -1031,7 +1269,7 @@ pub(crate) mod tests {
         std::fs::write(inbox.join(format!("{name}.authorization.json.signatures.json")),
             &fixture.side.authorization_signatures).unwrap();
         Config { context, paths: Paths { inbox: inbox.strip_prefix("/").unwrap().to_str().unwrap().to_owned(),
-            protected: temp.join("protected"), facts_root }, after_seal: None }
+            protected: temp.join("protected"), facts_root, state_root: temp.join("updated-state") }, after_seal: None }
     }
     fn root_temp() -> tempfile::TempDir {
         assert_eq!(nix::unistd::geteuid().as_raw(), 0, "requires root");
@@ -1078,14 +1316,18 @@ pub(crate) mod tests {
         // Re-entrant: a later run re-verifies the whole stage and keeps the first receipt.
         let later = Config { context: fixture.context(config.context.now + 5),
             paths: Paths { inbox: config.paths.inbox.clone(), protected: config.paths.protected.clone(),
-                facts_root: empty.clone() }, after_seal: None };
+                facts_root: empty.clone(), state_root: config.paths.state_root.clone() }, after_seal: None };
         assert_eq!(&verify_and_stage_with(&later, BootstrapMode::Install, &mut step).unwrap().receipt, receipt);
-        assert_eq!(&verify_and_stage_with(&later, BootstrapMode::Rollback, &mut step).unwrap().receipt, receipt);
-        // An R3 journal of the same generation resumes; another mode, another
-        // generation or a committed run is refused.
+        // Rollback without an in-progress journal has no authority, even for a staged generation.
+        assert!(verify_and_stage_with(&later, BootstrapMode::Rollback, &mut step).is_err());
+        assert_eq!(step, Step::Preconditions);
+        // An R3 journal of the same generation resumes (rollback re-verifies the same
+        // stage and keeps its receipt); another mode, another generation or a
+        // committed run is refused.
         let generation = hex::encode(receipt.manifest_digest.0);
         write_journal(&later, "install", &generation, false);
         assert!(verify_and_stage_with(&later, BootstrapMode::Install, &mut step).is_ok());
+        assert_eq!(&verify_and_stage_with(&later, BootstrapMode::Rollback, &mut step).unwrap().receipt, receipt);
         assert!(verify_and_stage_with(&later, BootstrapMode::Upgrade, &mut step).is_err());
         assert_eq!(step, Step::Preconditions);
         write_journal(&later, "install", &"00".repeat(32), false);
@@ -1165,6 +1407,94 @@ pub(crate) mod tests {
         assert_eq!(step, Step::OpenInbox);
         std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(verify_and_stage_with(&config, BootstrapMode::Install, &mut step).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires root native Linux openat2/statx/memfd; writes only its own /root fixture tree"]
+    fn iso_root_bootstrap_anti_rollback_floor_state_and_rollback_scope() {
+        use std::os::unix::fs::symlink;
+        let temp = root_temp();
+        let empty = temp.path().join("facts-root");
+        std::fs::create_dir(&empty).unwrap();
+        let fixture = host_fixture(None);
+        let config = root_config(temp.path(), &fixture, empty);
+        let protected = config.paths.protected.clone();
+        let stages = protected.join(STAGE_DIRECTORY);
+        let mut step = Step::Harden;
+        let private_file = |path: &Path, bytes: &[u8], mode: u32| {
+            let _ = std::fs::remove_file(path);
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        std::fs::create_dir(&protected).unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Rollback with an uncommitted journal of this very generation but nothing
+        // staged: refused at step 9 and nothing is created.
+        let generation = manifest_digest(&fixture.manifest_bytes);
+        write_journal(&config, "upgrade", &hex::encode(generation.0), false);
+        assert!(verify_and_stage_with(&config, BootstrapMode::Rollback, &mut step).is_err());
+        assert_eq!(step, Step::Stage);
+        assert!(!stages.exists());
+        std::fs::remove_file(protected.join(BOOTSTRAP_JOURNAL)).unwrap();
+
+        // version-floor above the bundle: refused as a rollback before anything is staged.
+        let floor = protected.join(VERSION_FLOOR);
+        let pending = protected.join(VERSION_PENDING);
+        private_file(&floor, crate::version_text(next_patch()).as_bytes(), 0o600);
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Install, &mut step), Err(Error::Rollback)));
+        assert_eq!(step, Step::Manifest);
+        assert!(!stages.exists());
+        // Unsafe or malformed floor files refuse; they are never treated as absent.
+        for (text, mode) in [(version_string(), 0o644), (version_string(), 0o400), (format!("{}\n", version_string()), 0o600),
+            (format!("v{}", version_string()), 0o600), ("1".repeat(129), 0o600)] {
+            private_file(&floor, text.as_bytes(), mode);
+            assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_err(), "{text:?} {mode:o}");
+            assert_eq!(step, Step::Manifest);
+        }
+        std::fs::remove_file(&floor).unwrap();
+        private_file(&protected.join("floor-target"), version_string().as_bytes(), 0o600);
+        symlink(protected.join("floor-target"), &floor).unwrap();
+        assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_err());
+        assert_eq!(step, Step::Manifest);
+        std::fs::remove_file(&floor).unwrap();
+        std::fs::remove_file(protected.join("floor-target")).unwrap();
+        // version-pending reserves a version exactly like the floor.
+        private_file(&pending, crate::version_text(next_patch()).as_bytes(), 0o600);
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Rollback)));
+        std::fs::remove_file(&pending).unwrap();
+        // An equal floor is not a downgrade.
+        private_file(&floor, version_string().as_bytes(), 0o600);
+        let staged = verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).unwrap();
+        assert_eq!(staged.receipt.manifest_digest, generation);
+
+        // Updater state committing another generation at the same serial: a replay, refused.
+        let state_root = config.paths.state_root.clone();
+        std::fs::create_dir(&state_root).unwrap();
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state_file = state_root.join(UPDATER_STATE);
+        let replay = crate::linux::trust_init::initial_state(&fixture.manifest, Sha256Digest([7; 32]));
+        private_file(&state_file, &serde_json::to_vec(&replay).unwrap(), 0o600);
+        assert!(matches!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step), Err(Error::Rollback)));
+        assert_eq!(step, Step::Manifest);
+        // The generation the state already commits (an interrupted run of this bundle) resumes.
+        let same = crate::linux::trust_init::initial_state(&fixture.manifest, generation);
+        private_file(&state_file, &serde_json::to_vec(&same).unwrap(), 0o600);
+        assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_ok());
+        // A trust ledger must validate; a corrupt one refuses.
+        let ledger_file = state_root.join(UPDATER_LEDGER);
+        let ledger = TrustLedger::bootstrap(&fixture.root_bytes, &fixture.root_signatures,
+            manifest_digest(&fixture.root_bytes), config.context.now).unwrap();
+        private_file(&ledger_file, &serde_json::to_vec(&ledger).unwrap(), 0o600);
+        assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_ok());
+        private_file(&ledger_file, b"{\"schema_version\":1}", 0o600);
+        assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_err());
+        assert_eq!(step, Step::Manifest);
+        // A ledger without the state it is bound to is incomplete.
+        private_file(&ledger_file, &serde_json::to_vec(&ledger).unwrap(), 0o600);
+        std::fs::remove_file(&state_file).unwrap();
+        assert!(verify_and_stage_with(&config, BootstrapMode::Upgrade, &mut step).is_err());
+        assert_eq!(step, Step::Manifest);
     }
 
     /// Fork, put the pty on fd 0/1/2, then exec the sealed memfd through the

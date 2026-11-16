@@ -6164,6 +6164,7 @@
       "symbol": "crates/duduclaw-updated/src/linux/files.rs::tests::iso_root_same_verified_fd_exec_survives_path_replacement",
       "apis": {
         "command_constructor": 1,
+        "raw_execveat": 1,
         "terminal_status": 1
       },
       "effects": [
@@ -6171,7 +6172,55 @@
       ],
       "identity": "test",
       "migration": "test_only",
-      "rationale": "Ignored root test executes only a copied trusted true fixture through the verified-fd adapter after replacing its pathname; not downloaded production code."
+      "rationale": "Ignored root test executes only a copied trusted true fixture through the verified-fd adapter after replacing its pathname; the raw syscall(SYS_execveat) runs in its own pre_exec child of /usr/bin/false. Not downloaded production code."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::exec_sealed",
+      "apis": {
+        "raw_execveat": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "updater",
+      "migration": "privileged_service",
+      "rationale": "R1 root bootstrap verifier (duduclaw-bootstrap install|upgrade|rollback, run by the root administrator after the published SHA-256 comparison; production root exec). Trust precondition: reached only from run() after harden + real/effective uid 0, the compiled PRODUCTION root pin, 2-of-3 root threshold on root.json, the root-threshold BundleAuthorization, the legacy release minisign signature, the target-signed manifest, the anti-rollback floor/serial check and the re-verified stage; the staged gateway artifact is copied into a fresh memfd, sealed (SEAL|SHRINK|GROW|WRITE read back) and re-hashed against the signed manifest (sealed_executable). Then close_range(3..) CLOEXEC and execveat(AT_EMPTY_PATH) of that sealed fd with fixed argv `duduclaw service bootstrap-continue --protected-linux --mode <install|upgrade|rollback> --generation <hex>` and fixed env PATH/LANG; fd 0/1/2 kept for R3/R5's terminal. No pathname reopen and no fallback on failure. Runs as root by design (R3 continuation); no employee input."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/launcher.rs::launch",
+      "apis": {
+        "raw_execveat": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "updater",
+      "migration": "privileged_service",
+      "rationale": "Pre-existing frozen F launcher (duduclaw-updated --launch as the root service ExecStart; behaviour unchanged, newly visible after the inventory learned raw syscall(SYS_execveat)). Trust precondition: harden, update.lock held, state.json validated, the selected A/B slot fd hashed by verified_slot against the target-signed manifest accepted in the trust ledger and bound to the root-owned state selector; the durable boot attempt is saved before exec. execveat(AT_EMPTY_PATH) of that same verified fd with fixed argv `duduclaw-updated --serve-slot <a|b>` and fixed env PATH/LANG; no pathname reopen."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/linux/launcher.rs::Child<'_>::prepare",
+      "apis": {
+        "raw_execveat": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "trampoline",
+      "migration": "privileged_service",
+      "rationale": "Pre-existing HX helper child inside the duduclaw-run trampoline's isolated run (the child of Launcher::spawn's raw clone; behaviour unchanged, newly visible after the inventory learned raw syscall(SYS_execveat)). Applies stacked Landlock, the exact fd plan with every other descriptor closed and read back, hard=soft rlimits and the helper seccomp filter, then execveat(AT_EMPTY_PATH) of the root-verified signed helper executable fd with argv from the signed helper policy; no gateway invocation or local fallback."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/linux/runner.rs::execute_raw",
+      "apis": {
+        "raw_execveat": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "trampoline",
+      "migration": "privileged_service",
+      "rationale": "Pre-existing final exec of the duduclaw-run trampoline (behaviour unchanged, newly visible after the inventory learned raw syscall(SYS_execveat)): reached from execute_runtime (employee runtime after the rt-runtime cgroup move, setsid and exact fd plan) and execute_forwarder (egress forwarder). Resets signal handlers, installs the run's seccomp filter, then execveat(AT_EMPTY_PATH) of the root-verified executable fd with the verified Program argv/environment; on failure records the error page and _exit(126), no fallback."
     },
     {
       "symbol": "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::tests::exec_probe",

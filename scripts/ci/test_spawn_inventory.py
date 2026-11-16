@@ -68,6 +68,54 @@ class SpawnInventoryTests(unittest.TestCase):
         sites = self.scan('use libc as c; fn launch() { unsafe { c::execve(p, a, e); } }')
         self.assertEqual(sites[0].apis, {"raw_execve": 1})
 
+    def test_raw_execveat_syscall_is_counted(self):
+        sites = self.scan('pub(crate) fn exec_sealed(fd: i32) { unsafe { '
+                          'libc::syscall(libc::SYS_execveat, fd, p, a, e, libc::AT_EMPTY_PATH); } }')
+        self.assertEqual(sites[0].symbol, self.path + "::exec_sealed")
+        self.assertEqual(sites[0].apis, {"raw_execveat": 1})
+        sites = self.scan('use libc::{syscall, SYS_execveat}; fn run() { unsafe { syscall(SYS_execveat, fd); } }')
+        self.assertEqual(sites[0].apis, {"raw_execveat": 1})
+        sites = self.scan('fn run() { unsafe { nix::libc::syscall(nix::libc::SYS_execveat as i64, fd); '
+                          'libc::syscall(libc::SYS_execve, p, a, e); } }')
+        self.assertEqual(sites[0].apis, {"raw_execve": 1, "raw_execveat": 1})
+        # Inside a pre_exec closure the effect belongs to the enclosing function.
+        sites = self.scan('fn probe() { command.pre_exec(move || { '
+                          'libc::syscall(libc::SYS_execveat, raw, e, a, v, 0); Err(err()) }); }')
+        self.assertEqual(sites[0].apis, {"raw_execveat": 1})
+        # Other syscalls, seccomp lists naming the number and a local fn are not exec effects.
+        self.assertEqual(self.scan('''fn probe() {
+            unsafe { libc::syscall(libc::SYS_statx, fd); libc::syscall(libc::SYS_close_range, 3, 4, 0); }
+            let allowed = [libc::SYS_execveat as u32, libc::SYS_execve as u32];
+            // libc::syscall(libc::SYS_execveat, fd);
+            let text = "syscall(SYS_execveat";
+        }
+        fn syscall(number: i64) {}'''), [])
+        # A change from the raw form is a registry change, never silent.
+        registry = self.registry(self.scan('fn launch() { unsafe { libc::syscall(libc::SYS_execveat, f); } }'))
+        changed = self.scan('fn launch() { unsafe { libc::syscall(libc::SYS_execveat, f); libc::execve(p, a, e); } }')
+        self.assertTrue(any("changed process effects" in error for error in check(changed, registry)))
+        self.assertTrue(any("unclassified" in error for error in check(
+            self.scan('fn other() { unsafe { libc::syscall(libc::SYS_execveat, f); } }'), registry)))
+
+    def test_repository_registers_every_raw_execveat_site(self):
+        sites = {site.symbol: site for site in discover(Path(__file__).resolve().parents[2])}
+        registry = json.loads((Path(__file__).resolve().parent / "privileged_effects.json").read_text())
+        indexed = {entry["symbol"]: entry for entry in registry["entries"]}
+        expected = {
+            "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::exec_sealed": ("updater", "privileged_service"),
+            "crates/duduclaw-updated/src/linux/launcher.rs::launch": ("updater", "privileged_service"),
+            "crates/duduclaw-run/src/linux/launcher.rs::Child<'_>::prepare": ("trampoline", "privileged_service"),
+            "crates/duduclaw-run/src/linux/runner.rs::execute_raw": ("trampoline", "privileged_service"),
+            "crates/duduclaw-updated/src/linux/files.rs::tests::iso_root_same_verified_fd_exec_survives_path_replacement":
+                ("test", "test_only"),
+        }
+        raw = {symbol for symbol, site in sites.items() if "raw_execveat" in site.apis}
+        self.assertEqual(raw, set(expected))
+        for symbol, (identity, migration) in expected.items():
+            with self.subTest(symbol=symbol):
+                self.assertEqual(indexed[symbol]["apis"], sites[symbol].apis)
+                self.assertEqual((indexed[symbol]["identity"], indexed[symbol]["migration"]), (identity, migration))
+
     def test_type_alias_and_command_parameter(self):
         sites = self.scan('''type Launcher = std::process::Command;
             fn make() { Launcher::new("x").status(); }

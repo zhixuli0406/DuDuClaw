@@ -27,6 +27,13 @@ pub fn harden() -> Result<()> {
     }
     Ok(())
 }
+/// Real AND effective uid 0 (plan §4.1 step 1). `harden` checks only the effective
+/// uid; root entry points call this right after it, before reading anything.
+pub fn require_root() -> Result<()> {
+    // SAFETY: getuid/geteuid take no arguments and cannot fail.
+    if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 { return Err(Error::Maintenance); }
+    Ok(())
+}
 pub fn now() -> Result<u64> {
     Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| Error::Maintenance)?.as_secs())

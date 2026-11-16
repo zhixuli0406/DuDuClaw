@@ -12,13 +12,12 @@ pub const MANIFEST_ENTRY: &str = "manifest.json";
 pub const MANIFEST_SIGNATURES_ENTRY: &str = "manifest.json.signatures.json";
 const ARTIFACT_PREFIX: &str = "artifacts/";
 const BLOCK: usize = 512;
-/// A pax extended header may only carry `path` and `size`; anything larger is refused.
-const MAX_PAX_BYTES: usize = 4096;
 
 /// Hard bounds applied while parsing, before any manifest is authenticated.
 /// Exact artifact sizes are enforced afterwards by [`BundleEntries::check_manifest`].
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
+    /// Bound on tar headers of any type (every header counts, not only members).
     pub max_entries: usize,
     pub max_metadata_bytes: usize,
     pub max_signature_bytes: usize,
@@ -119,36 +118,6 @@ fn header_name(header: &[u8]) -> Result<String> {
     Ok(if prefix.is_empty() { name.to_owned() } else { format!("{prefix}/{name}") })
 }
 
-fn decimal(bytes: &[u8]) -> Result<u64> {
-    if bytes.is_empty() || bytes.len() > 20 || (bytes.len() > 1 && bytes[0] == b'0')
-        || !bytes.iter().all(u8::is_ascii_digit) { return Err(Error::Invalid); }
-    std::str::from_utf8(bytes).map_err(|_| Error::Invalid)?.parse().map_err(|_| Error::Invalid)
-}
-
-/// Strict pax records `"<len> <key>=<value>\n"`; only `path` and `size`, each once.
-fn pax(mut data: &[u8]) -> Result<(Option<String>, Option<u64>)> {
-    let (mut path, mut size) = (None, None);
-    while !data.is_empty() {
-        let space = data.iter().position(|b| *b == b' ').ok_or(Error::Invalid)?;
-        let length = usize::try_from(decimal(data.get(..space).ok_or(Error::Invalid)?)?).map_err(|_| Error::Invalid)?;
-        let record = data.get(..length).ok_or(Error::Invalid)?;
-        let body = record.get(space + 1..length.checked_sub(1).ok_or(Error::Invalid)?).ok_or(Error::Invalid)?;
-        if record.last() != Some(&b'\n') { return Err(Error::Invalid); }
-        let equals = body.iter().position(|b| *b == b'=').ok_or(Error::Invalid)?;
-        let (key, value) = (body.get(..equals).ok_or(Error::Invalid)?, body.get(equals + 1..).ok_or(Error::Invalid)?);
-        match key {
-            b"path" if path.is_none() => {
-                if value.is_empty() || !value.is_ascii() || value.contains(&0) { return Err(Error::Invalid); }
-                path = Some(std::str::from_utf8(value).map_err(|_| Error::Invalid)?.to_owned());
-            }
-            b"size" if size.is_none() => size = Some(decimal(value)?),
-            _ => return Err(Error::Invalid),
-        }
-        data = data.get(length..).ok_or(Error::Invalid)?;
-    }
-    Ok((path, size))
-}
-
 /// Same identifier rule as `ReleaseManifest::validate` artifact ids.
 fn artifact_id(name: &str) -> Option<&str> {
     let id = name.strip_prefix(ARTIFACT_PREFIX)?;
@@ -157,72 +126,59 @@ fn artifact_id(name: &str) -> Option<&str> {
     ok.then_some(id)
 }
 
-/// Parse the whole image. Only regular-file members with whitelisted names are
-/// accepted: no links, devices, directories, FIFOs, GNU extensions, global pax
-/// headers or pax keys other than `path`/`size`; no duplicates; bounded count and
-/// sizes; zero padding; exactly two-or-more zero blocks and nothing else at the end.
+/// Parse the whole image. The bundle format (plan §3.2) is plain uncompressed
+/// ustar, so only regular-file headers with whitelisted names are accepted: no
+/// pax headers of any kind (extended or global), no links, devices, directories,
+/// FIFOs or GNU extensions; no duplicates; every header counts toward
+/// `max_entries`; bounded sizes; zero padding; two-or-more zero blocks and
+/// nothing else at the end.
 pub fn read_ustar(image: &[u8], limits: &Limits) -> Result<BundleEntries> {
     let mut offset = 0usize;
-    let mut pending: Option<(Option<String>, Option<u64>)> = None;
     let mut metadata: [Option<Entry>; 4] = [None; 4];
     let mut artifacts = BTreeMap::new();
-    let mut count = 0usize;
+    let mut headers = 0usize;
     loop {
         let header = block(image, offset)?;
         if header.iter().all(|b| *b == 0) {
             let rest = image.get(offset..).ok_or(Error::Invalid)?;
-            if pending.is_some() || rest.len() < 2 * BLOCK || rest.iter().any(|b| *b != 0) { return Err(Error::Invalid); }
+            if rest.len() < 2 * BLOCK || rest.iter().any(|b| *b != 0) { return Err(Error::Invalid); }
             break;
         }
+        // Counted before anything else about the header is interpreted.
+        headers = headers.checked_add(1).ok_or(Error::Invalid)?;
+        if headers > limits.max_entries { return Err(Error::Invalid); }
         checksum_ok(header)?;
         if field(header, 257, 263)? != b"ustar\0" || field(header, 263, 265)? != b"00" { return Err(Error::Invalid); }
         if field(header, 157, 257)?.iter().any(|b| *b != 0) { return Err(Error::Invalid); }
         let declared = octal(field(header, 124, 136)?)?;
         let typeflag = *header.get(156).ok_or(Error::Invalid)?;
+        if typeflag != b'0' && typeflag != 0 { return Err(Error::Invalid); }
         let start = offset.checked_add(BLOCK).ok_or(Error::Invalid)?;
-        let size = match typeflag {
-            b'x' => {
-                let size = usize::try_from(declared).map_err(|_| Error::Invalid)?;
-                if pending.is_some() || size == 0 || size > MAX_PAX_BYTES { return Err(Error::Invalid); }
-                let data = BundleEntries::data(image, Entry { offset: start, size })?;
-                pending = Some(pax(data)?);
-                size
+        let name = header_name(header)?;
+        let size = usize::try_from(declared).map_err(|_| Error::Invalid)?;
+        let entry = Entry { offset: start, size };
+        let (slot, limit) = match name.as_str() {
+            ROOT_ENTRY => (Some(0), limits.max_metadata_bytes),
+            ROOT_SIGNATURES_ENTRY => (Some(1), limits.max_signature_bytes),
+            MANIFEST_ENTRY => (Some(2), limits.max_metadata_bytes),
+            MANIFEST_SIGNATURES_ENTRY => (Some(3), limits.max_signature_bytes),
+            other => {
+                artifact_id(other).ok_or(Error::Invalid)?;
+                (None, limits.max_artifact_bytes)
             }
-            b'0' | 0 => {
-                let (path, pax_size) = pending.take().unwrap_or((None, None));
-                // A pax size must agree with the header; no reader-dependent choice.
-                if pax_size.is_some_and(|value| value != declared) { return Err(Error::Invalid); }
-                let name = match path { Some(path) => path, None => header_name(header)? };
-                count += 1;
-                if count > limits.max_entries { return Err(Error::Invalid); }
-                let size = usize::try_from(declared).map_err(|_| Error::Invalid)?;
-                let entry = Entry { offset: start, size };
-                let (slot, limit) = match name.as_str() {
-                    ROOT_ENTRY => (Some(0), limits.max_metadata_bytes),
-                    ROOT_SIGNATURES_ENTRY => (Some(1), limits.max_signature_bytes),
-                    MANIFEST_ENTRY => (Some(2), limits.max_metadata_bytes),
-                    MANIFEST_SIGNATURES_ENTRY => (Some(3), limits.max_signature_bytes),
-                    other => {
-                        artifact_id(other).ok_or(Error::Invalid)?;
-                        (None, limits.max_artifact_bytes)
-                    }
-                };
-                if size > limit { return Err(Error::Invalid); }
-                BundleEntries::data(image, entry)?;
-                match slot {
-                    Some(index) => {
-                        let target = metadata.get_mut(index).ok_or(Error::Invalid)?;
-                        if target.replace(entry).is_some() { return Err(Error::Invalid); }
-                    }
-                    None => {
-                        let id = artifact_id(&name).ok_or(Error::Invalid)?.to_owned();
-                        if artifacts.insert(id, entry).is_some() { return Err(Error::Invalid); }
-                    }
-                }
-                size
-            }
-            _ => return Err(Error::Invalid),
         };
+        if size > limit { return Err(Error::Invalid); }
+        BundleEntries::data(image, entry)?;
+        match slot {
+            Some(index) => {
+                let target = metadata.get_mut(index).ok_or(Error::Invalid)?;
+                if target.replace(entry).is_some() { return Err(Error::Invalid); }
+            }
+            None => {
+                let id = artifact_id(&name).ok_or(Error::Invalid)?.to_owned();
+                if artifacts.insert(id, entry).is_some() { return Err(Error::Invalid); }
+            }
+        }
         let padded = size.checked_add(BLOCK - 1).ok_or(Error::Invalid)? / BLOCK * BLOCK;
         let next = start.checked_add(padded).ok_or(Error::Invalid)?;
         let padding = image.get(start.checked_add(size).ok_or(Error::Invalid)?..next).ok_or(Error::Invalid)?;
@@ -255,10 +211,30 @@ pub fn verify_authorization(root: &RootMetadata, bytes: &[u8], armors: &[String]
     Ok(authorization)
 }
 
+/// The exact `.minisig` text minisign writes: four non-empty `\n`-terminated
+/// lines (untrusted comment, signature, trusted comment, global signature) and
+/// nothing after the fourth newline. No CR or other control byte, no empty line;
+/// both signature lines are standard base64 text. `Signature::decode` alone would
+/// ignore trailing lines, so this runs first.
+pub(crate) fn strict_signature_text(text: &str) -> Result<()> {
+    let body = text.strip_suffix('\n').ok_or(Error::Signature)?;
+    let lines: Vec<&str> = body.split('\n').collect();
+    let [untrusted, signature, trusted, global] = *lines.as_slice() else { return Err(Error::Signature) };
+    let printable = |line: &str| !line.is_empty() && line.bytes().all(|b| (0x20..0x7f).contains(&b) || b >= 0x80);
+    let base64 = |line: &str| !line.is_empty()
+        && line.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+    if !lines.iter().copied().all(printable) || !base64(signature) || !base64(global)
+        || !untrusted.starts_with("untrusted comment: ") || !trusted.starts_with("trusted comment: ") {
+        return Err(Error::Signature);
+    }
+    Ok(())
+}
+
 /// Transition dual signature, half one: the legacy release minisign key. Legacy
 /// (non-prehashed) signatures are refused, as in the gateway updater, and the
 /// trusted comment must be exactly the one the release pipeline signs.
 pub fn verify_legacy_signature(data: &[u8], signature: &str, public_key: &str, trusted_comment: &str) -> Result<()> {
+    strict_signature_text(signature)?;
     let key = minisign_verify::PublicKey::from_base64(public_key).map_err(|_| Error::Signature)?;
     let signature = minisign_verify::Signature::decode(signature).map_err(|_| Error::Signature)?;
     key.verify(data, &signature, false).map_err(|_| Error::Signature)?;
@@ -336,7 +312,7 @@ pub(crate) mod tests {
         assert_eq!(BundleEntries::data(&image, entries.manifest_signatures).unwrap(), b"[\"sig\"]");
         assert_eq!(BundleEntries::data(&image, entries.artifacts["duduclaw-updated"]).unwrap(), &[7u8; 1500]);
         assert_eq!(entries.artifacts.len(), 2);
-        // ustar prefix field and a pax path naming an allowed member are equivalent.
+        // The ustar prefix field names an allowed member like the plain name does.
         let mut out = Vec::new();
         for (name, data) in inbox_entries().into_iter().take(5) { append(&mut out, name, data); }
         let mut split = header("duduclaw-updated", 3, b'0');
@@ -345,10 +321,11 @@ pub(crate) mod tests {
         append_raw(&mut out, split, b"abc");
         let entries = read_ustar(&finish(out), &Limits::BOOTSTRAP).unwrap();
         assert_eq!(entries.artifacts["duduclaw-updated"].size, 3);
+        // The bundle is plain ustar: even a pax header carrying only path or size is refused.
         let image = pax_then(&pax_record("path", "artifacts/extra"), "ignored-by-pax", b"xyz");
-        assert!(read_ustar(&image, &Limits::BOOTSTRAP).unwrap().artifacts.contains_key("extra"));
+        assert!(read_ustar(&image, &Limits::BOOTSTRAP).is_err());
         let image = pax_then(&pax_record("size", "3"), "artifacts/extra", b"xyz");
-        assert!(read_ustar(&image, &Limits::BOOTSTRAP).is_ok());
+        assert!(read_ustar(&image, &Limits::BOOTSTRAP).is_err());
         // Exact manifest correspondence: ids and signed sizes.
         let mut manifest = crate::publication::tests::manifest();
         manifest.artifacts.truncate(2);
@@ -442,5 +419,64 @@ pub(crate) mod tests {
         assert!(read_ustar(&noisy_name, &Limits::BOOTSTRAP).is_err());
         assert!(read_ustar(&[], &Limits::BOOTSTRAP).is_err());
         assert!(read_ustar(&[0u8; 1024], &Limits::BOOTSTRAP).is_err());
+    }
+
+    #[test]
+    fn ustar_counts_every_header_toward_the_entry_cap() {
+        let base = inbox_entries();
+        let exact = Limits { max_entries: base.len(), ..Limits::BOOTSTRAP };
+        assert!(read_ustar(&tar(&base), &exact).is_ok());
+        assert!(read_ustar(&tar(&base), &Limits { max_entries: base.len() - 1, ..exact }).is_err());
+        // A header of a refused type still consumes the budget first: with the cap
+        // already reached, the extra header is refused by the count itself.
+        let mut out = Vec::new();
+        for (name, data) in &base { append(&mut out, name, data); }
+        let record = pax_record("path", "artifacts/a");
+        append_raw(&mut out, header("PaxHeader/a", record.len(), b'x'), &record);
+        append(&mut out, "artifacts/a", b"a");
+        let image = finish(out);
+        assert!(read_ustar(&image, &exact).is_err());
+        assert!(read_ustar(&image, &Limits { max_entries: base.len() + 2, ..exact }).is_err());
+        // The production cap: MAX_ARTIFACTS artifact headers plus the four metadata members.
+        let mut out = Vec::new();
+        for (name, data) in base.iter().take(4) { append(&mut out, name, data); }
+        for index in 0..MAX_ARTIFACTS { append(&mut out, &format!("artifacts/a{index}"), b"x"); }
+        let full = out.clone();
+        assert_eq!(read_ustar(&finish(full), &Limits::BOOTSTRAP).unwrap().artifacts.len(), MAX_ARTIFACTS);
+        append(&mut out, "artifacts/one-more", b"x");
+        assert!(read_ustar(&finish(out), &Limits::BOOTSTRAP).is_err());
+    }
+
+    /// A real release signature (official key) over b"FAKE_BINARY", trusted comment "duduclaw test".
+    pub(crate) const OFFICIAL_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRUTh5pOpk0YmdButYZG9tlcekzhpZGpz83+E62dF1rtB5NtAoxXBenf0jZrluKejtL1R5cHtL60+75EzvH/EorwGHcc2aZlwkwQ=\ntrusted comment: duduclaw test\nmRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx2JdFAQ==\n";
+
+    #[test]
+    fn minisign_signature_text_is_strict() {
+        let verify = |text: &str| verify_legacy_signature(b"FAKE_BINARY", text, LEGACY_RELEASE_MINISIGN_KEY, "duduclaw test");
+        verify(OFFICIAL_SIGNATURE).unwrap();
+        strict_signature_text(OFFICIAL_SIGNATURE).unwrap();
+        let lines: Vec<&str> = OFFICIAL_SIGNATURE.lines().collect();
+        assert_eq!(lines.len(), 4);
+        let crlf = OFFICIAL_SIGNATURE.replace('\n', "\r\n");
+        let joined = |parts: &[&str]| parts.iter().map(|line| format!("{line}\n")).collect::<String>();
+        for bad in [
+            format!("{OFFICIAL_SIGNATURE}trailing line\n"),
+            format!("{OFFICIAL_SIGNATURE}\n"),
+            format!("{OFFICIAL_SIGNATURE}x"),
+            OFFICIAL_SIGNATURE.trim_end_matches('\n').to_owned(),
+            crlf,
+            joined(&[lines[0], "", lines[1], lines[2], lines[3]]),
+            joined(&[lines[0], lines[1], lines[2]]),
+            joined(&[lines[1], lines[2], lines[3]]),
+            joined(&["comment: x", lines[1], lines[2], lines[3]]),
+            joined(&[lines[0], lines[1], "comment: duduclaw test", lines[3]]),
+            joined(&[lines[0], &format!("{} ", lines[1]), lines[2], lines[3]]),
+            joined(&[lines[0], lines[1], &format!("{}\t", lines[2]), lines[3]]),
+            joined(&[lines[0], lines[1], lines[2], &format!("{}\r", lines[3])]),
+            String::new(),
+        ] {
+            assert!(strict_signature_text(&bad).is_err(), "{bad:?}");
+            assert!(verify(&bad).is_err(), "{bad:?}");
+        }
     }
 }

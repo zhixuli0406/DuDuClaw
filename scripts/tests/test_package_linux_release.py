@@ -21,6 +21,19 @@ SPEC = importlib.util.spec_from_file_location("linux_release", SCRIPT)
 PACKAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PACKAGE)
 TARGET = "x86_64-unknown-linux-gnu"
+PIN = "ab" * 32
+OTHER_PIN = "cd" * 32
+VERSION = PACKAGE.version_text(PACKAGE.workspace_version())
+BOOTSTRAP = PACKAGE.BOOTSTRAP_BINARY
+# Every variable that could carry a pin or a test-root setting into a test run.
+BOOTSTRAP_ENVIRONMENT = (PACKAGE.BOOTSTRAP_PIN_VARIABLE, PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE, "RUSTFLAGS",
+                         "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS",
+                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
+
+
+def good_probes(pin=PIN, version=VERSION):
+    return {"--print-root-pin": (0, f"PRODUCTION {pin}\n".encode()),
+            "--version": (0, f"duduclaw-bootstrap {version}\n".encode())}
 
 
 class LinuxReleaseTests(unittest.TestCase):
@@ -39,8 +52,9 @@ class LinuxReleaseTests(unittest.TestCase):
         (self.python / "example.py").write_text("print('fixture')\n")
         self.output = self.root / "out"
 
-    def package(self, target=TARGET):
-        return PACKAGE.create_archive(self.binaries, self.python, target, self.output)
+    def package(self, target=TARGET, include_bootstrap=True):
+        return PACKAGE.create_archive(self.binaries, self.python, target, self.output,
+                                      binaries=PACKAGE.archive_binaries(include_bootstrap))
 
     def test_both_archives_have_every_binary_regular_executable_and_sdk(self):
         for target in PACKAGE.TARGETS:
@@ -107,18 +121,43 @@ class LinuxReleaseTests(unittest.TestCase):
             (self.binaries / name).unlink()
         return release
 
-    def run_main(self, release, calls):
+    def run_main(self, release, calls, extra=(), environment=None, probes=None, host="x86_64",
+                 skip_build=True, output=None):
+        """Run main() with Cargo, glibc checks and the verifier probe faked.
+
+        `probes` maps a flag to (exit code, stdout); a probe that is not listed
+        fails the test, so "never executed" is asserted by omission.
+        """
+        environment = environment or {}
+        probes = probes or {}
+        self.build_environment = None
+
         def fake_run(command, **kwargs):
             calls.append([str(part) for part in command])
+            if command[1:2] == ["build"]:
+                self.build_environment = kwargs.get("env")
             return subprocess.CompletedProcess(command, 0)
-        argv = ["package-linux-release.py", "--target", TARGET, "--skip-build",
-                "--output-dir", str(self.output)]
+
+        def fake_probe(path, flag):
+            calls.append(["probe", str(path), flag])
+            return probes[flag]
+        argv = ["package-linux-release.py", "--target", TARGET, "--output-dir", str(self.output),
+                *(["--skip-build"] if skip_build else []), *extra]
         with patch.object(PACKAGE, "release_binary_dir", return_value=release), \
                 patch.object(PACKAGE.subprocess, "run", fake_run), \
+                patch.object(PACKAGE, "probe_bootstrap", fake_probe), \
+                patch.object(PACKAGE, "host_architecture", return_value=host), \
                 patch.object(sys, "argv", argv), \
-                patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}), \
-                contextlib.redirect_stdout(io.StringIO()):
+                patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": "", **environment}), \
+                contextlib.redirect_stdout(output if output is not None else io.StringIO()):
+            for variable in BOOTSTRAP_ENVIRONMENT:
+                if variable not in environment:
+                    os.environ.pop(variable, None)
             PACKAGE.main()
+
+    def archive_names(self):
+        with tarfile.open(self.output / "duduclaw-linux-x64.tar.gz") as bundle:
+            return set(bundle.getnames())
 
     def test_hardlinked_cargo_output_packages_via_private_staging_copy(self):
         release = self.cargo_layout()
@@ -130,13 +169,218 @@ class LinuxReleaseTests(unittest.TestCase):
         archive = self.output / "duduclaw-linux-x64.tar.gz"
         self.assertTrue(archive.is_file())
         checked = [Path(call[-1]) for call in calls if call[1:2] and call[1].endswith("check_glibc.py")]
-        self.assertEqual(len(checked), len(PACKAGE.BIN_PACKAGES))
+        self.assertEqual(len(checked), len(PACKAGE.archive_binaries(False)))
         for path in checked:
             self.assertNotEqual(path.parent, release)
             self.assertEqual(path.parent.name[:len("linux-release-inputs-")], "linux-release-inputs-")
         with tarfile.open(archive) as bundle:
-            for name in PACKAGE.BIN_PACKAGES:
+            for name in PACKAGE.archive_binaries(False):
                 self.assertEqual(bundle.extractfile(name).read(), (release / name).read_bytes())
+
+    # ---------------------------------------------------------------- bootstrap verifier guard
+
+    def test_no_pin_omits_bootstrap_with_one_line(self):
+        release = self.cargo_layout()
+        calls, output = [], io.StringIO()
+        self.run_main(release, calls, output=output)
+        names = self.archive_names()
+        self.assertNotIn(BOOTSTRAP, names)
+        for name in [*PACKAGE.archive_binaries(False), *PACKAGE.ARCHIVE_ALIASES]:
+            self.assertIn(name, names)
+        self.assertEqual(len([line for line in output.getvalue().splitlines() if BOOTSTRAP in line]), 1)
+        self.assertIn(PACKAGE.OMITTED_BOOTSTRAP_LINE, output.getvalue().splitlines())
+        self.assertFalse(any(call[0] == "probe" for call in calls))
+        # Without a pin the build the script runs does not even produce the verifier.
+        self.assertNotIn(BOOTSTRAP, PACKAGE.build_command(TARGET, "cargo", False))
+
+    def test_no_pin_omits_bootstrap_even_from_a_test_root_build(self):
+        release = self.cargo_layout()
+        self.run_main(release, [], environment={"RUSTFLAGS": "--cfg duduclaw_test_root",
+                                                PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE: "RWQtest"})
+        self.assertNotIn(BOOTSTRAP, self.archive_names())
+
+    def test_environment_pin_only_feeds_a_build_this_run_performs(self):
+        release = self.cargo_layout()
+        calls = []
+        self.run_main(release, calls, environment={PACKAGE.BOOTSTRAP_PIN_VARIABLE: PIN},
+                      probes=good_probes(), skip_build=False)
+        build = next(call for call in calls if call[1:2] == ["build"])
+        self.assertIn(BOOTSTRAP, build)
+        self.assertEqual(self.build_environment[PACKAGE.BOOTSTRAP_PIN_VARIABLE], PIN)
+        self.assertIn(BOOTSTRAP, self.archive_names())
+        # With --skip-build a stale build's environment is not trusted as the expected pin.
+        shutil.rmtree(self.output)
+        calls = []
+        self.run_main(release, calls, environment={PACKAGE.BOOTSTRAP_PIN_VARIABLE: PIN}, probes=good_probes())
+        self.assertNotIn(BOOTSTRAP, self.archive_names())
+        self.assertFalse(any(call[0] == "probe" for call in calls))
+        self.assertEqual(PACKAGE.expected_bootstrap_pin(None, {PACKAGE.BOOTSTRAP_PIN_VARIABLE: PIN}, True), PIN)
+        self.assertIsNone(PACKAGE.expected_bootstrap_pin(None, {PACKAGE.BOOTSTRAP_PIN_VARIABLE: PIN}, False))
+        self.assertIsNone(PACKAGE.expected_bootstrap_pin(None, {}, True))
+        self.assertEqual(PACKAGE.expected_bootstrap_pin(OTHER_PIN, {PACKAGE.BOOTSTRAP_PIN_VARIABLE: PIN}, True), OTHER_PIN)
+
+    def test_explicit_pin_is_built_in_and_verified_on_the_host_architecture(self):
+        release = self.cargo_layout()
+        calls = []
+        self.run_main(release, calls, extra=["--bootstrap-root-sha256", PIN], probes=good_probes(), skip_build=False)
+        self.assertEqual(self.build_environment[PACKAGE.BOOTSTRAP_PIN_VARIABLE], PIN)
+        probes = [call for call in calls if call[0] == "probe"]
+        self.assertEqual([call[2] for call in probes], ["--print-root-pin", "--version"])
+        for call in probes:
+            # The probed file is the private snapshot that is archived, not Cargo's output.
+            self.assertNotEqual(Path(call[1]).parent, release)
+            self.assertEqual(Path(call[1]).name, BOOTSTRAP)
+        with tarfile.open(self.output / "duduclaw-linux-x64.tar.gz") as bundle:
+            self.assertEqual(bundle.extractfile(BOOTSTRAP).read(), (release / BOOTSTRAP).read_bytes())
+
+    def marker(self, release, arch="x86_64", version=VERSION, pin=PIN, digest=None):
+        path = self.root / ("marker-" + hashlib.sha256(f"{arch}{version}{pin}{digest}".encode()).hexdigest()[:12])
+        path.write_text(PACKAGE.pin_marker_text(arch, version, digest or PACKAGE.sha256(release / BOOTSTRAP), pin))
+        return path
+
+    def test_pin_with_matching_marker_includes_foreign_architecture_verifier(self):
+        release = self.cargo_layout()
+        calls = []
+        # This host is aarch64: the x86_64 verifier cannot run here, so nothing is probed.
+        self.run_main(release, calls, extra=["--bootstrap-root-sha256", PIN,
+                      "--bootstrap-pin-verified-by", str(self.marker(release))], host="aarch64")
+        self.assertIn(BOOTSTRAP, self.archive_names())
+        self.assertFalse(any(call[0] == "probe" for call in calls))
+
+    def assert_refused(self, release, extra, **kwargs):
+        with self.assertRaises((ValueError, SystemExit)):
+            self.run_main(release, [], extra=extra, **kwargs)
+        self.assertFalse((self.output / "duduclaw-linux-x64.tar.gz").exists())
+
+    def test_unset_test_mismatched_pin_or_version_verifier_is_refused(self):
+        release = self.cargo_layout()
+        pinned = ["--bootstrap-root-sha256", PIN]
+        good = good_probes()
+        for name, probes in [
+                ("unset", {**good, "--print-root-pin": (1, b"UNSET\n")}),
+                ("unset exit 0", {**good, "--print-root-pin": (0, b"UNSET\n")}),
+                ("test", {**good, "--print-root-pin": (0, f"TEST {PIN}\n".encode())}),
+                ("other pin", {**good, "--print-root-pin": (0, f"PRODUCTION {OTHER_PIN}\n".encode())}),
+                ("trailing", {**good, "--print-root-pin": (0, f"PRODUCTION {PIN}\nPRODUCTION {PIN}\n".encode())}),
+                ("no newline", {**good, "--print-root-pin": (0, f"PRODUCTION {PIN}".encode())}),
+                ("failed exit", {**good, "--print-root-pin": (1, f"PRODUCTION {PIN}\n".encode())}),
+                ("other version", good_probes(version="0.0.1")),
+                ("version exit", {**good, "--version": (2, good["--version"][1])}),
+                ("version missing", {**good, "--version": (2, b"")})]:
+            with self.subTest(name=name):
+                self.assert_refused(release, pinned, probes=probes)
+        # A foreign-architecture verifier without (or with a non-matching) marker.
+        with self.subTest(name="foreign without marker"):
+            self.assert_refused(release, pinned, host="aarch64")
+        with self.subTest(name="non-linux host"):
+            self.assert_refused(release, pinned, host=None)
+        for name, marker in [("other pin", self.marker(release, pin=OTHER_PIN)),
+                             ("other version", self.marker(release, version="0.0.1")),
+                             ("other arch", self.marker(release, arch="aarch64")),
+                             ("other bytes", self.marker(release, digest="00" * 32))]:
+            with self.subTest(name="marker " + name):
+                self.assert_refused(release, [*pinned, "--bootstrap-pin-verified-by", str(marker)], host="aarch64")
+        with self.subTest(name="marker symlink"):
+            link = self.root / "marker-link"
+            link.symlink_to(self.marker(release))
+            self.assert_refused(release, [*pinned, "--bootstrap-pin-verified-by", str(link)], host="aarch64")
+        with self.subTest(name="malformed pin"):
+            self.assert_refused(release, ["--bootstrap-root-sha256", PIN.upper()], probes=good)
+        with self.subTest(name="marker without pin"):
+            self.assert_refused(release, ["--bootstrap-pin-verified-by", str(self.marker(release))])
+        # An unpinned build is also refused at the build-only step.
+        with self.subTest(name="build-only"):
+            with self.assertRaises(ValueError):
+                self.run_build_only(release, pinned, {**good, "--print-root-pin": (1, b"UNSET\n")})
+        # The archive writer itself only accepts a complete production set.
+        with self.assertRaises(ValueError):
+            PACKAGE.create_archive(release, self.python, TARGET, self.output, binaries=["duduclaw"])
+        with self.assertRaises(ValueError):
+            PACKAGE.create_archive(release, self.python, TARGET, self.output,
+                                   binaries=[*PACKAGE.BIN_PACKAGES, "duduclaw-isolation-test-signer"])
+        self.assertFalse(self.output.exists())
+
+    def run_build_only(self, release, extra, probes):
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0)
+        argv = ["package-linux-release.py", "--target", TARGET, "--build-only", *extra]
+        with patch.object(PACKAGE, "release_binary_dir", return_value=release), \
+                patch.object(PACKAGE.subprocess, "run", fake_run), \
+                patch.object(PACKAGE, "probe_bootstrap", lambda path, flag: probes[flag]), \
+                patch.object(PACKAGE, "host_architecture", return_value="x86_64"), \
+                patch.object(sys, "argv", argv), \
+                patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for variable in BOOTSTRAP_ENVIRONMENT:
+                os.environ.pop(variable, None)
+            PACKAGE.main()
+
+    def test_build_only_with_pin_verifies_the_fresh_build(self):
+        release = self.cargo_layout()
+        self.run_build_only(release, ["--bootstrap-root-sha256", PIN], good_probes())
+        with self.assertRaises(ValueError):
+            self.run_build_only(release, ["--bootstrap-root-sha256", PIN],
+                                {**good_probes(), "--print-root-pin": (0, f"TEST {PIN}\n".encode())})
+
+    def test_test_root_build_settings_are_refused_with_a_pin(self):
+        refused = [{"RUSTFLAGS": "-C opt-level=s --cfg duduclaw_test_root"},
+                   {"RUSTFLAGS": "--cfg=duduclaw_test_root"},
+                   {"RUSTFLAGS": "--cfg  duduclaw_test_root=\"1\""},
+                   {"RUSTFLAGS": "duduclaw_test_root"},
+                   {"CARGO_ENCODED_RUSTFLAGS": "-Copt-level=s\x1f--cfg\x1fduduclaw_test_root"},
+                   {"CARGO_BUILD_RUSTFLAGS": "--cfg 'duduclaw_test_root'"},
+                   {"CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "--cfg duduclaw_test_root"},
+                   {PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE: "RWQtest"},
+                   {PACKAGE.BOOTSTRAP_TEST_KEY_VARIABLE: ""}]
+        for environment in refused:
+            with self.subTest(environment=environment):
+                with self.assertRaises(ValueError):
+                    PACKAGE.refuse_test_root_environment(environment, TARGET)
+        # Tokenised flags, not substring matching: unrelated cfgs and names pass.
+        for environment in [{}, {"RUSTFLAGS": "--cfg duduclaw_test_root_extra"},
+                            {"RUSTFLAGS": "--cfg=feature=\"duduclaw_test_root\""},
+                            {"RUSTFLAGS": "-Cmetadata=duduclaw_test_root"},
+                            {"CARGO_ENCODED_RUSTFLAGS": "--cfg\x1fother"},
+                            {"CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "--cfg duduclaw_test_root"}]:
+            with self.subTest(environment=environment):
+                PACKAGE.refuse_test_root_environment(environment, TARGET)
+        # Wired into main(): refused before anything is packaged, even if the binary would pass.
+        release = self.cargo_layout()
+        for environment in refused[:3] + refused[-1:]:
+            with self.subTest(main=environment):
+                self.assert_refused(release, ["--bootstrap-root-sha256", PIN], probes=good_probes(),
+                                    environment=environment)
+
+    def test_pin_format_is_strict(self):
+        PACKAGE.parse_bootstrap_pin(PIN)
+        for bad in [PIN.upper(), "ab" * 31, "ab" * 33, PIN + "\n", " " + PIN, "zz" * 32, "", None]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    PACKAGE.parse_bootstrap_pin(bad)
+        with self.assertRaises(ValueError):
+            PACKAGE.expected_bootstrap_pin(None, {PACKAGE.BOOTSTRAP_PIN_VARIABLE: "not-a-pin"}, True)
+
+    def test_emitted_marker_round_trips_and_needs_the_target_architecture(self):
+        release = self.cargo_layout()
+        marker = self.root / "emitted-marker"
+        with patch.object(PACKAGE, "probe_bootstrap", lambda path, flag: good_probes()[flag]), \
+                patch.object(PACKAGE, "host_architecture", return_value="x86_64"):
+            PACKAGE.emit_pin_marker(release / BOOTSTRAP, TARGET, PIN, VERSION, marker)
+            with self.assertRaises(FileExistsError):
+                PACKAGE.emit_pin_marker(release / BOOTSTRAP, TARGET, PIN, VERSION, marker)
+        self.assertEqual(marker.read_text(), PACKAGE.pin_marker_text(
+            "x86_64", VERSION, PACKAGE.sha256(release / BOOTSTRAP), PIN))
+        with patch.object(PACKAGE, "host_architecture", return_value="aarch64"):
+            with self.assertRaises(ValueError):
+                PACKAGE.emit_pin_marker(release / BOOTSTRAP, TARGET, PIN, VERSION, self.root / "foreign-marker")
+        with patch.object(PACKAGE, "probe_bootstrap", lambda path, flag: {**good_probes(), "--print-root-pin": (0, b"UNSET\n")}[flag]), \
+                patch.object(PACKAGE, "host_architecture", return_value="x86_64"):
+            with self.assertRaises(ValueError):
+                PACKAGE.emit_pin_marker(release / BOOTSTRAP, TARGET, PIN, VERSION, self.root / "unset-marker")
+        self.assertFalse((self.root / "foreign-marker").exists() or (self.root / "unset-marker").exists())
+        self.run_main(release, [], extra=["--bootstrap-root-sha256", PIN, "--bootstrap-pin-verified-by", str(marker)],
+                      host="aarch64")
+        self.assertIn(BOOTSTRAP, self.archive_names())
 
     def test_staged_copy_is_independent_private_nlink_one(self):
         release = self.cargo_layout()
@@ -185,7 +429,7 @@ class LinuxReleaseTests(unittest.TestCase):
         self.assertEqual(before, archive.read_bytes())
 
     def test_explicit_production_build_includes_parser_engine(self):
-        command = PACKAGE.build_command(TARGET, "cross")
+        command = PACKAGE.build_command(TARGET, "cross", True)
         self.assertEqual(command[:2], ["cross", "build"])
         self.assertIn("--locked", command)
         self.assertNotIn("--bins", command)
@@ -193,6 +437,10 @@ class LinuxReleaseTests(unittest.TestCase):
         for name in PACKAGE.BIN_PACKAGES:
             self.assertIn(name, [command[i + 1] for i, part in enumerate(command) if part == "--bin"])
         self.assertIn("duduclaw-parse-worker/engine", command[command.index("--features") + 1])
+        unpinned = PACKAGE.build_command(TARGET, "cross", False)
+        bins = [unpinned[i + 1] for i, part in enumerate(unpinned) if part == "--bin"]
+        self.assertEqual(bins, PACKAGE.archive_binaries(False))
+        self.assertNotIn(BOOTSTRAP, bins)
 
     def test_f_publication_names_and_packaged_component_ids_agree(self):
         source = (ROOT / "crates/duduclaw-updated/src/publication.rs").read_text()
