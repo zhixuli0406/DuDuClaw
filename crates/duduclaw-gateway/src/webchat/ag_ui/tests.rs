@@ -455,7 +455,7 @@ fn web_lifetime_error_names_the_web_cap_and_suggests_background_work() {
     let event = run::failure("run_timeout");
     assert_eq!(event["code"], "run_timeout");
     let message = event["message"].as_str().unwrap();
-    assert!(message.contains("網頁對話") && message.contains("15 分鐘") && message.contains("背景任務"));
+    assert!(message.contains("網頁對話") && message.contains("設定的網頁對話執行時間上限") && message.contains("背景任務"));
     assert!(!run::failure("runtime_failed")["message"].as_str().unwrap().contains("15 分鐘"));
 }
 
@@ -463,14 +463,14 @@ mod timeout_tests {
     use super::*;
 
     #[tokio::test]
-    async fn employee_hour_limit_does_not_extend_web_chat_past_fifteen_minutes() {
+    async fn employee_five_minute_limit_expires_after_delivery_grace() {
         let f = Fixture::new(UserRole::Admin).await;
         let path = f.home.path().join("agents/worker/agent.toml");
         let mut table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         table.insert("runtime".into(), toml::Value::Table(
-            toml::from_str("provider='claude'\ntimeout_secs=3600").unwrap()));
+            toml::from_str("provider='claude'\ntimeout_secs=300").unwrap()));
         std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
-        assert_eq!(crate::runtime_config::claude_timeout_secs(f.home.path(), Some(path.parent().unwrap())), 3600);
+        assert_eq!(crate::runtime_config::claude_timeout_secs(f.home.path(), Some(path.parent().unwrap())), 300);
         let state = f.state();
         let broker = state.chat.approvals.clone().unwrap();
         let sid = session_id(&f.user, "worker", "thread");
@@ -485,7 +485,7 @@ mod timeout_tests {
         assert_eq!(frame(&mut rx).await["type"], "RUN_STARTED");
         let _blocked_turn = tokio::time::timeout(Duration::from_secs(30), seam.entered.recv()).await.unwrap().unwrap();
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(899)).await;
+        tokio::time::advance(Duration::from_secs(329)).await;
         tokio::task::yield_now().await;
         assert!(!worker.is_finished());
         assert!(rx.try_recv().is_err());
@@ -501,11 +501,18 @@ fn webchat_deadline_covers_resolved_employee_timeout_and_global_ceiling() {
     let home = tempfile::tempdir().unwrap();
     let dir = home.path().join("agents/anna");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("agent.toml"), "[runtime]\ntimeout_secs=7000\n").unwrap();
+    for (employee, expected) in [("timeout_secs=300", 330), ("", 1830)] {
+        std::fs::write(dir.join("agent.toml"), format!("[runtime]\nprovider='claude'\n{employee}\n")).unwrap();
+        assert_eq!(run_lifetime(home.path(), "anna").as_secs(), expected);
+        for max in [600, 7200, 14400] {
+            std::fs::write(home.path().join("config.toml"), format!("[runtime]\nmax_timeout_secs={max}\n")).unwrap();
+            assert_eq!(run_lifetime(home.path(), "anna").as_secs(), expected.min(max + 30));
+        }
+        std::fs::remove_file(home.path().join("config.toml")).unwrap();
+    }
+    std::fs::write(dir.join("agent.toml"), "[runtime]\ntimeout_secs=14000\n").unwrap();
     for max in [600, 7200, 14400] {
         std::fs::write(home.path().join("config.toml"), format!("[runtime]\nmax_timeout_secs={max}\n")).unwrap();
-        let timeout = crate::runtime_config::claude_timeout_secs(home.path(), Some(&dir));
-        assert!(run_lifetime(home.path()).as_secs() > timeout);
-        assert_eq!(run_lifetime(home.path()).as_secs(), max + 30);
+        assert!(run_lifetime(home.path(), "anna").as_secs() <= max + 30);
     }
 }

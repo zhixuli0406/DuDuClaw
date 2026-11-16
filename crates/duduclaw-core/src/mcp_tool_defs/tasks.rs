@@ -111,7 +111,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "timeout_secs",
-                description: "With kind='goal', unscheduled: per-run limit in seconds (30 up to runtime.max_timeout_secs; at most 14400), capped by the employee's and global limits. Fixed at creation.",
+                description: "With kind='goal', unscheduled: per-run limit in seconds (30 up to min(runtime.max_timeout_secs, 3600); at most one hour), capped by the employee's and global limits. Fixed at creation.",
                 required: false,
             },
             ParamDef {

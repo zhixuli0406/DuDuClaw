@@ -16,9 +16,11 @@ use input::{RunInput, ResumeEntry};
 const MAX_BODY: usize = 256 * 1024;
 const MAX_RUNS: usize = 10;
 const MAX_PER_USER: usize = 2;
-fn run_lifetime(home: &std::path::Path) -> Duration {
-    // Every employee/task timeout is capped by this policy. Leave time for final delivery.
-    Duration::from_secs(crate::runtime_config::TimeoutPolicy::load(home).max_secs + 30)
+fn run_lifetime(home: &std::path::Path, agent: &str) -> Duration {
+    let dir = home.join("agents").join(agent);
+    let timeout = crate::runtime_config::effective_agent_timeout_secs(&dir);
+    let maximum = crate::runtime_config::TimeoutPolicy::load(home).max_secs;
+    Duration::from_secs(timeout.min(maximum) + 30)
 }
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -149,7 +151,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "run_store_unavailable"),
         };
         let matches = receipts.get(&sid).is_some_and(|(at, entries)|
-            at.elapsed() < run_lifetime(&state.chat.ctx.home_dir) && same_decisions(entries, &input.resume));
+            at.elapsed() < run_lifetime(&state.chat.ctx.home_dir, &agent) && same_decisions(entries, &input.resume));
         if !matches { return error(StatusCode::CONFLICT, "stale_or_unknown_interrupt"); }
         true
     } else { false };
@@ -172,7 +174,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
             }
         }
     }
-    let turn = match journal.admit(&principal, &sid, &input.run_id, has_live_thread).await {
+    let turn = match journal.admit(&principal, &sid, &input.run_id, has_live_thread, &agent).await {
         Ok(turn) => turn,
         Err(reason) => {
             tracing::debug!(%reason, "AG-UI admission refused");

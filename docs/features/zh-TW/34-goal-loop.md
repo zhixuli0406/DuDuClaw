@@ -91,7 +91,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## 目標的單次執行時限
 
-每次 CLI 執行（含 Claude）和每次 OpenAI 相容 API 請求，都受員工的「單次執行時間上限」限制（`agent.toml [runtime] timeout_secs`，最低 30 秒，最高為全域 `[runtime] max_timeout_secs`）。未設定時採用全域 `[runtime] default_timeout_secs`；全域預設也未設定時，Claude 為 1800 秒，其他執行環境為 300 秒，仍受全域最高上限約束。比較複雜的目標可以另外給時限，不必改員工設定：在 `tasks_create`、`kind="goal"` 帶 `timeout_secs`（30 秒至全域 `max_timeout_secs`）。這個目標的每一輪都用它；開了任務沙箱的員工，沙箱逾時也改用它。每次執行與沙箱均受目前全域 `[runtime] max_timeout_secs` 約束。
+每次 CLI 執行（含 Claude）和每次 OpenAI 相容 API 請求，都受員工的「單次執行時間上限」限制（`agent.toml [runtime] timeout_secs`，最低 30 秒，最高為全域 `[runtime] max_timeout_secs`）。未設定時採用全域 `[runtime] default_timeout_secs`；全域預設也未設定時，Claude 為 1800 秒，其他執行環境為 300 秒，仍受全域最高上限約束。比較複雜的目標可以另外給時限，不必改員工設定：在 `tasks_create`、`kind="goal"` 帶 `timeout_secs`（30 秒至 `min(max_timeout_secs, 3600)`，最多一小時）。這個目標的每一輪都用它；開了任務沙箱的員工，沙箱逾時也改用它。每次執行與沙箱均受目前全域 `[runtime] max_timeout_secs` 約束。
 
 只有管理員可以設得比員工本身的上限更長，跟在員工編輯頁調高上限的規則一樣。儀表板 Operator、所有 MCP 呼叫者，以及建立者已不是管理員的排程交辦，最多只能用員工本身的上限（排程每次觸發都重新套用）。時限在目標建立時就固定，`tasks_update` 會拒絕修改。目標改派給其他員工時（任何改派方式）會清除時限，新負責人改用自己的上限。任務詳情頁會以標籤顯示。
 
@@ -155,6 +155,6 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## 單次執行步數
 
-執行步數另行設定：全域 `[runtime] default_max_turns` 預設 **50**，`max_turns_limit` 預設 **200**（整數 **1～10000**）。員工可設定 `[runtime] max_turns`，範圍從 **1** 至全域最高步數上限；留空採用全域預設，**0 不代表無限**。無效或無法讀取的設定採用有界預設，每個程序只警告一次；超出上限的值在執行時縮至上限，儀表板儲存時拒絕。提高員工步數需要管理員；擁有者可降低，清空後若因繼承預設而提高，也需要管理員。兩個全域鍵同樣由管理員變更，沿用既有設定提交與稽核流程。儀表板欄位位於時間上限旁；步數增加可能消耗更多額度、延長執行時間。Claude 通道回覆、背景工作與終端聊天皆套用此值；受保護模式待 RM-098 支援前維持 50 步。OpenAI 相容工具迴圈只有在員工明確設定 `max_turns` 時才採用該值，否則維持 10 輪；用盡時回傳獨立的步數上限錯誤。無人值守的 Claude／Grok 執行會停用互動提問工具；Claude 系統提示會提醒接近步數上限時整理進度並正常結束。主動檢查仍使用獨立的 `[proactive] max_turns`，接受 **1～64**。
+執行步數另行設定：全域 `[runtime] default_max_turns` 預設 **50**，`max_turns_limit` 預設 **200**（整數 **1～10000**）。員工可設定 `[runtime] max_turns`，範圍從 **1** 至全域最高步數上限；留空採用全域預設，**0 不代表無限**。設定讀取、解析或型別錯誤時，生效步數最多 50 步（OpenAI 相容工具迴圈最多 10 輪），並保留有效的較低限制，每個程序只警告一次；缺檔或缺鍵則採用預設；超出上限的值在執行時縮至上限，儀表板儲存時拒絕。提高員工步數需要管理員；擁有者可降低，清空後若因繼承預設而提高，也需要管理員。兩個全域鍵同樣由管理員變更，沿用既有設定提交與稽核流程。儀表板欄位位於時間上限旁；步數增加可能消耗更多額度、延長執行時間。Claude 通道回覆、背景工作與終端聊天皆套用此值；受保護模式待 RM-098 支援前維持 50 步。OpenAI 相容工具迴圈只有在員工明確設定 `max_turns` 時才採用該值，否則維持 10 輪；用盡時回傳獨立的步數上限錯誤。無人值守的 Claude／Grok 執行會停用互動提問工具；Claude 系統提示會提醒接近步數上限時整理進度並正常結束。主動檢查仍使用獨立的 `[proactive] max_turns`，接受 **1～64**。
 
-網頁對話的等待時間依全域 `max_timeout_secs` 加上交付緩衝決定，不會早於員工的生效時限結束。目標任務的 `timeout_secs` 可設為 **30 秒**至目前全域 `max_timeout_secs`，每輪執行仍受該上限約束。
+網頁對話依目標員工的生效時限（受全域 `max_timeout_secs` 約束）加上 30 秒交付緩衝決定；預設 1800 秒的員工為 1830 秒。目標任務的 `timeout_secs` 可設為 **30 秒**至 `min(max_timeout_secs, 3600)`；即使提高全域上限，目標任務仍最多一小時。

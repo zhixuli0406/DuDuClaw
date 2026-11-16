@@ -119,13 +119,13 @@ pub fn parse_cost_cap_cents(args: &serde_json::Value) -> Result<Option<u64>, Str
     }
 }
 
-const TIMEOUT_RANGE_ERROR: &str = "timeout_secs must be an integer between 30 and 14400";
+const TIMEOUT_RANGE_ERROR: &str = "timeout_secs must be an integer between 30 and 3600 (one hour)";
 
 /// Range check shared by every write of `tasks.timeout_secs`.
 pub fn check_timeout_secs(secs: Option<u64>) -> Result<(), String> {
     match secs {
         Some(s)
-            if !(crate::runtime_config::MIN_TIMEOUT_SECS..=14_400)
+            if !(crate::runtime_config::MIN_TIMEOUT_SECS..=3600)
                 .contains(&s) =>
         {
             Err(TIMEOUT_RANGE_ERROR.into())
@@ -156,7 +156,8 @@ pub fn check_timeout_widening(
     may_widen: bool,
 ) -> Result<(), String> {
     let Some(secs) = secs else { return Ok(()) };
-    let global_max = crate::runtime_config::TimeoutPolicy::load(home_dir).max_secs;
+    check_timeout_secs(Some(secs))?;
+    let global_max = crate::runtime_config::TimeoutPolicy::load(home_dir).max_secs.min(3600);
     if secs > global_max {
         return Err(format!("timeout_secs exceeds the global ceiling ({global_max} s)"));
     }
@@ -758,13 +759,14 @@ mod timeout_tests {
 mod configured_timeout_tests {
     use super::*;
     #[test]
-    fn goals_above_one_hour_follow_the_current_global_ceiling() {
+    fn goals_remain_capped_at_one_hour_with_a_larger_global_ceiling() {
         let home = tempfile::tempdir().unwrap();
         for max in [600, 7200, 14400] {
             std::fs::write(home.path().join("config.toml"), format!("[runtime]\nmax_timeout_secs={max}\n")).unwrap();
-            assert!(check_timeout_widening(home.path(), "anna", Some(max), true).is_ok());
+            assert!(check_timeout_widening(home.path(), "anna", Some(max.min(3600)), true).is_ok());
             assert!(check_timeout_widening(home.path(), "anna", Some(max + 1), true).is_err());
         }
-        assert_eq!(parse_timeout_secs(&serde_json::json!({"timeout_secs":7200})).unwrap(), Some(7200));
+        assert!(parse_timeout_secs(&serde_json::json!({"timeout_secs":7200})).unwrap_err().contains("3600 (one hour)"));
+        assert!(check_timeout_widening(home.path(), "anna", Some(7200), true).unwrap_err().contains("3600 (one hour)"));
     }
 }

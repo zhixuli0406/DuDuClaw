@@ -219,7 +219,7 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
     }
     if tool.name == "tasks_create" {
         properties.insert("timeout_secs".into(), serde_json::json!({
-            "type": "integer", "minimum": 30, "maximum": 14400,
+            "type": "integer", "minimum": 30, "maximum": 3600,
             "description": tool.params.iter().find(|p| p.name == "timeout_secs").map(|p| p.description).unwrap_or("")
         }));
         properties.insert("kind".into(),serde_json::json!({"type":"string","enum":["task","goal","discovery"],"default":"task"}));

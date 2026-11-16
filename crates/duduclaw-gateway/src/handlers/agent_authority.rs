@@ -526,7 +526,7 @@ mod turn_tests {
     fn owners_can_only_narrow_steps_including_clear_and_stored_over_ceiling() {
         let table = |s: &str| s.parse::<toml::Table>().unwrap();
         let timeout = crate::runtime_config::TimeoutPolicy::default();
-        let turns = duduclaw_core::turn_limits::TurnPolicy { default: 70, limit: 90 };
+        let turns = duduclaw_core::turn_limits::TurnPolicy::from_table(&"[runtime]\ndefault_max_turns=70\nmax_turns_limit=90".parse().unwrap());
         for (before, after, admin) in [
             ("", "[runtime]\nmax_turns=71", true),
             ("", "[runtime]\nmax_turns=60", false),
