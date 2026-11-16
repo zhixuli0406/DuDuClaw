@@ -11573,5 +11573,9 @@
   "routines.delivery.none": "尚無送達紀錄",
   "routines.delivery.notificationFailed": "通知無法送達，請檢查通道設定。",
   "routines.delivery.accessChanged": "收件對象的存取權已變更，請確認通知目的地。",
-  "routines.delivery.unknownReason": "無法完成送達。"
+  "routines.delivery.unknownReason": "無法完成送達。",
+  "channels.detail.behavior.dmReplyPlacement": "私訊回覆位置",
+  "channels.detail.behavior.dmReplyPlacement.help": "主畫面訊息預設回覆在主畫面；討論串內的訊息仍回覆在原討論串。",
+  "channels.detail.behavior.dmReplyPlacement.main": "主畫面（預設）",
+  "channels.detail.behavior.dmReplyPlacement.thread": "一律回覆在討論串"
 }

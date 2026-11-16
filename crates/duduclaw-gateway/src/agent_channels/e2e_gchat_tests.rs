@@ -63,6 +63,7 @@ pub(crate) fn chat_jwt(audience: &str) -> String {
 struct FakeGoogle {
     /// `(method, path, bearer, body)` of every Chat API call.
     calls: Mutex<Vec<(String, String, String, Value)>>,
+    queries: Mutex<Vec<(String, String)>>,
     first_message_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     first_message_started: tokio::sync::Notify,
     subscription_topic: Mutex<Option<String>>,
@@ -78,6 +79,7 @@ async fn fake_google(
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::Json<Value> {
+    f.queries.lock().unwrap().push((uri.path().to_owned(), uri.query().unwrap_or("").to_owned()));
     let path = uri.path().to_string();
     if path == "/jwks" {
         f.jwks_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -589,4 +591,51 @@ async fn googlechat_http_addon_shapes_report_actionable_channel_status() {
             assert!(status.error.as_ref().unwrap().contains("Build this Chat app as a Google Workspace add-on"));
         }
     }
+}
+
+#[tokio::test]
+async fn dm_reply_placement_uses_inbound_thread_reply_and_dashboard_setting() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = start_fake().await;
+    let email = format!("placement-{}@test.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+    let sa = service_account(&fake, &email);
+    use crate::trigger_route::tests::write_agent;
+    write_agent(&home.path().join("agents"), "sales", "業務", "", "specialist", &googlechat_section(home.path(), "987654321", &sa));
+    let ctx = super::e2e_tests::reply_ctx(home.path()).await;
+    super::e2e_seam::arm(home.path());
+    let app = crate::googlechat_agents::router(ctx.clone());
+    for (index, kind, legacy, thread_reply, always, expected) in [
+        (0, "DIRECT_MESSAGE", "DM", false, false, false),
+        (1, "DIRECT_MESSAGE", "DM", true, false, true),
+        (2, "SPACE", "SPACE", false, false, true),
+        (3, "DIRECT_MESSAGE", "DM", false, true, true),
+        (4, "", "DM", false, false, false),
+    ] {
+        ctx.channel_settings.set("googlechat", "global", "dm_reply_placement", if always { "thread" } else { "main" }).await.unwrap();
+        let space = format!("spaces/PLACEMENT{index}");
+        let mut event = message_event(&space, "hello");
+        let mut carried = json!({"name":space, "type":legacy, "singleUserBotDm":true});
+        if !kind.is_empty() { carried["spaceType"] = json!(kind); }
+        event["space"] = carried.clone(); event["message"]["space"] = carried;
+        event["message"]["thread"] = json!({"name":format!("{space}/threads/t")});
+        event["message"]["threadReply"] = json!(thread_reply);
+        assert_eq!(post(&app, "sales", Some(&chat_jwt("987654321")), &event).await, StatusCode::OK);
+        wait_text(&fake, &format!("Bearer tok-{email}"), "OWN_BOT_REPLY").await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let done = fake.state.calls.lock().unwrap().iter().any(|(_, path, _, body)| path.contains(&space) && body["text"].as_str().is_some_and(|t| t.contains("OWN_BOT_REPLY")));
+                if done { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        let calls = fake.state.calls.lock().unwrap();
+        let creates: Vec<_> = calls.iter().filter(|(method, path, _, _)| method == "POST" && path == &format!("/{space}/messages")).collect();
+        assert!(!creates.is_empty());
+        for (_, _, _, body) in creates { assert_eq!(body.get("thread").is_some(), expected); }
+        for (_, query) in fake.state.queries.lock().unwrap().iter().filter(|(path, _)| path == &format!("/{space}/messages")) {
+            assert_eq!(query == "messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD", expected);
+        }
+    }
+    assert!(!crate::channel_settings::CONFIG_KEYS.contains(&"dm_reply_placement"));
+    assert!(!crate::channel_settings::MCP_ACCESS_KEYS.contains(&"dm_reply_placement"));
 }

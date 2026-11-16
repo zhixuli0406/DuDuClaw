@@ -545,8 +545,9 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
                 .submit_in(&group, &conversation, async move { handle_message(&st, &queued).await }).is_ok());
             if !accepted
             {
-                let thread = event.pointer("/message/thread/name").and_then(|v| v.as_str());
-                notify_queue_full(&state, &group, &conversation, &space, thread);
+                let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &event["message"], &event).await;
+                let thread = reply_thread(&state, &event, is_dm).await;
+                notify_queue_full(&state, &group, &conversation, &space, thread.as_deref());
                 // ACK and drop this event: the notice asks the user to resend.
                 return (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response();
             }
@@ -651,20 +652,29 @@ fn event_space(event: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// Assemble smart chips before the shared input guard sees the inbound message.
+pub(crate) fn inbound_text(message: &serde_json::Value) -> String {
+    let mut text = message.get("argumentText").or_else(|| message.get("text"))
+        .and_then(serde_json::Value::as_str).unwrap_or("").trim().to_owned();
+    let links = crate::google_workspace::chat_read::rich_links(message, &text);
+    if !links.is_empty() { text.push_str(&format!("\n\n（訊息裡的預覽連結：{}）", serde_json::to_string(&links).expect("string links serialize"))); }
+    text
+}
+
+pub(crate) async fn reply_thread(state: &GoogleChatState, event: &serde_json::Value, is_dm: bool) -> Option<String> {
+    let message = &event["message"];
+    let always = state.ctx.channel_settings.get("googlechat", "global", "dm_reply_placement").await.as_deref() == Some("thread");
+    if is_dm && !always && message.get("threadReply").and_then(serde_json::Value::as_bool) != Some(true) { return None; }
+    message.pointer("/thread/name").and_then(serde_json::Value::as_str).map(str::to_owned)
+}
+
 async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value) {
     let message = event.get("message").cloned().unwrap_or_default();
     // Defence in depth: every entry already requires a human sender.
     if !is_human_message(&message) {
         return;
     }
-    // argumentText has the app @mention stripped; fall back to raw text.
-    let text = message
-        .get("argumentText")
-        .or_else(|| message.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let text = inbound_text(&message);
     // Attachment-only messages carry no text — parse attachments before the
     // empty-text bail so a bare file upload still reaches the agent.
     let attachments = parse_gchat_attachments(&message);
@@ -682,10 +692,8 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         warn!("Google Chat: MESSAGE event without space name");
         return;
     }
-    let thread = message
-        .pointer("/thread/name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &message, event).await;
+    let thread = reply_thread(state, event, is_dm).await;
     let sender = message
         .pointer("/sender/displayName")
         .and_then(|v| v.as_str())
@@ -699,7 +707,10 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
 
     let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&state.ctx, message.pointer("/space/type").or_else(|| event.pointer("/space/type")).and_then(|v| v.as_str()).is_some_and(|kind| matches!(kind, "ROOM" | "SPACE" | "GROUP_CHAT")), "googlechat", "global", &space, thread.as_deref(), message.get("name").and_then(|v| v.as_str()).unwrap_or(""), &sender_id, &sender, if text.is_empty() { "[附件]" } else { &text }).await;
 
-    info!("📩 Google Chat [{sender}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
+    let raw_text = message.get("argumentText").or_else(|| message.get("text"))
+        .and_then(serde_json::Value::as_str).unwrap_or("").trim();
+    let link_count = crate::google_workspace::chat_read::rich_links(&message, raw_text).len();
+    info!(sender = %sender, message_length = text.len(), link_count, "Google Chat inbound message");
 
     // ── Inbound attachments (WP1.3 parity with the other 8 channels) ──
     // Uploaded-to-Chat files are fetched through the media API with the
@@ -810,6 +821,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     });
 
     // ── Chat commands ──
+    // Future thread segmentation must require threadReply == true: every main-view DM message gets a fresh thread.
     let session_id = format!("googlechat:{space}");
     // An employee's own app answers in the employee's own bucket of the space
     // (two employees' apps can share one space).
@@ -893,11 +905,6 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     // Google Chat already shows a "思考中…" placeholder that the answer
     // replaces, so thinking display adds one line to the answer instead of a
     // second status message.
-    let is_dm = message
-        .pointer("/space/type")
-        .or_else(|| event.pointer("/space/type"))
-        .and_then(|v| v.as_str())
-        == Some("DM");
     // Chat's placeholder is reserved for progress/final delivery. Thinking
     // contributes at most a staff-only duration; never a summary in the answer.
     let thinking = crate::thinking::channel_presenter::ChannelThinking::new(
@@ -1179,6 +1186,30 @@ fn drive_attachment_note(filename: &str, file_id: &str) -> String {
     }
 }
 
+/// Send failures need app-installation guidance rather than read-tool authorization guidance.
+fn send_error_text(status: u16, lang: crate::trigger_route::texts::Lang) -> &'static str {
+    use crate::trigger_route::texts::Lang;
+    let row = match status { 403 | 404 => 0, 429 | 500..=599 => 1, _ => 2 };
+    let messages = match lang {
+        Lang::ZhTw => [
+            "對方尚未與此 Chat 應用程式建立對話，或應用程式不在該聊天室。請對方先私訊此應用程式一次，或請管理員為對方安裝，或將應用程式加入該聊天室。",
+            "Google Chat 暫時無法傳送訊息，請稍後再試。",
+            "Google Chat 拒絕傳送訊息，請管理員確認應用程式設定。",
+        ],
+        Lang::En => [
+            "The person has not started a conversation with this Chat app, or the app is not in the space. Ask the person to DM the app once, or ask an administrator to install it for them or add it to the space.",
+            "Google Chat temporarily cannot send messages. Try again later.",
+            "Google Chat rejected the message. Ask an administrator to check the app configuration.",
+        ],
+        Lang::Ja => [
+            "相手がこの Chat アプリとの会話を開始していないか、アプリがスペースに参加していません。相手に一度アプリへ DM を送ってもらうか、管理者にアプリのインストールまたはスペースへの追加を依頼してください。",
+            "Google Chat で一時的にメッセージを送信できません。しばらくしてから再試行してください。",
+            "Google Chat がメッセージを拒否しました。管理者にアプリの設定を確認してもらってください。",
+        ],
+    };
+    messages[row]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoogleChatSendError {
     InvalidTarget,
@@ -1187,14 +1218,21 @@ pub enum GoogleChatSendError {
     Transport,
 }
 
+impl GoogleChatSendError {
+    pub(crate) fn user_message(&self, home: &Path) -> String {
+        match self {
+            Self::Http { status } => send_error_text(*status, crate::trigger_route::texts::lang_for(home)).to_owned(),
+            _ => self.to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for GoogleChatSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidTarget => f.write_str("Google Chat 目標必須是有效的 spaces/<id>，不能使用使用者 ID 或電子郵件。"),
             Self::Configuration(reason) => f.write_str(reason),
-            Self::Http { status: 403 | 404 } => f.write_str("對方尚未與此 Chat 應用程式建立對話，或應用程式不在該聊天室。請對方先私訊此應用程式一次，或請管理員為對方安裝。"),
-            Self::Http { status } if *status == 429 || (500..=599).contains(status) => f.write_str("Google Chat 暫時無法傳送訊息，請稍後重試。"),
-            Self::Http { .. } => f.write_str("Google Chat 拒絕傳送訊息，請管理員確認應用程式設定。"),
+            Self::Http { status } => f.write_str(send_error_text(*status, crate::trigger_route::texts::Lang::ZhTw)),
             Self::Transport => f.write_str("Google Chat 暫時無法連線或取得授權，請稍後重試。"),
         }
     }
@@ -1209,7 +1247,7 @@ pub async fn send_text_to_space(
     space: &str,
     markdown: &str,
 ) -> Result<(), String> {
-    send_text_to_space_as(home_dir, None, space, markdown).await.map_err(|e| e.to_string())
+    send_text_to_space_as(home_dir, None, space, markdown).await.map_err(|e| e.user_message(home_dir))
 }
 
 /// [`send_text_to_space`] as an employee's own Chat app when `agent` has one
@@ -1514,6 +1552,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uploaded_attachment_line_uses_shared_format_and_history_parser() {
+        let message = serde_json::json!({"attachment":[{
+            "contentName":"季度報表.csv", "contentType":"text/csv",
+            "attachmentDataRef":{"resourceName":"spaces/a/messages/b/attachments/c"}
+        }]});
+        let attachments = parse_gchat_attachments(&message);
+        let att = &attachments[0];
+        let filename = att.effective_filename();
+        let mt = crate::media::media_type_from_mime(&att.content_type);
+        let path = Path::new("/private/attachments/stored-report.csv");
+        let line = crate::media::format_attachment_ref(&mt, &filename, path);
+        assert_eq!(line, "[📎 季度報表.csv (file)](/private/attachments/stored-report.csv) 請用 csv_read／xlsx_read／file_read 讀取");
+        let (display, references) = crate::chat_attachments::parse(&line);
+        assert_eq!(references, vec![(filename, path.to_string_lossy().into_owned())]);
+        assert!(!display.contains("/private/"));
+        assert!(display.contains("csv_read／xlsx_read／file_read"));
+    }
+
+    #[test]
+    fn inbound_links_use_json_array_even_with_trailer_delimiters() {
+        let uri = "https://example.com/）extra?value=\"quoted\"&next=）";
+        let message = serde_json::json!({"text":"title", "annotations":[
+            {"type":"RICH_LINK", "richLinkMetadata":{"uri":uri}},
+            {"type":"RICH_LINK", "richLinkMetadata":{"uri":"https://example.com/second"}},
+            {"type":"RICH_LINK", "richLinkMetadata":{"uri":uri}}
+        ]});
+        let text = inbound_text(&message);
+        let serialized = text.strip_prefix("title\n\n（訊息裡的預覽連結：").unwrap()
+            .strip_suffix('）').unwrap();
+        let links: Vec<String> = serde_json::from_str(serialized).unwrap();
+        assert_eq!(links, vec![uri, "https://example.com/second"]);
+        assert_eq!(serialized, serde_json::to_string(&links).unwrap());
+    }
+
+    #[test]
     fn drive_attachment_note_only_includes_valid_bounded_id() {
         assert!(drive_attachment_note("report", "Abc_123-xyz").contains("driveFileId: Abc_123-xyz"));
         assert!(drive_attachment_note("report", "Abc_123-xyz").contains("drive_read"));
@@ -1537,11 +1610,22 @@ mod tests {
     fn proactive_errors_explain_membership_and_temporary_failures() {
         for status in [403, 404] {
             let error = GoogleChatSendError::Http { status };
-            assert!(error.to_string().contains("請對方先私訊此應用程式一次"));
+            let text = error.to_string();
+            for guidance in ["先私訊此應用程式一次", "請管理員為對方安裝", "將應用程式加入該聊天室"] {
+                assert!(text.contains(guidance));
+            }
+            let en = send_error_text(status, crate::trigger_route::texts::Lang::En);
+            for guidance in ["DM the app once", "administrator to install", "add it to the space"] {
+                assert!(en.contains(guidance));
+            }
+            let ja = send_error_text(status, crate::trigger_route::texts::Lang::Ja);
+            for guidance in ["一度アプリへ DM", "管理者", "インストール", "スペースへの追加"] {
+                assert!(ja.contains(guidance));
+            }
             assert_eq!(error, GoogleChatSendError::Http { status });
         }
         for status in [429, 500, 502, 503, 599] {
-            assert!(GoogleChatSendError::Http { status }.to_string().contains("稍後重試"));
+            assert!(GoogleChatSendError::Http { status }.to_string().contains("稍後再試"));
         }
         assert!(!GoogleChatSendError::Http { status: 400 }.to_string().contains("尚未"));
     }

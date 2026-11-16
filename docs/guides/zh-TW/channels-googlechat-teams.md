@@ -197,3 +197,9 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 ## 群組近期對話設定
 
 管理員需在「通道 → 群組設定」逐群開啟保留。Telegram 可透過 BotFather `/setprivacy` 關閉隱私模式，或依 bot 管理員身分取得較廣的收訊；Slack 需訂閱 `message.channels`／`message.groups` 並授予 `channels:history`／`groups:history`，再重新安裝 App、邀請加入頻道。Discord 需開啟 MESSAGE CONTENT INTENT。Google Chat 與 Teams 可能只包含提及 App 的訊息，Teams 完整頻道收訊另需 `ChannelMessage.Read.Group` 等 RSC 權限。保留期限、員工讀取權與平台限制見[群組近期對話](../../features/zh-TW/72-group-context.md)。本次變更尚未驗證實際平台收送。
+
+### Google Chat 回覆與預覽連結
+
+私訊預設回覆在主畫面；使用者在討論串內傳送的訊息（`threadReply = true`）仍回覆在原討論串。聊天室維持既有討論串行為。管理員可到「通道 → Google Chat → 行為 → 私訊回覆位置」選擇「主畫面」（預設）或「一律回覆在討論串」。此設定僅能由儀表板修改，儲存在通道設定資料庫，請勿加入 `config.toml`。對話 session 仍以整個聊天室為單位。
+
+Google 文件／試算表的預覽連結會作為不可信訊息文字交給 AI，移除重複連結後最多保留 10 個 HTTPS 連結，每個上限 2048 位元組，含控制字元的連結會捨棄。閘道不會抓取連結。Chat 讀取工具的 `links` 陣列也納入內容掃描。缺少名稱時顯示可讀的替代文字；資源名稱與附件儲存路徑僅供工具操作，不應轉述給使用者。附件保留原始檔名，不需要新增 OAuth 權限。

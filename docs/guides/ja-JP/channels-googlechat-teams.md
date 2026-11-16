@@ -206,3 +206,9 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 ## グループ会話コンテキストの設定
 
 Admin が「チャンネル → グループ設定」でグループごとに保存を有効化します。Telegram は BotFather の `/setprivacy` を無効にするか、bot 管理者として受信します。Slack は `message.channels`／`message.groups` と `channels:history`／`groups:history` が必要で、変更後は App を再インストールしチャンネルへ招待します。Discord は MESSAGE CONTENT INTENT が必要です。Google Chat と Teams は App へのメンションのみを受信する場合があります。Teams の全チャンネル受信には `ChannelMessage.Read.Group` などの RSC が必要です。保存期間と参照権限は[グループ会話コンテキスト](../../features/ja-JP/72-group-context.md)を参照してください。本変更で実際のプラットフォーム送受信は未検証です。
+
+### Google Chat の返信とプレビューリンク
+
+DM は既定でメイン画面に返信します。スレッド内のメッセージ（`threadReply = true`）には同じスレッドで返信し、スペースの動作は従来どおりです。「チャンネル → Google Chat → 動作 → DM の返信先」で「メイン画面」（既定）または「常にスレッド内」を選択できます。変更はダッシュボードの管理者のみ可能で、設定はチャンネル設定データベースに保存されます。`config.toml` に追加しないでください。会話セッションは引き続きスペース全体で共有します。
+
+Google ドキュメント／スプレッドシートのプレビューリンクは信頼できないメッセージ本文として AI に渡されます。重複を除き HTTPS リンクを最大 10 件、各 2048 バイトまで保持し、制御文字を含むリンクは除外します。ゲートウェイはリンクにアクセスしません。読み取りツールの `links` 配列もスキャン対象です。名前がない場合は読みやすい代替名を使います。リソース名と保存パスはツール操作専用で、利用者には元の添付ファイル名を表示します。OAuth 権限の追加は不要です。

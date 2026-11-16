@@ -105,8 +105,9 @@ impl PendingGoogleCall {
         let chat_audit = matches!(native_tool.as_str(), "google_chat_spaces" | "google_chat_messages")
             .then(|| (self.context.home.clone(), self.context.agent.clone(), native_tool.clone()));
         let authority = self.resolve().await?.acquire_effect().await?;
-        let result = authority.execute_native(template).await.map_err(ClosedNativeFailure::into_refusal)?;
+        let mut result = authority.execute_native(template).await.map_err(ClosedNativeFailure::into_refusal)?;
         if let Some((home, agent, tool)) = chat_audit {
+            crate::google_workspace::chat_read::localize_error_result(&mut result, crate::trigger_route::texts::lang_for(&home));
             crate::google_workspace::chat_read::audit(&home, &agent, &tool, &arguments, &result);
         }
         Ok(result)

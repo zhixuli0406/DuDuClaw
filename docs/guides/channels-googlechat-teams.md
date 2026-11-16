@@ -202,3 +202,9 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 ## Group context setup
 
 To retain ordinary group discussion, an Admin must enable each group in Channels → Group settings. Telegram bots need BotFather `/setprivacy` disabled (or appropriate bot-admin delivery). Slack apps need `message.channels` / `message.groups` events and `channels:history` / `groups:history` scopes, followed by reinstalling the app and inviting it to the channel. Discord needs MESSAGE CONTENT INTENT. Google Chat and Teams may only include messages that mention the app; Teams full channel delivery requires RSC such as `ChannelMessage.Read.Group`. See [group context](../features/72-group-context.md) for retention, employee authorization and platform limitations. Real platform delivery remains unverified for this change.
+
+### Google Chat replies and preview links
+
+Direct messages reply in the main view by default. Messages written inside a thread (`threadReply = true`) stay in that thread; space replies keep their existing thread behavior. In **Channels → Google Chat → Behavior → DM reply placement**, choose **Main view** (default) or **Always in thread**. Only dashboard administrators can change this preference. It is stored in the channel settings database; do not add it to `config.toml`. Conversation sessions still cover the whole space.
+
+Google Docs/Sheets smart-chip links are included as untrusted message text, with duplicate links removed (up to 10 HTTPS links, each at most 2048 bytes; control characters are rejected). The gateway does not fetch these links. Chat read tools return a `links` array under the scanned data envelope. Missing names use readable placeholders; resource names and stored attachment paths are machine fields and must not be shown to users. Attachments retain their original filenames. No additional OAuth scopes are required.

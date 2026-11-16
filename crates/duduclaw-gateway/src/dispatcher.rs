@@ -3849,7 +3849,7 @@ async fn forward_to_channel_as(
         let report = format!("📨 **{}** 的回報：\n\n{}", safe_agent, safe_text);
         return crate::googlechat::send_text_to_space_as(home_dir, sender, channel_id, &report)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| e.user_message(home_dir));
     }
 
     // Split the body into paragraph/line-aligned chunks instead of truncating.

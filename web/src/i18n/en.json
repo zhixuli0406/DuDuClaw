@@ -11573,5 +11573,9 @@
   "routines.delivery.none": "No delivery recorded",
   "routines.delivery.notificationFailed": "Notification could not be delivered. Check the channel settings.",
   "routines.delivery.accessChanged": "Destination access changed. Review the notification destination.",
-  "routines.delivery.unknownReason": "Delivery could not be completed."
+  "routines.delivery.unknownReason": "Delivery could not be completed.",
+  "channels.detail.behavior.dmReplyPlacement": "DM reply placement",
+  "channels.detail.behavior.dmReplyPlacement.help": "Main-view messages reply in the main view by default; thread replies stay in their thread.",
+  "channels.detail.behavior.dmReplyPlacement.main": "Main view (default)",
+  "channels.detail.behavior.dmReplyPlacement.thread": "Always in thread"
 }

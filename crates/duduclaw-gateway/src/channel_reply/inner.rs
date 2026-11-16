@@ -1542,6 +1542,10 @@ async fn build_reply_with_session_inner_impl(
             );
         }
 
+        if session_id.split(':').next() == Some("googlechat") {
+            prompt.push_str("\n\nGoogle Chat display rule: Never show resource names (spaces/…, users/…), internal stored filenames, paths or IDs to users. Use space names, people's names and original attachment filenames. Machine fields are for tool operations only.");
+        }
+
         // O-4: system-operator guidance. Only present when `os_operator::decide`
         // (computed once above, before this prompt-build block) resolved this
         // turn to a ready, non-destructive `SystemOp` for a `system_operator`-

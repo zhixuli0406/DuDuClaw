@@ -28,6 +28,7 @@ pub(crate) fn config_settings_to_json(all: &[(String, String)]) -> Value {
     };
     json!({
         "mention_only": get(crate::channel_settings::keys::MENTION_ONLY).as_deref() == Some("true"),
+        "dm_reply_placement": if get(crate::channel_settings::keys::DM_REPLY_PLACEMENT).as_deref() == Some("thread") { "thread" } else { "main" },
         "auto_thread": get(crate::channel_settings::keys::AUTO_THREAD).as_deref() == Some("true"),
         "allowed_channels": json_array(crate::channel_settings::keys::ALLOWED_CHANNELS),
         "allowed_guilds": json_array(crate::channel_settings::keys::ALLOWED_GUILDS),

@@ -1805,7 +1805,7 @@ impl ChannelSender for GoogleChatSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
         crate::googlechat::send_text_to_space_as(&self.home_dir, self.agent.as_deref(), &self.space, text)
             .await
-            .map_err(|e| ChannelSendError(e.to_string()))
+            .map_err(|e| ChannelSendError(e.user_message(&self.home_dir)))
     }
 
     async fn send_photo(&self, _png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {

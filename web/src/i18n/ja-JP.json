@@ -11573,5 +11573,9 @@
   "routines.delivery.none": "配信履歴なし",
   "routines.delivery.notificationFailed": "通知を配信できませんでした。チャネル設定を確認してください。",
   "routines.delivery.accessChanged": "送信先のアクセス権が変更されました。通知先を確認してください。",
-  "routines.delivery.unknownReason": "配信を完了できませんでした。"
+  "routines.delivery.unknownReason": "配信を完了できませんでした。",
+  "channels.detail.behavior.dmReplyPlacement": "DM の返信先",
+  "channels.detail.behavior.dmReplyPlacement.help": "通常のメッセージにはメイン画面で返信し、スレッド内のメッセージには同じスレッドで返信します。",
+  "channels.detail.behavior.dmReplyPlacement.main": "メイン画面（既定）",
+  "channels.detail.behavior.dmReplyPlacement.thread": "常にスレッド内"
 }
