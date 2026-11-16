@@ -482,7 +482,7 @@ mod timeout_tests {
     }
 
     #[test]
-    fn configured_claude_timeout_names_the_applied_limit() {
+    fn configured_claude_timeout_and_work_deadline_use_their_respective_notices() {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("agents/worker");
         std::fs::create_dir_all(&dir).unwrap();
@@ -492,15 +492,15 @@ mod timeout_tests {
         assert!(configured.contains("15 分鐘安全上限"), "{configured}");
         assert!(configured.contains("請洽管理員"));
         assert!(!configured.contains("員工設定"));
-        // The employee was changed after this run started. Its failure still
-        // reports the captured 600 s, not today's 900 s setting.
+        // A classified work deadline uses the fixed turn-failure vocabulary,
+        // independent of either the captured or current timeout setting.
         let failure = ReplyFailure::simple(origin, "claude CLI hard timeout (600s, no output)".into());
         let message = failure.message("worker", home.path());
-        assert!(message.contains("10 分鐘安全上限"), "{message}");
-        assert!(!message.contains("15 分鐘"));
+        assert_eq!(failure.reason(), FailureReason::TimeoutTotal);
+        assert_eq!(message, super::super::TurnFailureReason::TimeoutTotal.text(None));
         let message = ReplyFailure::simple(origin, "claude CLI hard timeout (95s, no output)".into())
             .message("worker", home.path());
-        assert!(message.contains("95 秒安全上限"), "{message}");
+        assert_eq!(message, super::super::TurnFailureReason::TimeoutTotal.text(None));
     }
 
     /// RM-155: while macOS folder access is pending, a timeout names the

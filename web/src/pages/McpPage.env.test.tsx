@@ -285,7 +285,7 @@ it('shows translated startup results, both runtime sources and a read-only TOML 
       effective_runtimes: ['in_process'] },
   ] }]);
   renderPage('agents');
-  expect(await screen.findByText('Caller identity rejected')).toBeInTheDocument();
+  expect(await screen.findByText(/^Caller identity rejected ·$/)).toBeInTheDocument();
   expect(screen.getByText(/Used by: Claude, Codex, Grok/)).toBeInTheDocument();
   expect(screen.getByText('Read-only. Claude, Codex and Grok do not use this configuration.')).toBeInTheDocument();
   expect(screen.getByText('2026-11-17T00:00:00Z')).toBeInTheDocument();

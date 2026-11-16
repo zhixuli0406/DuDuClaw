@@ -311,8 +311,8 @@ mod rotation_tests {
             "expected last error to be propagated, got: {err}"
         );
 
-        // Extracted error must still be classifiable as Timeout (not Unknown).
-        assert_eq!(classify_cli_failure(&err), FailureReason::Timeout);
+        // Extracted work deadline retains the total-timeout classification.
+        assert_eq!(classify_cli_failure(&err), FailureReason::TimeoutTotal);
     }
 
     /// Scenario: billing-exhausted error places the account on a 24h cooldown.

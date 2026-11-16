@@ -2387,7 +2387,7 @@ mod placeholder_lifecycle_tests {
             Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
         let name = name.unwrap();
         chat::placeholder_statuses(&fake, Some(StatusCode::SERVICE_UNAVAILABLE), None, None);
-        let lock_conn = rusqlite::Connection::open(store.home()).unwrap();
+        let lock_conn = rusqlite::Connection::open(_home.path().join("googlechat_inbox.db")).unwrap();
         lock_conn.busy_timeout(std::time::Duration::ZERO).unwrap();
         lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let slot = Arc::new(tokio::sync::Mutex::new(Some(name.clone())));

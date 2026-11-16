@@ -1300,7 +1300,7 @@ mod tests {
             duduclaw_cli_runtime::PtyError::ReadTimeout(std::time::Duration::from_secs(600)), 600,
         );
         assert_eq!(error, "Grok CLI hard timeout after 600s");
-        assert_eq!(crate::channel_reply::classify_cli_failure(&error), crate::channel_reply::FailureReason::Timeout);
+        assert_eq!(crate::channel_reply::classify_cli_failure(&error), crate::channel_reply::FailureReason::TimeoutTotal);
     }
 
     use super::*;

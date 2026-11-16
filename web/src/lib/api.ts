@@ -3128,6 +3128,7 @@ export interface McpStartResult {
   ok: boolean;
   tool_count?: number | null;
   reason_code?: string | null;
+  time?: string;
 }
 
 export interface McpServerEntry extends McpServerDef {

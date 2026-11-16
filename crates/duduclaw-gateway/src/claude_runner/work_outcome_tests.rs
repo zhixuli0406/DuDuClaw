@@ -84,10 +84,15 @@ async fn background_idle_stops_pending_tool_and_keepalive_does_not_reset_it() {
     let entered = started.clone();
     let keepalives = Arc::new(AtomicUsize::new(0));
     let seen = keepalives.clone();
+    let keepalive_seen = Arc::new(tokio::sync::Notify::new());
+    let heartbeat = keepalive_seen.clone();
     let callback: crate::channel_reply::ProgressCallback = Box::new(move |event| {
         match event {
             crate::channel_reply::ProgressEvent::ToolUse { .. } => entered.notify_one(),
-            crate::channel_reply::ProgressEvent::Keepalive => { seen.fetch_add(1, Ordering::SeqCst); }
+            crate::channel_reply::ProgressEvent::Keepalive => {
+                seen.fetch_add(1, Ordering::SeqCst);
+                heartbeat.notify_one();
+            }
             _ => {}
         }
     });
@@ -97,7 +102,8 @@ async fn background_idle_stops_pending_tool_and_keepalive_does_not_reset_it() {
     tokio::time::timeout(std::time::Duration::from_secs(5), started.notified()).await.expect("tool event must arrive");
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(90)).await;
-    tokio::task::yield_now().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), keepalive_seen.notified()).await
+        .expect("keepalive must arrive before the idle deadline");
     assert!(!task.is_finished());
     assert!(keepalives.load(Ordering::SeqCst) > 0);
     tokio::time::advance(std::time::Duration::from_secs(31)).await;

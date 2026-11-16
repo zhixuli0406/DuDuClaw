@@ -25,6 +25,7 @@
     { "key": "odoo", "form_paths": ["odoo."], "kind": "change" },
     { "key": "runtime.provider", "form_paths": ["runtime.provider"], "kind": "change" },
     { "key": "runtime.fallback", "form_paths": ["runtime.fallback"], "kind": "change" },
+    { "key": "runtime.idle_timeout_secs", "form_paths": ["runtime.idle_timeout_secs"], "kind": "loosen" },
     { "key": "runtime.timeout_secs", "form_paths": ["runtime.timeout_secs"], "kind": "loosen" },
   { "key": "runtime.max_turns", "form_paths": ["runtime.max_turns"], "kind": "loosen" },
     { "key": "prompt.cli_bare_mode", "form_paths": [], "kind": "change" },

@@ -447,8 +447,8 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let home = tempfile::tempdir().unwrap();
             let dir = home.path().join("agents/alice");
-            std::fs::create_dir_all(&dir).unwrap();
             let handler = crate::handlers::MethodHandler::new(home.path().into()).await;
+            std::fs::create_dir_all(&dir).unwrap();
             for (mode, expected) in [("success", None), ("failure", Some(ReasonCode::IdentityRejected)),
                 ("timeout", Some(ReasonCode::Timeout))] {
                 let path = dir.join(".mcp.json");

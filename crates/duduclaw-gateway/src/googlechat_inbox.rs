@@ -122,7 +122,7 @@ impl Inbox {
             prepare_private(&PathBuf::from(format!("{}{suffix}", path.display())), false)?;
         }
         #[cfg(unix)]
-        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        let mut conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)
             .map_err(|_| "無法開啟 Google Chat 耐久收件匣")?;
         // HTTP Google Chat is also supported on Windows. Reuse the shared
         // private SQLite opener there (including its documented home-ACL trust).
@@ -153,7 +153,7 @@ impl Inbox {
             prepare_private(&PathBuf::from(format!("{}{suffix}", path.display())), false)?;
         }
         // v1 databases already have the table. Never rebuild/drop recovery rows.
-        migrate_placeholder_state(&conn)?;
+        migrate_placeholder_state(&mut conn)?;
         let store = Self { conn: Mutex::new(conn), home: home.canonicalize().map_err(|_| "placeholder home unavailable")? };
         store.prune(chrono::Utc::now().timestamp())?;
         Ok(store)
@@ -299,8 +299,7 @@ impl Inbox {
     }
 }
 
-fn migrate_placeholder_state(conn: &Connection) -> Result<(), String> {
-    let mut conn = conn;
+fn migrate_placeholder_state(conn: &mut Connection) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| "Google Chat placeholder migration failed".to_owned())?;
     if !placeholder_state_column(&tx)? {
@@ -445,9 +444,9 @@ mod googlechat_inbox_tests {
             let path = path.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
-                let conn = Connection::open(path).unwrap();
+                let mut conn = Connection::open(path).unwrap();
                 barrier.wait();
-                migrate_placeholder_state(&conn).unwrap();
+                migrate_placeholder_state(&mut conn).unwrap();
             })
         }).collect();
         for handle in handles { handle.join().unwrap(); }

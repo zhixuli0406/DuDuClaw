@@ -457,8 +457,13 @@ mod tests {
             ("agent_files", "checks_per_minute", 1, 1000),
             ("agent_files", "max_pending_per_user", 1, 200),
         ] {
-            for n in [min, max] { check(&format!("[{section}]\n{key}={n}\n")).unwrap(); }
-            for n in [min - 1, max + 1] { assert!(check(&format!("[{section}]\n{key}={n}\n")).is_err()); }
+            let paired = match key {
+                "default_max_turns" => "max_turns_limit=10000\n",
+                "max_turns_limit" => "default_max_turns=1\n",
+                _ => "",
+            };
+            for n in [min, max] { check(&format!("[{section}]\n{key}={n}\n{paired}")).unwrap(); }
+            for n in [min - 1, max + 1] { assert!(check(&format!("[{section}]\n{key}={n}\n{paired}")).is_err()); }
         }
         assert!(check("[runtime]\ndefault_timeout_secs=3601\n").is_err());
         assert!(check("[runtime]\nmax_timeout_secs=600\ndefault_timeout_secs=601\n").is_err());

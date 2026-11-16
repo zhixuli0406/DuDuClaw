@@ -7303,6 +7303,43 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Runs the real-proxy regression in its own filtered test process so the binary resolver override cannot affect parallel unit tests."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::terminal_result_survives_a_hung_process",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Fake CLI terminal-result regression verifies cleanup of a hung test process."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/mcp_start.rs::tests::rpc_probe_outcomes_leave_employee_bytes_mtime_and_directory_unchanged",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Isolated subprocess fixture verifies MCP probe outcomes preserve employee configuration."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::tests::terminal_result_survives_hung_codex_cleanup",
+      "apis": {
+        "command_constructor": 2
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Fake Codex terminal-result regression verifies cleanup of hung test processes."
     }
   ]
 }

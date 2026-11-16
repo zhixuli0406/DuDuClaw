@@ -9,7 +9,7 @@ use duduclaw_agent::registry::AgentRegistry;
 // Trait must be in scope to call `.complete()` / `.stream()` on providers.
 use duduclaw_llm::ChatProvider as _;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::failover::FailoverManager;
 use crate::failover::model::{
@@ -6673,7 +6673,7 @@ mod turn_budget_tests {
                 home.path(), None, SpawnIdentity { config_dir: Some(&dir), mcp_config: None }).unwrap();
             let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
             assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "88"));
-            assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].split(',').any(|t| t == "AskUserQuestion")));
+            assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].to_string_lossy().split(',').any(|t| t == "AskUserQuestion")));
             let text = std::fs::read_to_string(guards.prompt.as_ref().unwrap()).unwrap();
             assert!(text.contains("Step budget for this turn: 88"));
         }

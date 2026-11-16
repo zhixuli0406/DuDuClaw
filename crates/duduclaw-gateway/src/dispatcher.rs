@@ -425,6 +425,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
     prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
     gvu_ctx: Option<&Arc<crate::prediction::subagent_prediction::GvuTriggerCtx>>,
 ) -> Result<(), String> {
+    Box::pin(async {
     let mut messages = Vec::new();
     let mut cursor: Option<(String, String)> = None;
     let mut eligibility = std::collections::HashMap::new();
@@ -946,6 +947,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
     }
 
     Ok(())
+    }).await
 }
 
 /// Why a dispatch failed, as the two delegation reply paths need it.
@@ -1163,6 +1165,7 @@ async fn poll_and_dispatch(
     prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
     gvu_ctx: Option<&Arc<crate::prediction::subagent_prediction::GvuTriggerCtx>>,
 ) -> Result<(), String> {
+    Box::pin(async {
     let queue_path = home_dir.join("bus_queue.jsonl");
 
     // Read all lines
@@ -1847,6 +1850,7 @@ async fn poll_and_dispatch(
     }
 
     Ok(())
+    }).await
 }
 
 /// Delegation context injected as environment variables into Claude CLI subprocesses.
@@ -6544,7 +6548,7 @@ bot_token = "{token}"
             assert_eq!(reply, "⚠️ 子任務處理失敗：未知錯誤。請稍後再試或改寫指令。", "{raw}");
         }
         let reply = dispatch_failure_reply(&DispatchError::Other("hard timeout after 300s".into()));
-        assert_eq!(reply, "⚠️ 子任務處理失敗：處理逾時。請稍後再試或改寫指令。");
+        assert_eq!(reply, "⚠️ 子任務處理失敗：已達執行時限，尚未產生最終答案。請稍後再試或改寫指令。");
     }
 
     /// One explore lane, two sources: a responsibility round's contract lane

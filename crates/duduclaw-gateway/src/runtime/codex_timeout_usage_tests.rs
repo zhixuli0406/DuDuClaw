@@ -89,7 +89,8 @@ async fn measured_attempts(home: &Path, fallback: bool) {
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0], ("dispatch".into(), "gpt-5.4".into(), 11, 7, 3,
         Some("worker".into()), Some("timeout-task".into()), Some(7)));
-    assert!(result.unwrap_err().legacy_message().contains("partial output discarded"));
+    assert_eq!(crate::work_outcome::WorkOutcome::decode(&result.unwrap_err().legacy_message()),
+        Some(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 37, partial: String::new() }));
 }
 
 #[test]

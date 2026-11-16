@@ -91,7 +91,7 @@ fn child(home: std::path::PathBuf) {
         let command = captured.lock().unwrap().take().unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
         assert!(before.argv.iter().any(|arg| arg == "hi"));
-        assert!(before.argv.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].split(',').any(|t| t == "AskUserQuestion")));
+        assert!(before.argv.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].to_string_lossy().split(',').any(|t| t == "AskUserQuestion")));
         for minimal in [true, false] {
             let dir = home.join("agents/agnes");
             std::fs::create_dir_all(&dir).unwrap();
@@ -106,7 +106,7 @@ fn child(home: std::path::PathBuf) {
             let cmd = capture.lock().unwrap().take().unwrap();
             let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
             assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "73"));
-            assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].split(',').any(|t| t == "AskUserQuestion")));
+            assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].to_string_lossy().split(',').any(|t| t == "AskUserQuestion")));
         }
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before,
             "channel argv, env removals and cwd survive LocalBackend registration unchanged");

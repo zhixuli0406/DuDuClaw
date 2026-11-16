@@ -94,8 +94,6 @@ async fn browserbase_install_without_values_is_refused_naming_variables() {
     );
     assert!(err.contains("BROWSERBASE_PROJECT_ID") && err.contains("GEMINI_API_KEY"), "{err}");
     assert!(!err.contains("only-this"), "{err}");
-    let frame = Box::pin(h.handle("mcp.probe", json!({"agent_id":"alice","server_name":"fixture"}), &employee)).await;
-    assert!(!error_text(frame).is_empty());
     assert!(!home.path().join("agents/alice/.mcp.json").exists());
 }
 
@@ -203,6 +201,8 @@ async fn mcp_update_probe_is_admin_only() {
             "server_name":"fixture","server_def":{"command":"fixture","args":[],"env":{}}}), &employee)).await;
         assert!(!error_text(frame).is_empty());
     }
+    let frame = Box::pin(h.handle("mcp.probe", json!({"agent_id":"alice","server_name":"fixture"}), &employee)).await;
+    assert!(!error_text(frame).is_empty());
     assert!(!home.path().join("agents/alice/.mcp.json").exists());
 }
 

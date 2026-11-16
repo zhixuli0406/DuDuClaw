@@ -73,6 +73,7 @@ fn field(value: &Value, key: &str, max: usize) -> String {
 /// This helper does no network I/O. Reject oversized URIs rather than truncating them.
 pub(crate) fn rich_links(message: &Value, text: &str) -> Vec<String> {
     let mut links = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for annotation in message.get("annotations").and_then(Value::as_array).into_iter().flatten() {
         if annotation.get("type").and_then(Value::as_str) != Some("RICH_LINK") { continue; }
         let Some(uri) = annotation.pointer("/richLinkMetadata/uri").and_then(Value::as_str) else { continue; };
@@ -85,8 +86,9 @@ pub(crate) fn rich_links(message: &Value, text: &str) -> Vec<String> {
             || !parsed.username().is_empty() || parsed.password().is_some() { continue; }
         let normalized = parsed.as_str();
         if normalized.len() > 2048 { continue; }
-        if text.contains(uri) || links.iter().any(|link| link == normalized) { continue; }
-        links.push(normalized.to_owned());
+        if text.contains(uri) || !seen.insert(normalized.to_owned()) { continue; }
+        // Preserve provider spelling so Unicode instructions remain visible to input scanning.
+        links.push(uri.to_owned());
         if links.len() == 10 { break; }
     }
     links
@@ -339,7 +341,7 @@ mod rich_link_tests {
         let links = rich_links(&json!({"annotations":[
             chip("https://example.com"), chip("https://example.com/")
         ]}), "");
-        assert_eq!(links, vec!["https://example.com/"]);
+        assert_eq!(links, vec!["https://example.com"]);
     }
     #[test]
     fn links_reject_userinfo_whitespace_and_invisible_characters() {

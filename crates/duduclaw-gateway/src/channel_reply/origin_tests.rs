@@ -318,7 +318,7 @@ async fn webchat_provider_failure_is_typed_and_persists_only_one_vocabulary_noti
     let (_, reason) = track_failure_reason(build_guarded_reply_for_agent(
         "普通訊息", &ctx, "worker", sid, "owner", None,
     )).await;
-    assert_eq!(reason, Some(TurnFailureReason::Unknown));
+    assert_eq!(reason, Some(TurnFailureReason::Unavailable));
     let rows = ctx.session_manager.webchat_history(sid).await.unwrap();
     let notice = rows.iter().find(|r| r.notice_kind.as_deref() == Some("turn_failure")).unwrap();
     let turn = notice.client_msg_id.as_deref().unwrap().strip_prefix("turn_failure:").unwrap();

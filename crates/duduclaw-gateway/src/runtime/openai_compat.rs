@@ -1243,7 +1243,7 @@ mod tests {
                 OpenAiCompatRuntime::collect_sse(stream, &context,
                     started + std::time::Duration::from_secs(5)),
             ).await.expect_err("non-stop finish reason must not end the stream early");
-            assert_eq!(response.into_inner(), "elapsed");
+            assert_eq!(response.to_string(), "deadline has elapsed");
             assert_eq!(tokio::time::Instant::now() - started, std::time::Duration::from_secs(5));
 
             let frame = format!(
