@@ -1184,20 +1184,32 @@ where
     }
     if terminal {
         if let Some(registration) = registration { registration.retire(); }
-    } else if let Some(registration) = registration {
-        // Persist before the fallback can have an effect: cancellation, a lost
-        // response, or a crash during POST must never produce an interruption notice.
-        registration.cleanup_only().map_err(|_| None)?;
     }
     let sent = post().await;
     // A definite fallback refusal delivered nothing; retain interruption recovery.
-    if matches!(sent, Err(Some(_))) && !terminal {
+    if matches!(sent, Err(Some(_))) {
+        return sent;
+    }
+    if !terminal {
         if let Some(registration) = registration {
-            if registration.set_state("pending").is_err() {
-                warn!(failed = 1, "Google Chat placeholder state update failed");
+            // A crash between a successful POST and this state write leaves
+            // `pending`, so recovery may show an interruption beside a delivered
+            // answer. This is accepted; the reverse must never happen.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut persisted = false;
+            loop {
+                if registration.cleanup_only().is_ok() {
+                    persisted = true;
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !persisted {
+                warn!(failed = 1, "Google Chat placeholder cleanup state update failed; skipping cleanup");
+                return sent;
             }
         }
-        return sent;
     }
     if clear().await.is_terminal() {
         if let Some(registration) = registration { registration.retire(); }
@@ -2365,6 +2377,30 @@ mod placeholder_lifecycle_tests {
         let calls: Vec<_> = chat::chat_calls(&fake).into_iter().skip(before).collect();
         assert_eq!(calls.len(), 1);
         assert_eq!((calls[0].0.as_str(), calls[0].1.as_str()), ("DELETE", format!("/{name}").as_str()));
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_state_write_after_fallback_post_skips_delete_and_keeps_pending() {
+        use axum::http::StatusCode;
+        let (_home, fake, creds, store) = fixture().await;
+        let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/LOCKED", None,
+            Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
+        let name = name.unwrap();
+        chat::placeholder_statuses(&fake, Some(StatusCode::SERVICE_UNAVAILABLE), None, None);
+        let lock_conn = rusqlite::Connection::open(store.home()).unwrap();
+        lock_conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(name.clone())));
+        let result = deliver_reply(&creds, "spaces/LOCKED", None, &slot, registration.as_ref(), "ANSWER", None).await;
+        lock_conn.execute_batch("ROLLBACK").unwrap();
+        assert!(result.is_ok());
+        let calls = chat::chat_calls(&fake);
+        assert!(calls.iter().any(|(method, _, _, _)| method == "POST"));
+        assert!(!calls.iter().any(|(method, _, _, _)| method == "DELETE"));
+        let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_name, name);
+        assert_eq!(rows[0].state, "pending");
     }
 
     #[tokio::test]

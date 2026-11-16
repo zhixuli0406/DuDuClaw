@@ -300,24 +300,21 @@ impl Inbox {
 }
 
 fn migrate_placeholder_state(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("BEGIN IMMEDIATE;")
-        .map_err(|_| "Google Chat placeholder migration failed")?;
-    let result = (|| {
-        if !placeholder_state_column(conn)? {
-            if let Err(error) = conn.execute_batch("ALTER TABLE pending_placeholders ADD COLUMN state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','cleanup_only'));") {
-                let duplicate_column = error.to_string().to_ascii_lowercase().contains("duplicate column name");
-                if !duplicate_column || !placeholder_state_column(conn)? {
-                    return Err("Google Chat placeholder migration failed");
-                }
+    let mut conn = conn;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| "Google Chat placeholder migration failed".to_owned())?;
+    if !placeholder_state_column(&tx)? {
+        if let Err(error) = tx.execute_batch("ALTER TABLE pending_placeholders ADD COLUMN state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','cleanup_only'));") {
+            let duplicate_column = error.to_string().to_ascii_lowercase().contains("duplicate column name");
+            if !duplicate_column || !placeholder_state_column(&tx)? {
+                return Err("Google Chat placeholder migration failed".to_owned());
             }
         }
-        if !placeholder_state_column(conn)? {
-            return Err("Google Chat placeholder migration failed");
-        }
-        conn.execute_batch("COMMIT;").map_err(|_| "Google Chat placeholder migration failed")
-    })();
-    if result.is_err() { let _ = conn.execute_batch("ROLLBACK;"); }
-    result
+    }
+    if !placeholder_state_column(&tx)? {
+        return Err("Google Chat placeholder migration failed".to_owned());
+    }
+    tx.commit().map_err(|_| "Google Chat placeholder migration failed".to_owned())
 }
 
 fn placeholder_state_column(conn: &Connection) -> Result<bool, String> {
