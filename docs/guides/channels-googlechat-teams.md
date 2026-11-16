@@ -28,6 +28,8 @@ Final delivery stops further progress edits. If replacing the placeholder fails,
 
 Google Chat never includes a thinking summary in the answer. Existing thinking settings can allow internal staff a duration line; other senders see none. A resolved `zh-TW` reply uses conservative Traditional Chinese character conversion while preserving code and URLs. Auto language adds a reminder to follow the user's message language.
 
+If the gateway restarts during a reply, it attempts to change the existing “🤔 思考中…” message to “This reply was interrupted. Please send your message again.” It edits that message rather than posting a new notice. Recovery is limited to 200 messages and 30 seconds per start; temporary Google API failures are retried on a later restart, with records retired after 24 hours. Pub/Sub turns interrupted during processing are not automatically run again, so please resend your message.
+
 Rendering has not been verified on a real Google Chat client (尚未在真實 Google Chat 用戶端驗證). Check desktop and mobile table lists, Chinese bold boundaries, multiline bold and placeholder replacement.
 
 ## Google Chat

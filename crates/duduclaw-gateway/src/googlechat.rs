@@ -773,10 +773,29 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         return;
     }
 
-    // ── Placeholder message (Chat has no typing API) ──
-    let placeholder = Arc::new(tokio::sync::Mutex::new(
-        create_message(&state.creds, &space, thread.as_deref(), "🤔 思考中…").await,
-    ));
+    // Resolve the durable identity before creating any visible placeholder.
+    let session_id = format!("googlechat:{space}");
+    let reply_session = match &state.agent {
+        Some(agent) => crate::trigger_route::called_session(&session_id, agent),
+        None => session_id.clone(),
+    };
+    let employee_id = match &state.agent {
+        Some(agent) => agent.clone(),
+        None => state.ctx.registry.read().await.main_agent()
+            .map(|a| a.config.agent.name.clone()).unwrap_or_default(),
+    };
+    // Fail closed: never create a placeholder when recovery cannot be persisted.
+    let store = match crate::googlechat_inbox::Inbox::shared(&state.ctx.home_dir) {
+        Ok(store) => store,
+        Err(_) => { warn!(failed = 1, "Google Chat placeholder store unavailable"); return; }
+    };
+    let (name, registration) = match create_placeholder(
+        &state.creds, store, &space, thread.as_deref(), state.agent.clone(), employee_id, reply_session.clone(),
+    ).await {
+        Ok(created) => created,
+        Err(_) => { warn!(failed = 1, "Google Chat placeholder persistence failed"); return; }
+    };
+    let placeholder = Arc::new(tokio::sync::Mutex::new(name));
 
     // ── Progress: PATCH the placeholder in place ──
     let progress_state = state.clone();
@@ -821,14 +840,6 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     });
 
     // ── Chat commands ──
-    // Future thread segmentation must require threadReply == true: every main-view DM message gets a fresh thread.
-    let session_id = format!("googlechat:{space}");
-    // An employee's own app answers in the employee's own bucket of the space
-    // (two employees' apps can share one space).
-    let reply_session = match &state.agent {
-        Some(agent) => crate::trigger_route::called_session(&session_id, agent),
-        None => session_id.clone(),
-    };
     let delivery_target = DeliveryTarget {
         home: &state.ctx.home_dir,
         space: &space,
@@ -889,6 +900,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                 &space,
                 thread.as_deref(),
                 &placeholder,
+                registration.as_ref(),
                 &reply,
                 None,
             ).await);
@@ -950,6 +962,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
             &space,
             thread.as_deref(),
             &placeholder,
+            registration.as_ref(),
             crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
             None,
         ).await);
@@ -979,11 +992,13 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     if reply.trim().is_empty() {
         if deliberate_silence {
             if let Some(name) = placeholder.lock().await.take() {
-                delete_placeholder(&state.creds, &name).await;
+                if delete_placeholder(&state.creds, &name).await.is_terminal() {
+                    if let Some(registration) = registration.as_ref() { registration.retire(); }
+                }
             }
         } else {
             report_delivery(delivery_target, deliver_reply(&state.creds, &space, thread.as_deref(),
-                &placeholder, "⚠️ 沒有產生回覆，請再試一次。", None).await);
+                &placeholder, registration.as_ref(), "⚠️ 沒有產生回覆，請再試一次。", None).await);
         }
         return;
     }
@@ -998,6 +1013,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         &space,
         thread.as_deref(),
         &placeholder,
+        registration.as_ref(),
         &reply,
         Some(&guarded),
     )).await);
@@ -1052,6 +1068,7 @@ async fn deliver_reply(
     space: &str,
     thread: Option<&str>,
     placeholder: &Placeholder,
+    registration: Option<&crate::googlechat_inbox::PlaceholderRegistration>,
     reply_markdown: &str,
     guarded: Option<&crate::channel_reply::GuardedReply>,
 ) -> Result<(), Option<u16>> {
@@ -1059,9 +1076,16 @@ async fn deliver_reply(
     // disables all queued progress updates, including during retry back-off.
     let placeholder = placeholder.lock().await.take();
     if reply_markdown.trim().is_empty() {
-        if let Some(name) = placeholder.as_deref() { delete_placeholder(creds, name).await; }
+        if let Some(name) = placeholder.as_deref() {
+            if delete_placeholder(creds, name).await.is_terminal() {
+                if let Some(registration) = registration { registration.retire(); }
+            }
+        }
         return Ok(());
     }
+    let cleanup_text = crate::trigger_route::texts::googlechat_replied(
+        registration.map(|r| crate::trigger_route::texts::lang_for(r.home()))
+            .unwrap_or(crate::trigger_route::texts::Lang::ZhTw));
     let formatted = crate::markdown_render::to_googlechat_text(reply_markdown);
     let chunks = crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK);
     let mut failure = None;
@@ -1069,10 +1093,10 @@ async fn deliver_reply(
         if crate::channel_reply::guard_lost(guarded).await {
             let refusal = crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT;
             let result = if index == 0 && let Some(name) = placeholder.as_deref() {
-                replace_placeholder(name,
+                replace_placeholder(name, registration,
                     || update_message(creds, name, refusal),
                     || post_message(creds, space, thread, refusal),
-                    || update_message(creds, name, "處理已結束。"),
+                    || cleanup_placeholder(creds, name, cleanup_text),
                 ).await.map(|_| ())
             } else {
                 post_message(creds, space, thread, refusal).await.map(|_| ())
@@ -1086,7 +1110,7 @@ async fn deliver_reply(
             return match failure { Some(status) => Err(status), None => Ok(()) };
         }
         let result = if index == 0 && let Some(name) = placeholder.as_deref() {
-            replace_placeholder(name,
+            replace_placeholder(name, registration,
                 || async {
                     if crate::channel_reply::guard_lost(guarded).await {
                         return Err(PatchFailure { status: None, retry_after: std::time::Duration::ZERO });
@@ -1097,7 +1121,7 @@ async fn deliver_reply(
                     if crate::channel_reply::guard_lost(guarded).await { return Err(None); }
                     post_message(creds, space, thread, chunk).await
                 },
-                || update_message(creds, name, "處理已結束。"),
+                || cleanup_placeholder(creds, name, cleanup_text),
             ).await
         } else {
             post_message(creds, space, thread, chunk).await
@@ -1115,8 +1139,8 @@ async fn deliver_reply(
 }
 
 #[derive(Debug, Clone)]
-struct PatchFailure {
-    status: Option<u16>,
+pub(crate) struct PatchFailure {
+    pub(crate) status: Option<u16>,
     retry_after: std::time::Duration,
 }
 
@@ -1134,44 +1158,104 @@ fn patch_backoff(status: u16, retry_after: Option<&str>) -> std::time::Duration 
 /// The first chunk always has a new-message fallback after exactly one retry.
 /// Small injectable operations let tests exercise failure ordering without Chat credentials.
 async fn replace_placeholder<P, PF, S, SF, C, CF>(
-    name: &str, mut patch: P, post: S, clear: C,
+    name: &str, registration: Option<&crate::googlechat_inbox::PlaceholderRegistration>,
+    mut patch: P, post: S, clear: C,
 ) -> Result<Option<String>, Option<u16>>
 where
     P: FnMut() -> PF, PF: std::future::Future<Output = Result<(), PatchFailure>>,
     S: FnOnce() -> SF, SF: std::future::Future<Output = Result<Option<String>, Option<u16>>>,
-    C: FnOnce() -> CF, CF: std::future::Future<Output = Result<(), PatchFailure>>,
+    C: FnOnce() -> CF, CF: std::future::Future<Output = PlaceholderResolution>,
 {
-    match patch().await {
-        Ok(()) => return Ok(Some(name.to_string())),
-        Err(error) => {
-            warn!(status = ?error.status, "Google Chat final PATCH failed; retrying");
-            tokio::time::sleep(error.retry_after).await;
+    let mut terminal = false;
+    for attempt in 0..2 {
+        let result = patch().await;
+        terminal |= result.as_ref().err().is_some_and(|e| matches!(e.status, Some(403 | 404)));
+        match result {
+            Ok(()) => {
+                if let Some(registration) = registration { registration.retire(); }
+                return Ok(Some(name.to_string()));
+            }
+            Err(error) if attempt == 0 => {
+                warn!(status = ?error.status, "Google Chat final PATCH failed; retrying");
+                tokio::time::sleep(error.retry_after).await;
+            }
+            Err(error) => warn!(status = ?error.status, "Google Chat final PATCH failed; sending new message"),
         }
     }
-    match patch().await {
-        Ok(()) => Ok(Some(name.to_string())),
-        Err(error) => {
-            warn!(status = ?error.status, "Google Chat final PATCH failed; sending new message");
-            let sent = post().await;
-            if let Err(error) = clear().await {
-                warn!(status = ?error.status, "Google Chat placeholder cleanup failed");
+    if terminal {
+        if let Some(registration) = registration { registration.retire(); }
+    }
+    let sent = post().await;
+    // A definite fallback refusal delivered nothing; retain interruption recovery.
+    if matches!(sent, Err(Some(_))) {
+        return sent;
+    }
+    if !terminal {
+        if let Some(registration) = registration {
+            // A crash between a successful POST and this state write leaves
+            // `pending`, so recovery may show an interruption beside a delivered
+            // answer. This is accepted; the reverse must never happen.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut persisted = false;
+            loop {
+                if registration.cleanup_only().is_ok() {
+                    persisted = true;
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            sent
+            if !persisted {
+                warn!(failed = 1, "Google Chat placeholder cleanup state update failed; skipping cleanup");
+                return sent;
+            }
         }
+    }
+    if clear().await.is_terminal() {
+        if let Some(registration) = registration { registration.retire(); }
+    }
+    sent
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaceholderResolution { Terminal, Retry(Option<u16>) }
+impl PlaceholderResolution {
+    pub(crate) fn is_terminal(self) -> bool { matches!(self, Self::Terminal) }
+}
+
+pub(crate) async fn delete_placeholder(creds: &GoogleChatCreds, name: &str) -> PlaceholderResolution {
+    let Some((space, message)) = crate::googlechat_inbox::parse_message_resource_name(name) else {
+        return PlaceholderResolution::Retry(None);
+    };
+    let Ok(token) = creds.get_token().await else { return PlaceholderResolution::Retry(None); };
+    match creds.http.delete(format!("{}/spaces/{space}/messages/{message}", creds.api_base()))
+        .bearer_auth(token).send_authorized().await
+    {
+        Ok(response) if response.status().is_success() || matches!(response.status().as_u16(), 403 | 404) => PlaceholderResolution::Terminal,
+        Ok(response) => PlaceholderResolution::Retry(Some(response.status().as_u16())),
+        Err(_) => PlaceholderResolution::Retry(None),
     }
 }
 
-async fn delete_placeholder(creds: &GoogleChatCreds, name: &str) {
-    let Ok(token) = creds.get_token().await else {
-        warn!(status = ?Option::<u16>::None, "Google Chat placeholder removal token unavailable");
-        return;
+/// Cleanup-only recovery never claims the answer was interrupted. If DELETE
+/// is refused (403), try a neutral PATCH before treating the refusal as terminal.
+pub(crate) async fn cleanup_placeholder(creds: &GoogleChatCreds, name: &str, text: &str) -> PlaceholderResolution {
+    // Keep the raw status here so 403 can still attempt the neutral edit.
+    let Some((space, message)) = crate::googlechat_inbox::parse_message_resource_name(name) else {
+        return PlaceholderResolution::Retry(None);
     };
-    match creds.http.delete(format!("{}/{name}", creds.api_base()))
-        .bearer_auth(token).send_authorized().await
-    {
-        Ok(response) if response.status().is_success() => {}
-        Ok(response) => warn!(status = response.status().as_u16(), "Google Chat placeholder removal failed"),
-        Err(_) => warn!(status = ?Option::<u16>::None, "Google Chat placeholder removal transport failure"),
+    let Ok(token) = creds.get_token().await else { return PlaceholderResolution::Retry(None); };
+    let status = match creds.http.delete(format!("{}/spaces/{space}/messages/{message}", creds.api_base()))
+        .bearer_auth(token).send_authorized().await {
+        Ok(response) if response.status().is_success() => return PlaceholderResolution::Terminal,
+        Ok(response) => Some(response.status().as_u16()),
+        Err(_) => None,
+    };
+    if status == Some(404) { return PlaceholderResolution::Terminal; }
+    match update_message(creds, name, text).await {
+        Ok(()) => PlaceholderResolution::Terminal,
+        Err(error) if status == Some(403) || matches!(error.status, Some(403 | 404)) => PlaceholderResolution::Terminal,
+        Err(error) => PlaceholderResolution::Retry(error.status),
     }
 }
 
@@ -1318,13 +1402,31 @@ async fn sending_creds(
     Ok((creds, member))
 }
 
-/// spaces.messages.create — returns the created message `name` for edits.
-async fn create_message(
-    creds: &GoogleChatCreds,
-    space: &str,
-    thread: Option<&str>,
-    text: &str,
-) -> Option<String> {
+/// Persist the fully known client-assigned resource before any POST.
+async fn create_placeholder(
+    creds: &GoogleChatCreds, store: Arc<crate::googlechat_inbox::Inbox>, space: &str,
+    thread: Option<&str>, app_agent: Option<String>, employee_id: String, session_id: String,
+) -> Result<(Option<String>, Option<crate::googlechat_inbox::PlaceholderRegistration>), String> {
+    let id = format!("client-{}", uuid::Uuid::new_v4().simple());
+    let name = format!("{space}/messages/{id}");
+    let row = crate::googlechat_inbox::PendingPlaceholder {
+        message_name: name.clone(), space: space.to_owned(), app_agent,
+        app_email: creds.client_email().to_owned(), employee_id, session_id,
+        thread_name: thread.map(str::to_owned), created_at: chrono::Utc::now().timestamp(), state: "pending".into(),
+    };
+    let registration = crate::googlechat_inbox::PlaceholderRegistration::new(store, &row)?;
+    match post_message_with_id(creds, space, thread, "🤔 思考中…", Some(&id)).await {
+        Err(Some(_)) => {
+            registration.retire();
+            Ok((None, None))
+        }
+        // Success bodies need not be parseable; transport failures are ambiguous.
+        _ => Ok((Some(name), Some(registration))),
+    }
+}
+
+/// spaces.messages.create — returns the created message name for edits.
+async fn create_message(creds: &GoogleChatCreds, space: &str, thread: Option<&str>, text: &str) -> Option<String> {
     post_message(creds, space, thread, text).await.ok().flatten()
 }
 
@@ -1335,6 +1437,12 @@ async fn post_message(
     space: &str,
     thread: Option<&str>,
     text: &str,
+) -> Result<Option<String>, Option<u16>> {
+    post_message_with_id(creds, space, thread, text, None).await
+}
+
+async fn post_message_with_id(
+    creds: &GoogleChatCreds, space: &str, thread: Option<&str>, text: &str, message_id: Option<&str>,
 ) -> Result<Option<String>, Option<u16>> {
     let token = match creds.get_token().await {
         Ok(t) => t,
@@ -1348,6 +1456,10 @@ async fn post_message(
     if let Some(th) = thread {
         body["thread"] = serde_json::json!({ "name": th });
         url.push_str("?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
+    }
+    if let Some(id) = message_id {
+        url.push_str(if thread.is_some() { "&messageId=" } else { "?messageId=" });
+        url.push_str(id);
     }
     match creds
         .http
@@ -1493,11 +1605,13 @@ async fn download_media(creds: &GoogleChatCreds, resource_name: &str) -> Result<
 }
 
 /// spaces.messages.patch — edit a message's text in place.
-async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str) -> Result<(), PatchFailure> {
+pub(crate) async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str) -> Result<(), PatchFailure> {
+    let (space, message) = crate::googlechat_inbox::parse_message_resource_name(message_name)
+        .ok_or(PatchFailure { status: None, retry_after: std::time::Duration::ZERO })?;
     let token = creds.get_token().await.map_err(|_| PatchFailure {
         status: None, retry_after: std::time::Duration::from_secs(1),
     })?;
-    let url = format!("{}/{message_name}?updateMask=text", creds.api_base());
+    let url = format!("{}/spaces/{space}/messages/{message}?updateMask=text", creds.api_base());
     let body = serde_json::json!({ "text": text });
     match creds.http.patch(&url).bearer_auth(&token).json(&body).send_authorized().await {
         Ok(resp) if resp.status().is_success() => Ok(()),
@@ -2043,7 +2157,7 @@ mod delivery_display_tests {
     #[tokio::test]
     async fn failed_patch_retries_then_posts_and_clears() {
         let order = std::sync::Mutex::new(Vec::new());
-        let result = replace_placeholder("old", || async {
+        let result = replace_placeholder("old", None, || async {
             order.lock().unwrap().push("patch");
             Err(PatchFailure { status: Some(429), retry_after: std::time::Duration::ZERO })
         }, || async {
@@ -2051,7 +2165,7 @@ mod delivery_display_tests {
             Ok(Some("new".into()))
         }, || async {
             order.lock().unwrap().push("clear");
-            Ok(())
+            PlaceholderResolution::Terminal
         }).await;
         assert_eq!(result.unwrap().as_deref(), Some("new"));
         assert_eq!(*order.lock().unwrap(), ["patch", "patch", "post", "clear"]);
@@ -2060,16 +2174,16 @@ mod delivery_display_tests {
     #[tokio::test]
     async fn successful_retry_avoids_duplicate_and_failed_post_is_reported() {
         let calls = AtomicUsize::new(0);
-        let result = replace_placeholder("old", || async {
+        let result = replace_placeholder("old", None, || async {
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err(PatchFailure { status: Some(503), retry_after: std::time::Duration::ZERO })
             } else { Ok(()) }
         }, || async { panic!("must not post after successful PATCH") },
         || async { panic!("must not clear after successful PATCH") }).await;
         assert_eq!(result.unwrap().as_deref(), Some("old"));
-        let result = replace_placeholder("old", || async {
+        let result = replace_placeholder("old", None, || async {
             Err(PatchFailure { status: Some(500), retry_after: std::time::Duration::ZERO })
-        }, || async { Err(Some(403)) }, || async { Ok(()) }).await;
+        }, || async { Err(Some(403)) }, || async { PlaceholderResolution::Terminal }).await;
         assert_eq!(result, Err(Some(403)));
     }
 
@@ -2080,4 +2194,289 @@ mod delivery_display_tests {
         assert_eq!(patch_backoff(429, Some("invalid")).as_secs(), 1);
         assert_eq!(patch_backoff(503, Some("60")).as_secs(), 1);
     }
+}
+
+#[cfg(all(test, unix))]
+mod placeholder_lifecycle_tests {
+    use super::*;
+    use crate::agent_channels::{e2e_gchat_tests as chat, e2e_tests, e2e_seam};
+    use crate::googlechat_inbox::{Inbox, PendingPlaceholder, PlaceholderRegistration};
+
+    #[tokio::test]
+    async fn lost_guard_retires_placeholder_at_delivery_and_cancellation_preserves_it() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = chat::start_fake().await;
+        let email = format!("guard-{}@test.invalid", uuid::Uuid::new_v4().simple());
+        let sa = chat::service_account(&fake, &email);
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "sales", "", "specialist",
+            &chat::googlechat_section(home.path(), "444444443", &sa));
+        let ctx = e2e_tests::reply_ctx(home.path()).await;
+        e2e_seam::arm(home.path());
+        let creds = crate::googlechat_agents::agent_creds(home.path(), "sales").await.unwrap();
+        let store = Inbox::shared(home.path()).unwrap();
+        let name = create_message(&creds, "spaces/GUARD", None, "🤔 思考中…").await.unwrap();
+        let row = PendingPlaceholder {
+            message_name: name.clone(), space: "spaces/GUARD".into(), app_agent: Some("sales".into()),
+            app_email: email.clone(), employee_id: "sales".into(), session_id: "googlechat:spaces/GUARD".into(),
+            thread_name: None, created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),
+        };
+        let registration = PlaceholderRegistration::new(store.clone(), &row).unwrap();
+        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap(), vec![row.clone()]);
+        let guarded = crate::channel_reply::build_guarded_reply_for_agent(
+            "hello", &ctx, "sales", &row.session_id, "users/42", None).await;
+        guarded.refuse_delivery();
+        let placeholder = Arc::new(tokio::sync::Mutex::new(Some(name)));
+        deliver_reply(&creds, &row.space, None, &placeholder, Some(&registration), "SECRET ANSWER", Some(&guarded)).await.unwrap();
+        // Retirement happens inside delivery, before registration itself is dropped.
+        assert!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap().is_empty());
+        let text = chat::texts_with_bearer(&fake, &format!("Bearer tok-{email}")).join("\n");
+        assert!(text.contains(crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT));
+        assert!(!text.contains("SECRET ANSWER"));
+        drop(registration);
+        let cancelled = PlaceholderRegistration::new(store.clone(), &row).unwrap();
+        drop(cancelled);
+        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap(), vec![row]);
+    }
+
+    async fn fixture() -> (tempfile::TempDir, chat::Fake, GoogleChatCreds, Arc<Inbox>) {
+        let home = tempfile::tempdir().unwrap();
+        let fake = chat::start_fake().await;
+        let email = format!("placeholder-{}@test.invalid", uuid::Uuid::new_v4().simple());
+        let sa = chat::service_account(&fake, &email);
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "sales", "", "specialist",
+            &chat::googlechat_section(home.path(), "444444443", &sa));
+        let creds = GoogleChatCreds::for_agent(&sa, home.path(), "sales").unwrap();
+        creds.get_token().await.unwrap();
+        let store = Inbox::shared(home.path()).unwrap();
+        (home, fake, creds, store)
+    }
+
+    #[tokio::test]
+    async fn client_placeholder_is_durable_and_active_before_post_and_sends_message_id() {
+        let (_home, fake, creds, store) = fixture().await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        chat::gate_placeholder_post(&fake, gate.clone());
+        let create = create_placeholder(&creds, store.clone(), "spaces/CLIENT", Some("spaces/CLIENT/threads/T"),
+            Some("sales".into()), "sales".into(), "session".into());
+        let observe = async {
+            chat::placeholder_post_started(&fake).await;
+            let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+            assert_eq!(rows.len(), 1, "insert must precede POST at the fake server");
+            assert!(store.placeholder_active(&rows[0].message_name));
+            let (_, id) = crate::googlechat_inbox::parse_message_resource_name(&rows[0].message_name).unwrap();
+            assert_eq!(id.len(), 39);
+            assert!(id.strip_prefix("client-").unwrap().bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            let queries = chat::chat_queries(&fake);
+            let query = &queries.iter().find(|(p, _)| p == "/spaces/CLIENT/messages").unwrap().1;
+            assert!(query.split('&').any(|q| q == format!("messageId={id}")));
+            assert!(query.contains("messageReplyOption="));
+            gate.add_permits(1);
+            rows[0].message_name.clone()
+        };
+        let (created, known_name) = tokio::join!(create, observe);
+        let (name, registration) = created.unwrap();
+        assert_eq!(name.as_deref(), Some(known_name.as_str()));
+        drop(registration);
+        assert!(!store.placeholder_active(&known_name));
+        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn definite_post_failure_retires_but_timeout_and_unparseable_success_keep_known_name() {
+        let (_home, fake, mut creds, store) = fixture().await;
+        creds.http = reqwest::Client::builder().timeout(std::time::Duration::from_millis(100))
+            .redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        for mode in ["http", "timeout", "unparseable"] {
+            chat::placeholder_statuses(&fake, None,
+                (mode == "http").then_some(axum::http::StatusCode::SERVICE_UNAVAILABLE), None);
+            chat::placeholder_post_behavior(&fake,
+                (mode == "timeout").then_some(std::time::Duration::from_secs(2)), mode == "unparseable");
+            let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/CLIENT", None,
+                Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
+            let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+            if mode == "http" {
+                assert!(name.is_none() && registration.is_none() && rows.is_empty());
+            } else {
+                let name = name.unwrap();
+                assert_eq!(rows.len(), 1, "{mode}");
+                assert_eq!(rows[0].message_name, name);
+                assert!(store.placeholder_active(&name));
+                drop(registration);
+                assert!(!store.placeholder_active(&name));
+                store.remove_placeholder(&name).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_delivery_retires_only_on_terminal_patch_or_delete() {
+        use axum::http::StatusCode;
+        let (_home, fake, creds, store) = fixture().await;
+        for (reply, patch, post, delete, kept) in [
+            ("answer", None, None, None, false),
+            ("answer", Some(StatusCode::SERVICE_UNAVAILABLE), Some(StatusCode::SERVICE_UNAVAILABLE), Some(StatusCode::SERVICE_UNAVAILABLE), true),
+            ("answer", Some(StatusCode::FORBIDDEN), Some(StatusCode::SERVICE_UNAVAILABLE), Some(StatusCode::SERVICE_UNAVAILABLE), false),
+            ("", None, None, Some(StatusCode::SERVICE_UNAVAILABLE), true),
+            ("", None, None, Some(StatusCode::FORBIDDEN), false),
+            ("", None, None, Some(StatusCode::NOT_FOUND), false),
+            ("", None, None, None, false),
+        ] {
+            chat::placeholder_statuses(&fake, None, None, None);
+            let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/TERMINAL", None,
+                Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
+            let name = name.unwrap();
+            chat::placeholder_statuses(&fake, patch, post, delete);
+            let slot = Arc::new(tokio::sync::Mutex::new(Some(name.clone())));
+            let _ = deliver_reply(&creds, "spaces/TERMINAL", None, &slot, registration.as_ref(), reply, None).await;
+            let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+            assert_eq!(!rows.is_empty(), kept, "reply={reply}, patch={patch:?}, delete={delete:?}");
+            if kept { assert_eq!(rows[0].state, "pending"); }
+            drop(registration);
+            store.remove_placeholder(&name).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn definite_fallback_http_failure_keeps_pending_placeholder_without_delete() {
+        use axum::http::StatusCode;
+        let (_home, fake, creds, store) = fixture().await;
+        let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/FAILED", None,
+            Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
+        let name = name.unwrap();
+        chat::placeholder_statuses(&fake, Some(StatusCode::SERVICE_UNAVAILABLE),
+            Some(StatusCode::SERVICE_UNAVAILABLE), None);
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(name.clone())));
+        let result = deliver_reply(&creds, "spaces/FAILED", None, &slot, registration.as_ref(), "ANSWER", None).await;
+        assert!(result.is_err());
+        assert!(!chat::chat_calls(&fake).iter().any(|(method, _, _, _)| method == "DELETE"));
+        let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_name, name);
+        assert_eq!(rows[0].state, "pending");
+    }
+
+    #[tokio::test]
+    async fn fallback_delivered_with_failed_cleanup_is_deleted_by_sweep_without_interruption_notice() {
+        use axum::http::StatusCode;
+        let (home, fake, creds, store) = fixture().await;
+        let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/CLEANUP", None,
+            Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
+        let name = name.unwrap();
+        chat::placeholder_statuses(&fake, Some(StatusCode::SERVICE_UNAVAILABLE), None, Some(StatusCode::SERVICE_UNAVAILABLE));
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(name.clone())));
+        deliver_reply(&creds, "spaces/CLEANUP", None, &slot, registration.as_ref(), "ANSWER VIA FALLBACK", None).await.unwrap();
+        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap()[0].state, "cleanup_only");
+        drop(registration);
+        rusqlite::Connection::open(home.path().join("googlechat_inbox.db")).unwrap()
+            .execute("UPDATE pending_placeholders SET created_at=?1", [chrono::Utc::now().timestamp() - 70]).unwrap();
+        chat::placeholder_statuses(&fake, None, None, None);
+        duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+        let before = chat::chat_calls(&fake).len();
+        crate::googlechat_recovery::startup(home.path()).await;
+        assert!(store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap().is_empty());
+        let calls: Vec<_> = chat::chat_calls(&fake).into_iter().skip(before).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].0.as_str(), calls[0].1.as_str()), ("DELETE", format!("/{name}").as_str()));
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_state_write_after_fallback_post_skips_delete_and_keeps_pending() {
+        use axum::http::StatusCode;
+        let (_home, fake, creds, store) = fixture().await;
+        let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/LOCKED", None,
+            Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
+        let name = name.unwrap();
+        chat::placeholder_statuses(&fake, Some(StatusCode::SERVICE_UNAVAILABLE), None, None);
+        let lock_conn = rusqlite::Connection::open(store.home()).unwrap();
+        lock_conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(name.clone())));
+        let result = deliver_reply(&creds, "spaces/LOCKED", None, &slot, registration.as_ref(), "ANSWER", None).await;
+        lock_conn.execute_batch("ROLLBACK").unwrap();
+        assert!(result.is_ok());
+        let calls = chat::chat_calls(&fake);
+        assert!(calls.iter().any(|(method, _, _, _)| method == "POST"));
+        assert!(!calls.iter().any(|(method, _, _, _)| method == "DELETE"));
+        let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_name, name);
+        assert_eq!(rows[0].state, "pending");
+    }
+
+    #[tokio::test]
+    async fn cleanup_delete_refusal_attempts_localized_neutral_patch() {
+        use axum::http::StatusCode;
+        let (home, fake, creds, store) = fixture().await;
+        let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/CLEANUP", None,
+            Some("sales".into()), "sales".into(), "session".into()).await.unwrap();
+        let registration = registration.unwrap();
+        registration.cleanup_only().unwrap();
+        drop(registration);
+        rusqlite::Connection::open(home.path().join("googlechat_inbox.db")).unwrap()
+            .execute("UPDATE pending_placeholders SET created_at=?1", [chrono::Utc::now().timestamp() - 70]).unwrap();
+        chat::placeholder_statuses(&fake, None, None, Some(StatusCode::FORBIDDEN));
+        duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+        let before = chat::chat_calls(&fake).len();
+        crate::googlechat_recovery::startup(home.path()).await;
+        let calls: Vec<_> = chat::chat_calls(&fake).into_iter().skip(before).collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "DELETE");
+        assert_eq!(calls[1].0, "PATCH");
+        assert_eq!(calls[1].1, format!("/{}", name.unwrap()));
+        assert_eq!(calls[1].3["text"], "（已另行回覆）");
+        assert!(store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap().is_empty());
+    }
+
+
+    #[tokio::test]
+    async fn periodic_recovery_settles_panicked_reply_while_queue_runs_and_ignores_active_registration() {
+        let (home, fake, creds, store) = fixture().await;
+        duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+        let active_row = PendingPlaceholder {
+            message_name: "spaces/PERIODIC/messages/active".into(), space: "spaces/PERIODIC".into(),
+            app_agent: Some("sales".into()), app_email: creds.client_email().into(), employee_id: "sales".into(),
+            session_id: "active-session".into(), thread_name: None,
+            created_at: chrono::Utc::now().timestamp() - 100_000, state: "pending".into(),
+        };
+        let active_registration = PlaceholderRegistration::new(store.clone(), &active_row).unwrap();
+        let queue = crate::conversation_queue::ConversationQueue::default();
+        let turn_store = store.clone();
+        let (created, got_name) = tokio::sync::oneshot::channel();
+        queue.submit("reply", async move {
+            let (name, registration) = create_placeholder(&creds, turn_store, "spaces/PERIODIC", None,
+                Some("sales".into()), "sales".into(), "panicking-session".into()).await.unwrap();
+            let _registration = registration;
+            created.send(name.unwrap()).unwrap();
+            panic!("reply panics after creating its placeholder");
+        }).unwrap();
+        let (continued, running) = tokio::sync::oneshot::channel();
+        queue.submit("reply", async move { continued.send(()).unwrap(); }).unwrap();
+        let orphan = got_name.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), running).await.unwrap().unwrap();
+        assert!(!store.placeholder_active(&orphan), "panic must release the registration");
+        assert!(store.placeholder_active(&active_row.message_name));
+        rusqlite::Connection::open(home.path().join("googlechat_inbox.db")).unwrap()
+            .execute("UPDATE pending_placeholders SET created_at=?1 WHERE message_name=?2",
+                rusqlite::params![chrono::Utc::now().timestamp() - 70, orphan]).unwrap();
+        let task = crate::googlechat_recovery::spawn(home.path().to_path_buf()).unwrap();
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::time::resume();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+                if rows == vec![active_row.clone()] { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let patches: Vec<_> = chat::chat_calls(&fake).into_iter().filter(|c| c.0 == "PATCH").collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].1, format!("/{orphan}"));
+        assert_eq!(patches[0].3["text"], "這次回覆中斷了，請再傳一次。");
+        drop(active_registration);
+    }
+
 }

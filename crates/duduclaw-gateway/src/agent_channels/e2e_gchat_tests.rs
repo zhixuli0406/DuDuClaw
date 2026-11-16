@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
+use axum::response::{IntoResponse, Response};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
@@ -70,6 +71,11 @@ struct FakeGoogle {
     subscription_exactly_once: Mutex<Option<Value>>,
     jwks_requests: std::sync::atomic::AtomicUsize,
     token_scopes: Mutex<Vec<String>>,
+    patch_status: Mutex<Option<StatusCode>>,
+    post_status: Mutex<Option<StatusCode>>,
+    delete_status: Mutex<Option<StatusCode>>,
+    post_delay: Mutex<Option<Duration>>,
+    unparseable_post: std::sync::atomic::AtomicBool,
 }
 
 async fn fake_google(
@@ -78,7 +84,7 @@ async fn fake_google(
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
-) -> axum::Json<Value> {
+) -> Response {
     f.queries.lock().unwrap().push((uri.path().to_owned(), uri.query().unwrap_or("").to_owned()));
     let path = uri.path().to_string();
     if path == "/jwks" {
@@ -86,7 +92,7 @@ async fn fake_google(
         let k = test_key();
         return axum::Json(
             json!({"keys": [{"kty": "RSA", "kid": "test-kid", "alg": "RS256", "n": k.n, "e": k.e}]}),
-        );
+        ).into_response();
     }
     if path == "/token" {
         // The access token names the service account that asked for it, so
@@ -103,7 +109,7 @@ async fn fake_google(
         let iss = claims["iss"].as_str().unwrap_or("?");
         return axum::Json(
             json!({"access_token": format!("tok-{iss}"), "expires_in": 3600, "token_type": "Bearer"}),
-        );
+        ).into_response();
     }
     let bearer = headers
         .get("authorization")
@@ -123,7 +129,19 @@ async fn fake_google(
         if let Some(value) = f.subscription_exactly_once.lock().unwrap().clone() {
             subscription["enableExactlyOnceDelivery"] = value;
         }
-        return axum::Json(subscription);
+        return axum::Json(subscription).into_response();
+    }
+    if method == Method::PATCH {
+        if let Some(status) = *f.patch_status.lock().unwrap() { return status.into_response(); }
+    }
+    if method == Method::DELETE {
+        if let Some(status) = *f.delete_status.lock().unwrap() { return status.into_response(); }
+    }
+    if method == Method::POST {
+        let delay = *f.post_delay.lock().unwrap();
+        if let Some(delay) = delay { tokio::time::sleep(delay).await; }
+        if f.unparseable_post.load(std::sync::atomic::Ordering::SeqCst) { return "not json".into_response(); }
+        if let Some(status) = *f.post_status.lock().unwrap() { return status.into_response(); }
     }
     let gate = if method == Method::POST && path.ends_with("/messages") {
         f.first_message_gate.lock().unwrap().take()
@@ -134,9 +152,12 @@ async fn fake_google(
         f.first_message_started.notify_one();
         gate.acquire().await.unwrap().forget();
     }
-    axum::Json(
-        json!({"name": format!("{}/m{n}", path.trim_end_matches("/messages").trim_start_matches('/'))}),
-    )
+    let client_id = uri.query().and_then(|q| q.split('&').find_map(|v| v.strip_prefix("messageId=")));
+    let name = match client_id {
+        Some(id) => format!("{}/{id}", path.trim_start_matches('/')),
+        None => format!("{}/messages/m{n}", path.trim_end_matches("/messages").trim_start_matches('/')),
+    };
+    axum::Json(json!({"name": name})).into_response()
 }
 
 pub(crate) struct Fake {
@@ -256,6 +277,9 @@ async fn googlechat_full_queue_acks_without_creating_a_turn() {
     let turns: i64 = db.query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0)).unwrap();
     assert_eq!(turns, 0, "a rejected event must not create a turn");
     assert_eq!(texts_with_bearer(&fake, &format!("Bearer tok-{email}")).len(), 1);
+    let store = crate::googlechat_inbox::Inbox::shared(home.path()).unwrap();
+    assert!(store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap().is_empty(),
+        "queue-full rejects before creating a placeholder");
 }
 
 #[test]
@@ -633,9 +657,149 @@ async fn dm_reply_placement_uses_inbound_thread_reply_and_dashboard_setting() {
         assert!(!creates.is_empty());
         for (_, _, _, body) in creates { assert_eq!(body.get("thread").is_some(), expected); }
         for (_, query) in fake.state.queries.lock().unwrap().iter().filter(|(path, _)| path == &format!("/{space}/messages")) {
-            assert_eq!(query == "messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD", expected);
+            assert_eq!(query.split('&').any(|p| p == "messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"), expected);
         }
     }
     assert!(!crate::channel_settings::CONFIG_KEYS.contains(&"dm_reply_placement"));
     assert!(!crate::channel_settings::MCP_ACCESS_KEYS.contains(&"dm_reply_placement"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn placeholder_registration_survives_inflight_and_retires_on_reply_exits() {
+    for mode in ["final", "failure", "delivery_failure", "silence", "command"] {
+        let home = tempfile::tempdir().unwrap();
+        let fake = start_fake().await;
+        let email = format!("lifecycle-{}@test.invalid", uuid::Uuid::new_v4().simple());
+        let sa = service_account(&fake, &email);
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "sales", "", "specialist",
+            &googlechat_section(home.path(), "444444443", &sa));
+        let ctx = super::e2e_tests::reply_ctx(home.path()).await;
+        let mut waiting = super::e2e_seam::arm_waiting(home.path());
+        waiting.bind_failure_sessions();
+        if mode == "failure" {
+            super::e2e_seam::failure_reply(home.path(), "GENERATION_FAILED".into(), crate::channel_reply::TurnFailureReason::Internal);
+        }
+        if mode == "silence" { super::e2e_seam::empty_or_panicking_reply(home.path(), false); }
+        let creds = crate::googlechat_agents::agent_creds(home.path(), "sales").await.unwrap();
+        let state = Arc::new(crate::googlechat::GoogleChatState { ctx: ctx.clone(), creds, agent: Some("sales".into()) });
+        let event = message_event("spaces/LIFECYCLE", if mode == "command" { "/help" } else { "hello" });
+        let count = || -> i64 {
+            rusqlite::Connection::open(home.path().join("googlechat_inbox.db")).unwrap()
+                .query_row("SELECT count(*) FROM pending_placeholders", [], |r| r.get(0)).unwrap()
+        };
+        if mode == "command" {
+            crate::googlechat::process_pubsub_event(&state, &event).await;
+        } else {
+            let observe = async {
+                let turn = tokio::time::timeout(Duration::from_secs(10), waiting.entered.recv()).await.unwrap().unwrap();
+                assert_eq!(count(), 1, "placeholder must be durable while the model is running");
+                let rows = crate::googlechat_inbox::Inbox::shared(home.path()).unwrap()
+                    .stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+                assert_eq!(rows[0].app_agent.as_deref(), Some("sales"));
+                assert_eq!(rows[0].app_email, email);
+                assert_eq!(rows[0].employee_id, "sales");
+                assert_eq!(rows[0].session_id, turn.session_id);
+                if mode == "delivery_failure" {
+                    *fake.state.patch_status.lock().unwrap() = Some(StatusCode::FORBIDDEN);
+                    *fake.state.post_status.lock().unwrap() = Some(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                turn.release.send(()).unwrap();
+            };
+            tokio::join!(crate::googlechat::process_pubsub_event(&state, &event), observe);
+        }
+        assert_eq!(count(), 0, "every reply exit must retire recovery evidence: {mode}");
+        let calls = fake.state.calls.lock().unwrap();
+        assert!(calls.iter().any(|(method, _, _, _)| method == "POST"));
+        assert!(calls.iter().any(|(method, _, _, _)| method == "PATCH" || method == "DELETE"));
+
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_sweep_patches_existing_message_with_original_employee_app() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = start_fake().await;
+    let email = format!("restart-{}@test.invalid", uuid::Uuid::new_v4().simple());
+    let sa = service_account(&fake, &email);
+    crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "sales", "", "specialist",
+        &googlechat_section(home.path(), "444444443", &sa));
+    let store = crate::googlechat_inbox::Inbox::shared(home.path()).unwrap();
+    let row = crate::googlechat_inbox::PendingPlaceholder {
+        message_name: "spaces/RESTART/messages/old".into(), space: "spaces/RESTART".into(),
+        app_agent: Some("sales".into()), app_email: email.clone(), employee_id: "sales".into(),
+        session_id: "googlechat:spaces/RESTART:sales".into(), thread_name: None,
+        created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),
+    };
+    store.insert_placeholder(&row).unwrap();
+    duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+    crate::googlechat_recovery::startup(home.path()).await;
+    assert!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap().is_empty());
+    let calls = fake.state.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "PATCH");
+    assert_eq!(calls[0].1, "/spaces/RESTART/messages/old");
+    assert_eq!(calls[0].2, format!("Bearer tok-{email}"));
+    assert_eq!(calls[0].3["text"], "這次回覆中斷了，請再傳一次。");
+    drop(calls);
+    // A removed/rebound app is retained for retry; no shared-app fallback.
+    let mut mismatched = row;
+    mismatched.app_email = "previous-app@test.invalid".into();
+    store.insert_placeholder(&mismatched).unwrap();
+    crate::googlechat_recovery::startup(home.path()).await;
+    assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap().len(), 1);
+    assert_eq!(fake.state.calls.lock().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_sweep_handles_api_failures_without_posting_a_notice() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = start_fake().await;
+    let email = format!("status-{}@test.invalid", uuid::Uuid::new_v4().simple());
+    let sa = service_account(&fake, &email);
+    crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "sales", "", "specialist",
+        &googlechat_section(home.path(), "444444443", &sa));
+    let store = crate::googlechat_inbox::Inbox::shared(home.path()).unwrap();
+    duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+    for (status, age, kept) in [(404, 10, false), (403, 10, false), (503, 10, true), (503, 86_401, false)] {
+        let row = crate::googlechat_inbox::PendingPlaceholder {
+            message_name: "spaces/STATUS/messages/old".into(), space: "spaces/STATUS".into(),
+            app_agent: Some("sales".into()), app_email: email.clone(), employee_id: "sales".into(),
+            session_id: "googlechat:spaces/STATUS:sales".into(), thread_name: None,
+            created_at: chrono::Utc::now().timestamp() - age, state: "pending".into(),
+        };
+        // A retained transient row is aged for the next iteration.
+        store.remove_placeholder(&row.message_name).unwrap();
+        store.insert_placeholder(&row).unwrap();
+        *fake.state.patch_status.lock().unwrap() = Some(StatusCode::from_u16(status).unwrap());
+        crate::googlechat_recovery::startup(home.path()).await;
+        assert_eq!(!store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap().is_empty(), kept);
+    }
+    assert_eq!(fake.state.calls.lock().unwrap().len(), 4);
+    assert!(fake.state.calls.lock().unwrap().iter().all(|(method, _, bearer, _)| method == "PATCH" && bearer == &format!("Bearer tok-{email}")));
+}
+
+// Shared controls for lifecycle tests using this existing OAuth/Chat fake.
+pub(crate) fn placeholder_statuses(fake: &Fake, patch: Option<StatusCode>, post: Option<StatusCode>, delete: Option<StatusCode>) {
+    *fake.state.patch_status.lock().unwrap() = patch;
+    *fake.state.post_status.lock().unwrap() = post;
+    *fake.state.delete_status.lock().unwrap() = delete;
+}
+
+pub(crate) fn placeholder_post_behavior(fake: &Fake, delay: Option<Duration>, unparseable: bool) {
+    *fake.state.post_delay.lock().unwrap() = delay;
+    fake.state.unparseable_post.store(unparseable, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn gate_placeholder_post(fake: &Fake, gate: Arc<tokio::sync::Semaphore>) {
+    *fake.state.first_message_gate.lock().unwrap() = Some(gate);
+}
+
+pub(crate) async fn placeholder_post_started(fake: &Fake) {
+    tokio::time::timeout(Duration::from_secs(10), fake.state.first_message_started.notified()).await.unwrap();
+}
+
+pub(crate) fn chat_calls(fake: &Fake) -> Vec<(String, String, String, Value)> { fake.state.calls.lock().unwrap().clone() }
+pub(crate) fn chat_queries(fake: &Fake) -> Vec<(String, String)> { fake.state.queries.lock().unwrap().clone() }

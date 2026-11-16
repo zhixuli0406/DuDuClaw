@@ -231,6 +231,7 @@ pub mod google_workspace;
 pub mod googlechat;
 pub mod googlechat_pubsub;
 mod googlechat_inbox;
+mod googlechat_recovery;
 mod googlechat_space_kind;
 pub mod googlechat_agents;
 pub mod googlechat_identity;
