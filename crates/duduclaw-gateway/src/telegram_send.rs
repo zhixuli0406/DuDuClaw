@@ -276,14 +276,19 @@ pub(crate) async fn send(client: &reqwest::Client, api_base: &str, chat_id: &str
 
 async fn send_until(client: &reqwest::Client, api_base: &str, chat_id: &str,
     text: &str, format: Format, options: Options<'_>, deadline: Instant) -> Result<(), Failure> {
-    let bounded = duduclaw_core::truncate_bytes(text, MAX_INPUT_BYTES);
-    let truncated = bounded.len() < text.len();
+    const MAX_PREFIX_BYTES: usize = 256;
+    let bounded_prefix = options.literal_prefix.map(|prefix| duduclaw_core::truncate_bytes(prefix, MAX_PREFIX_BYTES));
+    let prefix_truncated = bounded_prefix.as_deref().zip(options.literal_prefix)
+        .is_some_and(|(bounded, original)| bounded.len() < original.len());
+    let text_budget = MAX_INPUT_BYTES - bounded_prefix.as_ref().map_or(0, String::len);
+    let bounded = duduclaw_core::truncate_bytes(text, text_budget);
+    let truncated = prefix_truncated || bounded.len() < text.len();
     let mut delivered = 0;
     let mut total = 0;
     let mut language = None;
     let delivery = async {
         language = crate::prompt_identity::read_default_language(options.home).await;
-        let mut chunks = chunks(bounded, format, options.literal_prefix);
+        let mut chunks = chunks(bounded, format, bounded_prefix.as_deref());
         if truncated || chunks.len() > crate::channel_format::limits::DELIVERY_CHUNKS {
             chunks.truncate(crate::channel_format::limits::DELIVERY_CHUNKS - 1);
             let notice = delivery_notice(language.as_deref(), false).to_owned();

@@ -321,6 +321,24 @@ async fn oversized_markdown_is_bounded_before_rendering() {
 }
 
 #[tokio::test]
+async fn oversized_literal_prefix_and_text_share_rendering_budget() {
+    let provider = TestChannelProvider::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let prefix = "p".repeat(3 * 1024 * 1024);
+    let text = "t".repeat(3 * 1024 * 1024);
+    let mut options = Options::new(home.path(), "notify", "oversized-prefix");
+    options.literal_prefix = Some(&prefix);
+    send(&reqwest::Client::new(), &crate::telegram::telegram_poll_api_base(&provider.token), "1",
+        &text, Format::MarkdownHtml, options).await.unwrap();
+    let requests = provider.requests();
+    assert!(requests.len() <= 16);
+    let rendered_bytes: usize = requests.iter()
+        .map(|request| request.body["text"].as_str().unwrap().len()).sum();
+    assert!(rendered_bytes <= 16 * LIMIT + delivery_notice(None, false).len());
+    assert_eq!(requests.last().unwrap().body["text"], delivery_notice(None, false));
+}
+
+#[tokio::test]
 async fn truncated_markdown_with_few_rendered_chunks_still_gets_fixed_notice() {
     let provider = TestChannelProvider::start().await;
     let home = tempfile::tempdir().unwrap();
