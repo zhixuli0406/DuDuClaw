@@ -68,9 +68,20 @@ pub(crate) fn session_history(
     summary: &str, bookmark: u32,
 ) -> (String, Vec<crate::runtime::ConversationTurn>) {
     let checked = checked_summary_bookmark(session_id, summary, bookmark, messages.len());
+    let mut non_system_rows = 0;
+    let mut floor = 0;
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role != "system" {
+            non_system_rows += 1;
+            if non_system_rows == 3 {
+                floor = index;
+                break;
+            }
+        }
+    }
     let mut history: Vec<_> = messages.iter()
         .take(messages.len().saturating_sub(1))
-        .skip(checked.after.min(messages.len().saturating_sub(3)))
+        .skip(checked.after.min(floor))
         .filter(|message| message.role != "system")
         .map(|message| crate::runtime::ConversationTurn {
             role: message.role.clone(), content: message.content.clone(),
@@ -522,6 +533,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tail_system_rows_do_not_hide_last_non_system_history() {
+        let mut messages = visible_messages(5);
+        messages[3].role = "system".into();
+        messages[4].role = "user".into();
+
+        let (summary, history) = session_history("system-tail", &messages, "- fact", 5);
+
+        assert_eq!(summary, "- fact");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, messages[1].content);
+        assert_eq!(history[1].content, messages[2].content);
     }
 
     #[test]
