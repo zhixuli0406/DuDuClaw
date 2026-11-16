@@ -1,10 +1,26 @@
-//! Read-only installer checks and the composite isolation readiness (v1.83 R4).
+//! Installer checks and the composite isolation readiness (v1.83 R4).
 //!
-//! Every check only reads root-owned state, root-verified sockets or fixed
-//! system tools, each bounded in time and size. A source that cannot be read,
-//! an unexpected owner/mode, a protocol mismatch or a timeout is "not ready"
-//! with a stable reason code, never "ready". Nothing here publishes an
-//! isolation fact, takes the update lock or changes system state.
+//! Inputs: root-owned files opened without following links (owner, mode,
+//! link count and size checked), root-verified sockets (the updater's
+//! authenticated probe, the DNS broker's fixed health request) and fixed
+//! system tools. No argument or environment variable of a spawned tool is
+//! attacker-influenced: `getent`/`id`/`systemctl` run through `command()`
+//! with fixed arguments, a cleared environment (fixed `PATH`, `HOME`,
+//! `LC_ALL`), `/` as working directory, a 30 s deadline and 4 MiB output
+//! limits; their output is parsed, never echoed. Every read is bounded in time
+//! and size. A source that cannot be read, an unexpected owner/mode, a
+//! protocol mismatch or a timeout is "not ready" with a stable reason code,
+//! never "ready". Nothing here publishes an isolation fact.
+//!
+//! Side effects that remain (all pre-existing, none in the composite sources
+//! except the first and the last):
+//! - `command()` creates two temporary output files under `/run` for each
+//!   tool run and removes them afterwards;
+//! - the item #1 `directories()` group calls `parse_runtime_tree(false)`, which
+//!   takes the update lock (`/var/lib/duduclaw-updated/update.lock`, which the
+//!   lock call may create) for the duration of that check;
+//! - the DNS broker health probe makes the broker open (and immediately
+//!   close) one TCP connection to its configured upstream.
 use super::*;
 use duduclaw_gateway::isolation_readiness::Reason;
 use duduclaw_isolation::{ids::Sha256Digest, update::{Architecture, InstallTarget, Product, ReleaseArtifact,
@@ -85,12 +101,15 @@ impl Finding {
 
 const MSG_UPDATE: &str = "更新服務的世代與安裝不一致，或更新服務沒有回應。";
 const MSG_COMPONENTS: &str = "隔離元件與目前世代不符。";
+const MSG_LAUNCHER: &str = "更新服務的固定啟動程式與安裝時記錄的版本不符。";
+const MSG_LAUNCHER_RECEIPT: &str = "缺少安裝時記錄的更新服務啟動程式收據，無法確認啟動程式未被更換。";
 const MSG_HOST_EVIDENCE: &str = "隔離執行服務的主機證據無法讀取、已過期或屬於其他開機。";
 const MSG_HOST_PROTOCOL: &str = "隔離執行服務的協定版本與此版本不符。";
 const MSG_LANDLOCK: &str = "此核心的 Landlock 自我測試未通過；Ubuntu 24.04 HWE 核心請改用 GA 核心或回報原廠。";
 const MSG_LANDLOCK_UNVERIFIED: &str = "無法取得此核心的 Landlock 自我測試結果。";
 const MSG_EGRESS: &str = "對外連線代理設定無效或未啟動。";
 const MSG_DNS_BROKER: &str = "DNS 轉送服務的設定無效或未啟動。";
+const MSG_DNS_BROKER_UNHEALTHY: &str = "DNS 轉送服務沒有在時限內回應健康檢查，或無法連到設定的上游 DNS。";
 const MSG_SECOND_LAYER: &str = "第二層 IP 過濾不可用。";
 const MSG_CLOUD_ADDRESS: &str = "偵測到雲端主機，但未設定主機的公開位址；若主機使用 1:1 NAT，員工可能連得到本機的公開 IP。";
 const MSG_PARSE: &str = "文件解析服務未就緒。";
@@ -98,6 +117,10 @@ const MSG_TRUST: &str = "更新信任根無法驗證，需要人工修復。";
 const MSG_TRUST_FROZEN: &str = "更新信任根已凍結；解除凍結前不會套用新版本。";
 const MSG_MIGRATION_UNREADABLE: &str = "資料遷移進度無法驗證。";
 const MSG_MIGRATION_INCOMPLETE: &str = "資料遷移尚未完成隔離驗證；請先完成遷移流程。";
+const MSG_MIGRATION_COMPLETION: &str = "資料遷移的內容已匯入，但最終完成檢查尚未通過；請再次執行遷移流程。";
+const MSG_MIGRATION_IN_PROGRESS: &str = "資料遷移有尚未完成的步驟；請再次執行遷移流程。";
+const MSG_MIGRATION_RECEIPTS: &str = "資料遷移的步驟紀錄不完整或無效，需要人工檢查。";
+const MSG_MIGRATION_PLAN_MISSING: &str = "偵測到資料遷移的檔案，但缺少遷移計畫，需要人工檢查。";
 const MSG_EDITION: &str = "此版本不支援員工隔離。";
 const MSG_EDITION_UNVERIFIED: &str = "無法確認團隊版授權；員工隔離維持停用。";
 const MSG_READY: &str = "所有就緒檢查均已通過，可以執行員工工作。";
@@ -115,9 +138,9 @@ pub(super) struct UpdateStateView {
     floor: ReleaseVersion,
 }
 
-/// spawnd's published host evidence: the combined freshness/boot/budget
-/// verdict of `EvidenceReport::check`, the boolean checks and Landlock
-/// `(detected_abi, selected_abi)`.
+/// spawnd's published host evidence: the combined verdict of
+/// `EvidenceReport::check` (freshness, boot, budget, the Landlock binding and
+/// every boolean), the boolean checks and Landlock `(detected_abi, selected_abi)`.
 #[derive(Clone, Debug)]
 pub(super) struct HostEvidence {
     verdict_ok: bool,
@@ -130,6 +153,18 @@ pub(super) struct EgressView { host_public_addresses_empty: bool }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TrustView { expires_at_unix: u64, frozen: bool }
+
+/// The frozen updater launcher as recorded at bootstrap in a root-owned
+/// receipt (never the current generation's `UpdateSlot` artifact: only the
+/// bootstrap/transition program replaces the launcher, so a legitimate update
+/// of `duduclaw-updated` must not change this comparison).
+// Constructed only by tests until R1/R3 define the receipt (see `launcher_receipt`).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LauncherReceipt { sha256: Sha256Digest, size_bytes: u64, mode: u32 }
+
+/// The fixed updater launcher path (`layout::BINARIES`).
+const UPDATER_LAUNCHER: &str = "/usr/libexec/duduclaw-updated-launch";
 
 /// Read-only data sources of the composite check (plan §4.4 data sources).
 /// Production reads root-owned state only; tests inject fakes.
@@ -144,31 +179,37 @@ pub(super) trait HostSources {
     /// The published file at `path` is root-owned, nlink 1, has the artifact's
     /// mode, size and SHA-256.
     fn component(&mut self, path: &'static str, artifact: &ReleaseArtifact) -> Result<()>;
+    /// The bootstrap's root-owned record of the frozen updater launcher.
+    /// `Ok(None)`: no such receipt exists on this host.
+    fn launcher_receipt(&mut self) -> Result<Option<LauncherReceipt>>;
+    /// The launcher at [`UPDATER_LAUNCHER`] is root-owned, nlink 1, has the
+    /// receipt's mode, size and SHA-256 (compared by descriptor).
+    fn launcher(&mut self, receipt: &LauncherReceipt) -> Result<()>;
     fn host_evidence(&mut self) -> Result<HostEvidence>;
     /// Loaded from the installed fragment, active, no unverified drop-ins.
     fn unit_active(&mut self, unit: &'static str) -> Result<()>;
     fn egress_config(&mut self) -> Result<EgressView>;
-    /// `Ok(true)`: the broker DNS route is configured and its config is valid.
+    /// `Ok(true)`: the broker DNS route is configured and its config passes
+    /// the broker's own validator (`duduclaw_egress::daemon::BrokerConfig`).
     fn dns_broker_configured(&mut self) -> Result<bool>;
+    /// The broker answered its fixed health request within 2 s.
+    fn dns_broker_health(&mut self) -> Result<()>;
     /// Heuristic for an informational notice only; never a security input.
     fn cloud_host(&mut self) -> bool;
     fn trust_root(&mut self) -> Result<TrustView>;
     fn now(&mut self) -> Result<u64>;
-    /// `Ok(None)`: no migration plan exists on this host.
-    fn migration_state(&mut self) -> Result<Option<MigrationState>>;
+    /// `Ok(None)`: no migration on this host. `Ok(Some(state))`: the verified
+    /// journal state with no pending intent and every stage receipt up to it
+    /// (`duduclaw_migration::root_host::readiness`). `Err(code)`: a stable
+    /// reason code of why it cannot be reported.
+    fn migration_state(&mut self) -> std::result::Result<Option<MigrationState>, &'static str>;
     /// `Ok(true)` only for a verified TEAM (non-Personal) license.
     fn edition_is_team(&mut self) -> Result<bool>;
 }
 
-/// Same rule as the gateway's update admission (`isolation_readiness`
-/// `compatible_update`): non-zero generation, this release's version and
-/// protocol 1 for all eight components.
+/// The one rule shared with the gateway's update admission.
 fn compatible_update(evidence: &GenerationEvidence, installed_version: &str) -> bool {
-    let p = &evidence.protocols;
-    evidence.generation.0 != [0; 32]
-        && duduclaw_updated::parse_version(installed_version).is_ok_and(|version| version == evidence.version)
-        && [p.gateway, p.spawnd, p.trampoline, p.egress, p.updated, p.mcp_bridge, p.parse_worker, p.importer]
-            .into_iter().all(|version| version == 1)
+    duduclaw_updated::readiness::compatible_update(evidence, installed_version)
 }
 
 /// Plan §4.4 items 2–10, each reported on its own; every item always runs.
@@ -176,6 +217,7 @@ pub(super) fn assess_host(sources: &mut dyn HostSources, installed_version: &str
     let mut out = Vec::new();
     update_findings(sources, installed_version, &mut out);
     component_findings(sources, &mut out);
+    launcher_findings(sources, &mut out);
     let evidence = host_findings(sources, &mut out);
     egress_findings(sources, evidence.as_ref(), &mut out);
     parse_findings(sources, &mut out);
@@ -205,13 +247,15 @@ fn update_findings(sources: &mut dyn HostSources, installed_version: &str, out: 
     }
 }
 
-/// Every fixed-path executable the installer layout publishes, plus the gateway.
+/// Every fixed-path executable the installer layout publishes that follows
+/// the current generation, plus the gateway. The frozen updater launcher is
+/// not one of them: [`launcher_findings`] compares it with its bootstrap receipt.
 fn component_paths() -> impl Iterator<Item = &'static str> {
-    layout::BINARIES.iter().copied().chain(std::iter::once(BINARY))
+    layout::BINARIES.iter().copied().filter(|path| *path != UPDATER_LAUNCHER).chain(std::iter::once(BINARY))
 }
 
-/// The signed artifact a fixed-path executable must equal. The updater's
-/// launcher is the `duduclaw-updated` binary (release archive alias).
+/// The signed artifact of the current generation a fixed-path executable must
+/// equal. Exact paths only; the frozen launcher has none.
 fn component_target(path: &str) -> Option<InstallTarget> {
     Some(match path {
         "/usr/lib/duduclaw/duduclaw-spawnd" => InstallTarget::Spawnd,
@@ -221,10 +265,22 @@ fn component_target(path: &str) -> Option<InstallTarget> {
         "/usr/lib/duduclaw/current/duduclaw-import" => InstallTarget::Importer,
         "/usr/lib/duduclaw/current/duduclaw-migrate" => InstallTarget::Migration,
         "/usr/lib/duduclaw/current/duduclaw-mcp-bridge" => InstallTarget::McpBridge,
-        "/usr/libexec/duduclaw-updated-launch" => InstallTarget::UpdateSlot,
         BINARY => InstallTarget::Gateway,
         _ => return None,
     })
+}
+
+// #3, frozen launcher: equal to what the bootstrap recorded, whatever the
+// current generation is. No receipt is a failure, never "matches".
+fn launcher_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) {
+    let item = Item::Components;
+    match sources.launcher_receipt() {
+        Err(_) => out.push(Finding::failed(item, "launcher_receipt_unreadable", MSG_LAUNCHER_RECEIPT)),
+        Ok(None) => out.push(Finding::failed(item, "launcher_receipt_missing", MSG_LAUNCHER_RECEIPT)),
+        Ok(Some(receipt)) => if sources.launcher(&receipt).is_err() {
+            out.push(Finding::failed(item, "launcher_mismatch", MSG_LAUNCHER));
+        },
+    }
 }
 
 /// The authenticated manifest of the selected generation, only while it is
@@ -300,7 +356,6 @@ fn host_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) -> Optio
             return None;
         }
     };
-    let start = out.len();
     if evidence.checks.protocol != duduclaw_isolation::ipc::PROTOCOL_VERSION {
         out.push(Finding::failed(Item::HostEvidence, "host_protocol_mismatch", MSG_HOST_PROTOCOL));
     }
@@ -309,8 +364,9 @@ fn host_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) -> Optio
     }
     // Q4 working default: a newer kernel is accepted only through spawnd's
     // existing clamp (selected = min(detected, highest known)) with a passing
-    // self test. Required even when the trampoline check itself failed.
-    let highest = Reason::LANDLOCK_HIGHEST_KNOWN_ABI;
+    // self test. Required even when the trampoline check itself failed. The
+    // highest known ABI is the shared contract constant spawnd's clamp uses.
+    let highest = duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI;
     let clamp_valid = evidence.landlock
         .is_some_and(|(detected, selected)| detected > 0 && selected == detected.min(highest));
     if !evidence.checks.landlock_self_test || !clamp_valid {
@@ -320,9 +376,11 @@ fn host_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) -> Optio
         out.push(Finding::notice(Item::Landlock, Reason::LANDLOCK_ABI_CLAMPED_CODE,
             Reason::landlock_abi_clamped_message(detected)));
     }
-    // Stale, future, other-boot or zero-budget evidence fails even when every
-    // boolean reads true.
-    if !evidence.verdict_ok && !out[start..].iter().any(Finding::is_failure) {
+    // spawnd's combined verdict (stale, future, other-boot or zero-budget
+    // evidence included) is always reported when it fails, even when every
+    // boolean reads true and even alongside other named failures: another
+    // failing item must never hide stale evidence.
+    if !evidence.verdict_ok {
         out.push(Finding::failed(Item::HostEvidence, "host_evidence_stale", MSG_HOST_EVIDENCE));
     }
     Some(evidence)
@@ -345,9 +403,16 @@ fn egress_findings(sources: &mut dyn HostSources, evidence: Option<&HostEvidence
     }
     match sources.dns_broker_configured() {
         Err(_) => out.push(Finding::failed(item, "dns_broker_config_invalid", MSG_DNS_BROKER)),
-        Ok(true) => if sources.unit_active("duduclaw-dns-broker.socket").is_err() {
-            out.push(Finding::failed(item, "dns_broker_inactive", MSG_DNS_BROKER));
-        },
+        Ok(true) => {
+            if sources.unit_active("duduclaw-dns-broker.socket").is_err() {
+                out.push(Finding::failed(item, "dns_broker_inactive", MSG_DNS_BROKER));
+            }
+            // An active socket proves nothing about the broker behind it:
+            // the broker itself must answer its fixed health request.
+            if sources.dns_broker_health().is_err() {
+                out.push(Finding::failed(item, "dns_broker_unhealthy", MSG_DNS_BROKER_UNHEALTHY));
+            }
+        }
         // The resolved route: spawnd's dns_route_verified (#4) covers it.
         Ok(false) => (),
     }
@@ -376,18 +441,48 @@ fn trust_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) {
     }
 }
 
-// #9 (design §10.3). Waiting for the administrator is not a failure: the host
-// is ready and unconfirmed employees are refused by the gateway. A migration
-// that has not reached that checkpoint has not verified the new platform yet.
+// #9 (design §10.3). Only `AwaitingAdministrator` is "pending" (not a
+// failure): the host is ready and unconfirmed employees are refused by the
+// gateway. The source reports a state only with no pending intent and every
+// stage receipt up to it. `ContentImported` blocks until the final live
+// readback of `Complete` succeeded (failed applies, outstanding rotations or
+// a missing isolation readback stop it there). Every other state, a pending
+// intent, missing receipts and artefacts without a plan block as well.
 fn migration_findings(sources: &mut dyn HostSources, out: &mut Vec<Finding>) {
     let item = Item::Migration;
     match sources.migration_state() {
-        Err(_) => out.push(Finding::failed(item, "migration_state_unreadable", MSG_MIGRATION_UNREADABLE)),
         Ok(None) | Ok(Some(MigrationState::Complete)) => (),
-        Ok(Some(MigrationState::AwaitingAdministrator | MigrationState::ContentImported)) =>
+        Ok(Some(MigrationState::AwaitingAdministrator)) =>
             out.push(Finding { item, severity: Severity::Pending, code: Reason::MIGRATION_PENDING_CODE,
                 message: Reason::MIGRATION_PENDING_MESSAGE.to_owned() }),
+        Ok(Some(MigrationState::ContentImported)) =>
+            out.push(Finding::failed(item, "migration_completion_unverified", MSG_MIGRATION_COMPLETION)),
         Ok(Some(_)) => out.push(Finding::failed(item, "migration_incomplete", MSG_MIGRATION_INCOMPLETE)),
+        Err(code) => {
+            let (code, message) = migration_error(code);
+            out.push(Finding::failed(item, code, message));
+        }
+    }
+}
+
+/// A source's reason code and its fixed message. Unknown codes collapse to
+/// the generic unreadable one, so a finding code is always from this list.
+fn migration_error(code: &str) -> (&'static str, &'static str) {
+    match code {
+        "migration_intent_pending" => ("migration_intent_pending", MSG_MIGRATION_IN_PROGRESS),
+        "migration_receipts_invalid" => ("migration_receipts_invalid", MSG_MIGRATION_RECEIPTS),
+        "migration_plan_missing" => ("migration_plan_missing", MSG_MIGRATION_PLAN_MISSING),
+        "migration_plan_invalid" => ("migration_plan_invalid", MSG_MIGRATION_UNREADABLE),
+        "migration_state_dir_unsafe" => ("migration_state_dir_unsafe", MSG_MIGRATION_UNREADABLE),
+        "migration_journal_missing" => ("migration_journal_missing", MSG_MIGRATION_UNREADABLE),
+        "migration_journal_unsafe" => ("migration_journal_unsafe", MSG_MIGRATION_UNREADABLE),
+        "migration_journal_oversized" => ("migration_journal_oversized", MSG_MIGRATION_UNREADABLE),
+        "migration_journal_sidecar" => ("migration_journal_sidecar", MSG_MIGRATION_IN_PROGRESS),
+        "migration_journal_changed" => ("migration_journal_changed", MSG_MIGRATION_IN_PROGRESS),
+        "migration_journal_schema" => ("migration_journal_schema", MSG_MIGRATION_UNREADABLE),
+        "migration_journal_unreadable" => ("migration_journal_unreadable", MSG_MIGRATION_UNREADABLE),
+        "migration_journal_conflict" => ("migration_journal_conflict", MSG_MIGRATION_UNREADABLE),
+        _ => ("migration_state_unreadable", MSG_MIGRATION_UNREADABLE),
     }
 }
 
@@ -412,12 +507,25 @@ fn cloud_dmi_value(value: &str) -> bool {
 
 /// Fixed install locations (they match `protected_linux_migration.rs` and the
 /// protected launcher's HOME); nothing is taken from the environment.
-const MIGRATION_PLAN: &str = "/var/lib/duduclaw-migrate/plan.json";
+const MIGRATION_STATE_DIR: &str = "/var/lib/duduclaw-migrate";
+const MIGRATION_LEGACY_HOME: &str = "/var/lib/duduclaw/.duduclaw";
+const MIGRATION_ROOT_KEY: &str = "/var/lib/duduclaw-protected/root.key";
 const GATEWAY_HOME: &str = "/var/lib/duduclaw/.duduclaw";
+/// The whole DNS broker health exchange, connect included.
+const DNS_BROKER_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BrokerConfigView { upstream: std::net::SocketAddr }
+/// A protected Linux install is always self-hosted: the edition rules are
+/// never chosen from this process's environment (root's shell could carry a
+/// deployment-type variable the systemd gateway does not have).
+const PROTECTED_LINUX_SELF_HOST: bool = true;
+
+/// The tier part of the edition rule: allowed on a self-hosted deployment and
+/// not a Personal profile. Pure; the signature, machine binding, grace period
+/// and revocation are checked by the caller.
+fn license_admits_isolation(license: &duduclaw_license::License) -> bool {
+    license.validate_tier_deployment_binding(PROTECTED_LINUX_SELF_HOST).is_ok()
+        && !duduclaw_core::EditionProfile::from_tier_key(license.tier.as_toml_key()).is_personal()
+}
 
 #[derive(Default)]
 struct LiveSources { gateway: Option<(u32, u32)> }
@@ -509,6 +617,31 @@ impl HostSources for LiveSources {
         Ok(())
     }
 
+    // The plan (PLAN §3.1, §4.1, §4.3) defines no durable root-owned receipt
+    // that records the frozen launcher's digest: R1's `StageReceipt`
+    // (`verified.json`) lists the bootstrap generation's `UpdateSlot` artifact,
+    // but it lives in the staging area that R3 S9 deletes at commit, and
+    // `slot-a.json` (`SlotReceipt`) records the updater slot's manifest, which
+    // changes with every update. Until R1/R3 add one, the frozen launcher
+    // cannot be verified and this item fails closed (`launcher_receipt_missing`).
+    // When the receipt exists, read it here by descriptor (root 0600, nlink 1,
+    // size cap, `deny_unknown_fields`) and return its digest, size and mode.
+    fn launcher_receipt(&mut self) -> Result<Option<LauncherReceipt>> { Ok(None) }
+
+    fn launcher(&mut self, receipt: &LauncherReceipt) -> Result<()> {
+        let path = Path::new(UPDATER_LAUNCHER);
+        parents(path)?;
+        trusted(path, false)?;
+        let file = fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != 0 || metadata.nlink() != 1 || metadata.mode() & 0o7777 != receipt.mode {
+            return Err(refused("launcher"));
+        }
+        duduclaw_updated::linux::files::verify_fd(file, receipt.size_bytes, receipt.sha256).map_err(refused)?;
+        Ok(())
+    }
+
     fn host_evidence(&mut self) -> Result<HostEvidence> {
         let (_, gid) = self.gateway_ids()?;
         let report = duduclaw_spawnd::host::EvidenceReport::read(gid)?;
@@ -526,14 +659,19 @@ impl HostSources for LiveSources {
         Ok(EgressView { host_public_addresses_empty: config.host_public_addresses.is_empty() })
     }
 
+    // The broker's own config type and its single validator: whatever the
+    // broker refuses at start is refused here.
     fn dns_broker_configured(&mut self) -> Result<bool> {
-        use duduclaw_egress::daemon::{read_root_config, BROKER_CONFIG_PATH};
+        use duduclaw_egress::daemon::{read_root_config, BrokerConfig, BROKER_CONFIG_PATH};
         if absent(BROKER_CONFIG_PATH)? { return Ok(false); }
-        let config: BrokerConfigView = read_root_config(BROKER_CONFIG_PATH).map_err(|_| refused("dns broker config"))?;
-        if config.upstream.ip().is_unspecified() || config.upstream.port() == 0 {
-            return Err(refused("dns broker config"));
-        }
+        let config: BrokerConfig = read_root_config(BROKER_CONFIG_PATH).map_err(|_| refused("dns broker config"))?;
+        config.validate().map_err(|_| refused("dns broker config"))?;
         Ok(true)
+    }
+
+    fn dns_broker_health(&mut self) -> Result<()> {
+        duduclaw_egress::resolver::probe_dns_broker_health(DNS_BROKER_HEALTH_TIMEOUT)
+            .map_err(|_| refused("dns broker health"))
     }
 
     fn cloud_host(&mut self) -> bool {
@@ -556,37 +694,28 @@ impl HostSources for LiveSources {
     fn now(&mut self) -> Result<u64> { duduclaw_updated::linux::now().map_err(refused) }
 
     // Never `RootMigration::open`: it takes the migration lock and creates the
-    // plan, lock file and journal. This opens the journal read-only.
-    fn migration_state(&mut self) -> Result<Option<MigrationState>> {
-        if absent(MIGRATION_PLAN)? { return Ok(None); }
-        let plan = duduclaw_migration::root_host::load_plan(Path::new(MIGRATION_PLAN))
-            .map_err(|_| refused("migration plan"))?;
-        if plan.state_dir != Path::new("/var/lib/duduclaw-migrate")
-            || plan.legacy_home != Path::new("/var/lib/duduclaw/.duduclaw")
-            || plan.root_key_path != Path::new("/var/lib/duduclaw-protected/root.key") {
-            return Err(refused("migration plan"));
-        }
-        let journal = plan.state_dir.join("journal.db");
-        let metadata = fs::symlink_metadata(&journal)?;
-        if !metadata.is_file() || metadata.uid() != 0 || metadata.nlink() != 1 || metadata.mode() & 0o7777 != 0o600 {
-            return Err(refused("migration journal"));
-        }
-        let db = rusqlite::Connection::open_with_flags(&journal,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(refused)?;
-        db.busy_timeout(std::time::Duration::from_secs(2)).map_err(refused)?;
-        let (id, state): (String, String) = db.query_row("SELECT id, state FROM migration WHERE singleton=1", [],
-            |row| Ok((row.get(0)?, row.get(1)?))).map_err(refused)?;
-        if id != serde_json::to_string(&plan.migration).map_err(refused)? {
-            return Err(refused("migration journal"));
-        }
-        serde_json::from_str::<MigrationState>(&state).map(Some).map_err(refused)
+    // plan, lock file and journal. The migration crate's one read-only
+    // verifier opens everything by descriptor and the journal immutable.
+    fn migration_state(&mut self) -> std::result::Result<Option<MigrationState>, &'static str> {
+        use duduclaw_migration::root_host::readiness::{verify_read_only, ExpectedLayout};
+        verify_read_only(&ExpectedLayout { state_dir: Path::new(MIGRATION_STATE_DIR),
+            legacy_home: Path::new(MIGRATION_LEGACY_HOME), root_key_path: Path::new(MIGRATION_ROOT_KEY) })
+            .map_err(|error| error.code())
     }
 
     // The gateway's own rule (license_runtime): signed by a trusted issuer,
-    // bound to this machine, within grace, tier allowed for this deployment,
+    // bound to this machine, within grace, tier allowed for a self-hosted
+    // deployment (always: `PROTECTED_LINUX_SELF_HOST`, never the environment),
     // no revocation marker. Read-only: the license lock is never taken (it
-    // would create a root-owned file in the gateway home). A signed license
-    // is the trust anchor, so the gateway account cannot forge TEAM.
+    // would create a root-owned file in the gateway home). The gateway account
+    // cannot forge a TEAM license (issuer signature, machine binding).
+    //
+    // KNOWN LIMITATION (decision for the owner / package R3): the license file
+    // and its revocation marker live in the gateway-owned home, so the gateway
+    // account can swap in another validly signed TEAM license bound to this
+    // machine, or delete the revocation marker. Closing this needs a
+    // root-owned entitlement receipt written by the installer; no receipt
+    // format is invented here and this check otherwise stays as is.
     fn edition_is_team(&mut self) -> Result<bool> {
         use duduclaw_license::{fingerprint_candidates, storage, FeatureGate, License, EMBEDDED_FEATURES_TOML};
         let home = Path::new(GATEWAY_HOME);
@@ -612,9 +741,8 @@ impl HostSources for LiveSources {
         let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).map_err(|_| refused("license policy"))?;
         let valid = duduclaw_gateway::license_runtime::production_registry().verify(&license).is_ok()
             && license.validate_any(&fingerprint_candidates(), gate.phone_home_interval_days(license.tier),
-                gate.grace_period_days(license.tier)).is_ok()
-            && license.validate_tier_deployment_binding(duduclaw_gateway::license_runtime::is_self_host_deployment()).is_ok();
-        Ok(valid && !duduclaw_core::EditionProfile::from_tier_key(license.tier.as_toml_key()).is_personal())
+                gate.grace_period_days(license.tier)).is_ok();
+        Ok(valid && license_admits_isolation(&license))
     }
 }
 

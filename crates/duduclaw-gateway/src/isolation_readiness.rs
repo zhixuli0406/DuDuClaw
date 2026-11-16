@@ -135,12 +135,10 @@ static UPDATE_OBSERVATION: std::sync::Mutex<Option<UpdateObservation>> = std::sy
 fn update_fresh(observed: Option<Instant>, now: Instant) -> bool {
     observed.and_then(|at| now.checked_duration_since(at)).is_some_and(|age| age <= Duration::from_secs(2))
 }
+/// The shared rule (`duduclaw_updated::readiness::compatible_update`, also used
+/// by the installer's composite readiness check) for this gateway's release.
 fn compatible_update(evidence: &duduclaw_updated::readiness::GenerationEvidence) -> bool {
-    let p = &evidence.protocols;
-    evidence.generation.0 != [0; 32]
-        && duduclaw_updated::parse_version(env!("CARGO_PKG_VERSION")).is_ok_and(|v| v == evidence.version)
-        && [p.gateway, p.spawnd, p.trampoline, p.egress, p.updated, p.mcp_bridge, p.parse_worker, p.importer]
-            .into_iter().all(|version| version == 1)
+    duduclaw_updated::readiness::compatible_update(evidence, env!("CARGO_PKG_VERSION"))
 }
 /// Authenticated F observation, usable by boot consumers only while fresh.
 #[cfg(target_os = "linux")]
@@ -277,16 +275,27 @@ pub fn report(home: &std::path::Path, admin: bool) -> Option<Readiness> {
     // action-required only for tools some protected employee is configured with.
     let needs = reasons::installed_tool_needs(home,
         assessment.employees.iter().map(|employee| employee.label.as_str()));
-    Some(with_features(readiness, assessment, reasons::installed_feature_reasons(), needs, admin))
+    // v1.83 R4: migration pending confirmation (action) and the Landlock
+    // clamp (notice only), from sources the gateway verifies itself.
+    let host = reasons::installed_host_reasons(home);
+    Some(with_features(readiness, assessment, reasons::installed_feature_reasons(), needs, host, admin))
 }
 
 /// [`with_assessment`] after splitting the host-wide feature reasons by
 /// `needs`: the concerned ones join the reasons, the rest become notices.
+/// `host` action reasons join the reasons; `host` notices stay notices.
 fn with_features(readiness: Readiness, mut assessment: reasons::Assessment, features: Vec<Reason>,
-    needs: reasons::ToolNeeds, admin: bool) -> Readiness {
-    let (action, notices) = needs.split(features);
+    needs: reasons::ToolNeeds, host: reasons::HostReasons, admin: bool) -> Readiness {
+    let (action, mut notices) = needs.split(features);
     assessment.reasons.extend(action);
+    assessment.reasons.extend(host.action);
+    notices.extend(host.notices);
     let mut readiness = with_assessment(readiness, assessment, admin);
+    // A notice-only reason that reached the assessment is moved, never kept
+    // as action-required (see `with_assessment`).
+    if let Some(moved) = readiness.notices.take() { notices.extend(moved); }
+    notices.sort();
+    notices.dedup();
     readiness.notices = (!notices.is_empty()).then_some(notices);
     readiness
 }
@@ -298,7 +307,10 @@ pub fn report_failed() -> Option<Readiness> {
 }
 
 fn with_assessment(mut readiness: Readiness, assessment: reasons::Assessment, admin: bool) -> Readiness {
-    let mut all = assessment.reasons;
+    // Notice-only reasons never count as action required, whatever path
+    // delivered them; they are reported under `notices`.
+    let (notices, mut all): (std::collections::BTreeSet<Reason>, std::collections::BTreeSet<Reason>) =
+        assessment.reasons.into_iter().partition(Reason::notice_only);
     // spawnd unreachable / receipt unreadable: the host evidence components.
     if readiness.components.launch_service == ComponentState::Unavailable {
         all.insert(Reason::ServiceUnavailable);
@@ -306,7 +318,11 @@ fn with_assessment(mut readiness: Readiness, assessment: reasons::Assessment, ad
     readiness.status = Some(if all.contains(&Reason::ServiceUnavailable) { Overall::ServiceUnavailable }
         else if readiness.ready && all.is_empty() { Overall::Ready } else { Overall::ActionRequired });
     readiness.reasons = Some(all.into_iter().collect());
-    readiness.employees = admin.then_some(assessment.employees);
+    readiness.notices = (!notices.is_empty()).then(|| notices.into_iter().collect());
+    readiness.employees = admin.then_some(assessment.employees.into_iter().map(|mut employee| {
+        employee.reasons.retain(|reason| !reason.notice_only());
+        employee
+    }).collect());
     readiness
 }
 
@@ -470,7 +486,7 @@ mod tests {
     #[test]
     fn w1_helper_reasons_informational_when_no_employee_uses_helper_tools() {
         use duduclaw_isolation::ipc::SpawndFeatures;
-        use reasons::{feature_reasons, Assessment, ToolNeeds};
+        use reasons::{feature_reasons, Assessment, HostReasons, ToolNeeds};
         let features = || feature_reasons(Some(SpawndFeatures::NONE), true, Some(&[] as &[&str]));
         let strings = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
         assert_eq!(features().len(), 5, "broker + launcher + three runtimes");
@@ -480,7 +496,7 @@ mod tests {
         for needs in [ToolNeeds::default(), ToolNeeds::from_lists(&[], &[]),
             ToolNeeds::from_lists(&[], &strings(&["web_search", "send_message"])),
             ToolNeeds::from_lists(&strings(&["file_read", "execute_program"]), &strings(&["file_read", "execute_program"]))] {
-            let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, true);
+            let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, HostReasons::default(), true);
             assert_eq!(readiness.status, Some(Overall::Ready), "{needs:?}");
             assert_eq!(readiness.reasons, Some(vec![]));
             assert_eq!(readiness.notices.as_ref().map(Vec::len), Some(5));
@@ -492,7 +508,7 @@ mod tests {
         // One employee configured with `execute_program`: the broker, the
         // launcher and the program runtime need action; the others stay notices.
         let needs = ToolNeeds::default().union(ToolNeeds::from_lists(&[], &strings(&["execute_program"])));
-        let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, true);
+        let readiness = with_features(base(all_ready()), Assessment::default(), features(), needs, HostReasons::default(), true);
         assert_eq!(readiness.status, Some(Overall::ActionRequired));
         let action = readiness.reasons.unwrap();
         assert!(action.contains(&Reason::WorkspaceBrokerUnavailable));
@@ -509,11 +525,71 @@ mod tests {
         let needs = ToolNeeds::from_lists(&[], &strings(&["browser_record_start"]));
         assert_eq!(needs.split(features()).0, vec![Reason::HelperLauncherUnavailable { reason: "spawnd_feature_missing" }]);
         // Fail closed: an unreadable profile counts as needing everything.
-        let readiness = with_features(base(all_ready()), Assessment::default(), features(), ToolNeeds::ALL, true);
+        let readiness = with_features(base(all_ready()), Assessment::default(), features(), ToolNeeds::ALL, HostReasons::default(), true);
         assert_eq!(readiness.status, Some(Overall::ActionRequired));
         assert!(readiness.notices.is_none());
         // Non-feature reasons are never demoted.
         assert!(ToolNeeds::default().concerns(&Reason::Revoked));
+    }
+
+    /// v1.83 R4: the dashboard report carries both host reasons with their
+    /// severity: a migration waiting for confirmation is action-required, the
+    /// Landlock clamp is only a notice under every tool need and every path.
+    #[test]
+    fn r4_report_carries_migration_pending_action_and_landlock_notice() {
+        use reasons::{host_reasons, Assessment, HostReasons, ToolNeeds};
+        for needs in [ToolNeeds::default(), ToolNeeds::ALL] {
+            let readiness = with_features(base(all_ready()), Assessment::default(), Vec::new(), needs,
+                host_reasons(Some((8, 7)), Ok(true)), true);
+            assert_eq!(readiness.status, Some(Overall::ActionRequired), "{needs:?}");
+            assert_eq!(readiness.reasons, Some(vec![Reason::MigrationPending]));
+            assert_eq!(readiness.notices, Some(vec![Reason::LandlockAbiClamped]));
+            let value = serde_json::to_value(&readiness).unwrap();
+            assert_eq!(value["reasons"], serde_json::json!([{"code": "migration_pending"}]));
+            assert_eq!(value["notices"], serde_json::json!([{"code": "landlock_abi_clamped"}]));
+        }
+        // The clamp alone never makes the host action-required.
+        let readiness = with_features(base(all_ready()), Assessment::default(), Vec::new(), ToolNeeds::ALL,
+            host_reasons(Some((9, 7)), Ok(false)), true);
+        assert_eq!(readiness.status, Some(Overall::Ready));
+        assert_eq!(readiness.reasons, Some(vec![]));
+        assert_eq!(readiness.notices, Some(vec![Reason::LandlockAbiClamped]));
+        // Even if a notice-only reason reached the assessment, it is moved.
+        let assessment = Assessment { reasons: [Reason::LandlockAbiClamped].into(), employees: Vec::new() };
+        let readiness = with_features(base(all_ready()), assessment, Vec::new(), ToolNeeds::ALL,
+            HostReasons::default(), true);
+        assert_eq!(readiness.status, Some(Overall::Ready));
+        assert_eq!(readiness.notices, Some(vec![Reason::LandlockAbiClamped]));
+        // No clamp, no migration: nothing; an unreadable store fails closed.
+        assert_eq!(host_reasons(Some((7, 7)), Ok(false)), HostReasons::default());
+        let readiness = with_features(base(all_ready()), Assessment::default(), Vec::new(), ToolNeeds::default(),
+            host_reasons(None, Err(())), true);
+        assert_eq!(readiness.status, Some(Overall::ServiceUnavailable));
+        assert!(readiness.reasons.unwrap().contains(&Reason::ServiceUnavailable));
+        // No wildcard escalation: the split and `concerns` keep the clamp a notice.
+        assert!(!ToolNeeds::ALL.concerns(&Reason::LandlockAbiClamped));
+        assert!(ToolNeeds::default().concerns(&Reason::MigrationPending));
+        assert_eq!(ToolNeeds::ALL.split(vec![Reason::LandlockAbiClamped]), (vec![], vec![Reason::LandlockAbiClamped]));
+        assert!(Reason::LandlockAbiClamped.notice_only() && !Reason::MigrationPending.notice_only());
+    }
+
+    /// Item 8: the gateway's update admission is the shared updater rule (the
+    /// installer's composite check calls the same function).
+    #[test]
+    fn update_admission_uses_the_shared_compatibility_rule() {
+        use duduclaw_isolation::{ids::Sha256Digest, update::{Product, ProtocolCompatibility}};
+        use duduclaw_updated::readiness::GenerationEvidence;
+        let one = ProtocolCompatibility { gateway: 1, spawnd: 1, trampoline: 1, egress: 1, updated: 1,
+            mcp_bridge: 1, parse_worker: 1, importer: 1 };
+        let good = GenerationEvidence { generation: Sha256Digest([3; 32]), product: Product::Duduclaw,
+            version: duduclaw_updated::parse_version(env!("CARGO_PKG_VERSION")).unwrap(), protocols: one };
+        let mut zero = good.clone(); zero.generation = Sha256Digest([0; 32]);
+        let mut newer = good.clone(); newer.version.patch += 1;
+        let mut protocol = good.clone(); protocol.protocols.parse_worker = 2;
+        for (evidence, expected) in [(good, true), (zero, false), (newer, false), (protocol, false)] {
+            assert_eq!(compatible_update(&evidence), expected);
+            assert_eq!(duduclaw_updated::readiness::compatible_update(&evidence, env!("CARGO_PKG_VERSION")), expected);
+        }
     }
 
     #[test]

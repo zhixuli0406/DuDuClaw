@@ -22,7 +22,13 @@
 //!   `helper_launcher_unavailable{reason}` / `helper_runtime_missing{runtime}`.
 //!   These are action-required only while some protected employee's
 //!   configured tool list names a tool that needs them ([`ToolNeeds`]);
-//!   otherwise `report` lists them as informational `notices`.
+//!   otherwise `report` lists them as informational `notices`;
+//! - v1.83 R4, host-wide ([`host_reasons`]): the migration confirmation
+//!   store's `incomplete()` (what the confirmation page serves as
+//!   `confirmations_incomplete`) ⇒ `migration_pending` (action required);
+//!   spawnd's checked evidence showing an applied Landlock clamp ⇒
+//!   `landlock_abi_clamped`, which is notice-only on every path
+//!   ([`Reason::notice_only`]).
 //!
 //! Fail closed: an unreadable source is `service_unavailable`, never "ready".
 //! The payload holds fixed codes, provider family names from the factory's
@@ -99,9 +105,24 @@ impl Reason {
     /// Administrator text (zh-TW) shared by the installer's readiness summary.
     pub const MIGRATION_PENDING_MESSAGE: &'static str =
         "主機就緒；資料遷移尚待管理員確認，未確認的員工不能執行。";
-    /// The highest Landlock ABI whose rule set this release knows. spawnd
-    /// selects `min(detected, this)` (`duduclaw-spawnd` host evidence).
-    pub const LANDLOCK_HIGHEST_KNOWN_ABI: u32 = 7;
+    /// The highest Landlock ABI whose rule set this release knows: the shared
+    /// contract constant (`duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI`)
+    /// that the trampoline clamps to and spawnd's evidence check compares with.
+    pub const LANDLOCK_HIGHEST_KNOWN_ABI: u32 = duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI;
+
+    /// Informational only: never an admission input and never part of
+    /// `reasons` (action required). [`Reason::LandlockAbiClamped`] is the only
+    /// such reason; every report path routes it to `notices`. Listed
+    /// explicitly, never by a wildcard.
+    pub fn notice_only(&self) -> bool {
+        match self {
+            Reason::LandlockAbiClamped => true,
+            Reason::BindingEvidenceMissing | Reason::ConnectorSetupRequired { .. } | Reason::PersonalBindingConflict
+            | Reason::Revoked | Reason::ServiceUnavailable | Reason::HelperLauncherUnavailable { .. }
+            | Reason::HelperRuntimeMissing { .. } | Reason::WorkspaceBrokerUnavailable
+            | Reason::HelperRecordingUnsupported | Reason::MigrationPending => false,
+        }
+    }
 
     /// Administrator text (zh-TW) for a clamped Landlock ABI, shared by the
     /// installer's readiness output. Numbers only; no host detail.
@@ -193,7 +214,9 @@ impl ToolNeeds {
     fn helpers(&self) -> bool { self.program || self.code_map || self.office }
 
     /// Whether `reason` (a [`feature_reasons`] entry) concerns these tools.
-    /// Non-feature reasons always do.
+    /// Other action reasons always do; a notice-only reason
+    /// ([`Reason::notice_only`]) never does. Every variant is listed, so a new
+    /// reason cannot become action-required through a wildcard.
     pub fn concerns(&self, reason: &Reason) -> bool {
         match reason {
             // The in-run helpers need the same Workspace grant as the file tools.
@@ -204,7 +227,10 @@ impl ToolNeeds {
                 duduclaw_execution::code_map_helper::RUNTIME => self.code_map,
                 _ => self.office,
             },
-            _ => true,
+            Reason::LandlockAbiClamped => false,
+            Reason::BindingEvidenceMissing | Reason::ConnectorSetupRequired { .. } | Reason::PersonalBindingConflict
+            | Reason::Revoked | Reason::ServiceUnavailable | Reason::HelperRecordingUnsupported
+            | Reason::MigrationPending => true,
         }
     }
 
@@ -247,6 +273,65 @@ pub(crate) fn installed_feature_reasons() -> Vec<Reason> {
 /// Protected mode exists only on Linux; elsewhere `report` never runs.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn installed_feature_reasons() -> Vec<Reason> { Vec::new() }
+
+/// v1.83 R4: host-wide reasons the gateway verifies from its own sources.
+/// `action` joins the report's `reasons`; `notices` are informational only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostReasons {
+    pub action: Vec<Reason>,
+    pub notices: Vec<Reason>,
+}
+
+/// v1.83 R4 (plan §4.4 dashboard row). `landlock` = `(detected, selected)`
+/// from a spawnd evidence report whose own `check()` passed (`None` when the
+/// report is missing, stale or invalid: the launch-service component already
+/// reports that). `migration_pending` = the confirmation store's
+/// `incomplete()` (the `confirmations_incomplete` value the migration
+/// confirmation page serves); `Err` = unreadable. Pure; fail closed: an
+/// unreadable store is `service_unavailable`, never "no migration".
+/// [`Reason::MigrationPending`] is action-required (an administrator must
+/// confirm); [`Reason::LandlockAbiClamped`] is only ever a notice.
+pub fn host_reasons(landlock: Option<(u32, u32)>, migration_pending: Result<bool, ()>) -> HostReasons {
+    let mut host = HostReasons::default();
+    match migration_pending {
+        Ok(true) => host.action.push(Reason::MigrationPending),
+        Ok(false) => {}
+        Err(()) => host.action.push(Reason::ServiceUnavailable),
+    }
+    if let Some(notice) = Reason::landlock_notice(landlock) { host.notices.push(notice); }
+    host
+}
+
+/// Same file and bound as the confirmation page's `migration.confirmations.list`
+/// (`migration-confirmations.db` in the gateway home, a regular file of at
+/// most 64 MiB, opened read-only). Absent = no migration on this host.
+/// Blocking (SQLite).
+pub(crate) fn migration_confirmations_pending(home: &Path) -> Result<bool, ()> {
+    let path = home.join("migration-confirmations.db");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 64 * 1024 * 1024 => {
+            duduclaw_migration::confirmation::ConfirmationStore::open_read_only(&path)
+                .and_then(|store| store.incomplete()).map_err(|_| ())
+        }
+        _ => Err(()),
+    }
+}
+
+/// [`host_reasons`] from the live sources: spawnd's published evidence (only
+/// when it passes the same `check()` admission uses) and the confirmation store.
+#[cfg(target_os = "linux")]
+pub(crate) fn installed_host_reasons(home: &Path) -> HostReasons {
+    let landlock = duduclaw_spawnd::host::EvidenceReport::read(nix::unistd::getegid().as_raw()).ok()
+        .filter(|report| report.check().is_ok())
+        .and_then(|report| report.landlock.as_ref().map(|landlock| (landlock.detected_abi, landlock.selected_abi)));
+    host_reasons(landlock, migration_confirmations_pending(home))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn installed_host_reasons(home: &Path) -> HostReasons {
+    host_reasons(None, migration_confirmations_pending(home))
+}
 
 /// Fixed ids reported by `helper_runtime_missing` (office scripts are one
 /// family of `duduclaw-office-<skill>-<script>-v1` runtimes).
@@ -525,5 +610,39 @@ mod hx5_tests {
         // action-required through the W1 split by itself.
         assert!(!feature_reasons(Some(duduclaw_isolation::ipc::SpawndFeatures::NONE), false, None)
             .iter().any(|reason| matches!(reason, Reason::LandlockAbiClamped | Reason::MigrationPending)));
+        assert_eq!(Reason::LANDLOCK_HIGHEST_KNOWN_ABI, duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI);
+    }
+
+    /// v1.83 R4: the producer. Pending confirmations ⇒ `migration_pending`
+    /// (action); an applied clamp ⇒ `landlock_abi_clamped` (notice); an
+    /// unreadable store ⇒ `service_unavailable`, never "no migration".
+    #[test]
+    fn r4_host_reasons_produce_both_codes_with_their_severity() {
+        assert_eq!(host_reasons(Some((8, 7)), Ok(true)),
+            HostReasons { action: vec![Reason::MigrationPending], notices: vec![Reason::LandlockAbiClamped] });
+        assert_eq!(host_reasons(None, Ok(false)), HostReasons::default());
+        assert_eq!(host_reasons(Some((8, 8)), Ok(false)), HostReasons::default(), "an unclamped ABI is not a notice");
+        assert_eq!(host_reasons(None, Err(())).action, vec![Reason::ServiceUnavailable]);
+    }
+
+    /// The live store reader: absent ⇒ no migration; anything that is not a
+    /// readable confirmation store ⇒ unreadable (fail closed).
+    #[test]
+    fn r4_migration_confirmation_store_absent_or_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Ok(false));
+        std::fs::create_dir(home.path().join("migration-confirmations.db")).unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("migration-confirmations.db"), b"not a database").unwrap();
+        assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+        #[cfg(unix)]
+        {
+            let home = tempfile::tempdir().unwrap();
+            let target = home.path().join("real.db");
+            std::fs::write(&target, b"").unwrap();
+            std::os::unix::fs::symlink(&target, home.path().join("migration-confirmations.db")).unwrap();
+            assert_eq!(migration_confirmations_pending(home.path()), Err(()));
+        }
     }
 }

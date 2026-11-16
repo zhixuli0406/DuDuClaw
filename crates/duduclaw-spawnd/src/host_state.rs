@@ -68,7 +68,12 @@ impl RunJournal {
 #[serde(deny_unknown_fields)]
 pub struct LandlockEvidence { pub detected_abi: u32, pub selected_abi: u32 }
 impl LandlockEvidence {
-    fn valid(&self) -> bool { self.detected_abi > 0 && self.selected_abi == self.detected_abi.min(7) }
+    /// The trampoline's clamp: `min(detected, LANDLOCK_HIGHEST_KNOWN_ABI)`, the
+    /// one shared constant (`duduclaw_isolation`).
+    fn valid(&self) -> bool {
+        self.detected_abi > 0
+            && self.selected_abi == self.detected_abi.min(duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI)
+    }
 }
 /// The one protocol feature set (`ipc::SpawndFeatures`, a u32 bitset:
 /// `helper_calls` = bit 0, `work_broker` = bit 1). The readiness report and

@@ -32,6 +32,8 @@ fn all_checks() -> HostChecks {
         process_scan_verified: true, egress_second_layer: EgressSecondLayer::Verified }
 }
 
+fn launcher_receipt() -> LauncherReceipt { LauncherReceipt { sha256: digest(4), size_bytes: 7, mode: 0o755 } }
+
 /// `None` = the source cannot be read.
 struct Fake {
     probe: Option<GenerationEvidence>,
@@ -39,14 +41,20 @@ struct Fake {
     current: Option<Sha256Digest>,
     manifest: Option<ReleaseManifest>,
     broken: Vec<&'static str>,
+    /// The bootstrap receipt of the frozen launcher (`Some(None)` = absent).
+    receipt: Option<Option<LauncherReceipt>>,
+    /// What the installed launcher hashes to.
+    launcher: Sha256Digest,
     evidence: Option<HostEvidence>,
     inactive: Vec<&'static str>,
     egress: Option<EgressView>,
     broker: Option<bool>,
+    /// The broker answers its health request in time.
+    broker_healthy: bool,
     cloud: bool,
     trust: Option<TrustView>,
     now: Option<u64>,
-    migration: Option<Option<MigrationState>>,
+    migration: std::result::Result<Option<MigrationState>, &'static str>,
     team: Option<bool>,
 }
 
@@ -60,22 +68,27 @@ impl Fake {
             current: Some(digest(1)),
             manifest: Some(manifest()),
             broken: Vec::new(),
+            receipt: Some(Some(launcher_receipt())),
+            launcher: digest(4),
             evidence: Some(HostEvidence { verdict_ok: true, checks: all_checks(), landlock: Some((6, 6)) }),
             inactive: Vec::new(),
             egress: Some(EgressView { host_public_addresses_empty: false }),
             broker: Some(false),
+            broker_healthy: true,
             cloud: false,
             trust: Some(TrustView { expires_at_unix: 2000, frozen: false }),
             now: Some(1000),
-            migration: Some(None),
+            migration: Ok(None),
             team: Some(true),
         }
     }
     fn unreadable() -> Self {
-        Self { probe: None, state: None, current: None, manifest: None, broken: Vec::new(), evidence: None,
+        Self { probe: None, state: None, current: None, manifest: None, broken: Vec::new(), receipt: None,
+            launcher: digest(0), evidence: None,
             inactive: vec!["duduclaw-egress.socket", "duduclaw-egress.service", "duduclaw-parse.socket",
                 "duduclaw-dns-broker.socket"],
-            egress: None, broker: None, cloud: true, trust: None, now: None, migration: None, team: None }
+            egress: None, broker: None, broker_healthy: false, cloud: true, trust: None, now: None,
+            migration: Err("migration_state_unreadable"), team: None }
     }
     fn assess(&mut self) -> Vec<Finding> { assess_host(self, VERSION) }
 }
@@ -92,7 +105,14 @@ impl HostSources for Fake {
         unavailable(self.manifest.clone())
     }
     fn component(&mut self, path: &'static str, artifact: &ReleaseArtifact) -> Result<()> {
+        // The frozen launcher is never compared with the generation.
+        assert_ne!(path, UPDATER_LAUNCHER);
         if self.broken.contains(&path) || artifact.sha256 != digest(9) { return Err(refused("mismatch")); }
+        Ok(())
+    }
+    fn launcher_receipt(&mut self) -> Result<Option<LauncherReceipt>> { unavailable(self.receipt) }
+    fn launcher(&mut self, receipt: &LauncherReceipt) -> Result<()> {
+        if receipt.sha256 != self.launcher { return Err(refused("launcher mismatch")); }
         Ok(())
     }
     fn host_evidence(&mut self) -> Result<HostEvidence> { unavailable(self.evidence.clone()) }
@@ -101,10 +121,13 @@ impl HostSources for Fake {
     }
     fn egress_config(&mut self) -> Result<EgressView> { unavailable(self.egress) }
     fn dns_broker_configured(&mut self) -> Result<bool> { unavailable(self.broker) }
+    fn dns_broker_health(&mut self) -> Result<()> {
+        if self.broker_healthy { Ok(()) } else { Err(refused("broker health timed out")) }
+    }
     fn cloud_host(&mut self) -> bool { self.cloud }
     fn trust_root(&mut self) -> Result<TrustView> { unavailable(self.trust) }
     fn now(&mut self) -> Result<u64> { unavailable(self.now) }
-    fn migration_state(&mut self) -> Result<Option<MigrationState>> { unavailable(self.migration) }
+    fn migration_state(&mut self) -> std::result::Result<Option<MigrationState>, &'static str> { self.migration }
     fn edition_is_team(&mut self) -> Result<bool> { unavailable(self.team) }
 }
 
@@ -218,15 +241,44 @@ fn service_protected_readiness_component_paths_map_to_distinct_signed_targets() 
         let name = duduclaw_updated::publication::artifact_name(&target).unwrap();
         let file = Path::new(path).file_name().unwrap().to_str().unwrap();
         match path {
-            "/usr/libexec/duduclaw-updated-launch" => assert_eq!(name, "duduclaw-updated"),
             BINARY => assert_eq!(name, "duduclaw"),
             _ => assert_eq!(name, file, "{path}"),
         }
         targets.push(target);
     }
-    assert_eq!(targets.len(), layout::BINARIES.len() + 1);
+    // Every published executable except the frozen launcher, plus the gateway.
+    assert_eq!(targets.len(), layout::BINARIES.len());
+    assert!(layout::BINARIES.contains(&UPDATER_LAUNCHER));
+    assert!(!component_paths().any(|path| path == UPDATER_LAUNCHER));
+    assert!(component_target(UPDATER_LAUNCHER).is_none());
+    assert!(!targets.contains(&InstallTarget::UpdateSlot));
     assert!(component_target("/usr/lib/duduclaw/duduclaw-spawnd.bak").is_none());
     assert!(component_target("/usr/lib/duduclaw/duduclaw-spawnd/").is_none());
+}
+
+/// Item 5: the frozen launcher is compared with its bootstrap receipt, never
+/// with the current generation. A missing receipt fails closed.
+#[test]
+fn service_protected_readiness_frozen_launcher_matches_its_bootstrap_receipt() {
+    // A legitimate update changes the generation's UpdateSlot artifact; the
+    // launcher still matches its receipt, so nothing fails.
+    let mut fake = Fake::healthy();
+    fake.manifest.as_mut().unwrap().artifacts.push(ReleaseArtifact {
+        id: duduclaw_updated::publication::artifact_name(&InstallTarget::UpdateSlot).unwrap(),
+        sha256: digest(5), size_bytes: 9, mode: 0o700, install_target: InstallTarget::UpdateSlot });
+    assert!(fake.assess().is_empty());
+    // Receipt missing (today's live state until R1/R3 add it), unreadable, mismatched.
+    let mut fake = Fake::healthy(); fake.receipt = Some(None);
+    let findings = fake.assess();
+    assert_eq!(failures(&findings), [(Item::Components, "launcher_receipt_missing")]);
+    assert_eq!(findings[0].message, MSG_LAUNCHER_RECEIPT);
+    assert!(FakeComposite(fake).verify().is_err());
+    let mut fake = Fake::healthy(); fake.receipt = None;
+    assert_eq!(failures(&fake.assess()), [(Item::Components, "launcher_receipt_unreadable")]);
+    let mut fake = Fake::healthy(); fake.launcher = digest(5);
+    assert_eq!(failures(&fake.assess()), [(Item::Components, "launcher_mismatch")]);
+    // The live source has no receipt to read: it reports "missing".
+    assert_eq!(LiveSources::default().launcher_receipt().unwrap(), None);
 }
 
 #[test]
@@ -247,25 +299,51 @@ fn service_protected_readiness_host_evidence_names_each_false_check() {
         (|c| c.startup_reconciled = false, "host_startup_unreconciled"),
         (|c| c.process_scan_verified = false, "host_process_scan_unverified"),
     ];
+    // A false boolean also fails spawnd's combined verdict; both are reported.
     for (flip, code) in cases {
         let mut fake = Fake::healthy();
         let evidence = fake.evidence.as_mut().unwrap();
         flip(&mut evidence.checks);
         evidence.verdict_ok = false;
-        assert_eq!(failures(&fake.assess()), [(Item::HostEvidence, code)]);
+        assert_eq!(failures(&fake.assess()), [(Item::HostEvidence, code), (Item::HostEvidence, "host_evidence_stale")]);
     }
     let messages: Vec<_> = host_checks(&HostChecks::default()).into_iter().map(|(_, _, message)| message).collect();
     assert!(messages.contains(&"員工帳號的 SSH 登入封鎖未通過實測。"));
     let mut fake = Fake::healthy();
     fake.evidence.as_mut().unwrap().checks.protocol = 2;
     fake.evidence.as_mut().unwrap().verdict_ok = false;
-    assert_eq!(failures(&fake.assess()), [(Item::HostEvidence, "host_protocol_mismatch")]);
+    assert_eq!(failures(&fake.assess()),
+        [(Item::HostEvidence, "host_protocol_mismatch"), (Item::HostEvidence, "host_evidence_stale")]);
     // Every boolean true but stale/other-boot evidence: still not ready.
     let mut fake = Fake::healthy(); fake.evidence.as_mut().unwrap().verdict_ok = false;
     assert_eq!(failures(&fake.assess()), [(Item::HostEvidence, "host_evidence_stale")]);
     let mut fake = Fake::healthy(); fake.evidence = None;
     assert_eq!(failures(&fake.assess()),
         [(Item::HostEvidence, "host_evidence_unavailable"), (Item::Landlock, "landlock_unverified")]);
+}
+
+/// Item 7: stale evidence is reported even when another item (Landlock, a
+/// named host check) fails too; HostEvidence is never shown as passed then.
+#[test]
+fn service_protected_readiness_stale_evidence_always_reported() {
+    let mut fake = Fake::healthy();
+    let evidence = fake.evidence.as_mut().unwrap();
+    evidence.verdict_ok = false;
+    evidence.checks.landlock_self_test = false;
+    let findings = fake.assess();
+    assert_eq!(failures(&findings), [(Item::Landlock, "landlock_self_test_failed"), (Item::HostEvidence, "host_evidence_stale")]);
+    let (lines, failed, _) = render(&findings);
+    assert_eq!(failed, 2);
+    assert!(lines.contains(&format!("[未通過] {}", Item::HostEvidence.label())), "{lines:?}");
+    assert!(!lines.contains(&format!("[通過] {}", Item::HostEvidence.label())), "{lines:?}");
+    // With a named host failure the stale verdict is still its own finding.
+    let mut fake = Fake::healthy();
+    let evidence = fake.evidence.as_mut().unwrap();
+    evidence.verdict_ok = false;
+    evidence.checks.storage_verified = false;
+    evidence.landlock = Some((9, 9));
+    assert_eq!(failures(&fake.assess()), [(Item::HostEvidence, "host_storage_unverified"),
+        (Item::Landlock, "landlock_self_test_failed"), (Item::HostEvidence, "host_evidence_stale")]);
 }
 
 #[test]
@@ -291,7 +369,8 @@ fn service_protected_readiness_landlock_clamp_is_a_notice_and_refusals_are_expli
         evidence.checks.landlock_self_test = self_test;
         evidence.verdict_ok = false;
         let findings = fake.assess();
-        assert_eq!(failures(&findings), [(Item::Landlock, "landlock_self_test_failed")], "{landlock:?} {self_test}");
+        assert_eq!(failures(&findings), [(Item::Landlock, "landlock_self_test_failed"),
+            (Item::HostEvidence, "host_evidence_stale")], "{landlock:?} {self_test}");
         assert!(codes(&findings, Severity::Notice).is_empty());
         assert!(findings[0].message.contains("Ubuntu 24.04 HWE"));
     }
@@ -313,8 +392,18 @@ fn service_protected_readiness_egress_dns_and_informational_notices() {
     assert_eq!(failures(&fake.assess()), [(Item::EgressDns, "dns_broker_inactive")]);
     let mut fake = Fake::healthy(); fake.broker = None;
     assert_eq!(failures(&fake.assess()), [(Item::EgressDns, "dns_broker_config_invalid")]);
-    // The resolved route does not need the broker socket.
-    let mut fake = Fake::healthy(); fake.inactive = vec!["duduclaw-dns-broker.socket"];
+    // Item 2: an active socket is not enough; the broker must answer its
+    // health request in time (timeout or no answer ⇒ unhealthy).
+    let mut fake = Fake::healthy(); fake.broker = Some(true); fake.broker_healthy = false;
+    let findings = fake.assess();
+    assert_eq!(failures(&findings), [(Item::EgressDns, "dns_broker_unhealthy")]);
+    assert_eq!(findings[0].message, MSG_DNS_BROKER_UNHEALTHY);
+    let mut fake = Fake::healthy(); fake.broker = Some(true); fake.broker_healthy = false;
+    fake.inactive = vec!["duduclaw-dns-broker.socket"];
+    assert_eq!(failures(&fake.assess()),
+        [(Item::EgressDns, "dns_broker_inactive"), (Item::EgressDns, "dns_broker_unhealthy")]);
+    // The resolved route does not need the broker socket nor probes it.
+    let mut fake = Fake::healthy(); fake.inactive = vec!["duduclaw-dns-broker.socket"]; fake.broker_healthy = false;
     assert!(fake.assess().is_empty());
     // Notices: second layer, cloud without configured public addresses.
     let mut fake = Fake::healthy();
@@ -340,6 +429,23 @@ fn service_protected_readiness_egress_dns_and_informational_notices() {
     assert!(FakeComposite(fake).verify().is_err());
 }
 
+/// Item 2: the broker config is validated by the broker's own type and
+/// validator; values the real broker refuses at start are refused here too.
+#[test]
+fn service_protected_readiness_broker_config_uses_the_brokers_validator() {
+    use duduclaw_egress::daemon::BrokerConfig;
+    for refused_value in ["224.0.0.1:53", "8.8.8.8:5353", "0.0.0.0:53", "[::]:53", "[ff02::fb]:53", "255.255.255.255:53"] {
+        let config: BrokerConfig = serde_json::from_str(&format!(r#"{{"upstream":"{refused_value}"}}"#)).unwrap();
+        assert!(config.validate().is_err(), "{refused_value}");
+    }
+    let config: BrokerConfig = serde_json::from_str(r#"{"upstream":"9.9.9.9:53"}"#).unwrap();
+    assert!(config.validate().is_ok());
+    assert!(serde_json::from_str::<BrokerConfig>(r#"{"upstream":"9.9.9.9:53","port":53}"#).is_err());
+    // No private copy of the config type is left in this module.
+    let source = include_str!("protected_linux_readiness.rs");
+    assert!(!source.contains(concat!("struct ", "BrokerConfigView")));
+}
+
 #[test]
 fn service_protected_readiness_parse_worker_socket_required() {
     let mut fake = Fake::healthy(); fake.inactive = vec!["duduclaw-parse.socket"];
@@ -361,31 +467,53 @@ fn service_protected_readiness_trust_root_expiry_frozen_unreadable() {
     assert!(failures(&findings).is_empty());
 }
 
+/// Item 1: only a verified `AwaitingAdministrator` (the source guarantees no
+/// pending intent and every stage receipt) is pending; `ContentImported`
+/// blocks until `Complete`'s final readback; every source error blocks with
+/// its own code.
 #[test]
 fn service_protected_readiness_migration_pending_changes_summary_only() {
     use MigrationState as S;
-    for state in [S::AwaitingAdministrator, S::ContentImported] {
-        let mut fake = Fake::healthy(); fake.migration = Some(Some(state));
-        let findings = fake.assess();
-        assert!(failures(&findings).is_empty(), "{state:?}");
-        assert_eq!(codes(&findings, Severity::Pending), [Reason::MIGRATION_PENDING_CODE]);
-        let (lines, failed, pending) = render(&findings);
-        assert_eq!((failed, pending), (0, true));
-        assert!(lines.contains(&"[待確認] 資料遷移".to_owned()), "{lines:?}");
-        assert!(FakeComposite(fake).verify().is_ok());
-    }
+    let mut fake = Fake::healthy(); fake.migration = Ok(Some(S::AwaitingAdministrator));
+    let findings = fake.assess();
+    assert!(failures(&findings).is_empty());
+    assert_eq!(codes(&findings, Severity::Pending), [Reason::MIGRATION_PENDING_CODE]);
+    let (lines, failed, pending) = render(&findings);
+    assert_eq!((failed, pending), (0, true));
+    assert!(lines.contains(&"[待確認] 資料遷移".to_owned()), "{lines:?}");
+    assert!(FakeComposite(fake).verify().is_ok());
     for state in [None, Some(S::Complete)] {
-        let mut fake = Fake::healthy(); fake.migration = Some(state);
+        let mut fake = Fake::healthy(); fake.migration = Ok(state);
         assert!(fake.assess().is_empty());
     }
+    // Content imported, final completion readback not yet passed: not ready.
+    let mut fake = Fake::healthy(); fake.migration = Ok(Some(S::ContentImported));
+    let findings = fake.assess();
+    assert_eq!(failures(&findings), [(Item::Migration, "migration_completion_unverified")]);
+    assert!(codes(&findings, Severity::Pending).is_empty());
+    assert!(FakeComposite(fake).verify().is_err());
     // Before the new platform was verified for the migration: not ready.
     for state in [S::Planned, S::OldEnvironmentStopped, S::LegacyQuarantined, S::KeysRotated,
         S::TokenRevocationRecorded, S::EmployeeProposalsStaged, S::ContentArchived, S::ConfirmationReady,
         S::IsolationVerified] {
-        let mut fake = Fake::healthy(); fake.migration = Some(Some(state));
+        let mut fake = Fake::healthy(); fake.migration = Ok(Some(state));
         assert_eq!(failures(&fake.assess()), [(Item::Migration, "migration_incomplete")], "{state:?}");
     }
-    let mut fake = Fake::healthy(); fake.migration = None;
+    // Every verifier error blocks with its own code (never pending, never "no migration").
+    use duduclaw_migration::root_host::readiness::ReadinessError as E;
+    for error in [E::Unavailable, E::StateDirUnsafe, E::PlanMissing, E::PlanInvalid, E::JournalMissing,
+        E::JournalUnsafe, E::JournalOversized, E::JournalSidecar, E::JournalChanged, E::JournalSchema,
+        E::JournalUnreadable, E::JournalConflict, E::IntentPending, E::ReceiptsInvalid] {
+        let mut fake = Fake::healthy(); fake.migration = Err(error.code());
+        let findings = fake.assess();
+        assert_eq!(failures(&findings), [(Item::Migration, error.code())], "{error:?}");
+        assert!(codes(&findings, Severity::Pending).is_empty());
+        assert!(!findings[0].message.contains('/'));
+    }
+    assert_eq!(migration_error("migration_plan_missing").1, MSG_MIGRATION_PLAN_MISSING);
+    assert_eq!(migration_error("migration_intent_pending").1, MSG_MIGRATION_IN_PROGRESS);
+    // An unknown code collapses to the generic one.
+    let mut fake = Fake::healthy(); fake.migration = Err("something_else");
     assert_eq!(failures(&fake.assess()), [(Item::Migration, "migration_state_unreadable")]);
     assert_eq!(Reason::MIGRATION_PENDING_MESSAGE, "主機就緒；資料遷移尚待管理員確認，未確認的員工不能執行。");
 }
@@ -398,6 +526,52 @@ fn service_protected_readiness_edition_requires_team() {
     assert_eq!(findings[0].message, "此版本不支援員工隔離。");
     let mut fake = Fake::healthy(); fake.team = None;
     assert_eq!(failures(&fake.assess()), [(Item::Edition, "edition_unverified")]);
+}
+
+fn license(tier: &str) -> duduclaw_license::License {
+    serde_json::from_value(serde_json::json!({ "version": 1, "subscription_id": "s", "customer_id": "c", "tier": tier,
+        "machine_fingerprint": "m", "issued_at": "2026-01-01T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z",
+        "last_phone_home": "2026-01-01T00:00:00Z", "public_key_id": "k", "signature": "" })).unwrap()
+}
+
+/// Item 4a: the tier rule always uses self-host rules on a protected Linux
+/// install; the deployment type is never read from this process's
+/// environment, so a cloud-only tier is refused however root's shell is set.
+#[test]
+fn service_protected_readiness_edition_uses_self_host_rules_regardless_of_environment() {
+    assert!(PROTECTED_LINUX_SELF_HOST);
+    // Cloud-only tiers would pass the cloud rules; they never pass here.
+    for tier in ["business", "studio", "solo", "hobby"] {
+        assert!(!license_admits_isolation(&license(tier)), "{tier}");
+    }
+    // Self-host TEAM tiers pass (they would fail the cloud rules).
+    for tier in ["self_host_pro", "oem", "partner"] {
+        assert!(license(tier).validate_tier_deployment_binding(false).is_err(), "{tier} is self-host only");
+        assert!(license_admits_isolation(&license(tier)), "{tier}");
+    }
+    // Personal profiles never pass.
+    for tier in ["personal_pro_self_host", "open_source"] {
+        assert!(!license_admits_isolation(&license(tier)), "{tier}");
+    }
+    // The module never consults the deployment environment helper.
+    let source = include_str!("protected_linux_readiness.rs");
+    assert!(!source.contains(concat!("is_self_host_", "deployment")));
+    assert!(!source.contains(concat!("DUDUCLAW_", "DEPLOYMENT")));
+}
+
+/// Item 8: the composite check and the gateway call the same updater rule.
+#[test]
+fn service_protected_readiness_update_rule_is_the_shared_function() {
+    let evidence = GenerationEvidence { generation: digest(1), product: Product::Duduclaw, version: version(),
+        protocols: protocols(1) };
+    let mut zero = evidence.clone(); zero.generation = digest(0);
+    let mut protocol = evidence.clone(); protocol.protocols.egress = 2;
+    for (evidence, expected) in [(evidence, true), (zero, false), (protocol, false)] {
+        assert_eq!(compatible_update(&evidence, VERSION), expected);
+        assert_eq!(duduclaw_updated::readiness::compatible_update(&evidence, VERSION), expected);
+    }
+    let source = include_str!("protected_linux_readiness.rs");
+    assert!(source.contains("duduclaw_updated::readiness::compatible_update(evidence, installed_version)"));
 }
 
 #[test]
