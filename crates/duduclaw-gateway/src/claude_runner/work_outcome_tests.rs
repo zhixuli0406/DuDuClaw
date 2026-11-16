@@ -105,3 +105,14 @@ async fn background_idle_stops_pending_tool_and_keepalive_does_not_reset_it() {
     assert_eq!(crate::work_outcome::WorkOutcome::decode(&error), Some(crate::work_outcome::WorkOutcome::TimeoutNoProgress {
         seconds:120, tool:Some("Bash".into()), partial:String::new() }));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_result_survives_a_hung_process() {
+    let mut cmd = tokio::process::Command::new("/bin/sh");
+    cmd.args(["-c", r#"printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"完成","usage":{"input_tokens":2,"output_tokens":3}}'; exec /bin/sleep 300"#]);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10),
+        call_claude_streaming(&mut cmd, None, None, 300, 1, 7)).await
+        .expect("terminal cleanup must be bounded").expect("terminal result must survive cleanup");
+    assert_eq!(response.text, "完成");
+}

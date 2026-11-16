@@ -187,6 +187,15 @@ mod rotation_tests {
         assert_eq!(seen, vec!["tok_capped", "tok_spare"]);
     }
 
+    #[tokio::test]
+    async fn provider_timeouts_rotate_to_the_spare() {
+        for error in ["connection timed out", "CLI pipe hard timeout", "MCP process wait timed out"] {
+            let (result, seen) = run_equal_priority_pair(error).await;
+            assert_eq!(result.as_deref(), Ok("hello from spare"));
+            assert_eq!(seen, vec!["tok_capped", "tok_spare"]);
+        }
+    }
+
     /// Scenario: summarized-failure retry (arXiv:2605.08563).
     ///
     /// First attempt hits a model-behavior failure (hard timeout); the retry

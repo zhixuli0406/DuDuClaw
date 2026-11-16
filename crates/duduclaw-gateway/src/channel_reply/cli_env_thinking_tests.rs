@@ -176,6 +176,16 @@ fn child(home: std::path::PathBuf) {
             assert_eq!(outcome, crate::work_outcome::WorkOutcome::MaxTurns { limit: 50, partial: "已完成第一份報表".into() });
         }
 
+        // A canonical result must survive a process that never exits.
+        // A valid idle policy must not delay returning a completed answer.
+        std::fs::write(home.join("config.toml"), "[runtime]\ndefault_idle_timeout_secs=60\n").unwrap();
+        std::fs::write(home.join("stream.jsonl"),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"完成"}
+"#).unwrap();
+        std::fs::write(home.join("hang-after-result"), "").unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), spawn(&home)).await
+            .expect("terminal cleanup must be bounded").expect("terminal result survives cleanup");
+        assert_eq!(answer, "完成");
     });
 }
 
@@ -196,7 +206,8 @@ fn l1_stub_claude_thinking_flows_by_policy() {
          n=0\nif [ -f '{h}/count' ]; then n=$(/bin/cat '{h}/count'); fi\nn=$((n+1))\n\
          printf '%s' \"$n\" > '{h}/count'\n\
          for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{h}/argv-'\"$n\"\n\
-         /bin/cat '{h}/stream.jsonl'\n",
+         /bin/cat '{h}/stream.jsonl'\n\
+         if [ -f '{h}/hang-after-result' ]; then exec /bin/sleep 300; fi\n",
         h = home.display()
     );
     crate::test_exec::write_executable(&bin.join("claude"), script, 0o755);
@@ -238,5 +249,5 @@ fn l1_stub_claude_thinking_flows_by_policy() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(std::fs::read_to_string(home.join("count")).unwrap(), "5");
+    assert_eq!(std::fs::read_to_string(home.join("count")).unwrap(), "6");
 }

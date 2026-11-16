@@ -44,6 +44,19 @@ fn render_backend_error(required: bool, error: std::io::Error, operation: &str) 
     }
 }
 
+/// A canonical result owns success; process cleanup must not replace it with
+/// an idle/exit error. The total deadline still bounds the cleanup grace.
+pub(crate) async fn finish_terminal(
+    child: &mut BackendChild, total_deadline: tokio::time::Instant,
+) -> Option<std::process::ExitStatus> {
+    let deadline = total_deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+    match tokio::time::timeout_at(deadline, child.child().wait()).await {
+        Ok(Ok(status)) if status.success() => { child.disarm(); Some(status) }
+        Ok(Ok(status)) => { child.kill_and_reap().await; Some(status) }
+        _ => { child.kill_and_reap().await; None }
+    }
+}
+
 #[derive(Debug)]
 pub enum OutputError {
     Timeout,

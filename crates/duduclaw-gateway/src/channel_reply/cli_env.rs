@@ -596,12 +596,14 @@ pub(super) async fn spawn_claude_cli_with_env(
     keepalive.reset(); // don't fire immediately
 
     // Hard max timeout — absolute safety net
+    let mut terminal_received = false;
     let mut idle = crate::work_outcome::IdleWatch::new(crate::runtime_config::idle_timeout_secs(home_dir, work_dir));
     let hard_max_timeout_secs = crate::runtime_config::claude_timeout_secs(home_dir, work_dir);
     let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(hard_max_timeout_secs));
     tokio::pin!(hard_deadline);
 
     loop {
+        if terminal_received { break; }
         tokio::select! {
             // Priority 1: read stream-json events from CLI stdout
             line_result = reader.next_line() => {
@@ -809,6 +811,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                                         child.kill_and_reap().await;
                                         return Err(error);
                                     }
+                                    terminal_received = true;
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                         // Only overwrite with the result event's text if it's
                                         // non-empty. When Claude uses tools, the final `result`
@@ -1051,8 +1054,14 @@ pub(super) async fn spawn_claude_cli_with_env(
 
     // Wait for process to exit
     #[cfg(target_os = "linux")]
-    if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
-    let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
+    if !terminal_received {
+        if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
+    }
+    let status = if terminal_received {
+        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline()).await
+    } else {
+        Some(child.child().wait().await.map_err(|e| format!("wait error: {e}"))?)
+    };
     child.disarm();
 
     // Snapshot stderr tail for error diagnostics.
@@ -1074,7 +1083,7 @@ pub(super) async fn spawn_claude_cli_with_env(
          result_events={result_events} \
          result_subtype={:?} stop_reason={:?} \
          last_line={:?} stderr_tail={:?}",
-        status.code().unwrap_or(-1),
+        status.as_ref().and_then(|s| s.code()).unwrap_or(-1),
         last_result_subtype,
         last_stop_reason,
         last_raw_line,
@@ -1087,10 +1096,10 @@ pub(super) async fn spawn_claude_cli_with_env(
     // a real result event with `is_error: true` and exit code 1. The
     // stream-json error check above should have caught those before we
     // reach here, but the exit-code gate is a defensive backstop.
-    if !status.success() {
+    if !terminal_received && !status.as_ref().is_some_and(|s| s.success()) {
         return Err(format!(
             "claude CLI exit {} ({diag})",
-            status.code().unwrap_or(-1)
+            status.as_ref().and_then(|s| s.code()).unwrap_or(-1)
         ));
     }
 

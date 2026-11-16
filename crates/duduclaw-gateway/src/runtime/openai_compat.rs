@@ -1065,7 +1065,7 @@ impl OpenAiCompatRuntime {
         let mut done = false;
 
         let mut idle = crate::work_outcome::IdleWatch::new(crate::runtime_config::idle_timeout_secs(&context.home_dir, context.agent_dir.as_deref()));
-        loop {
+        while !done {
             let next = tokio::select! {
                 next = stream.next() => next,
                 _ = idle.expired() => return Err(idle.outcome(content.clone()).encode()),
@@ -1093,7 +1093,7 @@ impl OpenAiCompatRuntime {
                         break;
                     }
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        idle.observe(&chunk);
+                        idle.observe_openai(&chunk);
                         reasoning.observe(&chunk);
                         if let Some(delta) = chunk
                             .pointer("/choices/0/delta/content")
@@ -1123,7 +1123,7 @@ impl OpenAiCompatRuntime {
             if let Some(json_str) = line.strip_prefix("data: ") {
                 if json_str != "[DONE]" {
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        idle.observe(&chunk);
+                        idle.observe_openai(&chunk);
                         reasoning.observe(&chunk);
                         if let Some(delta) = chunk
                             .pointer("/choices/0/delta/content")

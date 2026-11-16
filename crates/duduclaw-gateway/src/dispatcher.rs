@@ -22,7 +22,16 @@ use duduclaw_core::{
 };
 
 tokio::task_local! {
-    static DISPATCH_FAILURE_REFERENCE: (String, Option<String>);
+    static DISPATCH_FAILURE_REFERENCE: DispatchFailureDelivery;
+}
+
+/// Delivery diagnostics are separate from model-authored history.
+#[derive(Clone)]
+struct DispatchFailureDelivery {
+    reference: String,
+    language: Option<String>,
+    partial: String,
+    reason: crate::channel_reply::TurnFailureReason,
 }
 
 /// Message envelope stored in `bus_queue.jsonl`.
@@ -924,7 +933,13 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                 let reference = crate::work_outcome::WorkOutcome::reference(&host_text).unwrap_or_else(|| msg.id.clone());
                 let fallback_text = format!("{}\n{}", dispatch_failure_reply(&e),
                     crate::channel_reply::failure_notice::notice_suffix(language.as_deref(), Some(code), &reference));
-                DISPATCH_FAILURE_REFERENCE.scope((reference, language),
+                let partial = crate::work_outcome::WorkOutcome::decode(&host_text)
+                    .map(|outcome| outcome.partial().to_owned()).unwrap_or_default();
+                let reason = match &e {
+                    DispatchError::Other(error) => crate::channel_reply::classify_cli_failure(error).into(),
+                    _ => crate::channel_reply::TurnFailureReason::Unknown,
+                };
+                DISPATCH_FAILURE_REFERENCE.scope(DispatchFailureDelivery { reference, language, partial, reason },
                     forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target)).await;
             }
         }
@@ -3162,12 +3177,12 @@ pub(crate) async fn forward_delegation_response(
     };
 
     // Apply the public-visitor boundary after resolving the actual callback.
-    let visitor_notice = DISPATCH_FAILURE_REFERENCE.try_with(|(reference, language)| {
+    let visitor_notice = DISPATCH_FAILURE_REFERENCE.try_with(|failure| {
         let sid = format!("{channel_type}:{channel_id}");
         (crate::channel_reply::assembly::public_session(&sid)
             || (channel_type == "webchat" && crate::webchat::is_widget_visitor(&channel_id)))
             .then(|| format!("{}\n{}", crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE,
-                crate::channel_reply::failure_notice::notice_suffix(language.as_deref(), None, reference)))
+                crate::channel_reply::failure_notice::notice_suffix(failure.language.as_deref(), None, &failure.reference)))
     }).ok().flatten();
     let response_text = visitor_notice.as_deref().unwrap_or(response_text);
 
@@ -3459,7 +3474,9 @@ async fn append_subagent_reply_to_parent_session_with(
     // Two variants of the content — direct vs relayed. The reply body is
     // redacted per owning agent inside the closure (the owner is only known
     // once the session row is read), so only the owned strings move in.
-    let response_owned = response_text.to_string();
+    let failure = DISPATCH_FAILURE_REFERENCE.try_with(Clone::clone).ok();
+    let response_owned = failure.as_ref().map(|f| f.partial.clone()).unwrap_or_else(|| response_text.to_string());
+    let failure_only = failure.is_some() && response_owned.trim().is_empty();
     let responder_owned = responder_agent.to_string();
 
     let parent = parent_agent_id.to_string();
@@ -3518,6 +3535,10 @@ async fn append_subagent_reply_to_parent_session_with(
                 continue;
             };
 
+            // A delivery notice is never an ordinary assistant turn, including
+            // public visitor wording and references. Empty partials add no row.
+            if failure_only { return Ok(Some((sid.clone(), is_relayed))); }
+
             let content = subagent_reply_turn_content(
                 redaction.as_ref(),
                 &owner,
@@ -3557,6 +3578,18 @@ async fn append_subagent_reply_to_parent_session_with(
 
     match result {
         Ok(Ok(Some((sid, is_relayed)))) => {
+            if let Some(failure) = failure {
+                match crate::session::SessionManager::new(&home_dir.join("sessions.db")) {
+                    Ok(manager) => {
+                        if let Err(error) = manager.record_turn_failure(&sid, &failure.reference,
+                            failure.reason, failure.language.as_deref(), None).await {
+                            warn!(%error, "Delegation failure notice persistence failed");
+                        }
+                    }
+                    Err(error) => warn!(%error, "Delegation failure session store unavailable"),
+                }
+            }
+
             info!(
                 parent = %parent_agent_id,
                 responder = %responder_for_log,
@@ -5124,6 +5157,43 @@ mod tests {
             .await
             .unwrap();
         (tmp, home)
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_history_keeps_only_model_partial() {
+        for (channel, chat) in [("telegram", "42"), ("odoolivechat", "site:42"), ("webchat", "widget-visitor:42")] {
+            for partial in ["", "模型完成的部分"] {
+                let sid = format!("{channel}:{chat}");
+                let (_tmp, home) = setup_parent_session(&sid, "agnes").await;
+                let failure = DispatchFailureDelivery {
+                    reference: "failure-ref".into(), language: Some("zh-TW".into()), partial: partial.into(),
+                    reason: crate::channel_reply::TurnFailureReason::TimeoutNoProgress,
+                };
+                DISPATCH_FAILURE_REFERENCE.scope(failure,
+                    append_subagent_reply_to_parent_session(&home, channel, chat, None, "agnes", None,
+                        "worker", "platform notice and failure-ref")).await;
+                let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+                let messages = sm.get_messages(&sid).await.unwrap();
+                let assistants: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
+                assert_eq!(assistants.len(), usize::from(!partial.is_empty()));
+                if let Some(message) = assistants.first() {
+                    assert!(message.content.contains(partial));
+                    assert!(!message.content.contains("failure-ref"));
+                    assert!(!message.content.contains("platform notice"));
+                }
+                let conn = rusqlite::Connection::open(home.join("sessions.db")).unwrap();
+                let visible_notices: i64 = conn.query_row(
+                    "SELECT count(*) FROM session_messages WHERE role='assistant' AND hidden=0 AND content LIKE '%failure-ref%'",
+                    [], |r| r.get(0)).unwrap();
+                assert_eq!(visible_notices, 0);
+                if channel == "telegram" {
+                    let hidden: i64 = conn.query_row(
+                        "SELECT count(*) FROM session_messages WHERE hidden=1 AND notice_kind='turn_failure'",
+                        [], |r| r.get(0)).unwrap();
+                    assert_eq!(hidden, 1);
+                }
+            }
+        }
     }
 
     #[tokio::test]

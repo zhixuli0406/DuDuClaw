@@ -4043,12 +4043,14 @@ async fn call_claude_streaming(
     ));
     keepalive.reset();
 
+    let mut terminal_received = false;
     let mut idle = crate::work_outcome::IdleWatch::new(idle_timeout_secs);
     // Hard max timeout — absolute safety net
     let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(hard_max_timeout_secs));
     tokio::pin!(hard_deadline);
 
     loop {
+        if terminal_received { break; }
         tokio::select! {
             line_result = reader.next_line() => {
                 match line_result {
@@ -4082,6 +4084,7 @@ async fn call_claude_streaming(
                                         child.kill_and_reap().await;
                                         return Err(error);
                                     }
+                                    terminal_received = true;
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                         if !text.is_empty() {
                                             result_text = text.to_string();
@@ -4209,18 +4212,24 @@ async fn call_claude_streaming(
 
     thinking.finish();
     #[cfg(target_os = "linux")]
-    if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
-    let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
+    if !terminal_received {
+        if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
+    }
+    let status = if terminal_received {
+        crate::process_group::finish_terminal(&mut child, hard_deadline.deadline()).await
+    } else {
+        Some(child.child().wait().await.map_err(|e| format!("wait error: {e}"))?)
+    };
     // Preserve successful completion semantics; cancellation before this point
     // drops the managed owner and terminates all descendants.
     child.disarm();
     // Any non-zero exit is now a hard failure. Previously we only errored
     // when result_text was empty, which would surface CLI error text as
     // the "reply" whenever the stream-json layer accidentally wrote it.
-    if !status.success() {
+    if !terminal_received && !status.as_ref().is_some_and(|s| s.success()) {
         return Err(format!(
             "claude CLI exit {} (stream tail: {:?})",
-            status.code().unwrap_or(-1),
+            status.as_ref().and_then(|s| s.code()).unwrap_or(-1),
             result_text.chars().take(120).collect::<String>()
         ));
     }

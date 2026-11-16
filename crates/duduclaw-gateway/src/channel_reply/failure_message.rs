@@ -162,9 +162,10 @@ pub(crate) fn auth_failure_kind_for(
 /// is synthesized from the failure class, never from raw stderr (which could
 /// carry prompt-injection payloads).
 pub(crate) fn retry_hint_for(err: &str) -> Option<String> {
+    if crate::work_outcome::is_work_result(err) { return None; }
     match classify_cli_failure(err) {
-        FailureReason::MaxTurns | FailureReason::TimeoutTotal | FailureReason::TimeoutNoProgress => None,
-        FailureReason::Timeout => Some(
+        FailureReason::MaxTurns | FailureReason::TimeoutNoProgress => None,
+        FailureReason::Timeout | FailureReason::TimeoutTotal => Some(
             "A previous attempt at this exact request timed out before completing. \
              Do not repeat the same approach: answer more directly, keep tool use \
              to a minimum, and prefer a shorter response."

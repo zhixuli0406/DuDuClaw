@@ -469,7 +469,7 @@ describe('permission switches show what the gateway applies (RM-137)', () => {
 });
 
 it('writes only a dirty idle timeout including explicit disable and clear', () => {
-  for (idle_timeout_secs of [60, 0, null]) {
+  for (const idle_timeout_secs of [60, 0, null] as const) {
     const r = buildUpdatePayload(state({ runtime: { ...DEFAULT_RUNTIME, idle_timeout_secs } }), new Set(['runtime.idle_timeout_secs']), CTX);
     expect(r.payload).toEqual({ runtime: { idle_timeout_secs } });
   }

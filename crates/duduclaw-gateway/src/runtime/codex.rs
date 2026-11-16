@@ -1108,6 +1108,7 @@ tokio::task_local! { static CODEX_IDLE_TIMEOUT: u64; }
 #[derive(Default)]
 struct CodexOutput {
     idle: Option<crate::work_outcome::IdleWatch>,
+    terminal_at: Option<tokio::time::Instant>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     line: Vec<u8>,
@@ -1154,6 +1155,9 @@ impl CodexOutput {
         // retention cap. In particular, final usage must not disappear merely
         // because earlier tool output consumed the raw-log budget.
         if let Ok(event) = serde_json::from_str::<CodexEvent>(&line) {
+            if event.event_type == "turn.completed" && self.terminal_at.is_none() {
+                self.terminal_at = Some(tokio::time::Instant::now());
+            }
             if let Some(idle) = self.idle.as_mut() {
                 if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line) { idle.observe_codex(&raw); }
             }
@@ -1282,7 +1286,13 @@ async fn collect_codex_output_with_input(
     let mut status = None;
     let result = tokio::time::timeout(timeout, async {
         while !writer_done || !stdout_done || !stderr_done || status.is_none() {
+            let terminal_at = output.terminal_at;
             tokio::select! {
+                _ = async {
+                    if let Some(at) = terminal_at {
+                        tokio::time::sleep_until(at + std::time::Duration::from_secs(5)).await;
+                    } else { std::future::pending::<()>().await; }
+                } => { break; }
                 _ = output.idle.as_ref().expect("collector idle clock").expired() => { idle_stopped = true; break; }
                 written = &mut writer, if !writer_done => {
                     written?;
@@ -1323,7 +1333,9 @@ async fn collect_codex_output_with_input(
         }
         Ok(Err(error)) => {
             managed.kill_and_reap().await;
-            return Err(format!("Failed to read codex output: {error}"));
+            if output.terminal_at.is_none() {
+                return Err(format!("Failed to read codex output: {error}"));
+            }
         }
         Err(_) => { managed.kill_and_reap().await; }
     }
@@ -1847,7 +1859,7 @@ async fn execute_codex_command_with_input(
     )).await?;
 
     if let Some(status) = output.status {
-        if !status.success() {
+        if output.terminal_at.is_none() && !status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
                 "Codex CLI exited with {}: {}",
@@ -1859,8 +1871,8 @@ async fn execute_codex_command_with_input(
 
     // Parse JSONL output
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let response = RuntimeResponse {
-        partial_timeout_secs: output.status.is_none().then_some(timeout_secs),
+    let mut response = RuntimeResponse {
+        partial_timeout_secs: (output.status.is_none() && output.terminal_at.is_none()).then_some(timeout_secs),
         content: output.content.clone(),
         input_tokens: output.input_tokens,
         output_tokens: output.output_tokens,
@@ -1878,7 +1890,7 @@ async fn execute_codex_command_with_input(
 
     // Parse usage, native events and thinking above on both paths, even
     // when the deadline left no completed assistant message.
-    if output.status.is_none() {
+    if output.status.is_none() && output.terminal_at.is_none() {
         crate::runtime_dispatch::record_discarded_runtime_usage(context, &response).await;
         return Err(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: timeout_secs,
             partial: output.completed.last().cloned().unwrap_or_default() }.encode());
@@ -2187,6 +2199,30 @@ mod tests {
         ]).arg(&cwd).current_dir(&cwd);
         assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_result_survives_hung_codex_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let context = utility_context(home.path());
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", r#"printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"完成"}}' '{"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":3}}'; exec /bin/sleep 300"#]);
+        let output = CODEX_IDLE_TIMEOUT.scope(1,
+            tokio::time::timeout(std::time::Duration::from_secs(10),
+                collect_codex_output(&mut cmd, std::time::Duration::from_secs(300))))
+            .await.expect("terminal cleanup must be bounded").expect("completed result");
+        assert!(output.terminal_at.is_some());
+        assert_eq!(output.content, "完成");
+        assert_eq!(output.output_tokens, 3);
+        // The production response path must also accept a completed turn
+        // whose cleanup needed to kill the still-running process.
+        let output = std::sync::Mutex::new(Some(output));
+        let probe: CollectProbe = Box::new(move |_| Ok(output.lock().unwrap().take().unwrap()));
+        let mut cmd = tokio::process::Command::new("fixture-never-spawned");
+        let response = COLLECT_PROBE.scope(probe, execute_codex_command(&mut cmd, &context)).await.unwrap();
+        assert_eq!(response.content, "完成");
+        assert_eq!(response.partial_timeout_secs, None);
     }
 
     #[tokio::test]
