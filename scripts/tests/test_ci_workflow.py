@@ -88,7 +88,7 @@ class CiWorkflowTests(unittest.TestCase):
         # Compare full ordered steps: action pins/options, commands, features,
         # conditions, and environment must all follow the shipping Linux path.
         prefixes = ("actions/setup-node@", "dtolnay/rust-toolchain@", "Swatinem/rust-cache@")
-        names = {"Install cross (Linux)", "Build frontend",
+        names = {"Add swap (Linux)", "Install cross (Linux)", "Build frontend",
                  "Package Linux binaries and check glibc baseline"}
         commands = ("python3 scripts/package-linux-release.py ", "cross build --release")
         def linux_steps(job):
@@ -98,9 +98,9 @@ class CiWorkflowTests(unittest.TestCase):
                     or s.get("run", "").startswith(commands)]
 
         expected = linux_steps(release)
-        # setup-node, rust-toolchain, rust-cache, install cross, frontend,
+        # swap, setup-node, rust-toolchain, rust-cache, install cross, frontend,
         # packager --build-only, packager --skip-build (glibc baseline check).
-        self.assertEqual(len(expected), 7)
+        self.assertEqual(len(expected), 8)
         runs = [s.get("run", "") for s in expected]
         self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only", runs)
         self.assertIn("python3 scripts/package-linux-release.py --target ${{ matrix.target }} "
@@ -309,6 +309,57 @@ class CiWorkflowTests(unittest.TestCase):
             else:
                 for step_name in ("Install cross (Linux)", "Build frontend"):
                     self.assertIn(next(s for s in steps if s.get("name") == step_name), warm_steps)
+
+    def test_release_toolchain_pin_is_desktop_only(self):
+        workflows = {
+            name: yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(),
+                            Loader=yaml.BaseLoader)
+            for name in ("release", "linux-release-smoke", "desktop-release", "release-cache-warm")
+        }
+
+        def toolchain(name, job):
+            steps = [s for s in workflows[name]["jobs"][job]["steps"]
+                     if s.get("uses", "").startswith("dtolnay/rust-toolchain@")]
+            self.assertEqual(len(steps), 1)
+            self.assertEqual(steps[0]["uses"], "dtolnay/rust-toolchain@stable")
+            return steps[0]
+
+        desktop = toolchain("desktop-release", "build")
+        warmed = toolchain("release-cache-warm", "desktop-release")
+        self.assertEqual(desktop["with"]["toolchain"], "1.99.1")
+        self.assertEqual(warmed["with"]["toolchain"], "1.99.1")
+        self.assertEqual(desktop, warmed)
+        for name, job in (("release", "build"), ("linux-release-smoke", "build"),
+                          ("release-cache-warm", "release")):
+            with self.subTest(workflow=name, job=job):
+                self.assertNotIn("toolchain", toolchain(name, job).get("with", {}))
+
+    def test_release_linux_swap_immediately_follows_checkout_and_precedes_builds(self):
+        for name, job in (("release", "build"), ("linux-release-smoke", "build"),
+                          ("release-cache-warm", "release"),
+                          ("release-cache-warm", "desktop-release"),
+                          ("desktop-release", "build")):
+            with self.subTest(workflow=name, job=job):
+                workflow = yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(),
+                                     Loader=yaml.BaseLoader)
+                steps = workflow["jobs"][job]["steps"]
+                swaps = [i for i, s in enumerate(steps) if s.get("name") == "Add swap (Linux)"]
+                self.assertEqual(len(swaps), 1)
+                index = swaps[0]
+                self.assertGreater(index, 0)
+                self.assertTrue(steps[index - 1].get("uses", "").startswith("actions/checkout@"))
+                swap = steps[index]
+                self.assertIn("runner.os == 'Linux'", swap["if"])
+                for needle in ("swapoff -a", "16G", "/mnt/duduclaw-swap", "mkswap", "swapon", "free -h"):
+                    self.assertIn(needle, swap["run"])
+                # Keep the allocation and fallback commands identical to CI.
+                ci_swap = next(s for s in self.jobs["rust"]["steps"]
+                               if s.get("name") == "Add swap (Linux)")
+                self.assertEqual(swap["run"], ci_swap["run"])
+                for position, step in enumerate(steps):
+                    if any(needle in step.get("run", "")
+                           for needle in ("cargo ", "cross ", "package-linux-release.py")):
+                        self.assertLess(index, position)
 
     def test_release_cache_warming_is_main_only_read_only_and_secretless(self):
         path = ROOT / ".github/workflows/release-cache-warm.yml"

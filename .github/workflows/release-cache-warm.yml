@@ -71,6 +71,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Add swap (Linux)
+        # Release-mode rustc for duduclaw-gateway exceeds the 16 GB runner (SIGKILL).
+        # /mnt is the large ephemeral disk.
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /mnt/duduclaw-swap || sudo dd if=/dev/zero of=/mnt/duduclaw-swap bs=1M count=16384
+          sudo chmod 600 /mnt/duduclaw-swap && sudo mkswap /mnt/duduclaw-swap && sudo swapon /mnt/duduclaw-swap
+          free -h
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "22"
@@ -132,9 +142,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Add swap (Linux)
+        # Release-mode rustc for duduclaw-gateway exceeds the 16 GB runner (SIGKILL).
+        # /mnt is the large ephemeral disk.
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /mnt/duduclaw-swap || sudo dd if=/dev/zero of=/mnt/duduclaw-swap bs=1M count=16384
+          sudo chmod 600 /mnt/duduclaw-swap && sudo mkswap /mnt/duduclaw-swap && sudo swapon /mnt/duduclaw-swap
+          free -h
+
+      # Cargo 1.100's build-directory layout breaks ort-sys 2.0.0-rc.12
+      # copy_dylibs on Windows (DirectML.dll); remove when ort is upgraded past rc.12.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.99.1"
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
