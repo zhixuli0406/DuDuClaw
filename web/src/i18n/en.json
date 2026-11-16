@@ -1,4 +1,8 @@
 {
+  "agents.runtime.idleTimeout": "No-progress timeout (seconds)",
+  "agents.runtime.idleTimeout.hint": "Leave blank to inherit the global setting; 0 disables, otherwise 60 seconds to the global ceiling. Raising or disabling requires admin authority. Claude and Codex track progress events.",
+  "settings.limits.default_idle_timeout_secs": "Default no-progress timeout (seconds)",
+  "settings.limits.default_idle_timeout_secs.help": "Default: 900 seconds; 0 disables, otherwise 60 seconds to the ceiling. Keep-alive notices do not count as progress.",
   "agents.runtime.maxTurns": "Step limit",
   "agents.runtime.maxTurns.hint": "Optional: uses the global default (50); OpenAI-compatible tool loops keep 10 when blank. Raising the limit uses more quota and can extend runs; only an administrator may raise it.",
   "settings.limits.default_max_turns": "Default step limit",

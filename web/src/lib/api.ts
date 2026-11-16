@@ -147,6 +147,8 @@ export interface AgentDetail extends AgentInfo {
   max_turns_limit?: number;
   default_max_turns?: number;
   effective_timeout_secs?: number;
+  effective_idle_timeout_secs?: number;
+  default_idle_timeout_secs?: number;
   max_timeout_secs?: number;
   budget: AgentBudget;
   model: AgentModel;
@@ -180,6 +182,7 @@ export interface AgentDetail extends AgentInfo {
     provider?: string;
     fallback?: string;
     timeout_secs?: number | null;
+    idle_timeout_secs?: number | null;
     max_turns?: number | null;
   };
   /** [research] table — returned by agents.inspect so the automation tab's
@@ -3587,6 +3590,7 @@ export interface AgentRuntime {
   provider?: RuntimeProvider;
   /** Per-run CLI / per-request OpenAI-compatible API limit for all runtimes including Claude, from 30 seconds to the global ceiling. Null clears it. */
   timeout_secs?: number | null;
+  idle_timeout_secs?: number | null;
   max_turns?: number | null;
   /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
   fallback?: string;

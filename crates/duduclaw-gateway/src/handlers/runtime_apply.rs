@@ -202,6 +202,10 @@ pub(crate) fn apply_runtime_with_limits(
             return Err(format!("max_turns must be an integer between 1 and {max_turns_limit}"));
         }
     }
+    let idle_timeout_secs = rt.get("idle_timeout_secs");
+    if let Some(value) = idle_timeout_secs.filter(|v| !v.is_null()) {
+        crate::runtime_config::validate_idle_timeout(value.as_i64().ok_or("idle_timeout_secs must be integer seconds")?, max_timeout_secs)?;
+    }
     let timeout_secs = rt.get("timeout_secs");
     if let Some(value) = timeout_secs.filter(|v| !v.is_null()) {
         if !value.as_u64().is_some_and(|secs| (30..=max_timeout_secs).contains(&secs)) {
@@ -271,6 +275,10 @@ pub(crate) fn apply_runtime_with_limits(
             section.insert("max_turns".into(), toml::Value::Integer(turns));
             changes.push(format!("runtime.max_turns = {turns}"));
         }
+    }
+    if let Some(value) = idle_timeout_secs {
+        if value.is_null() { section.remove("idle_timeout_secs"); changes.push("runtime.idle_timeout_secs cleared".into()); }
+        else if let Some(secs) = value.as_i64() { section.insert("idle_timeout_secs".into(), toml::Value::Integer(secs)); changes.push(format!("runtime.idle_timeout_secs = {secs}")); }
     }
     if let Some(value) = timeout_secs {
         if value.is_null() {
@@ -465,4 +473,25 @@ mod timeout_tests {
         assert_eq!(table["runtime"]["timeout_secs"].as_integer(), Some(12000));
     }
 
+}
+
+#[cfg(test)]
+mod idle_limit_tests {
+    use super::*;
+    #[test]
+    fn employee_idle_write_and_clear_validate_before_mutation() {
+        let mut table = toml::Table::new();
+        for seconds in [0, 60, 600] {
+            let out = apply_runtime_with_timeout_ceiling(&mut table, &serde_json::json!({"runtime":{"idle_timeout_secs":seconds}}), 600).unwrap();
+            assert_eq!(table["runtime"]["idle_timeout_secs"].as_integer(), Some(seconds));
+            assert!(out.changes.iter().any(|c| c.contains("idle_timeout_secs")));
+        }
+        for value in [serde_json::json!(59), serde_json::json!(601), serde_json::json!(-1), serde_json::json!("60")] {
+            let before = table.clone();
+            assert!(apply_runtime_with_timeout_ceiling(&mut table, &serde_json::json!({"runtime":{"idle_timeout_secs":value}}), 600).is_err());
+            assert_eq!(table, before);
+        }
+        apply_runtime_with_timeout_ceiling(&mut table, &serde_json::json!({"runtime":{"idle_timeout_secs":null}}), 600).unwrap();
+        assert!(table["runtime"].get("idle_timeout_secs").is_none());
+    }
 }

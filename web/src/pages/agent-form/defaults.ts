@@ -57,10 +57,11 @@ export const AUTONOMY_LEVELS: ReadonlyArray<AutonomyLevel> = [
  *  from `agent.runtime` when available and falls back to these defaults
  *  otherwise. A partial update is still written only when the operator
  *  touches the tab. */
-export const DEFAULT_RUNTIME: Required<Pick<AgentRuntime, 'provider'>> & { fallback: string; timeout_secs: number; max_turns: number | null } = {
+export const DEFAULT_RUNTIME: Required<Pick<AgentRuntime, 'provider'>> & { fallback: string; timeout_secs: number; idle_timeout_secs: number | null; max_turns: number | null } = {
   provider: 'claude',
   fallback: '',
   timeout_secs: 300,
+  idle_timeout_secs: null,
   max_turns: null,
 };
 

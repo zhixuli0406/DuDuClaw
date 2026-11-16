@@ -127,7 +127,7 @@ impl FailoverManager {
         fallback: &'a str,
         error: &str,
     ) -> Option<&'a str> {
-        if model::is_llm_fallback_error(error)
+        if !crate::work_outcome::is_work_result(error) && model::is_llm_fallback_error(error)
             && model::should_attempt_model_fallback(primary, fallback)
         {
             Some(fallback)
@@ -385,6 +385,7 @@ fn record_successful_response(runtime:&RuntimeType,context:&RuntimeContext,respo
 /// Avoids broad substring matches like "safety" or "content policy" that
 /// could unintentionally match legitimate error descriptions.
 fn is_non_retryable(error: &str) -> bool {
+    if crate::work_outcome::is_work_result(error) { return true; }
     if error.starts_with("AUTONOMY_PAUSED:") { return true; }
     let lower = error.to_lowercase();
     // 4xx client errors (except 429 rate limit which is retryable)
@@ -1006,3 +1007,19 @@ mod tests {
 #[cfg(test)]
 #[path="failover/routing_failure_tests.rs"]
 mod routing_failure_tests;
+
+#[cfg(test)]
+mod work_limit_tests {
+    use super::*;
+    #[test]
+    fn work_limits_refuse_runtime_and_model_fallbacks() {
+        use crate::work_outcome::WorkOutcome;
+        for outcome in [WorkOutcome::MaxTurns { limit:7, partial:String::new() },
+            WorkOutcome::TimeoutTotal { seconds:60, partial:String::new() },
+            WorkOutcome::TimeoutNoProgress { seconds:60, tool:None, partial:String::new() }] {
+            let error = outcome.encode();
+            assert!(is_non_retryable(&error));
+            assert!(FailoverManager::model_fallback_for("claude-opus-4-6", "claude-sonnet-4-6", &error).is_none());
+        }
+    }
+}

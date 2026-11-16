@@ -21,6 +21,10 @@ use duduclaw_core::{
     MAX_DELEGATION_DEPTH, is_valid_discord_snowflake, truncate_bytes,
 };
 
+tokio::task_local! {
+    static DISPATCH_FAILURE_REFERENCE: (String, Option<String>);
+}
+
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BusMessage {
@@ -915,8 +919,13 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                 // sub-task died (silent drop). See `dispatch_failure_reply`:
                 // ordinary errors become a classified, non-leaking zh-TW notice;
                 // task-sandbox refusals carry their own operator-safe message.
-                let fallback_text = dispatch_failure_reply(&e);
-                forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target).await;
+                let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home_dir, &msg.target).await;
+                let code = match &e { DispatchError::Other(error) => crate::channel_reply::classify_cli_failure(error).as_str(), _ => "unknown" };
+                let reference = crate::work_outcome::WorkOutcome::reference(&host_text).unwrap_or_else(|| msg.id.clone());
+                let fallback_text = format!("{}\n{}", dispatch_failure_reply(&e),
+                    crate::channel_reply::failure_notice::notice_suffix(language.as_deref(), Some(code), &reference));
+                DISPATCH_FAILURE_REFERENCE.scope((reference, language),
+                    forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target)).await;
             }
         }
     }
@@ -999,6 +1008,10 @@ fn dispatch_failure_reply(error: &DispatchError) -> String {
             format!("⚠️ 子任務失敗（任務沙箱，{}）：{}", failure.code, failure.message)
         }
         DispatchError::Other(e) => {
+            if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(e) {
+                let notice = crate::channel_reply::failure_notice::work_notice(&outcome, None);
+                return if outcome.partial().trim().is_empty() { notice } else { format!("{}\n\n{notice}", outcome.partial()) };
+            }
             let label = short_failure_label(crate::channel_reply::classify_cli_failure(e));
             format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。")
         }
@@ -1059,7 +1072,9 @@ fn dispatch_failure_code(error: &DispatchError) -> String {
             FailureReason::AuthFailed => "auth_failed",
             FailureReason::RateLimited => "rate_limited",
             FailureReason::Billing => "billing",
-            FailureReason::Timeout => "timeout",
+            FailureReason::Timeout | FailureReason::TimeoutTotal => "timeout_total",
+            FailureReason::TimeoutNoProgress => "timeout_no_progress",
+            FailureReason::MaxTurns => "max_turns",
             FailureReason::SpawnError => "spawn_error",
             FailureReason::EmptyResponse => "empty_response",
             FailureReason::NoAccounts => "no_accounts",
@@ -1082,7 +1097,9 @@ fn short_failure_label(reason: crate::channel_reply::FailureReason) -> &'static 
         FailureReason::AuthFailed => "帳號未登入或認證失效",
         FailureReason::RateLimited => "API 使用量已達上限",
         FailureReason::Billing => "帳號額度已用完",
-        FailureReason::Timeout => "處理逾時",
+        FailureReason::Timeout | FailureReason::TimeoutTotal => "已達執行時限，尚未產生最終答案",
+        FailureReason::TimeoutNoProgress => "長時間沒有進展，已停止",
+        FailureReason::MaxTurns => "這一輪的步數用完了",
         FailureReason::SpawnError => "子程序啟動失敗",
         FailureReason::EmptyResponse => "未產生回應內容",
         FailureReason::NoAccounts => "沒有可用帳號",
@@ -3143,6 +3160,16 @@ pub(crate) async fn forward_delegation_response(
         );
         return;
     };
+
+    // Apply the public-visitor boundary after resolving the actual callback.
+    let visitor_notice = DISPATCH_FAILURE_REFERENCE.try_with(|(reference, language)| {
+        let sid = format!("{channel_type}:{channel_id}");
+        (crate::channel_reply::assembly::public_session(&sid)
+            || (channel_type == "webchat" && crate::webchat::is_widget_visitor(&channel_id)))
+            .then(|| format!("{}\n{}", crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE,
+                crate::channel_reply::failure_notice::notice_suffix(language.as_deref(), None, reference)))
+    }).ok().flatten();
+    let response_text = visitor_notice.as_deref().unwrap_or(response_text);
 
     // v1.8.20: look up the chain root (original origin_agent) so
     // `forward_to_channel` can cascade token resolution from the

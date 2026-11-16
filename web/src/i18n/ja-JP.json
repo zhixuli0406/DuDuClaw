@@ -1,4 +1,8 @@
 {
+  "agents.runtime.idleTimeout": "進展なしの制限時間（秒）",
+  "agents.runtime.idleTimeout.hint": "空欄は全体設定を継承。0 は無効、それ以外は 60 秒から全体上限まで。延長や無効化には管理者権限が必要です。Claude と Codex はイベントで進展を判定します。",
+  "settings.limits.default_idle_timeout_secs": "進展なしの既定制限時間（秒）",
+  "settings.limits.default_idle_timeout_secs.help": "既定は 900 秒。0 は無効、それ以外は 60 秒から上限まで。定期通知は進展に含まれません。",
   "agents.runtime.maxTurns": "1 回の実行ステップ上限",
   "agents.runtime.maxTurns.hint": "空欄はグローバル既定値（50）。OpenAI 互換ツールループは空欄なら 10 回です。増加は使用量と実行時間を増やす可能性があり、管理者権限が必要です。",
   "settings.limits.default_max_turns": "既定のステップ上限",

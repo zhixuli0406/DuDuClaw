@@ -546,6 +546,13 @@ where
             .unwrap_or_default();
         (r, ev)
     };
+    if let Err(error) = &result {
+        if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(error) {
+            let row = serde_json::json!({ "event":"dispatch_work_outcome", "agent":agent_id,
+                "reason_code":outcome.code(), "reference_id":run_key, "timestamp":chrono::Utc::now().to_rfc3339() });
+            if let Err(error) = crate::trajectory_guard::append_anomaly(home_dir, &row) { tracing::warn!(%error, "dispatch outcome audit append failed"); }
+        }
+    }
     let ended_at = chrono::Utc::now().to_rfc3339();
     let (status, preview_out) = match &result {
         Ok(text) => ("completed".to_string(), text.clone()),
@@ -1528,7 +1535,7 @@ async fn call_claude_for_agent_impl(
 
 /// Admission refusals never trigger account, model, or provider retries.
 fn is_admission_refusal(error: &str) -> bool {
-    duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
+    crate::work_outcome::is_work_result(error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
         || crate::budget::budget_refusal_message(error).is_some()
         || crate::autonomous_runtime::was_denied()
         || error.starts_with("AUTONOMY_PAUSED:")
@@ -3420,9 +3427,17 @@ pub async fn invalidate_rotator_cache() {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_WORK_ROTATOR: Arc<duduclaw_agent::account_rotator::AccountRotator>;
+    static TEST_WORK_ERROR: (String, Arc<std::sync::atomic::AtomicUsize>);
+}
+
 async fn get_rotator(
     home_dir: &Path,
 ) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
+    #[cfg(test)]
+    if let Ok(rotator) = TEST_WORK_ROTATOR.try_with(Arc::clone) { return Ok(rotator); }
     let cache = ROTATOR_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
 
     // Fast path: valid until invalidated, or until the backstop TTL elapses
@@ -3716,6 +3731,7 @@ async fn call_with_rotation(
                 return Ok(response.text);
             }
             Err(e) => {
+                if crate::work_outcome::is_work_result(&e) { return Err(e); }
                 // Defensive: the `.mcp.json` spawn gate runs once before this
                 // loop (`call_claude_for_agent_impl`), so its refusal never
                 // reaches here today. Should a later change move it into the
@@ -3933,8 +3949,7 @@ fn claude_tool_result_content_text(content: &serde_json::Value) -> Option<String
 
 /// Spawn a `claude` CLI process with streaming output and read the result.
 ///
-/// Uses `--output-format stream-json --verbose`. No idle timeout — the process
-/// runs until it completes or hits the effective runtime timeout.
+/// Uses `--output-format stream-json --verbose`. Event silence and total runtime have independent bounded deadlines.
 /// An optional `on_progress` callback receives `ProgressEvent`s for keepalive
 /// and tool-use progress (used by channel reply; cron/dispatch pass `None`).
 ///
@@ -3944,6 +3959,8 @@ async fn call_claude_streaming(
     on_progress: Option<&crate::channel_reply::ProgressCallback>,
     protected_input: Option<(&Path, &str, &str, &str)>,
     hard_max_timeout_secs: u64,
+    idle_timeout_secs: u64,
+    max_turns: u64,
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -3997,6 +4014,7 @@ async fn call_claude_streaming(
         .try_with(|sid| sid.as_deref().is_some_and(crate::channel_reply::assembly::public_session))
         .unwrap_or(false);
     let mut assistant_text = String::new();
+    let mut partial_assistant_text = String::new();
     let mut result_text = String::new();
     let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
     let mut last_tool_reported: Option<String> = None;
@@ -4025,6 +4043,7 @@ async fn call_claude_streaming(
     ));
     keepalive.reset();
 
+    let mut idle = crate::work_outcome::IdleWatch::new(idle_timeout_secs);
     // Hard max timeout — absolute safety net
     let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(hard_max_timeout_secs));
     tokio::pin!(hard_deadline);
@@ -4043,6 +4062,7 @@ async fn call_claude_streaming(
                         if line.trim().is_empty() { continue; }
 
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                            idle.observe(&event);
                             // Partial `stream_event` lines stop here: never the
                             // native-tool collector, never the answer text.
                             if thinking.observe(&event)
@@ -4057,16 +4077,10 @@ async fn call_claude_streaming(
                                     // Previously this embedded "[error] ..." into
                                     // result_text which was then returned as Ok,
                                     // silently surfacing CLI errors as the reply.
-                                    if event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                        let err_text = event
-                                            .get("result")
-                                            .and_then(|r| r.as_str())
-                                            .or_else(|| event.get("error").and_then(|e| e.as_str()))
-                                            .unwrap_or("Unknown stream-json error");
+                                    if let Some(error) = crate::work_outcome::result_error(&event, max_turns,
+                                        if result_text.is_empty() { &partial_assistant_text } else { &result_text }) {
                                         child.kill_and_reap().await;
-                                        return Err(format!(
-                                            "claude CLI stream error: {err_text}"
-                                        ));
+                                        return Err(error);
                                     }
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                         if !text.is_empty() {
@@ -4095,6 +4109,10 @@ async fn call_claude_streaming(
                                     );
                                     if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) {
                                         assistant_text = duduclaw_core::think_tags::last_assistant_text(content);
+                                        if !assistant_text.trim().is_empty() {
+                                            if !partial_assistant_text.is_empty() { partial_assistant_text.push_str("\n\n"); }
+                                            partial_assistant_text.push_str(&assistant_text);
+                                        }
                                         for block in content {
                                             let block_type = block.get("type").and_then(|t| t.as_str());
                                             match block_type {
@@ -4177,13 +4195,14 @@ async fn call_claude_streaming(
                 }
             }
 
-            _ = &mut hard_deadline => {
-                warn!("claude CLI hard timeout ({hard_max_timeout_secs}s) — killing process");
+            _ = idle.expired() => {
                 child.kill_and_reap().await;
-                return Err(format!(
-                    "claude CLI hard timeout ({hard_max_timeout_secs}s, partial output: {} chars)",
-                    result_text.len()
-                ));
+                return Err(idle.outcome(if result_text.is_empty() { partial_assistant_text.clone() } else { result_text.clone() }).encode());
+            }
+            _ = &mut hard_deadline => {
+                child.kill_and_reap().await;
+                return Err(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: hard_max_timeout_secs,
+                    partial: if result_text.is_empty() { partial_assistant_text.clone() } else { result_text.clone() } }.encode());
             }
         }
     }
@@ -5055,6 +5074,10 @@ async fn call_claude_with_env(
     // Team-as-Agent: identity-scoped config dir + explicit `--mcp-config`.
     identity: SpawnIdentity<'_>,
 ) -> Result<ClaudeResponse, String> {
+    #[cfg(test)]
+    if let Ok(error) = TEST_WORK_ERROR.try_with(|(error, calls)| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst); error.clone()
+    }) { return Err(error); }
     let home = identity.config_dir.or(work_dir).and_then(duduclaw_core::preset::agent_home_dir)
         .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
     let hard_max_timeout_secs = crate::runtime_config::claude_timeout_secs(&home, identity.config_dir.or(work_dir));
@@ -5066,7 +5089,7 @@ async fn call_claude_with_env(
         let system_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, 50)
             .replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
         let mut marker = tokio::process::Command::new("root-selected-claude");
-        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model)), hard_max_timeout_secs).await;
+        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model)), hard_max_timeout_secs, crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), 50).await;
     }
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
     // `_cmd_guards` holds the `--system-prompt-file` and (RFC-23 §13.6)
@@ -5099,7 +5122,13 @@ async fn call_claude_with_env(
     // outside its workspace (e.g. `~/.claude`).
     crate::runtime::apply_native_sandbox(&mut cmd, capabilities, work_dir, "claude")?;
 
-    call_claude_streaming(&mut cmd, None, None, hard_max_timeout_secs).await
+    // Report the budget on the actual command, not a config re-read after spawn.
+    let applied_max_turns = cmd.as_std().get_args().zip(cmd.as_std().get_args().skip(1))
+        .find(|(key, _)| *key == std::ffi::OsStr::new("--max-turns"))
+        .and_then(|(_, value)| value.to_str().and_then(|n| n.parse::<u64>().ok()))
+        .filter(|n| *n > 0).ok_or("Claude command has no valid applied step budget")?;
+    call_claude_streaming(&mut cmd, None, None, hard_max_timeout_secs,
+        crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), applied_max_turns).await
 }
 
 pub(crate) fn protected_claude_options_refusal() -> String {
@@ -6572,6 +6601,10 @@ mod live_dispatch_step_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "claude_runner/work_outcome_tests.rs"]
+mod work_outcome_tests;
+
 #[cfg(all(test, unix))]
 mod process_tree_cancellation_tests {
     #[tokio::test]
@@ -6580,7 +6613,7 @@ mod process_tree_cancellation_tests {
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.current_dir(dir.path())
             .args(["-c", "/bin/sleep 300 & echo $! > grandchild.pid; wait"]);
-        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None, None, 1800).await });
+        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None, None, 1800, 900, 50).await });
         let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(pid) = std::fs::read_to_string(dir.path().join("grandchild.pid"))

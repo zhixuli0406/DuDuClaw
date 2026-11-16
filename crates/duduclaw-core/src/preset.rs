@@ -89,6 +89,7 @@ const PER_AGENT_SCALAR_FIELDS: &[(&str, &str)] = &[
     // Clearing a per-agent timeout adopts the provider/global policy default,
     // never a wider preset value behind the Owner authority gate.
     ("runtime", "timeout_secs"),
+    ("runtime", "idle_timeout_secs"),
     ("runtime", "max_turns"),
     ("os_watch", "paths"),
     ("model", "account_pool"),

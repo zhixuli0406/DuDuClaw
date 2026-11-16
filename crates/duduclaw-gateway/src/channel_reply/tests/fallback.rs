@@ -36,7 +36,7 @@ mod fallback_tests {
     fn classify_timeout() {
         assert_eq!(
             classify_cli_failure("claude CLI hard timeout (1800s, no output)"),
-            FailureReason::Timeout
+            FailureReason::TimeoutTotal
         );
     }
 
@@ -46,7 +46,7 @@ mod fallback_tests {
             for err in [format!("{name} CLI timed out"),
                 format!("{name} CLI hard timeout after 300s"),
                 format!("{name} CLI hard timeout after 300s (no completed output)")] {
-                assert_eq!(classify_cli_failure(&err), FailureReason::Timeout, "{err}");
+                assert_eq!(classify_cli_failure(&err), FailureReason::TimeoutTotal, "{err}");
             }
         }
         assert_eq!(classify_cli_failure("not logged in; request timed out"), FailureReason::AuthFailed);

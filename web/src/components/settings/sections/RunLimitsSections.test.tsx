@@ -73,3 +73,12 @@ describe('Run limit settings cards', () => {
     await waitFor(() => expect(update).toHaveBeenCalledWith({ agent_files: { max_pending_per_user: 10 } }));
   });
 });
+
+it('saves the global idle timeout beside the total timeout, including disable', async () => {
+  renderWithProviders(<RunLimitsSections />);
+  const input = await screen.findByRole('spinbutton', { name: 'Default no-progress timeout (seconds)' });
+  await waitFor(() => expect(input).toHaveValue(900));
+  fireEvent.change(input, { target: { value: '0' } });
+  saveCard('Default no-progress timeout (seconds)');
+  await waitFor(() => expect(update).toHaveBeenCalledWith({ runtime: { default_idle_timeout_secs: 0 } }));
+});

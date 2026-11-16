@@ -119,7 +119,7 @@ async fn acl_loss_after_staging_refuses_sse_content_and_retracts_history() {
     let (_incoming_tx, incoming) = mpsc::channel(1);
     let lease = RunLease { state: state.clone(), sid: sid.clone() };
     let worker = tokio::spawn(run::start(state, broker, lease, f.user.clone(), "worker".into(), sid.clone(),
-        "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false))));
+        "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false)), Duration::from_secs(1830)));
     assert_eq!(frame(&mut rx).await["type"], "RUN_STARTED");
     let turn = tokio::time::timeout(Duration::from_secs(30), seam.entered.recv()).await.unwrap().unwrap();
     turn.release.send(()).unwrap();
@@ -273,7 +273,7 @@ async fn approval_resume_case(role: UserRole, kind: &str, external: bool, approv
     let broker_worker = broker.clone();
     let worker = tokio::spawn(async move {
         let (result, cleanup) = crate::channel_reply::with_delivery_cleanup(
-            run::execute(&state, &broker_worker, &user, "worker", &sid_worker, "host-turn", "hello", connection, &mut incoming_rx, &waiting_worker),
+            run::execute(&state, &broker_worker, &user, "worker", &sid_worker, "host-turn", "hello", connection, &mut incoming_rx, &waiting_worker, Duration::from_secs(1830)),
         ).await;
         cleanup.unwrap();
         result
@@ -379,7 +379,7 @@ async fn disconnected_stream_releases_run_slot_and_withdraws_approvals() {
     drop(rx);
     let (_tx, incoming) = mpsc::channel(1);
     let lease = RunLease { state: state.clone(), sid: sid.clone() };
-    run::start(state, broker.clone(), lease, f.user.clone(), "worker".into(), sid, "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false))).await;
+    run::start(state, broker.clone(), lease, f.user.clone(), "worker".into(), sid, "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false)), Duration::from_secs(1830)).await;
     assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
 }
 
@@ -480,7 +480,7 @@ mod timeout_tests {
         let user = f.user.clone();
         let worker = tokio::spawn(async move {
             run::execute(&state, &broker, &user, "worker", &sid, "timeout-turn", "hello",
-                connection, &mut incoming, &AtomicBool::new(false)).await
+                connection, &mut incoming, &AtomicBool::new(false), Duration::from_secs(330)).await
         });
         assert_eq!(frame(&mut rx).await["type"], "RUN_STARTED");
         let _blocked_turn = tokio::time::timeout(Duration::from_secs(30), seam.entered.recv()).await.unwrap().unwrap();

@@ -233,6 +233,7 @@ fn apply_global_utility(table: &mut toml::Table, params: &Value, out: &mut V168O
 
 fn apply_run_review_limits(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
     for (section, key, min, max) in [
+        ("runtime", "default_idle_timeout_secs", 0, 14_400),
         ("runtime", "max_timeout_secs", 60, 14_400),
         ("runtime", "default_max_turns", 1, 10_000),
         ("runtime", "max_turns_limit", 1, 10_000),
@@ -259,6 +260,7 @@ fn apply_run_review_limits(table: &mut toml::Table, params: &Value, out: &mut V1
         out.applied_immediate = true;
     }
     crate::runtime_config::TimeoutPolicy::from_table(table)?;
+    crate::runtime_config::idle_policy_from_table(table)?;
     duduclaw_core::turn_limits::TurnPolicy::validate(table)?;
     Ok(())
 }

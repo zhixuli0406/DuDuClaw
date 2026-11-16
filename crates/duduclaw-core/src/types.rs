@@ -4281,6 +4281,10 @@ pub struct RuntimeSection {
     #[serde(deserialize_with = "crate::agent_toml::deserialize_timeout_secs")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<i64>,
+    /// Event-silence limit; zero disables, absent inherits the global policy.
+    #[serde(deserialize_with = "crate::agent_toml::deserialize_timeout_secs")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<i64>,
     /// Optional bounded step budget; absent uses the global default (API loops: 10).
     #[serde(deserialize_with = "crate::agent_toml::deserialize_max_turns")]
     #[serde(skip_serializing_if = "Option::is_none")]

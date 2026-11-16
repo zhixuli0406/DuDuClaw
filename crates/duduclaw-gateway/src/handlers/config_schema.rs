@@ -253,6 +253,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("api", "anthropic_api_key_enc", Str),
     ("runtime", "utility_provider", Str),
     ("runtime", "default_timeout_secs", UInt),
+    ("runtime", "default_idle_timeout_secs", UInt),
     ("runtime", "max_timeout_secs", UInt),
     ("runtime", "default_max_turns", UInt),
     ("runtime", "max_turns_limit", UInt),
@@ -340,6 +341,7 @@ pub(crate) fn check_config_types_with_stored(
             }
         }
     }
+    crate::runtime_config::idle_policy_from_table(table)?;
     crate::runtime_config::TimeoutPolicy::from_table(table)?;
     duduclaw_core::turn_limits::TurnPolicy::validate(table)?;
     Ok(())

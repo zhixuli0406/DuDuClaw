@@ -167,6 +167,15 @@ fn child(home: std::path::PathBuf) {
         let log = std::fs::read_to_string(home.join("claude_stream.log")).unwrap();
         assert!(log.contains(r#""elided":"thinking_delta""#));
         assert!(!log.contains(SECRET), "debug log never holds thinking text");
+        for terminal in [r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}"#,
+                         r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#] {
+            std::fs::write(home.join("stream.jsonl"), format!("{}\n{terminal}\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"已完成第一份報表"}]}}"#)).unwrap();
+            let error = spawn(&home).await.unwrap_err();
+            let outcome = crate::work_outcome::WorkOutcome::decode(&error).unwrap();
+            assert_eq!(outcome, crate::work_outcome::WorkOutcome::MaxTurns { limit: 50, partial: "已完成第一份報表".into() });
+        }
+
     });
 }
 
@@ -229,5 +238,5 @@ fn l1_stub_claude_thinking_flows_by_policy() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(std::fs::read_to_string(home.join("count")).unwrap(), "3");
+    assert_eq!(std::fs::read_to_string(home.join("count")).unwrap(), "5");
 }

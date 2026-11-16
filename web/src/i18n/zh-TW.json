@@ -1,4 +1,8 @@
 {
+  "agents.runtime.idleTimeout": "無進展時限（秒）",
+  "agents.runtime.idleTimeout.hint": "留空沿用全域設定；0 停用，其他值須介於 60 秒與全域最高上限。提高或停用需要管理員權限。Claude 與 Codex 依事件判斷進展。",
+  "settings.limits.default_idle_timeout_secs": "預設無進展時限（秒）",
+  "settings.limits.default_idle_timeout_secs.help": "預設 900 秒；0 停用，其他值須介於 60 秒與最高上限。進度通知不算進展。",
   "agents.runtime.maxTurns": "單次執行步數上限",
   "agents.runtime.maxTurns.hint": "可留空：採用全域預設（50 步）；OpenAI 相容工具迴圈留空時維持 10 輪。提高步數會消耗更多額度、延長執行時間，且需要管理員。",
   "settings.limits.default_max_turns": "預設執行步數",

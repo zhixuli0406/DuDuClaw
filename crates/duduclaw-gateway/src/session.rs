@@ -1091,7 +1091,7 @@ impl SessionManager {
              SELECT ?1, 'assistant', ?2, 0, ?3, 1, 'turn_failure', ?4
              WHERE NOT EXISTS (SELECT 1 FROM session_messages
                  WHERE session_id=?1 AND notice_kind='turn_failure' AND client_msg_id=?4)",
-            params![session_id, reason.text(language), chrono::Utc::now().to_rfc3339(),
+            params![session_id, reason.render(language, turn_id, visitor), chrono::Utc::now().to_rfc3339(),
                 format!("turn_failure:{turn_id}")],
         ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))
@@ -3016,7 +3016,7 @@ mod tests {
         assert_eq!(mgr.list_summary_candidates().await.unwrap()[0].turn_count, 1);
         mgr.record_turn_failure("s1", "t2", crate::channel_reply::TurnFailureReason::Unknown, None, None).await.unwrap();
         let display = mgr.webchat_history("s1").await.unwrap();
-        assert_eq!(display.last().unwrap().message.content, crate::channel_reply::TurnFailureReason::Unknown.text(None));
+        assert!(display.last().unwrap().message.content.starts_with(crate::channel_reply::TurnFailureReason::Unknown.text(None)));
         // Undo/redaction still hides a notice from the display.
         mgr.revoke_message("s1", failure_id, "redacted").await.unwrap();
         assert!(mgr.webchat_history("s1").await.unwrap().iter().all(|m| m.id != failure_id));

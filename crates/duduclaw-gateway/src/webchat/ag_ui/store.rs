@@ -10,7 +10,6 @@ const MAX_PRINCIPAL_PER_MINUTE: i64 = 32;
 #[derive(Clone)]
 pub(super) struct Store {
     conn: Arc<Mutex<Connection>>,
-    home: std::path::PathBuf,
 }
 
 impl Store {
@@ -48,11 +47,11 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_ag_ui_threads_principal ON ag_ui_threads(principal);",
         ).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| format!("commit AG-UI migration: {e}"))?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)), home: home.to_path_buf() })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
-    pub(super) async fn admit(&self, principal: &str, sid: &str, run_id: &str, has_live_thread: bool, agent: &str) -> Result<String, String> {
-        let lifetime = super::run_lifetime(&self.home, agent).as_secs();
+    pub(super) async fn admit(&self, principal: &str, sid: &str, run_id: &str, has_live_thread: bool, lifetime: Duration) -> Result<String, String> {
+        let lifetime = lifetime.as_secs();
         let store = self.clone();
         let (principal, sid, run_id) = (principal.to_owned(), sid.to_owned(), run_id.to_owned());
         tokio::task::spawn_blocking(move || store.admit_at(&principal, &sid, &run_id, has_live_thread, chrono::Utc::now().timestamp(), lifetime))
@@ -149,7 +148,7 @@ mod tests {
         let store = Store::open(home.path()).unwrap();
         for (sid, runtime, lifetime) in [("short", "timeout_secs=300", 330), ("default", "", 1830)] {
             std::fs::write(dir.join("agent.toml"), format!("[runtime]\nprovider='claude'\n{runtime}\n")).unwrap();
-            store.admit("user:one", sid, "run", false, "anna").await.unwrap();
+            store.admit("user:one", sid, "run", false, super::super::run_lifetime(home.path(), "anna")).await.unwrap();
             let duration: i64 = store.conn.lock().unwrap().query_row(
                 "SELECT deadline-started FROM ag_ui_threads JOIN ag_ui_runs USING(session_id) WHERE session_id=?1",
                 [sid], |r| r.get(0),
@@ -196,13 +195,13 @@ mod tests {
     async fn admission_finish_allows_new_run_without_forgetting_replay_ids() {
         let home = tempfile::tempdir().unwrap();
         let store = Store::open(home.path()).unwrap();
-        let first = store.admit("user:one", "s", "r1", false, "anna").await.unwrap();
+        let first = store.admit("user:one", "s", "r1", false, super::super::run_lifetime(home.path(), "anna")).await.unwrap();
         store.finish("s", &first).await.unwrap();
-        let second = store.admit("user:one", "s", "r2", false, "anna").await.unwrap();
+        let second = store.admit("user:one", "s", "r2", false, super::super::run_lifetime(home.path(), "anna")).await.unwrap();
         assert_ne!(first, second);
         store.finish("s", &first).await.unwrap();
-        assert_eq!(store.admit("user:one", "s", "r3", false, "anna").await.unwrap_err(), "orphaned_thread");
-        assert_eq!(store.admit("user:one", "s", "r1", true, "anna").await.unwrap_err(), "run_id_reused");
+        assert_eq!(store.admit("user:one", "s", "r3", false, super::super::run_lifetime(home.path(), "anna")).await.unwrap_err(), "orphaned_thread");
+        assert_eq!(store.admit("user:one", "s", "r1", true, super::super::run_lifetime(home.path(), "anna")).await.unwrap_err(), "run_id_reused");
     }
 
     #[tokio::test]
@@ -212,12 +211,12 @@ mod tests {
         let first = store.admit_at("user:one", "s", "r1", false, 0, 3630).unwrap();
         assert_eq!(store.expired_turn("s").await.unwrap().as_deref(), Some(first.as_str()));
         assert!(store.expired_turn("unknown").await.unwrap().is_none());
-        assert_eq!(store.admit("user:one", "s", "r2", false, "anna").await.unwrap_err(), "orphaned_thread");
+        assert_eq!(store.admit("user:one", "s", "r2", false, super::super::run_lifetime(home.path(), "anna")).await.unwrap_err(), "orphaned_thread");
         store.finish("s", "wrong-turn").await.unwrap();
         assert_eq!(store.expired_turn("s").await.unwrap().as_deref(), Some(first.as_str()));
         store.finish("s", &first).await.unwrap();
         assert!(store.expired_turn("s").await.unwrap().is_none());
-        let second = store.admit("user:one", "s", "r3", false, "anna").await.unwrap();
+        let second = store.admit("user:one", "s", "r3", false, super::super::run_lifetime(home.path(), "anna")).await.unwrap();
         assert_ne!(first, second);
         assert!(store.expired_turn("s").await.unwrap().is_none());
     }

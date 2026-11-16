@@ -1038,3 +1038,6 @@ port = 18889
 # [runtime]
 # default_max_turns = 50     # Default Claude step budget; OpenAI-compatible loops keep 10 unless explicitly overridden per employee
 # max_turns_limit = 200      # Ceiling for employee max_turns; integer 1..=10000, never unlimited
+# default_idle_timeout_secs = 900 # Global event-silence window; 0 disables, otherwise 60..=max_timeout_secs
+# In each employee agent.toml [runtime]:
+# idle_timeout_secs = 900 # Optional override; raising or disabling requires administrator authority

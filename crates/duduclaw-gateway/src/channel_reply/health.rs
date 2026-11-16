@@ -32,7 +32,9 @@ pub(super) fn reason(reason: FailureReason) -> &'static str {
         FailureReason::Billing | FailureReason::AccountsCoolingDownLong => "quota",
         FailureReason::RateLimited | FailureReason::AccountsCoolingDownShort => "rate_limited",
         FailureReason::AuthFailed => "auth_dead",
-        FailureReason::Timeout => "timeout",
+        FailureReason::MaxTurns => "max_turns",
+        FailureReason::Timeout | FailureReason::TimeoutTotal => "timeout_total",
+        FailureReason::TimeoutNoProgress => "timeout_no_progress",
         _ => "other",
     }
 }

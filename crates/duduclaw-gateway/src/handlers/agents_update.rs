@@ -1171,7 +1171,10 @@ impl MethodHandler {
             let turn_policy = if !caller_is_admin {
                 duduclaw_core::turn_limits::TurnPolicy::load_checked(&home_for_update)?
             } else { duduclaw_core::turn_limits::TurnPolicy::load(&home_for_update) };
-            let authority = super::agent_authority::authority_diff_with_runtime_policy(&table_before, table, crate::runtime_config::TimeoutPolicy::load(&home_for_update), turn_policy);
+            let idle_default = crate::runtime_config::idle_policy_checked(&home_for_update)?;
+            let mut authority = super::agent_authority::authority_diff_with_runtime_policy(&table_before, table, crate::runtime_config::TimeoutPolicy::load(&home_for_update), turn_policy);
+            authority.retain(|c| c.key != "runtime.idle_timeout_secs");
+            authority.extend(super::agent_authority::idle_authority_diff(&table_before, table, idle_default));
             if !authority.is_empty() && !caller_is_admin {
                 let keys: Vec<&str> = authority.iter().map(|c| c.key.as_str()).collect();
                 // The model↔provider auto-align above is what moved the

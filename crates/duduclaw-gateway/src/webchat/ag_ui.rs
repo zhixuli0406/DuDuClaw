@@ -131,6 +131,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
     if !state.chat.ctx.registry.read().await.get(&agent).is_some_and(|a| a.config.agent.status.is_operational()) {
         return error(StatusCode::FORBIDDEN, "agent_unavailable");
     }
+    let lifetime = run_lifetime(&state.chat.ctx.home_dir, &agent);
     let Some(broker) = state.chat.approvals.clone() else { return error(StatusCode::SERVICE_UNAVAILABLE, "approvals_unavailable") };
     let principal = duduclaw_core::HumanPrincipal::user(&user).map(|p| p.to_string());
     let Some(principal) = principal else { return error(StatusCode::UNAUTHORIZED, "invalid_credential") };
@@ -151,7 +152,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "run_store_unavailable"),
         };
         let matches = receipts.get(&sid).is_some_and(|(at, entries)|
-            at.elapsed() < run_lifetime(&state.chat.ctx.home_dir, &agent) && same_decisions(entries, &input.resume));
+            at.elapsed() < lifetime && same_decisions(entries, &input.resume));
         if !matches { return error(StatusCode::CONFLICT, "stale_or_unknown_interrupt"); }
         true
     } else { false };
@@ -174,7 +175,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
             }
         }
     }
-    let turn = match journal.admit(&principal, &sid, &input.run_id, has_live_thread, &agent).await {
+    let turn = match journal.admit(&principal, &sid, &input.run_id, has_live_thread, lifetime).await {
         Ok(turn) => turn,
         Err(reason) => {
             tracing::debug!(%reason, "AG-UI admission refused");
@@ -210,7 +211,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
         let waiting = Arc::new(AtomicBool::new(false));
         runs.insert(sid.clone(), Entry { user: user.clone(), resume, waiting: waiting.clone() });
         let lease = RunLease { state: state.clone(), sid: sid.clone() };
-        tokio::spawn(run::start(state.clone(), broker, lease, user, agent, sid, turn, principal, text, connection, incoming, waiting));
+        tokio::spawn(run::start(state.clone(), broker, lease, user, agent, sid, turn, principal, text, connection, incoming, waiting, lifetime));
     }
     drop(runs);
     // Acknowledgement happens when axum asks for the next frame. Dropping the

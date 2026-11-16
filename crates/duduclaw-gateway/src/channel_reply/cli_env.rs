@@ -498,6 +498,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         .try_with(|sid| sid.as_deref().is_some_and(super::assembly::public_session))
         .unwrap_or(false);
     let mut assistant_text = String::new();
+    let mut partial_assistant_text = String::new();
     let mut result_text = String::new();
     // RFC-22 P1-7: capture token usage from `result` event so cost_telemetry
     // can be recorded for channel-path replies (previously: 0 entries for
@@ -595,6 +596,7 @@ pub(super) async fn spawn_claude_cli_with_env(
     keepalive.reset(); // don't fire immediately
 
     // Hard max timeout — absolute safety net
+    let mut idle = crate::work_outcome::IdleWatch::new(crate::runtime_config::idle_timeout_secs(home_dir, work_dir));
     let hard_max_timeout_secs = crate::runtime_config::claude_timeout_secs(home_dir, work_dir);
     let hard_deadline = tokio::time::sleep(std::time::Duration::from_secs(hard_max_timeout_secs));
     tokio::pin!(hard_deadline);
@@ -659,6 +661,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                         }
 
                         if let Some(event) = parsed {
+                            idle.observe(&event);
                             events_parsed += 1;
 
                             // Thinking display: a partial `stream_event` line is
@@ -799,34 +802,12 @@ pub(super) async fn spawn_claude_cli_with_env(
                                         .get("subtype")
                                         .and_then(|s| s.as_str())
                                         .map(String::from);
-                                    let is_error = event
-                                        .get("is_error")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    if is_error {
-                                        let err_text = event
-                                            .get("result")
-                                            .and_then(|r| r.as_str())
-                                            .unwrap_or("Unknown stream-json error");
+                                    if let Some(error) = crate::work_outcome::result_error(
+                                        &event, max_turns,
+                                        if result_text.is_empty() { &partial_assistant_text } else { &result_text },
+                                    ) {
                                         child.kill_and_reap().await;
-                                        // Include captured stderr tail in the error so we can
-                                        // diagnose cases where Claude CLI sets is_error=true
-                                        // without a meaningful `result` text (e.g. --resume
-                                        // failures, internal CLI errors). Without this the
-                                        // error just says "Unknown stream-json error".
-                                        let stderr_tail = stderr_buf
-                                            .lock()
-                                            .ok()
-                                            .map(|g| g.trim().to_string())
-                                            .filter(|s| !s.is_empty())
-                                            .map(|s| {
-                                                let snippet = duduclaw_core::truncate_bytes(&s, 500);
-                                                format!(" | stderr: {snippet}")
-                                            })
-                                            .unwrap_or_default();
-                                        return Err(format!(
-                                            "claude CLI stream error: {err_text}{stderr_tail}"
-                                        ));
+                                        return Err(error);
                                     }
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                         // Only overwrite with the result event's text if it's
@@ -944,6 +925,10 @@ pub(super) async fn spawn_claude_cli_with_env(
                                         .and_then(|c| c.as_array())
                                     {
                                         assistant_text = duduclaw_core::think_tags::last_assistant_text(content);
+                                        if !assistant_text.trim().is_empty() {
+                                            if !partial_assistant_text.is_empty() { partial_assistant_text.push_str("\n\n"); }
+                                            partial_assistant_text.push_str(&assistant_text);
+                                        }
                                         for block in content {
                                             let block_type = block.get("type").and_then(|t| t.as_str());
                                             match block_type {
@@ -1047,25 +1032,16 @@ pub(super) async fn spawn_claude_cli_with_env(
             }
 
             // Priority 3: hard max timeout — kill truly hung processes
-            _ = &mut hard_deadline => {
-                warn!(
-                    "claude CLI hard timeout ({hard_max_timeout_secs}s) — killing process"
-                );
+            _ = idle.expired() => {
                 child.kill_and_reap().await;
-                if result_text.is_empty() && !assistant_text.is_empty() && !public_fallback {
-                    // No authoritative result: only the final text segment is eligible.
-                    result_text = std::mem::take(&mut assistant_text);
-                }
-                if result_text.is_empty() {
-                    return Err(format!(
-                        "claude CLI hard timeout ({hard_max_timeout_secs}s, no output)"
-                    ));
-                }
-                warn!(
-                    "claude CLI hard timeout — returning partial result ({} chars)",
-                    result_text.len()
-                );
-                break;
+                return Err(idle.outcome(if result_text.is_empty() { partial_assistant_text.clone() } else { result_text.clone() }).encode());
+            }
+            _ = &mut hard_deadline => {
+                child.kill_and_reap().await;
+                return Err(crate::work_outcome::WorkOutcome::TimeoutTotal {
+                    seconds: hard_max_timeout_secs,
+                    partial: if result_text.is_empty() { partial_assistant_text.clone() } else { result_text.clone() },
+                }.encode());
             }
         }
     }

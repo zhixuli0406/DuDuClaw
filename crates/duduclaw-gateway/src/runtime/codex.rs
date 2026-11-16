@@ -1103,8 +1103,11 @@ const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
+tokio::task_local! { static CODEX_IDLE_TIMEOUT: u64; }
+
 #[derive(Default)]
 struct CodexOutput {
+    idle: Option<crate::work_outcome::IdleWatch>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     line: Vec<u8>,
@@ -1151,6 +1154,9 @@ impl CodexOutput {
         // retention cap. In particular, final usage must not disappear merely
         // because earlier tool output consumed the raw-log budget.
         if let Ok(event) = serde_json::from_str::<CodexEvent>(&line) {
+            if let Some(idle) = self.idle.as_mut() {
+                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line) { idle.observe_codex(&raw); }
+            }
             let (content, input, output, chunks) = parse_codex_stdout(&line);
             if event.event_type == "turn.completed"
                 && event.extra.get("usage").and_then(|u| serde_json::from_value::<CodexUsage>(u.clone()).ok()).is_some()
@@ -1267,7 +1273,8 @@ async fn collect_codex_output_with_input(
     let mut writer_done = false;
     let mut stdout = managed.child().stdout.take().ok_or("Failed to capture codex stdout")?;
     let mut stderr = managed.child().stderr.take().ok_or("Failed to capture codex stderr")?;
-    let mut output = CodexOutput::default();
+    let mut output = CodexOutput { idle: Some(crate::work_outcome::IdleWatch::new(CODEX_IDLE_TIMEOUT.try_with(|v| *v).unwrap_or(900))), ..Default::default() };
+    let mut idle_stopped = false;
     let mut stdout_buffer = [0u8; 8192];
     let mut stderr_buffer = [0u8; 8192];
     let mut stdout_done = false;
@@ -1276,6 +1283,7 @@ async fn collect_codex_output_with_input(
     let result = tokio::time::timeout(timeout, async {
         while !writer_done || !stdout_done || !stderr_done || status.is_none() {
             tokio::select! {
+                _ = output.idle.as_ref().expect("collector idle clock").expired() => { idle_stopped = true; break; }
                 written = &mut writer, if !writer_done => {
                     written?;
                     writer_done = true;
@@ -1298,6 +1306,10 @@ async fn collect_codex_output_with_input(
         }
         Ok::<(), std::io::Error>(())
     }).await;
+    if idle_stopped {
+        managed.kill_and_reap().await;
+        return Err(output.idle.as_ref().expect("collector idle clock").outcome(output.content.clone()).encode());
+    }
     output.finish_line();
     if output.truncated {
         warn!(stdout_limit = MAX_STDOUT_BYTES, line_limit = MAX_STDOUT_LINE_BYTES,
@@ -1829,9 +1841,10 @@ async fn execute_codex_command_with_input(
     input: Option<&[u8]>,
 ) -> Result<RuntimeResponse, String> {
     let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
-    let output = collect_codex_output_with_input(
+    let idle = crate::runtime_config::idle_timeout_secs(&context.home_dir, context.agent_dir.as_deref());
+    let output = CODEX_IDLE_TIMEOUT.scope(idle, collect_codex_output_with_input(
         cmd, std::time::Duration::from_secs(timeout_secs), input,
-    ).await?;
+    )).await?;
 
     if let Some(status) = output.status {
         if !status.success() {
@@ -1846,7 +1859,7 @@ async fn execute_codex_command_with_input(
 
     // Parse JSONL output
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut response = RuntimeResponse {
+    let response = RuntimeResponse {
         partial_timeout_secs: output.status.is_none().then_some(timeout_secs),
         content: output.content.clone(),
         input_tokens: output.input_tokens,
@@ -1866,14 +1879,9 @@ async fn execute_codex_command_with_input(
     // Parse usage, native events and thinking above on both paths, even
     // when the deadline left no completed assistant message.
     if output.status.is_none() {
-        response = crate::runtime_dispatch::validate_runtime_response(response, context).await?;
-        response.content = match output.timeout_content(timeout_secs) {
-            Ok(content) => content,
-            Err(error) => {
-                crate::runtime_dispatch::record_discarded_runtime_usage(context, &response).await;
-                return Err(error);
-            }
-        };
+        crate::runtime_dispatch::record_discarded_runtime_usage(context, &response).await;
+        return Err(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: timeout_secs,
+            partial: output.completed.last().cloned().unwrap_or_default() }.encode());
     }
 
     // JSONL metadata/reasoning lines are never fallback answers.
@@ -2194,15 +2202,11 @@ mod tests {
             });
             let mut cmd = tokio::process::Command::new("fixture-never-spawned");
             let call = COLLECT_PROBE.scope(probe, execute_codex_command(&mut cmd, &context));
-            if utility {
-                let error = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((),
-                    crate::runtime_dispatch::UTILITY_CALL.scope((), call)).await.unwrap_err();
-                assert_eq!(error, "codex CLI hard timeout after 300s (partial output discarded)");
-            } else {
-                let response = crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call).await.unwrap();
-                assert_eq!(response.content, "PASS");
-                assert_eq!(response.partial_timeout_secs, Some(300));
-            }
+            let error = if utility {
+                crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), crate::runtime_dispatch::UTILITY_CALL.scope((), call)).await.unwrap_err()
+            } else { crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call).await.unwrap_err() };
+            assert_eq!(crate::work_outcome::WorkOutcome::decode(&error), Some(crate::work_outcome::WorkOutcome::TimeoutTotal {
+                seconds:300, partial:"PASS".into() }));
         }
     }
 
