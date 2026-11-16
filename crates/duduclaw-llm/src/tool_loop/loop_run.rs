@@ -1003,10 +1003,9 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
         telemetry.record_provider(&last);
     }
 
-    // Cap exhausted while still asking for tools: return the last response but
-    // flag it so callers don't mistake it for a clean end-of-turn.
+    // Exhaustion is a distinct error; incomplete tool requests must never look successful.
     if last.stop == StopReason::ToolUse {
-        last.stop = StopReason::Other(MAX_ITERS_STOP.to_string());
+        return Err(LlmError::MaxTurns { limit: cap });
     }
     if !ccr_delivery_guards.still_valid().await {
         return Err(LlmError::InvalidRequest(

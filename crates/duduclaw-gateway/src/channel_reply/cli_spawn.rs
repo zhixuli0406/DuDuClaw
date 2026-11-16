@@ -587,6 +587,7 @@ where
                 return Ok(text);
             }
             Err(e) => {
+                if crate::work_outcome::is_work_result(&e) { return Err(e); }
                 // `.mcp.json` spawn gate: the employee's MCP configuration
                 // could not be confirmed. That is not this account's fault —
                 // do not book it against account health, and do not try the

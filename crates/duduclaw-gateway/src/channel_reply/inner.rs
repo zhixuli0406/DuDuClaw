@@ -4109,12 +4109,24 @@ async fn build_reply_with_session_inner_impl(
 
     let failure = last_cli_error.unwrap_or_else(||ReplyFailure::simple(ReplyOrigin::Unknown,"No error info".into()));
     let reason = failure.reason();
-    super::health::mark(&agent_id, Some(if mcp_gate_refused { "gate_refused" } else { super::health::reason(reason) }));
+    super::health::mark(&agent_id, Some(if mcp_gate_refused && !crate::work_outcome::is_work_result(&failure) { "gate_refused" } else { super::health::reason(reason) }));
     let diagnostic = failure.audit();
     let err_str = diagnostic.to_string();
-    super::failure::mark_runtime_failure();
     let notice_reason = failure.notice_reason();
-    super::persist_failure_notice(ctx, session_id, &agent_id, &turn_id, notice_reason, turn_generation.as_deref()).await;
+    super::failure::mark_turn_failure(notice_reason);
+    let partial_saved = if !super::assembly::public_session(session_id) {
+        if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(&failure) {
+            let partial = duduclaw_core::think_tags::strip_reasoning_prefix(outcome.partial());
+            super::failure_notice::persist_work_partial(ctx, session_id, &agent_id, &partial, turn_generation.as_deref()).await
+        } else { false }
+    } else { false };
+    super::failure_notice::FAILURE_DETAILS.scope((reason.as_str(), crate::work_outcome::WorkOutcome::decode(&failure)),
+        super::persist_failure_notice(ctx, session_id, &agent_id, &turn_id, notice_reason, turn_generation.as_deref())).await;
+    if partial_saved {
+        let _ = super::ccr_delivery::CCR_TURN_DELIVERY.try_with(|delivery| {
+            delivery.failure_notice_only.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
     warn!(
         agent = %name,
         reason = ?reason,
@@ -4165,7 +4177,7 @@ async fn build_reply_with_session_inner_impl(
     // `None`, so this stays fail-quiet the same way `deep_link` itself does.
     let console_url = if failure.display_origin().is_claude_cli() {failure_console_url(&ctx.home_dir, reason)} else {None};
     let doc_url = failure.display_origin().is_claude_cli().then(||failure_doc_url(reason)).flatten();
-    let audit = serde_json::json!({
+    let mut audit = serde_json::json!({
         "event": "channel_reply_fallback",
         "agent": agent_id,
         "session_id": session_id,
@@ -4181,6 +4193,7 @@ async fn build_reply_with_session_inner_impl(
         "doc_url": doc_url,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
+    super::failure_notice::attach_failure_reference(&mut audit, reason.as_str(), &turn_id);
     // Shared JSONL appends must use the existing cross-process file lock.
     // Await off-thread I/O, then preserve the same best-effort reply path.
     let audit_home = ctx.home_dir.clone();
@@ -4198,6 +4211,17 @@ async fn build_reply_with_session_inner_impl(
         ),
     }
 
+    let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
+    let visitor = super::assembly::public_session(session_id);
+    let reference = super::failure_notice::notice_suffix(language.as_deref(), (!visitor).then_some(reason.as_str()), &turn_id);
+    if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(&failure) {
+        if visitor { return format!("{}\n{reference}", crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE); }
+        let notice = super::failure_notice::work_notice(&outcome, language.as_deref());
+        let partial = duduclaw_core::think_tags::strip_reasoning_prefix(outcome.partial());
+        return if partial.trim().is_empty() { format!("{notice}\n{reference}") }
+            else { format!("{partial}\n\n{notice}\n{reference}") };
+    }
+    let message = async {
     // A public website visitor (Odoo Live Chat) is a customer, not the
     // operator: account states, dashboard links and file names must not
     // reach them. The audit row above keeps the real reason.
@@ -4228,6 +4252,8 @@ async fn build_reply_with_session_inner_impl(
         return msg.to_string();
     }
     failure.message(&name, &ctx.home_dir)
+    }.await;
+    format!("{message}\n{reference}")
 }
 
 /// Render operational status at the audience boundary, never in model text.

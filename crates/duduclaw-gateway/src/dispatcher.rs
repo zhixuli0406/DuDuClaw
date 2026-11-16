@@ -21,6 +21,19 @@ use duduclaw_core::{
     MAX_DELEGATION_DEPTH, is_valid_discord_snowflake, truncate_bytes,
 };
 
+tokio::task_local! {
+    static DISPATCH_FAILURE_REFERENCE: DispatchFailureDelivery;
+}
+
+/// Delivery diagnostics are separate from model-authored history.
+#[derive(Clone)]
+struct DispatchFailureDelivery {
+    reference: String,
+    language: Option<String>,
+    partial: String,
+    reason: crate::channel_reply::TurnFailureReason,
+}
+
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BusMessage {
@@ -915,8 +928,19 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                 // sub-task died (silent drop). See `dispatch_failure_reply`:
                 // ordinary errors become a classified, non-leaking zh-TW notice;
                 // task-sandbox refusals carry their own operator-safe message.
-                let fallback_text = dispatch_failure_reply(&e);
-                forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target).await;
+                let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home_dir, &msg.target).await;
+                let code = match &e { DispatchError::Other(error) => crate::channel_reply::classify_cli_failure(error).as_str(), _ => "unknown" };
+                let reference = crate::work_outcome::WorkOutcome::reference(&host_text).unwrap_or_else(|| msg.id.clone());
+                let fallback_text = format!("{}\n{}", dispatch_failure_reply(&e),
+                    crate::channel_reply::failure_notice::notice_suffix(language.as_deref(), Some(code), &reference));
+                let partial = crate::work_outcome::WorkOutcome::decode(&host_text)
+                    .map(|outcome| outcome.partial().to_owned()).unwrap_or_default();
+                let reason = match &e {
+                    DispatchError::Other(error) => crate::channel_reply::classify_cli_failure(error).into(),
+                    _ => crate::channel_reply::TurnFailureReason::Unknown,
+                };
+                DISPATCH_FAILURE_REFERENCE.scope(DispatchFailureDelivery { reference, language, partial, reason },
+                    forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target)).await;
             }
         }
     }
@@ -999,6 +1023,10 @@ fn dispatch_failure_reply(error: &DispatchError) -> String {
             format!("⚠️ 子任務失敗（任務沙箱，{}）：{}", failure.code, failure.message)
         }
         DispatchError::Other(e) => {
+            if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(e) {
+                let notice = crate::channel_reply::failure_notice::work_notice(&outcome, None);
+                return if outcome.partial().trim().is_empty() { notice } else { format!("{}\n\n{notice}", outcome.partial()) };
+            }
             let label = short_failure_label(crate::channel_reply::classify_cli_failure(e));
             format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。")
         }
@@ -1059,7 +1087,9 @@ fn dispatch_failure_code(error: &DispatchError) -> String {
             FailureReason::AuthFailed => "auth_failed",
             FailureReason::RateLimited => "rate_limited",
             FailureReason::Billing => "billing",
-            FailureReason::Timeout => "timeout",
+            FailureReason::Timeout | FailureReason::TimeoutTotal => "timeout_total",
+            FailureReason::TimeoutNoProgress => "timeout_no_progress",
+            FailureReason::MaxTurns => "max_turns",
             FailureReason::SpawnError => "spawn_error",
             FailureReason::EmptyResponse => "empty_response",
             FailureReason::NoAccounts => "no_accounts",
@@ -1082,7 +1112,9 @@ fn short_failure_label(reason: crate::channel_reply::FailureReason) -> &'static 
         FailureReason::AuthFailed => "帳號未登入或認證失效",
         FailureReason::RateLimited => "API 使用量已達上限",
         FailureReason::Billing => "帳號額度已用完",
-        FailureReason::Timeout => "處理逾時",
+        FailureReason::Timeout | FailureReason::TimeoutTotal => "已達執行時限，尚未產生最終答案",
+        FailureReason::TimeoutNoProgress => "長時間沒有進展，已停止",
+        FailureReason::MaxTurns => "這一輪的步數用完了",
         FailureReason::SpawnError => "子程序啟動失敗",
         FailureReason::EmptyResponse => "未產生回應內容",
         FailureReason::NoAccounts => "沒有可用帳號",
@@ -3144,6 +3176,16 @@ pub(crate) async fn forward_delegation_response(
         return;
     };
 
+    // Apply the public-visitor boundary after resolving the actual callback.
+    let visitor_notice = DISPATCH_FAILURE_REFERENCE.try_with(|failure| {
+        let sid = format!("{channel_type}:{channel_id}");
+        (crate::channel_reply::assembly::public_session(&sid)
+            || (channel_type == "webchat" && crate::webchat::is_widget_visitor(&channel_id)))
+            .then(|| format!("{}\n{}", crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE,
+                crate::channel_reply::failure_notice::notice_suffix(failure.language.as_deref(), None, &failure.reference)))
+    }).ok().flatten();
+    let response_text = visitor_notice.as_deref().unwrap_or(response_text);
+
     // v1.8.20: look up the chain root (original origin_agent) so
     // `forward_to_channel` can cascade token resolution from the
     // callback caller → chain root → global config. Without this hop,
@@ -3432,7 +3474,9 @@ async fn append_subagent_reply_to_parent_session_with(
     // Two variants of the content — direct vs relayed. The reply body is
     // redacted per owning agent inside the closure (the owner is only known
     // once the session row is read), so only the owned strings move in.
-    let response_owned = response_text.to_string();
+    let failure = DISPATCH_FAILURE_REFERENCE.try_with(Clone::clone).ok();
+    let response_owned = failure.as_ref().map(|f| f.partial.clone()).unwrap_or_else(|| response_text.to_string());
+    let failed = failure.is_some();
     let responder_owned = responder_agent.to_string();
 
     let parent = parent_agent_id.to_string();
@@ -3447,6 +3491,11 @@ async fn append_subagent_reply_to_parent_session_with(
         std::iter::once(parent.as_str()).chain(root.as_deref()),
     );
 
+    // Capture task-local widget identity before entering spawn_blocking.
+    let candidates: Vec<_> = candidates.into_iter().map(|sid| {
+        let public = crate::channel_reply::assembly::public_session(&sid);
+        (sid, public)
+    }).collect();
     let ch_type = channel_type.to_string();
     let ch_id = channel_id.to_string();
     let responder_for_log = responder_agent.to_string();
@@ -3460,7 +3509,7 @@ async fn append_subagent_reply_to_parent_session_with(
         // Try each candidate session_id in order. Accept a session whose
         // owner matches either the direct parent OR the chain root.
         // Direct match wins if both are available for the same session.
-        for sid in &candidates {
+        for (sid, public) in &candidates {
             // RM-173: a user clear left at its original id
             // (`STUCK_USER_CLEAR`) is not a live conversation — skip it.
             let existing: Option<String> = conn
@@ -3490,6 +3539,12 @@ async fn append_subagent_reply_to_parent_session_with(
                 );
                 continue;
             };
+
+            // Match direct-channel history: public visitors retain no failed
+            // partials; other sessions retain only nonempty model partials.
+            if failed && (*public || response_owned.trim().is_empty()) {
+                return Ok(Some((sid.clone(), is_relayed)));
+            }
 
             let content = subagent_reply_turn_content(
                 redaction.as_ref(),
@@ -3530,6 +3585,18 @@ async fn append_subagent_reply_to_parent_session_with(
 
     match result {
         Ok(Ok(Some((sid, is_relayed)))) => {
+            if let Some(failure) = failure {
+                match crate::session::SessionManager::new(&home_dir.join("sessions.db")) {
+                    Ok(manager) => {
+                        if let Err(error) = manager.record_turn_failure(&sid, &failure.reference,
+                            failure.reason, failure.language.as_deref(), None).await {
+                            warn!(%error, "Delegation failure notice persistence failed");
+                        }
+                    }
+                    Err(error) => warn!(%error, "Delegation failure session store unavailable"),
+                }
+            }
+
             info!(
                 parent = %parent_agent_id,
                 responder = %responder_for_log,
@@ -5050,6 +5117,46 @@ mod tests {
             .await
             .unwrap();
         (tmp, home)
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_history_keeps_only_non_public_model_partial() {
+        for (channel, chat) in [("telegram", "42"), ("odoolivechat", "site:42"), ("webchat", "widget-visitor:42")] {
+            for partial in ["", "模型完成的部分"] {
+                let sid = format!("{channel}:{chat}");
+                let (_tmp, home) = setup_parent_session(&sid, "agnes").await;
+                let failure = DispatchFailureDelivery {
+                    reference: "failure-ref".into(), language: Some("zh-TW".into()), partial: partial.into(),
+                    reason: crate::channel_reply::TurnFailureReason::TimeoutNoProgress,
+                };
+                crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(
+                    if channel == "webchat" { "widget-visitor:42" } else { "member" }.into(),
+                    DISPATCH_FAILURE_REFERENCE.scope(failure,
+                        append_subagent_reply_to_parent_session(&home, channel, chat, None, "agnes", None,
+                            "worker", "platform notice and failure-ref")),
+                ).await;
+                let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+                let messages = sm.get_messages(&sid).await.unwrap();
+                let assistants: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
+                assert_eq!(assistants.len(), usize::from(channel == "telegram" && !partial.is_empty()));
+                if let Some(message) = assistants.first() {
+                    assert!(message.content.contains(partial));
+                    assert!(!message.content.contains("failure-ref"));
+                    assert!(!message.content.contains("platform notice"));
+                }
+                let conn = rusqlite::Connection::open(home.join("sessions.db")).unwrap();
+                let visible_notices: i64 = conn.query_row(
+                    "SELECT count(*) FROM session_messages WHERE role='assistant' AND hidden=0 AND content LIKE '%failure-ref%'",
+                    [], |r| r.get(0)).unwrap();
+                assert_eq!(visible_notices, 0);
+                if channel == "telegram" {
+                    let hidden: i64 = conn.query_row(
+                        "SELECT count(*) FROM session_messages WHERE hidden=1 AND notice_kind='turn_failure'",
+                        [], |r| r.get(0)).unwrap();
+                    assert_eq!(hidden, 1);
+                }
+            }
+        }
     }
 
     #[tokio::test]

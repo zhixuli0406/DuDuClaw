@@ -81,12 +81,13 @@ impl ReplyFailure {
                 .requested
                 .map(ReplyOrigin::Runtime)
                 .unwrap_or(ReplyOrigin::Unknown),
-            summary: error.to_string(),
+            summary: error.legacy_message(),
             runtime: Some(error),
             secondary: None,
         }
     }
     pub(super) fn stop_fallbacks(&self) -> bool {
+        if crate::work_outcome::is_work_result(&self.summary) { return true; }
         if self.spawn_gate_message().is_some() { return true; }
         if self.runtime.as_ref().is_some_and(|failure| failure.preflight.is_some()) { return true; }
         crate::budget::budget_refusal_message(&self.summary).is_some()

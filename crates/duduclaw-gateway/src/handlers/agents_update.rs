@@ -934,7 +934,7 @@ impl MethodHandler {
 
             // ── Runtime ([runtime] section, RT.1) ──
             // provider enum / fallback.
-            let rt_outcome = super::runtime_apply::apply_runtime_with_timeout_ceiling(table, &params_clone, crate::runtime_config::TimeoutPolicy::load(&home_for_update).max_secs)?;
+            let rt_outcome = super::runtime_apply::apply_runtime_with_limits(table, &params_clone, crate::runtime_config::TimeoutPolicy::load(&home_for_update).max_secs, duduclaw_core::turn_limits::TurnPolicy::load(&home_for_update).limit)?;
             changes.extend(rt_outcome.changes);
             if let Ok(mut slot) = deprecated_for_closure.lock() {
                 *slot = rt_outcome.deprecated;
@@ -1079,9 +1079,10 @@ impl MethodHandler {
                         pt.insert("timezone".into(), toml::Value::String(v.into()));
                         changes.push(format!("proactive.timezone = \"{v}\""));
                     }
-                    if let Some(v) = p.get("max_turns").and_then(|v| v.as_u64()) {
-                        if v == 0 || v > 100 {
-                            return Err("proactive max_turns must be 1-100".into());
+                    if let Some(value) = p.get("max_turns") {
+                        let v = value.as_u64().ok_or("proactive max_turns must be an integer between 1 and 64")?;
+                        if v == 0 || v > u64::from(duduclaw_core::types::MAX_PROACTIVE_TURNS) {
+                            return Err("proactive max_turns must be 1-64".into());
                         }
                         pt.insert("max_turns".into(), toml::Value::Integer(v as i64));
                         changes.push(format!("proactive.max_turns = {v}"));
@@ -1167,7 +1168,13 @@ impl MethodHandler {
 
             // ── v1.68 authority guard: a real change to an org-guarded key
             // needs an admin; every change is audited after the commit. ──
-            let authority = super::agent_authority::authority_diff_with_timeout_policy(&table_before, table, crate::runtime_config::TimeoutPolicy::load(&home_for_update));
+            let turn_policy = if !caller_is_admin {
+                duduclaw_core::turn_limits::TurnPolicy::load_checked(&home_for_update)?
+            } else { duduclaw_core::turn_limits::TurnPolicy::load(&home_for_update) };
+            let idle_default = crate::runtime_config::idle_policy_checked(&home_for_update)?;
+            let mut authority = super::agent_authority::authority_diff_with_runtime_policy(&table_before, table, crate::runtime_config::TimeoutPolicy::load(&home_for_update), turn_policy);
+            authority.retain(|c| c.key != "runtime.idle_timeout_secs");
+            authority.extend(super::agent_authority::idle_authority_diff(&table_before, table, idle_default));
             if !authority.is_empty() && !caller_is_admin {
                 let keys: Vec<&str> = authority.iter().map(|c| c.key.as_str()).collect();
                 // The model↔provider auto-align above is what moved the

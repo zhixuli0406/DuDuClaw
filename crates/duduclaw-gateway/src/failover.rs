@@ -127,7 +127,7 @@ impl FailoverManager {
         fallback: &'a str,
         error: &str,
     ) -> Option<&'a str> {
-        if model::is_llm_fallback_error(error)
+        if !crate::work_outcome::is_work_result(error) && model::is_llm_fallback_error(error)
             && model::should_attempt_model_fallback(primary, fallback)
         {
             Some(fallback)
@@ -275,7 +275,8 @@ impl FailoverManager {
                     return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
                         RuntimePreflightKind::Budget, message.to_owned()));
                 }
-                if !crate::autonomous_runtime::was_denied() && !error.starts_with("AUTONOMY_PAUSED:") {
+                if crate::work_outcome::WorkOutcome::decode(&error).is_none()
+                    && !crate::autonomous_runtime::was_denied() && !error.starts_with("AUTONOMY_PAUSED:") {
                     self.record_failure(fb).await;
                 }
                 failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::ExecutionError(error));Err(failure)
@@ -385,6 +386,7 @@ fn record_successful_response(runtime:&RuntimeType,context:&RuntimeContext,respo
 /// Avoids broad substring matches like "safety" or "content policy" that
 /// could unintentionally match legitimate error descriptions.
 fn is_non_retryable(error: &str) -> bool {
+    if crate::work_outcome::is_work_result(error) { return true; }
     if error.starts_with("AUTONOMY_PAUSED:") { return true; }
     let lower = error.to_lowercase();
     // 4xx client errors (except 429 rate limit which is retryable)
@@ -473,6 +475,58 @@ mod tests {
         async fn is_available(&self) -> bool {
             true
         }
+    }
+
+    struct WorkOutcomeRuntime(String);
+
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for WorkOutcomeRuntime {
+        fn name(&self) -> &str { "work-outcome" }
+        async fn execute(&self, _: &str, _: &RuntimeContext) -> Result<RuntimeResponse, String> {
+            Err(self.0.clone())
+        }
+        async fn is_available(&self) -> bool { true }
+    }
+
+    #[tokio::test]
+    async fn fallback_work_outcomes_leave_health_unchanged() {
+        use crate::work_outcome::WorkOutcome;
+        for outcome in [WorkOutcome::MaxTurns { limit:7, partial:String::new() },
+            WorkOutcome::TimeoutTotal { seconds:60, partial:String::new() },
+            WorkOutcome::TimeoutNoProgress { seconds:60, tool:None, partial:String::new() }] {
+            let mgr = FailoverManager::new(300);
+            let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+            // Primary is unregistered; the healthy fallback actually executes.
+            runtimes.insert(RuntimeType::Claude, Box::new(WorkOutcomeRuntime(outcome.encode())));
+            let registry = RuntimeRegistry::with_runtimes(runtimes);
+            for _ in 0..3 {
+                let error = mgr.execute_with_failover(&registry, &RuntimeType::Grok, Some(&RuntimeType::Claude),
+                    "task", &stub_context(), &strings(&["claude-sonnet-4-6"])).await.unwrap_err();
+                assert!(error.contains(&outcome.encode()));
+            }
+            let fallback = mgr.health_summary().await.into_iter()
+                .find(|health| health.runtime_type == RuntimeType::Claude).unwrap();
+            assert_eq!(fallback.consecutive_failures, 0);
+            assert!(fallback.is_available);
+            assert!(fallback.cooldown_until.is_none());
+            assert!(fallback.last_failure.is_none());
+            assert!(fallback.last_success.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn untyped_timeout_still_uses_runtime_fallback() {
+        let mgr = FailoverManager::new(300);
+        let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        runtimes.insert(RuntimeType::Grok, Box::new(WorkOutcomeRuntime("connection timed out".into())));
+        runtimes.insert(RuntimeType::Claude, Box::new(StubRuntime { content:"recovered" }));
+        let registry = RuntimeRegistry::with_runtimes(runtimes);
+        let response = mgr.execute_with_failover(&registry, &RuntimeType::Grok, Some(&RuntimeType::Claude),
+            "task", &stub_context(), &strings(&["claude-sonnet-4-6"])).await.unwrap();
+        assert_eq!(response.content, "recovered");
+        let primary = mgr.health_summary().await.into_iter()
+            .find(|health| health.runtime_type == RuntimeType::Grok).unwrap();
+        assert_eq!(primary.consecutive_failures, 1);
     }
 
     fn stub_context() -> RuntimeContext {
@@ -1006,3 +1060,19 @@ mod tests {
 #[cfg(test)]
 #[path="failover/routing_failure_tests.rs"]
 mod routing_failure_tests;
+
+#[cfg(test)]
+mod work_limit_tests {
+    use super::*;
+    #[test]
+    fn work_limits_refuse_runtime_and_model_fallbacks() {
+        use crate::work_outcome::WorkOutcome;
+        for outcome in [WorkOutcome::MaxTurns { limit:7, partial:String::new() },
+            WorkOutcome::TimeoutTotal { seconds:60, partial:String::new() },
+            WorkOutcome::TimeoutNoProgress { seconds:60, tool:None, partial:String::new() }] {
+            let error = outcome.encode();
+            assert!(is_non_retryable(&error));
+            assert!(FailoverManager::model_fallback_for("claude-opus-4-6", "claude-sonnet-4-6", &error).is_none());
+        }
+    }
+}

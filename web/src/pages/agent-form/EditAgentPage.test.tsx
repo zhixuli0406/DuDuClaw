@@ -85,6 +85,15 @@ beforeEach(() => {
 });
 
 describe('EditAgentPage', () => {
+  it('shows the optional employee step budget next to the time limit', async () => {
+    mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'claude', max_turns: 75 }, max_turns_limit: 120, default_max_turns: 60 });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    const field = await screen.findByRole('spinbutton', { name: 'Step limit' });
+    await waitFor(() => expect(field).toHaveValue(75));
+    expect(field).toHaveAttribute('max', '120');
+    expect(field).toHaveAttribute('placeholder', '60');
+  });
+
   it('shows the effective Claude default and configured ceiling', async () => {
     mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'claude' }, effective_timeout_secs: 1800, max_timeout_secs: 7200 });
     renderAt('/agents/my-bot/edit?tab=brain');

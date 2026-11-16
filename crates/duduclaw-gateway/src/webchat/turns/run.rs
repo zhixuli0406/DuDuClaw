@@ -678,7 +678,7 @@ async fn notify_destinations(
         Some(agent) => crate::prompt_identity::resolve_fixed_message_language_for_id(&state.ctx.home_dir, agent).await,
         None => None,
     };
-    let Ok(notice) = serde_json::to_string(&ChatMessage::error_coded(reason.text(language.as_deref()), REPLY_UNDELIVERED_CODE))
+    let Ok(notice) = serde_json::to_string(&ChatMessage::error_coded(reason.render(language.as_deref(), turn, crate::channel_reply::assembly::public_session(sid)), REPLY_UNDELIVERED_CODE))
         else { return; };
     let fence = || crate::channel_reply::ReplyDeliveryFence::content_free().for_turn(cancel);
     let deadline = tokio::time::Instant::now() + NOTICE_RETRY_WINDOW;

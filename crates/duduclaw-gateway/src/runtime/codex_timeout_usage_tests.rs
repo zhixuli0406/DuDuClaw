@@ -84,19 +84,12 @@ async fn measured_attempts(home: &Path, fallback: bool) {
         ),
     ).await;
     assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(fallback_calls.load(Ordering::SeqCst), usize::from(fallback));
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0, "work deadlines never invoke a fallback");
     let usage = rows(home, "worker");
-    assert_eq!(usage.len(), if fallback { 2 } else { 1 });
+    assert_eq!(usage.len(), 1);
     assert_eq!(usage[0], ("dispatch".into(), "gpt-5.4".into(), 11, 7, 3,
         Some("worker".into()), Some("timeout-task".into()), Some(7)));
-    if fallback {
-        let response = result.unwrap();
-        assert_eq!(response.runtime_name, "claude");
-        assert_eq!(usage[1], ("dispatch".into(), response.model_used, 23, 5, 3,
-            Some("worker".into()), Some("timeout-task".into()), Some(7)));
-    } else {
-        assert!(result.unwrap_err().legacy_message().contains("partial output discarded"));
-    }
+    assert!(result.unwrap_err().legacy_message().contains("partial output discarded"));
 }
 
 #[test]

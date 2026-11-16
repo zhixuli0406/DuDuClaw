@@ -89,6 +89,8 @@ const PER_AGENT_SCALAR_FIELDS: &[(&str, &str)] = &[
     // Clearing a per-agent timeout adopts the provider/global policy default,
     // never a wider preset value behind the Owner authority gate.
     ("runtime", "timeout_secs"),
+    ("runtime", "idle_timeout_secs"),
+    ("runtime", "max_turns"),
     ("os_watch", "paths"),
     ("model", "account_pool"),
     ("container", "additional_mounts"),
@@ -1177,7 +1179,7 @@ max_active_skills = 2
     fn runtime_timeout_is_never_inherited_when_owner_clears_override() {
         let h = home();
         let dir = write_agent(h.path(), "clinic-sales", MINIMAL_AGENT);
-        write_preset(h.path(), "timeout", "[preset]\nversion='1'\n[runtime]\ntimeout_secs=3600\nprovider='codex'\n");
+        write_preset(h.path(), "timeout", "[preset]\nversion='1'\n[runtime]\ntimeout_secs=3600\nmax_turns=150\nprovider='codex'\n");
         let parsed = load_preset(h.path(), "timeout").unwrap();
         assert!(parsed.stripped_other.contains(&"runtime.timeout_secs".to_string()));
         assert!(parsed.config["runtime"].get("timeout_secs").is_none());
@@ -1194,6 +1196,7 @@ max_active_skills = 2
         let (resolved, state) = resolve_for_agent(h.path(), "clinic-sales", &table);
         assert!(state.is_applied());
         assert!(resolved["runtime"].get("timeout_secs").is_none(), "clearing cannot reveal 3600 from the preset");
+        assert!(resolved["runtime"].get("max_turns").is_none(), "clearing cannot reveal a preset step budget");
         let sections = crate::agent_toml::parse(&toml::to_string(&resolved).unwrap());
         assert_eq!(sections.runtime.timeout_secs, None, "unset retains the runtime's 300-second default");
     }

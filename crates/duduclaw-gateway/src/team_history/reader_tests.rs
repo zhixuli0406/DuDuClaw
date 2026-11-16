@@ -221,6 +221,6 @@ async fn manager_team_history_keeps_failure_notices_without_other_hidden_rows() 
     let session = get(&sm, &scope, "line:Ccustomer").await.unwrap().unwrap();
     let notices: Vec<_> = session.rows.iter().filter(|row| row.role == "turn_failure").collect();
     assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0].content, crate::channel_reply::TurnFailureReason::Timeout.text(None));
+    assert!(notices[0].content.starts_with(crate::channel_reply::TurnFailureReason::Timeout.text(None)));
     assert!(session.rows.iter().all(|row| row.content != "PRIVATE HIDDEN"));
 }

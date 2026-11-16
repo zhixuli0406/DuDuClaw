@@ -545,3 +545,17 @@ async fn autonomy_pause_rejected_round_requires_human() {
     d.tick_once().await.unwrap();
     assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn repeated_max_turns_results_never_become_infrastructure_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    let driver = GoalLoopDriver::new(store.clone(), queue, small_cfg()).with_home_dir(dir.path().into());
+    store.insert_task(&goal_task("work-result", "alice")).await.unwrap();
+    let error = crate::work_outcome::WorkOutcome::MaxTurns { limit:7, partial:"已完成一部分".into() }.encode();
+    for _ in 0..4 {
+        assert!(driver.on_dispatch_failed(&mut HashMap::new(), "work-result", &error).await.unwrap());
+        assert!(!driver.dispatch_failures.lock().await.contains_key("work-result"));
+        assert_eq!(store.get_task("work-result").await.unwrap().unwrap().pause_reason.as_deref(), Some("max_turns"));
+    }
+}

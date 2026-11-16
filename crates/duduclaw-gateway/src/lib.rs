@@ -202,6 +202,7 @@ pub mod channel_alerts;
 pub mod channel_capabilities;
 pub mod channel_format;
 pub mod channel_reply;
+pub(crate) mod work_outcome;
 pub mod channel_settings;
 pub mod channel_typing;
 pub mod claude_runner;

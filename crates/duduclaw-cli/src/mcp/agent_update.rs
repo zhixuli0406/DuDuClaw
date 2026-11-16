@@ -200,6 +200,9 @@ pub(crate) const SELF_AUTHORITY_PARAMS: &[&str] = &[
     "db_sources_remove",
     "budget_cents",
     "reply_language",
+    "runtime",
+    "timeout_secs",
+    "max_turns",
     "role",
 ];
 

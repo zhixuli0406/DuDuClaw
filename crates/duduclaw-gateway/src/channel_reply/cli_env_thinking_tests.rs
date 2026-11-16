@@ -91,6 +91,23 @@ fn child(home: std::path::PathBuf) {
         let command = captured.lock().unwrap().take().unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
         assert!(before.argv.iter().any(|arg| arg == "hi"));
+        assert!(before.argv.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].split(',').any(|t| t == "AskUserQuestion")));
+        for minimal in [true, false] {
+            let dir = home.join("agents/agnes");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), format!("[runtime]\nminimal_context={minimal}\nmax_turns=73\n")).unwrap();
+            let capture = Arc::new(Mutex::new(None));
+            let caps = crate::night_llm::night_capabilities();
+            let error = COMMAND_CAPTURE.scope(capture.clone(), spawn_claude_cli_with_env(
+                "hi", "m", "stable", &home, Some(&dir), None, Some(&caps), &Default::default(),
+                None, None, crate::runtime_dispatch::SpawnPurpose::Utility,
+            )).await.unwrap_err();
+            assert!(error.contains("captured"), "{error}");
+            let cmd = capture.lock().unwrap().take().unwrap();
+            let args = duduclaw_core::execution_gate::command_snapshot(&cmd).argv;
+            assert!(args.windows(2).any(|w| w[0] == "--max-turns" && w[1] == "73"));
+            assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1].split(',').any(|t| t == "AskUserQuestion")));
+        }
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before,
             "channel argv, env removals and cwd survive LocalBackend registration unchanged");
 
@@ -111,7 +128,12 @@ fn child(home: std::path::PathBuf) {
         assert!(live.iter().any(|a| a == "--include-partial-messages"), "{live:?}");
         let mut without_flag = live.clone();
         without_flag.retain(|a| a != "--include-partial-messages");
-        assert_eq!(without_flag, plain, "the flag is the only difference");
+        let normalize = |args: &[String]| {
+            let mut args = args.to_vec();
+            if let Some(i) = args.iter().position(|a| a == "--system-prompt-file") { args[i + 1] = "<prompt-file>".into(); }
+            args
+        };
+        assert_eq!(normalize(&without_flag), normalize(&plain), "the flag is the only difference");
         let events = got.lock().unwrap().clone();
         let texts: Vec<String> = events.iter().filter_map(|e| e.text.clone()).collect();
         let last = texts.last().expect("thinking text shown");
@@ -135,7 +157,7 @@ fn child(home: std::path::PathBuf) {
         crate::thinking::scope_turn(Some(sink), spawn(&home))
             .await
             .unwrap();
-        assert_eq!(argv(&home, 3), plain);
+        assert_eq!(normalize(&argv(&home, 3)), normalize(&plain));
         let events = got.lock().unwrap().clone();
         assert!(!events.is_empty(), "the turn still knows it thought");
         assert!(events.iter().all(|e| e.text.is_none() && e.line.is_none()));
@@ -145,6 +167,25 @@ fn child(home: std::path::PathBuf) {
         let log = std::fs::read_to_string(home.join("claude_stream.log")).unwrap();
         assert!(log.contains(r#""elided":"thinking_delta""#));
         assert!(!log.contains(SECRET), "debug log never holds thinking text");
+        for terminal in [r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}"#,
+                         r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#] {
+            std::fs::write(home.join("stream.jsonl"), format!("{}\n{terminal}\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"已完成第一份報表"}]}}"#)).unwrap();
+            let error = spawn(&home).await.unwrap_err();
+            let outcome = crate::work_outcome::WorkOutcome::decode(&error).unwrap();
+            assert_eq!(outcome, crate::work_outcome::WorkOutcome::MaxTurns { limit: 50, partial: "已完成第一份報表".into() });
+        }
+
+        // A canonical result must survive a process that never exits.
+        // A valid idle policy must not delay returning a completed answer.
+        std::fs::write(home.join("config.toml"), "[runtime]\ndefault_idle_timeout_secs=60\n").unwrap();
+        std::fs::write(home.join("stream.jsonl"),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"完成"}
+"#).unwrap();
+        std::fs::write(home.join("hang-after-result"), "").unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), spawn(&home)).await
+            .expect("terminal cleanup must be bounded").expect("terminal result survives cleanup");
+        assert_eq!(answer, "完成");
     });
 }
 
@@ -165,7 +206,8 @@ fn l1_stub_claude_thinking_flows_by_policy() {
          n=0\nif [ -f '{h}/count' ]; then n=$(/bin/cat '{h}/count'); fi\nn=$((n+1))\n\
          printf '%s' \"$n\" > '{h}/count'\n\
          for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{h}/argv-'\"$n\"\n\
-         /bin/cat '{h}/stream.jsonl'\n",
+         /bin/cat '{h}/stream.jsonl'\n\
+         if [ -f '{h}/hang-after-result' ]; then exec /bin/sleep 300; fi\n",
         h = home.display()
     );
     crate::test_exec::write_executable(&bin.join("claude"), script, 0o755);
@@ -207,5 +249,5 @@ fn l1_stub_claude_thinking_flows_by_policy() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(std::fs::read_to_string(home.join("count")).unwrap(), "3");
+    assert_eq!(std::fs::read_to_string(home.join("count")).unwrap(), "6");
 }

@@ -486,6 +486,9 @@ pub fn build_state_block(
 /// decode to `Unknown`; adding a reason never makes an old reader resume work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseReason {
+    MaxTurns,
+    TimeoutTotal,
+    TimeoutNoProgress,
     /// The loop ran but the state stopped changing — A2 oscillation
     /// (identical `state_hash` two rounds running), or an in-round tool streak.
     NoProgress,
@@ -516,6 +519,9 @@ impl PauseReason {
     /// SQLite and shipped over the dashboard RPC as a key.
     pub fn as_str(self) -> &'static str {
         match self {
+            PauseReason::MaxTurns => "max_turns",
+            PauseReason::TimeoutTotal => "timeout_total",
+            PauseReason::TimeoutNoProgress => "timeout_no_progress",
             PauseReason::NoProgress => "no_progress",
             PauseReason::BudgetExhausted => "budget_exhausted",
             PauseReason::BlockedNeedsDecision => "blocked_needs_decision",
@@ -532,6 +538,9 @@ impl PauseReason {
     /// [`PauseReason::Unknown`].
     pub fn from_stored(stored: Option<&str>) -> Self {
         match stored.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "max_turns" => PauseReason::MaxTurns,
+            "timeout_total" => PauseReason::TimeoutTotal,
+            "timeout_no_progress" => PauseReason::TimeoutNoProgress,
             "no_progress" => PauseReason::NoProgress,
             "budget_exhausted" => PauseReason::BudgetExhausted,
             "blocked_needs_decision" => PauseReason::BlockedNeedsDecision,
@@ -554,6 +563,9 @@ impl PauseReason {
     /// [`Self::as_str`] instead of reusing this.
     pub fn label_zh(self) -> &'static str {
         match self {
+            PauseReason::MaxTurns => "這一輪的步數用完了",
+            PauseReason::TimeoutTotal => "已達執行時限",
+            PauseReason::TimeoutNoProgress => "長時間沒有進展",
             PauseReason::NoProgress => "卡住沒進展",
             PauseReason::BudgetExhausted => "費用、次數或時限用盡",
             PauseReason::BlockedNeedsDecision => "等你決策",

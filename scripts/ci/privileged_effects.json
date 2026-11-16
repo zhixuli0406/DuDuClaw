@@ -4,6 +4,30 @@
   "identity_semantics": "identity records current execution domain; target_identity is a pending migration destination. test/operator/host_service are inventory-only domains outside the native wire contract",
   "entries": [
     {
+      "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::background_idle_stops_pending_tool_and_keepalive_does_not_reset_it",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Fake CLI pending-tool/idle-clock regression using the existing BackendChild termination path."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::background_stream_parser_preserves_partial_and_empty_or_missing_result",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Isolated fake CLI stream fixture for terminal step-budget errors; no provider calls."
+    },
+    {
       "symbol": "crates/duduclaw-agent/src/account_rotator/host_inheritance_tests.rs::run_ambient_child",
       "apis": {
         "command_constructor": 1,

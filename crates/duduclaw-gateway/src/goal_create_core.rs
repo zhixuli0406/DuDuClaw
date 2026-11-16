@@ -60,7 +60,7 @@ pub struct GoalCreateRequest {
     pub duration_hours: Option<f64>,
     /// Optional positive measured task-tree spend ceiling in cents.
     pub cost_cap_cents: Option<u64>,
-    /// Optional run limit (30–3600 s) for each CLI run / API request of this
+    /// Optional run limit (30 s up to the deployment ceiling) for each CLI run / API request of this
     /// goal's rounds, replacing the employee's `[runtime] timeout_secs`.
     /// Callers decide who may exceed the employee's own limit (see
     /// [`check_timeout_widening`]); this only checks the range.
@@ -119,13 +119,13 @@ pub fn parse_cost_cap_cents(args: &serde_json::Value) -> Result<Option<u64>, Str
     }
 }
 
-const TIMEOUT_RANGE_ERROR: &str = "timeout_secs must be an integer between 30 and 3600";
+const TIMEOUT_RANGE_ERROR: &str = "timeout_secs must be an integer between 30 and 3600 (one hour)";
 
 /// Range check shared by every write of `tasks.timeout_secs`.
 pub fn check_timeout_secs(secs: Option<u64>) -> Result<(), String> {
     match secs {
         Some(s)
-            if !(crate::runtime_config::MIN_TIMEOUT_SECS..=crate::runtime_config::MAX_TIMEOUT_SECS)
+            if !(crate::runtime_config::MIN_TIMEOUT_SECS..=3600)
                 .contains(&s) =>
         {
             Err(TIMEOUT_RANGE_ERROR.into())
@@ -156,7 +156,8 @@ pub fn check_timeout_widening(
     may_widen: bool,
 ) -> Result<(), String> {
     let Some(secs) = secs else { return Ok(()) };
-    let global_max = crate::runtime_config::TimeoutPolicy::load(home_dir).max_secs;
+    check_timeout_secs(Some(secs))?;
+    let global_max = crate::runtime_config::TimeoutPolicy::load(home_dir).max_secs.min(3600);
     if secs > global_max {
         return Err(format!("timeout_secs exceeds the global ceiling ({global_max} s)"));
     }
@@ -694,7 +695,7 @@ mod tests {
         assert_eq!(parse_timeout_secs(&json!({})).unwrap(), None);
         assert_eq!(parse_timeout_secs(&json!({"timeout_secs": null})).unwrap(), None);
         assert_eq!(parse_timeout_secs(&json!({"timeout_secs": 1800})).unwrap(), Some(1800));
-        for bad in [json!(0), json!(29), json!(3601), json!(-60), json!(90.5), json!("600")] {
+        for bad in [json!(0), json!(29), json!(14401), json!(-60), json!(90.5), json!("600")] {
             assert!(parse_timeout_secs(&json!({"timeout_secs": bad})).is_err(), "{bad}");
         }
     }
@@ -751,5 +752,21 @@ mod timeout_tests {
         assert!(check_timeout_widening(home.path(), "worker", Some(300), false).is_ok());
         std::fs::write(dir.join("agent.toml"), "[runtime]\nprovider='claude'\ntimeout_secs=120\n").unwrap();
         assert!(check_timeout_widening(home.path(), "worker", Some(121), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod configured_timeout_tests {
+    use super::*;
+    #[test]
+    fn goals_remain_capped_at_one_hour_with_a_larger_global_ceiling() {
+        let home = tempfile::tempdir().unwrap();
+        for max in [600, 7200, 14400] {
+            std::fs::write(home.path().join("config.toml"), format!("[runtime]\nmax_timeout_secs={max}\n")).unwrap();
+            assert!(check_timeout_widening(home.path(), "anna", Some(max.min(3600)), true).is_ok());
+            assert!(check_timeout_widening(home.path(), "anna", Some(max + 1), true).is_err());
+        }
+        assert!(parse_timeout_secs(&serde_json::json!({"timeout_secs":7200})).unwrap_err().contains("3600 (one hour)"));
+        assert!(check_timeout_widening(home.path(), "anna", Some(7200), true).unwrap_err().contains("3600 (one hour)"));
     }
 }

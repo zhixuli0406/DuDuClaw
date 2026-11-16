@@ -1023,6 +1023,9 @@ async fn agent_update_refuses_self_authority_changes() {
     let h = home.path();
     for (key, value) in [
         ("budget_cents", serde_json::json!(999_999)),
+        ("runtime", serde_json::json!({"max_turns":100})),
+        ("max_turns", serde_json::json!(100)),
+        ("timeout_secs", serde_json::json!(600)),
         ("reply_language", serde_json::json!("en")),
         ("db_sources_add", serde_json::json!("crm")),
         ("role", serde_json::json!("main")),

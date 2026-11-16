@@ -239,7 +239,6 @@ If `provider` is absent, the agent runs on Claude. An unrecognised value logs a 
 
 Increasing the effective `timeout_secs` requires an administrator. An Owner may lower it; clearing the setting restores 300 seconds and needs an administrator only when that increases the current effective limit.
 
-Codex previously stopped at 120 seconds. Only the user-facing channel reply path returns retained completed assistant messages on timeout. Utility calls (including judges and verifiers) and all internal text-only calls discard partial output and fail with a hard-timeout error. Internal conversations also receive a time-limit notice; Odoo public visitors receive only the completed text. Incomplete JSONL items are not returned as an answer. With no completed message, the run fails as a timeout. Grok timeouts are also identified as timeouts rather than unknown errors.
 
 On Windows, managed CLI children start suspended, join a kill-on-close Job Object, and resume only after assignment succeeds. Cleanup terminates the job even if the leader already exited; assignment failure kills the child and returns an error. Native Windows execution remains unverified in this round.
 
@@ -713,3 +712,19 @@ Owner decision 2026-10-16: the subscription-login features stay as they are (set
 ## The Takeaway
 
 The AI market is multi-provider. Building on a single CLI is like writing software for a single operating system — it works until it doesn't. The `AgentRuntime` trait abstracts away the differences, letting DuDuClaw treat Claude, Codex, any OpenAI-compatible endpoint as interchangeable backends. Your agents get the best available brain, every time.
+
+## Run step budgets
+
+The step budget is configured separately: global `[runtime] default_max_turns` defaults to **50**, and `max_turns_limit` defaults to **200** (integer **1–10000**). An employee may set `[runtime] max_turns` from **1** up to that ceiling; leaving it unset uses the global default. Zero never means unlimited. Invalid or unreadable settings use bounded defaults with one warning per process; values above the ceiling are clamped during execution and rejected on dashboard save. Raising an employee's limit requires an administrator; owners may lower it, and clearing it requires an administrator if the inherited default raises the effective budget. Changing either global key also requires an administrator and is audited through the existing config commit path. The dashboard places these fields beside the time limits. More steps can consume more quota and extend runs. Claude chat, background work and terminal chat use this budget; protected mode remains fixed at 50 pending RM-098. OpenAI-compatible tool loops use an explicit employee `max_turns`, otherwise retain 10; exhaustion returns a distinct max-turns error. Headless Claude/Grok runs disable interactive question tools. Claude receives a system-prompt reminder to summarise progress and stop near its step budget. Proactive checks retain their separate `max_turns`, accepted from **1 to 64**.
+
+Web chat waits for the configured global `max_timeout_secs` plus delivery time, so it does not cut a run short before the resolved employee timeout. Goal task `timeout_secs` may range from **30 seconds** to the current global `max_timeout_secs`; each round remains capped by that setting.
+
+## Event-silence limits and continuation
+
+The global `[runtime] default_idle_timeout_secs` defaults to **900 seconds**. An employee may override it with `[runtime] idle_timeout_secs`; absent means inherit, **0 disables**, and other values must be **60..=max_timeout_secs**. With an omitted global value, a lower global maximum also narrows the default. Read or parse failures use the built-in 900 seconds. Raising or disabling an employee limit, including clearing it to a larger or disabled global default, requires administrator authority; lowering does not. The dashboard places both fields next to the execution time limits, in the employee editor and global run limits.
+
+Claude chat and background runs, Codex JSONL runs, and OpenAI-compatible SSE responses stop when no event arrives within that window. Any parsed event counts, including tool events; the periodic 90-second keep-alive notice does not. The last unfinished tool is named when known. Grok and non-streaming OpenAI-compatible requests/tool loops retain their total timeout because these paths do not expose a live event stream here. Antigravity has been removed.
+
+A step limit (`max_turns`), total timeout (`timeout_total`), or event-silence timeout (`timeout_no_progress`) ends the current turn without marking an account unhealthy, changing accounts, or retrying another model/runtime. A timeout reports that **no final answer was produced before the time limit**, even when tools ran. For signed-in channel users, captured assistant text is delivered before the notice and saved as an assistant turn; reply “continue” to resume with that context. Claude step-limit notices include the applied step count. Public visitors receive only the visitor-safe generic message and reference number, with no partial text, counts, reason code, or operator hints.
+
+Failure notices end with a stable lowercase reason code and the first eight characters of the turn reference. The audit record retains `reason_code` and the full `reference_id`; background results use the dispatch run reference. Goal-loop work limits pause with `max_turns`, `timeout_total`, or `timeout_no_progress`, without accumulating infrastructure dispatch failures.

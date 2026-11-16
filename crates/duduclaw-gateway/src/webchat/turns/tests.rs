@@ -306,7 +306,7 @@ async fn panic_emits_correlated_terminal_frame_after_cleanup() {
     let stored = sessions.webchat_history("s").await.unwrap();
     assert_eq!(stored.len(), 2);
     assert_eq!(stored[1].notice_kind.as_deref(), Some("turn_failure"));
-    assert_eq!(stored[1].message.content, crate::channel_reply::TurnFailureReason::Internal.text(None));
+    assert!(stored[1].message.content.starts_with(crate::channel_reply::TurnFailureReason::Internal.text(None)));
     let Message::Text(text) = rx.recv().await.unwrap().message else { panic!("text") };
     let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(frame["code"], "internal_error");
@@ -1085,7 +1085,7 @@ async fn empty_reply_notice_is_fixed_idempotent_and_excluded_from_the_next_promp
     let history = sessions.webchat_history("webchat:empty").await.unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[1].notice_kind.as_deref(), Some("turn_failure"));
-    assert_eq!(history[1].message.content, crate::channel_reply::TurnFailureReason::Internal.text(None));
+    assert!(history[1].message.content.starts_with(crate::channel_reply::TurnFailureReason::Internal.text(None)));
     assert_eq!(sessions.read_last_n_turns_text("webchat:empty", 10).await.unwrap(), "user: question\n");
 }
 
