@@ -1,6 +1,6 @@
 //! Durable notification handoff. Only resource names are stored, never Chat text.
 //! A crash during a turn is uncertain and must not automatically repeat effects.
-use std::{path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock, Weak}};
+use std::{collections::HashSet, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock, Weak}};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub(crate) const MAX_MESSAGE_AGE_SECS: i64 = 7 * 24 * 60 * 60;
@@ -13,7 +13,7 @@ const MAX_PENDING: i64 = 100;
 const MAX_STREAM_ROWS: i64 = 1_000;
 const MAX_STREAM_PENDING: i64 = 10;
 const MAX_PAYLOAD: usize = 2048;
-pub(crate) struct Inbox { conn: Mutex<Connection> }
+pub(crate) struct Inbox { conn: Mutex<Connection>, home: PathBuf }
 pub(crate) struct Pending { pub id: String, pub payload: String }
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Admission { Inserted, Duplicate, Full }
@@ -29,10 +29,37 @@ pub(crate) struct PendingPlaceholder {
     pub session_id: String,
     pub thread_name: Option<String>,
     pub created_at: i64,
+    pub state: String,
 }
 
-/// Explicitly retired by final delivery or silence. Dropping a cancelled or
-/// panicked turn deliberately preserves recovery evidence for the next start.
+/// Accept only canonical Chat resource components, before constructing URLs.
+pub(crate) fn parse_message_resource_name(name: &str) -> Option<(&str, &str)> {
+    let mut parts = name.split('/');
+    let (Some("spaces"), Some(space), Some("messages"), Some(message), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) else { return None; };
+    let valid = |id: &str| (1..=128).contains(&id.len()) && !matches!(id, "." | "..")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    (valid(space) && valid(message)).then_some((space, message))
+}
+
+impl PendingPlaceholder {
+    pub(crate) fn valid(&self) -> bool {
+        parse_message_resource_name(&self.message_name).is_some_and(|(space, _)| self.space == format!("spaces/{space}"))
+            && self.app_agent.as_ref().is_none_or(|s| s.len() <= 128)
+            && self.employee_id.len() <= 128 && self.app_email.len() <= 320
+            && self.session_id.len() <= 512 && self.thread_name.as_ref().is_none_or(|s| s.len() <= 512)
+            && matches!(self.state.as_str(), "pending" | "cleanup_only")
+    }
+}
+
+// Home is part of the key: independent gateways/test homes cannot hide each
+// other's rows. All registrations in the process share this set.
+fn active() -> &'static Mutex<HashSet<(PathBuf, String)>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<(PathBuf, String)>>> = OnceLock::new();
+    ACTIVE.get_or_init(Default::default)
+}
+
+/// Drop releases liveness, preserving evidence for same-process recovery.
 pub(crate) struct PlaceholderRegistration {
     store: Arc<Inbox>,
     name: String,
@@ -40,16 +67,37 @@ pub(crate) struct PlaceholderRegistration {
 }
 impl PlaceholderRegistration {
     pub(crate) fn new(store: Arc<Inbox>, row: &PendingPlaceholder) -> Result<Self, String> {
+        // Publish liveness atomically with persistence from the sweep's view.
+        let mut active = active().lock().map_err(|_| "placeholder registry unavailable")?;
         store.insert_placeholder(row)?;
+        active.insert((store.home.clone(), row.message_name.clone()));
         Ok(Self { store, name: row.message_name.clone(), retired: false.into() })
     }
-}
-impl PlaceholderRegistration {
+
+    pub(crate) fn home(&self) -> &Path { &self.store.home }
+
+    pub(crate) fn cleanup_only(&self) -> Result<(), String> {
+        self.set_state("cleanup_only")
+    }
+
+    pub(crate) fn set_state(&self, state: &str) -> Result<(), String> {
+        self.store.placeholder_access(|conn| conn.execute(
+            "UPDATE pending_placeholders SET state=?2 WHERE message_name=?1", params![self.name, state]).map(|_| ()))
+    }
+
     pub(crate) fn retire(&self) {
         if self.retired.load(std::sync::atomic::Ordering::Relaxed) { return; }
         if self.store.remove_placeholder(&self.name).is_err() {
             tracing::warn!(failed = 1, "Google Chat placeholder retirement failed");
-        } else { self.retired.store(true, std::sync::atomic::Ordering::Relaxed); }
+        } else {
+            self.retired.store(true, std::sync::atomic::Ordering::Relaxed);
+            active().lock().unwrap_or_else(|e| e.into_inner()).remove(&(self.store.home.clone(), self.name.clone()));
+        }
+    }
+}
+impl Drop for PlaceholderRegistration {
+    fn drop(&mut self) {
+        active().lock().unwrap_or_else(|e| e.into_inner()).remove(&(self.store.home.clone(), self.name.clone()));
     }
 }
 
@@ -104,12 +152,20 @@ impl Inbox {
         for suffix in ["", "-wal", "-shm"] {
             prepare_private(&PathBuf::from(format!("{}{suffix}", path.display())), false)?;
         }
-        let store = Self { conn: Mutex::new(conn) };
+        // v1 databases already have the table. Never rebuild/drop recovery rows.
+        let has_state = conn.prepare("PRAGMA table_info(pending_placeholders)")
+            .and_then(|mut q| q.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>())
+            .map_err(|_| "Google Chat placeholder migration failed")?.iter().any(|name| name == "state");
+        if !has_state {
+            conn.execute_batch("ALTER TABLE pending_placeholders ADD COLUMN state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','cleanup_only'));")
+                .map_err(|_| "Google Chat placeholder migration failed")?;
+        }
+        let store = Self { conn: Mutex::new(conn), home: home.canonicalize().map_err(|_| "placeholder home unavailable")? };
         store.prune(chrono::Utc::now().timestamp())?;
         Ok(store)
     }
 
-    // Placeholder maintenance must not spend its startup budget waiting for
+    // Placeholder maintenance must not spend its sweep budget waiting for
     // another SQLite writer or this process's notification operations.
     fn placeholder_access<T>(&self, work: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
         let conn = self.conn.try_lock().map_err(|_| "placeholder store busy")?;
@@ -120,9 +176,10 @@ impl Inbox {
     }
 
     pub(crate) fn insert_placeholder(&self, row: &PendingPlaceholder) -> Result<(), String> {
+        if !row.valid() { return Err("invalid placeholder reference".into()); }
         self.placeholder_access(|conn| conn.execute(
-            "INSERT INTO pending_placeholders(message_name,space,app_agent,app_email,employee_id,session_id,thread_name,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![row.message_name,row.space,row.app_agent,row.app_email,row.employee_id,row.session_id,row.thread_name,row.created_at]).map(|_| ()))
+            "INSERT INTO pending_placeholders(message_name,space,app_agent,app_email,employee_id,session_id,thread_name,created_at,state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![row.message_name,row.space,row.app_agent,row.app_email,row.employee_id,row.session_id,row.thread_name,row.created_at,row.state]).map(|_| ()))
     }
 
     pub(crate) fn remove_placeholder(&self, name: &str) -> Result<(), String> {
@@ -130,15 +187,49 @@ impl Inbox {
             "DELETE FROM pending_placeholders WHERE message_name=?1", [name]).map(|_| ()))
     }
 
+    #[cfg(test)]
     pub(crate) fn stale_placeholders(&self, now: i64) -> Result<Vec<PendingPlaceholder>, String> {
+        self.read_placeholders(now.saturating_sub(5), false).map(|rows| rows.into_iter().filter_map(|(_, row)| row).collect())
+    }
+
+    pub(crate) fn placeholder_active(&self, name: &str) -> bool {
+        active().lock().map(|a| a.contains(&(self.home.clone(), name.to_owned()))).unwrap_or(true)
+    }
+
+    pub(crate) fn inactive_placeholders_before(&self, cutoff: i64) -> Result<Vec<(i64, Option<PendingPlaceholder>)>, String> {
+        self.read_placeholders(cutoff, true)
+    }
+
+    fn read_placeholders(&self, cutoff: i64, exclude_active: bool) -> Result<Vec<(i64, Option<PendingPlaceholder>)>, String> {
+        let active = active().lock().map_err(|_| "placeholder registry unavailable")?;
+        let names: Vec<_> = active.iter().filter(|(home, _)| exclude_active && home == &self.home).map(|(_, name)| name).collect();
+        let names = serde_json::to_string(&names).map_err(|_| "placeholder registry unavailable")?;
         self.placeholder_access(|conn| {
-            let mut query = conn.prepare("SELECT message_name,space,app_agent,app_email,employee_id,session_id,thread_name,created_at FROM pending_placeholders WHERE created_at < ?1 ORDER BY created_at,message_name LIMIT 200")?;
-            let rows = query.query_map([now - 5], |r| Ok(PendingPlaceholder {
-                message_name: r.get(0)?, space: r.get(1)?, app_agent: r.get(2)?, app_email: r.get(3)?,
-                employee_id: r.get(4)?, session_id: r.get(5)?, thread_name: r.get(6)?, created_at: r.get(7)?,
-            }))?;
+            let mut query = conn.prepare("SELECT rowid,message_name,space,app_agent,app_email,employee_id,session_id,thread_name,created_at,state FROM pending_placeholders WHERE created_at < ?1 AND message_name NOT IN (SELECT value FROM json_each(?2)) ORDER BY created_at,message_name LIMIT 200")?;
+            let rows = query.query_map(params![cutoff, names], |r| {
+                let rowid: i64 = r.get(0)?;
+                // Validate borrowed SQLite values before allocating any stored
+                // string. Even corrupt legacy rows cannot allocate huge fields.
+                for (column, limit, optional) in [(1, 273, false), (2, 135, false), (3, 128, true),
+                    (4, 320, false), (5, 128, false), (6, 512, false), (7, 512, true), (9, 12, false)] {
+                    match r.get_ref(column)? {
+                        rusqlite::types::ValueRef::Null if optional => {},
+                        rusqlite::types::ValueRef::Text(bytes) if bytes.len() <= limit && std::str::from_utf8(bytes).is_ok() => {},
+                        _ => return Ok((rowid, None)),
+                    }
+                }
+                let Ok(created_at) = r.get(8) else { return Ok((rowid, None)); };
+                Ok((rowid, Some(PendingPlaceholder {
+                    message_name: r.get(1)?, space: r.get(2)?, app_agent: r.get(3)?, app_email: r.get(4)?,
+                    employee_id: r.get(5)?, session_id: r.get(6)?, thread_name: r.get(7)?, created_at, state: r.get(9)?,
+                })))
+            })?;
             rows.collect()
         })
+    }
+
+    pub(crate) fn remove_placeholder_row(&self, rowid: i64) -> Result<(), String> {
+        self.placeholder_access(|conn| conn.execute("DELETE FROM pending_placeholders WHERE rowid=?1", [rowid]).map(|_| ()))
     }
 
     pub(crate) fn prune(&self, now: i64) -> Result<(), String> {
@@ -244,6 +335,71 @@ fn prepare_private(path: &Path, create: bool) -> Result<(), String> {
 #[cfg(all(test, unix))]
 mod googlechat_inbox_tests {
     use super::*;
+    fn placeholder() -> PendingPlaceholder {
+        PendingPlaceholder {
+            message_name: "spaces/A/messages/client-abc123".into(), space: "spaces/A".into(),
+            app_agent: Some("sales".into()), app_email: "sales@test.invalid".into(), employee_id: "sales".into(),
+            session_id: "session".into(), thread_name: None, created_at: 1, state: "pending".into(),
+        }
+    }
+
+    #[test]
+    fn message_resource_name_accepts_only_canonical_bounded_components() {
+        for name in ["spaces/A/messages/client-abc123", "spaces/a_.-Z/messages/m_.-9"] {
+            assert!(parse_message_resource_name(name).is_some(), "{name}");
+        }
+        let max = "a".repeat(128);
+        assert!(parse_message_resource_name(&format!("spaces/{max}/messages/{max}")).is_some());
+        for id in ["", ".", "..", "a?x=y", "a#fragment", "%2e%2e", "a/b", "空白", "a b", &"a".repeat(129)] {
+            assert!(parse_message_resource_name(&format!("spaces/{id}/messages/m")).is_none(), "space {id}");
+            assert!(parse_message_resource_name(&format!("spaces/A/messages/{id}")).is_none(), "message {id}");
+        }
+        for name in ["spaces/A/messages/m/extra", "/spaces/A/messages/m", "spaces/A/messages/m/", "spaces/A/message/m", "spaces/A/messages"] {
+            assert!(parse_message_resource_name(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn placeholder_insert_bounds_every_field() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Inbox::open(home.path()).unwrap();
+        let mut boundary = placeholder();
+        boundary.app_agent = Some("a".repeat(128)); boundary.employee_id = "a".repeat(128);
+        boundary.app_email = "e".repeat(320); boundary.session_id = "s".repeat(512);
+        boundary.thread_name = Some("t".repeat(512));
+        store.insert_placeholder(&boundary).unwrap();
+        store.remove_placeholder(&boundary.message_name).unwrap();
+        for field in 0..8 {
+            let mut row = placeholder();
+            match field {
+                0 => row.message_name = "spaces/../messages/m".into(),
+                1 => row.space = "spaces/B".into(),
+                2 => row.app_agent = Some("a".repeat(129)),
+                3 => row.employee_id = "a".repeat(129),
+                4 => row.app_email = "e".repeat(321),
+                5 => row.session_id = "s".repeat(513),
+                6 => row.thread_name = Some("t".repeat(513)),
+                _ => row.state = "unknown".into(),
+            }
+            assert!(store.insert_placeholder(&row).is_err(), "field {field}");
+        }
+    }
+
+    #[test]
+    fn placeholder_v1_migration_is_additive_and_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = Connection::open(home.path().join("googlechat_inbox.db")).unwrap();
+        conn.execute_batch(include_str!("../../duduclaw-import/src/googlechat-placeholders-v183.sql")).unwrap();
+        conn.execute("INSERT INTO pending_placeholders VALUES ('spaces/A/messages/client-abc123','spaces/A','sales','sales@test.invalid','sales','session',NULL,1)", []).unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let store = Inbox::open(home.path()).unwrap();
+            assert_eq!(store.stale_placeholders(100).unwrap(), vec![placeholder()]);
+            assert_eq!(store.conn.lock().unwrap().query_row(
+                "SELECT count(*) FROM pragma_table_info('pending_placeholders') WHERE name='state'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        }
+    }
+
     #[test]
     fn placeholders_survive_reopen_and_retire_without_changing_inbound_dedupe() {
         let home = tempfile::tempdir().unwrap();
@@ -251,7 +407,7 @@ mod googlechat_inbox_tests {
             message_name: "spaces/A/messages/status".into(), space: "spaces/A".into(),
             app_agent: Some("sales".into()), app_email: "sales@test.invalid".into(), employee_id: "sales".into(),
             session_id: "googlechat:spaces/A:sales".into(), thread_name: Some("spaces/A/threads/T".into()),
-            created_at: chrono::Utc::now().timestamp() - 10,
+            created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),
         };
         let store = Inbox::open(home.path()).unwrap();
         store.insert_placeholder(&row).unwrap();

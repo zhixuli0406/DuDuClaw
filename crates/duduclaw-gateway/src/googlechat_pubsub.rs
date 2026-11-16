@@ -788,7 +788,7 @@ mod googlechat_pubsub_tests {
             message_name: "spaces/AAA/messages/interrupted".into(), space: "spaces/AAA".into(),
             app_agent: None, app_email: h.state.creds.client_email().into(), employee_id: "dudu".into(),
             session_id: "googlechat:spaces/AAA".into(), thread_name: None,
-            created_at: chrono::Utc::now().timestamp() - 10,
+            created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),
         }).unwrap();
         crate::googlechat_recovery::startup(h.home.path()).await;
         assert!(h.inbox.stale_placeholders(chrono::Utc::now().timestamp()).unwrap().is_empty());

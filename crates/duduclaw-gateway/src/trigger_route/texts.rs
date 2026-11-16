@@ -140,11 +140,20 @@ mod tests {
     }
 }
 
-/// Only used to edit an existing Google Chat placeholder after a restart.
+/// Recovery text for an existing Google Chat placeholder after an interrupted turn.
 pub fn googlechat_interrupted(lang: Lang) -> &'static str {
     match lang {
         Lang::ZhTw => "這次回覆中斷了，請再傳一次。",
         Lang::En => "This reply was interrupted. Please send your message again.",
         Lang::Ja => "返信が中断されました。もう一度メッセージを送ってください。",
+    }
+}
+
+/// Neutral cleanup for a placeholder whose answer was sent separately.
+pub fn googlechat_replied(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhTw => "（已另行回覆）",
+        Lang::En => "(Replied separately)",
+        Lang::Ja => "（別途返信済み）",
     }
 }

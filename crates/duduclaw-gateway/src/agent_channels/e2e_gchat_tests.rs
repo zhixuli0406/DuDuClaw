@@ -73,6 +73,9 @@ struct FakeGoogle {
     token_scopes: Mutex<Vec<String>>,
     patch_status: Mutex<Option<StatusCode>>,
     post_status: Mutex<Option<StatusCode>>,
+    delete_status: Mutex<Option<StatusCode>>,
+    post_delay: Mutex<Option<Duration>>,
+    unparseable_post: std::sync::atomic::AtomicBool,
 }
 
 async fn fake_google(
@@ -131,7 +134,13 @@ async fn fake_google(
     if method == Method::PATCH {
         if let Some(status) = *f.patch_status.lock().unwrap() { return status.into_response(); }
     }
+    if method == Method::DELETE {
+        if let Some(status) = *f.delete_status.lock().unwrap() { return status.into_response(); }
+    }
     if method == Method::POST {
+        let delay = *f.post_delay.lock().unwrap();
+        if let Some(delay) = delay { tokio::time::sleep(delay).await; }
+        if f.unparseable_post.load(std::sync::atomic::Ordering::SeqCst) { return "not json".into_response(); }
         if let Some(status) = *f.post_status.lock().unwrap() { return status.into_response(); }
     }
     let gate = if method == Method::POST && path.ends_with("/messages") {
@@ -143,9 +152,12 @@ async fn fake_google(
         f.first_message_started.notify_one();
         gate.acquire().await.unwrap().forget();
     }
-    axum::Json(
-        json!({"name": format!("{}/messages/m{n}", path.trim_end_matches("/messages").trim_start_matches('/'))}),
-    ).into_response()
+    let client_id = uri.query().and_then(|q| q.split('&').find_map(|v| v.strip_prefix("messageId=")));
+    let name = match client_id {
+        Some(id) => format!("{}/{id}", path.trim_start_matches('/')),
+        None => format!("{}/messages/m{n}", path.trim_end_matches("/messages").trim_start_matches('/')),
+    };
+    axum::Json(json!({"name": name})).into_response()
 }
 
 pub(crate) struct Fake {
@@ -645,7 +657,7 @@ async fn dm_reply_placement_uses_inbound_thread_reply_and_dashboard_setting() {
         assert!(!creates.is_empty());
         for (_, _, _, body) in creates { assert_eq!(body.get("thread").is_some(), expected); }
         for (_, query) in fake.state.queries.lock().unwrap().iter().filter(|(path, _)| path == &format!("/{space}/messages")) {
-            assert_eq!(query == "messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD", expected);
+            assert_eq!(query.split('&').any(|p| p == "messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"), expected);
         }
     }
     assert!(!crate::channel_settings::CONFIG_KEYS.contains(&"dm_reply_placement"));
@@ -718,7 +730,7 @@ async fn restart_sweep_patches_existing_message_with_original_employee_app() {
         message_name: "spaces/RESTART/messages/old".into(), space: "spaces/RESTART".into(),
         app_agent: Some("sales".into()), app_email: email.clone(), employee_id: "sales".into(),
         session_id: "googlechat:spaces/RESTART:sales".into(), thread_name: None,
-        created_at: chrono::Utc::now().timestamp() - 10,
+        created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),
     };
     store.insert_placeholder(&row).unwrap();
     duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
@@ -756,7 +768,7 @@ async fn restart_sweep_handles_api_failures_without_posting_a_notice() {
             message_name: "spaces/STATUS/messages/old".into(), space: "spaces/STATUS".into(),
             app_agent: Some("sales".into()), app_email: email.clone(), employee_id: "sales".into(),
             session_id: "googlechat:spaces/STATUS:sales".into(), thread_name: None,
-            created_at: chrono::Utc::now().timestamp() - age,
+            created_at: chrono::Utc::now().timestamp() - age, state: "pending".into(),
         };
         // A retained transient row is aged for the next iteration.
         store.remove_placeholder(&row.message_name).unwrap();
@@ -768,3 +780,26 @@ async fn restart_sweep_handles_api_failures_without_posting_a_notice() {
     assert_eq!(fake.state.calls.lock().unwrap().len(), 4);
     assert!(fake.state.calls.lock().unwrap().iter().all(|(method, _, bearer, _)| method == "PATCH" && bearer == &format!("Bearer tok-{email}")));
 }
+
+// Shared controls for lifecycle tests using this existing OAuth/Chat fake.
+pub(crate) fn placeholder_statuses(fake: &Fake, patch: Option<StatusCode>, post: Option<StatusCode>, delete: Option<StatusCode>) {
+    *fake.state.patch_status.lock().unwrap() = patch;
+    *fake.state.post_status.lock().unwrap() = post;
+    *fake.state.delete_status.lock().unwrap() = delete;
+}
+
+pub(crate) fn placeholder_post_behavior(fake: &Fake, delay: Option<Duration>, unparseable: bool) {
+    *fake.state.post_delay.lock().unwrap() = delay;
+    fake.state.unparseable_post.store(unparseable, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn gate_placeholder_post(fake: &Fake, gate: Arc<tokio::sync::Semaphore>) {
+    *fake.state.first_message_gate.lock().unwrap() = Some(gate);
+}
+
+pub(crate) async fn placeholder_post_started(fake: &Fake) {
+    tokio::time::timeout(Duration::from_secs(10), fake.state.first_message_started.notified()).await.unwrap();
+}
+
+pub(crate) fn chat_calls(fake: &Fake) -> Vec<(String, String, String, Value)> { fake.state.calls.lock().unwrap().clone() }
+pub(crate) fn chat_queries(fake: &Fake) -> Vec<(String, String)> { fake.state.queries.lock().unwrap().clone() }

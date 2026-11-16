@@ -115,9 +115,11 @@ static APPROVALS: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V
     Catalog { version: SchemaVersion::V180, sql: APPROVALS_V181, label: "v1.81" }];
 // Recovery state is fingerprinted for schema inventory, never imported or replayed.
 const GOOGLECHAT_INBOX_V182: &str = include_str!("googlechat-inbox-v182.sql");
-const GOOGLECHAT_INBOX_V183: &str = concat!(include_str!("googlechat-inbox-v182.sql"), include_str!("googlechat-placeholders-v183.sql"));
-static GOOGLECHAT_INBOX: [Catalog; 2] = [
+const GOOGLECHAT_INBOX_V183_V1: &str = concat!(include_str!("googlechat-inbox-v182.sql"), include_str!("googlechat-placeholders-v183.sql"));
+const GOOGLECHAT_INBOX_V183: &str = concat!(include_str!("googlechat-inbox-v182.sql"), include_str!("googlechat-placeholders-v183.sql"), include_str!("googlechat-placeholder-state-v183.sql"));
+static GOOGLECHAT_INBOX: [Catalog; 3] = [
     Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V182, label: "v1.82" },
+    Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V183_V1, label: "v1.83" },
     Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V183, label: "v1.83" },
 ];
 fn catalogs(store: Store) -> &'static [Catalog] {
