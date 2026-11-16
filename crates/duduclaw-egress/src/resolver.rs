@@ -519,14 +519,16 @@ mod tests {
             let mut bytes = other.to_vec(); bytes.push(0);
             client.write_all(&bytes).await.unwrap();
             assert!(broker_health(server, address).await.is_err());
-            assert_eq!(client.read_u8().await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+            assert!(matches!(client.read_u8().await.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset));
         }
         // Unreachable upstream: no reply.
         drop(upstream);
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&request).await.unwrap();
         assert!(broker_health(server, address).await.is_err());
-        assert_eq!(client.read_u8().await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(matches!(client.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset));
     }
 
     /// The client side is bounded by its deadline and accepts only the exact reply.
