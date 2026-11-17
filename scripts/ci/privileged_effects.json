@@ -1748,7 +1748,7 @@
       "rationale": "Desktop/OS host integration outside native Linux employee isolation; needs its own capability boundary. Not a protected-mode execution exemption."
     },
     {
-      "symbol": "crates/duduclaw-egress/src/daemon.rs::serve_control",
+      "symbol": "crates/duduclaw-egress/src/daemon.rs::serve_control_with_probe",
       "apis": {
         "terminal_spawn": 1
       },
@@ -1758,6 +1758,18 @@
       "identity": "egress",
       "migration": "not_process",
       "rationale": "JoinSet::spawn creates a Tokio task for a registered run tunnel in the existing egress process; no native child is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-egress/src/dns_probe.rs::post_lookup_worker",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "egress",
+      "migration": "not_process",
+      "rationale": "One named std thread in the existing egress process handles the DNS probe's post-lookup work before the seccomp filter is installed (with TSYNC, so the thread is filtered too); no native child is launched."
     },
     {
       "symbol": "crates/duduclaw-egress/src/forwarder.rs::forward_loop",
