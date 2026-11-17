@@ -101,8 +101,17 @@ const INSTALLED: Sha256Digest = Sha256Digest([0xee; 32]);
 enum Census { #[default] Idle, Busy(Workloads), Fails }
 const LIVE_RUN: Workloads = Workloads { live_run_units: 1, employees_cgroup_populated: false };
 const POPULATED: Workloads = Workloads { live_run_units: 0, employees_cgroup_populated: true };
+/// What PID 1 reports for the gate and the units bound to it (production:
+/// `Systemd::units_down` over `GATED_UNITS`).
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+enum Gate { #[default] Down, Up, Uncertain }
 #[derive(Default)]
-struct FakeEffects { calls: Vec<&'static str>, fail: bool, world: Option<SharedWorld>, census: Census }
+struct FakeEffects { calls: Vec<&'static str>, fail: bool, world: Option<SharedWorld>, census: Census, gate: Gate,
+    /// Every gate check, with the journal on "disk" (over a world) at that moment.
+    gate_checks: Vec<Option<PublishJournal>>,
+    /// The gate state reported from the second check on (a gate that completed
+    /// meanwhile); `None`: unchanged.
+    gate_after_first: Option<Gate> }
 impl FakeEffects {
     fn over(world: &SharedWorld) -> Self { Self { world: Some(world.clone()), ..Self::default() } }
 }
@@ -167,6 +176,16 @@ impl Effects for FakeEffects {
             Census::Fails => Err(io::Error::other("census incomplete")),
         }
     }
+    fn gated_units_down(&mut self) -> io::Result<bool> {
+        let journal = self.world.as_ref().and_then(|world| world.lock().unwrap().disk.as_ref().and_then(MemoryStore::journal));
+        self.gate_checks.push(journal);
+        if self.gate_checks.len() > 1 { if let Some(gate) = self.gate_after_first { self.gate = gate; } }
+        match self.gate {
+            Gate::Down => Ok(true),
+            Gate::Up => Ok(false),
+            Gate::Uncertain => Err(io::Error::other("bus answer uncertain")),
+        }
+    }
 }
 /// A verified installed set and no publication (drain-only root tests).
 struct NoEffects;
@@ -182,6 +201,7 @@ impl Effects for NoEffects {
     fn installed(&mut self) -> io::Result<Option<Sha256Digest>> { Ok(Some(INSTALLED)) }
     fn readback(&mut self, _: Sha256Digest, _: bool) -> io::Result<Vec<ComponentReadback>> { Err(invalid()) }
     fn workloads(&mut self) -> io::Result<Workloads> { Ok(Workloads::default()) }
+    fn gated_units_down(&mut self) -> io::Result<bool> { Ok(true) }
 }
 
 /// Stands in for the admission loop: one iteration every 5 ms with a fixed run
@@ -1087,6 +1107,101 @@ fn update_open_apply_also_requires_an_idle_census() {
 }
 
 #[test]
+fn update_apply_refused_while_the_gate_or_a_bound_unit_is_up_or_uncertain() {
+    // The real fixed names: the gate, egress's socket and service, the gateway.
+    assert_eq!(GATED_UNITS, ["duduclaw-isolation-ready.service", "duduclaw-egress.socket", "duduclaw-egress.service",
+        "duduclaw-gateway.service"]);
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1), digest(2)]);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::over(&shared)).unwrap();
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent");
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    // PID 1 reports one of them active/starting/with a job, or no certain answer:
+    // refused after verification, before the journal and before any status change.
+    for gate in [Gate::Up, Gate::Uncertain] {
+        control.effects.gate = gate;
+        refused_outcome(&mut control, apply_command(digest(2)));
+        assert_eq!(store.journal(), None, "{gate:?}");
+        assert_eq!(slots(&shared), [Some(digest(1)); 8], "{gate:?}");
+        assert_eq!(control.report(), "consistent", "{gate:?}");
+        assert!(!control.exit_required() && !control.restart_required());
+    }
+    // All inactive: accepted, and every check ran before the journal existed.
+    control.effects.gate = Gate::Down;
+    control.effects.gate_checks.clear();
+    accepted(&mut control, apply_command(digest(2)));
+    assert_eq!(control.effects.gate_checks, vec![None, None]);
+    assert_eq!(slots(&shared), [Some(digest(2)); 8]);
+    assert_eq!(store.journal().map(|journal| journal.state), Some(PublishState::Published));
+}
+
+#[test]
+fn update_accepted_apply_leaves_consistent_before_the_journal_for_good() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1), digest(2)]);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::over(&shared)).unwrap();
+    let alive = own(&mut control);
+    let boot = boot_id().unwrap();
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent");
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    // The gate completes against the old status between the first check and
+    // the status change: the second check (after the change) refuses. The
+    // status already left `consistent` and the journal was never written.
+    control.effects.gate_after_first = Some(Gate::Up);
+    refused_outcome(&mut control, apply_command(digest(2)));
+    assert_eq!(control.effects.gate_checks.len(), 2);
+    assert_eq!(store.journal(), None);
+    assert_eq!(slots(&shared), [Some(digest(1)); 8]);
+    assert_eq!(control.report(), "recovering");
+    assert!(!status_accepted(Some(&serde_json::to_vec(&control.status()).unwrap()), &boot, Some(&alive)));
+    // The updater stops the gate again and retries: accepted, still `recovering`;
+    // this invocation never says `consistent` again (only its restart does).
+    control.effects.gate_after_first = None;
+    control.effects.gate = Gate::Down;
+    accepted(&mut control, apply_command(digest(2)));
+    assert_eq!(slots(&shared), [Some(digest(2)); 8]);
+    assert_eq!(control.report(), "recovering");
+    assert!(!status_accepted(Some(&serde_json::to_vec(&control.status()).unwrap()), &boot, Some(&alive)));
+    assert!(!control.opened());
+    assert!(!control.exit_required() && !control.restart_required());
+    drop(control);
+    // The restarted, re-verified process is the one that says `consistent`.
+    let (_barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    assert!(control.opened());
+    assert_eq!(control.report(), "consistent");
+}
+
+#[test]
+fn update_repairing_apply_also_requires_the_gate_down() {
+    // Started not consistent: the gate never completed; the updater stopped it.
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1)]);
+    shared.lock().unwrap().slots[6] = Some(digest(9));
+    let (_barrier, mut control) = restart(&store, &shared);
+    accepted(&mut control, ControlCommand::Drain { generation: digest(1) });
+    for gate in [Gate::Up, Gate::Uncertain] {
+        control.effects.gate = gate;
+        refused_outcome(&mut control, apply_command(digest(1)));
+        assert_eq!(store.journal(), None);
+        assert!(!control.restart_required());
+    }
+    control.effects.gate = Gate::Down;
+    control.effects.gate_checks.clear();
+    accepted(&mut control, apply_command(digest(1)));
+    // One check (this process never said `consistent`), then the restart path.
+    assert_eq!(control.effects.gate_checks, vec![None]);
+    assert!(control.restart_required());
+    assert_eq!(control.report(), "recovering");
+}
+
+#[test]
 fn update_employees_cgroup_census_reads_cgroupfs_fail_closed() {
     let root = tempfile::tempdir().unwrap();
     // Not the unified hierarchy (no cgroup.controllers, or not a file): no census.
@@ -1635,7 +1750,11 @@ fn activate(tree: &RootTree, control: &mut UpdateControl<DiskDrainStore, Install
     accepted(control, ControlCommand::Prepare { preparation: preparation.clone() });
     accepted(control, ControlCommand::Drain { generation });
     assert_eq!(DiskDrainStore::at(&tree.state).load().unwrap(), Some(generation));
+    // The production gate check (PID 1 over the system bus) found the gate,
+    // egress (socket and service) and the gateway down on this host.
     accepted(control, ControlCommand::Apply { preparation: preparation.clone() });
+    // An accepted publication: this process no longer says `consistent`.
+    assert_eq!(control.report(), "recovering");
     tree.assert_published(seed);
     let published = PublishJournal::new(generation, generation, previous, PublishState::Published).unwrap();
     assert_eq!(tree.journal(), Some(published));
@@ -2073,7 +2192,27 @@ fn iso_root_update_gate_drops_and_rearms_with_spawnd() {
     assert_ne!(units.state("egress").0, "active");
     units.job("StartUnit", "egress");
     units.until("dependent back after the gate", |units| units.state("egress").0 == "active");
-    // 3. Stopping spawnd stops the gate and every dependent.
+    // 3. The updater's step before Apply: stopping the gate alone stops the
+    //    dependent (BindsTo=) while spawnd keeps running; spawnd's precondition
+    //    (PID 1's filtered list, the production `units_down`) sees them up
+    //    before and down after, and a unit PID 1 never loaded as down.
+    let systemd = crate::systemd::linux::Systemd::connect().unwrap();
+    let (ready, egress) = (units.name("ready"), units.name("egress"));
+    let gated = [ready.as_str(), egress.as_str()];
+    assert!(!systemd.units_down(&gated).unwrap());
+    let spawnd = units.state("spawnd");
+    units.job("StopUnit", "ready");
+    units.until("gate and dependent stopped, spawnd running",
+        |units| ["ready", "egress"].iter().all(|role| units.state(role).0 == "inactive"));
+    assert_eq!(units.state("spawnd"), spawnd);
+    units.until("no job left on the gated units", |_| systemd.units_down(&gated).unwrap());
+    let never = format!("{}-never-loaded.service", units.prefix);
+    assert!(systemd.units_down(&[never.as_str()]).unwrap());
+    // Only a new spawnd invocation brings the gate back (Wants=).
+    let before = invocations(gate);
+    units.job("RestartUnit", "spawnd");
+    units.until("gate re-armed by the restarted spawnd", |units| units.rearmed(gate, &before));
+    // 4. Stopping spawnd stops the gate and every dependent.
     units.job("StopUnit", "spawnd");
     units.until("gate and dependent stopped with spawnd",
         |units| ["ready", "egress"].iter().all(|role| units.state(role).0 == "inactive"));

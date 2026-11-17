@@ -54,6 +54,39 @@ pub fn parse_run_unit(name: &str) -> Option<RunId> {
 pub fn run_unit_live(name: &str, active_state: &str) -> bool {
     parse_run_unit(name).is_some() && !matches!(active_state, "inactive" | "failed")
 }
+/// The `ListUnitsByPatterns` filter of the R6 census: exactly the run-unit
+/// name pattern, in every `ActiveState` but `inactive` and `failed`. A state a
+/// future systemd adds is not listed here; the census's second half (the
+/// employees cgroup must be empty) still sees any process such a unit holds.
+pub const RUN_UNIT_GLOB: &str = "duduclaw-run-*.service";
+pub const LIVE_UNIT_STATES: [&str; 6] = ["active", "reloading", "activating", "deactivating", "maintenance", "refreshing"];
+/// Hard cap on the entries one census reply may carry (spawnd never keeps more
+/// run units than this); a longer reply refuses the census.
+pub const MAX_CENSUS_UNITS: usize = 1024;
+/// The census over PID 1's filtered list (`(Id, ActiveState)` per entry):
+/// more entries than [`MAX_CENSUS_UNITS`] refuses, otherwise the live run units
+/// ([`run_unit_live`]) are counted.
+pub fn census_live_run_units<'a>(listed: impl ExactSizeIterator<Item = (&'a str, &'a str)>) -> io::Result<u32> {
+    if listed.len() > MAX_CENSUS_UNITS { return Err(invalid()); }
+    let live = listed.filter(|(name, state)| run_unit_live(name, state)).count();
+    u32::try_from(live).map_err(|_| invalid())
+}
+/// R6 `Apply` precondition over PID 1's list of `units` (`(Id, ActiveState,
+/// job id)` per loaded entry; a unit PID 1 has not loaded has no process and no
+/// job). `Ok(true)` only when every listed entry is one of `units`, at most once,
+/// `inactive` or `failed`, with no job. `Err`: an entry PID 1 should not have
+/// returned (another name, a duplicate, too many).
+pub fn units_down<'a>(units: &[&str], listed: impl ExactSizeIterator<Item = (&'a str, &'a str, u32)>) -> io::Result<bool> {
+    if listed.len() > units.len() { return Err(invalid()); }
+    let mut seen = Vec::with_capacity(units.len());
+    let mut down = true;
+    for (name, state, job) in listed {
+        if !units.contains(&name) || seen.contains(&name) { return Err(invalid()); }
+        seen.push(name);
+        down &= matches!(state, "inactive" | "failed") && job == 0;
+    }
+    Ok(down)
+}
 pub fn employee_slice(employee: EmployeeId) -> String {
     let hex: String = employee.0.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("duduclaw-employees-{hex}.slice")
@@ -234,6 +267,10 @@ pub mod linux {
             Property::DeviceAccess(v) => Value::from(v.iter().map(|(path, access)| (path.as_str(), access.as_str())).collect::<Vec<_>>()),
         }
     }
+    /// One `ListUnits*` entry: id, description, load, active and sub state,
+    /// following, unit path, job id, job type, job path.
+    type ListedUnit = (String, String, String, String, String, String,
+        OwnedObjectPath, u32, String, OwnedObjectPath);
     pub struct Systemd { connection: Connection, references: Mutex<UnitReferences> }
     /// A host-only receipt; no cgroup paths or PIDs go back over gateway IPC.
     pub struct StartedUnit { pub name: String, path: OwnedObjectPath, pub cgroup: PathBuf }
@@ -263,8 +300,6 @@ pub mod linux {
         /// Enumerate only exact daemon-generated names, including inactive units.
         /// Callers must reconcile this inventory before admitting a fresh run.
         pub fn list_runs(&self) -> io::Result<Vec<RunId>> {
-            type ListedUnit = (String, String, String, String, String, String,
-                OwnedObjectPath, u32, String, OwnedObjectPath);
             let units: Vec<ListedUnit> = self.manager()?.call("ListUnits", &()).map_err(bus_error)?;
             let mut runs: Vec<_> = units.into_iter().filter_map(|unit| parse_run_unit(&unit.0)).collect();
             runs.sort();
@@ -276,13 +311,24 @@ pub mod linux {
         /// many run units PID 1 currently has loaded in a live state
         /// ([`run_unit_live`]). Every unit that has a process, a job or a
         /// pending stop is loaded, so a run of an earlier spawnd process whose
-        /// asynchronous teardown is still in progress is counted.
+        /// asynchronous teardown is still in progress is counted. PID 1 filters
+        /// (exact run-unit pattern, live states); a reply longer than
+        /// [`MAX_CENSUS_UNITS`] refuses the census.
         pub fn live_run_units(&self) -> io::Result<u32> {
-            type ListedUnit = (String, String, String, String, String, String,
-                OwnedObjectPath, u32, String, OwnedObjectPath);
-            let units: Vec<ListedUnit> = self.manager()?.call("ListUnits", &()).map_err(bus_error)?;
-            let live = units.iter().filter(|unit| run_unit_live(&unit.0, &unit.3)).count();
-            u32::try_from(live).map_err(|_| invalid())
+            let units = self.list_by_patterns(&LIVE_UNIT_STATES, &[RUN_UNIT_GLOB])?;
+            census_live_run_units(units.iter().map(|unit| (unit.0.as_str(), unit.3.as_str())))
+        }
+        /// R6 `Apply` precondition, from the same source as the census: PID 1
+        /// reports each of `units` (exact names) not loaded, or `inactive` /
+        /// `failed` with no job ([`units_down`]). A bus error is `Err`.
+        pub fn units_down(&self, units: &[&str]) -> io::Result<bool> {
+            let listed = self.list_by_patterns(&[], units)?;
+            units_down(units, listed.iter().map(|unit| (unit.0.as_str(), unit.3.as_str(), unit.7)))
+        }
+        fn list_by_patterns(&self, states: &[&str], patterns: &[&str]) -> io::Result<Vec<ListedUnit>> {
+            let units: Vec<ListedUnit> = self.manager()?.call("ListUnitsByPatterns", &(states, patterns)).map_err(bus_error)?;
+            if units.len() > MAX_CENSUS_UNITS { return Err(invalid()); }
+            Ok(units)
         }
         /// `duduclaw-spawnd.service` as PID 1 sees it now: `(MainPID,
         /// InvocationID)` (lowercase hex, 32 digits) while it is `active` with a
@@ -861,6 +907,44 @@ mod tests {
             "duduclaw-run-ABABABABABABABABABABABABABABABAB.service"] {
             assert!(!run_unit_live(name, "active"), "{name}");
         }
+    }
+    #[test]
+    fn update_census_filtered_list_is_capped() {
+        let names: Vec<String> = (0..=MAX_CENSUS_UNITS as u32).map(|n| {
+            let mut bytes = [0u8; 16]; bytes[..4].copy_from_slice(&n.to_be_bytes()); run_unit(RunId(bytes))
+        }).collect();
+        // The filter PID 1 applies: exactly the run-unit pattern, every live state.
+        assert_eq!(RUN_UNIT_GLOB, "duduclaw-run-*.service");
+        assert!(!LIVE_UNIT_STATES.iter().any(|state| matches!(*state, "inactive" | "failed")));
+        let at_cap = names[..MAX_CENSUS_UNITS].iter().map(|name| (name.as_str(), "active"));
+        assert_eq!(census_live_run_units(at_cap).unwrap(), MAX_CENSUS_UNITS as u32);
+        // One entry over the cap: the census is refused, never a partial count.
+        assert!(census_live_run_units(names.iter().map(|name| (name.as_str(), "active"))).is_err());
+        // Inactive/failed entries and foreign names are not counted.
+        let mixed = [(names[0].as_str(), "failed"), (names[1].as_str(), "deactivating"), ("duduclaw-spawnd.service", "active")];
+        assert_eq!(census_live_run_units(mixed.into_iter()).unwrap(), 1);
+    }
+    #[test]
+    fn update_gate_units_down_only_when_every_entry_is_inactive_without_job() {
+        use duduclaw_isolation::ids::ISOLATION_GATED_UNITS as UNITS;
+        // Nothing loaded, or every unit inactive/failed with no job: down.
+        assert!(units_down(&UNITS, std::iter::empty()).unwrap());
+        let all = |state: &'static str, job: u32| UNITS.iter().map(move |name| (*name, state, job)).collect::<Vec<_>>();
+        assert!(units_down(&UNITS, all("inactive", 0).into_iter()).unwrap());
+        assert!(units_down(&UNITS, [(UNITS[0], "failed", 0)].into_iter()).unwrap());
+        // Any of them active, starting, stopping, or with a queued job: not down.
+        for (state, job) in [("active", 0), ("activating", 0), ("deactivating", 0), ("reloading", 0), ("inactive", 7)] {
+            for unit in UNITS {
+                let mut listed = all("inactive", 0);
+                for entry in &mut listed { if entry.0 == unit { *entry = (unit, state, job); } }
+                assert!(!units_down(&UNITS, listed.into_iter()).unwrap(), "{unit} {state} {job}");
+            }
+        }
+        // Uncertain replies refuse: a foreign name, a duplicate, too many entries.
+        assert!(units_down(&UNITS, [("duduclaw-spawnd.service", "inactive", 0)].into_iter()).is_err());
+        assert!(units_down(&UNITS, [(UNITS[1], "inactive", 0), (UNITS[1], "inactive", 0)].into_iter()).is_err());
+        let mut long = all("inactive", 0); long.push((UNITS[0], "inactive", 0));
+        assert!(units_down(&UNITS, long.into_iter()).is_err());
     }
     #[test]
     fn fixed_unit_policy_includes_r7_chown_and_resource_hard_limits() {

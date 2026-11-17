@@ -6158,7 +6158,7 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
-      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::systemctl",
+      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::systemctl_within",
       "apis": {
         "command_constructor": 1,
         "terminal_spawn": 1
@@ -6168,7 +6168,7 @@
       ],
       "identity": "updater",
       "migration": "privileged_service",
-      "rationale": "F root updater invokes trusted /usr/bin/systemctl with fixed internal activation/readback argv, cleared environment and bounded output/time. Controlling the signed service generation is root maintenance, not employee code execution. R6: unit restarts use the fixed argv `--no-block restart <fixed unit>` preceded by `reset-failed duduclaw-spawnd.service`, then `show --property=InvocationID --value` / `is-active --quiet` polling against one deadline (RESTART_DEADLINE); no new spawn site."
+      "rationale": "F root updater invokes trusted /usr/bin/systemctl with fixed internal activation/readback argv, cleared environment and bounded output/time. Controlling the signed service generation is root maintenance, not employee code execution. R6: unit restarts use the fixed argv `--no-block restart <fixed unit>` preceded by `reset-failed duduclaw-spawnd.service`, then `show --property=Job --value` / `show --property=InvocationID --value` / `is-active --quiet` polling against one deadline (RESTART_DEADLINE). Before Apply: `stop duduclaw-isolation-ready.service`, `stop duduclaw-egress.socket`, `stop duduclaw-egress.service`, `stop duduclaw-gateway.service`, then `show --property=ActiveState --value <unit>` and `show --property=Job --value <unit>` for those four fixed units (QUIESCE_DEADLINE). Every call is bounded by min(60 s, time left before its deadline) and is not spawned when nothing is left; `systemctl` is the 60 s wrapper. Single spawn site (/usr/bin/systemctl, fixed argv)."
     },
     {
       "symbol": "crates/duduclaw-updated/src/linux/download.rs::Downloader::url",

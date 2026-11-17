@@ -54,6 +54,16 @@ pub const ISOLATION_READY_UNIT: &str = "duduclaw-isolation-ready.service";
 /// single-binary gateway unit (no spawnd on those hosts) must not carry them.
 pub const ISOLATED_GATEWAY_UNIT_DEPENDENCIES: &str =
     "BindsTo=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n";
+/// The egress service (bound to [`ISOLATION_READY_UNIT`]) and the socket that
+/// activates it, and the isolated-install gateway unit (bound to it as well).
+pub const EGRESS_UNIT: &str = "duduclaw-egress.service";
+pub const EGRESS_SOCKET_UNIT: &str = "duduclaw-egress.socket";
+pub const ISOLATED_GATEWAY_UNIT: &str = "duduclaw-gateway.service";
+/// R6 `Apply` precondition: the consistency gate, every unit bound to it and
+/// the socket that could start one of them again. The updater stops and checks
+/// exactly these before `Apply`; spawnd refuses `Apply` unless PID 1 reports
+/// each of them inactive with no pending job.
+pub const ISOLATION_GATED_UNITS: [&str; 4] = [ISOLATION_READY_UNIT, EGRESS_SOCKET_UNIT, EGRESS_UNIT, ISOLATED_GATEWAY_UNIT];
 
 /// Inclusive numeric interval, checked before allocation (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +135,8 @@ mod tests {
         assert_eq!(lines, [format!("BindsTo={ISOLATION_READY_UNIT}"), format!("After={ISOLATION_READY_UNIT}")]);
         // Requires= alone would leave the gateway running after the gate drops.
         assert!(!ISOLATED_GATEWAY_UNIT_DEPENDENCIES.contains("Requires="));
+        assert_eq!(ISOLATION_GATED_UNITS, ["duduclaw-isolation-ready.service", "duduclaw-egress.socket",
+            "duduclaw-egress.service", "duduclaw-gateway.service"]);
     }
     #[test]
     fn uid_range_checks_fail_closed() {

@@ -29,7 +29,12 @@
 //! an empty employees cgroup. Without an admission loop (set not consistent at
 //! start) the census alone answers `Drain` and gates `Apply`: runs of an
 //! earlier spawnd process may still be tearing down. A census that cannot be
-//! completed refuses.
+//! completed refuses. After the generation verified and before its journal is
+//! written, `Apply` also requires PID 1 (same bus source) to report the
+//! consistency gate, the units bound to it and egress's socket ([`GATED_UNITS`])
+//! inactive with no job; an open process then says `recovering` (status file
+//! written first, or refused) for the rest of its life, so the gate the updater
+//! stopped is re-armed only by the restarted, re-verified spawnd.
 //!
 //! Publication journal (`/var/lib/duduclaw-spawnd/publish.json`, format in
 //! `duduclaw_updated::publish_journal`, plan R6 addendum): one rename per file is
@@ -271,7 +276,14 @@ pub trait Effects {
     /// Employee workloads as PID 1 and cgroupfs see them now, whichever spawnd
     /// process started them. `Err`: the census could not be completed.
     fn workloads(&mut self) -> io::Result<Workloads>;
+    /// From the census's source (PID 1 over the system bus): the consistency
+    /// gate and the units bound to it ([`GATED_UNITS`]) are all inactive with no
+    /// pending job. `false`: one is not; `Err`: the answer is uncertain.
+    fn gated_units_down(&mut self) -> io::Result<bool>;
 }
+/// The consistency gate, the units bound to it and egress's activating socket
+/// (fixed names, `duduclaw_isolation::ids`).
+pub const GATED_UNITS: [&str; 4] = duduclaw_isolation::ids::ISOLATION_GATED_UNITS;
 
 /// The workload census behind `Drain` (no admission loop) and `Apply`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -306,6 +318,10 @@ fn system_census() -> io::Result<Workloads> {
     let systemd = crate::systemd::linux::Systemd::connect()?;
     let live_run_units = systemd.live_run_units()?;
     Ok(Workloads { live_run_units, employees_cgroup_populated: employees_cgroup_populated(Path::new(CGROUP_ROOT))? })
+}
+/// Production gate check: PID 1's filtered unit list over the system bus.
+fn system_gated_units_down() -> io::Result<bool> {
+    crate::systemd::linux::Systemd::connect()?.units_down(&GATED_UNITS)
 }
 
 /// What [`UpdateControl::new`] found and did at start (audit and status).
@@ -378,8 +394,9 @@ fn boot_id() -> io::Result<String> {
 pub(crate) struct UpdateStatus {
     schema: u16,
     /// `consistent` (verified at this process's start and fully opened, journal
-    /// absent or `published`), `recovering` (verified, not yet opened; or a
-    /// repaired set waiting for the restart) or `inconsistent` (also: an opened
+    /// absent or `published`), `recovering` (verified, not yet opened; a
+    /// repaired set waiting for the restart; or an open process that accepted
+    /// an `Apply` and waits for its restart) or `inconsistent` (also: an opened
     /// set a later request left inconsistent; this process is exiting).
     set: &'static str,
     /// With `inconsistent`: the fixed reason code.
@@ -440,8 +457,19 @@ fn announce(line: &str) {
 fn publish_verified<S: JournalStore, E: Effects>(store: &mut S, effects: &mut E, generation: Sha256Digest,
     expected_manifest: Option<Sha256Digest>, previous: Option<Sha256Digest>, preparation: Option<&Preparation>)
     -> io::Result<()> {
+    let manifest = verified_manifest(effects, generation, expected_manifest, preparation)?;
+    publish_journaled(store, effects, generation, manifest, previous)
+}
+/// [`publish_verified`]'s first half: the complete verification, nothing written.
+fn verified_manifest<E: Effects>(effects: &mut E, generation: Sha256Digest, expected_manifest: Option<Sha256Digest>,
+    preparation: Option<&Preparation>) -> io::Result<Sha256Digest> {
     let manifest = effects.verify(generation, preparation)?;
     if expected_manifest.is_some_and(|expected| expected != manifest) { return Err(invalid()); }
+    Ok(manifest)
+}
+/// [`publish_verified`]'s second half, for a generation just verified.
+fn publish_journaled<S: JournalStore, E: Effects>(store: &mut S, effects: &mut E, generation: Sha256Digest,
+    manifest: Sha256Digest, previous: Option<Sha256Digest>) -> io::Result<()> {
     let mut journal = PublishJournal::new(generation, manifest, previous, PublishState::Publishing).map_err(|_| invalid())?;
     // 1. Durable before the first destination is touched.
     store.persist_journal(&journal)?;
@@ -501,6 +529,12 @@ enum Phase {
     Verified,
     /// Verified and everything opened ([`UpdateControl::opened`]).
     Open,
+    /// Was `Verified`/`Open`, then an `Apply` was accepted for publication:
+    /// the status said `recovering` before its journal was written and says so
+    /// for the rest of this process. The admission loop still runs (closed by
+    /// the drain barrier); only the restarted, re-verified spawnd says
+    /// `consistent` again, so a stopped gate is re-armed only by that invocation.
+    Superseded,
     /// Not consistent at start: only the update endpoint is open, no admission
     /// loop exists, so no run can be admitted by this process.
     Closed,
@@ -578,7 +612,7 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
     /// must exit with [`EXIT_SET_INCONSISTENT`] (admission is already closed).
     pub(crate) fn exit_required(&self) -> bool { self.phase == Phase::Failed }
     /// The admission loop of this process runs (or is about to).
-    fn admission_live(&self) -> bool { matches!(self.phase, Phase::Verified | Phase::Open) }
+    fn admission_live(&self) -> bool { matches!(self.phase, Phase::Verified | Phase::Open | Phase::Superseded) }
     pub(crate) fn status(&mut self) -> UpdateStatus {
         let (barrier, barrier_generation) = barrier_words(self.barrier.closure());
         let (startup_barrier, startup_barrier_generation) = barrier_words(self.startup.drain);
@@ -595,8 +629,10 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
             // A later request of this open process left the set inconsistent:
             // admission is closed and the process exits (the gate drops with it).
             Phase::Failed => ("inconsistent", Some(later)),
-            Phase::Open if !publication_consistent => ("inconsistent", Some(later)),
+            Phase::Open | Phase::Superseded if !publication_consistent => ("inconsistent", Some(later)),
             Phase::Open => ("consistent", None),
+            // A publication was accepted: only the restarted spawnd may say `consistent`.
+            Phase::Superseded => ("recovering", None),
         };
         UpdateStatus { schema: STATUS_SCHEMA, set, closed_reason, owner: self.owner.clone(),
             admission_closed: self.barrier.is_closed(), barrier, barrier_generation, journal,
@@ -605,7 +641,10 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
     }
     /// Write the status file (when configured) and announce the `STATUS=` line
     /// when it changed. A failed write is part of the line. Returns the line.
-    pub(crate) fn report(&mut self) -> String {
+    pub(crate) fn report(&mut self) -> String { self.report_written().0 }
+    /// [`Self::report`], and whether the status file was written (`true` when
+    /// none is configured).
+    fn report_written(&mut self) -> (String, bool) {
         let status = self.status();
         let written = match &self.status_root {
             Some(root) => write_status(root, &status).is_ok(),
@@ -617,7 +656,7 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
             announce(&line);
             self.reported = Some(line.clone());
         }
-        line
+        (line, written)
     }
     /// Every refusal, whatever its cause, is the single `Refused` outcome. The
     /// set is re-checked before the reply exists ([`Self::settle`]), so no run
@@ -656,8 +695,9 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
             ControlCommand::Apply { preparation } => {
                 self.drained(preparation.generation)?;
                 let previous = self.previous_for(preparation.generation)?;
-                publish_verified(&mut self.store, &mut self.effects, preparation.generation, None, previous,
-                    Some(preparation))?;
+                let manifest = verified_manifest(&mut self.effects, preparation.generation, None, Some(preparation))?;
+                self.accept_publication()?;
+                publish_journaled(&mut self.store, &mut self.effects, preparation.generation, manifest, previous)?;
                 // A set this process found not consistent is now complete: it
                 // replies, then restarts so the next start verifies everything
                 // before opening anything (never an in-process switch).
@@ -711,6 +751,23 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
     /// employees cgroup; an incomplete census or any live workload refuses.
     fn census_idle(&mut self) -> io::Result<()> {
         if self.effects.workloads()?.idle() { Ok(()) } else { Err(invalid()) }
+    }
+    /// Apply's last precondition, after the generation verified and before its
+    /// journal: PID 1 reports the consistency gate and every unit bound to it
+    /// down ([`GATED_UNITS`]; the updater stopped them), so no component can
+    /// load a partly published set. An open process then stops saying
+    /// `consistent` for good ([`Phase::Superseded`]; the status file must land,
+    /// or the Apply is refused), so the stopped gate cannot complete against
+    /// this invocation again; and the gate is checked once more, in case it
+    /// completed against the old status before that write. A process that
+    /// started not consistent never said `consistent` (its gate is down too).
+    fn accept_publication(&mut self) -> io::Result<()> {
+        if !self.effects.gated_units_down()? { return Err(invalid()); }
+        if !self.admission_live() { return Ok(()); }
+        self.phase = Phase::Superseded;
+        if !self.report_written().1 { return Err(invalid()); }
+        if !self.effects.gated_units_down()? { return Err(invalid()); }
+        Ok(())
     }
     /// The journal's `previous` for a publication of `generation`:
     /// - a journal of the same generation (a retried `Apply`) keeps its own;
@@ -1331,6 +1388,7 @@ impl Effects for InstalledEffects {
         Ok(components(&manifest, Observed { own_image: self.own_image, live, euid, trampoline: trampoline.ok() }))
     }
     fn workloads(&mut self) -> io::Result<Workloads> { system_census() }
+    fn gated_units_down(&mut self) -> io::Result<bool> { system_gated_units_down() }
 }
 
 /// What this process observed for its readback.

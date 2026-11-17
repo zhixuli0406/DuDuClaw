@@ -96,7 +96,16 @@ it completes only for the new process. After an explicit restart of spawnd,
 egress and the gateway are restarted with the gate; after a crash or exit
 82/83 they stay stopped until started again (egress by its socket, the gateway
 by the updater or an operator), and then wait for the re-armed gate. The
-updater is not bound to spawnd, so spawnd restarts never stop it. The
+updater is not bound to spawnd, so spawnd restarts never stop it.
+
+Before every `Apply` the updater stops the gate (and with it egress and the
+gateway), then `duduclaw-egress.socket`, egress and the gateway explicitly,
+and requires PID 1 to report all four (`duduclaw_isolation::ids::ISOLATION_GATED_UNITS`)
+`inactive`/`failed` with no pending job; otherwise it aborts before `Apply`.
+spawnd refuses `Apply` unless its own system-bus readback of the same units
+agrees, and an open spawnd that accepts an `Apply` reports `recovering` (status
+file written before the publication journal) until it is restarted, so the
+stopped gate is re-armed only by the restarted, re-verified spawnd. The
 isolated-install gateway unit (written by the installer package, R3) must carry
 `duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES` (the two
 `BindsTo=`/`After=` lines). The single-binary gateway unit

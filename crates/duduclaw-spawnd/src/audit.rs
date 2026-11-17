@@ -328,6 +328,20 @@ impl AuditQueue {
             std::sync::atomic::Ordering::Relaxed, |count| Some(count.saturating_add(1)));
     }
 }
+/// The worker's rate-limit decision for one record: `Some(suppressed)` writes
+/// it, `None` suppresses it (not written). An acknowledged record bypasses the
+/// limit (and is not counted against it): those are the few security-relevant
+/// records whose caller reports whether they landed, so suppression would let
+/// a record that was never written be acknowledged as written.
+#[cfg(any(target_os = "linux", test))]
+fn admit_record(budget: &mut AuditBudget, source: u8, at_unix_ms: u64, acknowledged: bool) -> Option<u64> {
+    if acknowledged { return Some(0); }
+    budget.admit(source, at_unix_ms)
+}
+/// The acknowledgement for a write result: only `Ok(true)` (written and
+/// synced) is `true`; a suppressed (`Ok(false)`) or failed write is not.
+#[cfg(any(target_os = "linux", test))]
+fn acknowledgement(result: &std::io::Result<bool>) -> bool { matches!(result, Ok(true)) }
 #[cfg(any(target_os = "linux", test))]
 fn audit_channel() -> (AuditQueue, std::sync::mpsc::Receiver<Queued>) {
     let (sender, receiver) = std::sync::mpsc::sync_channel(QUEUE_LENGTH);
@@ -361,8 +375,8 @@ pub mod disk {
                     match receiver.recv_timeout(Duration::from_secs(60)) {
                         Ok((source, mut record, acknowledge)) => {
                             record.suppressed = record.suppressed.saturating_add(dropped.swap(0, Ordering::Relaxed));
-                            let written = log.write(source, record).is_ok();
-                            if let Some(acknowledge) = acknowledge { let _ = acknowledge.try_send(written); }
+                            let written = log.write(source, record, acknowledge.is_some());
+                            if let Some(acknowledge) = acknowledge { let _ = acknowledge.try_send(acknowledgement(&written)); }
                         }
                         Err(RecvTimeoutError::Timeout) => { let _ = log.sweep(now_ms()); }
                         Err(RecvTimeoutError::Disconnected) => {
@@ -402,10 +416,12 @@ pub mod disk {
     impl Default for AuditLog { fn default() -> Self { Self { budget: AuditBudget::new(60), pending_suppressed: 0 } } }
     impl AuditLog {
         /// Called only by the dedicated worker. No free-form diagnostics or
-        /// secret-bearing values can enter this schema.
-        pub fn write(&mut self, source: u8, mut record: Record) -> io::Result<()> {
+        /// secret-bearing values can enter this schema. `Ok(true)`: written and
+        /// synced; `Ok(false)`: suppressed by the rate limit, NOT written (never
+        /// for an `acknowledged` record, which bypasses the limit).
+        pub fn write(&mut self, source: u8, mut record: Record, acknowledged: bool) -> io::Result<bool> {
             self.pending_suppressed = self.pending_suppressed.saturating_add(record.suppressed);
-            let Some(suppressed) = self.budget.admit(source, record.at_unix_ms) else { return Ok(()); };
+            let Some(suppressed) = admit_record(&mut self.budget, source, record.at_unix_ms, acknowledged) else { return Ok(false); };
             self.pending_suppressed = self.pending_suppressed.saturating_add(suppressed);
             record.suppressed = self.pending_suppressed;
             let mut bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
@@ -429,7 +445,7 @@ pub mod disk {
                 File::open(directory)?.sync_all()
             });
             if result.is_ok() { self.pending_suppressed = 0; }
-            result
+            result.map(|()| true)
         }
         /// Runs also on recv_timeout, so an idle daemon expires its oldest logs.
         pub fn sweep(&mut self, now: u64) -> io::Result<()> {
@@ -581,6 +597,22 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
         drop(receiver);
+    }
+    #[test]
+    fn acknowledged_record_bypasses_an_exhausted_rate_limit() {
+        // The worker's default budget (60/min/source), exhausted on source 2.
+        let mut budget = AuditBudget::new(60);
+        for at in 0..60 { assert_eq!(admit_record(&mut budget, 2, at, false), Some(0)); }
+        assert_eq!(admit_record(&mut budget, 2, 61, false), None);
+        // An acknowledged record is still written, and not counted against the window.
+        for at in 62..70 { assert_eq!(admit_record(&mut budget, 2, at, true), Some(0)); }
+        assert_eq!(admit_record(&mut budget, 2, 70, false), None);
+        // The next window reports only the records the limit actually suppressed.
+        assert_eq!(admit_record(&mut budget, 2, 60_000, false), Some(2));
+        // A suppressed or failed write is never acknowledged as written.
+        assert!(acknowledgement(&Ok(true)));
+        assert!(!acknowledgement(&Ok(false)));
+        assert!(!acknowledgement(&Err(std::io::ErrorKind::PermissionDenied.into())));
     }
     #[test]
     fn bounded_output_and_event_rate() {
