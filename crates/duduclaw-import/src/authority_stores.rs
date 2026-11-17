@@ -194,7 +194,7 @@ pub(super) fn mcp_keys(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Bu
     let version=|c:&Connection|c.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0));
     if version(&conn)?!=version(&expected)? {return Err(Error::Schema);}
     if conn.query_row("PRAGMA quick_check",[],|r|r.get::<_,String>(0))?!="ok" {return Err(Error::Content);}
-    if crate::sqlite::schema(&conn)?!=crate::sqlite::schema(&expected)? {return Err(Error::Schema);}
+    crate::catalog::detect(&conn,crate::catalog::Store::McpKeys,None)?;
     conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
         AuthAction::Select=>Authorization::Allow,
         AuthAction::Read {table_name:"mcp_api_keys",column_name:"name"|"deleted_at"}

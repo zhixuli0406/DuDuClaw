@@ -49,13 +49,15 @@ const MAX_REPORTED: usize = 16;
 
 /// A legacy store with more than one accepted schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Store { Sessions, Tasks, Cron, Memory, Approvals, GoogleChatInbox }
+pub enum Store { Sessions, Tasks, Cron, Memory, Approvals, GoogleChatInbox, Users, Workflow, Autopilot, ChannelSettings, McpKeys }
 impl Store {
     pub fn file_name(self) -> &'static str {
         match self {
             Self::Sessions => "sessions.db", Self::Tasks => "tasks.db", Self::Cron => "cron_tasks.db",
             Self::Memory => "memory.db", Self::Approvals => "approvals.db",
             Self::GoogleChatInbox => "googlechat_inbox.db",
+            Self::Users => "users.db", Self::Workflow => "workflow.db", Self::Autopilot => "autopilot.db",
+            Self::ChannelSettings => "sessions.db", Self::McpKeys => "mcp_keys.db",
         }
     }
 }
@@ -71,7 +73,7 @@ impl SchemaVersion {
     pub fn label(self) -> &'static str { match self { Self::V1793 => "v1.79.3", Self::V180 => "v1.80.x", Self::V181 => "v1.81" } }
 }
 
-struct Catalog { version: SchemaVersion, sql: &'static str, label: &'static str }
+pub(crate) struct Catalog { pub(crate) version: SchemaVersion, pub(crate) sql: &'static str, pub(crate) label: &'static str }
 impl Catalog {
     const fn new(version: SchemaVersion, sql: &'static str) -> Self {
         Catalog { version, sql, label: match version { SchemaVersion::V1793 => "v1.79.3", SchemaVersion::V180 => "v1.80.x", SchemaVersion::V181 => "v1.81" } }
@@ -122,11 +124,21 @@ static GOOGLECHAT_INBOX: [Catalog; 3] = [
     Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V183_V1, label: "v1.83" },
     Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V183, label: "v1.83" },
 ];
-fn catalogs(store: Store) -> &'static [Catalog] {
+// These stores keep their existing content mappings. Centralising their exact
+// catalogs does not grant access to any additional table or column.
+static USERS: [Catalog; 1] = [Catalog::new(SchemaVersion::V1793, include_str!("users-v1793.sql"))];
+static WORKFLOW: [Catalog; 1] = [Catalog::new(SchemaVersion::V1793, include_str!("workflow-v1793.sql"))];
+static AUTOPILOT: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, include_str!("autopilot-v1793.sql")),
+    Catalog { version: SchemaVersion::V180, sql: include_str!("autopilot-v182.sql"), label: "v1.82" }];
+static CHANNEL_SETTINGS: [Catalog; 1] = [Catalog::new(SchemaVersion::V1793, include_str!("channel-settings-v1793.sql"))];
+static MCP_KEYS: [Catalog; 1] = [Catalog { version: SchemaVersion::V180, sql: include_str!("mcp-keys-v182.sql"), label: "v1.82" }];
+pub(crate) fn catalogs(store: Store) -> &'static [Catalog] {
     match store {
         Store::Sessions => &SESSIONS, Store::Tasks => &TASKS, Store::Cron => &CRON,
         Store::Memory => &MEMORY, Store::Approvals => &APPROVALS,
         Store::GoogleChatInbox => &GOOGLECHAT_INBOX,
+        Store::Users => &USERS, Store::Workflow => &WORKFLOW, Store::Autopilot => &AUTOPILOT,
+        Store::ChannelSettings => &CHANNEL_SETTINGS, Store::McpKeys => &MCP_KEYS,
     }
 }
 
@@ -252,7 +264,7 @@ fn tokens(sql: &str) -> BTreeSet<String> {
         .filter(|t| !t.is_empty()).map(str::to_ascii_lowercase).collect()
 }
 
-fn differences(actual: &[SchemaRow], expected: &[SchemaRow], expected_conn: &Connection) -> Result<Vec<Difference>> {
+pub(crate) fn differences(actual: &[SchemaRow], expected: &[SchemaRow], expected_conn: &Connection) -> Result<Vec<Difference>> {
     // (type, name) is unique in sqlite_schema; the value is (tbl_name, sql).
     fn index(rows: &[SchemaRow]) -> BTreeMap<(&str, &str), (&str, Option<&str>)> {
         rows.iter().map(|(kind, name, table, sql)| ((kind.as_str(), name.as_str()), (table.as_str(), sql.as_deref()))).collect()

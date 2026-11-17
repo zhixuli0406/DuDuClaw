@@ -191,8 +191,7 @@ fn users_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     let mut conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     crate::sqlite::harden(&mut conn)?;
     check_sqlite(&conn)?;
-    let expected=Connection::open_in_memory()?;expected.execute_batch(include_str!("users-v1793.sql"))?;
-    if crate::sqlite::schema(&conn)?!=crate::sqlite::schema(&expected)? {return Err(Error::Schema);}
+    crate::catalog::detect(&conn,crate::catalog::Store::Users,None)?;
     conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
         AuthAction::Select=>Authorization::Allow,
         AuthAction::Read {table_name:"users",column_name:"id"|"email"|"display_name"|"role"|"department"}

@@ -1,5 +1,6 @@
 [package]
 name = "duduclaw-import"
+default-run = "duduclaw-import"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
