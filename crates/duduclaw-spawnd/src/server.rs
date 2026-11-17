@@ -120,6 +120,15 @@ pub(crate) fn coordination_time_ms() -> io::Result<u64> {
 pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listener,
     gateway: (u32, u32), snapshots: SnapshotAuthority, host: H, limits: Limits,
     audit: crate::audit::disk::AuditWorker) -> io::Result<()> {
+    serve_with_drain(listener, gateway, snapshots, host, limits, audit, None)
+}
+
+/// [`serve`] bound to the R6 update drain barrier (`update_control`): admission
+/// refuses new runs while it is closed, and every iteration reports the
+/// admitted run count observed after that iteration's admissions.
+pub fn serve_with_drain<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listener,
+    gateway: (u32, u32), snapshots: SnapshotAuthority, host: H, limits: Limits,
+    audit: crate::audit::disk::AuditWorker, drain: Option<crate::admission::DrainBarrier>) -> io::Result<()> {
     harden_process()?;
     use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
     let handler = SigAction::new(SigHandler::Handler(stop), SaFlags::empty(), SigSet::empty());
@@ -127,9 +136,12 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
     unsafe { sigaction(Signal::SIGTERM, &handler)?; sigaction(Signal::SIGINT, &handler)?; }
     if snapshots.gateway_uid != gateway.0 { return Err(unavailable()); }
     let mut coordinator = Coordinator::new(host, limits).map_err(|_| unavailable())?;
+    if let Some(barrier) = &drain { coordinator.set_drain_barrier(barrier.clone()); }
     coordination_time_ms()?;
     let mut clients: Vec<Client> = Vec::new();
     loop {
+        // Read before any admission of this iteration; reported after them.
+        let epoch = drain.as_ref().map(crate::admission::DrainBarrier::epoch);
         let now = coordination_time_ms()?;
         if STOP.load(Ordering::Relaxed) {
             coordinator.begin_shutdown(now);
@@ -143,7 +155,7 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
         }
         // Host adapters may not block this loop: slow probes/startup belong in
         // adapter-owned jobs with finite deadlines, observed by poll().
-        let _ = coordinator.tick(now);
+        let healthy = coordinator.tick(now).is_ok();
         if clients.len() < MAX_CONNECTIONS {
             match listener.accept_gateway(gateway.0, gateway.1) {
                 Ok(socket) => {
@@ -191,6 +203,9 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
                 coordinator.disconnect(client.id, now);
                 clients.swap_remove(index);
             } else { index += 1; }
+        }
+        if let (Some(barrier), Some(epoch)) = (&drain, epoch) {
+            barrier.observe(epoch, coordinator.admitted_runs(), healthy);
         }
         std::thread::sleep(Duration::from_millis(25));
     }

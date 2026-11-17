@@ -34,6 +34,12 @@ It writes `/run/duduclaw-spawnd/readiness.json` atomically as root:gateway-group
 A running service alone is not a successful readiness check. BindsTo on each run
 unit provides PID 1 shutdown cleanup, followed by startup residue reconciliation.
 
+The daemon also binds the root-only update control socket
+`/run/duduclaw-spawnd/update.sock` (root 0600) for `duduclaw-updated`. Its
+`Apply` republishes the verified generation's root components, so the unit adds
+`ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin`.
+The drain barrier is kept in `/var/lib/duduclaw-spawnd/drain.json` across restarts.
+
 The native Linux service lifecycle and D-Bus fd handoff require root VM testing
 on systemd 249, 252 and 255. No installation or activation has been performed by
 this implementation change.

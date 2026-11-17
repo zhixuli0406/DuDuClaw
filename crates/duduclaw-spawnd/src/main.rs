@@ -21,9 +21,11 @@ fn main() {
             let audit = AuditWorker::start()?;
             let host = LinuxHost::open(gateway, Components::installed(), audit.clone())?;
             let listener = server::listener(gateway.1)?;
+            // R6: restore the durable drain barrier before the first admission.
+            let drain = duduclaw_spawnd::update_control::start()?;
             let snapshots = host.snapshots;
             let limits = Limits { host_ptys: host.host_ptys, ..Limits::default() };
-            server::serve(listener, gateway, snapshots, host, limits, audit)
+            server::serve_with_drain(listener, gateway, snapshots, host, limits, audit, Some(drain))
         })();
         if result.is_ok() { return; }
     }

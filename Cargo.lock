@@ -1946,10 +1946,12 @@ name = "duduclaw-egress"
 version = "1.82.0"
 dependencies = [
  "duduclaw-isolation",
+ "duduclaw-updated",
  "libc",
  "nix 0.29.0",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

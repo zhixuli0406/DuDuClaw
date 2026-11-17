@@ -41,8 +41,9 @@ export function pendingProtectedUpdate(): string | null {
 }
 
 /** Gateway result code: the host has no reachable root updater, so the gateway
- * sent NO request. Until the separate update service is installable (planned
- * v1.82.0) the administrator updates from the host terminal instead. */
+ * sent NO request. Single-binary protected hosts have no update service; only
+ * an isolated installation (v1.83.0) does, so there the administrator updates
+ * from the host terminal instead. */
 export const UPDATER_NOT_INSTALLED = 'updater_not_installed';
 
 /** Root-managed command the dashboard shows instead of updating itself. */

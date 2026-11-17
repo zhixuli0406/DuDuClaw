@@ -108,12 +108,18 @@ pub async fn host_main() -> Result<(), EgressError> {
     let resolver = HostResolver::new();
     for profile in config.profiles.as_slice() { resolver.probe(profile.dns_route).await?; }
     let listener = CheckedSocket::new(activated_listener(EGRESS_CONTROL_SOCKET, libc::SOCK_SEQPACKET)?).map_err(io_error)?;
+    // R6: hash the running image and bind the update readback endpoint before
+    // seccomp. Without it the updater's readback fails closed; egress still runs.
+    let identity = crate::update_readback::Identity::observe();
+    let readback = crate::update_readback::bind("/run");
+    if readback.is_err() { eprintln!("egress update readback unavailable"); }
     // SR5 item 7: the host's own interface addresses, before seccomp; they
     // are refreshed on use (`policy::host_addresses`). SR5 round 3 N7b: plus
     // the configured NAT public addresses.
     crate::policy::configure_host_public_addresses(&config.host_public_addresses)?;
     crate::policy::init_host_addresses()?;
     crate::seccomp::install()?;
+    if let Ok(readback) = readback { crate::update_readback::start(readback, identity); }
     loop {
         let fd = listener.accept().await.map_err(io_error)?;
         if socket_info(&fd, libc::SOCK_SEQPACKET, true, false).is_err() { continue; }

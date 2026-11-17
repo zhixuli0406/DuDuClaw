@@ -83,6 +83,41 @@ They require a disposable root Linux VM and the installation prerequisites named
 in each ignore reason. The account test modifies login ACLs; the systemd resource
 test requires the complete trusted service hierarchy.
 
+## Update control endpoint (v1.83 R6)
+
+`update_control.rs` serves `/run/duduclaw-spawnd/update.sock` (root 0600 in the
+root-owned `/run/duduclaw-spawnd`) for `duduclaw-updated`'s activation client:
+only a uid 0 / gid 0 `SO_PEERCRED` peer is answered; one `SOCK_SEQPACKET` frame
+of the `activation_contract` types per connection, no ancillary data, unknown
+fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
+
+- `Prepare` refuses a manifest with data migrations (their executor, G's, is
+  not part of this release) and checks the fixed destinations. Before the
+  generation is staged (the updater's preflight precedes its download) that is
+  all; once staged, the manifest must hash to the generation digest, equal the
+  request's preparation, and every artifact must pass `verify_fd`.
+- `Drain{g}` writes `/var/lib/duduclaw-spawnd/drain.json` durably (temporary,
+  fsync, rename, directory fsync) **before** the in-memory barrier closes, then
+  replies with the admitted runs counted by an admission iteration that began
+  after the closure. New `StartRun`s are refused (`not_ready`); queued and
+  running runs are kept. The updater retries until the count is zero.
+- `Apply` requires the barrier closed for exactly that generation in memory and
+  on disk, and zero admitted runs. It re-authenticates the manifest against the
+  trust ledger and copies spawnd, run, parse worker, `/usr/lib/duduclaw/current/*`,
+  egress and gateway from the generation directory, hashing each file from its
+  descriptor while copying, to `<name>.next`, fsync, rename, directory fsync.
+- `Readback` reports spawnd itself (`sha256(/proc/self/exe)`, liveness of the
+  admission loop) and the trampoline it executes. Other non-daemon components
+  (parse worker, MCP bridge, importer, migration, egress forwarder, runtime
+  entries) report `ready: false`: no executable readback under a non-root
+  identity exists yet, so the updater cannot validate an activation until one does.
+- `Resume{g}` removes the record durably, then reopens admission. It is the only
+  way to lift the barrier. At start the record is read strictly before the first
+  admission; an unreadable record keeps admission closed until a new `Drain`.
+
+The unit grants spawnd write access to `/usr/lib/duduclaw`, `/usr/libexec/duduclaw`
+and `/opt/duduclaw/bin` for this publication.
+
 ## Package H adapter
 
 `storage::LoopStorage::open(storage_directory, journal_directory)` implements the

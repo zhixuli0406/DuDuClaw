@@ -62,6 +62,82 @@ impl BrokerOutcome {
     fn reply(response: SpawnResponse) -> Self { Self { response, file: None, detail: None } }
 }
 
+/// R6 per-generation update drain barrier, shared by the root update endpoint
+/// (`update_control`) and the single-owner admission loop. While closed, every
+/// new `StartRun` is refused; runs admitted before the closure (queued or
+/// running) are kept and run to completion. Only `update_control` closes or
+/// lifts it, and only after the durable record (`drain.json`) says the same:
+/// closed after the record is written, lifted only by `Resume` of the recorded
+/// generation after the record is removed. A record that cannot be read at
+/// start closes it as [`DrainClosure::Unreadable`], which no `Resume` lifts.
+#[derive(Clone, Default)]
+pub struct DrainBarrier(std::sync::Arc<(std::sync::Mutex<BarrierState>, std::sync::Condvar)>);
+#[derive(Default)]
+struct BarrierState { closed: Option<DrainClosure>, epoch: u64, observed: Option<DrainObservation> }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainClosure {
+    Generation(duduclaw_isolation::ids::Sha256Digest),
+    /// A record exists but could not be read or parsed: closed, generation unknown.
+    Unreadable,
+}
+/// What the admission loop saw in one full iteration that began at `epoch`.
+#[derive(Clone, Copy, Debug)]
+pub struct DrainObservation {
+    pub epoch: u64,
+    /// Admitted runs: queued, starting, running or draining.
+    pub admitted_runs: usize,
+    /// The iteration's admission tick succeeded (process scan and host checks).
+    pub healthy: bool,
+    pub at: std::time::Instant,
+}
+impl DrainBarrier {
+    /// A poisoned lock is treated as closed with an unknown generation.
+    pub fn closure(&self) -> Option<DrainClosure> {
+        match self.0.0.lock() { Ok(state) => state.closed, Err(_) => Some(DrainClosure::Unreadable) }
+    }
+    pub fn is_closed(&self) -> bool { self.closure().is_some() }
+    /// Close (or re-key) the barrier; returns the new epoch. `None`: the state
+    /// is unusable, and the caller must not report the barrier as closed.
+    pub fn close(&self, closure: DrainClosure) -> Option<u64> {
+        let mut state = self.0.0.lock().ok()?;
+        state.epoch = state.epoch.checked_add(1)?;
+        state.closed = Some(closure);
+        Some(state.epoch)
+    }
+    /// Lift a barrier closed for exactly `generation`; an open barrier stays open.
+    /// An unreadable closure or another generation's closure is never lifted.
+    pub fn open(&self, generation: duduclaw_isolation::ids::Sha256Digest) -> bool {
+        let Ok(mut state) = self.0.0.lock() else { return false };
+        match state.closed {
+            None => true,
+            Some(DrainClosure::Generation(closed)) if closed == generation => { state.closed = None; true }
+            Some(_) => false,
+        }
+    }
+    /// The epoch the admission loop records at the start of an iteration.
+    pub fn epoch(&self) -> u64 { self.0.0.lock().map(|state| state.epoch).unwrap_or(u64::MAX) }
+    /// Called by the admission loop once per iteration, after its admissions.
+    pub fn observe(&self, epoch: u64, admitted_runs: usize, healthy: bool) {
+        let Ok(mut state) = self.0.0.lock() else { return };
+        if state.observed.is_some_and(|previous| previous.epoch > epoch) { return; }
+        state.observed = Some(DrainObservation { epoch, admitted_runs, healthy, at: std::time::Instant::now() });
+        self.0.1.notify_all();
+    }
+    pub fn last_observation(&self) -> Option<DrainObservation> { self.0.0.lock().ok()?.observed }
+    /// Wait (bounded) for an iteration that began at or after `epoch` and was
+    /// recorded at or after `after`. `None` on timeout or an unusable state.
+    pub fn wait_observation(&self, epoch: u64, after: std::time::Instant, timeout: std::time::Duration)
+        -> Option<DrainObservation> {
+        let deadline = std::time::Instant::now().checked_add(timeout)?;
+        let mut state = self.0.0.lock().ok()?;
+        loop {
+            if let Some(observed) = state.observed.filter(|o| o.epoch >= epoch && o.at >= after) { return Some(observed); }
+            let remaining = deadline.checked_duration_since(std::time::Instant::now()).filter(|r| !r.is_zero())?;
+            state = self.0.1.wait_timeout(state, remaining).ok()?.0;
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "admission_tests.rs"]
 mod tests;
@@ -259,6 +335,8 @@ pub struct Coordinator<H: Host> {
     stopping: BTreeMap<EmployeeId, usize>,
     /// HX4 per-run helper calls (FIFO, call ids, outcomes); never an admission entry.
     helpers: BTreeMap<RunId, helpers::RunHelpers<H::Inputs>>,
+    /// R6 update drain barrier (`None`: no update endpoint, e.g. unit tests).
+    drain: Option<DrainBarrier>,
 }
 impl<H: Host> Coordinator<H> {
     pub fn new(host: H, limits: Limits) -> Result<Self> {
@@ -270,7 +348,16 @@ impl<H: Host> Coordinator<H> {
         }
         Ok(Self { host, limits, entries: BTreeMap::new(), sequence: 0,
             last_now: 0, last_scan: None, scan_ok: false,
-            tickets: BTreeMap::new(), next_ticket: 0, stopping: BTreeMap::new(), helpers: BTreeMap::new() })
+            tickets: BTreeMap::new(), next_ticket: 0, stopping: BTreeMap::new(), helpers: BTreeMap::new(), drain: None })
+    }
+    /// R6: refuse new `StartRun` admissions while the update barrier is closed.
+    pub fn set_drain_barrier(&mut self, barrier: DrainBarrier) { self.drain = Some(barrier); }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn host_mut_for_test(&mut self) -> &mut H { &mut self.host }
+    /// R6: runs the drain must wait for (queued, starting, running, draining).
+    /// Reservations without a `StartRun` are not runs.
+    pub fn admitted_runs(&self) -> usize {
+        self.entries.values().filter(|entry| entry.state == AdmissionState::Queued || entry.active()).count()
     }
     fn host_ticket(&mut self) -> Result<Ticket> {
         self.next_ticket = self.next_ticket.checked_add(1).ok_or(ErrorCode::ResourceLimit)?;
@@ -480,6 +567,8 @@ impl<H: Host> Coordinator<H> {
     pub fn start(&mut self, connection: ControlConnectionId, request: SpawnRequest, inputs: H::Inputs,
         now: u64) -> Result<SpawnResponse> {
         self.time(now)?;
+        // R6: a closed update barrier refuses every new run; queued ones stay.
+        if self.drain.as_ref().is_some_and(DrainBarrier::is_closed) { return Err(ErrorCode::NotReady); }
         request.validate().map_err(|_| ErrorCode::InvalidRequest)?;
         let SpawnRequest::StartRun { run, employee_id, ref runtime_request, prompt_bytes, ref input_fds, pty, .. } = request
             else { return Err(ErrorCode::InvalidRequest); };

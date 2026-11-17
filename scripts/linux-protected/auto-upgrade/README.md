@@ -2,7 +2,7 @@
 
 這組腳本保留每日 03:30、最多延遲 20 分鐘且不補跑的排程，改向獨立更新服務提出要求。
 
-**目前僅供開發，請勿啟用 timer。** 新更新服務已實作世代切換、固定服務重啟及健康讀回；跨套件的排空、遷移與就緒端點仍須串接，缺少端點時會回報維護，不會提交新的版本下限。遷移 bootstrap 雙簽、真實 FIDO2 與 Linux 實機更新尚未完成。只把這組檔案複製到 v1.79.3 不會安裝服務、帳號或信任根；既有夜間部署應保留先前審閱過的固定版本 helper，等待完整遷移。
+**尚未出貨：等 v1.83.0 隔離安裝程式（`duduclaw-bootstrap install`）提供後才使用。** 屆時 timer 在隔離安裝完成後**預設啟用**（owner 決定 Q11 的工作預設），每晚只觸發一次 Apply，不帶任何參數。更新服務的三個伺服端已實作：spawnd `/run/duduclaw-spawnd/update.sock`（Prepare／Drain／Apply／Readback／Resume；Drain 先耐久寫入 `/var/lib/duduclaw-spawnd/drain.json` 才關閉新執行的准入，排隊與執行中的保留）、gateway `/run/duduclaw-gateway-update/readback.sock`、egress `/run/duduclaw-egress-update/readback.sock`，都只接受 root 對端。仍未完成：清單綁定的資料遷移執行者（有資料遷移的世代一律拒絕）、parse worker／MCP bridge／importer／migration／egress forwarder／runtime entries 以非 root 身分的執行讀回（目前回 `ready:false`，更新服務因此無法提交新世代）、遷移 bootstrap 雙簽、真實 FIDO2 與 Linux 實機更新。缺少或未就緒的端點一律回報維護，不會提交新的版本下限。只把這組檔案複製到 v1.79.3 不會安裝服務、帳號或信任根；既有夜間部署應保留先前審閱過的固定版本 helper，等待完整遷移。
 
 此目錄從 v1.80.0 起收錄於原始碼，v1.79.3 以前的標籤沒有它；發行 tarball 也不含 `scripts/`。請從固定的完整 commit SHA 取得並審閱，例如 `v1.80.0` 標籤指向的 commit（下方以 `<commit>` 表示，請換成你審閱過的那一筆），不要使用會移動的 `main`。
 
@@ -12,7 +12,7 @@ v1.80.x 標籤中的版本只呼叫既有的 `service upgrade --protected-linux 
 
 ## 日後部署的來源要求
 
-完整隔離遷移提供前，不要執行安裝指令。屆時須依已發布的遷移指引佈建更新服務，再審閱精確 commit 的四個腳本／unit 檔。不要使用會移動的 `main`，也不要從使用者可寫入的 checkout 以 root 執行 `install.sh`。
+完整隔離遷移提供前，不要執行安裝指令。屆時須依已發布的遷移指引佈建更新服務，再審閱精確 commit 的四個腳本／unit 檔。`install.sh` 通過檢查後即 `systemctl enable --now duduclaw-auto-upgrade.timer`（預設啟用）；不要自動更新時，安裝後執行 `--uninstall`。不要使用會移動的 `main`，也不要從使用者可寫入的 checkout 以 root 執行 `install.sh`。
 
 安裝器仍要求 root:root 來源、一般檔案與所有上層目錄不可被其他人寫入，拒絕符號連結及 sticky `/tmp`。通過後複製至 `/run` 的 root 專用 0700 快照，重驗型別與 1 byte 至 1 MiB 大小後安裝。權限檢查無法證明程式碼出處；必須核對固定 commit 與 root 副本。
 

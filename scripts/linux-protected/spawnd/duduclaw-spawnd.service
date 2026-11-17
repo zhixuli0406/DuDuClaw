@@ -28,6 +28,9 @@ ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-s
 # HX helper slots: spawnd creates rt-init/rt-runtime/hx leaves inside delegated run
 # units only. The rest of /sys/fs/cgroup stays read-only (ProtectControlGroups=yes).
 ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice
+# R6 update Apply (update.sock, root peers only) republishes the verified
+# generation's root components at these fixed paths: file.next + fsync + rename.
+ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes

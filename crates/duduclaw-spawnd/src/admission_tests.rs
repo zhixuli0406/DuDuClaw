@@ -468,6 +468,65 @@ fn asynchronous_poll_keeps_lease_and_shutdown_cancels_the_queue() {
     assert!(matches!(c.status(run(2), conn()).unwrap(), RunStatus::Ended(RunOutcome::Cancelled)));
 }
 
+#[test]
+fn update_drain_barrier_refuses_new_starts_and_keeps_admitted_runs() {
+    use duduclaw_isolation::ids::Sha256Digest;
+    let barrier = DrainBarrier::default();
+    let mut c = Coordinator::new(FakeHost::default(), Limits { host_runs: 1, ..Limits::default() }).unwrap();
+    c.set_drain_barrier(barrier.clone());
+    queue(&mut c, 1, 1, RuntimeKind::Codex);
+    queue(&mut c, 2, 2, RuntimeKind::Codex);
+    c.reserve(conn(), employee(3), run(3), 100).unwrap();
+    let generation = Sha256Digest([5; 32]);
+    assert!(barrier.close(DrainClosure::Generation(generation)).is_some());
+    assert_eq!(c.start(conn(), request(3, 3, RuntimeKind::Codex), (), 100), Err(ErrorCode::NotReady));
+    // The refused request leaves its reservation, which is not a run.
+    assert!(matches!(c.status(run(3), conn()).unwrap(), RunStatus::Reserved { .. }));
+    assert_eq!(c.admitted_runs(), 2);
+    // Queued runs are kept and still start under the closed barrier.
+    c.tick(100).unwrap();
+    assert_eq!(c.host.starts, vec![run(1)]);
+    assert!(matches!(c.status(run(2), conn()).unwrap(), RunStatus::Queued(_)));
+    c.host.end = true;
+    c.tick(101).unwrap();
+    c.tick(102).unwrap();
+    assert_eq!(c.host.starts, vec![run(1), run(2)]);
+    assert_eq!(c.admitted_runs(), 0);
+    // Only the closed generation lifts it; then admission resumes.
+    assert!(!barrier.open(Sha256Digest([6; 32])));
+    assert_eq!(c.start(conn(), request(3, 3, RuntimeKind::Codex), (), 103), Err(ErrorCode::NotReady));
+    assert!(barrier.open(generation));
+    assert!(c.start(conn(), request(3, 3, RuntimeKind::Codex), (), 103).is_ok());
+}
+
+#[test]
+fn update_drain_barrier_unreadable_closure_and_bounded_observation() {
+    use duduclaw_isolation::ids::Sha256Digest;
+    use std::time::{Duration, Instant};
+    let generation = Sha256Digest([5; 32]);
+    let barrier = DrainBarrier::default();
+    assert_eq!(barrier.closure(), None);
+    assert!(barrier.open(generation));
+    let unreadable = barrier.close(DrainClosure::Unreadable).unwrap();
+    assert!(!barrier.open(generation));
+    assert!(barrier.is_closed());
+    // Re-keying (a rewritten record) moves to a later epoch.
+    let keyed = barrier.close(DrainClosure::Generation(generation)).unwrap();
+    assert!(keyed > unreadable);
+    let start = Instant::now();
+    // An iteration that began before the closure never answers for it.
+    barrier.observe(unreadable, 0, true);
+    assert!(barrier.wait_observation(keyed, start, Duration::from_millis(50)).is_none());
+    barrier.observe(keyed, 3, true);
+    let observed = barrier.wait_observation(keyed, start, Duration::from_millis(50)).unwrap();
+    assert_eq!((observed.epoch, observed.admitted_runs, observed.healthy), (keyed, 3, true));
+    // A late report from an older iteration cannot overwrite a newer one.
+    barrier.observe(unreadable, 0, true);
+    assert_eq!(barrier.last_observation().unwrap().epoch, keyed);
+    // Observations recorded before `after` are stale.
+    assert!(barrier.wait_observation(keyed, Instant::now() + Duration::from_secs(1), Duration::from_millis(50)).is_none());
+}
+
 fn running_pty() -> Coordinator<FakeHost> {
     let mut c = Coordinator::new(FakeHost::default(), Limits::default()).unwrap();
     c.reserve(conn(), employee(1), run(1), 100).unwrap();

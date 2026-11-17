@@ -31,6 +31,9 @@ pub mod transport;
 pub mod fds;
 #[cfg(target_os = "linux")]
 pub mod server;
+/// R6 root update endpoint (`update.sock`): Prepare/Drain/Apply/Readback/Resume.
+#[cfg(target_os = "linux")]
+pub mod update_control;
 #[cfg(target_os = "linux")]
 pub mod channels;
 #[cfg(target_os = "linux")]

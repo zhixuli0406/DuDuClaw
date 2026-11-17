@@ -4663,6 +4663,18 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/update_readback.rs::linux::start",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "R6: std::thread::Builder::spawn starts the one bounded Rust thread serving the root-only update readback socket (one frame per connection, 5 s timeouts); no OS child process is launched."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/updater.rs::apply_update_inner",
       "apis": {
         "command_constructor": 1,
@@ -7168,6 +7180,18 @@
       "identity": "spawn_daemon",
       "migration": "not_process",
       "rationale": "spawnd starts one fresh Rust thread that unshares CLONE_FS|CLONE_NEWNS to compose the native home mount in a disposable namespace and returns a detached clone; no employee process or OS child is started."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/update_control.rs::start",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "R6: std::thread::Builder::spawn starts the one root update-control thread serving update.sock (uid 0 peers only); its Apply republishes verified generation files at fixed root paths. No OS child process is launched."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/work_anchor.rs::tests::iso_root_work_anchor_not_writable_by_employee",
