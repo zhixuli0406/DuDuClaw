@@ -492,15 +492,17 @@ mod timeout_tests {
         assert!(configured.contains("15 分鐘安全上限"), "{configured}");
         assert!(configured.contains("請洽管理員"));
         assert!(!configured.contains("員工設定"));
-        // A classified work deadline uses the fixed turn-failure vocabulary,
-        // independent of either the captured or current timeout setting.
+        // A classified work deadline names the captured limit, not the current setting.
         let failure = ReplyFailure::simple(origin, "claude CLI hard timeout (600s, no output)".into());
         let message = failure.message("worker", home.path());
         assert_eq!(failure.reason(), FailureReason::TimeoutTotal);
-        assert_eq!(message, super::super::TurnFailureReason::TimeoutTotal.text(None));
-        let message = ReplyFailure::simple(origin, "claude CLI hard timeout (95s, no output)".into())
-            .message("worker", home.path());
-        assert_eq!(message, super::super::TurnFailureReason::TimeoutTotal.text(None));
+        assert!(message.contains("10 分鐘"), "{message}");
+        assert!(!message.contains("15 分鐘"));
+        assert!(message.contains("需要延長上限時，請洽管理員。"));
+        let failure = ReplyFailure::simple(origin, "claude CLI hard timeout (95s, no output)".into());
+        let message = failure.message("worker", home.path());
+        assert_eq!(failure.reason(), FailureReason::TimeoutTotal);
+        assert!(message.contains("95 秒"), "{message}");
     }
 
     /// RM-155: while macOS folder access is pending, a timeout names the

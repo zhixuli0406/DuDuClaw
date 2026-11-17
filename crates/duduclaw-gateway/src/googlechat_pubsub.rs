@@ -784,7 +784,7 @@ mod googlechat_pubsub_tests {
         let mut waiting = e2e_seam::arm_waiting(h.home.path());
         duduclaw_core::gateway_instance::acquire(h.home.path()).unwrap();
         h.inbox.insert_placeholder(&crate::googlechat_inbox::PendingPlaceholder {
-            message_name: "spaces/AAA/messages/interrupted".into(), space: "spaces/AAA".into(),
+            message_name: format!("spaces/AAA/messages/client-{}", "a".repeat(32)), space: "spaces/AAA".into(),
             app_agent: None, app_email: h.state.creds.client_email().into(), employee_id: "dudu".into(),
             session_id: "googlechat:spaces/AAA".into(), thread_name: None,
             created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),

@@ -77,6 +77,11 @@ pub(crate) fn rich_links(message: &Value, text: &str) -> Vec<String> {
     for annotation in message.get("annotations").and_then(Value::as_array).into_iter().flatten() {
         if annotation.get("type").and_then(Value::as_str) != Some("RICH_LINK") { continue; }
         let Some(uri) = annotation.pointer("/richLinkMetadata/uri").and_then(Value::as_str) else { continue; };
+        if uri.len() > 2048 { continue; }
+        // Provider spelling is emitted, so IDN hosts would show look-alike Unicode instead of punycode.
+        if !uri.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://")) { continue; }
+        let authority = uri.get(8..).unwrap_or("").split(['/', '?', '#', '\\']).next().unwrap_or("");
+        if !authority.is_ascii() { continue; }
         if uri.chars().any(|c| c.is_whitespace() || c.is_control()
             || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
                 | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{200b}'..='\u{200d}'
@@ -342,6 +347,22 @@ mod rich_link_tests {
             chip("https://example.com"), chip("https://example.com/")
         ]}), "");
         assert_eq!(links, vec!["https://example.com"]);
+    }
+    #[test]
+    fn oversized_provider_spelling_is_rejected_even_when_normalized_is_short() {
+        let uri = format!("https://example.com/{}", "a/../".repeat(500));
+        assert!(uri.len() > 2048);
+        assert_eq!(url::Url::parse(&uri).unwrap().as_str(), "https://example.com/");
+        assert!(rich_links(&json!({"annotations":[chip(&uri)]}), "").is_empty());
+    }
+    #[test]
+    fn unicode_authority_is_rejected_but_unicode_path_is_preserved() {
+        let path = "https://example.com/路徑";
+        let links = rich_links(&json!({"annotations":[
+            chip("https://еxample.com/a"), chip("https:/еxample.com/a"),
+            chip("https:еxample.com/a"), chip(path), chip("HTTPS://example.com/ok")
+        ]}), "");
+        assert_eq!(links, vec![path, "HTTPS://example.com/ok"]);
     }
     #[test]
     fn links_reject_userinfo_whitespace_and_invisible_characters() {

@@ -2,6 +2,17 @@ use super::*;
 use crate::test_channel_provider::TestChannelProvider;
 use serde_json::json;
 
+async fn wait_for_request(provider: &TestChannelProvider, index: usize) {
+    let started = std::time::Instant::now();
+    loop {
+        let count = provider.requests().len();
+        if count > index { return; }
+        assert!(started.elapsed() < Duration::from_secs(20),
+            "timed out waiting for request index {index}; provider.requests().len() = {count}");
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test]
 async fn parse_error_retries_plain_and_preserves_url() {
     let provider = TestChannelProvider::start().await;
@@ -242,15 +253,20 @@ async fn delivery_budget_cancels_a_later_request_and_records_non_content_failure
     let client = reqwest::Client::new();
     let base = crate::telegram::telegram_poll_api_base(&provider.token);
     let text = "a".repeat(LIMIT * 4);
+    tokio::time::pause();
     let delivery = send(&client, &base, "1", &text, Format::Plain, Options::new(home.path(), "notify", "budget"));
     let clock = async {
-        for count in 1..=3 {
-            while provider.requests().len() < count { tokio::task::yield_now().await; }
-            if count == 1 { tokio::time::pause(); }
-            tokio::time::advance(Duration::from_secs(40)).await;
+        for index in 0..3 {
+            wait_for_request(&provider, index).await;
+            // Cross the timer wheel's millisecond rounding before waiting for network I/O.
+            tokio::time::advance(Duration::from_millis(40001)).await;
         }
     };
-    let (result, ()) = tokio::join!(delivery, clock);
+    tokio::pin!(delivery);
+    let result = tokio::select! {
+        result = &mut delivery => result,
+        () = clock => delivery.await,
+    };
     tokio::time::resume();
     let error = result.unwrap_err();
     assert!(!error.content);
@@ -268,13 +284,17 @@ async fn request_attempt_times_out_after_45_seconds() {
     let home = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
     let base = crate::telegram::telegram_poll_api_base(&provider.token);
+    tokio::time::pause();
     let delivery = send(&client, &base, "1", "test", Format::Plain, Options::new(home.path(), "notify", "timeout"));
     let clock = async {
-        while provider.requests().is_empty() { tokio::task::yield_now().await; }
-        tokio::time::pause();
+        wait_for_request(&provider, 0).await;
         tokio::time::advance(Duration::from_secs(46)).await;
     };
-    let (result, ()) = tokio::join!(delivery, clock);
+    tokio::pin!(delivery);
+    let result = tokio::select! {
+        result = &mut delivery => result,
+        () = clock => delivery.await,
+    };
     tokio::time::resume();
     let error = result.unwrap_err();
     assert_eq!(error.description, "Telegram request timeout");
@@ -364,21 +384,32 @@ async fn cron_body_and_failure_notice_share_one_delivery_budget() {
     let client = reqwest::Client::new();
     let base = crate::telegram::telegram_poll_api_base(&provider.token);
     let input = "a".repeat(LIMIT * 3);
+    tokio::time::pause();
+    let started = std::cell::Cell::new(None);
     let delivery = send_cron(&client, &base, "1", &input, "budget", "cron-budget", home.path());
     let clock = async {
-        let mut started = None;
         for (index, seconds) in [40, 40, 30, 10].into_iter().enumerate() {
-            while provider.requests().len() <= index { tokio::task::yield_now().await; }
+            wait_for_request(&provider, index).await;
             if index == 0 {
-                tokio::time::pause();
-                started = Some(Instant::now());
+                // Leave one timer tick between the delivery deadline and the measured window.
+                tokio::time::advance(Duration::from_millis(1)).await;
+                started.set(Some(Instant::now()));
             }
-            tokio::time::advance(Duration::from_secs(seconds)).await;
+            let step = if index == 3 {
+                (started.get().unwrap() + Duration::from_secs(120)) - Instant::now()
+            } else {
+                // Sleep deadlines round up to the next millisecond.
+                Duration::from_secs(seconds) + Duration::from_millis(1)
+            };
+            tokio::time::advance(step).await;
         }
-        started.unwrap()
     };
-    let (result, started) = tokio::join!(delivery, clock);
-    let elapsed = started.elapsed();
+    tokio::pin!(delivery);
+    let result = tokio::select! {
+        result = &mut delivery => result,
+        () = clock => delivery.await,
+    };
+    let elapsed = started.get().expect("delivery ended before its first request").elapsed();
     tokio::time::resume();
     assert!(result.unwrap_err().content);
     assert_eq!(provider.requests().len(), 4);

@@ -106,7 +106,7 @@ mod tests {
 
     fn row(index: usize, age: i64) -> PendingPlaceholder {
         PendingPlaceholder {
-            message_name: format!("spaces/A/messages/{index}"), space: "spaces/A".into(),
+            message_name: format!("spaces/A/messages/client-{index:032x}"), space: "spaces/A".into(),
             app_agent: Some("sales".into()), app_email: "sales@example.invalid".into(),
             employee_id: "sales".into(), session_id: "googlechat:spaces/A:sales".into(),
             thread_name: Some("spaces/A/threads/T".into()), created_at: 100_000 - age, state: "pending".into(),
@@ -120,9 +120,12 @@ mod tests {
         for (i, age) in [(0, 10), (1, 10), (2, 10), (3, 10), (4, MAX_AGE + 1), (5, 5)] {
             store.insert_placeholder(&row(i, age)).unwrap();
         }
-        let counts = sweep(&store, 100_000, 5, tokio::time::Instant::now() + SWEEP_BUDGET, |row| async move {
-            match row.message_name.rsplit('/').next().unwrap() {
-                "0" => Ok(()), "1" => Err(Some(404)), "2" => Err(Some(403)), _ => Err(Some(503)),
+        let counts = sweep(&store, 100_000, 5, tokio::time::Instant::now() + SWEEP_BUDGET, |r| async move {
+            match r.message_name {
+                name if name == row(0, 10).message_name => Ok(()),
+                name if name == row(1, 10).message_name => Err(Some(404)),
+                name if name == row(2, 10).message_name => Err(Some(403)),
+                _ => Err(Some(503)),
             }
         }).await.unwrap();
         assert_eq!(counts, Counts { attempted: 5, deleted: 4, failed: 2 });
@@ -159,6 +162,25 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Inbox::shared(home.path()).unwrap();
         let conn = rusqlite::Connection::open(home.path().join("googlechat_inbox.db")).unwrap();
+        let invalid_names = [
+            "spaces/A/messages/123".to_owned(),
+            "spaces/A/messages/status".to_owned(),
+            "spaces/A/messages/client-XYZ".to_owned(),
+            format!("spaces/A/messages/client-{}", "a".repeat(31)),
+            format!("spaces/A/messages/client-{}", "A".repeat(32)),
+        ];
+        for (i, name) in invalid_names.iter().enumerate() {
+            let mut invalid = row(i, 100);
+            invalid.message_name = name.clone();
+            // Simulate tampered disk state bypassing insert validation.
+            conn.execute(
+                "INSERT INTO pending_placeholders(message_name,space,app_agent,app_email,employee_id,session_id,thread_name,created_at,state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params![invalid.message_name,invalid.space,invalid.app_agent,invalid.app_email,invalid.employee_id,invalid.session_id,invalid.thread_name,invalid.created_at,invalid.state]).unwrap();
+        }
+        // Keep the valid control at the age cutoff so no provider call is due.
+        let valid = row(99, 60);
+        assert!(valid.valid());
+        store.insert_placeholder(&valid).unwrap();
         for (i, column, value) in [
             (0, "message_name", "spaces/../messages/m".to_owned()),
             (1, "message_name", format!("spaces/A/messages/{}", "m".repeat(129))),
@@ -175,8 +197,8 @@ mod tests {
         }
         let counts = sweep(&store, 100_000, 60, tokio::time::Instant::now() + SWEEP_BUDGET,
             |_| async { panic!("invalid row must never request credentials or make a request") }).await.unwrap();
-        assert_eq!(counts, Counts { attempted: 8, deleted: 8, failed: 0 });
-        assert!(store.stale_placeholders(100_000).unwrap().is_empty());
+        assert_eq!(counts, Counts { attempted: 13, deleted: 13, failed: 0 });
+        assert_eq!(store.stale_placeholders(100_000).unwrap(), vec![valid]);
     }
 
     #[tokio::test]
@@ -192,12 +214,12 @@ mod tests {
         }
         store.insert_placeholder(&row(300, 61)).unwrap();
         let counts = sweep(&store, 100_000, 60, tokio::time::Instant::now() + SWEEP_BUDGET, |r| async move {
-            assert_eq!(r.message_name, "spaces/A/messages/300"); Ok(())
+        assert_eq!(r.message_name, row(300, 61).message_name); Ok(())
         }).await.unwrap();
         assert_eq!(counts.attempted, 1);
         drop(registration);
         let counts = sweep(&store, 100_000, 60, tokio::time::Instant::now() + SWEEP_BUDGET, |r| async move {
-            assert_eq!(r.message_name, "spaces/A/messages/0"); Ok(())
+            assert_eq!(r.message_name, row(0, MAX_AGE + 1).message_name); Ok(())
         }).await.unwrap();
         assert_eq!(counts.deleted, 1);
         assert_eq!(store.stale_placeholders(100_000).unwrap().len(), 200);
@@ -209,7 +231,7 @@ mod tests {
         let store = Inbox::shared(home.path()).unwrap();
         for (index, age) in [(0, 59), (1, 60), (2, 61)] { store.insert_placeholder(&row(index, age)).unwrap(); }
         let counts = sweep(&store, 100_000, 60, tokio::time::Instant::now() + SWEEP_BUDGET, |r| async move {
-            assert_eq!(r.message_name, "spaces/A/messages/2"); Ok(())
+            assert_eq!(r.message_name, row(2, 61).message_name); Ok(())
         }).await.unwrap();
         assert_eq!(counts, Counts { attempted: 1, deleted: 1, failed: 0 });
         assert_eq!(store.stale_placeholders(100_000).unwrap().len(), 2);

@@ -2214,28 +2214,28 @@ mod placeholder_lifecycle_tests {
         e2e_seam::arm(home.path());
         let creds = crate::googlechat_agents::agent_creds(home.path(), "sales").await.unwrap();
         let store = Inbox::shared(home.path()).unwrap();
-        let name = create_message(&creds, "spaces/GUARD", None, "🤔 思考中…").await.unwrap();
-        let row = PendingPlaceholder {
-            message_name: name.clone(), space: "spaces/GUARD".into(), app_agent: Some("sales".into()),
-            app_email: email.clone(), employee_id: "sales".into(), session_id: "googlechat:spaces/GUARD".into(),
-            thread_name: None, created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),
-        };
-        let registration = PlaceholderRegistration::new(store.clone(), &row).unwrap();
-        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap(), vec![row.clone()]);
+        let (name, registration) = create_placeholder(&creds, store.clone(), "spaces/GUARD", None,
+            Some("sales".into()), "sales".into(), "googlechat:spaces/GUARD".into()).await.unwrap();
+        let name = name.unwrap();
+        let registration = registration.unwrap();
+        let rows = store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = rows[0].clone();
+        assert_eq!(row.message_name, name);
         let guarded = crate::channel_reply::build_guarded_reply_for_agent(
             "hello", &ctx, "sales", &row.session_id, "users/42", None).await;
         guarded.refuse_delivery();
         let placeholder = Arc::new(tokio::sync::Mutex::new(Some(name)));
         deliver_reply(&creds, &row.space, None, &placeholder, Some(&registration), "SECRET ANSWER", Some(&guarded)).await.unwrap();
         // Retirement happens inside delivery, before registration itself is dropped.
-        assert!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap().is_empty());
+        assert!(store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap().is_empty());
         let text = chat::texts_with_bearer(&fake, &format!("Bearer tok-{email}")).join("\n");
         assert!(text.contains(crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT));
         assert!(!text.contains("SECRET ANSWER"));
         drop(registration);
         let cancelled = PlaceholderRegistration::new(store.clone(), &row).unwrap();
         drop(cancelled);
-        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp()).unwrap(), vec![row]);
+        assert_eq!(store.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap(), vec![row]);
     }
 
     async fn fixture() -> (tempfile::TempDir, chat::Fake, GoogleChatCreds, Arc<Inbox>) {
@@ -2433,7 +2433,7 @@ mod placeholder_lifecycle_tests {
         let (home, fake, creds, store) = fixture().await;
         duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
         let active_row = PendingPlaceholder {
-            message_name: "spaces/PERIODIC/messages/active".into(), space: "spaces/PERIODIC".into(),
+            message_name: format!("spaces/PERIODIC/messages/client-{}", "a".repeat(32)), space: "spaces/PERIODIC".into(),
             app_agent: Some("sales".into()), app_email: creds.client_email().into(), employee_id: "sales".into(),
             session_id: "active-session".into(), thread_name: None,
             created_at: chrono::Utc::now().timestamp() - 100_000, state: "pending".into(),

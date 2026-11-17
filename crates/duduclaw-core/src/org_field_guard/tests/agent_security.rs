@@ -306,8 +306,10 @@ fn agent_status_is_frozen_for_the_agent() {
 
 #[test]
 fn unchanged_security_sections_and_ordinary_sections_pass() {
+    let mut seen = std::collections::HashSet::new();
     let all: String = SECTION_CASES
         .iter()
+        .filter(|(section, _, _)| seen.insert(*section))
         .map(|(_, before, _)| *before)
         .collect::<Vec<_>>()
         .join("\n");

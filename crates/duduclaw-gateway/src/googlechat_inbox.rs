@@ -44,7 +44,12 @@ pub(crate) fn parse_message_resource_name(name: &str) -> Option<(&str, &str)> {
 
 impl PendingPlaceholder {
     pub(crate) fn valid(&self) -> bool {
-        parse_message_resource_name(&self.message_name).is_some_and(|(space, _)| self.space == format!("spaces/{space}"))
+        parse_message_resource_name(&self.message_name).is_some_and(|(space, message)| {
+            self.space == format!("spaces/{space}")
+                && message.strip_prefix("client-").is_some_and(|id| {
+                    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+        })
             && self.app_agent.as_ref().is_none_or(|s| s.len() <= 128)
             && self.employee_id.len() <= 128 && self.app_email.len() <= 320
             && self.session_id.len() <= 512 && self.thread_name.as_ref().is_none_or(|s| s.len() <= 512)
@@ -367,7 +372,7 @@ mod googlechat_inbox_tests {
     use super::*;
     fn placeholder() -> PendingPlaceholder {
         PendingPlaceholder {
-            message_name: "spaces/A/messages/client-abc123".into(), space: "spaces/A".into(),
+            message_name: format!("spaces/A/messages/client-{}", "a".repeat(32)), space: "spaces/A".into(),
             app_agent: Some("sales".into()), app_email: "sales@test.invalid".into(), employee_id: "sales".into(),
             session_id: "session".into(), thread_name: None, created_at: 1, state: "pending".into(),
         }
@@ -375,8 +380,8 @@ mod googlechat_inbox_tests {
 
     #[test]
     fn message_resource_name_accepts_only_canonical_bounded_components() {
-        for name in ["spaces/A/messages/client-abc123", "spaces/a_.-Z/messages/m_.-9"] {
-            assert!(parse_message_resource_name(name).is_some(), "{name}");
+        for name in [format!("spaces/A/messages/client-{}", "a".repeat(32)), "spaces/a_.-Z/messages/m_.-9".into()] {
+            assert!(parse_message_resource_name(&name).is_some(), "{name}");
         }
         let max = "a".repeat(128);
         assert!(parse_message_resource_name(&format!("spaces/{max}/messages/{max}")).is_some());
@@ -420,7 +425,7 @@ mod googlechat_inbox_tests {
         let home = tempfile::tempdir().unwrap();
         let conn = Connection::open(home.path().join("googlechat_inbox.db")).unwrap();
         conn.execute_batch(include_str!("../../duduclaw-import/src/googlechat-placeholders-v183.sql")).unwrap();
-        conn.execute("INSERT INTO pending_placeholders VALUES ('spaces/A/messages/client-abc123','spaces/A','sales','sales@test.invalid','sales','session',NULL,1)", []).unwrap();
+        conn.execute(&format!("INSERT INTO pending_placeholders VALUES ('spaces/A/messages/client-{}','spaces/A','sales','sales@test.invalid','sales','session',NULL,1)", "a".repeat(32)), []).unwrap();
         drop(conn);
         for _ in 0..2 {
             let store = Inbox::open(home.path()).unwrap();
@@ -463,7 +468,7 @@ mod googlechat_inbox_tests {
     fn placeholders_survive_reopen_and_retire_without_changing_inbound_dedupe() {
         let home = tempfile::tempdir().unwrap();
         let row = PendingPlaceholder {
-            message_name: "spaces/A/messages/status".into(), space: "spaces/A".into(),
+            message_name: format!("spaces/A/messages/client-{}", "a".repeat(32)), space: "spaces/A".into(),
             app_agent: Some("sales".into()), app_email: "sales@test.invalid".into(), employee_id: "sales".into(),
             session_id: "googlechat:spaces/A:sales".into(), thread_name: Some("spaces/A/threads/T".into()),
             created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),

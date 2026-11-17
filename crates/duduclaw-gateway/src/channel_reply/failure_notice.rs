@@ -212,7 +212,16 @@ pub(crate) fn work_notice(outcome: &crate::work_outcome::WorkOutcome, language: 
             "zh-CN" | "zh_CN" => format!("这一轮的步数用完了（上限 {limit} 步）。已完成的部分已保留，回复「继续」可以接着做。"),
             _ => format!("這一輪的步數用完了（上限 {limit} 步）。已完成的部分已保留，回覆『繼續』可以接著做。"),
         },
-        WorkOutcome::TimeoutTotal { .. } => TurnFailureReason::TimeoutTotal.text(language).into(),
+        WorkOutcome::TimeoutTotal { seconds, .. } => {
+            if *seconds == 0 { return TurnFailureReason::TimeoutTotal.text(language).into(); }
+            let duration = timeout_duration(*seconds, lang);
+            match lang {
+                "en" => format!("No final answer was produced within the {duration} time limit. Completed work has been kept; reply “continue” to carry on."),
+                "ja" | "ja-JP" => format!("{duration} の制限時間内に最終回答が生成されませんでした。完了した作業は保持されています。「続けて」と返信すると再開できます。"),
+                "zh-CN" | "zh_CN" => format!("已达 {duration} 的时间上限，尚未生成最终答复。已完成的部分已保留，回复「继续」可以接着做。"),
+                _ => format!("已達 {duration} 的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。"),
+            }
+        }
         WorkOutcome::TimeoutNoProgress { seconds, tool, .. } => {
             let minutes = seconds.div_ceil(60);
             match lang {
@@ -221,6 +230,45 @@ pub(crate) fn work_notice(outcome: &crate::work_outcome::WorkOutcome, language: 
                 "zh-CN" | "zh_CN" => format!("这次回复{} {minutes} 分钟没有进展，已先停止。已完成的部分已保留，回复「继续」可以接着做。", tool.as_ref().map(|s| format!("在「{s}」停了")).unwrap_or_default()),
                 _ => format!("這次回覆{}{minutes} 分鐘沒有進展，已先停止。已完成的部分已保留，回覆『繼續』可以接著做。", tool.as_ref().map(|s| format!("在『{s}』停了 ")).unwrap_or_else(|| "已有 ".into())),
             }
+        }
+    }
+}
+
+fn timeout_duration(seconds: u64, lang: &str) -> String {
+    let minutes = seconds >= 60 && seconds % 60 == 0;
+    let value = if minutes { seconds / 60 } else { seconds };
+    let unit = match (lang, minutes) {
+        ("en", true) => if value == 1 { "minute" } else { "minutes" },
+        ("en", false) => if value == 1 { "second" } else { "seconds" },
+        ("ja" | "ja-JP", true) => "分",
+        ("zh-CN" | "zh_CN", true) => "分钟",
+        (_, true) => "分鐘",
+        (_, false) => "秒",
+    };
+    format!("{value} {unit}")
+}
+
+#[cfg(test)]
+mod work_notice_tests {
+    use super::*;
+
+    #[test]
+    fn total_timeout_notice_names_applied_duration_or_uses_zero_fallback() {
+        for (language, expected) in [
+            ("zh-TW", [(600, "10 分鐘"), (95, "95 秒"), (60, "1 分鐘"), (1, "1 秒")]),
+            ("en", [(600, "10 minutes"), (95, "95 seconds"), (60, "1 minute"), (1, "1 second")]),
+        ] {
+            for (seconds, duration) in expected {
+                let outcome = crate::work_outcome::WorkOutcome::TimeoutTotal { seconds, partial: String::new() };
+                let expected = if language == "en" {
+                    format!("No final answer was produced within the {duration} time limit. Completed work has been kept; reply “continue” to carry on.")
+                } else {
+                    format!("已達 {duration} 的時間上限，尚未產生最終答案。已完成的部分已保留，回覆『繼續』可以接著做。")
+                };
+                assert_eq!(work_notice(&outcome, Some(language)), expected);
+            }
+            let outcome = crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 0, partial: String::new() };
+            assert_eq!(work_notice(&outcome, Some(language)), TurnFailureReason::TimeoutTotal.text(Some(language)));
         }
     }
 }

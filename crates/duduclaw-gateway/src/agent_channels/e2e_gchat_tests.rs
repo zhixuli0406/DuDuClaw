@@ -727,7 +727,7 @@ async fn restart_sweep_patches_existing_message_with_original_employee_app() {
         &googlechat_section(home.path(), "444444443", &sa));
     let store = crate::googlechat_inbox::Inbox::shared(home.path()).unwrap();
     let row = crate::googlechat_inbox::PendingPlaceholder {
-        message_name: "spaces/RESTART/messages/old".into(), space: "spaces/RESTART".into(),
+        message_name: format!("spaces/RESTART/messages/client-{}", "a".repeat(32)), space: "spaces/RESTART".into(),
         app_agent: Some("sales".into()), app_email: email.clone(), employee_id: "sales".into(),
         session_id: "googlechat:spaces/RESTART:sales".into(), thread_name: None,
         created_at: chrono::Utc::now().timestamp() - 10, state: "pending".into(),
@@ -739,7 +739,7 @@ async fn restart_sweep_patches_existing_message_with_original_employee_app() {
     let calls = fake.state.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "PATCH");
-    assert_eq!(calls[0].1, "/spaces/RESTART/messages/old");
+    assert_eq!(calls[0].1, format!("/{}", row.message_name));
     assert_eq!(calls[0].2, format!("Bearer tok-{email}"));
     assert_eq!(calls[0].3["text"], "這次回覆中斷了，請再傳一次。");
     drop(calls);
@@ -765,7 +765,7 @@ async fn restart_sweep_handles_api_failures_without_posting_a_notice() {
     duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
     for (status, age, kept) in [(404, 10, false), (403, 10, false), (503, 10, true), (503, 86_401, false)] {
         let row = crate::googlechat_inbox::PendingPlaceholder {
-            message_name: "spaces/STATUS/messages/old".into(), space: "spaces/STATUS".into(),
+            message_name: format!("spaces/STATUS/messages/client-{}", "a".repeat(32)), space: "spaces/STATUS".into(),
             app_agent: Some("sales".into()), app_email: email.clone(), employee_id: "sales".into(),
             session_id: "googlechat:spaces/STATUS:sales".into(), thread_name: None,
             created_at: chrono::Utc::now().timestamp() - age, state: "pending".into(),
