@@ -1,10 +1,19 @@
 //! Native stop implementation. Unknown activation/readback state is a refusal.
-use std::{collections::BTreeSet, fs, io::Read, os::unix::fs::MetadataExt, path::Path, process::{Command, Stdio}, time::{Duration, Instant}};
+use std::{collections::BTreeSet, fs, io::Read, os::unix::fs::{MetadataExt, PermissionsExt}, path::Path, process::{Command, Stdio}, time::{Duration, Instant}};
 use super::{RootMigrationIntegration, RootPlan, Error, Evidence, StageOperation, MigrationState, path_metadata, trusted_parents, publish, read_private, private_dir};
 
 const GATEWAY: &str = "duduclaw-gateway.service";
 const USER: &str = "duduclaw";
 const COMMAND_LIMIT: u64 = 4 * 1024 * 1024;
+/// Synthetic instance through which a template (`name@.type`) is inspected:
+/// `show name@.type` is refused by systemd, `show name@PROBE.type` answers with
+/// the template's settings and leaves no loaded unit behind.
+const PROBE: &str = "duduclaw-migration-probe";
+/// The probe as an `%I` (unescaped instance) specifier resolves it.
+const PROBE_UNESCAPED: &str = "duduclaw/migration/probe";
+const SHOW: &str = "--property=User,Triggers,LoadState";
+/// Selected units that were already masked before this migration masked anything.
+const PREMASKED: &str = "premasked-units.json";
 
 /// Installer-native implementation of the early root stages. Later stages are
 /// deliberately unavailable until the gateway/import/isolation adapters are wired.
@@ -112,11 +121,83 @@ fn inventory_names(files: &str, loaded: &str) -> Result<BTreeSet<String>, Error>
     }
     Ok(names)
 }
+/// `prefix@PROBE.type` for a template `prefix@.type`.
+fn probe_name(template: &str) -> Result<String, Error> {
+    if unit_kind(template)? != UnitKind::Template { return Err(Error::Invalid); }
+    let (stem, kind) = template.rsplit_once('.').ok_or(Error::Invalid)?;
+    let probe = format!("{stem}{PROBE}.{kind}");
+    if unit_kind(&probe)? != UnitKind::Instance { return Err(Error::Invalid); }
+    Ok(probe)
+}
+/// The name `show` is asked about: a template only ever through its probe.
+fn query_name(unit: &str) -> Result<String, Error> {
+    if unit_kind(unit)? == UnitKind::Template { probe_name(unit) } else { Ok(unit.to_string()) }
+}
+/// A probe instance named in `Triggers=` stands for its template.
+fn unprobe(unit: &str) -> String {
+    unit.rsplit_once('.')
+        .and_then(|(stem, kind)| Some(format!("{}@.{kind}", stem.strip_suffix(PROBE)?.strip_suffix('@')?)))
+        .filter(|template| unit_kind(template) == Ok(UnitKind::Template))
+        .unwrap_or_else(|| unit.to_string())
+}
+/// One `show <unit> --property=User,Triggers,LoadState` answer.
+struct Shown { load: String, user: String, triggers: Vec<String> }
+/// LoadState exactly once and non-empty; User/Triggers at most once; nothing else.
+fn parse_show(show: &str) -> Result<Shown, Error> {
+    let (mut load, mut user, mut triggers) = (None, None, None);
+    for line in show.lines().filter(|line| !line.is_empty()) {
+        let (key, value) = line.split_once('=').ok_or(Error::Invalid)?;
+        let slot = match key { "LoadState" => &mut load, "User" => &mut user, "Triggers" => &mut triggers, _ => return Err(Error::Invalid) };
+        if slot.replace(value).is_some() { return Err(Error::Invalid); }
+    }
+    let load = load.filter(|v| !v.is_empty()).ok_or(Error::Invalid)?;
+    Ok(Shown { load: load.to_string(), user: user.unwrap_or("").to_string(),
+        triggers: triggers.unwrap_or("").split_whitespace().map(unprobe).collect() })
+}
+/// `show` one unit (a template through its probe) and refuse an unknown load
+/// state: `error`/`stub`/... leave `User=` unknown. A listed template's probe
+/// must resolve to its file, so `not-found` is accepted for loadable names only.
+fn inspect(systemctl: &mut impl FnMut(&[&str]) -> Result<String, Error>, unit: &str) -> Result<Shown, Error> {
+    let kind = unit_kind(unit)?;
+    let query = query_name(unit)?;
+    let shown = parse_show(&systemctl(&["show", query.as_str(), SHOW])?)?;
+    let known = matches!(shown.load.as_str(), "loaded" | "masked" | "bad-setting")
+        || (kind != UnitKind::Template && shown.load == "not-found");
+    if known { Ok(shown) } else { Err(Error::Invalid) }
+}
+/// The comparison that selects a unit for the legacy account.
+fn legacy_owner(plan: &RootPlan, owner: &str) -> bool {
+    owner == USER || owner.parse::<u32>().ok() == Some(plan.gateway_uid)
+}
+/// A template whose probe reports a `User=` containing the probe string derives
+/// its user from the instance name (`User=%i`, `User=prefix-%i`, `%I`). Returns
+/// the exact instances that resolve to the legacy account — instantiated by
+/// account name or by numeric uid (`user@.service` uses the uid) — or None for a
+/// fixed user.
+fn derived_instances(plan: &RootPlan, template: &str, user: &str) -> Result<Option<BTreeSet<String>>, Error> {
+    let forms: Vec<&str> = [PROBE, PROBE_UNESCAPED].into_iter().filter(|form| user.contains(form)).collect();
+    if forms.is_empty() { return Ok(None); }
+    let (stem, kind) = template.rsplit_once('.').ok_or(Error::Invalid)?;
+    let mut instances = BTreeSet::new();
+    for candidate in [USER.to_string(), plan.gateway_uid.to_string()] {
+        if forms.iter().any(|form| legacy_owner(plan, &user.replace(form, &candidate))) {
+            let instance = format!("{stem}{candidate}.{kind}");
+            if unit_kind(&instance)? != UnitKind::Instance { return Err(Error::Invalid); }
+            instances.insert(instance);
+        }
+    }
+    Ok(Some(instances))
+}
 fn units(plan: &RootPlan) -> Result<BTreeSet<String>, Error> {
     units_with(plan, |args| checked(plan, "systemctl", args))
 }
 /// `units` over an injected `systemctl` runner (tests use a fake).
-fn units_with(plan: &RootPlan, mut systemctl: impl FnMut(&[&str]) -> Result<String, Error>) -> Result<BTreeSet<String>, Error> {
+fn units_with(plan: &RootPlan, systemctl: impl FnMut(&[&str]) -> Result<String, Error>) -> Result<BTreeSet<String>, Error> {
+    units_seeded(plan, &BTreeSet::new(), systemctl)
+}
+/// `seeds` count as selected for the `Triggers=` closure (saved-set validation).
+fn units_seeded(plan: &RootPlan, seeds: &BTreeSet<String>, mut systemctl: impl FnMut(&[&str]) -> Result<String, Error>)
+    -> Result<BTreeSet<String>, Error> {
     let files = systemctl(&["list-unit-files", "--no-legend", "--no-pager", "--type=service,socket,timer"])?;
     // Transient systemd-run units and loaded-only services have no unit file.
     // Include them while stopped and on every readback, including a delayed
@@ -124,25 +205,32 @@ fn units_with(plan: &RootPlan, mut systemctl: impl FnMut(&[&str]) -> Result<Stri
     let loaded = systemctl(&["list-units", "--all", "--plain", "--no-legend", "--no-pager", "--type=service,socket,timer"])?;
     let names = inventory_names(&files, &loaded)?;
     let mut selected = BTreeSet::from([GATEWAY.to_string(), format!("user@{}.service", plan.gateway_uid)]);
+    selected.extend(seeds.iter().cloned());
     let mut references = Vec::new();
-    for name in names {
-        // A template (`name@.type`, from list-unit-files only) is a unit FILE with no
-        // runtime state: systemd 255 refuses `show` for it ("neither a valid
-        // invocation ID nor unit name"). Its live instances (non-empty instance) are
-        // listed by `list-units --all` and inspected below like any other unit. The
-        // legacy account's stop set selects by User=/Triggers= of loadable units
-        // only, so no template is recorded (the product's own templates belong to
-        // the new environment). Every other `show` failure still refuses.
-        if unit_kind(&name)? == UnitKind::Template { continue; }
-        let show = systemctl(&["show", name.as_str(), "--property=User,Triggers"])?;
-        let mut owner = "";
-        let mut triggers = Vec::new();
-        for line in show.lines() {
-            if let Some(v) = line.strip_prefix("User=") { owner = v; }
-            if let Some(v) = line.strip_prefix("Triggers=") { triggers = v.split_whitespace().map(str::to_string).collect(); }
+    let mut derived = BTreeSet::new();
+    for name in &names {
+        // A template (`name@.type`, list-unit-files only) can be instantiated
+        // later by anything, so it is inspected through its probe instance; its
+        // live instances come from `list-units --all` and are inspected as units.
+        let shown = inspect(&mut systemctl, name)?;
+        if unit_kind(name)? == UnitKind::Template {
+            if let Some(instances) = derived_instances(plan, name, &shown.user)? {
+                // Never mask an instance-derived template (stock `user@.service`
+                // serves every session); the legacy instances are blocked below.
+                derived.extend(instances);
+                continue;
+            }
         }
-        if owner == USER || owner.parse::<u32>().ok() == Some(plan.gateway_uid) { selected.insert(name.to_string()); }
-        references.push((name.to_string(), triggers));
+        // A fixed legacy user, or the Triggers= closure, selects a template
+        // itself: masking `name@.type` blocks every future instance.
+        if legacy_owner(plan, &shown.user) { selected.insert(name.clone()); }
+        references.push((name.clone(), shown.triggers));
+    }
+    // Loaded legacy instances were already inspected from the listing.
+    for name in derived.difference(&names) {
+        let shown = inspect(&mut systemctl, name)?;
+        if legacy_owner(plan, &shown.user) { selected.insert(name.clone()); }
+        references.push((name.clone(), shown.triggers));
     }
     loop {
         let before = selected.len();
@@ -155,13 +243,113 @@ fn units_with(plan: &RootPlan, mut systemctl: impl FnMut(&[&str]) -> Result<Stri
 }
 fn saved_units(plan: &RootPlan) -> Result<BTreeSet<String>, Error> {
     let names: BTreeSet<String> = serde_json::from_slice(&read_private(&plan.state_dir.join("stopped-units.json"), COMMAND_LIMIT, 0)?)?;
-    // `units` never selects a template; one in the saved set is not our inventory.
-    if names.len() > 10_000 || !names.contains(GATEWAY)
-        || names.iter().any(|n| !matches!(unit_kind(n), Ok(UnitKind::Plain | UnitKind::Instance))) { return Err(Error::Invalid); }
+    saved_units_with(plan, names, |args| checked(plan, "systemctl", args))
+}
+/// A template is accepted only as `units` selects it (rule 2a): it either reads
+/// back masked by the stop already, or is selected now — with the other saved
+/// units and masked templates as seeds, so a template selected through a
+/// trigger that is already masked stays accepted. Any other template refuses.
+fn saved_units_with(plan: &RootPlan, names: BTreeSet<String>, mut systemctl: impl FnMut(&[&str]) -> Result<String, Error>)
+    -> Result<BTreeSet<String>, Error> {
+    if names.len() > 10_000 || !names.contains(GATEWAY) || names.iter().any(|n| unit_kind(n).is_err()) { return Err(Error::Invalid); }
+    let mut seeds = BTreeSet::new();
+    let mut pending = Vec::new();
+    for name in &names {
+        if unit_kind(name)? != UnitKind::Template { seeds.insert(name.clone()); continue; }
+        match inspect(&mut systemctl, name)?.load.as_str() {
+            "masked" => { seeds.insert(name.clone()); }
+            _ => pending.push(name),
+        }
+    }
+    if !pending.is_empty() {
+        let selected = units_seeded(plan, &seeds, &mut systemctl)?;
+        if pending.iter().any(|name| !selected.contains(*name)) { return Err(Error::Invalid); }
+    }
     Ok(names)
 }
+/// Every saved unit reads back masked and not running; a template through its
+/// probe instance (masking `name@.type` masks every instance).
+fn masked_with(saved: &BTreeSet<String>, mut systemctl: impl FnMut(&[&str]) -> Result<String, Error>) -> Result<bool, Error> {
+    for unit in saved {
+        let query = query_name(unit)?;
+        let show = systemctl(&["show", query.as_str(), "--property=ActiveState,LoadState"])?;
+        if !show.lines().any(|l| l == "LoadState=masked")
+            || !show.lines().any(|l| l == "ActiveState=inactive" || l == "ActiveState=failed") { return Ok(false); }
+    }
+    Ok(true)
+}
+fn premasked_with(selected: &BTreeSet<String>, mut systemctl: impl FnMut(&[&str]) -> Result<String, Error>) -> Result<BTreeSet<String>, Error> {
+    let mut premasked = BTreeSet::new();
+    for unit in selected {
+        let query = query_name(unit)?;
+        let show = systemctl(&["show", query.as_str(), "--property=LoadState"])?;
+        if show.lines().any(|l| l == "LoadState=masked") { premasked.insert(unit.clone()); }
+    }
+    Ok(premasked)
+}
+/// The saved stop set. Nothing is masked before it is published, so a selected
+/// unit that reads masked now was masked by someone else: restore keeps it.
+fn record(plan: &RootPlan) -> Result<BTreeSet<String>, Error> {
+    let path = plan.state_dir.join("stopped-units.json");
+    if path.try_exists()? { return saved_units(plan); }
+    let selected = units(plan)?;
+    let premasked = premasked_with(&selected, |args| checked(plan, "systemctl", args))?;
+    publish(&plan.state_dir.join(PREMASKED), &serde_json::to_vec(&premasked)?, 0, 0, true)?;
+    publish(&path, &serde_json::to_vec(&selected)?, 0, 0, false)?;
+    Ok(selected)
+}
+/// Saved units to unmask on restore, in order; one masked before is kept.
+fn unmask_with(saved: &BTreeSet<String>, premasked: &BTreeSet<String>, mut systemctl: impl FnMut(&[&str]) -> Result<String, Error>)
+    -> Result<Vec<String>, Error> {
+    let mut unmasked = Vec::new();
+    for unit in saved.difference(premasked) {
+        systemctl(&["unmask", unit.as_str()])?;
+        unmasked.push(unit.clone());
+    }
+    Ok(unmasked)
+}
+/// Put back the unit file `mask_unit` moved into the recovery area.
+fn put_back(plan: &RootPlan, unit: &str) -> Result<(), Error> {
+    let backup = plan.state_dir.join("legacy-units").join(unit);
+    if !backup.try_exists()? { return Ok(()); }
+    let path = Path::new("/etc/systemd/system").join(unit);
+    trusted_parents(&path)?;
+    match fs::symlink_metadata(&path) {
+        // Still masked after `unmask`, or the original/an administrator's file is in place.
+        Ok(m) => {
+            if m.file_type().is_symlink() && fs::read_link(&path)? == Path::new("/dev/null") { return Err(Error::Readback); }
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let bytes = read_private(&backup, 1024 * 1024, 0)?;
+    publish(&path, &bytes, 0, 0, false)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+    super::sync_parent(&path)
+}
+/// Restore path: unmask exactly the saved units this migration masked —
+/// templates (2a), legacy instances of instance-derived templates (2b) and
+/// plain units — put back replaced unit files and read the unmask back.
+pub fn restore(plan: &RootPlan) -> Result<(), Error> {
+    super::root()?;
+    let saved = saved_units(plan)?;
+    let premasked: BTreeSet<String> = serde_json::from_slice(&read_private(&plan.state_dir.join(PREMASKED), COMMAND_LIMIT, 0)?)?;
+    if !premasked.is_subset(&saved) { return Err(Error::Invalid); }
+    let unmasked = unmask_with(&saved, &premasked, |args| checked(plan, "systemctl", args))?;
+    for unit in &unmasked { put_back(plan, unit)?; }
+    checked(plan, "systemctl", &["daemon-reload"])?;
+    for unit in &unmasked {
+        let query = query_name(unit)?;
+        let show = checked(plan, "systemctl", &["show", query.as_str(), "--property=LoadState"])?;
+        if show.lines().any(|l| l == "LoadState=masked") { return Err(Error::Readback); }
+    }
+    Ok(())
+}
 fn mask_unit(plan: &RootPlan, unit: &str) -> Result<(), Error> {
-    checked(plan, "systemctl", &["stop", unit])?;
+    // A template has no runtime state (`stop name@.type` is refused); its live
+    // instances are inventory entries of their own and stopped as such.
+    if unit_kind(unit)? != UnitKind::Template { checked(plan, "systemctl", &["stop", unit])?; }
     let path = Path::new("/etc/systemd/system").join(unit);
     trusted_parents(&path)?;
     if let Ok(m) = fs::symlink_metadata(&path) {
@@ -295,21 +483,12 @@ fn verify_stopped(plan: &RootPlan) -> Result<bool, Error> {
     if !login_blocked(plan)? || !schedulers_blocked(plan)? || !uid_processes(plan.gateway_uid)?.is_empty() { return Ok(false); }
     let saved = saved_units(plan)?;
     if !units(plan)?.is_subset(&saved) { return Err(Error::Conflict); }
-    for unit in saved {
-        let show = checked(plan, "systemctl", &["show", &unit, "--property=ActiveState,LoadState"])?;
-        if !show.lines().any(|l| l == "LoadState=masked")
-            || !show.lines().any(|l| l == "ActiveState=inactive" || l == "ActiveState=failed") { return Ok(false); }
-    }
-    Ok(true)
+    // Includes every template (2a) and legacy instance (2b) the stop masked.
+    masked_with(&saved, |args| checked(plan, "systemctl", args))
 }
 fn stop(plan: &RootPlan) -> Result<(), Error> {
     account(plan)?;
-    let path = plan.state_dir.join("stopped-units.json");
-    let selected = if path.try_exists()? { saved_units(plan)? } else {
-        let selected = units(plan)?;
-        publish(&path, &serde_json::to_vec(&selected)?, 0, 0, false)?;
-        selected
-    };
+    let selected = record(plan)?;
     checked(plan, "usermod", &["--lock", "--expiredate", "1", "--shell", "/usr/sbin/nologin", USER])?;
     checked(plan, "loginctl", &["disable-linger", USER])?;
     // No current login session is a normal outcome; readback is authoritative.
@@ -364,55 +543,252 @@ mod tests {
             assert_eq!(unit_kind(bad), Err(Error::Invalid), "{bad:?}");
         }
     }
-    /// A fake `systemctl` for `units_with`, shaped like systemd 255 on Ubuntu 24.04:
-    /// `show` of a template exits non-zero. `fail` makes one more `show` fail.
-    fn fake_systemctl<'a>(files: &'a str, loaded: &'a str, fail: Option<&'a str>, shown: &'a mut Vec<String>)
-        -> impl FnMut(&[&str]) -> Result<String, Error> + 'a {
-        move |args: &[&str]| match args {
-            ["list-unit-files", "--no-legend", "--no-pager", "--type=service,socket,timer"] => Ok(files.to_string()),
-            ["list-units", "--all", "--plain", "--no-legend", "--no-pager", "--type=service,socket,timer"] => Ok(loaded.to_string()),
-            ["show", name, "--property=User,Triggers"] => {
-                shown.push(name.to_string());
-                if name.contains("@.") || fail == Some(*name) { return Err(Error::Unavailable); }
-                Ok(match *name {
-                    "duduclaw-worker@1.service" => "User=duduclaw\nTriggers=\n",
-                    "worker-kick.timer" => "User=\nTriggers=duduclaw-worker@1.service\n",
-                    "numeric-owner.service" => "User=999\nTriggers=\n",
-                    _ => "User=\nTriggers=\n",
-                }.to_string())
+    fn test_plan(uid: u32) -> RootPlan {
+        RootPlan { migration: duduclaw_isolation::ids::RequestId([5; 16]), state_dir: "/nonexistent".into(),
+            legacy_home: "/nonexistent/home".into(), root_key_path: "/nonexistent/key".into(), gateway_uid: uid,
+            gateway_gid: uid, snapshot_content_limit: 1024, snapshot_encoded_limit: 4096, expires_at_unix: 2_000_000_000 }
+    }
+    /// A fake host behind the `systemctl` seam, shaped like systemd 255 on Ubuntu
+    /// 24.04: `show` of a template NAME exits non-zero (only a probe instance
+    /// answers). `answers` maps a shown name to its User/Triggers/LoadState body;
+    /// anything else is a loaded root unit. Names in `masked` read back masked;
+    /// `fail` makes that one `show` fail. Every call is recorded.
+    #[derive(Clone, Default)]
+    struct FakeHost { files: &'static str, loaded: &'static str, answers: &'static [(&'static str, &'static str)],
+        masked: Vec<&'static str>, fail: Option<&'static str> }
+    fn fake<'a>(host: &'a FakeHost, calls: &'a mut Vec<String>) -> impl FnMut(&[&str]) -> Result<String, Error> + 'a {
+        move |args: &[&str]| {
+            calls.push(args.join(" "));
+            match args {
+                ["list-unit-files", "--no-legend", "--no-pager", "--type=service,socket,timer"] => Ok(host.files.to_string()),
+                ["list-units", "--all", "--plain", "--no-legend", "--no-pager", "--type=service,socket,timer"] => Ok(host.loaded.to_string()),
+                ["show", name, property] => {
+                    if unit_kind(name) == Ok(UnitKind::Template) || host.fail == Some(*name) { return Err(Error::Unavailable); }
+                    let masked = host.masked.iter().any(|m| m == name);
+                    match *property {
+                        "--property=User,Triggers,LoadState" if masked => Ok("User=\nTriggers=\nLoadState=masked\n".to_string()),
+                        "--property=User,Triggers,LoadState" => Ok(host.answers.iter().find(|(n, _)| n == name)
+                            .map_or("User=\nTriggers=\nLoadState=loaded\n", |(_, a)| *a).to_string()),
+                        "--property=ActiveState,LoadState" | "--property=LoadState" =>
+                            Ok(format!("ActiveState=inactive\nLoadState={}\n", if masked { "masked" } else { "loaded" })),
+                        _ => Err(Error::Invalid),
+                    }
+                }
+                ["unmask", _] => Ok(String::new()),
+                _ => Err(Error::Invalid),
             }
-            _ => Err(Error::Invalid),
+        }
+    }
+    /// Names inspected through `show … --property=User,Triggers,LoadState`.
+    fn shown(calls: &[String]) -> Vec<&str> {
+        calls.iter().filter_map(|c| c.strip_prefix("show ")?.strip_suffix(" --property=User,Triggers,LoadState")).collect()
+    }
+    #[test]
+    fn inventory_probes_templates_inspects_instances_and_still_refuses_failed_show() {
+        let plan = test_plan(999);
+        let host = FakeHost {
+            files: "getty@.service enabled enabled\napport-coredump-hook@.service static -\n\
+                duduclaw-worker@.service disabled enabled\nduduclaw-gateway.service enabled enabled\n\
+                numeric-owner.service enabled enabled\nunrelated.service enabled enabled\nworker-kick.timer enabled enabled\n",
+            loaded: "getty@tty1.service loaded active running Getty on tty1\n\
+                duduclaw-worker@1.service loaded activating auto-restart Worker 1\n\
+                worker-kick.timer loaded active waiting Kick\nunrelated.service loaded active running Unrelated\n",
+            answers: &[("duduclaw-worker@1.service", "User=duduclaw\nTriggers=\nLoadState=loaded\n"),
+                ("worker-kick.timer", "User=\nTriggers=duduclaw-worker@1.service\nLoadState=loaded\n"),
+                ("numeric-owner.service", "User=999\nTriggers=\nLoadState=loaded\n")],
+            ..FakeHost::default() };
+        let mut calls = Vec::new();
+        let selected = units_with(&plan, fake(&host, &mut calls)).unwrap();
+        assert_eq!(selected, BTreeSet::from(["duduclaw-gateway.service", "user@999.service", "duduclaw-worker@1.service",
+            "worker-kick.timer", "numeric-owner.service"].map(String::from)));
+        // No template NAME reached `show`; each template was probed; every
+        // instance and plain unit was inspected.
+        let names = shown(&calls);
+        assert!(calls.iter().filter_map(|c| c.strip_prefix("show ")?.split(' ').next())
+            .all(|name| unit_kind(name) != Ok(UnitKind::Template)), "{calls:?}");
+        for name in ["getty@duduclaw-migration-probe.service", "apport-coredump-hook@duduclaw-migration-probe.service",
+            "duduclaw-worker@duduclaw-migration-probe.service", "getty@tty1.service", "duduclaw-worker@1.service",
+            "unrelated.service", "duduclaw-gateway.service"] {
+            assert!(names.contains(&name), "{name} not inspected");
+        }
+        // A genuine `show` failure — plain, instance or template probe — refuses.
+        for fail in ["unrelated.service", "getty@tty1.service", "getty@duduclaw-migration-probe.service"] {
+            let failing = FakeHost { fail: Some(fail), ..host.clone() };
+            let mut calls = Vec::new();
+            assert_eq!(units_with(&plan, fake(&failing, &mut calls)), Err(Error::Unavailable), "{fail}");
+        }
+        // A malformed name in a listing refuses before any `show`.
+        let malformed = FakeHost { files: "@tty1.service enabled enabled\n", ..FakeHost::default() };
+        let mut calls = Vec::new();
+        assert_eq!(units_with(&plan, fake(&malformed, &mut calls)), Err(Error::Invalid));
+        assert!(shown(&calls).is_empty());
+    }
+    #[test]
+    fn fixed_user_legacy_template_is_masked_by_name_blocked_only_after_readback_and_unmasked_on_restore() {
+        let plan = test_plan(997);
+        let mut host = FakeHost {
+            files: "legacy@.service disabled enabled\nlegacy-kick@.timer static -\nduduclaw-gateway.service enabled enabled\n",
+            answers: &[("legacy@duduclaw-migration-probe.service", "User=duduclaw\nTriggers=\nLoadState=loaded\n"),
+                ("legacy-kick@duduclaw-migration-probe.timer", "User=\nTriggers=legacy@duduclaw-migration-probe.service\nLoadState=loaded\n")],
+            ..FakeHost::default() };
+        let mut calls = Vec::new();
+        let selected = units_with(&plan, fake(&host, &mut calls)).unwrap();
+        // The fixed-user template itself, and the template whose probe triggers it.
+        assert_eq!(selected, BTreeSet::from(["duduclaw-gateway.service", "user@997.service", "legacy@.service",
+            "legacy-kick@.timer"].map(String::from)));
+        let mut calls = Vec::new();
+        assert_eq!(premasked_with(&selected, fake(&host, &mut calls)), Ok(BTreeSet::new()));
+        let mut calls = Vec::new();
+        assert_eq!(saved_units_with(&plan, selected.clone(), fake(&host, &mut calls)), Ok(selected.clone()));
+        // activation_sources_blocked stays false until every template's probe reads masked.
+        host.masked = vec!["duduclaw-gateway.service", "user@997.service"];
+        let mut calls = Vec::new();
+        assert_eq!(masked_with(&selected, fake(&host, &mut calls)), Ok(false));
+        host.masked.push("legacy@duduclaw-migration-probe.service");
+        let mut calls = Vec::new();
+        assert_eq!(masked_with(&selected, fake(&host, &mut calls)), Ok(false));
+        // An interrupted stop (one template masked, its trigger not yet) still validates.
+        let mut calls = Vec::new();
+        assert_eq!(saved_units_with(&plan, selected.clone(), fake(&host, &mut calls)), Ok(selected.clone()));
+        host.masked.push("legacy-kick@duduclaw-migration-probe.timer");
+        let mut calls = Vec::new();
+        assert_eq!(masked_with(&selected, fake(&host, &mut calls)), Ok(true));
+        let mut calls = Vec::new();
+        assert_eq!(saved_units_with(&plan, selected.clone(), fake(&host, &mut calls)), Ok(selected.clone()));
+        // Restore unmasks the template names; a unit masked before the migration stays masked.
+        let premasked = BTreeSet::from(["duduclaw-gateway.service".to_string()]);
+        let mut calls = Vec::new();
+        let unmasked = unmask_with(&selected, &premasked, fake(&host, &mut calls)).unwrap();
+        assert_eq!(unmasked, ["legacy-kick@.timer", "legacy@.service", "user@997.service"].map(String::from));
+        assert_eq!(calls, ["unmask legacy-kick@.timer", "unmask legacy@.service", "unmask user@997.service"].map(String::from));
+    }
+    #[test]
+    fn instance_derived_template_is_never_masked_only_its_legacy_instances() {
+        let plan = test_plan(997);
+        let host = FakeHost {
+            files: "user@.service static -\nprefixed@.service static -\nunescaped@.service static -\nduduclaw-gateway.service enabled enabled\n",
+            loaded: "user@1000.service loaded active running User Manager for UID 1000\n",
+            answers: &[
+                // `User=%i` echoes the probe (measured on systemd 249 and 255).
+                ("user@duduclaw-migration-probe.service", "User=duduclaw-migration-probe\nTriggers=\nLoadState=loaded\n"),
+                ("user@duduclaw.service", "User=duduclaw\nTriggers=\nLoadState=loaded\n"),
+                ("user@997.service", "User=997\nTriggers=\nLoadState=loaded\n"),
+                ("user@1000.service", "User=1000\nTriggers=\nLoadState=loaded\n"),
+                // `User=svc-%i`: no instance resolves to the legacy account.
+                ("prefixed@duduclaw-migration-probe.service", "User=svc-duduclaw-migration-probe\nTriggers=\nLoadState=loaded\n"),
+                // `User=%I`: the unescaped probe.
+                ("unescaped@duduclaw-migration-probe.service", "User=duduclaw/migration/probe\nTriggers=\nLoadState=loaded\n"),
+                ("unescaped@duduclaw.service", "User=duduclaw\nTriggers=\nLoadState=loaded\n"),
+                // A drop-in gives this instance another user: not selected.
+                ("unescaped@997.service", "User=other\nTriggers=\nLoadState=loaded\n"),
+            ],
+            ..FakeHost::default() };
+        let mut calls = Vec::new();
+        let selected = units_with(&plan, fake(&host, &mut calls)).unwrap();
+        assert_eq!(selected, BTreeSet::from(["duduclaw-gateway.service", "user@997.service", "user@duduclaw.service",
+            "unescaped@duduclaw.service"].map(String::from)));
+        assert!(!selected.iter().any(|name| unit_kind(name) == Ok(UnitKind::Template)), "{selected:?}");
+        let names = shown(&calls);
+        for name in ["user@duduclaw.service", "user@997.service", "unescaped@duduclaw.service", "unescaped@997.service"] {
+            assert!(names.contains(&name), "{name} not inspected");
+        }
+        assert!(!names.iter().any(|name| name.starts_with("prefixed@") && !name.contains(PROBE)), "{names:?}");
+        // The saved set holds the masked instances, never the template.
+        let mut calls = Vec::new();
+        assert_eq!(saved_units_with(&plan, selected.clone(), fake(&host, &mut calls)), Ok(selected.clone()));
+    }
+    #[test]
+    fn template_with_another_fixed_user_or_root_is_untouched() {
+        let plan = test_plan(997);
+        let host = FakeHost {
+            files: "www@.service static -\nrooted@.service static -\nnumeric@.service static -\nduduclaw-gateway.service enabled enabled\n",
+            loaded: "gone.service not-found inactive dead gone.service\n",
+            answers: &[("www@duduclaw-migration-probe.service", "User=www-data\nTriggers=\nLoadState=loaded\n"),
+                ("numeric@duduclaw-migration-probe.service", "User=1000\nTriggers=\nLoadState=loaded\n"),
+                ("gone.service", "User=\nTriggers=\nLoadState=not-found\n")],
+            ..FakeHost::default() };
+        let mut calls = Vec::new();
+        let selected = units_with(&plan, fake(&host, &mut calls)).unwrap();
+        assert_eq!(selected, BTreeSet::from(["duduclaw-gateway.service", "user@997.service"].map(String::from)));
+        // Only the probes: no instance of these templates is generated.
+        assert_eq!(shown(&calls), ["duduclaw-gateway.service", "gone.service", "numeric@duduclaw-migration-probe.service",
+            "rooted@duduclaw-migration-probe.service", "www@duduclaw-migration-probe.service"]);
+    }
+    #[test]
+    fn template_probe_failure_unknown_load_state_or_unparseable_answer_refuses() {
+        let plan = test_plan(997);
+        let base = FakeHost { files: "legacy@.service disabled enabled\nduduclaw-gateway.service enabled enabled\n", ..FakeHost::default() };
+        let failing = FakeHost { fail: Some("legacy@duduclaw-migration-probe.service"), ..base.clone() };
+        let mut calls = Vec::new();
+        assert_eq!(units_with(&plan, fake(&failing, &mut calls)), Err(Error::Unavailable));
+        for answer in [
+            "User=duduclaw\nTriggers=\nLoadState=not-found\n", // a listed template must resolve to its file
+            "User=duduclaw\nTriggers=\nLoadState=error\n",
+            "User=duduclaw\nTriggers=\nLoadState=\n",
+            "User=duduclaw\nTriggers=\n",
+            "User=duduclaw\nUser=root\nLoadState=loaded\n",
+            "User=duduclaw\nLoadState=loaded\nFragmentPath=/etc/systemd/system/legacy@.service\n",
+            "garbage\n",
+        ] {
+            let host = FakeHost { answers: Box::leak(Box::new([("legacy@duduclaw-migration-probe.service", answer)])), ..base.clone() };
+            let mut calls = Vec::new();
+            assert_eq!(units_with(&plan, fake(&host, &mut calls)), Err(Error::Invalid), "{answer:?}");
         }
     }
     #[test]
-    fn inventory_skips_templates_inspects_instances_and_still_refuses_failed_show() {
-        let plan = RootPlan { migration: duduclaw_isolation::ids::RequestId([5; 16]), state_dir: "/nonexistent".into(),
-            legacy_home: "/nonexistent/home".into(), root_key_path: "/nonexistent/key".into(), gateway_uid: 999,
-            gateway_gid: 999, snapshot_content_limit: 1024, snapshot_encoded_limit: 4096, expires_at_unix: 2_000_000_000 };
-        let files = "getty@.service enabled enabled\napport-coredump-hook@.service static -\n\
-            duduclaw-worker@.service disabled enabled\nduduclaw-gateway.service enabled enabled\n\
-            numeric-owner.service enabled enabled\nunrelated.service enabled enabled\nworker-kick.timer enabled enabled\n";
-        let loaded = "getty@tty1.service loaded active running Getty on tty1\n\
-            duduclaw-worker@1.service loaded activating auto-restart Worker 1\n\
-            worker-kick.timer loaded active waiting Kick\nunrelated.service loaded active running Unrelated\n";
-        let mut shown = Vec::new();
-        let selected = units_with(&plan, fake_systemctl(files, loaded, None, &mut shown)).unwrap();
-        assert_eq!(selected, BTreeSet::from(["duduclaw-gateway.service", "user@999.service", "duduclaw-worker@1.service",
-            "worker-kick.timer", "numeric-owner.service"].map(String::from)));
-        // No template reached `show`; every instance and plain unit did.
-        assert!(shown.iter().all(|name| unit_kind(name) != Ok(UnitKind::Template)), "{shown:?}");
-        for name in ["getty@tty1.service", "duduclaw-worker@1.service", "unrelated.service", "duduclaw-gateway.service"] {
-            assert!(shown.iter().any(|shown| shown == name), "{name} not inspected");
+    fn stock_templates_are_probed_without_failure_and_none_is_masked() {
+        let plan = test_plan(997);
+        let host = FakeHost {
+            files: "getty@.service enabled enabled\nuser@.service static -\nsystemd-fsck@.service static -\n\
+                serial-getty@.service disabled enabled\napport-coredump-hook@.service static -\nautovt@.service alias -\n",
+            loaded: "getty@tty1.service loaded active running Getty on tty1\n\
+                user@1000.service loaded active running User Manager for UID 1000\n",
+            answers: &[("user@duduclaw-migration-probe.service", "User=duduclaw-migration-probe\nTriggers=\nLoadState=loaded\n"),
+                ("user@duduclaw.service", "User=duduclaw\nTriggers=\nLoadState=loaded\n"),
+                ("user@997.service", "User=997\nTriggers=\nLoadState=loaded\n"),
+                ("user@1000.service", "User=1000\nTriggers=\nLoadState=loaded\n")],
+            ..FakeHost::default() };
+        let mut calls = Vec::new();
+        let selected = units_with(&plan, fake(&host, &mut calls)).unwrap();
+        assert_eq!(selected, BTreeSet::from(["duduclaw-gateway.service", "user@997.service", "user@duduclaw.service"].map(String::from)));
+        // Beyond the listing and the probes, only the two legacy user@ instances.
+        let generated: Vec<_> = shown(&calls).into_iter().filter(|name| !name.contains(PROBE) && !host.loaded.contains(*name)).collect();
+        assert_eq!(generated, ["user@997.service", "user@duduclaw.service"]);
+    }
+    #[test]
+    fn saved_set_accepts_exactly_the_masked_templates_and_instances() {
+        let plan = test_plan(997);
+        let host = FakeHost {
+            files: "legacy@.service disabled enabled\nuser@.service static -\ngetty@.service enabled enabled\n\
+                www@.service static -\nduduclaw-gateway.service enabled enabled\n",
+            answers: &[("legacy@duduclaw-migration-probe.service", "User=duduclaw\nTriggers=\nLoadState=loaded\n"),
+                ("user@duduclaw-migration-probe.service", "User=duduclaw-migration-probe\nTriggers=\nLoadState=loaded\n"),
+                ("user@duduclaw.service", "User=duduclaw\nTriggers=\nLoadState=loaded\n"),
+                ("user@997.service", "User=997\nTriggers=\nLoadState=loaded\n"),
+                ("www@duduclaw-migration-probe.service", "User=www-data\nTriggers=\nLoadState=loaded\n")],
+            ..FakeHost::default() };
+        let mut calls = Vec::new();
+        let selected = units_with(&plan, fake(&host, &mut calls)).unwrap();
+        assert_eq!(selected, BTreeSet::from(["duduclaw-gateway.service", "user@997.service", "user@duduclaw.service",
+            "legacy@.service"].map(String::from)));
+        let mut calls = Vec::new();
+        assert_eq!(saved_units_with(&plan, selected.clone(), fake(&host, &mut calls)), Ok(selected.clone()));
+        // Once masked by the stop, the same set still validates.
+        let masked = FakeHost { masked: vec!["legacy@duduclaw-migration-probe.service", "user@duduclaw.service",
+            "user@997.service", "duduclaw-gateway.service"], ..host.clone() };
+        let mut calls = Vec::new();
+        assert_eq!(saved_units_with(&plan, selected.clone(), fake(&masked, &mut calls)), Ok(selected.clone()));
+        // Any other template refuses: instance-derived, root, another fixed user, unlisted.
+        for other in ["user@.service", "getty@.service", "www@.service", "absent@.service"] {
+            let mut saved = selected.clone();
+            saved.insert(other.to_string());
+            let mut calls = Vec::new();
+            assert_eq!(saved_units_with(&plan, saved, fake(&host, &mut calls)), Err(Error::Invalid), "{other}");
         }
-        // A genuine `show` failure of a non-template, plain or instance, still refuses.
-        for fail in ["unrelated.service", "getty@tty1.service"] {
-            let mut shown = Vec::new();
-            assert_eq!(units_with(&plan, fake_systemctl(files, loaded, Some(fail), &mut shown)), Err(Error::Unavailable), "{fail}");
-        }
-        // A malformed name in a listing refuses before any `show`.
-        let mut shown = Vec::new();
-        assert_eq!(units_with(&plan, fake_systemctl("@tty1.service enabled enabled\n", "", None, &mut shown)), Err(Error::Invalid));
-        assert!(shown.is_empty());
+        let mut without_gateway = selected.clone();
+        without_gateway.remove(GATEWAY);
+        let mut calls = Vec::new();
+        assert_eq!(saved_units_with(&plan, without_gateway, fake(&host, &mut calls)), Err(Error::Invalid));
     }
     #[test]
     #[ignore = "root/systemd required; creates a disposable transient unit with a delayed restart"]
@@ -441,6 +817,64 @@ mod tests {
         if fs::read_link(&mask).ok().as_deref() == Some(Path::new("/dev/null")) { fs::remove_file(mask).unwrap(); }
         let _ = command(&plan, "systemctl", &["reset-failed", &unit]);
         checked(&plan, "systemctl", &["daemon-reload"]).unwrap();
+        result.unwrap();
+    }
+    #[test]
+    #[ignore = "iso_root_: root/systemd on a disposable VM (DUDUCLAW_ISO_DISPOSABLE=1); creates a temporary system account and template unit"]
+    fn iso_root_fixed_user_template_is_masked_and_restored() {
+        super::super::root().unwrap();
+        assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"), "disposable VM only");
+        let uid = 199_993;
+        let account = "ddc-iso-tmpl";
+        assert!(uid_processes(uid).unwrap().is_empty(), "test uid already in use");
+        // Scratch state directory: emptied file by file below, never recursively.
+        let state = tempfile::Builder::new().prefix("ddc-iso-tmpl-").tempdir_in("/root").unwrap().keep();
+        let plan = RootPlan { migration: duduclaw_isolation::ids::RequestId([6; 16]), state_dir: state.clone(),
+            legacy_home: state.join("unused-home"), root_key_path: state.join("unused-key"), gateway_uid: uid,
+            gateway_gid: uid, snapshot_content_limit: 1024, snapshot_encoded_limit: 4096, expires_at_unix: 2_000_000_000 };
+        for (database, key) in [("passwd", account), ("passwd", "199993"), ("group", account)] {
+            assert!(!command(&plan, "getent", &[database, key]).unwrap().0, "{database} {key} already exists");
+        }
+        let prefix = format!("ddc-iso-tmpl-{}", std::process::id());
+        let template = format!("{prefix}@.service");
+        let instance = format!("{prefix}@x.service");
+        let unit_file = Path::new("/etc/systemd/system").join(&template);
+        assert!(fs::symlink_metadata(&unit_file).is_err(), "unit file already exists");
+        checked(&plan, "useradd", &["--system", "--uid", "199993", "--user-group", "--no-create-home",
+            "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", account]).unwrap();
+        // A numeric User= is compared with the plan's uid exactly as the legacy
+        // account's (`USER` is the fixed production name and is not created here).
+        let text = format!("[Unit]\nDescription=DuDuClaw iso root test fixed-user template\n[Service]\nType=simple\nUser={uid}\nExecStart=/usr/bin/sleep 300\n");
+        let result = (|| -> Result<(), Error> {
+            fs::write(&unit_file, &text)?;
+            fs::set_permissions(&unit_file, fs::Permissions::from_mode(0o644))?;
+            checked(&plan, "systemctl", &["daemon-reload"])?;
+            let selected = record(&plan)?;
+            if !selected.contains(&template) { return Err(Error::Readback); }
+            // Only the template is masked here: the other selected names (the
+            // legacy gateway and user@ units) are not this test's to change.
+            mask_unit(&plan, &template)?;
+            checked(&plan, "systemctl", &["daemon-reload"])?;
+            if !masked_with(&BTreeSet::from([template.clone()]), |args| checked(&plan, "systemctl", args))? { return Err(Error::Readback); }
+            if command(&plan, "systemctl", &["start", &instance])?.0 { return Err(Error::Readback); }
+            restore(&plan)?;
+            let probe = checked(&plan, "systemctl", &["show", &probe_name(&template)?, "--property=LoadState"])?;
+            if !probe.lines().any(|l| l == "LoadState=loaded") || fs::read_to_string(&unit_file)? != text { return Err(Error::Readback); }
+            Ok(())
+        })();
+        let _ = command(&plan, "systemctl", &["stop", &instance]);
+        let _ = command(&plan, "systemctl", &["reset-failed", &instance]);
+        // Exactly the files this test created (the unit file, or the mask left in
+        // its place by a failed restore, and the stop's records), one by one.
+        for path in [unit_file.clone(), state.join("legacy-units").join(&template), state.join("stopped-units.json"), state.join(PREMASKED)] {
+            if fs::symlink_metadata(&path).is_ok() { checked(&plan, "rm", &["--", path.to_str().unwrap()]).unwrap(); }
+        }
+        checked(&plan, "systemctl", &["daemon-reload"]).unwrap();
+        checked(&plan, "userdel", &[account]).unwrap();
+        // userdel removes the user group itself where USERGROUPS_ENAB is set.
+        let _ = command(&plan, "groupdel", &[account]);
+        if state.join("legacy-units").try_exists().unwrap() { fs::remove_dir(state.join("legacy-units")).unwrap(); }
+        fs::remove_dir(&state).unwrap();
         result.unwrap();
     }
     #[test]
