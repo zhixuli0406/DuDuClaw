@@ -4,27 +4,66 @@ fn fixture(scenario: &str) {
     #[cfg(feature = "root-test-fixture")]
     {
         assert!(cfg!(target_os = "linux"), "iso_root_ tests require native Linux");
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_duduclaw-run-root-fixture"))
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_duduclaw-run-root-fixture"))
             .env("DUDUCLAW_ROOT_TEST",scenario)
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
             .spawn().expect("start single-threaded root fixture");
-        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
-        let mut timed_out=false;
-        while child.try_wait().expect("fixture status").is_none() {
-            if std::time::Instant::now()>=deadline {
-                timed_out=true;
-                child.kill().expect("stop timed-out fixture supervisor");
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let output=child.wait_with_output().expect("reap fixture and its bounded output");
-        assert!(!timed_out,"root fixture {scenario} exceeded parent deadline");
-        assert!(output.status.success(), "root fixture {scenario} failed: {}",
-            String::from_utf8_lossy(&output.stderr));
+        await_fixture(child, scenario, 60);
     }
     #[cfg(not(feature = "root-test-fixture"))]
     panic!("{scenario} requires --features root-test-fixture; it was not executed");
+}
+
+#[cfg(feature = "root-test-fixture")]
+fn await_fixture(mut child: std::process::Child, scenario: &str, seconds: u64) {
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(seconds);
+    let mut timed_out=false;
+    while child.try_wait().expect("fixture status").is_none() {
+        if std::time::Instant::now()>=deadline {
+            timed_out=true;
+            child.kill().expect("stop timed-out fixture supervisor");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output=child.wait_with_output().expect("reap fixture and its bounded output");
+    assert!(!timed_out,"root fixture {scenario} exceeded parent deadline");
+    assert!(output.status.success(), "root fixture {scenario} failed: {}",
+        String::from_utf8_lossy(&output.stderr));
+}
+
+/// The same fixture inside a transient systemd unit with the run unit's
+/// `RestrictNamespaces=` (under which systemd answers `clone3` with ENOSYS) and
+/// NoNewPrivileges. The run unit's 7-capability bounding set is NOT applied: the
+/// launch fixture itself (outside the trampoline) needs capabilities the real
+/// spawnd-prepared flow does not, e.g. reading employee `/proc/<pid>/ns/*` links.
+/// `RuntimeMaxSec` bounds the unit even if the waiting `systemd-run` is killed.
+fn fixture_in_run_unit_restrictions(scenario: &str) {
+    #[cfg(feature = "root-test-fixture")]
+    {
+        assert!(cfg!(target_os = "linux"), "iso_root_ tests require native Linux");
+        let child = std::process::Command::new("/usr/bin/systemd-run")
+            .args(["--wait", "--collect", "--pipe", "--quiet",
+                "-p", "RestrictNamespaces=mnt ipc uts net pid", "-p", "NoNewPrivileges=yes",
+                "-p", "RuntimeMaxSec=60"])
+            .arg(format!("--setenv=DUDUCLAW_ROOT_TEST={scenario}"))
+            .arg("--").arg(env!("CARGO_BIN_EXE_duduclaw-run-root-fixture"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().expect("start root fixture through /usr/bin/systemd-run");
+        await_fixture(child, scenario, 90);
+    }
+    #[cfg(not(feature = "root-test-fixture"))]
+    panic!("{scenario} requires --features root-test-fixture; it was not executed");
+}
+
+#[test]
+#[ignore = "requires a disposable root Linux VM with systemd (DUDUCLAW_ISO_DISPOSABLE=1), full trampoline; --features root-test-fixture"]
+fn iso_root_launch_under_run_unit_namespace_restriction() {
+    assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
+        "set DUDUCLAW_ISO_DISPOSABLE=1 only on a disposable VM");
+    // serve → probe → namespaces → pivot → init clone → exec, under systemd's filter.
+    fixture_in_run_unit_restrictions("launch-elf");
 }
 
 #[test]
@@ -54,6 +93,17 @@ fn iso_root_mount_tree_pty_and_proc_readbacks() { fixture("mounts"); }
 #[test]
 #[ignore = "requires root Linux with private detached mounts; --features root-test-fixture"]
 fn iso_root_detached_mount_private_propagation() { fixture("propagation"); }
+
+/// R7f: production `attach_input` under exactly the run unit's capability set
+/// (no CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH) onto an employee-owned 0700 mount
+/// root, with the O_PATH readback; in the fresh single-threaded fixture process.
+#[test]
+#[ignore = "iso_root_: disposable root Linux VM (DUDUCLAW_ISO_DISPOSABLE=1); --features root-test-fixture"]
+fn iso_root_attach_input_without_dac_capabilities() {
+    assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
+        "set DUDUCLAW_ISO_DISPOSABLE=1 only on a disposable VM");
+    fixture("attach-input-no-dac");
+}
 
 #[test]
 #[ignore = "requires root Linux full trampoline; --features root-test-fixture"]

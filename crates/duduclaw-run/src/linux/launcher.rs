@@ -26,7 +26,6 @@ use super::{bootstrap, fd, runner::{self, FailurePage, HelperProgram, LauncherPl
 
 /// The one byte the launcher writes to init's ready pipe once it is isolated.
 pub(super) const READY: u8 = b'L';
-const CLONE_PIDFD: u64 = 0x1000;
 /// Bounded scratch cleanup: entries visited per call, directory depth.
 const SCRATCH_BUDGET: usize = 100_000;
 const SCRATCH_DEPTH: usize = 32;
@@ -460,20 +459,21 @@ impl Launcher<'_> {
             let timer = timer(start.timeout_ms.min(helper.timeout_ms))?;
             let child = Child { helper, filter, entry, script, files, scratch: scratch_path, environment,
                 slot: self.slots[slot_index(start.slot)].as_raw_fd(), launcher: self.pid, abi: self.abi };
-            let mut pidfd: RawFd = -1;
-            // Raw clone (no clone3: common returns ENOSYS); CLONE_PIDFD carries no namespace flag.
-            let pid = unsafe { libc::syscall(libc::SYS_clone, (libc::SIGCHLD as u64) | CLONE_PIDFD, 0usize,
-                &mut pidfd as *mut RawFd, 0usize, 0usize) };
-            if pid < 0 { return Err(LauncherError::Sandbox); }
-            if pid == 0 { child.exec(input, stdout, stderr, stdin_read, status_write); }
-            if pidfd < 0 {
-                kill_group(pid as i32);
-                unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0); }
-                return Err(LauncherError::Sandbox);
-            }
+            // Legacy clone(CLONE_PIDFD | SIGCHLD), not clone3: common and systemd's
+            // RestrictNamespaces= return ENOSYS for clone3 (shared with init: `process`).
+            let (pid, pidfd) = match unsafe { super::process::clone_with_pidfd() } {
+                Err(super::process::CloneError::Failed) => return Err(LauncherError::Sandbox),
+                Ok(super::process::Cloned::Child) => child.exec(input, stdout, stderr, stdin_read, status_write),
+                Err(super::process::CloneError::NoPidfd(pid)) => {
+                    kill_group(pid);
+                    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0); }
+                    return Err(LauncherError::Sandbox);
+                }
+                Ok(super::process::Cloned::Parent { pid, pidfd }) => (pid, pidfd),
+            };
             // The call's fds now live only in the helper.
             drop((input, stdout, stderr, stdin_read, status_write));
-            Ok(Live { call: start.call, slot: start.slot, pid: pid as i32, pidfd: unsafe { OwnedFd::from_raw_fd(pidfd) },
+            Ok(Live { call: start.call, slot: start.slot, pid, pidfd,
                 timer, status: Some(status_read), stdin: stdin_write, failed: None, timed_out: false, started: false,
                 scratch: scratch.clone() })
         })();

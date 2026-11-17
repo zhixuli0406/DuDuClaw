@@ -710,12 +710,18 @@ The common filter additionally refuses ptrace/process_vm operations and limits
 socketpair to AF_UNIX. These are deliberate narrowing defenses.
 
 Kernel readiness checks require Linux 5.15+, actual Landlock ABI >=1, seccomp
-KILL_PROCESS, clone3, openat2, statx mount IDs, close_range and detached fs-context
+KILL_PROCESS, pidfd support (`pidfd_open` on the trampoline itself; no process is
+created), openat2, statx mount IDs, close_range and detached fs-context
 mount APIs including recursive mount_setattr/NOSYMFOLLOW. I1 selects the exact
 ABI-7 filesystem policy on kernels reporting newer ABIs; missing ABI 1 or any
 enforcement failure still refuses execution. Launch still verifies every actual namespace, mount
 and privilege syscall. Kernel capability probing does not prove B1/systemd/egress
 readiness or replace the three-distribution acceptance run.
+
+The PID-namespace init (after `unshare(CLONE_NEWPID)`) and every HX helper are
+created with legacy `clone(CLONE_PIDFD | SIGCHLD)`, never `clone3`: systemd's
+`RestrictNamespaces=` on the run unit returns ENOSYS for `clone3`, whose flags
+seccomp cannot inspect (`duduclaw_run::linux::process`).
 
 ### Round 2 implementation and handoff
 

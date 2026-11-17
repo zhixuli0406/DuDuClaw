@@ -7244,6 +7244,32 @@
       "rationale": "Ignored root Linux acceptance test forks a child into a private mount namespace to check the /etc protected-mode projection, then _exits; not a production spawn path."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/bootstrap_mounts.rs::tests::iso_root_etc_projection_attaches_through_build_root",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux acceptance test (DUDUCLAW_ISO_DISPOSABLE=1) re-executes only itself (current test binary, --exact) so the production /etc projection is attached by build_root in a fresh process's private namespaces instead of a fork of the harness; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/bootstrap_mounts.rs::tests::iso_root_etc_projection_refuses_mounted_ca_chain",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux acceptance test re-executes only itself in a fresh process to verify that a mounted CA chain is refused in a private mount namespace; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/transport.rs::tests::root_tests::iso_root_egress_control_identity_over_socket_activation",
       "apis": {
         "raw_fork": 1
@@ -7377,7 +7403,7 @@
       ],
       "identity": "trampoline",
       "migration": "privileged_service",
-      "rationale": "HX in-run helper launcher (D8 revision 2.1/2.4/2.5) inside the duduclaw-run trampoline: raw clone with CLONE_PIDFD, then Child::exec of a root-verified signed helper fd (execveat) after setsid/PDEATHSIG, slot cgroup, exact fds, stacked Landlock, hard=soft rlimits and seccomp. Runs only inside the isolated run, holds no capability, prompt, stdin, MCP channel or egress socket; no gateway invocation or local fallback."
+      "rationale": "HX in-run helper launcher (D8 revision 2.1/2.4/2.5) inside the duduclaw-run trampoline: raw legacy clone(CLONE_PIDFD | SIGCHLD) via linux::process::clone_with_pidfd (shared with namespace-init creation; never clone3), then Child::exec of a root-verified signed helper fd (execveat) after setsid/PDEATHSIG, slot cgroup, exact fds, stacked Landlock, hard=soft rlimits and seccomp. Runs only inside the isolated run, holds no capability, prompt, stdin, MCP channel or egress socket; no gateway invocation or local fallback."
     },
     {
       "symbol": "crates/duduclaw-run/src/linux/runner.rs::tests::launcher_ready_before_all_isolated",
