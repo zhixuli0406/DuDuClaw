@@ -12,6 +12,8 @@ mod in_place;
 mod bootstrap;
 #[path = "protected_linux_rollback.rs"]
 mod rollback;
+#[path = "protected_linux_ledger.rs"]
+mod ledger;
 pub(super) use bootstrap::ContinueOptions;
 
 fn gate() -> Result<()> {

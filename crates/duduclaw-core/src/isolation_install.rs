@@ -296,6 +296,28 @@ mod tests {
         assert_eq!(FACTS, duduclaw_isolation::update::ISOLATION_FACTS);
     }
 
+    /// Review F9: the VM acceptance script's leftover check consumes the
+    /// authoritative list. Its `FACTS='…'` block (one path per line) must equal
+    /// [`FACTS`] as a set, with no duplicate and nothing extra.
+    #[test]
+    fn isolation_install_acceptance_script_lists_every_fact() {
+        let script = include_str!("../../../scripts/live-test/linux-protected/install-acceptance.sh");
+        let mut lines = script.lines().skip_while(|line| *line != "FACTS='");
+        assert_eq!(lines.next(), Some("FACTS='"), "the script must open the list with a FACTS=' line");
+        let mut listed: Vec<&str> = Vec::new();
+        let mut closed = false;
+        for line in lines {
+            if line == "'" { closed = true; break; }
+            assert!(!line.contains('\'') && !line.trim().is_empty(), "malformed FACTS line: {line:?}");
+            listed.push(line.trim());
+        }
+        assert!(closed, "the FACTS list must end with a line holding only '");
+        let unique: std::collections::BTreeSet<&str> = listed.iter().copied().collect();
+        assert_eq!(unique.len(), listed.len(), "duplicate path in the script's FACTS");
+        let production: std::collections::BTreeSet<&str> = FACTS.iter().copied().collect();
+        assert_eq!(unique, production, "install-acceptance.sh FACTS differs from isolation_install::FACTS");
+    }
+
     #[test]
     fn isolation_install_thread_root_only_narrows_and_never_latches() {
         let root = tempfile::tempdir().unwrap();

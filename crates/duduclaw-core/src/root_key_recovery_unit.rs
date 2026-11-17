@@ -52,11 +52,22 @@ WantedBy=multi-user.target
 ")
 }
 
+/// The `[Unit]` dependency lines of the isolated gateway unit (plan 「設計補充」
+/// R6 「啟動順序與「一致」的判定」 points 3 and 6): the gateway is bound to the
+/// isolation readiness unit, never directly to spawnd, so it starts only after
+/// the whole platform was judged consistent and stops when that unit stops.
+/// The single definition in this crate: the R6 branch exports the same text as
+/// `duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES`; merging
+/// replaces this value with that constant (one line).
+pub const ISOLATED_GATEWAY_UNIT_DEPENDENCIES: &str =
+    "BindsTo=duduclaw-isolation-ready.service\nAfter=duduclaw-isolation-ready.service\n";
+
 /// The gateway unit of a v1.83 isolated install (written only by the isolation
 /// bootstrap, `duduclaw service bootstrap-continue`). It is [`protected_unit_text`]
 /// with four additions and nothing removed:
-/// - `Requires=`/`After=duduclaw-spawnd.service`: the gateway starts only after
-///   spawnd (which reports READY after its startup recovery) and stops with it;
+/// - [`ISOLATED_GATEWAY_UNIT_DEPENDENCIES`] (`BindsTo=`/`After=` the isolation
+///   readiness unit): the gateway starts only after the platform is ready and
+///   stops with it;
 /// - `User=duduclaw`/`Group=duduclaw` with the `!` ExecStart prefix: systemd
 ///   still runs the root launcher as root (the `!` prefix lifts only the
 ///   user/group change; every sandboxing setting still applies), the launcher
@@ -68,7 +79,7 @@ WantedBy=multi-user.target
 pub fn isolated_unit_text() -> String {
     protected_unit_text()
         .replacen("Wants=network-online.target\n",
-            "Wants=network-online.target\nRequires=duduclaw-spawnd.service\nAfter=duduclaw-spawnd.service\n", 1)
+            &format!("Wants=network-online.target\n{ISOLATED_GATEWAY_UNIT_DEPENDENCIES}"), 1)
         .replacen("Type=simple\nExecStart=/usr/local/libexec/",
             "Type=simple\nUser=duduclaw\nGroup=duduclaw\nExecStart=!/usr/local/libexec/", 1)
         .replacen("UMask=0077\n",
@@ -182,9 +193,13 @@ mod tests {
     fn root_key_isolated_unit_only_adds_the_four_isolation_settings() {
         let base = protected_unit_text();
         let isolated = isolated_unit_text();
-        let added = ["Requires=duduclaw-spawnd.service", "After=duduclaw-spawnd.service", "User=duduclaw",
+        let added = ["BindsTo=duduclaw-isolation-ready.service", "After=duduclaw-isolation-ready.service", "User=duduclaw",
             "Group=duduclaw", "NoNewPrivileges=yes", "RuntimeDirectory=duduclaw-gateway-update",
             "RuntimeDirectoryMode=0750"];
+        // The dependency lines come only from the one named constant, and the
+        // gateway no longer names spawnd directly.
+        assert_eq!(ISOLATED_GATEWAY_UNIT_DEPENDENCIES.lines().collect::<Vec<_>>(), added[..2].to_vec());
+        assert!(!isolated.contains("duduclaw-spawnd"));
         for line in added {
             assert_eq!(isolated.lines().filter(|l| *l == line).count(), 1, "{line}");
             assert!(!base.lines().any(|l| l == line), "{line}");
@@ -199,7 +214,8 @@ mod tests {
         assert_eq!(isolated.lines().count(), base.lines().count() + added.len());
         // The ordering lines belong to [Unit], the identity lines to [Service].
         let (unit_section, service_section) = isolated.split_once("[Service]").unwrap();
-        assert!(unit_section.lines().any(|l| l == "Requires=duduclaw-spawnd.service"));
+        assert!(unit_section.lines().any(|l| l == "BindsTo=duduclaw-isolation-ready.service"));
+        assert!(unit_section.lines().any(|l| l == "After=duduclaw-isolation-ready.service"));
         for line in ["User=duduclaw", "RuntimeDirectory=duduclaw-gateway-update", "NoNewPrivileges=yes"] {
             assert!(service_section.split("[Install]").next().unwrap().lines().any(|l| l == line), "{line}");
         }

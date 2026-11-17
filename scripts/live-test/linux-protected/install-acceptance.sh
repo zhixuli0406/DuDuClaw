@@ -26,10 +26,54 @@ INBOX=/root/duduclaw-migrate
 BOOTSTRAP=$INBOX/duduclaw-bootstrap
 JOURNAL=/var/lib/duduclaw-protected/isolation-bootstrap.json
 RECEIPT=/etc/duduclaw-updated/launcher-receipt.json
-FACTS='/run/duduclaw-spawnd/control.sock /etc/systemd/system/duduclaw-spawnd.service /usr/lib/duduclaw
-/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /etc/duduclaw-updated /var/lib/duduclaw-updated
-/opt/duduclaw-isolated /var/lib/duduclaw-migrate /usr/libexec/duduclaw /usr/libexec/duduclaw-updated-launch
-/opt/duduclaw/bin/duduclaw-egress /etc/duduclaw/migration-import.json'
+# The complete production list, one path per line. It must equal
+# duduclaw_core::isolation_install::FACTS exactly (set equality is a CI unit
+# test: isolation_install::tests::isolation_install_acceptance_script_lists_every_fact),
+# so a leftover outside a hand-picked subset cannot pass the rollback check.
+FACTS='
+/run/duduclaw-spawnd/control.sock
+/etc/systemd/system/duduclaw-spawnd.socket
+/etc/systemd/system/duduclaw-spawnd.service
+/etc/systemd/system/duduclaw-employees.slice
+/etc/systemd/system/duduclaw-egress.socket
+/etc/systemd/system/duduclaw-egress.service
+/etc/systemd/system/duduclaw-dns-broker.socket
+/etc/systemd/system/duduclaw-dns-broker.service
+/etc/systemd/system/duduclaw-parse.socket
+/etc/systemd/system/duduclaw-parse@.service
+/etc/systemd/system/duduclaw-updated.service
+/etc/systemd/system/duduclaw-import@.service
+/etc/systemd/system/duduclaw-migrate-expire@.service
+/etc/systemd/system/duduclaw-migrate-expire@.timer
+/usr/lib/duduclaw
+/usr/lib/duduclaw/parse-root
+/usr/lib/duduclaw/parse-root-tree
+/usr/lib/duduclaw/current
+/usr/libexec/duduclaw
+/var/lib/duduclaw-spawnd
+/var/lib/duduclaw-spawnd/etc
+/var/log/duduclaw-spawnd
+/etc/duduclaw-updated
+/var/lib/duduclaw-updated
+/opt/duduclaw-isolated
+/opt/duduclaw-isolated/generations
+/opt/duduclaw-isolated/slots
+/opt/duduclaw-isolated/slots/a
+/opt/duduclaw-isolated/slots/b
+/var/lib/duduclaw-migrate
+/opt/duduclaw-isolated/current
+/var/lib/duduclaw-updated/state.json
+/etc/duduclaw/migration-import.json
+/usr/lib/duduclaw/duduclaw-spawnd
+/usr/lib/duduclaw/duduclaw-run
+/opt/duduclaw/bin/duduclaw-egress
+/usr/libexec/duduclaw/duduclaw-parse-worker
+/usr/lib/duduclaw/current/duduclaw-import
+/usr/lib/duduclaw/current/duduclaw-migrate
+/usr/lib/duduclaw/current/duduclaw-mcp-bridge
+/usr/lib/duduclaw/current/duduclaw
+/usr/libexec/duduclaw-updated-launch
+'
 PASSED=0 FAILED=0
 
 usage() { echo 'usage: sudo sh install-acceptance.sh install [--dns-upstream IP:53] [--enable-now] | rollback | root-tests <workspace> <test>' >&2; exit 2; }
