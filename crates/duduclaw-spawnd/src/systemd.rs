@@ -28,6 +28,27 @@ pub struct UnitPolicy {
 }
 
 fn invalid() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "invalid unit policy") }
+/// [`invalid`] naming what was refused: `invalid unit policy: <what>` (same
+/// kind). `<what>` names a property, cgroup file or process field and carries
+/// only values spawnd set or PID 1/the kernel reports for the unit, bounded
+/// with [`bounded_text`] where they come from outside.
+fn invalid_because(what: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("invalid unit policy: {what}"))
+}
+/// Single-line, bounded rendering for a refusal message: at most 200 bytes of
+/// `text` (cut at a character boundary, `...` appended when cut), every
+/// control character replaced by `?`.
+#[cfg(any(target_os = "linux", test))]
+fn bounded_text(text: &str) -> String {
+    const MAX: usize = 200;
+    let mut rendered = String::new();
+    for character in text.chars() {
+        let character = if character.is_control() { '?' } else { character };
+        if rendered.len() + character.len_utf8() > MAX { rendered.push_str("..."); break; }
+        rendered.push(character);
+    }
+    rendered
+}
 pub fn run_unit(run: RunId) -> String {
     let hex: String = run.0.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("duduclaw-run-{hex}.service")
@@ -243,27 +264,46 @@ pub static RUN_UNIT_DEFAULTED: [(&str, Property); 3] = [
 /// bounding = [`TRAMPOLINE_CAPABILITIES`], no ambient capability and
 /// no_new_privs set.
 pub fn run_process_status_ok(status: &str) -> io::Result<bool> {
-    let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+    run_process_status_mismatch(status).map(|mismatch| mismatch.is_none())
+}
+/// [`run_process_status_ok`] naming the first field (in the order `Uid`,
+/// `Gid`, `CapPrm`, `CapEff`, `CapBnd`, `CapAmb`, `NoNewPrivs`) that is not
+/// as required, with its value as read: `Ok(None)` exactly when
+/// `run_process_status_ok` is `Ok(true)`. A missing, duplicated or malformed
+/// field is `Err` naming it (`main process <field> missing|duplicated|malformed`).
+pub fn run_process_status_mismatch(status: &str) -> io::Result<Option<(&'static str, &str)>> {
+    const FIELDS: [&str; 7] = ["Uid", "Gid", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs"];
+    let mut fields: BTreeMap<&'static str, &str> = BTreeMap::new();
     for line in status.lines() {
         let Some((key, value)) = line.split_once(':') else { continue };
-        if matches!(key, "Uid" | "Gid" | "CapPrm" | "CapEff" | "CapBnd" | "CapAmb" | "NoNewPrivs")
-            && fields.insert(key, value.trim()).is_some() { return Err(invalid()); }
+        let Some(&known) = FIELDS.iter().find(|field| **field == key) else { continue };
+        if fields.insert(known, value.trim()).is_some() {
+            return Err(invalid_because(format_args!("main process {known} duplicated")));
+        }
     }
-    let field = |key: &str| fields.get(key).copied().ok_or_else(invalid);
+    let field = |key: &'static str| fields.get(key).copied()
+        .ok_or_else(|| invalid_because(format_args!("main process {key} missing")));
     let root = |text: &str| {
         let ids: Vec<&str> = text.split_whitespace().collect();
         ids.len() == 4 && ids.iter().all(|id| *id == "0")
     };
-    let capabilities = |text: &str| -> io::Result<u64> {
-        if text.len() != 16 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(invalid()); }
-        u64::from_str_radix(text, 16).map_err(|_| invalid())
+    let capabilities = |key: &'static str, text: &str| -> io::Result<u64> {
+        let malformed = || invalid_because(format_args!("main process {key} malformed"));
+        if text.len() != 16 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(malformed()); }
+        u64::from_str_radix(text, 16).map_err(|_| malformed())
     };
-    Ok(root(field("Uid")?) && root(field("Gid")?)
-        && capabilities(field("CapPrm")?)? == TRAMPOLINE_CAPABILITIES
-        && capabilities(field("CapEff")?)? == TRAMPOLINE_CAPABILITIES
-        && capabilities(field("CapBnd")?)? == TRAMPOLINE_CAPABILITIES
-        && capabilities(field("CapAmb")?)? == 0
-        && field("NoNewPrivs")? == "1")
+    for key in ["Uid", "Gid"] {
+        let text = field(key)?;
+        if !root(text) { return Ok(Some((key, text))); }
+    }
+    for (key, required) in [("CapPrm", TRAMPOLINE_CAPABILITIES), ("CapEff", TRAMPOLINE_CAPABILITIES),
+        ("CapBnd", TRAMPOLINE_CAPABILITIES), ("CapAmb", 0)] {
+        let text = field(key)?;
+        if capabilities(key, text)? != required { return Ok(Some((key, text))); }
+    }
+    let text = field("NoNewPrivs")?;
+    if text != "1" { return Ok(Some(("NoNewPrivs", text))); }
+    Ok(None)
 }
 /// R7g: `/proc/<MainPID>/cgroup` names exactly the unit's own cgroup (v2 only;
 /// spawnd moves the trampoline into `rt-init` only after start). Guards the
@@ -416,7 +456,7 @@ pub mod linux {
             Proxy::new(&self.connection, BUS, "/org/freedesktop/systemd1", MANAGER).map_err(bus_error)
         }
         fn start_referenced(&self, name: &str, mut properties: Vec<(&str, Value<'_>)>) -> io::Result<()> {
-            if properties.iter().any(|(key, _)| *key == "AddRef") { return Err(invalid()); }
+            if properties.iter().any(|(key, _)| *key == "AddRef") { return Err(invalid_because("AddRef preset by caller")); }
             // AddRef is atomic with creation: even an immediately exited unit
             // survives until readback. All reference RPCs share this lock.
             properties.push(("AddRef", Value::from(true)));
@@ -603,7 +643,7 @@ pub mod linux {
                 let code: i32 = service.get_property("ExecMainCode").map_err(bus_error)?;
                 let status: i32 = service.get_property("ExecMainStatus").map_err(bus_error)?;
                 // CLD_EXITED; a signal or a missing exec is never a probe answer.
-                if code != 1 { return Err(invalid()); }
+                if code != 1 { return Err(invalid_because(format_args!("probe ExecMainCode {code} (status {status})"))); }
                 Ok(status)
             })();
             let _ = self.kill_name(&name);
@@ -625,7 +665,7 @@ pub mod linux {
         /// harmless executable to exercise the production policy and readback.
         fn start_exec(&self, policy: &UnitPolicy, executable: &str, argv: Vec<&str>, bootstrap: BorrowedFd<'_>,
             stdout: BorrowedFd<'_>, stderr: BorrowedFd<'_>) -> io::Result<StartedUnit> {
-            if parse_run_unit(&policy.name).is_none() { return Err(invalid()); }
+            if parse_run_unit(&policy.name).is_none() { return Err(invalid_because("unit name")); }
             self.ensure_employee_slice(policy)?;
             let mut properties: Vec<(&str, Value<'_>)> = policy.properties.iter()
                 .map(|(key, property)| (*key, value(property))).collect();
@@ -643,10 +683,13 @@ pub mod linux {
                     let actual: OwnedValue = if matches!(key, "BindsTo" | "After") {
                         let actual: Vec<String> = unit_proxy.get_property(key).map_err(bus_error)?;
                         // systemd adds implicit ordering dependencies as well.
-                        if !actual.iter().any(|name| name == "duduclaw-spawnd.service") { return Err(invalid()); }
+                        if !actual.iter().any(|name| name == "duduclaw-spawnd.service") {
+                            return Err(invalid_because(format_args!("dependency {key} (actual {})",
+                                bounded_text(&format!("{actual:?}")))));
+                        }
                         continue;
                     } else { service.get_property(key).map_err(bus_error)? };
-                    if !property_matches(expected, actual)? { return Err(invalid()); }
+                    readback_matches(key, expected, actual)?;
                 }
                 // Standard*FileDescriptor overrides the null defaults; systemd
                 // 249 does not expose these received descriptors as properties.
@@ -668,12 +711,15 @@ pub mod linux {
             result
         }
         fn ensure_employee_slice(&self, policy: &UnitPolicy) -> io::Result<()> {
-            let Some(Property::Text(name)) = policy.properties.get("Slice") else { return Err(invalid()); };
+            let Some(Property::Text(name)) = policy.properties.get("Slice") else {
+                return Err(invalid_because("slice Slice not in policy"));
+            };
             let properties: Vec<(&str, Value<'_>)> = ["MemoryAccounting", "CPUAccounting",
                 "TasksAccounting", "IOAccounting", "MemoryMax", "MemorySwapMax",
                 "CPUQuotaPerSecUSec", "TasksMax", "IOReadBandwidthMax", "IOWriteBandwidthMax",
                 "IOReadIOPSMax", "IOWriteIOPSMax"].into_iter().map(|key| {
-                    policy.properties.get(key).map(|property| (key, value(property))).ok_or_else(invalid)
+                    policy.properties.get(key).map(|property| (key, value(property)))
+                        .ok_or_else(|| invalid_because(format_args!("slice {key} not in policy")))
                 }).collect::<io::Result<_>>()?;
             let manager = self.manager()?;
             let existing: zbus::Result<OwnedObjectPath> = manager.call("GetUnit", &(name.as_str(),));
@@ -690,7 +736,7 @@ pub mod linux {
             let slice = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Slice").map_err(bus_error)?;
             for (key, expected) in properties {
                 let actual: OwnedValue = slice.get_property(key).map_err(bus_error)?;
-                if actual != expected.try_to_owned().map_err(bus_error)? { return Err(invalid()); }
+                if actual != expected.try_to_owned().map_err(bus_error)? { return Err(readback_refusal("slice readback", key, &actual)); }
             }
             Ok(())
         }
@@ -836,41 +882,60 @@ pub mod linux {
         text.parse().map_err(|_| invalid())
     }
     fn verify_run_resources(directory: &Path, policy: &UnitPolicy) -> io::Result<()> {
+        let refuse = |what: String| invalid_because(format_args!("resource {what}"));
         for (property, file) in [("MemoryMax", "memory.max"), ("MemorySwapMax", "memory.swap.max"),
             ("TasksMax", "pids.max")] {
-            let Some(Property::U64(expected)) = policy.properties.get(property) else { return Err(invalid()); };
-            let actual = read_number(&directory.join(file))?;
+            let Some(Property::U64(expected)) = policy.properties.get(property) else {
+                return Err(refuse(format!("{property} not in policy")));
+            };
+            let actual = read_number(&directory.join(file))
+                .map_err(|error| named(error, format!("resource {file} not a number")))?;
             // Kernel page rounding may narrow a byte ceiling but never widen it.
-            if actual > *expected || (*expected != 0 && actual == 0) { return Err(invalid()); }
+            if actual > *expected || (*expected != 0 && actual == 0) {
+                return Err(refuse(format!("{file} (read {actual}, {property} {expected})")));
+            }
         }
-        let Some(Property::U64(expected_cpu)) = policy.properties.get("CPUQuotaPerSecUSec") else { return Err(invalid()); };
+        let Some(Property::U64(expected_cpu)) = policy.properties.get("CPUQuotaPerSecUSec") else {
+            return Err(refuse("CPUQuotaPerSecUSec not in policy".into()));
+        };
         let text = std::fs::read_to_string(directory.join("cpu.max"))?;
+        let cpu_max = || refuse(format!("cpu.max (read {:?}, CPUQuotaPerSecUSec {expected_cpu})", bounded_text(&text)));
         let words: Vec<_> = text.split_whitespace().collect();
-        if words.len() != 2 { return Err(invalid()); }
-        let quota: u64 = words[0].parse().map_err(|_| invalid())?;
-        let period: u64 = words[1].parse().map_err(|_| invalid())?;
+        if words.len() != 2 { return Err(cpu_max()); }
+        let quota: u64 = words[0].parse().map_err(|_| cpu_max())?;
+        let period: u64 = words[1].parse().map_err(|_| cpu_max())?;
         if period == 0 || quota == 0 || u128::from(quota) * 1_000_000 > u128::from(*expected_cpu) * u128::from(period) {
-            return Err(invalid());
+            return Err(cpu_max());
         }
         let text = std::fs::read_to_string(directory.join("io.max"))?;
         for (property, field) in [("IOReadBandwidthMax", "rbps"), ("IOWriteBandwidthMax", "wbps"),
             ("IOReadIOPSMax", "riops"), ("IOWriteIOPSMax", "wiops")] {
-            let Some(Property::DeviceLimits(limits)) = policy.properties.get(property) else { return Err(invalid()); };
-            if limits.len() != 1 { return Err(invalid()); }
-            let device = limits[0].0.strip_prefix("/dev/block/").ok_or_else(invalid)?;
+            let Some(Property::DeviceLimits(limits)) = policy.properties.get(property) else {
+                return Err(refuse(format!("{property} not in policy")));
+            };
+            if limits.len() != 1 { return Err(refuse(format!("{property} not one device"))); }
+            let device = limits[0].0.strip_prefix("/dev/block/")
+                .ok_or_else(|| refuse(format!("{property} device not /dev/block/<major>:<minor>")))?;
+            let io_max = || refuse(format!("io.max {field} for {device} (read {:?}, {property} {})",
+                bounded_text(&text), limits[0].1));
             let matching: Vec<_> = text.lines().filter(|line| line.split_whitespace().next() == Some(device)).collect();
-            if matching.len() != 1 { return Err(invalid()); }
+            if matching.len() != 1 { return Err(io_max()); }
             let mut found = None;
             for entry in matching[0].split_whitespace().skip(1) {
-                let (key, value) = entry.split_once('=').ok_or_else(invalid)?;
+                let (key, value) = entry.split_once('=').ok_or_else(|| io_max())?;
                 if key == field {
-                    if found.is_some() { return Err(invalid()); }
-                    found = Some(value.parse::<u64>().map_err(|_| invalid())?);
+                    if found.is_some() { return Err(io_max()); }
+                    found = Some(value.parse::<u64>().map_err(|_| io_max())?);
                 }
             }
-            if !found.is_some_and(|value| value > 0 && value <= limits[0].1) { return Err(invalid()); }
+            if !found.is_some_and(|value| value > 0 && value <= limits[0].1) { return Err(io_max()); }
         }
         Ok(())
+    }
+    /// A refusal (`InvalidData`) from a lower check renamed to `what`; any
+    /// other error (I/O, bus) is returned unchanged.
+    fn named(error: io::Error, what: impl std::fmt::Display) -> io::Error {
+        if error.kind() == io::ErrorKind::InvalidData { invalid_because(what) } else { error }
     }
     /// R7g: the started process itself, not only PID 1's configuration. Waits
     /// (bounded) until the `Type=exec` unit is `active` (its process has
@@ -886,19 +951,46 @@ pub mod linux {
             let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
             if state == "active" { break; }
             // A just-queued start job may still read `inactive`.
-            if !matches!(state.as_str(), "inactive" | "activating") || Instant::now() >= until { return Err(invalid()); }
+            if !matches!(state.as_str(), "inactive" | "activating") || Instant::now() >= until {
+                return Err(invalid_because(format_args!("main process not active (ActiveState {:?})", bounded_text(&state))));
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
         let pid: u32 = service.get_property("MainPID").map_err(bus_error)?;
-        if pid == 0 { return Err(invalid()); }
+        if pid == 0 { return Err(invalid_because("main process MainPID 0")); }
         let process = PathBuf::from(format!("/proc/{pid}"));
         let status = std::fs::read_to_string(process.join("status"))?;
         let membership = std::fs::read_to_string(process.join("cgroup"))?;
         let after: u32 = service.get_property("MainPID").map_err(bus_error)?;
-        if after != pid || !run_process_status_ok(&status)? || !run_process_cgroup_ok(&membership, control_group) {
-            return Err(invalid());
+        if after != pid { return Err(invalid_because("main process MainPID changed")); }
+        if let Some((field, value)) = run_process_status_mismatch(&status)? {
+            return Err(invalid_because(format_args!("main process {field} {:?}", bounded_text(value))));
+        }
+        if !run_process_cgroup_ok(&membership, control_group) {
+            return Err(invalid_because(format_args!("main process cgroup (read {:?}, unit {:?})",
+                bounded_text(&membership), bounded_text(control_group))));
         }
         Ok(())
+    }
+    /// One run-unit property PID 1 reported after start, against the policy
+    /// ([`property_matches`]): a mismatch is `invalid unit policy: readback
+    /// <key>: actual signature <sig> value <debug>` ([`readback_refusal`]); a
+    /// reply that does not even convert keeps its bus error kind and gains the
+    /// same naming.
+    fn readback_matches(key: &str, expected: &Property, actual: OwnedValue) -> io::Result<()> {
+        let refusal = readback_refusal("readback", key, &actual);
+        match property_matches(expected, actual) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(refusal),
+            Err(error) => Err(io::Error::new(error.kind(), format!("{error}; {refusal}"))),
+        }
+    }
+    /// `invalid unit policy: <scope> <key>: actual signature <sig> value
+    /// <debug>`, both renderings bounded ([`bounded_text`]). Unit and slice
+    /// properties are spawnd's own settings or systemd defaults, not secrets.
+    fn readback_refusal(scope: &str, key: &str, actual: &OwnedValue) -> io::Error {
+        invalid_because(format_args!("{scope} {key}: actual signature {} value {}",
+            bounded_text(&actual.value_signature().to_string()), bounded_text(&format!("{actual:?}"))))
     }
     fn property_matches(expected: &Property, actual: OwnedValue) -> io::Result<bool> {
         match expected {
@@ -1094,6 +1186,61 @@ pub mod linux {
             // A wrongly typed reply is not a match either.
             assert!(!property_matches(expected["User"], owned(Value::from(0u32))).unwrap());
             assert!(!property_matches(expected["RestrictSUIDSGID"], owned(Value::from(""))).unwrap());
+        }
+
+        #[test]
+        fn run_unit_readback_mismatch_names_the_property_and_actual_value() {
+            let owned = |value: Value<'_>| value.try_to_owned().unwrap();
+            let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &r7g_limits(), &r7g_timeouts(), 8, 1).unwrap();
+            let expected: BTreeMap<&str, &Property> = policy.readback().collect();
+            readback_matches("StandardInput", expected["StandardInput"], owned(Value::from("null"))).unwrap();
+            readback_matches("RestrictSUIDSGID", expected["RestrictSUIDSGID"], owned(Value::from(false))).unwrap();
+            // A mismatch: still InvalidData, now naming the property, the
+            // actual value's D-Bus signature and the actual value.
+            let error = readback_matches("StandardInput", expected["StandardInput"], owned(Value::from("fd"))).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let message = error.to_string();
+            assert!(message.starts_with("invalid unit policy"), "{message}");
+            assert!(message.starts_with("invalid unit policy: readback StandardInput: actual signature s value "), "{message}");
+            assert!(message.contains("fd"), "{message}");
+            let error = readback_matches("RestrictSUIDSGID", expected["RestrictSUIDSGID"], owned(Value::from(true))).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().starts_with("invalid unit policy: readback RestrictSUIDSGID: actual signature b value "), "{error}");
+            let error = readback_matches("LimitNOFILE", expected["LimitNOFILE"], owned(Value::from(1024u64))).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().starts_with("invalid unit policy: readback LimitNOFILE: actual signature t value "), "{error}");
+            assert!(error.to_string().contains("1024"), "{error}");
+            // A deny-list (allow flag false) reply for the allow-list property.
+            let error = readback_matches("RestrictAddressFamilies", expected["RestrictAddressFamilies"],
+                owned(Value::from((false, vec!["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"])))).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().starts_with("invalid unit policy: readback RestrictAddressFamilies: actual signature (bas) value "), "{error}");
+            // The rendering is bounded and single-line.
+            let prefix = "invalid unit policy: readback User: actual signature s value ";
+            let long = "x\n".repeat(500);
+            let message = readback_matches("User", expected["User"], owned(Value::from(long.as_str()))).unwrap_err().to_string();
+            assert!(message.starts_with(prefix), "{message}");
+            assert!(!message.chars().any(char::is_control), "{message}");
+            assert!(message.len() <= prefix.len() + 200 + "...".len(), "{}", message.len());
+            assert!(message.ends_with("..."), "{message}");
+            // A reply that does not convert keeps its (bus) kind, now named too.
+            let error = readback_matches("SystemCallArchitectures", expected["SystemCallArchitectures"],
+                owned(Value::from(7u32))).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(error.to_string().contains("invalid unit policy: readback SystemCallArchitectures: actual signature u value "), "{error}");
+            // The slice readback uses the same naming under its own scope.
+            let error = readback_refusal("slice readback", "MemoryMax", &owned(Value::from(u64::MAX)));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().starts_with("invalid unit policy: slice readback MemoryMax: actual signature t value "), "{error}");
+        }
+
+        #[test]
+        fn non_refusal_errors_are_not_renamed() {
+            let renamed = named(invalid(), "resource memory.max not a number");
+            assert_eq!(renamed.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(renamed.to_string(), "invalid unit policy: resource memory.max not a number");
+            let missing = named(io::ErrorKind::NotFound.into(), "resource memory.max not a number");
+            assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         }
 
         fn r7g_limits() -> ResourceLimits {
@@ -1490,6 +1637,36 @@ mod tests {
             assert!(run_process_status_ok(&R7G_STATUS.replace(from, to)).is_err(), "{to}");
         }
         assert!(run_process_status_ok("").is_err());
+    }
+    #[test]
+    fn unit_policy_refusals_name_what_failed() {
+        let error = invalid_because("dependency BindsTo");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "invalid unit policy: dependency BindsTo");
+        assert_eq!(bounded_text("a\tb\nc"), "a?b?c");
+        assert_eq!(bounded_text(&"x".repeat(200)), "x".repeat(200));
+        // Cut at a character boundary, never past 200 bytes of content.
+        let cut = bounded_text(&"é".repeat(150));
+        assert_eq!(cut, format!("{}...", "é".repeat(100)));
+        // The main-process readback names the first field that is not as required.
+        assert_eq!(run_process_status_mismatch(R7G_STATUS).unwrap(), None);
+        let lost = R7G_STATUS.replace("CapEff:\t00000000012011c1", "CapEff:\t0000000001201141");
+        assert_eq!(run_process_status_mismatch(&lost).unwrap(), Some(("CapEff", "0000000001201141")));
+        assert!(!run_process_status_ok(&lost).unwrap());
+        let user = R7G_STATUS.replace("Uid:\t0\t0\t0\t0", "Uid:\t0\t70000\t0\t0");
+        assert_eq!(run_process_status_mismatch(&user).unwrap().map(|(field, _)| field), Some("Uid"));
+        let privs = R7G_STATUS.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0");
+        assert_eq!(run_process_status_mismatch(&privs).unwrap(), Some(("NoNewPrivs", "0")));
+        for (status, message) in [
+            (R7G_STATUS.replace("NoNewPrivs:\t1\n", ""), "invalid unit policy: main process NoNewPrivs missing"),
+            (format!("{R7G_STATUS}CapBnd:\t00000000012011c1\n"), "invalid unit policy: main process CapBnd duplicated"),
+            (R7G_STATUS.replace("CapEff:\t00000000012011c1", "CapEff:\t12011c1"), "invalid unit policy: main process CapEff malformed"),
+        ] {
+            let error = run_process_status_mismatch(&status).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), message);
+            assert_eq!(run_process_status_ok(&status).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
     }
     #[test]
     fn run_process_cgroup_must_be_the_units_own() {
