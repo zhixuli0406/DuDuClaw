@@ -247,7 +247,7 @@ mod linux {
     }
 
     /// Fixed executable paths and argv only; bounded output, deadline, no inherited env.
-    fn command(path: &str, args: &[&str]) -> io::Result<(i32, String)> {
+    pub(crate) fn command(path: &str, args: &[&str]) -> io::Result<(i32, String)> {
         root_path(Path::new(path), false)?;
         let (mut output, writer) = UnixStream::pair()?;
         output.set_nonblocking(true)?;
@@ -669,6 +669,9 @@ mod linux {
 }
 #[cfg(target_os = "linux")]
 pub use linux::{LinuxAccounts, unexpected_processes, terminate_intruder, employee_process_count};
+/// Root tests elsewhere in the crate use the same fixed-argv helper.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::command as root_command;
 
 #[cfg(test)]
 mod tests {

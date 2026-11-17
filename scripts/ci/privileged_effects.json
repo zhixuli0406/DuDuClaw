@@ -7244,6 +7244,18 @@
       "rationale": "Ignored root Linux acceptance test forks a child into a private mount namespace to check the /etc protected-mode projection, then _exits; not a production spawn path."
     },
     {
+      "symbol": "crates/duduclaw-spawnd/src/transport.rs::tests::root_tests::iso_root_egress_control_identity_over_socket_activation",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root Linux test forks a child that drops to a temporary system account and answers one socket frame to verify egress credential checks; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/allocation_retire_tests.rs::iso_root_retire_gid_match_counts_as_live",
       "apis": {
         "command_constructor": 1,
