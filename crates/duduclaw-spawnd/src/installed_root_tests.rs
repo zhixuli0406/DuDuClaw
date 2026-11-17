@@ -2,7 +2,7 @@
 //! records, accounts, or run receipts are manufactured by these tests.
 use super::*;
 use duduclaw_mcp_boundary::config::{RuntimeBridgeRegistry, runtime_projection, prepare_runtime_bridge};
-use crate::{accounts::{InstallationEvidence, LinuxAccounts}, host::DnsEvidence, registry::AccountHost};
+use crate::{accounts::{InstallationEvidence, LinuxAccounts}, registry::AccountHost};
 
 fn require_disposable_root() {
     assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
@@ -96,8 +96,13 @@ fn iso_root_e2e_installed_publication_live_install_evidence() {
     let facts = selftest.ensure(&mut crate::selftest::InstalledHost::default())
         .expect("installed trampoline and self-test binaries match the signed generation");
     crate::selftest::readiness(&facts).check().expect("isolation self-test unit passed on this kernel");
-    let mut dns = InstalledEvidence;
-    DnsEvidence::verify(&mut dns).expect("real root DNS route measurement without private-IP bypass");
+    // R7b: the DNS route is no longer a receipt fact. Its probe inputs must be
+    // installed: a policy v4 probe name and one configured route. (The probe
+    // itself needs spawnd's own control connection; egress serves one
+    // controller, so this process cannot send it.)
+    let name = installed_dns_probe_name().expect("verified installed signed policy");
+    assert!(name.is_some(), "the installed signed policy must be v4 (dns_probe_name)");
+    configured_dns_route().expect("root-owned /etc/duduclaw/egress.json with one DNS route");
 }
 
 fn installed_run() -> RunHandle {

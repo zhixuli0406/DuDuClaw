@@ -203,6 +203,60 @@ async fn iso_root_unregister_ack_follows_data_socket_eof() {
     assert!(tokio::time::timeout(Duration::from_secs(1),task).await.unwrap().unwrap().is_err());
 }
 
+/// R7b on a real host (Ubuntu 24.04 VM, systemd-resolved, outbound DNS): the
+/// real control loop (`serve_control`, as for the unregister test above) and
+/// the real resolver through the `resolved_varlink` route answer `ProbeDns`.
+/// The spawnd side of the exchange (credential-checked receive of the egress
+/// account) is the R7e harness in spawnd's `transport.rs`; spawnd cannot run
+/// the egress code itself, so the spawnd half is covered there and by the
+/// non-root `probe_dns` client tests.
+#[tokio::test]
+#[ignore = "root Linux VM with systemd-resolved and outbound DNS required; takes about 11 s"]
+async fn iso_root_egress_dns_probe_through_control_socket() {
+    use nix::sys::socket::{socketpair, AddressFamily, SockType, SockFlag};
+    use duduclaw_isolation::{ipc::{self, Envelope}, ids::RequestId};
+    async fn probe(control: &CheckedSocket, id: u8, name: &str) -> EgressControlResponse {
+        let packet = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([id; 16]),
+            message: EgressControl::ProbeDns { name: name.into() } }).unwrap();
+        control.send_packet(&packet).await.unwrap();
+        let mut buffer = vec![0; ipc::MAX_FRAME_BYTES + 4];
+        // The probe deadline is 3 s; the reply follows well inside the control timeout.
+        let (n, fds) = tokio::time::timeout(Duration::from_secs(5), control.receive(&mut buffer)).await.unwrap().unwrap();
+        assert!(fds.is_empty());
+        let reply = ipc::decode::<EgressControlResponse>(&buffer[..n]).unwrap();
+        assert_eq!(reply.request_id, RequestId([id; 16]));
+        reply.message
+    }
+    assert_eq!(nix::unistd::geteuid().as_raw(), 0);
+    let (a, b) = socketpair(AddressFamily::Unix, SockType::SeqPacket, None, SockFlag::SOCK_CLOEXEC).unwrap();
+    let control = CheckedSocket::new(a).unwrap();
+    let server = CheckedSocket::new(b).unwrap();
+    let config = duduclaw_egress::daemon::Config { profiles: List::new(vec![profile()]).unwrap(),
+        run_caps: RunCaps { total_bytes: 1024, total_connections: 2 }, max_runs: 1, host_public_addresses: Vec::new() };
+    let task = tokio::spawn(async move { duduclaw_egress::daemon::serve_control(server, &config).await });
+    let started = std::time::Instant::now();
+    let first = probe(&control, 1, "example.com").await;
+    assert!(started.elapsed() < Duration::from_secs(4), "probe deadline");
+    match &first {
+        EgressControlResponse::DnsProbed { route: DnsRoute::ResolvedVarlink, resolved: true, public_addresses } =>
+            assert!(*public_addresses >= 1),
+        other => panic!("unexpected {other:?}"),
+    }
+    // Inside the 10 s window: the cached result, and another name is refused.
+    assert_eq!(probe(&control, 2, "example.com").await, first);
+    assert_eq!(probe(&control, 3, "does-not-exist.example.com").await,
+        EgressControlResponse::Refused { code: EgressError::ResourceLimit });
+    // An invalid name is refused; the control connection stays usable.
+    assert_eq!(probe(&control, 4, "localhost").await, EgressControlResponse::Refused { code: EgressError::InvalidRequest });
+    // After the window: a name that passes the syntax rule but does not resolve.
+    tokio::time::sleep(Duration::from_millis(10_500).saturating_sub(started.elapsed())).await;
+    let missing = probe(&control, 5, "does-not-exist.example.com").await;
+    assert_eq!(missing, EgressControlResponse::DnsProbed { route: DnsRoute::ResolvedVarlink, resolved: false, public_addresses: 0 });
+    assert_eq!(probe(&control, 6, "does-not-exist.example.com").await, missing);
+    drop(control);
+    assert!(tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+}
+
 #[test]
 fn config_bounds_aggregate_tunnel_reservations() {
     let mut config = duduclaw_egress::daemon::Config {

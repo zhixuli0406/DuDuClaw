@@ -11,6 +11,9 @@ pub mod transport;
 pub mod resolver;
 #[cfg(target_os = "linux")]
 pub mod daemon;
+/// R7b: the `ProbeDns` control request (one bounded, rate-limited lookup).
+#[cfg(target_os = "linux")]
+pub mod dns_probe;
 #[cfg(target_os = "linux")]
 pub mod forwarder;
 

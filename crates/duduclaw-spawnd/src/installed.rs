@@ -3,11 +3,15 @@
 use std::{ffi::CString, fs::{self, File}, io, os::fd::AsFd, path::Path, sync::{Arc, Mutex}};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use duduclaw_isolation::{bounded::Text, egress::ProfileId, execution::{RunHandle, DiskQuota, NetworkPolicy, ResourceLimits, RunTimeouts, RuntimeKind},
+use duduclaw_isolation::{bounded::Text, egress::{DnsRoute, EgressProfile, ProfileId}, execution::{RunHandle, DiskQuota, NetworkPolicy, ResourceLimits, RunTimeouts, RuntimeKind},
     ids::{EmployeeId, Sha256Digest, UidRange}, ipc::{ErrorCode, QueueClass}, update::{InstallTarget, ReleaseManifest}};
 use duduclaw_updated::linux::{files::Directory, service::{artifact_name, verified_committed_generation}, INSTALL_ROOT};
 use crate::{Result, policy::{EmployeeEntitlement, Executable, PublishedRuntime, RootPolicy, TurnLimit}};
 const ROOT: &str = "/var/lib/duduclaw-spawnd";
+/// Per-run /etc projection state (the etc-state parent of `RootPublicationAnchors`).
+pub const ETC_STATE_DIRECTORY: &str = "/var/lib/duduclaw-spawnd/etc-state";
+/// Per-employee MCP projection files (the projection root of `RootPublicationAnchors`).
+pub const PROJECTIONS_DIRECTORY: &str = "/var/lib/duduclaw-spawnd/projections";
 const RECEIPTS: &str = "/run/duduclaw-isolation-evidence";
 pub const GATEWAY_PUBLICATION: &str = "/run/duduclaw-spawnd/publication.json";
 const POLICY_ID: &str = "isolation-policy-v1";
@@ -213,7 +217,8 @@ struct NativeRecord {
 struct ForwarderRecord { entry: String, executable_digest: Sha256Digest, argv: Vec<String>,
     seccomp: duduclaw_run::seccomp::RuntimeProfile, seccomp_digest: Sha256Digest }
 /// Verified in-memory policy; `version` records which signed schema produced it.
-struct SignedPolicy { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
+/// `dns_probe_name` (R7b) exists from v4 on; `None` for v1–v3.
+struct SignedPolicy { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord>, dns_probe_name: Option<String> }
 /// Exact v1 document. A v2 document always carries `domain`, so this strict
 /// reader (and every deployed v1 reader) refuses it instead of reinterpreting it.
 #[derive(Deserialize)]
@@ -231,35 +236,70 @@ const POLICY_DOMAIN_V2: &str = "duduclaw-isolation-policy-v2";
 #[serde(deny_unknown_fields)]
 struct SignedPolicyV3 { domain: String, version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
 const POLICY_DOMAIN_V3: &str = "duduclaw-isolation-policy-v3";
+/// v4 (R7b): the v3 shape under its own signed domain plus the required
+/// `dns_probe_name` (`duduclaw_isolation::egress::validate_dns_probe_name`):
+/// a hostname AI employees need anyway, chosen by the vendor at signing time,
+/// that spawnd asks egress to resolve as its DNS route evidence.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPolicyV4 { domain: String, version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord>, dns_probe_name: String }
+const POLICY_DOMAIN_V4: &str = "duduclaw-isolation-policy-v4";
 #[derive(Deserialize)]
 struct PolicyVersion { version: u16 }
-/// v3 reader. A v1 document is accepted as "no launcher" (helper tools then
-/// report `helper_launcher_unavailable`); a v1 document naming a launcher, a v2
-/// or v3 document without its own domain, a v1/v2 document with a step range,
-/// a v3 document with any invalid step range (the whole policy), or any other
-/// version is refused.
+/// v4 reader. A v1 document is accepted as "no launcher" (helper tools then
+/// report `helper_launcher_unavailable`); a v1 document naming a launcher, a
+/// v2, v3 or v4 document without its own domain, a v1/v2 document with a step
+/// range, a v1–v3 document with a `dns_probe_name`, a v4 document without a
+/// valid one, a v3/v4 document with any invalid step range (the whole
+/// policy), or any other version is refused.
 fn parse_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
     let probe: PolicyVersion = serde_json::from_slice(bytes).map_err(|_| denied())?;
     let policy = match probe.version {
         1 => {
             let v1: SignedPolicyV1 = serde_json::from_slice(bytes).map_err(|_| denied())?;
             if v1.version != 1 || v1.native.iter().any(|n| n.launcher.is_some()) { return Err(denied()); }
-            SignedPolicy { version: 1, runtimes: v1.runtimes, native: v1.native }
+            SignedPolicy { version: 1, runtimes: v1.runtimes, native: v1.native, dns_probe_name: None }
         }
         2 => {
             let v2: SignedPolicyV2 = serde_json::from_slice(bytes).map_err(|_| denied())?;
             if v2.version != 2 || v2.domain != POLICY_DOMAIN_V2 { return Err(denied()); }
-            SignedPolicy { version: 2, runtimes: v2.runtimes, native: v2.native }
+            SignedPolicy { version: 2, runtimes: v2.runtimes, native: v2.native, dns_probe_name: None }
         }
         3 => {
             let v3: SignedPolicyV3 = serde_json::from_slice(bytes).map_err(|_| denied())?;
             if v3.version != 3 || v3.domain != POLICY_DOMAIN_V3 { return Err(denied()); }
-            SignedPolicy { version: 3, runtimes: v3.runtimes, native: v3.native }
+            SignedPolicy { version: 3, runtimes: v3.runtimes, native: v3.native, dns_probe_name: None }
+        }
+        4 => {
+            let v4: SignedPolicyV4 = serde_json::from_slice(bytes).map_err(|_| denied())?;
+            if v4.version != 4 || v4.domain != POLICY_DOMAIN_V4 { return Err(denied()); }
+            duduclaw_isolation::egress::validate_dns_probe_name(&v4.dns_probe_name).map_err(|_| denied())?;
+            SignedPolicy { version: 4, runtimes: v4.runtimes, native: v4.native, dns_probe_name: Some(v4.dns_probe_name) }
         }
         _ => return Err(denied()),
     };
+    dns_probe_name_key(bytes, policy.version)?;
     turn_limit_keys(bytes, policy.version)?;
     validate_turn_limits(&policy)?;
+    Ok(policy)
+}
+/// R7b, decided on the raw document like `turn_limit_keys`: the key (also as
+/// an explicit `null`) is refused before v4. The strict v1–v3 readers refuse
+/// it as an unknown field too; this keeps the rule explicit.
+fn dns_probe_name_key(bytes: &[u8], version: u16) -> io::Result<()> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| denied())?;
+    if version < 4 && document.get("dns_probe_name").is_some() { return Err(denied()); }
+    Ok(())
+}
+/// A signed policy document through spawnd's strict reader plus the
+/// runtime/native pairing `bundle` requires (installer-side readers).
+fn signed_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
+    if bytes.len() > 1024 * 1024 { return Err(denied()); }
+    let policy = parse_policy(bytes)?;
+    if policy.native.len() != policy.runtimes.len() { return Err(denied()); }
+    for runtime in &policy.runtimes {
+        if !policy.native.iter().any(|native| native.profile == runtime.profile) { return Err(denied()); }
+    }
     Ok(policy)
 }
 /// The egress profile ids the signed isolation policy names (`network:
@@ -270,17 +310,45 @@ fn parse_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
 /// root installer (R3 S5) writes `/etc/duduclaw/egress.json` from exactly
 /// these ids; a policy spawnd would refuse is refused here as well.
 pub fn signed_policy_egress_profiles(bytes: &[u8]) -> io::Result<Vec<ProfileId>> {
-    if bytes.len() > 1024 * 1024 { return Err(denied()); }
-    let policy = parse_policy(bytes)?;
-    if policy.native.len() != policy.runtimes.len() { return Err(denied()); }
+    let policy = signed_policy(bytes)?;
     let mut profiles = Vec::new();
     for runtime in &policy.runtimes {
-        if !policy.native.iter().any(|native| native.profile == runtime.profile) { return Err(denied()); }
         if let NetworkPolicy::Egress(profile) = &runtime.network {
             if !profiles.contains(profile) { profiles.push(*profile); }
         }
     }
     Ok(profiles)
+}
+/// R7b: the signed policy's `dns_probe_name` through the same strict reader;
+/// `None` for a policy older than v4 (spawnd then never reports the DNS route
+/// as verified).
+pub fn signed_policy_dns_probe_name(bytes: &[u8]) -> io::Result<Option<String>> {
+    Ok(signed_policy(bytes)?.dns_probe_name)
+}
+/// R7b: the probe name of the committed generation's verified policy (the
+/// full `bundle` checks). Blocking (updater probe): DNS evidence worker only.
+pub(crate) fn installed_dns_probe_name() -> io::Result<Option<String>> {
+    Ok(bundle()?.policy.dns_probe_name)
+}
+/// R7b: spawnd's view of the installer's `/etc/duduclaw/egress.json` (the
+/// document egress reads): the profiles, each in its strict shape. The other
+/// members are egress's to validate; egress refuses to start on them.
+#[derive(Deserialize)]
+struct EgressConfiguration { profiles: Vec<EgressProfile> }
+const EGRESS_CONFIGURATION_DIRECTORY: &str = "/etc/duduclaw";
+/// The DNS route this host is configured for: the one route of every profile
+/// in the root-owned egress configuration (read with the same root
+/// ownership, no-symlink and single-link checks as the other installed
+/// documents). The installer writes it from the signed policy's profile ids
+/// and the route it selected; spawnd has no other source for the route.
+pub(crate) fn configured_dns_route() -> io::Result<DnsRoute> {
+    let configuration: EgressConfiguration = read(EGRESS_CONFIGURATION_DIRECTORY, "egress.json")?;
+    single_route(&configuration.profiles)
+}
+fn single_route(profiles: &[EgressProfile]) -> io::Result<DnsRoute> {
+    let first = profiles.first().ok_or_else(denied)?;
+    if profiles.iter().any(|profile| profile.validate().is_err() || profile.dns_route != first.dns_route) { return Err(denied()); }
+    Ok(first.dns_route)
 }
 /// R6 review round, finding 3: decided on the raw document, because the typed
 /// record reads both an absent key and `"turn_limit": null` as `None`. A
@@ -461,7 +529,7 @@ impl crate::host::Publication for InstalledPublication {
     fn supervisor_identity(&mut self) -> Result<(u32, u32)> { os(crate::server::named_identity(c"duduclaw-runsup")) }
     fn anchors(&mut self) -> Result<crate::bootstrap_mounts::RootPublicationAnchors> {
         let b = self.checked_bundle()?;
-        os(crate::bootstrap_mounts::RootPublicationAnchors::new(b.directory, Path::new(ROOT).join("etc-state"), Path::new(ROOT).join("projections")))
+        os(crate::bootstrap_mounts::RootPublicationAnchors::new(b.directory, Path::new(ETC_STATE_DIRECTORY).into(), Path::new(PROJECTIONS_DIRECTORY).into()))
     }
     fn prepare_mcp_projection(&mut self, plan: &crate::bootstrap::BootstrapPlan, runtime: &PublishedRuntime) -> Result<()> {
         use std::io::Write;
@@ -481,7 +549,7 @@ impl crate::host::Publication for InstalledPublication {
         os(acceptance.validate(&projection))?;
         let native = b.policy.native.iter().find(|n| n.profile == runtime.profile).ok_or(ErrorCode::RuntimeDenied)?;
         os(acceptance.validate_launch(record, native))?;
-        let anchor = Path::new(ROOT).join("projections");
+        let anchor = Path::new(PROJECTIONS_DIRECTORY).to_path_buf();
         os(crate::registry::root_path(&anchor, true))?;
         let hex: String = plan.employee.0.iter().map(|byte| format!("{byte:02x}")).collect();
         let path = anchor.join(hex);
@@ -595,28 +663,23 @@ impl crate::host::Publication for InstalledPublication {
 /// responsible for performing the observations and atomically renewing it.
 /// R7a: the trampoline facts (executable digest, Landlock/namespace self-test,
 /// ABI pair) are no longer part of it; spawnd measures them itself
-/// (`crate::selftest`). Accounts/SSH and DNS/egress still read this receipt.
+/// (`crate::selftest`). R7b: the DNS facts are no longer part of it either;
+/// spawnd probes the route through egress (`crate::dns_evidence`). A receipt
+/// that still carries a `dns` member is refused as a whole (unknown field).
+/// R7b part 2: the file-owner facts (`unowned_uids`, `owner_inventory_digest`)
+/// are gone too; spawnd scans its own state directories at each UID
+/// allocation (`crate::owner_inventory`), and a receipt still carrying them is
+/// refused. External NSS and SSH still read this receipt.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallReceipt {
     version: u16, generation: Sha256Digest, boot_id: String, checked_boottime_ms: u64, valid_for_ms: u64,
     external_nss_range: Option<UidRange>, iam_reservation_digest: Option<Sha256Digest>,
-    unowned_uids: Vec<u32>, owner_inventory_digest: Sha256Digest, ssh: Vec<SshReceipt>,
-    dns: DnsReceipt,
+    ssh: Vec<SshReceipt>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SshReceipt { account: String, control_exit: i32, public_key_exit: i32, forwarding_exit: i32, transcript_digest: Sha256Digest }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DnsReceipt {
-    query: Text<253>, expected_answer: Sha256Digest, observed_answer: Sha256Digest,
-    route: DnsRoute, ip_address_allow: Vec<String>, second_layer: crate::readiness::EgressSecondLayer,
-    transcript_digest: Sha256Digest,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DnsRoute { ResolvedVarlink, DedicatedBroker }
 fn receipt() -> io::Result<InstallReceipt> {
     let (generation, _) = committed_generation()?;
     let receipt: InstallReceipt = read(RECEIPTS, "installation.json")?;
@@ -626,8 +689,7 @@ fn receipt() -> io::Result<InstallReceipt> {
     let now = crate::host_state::boottime_ms()?;
     if receipt.version != 1 || receipt.generation != generation || receipt.boot_id != boot.trim()
         || receipt.valid_for_ms == 0 || receipt.valid_for_ms > 60_000 || now < receipt.checked_boottime_ms
-        || now - receipt.checked_boottime_ms >= receipt.valid_for_ms || receipt.ssh.len() > 30_000
-        || receipt.unowned_uids.len() > 30_000 { return Err(denied()); }
+        || now - receipt.checked_boottime_ms >= receipt.valid_for_ms || receipt.ssh.len() > 30_000 { return Err(denied()); }
     Ok(receipt)
 }
 pub struct InstalledEvidence;
@@ -635,11 +697,6 @@ impl crate::accounts::InstallationEvidence for InstalledEvidence {
     fn external_nss_range_reserved_and_enumerable(&self, range: UidRange) -> io::Result<()> {
         let r = receipt()?;
         if r.external_nss_range != Some(range) || !r.iam_reservation_digest.is_some_and(nonzero) { return Err(denied()); }
-        Ok(())
-    }
-    fn no_existing_file_owner(&self, uid: u32) -> io::Result<()> {
-        let r = receipt()?;
-        if !nonzero(r.owner_inventory_digest) || !r.unowned_uids.contains(&uid) { return Err(denied()); }
         Ok(())
     }
     fn ssh_public_key_and_forwarding_denied(&self, account: &str) -> io::Result<()> {
@@ -650,21 +707,16 @@ impl crate::accounts::InstallationEvidence for InstalledEvidence {
         Ok(())
     }
 }
-impl crate::host::DnsEvidence for InstalledEvidence {
-    fn verify(&mut self) -> Result<crate::readiness::EgressSecondLayer> {
-        let r = os(receipt())?.dns;
-        if r.query.as_str().is_empty() || !nonzero(r.expected_answer) || r.expected_answer != r.observed_answer
-            || !nonzero(r.transcript_digest) { return Err(ErrorCode::IsolationUnavailable); }
-        crate::readiness::validate_egress_ip_allow(&r.ip_address_allow)?;
-        // The root harness probes the configured Unix route, including broker
-        // restrictions, and binds both query and answer to this short receipt.
-        match r.route { DnsRoute::ResolvedVarlink | DnsRoute::DedicatedBroker => Ok(r.second_layer) }
-    }
-}
 pub fn install(components: &mut crate::host::Components) {
     components.publication = Box::new(InstalledPublication::default());
     components.installation = Arc::new(InstalledEvidence);
-    components.egress = Box::new(crate::host::LinuxEgress::new(Box::new(InstalledEvidence)));
+    // R7b: DNS route evidence from spawnd's own probe through egress, over the
+    // same (single) control connection the run registrations use.
+    let client = crate::host::SharedEgressClient::default();
+    // The second layer from PID 1's own view of the egress unit's IP rules.
+    components.egress = Box::new(crate::host::LinuxEgress::with_client(
+        Box::new(crate::dns_evidence::installed(client.clone())), client)
+        .with_second_layer(Box::new(crate::egress_layer::installed())));
     // R7a: trampoline readiness comes from spawnd's own self-test, not the receipt.
     components.trampoline = Box::new(crate::native_trampoline::NativeTrampoline::new(
         Box::new(crate::selftest::SelfTestInstallation::default())));
@@ -702,7 +754,7 @@ mod tests {
                 vendor_digest: Some(Sha256Digest([3;32])), profile: record.profile,
                 runtime: duduclaw_run::seccomp::RuntimeProfile { allowed_syscalls: vec![0] },
                 runtime_digest: Sha256Digest([4;32]), forwarder: None, tmpfs_bytes: 4096,
-                tmpfs_inodes: 32, proc_subset_pid: true, launcher: None }] };
+                tmpfs_inodes: 32, proc_subset_pid: true, launcher: None }], dns_probe_name: None };
             let mut manifest = ReleaseManifest { schema_version: 1, product: Product::Duduclaw, version,
                 channel: ReleaseChannel::Stable, os: OperatingSystem::Linux, arch: Architecture::X86_64,
                 minimum_version: version, serial: 1, created_at_unix: 1, expires_at_unix: 2,
@@ -831,6 +883,20 @@ mod tests {
         value.as_object_mut().unwrap().insert("ready".into(), true.into());
         assert!(serde_json::from_value::<HostPublication>(value).is_err());
         assert!(serde_json::from_str::<InstallReceipt>(r#"{"ready":true}"#).is_err());
+        // R7b: the receipt has no DNS part any more; one that still carries it is refused.
+        let receipt = serde_json::json!({ "version": 1, "generation": Sha256Digest([1; 32]), "boot_id": "boot",
+            "checked_boottime_ms": 1, "valid_for_ms": 1000, "external_nss_range": null, "iam_reservation_digest": null,
+            "ssh": [] });
+        assert!(serde_json::from_value::<InstallReceipt>(receipt.clone()).is_ok());
+        let mut with_dns = receipt.clone();
+        with_dns["dns"] = serde_json::json!({ "route": "resolved_varlink" });
+        assert!(serde_json::from_value::<InstallReceipt>(with_dns).is_err());
+        // R7b part 2: nor a file-owner part (spawnd scans its own state directories).
+        for (key, value) in [("unowned_uids", serde_json::json!([])), ("owner_inventory_digest", serde_json::json!(Sha256Digest([2; 32])))] {
+            let mut with_owners = receipt.clone();
+            with_owners[key] = value;
+            assert!(serde_json::from_value::<InstallReceipt>(with_owners).is_err(), "{key}");
+        }
     }
     #[test]
     fn mcp_acceptance_binds_exact_runtime_projection_and_child_exec() {
@@ -894,7 +960,7 @@ mod tests {
         assert!(parse_policy(&serde_json::to_vec(&smuggled).unwrap()).is_err());
         let mut relabelled = v1_document(); relabelled["domain"] = POLICY_DOMAIN_V2.into();
         assert!(parse_policy(&serde_json::to_vec(&relabelled).unwrap()).is_err());
-        for version in [0, 3, 65535] {
+        for version in [0, 3, 4, 65535] {
             let mut other = v1_document(); other["version"] = version.into();
             assert!(parse_policy(&serde_json::to_vec(&other).unwrap()).is_err());
         }
@@ -1105,6 +1171,110 @@ mod tests {
             value["runtimes"][0]["fixed_args"].as_array_mut().unwrap().insert(index, smuggled.into());
             assert!(!parses(value), "{index} {smuggled}");
         }
+    }
+
+    /// R7b: v4 = the v3 shape under its own domain plus `dns_probe_name`.
+    fn v4_document() -> serde_json::Value {
+        let mut value = v3_document();
+        value["domain"] = POLICY_DOMAIN_V4.into();
+        value["version"] = 4.into();
+        value["dns_probe_name"] = "api.example.com".into();
+        value
+    }
+    fn parses(value: &serde_json::Value) -> bool { parse_policy(&serde_json::to_vec(value).unwrap()).is_ok() }
+    #[test]
+    fn policy_v4_carries_the_probe_name_and_older_versions_have_none() {
+        let bytes = serde_json::to_vec(&v4_document()).unwrap();
+        let policy = parse_policy(&bytes).unwrap();
+        assert_eq!((policy.version, policy.dns_probe_name.as_deref()), (4, Some("api.example.com")));
+        // Everything v3 carries still reaches the policy.
+        assert_eq!(policy.runtimes[0].turn_limit, Some(crate::policy::WORKING_DEFAULT_TURN_LIMIT));
+        validate_launchers(&policy).unwrap();
+        assert_eq!(signed_policy_dns_probe_name(&bytes).unwrap().as_deref(), Some("api.example.com"));
+        assert_eq!(signed_policy_egress_profiles(&bytes).unwrap(), Vec::<ProfileId>::new());
+        // v1–v3: no probe name (spawnd then never reports the DNS route as verified).
+        let record = runtime_record();
+        let v2 = serde_json::to_value(SignedPolicyV2 { domain: POLICY_DOMAIN_V2.into(), version: 2,
+            runtimes: vec![record.clone()], native: vec![native_record(&record)] }).unwrap();
+        for older in [v1_document(), v2, v3_document()] {
+            let bytes = serde_json::to_vec(&older).unwrap();
+            assert_eq!(parse_policy(&bytes).unwrap().dns_probe_name, None);
+            assert_eq!(signed_policy_dns_probe_name(&bytes).unwrap(), None);
+        }
+        // The deployed v1–v3 readers refuse v4 bytes outright.
+        assert!(serde_json::from_slice::<SignedPolicyV1>(&bytes).is_err());
+        assert!(serde_json::from_slice::<SignedPolicyV3>(&bytes).is_err());
+    }
+    #[test]
+    fn policy_v4_refusals() {
+        // Missing, null or non-string probe name.
+        let mut value = v4_document(); value.as_object_mut().unwrap().remove("dns_probe_name");
+        assert!(!parses(&value), "missing");
+        for bad in [serde_json::Value::Null, 7.into(), serde_json::json!(["api.example.com"])] {
+            let mut value = v4_document(); value["dns_probe_name"] = bad.clone();
+            assert!(!parses(&value), "{bad}");
+        }
+        // Each part of the name rule.
+        let long_label = format!("{}.com", "a".repeat(64));
+        let long_name = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+        for name in ["", "com", "localhost", "API.example.com", "api.example.com.", "-api.example.com", "api-.example.com",
+            "api_x.example.com", "api..example.com", "192.0.2.1", "printer.local", "db.internal", "app.localhost",
+            "\u{e4}pi.example.com", long_label.as_str(), long_name.as_str()] {
+            let mut value = v4_document(); value["dns_probe_name"] = name.into();
+            assert!(!parses(&value), "{name}");
+        }
+        // v4 needs its exact domain; relabelling either way is refused.
+        for (version, domain) in [(4, serde_json::Value::Null), (4, POLICY_DOMAIN_V3.into()), (3, POLICY_DOMAIN_V4.into())] {
+            let mut value = v4_document(); value["version"] = version.into();
+            if domain.is_null() { value.as_object_mut().unwrap().remove("domain"); } else { value["domain"] = domain; }
+            assert!(!parses(&value), "{version}");
+        }
+        // An unknown top-level member is refused as before.
+        let mut value = v4_document(); value["dns_route"] = "resolved_varlink".into();
+        assert!(!parses(&value));
+        // v1–v3 refuse the key, also as an explicit null.
+        let record = runtime_record();
+        let v2 = serde_json::to_value(SignedPolicyV2 { domain: POLICY_DOMAIN_V2.into(), version: 2,
+            runtimes: vec![record.clone()], native: vec![native_record(&record)] }).unwrap();
+        for older in [v1_document(), v2, v3_document()] {
+            assert!(parses(&older));
+            for key in [serde_json::Value::from("api.example.com"), serde_json::Value::Null] {
+                let mut value = older.clone(); value["dns_probe_name"] = key.clone();
+                assert!(!parses(&value), "{} {key}", older["version"]);
+            }
+        }
+        // The v3 turn-limit rules still apply to v4 as a whole.
+        let mut value = v4_document(); value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(!parses(&value));
+    }
+    #[test]
+    fn configured_dns_route_is_the_single_route_of_valid_profiles() {
+        use std::num::{NonZeroU16, NonZeroU32};
+        let limits = duduclaw_isolation::egress::EgressLimits { max_frame_bytes: NonZeroU32::new(65536).unwrap(),
+            max_tunnels: NonZeroU16::new(16).unwrap(), frames_per_second: NonZeroU32::new(100).unwrap(),
+            bytes_per_second: NonZeroU32::new(1024).unwrap(), connect_timeout_ms: NonZeroU32::new(5000).unwrap(),
+            idle_timeout_ms: NonZeroU32::new(30000).unwrap(), max_header_bytes: NonZeroU32::new(8192).unwrap(),
+            max_headers: NonZeroU16::new(32).unwrap() };
+        let profile = |seed: u8, dns_route| EgressProfile { id: ProfileId(Sha256Digest([seed; 32])),
+            allowed_connect_ports: duduclaw_isolation::bounded::List::new(vec![NonZeroU16::new(443).unwrap()]).unwrap(),
+            dns_route, limits: limits.clone() };
+        assert_eq!(single_route(&[profile(1, DnsRoute::DedicatedDnsBroker), profile(2, DnsRoute::DedicatedDnsBroker)]).unwrap(),
+            DnsRoute::DedicatedDnsBroker);
+        assert!(single_route(&[]).is_err());
+        assert!(single_route(&[profile(1, DnsRoute::ResolvedVarlink), profile(2, DnsRoute::DedicatedDnsBroker)]).is_err());
+        let mut invalid = profile(1, DnsRoute::ResolvedVarlink);
+        invalid.allowed_connect_ports = duduclaw_isolation::bounded::List::new(vec![]).unwrap();
+        assert!(single_route(&[invalid]).is_err());
+        // The installer's document shape: extra top-level members are egress's;
+        // a profile's shape is strict, and the route spelling is the product's.
+        let document = serde_json::json!({ "profiles": [profile(1, DnsRoute::DedicatedDnsBroker)], "run_caps": {}, "max_runs": 1 });
+        assert_eq!(document["profiles"][0]["dns_route"], "dedicated_dns_broker");
+        let configuration: EgressConfiguration = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(single_route(&configuration.profiles).unwrap(), DnsRoute::DedicatedDnsBroker);
+        let mut legacy = document.clone(); legacy["profiles"][0]["dns_route"] = "dedicated_broker".into();
+        assert!(serde_json::from_value::<EgressConfiguration>(legacy).is_err());
+        let mut extra = document; extra["profiles"][0]["ready"] = true.into();
+        assert!(serde_json::from_value::<EgressConfiguration>(extra).is_err());
     }
 
     /// R6 on a real installed host: for every employee entitled to a ranged

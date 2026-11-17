@@ -229,6 +229,58 @@ class ManifestSigningTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 SIGN.validate_policy_document(document)
 
+    def test_policy_v4_dns_probe_name(self):
+        """R7b: v4 = v3 + the required `dns_probe_name`, spawnd's rule; v1-v3 refuse the key."""
+        runtime = {"runtime": {"kind": "claude"}, "mcp": True, "fixed_args": list(self.RANGED),
+                   "turn_limit": dict(SIGN.TURN_LIMIT_WORKING_DEFAULT)}
+
+        def policy(version=4, domain=SIGN.POLICY_DOMAIN_V4, name="api.example.com", record=runtime):
+            document = {"version": version, "runtimes": [dict(record)],
+                        "native": [{"profile": [1] * 32, "tmpfs_bytes": 4096}]}
+            if domain is not None:
+                document["domain"] = domain
+            if name is not None:
+                document["dns_probe_name"] = name
+            return document
+
+        def refused(document, message):
+            with self.assertRaisesRegex(ValueError, message):
+                SIGN.validate_policy_document(document)
+
+        SIGN.validate_policy_document(policy())
+        for good in ("example.com", "a.b", "x-1.example.org", "1.example.com", "a" * 63 + ".com"):
+            SIGN.validate_policy_document(policy(name=good))
+        # Missing name, wrong or missing domain, an extra key.
+        refused(policy(name=None), "v4 policy requires")
+        refused(policy(domain=SIGN.POLICY_DOMAIN_V3), "v4 policy requires")
+        refused(policy(domain=None), "v4 policy requires")
+        refused(dict(policy(), dns_route="resolved_varlink"), "v4 policy requires")
+        # Each part of the name rule.
+        long_name = ".".join(["a" * 60] * 5) + ".com"
+        for name, message in ((None, "v4 policy requires"), ("", "1 to 253"), (7, "1 to 253"), (["a.b"], "1 to 253"),
+                              ("äpi.example.com", "1 to 253"), (long_name, "1 to 253"),
+                              ("com", "two labels"), ("localhost", "two labels"), ("API.example.com", "two labels"),
+                              ("api.example.com.", "two labels"), ("-api.example.com", "two labels"),
+                              ("api-.example.com", "two labels"), ("api_x.example.com", "two labels"),
+                              ("api..example.com", "two labels"), ("a" * 64 + ".com", "two labels"),
+                              ("exa mple.com", "two labels"), ("192.0.2.1", "IP address"),
+                              ("printer.local", "local name"), ("db.internal", "local name"),
+                              ("app.localhost", "local name")):
+            with self.subTest(name=name):
+                refused(policy(name=name), message)
+        # v1-v3 refuse the key (also as null); without it they are unaffected.
+        legacy = dict(runtime, fixed_args=list(self.LEGACY))
+        del legacy["turn_limit"]
+        for version, domain, record in ((1, None, legacy), (2, SIGN.POLICY_DOMAIN_V2, legacy),
+                                        (3, SIGN.POLICY_DOMAIN_V3, runtime)):
+            SIGN.validate_policy_document(policy(version, domain, None, record))
+            for name in ("api.example.com", None):
+                document = policy(version, domain, None, record)
+                document["dns_probe_name"] = name
+                refused(document, "dns_probe_name requires policy v4")
+        # The v3 rules still apply to v4.
+        refused(policy(record=dict(runtime, turn_limit={"min": 1, "default": 50, "max": 1001})), "turn_limit")
+
     def test_claude_mcp_step_limit_shape_in_every_version(self):
         """Review round, findings 1-3: the signer refuses what spawnd refuses."""
         codex = {"runtime": {"kind": "codex"}, "mcp": True, "fixed_args": []}

@@ -58,6 +58,10 @@ pub trait AccountHost {
     fn policy(&mut self) -> io::Result<HostUidPolicy>;
     fn verify_namespace(&mut self, registry: &Registry) -> io::Result<()>;
     fn uid_available(&mut self, uid: u32) -> io::Result<bool>;
+    /// Every id in `range` that already owns (as uid or gid) a file the host
+    /// can see in spawnd's state directories. Called once per reservation,
+    /// before any candidate; an error refuses the reservation.
+    fn occupied_ids(&mut self, range: UidRange) -> io::Result<BTreeSet<u32>>;
     fn create_locked(&mut self, account: &EmployeeAccount) -> io::Result<()>;
     fn verify_locked(&mut self, account: &EmployeeAccount) -> io::Result<()>;
     /// Quarantine an interrupted/retired identity, including a group-only residue.
@@ -106,8 +110,11 @@ impl Registry {
         host.verify_namespace(self)?;
         if self.employees.iter().any(|account| account.employee == employee) { return Err(invalid()); }
         let used: BTreeSet<_> = self.employees.iter().map(|account| account.uid).collect();
+        // R7b: one file-owner inventory per allocation. The candidate's gid is
+        // its uid, so an id owning a file as either is skipped.
+        let occupied = host.occupied_ids(self.range)?;
         for uid in self.range.first..=self.range.last {
-            if !used.contains(&uid) && host.uid_available(uid)? {
+            if !used.contains(&uid) && !occupied.contains(&uid) && host.uid_available(uid)? {
                 self.employees.push(EmployeeAccount { employee, uid, gid: uid, state: AccountState::Reserved });
                 return Ok(self.employees.len() - 1);
             }
@@ -289,9 +296,53 @@ mod tests {
         }) }
         fn verify_namespace(&mut self, _: &Registry) -> io::Result<()> { Ok(()) }
         fn uid_available(&mut self, _: u32) -> io::Result<bool> { Ok(true) }
+        fn occupied_ids(&mut self, _: UidRange) -> io::Result<BTreeSet<u32>> { Ok(BTreeSet::new()) }
         fn create_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { Ok(()) }
         fn verify_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { Ok(()) }
         fn recover_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { Ok(()) }
+    }
+    /// R7b: a host whose file-owner inventory is scripted; counts inventories
+    /// and every candidate the getent check saw.
+    struct Inventory { occupied: io::Result<BTreeSet<u32>>, scans: usize, candidates: Vec<u32> }
+    impl AccountHost for Inventory {
+        fn policy(&mut self) -> io::Result<HostUidPolicy> { Host.policy() }
+        fn verify_namespace(&mut self, _: &Registry) -> io::Result<()> { Ok(()) }
+        fn uid_available(&mut self, uid: u32) -> io::Result<bool> { self.candidates.push(uid); Ok(true) }
+        fn occupied_ids(&mut self, range: UidRange) -> io::Result<BTreeSet<u32>> {
+            assert_eq!(range, Registry::default().range);
+            self.scans += 1;
+            match &self.occupied { Ok(ids) => Ok(ids.clone()), Err(_) => Err(io::Error::other("inventory bound exceeded")) }
+        }
+        fn create_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { Ok(()) }
+        fn verify_locked(&mut self, _: &EmployeeAccount) -> io::Result<()> { Ok(()) }
+    }
+    #[test]
+    fn reserve_skips_file_owning_ids_with_one_inventory_per_allocation() {
+        let mut registry = Registry::default();
+        let mut host = Inventory { occupied: Ok([70000, 70001, 70003].into()), scans: 0, candidates: vec![] };
+        let index = registry.reserve(EmployeeId([1; 16]), &mut host).unwrap();
+        assert_eq!((registry.employees[index].uid, registry.employees[index].gid), (70002, 70002));
+        assert_eq!(host.scans, 1);
+        // Occupied ids never reach the per-candidate check.
+        assert_eq!(host.candidates, [70002]);
+        let index = registry.reserve(EmployeeId([2; 16]), &mut host).unwrap();
+        assert_eq!(registry.employees[index].uid, 70004);
+        assert_eq!((host.scans, host.candidates.as_slice()), (2, &[70002, 70004][..]));
+    }
+    #[test]
+    fn reserve_refuses_when_the_inventory_fails_and_records_nothing() {
+        let mut registry = Registry::default();
+        registry.reserve(EmployeeId([1; 16]), &mut Host).unwrap();
+        registry.employees[0].state = AccountState::Ready;
+        let before = registry.employees.clone();
+        let mut host = Inventory { occupied: Err(io::ErrorKind::Other.into()), scans: 0, candidates: vec![] };
+        assert!(registry.reserve(EmployeeId([2; 16]), &mut host).is_err());
+        assert_eq!(host.scans, 1);
+        assert!(host.candidates.is_empty());
+        // No reservation was made, so nothing can be tombstoned by `allocate`,
+        // and the existing account is untouched.
+        assert_eq!(registry.employees, before);
+        assert!(registry.employees.iter().all(|account| account.state != AccountState::Tombstone));
     }
     #[test]
     fn tombstones_and_reserved_ids_are_never_recycled() {

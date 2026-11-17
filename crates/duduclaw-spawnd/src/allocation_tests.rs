@@ -12,6 +12,7 @@ impl AccountHost for Accounts{
     fn policy(&mut self)->io::Result<HostUidPolicy>{Ok(HostUidPolicy{system:UidRange{first:100,last:999},login:UidRange{first:1000,last:60000},subuids:vec![],subgids:vec![],systemd:vec![]})}
     fn verify_namespace(&mut self,_:&Registry)->io::Result<()>{Ok(())}
     fn uid_available(&mut self,_:u32)->io::Result<bool>{Ok(true)}
+    fn occupied_ids(&mut self,_:UidRange)->io::Result<std::collections::BTreeSet<u32>>{Ok(Default::default())}
     fn create_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{self.created+=1;if self.create_fail{Err(io::Error::other("injected useradd failure"))}else{Ok(())}}
     fn verify_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{Ok(())}
     fn recover_locked(&mut self,_:&EmployeeAccount)->io::Result<()>{

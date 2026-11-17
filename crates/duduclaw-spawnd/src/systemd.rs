@@ -259,9 +259,24 @@ pub struct FixedUnitLoad {
 /// ([`fixed_unit_file_valid`]) and PID 1's effective configuration
 /// ([`checked_fixed_unit_effective`]) are checked separately.
 pub fn fixed_unit_load_valid(name: &str, load: &FixedUnitLoad) -> bool {
-    name == duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT && load.id == name && load.load_state == "loaded"
-        && load.fragment_path == format!("{FIXED_UNIT_DIRECTORY}/{name}")
-        && load.drop_in_paths.is_empty() && !load.need_daemon_reload && !load.transient
+    name == duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT && fixed_unit_load_mismatch(name, load).is_none()
+}
+/// The load rule of [`fixed_unit_load_valid`] for any unit `name` (R7b: also
+/// the egress and DNS broker units): `None` when PID 1 loaded exactly
+/// `name` from `FIXED_UNIT_DIRECTORY/name` with no drop-in, no pending
+/// daemon-reload and not transient; otherwise the first check that fails, named.
+pub fn fixed_unit_load_mismatch(name: &str, load: &FixedUnitLoad) -> Option<String> {
+    if load.id != name { return Some(format!("Id {:?}", bounded_text(&load.id))); }
+    if load.load_state != "loaded" { return Some(format!("LoadState {:?}", bounded_text(&load.load_state))); }
+    if load.fragment_path != format!("{FIXED_UNIT_DIRECTORY}/{name}") {
+        return Some(format!("FragmentPath {:?}", bounded_text(&load.fragment_path)));
+    }
+    if !load.drop_in_paths.is_empty() {
+        return Some(format!("DropInPaths {}", bounded_text(&format!("{:?}", load.drop_in_paths))));
+    }
+    if load.need_daemon_reload { return Some("NeedDaemonReload true".into()); }
+    if load.transient { return Some("Transient true".into()); }
+    None
 }
 /// R7a: the one command the fixed unit may run (the installed path of
 /// `InstallTarget::TrampolineSelftest`).
@@ -535,9 +550,186 @@ impl ReadbackRefusals {
     }
 }
 
-/// The DNS second layer must not exempt private resolver IPs (r7 supersedes §4.3).
-pub fn egress_second_layer_valid(address_allow: &[String], dns_route: &str) -> bool {
-    address_allow.is_empty() && matches!(dns_route, "resolved_varlink" | "dedicated_dns_broker")
+/// R7b: the egress unit as shipped. The second-layer readback's expected IP
+/// rules are parsed from exactly this text ([`shipped_egress_ip_rules`]), so
+/// they cannot drift from what the installer writes.
+pub const EGRESS_UNIT_TEXT: &str = include_str!("../../duduclaw-egress/systemd/duduclaw-egress.service");
+/// R7b: the dedicated DNS broker's service (read back on `dedicated_dns_broker` hosts only).
+pub const DNS_BROKER_UNIT: &str = "duduclaw-dns-broker.service";
+/// Address families as PID 1 reports them in `IPAddressDeny`/`IPAddressAllow`
+/// (AF_INET, AF_INET6; fixed Linux values, spelled out for portable tests).
+pub const IP_FAMILY_INET: i32 = 2;
+pub const IP_FAMILY_INET6: i32 = 10;
+/// One `IPAddressDeny`/`IPAddressAllow` entry as PID 1 reports it, D-Bus
+/// `(iayu)`: address family, address bytes (4 or 16), prefix length.
+pub type IpEntry = (i32, Vec<u8>, u32);
+/// A unit's two IP access lists (expected from a unit file or read back from PID 1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IpRules { pub deny: Vec<IpEntry>, pub allow: Vec<IpEntry> }
+/// A list PID 1 reports with more entries than this is refused unread.
+pub const MAX_IP_ENTRIES: usize = 1024;
+/// One `address/prefix` token of an `IPAddressDeny=`/`IPAddressAllow=` line,
+/// strictly: a literal IPv4 or IPv6 address, `/`, a decimal prefix length no
+/// longer than the address (no leading zero), and no address bit set beyond
+/// the prefix. `any`, `localhost`, a bare address or any other spelling is
+/// refused (systemd would widen or normalise it).
+pub fn parse_ip_prefix(token: &str) -> Result<IpEntry, String> {
+    let (address, prefix) = token.split_once('/').ok_or_else(|| format!("{token:?} is not address/prefix"))?;
+    let address: std::net::IpAddr = address.parse().map_err(|_| format!("{token:?}: not a literal address"))?;
+    if prefix.is_empty() || prefix.len() > 3 || !prefix.bytes().all(|byte| byte.is_ascii_digit())
+        || (prefix.len() > 1 && prefix.starts_with('0')) {
+        return Err(format!("{token:?}: prefix length"));
+    }
+    let prefix: u32 = prefix.parse().map_err(|_| format!("{token:?}: prefix length"))?;
+    let (family, bytes) = match address {
+        std::net::IpAddr::V4(address) => (IP_FAMILY_INET, address.octets().to_vec()),
+        std::net::IpAddr::V6(address) => (IP_FAMILY_INET6, address.octets().to_vec()),
+    };
+    if prefix as usize > bytes.len() * 8 { return Err(format!("{token:?}: prefix longer than the address")); }
+    let host_bits_clear = bytes.iter().enumerate().all(|(index, byte)| {
+        let kept = prefix.saturating_sub(index as u32 * 8).min(8);
+        let mask: u8 = if kept == 0 { 0 } else { 0xff << (8 - kept) };
+        byte & !mask == 0
+    });
+    if !host_bits_clear { return Err(format!("{token:?}: address bits set beyond /{prefix}")); }
+    Ok((family, bytes, prefix))
+}
+/// Every `IPAddressDeny=`/`IPAddressAllow=` assignment of a unit file's
+/// `[Service]` section, each value split on whitespace and parsed with
+/// [`parse_ip_prefix`]. Refused: such a line outside `[Service]`, an empty
+/// assignment (it would reset the list), a continued (`\`) line, a duplicate
+/// entry within one list, and a file with no deny entry at all.
+pub fn unit_ip_rules(text: &str) -> Result<IpRules, String> {
+    let mut section = "";
+    let mut rules = IpRules::default();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') { continue; }
+        if line.starts_with('[') { section = line; continue; }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        let list = match key { "IPAddressDeny" => &mut rules.deny, "IPAddressAllow" => &mut rules.allow, _ => continue };
+        let number = index + 1;
+        if section != "[Service]" { return Err(format!("line {number}: {key}= outside [Service]")); }
+        if value.trim_end().ends_with('\\') { return Err(format!("line {number}: continued {key}= line")); }
+        let tokens: Vec<&str> = value.split_whitespace().collect();
+        if tokens.is_empty() { return Err(format!("line {number}: empty {key}= resets the list")); }
+        for token in tokens {
+            let entry = parse_ip_prefix(token).map_err(|reason| format!("line {number}: {key}=: {reason}"))?;
+            if list.contains(&entry) { return Err(format!("line {number}: {key}=: duplicate {token:?}")); }
+            list.push(entry);
+        }
+    }
+    if rules.deny.is_empty() { return Err("no IPAddressDeny= in [Service]".into()); }
+    Ok(rules)
+}
+/// The shipped egress unit's IP rules ([`EGRESS_UNIT_TEXT`], [`unit_ip_rules`]).
+pub fn shipped_egress_ip_rules() -> Result<IpRules, String> { unit_ip_rules(EGRESS_UNIT_TEXT) }
+/// `address/prefix` for an entry of a known family and length, otherwise
+/// `family <n> <bytes>/<prefix>`.
+pub fn render_ip_entry(entry: &IpEntry) -> String {
+    let (family, bytes, prefix) = entry;
+    match *family {
+        IP_FAMILY_INET => if let Ok(octets) = <[u8; 4]>::try_from(bytes.as_slice()) {
+            return format!("{}/{prefix}", std::net::Ipv4Addr::from(octets));
+        },
+        IP_FAMILY_INET6 => if let Ok(octets) = <[u8; 16]>::try_from(bytes.as_slice()) {
+            return format!("{}/{prefix}", std::net::Ipv6Addr::from(octets));
+        },
+        _ => {}
+    }
+    format!("family {family} {bytes:02x?}/{prefix}")
+}
+/// Entries of `left` not matched one-for-one by an entry of `right` (multiset difference).
+fn ip_difference(left: &[IpEntry], right: &[IpEntry]) -> Vec<String> {
+    let mut remaining: Vec<&IpEntry> = right.iter().collect();
+    let mut different = Vec::new();
+    for entry in left {
+        match remaining.iter().position(|candidate| *candidate == entry) {
+            Some(index) => { remaining.swap_remove(index); }
+            None => different.push(render_ip_entry(entry)),
+        }
+    }
+    different
+}
+/// One list PID 1 reported against the expected one: an exact multiset (any
+/// order, each entry as often, nothing merged or widened). A mismatch is
+/// `invalid unit policy: second layer <unit> <key>: missing [..] unexpected [..]`,
+/// both renderings bounded.
+fn ip_list_matches(unit: &str, key: &str, expected: &[IpEntry], actual: &[IpEntry]) -> io::Result<()> {
+    if actual.len() > MAX_IP_ENTRIES {
+        return Err(invalid_because(format_args!("second layer {unit} {key}: {} entries", actual.len())));
+    }
+    let missing = ip_difference(expected, actual);
+    let unexpected = ip_difference(actual, expected);
+    if missing.is_empty() && unexpected.is_empty() { return Ok(()); }
+    Err(invalid_because(format_args!("second layer {unit} {key}: missing [{}] unexpected [{}]",
+        bounded_text(&missing.join(" ")), bounded_text(&unexpected.join(" ")))))
+}
+/// R7b: the egress unit's rules as PID 1 reports them equal the shipped
+/// unit's, each list an exact multiset ([`ip_list_matches`]); every mismatch
+/// is named in one refusal.
+pub fn checked_egress_ip_rules(unit: &str, expected: &IpRules, actual: &IpRules) -> io::Result<()> {
+    let mut refusals = ReadbackRefusals::default();
+    refusals.check(ip_list_matches(unit, "IPAddressDeny", &expected.deny, &actual.deny));
+    refusals.check(ip_list_matches(unit, "IPAddressAllow", &expected.allow, &actual.allow));
+    refusals.finish()
+}
+/// A single host (/32, /128) that is unicast and not loopback (nor
+/// unspecified, multicast, the IPv4 broadcast address, or an IPv4-mapped
+/// loopback/unspecified address).
+fn single_unicast_host(entry: &IpEntry) -> bool {
+    match (entry.0, entry.2) {
+        (IP_FAMILY_INET, 32) => <[u8; 4]>::try_from(entry.1.as_slice()).is_ok_and(|octets| {
+            let address = std::net::Ipv4Addr::from(octets);
+            !address.is_unspecified() && !address.is_loopback() && !address.is_multicast() && !address.is_broadcast()
+        }),
+        (IP_FAMILY_INET6, 128) => <[u8; 16]>::try_from(entry.1.as_slice()).is_ok_and(|octets| {
+            let address = std::net::Ipv6Addr::from(octets);
+            !address.is_unspecified() && !address.is_loopback() && !address.is_multicast()
+                && address.to_ipv4_mapped().is_none_or(|mapped| !mapped.is_unspecified() && !mapped.is_loopback())
+        }),
+        _ => false,
+    }
+}
+/// R7b: the DNS broker's rules as PID 1 reports them: `IPAddressDeny` exactly
+/// `any` (PID 1 reports `::/0` and `0.0.0.0/0`), `IPAddressAllow` non-empty
+/// with every entry a single unicast, non-loopback host (the upstream).
+pub fn checked_broker_ip_rules(unit: &str, actual: &IpRules) -> io::Result<()> {
+    let any = [(IP_FAMILY_INET6, vec![0; 16], 0), (IP_FAMILY_INET, vec![0; 4], 0)];
+    let mut refusals = ReadbackRefusals::default();
+    refusals.check(ip_list_matches(unit, "IPAddressDeny", &any, &actual.deny));
+    refusals.check(if actual.allow.is_empty() {
+        Err(invalid_because(format_args!("second layer {unit} IPAddressAllow: empty (no upstream allowed)")))
+    } else if actual.allow.len() > MAX_IP_ENTRIES {
+        Err(invalid_because(format_args!("second layer {unit} IPAddressAllow: {} entries", actual.allow.len())))
+    } else if let Some(entry) = actual.allow.iter().find(|entry| !single_unicast_host(entry)) {
+        Err(invalid_because(format_args!("second layer {unit} IPAddressAllow: {} is not a single unicast host",
+            bounded_text(&render_ip_entry(entry)))))
+    } else { Ok(()) });
+    refusals.finish()
+}
+/// R7b: the egress unit PID 1 runs is the installed one, loaded from exactly
+/// its own file with no drop-in (a drop-in could add `IPAddressAllow=any`), no
+/// pending reload, not transient ([`fixed_unit_load_mismatch`]), and `active`.
+pub fn egress_unit_running_valid(name: &str, load: &FixedUnitLoad, active_state: &str) -> io::Result<()> {
+    if let Some(reason) = fixed_unit_load_mismatch(name, load) {
+        return Err(invalid_because(format_args!("second layer {name}: {reason}")));
+    }
+    if active_state != "active" {
+        return Err(invalid_because(format_args!("second layer {name}: ActiveState {:?}", bounded_text(active_state))));
+    }
+    Ok(())
+}
+/// R7b: the DNS broker unit is loaded from exactly its own installed file
+/// (same rule as the egress unit, [`fixed_unit_load_mismatch`]). It is
+/// socket-activated, so it need not be running: PID 1 reports the rules of
+/// the loaded configuration either way.
+pub fn broker_unit_load_valid(name: &str, load: &FixedUnitLoad) -> io::Result<()> {
+    match fixed_unit_load_mismatch(name, load) {
+        Some(reason) => Err(invalid_because(format_args!("second layer {name}: {reason}"))),
+        None => Ok(()),
+    }
 }
 
 /// Strict cgroup v2 parser: absence/duplicates/unknown populated values deny.
@@ -747,6 +939,60 @@ pub mod linux {
             let pid: u32 = service.get_property("MainPID").map_err(bus_error)?;
             if pid == 0 || invocation.len() != 16 || invocation.iter().all(|byte| *byte == 0) { return Ok(None); }
             Ok(Some((pid, invocation.iter().map(|byte| format!("{byte:02x}")).collect())))
+        }
+        /// R7b: `egress_second_layer` as PID 1 holds it. The running
+        /// [`duduclaw_isolation::ids::EGRESS_UNIT`] must be the installed unit
+        /// ([`egress_unit_running_valid`]: own file, no drop-in, `active`) and
+        /// its `IPAddressDeny`/`IPAddressAllow` must equal the shipped unit's
+        /// ([`shipped_egress_ip_rules`], [`checked_egress_ip_rules`]). With
+        /// `broker` (route `dedicated_dns_broker`) [`DNS_BROKER_UNIT`] must be
+        /// loaded from its own file ([`broker_unit_load_valid`]) with deny-all
+        /// plus single-host upstream allows ([`checked_broker_ip_rules`]).
+        /// Read-only properties; this is PID 1's configuration for the units,
+        /// not proof that the kernel filter is attached (reading the attached
+        /// BPF programs needs a privilege spawnd does not hold). `Err` names
+        /// the first reason (not loaded, not active, a property unreadable, a
+        /// mismatch); a bus failure keeps its `Other` kind.
+        pub fn egress_second_layer(&self, broker: bool) -> io::Result<()> {
+            let expected = shipped_egress_ip_rules().map_err(|reason|
+                invalid_because(format_args!("second layer shipped egress unit: {}", bounded_text(&reason))))?;
+            let egress = duduclaw_isolation::ids::EGRESS_UNIT;
+            let (load, state, rules) = self.unit_ip_readback(egress)?;
+            egress_unit_running_valid(egress, &load, &state)?;
+            checked_egress_ip_rules(egress, &expected, &rules)?;
+            if broker {
+                let (load, _, rules) = self.unit_ip_readback(DNS_BROKER_UNIT)?;
+                broker_unit_load_valid(DNS_BROKER_UNIT, &load)?;
+                checked_broker_ip_rules(DNS_BROKER_UNIT, &rules)?;
+            }
+            Ok(())
+        }
+        /// The readback half of [`Self::egress_second_layer`] for one loaded
+        /// unit (`GetUnit`: a unit PID 1 has not loaded is refused, never
+        /// loaded here): its load record, `ActiveState`, and its two IP lists
+        /// from the `Service` interface, each decoded as `a(iayu)`. Root tests
+        /// pass their own transient unit's name; production only the fixed names.
+        fn unit_ip_readback(&self, name: &str) -> io::Result<(FixedUnitLoad, String, IpRules)> {
+            let unreadable = |key: &str| io::Error::other(format!("invalid unit policy: second layer {name} {key} unreadable"));
+            let path: OwnedObjectPath = match self.manager()?.call("GetUnit", &(name,)) {
+                Ok(path) => path,
+                Err(error) if missing_unit(&error) => return Err(invalid_because(format_args!("second layer {name}: not loaded"))),
+                Err(_) => return Err(unreadable("GetUnit")),
+            };
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+            let load = FixedUnitLoad {
+                id: unit.get_property("Id").map_err(|_| unreadable("Id"))?,
+                load_state: unit.get_property("LoadState").map_err(|_| unreadable("LoadState"))?,
+                fragment_path: unit.get_property("FragmentPath").map_err(|_| unreadable("FragmentPath"))?,
+                drop_in_paths: unit.get_property("DropInPaths").map_err(|_| unreadable("DropInPaths"))?,
+                need_daemon_reload: unit.get_property("NeedDaemonReload").map_err(|_| unreadable("NeedDaemonReload"))?,
+                transient: unit.get_property("Transient").map_err(|_| unreadable("Transient"))?,
+            };
+            let state: String = unit.get_property("ActiveState").map_err(|_| unreadable("ActiveState"))?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            let deny: Vec<IpEntry> = service.get_property("IPAddressDeny").map_err(|_| unreadable("IPAddressDeny"))?;
+            let allow: Vec<IpEntry> = service.get_property("IPAddressAllow").map_err(|_| unreadable("IPAddressAllow"))?;
+            Ok((load, state, IpRules { deny, allow }))
         }
         /// Recover a receipt after a failed launch or daemon restart. Missing
         /// cgroups are only cleanup proof after an inactive readback.
@@ -2150,6 +2396,89 @@ pub mod linux {
             drop(systemd);
             drop(restore);
         }
+
+        /// Stops, resets and unreferences a test transient unit however the test ends.
+        struct TransientUnitCleanup<'a>(&'a Systemd, String);
+        impl Drop for TransientUnitCleanup<'_> {
+            fn drop(&mut self) {
+                let name = self.1.as_str();
+                let _ = self.0.kill_name(name);
+                let Ok(manager) = self.0.manager() else { return };
+                if let Ok(path) = manager.call::<_, _, OwnedObjectPath>("GetUnit", &(name,)) {
+                    if let Ok(unit) = Proxy::new(&self.0.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit") {
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while unit.get_property::<String>("ActiveState").is_ok_and(|state| state != "inactive" && state != "failed")
+                            && Instant::now() < until { std::thread::sleep(Duration::from_millis(25)); }
+                    }
+                }
+                let _: zbus::Result<()> = manager.call("ResetFailedUnit", &(name,));
+                if let Ok(mut references) = self.0.references.lock() {
+                    if let Err(error) = references.release(name, || manager.call::<_, _, ()>("UnrefUnit", &(name,)).map_err(bus_error)) {
+                        eprintln!("test unit cleanup failed for {name}: {error}");
+                    }
+                }
+            }
+        }
+        /// A transient `/usr/bin/sleep 30` service carrying exactly `rules`,
+        /// started through the manager and read `active`.
+        fn ip_rules_test_unit<'a>(systemd: &'a Systemd, rules: &IpRules) -> TransientUnitCleanup<'a> {
+            let hex: String = test_id().0.iter().map(|byte| format!("{byte:02x}")).collect();
+            let name = format!("duduclaw-r7b-iprules-{hex}.service");
+            let cleanup = TransientUnitCleanup(systemd, name.clone());
+            let properties: Vec<(&str, Value<'_>)> = vec![
+                ("Type", Value::from("exec")), ("RuntimeMaxUSec", Value::from(60_000_000u64)),
+                ("StandardInput", Value::from("null")), ("StandardOutput", Value::from("null")),
+                ("StandardError", Value::from("null")),
+                ("IPAddressDeny", Value::from(rules.deny.clone())), ("IPAddressAllow", Value::from(rules.allow.clone())),
+                ("ExecStart", Value::from(vec![("/usr/bin/sleep", vec!["/usr/bin/sleep", "30"], false)])),
+            ];
+            systemd.start_referenced(&name, properties).unwrap_or_else(|error| panic!("StartTransientUnit {name}: {error}"));
+            let path: OwnedObjectPath = systemd.manager().unwrap().call("GetUnit", &(name.as_str(),)).unwrap();
+            let unit = Proxy::new(&systemd.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let state: String = unit.get_property("ActiveState").unwrap();
+                if state == "active" { break; }
+                assert!(Instant::now() < until, "{name} not active: {state}");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            drop(unit);
+            cleanup
+        }
+
+        /// R7b on a real host: a unit carrying exactly the shipped egress
+        /// unit's deny/allow sets reads back (through the production readback,
+        /// `unit_ip_readback`, and comparison, `checked_egress_ip_rules`) as a
+        /// match although PID 1 reports both lists in its own order; one extra
+        /// allow entry is a named mismatch.
+        #[test]
+        #[ignore = "iso_root_: root disposable systemd Linux VM (DUDUCLAW_ISO_DISPOSABLE=1) with cgroup v2 IP filtering; starts two transient sleep units; --test-threads=1"]
+        fn iso_root_egress_second_layer_readback_matches_real_systemd() {
+            assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"), "disposable host only");
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            let expected = shipped_egress_ip_rules().unwrap();
+            assert_eq!((expected.deny.len(), expected.allow.len()), (22, 9));
+            let systemd = Systemd::connect().unwrap();
+            let unit = ip_rules_test_unit(&systemd, &expected);
+            let (load, state, rules) = systemd.unit_ip_readback(&unit.1).unwrap();
+            assert_eq!(state, "active");
+            assert!(load.transient, "{load:?}");
+            // A transient unit of any name is never accepted as the installed one.
+            assert!(egress_unit_running_valid(&unit.1, &load, &state).is_err());
+            checked_egress_ip_rules(&unit.1, &expected, &rules)
+                .unwrap_or_else(|error| panic!("PID 1 reported {rules:?}: {error}"));
+            drop(unit);
+
+            let mut widened = expected.clone();
+            widened.allow.push(parse_ip_prefix("198.51.100.7/32").unwrap());
+            let unit = ip_rules_test_unit(&systemd, &widened);
+            let (_, _, rules) = systemd.unit_ip_readback(&unit.1).unwrap();
+            assert_eq!(rules.allow.len(), 10, "{rules:?}");
+            let error = checked_egress_ip_rules(&unit.1, &expected, &rules).unwrap_err();
+            assert!(error.to_string().contains("IPAddressAllow: missing [] unexpected [198.51.100.7/32]"), "{error}");
+            drop(unit);
+            assert!(systemd.references.lock().unwrap().units.is_empty());
+        }
     }
 }
 
@@ -2789,11 +3118,161 @@ mod tests {
             assert!(pty_budget(maximum, reserved).is_err());
         }
     }
+    fn prefixes(tokens: &[&str]) -> Vec<IpEntry> { tokens.iter().map(|token| parse_ip_prefix(token).unwrap()).collect() }
+    /// R7b: the expected sets are the shipped unit's own lines, parsed strictly.
     #[test]
-    fn dns_second_layer_has_no_private_resolver_exemption() {
-        assert!(egress_second_layer_valid(&[], "resolved_varlink"));
-        assert!(egress_second_layer_valid(&[], "dedicated_dns_broker"));
-        assert!(!egress_second_layer_valid(&["10.0.0.53/32".into()], "dedicated_dns_broker"));
-        assert!(!egress_second_layer_valid(&[], "gateway_selected"));
+    fn egress_second_layer_shipped_unit_parses_to_22_deny_and_9_allow() {
+        let rules = shipped_egress_ip_rules().unwrap();
+        assert_eq!(rules.deny.len(), 22);
+        assert_eq!(rules.allow.len(), 9);
+        assert_eq!(rules.allow, prefixes(&["192.0.0.9/32", "192.0.0.10/32", "2001:1::1/128", "2001:1::2/128",
+            "2001:1::3/128", "2001:3::/32", "2001:4:112::/48", "2001:20::/28", "2001:30::/28"]));
+        for token in ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4",
+            "::/3", "4000::/2", "8000::/1", "2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20"] {
+            assert!(rules.deny.contains(&parse_ip_prefix(token).unwrap()), "{token}");
+        }
+        assert_eq!(rules.deny.iter().filter(|entry| entry.0 == IP_FAMILY_INET).count(), 15);
+        assert_eq!(rules.deny.iter().filter(|entry| entry.0 == IP_FAMILY_INET6).count(), 7);
+        assert_eq!(parse_ip_prefix("2001:4:112::/48").unwrap(),
+            (IP_FAMILY_INET6, vec![0x20, 0x01, 0, 4, 0x01, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 48));
+        assert_eq!(parse_ip_prefix("100.64.0.0/10").unwrap(), (IP_FAMILY_INET, vec![100, 64, 0, 0], 10));
+        assert_eq!(render_ip_entry(&parse_ip_prefix("2001:db8::/32").unwrap()), "2001:db8::/32");
+        assert_eq!(render_ip_entry(&(7, vec![1, 2], 3)), "family 7 [01, 02]/3");
+    }
+    #[test]
+    fn egress_second_layer_unit_parser_is_strict() {
+        for token in ["any", "localhost", "10.0.0.1", "10.0.0.1/", "10.0.0.1/33", "::/129", "10.0.0.0/08",
+            "10.0.0.1/24", "8000::/0", "2001:db8::1/32", "10.0.0.0/8/8", "10.0.0.0/+8", "010.0.0.0/8", "10.0.0.0 /8"] {
+            assert!(parse_ip_prefix(token).is_err(), "{token}");
+        }
+        let unit = |lines: &str| unit_ip_rules(&format!("[Unit]\nDescription=x\n\n[Service]\nExecStart=/bin/true\n{lines}"));
+        assert_eq!(unit("IPAddressDeny=10.0.0.0/8\nIPAddressAllow=192.0.0.9/32 2001:30::/28\n").unwrap(),
+            IpRules { deny: prefixes(&["10.0.0.0/8"]), allow: prefixes(&["192.0.0.9/32", "2001:30::/28"]) });
+        // Assignments accumulate across lines; comments and spacing are ignored.
+        assert_eq!(unit("IPAddressDeny = 10.0.0.0/8\n# IPAddressAllow=any\nIPAddressDeny=::/3\n").unwrap().deny,
+            prefixes(&["10.0.0.0/8", "::/3"]));
+        for (lines, reason) in [
+            ("IPAddressDeny=any\n", "any"),
+            ("IPAddressDeny=10.0.0.0/8\nIPAddressAllow=any\n", "allow any"),
+            ("IPAddressDeny=10.0.0.1\n", "bare address"),
+            ("IPAddressDeny=10.0.0.1/8\n", "host bits"),
+            ("IPAddressDeny=10.0.0.0/8 10.0.0.0/8\n", "duplicate on one line"),
+            ("IPAddressDeny=10.0.0.0/8\nIPAddressDeny=10.0.0.0/8\n", "duplicate across lines"),
+            ("IPAddressDeny=10.0.0.0/8\nIPAddressDeny=\n", "empty assignment resets the list"),
+            ("IPAddressDeny=10.0.0.0/8\nIPAddressAllow=  \n", "blank assignment"),
+            ("IPAddressDeny=10.0.0.0/8 \\\n", "continuation"),
+            ("IPAddressAllow=192.0.0.9/32\n", "no deny at all"),
+        ] {
+            assert!(unit(lines).is_err(), "{reason}");
+        }
+        assert!(unit_ip_rules("[Unit]\nIPAddressDeny=10.0.0.0/8\n[Service]\nIPAddressDeny=::/3\n").is_err(), "outside [Service]");
+        // The same prefix in both lists is two different lists.
+        assert!(unit("IPAddressDeny=10.0.0.0/8\nIPAddressAllow=10.0.0.0/8\n").is_ok());
+    }
+    fn egress_load() -> FixedUnitLoad {
+        FixedUnitLoad { id: "duduclaw-egress.service".into(), load_state: "loaded".into(),
+            fragment_path: "/etc/systemd/system/duduclaw-egress.service".into(),
+            drop_in_paths: vec![], need_daemon_reload: false, transient: false }
+    }
+    /// R7b: PID 1's lists come back in hash order; they match as exact
+    /// multisets, and every deviation is a named refusal.
+    #[test]
+    fn egress_second_layer_readback_is_an_exact_multiset_with_named_reasons() {
+        let unit = duduclaw_isolation::ids::EGRESS_UNIT;
+        let expected = shipped_egress_ip_rules().unwrap();
+        // Shuffled as measured on systemd 255 (and fully reversed).
+        let mut shuffled = expected.clone();
+        shuffled.deny.rotate_left(13);
+        shuffled.deny.swap(0, 5);
+        shuffled.allow.reverse();
+        checked_egress_ip_rules(unit, &expected, &shuffled).unwrap();
+        let refusal = |actual: &IpRules| checked_egress_ip_rules(unit, &expected, actual).unwrap_err().to_string();
+        let mut missing = expected.clone();
+        missing.allow.retain(|entry| render_ip_entry(entry) != "2001:30::/28");
+        assert!(refusal(&missing).contains("second layer duduclaw-egress.service IPAddressAllow: missing [2001:30::/28] unexpected []"),
+            "{}", refusal(&missing));
+        let mut extra = expected.clone();
+        extra.allow.push(parse_ip_prefix("10.0.0.53/32").unwrap());
+        assert!(refusal(&extra).contains("IPAddressAllow: missing [] unexpected [10.0.0.53/32]"), "{}", refusal(&extra));
+        let mut any = expected.clone();
+        any.allow.extend(prefixes(&["::/0", "0.0.0.0/0"]));
+        assert!(refusal(&any).contains("unexpected [::/0 0.0.0.0/0]"), "{}", refusal(&any));
+        let mut widened = expected.clone();
+        let index = widened.deny.iter().position(|entry| render_ip_entry(entry) == "10.0.0.0/8").unwrap();
+        widened.deny[index].2 = 9;
+        assert!(refusal(&widened).contains("IPAddressDeny: missing [10.0.0.0/8] unexpected [10.0.0.0/9]"), "{}", refusal(&widened));
+        let mut family = expected.clone();
+        family.deny[index].0 = IP_FAMILY_INET6;
+        assert!(refusal(&family).contains("IPAddressDeny: missing [10.0.0.0/8] unexpected [family 10 [0a, 00, 00, 00]/8]"),
+            "{}", refusal(&family));
+        let mut duplicate = expected.clone();
+        duplicate.deny.push(duplicate.deny[0].clone());
+        assert!(refusal(&duplicate).contains("IPAddressDeny: missing [] unexpected [0.0.0.0/8]"), "{}", refusal(&duplicate));
+        let mut unset = expected.clone();
+        unset.deny.clear();
+        assert!(refusal(&unset).starts_with("invalid unit policy: second layer duduclaw-egress.service IPAddressDeny: missing ["));
+        // Both lists wrong: both named in one refusal.
+        let mut both = missing.clone();
+        both.deny = widened.deny.clone();
+        let message = refusal(&both);
+        assert!(message.contains("IPAddressDeny: ") && message.contains("; second layer duduclaw-egress.service IPAddressAllow: "), "{message}");
+        // An oversize reply is refused without comparing it.
+        let mut huge = expected.clone();
+        huge.allow = vec![expected.allow[0].clone(); MAX_IP_ENTRIES + 1];
+        assert!(refusal(&huge).contains(&format!("IPAddressAllow: {} entries", MAX_IP_ENTRIES + 1)));
+    }
+    #[test]
+    fn egress_second_layer_requires_the_installed_active_unit_without_drop_ins() {
+        let unit = duduclaw_isolation::ids::EGRESS_UNIT;
+        egress_unit_running_valid(unit, &egress_load(), "active").unwrap();
+        let reason = |load: &FixedUnitLoad, state: &str| egress_unit_running_valid(unit, load, state).unwrap_err().to_string();
+        let mut drop_in = egress_load();
+        drop_in.drop_in_paths = vec!["/etc/systemd/system/duduclaw-egress.service.d/10-allow.conf".into()];
+        assert!(reason(&drop_in, "active").contains("second layer duduclaw-egress.service: DropInPaths [\"/etc/systemd/system/duduclaw-egress.service.d/10-allow.conf\"]"),
+            "{}", reason(&drop_in, "active"));
+        for state in ["inactive", "activating", "failed", "deactivating", ""] {
+            assert!(reason(&egress_load(), state).contains(&format!("ActiveState {state:?}")), "{state}");
+        }
+        let cases: [(fn(&mut FixedUnitLoad), &str); 5] = [
+            (|load| load.fragment_path = "/run/systemd/transient/duduclaw-egress.service".into(), "FragmentPath"),
+            (|load| load.load_state = "not-found".into(), "LoadState"),
+            (|load| load.need_daemon_reload = true, "NeedDaemonReload"),
+            (|load| load.transient = true, "Transient"),
+            (|load| load.id = "duduclaw-egress-other.service".into(), "Id"),
+        ];
+        for (change, named) in cases {
+            let mut load = egress_load();
+            change(&mut load);
+            assert!(reason(&load, "active").contains(named), "{named}: {}", reason(&load, "active"));
+        }
+        // The self-test unit keeps its own allow-listed name rule.
+        assert!(!fixed_unit_load_valid(unit, &egress_load()));
+        assert_eq!(fixed_unit_load_mismatch(unit, &egress_load()), None);
+    }
+    #[test]
+    fn egress_second_layer_broker_denies_all_but_single_upstream_hosts() {
+        let unit = DNS_BROKER_UNIT;
+        let rules = |deny: &[&str], allow: &[&str]| IpRules { deny: prefixes(deny), allow: prefixes(allow) };
+        // `IPAddressDeny=any` as PID 1 reports it, either order.
+        checked_broker_ip_rules(unit, &rules(&["::/0", "0.0.0.0/0"], &["9.9.9.9/32"])).unwrap();
+        checked_broker_ip_rules(unit, &rules(&["0.0.0.0/0", "::/0"], &["2620:fe::fe/128", "149.112.112.112/32"])).unwrap();
+        let refused = |rules: IpRules| checked_broker_ip_rules(unit, &rules).unwrap_err().to_string();
+        assert!(refused(rules(&["::/0", "0.0.0.0/0"], &[])).contains("IPAddressAllow: empty"));
+        assert!(refused(rules(&[], &["9.9.9.9/32"])).contains("IPAddressDeny: missing [::/0 0.0.0.0/0]"));
+        assert!(refused(rules(&["0.0.0.0/0"], &["9.9.9.9/32"])).contains("IPAddressDeny: missing [::/0]"));
+        assert!(refused(rules(&["::/0", "0.0.0.0/0", "10.0.0.0/8"], &["9.9.9.9/32"])).contains("unexpected [10.0.0.0/8]"));
+        for allow in ["9.9.9.0/24", "127.0.0.53/32", "0.0.0.0/32", "224.0.0.251/32", "255.255.255.255/32",
+            "::1/128", "::/128", "ff02::fb/128", "::ffff:127.0.0.1/128", "2620:fe::/48", "0.0.0.0/0"] {
+            let message = refused(rules(&["::/0", "0.0.0.0/0"], &["9.9.9.9/32", allow]));
+            assert!(message.contains(&format!("IPAddressAllow: {allow} is not a single unicast host")), "{allow}: {message}");
+        }
+        assert!(refused(IpRules { deny: prefixes(&["::/0", "0.0.0.0/0"]), allow: vec![(IP_FAMILY_INET, vec![9; 16], 32)] })
+            .contains("is not a single unicast host"));
+        let mut load = egress_load();
+        load.id = unit.into();
+        load.fragment_path = format!("{FIXED_UNIT_DIRECTORY}/{unit}");
+        broker_unit_load_valid(unit, &load).unwrap();
+        load.drop_in_paths = vec!["/run/systemd/system/duduclaw-dns-broker.service.d/x.conf".into()];
+        assert!(broker_unit_load_valid(unit, &load).unwrap_err().to_string().contains("DropInPaths"));
     }
 }

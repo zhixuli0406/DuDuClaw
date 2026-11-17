@@ -59,6 +59,19 @@ pub mod installed;
 #[cfg(any(target_os = "linux", test))]
 pub mod selftest;
 
+/// R7b: `dns_route_verified` from a live probe through egress.
+#[cfg(any(target_os = "linux", test))]
+pub mod dns_evidence;
+
+/// R7b: `egress_second_layer` from PID 1's view of the egress unit's IP rules.
+#[cfg(any(target_os = "linux", test))]
+pub mod egress_layer;
+
+/// R7b: employee-range owners of files in spawnd's own state directories,
+/// scanned once per UID allocation.
+#[cfg(target_os = "linux")]
+pub mod owner_inventory;
+
 #[cfg(target_os = "linux")]
 pub mod gateway_mcp;
 

@@ -392,9 +392,12 @@ account. It locks/expires the password/account, installs nologin and `/nonexiste
 removes supplementary groups, disables linger and user managers, fixes effective
 cron/at ACLs, reloads SSH, and reads the results back. Unknown aliases or jobs are
 not silently accepted. User creation disables subordinate-ID allocation and
-lastlog initialization. External IAM range reservation, complete existing-owner
-scan and live SSH public-key/forwarding negatives remain explicit evidence hooks;
-`MissingInstallationEvidence` always refuses them. `userdbctl` supports bounded
+lastlog initialization. External IAM range reservation and live SSH
+public-key/forwarding negatives remain explicit evidence hooks;
+`MissingInstallationEvidence` always refuses them. The existing-owner check is
+no longer installer evidence (R7b): each allocation takes one file-owner
+inventory of spawnd's own state directories (`owner_inventory`, see "R7b: egress
+second layer and file-owner inventory") before trying any candidate. `userdbctl` supports bounded
 JSON arrays or object streams and rejects unknown record shapes.
 
 The service now allows `/etc` and the existing linger directory to be written for
@@ -1217,13 +1220,107 @@ both routes must bind both. The broker has its own `/run` projection and syscall
 allowlist. The installer supplies its exact upstream IP allow rule; the shipped
 broker template denies all IPs until that drop-in is present.
 
+### R7b: DNS route evidence through egress
+
+spawnd's `dns_route_verified` was read from the DNS part of the root-harness
+receipt `/run/duduclaw-isolation-evidence/installation.json`, which no program
+produces. It is now a live observation:
+
+- **Signed policy v4.** Domain `duduclaw-isolation-policy-v4`: exactly the v3
+  shape plus the required top-level `dns_probe_name`. The vendor chooses, at
+  signing time, a hostname AI employees need anyway (for example the model API
+  host). Rule (`duduclaw_isolation::egress::validate_dns_probe_name`, mirrored in
+  `scripts/sign-isolation-manifest.py`): ASCII lower case, 1–253 bytes, at least
+  two labels of 1–63 bytes of `[a-z0-9-]` not starting or ending with `-`, no
+  trailing dot, a last label that is not all digits, and neither `localhost` nor
+  a name under `.local`, `.internal` or `.localhost`. v1–v3 refuse the key.
+  spawnd refuses to report the DNS route as verified with a policy older than v4.
+- **Control request.** `EgressControl::ProbeDns { name }` →
+  `EgressControlResponse::DnsProbed { route, resolved, public_addresses }` (or
+  `Refused { code }`); no descriptors either way. Egress validates the name,
+  performs one lookup through the single route all profiles use, with the
+  resolver runs use and a 3 s deadline, and counts the answers that pass the
+  run-time filter (public, not one of the host's own addresses). A failed
+  lookup is `resolved: false`. At most one real lookup per 10 s: inside the
+  window the previous result is returned for the same name and other names are
+  refused. The serial control loop is delayed by at most the 3 s deadline.
+  Neither `EGRESS_PROTOCOL_VERSION` nor `ipc::PROTOCOL_VERSION` changed: the
+  former is the data-plane frame version that the update readback compares with
+  the signed manifest's `protocols.egress` (pinned to 1 across the signing
+  pipeline and spawnd's generation check), not a spawnd↔egress handshake; the
+  readback already binds both running binaries to the same signed generation
+  by `build_sha256`, and an unknown request variant is refused by the strict decoder.
+- **Evidence.** A spawnd background worker (started by the first readiness
+  refresh after start-up recovery, never a precondition of opening) sends the
+  probe over the existing control connection and passes only on
+  `DnsProbed { route: <configured>, resolved: true, public_addresses >= 1 }`.
+  The configured route is the one route of every profile in the root-owned
+  `/etc/duduclaw/egress.json` that the installer writes. A pass is fresh for
+  60 s (re-probed after 45 s); a failure is retried after 5 s; no result,
+  stale, policy < v4, no connection or a refusal reads as not verified. The
+  refresh loop only loads an atomic snapshot. The receipt's `dns` member is
+  gone (a receipt still carrying it is refused as a whole).
+
 **R7-M2:** never add the upstream resolver to the egress service's IPAddressAllow.
 Only the separate broker receives that exception. Egress's IP rules form a second
 layer for direct socket destinations, including metadata. They cannot inspect a
-public relay or tunnel content. B1 still must read back actual unit properties
-and cgroup BPF attachment; missing second-layer enforcement is reported separately
-from the primary code policy. Neither those readbacks nor namespace construction
-are implemented by this package.
+public relay or tunnel content. Missing second-layer enforcement is reported
+separately from the primary code policy (`egress_second_layer` is display-only:
+`Readiness::check` does not include it).
+
+### R7b: egress second layer and file-owner inventory
+
+Two more facts of the never-produced installation receipt are now measured by
+spawnd itself.
+
+- **`egress_second_layer` from PID 1.** A spawnd background worker
+  (`egress_layer`, same snapshot and cadence as the DNS evidence: fresh for
+  60 s, re-read after 45 s, retried after 5 s on failure; the refresh loop only
+  loads the snapshot) reads, over its own D-Bus connection,
+  `duduclaw-egress.service` from PID 1 (`Systemd::egress_second_layer`):
+  `GetUnit` (not loaded ⇒ unavailable), `FragmentPath` exactly
+  `/etc/systemd/system/duduclaw-egress.service`, no `DropInPaths` (a drop-in
+  could add `IPAddressAllow=any`), no pending reload, not transient,
+  `ActiveState=active`, and `IPAddressDeny`/`IPAddressAllow` (`a(iayu)`:
+  family, address bytes, prefix length) each equal, as an exact multiset, to the
+  sets parsed from the shipped unit text embedded in spawnd
+  (`systemd::EGRESS_UNIT_TEXT`: 22 deny and 9 allow prefixes; strict parser:
+  literal `addr/prefix` only, no `any`, no host bits, no duplicates, no
+  resetting empty assignment). PID 1 reports both lists in hash order, not unit
+  file order (measured on systemd 255); `IPAddressDeny=any` reads back as
+  `::/0` and `0.0.0.0/0`. On `dedicated_dns_broker` hosts
+  `duduclaw-dns-broker.service` must also be loaded from its own file with no
+  drop-in, deny exactly `any`, and allow a non-empty list of single unicast,
+  non-loopback hosts (/32, /128). Anything else, including an unreadable
+  property, is `unavailable`; the reason is logged when it changes. Because the
+  egress unit starts only after spawnd's readiness gate, the value is
+  `unavailable` until the first successful readback. A broker deployment that
+  rebinds egress's DNS socket in a drop-in (see the templates paragraph above)
+  therefore reads `unavailable`. **Scope:** this verifies what PID 1 has
+  configured for the unit, not that the cgroup BPF filter is attached in the
+  kernel; reading the attached programs needs a privilege spawnd does not hold.
+- **File-owner inventory at UID allocation.** The receipt's `unowned_uids`
+  and `owner_inventory_digest` are gone (a receipt still carrying them is
+  refused as a whole) and `InstallationEvidence` no longer has a file-owner
+  hook. `Registry::reserve` asks the account host once per allocation, before
+  the candidate loop, for the occupied ids (`AccountHost::occupied_ids`); the
+  per-candidate `getent` checks are unchanged. The scan (`owner_inventory`)
+  walks only spawnd's own state directories under `/var/lib/duduclaw-spawnd`:
+  `work-anchors`, `images`, `storage`, `projections` and `etc-state`, and
+  collects every uid and gid inside the employee range that owns an entry; a
+  candidate found as either is skipped (an employee's gid is its uid). spawnd
+  cannot see the host's `/home`, `/root` or `/tmp` by design, so files there
+  are outside the inventory. Each root is opened from `/` without symlinks
+  through root-owned, not group/other-writable components; entries are read
+  through directory descriptors and inspected with
+  `fstatat(AT_SYMLINK_NOFOLLOW)` (a symlink is recorded, never followed); a
+  subdirectory is entered only through `openat2` with
+  `RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV`, so a mounted employee
+  image or any other mount is recorded by the owner seen from its parent and
+  not entered. Bounds: 200,000 entries in total and 12 levels below a root.
+  Exceeding a bound or any error except a root that does not exist yet (an
+  empty contribution on a fresh install) fails the inventory and refuses the
+  allocation without reserving or tombstoning anything.
 
 ### Validation and remaining acceptance
 

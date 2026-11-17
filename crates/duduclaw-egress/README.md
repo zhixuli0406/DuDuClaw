@@ -38,6 +38,24 @@ answers without that SOA, unrelated SOAs, malformed replies and NXDOMAIN are
 refused. Both families empty still fails; addresses remain subject to the
 existing downstream public-IP policy.
 
+## DNS probe for spawnd's readiness (R7b)
+
+The control connection also accepts `ProbeDns { name }` (no descriptors).
+Egress refuses a name that fails `validate_dns_probe_name` (`InvalidRequest`)
+or a configuration whose profiles do not share one DNS route (`Unavailable`).
+Otherwise it performs one real lookup through that route with the resolver runs
+use, bounded by a 3 s deadline, and answers
+`DnsProbed { route, resolved, public_addresses }`: `public_addresses` counts the
+answers that pass the run-time filter (public and not one of the host's own
+addresses). A failed or timed-out lookup is `resolved: false,
+public_addresses: 0`, not a control error. At most one real lookup happens per
+10 s; within that window the previous result is returned for the same name and
+any other name is refused (`ResourceLimit`). The control loop is serial, so a
+probe delays a following Register/Unregister by at most the 3 s deadline. The
+journal line records only name, route, `resolved` and the count, never answers.
+Root test on a VM with systemd-resolved and outbound DNS:
+`cargo test -p duduclaw-egress --test host iso_root_egress_dns_probe_through_control_socket -- --ignored --exact`.
+
 ## Global admission limit
 
 The daemon shares 64 tunnel permits across all registered runs. It acquires a

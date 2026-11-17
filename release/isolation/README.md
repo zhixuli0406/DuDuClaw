@@ -18,6 +18,18 @@ version). Artifact ids are the fixed names the update service downloads
 signs. Changing the component set, a protocol version or `minimum_version` is a
 reviewed change of this file.
 
+## Signed isolation policy (`isolation-policy-v1` artifact)
+
+The reviewed policy document bound by the manifest is checked offline by
+`validate_policy_document` in `scripts/sign-isolation-manifest.py` and again by
+spawnd. Policy v4 (domain `duduclaw-isolation-policy-v4`) is v3 plus the
+required `dns_probe_name`: choose, at signing time, a hostname AI employees
+need anyway (for example the model API host) — lower-case ASCII, at least two
+labels, no trailing dot, not an IP address, not `localhost` or a
+`.local`/`.internal`/`.localhost` name. spawnd asks egress to resolve it through
+the configured DNS route as its DNS readiness evidence, and never reports the
+DNS route as verified with a policy older than v4.
+
 ## `../bootstrap-root.sha256` (not present yet)
 
 The production root pin: the SHA-256 of the signed production `root.json`, one
