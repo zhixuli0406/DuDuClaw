@@ -17,8 +17,10 @@ const MOUNT_ATTR_NOEXEC: u64 = 8;
 const MOUNT_ATTR_NOSYMFOLLOW: u64 = 0x0020_0000;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PROJECTION_FILES: usize = 5;
-/// The /etc projection: the five identity files plus the R3-1 marker directory.
-const MAX_ETC_ENTRIES: usize = MAX_PROJECTION_FILES + 1;
+/// The /etc projection's top level: the five identity files, the R3-1 marker
+/// directory and the root of the trampoline's CA mount point chain
+/// ([`duduclaw_run::ETC_PROJECTION_DIRECTORIES`], i.e. `ssl/`).
+const MAX_ETC_ENTRIES: usize = MAX_PROJECTION_FILES + 2;
 /// Attributes of the detached /etc clone handed to the runtime (R3-1: the
 /// marker is read-only and its path is never followed through a symlink).
 pub(crate) const ETC_MOUNT_ATTRIBUTES: u64 =
@@ -127,7 +129,7 @@ pub fn prepare(plan: &BootstrapPlan, storage: &AttachedStorage, anchors: &RootPu
     let runtime = detached_clone(runtime_anchor.as_fd(), readonly)?;
     let projection = employee_projection(anchors, plan.employee)?;
     let home = super::native_home::prepare(persistent_home, work.as_fd(), projection.as_fd(), plan.uid, plan.gid)?;
-    let etc_anchor = publish_projection(anchors, plan)?;
+    let etc_anchor = publish_projection(anchors, plan.run, plan.uid, plan.gid)?;
     let etc = detached_clone(etc_anchor.as_fd(), ETC_MOUNT_ATTRIBUTES)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let (executable, script) = match &plan.executable {
@@ -290,10 +292,10 @@ pub(crate) fn open_verified(runtime: BorrowedFd<'_>, name: &str, digest: Sha256D
 }
 
 fn run_name(run: RunHandle) -> String { run.0.0.iter().map(|byte| format!("{byte:02x}")).collect() }
-fn publish_projection(anchors: &RootPublicationAnchors, plan: &BootstrapPlan) -> io::Result<OwnedFd> {
+fn publish_projection(anchors: &RootPublicationAnchors, run: RunHandle, uid: u32, gid: u32) -> io::Result<OwnedFd> {
     let parent = trusted_directory(&anchors.etc_state)?;
     if metadata(&parent)?.mode() & 0o7777 != 0o700 { return Err(invalid()); }
-    let name = CString::new(run_name(plan.run)).map_err(|_| invalid())?;
+    let name = CString::new(run_name(run)).map_err(|_| invalid())?;
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
     if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err(io::Error::last_os_error()); }
     let directory = owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
@@ -303,37 +305,123 @@ fn publish_projection(anchors: &RootPublicationAnchors, plan: &BootstrapPlan) ->
     if result == 0 && unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) } != 0 { return Err(io::Error::last_os_error()); }
     let stat = metadata(&directory)?;
     if stat.uid() != 0 || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
-    let content = minimal_etc(plan.uid, plan.gid).map_err(|_| invalid())?;
-    for (name, value) in &content { publish_file(directory.as_fd(), name, value.as_bytes())?; }
-    // SR5 round 3 follow-up R3-1: `/etc/duduclaw/protected-mode` inside the
-    // runtime (see `bootstrap::ETC_MARKER_DIR`), root-owned and read-only.
-    publish_marker(directory.as_fd())?;
-    let mut top_level = content.clone();
-    top_level.insert(ETC_MARKER_DIR, String::new());
-    verify_projection_entries(directory.as_fd(), &top_level, MAX_ETC_ENTRIES)?;
+    write_etc_projection(directory.as_fd(), uid, gid, 0)?;
     File::from(directory.try_clone()?).sync_all()?;
     File::from(parent).sync_all()?;
     Ok(directory)
 }
+/// Publish the whole /etc projection inside `directory` and verify its exact
+/// shape: [`minimal_etc`], the R3-1 marker and the trampoline's CA mount point
+/// ([`duduclaw_run::ETC_PROJECTION_DIRECTORIES`]). Existing entries (EEXIST)
+/// are accepted only if they verify. `owner` is 0 in production (tests only
+/// pass their own uid so they can run unprivileged).
+fn write_etc_projection(directory: BorrowedFd<'_>, uid: u32, gid: u32, owner: u32) -> io::Result<()> {
+    let content = minimal_etc(uid, gid).map_err(|_| invalid())?;
+    for (name, value) in &content { publish_file(directory, name, value.as_bytes(), owner)?; }
+    // SR5 round 3 follow-up R3-1: `/etc/duduclaw/protected-mode` inside the
+    // runtime (see `bootstrap::ETC_MARKER_DIR`), root-owned and read-only.
+    publish_marker(directory, owner)?;
+    // R7f: `build_root` attaches the host CA certificates on `ssl/certs`.
+    publish_ca_mount_point(directory, owner)?;
+    verify_etc_projection(directory, uid, gid, owner)
+}
+/// Exact shape of the /etc projection: the five files, `duduclaw/` and the CA
+/// mount point chain's root at the top level (nothing else), and the chain
+/// itself as [`verify_ca_mount_point`] requires.
+fn verify_etc_projection(directory: BorrowedFd<'_>, uid: u32, gid: u32, owner: u32) -> io::Result<()> {
+    let mut top_level = minimal_etc(uid, gid).map_err(|_| invalid())?;
+    top_level.insert(ETC_MARKER_DIR, String::new());
+    let chain = projection_directory_chain()?;
+    if top_level.insert(chain[0], String::new()).is_some() { return Err(invalid()); }
+    verify_projection_entries(directory, &top_level, MAX_ETC_ENTRIES)?;
+    verify_ca_mount_point(directory, owner)
+}
+/// Single components of [`duduclaw_run::ETC_PROJECTION_DIRECTORIES`]: each
+/// entry must be its predecessor plus one flat component (`["ssl", "certs"]`).
+fn projection_directory_chain() -> io::Result<Vec<&'static str>> {
+    let mut names = Vec::new();
+    let mut previous: Option<&str> = None;
+    for path in duduclaw_run::ETC_PROJECTION_DIRECTORIES {
+        let name = match (previous, path.rsplit_once('/')) {
+            (None, None) => path,
+            (Some(parent), Some((prefix, name))) if prefix == parent => name,
+            _ => return Err(invalid()),
+        };
+        if name.is_empty() || matches!(name, "." | "..") || name.contains('/') { return Err(invalid()); }
+        names.push(name);
+        previous = Some(path);
+    }
+    if names.is_empty() { return Err(invalid()); }
+    Ok(names)
+}
+/// R7f: the directories the trampoline mounts the host CA certificates beneath
+/// (`<projection>/ssl/certs`): `owner` 0755, empty, same create/verify/fsync
+/// discipline as the marker directory. Never followed through a symlink.
+fn publish_ca_mount_point(directory: BorrowedFd<'_>, owner: u32) -> io::Result<()> {
+    let mut opened: Vec<OwnedFd> = Vec::new();
+    for name in projection_directory_chain()? {
+        let parent = opened.last().map_or(directory, |fd| fd.as_fd());
+        let next = publish_directory(parent, name, owner)?;
+        opened.push(next);
+    }
+    verify_ca_mount_point(directory, owner)?;
+    // Innermost first; each parent then records its new entry.
+    for fd in opened.into_iter().rev() { File::from(fd).sync_all()?; }
+    Ok(())
+}
+/// `name` beneath `parent`: created 0755 if absent, then required to be a real
+/// `owner`-owned 0755 directory (an existing one is never re-moded).
+fn publish_directory(parent: BorrowedFd<'_>, name: &str, owner: u32) -> io::Result<OwnedFd> {
+    let name = CString::new(name).map_err(|_| invalid())?;
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+    if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err(io::Error::last_os_error()); }
+    let directory = owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    if metadata(&directory)?.uid() != owner { return Err(invalid()); }
+    // The unit's UMask narrows mkdirat; the runtime uid must be able to traverse.
+    if result == 0 && unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) } != 0 { return Err(io::Error::last_os_error()); }
+    let stat = metadata(&directory)?;
+    if !stat.is_dir() || stat.uid() != owner || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
+    Ok(directory)
+}
+/// Every directory of the chain is a real `owner`-owned 0755 directory that
+/// holds exactly the next one; the last (the CA mount point) is EMPTY.
+fn verify_ca_mount_point(directory: BorrowedFd<'_>, owner: u32) -> io::Result<()> {
+    let names = projection_directory_chain()?;
+    let mut current: Option<OwnedFd> = None;
+    for (index, name) in names.iter().enumerate() {
+        let parent = current.as_ref().map_or(directory, |fd| fd.as_fd());
+        let name = CString::new(*name).map_err(|_| invalid())?;
+        let next = owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+        let stat = metadata(&next)?;
+        if !stat.is_dir() || stat.uid() != owner || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
+        let expected: BTreeMap<&str, String> = names.get(index + 1)
+            .map(|child| BTreeMap::from([(*child, String::new())])).unwrap_or_default();
+        verify_projection_entries(next.as_fd(), &expected, expected.len())?;
+        current = Some(next);
+    }
+    Ok(())
+}
 /// R3-1: `<projection>/duduclaw/protected-mode` (root 0755 dir, root 0444
 /// single-link file with exactly [`ETC_MARKER_CONTENT`], nothing else).
-fn publish_marker(directory: BorrowedFd<'_>) -> io::Result<()> {
+fn publish_marker(directory: BorrowedFd<'_>, owner: u32) -> io::Result<()> {
     let name = CString::new(ETC_MARKER_DIR).map_err(|_| invalid())?;
     let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) };
     if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err(io::Error::last_os_error()); }
     let marker_dir = owned(unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
-    if metadata(&marker_dir)?.uid() != 0 { return Err(invalid()); }
+    if metadata(&marker_dir)?.uid() != owner { return Err(invalid()); }
     // The unit's UMask narrows mkdirat; the runtime uid must be able to traverse.
     if result == 0 && unsafe { libc::fchmod(marker_dir.as_raw_fd(), 0o755) } != 0 { return Err(io::Error::last_os_error()); }
     let stat = metadata(&marker_dir)?;
-    if stat.uid() != 0 || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
-    publish_file(marker_dir.as_fd(), ETC_MARKER_FILE, ETC_MARKER_CONTENT.as_bytes())?;
+    if stat.uid() != owner || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
+    publish_file(marker_dir.as_fd(), ETC_MARKER_FILE, ETC_MARKER_CONTENT.as_bytes(), owner)?;
     verify_projection_entries(marker_dir.as_fd(),
         &BTreeMap::from([(ETC_MARKER_FILE, ETC_MARKER_CONTENT.to_owned())]), 1)?;
     File::from(marker_dir).sync_all()
 }
-fn publish_file(directory: BorrowedFd<'_>, name: &str, value: &[u8]) -> io::Result<()> {
+fn publish_file(directory: BorrowedFd<'_>, name: &str, value: &[u8], owner: u32) -> io::Result<()> {
     use std::io::Write;
     let name = CString::new(name).map_err(|_| invalid())?;
     let raw = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
@@ -346,7 +434,7 @@ fn publish_file(directory: BorrowedFd<'_>, name: &str, value: &[u8]) -> io::Resu
     } else if io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err(io::Error::last_os_error()); }
     let fd = owned(unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
     let stat = metadata(&fd)?;
-    if !stat.is_file() || stat.uid() != 0 || stat.mode() & 0o7777 != 0o444 || stat.nlink() != 1 || stat.len() != value.len() as u64 { return Err(invalid()); }
+    if !stat.is_file() || stat.uid() != owner || stat.mode() & 0o7777 != 0o444 || stat.nlink() != 1 || stat.len() != value.len() as u64 { return Err(invalid()); }
     let mut actual = Vec::new(); File::from(fd).take(4096).read_to_end(&mut actual)?;
     if actual != value { return Err(invalid()); }
     Ok(())
@@ -419,6 +507,8 @@ pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> i
     // unlinking anything; no unknown path is removed during recovery.
     let mut entries = Vec::new();
     let mut marker_dir = false;
+    let ca_root = projection_directory_chain()?[0];
+    let mut ca_dir = false;
     for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
         let entry = entry?;
         // R3-1: the marker directory (possibly partial: empty or just the marker).
@@ -428,12 +518,20 @@ pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> i
             marker_dir = true;
             continue;
         }
+        // R7f: the CA mount point chain (possibly partial); checked level by level below.
+        if entry.file_name().to_str() == Some(ca_root) && !ca_dir {
+            let stat = fs::symlink_metadata(entry.path())?;
+            if !stat.is_dir() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o700 | 0o755) { return Err(invalid()); }
+            ca_dir = true;
+            continue;
+        }
         if entries.len() >= MAX_PROJECTION_FILES || !entry.file_name().to_str().is_some_and(|name| expected.contains_key(name)) { return Err(invalid()); }
         let stat = fs::symlink_metadata(entry.path())?;
         if !stat.is_file() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o400 | 0o444) || stat.nlink() != 1 { return Err(invalid()); }
         entries.push(c_name(&entry.file_name())?);
     }
     if marker_dir { cleanup_marker(directory.as_fd())?; }
+    if ca_dir { remove_directory_chain(directory.as_fd(), &projection_directory_chain()?)?; }
     for entry in entries {
         if unsafe { libc::unlinkat(directory.as_raw_fd(), entry.as_ptr(), 0) } != 0 { return Err(io::Error::last_os_error()); }
     }
@@ -467,6 +565,29 @@ fn cleanup_marker(directory: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
+/// R7f cleanup of the (possibly partial) CA mount point chain `names` beneath
+/// `parent`: each level must be a real root-owned 0700/0755 directory holding
+/// at most the next level; the last one must be empty. Anything else keeps the
+/// residue (and readiness fails). Nothing unknown is ever removed.
+fn remove_directory_chain(parent: BorrowedFd<'_>, names: &[&str]) -> io::Result<()> {
+    let Some((first, rest)) = names.split_first() else { return Ok(()) };
+    let name = CString::new(*first).map_err(|_| invalid())?;
+    let directory = owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    let stat = metadata(&directory)?;
+    if !stat.is_dir() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o700 | 0o755) { return Err(invalid()); }
+    let mut child = false;
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+        let entry = entry?;
+        if child || !rest.first().is_some_and(|next| entry.file_name().to_str() == Some(*next)) { return Err(invalid()); }
+        child = true;
+    }
+    if child { remove_directory_chain(directory.as_fd(), rest)?; }
+    File::from(directory).sync_all()?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 { return Err(io::Error::last_os_error()); }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,8 +596,130 @@ mod tests {
         for flag in [MOUNT_ATTR_RDONLY, MOUNT_ATTR_NOSUID, MOUNT_ATTR_NODEV, MOUNT_ATTR_NOEXEC, MOUNT_ATTR_NOSYMFOLLOW] {
             assert_eq!(ETC_MOUNT_ATTRIBUTES & flag, flag);
         }
-        assert!(MAX_ETC_ENTRIES > minimal_etc(70000, 70000).unwrap().len());
+        // Exactly the five files, `duduclaw/` and `ssl/`: no room for anything else.
+        assert_eq!(MAX_ETC_ENTRIES, minimal_etc(70000, 70000).unwrap().len() + 2);
         assert!(!minimal_etc(70000, 70000).unwrap().contains_key(ETC_MARKER_DIR));
+    }
+    /// The producer's directory list IS the trampoline's: `build_root` opens and
+    /// mounts on `duduclaw_run::ETC_CA_MOUNT_POINT`, the last entry of the same
+    /// shared constant this writer walks.
+    #[test]
+    fn r7f_etc_ca_mount_point_is_the_shared_trampoline_constant() {
+        assert_eq!(projection_directory_chain().unwrap(), ["ssl", "certs"]);
+        assert_eq!(duduclaw_run::ETC_PROJECTION_DIRECTORIES.last(), Some(&duduclaw_run::ETC_CA_MOUNT_POINT));
+        assert_eq!(projection_directory_chain().unwrap().join("/"), duduclaw_run::ETC_CA_MOUNT_POINT);
+        let top = projection_directory_chain().unwrap()[0];
+        assert!(!minimal_etc(70000, 70000).unwrap().contains_key(top) && top != ETC_MARKER_DIR);
+    }
+    /// Unprivileged scratch directory for the writer/verifier tests.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> (Self, OwnedFd) {
+            use std::os::unix::fs::PermissionsExt;
+            let path = std::env::temp_dir().join(format!("duduclaw-r7f-etc-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let fd: OwnedFd = File::open(&path).unwrap().into();
+            (Self(path), fd)
+        }
+    }
+    impl Drop for Scratch { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    fn euid() -> u32 { unsafe { libc::geteuid() } }
+    /// Relative paths of every directory beneath `base` (no symlink followed).
+    fn directories(base: &Path, relative: &Path, found: &mut Vec<String>) {
+        for entry in fs::read_dir(base.join(relative)).unwrap() {
+            let entry = entry.unwrap();
+            if fs::symlink_metadata(entry.path()).unwrap().is_dir() {
+                let path = relative.join(entry.file_name());
+                found.push(path.to_str().unwrap().to_owned());
+                directories(base, &path, found);
+            }
+        }
+    }
+    #[test]
+    fn r7f_etc_projection_writer_publishes_the_empty_ca_mount_point() {
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, dir) = Scratch::new("writer");
+        let owner = euid();
+        write_etc_projection(dir.as_fd(), 70000, 70000, owner).unwrap();
+        for path in duduclaw_run::ETC_PROJECTION_DIRECTORIES {
+            let stat = fs::symlink_metadata(scratch.0.join(path)).unwrap();
+            assert!(stat.is_dir(), "{path}");
+            assert_eq!(stat.uid(), owner, "{path}");
+            assert_eq!(stat.permissions().mode() & 0o7777, 0o755, "{path}");
+        }
+        assert_eq!(fs::read_dir(scratch.0.join(duduclaw_run::ETC_CA_MOUNT_POINT)).unwrap().count(), 0, "mount point is empty");
+        // The only directories the producer creates: the marker's and the shared list.
+        let mut found = Vec::new();
+        directories(&scratch.0, Path::new(""), &mut found);
+        found.sort();
+        let mut expected: Vec<String> = duduclaw_run::ETC_PROJECTION_DIRECTORIES.iter().map(|path| (*path).to_owned()).collect();
+        expected.push(ETC_MARKER_DIR.to_owned());
+        expected.sort();
+        assert_eq!(found, expected);
+        // The exact-shape verifier accepts it, also on republication (EEXIST).
+        verify_etc_projection(dir.as_fd(), 70000, 70000, owner).unwrap();
+        write_etc_projection(dir.as_fd(), 70000, 70000, owner).unwrap();
+        // Owner is part of the shape (root in production).
+        assert!(verify_etc_projection(dir.as_fd(), 70000, 70000, owner.wrapping_add(1)).is_err());
+        assert!(verify_ca_mount_point(dir.as_fd(), owner.wrapping_add(1)).is_err());
+    }
+    #[test]
+    fn r7f_etc_projection_verifier_rejects_any_other_ca_mount_point_shape() {
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, dir) = Scratch::new("verifier");
+        let owner = euid();
+        write_etc_projection(dir.as_fd(), 70000, 70000, owner).unwrap();
+        let ssl = scratch.0.join(duduclaw_run::ETC_PROJECTION_DIRECTORIES[0]);
+        let certs = scratch.0.join(duduclaw_run::ETC_CA_MOUNT_POINT);
+        let rejected = || verify_etc_projection(dir.as_fd(), 70000, 70000, owner).is_err();
+        assert!(!rejected());
+        // An extra entry inside ssl/certs (file or directory) — also on republication.
+        fs::write(certs.join("extra"), b"x").unwrap();
+        assert!(rejected());
+        assert!(write_etc_projection(dir.as_fd(), 70000, 70000, owner).is_err());
+        fs::remove_file(certs.join("extra")).unwrap();
+        fs::create_dir(certs.join("nested")).unwrap();
+        assert!(rejected());
+        fs::remove_dir(certs.join("nested")).unwrap();
+        // An extra entry inside ssl.
+        fs::create_dir(ssl.join("private")).unwrap();
+        assert!(rejected());
+        fs::remove_dir(ssl.join("private")).unwrap();
+        assert!(!rejected());
+        // Wrong modes (the republication never re-modes an existing directory).
+        for path in [&certs, &ssl] {
+            for mode in [0o700, 0o775, 0o777, 0o1755] {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+                assert!(rejected(), "{} mode {mode:o}", path.display());
+                assert!(write_etc_projection(dir.as_fd(), 70000, 70000, owner).is_err());
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(!rejected());
+        // Missing ssl/certs.
+        fs::remove_dir(&certs).unwrap();
+        assert!(rejected());
+        // Not a real directory: a regular file or a symlink at ssl/certs.
+        fs::write(&certs, b"").unwrap();
+        assert!(rejected());
+        fs::remove_file(&certs).unwrap();
+        std::os::unix::fs::symlink(&ssl, &certs).unwrap();
+        assert!(rejected());
+        fs::remove_file(&certs).unwrap();
+        // Missing ssl entirely, and a symlink in its place.
+        fs::remove_dir(&ssl).unwrap();
+        assert!(rejected());
+        let elsewhere = scratch.0.join(ETC_MARKER_DIR);
+        std::os::unix::fs::symlink(&elsewhere, &ssl).unwrap();
+        assert!(rejected());
+        fs::remove_file(&ssl).unwrap();
+        // The writer restores exactly the expected shape; an extra top-level entry is still refused.
+        write_etc_projection(dir.as_fd(), 70000, 70000, owner).unwrap();
+        assert!(!rejected());
+        fs::create_dir(scratch.0.join("ssl.d")).unwrap();
+        assert!(rejected());
     }
     /// R3-1 end-to-end: publish the real /etc projection, clone it exactly as
     /// `prepare` does (read-only/nosymfollow), and read the marker through the
@@ -491,14 +734,11 @@ mod tests {
         let anchors = RootPublicationAnchors::new(root.clone(), root.clone(), root.clone()).unwrap();
         let run = RunHandle(duduclaw_isolation::ids::RunId([0x93; 16]));
         let directory = root.join(run_name(run));
-        // Publish via the same helpers `publish_projection` uses.
+        // Publish via the same writer `publish_projection` uses.
         fs::create_dir(&directory).unwrap(); fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         let dir: OwnedFd = File::open(&directory).unwrap().into();
-        for (name, value) in &minimal_etc(70000, 70000).unwrap() { publish_file(dir.as_fd(), name, value.as_bytes()).unwrap(); }
-        publish_marker(dir.as_fd()).unwrap();
-        let mut top_level = minimal_etc(70000, 70000).unwrap();
-        top_level.insert(ETC_MARKER_DIR, String::new());
-        verify_projection_entries(dir.as_fd(), &top_level, MAX_ETC_ENTRIES).unwrap();
+        write_etc_projection(dir.as_fd(), 70000, 70000, 0).unwrap();
+        verify_etc_projection(dir.as_fd(), 70000, 70000, 0).unwrap();
         let clone = detached_clone(dir.as_fd(), ETC_MOUNT_ATTRIBUTES).unwrap();
         let path = CString::new(format!("{ETC_MARKER_DIR}/{ETC_MARKER_FILE}")).unwrap();
         let fd = owned(unsafe { libc::openat(clone.as_raw_fd(), path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) } as _).unwrap();
@@ -529,8 +769,8 @@ mod tests {
         let directory = root.join("etc");
         fs::create_dir(&directory).unwrap(); fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         let dir: OwnedFd = File::open(&directory).unwrap().into();
-        for (name, value) in &minimal_etc(70000, 70000).unwrap() { publish_file(dir.as_fd(), name, value.as_bytes()).unwrap(); }
-        publish_marker(dir.as_fd()).unwrap();
+        for (name, value) in &minimal_etc(70000, 70000).unwrap() { publish_file(dir.as_fd(), name, value.as_bytes(), 0).unwrap(); }
+        publish_marker(dir.as_fd(), 0).unwrap();
         let projection = detached_clone(dir.as_fd(), ETC_MOUNT_ATTRIBUTES).unwrap();
         let projection_fd = projection.as_raw_fd();
         // What `Sources::system()` is inside the sandbox when the env flag is
@@ -621,6 +861,16 @@ mod tests {
         fs::create_dir(&residue).unwrap(); fs::set_permissions(&residue, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(residue.join("passwd"), b"partial").unwrap();
         fs::set_permissions(residue.join("passwd"), fs::Permissions::from_mode(0o400)).unwrap();
+        // R7f: a partial CA mount point chain (interrupted before fchmod: 0700).
+        for path in duduclaw_run::ETC_PROJECTION_DIRECTORIES {
+            fs::create_dir(residue.join(path)).unwrap();
+            fs::set_permissions(residue.join(path), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // Unknown content inside the mount point keeps the residue.
+        fs::write(residue.join(duduclaw_run::ETC_CA_MOUNT_POINT).join("unknown"), b"x").unwrap();
+        assert!(cleanup_projection(&anchors, run).is_err());
+        assert!(residue.join(duduclaw_run::ETC_CA_MOUNT_POINT).join("unknown").exists());
+        fs::remove_file(residue.join(duduclaw_run::ETC_CA_MOUNT_POINT).join("unknown")).unwrap();
         assert_eq!(projection_runs(&anchors).unwrap(), vec![run]);
         cleanup_projection(&anchors, run).unwrap();
         assert!(projection_runs(&anchors).unwrap().is_empty());
@@ -661,5 +911,106 @@ mod tests {
         drop(verified); drop(mount); drop(source); drop(projection);
         fs::remove_file(root.join(&other_name)).unwrap(); fs::remove_dir(root.join(&employee_name)).unwrap();
         fs::remove_file(root.join("fixture")).unwrap(); fs::remove_dir(root).unwrap();
+    }
+    /// R7f end-to-end: the PRODUCTION writer (`publish_projection`) publishes
+    /// the /etc projection, it is cloned exactly as `prepare` does and handed
+    /// with the other inputs to the trampoline library's `build_root`, which
+    /// must attach the host CA certificates on its `ssl/certs`. All namespace
+    /// and mount work runs in a fresh re-exec of only this test (no fork of the
+    /// harness); this process prepares the anchors and cleans up afterwards.
+    #[test]
+    #[ignore = "iso_root_: disposable root Linux VM (DUDUCLAW_ISO_DISPOSABLE=1) with host /etc/ssl/certs"]
+    fn iso_root_etc_projection_attaches_through_build_root() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "DUDUCLAW_ISO_ETC_PROJECTION_ROOT";
+        const NAME: &str = "bootstrap_mounts::tests::iso_root_etc_projection_attaches_through_build_root";
+        assert_eq!(unsafe { libc::geteuid() }, 0, "requires native root Linux; no skip");
+        assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
+            "set DUDUCLAW_ISO_DISPOSABLE=1 only on a disposable VM");
+        let run = RunHandle(duduclaw_isolation::ids::RunId([0x95; 16]));
+        let employee = EmployeeId([0x75; 16]);
+        if let Ok(root) = std::env::var(CHILD) {
+            etc_projection_through_build_root(Path::new(&root), run, employee);
+            return;
+        }
+        let root = PathBuf::from(format!("/run/duduclaw-r7f-etc-ca-{}", std::process::id()));
+        let employee_dir = format!("projections/{}", employee.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        fs::create_dir(&root).unwrap(); fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        for (path, mode) in [("etc-state", 0o700), ("runtime", 0o755), ("projections", 0o755),
+            (employee_dir.as_str(), 0o755), ("home", 0o700), ("work", 0o700)] {
+            fs::create_dir(root.join(path)).unwrap();
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for path in ["home", "work"] {
+            let path = CString::new(root.join(path).as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(path.as_ptr(), 70000, 70000) }, 0);
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--ignored", "--test-threads=1", "--nocapture"])
+            .env(CHILD, &root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().expect("fresh process running only this test");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut timed_out = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline { timed_out = true; child.kill().unwrap(); break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        // Clean up first (the child's namespace, and with it every mount, is gone).
+        let anchors = RootPublicationAnchors::new(root.join("runtime"), root.join("etc-state"), root.join("projections")).unwrap();
+        let cleaned = cleanup_projection(&anchors, run);
+        let residue = projection_runs(&anchors);
+        for path in [employee_dir.as_str(), "projections", "runtime", "home", "work", "etc-state"] { let _ = fs::remove_dir(root.join(path)); }
+        let _ = fs::remove_dir(&root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!timed_out, "child exceeded its deadline");
+        assert!(output.status.success() && stdout.contains("1 passed"), "child failed or did not run: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr));
+        cleaned.unwrap();
+        assert!(residue.unwrap().is_empty());
+    }
+    /// Child half of `iso_root_etc_projection_attaches_through_build_root`.
+    fn etc_projection_through_build_root(root: &Path, run: RunHandle, employee: EmployeeId) {
+        use duduclaw_run::linux::mounts;
+        let anchors = RootPublicationAnchors::new(root.join("runtime"), root.join("etc-state"), root.join("projections")).unwrap();
+        // `prepare`'s sources and attributes for each input.
+        let etc_anchor = publish_projection(&anchors, run, 70000, 70000).unwrap();
+        verify_etc_projection(etc_anchor.as_fd(), 70000, 70000, 0).unwrap();
+        let etc = detached_clone(etc_anchor.as_fd(), ETC_MOUNT_ATTRIBUTES).unwrap();
+        let readonly = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOSYMFOLLOW;
+        let runtime = detached_clone(trusted_directory(&anchors.runtime).unwrap().as_fd(), readonly).unwrap();
+        let projection = employee_projection(&anchors, employee).unwrap();
+        // H's employee-owned home/work roots (no native-home files: a non-native runtime).
+        let home_source: OwnedFd = File::open(root.join("home")).unwrap().into();
+        let work_source: OwnedFd = File::open(root.join("work")).unwrap().into();
+        let home = detached_clone(home_source.as_fd(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV).unwrap();
+        let work = detached_clone(work_source.as_fd(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC).unwrap();
+        let input = |fd: OwnedFd| {
+            let mut fs: libc::statfs64 = unsafe { mem::zeroed() };
+            assert_eq!(unsafe { libc::fstatfs64(fd.as_raw_fd(), &mut fs) }, 0);
+            let expected_mount_id = crate::fds::mount_id(fd.as_fd()).unwrap();
+            mounts::DetachedMount { fd, expected_mount_id, expected_fs_type: fs.f_type as i64 }
+        };
+        let etc_mount = crate::fds::mount_id(etc.as_fd()).unwrap();
+        let inputs = mounts::MountInputs { home: input(home), work: input(work), projection: input(projection),
+            runtime: input(runtime), etc: input(etc) };
+        // The trampoline's namespace entry, then a stand-in for systemd's PrivateTmp.
+        mounts::enter_namespaces().expect("private namespaces");
+        assert_eq!(unsafe { libc::mount(c"tmpfs".as_ptr(), c"/tmp".as_ptr(), c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV, c"size=4194304,nr_inodes=128,mode=1777".as_ptr().cast()) }, 0);
+        let config = mounts::RootConfig { employee_uid: 70000, employee_gid: 70000, pty: false, pty_limit: 2,
+            work_noexec: true, tmp_noexec: true, tmpfs_bytes: 1024 * 1024, tmpfs_inodes: 64 };
+        let prepared = mounts::build_root(inputs, &config);
+        assert!(prepared.is_ok(), "build_root with the production /etc projection: {:?}", prepared.as_ref().err());
+        let mount_of = |path: &str| crate::fds::mount_id(File::open(path).unwrap().as_fd()).unwrap();
+        assert_eq!(mount_of("/tmp/duduclaw-root/etc"), etc_mount);
+        assert_eq!(mount_of(&format!("/tmp/duduclaw-root/etc/{}", duduclaw_run::ETC_PROJECTION_DIRECTORIES[0])), etc_mount);
+        assert_ne!(mount_of(&format!("/tmp/duduclaw-root/etc/{}", duduclaw_run::ETC_CA_MOUNT_POINT)), etc_mount,
+            "host CA certificates are attached on the projection's mount point");
+        assert_eq!(fs::read_to_string(format!("/tmp/duduclaw-root/etc/{ETC_MARKER_DIR}/{ETC_MARKER_FILE}")).unwrap(), ETC_MARKER_CONTENT);
+        assert_eq!(fs::read_to_string("/tmp/duduclaw-root/etc/passwd").unwrap(), minimal_etc(70000, 70000).unwrap()["passwd"]);
+        drop(prepared);
     }
 }

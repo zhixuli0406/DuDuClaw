@@ -38,7 +38,8 @@ pub struct DetachedMount {
 }
 
 /// Ordered, fixed-purpose mount inputs. `etc` must be the minimal projection,
-/// including an empty ssl/certs directory, never a clone of host /etc.
+/// including spawnd's empty root-owned [`crate::ETC_PROJECTION_DIRECTORIES`]
+/// (the CA mount point), never a clone of host /etc.
 pub struct MountInputs {
     pub home: DetachedMount,
     pub work: DetachedMount,
@@ -326,6 +327,9 @@ pub fn build_root(inputs: MountInputs, config: &RootConfig) -> Result<PreparedRo
     attach_input(inputs.projection, root.as_raw_fd(), c"config", readonly | MOUNT_NOEXEC)?;
     let runtime_mount_id = attach_input(inputs.runtime, root.as_raw_fd(), c"runtime", readonly)?;
     attach_input(inputs.etc, root.as_raw_fd(), c"etc", readonly | MOUNT_NOEXEC)?;
+    // The mount point is spawnd's empty root-owned 0755 directory from the shared
+    // list; it is never created here (the projection is read-only and spawnd's).
+    let ca_mount_point = CString::new(crate::ETC_CA_MOUNT_POINT).map_err(|_| MountError::InvalidPolicy)?;
     // Only this public certificate directory is borrowed from host /etc.
     let ca = clone_tree(c"/etc/ssl/certs", true)?;
     set_private(ca.as_raw_fd(), true)?;
@@ -333,10 +337,10 @@ pub fn build_root(inputs: MountInputs, config: &RootConfig) -> Result<PreparedRo
     // authority projections, CA certificates must not set NOSYMFOLLOW.
     set_attributes(ca.as_raw_fd(), MOUNT_RDONLY | MOUNT_NOSUID | MOUNT_NODEV, true)?;
     let etc = open_dir(root.as_raw_fd(), c"etc")?;
-    let ca_target = open_dir(etc.as_raw_fd(), c"ssl/certs")?;
+    let ca_target = open_dir(etc.as_raw_fd(), &ca_mount_point)?;
     drop(ca_target);
-    move_mount(ca, etc.as_raw_fd(), c"ssl/certs")?;
-    let ca_readback = open_dir(etc.as_raw_fd(), c"ssl/certs")?;
+    move_mount(ca, etc.as_raw_fd(), &ca_mount_point)?;
+    let ca_readback = open_dir(etc.as_raw_fd(), &ca_mount_point)?;
     verify_flags(ca_readback.as_raw_fd(), MOUNT_RDONLY | MOUNT_NOSUID | MOUNT_NODEV)?;
     drop(ca_readback);
     drop(etc);
@@ -534,7 +538,10 @@ fn allocate_pty(dev: RawFd, uid: u32, mount_id: u64) -> Result<PtyPair, MountErr
     Ok(PtyPair { master, slave, mount_id })
 }
 
-fn attach_input(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> Result<u64, MountError> {
+/// Attach one spawnd-provided detached mount at `root`/`name` and read it back.
+/// `pub` only for the debug root fixture (R7f DAC-less acceptance scenario);
+/// production callers are `build_root` and `attach_helpers`.
+pub fn attach_input(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> Result<u64, MountError> {
     if input.expected_mount_id == 0 { return Err(MountError::Identity); }
     // Do not turn a normal directory into a source mount: move_mount requires
     // the supplied detached mount root. Both before/after identities must match.
@@ -846,104 +853,7 @@ mod tests {
         assert_eq!(open_dir_path(parent, c"link").err(), Some(MountError::Directory));
         assert_eq!(open_dir_path(parent, c"../locked").err(), Some(MountError::Directory));
     }
-
-    /// Forked child of `iso_root_attach_input_without_dac_capabilities`;
-    /// returns 0 or the number of the failed step.
-    fn attach_without_dac(owner: u32) -> i32 {
-        // SAFETY: this forked child owns its new mount namespace.
-        unsafe {
-            if libc::unshare(libc::CLONE_NEWNS) != 0 { return 1; }
-            if libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
-                libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) != 0 { return 2; }
-        }
-        // Root-owned stage (over /tmp, in this namespace only) with the fixed mountpoint.
-        let Ok(stage) = tmpfs(1024 * 1024, 64, "0755", MOUNT_NOSUID | MOUNT_NODEV) else { return 3 };
-        if move_mount(stage, libc::AT_FDCWD, c"/tmp").is_err() { return 4; }
-        let Ok(root) = open_dir(libc::AT_FDCWD, c"/tmp") else { return 5 };
-        if mkdir(root.as_raw_fd(), c"work", 0o755).is_err() { return 6; }
-        // The employee input: a detached tmpfs whose root is `owner`-owned, mode 0700.
-        let attrs = MOUNT_NOSUID | MOUNT_NODEV;
-        let Ok(input) = filesystem(c"tmpfs", &[("size", "1048576".into()), ("nr_inodes", "64".into()),
-            ("mode", "0700".into()), ("uid", owner.to_string()), ("gid", owner.to_string())], attrs) else { return 7 };
-        let Ok(before) = statx(input.as_raw_fd()) else { return 8 };
-        if before.stx_uid != owner || before.stx_mode & 0o7777 != 0o700 || before.stx_mnt_id == 0 { return 9; }
-        let expected = before.stx_mnt_id;
-        if !reduce_to_run_unit_capabilities() { return 10; }
-        let mounted = attach_input(DetachedMount { fd: input, expected_mount_id: expected,
-            expected_fs_type: TMPFS_MAGIC }, root.as_raw_fd(), c"work", attrs);
-        if mounted != Ok(expected) { return 11; }
-        // Precondition: the old O_RDONLY readback of the same object is EACCES here.
-        // SAFETY: fixed name beneath the owned stage descriptor.
-        let raw = unsafe { libc::openat(root.as_raw_fd(), c"work".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-        if raw >= 0 { unsafe { libc::close(raw); } return 12; }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EACCES) { return 13; }
-        if open_dir(root.as_raw_fd(), c"work").is_ok() { return 14; }
-        let Ok(work) = open_dir_path(root.as_raw_fd(), c"work") else { return 15 };
-        let Ok(after) = statx(work.as_raw_fd()) else { return 16 };
-        if after.stx_mnt_id != expected || after.stx_uid != owner || after.stx_ino != before.stx_ino { return 17; }
-        0
-    }
-
-    /// Exactly the run unit's capability set: bounding, effective and permitted
-    /// are `REQUIRED_BOUNDING_CAPABILITIES`; inheritable and ambient are empty.
-    fn reduce_to_run_unit_capabilities() -> bool {
-        use super::super::privileges::REQUIRED_BOUNDING_CAPABILITIES as REQUIRED;
-        #[repr(C)]
-        struct Header { version: u32, pid: i32 }
-        #[repr(C)]
-        #[derive(Default, Clone, Copy)]
-        struct Data { effective: u32, permitted: u32, inheritable: u32 }
-        let read = |cap: u32| unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap as libc::c_ulong,
-            0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) };
-        let mut wanted = [Data::default(); 2];
-        for cap in REQUIRED {
-            wanted[(*cap / 32) as usize].effective |= 1 << (*cap % 32);
-            wanted[(*cap / 32) as usize].permitted |= 1 << (*cap % 32);
-        }
-        // SAFETY: prctl/capget/capset on this forked child only; exact v3 layouts.
-        unsafe {
-            for cap in 0..64u32 {
-                if read(cap) < 0 {
-                    if cap > 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) { break; }
-                    return false;
-                }
-                if !REQUIRED.contains(&cap) && libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong,
-                    0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) != 0 { return false; }
-            }
-            let header = Header { version: 0x2008_0522, pid: 0 };
-            if libc::syscall(libc::SYS_capset, &header, wanted.as_ptr()) != 0 { return false; }
-            if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
-                0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) != 0 { return false; }
-            let mut header = Header { version: 0x2008_0522, pid: 0 };
-            let mut actual = [Data::default(); 2];
-            if libc::syscall(libc::SYS_capget, &mut header, actual.as_mut_ptr()) != 0 { return false; }
-            if actual.iter().zip(&wanted).any(|(a, w)| a.effective != w.effective
-                || a.permitted != w.permitted || a.inheritable != 0) { return false; }
-        }
-        // CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER are gone from the bounding set too.
-        [1u32, 2, 3].iter().all(|cap| read(*cap) == 0) && REQUIRED.iter().all(|cap| read(*cap) == 1)
-    }
-
-    #[test]
-    #[ignore = "iso_root_: disposable root Linux VM (DUDUCLAW_ISO_DISPOSABLE=1); private mount namespace in a forked child"]
-    fn iso_root_attach_input_without_dac_capabilities() {
-        assert_eq!(unsafe { libc::geteuid() }, 0, "requires native root Linux; no skip");
-        assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
-            "set DUDUCLAW_ISO_DISPOSABLE=1 only on a disposable VM");
-        // `nobody` unless a disposable VM supplies another non-root owner.
-        let owner: u32 = std::env::var("DUDUCLAW_ISO_TEST_UID").map_or(65534, |uid| uid.parse().expect("numeric uid"));
-        assert_ne!(owner, 0);
-        // SAFETY: the child runs only `attach_without_dac` and leaves by _exit.
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0);
-        if child == 0 {
-            let code = attach_without_dac(owner);
-            unsafe { libc::_exit(code) }
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        assert!(libc::WIFEXITED(status), "child status {status:#x}");
-        assert_eq!(libc::WEXITSTATUS(status), 0, "failed step number in attach_without_dac");
-    }
+    // The DAC-less `attach_input` acceptance runs in the single-threaded root
+    // fixture (`DUDUCLAW_ROOT_TEST=attach-input-no-dac`, tests/root.rs), never
+    // forked from this multi-threaded harness.
 }

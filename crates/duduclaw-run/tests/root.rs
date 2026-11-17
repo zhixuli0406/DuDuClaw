@@ -94,6 +94,17 @@ fn iso_root_mount_tree_pty_and_proc_readbacks() { fixture("mounts"); }
 #[ignore = "requires root Linux with private detached mounts; --features root-test-fixture"]
 fn iso_root_detached_mount_private_propagation() { fixture("propagation"); }
 
+/// R7f: production `attach_input` under exactly the run unit's capability set
+/// (no CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH) onto an employee-owned 0700 mount
+/// root, with the O_PATH readback; in the fresh single-threaded fixture process.
+#[test]
+#[ignore = "iso_root_: disposable root Linux VM (DUDUCLAW_ISO_DISPOSABLE=1); --features root-test-fixture"]
+fn iso_root_attach_input_without_dac_capabilities() {
+    assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
+        "set DUDUCLAW_ISO_DISPOSABLE=1 only on a disposable VM");
+    fixture("attach-input-no-dac");
+}
+
 #[test]
 #[ignore = "requires root Linux full trampoline; --features root-test-fixture"]
 fn iso_root_full_launch_elf_capability_fd_handoff() { fixture("launch-elf"); }

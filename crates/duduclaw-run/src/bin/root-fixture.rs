@@ -43,7 +43,10 @@ mod linux {
             for name in ["home","work","ephemeral","gateway","config","runtime","etc"] {
                 std::fs::create_dir(fixture.0.join(name)).unwrap();
             }
-            std::fs::create_dir_all(fixture.0.join("etc/ssl/certs")).unwrap();
+            // The CA mount point spawnd publishes in every /etc projection.
+            for directory in duduclaw_run::ETC_PROJECTION_DIRECTORIES {
+                std::fs::create_dir(fixture.0.join("etc").join(directory)).unwrap();
+            }
             std::fs::write(fixture.0.join("etc/hosts"),b"127.0.0.1 localhost\n").unwrap();
             for name in ["home","work"] {
                 let path=cpath(&fixture.0.join(name));
@@ -425,6 +428,98 @@ mod linux {
         });
         child.success();
     }
+    /// Exactly the run unit's capability set: bounding, effective and permitted
+    /// are `REQUIRED_BOUNDING_CAPABILITIES`; inheritable and ambient are empty.
+    fn reduce_to_run_unit_capabilities() {
+        use privileges::REQUIRED_BOUNDING_CAPABILITIES as REQUIRED;
+        #[repr(C)]
+        struct Header { version: u32, pid: i32 }
+        #[repr(C)]
+        #[derive(Default, Clone, Copy)]
+        struct Data { effective: u32, permitted: u32, inheritable: u32 }
+        let read=|cap: u32| unsafe { libc::prctl(libc::PR_CAPBSET_READ,cap as libc::c_ulong,
+            0 as libc::c_ulong,0 as libc::c_ulong,0 as libc::c_ulong) };
+        let mut wanted=[Data::default();2];
+        for cap in REQUIRED {
+            wanted[(*cap/32) as usize].effective|=1<<(*cap%32);
+            wanted[(*cap/32) as usize].permitted|=1<<(*cap%32);
+        }
+        for cap in 0..64u32 {
+            if read(cap)<0 {
+                assert!(cap>0 && errno()==libc::EINVAL,"PR_CAPBSET_READ failed");
+                break;
+            }
+            if !REQUIRED.contains(&cap) {
+                assert_eq!(unsafe { libc::prctl(libc::PR_CAPBSET_DROP,cap as libc::c_ulong,
+                    0 as libc::c_ulong,0 as libc::c_ulong,0 as libc::c_ulong) },0,"bounding drop");
+            }
+        }
+        let header=Header { version:0x2008_0522,pid:0 };
+        assert_eq!(unsafe { libc::syscall(libc::SYS_capset,&header,wanted.as_ptr()) },0,"capset");
+        assert_eq!(unsafe { libc::prctl(libc::PR_CAP_AMBIENT,libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0 as libc::c_ulong,0 as libc::c_ulong,0 as libc::c_ulong) },0,"ambient clear");
+        let mut header=Header { version:0x2008_0522,pid:0 };
+        let mut actual=[Data::default();2];
+        assert_eq!(unsafe { libc::syscall(libc::SYS_capget,&mut header,actual.as_mut_ptr()) },0,"capget");
+        for (a,w) in actual.iter().zip(&wanted) {
+            assert!(a.effective==w.effective && a.permitted==w.permitted && a.inheritable==0,
+                "capabilities must be exactly the run unit's set");
+        }
+        // CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER are gone from the bounding set too.
+        assert!([1u32,2,3].iter().all(|cap| read(*cap)==0),"DAC capabilities left in the bounding set");
+        assert!(REQUIRED.iter().all(|cap| read(*cap)==1),"required bounding capability missing");
+    }
+    /// R7f: production `mounts::attach_input` as root holding exactly the run
+    /// unit's capabilities (no CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH/CAP_FOWNER)
+    /// onto an employee-owned 0700 mount root. The pre-R7f O_RDONLY readback of
+    /// the same object is EACCES; the O_PATH readback keeps its identity.
+    fn attach_input_without_dac(root: &Path) {
+        let mut child=Child::spawn(|| {
+            // Everything below is private to this worker's own mount namespace.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) },0,"private mount namespace");
+            assert_eq!(unsafe { libc::mount(std::ptr::null(),c"/".as_ptr(),std::ptr::null(),
+                libc::MS_REC|libc::MS_PRIVATE,std::ptr::null()) },0,"private propagation");
+            // Root-owned stage with the fixed mount point, as the root tmpfs in build_root.
+            let stage=root.join("ephemeral");
+            mount_fixture_tmpfs(&cpath(&stage),c"size=1048576,nr_inodes=64,mode=0755");
+            for name in ["work","input"] {
+                std::fs::create_dir(stage.join(name)).unwrap();
+                std::fs::set_permissions(stage.join(name),Permissions::from_mode(0o755)).unwrap();
+            }
+            // The employee input: a detached clone of a tmpfs whose root is employee-owned, 0700.
+            let options=CString::new(format!("size=1048576,nr_inodes=64,mode=0700,uid={EMPLOYEE},gid={EMPLOYEE}")).unwrap();
+            mount_fixture_tmpfs(&cpath(&stage.join("input")),&options);
+            let attrs=2|4;
+            let input=detached(&stage.join("input"),attrs);
+            let before=fd::observe(input.fd.as_raw_fd()).unwrap();
+            assert_eq!(before.kind,duduclaw_run::validation::FileKind::Directory);
+            assert!(before.uid==EMPLOYEE && before.mode&0o7777==0o700 && before.identity.mount!=0,
+                "employee-owned 0700 detached mount root");
+            let expected=input.expected_mount_id;
+            assert_eq!(before.identity.mount,expected);
+            let stage_fd=open_dir(&stage);
+            reduce_to_run_unit_capabilities();
+            assert_eq!(mounts::attach_input(input,stage_fd.as_raw_fd(),c"work",attrs),Ok(expected),
+                "production attach_input without DAC capabilities");
+            // Precondition: the pre-R7f O_RDONLY readback of the same object is EACCES here.
+            let raw=unsafe { libc::openat(stage_fd.as_raw_fd(),c"work".as_ptr(),
+                libc::O_RDONLY|libc::O_DIRECTORY|libc::O_CLOEXEC) };
+            let refused=errno();
+            if raw>=0 { unsafe { libc::close(raw); } }
+            assert_eq!(raw,-1,"O_RDONLY must be refused without DAC capabilities");
+            assert_eq!(refused,libc::EACCES);
+            // The O_PATH readback: same mount, owner and inode as before the move.
+            let work=unsafe { libc::openat(stage_fd.as_raw_fd(),c"work".as_ptr(),
+                libc::O_PATH|libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC) };
+            assert!(work>=0,"O_PATH readback needs no permission on the directory");
+            let work=unsafe { OwnedFd::from_raw_fd(work) };
+            let after=fd::observe(work.as_raw_fd()).unwrap();
+            assert_eq!(after.identity.mount,expected);
+            assert_eq!(after.uid,EMPLOYEE);
+            assert_eq!(after.identity.inode,before.identity.inode);
+        });
+        child.success();
+    }
     pub fn runtime_mode() { launch::runtime_mode(); }
     pub fn helper_mode() { helpers::helper_mode(); }
     pub fn run() {
@@ -489,6 +584,7 @@ mod linux {
             "d8"=>d8(root),"gateway"=>gateway(root),"metadata"=>metadata(root),
             "ptrace"=>ptrace(root),"fds"=>fds(),"mounts"=>mount_tree(root),
             "propagation"=>crate::propagation::run(root),
+            "attach-input-no-dac"=>attach_input_without_dac(root),
             "launch-elf"|"launch-script"|"launch-pty"|"launch-exec-failure"|
             "launch-forwarder-failure"|"launch-cancel"|"launch-cancel-startup"|"launch-teardown"|
             "launch-supervisor-failure"|"launch-fast-exit"=>launch::run(root,&scenario),
