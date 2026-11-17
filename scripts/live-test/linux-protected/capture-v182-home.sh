@@ -2,11 +2,17 @@
 # Reviewer-only smoke fixture; no compilation or downloads are performed here.
 # Usage: DUDUCLAW_V182_BIN=/verified/v182/duduclaw CAPTURE_BIN=/built/capture \
 #   bash capture-v182-home.sh > /outside/home/report.json
+PATH=/usr/bin:/bin
+export PATH
 set -euo pipefail
 [ "$#" -eq 0 ] || { echo '此腳本不接受既有 home；只建立拋棄式 fixture。' >&2; exit 2; }
 [ "$(uname -s)" = Linux ] || { echo '請在拋棄式 Linux VM 執行。' >&2; exit 2; }
 : "${DUDUCLAW_V182_BIN:?請設定已驗證官方簽章的 v1.82.x 執行檔}"
 : "${CAPTURE_BIN:?請設定已建置的 duduclaw-capture-legacy-schemas}"
+case "$CAPTURE_BIN" in /*) ;; *) echo 'CAPTURE_BIN 必須為絕對路徑。' >&2; exit 2 ;; esac
+[ -f "$CAPTURE_BIN" ] && [ -x "$CAPTURE_BIN" ] && [ ! -L "$CAPTURE_BIN" ] || {
+  echo 'CAPTURE_BIN 必須為非符號連結的一般可執行檔。' >&2; exit 2;
+}
 case "$DUDUCLAW_V182_BIN" in /*) ;; *) echo '執行檔必須為絕對路徑。' >&2; exit 2 ;; esac
 case "$("$DUDUCLAW_V182_BIN" --version)" in 'duduclaw 1.82.0') ;; *) echo 'fixture 建立版本必須為 v1.82.0。' >&2; exit 2 ;; esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"

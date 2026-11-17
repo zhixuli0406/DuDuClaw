@@ -54,9 +54,9 @@ with the exact reviewed `channel_settings` extension); the closest catalog is us
 only to describe a refusal, never to accept. An unknown schema exits as a schema
 rejection, and the worker writes a bounded report to stderr naming the closest
 version and the differing objects (missing/unexpected/changed table, index, view or
-trigger, and catalog columns absent from a changed table). The report never contains
-SQL text or row content; unexpected names that are not plain identifiers are shown
-as `<unprintable name>`. Mappings: v1.80 sessions also skip unpublished replies
+trigger (unknown names appear only as ordinals and SHA-256 prefixes), and catalog columns absent from a changed table). The report never contains
+SQL text, row content or unexpected source names; unknown names are represented
+only by a stable ordinal and the first 16 hex characters of their SHA-256. Mappings: v1.80 sessions also skip unpublished replies
 (`delivery_pending`); tasks exclude A2A-owned goals in both versions (owner
 column/registry in v1.80, `created_via='a2a'` or an `a2a:` creator in both, inherited
 by child tasks); cron actor columns (`on_behalf_of`, and v1.80 `created_by_user_id`
@@ -215,14 +215,31 @@ untrusted SQL from an operator report into a catalog.
 
 ### Report and refusal contract
 
+Both capture wrappers fix `PATH` to `/usr/bin:/bin` and require `CAPTURE_BIN`
+to be an absolute path to a regular executable file that is not a symlink.
+
 The separate operator binary is `duduclaw-capture-legacy-schemas`; the existing
 sandboxed `duduclaw-import` fd worker keeps its default invocation. The new
 binary takes `<home> --created-with <v1.80.0|v1.80.1|v1.81.0|v1.82.0>`.
 It is supported on native Linux; Unix library tests also exercise file safety.
-It creates no files in the supplied home. All home path components and store
+It creates no files in the supplied home. The home itself and store/sidecar
 opens use no-follow directory descriptors; source files must open read-only,
-be regular and at most 256 MiB. SQLite opens only a private temporary copy,
-using `mode=ro&immutable=1`; the normal importer heap, schema-row, SQL-length,
+be regular, have exactly one hard link and be at most 256 MiB.
+Run as root or as the home's owner: Linux requires `O_NOATIME` for source and
+sidecar opens; an `EPERM` refusal produces `refused_noatime`, with no retry that
+could update access times. Linux copies bytes only into an anonymous memfd,
+then applies `F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE|F_SEAL_SEAL`. SQLite opens
+`/proc/self/fd/<n>` read-only with `mode=ro&immutable=1`; a capture-only VFS
+preserves this generated path instead of resolving the procfs magic link, and
+provides only sealed read-only descriptor I/O (no file creation, WAL or mmap).
+No named copy is created on Linux, including on failures or process termination.
+The non-Linux Unix development/test fallback ignores `TMPDIR`: it creates a
+0700 directory under the fixed, verified root-owned `/tmp` (canonicalized on
+macOS), verifies that the private directory and the captured home do not overlap
+in either direction, and creates `source.db` with 0600 and `O_EXCL|O_NOFOLLOW`.
+RAII removes that directory on success and error returns (unlike memfd, a forced
+process termination can leave this development-only named fallback behind).
+The normal importer heap, schema-row, SQL-length,
 column and query-time limits apply. Workflow keeps the existing reviewed
 expression-depth exception. The capture queries only schema and pragma metadata.
 It does not run quick_check or read application/FTS data rows.
@@ -233,22 +250,32 @@ silently omit pending schema changes. SHM, even though unused, must be a bounded
 regular non-symlink file. A WAL-bearing customer home is not repaired by this
 tool: arrange a normal clean shutdown under the operator's existing procedure,
 or investigate it separately. Never delete sidecars to force a capture.
-The file is checked for size/time changes during copying, but this is not a
-live snapshot protocol; writers must stay stopped throughout capture.
+Before and after copying, capture compares the store's device/inode, size,
+mtime and ctime (seconds and nanoseconds), link count, all three sidecars'
+existence and identities, and the parent directory's device/inode (including
+reopening the home to detect replacement). Sidecars with multiple links refuse.
+This is not a live snapshot protocol; writers must stay stopped throughout capture.
 
 One deterministic UTF-8 JSON object is written to stdout, at most 128 KiB,
 with stable path/placeholder ordering and no timestamps or absolute host paths:
 
 - Top-level: `format_version` (1), `source_version` (matrix endpoint v1.82.x,
   an operator assertion, not an inferred binary version), `migration_target`,
-  `creating_version`, `release_matrix_verified` (false), `stores`, `pending_captures`.
+  `creating_version`, `release_matrix_verified` (false), `stores`, `pending_captures`,
+  `private_copy` (`sealed_memfd` on Linux, `private_0700_directory_0600_file` on
+  other Unix development/test platforms).
 - Per store: `path`, `status`, `user_version`, `application_id`, `schema_sha256`,
   `catalog`, `exact_catalog`, `expected_candidate`, `differences`, `omitted_differences`.
 - Fingerprint: lowercase SHA-256 of compact serde_json serialization of the
   complete ordered `(type,name,tbl_name,sql)` schema tuples (including null SQL
   for SQLite autoindexes), using the existing schema query's stable ordering.
-  SQL and rows themselves are never emitted. Untrusted identifiers are bounded
-  plain ASCII identifiers or `<unprintable name>`. At most 16 differences appear.
+  SQL and rows themselves are never emitted. At most 16 differences appear.
+  An unknown source object is represented only as `unexpected <kind>
+  ordinal=<n> name_sha256=<hex>`: kind is a fixed table/index/trigger/view label,
+  ordinal is one-based among unknown objects sorted by kind/name, and hex is
+  the first 16 lowercase hex characters of SHA-256 of the exact UTF-8 name.
+  Source names are never emitted. Missing and changed entries use trusted
+  catalog names; changed entries require an exact kind/name catalog match.
 - Catalog id: trusted relative filename, label, zero-based catalog ordinal and
   optional `:channel_settings`; ordinal distinguishes same-label fresh/upgraded
   shapes. `exact_catalog=false` means closest-only diagnostics, never acceptance.
@@ -256,7 +283,9 @@ with stable path/placeholder ordering and no timestamps or absolute host paths:
   candidate exactly including pragmas. `catalog_only_not_v182_expected` records
   an old exact catalog without a v182 candidate; `unrecognised` records drift.
   `refused_*` records unsafe opens, sidecars, limits, malformed SQLite or changes
-  during copy. Failure values never echo filesystem/SQLite error details.
+  during copy. `refused_hardlink` records any store/sidecar link count other
+  than one; `refused_noatime` records Linux `O_NOATIME` permission refusal.
+  Failure values never echo filesystem/SQLite error details.
 
 Exit 0 means inventory completed with only absent stores/code candidates;
 it **does not** approve migration or prove every feature store was initialized.

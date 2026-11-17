@@ -6,8 +6,7 @@
 //! pinned catalog; the matching version then selects that version's own column
 //! mapping. There is no "close enough": the closest catalog is used solely to
 //! name the differences in the refusal report. Names in the report come from
-//! the trusted catalogs, except unexpected object names, which are shown only
-//! when they are short plain identifiers. No SQL text or row content is ever
+//! the trusted catalogs; unexpected names are represented only by a digest. No SQL text or row content is ever
 //! part of a report.
 use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fmt};
 use rusqlite::Connection;
@@ -152,7 +151,7 @@ pub enum Difference {
     /// An object of the catalog is absent from the source.
     Missing { object: String, name: String },
     /// The source has an object the catalog does not have.
-    Unexpected { object: String, name: String },
+    Unexpected { object: String, ordinal: usize, name_sha256: String },
     /// Same object, different definition. `missing_columns` lists catalog
     /// columns whose name does not occur in the source definition.
     Changed { object: String, name: String, missing_columns: Vec<String> },
@@ -161,7 +160,7 @@ impl fmt::Display for Difference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing { object, name } => write!(f, "missing {object} {name}"),
-            Self::Unexpected { object, name } => write!(f, "unexpected {object} {name}"),
+            Self::Unexpected { object, ordinal, name_sha256 } => write!(f, "unexpected {object} ordinal={ordinal} name_sha256={name_sha256}"),
             Self::Changed { object, name, missing_columns } if missing_columns.is_empty() => write!(f, "changed {object} {name}"),
             Self::Changed { object, name, missing_columns } => write!(f, "changed {object} {name} (missing column {})", missing_columns.join(", ")),
         }
@@ -249,12 +248,13 @@ pub(crate) fn detect(conn: &Connection, store: Store, extension: Option<&str>) -
 #[path = "catalog_tests.rs"]
 mod tests;
 
-fn printable(value: &str) -> String {
-    if !value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        value.to_owned()
-    } else {
-        "<unprintable name>".to_owned()
-    }
+/// Only a fixed kind label and an irreversible name digest may leave the source.
+pub(crate) fn name_digest(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(value.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+fn printable_kind(value: &str) -> &'static str {
+    match value { "table" => "table", "index" => "index", "trigger" => "trigger", "view" => "view", _ => "unknown" }
 }
 
 /// Identifier-like tokens of a definition. Used only to test whether a
@@ -287,9 +287,11 @@ pub(crate) fn differences(actual: &[SchemaRow], expected: &[SchemaRow], expected
             Some(_) => {}
         }
     }
+    let mut ordinal = 0;
     for &(kind, name) in actual_index.keys() {
         if !expected_index.contains_key(&(kind, name)) {
-            result.push(Difference::Unexpected { object: printable(kind), name: printable(name) });
+            ordinal += 1;
+            result.push(Difference::Unexpected { object: printable_kind(kind).into(), ordinal, name_sha256: name_digest(name) });
         }
     }
     Ok(result)

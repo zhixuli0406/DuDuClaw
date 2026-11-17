@@ -165,6 +165,139 @@ mod filesystem {
         }
     }
     #[test]
+    fn capture_refuses_hardlinked_store_and_sidecar() {
+        let home = home(); seed(home.path(), catalog::TASKS_V182);
+        let alias = home.path().join("alias");
+        fs::hard_link(home.path().join("tasks.db"), &alias).unwrap();
+        assert_eq!(task(&capture(home.path(), "v1.82.0").unwrap()).status, "refused_hardlink");
+        fs::remove_file(&alias).unwrap();
+        let sidecar = home.path().join("tasks.db-shm");
+        fs::write(&sidecar, []).unwrap();
+        fs::hard_link(&sidecar, alias).unwrap();
+        assert_eq!(task(&capture(home.path(), "v1.82.0").unwrap()).status, "refused_hardlink");
+    }
+    #[test]
+    fn capture_detects_ctime_sidecar_and_parent_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        for change in ["ctime", "sidecar_add", "sidecar_remove", "sidecar_replace", "store_replace", "parent"] {
+            let parent = home();
+            let path = parent.path().join("home"); fs::create_dir(&path).unwrap();
+            seed(&path, catalog::TASKS_V182);
+            if matches!(change, "sidecar_remove" | "sidecar_replace") { fs::write(path.join("tasks.db-shm"), []).unwrap(); }
+            let report = capture_with_hook(&path, "v1.82.0", |store| {
+                if store != Store::Tasks { return; }
+                match change {
+                    "ctime" => {
+                        let main = path.join("tasks.db");
+                        let before = identity(&fs::metadata(&main).unwrap());
+                        fs::set_permissions(&main, fs::Permissions::from_mode(0o400)).unwrap();
+                        let after = identity(&fs::metadata(main).unwrap());
+                        assert_eq!((before.size, before.mtime, before.mtime_ns), (after.size, after.mtime, after.mtime_ns));
+                        assert_ne!((before.ctime, before.ctime_ns), (after.ctime, after.ctime_ns));
+                    },
+                    "sidecar_add" => fs::write(path.join("tasks.db-shm"), []).unwrap(),
+                    "sidecar_remove" => fs::remove_file(path.join("tasks.db-shm")).unwrap(),
+                    "sidecar_replace" => {
+                        fs::rename(path.join("tasks.db-shm"), path.join("old-shm")).unwrap();
+                        fs::write(path.join("tasks.db-shm"), []).unwrap();
+                    },
+                    "store_replace" => {
+                        fs::rename(path.join("tasks.db"), path.join("old-db")).unwrap();
+                        fs::copy(path.join("old-db"), path.join("tasks.db")).unwrap();
+                    },
+                    "parent" => {
+                        fs::rename(&path, parent.path().join("old-home")).unwrap();
+                        fs::create_dir(&path).unwrap();
+                    },
+                    _ => unreachable!(),
+                }
+            }).unwrap();
+            assert_eq!(task(&report).status, "refused_sqlite_or_changed", "{change}");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_noatime_errno_maps_to_distinct_refusal() {
+        assert_eq!(open_refusal(rustix::io::Errno::PERM), "refused_noatime");
+        assert_eq!(open_refusal(rustix::io::Errno::ACCESS), "refused_open");
+        assert!(source_flags().contains(rustix::fs::OFlags::NOATIME));
+    }
+    #[test]
+    fn capture_private_copy_ignores_tmpdir_and_cleans_up() {
+        // Run this test in a child so TMPDIR does not race other Rust tests.
+        const CHILD: &str = "DUDUCLAW_CAPTURE_COPY_TEST_HOME";
+        if let Some(path) = std::env::var_os(CHILD) {
+            use std::os::unix::fs::MetadataExt;
+            let path = std::path::PathBuf::from(path);
+            assert_eq!(std::env::var_os("TMPDIR").unwrap().as_os_str(), path.as_os_str());
+            let listing = |dir: &Path| {
+                let mut names = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>();
+                names.sort(); names
+            };
+            let before = listing(&path);
+            #[cfg(target_os = "linux")]
+            let temp_listings = [std::path::PathBuf::from("/tmp"), std::path::PathBuf::from("/var/tmp")]
+                .into_iter().filter(|p| p.is_dir()).map(|dir| {
+                    // Ignore unrelated concurrent system activity; capture's
+                    // fixed-prefix artifacts must never appear in trusted roots.
+                    let names = listing(&dir).into_iter().filter(|n| n.to_string_lossy().starts_with("duduclaw-capture-")).collect::<Vec<_>>();
+                    (dir, names)
+                }).collect::<Vec<_>>();
+            let file = fs::File::open(path.join("tasks.db")).unwrap();
+            let copy = PrivateCopy::new(&file, &path).unwrap();
+            assert_eq!(listing(&path), before);
+            #[cfg(target_os = "linux")]
+            {
+                use rustix::fs::{SealFlags, fcntl_get_seals};
+                assert_eq!(copy.file.metadata().unwrap().nlink(), 0);
+                let required = SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE | SealFlags::SEAL;
+                assert!(fcntl_get_seals(&copy.file).unwrap().contains(required));
+                assert!(copy.file.set_len(0).is_err());
+                assert!(std::os::unix::fs::FileExt::write_at(&copy.file, b"x", 0).is_err());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let home = fs::canonicalize(&path).unwrap();
+                let dir = copy.directory.path();
+                assert!(!dir.starts_with(&home) && !home.starts_with(dir));
+                assert_eq!(fs::metadata(dir).unwrap().mode() & 0o777, 0o700);
+                assert_eq!(fs::metadata(copy.path()).unwrap().mode() & 0o777, 0o600);
+                assert_eq!(dir.parent().unwrap(), fs::canonicalize("/tmp").unwrap());
+            }
+            let conn = copy.open().unwrap();
+            assert!(inspect(&conn, Store::Tasks).unwrap().exact_catalog);
+            assert!(conn.execute_batch("CREATE TABLE denied(x);").is_err());
+            copy.close(conn).unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(copy.copied_bytes, file.metadata().unwrap().len());
+                assert!(memfd::verify(&copy.file, copy.copied_bytes + 1).is_err());
+                let unsealed = fs::File::open(path.join("tasks.db")).unwrap();
+                assert!(memfd::verify(&unsealed, copy.copied_bytes).is_err());
+                copy.verify().unwrap();
+            }
+            let copy_path = copy.path();
+            drop(copy);
+            assert!(!copy_path.exists());
+            assert_eq!(listing(&path), before);
+            let report = capture_with_hook(&path, "v1.82.0", |_| {
+                assert_eq!(listing(&path), before, "no copy may appear in TMPDIR/home even during capture");
+                #[cfg(target_os = "linux")]
+                for (dir, names) in &temp_listings {
+                    assert_eq!(&listing(dir).into_iter().filter(|n| n.to_string_lossy().starts_with("duduclaw-capture-")).collect::<Vec<_>>(), names);
+                }
+            }).unwrap();
+            assert_eq!(report.private_copy, COPY_MECHANISM);
+            assert_eq!(listing(&path), before);
+            return;
+        }
+        let home = home(); seed(home.path(), catalog::TASKS_V182);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("{}::capture_private_copy_ignores_tmpdir_and_cleans_up", module_path!().split_once("::").unwrap().1), "--nocapture"])
+            .env(CHILD, home.path()).env("TMPDIR", home.path()).status().unwrap();
+        assert!(status.success());
+    }
+    #[test]
     fn capture_missing_stores_and_excluded_creating_version() {
         let home = home();
         let report = capture(home.path(), "v1.80.0").unwrap();
@@ -181,6 +314,31 @@ fn capture_report_size_limit_refuses_instead_of_truncating_json() {
     store.differences.push("x".repeat(MAX_REPORT_BYTES));
     let report = Report { format_version: 1, source_version: expected::SOURCE,
         migration_target: expected::TARGET, creating_version: "v1.82.0".into(),
-        release_matrix_verified: false, stores: vec![store], pending_captures: Vec::new() };
+        release_matrix_verified: false, stores: vec![store], pending_captures: Vec::new(), private_copy: COPY_MECHANISM };
     assert_eq!(report.encode(), Err(Error::Limit));
+}
+
+#[test]
+fn capture_unknown_names_are_digest_only_and_deterministic() {
+    let conn = database(catalog::TASKS_V182);
+    let names = ["AWS_SECRET_distinct_token_482", "private_index_629", "private_trigger_739", "private_view_841"];
+    conn.execute_batch("CREATE TABLE AWS_SECRET_distinct_token_482(x TEXT);
+        CREATE INDEX private_index_629 ON AWS_SECRET_distinct_token_482(x);
+        CREATE TRIGGER private_trigger_739 AFTER INSERT ON AWS_SECRET_distinct_token_482 BEGIN SELECT 1; END;
+        CREATE VIEW private_view_841 AS SELECT x FROM AWS_SECRET_distinct_token_482;").unwrap();
+    let first = inspect(&conn, Store::Tasks).unwrap();
+    let text = serde_json::to_string(&first).unwrap();
+    assert_eq!(text, serde_json::to_string(&inspect(&conn, Store::Tasks).unwrap()).unwrap());
+    for name in names {
+        assert!(!text.contains(name));
+        assert!(text.contains(&catalog::name_digest(name)));
+    }
+    for (ordinal, kind) in ["index", "table", "trigger", "view"].iter().enumerate() {
+        assert!(text.contains(&format!("unexpected {kind} ordinal={} name_sha256=", ordinal + 1)));
+    }
+    assert_eq!(catalog::name_digest("abc"), "ba7816bf8f01cfea");
+    conn.execute_batch("ALTER TABLE tasks ADD COLUMN private_definition_984 TEXT;").unwrap();
+    let changed = serde_json::to_string(&inspect(&conn, Store::Tasks).unwrap()).unwrap();
+    assert!(changed.contains("changed table tasks"));
+    assert!(!changed.contains("private_definition_984"));
 }

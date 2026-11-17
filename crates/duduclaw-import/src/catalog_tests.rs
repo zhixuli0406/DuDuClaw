@@ -292,7 +292,7 @@ fn rm173_import_refuses_v181_sessions_with_planted_objects() {
     let file = store(SESSION_V181, "CREATE INDEX planted_idx ON sessions(user_cleared_at);");
     assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, Vec::new()), Err(Error::Schema));
     assert_eq!(take_schema_refusal().expect("refusal report").differences,
-        vec![Difference::Unexpected { object: "index".into(), name: "planted_idx".into() }]);
+        vec![Difference::Unexpected { object: "index".into(), ordinal: 1, name_sha256: name_digest("planted_idx") }]);
     // Half-upgraded: v1.80.x plus only one RM-173 column (and no marker table) is neither catalog.
     let file = store(SESSION_V180, "ALTER TABLE sessions ADD COLUMN user_cleared_at TEXT;");
     assert_eq!(import(&request(SourceKind::SessionsSqlite, "sessions.db"), source(&file), None, Vec::new()), Err(Error::Schema));
@@ -306,7 +306,12 @@ fn import_refuses_tasks_store_with_extra_unknown_table() {
         assert_eq!(extract(&request(SourceKind::AuthorityTasksSqlite, "tasks.db"), source(&file), None).err(), Some(Error::Schema));
         let message = take_schema_refusal().expect("refusal report").to_string();
         assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.82)"), "{message}");
-        assert!(message.contains("unexpected table planted_markers"), "{message}");
+        assert!(message.contains("closest (v1.80.x)"), "{message}");
+        assert!(message.contains("unexpected table ordinal=1 name_sha256="), "{message}");
+        let digest = message.split("unexpected table ordinal=1 name_sha256=").nth(1).unwrap().split_whitespace().next().unwrap();
+        assert_eq!(digest.len(), 16, "{message}");
+        assert!(digest.chars().all(|character| character.is_ascii_hexdigit()), "{message}");
+        assert!(!message.contains("planted_markers"), "{message}");
     }
 }
 
@@ -361,13 +366,13 @@ fn import_refuses_unknown_schema_with_diff() {
     assert!(take_schema_refusal().is_none(), "taking the report clears it");
 
     // Half-upgraded tasks store plus planted objects: closest is v1.79.3. The
-    // report names objects but never their SQL, and hides non-identifier names.
+    // report hides all unexpected names and their SQL.
     let file = store(TASKS_V1793, "ALTER TABLE tasks ADD COLUMN a2a_owner TEXT;
         CREATE TABLE \"SECRET-CANARY\"(token TEXT);
         CREATE TRIGGER planted AFTER INSERT ON tasks BEGIN SELECT 'SECRET-BODY'; END;");
     assert_eq!(extract(&request(SourceKind::AuthorityTasksSqlite, "tasks.db"), source(&file), None).err(), Some(Error::Schema));
     let message = take_schema_refusal().expect("refusal report").to_string();
-    for expected in ["tasks.db", "closest (v1.79.3)", "changed table tasks", "unexpected trigger planted", "unexpected table <unprintable name>"] {
+    for expected in ["tasks.db", "closest (v1.79.3)", "changed table tasks", "unexpected trigger ordinal=2 name_sha256=", "unexpected table ordinal=1 name_sha256="] {
         assert!(message.contains(expected), "{message}");
     }
     assert!(!message.contains("SECRET"), "{message}");
@@ -381,7 +386,7 @@ fn import_refuses_unknown_schema_with_diff() {
     assert!(out.is_empty());
     let refusal = take_schema_refusal().expect("refusal report");
     assert_eq!((refusal.store, refusal.closest), (Store::Sessions, SchemaVersion::V180));
-    assert_eq!(refusal.differences, vec![Difference::Unexpected { object: "index".into(), name: "planted_idx".into() }]);
+    assert_eq!(refusal.differences, vec![Difference::Unexpected { object: "index".into(), ordinal: 1, name_sha256: name_digest("planted_idx") }]);
     assert!(refusal.to_string().contains("sessions.db"));
 }
 

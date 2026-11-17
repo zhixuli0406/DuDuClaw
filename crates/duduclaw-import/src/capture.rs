@@ -5,6 +5,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use crate::{catalog::{self, Store}, expected, sqlite, Error, Result};
 
+#[cfg(target_os = "linux")]
+#[path = "capture_memfd.rs"]
+mod memfd;
+
 const MAX_REPORT_BYTES: usize = 128 * 1024;
 const MAX_DIFFERENCES: usize = 16;
 use crate::expected::STORES;
@@ -19,6 +23,7 @@ pub struct Report {
     pub release_matrix_verified: bool,
     pub stores: Vec<StoreReport>,
     pub pending_captures: Vec<String>,
+    pub private_copy: &'static str,
 }
 #[derive(Debug, Serialize)]
 pub struct StoreReport {
@@ -58,7 +63,12 @@ impl Report {
 /// The caller must stop all home writers first; nonempty WAL/journals refuse.
 #[cfg(unix)]
 pub fn capture(home: &Path, creating_version: &str) -> Result<Report> {
-    use std::{fs::File, io::Read, path::Component};
+    capture_with_hook(home, creating_version, |_| {})
+}
+
+#[cfg(unix)]
+fn capture_with_hook(home: &Path, creating_version: &str, after_copy: impl Fn(Store)) -> Result<Report> {
+    use std::{fs::File, path::Component};
     use rustix::fs::{open, openat, Mode, OFlags};
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     if home.components().any(|c| !matches!(c, Component::RootDir | Component::CurDir | Component::Normal(_))) {
@@ -75,7 +85,7 @@ pub fn capture(home: &Path, creating_version: &str) -> Result<Report> {
     if !expected::CREATING_VERSIONS.contains(&creating_version) { return Err(Error::InvalidRequest); }
     let mut report = Report { format_version: 1, source_version: expected::SOURCE,
         migration_target: expected::TARGET, creating_version: creating_version.to_owned(),
-        release_matrix_verified: false, stores: Vec::new(), pending_captures: Vec::new() };
+        release_matrix_verified: false, stores: Vec::new(), pending_captures: Vec::new(), private_copy: COPY_MECHANISM };
     // Each creating-version/store pair is deliberately unresolved until a
     // signed-release VM capture has been reviewed, even if code SQL matches.
     report.pending_captures = expected::release_captures().into_iter().map(|c| c.id).collect();
@@ -83,71 +93,61 @@ pub fn capture(home: &Path, creating_version: &str) -> Result<Report> {
     report.pending_captures.sort();
     for store in STORES {
         let mut entry = StoreReport::absent(store);
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        let flags = source_flags();
         let fd = match openat(&directory, store.file_name(), flags, Mode::empty()) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT) => { report.stores.push(entry); continue; },
-            Err(_) => { entry.status = "refused_open"; report.stores.push(entry); continue; },
+            Err(error) => { entry.status = open_refusal(error); report.stores.push(entry); continue; },
         };
-        let mut file = File::from(fd);
+        let file = File::from(fd);
         let metadata = file.metadata()?;
+        use std::os::unix::fs::MetadataExt;
         if !metadata.is_file() || metadata.len() > crate::MAX_SOURCE_BYTES {
             entry.status = "refused_file_or_limit"; report.stores.push(entry); continue;
         }
-        let sidecars_clean = || -> Result<bool> {
-            for suffix in ["-wal", "-shm", "-journal"] {
-                let name = format!("{}{suffix}", store.file_name());
-                match openat(&directory, name.as_str(), flags, Mode::empty()) {
-                    Ok(fd) => {
-                        let meta = File::from(fd).metadata()?;
-                        // SHM is not read, but must be a bounded regular file.
-                        if !meta.is_file() || meta.len() > crate::MAX_SOURCE_BYTES
-                            || (suffix != "-shm" && meta.len() != 0) { return Ok(false); }
-                    },
-                    Err(rustix::io::Errno::NOENT) => {},
-                    Err(_) => return Ok(false),
-                }
-            }
-            Ok(true)
-        };
-        if !sidecars_clean()? {
-            entry.status = "refused_sidecar"; report.stores.push(entry); continue;
+        if metadata.nlink() != 1 {
+            entry.status = "refused_hardlink"; report.stores.push(entry); continue;
         }
-        // Source is only ever a read-only descriptor. SQLite opens an immutable
-        // private copy, avoiding path re-open races and any home WAL/SHM writes.
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("source.db");
+        let before = match snapshot(home, &directory, store) {
+            Ok(state) if state.store == identity(&metadata) => state,
+            Ok(_) => { entry.status = "refused_sqlite_or_changed"; report.stores.push(entry); continue; },
+            Err(status) => { entry.status = status; report.stores.push(entry); continue; },
+        };
+        // SQLite never receives a descriptor/path into the customer's home.
         let result = (|| -> Result<StoreReport> {
-            sqlite::copy_bounded(file.by_ref(), &path)?;
-            if !sidecars_clean()? { return Err(Error::Io); }
-            use std::os::unix::fs::MetadataExt;
-            let after = file.metadata()?;
-            // Compare the same descriptor's identity and content timestamps at
-            // full filesystem precision, excluding access/metadata-only changes.
-            if metadata.dev() != after.dev() || metadata.ino() != after.ino()
-                || metadata.len() != after.len() || metadata.mtime() != after.mtime()
-                || metadata.mtime_nsec() != after.mtime_nsec() { return Err(Error::Io); }
-            let mut conn = Connection::open_with_flags(immutable_uri(&path),
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-            sqlite::harden(&mut conn)?;
-            // Match the existing authority readers: the task authority trigger
-            // covers more than 32 fields; workflow also needs this fixed bound.
-            if matches!(store, Store::Tasks | Store::Workflow) {
-                conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128)?;
-            }
-            conn.authorizer(Some(|c: AuthContext<'_>| {
-                if c.accessor.is_some() { return Authorization::Deny; }
-                match c.action {
-                    AuthAction::Select => Authorization::Allow,
-                    AuthAction::Pragma { pragma_name: "user_version" | "application_id", pragma_value: None } => Authorization::Allow,
-                    AuthAction::Read { table_name: "sqlite_schema" | "sqlite_master", column_name: "type" | "name" | "tbl_name" | "sql" }
-                        if c.database_name == Some("main") => Authorization::Allow,
-                    AuthAction::Function { function_name }
-                        if ["date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"].iter().any(|n| function_name.eq_ignore_ascii_case(n)) => Authorization::Allow,
-                    _ => Authorization::Deny,
+            let copy = PrivateCopy::new(&file, home)?;
+            after_copy(store);
+            if snapshot(home, &directory, store).ok().as_ref() != Some(&before)
+                || identity(&file.metadata()?) != before.store { return Err(Error::Io); }
+            let mut conn = copy.open()?;
+            let inspected = (|| -> Result<StoreReport> {
+                conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
+                sqlite::harden(&mut conn)?;
+                // Match the existing authority readers: the task authority trigger
+                // covers more than 32 fields; workflow also needs this fixed bound.
+                if matches!(store, Store::Tasks | Store::Workflow) {
+                    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128)?;
                 }
-            }))?;
-            inspect(&conn, store)
+                conn.authorizer(Some(|c: AuthContext<'_>| {
+                    if c.accessor.is_some() { return Authorization::Deny; }
+                    match c.action {
+                        AuthAction::Select => Authorization::Allow,
+                        AuthAction::Pragma { pragma_name: "user_version" | "application_id", pragma_value: None } => Authorization::Allow,
+                        AuthAction::Read { table_name: "sqlite_schema" | "sqlite_master", column_name: "type" | "name" | "tbl_name" | "sql" }
+                            if c.database_name == Some("main") => Authorization::Allow,
+                        AuthAction::Function { function_name }
+                            if ["date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"].iter().any(|n| function_name.eq_ignore_ascii_case(n)) => Authorization::Allow,
+                        _ => Authorization::Deny,
+                    }
+                }))?;
+                inspect(&conn, store)
+            })();
+            // Close and recheck the held descriptor even when inspection failed.
+            copy.close(conn)?;
+            let found = inspected?;
+            if snapshot(home, &directory, store).ok().as_ref() != Some(&before)
+                || identity(&file.metadata()?) != before.store { return Err(Error::Io); }
+            Ok(found)
         })();
         entry = match result {
             Ok(found) => found,
@@ -161,6 +161,138 @@ pub fn capture(home: &Path, creating_version: &str) -> Result<Report> {
 }
 #[cfg(not(unix))]
 pub fn capture(_home: &Path, _creating_version: &str) -> Result<Report> { Err(Error::Isolation) }
+
+#[cfg(target_os = "linux")]
+const COPY_MECHANISM: &str = "sealed_memfd";
+#[cfg(not(target_os = "linux"))]
+const COPY_MECHANISM: &str = "private_0700_directory_0600_file";
+
+#[cfg(unix)]
+fn source_flags() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    #[cfg(target_os = "linux")]
+    let flags = flags | OFlags::NOATIME;
+    flags
+}
+#[cfg(unix)]
+fn open_refusal(error: rustix::io::Errno) -> &'static str {
+    #[cfg(target_os = "linux")]
+    if error == rustix::io::Errno::PERM { return "refused_noatime"; }
+    let _ = error;
+    "refused_open"
+}
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct Identity { dev: u64, ino: u64, size: u64, mtime: i64, mtime_ns: i64, ctime: i64, ctime_ns: i64, nlink: u64 }
+#[cfg(unix)]
+fn identity(meta: &std::fs::Metadata) -> Identity {
+    use std::os::unix::fs::MetadataExt;
+    Identity { dev: meta.dev(), ino: meta.ino(), size: meta.len(), mtime: meta.mtime(),
+        mtime_ns: meta.mtime_nsec(), ctime: meta.ctime(), ctime_ns: meta.ctime_nsec(), nlink: meta.nlink() }
+}
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct Snapshot { parent: (u64, u64), store: Identity, sidecars: Vec<Option<Identity>> }
+#[cfg(unix)]
+fn snapshot(home: &Path, directory: &std::os::fd::OwnedFd, store: Store) -> std::result::Result<Snapshot, &'static str> {
+    use std::{fs::File, os::unix::fs::MetadataExt};
+    use rustix::fs::{open, openat, Mode, OFlags};
+    let parent = File::from(open(home, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty()).map_err(|_| "refused_sqlite_or_changed")?).metadata().map_err(|_| "refused_sqlite_or_changed")?;
+    let held = File::from(directory.try_clone().map_err(|_| "refused_sqlite_or_changed")?)
+        .metadata().map_err(|_| "refused_sqlite_or_changed")?;
+    if (parent.dev(), parent.ino()) != (held.dev(), held.ino()) { return Err("refused_sqlite_or_changed"); }
+    let read_meta = |name: &str| -> std::result::Result<Option<std::fs::Metadata>, &'static str> {
+        match openat(directory, name, source_flags(), Mode::empty()) {
+            Ok(fd) => Ok(Some(File::from(fd).metadata().map_err(|_| "refused_sidecar")?)),
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(error) => Err(if open_refusal(error) == "refused_noatime" { "refused_noatime" } else { "refused_sidecar" }),
+        }
+    };
+    let main = read_meta(store.file_name())?.ok_or("refused_sqlite_or_changed")?;
+    let mut sidecars = Vec::new();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let meta = read_meta(&format!("{}{suffix}", store.file_name()))?;
+        if let Some(meta) = &meta {
+            if meta.nlink() != 1 { return Err("refused_hardlink"); }
+            if !meta.is_file() || meta.len() > crate::MAX_SOURCE_BYTES
+                || (suffix != "-shm" && meta.len() != 0) { return Err("refused_sidecar"); }
+        }
+        sidecars.push(meta.as_ref().map(identity));
+    }
+    Ok(Snapshot { parent: (parent.dev(), parent.ino()), store: identity(&main), sidecars })
+}
+
+#[cfg(unix)]
+struct PrivateCopy {
+    #[cfg(target_os = "linux")]
+    file: std::fs::File,
+    #[cfg(target_os = "linux")]
+    copied_bytes: u64,
+    #[cfg(not(target_os = "linux"))]
+    directory: tempfile::TempDir,
+}
+#[cfg(unix)]
+impl PrivateCopy {
+    fn new(input: impl std::io::Read, _home: &Path) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let (file, copied_bytes) = memfd::copy(input)?;
+            Ok(Self { file, copied_bytes })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // Ignore TMPDIR. The shared fixed root must be root-owned and sticky
+            // if writable by other users. Request 0700 at directory creation.
+            let root = std::fs::canonicalize("/tmp")?;
+            let home = std::fs::canonicalize(_home)?;
+            let meta = std::fs::metadata(&root)?;
+            if meta.uid() != 0 || (meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0)
+                || root.starts_with(&home) { return Err(Error::Isolation); }
+            let directory = tempfile::Builder::new().prefix("duduclaw-capture-")
+                .permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in(&root)?;
+            let path = directory.path();
+            if path.starts_with(&home) || home.starts_with(path)
+                || std::fs::metadata(path)?.mode() & 0o777 != 0o700 { return Err(Error::Isolation); }
+            sqlite::copy_bounded(input, &path.join("source.db"))?;
+            Ok(Self { directory })
+        }
+    }
+    fn open(&self) -> Result<Connection> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        #[cfg(target_os = "linux")]
+        {
+            self.verify()?;
+            // Omit SQLITE_OPEN_NOFOLLOW only for our own procfs magic link:
+            // the owned, sealed anonymous fd cannot be replaced by an attacker.
+            // immutable=1 disables locks and all journal/WAL sidecar creation.
+            let uri = format!("file:{}?mode=ro&immutable=1", self.path().display());
+            Ok(Connection::open_with_flags(uri, flags)?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        { Ok(Connection::open_with_flags(immutable_uri(&self.path()), flags)?) }
+    }
+    fn verify(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        { memfd::verify(&self.file, self.copied_bytes)?; }
+        Ok(())
+    }
+    fn close(&self, conn: Connection) -> Result<()> {
+        // Drop even a connection returned by a failed close before checking the fd.
+        let closed = conn.close().map_err(|(_, error)| error);
+        self.verify()?;
+        closed?;
+        Ok(())
+    }
+    fn path(&self) -> std::path::PathBuf {
+        #[cfg(target_os = "linux")]
+        { use std::os::fd::AsRawFd; format!("/proc/self/fd/{}", self.file.as_raw_fd()).into() }
+        #[cfg(not(target_os = "linux"))]
+        { self.directory.path().join("source.db") }
+    }
+}
 
 #[cfg(unix)]
 fn immutable_uri(path: &Path) -> String {
@@ -188,6 +320,7 @@ fn inspect(conn: &Connection, store: Store) -> Result<StoreReport> {
         for extension in [false, true] {
             if extension && store != Store::Sessions { continue; }
             let expected = Connection::open_in_memory()?;
+            expected.execute_batch("PRAGMA temp_store=MEMORY;")?;
             expected.execute_batch(catalog.sql)?;
             if extension { expected.execute_batch(sqlite::CHANNEL_SETTINGS_SCHEMA)?; }
             let expected_rows = sqlite::schema(&expected)?;

@@ -11,7 +11,14 @@ const MAX_QUERY_SECONDS: u64 = 30;
 pub(crate) type SchemaRow = (String, String, String, Option<String>);
 
 pub(crate) fn copy_bounded(mut input: impl Read, path: &Path) -> Result<()> {
-    let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let mut output = options.open(path)?;
     let count = std::io::copy(&mut input.by_ref().take(MAX_SOURCE_BYTES + 1), &mut output)?;
     if count > MAX_SOURCE_BYTES { return Err(Error::Limit); }
     output.sync_all()?;
@@ -397,7 +404,7 @@ mod memory_tests {
         assert!(out.is_empty());
         let refusal=catalog::take_schema_refusal().expect("refusal report");
         assert_eq!((refusal.store,refusal.closest),(Store::Memory,SchemaVersion::V180));
-        assert_eq!(refusal.differences,vec![catalog::Difference::Unexpected{object:"index".into(),name:"planted_idx".into()}]);
+        assert_eq!(refusal.differences,vec![catalog::Difference::Unexpected{object:"index".into(),ordinal:1,name_sha256:catalog::name_digest("planted_idx")}]);
     }
     #[test]
     fn memory_import_rejects_planted_table_view_and_trigger() {
