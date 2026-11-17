@@ -158,6 +158,10 @@ pub(super) fn run(store: &Store, journal: Option<Journal>, generation: Option<&s
         marked
     };
     println!("正在回退尚未完成的隔離安裝……");
+    // Review round 6 item 1: a component object its producer created in an
+    // interrupted run gets the resume's confirmation attempt first (while its
+    // units are still loaded); unconfirmed, it stays `intent` and is kept below.
+    let mut ledger = boot::confirm_components_for_rollback(ledger)?;
     // Review round 4 item 1: the full process scan is part of the shared quiesce.
     stop_units(&ledger, &boot_id)?;
     // Review M3: runtime directories of an earlier boot, left to the system.
@@ -988,6 +992,50 @@ mod tests {
         assert_eq!(names(directory.path()), vec!["alias".to_owned(), "unit".to_owned()]);
         finish(&[], &[]).unwrap();
         assert!(finish(&[], &["/usr/lib/duduclaw"]).is_err());
+    }
+
+    /// Review round 6 item 1: the root key's ledger path answered from a real
+    /// file `root.key` in a temporary directory.
+    struct TempHost { dir: fs::File }
+    impl ledger::LedgerHost for TempHost {
+        fn save(&mut self, ledger: &Ledger) -> Result<()> { ledger.validate() }
+        fn present(&mut self, _: &str) -> Result<bool> { Ok(ledger::identity_at(&self.dir, c"root.key", Kind::File)?.is_some()) }
+        fn identity(&mut self, _: &str, kind: Kind) -> Result<Option<Identity>> { ledger::identity_at(&self.dir, c"root.key", kind) }
+        fn classify(&mut self, entry: &Entry) -> Result<Now> { ledger::classify_at(&self.dir, c"root.key", entry, &ledger::boot_id()?) }
+    }
+
+    #[test]
+    fn rollback_removes_a_component_confirmed_on_resume() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("root.key");
+        fs::write(&path, b"key").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let dir = fs::File::open(directory.path()).unwrap();
+        let boot_id = ledger::boot_id().unwrap();
+        let key = duduclaw_core::root_key::KEY_PATH;
+        let (generation, nonce) = ("cd".repeat(32), "5a".repeat(32));
+        // The run crashed after the launcher created the key, before its confirm.
+        let mut crashed = Ledger::new(&generation, &nonce);
+        crashed.entries.push(Entry { path: key.into(), kind: Kind::File, state: State::Intent, identity: None,
+            keep: Vec::new(), quarantine: None });
+        let host = TempHost { dir: dir.try_clone().unwrap() };
+        let mut recorder = ledger::Recorder::open(host, Some(crashed), &generation, &nonce).unwrap();
+        // Unconfirmed it matches nothing: kept and listed.
+        let unconfirmed = recorder.ledger().entry(key).unwrap().clone();
+        assert_eq!(remove_quarantined(&dir, c"root.key", &unconfirmed, &boot_id, me()).unwrap(), Removal::Kept(key.into()));
+        // The confirmation attempt fails (a producer check): still `intent`, still kept.
+        assert!(recorder.resume_component(key, |_, _, _| Ok(false)).is_err());
+        let still = recorder.ledger().entry(key).unwrap().clone();
+        assert_eq!((still.state, still.identity.is_none()), (State::Intent, true));
+        assert_eq!(remove_quarantined(&dir, c"root.key", &still, &boot_id, me()).unwrap(), Removal::Kept(key.into()));
+        assert!(path.exists());
+        // Confirmed (absence restored from the durable intent, the checks hold): removed by the ordinary rule.
+        recorder.resume_component(key, |_, identity, absent| Ok(absent && identity.mode & 0o7777 == 0o600)).unwrap();
+        let confirmed = recorder.ledger().entry(key).unwrap().clone();
+        assert_eq!((confirmed.state, confirmed.identity.is_some()), (State::Created, true));
+        assert_eq!(remove_quarantined(&dir, c"root.key", &confirmed, &boot_id, me()).unwrap(), Removal::Removed);
+        assert!(names(directory.path()).is_empty(), "removed, no quarantine left behind");
     }
 
     #[test]

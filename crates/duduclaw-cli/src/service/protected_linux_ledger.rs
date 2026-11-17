@@ -35,6 +35,12 @@
 //! object (never adopted). Otherwise the step refuses by path and the entry is
 //! left untouched. The ledger carries its transaction's nonce (the journal's)
 //! and is refused for any other transaction, even of the same generation.
+//!
+//! Review round 6 item 1: the one exception is the fixed allow-list of
+//! component objects ([`RESUMABLE_COMPONENTS`]), whose producer may have run
+//! in an interrupted run after the durable intent and before the confirm:
+//! [`Recorder::resume_component`] restores the proof of absence from the
+//! durable intent and accepts the object only through the producer checks.
 use super::*;
 use super::bootstrap::{self as boot, Store};
 use std::{ffi::{CStr, CString}, io::Read, os::{fd::RawFd, unix::ffi::OsStrExt}};
@@ -50,6 +56,12 @@ const MAX_HASHED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) const GATEWAY_DATA_PATH: &str = "/var/lib/duduclaw/.duduclaw";
 pub(super) const LEDGER_DAMAGED: &str = "隔離安裝的建立紀錄無法驗證（可能已損毀或被修改），已停止。請勿刪除它；請保留現況並聯絡原廠協助人工處理。";
 pub(super) const MOUNT_ID_UNAVAILABLE: &str = "此核心無法回報掛載識別碼（需要 Linux 5.8 以上的 statx STATX_MNT_ID），無法安全判斷要移除的物件，已停止。";
+/// Review round 6 item 1: the objects other components create (R1's updater
+/// state root, spawnd's runtime directory, the gateway's root key), confirmed
+/// only through [`Recorder::confirm_component`]; the ONLY paths
+/// [`Recorder::resume_component`] acts on.
+pub(super) const RESUMABLE_COMPONENTS: [(&str, Kind); 3] = [(duduclaw_updated::linux::STATE_ROOT, Kind::Tree),
+    (boot::SPAWND_RUNTIME, Kind::Tree), (duduclaw_core::root_key::KEY_PATH, Kind::File)];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -631,6 +643,15 @@ impl Recorder<LiveHost> {
         let existing = read(&store)?;
         Recorder::open(LiveHost { store }, existing, generation, nonce)
     }
+
+    /// Review round 6 item 1: a recorder over the ledger a rollback holds (read
+    /// from the protected root and bound to its transaction by the caller), so
+    /// a component entry can be confirmed before anything is removed.
+    pub(super) fn over_live(ledger: Ledger) -> Result<Self> {
+        let store = Store::open()?;
+        let (generation, nonce) = (ledger.generation.clone(), ledger.nonce.clone());
+        Recorder::open(LiveHost { store }, Some(ledger), &generation, &nonce)
+    }
 }
 
 /// Review H3: an existing object at a ledgered path the step would create again.
@@ -661,7 +682,8 @@ impl<H: LedgerHost> Recorder<H> {
     /// found nothing there, and that intent is durable — the proof of absence
     /// taken immediately before the producing action of the same step. False
     /// when the path held the recorded object (a re-run), was never intended
-    /// in this run, or the intent was not written.
+    /// in this run, or the intent was not written. Review round 6 item 1: also
+    /// true once [`Self::resume_component`] restored it from the durable intent.
     pub(super) fn absent_at_intent(&self, path: &str) -> bool { self.absent.iter().any(|absent| absent == path) }
 
     fn save(&mut self, next: Ledger) -> Result<()> {
@@ -675,6 +697,12 @@ impl<H: LedgerHost> Recorder<H> {
     /// Step 1 of the lifecycle, one durable write for all `items`. Review H3:
     /// an existing entry is re-intended only when its path holds nothing or
     /// exactly the recorded object; nothing is written when any item refuses.
+    ///
+    /// Review round 6 item 1, INVARIANT: this is the only writer of an entry
+    /// in `intent` WITHOUT an identity, and it writes one only after finding
+    /// nothing at the path (a new entry: `present` false; an existing entry
+    /// without an identity: `Now::Absent` — anything present refuses with
+    /// `never_adopted` before the write). See [`Self::resume_component`].
     pub(super) fn intend(&mut self, items: &[(&str, Kind)]) -> Result<()> {
         let mut next = self.ledger.clone();
         let mut absent: Vec<(&str, bool)> = Vec::new();
@@ -795,6 +823,44 @@ impl<H: LedgerHost> Recorder<H> {
             Some(entry) if entry.state == State::Created => Ok(()),
             _ => Err(component_unconfirmed(path)),
         }
+    }
+
+    /// Review round 6 item 1: the resume of a component object (ONLY the
+    /// fixed [`RESUMABLE_COMPONENTS`]; any other path refuses as damaged and
+    /// keeps `never_adopted` through [`Self::intend`]) whose producer ran in an
+    /// interrupted run after its durable intent but before
+    /// [`Self::confirm_component`]: the entry is `intent` without an identity
+    /// and an object is present now.
+    ///
+    /// Why the durable intent is the proof of absence: an `intent` entry
+    /// without an identity is written only by [`Self::intend`], and only after
+    /// it found nothing at the path (see the invariant there). No other writer
+    /// produces one: `confirm_proven` and `confirm_component` only record an
+    /// identity or move an entry WITH one back to `intent` (keeping it);
+    /// `rerecord_mode` needs an identity; `contents` records one; rollback
+    /// only adds quarantine records; [`Ledger::validate`] refuses `created`
+    /// without one. So the last durable intent of this transaction for the
+    /// path found it absent, and `absent_at_intent` is restored from it — no
+    /// persisted marker is needed (ledger schema unchanged).
+    ///
+    /// The object present now is accepted only through `accept` — the caller's
+    /// producer checks, given the ledger, the object's identity and the
+    /// restored absence — via [`Self::confirm_component`]: otherwise its
+    /// refusal (`component_unconfirmed`), nothing adopted, the entry stays
+    /// `intent`. Nothing to resume (no entry, an identity recorded, or nothing
+    /// present): `Ok`, nothing written.
+    pub(super) fn resume_component(&mut self, path: &str,
+        accept: impl FnOnce(&Ledger, &Identity, bool) -> Result<bool>) -> Result<()> {
+        let Some(&(_, kind)) = RESUMABLE_COMPONENTS.iter().find(|(component, _)| *component == path) else {
+            return Err(refused(LEDGER_DAMAGED));
+        };
+        let Some(entry) = self.ledger.entry(path) else { return Ok(()) };
+        if entry.kind != kind { return Err(refused(LEDGER_DAMAGED)); }
+        if entry.state != State::Intent || entry.identity.is_some() || !self.host.present(path)? { return Ok(()); }
+        self.absent.retain(|seen| seen != path);
+        self.absent.push(path.to_owned());
+        let (ledger, absent) = (self.ledger.clone(), self.absent_at_intent(path));
+        self.confirm_component(path, |identity| accept(&ledger, identity, absent))
     }
 
     /// Review L1: the installer re-applied the permission bits `mode` to a
@@ -1240,6 +1306,103 @@ mod tests {
         world.borrow_mut().put("/opt/duduclaw", identity(Kind::Directory, 71));
         recorder.intend(&[("/opt/duduclaw", Kind::Directory)]).unwrap();
         assert!(!recorder.absent_at_intent("/opt/duduclaw"));
+    }
+
+    /// Review round 6 item 1: the ledger a run left when it crashed after the
+    /// producer created `path` and before its confirm (`intent`, no identity),
+    /// opened by the resumed run (a new process: no in-memory proof of absence).
+    fn crashed_after_producer(world: &Rc<RefCell<World>>, path: &str, kind: Kind, object: Identity) -> Recorder<FakeHost> {
+        let mut crashed = open(world);
+        crashed.intend(&[(path, kind)]).unwrap();
+        world.borrow_mut().put(path, object);
+        let saved = crashed.ledger().clone();
+        let resumed = Recorder::open(FakeHost(world.clone()), Some(saved), &"cd".repeat(32), &nonce()).unwrap();
+        assert!(!resumed.absent_at_intent(path));
+        resumed
+    }
+
+    /// The statx facts of `identity`, born long before the crashed run's window.
+    fn early_facts(identity: &Identity, absent: bool, nlink: u64) -> super::super::bootstrap::ComponentFacts {
+        super::super::bootstrap::ComponentFacts { parent_mount: Some(identity.mount_id), absent_at_intent: absent,
+            creation: Some(Creation { device: identity.device, inode: identity.inode, nlink, btime: Some((1, 0)) }),
+            window: Some(Clocks { realtime: (2_000, 0), boottime: (100, 0) }),
+            now: Some(Clocks { realtime: (2_010, 0), boottime: (110, 0) }) }
+    }
+
+    fn component_resumes_only_through_the_producer_checks(path: &str, kind: Kind, object: Identity, nlink: u64) {
+        use super::super::bootstrap::{resumed_component_proven, root_key_proven, runtime_directory_proven, state_root_proven};
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = crashed_after_producer(&world, path, kind, object.clone());
+        // The general re-intent still refuses it (never adopted), nothing written.
+        let saves = world.borrow().saved.len();
+        assert!(recorder.intend(&[(path, kind)]).unwrap_err().to_string().contains(path));
+        assert_eq!(world.borrow().saved.len(), saves);
+        // The producer fact fails: the existing refusal, nothing adopted.
+        let error = recorder.resume_component(path, |_, identity, absent|
+            Ok(resumed_component_proven(path, identity, &early_facts(identity, absent, nlink), false))).unwrap_err().to_string();
+        assert!(error.contains(path), "{error}");
+        let entry = recorder.ledger().entry(path).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Intent, None));
+        // Another owner than the producer leaves: refused as well.
+        assert!(recorder.resume_component(path, |_, identity, absent| {
+            let foreign = Identity { uid: 1, ..identity.clone() };
+            Ok(resumed_component_proven(path, &foreign, &early_facts(&foreign, absent, nlink), true))
+        }).is_err());
+        assert_eq!(recorder.ledger().entry(path).unwrap().state, State::Intent);
+        // Every producer-specific fact holds: confirmed. The absence is restored
+        // from the durable intent; only the time comparison is skipped (the
+        // ordinary proof refuses the same facts against the crashed run's window).
+        recorder.resume_component(path, |_, identity, absent| {
+            assert!(absent, "restored from the durable intent");
+            let facts = early_facts(identity, absent, nlink);
+            let ordinary = if path == duduclaw_updated::linux::STATE_ROOT { state_root_proven(identity, &facts, true) }
+                else if kind == Kind::Tree { runtime_directory_proven(identity, &facts, true) }
+                else { root_key_proven(identity, &facts, true) };
+            assert!(!ordinary, "the birth time predates the old window");
+            Ok(resumed_component_proven(path, identity, &facts, true))
+        }).unwrap();
+        assert!(recorder.absent_at_intent(path));
+        let entry = recorder.ledger().entry(path).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Created, Some(object)));
+        // The step's own re-intent now finds the recorded object; nothing is left to resume.
+        recorder.intend(&[(path, kind)]).unwrap();
+        recorder.resume_component(path, |_, _, _| -> Result<bool> { panic!("nothing to resume") }).unwrap();
+    }
+
+    #[test]
+    fn interrupted_state_root_is_confirmed_on_resume_only_by_the_producer_checks() {
+        let state = Identity { mode: libc::S_IFDIR | 0o700, ..identity(Kind::Tree, 80) };
+        component_resumes_only_through_the_producer_checks(duduclaw_updated::linux::STATE_ROOT, Kind::Tree, state, 2);
+    }
+
+    #[test]
+    fn interrupted_runtime_directory_is_confirmed_on_resume_only_by_the_producer_checks() {
+        component_resumes_only_through_the_producer_checks(super::super::bootstrap::SPAWND_RUNTIME, Kind::Tree,
+            identity(Kind::Tree, 81), 2);
+    }
+
+    #[test]
+    fn interrupted_root_key_is_confirmed_on_resume_only_by_the_producer_checks() {
+        let key = Identity { mode: libc::S_IFREG | 0o600, ..identity(Kind::File, 82) };
+        component_resumes_only_through_the_producer_checks(duduclaw_core::root_key::KEY_PATH, Kind::File, key, 1);
+    }
+
+    #[test]
+    fn general_intent_without_identity_is_never_adopted_on_resume() {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut recorder = crashed_after_producer(&world, LAUNCHER, Kind::File, identity(Kind::File, 90));
+        let before = recorder.ledger().clone();
+        let saves = world.borrow().saved.len();
+        let error = recorder.intend(&[(LAUNCHER, Kind::File)]).unwrap_err().to_string();
+        assert!(error.contains(LAUNCHER), "{error}");
+        // Not on the component allow-list: the resume path refuses it outright,
+        // restores no absence and confirms nothing, whatever the caller accepts.
+        assert!(recorder.resume_component(LAUNCHER, |_, _, _| Ok(true)).is_err());
+        assert!(!recorder.absent_at_intent(LAUNCHER));
+        assert_eq!(recorder.ledger(), &before);
+        assert_eq!(world.borrow().saved.len(), saves, "nothing written");
+        let entry = recorder.ledger().entry(LAUNCHER).unwrap().clone();
+        assert_eq!((entry.state, entry.identity), (State::Intent, None));
     }
 
     #[test]

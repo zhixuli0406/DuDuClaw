@@ -90,14 +90,24 @@ impl Reapable for std::process::Child {
 /// (`try_wait`) for at most `bound` in `step`s. One still not reaped then is
 /// handed to a detached thread that only `wait()`s for it (so no zombie
 /// remains once it exits) and the caller stops blocking. True: reaped here.
+///
+/// Review round 6 item 2: only `Ok(Some(_))` means reaped. A failing
+/// `try_wait` (`Err`) proves nothing about the child — it may still run — so
+/// it is handled exactly like `Ok(None)`: SIGKILL, the bounded reap, then the
+/// detached reaper.
 fn kill_and_reap<C: Reapable>(mut child: C, bound: std::time::Duration, step: std::time::Duration) -> bool {
     use std::time::Instant;
-    // Reaped already, or waitpid fails (nothing left to reap).
-    if !matches!(child.try_reap(), Ok(None)) { return true; }
+    match child.try_reap() {
+        Ok(Some(_)) => return true,
+        Ok(None) | Err(_) => (),
+    }
     let _ = child.kill();
     let until = Instant::now() + bound;
     loop {
-        if !matches!(child.try_reap(), Ok(None)) { return true; }
+        match child.try_reap() {
+            Ok(Some(_)) => return true,
+            Ok(None) | Err(_) => (),
+        }
         let now = Instant::now();
         if now >= until { break; }
         std::thread::sleep(step.min(until - now));

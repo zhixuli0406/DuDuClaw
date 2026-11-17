@@ -2396,6 +2396,9 @@ fn publish_platform(context: &mut Context) -> Result<()> {
     // creates are ledgered first (review F4).
     let stage = &context.stage;
     let state_root = duduclaw_updated::linux::STATE_ROOT;
+    // Review round 6 item 1: a state root R1 created in an interrupted run
+    // before it was confirmed is confirmed now (or the step refuses).
+    resume_component(&mut context.recorder, state_root, context.generation)?;
     // Review round 4 item 2: the window of R1's publish opens here.
     let window = ledger::window_start();
     let digest = context.recorder.record(&TRUST_TREES.map(|tree| (tree, Kind::Tree)), || {
@@ -2415,11 +2418,7 @@ fn publish_platform(context: &mut Context) -> Result<()> {
     // absent at the durable intent `record` made right before publish (review
     // round 5 item 5), and holding R1's state file for this generation with
     // nothing pending. Not proven: the step fails (review round 4 item 2).
-    let generation = context.generation;
-    let saved: std::result::Result<duduclaw_updated::state::State, _> =
-        Directory::open(Path::new(state_root)).and_then(|root| root.json("state.json"));
-    let names_generation = saved.is_ok_and(|state| state.validate().is_ok() && state.pending.is_none()
-        && state.effective_digest() == generation);
+    let names_generation = state_names_generation(context.generation);
     let absent = context.recorder.absent_at_intent(state_root);
     context.recorder.confirm_component(state_root,
         |identity| Ok(state_root_proven(identity, &component_facts(state_root, absent, window), names_generation)))?;
@@ -3095,6 +3094,82 @@ pub(super) fn root_key_proven(identity: &ledger::Identity, facts: &ComponentFact
         && facts.creation.is_some_and(|creation| creation.nlink == 1) && created_by_this_install(identity, facts)
 }
 
+/// Review round 6 item 1 (pure): a component object (`path`, one of
+/// [`ledger::RESUMABLE_COMPONENTS`]) its producer created in an interrupted
+/// run, checked on resume or at rollback by exactly the producer-specific
+/// proof of the original confirm — shape, owner, mode, mount, the statx facts
+/// of the same inode, the absence the durable intent proves
+/// (`facts.absent_at_intent`) and the producer binding `producer` (R1's state
+/// file names this generation / PID 1 reports this install's socket unit
+/// listening inside it / PID 1 loads this install's gateway unit) — except
+/// the time comparison: the crashed run's window is gone, so only that is
+/// skipped (`window: None`). Any other path: false.
+pub(super) fn resumed_component_proven(path: &str, identity: &ledger::Identity, facts: &ComponentFacts, producer: bool) -> bool {
+    let facts = ComponentFacts { window: None, ..*facts };
+    if path == duduclaw_updated::linux::STATE_ROOT {
+        state_root_proven(identity, &facts, producer)
+    } else if path == SPAWND_RUNTIME {
+        runtime_directory_proven(identity, &facts, producer)
+    } else if path == duduclaw_core::root_key::KEY_PATH {
+        root_key_proven(identity, &facts, producer)
+    } else {
+        false
+    }
+}
+
+/// R1's state file in the updater state root is valid, names `generation`
+/// and has nothing pending.
+fn state_names_generation(generation: Sha256Digest) -> bool {
+    let saved: std::result::Result<duduclaw_updated::state::State, _> =
+        Directory::open(Path::new(duduclaw_updated::linux::STATE_ROOT)).and_then(|root| root.json("state.json"));
+    saved.is_ok_and(|state| state.validate().is_ok() && state.pending.is_none() && state.effective_digest() == generation)
+}
+
+/// PID 1 loads this install's ledgered, unmodified spawnd socket unit and
+/// reports it listening inside spawnd's runtime directory.
+fn runtime_owner_listens(ledger: &ledger::Ledger) -> bool {
+    live_unit_is_ours(ledger, SPAWND_RUNTIME_OWNER, Instant::now() + QUIESCE_COMMAND_CAP)
+        && command("systemctl", &["show", SPAWND_RUNTIME_OWNER, "--property=Listen"]).ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| listens_in(&output.stdout, SPAWND_RUNTIME))
+}
+
+/// Review round 6 item 1: the live resume of component `path`
+/// ([`ledger::Recorder::resume_component`], [`resumed_component_proven`]).
+/// Nothing to resume: `Ok`. Present but not proven: `component_unconfirmed`.
+fn resume_component(recorder: &mut LiveRecorder, path: &str, generation: Sha256Digest) -> Result<()> {
+    recorder.resume_component(path, |ledger, identity, absent| {
+        let producer = if path == duduclaw_updated::linux::STATE_ROOT {
+            state_names_generation(generation)
+        } else if path == SPAWND_RUNTIME {
+            runtime_owner_listens(ledger)
+        } else if path == duduclaw_core::root_key::KEY_PATH {
+            live_unit_is_ours(ledger, UNIT, Instant::now() + QUIESCE_COMMAND_CAP)
+        } else {
+            false
+        };
+        Ok(resumed_component_proven(path, identity, &component_facts(path, absent, None), producer))
+    })
+}
+
+/// Review round 6 item 1: before a rollback stops or removes anything, each
+/// component entry still `intent` without an identity whose object is present
+/// gets the same confirmation attempt as an install resume. Confirmed: it has
+/// an identity and the removal below removes it by the ordinary rule. Not
+/// confirmed (any failure of the attempt included): left `intent`, so the
+/// removal keeps and lists it as before.
+pub(super) fn confirm_components_for_rollback(ledger: ledger::Ledger) -> Result<ledger::Ledger> {
+    let pending = ledger::RESUMABLE_COMPONENTS.iter().any(|(path, _)| ledger.entry(path)
+        .is_some_and(|entry| entry.state == ledger::State::Intent && entry.identity.is_none()));
+    if !pending { return Ok(ledger); }
+    let generation = parse_generation(&ledger.generation).ok_or_else(|| refused(ledger::LEDGER_DAMAGED))?;
+    let mut recorder = LiveRecorder::over_live(ledger)?;
+    for (path, _) in ledger::RESUMABLE_COMPONENTS {
+        let _ = resume_component(&mut recorder, path, generation);
+    }
+    Ok(recorder.ledger().clone())
+}
+
 /// The units S6 starts, in order (the broker socket only on the broker route).
 fn started_units(dns: &Dns) -> Vec<&'static str> {
     SERVICE_ORDER.iter().copied()
@@ -3130,6 +3205,9 @@ fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
     let output = command("systemctl", &["daemon-reload"])?;
     if !output.status.success() { return Err(refused(SYSTEMCTL_FAILED)); }
     let gateway = passwd_entry("duduclaw")?.ok_or_else(|| refused("無法查詢服務帳號。"))?;
+    // Review round 6 item 1: a runtime directory systemd created in an
+    // interrupted run before it was confirmed is confirmed now (or the step refuses).
+    resume_component(&mut context.recorder, SPAWND_RUNTIME, context.generation)?;
     // systemd creates spawnd's runtime directory: ledgered before it can exist.
     context.recorder.intend(&[(SPAWND_RUNTIME, Kind::Tree)])?;
     let generation = context.generation;
@@ -3153,10 +3231,7 @@ fn start_services(context: &mut Context, dns: &Dns) -> Result<()> {
     // started (review round 5 item 5), and PID
     // 1 reports this install's ledgered, unmodified socket unit as listening
     // in it. Review round 4 item 2: otherwise the step fails (never adopted).
-    let owner = live_unit_is_ours(context.recorder.ledger(), SPAWND_RUNTIME_OWNER, Instant::now() + QUIESCE_COMMAND_CAP)
-        && command("systemctl", &["show", SPAWND_RUNTIME_OWNER, "--property=Listen"]).ok()
-            .filter(|output| output.status.success())
-            .is_some_and(|output| listens_in(&output.stdout, SPAWND_RUNTIME));
+    let owner = runtime_owner_listens(context.recorder.ledger());
     let absent = context.recorder.absent_at_intent(SPAWND_RUNTIME);
     let confirmed = context.recorder.confirm_component(SPAWND_RUNTIME,
         |identity| Ok(runtime_directory_proven(identity, &component_facts(SPAWND_RUNTIME, absent, window), owner)));
@@ -3284,6 +3359,9 @@ fn start_gateway(context: &mut Context) -> Result<()> {
         .map(|name| name.into_string().map_err(|_| refused("Gateway 資料目錄含有無法辨識的名稱。")))
         .collect::<Result<Vec<_>>>()?;
     recorder.contents(ledger::GATEWAY_DATA_PATH, keep)?;
+    // Review round 6 item 1: a root key the launcher created in an interrupted
+    // run before it was confirmed is confirmed now (or the step refuses).
+    resume_component(recorder, duduclaw_core::root_key::KEY_PATH, context.generation)?;
     // The gateway's launcher creates the root key at its first start.
     recorder.intend(&[(duduclaw_core::root_key::KEY_PATH, Kind::File)])?;
     let output = command("systemctl", &["enable", UNIT])?;
@@ -3922,6 +4000,8 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
     struct FakeChild {
         /// `try_wait` reports it reaped once killed (else never).
         dies_on_kill: bool,
+        /// Review round 6 item 2: `try_wait` fails (`Err`) while it is not reaped.
+        try_wait_fails: bool,
         killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
         reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// `wait()` blocks until this is signalled (or its sender dropped).
@@ -3932,6 +4012,7 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
         fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
             use std::os::unix::process::ExitStatusExt;
             let dead = self.dies_on_kill && self.killed.load(std::sync::atomic::Ordering::SeqCst);
+            if !dead && self.try_wait_fails { return Err(std::io::Error::other("waitpid failed")); }
             Ok(dead.then(|| std::process::ExitStatus::from_raw(9)))
         }
         fn kill(&mut self) -> std::io::Result<()> {
@@ -3947,12 +4028,42 @@ gshadow:        files\nhosts:          files mdns4_minimal [NOTFOUND=return] dns
     }
 
     #[test]
+    fn failing_try_wait_is_not_reaped_and_still_gets_sigkill() {
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+        // Review round 6 item 2: `try_wait` errs for a child still running.
+        let fake = |dies_on_kill: bool| {
+            let (killed, reaped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (release, receiver) = mpsc::channel();
+            (FakeChild { dies_on_kill, try_wait_fails: true, killed: killed.clone(), reaped: reaped.clone(), release: receiver },
+                killed, reaped, release)
+        };
+        // It dies on SIGKILL: the kill was sent and the bounded reap saw it.
+        let (child, killed, reaped, _release) = fake(true);
+        assert!(super::super::kill_and_reap(child, Duration::from_millis(200), Duration::from_millis(20)));
+        assert!(killed.load(Ordering::SeqCst), "an Err is not 'already reaped': SIGKILL was sent");
+        assert!(!reaped.load(Ordering::SeqCst));
+        // `try_wait` keeps failing: SIGKILL, the whole bounded reap, then the detached reaper.
+        let (child, killed, reaped, release) = fake(false);
+        let started = Instant::now();
+        assert!(!super::super::kill_and_reap(child, Duration::from_millis(200), Duration::from_millis(20)));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(2), "{took:?}");
+        assert!(killed.load(Ordering::SeqCst));
+        assert!(!reaped.load(Ordering::SeqCst), "the caller did not wait for it");
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !reaped.load(Ordering::SeqCst) && Instant::now() < until { std::thread::sleep(Duration::from_millis(10)); }
+        assert!(reaped.load(Ordering::SeqCst), "handed to the detached reaper");
+    }
+
+    #[test]
     fn command_reap_and_output_read_never_block_past_their_bounds() {
         use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
         let fake = |dies_on_kill: bool| {
             let (killed, reaped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
             let (release, receiver) = mpsc::channel();
-            (FakeChild { dies_on_kill, killed: killed.clone(), reaped: reaped.clone(), release: receiver }, killed, reaped, release)
+            (FakeChild { dies_on_kill, try_wait_fails: false, killed: killed.clone(), reaped: reaped.clone(), release: receiver },
+                killed, reaped, release)
         };
         // Dies on SIGKILL: reaped within the bound by the caller itself.
         let (child, killed, reaped, _release) = fake(true);
