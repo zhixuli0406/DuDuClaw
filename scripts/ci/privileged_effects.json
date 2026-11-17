@@ -7404,6 +7404,18 @@
       "rationale": "Test-only fork child lowers its own rlimits and _exits; not a production spawn path."
     },
     {
+      "symbol": "crates/duduclaw-run/src/linux/mounts.rs::tests::iso_root_attach_input_without_dac_capabilities",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Root-only ignored test (DUDUCLAW_ISO_DISPOSABLE=1): the fork child enters a private mount namespace, reduces its capabilities to the run unit's set and calls attach_input, then _exits; never execs, not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-run/src/bin/root-fixture/helpers.rs::Session::new",
       "apis": {
         "raw_fork": 1

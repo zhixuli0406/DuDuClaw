@@ -544,7 +544,10 @@ fn attach_input(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> R
     set_private(input.fd.as_raw_fd(), true)?;
     set_attributes(input.fd.as_raw_fd(), attrs, true)?;
     move_mount(input.fd, root, name)?;
-    let target = open_dir(root, name)?;
+    // R7f: O_PATH readback. The home/work roots are employee-owned 0700 and the
+    // run unit has no CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH, so O_RDONLY is EACCES.
+    // verify_mount only uses statx(AT_EMPTY_PATH) and fstatfs64 on this fd.
+    let target = open_dir_path(root, name)?;
     verify_mount(target.as_raw_fd(), Some(input.expected_mount_id), input.expected_fs_type, attrs)
 }
 
@@ -611,6 +614,17 @@ struct OpenHow { flags: u64, mode: u64, resolve: u64 }
 fn open_dir(parent: RawFd, name: &CStr) -> Result<OwnedFd, MountError> {
     // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS; relative opens also BENEATH.
     let how = OpenHow { flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0, resolve: 0x02 | 0x04 | if parent == libc::AT_FDCWD { 0 } else { 0x08 } };
+    // SAFETY: initialized open_how v0 and valid C string.
+    owned(unsafe { libc::syscall(libc::SYS_openat2, parent, name.as_ptr(), &how, size_of::<OpenHow>()) },
+        MountError::Directory)
+}
+
+/// `open_dir` as an O_PATH descriptor (same resolve flags): needs search on the
+/// ancestors only, no permission on the directory itself. Valid for statx
+/// (AT_EMPTY_PATH) and fstatfs; never for getdents, *at creation or fchdir.
+fn open_dir_path(parent: RawFd, name: &CStr) -> Result<OwnedFd, MountError> {
+    let how = OpenHow { flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         mode: 0, resolve: 0x02 | 0x04 | if parent == libc::AT_FDCWD { 0 } else { 0x08 } };
     // SAFETY: initialized open_how v0 and valid C string.
     owned(unsafe { libc::syscall(libc::SYS_openat2, parent, name.as_ptr(), &how, size_of::<OpenHow>()) },
@@ -789,5 +803,147 @@ mod tests {
         assert_eq!(request.link.ifi_index, 1);
         assert_eq!(request.link.ifi_change, 0);
         assert_eq!(read_header(&[]).err(), Some(MountError::Loopback));
+    }
+
+    struct TempTree(std::path::PathBuf);
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0.join("link"));
+            let _ = std::fs::remove_dir(self.0.join("locked"));
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn open_dir_path_reads_back_a_directory_the_caller_cannot_open() {
+        let tree = TempTree(std::env::temp_dir().join(format!("duduclaw-run-o-path-{}", std::process::id())));
+        std::fs::create_dir(&tree.0).unwrap();
+        let parent = std::fs::File::open(&tree.0).unwrap();
+        let parent = parent.as_raw_fd();
+        // SAFETY: fixed names beneath the owned test directory.
+        unsafe {
+            assert_eq!(libc::mkdirat(parent, c"locked".as_ptr(), 0o700), 0);
+            assert_eq!(libc::fchmodat(parent, c"locked".as_ptr(), 0, 0), 0);
+            assert_eq!(libc::symlinkat(c"locked".as_ptr(), parent, c"link".as_ptr()), 0);
+        }
+        if unsafe { libc::geteuid() } != 0 {
+            // The pre-R7f readback, as root without DAC capabilities on an employee 0700 root.
+            assert_eq!(open_dir(parent, c"locked").err(), Some(MountError::Directory));
+        }
+        let fd = open_dir_path(parent, c"locked").expect("O_PATH needs no permission on the directory");
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_PATH != 0);
+        let stat = statx(fd.as_raw_fd()).expect("statx(AT_EMPTY_PATH) on an O_PATH descriptor");
+        assert_eq!(u32::from(stat.stx_mode) & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(stat.stx_mode & 0o7777, 0);
+        // SAFETY: initialized statfs buffer and live descriptor.
+        let mut fs: libc::statfs64 = unsafe { zeroed() };
+        assert_eq!(unsafe { libc::fstatfs64(fd.as_raw_fd(), &mut fs) }, 0, "fstatfs on an O_PATH descriptor");
+        // The production readback, against the temp directory's own filesystem.
+        assert_eq!(verify_mount(fd.as_raw_fd(), Some(stat.stx_mnt_id), fs.f_type as i64, 0), Ok(stat.stx_mnt_id));
+        assert_eq!(verify_mount(fd.as_raw_fd(), Some(stat.stx_mnt_id + 1), fs.f_type as i64, 0), Err(MountError::Identity));
+        // Same resolution refusals as open_dir: no symlink, no escape.
+        assert_eq!(open_dir_path(parent, c"link").err(), Some(MountError::Directory));
+        assert_eq!(open_dir_path(parent, c"../locked").err(), Some(MountError::Directory));
+    }
+
+    /// Forked child of `iso_root_attach_input_without_dac_capabilities`;
+    /// returns 0 or the number of the failed step.
+    fn attach_without_dac(owner: u32) -> i32 {
+        // SAFETY: this forked child owns its new mount namespace.
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWNS) != 0 { return 1; }
+            if libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) != 0 { return 2; }
+        }
+        // Root-owned stage (over /tmp, in this namespace only) with the fixed mountpoint.
+        let Ok(stage) = tmpfs(1024 * 1024, 64, "0755", MOUNT_NOSUID | MOUNT_NODEV) else { return 3 };
+        if move_mount(stage, libc::AT_FDCWD, c"/tmp").is_err() { return 4; }
+        let Ok(root) = open_dir(libc::AT_FDCWD, c"/tmp") else { return 5 };
+        if mkdir(root.as_raw_fd(), c"work", 0o755).is_err() { return 6; }
+        // The employee input: a detached tmpfs whose root is `owner`-owned, mode 0700.
+        let attrs = MOUNT_NOSUID | MOUNT_NODEV;
+        let Ok(input) = filesystem(c"tmpfs", &[("size", "1048576".into()), ("nr_inodes", "64".into()),
+            ("mode", "0700".into()), ("uid", owner.to_string()), ("gid", owner.to_string())], attrs) else { return 7 };
+        let Ok(before) = statx(input.as_raw_fd()) else { return 8 };
+        if before.stx_uid != owner || before.stx_mode & 0o7777 != 0o700 || before.stx_mnt_id == 0 { return 9; }
+        let expected = before.stx_mnt_id;
+        if !reduce_to_run_unit_capabilities() { return 10; }
+        let mounted = attach_input(DetachedMount { fd: input, expected_mount_id: expected,
+            expected_fs_type: TMPFS_MAGIC }, root.as_raw_fd(), c"work", attrs);
+        if mounted != Ok(expected) { return 11; }
+        // Precondition: the old O_RDONLY readback of the same object is EACCES here.
+        // SAFETY: fixed name beneath the owned stage descriptor.
+        let raw = unsafe { libc::openat(root.as_raw_fd(), c"work".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if raw >= 0 { unsafe { libc::close(raw); } return 12; }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EACCES) { return 13; }
+        if open_dir(root.as_raw_fd(), c"work").is_ok() { return 14; }
+        let Ok(work) = open_dir_path(root.as_raw_fd(), c"work") else { return 15 };
+        let Ok(after) = statx(work.as_raw_fd()) else { return 16 };
+        if after.stx_mnt_id != expected || after.stx_uid != owner || after.stx_ino != before.stx_ino { return 17; }
+        0
+    }
+
+    /// Exactly the run unit's capability set: bounding, effective and permitted
+    /// are `REQUIRED_BOUNDING_CAPABILITIES`; inheritable and ambient are empty.
+    fn reduce_to_run_unit_capabilities() -> bool {
+        use super::super::privileges::REQUIRED_BOUNDING_CAPABILITIES as REQUIRED;
+        #[repr(C)]
+        struct Header { version: u32, pid: i32 }
+        #[repr(C)]
+        #[derive(Default, Clone, Copy)]
+        struct Data { effective: u32, permitted: u32, inheritable: u32 }
+        let read = |cap: u32| unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap as libc::c_ulong,
+            0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) };
+        let mut wanted = [Data::default(); 2];
+        for cap in REQUIRED {
+            wanted[(*cap / 32) as usize].effective |= 1 << (*cap % 32);
+            wanted[(*cap / 32) as usize].permitted |= 1 << (*cap % 32);
+        }
+        // SAFETY: prctl/capget/capset on this forked child only; exact v3 layouts.
+        unsafe {
+            for cap in 0..64u32 {
+                if read(cap) < 0 {
+                    if cap > 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) { break; }
+                    return false;
+                }
+                if !REQUIRED.contains(&cap) && libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong,
+                    0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) != 0 { return false; }
+            }
+            let header = Header { version: 0x2008_0522, pid: 0 };
+            if libc::syscall(libc::SYS_capset, &header, wanted.as_ptr()) != 0 { return false; }
+            if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) != 0 { return false; }
+            let mut header = Header { version: 0x2008_0522, pid: 0 };
+            let mut actual = [Data::default(); 2];
+            if libc::syscall(libc::SYS_capget, &mut header, actual.as_mut_ptr()) != 0 { return false; }
+            if actual.iter().zip(&wanted).any(|(a, w)| a.effective != w.effective
+                || a.permitted != w.permitted || a.inheritable != 0) { return false; }
+        }
+        // CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER are gone from the bounding set too.
+        [1u32, 2, 3].iter().all(|cap| read(*cap) == 0) && REQUIRED.iter().all(|cap| read(*cap) == 1)
+    }
+
+    #[test]
+    #[ignore = "iso_root_: disposable root Linux VM (DUDUCLAW_ISO_DISPOSABLE=1); private mount namespace in a forked child"]
+    fn iso_root_attach_input_without_dac_capabilities() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "requires native root Linux; no skip");
+        assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
+            "set DUDUCLAW_ISO_DISPOSABLE=1 only on a disposable VM");
+        // `nobody` unless a disposable VM supplies another non-root owner.
+        let owner: u32 = std::env::var("DUDUCLAW_ISO_TEST_UID").map_or(65534, |uid| uid.parse().expect("numeric uid"));
+        assert_ne!(owner, 0);
+        // SAFETY: the child runs only `attach_without_dac` and leaves by _exit.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let code = attach_without_dac(owner);
+            unsafe { libc::_exit(code) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "failed step number in attach_without_dac");
     }
 }
