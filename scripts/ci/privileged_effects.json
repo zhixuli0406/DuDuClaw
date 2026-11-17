@@ -7440,19 +7440,6 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Fake Codex terminal-result regression verifies cleanup of hung test processes."
-    },
-    {
-      "symbol": "crates/duduclaw-import/src/capture_tests.rs::filesystem::capture_private_copy_ignores_tmpdir_and_cleans_up",
-      "apis": {
-        "command_constructor": 1,
-        "terminal_status": 1
-      },
-      "effects": [
-        "process_spawn"
-      ],
-      "identity": "test",
-      "migration": "test_only",
-      "rationale": "Re-executes this capture regression with TMPDIR set to an isolated home to verify private-copy placement, sealing, and cleanup."
     }
   ]
 }
