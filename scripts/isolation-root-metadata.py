@@ -17,7 +17,8 @@ application ssh:duduclaw-target; all four keys are distinct. ECDSA security keys
 are refused until the verifier supports them (plan Q5).
 
 Sign the output afterwards with the root threshold, e.g. R1 (touch + PIN) and R2
-(key locations from DUDUCLAW_ISOLATION_SIGNING_KEY_1/_2 or the terminal prompt, never argv):
+(key locations on stdin, one per line, R1 first: prompted on a terminal; never argv
+or the environment):
   python3 -I scripts/sign-isolation-manifest.py --kind root --template root.unsigned.json \
       --output root.json --key-count 2 --ssh-keygen <Homebrew ssh-keygen>
 The SHA-256 of the signed root.json (printed by that command, identical to the

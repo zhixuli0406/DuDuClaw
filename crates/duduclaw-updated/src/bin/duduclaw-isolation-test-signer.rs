@@ -10,9 +10,10 @@
 //! printed; errors are fixed one-line messages.
 use std::{fs::{File, OpenOptions}, io::{Read, Write}, path::Path, process::ExitCode};
 
-use duduclaw_isolation::update::{EMERGENCY_SSHSIG_NAMESPACE, MAX_MIGRATION_BUNDLE_BYTES,
+use duduclaw_isolation::update::{RootMetadata, EMERGENCY_SSHSIG_NAMESPACE, MAX_MIGRATION_BUNDLE_BYTES,
     MIGRATION_BUNDLE_SSHSIG_NAMESPACE, RELEASE_SSHSIG_NAMESPACE, ROOT_SSHSIG_NAMESPACE, RUNTIME_SSHSIG_NAMESPACE};
-use duduclaw_updated::{metadata::MAX_METADATA_BYTES, test_signer::{openssh_public_line, Role, TestKey}};
+use duduclaw_updated::{metadata::{decode_canonical, MAX_METADATA_BYTES}, sshsig::SshSignature,
+    test_signer::{openssh_public_line, Role, TestKey}};
 
 const USAGE: &str = "TEST-ONLY isolation signer (never use for a release)
 usage:
@@ -23,9 +24,13 @@ usage:
   duduclaw-isolation-test-signer minisign <key-path> <input> <trusted-comment> <output>
       prehashed minisign signature (BLAKE2b-512) with exactly that trusted comment
   duduclaw-isolation-test-signer minisign-public <key-path>
-      prints the base64 public key for DUDUCLAW_BOOTSTRAP_TEST_MINISIGN_KEY";
+      prints the base64 public key for DUDUCLAW_BOOTSTRAP_TEST_MINISIGN_KEY
+  duduclaw-isolation-test-signer verify <root.json> <root|release|runtime|emergency|bundle> <input> <signature> <key-id-hex>
+      exit 0 only if <signature> (SSHSIG) was made by the root key <key-id-hex> of the canonical
+      <root.json> over exactly <input> under that kind's namespace (production sshsig verifier)";
 
 const MAX_KEY_FILE_BYTES: u64 = 4096;
+const MAX_SIGNATURE_FILE_BYTES: u64 = 16 * 1024;
 
 fn namespace(kind: &str) -> Option<&'static str> {
     match kind {
@@ -129,8 +134,31 @@ fn minisign(key: &Path, input: &Path, trusted_comment: &str, output: &Path) -> R
     write_new(output, 0o644, signature.as_bytes())
 }
 
+/// Verification of one signature with the crate's production code (`sshsig::SshSignature`):
+/// scripts/sign-isolation-manifest.py checks TEST signatures with this instead of skipping
+/// them (`ssh-keygen -Y verify` is the production path). The signing key must be the root
+/// key whose id the caller computed, and that id must be the one embedded in the signature.
+fn verify(root: &Path, kind: &str, input: &Path, signature: &Path, key_id: &str) -> Result<(), &'static str> {
+    let namespace = namespace(kind).ok_or("unknown document kind")?;
+    let root_bytes = read_bounded(root, MAX_METADATA_BYTES as u64)?;
+    let root: RootMetadata = decode_canonical(&root_bytes).map_err(|_| "root metadata is not canonical")?;
+    let message = read_bounded(input, MAX_METADATA_BYTES as u64)?;
+    let armor = String::from_utf8(read_bounded(signature, MAX_SIGNATURE_FILE_BYTES)?)
+        .map_err(|_| "signature is not text")?;
+    let signature = SshSignature::parse(&armor).map_err(|_| "malformed SSH signature")?;
+    let expected: [u8; 32] = hex::decode(key_id).ok().and_then(|bytes| bytes.try_into().ok())
+        .ok_or("key id must be 64 hex digits")?;
+    if signature.key_id().0 != expected { return Err("the signature was made by another key"); }
+    let key = root.root_keys.iter().find(|key| key.key_id.0 == expected)
+        .ok_or("not a root key of the root metadata")?;
+    signature.verify(key, namespace, &message).map_err(|_| "signature does not verify")?;
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), &'static str> {
     match args {
+        [command, root, kind, input, signature, key_id] if command == "verify" =>
+            verify(Path::new(root), kind, Path::new(input), Path::new(signature), key_id),
         [command, role, path] if command == "keygen" => keygen(role, Path::new(path)),
         [command, key, kind, input, output] if command == "sign" =>
             sign(Path::new(key), kind, Path::new(input), Path::new(output)),

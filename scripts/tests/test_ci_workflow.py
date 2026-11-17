@@ -504,6 +504,21 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(fetch["env"]["FETCH_TOKEN"], "${{ github.token }}")
         self.assertIn('GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"', fetch["run"])
         self.assertNotIn("${{", fetch["run"])
+        # The token (and the header built from it) is gone before anything else runs: the
+        # checkout runs without hooks, fsmonitor or system/global filter drivers, and its
+        # result must equal the fetched blob byte for byte (no smudge).
+        run = fetch["run"]
+        unset = run.index("unset FETCH_TOKEN auth")
+        self.assertLess(run.index("git fetch --no-tags --depth=1"), unset)
+        self.assertEqual(run.count("FETCH_TOKEN"), 2)  # the header construction and the unset
+        self.assertEqual(run.count("$auth"), 1)
+        checkout = run.index("checkout FETCH_HEAD --")
+        self.assertLess(unset, checkout)
+        command = run[run.rindex("GIT_CONFIG_NOSYSTEM=1", 0, checkout):checkout]
+        for needle in ("GIT_CONFIG_GLOBAL=/dev/null", "-c core.hooksPath=/dev/null", "-c core.fsmonitor=",
+                       "-c core.attributesFile=/dev/null"):
+            self.assertIn(needle, command)
+        self.assertLess(checkout, run.index('git cat-file blob "FETCH_HEAD:$script" | cmp -s - "$script"'))
 
     def test_release_linux_swap_immediately_follows_checkout_and_precedes_builds(self):
         for name, job in (("release", "build"), ("linux-release-smoke", "build"),

@@ -18,16 +18,28 @@ isolation-sign gates this).
 TEST-ONLY key set of scripts/isolation-test-keys.sh; that binary refuses every
 key that is not a TEST-ONLY key file. Only that path takes --key <file>.
 
-Key locations (production, i.e. without --test-signer): never on the command
-line, because any local process can read another process's argv (ps). They come
-from DUDUCLAW_ISOLATION_SIGNING_KEY_1 .. _<--key-count> or, for each one not
-set, from an attended prompt on the controlling terminal (echoed: a location is
-not a secret). --key is refused. ssh-keygen -Y sign needs `-f <path>`; it is
-given only `<private 0700 temp dir>/signing-key`, a symlink to the real key
-(plus signing-key.pub when the key has one), and the directory is removed right
-after. Residual exposure: while ssh-keygen runs (the moment of signing, on the
-offline ceremony machine) its argv shows that neutral temporary path, and the
-symlink target is readable only by the operator's own user (and root).
+Key locations (production, i.e. without --test-signer): ONLY on stdin, one
+location per line, signing key 1 first (for --kind bundle: R1 then R2), exactly
+--key-count lines. Never on the command line (any local process can read argv)
+and never from the environment: a DUDUCLAW_ISOLATION_*KEY* variable in the
+environment is refused. On a terminal each line is prompted for (echoed: a
+location is not a secret); scripts/release.sh isolation-sign pipes the locations
+it read at its own prompt. --key is refused. ssh-keygen -Y sign needs `-f
+<path>`; it is given only `<private 0700 temp dir>/signing-key`, a symlink to the
+real key (plus signing-key.pub when the key has one), and the directory is
+removed right after. Every child (ssh-keygen, minisign, the TEST signer) runs with
+an explicit environment: PATH=/usr/bin:/bin:/usr/sbin:/sbin plus HOME, LANG,
+LC_ALL, LC_CTYPE, TERM and TMPDIR when set, nothing else (no key variable, no
+SSH_AUTH_SOCK, SSH_SK_HELPER, SSH_ASKPASS or DISPLAY), with the controlling
+terminal as stdin for its PIN/passphrase prompt. Tools named without a path are
+looked up only in /usr/bin, /bin, /usr/sbin, /sbin, /opt/homebrew/bin and
+/usr/local/bin, never in PATH. Residual exposure: while a signer runs its argv
+shows the neutral temporary path, and the symlink target is readable by the
+operator's own user (and root).
+
+--minisign-sign <file> --trusted-comment <text> --output <file.minisig>: the
+legacy release key (minisign) signs <file>, its location read from stdin the same
+way and handed to minisign only as the neutral link.
 
 Root threshold (--kind root and --kind bundle): after signing and before any
 output is written, the key id of every signature is computed from the public key
@@ -35,9 +47,17 @@ embedded in the SSHSIG itself (SHA-256 of the key blob, like isolation-root-meta
 and sshsig.rs); the key ids must be pairwise different, each a root key of the
 canonical root metadata (the document itself for --kind root; --root-metadata,
 optionally pinned by --root-sha256, for --kind bundle), not revoked, and together
-meet its root_threshold. Otherwise nothing is written. Distinct paths, links or
-handles to one key are therefore one signer. --check-threshold re-runs exactly
-this check on written files (scripts/release.sh does so before uploading).
+meet its root_threshold. Each signature must also have the shape the Rust verifier
+(crates/duduclaw-updated/src/sshsig.rs) accepts (ssh-ed25519 or
+sk-ssh-ed25519@openssh.com matching the registered key, role application, 64-byte
+signature with canonical S, no small-order point, security-key flags exactly
+UP|UV, no trailing bytes) and must VERIFY cryptographically over the exact
+canonical bytes and namespace: `ssh-keygen -Y verify` against an allowed-signers
+file listing only the root key with that key id (principal = key id); with
+--test-signer, `<test signer> verify`, which runs the crate's production verifier.
+Otherwise nothing is written. Distinct paths, links or handles to one key are
+therefore one signer. --check-threshold re-runs exactly this check on written
+files (scripts/release.sh does so before uploading).
 """
 import argparse
 import base64
@@ -51,6 +71,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -68,15 +89,34 @@ MAX_METADATA_BYTES = 256 * 1024
 MAX_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 BUNDLE_NAME = re.compile(r"duduclaw-isolated-linux-(x86_64|aarch64)-(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\."
                          r"(0|[1-9][0-9]{0,8})\.tar")
-# Production key locations (never argv): DUDUCLAW_ISOLATION_SIGNING_KEY_<n>, n = 1..--key-count.
-KEY_ENVIRONMENT = "DUDUCLAW_ISOLATION_SIGNING_KEY_{}"
-# The only name ssh-keygen ever sees for a key (neutral_key_link).
+# Production key locations come only from stdin (read_key_locations); a variable of this
+# shape in the environment is refused, so no key location can be inherited by any child.
+KEY_VARIABLE = re.compile(r"DUDUCLAW_ISOLATION_[A-Za-z0-9_]*KEY[A-Za-z0-9_]*")
+MAX_LOCATION_BYTES = 4096
+# The only name ssh-keygen / minisign ever see for a key (neutral_key_link).
 NEUTRAL_KEY_NAME = "signing-key"
 MAX_SIGNERS = 6
 # duduclaw-updated sshsig.rs MAX_SIGNATURE_BYTES / duduclaw-isolation MAX_KEY_BLOB_BYTES.
 MAX_SIGNATURE_BYTES = 16 * 1024
 MAX_KEY_BLOB_BYTES = 4096
 THRESHOLD_KINDS = ("root", "bundle")
+# Every child gets exactly this environment (child_environment): a fixed PATH plus these
+# variables when set. Never a key location, SSH_AUTH_SOCK, SSH_SK_HELPER, SSH_ASKPASS, DISPLAY.
+SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+CHILD_VARIABLES = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR")
+# A tool named without a path is looked up only here (never PATH): system directories first.
+TOOL_DIRECTORIES = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/homebrew/bin", "/usr/local/bin")
+# The accept set of duduclaw-updated sshsig.rs (SshSignature::verify, validate_key) and
+# duduclaw-isolation update.rs (ROOT/TARGET_SK_APPLICATION, REQUIRED_SK_FLAGS).
+ED25519 = b"ssh-ed25519"
+SK_ED25519 = b"sk-ssh-ed25519@openssh.com"
+ROOT_SK_APPLICATION = "ssh:duduclaw-root"
+TARGET_SK_APPLICATION = "ssh:duduclaw-target"
+REQUIRED_SK_FLAGS = 0x01 | 0x04
+ED25519_GROUP_ORDER = 2 ** 252 + 27742317777372353535851937790883648493
+_FIELD = 2 ** 255 - 19
+_CURVE_D = (-121665 * pow(121666, _FIELD - 2, _FIELD)) % _FIELD
+_SQRT_MINUS_ONE = pow(2, (_FIELD - 1) // 4, _FIELD)
 
 
 def unique_object(pairs):
@@ -257,44 +297,97 @@ def bundle_authorization(path, expires_at_unix, now=None):
             "bundle_sha256": list(digest), "bundle_size": size, "expires_at_unix": expires_at_unix}
 
 
-def prompt_terminal(text):
-    """One line from the controlling terminal, echo on (a key location is not a secret)."""
-    try:
-        with open("/dev/tty", "w", encoding="utf-8") as output, open("/dev/tty", encoding="utf-8") as source:
-            output.write(text)
-            output.flush()
-            line = source.readline()
-    except OSError as error:
-        raise ValueError("no controlling terminal for the key prompt: set "
-                         + KEY_ENVIRONMENT.format("<n>") + " instead") from error
-    return line[:-1] if line.endswith("\n") else line
-
-
-def key_locations(count, environ=None, prompt=prompt_terminal):
-    """Production key locations, never from argv: DUDUCLAW_ISOLATION_SIGNING_KEY_<n>, else the prompt.
-
-    Messages never contain a location.
-    """
+def refuse_key_variables(environ=None):
+    """Key locations never come from (or travel through) the environment."""
     environ = os.environ if environ is None else environ
+    names = sorted(name for name in environ if KEY_VARIABLE.fullmatch(name))
+    if names:
+        raise ValueError("key locations are never read from the environment (they are handed over on stdin); "
+                         "unset " + ", ".join(names))
+
+
+def child_environment(environ=None):
+    """The complete environment of every child process: a fixed PATH and CHILD_VARIABLES, nothing else."""
+    environ = os.environ if environ is None else environ
+    result = {"PATH": SYSTEM_PATH}
+    for name in CHILD_VARIABLES:
+        value = environ.get(name)
+        if value:
+            result[name] = value
+    return result
+
+
+def resolve_tool(value, what):
+    """Absolute path of a tool: an absolute path as given, or a bare name looked up only in
+    TOOL_DIRECTORIES (never PATH). scripts/release.sh always passes absolute paths."""
+    value = os.fspath(value) if value is not None else ""
+    if not value or "\0" in value or "\n" in value:
+        raise ValueError(f"{what}: invalid tool path")
+    if os.path.isabs(value):
+        candidate = value
+    elif "/" in value:
+        raise ValueError(f"{what} must be an absolute path or a bare name")
+    else:
+        candidate = shutil.which(value, path=os.pathsep.join(TOOL_DIRECTORIES))
+        if candidate is None:
+            raise ValueError(f"{what}: {value} is not in {', '.join(TOOL_DIRECTORIES)}")
+    if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+        raise ValueError(f"{what} is not an executable file")
+    return candidate
+
+
+def read_key_locations(count, stream=None, interactive=None):
+    """Production key locations: exactly `count` lines on stdin, signing key 1 first.
+
+    Never argv, never the environment. On a terminal every line is prompted for
+    on stderr; from a pipe (scripts/release.sh) exactly `count` lines and nothing
+    else must arrive. Messages never contain a location.
+    """
     if not _integer(count, 1, MAX_SIGNERS):
         raise ValueError("use 1 to 6 signing keys")
-    if KEY_ENVIRONMENT.format(count + 1) in environ:
-        raise ValueError(f"{KEY_ENVIRONMENT.format(count + 1)} is set, but only {count} signing key(s) are used")
+    if stream is None:
+        if sys.stdin is None:
+            raise ValueError("key locations are read from stdin, which is closed")
+        stream = sys.stdin.buffer
+    if interactive is None:
+        interactive = stream.isatty()
     locations = []
     for index in range(1, count + 1):
-        value = environ.get(KEY_ENVIRONMENT.format(index))
-        if value is None:
-            value = prompt(f"Location of signing key {index} of {count} (key file or security-key handle; "
-                           "a path, not a secret): ")
-        if not value or any(character in value for character in "\0\r\n"):
+        if interactive:
+            sys.stderr.write(f"Location of signing key {index} of {count} (key file or security-key handle; "
+                             "a path, not a secret): ")
+            sys.stderr.flush()
+        line = stream.readline(MAX_LOCATION_BYTES + 1)
+        if not line.endswith(b"\n"):
+            raise ValueError(f"signing key {index}: no complete location line on stdin "
+                             "(one line per key, signing key 1 first)")
+        value = line[:-1]
+        if not value or any(byte in value for byte in b"\0\r"):
             raise ValueError(f"signing key {index}: empty or malformed location")
-        location = Path(os.path.abspath(value))
+        location = Path(os.path.abspath(os.fsdecode(value)))
         if not location.is_file():
             raise ValueError(f"signing key {index} is not a file")
         locations.append(location)
+    if not interactive and stream.read(1):
+        raise ValueError(f"stdin carries more than the {count} expected key location line(s)")
     if len(set(locations)) != len(locations):
         raise ValueError("use distinct signing keys")
     return locations
+
+
+@contextlib.contextmanager
+def terminal_stdin():
+    """The controlling terminal as a signer's stdin (ssh-keygen and minisign ask for the
+    PIN / passphrase there; stdin of this process is the key-location pipe); /dev/null without one."""
+    try:
+        descriptor = os.open("/dev/tty", os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        descriptor = None
+    try:
+        yield subprocess.DEVNULL if descriptor is None else descriptor
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 @contextlib.contextmanager
@@ -337,8 +430,136 @@ def _ssh_string(blob, offset):
     return blob[offset + 4:end], end
 
 
-def signature_public_blob(armor, namespace):
-    """The public key blob inside an armored SSHSIG, parsed as strictly as sshsig.rs."""
+def _edwards_point(encoded):
+    """RFC 8032 §5.1.3 decoding of an Ed25519 point; ValueError unless canonical and on the curve."""
+    if len(encoded) != 32:
+        raise ValueError("an Ed25519 point has 32 bytes")
+    y = int.from_bytes(encoded, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    if y >= _FIELD:
+        raise ValueError("non-canonical Ed25519 point")
+    u, v = (y * y - 1) % _FIELD, (_CURVE_D * y * y + 1) % _FIELD
+    x2 = u * pow(v, _FIELD - 2, _FIELD) % _FIELD
+    if x2 == 0:
+        if sign:
+            raise ValueError("non-canonical Ed25519 point")
+        return 0, y
+    x = pow(x2, (_FIELD + 3) // 8, _FIELD)
+    if (x * x - x2) % _FIELD:
+        x = x * _SQRT_MINUS_ONE % _FIELD
+    if (x * x - x2) % _FIELD:
+        raise ValueError("not an Ed25519 curve point")
+    if x & 1 != sign:
+        x = _FIELD - x
+    return x, y
+
+
+def _edwards_add(first, second):
+    """Complete twisted Edwards addition (a = -1) in affine coordinates."""
+    (x1, y1), (x2, y2) = first, second
+    t = _CURVE_D * x1 * x2 * y1 * y2 % _FIELD
+    x3 = (x1 * y2 + y1 * x2) * pow((1 + t) % _FIELD, _FIELD - 2, _FIELD) % _FIELD
+    y3 = (y1 * y2 + x1 * x2) * pow((1 - t) % _FIELD, _FIELD - 2, _FIELD) % _FIELD
+    return x3, y3
+
+
+def is_small_order(encoded):
+    """ed25519-dalek is_weak / is_small_order: 8·P is the identity. Undecodable points raise."""
+    point = _edwards_point(encoded)
+    for _ in range(3):
+        point = _edwards_add(point, point)
+    return point == (0, 1)
+
+
+def check_signature_shape(public, inner, key):
+    """Reject before any cryptography what sshsig.rs (SshSignature::verify, validate_key) rejects:
+    key and signature algorithm ssh-ed25519 or sk-ssh-ed25519@openssh.com, matching each other and
+    the registered key; the role application bound in an sk key blob; a 32-byte key that is no
+    small-order point; a 64-byte signature with canonical S and a non-small-order R;
+    security-key flags exactly UP|UV plus a 4-byte counter; no trailing bytes anywhere."""
+    name, offset = _ssh_string(public, 0)
+    raw, offset = _ssh_string(public, offset)
+    algorithm, application = key.get("algorithm"), key.get("application")
+    if len(raw) != 32:
+        raise ValueError("root key is not a 32-byte Ed25519 key")
+    if name == ED25519 and algorithm == "ed25519" and application is None:
+        pass
+    elif (name == SK_ED25519 and algorithm == "sk_ed25519"
+          and application in (ROOT_SK_APPLICATION, TARGET_SK_APPLICATION)):
+        bound, offset = _ssh_string(public, offset)
+        if bound != application.encode("ascii"):
+            raise ValueError("security-key blob does not bind the registered application")
+    else:
+        raise ValueError("root key is not ssh-ed25519 or sk-ssh-ed25519@openssh.com with its registered "
+                         "algorithm and application (the verifier accepts nothing else)")
+    if offset != len(public):
+        raise ValueError("trailing bytes after the root key")
+    if is_small_order(raw):
+        raise ValueError("root key is a weak (small-order) Ed25519 point")
+    signed_name, offset = _ssh_string(inner, 0)
+    signature, offset = _ssh_string(inner, offset)
+    if signed_name != name or len(signature) != 64:
+        raise ValueError("signature algorithm or length is not what the verifier accepts for this key")
+    if name == SK_ED25519:
+        if offset + 5 > len(inner) or inner[offset] != REQUIRED_SK_FLAGS:
+            raise ValueError("security-key signature flags must be exactly user presence + user verification")
+        offset += 5
+    if offset != len(inner):
+        raise ValueError("trailing bytes after the signature")
+    if int.from_bytes(signature[32:], "little") >= ED25519_GROUP_ORDER or is_small_order(signature[:32]):
+        raise ValueError("non-canonical or small-order Ed25519 signature")
+
+
+def ssh_keygen_verifier(ssh_keygen):
+    """Production cryptographic check: `ssh-keygen -Y verify` over the exact bytes and namespace,
+    against an allowed-signers file in a private temporary directory that lists ONLY the root key
+    whose key id was computed, under the principal <key id hex>."""
+    tool = resolve_tool(ssh_keygen, "--ssh-keygen")
+
+    def verify(armor, key_id, public, namespace, payload):
+        algorithm = _ssh_string(public, 0)[0].decode("ascii")
+        principal = key_id.hex()
+        with tempfile.TemporaryDirectory(prefix="duduclaw-verify-") as temporary:
+            directory = Path(temporary)
+            directory.chmod(0o700)
+            allowed = directory / "allowed_signers"
+            allowed.write_text(f'{principal} namespaces="{namespace}" {algorithm} '
+                               f'{base64.b64encode(public).decode("ascii")}\n', encoding="ascii")
+            signature = directory / "signature"
+            signature.write_text(armor, encoding="ascii")
+            result = subprocess.run([tool, "-Y", "verify", "-f", str(allowed), "-I", principal, "-n", namespace,
+                                     "-s", str(signature)], input=payload, env=child_environment(),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+            raise ValueError(f"the signature of root key {principal} does not verify (ssh-keygen -Y verify"
+                             + (f": {detail[-1]}" if detail else "") + ")")
+    return verify
+
+
+def isolation_test_signer_verifier(test_signer, root_bytes, kind):
+    """TEST mode: `<test signer> verify`, i.e. the crate's production SshSignature::verify. Never skipped."""
+    tool = resolve_tool(os.path.abspath(test_signer), "--test-signer")
+
+    def verify(armor, key_id, public, namespace, payload):
+        if NAMESPACES[kind] != namespace:
+            raise ValueError("namespace does not belong to this document kind")
+        with tempfile.TemporaryDirectory(prefix="duduclaw-verify-") as temporary:
+            directory = Path(temporary)
+            directory.chmod(0o700)
+            (directory / "root.json").write_bytes(root_bytes)
+            (directory / "document").write_bytes(payload)
+            (directory / "signature").write_text(armor, encoding="ascii")
+            result = subprocess.run([tool, "verify", str(directory / "root.json"), kind, str(directory / "document"),
+                                     str(directory / "signature"), key_id.hex()], env=child_environment(),
+                                    stdin=subprocess.DEVNULL, capture_output=True)
+        if result.returncode != 0:
+            raise ValueError(f"the TEST signature of root key {key_id.hex()} does not verify (test signer verify)")
+    return verify
+
+
+def parse_signature(armor, namespace):
+    """(public key blob, inner signature blob) of an armored SSHSIG, parsed as strictly as sshsig.rs."""
     if not isinstance(armor, str) or len(armor) > MAX_SIGNATURE_BYTES:
         raise ValueError("malformed SSH signature")
     lines = (armor[:-1] if armor.endswith("\n") else armor).split("\n")
@@ -358,11 +579,11 @@ def signature_public_blob(armor, namespace):
     signed_namespace, offset = _ssh_string(blob, offset)
     reserved, offset = _ssh_string(blob, offset)
     hash_algorithm, offset = _ssh_string(blob, offset)
-    _, offset = _ssh_string(blob, offset)
+    signature, offset = _ssh_string(blob, offset)
     if (offset != len(blob) or not 0 < len(public) <= MAX_KEY_BLOB_BYTES or reserved
             or hash_algorithm != b"sha512" or signed_namespace != namespace.encode("ascii")):
         raise ValueError("SSH signature has the wrong namespace, hash algorithm or shape")
-    return public
+    return public, signature
 
 
 def _byte_array(value, length=None):
@@ -373,7 +594,7 @@ def _byte_array(value, length=None):
 
 
 def root_signers(root_bytes):
-    """({key_id: public blob}, revoked key ids, root_threshold) of canonical root metadata."""
+    """({key_id: {"blob", "algorithm", "application"}}, revoked key ids, root_threshold) of canonical root metadata."""
     if len(root_bytes) > MAX_METADATA_BYTES:
         raise ValueError("root metadata exceeds the metadata limit")
     try:
@@ -393,7 +614,7 @@ def root_signers(root_bytes):
         blob, key_id = _byte_array(key.get("public_blob")), _byte_array(key.get("key_id"), 32)
         if not 0 < len(blob) <= MAX_KEY_BLOB_BYTES or hashlib.sha256(blob).digest() != key_id or key_id in roots:
             raise ValueError("each root key id must be the SHA-256 of its own public key blob, once")
-        roots[key_id] = blob
+        roots[key_id] = {"blob": blob, "algorithm": key.get("algorithm"), "application": key.get("application")}
     revoked = document.get("revoked_key_ids")
     if not isinstance(revoked, list):
         raise ValueError("invalid revoked_key_ids")
@@ -404,27 +625,37 @@ def root_signers(root_bytes):
     return roots, revoked, threshold
 
 
-def check_root_threshold(signatures, root_bytes, namespace):
+def check_root_threshold(signatures, root_bytes, namespace, payload, verify):
     """Same rules as duduclaw-updated trust::signatures/reject_unknown/threshold: every
-    signer is identified by the key embedded in its signature, never by a path or handle.
-    Returns the distinct signer key ids (hex)."""
+    signer is identified by the key embedded in its signature, never by a path or handle,
+    and every signature must verify over `payload` (the exact canonical bytes) under
+    `namespace` with `verify` (ssh_keygen_verifier or isolation_test_signer_verifier),
+    which is mandatory. Returns the distinct signer key ids (hex)."""
     roots, revoked, threshold = root_signers(root_bytes)
+    if not isinstance(payload, bytes) or not callable(verify):
+        raise ValueError("signatures are accepted only after cryptographic verification over the exact bytes")
     if not isinstance(signatures, list) or not 1 <= len(signatures) <= MAX_SIGNERS:
         raise ValueError("expected 1 to 6 signatures")
     seen = set()
+    checked = []
     for armor in signatures:
-        blob = signature_public_blob(armor, namespace)
-        key_id = hashlib.sha256(blob).digest()
+        public, inner = parse_signature(armor, namespace)
+        key_id = hashlib.sha256(public).digest()
         if key_id in seen:
             raise ValueError("two signatures were made by the same key (another path, link or handle "
                              "to one key is not a second signer)")
         seen.add(key_id)
-        if roots.get(key_id) != blob:
+        key = roots.get(key_id)
+        if key is None or key["blob"] != public:
             raise ValueError("a signature was made by a key that is not a root key of the root metadata")
         if key_id in revoked:
             raise ValueError("a signature was made by a revoked root key")
+        check_signature_shape(public, inner, key)
+        checked.append((armor, key_id, public))
     if len(seen) < threshold:
         raise ValueError(f"{len(seen)} distinct root key(s) do not meet the root threshold of {threshold}")
+    for armor, key_id, public in checked:
+        verify(armor, key_id, public, namespace, payload)
     return sorted(key_id.hex() for key_id in seen)
 
 
@@ -453,8 +684,10 @@ def check_written_threshold(parser, args):
     if args.kind not in THRESHOLD_KINDS:
         parser.error("--check-threshold applies to --kind root or --kind bundle")
     if any(value is not None for value in (args.output, args.key, args.key_count, args.template, args.artifacts_dir,
-                                           args.bundle, args.expires_at_unix, args.test_signer)):
-        parser.error("--check-threshold takes only --kind, --signatures, --root-metadata and --root-sha256")
+                                           args.bundle, args.expires_at_unix, args.minisign_sign,
+                                           args.trusted_comment)):
+        parser.error("--check-threshold takes only --kind, --signatures, --root-metadata, --root-sha256 and the "
+                     "verifier (--ssh-keygen, or --test-signer for TEST signatures)")
     try:
         document = read_bounded(args.check_threshold, MAX_METADATA_BYTES)
         signatures = json.loads(read_bounded(args.signatures or Path(str(args.check_threshold) + ".signatures.json"),
@@ -471,10 +704,58 @@ def check_written_threshold(parser, args):
             if canonical_bytes(parsed) != document:
                 raise ValueError("the authorization is not canonical")
             root_bytes = read_root_metadata(args.root_metadata, args.root_sha256)
-        signers = check_root_threshold(signatures, root_bytes, NAMESPACES[args.kind])
+        verify = (isolation_test_signer_verifier(args.test_signer, root_bytes, args.kind)
+                  if args.test_signer is not None else ssh_keygen_verifier(args.ssh_keygen))
+        signers = check_root_threshold(signatures, root_bytes, NAMESPACES[args.kind], document, verify)
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    print(f"root threshold met by {len(signers)} distinct root keys")
+    print(f"root threshold met by {len(signers)} distinct root keys; every signature verified")
+
+
+def minisign_sign(parser, args):
+    """--minisign-sign: the legacy release key signs one file (scripts/release.sh, migration bundle).
+
+    The key location arrives on stdin like every production key location; minisign
+    sees only the neutral link, the child environment and the terminal as stdin
+    (it reads its password there). Nothing is written unless minisign succeeds;
+    an existing output is never overwritten. The caller verifies the result.
+    """
+    if any(value is not None for value in (args.template, args.artifacts_dir, args.bundle, args.expires_at_unix,
+                                           args.key, args.key_count, args.root_metadata, args.root_sha256,
+                                           args.signatures, args.test_signer)):
+        parser.error("--minisign-sign takes only --trusted-comment, --output and --minisign")
+    comment = args.trusted_comment
+    if args.output is None or comment is None:
+        parser.error("--minisign-sign requires --trusted-comment and --output")
+    if not comment or len(comment) > 1024 or not comment.isprintable():
+        parser.error("--trusted-comment must be one printable line")
+    try:
+        refuse_key_variables()
+        tool = resolve_tool(args.minisign, "--minisign")
+        source = os.lstat(args.minisign_sign)
+        if not stat.S_ISREG(source.st_mode) or source.st_size == 0:
+            raise ValueError("--minisign-sign must name a nonempty regular file")
+        if args.output.exists() or args.output.is_symlink():
+            raise ValueError("output already exists")
+        [key] = read_key_locations(1)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    with tempfile.TemporaryDirectory(prefix="duduclaw-minisign-") as temporary:
+        staged = Path(temporary) / "signature.minisig"
+        try:
+            with neutral_key_link(key) as link, terminal_stdin() as terminal:
+                subprocess.run([tool, "-S", "-s", str(link), "-m", str(args.minisign_sign), "-t", comment,
+                                "-x", str(staged)], check=True, env=child_environment(), stdin=terminal)
+        except (OSError, subprocess.CalledProcessError):
+            parser.error("minisign -S failed; nothing was written")
+        try:
+            signature = staged.read_bytes()
+        except OSError:
+            signature = b""
+        if not signature:
+            parser.error("minisign wrote no signature; nothing was written")
+        with args.output.open("xb") as output:
+            output.write(signature)
 
 
 def main():
@@ -489,8 +770,8 @@ def main():
                         help="TEST-ONLY, with --test-signer: throwaway test key file; repeat for threshold "
                              "signatures. Production refuses it (see key locations above)")
     parser.add_argument("--key-count", type=int,
-                        help="production: number of signing keys (default 1; root/bundle: 2 or 3), each read "
-                             "from " + KEY_ENVIRONMENT.format("<n>") + " or the terminal prompt")
+                        help="production: number of signing keys (default 1; root/bundle: 2 or 3); their "
+                             "locations are read from stdin, one per line, key 1 first")
     parser.add_argument("--root-metadata", type=Path,
                         help="--kind bundle: the pinned canonical root.json whose root keys must sign")
     parser.add_argument("--root-sha256", help="expected SHA-256 (bootstrap pin) of the root metadata")
@@ -499,12 +780,27 @@ def main():
     parser.add_argument("--signatures", type=Path,
                         help="with --check-threshold: signatures JSON (default <document>.signatures.json)")
     parser.add_argument("--ssh-keygen", default="ssh-keygen",
-                        help="use Homebrew OpenSSH for FIDO2 support on macOS")
+                        help="absolute path (scripts/release.sh passes one), or a name looked up only in "
+                             + ", ".join(TOOL_DIRECTORIES) + "; use Homebrew OpenSSH for FIDO2 on macOS. "
+                             "Signs, and verifies every root-threshold signature (-Y verify)")
     parser.add_argument("--test-signer", type=Path,
-                        help="TEST-ONLY: duduclaw-isolation-test-signer instead of ssh-keygen (test key set only)")
+                        help="TEST-ONLY: duduclaw-isolation-test-signer instead of ssh-keygen (test key set only); "
+                             "its `verify` command checks root-threshold signatures")
+    parser.add_argument("--minisign-sign", type=Path,
+                        help="legacy release key: minisign-sign this file (key location on stdin)")
+    parser.add_argument("--trusted-comment", help="with --minisign-sign: the exact trusted comment")
+    parser.add_argument("--minisign", default="minisign",
+                        help="with --minisign-sign: absolute path, or a name looked up like --ssh-keygen")
     args = parser.parse_args()
     if args.test_signer is not None and args.ssh_keygen != "ssh-keygen":
         parser.error("--test-signer and --ssh-keygen are mutually exclusive")
+    if args.minisign_sign is not None:
+        if args.check_threshold is not None:
+            parser.error("--minisign-sign and --check-threshold are mutually exclusive")
+        minisign_sign(parser, args)
+        return
+    if args.trusted_comment is not None or args.minisign != "minisign":
+        parser.error("--trusted-comment/--minisign belong to --minisign-sign")
     if args.check_threshold is not None:
         check_written_threshold(parser, args)
         return
@@ -514,9 +810,9 @@ def main():
         parser.error("--output is required")
     if args.test_signer is None:
         if args.key:
-            parser.error("production signing never takes --key: key locations come from "
-                         + KEY_ENVIRONMENT.format("<n>") + " or the terminal prompt, because argv is visible "
-                         "to other local processes (--key is only for --test-signer)")
+            parser.error("production signing never takes --key: key locations are read from stdin, one per "
+                         "line, because argv is visible to other local processes (--key is only for "
+                         "--test-signer)")
         count = 1 if args.key_count is None else args.key_count
     else:
         if args.key_count is not None:
@@ -575,9 +871,16 @@ def main():
     signature_output = Path(str(args.output) + ".signatures.json")
     if args.output.exists() or signature_output.exists():
         parser.error("output already exists")
-    # Every refusal above happens before a key location is asked for or a key is touched.
+    # Every refusal above happens before a key location is read or a key is touched.
     try:
-        keys = args.key if args.test_signer is not None else key_locations(count)
+        if args.test_signer is None:
+            refuse_key_variables()
+            args.ssh_keygen = resolve_tool(args.ssh_keygen, "--ssh-keygen")
+        verify = None
+        if args.kind in THRESHOLD_KINDS:
+            verify = (isolation_test_signer_verifier(args.test_signer, root_bytes, args.kind)
+                      if args.test_signer is not None else ssh_keygen_verifier(args.ssh_keygen))
+        keys = args.key if args.test_signer is not None else read_key_locations(count)
     except ValueError as error:
         parser.error(str(error))
     # No output is published until every signer succeeds. Existing outputs are
@@ -588,18 +891,21 @@ def main():
         signatures = []
         for key in keys:
             if args.test_signer is not None:
-                subprocess.run(signer_command(args, key, stage), check=True)
+                subprocess.run(signer_command(args, key, stage), check=True, env=child_environment(),
+                               stdin=subprocess.DEVNULL)
             else:
-                with neutral_key_link(key) as link:
-                    subprocess.run(signer_command(args, link, stage), check=True)
+                with neutral_key_link(key) as link, terminal_stdin() as terminal:
+                    subprocess.run(signer_command(args, link, stage), check=True, env=child_environment(),
+                                   stdin=terminal)
             detached = Path(str(stage) + ".sig")
             signatures.append(detached.read_text(encoding="ascii"))
             detached.unlink()
         if args.kind in THRESHOLD_KINDS:
             # R2-5: signers are the keys embedded in the signatures, checked against the
-            # root metadata before anything is written (so nothing is left to delete).
+            # root metadata and verified cryptographically over `payload` before anything
+            # is written (so nothing is left to delete).
             try:
-                check_root_threshold(signatures, root_bytes, NAMESPACES[args.kind])
+                check_root_threshold(signatures, root_bytes, NAMESPACES[args.kind], payload, verify)
             except ValueError as error:
                 parser.error(f"{error}; nothing was written")
         if args.kind == "bundle":

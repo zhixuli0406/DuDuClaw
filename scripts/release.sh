@@ -12,7 +12,10 @@
 #                                                          # native Linux isolation release
 #
 # isolation-sign (plan R2 §4.2) runs after CI has published the tag's Linux
-# archives. It needs release/bootstrap-root.sha256 (added after the key
+# archives, in two stages: stage 1 (this working tree, no secret) snapshots the
+# tag's ceremony files into a private read-only directory and execs stage 2 from
+# that snapshot with an empty, allow-listed environment (see its --help). It
+# needs release/bootstrap-root.sha256 (added after the key
 # ceremony; without it there is no production pin and nothing to sign). Per
 # release it probes the released duduclaw-bootstrap (PRODUCTION <pin>), signs
 # the isolation manifest with the target key, uploads the update-service assets
@@ -66,6 +69,19 @@
 # Enterprise images default to CLOUD_BUILD=1 (native amd64 Cloud Build).
 # Set CLOUD_BUILD=0 only for a deliberate local Docker build.
 set -euo pipefail
+
+# isolation-sign (plan R2 §4.2): its trusted computing base must not be chosen by the
+# caller's PATH. These are the first statements executed for it, before any external
+# command; every tool is later resolved to an absolute path (isolation_resolve_tools).
+# Functions imported from the environment are recorded now, before this script defines
+# its own, so stage 1 can refuse them.
+ISOLATION_IMPORTED_FUNCTIONS=""
+if [[ "${1:-}" == "isolation-sign" ]]; then
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+    export PATH
+    hash -r
+    ISOLATION_IMPORTED_FUNCTIONS="$(declare -F)"
+fi
 
 # --- Config ---
 WORKSPACE_TOML="Cargo.toml"
@@ -401,14 +417,17 @@ run_verify() {
 # by the root threshold; later versions reach migrated hosts through the update
 # service. Adding a version here is an owner decision, never a routine edit.
 ISOLATION_MIGRATION_BUNDLE_VERSIONS="1.83.0"
+ISOLATION_REPO="zhixuli0406/DuDuClaw"
+# Paths RELATIVE TO THE CEREMONY SNAPSHOT: stage 2 reads them only from there.
 ISOLATION_PIN_FILE="release/bootstrap-root.sha256"
 ISOLATION_TEMPLATE="release/isolation/manifest-template.json"
-ISOLATION_REPO="zhixuli0406/DuDuClaw"
-ISOLATION_WORK=""
 # R2-2: the probe container image, by digest only (see the file's header).
 ISOLATION_PROBE_DIGEST_FILE="release/isolation/probe-image.digest"
-# R2-1: every file the ceremony executes or reads by path. Each must be
-# byte-identical to its blob at the checked-out tag before anything runs.
+ISOLATION_WORK=""
+ISOLATION_SNAPSHOT=""
+# R2-1: every file stage 2 reads or executes. Stage 1 writes each of them from the
+# TAG's blob into a private read-only snapshot; stage 2 runs only from that snapshot,
+# checks it holds exactly these files, and re-checks every byte against the tag.
 ISOLATION_CEREMONY_FILES=(
     scripts/release.sh
     scripts/package-linux-release.py
@@ -416,52 +435,125 @@ ISOLATION_CEREMONY_FILES=(
     scripts/check_glibc.py
     release/isolation/manifest-template.json
     release/isolation/probe-image.digest
+    release/isolation/README.md
     release/bootstrap-root.sha256
     crates/duduclaw-isolation/src/update.rs
     Cargo.toml
 )
-# R2-3: key locations come only from these variables or an attended prompt.
-ISOLATION_TARGET_KEY_VARIABLE="DUDUCLAW_ISOLATION_TARGET_KEY"
-ISOLATION_ROOT_KEY_VARIABLES=(DUDUCLAW_ISOLATION_ROOT_KEY_1 DUDUCLAW_ISOLATION_ROOT_KEY_2)
-ISOLATION_LEGACY_KEY_VARIABLE="DUDUCLAW_ISOLATION_LEGACY_MINISIGN_KEY"
+# The fixed PATH of the ceremony and where tools may come from (never the caller's PATH).
+ISOLATION_SYSTEM_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+ISOLATION_SYSTEM_DIRS="/usr/bin /bin /usr/sbin /sbin"
+ISOLATION_HOMEBREW_DIRS="/opt/homebrew/bin /usr/local/bin"
+# <variable suffix>:<command>. System tools only from ISOLATION_SYSTEM_DIRS; the others
+# from those, then ISOLATION_HOMEBREW_DIRS (ssh-keygen: Homebrew first, for FIDO2).
+ISOLATION_SYSTEM_TOOLS="ENV:env BASH:bash GIT:git PYTHON:python3 MKTEMP:mktemp MKDIR:mkdir RM:rm CHMOD:chmod CP:cp DATE:date UNAME:uname"
+ISOLATION_HOMEBREW_TOOLS="SSH_KEYGEN:ssh-keygen GH:gh MINISIGN:minisign DOCKER:docker"
+ISOLATION_TOOL_ENV="" ISOLATION_TOOL_BASH="" ISOLATION_TOOL_GIT="" ISOLATION_TOOL_PYTHON="" ISOLATION_TOOL_MKTEMP=""
+ISOLATION_TOOL_MKDIR="" ISOLATION_TOOL_RM="" ISOLATION_TOOL_CHMOD="" ISOLATION_TOOL_CP="" ISOLATION_TOOL_DATE=""
+ISOLATION_TOOL_UNAME="" ISOLATION_TOOL_SSH_KEYGEN="" ISOLATION_TOOL_GH="" ISOLATION_TOOL_MINISIGN="" ISOLATION_TOOL_DOCKER=""
+# Stage-2 markers: set only by stage 1's `env -i` exec (their names contain no "KEY").
+ISOLATION_SNAPSHOT_MARKER="DUDUCLAW_ISOLATION_CEREMONY_SNAPSHOT"
+ISOLATION_REPO_MARKER="DUDUCLAW_ISOLATION_CEREMONY_REPO"
+# Attended key-location prompts use the controlling terminal only.
+ISOLATION_TTY_IN="/dev/tty"
+ISOLATION_TTY_OUT="/dev/tty"
+# The complete environment of every child (isolation_child_environment) and of git.
+ISOLATION_CHILD_ENV=("PATH=$ISOLATION_SYSTEM_PATH")
+ISOLATION_GIT_ENV=("PATH=$ISOLATION_SYSTEM_PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 GIT_ATTR_NOSYSTEM=1 GIT_NO_LAZY_FETCH=1
+    LC_ALL=C)
+# No hook, fsmonitor, pager, attribute/ignore file, credential/askpass helper, replace
+# ref or transport. The ceremony only runs rev-parse, ls-tree, cat-file blob and
+# hash-object --no-filters, none of which runs a filter, textconv or alias.
+ISOLATION_GIT_OPTIONS=(--no-pager --no-replace-objects --literal-pathspecs
+    -c core.fsmonitor= -c core.hooksPath=/dev/null -c core.pager=cat -c protocol.allow=never
+    -c core.untrackedCache=false -c core.attributesFile=/dev/null -c core.excludesFile=/dev/null
+    -c core.askPass= -c credential.helper= -c diff.external= -c gc.auto=0 -c maintenance.auto=false)
 
 isolation_sign_usage() {
-    cat <<'EOF'
+    # Builtins only: --help runs before any tool is resolved.
+    local line
+    while IFS= read -r line; do printf '%s\n' "$line"; done <<'EOF'
 Usage: scripts/release.sh isolation-sign \
          --root-metadata <root.json> --root-signatures <root.json.signatures.json> \
-         --output-dir <new directory> [--ssh-keygen <Homebrew ssh-keygen>] \
+         --output-dir <new directory> [--ssh-keygen <absolute path of ssh-keygen>] \
          [--manifest-valid-days <1-1830, default 365>] \
          [--migration-bundle [--authorization-valid-days <1-1830, default 730>]] \
-         [--no-upload]
-
-Key locations are NEVER command-line arguments (any local process can read
-argv): each comes from its environment variable or, when that is unset, from
-an attended prompt on the terminal (echoed; a location is not a secret):
-  DUDUCLAW_ISOLATION_TARGET_KEY            target key handle
-  DUDUCLAW_ISOLATION_ROOT_KEY_1 / _2       --migration-bundle: R1 handle, R2 key
-  DUDUCLAW_ISOLATION_LEGACY_MINISIGN_KEY   --migration-bundle: legacy minisign key
-                                           (empty prompt answer: ~/.minisign/duduclaw-release.key)
-They reach the signers only through the environment. ssh-keygen / minisign are
-given `-f`/`-s <private 0700 temp dir>/signing-key`, a symlink to the real key
-that is removed right after. Residual exposure: while ssh-keygen or minisign
-runs (the signing moment, on this offline ceremony machine) its argv shows that
-neutral temporary name, and only your own user (and root) can read the link or
-the environment.
+         [--no-upload] [--preflight]
 
 OFFLINE signing of the native Linux isolation release (plan R2 §4.2). Run it
 attended, in an interactive terminal, on the release machine with the hardware
-key attached, from a clean checkout of tag v<version>, after CI has published
-that tag's Linux archives. Never in CI; never with stdin/stdout sent to a log.
+key attached, from a checkout whose HEAD is tag v<version>, after CI has
+published that tag's Linux archives. Never in CI; never with stdin/stdout sent
+to a log. Start it from a clean login shell: exported shell functions, BASH_ENV
+and shell tracing are refused.
+
+Two stages (what you will see):
+  STAGE 1 runs from this working tree and handles NO secret. Its first statement
+  sets PATH=/usr/bin:/bin:/usr/sbin:/sbin. It refuses CI, any
+  DUDUCLAW_ISOLATION_*KEY* environment variable, wrong options, a
+  non-interactive terminal, a missing release/bootstrap-root.sha256 and a HEAD
+  that is not tag v<version>. It resolves every tool ONCE to an absolute path:
+  env, bash, git, python3, mktemp, mkdir, rm, chmod, cp, date and uname only
+  from /usr/bin /bin /usr/sbin /sbin; gh, minisign and docker from those, then
+  /opt/homebrew/bin and /usr/local/bin; ssh-keygen from --ssh-keygen (which must
+  name ssh-keygen in one of those directories) or else Homebrew first (FIDO2 on
+  macOS), then the system. A tool that is not a regular executable file (after
+  resolving links) owned by root or you, or whose directory (as named, and after
+  resolving links) is group/other-writable or owned by someone else, is refused.
+  For every trusted tool directory owned by YOUR user (Homebrew on Apple Silicon)
+  you see one line:
+    NOTICE: trusting <directory>: this tool directory is owned by your user, ...
+  git runs without any GIT_* variable of yours, with GIT_CONFIG_NOSYSTEM=1,
+  GIT_CONFIG_GLOBAL=/dev/null and no hook, fsmonitor, pager, filter, alias or
+  transport. Stage 1 then writes each ceremony file FROM THE TAG'S BLOB (git
+  cat-file blob, never the working tree) into a new private directory (yours,
+  0700), checks each against its blob id (git hash-object --no-filters), makes
+  the files 0400 and the directories 0500, prints
+    Stage 1: snapshot of v<version> (<commit>) in <directory>; continuing from it (stage 2).
+  and execs that snapshot's scripts/release.sh through env -i with only PATH,
+  HOME, TERM, LANG/LC_ALL/LC_CTYPE and two marker variables (no SSH_AUTH_SOCK).
+  STAGE 2 runs only from such a snapshot and refuses otherwise (the directory is
+  yours, 0500/0700, holds exactly the ceremony files, read-only, and $0 is its
+  scripts/release.sh). It repeats the tool resolution, the git scrubbing and
+  every precondition, re-checks every snapshot byte against tag v<version> of the
+  original repository (blob ids recomputed by python3), and prints the tools it
+  uses. After that NOTHING of the working tree is read or executed: the scripts,
+  template, pin and probe digests come from the snapshot (a file changed in the
+  working tree after stage 1 is irrelevant), the released archives come from
+  GitHub, --root-metadata must match the pin. Python helpers run only from the
+  snapshot as <absolute python3> -I -B; every child process gets the same
+  allow-listed environment. The snapshot and all temporary files are removed on
+  every exit (success, failure, Ctrl-C). --preflight stops after the
+  preconditions: nothing is signed and no key location is asked for.
+
+Key locations are NEVER command-line arguments (any local process can read
+argv) and NEVER environment variables (every child would inherit them): stage 2
+asks for each at an attended prompt on the terminal (echoed; a location is not a
+secret) and keeps it only in an unexported shell variable:
+  target key handle                         every release
+  root key R1, root key R2                  --migration-bundle
+  legacy release minisign key               --migration-bundle
+                                            (empty answer: ~/.minisign/duduclaw-release.key)
+Each reaches its signer helper ONLY on the helper's stdin, one location per
+line, in this order: the target key (package-linux-release.py
+--signing-key-stdin, which passes it on to sign-isolation-manifest.py's stdin);
+R1 then R2 (sign-isolation-manifest.py --kind bundle --key-count 2); the legacy
+key (sign-isolation-manifest.py --minisign-sign). The helper links it as
+<private 0700 temp dir>/signing-key and starts ssh-keygen / minisign with that
+neutral name, an explicit minimal environment (no key variable, no
+SSH_AUTH_SOCK) and the terminal for your PIN / passphrase; the link is removed
+right after. Residual exposure: while ssh-keygen or minisign runs its argv shows
+the neutral temporary name, and only your own user (and root) can read the link.
 
 Steps, in order (any failure stops everything; no output is ever overwritten):
-  0. Preconditions: not CI, interactive terminal, release/bootstrap-root.sha256
-     present (absent = no production pin = nothing to sign), HEAD at tag
-     v<version>, no change and NO untracked file anywhere in the checkout, no
-     ignored file (e.g. __pycache__) under scripts/ or release/, no index flag
-     but H in `git ls-files -v` (assume-unchanged / skip-worktree refused), every
-     ceremony file byte-identical to its blob at the tag; SHA-256 of
-     --root-metadata equal to the pin and its signatures meeting its own root
-     threshold; gh/minisign/ssh-keygen. Every Python step runs as python3 -I -B.
+  0. Preconditions (stage 2, again): not CI, interactive terminal,
+     release/bootstrap-root.sha256 in the snapshot (absent = no production pin =
+     nothing to sign), HEAD at tag v<version>, every snapshot file
+     byte-identical to its blob at the tag; SHA-256 of --root-metadata equal to
+     the pin and its signatures meeting its own root threshold, each verified
+     with ssh-keygen -Y verify; --output-dir absent; gh, minisign and docker
+     resolved.
   For x86_64 and aarch64:
   1. Download duduclaw-linux-<arch>.tar.gz (+ .sha256, .minisig) of the tag; verify
      the CI minisign signature with the official release key and its exact
@@ -484,8 +576,10 @@ Steps, in order (any failure stops everything; no output is ever overwritten):
      (minisign asks for its password); both are verified before going on. The
      signers are identified by the keys embedded in the signatures (two paths to
      one key are one signer): distinct, registered in --root-metadata, not
-     revoked, meeting its threshold; otherwise the authorization is deleted and
-     nothing is added to the upload list.
+     revoked, meeting its threshold, each signature in the shape the Rust
+     verifier accepts and verified with ssh-keygen -Y verify over the exact
+     bytes; otherwise the authorization is deleted and nothing is added to the
+     upload list.
   Then:
   5. Write <output-dir>/SHA256SUMS-isolation.txt from the exact bytes to upload,
      plus "<pin>  root.json" (the root metadata fingerprint).
@@ -500,8 +594,11 @@ Secrets: key files and key handles are opened only by ssh-keygen / minisign,
 which prompt on the terminal. This script never copies, prints or logs a key,
 passphrase or PIN; its temporary directory holds public release data and, only
 while a signer runs, the neutral `signing-key` symlink; it is removed on exit.
-Before the docker probe can run, pre-pull the digests of
-release/isolation/probe-image.digest yourself (docker pull --platform ... ubuntu@sha256:...).
+gh and docker see only HOME (their own configuration): log in with
+`gh auth login` and select the docker context beforehand (GH_TOKEN, DOCKER_HOST
+and similar variables are not passed). Before the docker probe can run, pre-pull
+the digests of release/isolation/probe-image.digest yourself (docker pull
+--platform ... ubuntu@sha256:...).
 EOF
 }
 
@@ -511,7 +608,7 @@ isolation_fail() {
 }
 
 isolation_sha256() {
-    python3 -I -B -c 'import hashlib, sys
+    isolation_run "$ISOLATION_TOOL_PYTHON" -I -B -c 'import hashlib, sys
 digest = hashlib.sha256()
 with open(sys.argv[1], "rb") as source:
     for chunk in iter(lambda: source.read(1 << 20), b""):
@@ -521,7 +618,7 @@ print(digest.hexdigest())' "$1"
 
 # Exact minisign text: four lines, prehashed (ED) signature, exact trusted comment.
 isolation_check_minisig() {
-    python3 -I -B - "$1" "$2" <<'PY'
+    isolation_run "$ISOLATION_TOOL_PYTHON" -I -B - "$1" "$2" <<'PY'
 import base64, binascii, sys
 try:
     with open(sys.argv[1], "rb") as source:
@@ -535,106 +632,488 @@ sys.exit(0 if ok else 1)
 PY
 }
 
-# R2-1: the ceremony runs only on a checkout that is exactly tag $1. Rule:
-#  - HEAD is the tag's commit, and the shell runs at the repository top level;
-#  - no tracked change and NO untracked file anywhere (any untracked file refuses);
-#  - no ignored file under scripts/ or release/, the only directories the ceremony
-#    executes or loads code from (this also catches __pycache__, which importlib
-#    would read for scripts loaded by path). Ignored build output elsewhere (e.g.
-#    target/, web/node_modules) is allowed: every Python step runs as
-#    `python3 -I -B`, so neither the working directory nor the script directory is
-#    on sys.path, PYTHON* variables and the user site are ignored, and no
-#    bytecode is written; nothing outside scripts/ and release/ is executed;
-#  - `git ls-files -v` shows only "H" (assume-unchanged / skip-worktree hide edits
-#    from git status);
-#  - every ISOLATION_CEREMONY_FILES entry is a regular file byte-identical to its
-#    blob at the tag (git cat-file + cmp), whatever git status believes.
-# git runs with fsmonitor and the untracked cache disabled, so no hook or cache
-# can shape these answers.
-isolation_check_checkout() {
-    local tag="$1" head tag_commit top listing path blob
-    local -a git_plain=(git -c core.fsmonitor=false -c core.untrackedCache=false)
-    top="$("${git_plain[@]}" rev-parse --show-toplevel)" || { isolation_fail "not a git checkout"; return 1; }
-    if [[ "$top" != "$(pwd -P)" ]]; then
-        isolation_fail "run isolation-sign from the repository top level"; return 1
+# Every child process of the ceremony: `env -i` (the resolved env) plus exactly
+# ISOLATION_CHILD_ENV, and an absolute program path (never a bare name).
+isolation_run() {
+    "$ISOLATION_TOOL_ENV" -i "${ISOLATION_CHILD_ENV[@]}" "$@"
+}
+
+# Every git call goes through here: scrubbed environment (ISOLATION_GIT_ENV, no GIT_*
+# of the caller, no system/global config) and ISOLATION_GIT_OPTIONS.
+isolation_git() {
+    "$ISOLATION_TOOL_ENV" -i "${ISOLATION_GIT_ENV[@]}" "$ISOLATION_TOOL_GIT" "${ISOLATION_GIT_OPTIONS[@]}" "$@"
+}
+
+# R2-3 hand-off: `isolation_handoff <n> <location 1> .. <location n> <program> <args>`
+# runs the helper with the n key locations on its STDIN, one per line, in the given
+# order. printf is a builtin: no process ever has a location in its argv or environment.
+isolation_handoff() {
+    local count="$1" index
+    local -a locations=()
+    shift
+    for (( index = 0; index < count; index++ )); do
+        locations+=("$1")
+        shift
+    done
+    printf '%s\n' "${locations[@]}" | isolation_run "$@"
+}
+
+# Allow-listed environment for children (and for stage 2): fixed PATH, HOME, TERM, locale.
+isolation_child_environment() {
+    local name value
+    ISOLATION_CHILD_ENV=("PATH=$ISOLATION_SYSTEM_PATH")
+    if [[ "${HOME:-}" == /* && "$HOME" != *$'\n'* ]]; then ISOLATION_CHILD_ENV+=("HOME=$HOME"); fi
+    for name in TERM LANG LC_ALL LC_CTYPE; do
+        value="${!name:-}"
+        if [[ "$value" =~ ^[A-Za-z0-9_.@-]+$ ]]; then ISOLATION_CHILD_ENV+=("$name=$value"); fi
+    done
+}
+
+# Refusals that need no tool and no secret, first in both stages.
+isolation_refuse_hostile_start() {
+    local name
+    if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
+        isolation_fail "isolation-sign uses offline keys and never runs in CI"; return 1
     fi
-    head="$("${git_plain[@]}" rev-parse --verify HEAD)" || { isolation_fail "cannot read HEAD"; return 1; }
-    tag_commit="$("${git_plain[@]}" rev-parse --verify --quiet "refs/tags/$tag^{commit}" || true)"
-    if [[ -z "$tag_commit" || "$head" != "$tag_commit" ]]; then
-        isolation_fail "check out tag $tag first: the template, pin file and released archives must belong to it"
+    for name in ${!DUDUCLAW_ISOLATION_@}; do
+        case "$name" in
+            *KEY*)
+                isolation_fail "$name is set: key locations are entered only at the attended prompt, never" \
+                    "through the environment (every child process would inherit it); unset it and start again"
+                return 1 ;;
+        esac
+    done
+    if [[ -n "$ISOLATION_IMPORTED_FUNCTIONS" || -n "${BASH_ENV:-}" ]]; then
+        isolation_fail "the environment exports shell functions or BASH_ENV, which can replace commands of this" \
+            "script; start isolation-sign from a clean login shell"
         return 1
     fi
-    listing="$("${git_plain[@]}" status --porcelain=v1 --untracked-files=all)" \
-        || { isolation_fail "git status failed"; return 1; }
-    if [[ -n "$listing" ]]; then
-        isolation_fail "the working tree has uncommitted changes or untracked files (any untracked file is refused)"
-        return 1
-    fi
-    listing="$("${git_plain[@]}" status --porcelain=v1 --untracked-files=all --ignored=matching -- scripts release)" \
-        || { isolation_fail "git status failed"; return 1; }
-    if [[ -n "$listing" ]]; then
-        isolation_fail "ignored files exist under scripts/ or release/ (e.g. __pycache__); remove them" \
-            "(git clean -ndX -- scripts release lists them)"
-        return 1
-    fi
-    listing="$("${git_plain[@]}" ls-files -v)" || { isolation_fail "git ls-files failed"; return 1; }
-    if [[ -n "$listing" ]] && grep -q -v '^H ' <<< "$listing"; then
-        isolation_fail "tracked files carry index flags (assume-unchanged, skip-worktree, ...):" \
-            "git ls-files -v must show only H"
-        return 1
-    fi
-    for path in "${ISOLATION_CEREMONY_FILES[@]}"; do
-        if [[ ! -f "$path" || -L "$path" ]]; then
-            isolation_fail "$path is missing or not a regular file"; return 1
+    case "$-" in
+        *x*|*v*) isolation_fail "shell tracing (set -x / -v) is on; it is refused for the ceremony"; return 1 ;;
+    esac
+}
+
+# Unset every GIT_* variable before the first git call (isolation_git also starts
+# git through env -i with ISOLATION_GIT_ENV only).
+isolation_scrub_git_environment() {
+    local name
+    for name in ${!GIT_@}; do unset "$name"; done
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0
+}
+
+# Resolves ISOLATION_TOOL_<NAME> once to absolute paths (rule: ISOLATION_SYSTEM_TOOLS
+# only from ISOLATION_SYSTEM_DIRS; ISOLATION_HOMEBREW_TOOLS from those, then
+# ISOLATION_HOMEBREW_DIRS, ssh-keygen Homebrew first unless --ssh-keygen names
+# ssh-keygen in one of these directories). python3 (from a system directory) then
+# audits every candidate: a regular executable after resolving links, owned by root
+# or you, not group/other-writable, in directories (as named and resolved) owned by
+# root or you and not group/other-writable; one NOTICE line names each trusted
+# directory owned by you. gh, minisign and docker may be absent here; stage 2 refuses
+# before any prompt if they are (isolation_require_tools). Everything else must exist.
+ISOLATION_TOOL_AUDIT_PY='import os, stat, sys
+uid = os.geteuid()
+trusted = []
+def directory_ok(path):
+    try:
+        info = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, uid) or info.st_mode & 0o022:
+        return False
+    if info.st_uid != 0 and path not in trusted:
+        trusted.append(path)
+    return True
+status = 0
+for argument in sys.argv[1:]:
+    name, _, candidate = argument.partition("=")
+    real = os.path.realpath(candidate)
+    try:
+        info = os.stat(real)
+        ok = (os.path.isabs(candidate) and stat.S_ISREG(info.st_mode) and os.access(real, os.X_OK)
+              and info.st_uid in (0, uid) and not info.st_mode & 0o022
+              and not any(character in real for character in "\t\n=")
+              and directory_ok(os.path.dirname(candidate)) and directory_ok(os.path.dirname(real)))
+    except OSError:
+        ok = False
+    if not ok:
+        sys.stderr.write("Error: refusing " + candidate + ": not a regular executable owned by root or you, or its"
+                         " directory is group/other-writable or owned by someone else\n")
+        status = 1
+        continue
+    sys.stdout.write(name + "\t" + real + "\n")
+for path in trusted:
+    sys.stderr.write("NOTICE: trusting " + path + ": this tool directory is owned by your user, not root;"
+                     " anything running as you could replace its tools.\n")
+sys.exit(status)'
+isolation_resolve_tools() {
+    local entry variable name directory candidate dirs output env_path="" python_path=""
+    local -a audit=()
+    for entry in $ISOLATION_SYSTEM_TOOLS $ISOLATION_HOMEBREW_TOOLS; do
+        variable="${entry%%:*}"
+        name="${entry#*:}"
+        printf -v "ISOLATION_TOOL_$variable" '%s' ""
+        case " $ISOLATION_SYSTEM_TOOLS " in
+            *" $entry "*) dirs="$ISOLATION_SYSTEM_DIRS" ;;
+            *) dirs="$ISOLATION_SYSTEM_DIRS $ISOLATION_HOMEBREW_DIRS" ;;
+        esac
+        if [[ "$variable" == "SSH_KEYGEN" ]]; then dirs="$ISOLATION_HOMEBREW_DIRS $ISOLATION_SYSTEM_DIRS"; fi
+        candidate=""
+        if [[ "$variable" == "SSH_KEYGEN" && -n "$ISOLATION_SSH_KEYGEN_OPTION" ]]; then
+            case " $dirs " in
+                *" ""${ISOLATION_SSH_KEYGEN_OPTION%/*}"" "*) ;;
+                *) isolation_fail "--ssh-keygen must be the absolute path of ssh-keygen in one of: $dirs"; return 1 ;;
+            esac
+            if [[ "${ISOLATION_SSH_KEYGEN_OPTION##*/}" != "ssh-keygen" ]]; then
+                isolation_fail "--ssh-keygen must be the absolute path of ssh-keygen in one of: $dirs"; return 1
+            fi
+            candidate="$ISOLATION_SSH_KEYGEN_OPTION"
+        else
+            for directory in $dirs; do
+                if [[ -e "$directory/$name" ]]; then candidate="$directory/$name"; break; fi
+            done
         fi
-        blob="$("${git_plain[@]}" rev-parse --verify --quiet "$tag_commit:$path")" \
-            || { isolation_fail "$path is not tracked at $tag"; return 1; }
-        if ! "${git_plain[@]}" cat-file blob "$blob" | cmp -s - "$path"; then
-            isolation_fail "$path differs from its blob at $tag"; return 1
+        if [[ -z "$candidate" ]]; then
+            case "$variable" in
+                GH|MINISIGN|DOCKER) continue ;;
+            esac
+            isolation_fail "$name not found in $dirs (the ceremony never searches PATH)"; return 1
+        fi
+        if [[ "$variable" == "ENV" ]]; then env_path="$candidate"; fi
+        if [[ "$variable" == "PYTHON" ]]; then python_path="$candidate"; fi
+        audit+=("$variable=$candidate")
+    done
+    output="$("$env_path" -i "PATH=$ISOLATION_SYSTEM_PATH" "$python_path" -I -B -c "$ISOLATION_TOOL_AUDIT_PY" \
+        "${audit[@]}")" || { isolation_fail "a ceremony tool failed the location audit (above)"; return 1; }
+    while IFS=$'\t' read -r variable candidate; do
+        case " $ISOLATION_SYSTEM_TOOLS $ISOLATION_HOMEBREW_TOOLS " in
+            *" ""$variable"":"*) printf -v "ISOLATION_TOOL_$variable" '%s' "$candidate" ;;
+            *) isolation_fail "unexpected tool audit output"; return 1 ;;
+        esac
+    done <<< "$output"
+    for entry in $ISOLATION_SYSTEM_TOOLS SSH_KEYGEN:ssh-keygen; do
+        variable="ISOLATION_TOOL_${entry%%:*}"
+        if [[ "${!variable}" != /* ]]; then isolation_fail "${entry#*:} could not be resolved"; return 1; fi
+    done
+}
+
+# Stage 2, before any prompt: the tools only some steps use must exist as well.
+isolation_require_tools() {
+    local entry variable
+    for entry in GH:gh MINISIGN:minisign DOCKER:docker; do
+        variable="ISOLATION_TOOL_${entry%%:*}"
+        if [[ "${!variable}" != /* ]]; then
+            isolation_fail "${entry#*:} not found in $ISOLATION_SYSTEM_DIRS $ISOLATION_HOMEBREW_DIRS" \
+                "(the ceremony never searches PATH)"
+            return 1
         fi
     done
 }
 
-# R2-3: one key location, from the named variable or an attended prompt on the
-# controlling terminal (echo on), never from argv. Prints the absolute location.
-# $3 (optional) is used when the prompt answer is empty. Messages name the
-# variable, never the location.
-isolation_key_location() {
-    local variable="$1" label="$2" fallback="${3:-}" value
-    value="${!variable:-}"
-    if [[ -z "$value" ]]; then
-        if ! { exec 3<>/dev/tty; } 2>/dev/null; then
-            isolation_fail "no terminal for the $label prompt: set $variable"; return 1
-        fi
-        printf 'Location of the %s (a path, not a secret; or set %s): ' "$label" "$variable" >&3
-        IFS= read -r value <&3 || value=""
-        exec 3>&-
-        if [[ -z "$value" ]]; then value="$fallback"; fi
+# Option parsing shared by both stages (sets ISOLATION_* option variables).
+isolation_parse_arguments() {
+    ISOLATION_ROOT_METADATA="" ISOLATION_ROOT_SIGNATURES="" ISOLATION_OUTPUT_DIR="" ISOLATION_SSH_KEYGEN_OPTION=""
+    ISOLATION_MANIFEST_DAYS=365 ISOLATION_AUTHORIZATION_DAYS=730 ISOLATION_BUNDLE_OPTION=0 ISOLATION_UPLOAD=1
+    ISOLATION_PREFLIGHT=0 ISOLATION_HELP=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) ISOLATION_HELP=1; return 0 ;;
+            --target-key|--root-key|--legacy-minisign-key)
+                isolation_fail "$1 is refused: key locations are never command-line arguments (other local" \
+                    "processes can read argv) nor environment variables; answer the attended prompt (see --help)"
+                return 1 ;;
+            --root-metadata) ISOLATION_ROOT_METADATA="${2:?--root-metadata needs a value}"; shift 2 ;;
+            --root-signatures) ISOLATION_ROOT_SIGNATURES="${2:?--root-signatures needs a value}"; shift 2 ;;
+            --output-dir) ISOLATION_OUTPUT_DIR="${2:?--output-dir needs a value}"; shift 2 ;;
+            --ssh-keygen) ISOLATION_SSH_KEYGEN_OPTION="${2:?--ssh-keygen needs a value}"; shift 2 ;;
+            --manifest-valid-days) ISOLATION_MANIFEST_DAYS="${2:?--manifest-valid-days needs a value}"; shift 2 ;;
+            --authorization-valid-days)
+                ISOLATION_AUTHORIZATION_DAYS="${2:?--authorization-valid-days needs a value}"; shift 2 ;;
+            --migration-bundle) ISOLATION_BUNDLE_OPTION=1; shift ;;
+            --no-upload) ISOLATION_UPLOAD=0; shift ;;
+            --preflight) ISOLATION_PREFLIGHT=1; shift ;;
+            *) isolation_fail "unknown isolation-sign option '$1' (see --help)"; return 1 ;;
+        esac
+    done
+}
+
+# Owner decision Q6, required options and validity windows for version $1.
+isolation_check_arguments() {
+    local version="$1" bundle_release=0 listed days
+    for listed in $ISOLATION_MIGRATION_BUNDLE_VERSIONS; do
+        if [[ "$listed" == "$version" ]]; then bundle_release=1; fi
+    done
+    if [[ "$ISOLATION_BUNDLE_OPTION" == "1" && "$bundle_release" == "0" ]]; then
+        isolation_fail "owner decision Q6: only v$ISOLATION_MIGRATION_BUNDLE_VERSIONS ships a migration bundle;" \
+            "v$version reaches migrated hosts through the update service. Drop --migration-bundle."
+        return 1
     fi
+    if [[ "$ISOLATION_BUNDLE_OPTION" == "0" && "$bundle_release" == "1" ]]; then
+        isolation_fail "v$version is the migration-bundle release (owner decision Q6);" \
+            "pass --migration-bundle (the R1 and R2 key locations are asked for at the prompt)."
+        return 1
+    fi
+    if [[ -z "$ISOLATION_ROOT_METADATA" || -z "$ISOLATION_ROOT_SIGNATURES" || -z "$ISOLATION_OUTPUT_DIR" ]]; then
+        isolation_fail "--root-metadata, --root-signatures and --output-dir are required (see --help)"
+        return 1
+    fi
+    for days in "$ISOLATION_MANIFEST_DAYS" "$ISOLATION_AUTHORIZATION_DAYS"; do
+        if [[ ! "$days" =~ ^[1-9][0-9]{0,3}$ ]] || (( days > 1830 )); then
+            isolation_fail "validity must be 1 to 1830 days"; return 1
+        fi
+    done
+}
+
+# The first `version = "x.y.z"` line of Cargo.toml $1 (as extract_version), builtins only.
+isolation_read_version() {
+    local line pattern='^version = "([0-9]+\.[0-9]+\.[0-9]+)"'
+    if [[ ! -f "$1" || -L "$1" ]]; then return 1; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $pattern ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done < "$1"
+    return 1
+}
+
+# The blob id of $2 at commit $1: a regular file (mode 100644/100755), never a link
+# or submodule, exactly that path.
+isolation_tag_blob() {
+    local listing pattern="^(100644|100755) blob ([0-9a-f]{40}|[0-9a-f]{64})"$'\t'"(.+)$"
+    listing="$(isolation_git ls-tree "$1" -- "$2")" || { isolation_fail "git ls-tree failed for $2"; return 1; }
+    if [[ ! "$listing" =~ $pattern || "${BASH_REMATCH[3]}" != "$2" ]]; then
+        isolation_fail "$2 is not a regular file tracked at the tag"; return 1
+    fi
+    printf '%s\n' "${BASH_REMATCH[2]}"
+}
+
+# Removes the ceremony snapshot and the work directory (EXIT trap of both stages; stage
+# 1's trap disappears with its exec, so a snapshot outlives stage 1 only into stage 2).
+isolation_cleanup() {
+    if [[ -n "$ISOLATION_WORK" && -d "$ISOLATION_WORK" ]]; then
+        isolation_run "$ISOLATION_TOOL_RM" -rf -- "$ISOLATION_WORK" || true
+    fi
+    if [[ -n "$ISOLATION_SNAPSHOT" && -d "$ISOLATION_SNAPSHOT" ]]; then
+        isolation_run "$ISOLATION_TOOL_CHMOD" -R u+w -- "$ISOLATION_SNAPSHOT" || true
+        isolation_run "$ISOLATION_TOOL_RM" -rf -- "$ISOLATION_SNAPSHOT" || true
+    fi
+}
+
+isolation_set_traps() {
+    trap isolation_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+# A private base for the snapshot: TMPDIR if it is yours with mode 0700 (macOS), else /tmp
+# (root-owned, sticky).
+ISOLATION_TMP_AUDIT_PY='import os, stat, sys
+uid = os.geteuid()
+for candidate in (sys.argv[1], "/tmp"):
+    if not candidate or not os.path.isabs(candidate):
+        continue
+    real = os.path.realpath(candidate)
+    try:
+        info = os.stat(real)
+    except OSError:
+        continue
+    private = info.st_uid == uid and not info.st_mode & 0o077
+    shared = info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+    if stat.S_ISDIR(info.st_mode) and (private or shared) and "\n" not in real:
+        print(real)
+        sys.exit(0)
+sys.exit("Error: no private (yours, 0700) or root-owned sticky directory for the ceremony snapshot")'
+
+# STAGE 1 (runs from the mutable working tree; handles NO secret). Pre-checks, then a
+# private snapshot of the TAG's ceremony files, then exec of the snapshot's release.sh
+# with an empty, allow-listed environment. Nothing here is trusted by stage 2.
+isolation_stage1() {
+    isolation_refuse_hostile_start || return 1
+    isolation_parse_arguments "$@" || return 1
+    if [[ "$ISOLATION_HELP" == "1" ]]; then isolation_sign_usage; return 0; fi
+    local version
+    version="$(isolation_read_version Cargo.toml)" \
+        || { isolation_fail "run isolation-sign from the repository top level (no Cargo.toml version here)"; return 1; }
+    isolation_check_arguments "$version" || return 1
+    if [[ ! -t 0 ]]; then
+        isolation_fail "isolation-sign must run attended in an interactive terminal (keys prompt on the tty)"
+        return 1
+    fi
+    if [[ ! -f "$ISOLATION_PIN_FILE" || -L "$ISOLATION_PIN_FILE" ]]; then
+        isolation_fail "$ISOLATION_PIN_FILE is absent: there is no production root pin, so no isolation" \
+            "release can be signed (the key ceremony adds it through a reviewed PR)."
+        return 1
+    fi
+    isolation_scrub_git_environment
+    isolation_resolve_tools || return 1
+    isolation_child_environment
+    local tag="v$version" top head tag_commit base path id file recomputed
+    top="$(isolation_git rev-parse --show-toplevel)" || { isolation_fail "not a git checkout"; return 1; }
+    if [[ "$top" != "$(pwd -P)" ]]; then
+        isolation_fail "run isolation-sign from the repository top level"; return 1
+    fi
+    head="$(isolation_git rev-parse --verify HEAD)" || { isolation_fail "cannot read HEAD"; return 1; }
+    tag_commit="$(isolation_git rev-parse --verify --quiet "refs/tags/$tag^{commit}")" || tag_commit=""
+    if [[ -z "$tag_commit" || "$head" != "$tag_commit" ]]; then
+        isolation_fail "check out tag $tag first: the template, pin file and released archives must belong to it"
+        return 1
+    fi
+    base="$(isolation_run "$ISOLATION_TOOL_PYTHON" -I -B -c "$ISOLATION_TMP_AUDIT_PY" "${TMPDIR:-}")" || return 1
+    umask 077
+    ISOLATION_SNAPSHOT="$(isolation_run "$ISOLATION_TOOL_MKTEMP" -d "$base/duduclaw-isolation-ceremony.XXXXXX")" \
+        || { isolation_fail "cannot create the ceremony snapshot directory"; return 1; }
+    isolation_set_traps
+    for path in "${ISOLATION_CEREMONY_FILES[@]}"; do
+        id="$(isolation_tag_blob "$tag_commit" "$path")" || return 1
+        file="$ISOLATION_SNAPSHOT/$path"
+        isolation_run "$ISOLATION_TOOL_MKDIR" -p -m 0700 -- "${file%/*}" || return 1
+        isolation_git cat-file blob "$id" > "$file" || { isolation_fail "git cat-file failed for $path"; return 1; }
+        recomputed="$(isolation_git hash-object --no-filters -t blob -- "$file")" || return 1
+        if [[ "$recomputed" != "$id" ]]; then
+            isolation_fail "$path written to the snapshot is not its blob $id at $tag"; return 1
+        fi
+    done
+    isolation_run "$ISOLATION_TOOL_CHMOD" -R u=rX,go= -- "$ISOLATION_SNAPSHOT" || return 1
+    echo "Stage 1: snapshot of $tag ($tag_commit) in $ISOLATION_SNAPSHOT; continuing from it (stage 2)."
+    exec "$ISOLATION_TOOL_ENV" -i "${ISOLATION_CHILD_ENV[@]}" "$ISOLATION_SNAPSHOT_MARKER=$ISOLATION_SNAPSHOT" \
+        "$ISOLATION_REPO_MARKER=$top" "$ISOLATION_TOOL_BASH" "$ISOLATION_SNAPSHOT/scripts/release.sh" isolation-sign "$@"
+}
+
+# Stage 2's own check of the snapshot it runs from: an absolute physical directory owned
+# by you, mode 0500/0700, in a directory that is yours or root-owned (and sticky when
+# shared); every entry a directory (0500/0700) on the way to a listed file or a listed
+# regular file (yours, read-only, one link); exactly the listed files; and $0 is its
+# scripts/release.sh.
+ISOLATION_SNAPSHOT_AUDIT_PY='import os, stat, sys
+snapshot, script, files = sys.argv[1], sys.argv[2], set(sys.argv[3:])
+uid = os.geteuid()
+def fail(message):
+    sys.exit("Error: not a valid ceremony snapshot: " + message)
+if not os.path.isabs(snapshot) or os.path.realpath(snapshot) != snapshot:
+    fail("the snapshot path is not absolute and physical")
+info = os.lstat(snapshot)
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) not in (0o500, 0o700):
+    fail("the snapshot directory is not yours with mode 0500 or 0700")
+parent = os.stat(os.path.dirname(snapshot))
+if parent.st_uid not in (0, uid) or (parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX):
+    fail("the snapshot sits in a directory others can rename it in")
+if os.path.realpath(script) != os.path.join(snapshot, "scripts", "release.sh"):
+    fail("this script is not the snapshot scripts/release.sh")
+seen = set()
+for directory, subdirectories, names in os.walk(snapshot):
+    for name in subdirectories:
+        path = os.path.join(directory, name)
+        info = os.lstat(path)
+        prefix = os.path.relpath(path, snapshot) + "/"
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) not in (0o500, 0o700)
+                or not any(item.startswith(prefix) for item in files)):
+            fail("unexpected directory " + prefix)
+    for name in names:
+        path = os.path.join(directory, name)
+        info = os.lstat(path)
+        relative = os.path.relpath(path, snapshot)
+        if (relative not in files or not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o400):
+            fail("unexpected or writable entry " + relative)
+        seen.add(relative)
+if seen != files:
+    fail("missing " + ", ".join(sorted(files - seen)))'
+
+# Every snapshot file against the blob id listed at the tag (path=id ...), recomputed
+# here from the snapshot bytes ("blob <size>\0" + bytes; SHA-1 or SHA-256 repositories).
+ISOLATION_BLOB_CHECK_PY='import hashlib, os, sys
+snapshot = sys.argv[1]
+for argument in sys.argv[2:]:
+    path, _, expected = argument.rpartition("=")
+    with open(os.path.join(snapshot, path), "rb") as source:
+        data = source.read()
+    digest = hashlib.sha1 if len(expected) == 40 else hashlib.sha256
+    if digest(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest() != expected:
+        sys.exit("Error: snapshot file " + path + " differs from its blob at the tag")'
+
+# STAGE 2 (runs from the snapshot; trusts nothing stage 1 did). Only `exec`ed by stage 1.
+isolation_stage2() {
+    isolation_refuse_hostile_start || return 1
+    local snapshot="${DUDUCLAW_ISOLATION_CEREMONY_SNAPSHOT:-}" repo="${DUDUCLAW_ISOLATION_CEREMONY_REPO:-}"
+    if [[ "$snapshot" != /* || "$repo" != /* || "$0" != "$snapshot/scripts/release.sh" || ! -d "$snapshot" \
+            || -L "$snapshot" || ! -O "$snapshot" ]]; then
+        isolation_fail "not launched from a valid ceremony snapshot: stage 2 runs only as exec'd by stage 1." \
+            "Start scripts/release.sh isolation-sign from the checkout (nothing was removed)."
+        return 1
+    fi
+    isolation_parse_arguments "$@" || return 1
+    isolation_scrub_git_environment
+    isolation_resolve_tools || return 1
+    isolation_child_environment
+    if ! isolation_run "$ISOLATION_TOOL_PYTHON" -I -B -c "$ISOLATION_SNAPSHOT_AUDIT_PY" "$snapshot" "$0" \
+            "${ISOLATION_CEREMONY_FILES[@]}"; then
+        isolation_fail "stage 2 refuses to run from it (nothing was removed)"; return 1
+    fi
+    if [[ "$(pwd -P)" != "$repo" ]]; then
+        isolation_fail "stage 2 must start in the repository stage 1 checked"; return 1
+    fi
+    ISOLATION_SNAPSHOT="$snapshot"
+    isolation_set_traps
+    ISOLATION_WORK="$(isolation_run "$ISOLATION_TOOL_MKTEMP" -d "${snapshot%/*}/duduclaw-isolation-sign.XXXXXX")" \
+        || { isolation_fail "cannot create the work directory"; return 1; }
+    isolation_run "$ISOLATION_TOOL_MKDIR" -m 0700 -- "$ISOLATION_WORK/tmp" || return 1
+    ISOLATION_CHILD_ENV+=("TMPDIR=$ISOLATION_WORK/tmp")
+    echo "Stage 2: running from $snapshot. Tools: env=$ISOLATION_TOOL_ENV git=$ISOLATION_TOOL_GIT" \
+        "python3=$ISOLATION_TOOL_PYTHON ssh-keygen=$ISOLATION_TOOL_SSH_KEYGEN gh=${ISOLATION_TOOL_GH:-missing}" \
+        "minisign=${ISOLATION_TOOL_MINISIGN:-missing} docker=${ISOLATION_TOOL_DOCKER:-missing}"
+    run_isolation_sign
+}
+
+# R2-1 stage-2 gate on the ORIGINAL repository. Stage 2 reads nothing from its working
+# tree (every file it reads or executes is in the snapshot, the released archives come
+# from GitHub, --root-metadata is checked against the pin), so the gate covers exactly
+# what it uses from there: HEAD is the tag's commit, and every snapshot file is the
+# blob of that commit (blob ids recomputed by python3 from the snapshot bytes).
+isolation_check_repository() {
+    local tag="$1" top head tag_commit path id
+    local -a expected=()
+    top="$(isolation_git rev-parse --show-toplevel)" || { isolation_fail "not a git checkout"; return 1; }
+    if [[ "$top" != "$(pwd -P)" ]]; then
+        isolation_fail "run isolation-sign from the repository top level"; return 1
+    fi
+    head="$(isolation_git rev-parse --verify HEAD)" || { isolation_fail "cannot read HEAD"; return 1; }
+    tag_commit="$(isolation_git rev-parse --verify --quiet "refs/tags/$tag^{commit}")" || tag_commit=""
+    if [[ -z "$tag_commit" || "$head" != "$tag_commit" ]]; then
+        isolation_fail "check out tag $tag first: the template, pin file and released archives must belong to it"
+        return 1
+    fi
+    for path in "${ISOLATION_CEREMONY_FILES[@]}"; do
+        id="$(isolation_tag_blob "$tag_commit" "$path")" || return 1
+        expected+=("$path=$id")
+    done
+    if ! isolation_run "$ISOLATION_TOOL_PYTHON" -I -B -c "$ISOLATION_BLOB_CHECK_PY" "$ISOLATION_SNAPSHOT" \
+            "${expected[@]}"; then
+        isolation_fail "the ceremony snapshot differs from tag $tag"; return 1
+    fi
+}
+
+# R2-3: one key location, ONLY from an attended prompt on the controlling terminal
+# (echo on; never argv, never the environment). Prints the absolute location for an
+# unexported shell variable of the caller. $2 (optional) is used when the answer is
+# empty. Messages name the key, never the location.
+isolation_key_location() {
+    local label="$1" fallback="${2:-}" value=""
+    if ! { exec 3<"$ISOLATION_TTY_IN" 4>>"$ISOLATION_TTY_OUT"; } 2>/dev/null; then
+        isolation_fail "no terminal for the $label prompt (key locations are entered only there)"; return 1
+    fi
+    printf 'Location of the %s (a path, not a secret): ' "$label" >&4
+    IFS= read -r value <&3 || value=""
+    exec 3<&- 4>&-
+    if [[ -z "$value" ]]; then value="$fallback"; fi
     if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
-        isolation_fail "the $label location ($variable or the prompt) is empty or malformed"; return 1
+        isolation_fail "the $label location is empty or malformed"; return 1
     fi
     if [[ "$value" != /* ]]; then value="$PWD/$value"; fi
     if [[ ! -f "$value" ]]; then
-        isolation_fail "the $label location ($variable or the prompt) is not a file"; return 1
+        isolation_fail "the $label location is not a file"; return 1
     fi
     printf '%s\n' "$value"
-}
-
-# minisign -S with only a neutral symlink in its argv (R2-3), created in a private
-# 0700 directory inside ISOLATION_WORK (removed here and by the EXIT trap). The
-# link is made by Python from the environment, so the real location never
-# appears in any argv. $1 key location, $2 file, $3 trusted comment, $4 output.
-isolation_minisign_sign() {
-    local link_dir="$ISOLATION_WORK/minisign-key" rc=0
-    mkdir -m 0700 -- "$link_dir"
-    ISOLATION_LINK_TARGET="$1" python3 -I -B -c 'import os, sys
-os.symlink(os.path.abspath(os.environ["ISOLATION_LINK_TARGET"]), sys.argv[1])' "$link_dir/signing-key" || rc=$?
-    if [[ "$rc" == "0" ]]; then
-        minisign -S -s "$link_dir/signing-key" -m "$2" -t "$3" -x "$4" || rc=$?
-    fi
-    rm -rf -- "$link_dir"
-    return "$rc"
 }
 
 # R2-2: the digest reference for docker platform $1 from ISOLATION_PROBE_DIGEST_FILE:
@@ -673,7 +1152,7 @@ isolation_probe_docker_argv() {
     if [[ "$binary" != /* || "$binary" == *,* || "$binary" == *$'\n'* ]]; then
         isolation_fail "the verifier path cannot be bind-mounted safely"; return 1
     fi
-    ISOLATION_DOCKER_ARGV=(docker run --rm --pull=never --platform "$platform"
+    ISOLATION_DOCKER_ARGV=("$ISOLATION_TOOL_DOCKER" run --rm --pull=never --platform "$platform"
         --network none --read-only --user 65534:65534 --cap-drop=ALL
         --security-opt no-new-privileges --pids-limit 32 --memory 256m --memory-swap 256m
         --entrypoint /probe/duduclaw-bootstrap
@@ -684,11 +1163,12 @@ isolation_probe_docker_argv() {
 # Execute the verifier's read-only --print-root-pin; its stdout is the result.
 # $1 is a private copy named duduclaw-bootstrap in its own directory.
 isolation_probe_pin() {
-    local binary="$1" arch="$2" host_arch platform image
-    host_arch="$(uname -m)"
+    local binary="$1" arch="$2" host_arch host_os platform image
+    host_arch="$(isolation_run "$ISOLATION_TOOL_UNAME" -m)" || return 1
+    host_os="$(isolation_run "$ISOLATION_TOOL_UNAME" -s)" || return 1
     if [[ "$host_arch" == "arm64" ]]; then host_arch="aarch64"; fi
-    if [[ "$(uname -s)" == "Linux" && "$host_arch" == "$arch" ]]; then
-        env -i "$binary" --print-root-pin
+    if [[ "$host_os" == "Linux" && "$host_arch" == "$arch" ]]; then
+        "$ISOLATION_TOOL_ENV" -i "$binary" --print-root-pin
         return
     fi
     case "$arch" in
@@ -696,134 +1176,106 @@ isolation_probe_pin() {
         aarch64) platform="linux/arm64" ;;
         *) return 1 ;;
     esac
-    command -v docker >/dev/null 2>&1 \
-        || isolation_fail "executing the $arch verifier here needs docker (or run on Linux $arch)" || return 1
+    if [[ "$ISOLATION_TOOL_DOCKER" != /* ]]; then
+        isolation_fail "executing the $arch verifier here needs docker (or run on Linux $arch)"; return 1
+    fi
     image="$(isolation_probe_image "$platform")" || return 1
     local -a ISOLATION_DOCKER_ARGV=()
     isolation_probe_docker_argv "$binary" "$platform" "$image" || return 1
-    "${ISOLATION_DOCKER_ARGV[@]}"
+    isolation_run "${ISOLATION_DOCKER_ARGV[@]}"
 }
 
+# STAGE 2 ceremony body (from isolation_stage2: snapshot audited, traps set, work
+# directory created). Every file it reads or executes is "$snapshot/...".
 run_isolation_sign() {
-    local root_metadata="" root_signatures="" output_dir="" ssh_keygen="ssh-keygen"
-    local manifest_days=365 authorization_days=730 migration_bundle=0 upload=1
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -h|--help) isolation_sign_usage; return 0 ;;
-            --target-key|--root-key|--legacy-minisign-key)
-                isolation_fail "$1 is refused: key locations are never command-line arguments (other local" \
-                    "processes can read argv); set its DUDUCLAW_ISOLATION_* variable or answer the prompt (see --help)"
-                return 1 ;;
-            --root-metadata) root_metadata="${2:?--root-metadata needs a value}"; shift 2 ;;
-            --root-signatures) root_signatures="${2:?--root-signatures needs a value}"; shift 2 ;;
-            --output-dir) output_dir="${2:?--output-dir needs a value}"; shift 2 ;;
-            --ssh-keygen) ssh_keygen="${2:?--ssh-keygen needs a value}"; shift 2 ;;
-            --manifest-valid-days) manifest_days="${2:?--manifest-valid-days needs a value}"; shift 2 ;;
-            --authorization-valid-days) authorization_days="${2:?--authorization-valid-days needs a value}"; shift 2 ;;
-            --migration-bundle) migration_bundle=1; shift ;;
-            --no-upload) upload=0; shift ;;
-            *) isolation_fail "unknown isolation-sign option '$1' (see --help)"; return 1 ;;
-        esac
-    done
+    local snapshot="$ISOLATION_SNAPSHOT" python="$ISOLATION_TOOL_PYTHON" ssh_keygen="$ISOLATION_TOOL_SSH_KEYGEN"
+    local root_metadata="$ISOLATION_ROOT_METADATA" root_signatures="$ISOLATION_ROOT_SIGNATURES"
+    local output_dir="$ISOLATION_OUTPUT_DIR" manifest_days="$ISOLATION_MANIFEST_DAYS"
+    local authorization_days="$ISOLATION_AUTHORIZATION_DAYS" migration_bundle="$ISOLATION_BUNDLE_OPTION"
+    local upload="$ISOLATION_UPLOAD" pin_file="$snapshot/$ISOLATION_PIN_FILE"
+    ISOLATION_PROBE_DIGEST_FILE="$snapshot/$ISOLATION_PROBE_DIGEST_FILE"
 
-    # 0. Preconditions, cheapest and most decisive first.
-    if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
-        isolation_fail "isolation-sign uses offline keys and never runs in CI"; return 1
-    fi
-    local bundle_release=0 listed
-    local -a bundle_versions=()
-    read -r -a bundle_versions <<< "$ISOLATION_MIGRATION_BUNDLE_VERSIONS"
-    for listed in "${bundle_versions[@]}"; do
-        if [[ "$listed" == "$CURRENT_VERSION" ]]; then bundle_release=1; fi
-    done
-    if [[ "$migration_bundle" == "1" && "$bundle_release" == "0" ]]; then
-        isolation_fail "owner decision Q6: only v$ISOLATION_MIGRATION_BUNDLE_VERSIONS ships a migration bundle;" \
-            "v$CURRENT_VERSION reaches migrated hosts through the update service. Drop --migration-bundle."
-        return 1
-    fi
-    if [[ "$migration_bundle" == "0" && "$bundle_release" == "1" ]]; then
-        isolation_fail "v$CURRENT_VERSION is the migration-bundle release (owner decision Q6);" \
-            "pass --migration-bundle (root keys: DUDUCLAW_ISOLATION_ROOT_KEY_1/_2 or the prompt)."
-        return 1
-    fi
-    if [[ -z "$root_metadata" || -z "$root_signatures" || -z "$output_dir" ]]; then
-        isolation_fail "--root-metadata, --root-signatures and --output-dir are required (see --help)"
-        return 1
-    fi
-    local days
-    for days in "$manifest_days" "$authorization_days"; do
-        if [[ ! "$days" =~ ^[1-9][0-9]{0,3}$ ]] || (( days > 1830 )); then
-            isolation_fail "validity must be 1 to 1830 days"; return 1
-        fi
-    done
+    # 0. Preconditions again, from the snapshot (stage 1 is trusted with none of them).
+    CURRENT_VERSION="$(isolation_read_version "$snapshot/Cargo.toml")" \
+        || { isolation_fail "the snapshot Cargo.toml has no version"; return 1; }
+    isolation_check_arguments "$CURRENT_VERSION" || return 1
     if [[ ! -t 0 ]]; then
         isolation_fail "isolation-sign must run attended in an interactive terminal (keys prompt on the tty)"
         return 1
     fi
-    if [[ ! -f "$ISOLATION_PIN_FILE" || -L "$ISOLATION_PIN_FILE" ]]; then
+    if [[ ! -f "$pin_file" || -L "$pin_file" ]]; then
         isolation_fail "$ISOLATION_PIN_FILE is absent: there is no production root pin, so no isolation" \
             "release can be signed (the key ceremony adds it through a reviewed PR)."
         return 1
     fi
-    # R2-1: before any Python runs, the checkout must be exactly the tag (rule above
-    # isolation_check_checkout); from here on every Python step runs isolated (-I -B).
+    # R2-1: the snapshot is exactly tag v<version> of the original repository, and that
+    # repository's HEAD is the tag; nothing else of the repository is used from here on.
     local tag="v$CURRENT_VERSION"
-    isolation_check_checkout "$tag" || return 1
+    isolation_check_repository "$tag" || return 1
     local pin
-    pin="$(python3 -I -B -c 'import importlib.util, sys
-spec = importlib.util.spec_from_file_location("packager", "scripts/package-linux-release.py")
+    pin="$(isolation_run "$python" -I -B -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("packager", sys.argv[2])
 packager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packager)
 pin = packager.read_pin_file(sys.argv[1])
 if pin is None:
     sys.exit("production pin file is absent")
-print(pin)' "$ISOLATION_PIN_FILE")"
+print(pin)' "$pin_file" "$snapshot/scripts/package-linux-release.py")"
     if [[ ! -f "$root_metadata" || -L "$root_metadata" || ! -f "$root_signatures" || -L "$root_signatures" ]]; then
         isolation_fail "--root-metadata and --root-signatures must be regular files"; return 1
     fi
     if [[ "$(isolation_sha256 "$root_metadata")" != "$pin" ]]; then
         isolation_fail "SHA-256 of --root-metadata differs from $ISOLATION_PIN_FILE"; return 1
     fi
-    # The pinned root's own signatures: distinct registered root keys meeting its threshold.
-    if ! python3 -I -B scripts/sign-isolation-manifest.py --kind root --check-threshold "$root_metadata" \
-            --signatures "$root_signatures" --root-sha256 "$pin"; then
+    # The pinned root's own signatures: distinct registered root keys meeting its threshold,
+    # each verified with ssh-keygen -Y verify over the exact bytes.
+    if ! isolation_run "$python" -I -B "$snapshot/scripts/sign-isolation-manifest.py" --kind root \
+            --check-threshold "$root_metadata" --signatures "$root_signatures" --root-sha256 "$pin" \
+            --ssh-keygen "$ssh_keygen"; then
         isolation_fail "--root-signatures do not meet the root threshold of --root-metadata"; return 1
     fi
-    local tool
-    for tool in gh minisign "$ssh_keygen"; do
-        if ! command -v "$tool" >/dev/null 2>&1; then isolation_fail "$tool is not on PATH"; return 1; fi
-    done
-    local legacy_public
-    legacy_public="$(sed -n 's|^pub const LEGACY_RELEASE_MINISIGN_KEY: &str = "\([A-Za-z0-9+/=]*\)";$|\1|p' \
-        crates/duduclaw-isolation/src/update.rs)"
-    if [[ ! "$legacy_public" =~ ^RW[A-Za-z0-9+/]{54}$ ]]; then
+    local legacy_public="" line legacy_count=0
+    local legacy_pattern='^pub const LEGACY_RELEASE_MINISIGN_KEY: &str = "([A-Za-z0-9+/=]*)";$'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $legacy_pattern ]]; then
+            legacy_public="${BASH_REMATCH[1]}"
+            legacy_count=$((legacy_count + 1))
+        fi
+    done < "$snapshot/crates/duduclaw-isolation/src/update.rs"
+    if [[ "$legacy_count" != "1" || ! "$legacy_public" =~ ^RW[A-Za-z0-9+/]{54}$ ]]; then
         isolation_fail "cannot read LEGACY_RELEASE_MINISIGN_KEY from duduclaw-isolation"; return 1
     fi
-    # R2-3: key locations from the environment or the attended prompt, never argv.
-    local target_key="" legacy_minisign_key="" location variable
+    if [[ -e "$output_dir" || -L "$output_dir" ]]; then
+        isolation_fail "--output-dir must not exist yet (outputs are never overwritten)"; return 1
+    fi
+    isolation_require_tools || return 1
+    if [[ "$ISOLATION_PREFLIGHT" == "1" ]]; then
+        echo "Preflight passed for $tag: the snapshot is the tag, every tool resolved, --root-metadata matches" \
+            "the pin and its signatures verify. Nothing was signed and no key location was asked for."
+        return 0
+    fi
+    # R2-3: key locations only from the attended prompt, into unexported shell variables.
+    local target_key="" legacy_minisign_key="" location index
     local -a root_keys=()
-    target_key="$(isolation_key_location "$ISOLATION_TARGET_KEY_VARIABLE" "target key handle")" || return 1
+    target_key="$(isolation_key_location "target key handle")" || return 1
     if [[ "$migration_bundle" == "1" ]]; then
-        for variable in "${ISOLATION_ROOT_KEY_VARIABLES[@]}"; do
-            location="$(isolation_key_location "$variable" "root key ${variable##*_} (R${variable##*_})")" || return 1
+        for index in 1 2; do
+            location="$(isolation_key_location "root key R$index")" || return 1
             root_keys+=("$location")
         done
         if [[ "${root_keys[0]}" == "${root_keys[1]}" ]]; then
             isolation_fail "--migration-bundle needs two distinct root keys (the 2-of-3 threshold)"; return 1
         fi
-        legacy_minisign_key="$(isolation_key_location "$ISOLATION_LEGACY_KEY_VARIABLE" \
-            "legacy release minisign key" "$HOME/.minisign/duduclaw-release.key")" || return 1
+        legacy_minisign_key="$(isolation_key_location "legacy release minisign key" \
+            "${HOME:+$HOME/.minisign/duduclaw-release.key}")" || return 1
     fi
-    if [[ -e "$output_dir" || -L "$output_dir" ]]; then
-        isolation_fail "--output-dir must not exist yet (outputs are never overwritten)"; return 1
-    fi
-    mkdir -m 0700 -- "$output_dir"
-    ISOLATION_WORK="$(mktemp -d "${TMPDIR:-/tmp}/duduclaw-isolation-sign.XXXXXX")"
-    trap 'rm -rf -- "$ISOLATION_WORK"' EXIT
+    isolation_run "$ISOLATION_TOOL_MKDIR" -m 0700 -- "$output_dir"
 
-    local arch triple archive bundle_name verifier probe_output expires asset
+    local arch triple archive bundle_name verifier probe_output expires asset now
     local -a uploads=()
-    expires=$(( $(date +%s) + authorization_days * 86400 ))
+    now="$(isolation_run "$ISOLATION_TOOL_DATE" +%s)"
+    if [[ ! "$now" =~ ^[0-9]+$ ]]; then isolation_fail "cannot read the clock"; return 1; fi
+    expires=$(( now + authorization_days * 86400 ))
     for arch in x86_64 aarch64; do
         if [[ "$arch" == "x86_64" ]]; then
             triple="x86_64-unknown-linux-gnu"; archive="duduclaw-linux-x64.tar.gz"
@@ -831,19 +1283,20 @@ print(pin)' "$ISOLATION_PIN_FILE")"
             triple="aarch64-unknown-linux-gnu"; archive="duduclaw-linux-arm64.tar.gz"
         fi
         echo "== $arch: $archive of $tag"
-        mkdir -m 0700 -- "$ISOLATION_WORK/$arch" "$ISOLATION_WORK/$arch/probe"
-        gh release download "$tag" --repo "$ISOLATION_REPO" --dir "$ISOLATION_WORK/$arch" \
-            --pattern "$archive" --pattern "$archive.sha256" --pattern "$archive.minisig"
-        minisign -V -q -P "$legacy_public" -m "$ISOLATION_WORK/$arch/$archive" -x "$ISOLATION_WORK/$arch/$archive.minisig"
+        isolation_run "$ISOLATION_TOOL_MKDIR" -m 0700 -- "$ISOLATION_WORK/$arch" "$ISOLATION_WORK/$arch/probe"
+        isolation_run "$ISOLATION_TOOL_GH" release download "$tag" --repo "$ISOLATION_REPO" \
+            --dir "$ISOLATION_WORK/$arch" --pattern "$archive" --pattern "$archive.sha256" --pattern "$archive.minisig"
+        isolation_run "$ISOLATION_TOOL_MINISIGN" -V -q -P "$legacy_public" -m "$ISOLATION_WORK/$arch/$archive" \
+            -x "$ISOLATION_WORK/$arch/$archive.minisig"
         if ! isolation_check_minisig "$ISOLATION_WORK/$arch/$archive.minisig" "duduclaw $tag $archive"; then
             isolation_fail "$archive.minisig is not the release job's prehashed signature for $tag"; return 1
         fi
         # 1. The released verifier must be a PRODUCTION build of exactly this pin.
-        python3 -I -B scripts/package-linux-release.py --target "$triple" \
+        isolation_run "$python" -I -B "$snapshot/scripts/package-linux-release.py" --target "$triple" \
             --extract-bootstrap "$ISOLATION_WORK/$arch/$archive" --output-dir "$ISOLATION_WORK/$arch/verifier"
         verifier="$ISOLATION_WORK/$arch/verifier/duduclaw-bootstrap-linux-$arch"
-        cp -- "$verifier" "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap"
-        chmod 0755 "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap"
+        isolation_run "$ISOLATION_TOOL_CP" -- "$verifier" "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap"
+        isolation_run "$ISOLATION_TOOL_CHMOD" 0755 "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap"
         probe_output="$(isolation_probe_pin "$ISOLATION_WORK/$arch/probe/duduclaw-bootstrap" "$arch")"
         if [[ "$probe_output" != "PRODUCTION $pin" ]]; then
             # The probe output itself is not echoed; only the expectation is named.
@@ -852,47 +1305,55 @@ print(pin)' "$ISOLATION_PIN_FILE")"
         fi
         # 2. Target key: isolation manifest over the binaries of this released archive.
         local -a package_args=(--target "$triple" --from-release-archive "$ISOLATION_WORK/$arch/$archive"
-            --manifest-template "$ISOLATION_TEMPLATE" --manifest-valid-days "$manifest_days"
-            --signing-key-from-env --ssh-keygen "$ssh_keygen" --output-dir "$output_dir")
+            --manifest-template "$snapshot/$ISOLATION_TEMPLATE" --manifest-valid-days "$manifest_days"
+            --signing-key-stdin --ssh-keygen "$ssh_keygen" --output-dir "$output_dir")
         if [[ "$migration_bundle" == "1" ]]; then
             package_args+=(--bootstrap-root "$root_metadata" --bootstrap-root-signatures "$root_signatures")
         fi
         echo "Target key ($arch manifest): touch the key and enter its PIN when ssh-keygen asks."
-        DUDUCLAW_ISOLATION_TARGET_KEY="$target_key" python3 -I -B scripts/package-linux-release.py "${package_args[@]}"
+        # The target key location travels only on stdin (package-linux-release.py passes it on
+        # to sign-isolation-manifest.py's stdin, which links it for ssh-keygen).
+        isolation_handoff 1 "$target_key" "$python" -I -B "$snapshot/scripts/package-linux-release.py" \
+            "${package_args[@]}"
         for asset in "$output_dir/isolated-linux-$arch-"*; do
             if [[ -f "$asset" && ! -L "$asset" ]]; then uploads+=("$asset"); fi
         done
         if [[ "$migration_bundle" == "1" ]]; then
             # 3. Plain-ustar migration bundle (plan §3.2).
-            python3 -I -B scripts/package-linux-release.py --target "$triple" \
+            isolation_run "$python" -I -B "$snapshot/scripts/package-linux-release.py" --target "$triple" \
                 --migration-bundle-from "$output_dir/isolated-linux-$arch-bootstrap-inbox" --output-dir "$output_dir"
             bundle_name="duduclaw-isolated-linux-$arch-$CURRENT_VERSION.tar"
             local authorization="$output_dir/$bundle_name.authorization.json"
-            # 4. Transition dual signature: root threshold + legacy release key.
+            # 4. Transition dual signature: root threshold + legacy release key. R1 then R2
+            # on the signer's stdin (never argv or the environment).
             echo "Root threshold ($arch bundle): R1 touch + PIN, then the R2 passphrase."
-            DUDUCLAW_ISOLATION_SIGNING_KEY_1="${root_keys[0]}" DUDUCLAW_ISOLATION_SIGNING_KEY_2="${root_keys[1]}" \
-                python3 -I -B scripts/sign-isolation-manifest.py --kind bundle --bundle "$output_dir/$bundle_name" \
+            isolation_handoff 2 "${root_keys[0]}" "${root_keys[1]}" "$python" -I -B \
+                "$snapshot/scripts/sign-isolation-manifest.py" --kind bundle --bundle "$output_dir/$bundle_name" \
                 --expires-at-unix "$expires" --output "$authorization" --key-count 2 \
                 --root-metadata "$root_metadata" --root-sha256 "$pin" --ssh-keygen "$ssh_keygen"
             # R2-5, before anything of this bundle reaches the upload list: the signers are
             # the keys embedded in the signatures, distinct, registered in the pinned root,
-            # not revoked, meeting its threshold. Otherwise the authorization is deleted.
-            if ! python3 -I -B scripts/sign-isolation-manifest.py --kind bundle --check-threshold "$authorization" \
-                    --root-metadata "$root_metadata" --root-sha256 "$pin"; then
-                rm -f -- "$authorization" "$authorization.signatures.json"
+            # not revoked, meeting its threshold, every signature verified by ssh-keygen
+            # -Y verify over the written bytes. Otherwise the authorization is deleted.
+            if ! isolation_run "$python" -I -B "$snapshot/scripts/sign-isolation-manifest.py" --kind bundle \
+                    --check-threshold "$authorization" --root-metadata "$root_metadata" --root-sha256 "$pin" \
+                    --ssh-keygen "$ssh_keygen"; then
+                isolation_run "$ISOLATION_TOOL_RM" -f -- "$authorization" "$authorization.signatures.json"
                 isolation_fail "the $arch BundleAuthorization signatures do not meet the root threshold; deleted"
                 return 1
             fi
             echo "Legacy release key ($arch bundle): minisign asks for its password."
-            isolation_minisign_sign "$legacy_minisign_key" "$output_dir/$bundle_name" \
-                "duduclaw v$CURRENT_VERSION $bundle_name" "$output_dir/$bundle_name.minisig"
-            minisign -V -q -P "$legacy_public" -m "$output_dir/$bundle_name" -x "$output_dir/$bundle_name.minisig"
+            isolation_handoff 1 "$legacy_minisign_key" "$python" -I -B "$snapshot/scripts/sign-isolation-manifest.py" \
+                --minisign-sign "$output_dir/$bundle_name" --trusted-comment "duduclaw v$CURRENT_VERSION $bundle_name" \
+                --output "$output_dir/$bundle_name.minisig" --minisign "$ISOLATION_TOOL_MINISIGN"
+            isolation_run "$ISOLATION_TOOL_MINISIGN" -V -q -P "$legacy_public" -m "$output_dir/$bundle_name" \
+                -x "$output_dir/$bundle_name.minisig"
             if ! isolation_check_minisig "$output_dir/$bundle_name.minisig" "duduclaw v$CURRENT_VERSION $bundle_name"; then
                 isolation_fail "$bundle_name.minisig is not a prehashed signature with the verifier's trusted comment"
                 return 1
             fi
-            cp -- "$verifier" "$output_dir/duduclaw-bootstrap-linux-$arch"
-            chmod 0755 "$output_dir/duduclaw-bootstrap-linux-$arch"
+            isolation_run "$ISOLATION_TOOL_CP" -- "$verifier" "$output_dir/duduclaw-bootstrap-linux-$arch"
+            isolation_run "$ISOLATION_TOOL_CHMOD" 0755 "$output_dir/duduclaw-bootstrap-linux-$arch"
             uploads+=("$output_dir/duduclaw-bootstrap-linux-$arch" "$output_dir/$bundle_name"
                 "$output_dir/$bundle_name.minisig" "$output_dir/$bundle_name.authorization.json"
                 "$output_dir/$bundle_name.authorization.json.signatures.json")
@@ -907,14 +1368,14 @@ print(pin)' "$ISOLATION_PIN_FILE")"
     done
     {
         for index in "${!uploads[@]}"; do
-            printf '%s  %s\n' "${hashes[$index]}" "$(basename -- "${uploads[$index]}")"
+            printf '%s  %s\n' "${hashes[$index]}" "${uploads[$index]##*/}"
         done
         printf '%s  %s\n' "$pin" "root.json"
     } > "$sums_file"
     echo ""
     echo "Assets for GitHub release $tag:"
     for index in "${!uploads[@]}"; do
-        printf '  %s\n' "$(basename -- "${uploads[$index]}")"
+        printf '  %s\n' "${uploads[$index]##*/}"
     done
     if [[ "$upload" == "0" ]]; then
         echo "--no-upload: nothing uploaded; every output stays in $output_dir."
@@ -928,14 +1389,15 @@ print(pin)' "$ISOLATION_PIN_FILE")"
         fi
         for index in "${!uploads[@]}"; do
             if [[ "$(isolation_sha256 "${uploads[$index]}")" != "${hashes[$index]}" ]]; then
-                isolation_fail "$(basename -- "${uploads[$index]}") changed after it was recorded"; return 1
+                isolation_fail "${uploads[$index]##*/} changed after it was recorded"; return 1
             fi
         done
-        gh release upload "$tag" --repo "$ISOLATION_REPO" "${uploads[@]}"
-        mkdir -m 0700 -- "$ISOLATION_WORK/readback"
+        isolation_run "$ISOLATION_TOOL_GH" release upload "$tag" --repo "$ISOLATION_REPO" "${uploads[@]}"
+        isolation_run "$ISOLATION_TOOL_MKDIR" -m 0700 -- "$ISOLATION_WORK/readback"
         for index in "${!uploads[@]}"; do
-            name="$(basename -- "${uploads[$index]}")"
-            gh release download "$tag" --repo "$ISOLATION_REPO" --dir "$ISOLATION_WORK/readback" --pattern "$name"
+            name="${uploads[$index]##*/}"
+            isolation_run "$ISOLATION_TOOL_GH" release download "$tag" --repo "$ISOLATION_REPO" \
+                --dir "$ISOLATION_WORK/readback" --pattern "$name"
             if [[ "$(isolation_sha256 "$ISOLATION_WORK/readback/$name")" != "${hashes[$index]}" ]]; then
                 isolation_fail "uploaded $name differs from the signed bytes; investigate before publishing"; return 1
             fi
@@ -944,12 +1406,25 @@ print(pin)' "$ISOLATION_PIN_FILE")"
     fi
     echo ""
     echo "SHA256SUMS-isolation.txt (sha256 $(isolation_sha256 "$sums_file")):"
-    cat -- "$sums_file"
+    while IFS= read -r line || [[ -n "$line" ]]; do printf '%s\n' "$line"; done < "$sums_file"
     echo "[external gate] Publish this list on the website AND the licensed console only after"
     echo "owner confirmation; both must show identical values (design §8 step 1)."
 }
 
 # --- Arg parsing / sub-commands ---
+# isolation-sign is dispatched before anything else runs (CURRENT_VERSION below would
+# already execute grep/sed): stage 2 when started by stage 1's exec (marker variables
+# present; it validates them and refuses otherwise), stage 1 everywhere else.
+if [[ "${1:-}" == "isolation-sign" ]]; then
+    shift
+    if [[ -n "${DUDUCLAW_ISOLATION_CEREMONY_SNAPSHOT+x}" || -n "${DUDUCLAW_ISOLATION_CEREMONY_REPO+x}" ]]; then
+        isolation_stage2 "$@"
+    else
+        isolation_stage1 "$@"
+    fi
+    exit $?
+fi
+
 if [[ $# -lt 1 ]]; then
     echo "Usage:"
     echo "  $0 <hotfix|minor|major> [--title \"<theme>\"] [--dry-run]"
@@ -972,11 +1447,6 @@ case "$1" in
     linux-assets)
         shift
         exec python3 "$(dirname "$0")/package-linux-release.py" "$@"
-        ;;
-    isolation-sign)
-        shift
-        run_isolation_sign "$@"
-        exit $?
         ;;
     audit)
         run_audit "$CURRENT_VERSION" || {

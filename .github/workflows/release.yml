@@ -179,7 +179,19 @@ jobs:
           GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
             GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
             git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
-          git checkout FETCH_HEAD -- scripts/macos/verify-gateway-signature.sh
+          # The token is needed for the fetch only: nothing after it (hooks, filters,
+          # the checkout) can see it.
+          unset FETCH_TOKEN auth
+          # No hook, fsmonitor or system/global config (filter drivers) runs during the
+          # checkout; the written file must be exactly the fetched blob (no smudge).
+          script=scripts/macos/verify-gateway-signature.sh
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            git -c core.hooksPath=/dev/null -c core.fsmonitor= -c core.attributesFile=/dev/null \
+            checkout FETCH_HEAD -- "$script"
+          if ! git cat-file blob "FETCH_HEAD:$script" | cmp -s - "$script"; then
+            echo "::error::$script differs from its blob at $WORKFLOW_SHA (a checkout filter ran)"
+            exit 1
+          fi
           echo "verify-gateway-signature.sh taken from workflow revision $WORKFLOW_SHA (build source commit: $TAG_COMMIT)"
 
       - name: Build, sign and notarize macOS gateway
