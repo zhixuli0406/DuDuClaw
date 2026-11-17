@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use duduclaw_isolation::{bounded::Text, egress::ProfileId, execution::{RunHandle, DiskQuota, NetworkPolicy, ResourceLimits, RunTimeouts, RuntimeKind},
     ids::{EmployeeId, Sha256Digest, UidRange}, ipc::{ErrorCode, QueueClass}, update::{InstallTarget, ReleaseManifest}};
 use duduclaw_updated::linux::{files::Directory, service::{artifact_name, verified_committed_generation}, INSTALL_ROOT};
-use crate::{Result, policy::{EmployeeEntitlement, Executable, PublishedRuntime, RootPolicy}};
+use crate::{Result, policy::{EmployeeEntitlement, Executable, PublishedRuntime, RootPolicy, TurnLimit}};
 const ROOT: &str = "/var/lib/duduclaw-spawnd";
 const RECEIPTS: &str = "/run/duduclaw-isolation-evidence";
 pub const GATEWAY_PUBLICATION: &str = "/run/duduclaw-spawnd/publication.json";
@@ -107,6 +107,13 @@ pub struct RuntimeRecord {
     pub network: NetworkPolicy, pub mcp: bool, pub pty_allowed: bool,
     pub queue_class: QueueClass,
     pub mcp_acceptance: Option<McpAcceptance>,
+    /// R6 policy v3 only. Omitted when absent, so v1/v2 records (and their
+    /// MCP launch-policy digests) are byte-identical to before; a ranged v3
+    /// record's digest covers the range, so its acceptance is regenerated.
+    /// In a signed policy the key's presence is checked on the raw bytes
+    /// (`turn_limit_keys`): refused before v3, and `null` refused in v3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_limit: Option<TurnLimit>,
 }
 impl RuntimeRecord {
     pub fn to_runtime(&self) -> PublishedRuntime {
@@ -117,12 +124,18 @@ impl RuntimeRecord {
         };
         PublishedRuntime { runtime: self.runtime.clone(), profile: self.profile, executable, pinned_version: self.pinned_version.clone(),
             fixed_args: self.fixed_args.clone(), resources: self.resources.clone(), timeouts: self.timeouts.clone(), network: self.network.clone(),
-            mcp: self.mcp, pty_allowed: self.pty_allowed, queue_class: self.queue_class }
+            mcp: self.mcp, pty_allowed: self.pty_allowed, queue_class: self.queue_class, turn_limit: self.turn_limit }
     }
 }
+/// Root-owned host entitlement. `max_turns` (R6) can only narrow the signed
+/// step range; it is omitted when absent so existing files keep their shape.
+/// It is written only by root (see the R6 report: the approved-proposal RPC
+/// that writes it is not part of this change).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EntitlementRecord { pub employee: EmployeeId, pub profiles: Vec<ProfileId> }
+pub struct EntitlementRecord { pub employee: EmployeeId, pub profiles: Vec<ProfileId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u16> }
 /// Signed exact-runtime acceptance, produced by exercising the CLI's own MCP
 /// child launch. A direct bridge invocation cannot produce this acceptance.
 #[derive(Clone, Serialize, Deserialize)]
@@ -211,26 +224,66 @@ struct SignedPolicyV1 { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<
 #[serde(deny_unknown_fields)]
 struct SignedPolicyV2 { domain: String, version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
 const POLICY_DOMAIN_V2: &str = "duduclaw-isolation-policy-v2";
+/// v3 (R6): the v2 shape under its own signed domain; runtime records may carry
+/// `turn_limit`. v1/v2 documents carrying `turn_limit` are refused.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPolicyV3 { domain: String, version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
+const POLICY_DOMAIN_V3: &str = "duduclaw-isolation-policy-v3";
 #[derive(Deserialize)]
 struct PolicyVersion { version: u16 }
-/// v2 reader. A v1 document is accepted as "no launcher" (helper tools then
+/// v3 reader. A v1 document is accepted as "no launcher" (helper tools then
 /// report `helper_launcher_unavailable`); a v1 document naming a launcher, a v2
-/// document without its domain, or any other version is refused.
+/// or v3 document without its own domain, a v1/v2 document with a step range,
+/// a v3 document with any invalid step range (the whole policy), or any other
+/// version is refused.
 fn parse_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
     let probe: PolicyVersion = serde_json::from_slice(bytes).map_err(|_| denied())?;
-    match probe.version {
+    let policy = match probe.version {
         1 => {
             let v1: SignedPolicyV1 = serde_json::from_slice(bytes).map_err(|_| denied())?;
             if v1.version != 1 || v1.native.iter().any(|n| n.launcher.is_some()) { return Err(denied()); }
-            Ok(SignedPolicy { version: 1, runtimes: v1.runtimes, native: v1.native })
+            SignedPolicy { version: 1, runtimes: v1.runtimes, native: v1.native }
         }
         2 => {
             let v2: SignedPolicyV2 = serde_json::from_slice(bytes).map_err(|_| denied())?;
             if v2.version != 2 || v2.domain != POLICY_DOMAIN_V2 { return Err(denied()); }
-            Ok(SignedPolicy { version: 2, runtimes: v2.runtimes, native: v2.native })
+            SignedPolicy { version: 2, runtimes: v2.runtimes, native: v2.native }
         }
-        _ => Err(denied()),
+        3 => {
+            let v3: SignedPolicyV3 = serde_json::from_slice(bytes).map_err(|_| denied())?;
+            if v3.version != 3 || v3.domain != POLICY_DOMAIN_V3 { return Err(denied()); }
+            SignedPolicy { version: 3, runtimes: v3.runtimes, native: v3.native }
+        }
+        _ => return Err(denied()),
+    };
+    turn_limit_keys(bytes, policy.version)?;
+    validate_turn_limits(&policy)?;
+    Ok(policy)
+}
+/// R6 review round, finding 3: decided on the raw document, because the typed
+/// record reads both an absent key and `"turn_limit": null` as `None`. A
+/// v1/v2 runtime record must not carry the key at all; a v3 record either
+/// omits it (no range: the fixed `--max-turns 50` shape) or carries a range
+/// object. An explicit `null` is refused in every version.
+fn turn_limit_keys(bytes: &[u8], version: u16) -> io::Result<()> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| denied())?;
+    let runtimes = document.get("runtimes").and_then(serde_json::Value::as_array).ok_or_else(denied)?;
+    for record in runtimes {
+        let record = record.as_object().ok_or_else(denied)?;
+        if record.get("turn_limit").is_some_and(|limit| version < 3 || limit.is_null()) { return Err(denied()); }
     }
+    Ok(())
+}
+/// R6: no step range before v3; every v3 range valid; every Claude MCP record
+/// with exactly the canonical fixed-50 or ranged argument shape. Otherwise
+/// the policy is refused as a whole.
+fn validate_turn_limits(policy: &SignedPolicy) -> io::Result<()> {
+    for record in &policy.runtimes {
+        if record.turn_limit.is_some() && policy.version < 3 { return Err(denied()); }
+        io(crate::policy::validate_turn_limit(&record.to_runtime()))?;
+    }
+    Ok(())
 }
 /// HX publication checks 1–7 against the verified runtime set (§2.3), plus the
 /// `/helper-tmp` budget, which must fit inside the parent's tmpfs budget.
@@ -261,7 +314,8 @@ pub struct GatewayPublication {
 impl GatewayPublication {
     pub fn policy(&self) -> Result<RootPolicy> {
         RootPolicy::from_verified_publication(self.runtimes.iter().map(RuntimeRecord::to_runtime).collect(),
-            self.entitlements.iter().map(|e| EmployeeEntitlement { employee: e.employee, profiles: e.profiles.clone() }).collect())
+            self.entitlements.iter().map(|e| EmployeeEntitlement { employee: e.employee, profiles: e.profiles.clone(),
+                max_turns: e.max_turns }).collect())
     }
     pub fn read(gateway_gid: u32) -> io::Result<Self> {
         // The gateway projection uses a dedicated group, not F's root-only reader.
@@ -352,9 +406,13 @@ fn checked_runtime<'a>(records: &'a [RuntimeRecord], runtime: &PublishedRuntime)
     if matching.next().is_some() || record.to_runtime() != *runtime { return Err(ErrorCode::RuntimeDenied); }
     Ok(record)
 }
+/// Recompute the plan from the signed record. `from_runtime` re-checks the
+/// step limit against the record's signed range (R6 item 4); the employee's
+/// entitlement narrowing was applied by `RootPolicy::max_turns` at start.
 fn check_plan_runtime(plan: &crate::bootstrap::BootstrapPlan, runtime: &PublishedRuntime) -> Result<()> {
     let expected = crate::bootstrap::BootstrapPlan::from_runtime(plan.run, plan.employee, plan.uid, plan.gid,
-        plan.supervisor_uid, plan.supervisor_gid, plan.nonce, runtime, plan.pty, plan.prompt_bytes, &plan.input_fds, plan.proxy_port)?;
+        plan.supervisor_uid, plan.supervisor_gid, plan.nonce, runtime, plan.pty, plan.prompt_bytes, &plan.input_fds, plan.proxy_port,
+        plan.max_turns)?;
     if expected.encode()? != plan.encode()? { return Err(ErrorCode::RuntimeDenied); }
     Ok(())
 }
@@ -614,13 +672,16 @@ mod tests {
     fn runtime_record() -> RuntimeRecord {
         RuntimeRecord { runtime: RuntimeKind::Claude, profile: ProfileId(Sha256Digest([1; 32])),
             executable: ExecutableRecord::Elf { entry: Text::new("claude".into()).unwrap(), digest: Sha256Digest([2; 32]) },
-            pinned_version: Text::new("2.0.0".into()).unwrap(), fixed_args: vec![],
+            pinned_version: Text::new("2.0.0".into()).unwrap(),
+            // The canonical v1/v2 Claude MCP shape (fixed `--max-turns 50`).
+            fixed_args: crate::gateway_plan::claude_arguments("model").unwrap().into_iter().map(|arg| Text::new(arg).unwrap()).collect(),
             resources: ResourceLimits { memory_bytes: 1024 * 1024, cpu_quota_percent: 100, tasks: 16,
                 open_files: 4096, ptys: 16, disk: DiskQuota::LoopFilesystem { bytes: 1024, inodes: 32 },
                 io_read_bytes_per_sec: 1024, io_write_bytes_per_sec: 1024, io_read_ops_per_sec: 10,
                 io_write_ops_per_sec: 10, output_buffer_bytes: 4096, output_total_bytes: 4096, memfd_total_bytes: 4096 },
             timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 1000, pty_idle_ms: None, termination_grace_ms: 100 },
-            network: NetworkPolicy::Offline, mcp: true, pty_allowed: false, queue_class: QueueClass::Background, mcp_acceptance: None }
+            network: NetworkPolicy::Offline, mcp: true, pty_allowed: false, queue_class: QueueClass::Background, mcp_acceptance: None,
+            turn_limit: None }
     }
     #[test]
     fn native_runtime_publication_requires_signed_adapter_and_matching_vendor_digest() {
@@ -690,12 +751,42 @@ mod tests {
     fn bootstrap_plan_must_match_the_exact_signed_runtime() {
         let runtime = runtime_record().to_runtime();
         let mut plan = crate::bootstrap::BootstrapPlan::from_runtime(RunHandle(duduclaw_isolation::ids::RunId([1; 16])),
-            EmployeeId([2; 16]), 70000, 70000, 400, 400, [3; 32], &runtime, false, 0, &[], None).unwrap();
+            EmployeeId([2; 16]), 70000, 70000, 400, 400, [3; 32], &runtime, false, 0, &[], None, None).unwrap();
         assert!(check_plan_runtime(&plan, &runtime).is_ok());
         plan.argv.push("--other-config".into());
         assert!(check_plan_runtime(&plan, &runtime).is_err());
         plan.argv.pop(); plan.open_files += 1;
         assert!(check_plan_runtime(&plan, &runtime).is_err());
+        // An unranged record never accepts a step limit.
+        plan.open_files -= 1; plan.max_turns = Some(50);
+        assert!(check_plan_runtime(&plan, &runtime).is_err());
+    }
+    #[test]
+    fn ranged_plan_recheck_binds_the_limit_and_its_argv_position() {
+        let record = ranged_record();
+        let runtime = record.to_runtime();
+        let build = |max_turns| crate::bootstrap::BootstrapPlan::from_runtime(RunHandle(duduclaw_isolation::ids::RunId([1; 16])),
+            EmployeeId([2; 16]), 70000, 70000, 400, 400, [3; 32], &runtime, false, 0, &[], None, max_turns);
+        let plan = build(Some(80)).unwrap();
+        assert!(check_plan_runtime(&plan, &runtime).is_ok());
+        // Changing the value in argv only, or in the field only, is refused.
+        let mut changed = plan.clone();
+        let index = changed.argv.iter().position(|arg| arg == "--max-turns").unwrap();
+        changed.argv[index + 1] = "200".into();
+        assert!(check_plan_runtime(&changed, &runtime).is_err());
+        let mut changed = plan.clone(); changed.max_turns = Some(200);
+        assert!(check_plan_runtime(&changed, &runtime).is_err());
+        // A value outside the signed range can never be re-derived.
+        let mut changed = plan.clone(); changed.max_turns = Some(201);
+        assert!(check_plan_runtime(&changed, &runtime).is_err());
+        let mut changed = plan; changed.max_turns = None;
+        assert!(check_plan_runtime(&changed, &runtime).is_err());
+        // The MCP suffix check of `record_mcp_projection` is unchanged: the
+        // signed arguments still end with the projection's exact suffix.
+        let arguments: Vec<_> = record.fixed_args.iter().map(|arg| arg.as_str()).collect();
+        let expected = duduclaw_mcp_boundary::config::claude_mcp_arguments();
+        let expected: Vec<_> = expected.iter().map(String::as_str).collect();
+        assert!(arguments.ends_with(&expected));
     }
     #[test]
     fn generation_cache_requires_same_live_signed_identity_and_protocols() {
@@ -811,7 +902,7 @@ mod tests {
         let record = runtime_record();
         let employee = EmployeeId([5; 16]);
         let root = RootPolicy::from_verified_publication(vec![record.to_runtime()],
-            vec![EmployeeEntitlement { employee, profiles: vec![record.profile] }]).unwrap()
+            vec![EmployeeEntitlement { employee, profiles: vec![record.profile], max_turns: None }]).unwrap()
             .with_launchers(duduclaw_run::seccomp::Architecture::native().unwrap(), launchers(&policy)).unwrap();
         // No launcher: the helper table is empty, so every helper call is refused.
         assert!(root.helper_table(employee, &record.to_runtime()).is_empty());
@@ -846,6 +937,207 @@ mod tests {
         value["native"][0]["launcher"] = launcher_value();
         let policy = parse_policy(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(validate_launchers(&policy).is_err());
+    }
+
+    /// A v3 Claude record: signed arguments without `--max-turns`, the fixed
+    /// MCP suffix last, and the Q12 working-default range (pending owner).
+    fn ranged_record() -> RuntimeRecord {
+        let mut record = runtime_record();
+        record.fixed_args = crate::gateway_plan::claude_ranged_arguments("model").unwrap().into_iter()
+            .map(|arg| Text::new(arg).unwrap()).collect();
+        record.turn_limit = Some(crate::policy::WORKING_DEFAULT_TURN_LIMIT);
+        record
+    }
+    fn v3_document() -> serde_json::Value {
+        let record = ranged_record();
+        serde_json::json!({ "domain": POLICY_DOMAIN_V3, "version": 3, "runtimes": [record.clone()],
+            "native": [native_record(&record)] })
+    }
+    #[test]
+    fn policy_v3_carries_the_signed_range_under_its_own_domain() {
+        let policy = parse_policy(&serde_json::to_vec(&v3_document()).unwrap()).unwrap();
+        assert_eq!(policy.version, 3);
+        assert_eq!(policy.runtimes[0].turn_limit, Some(crate::policy::WORKING_DEFAULT_TURN_LIMIT));
+        validate_launchers(&policy).unwrap();
+        // The range reaches the gateway projection and the root policy unchanged.
+        let report = GatewayPublication { version: 1, generation: Sha256Digest([1; 32]), boot_id: "boot".into(),
+            checked_boottime_ms: 50, valid_for_ms: 1000, runtimes: policy.runtimes,
+            entitlements: vec![EntitlementRecord { employee: EmployeeId([5; 16]), profiles: vec![ProfileId(Sha256Digest([1; 32]))],
+                max_turns: Some(30) }] };
+        let projected: GatewayPublication = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        let root = projected.policy().unwrap();
+        assert_eq!(root.turn_cap(EmployeeId([5; 16])), Some(30));
+        // v3 needs its exact domain; relabelling as v1/v2 is refused.
+        for (version, domain) in [(3, serde_json::Value::Null), (3, POLICY_DOMAIN_V2.into()), (2, POLICY_DOMAIN_V3.into()),
+            (1, POLICY_DOMAIN_V3.into())] {
+            let mut value = v3_document();
+            value["version"] = version.into();
+            if domain.is_null() { value.as_object_mut().unwrap().remove("domain"); } else { value["domain"] = domain; }
+            assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "{version}");
+        }
+        // The deployed v1 and v2 readers refuse v3 bytes outright.
+        let bytes = serde_json::to_vec(&v3_document()).unwrap();
+        assert!(serde_json::from_slice::<SignedPolicyV1>(&bytes).is_err());
+        // An unknown field inside the range is refused.
+        let mut value = v3_document(); value["runtimes"][0]["turn_limit"]["step"] = 1.into();
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+    #[test]
+    fn policy_v3_with_any_invalid_range_is_refused_as_a_whole() {
+        // A second, valid record does not rescue the document.
+        let mut second = runtime_record();
+        second.runtime = RuntimeKind::Codex; second.profile = ProfileId(Sha256Digest([9; 32]));
+        let bads: Vec<serde_json::Value> = vec![
+            serde_json::json!({"min": 0, "max": 200, "default": 50}),
+            serde_json::json!({"min": 60, "max": 200, "default": 50}),
+            serde_json::json!({"min": 1, "max": 40, "default": 50}),
+            serde_json::json!({"min": 1, "max": 1001, "default": 50}),
+            serde_json::json!({"min": 1, "max": 200}),
+            serde_json::json!({"min": -1, "max": 200, "default": 50}),
+            serde_json::json!({"min": 1, "max": 70000, "default": 50}),
+            serde_json::json!("1..200"),
+        ];
+        for bad in bads {
+            let mut value = v3_document();
+            value["runtimes"][0]["turn_limit"] = bad.clone();
+            value["runtimes"].as_array_mut().unwrap().push(serde_json::to_value(&second).unwrap());
+            value["native"].as_array_mut().unwrap().push(serde_json::to_value(native_record(&second)).unwrap());
+            assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "{bad}");
+        }
+        // A ranged record must not also carry a fixed `--max-turns`.
+        let mut value = v3_document();
+        let arguments = value["runtimes"][0]["fixed_args"].as_array_mut().unwrap();
+        arguments.insert(0, serde_json::Value::from("500"));
+        arguments.insert(0, serde_json::Value::from("--max-turns"));
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        // A range on a record that is not a Claude MCP runtime.
+        let mut value = v3_document(); value["runtimes"][0]["runtime"] = serde_json::to_value(RuntimeKind::Codex).unwrap();
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+    #[test]
+    fn policy_v1_v2_unaffected_and_cannot_carry_a_range() {
+        // v1/v2 keep parsing exactly as before; no record has a range.
+        let v1 = parse_policy(&serde_json::to_vec(&v1_document()).unwrap()).unwrap();
+        assert!(v1.runtimes.iter().all(|record| record.turn_limit.is_none()));
+        let record = runtime_record();
+        let v2 = SignedPolicyV2 { domain: POLICY_DOMAIN_V2.into(), version: 2, runtimes: vec![record.clone()],
+            native: vec![native_record(&record)] };
+        let v2_bytes = serde_json::to_vec(&v2).unwrap();
+        assert!(parse_policy(&v2_bytes).unwrap().runtimes.iter().all(|record| record.turn_limit.is_none()));
+        // The serialized record (input of the MCP launch-policy digest) has no
+        // new key, so deployed v1/v2 acceptances keep their digests.
+        assert!(serde_json::to_value(&record).unwrap().get("turn_limit").is_none());
+        // A range in a v1 or v2 document is refused as a whole.
+        let range = serde_json::to_value(crate::policy::WORKING_DEFAULT_TURN_LIMIT).unwrap();
+        let mut value = v1_document(); value["runtimes"][0]["turn_limit"] = range.clone();
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(&v2_bytes).unwrap();
+        value["runtimes"][0]["turn_limit"] = range;
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        // R6 review round, finding 3: the key itself is refused before v3,
+        // also as an explicit `null` (which the typed record reads as absent).
+        let mut value = v1_document(); value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(serde_json::from_slice::<SignedPolicyV1>(&serde_json::to_vec(&value).unwrap()).unwrap().runtimes[0].turn_limit.is_none());
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "v1 null");
+        let mut value: serde_json::Value = serde_json::from_slice(&v2_bytes).unwrap();
+        value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err(), "v2 null");
+        // Host entitlements without `max_turns` keep their exact shape.
+        let entitlement: EntitlementRecord = serde_json::from_value(serde_json::json!({
+            "employee": EmployeeId([1; 16]), "profiles": [] })).unwrap();
+        assert!(entitlement.max_turns.is_none());
+        assert!(serde_json::to_value(&entitlement).unwrap().get("max_turns").is_none());
+        assert!(serde_json::from_value::<EntitlementRecord>(serde_json::json!({
+            "employee": EmployeeId([1; 16]), "profiles": [], "max_turns": 30, "ready": true })).is_err());
+    }
+
+    /// R6 review round, findings 1–3: every signed Claude MCP record carries
+    /// exactly one enforceable step limit, in every policy version; a v3
+    /// `"turn_limit": null` is refused (absent is the only "no range").
+    #[test]
+    fn policy_claude_mcp_step_limit_shape_is_refused_as_a_whole() {
+        let mut second = runtime_record();
+        second.runtime = RuntimeKind::Codex; second.profile = ProfileId(Sha256Digest([9; 32])); second.fixed_args.clear();
+        let parses = |mut value: serde_json::Value| {
+            value["runtimes"].as_array_mut().unwrap().push(serde_json::to_value(&second).unwrap());
+            value["native"].as_array_mut().unwrap().push(serde_json::to_value(native_record(&second)).unwrap());
+            parse_policy(&serde_json::to_vec(&value).unwrap()).is_ok()
+        };
+        let legacy = serde_json::to_value(crate::gateway_plan::claude_arguments("model").unwrap()).unwrap();
+        let ranged = serde_json::to_value(crate::gateway_plan::claude_ranged_arguments("model").unwrap()).unwrap();
+        let unranged = |mut value: serde_json::Value| {
+            value["runtimes"][0].as_object_mut().unwrap().remove("turn_limit");
+            value
+        };
+        assert!(parses(v3_document()));
+        assert!(parses(v1_document()));
+        // v3 without a range keeps the canonical fixed 50.
+        let mut value = unranged(v3_document()); value["runtimes"][0]["fixed_args"] = legacy.clone();
+        assert!(parses(value));
+        // v3: an explicit null is not "no range".
+        let mut value = v3_document(); value["runtimes"][0]["turn_limit"] = serde_json::Value::Null;
+        assert!(!parses(value), "v3 null");
+        // Neither a range nor the fixed flag (would launch with no step limit).
+        assert!(!parses(unranged(v3_document())), "v3 neither");
+        let mut value = v1_document(); value["runtimes"][0]["fixed_args"] = ranged.clone();
+        assert!(!parses(value), "v1 neither");
+        // Both.
+        let mut value = v3_document(); value["runtimes"][0]["fixed_args"] = legacy.clone();
+        assert!(!parses(value), "v3 both");
+        // The fixed flag with another value, duplicated or in `=` spelling.
+        let position = crate::policy::CLAUDE_FIXED_PREFIX.len();
+        for (index, replacement) in [(position + 1, "500"), (position, "--max-turns=50")] {
+            let mut value = v1_document(); value["runtimes"][0]["fixed_args"][index] = replacement.into();
+            assert!(!parses(value), "{replacement}");
+        }
+        let mut value = v1_document();
+        let arguments = value["runtimes"][0]["fixed_args"].as_array_mut().unwrap();
+        arguments.insert(position, "50".into()); arguments.insert(position, "--max-turns".into());
+        assert!(!parses(value), "duplicated");
+        // A bare `--` before the suffix, or the insertion point after a
+        // value-taking option.
+        for (index, smuggled) in [(14, "--"), (1, "--"), (14, "--model")] {
+            let mut value = v3_document();
+            value["runtimes"][0]["fixed_args"].as_array_mut().unwrap().insert(index, smuggled.into());
+            assert!(!parses(value), "{index} {smuggled}");
+        }
+    }
+
+    /// R6 on a real installed host: for every employee entitled to a ranged
+    /// (policy v3) Claude runtime in the live root publication, nothing the
+    /// gateway can ask for exceeds the signed maximum or the employee's root
+    /// ceiling, and a request above either is refused rather than clamped.
+    /// The real run chain (`tests/claude_chain.rs`) passes the same value.
+    #[test]
+    #[ignore = "requires root native Linux installed protected host with a policy v3 Claude runtime"]
+    fn iso_root_e2e_max_turns_entitlement_narrows_only() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let (_, gid) = crate::server::gateway_identity().unwrap();
+        let publication = GatewayPublication::read(gid).expect("fresh installed signed root publication");
+        let policy = publication.policy().unwrap();
+        let mut checked = 0;
+        for entitlement in &publication.entitlements {
+            let Ok((claude, _)) = policy.derive(entitlement.employee, &RuntimeKind::Claude, false) else { continue };
+            let Some(limit) = claude.turn_limit else { continue };
+            let employee = entitlement.employee;
+            let cap = entitlement.max_turns.unwrap_or(limit.max).min(limit.max);
+            for desired in [u64::MAX, u64::from(limit.max) + 1, u64::from(limit.default), 50] {
+                let request = crate::policy::narrowed_request(limit, entitlement.max_turns, desired);
+                match policy.max_turns(employee, claude, Some(request)) {
+                    Ok(value) => assert!(value == Some(request) && request <= cap),
+                    Err(_) => assert!(request < limit.min),
+                }
+            }
+            assert!(policy.max_turns(employee, claude, Some(limit.max.saturating_add(1))).is_err());
+            if cap < limit.max { assert!(policy.max_turns(employee, claude, Some(cap + 1)).is_err()); }
+            match policy.max_turns(employee, claude, None) {
+                Ok(Some(value)) => assert!(limit.min <= value && value <= cap),
+                Ok(None) => panic!("a ranged record always yields a value"),
+                Err(_) => assert!(cap < limit.min),
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no employee is entitled to a policy v3 ranged Claude runtime on this host");
     }
 
 }

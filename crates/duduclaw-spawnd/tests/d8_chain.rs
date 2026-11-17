@@ -255,7 +255,8 @@ fn plan(setup: &Setup, gid: u32, run: RunHandle, role: &str) -> SpawnPolicy {
         resources: runtime.resources.clone(), network: runtime.network.clone(), pty: false,
         capabilities: CapabilityHandover { mcp_bridge: false, egress_forwarder: false }, timeouts: runtime.timeouts.clone(),
         inputs: RunInputs { prompt: RunInput { max_bytes: prompt.len() as u64,
-            reader: Box::new(duduclaw_execution::io::Reader(std::io::Cursor::new(prompt))) }, attachments: vec![] } }
+            reader: Box::new(duduclaw_execution::io::Reader(std::io::Cursor::new(prompt))) }, attachments: vec![] },
+        requested_max_turns: None }
 }
 async fn io(backend: &SpawndBackend, run: RunHandle) -> RunStdio {
     loop { match backend.take_stdio(run).await { Ok(io) => return io,

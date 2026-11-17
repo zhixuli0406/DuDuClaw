@@ -378,6 +378,8 @@ fn map_error(code: ErrorCode) -> BackendError {
         ErrorCode::HelperBusy | ErrorCode::HelperUnavailable | ErrorCode::HelperCgroupUnavailable
             | ErrorCode::HelperRecordingUnsupported => BackendError::Unavailable,
         ErrorCode::RunTimeExhausted => BackendError::Timeout,
+        // R6: `requested_max_turns` outside the wire bound.
+        ErrorCode::StepLimitDenied => BackendError::Denied,
     }
 }
 

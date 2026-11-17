@@ -283,6 +283,7 @@ fn local_policy(run: RunHandle, class: ExecutionClass, pty: bool) -> SpawnPolicy
         capabilities: CapabilityHandover { mcp_bridge: false, egress_forwarder: false },
         timeouts: RunTimeouts { queue_ms: 30000, startup_ms: 0, runtime_ms: 0, pty_idle_ms: None, termination_grace_ms: 0 },
         inputs: RunInputs { prompt: RunInput { reader: Box::new(crate::io::Reader(tokio::io::empty())), max_bytes: 0 }, attachments: vec![] },
+        requested_max_turns: None,
     }
 }
 

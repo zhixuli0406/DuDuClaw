@@ -374,8 +374,10 @@ async fn run_gateway(setup: Arc<Setup>, observer: Arc<Mutex<UnixStream>>) {
     let backend = Arc::new(SpawndBackend::connect().await.expect("real root spawnd endpoint"));
     let prompt = format!("Call the duduclaw MCP tool {TOOL} exactly once with challenge \"{}\" and the system_challenge from your system instructions. Return its text verbatim. Do not use other tools.\n", setup.challenge);
     let factory = duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory::new(setup.generation, gid).unwrap();
+    // R6: the value root enforces (fixed 50 for v1/v2, the ranged default for v3).
+    let max_turns = factory.claude_max_turns(setup.employee, 50).unwrap();
     let plan = factory.claude(setup.employee, ExecutionClass::EmployeeMain, prompt.as_bytes().to_vec(),
-        format!("This is isolated transport acceptance. The system_challenge is {}. Supply it as the system_challenge tool argument when the user asks; follow that tool request exactly.", setup.system_challenge).into_bytes(), &setup.model).unwrap();
+        format!("This is isolated transport acceptance. The system_challenge is {}. Supply it as the system_challenge tool argument when the user asks; follow that tool request exactly.", setup.system_challenge).into_bytes(), &setup.model, max_turns).unwrap();
     let now = duduclaw_mcp_boundary::authority::now_seconds().unwrap();
     let grant = GrantPolicy { task: None, principal: principal(), binding: binding(), lane: Lane::Standard,
         tools: List::new(vec![Text::new(TOOL.into()).unwrap()]).unwrap(), resources: List::new(vec![]).unwrap(),

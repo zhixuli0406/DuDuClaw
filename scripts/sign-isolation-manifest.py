@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import unicodedata
 
 NAMESPACES = {
     "root": "duduclaw-root-metadata-v1@dudustudio",
@@ -80,6 +81,22 @@ def bind_artifacts(document, directory):
 
 
 POLICY_DOMAIN_V2 = "duduclaw-isolation-policy-v2"
+POLICY_DOMAIN_V3 = "duduclaw-isolation-policy-v3"
+# Policy v3 step range (spawnd `policy::TurnLimit`): 1 <= min <= default <= max <= 1000.
+TURN_LIMIT_KEYS = {"min", "max", "default"}
+TURN_LIMIT_CEILING = 1000
+# Working default for a v3 template: PENDING OWNER DECISION Q12 (min 1, default 50, max 200).
+TURN_LIMIT_WORKING_DEFAULT = {"min": 1, "default": 50, "max": 200}
+CLAUDE_MCP_SUFFIX = ["--strict-mcp-config", "--mcp-config", "/config/mcp.json"]
+# The canonical signed Claude MCP shape (spawnd `policy::validate_claude_arguments`,
+# `gateway_plan::claude_arguments`): this prefix, then `--max-turns 50` only
+# without a range, then optionally `--model <m>`, then the fixed MCP suffix.
+CLAUDE_FIXED_PREFIX = ["-p", "--input-format", "text", "--output-format", "stream-json", "--verbose",
+                       "--system-prompt-file", "/proc/self/fd/5", "--tools", "", "--allowedTools", "mcp__duduclaw__*"]
+# Options of that shape which consume the next element (spawnd `CLAUDE_VALUE_OPTIONS`).
+CLAUDE_VALUE_OPTIONS = {"--input-format", "--output-format", "--system-prompt-file", "--tools",
+                        "--allowedTools", "--max-turns", "--model", "--mcp-config"}
+LEGACY_FIXED_MAX_TURNS = "50"
 HELPER_BINDING_KEYS = {"profile", "slot", "seccomp", "seccomp_digest", "self_only", "memory_bytes", "tasks",
                        "cpu_quota_percent", "open_files", "file_size_bytes", "timeout_ms", "filesystem", "egress"}
 HELPER_FS = {"work", "work_recordings", "system_ro"}
@@ -90,13 +107,74 @@ def _integer(value, low, high):
     return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
 
 
+def _plain_model(model):
+    return (isinstance(model, str) and model != "" and len(model.encode("utf-8")) <= 256
+            and not model.startswith("-") and model.strip() == model
+            and not any(unicodedata.category(char) == "Cc" for char in model))
+
+
+def validate_claude_arguments(arguments, ranged):
+    """Signed arguments of a Claude MCP record, in every policy version.
+
+    Without a range: exactly prefix + `--max-turns 50` + [`--model m`] + suffix.
+    With a range (v3): prefix + [`--model m`] + suffix and no `--max-turns` in
+    any spelling; spawnd inserts `--max-turns <n>` right before the suffix, so
+    no bare `--` may precede it and it must not follow a value-taking option.
+    """
+    suffix = len(CLAUDE_MCP_SUFFIX)
+    if not isinstance(arguments, list) or not all(isinstance(arg, str) for arg in arguments) \
+            or len(arguments) < suffix or arguments[-suffix:] != CLAUDE_MCP_SUFFIX:
+        raise ValueError("Claude MCP arguments must end with the fixed MCP suffix")
+    head = arguments[:-suffix]
+    if "--" in head or not head or head[-1] in CLAUDE_VALUE_OPTIONS:
+        raise ValueError("the --max-turns insertion point must stay in the CLI option area")
+    if sum(arg.startswith("--max-turns") for arg in arguments) != (0 if ranged else 1):
+        raise ValueError("a Claude MCP record needs exactly one of turn_limit or the fixed --max-turns 50")
+    rest = head[len(CLAUDE_FIXED_PREFIX):]
+    if head[:len(CLAUDE_FIXED_PREFIX)] != CLAUDE_FIXED_PREFIX:
+        raise ValueError("Claude MCP arguments are not the canonical shape")
+    if not ranged:
+        if rest[:2] != ["--max-turns", LEGACY_FIXED_MAX_TURNS]:
+            raise ValueError("the fixed step limit is exactly --max-turns 50 after the input protocol")
+        rest = rest[2:]
+    if rest and not (len(rest) == 2 and rest[0] == "--model" and _plain_model(rest[1])):
+        raise ValueError("Claude MCP arguments are not the canonical shape")
+
+
+def validate_turn_limit(runtime, version):
+    """Step limit of one runtime record (spawnd re-checks all of it).
+
+    Every Claude MCP record, in every version, has exactly one enforceable
+    step limit: absent `turn_limit` with the canonical fixed `--max-turns 50`,
+    or (v3 only) a valid `turn_limit` object with no `--max-turns` at all.
+    The key is refused before v3 and as an explicit null; any invalid value
+    makes the whole policy invalid.
+    """
+    if not isinstance(runtime, dict):
+        return
+    claude_mcp = runtime.get("runtime") == {"kind": "claude"} and runtime.get("mcp") is True
+    ranged = "turn_limit" in runtime
+    if ranged:
+        limit = runtime["turn_limit"]
+        if version < 3:
+            raise ValueError("turn_limit requires policy v3")
+        if not isinstance(limit, dict) or set(limit) != TURN_LIMIT_KEYS \
+                or not all(_integer(limit[key], 1, TURN_LIMIT_CEILING) for key in TURN_LIMIT_KEYS) \
+                or not limit["min"] <= limit["default"] <= limit["max"]:
+            raise ValueError("turn_limit must satisfy 1 <= min <= default <= max <= 1000")
+        if not claude_mcp:
+            raise ValueError("turn_limit requires a Claude MCP record")
+    if claude_mcp:
+        validate_claude_arguments(runtime.get("fixed_args"), ranged)
+
+
 def validate_policy_document(document):
     """Offline shape check of the signed isolation policy artifact.
 
     spawnd re-runs every publication check (HX D8 revision section 2.3) on the
     bytes; this only stops a malformed template before it is bound by the
-    release manifest. v2 carries its domain and version in the signed bytes;
-    v1 has neither a domain nor a launcher.
+    release manifest. v2 and v3 carry their domain and version in the signed
+    bytes; v1 has neither a domain nor a launcher; only v3 has step ranges.
     """
     if not isinstance(document, dict):
         raise ValueError("policy must be an object")
@@ -107,18 +185,23 @@ def validate_policy_document(document):
     elif version == 2:
         if set(document) != {"domain", "version", "runtimes", "native"} or document["domain"] != POLICY_DOMAIN_V2:
             raise ValueError("v2 policy requires its signed domain")
+    elif version == 3:
+        if set(document) != {"domain", "version", "runtimes", "native"} or document["domain"] != POLICY_DOMAIN_V3:
+            raise ValueError("v3 policy requires its signed domain")
     else:
         raise ValueError("unsupported policy version")
     native = document.get("native")
     if not isinstance(native, list) or not isinstance(document.get("runtimes"), list) \
             or len(native) != len(document["runtimes"]):
         raise ValueError("one native record per runtime")
+    for runtime in document["runtimes"]:
+        validate_turn_limit(runtime, version)
     for record in native:
         launcher = record.get("launcher") if isinstance(record, dict) else None
         if launcher is None:
             continue
-        if version != 2:
-            raise ValueError("launcher requires policy v2")
+        if version < 2:
+            raise ValueError("launcher requires policy v2 or later")
         if not isinstance(launcher, dict) or set(launcher) != {"reserve", "helpers", "helper_tmpfs_bytes"}:
             raise ValueError("invalid launcher record")
         if not _integer(launcher["helper_tmpfs_bytes"], 1, record.get("tmpfs_bytes", 0)):

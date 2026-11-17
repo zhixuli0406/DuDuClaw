@@ -933,6 +933,7 @@ mod tests {
             timeouts: RunTimeouts { queue_ms: 30000, startup_ms: 5000, runtime_ms: 5000,
                 pty_idle_ms: None, termination_grace_ms: 100 },
             inputs: RunInputs { prompt: RunInput { reader: Box::new(Reader(tokio::io::empty())), max_bytes: 0 }, attachments: vec![] },
+            requested_max_turns: None,
         }
     }
 

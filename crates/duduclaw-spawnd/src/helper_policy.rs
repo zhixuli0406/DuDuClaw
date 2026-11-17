@@ -249,7 +249,7 @@ mod tests {
                 output_total_bytes: 1 << 20, memfd_total_bytes: 1 << 20 },
             timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 3_600_000, pty_idle_ms: None,
                 termination_grace_ms: 15_000 },
-            network, mcp: false, pty_allowed: false, queue_class: QueueClass::Background }
+            network, mcp: false, pty_allowed: false, queue_class: QueueClass::Background, turn_limit: None }
     }
     fn registered(name: &str) -> RuntimeKind { RuntimeKind::Registered(Text::new(name.into()).unwrap()) }
     fn egress() -> NetworkPolicy { NetworkPolicy::Egress(ProfileId(Sha256Digest([7; 32]))) }

@@ -113,7 +113,8 @@ mod tests {
     use duduclaw_isolation::{bounded::List, execution::{RunHandle, RuntimeKind}, ids::{EmployeeId, RunId}};
     fn request() -> SpawnRequest {
         SpawnRequest::StartRun { run: RunHandle(RunId([1;16])), employee_id: EmployeeId([2;16]), runtime_request: RuntimeKind::Codex,
-            task_ref: None, workspace: None, prompt_bytes: 2, input_fds: List::new(vec![]).unwrap(), pty: false }
+            task_ref: None, workspace: None, prompt_bytes: 2, input_fds: List::new(vec![]).unwrap(), pty: false,
+            requested_max_turns: None }
     }
     #[test]
     fn sealed_fd_rejects_missing_seals_and_false_size() {
