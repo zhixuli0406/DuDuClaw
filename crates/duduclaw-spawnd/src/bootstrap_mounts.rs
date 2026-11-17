@@ -48,7 +48,9 @@ fn open_trusted(parent: BorrowedFd<'_>, name: &CStr, flags: i32) -> io::Result<O
 /// R7f review round 2: the /etc projection's directories (`duduclaw/`, `ssl/`,
 /// `ssl/certs`) are opened only through [`open_trusted`]: publish, verify and
 /// cleanup refuse a component that is a mount point (or a symlink) before
-/// trusting, let alone removing, anything beneath it.
+/// trusting, let alone removing, anything beneath it. Round 3: the same holds
+/// for the per-run top directory beneath the etc-state parent (publish, also on
+/// EEXIST; enumeration; cleanup).
 fn open_same_mount_directory(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {
     open_trusted(parent, name, libc::O_RDONLY | libc::O_DIRECTORY)
 }
@@ -313,8 +315,9 @@ fn publish_projection(anchors: &RootPublicationAnchors, run: RunHandle, uid: u32
     let name = CString::new(run_name(run)).map_err(|_| invalid())?;
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
     if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err(io::Error::last_os_error()); }
-    let directory = owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    // An existing (EEXIST) directory is not known to be ours: one that is a mount
+    // point (e.g. a foreign projection bound over a residue) is refused here.
+    let directory = open_same_mount_directory(parent.as_fd(), &name)?;
     let stat = metadata(&directory)?;
     if stat.uid() != 0 { return Err(invalid()); }
     if result == 0 && unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) } != 0 { return Err(io::Error::last_os_error()); }
@@ -503,7 +506,9 @@ pub fn projection_runs(anchors: &RootPublicationAnchors) -> io::Result<Vec<RunHa
         let name = entry.file_name();
         let name = name.to_str().ok_or_else(invalid)?;
         let run = crate::systemd::parse_run_unit(&format!("duduclaw-run-{name}.service")).ok_or_else(invalid)?;
-        let stat = fs::symlink_metadata(entry.path())?;
+        // The run directory itself, on the etc-state mount (a mount point or a
+        // symlink is refused), not a path stat that would look through a mount.
+        let stat = metadata(&open_same_mount_directory(parent.as_fd(), &c_name(&entry.file_name())?)?)?;
         if !stat.is_dir() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o700 | 0o755) { return Err(invalid()); }
         runs.push(RunHandle(run));
     }
@@ -515,9 +520,12 @@ pub fn projection_runs(anchors: &RootPublicationAnchors) -> io::Result<Vec<RunHa
 pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> io::Result<()> {
     let parent = trusted_directory(&anchors.etc_state)?;
     let name = CString::new(run_name(run)).map_err(|_| invalid())?;
-    let raw = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-    if raw < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) { return Ok(()); }
-    let directory = owned(raw as _)?;
+    // A top directory that is a mount point is refused before anything inside it
+    // is enumerated, let alone removed.
+    let directory = match open_same_mount_directory(parent.as_fd(), &name) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+        opened => opened?,
+    };
     if metadata(&directory)?.uid() != 0 || !matches!(metadata(&directory)?.mode() & 0o7777, 0o700 | 0o755) { return Err(invalid()); }
     let expected = minimal_etc(70000, 70000).map_err(|_| invalid())?;
     // Interrupted creation can leave a subset. Enumerate and validate before
@@ -929,9 +937,12 @@ mod tests {
     /// the O_NOFOLLOW checks accepted), a root 0755 tmpfs on `ssl/certs`, or
     /// `duduclaw/` bind-mounted onto itself — is refused by publish, verify
     /// and cleanup, and cleanup removes nothing (neither the foreign `certs/`
-    /// nor any projection entry). All mounts are made in the private namespace
-    /// of a fresh re-exec of only this test; this process prepares the
-    /// projection and cleans it up afterwards.
+    /// nor any projection entry). Round 3: a shape-valid foreign projection
+    /// (a second run's) bind-mounted over the EXISTING per-run top directory
+    /// is refused by publish, verify-by-name and cleanup, with nothing of it
+    /// removed; after unmounting, normal cleanup succeeds. All mounts are made
+    /// in the private namespace of a fresh re-exec of only this test; this
+    /// process prepares both projections and cleans them up afterwards.
     #[test]
     #[ignore = "iso_root_: disposable root Linux VM (DUDUCLAW_ISO_DISPOSABLE=1)"]
     fn iso_root_etc_projection_refuses_mounted_ca_chain() {
@@ -942,8 +953,9 @@ mod tests {
         assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
             "set DUDUCLAW_ISO_DISPOSABLE=1 only on a disposable VM");
         let run = RunHandle(duduclaw_isolation::ids::RunId([0x97; 16]));
+        let foreign_run = RunHandle(duduclaw_isolation::ids::RunId([0x98; 16]));
         if let Ok(root) = std::env::var(CHILD) {
-            mounted_ca_chain_is_refused(Path::new(&root), run);
+            mounted_ca_chain_is_refused(Path::new(&root), run, foreign_run);
             return;
         }
         let root = PathBuf::from(format!("/run/duduclaw-r7f-mounted-ca-{}", std::process::id()));
@@ -952,6 +964,8 @@ mod tests {
         // The complete production projection, and a foreign root-owned 0755
         // tree holding only an empty 0755 `certs/`.
         drop(publish_projection(&anchors, run, 70000, 70000).unwrap());
+        // A second, shape-valid production projection to bind over the first.
+        drop(publish_projection(&anchors, foreign_run, 70000, 70000).unwrap());
         let foreign = root.join("foreign");
         let foreign_certs = foreign.join(projection_directory_chain().unwrap()[1]);
         for path in [&foreign, &foreign_certs] {
@@ -974,6 +988,7 @@ mod tests {
         let foreign_kept = foreign_certs.is_dir();
         let cleaned = cleanup_projection(&anchors, run);
         let projection_gone = !root.join(run_name(run)).exists();
+        let foreign_cleaned = cleanup_projection(&anchors, foreign_run);
         let _ = fs::remove_dir(&foreign_certs);
         let _ = fs::remove_dir(&foreign);
         let _ = fs::remove_dir(&root);
@@ -984,9 +999,10 @@ mod tests {
         assert!(foreign_kept, "the foreign certs/ is never removed");
         cleaned.unwrap();
         assert!(projection_gone);
+        foreign_cleaned.unwrap();
     }
     /// Child half of `iso_root_etc_projection_refuses_mounted_ca_chain`.
-    fn mounted_ca_chain_is_refused(root: &Path, run: RunHandle) {
+    fn mounted_ca_chain_is_refused(root: &Path, run: RunHandle, foreign_run: RunHandle) {
         let anchors = RootPublicationAnchors::new(root.to_path_buf(), root.to_path_buf(), root.to_path_buf()).unwrap();
         let residue = root.join(run_name(run));
         let ssl = residue.join(duduclaw_run::ETC_PROJECTION_DIRECTORIES[0]);
@@ -1037,6 +1053,41 @@ mod tests {
         // Control: without the mounts the same projection verifies again.
         verify_etc_projection(dir.as_fd(), 70000, 70000, 0).expect("control after unmount");
         intact("after unmount");
+        // Round 3: a shape-valid foreign projection bind-mounted over the
+        // EXISTING per-run top directory. Every path opens the top directory by
+        // name on the etc-state mount (as `publish_projection`/`cleanup_projection`
+        // do), so publish (EEXIST), verify and cleanup all refuse.
+        let foreign_projection = root.join(run_name(foreign_run));
+        let parent = trusted_directory(root).unwrap();
+        let name = CString::new(run_name(run)).unwrap();
+        let verify_by_name = || open_same_mount_directory(parent.as_fd(), &name)
+            .and_then(|top| verify_etc_projection(top.as_fd(), 70000, 70000, 0));
+        let foreign_intact = |what: &str| {
+            let fd: OwnedFd = File::open(&foreign_projection).unwrap().into();
+            verify_etc_projection(fd.as_fd(), 70000, 70000, 0)
+                .unwrap_or_else(|error| panic!("{what}: the foreign projection keeps its exact shape: {error}"));
+            assert!(foreign_projection.join(ETC_MARKER_DIR).join(ETC_MARKER_FILE).is_file(), "{what}: foreign marker");
+            assert!(foreign_projection.join(duduclaw_run::ETC_CA_MOUNT_POINT).is_dir(), "{what}: foreign CA chain");
+        };
+        verify_by_name().expect("control: the run's projection verifies by name");
+        foreign_intact("control");
+        bind(&foreign_projection, &residue);
+        assert_eq!(open_same_mount_directory(parent.as_fd(), &name).unwrap_err().raw_os_error(), Some(libc::EXDEV),
+            "the top directory is a mount point");
+        assert!(publish_projection(&anchors, run, 70000, 70000).is_err(), "top mount: publish");
+        assert!(verify_by_name().is_err(), "top mount: verify");
+        assert!(cleanup_projection(&anchors, run).is_err(), "top mount: cleanup");
+        foreign_intact("top mount");
+        // The run's own projection beneath the mount is untouched as well.
+        verify_etc_projection(dir.as_fd(), 70000, 70000, 0).expect("own projection beneath the mount");
+        unmount(&residue);
+        foreign_intact("after unmounting the top");
+        intact("after unmounting the top");
+        verify_by_name().expect("control after unmounting the top");
+        // Normal cleanup now succeeds and removes exactly the run's projection.
+        cleanup_projection(&anchors, run).expect("cleanup after unmount");
+        assert!(fs::symlink_metadata(&residue).is_err(), "the run's projection is removed");
+        foreign_intact("after cleanup");
     }
     #[test]
     #[ignore = "requires root and CAP_SYS_ADMIN on disposable Linux VM"]
