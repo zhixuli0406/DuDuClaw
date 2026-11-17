@@ -47,8 +47,15 @@ device lacking Ed25519 support cannot sign accepted releases in this package.
 recomputes every artifact size and SHA-256 from `--artifacts-dir/<artifact-id>`,
 writes compact sorted-key UTF-8 JSON, and signs it with the fixed role namespace.
 It emits `<output>.signatures.json` containing the detached armor strings.
-Root/emergency metadata use `--kind root` / `--kind emergency` and repeat `--key`
-for distinct signers. No private keys belong in this repository.
+Root/emergency metadata use `--kind root` / `--kind emergency` with `--key-count N`;
+production key locations are read from stdin, one per line (prompted on a
+terminal), never argv or the environment (`--key` is accepted only with the TEST
+signer). No private keys belong in this repository.
 
-The script does not prove threshold authorization or accept the release on a
-client: run the Rust verifier and the installation tests before publication.
+For `--kind root` and `--kind bundle` the script checks that the signatures come
+from distinct, registered, unrevoked root keys meeting the threshold (by the key
+embedded in each signature), that each has the shape `sshsig.rs` accepts, and
+that each verifies cryptographically over the exact bytes: `ssh-keygen -Y verify`
+in production, `duduclaw-isolation-test-signer verify` (this crate's verifier)
+for TEST signatures. It does not accept the release on a client: run the Rust
+verifier and the installation tests before publication.

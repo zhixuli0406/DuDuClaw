@@ -8,6 +8,9 @@ pub mod trust_store;
 pub mod publication;
 pub mod bundle;
 pub mod bootstrap_cli;
+/// TEST-ONLY software signer (plan §3.3, R2 §4.2): unit tests and feature `test-signer` only.
+#[cfg(any(test, feature = "test-signer"))]
+pub mod test_signer;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]
