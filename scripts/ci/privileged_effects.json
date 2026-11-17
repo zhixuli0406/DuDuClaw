@@ -4,6 +4,19 @@
   "identity_semantics": "identity records current execution domain; target_identity is a pending migration destination. test/operator/host_service are inventory-only domains outside the native wire contract",
   "entries": [
     {
+      "symbol": "crates/duduclaw-import/src/capture_tests.rs::filesystem::capture_creates_no_files_in_home_tmpdir_or_cwd",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Re-executes only this regression test with isolated TMPDIR and cwd to verify in-memory capture creates no files, without changing the concurrent test runner environment."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::background_idle_stops_pending_tool_and_keepalive_does_not_reset_it",
       "apis": {
         "command_constructor": 1

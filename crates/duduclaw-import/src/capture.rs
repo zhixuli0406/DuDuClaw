@@ -5,10 +5,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use crate::{catalog::{self, Store}, expected, sqlite, Error, Result};
 
-#[cfg(target_os = "linux")]
-#[path = "capture_memfd.rs"]
-mod memfd;
-
 const MAX_REPORT_BYTES: usize = 128 * 1024;
 const MAX_DIFFERENCES: usize = 16;
 use crate::expected::STORES;
@@ -67,7 +63,12 @@ pub fn capture(home: &Path, creating_version: &str) -> Result<Report> {
 }
 
 #[cfg(unix)]
-fn capture_with_hook(home: &Path, creating_version: &str, after_copy: impl Fn(Store)) -> Result<Report> {
+fn capture_with_hook(home: &Path, creating_version: &str, after_read: impl Fn(Store)) -> Result<Report> {
+    capture_with_bound(home, creating_version, crate::MAX_SOURCE_BYTES, after_read)
+}
+
+#[cfg(unix)]
+fn capture_with_bound(home: &Path, creating_version: &str, max_bytes: u64, after_read: impl Fn(Store)) -> Result<Report> {
     use std::{fs::File, path::Component};
     use rustix::fs::{open, openat, Mode, OFlags};
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -102,8 +103,11 @@ fn capture_with_hook(home: &Path, creating_version: &str, after_copy: impl Fn(St
         let file = File::from(fd);
         let metadata = file.metadata()?;
         use std::os::unix::fs::MetadataExt;
-        if !metadata.is_file() || metadata.len() > crate::MAX_SOURCE_BYTES {
+        if !metadata.is_file() {
             entry.status = "refused_file_or_limit"; report.stores.push(entry); continue;
+        }
+        if metadata.len() > max_bytes {
+            entry.status = "refused_too_large"; report.stores.push(entry); continue;
         }
         if metadata.nlink() != 1 {
             entry.status = "refused_hardlink"; report.stores.push(entry); continue;
@@ -113,43 +117,14 @@ fn capture_with_hook(home: &Path, creating_version: &str, after_copy: impl Fn(St
             Ok(_) => { entry.status = "refused_sqlite_or_changed"; report.stores.push(entry); continue; },
             Err(status) => { entry.status = status; report.stores.push(entry); continue; },
         };
-        // SQLite never receives a descriptor/path into the customer's home.
+        // Only the validated descriptor is read; SQLite never opens a source path.
         let result = (|| -> Result<StoreReport> {
-            let copy = PrivateCopy::new(&file, home, metadata.len())?;
-            let inspected = (|| -> Result<StoreReport> {
-            after_copy(store);
+            let conn = read_image(&file, metadata.len(), max_bytes, store)?;
+            after_read(store);
             if snapshot(home, &directory, store).ok().as_ref() != Some(&before)
                 || identity(&file.metadata()?) != before.store { return Err(Error::Io); }
-                let mut conn = copy.open()?;
-                let inspected = (|| -> Result<StoreReport> {
-                    conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
-                    sqlite::harden(&mut conn)?;
-                // Match the existing authority readers: the task authority trigger
-                // covers more than 32 fields; workflow also needs this fixed bound.
-                    if matches!(store, Store::Tasks | Store::Workflow) {
-                        conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128)?;
-                    }
-                    conn.authorizer(Some(|c: AuthContext<'_>| {
-                    if c.accessor.is_some() { return Authorization::Deny; }
-                    match c.action {
-                        AuthAction::Select => Authorization::Allow,
-                        AuthAction::Pragma { pragma_name: "user_version" | "application_id", pragma_value: None } => Authorization::Allow,
-                        AuthAction::Read { table_name: "sqlite_schema" | "sqlite_master", column_name: "type" | "name" | "tbl_name" | "sql" }
-                            if c.database_name == Some("main") => Authorization::Allow,
-                        AuthAction::Function { function_name }
-                            if ["date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"].iter().any(|n| function_name.eq_ignore_ascii_case(n)) => Authorization::Allow,
-                        _ => Authorization::Deny,
-                    }
-                    }))?;
-                    inspect(&conn, store)
-                })();
-                let closed = copy.close(conn);
-                closed?;
-                inspected
-            })();
-            let removed = copy.remove();
-            removed?;
-            let found = inspected?;
+            let found = inspect(&conn, store)?;
+            conn.close().map_err(|(_, error)| error)?;
             if snapshot(home, &directory, store).ok().as_ref() != Some(&before)
                 || identity(&file.metadata()?) != before.store { return Err(Error::Io); }
             Ok(found)
@@ -167,10 +142,7 @@ fn capture_with_hook(home: &Path, creating_version: &str, after_copy: impl Fn(St
 #[cfg(not(unix))]
 pub fn capture(_home: &Path, _creating_version: &str) -> Result<Report> { Err(Error::Isolation) }
 
-#[cfg(target_os = "linux")]
-const COPY_MECHANISM: &str = "sealed_memfd";
-#[cfg(not(target_os = "linux"))]
-const COPY_MECHANISM: &str = "private_0700_directory_0600_file";
+const COPY_MECHANISM: &str = "in_memory";
 
 #[cfg(unix)]
 fn source_flags() -> rustix::fs::OFlags {
@@ -229,97 +201,60 @@ fn snapshot(home: &Path, directory: &std::os::fd::OwnedFd, store: Store) -> std:
     Ok(Snapshot { parent: (parent.dev(), parent.ino()), store: identity(&main), sidecars })
 }
 
-#[cfg(unix)]
-struct PrivateCopy {
-    #[cfg(target_os = "linux")]
-    file: std::fs::File,
-    #[cfg(target_os = "linux")]
-    copied_bytes: u64,
-    #[cfg(not(target_os = "linux"))]
-    directory: tempfile::TempDir,
-}
-#[cfg(unix)]
-impl PrivateCopy {
-    fn new(input: impl std::io::Read, _home: &Path, expected_bytes: u64) -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            let (file, copied_bytes) = memfd::copy(input, expected_bytes)?;
-            Ok(Self { file, copied_bytes })
+/// Load exactly one bounded image into SQLite-owned memory. No VFS file is opened.
+fn read_image(mut input: impl std::io::Read, expected_bytes: u64, max_bytes: u64, store: Store) -> Result<Connection> {
+    use std::io::Read;
+    if expected_bytes > max_bytes || expected_bytes > crate::MAX_SOURCE_BYTES { return Err(Error::Limit); }
+    let size = usize::try_from(expected_bytes).map_err(|_| Error::Limit)?;
+    let mut conn = Connection::open_in_memory_with_flags(
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
+    sqlite::harden_capture(&mut conn)?;
+    // The reviewed task/workflow schemas require this exception to the depth-32 limit.
+    if matches!(store, Store::Tasks | Store::Workflow) {
+        conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128)?;
+    }
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let reopening = Arc::new(AtomicBool::new(false));
+    let allow_reopen = Arc::clone(&reopening);
+    conn.authorizer(Some(move |c: AuthContext<'_>| {
+        if c.accessor.is_some() { return Authorization::Deny; }
+        match c.action {
+            // sqlite3_deserialize prepares this fixed internal ATTACH before
+            // reopening main with memdb. Permit it once, only during that API call.
+            AuthAction::Attach { filename: "x" } if allow_reopen.swap(false, Ordering::SeqCst) => Authorization::Allow,
+            AuthAction::Select => Authorization::Allow,
+            AuthAction::Pragma { pragma_name: "user_version" | "application_id", pragma_value: None } => Authorization::Allow,
+            AuthAction::Read { table_name: "sqlite_schema" | "sqlite_master", column_name: "type" | "name" | "tbl_name" | "sql" }
+                if c.database_name == Some("main") => Authorization::Allow,
+            AuthAction::Function { function_name }
+                if ["date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"].iter().any(|n| function_name.eq_ignore_ascii_case(n)) => Authorization::Allow,
+            _ => Authorization::Deny,
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            // Ignore TMPDIR. The shared fixed root must be root-owned and sticky
-            // if writable by other users. Request 0700 at directory creation.
-            let root = std::fs::canonicalize("/tmp")?;
-            let home = std::fs::canonicalize(_home)?;
-            let meta = std::fs::metadata(&root)?;
-            if meta.uid() != 0 || (meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0)
-                || root.starts_with(&home) { return Err(Error::Isolation); }
-            let directory = tempfile::Builder::new().prefix("duduclaw-capture-")
-                .permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in(&root)?;
-            let copied = (|| -> Result<()> {
-                let path = directory.path();
-                if path.starts_with(&home) || home.starts_with(path)
-                    || std::fs::metadata(path)?.mode() & 0o777 != 0o700 { return Err(Error::Isolation); }
-                let source = path.join("source.db");
-                sqlite::copy_bounded(input, &source)?;
-                if std::fs::metadata(source)?.len() != expected_bytes { return Err(Error::Io); }
-                Ok(())
-            })();
-            if let Err(error) = copied {
-                directory.close().map_err(|_| Error::Isolation)?;
-                return Err(error);
-            }
-            Ok(Self { directory })
-        }
-    }
-    fn open(&self) -> Result<Connection> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        #[cfg(target_os = "linux")]
-        {
-            self.verify()?;
-            // Omit SQLITE_OPEN_NOFOLLOW only for our own procfs magic link:
-            // the owned, sealed anonymous fd cannot be replaced by an attacker.
-            // immutable=1 disables locks and all journal/WAL sidecar creation.
-            let uri = format!("file:{}?mode=ro&immutable=1", self.path().display());
-            Ok(Connection::open_with_flags(uri, flags)?)
-        }
-        #[cfg(not(target_os = "linux"))]
-        { Ok(Connection::open_with_flags(immutable_uri(&self.path()), flags)?) }
-    }
-    fn verify(&self) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        { memfd::verify(&self.file, self.copied_bytes)?; }
-        Ok(())
-    }
-    fn close(&self, conn: Connection) -> Result<()> {
-        // Drop even a connection returned by a failed close before checking the fd.
-        let closed = conn.close().map_err(|(_, error)| error);
-        self.verify()?;
-        closed?;
-        Ok(())
-    }
-    fn remove(self) -> Result<()> {
-        #[cfg(not(target_os = "linux"))]
-        self.directory.close().map_err(|_| Error::Isolation)?;
-        Ok(())
-    }
-    fn path(&self) -> std::path::PathBuf {
-        #[cfg(target_os = "linux")]
-        { use std::os::fd::AsRawFd; format!("/proc/self/fd/{}", self.file.as_raw_fd()).into() }
-        #[cfg(not(target_os = "linux"))]
-        { self.directory.path().join("source.db") }
-    }
+    }))?;
+    // A checkpointed WAL-mode header cannot be deserialized as-is (SQLITE_CANTOPEN).
+    // Normalize only the in-memory journal-version bytes, never the source. The
+    // caller has already refused nonempty WAL/journals and checks identities again.
+    let mut reader = ImageReader { input: &mut input, offset: 0 };
+    reopening.store(true, Ordering::SeqCst);
+    let loaded = conn.deserialize_read_exact("main", &mut reader, size, true);
+    reopening.store(false, Ordering::SeqCst);
+    loaded?;
+    let mut extra = [0];
+    if reader.read(&mut extra)? != 0 { return Err(Error::Io); }
+    Ok(conn)
 }
 
-#[cfg(unix)]
-fn immutable_uri(path: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    let mut uri = String::from("file:");
-    for byte in path.as_os_str().as_bytes() { uri.push_str(&format!("%{byte:02X}")); }
-    uri.push_str("?mode=ro&immutable=1");
-    uri
+struct ImageReader<R> { input: R, offset: u64 }
+impl<R: std::io::Read> std::io::Read for ImageReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.input.read(buffer)?;
+        for (index, byte) in buffer.iter_mut().take(count).take(20u64.saturating_sub(self.offset) as usize).enumerate() {
+            if matches!(self.offset + index as u64, 18 | 19) && *byte == 2 { *byte = 1; }
+        }
+        self.offset += count as u64;
+        Ok(count)
+    }
 }
 
 fn inspect(conn: &Connection, store: Store) -> Result<StoreReport> {

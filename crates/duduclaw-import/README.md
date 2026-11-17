@@ -227,31 +227,40 @@ opens use no-follow directory descriptors; source files must open read-only,
 be regular, have exactly one hard link and be at most 256 MiB.
 Run as root or as the home's owner: Linux requires `O_NOATIME` for source and
 sidecar opens; an `EPERM` refusal produces `refused_noatime`, with no retry that
-could update access times. Linux copies bytes only into an anonymous memfd,
-then applies `F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE|F_SEAL_SEAL`. SQLite opens
-`/proc/self/fd/<n>` through SQLite's default VFS with `mode=ro&immutable=1`.
-The memfd is sealed against writes and size changes; immutable read-only access
-prevents SQLite from creating files or using WAL, and temporary storage is kept
-in memory.
-No named copy is created on Linux, including on failures or process termination.
-The non-Linux Unix development/test fallback ignores `TMPDIR`: it creates a
-0700 directory under the fixed, verified root-owned `/tmp` (canonicalized on
-macOS), verifies that the private directory and the captured home do not overlap
-in either direction, and creates `source.db` with 0600 and `O_EXCL|O_NOFOLLOW`.
-RAII removes that directory on success and error returns (unlike memfd, a forced
-process termination can leave this development-only named fallback behind).
-The normal importer heap, schema-row, SQL-length,
-column and query-time limits apply. Workflow keeps the existing reviewed
-expression-depth exception. The capture queries only schema and pragma metadata.
+could update access times. On Linux and macOS, bytes from the validated source
+file descriptor are deserialized directly into a read-only, SQLite-owned
+in-memory database. No copy of the store is ever written to disk; the image
+lives only in this process's memory for the duration of the capture. No memfd,
+private temporary directory, named copy, or descriptor-path URI is used.
+Temporary SQLite storage stays in memory. Nonempty WAL/journals are refused
+before reading; for a checkpointed WAL-mode image, only the in-memory header's
+journal-version bytes (18 and 19) are normalized to rollback mode, as required
+by SQLite's deserialize API. The source bytes are never modified.
+Hardening, the schema-only authorizer and all connection limits are installed
+before deserialization. SQLite internally prepares `ATTACH x AS main` during
+that API call; the authorizer permits exactly one `x` attach only within the
+call and denies attach again before any schema query. No source SQL runs in
+that window and SQLite reopens `main` with its memory VFS.
+The dedicated capture process narrows SQLite's
+process-wide heap ceiling to 320 MiB (256 MiB maximum image + the existing
+64 MiB working margin); import and authority paths retain their 64 MiB ceiling.
+An already lower process-wide ceiling is never raised, so callers sharing a
+process with import/authority readers cannot rely on the larger capture budget;
+use the separate capture binary for the full store-size range.
+The exact descriptor length is checked before allocation and must match the
+reader, including EOF; oversized stores produce `refused_too_large`.
+Schema-row, SQL-length, column and query-time limits remain unchanged. Tasks
+and workflow retain their reviewed expression-depth limit of 128.
+The capture queries only schema and pragma metadata.
 It does not run quick_check or read application/FTS data rows.
 
 Stop **all** writers before capture, including gateway, timers and CLI/MCP
-processes. Nonempty WAL or rollback journals refuse: immutable SQLite must not
+processes. Nonempty WAL or rollback journals refuse: the in-memory image must not
 silently omit pending schema changes. SHM, even though unused, must be a bounded
 regular non-symlink file. A WAL-bearing customer home is not repaired by this
 tool: arrange a normal clean shutdown under the operator's existing procedure,
 or investigate it separately. Never delete sidecars to force a capture.
-Before and after copying, capture compares the store's device/inode, size,
+Before reading and after schema inspection, capture compares the store's device/inode, size,
 mtime and ctime (seconds and nanoseconds), link count, all three sidecars'
 existence and identities, and the parent directory's device/inode (including
 reopening the home to detect replacement). Sidecars with multiple links refuse.
@@ -263,8 +272,7 @@ with stable path/placeholder ordering and no timestamps or absolute host paths:
 - Top-level: `format_version` (1), `source_version` (matrix endpoint v1.82.x,
   an operator assertion, not an inferred binary version), `migration_target`,
   `creating_version`, `release_matrix_verified` (false), `stores`, `pending_captures`,
-  `private_copy` (`sealed_memfd` on Linux, `private_0700_directory_0600_file` on
-  other Unix development/test platforms).
+  `private_copy` (always `in_memory` on every platform).
 - Per store: `path`, `status`, `user_version`, `application_id`, `schema_sha256`,
   `catalog`, `exact_catalog`, `expected_candidate`, `differences`, `omitted_differences`.
 - Fingerprint: lowercase SHA-256 of compact serde_json serialization of the
@@ -284,7 +292,8 @@ with stable path/placeholder ordering and no timestamps or absolute host paths:
   candidate exactly including pragmas. `catalog_only_not_v182_expected` records
   an old exact catalog without a v182 candidate; `unrecognised` records drift.
   `refused_*` records unsafe opens, sidecars, limits, malformed SQLite or changes
-  during copy. `refused_hardlink` records any store/sidecar link count other
+  during reading. `refused_too_large` records a store over the 256 MiB bound,
+  checked before allocating its image. `refused_hardlink` records any store/sidecar link count other
   than one; `refused_noatime` records Linux `O_NOATIME` permission refusal.
   Failure values never echo filesystem/SQLite error details.
 
