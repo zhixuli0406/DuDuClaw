@@ -309,13 +309,13 @@ const TRACK_REFUSED_ID: &str = "請求識別碼無效或過長，已拒絕此請
 /// the unanswered ones. Keys are normalised [`id_key`]s; the stored value is
 /// the client's ORIGINAL id, echoed back verbatim. Bounded by
 /// [`MAX_PENDING_CALLS`]; a refused request is answered locally and never
-/// tears the session down.
+/// tears the session down. A refusal of a request this tracker did NOT
+/// register is queued with `settles: false` and never reaches
+/// [`Self::answered`] (see [`client_frame_written`]), so it cannot settle a
+/// live request that shares its id.
 #[derive(Debug, Default)]
 struct RequestTracker {
     live: HashMap<String, (Value, bool)>,
-    /// Local refusals of a duplicate id still on their way to the client:
-    /// each must not consume the live request's entry when it passes.
-    refusing: HashMap<String, usize>,
 }
 
 impl RequestTracker {
@@ -325,9 +325,6 @@ impl RequestTracker {
             return Err(TRACK_REFUSED_ID);
         }
         if self.live.contains_key(&key) {
-            if self.refusing.len() < MAX_PENDING_CALLS || self.refusing.contains_key(&key) {
-                *self.refusing.entry(key).or_default() += 1;
-            }
             return Err(TRACK_REFUSED_DUPLICATE);
         }
         if self.live.len() >= MAX_PENDING_CALLS {
@@ -337,14 +334,9 @@ impl RequestTracker {
         Ok(())
     }
 
-    /// A response passed to the client. `Some(initialize)` when it answered a
-    /// tracked request.
+    /// A settling response passed to the client. `Some(initialize)` when it
+    /// answered a tracked request; a second answer for the same id is a no-op.
     fn answered(&mut self, key: &str) -> Option<bool> {
-        if let Some(count) = self.refusing.get_mut(key) {
-            *count -= 1;
-            if *count == 0 { self.refusing.remove(key); }
-            return None;
-        }
         self.live.remove(key).map(|(_, initialize)| initialize)
     }
 
@@ -358,6 +350,55 @@ impl RequestTracker {
     fn drain(&mut self) -> Vec<Value> {
         self.live.drain().map(|(_, (id, _))| id).collect()
     }
+}
+
+/// The client writer's bookkeeping for one frame it is about to write.
+/// `settles` is false for a local refusal of a request the tracker did not
+/// register (duplicate id, tracker full, oversized id, or a frame that is not
+/// a tracked request): such a frame answers only itself and never touches the
+/// tracker. Returns true when the frame successfully answered a tracked
+/// `initialize`.
+fn client_frame_written(requests: &Mutex<RequestTracker>, line: &str, settles: bool) -> bool {
+    if !settles { return false; }
+    let Some(frame) = parse_frame(line).filter(is_response) else { return false };
+    let Some(key) = frame.get("id").and_then(id_key) else { return false };
+    let init = requests.lock().ok().and_then(|mut r| r.answered(&key));
+    init == Some(true) && frame.get("result").is_some() && frame.get("error").is_none()
+}
+
+/// One frame for the client. Every producer shares ONE FIFO channel, so two
+/// answers carrying the same wire id reach the client in the order they were
+/// produced. `settles` as for [`client_frame_written`].
+struct ClientFrame {
+    line: String,
+    settles: bool,
+}
+
+type ClientTx = mpsc::UnboundedSender<ClientFrame>;
+
+/// The sole writer of the client stream: frames strictly in arrival order,
+/// each settling the tracker as it is written. Stops when every sender is gone
+/// or a write fails, and hands `out` back so final error frames follow every
+/// queued frame on the same stream.
+async fn write_client_frames<W: AsyncWrite + Unpin>(
+    mut rx: mpsc::UnboundedReceiver<ClientFrame>,
+    mut out: W,
+    requests: &Mutex<RequestTracker>,
+    initialized: &std::sync::atomic::AtomicBool,
+) -> W {
+    while let Some(ClientFrame { mut line, settles }) = rx.recv().await {
+        if client_frame_written(requests, &line, settles) {
+            initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        line.push('\n');
+        if out.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+        if out.flush().await.is_err() {
+            break;
+        }
+    }
+    out
 }
 
 /// Owns the slot until the upstream write completes. Every local refusal, cancellation,
@@ -569,37 +610,21 @@ async fn run_proxy_io_monitored(
     let initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ProxyIo {
         client_in,
-        mut client_out,
+        client_out,
         mut upstream_in,
         upstream_out,
     } = io;
 
     // One writer owns `client_out`, because two producers write to it: the
     // upstream→client pump, and the answers the client→upstream pump gives
-    // itself (redaction denials, refused tools).
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // itself (redaction denials, refused tools). One FIFO channel keeps every
+    // frame in production order; each frame states whether it settles.
+    let (tx, rx) = mpsc::unbounded_channel::<ClientFrame>();
     let writer_requests = requests.clone();
     let writer_initialized = initialized.clone();
     let writer = tokio::spawn(async move {
-        while let Some(mut line) = rx.recv().await {
-            if let Some(frame) = parse_frame(&line).filter(is_response) {
-                if let Some(key) = frame.get("id").and_then(id_key) {
-                    let init = writer_requests.lock().ok().and_then(|mut r| r.answered(&key));
-                    if init == Some(true) && frame.get("result").is_some() && frame.get("error").is_none() {
-                        writer_initialized.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-            }
-            line.push('\n');
-            if client_out.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-            if client_out.flush().await.is_err() {
-                break;
-            }
-        }
         // Handed back so final error frames use the same client stream.
-        client_out
+        write_client_frames(rx, client_out, &writer_requests, &writer_initialized).await
     });
 
     // One writer owns `upstream_in` too: a call held for approval is
@@ -620,9 +645,12 @@ async fn run_proxy_io_monitored(
             {
                 if let Some(id) = parse_frame(&frame.line).and_then(|v| v.get("id").cloned()) {
                     let id = frame.slot.as_ref().map(|slot| slot.id.clone()).unwrap_or(id);
-                    let _ = writer_tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
-                        &id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
-                    ));
+                    let _ = writer_tx.send(ClientFrame {
+                        line: duduclaw_gateway::third_party_tools::refusal_frame(
+                            &id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
+                        ),
+                        settles: true,
+                    });
                 }
                 if let Some(gate) = &writer_gate { gate.close_pending(); }
                 continue;
@@ -669,7 +697,7 @@ async fn run_proxy_io_monitored(
                             match response_context(&pending, &mut frame) {
                                 Ok(context) => context,
                                 Err(refusal) => {
-                                    if tx.send(refusal).is_err() { break; }
+                                    if tx.send(ClientFrame { line: refusal, settles: true }).is_err() { break; }
                                     continue;
                                 }
                             }
@@ -691,7 +719,7 @@ async fn run_proxy_io_monitored(
                         rewrite_upstream_frame(layer.as_deref(), &server_label, frame, line, context, tool.as_deref())
                     }
                 };
-                if tx.send(out).is_err() {
+                if tx.send(ClientFrame { line: out, settles: true }).is_err() {
                     break;
                 }
             }
@@ -752,24 +780,35 @@ async fn run_proxy_io_monitored(
                 requests.lock().map_err(|_| std::io::ErrorKind::Other)?.cancel(request_id);
             }
         }
+        let mut registered = false;
         if monitor && frame.get("method").is_some() {
             if let Some(id) = frame.get("id").filter(|id| id_key(id).is_some()) {
                 let tracked = requests.lock().map_err(|_| std::io::ErrorKind::Other)?
                     .track(id, frame["method"] == "initialize");
                 if let Err(reason) = tracked {
                     // Refuse only this request; the session and the upstream stay up.
-                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(id, reason));
+                    // Untracked, so it must not settle a live request with this id.
+                    let _ = tx.send(ClientFrame {
+                        line: duduclaw_gateway::third_party_tools::refusal_frame(id, reason),
+                        settles: false,
+                    });
                     continue;
                 }
+                registered = true;
             }
         }
+        // A local refusal settles the tracker only for a request it registered.
+        let settles = registered;
         if identity_home.as_deref().is_some_and(|home|
             crate::mcp::caller_identity_verdict(home) == duduclaw_core::IdentityVerdict::Rejected)
         {
             if let Some(id) = frame.get("id") {
-                let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
-                    id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
-                ));
+                let _ = tx.send(ClientFrame {
+                    line: duduclaw_gateway::third_party_tools::refusal_frame(
+                        id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
+                    ),
+                    settles,
+                });
             }
             continue;
         }
@@ -777,10 +816,13 @@ async fn run_proxy_io_monitored(
             || (frame.get("method").and_then(Value::as_str) == Some("tools/call")
                 && tool_call_of(&frame).is_none())
         {
-            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
-                &frame.get("id").cloned().unwrap_or(Value::Null),
-                "Malformed tools/call cannot pass the egress gate.",
-            ));
+            let _ = tx.send(ClientFrame {
+                line: duduclaw_gateway::third_party_tools::refusal_frame(
+                    &frame.get("id").cloned().unwrap_or(Value::Null),
+                    "Malformed tools/call cannot pass the egress gate.",
+                ),
+                settles,
+            });
             continue;
         }
         if let Some(gate) = gate.as_ref() {
@@ -792,14 +834,20 @@ async fn run_proxy_io_monitored(
             }
             if let Some((id, tool, _)) = tool_call_of(&frame) {
                 if !call_capacity(&mut held) {
-                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
-                        &id, "同時執行的工具呼叫已達上限，請稍後再試。",
-                    ));
+                    let _ = tx.send(ClientFrame {
+                        line: duduclaw_gateway::third_party_tools::refusal_frame(
+                            &id, "同時執行的工具呼叫已達上限，請稍後再試。",
+                        ),
+                        settles,
+                    });
                     continue;
                 }
                 if matches!(gate.decide(&tool).1, duduclaw_core::ThirdPartyDecision::Block(_)) {
                     let msg = gate.check_call(&tool).await.err().unwrap_or_default();
-                    let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
+                    let _ = tx.send(ClientFrame {
+                        line: duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg),
+                        settles,
+                    });
                     continue;
                 }
                 // Restore before approval so the card and digest describe the
@@ -819,7 +867,10 @@ async fn run_proxy_io_monitored(
                             }
                         }
                         Err(msg) => {
-                            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg));
+                            let _ = tx.send(ClientFrame {
+                                line: duduclaw_gateway::third_party_tools::refusal_frame(&id, &msg),
+                                settles: true,
+                            });
                         }
                     }
                 });
@@ -905,7 +956,7 @@ async fn prepare_upstream(
     server: &str,
     layer: Option<&McpRedactionLayer>,
     pending: &Arc<Mutex<PendingCalls>>,
-    tx: &mpsc::UnboundedSender<String>,
+    tx: &ClientTx,
     frame: &Value,
     line: &str,
 ) -> Option<PreparedFrame> {
@@ -927,7 +978,10 @@ async fn prepare_upstream(
     let ns = namespaced_tool(server, &tool);
     let restored = match decide_args(layer, &ns, &args) {
         ArgDecision::Deny { reason, tokens_seen } => {
-            let _ = tx.send(egress_deny_response(&id, &ns, &reason, tokens_seen).to_string());
+            let _ = tx.send(ClientFrame {
+                line: egress_deny_response(&id, &ns, &reason, tokens_seen).to_string(),
+                settles: true,
+            });
             return None;
         }
         ArgDecision::Forward(restored) => restored,
@@ -938,7 +992,10 @@ async fn prepare_upstream(
     {
         Ok(generation) => generation,
         Err(reason) => {
-            let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(&id, reason));
+            let _ = tx.send(ClientFrame {
+                line: duduclaw_gateway::third_party_tools::refusal_frame(&id, reason),
+                settles: true,
+            });
             return None;
         }
     };
@@ -1496,7 +1553,7 @@ mod tests {
         for i in 0..MAX_PENDING_CALLS { tracker.track(&json!(i), false).unwrap(); }
         assert_eq!(tracker.track(&json!("extra"), false), Err(TRACK_REFUSED_FULL));
         assert_eq!(tracker.live.len(), MAX_PENDING_CALLS, "the live requests stay tracked");
-        // The local refusal passing the writer touches no live entry.
+        // An answer for the refused id touches no live entry.
         assert_eq!(tracker.answered(&id_key(&json!("extra")).unwrap()), None);
         assert_eq!(tracker.live.len(), MAX_PENDING_CALLS);
         // Cancellation frees capacity for the next request.
@@ -1506,14 +1563,105 @@ mod tests {
 
     #[test]
     fn tracker_duplicate_refusal_does_not_consume_the_live_entry() {
-        let mut tracker = RequestTracker::default();
-        tracker.track(&json!(5), false).unwrap();
-        assert_eq!(tracker.track(&json!(5.0), false), Err(TRACK_REFUSED_DUPLICATE));
-        let key = id_key(&json!(5)).unwrap();
-        assert_eq!(tracker.answered(&key), None, "the local refusal");
-        assert!(!tracker.is_empty());
-        assert_eq!(tracker.answered(&key), Some(false), "the real answer");
-        assert!(tracker.is_empty());
+        let requests = Mutex::new(RequestTracker::default());
+        requests.lock().unwrap().track(&json!(5), false).unwrap();
+        let reason = requests.lock().unwrap().track(&json!(5.0), false).unwrap_err();
+        assert_eq!(reason, TRACK_REFUSED_DUPLICATE);
+        let refusal = duduclaw_gateway::third_party_tools::refusal_frame(&json!(5.0), reason);
+        assert!(!client_frame_written(&requests, &refusal, false), "the local refusal");
+        assert!(!requests.lock().unwrap().is_empty());
+        let answer = json!({"jsonrpc": "2.0", "id": 5, "result": {}}).to_string();
+        assert!(!client_frame_written(&requests, &answer, true), "the real answer");
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn orphaned_duplicate_refusals_never_settle_a_later_live_request() {
+        let requests = Mutex::new(RequestTracker::default());
+        for i in 0..MAX_PENDING_CALLS {
+            requests.lock().unwrap().track(&json!(i), false).unwrap();
+        }
+        // The client stalls its stdout while duplicating every live id.
+        let mut refusals = Vec::new();
+        for i in 0..MAX_PENDING_CALLS {
+            let id = json!(i);
+            let reason = requests.lock().unwrap().track(&id, false).unwrap_err();
+            assert_eq!(reason, TRACK_REFUSED_DUPLICATE);
+            refusals.push(duduclaw_gateway::third_party_tools::refusal_frame(&id, reason));
+        }
+        requests.lock().unwrap().cancel(&json!(0));
+        let fresh = json!("fresh");
+        requests.lock().unwrap().track(&fresh, false).unwrap();
+        let reason = requests.lock().unwrap().track(&fresh, false).unwrap_err();
+        assert_eq!(reason, TRACK_REFUSED_DUPLICATE);
+        refusals.push(duduclaw_gateway::third_party_tools::refusal_frame(&fresh, reason));
+        // The client resumes reading: every local refusal passes the writer.
+        for line in &refusals {
+            assert!(!client_frame_written(&requests, line, false));
+        }
+        let outstanding = requests.lock().unwrap().drain();
+        assert_eq!(outstanding.len(), MAX_PENDING_CALLS, "one final error per live id");
+        assert!(outstanding.contains(&fresh), "the new request still gets its final error");
+        assert!(!outstanding.contains(&json!(0)), "the cancelled request gets none");
+    }
+
+    #[test]
+    fn stale_full_tracker_refusal_never_settles_a_resent_id() {
+        let requests = Mutex::new(RequestTracker::default());
+        for i in 0..MAX_PENDING_CALLS {
+            requests.lock().unwrap().track(&json!(i), false).unwrap();
+        }
+        let x = json!("x");
+        let reason = requests.lock().unwrap().track(&x, false).unwrap_err();
+        assert_eq!(reason, TRACK_REFUSED_FULL);
+        let stale = duduclaw_gateway::third_party_tools::refusal_frame(&x, reason);
+        // A slot frees: the upstream answers request 0.
+        let answer = json!({"jsonrpc": "2.0", "id": 0, "result": {}}).to_string();
+        assert!(!client_frame_written(&requests, &answer, true));
+        requests.lock().unwrap().track(&x, false).unwrap();
+        // The stale refusal reaches the writer only now.
+        assert!(!client_frame_written(&requests, &stale, false));
+        let outstanding = requests.lock().unwrap().drain();
+        assert_eq!(outstanding.len(), MAX_PENDING_CALLS);
+        assert!(outstanding.contains(&x), "the re-sent request is still live");
+        assert!(!outstanding.contains(&json!(0)), "an answered request gets no final error");
+    }
+
+    #[test]
+    fn upstream_response_settles_a_live_id_exactly_once() {
+        let requests = Mutex::new(RequestTracker::default());
+        requests.lock().unwrap().track(&json!(1), true).unwrap();
+        requests.lock().unwrap().track(&json!(2), false).unwrap();
+        let answer = json!({"jsonrpc": "2.0", "id": 1.0, "result": {}}).to_string();
+        assert!(client_frame_written(&requests, &answer, true), "the initialize answer");
+        assert!(!client_frame_written(&requests, &answer, true), "a second answer is a no-op");
+        assert_eq!(requests.lock().unwrap().live.len(), 1);
+        // A gate refusal of a registered request settles it like a response.
+        let refusal = duduclaw_gateway::third_party_tools::refusal_frame(&json!(2), "blocked");
+        assert!(!client_frame_written(&requests, &refusal, true));
+        assert!(requests.lock().unwrap().is_empty(), "no final error for answered ids");
+    }
+
+    #[tokio::test]
+    async fn writer_keeps_a_stale_refusal_ahead_of_the_settling_response() {
+        let requests = Mutex::new(RequestTracker::default());
+        let initialized = std::sync::atomic::AtomicBool::new(false);
+        let x = json!("x");
+        // A "tracker full" refusal for X is queued while the client is stalled;
+        // X is then re-sent, registered, and answered by the upstream.
+        let stale = duduclaw_gateway::third_party_tools::refusal_frame(&x, TRACK_REFUSED_FULL);
+        requests.lock().unwrap().track(&x, true).unwrap();
+        let answer = json!({"jsonrpc": "2.0", "id": "x", "result": {}}).to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ClientFrame { line: stale.clone(), settles: false }).unwrap();
+        tx.send(ClientFrame { line: answer.clone(), settles: true }).unwrap();
+        drop(tx);
+        let out = write_client_frames(rx, Vec::new(), &requests, &initialized).await;
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{stale}\n{answer}\n"), "production order");
+        assert!(requests.lock().unwrap().is_empty(), "the answer settled X");
+        // Only the success answer can report the tracked `initialize`: the
+        // stale refusal did not consume the live entry first.
+        assert!(initialized.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
@@ -1607,7 +1755,7 @@ mod tests {
         let first = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &original, &original.to_string()).await.unwrap();
         let duplicate = json!({"id":1, "method":"tools/call", "params":{"name":"public", "arguments":{}}});
         assert!(prepare_upstream("fakepg", Some(&layer), &pending, &tx, &duplicate, &duplicate.to_string()).await.is_none());
-        assert!(rx.recv().await.unwrap().contains("重複"));
+        assert!(rx.recv().await.unwrap().line.contains("重複"));
         let sent: Value = serde_json::from_str(&first.line).unwrap();
         let mut response = json!({"id":sent["id"], "result":{"rows":[{"name":"王小明"}]}});
         let context = response_context(&pending, &mut response).unwrap();
