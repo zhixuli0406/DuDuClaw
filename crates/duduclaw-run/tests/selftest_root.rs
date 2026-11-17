@@ -1,8 +1,13 @@
-//! R7a: the shipped `duduclaw-run-selftest` binary, run directly as root on a
-//! disposable Linux VM (no systemd unit; spawnd's unit path is covered by the
-//! spawnd root tests). Guarded by DUDUCLAW_ISO_DISPOSABLE=1 because it creates
-//! the `duduclaw-selftest` system account when it is missing.
+//! R7a: the shipped `duduclaw-run-selftest` binary on a disposable Linux VM,
+//! run directly as root and as a transient systemd service with the run units'
+//! capability bounding set (spawnd's fixed-unit path is covered by the spawnd
+//! root tests). Guarded by DUDUCLAW_ISO_DISPOSABLE=1 because it creates the
+//! `duduclaw-selftest` system account when it is missing.
 use std::process::{Command, Stdio};
+
+/// The run units' (and the fixed self-test unit's) `CapabilityBoundingSet=`.
+const RUN_UNIT_CAPABILITIES: &str =
+    "CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE";
 
 fn require_disposable_root() {
     assert!(cfg!(target_os = "linux"), "iso_root_ tests require native Linux");
@@ -26,8 +31,13 @@ fn ensure_selftest_account() {
 
 /// Bounded run of the built binary; returns (exit code, stdout, stderr).
 fn run(arguments: &[&str]) -> (Option<i32>, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_duduclaw-run-selftest"))
-        .args(arguments).env_clear().stdin(Stdio::null())
+    let mut command = Command::new(env!("CARGO_BIN_EXE_duduclaw-run-selftest"));
+    command.args(arguments);
+    bounded(command)
+}
+
+fn bounded(mut command: Command) -> (Option<i32>, String, String) {
+    let mut child = command.env_clear().stdin(Stdio::null())
         .stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().expect("start duduclaw-run-selftest");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -43,12 +53,7 @@ fn run(arguments: &[&str]) -> (Option<i32>, String, String) {
         String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
-#[test]
-#[ignore = "iso_root_: disposable root Linux VM with namespaces, Landlock and seccomp; DUDUCLAW_ISO_DISPOSABLE=1"]
-fn iso_root_selftest_binary_passes_on_this_kernel() {
-    require_disposable_root();
-    ensure_selftest_account();
-    let (code, stdout, stderr) = run(&[]);
+fn assert_passed((code, stdout, stderr): (Option<i32>, String, String)) {
     assert_eq!(code, Some(0), "self-test failed: {stderr}");
     assert!(stderr.is_empty(), "{stderr}");
     let lines: Vec<&str> = stdout.lines().collect();
@@ -68,6 +73,45 @@ fn iso_root_selftest_binary_passes_on_this_kernel() {
     let selected = value["selected_abi"].as_u64().unwrap() as u32;
     assert!(detected >= 1);
     assert_eq!(selected, detected.min(duduclaw_isolation::LANDLOCK_HIGHEST_KNOWN_ABI));
+}
+
+/// Removes the private copy of the binary on every exit of the test.
+struct PrivateCopy(std::path::PathBuf);
+impl Drop for PrivateCopy {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
+#[test]
+#[ignore = "iso_root_: disposable root Linux VM with namespaces, Landlock and seccomp; DUDUCLAW_ISO_DISPOSABLE=1"]
+fn iso_root_selftest_binary_passes_on_this_kernel() {
+    require_disposable_root();
+    ensure_selftest_account();
+    // Started as full root: the binary lowers itself to the run units' set.
+    assert_passed(run(&[]));
+}
+
+#[test]
+#[ignore = "iso_root_: disposable root Linux VM with systemd, namespaces, Landlock and seccomp; DUDUCLAW_ISO_DISPOSABLE=1"]
+fn iso_root_selftest_passes_under_the_run_unit_capability_set() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    require_disposable_root();
+    ensure_selftest_account();
+    // Without CAP_DAC_* the service may not reach a build tree below a
+    // non-root home: exec a copy from a fresh root-owned 0700 directory, as
+    // production execs a root-owned path under /usr/lib/duduclaw.
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos();
+    let directory = std::env::temp_dir().join(format!("duduclaw-selftest-unit-{}-{nanos}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&directory).expect("fresh private directory");
+    let copy = PrivateCopy(directory);
+    let binary = copy.0.join("duduclaw-run-selftest");
+    std::fs::copy(env!("CARGO_BIN_EXE_duduclaw-run-selftest"), &binary).expect("copy self-test binary");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("binary mode");
+    let mut command = Command::new("/usr/bin/systemd-run");
+    // TODO(R7f): add `-p RestrictNamespaces=<the run units' set>` once the
+    // trampoline's probe uses legacy clone instead of clone3 (ENOSYS under it).
+    command.args(["--quiet", "--wait", "--collect", "--pipe", "-p", "NoNewPrivileges=yes",
+        "-p", RUN_UNIT_CAPABILITIES]).arg(&binary);
+    assert_passed(bounded(command));
 }
 
 #[test]

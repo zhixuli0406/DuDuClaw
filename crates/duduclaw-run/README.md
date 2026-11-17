@@ -92,8 +92,21 @@ non-Linux). It does not exercise the bootstrap socket, detached mounts made by
 spawnd, `/proc` `hidepid`/`subset` visibility, the PTY path, the supervisor or
 runtime seccomp filters, or exec.
 
+Stage 4 `capabilities` also fixes the capability state to the run units'
+exactly: bounding = effective = permitted = `REQUIRED_BOUNDING_CAPABILITIES`
+(CAP_CHOWN CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN
+CAP_SYS_RESOURCE), inheritable and ambient empty, read back. Under the fixed
+unit the bounding set already is that set, and an effective set holding
+CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH fails the stage. Started with a wider
+bounding set (by hand as full root) it lowers the bounding set first, so every
+later stage, `build_root` included, runs without either DAC capability, as the
+trampoline does under its unit. The work area's `home` and `work` are what
+spawnd hands the trampoline: mount roots owned by the account, mode 0700.
+
 Root-only tests (`DUDUCLAW_ISO_DISPOSABLE=1`, creates the `duduclaw-selftest`
-system account if missing; no `root-test-fixture` feature needed):
+system account if missing; no `root-test-fixture` feature needed; one test
+runs the binary as a transient `systemd-run` service with
+`NoNewPrivileges=yes` and the run units' `CapabilityBoundingSet=`):
 `cargo test -p duduclaw-run --test selftest_root -- --ignored iso_root_ --test-threads=1`.
 
 ## B1 adapter

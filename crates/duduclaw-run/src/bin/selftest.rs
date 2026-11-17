@@ -12,6 +12,14 @@
 //! table (`runner::restrict_filesystem`) and the common seccomp filter. Then it
 //! asserts that the policy actually denies and allows what it must.
 //!
+//! Capabilities (stage `capabilities`): the process is first brought to the
+//! run units' exact state: bounding = effective = permitted =
+//! `REQUIRED_BOUNDING_CAPABILITIES`, inheritable and ambient empty, read back.
+//! Under the fixed unit that is already the case, and an effective set holding
+//! CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH there fails the stage. Started wider
+//! (by hand as full root) the bounding set is lowered to it first, so a manual
+//! run exercises the same no-DAC conditions as the unit.
+//!
 //! Output: exit 0 and one JSON line on stdout only when every assertion held.
 //! Any failure: one JSON line on stderr naming the stage, and that stage's
 //! exit code (table in `Stage::code`). No path, errno text or account name is
@@ -94,6 +102,28 @@ mod stages {
         }
         root
     }
+
+    /// CAP_DAC_OVERRIDE (1) and CAP_DAC_READ_SEARCH (2). Neither is in the run
+    /// units' bounding set, so the trampoline never holds them.
+    pub(crate) const DAC_CAPABILITIES: u64 = (1 << 1) | (1 << 2);
+    /// `capabilities` stage, before any change. `required` must be held in both
+    /// the bounding and the effective set. A bounding set of exactly `required`
+    /// is the fixed unit: its effective set must then hold neither DAC
+    /// capability. Returns the bounding capabilities to drop (non-empty only when
+    /// started wider, e.g. by hand as full root); `None` refuses.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn bounding_to_drop(bounding: u64, effective: u64, required: u64) -> Option<u64> {
+        if required & DAC_CAPABILITIES != 0 || bounding & required != required
+            || effective & required != required { return None; }
+        if bounding == required && effective & DAC_CAPABILITIES != 0 { return None; }
+        Some(bounding & !required)
+    }
+    /// After the reduction: exactly the run unit's capability state.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn reduced_to(bounding: u64, effective: u64, permitted: u64, inheritable: u64, required: u64) -> bool {
+        bounding == required && effective == required && permitted == required && inheritable == 0
+            && effective & DAC_CAPABILITIES == 0
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -106,7 +136,7 @@ mod linux {
     use std::time::{Duration, Instant};
     use duduclaw_isolation::ids::{selftest_identity_allowed, SELFTEST_USER, SERVICE_USERS};
     use duduclaw_run::{linux::{fd, mounts, privileges, probe, runner}, seccomp};
-    use super::stages::{propagation_private, Stage};
+    use super::stages::{bounding_to_drop, propagation_private, reduced_to, Stage};
 
     /// The private work area: a fresh tmpfs over `/tmp`, inside this process's
     /// own mount namespace only. `build_root` stages the new root under it too.
@@ -139,6 +169,7 @@ mod linux {
         check(fd::close_range(3, u32::MAX), Stage::Descriptors);
         if std::env::args_os().count() != 1 { fail(Stage::Arguments); }
         check(privileges::require_root_capabilities(), Stage::Capabilities);
+        check(run_unit_capabilities(), Stage::Capabilities);
         let ready = check(probe::probe(), Stage::Probe);
         // NSS is consulted here, before any namespace or mount change.
         let (uid, gid) = check(identity(), Stage::Account);
@@ -168,6 +199,70 @@ mod linux {
         let mut out = std::io::stdout().lock();
         if out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_err() { fail(Stage::Output); }
         std::process::exit(0);
+    }
+
+    #[repr(C)]
+    struct CapHeader { version: u32, pid: i32 }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CapData { effective: u32, permitted: u32, inheritable: u32 }
+    const CAPABILITY_V3: u32 = 0x2008_0522;
+
+    /// (effective, permitted, inheritable) of this process as 64-bit masks.
+    fn capability_sets() -> Result<(u64, u64, u64), ()> {
+        let mut header = CapHeader { version: CAPABILITY_V3, pid: 0 };
+        let mut data = [CapData::default(); 2];
+        // SAFETY: v3 header with the two data elements it requires, filled by the kernel.
+        if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 { return Err(()); }
+        let join = |low: u32, high: u32| u64::from(low) | (u64::from(high) << 32);
+        Ok((join(data[0].effective, data[1].effective), join(data[0].permitted, data[1].permitted),
+            join(data[0].inheritable, data[1].inheritable)))
+    }
+    fn bounding_set() -> Result<u64, ()> {
+        let mut mask = 0u64;
+        for cap in 0..64u32 {
+            // SAFETY: read-only query of this process's bounding set.
+            let held = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap as libc::c_ulong, 0 as libc::c_ulong,
+                0 as libc::c_ulong, 0 as libc::c_ulong) };
+            match held {
+                1 => mask |= 1u64 << cap,
+                0 => {}
+                // The first capability the kernel does not know ends the set.
+                _ if errno() == libc::EINVAL && cap > 24 => return Ok(mask),
+                _ => return Err(()),
+            }
+        }
+        Err(())
+    }
+    /// The run unit's exact capability state, however the binary was started.
+    /// Under the fixed unit the bounding set already equals
+    /// `REQUIRED_BOUNDING_CAPABILITIES` and the effective set must hold no DAC
+    /// capability; started wider (by hand as full root), the bounding set is
+    /// lowered to that set first. Then effective = permitted = that set,
+    /// inheritable and ambient empty, read back. Every later stage, `build_root`
+    /// included, so runs without CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH, exactly
+    /// like the trampoline under its unit.
+    fn run_unit_capabilities() -> Result<(), ()> {
+        let required = privileges::REQUIRED_BOUNDING_CAPABILITIES.iter().fold(0u64, |mask, cap| mask | (1u64 << cap));
+        let (effective, _, _) = capability_sets()?;
+        let excess = bounding_to_drop(bounding_set()?, effective, required).ok_or(())?;
+        for cap in (0..64u32).filter(|&cap| excess & (1u64 << cap) != 0) {
+            // SAFETY: only lowers this process's bounding set; CAP_SETPCAP is required and kept.
+            if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0 as libc::c_ulong,
+                0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 { return Err(()); }
+        }
+        let header = CapHeader { version: CAPABILITY_V3, pid: 0 };
+        let (low, high) = (required as u32, (required >> 32) as u32);
+        let data = [CapData { effective: low, permitted: low, inheritable: 0 },
+            CapData { effective: high, permitted: high, inheritable: 0 }];
+        // SAFETY: v3 header with two initialized elements; only lowers this process's sets.
+        if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 { return Err(()); }
+        // SAFETY: argument-only call on this process.
+        if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 { return Err(()); }
+        let (effective, permitted, inheritable) = capability_sets()?;
+        if !reduced_to(bounding_set()?, effective, permitted, inheritable, required) { return Err(()); }
+        Ok(())
     }
 
     /// `Some((uid, gid))`, `None` if the account does not exist, `Err` if NSS failed.
@@ -202,6 +297,11 @@ mod linux {
     /// Root-owned anchors on the private tmpfs, cloned exactly as spawnd hands
     /// detached mounts to the trampoline: private propagation, then the
     /// attributes `build_root` re-verifies for each fixed destination.
+    /// `home` and `work` deliberately equal what spawnd hands the trampoline
+    /// (storage adapter `mounts`: mount roots owned by the employee, mode exactly
+    /// 0700); every directory root traverses is root-owned 0755. Do not widen
+    /// them to make `build_root` pass without DAC capabilities: that would hide
+    /// a trampoline dependency the real run units cannot satisfy.
     fn work_area(uid: u32, gid: u32) -> Result<mounts::MountInputs, ()> {
         // SAFETY: static C strings; the mount exists only in this namespace.
         if unsafe { libc::mount(c"tmpfs".as_ptr(), AREA.as_ptr(), c"tmpfs".as_ptr(),
@@ -335,7 +435,31 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
-    use super::stages::{propagation_private, Stage};
+    use super::stages::{bounding_to_drop, propagation_private, reduced_to, Stage, DAC_CAPABILITIES};
+
+    #[test]
+    fn selftest_capabilities_reduce_to_the_run_unit_set_without_dac() {
+        // REQUIRED_BOUNDING_CAPABILITIES (linux-only constant): CHOWN SETGID SETUID
+        // SETPCAP NET_ADMIN SYS_ADMIN SYS_RESOURCE.
+        let required: u64 = [0u32, 6, 7, 8, 12, 21, 24].iter().fold(0, |mask, cap| mask | (1u64 << cap));
+        // The fixed unit: nothing to drop, but DAC in the effective set refuses.
+        assert_eq!(bounding_to_drop(required, required, required), Some(0));
+        assert_eq!(bounding_to_drop(required, required | (1 << 1), required), None);
+        assert_eq!(bounding_to_drop(required, required | (1 << 2), required), None);
+        // Full root by hand: everything outside the set is dropped, DAC included.
+        let full = (1u64 << 41) - 1;
+        assert_eq!(bounding_to_drop(full, full, required), Some(full & !required));
+        assert_eq!(full & !required & DAC_CAPABILITIES, DAC_CAPABILITIES);
+        // A missing required capability, or a required set with DAC, refuses.
+        assert_eq!(bounding_to_drop(required & !(1 << 21), required, required), None);
+        assert_eq!(bounding_to_drop(full, required & !(1 << 8), required), None);
+        assert_eq!(bounding_to_drop(full, full, required | (1 << 2)), None);
+        assert!(reduced_to(required, required, required, 0, required));
+        assert!(!reduced_to(required | (1 << 2), required, required, 0, required));
+        assert!(!reduced_to(required, required, required | (1 << 1), 0, required));
+        assert!(!reduced_to(required, required & !1, required, 0, required));
+        assert!(!reduced_to(required, required, required, 1, required));
+    }
 
     #[test]
     fn selftest_stage_codes_are_distinct_small_and_never_success_or_platform() {
