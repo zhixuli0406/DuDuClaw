@@ -3,6 +3,9 @@
 //! does NOT bypass or claim acceptance of production gateway boot/CLI factories.
 #![cfg(target_os = "linux")]
 
+#[path = "support/run_cleanup.rs"]
+mod run_cleanup;
+
 use std::{ffi::OsString, fs, io::{Read, Write}, os::{fd::{AsRawFd, FromRawFd},
     unix::{fs::MetadataExt, net::UnixStream, process::CommandExt}}, path::{Path, PathBuf},
     process::{Child, Command, Stdio}, sync::{Arc, Mutex}, time::{Duration, Instant}};
@@ -114,12 +117,14 @@ impl Drop for Cleanup {
         if self.child.try_wait().ok().flatten().is_none() {
             eprintln!("gateway test child did not retire after SIGKILL");
         }
-        if !self.finished {
+        {
             if let Some(run) = self.run {
                 if let Ok(systemd) = duduclaw_spawnd::systemd::linux::Systemd::connect() {
-                    let _ = systemd.kill_run(run.0);
                     if let Ok(unit) = systemd.inspect_run(run.0) {
                         if !unit.cgroup.as_os_str().is_empty() { self.cgroup = Some(unit.cgroup); }
+                    }
+                    if let Err(error) = run_cleanup::cleanup_run(&systemd, run.0) {
+                        eprintln!("Claude test-owned run cleanup failed: {error}");
                     }
                 }
             }
@@ -289,6 +294,17 @@ impl LiveAuthority for TestAuthority {
 }
 struct Echo { setup: Arc<Setup>, observer: Arc<Mutex<UnixStream>>, calls: Mutex<u32> }
 impl Dispatcher for Echo {
+    fn require_context_services(&self, context: &RequestContext) -> Result<(), VerificationError> {
+        let record = context.record();
+        // This fixture serves only its finite echo grant, not employee-scope services.
+        if record.employee != self.setup.employee || record.principal != principal()
+            || record.employee_binding != binding() || record.employee_scope()
+            || record.tools.as_slice().iter().map(|name| name.as_str()).collect::<Vec<_>>() != vec![TOOL]
+            || !record.resources.as_slice().is_empty() {
+            return Err(VerificationError::BindingMismatch);
+        }
+        Ok(())
+    }
     fn dispatch<'a>(&'a self, context: RequestContext, agent: &'a str, request: Value)
         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
         Box::pin(async move {

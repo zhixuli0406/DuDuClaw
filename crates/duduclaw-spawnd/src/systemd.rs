@@ -317,6 +317,16 @@ pub mod linux {
     pub struct Systemd { connection: Connection, references: Mutex<UnitReferences> }
     /// A host-only receipt; no cgroup paths or PIDs go back over gateway IPC.
     pub struct StartedUnit { pub name: String, path: OwnedObjectPath, pub cgroup: PathBuf }
+    #[cfg(test)]
+    pub(crate) struct TestRunCleanup<'a>(pub &'a Systemd, pub RunId);
+    #[cfg(test)]
+    impl Drop for TestRunCleanup<'_> {
+        fn drop(&mut self) {
+            if let Err(error) = self.0.cleanup_test_run(self.1) {
+                eprintln!("test run cleanup failed for {}: {error}", run_unit(self.1));
+            }
+        }
+    }
     impl Systemd {
         pub fn connect() -> io::Result<Self> {
             let connection = Builder::system().map_err(bus_error)?
@@ -424,6 +434,38 @@ pub mod linux {
         }
         /// Cancellation remains available even when no launch receipt was returned.
         pub fn kill_run(&self, run: RunId) -> io::Result<()> { self.kill_name(&run_unit(run)) }
+        #[cfg(test)]
+        pub(crate) fn cleanup_test_run(&self, run: RunId) -> io::Result<()> {
+            let name = run_unit(run);
+            let manager = self.manager()?;
+            let path: OwnedObjectPath = match manager.call("GetUnit", &(name.as_str(),)) {
+                Ok(path) => path,
+                Err(error) if missing_unit(&error) => return Ok(()),
+                Err(error) => return Err(bus_error(error)),
+            };
+            self.references.lock().map_err(|_| invalid())?.acquire(&name, true, || {
+                manager.call::<_, _, ()>("RefUnit", &(name.as_str(),)).map_err(bus_error)
+            })?;
+            self.kill_run(run)?;
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+                if state == "inactive" || state == "failed" { break; }
+                if Instant::now() >= until { return Err(io::ErrorKind::TimedOut.into()); }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let _: () = manager.call("ResetFailedUnit", &(name.as_str(),)).map_err(bus_error)?;
+            self.references.lock().map_err(|_| invalid())?.release(&name, || {
+                manager.call::<_, _, ()>("UnrefUnit", &(name.as_str(),)).map_err(bus_error)
+            })?;
+            // Collection is asynchronous after the last reference is released.
+            while self.list_runs()?.contains(&run) {
+                if Instant::now() >= until { return Err(io::ErrorKind::TimedOut.into()); }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(())
+        }
         /// Root tests only: a run-named, delegated unit whose single process
         /// (`/usr/bin/cat` on `input`) waits like a trampoline before bootstrap.
         #[cfg(test)]
@@ -824,16 +866,8 @@ pub mod linux {
         impl Drop for TestRun {
             fn drop(&mut self) {
                 if let Ok(systemd) = Systemd::connect() {
-                    let _ = systemd.kill_run(self.0);
-                    if let Ok(run) = systemd.inspect_run(self.0) {
-                        let until = Instant::now() + Duration::from_secs(5);
-                        while Instant::now() < until {
-                            match systemd.cleanup(&run) {
-                                Ok((true, true)) => { let _ = systemd.release_reference(&run); break; },
-                                Ok(_) => std::thread::sleep(Duration::from_millis(25)),
-                                Err(_) => break,
-                            }
-                        }
+                    if let Err(error) = systemd.cleanup_test_run(self.0) {
+                        eprintln!("test run cleanup failed: {error}");
                     }
                 }
             }

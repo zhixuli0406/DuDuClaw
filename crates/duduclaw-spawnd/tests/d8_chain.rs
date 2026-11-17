@@ -3,6 +3,9 @@
 //! Never manufactures signed policy, employee allocations, receipts or readiness.
 #![cfg(all(target_os = "linux", feature = "root-test-fixture"))]
 
+#[path = "support/run_cleanup.rs"]
+mod run_cleanup;
+
 use std::{fs, io::{Read, Write}, os::{fd::{AsRawFd, FromRawFd, OwnedFd},
     unix::{fs::MetadataExt, net::UnixStream, process::CommandExt}}, path::Path,
     process::{Child, Command, Stdio}, sync::Arc, time::{Duration, Instant}};
@@ -124,20 +127,10 @@ impl Drop for Cleanup {
         if !self.finished { let _ = self.child.kill(); }
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(25)); }
-        if !self.finished {
-            if let Ok(systemd) = Systemd::connect() {
-                for run in &self.runs { let _ = systemd.kill_run(run.0); }
-                for run in &self.runs {
-                    if let Ok(unit) = systemd.inspect_run(run.0) {
-                        let deadline = Instant::now() + Duration::from_secs(15);
-                        loop {
-                            match systemd.cleanup(&unit) {
-                                Ok((true, true)) => break,
-                                _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-                                _ => { eprintln!("D8 cleanup not proven for {}", unit.name); break; }
-                            }
-                        }
-                    }
+        if let Ok(systemd) = Systemd::connect() {
+            for run in &self.runs {
+                if let Err(error) = run_cleanup::cleanup_run(&systemd, run.0) {
+                    eprintln!("D8 test-owned run cleanup failed: {error}");
                 }
             }
         }

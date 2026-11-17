@@ -1,5 +1,8 @@
 //! Installed A -> B1 -> systemd -> B2 PTY tests. No synthetic readiness or policy.
 #![cfg(all(target_os = "linux", feature = "root-test-fixture"))]
+
+#[path = "support/run_cleanup.rs"]
+mod run_cleanup;
 use std::{fs, io::{Read, Write}, os::{fd::{AsRawFd, FromRawFd},
     unix::{fs::MetadataExt, net::UnixStream, process::CommandExt}}, path::Path,
     process::{Child, Command, Stdio}, time::{Duration, Instant}};
@@ -37,15 +40,14 @@ struct Cleanup { child: Child, run: Option<RunHandle>, uid: u32, finished: bool 
 impl Drop for Cleanup {
     fn drop(&mut self) {
         if !self.finished { let _ = self.child.kill(); }
-        if !self.finished {
+        {
             if let (Ok(systemd), Some(run)) = (Systemd::connect(), self.run) {
-                let _ = systemd.kill_run(run.0);
+                if let Err(error) = run_cleanup::cleanup_run(&systemd, run.0) {
+                    eprintln!("PTY test-owned run cleanup failed: {error}");
+                }
                 let deadline = Instant::now() + Duration::from_secs(15);
                 loop {
-                    let retired = match systemd.inspect_run(run.0) {
-                        Ok(unit) => systemd.cleanup(&unit).is_ok_and(|proof| proof == (true, true)),
-                        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-                    };
+                    let retired = systemd.list_runs().is_ok_and(|runs| !runs.contains(&run.0));
                     if retired && duduclaw_spawnd::accounts::unexpected_processes(self.uid, None).is_ok_and(|p| p.is_empty()) { break; }
                     if Instant::now() >= deadline { eprintln!("PTY test-owned run retirement could not be proved"); break; }
                     std::thread::sleep(Duration::from_millis(50));
@@ -158,7 +160,7 @@ fn installed_pty_gateway_child() {
         let backend=SpawndBackend::connect().await.unwrap(); let run=backend.reserve(setup.employee).await.unwrap();
         send(&mut observer,&Event::Reserved{run});
         backend.configure_pty(run,PtySize{rows:31,columns:113}).await.unwrap();
-        backend.spawn(SpawnPolicy{run,employee:setup.employee,class:ExecutionClass::EmployeeMain,runtime:kind(),
+        backend.spawn(SpawnPolicy{workspace_delivery:None,run,employee:setup.employee,class:ExecutionClass::EmployeeMain,runtime:kind(),
             argv_allowlist:vec![],environment_allowlist:Default::default(),workspace:WorkspacePolicy{
                 workspace:Text::new("employee-work".into()).unwrap(),relative_cwd:Text::new(String::new()).unwrap()},
             resources:runtime.resources.clone(),network:runtime.network.clone(),pty:true,
