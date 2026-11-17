@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 mod sqlite;
 pub mod catalog;
+pub mod expected;
+pub mod capture;
 pub mod authority;
 pub use catalog::{take_schema_refusal, SchemaRefusal, SchemaVersion};
 #[cfg(target_os = "linux")]

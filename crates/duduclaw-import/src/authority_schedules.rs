@@ -25,19 +25,8 @@ pub(super) fn sqlite(input: impl Read, wal: Option<&mut dyn Read>, builder: &mut
     check_sqlite(&conn)?;
     // Autopilot: v1.79.3 (unchanged) or v1.82 (plus the approval-gate ledger,
     // which is never authorized for reading below). Exact match only.
-    let catalogs: &[&str] = if workflow {
-        &[include_str!("workflow-v1793.sql")]
-    } else {
-        &[include_str!("autopilot-v1793.sql"), include_str!("autopilot-v182.sql")]
-    };
-    let actual = crate::sqlite::schema(&conn)?;
-    let mut matched = false;
-    for catalog in catalogs {
-        let expected = Connection::open_in_memory()?;
-        expected.execute_batch(catalog)?;
-        if actual == crate::sqlite::schema(&expected)? { matched = true; break; }
-    }
-    if !matched { return Err(Error::Schema); }
+    crate::catalog::detect(&conn, if workflow { crate::catalog::Store::Workflow }
+        else { crate::catalog::Store::Autopilot }, None)?;
     conn.authorizer(Some(|c: AuthContext<'_>| match c.action {
         AuthAction::Select => Authorization::Allow,
         AuthAction::Read { table_name: "autopilot_rules", column_name: "id" | "name" }

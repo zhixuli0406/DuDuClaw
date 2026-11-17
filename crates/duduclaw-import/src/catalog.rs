@@ -6,8 +6,7 @@
 //! pinned catalog; the matching version then selects that version's own column
 //! mapping. There is no "close enough": the closest catalog is used solely to
 //! name the differences in the refusal report. Names in the report come from
-//! the trusted catalogs, except unexpected object names, which are shown only
-//! when they are short plain identifiers. No SQL text or row content is ever
+//! the trusted catalogs; unexpected names are represented only by a digest. No SQL text or row content is ever
 //! part of a report.
 use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fmt};
 use rusqlite::Connection;
@@ -49,13 +48,15 @@ const MAX_REPORTED: usize = 16;
 
 /// A legacy store with more than one accepted schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Store { Sessions, Tasks, Cron, Memory, Approvals, GoogleChatInbox }
+pub enum Store { Sessions, Tasks, Cron, Memory, Approvals, GoogleChatInbox, Users, Workflow, Autopilot, ChannelSettings, McpKeys }
 impl Store {
     pub fn file_name(self) -> &'static str {
         match self {
             Self::Sessions => "sessions.db", Self::Tasks => "tasks.db", Self::Cron => "cron_tasks.db",
             Self::Memory => "memory.db", Self::Approvals => "approvals.db",
             Self::GoogleChatInbox => "googlechat_inbox.db",
+            Self::Users => "users.db", Self::Workflow => "workflow.db", Self::Autopilot => "autopilot.db",
+            Self::ChannelSettings => "sessions.db", Self::McpKeys => "mcp_keys.db",
         }
     }
 }
@@ -71,7 +72,7 @@ impl SchemaVersion {
     pub fn label(self) -> &'static str { match self { Self::V1793 => "v1.79.3", Self::V180 => "v1.80.x", Self::V181 => "v1.81" } }
 }
 
-struct Catalog { version: SchemaVersion, sql: &'static str, label: &'static str }
+pub(crate) struct Catalog { pub(crate) version: SchemaVersion, pub(crate) sql: &'static str, pub(crate) label: &'static str }
 impl Catalog {
     const fn new(version: SchemaVersion, sql: &'static str) -> Self {
         Catalog { version, sql, label: match version { SchemaVersion::V1793 => "v1.79.3", SchemaVersion::V180 => "v1.80.x", SchemaVersion::V181 => "v1.81" } }
@@ -122,11 +123,21 @@ static GOOGLECHAT_INBOX: [Catalog; 3] = [
     Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V183_V1, label: "v1.83" },
     Catalog { version: SchemaVersion::V181, sql: GOOGLECHAT_INBOX_V183, label: "v1.83" },
 ];
-fn catalogs(store: Store) -> &'static [Catalog] {
+// These stores keep their existing content mappings. Centralising their exact
+// catalogs does not grant access to any additional table or column.
+static USERS: [Catalog; 1] = [Catalog::new(SchemaVersion::V1793, include_str!("users-v1793.sql"))];
+static WORKFLOW: [Catalog; 1] = [Catalog::new(SchemaVersion::V1793, include_str!("workflow-v1793.sql"))];
+static AUTOPILOT: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, include_str!("autopilot-v1793.sql")),
+    Catalog { version: SchemaVersion::V180, sql: include_str!("autopilot-v182.sql"), label: "v1.82" }];
+static CHANNEL_SETTINGS: [Catalog; 1] = [Catalog::new(SchemaVersion::V1793, include_str!("channel-settings-v1793.sql"))];
+static MCP_KEYS: [Catalog; 1] = [Catalog { version: SchemaVersion::V180, sql: include_str!("mcp-keys-v182.sql"), label: "v1.82" }];
+pub(crate) fn catalogs(store: Store) -> &'static [Catalog] {
     match store {
         Store::Sessions => &SESSIONS, Store::Tasks => &TASKS, Store::Cron => &CRON,
         Store::Memory => &MEMORY, Store::Approvals => &APPROVALS,
         Store::GoogleChatInbox => &GOOGLECHAT_INBOX,
+        Store::Users => &USERS, Store::Workflow => &WORKFLOW, Store::Autopilot => &AUTOPILOT,
+        Store::ChannelSettings => &CHANNEL_SETTINGS, Store::McpKeys => &MCP_KEYS,
     }
 }
 
@@ -140,7 +151,7 @@ pub enum Difference {
     /// An object of the catalog is absent from the source.
     Missing { object: String, name: String },
     /// The source has an object the catalog does not have.
-    Unexpected { object: String, name: String },
+    Unexpected { object: String, ordinal: usize, name_sha256: String },
     /// Same object, different definition. `missing_columns` lists catalog
     /// columns whose name does not occur in the source definition.
     Changed { object: String, name: String, missing_columns: Vec<String> },
@@ -149,7 +160,7 @@ impl fmt::Display for Difference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing { object, name } => write!(f, "missing {object} {name}"),
-            Self::Unexpected { object, name } => write!(f, "unexpected {object} {name}"),
+            Self::Unexpected { object, ordinal, name_sha256 } => write!(f, "unexpected {object} ordinal={ordinal} name_sha256={name_sha256}"),
             Self::Changed { object, name, missing_columns } if missing_columns.is_empty() => write!(f, "changed {object} {name}"),
             Self::Changed { object, name, missing_columns } => write!(f, "changed {object} {name} (missing column {})", missing_columns.join(", ")),
         }
@@ -237,12 +248,13 @@ pub(crate) fn detect(conn: &Connection, store: Store, extension: Option<&str>) -
 #[path = "catalog_tests.rs"]
 mod tests;
 
-fn printable(value: &str) -> String {
-    if !value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        value.to_owned()
-    } else {
-        "<unprintable name>".to_owned()
-    }
+/// Only a fixed kind label and an irreversible name digest may leave the source.
+pub(crate) fn name_digest(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(value.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+fn printable_kind(value: &str) -> &'static str {
+    match value { "table" => "table", "index" => "index", "trigger" => "trigger", "view" => "view", _ => "unknown" }
 }
 
 /// Identifier-like tokens of a definition. Used only to test whether a
@@ -252,7 +264,7 @@ fn tokens(sql: &str) -> BTreeSet<String> {
         .filter(|t| !t.is_empty()).map(str::to_ascii_lowercase).collect()
 }
 
-fn differences(actual: &[SchemaRow], expected: &[SchemaRow], expected_conn: &Connection) -> Result<Vec<Difference>> {
+pub(crate) fn differences(actual: &[SchemaRow], expected: &[SchemaRow], expected_conn: &Connection) -> Result<Vec<Difference>> {
     // (type, name) is unique in sqlite_schema; the value is (tbl_name, sql).
     fn index(rows: &[SchemaRow]) -> BTreeMap<(&str, &str), (&str, Option<&str>)> {
         rows.iter().map(|(kind, name, table, sql)| ((kind.as_str(), name.as_str()), (table.as_str(), sql.as_deref()))).collect()
@@ -275,9 +287,11 @@ fn differences(actual: &[SchemaRow], expected: &[SchemaRow], expected_conn: &Con
             Some(_) => {}
         }
     }
+    let mut ordinal = 0;
     for &(kind, name) in actual_index.keys() {
         if !expected_index.contains_key(&(kind, name)) {
-            result.push(Difference::Unexpected { object: printable(kind), name: printable(name) });
+            ordinal += 1;
+            result.push(Difference::Unexpected { object: printable_kind(kind).into(), ordinal, name_sha256: name_digest(name) });
         }
     }
     Ok(result)

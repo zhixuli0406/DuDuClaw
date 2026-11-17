@@ -54,9 +54,9 @@ with the exact reviewed `channel_settings` extension); the closest catalog is us
 only to describe a refusal, never to accept. An unknown schema exits as a schema
 rejection, and the worker writes a bounded report to stderr naming the closest
 version and the differing objects (missing/unexpected/changed table, index, view or
-trigger, and catalog columns absent from a changed table). The report never contains
-SQL text or row content; unexpected names that are not plain identifiers are shown
-as `<unprintable name>`. Mappings: v1.80 sessions also skip unpublished replies
+trigger (unknown names appear only as ordinals and SHA-256 prefixes), and catalog columns absent from a changed table). The report never contains
+SQL text, row content or unexpected source names; unknown names are represented
+only by a stable ordinal and the first 16 hex characters of their SHA-256. Mappings: v1.80 sessions also skip unpublished replies
 (`delivery_pending`); tasks exclude A2A-owned goals in both versions (owner
 column/registry in v1.80, `created_via='a2a'` or an `a2a:` creator in both, inherited
 by child tasks); cron actor columns (`on_behalf_of`, and v1.80 `created_by_user_id`
@@ -175,3 +175,164 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-import --offline
 ## License
 
 Apache-2.0.
+
+## R5 front half: read-only v1.82 schema capture
+
+The migration target is v1.83.0. A supported single-binary host must first
+upgrade in place to v1.82.x. The creating-version matrix is v1.80.0, v1.80.1,
+v1.81.0 and v1.82.0, each **after** upgrading to v1.82.x; v1.79.3 is excluded.
+The old parser catalogs remain available for existing callers, but are not
+proof of eligibility for this new upgrade path. No installer, upgrade routing,
+root migration pipeline, materialization or confirmation behavior is added here.
+
+`src/expected.rs` is the hand-off API. `SETS` contains byte-pinned,
+code-derived *candidates*. It reuses the existing SQL and retains V180/V181
+column mappings when no readable content column changed. `release_captures()`
+contains 40 explicitly unfilled creating-version/store slots; `expected_sql`,
+`user_version` and `application_id` are `None`, and `matches()` always refuses
+an unfilled slot. The later pipeline must consume verified release slots,
+not accept a code candidate as release evidence. Users and causal-memory also
+have named `NEEDS-RELEASE-CAPTURE` candidates with no SQL; an empty database
+cannot match a placeholder. No release-capture slot has been verified yet.
+When evidence is reviewed, pin SQL as `<store>-<creating-version>-to-<last-version>.sql`
+(with an actual last patch version), store the captured pragma values and
+provenance, and test exact acceptance plus extra-index refusal. Never paste
+untrusted SQL from an operator report into a catalog.
+
+| Store / relative path | Code candidate and provenance | Real capture still required |
+| --- | --- | --- |
+| `sessions.db` | `SESSION_V182` and `SESSION_V182_UPGRADED`: gateway `SessionManager` CREATE/ALTER order plus `recipient_guard/origin.rs` SCHEMA | Each creating version, including channel-settings extension; actual fresh/upgraded ordering |
+| channel settings (inside `sessions.db`) | `ChannelSettingsManager::from_session_db`, existing `channel-settings-v1793.sql`, combined with both session shapes | Same session matrix; no separate physical database is assumed |
+| `tasks.db` | `TASKS_V182`: gateway `task_store/schema.rs`, marker table and `source_origin_proof` ALTER | Each creating version and shipped labels |
+| `cron_tasks.db` | `CRON_V182`: gateway `cron_store.rs` initializer, ordered TEXT-column additions, receipts and scoped indexes | Each creating version; historical v182 label was unverified |
+| `approvals.db` | `APPROVALS_V181`: gateway `approval/store.rs`, lease and employee-incarnation migrations | Each creating version; `-v180` lease label is not proof of v1.80 shipping shape |
+| `memory.db` | `MEMORY_V180`: `SqliteMemoryEngine` in memory `engine.rs`, without causal tables, user_version 0 | Each creating version; causal same-file shape/user_version 1 is a separate placeholder; do not broaden the content reader until verified |
+| `users.db` | Historical `users-v1793.sql` is a closest-catalog diagnostic only; **no v182 candidate** | Auth `db.rs`, MFA/bootstrap/reset-outbox, remembered-session and isolation migrations have history-dependent ordering. Capture real released homes; refusal means **no user account proposals** |
+| `workflow.db` | Existing `workflow-v1793.sql`: gateway workflow `store.rs` and `draft_store.rs` initializers; design records unchanged DDL | Each creating version; no new mapping |
+| `autopilot.db` | `autopilot-v182.sql`: gateway `AutopilotStore`, including `DISPATCH_SCHEMA_SQL` | Each creating version; approval dispatch remains unreadable |
+| `mcp_keys.db` | `mcp-keys-v182.sql`: core `mcp_key_store::SCHEMA_SQL`, user_version 1 | Each creating version; no key material is captured |
+| `googlechat_inbox.db` | Wave-1 `googlechat-inbox-v182.sql`: gateway inbox initializer | Each creating version, when enabled; inventory only, never import/replay delivery state. v183 placeholder catalogs are not v182 candidates |
+
+### Report and refusal contract
+
+Both capture wrappers fix `PATH` to `/usr/bin:/bin` and require `CAPTURE_BIN`
+to be an absolute path to a regular executable file that is not a symlink.
+
+The separate operator binary is `duduclaw-capture-legacy-schemas`; the existing
+sandboxed `duduclaw-import` fd worker keeps its default invocation. The new
+binary takes `<home> --created-with <v1.80.0|v1.80.1|v1.81.0|v1.82.0>`.
+It is supported on native Linux; Unix library tests also exercise file safety.
+It creates no files in the supplied home. The home itself and store/sidecar
+opens use no-follow directory descriptors; source files must open read-only,
+be regular, have exactly one hard link and be at most 256 MiB.
+Run as root or as the home's owner: Linux requires `O_NOATIME` for source and
+sidecar opens; an `EPERM` refusal produces `refused_noatime`, with no retry that
+could update access times. Linux copies bytes only into an anonymous memfd,
+then applies `F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE|F_SEAL_SEAL`. SQLite opens
+`/proc/self/fd/<n>` through SQLite's default VFS with `mode=ro&immutable=1`.
+The memfd is sealed against writes and size changes; immutable read-only access
+prevents SQLite from creating files or using WAL, and temporary storage is kept
+in memory.
+No named copy is created on Linux, including on failures or process termination.
+The non-Linux Unix development/test fallback ignores `TMPDIR`: it creates a
+0700 directory under the fixed, verified root-owned `/tmp` (canonicalized on
+macOS), verifies that the private directory and the captured home do not overlap
+in either direction, and creates `source.db` with 0600 and `O_EXCL|O_NOFOLLOW`.
+RAII removes that directory on success and error returns (unlike memfd, a forced
+process termination can leave this development-only named fallback behind).
+The normal importer heap, schema-row, SQL-length,
+column and query-time limits apply. Workflow keeps the existing reviewed
+expression-depth exception. The capture queries only schema and pragma metadata.
+It does not run quick_check or read application/FTS data rows.
+
+Stop **all** writers before capture, including gateway, timers and CLI/MCP
+processes. Nonempty WAL or rollback journals refuse: immutable SQLite must not
+silently omit pending schema changes. SHM, even though unused, must be a bounded
+regular non-symlink file. A WAL-bearing customer home is not repaired by this
+tool: arrange a normal clean shutdown under the operator's existing procedure,
+or investigate it separately. Never delete sidecars to force a capture.
+Before and after copying, capture compares the store's device/inode, size,
+mtime and ctime (seconds and nanoseconds), link count, all three sidecars'
+existence and identities, and the parent directory's device/inode (including
+reopening the home to detect replacement). Sidecars with multiple links refuse.
+This is not a live snapshot protocol; writers must stay stopped throughout capture.
+
+One deterministic UTF-8 JSON object is written to stdout, at most 128 KiB,
+with stable path/placeholder ordering and no timestamps or absolute host paths:
+
+- Top-level: `format_version` (1), `source_version` (matrix endpoint v1.82.x,
+  an operator assertion, not an inferred binary version), `migration_target`,
+  `creating_version`, `release_matrix_verified` (false), `stores`, `pending_captures`,
+  `private_copy` (`sealed_memfd` on Linux, `private_0700_directory_0600_file` on
+  other Unix development/test platforms).
+- Per store: `path`, `status`, `user_version`, `application_id`, `schema_sha256`,
+  `catalog`, `exact_catalog`, `expected_candidate`, `differences`, `omitted_differences`.
+- Fingerprint: lowercase SHA-256 of compact serde_json serialization of the
+  complete ordered `(type,name,tbl_name,sql)` schema tuples (including null SQL
+  for SQLite autoindexes), using the existing schema query's stable ordering.
+  SQL and rows themselves are never emitted. At most 16 differences appear.
+  An unknown source object is represented only as `unexpected <kind>
+  ordinal=<n> name_sha256=<hex>`: kind is a fixed table/index/trigger/view label,
+  ordinal is one-based among unknown objects sorted by kind/name, and hex is
+  the first 16 lowercase hex characters of SHA-256 of the exact UTF-8 name.
+  Source names are never emitted. Missing and changed entries use trusted
+  catalog names; changed entries require an exact kind/name catalog match.
+- Catalog id: trusted relative filename, label, zero-based catalog ordinal and
+  optional `:channel_settings`; ordinal distinguishes same-label fresh/upgraded
+  shapes. `exact_catalog=false` means closest-only diagnostics, never acceptance.
+- `absent` records an optional missing file; `code_candidate` matches a code
+  candidate exactly including pragmas. `catalog_only_not_v182_expected` records
+  an old exact catalog without a v182 candidate; `unrecognised` records drift.
+  `refused_*` records unsafe opens, sidecars, limits, malformed SQLite or changes
+  during copy. `refused_hardlink` records any store/sidecar link count other
+  than one; `refused_noatime` records Linux `O_NOATIME` permission refusal.
+  Failure values never echo filesystem/SQLite error details.
+
+Exit 0 means inventory completed with only absent stores/code candidates;
+it **does not** approve migration or prove every feature store was initialized.
+Exit 4 still writes the report but contains refused/unrecognised stores. Exit 3
+means capture could not complete; discard stdout. All unknown schemas remain
+refused, and all unfilled release-matrix slots remain refused even on exit 0.
+
+### Reviewer smoke run (not executed by the implementer)
+
+In a disposable Linux VM, build the capture binary with
+`cargo build -p duduclaw-import --bin duduclaw-capture-legacy-schemas`.
+Use an official, signature-verified v1.82.0 gateway binary for this fresh fixture:
+`DUDUCLAW_V182_BIN=/absolute/v182/duduclaw CAPTURE_BIN=/absolute/target/debug/duduclaw-capture-legacy-schemas bash scripts/live-test/linux-protected/capture-v182-home.sh > /tmp/r5-report.json`.
+The script calls `make-home.sh`, uses isolated HOME/DUDUCLAW_HOME with the
+production-shaped wildcard-allowlist employee, waits for loopback health,
+stops the gateway, then captures. It retains the disposable fixture/logs in
+`/tmp` for reviewer inspection; only stdout should be returned. Lazy stores
+may be absent: this smoke fixture is not the complete signed-release matrix.
+Unit tests live in `capture_tests.rs` and `expected.rs`; reviewer command:
+`cargo test -p duduclaw-import`. None of these Rust commands or the live script
+were executed during implementation.
+
+### Real release-matrix/operator capture
+
+Use disposable Linux VMs for the release matrix. Download official v1.80.0,
+v1.80.1, v1.81.0 and v1.82.0 tarballs and their minisign signatures; verify
+against the independently trusted release public key before extracting or
+executing anything. Do not use this development checkout as a historical binary.
+For each creating version X, use `make-home.sh` with a new empty home and
+isolated OS HOME. Boot X to health, initialize the applicable feature stores,
+stop cleanly, then boot/stop each later official release in order through the
+chosen v1.82.x endpoint. Capture only the endpoint (Q3), including stores
+created lazily by Google Chat, workflow, autopilot and causal features where
+applicable. Keep release versions, verified artifact hashes, feature-initializer
+steps and CREATE/ALTER provenance in the PR evidence; don't send customer logs.
+This package intentionally does not automate downloads, minisign trust setup,
+feature seeding, host upgrades or migration.
+
+For an existing real host already upgraded to v1.82.x, with all writers stopped,
+run the wrapper as an account with read access:
+`CAPTURE_BIN=/absolute/duduclaw-capture-legacy-schemas bash scripts/live-test/linux-protected/capture-legacy-schemas.sh /absolute/legacy-home v1.80.0 > /outside/legacy-home/schema-report.json`.
+Replace the final argument with the documented original creating version; if
+that history is unknown, establish it before assigning a matrix slot. Write the
+report outside every customer home. Send back **only the JSON report**, including
+exit-4 reports; no databases, SQL dumps, config, identities, keys, credentials,
+logs or home archives. Reports contain fingerprints rather than raw SQL so a
+planted schema cannot disclose a secret via DDL. Missing catalog SQL must be
+reproduced from the verified release VM and reviewed locally, using the report
+to compare fingerprints; operator reports are diagnostics, never trusted DDL.
