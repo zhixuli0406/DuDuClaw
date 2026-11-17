@@ -816,7 +816,10 @@ fn arm_drain_alarm(ms: u64) {
     unsafe { libc::setitimer(libc::ITIMER_REAL, &timer, std::ptr::null_mut()); }
 }
 
-fn restrict_filesystem(abi: u32) -> Result<()> {
+/// The runtime's Landlock domain over [`crate::helper_policy::RUNTIME_LANDLOCK`],
+/// resolved in the caller's (pivoted) root. Public only so that the R7a
+/// self-test binary applies exactly this function, not a copy of it.
+pub fn restrict_filesystem(abi: u32) -> Result<()> {
     let policy = Policy::for_abi(abi).map_err(|_| Error::Landlock)?;
     let mut roots = Vec::new();
     // One table: HX publication check 6 is computed against exactly this list.

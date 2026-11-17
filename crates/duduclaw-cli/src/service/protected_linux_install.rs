@@ -944,6 +944,29 @@ mod spawnd_install_tests {
         assert!(lookup("duduclaw-employees.slice").lines().any(|line| line == "TasksMax=1024"));
         assert!(lookup("duduclaw.slice").lines().any(|line| line == "MemoryMin=512M"));
     }
+
+    /// R7a: the installer writes exactly the bytes spawnd requires at
+    /// /etc/systemd/system/duduclaw-isolation-selftest.service (root 0644, like
+    /// every layout unit), for the name spawnd starts, running the published
+    /// self-test binary; it never enables or starts it.
+    #[test]
+    fn selftest_unit_is_installed_as_spawnd_requires_and_never_enabled() {
+        use duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT;
+        let text = layout::UNITS.iter().find(|(unit, _)| *unit == ISOLATION_SELFTEST_UNIT).unwrap().1;
+        assert_eq!(text, duduclaw_spawnd::systemd::ISOLATION_SELFTEST_UNIT_TEXT);
+        assert!(duduclaw_spawnd::systemd::fixed_unit_file_valid(text.as_bytes()));
+        assert_eq!(layout::UNITS.iter().filter(|(unit, _)| *unit == ISOLATION_SELFTEST_UNIT).count(), 1);
+        let exec = format!("ExecStart={}", duduclaw_spawnd::systemd::SELFTEST_EXECUTABLE);
+        assert!(text.lines().any(|line| line == exec));
+        assert!(layout::BINARIES.contains(&duduclaw_spawnd::systemd::SELFTEST_EXECUTABLE));
+        assert!(!text.lines().any(|line| line.trim() == "[Install]" || line.starts_with("WantedBy=")));
+        // The staging step writes unit files only; enabling and starting belong to S6.
+        let source = include_str!("protected_linux_install.rs");
+        let staging = source.split("fn install_isolation_support_for(").nth(1).unwrap()
+            .split("\nfn isolation_account(").next().unwrap();
+        assert!(staging.contains("atomic_install(&format!(\"/etc/systemd/system/{name}\"), 0o644"));
+        for effect in ["\"enable\"", "\"start\"", "\"--now\""] { assert!(!staging.contains(effect), "{effect}"); }
+    }
 }
 
 #[cfg(test)]

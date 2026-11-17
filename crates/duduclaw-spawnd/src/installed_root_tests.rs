@@ -2,8 +2,7 @@
 //! records, accounts, or run receipts are manufactured by these tests.
 use super::*;
 use duduclaw_mcp_boundary::config::{RuntimeBridgeRegistry, runtime_projection, prepare_runtime_bridge};
-use crate::{accounts::{InstallationEvidence, LinuxAccounts}, host::DnsEvidence,
-    native_trampoline::Installation, registry::AccountHost};
+use crate::{accounts::{InstallationEvidence, LinuxAccounts}, host::DnsEvidence, registry::AccountHost};
 
 fn require_disposable_root() {
     assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
@@ -92,9 +91,11 @@ fn iso_root_e2e_installed_publication_live_install_evidence() {
     if let Some(range) = install.external_nss_range {
         evidence.external_nss_range_reserved_and_enumerable(range).expect("external IAM reservation evidence");
     }
-    let mut trampoline = InstalledEvidence;
-    let kernel = Installation::readback(&mut trampoline).expect("actual installed trampoline digest and kernel/ABI evidence");
-    kernel.check().expect("trampoline evidence is complete");
+    // R7a: the trampoline facts come from spawnd's own self-test through PID 1.
+    let mut selftest = crate::selftest::SelfTest::default();
+    let facts = selftest.ensure(&mut crate::selftest::InstalledHost::default())
+        .expect("installed trampoline and self-test binaries match the signed generation");
+    crate::selftest::readiness(&facts).check().expect("isolation self-test unit passed on this kernel");
     let mut dns = InstalledEvidence;
     DnsEvidence::verify(&mut dns).expect("real root DNS route measurement without private-IP bypass");
 }

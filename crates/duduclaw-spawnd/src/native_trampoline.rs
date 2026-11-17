@@ -63,8 +63,9 @@ pub struct ForwarderProfile {
     pub seccomp: RuntimeProfile,
     pub seccomp_digest: Sha256Digest,
 }
-/// Supplied by the installer only after binary digest and isolated namespace /
-/// Landlock self-tests have been read back. Kernel ABI probing alone is not it.
+/// Readback of the binary digests and the isolated namespace / Landlock
+/// self-test (R7a: `crate::selftest::SelfTestInstallation`, measured by spawnd
+/// through PID 1, not an installer receipt). Kernel ABI probing alone is not it.
 pub trait Installation: Send { fn readback(&mut self) -> Result<TrampolineReadiness>; }
 pub struct MissingInstallation;
 impl Installation for MissingInstallation { fn readback(&mut self) -> Result<TrampolineReadiness> { Err(unavailable()) } }

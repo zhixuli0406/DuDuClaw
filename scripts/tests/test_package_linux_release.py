@@ -867,14 +867,32 @@ class LinuxReleaseTests(unittest.TestCase):
     def test_f_publication_names_and_packaged_component_ids_agree(self):
         source = (ROOT / "crates/duduclaw-updated/src/publication.rs").read_text()
         variants = {"gateway": "Gateway", "spawnd": "Spawnd", "trampoline": "Trampoline",
-            "egress": "Egress", "egress_forwarder": "EgressForwarder", "mcp_bridge": "McpBridge",
+            "trampoline_selftest": "TrampolineSelftest", "egress": "Egress", "egress_forwarder": "EgressForwarder", "mcp_bridge": "McpBridge",
             "parse_worker": "ParseWorker", "importer": "Importer", "migration": "Migration", "update_slot": "UpdateSlot"}
         for kind, variant in variants.items():
             match = re.search(r'InstallTarget::' + variant + r' => "([^"]+)"', source)
             self.assertIsNotNone(match, kind)
             filename = match[1]
             self.assertEqual(PACKAGE.ARCHIVE_ALIASES.get(filename, filename), PACKAGE.INSTALL_BINARIES[kind])
+        self.assertEqual(set(variants), set(PACKAGE.INSTALL_BINARIES))
         self.assertEqual(PACKAGE.ARCHIVE_ALIASES["duduclaw-updated-launch"], "duduclaw-updated")
+
+    def test_trampoline_selftest_is_built_packaged_and_listed(self):
+        # R7a: a production bin of the trampoline's crate, a required signed
+        # target, and an artifact of the release template.
+        self.assertEqual(PACKAGE.BIN_PACKAGES["duduclaw-run-selftest"], "duduclaw-run")
+        self.assertEqual(PACKAGE.INSTALL_BINARIES["trampoline_selftest"], "duduclaw-run-selftest")
+        self.assertIn("trampoline_selftest", PACKAGE.REQUIRED_TARGETS)
+        command = PACKAGE.build_command(TARGET, "cross", False)
+        self.assertIn("duduclaw-run-selftest", [command[i + 1] for i, part in enumerate(command) if part == "--bin"])
+        template = json.loads((ROOT / "release/isolation/manifest-template.json").read_bytes())
+        listed = [a for a in template["artifacts"] if a["install_target"]["kind"] == "trampoline_selftest"]
+        self.assertEqual(listed, [{"id": "duduclaw-run-selftest", "mode": 0o755,
+                                   "install_target": {"kind": "trampoline_selftest"}}])
+        document = self.manifest()
+        document["artifacts"] = [a for a in document["artifacts"] if a["install_target"]["kind"] != "trampoline_selftest"]
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            PACKAGE.validate_targets(document["artifacts"])
 
     def test_relative_target_dir_matches_cargo_working_directory(self):
         original = Path.cwd()
@@ -975,11 +993,11 @@ class LinuxReleaseTests(unittest.TestCase):
             document["artifacts"].append({"id": registry, "mode": mode,
                 "install_target": {"kind": "runtime_entry", "registry_id": registry}})
         PACKAGE.validate_targets(document["artifacts"])
-        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][11], self.binaries, None),
+        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][12], self.binaries, None),
                          self.binaries / "duduclaw-api-worker")
         with self.assertRaises(ValueError):
-            PACKAGE.runtime_source(document["artifacts"][10], self.binaries, None)
-        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][10], self.binaries, self.root),
+            PACKAGE.runtime_source(document["artifacts"][11], self.binaries, None)
+        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][11], self.binaries, self.root),
                          self.root / "runtime-isolation-policy-v1")
         duplicate = document["artifacts"] + [document["artifacts"][-1]]
         with self.assertRaises(ValueError):
@@ -1013,7 +1031,7 @@ class LinuxReleaseTests(unittest.TestCase):
         template.write_text(json.dumps(document))
         with patch.dict(os.environ, {"CI": "", "GITHUB_ACTIONS": ""}):
             outputs = PACKAGE.sign_release(self.binaries, TARGET, self.output, template, key, "ssh-keygen")
-        self.assertEqual(len(outputs), 12)
+        self.assertEqual(len(outputs), 13)
         manifest = self.output / "isolated-linux-x86_64-manifest.json"
         document = json.loads(manifest.read_bytes())
         for artifact in document["artifacts"]:
@@ -1049,7 +1067,7 @@ class LinuxReleaseTests(unittest.TestCase):
         template.write_text(json.dumps(document))
         with patch.dict(os.environ, {"CI":"", "GITHUB_ACTIONS":""}):
             outputs = PACKAGE.sign_release(self.binaries,TARGET,self.output,template,key,"ssh-keygen",runtime_dir)
-        self.assertEqual(len(outputs),16)
+        self.assertEqual(len(outputs),17)
         canonical = lambda value: json.dumps(value,sort_keys=True,separators=(",", ":")).encode()
         root = self.root / "root.json"
         root.write_bytes(canonical({"schema_version":1,"version":1}))
@@ -1057,7 +1075,7 @@ class LinuxReleaseTests(unittest.TestCase):
         signatures.write_text('["root-fixture-a","root-fixture-b"]')
         inbox = PACKAGE.create_bootstrap_inbox(TARGET,self.output,root,signatures)
         manifest = json.loads((inbox / "manifest.json").read_bytes())
-        self.assertEqual(len(list((inbox / "artifacts").iterdir())),14)
+        self.assertEqual(len(list((inbox / "artifacts").iterdir())),15)
         for artifact in manifest["artifacts"]:
             payload = (inbox / "artifacts" / artifact["id"]).read_bytes()
             self.assertEqual(artifact["sha256"],list(hashlib.sha256(payload).digest()))

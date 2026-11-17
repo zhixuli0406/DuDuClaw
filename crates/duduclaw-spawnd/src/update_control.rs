@@ -40,7 +40,7 @@
 //!
 //! Publication journal (`/var/lib/duduclaw-spawnd/publish.json`, format in
 //! `duduclaw_updated::publish_journal`, plan R6 addendum): one rename per file is
-//! atomic, the set of eight is not. So `Apply` first verifies the whole
+//! atomic, the set of nine (R7a added the run self-test) is not. So `Apply` first verifies the whole
 //! generation, then durably writes `{generation, manifest_sha256, previous,
 //! publishing}` and reads it back, then replaces the components, syncs every
 //! destination file and directory, then rewrites the journal as `published`.
@@ -52,7 +52,7 @@
 //! any socket is bound and before admission, and verifies the installed set
 //! EVERY time: whatever the journal says (`publishing` or `published`), its
 //! generation is re-verified against the trust ledger (including revocation),
-//! its manifest digest must be the journal's, and all eight destinations are
+//! its manifest digest must be the journal's, and all nine destinations are
 //! republished idempotently; on failure the journal's `previous` is verified
 //! and published with the same procedure. Without a journal, the generation
 //! the `current` selector names is verified the same way and every destination
@@ -262,7 +262,7 @@ pub trait Effects {
     /// a request, also that it is exactly that manifest's preparation. Returns
     /// the SHA-256 of the manifest bytes.
     fn verify(&mut self, generation: Sha256Digest, preparation: Option<&Preparation>) -> io::Result<Sha256Digest>;
-    /// Replace the eight fixed components with `generation`'s (each hashed from
+    /// Replace the nine fixed components with `generation`'s (each hashed from
     /// its descriptor while copied; a destination already holding exactly the
     /// artifact's bytes is kept), then sync every destination file and directory.
     /// A stale `<name>.next` is removed for every component, kept ones included
@@ -488,7 +488,7 @@ fn publish_journaled<S: JournalStore, E: Effects>(store: &mut S, effects: &mut E
 
 /// Start-up verification with a journal (plan R6 addenda): whatever its state,
 /// the journal's generation is fully re-verified (trust ledger including
-/// revocation, the journal's manifest digest, every artifact) and all eight
+/// revocation, the journal's manifest digest, every artifact) and all nine
 /// destinations are republished with the idempotent procedure (a destination
 /// already holding the right bytes is kept, an altered one is replaced).
 fn recover_journal<S: JournalStore, E: Effects>(store: &mut S, effects: &mut E, journal: PublishJournal)
@@ -1171,11 +1171,13 @@ pub fn notify(state: &str) -> io::Result<()> {
 }
 
 /// Fixed destinations (relative to the publication root) in the plan's order:
-/// spawnd, run, parse worker, `/usr/lib/duduclaw/current/*`, egress, gateway.
-/// File names are `publication::artifact_name`. The egress forwarder and
-/// runtime entries are used from the generation itself; the updater slot is F's.
-fn publication() -> [(InstallTarget, &'static str); 8] {
+/// spawnd, run, run self-test (R7a), parse worker, `/usr/lib/duduclaw/current/*`,
+/// egress, gateway. File names are `publication::artifact_name`. The egress
+/// forwarder and runtime entries are used from the generation itself; the
+/// updater slot is F's.
+fn publication() -> [(InstallTarget, &'static str); 9] {
     [(InstallTarget::Spawnd, "usr/lib/duduclaw"), (InstallTarget::Trampoline, "usr/lib/duduclaw"),
+        (InstallTarget::TrampolineSelftest, "usr/lib/duduclaw"),
         (InstallTarget::ParseWorker, "usr/libexec/duduclaw"), (InstallTarget::Importer, "usr/lib/duduclaw/current"),
         (InstallTarget::Migration, "usr/lib/duduclaw/current"), (InstallTarget::McpBridge, "usr/lib/duduclaw/current"),
         (InstallTarget::Egress, "opt/duduclaw/bin"), (InstallTarget::Gateway, "opt/duduclaw/bin")]
@@ -1468,11 +1470,14 @@ impl Effects for InstalledEffects {
     fn readback(&mut self, generation: Sha256Digest, live: bool) -> io::Result<Vec<ComponentReadback>> {
         let directory = self.generation_directory(generation)?.ok_or_else(invalid)?;
         let (_, manifest) = self.manifest(&directory, generation)?;
-        let trampoline = Directory::open(&self.publish_root.join("usr/lib/duduclaw")).and_then(|d| d.read("duduclaw-run"))
+        let installed = |name: &str| Directory::open(&self.publish_root.join("usr/lib/duduclaw")).and_then(|d| d.read(name))
             .map_err(updated).and_then(|file| digest_file(file, Some(0o755)));
+        let trampoline = installed("duduclaw-run");
+        let trampoline_selftest = installed("duduclaw-run-selftest");
         // SAFETY: geteuid has no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        Ok(components(&manifest, Observed { own_image: self.own_image, live, euid, trampoline: trampoline.ok() }))
+        Ok(components(&manifest, Observed { own_image: self.own_image, live, euid, trampoline: trampoline.ok(),
+            trampoline_selftest: trampoline_selftest.ok() }))
     }
     fn workloads(&mut self) -> io::Result<Workloads> { system_census() }
     fn gated_units_down(&mut self) -> io::Result<bool> { system_gated_units_down() }
@@ -1486,6 +1491,8 @@ pub(crate) struct Observed {
     pub euid: u32,
     /// SHA-256 of the published `/usr/lib/duduclaw/duduclaw-run`, by descriptor.
     pub trampoline: Option<Sha256Digest>,
+    /// R7a: SHA-256 of the published `/usr/lib/duduclaw/duduclaw-run-selftest`.
+    pub trampoline_selftest: Option<Sha256Digest>,
 }
 
 /// spawnd's readback: itself, the trampoline it executes, and every other
@@ -1515,6 +1522,12 @@ pub(crate) fn components(manifest: &ReleaseManifest, observed: Observed) -> Vec<
                 let matched = observed.trampoline == Some(artifact.sha256);
                 record(manifest.product, matched.then_some(manifest.version), manifest.protocols.trampoline,
                     observed.trampoline, Some(observed.euid), matched && observed.euid == 0)
+            }
+            // R7a: the self-test bytes PID 1 executes for this root process, same rule.
+            InstallTarget::TrampolineSelftest => {
+                let matched = observed.trampoline_selftest == Some(artifact.sha256);
+                record(manifest.product, matched.then_some(manifest.version), manifest.protocols.trampoline,
+                    observed.trampoline_selftest, Some(observed.euid), matched && observed.euid == 0)
             }
             // Non-daemon, non-root components (parse worker, MCP bridge, importer,
             // migration, egress forwarder, runtime entries): no executable

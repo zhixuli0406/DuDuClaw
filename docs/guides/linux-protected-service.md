@@ -99,6 +99,8 @@ A complete installation requires these roles and inputs:
 | Employee identities | Permanently recorded IDs, normally 70000–99999; allocated only after employee confirmation |
 | Trusted programs | Gateway, spawnd, trampoline, egress/forwarder/DNS broker, updater/frozen launcher, parser, importer, migration command and MCP stdio bridge; root-owned executable files |
 | Services | Gateway, spawnd socket/service, egress socket/service, optional DNS broker, updater, parse socket/template and TCB/employee slices |
+| Self-test account | `duduclaw-selftest`: the isolation self-test drops to it; system ID like the other service accounts, no home, no login shell, own group, no supplementary groups, locked |
+| Self-test unit | `/etc/systemd/system/duduclaw-isolation-selftest.service`, root:root 0644, exactly the shipped text with no drop-in; no `[Install]`: the installer never enables or starts it, spawnd starts it |
 | Parser roots | `/usr/lib/duduclaw/parse-root` and `/usr/lib/duduclaw/parse-root-tree`, root:root 0755; initially empty, never populated with host data |
 | Signed state | Bootstrap trust, compatible generation, runtime registry, updater slots/state and migration/readiness integration |
 

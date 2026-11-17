@@ -76,11 +76,15 @@ use duduclaw_updated::linux::{bootstrap_verify, files::Directory};
 /// (employees, TCB, aggregate). Review round 4 item 1: template instances,
 /// spawnd's transient runs and per-employee slices are enumerated from PID 1
 /// by `boot::quiesce_isolation` (`boot::unit_shape`), never by pattern here.
-const STOP_ORDER: [&str; 14] = [UNIT, boot::NIGHTLY_TIMER,
+/// R7a: the self-test oneshot stops right after spawnd, its only starter, so
+/// nothing can start it again once it is down.
+const STOP_ORDER: [&str; 15] = [UNIT, boot::NIGHTLY_TIMER,
     "duduclaw-egress.socket", "duduclaw-dns-broker.socket", "duduclaw-parse.socket", "duduclaw-spawnd.socket",
     "duduclaw-auto-upgrade.service", "duduclaw-updated.service", "duduclaw-egress.service", "duduclaw-dns-broker.service",
-    "duduclaw-spawnd.service", "duduclaw-employees.slice", "duduclaw-tcb.slice", "duduclaw.slice"];
-/// The units a bootstrap run enables (S6, S8); the others have no `[Install]`.
+    "duduclaw-spawnd.service", duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT,
+    "duduclaw-employees.slice", "duduclaw-tcb.slice", "duduclaw.slice"];
+/// The units a bootstrap run enables (S6, S8); the others have no `[Install]`
+/// (the R7a self-test unit among them: spawnd starts it through PID 1).
 const ENABLED: [&str; 9] = [UNIT, boot::NIGHTLY_TIMER, "duduclaw-egress.socket", "duduclaw-dns-broker.socket",
     "duduclaw-parse.socket", "duduclaw-spawnd.socket", "duduclaw-spawnd.service", "duduclaw-egress.service",
     "duduclaw-updated.service"];
@@ -788,6 +792,15 @@ mod tests {
             assert!(layout::UNITS.iter().any(|(name, _)| name == unit), "{unit}");
             assert!(!ENABLED.contains(unit), "{unit}");
         }
+        // R7a: the self-test unit file is removed by the rollback, never enabled
+        // (nothing to disable) and stopped right after spawnd, its only starter.
+        // Its account is kept with the other system accounts (module docs).
+        let selftest = duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT;
+        assert!(files.contains(&unit_path(selftest)));
+        assert!(files.iter().any(|file| file == "/usr/lib/duduclaw/duduclaw-run-selftest"));
+        assert!(!ENABLED.contains(&selftest));
+        assert_eq!(position(selftest), position("duduclaw-spawnd.service") + 1);
+        assert!(!boot::GATEWAY_READY_UNITS.contains(&selftest));
     }
 
     fn set_mount_ids(rewrite: impl Fn(&[u8]) -> Option<u64> + 'static) {

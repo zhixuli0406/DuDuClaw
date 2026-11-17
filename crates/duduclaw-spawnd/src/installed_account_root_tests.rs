@@ -2,7 +2,7 @@
 //! The fixed localhost fixture and positive controls are mandatory. These tests
 //! never equate a missing executable or unreachable service with account denial.
 use super::*;
-use std::{fs::OpenOptions, io::{Read, Write}, os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+use std::{fs::OpenOptions, io::{Read, Write}, os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf, process::{Command, Stdio}, sync::atomic::{AtomicUsize, Ordering}};
 const FIXTURE: &str = "/run/duduclaw-iso-account-test";
 const AUTHORIZED: &str = "/run/duduclaw-iso-account-test/authorized_keys/%u";

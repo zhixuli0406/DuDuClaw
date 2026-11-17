@@ -139,7 +139,7 @@ fn protocol(manifest: &ReleaseManifest, target: &InstallTarget) -> u16 {
     match target {
         InstallTarget::Gateway => manifest.protocols.gateway,
         InstallTarget::Spawnd | InstallTarget::RuntimeEntry { .. } => manifest.protocols.spawnd,
-        InstallTarget::Trampoline => manifest.protocols.trampoline,
+        InstallTarget::Trampoline | InstallTarget::TrampolineSelftest => manifest.protocols.trampoline,
         InstallTarget::Egress | InstallTarget::EgressForwarder => manifest.protocols.egress,
         InstallTarget::McpBridge => manifest.protocols.mcp_bridge,
         InstallTarget::ParseWorker => manifest.protocols.parse_worker,
@@ -159,7 +159,8 @@ pub fn validate_readbacks(manifest: &ReleaseManifest, readbacks: &[ComponentRead
         if found.next().is_some() || report.target != artifact.install_target || report.product != manifest.product
             || report.version != manifest.version || report.protocol != protocol(manifest, &artifact.install_target)
             || report.build_sha256 != artifact.sha256 || !report.ready { return Err(Error::Maintenance); }
-        let root_component = matches!(artifact.install_target, InstallTarget::Spawnd | InstallTarget::Trampoline);
+        let root_component = matches!(artifact.install_target,
+            InstallTarget::Spawnd | InstallTarget::Trampoline | InstallTarget::TrampolineSelftest);
         if (report.effective_uid == 0) != root_component { return Err(Error::Maintenance); }
     }
     Ok(())

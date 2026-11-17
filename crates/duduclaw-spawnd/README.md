@@ -153,14 +153,15 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   on disk, and zero admitted runs in a fresh healthy iteration. It verifies the
   whole generation first (manifest digest, signature against the trust ledger,
   every artifact from its descriptor), then writes the publication journal (see
-  below), then copies spawnd, run, parse worker, `/usr/lib/duduclaw/current/*`,
+  below), then copies spawnd, run, run self-test (R7a), parse worker, `/usr/lib/duduclaw/current/*`,
   egress and gateway from the generation directory, hashing each file from its
   descriptor while copying, to `<name>.next`, fsync, rename, directory fsync;
   finally every destination file and directory is synced again and the journal
   says `published`. While a journal of another generation is `publishing`,
   `Apply` is refused except for that journal's previous generation (the roll-back).
 - `Readback` reports spawnd itself (`sha256(/proc/self/exe)`, liveness of the
-  admission loop) and the trampoline it executes. Other non-daemon components
+  admission loop), the trampoline it executes and (R7a) the published
+  `duduclaw-run-selftest`, by the trampoline's rule. Other non-daemon components
   (parse worker, MCP bridge, importer, migration, egress forwarder, runtime
   entries) report `ready: false`: no executable readback under a non-root
   identity exists yet, so the updater cannot validate an activation until one does.
@@ -548,11 +549,46 @@ printing them to employee stderr. The B1 readiness interface carries both fields
 when a trusted installation producer returns verified evidence, the daemon logs
 the pair once per daemon process to stderr and publishes it as `EvidenceReport.landlock`
 (`detected_abi`, `selected_abi`). The supplied service routes stderr to the
-journal (rate-limited); readiness remains the retained operator evidence. The selected ABI cannot exceed 7. The default
-native adapter still uses `MissingInstallation`, so the production producer is
-absent: neither kernel probing nor an arbitrary configuration flag makes this
-readiness evidence available. The bootstrap receipt's selected ABI alone is not
-an installation self-test or an operator readiness report.
+journal (rate-limited); readiness remains the retained operator evidence. The selected ABI cannot exceed 7.
+Neither kernel probing nor an arbitrary configuration flag makes this readiness
+evidence available. The bootstrap receipt's selected ABI alone is not an
+installation self-test or an operator readiness report.
+
+### R7a: trampoline facts from spawnd's own self-test
+
+The installed adapter (`installed::install`) gives `NativeTrampoline` a
+`selftest::SelfTestInstallation`; no installer receipt supplies these facts any
+more. `trampoline_verified` requires both `/usr/lib/duduclaw/duduclaw-run` and
+`/usr/lib/duduclaw/duduclaw-run-selftest` to match the committed signed
+generation's `Trampoline` / `TrampolineSelftest` artifacts (sha256, size and
+mode, by descriptor; the check moved here from the receipt reader).
+`landlock_self_test` and `namespace_self_test` are the cached pass of the fixed
+unit `duduclaw-isolation-selftest.service`, which spawnd starts through PID 1
+(`Systemd::run_fixed_unit`: only that name; PID 1 must load it from
+`/etc/systemd/system/duduclaw-isolation-selftest.service` with no drop-in, no
+pending daemon-reload, not transient and not already running; PID 1 must
+report the run units' `NoNewPrivileges`, `TRAMPOLINE_CAPABILITIES`, no ambient
+capability and `TRAMPOLINE_NAMESPACES`, and `User`/`Group` empty and
+`RestrictSUIDSGID` false (`RUN_UNIT_DEFAULTED`), every mismatch named as
+`invalid unit policy: fixed unit readback <Key>: …`; the journal is never
+parsed). `run_fixed_unit` holds a `Unit.Ref` on the unit from before the
+pre-start readback until it returns, released on every path including errors
+and the deadline, and refuses without starting if the reference cannot be
+taken: unreferenced, PID 1 collects the finished oneshot and every outcome
+field reads 0. A run passes only on a new `InvocationID`, `ActiveState=inactive`,
+`Result=success`, `ExecMainCode=1` (exited), `ExecMainStatus=0`, a non-zero
+`ExecMainPID`, and `ExecStart`'s single pinned record agreeing with that pid
+and exit, started after the record read before the start and exited after it
+started; anything else fails. The ABI pair is the live probe.
+The outcome is cached under (boot id, committed generation, detected/selected
+ABI, both artifact identities): a pass is reused for that key, any key change
+runs the unit again, a fail is reused for 60 s before one retry. The run happens
+on a background thread first requested by the first readiness refresh after
+start-up recovery, so it never delays the sockets, the update endpoint or the
+refresh loop (a run in progress reads as "not yet passed"). The protected
+installer creates the `duduclaw-selftest` system account and installs the unit
+file (`protected_linux_layout.rs`) before it starts spawnd; without them this
+readiness fails closed.
 
 ## UserDB account verification
 
@@ -630,11 +666,12 @@ state or executable path is disclosed through the projection.
 not an operator configuration. It binds the committed generation and current
 boot with at most 60 seconds validity. It records UID inventory and permanent
 external-IAM reservation digests; per-account SSH positive control, denied
-public-key login and forwarding observations; actual trampoline Landlock and
-namespace test exit results; and DNS query/answer digests through resolved
-Varlink or a dedicated broker with no private-IP allow exception. The consumer
-also hashes the exact `/usr/lib/duduclaw/duduclaw-run` executable against F's
-signed artifact, and repeats the live kernel ABI probe. Missing, stale, changed
+public-key login and forwarding observations; and DNS query/answer digests
+through resolved Varlink or a dedicated broker with no private-IP allow
+exception. Since R7a it carries no trampoline facts (a receipt with a
+`trampoline` member is refused as an unknown field); the trampoline digest,
+self-test and ABI evidence come from spawnd's own self-test (see "R7a:
+trampoline facts from spawnd's own self-test" above). Missing, stale, changed
 or malformed receipts deny admission. The trusted root harness must renew real
 observations; this change does not implement that harness or claim an installed
 host is ready. Root caches only a fully verified immutable F generation and its
@@ -701,7 +738,9 @@ The VM must have the compiled-version F service running with a committed signed
 generation; B1 must continuously publish current root/gateway reports, with at
 least one confirmed MCP-enabled Claude entitlement. The signed runtime policy
 must contain real exact-runtime MCP inheritance acceptance. The root measurement
-harness must continuously renew the installation/SSH/DNS/kernel receipts. No test
+harness must continuously renew the installation/SSH/DNS receipts; the second
+test also starts the installed `duduclaw-isolation-selftest.service` through
+PID 1 (R7a), which needs the unit file and the `duduclaw-selftest` account. No test
 synthesizes those prerequisites. For the third test, an externally started real
 Claude run must remain journaled and its MCP receipt must be less than 60 seconds
 old. Set `ISO_INSTALLED_RUN_ID` to that actual 32-character lowercase hex run ID.

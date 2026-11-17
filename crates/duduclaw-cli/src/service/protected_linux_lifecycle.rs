@@ -175,6 +175,9 @@ mod tests {
     fn service_protected_lifecycle_units_are_exact_and_unknown_activation_refuses() {
         assert!(owned_unit("duduclaw-run-0123456789abcdef0123456789abcdef.service"));
         assert!(owned_unit("duduclaw-parse@3-1.service"));
+        // R7a: a loaded self-test unit is inventoried (fenced, stopped, removed), never refused as unknown.
+        assert!(owned_unit("duduclaw-isolation-selftest.service"));
+        assert_eq!(inventory("duduclaw-isolation-selftest.service static\n").unwrap().len(), 1);
         for name in ["--help", "duduclaw-run-x.service", "duduclaw-parse@../x.service",
             "duduclaw-gateway.service.evil", "duduclaw-other.service"] { assert!(!owned_unit(name)); }
         assert!(inventory("duduclaw-other.service enabled\n").is_err());

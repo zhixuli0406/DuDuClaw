@@ -38,7 +38,6 @@ fn invalid_because(what: impl std::fmt::Display) -> io::Error {
 /// Single-line, bounded rendering for a refusal message: at most 200 bytes of
 /// `text` (cut at a character boundary, `...` appended when cut), every
 /// control character replaced by `?`.
-#[cfg(any(target_os = "linux", test))]
 fn bounded_text(text: &str) -> String {
     const MAX: usize = 200;
     let mut rendered = String::new();
@@ -244,6 +243,185 @@ impl UnitPolicy {
     }
 }
 
+/// R7a: the directory the installer writes every fixed DuDuClaw unit file to
+/// (the same directory as the isolation facts' unit files).
+pub const FIXED_UNIT_DIRECTORY: &str = "/etc/systemd/system";
+/// PID 1's view of a fixed unit, read back before it is started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedUnitLoad {
+    pub id: String, pub load_state: String, pub fragment_path: String,
+    pub drop_in_paths: Vec<String>, pub need_daemon_reload: bool, pub transient: bool,
+}
+/// Only the single allow-listed unit, loaded by PID 1 from exactly its own file
+/// in [`FIXED_UNIT_DIRECTORY`], with no drop-in, no pending daemon-reload and
+/// not transient (a transient unit of the same name would carry caller-chosen
+/// properties). Anything else refuses before any start. The file's content
+/// ([`fixed_unit_file_valid`]) and PID 1's effective configuration
+/// ([`checked_fixed_unit_effective`]) are checked separately.
+pub fn fixed_unit_load_valid(name: &str, load: &FixedUnitLoad) -> bool {
+    name == duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT && load.id == name && load.load_state == "loaded"
+        && load.fragment_path == format!("{FIXED_UNIT_DIRECTORY}/{name}")
+        && load.drop_in_paths.is_empty() && !load.need_daemon_reload && !load.transient
+}
+/// R7a: the one command the fixed unit may run (the installed path of
+/// `InstallTarget::TrampolineSelftest`).
+pub const SELFTEST_EXECUTABLE: &str = "/usr/lib/duduclaw/duduclaw-run-selftest";
+/// The slice every DuDuClaw TCB service, including the self-test unit, runs in.
+pub const TCB_SLICE: &str = "duduclaw-tcb.slice";
+/// The shipped self-test unit text; the installed file must be exactly these bytes.
+pub const ISOLATION_SELFTEST_UNIT_TEXT: &str =
+    include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service");
+/// Read bound for an installed fixed unit file (the shipped one is ~4 KiB).
+pub const MAX_FIXED_UNIT_BYTES: usize = 64 * 1024;
+/// The installed unit file's content, read through the trusted-directory
+/// reader, is byte-for-byte the shipped text. A wrong or stale file at the
+/// right path (e.g. `ExecStart=/bin/true`) refuses before any start.
+pub fn fixed_unit_file_valid(installed: &[u8]) -> bool { installed == ISOLATION_SELFTEST_UNIT_TEXT.as_bytes() }
+/// One `ExecStart` entry as PID 1 reports it, D-Bus `(sasbttttuii)`: path,
+/// argv, ignore-failure (`-` prefix), start realtime/monotonic, exit
+/// realtime/monotonic (µs), then pid, code (CLD_*) and status of the
+/// command's last execution.
+pub type ExecStartEntry = (String, Vec<String>, bool, u64, u64, u64, u64, u32, i32, i32);
+/// A parsed [`ExecStartEntry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecCommand {
+    pub path: String, pub argv: Vec<String>, pub ignore_failure: bool,
+    pub start_monotonic_us: u64, pub exit_monotonic_us: u64, pub pid: u32, pub code: i32, pub status: i32,
+}
+impl From<ExecStartEntry> for ExecCommand {
+    fn from(entry: ExecStartEntry) -> Self {
+        let (path, argv, ignore_failure, _, start_monotonic_us, _, exit_monotonic_us, pid, code, status) = entry;
+        Self { path, argv, ignore_failure, start_monotonic_us, exit_monotonic_us, pid, code, status }
+    }
+}
+/// Exactly `SELFTEST_EXECUTABLE` with argv `[SELFTEST_EXECUTABLE]`, failures not ignored.
+pub fn fixed_unit_command_valid(command: &ExecCommand) -> bool {
+    command.path == SELFTEST_EXECUTABLE && command.argv.len() == 1 && command.argv[0] == SELFTEST_EXECUTABLE
+        && !command.ignore_failure
+}
+/// The PID 1 properties of the fixed unit's `org.freedesktop.systemd1.Service`
+/// interface the checks read (a fake in tests). Any `Err` refuses.
+pub trait FixedUnitProperties {
+    fn exec_start(&self) -> io::Result<Vec<ExecStartEntry>>;
+    fn text(&self, name: &'static str) -> io::Result<String>;
+    fn flag(&self, name: &'static str) -> io::Result<bool>;
+    fn mask(&self, name: &'static str) -> io::Result<u64>;
+}
+/// R7a/R7g: every scalar property of the fixed unit PID 1 must report besides
+/// `ExecStart`, with its required value. The trampoline's privilege state is
+/// the run units' (same constants and values `UnitPolicy::new` sets:
+/// NoNewPrivileges, `TRAMPOLINE_CAPABILITIES`, no ambient capability,
+/// `TRAMPOLINE_NAMESPACES`); every [`RUN_UNIT_DEFAULTED`] property reads back
+/// its default (`User`/`Group` empty, `RestrictSUIDSGID` false: an explicit
+/// `User=root` loses CAP_SETUID and `RestrictSUIDSGID=` makes `openat2` ENOSYS
+/// on systemd 255, failing the self-test at `capabilities`/`probe`); plus the
+/// fixed unit's own TCB slice and `Type=oneshot`.
+pub fn fixed_unit_readback() -> Vec<(&'static str, Property)> {
+    let mut expected = vec![
+        ("NoNewPrivileges", Property::Bool(true)),
+        ("CapabilityBoundingSet", Property::U64(TRAMPOLINE_CAPABILITIES)),
+        ("AmbientCapabilities", Property::U64(0)),
+        ("RestrictNamespaces", Property::U64(TRAMPOLINE_NAMESPACES)),
+        ("Slice", Property::Text(TCB_SLICE.into())),
+        ("Type", Property::Text("oneshot".into())),
+    ];
+    expected.extend(RUN_UNIT_DEFAULTED.iter().cloned());
+    expected
+}
+/// One fixed-unit property as PID 1 reports it, read through the accessor of
+/// its expected value's type (`flag` `b`, `mask` `t`, `text` `s`).
+fn read_fixed_unit_property(properties: &dyn FixedUnitProperties, key: &'static str, expected: &Property) -> io::Result<Property> {
+    match expected {
+        Property::Bool(_) => properties.flag(key).map(Property::Bool),
+        Property::U64(_) => properties.mask(key).map(Property::U64),
+        Property::Text(_) => properties.text(key).map(Property::Text),
+        _ => Err(invalid_because(format_args!("fixed unit readback {key}: no scalar reader"))),
+    }
+}
+/// `invalid unit policy: fixed unit readback <key>: actual value <debug>`,
+/// the rendering bounded ([`bounded_text`]).
+fn fixed_unit_refusal(key: &str, actual: &dyn std::fmt::Debug) -> io::Error {
+    invalid_because(format_args!("fixed unit readback {key}: actual value {}", bounded_text(&format!("{actual:?}"))))
+}
+/// R7a: read and check the fixed unit's effective configuration as PID 1
+/// holds it, on the starting connection immediately before `StartUnit`:
+/// exactly one command ([`fixed_unit_command_valid`]) and every
+/// [`fixed_unit_readback`] property at its value. A property that cannot be
+/// read refuses at once; otherwise every property is compared before refusing
+/// and every mismatch is named in one refusal ([`ReadbackRefusals`],
+/// [`fixed_unit_refusal`]). `Ok` is the single command's record before the
+/// start (its last-execution start time binds the outcome).
+pub fn checked_fixed_unit_effective(properties: &dyn FixedUnitProperties) -> io::Result<ExecCommand> {
+    let mut exec_start: Vec<ExecCommand> = properties.exec_start()?.into_iter().map(ExecCommand::from).collect();
+    let mut refusals = ReadbackRefusals::default();
+    if !matches!(exec_start.as_slice(), [command] if fixed_unit_command_valid(command)) {
+        let actual: Vec<(&str, &[String], bool)> = exec_start.iter()
+            .map(|command| (command.path.as_str(), command.argv.as_slice(), command.ignore_failure)).collect();
+        refusals.check(Err(fixed_unit_refusal("ExecStart", &actual)));
+    }
+    for (key, expected) in fixed_unit_readback() {
+        let actual = read_fixed_unit_property(properties, key, &expected)?;
+        refusals.check(if actual == expected { Ok(()) } else { Err(fixed_unit_refusal(key, &actual)) });
+    }
+    refusals.finish()?;
+    exec_start.pop().ok_or_else(invalid)
+}
+/// The started invocation has finished: PID 1 reports a new, non-zero
+/// InvocationID (not the one read before `StartUnit`) and the unit is back to
+/// `inactive` or `failed`. A start that never acquires an invocation times out.
+pub fn fixed_unit_finished(before: &[u8], invocation: &[u8], active_state: &str) -> bool {
+    invocation.len() == 16 && invocation.iter().any(|byte| *byte != 0) && invocation != before
+        && matches!(active_state, "inactive" | "failed")
+}
+/// How the fixed oneshot unit ended, as PID 1 records it. The journal is never parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedUnitOutcome {
+    pub result: String, pub exec_main_code: i32, pub exec_main_status: i32, pub exec_main_pid: u32,
+    pub invocation: Vec<u8>,
+    /// InvocationID read before `StartUnit` (empty when PID 1 had none).
+    pub previous_invocation: Vec<u8>,
+    /// `ActiveState` when the invocation was seen finished.
+    pub active_state: String,
+    /// `ExecStart` read after the unit finished.
+    pub recorded: Vec<ExecCommand>,
+    /// `start_monotonic_us` of the command's record read before `StartUnit`.
+    pub previous_start_us: u64,
+}
+impl FixedUnitOutcome {
+    /// Strict, read while `run_fixed_unit` holds its reference on the unit
+    /// (systemd 255 keeps a referenced finished oneshot with
+    /// `ExecMainCode=1`, its `ExecMainPID` and a fresh InvocationID; an
+    /// unreferenced one is collected and reads all zero): [`Self::failure`] is `None`.
+    pub fn passed(&self) -> bool { self.failure().is_none() }
+    /// The first check this outcome fails, named; `None` only when all hold:
+    /// a new non-zero InvocationID different from the one before `StartUnit`,
+    /// `ActiveState=inactive`, `Result=success`, `ExecMainCode` 1 (CLD_EXITED),
+    /// `ExecMainStatus` 0, `ExecMainPID` non-zero, and
+    /// [`Self::recorded_by_this_start`].
+    pub fn failure(&self) -> Option<&'static str> {
+        if !fixed_unit_finished(&self.previous_invocation, &self.invocation, &self.active_state) {
+            return Some("InvocationID not a new finished invocation");
+        }
+        if self.active_state != "inactive" { return Some("ActiveState"); }
+        if self.result != "success" { return Some("Result"); }
+        if self.exec_main_code != 1 { return Some("ExecMainCode"); }
+        if self.exec_main_status != 0 { return Some("ExecMainStatus"); }
+        if self.exec_main_pid == 0 { return Some("ExecMainPID"); }
+        if !self.recorded_by_this_start() { return Some("ExecStart record"); }
+        None
+    }
+    /// `ExecStart`'s own status record (its struct carries pid/code/status of
+    /// the last execution) is the single pinned command, agrees with
+    /// `ExecMainPID` and records an exit with status 0 (code 1, CLD_EXITED),
+    /// started after the record read before `StartUnit` (0 when never run),
+    /// and exited (non-zero, not before its start).
+    pub fn recorded_by_this_start(&self) -> bool {
+        matches!(self.recorded.as_slice(), [command] if fixed_unit_command_valid(command)
+            && command.pid == self.exec_main_pid && command.code == 1 && command.status == 0
+            && command.start_monotonic_us > self.previous_start_us
+            && command.exit_monotonic_us != 0 && command.exit_monotonic_us >= command.start_monotonic_us)
+    }
+}
 /// R7g: run-unit properties spawnd deliberately does not set, with the value
 /// PID 1 must report for each. `User`/`Group` empty: a system service with
 /// neither set runs as root:root with the full bounding set it is given (an
@@ -310,6 +488,51 @@ pub fn run_process_status_mismatch(status: &str) -> io::Result<Option<(&'static 
 /// status readback against a recycled PID.
 pub fn run_process_cgroup_ok(membership: &str, control_group: &str) -> bool {
     membership.strip_prefix("0::").and_then(|rest| rest.strip_suffix('\n')) == Some(control_group)
+}
+
+/// At most this many readback failures are named in one refusal.
+const MAX_READBACK_NAMED: usize = 16;
+/// A combined readback refusal stops adding named failures past this many
+/// bytes (each failure is itself bounded with [`bounded_text`]).
+const MAX_READBACK_MESSAGE: usize = 2048;
+/// Every readback failure of one start (run unit or fixed unit), in readback
+/// order: the first [`MAX_READBACK_NAMED`] are kept, the rest only counted.
+#[derive(Default)]
+struct ReadbackRefusals { named: Vec<io::Error>, total: usize }
+impl ReadbackRefusals {
+    fn check(&mut self, result: io::Result<()>) {
+        if let Err(error) = result {
+            self.total += 1;
+            if self.named.len() < MAX_READBACK_NAMED { self.named.push(error); }
+        }
+    }
+    /// `Ok` only when nothing failed. Otherwise one error `invalid unit
+    /// policy: <scope> <Key1>: …; <scope> <Key2>: …[; <n> more readback
+    /// mismatches not shown]` (scope `readback` or `fixed unit readback`),
+    /// bounded to about [`MAX_READBACK_MESSAGE`] bytes; its kind is
+    /// `InvalidData` unless a failure had another kind (a reply that did not
+    /// convert), in which case the first such kind.
+    fn finish(self) -> io::Result<()> {
+        if self.total == 0 { return Ok(()); }
+        const PREFIX: &str = "invalid unit policy: ";
+        let kind = self.named.iter().map(io::Error::kind)
+            .find(|kind| *kind != io::ErrorKind::InvalidData).unwrap_or(io::ErrorKind::InvalidData);
+        let mut message = String::from(PREFIX);
+        let mut shown = 0;
+        for error in &self.named {
+            let text = error.to_string();
+            let detail = text.strip_prefix(PREFIX).unwrap_or(&text);
+            let separator = if shown == 0 { "" } else { "; " };
+            if shown > 0 && message.len() + separator.len() + detail.len() > MAX_READBACK_MESSAGE { break; }
+            message.push_str(separator);
+            message.push_str(detail);
+            shown += 1;
+        }
+        if shown < self.total {
+            message.push_str(&format!("; {} more readback mismatches not shown", self.total - shown));
+        }
+        Err(io::Error::new(kind, message))
+    }
 }
 
 /// The DNS second layer must not exempt private resolver IPs (r7 supersedes §4.3).
@@ -655,6 +878,93 @@ pub mod linux {
             released?;
             Ok(status)
         }
+        /// R7a: start the pre-installed fixed unit `name` through PID 1 and wait,
+        /// at most `deadline`, for that invocation to finish. Only
+        /// [`duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT`] is accepted, and
+        /// only while its installed file is exactly the shipped text
+        /// ([`fixed_unit_file_valid`]), PID 1 loads it from that file with no
+        /// drop-in, no pending reload, not transient ([`fixed_unit_load_valid`]),
+        /// it is not already running, and PID 1's effective configuration is
+        /// the pinned one ([`checked_fixed_unit_effective`], read on this
+        /// connection immediately before `StartUnit`). Same polling style as
+        /// [`Self::run_cgroup_probe`].
+        ///
+        /// The unit is pinned by a reference of this connection for the whole
+        /// call. Nothing else references it (no `[Install]`, nothing pulls it
+        /// in), so PID 1 garbage-collects it as soon as it is inactive, and
+        /// every later property read loads a fresh copy (empty InvocationID,
+        /// default `Result=success`, `ExecMainCode=0`): without the pin this
+        /// invocation's outcome is gone before it is read, and the checks
+        /// before `StartUnit` could each read a different load of the unit.
+        /// `Unit.Ref` on the unit's own object path loads and references it in
+        /// one PID 1 call (a separate `LoadUnit` result may be collected first).
+        pub fn run_fixed_unit(&self, name: &str, deadline: Duration) -> io::Result<FixedUnitOutcome> {
+            if name != duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT { return Err(invalid()); }
+            if !fixed_unit_file_valid(&installed_fixed_unit(name)?) { return Err(invalid()); }
+            let manager = self.manager()?;
+            let path: OwnedObjectPath = manager.call("LoadUnit", &(name,)).map_err(bus_error)?;
+            let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+            self.references.lock().map_err(|_| invalid())?.acquire(name, false, || {
+                unit.call::<_, _, ()>("Ref", &()).map_err(bus_error)
+            })?;
+            let outcome = self.run_pinned_fixed_unit(name, &manager, &path, &unit, deadline);
+            let released = self.references.lock().map_err(|_| invalid())?.release(name, || {
+                manager.call::<_, _, ()>("UnrefUnit", &(name,)).map_err(bus_error)
+            });
+            let outcome = outcome?;
+            released?;
+            Ok(outcome)
+        }
+        /// [`Self::run_fixed_unit`] once the unit is pinned.
+        fn run_pinned_fixed_unit(&self, name: &str, manager: &Proxy<'_>, path: &OwnedObjectPath, unit: &Proxy<'_>,
+            deadline: Duration) -> io::Result<FixedUnitOutcome> {
+            let load = FixedUnitLoad {
+                id: unit.get_property("Id").map_err(bus_error)?,
+                load_state: unit.get_property("LoadState").map_err(bus_error)?,
+                fragment_path: unit.get_property("FragmentPath").map_err(bus_error)?,
+                drop_in_paths: unit.get_property("DropInPaths").map_err(bus_error)?,
+                need_daemon_reload: unit.get_property("NeedDaemonReload").map_err(bus_error)?,
+                transient: unit.get_property("Transient").map_err(bus_error)?,
+            };
+            if !fixed_unit_load_valid(name, &load) { return Err(invalid()); }
+            let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+            match state.as_str() {
+                "inactive" => {}
+                // A previous failed invocation: clear it so this start is fresh.
+                "failed" => manager.call::<_, _, ()>("ResetFailedUnit", &(name,)).map_err(bus_error)?,
+                // Someone else's invocation is in progress: never adopt its result.
+                _ => return Err(invalid()),
+            }
+            let before: Vec<u8> = unit.get_property("InvocationID").map_err(bus_error)?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            // Content as PID 1 will execute it: an unreadable, unparsable or
+            // different property refuses. A reload racing this read cannot pass
+            // either: the outcome must be recorded by the pinned command.
+            let previous = checked_fixed_unit_effective(&service)?;
+            let _job: OwnedObjectPath = manager.call("StartUnit", &(name, "replace")).map_err(bus_error)?;
+            let until = Instant::now() + deadline;
+            let outcome = loop {
+                let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+                let invocation: Vec<u8> = unit.get_property("InvocationID").map_err(bus_error)?;
+                if fixed_unit_finished(&before, &invocation, &state) {
+                    break FixedUnitOutcome { result: service.get_property("Result").map_err(bus_error)?,
+                        exec_main_code: service.get_property("ExecMainCode").map_err(bus_error)?,
+                        exec_main_status: service.get_property("ExecMainStatus").map_err(bus_error)?,
+                        exec_main_pid: service.get_property("ExecMainPID").map_err(bus_error)?, invocation,
+                        previous_invocation: before.clone(), active_state: state,
+                        recorded: FixedUnitProperties::exec_start(&service)?.into_iter().map(ExecCommand::from).collect(),
+                        previous_start_us: previous.start_monotonic_us };
+                }
+                if Instant::now() >= until {
+                    let _: zbus::Result<OwnedObjectPath> = manager.call("StopUnit", &(name, "replace"));
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            // The outcome is read; a failed state would otherwise linger in PID 1.
+            if state_failed(unit) { let _: zbus::Result<()> = manager.call("ResetFailedUnit", &(name,)); }
+            Ok(outcome)
+        }
         /// Descriptors must be validated by B1 before this call. Runtime release
         /// remains blocked on the bootstrap handshake and B2 status readback.
         pub fn start(&self, policy: &UnitPolicy, bootstrap: BorrowedFd<'_>,
@@ -874,6 +1184,29 @@ pub mod linux {
             host_pty_budget()
         }
     }
+    fn state_failed(unit: &Proxy<'_>) -> bool {
+        unit.get_property::<String>("ActiveState").is_ok_and(|state| state == "failed")
+    }
+    /// A unit's `org.freedesktop.systemd1.Service` proxy. Each property is
+    /// decoded into exactly its documented D-Bus type (`ExecStart`
+    /// `a(sasbttttuii)`, `User`/`Group`/`Slice`/`Type` `s`,
+    /// `NoNewPrivileges`/`RestrictSUIDSGID` `b`,
+    /// `CapabilityBoundingSet`/`AmbientCapabilities`/`RestrictNamespaces` `t`);
+    /// any other type is an error, so the check refuses.
+    impl FixedUnitProperties for Proxy<'_> {
+        fn exec_start(&self) -> io::Result<Vec<ExecStartEntry>> { self.get_property("ExecStart").map_err(bus_error) }
+        fn text(&self, name: &'static str) -> io::Result<String> { self.get_property(name).map_err(bus_error) }
+        fn flag(&self, name: &'static str) -> io::Result<bool> { self.get_property(name).map_err(bus_error) }
+        fn mask(&self, name: &'static str) -> io::Result<u64> { self.get_property(name).map_err(bus_error) }
+    }
+    /// R7a: the installed fixed unit file, read through the trusted-directory
+    /// reader (root-owned chain without symlinks, root-owned regular file with
+    /// one link and no group/other write, at most [`MAX_FIXED_UNIT_BYTES`]).
+    pub fn installed_fixed_unit(name: &str) -> io::Result<Vec<u8>> {
+        if name != duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT { return Err(invalid()); }
+        let directory = duduclaw_updated::linux::files::Directory::open(Path::new(FIXED_UNIT_DIRECTORY)).map_err(|_| invalid())?;
+        directory.bytes(name, MAX_FIXED_UNIT_BYTES).map_err(|_| invalid())
+    }
     pub fn host_pty_budget() -> io::Result<u32> {
         pty_budget(&std::fs::read_to_string("/proc/sys/kernel/pty/max")?,
             &std::fs::read_to_string("/proc/sys/kernel/pty/reserve")?)
@@ -1002,49 +1335,6 @@ pub mod linux {
         if present { return Ok(()); }
         Err(invalid_because(format_args!("readback {key}: dependency missing (actual {})",
             bounded_text(&format!("{actual:?}")))))
-    }
-    /// At most this many readback failures are named in one refusal.
-    const MAX_READBACK_NAMED: usize = 16;
-    /// A combined readback refusal stops adding named failures past this many
-    /// bytes (each failure is itself bounded, see [`readback_refusal`]).
-    const MAX_READBACK_MESSAGE: usize = 2048;
-    /// Every readback failure of one start, in readback order: the first
-    /// [`MAX_READBACK_NAMED`] are kept, the rest only counted.
-    #[derive(Default)]
-    struct ReadbackRefusals { named: Vec<io::Error>, total: usize }
-    impl ReadbackRefusals {
-        fn check(&mut self, result: io::Result<()>) {
-            if let Err(error) = result {
-                self.total += 1;
-                if self.named.len() < MAX_READBACK_NAMED { self.named.push(error); }
-            }
-        }
-        /// `Ok` only when nothing failed. Otherwise one error `invalid unit
-        /// policy: readback <Key1>: …; readback <Key2>: …[; <n> more readback
-        /// mismatches not shown]`, bounded to about [`MAX_READBACK_MESSAGE`]
-        /// bytes; its kind is `InvalidData` unless a failure had another kind
-        /// (a reply that did not convert), in which case the first such kind.
-        fn finish(self) -> io::Result<()> {
-            if self.total == 0 { return Ok(()); }
-            const PREFIX: &str = "invalid unit policy: ";
-            let kind = self.named.iter().map(io::Error::kind)
-                .find(|kind| *kind != io::ErrorKind::InvalidData).unwrap_or(io::ErrorKind::InvalidData);
-            let mut message = String::from(PREFIX);
-            let mut shown = 0;
-            for error in &self.named {
-                let text = error.to_string();
-                let detail = text.strip_prefix(PREFIX).unwrap_or(&text);
-                let separator = if shown == 0 { "" } else { "; " };
-                if shown > 0 && message.len() + separator.len() + detail.len() > MAX_READBACK_MESSAGE { break; }
-                message.push_str(separator);
-                message.push_str(detail);
-                shown += 1;
-            }
-            if shown < self.total {
-                message.push_str(&format!("; {} more readback mismatches not shown", self.total - shown));
-            }
-            Err(io::Error::new(kind, message))
-        }
     }
     /// `invalid unit policy: <scope> <key>: actual signature <sig> value
     /// <debug>`, both renderings bounded ([`bounded_text`]). Unit and slice
@@ -1656,6 +1946,210 @@ pub mod linux {
             let _ = systemd.kill_name(&employee_slice(employee));
             drop(directory);
         }
+
+        use duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT;
+        const SELFTEST_DROP_IN_DIRECTORY: &str = "/etc/systemd/system/duduclaw-isolation-selftest.service.d";
+        const SELFTEST_DROP_IN: &str = "10-test.conf";
+        fn selftest_unit_path() -> PathBuf { Path::new(FIXED_UNIT_DIRECTORY).join(ISOLATION_SELFTEST_UNIT) }
+        /// The R7a fixed-unit root tests need this branch's unit file and
+        /// self-test binary installed; anything else panics naming what to install.
+        fn require_installed_selftest_unit() {
+            let unit = selftest_unit_path();
+            let install = format!("install this branch's scripts/linux-protected/spawnd/{ISOLATION_SELFTEST_UNIT} \
+                byte for byte as {} (root:root 0644, one link, no symlink in the path), \
+                scripts/linux-protected/spawnd/duduclaw-tcb.slice next to it, then `systemctl daemon-reload`", unit.display());
+            match std::fs::read(&unit) {
+                Ok(bytes) if fixed_unit_file_valid(&bytes) => {}
+                Ok(bytes) => panic!("{} ({} bytes) is not the shipped ISOLATION_SELFTEST_UNIT_TEXT ({} bytes): {install}",
+                    unit.display(), bytes.len(), ISOLATION_SELFTEST_UNIT_TEXT.len()),
+                Err(error) => panic!("{}: {error}: {install}", unit.display()),
+            }
+            let install = format!("install this branch's duduclaw-run-selftest binary \
+                (`cargo build --release -p duduclaw-run --bin duduclaw-run-selftest`) as {SELFTEST_EXECUTABLE} (root:root 0755)");
+            match std::fs::metadata(SELFTEST_EXECUTABLE) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => panic!("{SELFTEST_EXECUTABLE} is not a regular file: {install}"),
+                Err(error) => panic!("{SELFTEST_EXECUTABLE}: {error}: {install}"),
+            }
+        }
+        /// `systemctl daemon-reload` through the manager's `Reload` (PID 1
+        /// replies once the reload is done), on its own connection with a
+        /// method timeout longer than [`Systemd::connect`]'s 5 s.
+        fn daemon_reload() -> io::Result<()> {
+            let connection = Builder::system().map_err(bus_error)?
+                .method_timeout(Duration::from_secs(90)).build().map_err(bus_error)?;
+            let manager = Proxy::new(&connection, BUS, "/org/freedesktop/systemd1", MANAGER).map_err(bus_error)?;
+            manager.call::<_, _, ()>("Reload", &()).map_err(|error| io::Error::other(format!("daemon-reload: {error}")))
+        }
+        /// The production call; any refusal or bus error is printed in full.
+        fn assert_selftest_passes(systemd: &Systemd, what: &str) -> FixedUnitOutcome {
+            let deadline = Duration::from_millis(crate::selftest::UNIT_DEADLINE_MS);
+            let outcome = systemd.run_fixed_unit(ISOLATION_SELFTEST_UNIT, deadline).unwrap_or_else(|error| panic!(
+                "{what}: run_fixed_unit returned an error: {error} ({error:?}); see `journalctl -b -u {ISOLATION_SELFTEST_UNIT}`"));
+            assert!(outcome.passed(), "{what}: the self-test unit did not pass ({:?} failed): {outcome:?}; \
+                see `journalctl -b -u {ISOLATION_SELFTEST_UNIT}`", outcome.failure());
+            assert!(systemd.references.lock().unwrap().units.is_empty(), "{what}: run_fixed_unit kept its reference");
+            outcome
+        }
+        /// With no other reference held, PID 1 collects the finished oneshot
+        /// once `run_fixed_unit` dropped its own: a fresh load through a new
+        /// connection reads an empty InvocationID. Polled briefly, since PID 1
+        /// collects from its queue after the `UnrefUnit` reply.
+        fn assert_selftest_unreferenced(what: &str) {
+            let observer = Systemd::connect().unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let path: OwnedObjectPath = observer.manager().unwrap().call("LoadUnit", &(ISOLATION_SELFTEST_UNIT,)).unwrap();
+                let unit = Proxy::new(&observer.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").unwrap();
+                let invocation: Vec<u8> = unit.get_property("InvocationID").unwrap();
+                if invocation.is_empty() { return; }
+                assert!(Instant::now() < until, "{what}: InvocationID {invocation:02x?} still loaded: run_fixed_unit did not release its reference");
+                drop(unit);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        /// R7a on a real host: the production fixed-unit path (installed file
+        /// bytes, PID 1 load state, effective properties, `StartUnit`, outcome
+        /// of this invocation) starts the installed self-test unit through PID 1
+        /// and it passes, twice in a row on one connection: the second start of
+        /// the finished oneshot is told apart from the first by its own
+        /// InvocationID and `ExecStart` record, never adopting the first result.
+        #[test]
+        #[ignore = "iso_root_: root disposable systemd Linux VM (DUDUCLAW_ISO_DISPOSABLE=1) with this branch's duduclaw-isolation-selftest.service, duduclaw-tcb.slice and /usr/lib/duduclaw/duduclaw-run-selftest installed, no active B1 daemon; --test-threads=1"]
+        fn iso_root_fixed_unit_selftest_runs_through_pid1() {
+            assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"), "disposable host only");
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            require_installed_selftest_unit();
+            let systemd = Systemd::connect().unwrap();
+            let first = assert_selftest_passes(&systemd, "first start");
+            assert_selftest_unreferenced("after the first start");
+            let second = assert_selftest_passes(&systemd, "second start");
+            assert_selftest_unreferenced("after the second start");
+            assert_ne!(first.invocation, second.invocation, "the second start adopted the first invocation: {first:?} / {second:?}");
+            assert!(second.recorded[0].start_monotonic_us > first.recorded[0].start_monotonic_us,
+                "the second outcome is not recorded by the second start: {first:?} / {second:?}");
+        }
+
+        /// A second connection holding its own reference on the fixed unit, so
+        /// PID 1 keeps it loaded between `run_fixed_unit` calls (unreferenced,
+        /// the inactive oneshot is collected together with its InvocationID and
+        /// `ExecStart` record, and a touched file is simply loaded afresh). PID 1
+        /// drops the reference with the connection.
+        struct SelftestObserver { systemd: Systemd, path: OwnedObjectPath }
+        impl SelftestObserver {
+            fn new() -> Self {
+                let systemd = Systemd::connect().unwrap();
+                let path: OwnedObjectPath = systemd.manager().unwrap().call("LoadUnit", &(ISOLATION_SELFTEST_UNIT,)).unwrap();
+                Proxy::new(&systemd.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").unwrap()
+                    .call::<_, _, ()>("Ref", &()).unwrap();
+                Self { systemd, path }
+            }
+            fn proxy(&self, interface: &'static str) -> Proxy<'_> {
+                Proxy::new(&self.systemd.connection, BUS, self.path.as_str(), interface).unwrap()
+            }
+            fn need_daemon_reload(&self) -> bool {
+                self.proxy("org.freedesktop.systemd1.Unit").get_property("NeedDaemonReload").unwrap()
+            }
+            fn drop_in_paths(&self) -> Vec<String> {
+                self.proxy("org.freedesktop.systemd1.Unit").get_property("DropInPaths").unwrap()
+            }
+            /// InvocationID, ActiveState and `ExecStart`'s last start times: a
+            /// start changes the first and the last.
+            fn invocation(&self) -> (Vec<u8>, String, Vec<u64>) {
+                let unit = self.proxy("org.freedesktop.systemd1.Unit");
+                let service = self.proxy("org.freedesktop.systemd1.Service");
+                let starts = FixedUnitProperties::exec_start(&service).unwrap().into_iter()
+                    .map(|entry| ExecCommand::from(entry).start_monotonic_us).collect();
+                (unit.get_property("InvocationID").unwrap(), unit.get_property("ActiveState").unwrap(), starts)
+            }
+            /// `run_fixed_unit` refuses (InvalidData, before any start) and the
+            /// unit was not started: same invocation and record, still inactive.
+            fn assert_refused(&self, systemd: &Systemd, what: &str) {
+                let before = self.invocation();
+                let deadline = Duration::from_millis(crate::selftest::UNIT_DEADLINE_MS);
+                let result = systemd.run_fixed_unit(ISOLATION_SELFTEST_UNIT, deadline);
+                let error = match result {
+                    Ok(outcome) => panic!("{what}: run_fixed_unit started the unit: {outcome:?}"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{what}: {error} ({error:?})");
+                let after = self.invocation();
+                assert_eq!(after, before, "{what}: refused ({error}) but PID 1 shows a new invocation");
+                assert_eq!(after.1, "inactive", "{what}");
+                assert!(systemd.references.lock().unwrap().units.is_empty(), "{what}: run_fixed_unit kept its reference");
+            }
+        }
+        /// Puts the host back however `iso_root_fixed_unit_refuses_drop_in_and_modified_file`
+        /// ends: removes the test drop-in and the directory the test created,
+        /// restores the unit file's mtime, reloads PID 1. The unit file's
+        /// content is never written.
+        struct SelftestUnitRestore { modified: std::time::SystemTime }
+        impl Drop for SelftestUnitRestore {
+            fn drop(&mut self) {
+                let directory = Path::new(SELFTEST_DROP_IN_DIRECTORY);
+                for (what, removed) in [("drop-in", std::fs::remove_file(directory.join(SELFTEST_DROP_IN))),
+                    ("drop-in directory", std::fs::remove_dir(directory))] {
+                    if let Err(error) = removed.or_else(|error| if error.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(error) }) {
+                        eprintln!("restore: removing the test {what} under {}: {error}", directory.display());
+                    }
+                }
+                if let Err(error) = std::fs::File::open(selftest_unit_path()).and_then(|file| file.set_modified(self.modified)) {
+                    eprintln!("restore: unit file mtime: {error}");
+                }
+                if let Err(error) = daemon_reload() { eprintln!("restore: {error}"); }
+            }
+        }
+
+        /// R7a on a real host: PID 1's own view refuses before any start (a)
+        /// a drop-in (after daemon-reload: `DropInPaths`) and (b) an installed
+        /// file newer than PID 1's load (`NeedDaemonReload`, keyed on the
+        /// fragment's mtime; only visible while the unit stays loaded, hence the
+        /// observer's reference), and passes again once each is undone and
+        /// PID 1 reloaded.
+        #[test]
+        #[ignore = "iso_root_: root disposable systemd Linux VM (DUDUCLAW_ISO_DISPOSABLE=1) with this branch's duduclaw-isolation-selftest.service, duduclaw-tcb.slice and /usr/lib/duduclaw/duduclaw-run-selftest installed, no drop-in for it, no active B1 daemon; daemon-reloads PID 1; --test-threads=1"]
+        fn iso_root_fixed_unit_refuses_drop_in_and_modified_file() {
+            assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"), "disposable host only");
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            require_installed_selftest_unit();
+            let directory = Path::new(SELFTEST_DROP_IN_DIRECTORY);
+            assert!(std::fs::symlink_metadata(directory).is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                "{} exists: remove it and `systemctl daemon-reload` first", directory.display());
+            let unit_path = selftest_unit_path();
+            let original = std::fs::metadata(&unit_path).unwrap().modified().unwrap();
+            let restore = SelftestUnitRestore { modified: original };
+            let systemd = Systemd::connect().unwrap();
+            let observer = SelftestObserver::new();
+            assert!(!observer.need_daemon_reload(), "PID 1 has a pending reload before the test: run `systemctl daemon-reload`");
+            assert!(observer.drop_in_paths().is_empty());
+            assert_selftest_passes(&systemd, "before any change");
+
+            // (a) A harmless drop-in, loaded by daemon-reload.
+            std::fs::create_dir(directory).unwrap();
+            let drop_in = directory.join(SELFTEST_DROP_IN);
+            std::fs::write(&drop_in, "[Service]\nTimeoutStartSec=31\n").unwrap();
+            daemon_reload().unwrap();
+            assert_eq!(observer.drop_in_paths(), [drop_in.to_str().unwrap()], "PID 1 did not load the test drop-in");
+            observer.assert_refused(&systemd, "drop-in loaded");
+            std::fs::remove_file(&drop_in).unwrap();
+            std::fs::remove_dir(directory).unwrap();
+            daemon_reload().unwrap();
+            assert!(observer.drop_in_paths().is_empty());
+            assert_selftest_passes(&systemd, "drop-in removed and reloaded");
+
+            // (b) Same bytes, newer mtime: PID 1 reports a pending daemon-reload.
+            std::fs::File::open(&unit_path).unwrap().set_modified(original + Duration::from_secs(2)).unwrap();
+            assert!(observer.need_daemon_reload(), "PID 1 does not key NeedDaemonReload on the unit file's mtime");
+            observer.assert_refused(&systemd, "unit file touched, no daemon-reload");
+            daemon_reload().unwrap();
+            assert!(!observer.need_daemon_reload());
+            assert_selftest_passes(&systemd, "touched and reloaded");
+            assert!(fixed_unit_file_valid(&std::fs::read(&unit_path).unwrap()), "the unit file's content changed");
+            drop(observer);
+            drop(systemd);
+            drop(restore);
+        }
     }
 }
 
@@ -1675,6 +2169,313 @@ mod tests {
     fn timeouts() -> RunTimeouts {
         RunTimeouts { queue_ms: 30000, startup_ms: 5000, runtime_ms: 60000,
             pty_idle_ms: Some(30000), termination_grace_ms: 5000 }
+    }
+    fn selftest_load() -> FixedUnitLoad {
+        FixedUnitLoad { id: "duduclaw-isolation-selftest.service".into(), load_state: "loaded".into(),
+            fragment_path: "/etc/systemd/system/duduclaw-isolation-selftest.service".into(),
+            drop_in_paths: vec![], need_daemon_reload: false, transient: false }
+    }
+    /// R7a: the fixed unit is started only when PID 1 loads exactly the
+    /// installed file; every deviation refuses before StartUnit.
+    #[test]
+    fn selftest_fixed_unit_readback_refuses_any_other_source() {
+        use duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT;
+        let good = selftest_load();
+        assert!(fixed_unit_load_valid(ISOLATION_SELFTEST_UNIT, &good));
+        // Only the allow-listed name, even when everything else matches.
+        let mut other = good.clone(); other.id = "duduclaw-spawnd.service".into();
+        other.fragment_path = "/etc/systemd/system/duduclaw-spawnd.service".into();
+        assert!(!fixed_unit_load_valid("duduclaw-spawnd.service", &other));
+        assert!(parse_run_unit(ISOLATION_SELFTEST_UNIT).is_none());
+        let cases: [fn(&mut FixedUnitLoad); 8] = [
+            |l| l.fragment_path = "/run/systemd/system/duduclaw-isolation-selftest.service".into(),
+            |l| l.fragment_path = "/usr/lib/systemd/system/duduclaw-isolation-selftest.service".into(),
+            |l| l.fragment_path = String::new(),
+            |l| l.drop_in_paths = vec!["/etc/systemd/system/duduclaw-isolation-selftest.service.d/x.conf".into()],
+            |l| l.need_daemon_reload = true,
+            |l| l.transient = true,
+            |l| l.load_state = "not-found".into(),
+            |l| l.id = "duduclaw-isolation-ready.service".into(),
+        ];
+        for (index, change) in cases.iter().enumerate() {
+            let mut load = selftest_load();
+            change(&mut load);
+            assert!(!fixed_unit_load_valid(ISOLATION_SELFTEST_UNIT, &load), "case {index}");
+        }
+    }
+    #[test]
+    fn selftest_fixed_unit_finishes_only_on_a_new_invocation_and_passes_only_on_exit_zero() {
+        let old = [7u8; 16];
+        let new = [9u8; 16];
+        assert!(fixed_unit_finished(&old, &new, "inactive"));
+        assert!(fixed_unit_finished(&[], &new, "failed"));
+        // The previous invocation's result is never adopted.
+        assert!(!fixed_unit_finished(&old, &old, "inactive"));
+        for state in ["active", "activating", "deactivating", "reloading", ""] {
+            assert!(!fixed_unit_finished(&old, &new, state), "{state}");
+        }
+        assert!(!fixed_unit_finished(&old, &[0; 16], "inactive"));
+        assert!(!fixed_unit_finished(&old, &[9; 15], "inactive"));
+        let pass = selftest_outcome();
+        assert!(pass.passed());
+        for outcome in [FixedUnitOutcome { exec_main_status: 22, ..pass.clone() },
+            FixedUnitOutcome { result: "signal".into(), ..pass.clone() },
+            FixedUnitOutcome { result: "exit-code".into(), ..pass.clone() },
+            FixedUnitOutcome { result: "timeout".into(), ..pass.clone() },
+            // Not exited (CLD_KILLED, CLD_DUMPED) or no main process recorded.
+            FixedUnitOutcome { exec_main_code: 2, ..pass.clone() },
+            FixedUnitOutcome { exec_main_code: 3, ..pass.clone() },
+            FixedUnitOutcome { exec_main_code: 0, ..pass.clone() }] {
+            assert!(!outcome.passed(), "{outcome:?}");
+        }
+    }
+    fn selftest_command() -> ExecCommand {
+        ExecCommand { path: SELFTEST_EXECUTABLE.into(), argv: vec![SELFTEST_EXECUTABLE.into()], ignore_failure: false,
+            start_monotonic_us: 2_000, exit_monotonic_us: 3_000, pid: 4242, code: 1, status: 0 }
+    }
+    fn selftest_outcome() -> FixedUnitOutcome {
+        FixedUnitOutcome { result: "success".into(), exec_main_code: 1, exec_main_status: 0, exec_main_pid: 4242,
+            invocation: vec![9; 16], previous_invocation: vec![7; 16], active_state: "inactive".into(),
+            recorded: vec![selftest_command()], previous_start_us: 1_000 }
+    }
+    /// R7a item 1b: the outcome counts only when `ExecStart`'s own record of
+    /// this start names the pinned binary, agrees with `ExecMainPID`, records
+    /// an exit with status 0, and was started and exited by this start.
+    #[test]
+    fn selftest_fixed_unit_outcome_is_bound_to_the_exec_start_record_of_this_start() {
+        let pass = selftest_outcome();
+        assert!(pass.recorded_by_this_start() && pass.passed());
+        let cases: [fn(&mut FixedUnitOutcome); 13] = [
+            |o| o.recorded[0].path = "/bin/true".into(),
+            |o| o.recorded[0].argv = vec!["/bin/true".into()],
+            |o| o.recorded[0].ignore_failure = true,
+            |o| o.recorded[0].status = 1,
+            // The record is the previous execution's, not this start's.
+            |o| o.recorded[0].start_monotonic_us = o.previous_start_us,
+            |o| o.recorded.clear(),
+            |o| { let extra = o.recorded[0].clone(); o.recorded.push(extra); },
+            // Record and ExecMain* must describe the same process and exit.
+            |o| o.recorded[0].pid += 1,
+            |o| o.exec_main_pid += 1,
+            |o| o.recorded[0].code = 2,
+            |o| o.recorded[0].code = 0,
+            |o| o.recorded[0].exit_monotonic_us = 0,
+            |o| o.recorded[0].exit_monotonic_us = o.recorded[0].start_monotonic_us - 1,
+        ];
+        for (index, change) in cases.iter().enumerate() {
+            let mut outcome = selftest_outcome();
+            change(&mut outcome);
+            assert!(!outcome.passed(), "case {index}");
+        }
+        // A never-run unit's record starts at 0, so any real start is later.
+        assert!(FixedUnitOutcome { previous_start_us: 0, ..pass }.passed());
+    }
+    /// 32 lowercase hex digits as PID 1 prints an InvocationID.
+    fn invocation_id(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len(), 32);
+        (0..16).map(|index| u8::from_str_radix(&hex[2 * index..2 * index + 2], 16).unwrap()).collect()
+    }
+    /// The two passing starts measured over D-Bus on systemd 255 while the
+    /// unit was referenced (`Unit.Ref`), the second read before it as the
+    /// first's state.
+    fn measured_outcomes() -> [FixedUnitOutcome; 2] {
+        let command = |start_monotonic_us, exit_monotonic_us, pid| ExecCommand {
+            start_monotonic_us, exit_monotonic_us, pid, code: 1, status: 0, ..selftest_command() };
+        let first = invocation_id("09ce588d7be3404c96d0a5a8527c8322");
+        let second = invocation_id("3d8524f487654ddd88252a8ee61a7b10");
+        [FixedUnitOutcome { result: "success".into(), exec_main_code: 1, exec_main_status: 0, exec_main_pid: 2710,
+            invocation: first.clone(), previous_invocation: vec![], active_state: "inactive".into(),
+            recorded: vec![command(1399861163, 1399905728, 2710)], previous_start_us: 0 },
+         FixedUnitOutcome { result: "success".into(), exec_main_code: 1, exec_main_status: 0, exec_main_pid: 2717,
+            invocation: second, previous_invocation: first, active_state: "inactive".into(),
+            recorded: vec![command(1400862120, 1400904636, 2717)], previous_start_us: 1399861163 }]
+    }
+    /// R7a on systemd 255 with the unit referenced: a passing start reports a
+    /// new InvocationID, `Result=success`, `ExecMainCode=1 ExecMainStatus=0`,
+    /// its `ExecMainPID`, and an `ExecStart` record of the same process. The
+    /// measured values pass; every single deviation fails, including the
+    /// all-zero reading of an unreferenced (collected) unit.
+    #[test]
+    fn selftest_fixed_unit_passes_only_on_exited_zero_of_this_invocation_with_matching_record() {
+        const NOT_NEW: &str = "InvocationID not a new finished invocation";
+        for measured in measured_outcomes() {
+            assert_eq!(measured.failure(), None, "{measured:?}");
+            assert!(measured.passed());
+            let cases: [(&str, fn(&mut FixedUnitOutcome)); 18] = [
+                ("ExecMainCode", |o: &mut FixedUnitOutcome|o.exec_main_code = 0),
+                ("ExecMainCode", |o: &mut FixedUnitOutcome|o.exec_main_code = 2),
+                ("ExecMainPID", |o: &mut FixedUnitOutcome|{ o.exec_main_pid = 0; o.recorded[0].pid = 0; }),
+                ("ExecStart record", |o: &mut FixedUnitOutcome|o.exec_main_pid += 1),
+                ("ExecStart record", |o: &mut FixedUnitOutcome|o.recorded[0].pid += 1),
+                ("ExecMainStatus", |o: &mut FixedUnitOutcome|o.exec_main_status = 1),
+                ("ExecStart record", |o: &mut FixedUnitOutcome|o.recorded[0].status = 1),
+                ("ExecStart record", |o: &mut FixedUnitOutcome|{ o.recorded[0].code = 2; o.recorded[0].status = 9; }),
+                ("Result", |o: &mut FixedUnitOutcome|o.result = "exit-code".into()),
+                ("Result", |o: &mut FixedUnitOutcome|o.result = "Success".into()),
+                (NOT_NEW, |o: &mut FixedUnitOutcome|o.invocation = o.previous_invocation.clone()),
+                (NOT_NEW, |o: &mut FixedUnitOutcome|o.invocation = vec![]),
+                (NOT_NEW, |o: &mut FixedUnitOutcome|o.invocation = vec![0; 16]),
+                ("ExecStart record", |o: &mut FixedUnitOutcome|o.recorded[0].start_monotonic_us = o.previous_start_us),
+                ("ExecStart record", |o: &mut FixedUnitOutcome|o.recorded[0].exit_monotonic_us = 0),
+                ("ExecStart record", |o: &mut FixedUnitOutcome|o.recorded[0].exit_monotonic_us = o.recorded[0].start_monotonic_us - 1),
+                ("ActiveState", |o: &mut FixedUnitOutcome|o.active_state = "failed".into()),
+                (NOT_NEW, |o: &mut FixedUnitOutcome|o.active_state = "active".into()),
+            ];
+            for (expected, change) in cases {
+                let mut outcome = measured.clone();
+                change(&mut outcome);
+                assert!(!outcome.passed(), "{outcome:?}");
+                assert_eq!(outcome.failure(), Some(expected), "{outcome:?}");
+            }
+            for result in ["signal", "core-dump", "timeout", "oom-kill", "watchdog", "start-limit-hit",
+                "resources", "protocol", "", "success "] {
+                assert_eq!(FixedUnitOutcome { result: result.into(), ..measured.clone() }.failure(), Some("Result"));
+            }
+        }
+        // FACT 1: the unreferenced unit after a passing run (collected, every field 0).
+        let [first, _] = measured_outcomes();
+        let mut collected = FixedUnitOutcome { exec_main_code: 0, exec_main_pid: 0, invocation: vec![], ..first };
+        collected.recorded[0] = ExecCommand { start_monotonic_us: 0, exit_monotonic_us: 0, pid: 0, code: 0, status: 0,
+            ..selftest_command() };
+        assert!(!collected.passed(), "{collected:?}");
+    }
+    /// R7a item 1a: only the exact shipped bytes are a valid installed unit file.
+    #[test]
+    fn selftest_fixed_unit_file_must_be_the_shipped_bytes() {
+        let shipped = ISOLATION_SELFTEST_UNIT_TEXT;
+        assert!(fixed_unit_file_valid(shipped.as_bytes()));
+        assert!(shipped.len() < MAX_FIXED_UNIT_BYTES);
+        assert!(shipped.lines().any(|line| line == format!("ExecStart={SELFTEST_EXECUTABLE}")));
+        assert!(shipped.lines().any(|line| line == format!("Slice={TCB_SLICE}")));
+        for installed in [shipped.replace(&format!("ExecStart={SELFTEST_EXECUTABLE}"), "ExecStart=/bin/true"),
+            shipped.replace("NoNewPrivileges=yes", "NoNewPrivileges=no"),
+            format!("{shipped}\n"), format!("{shipped}ExecStartPre=/bin/true\n"),
+            shipped[..shipped.len() - 1].to_owned(), shipped.replace('\n', "\r\n"), String::new()] {
+            assert!(!fixed_unit_file_valid(installed.as_bytes()), "{installed:?}");
+        }
+    }
+    /// A scripted PID 1 Service interface; `unreadable` names a property whose read fails.
+    #[derive(Clone)]
+    struct FakeUnit {
+        exec_start: Vec<ExecStartEntry>, user: String, group: String, no_new_privileges: bool,
+        restrict_suid_sgid: bool, capabilities: u64, ambient: u64,
+        namespaces: u64, slice: String, kind: String, unreadable: Option<&'static str>,
+    }
+    impl FakeUnit {
+        fn read<T>(&self, name: &str, value: T) -> io::Result<T> {
+            if self.unreadable == Some(name) { return Err(io::ErrorKind::InvalidData.into()); }
+            Ok(value)
+        }
+    }
+    impl FixedUnitProperties for FakeUnit {
+        fn exec_start(&self) -> io::Result<Vec<ExecStartEntry>> { self.read("ExecStart", self.exec_start.clone()) }
+        fn text(&self, name: &'static str) -> io::Result<String> {
+            let value = match name { "User" => &self.user, "Group" => &self.group, "Slice" => &self.slice,
+                "Type" => &self.kind, _ => return Err(invalid()) };
+            self.read(name, value.clone())
+        }
+        fn flag(&self, name: &'static str) -> io::Result<bool> {
+            let value = match name { "NoNewPrivileges" => self.no_new_privileges,
+                "RestrictSUIDSGID" => self.restrict_suid_sgid, _ => return Err(invalid()) };
+            self.read(name, value)
+        }
+        fn mask(&self, name: &'static str) -> io::Result<u64> {
+            let value = match name { "CapabilityBoundingSet" => self.capabilities, "AmbientCapabilities" => self.ambient,
+                "RestrictNamespaces" => self.namespaces, _ => return Err(invalid()) };
+            self.read(name, value)
+        }
+    }
+    fn exec(path: &str, argv: &[&str]) -> ExecStartEntry {
+        (path.into(), argv.iter().map(|arg| (*arg).to_owned()).collect(), false, 0, 0, 0, 0, 0, 0, 0)
+    }
+    /// PID 1's view of the shipped unit: no `User=`/`Group=` (both read back
+    /// empty, root by default) and no `RestrictSUIDSGID=` (false).
+    fn selftest_unit() -> FakeUnit {
+        FakeUnit { exec_start: vec![exec(SELFTEST_EXECUTABLE, &[SELFTEST_EXECUTABLE])], user: String::new(),
+            group: String::new(), no_new_privileges: true, restrict_suid_sgid: false,
+            capabilities: TRAMPOLINE_CAPABILITIES, ambient: 0, namespaces: TRAMPOLINE_NAMESPACES,
+            slice: TCB_SLICE.into(), kind: "oneshot".into(), unreadable: None }
+    }
+    /// R7a item 1b: PID 1's effective configuration of the fixed unit must be
+    /// exactly the pinned one; any deviation or unreadable property refuses.
+    #[test]
+    fn selftest_fixed_unit_effective_properties_refuse_any_deviation() {
+        let good = selftest_unit();
+        let command = checked_fixed_unit_effective(&good).unwrap();
+        assert_eq!((command.path.as_str(), command.argv.as_slice()), (SELFTEST_EXECUTABLE, [SELFTEST_EXECUTABLE.to_owned()].as_slice()));
+        let cases: [fn(&mut FakeUnit); 23] = [
+            // R7g: an explicit identity (even root) or RestrictSUIDSGID refuses.
+            |u| u.user = "root".into(),
+            |u| u.group = "root".into(),
+            |u| u.group = "0".into(),
+            |u| u.restrict_suid_sgid = true,
+            |u| u.ambient = 1 << 7,
+            |u| u.capabilities = TRAMPOLINE_CAPABILITIES & !(1 << 7),
+            |u| u.exec_start = vec![exec("/bin/true", &["/bin/true"])],
+            |u| u.exec_start = vec![exec("/bin/true", &[SELFTEST_EXECUTABLE])],
+            |u| u.exec_start = vec![exec(SELFTEST_EXECUTABLE, &["/bin/true"])],
+            |u| u.exec_start = vec![exec(SELFTEST_EXECUTABLE, &[SELFTEST_EXECUTABLE, "--skip"])],
+            |u| u.exec_start = vec![exec(SELFTEST_EXECUTABLE, &[])],
+            |u| u.exec_start = vec![exec(SELFTEST_EXECUTABLE, &[SELFTEST_EXECUTABLE]), exec(SELFTEST_EXECUTABLE, &[SELFTEST_EXECUTABLE])],
+            |u| u.exec_start = vec![exec(SELFTEST_EXECUTABLE, &[SELFTEST_EXECUTABLE]), exec("/bin/true", &["/bin/true"])],
+            |u| u.exec_start = vec![],
+            |u| u.exec_start[0].2 = true,
+            |u| u.user = "nobody".into(),
+            |u| u.user = "0".into(),
+            |u| u.no_new_privileges = false,
+            |u| u.capabilities = TRAMPOLINE_CAPABILITIES | (1 << 1),
+            |u| u.capabilities = u64::MAX,
+            |u| u.namespaces = TRAMPOLINE_NAMESPACES | 0x1000_0000,
+            |u| u.slice = "system.slice".into(),
+            |u| u.kind = "simple".into(),
+        ];
+        for (index, change) in cases.iter().enumerate() {
+            let mut unit = selftest_unit();
+            change(&mut unit);
+            assert!(checked_fixed_unit_effective(&unit).is_err(), "case {index}");
+        }
+        for name in ["ExecStart", "User", "Group", "NoNewPrivileges", "RestrictSUIDSGID", "CapabilityBoundingSet",
+            "AmbientCapabilities", "RestrictNamespaces", "Slice", "Type"] {
+            let unit = FakeUnit { unreadable: Some(name), ..selftest_unit() };
+            assert!(checked_fixed_unit_effective(&unit).is_err(), "{name}");
+        }
+    }
+    /// R7g: the fixed unit's privilege readback is the run units' (same keys,
+    /// same values as `UnitPolicy::new` / `RUN_UNIT_DEFAULTED`), and every
+    /// mismatch is named in one refusal.
+    #[test]
+    fn selftest_fixed_unit_readback_is_the_run_unit_privilege_policy_and_names_mismatches() {
+        let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &limits(), &timeouts(), 8, 1).unwrap();
+        let run: BTreeMap<&str, &Property> = policy.readback().collect();
+        let fixed: BTreeMap<&str, Property> = fixed_unit_readback().into_iter().collect();
+        assert_eq!(fixed.len(), fixed_unit_readback().len(), "no key twice");
+        for key in ["NoNewPrivileges", "CapabilityBoundingSet", "AmbientCapabilities", "RestrictNamespaces",
+            "User", "Group", "RestrictSUIDSGID"] {
+            assert_eq!(&fixed[key], run[key], "{key}");
+        }
+        for (key, value) in RUN_UNIT_DEFAULTED.iter() { assert_eq!(&fixed[key], value, "{key}"); }
+        // Only Slice and Type are the fixed unit's own.
+        assert_eq!(fixed["Slice"], Property::Text(TCB_SLICE.into()));
+        assert_eq!(fixed["Type"], Property::Text("oneshot".into()));
+        assert_eq!(fixed.len(), 9);
+        // One mismatch: named with its key and actual value.
+        let error = checked_fixed_unit_effective(&FakeUnit { user: "root".into(), ..selftest_unit() }).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().starts_with("invalid unit policy: fixed unit readback User: actual value "), "{error}");
+        assert!(error.to_string().contains("root"), "{error}");
+        // Several: all named in readback order, one prefix.
+        let unit = FakeUnit { exec_start: vec![exec("/bin/true", &["/bin/true"])], group: "root".into(),
+            restrict_suid_sgid: true, ..selftest_unit() };
+        let message = checked_fixed_unit_effective(&unit).unwrap_err().to_string();
+        assert_eq!(message.matches("invalid unit policy: ").count(), 1, "{message}");
+        let keys: Vec<&str> = message.strip_prefix("invalid unit policy: ").unwrap().split("; ")
+            .map(|entry| entry.strip_prefix("fixed unit readback ").expect(&message).split(':').next().unwrap()).collect();
+        assert_eq!(keys, ["ExecStart", "Group", "RestrictSUIDSGID"], "{message}");
+        // The rendering is bounded and single-line.
+        let message = checked_fixed_unit_effective(&FakeUnit { slice: "x\n".repeat(500), ..selftest_unit() })
+            .unwrap_err().to_string();
+        assert!(!message.chars().any(char::is_control), "{message}");
+        assert!(message.len() <= "invalid unit policy: fixed unit readback Slice: actual value ".len() + 203, "{message}");
     }
     #[test]
     fn run_unit_parser_accepts_only_exact_canonical_names() {

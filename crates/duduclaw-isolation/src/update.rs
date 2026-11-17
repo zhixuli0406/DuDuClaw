@@ -29,6 +29,7 @@ pub const ISOLATION_FACTS: &[&str] = &[
     "/etc/systemd/system/duduclaw-spawnd.socket",
     "/etc/systemd/system/duduclaw-spawnd.service",
     "/etc/systemd/system/duduclaw-isolation-ready.service",
+    "/etc/systemd/system/duduclaw-isolation-selftest.service",
     "/etc/systemd/system/duduclaw-employees.slice",
     "/etc/systemd/system/duduclaw-egress.socket",
     "/etc/systemd/system/duduclaw-egress.service",
@@ -61,6 +62,7 @@ pub const ISOLATION_FACTS: &[&str] = &[
     "/etc/duduclaw/migration-import.json",
     "/usr/lib/duduclaw/duduclaw-spawnd",
     "/usr/lib/duduclaw/duduclaw-run",
+    "/usr/lib/duduclaw/duduclaw-run-selftest",
     "/opt/duduclaw/bin/duduclaw-egress",
     "/usr/libexec/duduclaw/duduclaw-parse-worker",
     "/usr/lib/duduclaw/current/duduclaw-import",
@@ -124,6 +126,9 @@ pub enum InstallTarget {
     Gateway,
     Spawnd,
     Trampoline,
+    /// R7a: `duduclaw-run-selftest`, the isolation self-test of the trampoline
+    /// library, installed next to the trampoline (`/usr/lib/duduclaw`).
+    TrampolineSelftest,
     Egress,
     EgressForwarder,
     McpBridge,

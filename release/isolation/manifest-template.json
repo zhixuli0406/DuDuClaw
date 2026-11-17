@@ -19,6 +19,7 @@
     {"id": "duduclaw", "mode": 493, "install_target": {"kind": "gateway"}},
     {"id": "duduclaw-spawnd", "mode": 493, "install_target": {"kind": "spawnd"}},
     {"id": "duduclaw-run", "mode": 493, "install_target": {"kind": "trampoline"}},
+    {"id": "duduclaw-run-selftest", "mode": 493, "install_target": {"kind": "trampoline_selftest"}},
     {"id": "duduclaw-egress", "mode": 493, "install_target": {"kind": "egress"}},
     {"id": "duduclaw-egress-forwarder", "mode": 493, "install_target": {"kind": "egress_forwarder"}},
     {"id": "duduclaw-mcp-bridge", "mode": 493, "install_target": {"kind": "mcp_bridge"}},

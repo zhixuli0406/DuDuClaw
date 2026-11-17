@@ -67,7 +67,7 @@ ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice
 # R6 update Apply (update.sock, root peers only) republishes the verified
 # generation's root components at these fixed paths: file.next + fsync + rename.
 # Atomic replacement creates file.next in, and renames within, each directory, so
-# the whole directory must be writable (broader than the eight fixed files).
+# the whole directory must be writable (broader than the nine fixed files).
 # Narrowing this needs a separate narrow publisher helper (known residual, R6).
 ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin
 ProtectHome=yes

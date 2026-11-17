@@ -59,7 +59,7 @@ The daemon also binds the root-only update control socket
 `Apply` republishes the verified generation's root components, so the unit adds
 `ReadWritePaths=-/usr/lib/duduclaw -/usr/libexec/duduclaw -/opt/duduclaw/bin`:
 atomic replacement creates `<name>.next` inside each directory and renames it,
-which needs directory write access, broader than the eight fixed files. Narrowing
+which needs directory write access, broader than the nine fixed files. Narrowing
 it needs a separate narrow publisher helper (known residual, plan R6).
 The drain barrier is kept in `/var/lib/duduclaw-spawnd/drain.json` across restarts.
 
@@ -130,6 +130,24 @@ isolated-install gateway unit (written by the installer package, R3) must carry
 `duduclaw_isolation::ids::ISOLATED_GATEWAY_UNIT_DEPENDENCIES` (the two
 `BindsTo=`/`After=` lines). The single-binary gateway unit
 (`duduclaw_core::root_key_recovery_unit`) does not (no spawnd on those hosts).
+
+`duduclaw-isolation-selftest.service` (R7a; oneshot, `RemainAfterExit=no`, no
+`[Install]`) runs `/usr/lib/duduclaw/duduclaw-run-selftest` as root in
+`duduclaw-tcb.slice` with exactly the trampoline's `CapabilityBoundingSet=` and
+`RestrictNamespaces=` (pinned against `TRAMPOLINE_CAPABILITIES` /
+`TRAMPOLINE_NAMESPACES` by spawnd's unit-file test), `TimeoutStartSec=30` and
+stdout/stderr to the journal. Root is the default identity: like run units it
+sets neither `User=`/`Group=` nor `RestrictSUIDSGID=` (R7g; an explicit
+`User=root` loses `CAP_SETUID`, `RestrictSUIDSGID=` makes `openat2` ENOSYS), and
+spawnd reads back `User=""`, `Group=""`, `RestrictSUIDSGID=no` before starting
+it. Every other sandbox directive it shares with run units has
+`UnitPolicy::new`'s value; the deliberate differences are listed in the unit
+file. Only spawnd starts it (by name, through PID 1),
+after its start-up recovery, and only while PID 1 loads it from
+`/etc/systemd/system/` without drop-ins. Its name is not of the run-unit shape,
+so no run inventory counts it.
+The protected installer installs this unit at `/etc/systemd/system/` (root:root 0644, exactly these bytes) before spawnd starts, and never enables or starts it.
+The protected installer creates the `duduclaw-selftest` system account (no login, no home, own group, no supplementary groups) before spawnd starts.
 
 The native Linux service lifecycle and D-Bus fd handoff require root VM testing
 on systemd 249, 252 and 255. No installation or activation has been performed by

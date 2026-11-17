@@ -1024,10 +1024,137 @@ const SPAWND_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/
 const READY_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-ready.service");
 const EGRESS_UNIT: &str = include_str!("../../duduclaw-egress/systemd/duduclaw-egress.service");
 const UPDATED_UNIT: &str = include_str!("../../../scripts/linux-protected/updated/duduclaw-updated.service");
+const SELFTEST_UNIT: &str = include_str!("../../../scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service");
 const AUTO_UPGRADE_UNIT: &str = include_str!("../../../scripts/linux-protected/auto-upgrade/duduclaw-auto-upgrade.service");
 /// Directive lines (comments and blank lines dropped).
 fn directives(unit: &str) -> Vec<&str> {
     unit.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).collect()
+}
+
+/// R7a: the fixed self-test unit carries exactly the trampoline's capability
+/// bounding set and namespace allowance, never the run-unit name shape, and
+/// nothing that would let it be enabled or started by anything but spawnd.
+/// R7g: no identity and no RestrictSUIDSGID, and every sandbox directive it
+/// shares with run units has exactly the value `UnitPolicy::new` sets.
+#[test]
+fn update_unit_isolation_selftest_matches_the_trampoline_constants() {
+    use crate::systemd::{parse_run_unit, Property, UnitPolicy, RUN_UNIT_DEFAULTED, TRAMPOLINE_CAPABILITIES,
+        TRAMPOLINE_NAMESPACES, FIXED_UNIT_DIRECTORY};
+    use duduclaw_isolation::execution::{DiskQuota, ResourceLimits, RunTimeouts};
+    use duduclaw_isolation::ids::ISOLATION_SELFTEST_UNIT;
+    assert!(parse_run_unit(ISOLATION_SELFTEST_UNIT).is_none());
+    assert_eq!(FIXED_UNIT_DIRECTORY, "/etc/systemd/system");
+    let lines = directives(SELFTEST_UNIT);
+    // The deliberate differences from run units (each explained in the unit).
+    for expected in ["Type=oneshot", "RemainAfterExit=no", "ExecStart=/usr/lib/duduclaw/duduclaw-run-selftest",
+        "Slice=duduclaw-tcb.slice", "TimeoutStartSec=30", "OOMPolicy=stop", "PrivateNetwork=yes",
+        "RestrictAddressFamilies=AF_UNIX AF_NETLINK", "TasksMax=16", "MemoryMax=128M", "LimitNOFILE=1024",
+        "StandardOutput=journal", "StandardError=journal"] {
+        assert!(lines.contains(&expected), "{expected}");
+    }
+    // R7g (systemd 255): an explicit User=root/Group=root loses CAP_SETUID
+    // (self-test stage `capabilities`), RestrictSUIDSGID= makes openat2 ENOSYS
+    // (stage `probe`). Neither is set; spawnd reads back RUN_UNIT_DEFAULTED.
+    let defaulted: Vec<&str> = RUN_UNIT_DEFAULTED.iter().map(|(key, _)| *key).collect();
+    assert_eq!(defaulted, ["User", "Group", "RestrictSUIDSGID"]);
+    for key in defaulted {
+        assert!(!lines.iter().any(|line| line.starts_with(&format!("{key}="))), "{key}");
+    }
+    // The ExecStart is the shipped artifact path of InstallTarget::TrampolineSelftest.
+    let artifact = artifact_name(&InstallTarget::TrampolineSelftest).unwrap();
+    assert!(lines.contains(&format!("ExecStart=/usr/lib/duduclaw/{artifact}").as_str()));
+    fn single<'a>(lines: &[&'a str], key: &str) -> &'a str {
+        let found: Vec<&'a str> = lines.iter().filter_map(|line| line.strip_prefix(key)).collect();
+        assert_eq!(found.len(), 1, "exactly one {key}");
+        found[0]
+    }
+    let value = |key: &str| single(&lines, key);
+    let capability = |name: &str| -> u64 {
+        match name {
+            "CAP_CHOWN" => 1 << 0, "CAP_SETGID" => 1 << 6, "CAP_SETUID" => 1 << 7, "CAP_SETPCAP" => 1 << 8,
+            "CAP_NET_ADMIN" => 1 << 12, "CAP_SYS_ADMIN" => 1 << 21, "CAP_SYS_RESOURCE" => 1 << 24,
+            other => panic!("capability outside the trampoline set: {other}"),
+        }
+    };
+    let bounding = value("CapabilityBoundingSet=").split_whitespace().map(capability).fold(0, |set, bit| set | bit);
+    assert_eq!(bounding, TRAMPOLINE_CAPABILITIES);
+    let namespace = |name: &str| -> u64 {
+        match name {
+            "mnt" => 0x0002_0000, "ipc" => 0x0800_0000, "uts" => 0x0400_0000, "net" => 0x4000_0000,
+            "pid" => 0x2000_0000, other => panic!("namespace outside the trampoline set: {other}"),
+        }
+    };
+    let namespaces = value("RestrictNamespaces=").split_whitespace().map(namespace).fold(0, |set, bit| set | bit);
+    assert_eq!(namespaces, TRAMPOLINE_NAMESPACES);
+    // Every directive shared with run units carries exactly UnitPolicy::new's
+    // value, driven from the policy's own properties. Exempt, with the reason:
+    let exempt: [(&str, &str); 26] = [
+        ("Type", "oneshot: spawnd waits for this one invocation's result"),
+        ("Slice", "a TCB service in duduclaw-tcb.slice, not an employee slice"),
+        ("StandardOutput", "journal: the stage line is the only failure report"),
+        ("StandardError", "journal: the stage line is the only failure report"),
+        ("OOMPolicy", "stop: any OOM kill fails the self-test"),
+        ("RestrictAddressFamilies", "AF_UNIX AF_NETLINK only, under PrivateNetwork=yes (narrower)"),
+        ("TasksMax", "its own fixed ceiling"),
+        ("MemoryMax", "its own fixed ceiling"),
+        ("LimitNOFILE", "its own fixed ceiling (soft = hard, as for run units)"),
+        ("LimitNOFILESoft", "its own fixed ceiling (soft = hard, as for run units)"),
+        ("TimeoutStartUSec", "TimeoutStartSec=30 bounds the whole oneshot run"),
+        ("RuntimeMaxUSec", "per-run timeout; a oneshot is bounded by TimeoutStartSec"),
+        ("TimeoutStopUSec", "per-run termination grace"),
+        ("CPUQuotaPerSecUSec", "per-run CPU ceiling"),
+        ("IOReadBandwidthMax", "per-run IO ceiling on the employee storage device"),
+        ("IOWriteBandwidthMax", "per-run IO ceiling on the employee storage device"),
+        ("IOReadIOPSMax", "per-run IO ceiling on the employee storage device"),
+        ("IOWriteIOPSMax", "per-run IO ceiling on the employee storage device"),
+        ("MemoryAccounting", "follows from its own MemoryMax"),
+        ("TasksAccounting", "follows from its own TasksMax"),
+        ("CPUAccounting", "no CPU ceiling to account"),
+        ("IOAccounting", "no IO ceiling to account"),
+        ("Delegate", "creates no cgroup (run units: spawnd's rt-init/rt-runtime/hx leaves)"),
+        ("DeviceAllow", "builds its root without a pty (run units: per-run devpts)"),
+        ("BindsTo", "nothing pulls it in; spawnd starts it and waits"),
+        ("After", "nothing pulls it in; spawnd starts it and waits"),
+    ];
+    let limits = ResourceLimits { memory_bytes: 1 << 30, cpu_quota_percent: 100, tasks: 128, open_files: 4096, ptys: 16,
+        disk: DiskQuota::LoopFilesystem { bytes: 1024, inodes: 100 },
+        io_read_bytes_per_sec: 1024, io_write_bytes_per_sec: 1024, io_read_ops_per_sec: 100, io_write_ops_per_sec: 100,
+        output_buffer_bytes: 65536, output_total_bytes: 1 << 20, memfd_total_bytes: 64 << 20 };
+    let timeouts = RunTimeouts { queue_ms: 30000, startup_ms: 5000, runtime_ms: 60000, pty_idle_ms: Some(30000),
+        termination_grace_ms: 5000 };
+    let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &limits, &timeouts, 8, 1).unwrap();
+    for (key, _) in exempt { assert!(policy.properties.contains_key(key), "exempt {key} is not a run-unit property"); }
+    let mut compared = 0;
+    for (key, property) in &policy.properties {
+        if exempt.iter().any(|(name, _)| name == key) { continue; }
+        let expected = match (*key, property) {
+            // The same constants, parsed back from the unit's names above.
+            ("CapabilityBoundingSet", Property::U64(mask)) => { assert_eq!(bounding, *mask); compared += 1; continue; }
+            ("RestrictNamespaces", Property::U64(mask)) => { assert_eq!(namespaces, *mask); compared += 1; continue; }
+            ("AmbientCapabilities", Property::U64(0)) => String::new(),
+            ("UMask", Property::U32(mask)) => format!("{mask:04o}"),
+            (_, Property::Bool(true)) => "yes".into(),
+            (_, Property::Text(text)) => text.clone(),
+            (_, Property::U64(number)) => number.to_string(),
+            (_, Property::Strings(entries)) => entries.join(" "),
+            other => panic!("no unit-file rendering for {other:?}"),
+        };
+        // `LimitCORE=` sets the soft and the hard limit to one value.
+        let directive = if *key == "LimitCORESoft" { "LimitCORE" } else { *key };
+        assert_eq!(value(&format!("{directive}=")), expected, "{key}");
+        compared += 1;
+    }
+    assert_eq!(compared + exempt.len(), policy.properties.len());
+    // Its own families are a subset of the run units' allow-list.
+    let Property::AllowStrings(run_families) = &policy.properties["RestrictAddressFamilies"] else { panic!() };
+    assert!(value("RestrictAddressFamilies=").split_whitespace().all(|family| run_families.iter().any(|run| run == family)));
+    // Not enabled by anything, never restarted behind spawnd, never a long-running
+    // or network service; sethostname in its own UTS namespace stays allowed.
+    assert!(!SELFTEST_UNIT.lines().any(|line| line == "[Install]"));
+    assert!(!lines.iter().any(|line| line.starts_with("Restart=") || line.starts_with("ProtectHostname=")
+        || line.starts_with("ReadWritePaths=") || line.contains("AF_INET") || line.starts_with("DynamicUser=")
+        || line.starts_with("Wants=") || line.starts_with("Requires=") || line.starts_with("BindsTo=")
+        || line.starts_with("After=") || line.starts_with("Delegate=") || line.starts_with("DeviceAllow=")));
 }
 
 #[test]
@@ -1035,14 +1162,15 @@ fn update_units_reaching_openat2_set_no_restrict_suid_sgid() {
     // R7g (systemd 255): under RestrictSUIDSGID= systemd's filter answers ENOSYS
     // for every openat2; these units' binaries need openat2's RESOLVE_*
     // guarantees. NoNewPrivileges=yes stays on every one of them.
-    for unit in [SPAWND_UNIT, READY_UNIT, UPDATED_UNIT, AUTO_UPGRADE_UNIT] {
+    for unit in [SPAWND_UNIT, READY_UNIT, UPDATED_UNIT, AUTO_UPGRADE_UNIT, SELFTEST_UNIT] {
         let lines = directives(unit);
         assert!(!lines.iter().any(|line| line.starts_with("RestrictSUIDSGID=")), "{unit}");
         assert!(lines.contains(&"NoNewPrivileges=yes"), "{unit}");
     }
     // The updater binary drops its downloader child to duduclaw-dl (CAP_SETUID):
     // root by default, since an explicit User=root loses CAP_SETUID on systemd 255.
-    for unit in [UPDATED_UNIT, AUTO_UPGRADE_UNIT] {
+    // The self-test needs the run units' CAP_SETUID for the same reason.
+    for unit in [UPDATED_UNIT, AUTO_UPGRADE_UNIT, SELFTEST_UNIT] {
         assert!(!directives(unit).iter().any(|line| line.starts_with("User=") || line.starts_with("Group=")), "{unit}");
     }
     // Egress never calls openat2 (its own filter allows only openat): kept.
@@ -1777,7 +1905,8 @@ fn manifest_with(artifacts: Vec<ReleaseArtifact>) -> ReleaseManifest {
             parse_worker: 1, importer: 1 }, artifacts, migrations: vec![] }
 }
 fn all_targets() -> Vec<InstallTarget> {
-    vec![InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline, InstallTarget::Egress,
+    vec![InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline, InstallTarget::TrampolineSelftest,
+        InstallTarget::Egress,
         InstallTarget::EgressForwarder, InstallTarget::McpBridge, InstallTarget::ParseWorker, InstallTarget::Importer,
         InstallTarget::Migration, InstallTarget::UpdateSlot]
 }
@@ -1793,7 +1922,9 @@ fn fixed_manifest() -> ReleaseManifest {
 fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     let manifest = fixed_manifest();
     let trampoline = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Trampoline).unwrap().sha256;
-    let observed = |own_image, live, euid, trampoline| Observed { own_image, live, euid, trampoline };
+    let selftest = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::TrampolineSelftest).unwrap().sha256;
+    let observed = |own_image, live, euid, trampoline| Observed { own_image, live, euid, trampoline,
+        trampoline_selftest: Some(selftest) };
     let reports = components(&manifest, observed(Some(digest(42)), true, 0, Some(trampoline)));
     assert_eq!(reports.len(), manifest.artifacts.len() - 3);
     assert!(!reports.iter().any(|r| matches!(r.target, InstallTarget::Gateway | InstallTarget::Egress | InstallTarget::UpdateSlot)));
@@ -1822,6 +1953,20 @@ fn update_readback_reports_only_spawnd_side_components_and_never_guesses() {
     assert!(!replaced.ready);
     assert_eq!((replaced.build_sha256, replaced.version), (digest(9), ReleaseVersion { major: 0, minor: 0, patch: 0 }));
     assert!(!find(&components(&manifest, observed(Some(digest(42)), true, 0, None)), InstallTarget::Trampoline).ready);
+    // R7a: the self-test binary is read back by the same rule as the trampoline.
+    let check = find(&reports, InstallTarget::TrampolineSelftest);
+    assert!(check.ready);
+    assert_eq!((check.build_sha256, check.version, check.effective_uid, check.protocol),
+        (selftest, manifest.version, 0, manifest.protocols.trampoline));
+    assert_eq!(check.artifact_id, "duduclaw-run-selftest");
+    let with_selftest = |value| Observed { own_image: Some(digest(42)), live: true, euid: 0, trampoline: Some(trampoline),
+        trampoline_selftest: value };
+    for value in [None, Some(digest(9))] {
+        let reports = components(&manifest, with_selftest(value));
+        assert!(!find(&reports, InstallTarget::TrampolineSelftest).ready);
+        assert!(find(&reports, InstallTarget::Trampoline).ready);
+    }
+    assert!(!find(&unprivileged, InstallTarget::TrampolineSelftest).ready);
 }
 
 #[test]
@@ -1829,7 +1974,8 @@ fn update_publication_matches_the_installed_layout() {
     let published: Vec<String> = publication().iter()
         .map(|(target, directory)| format!("/{directory}/{}", artifact_name(target).unwrap())).collect();
     assert_eq!(published, [
-        "/usr/lib/duduclaw/duduclaw-spawnd", "/usr/lib/duduclaw/duduclaw-run", "/usr/libexec/duduclaw/duduclaw-parse-worker",
+        "/usr/lib/duduclaw/duduclaw-spawnd", "/usr/lib/duduclaw/duduclaw-run", "/usr/lib/duduclaw/duduclaw-run-selftest",
+        "/usr/libexec/duduclaw/duduclaw-parse-worker",
         "/usr/lib/duduclaw/current/duduclaw-import", "/usr/lib/duduclaw/current/duduclaw-migrate",
         "/usr/lib/duduclaw/current/duduclaw-mcp-bridge", "/opt/duduclaw/bin/duduclaw-egress", "/opt/duduclaw/bin/duduclaw"]);
 }

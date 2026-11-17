@@ -1,6 +1,6 @@
 //! Consumers of F's signed policy artifact and root installer's measured receipts.
 //! Neither gateway IPC nor employee files can publish these inputs.
-use std::{ffi::CString, fs::{self, File}, io, os::fd::AsFd, os::unix::fs::MetadataExt, path::Path, sync::{Arc, Mutex}};
+use std::{ffi::CString, fs::{self, File}, io, os::fd::AsFd, path::Path, sync::{Arc, Mutex}};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use duduclaw_isolation::{bounded::Text, egress::ProfileId, execution::{RunHandle, DiskQuota, NetworkPolicy, ResourceLimits, RunTimeouts, RuntimeKind},
@@ -38,7 +38,8 @@ fn live_generation() -> io::Result<duduclaw_updated::readiness::GenerationEviden
 /// Cache only the expensive verification of immutable root generation artifacts.
 /// Every use requires F's authenticated live nonce probe; a failed probe discards
 /// the cache. Executable descriptors still receive their normal per-run hashes.
-fn committed_generation() -> io::Result<(Sha256Digest, ReleaseManifest)> {
+/// Also the generation input of the R7a self-test key (`crate::selftest`).
+pub(crate) fn committed_generation() -> io::Result<(Sha256Digest, ReleaseManifest)> {
     let started = crate::host_state::boottime_ms()?;
     let mut slot = VERIFIED_GENERATION.lock().map_err(|_| denied())?;
     let live = match live_generation() {
@@ -592,22 +593,20 @@ impl crate::host::Publication for InstalledPublication {
 /// Root harness receipt. Passes require an actual positive control plus denied
 /// public-key login/forwarding, not a stored "ready" switch. Its producer remains
 /// responsible for performing the observations and atomically renewing it.
+/// R7a: the trampoline facts (executable digest, Landlock/namespace self-test,
+/// ABI pair) are no longer part of it; spawnd measures them itself
+/// (`crate::selftest`). Accounts/SSH and DNS/egress still read this receipt.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallReceipt {
     version: u16, generation: Sha256Digest, boot_id: String, checked_boottime_ms: u64, valid_for_ms: u64,
     external_nss_range: Option<UidRange>, iam_reservation_digest: Option<Sha256Digest>,
     unowned_uids: Vec<u32>, owner_inventory_digest: Sha256Digest, ssh: Vec<SshReceipt>,
-    trampoline: TrampolineReceipt,
     dns: DnsReceipt,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SshReceipt { account: String, control_exit: i32, public_key_exit: i32, forwarding_exit: i32, transcript_digest: Sha256Digest }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrampolineReceipt { executable_digest: Sha256Digest, landlock_exit: i32, namespace_exit: i32,
-    detected_abi: u32, selected_abi: u32, transcript_digest: Sha256Digest }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsReceipt {
@@ -619,21 +618,16 @@ struct DnsReceipt {
 #[serde(rename_all = "snake_case")]
 enum DnsRoute { ResolvedVarlink, DedicatedBroker }
 fn receipt() -> io::Result<InstallReceipt> {
-    let (generation, manifest) = committed_generation()?;
+    let (generation, _) = committed_generation()?;
     let receipt: InstallReceipt = read(RECEIPTS, "installation.json")?;
-    // Verify the exact executable PID 1 will start, not merely an unused copy
-    // under the signed generation directory.
-    let artifact = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Trampoline).ok_or_else(denied)?;
-    let installed = io(io(Directory::open(Path::new("/usr/lib/duduclaw")))?.read("duduclaw-run"))?;
-    if installed.metadata()?.mode() & 0o7777 != u32::from(artifact.mode) { return Err(denied()); }
-    io(duduclaw_updated::linux::files::verify_fd(installed, artifact.size_bytes, artifact.sha256))?;
+    // R7a: the installed trampoline's digest/mode/size check moved, with the
+    // self-test artifact's, to `crate::selftest::live_key` (no receipt needed).
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let now = crate::host_state::boottime_ms()?;
     if receipt.version != 1 || receipt.generation != generation || receipt.boot_id != boot.trim()
         || receipt.valid_for_ms == 0 || receipt.valid_for_ms > 60_000 || now < receipt.checked_boottime_ms
         || now - receipt.checked_boottime_ms >= receipt.valid_for_ms || receipt.ssh.len() > 30_000
-        || receipt.unowned_uids.len() > 30_000 || !manifest.artifacts.iter().any(|a|
-            a.install_target == InstallTarget::Trampoline && a.sha256 == receipt.trampoline.executable_digest) { return Err(denied()); }
+        || receipt.unowned_uids.len() > 30_000 { return Err(denied()); }
     Ok(receipt)
 }
 pub struct InstalledEvidence;
@@ -656,18 +650,6 @@ impl crate::accounts::InstallationEvidence for InstalledEvidence {
         Ok(())
     }
 }
-impl crate::native_trampoline::Installation for InstalledEvidence {
-    fn readback(&mut self) -> Result<crate::bootstrap::TrampolineReadiness> {
-        let r = os(receipt())?.trampoline;
-        let actual = os(duduclaw_run::linux::probe::probe())?;
-        if r.landlock_exit != 0 || r.namespace_exit != 0 || !nonzero(r.transcript_digest)
-            || r.detected_abi != actual.landlock_abi || r.selected_abi != actual.landlock_ruleset_abi { return Err(ErrorCode::IsolationUnavailable); }
-        let evidence = crate::bootstrap::TrampolineReadiness { version: 1, executable_verified: true,
-            landlock_self_test: true, namespace_self_test: true, detected_landlock_abi: r.detected_abi, selected_landlock_abi: r.selected_abi };
-        evidence.check()?;
-        Ok(evidence)
-    }
-}
 impl crate::host::DnsEvidence for InstalledEvidence {
     fn verify(&mut self) -> Result<crate::readiness::EgressSecondLayer> {
         let r = os(receipt())?.dns;
@@ -683,7 +665,9 @@ pub fn install(components: &mut crate::host::Components) {
     components.publication = Box::new(InstalledPublication::default());
     components.installation = Arc::new(InstalledEvidence);
     components.egress = Box::new(crate::host::LinuxEgress::new(Box::new(InstalledEvidence)));
-    components.trampoline = Box::new(crate::native_trampoline::NativeTrampoline::new(Box::new(InstalledEvidence)));
+    // R7a: trampoline readiness comes from spawnd's own self-test, not the receipt.
+    components.trampoline = Box::new(crate::native_trampoline::NativeTrampoline::new(
+        Box::new(crate::selftest::SelfTestInstallation::default())));
 }
 
 #[cfg(test)]

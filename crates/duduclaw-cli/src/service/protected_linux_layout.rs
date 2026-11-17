@@ -3,6 +3,8 @@
 pub(super) const BINARIES: &[&str] = &[
     "/usr/lib/duduclaw/duduclaw-spawnd",
     "/usr/lib/duduclaw/duduclaw-run",
+    // R7a: the trampoline's isolation self-test (ExecStart of the fixed self-test unit).
+    "/usr/lib/duduclaw/duduclaw-run-selftest",
     "/opt/duduclaw/bin/duduclaw-egress",
     "/usr/libexec/duduclaw/duduclaw-parse-worker",
     "/usr/lib/duduclaw/current/duduclaw-import",
@@ -14,8 +16,10 @@ pub(super) const BINARIES: &[&str] = &[
     "/usr/libexec/duduclaw-updated-launch",
 ];
 
+// `duduclaw-selftest` is `duduclaw_isolation::ids::SELFTEST_USER` (a literal:
+// this module stays std-only; equality is tested in protected_linux_tests.rs).
 pub(super) const ACCOUNTS: &[&str] = &[
-    "duduclaw-runsup", "duduclaw-egress", "duduclaw-dl", "duduclaw-dns",
+    "duduclaw-runsup", "duduclaw-egress", "duduclaw-dl", "duduclaw-dns", "duduclaw-selftest",
 ];
 
 // Parent-first; none of these directories belongs to an employee or gateway.
@@ -44,6 +48,8 @@ pub(super) const UNITS: &[(&str, &str)] = &[
     ("duduclaw-spawnd.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.service")),
     ("duduclaw-spawnd.socket", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.socket")),
     ("duduclaw-isolation-ready.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-isolation-ready.service")),
+    // R7a: no [Install]; never enabled or started here (spawnd starts it through PID 1).
+    ("duduclaw-isolation-selftest.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-isolation-selftest.service")),
     ("duduclaw.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw.slice")),
     ("duduclaw-tcb.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-tcb.slice")),
     ("duduclaw-employees.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-employees.slice")),
@@ -183,8 +189,13 @@ mod tests {
         for root in ["/usr/lib/duduclaw/parse-root", "/usr/lib/duduclaw/parse-root-tree"] {
             assert!(DIRECTORIES.contains(&(root, 0o755)));
         }
-        assert_eq!(ACCOUNTS.len(), 4);
-        assert_eq!(BINARIES.len(), 9);
+        assert_eq!(ACCOUNTS.len(), 5);
+        assert_eq!(BINARIES.len(), 10);
+        // R7a: the self-test unit runs the published self-test binary; the account it drops to is created here.
+        let selftest = UNITS.iter().find(|(name, _)| *name == "duduclaw-isolation-selftest.service").unwrap().1;
+        assert!(selftest.lines().any(|line| line == "ExecStart=/usr/lib/duduclaw/duduclaw-run-selftest"));
+        assert!(!selftest.lines().any(|line| line.trim() == "[Install]"), "never enabled");
+        assert!(ACCOUNTS.contains(&"duduclaw-selftest"));
         // Every binary's parent directory is created by the layout (parent first).
         for binary in BINARIES {
             let parent = std::path::Path::new(binary).parent().unwrap().to_str().unwrap();
