@@ -6272,6 +6272,19 @@
       "rationale": "Pre-existing final exec of the duduclaw-run trampoline (behaviour unchanged, newly visible after the inventory learned raw syscall(SYS_execveat)): reached from execute_runtime (employee runtime after the rt-runtime cgroup move, setsid and exact fd plan) and execute_forwarder (egress forwarder). Resets signal handlers, installs the run's seccomp filter, then execveat(AT_EMPTY_PATH) of the root-verified executable fd with the verified Program argv/environment; on failure records the error page and _exit(126), no fallback."
     },
     {
+      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::tests::shell",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only helper starts a fixed /bin/sh child to verify systemctl client child reaping and deadline handling; never compiled into the daemon."
+    },
+    {
       "symbol": "crates/duduclaw-updated/src/linux/bootstrap_verify.rs::tests::exec_probe",
       "apis": {
         "command_constructor": 1,
