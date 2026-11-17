@@ -415,7 +415,7 @@ fn googlechat_recovery_catalogs_match_initializer_and_refuse_unknown_objects() {
         conn.execute_batch("CREATE TABLE unknown_state (id TEXT)").unwrap();
         assert!(detect(&conn, Store::GoogleChatInbox, None).is_err());
     }
-    let source = include_str!("../../duduclaw-gateway/src/googlechat_inbox.rs");
+    let source = include_str!("../../duduclaw-gateway/src/googlechat_inbox.rs").replace("\r\n", "\n");
     assert!(source.contains(GOOGLECHAT_INBOX_V182));
     assert!(source.contains(include_str!("googlechat-placeholders-v183.sql")));
     assert!(source.contains(include_str!("googlechat-placeholder-state-v183.sql").trim()));
