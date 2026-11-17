@@ -1,6 +1,6 @@
 //! Linux-only B1 preparation of private detached mounts and verified executable
 //! descriptors. This does not enter the B2 namespace or release its start barrier.
-use std::{collections::BTreeMap, ffi::{CString, OsStr}, fs::{self, File}, io::{self, Read}, mem,
+use std::{collections::BTreeMap, ffi::{CStr, CString, OsStr}, fs::{self, File}, io::{self, Read}, mem,
     os::{fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd}, unix::{ffi::OsStrExt, fs::MetadataExt}},
     path::{Component, Path, PathBuf}, time::{Duration, Instant}};
 use sha2::{Digest, Sha256};
@@ -34,6 +34,23 @@ fn c_name(name: &OsStr) -> io::Result<CString> { CString::new(name.as_bytes()).m
 pub(super) fn owned(raw: libc::c_long) -> io::Result<OwnedFd> {
     if raw < 0 { return Err(io::Error::last_os_error()); }
     Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+}
+/// openat2 resolution of every trusted open beneath a held directory: no
+/// escape, no symlink (magic or not) and no mount crossing. A target that is
+/// itself a mount point (bind or otherwise) fails with EXDEV, so the result is
+/// always on the SAME mount as `parent`.
+const TRUSTED_RESOLVE: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS
+    | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV;
+fn open_trusted(parent: BorrowedFd<'_>, name: &CStr, flags: i32) -> io::Result<OwnedFd> {
+    let how = OpenHow { flags: (flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64, mode: 0, resolve: TRUSTED_RESOLVE };
+    owned(unsafe { libc::syscall(libc::SYS_openat2, parent.as_raw_fd(), name.as_ptr(), &how, mem::size_of::<OpenHow>()) })
+}
+/// R7f review round 2: the /etc projection's directories (`duduclaw/`, `ssl/`,
+/// `ssl/certs`) are opened only through [`open_trusted`]: publish, verify and
+/// cleanup refuse a component that is a mount point (or a symlink) before
+/// trusting, let alone removing, anything beneath it.
+fn open_same_mount_directory(parent: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {
+    open_trusted(parent, name, libc::O_RDONLY | libc::O_DIRECTORY)
 }
 
 /// Construct only from F's verified root publication. Paths are not serializable
@@ -264,9 +281,7 @@ pub(crate) fn open_verified(runtime: BorrowedFd<'_>, name: &str, digest: Sha256D
         return Err(invalid());
     }
     let name = CString::new(name).map_err(|_| invalid())?;
-    let how = OpenHow { flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64, mode: 0,
-        resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV };
-    let fd = owned(unsafe { libc::syscall(libc::SYS_openat2, runtime.as_raw_fd(), name.as_ptr(), &how, mem::size_of::<OpenHow>()) })?;
+    let fd = open_trusted(runtime, &name, libc::O_RDONLY)?;
     let before = identity(fd.as_fd())?;
     if before.mode & libc::S_IFMT != libc::S_IFREG || before.uid != 0 || before.mode & 0o022 != 0
         || before.bytes == 0 || before.bytes > MAX_EXECUTABLE_BYTES || before.mount_id != crate::fds::mount_id(runtime)? {
@@ -334,6 +349,8 @@ fn verify_etc_projection(directory: BorrowedFd<'_>, uid: u32, gid: u32, owner: u
     let chain = projection_directory_chain()?;
     if top_level.insert(chain[0], String::new()).is_some() { return Err(invalid()); }
     verify_projection_entries(directory, &top_level, MAX_ETC_ENTRIES)?;
+    // Like the CA chain, the marker directory is on this projection's mount.
+    open_same_mount_directory(directory, &CString::new(ETC_MARKER_DIR).map_err(|_| invalid())?)?;
     verify_ca_mount_point(directory, owner)
 }
 /// Single components of [`duduclaw_run::ETC_PROJECTION_DIRECTORIES`]: each
@@ -356,7 +373,8 @@ fn projection_directory_chain() -> io::Result<Vec<&'static str>> {
 }
 /// R7f: the directories the trampoline mounts the host CA certificates beneath
 /// (`<projection>/ssl/certs`): `owner` 0755, empty, same create/verify/fsync
-/// discipline as the marker directory. Never followed through a symlink.
+/// discipline as the marker directory. Never followed through a symlink or
+/// into a mount point.
 fn publish_ca_mount_point(directory: BorrowedFd<'_>, owner: u32) -> io::Result<()> {
     let mut opened: Vec<OwnedFd> = Vec::new();
     for name in projection_directory_chain()? {
@@ -370,13 +388,13 @@ fn publish_ca_mount_point(directory: BorrowedFd<'_>, owner: u32) -> io::Result<(
     Ok(())
 }
 /// `name` beneath `parent`: created 0755 if absent, then required to be a real
-/// `owner`-owned 0755 directory (an existing one is never re-moded).
+/// `owner`-owned 0755 directory on `parent`'s mount (an existing one is never
+/// re-moded).
 fn publish_directory(parent: BorrowedFd<'_>, name: &str, owner: u32) -> io::Result<OwnedFd> {
     let name = CString::new(name).map_err(|_| invalid())?;
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
     if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err(io::Error::last_os_error()); }
-    let directory = owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    let directory = open_same_mount_directory(parent, &name)?;
     if metadata(&directory)?.uid() != owner { return Err(invalid()); }
     // The unit's UMask narrows mkdirat; the runtime uid must be able to traverse.
     if result == 0 && unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) } != 0 { return Err(io::Error::last_os_error()); }
@@ -384,16 +402,16 @@ fn publish_directory(parent: BorrowedFd<'_>, name: &str, owner: u32) -> io::Resu
     if !stat.is_dir() || stat.uid() != owner || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
     Ok(directory)
 }
-/// Every directory of the chain is a real `owner`-owned 0755 directory that
-/// holds exactly the next one; the last (the CA mount point) is EMPTY.
+/// Every directory of the chain is a real `owner`-owned 0755 directory on its
+/// parent's mount (none is a mount point) that holds exactly the next one; the
+/// last (the CA mount point) is EMPTY.
 fn verify_ca_mount_point(directory: BorrowedFd<'_>, owner: u32) -> io::Result<()> {
     let names = projection_directory_chain()?;
     let mut current: Option<OwnedFd> = None;
     for (index, name) in names.iter().enumerate() {
         let parent = current.as_ref().map_or(directory, |fd| fd.as_fd());
         let name = CString::new(*name).map_err(|_| invalid())?;
-        let next = owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+        let next = open_same_mount_directory(parent, &name)?;
         let stat = metadata(&next)?;
         if !stat.is_dir() || stat.uid() != owner || stat.mode() & 0o7777 != 0o755 { return Err(invalid()); }
         let expected: BTreeMap<&str, String> = names.get(index + 1)
@@ -409,8 +427,7 @@ fn publish_marker(directory: BorrowedFd<'_>, owner: u32) -> io::Result<()> {
     let name = CString::new(ETC_MARKER_DIR).map_err(|_| invalid())?;
     let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) };
     if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err(io::Error::last_os_error()); }
-    let marker_dir = owned(unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    let marker_dir = open_same_mount_directory(directory, &name)?;
     if metadata(&marker_dir)?.uid() != owner { return Err(invalid()); }
     // The unit's UMask narrows mkdirat; the runtime uid must be able to traverse.
     if result == 0 && unsafe { libc::fchmod(marker_dir.as_raw_fd(), 0o755) } != 0 { return Err(io::Error::last_os_error()); }
@@ -512,15 +529,17 @@ pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> i
     for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
         let entry = entry?;
         // R3-1: the marker directory (possibly partial: empty or just the marker).
+        // Both directories are opened on this projection's mount (a mount point
+        // or symlink is refused) here, before anything is removed.
         if entry.file_name().to_str() == Some(ETC_MARKER_DIR) && !marker_dir {
-            let stat = fs::symlink_metadata(entry.path())?;
+            let stat = metadata(&open_same_mount_directory(directory.as_fd(), &c_name(&entry.file_name())?)?)?;
             if !stat.is_dir() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o700 | 0o755) { return Err(invalid()); }
             marker_dir = true;
             continue;
         }
         // R7f: the CA mount point chain (possibly partial); checked level by level below.
         if entry.file_name().to_str() == Some(ca_root) && !ca_dir {
-            let stat = fs::symlink_metadata(entry.path())?;
+            let stat = metadata(&open_same_mount_directory(directory.as_fd(), &c_name(&entry.file_name())?)?)?;
             if !stat.is_dir() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o700 | 0o755) { return Err(invalid()); }
             ca_dir = true;
             continue;
@@ -530,8 +549,10 @@ pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> i
         if !stat.is_file() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o400 | 0o444) || stat.nlink() != 1 { return Err(invalid()); }
         entries.push(c_name(&entry.file_name())?);
     }
-    if marker_dir { cleanup_marker(directory.as_fd())?; }
+    // The chain first: it checks every level (mount, shape) before its first
+    // removal, so a mount point anywhere in it refuses with nothing removed.
     if ca_dir { remove_directory_chain(directory.as_fd(), &projection_directory_chain()?)?; }
+    if marker_dir { cleanup_marker(directory.as_fd())?; }
     for entry in entries {
         if unsafe { libc::unlinkat(directory.as_raw_fd(), entry.as_ptr(), 0) } != 0 { return Err(io::Error::last_os_error()); }
     }
@@ -545,8 +566,7 @@ pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> i
 /// keeps the residue (and readiness fails), as for the flat files.
 fn cleanup_marker(directory: BorrowedFd<'_>) -> io::Result<()> {
     let name = CString::new(ETC_MARKER_DIR).map_err(|_| invalid())?;
-    let marker_dir = owned(unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    let marker_dir = open_same_mount_directory(directory, &name)?;
     if metadata(&marker_dir)?.uid() != 0 { return Err(invalid()); }
     let mut present = false;
     for entry in fs::read_dir(format!("/proc/self/fd/{}", marker_dir.as_raw_fd()))? {
@@ -566,14 +586,16 @@ fn cleanup_marker(directory: BorrowedFd<'_>) -> io::Result<()> {
 }
 
 /// R7f cleanup of the (possibly partial) CA mount point chain `names` beneath
-/// `parent`: each level must be a real root-owned 0700/0755 directory holding
+/// `parent`: each level must be a real root-owned 0700/0755 directory on its
+/// parent's mount (not a mount point) holding
 /// at most the next level; the last one must be empty. Anything else keeps the
 /// residue (and readiness fails). Nothing unknown is ever removed.
 fn remove_directory_chain(parent: BorrowedFd<'_>, names: &[&str]) -> io::Result<()> {
     let Some((first, rest)) = names.split_first() else { return Ok(()) };
     let name = CString::new(*first).map_err(|_| invalid())?;
-    let directory = owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+    // A level that is a mount point is refused here, before anything in it (or
+    // in the chain: removal starts only after the innermost level checks out).
+    let directory = open_same_mount_directory(parent, &name)?;
     let stat = metadata(&directory)?;
     if !stat.is_dir() || stat.uid() != 0 || !matches!(stat.mode() & 0o7777, 0o700 | 0o755) { return Err(invalid()); }
     let mut child = false;
@@ -610,6 +632,31 @@ mod tests {
         assert_eq!(projection_directory_chain().unwrap().join("/"), duduclaw_run::ETC_CA_MOUNT_POINT);
         let top = projection_directory_chain().unwrap()[0];
         assert!(!minimal_etc(70000, 70000).unwrap().contains_key(top) && top != ETC_MARKER_DIR);
+    }
+    /// R7f review round 2: projection directories are opened only through
+    /// `open_trusted`, whose resolution never crosses a mount (nor follows a
+    /// symlink or escapes): a child on a different mount than its parent is
+    /// EXDEV; one on the parent's mount opens.
+    #[test]
+    fn r7f_projection_directories_open_only_on_the_parent_mount() {
+        assert_eq!(TRUSTED_RESOLVE, libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS
+            | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV);
+        assert_ne!(TRUSTED_RESOLVE & libc::RESOLVE_NO_XDEV, 0, "mount points are refused");
+        // Decision on the live system (unprivileged): `/proc` is normally its own mount.
+        let slash: OwnedFd = File::open("/").unwrap().into();
+        let proc_mount = crate::fds::mount_id(File::open("/proc").unwrap().as_fd()).unwrap();
+        if proc_mount != crate::fds::mount_id(slash.as_fd()).unwrap() {
+            let error = open_same_mount_directory(slash.as_fd(), c"proc").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+        }
+        // Same mount: opens. Symlink or escape: refused.
+        let (scratch, dir) = Scratch::new("same-mount");
+        fs::create_dir(scratch.0.join("child")).unwrap();
+        std::os::unix::fs::symlink(scratch.0.join("child"), scratch.0.join("link")).unwrap();
+        let child = open_same_mount_directory(dir.as_fd(), c"child").unwrap();
+        assert_eq!(crate::fds::mount_id(child.as_fd()).unwrap(), crate::fds::mount_id(dir.as_fd()).unwrap());
+        assert!(open_same_mount_directory(dir.as_fd(), c"link").is_err());
+        assert!(open_same_mount_directory(child.as_fd(), c"..").is_err());
     }
     /// Unprivileged scratch directory for the writer/verifier tests.
     struct Scratch(PathBuf);
@@ -876,6 +923,120 @@ mod tests {
         assert!(projection_runs(&anchors).unwrap().is_empty());
         cleanup_projection(&anchors, run).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+    /// R7f review round 2: a mount on any projection directory — a root 0755
+    /// bind mount on `ssl/` whose tree holds only an empty `certs/` (the shape
+    /// the O_NOFOLLOW checks accepted), a root 0755 tmpfs on `ssl/certs`, or
+    /// `duduclaw/` bind-mounted onto itself — is refused by publish, verify
+    /// and cleanup, and cleanup removes nothing (neither the foreign `certs/`
+    /// nor any projection entry). All mounts are made in the private namespace
+    /// of a fresh re-exec of only this test; this process prepares the
+    /// projection and cleans it up afterwards.
+    #[test]
+    #[ignore = "iso_root_: disposable root Linux VM (DUDUCLAW_ISO_DISPOSABLE=1)"]
+    fn iso_root_etc_projection_refuses_mounted_ca_chain() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "DUDUCLAW_ISO_MOUNTED_CA_CHAIN_ROOT";
+        const NAME: &str = "bootstrap_mounts::tests::iso_root_etc_projection_refuses_mounted_ca_chain";
+        assert_eq!(unsafe { libc::geteuid() }, 0, "requires native root Linux; no skip");
+        assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
+            "set DUDUCLAW_ISO_DISPOSABLE=1 only on a disposable VM");
+        let run = RunHandle(duduclaw_isolation::ids::RunId([0x97; 16]));
+        if let Ok(root) = std::env::var(CHILD) {
+            mounted_ca_chain_is_refused(Path::new(&root), run);
+            return;
+        }
+        let root = PathBuf::from(format!("/run/duduclaw-r7f-mounted-ca-{}", std::process::id()));
+        fs::create_dir(&root).unwrap(); fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let anchors = RootPublicationAnchors::new(root.clone(), root.clone(), root.clone()).unwrap();
+        // The complete production projection, and a foreign root-owned 0755
+        // tree holding only an empty 0755 `certs/`.
+        drop(publish_projection(&anchors, run, 70000, 70000).unwrap());
+        let foreign = root.join("foreign");
+        let foreign_certs = foreign.join(projection_directory_chain().unwrap()[1]);
+        for path in [&foreign, &foreign_certs] {
+            fs::create_dir(path).unwrap(); fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--ignored", "--test-threads=1", "--nocapture"])
+            .env(CHILD, &root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().expect("fresh process running only this test");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut timed_out = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline { timed_out = true; child.kill().unwrap(); break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        // Clean up first (the child's namespace, and with it every mount, is gone).
+        let foreign_kept = foreign_certs.is_dir();
+        let cleaned = cleanup_projection(&anchors, run);
+        let projection_gone = !root.join(run_name(run)).exists();
+        let _ = fs::remove_dir(&foreign_certs);
+        let _ = fs::remove_dir(&foreign);
+        let _ = fs::remove_dir(&root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!timed_out, "child exceeded its deadline");
+        assert!(output.status.success() && stdout.contains("1 passed"), "child failed or did not run: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr));
+        assert!(foreign_kept, "the foreign certs/ is never removed");
+        cleaned.unwrap();
+        assert!(projection_gone);
+    }
+    /// Child half of `iso_root_etc_projection_refuses_mounted_ca_chain`.
+    fn mounted_ca_chain_is_refused(root: &Path, run: RunHandle) {
+        let anchors = RootPublicationAnchors::new(root.to_path_buf(), root.to_path_buf(), root.to_path_buf()).unwrap();
+        let residue = root.join(run_name(run));
+        let ssl = residue.join(duduclaw_run::ETC_PROJECTION_DIRECTORIES[0]);
+        let certs = residue.join(duduclaw_run::ETC_CA_MOUNT_POINT);
+        let marker = residue.join(ETC_MARKER_DIR);
+        let foreign = root.join("foreign");
+        let foreign_certs = foreign.join(projection_directory_chain().unwrap()[1]);
+        let cpath = |path: &Path| CString::new(path.as_os_str().as_bytes()).unwrap();
+        // Everything below is private to this process's own mount namespace.
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) }, 0, "private mount namespace");
+        assert_eq!(unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) }, 0, "private propagation");
+        // Opened after unshare: the descriptor must be on THIS namespace's mount.
+        let dir: OwnedFd = File::open(&residue).unwrap().into();
+        let bind = |source: &Path, target: &Path| assert_eq!(unsafe { libc::mount(cpath(source).as_ptr(),
+            cpath(target).as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) }, 0, "bind mount on {}", target.display());
+        let tmpfs = |target: &Path| assert_eq!(unsafe { libc::mount(c"tmpfs".as_ptr(), cpath(target).as_ptr(),
+            c"tmpfs".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV, c"size=65536,nr_inodes=16,mode=0755".as_ptr().cast()) },
+            0, "tmpfs on {}", target.display());
+        let unmount = |target: &Path| assert_eq!(unsafe { libc::umount2(cpath(target).as_ptr(), 0) }, 0,
+            "umount {}", target.display());
+        // Nothing of the projection, or beneath a mount on it, was removed.
+        let intact = |what: &str| {
+            for path in [&ssl, &certs, &marker, &marker.join(ETC_MARKER_FILE), &foreign_certs] {
+                assert!(fs::symlink_metadata(path).is_ok(), "{what}: {} still exists", path.display());
+            }
+            for name in minimal_etc(70000, 70000).unwrap().keys() { assert!(residue.join(name).is_file(), "{what}: {name}"); }
+        };
+        let refused = |what: &str| {
+            assert!(verify_etc_projection(dir.as_fd(), 70000, 70000, 0).is_err(), "{what}: verify");
+            assert!(write_etc_projection(dir.as_fd(), 70000, 70000, 0).is_err(), "{what}: publish");
+            assert!(cleanup_projection(&anchors, run).is_err(), "{what}: cleanup");
+            intact(what);
+        };
+        verify_etc_projection(dir.as_fd(), 70000, 70000, 0).expect("control: no mount");
+        bind(&foreign, &ssl);
+        assert!(verify_ca_mount_point(dir.as_fd(), 0).is_err());
+        refused("bind mount on ssl");
+        assert!(certs.is_dir() && foreign_certs.is_dir(), "the foreign certs/ still exists");
+        unmount(&ssl);
+        tmpfs(&certs);
+        assert!(verify_ca_mount_point(dir.as_fd(), 0).is_err());
+        refused("tmpfs on ssl/certs");
+        unmount(&certs);
+        bind(&marker, &marker);
+        refused("bind mount on duduclaw");
+        unmount(&marker);
+        // Control: without the mounts the same projection verifies again.
+        verify_etc_projection(dir.as_fd(), 70000, 70000, 0).expect("control after unmount");
+        intact("after unmount");
     }
     #[test]
     #[ignore = "requires root and CAP_SYS_ADMIN on disposable Linux VM"]

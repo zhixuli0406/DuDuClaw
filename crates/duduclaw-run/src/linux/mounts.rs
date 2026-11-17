@@ -538,10 +538,17 @@ fn allocate_pty(dev: RawFd, uid: u32, mount_id: u64) -> Result<PtyPair, MountErr
     Ok(PtyPair { master, slave, mount_id })
 }
 
+/// TEST FIXTURE ONLY: `attach_input` for the debug root fixture's R7f DAC-less
+/// acceptance scenario. Compiled only with `root-test-fixture` (never in a
+/// production build); the implementation itself stays module-private.
+#[cfg(feature = "root-test-fixture")]
+pub fn attach_input_for_root_fixture(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> Result<u64, MountError> {
+    attach_input(input, root, name, attrs)
+}
+
 /// Attach one spawnd-provided detached mount at `root`/`name` and read it back.
-/// `pub` only for the debug root fixture (R7f DAC-less acceptance scenario);
-/// production callers are `build_root` and `attach_helpers`.
-pub fn attach_input(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> Result<u64, MountError> {
+/// Callers: `build_root` and `attach_helpers` (and the fixture-only wrapper above).
+fn attach_input(input: DetachedMount, root: RawFd, name: &CStr, attrs: u64) -> Result<u64, MountError> {
     if input.expected_mount_id == 0 { return Err(MountError::Identity); }
     // Do not turn a normal directory into a source mount: move_mount requires
     // the supplied detached mount root. Both before/after identities must match.

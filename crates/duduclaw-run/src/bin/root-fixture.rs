@@ -499,7 +499,7 @@ mod linux {
             assert_eq!(before.identity.mount,expected);
             let stage_fd=open_dir(&stage);
             reduce_to_run_unit_capabilities();
-            assert_eq!(mounts::attach_input(input,stage_fd.as_raw_fd(),c"work",attrs),Ok(expected),
+            assert_eq!(mounts::attach_input_for_root_fixture(input,stage_fd.as_raw_fd(),c"work",attrs),Ok(expected),
                 "production attach_input without DAC capabilities");
             // Precondition: the pre-R7f O_RDONLY readback of the same object is EACCES here.
             let raw=unsafe { libc::openat(stage_fd.as_raw_fd(),c"work".as_ptr(),
