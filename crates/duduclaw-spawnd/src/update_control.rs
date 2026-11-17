@@ -19,7 +19,9 @@
 //! - `Resume{g}` is the only way to lift it: when the barrier and the record
 //!   both name `g` (or nothing) and the publication journal is absent or
 //!   `published` for `g`, the journal and then the record are removed durably
-//!   first, then admission reopens.
+//!   first, then admission reopens. A process that accepted a publication
+//!   (`Apply`, [`Phase::Superseded`]) refuses every `Resume` and changes
+//!   nothing: only the restarted, re-verified spawnd may reopen admission.
 //!
 //! `Apply` publishes only from the verified generation directory, hashing each
 //! artifact from its descriptor while copying it, and only under the closed,
@@ -534,6 +536,11 @@ enum Phase {
     /// for the rest of this process. The admission loop still runs (closed by
     /// the drain barrier); only the restarted, re-verified spawnd says
     /// `consistent` again, so a stopped gate is re-armed only by that invocation.
+    /// `Resume` is refused (admission never reopens against components this
+    /// process may not be running); `Apply` is accepted only for the generation
+    /// whose publication was accepted (an idempotent retry); `Prepare`
+    /// (read-only verification), `Drain` (closes, never opens) and `Readback`
+    /// are served.
     Superseded,
     /// Not consistent at start: only the update endpoint is open, no admission
     /// loop exists, so no run can be admitted by this process.
@@ -560,7 +567,10 @@ pub struct UpdateControl<S, E> { store: S, barrier: DrainBarrier, effects: E, st
     reported: Option<String>,
     /// A synchronously written audit record did not land (part of `STATUS=`
     /// for the rest of this process).
-    audit_failed: bool }
+    audit_failed: bool,
+    /// The generation whose publication this process accepted
+    /// ([`Phase::Superseded`]): the only one a later `Apply` may name.
+    superseded_by: Option<Sha256Digest> }
 impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
     /// Restores the barrier from the durable record, then verifies the
     /// installed set (journal: re-verify and republish, or roll back; no
@@ -590,7 +600,7 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
             Phase::Closed
         };
         Ok(Self { store, barrier, effects, startup: Startup { drain, recovery, journal, selected }, phase,
-            owner: Owner::current().ok(), status_root: None, reported: None, audit_failed: false })
+            owner: Owner::current().ok(), status_root: None, reported: None, audit_failed: false, superseded_by: None })
     }
     /// Production: the status file lives in `root` (`/run/duduclaw-spawnd`).
     fn with_status_root(mut self, root: &Path) -> Self { self.status_root = Some(root.to_path_buf()); self }
@@ -689,6 +699,17 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
         if command.generation().0 == [0; 32] { return Err(invalid()); }
         // A failed process answers nothing more; it exits after this reply.
         if self.phase == Phase::Failed { return Err(invalid()); }
+        // A process that accepted a publication: no Resume (only the restarted,
+        // re-verified spawnd reopens admission) and no Apply of another
+        // generation; refused before anything is read or written.
+        if self.phase == Phase::Superseded {
+            let served = match command {
+                ControlCommand::Resume { .. } => false,
+                ControlCommand::Apply { preparation } => self.superseded_by == Some(preparation.generation),
+                ControlCommand::Prepare { .. } | ControlCommand::Drain { .. } | ControlCommand::Readback { .. } => true,
+            };
+            if !served { return Err(invalid()); }
+        }
         match command {
             ControlCommand::Prepare { preparation } => { self.effects.prepare(preparation)?; Ok(ControlOutcome::Prepared) }
             ControlCommand::Drain { generation } => self.drain(*generation),
@@ -696,7 +717,7 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
                 self.drained(preparation.generation)?;
                 let previous = self.previous_for(preparation.generation)?;
                 let manifest = verified_manifest(&mut self.effects, preparation.generation, None, Some(preparation))?;
-                self.accept_publication()?;
+                self.accept_publication(preparation.generation)?;
                 publish_journaled(&mut self.store, &mut self.effects, preparation.generation, manifest, previous)?;
                 // A set this process found not consistent is now complete: it
                 // replies, then restarts so the next start verifies everything
@@ -761,9 +782,11 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
     /// this invocation again; and the gate is checked once more, in case it
     /// completed against the old status before that write. A process that
     /// started not consistent never said `consistent` (its gate is down too).
-    fn accept_publication(&mut self) -> io::Result<()> {
+    fn accept_publication(&mut self, generation: Sha256Digest) -> io::Result<()> {
         if !self.effects.gated_units_down()? { return Err(invalid()); }
         if !self.admission_live() { return Ok(()); }
+        // `handle` admits a Superseded Apply only for this same generation.
+        self.superseded_by = Some(generation);
         self.phase = Phase::Superseded;
         if !self.report_written().1 { return Err(invalid()); }
         if !self.effects.gated_units_down()? { return Err(invalid()); }
@@ -789,7 +812,8 @@ impl<S: DrainStore + JournalStore, E: Effects> UpdateControl<S, E> {
     fn resume(&mut self, generation: Sha256Digest) -> io::Result<ControlOutcome> {
         // There is no admission to reopen in a process that started not
         // consistent: only its restart (after a repairing Apply) opens anything.
-        if !self.admission_live() { return Err(invalid()); }
+        // Nor in a process that accepted a publication (also refused in `handle`).
+        if !self.admission_live() || self.phase == Phase::Superseded { return Err(invalid()); }
         let matches = match self.barrier.closure() {
             None => true,
             Some(DrainClosure::Generation(closed)) => closed == generation,

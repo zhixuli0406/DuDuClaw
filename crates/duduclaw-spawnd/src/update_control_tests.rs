@@ -395,9 +395,71 @@ fn update_apply_requires_closed_recorded_generation_and_no_runs() {
     assert!(!control.restart_required());
     // The selected generation is the journal's previous.
     assert_eq!(store.journal(), Some(PublishJournal::new(digest(7), digest(7), Some(INSTALLED), PublishState::Published).unwrap()));
+    // This process accepted the publication: only its restart may resume.
+    assert!(matches!(outcome(&mut control, ControlCommand::Resume { generation: digest(7) }), ControlOutcome::Refused));
+    assert!(barrier.is_closed());
+    drop(control);
+    drop(admission);
+    // The restart (the updater's, after Apply): a new process reads the disk,
+    // re-verifies the `published` journal, and only then accepts the Resume.
+    let barrier = DrainBarrier::default();
+    let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::default()).unwrap();
+    assert!(control.consistent_at_start());
+    assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(7))));
     accepted(&mut control, ControlCommand::Resume { generation: digest(7) });
     assert_eq!(store.journal(), None);
     assert!(matches!(outcome(&mut control, apply(digest(7))), ControlOutcome::Refused));
+}
+
+#[test]
+fn update_superseded_refuses_resume_and_other_generations_and_changes_nothing() {
+    let store = MemoryStore::default();
+    let shared = new_world(&store, digest(1), &[digest(1), digest(2), digest(3)]);
+    let barrier = DrainBarrier::default();
+    let _admission = Observer::new(&barrier, 0);
+    let mut control = UpdateControl::new(store.clone(), barrier.clone(), FakeEffects::over(&shared)).unwrap();
+    assert!(control.opened());
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    accepted(&mut control, apply_command(digest(2)));
+    let published = PublishJournal::new(digest(2), digest(2), Some(digest(1)), PublishState::Published).unwrap();
+    assert_eq!(store.journal(), Some(published));
+    assert_eq!(control.report(), "recovering");
+    // Before the restart: Resume (whatever generation), Apply of another
+    // generation, and a Prepare/Drain/Apply sequence for another generation
+    // are refused; the barrier stays closed and neither the journal, the
+    // drain record nor any destination changes.
+    let events = store.0.lock().unwrap().events.len();
+    control.effects.calls.clear();
+    for command in [ControlCommand::Resume { generation: digest(2) }, ControlCommand::Resume { generation: digest(1) },
+        apply_command(digest(3)), apply_command(digest(1)), ControlCommand::Resume { generation: digest(2) }] {
+        refused_outcome(&mut control, command);
+        assert_eq!(barrier.closure(), Some(DrainClosure::Generation(digest(2))));
+        assert_eq!(store.journal(), Some(published));
+        assert_eq!(store.clone().load().unwrap(), Some(digest(2)));
+        assert_eq!(store.0.lock().unwrap().events.len(), events);
+        assert_eq!(slots(&shared), [Some(digest(2)); 8]);
+    }
+    // Refused before anything was verified, published or checked.
+    assert!(control.effects.calls.is_empty());
+    assert!(!control.exit_required() && !control.restart_required());
+    assert_eq!(control.report(), "recovering");
+    // Read-only readback is served; an idempotent retry of the accepted
+    // generation (a lost reply: Prepare, Drain, Apply) is served and keeps
+    // the journal's previous; the barrier never opens.
+    accepted(&mut control, ControlCommand::Readback { generation: digest(2) });
+    accepted(&mut control, ControlCommand::Prepare { preparation: preparation(digest(2)) });
+    accepted(&mut control, ControlCommand::Drain { generation: digest(2) });
+    accepted(&mut control, apply_command(digest(2)));
+    assert_eq!(store.journal(), Some(published));
+    refused_outcome(&mut control, ControlCommand::Resume { generation: digest(2) });
+    assert!(barrier.is_closed());
+    drop(control);
+    // Only the restarted, re-verified process resumes.
+    let (barrier, mut control) = restart(&store, &shared);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    accepted(&mut control, ControlCommand::Resume { generation: digest(2) });
+    assert_eq!(store.journal(), None);
+    assert!(!barrier.is_closed());
 }
 
 // ---------------------------------------------------------------- publication journal
@@ -1744,8 +1806,11 @@ fn repair_over_socket(control: &mut UpdateControl<DiskDrainStore, InstalledEffec
     validate_response(&apply, &response).unwrap();
 }
 
+/// One activation up to the Resume. The process that applied is replaced by a
+/// restarted one (the updater's restart) before the Resume: the returned
+/// barrier is the restarted process's, which `control` now is.
 fn activate(tree: &RootTree, control: &mut UpdateControl<DiskDrainStore, InstalledEffects>, manifest: &ReleaseManifest,
-    generation: Sha256Digest, seed: u8, previous: Option<Sha256Digest>) {
+    generation: Sha256Digest, seed: u8, previous: Option<Sha256Digest>) -> DrainBarrier {
     let preparation = Preparation::for_manifest(manifest, generation);
     accepted(control, ControlCommand::Prepare { preparation: preparation.clone() });
     accepted(control, ControlCommand::Drain { generation });
@@ -1775,10 +1840,21 @@ fn activate(tree: &RootTree, control: &mut UpdateControl<DiskDrainStore, Install
     let run = components.iter().find(|r| r.target == InstallTarget::Trampoline).unwrap();
     let expected = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::Trampoline).unwrap();
     assert!(run.ready && run.build_sha256 == expected.sha256);
+    // Not by the process that applied: Refused, nothing changed on disk.
+    refused_outcome(control, ControlCommand::Resume { generation });
+    assert_eq!(DiskDrainStore::at(&tree.state).load().unwrap(), Some(generation));
+    assert_eq!(tree.journal(), Some(published));
+    // The restart: a new process re-verifies the `published` journal and opens.
+    let barrier = DrainBarrier::default();
+    *control = tree.control(&barrier);
+    assert_eq!(control.startup().recovery, PublicationRecovery::Reverified);
+    assert_eq!(barrier.closure(), Some(DrainClosure::Generation(generation)));
+    assert!(control.opened());
     accepted(control, ControlCommand::Resume { generation });
     assert_eq!(DiskDrainStore::at(&tree.state).load().unwrap(), None);
     // Removed only by the Resume that follows the commit.
     assert_eq!(tree.journal(), None);
+    barrier
 }
 
 #[test]
@@ -1797,7 +1873,10 @@ fn iso_root_update_apply_end_to_end_two_generations() {
     let absent = Sha256Digest([0xab; 32]);
     accepted(&mut control, ControlCommand::Prepare { preparation: preparation(absent) });
     let (second, next) = tree.stage(2);
-    activate(&tree, &mut control, &next, second, 2, Some(first));
+    let barrier = activate(&tree, &mut control, &next, second, 2, Some(first));
+    // The restarted process's admission loop from here on.
+    drop(admission);
+    let admission = Observer::new(&barrier, 0);
     // A stale or foreign generation can never be applied once admission reopened.
     assert!(matches!(outcome(&mut control, ControlCommand::Apply { preparation: Preparation::for_manifest(&manifest, first) }),
         ControlOutcome::Refused));
@@ -1981,6 +2060,11 @@ fn iso_root_update_power_loss_each_phase() {
         accepted(&mut control, ControlCommand::Drain { generation: first });
         accepted(&mut control, ControlCommand::Apply { preparation: Preparation::for_manifest(&manifest, first) });
         assert_eq!(tree.journal(), Some(PublishJournal::new(first, first, Some(second), PublishState::Published).unwrap()));
+        // Resumed only by the restarted process, never by the one that applied.
+        refused_outcome(&mut control, ControlCommand::Resume { generation: first });
+        assert!(barrier.is_closed());
+        drop(control);
+        let (_, mut control) = restart();
         accepted(&mut control, ControlCommand::Resume { generation: first });
     }
     // 6. Partial publication, then the new generation's directory is corrupted:

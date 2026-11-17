@@ -1,7 +1,7 @@
 //! Real Linux generation publication and service readback. Missing integration
 //! endpoints refuse before publication; no successful mock is used in production.
 use std::{ffi::CString, fs::File, io::Read, os::{fd::{AsRawFd, FromRawFd}, unix::fs::MetadataExt}, path::Path,
-    process::{Command, Stdio}, time::{Duration, Instant}};
+    process::{Child, Command, Stdio}, time::{Duration, Instant}};
 use duduclaw_isolation::{ids::{RequestId, Sha256Digest}, update::*};
 use nix::sys::socket::{self, sockopt, UnixAddr};
 use crate::{Error, Result, activation_contract::{self, ActivationRuntime, GenerationPreparation,
@@ -219,32 +219,58 @@ const SYSTEMCTL_BOUND: Duration = Duration::from_secs(60);
 /// The one deadline of [`quiesce_units`] (stops of the gate, egress and the
 /// gateway, then PID 1's readback).
 const QUIESCE_DEADLINE: Duration = Duration::from_secs(180);
-fn systemctl(args: &[&str], capture: bool) -> Result<Vec<u8>> { systemctl_within(args, capture, SYSTEMCTL_BOUND) }
-/// Small fixed-argv systemd adapter. Commands and children have a bounded lifetime
-/// (`budget`, at most [`SYSTEMCTL_BOUND`]; nothing is spawned for a zero budget),
-/// no inherited environment, no shell, no stdin and bounded diagnostic output.
-/// Unit restarts are queued with `--no-block` and waited for by
-/// [`restart_units`], which passes each call the time left before its deadline.
-fn systemctl_within(args: &[&str], capture: bool, budget: Duration) -> Result<Vec<u8>> {
-    let budget = budget.min(SYSTEMCTL_BOUND);
-    if budget.is_zero() { return Err(Error::Maintenance); }
-    Directory::open(Path::new("/usr/bin"))?.read("systemctl")?;
-    let mut child = Command::new("/usr/bin/systemctl").env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("LANG", "C").args(["--no-ask-password", "--no-pager"]).args(args)
-        .stdin(Stdio::null()).stdout(if capture { Stdio::piped() } else { Stdio::null() }).stderr(Stdio::null()).spawn()?;
+/// How often a running systemctl client is polled (never past its deadline).
+const CLIENT_POLL: Duration = Duration::from_millis(20);
+fn systemctl(args: &[&str], capture: bool) -> Result<Vec<u8>> {
+    systemctl_within(args, capture, Instant::now() + SYSTEMCTL_BOUND)
+}
+/// Small fixed-argv systemd adapter. Commands and children live until the
+/// absolute `deadline` at most ([`client_within`]: nothing is spawned once it
+/// has passed, the client is killed when it is reached), with no inherited
+/// environment, no shell, no stdin and bounded diagnostic output. Callers pass
+/// their own deadline: [`restart_units`] and [`quiesce_units`] pass the time
+/// left before their one deadline (at most [`SYSTEMCTL_BOUND`] per call, except
+/// a unit restart, which waits for its own job until the restart deadline).
+fn systemctl_within(args: &[&str], capture: bool, deadline: Instant) -> Result<Vec<u8>> {
+    client_within(deadline, Instant::now, std::thread::sleep, || {
+        Directory::open(Path::new("/usr/bin"))?.read("systemctl")?;
+        // The same deadline again after this setup: nothing is spawned once it passed.
+        if Instant::now() >= deadline { return Err(Error::Maintenance); }
+        Ok(Command::new("/usr/bin/systemctl").env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("LANG", "C").args(["--no-ask-password", "--no-pager"]).args(args)
+            .stdin(Stdio::null()).stdout(if capture { Stdio::piped() } else { Stdio::null() }).stderr(Stdio::null()).spawn()?)
+    })
+}
+/// One client against one absolute `deadline` on the clock `now`: when it has
+/// passed nothing is spawned (`Err(Maintenance)`); after the spawn the wait is
+/// computed from the same deadline again ([`wait_within`]), and a client still
+/// running at the deadline is killed (`Err(Maintenance)`). A non-zero exit is
+/// `Err(Maintenance)`; at most 128 bytes of stdout are returned.
+fn client_within(deadline: Instant, mut now: impl FnMut() -> Instant, mut pause: impl FnMut(Duration),
+    spawn: impl FnOnce() -> Result<Child>) -> Result<Vec<u8>> {
+    if now() >= deadline { return Err(Error::Maintenance); }
+    let mut child = spawn()?;
     let output = child.stdout.take().map(|mut pipe| std::thread::spawn(move || {
         let mut bytes = Vec::new(); pipe.by_ref().take(129).read_to_end(&mut bytes).map(|_| bytes)
     }));
-    let deadline = Instant::now() + budget;
-    let status = loop {
-        if let Some(status) = child.try_wait()? { break status; }
-        if Instant::now() >= deadline { let _ = child.kill(); let _ = child.wait(); return Err(Error::Maintenance); }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let exited = wait_within(|| Ok(child.try_wait()?), deadline, &mut now, &mut pause)?;
+    let Some(status) = exited else { let _ = child.kill(); let _ = child.wait(); return Err(Error::Maintenance) };
     if !status.success() { return Err(Error::Maintenance); }
     let bytes = match output { Some(handle) => handle.join().map_err(|_| Error::Maintenance)??, None => vec![] };
     if bytes.len() > 128 { return Err(Error::Maintenance); }
     Ok(bytes)
+}
+/// Poll `exited` until it yields (`Some`) or the absolute `deadline` is reached
+/// (`None`); every pause is `min(CLIENT_POLL, deadline - now)`, so the wait
+/// never runs past the deadline by more than one poll of `exited`.
+fn wait_within<T>(mut exited: impl FnMut() -> Result<Option<T>>, deadline: Instant, mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(Duration)) -> Result<Option<T>> {
+    loop {
+        if let Some(value) = exited()? { return Ok(Some(value)); }
+        let left = deadline.saturating_duration_since(now());
+        if left.is_zero() { return Ok(None); }
+        pause(CLIENT_POLL.min(left));
+    }
 }
 fn main_pid(unit: &str) -> Result<u32> {
     let output = systemctl(&["show", "--property=MainPID", "--value", unit], true)?;
@@ -286,65 +312,79 @@ fn live_processes(manifest: &ReleaseManifest) -> Result<Vec<u32>> {
 }
 
 /// What [`restart_units`] and [`quiesce_units`] need from PID 1 and the clock
-/// (production: [`Systemctl`]). Every PID 1 call gets `budget`: the time left
-/// before the caller's one deadline, at most [`SYSTEMCTL_BOUND`].
+/// (production: [`Systemctl`]). Every PID 1 call gets an absolute `deadline`
+/// derived from the caller's one deadline ([`call_deadline`], or the deadline
+/// itself for a unit restart).
 trait UnitControl {
     /// Monotonic now (production: `Instant::now()`).
     fn now(&mut self) -> Instant;
     /// Wait between polls (production: `thread::sleep`).
     fn pause(&mut self, duration: Duration);
     /// `systemctl show --property=InvocationID --value` (empty: never started).
-    fn invocation(&mut self, unit: &str, budget: Duration) -> Result<Vec<u8>>;
+    fn invocation(&mut self, unit: &str, deadline: Instant) -> Result<Vec<u8>>;
     /// `systemctl reset-failed`: flushes the unit's start-rate counter.
-    fn reset_failed(&mut self, unit: &str, budget: Duration) -> Result<()>;
-    /// `systemctl --no-block restart`: the job is queued, not waited for.
-    fn restart_queued(&mut self, unit: &str, budget: Duration) -> Result<()>;
+    fn reset_failed(&mut self, unit: &str, deadline: Instant) -> Result<()>;
+    /// `systemctl restart` (no `--no-block`): the client waits for exactly the
+    /// job it enqueued; `Ok` only when that job's result is `done` (a failed,
+    /// cancelled, timed-out or dependency-failed job exits non-zero). A client
+    /// killed at `deadline` is `Err` (the job stays with PID 1).
+    fn restart(&mut self, unit: &str, deadline: Instant) -> Result<()>;
     /// `systemctl is-active --quiet`.
-    fn active(&mut self, unit: &str, budget: Duration) -> bool;
+    fn active(&mut self, unit: &str, deadline: Instant) -> bool;
     /// `systemctl show --property=Job --value`: PID 1 holds a job for the unit.
-    fn job_pending(&mut self, unit: &str, budget: Duration) -> Result<bool>;
-    /// `systemctl stop` (waits for the stop job, within `budget`).
-    fn stop(&mut self, unit: &str, budget: Duration) -> Result<()>;
+    fn job_pending(&mut self, unit: &str, deadline: Instant) -> Result<bool>;
+    /// `systemctl stop` (waits for the stop job, until `deadline`).
+    fn stop(&mut self, unit: &str, deadline: Instant) -> Result<()>;
     /// `systemctl show --property=ActiveState --value`.
-    fn active_state(&mut self, unit: &str, budget: Duration) -> Result<Vec<u8>>;
+    fn active_state(&mut self, unit: &str, deadline: Instant) -> Result<Vec<u8>>;
 }
-/// `show --property=Job --value`: empty (no job) or a job id. Anything else is uncertain.
+/// `show --property=Job --value` (systemd 249): an empty line when there is no
+/// job (also for a unit PID 1 never loaded), otherwise the job id (a non-zero
+/// `u32`) and a newline. Anything else, a missing newline included, is uncertain.
 fn parse_job(output: &[u8]) -> Result<bool> {
-    let text = output.strip_suffix(b"\n").unwrap_or(output);
+    let text = output.strip_suffix(b"\n").ok_or(Error::Maintenance)?;
     if text.is_empty() { return Ok(false); }
-    if text.iter().all(u8::is_ascii_digit) && text.len() <= 10 && text.iter().any(|b| *b != b'0') { return Ok(true); }
+    if text.len() <= 10 && text.iter().all(u8::is_ascii_digit) && text[0] != b'0'
+        && std::str::from_utf8(text).ok().and_then(|id| id.parse::<u32>().ok()).is_some() { return Ok(true); }
     Err(Error::Maintenance)
+}
+/// `show --property=InvocationID --value` of a started unit: 32 lowercase hex
+/// digits (not all zero) and a newline.
+fn valid_invocation(output: &[u8]) -> bool {
+    output.strip_suffix(b"\n").is_some_and(|id| id.len() == 32
+        && id.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) && id.iter().any(|b| *b != b'0'))
 }
 struct Systemctl;
 impl UnitControl for Systemctl {
     fn now(&mut self) -> Instant { Instant::now() }
     fn pause(&mut self, duration: Duration) { std::thread::sleep(duration) }
-    fn invocation(&mut self, unit: &str, budget: Duration) -> Result<Vec<u8>> {
-        systemctl_within(&["show", "--property=InvocationID", "--value", unit], true, budget)
+    fn invocation(&mut self, unit: &str, deadline: Instant) -> Result<Vec<u8>> {
+        systemctl_within(&["show", "--property=InvocationID", "--value", unit], true, deadline)
     }
-    fn reset_failed(&mut self, unit: &str, budget: Duration) -> Result<()> {
-        systemctl_within(&["reset-failed", unit], false, budget).map(drop)
+    fn reset_failed(&mut self, unit: &str, deadline: Instant) -> Result<()> {
+        systemctl_within(&["reset-failed", unit], false, deadline).map(drop)
     }
-    fn restart_queued(&mut self, unit: &str, budget: Duration) -> Result<()> {
-        systemctl_within(&["--no-block", "restart", unit], false, budget).map(drop)
+    fn restart(&mut self, unit: &str, deadline: Instant) -> Result<()> {
+        systemctl_within(&["restart", unit], false, deadline).map(drop)
     }
-    fn active(&mut self, unit: &str, budget: Duration) -> bool {
-        systemctl_within(&["is-active", "--quiet", unit], false, budget).is_ok()
+    fn active(&mut self, unit: &str, deadline: Instant) -> bool {
+        systemctl_within(&["is-active", "--quiet", unit], false, deadline).is_ok()
     }
-    fn job_pending(&mut self, unit: &str, budget: Duration) -> Result<bool> {
-        parse_job(&systemctl_within(&["show", "--property=Job", "--value", unit], true, budget)?)
+    fn job_pending(&mut self, unit: &str, deadline: Instant) -> Result<bool> {
+        parse_job(&systemctl_within(&["show", "--property=Job", "--value", unit], true, deadline)?)
     }
-    fn stop(&mut self, unit: &str, budget: Duration) -> Result<()> { systemctl_within(&["stop", unit], false, budget).map(drop) }
-    fn active_state(&mut self, unit: &str, budget: Duration) -> Result<Vec<u8>> {
-        systemctl_within(&["show", "--property=ActiveState", "--value", unit], true, budget)
+    fn stop(&mut self, unit: &str, deadline: Instant) -> Result<()> { systemctl_within(&["stop", unit], false, deadline).map(drop) }
+    fn active_state(&mut self, unit: &str, deadline: Instant) -> Result<Vec<u8>> {
+        systemctl_within(&["show", "--property=ActiveState", "--value", unit], true, deadline)
     }
 }
-/// The time left before `deadline` for one PID 1 call (at most
-/// [`SYSTEMCTL_BOUND`]); `Err(Maintenance)` at once when nothing remains.
-fn remaining(control: &mut impl UnitControl, deadline: Instant) -> Result<Duration> {
-    let left = deadline.saturating_duration_since(control.now());
-    if left.is_zero() { return Err(Error::Maintenance); }
-    Ok(left.min(SYSTEMCTL_BOUND))
+/// The absolute deadline of one PID 1 query or stop: the caller's `deadline`,
+/// or [`SYSTEMCTL_BOUND`] from now if that is earlier; `Err(Maintenance)` at
+/// once (nothing is called) when the deadline has passed.
+fn call_deadline(control: &mut impl UnitControl, deadline: Instant) -> Result<Instant> {
+    let now = control.now();
+    if now >= deadline { return Err(Error::Maintenance); }
+    Ok(deadline.min(now + SYSTEMCTL_BOUND))
 }
 
 /// The updater's step right before `Apply` (`GenerationEffects::quiesce`):
@@ -356,76 +396,80 @@ fn remaining(control: &mut impl UnitControl, deadline: Instant) -> Result<Durati
 /// or readback that fails or does not confirm that is `Err(Maintenance)`, before
 /// `Apply` is sent: nothing was published, and the next activation attempt
 /// repeats the idempotent sequence (spawnd also refuses `Apply` on its own
-/// readback of the same units).
+/// readback of the same units). One absolute deadline, taken once on entry,
+/// bounds every call ([`call_deadline`]).
 fn quiesce_units(control: &mut impl UnitControl, deadline: Duration) -> Result<()> {
     use duduclaw_isolation::ids::{ISOLATION_GATED_UNITS, ISOLATION_READY_UNIT, EGRESS_SOCKET_UNIT, EGRESS_UNIT, ISOLATED_GATEWAY_UNIT};
     let deadline = control.now() + deadline;
     for unit in [ISOLATION_READY_UNIT, EGRESS_SOCKET_UNIT, EGRESS_UNIT, ISOLATED_GATEWAY_UNIT] {
-        let budget = remaining(control, deadline)?;
-        control.stop(unit, budget)?;
+        let call = call_deadline(control, deadline)?;
+        control.stop(unit, call)?;
     }
     for unit in ISOLATION_GATED_UNITS {
-        let budget = remaining(control, deadline)?;
-        let state = control.active_state(unit, budget)?;
+        let call = call_deadline(control, deadline)?;
+        let state = control.active_state(unit, call)?;
         if state != b"inactive\n" && state != b"failed\n" { return Err(Error::Maintenance); }
-        let budget = remaining(control, deadline)?;
-        if control.job_pending(unit, budget)? { return Err(Error::Maintenance); }
+        let call = call_deadline(control, deadline)?;
+        if control.job_pending(unit, call)? { return Err(Error::Maintenance); }
     }
     Ok(())
 }
-/// Restart the three units against one deadline that exceeds spawnd's whole
-/// stop and start budget ([`RESTART_DEADLINE`]): the jobs are queued with
-/// `--no-block` (PID 1 owns them; no client is killed half way), then every
-/// unit must have no pending job (the queued restart has run, not merely an
-/// automatic restart that finished in between), be `active` and have a new
-/// invocation id (a start that began after this restart was requested). The
-/// deadline is strict: every PID 1 call gets only the time left (at most
-/// [`SYSTEMCTL_BOUND`]), polls sleep at most that long, and nothing is called
-/// once it has passed. spawnd's start-rate counter is flushed first:
-/// this restart follows every `Apply`, including every repairing one, and must
-/// not consume the crash-loop budget (`StartLimitBurst=`) that automatic
-/// restarts are counted against.
+/// Restart the three units against one absolute deadline, taken once on entry,
+/// that exceeds spawnd's whole stop and start budget ([`RESTART_DEADLINE`]).
+/// Each restart is `systemctl restart` without `--no-block`: the client waits
+/// for exactly the job it enqueued and succeeds only when that job's result is
+/// `done`; a failed or cancelled job is `Err(Maintenance)` at once, whatever
+/// the unit shows later (an automatic restart may still make it active under
+/// a new invocation). Each restart client lives until the deadline at most; a
+/// client killed there is `Err(Maintenance)` (its job stays with PID 1). Then
+/// every unit must have no pending job, be `active` and have a new, well-formed
+/// invocation id. Every other PID 1 call gets at most [`SYSTEMCTL_BOUND`] of the
+/// time left ([`call_deadline`]), polls sleep `min(poll, deadline - now)`, and
+/// nothing is called once the deadline has passed. spawnd's start-rate counter
+/// is flushed first: this restart follows every `Apply`, including every
+/// repairing one, and must not consume the crash-loop budget
+/// (`StartLimitBurst=`) that automatic restarts are counted against.
 ///
-/// spawnd is queued first: its restart also restarts the consistency gate
-/// (`PartOf=`/`BindsTo=`) and with it egress and the gateway, so their queued
-/// restarts merge behind the new gate instead of starting against the old one.
+/// spawnd is restarted first: its restart also restarts the consistency gate
+/// (`PartOf=`/`BindsTo=`), so egress and then the gateway start behind the
+/// new gate instead of against the old one.
 ///
-/// On timeout `Err(Maintenance)`. Nothing is resumed: spawnd's drain record
-/// still closes admission for the generation, its publication journal says
-/// `published`, `current` already names the generation and the updater's
-/// pending activation stays `Prepared`. The next activation attempt (or the
-/// updater's start-up reconciliation) repeats the idempotent sequence, whose
-/// own restart replaces any job PID 1 still holds; a spawnd that came back
-/// inconsistent meanwhile is repaired by that attempt's `Apply`.
+/// On failure or timeout `Err(Maintenance)`. Nothing is resumed: spawnd's
+/// drain record still closes admission for the generation, its publication
+/// journal says `published`, `current` already names the generation and the
+/// updater's pending activation stays `Prepared`. The next activation attempt
+/// (or the updater's start-up reconciliation) repeats the idempotent sequence,
+/// whose own restart replaces any job PID 1 still holds; a spawnd that came
+/// back inconsistent meanwhile is repaired by that attempt's `Apply`.
 fn restart_units(control: &mut impl UnitControl, deadline: Duration, poll: Duration) -> Result<()> {
     let deadline = control.now() + deadline;
     let mut before = Vec::with_capacity(UNITS.len());
     for (unit, _) in &UNITS {
-        let budget = remaining(control, deadline)?;
-        before.push(control.invocation(unit, budget)?);
+        let call = call_deadline(control, deadline)?;
+        before.push(control.invocation(unit, call)?);
     }
-    let budget = remaining(control, deadline)?;
-    control.reset_failed(SPAWND_UNIT, budget)?;
-    let budget = remaining(control, deadline)?;
-    control.restart_queued(SPAWND_UNIT, budget)?;
-    for (unit, _) in UNITS.iter().filter(|(unit, _)| *unit != SPAWND_UNIT) {
-        let budget = remaining(control, deadline)?;
-        control.restart_queued(unit, budget)?;
+    let call = call_deadline(control, deadline)?;
+    control.reset_failed(SPAWND_UNIT, call)?;
+    // spawnd, then egress, then the gateway.
+    for unit in std::iter::once(SPAWND_UNIT).chain(UNITS.iter().map(|(unit, _)| *unit).filter(|unit| *unit != SPAWND_UNIT)) {
+        // The restart waits for its own job until the deadline itself.
+        if control.now() >= deadline { return Err(Error::Maintenance); }
+        control.restart(unit, deadline)?;
     }
     loop {
         let mut restarted = true;
         for ((unit, _), old) in UNITS.iter().zip(&before) {
-            // The job first: once none is pending, the explicit restart has run.
-            let budget = remaining(control, deadline)?;
-            if control.job_pending(unit, budget).unwrap_or(true) { restarted = false; break; }
-            let budget = remaining(control, deadline)?;
-            let fresh = control.invocation(unit, budget).is_ok_and(|now| now.iter().any(u8::is_ascii_hexdigit) && now != *old);
+            let call = call_deadline(control, deadline)?;
+            if control.job_pending(unit, call).unwrap_or(true) { restarted = false; break; }
+            let call = call_deadline(control, deadline)?;
+            let fresh = control.invocation(unit, call).is_ok_and(|now| valid_invocation(&now) && now != *old);
             if !fresh { restarted = false; break; }
-            let budget = remaining(control, deadline)?;
-            if !control.active(unit, budget) { restarted = false; break; }
+            let call = call_deadline(control, deadline)?;
+            if !control.active(unit, call) { restarted = false; break; }
         }
         if restarted { return Ok(()); }
-        let left = remaining(control, deadline)?;
+        let left = deadline.saturating_duration_since(control.now());
+        if left.is_zero() { return Err(Error::Maintenance); }
         control.pause(poll.min(left));
     }
 }
@@ -508,16 +552,19 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
     use duduclaw_isolation::ids::ISOLATION_GATED_UNITS;
     type Log = Rc<RefCell<Vec<String>>>;
-    /// Scripted PID 1 on a fake clock. After the restarts are queued, PID 1
-    /// holds the explicit restart job until `settles_after` `Job` reads
-    /// happened (`None`: never, as with a spawnd stuck verifying or failing);
-    /// then every unit reports no job, a new invocation and `active`.
-    /// `early_fresh`: an automatic restart finished between the "before" sample
-    /// and the explicit job: active under a new invocation while that job is
-    /// still pending. Every call takes `cost` of fake time, cut at its budget
-    /// (a call that reaches its budget is killed: an error).
+    /// Scripted PID 1 on a fake clock. Once a restart ran, PID 1 still holds
+    /// a job for the units (one queued behind the restart, e.g. the gate's)
+    /// until `settles_after` `Job` reads happened (`None`: never, as with a
+    /// spawnd stuck verifying or failing); then every unit reports no job, a
+    /// new invocation and `active`. `early_fresh`: active under a new
+    /// invocation while that job is still pending. `restart_fails`: the job of
+    /// that unit's `systemctl restart` fails (the client exits non-zero) although
+    /// the unit restarted. Every call takes `cost` of fake time (a restart
+    /// `restart_cost`, when set), cut at its deadline (a call that reaches its
+    /// deadline is killed: an error).
     struct FakeUnits { log: Log, restarted: bool, polls: usize, settles_after: Option<usize>, always_active: bool,
         early_fresh: bool, base: Instant, clock: Duration, cost: Duration, budgets: Vec<Duration>,
+        restart_cost: Option<Duration>, restart_fails: Option<&'static str>,
         /// Quiesce: `ActiveState` reported per unit (default `inactive`), units
         /// with a pending job, and a unit whose stop fails.
         states: Vec<(&'static str, &'static str)>, jobs: Vec<&'static str>, stop_fails: Option<&'static str> }
@@ -525,67 +572,73 @@ mod tests {
         fn new() -> Self {
             Self { log: Log::default(), restarted: false, polls: 0, settles_after: None, always_active: false,
                 early_fresh: false, base: Instant::now(), clock: Duration::ZERO, cost: Duration::ZERO, budgets: vec![],
-                states: vec![], jobs: vec![], stop_fails: None }
+                restart_cost: None, restart_fails: None, states: vec![], jobs: vec![], stop_fails: None }
         }
         fn settled(&self) -> bool { self.restarted && self.settles_after.is_some_and(|after| self.polls >= after) }
         fn fresh(&self) -> bool { self.settled() || (self.early_fresh && self.restarted) }
-        /// One PID 1 call: `false` when it ran into its budget (killed).
-        fn call(&mut self, entry: String, budget: Duration) -> bool {
-            assert!(!budget.is_zero() && budget <= SYSTEMCTL_BOUND, "{entry}: {budget:?}");
+        /// One PID 1 call until `deadline`: `false` when it ran into it (killed).
+        /// A query or stop is never given more than [`SYSTEMCTL_BOUND`].
+        fn call(&mut self, entry: String, deadline: Instant, cost: Duration, bounded: bool) -> bool {
+            let budget = deadline.saturating_duration_since(self.base + self.clock);
+            assert!(!budget.is_zero() && (!bounded || budget <= SYSTEMCTL_BOUND), "{entry}: {budget:?}");
             self.log.borrow_mut().push(entry);
             self.budgets.push(budget);
-            self.clock += self.cost.min(budget);
-            self.cost < budget
+            self.clock += cost.min(budget);
+            cost < budget
         }
+        fn query(&mut self, entry: String, deadline: Instant) -> bool { self.call(entry, deadline, self.cost, true) }
         fn calls(&self) -> Vec<String> { self.log.borrow().clone() }
     }
     impl UnitControl for FakeUnits {
         fn now(&mut self) -> Instant { self.base + self.clock }
         fn pause(&mut self, duration: Duration) { self.clock += duration; }
-        fn invocation(&mut self, unit: &str, budget: Duration) -> Result<Vec<u8>> {
-            if !self.call(format!("invocation {unit}"), budget) { return Err(Error::Maintenance); }
+        fn invocation(&mut self, unit: &str, deadline: Instant) -> Result<Vec<u8>> {
+            if !self.query(format!("invocation {unit}"), deadline) { return Err(Error::Maintenance); }
             let digit = if self.fresh() { "b" } else { "a" };
             Ok(format!("{}\n", digit.repeat(32)).into_bytes())
         }
-        fn reset_failed(&mut self, unit: &str, budget: Duration) -> Result<()> {
-            if self.call(format!("reset-failed {unit}"), budget) { Ok(()) } else { Err(Error::Maintenance) }
+        fn reset_failed(&mut self, unit: &str, deadline: Instant) -> Result<()> {
+            if self.query(format!("reset-failed {unit}"), deadline) { Ok(()) } else { Err(Error::Maintenance) }
         }
-        fn restart_queued(&mut self, unit: &str, budget: Duration) -> Result<()> {
-            if !self.call(format!("--no-block restart {unit}"), budget) { return Err(Error::Maintenance); }
+        fn restart(&mut self, unit: &str, deadline: Instant) -> Result<()> {
+            let cost = self.restart_cost.unwrap_or(self.cost);
+            if !self.call(format!("restart {unit}"), deadline, cost, false) { return Err(Error::Maintenance); }
             self.restarted = true;
+            if self.restart_fails == Some(unit) { return Err(Error::Maintenance); }
             Ok(())
         }
-        fn active(&mut self, unit: &str, budget: Duration) -> bool {
-            self.call(format!("is-active {unit}"), budget) && (self.always_active || self.fresh())
+        fn active(&mut self, unit: &str, deadline: Instant) -> bool {
+            self.query(format!("is-active {unit}"), deadline) && (self.always_active || self.fresh())
         }
-        fn job_pending(&mut self, unit: &str, budget: Duration) -> Result<bool> {
-            if !self.call(format!("job {unit}"), budget) { return Err(Error::Maintenance); }
+        fn job_pending(&mut self, unit: &str, deadline: Instant) -> Result<bool> {
+            if !self.query(format!("job {unit}"), deadline) { return Err(Error::Maintenance); }
             if self.restarted { self.polls += 1; }
             Ok(self.jobs.iter().any(|job| *job == unit) || (self.restarted && !self.settled()))
         }
-        fn stop(&mut self, unit: &str, budget: Duration) -> Result<()> {
-            if !self.call(format!("stop {unit}"), budget) || self.stop_fails == Some(unit) { return Err(Error::Maintenance); }
+        fn stop(&mut self, unit: &str, deadline: Instant) -> Result<()> {
+            if !self.query(format!("stop {unit}"), deadline) || self.stop_fails == Some(unit) { return Err(Error::Maintenance); }
             Ok(())
         }
-        fn active_state(&mut self, unit: &str, budget: Duration) -> Result<Vec<u8>> {
-            if !self.call(format!("active-state {unit}"), budget) { return Err(Error::Maintenance); }
+        fn active_state(&mut self, unit: &str, deadline: Instant) -> Result<Vec<u8>> {
+            if !self.query(format!("active-state {unit}"), deadline) { return Err(Error::Maintenance); }
             let state = self.states.iter().find(|(name, _)| *name == unit).map_or("inactive", |(_, state)| *state);
             Ok(format!("{state}\n").into_bytes())
         }
     }
     fn queued(units: &FakeUnits) -> Vec<String> {
-        units.calls().into_iter().filter(|call| call.starts_with("reset-failed ") || call.starts_with("--no-block ")).collect()
+        units.calls().into_iter().filter(|call| call.starts_with("reset-failed ") || call.starts_with("restart ")).collect()
     }
     #[test]
-    fn restart_queues_jobs_and_waits_for_new_invocations() {
+    fn restart_waits_for_each_job_in_order_and_for_new_invocations() {
         let mut units = FakeUnits { settles_after: Some(7), ..FakeUnits::new() };
         restart_units(&mut units, Duration::from_secs(5), Duration::from_millis(1)).unwrap();
-        // The invocations before, then the start-rate flush of spawnd, then
-        // non-blocking restarts only: PID 1 owns the jobs, no client is killed.
+        // The invocations before, then the start-rate flush of spawnd, then one
+        // blocking restart per unit (each waits for its own job): spawnd,
+        // egress, the gateway.
         assert_eq!(units.calls().into_iter().take(3).collect::<Vec<_>>(),
             ["invocation duduclaw-egress.service", "invocation duduclaw-spawnd.service", "invocation duduclaw-gateway.service"]);
-        assert_eq!(queued(&units), ["reset-failed duduclaw-spawnd.service", "--no-block restart duduclaw-spawnd.service",
-            "--no-block restart duduclaw-egress.service", "--no-block restart duduclaw-gateway.service"]);
+        assert_eq!(queued(&units), ["reset-failed duduclaw-spawnd.service", "restart duduclaw-spawnd.service",
+            "restart duduclaw-egress.service", "restart duduclaw-gateway.service"]);
         // Accepted only after a poll that found no job, a new invocation and active for every unit.
         assert_eq!(units.calls().iter().rev().take(9).rev().map(String::as_str).collect::<Vec<_>>(),
             ["job duduclaw-egress.service", "invocation duduclaw-egress.service", "is-active duduclaw-egress.service",
@@ -605,12 +658,104 @@ mod tests {
         // A job that never leaves: never accepted, even though active + new invocation.
         let mut units = FakeUnits { early_fresh: true, always_active: true, ..FakeUnits::new() };
         assert!(matches!(restart_units(&mut units, Duration::from_secs(5), Duration::from_millis(100)), Err(Error::Maintenance)));
-        // A job read that fails is not "no job" either.
-        assert!(parse_job(b"").is_ok_and(|pending| !pending) && parse_job(b"\n").is_ok_and(|pending| !pending));
-        assert!(parse_job(b"4711\n").unwrap());
-        for uncertain in [&b"0\n"[..], &b"n/a\n"[..], &b"4711 start\n"[..], &b"-1\n"[..], &b"99999999999\n"[..]] {
-            assert!(parse_job(uncertain).is_err());
+        // A job read that fails is not "no job" either. systemd 249 prints an
+        // empty line for "no job" (also for a never-loaded unit); a job id is a
+        // non-zero u32. No output at all, or no newline, is uncertain.
+        assert!(parse_job(b"\n").is_ok_and(|pending| !pending));
+        assert!(parse_job(b"4711\n").unwrap() && parse_job(b"4294967295\n").unwrap());
+        for uncertain in [&b""[..], &b"4711"[..], &b"\n\n"[..], &b"0\n"[..], &b"0471\n"[..], &b"n/a\n"[..], &b"4711 start\n"[..],
+            &b"-1\n"[..], &b" 4711\n"[..], &b"4294967296\n"[..], &b"99999999999\n"[..]] {
+            assert!(parse_job(uncertain).is_err(), "{uncertain:?}");
         }
+        // InvocationID: 32 lowercase hex digits and a newline.
+        assert!(valid_invocation(b"0123456789abcdef0123456789abcdef\n"));
+        for invalid in [&b""[..], &b"\n"[..], &b"0123456789abcdef0123456789abcdef"[..], &b"0123456789ABCDEF0123456789ABCDEF\n"[..],
+            &b"0123456789abcdef0123456789abcde\n"[..], &b"00000000000000000000000000000000\n"[..],
+            &b"0123456789abcdef0123456789abcdeg\n"[..]] {
+            assert!(!valid_invocation(invalid), "{invalid:?}");
+        }
+    }
+    #[test]
+    fn restart_job_failure_is_an_error_even_if_the_unit_later_looks_restarted() {
+        // The job `systemctl restart` enqueued fails (the client exits
+        // non-zero), although the unit is (or soon will be) active under a new
+        // invocation, e.g. after an automatic restart: Err at once, nothing
+        // after it is restarted and no post-condition can turn it into success.
+        for failing in ["duduclaw-spawnd.service", "duduclaw-egress.service", "duduclaw-gateway.service"] {
+            let mut units = FakeUnits { restart_fails: Some(failing), settles_after: Some(0), always_active: true,
+                early_fresh: true, ..FakeUnits::new() };
+            assert!(matches!(restart_units(&mut units, Duration::from_secs(5), Duration::from_millis(1)), Err(Error::Maintenance)));
+            let restarts = queued(&units);
+            assert_eq!(restarts.last().map(String::as_str), Some(format!("restart {failing}").as_str()), "{failing}");
+            assert!(!units.calls().iter().any(|call| call.starts_with("job ") || call.starts_with("is-active ")), "{failing}");
+            // What a later readback would have shown: no job, active, new invocation.
+            let later = units.now() + Duration::from_secs(1);
+            assert!(!units.job_pending(failing, later).unwrap() && units.active(failing, later));
+            let old = format!("{}\n", "a".repeat(32)).into_bytes();
+            assert!(units.invocation(failing, later).is_ok_and(|id| valid_invocation(&id) && id != old));
+        }
+    }
+    #[test]
+    fn restart_client_waits_for_its_job_until_the_deadline_only() {
+        // A restart is not cut at the 60 s query bound: spawnd's own stop and
+        // start may take longer (here 200 s of a 450 s deadline) and succeed.
+        let deadline = Duration::from_secs(450);
+        let mut units = FakeUnits { restart_cost: Some(Duration::from_secs(200)), settles_after: Some(0), ..FakeUnits::new() };
+        assert!(matches!(restart_units(&mut units, deadline, Duration::from_millis(500)), Err(Error::Maintenance)));
+        // spawnd and egress restarted (200 s each); the gateway's client got only
+        // the 50 s left and was killed exactly at the deadline, never later.
+        assert_eq!(queued(&units)[1..], ["restart duduclaw-spawnd.service", "restart duduclaw-egress.service",
+            "restart duduclaw-gateway.service"]);
+        assert!(units.budgets.iter().any(|budget| *budget > SYSTEMCTL_BOUND));
+        assert_eq!(units.clock, deadline);
+        assert!(!units.calls().iter().any(|call| call.starts_with("job ")));
+        // With time for all three, the restart is accepted.
+        let mut units = FakeUnits { restart_cost: Some(Duration::from_secs(100)), settles_after: Some(0), ..FakeUnits::new() };
+        restart_units(&mut units, deadline, Duration::from_millis(500)).unwrap();
+        assert!(units.clock <= deadline);
+    }
+    #[test]
+    fn client_wait_is_bounded_by_one_absolute_deadline() {
+        use std::cell::Cell;
+        let base = Instant::now();
+        let clock = Cell::new(Duration::ZERO);
+        let now = || base + clock.get();
+        let advance = |duration: Duration| clock.set(clock.get() + duration);
+        let deadline = base + Duration::from_millis(1001);
+        // A client that never exits: the wait ends exactly at the deadline;
+        // every pause is at most one poll interval and the last is cut to the
+        // millisecond left.
+        let mut pauses = Vec::new();
+        let waited = wait_within(|| Ok(None::<()>), deadline, now, |duration| { pauses.push(duration); advance(duration) }).unwrap();
+        assert!(waited.is_none());
+        assert_eq!(now(), deadline);
+        assert!(pauses.iter().all(|pause| *pause <= CLIENT_POLL));
+        assert_eq!(pauses.last(), Some(&Duration::from_millis(1)));
+        // Each poll itself takes 30 ms: the wait passes the deadline by at most
+        // that one poll, never by a further pause.
+        clock.set(Duration::ZERO);
+        let slow = || { advance(Duration::from_millis(30)); Ok(None::<()>) };
+        assert!(wait_within(slow, deadline, now, advance).unwrap().is_none());
+        assert!(now() >= deadline && now() <= deadline + Duration::from_millis(30), "{:?}", now() - deadline);
+        // Setup that already used the whole deadline: no pause at all.
+        clock.set(Duration::from_millis(1001));
+        assert!(wait_within(|| Ok(None::<()>), deadline, now, |_| panic!("paused past the deadline")).unwrap().is_none());
+        // A client that exits: its status, after two pauses.
+        clock.set(Duration::ZERO);
+        let mut polls = 0;
+        assert_eq!(wait_within(|| { polls += 1; Ok((polls == 3).then_some(7)) }, deadline, now, advance).unwrap(), Some(7));
+        assert_eq!(clock.get(), 2 * CLIENT_POLL);
+    }
+    #[test]
+    fn client_is_not_spawned_once_the_deadline_has_passed() {
+        let base = Instant::now();
+        for late in [Duration::ZERO, Duration::from_millis(1)] {
+            let mut spawned = false;
+            let result = client_within(base, || base + late, |_| panic!("no wait"), || { spawned = true; Err(Error::Maintenance) });
+            assert!(matches!(result, Err(Error::Maintenance)) && !spawned, "{late:?}");
+        }
+        assert!(matches!(systemctl_within(&["is-active", "--quiet", "duduclaw-spawnd.service"], false, Instant::now()),
+            Err(Error::Maintenance)));
     }
     #[test]
     fn restart_timeout_is_one_shared_deadline_and_recoverable() {
@@ -621,8 +766,8 @@ mod tests {
             let error = restart_units(&mut units, Duration::from_millis(60), Duration::from_millis(5)).unwrap_err();
             assert!(matches!(error, Error::Maintenance));
             assert_eq!(units.clock, Duration::from_millis(60));
-            // The jobs were queued once and left to PID 1; the next attempt
-            // repeats the idempotent sequence (nothing is resumed here).
+            // Each unit was restarted once; the next attempt repeats the
+            // idempotent sequence (nothing is resumed here).
             assert_eq!(queued(&units).len(), 4);
         }
         // The production deadline outlasts spawnd's whole stop and start budget.
@@ -649,8 +794,14 @@ mod tests {
         assert!(units.calls().is_empty());
         assert!(matches!(quiesce_units(&mut units, Duration::ZERO), Err(Error::Maintenance)));
         assert!(units.calls().is_empty());
-        assert!(matches!(systemctl_within(&["is-active", "--quiet", "duduclaw-spawnd.service"], false, Duration::ZERO),
-            Err(Error::Maintenance)));
+        // Quiesce against one 180 s deadline taken on entry: slow stops (50 s
+        // each); the fourth gets only the 30 s left and is killed exactly at
+        // the deadline, and nothing is called after it.
+        let mut units = FakeUnits { cost: Duration::from_secs(50), ..FakeUnits::new() };
+        assert!(matches!(quiesce_units(&mut units, QUIESCE_DEADLINE), Err(Error::Maintenance)));
+        assert_eq!(units.clock, QUIESCE_DEADLINE);
+        assert_eq!(units.calls().len(), 4);
+        assert_eq!(units.budgets.last(), Some(&Duration::from_secs(30)));
     }
 
     fn manifest() -> ReleaseManifest {
@@ -771,20 +922,34 @@ mod tests {
         // The readbacks restart and quiesce rely on: no job once a restart
         // finished, `active`; a stop leaves `inactive` and no job; a unit PID 1
         // never loaded reads as `inactive` with no job.
-        let budget = Duration::from_secs(10);
-        assert!(!Systemctl.job_pending(&unit, budget).unwrap());
-        assert_eq!(Systemctl.active_state(&unit, budget).unwrap(), b"active\n");
-        Systemctl.stop(&unit, budget).unwrap();
-        assert_eq!(Systemctl.active_state(&unit, budget).unwrap(), b"inactive\n");
-        assert!(!Systemctl.job_pending(&unit, budget).unwrap());
+        let deadline = || Instant::now() + Duration::from_secs(10);
+        assert!(!Systemctl.job_pending(&unit, deadline()).unwrap());
+        assert_eq!(Systemctl.active_state(&unit, deadline()).unwrap(), b"active\n");
+        let started = Systemctl.invocation(&unit, deadline()).unwrap();
+        assert!(valid_invocation(&started), "{started:?}");
+        Systemctl.stop(&unit, deadline()).unwrap();
+        assert_eq!(Systemctl.active_state(&unit, deadline()).unwrap(), b"inactive\n");
+        assert!(!Systemctl.job_pending(&unit, deadline()).unwrap());
         let never = format!("duduclaw-update-test-never-{}.service", std::process::id());
-        assert_eq!(Systemctl.active_state(&never, budget).unwrap(), b"inactive\n");
-        assert!(!Systemctl.job_pending(&never, budget).unwrap());
-        // A queued restart is pending until it ran, then gone.
-        Systemctl.restart_queued(&unit, budget).unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
-        while Systemctl.job_pending(&unit, budget).unwrap() { assert!(Instant::now() < until); std::thread::sleep(RESTART_POLL); }
-        assert!(Systemctl.active(&unit, budget));
+        assert_eq!(Systemctl.active_state(&never, deadline()).unwrap(), b"inactive\n");
+        assert!(!Systemctl.job_pending(&never, deadline()).unwrap());
+        // The blocking restart returns once its own job is done: no job left,
+        // active, a new invocation id.
+        Systemctl.restart(&unit, deadline()).unwrap();
+        assert!(!Systemctl.job_pending(&unit, deadline()).unwrap());
+        assert!(Systemctl.active(&unit, deadline()));
+        let restarted = Systemctl.invocation(&unit, deadline()).unwrap();
+        assert!(valid_invocation(&restarted) && restarted != started);
+        // A restart whose job fails (a oneshot whose start fails) is an error.
+        let failing = format!("duduclaw-update-test-fail-{}.service", std::process::id());
+        let mut file = directory.create(&failing).unwrap();
+        file.write_all(b"[Unit]\nDescription=Isolated updater failing restart test\n[Service]\nType=oneshot\nExecStart=/usr/bin/false\n").unwrap();
+        file.sync_all().unwrap(); directory.sync().unwrap();
+        let _failing_cleanup = Cleanup { directory: &directory, unit: &failing };
+        systemctl(&["daemon-reload"], false).unwrap();
+        assert!(matches!(Systemctl.restart(&failing, deadline()), Err(Error::Maintenance)));
+        // A deadline that has passed spawns no client: Maintenance.
+        assert!(matches!(Systemctl.restart(&unit, Instant::now()), Err(Error::Maintenance)));
     }
     #[test]
     #[ignore = "Requires root Linux systemd and /usr/bin/python3; temporary units test the production capability boundary"]

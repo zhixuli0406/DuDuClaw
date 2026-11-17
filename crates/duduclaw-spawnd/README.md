@@ -121,7 +121,11 @@ fields refused, 5 s timeouts. Every refusal is the single `Refused` outcome.
   `g`; it removes the journal, then the record, durably, then reopens admission.
   It is the only way to lift the barrier. At start the record is read strictly
   before the first admission; an unreadable record keeps admission closed until
-  a new `Drain`.
+  a new `Drain`. A process that accepted a publication (`Apply` past its gate
+  check) refuses every `Resume` and changes nothing, and refuses an `Apply` of
+  any other generation; `Prepare`, `Drain`, `Readback` and a retried `Apply` of
+  the same generation are still served. Only the restarted, re-verified spawnd
+  resumes.
 
 ### Publication journal and start-up recovery
 
@@ -266,10 +270,13 @@ synchronously written audit record that did not land `; audit_write_failed`.
 - `duduclaw-updated.service`: `Wants=`/`After=duduclaw-spawnd.service` only, so
   it starts on an inconsistent set and can repair it, and spawnd restarts never
   stop or restart it. Not `Requires=`/`BindsTo=`/`PartOf=`: the updater itself
-  restarts spawnd during an activation (`systemctl reset-failed`, then
-  `systemctl --no-block restart`, then polling every unit for `active` under a
-  new `InvocationID` against one deadline, `RESTART_DEADLINE` = stop 90 s +
-  start 300 s + 60 s), which those would propagate to the updater.
+  restarts spawnd during an activation (`systemctl reset-failed`, then a
+  blocking `systemctl restart` of spawnd, egress and the gateway, each waiting
+  for its own job's `done` result, then checking every unit for no pending job
+  and `active` under a new `InvocationID`, all against one absolute deadline,
+  `RESTART_DEADLINE` = stop 90 s + start 300 s + 60 s), which those would
+  propagate to the updater. The spawnd process that accepted the `Apply`
+  refuses `Resume`: only the restarted, re-verified spawnd reopens admission.
 
 The unit grants spawnd write access to `/usr/lib/duduclaw`, `/usr/libexec/duduclaw`
 and `/opt/duduclaw/bin` for this publication: an atomic replacement creates
